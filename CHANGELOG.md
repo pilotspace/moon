@@ -6,6 +6,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`INFO MoonStore` now reports the size and shape of the KV cold tier** (#656).
+  The whole `# MoonStore` section was one boolean, `disk_offload_enabled`, while the cold
+  tier was the single largest consumer in the data directory. On the instance that motivated
+  this — 1.43M keys, `used_memory` 1.49 GB, disk-offload on — the 15 GB data dir held
+  **7.6 GB of `heap-*.mpf`**, and nothing reported how big the cold tier was or how much of
+  it was dead.
+
+  Two existing fields look like they answer this and do not. `reclamation_cold_segments` and
+  its siblings sit under `-- Vector segment tiers --` and count **vector** segments, so on a
+  KV-only instance they read 0 while the KV cold tier holds gigabytes — worse than absent,
+  because a zero reads as an answer. `spilled_keys` is a monotonic count of keys ever
+  spilled: a rate, never a level.
+
+  ```text
+  # MoonStore
+  disk_offload_enabled:1
+  cold_keys:...                 live keys resident only on disk
+  cold_disk_bytes:...           on-disk bytes of live KvLeaf files
+  cold_files:...                heap files the manifest lists as live
+  cold_files_referenced:...     files holding at least one live key
+  cold_files_dead:...           on disk, referenced by nothing
+  cold_files_pending_unlink:... awaiting unlink by the sweep
+  cold_index_bytes:...          RAM the index costs (NOT disk)
+  ```
+
+  This exposes existing state rather than adding bookkeeping: `ColdIndex` already maintained
+  every input, and the manifest already recorded each file's `byte_size`. The values are
+  published by the cold orphan sweep, i.e. once per `--cold-orphan-sweep-interval-secs`
+  (60s default) rather than on the 100ms memory tick — summing the manifest's file entries is
+  O(files), which on a G2-sized cold tier (100k+ heap files) is milliseconds of shard-thread
+  time per tick for a number nobody reads at that resolution. All fields read 0 until the
+  first sweep, and stay 0 when disk-offload is off.
+
+  `cold_files - cold_files_referenced` is the dead-space answer at the granularity reclaim
+  actually operates on. Per-key dead space inside a partially-live file is not derivable:
+  `ColdLocation` records where an entry is, not how many bytes it occupies.
+
 ### Changed
 - **`scripts/ci-local.sh` now pre-flights the VM's free disk before it starts** (#658).
   A full VM root does not announce itself: a run reported `VM tokio suite FAILED (rc=1)`
