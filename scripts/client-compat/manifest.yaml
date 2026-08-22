@@ -83,20 +83,14 @@ entries:
     command: "GET k"
     policy: exact
 
+  # FIXED 2026-08-22 by moon#639. The waiver is retired rather than deleted:
+  # this is a live parity assertion now, so the queueing behaviour cannot
+  # silently regress. The residual this entry recorded as "not yet understood"
+  # was `is_intercept_only`, an exemption list the gate consulted — CONFIG did
+  # sit below the gate, and the gate then waved it through.
   - name: multi_queues_config_get
     command: "CONFIG GET maxmemory"
     policy: type_only
-    expect_diff:
-      reason: >-
-        FOUND BY THIS HARNESS, 2026-08-09. CONFIG GET inside MULTI is not
-        queued either — EXEC returns *0. A second command family bypassing
-        transaction queueing, distinct from the inline-GET path.
-        Owner: multi-exec-queue-semantics (re-owned 2026-08-10: a
-        transaction-QUEUEING defect, not a reply-type one).
-        STILL REPRODUCES 2026-08-12 after the MULTI queue gate landed, which
-        DID fix the same class for INFO and SUBSCRIBE. CONFIG sits below the
-        gate in every handler, so the reason is not intercept order and is not
-        yet understood — deliberately not guessed at here.
 
   # FIXED 2026-08-12 by multi-exec-queue-semantics. The waivers are retired
   # rather than deleted: these two are now live parity assertions, so the
@@ -226,20 +220,12 @@ entries:
   # Split from the entry above rather than folded into it: a waiver is
   # per-entry, so waiving the whole case would blunt the two contexts that
   # genuinely pass. This entry keeps the MULTI defect on the books.
+  # FIXED 2026-08-22 by moon#639; waiver retired, entry kept as a live
+  # assertion that EXEC returns one slot per queued command.
   - name: empty_config_get_in_multi
     command: "CONFIG GET no-such-parameter-at-all"
     policy: type_only
     contexts: [multi]
-    expect_diff:
-      reason: >-
-        Redis answers *1[%0]; Moon answers a bare *0 — CONFIG GET is never
-        queued inside MULTI at all, so EXEC returns an empty array. The reply
-        TYPE is correct in every context where the command actually runs
-        (standalone and pipeline both answer %0); this is the transaction
-        QUEUEING gap, not a reply-shape one.
-        STILL REPRODUCES 2026-08-12 after the MULTI queue gate landed — see
-        multi_queues_config_get for the same unexplained residual.
-        Owner: multi-exec-queue-semantics.
 
   - name: empty_smembers_is_still_a_set
     setup: ["DEL nosuchset"]
@@ -375,12 +361,10 @@ entries:
   - name: shapes_acl_getuser
     command: "ACL GETUSER default"
     policy: type_only
-    # `multi` is excluded on purpose: ACL is a further member of the
-    # transaction-queueing bypass class already waived on config_get_in_multi
-    # (moon answers the reply inline instead of +QUEUED, so EXEC returns *0).
-    # Measured 2026-08-22, same class, not a reply-shape defect.
-    # Owner: multi-exec-queue-semantics.
-    contexts: [standalone, pipeline]
+    # `multi` restored 2026-08-22 by moon#639: ACL was a member of the
+    # transaction-queueing bypass class and now queues like everything else,
+    # so this case is exercisable in a transaction again.
+    contexts: [standalone, pipeline, multi]
     expect_diff:
       reason: >-
         NARROWED by moon#631: the reply TYPE is now correct — both servers
@@ -404,23 +388,20 @@ entries:
   # told yes-and-you-are-in on a wide-open server. Both now answer the same
   # error, byte for byte, so this is an `exact` live assertion.
   #
-  # `standalone, pipeline` only — inside MULTI, `AUTH` is a member of the
-  # transaction-queueing bypass class tracked by moon#639 (it answers inline
-  # instead of `+QUEUED`), which has nothing to do with the reply itself.
+  # `multi` restored 2026-08-22 by moon#639: AUTH was a member of the
+  # transaction-queueing bypass class and now answers `+QUEUED`, so the same
+  # byte-for-byte error is assertable from inside a transaction too.
   - name: auth_without_password_configured
     command: "AUTH probe-only-not-a-real-credential"
     policy: exact
-    contexts: [standalone, pipeline]
 
   - name: acl_users_lists_registered_usernames
     command: "ACL USERS"
     policy: sorted
-    contexts: [standalone, pipeline]
 
   - name: acl_help_is_not_a_missing_subcommand
     command: "ACL HELP"
     policy: type_only
-    contexts: [standalone, pipeline]
     expect_diff:
       reason: >-
         FIXED in moon#640 to the extent Moon can: `ACL HELP` was unimplemented
@@ -458,19 +439,16 @@ entries:
   # dispatches on. Live assertions, never waivers: they are the regression
   # guard for a class that took a wire-level sweep to see at all.
   #
-  # `standalone, pipeline` only. Inside MULTI, `CLIENT` and `INFO` are
-  # intercept-only families in Moon and execute immediately instead of
-  # queueing — a transaction-queueing divergence already owned by
-  # multi-exec-queue-semantics, which this entry must not re-litigate.
+  # `multi` restored 2026-08-22 by moon#639: `CLIENT` (and `INFO` before it)
+  # queue like every other command now, so the reply type is assertable from
+  # inside a transaction as well.
   - name: verbatim_info
     command: "INFO server"
     policy: type_only
-    contexts: [standalone, pipeline]
 
   - name: verbatim_client_list
     command: "CLIENT LIST"
     policy: type_only
-    contexts: [standalone, pipeline]
 
   - name: verbatim_lolwut
     command: "LOLWUT"

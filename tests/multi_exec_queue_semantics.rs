@@ -651,23 +651,26 @@ fn me10b_unregistered_dotted_commands_still_queue() {
 }
 
 // ---------------------------------------------------------------------------
-// me10c — intercept-only commands must not be queued into a guaranteed error.
+// me10c — no connection-intercept family may end up as an error inside EXEC.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn me10c_intercept_only_commands_are_not_queued_into_an_error() {
+fn me10c_no_intercept_family_ends_up_as_an_error_inside_exec() {
     // LATENCY is deliberately NOT in this list: it errors outside a
     // transaction too (Moon does not implement it), so including it would have
     // hidden an unimplemented command behind a transaction exemption.
     //
     // These reach a connection-level intercept and never `dispatch()`, so the
-    // transaction executor cannot replay them. Redis queues and runs them all;
-    // Moon cannot yet, so it keeps executing them immediately — the
-    // pre-existing divergence the compat manifest waives.
+    // transaction executor cannot replay them. moon#639 made them queue and
+    // run at EXEC anyway, via a post-pass that fills the slot the executor
+    // left; `me12` asserts that stronger property directly.
     //
-    // What must NEVER happen is the middle state: queueing them into an
-    // `-ERR unknown command` inside EXEC. That turns data into an error, which
-    // is strictly worse than the divergence it replaced.
+    // This test is the FLOOR beneath it, and it is kept deliberately weak so
+    // it keeps holding if the mechanism is ever traded for another one: what
+    // must NEVER happen is the middle state, where a family that works outside
+    // MULTI is queued into an `-ERR unknown command` inside EXEC. That turns
+    // data into an error, which is strictly worse than the divergence #639
+    // replaced.
     let m = spawn_moon("1");
     for cmd in [
         &["CONFIG", "GET", "maxmemory"][..],
@@ -721,5 +724,272 @@ fn me11_queue_semantics_hold_at_four_shards() {
             .send(&["GET", "me11:crossshard:key"])
             .starts_with("$-1"),
         "a cross-shard write in an aborted transaction must not apply either"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// me12 — moon#639. The families me10c merely tolerated must actually QUEUE.
+// ---------------------------------------------------------------------------
+
+/// Leading `*N` of a RESP array reply, or `None` if the reply is not an array.
+fn array_len(reply: &str) -> Option<i64> {
+    let rest = reply.strip_prefix('*')?;
+    let end = rest.find("\r\n")?;
+    rest[..end].parse().ok()
+}
+
+#[test]
+fn me12_intercept_only_commands_queue_and_appear_in_exec() {
+    // me10c pinned the floor: these must not become an ERROR inside EXEC.
+    // This pins the CEILING that Redis actually implements: they must reply
+    // `+QUEUED` and occupy a slot in the EXEC array, like every other command.
+    //
+    // Measured against redis-server 8.6.1 (moon#639): every row below answers
+    // `+QUEUED`. Moon answered with the command's real reply and then returned
+    // `*0` from EXEC — a client that queued three commands read an array of
+    // zero, so `pipeline.execute()` in every library either mis-zips its
+    // results or raises.
+    let m = spawn_moon("1");
+    for cmd in [
+        &["ACL", "WHOAMI"][..],
+        &["ACL", "LIST"][..],
+        &["ACL", "CAT"][..],
+        &["ACL", "GETUSER", "default"][..],
+        &["CONFIG", "GET", "maxmemory"][..],
+        &["CLIENT", "GETNAME"][..],
+        &["CLIENT", "INFO"][..],
+        &["CLUSTER", "INFO"][..],
+        &["SCRIPT", "EXISTS", "deadbeef"][..],
+        &["WAIT", "0", "0"][..],
+        &["PUBSUB", "CHANNELS"][..],
+        &["HELLO", "2"][..],
+    ] {
+        let mut c = Conn::open(m.port);
+        c.send(&["MULTI"]);
+        let queued = c.send(cmd);
+        assert!(
+            queued.starts_with("+QUEUED"),
+            "{cmd:?} must QUEUE inside MULTI, not execute inline. \
+             redis-server 8.6.1 answers +QUEUED; got {queued:?}"
+        );
+        let exec = c.send(&["EXEC"]);
+        assert_eq!(
+            array_len(&exec),
+            Some(1),
+            "EXEC must return one slot for the one queued command {cmd:?}; \
+             a shorter array silently mis-aligns every client that zips \
+             replies to queued commands. got {exec:?}"
+        );
+        assert!(
+            !exec.contains("unknown command") && !exec.contains("EXECABORT"),
+            "{cmd:?} must EXECUTE at EXEC time, not error. got {exec:?}"
+        );
+    }
+}
+
+#[test]
+fn me12b_exec_array_length_equals_the_number_of_queued_commands() {
+    // The mixed case is the one that actually breaks clients: a transaction
+    // interleaving keyspace commands with intercepted ones must return one
+    // slot per queued command, IN ORDER. With the inline bug the intercepted
+    // rows vanished from the array and every later reply shifted up one.
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    c.send(&["MULTI"]);
+    for cmd in [
+        &["SET", "me12k", "v1"][..],
+        &["CONFIG", "GET", "maxmemory"][..],
+        &["GET", "me12k"][..],
+        &["CLIENT", "GETNAME"][..],
+        &["INCR", "me12n"][..],
+    ] {
+        let r = c.send(cmd);
+        assert!(r.starts_with("+QUEUED"), "{cmd:?} -> {r:?}");
+    }
+    let exec = c.send(&["EXEC"]);
+    assert_eq!(
+        array_len(&exec),
+        Some(5),
+        "five queued commands must produce a five-element EXEC array; got {exec:?}"
+    );
+    // Order check: the LAST slot is INCR's `:1`. If the intercepted rows were
+    // dropped the array would be short AND this would land in a different
+    // position, so asserting the tail catches a silent re-ordering that a
+    // length check alone would miss.
+    assert!(
+        exec.trim_end().ends_with(":1"),
+        "the final slot must be INCR's reply, in queue order; got {exec:?}"
+    );
+}
+
+#[test]
+fn me12c_config_set_in_multi_does_not_survive_discard() {
+    // The sharpest consequence of executing at queue time: the command TAKES
+    // EFFECT even though the client abandoned the transaction. A client that
+    // builds a MULTI, hits an application-level error, and DISCARDs has every
+    // right to expect the server unchanged.
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    let before = c.send(&["CONFIG", "GET", "maxmemory"]);
+
+    c.send(&["MULTI"]);
+    let queued = c.send(&["CONFIG", "SET", "maxmemory", "123456789"]);
+    assert!(
+        queued.starts_with("+QUEUED"),
+        "CONFIG SET must queue, not apply immediately; got {queued:?}"
+    );
+    c.send(&["DISCARD"]);
+
+    let after = c.send(&["CONFIG", "GET", "maxmemory"]);
+    assert_eq!(
+        before, after,
+        "DISCARD must leave maxmemory untouched. Executing CONFIG SET at queue \
+         time makes DISCARD a no-op for the mutation, which is a server-state \
+         change the client explicitly revoked."
+    );
+}
+
+#[test]
+fn me12d_client_setname_in_multi_does_not_survive_discard() {
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    c.send(&["CLIENT", "SETNAME", "original"]);
+
+    c.send(&["MULTI"]);
+    let queued = c.send(&["CLIENT", "SETNAME", "hijacked"]);
+    assert!(
+        queued.starts_with("+QUEUED"),
+        "CLIENT SETNAME must queue; got {queued:?}"
+    );
+    c.send(&["DISCARD"]);
+
+    let name = c.send(&["CLIENT", "GETNAME"]);
+    assert!(
+        name.contains("original"),
+        "DISCARD must leave the connection name unchanged; got {name:?}"
+    );
+}
+
+#[test]
+fn me12e_auth_in_multi_does_not_change_identity_through_discard() {
+    // The sharpest member of the family. `AUTH` is intercepted far above the
+    // queue gate — it has to be, so an unauthenticated client can reach it —
+    // and that is exactly why it used to execute at queue time. A client could
+    // therefore change its authenticated identity in the MIDDLE of a
+    // transaction whose already-queued commands were authorized under the
+    // previous identity, and `DISCARD` did not undo it.
+    // A second ACL user rather than `--requirepass`: the readiness probe PINGs,
+    // and a password on the default user answers that PING `-NOAUTH`, so the
+    // harness would never see the server come up. Same property, no instrument
+    // problem.
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    assert!(
+        c.send(&["ACL", "SETUSER", "alt", "on", ">altpass", "~*", "+@all"])
+            .starts_with("+OK")
+    );
+    let before = c.send(&["ACL", "WHOAMI"]);
+    assert!(before.contains("default"), "baseline identity: {before:?}");
+
+    c.send(&["MULTI"]);
+    let queued = c.send(&["AUTH", "alt", "altpass"]);
+    assert!(
+        queued.starts_with("+QUEUED"),
+        "AUTH must queue inside MULTI, not authenticate immediately; got {queued:?}"
+    );
+    c.send(&["DISCARD"]);
+
+    let after = c.send(&["ACL", "WHOAMI"]);
+    assert_eq!(
+        before, after,
+        "DISCARD must leave the connection's identity untouched"
+    );
+}
+
+#[test]
+fn me12f_an_aborted_exec_runs_no_intercepts_either() {
+    // moon#639 runs the queued intercepts AFTER the keyspace body precisely so
+    // that a WATCH conflict — which aborts before the body runs — skips them
+    // too. Running them first would make an aborted transaction still apply
+    // its CONFIG SET, which is the bug this issue is about wearing a different
+    // hat.
+    let m = spawn_moon("1");
+    let mut watcher = Conn::open(m.port);
+    let mut other = Conn::open(m.port);
+
+    watcher.send(&["SET", "me12f", "v0"]);
+    let before = watcher.send(&["CONFIG", "GET", "maxmemory"]);
+    watcher.send(&["WATCH", "me12f"]);
+    watcher.send(&["MULTI"]);
+    assert!(
+        watcher
+            .send(&["CONFIG", "SET", "maxmemory", "987654321"])
+            .starts_with("+QUEUED")
+    );
+    assert!(watcher.send(&["GET", "me12f"]).starts_with("+QUEUED"));
+
+    // Break the watch from another connection.
+    other.send(&["SET", "me12f", "v1"]);
+
+    let exec = watcher.send(&["EXEC"]);
+    assert!(
+        exec.starts_with("*-1"),
+        "a broken WATCH must abort EXEC with a null array; got {exec:?}"
+    );
+    let after = watcher.send(&["CONFIG", "GET", "maxmemory"]);
+    assert_eq!(
+        before, after,
+        "an aborted EXEC must not apply a queued CONFIG SET"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// me12g — a queued HELLO switches the protocol at the EXEC reply, not at the
+// start of the batch.
+// ---------------------------------------------------------------------------
+
+/// `HELLO 3` runs from the `EXEC` post-pass, where the intercept writes into a
+/// LOCAL one-element vec — so the "index this reply will occupy" it would
+/// otherwise derive is `0`, the START of the outer batch. Recording the switch
+/// there re-encodes replies the client already had answered under RESP2.
+///
+/// The probe sends ONE pipelined batch. `COMMAND DOCS GET` is the
+/// discriminator: RESP2 answers a flat array (`*2`), RESP3 a Map (`%1`). It is
+/// answered before `MULTI` is even read, so its reply can only be RESP2 — a
+/// leading `%` means the switch was recorded at index 0 and the encoder
+/// re-typed a reply the client had already been promised in RESP2.
+///
+/// The discriminator matters more than the assertion here: `HGETALL`, `GEOPOS`,
+/// `ZSCORE` and `CONFIG GET` all LOOK like they would catch it and none of them
+/// do — they are either shaped at push time or answered off the inline path,
+/// so they never occupy a slot in the batch the encoder walks. Measured
+/// 2026-08-22 against a deliberately mutated build; `COMMAND DOCS`,
+/// `XINFO GROUPS` and `XPENDING` were the three that flipped.
+#[test]
+fn me12g_a_queued_hello_does_not_retroactively_upgrade_earlier_replies() {
+    let m = spawn_moon("1");
+    let mut c = Conn::open(m.port);
+    const BATCH: &[u8] = concat!(
+        "*3\r\n$7\r\nCOMMAND\r\n$4\r\nDOCS\r\n$3\r\nGET\r\n",
+        "*1\r\n$5\r\nMULTI\r\n",
+        "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n",
+        "*1\r\n$4\r\nEXEC\r\n",
+    )
+    .as_bytes();
+    let reply = c.send_raw(BATCH);
+    assert!(
+        reply.starts_with('*'),
+        "the COMMAND DOCS answered before MULTI was even read must stay RESP2 \
+         (a flat array); a leading %% means the queued HELLO recorded its \
+         protocol switch at the start of the batch instead of at the EXEC \
+         reply. got {reply:?}"
+    );
+    assert!(
+        reply.contains("+OK\r\n") && reply.contains("+QUEUED\r\n"),
+        "MULTI and the queued HELLO must both be in the same batch reply; got {reply:?}"
+    );
+    assert!(
+        reply.contains("proto"),
+        "the EXEC array must carry HELLO's own answer; got {reply:?}"
     );
 }

@@ -291,6 +291,18 @@ pub(crate) fn execute_transaction(
 
         // C2: PUBLISH queued inside MULTI — defer fan-out to the caller so it
         // happens after the transaction body (see execute_transaction_sharded).
+        //
+        // moon#639 deliberately does NOT leave intercept placeholders here.
+        // This executor has exactly one caller — `handler_single`, the
+        // single-shard tokio / embedded path — and that handler runs its
+        // AUTH / HELLO / ACL / CLIENT / CONFIG / WAIT intercepts ABOVE its
+        // MULTI gate, so those never reach this loop at all. The families it
+        // does queue (CLUSTER, SCRIPT, PUBSUB) reach `dispatch()` below and
+        // answer for real; a placeholder here would replace a working reply
+        // with a Null nobody fills. `handler_single` keeps the queue-time
+        // divergence for its six intercepted families — it is a library entry
+        // point, not the shipped server path, and `embedded.rs` already steers
+        // transactional embedders to the sharded handler.
         if queue_exec_publish(cmd, cmd_args, &mut results, exec_publishes) {
             continue;
         }
@@ -447,6 +459,17 @@ pub(crate) fn execute_transaction_sharded(
         // table can't run it. Record it for the caller to fan out AFTER the
         // transaction body (all preceding writes applied first) and leave a
         // placeholder the caller patches with the receiver count.
+        // moon#639: a connection-level intercept (CONFIG, CLIENT, ACL,
+        // CLUSTER, SCRIPT, WAIT, PUBSUB, AUTH, HELLO) queues like any other
+        // command but cannot be replayed through `dispatch()`. Leave its slot
+        // and let the caller — which HAS the connection — fill it in. Keeping
+        // the slot here is what makes the EXEC array one-per-queued-command
+        // regardless of which executor ran the body.
+        if is_txn_connection_intercept(cmd) {
+            results.push(TXN_INTERCEPT_PLACEHOLDER);
+            continue;
+        }
+
         if queue_exec_publish(cmd, cmd_args, &mut results, exec_publishes) {
             continue;
         }
@@ -2061,49 +2084,72 @@ pub(crate) fn is_transaction_control(cmd: &[u8]) -> bool {
     CONTROL.iter().any(|c| cmd.eq_ignore_ascii_case(c))
 }
 
-/// Commands the transaction executor CANNOT run, so queueing them would turn a
-/// working command into a guaranteed error inside `EXEC`.
+/// Commands that queue inside `MULTI` but are executed by the CONNECTION at
+/// `EXEC` time rather than by the transaction executor.
 ///
-/// `execute_transaction` replays the queue through `dispatch()`. These commands
-/// are connection-level *intercepts* — they never reach `dispatch()` at all, so
-/// a queued one comes back as `-ERR unknown command`. Measured 2026-08-12 by
-/// queueing each inside a MULTI and reading the EXEC array:
+/// These are connection-level *intercepts*: they never reach `dispatch()`, so
+/// the executor cannot replay them the way it replays a keyspace command. They
+/// also touch no keyspace data, so they do not need the executor's database
+/// lock — what they need is the `ConnectionState` / `ConnectionContext` the
+/// executor does not have (and, on a routed body, is not even on the same
+/// thread as).
 ///
-/// ```text
-/// CONFIG · CLIENT · ACL · CLUSTER · SCRIPT · WAIT          -> unknown command
-/// INFO · SLOWLOG · PUBLISH · MEMORY · DEBUG · COMMAND · OBJECT -> execute fine
-/// ```
+/// The executor pushes a placeholder into the result array for each of these
+/// and the caller overwrites that slot with the real reply, so the array keeps
+/// one slot per queued command, in queue order. See `run_txn_intercepts`.
 ///
-/// Redis queues all of them and runs them properly. Moon cannot yet, so these
-/// keep EXECUTING immediately — the pre-existing divergence, which the
-/// client-compat manifest already waives — rather than queueing into a hard
-/// error. That is strictly better than the alternative: before the queue gate a
-/// client got its data with the wrong reply shape; queueing it unconditionally
-/// gave them an error instead, which is a regression, not a narrowing.
+/// **Ordering divergence, deliberate and bounded** (moon#639): the placeholders
+/// are filled AFTER the keyspace body commits, not interleaved with it. Redis
+/// runs the whole queue in order. Doing the same here would mean either running
+/// connection-level code inside the executor's database lock or on a shard
+/// thread that has no connection, so the side effects of these commands land
+/// after the body's. The client-visible array shape and order are unaffected,
+/// and running them after the body is what makes an aborted `EXEC` (a `WATCH`
+/// conflict) skip them entirely — which is the property worth having.
 ///
-/// `LATENCY` looked like a member and is NOT: it errors outside a transaction
-/// too, because Moon does not implement it at all. Exempting it would have
-/// papered over nothing and hidden a genuine unimplemented command.
+/// Before moon#639 these commands did not queue at all: they executed at QUEUE
+/// time, delivered their reply mid-transaction, and left no slot in the `EXEC`
+/// array — so `MULTI / CONFIG SET maxmemory 0 / DISCARD` applied the change the
+/// client had revoked, and a client that queued three commands read `*0`.
 ///
-/// `PUBSUB` was absent from `COMMAND_META` when this list was written, so
-/// `queue_time_rejection` would have called it an unknown command and poisoned
-/// the transaction — it has no dot, so the dotted carve-out missed it. That is
-/// exactly the regression class the §1 ⚠ assumption named, and it is handled by
-/// `queue_time_rejection` consulting this list rather than by exempting
-/// `PUBSUB` from queueing. **moon#635 registered `PUBSUB` (it was a command
-/// Moon answered but never published), so that specific hole is closed at the
-/// source too** — the belt-and-braces reading of this list is unchanged, and
-/// the next unregistered container to land here would hit the same trap.
-///
-/// Removing an entry from this list requires teaching `execute_transaction` to
-/// run it. The test `me10` asserts every queued command's EXEC result is not an
-/// error, so a premature removal fails loudly.
-pub(crate) fn is_intercept_only(cmd: &[u8]) -> bool {
-    const INTERCEPT_ONLY: [&[u8]; 7] = [
-        b"CONFIG", b"CLIENT", b"ACL", b"CLUSTER", b"SCRIPT", b"WAIT", b"PUBSUB",
+/// `AUTH` and `HELLO` are members even though they are intercepted far above
+/// the queue gate (they must be, to work unauthenticated). Their intercepts
+/// skip themselves while `conn.in_multi`, which is safe because being in a
+/// transaction already implies being authenticated.
+pub(crate) fn is_txn_connection_intercept(cmd: &[u8]) -> bool {
+    const CONNECTION_INTERCEPTS: [&[u8]; 9] = [
+        b"CONFIG", b"CLIENT", b"ACL", b"CLUSTER", b"SCRIPT", b"WAIT", b"PUBSUB", b"AUTH", b"HELLO",
     ];
-    INTERCEPT_ONLY.iter().any(|c| cmd.eq_ignore_ascii_case(c))
+    CONNECTION_INTERCEPTS
+        .iter()
+        .any(|c| cmd.eq_ignore_ascii_case(c))
 }
+
+/// Snapshot the queue for [`fill_txn_intercept_slots`], or an empty `Vec` when
+/// the body holds no connection-level intercept (moon#639).
+///
+/// The filler needs the queue AND `&mut conn`, and the queue lives on the
+/// connection — so it has to be copied out first. Copying only when there is
+/// something to fill keeps an ordinary `EXEC` allocation-free on this path.
+///
+/// [`fill_txn_intercept_slots`]: crate::server::conn::handler_monoio::dispatch::fill_txn_intercept_slots
+#[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
+pub(crate) fn txn_intercept_snapshot(queue: &[Frame]) -> Vec<Frame> {
+    if queue
+        .iter()
+        .filter_map(crate::server::conn::util::extract_command)
+        .any(|(c, _)| is_txn_connection_intercept(c))
+    {
+        queue.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+/// The placeholder the executor leaves for a [`is_txn_connection_intercept`]
+/// command, for the caller to overwrite. Never reaches a client: `EXEC` on any
+/// path either fills every placeholder or aborts the whole array.
+pub(crate) const TXN_INTERCEPT_PLACEHOLDER: Frame = Frame::Null;
 
 /// Validate a command at QUEUE time, the way Redis does before storing it.
 ///

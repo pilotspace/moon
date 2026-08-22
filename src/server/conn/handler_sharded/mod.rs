@@ -86,6 +86,7 @@ mod ft;
 mod pubsub;
 mod read;
 mod txn;
+mod txn_intercepts;
 mod write;
 
 /// Result of `handle_connection_sharded_inner` execution.
@@ -839,47 +840,37 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // pre-auth gate above handles them only while
                     // UNauthenticated; this is the post-authentication path.
                     // --- AUTH (already conn.authenticated) ---
-                    if cmd.eq_ignore_ascii_case(b"AUTH") {
-                        let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
-                        if let Some(uname) = opt_user {
-                            conn.adopt_user(uname, &ctx.acl_table);
-                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                crate::auth_ratelimit::record_success(addr.ip());
-                            }
-                        } else if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                            auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
-                        }
-                        responses.push(response);
+                    // moon#639: steps aside inside MULTI so the queue gate
+                    // below sees it and EXEC runs it. Safe because being in a
+                    // transaction already implies being authenticated.
+                    if !conn.in_multi
+                        && txn_intercepts::try_handle_auth(
+                            cmd,
+                            cmd_args,
+                            &mut conn,
+                            ctx,
+                            &peer_addr,
+                            &mut auth_delay_ms,
+                            &mut responses,
+                        )
+                    {
                         continue;
                     }
 
                     // --- HELLO ---
-                    if cmd.eq_ignore_ascii_case(b"HELLO") {
-                        let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
-                            cmd_args, conn.protocol_version, client_id, &ctx.acl_table, &mut conn.authenticated,
-                            crate::command::identity::hello_role_and_mode(
-                                ctx.repl_state.as_ref(),
-                                ctx.cluster_state.is_some(),
-                            ),
-                        );
-                        if !matches!(&response, Frame::Error(_)) {
-                            crate::server::conn::shared::note_protocol_switch(&mut conn, responses.len(), new_proto);
-                            conn.protocol_version = new_proto;
-                        }
-                        if let Some(name) = new_name { conn.client_name = Some(name); }
-                        if let Some(ref uname) = opt_user {
-                            conn.adopt_user(uname.clone(), &ctx.acl_table);
-                        }
-                        if matches!(&response, Frame::Error(_)) {
-                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
-                            }
-                        } else if opt_user.is_some() {
-                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                crate::auth_ratelimit::record_success(addr.ip());
-                            }
-                        }
-                        responses.push(response);
+                    if !conn.in_multi
+                        && txn_intercepts::try_handle_hello(
+                            cmd,
+                            cmd_args,
+                            &mut conn,
+                            ctx,
+                            client_id,
+                            &peer_addr,
+                            &mut auth_delay_ms,
+                            responses.len(),
+                            &mut responses,
+                        )
+                    {
                         continue;
                     }
 
@@ -976,10 +967,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // The replication handshake verbs are exempt. A replica
                     // never opens a transaction, so queueing them could only
                     // ever break a handshake — and no test covers that.
-                    if conn.in_multi
-                        && !is_transaction_control(cmd)
-                        && !crate::server::conn::shared::is_intercept_only(cmd)
-                    {
+                    if conn.in_multi && !is_transaction_control(cmd) {
                         // FT.* vector commands aren't wired through the txn
                         // execution path; reject them explicitly inside MULTI
                         // (matches handler_single) rather than failing later.
@@ -1072,54 +1060,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     crate::monitor::feed_frames(conn.selected_db, &peer_addr, cmd, cmd_args);
 
                     // --- CLUSTER subcommands ---
-                    if cmd.eq_ignore_ascii_case(b"CLUSTER") {
-                        if let Some(ref cs) = ctx.cluster_state {
-                            #[allow(clippy::unwrap_used)] // Fallback "127.0.0.1:6379" is a valid literal
-                            let self_addr: std::net::SocketAddr =
-                                format!("127.0.0.1:{}", ctx.config_port)
-                                    .parse()
-                                    .unwrap_or_else(|_| "127.0.0.1:6379".parse().unwrap());
-                            let resp = crate::cluster::command::handle_cluster_command(
-                                cmd_args, cs, self_addr,
-                            );
-                            // CLUSTER REPLICATE must actually replicate rather
-                            // than only relabel the node — see the monoio path.
-                            if matches!(resp, Frame::SimpleString(ref ok) if ok.as_ref() == b"OK")
-                                && let Some((host, port)) =
-                                    crate::cluster::command::cluster_replicate_target(cmd_args, cs)
-                                && let Some(ref rs) = ctx.repl_state
-                            {
-                                rs.write().set_role(
-                                    crate::replication::state::ReplicationRole::Replica {
-                                        host: host.clone(),
-                                        port,
-                                        state:
-                                            crate::replication::handshake::ReplicaHandshakeState::PingPending,
-                                    },
-                                );
-                                let epoch =
-                                    crate::replication::replica::bump_replica_task_epoch();
-                                let cfg = crate::replication::replica::ReplicaTaskConfig {
-                                    master_host: host,
-                                    master_port: port,
-                                    repl_state: std::sync::Arc::clone(rs),
-                                    num_shards: ctx.num_shards,
-                                    persistence_dir: None,
-                                    listening_port: 0,
-                                    epoch,
-                                    stream_db: std::sync::atomic::AtomicUsize::new(0),
-                                    shard_databases: ctx.shard_databases.clone(),
-                                };
-                                tokio::task::spawn_local(
-                                    crate::replication::replica::run_replica_task(cfg),
-                                );
-                            }
-                            responses.push(resp);
-                        } else {
-                            responses.push(Frame::Error(Bytes::from_static(
-                                b"ERR This instance has cluster support disabled",
-                            )));
-                        }
+                    if txn_intercepts::try_handle_cluster(cmd, cmd_args, ctx, &mut responses) {
                         continue;
                     }
 
@@ -1179,17 +1120,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- SCRIPT subcommands ---
-                    if cmd.eq_ignore_ascii_case(b"SCRIPT") {
-                        let (response, fanout) = crate::scripting::handle_script_subcommand(&ctx.script_cache, cmd_args);
-                        if let Some((sha1, script_bytes)) = fanout {
-                            // E3: bounded fan-out — a full ring no longer
-                            // silently diverges that shard's script cache.
-                            crate::server::conn::shared::script_fanout_bounded(
-                                ctx, &shutdown, &sha1, &script_bytes,
-                            )
-                            .await;
-                        }
-                        responses.push(response);
+                    if txn_intercepts::try_handle_script(
+                        cmd,
+                        cmd_args,
+                        ctx,
+                        &shutdown,
+                        &mut responses,
+                    )
+                    .await
+                    {
                         continue;
                     }
 
@@ -1251,11 +1190,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // exactly the invariant the code above it violated.
 
                     // --- ACL ---
-                    if cmd.eq_ignore_ascii_case(b"ACL") {
-                        let response = crate::command::acl::handle_acl(
-                            cmd_args, &ctx.acl_table, &mut conn.acl_log, &conn.current_user, &peer_addr, &ctx.runtime_config, client_id,
-                        );
-                        responses.push(response);
+                    if txn_intercepts::try_handle_acl(
+                        cmd,
+                        cmd_args,
+                        client_id,
+                        &mut conn,
+                        ctx,
+                        &peer_addr,
+                        &mut responses,
+                    ) {
                         continue;
                     }
 
@@ -1505,7 +1448,7 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                     // --- MULTI / EXEC_CMD / DISCARD ---
                     let mut exec_publishes: Vec<(usize, Bytes, Bytes)> = Vec::new();
-                    if write::try_handle_multi_exec(cmd, cmd_args, &mut conn, ctx, &mut responses, &mut exec_publishes).await {
+                    if write::try_handle_multi_exec(cmd, cmd_args, &mut conn, ctx, &mut responses, &mut exec_publishes, &shutdown).await {
                         // C2: PUBLISH queued inside MULTI fans out only now — after the
                         // transaction body has been applied — and its placeholder in the
                         // EXEC reply array is patched with the real receiver count.

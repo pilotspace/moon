@@ -1712,7 +1712,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // gating HELLO would break the RESP3 handshake. `check_auth_gate`
             // above only handles them while UNauthenticated, so these are the
             // post-authentication path and must stay ahead of the gate.
-            if cmd_len == 4
+            //
+            // moon#639: both step aside while a transaction is open, so the
+            // queue gate below sees them and they run at EXEC instead. Safe
+            // precisely because `conn.in_multi` implies authenticated — MULTI
+            // itself does not reach this point unauthenticated — so stepping
+            // aside can never strand a client that still needs to AUTH.
+            if !conn.in_multi
+                && cmd_len == 4
                 && dispatch::try_handle_auth(
                     cmd,
                     cmd_args,
@@ -1725,7 +1732,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 continue;
             }
-            if cmd_len == 5
+            if !conn.in_multi
+                && cmd_len == 5
                 && dispatch::try_handle_hello(
                     cmd,
                     cmd_args,
@@ -1736,6 +1744,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     &mut auth_delay_ms,
                     shaped!(),
                     &mut codec,
+                    None,
                 )
             {
                 continue;
@@ -1803,10 +1812,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // This handler is the DEFAULT runtime (`runtime-monoio`). The
             // sharded/tokio handlers carry the identical gate — a fix in only
             // one of them is invisible to whichever job builds the other.
-            if conn.in_multi
-                && !is_transaction_control(cmd)
-                && !crate::server::conn::shared::is_intercept_only(cmd)
-            {
+            if conn.in_multi && !is_transaction_control(cmd) {
                 // FT.* isn't wired through the txn execution path; reject it
                 // explicitly rather than failing incidentally later.
                 if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
@@ -2169,6 +2175,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 ctx,
                 &mut responses,
                 &mut exec_publishes,
+                &shutdown,
+                &mut codec,
             )
             .await
             {

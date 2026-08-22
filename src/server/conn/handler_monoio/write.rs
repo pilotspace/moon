@@ -704,6 +704,7 @@ async fn mq_hop_or_local(
 /// the same group-commit path as normal writes (previously this path logged
 /// nothing, so every transactional write was lost on restart — including at
 /// `--shards 1` under the monoio TopLevel writer).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn try_handle_multi_exec(
     cmd: &[u8],
     args: &[Frame],
@@ -711,6 +712,11 @@ pub(super) async fn try_handle_multi_exec(
     ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
     exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
+    // moon#639: EXEC now runs the queued connection-level intercepts itself.
+    // `SCRIPT LOAD` needs the shutdown token for its bounded shard fan-out and
+    // `HELLO` needs the codec to switch protocol, so both travel down here.
+    shutdown: &crate::runtime::cancel::CancellationToken,
+    codec: &mut crate::server::codec::RespCodec,
 ) -> bool {
     // --- WATCH / UNWATCH ---
     // Before the MULTI queueing step below, so `WATCH` inside MULTI is refused
@@ -779,6 +785,13 @@ pub(super) async fn try_handle_multi_exec(
                     {
                         let commands: Vec<Frame> = conn.command_queue.to_vec();
                         conn.command_queue.clear();
+                        // moon#639: the owner shard cannot run connection-level
+                        // intercepts (no connection there), so it leaves a
+                        // placeholder per queued one and we fill them when the
+                        // reply comes back. Cloned only when the body actually
+                        // contains one, so an ordinary routed EXEC is unchanged.
+                        let queued_for_intercepts =
+                            crate::server::conn::shared::txn_intercept_snapshot(&commands);
                         // Keep a copy of the body for CLIENT TRACKING
                         // invalidation ONLY when tracking is active — the routed
                         // reply carries results, not the command frames, and the
@@ -860,6 +873,24 @@ pub(super) async fn try_handle_multi_exec(
                                 // cannot fan out from inside its own message
                                 // loop) and patch the result on a failed leg.
                                 let mut routed_result = r.result;
+                                // moon#639: the owner shard ran the keyspace
+                                // body and left a placeholder for every queued
+                                // connection-level intercept — it has no
+                                // connection to run them on. Fill them here,
+                                // where the connection lives.
+                                super::dispatch::fill_txn_intercept_slots(
+                                    &mut routed_result,
+                                    &queued_for_intercepts,
+                                    conn,
+                                    ctx,
+                                    shutdown,
+                                    codec,
+                                    // The outer index this EXEC reply will
+                                    // occupy — a queued HELLO records its
+                                    // protocol switch there, not at 0.
+                                    responses.len(),
+                                )
+                                .await;
                                 crate::shard::coordinator::broadcast_txn_flushes(
                                     &mut routed_result,
                                     &r.exec_flushes,
@@ -906,6 +937,24 @@ pub(super) async fn try_handle_multi_exec(
                 &mut exec_wakes,
                 &watched,
             );
+            // moon#639: fill the slots the executor left for connection-level
+            // intercepts. Snapshotted first because filling takes `&mut conn`
+            // and the queue lives on it; the clone happens only when the body
+            // actually contains an intercept.
+            {
+                let queued_for_intercepts =
+                    crate::server::conn::shared::txn_intercept_snapshot(&conn.command_queue);
+                super::dispatch::fill_txn_intercept_slots(
+                    &mut result,
+                    &queued_for_intercepts,
+                    conn,
+                    ctx,
+                    shutdown,
+                    codec,
+                    responses.len(),
+                )
+                .await;
+            }
             // moon#606: raise the wakes the body recorded. A producer queued
             // inside MULTI reaches none of the live write path's hooks, so
             // without this a `MULTI ; LPUSH k v ; EXEC` left a client blocked
