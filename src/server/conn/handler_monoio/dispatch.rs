@@ -1900,3 +1900,140 @@ pub(super) async fn try_handle_blocking<
     responses.clear();
     BlockingResult::Handled
 }
+
+/// Execute one queued connection-level intercept at `EXEC` time (moon#639).
+///
+/// The transaction executor cannot run these: they never reach `dispatch()`,
+/// they need `ConnectionState`/`ConnectionContext`, and on a routed body the
+/// executor is not even on this thread. It leaves a
+/// [`crate::server::conn::shared::TXN_INTERCEPT_PLACEHOLDER`] in the result
+/// array and the caller replaces that slot with what this returns.
+///
+/// The chain below is the SAME sequence, in the same order, that the main loop
+/// runs — `AUTH`/`HELLO` first (they are intercepted above the queue gate and
+/// skip themselves while `conn.in_multi`), then the rest. A family that gains a
+/// new intercept must be added in both places or its queued form answers
+/// "unknown command" while its live form works, which no single test would
+/// catch. `me12` drives every member of
+/// [`crate::server::conn::shared::is_txn_connection_intercept`] through `EXEC`
+/// and fails on an error reply, which is that test.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_txn_connection_intercept(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    client_id: u64,
+    conn: &mut ConnectionState,
+    ctx: &ConnectionContext,
+    peer_addr: &str,
+    shutdown: &crate::runtime::cancel::CancellationToken,
+    codec: &mut crate::server::codec::RespCodec,
+) -> Frame {
+    let proto = conn.protocol_version;
+    let mut out: Vec<Frame> = Vec::with_capacity(1);
+    // The delay an AUTH failure would impose on the live path. Inside EXEC
+    // there is no read loop to slow down, so it is collected and dropped:
+    // sleeping here would hold up the rest of the transaction's replies.
+    let mut auth_delay_ms: u64 = 0;
+
+    macro_rules! shaped {
+        () => {
+            &mut crate::server::conn::intercept::InterceptReplies::new(
+                &mut out, cmd, cmd_args, proto,
+            )
+        };
+    }
+
+    let handled = try_handle_auth(
+        cmd,
+        cmd_args,
+        conn,
+        ctx,
+        peer_addr,
+        &mut auth_delay_ms,
+        shaped!(),
+    ) || try_handle_hello(
+        cmd,
+        cmd_args,
+        conn,
+        ctx,
+        client_id,
+        peer_addr,
+        &mut auth_delay_ms,
+        shaped!(),
+        codec,
+    ) || try_handle_cluster(cmd, cmd_args, ctx, shaped!())
+        || try_handle_script(cmd, cmd_args, ctx, shutdown, shaped!()).await
+        || try_handle_acl(cmd, cmd_args, conn, ctx, peer_addr, shaped!())
+        || try_handle_config(cmd, cmd_args, ctx, shaped!())
+        || try_handle_wait(cmd, cmd_args, ctx, shaped!()).await
+        || try_handle_client_early(cmd, cmd_args, client_id, conn, shaped!())
+        || try_handle_client_tracking(cmd, cmd_args, client_id, conn, ctx, shaped!())
+        || try_handle_client_admin(cmd, cmd_args, client_id, conn, shaped!())
+        || super::pubsub::try_handle_pubsub_introspection(cmd, cmd_args, ctx, &mut out);
+
+    if !handled {
+        return Frame::Error(Bytes::from(format!(
+            "ERR unknown command '{}' inside MULTI/EXEC",
+            String::from_utf8_lossy(cmd)
+        )));
+    }
+    // An intercept pushes exactly one reply. Taking the LAST is defensive
+    // against one that pushes a preamble; taking `None` cannot happen when
+    // `handled` is true, but erroring beats indexing.
+    out.pop().unwrap_or_else(|| {
+        Frame::Error(Bytes::from_static(
+            b"ERR intercept produced no reply inside MULTI/EXEC",
+        ))
+    })
+}
+
+/// Replace every [`crate::server::conn::shared::TXN_INTERCEPT_PLACEHOLDER`] the
+/// executor left in an `EXEC` array with the intercept's real reply (moon#639).
+///
+/// Walks the QUEUE, not the result array, so the mapping from slot to command
+/// is the queue order the client saw — the executor pushes exactly one result
+/// per queued command, which is the invariant `me12b` pins.
+///
+/// A `NullArray` result is an aborted transaction (`WATCH` conflict): nothing
+/// in the body ran, so nothing in the intercepts may run either. Returning
+/// early here is what makes that true, and it is the reason the intercepts run
+/// after the body rather than before it.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn fill_txn_intercept_slots(
+    result: &mut Frame,
+    queue: &[Frame],
+    conn: &mut ConnectionState,
+    ctx: &ConnectionContext,
+    shutdown: &crate::runtime::cancel::CancellationToken,
+    codec: &mut crate::server::codec::RespCodec,
+) {
+    let Frame::Array(results) = result else {
+        return; // NullArray (aborted) or an error frame: no slots to fill.
+    };
+    if !queue
+        .iter()
+        .filter_map(crate::server::conn::util::extract_command)
+        .any(|(c, _)| crate::server::conn::shared::is_txn_connection_intercept(c))
+    {
+        return; // the common case: no intercepts queued, nothing to walk.
+    }
+    let client_id = conn.client_id;
+    // Cloned once per EXEC that actually has intercepts: `run_txn_connection_intercept`
+    // takes `&mut conn`, so the address cannot be borrowed out of it at the
+    // same time. Not a hot path.
+    let peer_addr = conn.peer_addr.clone();
+    for (i, frame) in queue.iter().enumerate() {
+        if i >= results.len() {
+            break;
+        }
+        let Some((c, a)) = crate::server::conn::util::extract_command(frame) else {
+            continue;
+        };
+        if !crate::server::conn::shared::is_txn_connection_intercept(c) {
+            continue;
+        }
+        results[i] =
+            run_txn_connection_intercept(c, a, client_id, conn, ctx, &peer_addr, shutdown, codec)
+                .await;
+    }
+}

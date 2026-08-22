@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Eight command families executed at queue time inside `MULTI` instead of at `EXEC`** (#639).
+  `CONFIG`, `CLIENT`, `ACL`, `CLUSTER`, `SCRIPT`, `WAIT`, `PUBSUB` and `AUTH`/`HELLO` are
+  *connection-level intercepts*: they are answered above `dispatch()` because they need the
+  connection's own state. The `MULTI` queue gate sat below them and consulted an exemption list,
+  so a queued `CONFIG SET maxmemory 123mb` ran **immediately**, answered `+OK` where the client
+  expected `+QUEUED`, and stayed in effect through `DISCARD`. `EXEC` then returned an array with
+  no slot for it — a client that indexes the `EXEC` reply by queue position read every subsequent
+  result off by one.
+
+  ```text
+  MULTI                          redis 8.6.1      moon before      moon after
+  CONFIG SET maxmemory 123mb     +QUEUED          +OK  (applied)   +QUEUED
+  SET k v                        +QUEUED          +QUEUED          +QUEUED
+  DISCARD                        +OK              +OK              +OK
+  CONFIG GET maxmemory           unchanged        123mb (leaked)   unchanged
+  GET k                          $-1              $-1              $-1
+  ```
+
+  The gate now exempts only `MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH`, and `AUTH`/`HELLO` skip
+  their own above-the-gate intercept while a transaction is open. The executor leaves one
+  placeholder per queued intercept, and the connection — which is the only thing that *can* run
+  them — fills those slots after the body commits. Running them after rather than before is what
+  keeps an aborted `EXEC` (a broken `WATCH`) side-effect free: it returns `*-1` and no intercept
+  runs at all. The residual is a documented ordering divergence — an intercept's side effect lands
+  after the keyspace body rather than interleaved with it — which no reply the client sees can
+  distinguish.
+
+  `handler_single` (the single-shard tokio / embedded library path, not the shipped server) keeps
+  the old queue-time behaviour for the six families it intercepts above its own gate; `embedded.rs`
+  already steers transactional embedders to the sharded handler. `SUBSCRIBE` inside `MULTI` remains
+  the inverse divergence: Moon refuses it at queue time, Redis queues it.
+
+  Three client-compat waivers are retired and become live parity assertions
+  (`multi_queues_config_get`, `empty_config_get_in_multi`), and `shapes_acl_getuser`,
+  `auth_without_password_configured`, `verbatim_info`, `verbatim_client_list`,
+  `acl_users_lists_registered_usernames` and `acl_help_is_not_a_missing_subcommand` regain the
+  `multi` context they had been excluded from for this reason.
+
 - **Every blocking pop invalidated nothing, so client-side caches went permanently stale** (#644).
   `try_handle_blocking` serves the keyspace-modifying half of `BLPOP`/`BRPOP`/`BLMPOP`/
   `BZPOPMIN`/`BZPOPMAX`/`BZMPOP`/`BLMOVE`/`BRPOPLPUSH` and pushes its own reply — and it was the
