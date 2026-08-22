@@ -101,6 +101,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extrapolates to roughly 2ms of global-lock hold per hangup. Same remedy as #613 (text index) and
   #614 (payload index); the reverse index costs one entry per (client, key) currently tracked,
   which is the same bound the forward map already carries.
+- **Every disconnect swept the whole pub/sub registry three times, under its exclusive lock**
+  (#651). `unsubscribe_all` / `sunsubscribe_all` had no record of which channels a subscriber had
+  joined, so teardown walked every channel in the registry — including for a connection subscribed
+  to nothing — while holding `pubsub_registry.write()`, which every shard's `PUBLISH` fan-out
+  blocks behind. Two things made it worse than the tracking-table analogue (#649): the channel map
+  has **no cap**, so there was no ceiling on the stall; and bare `UNSUBSCRIBE` reaches the same
+  sweep, making it a command-rate path and not only a connection-churn one.
+
+  A reverse index (`subscriber id -> channels joined`) for both the exact and sharded namespaces.
+  Measured with `bench_unsubscribe_all_cost_vs_channels` (`#[ignore]`d), 100 disconnects of
+  connections subscribed to nothing against a registry of *n* channels:
+
+  | channels | µs/disconnect before | after |
+  |---:|---:|---:|
+  | 1,000 | 1.50 | 0.007 |
+  | 2,000 | 3.04 | 0.005 |
+  | 4,000 | 6.01 | 0.005 |
+  | 8,000 | 12.89 | 0.006 |
+  | 16,000 | 25.40 | 0.006 |
+
+  `patterns` still sweeps: it is a `Vec` bounded by *distinct patterns*, not by subscribers.
 
 ## [0.8.6] — 2026-08-22
 
