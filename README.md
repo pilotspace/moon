@@ -376,7 +376,8 @@ Redis 8.6.1.*
 | **v0.8.3** | Connection plane at scale — idle conns 56.5 → 3.25 KB (−94%, task-exit parking + idle downshift + TLS diet), loud maxclients, striped registry, c1M-ready (1 M idle ≈ 3.3 GB) | **GA** |
 | **v0.8.4** | c1M follow-ups — TLS task-parking (47 → 26 KB idle), park/wake registry handoff, park-vs-error spin fix (RST'd parked conn no longer pins a shard) | **GA** |
 | **v0.8.5** | Durability hardening — AOF rewrites never drop acked writes (overflow spill + exactly-once snapshot cut, adversarially verified), fail-loud WAL mid-chain tears, sticky append/fsync degraded latches, deep-review wave (LFU/LRU arithmetic, cluster election, silent-failure hardening) | **GA** |
-| **v0.8.6** (current) | Wire parity + multi-shard correctness — RESP3 type/shape fidelity across the reply surface, cross-shard two-key writes refuse instead of silently discarding, one blocking wake hook instead of eight, ACL enforced inside Lua and on the inline fast path, container subcommands published in COMMAND LIST/INFO/DOCS | **GA** |
+| **v0.8.6** | Wire parity + multi-shard correctness — RESP3 type/shape fidelity across the reply surface, cross-shard two-key writes refuse instead of silently discarding, one blocking wake hook instead of eight, ACL enforced inside Lua and on the inline fast path, container subcommands published in COMMAND LIST/INFO/DOCS | **GA** |
+| **v0.8.7** (current) | `MULTI` queues every command — eight connection-intercept families (`CONFIG`, `CLIENT`, `ACL`, `CLUSTER`, `SCRIPT`, `WAIT`, `PUBSUB`, `AUTH`/`HELLO`) stop executing at queue time; blocking pops invalidate the key they served; three per-client teardown paths stop sweeping the whole collection (tracking table and pub/sub registry each under a lock every shard blocks behind) | **GA** |
 | **v0.9** | Horizontal scale — cluster-on-monoio + multi-shard replicas | planned |
 | **v1.0** | Every [`PRODUCTION-CONTRACT.md`](docs/PRODUCTION-CONTRACT.md) GA box ticked | gate |
 
