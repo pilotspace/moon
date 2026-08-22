@@ -6,6 +6,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Every blocking pop invalidated nothing, so client-side caches went permanently stale** (#644).
+  `try_handle_blocking` serves the keyspace-modifying half of `BLPOP`/`BRPOP`/`BLMPOP`/
+  `BZPOPMIN`/`BZPOPMAX`/`BZMPOP`/`BLMOVE`/`BRPOPLPUSH` and pushes its own reply — and it was the
+  one write path with no `invalidate_after_write` call. That call is hand-copied at **twelve**
+  other sites; the blocking path was a thirteenth nobody added it to, which is the same shape as
+  #623 (eight hand-copied wake hooks) one layer over. A RESP3 client with `CLIENT TRACKING ON`
+  that cached a list and had `BLPOP` drain it kept serving the old value forever. Measured against
+  redis-server 8.6.1 at `--shards 4`, hash-tagged keys, three non-blocking controls proving the
+  instrument:
+
+  ```text
+                     before            after / redis 8.6.1
+  LPOP     [control] PUSH              PUSH
+  ZPOPMIN  [control] PUSH              PUSH
+  LMPOP    [control] PUSH              PUSH
+  BLPOP              (nothing)         PUSH
+  BRPOP              (nothing)         PUSH
+  BLMPOP             (nothing)         PUSH
+  BZPOPMIN           (nothing)         PUSH
+  BZMPOP             (nothing)         PUSH
+  BLMOVE src         (nothing)         PUSH
+  BLMOVE dst         (nothing)         PUSH
+  BRPOPLPUSH src     (nothing)         PUSH
+  ```
+
+  The keys come from the **reply**, not the arguments, because a blocking command's arguments name
+  candidates and only one is served. Redis invalidates the served key alone and nothing at all on
+  timeout — both measured, both pinned: `BLPOP k1 k2` with `k1` empty leaves a client's cache of
+  `k1` intact, and a timed-out `BLPOP` pushes nothing. Reusing `written_keys` here would have
+  re-introduced #584 (invalidating keys a command only read) on a new path.
+
+  This also corrects PR #583, which listed `BLMPOP` and `BZMPOP` as covered: the key extractor was
+  taught about them and has passing unit tests, but the execution path never called it — which is
+  why a unit test could not see the gap and an end-to-end probe could.
+
+### Changed
+- **The consistency suite's null-type probes use hash-tagged keys** (#637). `BLMOVE %K %K-d` and
+  `BRPOPLPUSH %K %K-d` generated two keys that hash to different shards, so at `--shards >= 2`
+  moon correctly refused the move cross-shard (#570/#591) and the probe compared a routing refusal
+  against redis's `*-1` — a null-**type** assertion that was really measuring routing, failing for
+  a reason it was never written to test. `nulltype:{N}` co-locates both keys at any shard count.
+  Nine new tracking rows cover the blocking family, including the two directions a fix must NOT
+  break: an unserved candidate key, and a timed-out pop.
+
+
 ## [0.8.6] — 2026-08-22
 
 ### Security

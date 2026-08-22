@@ -1592,6 +1592,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 return (HandlerResult::Done, None);
                             }
                         };
+                    // moon#644: the blocking path modifies the keyspace, so it owes tracking
+                    // clients an invalidation exactly like every other write — it just never
+                    // sent one. Placed BEFORE the RESP3 conversion so the reply still has the
+                    // RESP2 shapes `blocking_served_keys` reads (the conversion rewrites
+                    // scores and containers, and the served key must not depend on which
+                    // protocol the client negotiated).
+                    crate::tracking::invalidation::invalidate_after_blocking_serve(
+                        &ctx.tracking_table,
+                        cmd,
+                        cmd_args,
+                        &blocking_response,
+                        conn.client_id,
+                    );
                         let blocking_response = apply_resp3_conversion(
                             cmd,
                             cmd_args,

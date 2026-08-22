@@ -1867,6 +1867,20 @@ pub(super) async fn try_handle_blocking<
         }
     };
 
+    // moon#644: the blocking path modifies the keyspace, so it owes tracking
+    // clients an invalidation exactly like every other write — it just never
+    // sent one. Placed BEFORE the RESP3 conversion so the reply still has the
+    // RESP2 shapes `blocking_served_keys` reads (the conversion rewrites
+    // scores and containers, and the served key must not depend on which
+    // protocol the client negotiated).
+    crate::tracking::invalidation::invalidate_after_blocking_serve(
+        &ctx.tracking_table,
+        cmd,
+        cmd_args,
+        &blocking_response,
+        conn.client_id,
+    );
+
     // moon#559 / moon#462: this is an INTERCEPT — it short-circuits the
     // dispatch exit where every other reply meets the RESP3 policy — so it
     // must apply that policy itself or the whole blocking family answers

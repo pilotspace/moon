@@ -874,7 +874,16 @@ nulltype_i=0
 null_probe() {
     local kind="$1"; shift
     nulltype_i=$((nulltype_i + 1))
-    local key="nulltype:${nulltype_i}"
+    # Hash-TAGGED (moon#637). Two of these probes are two-key commands whose
+    # second key is `%K-d`: `BLMOVE %K %K-d` and `BRPOPLPUSH %K %K-d`. With a
+    # bare `nulltype:N` the two keys hash to DIFFERENT shards at --shards >= 2,
+    # so moon correctly refuses the move cross-shard (moon#570/#591) and the
+    # probe compared a routing refusal against redis's `*-1` — a null-TYPE test
+    # that was really testing routing, and failed for a reason it was not
+    # written to measure. `{N}` makes `nulltype:{N}` and `nulltype:{N}-d` share
+    # a tag, so they co-locate at ANY shard count and the probe measures the
+    # null type again. The single-key probes are unaffected either way.
+    local key="nulltype:{${nulltype_i}}"
     local -a argv=()
     local a
     for a in "$@"; do argv+=("${a//%K/$key}"); done
@@ -1486,6 +1495,58 @@ assert_tracking "tracking: ZRANGESTORE SOURCE not invalidated" \
     "tz:a" "ZRANGE tz:a 0 -1" ZRANGESTORE tz:r tz:a 0 -1
 assert_tracking "tracking: ZRANGESTORE DEST invalidated [control]" \
     "tz:r" "ZRANGE tz:r 0 -1" ZRANGESTORE tz:r tz:a 0 -1
+
+# ---------------------------------------------------------------------------
+# moon#644 -- every BLOCKING pop modifies the keyspace and must invalidate.
+#
+# `try_handle_blocking` is a THIRTEENTH write path, and nobody gave it the
+# `invalidate_after_write` call that the other twelve carry by hand. So a
+# tracking client that cached a list and had BLPOP drain it kept serving the
+# stale value forever. Measured against redis 8.6.1: all eight rows below
+# pushed on redis and pushed NOTHING on moon.
+#
+# Keys are hash-tagged `{tb}` so each command's keys are co-located at ANY
+# `--shards N` (moon#637): an un-tagged pair would make this a routing test
+# instead of an invalidation test, and would pass for the wrong reason at
+# --shards 1 while being unable to run at all at --shards 4.
+#
+# Every row is seeded first, because a blocking command with no data PARKS --
+# and a parked probe measures the timeout path, not the serve path.
+# ---------------------------------------------------------------------------
+both DEL "tkb:{tb}:l1" "tkb:{tb}:l2" "tkb:{tb}:l3" "tkb:{tb}:z1" "tkb:{tb}:z2" "tkb:{tb}:mv" "tkb:{tb}:md"
+
+both RPUSH "tkb:{tb}:l1" a b
+assert_tracking "tracking: BLPOP invalidates the key it drained" \
+    "tkb:{tb}:l1" "LRANGE tkb:{tb}:l1 0 -1" BLPOP "tkb:{tb}:l1" 0
+both RPUSH "tkb:{tb}:l2" a b
+assert_tracking "tracking: BRPOP invalidates the key it drained" \
+    "tkb:{tb}:l2" "LRANGE tkb:{tb}:l2 0 -1" BRPOP "tkb:{tb}:l2" 0
+both RPUSH "tkb:{tb}:l3" a b
+assert_tracking "tracking: BLMPOP invalidates the key it popped" \
+    "tkb:{tb}:l3" "LRANGE tkb:{tb}:l3 0 -1" BLMPOP 0 1 "tkb:{tb}:l3" LEFT
+both ZADD "tkb:{tb}:z1" 1 m 2 n
+assert_tracking "tracking: BZPOPMIN invalidates the key it popped" \
+    "tkb:{tb}:z1" "ZRANGE tkb:{tb}:z1 0 -1" BZPOPMIN "tkb:{tb}:z1" 0
+both ZADD "tkb:{tb}:z2" 1 m 2 n
+assert_tracking "tracking: BZMPOP invalidates the key it popped" \
+    "tkb:{tb}:z2" "ZRANGE tkb:{tb}:z2 0 -1" BZMPOP 0 1 "tkb:{tb}:z2" MIN
+both RPUSH "tkb:{tb}:mv" a b
+assert_tracking "tracking: BLMOVE invalidates its SOURCE" \
+    "tkb:{tb}:mv" "LRANGE tkb:{tb}:mv 0 -1" BLMOVE "tkb:{tb}:mv" "tkb:{tb}:md" LEFT RIGHT 0
+both DEL "tkb:{tb}:mv" "tkb:{tb}:md"
+both RPUSH "tkb:{tb}:mv" a b
+assert_tracking "tracking: BLMOVE invalidates its DESTINATION" \
+    "tkb:{tb}:md" "LRANGE tkb:{tb}:md 0 -1" BLMOVE "tkb:{tb}:mv" "tkb:{tb}:md" LEFT RIGHT 0
+
+# The two directions a fix must NOT break. A hook that invalidated
+# unconditionally would pass every row above and fail both of these.
+both DEL "tkb:{tb}:u1" "tkb:{tb}:u2"
+both RPUSH "tkb:{tb}:u2" a
+assert_tracking "tracking: BLPOP leaves an UNSERVED candidate alone" \
+    "tkb:{tb}:u1" "LRANGE tkb:{tb}:u1 0 -1" BLPOP "tkb:{tb}:u1" "tkb:{tb}:u2" 0
+both DEL "tkb:{tb}:t1"
+assert_tracking "tracking: a TIMED-OUT BLPOP invalidates nothing" \
+    "tkb:{tb}:t1" "LRANGE tkb:{tb}:t1 0 -1" BLPOP "tkb:{tb}:t1" 0.1
 
 # Same-role commands must be untouched: every key they name IS written.
 assert_tracking "tracking: SET invalidates its key [control]" \
