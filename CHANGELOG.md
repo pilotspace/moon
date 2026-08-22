@@ -76,6 +76,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Total time to retire 4000 documents: 53.98ms -> 1.03ms (tag), 46.94ms -> 1.13ms (numeric). The
   trade-off is memory: one entry per (document, field) written, holding the values. Tag values are
   `Bytes` sharing the buffer already stored as the bitmap map's key; numerics are 8 bytes each.
+- **Every client disconnect swept the entire tracking table, holding the process-wide tracking
+  mutex** (#649). `TrackingTable::untrack_all` had no record of which keys a client had tracked, so
+  it walked all of them — even for a client that had tracked nothing. The tracking table is
+  deliberately one global mutex-guarded instance (a per-shard table drops cross-shard
+  invalidations), so the sweep did not merely cost the departing client: **every shard's
+  invalidation path blocked behind it**, and the stall grew with the table, capped at one million
+  keys. `untrack_all` runs from eight disconnect / `CLIENT TRACKING OFF` sites, so any client
+  closing its socket reached it.
+
+  A reverse index (`client_id -> keys it tracks`) makes teardown proportional to what the client
+  actually tracked. Measured with `bench_untrack_all_cost_vs_table_size` (`#[ignore]`d), timing
+  100 disconnects of clients that tracked nothing, against a table of *n* keys:
+
+  | tracked keys | µs/disconnect before | after |
+  |---:|---:|---:|
+  | 1,000 | 0.97 | 0.07 |
+  | 2,000 | 2.72 | 0.03 |
+  | 4,000 | 6.30 | 0.03 |
+  | 8,000 | 11.91 | 0.03 |
+  | 16,000 | 31.77 | 0.03 |
+
+  Linear before, flat after — so the win keeps growing toward the 1M cap, where the old path
+  extrapolates to roughly 2ms of global-lock hold per hangup. Same remedy as #613 (text index) and
+  #614 (payload index); the reverse index costs one entry per (client, key) currently tracked,
+  which is the same bound the forward map already carries.
 
 ## [0.8.6] — 2026-08-22
 

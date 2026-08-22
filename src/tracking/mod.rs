@@ -80,6 +80,16 @@ impl Default for TrackingState {
 pub struct TrackingTable {
     /// Normal mode: key -> set of (client_id, noloop)
     key_clients: HashMap<Bytes, Vec<(u64, bool)>>,
+    /// REVERSE index of `key_clients`: client_id -> the keys it currently tracks.
+    ///
+    /// Disconnect used to sweep every entry of `key_clients` looking for the
+    /// departing client, holding the process-wide tracking mutex for the whole
+    /// walk — so one client hanging up stalled every other shard's invalidation
+    /// path, and the stall grew with the table (capped at `max_keys`, one
+    /// million). This makes teardown proportional to what the client actually
+    /// tracked. Kept exactly in step with `key_clients`: every insertion and
+    /// every removal there has a matching update here.
+    client_keys: HashMap<u64, std::collections::HashSet<Bytes>>,
     /// BCAST mode: list of (client_id, prefix, noloop)
     bcast_clients: Vec<(u64, Bytes, bool)>,
     /// Client channels: client_id -> MpscSender<Frame>
@@ -99,6 +109,7 @@ impl TrackingTable {
     pub fn with_max_keys(max_keys: usize) -> Self {
         Self {
             key_clients: HashMap::new(),
+            client_keys: HashMap::new(),
             bcast_clients: Vec::new(),
             client_channels: HashMap::new(),
             redirects: HashMap::new(),
@@ -142,6 +153,10 @@ impl TrackingTable {
         if let Some(clients) = self.key_clients.get_mut(key) {
             if !clients.iter().any(|(id, _)| *id == client_id) {
                 clients.push((client_id, noloop));
+                self.client_keys
+                    .entry(client_id)
+                    .or_default()
+                    .insert(key.clone());
             }
             return None;
         }
@@ -154,6 +169,7 @@ impl TrackingTable {
             let clients = self.key_clients.remove(&victim).unwrap_or_default();
             let mut senders = Vec::new();
             for (cid, _noloop) in clients {
+                Self::forget_client_key(&mut self.client_keys, cid, &victim);
                 // No noloop skip: cap eviction is not a self-write — every
                 // tracker of the victim key must drop its cached copy.
                 let target_id = self.redirects.get(&cid).copied().unwrap_or(cid);
@@ -168,6 +184,10 @@ impl TrackingTable {
 
         self.key_clients
             .insert(key.clone(), vec![(client_id, noloop)]);
+        self.client_keys
+            .entry(client_id)
+            .or_default()
+            .insert(key.clone());
         evicted
     }
 
@@ -192,6 +212,11 @@ impl TrackingTable {
         // Normal mode: check key_clients
         if let Some(clients) = self.key_clients.remove(key) {
             for (cid, noloop) in clients {
+                // The key is gone from the forward map, so it must go from the
+                // reverse one too -- a stale entry would make the reverse index
+                // grow without bound for a client that re-reads an
+                // often-invalidated key, and teardown would walk the garbage.
+                Self::forget_client_key(&mut self.client_keys, cid, key);
                 // NOLOOP: skip if the writer is the same client
                 if noloop && cid == writer_client_id {
                     continue;
@@ -221,11 +246,21 @@ impl TrackingTable {
 
     /// Remove all tracking for a client (on disconnect or TRACKING OFF).
     pub fn untrack_all(&mut self, client_id: u64) {
-        // Remove from key_clients
-        self.key_clients.retain(|_, clients| {
-            clients.retain(|(id, _)| *id != client_id);
-            !clients.is_empty()
-        });
+        // Visit only the keys this client actually tracked. This used to
+        // `retain` over the whole table -- O(tracked keys) per disconnect,
+        // under the process-wide mutex, regardless of whether the departing
+        // client had tracked anything at all.
+        if let Some(keys) = self.client_keys.remove(&client_id) {
+            for key in keys {
+                let Some(clients) = self.key_clients.get_mut(&key) else {
+                    continue;
+                };
+                clients.retain(|(id, _)| *id != client_id);
+                if clients.is_empty() {
+                    self.key_clients.remove(&key);
+                }
+            }
+        }
         // Remove from bcast_clients
         self.bcast_clients.retain(|(id, _, _)| *id != client_id);
         // Remove channel and redirect
@@ -235,12 +270,31 @@ impl TrackingTable {
         self.redirects.remove(&client_id);
     }
 
+    /// Drop one (client, key) pair from the reverse index, retiring the
+    /// client's entry when it has nothing left to track.
+    ///
+    /// Free function over the map so callers can hold a borrow of the forward
+    /// map across the call.
+    fn forget_client_key(
+        client_keys: &mut HashMap<u64, std::collections::HashSet<Bytes>>,
+        client_id: u64,
+        key: &Bytes,
+    ) {
+        if let Some(keys) = client_keys.get_mut(&client_id) {
+            keys.remove(key);
+            if keys.is_empty() {
+                client_keys.remove(&client_id);
+            }
+        }
+    }
+
     /// Cache-flush invalidation (FLUSHALL/FLUSHDB): every registered client
     /// must drop its whole local cache. Clears the per-key table and returns
     /// every client channel so the caller can push the RESP3 flush
     /// invalidation (`invalidate` + Null payload, the Redis convention).
     pub fn invalidate_all(&mut self) -> Vec<channel::MpscSender<Frame>> {
         self.key_clients.clear();
+        self.client_keys.clear();
         self.client_channels.values().cloned().collect()
     }
 }
@@ -249,6 +303,175 @@ impl TrackingTable {
 mod tests {
     use super::*;
     use crate::runtime::channel;
+
+    /// The forward and reverse indexes must describe exactly the same set of
+    /// (key, client) pairs. Every test below asserts this after mutating the
+    /// table -- a reverse index that drifts is worse than no reverse index,
+    /// because teardown then silently leaves a departed client registered on a
+    /// key and keeps pushing invalidations into a dead channel.
+    fn assert_indexes_agree(table: &TrackingTable) {
+        let mut forward: Vec<(u64, Bytes)> = Vec::new();
+        for (key, clients) in &table.key_clients {
+            assert!(!clients.is_empty(), "empty client list left on {key:?}");
+            for (cid, _) in clients {
+                forward.push((*cid, key.clone()));
+            }
+        }
+        let mut reverse: Vec<(u64, Bytes)> = Vec::new();
+        for (cid, keys) in &table.client_keys {
+            assert!(!keys.is_empty(), "empty key set left for client {cid}");
+            for key in keys {
+                reverse.push((*cid, key.clone()));
+            }
+        }
+        forward.sort();
+        reverse.sort();
+        assert_eq!(forward, reverse, "forward and reverse indexes disagree");
+    }
+
+    fn sender() -> channel::MpscSender<Frame> {
+        let (tx, rx) = channel::mpsc_unbounded::<Frame>();
+        std::mem::forget(rx); // keep the channel alive for the test's lifetime
+        tx
+    }
+
+    #[test]
+    fn disconnect_untracks_only_the_departing_client() {
+        let mut table = TrackingTable::new();
+        table.register_client(1, sender());
+        table.register_client(2, sender());
+        let shared = Bytes::from_static(b"shared");
+        let solo = Bytes::from_static(b"solo");
+        table.track_key(1, &shared, false);
+        table.track_key(2, &shared, false);
+        table.track_key(1, &solo, false);
+        assert_indexes_agree(&table);
+
+        table.untrack_all(1);
+
+        assert_eq!(table.tracked_clients(&shared), vec![2]);
+        assert!(
+            !table.key_clients.contains_key(&solo),
+            "a key with no trackers left must be dropped, not kept empty"
+        );
+        assert_indexes_agree(&table);
+    }
+
+    #[test]
+    fn invalidating_a_key_clears_it_from_the_reverse_index() {
+        let mut table = TrackingTable::new();
+        table.register_client(1, sender());
+        let k = Bytes::from_static(b"k");
+        // Track, invalidate, re-track -- ten times. The reverse index must not
+        // accumulate: it mirrors the forward map, which holds one entry.
+        for _ in 0..10 {
+            table.track_key(1, &k, false);
+            table.invalidate_key(&k, 99);
+        }
+        assert!(table.client_keys.is_empty(), "reverse index accumulated");
+        table.track_key(1, &k, false);
+        assert_eq!(table.client_keys[&1].len(), 1);
+        assert_indexes_agree(&table);
+
+        // And teardown after an invalidation must not trip over the gap.
+        table.invalidate_key(&k, 99);
+        table.untrack_all(1);
+        assert_indexes_agree(&table);
+    }
+
+    #[test]
+    fn cap_eviction_clears_the_reverse_index() {
+        let mut table = TrackingTable::with_max_keys(2);
+        table.register_client(1, sender());
+        table.track_key(1, &Bytes::from_static(b"a"), false);
+        table.track_key(1, &Bytes::from_static(b"b"), false);
+        // The third key evicts an arbitrary existing one.
+        let evicted = table.track_key(1, &Bytes::from_static(b"c"), false);
+        assert!(evicted.is_some(), "the cap must evict");
+        assert_eq!(table.key_clients.len(), 2, "table must stay at the cap");
+        assert_indexes_agree(&table);
+    }
+
+    #[test]
+    fn flush_invalidation_clears_the_reverse_index() {
+        let mut table = TrackingTable::new();
+        table.register_client(1, sender());
+        table.track_key(1, &Bytes::from_static(b"a"), false);
+        table.invalidate_all();
+        assert!(
+            table.client_keys.is_empty(),
+            "FLUSHALL left a stale reverse entry"
+        );
+        assert_indexes_agree(&table);
+        // The client is still registered, so it can track again.
+        table.track_key(1, &Bytes::from_static(b"b"), false);
+        assert_indexes_agree(&table);
+    }
+
+    #[test]
+    fn tracking_the_same_key_twice_records_one_reverse_entry() {
+        let mut table = TrackingTable::new();
+        table.register_client(1, sender());
+        let k = Bytes::from_static(b"k");
+        table.track_key(1, &k, false);
+        table.track_key(1, &k, false);
+        assert_eq!(table.tracked_clients(&k), vec![1]);
+        assert_eq!(table.client_keys[&1].len(), 1);
+        assert_indexes_agree(&table);
+    }
+
+    #[test]
+    fn disconnecting_an_untracked_client_leaves_the_table_alone() {
+        let mut table = TrackingTable::new();
+        table.register_client(1, sender());
+        let k = Bytes::from_static(b"k");
+        table.track_key(1, &k, false);
+
+        table.untrack_all(42); // never tracked, never registered
+
+        assert_eq!(table.tracked_clients(&k), vec![1]);
+        assert_indexes_agree(&table);
+    }
+
+    /// Cost of ONE client disconnecting, as the tracking table's key count grows.
+    ///
+    /// `#[ignore]`d: a measurement, not an assertion. Run it explicitly:
+    /// `cargo test --release --lib bench_untrack_all_cost_vs_table_size -- --ignored --nocapture`
+    ///
+    /// The disconnecting client tracks NOTHING, so every microsecond spent is
+    /// the sweep over other clients' keys. Flat µs/disconnect means the table
+    /// size does not matter; growth means each disconnect is O(table).
+    #[test]
+    #[ignore = "measurement harness; run explicitly with --nocapture"]
+    fn bench_untrack_all_cost_vs_table_size() {
+        use std::time::Instant;
+        println!("{:<10} {:<16} total", "keys", "µs/disconnect");
+        for keys in [1000_usize, 2000, 4000, 8000, 16000] {
+            let mut table = TrackingTable::new();
+            let (tx, _rx) = channel::mpsc_unbounded::<Frame>();
+            table.register_client(1, tx.clone());
+            for k in 0..keys {
+                table.track_key(1, &Bytes::from(format!("key:{k}")), false);
+            }
+            // 100 clients that tracked nothing at all connect and disconnect.
+            const CHURN: usize = 100;
+            for c in 0..CHURN {
+                table.register_client(100 + c as u64, tx.clone());
+            }
+            let t = Instant::now();
+            for c in 0..CHURN {
+                table.untrack_all(100 + c as u64);
+            }
+            let el = t.elapsed();
+            println!(
+                "{:<10} {:<16.3} {:?}",
+                keys,
+                el.as_secs_f64() * 1e6 / CHURN as f64,
+                el
+            );
+            assert_eq!(table.key_clients.len(), keys, "sweep dropped live entries");
+        }
+    }
 
     #[test]
     fn test_new_creates_empty_table() {
