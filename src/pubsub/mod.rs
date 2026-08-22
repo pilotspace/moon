@@ -53,6 +53,26 @@ pub struct PubSubRegistry {
     /// Sharded (`SSUBSCRIBE`) channels — a separate namespace from `channels`,
     /// so `SPUBLISH ch` structurally cannot reach a `SUBSCRIBE ch`.
     shard_channels: HashMap<Bytes, Vec<Subscriber>>,
+    /// REVERSE index of `channels`: subscriber id -> the channels it joined.
+    ///
+    /// Teardown used to `retain` over the whole channel map (moon#651) — under
+    /// the registry's exclusive lock, three times per disconnect, so every
+    /// shard's `PUBLISH` fan-out blocked behind a walk of channels the
+    /// departing connection had never heard of. Unlike the tracking table this
+    /// map has no cap, so there was no ceiling on the stall.
+    ///
+    /// Kept in step by `subscribe` and `unsubscribe`. It MAY name a channel the
+    /// subscriber is no longer in: `publish` drops slow subscribers from inside
+    /// a `retain` over `channels`, which borrows the map exclusively. Teardown
+    /// therefore treats a reverse entry as a *candidate* and only reports a
+    /// channel it actually removed the subscriber from. Staleness is bounded by
+    /// the distinct channels one connection ever joined without unsubscribing —
+    /// re-subscribing re-inserts the same set member — so it can never exceed
+    /// what the old code walked, and it is paid once, at that connection's own
+    /// disconnect.
+    sub_channels: HashMap<u64, std::collections::HashSet<Bytes>>,
+    /// REVERSE index of `shard_channels`. Same contract as `sub_channels`.
+    sub_shard_channels: HashMap<u64, std::collections::HashSet<Bytes>>,
 }
 
 impl PubSubRegistry {
@@ -61,11 +81,17 @@ impl PubSubRegistry {
             channels: HashMap::new(),
             patterns: Vec::new(),
             shard_channels: HashMap::new(),
+            sub_channels: HashMap::new(),
+            sub_shard_channels: HashMap::new(),
         }
     }
 
     /// Subscribe to an exact channel.
     pub fn subscribe(&mut self, channel: Bytes, sub: Subscriber) {
+        self.sub_channels
+            .entry(sub.id)
+            .or_default()
+            .insert(channel.clone());
         self.channels
             .entry(channel)
             .or_insert_with(Vec::new)
@@ -74,12 +100,61 @@ impl PubSubRegistry {
 
     /// Unsubscribe from an exact channel by subscriber ID.
     pub fn unsubscribe(&mut self, channel: &[u8], sub_id: u64) {
+        // Explicit UNSUBSCRIBE must clear the reverse entry, or a connection
+        // cycling through distinct channels would grow it without bound.
+        Self::forget_sub_channel(&mut self.sub_channels, sub_id, channel);
         if let Some(subs) = self.channels.get_mut(channel) {
             subs.retain(|s| s.id != sub_id);
             if subs.is_empty() {
                 self.channels.remove(channel);
             }
         }
+    }
+
+    /// Drop one (subscriber, channel) pair from a reverse index, retiring the
+    /// subscriber's entry once it names nothing.
+    fn forget_sub_channel(
+        index: &mut HashMap<u64, std::collections::HashSet<Bytes>>,
+        sub_id: u64,
+        channel: &[u8],
+    ) {
+        if let Some(joined) = index.get_mut(&sub_id) {
+            joined.remove(channel);
+            if joined.is_empty() {
+                index.remove(&sub_id);
+            }
+        }
+    }
+
+    /// Remove `sub_id` from the channels its reverse index names, pruning any
+    /// channel it was the last subscriber of. Returns only the channels the
+    /// subscriber was *actually* removed from — callers use that list to
+    /// unpropagate remote subscription maps, so a stale candidate must not
+    /// appear in it.
+    fn retire_subscriber(
+        channels: &mut HashMap<Bytes, Vec<Subscriber>>,
+        joined: Option<std::collections::HashSet<Bytes>>,
+        sub_id: u64,
+    ) -> Vec<Bytes> {
+        let Some(joined) = joined else {
+            return Vec::new();
+        };
+        let mut removed = Vec::with_capacity(joined.len());
+        for channel in joined {
+            let Some(subs) = channels.get_mut(&channel) else {
+                continue; // channel already gone (last subscriber slow-dropped)
+            };
+            let before = subs.len();
+            subs.retain(|s| s.id != sub_id);
+            if subs.len() == before {
+                continue; // stale candidate: already slow-dropped from here
+            }
+            if subs.is_empty() {
+                channels.remove(&channel);
+            }
+            removed.push(channel);
+        }
+        removed
     }
 
     /// Subscribe to a glob pattern.
@@ -107,16 +182,11 @@ impl PubSubRegistry {
 
     /// Remove subscriber from all channels. Returns list of channels they were in.
     pub fn unsubscribe_all(&mut self, sub_id: u64) -> Vec<Bytes> {
-        let mut removed = Vec::new();
-        self.channels.retain(|channel, subs| {
-            let before = subs.len();
-            subs.retain(|s| s.id != sub_id);
-            if subs.len() < before {
-                removed.push(channel.clone());
-            }
-            !subs.is_empty()
-        });
-        removed
+        Self::retire_subscriber(
+            &mut self.channels,
+            self.sub_channels.remove(&sub_id),
+            sub_id,
+        )
     }
 
     /// Remove subscriber from all patterns. Returns list of patterns they were in.
@@ -328,11 +398,16 @@ impl PubSubRegistry {
 
     /// Subscribe to a sharded channel.
     pub fn ssubscribe(&mut self, channel: Bytes, sub: Subscriber) {
+        self.sub_shard_channels
+            .entry(sub.id)
+            .or_default()
+            .insert(channel.clone());
         self.shard_channels.entry(channel).or_default().push(sub);
     }
 
     /// Unsubscribe from a sharded channel by subscriber ID.
     pub fn sunsubscribe(&mut self, channel: &[u8], sub_id: u64) {
+        Self::forget_sub_channel(&mut self.sub_shard_channels, sub_id, channel);
         if let Some(subs) = self.shard_channels.get_mut(channel) {
             subs.retain(|s| s.id != sub_id);
             if subs.is_empty() {
@@ -343,16 +418,11 @@ impl PubSubRegistry {
 
     /// Remove a subscriber from every sharded channel. Returns those channels.
     pub fn sunsubscribe_all(&mut self, sub_id: u64) -> Vec<Bytes> {
-        let mut removed = Vec::new();
-        self.shard_channels.retain(|channel, subs| {
-            let before = subs.len();
-            subs.retain(|s| s.id != sub_id);
-            if subs.len() < before {
-                removed.push(channel.clone());
-            }
-            !subs.is_empty()
-        });
-        removed
+        Self::retire_subscriber(
+            &mut self.shard_channels,
+            self.sub_shard_channels.remove(&sub_id),
+            sub_id,
+        )
     }
 
     /// Count sharded channels this subscriber is subscribed to.
@@ -827,6 +897,203 @@ mod tests {
     use super::*;
     use crate::protocol::ParseConfig;
     use crate::runtime::channel;
+
+    /// The reverse index may name channels a subscriber has since been
+    /// slow-dropped from, but it must never MISS one it is still in, and the
+    /// forward map must never keep an emptied channel entry.
+    fn assert_no_missing_reverse_entries(reg: &PubSubRegistry) {
+        for (channel, subs) in &reg.channels {
+            assert!(
+                !subs.is_empty(),
+                "empty subscriber list left on {channel:?}"
+            );
+            for sub in subs {
+                assert!(
+                    reg.sub_channels
+                        .get(&sub.id)
+                        .is_some_and(|joined| joined.contains(channel)),
+                    "subscriber {} is in {channel:?} but the reverse index does not say so",
+                    sub.id
+                );
+            }
+        }
+        for (channel, subs) in &reg.shard_channels {
+            assert!(
+                !subs.is_empty(),
+                "empty subscriber list left on {channel:?}"
+            );
+            for sub in subs {
+                assert!(
+                    reg.sub_shard_channels
+                        .get(&sub.id)
+                        .is_some_and(|joined| joined.contains(channel)),
+                    "subscriber {} is in sharded {channel:?} but the reverse index does not say so",
+                    sub.id
+                );
+            }
+        }
+    }
+
+    fn live_sub(id: u64) -> Subscriber {
+        let (tx, rx) = channel::mpsc_bounded::<Bytes>(16);
+        std::mem::forget(rx);
+        Subscriber::new(tx, id)
+    }
+
+    #[test]
+    fn disconnect_removes_only_the_departing_subscriber() {
+        let mut reg = PubSubRegistry::new();
+        let shared = Bytes::from_static(b"shared");
+        let solo = Bytes::from_static(b"solo");
+        reg.subscribe(shared.clone(), live_sub(1));
+        reg.subscribe(shared.clone(), live_sub(2));
+        reg.subscribe(solo.clone(), live_sub(1));
+
+        let mut removed = reg.unsubscribe_all(1);
+        removed.sort();
+        assert_eq!(removed, vec![shared.clone(), solo.clone()]);
+        assert_eq!(reg.channels[&shared].len(), 1);
+        assert!(
+            !reg.channels.contains_key(&solo),
+            "a channel with no subscribers left must be dropped"
+        );
+        assert!(!reg.sub_channels.contains_key(&1));
+        assert_no_missing_reverse_entries(&reg);
+    }
+
+    #[test]
+    fn a_slow_dropped_channel_is_not_reported_as_removed_on_disconnect() {
+        // The returned list drives `unpropagate_subscription` against every
+        // other shard's remote map, so reporting a channel this subscriber was
+        // already dropped from would tear down a subscription it never had.
+        let mut reg = PubSubRegistry::new();
+        let ch = Bytes::from_static(b"ch");
+        let (tx, rx) = channel::mpsc_bounded::<Bytes>(1);
+        reg.subscribe(ch.clone(), Subscriber::new(tx, 1));
+        // A healthy second subscriber keeps the channel alive, so teardown
+        // reaches the "is this candidate stale?" branch rather than the
+        // "channel is gone entirely" one.
+        reg.subscribe(ch.clone(), live_sub(2));
+        // Fill subscriber 1's one-slot buffer, then publish again: its second
+        // send fails and `publish` drops it.
+        reg.publish(&ch, &Bytes::from_static(b"a"));
+        reg.publish(&ch, &Bytes::from_static(b"b"));
+        drop(rx);
+        assert_eq!(
+            reg.channels[&ch].iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![2],
+            "slow subscriber was not dropped"
+        );
+        // The reverse index still names it -- that is the tolerated staleness.
+        assert!(reg.sub_channels[&1].contains(&ch));
+
+        assert!(
+            reg.unsubscribe_all(1).is_empty(),
+            "a channel the subscriber was already dropped from must not be reported"
+        );
+        assert_eq!(
+            reg.channels[&ch].len(),
+            1,
+            "teardown disturbed a live subscriber"
+        );
+        assert_no_missing_reverse_entries(&reg);
+    }
+
+    #[test]
+    fn explicit_unsubscribe_clears_the_reverse_entry() {
+        let mut reg = PubSubRegistry::new();
+        // A connection cycling through distinct channels must not accumulate.
+        for i in 0..50 {
+            let ch = Bytes::from(format!("ch:{i}"));
+            reg.subscribe(ch.clone(), live_sub(1));
+            reg.unsubscribe(&ch, 1);
+        }
+        assert!(
+            !reg.sub_channels.contains_key(&1),
+            "reverse index accumulated across subscribe/unsubscribe cycles"
+        );
+        assert!(reg.channels.is_empty());
+        assert_no_missing_reverse_entries(&reg);
+    }
+
+    #[test]
+    fn resubscribing_after_a_disconnect_works() {
+        let mut reg = PubSubRegistry::new();
+        let ch = Bytes::from_static(b"ch");
+        reg.subscribe(ch.clone(), live_sub(1));
+        reg.unsubscribe_all(1);
+        reg.subscribe(ch.clone(), live_sub(1));
+        assert_eq!(reg.publish(&ch, &Bytes::from_static(b"m")), 1);
+        assert_eq!(reg.unsubscribe_all(1), vec![ch]);
+        assert_no_missing_reverse_entries(&reg);
+    }
+
+    #[test]
+    fn sharded_and_exact_namespaces_retire_independently() {
+        let mut reg = PubSubRegistry::new();
+        let ch = Bytes::from_static(b"ch");
+        reg.subscribe(ch.clone(), live_sub(1));
+        reg.ssubscribe(ch.clone(), live_sub(1));
+
+        assert_eq!(reg.sunsubscribe_all(1), vec![ch.clone()]);
+        assert!(reg.shard_channels.is_empty());
+        assert_eq!(
+            reg.channels[&ch].len(),
+            1,
+            "retiring the sharded namespace touched the exact one"
+        );
+        assert_eq!(reg.unsubscribe_all(1), vec![ch]);
+        assert_no_missing_reverse_entries(&reg);
+    }
+
+    #[test]
+    fn disconnecting_an_unknown_subscriber_leaves_the_registry_alone() {
+        let mut reg = PubSubRegistry::new();
+        let ch = Bytes::from_static(b"ch");
+        reg.subscribe(ch.clone(), live_sub(1));
+        assert!(reg.unsubscribe_all(999).is_empty());
+        assert!(reg.sunsubscribe_all(999).is_empty());
+        assert_eq!(reg.channels[&ch].len(), 1);
+        assert_no_missing_reverse_entries(&reg);
+    }
+
+    /// Cost of ONE subscriber disconnecting, as the registry's channel count
+    /// grows. `#[ignore]`d: a measurement, not an assertion.
+    ///
+    /// `cargo test --release --lib bench_unsubscribe_all_cost_vs_channels -- --ignored --nocapture`
+    ///
+    /// The disconnecting subscribers are subscribed to NOTHING, so every
+    /// microsecond is the sweep over other connections' channels.
+    #[test]
+    #[ignore = "measurement harness; run explicitly with --nocapture"]
+    fn bench_unsubscribe_all_cost_vs_channels() {
+        use std::time::Instant;
+        println!("{:<10} {:<16} total", "channels", "µs/disconnect");
+        for chans in [1000_usize, 2000, 4000, 8000, 16000] {
+            let mut reg = PubSubRegistry::new();
+            let (tx, rx) = channel::mpsc_bounded::<Bytes>(16);
+            std::mem::forget(rx);
+            for c in 0..chans {
+                reg.subscribe(
+                    Bytes::from(format!("ch:{c}")),
+                    Subscriber::new(tx.clone(), 1),
+                );
+            }
+            const CHURN: usize = 100;
+            let t = Instant::now();
+            for c in 0..CHURN {
+                reg.unsubscribe_all(1000 + c as u64);
+            }
+            let el = t.elapsed();
+            println!(
+                "{:<10} {:<16.3} {:?}",
+                chans,
+                el.as_secs_f64() * 1e6 / CHURN as f64,
+                el
+            );
+            assert_eq!(reg.channels.len(), chans, "sweep dropped live channels");
+        }
+    }
 
     /// Parse pre-serialized RESP bytes back into a Frame for assertion.
     fn parse_resp(data: &[u8]) -> Frame {
