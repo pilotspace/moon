@@ -45,14 +45,23 @@ case "${1:-}" in
   *) echo "usage: $0 [--quick|--full]" >&2; exit 2 ;;
 esac
 
-cd "$REPO" || exit 2
+# Library mode is sourced from anywhere — CI runs the pre-flight test on a
+# hosted runner where $REPO does not exist, and an unconditional `cd` here
+# exits the sourcing shell before a single function is defined.
+if [ -z "${CI_LOCAL_LIB_ONLY:-}" ]; then
+  cd "$REPO" || exit 2
+fi
 
 tree_fingerprint() {
   # HEAD + a hash of the porcelain status (tracked mtimes don't matter;
   # content and branch do).
   echo "$(git rev-parse HEAD) $(git status --porcelain | git hash-object --stdin)"
 }
-FP_START="$(tree_fingerprint)"
+# Not in library mode: the fingerprint shells out to git, and the test
+# harness may source this from a directory that is not a checkout.
+if [ -z "${CI_LOCAL_LIB_ONLY:-}" ]; then
+  FP_START="$(tree_fingerprint)"
+fi
 
 declare -a NAMES RCS SECS
 run_step() { # run_step <name> <cmd...>
