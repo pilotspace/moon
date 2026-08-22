@@ -6,6 +6,17 @@ use roaring::RoaringBitmap;
 
 use super::expression::FilterExpr;
 
+/// The values one document wrote to one field.
+///
+/// `SmallVec<[_; 1]>` because the overwhelmingly common case is a document
+/// holding exactly one value per field; a multi-value tag field stays correct,
+/// it just spills to the heap.
+#[derive(Default)]
+struct DocFieldValues {
+    tags: smallvec::SmallVec<[Bytes; 1]>,
+    numerics: smallvec::SmallVec<[OrderedFloat<f64>; 1]>,
+}
+
 /// Payload index maintaining Roaring bitmaps per tag value and numeric value.
 ///
 /// Each field gets its own index: tags use `HashMap<value, bitmap>`,
@@ -15,6 +26,21 @@ pub struct PayloadIndex {
     tag_indexes: HashMap<Bytes, HashMap<Bytes, RoaringBitmap>>,
     /// field_name -> { numeric_value -> bitmap of internal_ids }
     numeric_indexes: HashMap<Bytes, BTreeMap<OrderedFloat<f64>, RoaringBitmap>>,
+    /// FORWARD index: internal_id -> field -> the values that document wrote.
+    ///
+    /// moon#614. Retiring a document used to walk EVERY distinct value bitmap
+    /// in the field, because nothing recorded which ones the document was
+    /// actually in — `O(distinct values)` per document regardless of how many
+    /// values that document had, so `O(n^2)` across a bulk update of a
+    /// high-cardinality field (`sku`, `price`, any coordinate). This makes the
+    /// retire path proportional to what the document actually wrote.
+    ///
+    /// Same remedy as moon#613 applied to the text index, and the memory
+    /// trade-off is the same and worth stating: one entry per
+    /// (document, field) that was written, holding the values themselves.
+    /// Tag values are `Bytes`, so they share the buffer already stored as the
+    /// key of `tag_indexes`; numerics are 8 bytes each.
+    doc_values: HashMap<u32, HashMap<Bytes, DocFieldValues>>,
     /// Full-text indexes (feature-gated behind `text-index`)
     #[cfg(feature = "text-index")]
     text_indexes: crate::vector::filter::text_index::TextIndex,
@@ -26,6 +52,7 @@ impl PayloadIndex {
         Self {
             tag_indexes: HashMap::new(),
             numeric_indexes: HashMap::new(),
+            doc_values: HashMap::new(),
             #[cfg(feature = "text-index")]
             text_indexes: crate::vector::filter::text_index::TextIndex::new(),
         }
@@ -39,6 +66,18 @@ impl PayloadIndex {
             .entry(value.clone())
             .or_default()
             .insert(internal_id);
+        // Forward index (moon#614). Deduped: re-inserting the same value for
+        // the same document is idempotent in the bitmap, so it must be
+        // idempotent here too or the retire list grows without bound.
+        let slot = self
+            .doc_values
+            .entry(internal_id)
+            .or_default()
+            .entry(field.clone())
+            .or_default();
+        if !slot.tags.contains(value) {
+            slot.tags.push(value.clone());
+        }
     }
 
     /// Insert a numeric value for the given internal vector ID.
@@ -49,6 +88,19 @@ impl PayloadIndex {
             .entry(OrderedFloat(value))
             .or_default()
             .insert(internal_id);
+        // Forward index (moon#614). `insert_geo` routes through here for
+        // `{field}__lat` / `{field}__lon`, so geo sub-fields are recorded under
+        // their own names with no extra bookkeeping.
+        let slot = self
+            .doc_values
+            .entry(internal_id)
+            .or_default()
+            .entry(field.clone())
+            .or_default();
+        let v = OrderedFloat(value);
+        if !slot.numerics.contains(&v) {
+            slot.numerics.push(v);
+        }
     }
 
     /// Insert geo coordinates for the given internal vector ID.
@@ -77,56 +129,110 @@ impl PayloadIndex {
         // No-op: text-index feature not enabled
     }
 
-    /// Remove an internal ID from a specific field's bitmaps only (for metadata updates).
+    /// Retire `internal_id` from ONE field's bitmaps, and from that field's geo
+    /// sub-fields (`{field}__lat`, `{field}__lon`) if it is a geo field.
     ///
-    /// Removes `internal_id` from both tag and numeric indexes for the given `field`,
-    /// and from geo sub-fields (`{field}__lat`, `{field}__lon`) if present.
-    /// O(values_per_field) -- acceptable because metadata updates are rare relative to search.
+    /// `O(values this document wrote to the field)` — effectively O(1), since a
+    /// document almost always holds one value per field. It used to be
+    /// `O(distinct values in the field)`: with no record of which bitmaps the
+    /// document was in, it visited all of them (moon#614). That is fine for
+    /// `color` or `status` and quadratic for `sku` or `price`, where the
+    /// distinct-value count grows with the corpus.
+    ///
+    /// Emptied bitmaps are dropped rather than left behind. Retaining them is
+    /// how the pre-fix text index grew without bound (moon#613): a field that
+    /// had once seen a million values kept paying for all million on every
+    /// later retire and every search miss, long after the documents were gone.
     pub fn remove_field(&mut self, field: &Bytes, internal_id: u32) {
-        if let Some(tag_map) = self.tag_indexes.get_mut(field) {
-            for bitmap in tag_map.values_mut() {
-                bitmap.remove(internal_id);
-            }
-        }
-        if let Some(num_map) = self.numeric_indexes.get_mut(field) {
-            for bitmap in num_map.values_mut() {
-                bitmap.remove(internal_id);
-            }
-        }
-        // Also clean up geo sub-fields if this is a geo field
+        // Geo writes two numeric sub-fields, so retiring the parent field must
+        // retire those too. They are recorded in the forward index under their
+        // own names, which is why this is a lookup rather than a sweep.
         let field_str = std::str::from_utf8(field).unwrap_or("");
         let lat_field = Bytes::from(format!("{field_str}__lat"));
         let lon_field = Bytes::from(format!("{field_str}__lon"));
-        if let Some(num_map) = self.numeric_indexes.get_mut(&lat_field) {
-            for bitmap in num_map.values_mut() {
-                bitmap.remove(internal_id);
+
+        if let Some(fields) = self.doc_values.get_mut(&internal_id) {
+            for f in [field, &lat_field, &lon_field] {
+                if let Some(values) = fields.remove(f) {
+                    Self::retire_values(
+                        &mut self.tag_indexes,
+                        &mut self.numeric_indexes,
+                        f,
+                        &values,
+                        internal_id,
+                    );
+                }
+            }
+            if fields.is_empty() {
+                self.doc_values.remove(&internal_id);
             }
         }
-        if let Some(num_map) = self.numeric_indexes.get_mut(&lon_field) {
-            for bitmap in num_map.values_mut() {
-                bitmap.remove(internal_id);
-            }
-        }
+
         #[cfg(feature = "text-index")]
         self.text_indexes.remove_field(field, internal_id);
     }
 
-    /// Remove an internal ID from ALL bitmaps (for vector deletion).
+    /// Retire `internal_id` from every field it was written to (vector deletion).
     ///
-    /// O(fields * values) -- acceptable because DEL is rare relative to search.
+    /// `O(values this document wrote)`, was `O(fields * distinct values)`.
     pub fn remove(&mut self, internal_id: u32) {
-        for field_map in self.tag_indexes.values_mut() {
-            for bitmap in field_map.values_mut() {
-                bitmap.remove(internal_id);
-            }
-        }
-        for field_map in self.numeric_indexes.values_mut() {
-            for bitmap in field_map.values_mut() {
-                bitmap.remove(internal_id);
+        if let Some(fields) = self.doc_values.remove(&internal_id) {
+            for (f, values) in &fields {
+                Self::retire_values(
+                    &mut self.tag_indexes,
+                    &mut self.numeric_indexes,
+                    f,
+                    values,
+                    internal_id,
+                );
             }
         }
         #[cfg(feature = "text-index")]
         self.text_indexes.remove(internal_id);
+    }
+
+    /// Drop `internal_id` from exactly the bitmaps named by `values`, and drop
+    /// any bitmap (and any field map) the removal left empty.
+    ///
+    /// Free function over the two maps rather than `&mut self`, so the caller
+    /// can hold a borrow of `doc_values` across the call.
+    fn retire_values(
+        tag_indexes: &mut HashMap<Bytes, HashMap<Bytes, RoaringBitmap>>,
+        numeric_indexes: &mut HashMap<Bytes, BTreeMap<OrderedFloat<f64>, RoaringBitmap>>,
+        field: &Bytes,
+        values: &DocFieldValues,
+        internal_id: u32,
+    ) {
+        if !values.tags.is_empty()
+            && let Some(tag_map) = tag_indexes.get_mut(field)
+        {
+            for value in &values.tags {
+                if let Some(bitmap) = tag_map.get_mut(value) {
+                    bitmap.remove(internal_id);
+                    if bitmap.is_empty() {
+                        tag_map.remove(value);
+                    }
+                }
+            }
+            if tag_map.is_empty() {
+                tag_indexes.remove(field);
+            }
+        }
+        if !values.numerics.is_empty()
+            && let Some(num_map) = numeric_indexes.get_mut(field)
+        {
+            for value in &values.numerics {
+                if let Some(bitmap) = num_map.get_mut(value) {
+                    bitmap.remove(internal_id);
+                    if bitmap.is_empty() {
+                        num_map.remove(value);
+                    }
+                }
+            }
+            if num_map.is_empty() {
+                numeric_indexes.remove(field);
+            }
+        }
     }
 
     /// Evaluate a filter expression and return the bitmap of matching internal IDs.
@@ -314,6 +420,67 @@ fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cost of retiring documents, as a field's DISTINCT-VALUE COUNT grows.
+    ///
+    /// `#[ignore]`d: this is a measurement, not an assertion — it exists so the
+    /// claim in the commit message is reproducible rather than asserted. Same
+    /// harness shape as `text_index::bench_removal_cost_vs_vocabulary` (moon#613),
+    /// because moon#614 is the tag/numeric/geo analogue of that defect and the
+    /// two numbers should be read the same way.
+    ///
+    /// One document per distinct value, so each document belongs to exactly ONE
+    /// bitmap while the pre-fix `remove_field` must visit all `n` of them.
+    /// Report is µs per retired document: **flat means the field's cardinality
+    /// no longer matters; linear growth is the quadratic still being there.**
+    /// A constant-factor win and a removed quadratic look very different on this
+    /// curve, and only the second justifies the extra index.
+    ///
+    /// Run: `cargo test --release --lib bench_payload_removal -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement harness; run explicitly with --nocapture"]
+    fn bench_payload_removal_cost_vs_cardinality() {
+        use std::time::Instant;
+        let tagf = field("sku");
+        let numf = field("price");
+        println!(
+            "{:<7} {:<12} {:<14} total",
+            "docs", "tag µs/doc", "numeric µs/doc"
+        );
+        for docs in [250_u32, 500, 1000, 2000, 4000] {
+            // --- tag field: one distinct value per document ---
+            let mut idx = PayloadIndex::new();
+            for d in 0..docs {
+                idx.insert_tag(&tagf, &Bytes::from(format!("sku-{d}")), d);
+            }
+            let t0 = Instant::now();
+            for d in 0..docs {
+                idx.remove_field(&tagf, d);
+            }
+            let tag_el = t0.elapsed();
+
+            // --- numeric field: one distinct value per document ---
+            let mut idx2 = PayloadIndex::new();
+            for d in 0..docs {
+                idx2.insert_numeric(&numf, f64::from(d), d);
+            }
+            let t1 = Instant::now();
+            for d in 0..docs {
+                idx2.remove_field(&numf, d);
+            }
+            let num_el = t1.elapsed();
+
+            let per = |e: std::time::Duration| e.as_secs_f64() * 1e6 / f64::from(docs);
+            println!(
+                "{:<7} {:<12.3} {:<14.3} {:?} / {:?}",
+                docs,
+                per(tag_el),
+                per(num_el),
+                tag_el,
+                num_el
+            );
+        }
+    }
 
     fn field(s: &str) -> Bytes {
         Bytes::from(s.to_owned())
@@ -563,6 +730,141 @@ mod tests {
         };
         let bm = idx.evaluate_bitmap(&expr, 10);
         assert!(bm.is_empty());
+    }
+
+    // ---- moon#614: the forward index must not change WHAT is retired, only
+    // how much work retiring costs. These attack the bookkeeping directly.
+
+    #[test]
+    fn retiring_a_document_drops_the_bitmap_it_emptied() {
+        let mut idx = PayloadIndex::new();
+        let f = field("sku");
+        idx.insert_tag(&f, &Bytes::from_static(b"only-doc-with-this"), 1);
+        idx.insert_tag(&f, &Bytes::from_static(b"shared"), 1);
+        idx.insert_tag(&f, &Bytes::from_static(b"shared"), 2);
+        assert_eq!(idx.tag_indexes[&f].len(), 2);
+
+        idx.remove(1);
+
+        // The value only doc 1 held is gone entirely -- not left behind as an
+        // empty bitmap. Retaining it is exactly how the pre-moon#613 text index
+        // grew without bound and kept the retire cost quadratic.
+        let tags = &idx.tag_indexes[&f];
+        assert_eq!(tags.len(), 1, "emptied value bitmap was retained: {tags:?}");
+        assert!(tags.contains_key(&Bytes::from_static(b"shared")));
+        // And the forward-index entry for the retired document is gone too.
+        assert!(!idx.doc_values.contains_key(&1));
+    }
+
+    #[test]
+    fn retiring_the_last_document_drops_the_field_map() {
+        let mut idx = PayloadIndex::new();
+        let f = field("price");
+        idx.insert_numeric(&f, 9.99, 7);
+        idx.remove(7);
+        assert!(
+            !idx.numeric_indexes.contains_key(&f),
+            "field map survived with no documents in it"
+        );
+        assert!(idx.doc_values.is_empty());
+    }
+
+    #[test]
+    fn re_inserting_after_a_retire_indexes_the_document_again() {
+        let mut idx = PayloadIndex::new();
+        let f = field("color");
+        let red = Bytes::from_static(b"red");
+        idx.insert_tag(&f, &red, 1);
+        idx.remove(1);
+        idx.insert_tag(&f, &red, 1);
+
+        let hits = idx.evaluate_bitmap(
+            &FilterExpr::TagEq {
+                field: f.clone(),
+                value: red.clone(),
+            },
+            8,
+        );
+        assert!(hits.contains(1), "re-insert after retire was not indexed");
+        // A second retire must still clear it -- the forward index was rebuilt,
+        // not left stale from the first round.
+        idx.remove(1);
+        let hits = idx.evaluate_bitmap(
+            &FilterExpr::TagEq {
+                field: f,
+                value: red,
+            },
+            8,
+        );
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn inserting_the_same_value_twice_still_retires_in_one_call() {
+        let mut idx = PayloadIndex::new();
+        let f = field("tag");
+        let v = Bytes::from_static(b"v");
+        idx.insert_tag(&f, &v, 3);
+        idx.insert_tag(&f, &v, 3);
+        idx.insert_numeric(&field("n"), 1.0, 3);
+        idx.insert_numeric(&field("n"), 1.0, 3);
+
+        // Dedup matters twice over: the retire list must not grow on repeat
+        // writes, and one remove must be enough (the bitmap holds one bit).
+        assert_eq!(idx.doc_values[&3][&f].tags.len(), 1);
+        assert_eq!(idx.doc_values[&3][&field("n")].numerics.len(), 1);
+
+        idx.remove(3);
+        assert!(idx.tag_indexes.is_empty());
+        assert!(idx.numeric_indexes.is_empty());
+    }
+
+    #[test]
+    fn retiring_an_unknown_document_is_a_no_op() {
+        let mut idx = PayloadIndex::new();
+        let f = field("color");
+        idx.insert_tag(&f, &Bytes::from_static(b"red"), 1);
+
+        idx.remove(999);
+        idx.remove_field(&f, 999);
+        idx.remove_field(&field("never-written"), 1);
+
+        let hits = idx.evaluate_bitmap(
+            &FilterExpr::TagEq {
+                field: f,
+                value: Bytes::from_static(b"red"),
+            },
+            8,
+        );
+        assert!(
+            hits.contains(1),
+            "an unrelated retire dropped a live document"
+        );
+    }
+
+    #[test]
+    fn remove_field_leaves_the_documents_other_fields_alone() {
+        let mut idx = PayloadIndex::new();
+        let color = field("color");
+        let size = field("size");
+        idx.insert_tag(&color, &Bytes::from_static(b"red"), 1);
+        idx.insert_numeric(&size, 42.0, 1);
+
+        idx.remove_field(&color, 1);
+
+        assert!(
+            idx.evaluate_bitmap(
+                &FilterExpr::NumEq {
+                    field: size,
+                    value: OrderedFloat(42.0)
+                },
+                8
+            )
+            .contains(1),
+            "removing one field retired the document from another"
+        );
+        // The document is still tracked, because it still has a field.
+        assert!(idx.doc_values.contains_key(&1));
     }
 
     #[test]

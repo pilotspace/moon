@@ -51,6 +51,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Nine new tracking rows cover the blocking family, including the two directions a fix must NOT
   break: an unserved candidate key, and a timed-out pop.
 
+### Performance
+- **Retiring a vector document from the payload index was quadratic in the field's cardinality**
+  (#614). `PayloadIndex::remove` and `remove_field` walked *every* distinct value bitmap of a
+  field, because nothing recorded which bitmaps the document was actually in. That is harmless on
+  `color` or `status`, and quadratic on `sku`, `price`, or any coordinate — fields whose distinct
+  value count grows with the corpus — so a bulk delete or re-index got slower as the index got
+  bigger. A per-document forward index (`internal_id -> field -> values written`) now makes the
+  retire path proportional to what the document actually wrote, and emptied bitmaps are dropped
+  rather than left behind to be walked forever (the moon#613 growth bug, in the sibling index).
+
+  Measured with the in-tree harness (`bench_payload_removal_cost_vs_cardinality`, `#[ignore]`d —
+  run it with `--nocapture`), timing the removal of every document one at a time. Per-document
+  cost used to double as the corpus doubled; it is now flat:
+
+  | docs | tag µs/doc before | after | numeric µs/doc before | after |
+  |---:|---:|---:|---:|---:|
+  | 250 | 0.98 | 0.28 | 0.86 | 0.28 |
+  | 500 | 1.71 | 0.23 | 1.59 | 0.28 |
+  | 1000 | 3.28 | 0.30 | 3.06 | 0.35 |
+  | 2000 | 6.54 | 0.24 | 5.56 | 0.27 |
+  | 4000 | 13.50 | 0.26 | 11.74 | 0.28 |
+
+  Total time to retire 4000 documents: 53.98ms -> 1.03ms (tag), 46.94ms -> 1.13ms (numeric). The
+  trade-off is memory: one entry per (document, field) written, holding the values. Tag values are
+  `Bytes` sharing the buffer already stored as the bitmap map's key; numerics are 8 bytes each.
 
 ## [0.8.6] — 2026-08-22
 
