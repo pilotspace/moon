@@ -463,6 +463,16 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "REPLCONF" => CommandMeta { name: "REPLCONF", arity: -1, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "PSYNC" => CommandMeta { name: "PSYNC", arity: 3, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "CLUSTER" => CommandMeta { name: "CLUSTER", arity: -2, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
+    // moon#635: four commands Moon ANSWERS but never published. A client that
+    // builds its table from `COMMAND LIST` refused to send them — the sharp
+    // one is `PUBSUB`, where a pub/sub client that feature-detects concluded
+    // the server has no pub/sub introspection at all. Arity and flags from
+    // `COMMAND INFO` on redis-server 8.6.1; each was confirmed to dispatch by
+    // SENDING it, because `COMMAND INFO` is exactly the surface under repair.
+    "PUBSUB" => CommandMeta { name: "PUBSUB", arity: -2, flags: CommandFlags::PUBSUB, first_key: 0, last_key: 0, step: 0, acl_categories: PUB },
+    "ASKING" => CommandMeta { name: "ASKING", arity: 1, flags: CommandFlags::FAST, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
+    "READONLY" => CommandMeta { name: "READONLY", arity: 1, flags: CommandFlags::FAST.union(CommandFlags::LOADING).union(CommandFlags::STALE), first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
+    "READWRITE" => CommandMeta { name: "READWRITE", arity: 1, flags: CommandFlags::FAST.union(CommandFlags::LOADING).union(CommandFlags::STALE), first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
 
     // ---- Vector search commands ----
     "FT.CREATE" => CommandMeta { name: "FT.CREATE", arity: -2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: SRCH },
@@ -750,6 +760,184 @@ pub fn is_read(cmd: &[u8]) -> bool {
 /// Return the total number of commands in the registry.
 pub fn command_count() -> usize {
     COMMAND_META.len()
+}
+
+// ---------------------------------------------------------------------------
+// Container subcommands (moon#635)
+// ---------------------------------------------------------------------------
+
+/// One subcommand of a container command, as `COMMAND LIST` must enumerate it.
+///
+/// Redis publishes every container subcommand as its own `container|sub` entry
+/// — 137 of its 411 `COMMAND LIST` names. Moon published NONE, which is why
+/// `COMMAND COUNT` and `COMMAND LIST` returned the identical number (263) where
+/// Redis's differ by design (274 vs 411). A client that builds its local
+/// command table from `COMMAND LIST` therefore never learned that `CONFIG`,
+/// `CLIENT`, `XINFO` and the rest have subcommands with their own arity.
+#[derive(Clone, Copy, Debug)]
+pub struct SubcommandMeta {
+    /// Uppercase subcommand name, WITHOUT the container prefix.
+    pub name: &'static str,
+    /// Same convention as [`CommandMeta::arity`], and it counts the CONTAINER
+    /// name too: `CONFIG GET p` is arity -3, not -2.
+    pub arity: i16,
+    pub flags: CommandFlags,
+    pub acl_categories: AclCategories,
+}
+
+/// Every subcommand Moon actually dispatches, keyed by uppercase container.
+///
+/// **Measured, not copied.** Each name here was probed against a live Moon
+/// (2026-08-22) with a per-container BOGUS subcommand as the control, because
+/// five containers answer an unknown subcommand with something other than
+/// "unknown subcommand" — `MEMORY` says "not supported", `XGROUP` says "not
+/// recognized", and `OBJECT` / `XINFO` / `HOTKEYS` answer an ARITY error, which
+/// a naive probe reads as "it exists". The first sweep believed all 31 of
+/// Redis's `CLUSTER` subcommands were present; with cluster support disabled
+/// every one of them answers "This instance has cluster support disabled", so
+/// the real count (18, measured with `--cluster-enabled`) was hidden.
+///
+/// Names Redis has and Moon does NOT are deliberately absent — `ACL DRYRUN`,
+/// `CLIENT UNBLOCK`, `COMMAND GETKEYS`, `SCRIPT KILL`, the `LATENCY` and
+/// `MODULE` families, and eleven `CLUSTER` subcommands. Publishing a name that
+/// does not dispatch is the same defect one level up, and
+/// `tests/command_list_subcommands.rs::cl3` fails if any listed name stops
+/// dispatching.
+///
+/// `HOTKEYS` is absent on purpose: Redis 8.6 models it as a container
+/// (`hotkeys|get`, `hotkeys|start`, …), Moon takes `HOTKEYS [COUNT n]` with no
+/// subcommands at all, so it has none to publish.
+///
+/// Arity and flags come from `COMMAND INFO <container>|<sub>` on redis-server
+/// 8.6.1 for the names the two servers share, since they implement the same
+/// syntax. Redis's `denyoom` and `no_async_loading` are dropped rather than
+/// translated: Moon models neither, and inventing them would be the same lie
+/// this table exists to stop telling.
+pub static SUBCOMMAND_META: phf::Map<&'static str, &'static [SubcommandMeta]> = phf_map! {
+    "ACL" => &[
+        SubcommandMeta { name: "CAT", arity: -2, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "DELUSER", arity: -3, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "GENPASS", arity: -2, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "GETUSER", arity: 3, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "HELP", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "LIST", arity: 2, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "LOAD", arity: 2, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "LOG", arity: -2, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "SAVE", arity: 2, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "SETUSER", arity: -3, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "USERS", arity: 2, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "WHOAMI", arity: 2, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+    ],
+    "CLIENT" => &[
+        SubcommandMeta { name: "GETNAME", arity: 2, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
+        SubcommandMeta { name: "ID", arity: 2, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
+        SubcommandMeta { name: "INFO", arity: 2, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
+        SubcommandMeta { name: "KILL", arity: -3, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
+        SubcommandMeta { name: "LIST", arity: -2, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
+        SubcommandMeta { name: "NO-EVICT", arity: 3, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
+        SubcommandMeta { name: "NO-TOUCH", arity: 3, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
+        SubcommandMeta { name: "PAUSE", arity: -3, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
+        SubcommandMeta { name: "SETNAME", arity: 3, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
+        SubcommandMeta { name: "TRACKING", arity: -3, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
+        SubcommandMeta { name: "UNPAUSE", arity: 2, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
+    ],
+    "CLUSTER" => &[
+        SubcommandMeta { name: "ADDSLOTS", arity: -3, flags: CommandFlags::ADMIN.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "COUNT-FAILURE-REPORTS", arity: 3, flags: CommandFlags::ADMIN.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "COUNTKEYSINSLOT", arity: 3, flags: CommandFlags::STALE, acl_categories: SRV },
+        SubcommandMeta { name: "DELSLOTS", arity: -3, flags: CommandFlags::ADMIN.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "FAILOVER", arity: -2, flags: CommandFlags::ADMIN.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "INFO", arity: 2, flags: CommandFlags::STALE, acl_categories: SRV },
+        SubcommandMeta { name: "KEYSLOT", arity: 3, flags: CommandFlags::STALE, acl_categories: SRV },
+        SubcommandMeta { name: "MEET", arity: -4, flags: CommandFlags::ADMIN.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "MYID", arity: 2, flags: CommandFlags::STALE, acl_categories: SRV },
+        SubcommandMeta { name: "MYSHARDID", arity: 2, flags: CommandFlags::STALE, acl_categories: SRV },
+        SubcommandMeta { name: "NODES", arity: 2, flags: CommandFlags::STALE, acl_categories: SRV },
+        SubcommandMeta { name: "REPLICAS", arity: 3, flags: CommandFlags::ADMIN.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "REPLICATE", arity: 3, flags: CommandFlags::ADMIN.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "RESET", arity: -2, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "SETSLOT", arity: -4, flags: CommandFlags::ADMIN.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "SHARDS", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "SLAVES", arity: 3, flags: CommandFlags::ADMIN.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "SLOTS", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
+    ],
+    "COMMAND" => &[
+        SubcommandMeta { name: "COUNT", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "DOCS", arity: -2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "INFO", arity: -2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "LIST", arity: -2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
+    ],
+    "CONFIG" => &[
+        SubcommandMeta { name: "GET", arity: -3, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "RESETSTAT", arity: 2, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "REWRITE", arity: 2, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "SET", arity: -4, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+    ],
+    "FUNCTION" => &[
+        SubcommandMeta { name: "DELETE", arity: 3, flags: CommandFlags::WRITE.union(CommandFlags::NOSCRIPT), acl_categories: SCR },
+        SubcommandMeta { name: "FLUSH", arity: -2, flags: CommandFlags::WRITE.union(CommandFlags::NOSCRIPT), acl_categories: SCR },
+        SubcommandMeta { name: "LIST", arity: -2, flags: CommandFlags::NOSCRIPT, acl_categories: SCR },
+        SubcommandMeta { name: "LOAD", arity: -3, flags: CommandFlags::WRITE.union(CommandFlags::NOSCRIPT), acl_categories: SCR },
+    ],
+    "MEMORY" => &[
+        SubcommandMeta { name: "DOCTOR", arity: 2, flags: CommandFlags::NONE, acl_categories: SRV },
+        SubcommandMeta { name: "HELP", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "STATS", arity: 2, flags: CommandFlags::NONE, acl_categories: SRV },
+        SubcommandMeta { name: "USAGE", arity: -3, flags: CommandFlags::READONLY, acl_categories: SRV },
+    ],
+    "OBJECT" => &[
+        SubcommandMeta { name: "ENCODING", arity: 3, flags: CommandFlags::READONLY, acl_categories: GEN },
+        SubcommandMeta { name: "FREQ", arity: 3, flags: CommandFlags::READONLY, acl_categories: GEN },
+        SubcommandMeta { name: "HELP", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: GEN },
+        SubcommandMeta { name: "IDLETIME", arity: 3, flags: CommandFlags::READONLY, acl_categories: GEN },
+        SubcommandMeta { name: "REFCOUNT", arity: 3, flags: CommandFlags::READONLY, acl_categories: GEN },
+    ],
+    "PUBSUB" => &[
+        SubcommandMeta { name: "CHANNELS", arity: -2, flags: CommandFlags::PUBSUB.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: PUB },
+        SubcommandMeta { name: "NUMPAT", arity: 2, flags: CommandFlags::PUBSUB.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: PUB },
+        SubcommandMeta { name: "NUMSUB", arity: -2, flags: CommandFlags::PUBSUB.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: PUB },
+        SubcommandMeta { name: "SHARDCHANNELS", arity: -2, flags: CommandFlags::PUBSUB.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: PUB },
+        SubcommandMeta { name: "SHARDNUMSUB", arity: -2, flags: CommandFlags::PUBSUB.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: PUB },
+    ],
+    "SCRIPT" => &[
+        SubcommandMeta { name: "EXISTS", arity: -3, flags: CommandFlags::NOSCRIPT, acl_categories: SCR },
+        SubcommandMeta { name: "FLUSH", arity: -2, flags: CommandFlags::NOSCRIPT, acl_categories: SCR },
+        SubcommandMeta { name: "LOAD", arity: 3, flags: CommandFlags::NOSCRIPT.union(CommandFlags::STALE), acl_categories: SCR },
+    ],
+    "SLOWLOG" => &[
+        SubcommandMeta { name: "GET", arity: -2, flags: CommandFlags::ADMIN.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "HELP", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "LEN", arity: 2, flags: CommandFlags::ADMIN.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "RESET", arity: 2, flags: CommandFlags::ADMIN.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+    ],
+    "XGROUP" => &[
+        SubcommandMeta { name: "CREATE", arity: -5, flags: CommandFlags::WRITE, acl_categories: STM },
+        SubcommandMeta { name: "CREATECONSUMER", arity: 5, flags: CommandFlags::WRITE, acl_categories: STM },
+        SubcommandMeta { name: "DELCONSUMER", arity: 5, flags: CommandFlags::WRITE, acl_categories: STM },
+        SubcommandMeta { name: "DESTROY", arity: 4, flags: CommandFlags::WRITE, acl_categories: STM },
+        SubcommandMeta { name: "SETID", arity: -5, flags: CommandFlags::WRITE, acl_categories: STM },
+    ],
+    "XINFO" => &[
+        SubcommandMeta { name: "CONSUMERS", arity: 4, flags: CommandFlags::READONLY, acl_categories: STM },
+        SubcommandMeta { name: "GROUPS", arity: 3, flags: CommandFlags::READONLY, acl_categories: STM },
+        SubcommandMeta { name: "STREAM", arity: -3, flags: CommandFlags::READONLY, acl_categories: STM },
+    ],
+};
+
+/// Look up a `container|sub` name, case-insensitively.
+///
+/// Returns `None` for a bare container name — that resolves through
+/// [`lookup`] like any other command.
+pub fn lookup_subcommand(container: &[u8], sub: &[u8]) -> Option<&'static SubcommandMeta> {
+    let cont = std::str::from_utf8(container).ok()?.to_ascii_uppercase();
+    let subs = SUBCOMMAND_META.get(cont.as_str())?;
+    subs.iter()
+        .find(|s| s.name.as_bytes().eq_ignore_ascii_case(sub))
+}
+
+/// Total number of container subcommands the registry publishes.
+pub fn subcommand_count() -> usize {
+    SUBCOMMAND_META.values().map(|v| v.len()).sum()
 }
 
 // ---------------------------------------------------------------------------

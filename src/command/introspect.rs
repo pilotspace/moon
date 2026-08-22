@@ -71,15 +71,74 @@ const CATEGORY_NAMES: &[(AclCategories, &str)] = &[
 /// and a client indexing by position needs the field to exist. Emitting six
 /// fields would make every modern driver's key-spec lookup fall off the end.
 fn spec_frame(meta: &CommandMeta) -> Frame {
+    // moon#635: a container command carries its subcommands' specs here, the
+    // way redis does. Everything else gets an empty Set, which is also what
+    // redis sends for a leaf command.
+    let subs = crate::command::metadata::SUBCOMMAND_META
+        .get(meta.name)
+        .map(|list| {
+            let mut out = crate::protocol::FrameVec::with_capacity(list.len());
+            for sub in list.iter() {
+                out.push(sub_spec_frame(meta.name, sub));
+            }
+            out
+        })
+        .unwrap_or_default();
+    spec_row(
+        meta.name.to_ascii_lowercase(),
+        meta.arity,
+        meta.flags,
+        meta.acl_categories,
+        meta.first_key,
+        meta.last_key,
+        meta.step,
+        subs,
+    )
+}
+
+/// The spec row for one container subcommand, named `container|sub` the way
+/// redis names it (moon#635).
+fn sub_spec_frame(container: &str, sub: &crate::command::metadata::SubcommandMeta) -> Frame {
+    let mut name = container.to_ascii_lowercase();
+    name.push('|');
+    name.push_str(&sub.name.to_ascii_lowercase());
+    // A subcommand never nests further, and none of Moon's takes a key at a
+    // fixed position — the key, when there is one, is at the container's
+    // position and `COMMAND GETKEYS` answers from the container's spec.
+    spec_row(
+        name,
+        sub.arity,
+        sub.flags,
+        sub.acl_categories,
+        0,
+        0,
+        0,
+        crate::protocol::FrameVec::new(),
+    )
+}
+
+/// The ten-member `COMMAND INFO` row, shared by commands and subcommands so
+/// the two cannot drift into different shapes.
+#[allow(clippy::too_many_arguments)]
+fn spec_row(
+    name_lower: String,
+    arity: i16,
+    cmd_flags: crate::command::metadata::CommandFlags,
+    acl_cats: crate::command::metadata::AclCategories,
+    first_key: i16,
+    last_key: i16,
+    step: i16,
+    subcommands: crate::protocol::FrameVec,
+) -> Frame {
     let mut flags = crate::protocol::FrameVec::new();
     for (bit, name) in FLAG_NAMES {
-        if meta.flags.contains(*bit) {
+        if cmd_flags.contains(*bit) {
             flags.push(Frame::SimpleString(Bytes::from_static(name.as_bytes())));
         }
     }
     let mut cats = crate::protocol::FrameVec::new();
     for (bit, name) in CATEGORY_NAMES {
-        if meta.acl_categories.contains(*bit) {
+        if acl_cats.contains(*bit) {
             cats.push(Frame::SimpleString(Bytes::from_static(name.as_bytes())));
         }
     }
@@ -90,16 +149,16 @@ fn spec_frame(meta: &CommandMeta) -> Frame {
     // (moon#631; item 3 of the `identity_command_info_known_and_unknown`
     // client-compat waiver).
     Frame::Array(framevec![
-        Frame::BulkString(Bytes::from(meta.name.to_ascii_lowercase())),
-        Frame::Integer(meta.arity as i64),
+        Frame::BulkString(Bytes::from(name_lower)),
+        Frame::Integer(arity as i64),
         Frame::Set(flags),
-        Frame::Integer(meta.first_key as i64),
-        Frame::Integer(meta.last_key as i64),
-        Frame::Integer(meta.step as i64),
+        Frame::Integer(first_key as i64),
+        Frame::Integer(last_key as i64),
+        Frame::Integer(step as i64),
         Frame::Set(cats),
         Frame::Set(framevec![]), // tips
         Frame::Set(framevec![]), // key specs
-        Frame::Set(framevec![]), // subcommands
+        Frame::Set(subcommands),
     ])
 }
 
@@ -233,13 +292,20 @@ fn getkeys(argv: &[Frame]) -> Frame {
 /// registry does not carry them. Omitting a field it has no value for is the
 /// honest gap; inventing one is not.
 fn docs_for(meta: &CommandMeta) -> (Frame, Frame) {
-    let arity_note = if meta.arity < 0 {
-        format!("{} (variadic, minimum {})", meta.name, -meta.arity)
+    docs_row(meta.name.to_ascii_lowercase(), meta.name, meta.arity)
+}
+
+/// One doc entry, shared by commands and subcommands so the two cannot drift
+/// into different shapes (moon#635). `display` is the name the summary text
+/// quotes; `name_lower` is the map key.
+fn docs_row(name_lower: String, display: &str, arity: i16) -> (Frame, Frame) {
+    let arity_note = if arity < 0 {
+        format!("{display} (variadic, minimum {})", -arity)
     } else {
-        format!("{} (arity {})", meta.name, meta.arity)
+        format!("{display} (arity {arity})")
     };
     (
-        Frame::BulkString(Bytes::from(meta.name.to_ascii_lowercase())),
+        Frame::BulkString(Bytes::from(name_lower)),
         Frame::Map(vec![
             (
                 Frame::BulkString(Bytes::from_static(b"summary")),
@@ -251,6 +317,49 @@ fn docs_for(meta: &CommandMeta) -> (Frame, Frame) {
             ),
         ]),
     )
+}
+
+/// Resolve a `COMMAND DOCS` name to its doc entry.
+///
+/// Redis resolves an explicitly-named `container|sub` here (measured on 8.6.1:
+/// `COMMAND DOCS config|get` answers a full doc map) even though its BARE
+/// `COMMAND DOCS` keys only the 274 top-level names and nests subcommand docs
+/// under each container instead. Moon matches both halves: this function is
+/// used only on the explicit-name path (moon#635).
+fn resolve_docs(name: &[u8]) -> Option<(Frame, Frame)> {
+    match name.iter().position(|b| *b == b'|') {
+        None => crate::command::metadata::lookup(name).map(docs_for),
+        Some(bar) => {
+            let (container, sub) = (&name[..bar], &name[bar + 1..]);
+            let meta = crate::command::metadata::lookup(container)?;
+            let sub_meta = crate::command::metadata::lookup_subcommand(container, sub)?;
+            let mut key = meta.name.to_ascii_lowercase();
+            key.push('|');
+            key.push_str(&sub_meta.name.to_ascii_lowercase());
+            let display = key.clone();
+            Some(docs_row(key, &display, sub_meta.arity))
+        }
+    }
+}
+
+/// Resolve a `COMMAND INFO` name to its spec row.
+///
+/// Accepts either a plain command name or the `container|sub` form redis uses
+/// and `COMMAND LIST` now publishes (moon#635). Without this, a client that
+/// read `config|get` out of `COMMAND LIST` and asked `COMMAND INFO` about it
+/// got a null element — publishing a name the very next call denies.
+fn resolve_spec(name: &[u8]) -> Option<Frame> {
+    match name.iter().position(|b| *b == b'|') {
+        None => crate::command::metadata::lookup(name).map(spec_frame),
+        Some(bar) => {
+            let (container, sub) = (&name[..bar], &name[bar + 1..]);
+            // The container must itself be registered: `NOSUCH|GET` is not a
+            // subcommand of anything.
+            let meta = crate::command::metadata::lookup(container)?;
+            let sub_meta = crate::command::metadata::lookup_subcommand(container, sub)?;
+            Some(sub_spec_frame(meta.name, sub_meta))
+        }
+    }
 }
 
 fn extract(f: &Frame) -> Option<Bytes> {
@@ -280,11 +389,26 @@ pub fn command(args: &[Frame]) -> Frame {
         if args.len() != 1 {
             return err("ERR Unknown subcommand or wrong number of arguments for 'LIST'");
         }
-        let mut out = crate::protocol::FrameVec::with_capacity(COMMAND_META.len());
+        // moon#635: containers first, then every `container|sub` — the shape
+        // redis publishes. `COMMAND COUNT` deliberately does NOT grow to
+        // match: redis counts only top-level commands (274) while listing
+        // 411, and the two agreeing was itself the tell that Moon enumerated
+        // no subcommands at all.
+        let mut out = crate::protocol::FrameVec::with_capacity(
+            COMMAND_META.len() + crate::command::metadata::subcommand_count(),
+        );
         for meta in COMMAND_META.values() {
             out.push(Frame::BulkString(Bytes::from(
                 meta.name.to_ascii_lowercase(),
             )));
+        }
+        for (container, subs) in crate::command::metadata::SUBCOMMAND_META.entries() {
+            for sub in subs.iter() {
+                let mut name = container.to_ascii_lowercase();
+                name.push('|');
+                name.push_str(&sub.name.to_ascii_lowercase());
+                out.push(Frame::BulkString(Bytes::from(name)));
+            }
         }
         return Frame::Array(out);
     }
@@ -297,8 +421,7 @@ pub fn command(args: &[Frame]) -> Frame {
         let mut out = crate::protocol::FrameVec::with_capacity(args.len() - 1);
         for a in &args[1..] {
             let spec = extract(a)
-                .and_then(|n| crate::command::metadata::lookup(&n))
-                .map(spec_frame)
+                .and_then(|n| resolve_spec(&n))
                 // An unknown name is a NULL ELEMENT inside the array, not a
                 // skipped entry: the reply is positional, so dropping it would
                 // silently misalign every name after it.
@@ -321,8 +444,8 @@ pub fn command(args: &[Frame]) -> Frame {
             }
         } else {
             for a in &args[1..] {
-                if let Some(meta) = extract(a).and_then(|n| crate::command::metadata::lookup(&n)) {
-                    out.push(docs_for(meta));
+                if let Some(entry) = extract(a).and_then(|n| resolve_docs(&n)) {
+                    out.push(entry);
                 }
                 // Redis omits unknown names from DOCS entirely (unlike INFO,
                 // which is positional and uses a null element).

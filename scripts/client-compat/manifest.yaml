@@ -273,6 +273,69 @@ entries:
     command: "ROLE"
     policy: type_only
 
+  # ── COMMAND LIST container surface (moon#635) ─────────────────────────
+  # `COMMAND LIST` must enumerate container subcommands as `container|sub`
+  # entries the way redis does. Before the fix Moon emitted ZERO names
+  # containing `|`, so `COMMAND COUNT` and `COMMAND LIST` returned the
+  # identical 263 where redis's legitimately differ (274 vs 411) — that
+  # equality was the tell. `type_only` because the COUNTS are supposed to
+  # differ (Moon implements fewer subcommands: 82 vs redis's 137), while the
+  # reply TYPE is what a client building its command table dispatches on.
+  #
+  # `COMMAND INFO config|get` is the follow-through: publishing a name that
+  # the very next call answers with a null element would be worse than not
+  # publishing it at all.
+  - name: command_list_publishes_subcommands
+    command: "COMMAND LIST"
+    policy: type_only
+    expect_diff:
+      reason: >-
+        FIXED in moon#635 to the extent Moon can: `COMMAND LIST` now publishes
+        `container|sub` entries at all, where it published ZERO before. What
+        remains is a COUNT gap, not a shape one — 349 names (267 top-level + 82
+        subcommands) against redis 8.6.1's 411 (274 + 137) — and `type_only`
+        still compares element counts, so it cannot be a live assertion while
+        Moon implements fewer commands than redis. That is a permanent
+        condition, not a defect: every name Moon publishes is asserted to
+        actually dispatch by command_list_subcommands::cl3, and every name it
+        omits is one Moon does not implement.
+        Owner: none — this waiver retires only if Moon reaches command parity.
+
+  - name: command_info_resolves_a_subcommand_name
+    command: "COMMAND INFO config|get"
+    policy: type_only
+    expect_diff:
+      reason: >-
+        NEW in moon#635 — before it, this was a NULL element: `config|get` was
+        a name no server-side lookup could resolve. Moon now matches redis
+        8.6.1 on the name, the arity (-3) and all four flags (admin, noscript,
+        loading, stale), element for element. The single remaining divergence
+        is acl_categories: redis reports @admin @slow @dangerous, Moon reports
+        @server. That is the SAME registry-wide acl_categories thinness already
+        waived on identity_command_info_known_and_unknown and
+        monitor_command_is_registered, not a subcommand-specific gap.
+        Owner: sdk-wire-form-fixes, which owns acl_categories completeness.
+
+  # The other half of the container surface. Redis SPLITS the two forms and
+  # moon#635 matches the split: an explicitly named `container|sub` resolves,
+  # while the BARE `COMMAND DOCS` keys only top-level names (redis's has 274
+  # keys, none containing a `|` — subcommand docs are nested under each
+  # container instead of flattened the way LIST flattens them).
+  - name: command_docs_resolves_a_subcommand_name
+    command: "COMMAND DOCS config|get"
+    policy: type_only
+    expect_diff:
+      reason: >-
+        NEW in moon#635 — before it, this answered an EMPTY map, so a client
+        that read `config|get` out of `COMMAND LIST` and asked for its docs got
+        nothing back. Moon now answers a doc map keyed `config|get`, matching
+        redis 8.6.1 on the key and on `summary`/`since`. It does not carry
+        `group`, `complexity`, `history` or `arguments`: Moon's registry holds
+        no value for those fields, and omitting a field it cannot fill is the
+        honest gap where inventing one is not — the SAME omission already
+        waived on shapes_command_docs for the top-level form.
+        Owner: sdk-wire-form-fixes, which owns COMMAND DOCS field completeness.
+
   - name: identity_command_info_known_and_unknown
     command: "COMMAND INFO GET nosuchcmd"
     policy: type_only

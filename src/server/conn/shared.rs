@@ -2085,11 +2085,15 @@ pub(crate) fn is_transaction_control(cmd: &[u8]) -> bool {
 /// too, because Moon does not implement it at all. Exempting it would have
 /// papered over nothing and hidden a genuine unimplemented command.
 ///
-/// `PUBSUB` is absent from `COMMAND_META`, so `queue_time_rejection` would call
-/// it an unknown command and poison the transaction — it has no dot, so the
-/// dotted carve-out misses it. That is exactly the regression class the §1 ⚠
-/// assumption named. It is handled by `queue_time_rejection` consulting this
-/// list, not by exempting it from queueing.
+/// `PUBSUB` was absent from `COMMAND_META` when this list was written, so
+/// `queue_time_rejection` would have called it an unknown command and poisoned
+/// the transaction — it has no dot, so the dotted carve-out missed it. That is
+/// exactly the regression class the §1 ⚠ assumption named, and it is handled by
+/// `queue_time_rejection` consulting this list rather than by exempting
+/// `PUBSUB` from queueing. **moon#635 registered `PUBSUB` (it was a command
+/// Moon answered but never published), so that specific hole is closed at the
+/// source too** — the belt-and-braces reading of this list is unchanged, and
+/// the next unregistered container to land here would hit the same trap.
 ///
 /// Removing an entry from this list requires teaching `execute_transaction` to
 /// run it. The test `me10` asserts every queued command's EXEC result is not an

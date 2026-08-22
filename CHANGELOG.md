@@ -164,6 +164,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--shards 1` and `--shards 4`).
 
 ### Fixed
+- **`COMMAND LIST` published no container subcommands, and omitted four commands Moon answers** (#635).
+  Redis enumerates every container subcommand as its own `container|sub` entry — 137 of its 411
+  `COMMAND LIST` names — which is why its `LIST` is larger than its `COUNT`. Moon emitted zero names
+  containing `|`, so the two returned the identical number, and that equality was the tell:
+
+  ```text
+                   COMMAND COUNT   COMMAND LIST   of which container|sub
+    redis 8.6.1          274            411               137
+    moon (before)        263            263                 0
+    moon (after)         267            349                82
+  ```
+
+  A client library builds its local command table from `COMMAND LIST`. Against the old Moon it
+  refused to send `PUBSUB CHANNELS` (works, was unlisted — a pub/sub client that feature-detects
+  concluded the server had no pub/sub introspection at all), and it never learned that `CONFIG`,
+  `CLIENT`, `XINFO` and ten other containers take subcommands with their own arity. `ASKING`,
+  `READONLY` and `READWRITE` were unlisted for the same reason. `COMMAND INFO container|sub` now
+  resolves too, and a container's own spec carries its subcommands' specs the way redis's does.
+
+  `COMMAND DOCS` follows redis's split, measured on 8.6.1: an **explicitly named** `container|sub`
+  resolves to a doc map, while the **bare** `COMMAND DOCS` keys only the top-level names (redis's
+  answer has 274 keys and not one contains a `|`, because it nests subcommand docs under each
+  container rather than flattening them the way `LIST` does).
+
+  **`COMMAND COUNT` deliberately does not grow to match `LIST`** — redis counts only top-level
+  commands, and the two agreeing is precisely the symptom this fixes.
+
+  The 82 names are **measured, not copied from redis**. Each was probed against a live Moon with a
+  per-container BOGUS control, because five containers answer an unknown subcommand with something
+  other than "unknown subcommand": `MEMORY` says "not supported", `XGROUP` says "not recognized",
+  and `OBJECT` / `XINFO` / `HOTKEYS` answer an ARITY error, which a naive probe reads as "it
+  exists". The first sweep believed all 31 of redis's `CLUSTER` subcommands were present — with
+  cluster support disabled every one answers "This instance has cluster support disabled", hiding
+  the real count of 18. Names Moon does not implement (`ACL DRYRUN`, `CLIENT UNBLOCK`, `SCRIPT
+  KILL`, the `LATENCY` and `MODULE` families, 13 `CLUSTER` subcommands) are deliberately absent,
+  and `command_list_subcommands::cl3` SENDS every published name and fails if one stops
+  dispatching. `HOTKEYS` publishes none: redis models it as a container, Moon takes
+  `HOTKEYS [COUNT n]` with no subcommands at all.
+
 - **`AUTH <password>` answered `+OK` on a server with no password configured** (#640). That is the
   standard probe for "does this server require authentication?", so a deployment that MEANT to set
   `requirepass` and did not looked correctly secured from the client side. The single-argument form

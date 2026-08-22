@@ -1320,16 +1320,34 @@ count_is_positive_int() {
 assert_eq "COMMAND COUNT is a positive integer" \
     "$(count_is_positive_int "$PORT_REDIS")" "$(count_is_positive_int "$PORT_RUST")"
 
-# The bare COMMAND array must hold exactly COMMAND COUNT entries on each server.
-count_matches_specs() {
-    local port="$1" n specs
+# `COMMAND LIST` must be LARGER than `COMMAND COUNT`, on both servers, because
+# LIST enumerates container subcommands as `container|sub` entries and COUNT
+# counts only top-level commands.
+#
+# This check used to assert the two were EQUAL (moon#635). It passed on Moon
+# for the wrong reason -- Moon published no subcommands at all, so the numbers
+# matched -- and disagreed with redis, where they legitimately differ (274 vs
+# 411). Comparing the two servers' rendered "mismatch(a vs b)" strings could
+# never have agreed either, since the numbers differ by construction. What is
+# comparable is the RELATION, and the count of `|` names is the direct
+# evidence: zero of them was the whole defect.
+count_vs_list() {
+    local port="$1" n listed subs
     n="$(redis-cli -p "$port" COMMAND COUNT 2>&1)"
-    # One line per top-level spec: count the lines that open a spec's name.
-    specs="$(redis-cli -p "$port" COMMAND LIST 2>&1 | grep -c .)"
-    [[ "$n" == "$specs" ]] && echo "match" || echo "mismatch($n vs $specs)"
+    listed="$(redis-cli -p "$port" COMMAND LIST 2>&1 | grep -c .)"
+    subs="$(redis-cli -p "$port" COMMAND LIST 2>&1 | grep -c '|')"
+    if [[ ! "$n" =~ ^[0-9]+$ ]]; then
+        echo "COUNT-NOT-AN-INT:$n"
+    elif [[ "$subs" -eq 0 ]]; then
+        echo "no-subcommands-published"
+    elif [[ "$listed" -gt "$n" ]]; then
+        echo "list>count-with-subcommands"
+    else
+        echo "list($listed)-not-greater-than-count($n)"
+    fi
 }
-assert_eq "COMMAND COUNT equals COMMAND LIST length" \
-    "$(count_matches_specs "$PORT_REDIS")" "$(count_matches_specs "$PORT_RUST")"
+assert_eq "COMMAND LIST exceeds COMMAND COUNT and publishes subcommands" \
+    "$(count_vs_list "$PORT_REDIS")" "$(count_vs_list "$PORT_RUST")"
 
 assert_both "COMMAND GETKEYS extracts keys" COMMAND GETKEYS MSET ik1 v1 ik2 v2
 assert_both "COMMAND GETKEYS rejects a keyless command" COMMAND GETKEYS PING

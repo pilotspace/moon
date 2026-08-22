@@ -852,6 +852,12 @@ if should_run "connection"; then
     # regression to a stub cannot slip past as "ok".
     assert_moon_contains "COMMAND INFO GET names the command" "get" COMMAND INFO GET
     assert_moon_contains "COMMAND LIST includes reset" "reset" COMMAND LIST
+    # moon#635: the container surface. `pubsub` is a command Moon ANSWERS but
+    # never published, so a client building its table from LIST refused to send
+    # it; `config|get` is the subcommand form Moon published none of.
+    assert_moon_contains "COMMAND LIST includes pubsub" "pubsub" COMMAND LIST
+    assert_moon_contains "COMMAND LIST includes container subcommands" "config|get" COMMAND LIST
+    assert_moon_contains "COMMAND INFO resolves a subcommand" "config|get" COMMAND INFO "config|get"
     assert_moon_contains "COMMAND GETKEYS extracts the key" "k1" COMMAND GETKEYS MSET k1 v1 k2 v2
     assert_moon_contains "COMMAND GETKEYS rejects keyless" "no key arguments" COMMAND GETKEYS PING
     # moon#537: `first_key: 0` mirrors redis and means "the keys are not at a
