@@ -1065,7 +1065,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- Lua scripting: EVAL / EVALSHA ---
-                    if cmd.eq_ignore_ascii_case(b"EVAL") || cmd.eq_ignore_ascii_case(b"EVALSHA") {
+                    let script_read_only = cmd.eq_ignore_ascii_case(b"EVAL_RO")
+                        || cmd.eq_ignore_ascii_case(b"EVALSHA_RO");
+                    let script_is_eval =
+                        cmd.eq_ignore_ascii_case(b"EVAL") || cmd.eq_ignore_ascii_case(b"EVAL_RO");
+                    if script_is_eval
+                        || cmd.eq_ignore_ascii_case(b"EVALSHA")
+                        || cmd.eq_ignore_ascii_case(b"EVALSHA_RO")
+                    {
                         // moon#508: a script whose keys all live on another
                         // shard runs THERE. Same helper as handler_monoio —
                         // one routing policy, not two that can drift.
@@ -1073,7 +1080,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // a later EVALSHA is answerable from every shard.
                         // Before routing, so the load and the execution reach
                         // the target over the same ring in that order.
-                        if cmd.eq_ignore_ascii_case(b"EVAL") {
+                        // `EVAL_RO` carries a body too, so it owes the same
+                        // fan-out: a later `EVALSHA`/`EVALSHA_RO` of that sha
+                        // must be answerable from every shard.
+                        if script_is_eval {
                             crate::server::conn::shared::eval_script_fanout(
                                 ctx, &shutdown, cmd_args,
                             )
@@ -1101,17 +1111,17 @@ pub(crate) async fn handle_connection_sharded_inner<
                         let db_count = ctx.shard_databases.db_count();
                         // Unconditional slice path: ShardSlice is always initialized.
                         let response = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                            if cmd.eq_ignore_ascii_case(b"EVAL") {
+                            if script_is_eval {
                                 crate::scripting::handle_eval(
                                     &ctx.lua, &ctx.script_cache, cmd_args, db,
                                     ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
-                                    &script_acl,
+                                    &script_acl, script_read_only,
                                 )
                             } else {
                                 crate::scripting::handle_evalsha(
                                     &ctx.lua, &ctx.script_cache, cmd_args, db,
                                     ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
-                                    &script_acl,
+                                    &script_acl, script_read_only,
                                 )
                             }
                         });

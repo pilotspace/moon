@@ -1058,6 +1058,14 @@ if should_run "scripting"; then
     rcli SET lua:k1 luaval >/dev/null 2>&1; mcli SET lua:k1 luaval >/dev/null 2>&1
     assert_match "EVAL redis.call"     EVAL "return redis.call('GET', KEYS[1])" 1 lua:k1
     assert_match "EVAL table"          EVAL "return {1,2,3}" 0
+    # moon#636: EVAL_RO is EVAL with ONE difference — a write is refused. The
+    # read row is the control: without it, a handler that refused everything
+    # in read-only mode would look correct.
+    assert_match "EVAL_RO reads"       EVAL_RO "return redis.call('GET', KEYS[1])" 1 lua:k1
+    assert_moon_contains "EVAL_RO refuses a write" "read-only" \
+        EVAL_RO "return redis.call('SET', KEYS[1], 'x')" 1 lua:k1
+    # ...and refused means the value did NOT change.
+    assert_match "EVAL_RO write did not land" GET lua:k1
 
     # moon#515: Redis caches an EVAL'd body server-wide, so EVAL-then-EVALSHA
     # is a supported idiom. moon cached it only on the executing shard, so at

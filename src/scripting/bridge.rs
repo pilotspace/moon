@@ -812,7 +812,9 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"1")),
             Frame::BulkString(Bytes::from_static(b"cow517")),
         ];
-        let run_script = crate::scripting::handle_eval;
+        let run_script = |lua: &_, cache: &_, args: &_, db: &mut _, a, b, c, d, acl: &_| {
+            crate::scripting::handle_eval(lua, cache, args, db, a, b, c, d, acl, false)
+        };
         let result = run_script(
             &lua,
             &cache,

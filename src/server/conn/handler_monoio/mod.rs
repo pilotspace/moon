@@ -1907,12 +1907,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if cmd_len == 7 && dispatch::try_handle_cluster(cmd, cmd_args, ctx, shaped!()) {
                 continue;
             }
-            if cmd_len == 7
+            // Lengths, not names: 7 is EVALSHA *and* EVAL_RO, 10 is
+            // EVALSHA_RO, 4 is EVAL. EVALSHA runs first and rejects EVAL_RO by
+            // name, so the 7-byte case falls through to the EVAL handler.
+            if (cmd_len == 7 || cmd_len == 10)
                 && dispatch::try_handle_evalsha(cmd, cmd_args, &conn, ctx, shaped!()).await
             {
                 continue;
             }
-            if cmd_len == 4
+            if (cmd_len == 4 || cmd_len == 7)
                 && dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &shutdown, shaped!()).await
             {
                 continue;

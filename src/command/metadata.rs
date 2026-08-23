@@ -436,6 +436,11 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     // ---- Scripting commands ----
     "EVAL" => CommandMeta { name: "EVAL", arity: -3, flags: CommandFlags(CommandFlags::NOSCRIPT.0 | CommandFlags::MAY_REPLICATE.0 | CommandFlags::NO_MANDATORY_KEYS.0), first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
     "EVALSHA" => CommandMeta { name: "EVALSHA", arity: -3, flags: CommandFlags(CommandFlags::NOSCRIPT.0 | CommandFlags::MAY_REPLICATE.0 | CommandFlags::NO_MANDATORY_KEYS.0), first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
+    // The `_RO` twins carry READONLY where their parents carry MAY_REPLICATE:
+    // a read-only script emits nothing to replicate, and the flag is what ACL
+    // and the read-only-replica gate read.
+    "EVAL_RO" => CommandMeta { name: "EVAL_RO", arity: -3, flags: CommandFlags(CommandFlags::READONLY.0 | CommandFlags::NOSCRIPT.0 | CommandFlags::NO_MANDATORY_KEYS.0), first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
+    "EVALSHA_RO" => CommandMeta { name: "EVALSHA_RO", arity: -3, flags: CommandFlags(CommandFlags::READONLY.0 | CommandFlags::NOSCRIPT.0 | CommandFlags::NO_MANDATORY_KEYS.0), first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
     "SCRIPT" => CommandMeta { name: "SCRIPT", arity: -2, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
     "FUNCTION" => CommandMeta { name: "FUNCTION", arity: -2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
     "FCALL" => CommandMeta { name: "FCALL", arity: -3, flags: CommandFlags(CommandFlags::WRITE.0 | CommandFlags::NO_MANDATORY_KEYS.0), first_key: 3, last_key: 0, step: 1, acl_categories: SCR },

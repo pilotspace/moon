@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`EVAL_RO` and `EVALSHA_RO`** (#636). The read-only script forms clients use to send
+  scripts to a replica, or to prove to themselves that a script cannot write. Previously
+  `-ERR unknown command`.
+
+  Both share `EVAL`/`EVALSHA`'s entire path — parsing, cross-shard routing, the
+  server-wide body fan-out, the caller's ACL — and differ in one bit handed to the
+  executor: a write attempted from the script body is refused at the first `redis.call`,
+  before it lands, not reported after the fact. The refusal machinery already existed
+  for `FCALL_RO`; this wires the `EVAL` family into it. The read-only bit travels with a
+  routed script, so `EVAL_RO` stays read-only when its keys live on another shard — the
+  place it would most easily have been dropped.
+
+  Verified against redis-server 8.6.1 at `--shards 1` **and** `--shards 4`: reads
+  answered, writes refused, the value provably unchanged after each refusal, and plain
+  `EVAL` still writing as the control.
+
 - **`HSTRLEN` and `MODULE`** (#636). Two commands clients reach for that moon answered
   with `-ERR unknown command`.
 
@@ -77,6 +93,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as an answer. That shard also logs a warning, because cold keys with no manifest will not
   survive a restart — `rebuild_from_manifest` is the only thing that re-indexes them.
 ### Fixed
+- **`EVALSHA <sha>` with no `numkeys` answered `NOSCRIPT` instead of an arity error**
+  (#636). redis rejects on arity (`-3`) before it ever looks the sha up. A client told
+  `NOSCRIPT` re-runs `SCRIPT LOAD` and retries the same malformed call — forever.
 - **`MQ POP` no longer strands messages it claimed but never returned** (#652).
   `MQ POP <key> COUNT <n>` asks `read_group_new` for `n + max_delivery_count`
   entries so that dead letters do not consume the caller's budget, then returns

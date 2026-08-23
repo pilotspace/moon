@@ -65,6 +65,20 @@ pub fn vm_used_memory(slot: &ShardLuaSlot) -> Option<usize> {
     }
 }
 
+/// The arity error names the command the CLIENT sent, which for the `_RO`
+/// twins is not the name of the handler they share. Measured against redis
+/// 8.6.1: `EVAL_RO body` answers `...for 'eval_ro' command`, and `EVALSHA sha`
+/// answers an arity error rather than `NOSCRIPT` — redis checks arity (-3)
+/// before it looks a sha up (moon#636).
+fn eval_arity_error(sha_form: bool, read_only: bool) -> Frame {
+    Frame::Error(Bytes::from_static(match (sha_form, read_only) {
+        (false, false) => b"ERR wrong number of arguments for 'eval' command",
+        (false, true) => b"ERR wrong number of arguments for 'eval_ro' command",
+        (true, false) => b"ERR wrong number of arguments for 'evalsha' command",
+        (true, true) => b"ERR wrong number of arguments for 'evalsha_ro' command",
+    }))
+}
+
 /// Handle the EVAL Redis command: parse args, validate keys, cache script, run.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_eval(
@@ -77,7 +91,15 @@ pub fn handle_eval(
     selected_db: usize,
     db_count: usize,
     acl: &crate::acl::ScriptAcl,
+    // `true` for `EVAL_RO`: any write attempted by the script body is refused
+    // at the first `redis.call`, not merely reported afterwards.
+    read_only: bool,
 ) -> Frame {
+    // Arity BEFORE parsing: `parse_eval_args` is shared with `EVALSHA` and the
+    // routing helpers, so it cannot know which name to put in the error.
+    if args.len() < 2 {
+        return eval_arity_error(false, read_only);
+    }
     let (script, _numkeys, keys, argv) = match parse_eval_args(args) {
         Ok(parsed) => parsed,
         Err(e) => return e,
@@ -102,6 +124,7 @@ pub fn handle_eval(
         selected_db,
         db_count,
         acl,
+        read_only,
     )
 }
 
@@ -117,11 +140,14 @@ pub fn handle_evalsha(
     selected_db: usize,
     db_count: usize,
     acl: &crate::acl::ScriptAcl,
+    // `true` for `EVALSHA_RO` — see [`handle_eval`].
+    read_only: bool,
 ) -> Frame {
-    if args.is_empty() {
-        return Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'evalsha' command",
-        ));
+    // `EVALSHA <sha>` with no numkeys is an ARITY error, not `NOSCRIPT`:
+    // redis rejects on arity (-3) before it ever looks the sha up, and a
+    // client that sees NOSCRIPT will pointlessly re-`SCRIPT LOAD` and retry.
+    if args.len() < 2 {
+        return eval_arity_error(true, read_only);
     }
 
     // Extract SHA1 hex from first argument
@@ -170,6 +196,7 @@ pub fn handle_evalsha(
         selected_db,
         db_count,
         acl,
+        read_only,
     )
 }
 
@@ -445,12 +472,19 @@ fn run_script(
     selected_db: usize,
     db_count: usize,
     acl: &crate::acl::ScriptAcl,
+    read_only: bool,
 ) -> Frame {
     // Set thread-local DB pointer + caller identity for the redis.call/pcall
     // bridge. `acl` is what every inner command is authorized against
     // (moon#569) — the script body itself is never trusted to declare what it
     // will touch.
     bridge::set_script_db(db, selected_db, db_count, acl);
+    // `EVAL_RO`/`EVALSHA_RO`. Armed AFTER `set_script_db`, which clears the
+    // flag as part of installing a fresh script context, and disarmed by
+    // `clear_script_db` on every exit path below — the flag is a thread-local
+    // and one shard thread runs every script for its connections, so a sticky
+    // `true` would silently turn later plain `EVAL`s into `EVAL_RO`.
+    bridge::set_script_read_only(read_only);
 
     // Install timeout hook (5-second wall-clock limit)
     let timeout = Duration::from_secs(5);
@@ -655,6 +689,7 @@ mod tests {
             0,
             1,
             &crate::acl::ScriptAcl::trusted(),
+            false,
         );
         assert!(matches!(result, Frame::Integer(42)));
     }
@@ -673,6 +708,7 @@ mod tests {
             0,
             1,
             &crate::acl::ScriptAcl::trusted(),
+            false,
         );
         assert!(matches!(result, Frame::BulkString(b) if b == Bytes::from_static(b"mykey")));
     }
@@ -692,6 +728,7 @@ mod tests {
             0,
             1,
             &crate::acl::ScriptAcl::trusted(),
+            false,
         );
         assert!(matches!(result, Frame::BulkString(b) if b == Bytes::from_static(b"testval")));
     }
@@ -711,6 +748,7 @@ mod tests {
             0,
             1,
             &crate::acl::ScriptAcl::trusted(),
+            false,
         );
         // pcall returns {err = ...} table, which converts to Frame::Error
         assert!(matches!(result, Frame::Error(_)));
@@ -731,6 +769,7 @@ mod tests {
             0,
             1,
             &crate::acl::ScriptAcl::trusted(),
+            false,
         );
         assert!(matches!(result, Frame::BulkString(b) if b == Bytes::from_static(b"hello")));
 
@@ -744,6 +783,7 @@ mod tests {
             0,
             1,
             &crate::acl::ScriptAcl::trusted(),
+            false,
         );
         assert!(matches!(result, Frame::Null));
 
@@ -757,6 +797,7 @@ mod tests {
             0,
             1,
             &crate::acl::ScriptAcl::trusted(),
+            false,
         );
         assert!(matches!(result, Frame::Null));
 
@@ -770,6 +811,7 @@ mod tests {
             0,
             1,
             &crate::acl::ScriptAcl::trusted(),
+            false,
         );
         assert!(matches!(result, Frame::Integer(1)));
 
@@ -783,6 +825,7 @@ mod tests {
             0,
             1,
             &crate::acl::ScriptAcl::trusted(),
+            false,
         );
         match result {
             Frame::Array(items) => {
@@ -870,6 +913,7 @@ mod tests {
             0,
             1,
             &acl,
+            false,
         );
         match denied {
             Frame::Error(e) => assert!(
@@ -891,6 +935,7 @@ mod tests {
             0,
             1,
             &acl,
+            false,
         );
         assert!(
             matches!(&allowed, Frame::BulkString(b) if b.as_ref() == b"v"),
@@ -916,7 +961,7 @@ mod tests {
             // runtime-computed weight keys: unnameable, so DENY
             b"return redis.call('SORT', 'app:l', 'BY', 'secret:w_*')",
         ] {
-            let r = run_script(&lua, body, vec![], vec![], &mut db, 0, 1, &acl);
+            let r = run_script(&lua, body, vec![], vec![], &mut db, 0, 1, &acl, false);
             assert!(
                 matches!(&r, Frame::Error(e) if e.starts_with(b"NOPERM")),
                 "not denied: {} -> {r:?}",
@@ -934,6 +979,7 @@ mod tests {
             0,
             1,
             &acl,
+            false,
         );
         assert!(matches!(r, Frame::Integer(0)), "unexpected: {r:?}");
     }
@@ -954,6 +1000,7 @@ mod tests {
             0,
             1,
             &crate::acl::ScriptAcl::deny(),
+            false,
         );
         assert!(
             matches!(&r, Frame::Error(e) if e.starts_with(b"NOPERM")),
@@ -982,8 +1029,203 @@ mod tests {
             0,
             1,
             &crate::acl::ScriptAcl::trusted(),
+            false,
         );
         assert!(matches!(result, Frame::Integer(42)));
+    }
+
+    /// `EVAL_RO` is `EVAL` with one difference that matters: a write inside
+    /// the script is refused. The read half is the control — without it, a
+    /// handler that refused *everything* in read-only mode would pass.
+    #[test]
+    fn eval_ro_reads_but_refuses_a_write() {
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+        let cache = Rc::new(RefCell::new(ScriptCache::new()));
+        let mut db = Database::new();
+        db.set(
+            Bytes::from_static(b"rk"),
+            crate::storage::Entry::new_string(Bytes::from_static(b"hello")),
+        );
+
+        let read = vec![
+            Frame::BulkString(Bytes::from_static(b"return redis.call('GET', KEYS[1])")),
+            Frame::BulkString(Bytes::from_static(b"1")),
+            Frame::BulkString(Bytes::from_static(b"rk")),
+        ];
+        let r = handle_eval(
+            &lua,
+            &cache,
+            &read,
+            &mut db,
+            0,
+            1,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+            true,
+        );
+        assert!(
+            matches!(&r, Frame::BulkString(v) if v.as_ref() == b"hello"),
+            "a read-only script must still be able to READ: {r:?}"
+        );
+
+        let write = vec![
+            Frame::BulkString(Bytes::from_static(
+                b"return redis.call('SET', KEYS[1], 'x')",
+            )),
+            Frame::BulkString(Bytes::from_static(b"1")),
+            Frame::BulkString(Bytes::from_static(b"rk")),
+        ];
+        let w = handle_eval(
+            &lua,
+            &cache,
+            &write,
+            &mut db,
+            0,
+            1,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+            true,
+        );
+        assert!(
+            matches!(&w, Frame::Error(e) if e.windows(11).any(|c| c == b"read-only s")),
+            "a write from a read-only script must be refused: {w:?}"
+        );
+        // ...and refused means NOT APPLIED, not merely reported.
+        let after = handle_eval(
+            &lua,
+            &cache,
+            &read,
+            &mut db,
+            0,
+            1,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+            true,
+        );
+        assert!(
+            matches!(&after, Frame::BulkString(v) if v.as_ref() == b"hello"),
+            "the refused write still landed: {after:?}"
+        );
+    }
+
+    /// The read-only flag must not leak into the NEXT script on the same VM.
+    /// It lives in a thread-local, and a shard thread runs every script for
+    /// its connections, so a sticky flag would silently turn plain `EVAL`
+    /// into `EVAL_RO` for the rest of the process.
+    #[test]
+    fn the_read_only_flag_does_not_outlive_its_script() {
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+        let cache = Rc::new(RefCell::new(ScriptCache::new()));
+        let mut db = Database::new();
+
+        let write = vec![
+            Frame::BulkString(Bytes::from_static(
+                b"return redis.call('SET', KEYS[1], 'x')",
+            )),
+            Frame::BulkString(Bytes::from_static(b"1")),
+            Frame::BulkString(Bytes::from_static(b"rk")),
+        ];
+        let _ = handle_eval(
+            &lua,
+            &cache,
+            &write,
+            &mut db,
+            0,
+            1,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+            true,
+        );
+        // Same script, same VM, this time as plain EVAL.
+        let w = handle_eval(
+            &lua,
+            &cache,
+            &write,
+            &mut db,
+            0,
+            1,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+            false,
+        );
+        assert!(
+            matches!(&w, Frame::SimpleString(v) if v.as_ref() == b"OK"),
+            "the previous script's read-only flag leaked into a plain EVAL: {w:?}"
+        );
+    }
+
+    /// The arity error must name what the CLIENT sent. All four names share
+    /// two handlers, so a handler that hard-codes its own name is wrong for
+    /// half its callers — which is exactly what `EVAL_RO` hit.
+    #[test]
+    fn the_arity_error_names_the_command_the_client_sent() {
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+        let cache = Rc::new(RefCell::new(ScriptCache::new()));
+        let mut db = Database::new();
+        let one = vec![Frame::BulkString(Bytes::from_static(b"body"))];
+
+        for (read_only, want) in [
+            (
+                false,
+                &b"ERR wrong number of arguments for 'eval' command"[..],
+            ),
+            (true, b"ERR wrong number of arguments for 'eval_ro' command"),
+        ] {
+            let r = handle_eval(
+                &lua,
+                &cache,
+                &one,
+                &mut db,
+                0,
+                1,
+                0,
+                1,
+                &crate::acl::ScriptAcl::trusted(),
+                read_only,
+            );
+            assert_eq!(
+                r,
+                Frame::Error(Bytes::from_static(want)),
+                "read_only={read_only}"
+            );
+        }
+
+        // `EVALSHA <sha>` is short by one argument. redis answers on ARITY,
+        // never `NOSCRIPT` — a client told NOSCRIPT re-loads the script and
+        // retries the same malformed call forever.
+        for (read_only, want) in [
+            (
+                false,
+                &b"ERR wrong number of arguments for 'evalsha' command"[..],
+            ),
+            (
+                true,
+                b"ERR wrong number of arguments for 'evalsha_ro' command",
+            ),
+        ] {
+            let r = handle_evalsha(
+                &lua,
+                &cache,
+                &one,
+                &mut db,
+                0,
+                1,
+                0,
+                1,
+                &crate::acl::ScriptAcl::trusted(),
+                read_only,
+            );
+            assert_eq!(
+                r,
+                Frame::Error(Bytes::from_static(want)),
+                "read_only={read_only}"
+            );
+        }
     }
 
     #[test]
@@ -1009,6 +1251,7 @@ mod tests {
             0,
             1,
             &crate::acl::ScriptAcl::trusted(),
+            false,
         );
         match result {
             Frame::Error(e) => assert!(e.starts_with(b"NOSCRIPT".as_slice())),
@@ -1037,6 +1280,7 @@ mod tests {
             0,
             1,
             &crate::acl::ScriptAcl::trusted(),
+            false,
         );
 
         // Get the SHA1
@@ -1057,6 +1301,7 @@ mod tests {
             0,
             1,
             &crate::acl::ScriptAcl::trusted(),
+            false,
         );
         assert!(matches!(result, Frame::Integer(99)));
     }

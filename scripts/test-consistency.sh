@@ -1413,6 +1413,31 @@ assert_both "GETKEYS numkeys exceeds argv"          COMMAND GETKEYS LMPOP 3 ik1 
 # a count the argv cannot satisfy) is an empty ARRAY, not an error. LMPOP with
 # the same shape of bad count IS an error — that contrast is the whole point.
 assert_both "GETKEYS EVAL numkeys 0 is an empty array" COMMAND GETKEYS EVAL "return 1" 0
+# moon#636: the _RO twins are movable-key exactly like their parents.
+assert_both "GETKEYS EVAL_RO"                         COMMAND GETKEYS EVAL_RO "return 1" 1 ik1
+assert_both "GETKEYS EVALSHA_RO"                      COMMAND GETKEYS EVALSHA_RO deadbeef 1 ik1
+
+# moon#636: EVAL_RO must stay read-only when its key lives on ANOTHER shard.
+# The routed name is the only place a cross-shard script learns which variant
+# it is, so this is exactly where the flag can be dropped. 24 keys, because at
+# --shards 4 a single hard-coded key has a 1-in-4 chance of being shard-local
+# and proving nothing; forcing the routed flag to `false` leaked 17 of these 24
+# (measured 2026-08-23), so the row is not vacuous.
+xs_leaked=0
+xs_readfail=0
+for i in $(seq 1 24); do
+    redis-cli -p "$PORT_RUST" SET "xsro:$i" base >/dev/null 2>&1
+    redis-cli -p "$PORT_RUST" EVAL_RO "return redis.call('SET', KEYS[1], 'PWNED')" \
+        1 "xsro:$i" >/dev/null 2>&1
+    v="$(redis-cli -p "$PORT_RUST" GET "xsro:$i" 2>&1)"
+    [ "$v" = "base" ] || xs_leaked=$((xs_leaked + 1))
+    r="$(redis-cli -p "$PORT_RUST" EVAL_RO "return redis.call('GET', KEYS[1])" 1 "xsro:$i" 2>&1)"
+    [ "$r" = "base" ] || xs_readfail=$((xs_readfail + 1))
+done
+assert_eq "EVAL_RO write refused on every shard" "0" "$xs_leaked"
+# The control: a handler that refused EVERYTHING in read-only mode would pass
+# the row above and fail this one.
+assert_eq "EVAL_RO read answered on every shard" "0" "$xs_readfail"
 assert_both "GETKEYS EVAL bad numkeys is empty too"    COMMAND GETKEYS EVAL "return 1" 9 ik1
 
 # ---------------------------------------------------------------------------

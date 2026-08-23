@@ -191,10 +191,11 @@ mod tests {
             b"EVALSHA",
             b"PUBLISH",
             b"SPUBLISH",
-            // `EVAL_RO` / `EVALSHA_RO` are deliberately absent: they are not in
-            // Moon's registry at all, so `lookup` returns None and dispatch
-            // refuses them as unknown commands. They stay listed in
-            // `REFUSED_BY_NAME` so the rule is already right if they land.
+            // moon#636 landed `EVAL_RO`/`EVALSHA_RO`, so they are no longer
+            // refused-as-unknown — they are refused by the same first_key rule
+            // as their parents, which is what these two rows now prove.
+            b"EVAL_RO",
+            b"EVALSHA_RO",
         ] {
             assert!(
                 refused(c),
