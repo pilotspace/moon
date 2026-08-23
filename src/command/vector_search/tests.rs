@@ -1090,6 +1090,49 @@ fn filter_clause_reads_exclusive_bounds_and_infinities() {
         }
         other => panic!("expected NumRange, got {other:?}"),
     }
+    // ...and the half-open forms, which are the ones a client actually writes.
+    for expr in ["@price:[-inf 100]", "@price:[10 +inf]", "@price:[(10 inf]"] {
+        assert!(
+            matches!(
+                parse(expr),
+                crate::vector::filter::FilterExpr::NumRange { .. }
+            ),
+            "{expr} is a valid open-ended range"
+        );
+    }
+}
+
+/// An INVERTED range is rejected whether or not its bounds are finite.
+///
+/// The three FT.SEARCH numeric grammars disagreed here: `text/query/parse.rs`
+/// tests a plain `min > max`, while this parser and `ft_text_search.rs` both
+/// carried a `min.is_finite() && max.is_finite() &&` conjunct — so
+/// `[+inf 5]` was rejected by one grammar and accepted by the other two.
+/// The conjunct was never load-bearing: `[-inf +inf]` and every half-open
+/// form have `min <= max` already, so the plain comparison keeps them
+/// (pinned above) and the guard is the same rule everywhere (moon#648).
+#[test]
+fn an_inverted_range_is_rejected_even_when_a_bound_is_infinite() {
+    let parse = |expr: &str| {
+        parse_filter_clause(&[
+            bulk(b"idx"),
+            bulk(b"*=>[KNN 5 @vec $q]"),
+            bulk(b"FILTER"),
+            bulk(expr.as_bytes()),
+        ])
+        .into_option()
+    };
+    for expr in [
+        "@price:[300 100]",
+        "@price:[+inf 5]",
+        "@price:[5 -inf]",
+        "@price:[+inf -inf]",
+    ] {
+        assert!(
+            parse(expr).is_err(),
+            "{expr} is inverted and must be an error, not a filter"
+        );
+    }
 }
 
 #[test]

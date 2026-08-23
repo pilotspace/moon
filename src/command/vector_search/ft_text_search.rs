@@ -945,8 +945,8 @@ pub struct QueryTerm {
 ///   rejected at parse time with an actionable error.
 /// - **`FieldFilter::NumericRange` (Plan 07):** Closed or half-open range
 ///   over an `OrderedFloat<f64>` BTreeMap. `f64::NEG_INFINITY` /
-///   `f64::INFINITY` encode unbounded bounds. Inverted ranges (finite
-///   `min > max`) are rejected at parse time.
+///   `f64::INFINITY` encode unbounded bounds. Inverted ranges (`min > max`,
+///   infinities included) are rejected at parse time.
 ///
 /// Plan 06 introduces the enum with one variant (`Tag`); Plan 07 adds
 /// `NumericRange`. New variants MUST preserve the invariants above or
@@ -968,8 +968,9 @@ pub enum FieldFilter {
     /// `min` / `max` are `f64`; `f64::NEG_INFINITY` / `f64::INFINITY` encode
     /// unbounded bounds (queried via `-inf` / `+inf` literals).
     /// `min_exclusive` / `max_exclusive` come from the `(` prefix in the
-    /// bound (e.g. `[(10 100]` → `min_exclusive=true`). Finite `min > max`
-    /// is rejected at parse time, NOT executed as an empty range.
+    /// bound (e.g. `[(10 100]` → `min_exclusive=true`). An inverted range
+    /// (`min > max`, infinities included) is rejected at parse time, NOT
+    /// executed as an empty range.
     NumericRange {
         field: Bytes,
         min: f64,
@@ -1237,9 +1238,11 @@ pub fn pre_parse_field_filter(query: &[u8]) -> Result<Option<TextQueryClause>, &
             }
             let (min, min_exclusive) = parse_numeric_bound(lo_raw)?;
             let (max, max_exclusive) = parse_numeric_bound(hi_raw)?;
-            // T-152-07-05: inverted range REJECTED (no auto-swap). Only applies
-            // when BOTH bounds are finite — `[-inf +inf]` is always valid.
-            if min.is_finite() && max.is_finite() && min > max {
+            // T-152-07-05: inverted range REJECTED (no auto-swap). The
+            // comparison is plain `min > max` — `[-inf +inf]` and the
+            // half-open forms already satisfy it, so the old is-finite
+            // conjunct only ever let `[+inf 5]` through (moon#648).
+            if min > max {
                 return Err("ERR invalid numeric range (min > max)");
             }
             Ok(Some(TextQueryClause {

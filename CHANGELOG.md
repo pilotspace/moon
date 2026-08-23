@@ -137,6 +137,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ⚠ **Behaviour change:** a query whose prefilter cannot be parsed now fails
   instead of returning results. Queries that appeared to work were returning a
   wider result set than they asked for.
+- **`FT.SEARCH ... HYBRID ... FILTER NUMERIC` with an inverted range no longer
+  aborts the server** (#669). The same defect as #664, one command away, and
+  still live after #664's fix: that fix hardened the **vector** payload index,
+  while `HYBRID`'s `FILTER NUMERIC <field> <min> <max>` filters through the
+  **text** index's numeric BTree — a different evaluator with the same
+  `BTreeMap::range` call and no guard. Its parser checked that each bound was
+  finite and never that they were ordered.
+
+  Measured at `--shards 1` on a build with only this fix reverted: one query
+  produced `Abort trap: 6`, `thread 'shard-0' panicked ... range start is
+  greater than range end in BTreeMap`, and `Connection refused` for every
+  client thereafter.
+
+  Fixed in two layers, because guarding the caller is what left this reachable
+  in the first place: `TextIndex::search_numeric_range` is now **total** — an
+  impossible range is an empty result, compared in `OrderedFloat` space so the
+  infinities and a stray NaN are covered — and the `FILTER NUMERIC` parser
+  refuses `min > max` by name (`ERR FILTER NUMERIC min is greater than max`),
+  since silence would tell the caller their filter matched nothing.
+
+  The inverted-range rule also lost its `min.is_finite() && max.is_finite() &&`
+  conjunct in the two grammars that carried it. The conjunct excluded nothing
+  real — `[-inf +inf]` and every half-open form already satisfy `min <= max` —
+  while letting `[+inf 5]` through, so the three FT.SEARCH numeric grammars
+  disagreed on exactly the case #648 exists to unify.
 
 ### Changed
 - **`scripts/ci-local.sh` now pre-flights the VM's free disk before it starts** (#658).

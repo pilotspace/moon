@@ -384,10 +384,15 @@ fn parse_filter_string(s: &[u8]) -> Option<FilterExpr> {
                 let (max, max_excl) = parse_numeric_bound(parts[1])?;
                 // An inverted range is REJECTED, not swapped and not tolerated:
                 // `BTreeMap::range(min..=max)` panics when start > end, and a
-                // shard-thread panic aborts the whole process (moon#664). Only
-                // applies when both bounds are finite -- `[-inf +inf]` is valid.
-                // Matches ft_text_search.rs's rule for the full grammar.
-                if min.is_finite() && max.is_finite() && min > max {
+                // shard-thread panic aborts the whole process (moon#664).
+                //
+                // The comparison is plain `min > max`, with no is-finite
+                // conjunct: `[-inf +inf]` and every half-open form already
+                // satisfy `min <= max`, so guarding on finiteness excluded
+                // nothing except the inverted infinite ranges (`[+inf 5]`) it
+                // then let through. All three FT.SEARCH numeric grammars now
+                // apply this identical rule -- text/query/parse.rs always did.
+                if min > max {
                     return None;
                 }
                 if (min - max).abs() < f64::EPSILON && !min_excl && !max_excl {

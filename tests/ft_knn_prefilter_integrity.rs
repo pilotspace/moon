@@ -203,7 +203,11 @@ fn knn_prefilter_that_cannot_be_parsed_is_an_error_not_an_unfiltered_search() {
 #[ignore] // Spawns a server; run explicitly.
 fn inverted_knn_prefilter_range_does_not_kill_the_server() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, port) = spawn_moon(dir.path());
+    let (child, port) = spawn_moon(dir.path());
+    // Guarded like its two siblings: every assertion below is load-bearing, so
+    // any one of them failing unwinds — and without the guard that unwind
+    // leaks a moon process holding the port.
+    let mut guard = ServerGuard(child);
     std::thread::sleep(Duration::from_millis(500));
     let mut c = common::Conn::open(port);
     seed(&mut c);
@@ -211,11 +215,20 @@ fn inverted_knn_prefilter_range_does_not_kill_the_server() {
     // RED (moon#664): `BTreeMap::range(300..=100)` panics, and the shard-panic
     // policy aborts the WHOLE process. One malformed query from any client
     // takes down every connection and every other shard.
-    let reply = knn(&mut c, "@vt:[300 100]=>[KNN 4 @vec $qq]");
-    assert!(
-        reply.starts_with('-'),
-        "an inverted range must be a per-query error: {reply}"
-    );
+    // `[+inf 5]` is the case the first cut of this guard let through: it
+    // tested `min.is_finite() && max.is_finite() && min > max`, so an inverted
+    // range with an infinite bound skipped the parser rejection entirely.
+    for bad in [
+        "@vt:[300 100]=>[KNN 4 @vec $qq]",
+        "@vt:[+inf 5]=>[KNN 4 @vec $qq]",
+        "@vt:[5 -inf]=>[KNN 4 @vec $qq]",
+    ] {
+        let reply = knn(&mut c, bad);
+        assert!(
+            reply.starts_with('-'),
+            "an inverted range must be a per-query error: {bad} -> {reply}"
+        );
+    }
 
     // The load-bearing assertion. A dead connection and a dead process look the
     // same from the client socket, so ask the OS instead: a live server answers
@@ -226,7 +239,7 @@ fn inverted_knn_prefilter_range_does_not_kill_the_server() {
         "server must still serve new connections"
     );
     assert_eq!(
-        child.try_wait().expect("try_wait"),
+        guard.0.try_wait().expect("try_wait"),
         None,
         "the moon process must still be running -- it aborted on the inverted range"
     );
@@ -236,7 +249,130 @@ fn inverted_knn_prefilter_range_does_not_kill_the_server() {
         !log.contains("panicked at"),
         "no shard may panic on malformed client input; stderr:\n{log}"
     );
+}
 
-    let _ = child.kill();
-    let _ = child.wait();
+/// The SAME defect one command away: `FT.SEARCH ... HYBRID ... FILTER NUMERIC
+/// <field> <min> <max>` validated that each bound was finite and never that
+/// they were ordered, so an inverted range reached
+/// `TextIndex::search_numeric_range`'s `BTreeMap::range` and aborted the
+/// process exactly as the KNN prefilter did.
+///
+/// Measured on a binary with the guards reverted, `--shards 1`:
+///
+/// ```text
+/// FT.SEARCH cidx "machine learning" HYBRID VECTOR @vec $q FUSION RRF \
+///     FILTER NUMERIC @score 300 100 PARAMS 2 q <blob>
+///   -> Error: Server closed the connection
+///   Abort trap: 6 -- thread 'shard-0' panicked ...
+///     range start is greater than range end in BTreeMap
+///   -> next connection: Connection refused
+/// ```
+///
+/// Fixed in two layers: the parser refuses the range by name, and
+/// `search_numeric_range` is total so the next caller cannot rediscover this.
+#[test]
+#[ignore] // Spawns a server; run explicitly.
+fn an_inverted_hybrid_numeric_filter_does_not_kill_the_server() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child, port) = spawn_moon(dir.path());
+    let mut guard = ServerGuard(child);
+    std::thread::sleep(Duration::from_millis(500));
+    let mut c = common::Conn::open(port);
+
+    let created = c.send(&[
+        "FT.CREATE",
+        "hidx",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "h:",
+        "SCHEMA",
+        "title",
+        "TEXT",
+        "score",
+        "NUMERIC",
+        "vec",
+        "VECTOR",
+        "HNSW",
+        "6",
+        "TYPE",
+        "FLOAT32",
+        "DIM",
+        "4",
+        "DISTANCE_METRIC",
+        "COSINE",
+    ]);
+    assert!(created.starts_with('+'), "FT.CREATE: {created}");
+    for (i, title) in [
+        "machine learning doc one",
+        "machine learning doc two",
+        "unrelated filler text",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let key = format!("h:{i}");
+        let score = ((i + 1) * 10).to_string();
+        let r = c.send(&["HSET", &key, "title", title, "score", &score, "vec", VEC_A]);
+        assert!(r.starts_with(':'), "HSET {key}: {r}");
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    let hybrid = |c: &mut common::Conn, lo: &str, hi: &str| {
+        c.send(&[
+            "FT.SEARCH",
+            "hidx",
+            "machine learning",
+            "HYBRID",
+            "VECTOR",
+            "@vec",
+            "$q",
+            "FUSION",
+            "RRF",
+            "FILTER",
+            "NUMERIC",
+            "@score",
+            lo,
+            hi,
+            "LIMIT",
+            "0",
+            "3",
+            "PARAMS",
+            "2",
+            "q",
+            VEC_A,
+        ])
+    };
+
+    // The control FIRST: if this does not return rows, the inverted probe
+    // below never reaches the evaluator and the test proves nothing.
+    let ok = hybrid(&mut c, "0", "100");
+    assert!(
+        match_count(&ok).is_some_and(|n| n > 0),
+        "the fixture must actually match before the inverted probe means anything: {ok}"
+    );
+
+    let bad = hybrid(&mut c, "300", "100");
+    assert!(
+        bad.starts_with('-'),
+        "an inverted FILTER NUMERIC must be a per-query error: {bad}"
+    );
+
+    // The load-bearing assertion: ask the OS, not the socket.
+    let mut c2 = common::Conn::open(port);
+    assert!(
+        c2.send(&["PING"]).starts_with("+PONG"),
+        "server must still serve new connections"
+    );
+    assert_eq!(
+        guard.0.try_wait().expect("try_wait"),
+        None,
+        "the moon process must still be running -- it aborted on the inverted range"
+    );
+    let log = std::fs::read_to_string(dir.path().join("moon.stderr.log")).unwrap_or_default();
+    assert!(
+        !log.contains("panicked at"),
+        "no shard may panic on malformed client input; stderr:\n{log}"
+    );
 }

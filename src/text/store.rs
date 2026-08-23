@@ -1502,6 +1502,24 @@ impl TextIndex {
             return Vec::new();
         };
 
+        // `BTreeMap::range` PANICS by contract when start > end, or when start
+        // == end with either bound excluded — and a panic on a shard thread
+        // aborts the whole moon process (moon#664). Three of this function's
+        // four callers validate their bounds first; `FT.HYBRID`'s
+        // `FILTER NUMERIC <field> <min> <max>` checks only that each bound is
+        // finite, never that they are ordered. Being total here catches that
+        // caller and the next one: an impossible range has no members, which
+        // is an empty result, not an abort.
+        //
+        // The comparison is in `OrderedFloat` space — the same total order the
+        // BTreeMap itself uses — so it stays correct for the infinities and
+        // cannot be fooled by a NaN that slipped past a parser.
+        let lo_v = ordered_float::OrderedFloat(min);
+        let hi_v = ordered_float::OrderedFloat(max);
+        if lo_v > hi_v || (lo_v == hi_v && (min_exclusive || max_exclusive)) {
+            return Vec::new();
+        }
+
         let lo = if min == f64::NEG_INFINITY {
             Unbounded
         } else if min_exclusive {
