@@ -2066,12 +2066,26 @@ pub async fn coordinate_debug_digest(
             script_acl: crate::acl::ScriptAcl::deny(),
             reply_tx,
         };
-        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        // `spsc_send` DROPS `reply_tx` when it gives up, so a discarded
+        // Backpressure would surface later as "reply channel closed" — after
+        // every remaining shard had been dispatched to and waited on. Stop
+        // here and say what actually happened.
+        if spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await
+            == PushOutcome::Backpressure
+        {
+            return Frame::Error(Bytes::from_static(
+                b"ERR cross-shard DEBUG DIGEST dispatch backpressured",
+            ));
+        }
         pending.push(reply_rx);
     }
 
     for reply_rx in pending {
-        match recv_reply_bounded(reply_rx).await {
+        // `recv_reply_bounded_reason`, not `recv_reply_bounded`: the two
+        // failures are different facts about the shard, and this error text
+        // makes a claim about which one happened. A shard still grinding
+        // through a large keyspace is not a shard that dropped its sender.
+        match recv_reply_bounded_reason(reply_rx).await {
             Ok(frame) => match crate::command::debug_digest::partials_from_frame(&frame) {
                 Some(partials) => all.extend(partials),
                 None => {
@@ -2080,9 +2094,14 @@ pub async fn coordinate_debug_digest(
                     ));
                 }
             },
-            Err(_) => {
+            Err(ReplyFailure::Closed) => {
                 return Frame::Error(Bytes::from_static(
                     b"ERR cross-shard reply channel closed during DEBUG DIGEST",
+                ));
+            }
+            Err(ReplyFailure::TimedOut) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR cross-shard DEBUG DIGEST timed out waiting for a shard",
                 ));
             }
         }

@@ -1014,16 +1014,27 @@ if should_run "connection"; then
         "0000000000000000000000000000000000000000" DEBUG DIGEST
     mcli SET dg:probe v1 >/dev/null 2>&1
     DG_ONE=$(mcli DEBUG DIGEST 2>/dev/null)
-    if [[ "$DG_ONE" == "0000000000000000000000000000000000000000" ]]; then
-        FAIL=$((FAIL + 1)); TOTAL=$((TOTAL + 1))
-        echo "  FAIL: DEBUG DIGEST stayed at zero after a key was written"
+    TOTAL=$((TOTAL + 1))
+    # Same reasoning as DG_TWO below: "not the zero sentinel" is satisfied by
+    # an error string too, so require a real 40-hex digest.
+    if [[ "$DG_ONE" =~ ^[0-9a-f]{40}$ && "$DG_ONE" != "0000000000000000000000000000000000000000" ]]; then
+        PASS=$((PASS + 1))
     else
-        PASS=$((PASS + 1)); TOTAL=$((TOTAL + 1))
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: DEBUG DIGEST gave no non-zero digest after a write: $DG_ONE"
     fi
     # Same data must give the same digest; different data must not.
+    # "differs from DG_ONE" is not enough on its own -- an ERROR reply also
+    # differs, so a broken DEBUG DIGEST would pass. Require an actual digest.
     mcli SET dg:probe v2 >/dev/null 2>&1
     DG_TWO=$(mcli DEBUG DIGEST 2>/dev/null)
-    assert_moon_not_contains "DEBUG DIGEST changes with the value" "$DG_ONE" DEBUG DIGEST
+    TOTAL=$((TOTAL + 1))
+    if [[ "$DG_TWO" =~ ^[0-9a-f]{40}$ && "$DG_TWO" != "$DG_ONE" ]]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: DEBUG DIGEST did not return a changed digest: $DG_TWO"
+    fi
     mcli SET dg:probe v1 >/dev/null 2>&1
     assert_moon "DEBUG DIGEST returns to its earlier value" "$DG_ONE" DEBUG DIGEST
 fi
