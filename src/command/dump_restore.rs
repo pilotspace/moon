@@ -62,9 +62,17 @@ pub fn dump(db: &mut Database, args: &[Frame]) -> Frame {
 /// keys that happened to route cross-shard, because the SPSC path uses
 /// `dispatch()`.
 ///
-/// The cold-tier fallback is the second half of the same lesson: a read-path
-/// arm that only consults the hot plane answers nil for a spilled key
-/// (moon#610's class), so the miss branch asks the cold tier before giving up.
+/// The accessor choice is the second half of the same lesson. A read-path arm
+/// built on `get_if_alive` consults the HOT plane alone and answers nil for a
+/// spilled key (moon#610's class), so this reads through
+/// `get_if_alive_any_plane`. The first draft hand-rolled that fallback here
+/// instead -- hot probe, then `get_cold_value` -- and mapped the value kinds
+/// by hand, silently dropping sorted sets and streams: `DUMP` answered nil for
+/// a live tiered ZSET while `EXISTS` answered 1, which is #610 verbatim. The
+/// accessor also reaches the in-flight spill plane (#459), a window a
+/// `get_cold_value` fallback misses entirely. Per-call-site fallbacks are how
+/// this class drifted the first time; `tests/cold_read_through_shape.rs` is
+/// what caught the repeat.
 pub fn dump_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     if args.len() != 1 {
         return err_wrong_args("DUMP");
@@ -72,36 +80,10 @@ pub fn dump_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     let Some(key) = extract_key(&args[0]) else {
         return err_wrong_args("DUMP");
     };
-    if let Some(entry) = db.get_if_alive(key, now_ms) {
-        return Frame::BulkString(Bytes::from(dump_payload::encode(entry)));
-    }
-    // Spilled to the cold tier: still a real key, and DUMP must serialize it.
-    match db.get_cold_value(key, now_ms) {
-        Some(value) => match entry_from_value(value) {
-            Some(entry) => Frame::BulkString(Bytes::from(dump_payload::encode(&entry))),
-            // A cold value of a kind with no redis-compatible tag. Nil is the
-            // honest answer -- the alternative is emitting a payload no
-            // RESTORE can read.
-            None => Frame::Null,
-        },
+    match db.get_if_alive_any_plane(key, now_ms) {
+        Some(view) => Frame::BulkString(Bytes::from(dump_payload::encode(&view))),
         None => Frame::Null,
     }
-}
-
-/// Rebuild an owned entry around a value read back from the cold tier, so it
-/// can be handed to the same encoder the hot path uses.
-fn entry_from_value(value: crate::storage::entry::RedisValue) -> Option<crate::storage::Entry> {
-    use crate::storage::entry::RedisValue;
-    let mut entry = match value {
-        RedisValue::String(v) => return Some(crate::storage::Entry::new_string(v)),
-        RedisValue::Hash(_) => crate::storage::Entry::new_hash(),
-        RedisValue::List(_) => crate::storage::Entry::new_list(),
-        RedisValue::Set(_) => crate::storage::Entry::new_set(),
-        _ => return None,
-    };
-    let slot = entry.redis_value_mut()?;
-    *slot = value;
-    Some(entry)
 }
 
 /// `RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME s] [FREQ f]`
@@ -478,6 +460,86 @@ mod dispatch_wiring_tests {
                 )
             }
             _ => panic!("unexpected dispatch_read result for DUMP"),
+        }
+    }
+
+    /// moon#610's class, in the shape that bit this file.
+    ///
+    /// `dump_readonly` is the path a live server takes, and a key mid-spill
+    /// is in NEITHER the hot table nor the cold index -- it lives only in the
+    /// in-flight plane (#459), which is why this test can build one with no
+    /// disk at all. A SORTED SET is the discriminating type: the hand-rolled
+    /// cold fallback this replaced mapped String/Hash/List/Set by hand and
+    /// dropped ZSet on the floor, so `DUMP` answered nil for a live sorted
+    /// set while `EXISTS` answered 1 -- the exact "tiered key reads as
+    /// missing" bug #610 was opened for, reintroduced by a fallback written
+    /// per-call-site instead of taken from the accessor.
+    #[test]
+    fn the_read_path_serves_a_key_that_has_left_the_hot_plane() {
+        use crate::storage::entry::RedisValue;
+        use ordered_float::OrderedFloat;
+        use std::collections::{BTreeMap, HashMap};
+
+        let mut members: HashMap<Bytes, f64> = HashMap::new();
+        let mut scores: BTreeMap<(OrderedFloat<f64>, Bytes), ()> = BTreeMap::new();
+        for (m, sc) in [(&b"m1"[..], 1.5f64), (&b"m2"[..], 2.5f64)] {
+            let m = Bytes::copy_from_slice(m);
+            members.insert(m.clone(), sc);
+            scores.insert((OrderedFloat(sc), m), ());
+        }
+        let mut entry = crate::storage::Entry::new_string(Bytes::new());
+        entry.value =
+            crate::storage::compact_value::CompactValue::from_redis_value(RedisValue::SortedSet {
+                members: members.clone(),
+                scores,
+            });
+
+        // Serialize exactly as the eviction path does, so the payload under
+        // test is the one a real spill would leave behind.
+        let value_type = crate::storage::value_codec::value_type_of(&entry.as_redis_value());
+        let bytes = crate::storage::tiered::kv_serde::serialize_collection(&entry.as_redis_value())
+            .expect("zset serializes");
+
+        let mut db = Database::new();
+        // Never in the hot plane: marked in flight, exactly as
+        // `evict_one_async_spill` leaves a key after `db.remove`.
+        db.spill_inflight_mark(
+            Bytes::from_static(b"z"),
+            crate::storage::db::PendingSpill {
+                req_id: 1,
+                value_type,
+                value_bytes: Bytes::from(bytes),
+                ttl_ms: None,
+            },
+        );
+        // Probe the hot table directly rather than through `get_if_alive`:
+        // that accessor is DENIED inside `src/command/` by
+        // `tests/cold_read_through_shape.rs`, and the guard greps source text,
+        // so it cannot tell a precondition in a test from a real hot-only
+        // read. Naming the table is also the clearer assertion.
+        assert!(
+            db.data().get(&b"z"[..]).is_none(),
+            "precondition: the key must NOT be in the hot plane, or this test \
+             proves nothing about the cold read-through"
+        );
+
+        let got = dump_readonly(&db, &[Frame::BulkString(Bytes::from_static(b"z"))], 0);
+        let payload = match got {
+            Frame::BulkString(b) => b,
+            Frame::Null => panic!(
+                "DUMP answered nil for a live sorted set that had left the hot \
+                 plane -- the read path is hot-only again (moon#610)"
+            ),
+            other => panic!("unexpected DUMP reply: {other:?}"),
+        };
+
+        // Answering with SOME payload is not enough: it has to be the value.
+        let back = dump_payload::decode(&payload).expect("payload decodes");
+        match back.as_redis_value() {
+            crate::storage::compact_value::RedisValueRef::SortedSet { members: m, .. } => {
+                assert_eq!(*m, members, "the tiered sorted set round-tripped wrong")
+            }
+            _ => panic!("decoded entry is not a sorted set"),
         }
     }
 
