@@ -19,6 +19,7 @@ pub mod key_extra;
 pub mod keyspace;
 pub mod list;
 pub mod metadata;
+pub mod module_cmd;
 pub mod mq;
 pub mod persistence;
 pub mod scan_options;
@@ -555,9 +556,12 @@ fn dispatch_inner(
             }
         }
         (6, b'm') => {
-            // MEMORY (USAGE, STATS, DOCTOR, HELP), MSETNX
+            // MEMORY (USAGE, STATS, DOCTOR, HELP), MODULE, MSETNX
             if cmd.eq_ignore_ascii_case(b"MEMORY") {
                 return resp(server_admin::memory(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"MODULE") {
+                return resp(module_cmd::module(args));
             }
             if cmd.eq_ignore_ascii_case(b"MSETNX") {
                 return resp(string::msetnx(db, args));
@@ -694,7 +698,10 @@ fn dispatch_inner(
             }
         }
         (7, b'h') => {
-            // HEALTHZ HOTKEYS HGETALL HEXISTS HINCRBY HEXPIRE HGETDEL
+            // HEALTHZ HOTKEYS HGETALL HEXISTS HINCRBY HEXPIRE HGETDEL HSTRLEN
+            if cmd.eq_ignore_ascii_case(b"HSTRLEN") {
+                return resp(hash::hstrlen(db, args));
+            }
             if cmd.eq_ignore_ascii_case(b"HEALTHZ") {
                 return resp(connection::healthz());
             }
@@ -1127,7 +1134,7 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         | (6, b'z')  // ZSCORE, ZRANGE, ZCOUNT, ZINTER, ZUNION
         | (7, b'c')  // COMMAND
         | (7, b'g')  // GEODIST, GEOHASH
-        | (7, b'h')  // HGETALL, HEXISTS
+        | (7, b'h')  // HGETALL, HEXISTS, HSTRLEN
         | (7, b'p')  // PFCOUNT
         | (7, b's')  // SLOWLOG
         | (7, b'z')  // ZMSCORE
@@ -1373,9 +1380,14 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             }
         }
         (6, b'm') => {
-            // MEMORY (USAGE / STATS / DOCTOR / HELP — all read-only)
+            // MEMORY (USAGE / STATS / DOCTOR / HELP — all read-only), MODULE
             if cmd.eq_ignore_ascii_case(b"MEMORY") {
                 return resp(server_admin::memory_readonly(db, args, now_ms));
+            }
+            // MODULE touches no keyspace at all, so the read-only track can
+            // answer it with the same function the mutable track uses.
+            if cmd.eq_ignore_ascii_case(b"MODULE") {
+                return resp(module_cmd::module(args));
             }
         }
         (6, b'o') => {
@@ -1445,7 +1457,10 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             }
         }
         (7, b'h') => {
-            // HGETALL HEXISTS HOTKEYS
+            // HGETALL HEXISTS HOTKEYS HSTRLEN
+            if cmd.eq_ignore_ascii_case(b"HSTRLEN") {
+                return resp(hash::hstrlen_readonly(db, args, now_ms));
+            }
             if cmd.eq_ignore_ascii_case(b"HGETALL") {
                 return resp(hash::hgetall_readonly(db, args, now_ms));
             }

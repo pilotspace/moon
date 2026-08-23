@@ -526,6 +526,10 @@ if should_run "hash"; then
     assert_match "HLEN"                HLEN hsh:k1
     assert_match "HEXISTS (yes)"       HEXISTS hsh:k1 f1
     assert_match "HEXISTS (no)"        HEXISTS hsh:k1 missing
+    # moon#636. `f1` (2 bytes) vs `v1` (2 bytes) would NOT discriminate, so
+    # measure a field whose name and value differ in length.
+    assert_match "HSTRLEN"             HSTRLEN hsh:k1 f1
+    assert_match "HSTRLEN (missing)"   HSTRLEN hsh:k1 missing
     assert_match "HDEL"                HDEL hsh:k1 f5
     assert_match "HSETNX (new)"        HSETNX hsh:k1 f6 v6
     assert_match "HSETNX (exists)"     HSETNX hsh:k1 f6 v6b
@@ -913,6 +917,12 @@ if should_run "connection"; then
     assert_moon_contains "RESET arity" "wrong number of arguments" RESET now
     assert_moon_contains "CLIENT INFO laddr is not port 0" "laddr=127.0.0.1:$PORT_RUST" CLIENT INFO
     assert_moon_contains "MEMORY DOCTOR" "Per-subsystem (resident):" MEMORY DOCTOR
+    # moon#636: clients feature-detect with MODULE LIST on connect. An empty
+    # array is the truthful answer; an unknown-command error reads as broken.
+    # Not `assert_match` — redis 8.x ships `vectorset`, so ITS list is not
+    # empty; moon loading nothing is the correct answer, not a divergence.
+    assert_moon "MODULE LIST is empty" "" MODULE LIST
+    assert_match "MODULE unknown sub"  MODULE BOGUS
     # task #511: MEMORY USAGE must hash the KEY, not the literal "USAGE".
     # Single-shard here, so this catches the arity/shape regression; the
     # cross-shard routing itself is covered in test-consistency.sh.

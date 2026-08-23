@@ -378,6 +378,12 @@ assert_both "HMGET" HMGET h:test f1 f3 nonexistent
 assert_both "HLEN" HLEN h:test
 assert_both "HEXISTS f1" HEXISTS h:test f1
 assert_both "HEXISTS missing" HEXISTS h:test missing
+# moon#636: HSTRLEN measures the VALUE, not the field name — the one thing an
+# implementation can plausibly get backwards. `f1` is 2 bytes and `val1` is 4,
+# so a name/value swap changes the answer.
+assert_both "HSTRLEN f1" HSTRLEN h:test f1
+assert_both "HSTRLEN missing field" HSTRLEN h:test missing
+assert_both "HSTRLEN missing key" HSTRLEN h:nosuch f1
 
 # Large hash value
 HVAL=$(python3 -c "print('X' * 1024)")
@@ -1561,6 +1567,21 @@ assert_tracking "tracking: RENAME invalidates its source [control]" \
     "tp:rs" "GET tp:rs" RENAME tp:rs tp:rd
 assert_both "COMMAND COUNT arity" COMMAND COUNT extra
 assert_both "COMMAND INFO unknown name" COMMAND INFO definitely-not-a-command
+
+# MODULE (moon#636). Clients feature-detect on connect; `-ERR unknown command`
+# reads as a broken server, `*0` reads as "no modules", which is the truth.
+# NOT `assert_both`: redis 8.x ships the `vectorset` module built in, so its
+# LIST is non-empty. moon loads none — the empty array IS the parity-correct
+# answer, and comparing the two bodies would fail for the right reason.
+assert_eq "MODULE LIST is empty on moon" "" \
+    "$(redis-cli -p "$PORT_RUST" MODULE LIST 2>&1)"
+# The three refusals ARE byte-comparable, and they are the control that stops
+# the container from answering LIST to everything: container arity, SUBCOMMAND
+# arity (redis names it `module|list`), and unknown subcommand.
+assert_both "MODULE bare is a container arity error" MODULE
+assert_both "MODULE LIST extra is a subcommand arity error" MODULE LIST extra
+assert_both "MODULE unknown subcommand" MODULE BOGUS
+assert_both "MODULE LOAD is refused" MODULE LOAD /tmp/not-a-module.so
 
 # ROLE on a standalone master is byte-identical between the two.
 assert_both "ROLE on a master" ROLE

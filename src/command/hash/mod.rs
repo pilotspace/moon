@@ -1961,4 +1961,92 @@ mod tests {
              estimated_memory: one={one} many={many}"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // HSTRLEN (moon#636)
+    // ---------------------------------------------------------------------
+    //
+    // Every expectation captured from redis-server 8.6.1 on 2026-08-23.
+
+    #[test]
+    fn hstrlen_measures_the_field_value_not_the_field_name() {
+        let mut db = Database::new();
+        hset(&mut db, &make_args(&[b"h", b"f", b"hello world"]));
+        // redis: 11 -- the VALUE's length. A field name of a different
+        // length would make an implementation that measured the wrong
+        // side agree by accident, so `f` (1) and `hello world` (11) are
+        // deliberately different.
+        assert_eq!(
+            hstrlen(&mut db, &make_args(&[b"h", b"f"])),
+            Frame::Integer(11)
+        );
+    }
+
+    #[test]
+    fn hstrlen_answers_zero_for_every_kind_of_absence() {
+        let mut db = Database::new();
+        hset(&mut db, &make_args(&[b"h", b"f", b"v"]));
+        // redis answers :0 for a missing FIELD and a missing KEY alike --
+        // it does not distinguish them, and does not return nil.
+        assert_eq!(
+            hstrlen(&mut db, &make_args(&[b"h", b"nope"])),
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            hstrlen(&mut db, &make_args(&[b"nokey", b"f"])),
+            Frame::Integer(0)
+        );
+        // An empty value is also :0 — indistinguishable from absent, which
+        // is redis's behaviour and not a bug to be improved on.
+        hset(&mut db, &make_args(&[b"h", b"empty", b""]));
+        assert_eq!(
+            hstrlen(&mut db, &make_args(&[b"h", b"empty"])),
+            Frame::Integer(0)
+        );
+    }
+
+    #[test]
+    fn hstrlen_rejects_a_wrong_type_and_a_bad_arity() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"str"), Bytes::from_static(b"v"));
+        assert!(
+            matches!(hstrlen(&mut db, &make_args(&[b"str", b"f"])), Frame::Error(ref e)
+                if e.starts_with(b"WRONGTYPE")),
+            "a string key must answer WRONGTYPE, not :0"
+        );
+        for argv in [
+            vec![b"h".as_slice()],
+            vec![b"h".as_slice(), b"f", b"extra"],
+            vec![],
+        ] {
+            assert!(
+                matches!(hstrlen(&mut db, &make_args(&argv)), Frame::Error(ref e)
+                    if e.starts_with(b"ERR wrong number of arguments")),
+                "arity {} must be refused",
+                argv.len()
+            );
+        }
+    }
+
+    /// The read-only twin must agree with the mutable one everywhere — a
+    /// command answered from two dispatch paths that disagree is worse than
+    /// one that is simply missing.
+    #[test]
+    fn hstrlen_readonly_matches_the_mutable_track() {
+        let mut db = Database::new();
+        hset(&mut db, &make_args(&[b"h", b"f", b"hello world"]));
+        db.set_string(Bytes::from_static(b"str"), Bytes::from_static(b"v"));
+        for argv in [
+            vec![b"h".as_slice(), b"f"],
+            vec![b"h".as_slice(), b"missing"],
+            vec![b"nokey".as_slice(), b"f"],
+            vec![b"str".as_slice(), b"f"],
+            vec![b"h".as_slice()],
+        ] {
+            let args = make_args(&argv);
+            let expected = hstrlen(&mut db, &args);
+            let got = hstrlen_readonly(&db, &args, 0);
+            assert_eq!(got, expected, "argv {argv:?}");
+        }
+    }
 }

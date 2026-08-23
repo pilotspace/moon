@@ -1070,6 +1070,7 @@ mod tests {
             "CONFIG",
             "ACL",
             "SLOWLOG",
+            "MODULE",
             "MONITOR",
             "HOTKEYS",
             "DEBUG",

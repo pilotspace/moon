@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`HSTRLEN` and `MODULE`** (#636). Two commands clients reach for that moon answered
+  with `-ERR unknown command`.
+
+  `HSTRLEN key field` returns the length of the field's **value** — not the field name,
+  the one thing an implementation can plausibly get backwards — and `0` for a missing
+  field, a missing key, or an empty value alike, exactly as redis does. It is wired into
+  both the mutable and the read-only dispatch tracks.
+
+  `MODULE` matters because clients feature-detect with `MODULE LIST` on connect, and read
+  `-ERR unknown command` as a broken server. moon has no module loader and is not growing
+  one, so `MODULE LIST` answers the truth — an empty array — while `LOAD`/`LOADEX`/`UNLOAD`
+  are refused in redis's own words (the text a stock redis gives when `enable-module-command`
+  is unset). The container distinguishes redis's three refusals: a bare `MODULE` is a
+  container arity error, `MODULE LIST extra` is a *subcommand* arity error named
+  `module|list`, and anything else is `ERR unknown subcommand '<as sent>'. Try MODULE HELP.`
+
+  Both were diffed command-by-command against redis-server 8.6.1 — 17 probes byte-identical,
+  including ACL enforcement, `COMMAND GETKEYS`, RESP3, and every arity and wrong-type edge.
+  `MODULE LIST` is asserted moon-only rather than by parity: redis 8.x ships the `vectorset`
+  module built in, so its list is legitimately non-empty. Two gaps found while measuring are
+  filed separately, not papered over: unknown container subcommands are queued inside `MULTI`
+  instead of aborting the transaction (#670, systemic across all six containers tested).
 - **`INFO MoonStore` now reports the size and shape of the KV cold tier** (#656).
   The whole `# MoonStore` section was one boolean, `disk_offload_enabled`, while the cold
   tier was the single largest consumer in the data directory. On the instance that motivated
