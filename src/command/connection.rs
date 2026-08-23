@@ -598,6 +598,53 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         crate::vector::metrics::MOONSTORE_DISK_OFFLOAD_ENABLED
             .load(std::sync::atomic::Ordering::Relaxed) as u8
     );
+    // moon#656: the size and shape of the KV cold tier. Until this landed the
+    // section above was the WHOLE section, while the cold tier was the single
+    // largest consumer in the data directory and the only one with no reported
+    // size. The `reclamation_cold_*` fields do NOT answer this — they count
+    // vector segments, and read 0 on a KV-only instance holding gigabytes.
+    //
+    // Refreshed by the cold orphan sweep, i.e. once per
+    // `--cold-orphan-sweep-interval-secs` (60s default) — see `ShardColdStats`
+    // for why these are not on the 100ms tick. All zero until the first sweep,
+    // and permanently zero when disk-offload is off.
+    if let Some(shard_dbs) = crate::admin::metrics_setup::get_global_shard_databases() {
+        let cold = shard_dbs.read_cold_totals();
+        // Omitted, not zeroed, until a sweep has actually published — see
+        // `ShardColdStats::published`.
+        if cold.published {
+            // Index-derived: `ColdIndex` is per-shard state that needs no
+            // manifest, so these are answerable whenever a sweep has run.
+            let _ = write!(
+                sections,
+                "cold_keys:{}\r\n\
+                 cold_files_referenced:{}\r\n\
+                 cold_files_pending_unlink:{}\r\n\
+                 cold_index_bytes:{}\r\n",
+                cold.keys, cold.files_referenced, cold.files_pending_unlink, cold.index_bytes,
+            );
+            // Manifest-derived. A shard whose manifest failed to open still
+            // spills and still accumulates ColdIndex entries, so reporting
+            // these as 0 would put `cold_disk_bytes:0` next to a non-zero
+            // `cold_keys` and call it an answer. Omit instead; the publisher
+            // logs why.
+            if !cold.any_manifest_missing {
+                let _ = write!(
+                    sections,
+                    "cold_disk_bytes:{}\r\n\
+                     cold_files:{}\r\n\
+                     cold_files_dead:{}\r\n",
+                    cold.disk_bytes,
+                    cold.files,
+                    // Files on disk that no live key points at. Derived here
+                    // rather than published so it can never disagree with its
+                    // two terms; saturating because the two are sampled per
+                    // shard and a sweep between them could otherwise underflow.
+                    cold.files.saturating_sub(cold.files_referenced),
+                );
+            }
+        }
+    }
     sections.push_str("\r\n");
 
     // # Reclamation — observability foundation for Wave-1 production hardening (P10).

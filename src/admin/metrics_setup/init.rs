@@ -90,6 +90,28 @@ pub fn init_metrics(
         );
         gauge!("moon_used_memory_bytes").set(0.0);
 
+        // moon#656: the KV cold tier's on-disk footprint. Deliberately NOT
+        // primed to 0 here, unlike the gauges above: these series must be
+        // ABSENT until a cold sweep has published, so a dashboard can tell
+        // "no cold tier" from "not measured yet". A primed zero would make an
+        // instance with disk-offload disabled indistinguishable from one whose
+        // cold tier is genuinely empty.
+        describe_gauge!(
+            "moon_cold_disk_bytes",
+            Unit::Bytes,
+            "On-disk bytes of live KV cold-tier (disk-offload) heap files, summed across shards; refreshed once per --cold-orphan-sweep-interval-secs"
+        );
+        describe_gauge!(
+            "moon_cold_keys",
+            Unit::Count,
+            "Keys resident only in the KV cold tier -- a level, unlike the monotonic spilled_keys counter"
+        );
+        describe_gauge!(
+            "moon_cold_files",
+            Unit::Count,
+            "KV cold-tier heap files by state: referenced (>=1 live key), dead (on disk, referenced by nothing), pending_unlink (awaiting the sweep)"
+        );
+
         Some(ready)
     } else {
         None

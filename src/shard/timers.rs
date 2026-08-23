@@ -478,6 +478,20 @@ pub(crate) fn run_cold_orphan_sweep(
         }
     }
 
+    // moon#656: publish this shard's cold-tier shape for `INFO MoonStore`.
+    //
+    // This is the ONE place in the codebase that already holds all three
+    // inputs at once — every db's ColdIndex, the shard's manifest, and the
+    // shared publisher — and it runs on a fixed timer whenever disk-offload
+    // is enabled (the select arm is NOT gated on there being work to do), so
+    // the numbers refresh even on a completely idle instance.
+    //
+    // Cost: the ColdIndex reads are O(1) accumulator loads; the manifest walk
+    // is O(files) but happens once per sweep interval (60s default), not on
+    // the 100ms memory tick, where an O(files) walk would cost milliseconds
+    // of shard-thread time on a G2-sized cold tier.
+    publish_cold_stats(shard_databases, shard_id, db_count, manifest.as_deref());
+
     if total.entries_reclaimed > 0 {
         tracing::info!(
             shard = shard_id,
@@ -494,6 +508,89 @@ pub(crate) fn run_cold_orphan_sweep(
             "cold_expired_sweep: shard sweep complete",
         );
     }
+}
+
+/// Publish one shard's cold-tier shape into the shared per-shard slot read by
+/// `INFO MoonStore` (moon#656).
+///
+/// Split out of [`run_cold_orphan_sweep`] so the numbers it reports can be
+/// asserted directly, without driving a whole sweep.
+///
+/// The manifest predicate — `status == Active && file_type == KvLeaf` — is the
+/// same one [`crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest`]
+/// uses to decide what to re-index after a restart. Using a different predicate
+/// here would report a cold tier the server would not reload.
+pub(crate) fn publish_cold_stats(
+    shard_databases: &Arc<super::shared_databases::ShardDatabases>,
+    shard_id: usize,
+    db_count: usize,
+    manifest: Option<&crate::persistence::manifest::ShardManifest>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let Some(slot) = shard_databases.cold_per_shard.get(shard_id) else {
+        return;
+    };
+
+    let (keys, index_bytes, files_referenced, files_pending_unlink) = (0..db_count).fold(
+        (0usize, 0usize, 0usize, 0usize),
+        |(k, b, fr, pu), db_idx| {
+            crate::shard::slice::with_shard_db(db_idx, |db| match db.cold_index.as_ref() {
+                Some(ci) => (
+                    k.saturating_add(ci.len()),
+                    b.saturating_add(ci.resident_bytes()),
+                    fr.saturating_add(ci.referenced_file_count()),
+                    pu.saturating_add(ci.pending_unlink_len()),
+                ),
+                None => (k, b, fr, pu),
+            })
+        },
+    );
+
+    let (disk_bytes, files) = manifest.map_or((0u64, 0usize), |m| {
+        m.files()
+            .iter()
+            .filter(|e| {
+                e.status == crate::persistence::manifest::FileStatus::Active
+                    && e.file_type == crate::persistence::page::PageType::KvLeaf as u8
+            })
+            .fold((0u64, 0usize), |(bytes, n), e| {
+                (bytes.saturating_add(e.byte_size), n + 1)
+            })
+    });
+
+    slot.keys.store(keys, Ordering::Relaxed);
+    slot.index_bytes.store(index_bytes, Ordering::Relaxed);
+    slot.files_referenced
+        .store(files_referenced, Ordering::Relaxed);
+    slot.files_pending_unlink
+        .store(files_pending_unlink, Ordering::Relaxed);
+    slot.disk_bytes.store(disk_bytes, Ordering::Relaxed);
+    slot.files.store(files, Ordering::Relaxed);
+    slot.manifest_missing
+        .store(manifest.is_none(), Ordering::Relaxed);
+    if manifest.is_none() && keys > 0 {
+        // Not merely a reporting gap. A shard serving cold keys with no
+        // readable manifest cannot re-index them after a restart, because
+        // `ColdIndex::rebuild_from_manifest` is the only thing that puts them
+        // back — those keys are live now and gone on the next boot. The
+        // missing INFO field is the least of it, so say so at 60s cadence
+        // rather than silently reporting a zero.
+        tracing::warn!(
+            shard = shard_id,
+            cold_keys = keys,
+            "cold tier has keys but this shard has no readable manifest: on-disk \
+             size is unreportable and these keys will NOT survive a restart",
+        );
+    }
+    // Last, and `Release` rather than `Relaxed`: this flag is what allows INFO
+    // to print the six values above, so it must not become visible before
+    // them. With Relaxed on both sides a reader could see the flag on the
+    // FIRST sweep and still read zeros — publishing a block that claims an
+    // empty cold tier, which is exactly the misleading zero this whole change
+    // exists to remove. Paired with the `Acquire` load in `read_cold_totals`.
+    // Stale-by-one-sweep values remain fine and expected; zeros-with-flag do not.
+    slot.published.store(true, Ordering::Release);
 }
 
 /// WAL v3 fsync on 1-second interval (mirrors v2 everysec pattern).

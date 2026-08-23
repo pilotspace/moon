@@ -170,6 +170,30 @@ fn update_moon_memory_bytes() {
     // `logical_used_memory_bytes`'s doc comment for the full breakdown).
     gauge!("moon_used_memory_bytes").set((dashtable + hnsw + text + csr + lua + backlog) as f64);
 
+    // moon#656: the KV cold tier's on-disk footprint. INFO answers "how big is
+    // it right now" for a human at a prompt; an operator alerting on disk
+    // growth needs a time series, so the same published numbers are emitted
+    // here. Skipped entirely until a sweep has published — see
+    // `ShardColdStats::published` for why a zero would be worse than absence.
+    if let Some(shard_dbs) = get_global_shard_databases() {
+        let cold = shard_dbs.read_cold_totals();
+        if cold.published {
+            gauge!("moon_cold_keys").set(cold.keys as f64);
+            gauge!("moon_cold_files", "state" => "referenced").set(cold.files_referenced as f64);
+            gauge!("moon_cold_files", "state" => "pending_unlink")
+                .set(cold.files_pending_unlink as f64);
+            gauge!("moon_memory_bytes", "kind" => "cold_index").set(cold.index_bytes as f64);
+            // Manifest-derived — same omission rule as INFO. A gauge that
+            // reports 0 bytes for a cold tier that has keys is an alert that
+            // will never fire.
+            if !cold.any_manifest_missing {
+                gauge!("moon_cold_disk_bytes").set(cold.disk_bytes as f64);
+                gauge!("moon_cold_files", "state" => "dead")
+                    .set(cold.files.saturating_sub(cold.files_referenced) as f64);
+            }
+        }
+    }
+
     // Update the existing RSS gauge in the same snapshot so the integration
     // test can compare moon_memory_bytes sum against moon_rss_bytes from the
     // same scrape (no drift between separate reads).

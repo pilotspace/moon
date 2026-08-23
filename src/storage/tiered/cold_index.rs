@@ -296,6 +296,29 @@ impl ColdIndex {
         !self.pending_unlink.is_empty()
     }
 
+    /// How many zero-ref files are queued for unlink — `INFO MoonStore`'s
+    /// `cold_files_pending_unlink` (moon#656).
+    ///
+    /// The level behind [`Self::has_pending_unlink`]'s boolean. A number that
+    /// stays high across sweeps means files are being orphaned faster than the
+    /// sweep reclaims them, which is invisible from a boolean.
+    #[inline]
+    pub fn pending_unlink_len(&self) -> usize {
+        self.pending_unlink.len()
+    }
+
+    /// How many distinct heap files still hold at least one live cold key —
+    /// `INFO MoonStore`'s `cold_files_referenced` (moon#656).
+    ///
+    /// Deliberately NOT the number of heap files on disk: a file is unlinked
+    /// only after its LAST live key goes away (see [`Self::file_refs`]), so
+    /// subtracting this from the manifest's live `KvLeaf` file count is the
+    /// dead-file figure at the granularity reclaim actually operates on.
+    #[inline]
+    pub fn referenced_file_count(&self) -> usize {
+        self.file_refs.len()
+    }
+
     /// Iterate over all cold entries as `(key, location)` pairs.
     ///
     /// Used by the orphan sweeper to walk all entries without taking ownership.
@@ -734,6 +757,76 @@ impl ColdIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn loc_in(file_id: u64, slot: u16) -> ColdLocation {
+        ColdLocation {
+            file_id,
+            page_idx: 0,
+            slot_idx: slot,
+            ttl_ms: None,
+            value_type: crate::persistence::kv_page::ValueType::String,
+        }
+    }
+
+    /// moon#656: `INFO MoonStore` reports the cold tier's file-level shape,
+    /// and the two counters it needs are already maintained here — they were
+    /// simply not readable from outside this module.
+    #[test]
+    fn referenced_file_count_tracks_files_with_at_least_one_live_key() {
+        let mut idx = ColdIndex::new();
+        assert_eq!(
+            idx.referenced_file_count(),
+            0,
+            "empty index references no file"
+        );
+
+        // Two keys co-located in one file, one key in another: two files,
+        // three keys. A batched spill file holds up to FLUSH_ENTRY_CAP keys,
+        // so file count and key count are genuinely independent numbers —
+        // which is the whole point of reporting both.
+        idx.insert(Bytes::from_static(b"a"), loc_in(7, 0));
+        idx.insert(Bytes::from_static(b"b"), loc_in(7, 1));
+        idx.insert(Bytes::from_static(b"c"), loc_in(9, 0));
+        assert_eq!(idx.referenced_file_count(), 2);
+        assert_eq!(idx.len(), 3);
+
+        // Removing one of two co-located keys must NOT drop the file: its
+        // sibling still lives there. This is the invariant whose violation
+        // once collapsed cold read-through 200/200 -> 88/200.
+        idx.remove(b"a");
+        assert_eq!(idx.referenced_file_count(), 2, "file 7 still holds key b");
+
+        idx.remove(b"b");
+        assert_eq!(idx.referenced_file_count(), 1, "file 7 is now unreferenced");
+    }
+
+    /// The count reported as `cold_files_pending_unlink` — files whose last
+    /// live reference dropped and which the sweep has not yet unlinked.
+    #[test]
+    fn pending_unlink_len_counts_files_awaiting_the_sweep() {
+        let mut idx = ColdIndex::new();
+        assert_eq!(idx.pending_unlink_len(), 0);
+        assert!(!idx.has_pending_unlink());
+
+        idx.insert(Bytes::from_static(b"a"), loc_in(7, 0));
+        idx.insert(Bytes::from_static(b"c"), loc_in(9, 0));
+        assert_eq!(
+            idx.pending_unlink_len(),
+            0,
+            "both files are still referenced"
+        );
+
+        idx.remove(b"a");
+        assert_eq!(idx.pending_unlink_len(), 1, "file 7 dropped to zero refs");
+        assert!(idx.has_pending_unlink());
+
+        idx.remove(b"c");
+        assert_eq!(idx.pending_unlink_len(), 2);
+
+        // The existing boolean and the new count must never disagree — the
+        // sweep trigger reads one and INFO reports the other.
+        assert_eq!(idx.has_pending_unlink(), idx.pending_unlink_len() > 0);
+    }
 
     #[test]
     fn test_cold_index_insert_lookup_remove() {

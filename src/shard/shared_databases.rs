@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::{Mutex, MutexGuard};
 use smallvec::SmallVec;
@@ -51,6 +51,90 @@ pub struct ShardStoreMemory {
     pub pagecache: AtomicUsize,
 }
 
+/// Per-shard cold-tier (disk-offload) shape, published by the cold orphan
+/// sweep and summed for `INFO MoonStore` (moon#656).
+///
+/// Before this existed, `INFO MoonStore` carried exactly one field —
+/// `disk_offload_enabled` — while the cold tier was the single largest
+/// consumer in the data directory (7.6 GB of `heap-*.mpf` against a 15 GB
+/// data dir, on a 1.43M-key instance). The `reclamation_cold_*` fields look
+/// like they cover this and do not: they count VECTOR segments, so on a
+/// KV-only instance they read 0 while the KV cold tier holds gigabytes.
+///
+/// ## Freshness
+///
+/// These are refreshed by [`crate::shard::timers::run_cold_orphan_sweep`],
+/// i.e. once per `--cold-orphan-sweep-interval-secs` (default 60s), NOT on
+/// the 100ms memory tick. A disk-usage gauge does not need 100ms resolution,
+/// and the alternative — summing the manifest's file entries every 100ms —
+/// is O(files) on a shard event-loop thread, which on a G2-sized cold tier
+/// (100k+ heap files) is milliseconds of tick time for a number nobody reads
+/// that often. All values are 0 until the first sweep runs, and stay 0
+/// forever when disk-offload is disabled (the sweep does not run at all).
+#[derive(Debug, Default)]
+pub struct ShardColdStats {
+    /// Live keys resident only on disk — `ColdIndex::len()`.
+    pub keys: AtomicUsize,
+    /// RAM held by the cold INDEX itself. Not disk: this is the price of
+    /// knowing where the cold data is, and it is already charged against
+    /// `used_memory`.
+    pub index_bytes: AtomicUsize,
+    /// Heap files holding at least one live key — `ColdIndex::referenced_file_count()`.
+    pub files_referenced: AtomicUsize,
+    /// Files whose last live reference dropped, awaiting unlink by the sweep.
+    pub files_pending_unlink: AtomicUsize,
+    /// On-disk bytes of live `KvLeaf` files, from the manifest's `byte_size`.
+    pub disk_bytes: AtomicU64,
+    /// Live `KvLeaf` files in the manifest — the on-disk file count.
+    ///
+    /// `files - files_referenced` is the dead-file figure: files still on
+    /// disk that no live key points at.
+    pub files: AtomicUsize,
+    /// This shard had no readable manifest at publish time, so its
+    /// `disk_bytes` / `files` are 0 for lack of a source rather than because
+    /// the tier is empty.
+    ///
+    /// Reachable: `ShardManifest::open` failing leaves the shard running with
+    /// disk-offload ON and no manifest (`event_loop.rs` warns and continues),
+    /// and `Config::disk_offload_spill_inert` gates only on
+    /// `appendonly`/`save` — not on manifest presence. Spill then still
+    /// populates `ColdIndex`, because `ci.insert` sits OUTSIDE the
+    /// `if let Some(manifest)` block in the completion drain. The result would
+    /// be `cold_keys:16847` next to `cold_disk_bytes:0` — precisely the
+    /// confident-wrong-answer this whole section exists to stop reporting.
+    pub manifest_missing: std::sync::atomic::AtomicBool,
+    /// Set the first time this shard publishes. Distinguishes "the cold tier
+    /// is empty" from "nobody has looked yet".
+    ///
+    /// INFO omits the whole block until at least one shard has published,
+    /// following the rule the `# Stats` section already states: a field Moon
+    /// cannot answer truthfully is omitted rather than reported as a constant,
+    /// because a hardcoded zero is indistinguishable from a healthy server on
+    /// a dashboard. Three situations produce a never-published slot, and all
+    /// three would otherwise read as a genuinely empty cold tier: disk-offload
+    /// is off, `--cold-orphan-sweep-interval-secs 0` disables the sweeper that
+    /// publishes these, or the first sweep has not fired yet.
+    pub published: std::sync::atomic::AtomicBool,
+}
+
+/// A snapshot of [`ShardColdStats`] summed across shards, for INFO.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ColdTierTotals {
+    /// Whether ANY shard has published. `false` ⇒ the other fields are
+    /// meaningless and INFO omits them entirely.
+    pub published: bool,
+    /// Whether ANY shard lacked a manifest. `true` ⇒ `disk_bytes` and `files`
+    /// are not answerable and must be omitted; the index-derived fields stay
+    /// valid, since `ColdIndex` is per-shard state that needs no manifest.
+    pub any_manifest_missing: bool,
+    pub keys: usize,
+    pub index_bytes: usize,
+    pub files_referenced: usize,
+    pub files_pending_unlink: usize,
+    pub disk_bytes: u64,
+    pub files: usize,
+}
+
 /// Shared infrastructure handle — the residual cross-shard state after M5.
 ///
 /// Contains ONLY genuinely-shared handles. Per-shard data (databases, stores,
@@ -98,6 +182,8 @@ pub struct ShardDatabases {
     /// The shard's 100ms tick refreshes these via `with_shard`. Prometheus
     /// publisher and MEMORY DOCTOR read them with zero lock acquisitions.
     pub store_memory_per_shard: Box<[Arc<ShardStoreMemory>]>,
+    /// Per-shard cold-tier stats, published by the cold orphan sweep (moon#656).
+    pub cold_per_shard: Box<[Arc<ShardColdStats>]>,
 }
 
 impl ShardDatabases {
@@ -139,6 +225,10 @@ impl ShardDatabases {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let cold_per_shard: Box<[Arc<ShardColdStats>]> = (0..num_shards)
+            .map(|_| Arc::new(ShardColdStats::default()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
 
         let shared = Arc::new(Self {
             wal_append_txs,
@@ -148,6 +238,7 @@ impl ShardDatabases {
             memory_per_shard: memory_per_shard.clone(),
             elastic_budgets: elastic_budgets.clone(),
             store_memory_per_shard: store_memory_per_shard.clone(),
+            cold_per_shard,
         });
 
         // Build one ShardSliceInit per shard, consuming the databases. The
@@ -316,6 +407,36 @@ impl ShardDatabases {
     #[inline]
     pub fn published_shard_memory(&self, shard_id: usize) -> usize {
         self.memory_per_shard[shard_id].load(Ordering::Relaxed)
+    }
+
+    /// Sum every shard's published cold-tier stats with `Relaxed` loads.
+    /// Lock-free, O(num_shards), no allocation — the same shape as
+    /// [`Self::read_memory_sum`]. See [`ShardColdStats`] for freshness.
+    #[must_use]
+    pub fn read_cold_totals(&self) -> ColdTierTotals {
+        let mut t = ColdTierTotals::default();
+        for c in self.cold_per_shard.iter() {
+            // Acquire: pairs with the Release store at the end of
+            // `publish_cold_stats`, so seeing the flag guarantees seeing that
+            // sweep's values rather than the zeros they replaced.
+            t.published |= c.published.load(Ordering::Acquire);
+            t.any_manifest_missing |= c.manifest_missing.load(Ordering::Relaxed);
+            t.keys = t.keys.saturating_add(c.keys.load(Ordering::Relaxed));
+            t.index_bytes = t
+                .index_bytes
+                .saturating_add(c.index_bytes.load(Ordering::Relaxed));
+            t.files_referenced = t
+                .files_referenced
+                .saturating_add(c.files_referenced.load(Ordering::Relaxed));
+            t.files_pending_unlink = t
+                .files_pending_unlink
+                .saturating_add(c.files_pending_unlink.load(Ordering::Relaxed));
+            t.disk_bytes = t
+                .disk_bytes
+                .saturating_add(c.disk_bytes.load(Ordering::Relaxed));
+            t.files = t.files.saturating_add(c.files.load(Ordering::Relaxed));
+        }
+        t
     }
 
     /// Return a clone of the `Arc<ShardStoreMemory>` for `shard_id`.
@@ -1498,6 +1619,109 @@ mod tests {
     /// over base, inflating the budget the pressure cascade later compares a
     /// vector-INCLUSIVE used-term against. RED until `recompute_elastic_budget`
     /// adds the published vector bytes to its `used` snapshot.
+    /// moon#656: `INFO MoonStore` sums per-shard cold stats. A single-shard
+    /// read would under-report by 1/N — the same class of bug FT.INFO's
+    /// `num_docs` had before it scatter-gathered.
+    #[test]
+    fn read_cold_totals_sums_every_shard_not_just_one() {
+        let shared = new_shared(4, 1);
+        assert_eq!(
+            shared.read_cold_totals(),
+            ColdTierTotals::default(),
+            "nothing published yet: every field is 0, not stale garbage"
+        );
+
+        for (i, slot) in shared.cold_per_shard.iter().enumerate() {
+            let n = i + 1; // 1, 2, 3, 4
+            slot.keys.store(n * 10, Ordering::Relaxed);
+            slot.index_bytes.store(n * 100, Ordering::Relaxed);
+            slot.files_referenced.store(n, Ordering::Relaxed);
+            slot.files_pending_unlink.store(i, Ordering::Relaxed);
+            slot.disk_bytes.store(n as u64 * 1_000, Ordering::Relaxed);
+            slot.files.store(n * 2, Ordering::Relaxed);
+        }
+
+        assert!(
+            !shared.read_cold_totals().published,
+            "values stored but no shard marked itself published: INFO must still \
+             omit the block rather than report numbers no sweep stands behind"
+        );
+        shared.cold_per_shard[2]
+            .published
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let t = shared.read_cold_totals();
+        assert!(
+            t.published,
+            "one shard publishing is enough to report the sum"
+        );
+        assert_eq!(t.keys, 100, "10+20+30+40");
+        assert_eq!(t.index_bytes, 1_000);
+        assert_eq!(t.files_referenced, 10, "1+2+3+4");
+        assert_eq!(t.files_pending_unlink, 6, "0+1+2+3");
+        assert_eq!(t.disk_bytes, 10_000);
+        assert_eq!(t.files, 20);
+
+        // The field INFO derives rather than publishes: files on disk that no
+        // live key references.
+        assert_eq!(t.files.saturating_sub(t.files_referenced), 10);
+    }
+
+    /// A shard whose manifest failed to open still spills and still gains
+    /// `ColdIndex` entries, so its `disk_bytes`/`files` are 0 for lack of a
+    /// source. Reporting that as a cold tier of zero bytes, next to a non-zero
+    /// key count, is the confident-wrong-answer this section exists to remove.
+    /// One bad shard poisons only the manifest-derived fields; the
+    /// index-derived ones stay valid because `ColdIndex` needs no manifest.
+    #[test]
+    fn a_shard_without_a_manifest_poisons_only_the_disk_derived_fields() {
+        let shared = new_shared(2, 1);
+        for slot in shared.cold_per_shard.iter() {
+            slot.keys.store(1_000, Ordering::Relaxed);
+            slot.index_bytes.store(4_096, Ordering::Relaxed);
+            slot.files_referenced.store(9, Ordering::Relaxed);
+            slot.files.store(9, Ordering::Relaxed);
+            slot.disk_bytes.store(90_000, Ordering::Relaxed);
+            slot.published
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        let healthy = shared.read_cold_totals();
+        assert!(!healthy.any_manifest_missing);
+        assert_eq!(healthy.disk_bytes, 180_000);
+
+        // Exactly one of two shards loses its manifest.
+        shared.cold_per_shard[1]
+            .manifest_missing
+            .store(true, Ordering::Relaxed);
+
+        let t = shared.read_cold_totals();
+        assert!(
+            t.any_manifest_missing,
+            "one shard without a manifest must taint the total: the surviving \
+             shard's byte count is a fraction of the truth, not the truth"
+        );
+        // Index-derived survive — they never needed the manifest.
+        assert_eq!(t.keys, 2_000);
+        assert_eq!(t.index_bytes, 8_192);
+        assert_eq!(t.files_referenced, 18);
+    }
+
+    /// A shard that publishes MORE referenced files than the manifest reports
+    /// live must not underflow the derived dead-file count. The two terms come
+    /// from different sources sampled microseconds apart, so ordering between
+    /// them is not guaranteed.
+    #[test]
+    fn dead_file_count_saturates_instead_of_underflowing() {
+        let shared = new_shared(1, 1);
+        shared.cold_per_shard[0].files.store(3, Ordering::Relaxed);
+        shared.cold_per_shard[0]
+            .files_referenced
+            .store(5, Ordering::Relaxed);
+        let t = shared.read_cold_totals();
+        assert_eq!(t.files.saturating_sub(t.files_referenced), 0);
+    }
+
     #[test]
     fn recompute_elastic_budget_vector_heavy_shard_not_donor() {
         let shared = new_shared(4, 1);
