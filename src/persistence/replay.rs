@@ -283,6 +283,24 @@ impl CommandReplayEngine for DispatchReplayEngine {
             *selected_db = 0;
         }
 
+        // moon#677: FLUSHALL needs the full slice for the same reason SWAPDB
+        // does above -- `command::dispatch` only ever sees one `&mut
+        // Database`, so replaying a logged FLUSHALL through it would restore
+        // the fifteen databases the operator flushed. Intercepted here rather
+        // than fixed in `dispatch` because the slice simply is not reachable
+        // from there.
+        //
+        // `flushall` still runs first so the argument check stays in one
+        // place: a record with a bad qualifier errors and clears nothing,
+        // exactly as it would live.
+        if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+            let resp = crate::command::server_admin::flushall(&mut databases[*selected_db], args);
+            if !matches!(resp, Frame::Error(_)) {
+                crate::command::server_admin::flush_every_database(databases, *selected_db);
+            }
+            return;
+        }
+
         // Phase 200 — HEXPIRE-family replay shims.
         //
         // The user-facing command handlers for HEXPIRE / HPEXPIRE / HEXPIREAT

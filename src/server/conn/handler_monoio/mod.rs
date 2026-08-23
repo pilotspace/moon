@@ -2798,6 +2798,18 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
                                 || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
                         {
+                            // moon#677: the keyspace half of the same rule.
+                            // `dispatch` cleared `sel_db` only; a FLUSHALL has
+                            // to reach the other fifteen databases too, or the
+                            // index contents this hook drops for every db go
+                            // while their keys stay — the inconsistency that
+                            // made the bug findable.
+                            if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+                                crate::command::server_admin::flush_every_database(
+                                    &mut s.databases,
+                                    sel_db,
+                                );
+                            }
                             crate::shard::spsc_handler::auto_flush_indexes(
                                 &mut s.vector_store,
                                 &mut s.text_store,

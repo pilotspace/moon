@@ -1614,6 +1614,17 @@ pub async fn handle_connection(
                                                     // WS5a: FLUSHDB scopes to
                                                     // `conn.selected_db`; FLUSHALL clears
                                                     // every db.
+                                                    //
+                                                    // moon#677: keyspace half, inside
+                                                    // MULTI/EXEC too. `execute_transaction`
+                                                    // has returned, so no database guard is
+                                                    // held here and the helper can take each
+                                                    // lock itself.
+                                                    if c.eq_ignore_ascii_case(b"FLUSHALL") {
+                                                        crate::command::server_admin::flush_every_database_locked(
+                                                            db.as_slice(),
+                                                        );
+                                                    }
                                                     if c.eq_ignore_ascii_case(b"FLUSHDB") {
                                                         vs.lock().clear_all_contents_for_db(
                                                             conn.selected_db as u8,
@@ -2919,6 +2930,24 @@ pub async fn handle_connection(
                                     && (d_cmd.eq_ignore_ascii_case(b"FLUSHDB")
                                         || d_cmd.eq_ignore_ascii_case(b"FLUSHALL"))
                                 {
+                                    // moon#677: keyspace half. This handler
+                                    // holds `Arc<Vec<RwLock<Database>>>` and a
+                                    // live write guard on `current_db`, and
+                                    // `parking_lot` locks are not reentrant --
+                                    // so the guard is released first, exactly
+                                    // the way the MOVE and COPY-DB branches
+                                    // above release it to reach a second
+                                    // database, and re-taken afterwards to
+                                    // restore the loop invariant.
+                                    if d_cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+                                        drop(guard);
+                                        crate::command::server_admin::flush_every_database_locked(
+                                            db.as_slice(),
+                                        );
+                                        current_db = conn.selected_db;
+                                        guard = db[current_db].write();
+                                        guard.refresh_now();
+                                    }
                                     if d_cmd.eq_ignore_ascii_case(b"FLUSHDB") {
                                         if let Some(ref vs) = vector_store {
                                             vs.lock()

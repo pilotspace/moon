@@ -2295,6 +2295,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
                             {
                                 crate::shard::slice::with_shard(|s| {
+                                    // moon#677: `dispatch` cleared only
+                                    // `conn.selected_db`. FLUSHALL has to
+                                    // clear this shard's other databases as
+                                    // well — the broadcast below carries the
+                                    // same command to the other shards, where
+                                    // the SPSC arm does the same thing.
+                                    if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+                                        crate::command::server_admin::flush_every_database(
+                                            &mut s.databases,
+                                            conn.selected_db,
+                                        );
+                                    }
                                     crate::shard::spsc_handler::auto_flush_indexes(
                                         &mut s.vector_store,
                                         &mut s.text_store,

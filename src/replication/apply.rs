@@ -772,6 +772,14 @@ fn apply_index_parity_hooks(
     } else if cmd.eq_ignore_ascii_case(b"HDEL") {
         hooks::auto_hdel_vectors(&mut s.vector_store, args, db_index);
     } else if cmd.eq_ignore_ascii_case(b"FLUSHDB") || cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+        // moon#677: a streamed FLUSHALL clears every database on the replica,
+        // the same as on the master. Without this the master empties db0..15
+        // and the replica empties only the db the record was attributed to --
+        // divergence in fifteen databases, invisible until someone SELECTs
+        // one of them.
+        if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+            crate::command::server_admin::flush_every_database(&mut s.databases, db_index as usize);
+        }
         hooks::auto_flush_indexes(
             &mut s.vector_store,
             &mut s.text_store,

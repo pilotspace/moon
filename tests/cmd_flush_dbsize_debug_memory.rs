@@ -49,6 +49,14 @@ impl Drop for Moon {
 /// Start moon on a fresh port. Returns `None` if the binary is missing,
 /// `redis-cli` is missing, or the process never accepts connections.
 fn spawn_moon() -> Option<Moon> {
+    spawn_moon_shards(1)
+}
+
+/// Same, with an explicit shard count. moon#677 needs both: the bug is
+/// present at `--shards 1` (so it is not a routing problem) AND has to stay
+/// fixed at `--shards 4`, where the flush reaches the other shards through
+/// `coordinate_flush_broadcast` rather than the local path.
+fn spawn_moon_shards(shards: usize) -> Option<Moon> {
     if !redis_cli_available() {
         eprintln!("skipping: redis-cli not in PATH");
         return None;
@@ -69,7 +77,7 @@ fn spawn_moon() -> Option<Moon> {
                 "--port",
                 &port.to_string(),
                 "--shards",
-                "1",
+                &shards.to_string(),
                 "--admin-port",
                 "0",
                 "--appendonly",
@@ -261,4 +269,226 @@ fn cmd_memory_usage_returns_integer_or_nil() {
         .parse()
         .unwrap_or_else(|_| panic!("expected integer, got: {out:?}"));
     assert!(n >= 10);
+}
+
+// ---------------------------------------------------------------------------
+// moon#677: FLUSHALL means EVERY database
+// ---------------------------------------------------------------------------
+
+/// The databases these tests populate. Not 0..16 — the point is to prove the
+/// flush reaches databases the connection never selected, and a sparse set
+/// makes a partial fix (say, "db0 and db1") visible instead of accidentally
+/// passing.
+const PROBE_DBS: [&str; 5] = ["0", "1", "3", "7", "15"];
+
+/// `redis-cli -n <db>` picks the database for that invocation. Every call
+/// here is its own connection, which is exactly why the db is passed as a
+/// flag rather than as a preceding `SELECT`: a `SELECT` sent through a
+/// separate `redis-cli` process would apply to a connection that closes
+/// before the next command is written.
+fn cli_db(port: u16, db: &str, args: &[&str]) -> String {
+    let output = Command::new("redis-cli")
+        .args(["-p", &port.to_string(), "-n", db])
+        .args(args)
+        .output()
+        .expect("redis-cli");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn seed_probe_dbs(port: u16) {
+    for db in PROBE_DBS {
+        assert_eq!(
+            cli_db(port, db, &["SET", &format!("k{db}"), "v"]),
+            "OK",
+            "seeding db{db} failed"
+        );
+        assert_eq!(cli_db(port, db, &["DBSIZE"]), "1", "db{db} not seeded");
+    }
+}
+
+fn assert_flushall_emptied_everything(port: u16, shards: usize) {
+    let survivors: Vec<String> = PROBE_DBS
+        .iter()
+        .map(|db| (db, cli_db(port, db, &["DBSIZE"])))
+        .filter(|(_, size)| size != "0")
+        .map(|(db, size)| format!("db{db}={size}"))
+        .collect();
+    assert!(
+        survivors.is_empty(),
+        "FLUSHALL (shards={shards}) left {} database(s) populated: {}. \
+         An operator who runs FLUSHALL believes the instance is empty.",
+        survivors.len(),
+        survivors.join(" ")
+    );
+}
+
+#[test]
+fn flushall_clears_every_database_not_only_the_selected_one() {
+    let Some(m) = spawn_moon() else { return };
+    seed_probe_dbs(m.port);
+
+    // Issued from db0, the database the connection selected.
+    assert_eq!(cli_db(m.port, "0", &["FLUSHALL"]), "OK");
+    assert_flushall_emptied_everything(m.port, 1);
+}
+
+#[test]
+fn flushall_from_a_non_zero_database_also_clears_db0() {
+    let Some(m) = spawn_moon() else { return };
+    seed_probe_dbs(m.port);
+
+    // The mirror case: a fix that special-cased "also clear db0" rather than
+    // clearing every database would pass the test above and fail this one.
+    assert_eq!(cli_db(m.port, "7", &["FLUSHALL"]), "OK");
+    assert_flushall_emptied_everything(m.port, 1);
+}
+
+#[test]
+fn flushall_clears_every_database_across_shards() {
+    let Some(m) = spawn_moon_shards(4) else {
+        return;
+    };
+    seed_probe_dbs(m.port);
+
+    assert_eq!(cli_db(m.port, "0", &["FLUSHALL"]), "OK");
+    assert_flushall_emptied_everything(m.port, 4);
+}
+
+#[test]
+fn flushdb_still_clears_only_the_selected_database() {
+    let Some(m) = spawn_moon() else { return };
+    seed_probe_dbs(m.port);
+
+    // The counter-test for the fix above: FLUSHDB must NOT grow into
+    // FLUSHALL. Without this, "clear every database" passes both commands'
+    // tests and silently makes FLUSHDB destructive.
+    assert_eq!(cli_db(m.port, "3", &["FLUSHDB"]), "OK");
+    assert_eq!(cli_db(m.port, "3", &["DBSIZE"]), "0");
+    for db in PROBE_DBS.iter().filter(|d| **d != "3") {
+        assert_eq!(
+            cli_db(m.port, db, &["DBSIZE"]),
+            "1",
+            "FLUSHDB in db3 wrongly cleared db{db}"
+        );
+    }
+}
+
+#[test]
+fn info_keyspace_agrees_with_flushall() {
+    let Some(m) = spawn_moon() else { return };
+    seed_probe_dbs(m.port);
+    assert_eq!(cli_db(m.port, "0", &["FLUSHALL"]), "OK");
+
+    // DBSIZE is per-connection-db; INFO keyspace is the whole-instance view,
+    // and it is what an operator actually looks at after a flush. Both have
+    // to agree that nothing is left.
+    let info = cli_db(m.port, "0", &["INFO", "keyspace"]);
+    let leftovers: Vec<&str> = info
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("db") && l.contains("keys="))
+        .filter(|l| !l.contains("keys=0"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "INFO keyspace still lists populated databases after FLUSHALL: {leftovers:?}"
+    );
+}
+
+/// A FLUSHALL that a restart undoes is not a flush. This is the AOF-replay
+/// leg: the record is logged with the writer's selected db, so a replayer
+/// that hands it to `command::dispatch` clears that one database and restores
+/// the other fifteen from the log.
+///
+/// SIGKILL rather than SHUTDOWN on purpose — a clean shutdown can paper over
+/// a replay bug by rewriting the log from live state.
+#[test]
+fn flushall_survives_a_restart() {
+    if !redis_cli_available() {
+        eprintln!("skipping: redis-cli not in PATH");
+        return;
+    }
+    let bin = release_binary();
+    if !bin.exists() {
+        eprintln!("skipping: {} not built", bin.display());
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!("moon-flushall-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+
+    let spawn = |port: u16| {
+        Command::new(&bin)
+            .args([
+                "--port",
+                &port.to_string(),
+                "--shards",
+                "1",
+                "--admin-port",
+                "0",
+                "--appendonly",
+                "yes",
+                "--disk-free-min-pct",
+                "0",
+                "--dir",
+                dir.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn moon")
+    };
+
+    let (mut child, port) = common::spawn_listening(spawn);
+    let ready = |port: u16| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if redis_cli(port, &["PING"])
+                .map(|o| o.trim() == "PONG")
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        false
+    };
+    if !ready(port) {
+        common::sigkill(&mut child);
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("skipping: moon did not become ready on {port}");
+        return;
+    }
+
+    seed_probe_dbs(port);
+    assert_eq!(cli_db(port, "0", &["FLUSHALL"]), "OK");
+    // Give the 1ms-tick WAL buffer a moment to reach the log before SIGKILL.
+    thread::sleep(Duration::from_millis(300));
+
+    common::sigkill(&mut child);
+    common::wait_for_port_down(port);
+
+    let mut child2 = spawn(port);
+    let restarted = ready(port);
+    let outcome = if restarted {
+        PROBE_DBS
+            .iter()
+            .map(|db| (db, cli_db(port, db, &["DBSIZE"])))
+            .filter(|(_, size)| size != "0")
+            .map(|(db, size)| format!("db{db}={size}"))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    common::sigkill(&mut child2);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(restarted, "moon did not come back up after SIGKILL");
+    assert!(
+        outcome.is_empty(),
+        "restart resurrected {} database(s) a FLUSHALL had emptied: {}",
+        outcome.len(),
+        outcome.join(" ")
+    );
 }
