@@ -96,6 +96,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`EVALSHA <sha>` with no `numkeys` answered `NOSCRIPT` instead of an arity error**
   (#636). redis rejects on arity (`-3`) before it ever looks the sha up. A client told
   `NOSCRIPT` re-runs `SCRIPT LOAD` and retries the same malformed call — forever.
+- **`ci-local.sh`'s disk pre-flight passed while the volume backing the VM was
+  full** (#661). The guard added in #659 sampled free space *inside* moon-dev
+  and nowhere else. On 2026-08-22 it printed `local-monoio target 41G free 18G
+  OK` — the VM was telling the truth — while the macOS volume holding the VM's
+  auto-expanding disk image sat at 4.1G of 460G. Nothing could be written, so
+  both suites exited `rc=1` with **no error text at all**, which reads exactly
+  like a test failure. A guard that goes green on the one signature it exists
+  to catch is worse than no guard.
+
+  The pre-flight now judges both sides and refuses on either. Three details
+  that each cost a measurement:
+
+  - **`df -PB1` is a GNU spelling.** macOS `df` rejects `-B` and prints usage,
+    so a host probe written that way reads empty forever — and under the
+    existing "cannot measure, step aside" policy that is a check which never
+    runs. The probe uses `df -Pk`. When the host volume genuinely cannot be
+    read the pre-flight now says `host NOT CHECKED` out loud rather than
+    passing quietly. The test for this is deliberately platform-aware: the
+    arm that pins the spelling points at `/`, which every host mounts, and
+    the macOS-only volume is asserted only where it exists. A first draft
+    asserted the default path unconditionally — true on the machine that runs
+    ci-local, false on the Linux runner that gates the PR.
+  - **Not `df /`.** `/` is the sealed system snapshot. It shares the APFS
+    container's free space so *Available* matches, but *Capacity* does not
+    (24% vs 93% on the same machine) — anything keyed on the percentage is
+    wrong there.
+  - **A warm leg is cheap.** Measured: one warm tokio leg (5143 tests) grew
+    the image 90.2 → 90.5 GB. An earlier draft of this guard charged 12G per
+    warm leg — inferred from a 124G → 147G growth figure that was really a
+    *cold* run — and refused to start on a host with 33G free, an hour after
+    ci-local had passed on that same host. Only cold legs, which materialize a
+    whole ~34G target dir, are charged the full amount.
+
+  Also: on any failing leg the summary now prints host and VM free space
+  before the re-run advice, and the reclaim instructions no longer promise
+  what `fstrim` cannot deliver — it reports every unallocated block it trims,
+  which is not what the host gets back (82.8 GiB reported, under 1G returned).
+
 - **`MQ POP` no longer strands messages it claimed but never returned** (#652).
   `MQ POP <key> COUNT <n>` asks `read_group_new` for `n + max_delivery_count`
   entries so that dead letters do not consume the caller's budget, then returns

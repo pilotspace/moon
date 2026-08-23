@@ -119,6 +119,108 @@ disk_verdict() {
 
 as_gb() { echo $(( $1 / 1024 / 1024 / 1024 )); }
 
+# ── Host-side pre-flight (moon#661) ───────────────────────────────────
+# The VM's own number is not the answer. On 2026-08-22 the pre-flight
+# printed a green light on precisely the failure it was written to catch:
+#
+#   ✓ disk pre-flight (moon-dev)
+#     local-monoio   target  41G  free  18G  OK      <- the VM told the truth
+#   ✗ VM monoio suite FAILED (rc=1)                  <- no error text at all
+#
+# The macOS volume holding the VM's disk image was at 4.1G of 460G. The
+# image AUTO-EXPANDS -- the VM root grew 124G -> 147G across that single
+# run -- so the legs the pre-flight clears are themselves eating host
+# headroom while they run, and free space inside the VM never sees it.
+#
+# A wrinkle worth stating: an in-guest `rm` frees nothing on the host. The
+# image only gives blocks back after `fstrim`, so "I deleted a target dir"
+# is not a host remedy on its own.
+HOST_VOLUME=/System/Volumes/Data                    # NOT `/`: see read_host_avail_bytes
+HOST_FLOOR_BYTES=$((10 * 1024 * 1024 * 1024))       # macOS itself misbehaves below this
+HOST_WARN_SLACK_BYTES=$((15 * 1024 * 1024 * 1024))  # cushion above the arithmetic minimum
+# Measured 2026-08-23 on moon-dev: one WARM tokio leg (full nextest suite,
+# 5143 tests) grew the image 90.2 -> 90.5 GB and moved host free space by
+# less than a gigabyte. A warm leg is cheap; a COLD one is not, because it
+# materializes a whole ~34G target dir that the image must back. An earlier
+# draft of this guard charged 12G per warm leg and refused to start a run on
+# a host with 33G free -- on a machine where ci-local had passed an hour
+# before. A pre-flight that grounds healthy runs gets disabled, and then it
+# guards nothing.
+DISK_WARM_GROWTH_BYTES=$((2 * 1024 * 1024 * 1024))
+
+# vm_growth_bytes <leg1-target-bytes> <leg2-target-bytes>
+# How much the run will write INSIDE the VM, which is how much the image
+# will claim from the host. A cold leg materializes a whole target dir; a
+# warm one still grows the image by its incremental build.
+vm_growth_bytes() {
+  local total=0 tgt
+  for tgt in "$@"; do
+    if [ "$tgt" -lt "$DISK_COLD_DIR_BYTES" ]; then
+      total=$((total + DISK_COLD_NEED_BYTES))
+    else
+      total=$((total + DISK_WARM_GROWTH_BYTES))
+    fi
+  done
+  echo "$total"
+}
+
+# host_disk_verdict <host-avail-bytes> <vm-growth-bytes>
+# Echoes OK | WARN | FAIL, non-zero only for FAIL -- same contract as
+# disk_verdict, so a caller may check either the text or the status.
+host_disk_verdict() {
+  local avail=$1 growth=$2
+  if [ "$avail" -lt "$HOST_FLOOR_BYTES" ]; then echo FAIL; return 1; fi
+  if [ "$avail" -lt "$((HOST_FLOOR_BYTES + growth))" ]; then echo FAIL; return 1; fi
+  if [ "$avail" -lt "$((HOST_FLOOR_BYTES + growth + HOST_WARN_SLACK_BYTES))" ]; then
+    echo WARN; return 0
+  fi
+  echo OK; return 0
+}
+
+# read_host_avail_bytes — free bytes on the volume backing the VM image,
+# or nothing at all if it cannot be read.
+#
+# Two spellings that look right and are not:
+#   df -PB1   -- a GNU flag. macOS df rejects -B and prints usage, so a
+#                probe written that way reads EMPTY forever, and under the
+#                "cannot measure -> step aside" policy that is a guard
+#                which never runs. Hence `-Pk` and a x1024.
+#   df /      -- `/` is the sealed system snapshot. It shares the APFS
+#                container's free space, so Available happens to match,
+#                but Capacity does not (24% vs 93% on the same machine).
+#                Anything keyed on the percentage is wrong there.
+read_host_avail_bytes() {
+  [ -d "$HOST_VOLUME" ] || return 0
+  local kb
+  kb=$(df -Pk "$HOST_VOLUME" 2>/dev/null | awk 'NR==2 {print $4}')
+  case "$kb" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  echo $((kb * 1024))
+}
+
+# disk_facts — one line each for host and VM. Printed when a leg fails,
+# because "rc=1 and no output" is the signature of a full disk and reads
+# identically to a test failure. Cheap enough to print unconditionally on
+# failure; detecting "the leg printed nothing" would mean capturing every
+# leg's output, and a captured gate is a gate whose exit code is easy to
+# lose down a pipe.
+disk_facts() {
+  local h
+  h=$(read_host_avail_bytes)
+  if [ -n "$h" ]; then
+    echo "    host $HOST_VOLUME: $(as_gb "$h")G free"
+  else
+    echo "    host $HOST_VOLUME: UNREADABLE"
+  fi
+  local v
+  v=$(orb run -m "$VM" bash -c 'df -Pk / | awk "NR==2 {print \$4}"' 2>/dev/null)
+  case "$v" in
+    ''|*[!0-9]*) echo "    $VM /: UNREADABLE (OrbStack may be wedged)" ;;
+    *)           echo "    $VM /: $(as_gb $((v * 1024)))G free" ;;
+  esac
+}
+
 # preflight_disk — read the VM's real numbers, judge each leg in the order
 # it runs, and refuse to start a run that cannot finish. Failure to READ
 # the numbers is never itself a blocker: a pre-flight that can't measure
@@ -152,15 +254,38 @@ preflight_disk() {
       [ "$projected" -lt 0 ] && projected=0
     fi
   done
+  # moon#661: the host side. The VM's verdict above can be OK while the
+  # macOS volume backing its auto-expanding image has nothing left, and
+  # that failure arrives as rc=1 with no error text.
+  local host_avail growth hv
+  host_avail=$(read_host_avail_bytes)
+  growth=$(vm_growth_bytes $(echo "$probe" | sed -n 2p) $(echo "$probe" | sed -n 3p))
+  if [ -z "$host_avail" ]; then
+    # Loud, not silent: a host check that quietly never runs is the exact
+    # shape of the bug this guard was added for.
+    echo "  host           NOT CHECKED — could not read $HOST_VOLUME"
+  else
+    hv=$(host_disk_verdict "$host_avail" "$growth") || rc=1
+    printf "  %-14s needs %3sG  free %3sG  %s\n" \
+      "host" "$(as_gb "$growth")" "$(as_gb "$host_avail")" "$hv"
+  fi
+
   if [ $rc -ne 0 ]; then
     echo ""
-    echo "  ✗ NOT ENOUGH DISK IN $VM — refusing to start."
+    echo "  ✗ NOT ENOUGH DISK — refusing to start."
     echo "    A run started here fails with no error text and can wedge OrbStack."
     echo "    Biggest consumers:"
     orb run -m "$VM" bash -c 'du -sh ~/ci-target/* 2>/dev/null | sort -rh | head -6' 2>/dev/null | sed "s/^/      /"
-    echo "    Reclaim (each dir rebuilds from scratch, ~34G and ~25min):"
+    echo "    Reclaim inside the VM (each dir rebuilds from scratch, ~34G and ~25min):"
     echo "      orb run -m $VM bash -c 'rm -rf ~/ci-target/local-tokio'"
     echo "      orb run -m $VM bash -c 'rm -rf ~/ci-target/local-monoio'"
+    echo "    Then return those blocks TO THE HOST — an in-guest rm frees"
+    echo "    nothing on the host until the image is trimmed:"
+    echo "      orb run -m $VM sudo fstrim -av"
+    echo "    Check the host number again afterwards: fstrim reports every"
+    echo "    unallocated block it trims, which is NOT what the host gets"
+    echo "    back. Measured 2026-08-23: 82.8 GiB reported trimmed returned"
+    echo "    under 1G of host space, because most of it was already sparse."
   fi
   return $rc
 }
@@ -252,6 +377,11 @@ if [ $TREE_OK -ne 0 ]; then
   exit 3
 fi
 if [ $FAILED -ne 0 ]; then
+  # moon#661: read the disk BEFORE reading the test list. A leg that failed
+  # because nothing could be written exits rc=1 with no error text, which
+  # is indistinguishable from a test failure until you look here.
+  echo "  disk at end of run:"
+  disk_facts
   echo "  RESULT: FAIL — re-run failing suites in isolation before"
   echo "  attributing (known load-flake classes: fixed ports, kill-9 timing)."
   exit 1
