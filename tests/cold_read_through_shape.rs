@@ -42,6 +42,13 @@ const ALLOWED: &[(&str, &str)] = &[
         "src/command/string/string_read.rs",
         "GET: has its own cold read-through after the hot miss",
     ),
+    (
+        "src/command/debug_digest.rs",
+        "DEBUG DIGEST: plane-partitioned like KEYS -- the hot loop is hot-only \
+         on purpose and `cold_only_keys` supplies the rest, so a tiered key is \
+         digested exactly once. A read-through accessor here would count every \
+         tiered key TWICE and produce a digest that matches nothing.",
+    ),
 ];
 
 fn src_command_rs_files() -> Vec<PathBuf> {

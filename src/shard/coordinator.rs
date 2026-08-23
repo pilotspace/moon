@@ -2021,6 +2021,97 @@ pub async fn coordinate_dbsize(
     Frame::Integer(total)
 }
 
+/// Coordinate `DEBUG DIGEST` across all shards.
+///
+/// Each shard contributes UNFINALISED per-db partials; the coordinator merges
+/// them and folds the db indices once. Finalising per shard would mix each db
+/// index once per shard instead of once per server and the parts could no
+/// longer be combined.
+///
+/// The local leg runs inline rather than through the SPSC loop: a shard has no
+/// self-loop (and none at all at `--shards 1`), so a fan-out that included
+/// itself would silently drop its own keys.
+///
+/// # Failure is loud
+///
+/// If any shard fails to answer, this returns an ERROR rather than a digest
+/// over the shards that did reply. A digest missing one shard's keys is a
+/// well-formed 40-character answer that matches nothing — precisely the shape
+/// that sends someone hunting data loss that never happened.
+pub async fn coordinate_debug_digest(
+    my_shard: usize,
+    num_shards: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Frame {
+    let mut all: Vec<(usize, crate::command::debug_digest::Digest)> =
+        crate::command::debug_digest::local_partials();
+
+    let mut pending: Vec<channel::OneshotReceiver<Frame>> = Vec::new();
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue;
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let cmd_frame = Frame::Array(framevec![
+            Frame::BulkString(Bytes::from_static(b"DEBUG")),
+            Frame::BulkString(Bytes::from_static(b"DIGEST-SHARD")),
+        ]);
+        let msg = ShardMessage::Execute {
+            // The partials cover EVERY database, so the db this message is
+            // nominally addressed to is irrelevant — but it must be a valid
+            // index, and 0 always exists.
+            db_index: 0,
+            command: std::sync::Arc::new(cmd_frame),
+            script_acl: crate::acl::ScriptAcl::deny(),
+            reply_tx,
+        };
+        // `spsc_send` DROPS `reply_tx` when it gives up, so a discarded
+        // Backpressure would surface later as "reply channel closed" — after
+        // every remaining shard had been dispatched to and waited on. Stop
+        // here and say what actually happened.
+        if spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await
+            == PushOutcome::Backpressure
+        {
+            return Frame::Error(Bytes::from_static(
+                b"ERR cross-shard DEBUG DIGEST dispatch backpressured",
+            ));
+        }
+        pending.push(reply_rx);
+    }
+
+    for reply_rx in pending {
+        // `recv_reply_bounded_reason`, not `recv_reply_bounded`: the two
+        // failures are different facts about the shard, and this error text
+        // makes a claim about which one happened. A shard still grinding
+        // through a large keyspace is not a shard that dropped its sender.
+        match recv_reply_bounded_reason(reply_rx).await {
+            Ok(frame) => match crate::command::debug_digest::partials_from_frame(&frame) {
+                Some(partials) => all.extend(partials),
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR a shard returned a malformed DEBUG DIGEST partial",
+                    ));
+                }
+            },
+            Err(ReplyFailure::Closed) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR cross-shard reply channel closed during DEBUG DIGEST",
+                ));
+            }
+            Err(ReplyFailure::TimedOut) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR cross-shard DEBUG DIGEST timed out waiting for a shard",
+                ));
+            }
+        }
+    }
+
+    let merged = crate::command::debug_digest::merge_partials(all);
+    let digest = crate::command::debug_digest::finalize_dataset(merged);
+    Frame::SimpleString(Bytes::from(crate::command::debug_digest::to_hex(&digest)))
+}
+
 /// Coordinate RANDOMKEY across all shards.
 ///
 /// Asks every shard for BOTH its key count and one random key of its own, then

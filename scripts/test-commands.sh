@@ -19,8 +19,11 @@ set -euo pipefail
 #   ./scripts/test-commands.sh --moon-only      # Test moon without Redis comparison
 ###############################################################################
 
-PORT_REDIS=6399
-PORT_RUST=6400
+# Overridable like the sibling `test-consistency.sh`: these ports are often
+# already held by another checkout's servers, and a squatter on PORT_REDIS
+# would silently make every "expected" value below come from moon.
+PORT_REDIS="${PORT_REDIS:-6399}"
+PORT_RUST="${PORT_RUST:-6400}"
 SHARDS=1
 SKIP_BUILD=false
 SKIP_BENCH=false
@@ -992,6 +995,48 @@ if should_run "connection"; then
     assert_moon_raw_reply "BLPOP timeout is a null ARRAY" '*-1' BLPOP nulltype:t1 0.05
     assert_moon_raw_reply "GET miss is still a null BULK" '$-1' GET nulltype:t2
     assert_moon_raw_reply "ZPOPMIN miss is still an EMPTY array" '*0' ZPOPMIN nulltype:t3
+
+    # moon#636: DEBUG DIGEST. Byte-parity against redis is asserted in
+    # test-consistency.sh, which has the oracle running with DEBUG enabled;
+    # here the check is that the command is REACHABLE from a client and
+    # behaves as a fingerprint. That matters on its own: DEBUG DIGEST is
+    # served by a handler intercept rather than the ordinary dispatch, so a
+    # missing arm would be invisible to unit tests.
+    # moon#677: FLUSHALL clears only the selected database, so it cannot on
+    # its own establish "the dataset is empty". Nothing in this script writes
+    # outside db0 today, but the sentinel row would fail confusingly the first
+    # time something did -- and the failure would look like a digest bug.
+    # Collapse this back to a bare FLUSHALL once #677 lands.
+    for _dg_db in $(seq 0 15); do
+        redis-cli -p "$PORT_RUST" -n "$_dg_db" FLUSHDB >/dev/null 2>&1
+    done
+    assert_moon "DEBUG DIGEST of an empty dataset is the zero sentinel" \
+        "0000000000000000000000000000000000000000" DEBUG DIGEST
+    mcli SET dg:probe v1 >/dev/null 2>&1
+    DG_ONE=$(mcli DEBUG DIGEST 2>/dev/null)
+    TOTAL=$((TOTAL + 1))
+    # Same reasoning as DG_TWO below: "not the zero sentinel" is satisfied by
+    # an error string too, so require a real 40-hex digest.
+    if [[ "$DG_ONE" =~ ^[0-9a-f]{40}$ && "$DG_ONE" != "0000000000000000000000000000000000000000" ]]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: DEBUG DIGEST gave no non-zero digest after a write: $DG_ONE"
+    fi
+    # Same data must give the same digest; different data must not.
+    # "differs from DG_ONE" is not enough on its own -- an ERROR reply also
+    # differs, so a broken DEBUG DIGEST would pass. Require an actual digest.
+    mcli SET dg:probe v2 >/dev/null 2>&1
+    DG_TWO=$(mcli DEBUG DIGEST 2>/dev/null)
+    TOTAL=$((TOTAL + 1))
+    if [[ "$DG_TWO" =~ ^[0-9a-f]{40}$ && "$DG_TWO" != "$DG_ONE" ]]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: DEBUG DIGEST did not return a changed digest: $DG_TWO"
+    fi
+    mcli SET dg:probe v1 >/dev/null 2>&1
+    assert_moon "DEBUG DIGEST returns to its earlier value" "$DG_ONE" DEBUG DIGEST
 fi
 
 # ===========================================================================
@@ -1149,6 +1194,16 @@ if should_run "scripting"; then
     assert_moon "DUMP then RESTORE round-trips" "hello" \
         EVAL "local p = redis.call('DUMP', KEYS[1]); redis.call('RESTORE', KEYS[2], 0, p, 'REPLACE'); return redis.call('GET', KEYS[2])" \
         2 "dr:{dr}:src" "dr:{dr}:dst"
+
+    # moon#636: DEBUG DIGEST is not available from an inline context, and the
+    # refusal must name the limitation rather than answer from the one
+    # database that path can see. Lua is the reachable half of that pair from
+    # a one-shot client (MULTI needs a held connection); the message covers
+    # both, so match the phrase that names them rather than a single word.
+    # The digest's own behaviour is checked in the CONNECTION block.
+    assert_moon_contains "DEBUG DIGEST from Lua is refused, not guessed" \
+        "MULTI/EXEC and Lua" \
+        EVAL "return redis.call('DEBUG', 'DIGEST')" 0
 
     # moon#515: Redis caches an EVAL'd body server-wide, so EVAL-then-EVALSHA
     # is a supported idiom. moon cached it only on the executing shard, so at
@@ -1431,11 +1486,15 @@ if should_run "vector"; then
     # Create a fresh index for DD tests
     assert_moon_ok "FT.CREATE dd_test" FT.CREATE ddtest ON HASH PREFIX 1 dd: SCHEMA vec VECTOR HNSW 6 DIM 4 TYPE FLOAT32 DISTANCE_METRIC L2
 
-    # Insert documents
+    # Insert documents.
+    # `$PORT` (four sites below) was never a variable this script defines --
+    # under `set -euo pipefail` the first one ABORTED the whole run here, so
+    # every category after VECTOR SEARCH (MQ, txn_kv, eviction, benchmark) and
+    # the result summary never executed. Same class as moon#634.
     printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        | redis-cli -x -p "$PORT" HSET dd:1 vec >/dev/null 2>&1
+        | redis-cli -x -p "$PORT_RUST" HSET dd:1 vec >/dev/null 2>&1
     printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        | redis-cli -x -p "$PORT" HSET dd:2 vec >/dev/null 2>&1
+        | redis-cli -x -p "$PORT_RUST" HSET dd:2 vec >/dev/null 2>&1
 
     # Verify documents exist
     TOTAL=$((TOTAL + 1)); DD_EXISTS=$(mcli EXISTS dd:1 dd:2 2>&1)
@@ -1451,7 +1510,7 @@ if should_run "vector"; then
     # Test case insensitivity: create another index
     assert_moon_ok "FT.CREATE dd_test2" FT.CREATE ddtest2 ON HASH PREFIX 1 dd2: SCHEMA vec VECTOR HNSW 6 DIM 4 TYPE FLOAT32 DISTANCE_METRIC L2
     printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        | redis-cli -x -p "$PORT" HSET dd2:1 vec >/dev/null 2>&1
+        | redis-cli -x -p "$PORT_RUST" HSET dd2:1 vec >/dev/null 2>&1
 
     # Drop with lowercase dd flag
     assert_moon_ok "FT.DROPINDEX dd (lowercase)" FT.DROPINDEX ddtest2 dd
@@ -1462,7 +1521,7 @@ if should_run "vector"; then
     # Test without DD — documents should remain
     assert_moon_ok "FT.CREATE no_dd_test" FT.CREATE noddtest ON HASH PREFIX 1 ndd: SCHEMA vec VECTOR HNSW 6 DIM 4 TYPE FLOAT32 DISTANCE_METRIC L2
     printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        | redis-cli -x -p "$PORT" HSET ndd:1 vec >/dev/null 2>&1
+        | redis-cli -x -p "$PORT_RUST" HSET ndd:1 vec >/dev/null 2>&1
 
     assert_moon_ok "FT.DROPINDEX no DD" FT.DROPINDEX noddtest
 
@@ -2086,8 +2145,12 @@ if should_run "vector"; then
     # NUMERIC-07 (W-01 cross-shard correctness): 1-shard vs 4-shard identical keys
     # for @score:[5 15] on an independent fixture.
     TOTAL=$((TOTAL + 1))
-    pkill -f 'moon --port 6411' 2>/dev/null
-    pkill -f 'moon --port 6414' 2>/dev/null
+    # `|| true`: pkill exits 1 when nothing matched, and under
+    # `set -euo pipefail` that killed the run outright -- on a clean machine
+    # the FIRST of these (nothing to kill yet) aborted the script before
+    # NUMERIC-07, so MQ, txn_kv, eviction and the RESULT SUMMARY never ran.
+    pkill -f 'moon --port 6411' 2>/dev/null || true
+    pkill -f 'moon --port 6414' 2>/dev/null || true
     sleep 1
     ./target/release/moon --port 6411 --shards 1 --protected-mode no > /tmp/moon-6411.log 2>&1 &
     ./target/release/moon --port 6414 --shards 4 --protected-mode no > /tmp/moon-6414.log 2>&1 &
@@ -2109,8 +2172,12 @@ if should_run "vector"; then
         echo "1-shard: $N1"
         echo "4-shard: $N4"
     fi
-    pkill -f 'moon --port 6411' 2>/dev/null
-    pkill -f 'moon --port 6414' 2>/dev/null
+    # `|| true`: pkill exits 1 when nothing matched, and under
+    # `set -euo pipefail` that killed the run outright -- on a clean machine
+    # the FIRST of these (nothing to kill yet) aborted the script before
+    # NUMERIC-07, so MQ, txn_kv, eviction and the RESULT SUMMARY never ran.
+    pkill -f 'moon --port 6411' 2>/dev/null || true
+    pkill -f 'moon --port 6414' 2>/dev/null || true
 
     echo "  ft_aggregate: done"
 fi

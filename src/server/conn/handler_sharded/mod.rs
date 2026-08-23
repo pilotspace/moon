@@ -1744,6 +1744,26 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // Other DEBUG subcommands fall through.
                     }
 
+                    // --- DEBUG DIGEST (moon#636): whole-server, every shard, every db ---
+                    // See the monoio handler for why this cannot reach
+                    // `debug()`.
+                    if cmd.eq_ignore_ascii_case(b"DEBUG")
+                        && cmd_args
+                            .first()
+                            .and_then(crate::command::helpers::extract_bytes)
+                            .is_some_and(|s| s.eq_ignore_ascii_case(b"DIGEST"))
+                    {
+                        let response = crate::shard::coordinator::coordinate_debug_digest(
+                            ctx.shard_id,
+                            ctx.num_shards,
+                            &ctx.dispatch_tx,
+                            &ctx.spsc_notifiers,
+                        )
+                        .await;
+                        responses.push(response);
+                        continue;
+                    }
+
                     // --- Multi-key commands ---
                     if is_multi_key_command(cmd, cmd_args) {
                         let mut local_barrier_pending = false;

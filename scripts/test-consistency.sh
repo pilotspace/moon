@@ -116,7 +116,12 @@ if [[ "$SKIP_BUILD" == false ]]; then
 fi
 
 log "Starting Redis on :$PORT_REDIS ..."
-redis-server --port "$PORT_REDIS" --save "" --appendonly no --loglevel warning --daemonize no &>/dev/null &
+# `--enable-debug-command yes` is needed for the moon#636 DEBUG DIGEST rows:
+# redis >= 7 refuses DEBUG from a non-local config without it. Harmless
+# otherwise -- nothing else here calls DEBUG. The rows below still guard on
+# redis actually answering, so an older redis that rejects the flag degrades
+# to a LOUD skip rather than a wall of failures.
+redis-server --port "$PORT_REDIS" --save "" --appendonly no --loglevel warning --enable-debug-command yes --daemonize no &>/dev/null &
 REDIS_PID=$!
 
 log "Starting moon on :$PORT_RUST (shards=$SHARDS)..."
@@ -2983,6 +2988,156 @@ run_volatile_ttl_eviction_leg "disk-offload" tier --appendonly yes --disk-offloa
 
 # Restart moon with the originally-requested shard count so summary works.
 start_moon_with_shards "$SHARDS" || true
+
+# ===========================================================================
+# moon#636: DEBUG DIGEST -- whole-dataset fingerprint, byte-compatible with redis
+# ===========================================================================
+#
+# This is the one row that compares the ENTIRE keyspace in a single round trip
+# rather than one command at a time, so it catches divergence no per-command
+# assertion was written for.
+#
+# It runs LAST, and it restarts moon itself. Earlier sections spawn and tear
+# down their own servers (the MQ fan-out leaves the main instance stopped), so
+# a block placed mid-script silently compared against a dead port -- the
+# original draft did exactly that and reported "Could not connect" as moon's
+# digest.
+echo "=== moon#636: DEBUG DIGEST parity ==="
+
+# Guard both ends. `assert_both` would happily record a connection error as
+# moon's answer, so prove each server ANSWERS before comparing them.
+dg_redis_probe="$(redis-cli -t 3 -p "$PORT_REDIS" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
+if ! [[ "$dg_redis_probe" =~ ^[0-9a-f]{40}$ ]]; then
+    # DEBUG gated off ("not allowed"), an older redis ("unknown command"), or
+    # a server that is simply not there ("Could not connect"). Every row below
+    # compares against this process, so a non-answer must skip LOUDLY.
+    echo "  SKIP: redis did not answer DEBUG DIGEST (${dg_redis_probe:0:60}) --"
+    echo "        DEBUG DIGEST parity rows did NOT run."
+else
+    # Reaching a known-empty state on BOTH servers, which every row below
+    # depends on.
+    #
+    # moon#677: moon's FLUSHALL clears only the SELECTED database, so it
+    # cannot get moon there -- the db3 key written by the "spans every
+    # database" row would survive on moon and not on redis, and every
+    # comparison after it would be judging two genuinely different datasets
+    # while blaming the digest. Simplify this back to `both FLUSHALL` once
+    # #677 lands.
+    dg_clear_every_db() {
+        local d
+        # redis's FLUSHALL is correct, and redis carries state from every
+        # earlier section of this script -- including databases this one never
+        # touches, which would show up as a digest difference against a
+        # freshly restarted moon.
+        redis-cli -t 3 -p "$PORT_REDIS" FLUSHALL >/dev/null 2>&1 || true
+        # moon needs it spelled out, one database at a time.
+        for d in $(seq 0 15); do
+            redis-cli -t 3 -p "$PORT_RUST" -n "$d" FLUSHDB >/dev/null 2>&1 || true
+        done
+    }
+
+    # One key of every type the digest walks, plus a TTL and a FIXED stream id
+    # (an auto-generated `*` id differs per server, which would make the two
+    # datasets genuinely different and the comparison meaningless).
+    seed_digest_dataset() {
+        dg_clear_every_db
+        both SET  dg:str hello
+        both SET  dg:ttl withttl
+        both EXPIRE dg:ttl 9999
+        both RPUSH dg:list a b c
+        both SADD  dg:set  x y z
+        both HSET  dg:hash f1 v1 f2 v2
+        both ZADD  dg:zset 1 m1 2 m2
+        # 3.3 is the score that separates shortest-round-trip formatting from
+        # "%.17g" (3.2999999999999998). Without it the score format is unpinned:
+        # 1.5 / 2.25 / -0.125 render identically under both.
+        both ZADD  dg:zsetodd 3.3 q
+        both XADD  dg:stream 1234-5 f1 v1
+    }
+
+    # Run the whole comparison at BOTH shard counts. shards=1 proves the digest
+    # itself; shards=4 proves the cross-shard merge, which is a different code
+    # path (per-shard partials XOR-combined, db index folded once per server
+    # rather than once per shard).
+    run_digest_leg() {
+        local nshards="$1"
+        if ! start_moon_with_shards "$nshards"; then
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: [shards=$nshards] moon did not start -- digest rows did not run"
+            return
+        fi
+        local alive
+        alive="$(redis-cli -t 3 -p "$PORT_RUST" PING 2>&1 | tr -d '\r' || true)"
+        if [[ "$alive" != "PONG" ]]; then
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: [shards=$nshards] moon is not answering ($alive)"
+            return
+        fi
+
+        seed_digest_dataset
+        assert_both "[shards=$nshards] DEBUG DIGEST agrees with redis over a mixed dataset" \
+            DEBUG DIGEST
+
+        # It must be a FUNCTION of the data, not a constant that happens to agree.
+        local dg_before dg_after dg_restored dg_revlist
+        dg_before="$(redis-cli -t 3 -p "$PORT_RUST" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
+        both SET dg:str hello2
+        dg_after="$(redis-cli -t 3 -p "$PORT_RUST" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
+        if [[ "$dg_before" == "$dg_after" ]]; then
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: [shards=$nshards] DEBUG DIGEST did not change when a value changed"
+            echo "    digest: $dg_before"
+        else
+            PASS=$((PASS + 1))
+        fi
+        assert_both "[shards=$nshards] DEBUG DIGEST still agrees after the change" DEBUG DIGEST
+
+        # ...and it must come BACK, or it is drifting rather than fingerprinting.
+        both SET dg:str hello
+        dg_restored="$(redis-cli -t 3 -p "$PORT_RUST" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
+        assert_eq "[shards=$nshards] DEBUG DIGEST returns to its earlier value" \
+            "$dg_before" "$dg_restored"
+
+        # Order-independence: a set is a set.
+        both DEL dg:set
+        both SADD dg:set z y x
+        assert_both "[shards=$nshards] DEBUG DIGEST ignores set insertion order" DEBUG DIGEST
+
+        # ...but a list is NOT a set.
+        both DEL dg:list
+        both RPUSH dg:list c b a
+        dg_revlist="$(redis-cli -t 3 -p "$PORT_RUST" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
+        if [[ "$dg_revlist" == "$dg_restored" ]]; then
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: [shards=$nshards] DEBUG DIGEST ignored list ORDER (lists are not sets)"
+        else
+            PASS=$((PASS + 1))
+        fi
+        assert_both "[shards=$nshards] DEBUG DIGEST agrees on the reversed list" DEBUG DIGEST
+
+        # A key in another database must move the digest: the db index is
+        # folded into the dataset digest, not just the keys.
+        redis-cli -t 3 -p "$PORT_REDIS" -n 3 SET dg:db3 v >/dev/null 2>&1 || true
+        redis-cli -t 3 -p "$PORT_RUST"  -n 3 SET dg:db3 v >/dev/null 2>&1 || true
+        assert_both "[shards=$nshards] DEBUG DIGEST spans every database" DEBUG DIGEST
+
+        # Empty dataset is redis's all-zero sentinel, not an error. Clearing
+        # by db rather than by FLUSHALL for the moon#677 reason above -- the
+        # db3 key written just now is precisely what FLUSHALL fails to remove.
+        dg_clear_every_db
+        assert_both "[shards=$nshards] DEBUG DIGEST of an empty dataset" DEBUG DIGEST
+        assert_eq "[shards=$nshards] empty digest is the all-zero sentinel" \
+            "0000000000000000000000000000000000000000" \
+            "$(redis-cli -t 3 -p "$PORT_RUST" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
+    }
+
+    run_digest_leg 1
+    run_digest_leg 4
+
+    # Restore the originally-requested shard count so nothing downstream
+    # inherits a 4-shard server from this section.
+    start_moon_with_shards "$SHARDS" || true
+fi
 
 echo "============================================"
 echo "  Data Consistency Test Results"

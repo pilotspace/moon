@@ -198,12 +198,50 @@ fn classify_debug(args: &[Frame]) -> Result<DebugCall<'_>, Frame> {
         Ok(DebugCall::Panic)
     } else if sub.eq_ignore_ascii_case(b"HELP") {
         Ok(DebugCall::Help)
+    } else if sub.eq_ignore_ascii_case(b"DIGEST") {
+        // Recognised here ONLY so this path can refuse it loudly. The real
+        // implementation is an intercept that can reach every database and
+        // every shard; see `digest_off_path_error`.
+        Err(digest_off_path_error())
     } else {
         Err(Frame::Error(Bytes::from(format!(
             "ERR DEBUG subcommand '{}' not supported",
             String::from_utf8_lossy(sub),
         ))))
     }
+}
+
+/// `DEBUG DIGEST` reached the ordinary command path instead of its intercept.
+///
+/// Fail LOUD rather than answering from the single database this path can
+/// see. A digest over one db of one shard is forty perfectly plausible hex
+/// characters that match nothing: a harness comparing two servers would report
+/// a difference that is not there, with nothing in the reply to hint the
+/// answer was partial. An error is recoverable; a confident wrong digest is
+/// not.
+///
+/// In practice this is reached from the contexts that execute commands INLINE
+/// and so cannot call an intercept — inside `MULTI`/`EXEC`, and from Lua.
+/// Redis serves `DEBUG DIGEST` in both; moon does not, and the message says so
+/// rather than blaming the caller or inviting a bug report for a known
+/// limitation. Verified against redis 8.6.1: it answers inside MULTI.
+fn digest_off_path_error() -> Frame {
+    // ASCII only: this is a RESP simple error, which may contain no CR or LF
+    // and is conventionally one plain line.
+    Frame::Error(Bytes::from_static(
+        b"ERR DEBUG DIGEST spans every database and shard and cannot be served \
+          from an inline context; it is unavailable inside MULTI/EXEC and Lua. \
+          Send it as a top-level command.",
+    ))
+}
+
+/// This shard's UNFINALISED per-db partials, for the cross-shard fan-out.
+///
+/// Deliberately not a digest: finalising per shard would fold the db index in
+/// once per shard instead of once per server, and the parts could no longer be
+/// combined.
+pub fn debug_digest_shard_partials() -> Frame {
+    crate::command::debug_digest::partials_to_frame(&crate::command::debug_digest::local_partials())
 }
 
 fn debug_help() -> Frame {
@@ -219,6 +257,12 @@ fn debug_help() -> Frame {
         Frame::BulkString(Bytes::from_static(b"DEBUG PANIC")),
         Frame::BulkString(Bytes::from_static(
             b"  Panic this shard thread (crash-handling test aid, as in Redis).",
+        )),
+        Frame::BulkString(Bytes::from_static(b"DEBUG DIGEST")),
+        Frame::BulkString(Bytes::from_static(
+            b"  SHA1 fingerprint of the whole dataset, every database and \
+              shard. Byte-compatible with Redis, so two servers can be \
+              compared in one round trip. Not available inside MULTI or Lua.",
         )),
         Frame::BulkString(Bytes::from_static(b"DEBUG HELP")),
         Frame::BulkString(Bytes::from_static(b"  Return subcommand help.")),
@@ -1837,6 +1881,79 @@ mod tests {
     fn debug_sleep_rejects_non_float() {
         let f = debug_sleep(&[bulk(b"abc")]);
         assert!(matches!(f, Frame::Error(_)));
+    }
+
+    /// `DEBUG DIGEST` must never be answered from the ordinary command path.
+    ///
+    /// That path holds ONE database of ONE shard, so any digest it produced
+    /// would be forty plausible hex characters matching nothing. Redis does
+    /// serve this inside MULTI; moon cannot, and refusing is the only honest
+    /// option — a silently partial digest is worse than an error.
+    #[test]
+    fn debug_digest_is_refused_on_the_inline_path_rather_than_answered_partially() {
+        let mut db = Database::new();
+        db.set(
+            bytes::Bytes::from_static(b"k"),
+            crate::storage::Entry::new_string(bytes::Bytes::from_static(b"v")),
+        );
+        let args = [Frame::BulkString(Bytes::from_static(b"DIGEST"))];
+        match debug(&mut db, &args) {
+            Frame::Error(e) => {
+                let msg = String::from_utf8_lossy(&e);
+                assert!(
+                    msg.starts_with("ERR "),
+                    "must be a normal ERR reply, got {msg}"
+                );
+                assert!(
+                    msg.contains("MULTI"),
+                    "the message must name the actual limitation so a caller \
+                     knows what to do, got {msg}"
+                );
+                // A 40-hex answer here would be the bug this guards. Check
+                // the reply cannot BE a digest, not that it merely differs
+                // from one.
+                let hex_run = msg
+                    .split(|c: char| !c.is_ascii_hexdigit())
+                    .map(str::len)
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    hex_run < 40,
+                    "the refusal contains a 40-character hex run, which is \
+                     exactly what a digest looks like: {msg}"
+                );
+            }
+            other => panic!("DEBUG DIGEST was ANSWERED on the inline path: {other:?}"),
+        }
+    }
+
+    /// A RESP simple error may contain no CR or LF, and moon's own harnesses
+    /// parse these by line.
+    #[test]
+    fn the_off_path_error_is_a_single_ascii_line() {
+        let args = [Frame::BulkString(Bytes::from_static(b"DIGEST"))];
+        let mut db = Database::new();
+        let Frame::Error(e) = debug(&mut db, &args) else {
+            panic!("expected an error");
+        };
+        assert!(!e.contains(&b'\r'), "error frame contains CR");
+        assert!(!e.contains(&b'\n'), "error frame contains LF");
+        assert!(e.is_ascii(), "error frame is not ASCII");
+    }
+
+    /// The internal fan-out subcommand is NOT client surface: reaching the
+    /// ordinary path with it means a client sent it, and it must look unknown.
+    #[test]
+    fn the_internal_shard_subcommand_is_not_advertised_to_clients() {
+        let mut db = Database::new();
+        let args = [Frame::BulkString(Bytes::from_static(b"DIGEST-SHARD"))];
+        match debug(&mut db, &args) {
+            Frame::Error(e) => assert!(
+                String::from_utf8_lossy(&e).contains("not supported"),
+                "DIGEST-SHARD should read as an unknown subcommand to clients"
+            ),
+            other => panic!("DIGEST-SHARD answered a client: {other:?}"),
+        }
     }
 
     #[test]

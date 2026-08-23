@@ -3,6 +3,7 @@ pub mod cdc;
 pub mod client;
 pub mod config;
 pub mod connection;
+pub mod debug_digest;
 pub mod dump_restore;
 pub mod functions;
 pub mod geo;

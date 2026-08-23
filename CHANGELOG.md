@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`DEBUG DIGEST`** (#636). A SHA1 fingerprint of the whole dataset, so two servers can
+  be compared in one round trip instead of key by key. The crash-matrix and replication
+  suites want it for moon-vs-moon (pre-crash vs recovered, master vs replica); the
+  client-compat harness now uses it for moon-vs-redis.
+
+  **The digest is byte-compatible with redis-server 8.6.1**, which is the entire point:
+  a moon-private digest could only ever compare moon to moon, and an *almost*-compatible
+  one is worse than none — it reports two identical datasets as different and sends
+  someone hunting corruption that is not there. Every constant was verified against a
+  live redis rather than read off the source and assumed, which caught two details that
+  are not guessable from the names: `mixDigest` is `SHA1(digest ^ SHA1(data))`, **not**
+  `SHA1(digest ‖ data)` (the natural reading yields a codec that is perfectly
+  self-consistent and wrong against every real redis, so a round-trip test cannot catch
+  it), and the per-key fold *hashes* the 20-byte digest before xoring it rather than
+  xoring the digests directly. Scores use shortest-round-trip formatting, not `%.17g` —
+  `1.5`/`2.25`/`-0.125` agree under both and prove nothing; `3.3` is the only
+  discriminating case and has its own test.
+
+  Verified live against redis 8.6.1 across all six value types, key TTLs, database
+  placement, list order, and the empty dataset — identical digests at both `--shards 1`
+  and `--shards 4`. Sharding works because within a database every key contributes by
+  XOR, which is commutative: each shard accumulates independently and the coordinator
+  merges, folding each database index exactly once per *server*. The digest also does
+  not depend on which storage plane a key lives in — proven with 32 keys spilled to the
+  cold tier, same digest before and after (a digest that walked only the hot table would
+  report a server as differing from its own replica purely because the two had evicted
+  different keys).
+
+  Because the command answers from an *intercept* — dispatch has no context that spans
+  every database and shard — it sits below each handler's ACL gate rather than above it.
+  An intercept placed earlier answers before `NOPERM` is ever considered, and a whole-
+  dataset fingerprint handed to a user who was denied `DEBUG` is the worst instance of
+  that class: the command works, the digest is correct, and only a restricted user would
+  ever notice. `tests/admin_intercept_after_acl_shape.rs` pins the ordering in all three
+  connection handlers so the next privileged intercept cannot land above the gate.
+
+  The parity rows found a real divergence on their first run, which is the case
+  for building an aggregate oracle rather than more per-command assertions: moon's
+  `FLUSHALL` clears only the *selected* database (#677), so an "empty" moon still
+  held four of the five databases the row had written. Around 450 per-command
+  parity assertions had never seen it, because they all live in db0 where the
+  wrong behaviour and the right one are identical. Both harnesses clear database
+  by database until #677 lands, with a comment saying so.
+
+  Validating those rows also turned up three `set -e` defects in
+  `scripts/test-commands.sh` itself, fixed here only because they decide whether
+  the script can report anything at all: four `redis-cli -p "$PORT"` sites named
+  a variable the script never defines (the #634 class again), two unguarded
+  `pkill` calls that exit 1 when nothing matched, and hard-coded ports — so on a
+  machine where another checkout already holds 6399, the "expected" side of every
+  row silently came from a second moon. The remaining reasons that script cannot
+  finish a run on macOS, and the vector rows that have never passed, are filed as
+  #679 rather than fixed here.
+
+  **Known difference, stated rather than papered over:** redis serves `DEBUG DIGEST`
+  inside `MULTI`/`EXEC` and Lua; moon does not. Those contexts execute inline and cannot
+  reach the coordinator that spans every database and shard, so moon returns a clear
+  error naming the limitation instead of a digest computed from the one database that
+  path can see. `DEBUG DIGEST-VALUE` is deliberately **not** implemented yet — it needs
+  per-key cross-shard routing that `DEBUG`'s registry entry does not express, and one
+  that silently answered for the wrong shard would be the same almost-compatible hazard.
+
 - **`DUMP` and `RESTORE`** (#636). moon can now serialize a value to a redis-compatible
   payload and load one back, which is the primitive behind key migration and per-key
   backup. Both were *deregistered* on 2026-08-15 because they were advertised in

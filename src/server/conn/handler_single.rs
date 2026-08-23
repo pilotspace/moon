@@ -1837,6 +1837,69 @@ pub async fn handle_connection(
                         continue;
                     }
 
+                    // --- DEBUG DIGEST (moon#636) ---
+                    // Placement is load-bearing in TWO directions.
+                    //
+                    // BELOW the ACL gate above: DEBUG is an admin command,
+                    // and a dataset fingerprint is exactly the kind of
+                    // thing a restricted user must not be able to read. An
+                    // intercept above the gate would answer before NOPERM
+                    // was ever considered.
+                    //
+                    // ABOVE the per-command dispatch that takes a read
+                    // guard on the selected database: this walks EVERY
+                    // database, and re-locking the selected one while its
+                    // own guard is held can deadlock -- `parking_lot`'s
+                    // RwLock is not reentrant, so a writer queued between
+                    // the two reads blocks the second forever. Locking each
+                    // db in turn from here is the shape INFO's keyspace
+                    // walk already uses.
+                    //
+                    // BELOW the MULTI queue block just above: inside a
+                    // transaction the frame must QUEUE, not answer. An
+                    // intercept above it replies with a 40-character digest
+                    // where the protocol requires `+QUEUED`, and the client's
+                    // queue accounting then desyncs -- its EXEC array comes
+                    // back one element shorter than it queued. The other two
+                    // handlers get this from the same ordering; monoio spells
+                    // the rule out at its gate ("every non-transactional
+                    // intercept MUST sit below this"). At EXEC the queued
+                    // frame reaches `debug()`, which refuses it loudly.
+                    //
+                    // This handler is the embedded / non-sharded server, so
+                    // the local databases ARE the whole dataset.
+                    //
+                    // `cmd`/`cmd_args` from the ACL gate are out of scope here
+                    // -- that binding ends above the MULTI block -- so re-read
+                    // them from the frame, the same way the queue block and
+                    // the phase-2 dispatch below both do.
+                    if let Some((dg_cmd, dg_args)) = extract_command(&frame)
+                        && dg_cmd.eq_ignore_ascii_case(b"DEBUG")
+                    {
+                        if let Some(sub) = dg_args.first() {
+                            if let Some(sb) = crate::command::helpers::extract_bytes(sub) {
+                                if sb.eq_ignore_ascii_case(b"DIGEST") {
+                                    let mut partials = Vec::new();
+                                    for (idx, d) in db.iter().enumerate() {
+                                        let g = d.read();
+                                        let now_ms = g.now_ms();
+                                        if let Some(p) =
+                                            crate::command::debug_digest::db_partial(&g, now_ms)
+                                        {
+                                            partials.push((idx, p));
+                                        }
+                                    }
+                                    let digest =
+                                        crate::command::debug_digest::finalize_dataset(partials);
+                                    responses.push(Frame::SimpleString(bytes::Bytes::from(
+                                        crate::command::debug_digest::to_hex(&digest),
+                                    )));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
                     // --- Collect for phase 2 dispatch (needs db lock) ---
                     match extract_command(&frame) {
                         Some((cmd, cmd_args)) => {

@@ -2278,6 +2278,27 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
 
+            // --- DEBUG DIGEST (moon#636): whole-server, every shard, every db ---
+            // Intercepted here rather than reaching `debug()`, which is handed
+            // a single Database and could only ever answer for one db of one
+            // shard. `debug()` refuses it loudly for exactly that reason.
+            if cmd.eq_ignore_ascii_case(b"DEBUG")
+                && cmd_args
+                    .first()
+                    .and_then(crate::command::helpers::extract_bytes)
+                    .is_some_and(|s| s.eq_ignore_ascii_case(b"DIGEST"))
+            {
+                let response = crate::shard::coordinator::coordinate_debug_digest(
+                    ctx.shard_id,
+                    ctx.num_shards,
+                    &ctx.dispatch_tx,
+                    &ctx.spsc_notifiers,
+                )
+                .await;
+                responses.push(response);
+                continue;
+            }
+
             // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE, RANDOMKEY + multi-key ---
             if dispatch::try_handle_cross_shard_commands(
                 cmd,
