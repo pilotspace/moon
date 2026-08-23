@@ -548,6 +548,26 @@ fn handle_push(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
 
 /// MQ.POP — owner claims messages, routing max-delivery entries to the DLQ.
 ///
+/// Should an entry claimed at `delivery_count` be routed to the dead-letter
+/// queue instead of returned to the caller? `mdc == 0` disables dead-lettering.
+///
+/// This keeps the shipped `>=` comparison, which this function exists to NAME
+/// rather than quietly change. `delivery_count` counts the delivery in
+/// progress, so `MAXDELIVERY 1` dead-letters every FIRST delivery and such a
+/// queue never delivers anything — see moon#663.
+///
+/// That is not fixable here alone. `Stream::read_group_new` reads only `>`
+/// entries and writes each PEL entry with a hardcoded `delivery_count: 1`, and
+/// MQ exposes no XCLAIM/XAUTOCLAIM/visibility-timeout path, so the value
+/// reaching this predicate is ALWAYS exactly 1. Switching to `>` would make the
+/// branch unreachable for every `mdc` and turn dead-lettering into dead code;
+/// MAXDELIVERY only becomes meaningful once MQ can redeliver. moon#663 tracks
+/// both halves together.
+#[inline]
+fn should_dead_letter(delivery_count: u64, mdc: u32) -> bool {
+    mdc > 0 && delivery_count >= mdc as u64
+}
+
 /// Mirrors handler_sharded/write.rs MQ POP arm (lock-path `else` branch).
 /// Emits an `MqPop` WAL record capturing the full outcome (claimed ids +
 /// resulting delivery_count, the group's resulting `last_delivered_id`, and
@@ -587,6 +607,13 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                 Ok(Some(s)) => s,
                 _ => return (Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)), None),
             };
+            // The group's cursor BEFORE this call, so the release below can
+            // rewind to it if this POP ends up keeping nothing.
+            let prev_last_delivered = stream
+                .groups
+                .get(group_name.as_ref())
+                .map(|g| g.last_delivered_id)
+                .unwrap_or(StreamId::ZERO);
             let claimed = match stream.read_group_new(
                 &group_name,
                 &consumer_name,
@@ -605,9 +632,11 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                 Vec::with_capacity(count.min(claimed.len()));
             let mut dlq_entries: Vec<(StreamId, Vec<(Bytes, Bytes)>)> = Vec::new();
             let mut dlq_ack_ids: Vec<StreamId> = Vec::new();
-            // Every claimed id, with its delivery_count at claim time —
-            // recorded for the WAL regardless of DLQ routing (mirrors what
-            // read_group_new just inserted into the PEL).
+            // Every id this POP KEEPS (delivered or dead-lettered), with its
+            // delivery_count at claim time. Entries released below are
+            // deliberately absent: replay rebuilds the PEL from this list, so
+            // recording a released id would resurrect the stranding on
+            // recovery.
             let mut claimed_for_wal: Vec<crate::mq::wal::ClaimedEntry> =
                 Vec::with_capacity(claimed.len());
             // task #47: every entry `read_group_new` just claimed shares one
@@ -617,22 +646,57 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
             // reported on the original node, instead of resetting to 0.
             let mut delivery_time_for_wal: u64 = 0;
 
-            for (id, fields) in &claimed {
+            // `read_group_new` over-claims by `mdc` so dead letters do not
+            // eat the caller's COUNT. Walk the claim in id order: each entry
+            // either dead-letters, fills the caller's budget, or ends the
+            // batch. The first entry that can do neither marks `cut` — it and
+            // every entry after it are RELEASED below, because MQ has no
+            // XCLAIM/XAUTOCLAIM path and `read_group_new` only ever reads `>`,
+            // so an entry left claimed-but-undelivered is unreachable forever
+            // (moon#652).
+            let mut cut = claimed.len();
+            for (i, (id, fields)) in claimed.iter().enumerate() {
                 let pe = stream
                     .groups
                     .get(group_name.as_ref())
                     .and_then(|g| g.pel.get(id));
                 let delivery_count = pe.map(|pe| pe.delivery_count).unwrap_or(1);
-                if delivery_time_for_wal == 0 {
-                    delivery_time_for_wal = pe.map(|pe| pe.delivery_time).unwrap_or(0);
-                }
-                claimed_for_wal.push((id.ms, id.seq, delivery_count));
-                if mdc > 0 && delivery_count >= mdc as u64 {
+                if should_dead_letter(delivery_count, mdc) {
                     dlq_entries.push((*id, fields.clone()));
                     dlq_ack_ids.push(*id);
                 } else if results.len() < count {
                     results.push((*id, fields.clone()));
+                } else {
+                    cut = i;
+                    break;
                 }
+                if delivery_time_for_wal == 0 {
+                    delivery_time_for_wal = pe.map(|pe| pe.delivery_time).unwrap_or(0);
+                }
+                claimed_for_wal.push((id.ms, id.seq, delivery_count));
+            }
+
+            // Release the surplus: un-claim it from the PEL and the consumer's
+            // pending set, and rewind the group cursor to the last entry this
+            // POP actually kept, so the next POP re-reads from there.
+            if cut < claimed.len()
+                && let Some(group) = stream.groups.get_mut(group_name.as_ref())
+            {
+                for (id, _) in &claimed[cut..] {
+                    group.pel.remove(id);
+                    if let Some(c) = group.consumers.get_mut(consumer_name.as_ref()) {
+                        c.pending.remove(id);
+                    }
+                }
+                group.last_delivered_id = if cut == 0 {
+                    prev_last_delivered
+                } else {
+                    claimed[cut - 1].0
+                };
+            }
+
+            if results.is_empty() && dlq_entries.is_empty() {
+                return (Frame::Array(vec![].into()), None);
             }
 
             // Consumer-level `seen_time` for the fixed `__mq_default`
@@ -897,6 +961,27 @@ mod tests {
                 pagecache: AtomicUsize::new(0),
             }),
         })
+    }
+
+    // ── dead-letter ceiling ───────────────────────────────────────────────────
+
+    #[test]
+    fn dead_letter_ceiling_pins_the_shipped_comparison() {
+        // MAXDELIVERY 0 disables dead-lettering entirely — the documented
+        // escape hatch for callers hit by moon#663.
+        assert!(!should_dead_letter(1, 0));
+        assert!(!should_dead_letter(9_999, 0));
+
+        // MAXDELIVERY >= 2 delivers a first attempt to the consumer.
+        assert!(!should_dead_letter(1, 2));
+        assert!(!should_dead_letter(1, 3));
+
+        // KNOWN DEFECT (moon#663), pinned deliberately so the fix has to come
+        // here: `delivery_count` counts the delivery in progress, so `>=`
+        // makes MAXDELIVERY 1 dead-letter the FIRST delivery and such a queue
+        // never delivers anything. Correcting this to `>` requires a
+        // redelivery path to exist first, or the branch becomes unreachable.
+        assert!(should_dead_letter(1, 1));
     }
 
     // ── effective_key derivation ──────────────────────────────────────────────

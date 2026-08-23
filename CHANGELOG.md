@@ -54,6 +54,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   those as `0` would place `cold_disk_bytes:0` beside a non-zero `cold_keys` and present it
   as an answer. That shard also logs a warning, because cold keys with no manifest will not
   survive a restart — `rebuild_from_manifest` is the only thing that re-indexes them.
+### Fixed
+- **`MQ POP` no longer strands messages it claimed but never returned** (#652).
+  `MQ POP <key> COUNT <n>` asks `read_group_new` for `n + max_delivery_count`
+  entries so that dead letters do not consume the caller's budget, then returns
+  at most `n`. The surplus was left in the group PEL with `last_delivered_id`
+  advanced past it — and MQ reads only `>` (new) entries and exposes no
+  `XCLAIM`/`XAUTOCLAIM` path, so those entries were **unreachable forever**. No
+  error, no DLQ entry, no metric.
+
+  With the default `MAXDELIVERY 3`, a `COUNT 1` polling loop — the ordinary
+  shape for a queue worker — destroyed up to 3 messages per call against any
+  backlog deeper than 1. The reporter measured 28–62% of items never processed,
+  daily, for over a month. A message pushed *later* is delivered normally, which
+  is what made it read as intermittent loss rather than a dead queue.
+
+  `handle_pop` now walks the claim in id order and releases everything from the
+  first entry it can neither deliver nor dead-letter: removed from the PEL and
+  the consumer's pending set, with the group cursor rewound to the last entry
+  actually kept. The `MqPop` WAL record carries only the kept ids and the
+  post-rewind cursor, so replay cannot resurrect the stranding — proven by a
+  kill -9 round trip, since the in-memory state and the WAL record have to agree
+  and only a restart shows whether they do.
+
+  Two tests that had been loosened around the bug are tightened: the `COUNT`
+  test now asserts conservation against the pushed set instead of `len() >= 2`
+  (its comment had documented the over-claim as expected behaviour), and a new
+  test drains an 8-deep backlog with `COUNT 1` and requires every id back, in
+  order.
+
+  Not fixed here, and now tracked as #663: `max_delivery_count` is meaningless
+  in MQ — nothing ever redelivers, so the value tested against it is always 1,
+  and the shipped `>=` comparison makes `MAXDELIVERY 1` dead-letter every first
+  delivery so such a queue never delivers anything. Correcting the comparison
+  alone would make the DLQ branch unreachable for every ceiling; it needs a
+  redelivery path first. The predicate is extracted as `should_dead_letter` with
+  that trap documented at the one place it must be fixed.
 
 ### Changed
 - **`scripts/ci-local.sh` now pre-flights the VM's free disk before it starts** (#658).

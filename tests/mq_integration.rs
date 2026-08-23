@@ -656,9 +656,10 @@ async fn test_mq_pop_count() {
             .unwrap();
     }
 
-    // POP COUNT 10 -> returns remaining new messages
-    // Note: due to DLQ over-fetch (request_count = count + mdc = 10 + 10 = 20),
-    // this may consume more messages from the stream than the user requested COUNT.
+    // POP COUNT 10 -> returns everything still unclaimed: the third message
+    // from the first batch (which POP COUNT 2 must NOT have consumed) plus the
+    // two pushed since. This assertion used to read `>= 2`, which passed while
+    // the first POP silently stranded message 3 (moon#652).
     let pop_rest: redis::Value = redis::cmd("MQ")
         .arg("POP")
         .arg("count_q")
@@ -668,12 +669,18 @@ async fn test_mq_pop_count() {
         .await
         .unwrap();
     let ids_rest = extract_message_ids(&pop_rest);
-    // Should return at least 2 new messages (the ones pushed after first POP)
-    assert!(
-        ids_rest.len() >= 2,
-        "POP COUNT 10 should return at least 2 new messages, got {}",
+    assert_eq!(
+        ids_rest.len(),
+        3,
+        "POP COUNT 10 should return the 1 leftover + 2 new messages, got {}",
         ids_rest.len()
     );
+    for id in &ids_2 {
+        assert!(
+            !ids_rest.contains(id),
+            "no message may be delivered twice: {id}"
+        );
+    }
 
     shutdown.cancel();
 }
@@ -764,6 +771,14 @@ async fn test_mq_dlq_routing() {
     let mut conn = connect(port).await;
 
     // Create queue with MAXDELIVERY 1.
+    //
+    // NOTE: this test exercises a KNOWN DEFECT, moon#663. `MAXDELIVERY 1`
+    // dead-lettering a FIRST delivery is wrong — "deliver up to N times, then
+    // dead-letter" is what the name promises — but it is also the ONLY way to
+    // reach the DLQ path today, because nothing in MQ ever redelivers. Fixing
+    // the comparison without first adding a redelivery path would make this
+    // path unreachable and delete the coverage. Kept as-is deliberately until
+    // moon#663 fixes both halves.
     //
     // DLQ routing triggers during POP when delivery_count >= max_delivery_count.
     // With MAXDELIVERY 1, the very first POP creates a PEL entry with
@@ -986,6 +1001,219 @@ async fn test_mq_ack_invalid_id() {
         "Error should mention 'invalid message ID format', got: {}",
         err_msg
     );
+
+    shutdown.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: MQ POP must not strand messages (moon#652)
+// ---------------------------------------------------------------------------
+
+/// `MQ POP <key> COUNT <n>` over-claims `n + max_delivery_count` entries so
+/// that dead letters do not consume the caller's budget, but returns at most
+/// `n`. Every surplus entry lands in the group PEL with `last_delivered_id`
+/// advanced past it — and MQ exposes no XAUTOCLAIM/XCLAIM path, so it can
+/// never be delivered again.
+///
+/// This grades against the *pushed* set, not against a per-call count: a POP
+/// loop that returns the right number of messages each call while silently
+/// dropping the ones in between passes every count-shaped assertion.
+#[tokio::test]
+async fn test_mq_pop_count_one_drains_the_whole_backlog() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    // Default MAXDELIVERY (3) — the configuration the bug report hit.
+    let _: String = redis::cmd("MQ")
+        .arg("CREATE")
+        .arg("drain_q")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    let mut pushed: Vec<String> = Vec::new();
+    for i in 1..=8 {
+        let id: String = redis::cmd("MQ")
+            .arg("PUSH")
+            .arg("drain_q")
+            .arg("body")
+            .arg(format!("m{i}"))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        pushed.push(id);
+    }
+
+    // Poll COUNT 1 until the queue reports empty, the shape the reporting
+    // worker used. Bounded well above the backlog so a regression that
+    // returns nothing terminates instead of hanging.
+    let mut popped: Vec<String> = Vec::new();
+    for _ in 0..32 {
+        let v: redis::Value = redis::cmd("MQ")
+            .arg("POP")
+            .arg("drain_q")
+            .arg("COUNT")
+            .arg("1")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let ids = extract_message_ids(&v);
+        if ids.is_empty() {
+            break;
+        }
+        popped.extend(ids);
+    }
+
+    let dlq_len: i64 = redis::cmd("MQ")
+        .arg("DLQLEN")
+        .arg("drain_q")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        dlq_len, 0,
+        "nothing was ever redelivered, so nothing should have dead-lettered"
+    );
+
+    assert_eq!(
+        popped,
+        pushed,
+        "COUNT 1 polling must deliver every pushed message exactly once, in \
+         order: pushed {} got {} — the difference is unreachable forever",
+        pushed.len(),
+        popped.len()
+    );
+    shutdown.cancel();
+}
+
+/// The same conservation property under a batching consumer: a POP that
+/// returns fewer than COUNT must leave the remainder claimable, not consume
+/// it. `COUNT 2` against a 3-deep backlog is the minimal case.
+#[tokio::test]
+async fn test_mq_pop_leaves_the_surplus_claimable() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    let _: String = redis::cmd("MQ")
+        .arg("CREATE")
+        .arg("surplus_q")
+        .arg("MAXDELIVERY")
+        .arg("10")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    let mut pushed: Vec<String> = Vec::new();
+    for i in 1..=3 {
+        let id: String = redis::cmd("MQ")
+            .arg("PUSH")
+            .arg("surplus_q")
+            .arg("body")
+            .arg(format!("s{i}"))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        pushed.push(id);
+    }
+
+    let first: redis::Value = redis::cmd("MQ")
+        .arg("POP")
+        .arg("surplus_q")
+        .arg("COUNT")
+        .arg("2")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let first_ids = extract_message_ids(&first);
+    assert_eq!(first_ids.len(), 2, "POP COUNT 2 returns 2");
+
+    let second: redis::Value = redis::cmd("MQ")
+        .arg("POP")
+        .arg("surplus_q")
+        .arg("COUNT")
+        .arg("2")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let second_ids = extract_message_ids(&second);
+    assert_eq!(
+        second_ids,
+        vec![pushed[2].clone()],
+        "the third message was never returned by the first POP, so it must \
+         still be claimable"
+    );
+
+    shutdown.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: a first delivery is never a dead letter at MAXDELIVERY >= 2
+// ---------------------------------------------------------------------------
+
+/// Complements `test_mq_dlq_routing`, which pins the MAXDELIVERY 1 defect
+/// (moon#663). At every other ceiling a first delivery must reach the
+/// consumer, and the surplus over COUNT must not be consumed on the way —
+/// this is the leg that would have caught moon#652 dressed as dead-lettering
+/// rather than as stranding.
+#[tokio::test]
+async fn test_mq_pop_delivers_first_attempt_at_maxdelivery_two_and_above() {
+    let (port, shutdown) = start_server().await;
+    let mut conn = connect(port).await;
+
+    for (queue, mdc) in [("nodlq_q2", "2"), ("nodlq_q3", "3")] {
+        let _: String = redis::cmd("MQ")
+            .arg("CREATE")
+            .arg(queue)
+            .arg("MAXDELIVERY")
+            .arg(mdc)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let mut pushed: Vec<String> = Vec::new();
+        for i in 1..=3 {
+            let id: String = redis::cmd("MQ")
+                .arg("PUSH")
+                .arg(queue)
+                .arg("body")
+                .arg(format!("n{i}"))
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            pushed.push(id);
+        }
+
+        let mut popped: Vec<String> = Vec::new();
+        for _ in 0..8 {
+            let v: redis::Value = redis::cmd("MQ")
+                .arg("POP")
+                .arg(queue)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            let ids = extract_message_ids(&v);
+            if ids.is_empty() {
+                break;
+            }
+            popped.extend(ids);
+        }
+
+        assert_eq!(
+            popped, pushed,
+            "MAXDELIVERY {mdc}: every message must be delivered exactly once"
+        );
+
+        let dlq_len: i64 = redis::cmd("MQ")
+            .arg("DLQLEN")
+            .arg(queue)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            dlq_len, 0,
+            "MAXDELIVERY {mdc}: a first delivery is not a dead letter"
+        );
+    }
 
     shutdown.cancel();
 }
