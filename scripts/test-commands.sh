@@ -743,6 +743,42 @@ if should_run "key"; then
     assert_match "GEOSEARCH WITHCOORD+DIST+HASH" GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS 200 km ASC WITHCOORD WITHDIST WITHHASH
     assert_match "GEORADIUS WITHCOORD"      GEORADIUS k:geo 15 37 200 km ASC WITHCOORD
     assert_match "GEORADIUSBYMEMBER WITHCOORD" GEORADIUSBYMEMBER k:geo Palermo 200 km ASC WITHCOORD
+    # moon#645: the legacy STORE/STOREDIST clause. `{geo}` co-locates source
+    # and destination on one shard so every row below compares the COMMAND
+    # against Redis at any `--shards N` -- untagged names would make it a
+    # function of the shard count (moon refuses a two-key write whose keys
+    # are owned by different shards; that refusal is asserted in
+    # scripts/test-consistency.sh, not here).
+    rcli GEOADD {geo}:src 13.361389 38.115556 Palermo 15.087269 37.502669 Catania >/dev/null 2>&1
+    mcli GEOADD {geo}:src 13.361389 38.115556 Palermo 15.087269 37.502669 Catania >/dev/null 2>&1
+    assert_match "GEORADIUS STORE"            GEORADIUS {geo}:src 15 37 200 km STORE {geo}:d1
+    assert_match "GEORADIUS STORE result"     ZRANGE {geo}:d1 0 -1 WITHSCORES
+    assert_match "GEORADIUSBYMEMBER STORE"    GEORADIUSBYMEMBER {geo}:src Palermo 200 km STORE {geo}:d2
+    assert_match "GEORADIUSBYMEMBER STORE result" ZRANGE {geo}:d2 0 -1 WITHSCORES
+    assert_match "GEORADIUS COUNT+STORE"      GEORADIUS {geo}:src 15 37 200 km COUNT 1 STORE {geo}:d1
+    assert_match "GEORADIUS STORE rejects WITHDIST" GEORADIUS {geo}:src 15 37 200 km WITHDIST STORE {geo}:d1
+    assert_match "GEORADIUS STORE needs a dest"     GEORADIUS {geo}:src 15 37 200 km STORE
+    assert_match "GEOSEARCHSTORE rejects WITHCOORD" GEOSEARCHSTORE {geo}:d1 {geo}:src FROMLONLAT 15 37 BYRADIUS 200 km WITHCOORD
+    assert_match "GEORADIUS_RO still refuses STORE" GEORADIUS_RO {geo}:src 15 37 200 km STORE {geo}:d1
+    # STOREDIST stores the raw f64 distance rather than a %.4f rendering, so
+    # this is the one geo reply where moon and redis can differ in the last
+    # digit: measured 190.44242984775795 vs 190.44242984775784 for Palermo,
+    # ~1 ULP apart. Compare at 9 decimals -- five orders tighter than the 4dp
+    # every other geo reply exposes, and still ULP-immune.
+    rcli GEORADIUS {geo}:src 15 37 200 km STOREDIST {geo}:d3 >/dev/null 2>&1
+    mcli GEORADIUS {geo}:src 15 37 200 km STOREDIST {geo}:d3 >/dev/null 2>&1
+    TOTAL=$((TOTAL + 1))
+    _sd_round='NR%2==0{printf "%.9f\n",$1; next}{print}'
+    r_sd=$(rcli ZRANGE {geo}:d3 0 -1 WITHSCORES 2>/dev/null | awk "$_sd_round")
+    m_sd=$(mcli ZRANGE {geo}:d3 0 -1 WITHSCORES 2>/dev/null | awk "$_sd_round")
+    if [[ "$r_sd" == "$m_sd" && -n "$r_sd" ]]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: GEORADIUS STOREDIST scores"
+        echo "    REDIS: $(echo "$r_sd" | tr '\n' ' ')"
+        echo "    MOON:  $(echo "$m_sd" | tr '\n' ' ')"
+    fi
     # EXPIREAT / PEXPIREAT / EXPIRETIME / PEXPIRETIME
     rcli SET k:eat val >/dev/null 2>&1; mcli SET k:eat val >/dev/null 2>&1
     assert_match "EXPIREAT"            EXPIREAT k:eat 9999999999

@@ -460,6 +460,47 @@ mod tests {
         }
     }
 
+    /// The `_RO` twins delegate to the writable forms, which since moon#645
+    /// really do write. The rejection is what keeps a read-only command
+    /// read-only, so this pins the destination as well as the reply — and
+    /// pins the reply TEXT, which is redis's own `ERR syntax error`.
+    #[test]
+    fn the_read_only_twins_refuse_the_store_clause_in_redis_words() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        let syntax = Frame::Error(Bytes::from_static(b"ERR syntax error"));
+        for clause in [b"STORE".as_slice(), b"STOREDIST"] {
+            let got = georadius_ro(
+                &mut db,
+                &[
+                    bs(b"mygeo"),
+                    bs(b"15"),
+                    bs(b"37"),
+                    bs(b"200"),
+                    bs(b"km"),
+                    bs(clause),
+                    bs(b"dest"),
+                ],
+            );
+            assert_eq!(got, syntax);
+            assert!(!db.exists(b"dest"), "a read-only command must not write");
+
+            let got = georadiusbymember_ro(
+                &mut db,
+                &[
+                    bs(b"mygeo"),
+                    bs(b"Palermo"),
+                    bs(b"200"),
+                    bs(b"km"),
+                    bs(clause),
+                    bs(b"dest"),
+                ],
+            );
+            assert_eq!(got, syntax);
+            assert!(!db.exists(b"dest"));
+        }
+    }
+
     #[test]
     fn test_georadius_ro_rejects_store() {
         let mut db = Database::new();
@@ -568,5 +609,481 @@ mod tests {
         let expected = georadiusbymember_ro(&mut db, &args);
         let got = georadiusbymember_ro_readonly(&db, &args, 0);
         assert_eq!(got, expected);
+    }
+
+    // ---------------------------------------------------------------------
+    // GEORADIUS / GEORADIUSBYMEMBER STORE / STOREDIST (moon#645)
+    // ---------------------------------------------------------------------
+    //
+    // Every expectation below was captured from redis-server 8.6.1 on
+    // 2026-08-23 with the same Palermo/Catania seed, so these are parity
+    // pins rather than a self-consistent invention.
+
+    /// Read every member/score pair of a sorted set, sorted by score, so a
+    /// test can assert on what STORE actually wrote rather than on a count.
+    fn zset_pairs(db: &mut Database, key: &[u8]) -> Vec<(String, f64)> {
+        let (members, _) = db
+            .get_sorted_set(key)
+            .expect("destination must be readable")
+            .expect("destination must exist");
+        let mut v: Vec<(String, f64)> = members
+            .iter()
+            .map(|(m, s)| (String::from_utf8_lossy(m).into_owned(), *s))
+            .collect();
+        v.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    }
+
+    #[test]
+    fn georadius_store_writes_the_geohash_scores() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        let got = georadius(
+            &mut db,
+            &[
+                bs(b"mygeo"),
+                bs(b"15"),
+                bs(b"37"),
+                bs(b"200"),
+                bs(b"km"),
+                bs(b"STORE"),
+                bs(b"dest"),
+            ],
+        );
+        assert_eq!(
+            got,
+            Frame::Integer(2),
+            "STORE replies with the stored count"
+        );
+        // redis 8.6.1: Palermo 3479099956230698, Catania 3479447370796909
+        let pairs = zset_pairs(&mut db, b"dest");
+        assert_eq!(
+            pairs,
+            vec![
+                ("Palermo".to_string(), 3479099956230698.0),
+                ("Catania".to_string(), 3479447370796909.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn georadius_storedist_writes_distances_in_the_query_unit() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        let got = georadius(
+            &mut db,
+            &[
+                bs(b"mygeo"),
+                bs(b"15"),
+                bs(b"37"),
+                bs(b"200"),
+                bs(b"km"),
+                bs(b"STOREDIST"),
+                bs(b"dest"),
+            ],
+        );
+        assert_eq!(got, Frame::Integer(2));
+        // redis 8.6.1: Catania 56.4412578701582, Palermo 190.44242984775784
+        let pairs = zset_pairs(&mut db, b"dest");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "Catania");
+        assert!(
+            (pairs[0].1 - 56.4412578701582).abs() < 1e-6,
+            "Catania stored at {} km, redis says 56.4412578701582",
+            pairs[0].1
+        );
+        assert_eq!(pairs[1].0, "Palermo");
+        assert!(
+            (pairs[1].1 - 190.44242984775784).abs() < 1e-6,
+            "Palermo stored at {} km, redis says 190.44242984775784",
+            pairs[1].1
+        );
+    }
+
+    #[test]
+    fn georadius_storedist_follows_the_query_unit_not_meters() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        // Same circle in miles: redis 8.6.1 stores Catania 35.071058862737644.
+        let got = georadius(
+            &mut db,
+            &[
+                bs(b"mygeo"),
+                bs(b"15"),
+                bs(b"37"),
+                bs(b"200"),
+                bs(b"mi"),
+                bs(b"STOREDIST"),
+                bs(b"dest"),
+            ],
+        );
+        assert_eq!(got, Frame::Integer(2));
+        let pairs = zset_pairs(&mut db, b"dest");
+        assert!(
+            (pairs[0].1 - 35.071058862737644).abs() < 1e-6,
+            "expected miles, got {}",
+            pairs[0].1
+        );
+    }
+
+    #[test]
+    fn georadiusbymember_store_writes_the_destination() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        let got = georadiusbymember(
+            &mut db,
+            &[
+                bs(b"mygeo"),
+                bs(b"Catania"),
+                bs(b"200"),
+                bs(b"km"),
+                bs(b"STOREDIST"),
+                bs(b"dest"),
+            ],
+        );
+        assert_eq!(got, Frame::Integer(2));
+        // redis 8.6.1: Catania 0, Palermo 166.27415156960032
+        let pairs = zset_pairs(&mut db, b"dest");
+        assert_eq!(pairs[0].0, "Catania");
+        assert!(pairs[0].1.abs() < 1e-9);
+        assert!((pairs[1].1 - 166.27415156960032).abs() < 1e-6);
+    }
+
+    #[test]
+    fn store_is_incompatible_with_the_with_flags() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        // redis names all three in this fixed order, and says "in GEORADIUS"
+        // even when the command was GEORADIUSBYMEMBER.
+        let expected = Frame::Error(Bytes::from_static(
+            b"ERR STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORD options",
+        ));
+        for flag in [b"WITHCOORD".as_slice(), b"WITHDIST", b"WITHHASH"] {
+            let got = georadius(
+                &mut db,
+                &[
+                    bs(b"mygeo"),
+                    bs(b"15"),
+                    bs(b"37"),
+                    bs(b"200"),
+                    bs(b"km"),
+                    bs(flag),
+                    bs(b"STORE"),
+                    bs(b"dest"),
+                ],
+            );
+            assert_eq!(got, expected, "flag {}", String::from_utf8_lossy(flag));
+            assert!(!db.exists(b"dest"), "a rejected STORE must not write");
+        }
+        // The flag AFTER the clause is refused too (redis parses the whole
+        // option tail before it checks).
+        let got = georadius(
+            &mut db,
+            &[
+                bs(b"mygeo"),
+                bs(b"15"),
+                bs(b"37"),
+                bs(b"200"),
+                bs(b"km"),
+                bs(b"STORE"),
+                bs(b"dest"),
+                bs(b"WITHDIST"),
+            ],
+        );
+        assert_eq!(got, expected);
+        let got = georadiusbymember(
+            &mut db,
+            &[
+                bs(b"mygeo"),
+                bs(b"Catania"),
+                bs(b"200"),
+                bs(b"km"),
+                bs(b"WITHDIST"),
+                bs(b"STORE"),
+                bs(b"dest"),
+            ],
+        );
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn a_destination_named_like_an_option_is_still_a_destination() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        // redis 8.6.1 answers 2 here: STORE consumes the next argv slot
+        // whatever it spells, so `WITHDIST` is a key name, not a flag.
+        // A naive "does the tail contain WITHDIST" scan answers the
+        // incompatibility error instead.
+        let got = georadius(
+            &mut db,
+            &[
+                bs(b"mygeo"),
+                bs(b"15"),
+                bs(b"37"),
+                bs(b"200"),
+                bs(b"km"),
+                bs(b"STORE"),
+                bs(b"WITHDIST"),
+            ],
+        );
+        assert_eq!(got, Frame::Integer(2));
+        assert_eq!(zset_pairs(&mut db, b"WITHDIST").len(), 2);
+    }
+
+    #[test]
+    fn a_store_clause_with_no_destination_is_a_syntax_error() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        for clause in [b"STORE".as_slice(), b"STOREDIST"] {
+            let got = georadius(
+                &mut db,
+                &[
+                    bs(b"mygeo"),
+                    bs(b"15"),
+                    bs(b"37"),
+                    bs(b"200"),
+                    bs(b"km"),
+                    bs(clause),
+                ],
+            );
+            assert_eq!(got, Frame::Error(Bytes::from_static(b"ERR syntax error")));
+        }
+    }
+
+    #[test]
+    fn the_last_store_clause_wins() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        // redis 8.6.1: only `late` is written; `early` is never created.
+        let got = georadius(
+            &mut db,
+            &[
+                bs(b"mygeo"),
+                bs(b"15"),
+                bs(b"37"),
+                bs(b"200"),
+                bs(b"km"),
+                bs(b"STORE"),
+                bs(b"early"),
+                bs(b"STOREDIST"),
+                bs(b"late"),
+            ],
+        );
+        assert_eq!(got, Frame::Integer(2));
+        assert!(!db.exists(b"early"), "the superseded clause must not write");
+        let pairs = zset_pairs(&mut db, b"late");
+        assert!(
+            (pairs[0].1 - 56.4412578701582).abs() < 1e-6,
+            "STOREDIST won"
+        );
+    }
+
+    #[test]
+    fn an_empty_result_deletes_the_destination_and_answers_zero() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        db.set_string(
+            Bytes::from_static(b"dest"),
+            Bytes::from_static(b"i am in the way"),
+        );
+        // Middle of the Atlantic — nothing within 1km.
+        let got = georadius(
+            &mut db,
+            &[
+                bs(b"mygeo"),
+                bs(b"0"),
+                bs(b"0"),
+                bs(b"1"),
+                bs(b"km"),
+                bs(b"STORE"),
+                bs(b"dest"),
+            ],
+        );
+        assert_eq!(got, Frame::Integer(0));
+        assert!(
+            !db.exists(b"dest"),
+            "redis deletes the destination on 0 hits"
+        );
+    }
+
+    #[test]
+    fn count_bounds_what_store_writes() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        let got = georadius(
+            &mut db,
+            &[
+                bs(b"mygeo"),
+                bs(b"15"),
+                bs(b"37"),
+                bs(b"200"),
+                bs(b"km"),
+                bs(b"COUNT"),
+                bs(b"1"),
+                bs(b"STORE"),
+                bs(b"dest"),
+            ],
+        );
+        assert_eq!(got, Frame::Integer(1));
+        assert_eq!(zset_pairs(&mut db, b"dest")[0].0, "Catania");
+    }
+
+    #[test]
+    fn geosearchstore_storedist_stores_distances() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        let got = geosearchstore(
+            &mut db,
+            &[
+                bs(b"dest"),
+                bs(b"mygeo"),
+                bs(b"FROMLONLAT"),
+                bs(b"15"),
+                bs(b"37"),
+                bs(b"BYRADIUS"),
+                bs(b"200"),
+                bs(b"km"),
+                bs(b"ASC"),
+                bs(b"STOREDIST"),
+            ],
+        );
+        assert_eq!(got, Frame::Integer(2));
+        let pairs = zset_pairs(&mut db, b"dest");
+        assert!((pairs[0].1 - 56.4412578701582).abs() < 1e-6);
+    }
+
+    #[test]
+    fn geosearchstore_rejects_the_with_flags() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        let expected = Frame::Error(Bytes::from_static(
+            b"ERR GEOSEARCHSTORE is not compatible with WITHDIST, WITHHASH and WITHCOORD options",
+        ));
+        for flag in [b"WITHCOORD".as_slice(), b"WITHDIST", b"WITHHASH"] {
+            let got = geosearchstore(
+                &mut db,
+                &[
+                    bs(b"dest"),
+                    bs(b"mygeo"),
+                    bs(b"FROMLONLAT"),
+                    bs(b"15"),
+                    bs(b"37"),
+                    bs(b"BYRADIUS"),
+                    bs(b"200"),
+                    bs(b"km"),
+                    bs(flag),
+                ],
+            );
+            assert_eq!(got, expected, "flag {}", String::from_utf8_lossy(flag));
+            assert!(!db.exists(b"dest"));
+        }
+    }
+
+    #[test]
+    fn a_member_named_storedist_is_still_a_member() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        geoadd(
+            &mut db,
+            &[
+                bs(b"mygeo"),
+                bs(b"2.349014"),
+                bs(b"48.864716"),
+                bs(b"STOREDIST"),
+            ],
+        );
+        // FROMMEMBER consumes the next slot whatever it spells (redis 8.6.1
+        // answers 1 for the equivalent query).
+        let got = geosearchstore(
+            &mut db,
+            &[
+                bs(b"dest"),
+                bs(b"mygeo"),
+                bs(b"FROMMEMBER"),
+                bs(b"STOREDIST"),
+                bs(b"BYRADIUS"),
+                bs(b"1"),
+                bs(b"km"),
+            ],
+        );
+        assert_eq!(got, Frame::Integer(2), "Paris and STOREDIST share a point");
+    }
+
+    /// GEOSEARCH proper has no STORE clause at all: redis answers a plain
+    /// syntax error, and moon must not quietly accept one.
+    #[test]
+    fn plain_geosearch_has_no_store_clause() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        for clause in [
+            vec![bs(b"STORE"), bs(b"dest")],
+            vec![bs(b"STOREDIST")],
+            vec![bs(b"STOREDIST"), bs(b"dest")],
+        ] {
+            let mut args = vec![
+                bs(b"mygeo"),
+                bs(b"FROMLONLAT"),
+                bs(b"15"),
+                bs(b"37"),
+                bs(b"BYRADIUS"),
+                bs(b"200"),
+                bs(b"km"),
+            ];
+            args.extend(clause);
+            let got = geosearch(&mut db, &args);
+            assert_eq!(got, Frame::Error(Bytes::from_static(b"ERR syntax error")));
+            assert!(!db.exists(b"dest"));
+        }
+    }
+
+    /// A parse error must be reported, and must leave the destination alone.
+    /// The shipped code threw away `geosearch_inner`'s reply frame and read
+    /// only the (empty) match list, so a bad unit answered `:0` *and deleted
+    /// the destination key* — redis 8.6.1 answers the error and keeps it.
+    #[test]
+    fn a_failed_store_reports_the_error_and_keeps_the_destination() {
+        let mut db = Database::new();
+        setup_sicily(&mut db);
+        let bad_unit = Frame::Error(Bytes::from_static(
+            b"ERR unsupported unit provided. please use M, KM, FT, MI",
+        ));
+
+        db.set_string(Bytes::from_static(b"dest"), Bytes::from_static(b"keep me"));
+        let got = geosearchstore(
+            &mut db,
+            &[
+                bs(b"dest"),
+                bs(b"mygeo"),
+                bs(b"FROMLONLAT"),
+                bs(b"15"),
+                bs(b"37"),
+                bs(b"BYRADIUS"),
+                bs(b"200"),
+                bs(b"parsecs"),
+            ],
+        );
+        assert_eq!(got, bad_unit);
+        assert!(
+            db.exists(b"dest"),
+            "GEOSEARCHSTORE deleted dest on a parse error"
+        );
+
+        let got = georadius(
+            &mut db,
+            &[
+                bs(b"mygeo"),
+                bs(b"15"),
+                bs(b"37"),
+                bs(b"200"),
+                bs(b"parsecs"),
+                bs(b"STORE"),
+                bs(b"dest"),
+            ],
+        );
+        assert_eq!(got, bad_unit);
+        assert!(
+            db.exists(b"dest"),
+            "GEORADIUS STORE deleted dest on a parse error"
+        );
     }
 }
