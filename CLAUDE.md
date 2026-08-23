@@ -83,7 +83,7 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 - `scripts/bench-compare.sh` — Moon vs Redis side-by-side (all commands, pipeline 1–128, data 8B–64KB). Use `--requests 200000` for stable numbers.
 - `scripts/bench-production.sh` — 10 production scenarios (session, ratelimit, leaderboard, cache, queue, hash, connections, datasizes, memory, pipeline).
 - `scripts/bench-resources.sh` — RSS/memory bench. Starts a fresh server per row (RSS is a high-water mark; delta within one process is unreliable).
-- `scripts/test-commands.sh` — 190 tests across 13 categories (correctness vs Redis + throughput). `--skip-bench` for fast correctness-only.
+- `scripts/test-commands.sh` — 504 rows across 13 categories (correctness vs Redis + throughput). `--skip-bench` for fast correctness-only. Honours `PORT_REDIS`/`PORT_RUST`, and refuses to start if either port is already held (it would otherwise compare against somebody else's server).
 - `scripts/test-consistency.sh` — 132 data-consistency tests across 1/4/12 shard configs.
 - All scripts run inside `moon-dev` and need `redis-server` / `redis-benchmark` on PATH.
 

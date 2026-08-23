@@ -190,6 +190,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as an answer. That shard also logs a warning, because cold keys with no manifest will not
   survive a restart — `rebuild_from_manifest` is the only thing that re-indexes them.
 ### Fixed
+- **`scripts/test-commands.sh` runs to completion and prints its summary** (#679). The
+  suite CLAUDE.md points at for every new command had never reported totals: it died
+  partway through, silently, and the operator saw a truncated log rather than a result.
+  It now finishes — **504 rows, 478 passing** — which is also how the 26 long-standing
+  failures in it became visible for the first time (#683 tracks them; none are
+  regressions from this change).
+
+  Every abort was the same bash shape: a command whose non-zero status `set -euo
+  pipefail` turns into a silent exit. `grep` exits 1 when it matches nothing, `lsof`
+  exits 1 when a port is free, `pkill` exits 1 when nothing matched, and a shell
+  function whose last statement is a false `if` returns 1 too. Because the failure
+  prints nothing at all, each instance hid the next — which is why this took several
+  rounds and why two of the fixes are for aborts introduced *by* the earlier fixes:
+
+  * 26 command substitutions ending in `grep` (the reported NUMERIC-07 site was one of
+    a class, so the whole class is guarded);
+  * 6 raw `redis-cli` pipelines and all four client wrappers, so a dead server produces
+    failing rows and a summary instead of a truncated log;
+  * `cargo build ... 2>/dev/null`, which discarded the reason a build failed and left
+    the log reading `Building moon...` and nothing else;
+  * the `cleanup` trap, which returned the status of its last `kill` rather than the
+    script's — reporting a clean run as a failure.
+
+  Three defects behind wrong *results* rather than aborts:
+
+  * **`grep -Pzo "(?s)A.*B"` (13 call sites) is GNU-only.** On a macOS host `grep` is
+    ugrep, which rejects `-P` and exits 2 — and since the rows compared output rather
+    than status, that `2` was reported as moon's answer. Replaced with a portable
+    `spans()` helper.
+  * **No `--dir`, so moon used the CWD.** The suite wrote `appendonlydir/` and
+    `moon.lock` into the repo root and reloaded the previous run's FT indexes, so a
+    second run failed with `ERR Index already exists`. Each run now gets a fresh temp
+    dir, removed on exit.
+  * **No port pre-flight.** A leftover server from an unrelated run answers, and every
+    row silently compares against it. This is not hypothetical — it produced a full run
+    of `MOONERR diskfull` failures traced to another session's moon holding the port.
+    The suite now refuses to start on an occupied port and names the holder.
+
+  The `FT.CREATE ... VECTOR FLAT` row expected `OK`, but moon has only ever implemented
+  HNSW (`ERR expected HNSW algorithm`, in `ft_create.rs` since #27), so it had failed
+  from the day it was written and took four dependent rows down with it. It now creates
+  an HNSW index, and the FLAT gap is asserted explicitly instead of hiding inside a row
+  that expected success. Added a regression row for #681 that checks the server is still
+  alive after a truncated `FT.CREATE` — proven in both directions: it fails against a
+  pre-#682 binary and passes after.
+
 - **A truncated `FT.CREATE` no longer aborts the server** (#681). `FT.CREATE idx ON HASH
   PREFIX 1 d: SCHEMA v VECTOR HNSW` — the argument list cut off right after the algorithm
   keyword — indexed one past the end of argv and panicked. The panic ran on a shard
