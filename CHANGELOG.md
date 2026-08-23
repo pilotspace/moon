@@ -90,6 +90,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alone would make the DLQ branch unreachable for every ceiling; it needs a
   redelivery path first. The predicate is extracted as `should_dead_letter` with
   that trap documented at the one place it must be fixed.
+- **`FT.SEARCH` KNN prefilter: an inverted numeric range no longer aborts the
+  server, and an unreadable filter is an error instead of an unfiltered search**
+  (#664, #648).
+
+  `FT.SEARCH` has three numeric-range grammars. The full query grammar and the
+  `FieldFilter` grammar both read `(`-prefixed exclusive bounds and reject an
+  inverted range. The KNN-prefilter grammar did neither — its numeric branch was
+  a bare `parse::<f64>()`.
+
+  **#664 (process abort).** `@field:[300 100]` reached
+  `BTreeMap::range(min..=max)`, which panics by contract when start > end, and a
+  shard-thread panic aborts the whole process. Any client able to issue
+  `FT.SEARCH` could kill the server — every connection and every other shard —
+  with one command. Measured on `main`: the reply never arrives, the moon
+  process is gone. This violated the parser-defensiveness rule that malformed
+  client input must never crash the server.
+
+  **#648 (silent widening).** On any bound it could not read, the parser
+  returned `None` for the *entire* filter expression, and the caller read `None`
+  as "no filter was asked for" and ran an **unfiltered** KNN. `@vt:[100 (300]`
+  against three documents returned 3 rows instead of 2 — no error, no warning,
+  no metric. A filter that has silently stopped filtering is indistinguishable
+  from one that legitimately matched everything, so the caller cannot detect it.
+  On a scoped or multi-tenant store that is a confidentiality bug, not a recall
+  bug.
+
+  Three changes:
+
+  - `FilterExpr::NumRange` carries `min_excl` / `max_excl`, matching
+    `QueryNode::Numeric` and `FieldFilter::NumericRange`, so all three grammars
+    now agree on what `[100 (300]` means. `[v v]` collapses to `NumEq` only when
+    both bounds are inclusive — `[(50 50]` is the empty set, not "equals 50".
+  - The prefilter parser rejects an inverted range with the same rule the full
+    grammar uses, **and** the evaluator returns an empty bitmap rather than
+    calling `BTreeMap::range` with an impossible range. The parser is the
+    contract and the evaluator is the backstop; this bug existed because there
+    was only ever one of the two, and `FilterExpr` is reachable from more than
+    one parser.
+  - `parse_filter_clause` / `parse_inline_filter` return a tri-state
+    (`Absent` / `Parsed` / `Invalid`) instead of an `Option` that conflated "no
+    filter" with "unreadable filter". `Invalid` becomes
+    `ERR invalid FILTER expression`. It also short-circuits rather than falling
+    through from an unreadable explicit `FILTER` to the inline prefix.
+
+  ⚠ **Behaviour change:** a query whose prefilter cannot be parsed now fails
+  instead of returning results. Queries that appeared to work were returning a
+  wider result set than they asked for.
 
 ### Changed
 - **`scripts/ci-local.sh` now pre-flights the VM's free disk before it starts** (#658).

@@ -145,21 +145,73 @@ pub(crate) fn parse_usize(frame: &Frame) -> Option<usize> {
 ///   @field:{value}              -- tag equality
 ///   @field:[min max]            -- numeric range
 ///   @field:{value} @field2:[a b] -- implicit AND of multiple conditions
-pub(crate) fn parse_filter_clause(args: &[Frame]) -> Option<FilterExpr> {
+/// Outcome of parsing a filter expression.
+///
+/// This replaces an `Option<FilterExpr>` that conflated two very different
+/// answers: "the caller asked for no filter" and "the caller asked for a filter
+/// that cannot be read". Callers treated both as `None` and ran an UNFILTERED
+/// search, so a prefilter this parser could not read silently returned MORE
+/// rows than the caller scoped -- no error, no warning, no metric (moon#648).
+///
+/// A filter that has stopped filtering is indistinguishable from one that
+/// legitimately matched everything, so the caller has no way to detect it. On a
+/// scoped or multi-tenant store that is a confidentiality bug, not a recall bug.
+#[derive(Debug)]
+pub(crate) enum FilterParse {
+    /// No FILTER clause and no inline prefix -- run unfiltered, as asked.
+    Absent,
+    Parsed(FilterExpr),
+    /// A filter was supplied and could not be honoured as written. The caller
+    /// MUST return this as an error rather than fall back to unfiltered.
+    Invalid(&'static [u8]),
+}
+
+/// The wire error for a filter that cannot be honoured as written.
+pub(crate) const ERR_INVALID_FILTER: &[u8] = b"ERR invalid FILTER expression";
+
+impl FilterParse {
+    /// Try `next` only when nothing was supplied here. An `Invalid` short-
+    /// circuits: falling through from an unreadable explicit FILTER to the
+    /// inline prefix is how a rejected filter turned back into no filter.
+    pub(crate) fn or_else(self, next: impl FnOnce() -> FilterParse) -> FilterParse {
+        match self {
+            FilterParse::Absent => next(),
+            other => other,
+        }
+    }
+
+    /// Collapse to the `Option` the search path wants, or the error frame the
+    /// dispatch layer must return instead.
+    pub(crate) fn into_option(self) -> Result<Option<FilterExpr>, Frame> {
+        match self {
+            FilterParse::Absent => Ok(None),
+            FilterParse::Parsed(e) => Ok(Some(e)),
+            FilterParse::Invalid(msg) => Err(Frame::Error(Bytes::from_static(msg))),
+        }
+    }
+}
+
+pub(crate) fn parse_filter_clause(args: &[Frame]) -> FilterParse {
     // Find FILTER keyword in args (after index_name and query)
     let mut i = 2;
     while i < args.len() {
         if matches_keyword(&args[i], b"FILTER") {
             i += 1;
             if i >= args.len() {
-                return None;
+                // FILTER with no argument is malformed, not absent.
+                return FilterParse::Invalid(ERR_INVALID_FILTER);
             }
-            let filter_str = extract_bulk(&args[i])?;
-            return parse_filter_string(&filter_str);
+            let Some(filter_str) = extract_bulk(&args[i]) else {
+                return FilterParse::Invalid(ERR_INVALID_FILTER);
+            };
+            return match parse_filter_string(&filter_str) {
+                Some(e) => FilterParse::Parsed(e),
+                None => FilterParse::Invalid(ERR_INVALID_FILTER),
+            };
         }
         i += 1;
     }
-    None
+    FilterParse::Absent
 }
 
 /// Parse inline filter prefix from query string (RediSearch-compatible).
@@ -170,14 +222,22 @@ pub(crate) fn parse_filter_clause(args: &[Frame]) -> Option<FilterExpr> {
 ///   `@active:{true} @topic:{ml}=>[KNN 3 @vec $q]`
 ///
 /// Returns `None` if query starts with `*=>` (no filter prefix).
-pub(super) fn parse_inline_filter(query: &[u8]) -> Option<FilterExpr> {
-    let s = std::str::from_utf8(query).ok()?;
-    let arrow_pos = s.find("=>")?;
+pub(crate) fn parse_inline_filter(query: &[u8]) -> FilterParse {
+    let Ok(s) = std::str::from_utf8(query) else {
+        return FilterParse::Absent;
+    };
+    let Some(arrow_pos) = s.find("=>") else {
+        return FilterParse::Absent;
+    };
     let prefix = s[..arrow_pos].trim();
+    // `*=>` and a bare `=>` are the documented ways to ask for no prefilter.
     if prefix.is_empty() || prefix == "*" {
-        return None;
+        return FilterParse::Absent;
     }
-    parse_filter_string(prefix.as_bytes())
+    match parse_filter_string(prefix.as_bytes()) {
+        Some(e) => FilterParse::Parsed(e),
+        None => FilterParse::Invalid(ERR_INVALID_FILTER),
+    }
 }
 
 /// Parse SESSION clause from FT.SEARCH args.
@@ -197,6 +257,38 @@ pub fn parse_session_clause(args: &[Frame]) -> Option<Bytes> {
         i += 1;
     }
     None
+}
+
+/// Parse one numeric bound of a KNN-prefilter range: an optional leading `(`
+/// (exclusive), then a finite number or ±inf. Returns `(value, exclusive)`.
+///
+/// FT.SEARCH has three numeric grammars -- this one, `text::query::parse_bound`,
+/// and `ft_text_search::parse_numeric_bound`. Before moon#648 this one was a
+/// bare `parse::<f64>()`, so it alone could not read `(300` and returned `None`
+/// for the entire filter expression, which the caller then read as "no filter".
+/// The three now agree on syntax; the layering rule (`text/` must not import
+/// from `command/`) is why the code is not literally shared.
+fn parse_numeric_bound(s: &str) -> Option<(f64, bool)> {
+    let (body, excl) = match s.strip_prefix('(') {
+        Some(rest) => (rest, true),
+        None => (s, false),
+    };
+    parse_plain_number(body).map(|v| (v, excl))
+}
+
+/// A finite number or a case-insensitive ±infinity sentinel. NaN is rejected:
+/// it would make every `OrderedFloat` comparison downstream meaningless.
+fn parse_plain_number(s: &str) -> Option<f64> {
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+    let v = match lower.as_str() {
+        "-inf" | "-infinity" => f64::NEG_INFINITY,
+        "+inf" | "+infinity" | "inf" | "infinity" => f64::INFINITY,
+        _ => s.parse::<f64>().ok()?,
+    };
+    if v.is_nan() { None } else { Some(v) }
 }
 
 /// Parse filter string like "@field:{value}" or "@field:[min max]" or "@field:[lon lat radius_km]"
@@ -278,9 +370,9 @@ fn parse_filter_string(s: &[u8]) -> Option<FilterExpr> {
             let parts: Vec<&str> = range_str.split_whitespace().collect();
             if parts.len() == 3 {
                 // Geo radius: @field:[lon lat radius_km]
-                let lon: f64 = parts[0].parse().ok()?;
-                let lat: f64 = parts[1].parse().ok()?;
-                let radius_km: f64 = parts[2].parse().ok()?;
+                let lon: f64 = parse_plain_number(parts[0])?;
+                let lat: f64 = parse_plain_number(parts[1])?;
+                let radius_km: f64 = parse_plain_number(parts[2])?;
                 exprs.push(FilterExpr::GeoRadius {
                     field,
                     lon,
@@ -288,9 +380,17 @@ fn parse_filter_string(s: &[u8]) -> Option<FilterExpr> {
                     radius_km,
                 });
             } else if parts.len() == 2 {
-                let min: f64 = parts[0].parse().ok()?;
-                let max: f64 = parts[1].parse().ok()?;
-                if (min - max).abs() < f64::EPSILON {
+                let (min, min_excl) = parse_numeric_bound(parts[0])?;
+                let (max, max_excl) = parse_numeric_bound(parts[1])?;
+                // An inverted range is REJECTED, not swapped and not tolerated:
+                // `BTreeMap::range(min..=max)` panics when start > end, and a
+                // shard-thread panic aborts the whole process (moon#664). Only
+                // applies when both bounds are finite -- `[-inf +inf]` is valid.
+                // Matches ft_text_search.rs's rule for the full grammar.
+                if min.is_finite() && max.is_finite() && min > max {
+                    return None;
+                }
+                if (min - max).abs() < f64::EPSILON && !min_excl && !max_excl {
                     exprs.push(FilterExpr::NumEq {
                         field,
                         value: OrderedFloat(min),
@@ -300,6 +400,8 @@ fn parse_filter_string(s: &[u8]) -> Option<FilterExpr> {
                         field,
                         min: OrderedFloat(min),
                         max: OrderedFloat(max),
+                        min_excl,
+                        max_excl,
                     });
                 }
             } else {
