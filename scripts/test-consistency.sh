@@ -2457,6 +2457,9 @@ MQ_RESULT_12=""
 MQ_DLQ_RESULT_1=""
 MQ_DLQ_RESULT_4=""
 MQ_DLQ_RESULT_12=""
+MQ_DRAIN_RESULT_1=""
+MQ_DRAIN_RESULT_4=""
+MQ_DRAIN_RESULT_12=""
 
 MEM_USAGE_RESULT_1=""
 MEM_USAGE_RESULT_4=""
@@ -2493,6 +2496,27 @@ for NSHARDS in 1 4 12; do
         1)  MQ_DLQ_RESULT_1="$DLQ_LEN" ;;
         4)  MQ_DLQ_RESULT_4="$DLQ_LEN" ;;
         12) MQ_DLQ_RESULT_12="$DLQ_LEN" ;;
+    esac
+
+    # POP conservation (task #652): POP over-claims `COUNT + MAXDELIVERY`
+    # entries and returns at most COUNT. The surplus used to stay in the PEL
+    # with the group cursor advanced past it, and MQ reads only `>` entries --
+    # so it was unreachable forever. Drain a 4-deep backlog one message at a
+    # time and count what comes back: pre-fix this yields 1 of 4.
+    redis-cli -p "$PORT_RUST" MQ CREATE mqdrain MAXDELIVERY 3 >/dev/null 2>&1
+    for I in 1 2 3 4; do
+        redis-cli -p "$PORT_RUST" MQ PUSH mqdrain body "d$I" >/dev/null 2>&1
+    done
+    DRAIN_COUNT=0
+    for _ in 1 2 3 4 5 6 7 8; do
+        DRAIN_ONE=$(redis-cli -p "$PORT_RUST" MQ POP mqdrain COUNT 1 2>&1)
+        echo "$DRAIN_ONE" | grep -qF "body" || break
+        DRAIN_COUNT=$((DRAIN_COUNT + 1))
+    done
+    case "$NSHARDS" in
+        1)  MQ_DRAIN_RESULT_1="$DRAIN_COUNT" ;;
+        4)  MQ_DRAIN_RESULT_4="$DRAIN_COUNT" ;;
+        12) MQ_DRAIN_RESULT_12="$DRAIN_COUNT" ;;
     esac
 
     # MEMORY USAGE routing (task #511): the subcommand sits at args[0], so a
@@ -2551,6 +2575,30 @@ else
     echo "    1-shard:  $MQ_DLQ_RESULT_1"
     echo "    4-shard:  $MQ_DLQ_RESULT_4"
     echo "    12-shard: $MQ_DLQ_RESULT_12"
+fi
+
+# MQ POP conservation (task #652): every pushed message must be reachable by a
+# COUNT 1 polling loop, at every shard count. Pre-fix this returned 1 of 4 --
+# the other three were claimed, never delivered, and unreachable forever.
+MQ_DRAIN_OK=true
+for NSHARDS_LABEL in 1 4 12; do
+    case "$NSHARDS_LABEL" in
+        1)  DRAIN_R="$MQ_DRAIN_RESULT_1" ;;
+        4)  DRAIN_R="$MQ_DRAIN_RESULT_4" ;;
+        12) DRAIN_R="$MQ_DRAIN_RESULT_12" ;;
+    esac
+    if [ "$DRAIN_R" != "4" ]; then
+        MQ_DRAIN_OK=false
+    fi
+done
+if $MQ_DRAIN_OK; then
+    PASS=$((PASS + 1)); echo "  PASS: MQ POP delivers all 4 messages via COUNT 1 across 1/4/12 shards"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: MQ POP stranded messages (expected 4 delivered at every shard count)"
+    echo "    1-shard:  $MQ_DRAIN_RESULT_1"
+    echo "    4-shard:  $MQ_DRAIN_RESULT_4"
+    echo "    12-shard: $MQ_DRAIN_RESULT_12"
 fi
 
 # MEMORY DOCTOR: Moon-specific schema, not parity-tested against Redis.

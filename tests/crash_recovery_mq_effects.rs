@@ -575,3 +575,95 @@ fn xpending_idle_metadata_survives_kill9() {
         );
     }
 }
+
+/// moon#652 durability leg: entries a POP claimed-then-released must come back
+/// from the WAL as UNCLAIMED, not as pending-forever.
+///
+/// `handle_pop` over-claims by `max_delivery_count` and releases the surplus
+/// (un-claims it from the PEL and rewinds the group cursor). Replay rebuilds
+/// the PEL from the `MqPop` record's claimed-id list and restores its
+/// `last_delivered_id`, so if the record still carried the released ids — or
+/// the cursor from before the rewind — a restart would silently re-strand
+/// exactly the messages the fix rescued. The in-memory fix and the WAL record
+/// have to agree, and only a kill -9 round trip proves they do.
+#[test]
+#[ignore] // Requires built release binary; run explicitly.
+fn popped_surplus_is_released_across_kill9() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let extra: &[&str] = &["--appendonly", "yes", "--disk-free-min-pct", "0"];
+
+    let mut pushed: Vec<String> = Vec::new();
+
+    {
+        let (child, port) = spawn_moon(dir.path(), 1, extra);
+        let _guard = ServerGuard(child);
+        drop(wait_ready(port));
+
+        let mut c = Conn::open(port);
+        // Default MAXDELIVERY (3): POP COUNT 1 asks read_group_new for 4.
+        assert_eq!(
+            c.cmd_s(&["MQ", "CREATE", "surq"]),
+            Resp::Simple("OK".into())
+        );
+        for i in 1..=4 {
+            pushed.push(
+                c.cmd_s(&["MQ", "PUSH", "surq", "f", &format!("m{i}")])
+                    .flat(),
+            );
+        }
+
+        let popped = c.cmd_s(&["MQ", "POP", "surq", "COUNT", "1"]);
+        let ids = as_array(&popped);
+        assert_eq!(ids.len(), 1, "POP COUNT 1 returns 1");
+
+        // Exactly the delivered message is pending; the other three were
+        // claimed by read_group_new and must have been released again.
+        let pending = c.cmd_s(&["XPENDING", "surq", "__mq_consumers", "-", "+", "10"]);
+        assert_eq!(
+            as_array(&pending).len(),
+            1,
+            "only the delivered message may be pending pre-restart"
+        );
+
+        // Let the 1ms WAL flush tick drain every MQ effect record before the
+        // kill -- same settle wait as `mq_effect_records_survive_kill9`.
+        std::thread::sleep(Duration::from_millis(1500));
+        // _guard dropped here -> SIGKILL
+    }
+
+    {
+        let (child2, port2) = spawn_moon(dir.path(), 1, extra);
+        let _guard2 = ServerGuard(child2);
+        drop(wait_ready(port2));
+
+        let mut c = Conn::open(port2);
+
+        assert_eq!(
+            as_int(&c.cmd_s(&["XLEN", "surq"])),
+            4,
+            "sanity: all 4 pushes must have replayed before judging the PEL"
+        );
+
+        let pending = c.cmd_s(&["XPENDING", "surq", "__mq_consumers", "-", "+", "10"]);
+        assert_eq!(
+            as_array(&pending).len(),
+            1,
+            "replay must restore exactly the one delivered message as pending \
+             -- rebuilding the PEL from released ids re-strands them"
+        );
+
+        // The three released messages must still be claimable after recovery.
+        let rest = c.cmd_s(&["MQ", "POP", "surq", "COUNT", "10"]);
+        let rest_ids: Vec<String> = as_array(&rest)
+            .iter()
+            .map(|entry| as_array(entry)[0].flat())
+            .collect();
+        assert_eq!(
+            rest_ids,
+            pushed[1..].to_vec(),
+            "the released surplus must be re-claimable after recovery -- a \
+             last_delivered_id restored from before the rewind advances the \
+             cursor past them and they are unreachable forever"
+        );
+    }
+}
