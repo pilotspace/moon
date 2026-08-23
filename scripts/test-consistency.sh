@@ -1457,6 +1457,34 @@ assert_eq "EVAL_RO write refused on every shard" "0" "$xs_leaked"
 # The control: a handler that refused EVERYTHING in read-only mode would pass
 # the row above and fail this one.
 assert_eq "EVAL_RO read answered on every shard" "0" "$xs_readfail"
+
+# moon#672: a script error must reach the client as a WELL-FORMED RESP error
+# whose redis error CODE leads. Before the fix mlua's multi-line traceback was
+# framed raw, and a RESP *simple* error may not contain CR or LF -- so
+# `redis-cli` answered `Bad simple string value` and the client never saw the
+# error at all. That client-side parse failure is what this row detects; an
+# embedded-newline count would NOT, because a client that cannot parse the
+# frame prints a single line of its own too.
+both LPUSH luaerr:list a
+lua_err_unparseable=0
+for body in "return redis.call('GET', KEYS[1])" "error('boom')" \
+            "local x = nil return x.y" "return redis.call('NOSUCHCMD')"; do
+    out="$(redis-cli -p "$PORT_RUST" EVAL "$body" 1 luaerr:list 2>&1)"
+    case "$out" in
+        *"Bad simple string value"*|*"Protocol error"*)
+            lua_err_unparseable=$((lua_err_unparseable + 1)) ;;
+    esac
+done
+assert_eq "script errors are parseable RESP frames" "0" "$lua_err_unparseable"
+# The error CODE leads, so a client can match on it. Not `assert_both`: redis
+# appends its own ` script: <sha>, on @user_script:N.` tail, so only the head
+# is parity. `luaerr:list` is a list, so GET is a type clash.
+lua_err_code="$(redis-cli -p "$PORT_RUST" EVAL "return redis.call('GET', KEYS[1])" 1 luaerr:list 2>&1 | cut -d' ' -f1)"
+assert_eq "script error leads with its redis code" "WRONGTYPE" "$lua_err_code"
+# ...and the chunk is NAMED, so no moon source path can appear. This is the
+# row that fails if someone drops `.set_name("@user_script")`.
+lua_err_paths="$(redis-cli -p "$PORT_RUST" EVAL "error('boom')" 0 2>&1 | grep -c '\.rs' || true)"
+assert_eq "script errors leak no moon source path" "0" "$lua_err_paths"
 assert_both "GETKEYS EVAL bad numkeys is empty too"    COMMAND GETKEYS EVAL "return 1" 9 ik1
 
 # ---------------------------------------------------------------------------

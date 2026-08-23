@@ -511,8 +511,12 @@ fn run_script(
         }
         lua.globals().set("ARGV", argv_table)?;
 
-        // Load and execute
-        let val: LuaValue = lua.load(script).eval()?;
+        // Load and execute. The chunk is NAMED: without it mlua defaults the
+        // chunk name to this Rust file and line, so every Lua-level error and
+        // traceback quoted a moon source path back at the client (moon#672).
+        // `user_script` is the name redis uses, so error text that mentions it
+        // reads the same to a client either way.
+        let val: LuaValue = lua.load(script).set_name("@user_script").eval()?;
         types::lua_value_to_frame(lua, &val)
     })();
 
@@ -554,12 +558,227 @@ pub(crate) fn script_error_to_frame(e: mlua::Error) -> Frame {
             b"ERR Write commands are not allowed from read-only scripts",
         ));
     }
-    Frame::Error(Bytes::from(format!("ERR Error running script: {e}")))
+    // A redis error raised by `redis.call` reaches the client with its CODE
+    // still first. That code is the only part a client matches on, and moon
+    // already special-cased NOPERM and BUSY above for exactly this reason —
+    // every other code (WRONGTYPE, OOM, NOSCRIPT, ...) was buried behind the
+    // wrapper, so a client testing for WRONGTYPE saw a plain ERR and could
+    // not tell a type clash from a bug (moon#672). `msg` rather than `e`:
+    // for a RuntimeError, `e.to_string()` prepends mlua's "runtime error: ".
+    let head = strip_mlua_decoration(first_line(&msg));
+    if starts_with_error_code(&head) {
+        return Frame::Error(Bytes::from(head));
+    }
+    Frame::Error(Bytes::from(format!("ERR Error running script: {head}")))
+}
+
+/// Whether `msg` opens with a redis error code — an all-uppercase ASCII word
+/// of three or more letters followed by a space, which is redis's own
+/// convention (`ERR`, `WRONGTYPE`, `OOM`, `NOSCRIPT`, `CROSSSLOT`, ...).
+///
+/// Shape rather than an allowlist, so a code moon adds later is carried
+/// through without anyone having to remember to extend a list — the failure
+/// mode of an allowlist here is silent, and it is the client that pays.
+/// Peel mlua's own wrapper words off the front of a message.
+///
+/// A failure raised inside a `redis.call` callback reaches us as
+/// `runtime error: WRONGTYPE ...` — mlua's decoration, not the script's and
+/// not redis's. Peeling it is what lets the redis error CODE land first, and
+/// it is done in a loop because the wrappers nest when a callback raises
+/// through another callback.
+fn strip_mlua_decoration(msg: String) -> String {
+    const WRAPPERS: [&str; 3] = ["runtime error: ", "callback error: ", "error: "];
+    let mut out = msg.trim_start().to_string();
+    loop {
+        let Some(w) = WRAPPERS.iter().find(|w| out.starts_with(**w)) else {
+            return out;
+        };
+        out = out[w.len()..].trim_start().to_string();
+    }
+}
+
+fn starts_with_error_code(msg: &str) -> bool {
+    let Some((word, _rest)) = msg.split_once(' ') else {
+        return false;
+    };
+    word.len() >= 3 && word.bytes().all(|b| b.is_ascii_uppercase())
+}
+
+/// The first line of a script error, with any stray control bytes flattened.
+///
+/// mlua's `Display` appends a multi-line Lua traceback. A RESP **simple**
+/// error frame is terminated by the first CRLF and may not contain CR or LF
+/// anywhere else, so passing that through produced a frame no client could
+/// parse — `redis-cli` answered `Bad simple string value` and the client never
+/// saw the error at all (moon#672). Taking the first line matches what the
+/// `NOPERM` arm above has always done; the traceback's remaining frames say
+/// nothing a client can act on.
+pub(crate) fn first_line(msg: &str) -> String {
+    let head = msg.split(['\n', '\r']).next().unwrap_or("").trim_end();
+    // Belt and braces: a tab or other control byte is legal in a RESP error
+    // but renders as noise, and `\0` would truncate for a C client.
+    head.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A RESP simple error may not contain CR or LF. mlua's `Display` carries
+    /// a multi-line Lua traceback, so every runtime error used to be framed
+    /// with raw newlines in it — `redis-cli` answered `Bad simple string
+    /// value` and the client never saw what went wrong. The traceback also
+    /// named a moon SOURCE PATH, which is an information leak (moon#672).
+    #[test]
+    fn a_script_error_is_one_line_and_names_no_moon_source_path() {
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+        let mut db = Database::new();
+        db.set(
+            Bytes::from_static(b"sk"),
+            crate::storage::Entry::new_string(Bytes::from_static(b"not-a-number")),
+        );
+
+        // Four different ways to fail, because the framing bug was in the
+        // shared fallback arm and any one of them alone could be a special
+        // case: a failing redis.call, an explicit error(), a Lua type error,
+        // and an unknown command.
+        for body in [
+            &b"return redis.call('INCR', KEYS[1])"[..],
+            b"error('boom')",
+            b"local x = nil return x.y",
+            b"return redis.call('DEFINITELYNOTACOMMAND')",
+        ] {
+            let r = run_script(
+                &lua,
+                body,
+                vec![Bytes::from_static(b"sk")],
+                vec![],
+                &mut db,
+                0,
+                1,
+                &crate::acl::ScriptAcl::trusted(),
+                false,
+            );
+            let Frame::Error(e) = &r else {
+                panic!(
+                    "expected an error for {}: {r:?}",
+                    String::from_utf8_lossy(body)
+                );
+            };
+            assert!(
+                !e.contains(&b'\n') && !e.contains(&b'\r'),
+                "error frame carries a newline, which no RESP simple error may: {:?}",
+                String::from_utf8_lossy(e)
+            );
+            assert!(
+                !e.windows(3).any(|w| w == b".rs"),
+                "error frame leaks a moon source path: {:?}",
+                String::from_utf8_lossy(e)
+            );
+            // Still says something: an empty or bare `ERR` would satisfy both
+            // assertions above and tell the client nothing.
+            assert!(
+                e.len() > b"ERR ".len(),
+                "error frame is empty for {}: {:?}",
+                String::from_utf8_lossy(body),
+                String::from_utf8_lossy(e)
+            );
+        }
+    }
+
+    /// A redis error raised by `redis.call` must reach the client with its
+    /// CODE still first, because that is the only part a client matches on.
+    /// moon already special-cased NOPERM and BUSY for this reason; every
+    /// other code (WRONGTYPE, OOM, NOSCRIPT, ...) was buried behind
+    /// `ERR Error running script: runtime error: `, so a client testing for
+    /// WRONGTYPE saw a plain ERR and could not tell a type clash from a bug
+    /// (moon#672).
+    #[test]
+    fn a_redis_error_code_survives_the_script_that_raised_it() {
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+        let mut db = Database::new();
+        // A LIST, so a string command against it is a type clash.
+        db.set(Bytes::from_static(b"lk"), crate::storage::Entry::new_list());
+
+        let r = run_script(
+            &lua,
+            b"return redis.call('GET', KEYS[1])",
+            vec![Bytes::from_static(b"lk")],
+            vec![],
+            &mut db,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+            false,
+        );
+        let Frame::Error(e) = &r else {
+            panic!("expected an error: {r:?}")
+        };
+        assert!(
+            e.starts_with(b"WRONGTYPE"),
+            "the error code must lead, or no client can match it: {:?}",
+            String::from_utf8_lossy(e)
+        );
+
+        // The control: a plain Lua error carries NO redis code, and must keep
+        // the descriptive wrapper rather than being mistaken for one.
+        let r2 = run_script(
+            &lua,
+            b"error('boom')",
+            vec![],
+            vec![],
+            &mut db,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+            false,
+        );
+        let Frame::Error(e2) = &r2 else {
+            panic!("expected an error: {r2:?}")
+        };
+        assert!(
+            e2.starts_with(b"ERR "),
+            "a bare Lua error should still be an ERR: {:?}",
+            String::from_utf8_lossy(e2)
+        );
+        assert!(
+            String::from_utf8_lossy(e2).contains("boom"),
+            "the message was lost: {:?}",
+            String::from_utf8_lossy(e2)
+        );
+    }
+
+    /// The chunk is named so a Lua-level error points at `user_script`, the
+    /// name redis uses, rather than at whatever file mlua defaulted to.
+    #[test]
+    fn a_lua_error_names_user_script() {
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+        let mut db = Database::new();
+        let r = run_script(
+            &lua,
+            b"error('boom')",
+            vec![],
+            vec![],
+            &mut db,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+            false,
+        );
+        let Frame::Error(e) = &r else {
+            panic!("expected an error: {r:?}")
+        };
+        let text = String::from_utf8_lossy(e);
+        assert!(
+            text.contains("user_script"),
+            "error should name user_script: {text}"
+        );
+        assert!(text.contains("boom"), "error lost the message: {text}");
+    }
 
     #[test]
     fn test_parse_eval_args_basic() {
