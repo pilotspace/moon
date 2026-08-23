@@ -12,11 +12,16 @@ pub enum FilterExpr {
         field: Bytes,
         value: OrderedFloat<f64>,
     },
-    /// Numeric range: @field:[min max]
+    /// Numeric range: `@field:[min max]`, inclusive unless the matching bound
+    /// carried a `(` prefix. The flags mirror `text::query::ast::QueryNode::Numeric`
+    /// and `FieldFilter::NumericRange` -- FT.SEARCH's other two numeric grammars --
+    /// so all three agree on what `[100 (300]` means (moon#648).
     NumRange {
         field: Bytes,
         min: OrderedFloat<f64>,
         max: OrderedFloat<f64>,
+        min_excl: bool,
+        max_excl: bool,
     },
     /// Logical AND
     And(Box<FilterExpr>, Box<FilterExpr>),

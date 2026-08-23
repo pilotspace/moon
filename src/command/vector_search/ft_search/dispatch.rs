@@ -125,8 +125,16 @@ pub fn ft_search(
         return Frame::Error(Bytes::from_static(b"ERR invalid KNN query syntax"));
     }
 
-    // Parse optional FILTER clause: explicit FILTER keyword OR inline prefix in query string
-    let filter_expr = parse_filter_clause(args).or_else(|| parse_inline_filter(&query_str));
+    // Parse optional FILTER clause: explicit FILTER keyword OR inline prefix in
+    // query string. An unreadable filter is an ERROR here, never a fall-through
+    // to an unfiltered search (moon#648) -- see `FilterParse`.
+    let filter_expr = match parse_filter_clause(args)
+        .or_else(|| parse_inline_filter(&query_str))
+        .into_option()
+    {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
 
     // Parse optional LIMIT offset count
     let (limit_offset, limit_count) = parse_limit_clause(args);
@@ -552,7 +560,15 @@ pub fn ft_search_capture(
             return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn, db_index));
         }
     };
-    let filter_expr = parse_filter_clause(args).or_else(|| parse_inline_filter(&query_str));
+    let filter_expr = match parse_filter_clause(args)
+        .or_else(|| parse_inline_filter(&query_str))
+        .into_option()
+    {
+        Ok(f) => f,
+        // Same rule on the planning path: a filter that cannot be honoured is
+        // an error, not a silently wider search (moon#648).
+        Err(e) => return FtSearchPlan::Sync(e),
+    };
     let (offset, count) = parse_limit_clause(args);
 
     // Store phase: build the owned snapshot, or None → exact-frame sync fallback.

@@ -156,7 +156,7 @@ fn parse_cachesearch_args(args: &[Frame]) -> Result<CacheSearchArgs, Frame> {
     };
 
     // Parse FILTER and LIMIT from the shifted args (offset by 1 for cache_prefix).
-    let filter = parse_filter_clause(&args[1..]);
+    let filter = parse_filter_clause(&args[1..]).into_option()?;
     let (offset, count) = parse_limit_clause(&args[1..]);
 
     Ok(CacheSearchArgs {

@@ -567,3 +567,59 @@ fn numeric_noindex_field_skipped() {
         "NOINDEX field must not populate numeric index"
     );
 }
+
+/// `BTreeMap::range` PANICS by contract when start > end, or when start == end
+/// with either bound excluded — and a panic on a shard thread aborts the whole
+/// moon process. `search_numeric_range` is reached by FOUR callers, and only
+/// three of them validate their bounds first: `FT.HYBRID`'s
+/// `FILTER NUMERIC <field> <min> <max>` parser checks that each bound is
+/// finite and never that `min <= max`.
+///
+/// The evaluator is therefore made total, exactly as
+/// `vector::filter::payload_index` was for moon#664: an impossible range is an
+/// empty result, not a process abort. Guarding the caller alone would leave
+/// the next caller to rediscover this.
+#[test]
+fn an_impossible_numeric_range_is_empty_not_a_panic() {
+    let mut idx = num_only_index(&[b"score"]);
+    for (i, v) in [10.0, 20.0, 30.0, 40.0, 50.0].iter().enumerate() {
+        let args = num_args(&[(b"score", format!("{}", v).as_bytes())]);
+        idx.numeric_index_document(i as u64, format!("d:{}", i).as_bytes(), &args);
+    }
+    let f = Bytes::from_static(b"score");
+    // start > end, finite and infinite alike.
+    for (min, max) in [
+        (40.0, 20.0),
+        (f64::INFINITY, 20.0),
+        (40.0, f64::NEG_INFINITY),
+        (f64::INFINITY, f64::NEG_INFINITY),
+    ] {
+        assert!(
+            idx.search_numeric_range(&f, min, max, false, false)
+                .is_empty(),
+            "[{min} {max}] is empty, and must not abort the process"
+        );
+    }
+    // start == end with either bound excluded is the OTHER documented panic.
+    for (lo_ex, hi_ex) in [(true, false), (false, true), (true, true)] {
+        assert!(
+            idx.search_numeric_range(&f, 30.0, 30.0, lo_ex, hi_ex)
+                .is_empty(),
+            "an excluded single point is the empty set ({lo_ex}, {hi_ex})"
+        );
+    }
+    // The controls: everything above must not have broken a real range.
+    assert_eq!(
+        idx.search_numeric_range(&f, 20.0, 40.0, false, false).len(),
+        3
+    );
+    assert_eq!(
+        idx.search_numeric_range(&f, 30.0, 30.0, false, false).len(),
+        1
+    );
+    assert_eq!(
+        idx.search_numeric_range(&f, f64::NEG_INFINITY, f64::INFINITY, false, false)
+            .len(),
+        5
+    );
+}

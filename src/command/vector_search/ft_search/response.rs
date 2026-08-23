@@ -209,7 +209,7 @@ pub fn parse_ft_search_args(
         }
     };
 
-    let filter = parse_filter_clause(args);
+    let filter = parse_filter_clause(args).into_option()?;
     let (limit_offset, limit_count) = parse_limit_clause(args);
     Ok((index_name, query_blob, k, filter, limit_offset, limit_count))
 }

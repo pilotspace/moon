@@ -1294,6 +1294,66 @@ if should_run "vector"; then
     # Tag filter
     assert_moon_contains "FT.SEARCH tag filter" "doc:" FT.SEARCH testidx "@category:{science}=>[KNN 3 @vec \$q]" PARAMS 2 q "$(printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')"
 
+    # ── KNN-prefilter numeric grammar (moon#648 / moon#664) ────────────────
+    # FT.SEARCH has TWO numeric-range parsers. NUMERIC-01..06 below cover the
+    # full query grammar, which was always correct. These cover the KNN
+    # prefilter, which was not: it could not read a `(` bound and returned None
+    # for the WHOLE expression, and the caller read None as "no filter" and ran
+    # an UNFILTERED search. A filter that has silently stopped filtering is
+    # indistinguishable from one that legitimately matched everything.
+    mcli FT.CREATE knnfilt ON HASH PREFIX 1 kf: SCHEMA vt NUMERIC vec VECTOR HNSW 6 DIM 4 TYPE FLOAT32 DISTANCE_METRIC L2 >/dev/null 2>&1
+    # 16 NUL-free ASCII bytes = one FLOAT32 DIM 4 vector. A `printf '\x00...'`
+    # blob would NOT survive command substitution -- bash strips NUL bytes, the
+    # vector arrives short, and every query below answers "dimension mismatch"
+    # instead of exercising the filter. That makes the guard vacuous.
+    KF_VEC="ABCDEFGHIJKLMNOP"
+    mcli HSET kf:1 vt 150 vec "$KF_VEC" >/dev/null 2>&1
+    mcli HSET kf:2 vt 250 vec "$KF_VEC" >/dev/null 2>&1
+    mcli HSET kf:3 vt 350 vec "$KF_VEC" >/dev/null 2>&1
+    sleep 0.5
+
+    # KNNFILT-01 baseline: the prefilter is applied at all (150 only).
+    TOTAL=$((TOTAL + 1))
+    KF_INC=$(mcli FT.SEARCH knnfilt '@vt:[100 200]=>[KNN 4 @vec $q]' PARAMS 2 q "$KF_VEC" DIALECT 2 2>&1)
+    KF_N=$(echo "$KF_INC" | grep -c '^kf:')
+    if [ "$KF_N" -eq 1 ]; then
+        PASS=$((PASS + 1)); echo "  PASS: KNNFILT-01 prefilter [100 200] -> 1 key"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: KNNFILT-01 expected 1 got $KF_N: $KF_INC"
+    fi
+
+    # KNNFILT-02: exclusive upper bound. Pre-fix this returned 3 (unfiltered).
+    TOTAL=$((TOTAL + 1))
+    KF_EXCL=$(mcli FT.SEARCH knnfilt '@vt:[100 (300]=>[KNN 4 @vec $q]' PARAMS 2 q "$KF_VEC" DIALECT 2 2>&1)
+    KF_NE=$(echo "$KF_EXCL" | grep -c '^kf:')
+    if [ "$KF_NE" -eq 2 ]; then
+        PASS=$((PASS + 1)); echo "  PASS: KNNFILT-02 prefilter [100 (300] -> 2 keys (exclusive honoured)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: KNNFILT-02 expected 2 got $KF_NE (3 = filter silently dropped): $KF_EXCL"
+    fi
+
+    # KNNFILT-03: an unparseable prefilter is an ERROR, not a wider search.
+    TOTAL=$((TOTAL + 1))
+    KF_BAD=$(mcli FT.SEARCH knnfilt '@vt:[abc def]=>[KNN 4 @vec $q]' PARAMS 2 q "$KF_VEC" DIALECT 2 2>&1)
+    if echo "$KF_BAD" | grep -qi "invalid FILTER"; then
+        PASS=$((PASS + 1)); echo "  PASS: KNNFILT-03 unparseable prefilter rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: KNNFILT-03 expected an error, got: $KF_BAD"
+    fi
+
+    # KNNFILT-04 (moon#664): an inverted range must not abort the process.
+    # BTreeMap::range panics when start > end, and a shard panic aborts moon.
+    TOTAL=$((TOTAL + 1))
+    KF_INV=$(mcli FT.SEARCH knnfilt '@vt:[300 100]=>[KNN 4 @vec $q]' PARAMS 2 q "$KF_VEC" DIALECT 2 2>&1)
+    KF_ALIVE=$(mcli PING 2>&1)
+    if echo "$KF_INV" | grep -qi "invalid FILTER" && echo "$KF_ALIVE" | grep -qi "PONG"; then
+        PASS=$((PASS + 1)); echo "  PASS: KNNFILT-04 inverted prefilter rejected, server still alive"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: KNNFILT-04 reply='$KF_INV' ping='$KF_ALIVE' (empty ping = process aborted)"
+    fi
+
+    mcli FT.DROPINDEX knnfilt DD >/dev/null 2>&1
+
     # FT.DROPINDEX
     assert_moon_ok "FT.DROPINDEX" FT.DROPINDEX testidx
 

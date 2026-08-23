@@ -847,7 +847,7 @@ fn test_parse_filter_clause_tag() {
         bulk(b"q"),
         bulk(b"blob"),
     ];
-    let filter = parse_filter_clause(&args);
+    let filter = parse_filter_clause(&args).into_option().unwrap();
     assert!(filter.is_some(), "should parse @category:{{electronics}}");
     match filter.unwrap() {
         crate::vector::filter::FilterExpr::TagEq { field, value } => {
@@ -870,13 +870,21 @@ fn test_parse_filter_clause_numeric_range() {
         bulk(b"q"),
         bulk(b"blob"),
     ];
-    let filter = parse_filter_clause(&args);
+    let filter = parse_filter_clause(&args).into_option().unwrap();
     assert!(filter.is_some());
     match filter.unwrap() {
-        crate::vector::filter::FilterExpr::NumRange { field, min, max } => {
+        crate::vector::filter::FilterExpr::NumRange {
+            field,
+            min,
+            max,
+            min_excl,
+            max_excl,
+        } => {
             assert_eq!(&field[..], b"price");
             assert_eq!(*min, 10.0);
             assert_eq!(*max, 100.0);
+            assert!(!min_excl, "[10 100] has no exclusive bound");
+            assert!(!max_excl);
         }
         other => panic!("expected NumRange, got {other:?}"),
     }
@@ -890,7 +898,7 @@ fn test_parse_filter_clause_numeric_eq() {
         bulk(b"FILTER"),
         bulk(b"@price:[50 50]"),
     ];
-    let filter = parse_filter_clause(&args);
+    let filter = parse_filter_clause(&args).into_option().unwrap();
     assert!(filter.is_some());
     match filter.unwrap() {
         crate::vector::filter::FilterExpr::NumEq { field, value } => {
@@ -909,7 +917,7 @@ fn test_parse_filter_clause_compound() {
         bulk(b"FILTER"),
         bulk(b"@a:{x} @b:[1 10]"),
     ];
-    let filter = parse_filter_clause(&args);
+    let filter = parse_filter_clause(&args).into_option().unwrap();
     assert!(filter.is_some());
     match filter.unwrap() {
         crate::vector::filter::FilterExpr::And(left, right) => {
@@ -926,6 +934,207 @@ fn test_parse_filter_clause_compound() {
     }
 }
 
+/// moon#648: `Absent` and `Invalid` are different answers. The `Option` this
+/// replaces made them the same, and every caller read the collapsed `None` as
+/// "run unfiltered" -- so a filter the parser could not read silently widened
+/// the result set instead of failing.
+#[test]
+fn filter_clause_distinguishes_absent_from_unparseable() {
+    use crate::command::vector_search::ft_search::parse::FilterParse;
+
+    let filter_args = |expr: &str| {
+        vec![
+            bulk(b"idx"),
+            bulk(b"*=>[KNN 5 @vec $q]"),
+            bulk(b"FILTER"),
+            bulk(expr.as_bytes()),
+        ]
+    };
+
+    // No FILTER keyword at all -> Absent, and the search runs unfiltered as asked.
+    let none = vec![bulk(b"idx"), bulk(b"*=>[KNN 5 @vec $q]")];
+    assert!(matches!(parse_filter_clause(&none), FilterParse::Absent));
+
+    // Supplied but unreadable -> Invalid. Each of these previously produced
+    // `None`, i.e. an unfiltered search.
+    for bad in [
+        "@price:[abc def]", // non-numeric bounds
+        "@price:[10]",      // one bound
+        "@price:[1 2 3 4]", // four values (three is geo)
+        "@price:[( 100]",   // bare exclusive marker
+        "price:[1 10]",     // missing @
+        "@price:[300 100]", // inverted -- moon#664
+    ] {
+        assert!(
+            matches!(
+                parse_filter_clause(&filter_args(bad)),
+                FilterParse::Invalid(_)
+            ),
+            "{bad:?} must be Invalid, not Absent -- Absent means unfiltered"
+        );
+    }
+
+    // FILTER with nothing after it is malformed, not absent.
+    let dangling = vec![bulk(b"idx"), bulk(b"*=>[KNN 5 @vec $q]"), bulk(b"FILTER")];
+    assert!(matches!(
+        parse_filter_clause(&dangling),
+        FilterParse::Invalid(_)
+    ));
+}
+
+/// The collapse point. `parse_filter_clause` reporting `Invalid` is only half
+/// the fix -- `into_option` is where an unreadable filter either becomes an
+/// error frame or (as before moon#648) quietly becomes `None`, i.e. unfiltered.
+/// Without this the parser could report Invalid correctly and the search would
+/// still widen, and every parser-level assertion would still pass.
+#[test]
+fn into_option_turns_an_invalid_filter_into_an_error_not_none() {
+    use crate::command::vector_search::ft_search::parse::{ERR_INVALID_FILTER, FilterParse};
+
+    let err = FilterParse::Invalid(ERR_INVALID_FILTER)
+        .into_option()
+        .expect_err("Invalid must not collapse to Ok(None) -- that is unfiltered");
+    match err {
+        Frame::Error(msg) => assert_eq!(&msg[..], ERR_INVALID_FILTER),
+        other => panic!("expected an error frame, got {other:?}"),
+    }
+
+    assert!(
+        FilterParse::Absent
+            .into_option()
+            .expect("Absent is not an error")
+            .is_none(),
+        "Absent still means unfiltered, as asked"
+    );
+}
+
+/// An unreadable explicit FILTER must NOT fall through to the inline prefix.
+/// `Option::or_else` did exactly that, so a rejected filter turned back into a
+/// different filter -- or into none at all.
+#[test]
+fn an_invalid_filter_clause_does_not_fall_through_to_the_inline_prefix() {
+    use crate::command::vector_search::ft_search::parse::{FilterParse, parse_inline_filter};
+
+    let args = vec![
+        bulk(b"idx"),
+        bulk(b"@price:[1 10]=>[KNN 5 @vec $q]"),
+        bulk(b"FILTER"),
+        bulk(b"@price:[300 100]"),
+    ];
+    let combined = parse_filter_clause(&args)
+        .or_else(|| parse_inline_filter(b"@price:[1 10]=>[KNN 5 @vec $q]"));
+    assert!(
+        matches!(combined, FilterParse::Invalid(_)),
+        "an Invalid explicit FILTER must short-circuit, not defer to the inline prefix"
+    );
+
+    // Absent still defers, which is the behaviour worth preserving.
+    let no_filter_kw = vec![bulk(b"idx"), bulk(b"@price:[1 10]=>[KNN 5 @vec $q]")];
+    let deferred = parse_filter_clause(&no_filter_kw)
+        .or_else(|| parse_inline_filter(b"@price:[1 10]=>[KNN 5 @vec $q]"));
+    assert!(matches!(deferred, FilterParse::Parsed(_)));
+}
+
+/// moon#648 part one: the KNN prefilter must read `(`-prefixed exclusive
+/// bounds, the same as the full query grammar. It used a bare `parse::<f64>()`.
+#[test]
+fn filter_clause_reads_exclusive_bounds_and_infinities() {
+    let parse = |expr: &str| {
+        parse_filter_clause(&[
+            bulk(b"idx"),
+            bulk(b"*=>[KNN 5 @vec $q]"),
+            bulk(b"FILTER"),
+            bulk(expr.as_bytes()),
+        ])
+        .into_option()
+        .unwrap()
+        .unwrap_or_else(|| panic!("{expr} must parse"))
+    };
+
+    match parse("@price:[10 (100]") {
+        crate::vector::filter::FilterExpr::NumRange {
+            min,
+            max,
+            min_excl,
+            max_excl,
+            ..
+        } => {
+            assert_eq!((*min, *max), (10.0, 100.0));
+            assert!(!min_excl && max_excl, "only the upper bound is exclusive");
+        }
+        other => panic!("expected NumRange, got {other:?}"),
+    }
+
+    match parse("@price:[(10 100]") {
+        crate::vector::filter::FilterExpr::NumRange {
+            min_excl, max_excl, ..
+        } => assert!(min_excl && !max_excl),
+        other => panic!("expected NumRange, got {other:?}"),
+    }
+
+    // `[v v]` collapses to NumEq only when BOTH bounds are inclusive --
+    // `[(50 50]` is the empty set, and must not become "equals 50".
+    assert!(matches!(
+        parse("@price:[50 50]"),
+        crate::vector::filter::FilterExpr::NumEq { .. }
+    ));
+    match parse("@price:[(50 50]") {
+        crate::vector::filter::FilterExpr::NumRange { min_excl, .. } => assert!(min_excl),
+        other => panic!("[(50 50] must stay a range, got {other:?}"),
+    }
+
+    // ±inf sentinels, so an open-ended range is expressible.
+    match parse("@price:[-inf +inf]") {
+        crate::vector::filter::FilterExpr::NumRange { min, max, .. } => {
+            assert!(min.is_infinite() && max.is_infinite());
+        }
+        other => panic!("expected NumRange, got {other:?}"),
+    }
+    // ...and the half-open forms, which are the ones a client actually writes.
+    for expr in ["@price:[-inf 100]", "@price:[10 +inf]", "@price:[(10 inf]"] {
+        assert!(
+            matches!(
+                parse(expr),
+                crate::vector::filter::FilterExpr::NumRange { .. }
+            ),
+            "{expr} is a valid open-ended range"
+        );
+    }
+}
+
+/// An INVERTED range is rejected whether or not its bounds are finite.
+///
+/// The three FT.SEARCH numeric grammars disagreed here: `text/query/parse.rs`
+/// tests a plain `min > max`, while this parser and `ft_text_search.rs` both
+/// carried a `min.is_finite() && max.is_finite() &&` conjunct — so
+/// `[+inf 5]` was rejected by one grammar and accepted by the other two.
+/// The conjunct was never load-bearing: `[-inf +inf]` and every half-open
+/// form have `min <= max` already, so the plain comparison keeps them
+/// (pinned above) and the guard is the same rule everywhere (moon#648).
+#[test]
+fn an_inverted_range_is_rejected_even_when_a_bound_is_infinite() {
+    let parse = |expr: &str| {
+        parse_filter_clause(&[
+            bulk(b"idx"),
+            bulk(b"*=>[KNN 5 @vec $q]"),
+            bulk(b"FILTER"),
+            bulk(expr.as_bytes()),
+        ])
+        .into_option()
+    };
+    for expr in [
+        "@price:[300 100]",
+        "@price:[+inf 5]",
+        "@price:[5 -inf]",
+        "@price:[+inf -inf]",
+    ] {
+        assert!(
+            parse(expr).is_err(),
+            "{expr} is inverted and must be an error, not a filter"
+        );
+    }
+}
+
 #[test]
 fn test_parse_filter_clause_none() {
     // No FILTER keyword
@@ -937,7 +1146,7 @@ fn test_parse_filter_clause_none() {
         bulk(b"q"),
         bulk(b"blob"),
     ];
-    let filter = parse_filter_clause(&args);
+    let filter = parse_filter_clause(&args).into_option().unwrap();
     assert!(filter.is_none());
 }
 
@@ -1115,7 +1324,7 @@ fn test_parse_filter_bool_true() {
         bulk(b"FILTER"),
         bulk(b"@active:{true}"),
     ];
-    let filter = parse_filter_clause(&args);
+    let filter = parse_filter_clause(&args).into_option().unwrap();
     assert!(filter.is_some(), "should parse @active:{{true}}");
     match filter.unwrap() {
         crate::vector::filter::FilterExpr::BoolEq { field, value } => {
@@ -1134,7 +1343,7 @@ fn test_parse_filter_bool_false() {
         bulk(b"FILTER"),
         bulk(b"@active:{false}"),
     ];
-    let filter = parse_filter_clause(&args);
+    let filter = parse_filter_clause(&args).into_option().unwrap();
     assert!(filter.is_some(), "should parse @active:{{false}}");
     match filter.unwrap() {
         crate::vector::filter::FilterExpr::BoolEq { field, value } => {
@@ -1153,7 +1362,7 @@ fn test_parse_filter_bool_case_insensitive() {
         bulk(b"FILTER"),
         bulk(b"@flag:{TRUE}"),
     ];
-    let filter = parse_filter_clause(&args);
+    let filter = parse_filter_clause(&args).into_option().unwrap();
     assert!(filter.is_some());
     match filter.unwrap() {
         crate::vector::filter::FilterExpr::BoolEq { field, value } => {
@@ -1172,7 +1381,7 @@ fn test_parse_filter_geo() {
         bulk(b"FILTER"),
         bulk(b"@location:[-122.42 37.78 100.0]"),
     ];
-    let filter = parse_filter_clause(&args);
+    let filter = parse_filter_clause(&args).into_option().unwrap();
     assert!(filter.is_some(), "should parse geo filter");
     match filter.unwrap() {
         crate::vector::filter::FilterExpr::GeoRadius {
@@ -1198,7 +1407,7 @@ fn test_parse_filter_combined_bool_and_numeric() {
         bulk(b"FILTER"),
         bulk(b"@active:{true} @price:[10 50]"),
     ];
-    let filter = parse_filter_clause(&args);
+    let filter = parse_filter_clause(&args).into_option().unwrap();
     assert!(filter.is_some());
     match filter.unwrap() {
         crate::vector::filter::FilterExpr::And(left, right) => {
@@ -3144,7 +3353,7 @@ fn test_parse_filter_text_match_multiword() {
         bulk(b"FILTER"),
         bulk(b"@description:{machine learning}"),
     ];
-    let filter = parse_filter_clause(&args);
+    let filter = parse_filter_clause(&args).into_option().unwrap();
     assert!(
         filter.is_some(),
         "should parse @description:{{machine learning}}"
@@ -3169,7 +3378,7 @@ fn test_parse_filter_single_word_remains_tag() {
         bulk(b"FILTER"),
         bulk(b"@category:{science}"),
     ];
-    let filter = parse_filter_clause(&args);
+    let filter = parse_filter_clause(&args).into_option().unwrap();
     assert!(filter.is_some());
     match filter.unwrap() {
         crate::vector::filter::FilterExpr::TagEq { field, value } => {

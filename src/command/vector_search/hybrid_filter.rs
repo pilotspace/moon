@@ -176,6 +176,18 @@ fn parse_expr(state: &mut ParseState<'_>) -> Result<HybridFilter, Frame> {
             .and_then(|s| s.parse().ok())
             .filter(|v: &f64| v.is_finite())
             .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR FILTER NUMERIC invalid max")))?;
+        // An inverted range is refused, not executed as an empty set. Every
+        // other FT.SEARCH numeric grammar rejects `min > max` at parse time
+        // (moon#648), and until this guard existed an inverted FT.HYBRID
+        // filter reached `BTreeMap::range` and aborted the whole process the
+        // way moon#664's KNN prefilter did. `store::search_numeric_range` is
+        // now total as well, so this is the message rather than the crash fix:
+        // silence would tell the caller their filter matched nothing.
+        if min > max {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR FILTER NUMERIC min is greater than max",
+            )));
+        }
         state.leaf_count += 1;
         if state.leaf_count > 16 {
             return Err(Frame::Error(Bytes::from_static(b"ERR FILTER too complex")));
@@ -464,6 +476,40 @@ mod tests {
                 assert_eq!(value, "scratchpad");
             }
             _ => panic!("expected Tag"),
+        }
+    }
+
+    /// `FILTER NUMERIC` checked that each bound was finite and never that
+    /// they were ordered, so an inverted range reached `BTreeMap::range` and
+    /// aborted the whole process — the same defect as moon#664's KNN
+    /// prefilter, one command away. Refused at parse time now, and
+    /// `store::search_numeric_range` is total as a second line.
+    #[test]
+    fn an_inverted_numeric_filter_is_refused_not_executed() {
+        for (lo, hi) in [
+            (b"300".as_slice(), b"100".as_slice()),
+            (b"0.5", b"-0.5"),
+            (b"1e300", b"-1e300"),
+        ] {
+            let args = filter_args(&[b"NUMERIC", b"@score", lo, hi]);
+            let err = parse_filter_modifier(&args, 0).expect_err("must be refused");
+            assert_eq!(
+                err,
+                Frame::Error(Bytes::from_static(
+                    b"ERR FILTER NUMERIC min is greater than max"
+                )),
+                "{}..{} must name the problem",
+                String::from_utf8_lossy(lo),
+                String::from_utf8_lossy(hi)
+            );
+        }
+        // The control: a well-ordered range, and a single point, still parse.
+        for (lo, hi) in [(b"100".as_slice(), b"300".as_slice()), (b"7", b"7")] {
+            let args = filter_args(&[b"NUMERIC", b"@score", lo, hi]);
+            assert!(
+                parse_filter_modifier(&args, 0).expect("no error").is_some(),
+                "a valid range must still parse"
+            );
         }
     }
 

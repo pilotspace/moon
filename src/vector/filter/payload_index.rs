@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
@@ -254,12 +255,37 @@ impl PayloadIndex {
                 .cloned()
                 .unwrap_or_default(),
 
-            FilterExpr::NumRange { field, min, max } => {
+            FilterExpr::NumRange {
+                field,
+                min,
+                max,
+                min_excl,
+                max_excl,
+            } => {
                 let Some(btree) = self.numeric_indexes.get(field) else {
                     return RoaringBitmap::new();
                 };
+                // `BTreeMap::range` PANICS when start > end, or when start ==
+                // end with either bound excluded -- and a panic on a shard
+                // thread aborts the whole process (moon#664). The parser
+                // rejects those shapes, but this stays total anyway: the bug
+                // existed precisely because only one of the two ever checked,
+                // and `FilterExpr` is constructible from more than one parser.
+                if min > max || (min == max && (*min_excl || *max_excl)) {
+                    return RoaringBitmap::new();
+                }
+                let lo = if *min_excl {
+                    Bound::Excluded(*min)
+                } else {
+                    Bound::Included(*min)
+                };
+                let hi = if *max_excl {
+                    Bound::Excluded(*max)
+                } else {
+                    Bound::Included(*max)
+                };
                 let mut result = RoaringBitmap::new();
-                for (_k, bm) in btree.range(*min..=*max) {
+                for (_k, bm) in btree.range((lo, hi)) {
                     result |= bm;
                 }
                 result
@@ -533,11 +559,77 @@ mod tests {
             field: field("price"),
             min: OrderedFloat(8.0),
             max: OrderedFloat(16.0),
+            min_excl: false,
+            max_excl: false,
         };
         let bm = idx.evaluate_bitmap(&expr, 4);
         assert_eq!(bm.len(), 2);
         assert!(bm.contains(1)); // 10.0
         assert!(bm.contains(2)); // 15.0
+    }
+
+    #[test]
+    fn inverted_numeric_range_yields_empty_not_a_panic() {
+        // moon#664: `BTreeMap::range` panics by contract when start > end, and
+        // Moon's shard-panic policy aborts the WHOLE process. The parser is the
+        // contract, but the evaluator has to be total as well -- this bug
+        // existed because only one of the two ever checked.
+        let mut idx = PayloadIndex::new();
+        idx.insert_numeric(&field("price"), 5.0, 0);
+        idx.insert_numeric(&field("price"), 15.0, 1);
+
+        let expr = FilterExpr::NumRange {
+            field: field("price"),
+            min: OrderedFloat(300.0),
+            max: OrderedFloat(100.0),
+            min_excl: false,
+            max_excl: false,
+        };
+        assert!(idx.evaluate_bitmap(&expr, 2).is_empty());
+    }
+
+    #[test]
+    fn exclusive_numeric_bounds_drop_the_endpoints() {
+        let mut idx = PayloadIndex::new();
+        idx.insert_numeric(&field("vt"), 150.0, 0);
+        idx.insert_numeric(&field("vt"), 250.0, 1);
+        idx.insert_numeric(&field("vt"), 350.0, 2);
+
+        let range = |min: f64, max: f64, min_excl, max_excl| FilterExpr::NumRange {
+            field: field("vt"),
+            min: OrderedFloat(min),
+            max: OrderedFloat(max),
+            min_excl,
+            max_excl,
+        };
+
+        // [100 350] -> all three; [100 (350] -> drops 350.
+        assert_eq!(
+            idx.evaluate_bitmap(&range(100.0, 350.0, false, false), 3)
+                .len(),
+            3
+        );
+        assert_eq!(
+            idx.evaluate_bitmap(&range(100.0, 350.0, false, true), 3)
+                .len(),
+            2
+        );
+        // [(150 350] -> drops 150.
+        assert_eq!(
+            idx.evaluate_bitmap(&range(150.0, 350.0, true, false), 3)
+                .len(),
+            2
+        );
+        // Both exclusive on the same value is empty, not everything.
+        assert!(
+            idx.evaluate_bitmap(&range(150.0, 150.0, true, true), 3)
+                .is_empty()
+        );
+        // An exclusive bound on a degenerate range is empty too.
+        assert!(
+            idx.evaluate_bitmap(&range(250.0, 250.0, true, false), 3)
+                .is_empty()
+        );
     }
 
     #[test]
