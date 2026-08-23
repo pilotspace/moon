@@ -1868,8 +1868,15 @@ pub async fn handle_connection(
                     //
                     // This handler is the embedded / non-sharded server, so
                     // the local databases ARE the whole dataset.
-                    if cmd.eq_ignore_ascii_case(b"DEBUG") {
-                        if let Some(sub) = cmd_args.first() {
+                    //
+                    // `cmd`/`cmd_args` from the ACL gate are out of scope here
+                    // -- that binding ends above the MULTI block -- so re-read
+                    // them from the frame, the same way the queue block and
+                    // the phase-2 dispatch below both do.
+                    if let Some((dg_cmd, dg_args)) = extract_command(&frame)
+                        && dg_cmd.eq_ignore_ascii_case(b"DEBUG")
+                    {
+                        if let Some(sub) = dg_args.first() {
                             if let Some(sb) = crate::command::helpers::extract_bytes(sub) {
                                 if sb.eq_ignore_ascii_case(b"DIGEST") {
                                     let mut partials = Vec::new();
