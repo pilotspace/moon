@@ -1555,6 +1555,44 @@ pub async fn handle_connection(
                                     }
                                 }
                                 // Auto-index HSETs from the transaction
+                                // moon#677: keyspace half of a queued FLUSHALL, on
+                                // its own rather than inside the
+                                // `vector_store`-gated auto-index loop below.
+                                // Nesting it there tied "did every database get
+                                // cleared?" to "is vector search configured?" --
+                                // two unrelated questions. Today's only caller
+                                // always passes `Some`, so that was latent rather
+                                // than live, but the coupling is one `None` away
+                                // from reinstating #677 inside MULTI/EXEC.
+                                //
+                                // Note for anyone testing this: `main.rs` routes
+                                // every runtime through `listener::run_sharded`, so
+                                // this handler is reached only through the library
+                                // entry point (`server::handle_connection`) -- the
+                                // binary's MULTI/EXEC flush goes through
+                                // `conn::shared`, which is where the integration
+                                // test's mutation check lands.
+                                //
+                                // `execute_transaction` has returned by now, so no
+                                // database guard is held and the helper can take
+                                // each lock itself.
+                                if let Frame::Array(ref txn_results) = result {
+                                    for (i, cmd_frame) in conn.command_queue.iter().enumerate() {
+                                        if i >= txn_results.len()
+                                            || matches!(txn_results[i], Frame::Error(_))
+                                        {
+                                            continue;
+                                        }
+                                        if let Some((c, _)) = extract_command(cmd_frame)
+                                            && c.eq_ignore_ascii_case(b"FLUSHALL")
+                                        {
+                                            crate::command::server_admin::flush_every_database_locked(
+                                                db.as_slice(),
+                                            );
+                                        }
+                                    }
+                                }
+
                                 if let Some(ref vs) = vector_store {
                                     if let Frame::Array(ref txn_results) = result {
                                         let mut fallback_ts = crate::text::store::TextStore::new();
@@ -1614,17 +1652,6 @@ pub async fn handle_connection(
                                                     // WS5a: FLUSHDB scopes to
                                                     // `conn.selected_db`; FLUSHALL clears
                                                     // every db.
-                                                    //
-                                                    // moon#677: keyspace half, inside
-                                                    // MULTI/EXEC too. `execute_transaction`
-                                                    // has returned, so no database guard is
-                                                    // held here and the helper can take each
-                                                    // lock itself.
-                                                    if c.eq_ignore_ascii_case(b"FLUSHALL") {
-                                                        crate::command::server_admin::flush_every_database_locked(
-                                                            db.as_slice(),
-                                                        );
-                                                    }
                                                     if c.eq_ignore_ascii_case(b"FLUSHDB") {
                                                         vs.lock().clear_all_contents_for_db(
                                                             conn.selected_db as u8,

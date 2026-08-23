@@ -492,3 +492,47 @@ fn flushall_survives_a_restart() {
         outcome.join(" ")
     );
 }
+
+/// A queued `FLUSHALL` is a different code path from an immediate one — `EXEC`
+/// replays the body through `execute_transaction`, and the post-EXEC hooks are
+/// a separate block from the live write path's. It had no coverage at all
+/// until CodeRabbit pointed at moon#677's first cut of it, where the keyspace
+/// clear had been placed inside a `vector_store`-gated loop.
+///
+/// One connection for the whole exchange: `MULTI` state is connection-scoped,
+/// so the per-invocation `redis-cli` the other tests use would send `MULTI`,
+/// `FLUSHALL` and `EXEC` down three unrelated connections and assert nothing.
+#[test]
+fn flushall_inside_multi_exec_clears_every_database() {
+    let Some(m) = spawn_moon() else { return };
+    seed_probe_dbs(m.port);
+
+    let out = cli_pipe(m.port, "SELECT 0\nMULTI\nFLUSHALL\nEXEC\n");
+    assert!(
+        out.contains("OK"),
+        "MULTI/FLUSHALL/EXEC did not succeed: {out:?}"
+    );
+
+    assert_flushall_emptied_everything(m.port, 1);
+}
+
+/// Feed several commands to one `redis-cli` process — and therefore one
+/// connection — via stdin.
+fn cli_pipe(port: u16, script: &str) -> String {
+    use std::io::Write as _;
+    let mut child = Command::new("redis-cli")
+        .args(["-p", &port.to_string()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("redis-cli");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(script.as_bytes())
+        .expect("write");
+    let out = child.wait_with_output().expect("wait");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
