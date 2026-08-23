@@ -88,30 +88,64 @@ done
 log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 
 cleanup() {
+    # `rc` is captured and re-exited at the end (moon#679): a trap's exit
+    # status replaces the script's, and the `[[ -n ... ]] && kill` lines below
+    # return 1 whenever a PID is unset, which would report a clean run as a
+    # failure (and a failed run as whatever the last kill happened to return).
+    local rc=$?
     log "Cleaning up..."
     [[ -n "${RUST_PID:-}" ]] && kill "$RUST_PID" 2>/dev/null; wait "$RUST_PID" 2>/dev/null || true
     [[ -n "${REDIS_PID:-}" ]] && kill "$REDIS_PID" 2>/dev/null; wait "$REDIS_PID" 2>/dev/null || true
     pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
     pkill -f "moon.*${PORT_RUST}" 2>/dev/null || true
+    [[ -n "${MOON_DATA_DIR:-}" ]] && rm -rf "$MOON_DATA_DIR"
+    return "$rc"
 }
 trap cleanup EXIT
 
+# Multiline "A appears somewhere before B" match, reading stdin.
+#
+# Replaces `grep -Pzo "(?s)A.*B"` (moon#679). That idiom is GNU-only: on a
+# macOS host `grep` is ugrep, which rejects -P and exits 2 -- and because the
+# rows compared command output rather than exit status, that 2 leaked through
+# as `got: 2`, so every AGG-*/TAG-*/NUMERIC-04 row reported a moon answer of
+# "2" that moon never gave. Flattening newlines to spaces and using a plain
+# BRE works on GNU grep, BSD grep and ugrep alike.
+#
+# The match is deliberately as loose as the idiom it replaces (`open.*5` also
+# matches "open" followed by a later "25"); tightening it is a separate change
+# from making it run at all.
+spans() {
+    tr '\n' ' ' | grep -q "$1"
+}
+
+# The `|| true` on every client wrapper is load-bearing (moon#679).
+#
+# `redis-cli` exits non-zero when it cannot reach the server, and under
+# `set -euo pipefail` that makes `VAR=$(mcli ...)` end the whole run. So the
+# moment a server died -- which is exactly when the suite has something
+# important to say -- the script stopped without printing its summary, and the
+# operator saw a truncated log rather than "N rows failed". A row that gets an
+# empty answer should FAIL and let the run continue to the totals.
+#
+# Nothing branches on these functions' exit status (checked: no `if mcli ...`
+# and no `mcli ... &&` anywhere in this file), so swallowing it costs nothing.
 rcli() {
     # Run redis-cli against Redis
-    redis-cli -p "$PORT_REDIS" "$@" 2>/dev/null
+    redis-cli -p "$PORT_REDIS" "$@" 2>/dev/null || true
 }
 
 mcli() {
     # Run redis-cli against moon
-    redis-cli -p "$PORT_RUST" "$@" 2>/dev/null
+    redis-cli -p "$PORT_RUST" "$@" 2>/dev/null || true
 }
 
 rcli_raw() {
-    redis-cli -p "$PORT_REDIS" --no-auth-warning "$@" 2>/dev/null
+    redis-cli -p "$PORT_REDIS" --no-auth-warning "$@" 2>/dev/null || true
 }
 
 mcli_raw() {
-    redis-cli -p "$PORT_RUST" --no-auth-warning "$@" 2>/dev/null
+    redis-cli -p "$PORT_RUST" --no-auth-warning "$@" 2>/dev/null || true
 }
 
 # Compare redis-cli output between Redis and moon
@@ -344,10 +378,14 @@ assert_bench() {
     TOTAL=$((TOTAL + 1))
     local raw rps
     raw=$(redis-benchmark -p "$PORT_RUST" -n 5000 -c 50 $cmd "$@" 2>&1 | tr '\r' '\n')
-    rps=$(echo "$raw" | grep -i "requests per second" | tail -1 | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]/ && $(i+1) ~ /requests/) print $i}' | sed 's/,//g')
+    # `|| true`: when redis-benchmark prints no summary line (a command it
+    # cannot drive, a server that went away) grep exits 1, pipefail propagates
+    # it, and set -e ends the run -- before the `-z "$rps"` fallback just below
+    # ever gets to do its job (moon#679).
+    rps=$(echo "$raw" | grep -i "requests per second" | tail -1 | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]/ && $(i+1) ~ /requests/) print $i}' | sed 's/,//g' || true)
     # Fallback: try -q mode format "COMMAND: NNN.NN requests per second"
     if [[ -z "$rps" ]]; then
-        rps=$(echo "$raw" | grep "requests per second" | tail -1 | sed 's/.*: \([0-9.]*\) requests.*/\1/' | sed 's/,//g')
+        rps=$(echo "$raw" | grep "requests per second" | tail -1 | sed 's/.*: \([0-9.]*\) requests.*/\1/' | sed 's/,//g' || true)
     fi
     if [[ -n "$rps" ]] && [[ "$rps" != "0" ]] && [[ "$rps" != "0.00" ]]; then
         BENCH_PASS=$((BENCH_PASS + 1))
@@ -377,7 +415,50 @@ log "=== Moon Command Coverage Test ==="
 
 if [[ "$SKIP_BUILD" == "false" ]]; then
     log "Building moon..."
-    cargo build --release --features text-index --quiet 2>/dev/null
+    # Do NOT swallow stderr here (moon#679). This was
+    # `cargo build ... --quiet 2>/dev/null`, so a failed build ended the run
+    # under `set -e` with the log reading "Building moon..." and nothing else
+    # -- no error, no summary, no clue. Whatever cargo has to say about why it
+    # could not build the binary this suite is about to test, the operator
+    # needs to see.
+    if ! cargo build --release --features text-index --quiet; then
+        echo "FATAL: cargo build failed; the suite has nothing to test." >&2
+        exit 2
+    fi
+fi
+
+# Refuse to run on a port somebody else is already listening on (moon#679).
+#
+# Without this the suite silently measures the WRONG SERVER: a leftover moon or
+# redis from another run answers, every row compares against it, and the report
+# looks authoritative. This is not hypothetical -- it produced a full run of
+# `MOONERR diskfull` failures that had nothing to do with the code under test,
+# because a moon from an unrelated session (a different binary, different
+# flags, different data dir) held the port. Judge by the LISTENER, not by
+# whether a PING comes back: a PING coming back is exactly the symptom.
+require_free_port() {
+    local port="$1" what="$2" owner
+    # `|| true`: lsof exits 1 when nothing matches -- i.e. when the port is
+    # FREE, the common case -- and pipefail + set -e would end the run there.
+    owner=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1" (pid "$2")"}' || true)
+    if [[ -n "$owner" ]]; then
+        echo "FATAL: port $port ($what) is already held by $owner." >&2
+        echo "       This suite would have compared against that process instead of" >&2
+        echo "       the server it started. Stop it, or re-run with a free port:" >&2
+        echo "         PORT_REDIS=<n> PORT_RUST=<n> $0" >&2
+        exit 2
+    fi
+    # Explicit: without it the function's status is that of the `if` test
+    # above, which is 1 when the port IS free -- and under `set -e` a function
+    # returning 1 at top level ends the script. The first draft of this very
+    # guard did exactly that, killing the run with no output at all.
+    return 0
+}
+require_free_port "$PORT_RUST" "moon"
+# A plain `[[ ... ]] && cmd` would be the same trap: false test, status 1,
+# `set -e` ends the run. Use an if.
+if [[ "$MOON_ONLY" == "false" ]]; then
+    require_free_port "$PORT_REDIS" "redis"
 fi
 
 if [[ "$MOON_ONLY" == "false" ]]; then
@@ -387,7 +468,16 @@ if [[ "$MOON_ONLY" == "false" ]]; then
 fi
 
 log "Starting moon on port $PORT_RUST ($SHARDS shards)..."
-RUST_LOG=warn "$RUST_BINARY" --port "$PORT_RUST" --shards "$SHARDS" --protected-mode no &
+# A fresh --dir per run (moon#679). Without it moon treats the CWD as its data
+# directory: it writes `appendonlydir/` and `moon.lock` into the repo root, and
+# -- because FLUSHALL deliberately keeps index DEFINITIONS -- it reloads the
+# previous run's FT indexes on start. The visible symptom is `FT.CREATE basic`
+# failing with `ERR Index already exists` on the second and every later run,
+# which makes the suite non-reproducible: a clean checkout passes, the same
+# checkout run twice does not.
+MOON_DATA_DIR=$(mktemp -d "${TMPDIR:-/tmp}/moon-test-commands.XXXXXX")
+RUST_LOG=warn "$RUST_BINARY" --port "$PORT_RUST" --shards "$SHARDS" --protected-mode no \
+    --dir "$MOON_DATA_DIR" --disk-free-min-pct 0 &
 RUST_PID=$!
 
 sleep 1
@@ -1073,7 +1163,7 @@ if should_run "transaction"; then
 
     # Test MULTI/EXEC via pipe (using \n not \r\n for redis-cli pipe mode)
     TOTAL=$((TOTAL + 1))
-    tx_moon=$(printf 'MULTI\nSET tx:k1 v1\nSET tx:k2 v2\nGET tx:k1\nEXEC\n' | redis-cli -p "$PORT_RUST" 2>/dev/null)
+    tx_moon=$(printf 'MULTI\nSET tx:k1 v1\nSET tx:k2 v2\nGET tx:k1\nEXEC\n' | redis-cli -p "$PORT_RUST" 2>/dev/null || true)
     if echo "$tx_moon" | grep -q "v1"; then
         PASS=$((PASS + 1))
     else
@@ -1084,7 +1174,7 @@ if should_run "transaction"; then
 
     # DISCARD (must be inside MULTI)
     TOTAL=$((TOTAL + 1))
-    tx_discard=$(printf 'MULTI\nDISCARD\n' | redis-cli -p "$PORT_RUST" 2>/dev/null)
+    tx_discard=$(printf 'MULTI\nDISCARD\n' | redis-cli -p "$PORT_RUST" 2>/dev/null || true)
     if echo "$tx_discard" | grep -q "OK"; then
         PASS=$((PASS + 1))
     else
@@ -1247,16 +1337,49 @@ if should_run "vector"; then
     echo "=== VECTOR SEARCH COMMANDS ==="
     mcli FLUSHALL >/dev/null 2>&1
 
-    # FT.CREATE — create a vector index
-    assert_moon "FT.CREATE basic"          "OK"    FT.CREATE myidx ON HASH PREFIX 1 doc: SCHEMA embedding VECTOR FLAT 6 DIM 4 DISTANCE_METRIC L2 TYPE FLOAT32
+    # FT.CREATE — create a vector index.
+    #
+    # HNSW, not FLAT (moon#679). This row asked for `VECTOR FLAT` and expected
+    # `OK` from the day it was written, but moon has only ever implemented
+    # HNSW: `ERR expected HNSW algorithm` has been in `ft_create.rs` since #27.
+    # So the row never passed, and the five rows below it -- FT.INFO,
+    # FT.SEARCH, FT.DROPINDEX, FT.INFO-after-drop -- all fell over behind it
+    # on an index that was never created. Four of the six "vector" rows in this
+    # category were reporting a failure that told you nothing.
+    #
+    # Note this is not a redis-parity assertion and never was: the
+    # `redis-server` this suite runs against has no query engine, so FT.* is
+    # `unknown command` on the Redis side. These are moon-only rows, which is
+    # why nothing flagged the expectation as unsupported.
+    assert_moon "FT.CREATE basic"          "OK"    FT.CREATE myidx ON HASH PREFIX 1 doc: SCHEMA embedding VECTOR HNSW 6 DIM 4 DISTANCE_METRIC L2 TYPE FLOAT32
+
+    # FLAT is a real RediSearch algorithm moon does not implement. Assert the
+    # refusal explicitly rather than letting it hide inside a row that expected
+    # success -- a gap that is asserted is a gap someone can find.
+    TOTAL=$((TOTAL + 1)); FT_FLAT=$(mcli FT.CREATE flatidx ON HASH PREFIX 1 f: SCHEMA v VECTOR FLAT 6 DIM 4 DISTANCE_METRIC L2 TYPE FLOAT32 2>&1)
+    if echo "$FT_FLAT" | grep -q "expected HNSW algorithm"; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.CREATE VECTOR FLAT refused (moon implements HNSW only)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.CREATE VECTOR FLAT expected 'expected HNSW algorithm', got: $FT_FLAT"
+    fi
+
+    # moon#681: a VECTOR clause truncated after the algorithm keyword used to
+    # panic the shard thread and abort the whole process. The row that matters
+    # is the PING after it -- an error reply is fine, a dead server is not.
+    TOTAL=$((TOTAL + 1)); FT_TRUNC=$(mcli FT.CREATE truncidx ON HASH PREFIX 1 t: SCHEMA v VECTOR HNSW 2>&1)
+    if [ "$(mcli PING 2>&1)" = "PONG" ]; then
+        PASS=$((PASS + 1)); echo "  PASS: moon#681 truncated FT.CREATE answers ($FT_TRUNC) and the server survives"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: moon#681 truncated FT.CREATE killed the server (reply was: $FT_TRUNC)"
+    fi
 
     # FT.INFO — index metadata
     TOTAL=$((TOTAL + 1)); FT_INFO=$(mcli FT.INFO myidx 2>&1)
     if echo "$FT_INFO" | grep -q "myidx"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO returns index name"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO returns index name"; fi
 
     # Insert vectors via HSET (auto-indexed) — use python3 to avoid null byte stripping in bash
-    python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<4f',1.0,0.0,0.0,0.0))" | redis-cli -x -p "$PORT_RUST" HSET doc:1 embedding >/dev/null 2>&1
-    python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<4f',0.0,1.0,0.0,0.0))" | redis-cli -x -p "$PORT_RUST" HSET doc:2 embedding >/dev/null 2>&1
+    python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<4f',1.0,0.0,0.0,0.0))" | redis-cli -x -p "$PORT_RUST" HSET doc:1 embedding >/dev/null 2>&1 || true
+    python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<4f',0.0,1.0,0.0,0.0))" | redis-cli -x -p "$PORT_RUST" HSET doc:2 embedding >/dev/null 2>&1 || true
 
     # FT.SEARCH — verify command doesn't error (redis-cli can't pass binary args directly)
     TOTAL=$((TOTAL + 1)); FT_SEARCH=$(mcli FT.SEARCH myidx "*" 2>&1)
@@ -1435,7 +1558,7 @@ if should_run "vector"; then
     # KNNFILT-01 baseline: the prefilter is applied at all (150 only).
     TOTAL=$((TOTAL + 1))
     KF_INC=$(mcli FT.SEARCH knnfilt '@vt:[100 200]=>[KNN 4 @vec $q]' PARAMS 2 q "$KF_VEC" DIALECT 2 2>&1)
-    KF_N=$(echo "$KF_INC" | grep -c '^kf:')
+    KF_N=$(echo "$KF_INC" | grep -c '^kf:' || true)
     if [ "$KF_N" -eq 1 ]; then
         PASS=$((PASS + 1)); echo "  PASS: KNNFILT-01 prefilter [100 200] -> 1 key"
     else
@@ -1445,7 +1568,7 @@ if should_run "vector"; then
     # KNNFILT-02: exclusive upper bound. Pre-fix this returned 3 (unfiltered).
     TOTAL=$((TOTAL + 1))
     KF_EXCL=$(mcli FT.SEARCH knnfilt '@vt:[100 (300]=>[KNN 4 @vec $q]' PARAMS 2 q "$KF_VEC" DIALECT 2 2>&1)
-    KF_NE=$(echo "$KF_EXCL" | grep -c '^kf:')
+    KF_NE=$(echo "$KF_EXCL" | grep -c '^kf:' || true)
     if [ "$KF_NE" -eq 2 ]; then
         PASS=$((PASS + 1)); echo "  PASS: KNNFILT-02 prefilter [100 (300] -> 2 keys (exclusive honoured)"
     else
@@ -1492,9 +1615,9 @@ if should_run "vector"; then
     # every category after VECTOR SEARCH (MQ, txn_kv, eviction, benchmark) and
     # the result summary never executed. Same class as moon#634.
     printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        | redis-cli -x -p "$PORT_RUST" HSET dd:1 vec >/dev/null 2>&1
+        | redis-cli -x -p "$PORT_RUST" HSET dd:1 vec >/dev/null 2>&1 || true
     printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        | redis-cli -x -p "$PORT_RUST" HSET dd:2 vec >/dev/null 2>&1
+        | redis-cli -x -p "$PORT_RUST" HSET dd:2 vec >/dev/null 2>&1 || true
 
     # Verify documents exist
     TOTAL=$((TOTAL + 1)); DD_EXISTS=$(mcli EXISTS dd:1 dd:2 2>&1)
@@ -1510,7 +1633,7 @@ if should_run "vector"; then
     # Test case insensitivity: create another index
     assert_moon_ok "FT.CREATE dd_test2" FT.CREATE ddtest2 ON HASH PREFIX 1 dd2: SCHEMA vec VECTOR HNSW 6 DIM 4 TYPE FLOAT32 DISTANCE_METRIC L2
     printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        | redis-cli -x -p "$PORT_RUST" HSET dd2:1 vec >/dev/null 2>&1
+        | redis-cli -x -p "$PORT_RUST" HSET dd2:1 vec >/dev/null 2>&1 || true
 
     # Drop with lowercase dd flag
     assert_moon_ok "FT.DROPINDEX dd (lowercase)" FT.DROPINDEX ddtest2 dd
@@ -1521,7 +1644,7 @@ if should_run "vector"; then
     # Test without DD — documents should remain
     assert_moon_ok "FT.CREATE no_dd_test" FT.CREATE noddtest ON HASH PREFIX 1 ndd: SCHEMA vec VECTOR HNSW 6 DIM 4 TYPE FLOAT32 DISTANCE_METRIC L2
     printf '\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        | redis-cli -x -p "$PORT_RUST" HSET ndd:1 vec >/dev/null 2>&1
+        | redis-cli -x -p "$PORT_RUST" HSET ndd:1 vec >/dev/null 2>&1 || true
 
     assert_moon_ok "FT.DROPINDEX no DD" FT.DROPINDEX noddtest
 
@@ -1561,7 +1684,7 @@ if should_run "vector"; then
     FT_TEXT_INFO=$(mcli FT.INFO textidx 2>&1)
 
     TOTAL=$((TOTAL + 1))
-    TEXT_NUM_DOCS=$(echo "$FT_TEXT_INFO" | grep -A1 "num_docs" | tail -1 | tr -d '[:space:]')
+    TEXT_NUM_DOCS=$(echo "$FT_TEXT_INFO" | grep -A1 "num_docs" | tail -1 | tr -d '[:space:]' || true)
     if [ -n "$TEXT_NUM_DOCS" ] && [ "$TEXT_NUM_DOCS" != "0" ] && [ "$TEXT_NUM_DOCS" -gt 0 ] 2>/dev/null; then
         PASS=$((PASS + 1)); echo "  PASS: FT.INFO text num_docs = $TEXT_NUM_DOCS (should be > 0)"
     else
@@ -1569,7 +1692,7 @@ if should_run "vector"; then
     fi
 
     TOTAL=$((TOTAL + 1))
-    TEXT_NUM_TERMS=$(echo "$FT_TEXT_INFO" | grep -A1 "num_terms" | tail -1 | tr -d '[:space:]')
+    TEXT_NUM_TERMS=$(echo "$FT_TEXT_INFO" | grep -A1 "num_terms" | tail -1 | tr -d '[:space:]' || true)
     if [ -n "$TEXT_NUM_TERMS" ] && [ "$TEXT_NUM_TERMS" != "0" ] && [ "$TEXT_NUM_TERMS" -gt 0 ] 2>/dev/null; then
         PASS=$((PASS + 1)); echo "  PASS: FT.INFO text num_terms = $TEXT_NUM_TERMS (should be > 0)"
     else
@@ -1662,7 +1785,7 @@ if should_run "vector"; then
     # 6. LIMIT clause: FT.SEARCH textidx "document" LIMIT 0 1 — returns exactly 1 doc entry
     TOTAL=$((TOTAL + 1))
     FT_LIMIT=$(mcli FT.SEARCH textidx "document" LIMIT 0 1 2>&1)
-    FT_LIMIT_DOC_COUNT=$(echo "$FT_LIMIT" | grep -c "doc:")
+    FT_LIMIT_DOC_COUNT=$(echo "$FT_LIMIT" | grep -c "doc:" || true)
     if [ "$FT_LIMIT_DOC_COUNT" -le 1 ] && echo "$FT_LIMIT" | grep -q "doc:"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH LIMIT 0 1 returns at most 1 result"
     else
@@ -1945,7 +2068,7 @@ if should_run "vector"; then
         # AGG-01: GROUPBY + COUNT — assert specific counts (open=5 closed=2)
         TOTAL=$((TOTAL + 1))
         AGG_COUNT=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE COUNT 0 AS cnt SORTBY 2 @cnt DESC 2>&1)
-        if echo "$AGG_COUNT" | grep -Pzo "(?s)open.*5" >/dev/null && echo "$AGG_COUNT" | grep -Pzo "(?s)closed.*2" >/dev/null; then
+        if echo "$AGG_COUNT" | spans "open.*5" && echo "$AGG_COUNT" | spans "closed.*2"; then
             PASS=$((PASS + 1)); echo "  PASS: AGG-01 GROUPBY+COUNT (open=5 closed=2)"
         else
             FAIL=$((FAIL + 1)); echo "  FAIL: AGG-01 expected open=5 closed=2, got: $AGG_COUNT"
@@ -1954,7 +2077,7 @@ if should_run "vector"; then
         # AGG-02: GROUPBY @priority (high=3 low=4)
         TOTAL=$((TOTAL + 1))
         AGG_PRIORITY=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @priority REDUCE COUNT 0 AS cnt SORTBY 2 @cnt DESC 2>&1)
-        if echo "$AGG_PRIORITY" | grep -Pzo "(?s)low.*4" >/dev/null && echo "$AGG_PRIORITY" | grep -Pzo "(?s)high.*3" >/dev/null; then
+        if echo "$AGG_PRIORITY" | spans "low.*4" && echo "$AGG_PRIORITY" | spans "high.*3"; then
             PASS=$((PASS + 1)); echo "  PASS: AGG-02 GROUPBY @priority (high=3 low=4)"
         else
             FAIL=$((FAIL + 1)); echo "  FAIL: AGG-02 expected high=3 low=4, got: $AGG_PRIORITY"
@@ -1965,7 +2088,7 @@ if should_run "vector"; then
         TOTAL=$((TOTAL + 1))
         AGG_SUM=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE SUM 1 @score AS total 2>&1)
         # Expected: status=open → 10+20+30+40+50=150; status=closed → 60+70=130.
-        if echo "$AGG_SUM" | grep -Pzo "(?s)open.*150" >/dev/null && echo "$AGG_SUM" | grep -Pzo "(?s)closed.*130" >/dev/null; then
+        if echo "$AGG_SUM" | spans "open.*150" && echo "$AGG_SUM" | spans "closed.*130"; then
             PASS=$((PASS + 1)); echo "  PASS: AGG-03 GROUPBY+SUM exact (open=150 closed=130)"
         else
             FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 expected open=150 closed=130, got: $AGG_SUM"
@@ -1982,7 +2105,7 @@ if should_run "vector"; then
         TOTAL=$((TOTAL + 1))
         AGG_MIN=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE MIN 1 @score AS min_score 2>&1)
         # Expected: status=open → min=10; status=closed → min=60.
-        if echo "$AGG_MIN" | grep -Pzo "(?s)open.*10" >/dev/null && echo "$AGG_MIN" | grep -Pzo "(?s)closed.*60" >/dev/null; then
+        if echo "$AGG_MIN" | spans "open.*10" && echo "$AGG_MIN" | spans "closed.*60"; then
             PASS=$((PASS + 1)); echo "  PASS: AGG-03 GROUPBY+MIN exact (open=10 closed=60)"
         else
             FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 expected MIN open=10 closed=60, got: $AGG_MIN"
@@ -1991,7 +2114,7 @@ if should_run "vector"; then
         TOTAL=$((TOTAL + 1))
         AGG_MAX=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE MAX 1 @score AS max_score 2>&1)
         # Expected: status=open → max=50; status=closed → max=70.
-        if echo "$AGG_MAX" | grep -Pzo "(?s)open.*50" >/dev/null && echo "$AGG_MAX" | grep -Pzo "(?s)closed.*70" >/dev/null; then
+        if echo "$AGG_MAX" | spans "open.*50" && echo "$AGG_MAX" | spans "closed.*70"; then
             PASS=$((PASS + 1)); echo "  PASS: AGG-03 GROUPBY+MAX exact (open=50 closed=70)"
         else
             FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 expected MAX open=50 closed=70, got: $AGG_MAX"
@@ -2028,7 +2151,7 @@ if should_run "vector"; then
         # TAG-01: @status:{open} GROUPBY @priority — expect high=3 low=2
         TOTAL=$((TOTAL + 1))
         AGG_TAG_FILTER=$(mcli FT.AGGREGATE aggidx '@status:{open}' GROUPBY 1 @priority REDUCE COUNT 0 AS cnt SORTBY 2 @cnt DESC 2>&1)
-        if echo "$AGG_TAG_FILTER" | grep -Pzo "(?s)high.*3" >/dev/null && echo "$AGG_TAG_FILTER" | grep -Pzo "(?s)low.*2" >/dev/null; then
+        if echo "$AGG_TAG_FILTER" | spans "high.*3" && echo "$AGG_TAG_FILTER" | spans "low.*2"; then
             PASS=$((PASS + 1)); echo "  PASS: TAG-01 @status:{open} GROUPBY @priority (high=3 low=2)"
         else
             FAIL=$((FAIL + 1)); echo "  FAIL: TAG-01 expected high=3 low=2, got: $AGG_TAG_FILTER"
@@ -2037,7 +2160,7 @@ if should_run "vector"; then
         # TAG-02: FT.SEARCH @status:{open} — 5 keys
         TOTAL=$((TOTAL + 1))
         SEARCH_TAG=$(mcli FT.SEARCH aggidx '@status:{open}' LIMIT 0 10 2>&1)
-        HIT_COUNT=$(echo "$SEARCH_TAG" | grep -c '^agg:')
+        HIT_COUNT=$(echo "$SEARCH_TAG" | grep -c '^agg:' || true)
         if [ "$HIT_COUNT" -eq 5 ]; then
             PASS=$((PASS + 1)); echo "  PASS: TAG-02 FT.SEARCH @status:{open} returned 5 keys"
         else
@@ -2047,7 +2170,7 @@ if should_run "vector"; then
         # TAG-03: @Status:{open} (mixed-case field) must match @status:{open}
         TOTAL=$((TOTAL + 1))
         SEARCH_TAG_CASE=$(mcli FT.SEARCH aggidx '@Status:{open}' LIMIT 0 10 2>&1)
-        HIT_COUNT_CASE=$(echo "$SEARCH_TAG_CASE" | grep -c '^agg:')
+        HIT_COUNT_CASE=$(echo "$SEARCH_TAG_CASE" | grep -c '^agg:' || true)
         if [ "$HIT_COUNT_CASE" -eq 5 ]; then
             PASS=$((PASS + 1)); echo "  PASS: TAG-03 case-insensitive field @Status:{open} → 5 keys"
         else
@@ -2081,7 +2204,7 @@ if should_run "vector"; then
         # NUMERIC-01: @score:[20 40] inclusive — agg:2 agg:3 agg:4 = 3 keys
         TOTAL=$((TOTAL + 1))
         NUM_INC=$(mcli FT.SEARCH aggidx '@score:[20 40]' LIMIT 0 10 2>&1)
-        HIT_NUM=$(echo "$NUM_INC" | grep -c '^agg:')
+        HIT_NUM=$(echo "$NUM_INC" | grep -c '^agg:' || true)
         if [ "$HIT_NUM" -eq 3 ]; then
             PASS=$((PASS + 1)); echo "  PASS: NUMERIC-01 @score:[20 40] inclusive → 3 keys"
         else
@@ -2091,7 +2214,7 @@ if should_run "vector"; then
         # NUMERIC-02: exclusive bounds — (20 40] → agg:3 agg:4 = 2 keys
         TOTAL=$((TOTAL + 1))
         NUM_EXCL=$(mcli FT.SEARCH aggidx '@score:[(20 40]' LIMIT 0 10 2>&1)
-        HIT_EXCL=$(echo "$NUM_EXCL" | grep -c '^agg:')
+        HIT_EXCL=$(echo "$NUM_EXCL" | grep -c '^agg:' || true)
         if [ "$HIT_EXCL" -eq 2 ]; then
             PASS=$((PASS + 1)); echo "  PASS: NUMERIC-02 @score:[(20 40] exclusive-low → 2 keys"
         else
@@ -2101,7 +2224,7 @@ if should_run "vector"; then
         # NUMERIC-03: full range [-inf +inf] → all 7 keys
         TOTAL=$((TOTAL + 1))
         NUM_FULL=$(mcli FT.SEARCH aggidx '@score:[-inf +inf]' LIMIT 0 20 2>&1)
-        HIT_FULL=$(echo "$NUM_FULL" | grep -c '^agg:')
+        HIT_FULL=$(echo "$NUM_FULL" | grep -c '^agg:' || true)
         if [ "$HIT_FULL" -eq 7 ]; then
             PASS=$((PASS + 1)); echo "  PASS: NUMERIC-03 @score:[-inf +inf] → 7 keys"
         else
@@ -2112,7 +2235,7 @@ if should_run "vector"; then
         # agg:1..3 (scores 10,20,30) all open → cnt=3 on status=open only
         TOTAL=$((TOTAL + 1))
         NUM_AGG=$(mcli FT.AGGREGATE aggidx '@score:[10 30]' GROUPBY 1 @status REDUCE COUNT 0 AS cnt 2>&1)
-        if echo "$NUM_AGG" | grep -Pzo "(?s)open.*3" >/dev/null; then
+        if echo "$NUM_AGG" | spans "open.*3"; then
             PASS=$((PASS + 1)); echo "  PASS: NUMERIC-04 FT.AGGREGATE @score:[10 30] GROUPBY status (open=3)"
         else
             FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-04 expected open=3, got: $NUM_AGG"
@@ -2152,18 +2275,22 @@ if should_run "vector"; then
     pkill -f 'moon --port 6411' 2>/dev/null || true
     pkill -f 'moon --port 6414' 2>/dev/null || true
     sleep 1
-    ./target/release/moon --port 6411 --shards 1 --protected-mode no > /tmp/moon-6411.log 2>&1 &
-    ./target/release/moon --port 6414 --shards 4 --protected-mode no > /tmp/moon-6414.log 2>&1 &
+    # Fresh dirs here too -- these two would otherwise reload `nidx` from the
+    # repo root and report a cross-shard "match" that came from disk.
+    N7_DIR1=$(mktemp -d "${TMPDIR:-/tmp}/moon-n7-1.XXXXXX")
+    N7_DIR2=$(mktemp -d "${TMPDIR:-/tmp}/moon-n7-4.XXXXXX")
+    ./target/release/moon --port 6411 --shards 1 --protected-mode no --dir "$N7_DIR1" --disk-free-min-pct 0 > /tmp/moon-6411.log 2>&1 &
+    ./target/release/moon --port 6414 --shards 4 --protected-mode no --dir "$N7_DIR2" --disk-free-min-pct 0 > /tmp/moon-6414.log 2>&1 &
     sleep 2
     for PORT in 6411 6414; do
-        redis-cli -p $PORT FT.CREATE nidx ON HASH PREFIX 1 n: SCHEMA status TAG score NUMERIC > /dev/null 2>&1
+        redis-cli -p $PORT FT.CREATE nidx ON HASH PREFIX 1 n: SCHEMA status TAG score NUMERIC > /dev/null 2>&1 || true
         for i in $(seq 0 19); do
-            redis-cli -p $PORT HSET n:$i status open score $i > /dev/null 2>&1
+            redis-cli -p $PORT HSET n:$i status open score $i > /dev/null 2>&1 || true
         done
     done
     sleep 1
-    N1=$(redis-cli -p 6411 FT.SEARCH nidx '@score:[5 15]' LIMIT 0 100 2>&1 | grep '^n:' | sort)
-    N4=$(redis-cli -p 6414 FT.SEARCH nidx '@score:[5 15]' LIMIT 0 100 2>&1 | grep '^n:' | sort)
+    N1=$(redis-cli -p 6411 FT.SEARCH nidx '@score:[5 15]' LIMIT 0 100 2>&1 | grep '^n:' | sort || true)
+    N4=$(redis-cli -p 6414 FT.SEARCH nidx '@score:[5 15]' LIMIT 0 100 2>&1 | grep '^n:' | sort || true)
     if [ "$N1" = "$N4" ] && [ -n "$N1" ]; then
         COUNT_N=$(echo "$N1" | wc -l | tr -d ' ')
         PASS=$((PASS + 1)); echo "  PASS: NUMERIC-07 1-shard and 4-shard return identical keys for @score:[5 15] (count=$COUNT_N)"
@@ -2304,7 +2431,7 @@ if should_run "temporal"; then
     mcli GRAPH.CREATE testgraph >/dev/null 2>&1
     ADDNODE_OUT=$(mcli GRAPH.ADDNODE testgraph :TestLabel 2>&1)
     # Extract numeric node_id from ADDNODE response (format: "(integer) <id>" or just "<id>")
-    NODE_ID=$(echo "$ADDNODE_OUT" | grep -oE '[0-9]+' | head -1)
+    NODE_ID=$(echo "$ADDNODE_OUT" | grep -oE '[0-9]+' | head -1 || true)
     if [[ -n "$NODE_ID" ]]; then
         TOTAL=$((TOTAL + 1))
         INV_OK=$(mcli TEMPORAL.INVALIDATE "$NODE_ID" NODE testgraph 2>&1)
@@ -2406,10 +2533,10 @@ print(f"ERR_MSG={err_msg}")
 PYEOF
     )
 
-    AS_OF_COUNT=$(echo "$FT_ASOF_OUT" | grep '^AS_OF_COUNT=' | cut -d= -f2)
-    AS_OF_KEYS=$(echo "$FT_ASOF_OUT" | grep '^AS_OF_KEYS=' | cut -d= -f2)
-    LATEST_COUNT=$(echo "$FT_ASOF_OUT" | grep '^LATEST_COUNT=' | cut -d= -f2)
-    ERR_MSG=$(echo "$FT_ASOF_OUT" | grep '^ERR_MSG=' | cut -d= -f2-)
+    AS_OF_COUNT=$(echo "$FT_ASOF_OUT" | grep '^AS_OF_COUNT=' | cut -d= -f2 || true)
+    AS_OF_KEYS=$(echo "$FT_ASOF_OUT" | grep '^AS_OF_KEYS=' | cut -d= -f2 || true)
+    LATEST_COUNT=$(echo "$FT_ASOF_OUT" | grep '^LATEST_COUNT=' | cut -d= -f2 || true)
+    ERR_MSG=$(echo "$FT_ASOF_OUT" | grep '^ERR_MSG=' | cut -d= -f2- || true)
 
     TOTAL=$((TOTAL + 1))
     if [[ "$AS_OF_COUNT" == "1" && "$AS_OF_KEYS" == "as:1" ]]; then
@@ -2481,10 +2608,10 @@ print(f"POST_KEYS={','.join(sorted(post_keys))}")
 PYEOF
     )
 
-    INSIDE_COUNT=$(echo "$FT_TXN_OUT" | grep '^INSIDE_COUNT=' | cut -d= -f2)
-    INSIDE_KEYS=$(echo "$FT_TXN_OUT" | grep '^INSIDE_KEYS=' | cut -d= -f2)
-    POST_COUNT=$(echo "$FT_TXN_OUT" | grep '^POST_COUNT=' | cut -d= -f2)
-    POST_KEYS=$(echo "$FT_TXN_OUT" | grep '^POST_KEYS=' | cut -d= -f2)
+    INSIDE_COUNT=$(echo "$FT_TXN_OUT" | grep '^INSIDE_COUNT=' | cut -d= -f2 || true)
+    INSIDE_KEYS=$(echo "$FT_TXN_OUT" | grep '^INSIDE_KEYS=' | cut -d= -f2 || true)
+    POST_COUNT=$(echo "$FT_TXN_OUT" | grep '^POST_COUNT=' | cut -d= -f2 || true)
+    POST_KEYS=$(echo "$FT_TXN_OUT" | grep '^POST_KEYS=' | cut -d= -f2 || true)
 
     # Inside TXN: must see tx:a (pre-TXN) but NOT tx:b (post-snapshot).
     TOTAL=$((TOTAL + 1))
@@ -2521,9 +2648,9 @@ if should_run "temporal"; then
     # rate the older direct edge pays lambda * age_seconds and the fresh
     # detour wins. Real wall-clock sleep creates the age gap.
     mcli GRAPH.CREATE decayg >/dev/null 2>&1
-    DECAY_A=$(mcli GRAPH.ADDNODE decayg Person name A 2>&1 | grep -oE '[0-9]+' | head -1)
-    DECAY_B=$(mcli GRAPH.ADDNODE decayg Person name B 2>&1 | grep -oE '[0-9]+' | head -1)
-    DECAY_C=$(mcli GRAPH.ADDNODE decayg Person name C 2>&1 | grep -oE '[0-9]+' | head -1)
+    DECAY_A=$(mcli GRAPH.ADDNODE decayg Person name A 2>&1 | grep -oE '[0-9]+' | head -1 || true)
+    DECAY_B=$(mcli GRAPH.ADDNODE decayg Person name B 2>&1 | grep -oE '[0-9]+' | head -1 || true)
+    DECAY_C=$(mcli GRAPH.ADDNODE decayg Person name C 2>&1 | grep -oE '[0-9]+' | head -1 || true)
 
     mcli GRAPH.ADDEDGE decayg "$DECAY_A" "$DECAY_C" KNOWS WEIGHT 1.0 >/dev/null 2>&1
     sleep 2
