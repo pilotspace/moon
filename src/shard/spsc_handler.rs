@@ -773,6 +773,17 @@ pub(crate) fn handle_shard_message_shared(
                 if cmd.eq_ignore_ascii_case(b"DEBUG") {
                     if let Some(sub) = args.first() {
                         if let Some(sub_bytes) = crate::command::helpers::extract_bytes(sub) {
+                            // The cross-shard fan-out leg (moon#636). Answers
+                            // this shard's UNFINALISED per-db partials. Must be
+                            // intercepted here, not in `debug()`: the partials
+                            // span every database and `cmd_dispatch` hands the
+                            // command a single one.
+                            if sub_bytes.eq_ignore_ascii_case(b"DIGEST-SHARD") {
+                                let frame =
+                                    crate::command::server_admin::debug_digest_shard_partials();
+                                let _ = reply_tx.send(frame);
+                                return;
+                            }
                             if sub_bytes.eq_ignore_ascii_case(b"RECLAMATION") {
                                 let frame = crate::shard::slice::with_shard(|s| {
                                     crate::command::server_admin::debug_reclamation(

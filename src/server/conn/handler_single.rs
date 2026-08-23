@@ -1756,6 +1756,51 @@ pub async fn handle_connection(
                             }
                         }
 
+                        // --- DEBUG DIGEST (moon#636) ---
+                        // Placement is load-bearing in TWO directions.
+                        //
+                        // BELOW the ACL gate above: DEBUG is an admin command,
+                        // and a dataset fingerprint is exactly the kind of
+                        // thing a restricted user must not be able to read. An
+                        // intercept above the gate would answer before NOPERM
+                        // was ever considered.
+                        //
+                        // ABOVE the per-command dispatch that takes a read
+                        // guard on the selected database: this walks EVERY
+                        // database, and re-locking the selected one while its
+                        // own guard is held can deadlock -- `parking_lot`'s
+                        // RwLock is not reentrant, so a writer queued between
+                        // the two reads blocks the second forever. Locking each
+                        // db in turn from here is the shape INFO's keyspace
+                        // walk already uses.
+                        //
+                        // This handler is the embedded / non-sharded server, so
+                        // the local databases ARE the whole dataset.
+                        if cmd.eq_ignore_ascii_case(b"DEBUG") {
+                            if let Some(sub) = cmd_args.first() {
+                                if let Some(sb) = crate::command::helpers::extract_bytes(sub) {
+                                    if sb.eq_ignore_ascii_case(b"DIGEST") {
+                                        let mut partials = Vec::new();
+                                        for (idx, d) in db.iter().enumerate() {
+                                            let g = d.read();
+                                            let now_ms = g.now_ms();
+                                            if let Some(p) =
+                                                crate::command::debug_digest::db_partial(&g, now_ms)
+                                            {
+                                                partials.push((idx, p));
+                                            }
+                                        }
+                                        let digest =
+                                            crate::command::debug_digest::finalize_dataset(partials);
+                                        responses.push(Frame::SimpleString(bytes::Bytes::from(
+                                            crate::command::debug_digest::to_hex(&digest),
+                                        )));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
                         // === RESET ===
                         // Shares `try_handle_reset` with the other two handlers
                         // rather than re-deriving "default state" here, so the

@@ -292,6 +292,142 @@ fn fold_value(d: &mut Digest, value: &RedisValueRef<'_>) {
     }
 }
 
+/// The digest contribution of one database, or `None` if it holds no keys.
+///
+/// `None` is not the same as `Some(ZERO)`: redis SKIPS empty databases when
+/// folding the final digest, and mixing the index of one would change the
+/// answer. A populated db whose partial happens to xor to zero must still be
+/// mixed, so emptiness is tracked explicitly rather than inferred.
+///
+/// # Both planes
+///
+/// Walks the hot table AND the cold tier. A key that eviction spilled to disk
+/// is still part of the dataset, and a digest that omitted it would report a
+/// server as differing from its own replica purely because the two had
+/// evicted different keys — moon#610's class, in a command where it would be
+/// nearly impossible to attribute.
+///
+/// Plane-PARTITIONED, in the style of `KEYS`: the hot loop uses the hot-only
+/// accessor on purpose and the cold plane is enumerated separately, so a
+/// tiered key is counted exactly once. Using a read-through accessor in the
+/// hot loop would double-count every tiered key.
+///
+/// # Cost
+///
+/// O(keys), and each COLD key costs a synchronous disk read to materialise
+/// its value. That is inherent — the digest is defined over values — and is
+/// why this is an admin command rather than something to call in a loop.
+/// It does not allocate per key: both walks borrow from the tables rather
+/// than snapshotting the key set, so digesting a large keyspace does not
+/// transiently double its key memory.
+pub fn db_partial(db: &crate::storage::Database, now_ms: u64) -> Option<Digest> {
+    let mut acc = ZERO;
+    let mut any = false;
+
+    for k in db.keys() {
+        if let Some(entry) = db.get_if_alive(k.as_bytes(), now_ms) {
+            accumulate_key(&mut acc, k.as_bytes(), entry);
+            any = true;
+        }
+    }
+
+    for key in db.cold_only_keys(now_ms) {
+        if let Some(view) = db.get_if_alive_any_plane(key, now_ms) {
+            accumulate_key(&mut acc, key, &view);
+            any = true;
+        }
+    }
+
+    if any { Some(acc) } else { None }
+}
+
+/// Every database on THIS shard that holds at least one key.
+///
+/// # Must not run inside a `with_shard_db` closure
+///
+/// `DEBUG DIGEST` spans EVERY database, but a command handler is handed one
+/// `&mut Database` and cannot reach its siblings — and re-entering the shard
+/// slice from inside that borrow panics. So this is called from the intercept
+/// sites (which hold no borrow), never from `debug()`. The `DEBUG RECLAMATION`
+/// intercept in `spsc_handler` establishes the same pattern.
+pub fn local_partials() -> Vec<(usize, Digest)> {
+    crate::shard::slice::with_shard(|slice| {
+        let mut out = Vec::new();
+        for (idx, db) in slice.databases.iter().enumerate() {
+            let now_ms = db.now_ms();
+            if let Some(partial) = db_partial(db, now_ms) {
+                out.push((idx, partial));
+            }
+        }
+        out
+    })
+}
+
+/// Wire form for one shard's partials: a flat array of
+/// `[db_index, hex_digest, db_index, hex_digest, ...]`.
+///
+/// Hex rather than raw bytes so a partial is readable in a packet capture and
+/// survives any layer that assumes text; this is a once-per-DEBUG-DIGEST
+/// message, so the encoding cost is irrelevant next to the walk itself.
+pub fn partials_to_frame(partials: &[(usize, Digest)]) -> crate::protocol::Frame {
+    use crate::protocol::Frame;
+    let mut out = Vec::with_capacity(partials.len() * 2);
+    for (db, d) in partials {
+        out.push(Frame::Integer(*db as i64));
+        out.push(Frame::BulkString(bytes::Bytes::from(to_hex(d))));
+    }
+    Frame::Array(out.into())
+}
+
+/// Inverse of [`partials_to_frame`]. `None` on any malformed reply — a shard
+/// that answered something unexpected must not be silently counted as empty,
+/// which would produce a confidently wrong digest.
+pub fn partials_from_frame(frame: &crate::protocol::Frame) -> Option<Vec<(usize, Digest)>> {
+    use crate::protocol::Frame;
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    if items.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(items.len() / 2);
+    for pair in items.chunks_exact(2) {
+        let Frame::Integer(db) = pair[0] else {
+            return None;
+        };
+        let Frame::BulkString(hex) = &pair[1] else {
+            return None;
+        };
+        if hex.len() != DIGEST_LEN * 2 || db < 0 {
+            return None;
+        }
+        let mut d = ZERO;
+        for (i, byte) in d.iter_mut().enumerate() {
+            let s = std::str::from_utf8(&hex[i * 2..i * 2 + 2]).ok()?;
+            *byte = u8::from_str_radix(s, 16).ok()?;
+        }
+        out.push((db as usize, d));
+    }
+    Some(out)
+}
+
+/// Merge partials from several shards into one per-db view.
+///
+/// Within a db every key contributes by XOR, so shard partials for the SAME db
+/// simply xor together. A db present on any shard is present in the result —
+/// "non-empty" is a global question, and a db empty here but populated on the
+/// next shard must still be folded.
+pub fn merge_partials(all: impl IntoIterator<Item = (usize, Digest)>) -> Vec<(usize, Digest)> {
+    let mut by_db: std::collections::BTreeMap<usize, Digest> = std::collections::BTreeMap::new();
+    for (db, partial) in all {
+        let slot = by_db.entry(db).or_insert(ZERO);
+        for (s, p) in slot.iter_mut().zip(partial.iter()) {
+            *s ^= *p;
+        }
+    }
+    by_db.into_iter().collect()
+}
+
 /// Render a digest as the 40 lowercase hex characters redis replies with.
 pub fn to_hex(d: &Digest) -> String {
     let mut s = String::with_capacity(DIGEST_LEN * 2);
@@ -577,6 +713,99 @@ mod tests {
             to_hex(&finalize_dataset(vec![(0, merged)])),
             to_hex(&finalize_dataset(vec![(0, whole)]))
         );
+    }
+
+    #[test]
+    fn partials_survive_the_wire_form() {
+        let mut a = ZERO;
+        accumulate_key(&mut a, b"k0", &string_entry("v0"));
+        let mut b = ZERO;
+        accumulate_key(&mut b, b"k3", &string_entry("v3"));
+        let partials = vec![(0usize, a), (3usize, b)];
+        let frame = partials_to_frame(&partials);
+        assert_eq!(partials_from_frame(&frame), Some(partials));
+    }
+
+    #[test]
+    fn a_malformed_partials_reply_is_rejected_not_read_as_empty() {
+        use crate::protocol::Frame;
+        // A shard that answered something unexpected must NOT be counted as
+        // "no keys" -- that silently drops its whole contribution and yields a
+        // confidently wrong digest.
+        assert_eq!(partials_from_frame(&Frame::Integer(1)), None);
+        // Odd length.
+        assert_eq!(
+            partials_from_frame(&Frame::Array(vec![Frame::Integer(0)].into())),
+            None
+        );
+        // Digest not 40 hex chars.
+        assert_eq!(
+            partials_from_frame(&Frame::Array(
+                vec![
+                    Frame::Integer(0),
+                    Frame::BulkString(Bytes::from_static(b"beef")),
+                ]
+                .into()
+            )),
+            None
+        );
+        // Right length, not hex.
+        assert_eq!(
+            partials_from_frame(&Frame::Array(
+                vec![
+                    Frame::Integer(0),
+                    Frame::BulkString(Bytes::from_static(&[b'z'; 40])),
+                ]
+                .into()
+            )),
+            None
+        );
+        // Negative db index.
+        assert_eq!(
+            partials_from_frame(&Frame::Array(
+                vec![
+                    Frame::Integer(-1),
+                    Frame::BulkString(Bytes::from_static(&[b'0'; 40])),
+                ]
+                .into()
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn merging_shard_partials_equals_the_single_shard_answer() {
+        // The property the whole cross-shard design rests on, stated end to
+        // end: split the same keys across two shards, merge, and the final
+        // digest must equal the one-shard digest of all of them.
+        let a = string_entry("va");
+        let b = string_entry("vb");
+        let c = string_entry("vc");
+
+        let mut whole = ZERO;
+        accumulate_key(&mut whole, b"ka", &a);
+        accumulate_key(&mut whole, b"kb", &b);
+        accumulate_key(&mut whole, b"kc", &c);
+        let single = to_hex(&finalize_dataset(vec![(0, whole)]));
+
+        let mut s0 = ZERO;
+        accumulate_key(&mut s0, b"kc", &c);
+        let mut s1 = ZERO;
+        accumulate_key(&mut s1, b"ka", &a);
+        accumulate_key(&mut s1, b"kb", &b);
+        let merged = merge_partials(vec![(0, s0), (0, s1)]);
+        assert_eq!(to_hex(&finalize_dataset(merged)), single);
+    }
+
+    #[test]
+    fn a_db_populated_only_on_one_shard_still_counts() {
+        // "Non-empty" is a GLOBAL question. Shard 0 has nothing in db2; shard 1
+        // does. The merge must keep db2, or the digest silently omits it.
+        let mut only_on_shard1 = ZERO;
+        accumulate_key(&mut only_on_shard1, b"k2", &string_entry("v2"));
+        let merged = merge_partials(vec![(0, ZERO), (2, only_on_shard1)]);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|(db, _)| *db == 2));
     }
 
     #[test]
