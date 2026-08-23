@@ -190,6 +190,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as an answer. That shard also logs a warning, because cold keys with no manifest will not
   survive a restart — `rebuild_from_manifest` is the only thing that re-indexes them.
 ### Fixed
+- **A truncated `FT.CREATE` no longer aborts the server** (#681). `FT.CREATE idx ON HASH
+  PREFIX 1 d: SCHEMA v VECTOR HNSW` — the argument list cut off right after the algorithm
+  keyword — indexed one past the end of argv and panicked. The panic ran on a shard
+  thread, and moon deliberately escalates a shard panic to a whole-process abort rather
+  than serve on with a dead shard, so one short line from any client took the entire
+  server down: every database, every other connection. No auth and no large payload
+  required.
+
+  The parameter loop below the fault already guarded both ends
+  (`*pos + 1 < param_end && *pos + 1 < args.len()`), so the value read for every keyword
+  was safe; the parameter *count* read was the single unguarded one. That was measured,
+  not assumed — six truncation shapes were probed against freshly spawned,
+  listener-PID-checked servers, and only this one killed the process. It reports
+  `ERR invalid param count`, the same error an unparseable count already produced, so the
+  two ways of failing to supply a count are indistinguishable to a client. There is no
+  redis oracle for the string: the `redis-server` checked against has no query engine, so
+  `FT.CREATE` is `unknown command` there.
+
+  `FT.CREATE` argument parsing had **no fuzz target** for its whole life, which is how a
+  one-line remote crash survived in it; `fuzz/fuzz_targets/ft_create_args.rs` now drives
+  the real entry point with arbitrary argv and is listed in both matrices in
+  `fuzz.yml` (an unlisted target never runs — #576).
+
 - **Lua script errors reached the client as an unparseable RESP frame** (#672). mlua's
   `Display` carries a multi-line Lua traceback, and a RESP *simple* error may not contain
   CR or LF anywhere — so every runtime error (`redis.call('INCR', k)` on a string,

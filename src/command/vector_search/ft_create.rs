@@ -547,6 +547,21 @@ fn parse_vector_field_params(args: &[Frame], pos: &mut usize) -> Result<ParsedVe
     }
     *pos += 1;
 
+    // moon#681: `... VECTOR HNSW` with nothing after it left `*pos` at
+    // `args.len()`, and the read below indexed one past the end. That panic
+    // ran on a shard thread, which moon escalates to a process abort -- so a
+    // single truncated line from any client took the whole server down. The
+    // parameter loop further down already guards both ends
+    // (`*pos + 1 < args.len()`); this read was the one that did not.
+    //
+    // The error is the same one an unparseable count gets, so the two ways of
+    // failing to supply a count read identically to a client. There is no
+    // redis oracle to match: the `redis-server` this was checked against has
+    // no query engine, so `FT.CREATE` is `unknown command` there.
+    if *pos >= args.len() {
+        return Err(Frame::Error(Bytes::from_static(b"ERR invalid param count")));
+    }
+
     let num_params = match parse_u32(&args[*pos]) {
         Some(n) => n as usize,
         None => {
@@ -780,4 +795,97 @@ fn parse_vector_field_params(args: &[Frame], pos: &mut usize) -> Result<ParsedVe
         merge_mode,
         keep_raw,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bulk(s: &[u8]) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s))
+    }
+
+    fn err_text(f: &Frame) -> String {
+        match f {
+            Frame::Error(b) => String::from_utf8_lossy(b).into_owned(),
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
+    /// moon#681: `FT.CREATE idx ... SCHEMA v VECTOR HNSW` with nothing after
+    /// the algorithm keyword used to index one past the end and panic. The
+    /// panic was on a shard thread, and moon escalates a shard panic to a
+    /// process abort -- so a single short line from any client took the whole
+    /// server down, every database and every other connection with it.
+    ///
+    /// Before the fix this test does not fail an assertion, it *panics*, which
+    /// is the point: the parser must return an error frame for a truncated
+    /// argument list, never index past the end.
+    #[test]
+    fn truncated_after_the_algorithm_keyword_errors_instead_of_panicking() {
+        let args = vec![bulk(b"HNSW")];
+        let mut pos = 0usize;
+        let Err(err) = parse_vector_field_params(&args, &mut pos) else {
+            panic!("a truncated VECTOR clause must not parse");
+        };
+        assert_eq!(err_text(&err), "ERR invalid param count");
+    }
+
+    /// The neighbouring truncations were already safe -- the parameter loop
+    /// guards `*pos + 1 < args.len()` before every value read -- and this
+    /// pins that, so a future edit to the loop condition cannot quietly
+    /// reopen the same hole one keyword further in.
+    #[test]
+    fn truncations_inside_the_param_list_are_already_bounded() {
+        for tail in [
+            vec![bulk(b"HNSW"), bulk(b"6"), bulk(b"TYPE")],
+            vec![
+                bulk(b"HNSW"),
+                bulk(b"6"),
+                bulk(b"TYPE"),
+                bulk(b"FLOAT32"),
+                bulk(b"DIM"),
+            ],
+            vec![bulk(b"HNSW"), bulk(b"6"), bulk(b"DISTANCE_METRIC")],
+            vec![bulk(b"HNSW"), bulk(b"6"), bulk(b"M")],
+            vec![bulk(b"HNSW"), bulk(b"6"), bulk(b"EF_CONSTRUCTION")],
+            vec![bulk(b"HNSW"), bulk(b"6"), bulk(b"EF_RUNTIME")],
+            vec![bulk(b"HNSW"), bulk(b"6"), bulk(b"COMPACT_THRESHOLD")],
+        ] {
+            let mut pos = 0usize;
+            // Either outcome is fine; not panicking is the assertion.
+            let _ = parse_vector_field_params(&tail, &mut pos);
+        }
+    }
+
+    /// A non-numeric count still reports the count, not something further on.
+    #[test]
+    fn a_non_numeric_param_count_is_reported_as_such() {
+        let args = vec![bulk(b"HNSW"), bulk(b"notanint")];
+        let mut pos = 0usize;
+        let Err(err) = parse_vector_field_params(&args, &mut pos) else {
+            panic!("a non-numeric param count must not parse");
+        };
+        assert_eq!(err_text(&err), "ERR invalid param count");
+    }
+
+    /// The pre-existing guard above the fix: a missing/incorrect algorithm
+    /// keyword keeps its own distinct message, so the two failures stay
+    /// distinguishable to a client.
+    #[test]
+    fn a_wrong_algorithm_keyword_keeps_its_own_message() {
+        let args = vec![bulk(b"FLAT"), bulk(b"6")];
+        let mut pos = 0usize;
+        let Err(err) = parse_vector_field_params(&args, &mut pos) else {
+            panic!("FLAT is not implemented");
+        };
+        assert_eq!(err_text(&err), "ERR expected HNSW algorithm");
+
+        let empty: Vec<Frame> = vec![];
+        let mut pos = 0usize;
+        let Err(err) = parse_vector_field_params(&empty, &mut pos) else {
+            panic!("an empty argument list must not parse");
+        };
+        assert_eq!(err_text(&err), "ERR expected HNSW algorithm");
+    }
 }
