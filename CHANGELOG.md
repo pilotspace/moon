@@ -93,6 +93,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as an answer. That shard also logs a warning, because cold keys with no manifest will not
   survive a restart — `rebuild_from_manifest` is the only thing that re-indexes them.
 ### Fixed
+- **Lua script errors reached the client as an unparseable RESP frame** (#672). mlua's
+  `Display` carries a multi-line Lua traceback, and a RESP *simple* error may not contain
+  CR or LF anywhere — so every runtime error (`redis.call('INCR', k)` on a string,
+  `error('boom')`, a nil index, an unknown command) produced a frame `redis-cli` rejected
+  with `Bad simple string value`. The client never saw what went wrong. The same frame
+  quoted a moon **source path** (`src/scripting/mod.rs:496:1`) back at the client.
+
+  Three parts, each measured against redis-server 8.6.1:
+
+  1. The frame is now a single line — the traceback's remaining frames say nothing a
+     client can act on, which is what the `NOPERM` arm had always assumed.
+  2. The Lua chunk is **named** (`@user_script`, `@user_function` — the names redis uses),
+     so no moon source path can appear in an error at all.
+  3. A redis error **code** raised by `redis.call` now leads the reply, as it does on
+     redis. `WRONGTYPE`, `OOM`, `NOSCRIPT` and friends were buried behind
+     `ERR Error running script: runtime error: `, so a client testing for `WRONGTYPE`
+     saw a plain `ERR` and could not tell a type clash from a bug. moon already
+     special-cased `NOPERM` and `BUSY` for this reason; the rule is now general, keyed on
+     redis's own error-code *shape* rather than an allowlist that someone must remember
+     to extend.
+
+  `FUNCTION LOAD` carried an independent copy of the same defect and is fixed with the
+  same helper.
 - **`EVALSHA <sha>` with no `numkeys` answered `NOSCRIPT` instead of an arity error**
   (#636). redis rejects on arity (`-3`) before it ever looks the sha up. A client told
   `NOSCRIPT` re-runs `SCRIPT LOAD` and retries the same malformed call — forever.

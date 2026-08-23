@@ -84,7 +84,13 @@ impl LoadError {
                 "ERR Library '{}' already exists",
                 String::from_utf8_lossy(&name)
             ))),
-            LoadError::LuaError(e) => Frame::Error(Bytes::from(format!("ERR {e}"))),
+            // mlua's message can carry a multi-line traceback, and a RESP
+            // simple error may not contain CR or LF — the client would get a
+            // frame it cannot parse (moon#672).
+            LoadError::LuaError(e) => Frame::Error(Bytes::from(format!(
+                "ERR {}",
+                crate::scripting::first_line(&e)
+            ))),
             LoadError::NoFunctions => {
                 Frame::Error(Bytes::from_static(b"ERR No functions registered"))
             }
@@ -433,8 +439,12 @@ impl FunctionRegistry {
             .set("register_function", register_fn)
             .map_err(|e| LoadError::LuaError(e.to_string()))?;
 
-        // Evaluate the library body (everything after shebang)
+        // Evaluate the library body (everything after shebang). NAMED, for
+        // the same reason `run_script` names its chunk: mlua otherwise
+        // defaults the chunk name to this Rust file and line, and quotes a
+        // moon source path back at the client (moon#672).
         lua.load(rest)
+            .set_name("@user_function")
             .exec()
             .map_err(|e| LoadError::LuaError(e.to_string()))?;
 
@@ -621,6 +631,46 @@ pub fn parse_shebang(body: &[u8]) -> Result<(Bytes, &[u8]), LoadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `FUNCTION LOAD` with a broken body hands mlua's error straight to the
+    /// client. mlua's `Display` carries a multi-line traceback, and a RESP
+    /// simple error may not contain CR or LF — same defect as `EVAL`'s
+    /// (moon#672), a second copy in a second file.
+    #[test]
+    fn a_function_load_error_is_one_line_and_names_no_moon_source_path() {
+        let mut reg = FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::disabled());
+        for body in [
+            // A syntax error, and a body that runs but blows up.
+            &b"#!lua name=badlib\nthis is not lua ((("[..],
+            b"#!lua name=badlib2\nerror('boom')",
+            b"#!lua name=badlib3\nlocal x = nil return x.y",
+        ] {
+            let Err(e) = reg.load(body, false) else {
+                panic!(
+                    "expected a load failure for {}",
+                    String::from_utf8_lossy(body)
+                );
+            };
+            let Frame::Error(f) = e.into_frame() else {
+                panic!("a load failure must frame as an error");
+            };
+            assert!(
+                !f.contains(&b'\n') && !f.contains(&b'\r'),
+                "error frame carries a newline, which no RESP simple error may: {:?}",
+                String::from_utf8_lossy(&f)
+            );
+            assert!(
+                !f.windows(3).any(|w| w == b".rs"),
+                "error frame leaks a moon source path: {:?}",
+                String::from_utf8_lossy(&f)
+            );
+            assert!(
+                f.len() > b"ERR ".len(),
+                "error frame is empty: {:?}",
+                String::from_utf8_lossy(&f)
+            );
+        }
+    }
 
     #[test]
     fn test_parse_shebang_basic() {

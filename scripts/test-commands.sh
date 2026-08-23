@@ -224,6 +224,25 @@ assert_moon_contains() {
     fi
 }
 
+# The negative form: moon's reply must NOT contain the string. Used for
+# absence claims (moon#672: no reply may quote a moon source path), where the
+# positive form has nothing stable to match against.
+assert_moon_not_contains() {
+    local desc="$1" forbidden="$2"
+    shift 2
+    TOTAL=$((TOTAL + 1))
+    local moon_out
+    moon_out=$(mcli "$@" 2>&1)
+    if echo "$moon_out" | grep -qF "$forbidden"; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $desc (reply contains forbidden substring '$forbidden')"
+        echo "    CMD:  redis-cli $*"
+        echo "    GOT:  $(echo "$moon_out" | head -3)"
+    else
+        PASS=$((PASS + 1))
+    fi
+}
+
 # As above, but the expectation must be a WHOLE LINE of the reply.
 #
 # `COMMAND LIST` is the case that needs it: since moon#635 publishes
@@ -1102,6 +1121,18 @@ if should_run "scripting"; then
         EVAL_RO "return redis.call('SET', KEYS[1], 'x')" 1 lua:k1
     # ...and refused means the value did NOT change.
     assert_match "EVAL_RO write did not land" GET lua:k1
+
+    # moon#672: the redis error CODE raised inside a script must LEAD the reply
+    # -- it is the part a client matches on. moon buried it behind
+    # `ERR Error running script: runtime error: `, so a client could not tell a
+    # type clash from a bug. Not `assert_match`: redis appends its own
+    # ` script: <sha>, on @user_script:N.` tail, so only the head is parity.
+    mcli DEL lua:wt >/dev/null 2>&1; mcli LPUSH lua:wt a >/dev/null 2>&1
+    assert_moon_contains "script error leads with WRONGTYPE" "WRONGTYPE" \
+        EVAL "return redis.call('GET', KEYS[1])" 1 lua:wt
+    # ...and no error quotes a moon source path back at the client.
+    assert_moon_not_contains "script error leaks no moon source path" ".rs" \
+        EVAL "error('boom')" 0
 
     # moon#515: Redis caches an EVAL'd body server-wide, so EVAL-then-EVALSHA
     # is a supported idiom. moon cached it only on the executing shard, so at
