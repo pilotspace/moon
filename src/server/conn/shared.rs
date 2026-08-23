@@ -1629,7 +1629,9 @@ fn is_inline_intercepted(cmd: &[u8]) -> bool {
         // Lua and functions read and write real keys through the interceptor,
         // never through routing.
         (4, b'e') => cmd.eq_ignore_ascii_case(b"EVAL"),
-        (7, b'e') => cmd.eq_ignore_ascii_case(b"EVALSHA"),
+        // `EVAL_RO` is also 7 bytes, so this arm answers for both.
+        (7, b'e') => cmd.eq_ignore_ascii_case(b"EVALSHA") || cmd.eq_ignore_ascii_case(b"EVAL_RO"),
+        (10, b'e') => cmd.eq_ignore_ascii_case(b"EVALSHA_RO"),
         (5, b'f') => cmd.eq_ignore_ascii_case(b"FCALL"),
         (8, b'f') => cmd.eq_ignore_ascii_case(b"FCALL_RO") || cmd.eq_ignore_ascii_case(b"FUNCTION"),
         // SWAPDB exchanges whole databases across every shard.

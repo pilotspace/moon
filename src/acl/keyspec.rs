@@ -444,7 +444,10 @@ fn movable_shape(cmd: &[u8]) -> Option<Movable> {
         // A script may write any key it was handed; only the `_RO` forms
         // cannot.
         (4, b'e') if cmd.eq_ignore_ascii_case(b"EVAL") => vec1(Write),
+        // 7 bytes is EVALSHA *and* EVAL_RO; they differ in access, not shape.
         (7, b'e') if cmd.eq_ignore_ascii_case(b"EVALSHA") => vec1(Write),
+        (7, b'e') if cmd.eq_ignore_ascii_case(b"EVAL_RO") => vec1(Read),
+        (10, b'e') if cmd.eq_ignore_ascii_case(b"EVALSHA_RO") => vec1(Read),
         (5, b'f') if cmd.eq_ignore_ascii_case(b"FCALL") => vec1(Write),
         (8, b'f') if cmd.eq_ignore_ascii_case(b"FCALL_RO") => vec1(Read),
         // <cmd> dest numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...]
@@ -1070,6 +1073,7 @@ mod tests {
             "CONFIG",
             "ACL",
             "SLOWLOG",
+            "MODULE",
             "MONITOR",
             "HOTKEYS",
             "DEBUG",

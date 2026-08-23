@@ -184,6 +184,7 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "HINCRBY" => CommandMeta { name: "HINCRBY", arity: 4, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HINCRBYFLOAT" => CommandMeta { name: "HINCRBYFLOAT", arity: 4, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HRANDFIELD" => CommandMeta { name: "HRANDFIELD", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HSTRLEN" => CommandMeta { name: "HSTRLEN", arity: 3, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     // HEXPIRE-family write: min 6 args = CMD key when FIELDS numfields field
     "HEXPIRE" => CommandMeta { name: "HEXPIRE", arity: -6, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HPEXPIRE" => CommandMeta { name: "HPEXPIRE", arity: -6, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
@@ -413,6 +414,7 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     // `cdg1_registry_sweep_no_unknowns` now enumerates this table with NO
     // waiver list, so a registered-but-unreachable command fails the suite.
     "MEMORY" => CommandMeta { name: "MEMORY", arity: -2, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
+    "MODULE" => CommandMeta { name: "MODULE", arity: -2, flags: CommandFlags::NONE, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "FLUSHDB" => CommandMeta { name: "FLUSHDB", arity: -1, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },
     "FLUSHALL" => CommandMeta { name: "FLUSHALL", arity: -1, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },
     "SWAPDB" => CommandMeta { name: "SWAPDB", arity: 3, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },
@@ -434,6 +436,11 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     // ---- Scripting commands ----
     "EVAL" => CommandMeta { name: "EVAL", arity: -3, flags: CommandFlags(CommandFlags::NOSCRIPT.0 | CommandFlags::MAY_REPLICATE.0 | CommandFlags::NO_MANDATORY_KEYS.0), first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
     "EVALSHA" => CommandMeta { name: "EVALSHA", arity: -3, flags: CommandFlags(CommandFlags::NOSCRIPT.0 | CommandFlags::MAY_REPLICATE.0 | CommandFlags::NO_MANDATORY_KEYS.0), first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
+    // The `_RO` twins carry READONLY where their parents carry MAY_REPLICATE:
+    // a read-only script emits nothing to replicate, and the flag is what ACL
+    // and the read-only-replica gate read.
+    "EVAL_RO" => CommandMeta { name: "EVAL_RO", arity: -3, flags: CommandFlags(CommandFlags::READONLY.0 | CommandFlags::NOSCRIPT.0 | CommandFlags::NO_MANDATORY_KEYS.0), first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
+    "EVALSHA_RO" => CommandMeta { name: "EVALSHA_RO", arity: -3, flags: CommandFlags(CommandFlags::READONLY.0 | CommandFlags::NOSCRIPT.0 | CommandFlags::NO_MANDATORY_KEYS.0), first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
     "SCRIPT" => CommandMeta { name: "SCRIPT", arity: -2, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
     "FUNCTION" => CommandMeta { name: "FUNCTION", arity: -2, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: SCR },
     "FCALL" => CommandMeta { name: "FCALL", arity: -3, flags: CommandFlags(CommandFlags::WRITE.0 | CommandFlags::NO_MANDATORY_KEYS.0), first_key: 3, last_key: 0, step: 1, acl_categories: SCR },
@@ -897,6 +904,13 @@ pub static SUBCOMMAND_META: phf::Map<&'static str, &'static [SubcommandMeta]> = 
         SubcommandMeta { name: "HELP", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
         SubcommandMeta { name: "STATS", arity: 2, flags: CommandFlags::NONE, acl_categories: SRV },
         SubcommandMeta { name: "USAGE", arity: -3, flags: CommandFlags::READONLY, acl_categories: SRV },
+    ],
+    "MODULE" => &[
+        SubcommandMeta { name: "HELP", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "LIST", arity: 2, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT), acl_categories: AclCategories(SRV.0 | DNG.0) },
+        SubcommandMeta { name: "LOAD", arity: -3, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT), acl_categories: AclCategories(SRV.0 | DNG.0) },
+        SubcommandMeta { name: "LOADEX", arity: -3, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT), acl_categories: AclCategories(SRV.0 | DNG.0) },
+        SubcommandMeta { name: "UNLOAD", arity: 3, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT), acl_categories: AclCategories(SRV.0 | DNG.0) },
     ],
     "OBJECT" => &[
         SubcommandMeta { name: "ENCODING", arity: 3, flags: CommandFlags::READONLY, acl_categories: GEN },

@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`EVAL_RO` and `EVALSHA_RO`** (#636). The read-only script forms clients use to send
+  scripts to a replica, or to prove to themselves that a script cannot write. Previously
+  `-ERR unknown command`.
+
+  Both share `EVAL`/`EVALSHA`'s entire path — parsing, cross-shard routing, the
+  server-wide body fan-out, the caller's ACL — and differ in one bit handed to the
+  executor: a write attempted from the script body is refused at the first `redis.call`,
+  before it lands, not reported after the fact. The refusal machinery already existed
+  for `FCALL_RO`; this wires the `EVAL` family into it. The read-only bit travels with a
+  routed script, so `EVAL_RO` stays read-only when its keys live on another shard — the
+  place it would most easily have been dropped.
+
+  Verified against redis-server 8.6.1 at `--shards 1` **and** `--shards 4`: reads
+  answered, writes refused, the value provably unchanged after each refusal, and plain
+  `EVAL` still writing as the control.
+
+- **`HSTRLEN` and `MODULE`** (#636). Two commands clients reach for that moon answered
+  with `-ERR unknown command`.
+
+  `HSTRLEN key field` returns the length of the field's **value** — not the field name,
+  the one thing an implementation can plausibly get backwards — and `0` for a missing
+  field, a missing key, or an empty value alike, exactly as redis does. It is wired into
+  both the mutable and the read-only dispatch tracks.
+
+  `MODULE` matters because clients feature-detect with `MODULE LIST` on connect, and read
+  `-ERR unknown command` as a broken server. moon has no module loader and is not growing
+  one, so `MODULE LIST` answers the truth — an empty array — while `LOAD`/`LOADEX`/`UNLOAD`
+  are refused in redis's own words (the text a stock redis gives when `enable-module-command`
+  is unset). The container distinguishes redis's three refusals: a bare `MODULE` is a
+  container arity error, `MODULE LIST extra` is a *subcommand* arity error named
+  `module|list`, and anything else is `ERR unknown subcommand '<as sent>'. Try MODULE HELP.`
+
+  Both were diffed command-by-command against redis-server 8.6.1 — 17 probes byte-identical,
+  including ACL enforcement, `COMMAND GETKEYS`, RESP3, and every arity and wrong-type edge.
+  `MODULE LIST` is asserted moon-only rather than by parity: redis 8.x ships the `vectorset`
+  module built in, so its list is legitimately non-empty. Two gaps found while measuring are
+  filed separately, not papered over: unknown container subcommands are queued inside `MULTI`
+  instead of aborting the transaction (#670, systemic across all six containers tested).
 - **`INFO MoonStore` now reports the size and shape of the KV cold tier** (#656).
   The whole `# MoonStore` section was one boolean, `disk_offload_enabled`, while the cold
   tier was the single largest consumer in the data directory. On the instance that motivated
@@ -55,6 +93,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as an answer. That shard also logs a warning, because cold keys with no manifest will not
   survive a restart — `rebuild_from_manifest` is the only thing that re-indexes them.
 ### Fixed
+- **`EVALSHA <sha>` with no `numkeys` answered `NOSCRIPT` instead of an arity error**
+  (#636). redis rejects on arity (`-3`) before it ever looks the sha up. A client told
+  `NOSCRIPT` re-runs `SCRIPT LOAD` and retries the same malformed call — forever.
 - **`MQ POP` no longer strands messages it claimed but never returned** (#652).
   `MQ POP <key> COUNT <n>` asks `read_group_new` for `n + max_delivery_count`
   entries so that dead letters do not consume the caller's budget, then returns

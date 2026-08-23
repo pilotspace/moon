@@ -477,8 +477,18 @@ pub(crate) fn handle_shard_message_shared(
                 // without this a routed script would come back as an unknown
                 // command. Intercepted before cmd_dispatch for the same reason
                 // the FT. block below is.
-                let is_plain_eval = cmd.eq_ignore_ascii_case(b"EVAL");
-                if is_plain_eval || cmd.eq_ignore_ascii_case(b"EVALSHA") {
+                // The routed name still carries the `_RO` suffix, and this is
+                // the only place a cross-shard script learns which variant it
+                // is: dropping the suffix here would make `EVAL_RO` writable
+                // the moment its keys landed on another shard.
+                let read_only =
+                    cmd.eq_ignore_ascii_case(b"EVAL_RO") || cmd.eq_ignore_ascii_case(b"EVALSHA_RO");
+                let is_plain_eval =
+                    cmd.eq_ignore_ascii_case(b"EVAL") || cmd.eq_ignore_ascii_case(b"EVAL_RO");
+                if is_plain_eval
+                    || cmd.eq_ignore_ascii_case(b"EVALSHA")
+                    || cmd.eq_ignore_ascii_case(b"EVALSHA_RO")
+                {
                     let Some(rt) = lua_rt else {
                         let _ = reply_tx.send(crate::protocol::Frame::Error(
                             bytes::Bytes::from_static(
@@ -507,6 +517,7 @@ pub(crate) fn handle_shard_message_shared(
                                 db_idx,
                                 db_count,
                                 &script_acl,
+                                read_only,
                             )
                         } else {
                             crate::scripting::handle_evalsha(
@@ -519,6 +530,7 @@ pub(crate) fn handle_shard_message_shared(
                                 db_idx,
                                 db_count,
                                 &script_acl,
+                                read_only,
                             )
                         }
                     });

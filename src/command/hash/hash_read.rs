@@ -148,6 +148,33 @@ pub fn hlen(db: &mut Database, args: &[Frame]) -> Frame {
     }
 }
 
+/// HSTRLEN key field
+///
+/// The string length of the value stored at `field`, or 0 when the field, the
+/// key, or the value itself is empty. redis does not distinguish those three
+/// and neither do we — there is no nil reply on this command (moon#636).
+pub fn hstrlen(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.len() != 2 {
+        return err_wrong_args("HSTRLEN");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.as_ref(),
+        None => return err_wrong_args("HSTRLEN"),
+    };
+    let field = match extract_bytes(&args[1]) {
+        Some(f) => f,
+        None => return err_wrong_args("HSTRLEN"),
+    };
+    let now_ms = db.now_ms();
+    match db.get_hash_ref_if_alive(key, now_ms) {
+        // The VALUE's length, not the field name's — the one thing an
+        // implementation can plausibly get backwards.
+        Ok(Some(href)) => Frame::Integer(href.get_field(field).map_or(0, |v| v.len() as i64)),
+        Ok(None) => Frame::Integer(0),
+        Err(e) => e,
+    }
+}
+
 /// HKEYS key
 ///
 /// Returns all live field names in the hash. Expired fields are omitted.
@@ -314,6 +341,26 @@ pub fn hget_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             None => Frame::Null,
         },
         Ok(None) => Frame::Null,
+        Err(e) => e,
+    }
+}
+
+/// HSTRLEN (read-only twin).
+pub fn hstrlen_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 2 {
+        return err_wrong_args("HSTRLEN");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.as_ref(),
+        None => return err_wrong_args("HSTRLEN"),
+    };
+    let field = match extract_bytes(&args[1]) {
+        Some(f) => f,
+        None => return err_wrong_args("HSTRLEN"),
+    };
+    match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => Frame::Integer(href.get_field(field).map_or(0, |v| v.len() as i64)),
+        Ok(None) => Frame::Integer(0),
         Err(e) => e,
     }
 }

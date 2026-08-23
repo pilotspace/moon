@@ -215,7 +215,11 @@ pub(super) async fn try_handle_evalsha(
     ctx: &ConnectionContext,
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
-    if !cmd.eq_ignore_ascii_case(b"EVALSHA") {
+    // `EVALSHA_RO` is `EVALSHA` with writes refused, and shares every step
+    // below — resolving the caller, routing, the cached body. The ONE
+    // difference is the flag handed to the executor.
+    let read_only = cmd.eq_ignore_ascii_case(b"EVALSHA_RO");
+    if !read_only && !cmd.eq_ignore_ascii_case(b"EVALSHA") {
         return false;
     }
     // moon#569: resolve the caller ONCE per script, then let every inner
@@ -246,6 +250,7 @@ pub(super) async fn try_handle_evalsha(
             conn.selected_db,
             db_count,
             &script_acl,
+            read_only,
         )
     });
     responses.push(response);
@@ -265,7 +270,9 @@ pub(super) async fn try_handle_eval(
     shutdown: &crate::runtime::cancel::CancellationToken,
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
-    if !cmd.eq_ignore_ascii_case(b"EVAL") {
+    // `EVAL_RO` — see `try_handle_evalsha`.
+    let read_only = cmd.eq_ignore_ascii_case(b"EVAL_RO");
+    if !read_only && !cmd.eq_ignore_ascii_case(b"EVAL") {
         return false;
     }
     // moon#515: Redis caches an EVAL'd body server-wide, so `EVAL` once then
@@ -300,6 +307,7 @@ pub(super) async fn try_handle_eval(
             conn.selected_db,
             db_count,
             &script_acl,
+            read_only,
         )
     });
     responses.push(response);
