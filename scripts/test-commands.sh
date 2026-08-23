@@ -1134,6 +1134,22 @@ if should_run "scripting"; then
     assert_moon_not_contains "script error leaks no moon source path" ".rs" \
         EVAL "error('boom')" 0
 
+    # moon#636: DUMP/RESTORE. The payload cannot be compared against redis's --
+    # different value encodings and a different RDB version -- so the parity
+    # rows cover the ERROR surface, and the round-trip is checked inside Lua
+    # (a payload carried through the shell loses its NUL type byte).
+    assert_match "DUMP of a missing key"    DUMP dr:absent
+    assert_match "DUMP arity"               DUMP dr:a dr:b
+    assert_match "RESTORE bad payload"      RESTORE dr:k 0 garbage
+    assert_match "RESTORE negative TTL"     RESTORE dr:k -1 garbage
+    mcli SET "dr:{dr}:src" hello >/dev/null 2>&1
+    # The `{dr}` tag co-locates both keys: at --shards >= 2 they would
+    # otherwise land on different shards and the script is refused CROSSSLOT
+    # before it reaches DUMP at all.
+    assert_moon "DUMP then RESTORE round-trips" "hello" \
+        EVAL "local p = redis.call('DUMP', KEYS[1]); redis.call('RESTORE', KEYS[2], 0, p, 'REPLACE'); return redis.call('GET', KEYS[2])" \
+        2 "dr:{dr}:src" "dr:{dr}:dst"
+
     # moon#515: Redis caches an EVAL'd body server-wide, so EVAL-then-EVALSHA
     # is a supported idiom. moon cached it only on the executing shard, so at
     # --shards >= 2 the EVALSHA answered NOSCRIPT for every key that routed

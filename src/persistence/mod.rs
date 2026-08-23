@@ -7,6 +7,7 @@ pub mod clog;
 pub mod compression;
 pub mod control;
 pub mod dir_lock;
+pub mod dump_payload;
 pub mod fsync;
 pub mod kv_page;
 pub mod manifest;
