@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`DUMP` and `RESTORE`** (#636). moon can now serialize a value to a redis-compatible
+  payload and load one back, which is the primitive behind key migration and per-key
+  backup. Both were *deregistered* on 2026-08-15 because they were advertised in
+  `COMMAND` while dispatching nowhere; they return here the only way that table allows —
+  with the arms that serve them.
+
+  The payload is redis's own framing, `<type><value><rdb version u16><crc64 u64>`,
+  verified byte-for-byte against redis-server 8.6.1: moon's existing `crc64_jones`
+  reproduces redis's checksum exactly, and the checksum covers the version bytes as well
+  as the body — a detail a round-trip test cannot catch, because a codec that gets it
+  wrong still round-trips perfectly against itself.
+
+  **Interoperability is one-directional, and the PR says so rather than implying more.**
+  A moon payload restores into real redis: measured, all five types, values identical
+  after the hop (redis re-encodes the plain RDB types into its own listpack forms on
+  ingest). The reverse does not work for collections — redis 8 emits listpack and
+  quicklist encodings that moon has no decoder for. Those are refused with a distinct
+  error naming the encoding, not with the checksum error, because the payload is not
+  corrupt and sending an operator to hunt for corruption that is not there is its own
+  bug. A payload stamped with a newer RDB version is refused before its type byte is
+  ever read, which is the mechanism that keeps a redis 13 payload from reaching a
+  decoder that cannot read it.
+
+  Semantics were read off redis 8.6.1 rather than inferred, including three that are
+  easy to guess wrong: `RESTORE` validates its TTL *before* its payload; an `ABSTTL` in
+  the past is `+OK` with the key already gone, not an error; and `IDLETIME`/`FREQ` are
+  range-checked and then discarded, so `FREQ 300` is refused even though a valid value
+  changes nothing.
+
+  New fuzz target `dump_payload` (registered in **both** matrices in `fuzz.yml`) covers
+  the decoder, which any client permitted to run `RESTORE` feeds attacker-chosen bytes.
+  1.92M executions, no crashes, flat memory — the guards that matter are the
+  length-driven allocation bounds, since a valid CRC over a body claiming four billion
+  elements is trivially constructible.
+
 - **`EVAL_RO` and `EVALSHA_RO`** (#636). The read-only script forms clients use to send
   scripts to a replica, or to prove to themselves that a script cannot write. Previously
   `-ERR unknown command`.

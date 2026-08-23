@@ -30,6 +30,10 @@ use crate::storage::stream::{
 
 const REDIS_RDB_MAGIC: &[u8] = b"REDIS";
 const REDIS_RDB_VERSION: &[u8] = b"0010";
+/// The same version as a number. The RDB *file* header spells it in ASCII
+/// (`REDIS0010`); a `DUMP` payload footer carries it as a little-endian u16
+/// (moon#636). Two spellings of one fact, so they are derived from one line.
+pub(crate) const REDIS_RDB_VERSION_NUM: u16 = 10;
 
 const RDB_OPCODE_AUX: u8 = 0xFA;
 const RDB_OPCODE_RESIZEDB: u8 = 0xFB;
@@ -66,7 +70,7 @@ const RDB_ENC_INT32: u8 = 2;
 /// Uses the pre-computed lookup table from Redis src/crc64.c.
 /// Polynomial: 0xAD93D23594C935A9 (Jones, reflected).
 /// Test vector: CRC64("123456789") = 0xE9C6D914C4B8D9CA
-fn crc64_jones(data: &[u8]) -> u64 {
+pub(crate) fn crc64_jones(data: &[u8]) -> u64 {
     // This table is generated using the reflected polynomial 0x95AC9329AC4BC9B5
     // which is the bit-reversal of 0xAD93D23594C935A9.
     // Source: Redis src/crc64.c
@@ -282,16 +286,30 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) {
         buf.push(RDB_OPCODE_EXPIRETIME_MS);
         buf.extend_from_slice(&ms.to_le_bytes());
     }
+    write_typed_value(buf, Some(key), entry);
+}
 
+/// The key, when there is one. An RDB *file* entry is `tag key value`; a
+/// `DUMP` payload is `tag value` with no key at all (moon#636), and the two
+/// share every value encoder below.
+fn write_opt_key(buf: &mut Vec<u8>, key: Option<&[u8]>) {
+    if let Some(k) = key {
+        write_redis_string(buf, k);
+    }
+}
+
+/// Type tag + optional key + value bytes, i.e. everything after any TTL
+/// opcode. `key: None` produces exactly the body of a `DUMP` payload.
+pub(crate) fn write_typed_value(buf: &mut Vec<u8>, key: Option<&[u8]>, entry: &Entry) {
     match entry.as_redis_value() {
         RedisValueRef::String(s) => {
             buf.push(RDB_TYPE_STRING);
-            write_redis_string(buf, key);
+            write_opt_key(buf, key);
             write_redis_string(buf, s);
         }
         RedisValueRef::Hash(map) => {
             buf.push(RDB_TYPE_HASH);
-            write_redis_string(buf, key);
+            write_opt_key(buf, key);
             write_length(buf, map.len() as u64);
             for (field, value) in map.iter() {
                 write_redis_string(buf, field);
@@ -312,14 +330,17 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) {
         RedisValueRef::HashWithTtl { fields, ttls, .. } => {
             if !ttls.is_empty() {
                 tracing::warn!(
-                    key = %String::from_utf8_lossy(key),
+                    // A DUMP payload carries no key, so name the caller
+                    // rather than print an empty string that reads as a
+                    // key whose name is "".
+                    key = %String::from_utf8_lossy(key.unwrap_or(b"<DUMP payload>")),
                     ttls = ttls.len(),
                     "Redis-compat RDB drops per-field TTLs; cross-vendor migration loses HEXPIRE state. \
                      Use Moon-native RDB v2 or AOF (HPEXPIREAT emitted) to preserve TTLs."
                 );
             }
             buf.push(RDB_TYPE_HASH);
-            write_redis_string(buf, key);
+            write_opt_key(buf, key);
             write_length(buf, fields.len() as u64);
             for (field, value) in fields.iter() {
                 write_redis_string(buf, field);
@@ -328,7 +349,7 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) {
         }
         RedisValueRef::HashListpack(lp) => {
             buf.push(RDB_TYPE_HASH);
-            write_redis_string(buf, key);
+            write_opt_key(buf, key);
             let pairs: Vec<_> = lp.iter_pairs().collect();
             write_length(buf, pairs.len() as u64);
             for (f, v) in pairs {
@@ -338,7 +359,7 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) {
         }
         RedisValueRef::List(deque) => {
             buf.push(RDB_TYPE_LIST);
-            write_redis_string(buf, key);
+            write_opt_key(buf, key);
             write_length(buf, deque.len() as u64);
             for elem in deque.iter() {
                 write_redis_string(buf, elem);
@@ -346,7 +367,7 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) {
         }
         RedisValueRef::ListListpack(lp) => {
             buf.push(RDB_TYPE_LIST);
-            write_redis_string(buf, key);
+            write_opt_key(buf, key);
             let count = lp.len();
             write_length(buf, count as u64);
             for entry in lp.iter() {
@@ -355,7 +376,7 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) {
         }
         RedisValueRef::Set(set) => {
             buf.push(RDB_TYPE_SET);
-            write_redis_string(buf, key);
+            write_opt_key(buf, key);
             write_length(buf, set.len() as u64);
             for member in set.iter() {
                 write_redis_string(buf, member);
@@ -363,7 +384,7 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) {
         }
         RedisValueRef::SetListpack(lp) => {
             buf.push(RDB_TYPE_SET);
-            write_redis_string(buf, key);
+            write_opt_key(buf, key);
             let count = lp.len();
             write_length(buf, count as u64);
             for entry in lp.iter() {
@@ -372,7 +393,7 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) {
         }
         RedisValueRef::SetIntset(is) => {
             buf.push(RDB_TYPE_SET);
-            write_redis_string(buf, key);
+            write_opt_key(buf, key);
             let members: Vec<_> = is.iter().collect();
             write_length(buf, members.len() as u64);
             for val in members {
@@ -382,7 +403,7 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) {
         }
         RedisValueRef::SortedSet { members, .. } => {
             buf.push(RDB_TYPE_ZSET_2);
-            write_redis_string(buf, key);
+            write_opt_key(buf, key);
             write_length(buf, members.len() as u64);
             for (member, score) in members.iter() {
                 write_redis_string(buf, member);
@@ -391,7 +412,7 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) {
         }
         RedisValueRef::SortedSetBPTree { members, .. } => {
             buf.push(RDB_TYPE_ZSET_2);
-            write_redis_string(buf, key);
+            write_opt_key(buf, key);
             write_length(buf, members.len() as u64);
             for (member, score) in members.iter() {
                 write_redis_string(buf, member);
@@ -400,7 +421,7 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) {
         }
         RedisValueRef::SortedSetListpack(lp) => {
             buf.push(RDB_TYPE_ZSET_2);
-            write_redis_string(buf, key);
+            write_opt_key(buf, key);
             let pairs: Vec<_> = lp.iter_pairs().collect();
             write_length(buf, pairs.len() as u64);
             for (member, score_entry) in pairs {
@@ -424,7 +445,7 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) {
             // string/length framing — `write_redis_string`/`write_length` —
             // differs from that module's raw-LE-prefixed helpers).
             buf.push(RDB_TYPE_STREAM_MOON);
-            write_redis_string(buf, key);
+            write_opt_key(buf, key);
             write_length(buf, stream.entries.len() as u64);
             buf.extend_from_slice(&stream.last_id.ms.to_le_bytes());
             buf.extend_from_slice(&stream.last_id.seq.to_le_bytes());
@@ -779,7 +800,7 @@ pub fn load_rdb(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usize
 }
 
 /// Read a single RDB entry of the given type.
-fn read_rdb_entry(
+pub(crate) fn read_rdb_entry(
     cursor: &mut Cursor<&[u8]>,
     type_tag: u8,
     expiry_ms: Option<u64>,

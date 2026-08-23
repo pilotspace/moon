@@ -40,6 +40,7 @@ jobs:
           - mq_registry_blob
           - redis_rdb_load
           - term_fst_sidecar
+          - dump_payload
           - acl_keyspec
     steps:
       - uses: actions/checkout@v7
@@ -106,6 +107,7 @@ jobs:
           - mq_registry_blob
           - redis_rdb_load
           - term_fst_sidecar
+          - dump_payload
           - acl_keyspec
     steps:
       - uses: actions/checkout@v7

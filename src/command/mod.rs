@@ -3,6 +3,7 @@ pub mod cdc;
 pub mod client;
 pub mod config;
 pub mod connection;
+pub mod dump_restore;
 pub mod functions;
 pub mod geo;
 #[cfg(feature = "graph")]
@@ -159,9 +160,17 @@ fn dispatch_inner(
             }
         }
         (4, b'd') => {
-            // DECR
+            // DECR DUMP
             if cmd.eq_ignore_ascii_case(b"DECR") {
                 return resp(string::decr(db, args));
+            }
+            // DUMP is also served by `dispatch_read` -- the monoio handler
+            // branches on `metadata::is_write`, and DUMP is readonly, so the
+            // read arm is the one a live server actually reaches. This arm
+            // still matters: the cross-shard SPSC path and the tokio handler
+            // come through here.
+            if cmd.eq_ignore_ascii_case(b"DUMP") {
+                return resp(dump_restore::dump(db, args));
             }
         }
         (4, b'e') => {
@@ -745,6 +754,12 @@ fn dispatch_inner(
                 return resp(hll::pfmerge(db, args));
             }
         }
+        (7, b'r') => {
+            // RESTORE
+            if cmd.eq_ignore_ascii_case(b"RESTORE") {
+                return resp(dump_restore::restore(db, args));
+            }
+        }
         (7, b's') => {
             // SLOWLOG SORT_RO
             if cmd.eq_ignore_ascii_case(b"SLOWLOG") {
@@ -1105,6 +1120,7 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         (3, b'g')  // GET
         | (3, b'l')  // LCS
         | (3, b't')  // TTL
+        | (4, b'd')  // DUMP
         | (4, b'e')  // ECHO
         | (4, b'h')  // HGET, HLEN, HTTL
         | (4, b'i')  // INFO
@@ -1210,6 +1226,12 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             // TTL
             if cmd.eq_ignore_ascii_case(b"TTL") {
                 return resp(key::ttl_readonly(db, args, now_ms));
+            }
+        }
+        (4, b'd') => {
+            // DUMP -- readonly, so this is the arm a live monoio server hits.
+            if cmd.eq_ignore_ascii_case(b"DUMP") {
+                return resp(dump_restore::dump_readonly(db, args, now_ms));
             }
         }
         (4, b'e') => {

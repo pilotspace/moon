@@ -330,6 +330,13 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "PEXPIREAT" => CommandMeta { name: "PEXPIREAT", arity: -3, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
     "EXPIRETIME" => CommandMeta { name: "EXPIRETIME", arity: 2, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
     "PEXPIRETIME" => CommandMeta { name: "PEXPIRETIME", arity: 2, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    // moon#636. Arities are redis's: DUMP is 2 (an extra argument is an arity
+    // error, not an ignored token) and RESTORE is -4. redis also marks
+    // RESTORE `denyoom`; moon has no such flag, so COMMAND INFO reports the
+    // smaller set -- a pre-existing property of moon's flag vocabulary, not
+    // something specific to this command.
+    "DUMP" => CommandMeta { name: "DUMP", arity: 2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "RESTORE" => CommandMeta { name: "RESTORE", arity: -4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: AclCategories(GEN.0 | DNG.0) },
 
     // ---- Bitmap commands ----
     "GETBIT" => CommandMeta { name: "GETBIT", arity: 3, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
@@ -413,6 +420,11 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     // Re-add an entry only together with the arm that serves it —
     // `cdg1_registry_sweep_no_unknowns` now enumerates this table with NO
     // waiver list, so a registered-but-unreachable command fails the suite.
+    //
+    // MODULE came back that way in moon#671, and `DUMP`/`RESTORE` in moon#636
+    // — both as real top-level commands with dispatch arms, which is the only
+    // route back into this table. Their entries live with the other generic
+    // key commands above, not here.
     "MEMORY" => CommandMeta { name: "MEMORY", arity: -2, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "MODULE" => CommandMeta { name: "MODULE", arity: -2, flags: CommandFlags::NONE, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "FLUSHDB" => CommandMeta { name: "FLUSHDB", arity: -1, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },

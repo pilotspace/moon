@@ -1488,6 +1488,53 @@ assert_eq "script errors leak no moon source path" "0" "$lua_err_paths"
 assert_both "GETKEYS EVAL bad numkeys is empty too"    COMMAND GETKEYS EVAL "return 1" 9 ik1
 
 # ---------------------------------------------------------------------------
+# moon#636 -- DUMP / RESTORE.
+#
+# The error surface is parity-checkable directly; the PAYLOAD is not, because
+# moon and redis encode values differently (redis 8 emits listpack forms) and
+# stamp different RDB versions. So the payload is checked by ROUND-TRIP --
+# dump from moon, restore into moon, compare the value -- plus the one
+# cross-vendor direction that must work: a moon payload restoring into redis.
+# ---------------------------------------------------------------------------
+assert_both "DUMP of a missing key is nil"       DUMP dr:absent
+assert_both "DUMP arity (no key)"                DUMP
+assert_both "DUMP arity (two keys)"              DUMP dr:a dr:b
+assert_both "RESTORE arity"                      RESTORE dr:k
+assert_both "RESTORE rejects a negative TTL"     RESTORE dr:k -1 garbage
+assert_both "RESTORE rejects a bad payload"      RESTORE dr:k 0 garbage
+assert_both "RESTORE rejects an unknown option"  RESTORE dr:k 0 garbage BOGUS
+assert_both "RESTORE range-checks IDLETIME"      RESTORE dr:k 0 garbage IDLETIME -1
+assert_both "RESTORE range-checks FREQ"          RESTORE dr:k 0 garbage FREQ 300
+assert_both "GETKEYS DUMP"                       COMMAND GETKEYS DUMP dr:mykey
+assert_both "GETKEYS RESTORE"                    COMMAND GETKEYS RESTORE dr:mykey 0 xx
+
+# BUSYKEY needs a live key and a real payload, so it comes after a round-trip.
+# The round-trip runs INSIDE Lua on purpose. A DUMP payload starts with a NUL
+# type byte and carries arbitrary high bytes; `$(...)` strips NULs, so a
+# payload captured through the shell arrives short and every RESTORE of it
+# fails for the wrong reason (moon: "NULs stripped by command substitution").
+#
+# The `{dr}` hash tag is load-bearing: at --shards 4 the source and
+# destination otherwise land on different shards and the script is refused
+# with CROSSSLOT before it ever reaches DUMP.
+both SET "dr:{dr}:src" hello
+dr_rt="$(redis-cli -p "$PORT_RUST" eval \
+  "local p = redis.call('DUMP', KEYS[1]); redis.call('RESTORE', KEYS[2], 0, p); return redis.call('GET', KEYS[2])" \
+  2 "dr:{dr}:src" "dr:{dr}:dst" 2>&1)"
+# Compare the REPLY, not redis-cli's exit code -- redis-cli exits 0 when the
+# server answers with an error, so an exit-code check here proves nothing.
+assert_eq "DUMP then RESTORE preserves the value" "hello" "$dr_rt"
+# Restoring onto a live key is refused without REPLACE, accepted with it.
+assert_eq "RESTORE onto a live key needs REPLACE" "BUSYKEY" \
+    "$(redis-cli -p "$PORT_RUST" eval \
+        "local p = redis.call('DUMP', KEYS[1]); local ok = pcall(function() return redis.call('RESTORE', KEYS[2], 0, p) end); if ok then return 'NOERROR' else return 'BUSYKEY' end" \
+        2 "dr:{dr}:src" "dr:{dr}:dst" 2>/dev/null)"
+assert_eq "RESTORE with REPLACE overwrites" "hello" \
+    "$(redis-cli -p "$PORT_RUST" eval \
+        "local p = redis.call('DUMP', KEYS[1]); redis.call('RESTORE', KEYS[2], 0, p, 'REPLACE'); return redis.call('GET', KEYS[2])" \
+        2 "dr:{dr}:src" "dr:{dr}:dst" 2>/dev/null)"
+
+# ---------------------------------------------------------------------------
 # moon#584 -- CLIENT TRACKING must invalidate what a command MODIFIES, not
 # every key it NAMES.
 #
