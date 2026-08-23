@@ -351,9 +351,14 @@ pub fn workspace_rewrite_args(cmd: &[u8], args: &[Frame], ws_id: &WorkspaceId) -
         return out;
     }
 
-    // --- GEORADIUS/GEORADIUSBYMEMBER STORE variants: args[0] is key, STORE/STOREDIST keys ---
-    // For simplicity, prefix args[0] only (standard single-key behavior).
-    // The STORE dest key is a separate concern handled later if needed.
+    // NOTE: every *STORE destination this file does not name above falls
+    // through to the single-key default below and is therefore NOT prefixed:
+    // `GEOSEARCHSTORE`, `ZRANGESTORE`, `PFMERGE`, `SORT ... STORE`, and
+    // (since moon#645) `GEORADIUS*/... STORE|STOREDIST`. That is one gap, not
+    // five: this list is a hand-rolled second key walker that has drifted from
+    // `acl::keyspec::command_key_positions`, which already knows all of these
+    // layouts. Tracked as its own issue — fixing it means replacing the list,
+    // not appending to it.
 
     // --- Default: single-key command — prefix args[0] only ---
     let mut out = args.to_vec();

@@ -1749,12 +1749,14 @@ pub(crate) const CROSS_SHARD_WRITE_ERROR: &[u8] =
 ///   entry points (`blocking::immediate_scan`, `blocking::wakeup`) that this
 ///   pre-routing guard cannot see. Two overlapping guards for one family would
 ///   be worse than one complete one.
-/// * `ZDIFFSTORE`, and `GEORADIUS`/`GEORADIUSBYMEMBER`'s `STORE`/`STOREDIST`
-///   clause — not implemented in moon (unknown command / `ERR syntax error`
-///   respectively), so there is no write to misplace, and claiming
-///   `CROSSSLOT` would send a client chasing hash tags for a command that
-///   will never work. `tests/two_key_write_cross_shard.rs::t2k4` fails the
-///   moment either starts working, which is when they must be added here.
+/// * `ZDIFFSTORE` — not implemented in moon (unknown command), so there is
+///   no write to misplace, and claiming `CROSSSLOT` would send a client
+///   chasing hash tags for a command that will never work.
+///   `tests/two_key_write_cross_shard.rs::t2k4` fails the moment it starts
+///   working, which is when it must be added here. `GEORADIUS`/
+///   `GEORADIUSBYMEMBER` used to sit in this same bucket; moon#645
+///   implemented their `STORE`/`STOREDIST` clause, so they moved INTO the
+///   family below in the same change that made them able to write.
 /// * The read-only multi-key commands (`SINTER`, `SUNION`, `SDIFF`, `ZDIFF`,
 ///   `ZINTER`, `ZUNION`, `ZINTERCARD`, `SINTERCARD`, `LCS`, `PFCOUNT`,
 ///   `TOUCH`, `LMPOP`, `ZMPOP`) — same routing rule, but the consequence is a
@@ -1786,6 +1788,13 @@ fn touches_a_key_it_did_not_route_on(cmd: &[u8]) -> bool {
         }
         (7, b'p') => cmd.eq_ignore_ascii_case(b"PFMERGE"),
         (14, b'g') => cmd.eq_ignore_ascii_case(b"GEOSEARCHSTORE"),
+        // `GEORADIUS src ... STORE|STOREDIST dst` (moon#645). Without the
+        // clause the walker reports one key and this check is a no-op, so no
+        // read-only GEORADIUS is affected — exactly like `SORT` above. The
+        // `_RO` twins never reach here: they reject the clause outright and
+        // so can only ever name one key.
+        (9, b'g') => cmd.eq_ignore_ascii_case(b"GEORADIUS"),
+        (17, b'g') => cmd.eq_ignore_ascii_case(b"GEORADIUSBYMEMBER"),
         // moon#605. These two READ several streams, and the walker reports one
         // key per stream — so a single-stream `XREAD`/`XREADGROUP` is a no-op
         // here (one key cannot disagree with itself) and only a multi-stream
@@ -3278,7 +3287,53 @@ mod cross_shard_write_tests {
             ],
         ),
         ("SORT", &["{s}", "STORE", "{d}"]),
+        (
+            "GEORADIUS",
+            &["{s}", "15", "37", "200", "km", "STORE", "{d}"],
+        ),
+        (
+            "GEORADIUSBYMEMBER",
+            &["{s}", "Catania", "200", "km", "STOREDIST", "{d}"],
+        ),
     ];
+
+    /// The other half of the moon#645 contract: a GEORADIUS WITHOUT a store
+    /// clause names one key, so it must stay routable to any shard. A guard
+    /// that keyed off the command name alone would refuse every geo read at
+    /// `--shards > 1`.
+    #[test]
+    fn a_georadius_without_a_store_clause_is_never_refused() {
+        let src = "src";
+        let far = far_from(src);
+        for shape in [
+            &["{s}", "15", "37", "200", "km"][..],
+            &["{s}", "15", "37", "200", "km", "WITHCOORD", "ASC"][..],
+            &["{s}", "15", "37", "200", "km", "COUNT", "1"][..],
+        ] {
+            assert!(
+                cross_shard_multikey_rejection(b"GEORADIUS", &argv(shape, src, &far), N).is_none(),
+                "a clause-free GEORADIUS names one key and must run: {shape:?}"
+            );
+        }
+        assert!(
+            cross_shard_multikey_rejection(
+                b"GEORADIUSBYMEMBER",
+                &argv(&["{s}", "Catania", "200", "km", "ASC"], src, &far),
+                N
+            )
+            .is_none()
+        );
+        // The read-only twins refuse the clause themselves, so even spelled
+        // out they name a single key and must never be pre-refused here.
+        assert!(
+            cross_shard_multikey_rejection(
+                b"GEORADIUS_RO",
+                &argv(&["{s}", "15", "37", "200", "km", "STORE", "{d}"], src, &far),
+                N
+            )
+            .is_none()
+        );
+    }
 
     fn argv(shape: &[&str], src: &str, dst: &str) -> Vec<Frame> {
         shape

@@ -272,7 +272,7 @@ pub fn geohash(db: &mut Database, args: &[Frame]) -> Frame {
 ///   BYRADIUS radius M|KM|FT|MI|BYBOX width height M|KM|FT|MI
 ///   [ASC|DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]
 pub fn geosearch(db: &mut Database, args: &[Frame]) -> Frame {
-    let (_matches, results) = geosearch_inner(db, args, false);
+    let (_matches, _opts, results) = geosearch_inner(db, args, false);
     results
 }
 
@@ -283,9 +283,13 @@ pub fn georadius(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 5 {
         return err_wrong_args("GEORADIUS");
     }
+    let (opts, store) = match split_store_clause(&args[5..]) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     // Translate: GEORADIUS key lon lat radius unit [opts...]
     // → GEOSEARCH key FROMLONLAT lon lat BYRADIUS radius unit [opts...]
-    let mut new_args = Vec::with_capacity(args.len() + 3);
+    let mut new_args = Vec::with_capacity(opts.len() + 7);
     new_args.push(args[0].clone()); // key
     new_args.push(Frame::BulkString(Bytes::from_static(b"FROMLONLAT")));
     new_args.push(args[1].clone()); // lon
@@ -293,8 +297,8 @@ pub fn georadius(db: &mut Database, args: &[Frame]) -> Frame {
     new_args.push(Frame::BulkString(Bytes::from_static(b"BYRADIUS")));
     new_args.push(args[3].clone()); // radius
     new_args.push(args[4].clone()); // unit
-    new_args.extend_from_slice(&args[5..]); // remaining options
-    geosearch(db, &new_args)
+    new_args.extend_from_slice(&opts); // remaining options, STORE clause removed
+    run_geosearch(db, &new_args, store)
 }
 
 /// GEORADIUSBYMEMBER key member radius M|KM|FT|MI [opts...]
@@ -304,29 +308,41 @@ pub fn georadiusbymember(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 4 {
         return err_wrong_args("GEORADIUSBYMEMBER");
     }
-    let mut new_args = Vec::with_capacity(args.len() + 3);
+    let (opts, store) = match split_store_clause(&args[4..]) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut new_args = Vec::with_capacity(opts.len() + 6);
     new_args.push(args[0].clone()); // key
     new_args.push(Frame::BulkString(Bytes::from_static(b"FROMMEMBER")));
     new_args.push(args[1].clone()); // member
     new_args.push(Frame::BulkString(Bytes::from_static(b"BYRADIUS")));
     new_args.push(args[2].clone()); // radius
     new_args.push(args[3].clone()); // unit
-    new_args.extend_from_slice(&args[4..]); // remaining options
-    geosearch(db, &new_args)
+    new_args.extend_from_slice(&opts); // remaining options, STORE clause removed
+    run_geosearch(db, &new_args, store)
 }
 
 /// Reject GEORADIUS_RO/GEORADIUSBYMEMBER_RO args containing STORE/STOREDIST.
-/// Neither base command implements STORE today (no STORE handling in
-/// `geosearch_core`), so this is a defensive, explicit rejection rather than
-/// a functional behavior change — it turns a generic "ERR syntax error" into
-/// a message that names the actual constraint.
-fn geo_ro_rejects(cmd_name: &str, args: &[Frame]) -> Option<Frame> {
+///
+/// This is LOAD-BEARING, not cosmetic. Both `_RO` entry points delegate to
+/// `georadius`/`georadiusbymember`, and since moon#645 those implement the
+/// clause — so deleting this check turns a command declared read-only
+/// (`flags: R`, routable to a replica, dispatched on the shared-lock read
+/// path) into one that writes a key. `test_georadius_ro_rejects_store` pins
+/// both halves: the error, and the destination staying absent.
+///
+/// The message is redis's own `ERR syntax error`: `_RO` simply has no STORE
+/// clause in its grammar, and a client that matches on redis's text must see
+/// redis's text. (moon used to answer a bespoke "does not support
+/// STORE/STOREDIST" here, which additionally implied the writable forms did
+/// support it back when they did not — the self-inconsistency moon#645 was
+/// filed for.)
+fn geo_ro_rejects(args: &[Frame]) -> Option<Frame> {
     for a in args.iter().skip(1) {
         if let Some(tok) = extract_bytes(a) {
             if tok.eq_ignore_ascii_case(b"STORE") || tok.eq_ignore_ascii_case(b"STOREDIST") {
-                return Some(Frame::Error(Bytes::from(format!(
-                    "ERR {cmd_name} does not support STORE/STOREDIST"
-                ))));
+                return Some(Frame::Error(Bytes::from_static(b"ERR syntax error")));
             }
         }
     }
@@ -339,7 +355,7 @@ fn geo_ro_rejects(cmd_name: &str, args: &[Frame]) -> Option<Frame> {
 /// routable to replicas. Used on the mutable dispatch track; delegates to
 /// `georadius()` (itself a GEOSEARCH translation) once STORE is ruled out.
 pub fn georadius_ro(db: &mut Database, args: &[Frame]) -> Frame {
-    if let Some(e) = geo_ro_rejects("GEORADIUS_RO", args) {
+    if let Some(e) = geo_ro_rejects(args) {
         return e;
     }
     georadius(db, args)
@@ -352,7 +368,7 @@ pub fn georadius_ro_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Fram
     if args.len() < 5 {
         return err_wrong_args("GEORADIUS_RO");
     }
-    if let Some(e) = geo_ro_rejects("GEORADIUS_RO", args) {
+    if let Some(e) = geo_ro_rejects(args) {
         return e;
     }
     let mut new_args = Vec::with_capacity(args.len() + 3);
@@ -373,7 +389,7 @@ pub fn georadius_ro_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Fram
 /// safely routable to replicas. Used on the mutable dispatch track;
 /// delegates to `georadiusbymember()` once STORE is ruled out.
 pub fn georadiusbymember_ro(db: &mut Database, args: &[Frame]) -> Frame {
-    if let Some(e) = geo_ro_rejects("GEORADIUSBYMEMBER_RO", args) {
+    if let Some(e) = geo_ro_rejects(args) {
         return e;
     }
     georadiusbymember(db, args)
@@ -385,7 +401,7 @@ pub fn georadiusbymember_ro_readonly(db: &Database, args: &[Frame], now_ms: u64)
     if args.len() < 4 {
         return err_wrong_args("GEORADIUSBYMEMBER_RO");
     }
-    if let Some(e) = geo_ro_rejects("GEORADIUSBYMEMBER_RO", args) {
+    if let Some(e) = geo_ro_rejects(args) {
         return e;
     }
     let mut new_args = Vec::with_capacity(args.len() + 3);
@@ -399,7 +415,7 @@ pub fn georadiusbymember_ro_readonly(db: &Database, args: &[Frame], now_ms: u64)
     geosearch_readonly(db, &new_args, now_ms)
 }
 
-/// GEOSEARCHSTORE destination source ...
+/// GEOSEARCHSTORE destination source ... [STOREDIST]
 pub fn geosearchstore(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 2 {
         return err_wrong_args("GEOSEARCHSTORE");
@@ -410,19 +426,76 @@ pub fn geosearchstore(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     // Shift args so args[0] is now the source key
-    let (matches, _) = geosearch_inner(db, &args[1..], true);
+    let (matches, opts, reply) = geosearch_inner(db, &args[1..], true);
 
+    // A parse failure is an ERROR, not "nothing matched". Reading only the
+    // (empty) match list answered `:0` AND deleted the destination — redis
+    // reports the error and leaves the key alone (moon#645).
+    if matches!(reply, Frame::Error(_)) {
+        return reply;
+    }
+
+    store_geo_matches(db, dest, &matches, opts.unit_mult, opts.storedist)
+}
+
+/// The destination clause of the legacy `GEORADIUS*` forms: `STORE key` or
+/// `STOREDIST key`.
+struct StoreClause {
+    dest: Bytes,
+    /// `STOREDIST`: score each member by its distance in the query's unit
+    /// rather than by the 52-bit geohash.
+    by_distance: bool,
+}
+
+/// Run a translated GEOSEARCH and, if the legacy form carried one, apply its
+/// destination clause. Without a clause the reply is the member array, with
+/// one it is the stored count — exactly redis's split.
+fn run_geosearch(db: &mut Database, args: &[Frame], store: Option<StoreClause>) -> Frame {
+    let Some(clause) = store else {
+        let (_matches, _opts, reply) = geosearch_inner(db, args, false);
+        return reply;
+    };
+    let (matches, opts, reply) = geosearch_inner(db, args, false);
+    if matches!(reply, Frame::Error(_)) {
+        return reply;
+    }
+    store_geo_matches(
+        db,
+        clause.dest,
+        &matches,
+        opts.unit_mult,
+        clause.by_distance,
+    )
+}
+
+/// Write `matches` to `dest` as a fresh sorted set — the shared tail of
+/// GEOSEARCHSTORE and of the legacy `STORE`/`STOREDIST` clause. An empty
+/// match list deletes the destination and answers `:0`, as redis does.
+fn store_geo_matches(
+    db: &mut Database,
+    dest: Bytes,
+    matches: &[GeoMatch],
+    unit_mult: f64,
+    by_distance: bool,
+) -> Frame {
     if matches.is_empty() {
         db.remove(&dest);
         return Frame::Integer(0);
     }
 
     // Build a fresh sorted set from matches and store at dest
-    let mut new_members = std::collections::HashMap::new();
+    let mut new_members = std::collections::HashMap::with_capacity(matches.len());
     let mut new_tree = crate::storage::bptree::BPTree::new();
-    for (member, _dist, _lon, _lat, score) in &matches {
-        new_members.insert(member.clone(), *score);
-        new_tree.insert(OrderedFloat(*score), member.clone());
+    for (member, dist, _lon, _lat, score) in matches {
+        // STOREDIST scores are the distance expressed in the unit the query
+        // used; `dist` is carried in meters throughout, as WITHDIST is.
+        let stored = if by_distance {
+            dist / unit_mult
+        } else {
+            *score
+        };
+        new_members.insert(member.clone(), stored);
+        new_tree.insert(OrderedFloat(stored), member.clone());
     }
     let mut entry = crate::storage::entry::Entry::new_sorted_set_bptree();
     entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
@@ -436,16 +509,110 @@ pub fn geosearchstore(db: &mut Database, args: &[Frame]) -> Frame {
     Frame::Integer(matches.len() as i64)
 }
 
+/// Split a legacy `GEORADIUS*` option tail into the options GEOSEARCH
+/// understands and the optional destination clause.
+///
+/// The scan is grammar-aware, not a token search: `STORE` consumes the next
+/// argv slot whatever it spells, so `STORE WITHDIST` names a destination key
+/// called `WITHDIST` and must NOT trip the WITH* incompatibility check
+/// (measured against redis-server 8.6.1, which answers `:2` there). When both
+/// clauses appear the LAST one wins and the earlier destination is never
+/// written.
+fn split_store_clause(opts: &[Frame]) -> Result<(Vec<Frame>, Option<StoreClause>), Frame> {
+    let mut kept = Vec::with_capacity(opts.len());
+    let mut clause: Option<StoreClause> = None;
+    let mut with_flag = false;
+    let mut i = 0;
+    while i < opts.len() {
+        let Some(tok) = extract_bytes(&opts[i]) else {
+            kept.push(opts[i].clone());
+            i += 1;
+            continue;
+        };
+        if tok.eq_ignore_ascii_case(b"STORE") || tok.eq_ignore_ascii_case(b"STOREDIST") {
+            let by_distance = tok.eq_ignore_ascii_case(b"STOREDIST");
+            let Some(dest) = opts.get(i + 1).and_then(extract_bytes) else {
+                return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+            };
+            clause = Some(StoreClause {
+                dest: Bytes::copy_from_slice(dest),
+                by_distance,
+            });
+            i += 2;
+            continue;
+        }
+        if tok.eq_ignore_ascii_case(b"WITHCOORD")
+            || tok.eq_ignore_ascii_case(b"WITHDIST")
+            || tok.eq_ignore_ascii_case(b"WITHHASH")
+        {
+            with_flag = true;
+        } else if tok.eq_ignore_ascii_case(b"COUNT") {
+            // COUNT's value — and an optional ANY — are data, not options;
+            // stepping over them keeps a count of, say, `1` from ever being
+            // mistaken for a clause keyword.
+            kept.push(opts[i].clone());
+            i += 1;
+            if let Some(v) = opts.get(i) {
+                kept.push(v.clone());
+                i += 1;
+            }
+            if let Some(any) = opts.get(i)
+                && extract_bytes(any).is_some_and(|a| a.eq_ignore_ascii_case(b"ANY"))
+            {
+                kept.push(any.clone());
+                i += 1;
+            }
+            continue;
+        }
+        kept.push(opts[i].clone());
+        i += 1;
+    }
+    if clause.is_some() && with_flag {
+        // Redis names the three flags in this fixed order, and says
+        // "in GEORADIUS" even when the command was GEORADIUSBYMEMBER.
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORD options",
+        )));
+    }
+    Ok((kept, clause))
+}
+
 /// Returned by geosearch_inner: (member, dist_m, lon, lat, score)
 type GeoMatch = (Bytes, f64, f64, f64, f64);
 
-fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (Vec<GeoMatch>, Frame) {
+/// What the option tail asked for, beyond the match list itself. The store
+/// paths need both: `unit_mult` to turn the meters every match carries back
+/// into the query's unit, and `storedist` for GEOSEARCHSTORE's bare flag.
+#[derive(Clone, Copy)]
+struct GeoOpts {
+    /// Meters per unit of the query's BYRADIUS/BYBOX unit.
+    unit_mult: f64,
+    /// GEOSEARCHSTORE's `STOREDIST`: score by distance, not by geohash.
+    storedist: bool,
+}
+
+impl Default for GeoOpts {
+    fn default() -> Self {
+        // 1.0 = meters, the identity for every `dist / unit_mult` below, so
+        // an error return can never scale a distance by zero.
+        Self {
+            unit_mult: 1.0,
+            storedist: false,
+        }
+    }
+}
+
+fn geosearch_inner(
+    db: &mut Database,
+    args: &[Frame],
+    store_mode: bool,
+) -> (Vec<GeoMatch>, GeoOpts, Frame) {
     if args.len() < 6 {
-        return (Vec::new(), err_wrong_args("GEOSEARCH"));
+        return (Vec::new(), GeoOpts::default(), err_wrong_args("GEOSEARCH"));
     }
     let key = match extract_bytes(&args[0]) {
         Some(k) => k,
-        None => return (Vec::new(), err_wrong_args("GEOSEARCH")),
+        None => return (Vec::new(), GeoOpts::default(), err_wrong_args("GEOSEARCH")),
     };
     // Single up-front fetch (Redis also resolves the key object before
     // validating options). `get_sorted_set` lazy-expires — write-path
@@ -454,9 +621,9 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (Vec
     let members_opt = match db.get_sorted_set(key) {
         Ok(Some((members, _))) => Some(members),
         Ok(None) => None,
-        Err(e) => return (Vec::new(), e),
+        Err(e) => return (Vec::new(), GeoOpts::default(), e),
     };
-    geosearch_core(members_opt, args)
+    geosearch_core(members_opt, args, store_mode)
 }
 
 /// Shared GEOSEARCH parse + filter, independent of how the sorted set was
@@ -466,7 +633,8 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (Vec
 fn geosearch_core(
     members_opt: Option<&std::collections::HashMap<Bytes, f64>>,
     args: &[Frame],
-) -> (Vec<GeoMatch>, Frame) {
+    store_mode: bool,
+) -> (Vec<GeoMatch>, GeoOpts, Frame) {
     // Parse source: FROMMEMBER or FROMLONLAT
     let mut center_lon = 0.0f64;
     let mut center_lat = 0.0f64;
@@ -488,6 +656,7 @@ fn geosearch_core(
                 None => {
                     return (
                         Vec::new(),
+                        GeoOpts::default(),
                         Frame::Error(Bytes::from_static(b"ERR syntax error")),
                     );
                 }
@@ -495,7 +664,13 @@ fn geosearch_core(
             // Look up member's score
             let members_map = match members_opt {
                 Some(m) => m,
-                None => return (Vec::new(), Frame::Array(Vec::new().into())),
+                None => {
+                    return (
+                        Vec::new(),
+                        GeoOpts::default(),
+                        Frame::Array(Vec::new().into()),
+                    );
+                }
             };
             match members_map.get(member) {
                 Some(&score) => {
@@ -503,7 +678,13 @@ fn geosearch_core(
                     center_lon = lon;
                     center_lat = lat;
                 }
-                None => return (Vec::new(), Frame::Array(Vec::new().into())),
+                None => {
+                    return (
+                        Vec::new(),
+                        GeoOpts::default(),
+                        Frame::Array(Vec::new().into()),
+                    );
+                }
             }
             found_from = true;
         } else if arg.eq_ignore_ascii_case(b"FROMLONLAT") {
@@ -513,6 +694,7 @@ fn geosearch_core(
                 None => {
                     return (
                         Vec::new(),
+                        GeoOpts::default(),
                         Frame::Error(Bytes::from_static(b"ERR syntax error")),
                     );
                 }
@@ -523,6 +705,7 @@ fn geosearch_core(
                 None => {
                     return (
                         Vec::new(),
+                        GeoOpts::default(),
                         Frame::Error(Bytes::from_static(b"ERR syntax error")),
                     );
                 }
@@ -535,6 +718,7 @@ fn geosearch_core(
     if !found_from {
         return (
             Vec::new(),
+            GeoOpts::default(),
             Frame::Error(Bytes::from_static(b"ERR syntax error")),
         );
     }
@@ -548,11 +732,13 @@ fn geosearch_core(
     let mut withcoord = false;
     let mut withdist = false;
     let mut withhash = false;
+    let mut storedist = false;
     let mut output_unit_mult = 1.0f64; // for WITHDIST: convert meters → query unit
 
     let unit_err = || {
         (
             Vec::new(),
+            GeoOpts::default(),
             Frame::Error(Bytes::from_static(
                 b"ERR unsupported unit provided. please use M, KM, FT, MI",
             )),
@@ -571,6 +757,7 @@ fn geosearch_core(
             if box_width_m.is_some() {
                 return (
                     Vec::new(),
+                    GeoOpts::default(),
                     Frame::Error(Bytes::from_static(
                         b"ERR exactly one of BYRADIUS and BYBOX arguments must be provided",
                     )),
@@ -582,6 +769,7 @@ fn geosearch_core(
                 None => {
                     return (
                         Vec::new(),
+                        GeoOpts::default(),
                         Frame::Error(Bytes::from_static(b"ERR syntax error")),
                     );
                 }
@@ -601,6 +789,7 @@ fn geosearch_core(
             if radius_m.is_some() {
                 return (
                     Vec::new(),
+                    GeoOpts::default(),
                     Frame::Error(Bytes::from_static(
                         b"ERR exactly one of BYRADIUS and BYBOX arguments must be provided",
                     )),
@@ -612,6 +801,7 @@ fn geosearch_core(
                 None => {
                     return (
                         Vec::new(),
+                        GeoOpts::default(),
                         Frame::Error(Bytes::from_static(b"ERR syntax error")),
                     );
                 }
@@ -622,6 +812,7 @@ fn geosearch_core(
                 None => {
                     return (
                         Vec::new(),
+                        GeoOpts::default(),
                         Frame::Error(Bytes::from_static(b"ERR syntax error")),
                     );
                 }
@@ -649,6 +840,7 @@ fn geosearch_core(
                 _ => {
                     return (
                         Vec::new(),
+                        GeoOpts::default(),
                         Frame::Error(Bytes::from_static(b"ERR syntax error")),
                     );
                 }
@@ -662,15 +854,34 @@ fn geosearch_core(
                     }
                 }
             }
-        } else if arg.eq_ignore_ascii_case(b"WITHCOORD") {
-            withcoord = true;
-        } else if arg.eq_ignore_ascii_case(b"WITHDIST") {
-            withdist = true;
-        } else if arg.eq_ignore_ascii_case(b"WITHHASH") {
-            withhash = true;
+        } else if arg.eq_ignore_ascii_case(b"WITHCOORD")
+            || arg.eq_ignore_ascii_case(b"WITHDIST")
+            || arg.eq_ignore_ascii_case(b"WITHHASH")
+        {
+            // GEOSEARCHSTORE stores a sorted set, so it has nowhere to put
+            // the extras and redis refuses them by name rather than quietly
+            // dropping them (moon#645).
+            if store_mode {
+                return (
+                    Vec::new(),
+                    GeoOpts::default(),
+                    Frame::Error(Bytes::from_static(
+                        b"ERR GEOSEARCHSTORE is not compatible with WITHDIST, WITHHASH and WITHCOORD options",
+                    )),
+                );
+            }
+            withcoord |= arg.eq_ignore_ascii_case(b"WITHCOORD");
+            withdist |= arg.eq_ignore_ascii_case(b"WITHDIST");
+            withhash |= arg.eq_ignore_ascii_case(b"WITHHASH");
+        } else if store_mode && arg.eq_ignore_ascii_case(b"STOREDIST") {
+            // GEOSEARCHSTORE's STOREDIST is a bare flag with no argument.
+            // Plain GEOSEARCH has no such clause at all, so it stays a
+            // syntax error there.
+            storedist = true;
         } else {
             return (
                 Vec::new(),
+                GeoOpts::default(),
                 Frame::Error(Bytes::from_static(b"ERR syntax error")),
             );
         }
@@ -680,6 +891,7 @@ fn geosearch_core(
     if radius_m.is_none() && box_width_m.is_none() {
         return (
             Vec::new(),
+            GeoOpts::default(),
             Frame::Error(Bytes::from_static(
                 b"ERR exactly one of BYRADIUS and BYBOX arguments must be provided",
             )),
@@ -689,7 +901,13 @@ fn geosearch_core(
     // Get all members with their coordinates
     let members_map = match members_opt {
         Some(m) => m,
-        None => return (Vec::new(), Frame::Array(Vec::new().into())),
+        None => {
+            return (
+                Vec::new(),
+                GeoOpts::default(),
+                Frame::Array(Vec::new().into()),
+            );
+        }
     };
 
     // Filter by shape
@@ -763,7 +981,14 @@ fn geosearch_core(
         })
         .collect();
 
-    (matches, Frame::Array(results.into()))
+    (
+        matches,
+        GeoOpts {
+            unit_mult: output_unit_mult,
+            storedist,
+        },
+        Frame::Array(results.into()),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -945,6 +1170,6 @@ pub fn geosearch_readonly(db: &crate::storage::db::Database, args: &[Frame], now
         Ok(None) => None,
         Err(e) => return e,
     };
-    let (_matches, results) = geosearch_core(members_opt, args);
+    let (_matches, _opts, results) = geosearch_core(members_opt, args, false);
     results
 }

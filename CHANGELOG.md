@@ -118,6 +118,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.8.7] — 2026-08-22
 
 ### Fixed
+- **`GEORADIUS`/`GEORADIUSBYMEMBER` implement `STORE`/`STOREDIST`** (#645). Both answered a
+  generic `ERR syntax error` for a clause `COMMAND DOCS` advertises and `COMMAND GETKEYS`
+  already resolved the destination key for. The `_RO` twins refused it by name — with a
+  bespoke message that read as though the writable forms accepted it — so the surface was
+  self-inconsistent three ways. `STORE` writes the 52-bit geohash score, `STOREDIST` writes
+  the distance in the unit the query used, and an empty result deletes the destination and
+  answers `:0`, matching redis-server 8.6.1 value-for-value.
+
+  Two adjacent gaps in the same clause family went with it:
+
+  - `GEOSEARCHSTORE` accepted `WITHCOORD`/`WITHDIST`/`WITHHASH` and silently dropped them.
+    It now answers redis's `ERR GEOSEARCHSTORE is not compatible with WITHDIST, WITHHASH and
+    WITHCOORD options`, and supports the bare `STOREDIST` flag it had never parsed.
+  - `GEOSEARCHSTORE` read only the match list and threw away the reply frame, so **a parse
+    error answered `:0` and deleted the destination key**. It now reports the error and
+    leaves the key alone.
+
+  The read-only twins still refuse the clause — that check is load-bearing now that the
+  writable forms really do write — but in redis's own words (`ERR syntax error`) rather
+  than moon's.
+
+  Because these are two-key writes whose destination is not the routing key, both commands
+  joined the moon#592 cross-shard guard in the same change: at `--shards > 1` a destination
+  owned by another shard is refused with `CROSSSLOT` before anything is read or written,
+  never misplaced. Measured with the guard removed: 24 of 24 constructed cross-shard
+  placements acked `:2` and left the destination empty.
+
+  One deliberate limit: `STOREDIST` is the only geo reply that exposes a raw `f64` rather
+  than a `%.4f` rendering, and moon's haversine can land ~1 ULP from redis's
+  (`190.44242984775795` vs `190.44242984775784` for Palermo; Catania matches exactly). The
+  operation order already matches `geohashGetDistance`; the residue is below every other
+  geo reply's precision.
+
 - **Eight command families executed at queue time inside `MULTI` instead of at `EXEC`** (#639).
   `CONFIG`, `CLIENT`, `ACL`, `CLUSTER`, `SCRIPT`, `WAIT`, `PUBSUB` and `AUTH`/`HELLO` are
   *connection-level intercepts*: they are answered above `dispatch()` because they need the

@@ -247,6 +247,38 @@ const PROBES: &[Probe] = &[
         src_untouched: ":2\r\n",
         src_after_success: None,
     },
+    // moon#645 implemented the legacy STORE clause, which is what moved these
+    // two out of t2k4's "unimplemented" tripwire and into the family.
+    Probe {
+        label: "GEORADIUS-STORE",
+        seed: &[GEO_SEED],
+        argv: &["GEORADIUS", "{s}", "15", "37", "200", "km", "STORE", "{d}"],
+        dst_probe: &["ZCARD", "{d}"],
+        dst_landed: ":2\r\n",
+        dst_absent: ":0\r\n",
+        src_probe: &["ZCARD", "{s}"],
+        src_untouched: ":2\r\n",
+        src_after_success: None,
+    },
+    Probe {
+        label: "GEORADIUSBYMEMBER-STOREDIST",
+        seed: &[GEO_SEED],
+        argv: &[
+            "GEORADIUSBYMEMBER",
+            "{s}",
+            "Catania",
+            "200",
+            "km",
+            "STOREDIST",
+            "{d}",
+        ],
+        dst_probe: &["ZCARD", "{d}"],
+        dst_landed: ":2\r\n",
+        dst_absent: ":0\r\n",
+        src_probe: &["ZCARD", "{s}"],
+        src_untouched: ":2\r\n",
+        src_after_success: None,
+    },
     Probe {
         label: "SORT-STORE",
         seed: &[&["RPUSH", "{s}", "3", "1", "2"]],
@@ -517,18 +549,23 @@ fn t2k3_hash_tagged_pairs_still_work_at_four_shards() {
     );
 }
 
-/// Tripwire for the two members of the family moon does not implement yet.
+/// Tripwire for the member of the family moon does not implement yet.
 ///
-/// `ZDIFFSTORE` is not in the dispatch table, and `GEORADIUS`/
-/// `GEORADIUSBYMEMBER` reject `STORE`/`STOREDIST` outright
-/// (`geo_cmd::reject_store_clause`). Neither can therefore misplace a
-/// destination today, which is the only reason they are absent from
-/// `PROBES` and from the routing guard.
+/// `ZDIFFSTORE` is not in the dispatch table, so it cannot misplace a
+/// destination today, which is the only reason it is absent from `PROBES`
+/// and from the routing guard.
 ///
-/// If this test ever fails, one of them started working — and it went in
-/// WITHOUT a cross-shard guard, which means it shipped the moon#592 defect.
-/// Add it to `PROBES` and to `shared::cross_shard_write_rejection`'s family
-/// list in the same change.
+/// If this test ever fails, it started working — and it went in WITHOUT a
+/// cross-shard guard, which means it shipped the moon#592 defect. Add it to
+/// `PROBES` and to `shared::touches_a_key_it_did_not_route_on`'s family list
+/// in the same change.
+///
+/// `GEORADIUS`/`GEORADIUSBYMEMBER ... STORE` were the other two rows here
+/// until moon#645. They now work, so they are covered by `PROBES` above —
+/// which is exactly the migration this tripwire exists to force. The `_RO`
+/// twins still refuse the clause and are checked below, because a read-only
+/// command that started writing would be a worse defect than the one this
+/// file is about.
 #[test]
 fn t2k4_unimplemented_store_forms_stay_unimplemented_or_get_a_guard() {
     let m = spawn_moon(SHARDS);
@@ -552,9 +589,9 @@ fn t2k4_unimplemented_store_forms_stay_unimplemented_or_get_a_guard() {
     let cases: &[(&str, &[&str])] = &[
         ("ZDIFFSTORE", &["ZDIFFSTORE", "t2k:zd:d", "1", "t2k:zd:s"]),
         (
-            "GEORADIUS STORE",
+            "GEORADIUS_RO STORE",
             &[
-                "GEORADIUS",
+                "GEORADIUS_RO",
                 "t2k:gr:s",
                 "15",
                 "37",
@@ -565,14 +602,14 @@ fn t2k4_unimplemented_store_forms_stay_unimplemented_or_get_a_guard() {
             ],
         ),
         (
-            "GEORADIUSBYMEMBER STORE",
+            "GEORADIUSBYMEMBER_RO STOREDIST",
             &[
-                "GEORADIUSBYMEMBER",
+                "GEORADIUSBYMEMBER_RO",
                 "t2k:gm:s",
                 "Catania",
                 "200",
                 "km",
-                "STORE",
+                "STOREDIST",
                 "t2k:gm:d",
             ],
         ),
@@ -584,6 +621,14 @@ fn t2k4_unimplemented_store_forms_stay_unimplemented_or_get_a_guard() {
             "{label} now answers {reply:?} instead of an error. It writes a key it did \
              not route on, so it must be added to PROBES and to the cross-shard write \
              guard before it can ship (moon#592)."
+        );
+        // An error is not enough on its own: the destination must also be
+        // absent, or the command wrote and THEN failed.
+        let dst = argv[argv.len() - 1];
+        assert_eq!(
+            c.send(&["EXISTS", dst]),
+            ":0\r\n",
+            "{label} errored but still created {dst}"
         );
     }
 }

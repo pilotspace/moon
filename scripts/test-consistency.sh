@@ -712,6 +712,20 @@ assert_both "GEOADD count" GEOADD edge:geo 2.349014 48.864716 Paris
 assert_both "GEOSEARCH WITHCOORD" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS 200 km ASC WITHCOORD
 assert_both "GEORADIUS WITHCOORD" GEORADIUS edge:geo 15 37 200 km ASC WITHCOORD
 assert_both "GEORADIUSBYMEMBER WITHCOORD+DIST" GEORADIUSBYMEMBER edge:geo Palermo 200 km ASC WITHCOORD WITHDIST
+# moon#645: the legacy STORE/STOREDIST clause. Destination is {hash}-tagged
+# with the source so it is co-located at every shard count -- the cross-shard
+# half is the XW_CASES table above, this is the "it computes the right thing"
+# half.
+both GEOADD "{eg}:src" 13.361389 38.115556 Palermo 15.087269 37.502669 Catania
+assert_both "GEORADIUS STORE" GEORADIUS "{eg}:src" 15 37 200 km STORE "{eg}:d1"
+assert_both "GEORADIUS STORE result" ZRANGE "{eg}:d1" 0 -1 WITHSCORES
+assert_both "GEORADIUSBYMEMBER STOREDIST" GEORADIUSBYMEMBER "{eg}:src" Palermo 200 km STOREDIST "{eg}:d2"
+assert_both "GEORADIUSBYMEMBER STOREDIST result" ZRANGE "{eg}:d2" 0 -1
+assert_both "GEOSEARCHSTORE STOREDIST" GEOSEARCHSTORE "{eg}:d3" "{eg}:src" FROMLONLAT 15 37 BYRADIUS 200 km ASC STOREDIST
+assert_both "GEORADIUS STORE rejects WITHDIST" GEORADIUS "{eg}:src" 15 37 200 km WITHDIST STORE "{eg}:d1"
+assert_both "GEOSEARCHSTORE rejects WITHCOORD" GEOSEARCHSTORE "{eg}:d1" "{eg}:src" FROMLONLAT 15 37 BYRADIUS 200 km WITHCOORD
+assert_both "GEORADIUS STORE without a destination" GEORADIUS "{eg}:src" 15 37 200 km STORE
+assert_both "GEORADIUS_RO still refuses STORE" GEORADIUS_RO "{eg}:src" 15 37 200 km STORE "{eg}:d1"
 
 # EXPIREAT / PEXPIREAT / EXPIRETIME / PEXPIRETIME
 both SET edge:eat "val"
@@ -1187,6 +1201,11 @@ if [[ "$SHARDS" -gt 1 ]]; then
         "pfmerge|PFADD %S a b c|PFMERGE %D %S|PFCOUNT %D"
         "geosearchstore|GEOADD %S 15 37 Here|GEOSEARCHSTORE %D %S FROMLONLAT 15 37 BYRADIUS 200 km ASC|ZCARD %D"
         "sortstore|RPUSH %S 3 1 2|SORT %S STORE %D|LLEN %D"
+        # moon#645: the legacy STORE clause joined the family the moment
+        # it started writing. Without the guard these ack :1 and the
+        # destination is empty on a normally-routed read.
+        "georadiusstore|GEOADD %S 15 37 Here|GEORADIUS %S 15 37 200 km STORE %D|ZCARD %D"
+        "georadiusbymemberstoredist|GEOADD %S 15 37 Here|GEORADIUSBYMEMBER %S Here 200 km STOREDIST %D|ZCARD %D"
     )
     xw_lost=0
     xw_refused=0
