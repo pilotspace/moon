@@ -41,6 +41,12 @@ pub fn eval_set(node: &QueryNode, idx: &TextIndex) -> RoaringBitmap {
     match node {
         QueryNode::Empty => RoaringBitmap::new(),
 
+        // moon#693: membership comes from the document registry, not a posting list — so
+        // `*` also returns documents no term query can reach (one whose text analyzed to
+        // nothing is still in the index). `doc_id_to_key` is the same registry
+        // `eval_query_counted` resolves results through, so every id here is returnable.
+        QueryNode::MatchAll => idx.doc_id_to_key.keys().copied().collect(),
+
         QueryNode::Term {
             field,
             token,
@@ -187,7 +193,11 @@ fn accumulate_text_scores(
     scores: &mut HashMap<u32, f32>,
 ) {
     match node {
-        QueryNode::Empty | QueryNode::Tag { .. } | QueryNode::Numeric { .. } => {}
+        // MatchAll scores 0.0 by absence, like the other non-TEXT leaves (moon#693).
+        QueryNode::Empty
+        | QueryNode::MatchAll
+        | QueryNode::Tag { .. }
+        | QueryNode::Numeric { .. } => {}
 
         QueryNode::Term {
             field,
@@ -395,7 +405,11 @@ pub fn collect_highlight_terms(node: &QueryNode, idx: &TextIndex) -> Vec<String>
 
 fn collect_highlight_terms_inner(node: &QueryNode, idx: &TextIndex, out: &mut Vec<String>) {
     match node {
-        QueryNode::Empty | QueryNode::Tag { .. } | QueryNode::Numeric { .. } => {}
+        // MatchAll contributes no text term to highlight or to weight (moon#693).
+        QueryNode::Empty
+        | QueryNode::MatchAll
+        | QueryNode::Tag { .. }
+        | QueryNode::Numeric { .. } => {}
         QueryNode::Term {
             field,
             token,
@@ -463,7 +477,11 @@ struct DfAcc {
 
 fn collect_df_terms_inner(node: &QueryNode, idx: &TextIndex, acc: &mut DfAcc) {
     match node {
-        QueryNode::Empty | QueryNode::Tag { .. } | QueryNode::Numeric { .. } => {}
+        // MatchAll contributes no text term to highlight or to weight (moon#693).
+        QueryNode::Empty
+        | QueryNode::MatchAll
+        | QueryNode::Tag { .. }
+        | QueryNode::Numeric { .. } => {}
         QueryNode::Term {
             field,
             token,

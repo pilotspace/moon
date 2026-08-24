@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`FT.SEARCH <index> "*"` — the match-all query** (#693). `*` is how RediSearch says
+  "every document in this index", and it is what every "show me what is in here" example
+  uses. moon refused it on every index, and the refusal named KNN
+  (`ERR invalid KNN query syntax`) even for an index with no vector field — so a user
+  trying to enumerate a TEXT index was told the vector syntax was wrong.
+
+  `*` now routes to the inverted index, which is where the document registry lives, and
+  answers from that registry rather than from a posting list. That matters for
+  enumeration: a document whose text analyzes to nothing is still *in* the index, and `*`
+  lists it where no term query can reach it.
+
+  Deliberately narrow. `alp*` is still a prefix query — only the token that is exactly `*`
+  is match-all — and `@field:*` keeps its existing syntax error rather than silently
+  widening to every document, since RediSearch has no field-scoped match-all either.
+  `*=>[KNN 10 @vec $q]` is untouched; it is still routed by the `[KNN` marker.
+
+  Unchanged: an index built from VECTOR fields alone has no inverted index, so `*` there
+  answers `ERR no such index` — exactly as every other text query on such an index already
+  did. That gap is pre-existing and uniform, not introduced here. `FT.AGGREGATE idx "*"`
+  was already correct (it short-circuits to the registry before the parser) and is not
+  touched.
 - **`FT.SEARCH` can find ordinary English words again** (#690). Two independent defects
   produced one symptom — an empty result set, with no error and nothing for the user to
   act on.

@@ -37,6 +37,13 @@ pub enum QueryNode {
         min_excl: bool,
         max_excl: bool,
     },
+    /// Matches every document in the index — RediSearch's `*` (moon#693).
+    ///
+    /// The dual of [`QueryNode::Empty`], and the identity of intersection: it is the one
+    /// leaf whose membership comes from the index's document registry rather than from a
+    /// posting list, so it also returns documents no term query can reach (a document whose
+    /// text analyzed to nothing still exists and is still enumerable).
+    MatchAll,
     /// Matches ∅. Not an error — a valid empty leaf in the set algebra.
     Empty,
 }

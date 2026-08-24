@@ -367,6 +367,13 @@ impl Parser<'_> {
         if word.is_empty() {
             return Err(QueryError::Syntax);
         }
+        // moon#693: an unscoped bare `*` is RediSearch's match-all, not a zero-length prefix
+        // query (`classify_term` rejects it as one). Narrow deliberately: `alp*` is still a
+        // prefix query, and `@field:*` keeps its existing syntax error rather than silently
+        // widening to every document — RediSearch has no field-scoped match-all either.
+        if word == b"*" && field.is_none() {
+            return Ok(QueryNode::MatchAll);
+        }
         let (token, modifier) = classify_term(word)?;
         Ok(QueryNode::Term {
             field,
@@ -384,6 +391,8 @@ fn push_field(node: &mut QueryNode, idx: usize) {
                 *field = Some(idx);
             }
         }
+        // Match-all carries no field to scope (moon#693).
+        QueryNode::MatchAll => {}
         QueryNode::And(children) | QueryNode::Or(children) => {
             for c in children {
                 push_field(c, idx);
