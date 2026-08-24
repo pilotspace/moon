@@ -1170,7 +1170,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                         }
                         let db_count = ctx.shard_databases.db_count();
                         // Unconditional slice path: ShardSlice is always initialized.
-                        let response = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                        // moon#685: `with_shard` + `run_and_complete` rather
+                        // than `with_shard_db`, so a `redis.call('FLUSHALL')`
+                        // finishes on the other fifteen databases once this
+                        // one's `&mut` borrow has ended.
+                        let (response, pending_flush) = crate::shard::slice::with_shard(|s| {
+                            crate::scripting::pending_flush::run_and_complete(
+                                s,
+                                conn.selected_db,
+                                |db| {
                             if script_is_eval {
                                 crate::scripting::handle_eval(
                                     &ctx.lua, &ctx.script_cache, cmd_args, db,
@@ -1184,7 +1192,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     &script_acl, script_read_only,
                                 )
                             }
+                                },
+                            )
                         });
+                        let response = crate::server::conn::shared::finish_script_flush(
+                            pending_flush,
+                            response,
+                            conn.selected_db,
+                            ctx,
+                        )
+                        .await;
                         responses.push(response);
                         continue;
                     }
@@ -1389,12 +1406,22 @@ pub(crate) async fn handle_connection_sharded_inner<
                             }
                             crate::server::conn::core::ensure_function_registry(&func_registry, ctx);
                             let db_count = ctx.shard_databases.db_count();
+                            // moon#685: the registry borrow lives in its own
+                            // block — `finish_script_flush` below awaits, and a
+                            // `RefCell` borrow held across an await is how the
+                            // next command finds the registry already borrowed.
+                            let (response, pending_flush) = {
                             let guard = func_registry.borrow();
                             #[allow(clippy::unwrap_used)]
                             // ensure_function_registry guarantees Some
                             let reg = guard.as_ref().unwrap();
                             // Unconditional slice path: ShardSlice is always initialized.
-                            let response = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                            // moon#685: see the EVAL arm above.
+                            crate::shard::slice::with_shard(|s| {
+                                crate::scripting::pending_flush::run_and_complete(
+                                    s,
+                                    conn.selected_db,
+                                    |db| {
                                 // moon#569: FCALL runs under the caller's
                                 // ACL. Built once and shared by both arms —
                                 // main split FCALL and FCALL_RO into two
@@ -1414,8 +1441,17 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         &script_acl,
                                     )
                                 }
-                            });
-                            drop(guard);
+                                    },
+                                )
+                            })
+                            };
+                            let response = crate::server::conn::shared::finish_script_flush(
+                                pending_flush,
+                                response,
+                                conn.selected_db,
+                                ctx,
+                            )
+                            .await;
                             responses.push(response);
                             continue;
                         }

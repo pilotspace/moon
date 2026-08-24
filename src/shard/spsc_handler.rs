@@ -503,36 +503,55 @@ pub(crate) fn handle_shard_message_shared(
                         ));
                         return;
                     };
-                    let frame = crate::shard::slice::with_shard(|s| {
+                    // moon#685: the routed script arm gets the same
+                    // keyspace completion the connection-local arms got —
+                    // routing is invisible to the client, so it must not
+                    // decide how much of the keyspace a flush reaches.
+                    //
+                    // The cross-shard BROADCAST half stops here and is
+                    // discarded on purpose: `handle_shard_message_shared` is
+                    // synchronous and holds neither the SPSC producers nor the
+                    // notifiers `coordinate_flush_broadcast` needs, and fanning
+                    // out from inside a shard's own message loop is the
+                    // shard-to-shard wait cycle the MULTI path documents at
+                    // `shared::execute_transaction_sharded`. A script reaches
+                    // this arm only when `route_script_elsewhere` sent it here
+                    // for a DECLARED key on this shard, so the residue is "a
+                    // script that both declares a remote key and flushes",
+                    // which still clears only the owner shard — measured at
+                    // `--shards 4` (6 to 10 of 12 keys survive, depending on
+                    // where the declared key hashes) and tracked as moon#705.
+                    let (frame, _pending_flush) = crate::shard::slice::with_shard(|s| {
                         let db_count = s.databases.len();
-                        let db = &mut s.databases[db_idx];
-                        if is_plain_eval {
-                            crate::scripting::handle_eval(
-                                &vm,
-                                script_cache,
-                                args,
-                                db,
-                                shard_id,
-                                rt.num_shards(),
-                                db_idx,
-                                db_count,
-                                &script_acl,
-                                read_only,
-                            )
-                        } else {
-                            crate::scripting::handle_evalsha(
-                                &vm,
-                                script_cache,
-                                args,
-                                db,
-                                shard_id,
-                                rt.num_shards(),
-                                db_idx,
-                                db_count,
-                                &script_acl,
-                                read_only,
-                            )
-                        }
+                        crate::scripting::pending_flush::run_and_complete(s, db_idx, |db| {
+                            if is_plain_eval {
+                                crate::scripting::handle_eval(
+                                    &vm,
+                                    script_cache,
+                                    args,
+                                    db,
+                                    shard_id,
+                                    rt.num_shards(),
+                                    db_idx,
+                                    db_count,
+                                    &script_acl,
+                                    read_only,
+                                )
+                            } else {
+                                crate::scripting::handle_evalsha(
+                                    &vm,
+                                    script_cache,
+                                    args,
+                                    db,
+                                    shard_id,
+                                    rt.num_shards(),
+                                    db_idx,
+                                    db_count,
+                                    &script_acl,
+                                    read_only,
+                                )
+                            }
+                        })
                     });
                     let _ = reply_tx.send(frame);
                     return;
@@ -594,39 +613,42 @@ pub(crate) fn handle_shard_message_shared(
                         ));
                         return;
                     };
-                    let frame = crate::shard::slice::with_shard(|s| {
+                    // moon#685: see the routed EVAL arm above, including
+                    // why the broadcast half stops here.
+                    let (frame, _pending_flush) = crate::shard::slice::with_shard(|s| {
                         let db_count = s.databases.len();
-                        let db = &mut s.databases[db_idx];
-                        // moon#569 + moon#514: the ACL that travels with
-                        // `ShardMessage::Execute` is the ORIGIN connection's, so a
-                        // routed FCALL authorizes each inner `redis.call` exactly as
-                        // it would have on the shard the client is attached to.
-                        // Using this shard's own identity instead would let routing —
-                        // an implementation detail the client cannot see — decide
-                        // permissions.
-                        if is_fcall {
-                            crate::command::functions::handle_fcall(
-                                reg,
-                                args,
-                                db,
-                                shard_id,
-                                rt.num_shards(),
-                                db_idx,
-                                db_count,
-                                &script_acl,
-                            )
-                        } else {
-                            crate::command::functions::handle_fcall_ro(
-                                reg,
-                                args,
-                                db,
-                                shard_id,
-                                rt.num_shards(),
-                                db_idx,
-                                db_count,
-                                &script_acl,
-                            )
-                        }
+                        crate::scripting::pending_flush::run_and_complete(s, db_idx, |db| {
+                            // moon#569 + moon#514: the ACL that travels with
+                            // `ShardMessage::Execute` is the ORIGIN connection's, so a
+                            // routed FCALL authorizes each inner `redis.call` exactly as
+                            // it would have on the shard the client is attached to.
+                            // Using this shard's own identity instead would let routing —
+                            // an implementation detail the client cannot see — decide
+                            // permissions.
+                            if is_fcall {
+                                crate::command::functions::handle_fcall(
+                                    reg,
+                                    args,
+                                    db,
+                                    shard_id,
+                                    rt.num_shards(),
+                                    db_idx,
+                                    db_count,
+                                    &script_acl,
+                                )
+                            } else {
+                                crate::command::functions::handle_fcall_ro(
+                                    reg,
+                                    args,
+                                    db,
+                                    shard_id,
+                                    rt.num_shards(),
+                                    db_idx,
+                                    db_count,
+                                    &script_acl,
+                                )
+                            }
+                        })
                     });
                     drop(guard);
                     let _ = reply_tx.send(frame);

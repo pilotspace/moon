@@ -238,21 +238,33 @@ pub(super) async fn try_handle_evalsha(
         responses.push(routed);
         return true;
     }
-    let response = crate::shard::slice::with_shard(|s| {
+    let (response, pending_flush) = crate::shard::slice::with_shard(|s| {
         let db_count = s.databases.len();
-        crate::scripting::handle_evalsha(
-            &ctx.lua,
-            &ctx.script_cache,
-            cmd_args,
-            &mut s.databases[conn.selected_db],
-            ctx.shard_id,
-            ctx.num_shards,
-            conn.selected_db,
-            db_count,
-            &script_acl,
-            read_only,
-        )
+        // moon#685: `run_and_complete`, not a bare index, so a script's flush
+        // finishes on the other fifteen databases — and reports what is left
+        // for `finish_script_flush` to broadcast once this borrow has ended.
+        crate::scripting::pending_flush::run_and_complete(s, conn.selected_db, |db| {
+            crate::scripting::handle_evalsha(
+                &ctx.lua,
+                &ctx.script_cache,
+                cmd_args,
+                db,
+                ctx.shard_id,
+                ctx.num_shards,
+                conn.selected_db,
+                db_count,
+                &script_acl,
+                read_only,
+            )
+        })
     });
+    let response = crate::server::conn::shared::finish_script_flush(
+        pending_flush,
+        response,
+        conn.selected_db,
+        ctx,
+    )
+    .await;
     responses.push(response);
     true
 }
@@ -294,22 +306,31 @@ pub(super) async fn try_handle_eval(
         responses.push(routed);
         return true;
     }
-    let response = crate::shard::slice::with_shard(|s| {
+    let (response, pending_flush) = crate::shard::slice::with_shard(|s| {
         let db_count = s.databases.len();
-        let db = &mut s.databases[conn.selected_db];
-        crate::scripting::handle_eval(
-            &ctx.lua,
-            &ctx.script_cache,
-            cmd_args,
-            db,
-            ctx.shard_id,
-            ctx.num_shards,
-            conn.selected_db,
-            db_count,
-            &script_acl,
-            read_only,
-        )
+        // moon#685: see `try_handle_evalsha`.
+        crate::scripting::pending_flush::run_and_complete(s, conn.selected_db, |db| {
+            crate::scripting::handle_eval(
+                &ctx.lua,
+                &ctx.script_cache,
+                cmd_args,
+                db,
+                ctx.shard_id,
+                ctx.num_shards,
+                conn.selected_db,
+                db_count,
+                &script_acl,
+                read_only,
+            )
+        })
     });
+    let response = crate::server::conn::shared::finish_script_flush(
+        pending_flush,
+        response,
+        conn.selected_db,
+        ctx,
+    )
+    .await;
     responses.push(response);
     true
 }
@@ -1583,38 +1604,52 @@ pub(super) async fn try_handle_functions(
             return true;
         }
         crate::server::conn::core::ensure_function_registry(func_registry, ctx);
-        let guard = func_registry.borrow();
-        #[allow(clippy::unwrap_used)]
-        // ensure_function_registry guarantees Some
-        let reg = guard.as_ref().unwrap();
-        let response = crate::shard::slice::with_shard(|s| {
-            let db_count = s.databases.len();
-            let db = &mut s.databases[conn.selected_db];
-            if is_fcall {
-                crate::command::functions::handle_fcall(
-                    reg,
-                    cmd_args,
-                    db,
-                    ctx.shard_id,
-                    ctx.num_shards,
-                    conn.selected_db,
-                    db_count,
-                    &script_acl,
-                )
-            } else {
-                crate::command::functions::handle_fcall_ro(
-                    reg,
-                    cmd_args,
-                    db,
-                    ctx.shard_id,
-                    ctx.num_shards,
-                    conn.selected_db,
-                    db_count,
-                    &script_acl,
-                )
-            }
-        });
-        drop(guard);
+        // moon#685: the registry borrow lives in its own block. `finish_script_flush`
+        // below awaits, and a `RefCell` borrow held across an await is how a second
+        // command on this connection would find the registry already borrowed.
+        let (response, pending_flush) = {
+            let guard = func_registry.borrow();
+            #[allow(clippy::unwrap_used)]
+            // ensure_function_registry guarantees Some
+            let reg = guard.as_ref().unwrap();
+            crate::shard::slice::with_shard(|s| {
+                let db_count = s.databases.len();
+                // moon#685: a FUNCTION body reaches `redis.call` through the same
+                // bridge an EVAL does, so it needs the same completion.
+                crate::scripting::pending_flush::run_and_complete(s, conn.selected_db, |db| {
+                    if is_fcall {
+                        crate::command::functions::handle_fcall(
+                            reg,
+                            cmd_args,
+                            db,
+                            ctx.shard_id,
+                            ctx.num_shards,
+                            conn.selected_db,
+                            db_count,
+                            &script_acl,
+                        )
+                    } else {
+                        crate::command::functions::handle_fcall_ro(
+                            reg,
+                            cmd_args,
+                            db,
+                            ctx.shard_id,
+                            ctx.num_shards,
+                            conn.selected_db,
+                            db_count,
+                            &script_acl,
+                        )
+                    }
+                })
+            })
+        };
+        let response = crate::server::conn::shared::finish_script_flush(
+            pending_flush,
+            response,
+            conn.selected_db,
+            ctx,
+        )
+        .await;
         responses.push(response);
         return true;
     }
