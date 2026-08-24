@@ -207,6 +207,7 @@ pub(super) async fn run_txn_connection_intercept(
     peer_addr: &str,
     shutdown: &crate::runtime::cancel::CancellationToken,
     switch_index: usize,
+    func_registry: &std::rc::Rc<std::cell::RefCell<Option<crate::scripting::FunctionRegistry>>>,
 ) -> Frame {
     let mut out: Vec<Frame> = Vec::with_capacity(1);
     // Dropped: inside EXEC there is no read loop to slow down, and sleeping
@@ -270,7 +271,18 @@ pub(super) async fn run_txn_connection_intercept(
                 ),
             )
         }
-        || super::pubsub::try_handle_pubsub_introspection(cmd, cmd_args, ctx, &mut out);
+        || super::pubsub::try_handle_pubsub_introspection(cmd, cmd_args, ctx, &mut out)
+        // moon#697: ONE implementation shared with the monoio twin. Two copies of
+        // a fan-out this subtle is exactly how the paths drifted before.
+        || crate::server::conn::shared::try_handle_function_in_txn(
+            cmd,
+            cmd_args,
+            ctx,
+            shutdown,
+            func_registry,
+            &mut out,
+        )
+        .await;
 
     if !handled {
         return Frame::Error(Bytes::from(format!(
@@ -296,6 +308,7 @@ pub(super) async fn fill_txn_intercept_slots(
     ctx: &ConnectionContext,
     shutdown: &crate::runtime::cancel::CancellationToken,
     switch_index: usize,
+    func_registry: &std::rc::Rc<std::cell::RefCell<Option<crate::scripting::FunctionRegistry>>>,
 ) {
     let Frame::Array(results) = result else {
         return;
@@ -328,6 +341,7 @@ pub(super) async fn fill_txn_intercept_slots(
             &peer_addr,
             shutdown,
             switch_index,
+            func_registry,
         )
         .await;
     }

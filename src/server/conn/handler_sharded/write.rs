@@ -540,6 +540,12 @@ pub(super) async fn try_handle_multi_exec(
     // moon#639: EXEC runs the queued connection-level intercepts itself, and
     // `SCRIPT LOAD` needs the shutdown token for its bounded shard fan-out.
     shutdown: &crate::runtime::cancel::CancellationToken,
+    // moon#697: FUNCTION joined the connection-level intercepts. Its registry is
+    // per-SHARD-THREAD — the `RefCell` is shared with that thread's SPSC drain
+    // loop, which applies inbound fan-outs — so it travels down here rather than
+    // being rebuilt: a fresh registry would be invisible to the fan-out that
+    // makes FUNCTION LOAD server-wide.
+    func_registry: &std::rc::Rc<std::cell::RefCell<Option<crate::scripting::FunctionRegistry>>>,
 ) -> bool {
     // --- WATCH / UNWATCH ---
     // Before the MULTI queueing step below, so `WATCH` inside MULTI is refused
@@ -701,6 +707,7 @@ pub(super) async fn try_handle_multi_exec(
                                     ctx,
                                     shutdown,
                                     responses.len(),
+                                    func_registry,
                                 )
                                 .await;
                                 crate::shard::coordinator::broadcast_txn_flushes(
@@ -762,6 +769,7 @@ pub(super) async fn try_handle_multi_exec(
                     ctx,
                     shutdown,
                     switch_index,
+                    func_registry,
                 )
                 .await;
             }

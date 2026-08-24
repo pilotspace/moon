@@ -24,14 +24,10 @@
 //! state is per-connection, and a desynced socket turns the whole table into
 //! fiction). The issue reported 6 containers; the sweep found **14**.
 //!
-//! Four containers are deliberately NOT gated at queue time, and each exclusion
-//! is fenced by a test rather than left to a comment:
+//! Three containers are deliberately NOT gated at queue time, and each exclusion
+//! is fenced by a test rather than left to a comment. (`FUNCTION` was a fourth
+//! until moon#697 made its executor dispatch; `csp6` now asserts it IS gated.)
 //!
-//!   * `FUNCTION` — moon#697: inside `MULTI`, EVERY `FUNCTION` subcommand is
-//!     answered `ERR unknown command 'FUNCTION'` by the executor, valid ones
-//!     included. The gate's notion of "known subcommand" and the executor's
-//!     therefore disagree for this one container, and gating it would trade one
-//!     queued-vs-dispatched divergence for another (`csp6`).
 //!   * `CLUSTER` — with cluster support disabled Moon answers *every* CLUSTER
 //!     subcommand, bogus ones included, with "This instance has cluster support
 //!     disabled". Dispatch therefore never says "unknown subcommand", so the
@@ -124,8 +120,10 @@ fn spawn_moon(shards: &str) -> Moon {
 /// half of the gate uses Moon's `COMMAND_META`: a name Moon does not dispatch
 /// is not queueable, whether or not Redis has it.
 const GATED: &[&str] = &[
-    "ACL", "CLIENT", "COMMAND", "CONFIG", "MEMORY", "MODULE", "OBJECT", "PUBSUB", "SCRIPT",
-    "SLOWLOG", "XGROUP", "XINFO",
+    // FUNCTION joined in moon#697, once its EXEC executor stopped reporting an
+    // unknown command for every subcommand.
+    "ACL", "CLIENT", "COMMAND", "CONFIG", "FUNCTION", "MEMORY", "MODULE", "OBJECT", "PUBSUB",
+    "SCRIPT", "SLOWLOG", "XGROUP", "XINFO",
 ];
 
 /// The containers whose unknown-subcommand ERROR TEXT must match Redis.
@@ -281,33 +279,26 @@ fn csp5_a_known_subcommand_still_queues_and_runs() {
 }
 
 #[test]
-fn csp6_function_is_not_gated_because_its_executor_reports_an_unknown_command() {
-    // Known-red fence for moon#697, and the reason `FUNCTION` is absent from
-    // [`GATED`].
+fn csp6_function_is_gated_like_every_other_container() {
+    // Was a known-red fence for moon#697, which is now fixed: `FUNCTION` was the
+    // one container whose EXEC executor answered `ERR unknown command
+    // 'FUNCTION'` for EVERY subcommand, so there was no notion of a "known
+    // FUNCTION subcommand" for the gate to agree with.
     //
-    // The queue gate's whole safety argument is *queueable iff dispatchable*.
-    // Inside `MULTI` the executor answers EVERY `FUNCTION` subcommand — `LIST`
-    // included — with `ERR unknown command 'FUNCTION'`, so there is no notion of
-    // "known FUNCTION subcommand" for the gate to agree with. Gating it would
-    // swap one queued-vs-dispatched divergence for another rather than remove
-    // it.
-    //
-    // This test pins today's behaviour so that fixing moon#697 FAILS here, which
-    // is the prompt to add `FUNCTION` back to `GATED`.
+    // moon#697 added FUNCTION to `is_txn_connection_intercept`, so EXEC now
+    // dispatches it and "queueable iff dispatchable" holds. FUNCTION therefore
+    // moved into [`GATED`], and this asserts the behaviour rather than fencing
+    // its absence. Measured: redis-server 8.6.1 refuses `FUNCTION BOGUS` at
+    // queue time and answers `-EXECABORT`, exactly like CONFIG and OBJECT.
     let m = spawn_moon("1");
     let mut c = Conn::open(m.port);
     assert_eq!(c.send(&["MULTI"]), "+OK\r\n");
     assert_eq!(
         c.send(&["FUNCTION", "BOGUS"]),
-        "+QUEUED\r\n",
-        "moon#670/#697 — FUNCTION stays ungated at queue time"
+        unknown_sub("FUNCTION", "BOGUS"),
+        "moon#697 — FUNCTION is gated at queue time now"
     );
-    let exec = c.send(&["EXEC"]);
-    assert!(
-        exec.starts_with("*1\r\n") && exec.contains("unknown command 'FUNCTION'"),
-        "moon#697 — if this now dispatches, the bug is fixed: add FUNCTION to GATED \
-         and turn this into a queue-time assertion. Got {exec:?}"
-    );
+    assert_eq!(c.send(&["EXEC"]), EXECABORT);
 }
 
 #[test]

@@ -2180,6 +2180,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 &mut exec_publishes,
                 &shutdown,
                 &mut codec,
+                &func_registry,
             )
             .await
             {

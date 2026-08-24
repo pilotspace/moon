@@ -1353,6 +1353,36 @@ if should_run "transaction"; then
         echo "  FAIL: TXN-SUB-03 a valid container subcommand blocked the transaction"
     fi
 
+    # --- FUNCTION inside MULTI (moon#697) ---------------------------------
+    #
+    # Every FUNCTION subcommand was queued and then answered `unknown command`
+    # at EXEC. The verdict is read from a KEY written after it in the same
+    # transaction, not from EXEC's reply — an executor that errored on FUNCTION
+    # but still ran the rest would otherwise look fine.
+    TOTAL=$((TOTAL + 1))
+    mcli DEL tx:fn697 > /dev/null 2>&1
+    fn_exec=$(printf 'MULTI\nFUNCTION LIST\nSET tx:fn697 ran\nEXEC\n' \
+        | redis-cli -p "$PORT_RUST" 2>/dev/null || true)
+    if [ "$(mcli GET tx:fn697 2>/dev/null || true)" = "ran" ] \
+        && ! echo "$fn_exec" | grep -q "unknown command"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: FN-MULTI-01 FUNCTION LIST inside MULTI: $(echo "$fn_exec" | tr '\n' ' ')"
+    fi
+
+    # FUNCTION now joins the moon#670 queue gate, as redis 8.6.1 does.
+    TOTAL=$((TOTAL + 1))
+    fn_bogus=$(printf 'MULTI\nFUNCTION BOGUS\nEXEC\n' \
+        | redis-cli -p "$PORT_RUST" 2>&1 || true)
+    if echo "$fn_bogus" | grep -q "unknown subcommand 'BOGUS'. Try FUNCTION HELP." \
+        && echo "$fn_bogus" | grep -q "EXECABORT"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: FN-MULTI-02 expected queue-time refusal + EXECABORT, got: $(echo "$fn_bogus" | tr '\n' ' ')"
+    fi
+
     # --- Container HELP (moon#698) ----------------------------------------
     #
     # Redis gives every container a HELP subcommand answering an array of SIMPLE

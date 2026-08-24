@@ -1950,6 +1950,7 @@ pub(super) async fn run_txn_connection_intercept(
     shutdown: &crate::runtime::cancel::CancellationToken,
     codec: &mut crate::server::codec::RespCodec,
     switch_index: usize,
+    func_registry: &Rc<RefCell<Option<crate::scripting::FunctionRegistry>>>,
 ) -> Frame {
     let proto = conn.protocol_version;
     let mut out: Vec<Frame> = Vec::with_capacity(1);
@@ -1993,7 +1994,16 @@ pub(super) async fn run_txn_connection_intercept(
         || try_handle_client_early(cmd, cmd_args, client_id, conn, shaped!())
         || try_handle_client_tracking(cmd, cmd_args, client_id, conn, ctx, shaped!())
         || try_handle_client_admin(cmd, cmd_args, client_id, conn, shaped!())
-        || super::pubsub::try_handle_pubsub_introspection(cmd, cmd_args, ctx, &mut out);
+        || super::pubsub::try_handle_pubsub_introspection(cmd, cmd_args, ctx, &mut out)
+        || crate::server::conn::shared::try_handle_function_in_txn(
+            cmd,
+            cmd_args,
+            ctx,
+            shutdown,
+            func_registry,
+            &mut out,
+        )
+        .await;
 
     if !handled {
         return Frame::Error(Bytes::from(format!(
@@ -2031,6 +2041,7 @@ pub(super) async fn fill_txn_intercept_slots(
     shutdown: &crate::runtime::cancel::CancellationToken,
     codec: &mut crate::server::codec::RespCodec,
     switch_index: usize,
+    func_registry: &Rc<RefCell<Option<crate::scripting::FunctionRegistry>>>,
 ) {
     let Frame::Array(results) = result else {
         return; // NullArray (aborted) or an error frame: no slots to fill.
@@ -2067,6 +2078,7 @@ pub(super) async fn fill_txn_intercept_slots(
             shutdown,
             codec,
             switch_index,
+            func_registry,
         )
         .await;
     }

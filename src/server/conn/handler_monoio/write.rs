@@ -2,6 +2,9 @@
 //!
 //! Each helper returns `true` if the command was consumed (caller should `continue`).
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use bytes::Bytes;
 
 use crate::command::mq::{
@@ -717,6 +720,12 @@ pub(super) async fn try_handle_multi_exec(
     // `HELLO` needs the codec to switch protocol, so both travel down here.
     shutdown: &crate::runtime::cancel::CancellationToken,
     codec: &mut crate::server::codec::RespCodec,
+    // moon#697: FUNCTION joined the connection-level intercepts, and its
+    // registry is per-SHARD-THREAD (the `RefCell` is shared with that thread's
+    // SPSC drain loop, which applies inbound fan-outs). It therefore has to
+    // travel down here rather than be rebuilt: a fresh registry would be
+    // invisible to the fan-out that makes FUNCTION LOAD server-wide.
+    func_registry: &Rc<RefCell<Option<crate::scripting::FunctionRegistry>>>,
 ) -> bool {
     // --- WATCH / UNWATCH ---
     // Before the MULTI queueing step below, so `WATCH` inside MULTI is refused
@@ -889,6 +898,7 @@ pub(super) async fn try_handle_multi_exec(
                                     // occupy — a queued HELLO records its
                                     // protocol switch there, not at 0.
                                     responses.len(),
+                                    func_registry,
                                 )
                                 .await;
                                 crate::shard::coordinator::broadcast_txn_flushes(
@@ -952,6 +962,7 @@ pub(super) async fn try_handle_multi_exec(
                     shutdown,
                     codec,
                     responses.len(),
+                    func_registry,
                 )
                 .await;
             }
