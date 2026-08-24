@@ -842,6 +842,10 @@ class BinaryProvenance:
     def stale(self) -> bool:
         """True when a source file is newer than the binary.
 
+        "Source" means a file that went INTO this binary -- rustc's own
+        dep-info, not every `.rs` in the repo (moon#687). Editing a file this
+        build excludes by `cfg` is not a reason to distrust it.
+
         `newest_source_mtime == 0` means the source tree could not be scanned
         (a binary tested from outside a checkout, which is legitimate); that is
         NOT stale, because unknown must not masquerade as a verdict.
@@ -859,21 +863,86 @@ class BinaryProvenance:
         return line
 
 
-def _newest_source(root: str) -> tuple:
-    """(mtime, path) of the newest `.rs` file under `root/src`, or (0.0, "")."""
-    src = os.path.join(root, "src")
+def _compiled_sources(binary: str, root: str) -> list:
+    """The `root/src` files rustc actually read to build `binary`, or [].
+
+    moon#687: `src/` is not the set of files that went into the binary. Under
+    the default (monoio) feature set `src/server/conn/handler_single.rs` is
+    `#[cfg(feature = "runtime-tokio")]` and never reaches rustc -- so a
+    checkout that stamped it newer than the binary made a freshly built,
+    correct binary look stale, and `--strict` refused the whole run. That is
+    not a hypothetical: it took down the CI compat gate twice on a binary
+    cargo reported `Finished ... in 0.57s` for.
+
+    Cargo already writes the answer next to the binary: the dep-info `.d` file
+    is rustc's own record of every file it opened. Reading it is the
+    difference between "a file in the repo changed" and "the code in this
+    binary changed".
+
+    Returns `[]` when there is no usable dep-info, which the caller reads as
+    "no better answer available" and falls back to walking the tree. Empty
+    must never be read as "nothing can be stale" -- that would silently
+    disable the guard, which is the exact failure it exists to prevent.
+
+    A newly ADDED source is still caught: a file rustc has never seen is
+    unreachable until some existing file declares `mod` for it, and that
+    existing file is in the dep-info.
+    """
+    # Cargo writes `<name>.d` beside the binary -- `moon.d` for `moon`, and
+    # `moon.d` for `moon.exe` on Windows, hence both spellings.
+    for candidate in (binary + ".d", os.path.splitext(binary)[0] + ".d"):
+        if os.path.exists(candidate):
+            dep_info = candidate
+            break
+    else:
+        return []
+    try:
+        with open(dep_info, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return []
+
+    src_root = os.path.join(os.path.abspath(root), "src") + os.sep
+    found = []
+    for line in text.replace("\\\n", " ").splitlines():
+        # Make-style: `target: dep dep dep`. Escaped spaces (`\ `) are part of
+        # a path, so split on a space that is not preceded by a backslash.
+        _, sep, deps = line.partition(": ")
+        if not sep:
+            continue
+        for dep in re.split(r"(?<!\\) ", deps.strip()):
+            dep = dep.replace("\\ ", " ").strip()
+            if not dep.endswith(".rs"):
+                continue
+            full = os.path.abspath(os.path.join(root, dep))
+            # Registry crates, OUT_DIR generated code, and build scripts are
+            # listed too; only this checkout's `src/` is an operator's edit
+            # surface, and the walk it replaces looked at nothing else.
+            if full.startswith(src_root):
+                found.append(full)
+    return found
+
+
+def _newest_source(root: str, candidates: list = None) -> tuple:
+    """(mtime, path) of the newest `.rs` file, or (0.0, "").
+
+    `candidates` restricts the question to specific files (rustc's dep-info);
+    `None` walks every `.rs` under `root/src`.
+    """
+    if candidates is None:
+        src = os.path.join(root, "src")
+        candidates = []
+        for dirpath, _dirnames, filenames in os.walk(src):
+            candidates.extend(os.path.join(dirpath, n)
+                              for n in filenames if n.endswith(".rs"))
     newest, newest_path = 0.0, ""
-    for dirpath, _dirnames, filenames in os.walk(src):
-        for name in filenames:
-            if not name.endswith(".rs"):
-                continue
-            full = os.path.join(dirpath, name)
-            try:
-                m = os.stat(full).st_mtime
-            except OSError:
-                continue
-            if m > newest:
-                newest, newest_path = m, full
+    for full in candidates:
+        try:
+            m = os.stat(full).st_mtime
+        except OSError:
+            continue
+        if m > newest:
+            newest, newest_path = m, full
     return newest, newest_path
 
 
@@ -882,7 +951,8 @@ def binary_provenance(path: str, root: str = "") -> BinaryProvenance:
     if not root:
         root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     st = os.stat(path)
-    newest, newest_path = _newest_source(root)
+    compiled = _compiled_sources(path, root)
+    newest, newest_path = _newest_source(root, compiled or None)
     return BinaryProvenance(path=os.path.abspath(path), mtime=st.st_mtime,
                             size=st.st_size, newest_source_mtime=newest,
                             newest_source_path=newest_path)

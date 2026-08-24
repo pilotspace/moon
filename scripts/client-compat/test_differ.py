@@ -369,6 +369,93 @@ class TestBinaryProvenance(unittest.TestCase):
         prov = binary_provenance(binpath, root)
         enforce_binary_freshness(prov, strict=False)  # must not raise
 
+    # ── which sources count ────────────────────────────────────────────
+    #
+    # moon#687: the guard walked every `.rs` under `src/` and compared its
+    # mtime to the binary's. On the self-hosted CI runner that produced a
+    # false ERR_STALE_BINARY on a binary cargo had just certified fresh:
+    # `src/server/conn/handler_single.rs` is `#[cfg(feature =
+    # "runtime-tokio")]`, the compat job builds the default monoio runtime, so
+    # the file never reached rustc -- yet a checkout had stamped it newer than
+    # the binary and the whole gate refused to run.
+    #
+    # rustc already records exactly which files it read, in the dep-info `.d`
+    # file cargo writes next to the binary. That, not a directory walk, is the
+    # set the question is about.
+
+    def _cfg_tree(self, dep_info=None):
+        """A checkout with one compiled source and one cfg-excluded source.
+
+        Binary sits between them in age: newer than the compiled file, older
+        than the excluded one. So the two answers are distinguishable --
+        walking the tree says stale, reading dep-info says fresh.
+        """
+        root = tempfile.mkdtemp(prefix="prov-cfg-")
+        src = os.path.join(root, "src")
+        os.makedirs(src)
+        compiled = os.path.join(src, "lib.rs")
+        excluded = os.path.join(src, "tokio_only.rs")
+        for f in (compiled, excluded):
+            with open(f, "w") as fh:
+                fh.write("fn main() {}\n")
+        bindir = os.path.join(root, "target", "release")
+        os.makedirs(bindir)
+        binpath = os.path.join(bindir, "moon")
+        with open(binpath, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(binpath, 0o755)
+        if dep_info is not None:
+            with open(os.path.join(bindir, "moon.d"), "w") as fh:
+                fh.write(dep_info.format(bin=binpath, compiled=compiled))
+        base = 1_700_000_000
+        os.utime(compiled, (base, base))
+        os.utime(binpath, (base + 3600, base + 3600))
+        os.utime(excluded, (base + 7200, base + 7200))
+        return root, binpath, compiled, excluded
+
+    DEP_INFO = "{bin}: {compiled}\n{compiled}:\n"
+
+    def test_a_cfg_excluded_source_does_not_make_the_binary_stale(self):
+        root, binpath, _compiled, _excluded = self._cfg_tree(self.DEP_INFO)
+        prov = binary_provenance(binpath, root)
+        self.assertFalse(
+            prov.stale,
+            "a source rustc never read cannot make the binary out of date; "
+            f"blamed {prov.newest_source_path}")
+
+    def test_a_compiled_source_newer_than_the_binary_is_still_stale(self):
+        """The guard must keep catching the case it exists for."""
+        root, binpath, compiled, _excluded = self._cfg_tree(self.DEP_INFO)
+        os.utime(compiled, (1_700_000_000 + 9999, 1_700_000_000 + 9999))
+        prov = binary_provenance(binpath, root)
+        self.assertTrue(prov.stale)
+        self.assertEqual(prov.newest_source_path, compiled)
+
+    def test_without_dep_info_the_whole_tree_is_still_scanned(self):
+        """No `.d` means no better answer is available, and a conservative
+        false alarm beats silently trusting an unknown binary."""
+        root, binpath, _compiled, excluded = self._cfg_tree(dep_info=None)
+        prov = binary_provenance(binpath, root)
+        self.assertTrue(prov.stale)
+        self.assertEqual(prov.newest_source_path, excluded)
+
+    def test_an_unreadable_dep_info_falls_back_to_the_whole_tree(self):
+        """Garbage in the `.d` must not turn the guard off -- an empty input
+        set would read as "nothing can be stale", which is the failure the
+        guard exists to prevent."""
+        root, binpath, _compiled, excluded = self._cfg_tree("not a make rule\n")
+        prov = binary_provenance(binpath, root)
+        self.assertTrue(prov.stale)
+        self.assertEqual(prov.newest_source_path, excluded)
+
+    def test_dep_info_entries_outside_the_checkout_are_ignored(self):
+        """Cargo lists registry sources and OUT_DIR files too; only this
+        checkout's `src/` is the operator's edit surface."""
+        root, binpath, compiled, _excluded = self._cfg_tree(
+            "{bin}: {compiled} /nonexistent/registry/foo.rs\n{compiled}:\n")
+        prov = binary_provenance(binpath, root)
+        self.assertFalse(prov.stale)
+
     def test_provenance_renders_the_path_and_a_timestamp(self):
         """The header line is the whole point — it makes the mistake
         self-diagnosing instead of requiring someone to suspect it."""
