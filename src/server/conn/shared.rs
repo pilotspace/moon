@@ -684,6 +684,12 @@ pub(crate) fn execute_transaction_sharded(
             // flush is honoured.
             exec_flushes.push((results.len(), cmd_frame.clone(), selected));
             crate::shard::slice::with_shard(|s| {
+                // moon#677: keyspace half, on the local shard. The deferred
+                // broadcast above carries the same FLUSHALL to the other
+                // shards, where the SPSC arm clears their databases.
+                if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+                    crate::command::server_admin::flush_every_database(&mut s.databases, selected);
+                }
                 crate::shard::spsc_handler::auto_flush_indexes(
                     &mut s.vector_store,
                     &mut s.text_store,

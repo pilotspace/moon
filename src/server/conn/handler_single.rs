@@ -1555,6 +1555,44 @@ pub async fn handle_connection(
                                     }
                                 }
                                 // Auto-index HSETs from the transaction
+                                // moon#677: keyspace half of a queued FLUSHALL, on
+                                // its own rather than inside the
+                                // `vector_store`-gated auto-index loop below.
+                                // Nesting it there tied "did every database get
+                                // cleared?" to "is vector search configured?" --
+                                // two unrelated questions. Today's only caller
+                                // always passes `Some`, so that was latent rather
+                                // than live, but the coupling is one `None` away
+                                // from reinstating #677 inside MULTI/EXEC.
+                                //
+                                // Note for anyone testing this: `main.rs` routes
+                                // every runtime through `listener::run_sharded`, so
+                                // this handler is reached only through the library
+                                // entry point (`server::handle_connection`) -- the
+                                // binary's MULTI/EXEC flush goes through
+                                // `conn::shared`, which is where the integration
+                                // test's mutation check lands.
+                                //
+                                // `execute_transaction` has returned by now, so no
+                                // database guard is held and the helper can take
+                                // each lock itself.
+                                if let Frame::Array(ref txn_results) = result {
+                                    for (i, cmd_frame) in conn.command_queue.iter().enumerate() {
+                                        if i >= txn_results.len()
+                                            || matches!(txn_results[i], Frame::Error(_))
+                                        {
+                                            continue;
+                                        }
+                                        if let Some((c, _)) = extract_command(cmd_frame)
+                                            && c.eq_ignore_ascii_case(b"FLUSHALL")
+                                        {
+                                            crate::command::server_admin::flush_every_database_locked(
+                                                db.as_slice(),
+                                            );
+                                        }
+                                    }
+                                }
+
                                 if let Some(ref vs) = vector_store {
                                     if let Frame::Array(ref txn_results) = result {
                                         let mut fallback_ts = crate::text::store::TextStore::new();
@@ -2919,6 +2957,24 @@ pub async fn handle_connection(
                                     && (d_cmd.eq_ignore_ascii_case(b"FLUSHDB")
                                         || d_cmd.eq_ignore_ascii_case(b"FLUSHALL"))
                                 {
+                                    // moon#677: keyspace half. This handler
+                                    // holds `Arc<Vec<RwLock<Database>>>` and a
+                                    // live write guard on `current_db`, and
+                                    // `parking_lot` locks are not reentrant --
+                                    // so the guard is released first, exactly
+                                    // the way the MOVE and COPY-DB branches
+                                    // above release it to reach a second
+                                    // database, and re-taken afterwards to
+                                    // restore the loop invariant.
+                                    if d_cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+                                        drop(guard);
+                                        crate::command::server_admin::flush_every_database_locked(
+                                            db.as_slice(),
+                                        );
+                                        current_db = conn.selected_db;
+                                        guard = db[current_db].write();
+                                        guard.refresh_now();
+                                    }
                                     if d_cmd.eq_ignore_ascii_case(b"FLUSHDB") {
                                         if let Some(ref vs) = vector_store {
                                             vs.lock()

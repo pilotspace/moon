@@ -968,6 +968,10 @@ pub(crate) fn handle_shard_message_shared(
                                 );
                             }
 
+                            // moon#677: FLUSHALL empties every database on
+                            // this shard, not just the dispatched one.
+                            flush_every_database_on_flushall(&mut s.databases, cmd, db_idx, &frame);
+
                             // Auto-index: if HSET succeeded and key matches a vector index prefix,
                             // extract the vector field and append to mutable segment.
                             // vector_store and text_store accessed here (same with_shard closure).
@@ -1184,6 +1188,13 @@ pub(crate) fn handle_shard_message_shared(
                             args,
                         );
                     }
+
+                    // moon#677: this is the arm the flush broadcast lands on
+                    // (`coordinate_flush_broadcast` sends `MultiExecute`), so
+                    // it is the arm that empties the OTHER shards. Outside the
+                    // `is_write` block above only because `guard` is borrowed
+                    // there; FLUSHALL is a write either way.
+                    flush_every_database_on_flushall(&mut s.databases, cmd, db_idx, &frame);
 
                     results.push(if aof_ok {
                         frame
@@ -1423,6 +1434,11 @@ pub(crate) fn handle_shard_message_shared(
                         );
                     }
 
+                    // moon#677: keyspace half of the flush. Placed after the
+                    // last use of `guard` (a `&mut s.databases[db_idx]`
+                    // borrow) so the slice can be re-borrowed here.
+                    flush_every_database_on_flushall(&mut s.databases, cmd, db_idx, &frame);
+
                     results.push(if aof_ok {
                         frame
                     } else {
@@ -1588,6 +1604,10 @@ pub(crate) fn handle_shard_message_shared(
                                     args,
                                 );
                             }
+
+                            // moon#677: FLUSHALL empties every database on
+                            // this shard, not just the dispatched one.
+                            flush_every_database_on_flushall(&mut s.databases, cmd, db_idx, &frame);
 
                             // Fail-loud: mutation applied, but the client must not
                             // see success for a write whose AOF record was dropped.
@@ -1765,6 +1785,13 @@ pub(crate) fn handle_shard_message_shared(
                             args,
                         );
                     }
+
+                    // moon#677: this is the arm the flush broadcast lands on
+                    // (`coordinate_flush_broadcast` sends `MultiExecute`), so
+                    // it is the arm that empties the OTHER shards. Outside the
+                    // `is_write` block above only because `guard` is borrowed
+                    // there; FLUSHALL is a write either way.
+                    flush_every_database_on_flushall(&mut s.databases, cmd, db_idx, &frame);
 
                     results.push(if aof_ok {
                         frame
@@ -2004,6 +2031,11 @@ pub(crate) fn handle_shard_message_shared(
                             args,
                         );
                     }
+
+                    // moon#677: keyspace half of the flush. Placed after the
+                    // last use of `guard` (a `&mut s.databases[db_idx]`
+                    // borrow) so the slice can be re-borrowed here.
+                    flush_every_database_on_flushall(&mut s.databases, cmd, db_idx, &frame);
 
                     results.push(if aof_ok {
                         frame
@@ -3497,6 +3529,30 @@ pub fn auto_delete_vectors(
 /// the HSET auto-index hook must run this on a successful FLUSH, or flushed
 /// hashes stay searchable as ghost documents until restart.
 ///
+/// moon#677: the SPSC leg of `FLUSHALL`.
+///
+/// `cmd_dispatch` cleared `db_idx` and nothing else, because that is the one
+/// database it was handed. The whole point of the flush broadcast is that
+/// every shard ends up empty, and a shard that emptied one of its sixteen
+/// databases has not. Every arm that dispatches a command calls this right
+/// after its `&mut s.databases[db_idx]` borrow falls out of use.
+///
+/// Deliberately keyed on the command name rather than on a caller-passed
+/// flag: `FLUSHDB` must keep its single-database scope, and a bool argument
+/// at six call sites is one inverted call away from making `FLUSHDB`
+/// destructive.
+#[inline]
+fn flush_every_database_on_flushall(
+    databases: &mut [Database],
+    cmd: &[u8],
+    db_idx: usize,
+    frame: &crate::protocol::Frame,
+) {
+    if !matches!(frame, crate::protocol::Frame::Error(_)) && cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+        crate::command::server_admin::flush_every_database(databases, db_idx);
+    }
+}
+
 /// WS5a (db-scoped indexes): FLUSHDB (`is_flushdb = true`) now clears ONLY
 /// the contents of indexes owned by `db_index` — every other db's index
 /// contents survive. FLUSHALL (`is_flushdb = false`) still clears every

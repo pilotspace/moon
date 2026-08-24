@@ -8,10 +8,13 @@
 //! ## Semantics
 //!
 //! * `FLUSHDB` clears the currently-selected database on this shard.
-//! * `FLUSHALL` clears the currently-selected database on this shard as well;
-//!   the console gateway broadcasts the command to every shard, and a future
-//!   extension can iterate every DB index before flushing. For v0.1.5 we
-//!   match Redis behaviour with a single active DB.
+//! * `FLUSHALL` clears EVERY database on this shard; the console gateway
+//!   broadcasts the command to every shard, so one client call empties the
+//!   whole keyspace. `flushall` below can only reach the one database
+//!   `dispatch` hands it, so the other databases are cleared by
+//!   [`flush_every_database`] / [`flush_every_database_locked`], called from
+//!   the sites that hold the full set. Until moon#677 that second half did
+//!   not exist and `FLUSHALL` was a synonym for `FLUSHDB`.
 //! * `DEBUG OBJECT <key>` returns the redis-compatible one-line summary
 //!   (`Value at:0x0 refcount:N encoding:... serializedlength:N lru:0 lru_seconds_idle:0`)
 //!   so downstream tooling (redis-cli, RDBTools, Prometheus exporters) can
@@ -72,12 +75,53 @@ pub fn flushdb(db: &mut Database, args: &[Frame]) -> Frame {
 /// Clears the currently-selected database on this shard. The console gateway
 /// broadcasts the command to every shard, so a single client call fans out to
 /// the full cluster.
+///
+/// This is only half of `FLUSHALL`. `dispatch` hands every command a single
+/// `&mut Database`, so this entry point cannot express "every database" no
+/// matter what it does — the caller completes it with
+/// [`flush_every_database`] (or [`flush_every_database_locked`]), which is
+/// the only place the whole set is in scope. A caller that forgets makes
+/// `FLUSHALL` a synonym for `FLUSHDB`, which is exactly what moon#677 was.
 pub fn flushall(db: &mut Database, args: &[Frame]) -> Frame {
     if !check_flush_args(args) {
         return Frame::Error(Bytes::from_static(b"ERR syntax error"));
     }
     db.clear();
     Frame::SimpleString(Bytes::from_static(b"OK"))
+}
+
+/// moon#677: the rest of `FLUSHALL` — clear the databases `flushall` above
+/// could not see.
+///
+/// `selected` is the database `dispatch` already cleared, so it is skipped.
+/// Re-clearing it would be harmless, but skipping keeps one flush to one
+/// `record_keyspace_change` per database.
+///
+/// `Database::clear` is what makes this complete rather than cosmetic: it
+/// drops the cold-tier index and the in-flight spill record as well as the
+/// hot table, so a flushed key cannot come back through a read-through or a
+/// spill that lands after the flush.
+pub fn flush_every_database(databases: &mut [Database], selected: usize) {
+    for (idx, database) in databases.iter_mut().enumerate() {
+        if idx != selected {
+            database.clear();
+        }
+    }
+}
+
+/// Same, for the handler that owns `Vec<RwLock<Database>>` rather than a
+/// shard-local slice.
+///
+/// Takes **one lock at a time** and never holds two. That is not incidental:
+/// `MOVE` and `COPY ... DB n` hold two database locks at once, so a helper
+/// that held `selected` while reaching for another index could sit on the
+/// other side of that pair and deadlock. The caller therefore drops its own
+/// guard first and this loop clears every database including `selected` —
+/// which also means the result does not depend on `flushall` having run.
+pub fn flush_every_database_locked(databases: &[parking_lot::RwLock<Database>]) {
+    for database in databases {
+        database.write().clear();
+    }
 }
 
 fn check_flush_args(args: &[Frame]) -> bool {

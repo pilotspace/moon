@@ -259,6 +259,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that expected success. Added a regression row for #681 that checks the server is still
   alive after a truncated `FT.CREATE` — proven in both directions: it fails against a
   pre-#682 binary and passes after.
+- **`FLUSHALL` clears every database, not just the selected one** (#677). It behaved
+  exactly like `FLUSHDB`: an operator who ran it believed the instance was empty while
+  `INFO keyspace` still listed the other fifteen databases, each with its keys intact.
+  Reproduced at `--shards 1` and `--shards 4` — not a routing problem.
+
+  `dispatch` hands every command a single `&mut Database`, so `server_admin::flushall`
+  could not express "every database" no matter what it did, and the cross-shard broadcast
+  faithfully replayed the same one-database flush on every other shard. The keyspace half
+  now runs where the whole set is in scope, next to the index hook that already
+  distinguished the two commands — which is what made the bug visible in the first place:
+  a `FLUSHALL` dropped the *search indexes* for db1..db15 while keeping their *keys*.
+
+  Fixed at every site that can execute a flush, because a missing arm in one of them is
+  invisible to CI (only the monoio handler ships, and only the tokio one runs on PRs):
+  the three connection handlers, the sharded and single-threaded `MULTI`/`EXEC` paths,
+  and all six SPSC arms — including `MultiExecute`, which is the arm the flush broadcast
+  lands on and therefore the one that empties the *other* shards.
+
+  Two legs beyond the live path, both of which would have silently undone the fix:
+
+  * **AOF replay.** The record is logged with the writer's selected db, so replaying it
+    through `dispatch` restored every database the flush had emptied. Now intercepted
+    before dispatch, the same way `SWAPDB` already was and for the same reason. A restart
+    test covers it, and it fails against the un-intercepted replay.
+  * **Replication.** `apply.rs` handled `FLUSHDB` and `FLUSHALL` with one arm; a replica
+    applying a streamed `FLUSHALL` cleared one database and kept the rest, diverging from
+    its master in fifteen databases until somebody `SELECT`ed one.
+
+  `Database::clear` already drops the cold-tier index and the in-flight spill record
+  along with the hot table, so a flushed key cannot return through a read-through or
+  through a spill that lands after the flush.
+
+  `FLUSHDB` keeps its single-database scope, and there is a counter-test for that on both
+  the local and the replicated path — "clear every database" is a one-character mistake
+  away from making `FLUSHDB` destructive.
+
+  **Known gap, tracked as #685:** `redis.call('FLUSHALL')` inside a Lua script still
+  clears only the script's database. The script bridge holds one `&mut Database` and
+  already runs inside `with_shard`, so reaching the full set from there is a re-entrancy
+  problem rather than a missing call.
 
 - **A truncated `FT.CREATE` no longer aborts the server** (#681). `FT.CREATE idx ON HASH
   PREFIX 1 d: SCHEMA v VECTOR HNSW` — the argument list cut off right after the algorithm
