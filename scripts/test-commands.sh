@@ -30,7 +30,10 @@ SKIP_BENCH=false
 BENCH_ONLY=false
 MOON_ONLY=false
 CATEGORY_FILTER=""
-RUST_BINARY="./target/release/moon"
+# Overridable so the suite can be pointed at a specific build -- and so the
+# startup guard can be exercised (`MOON_BIN=/usr/bin/false` makes moon never
+# listen, which must abort the run, not produce vacuous passes).
+RUST_BINARY="${MOON_BIN:-./target/release/moon}"
 
 PASS=0
 FAIL=0
@@ -133,6 +136,29 @@ spans() {
 rcli() {
     # Run redis-cli against Redis
     redis-cli -p "$PORT_REDIS" "$@" 2>/dev/null || true
+}
+
+# Liveness probes that CAN fail.
+#
+# `rcli`/`mcli` end in `|| true` so an assertion row can compare output without
+# aborting the whole suite. That also makes them useless as health checks --
+# `mcli PING || exit 1` is a branch execution can never reach. These two do not
+# swallow the status, and they match the reply rather than just its exit code,
+# so a foreign process holding the port cannot fake liveness either.
+redis_is_up() { redis-cli -p "$PORT_REDIS" PING 2>/dev/null | grep -qx PONG; }
+moon_is_up()  { redis-cli -p "$PORT_RUST"  PING 2>/dev/null | grep -qx PONG; }
+
+# Poll rather than sleep a fixed amount: a cold first exec of a freshly built
+# binary can take well over a second, and the old `sleep 1` was the other half
+# of the same bug.
+await_up() {  # await_up <name> <probe-fn>
+    local name="$1" probe="$2" i
+    for i in $(seq 1 100); do
+        "$probe" && return 0
+        sleep 0.1
+    done
+    echo "$name failed to start (no PONG on its port after 10s)" >&2
+    return 1
 }
 
 mcli() {
@@ -573,13 +599,13 @@ RUST_LOG=warn "$RUST_BINARY" --port "$PORT_RUST" --shards "$SHARDS" --protected-
     --dir "$MOON_DATA_DIR" --disk-free-min-pct 0 &
 RUST_PID=$!
 
-sleep 1
-
-# Verify servers are up
+# Verify servers are up. These guards used to be `rcli PING || exit 1`, which
+# could never fire (see `moon_is_up`) -- a suite that ran to completion against
+# a server that was not listening reported 41 failures with every reply empty.
 if [[ "$MOON_ONLY" == "false" ]]; then
-    rcli PING >/dev/null 2>&1 || { echo "Redis failed to start"; exit 1; }
+    await_up "Redis" redis_is_up || exit 1
 fi
-mcli PING >/dev/null 2>&1 || { echo "moon failed to start"; exit 1; }
+await_up "moon" moon_is_up || exit 1
 
 log "Servers ready."
 

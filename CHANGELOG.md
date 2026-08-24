@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`scripts/test-commands.sh` can no longer run a whole suite against a server that never
+  started.** Both startup guards were structurally unreachable: `rcli`/`mcli` end in
+  `|| true` — right for the ~500 assertion rows, fatal for the health checks built on them,
+  since `mcli PING >/dev/null 2>&1 || exit 1` can never take its failure branch.
+
+  Measured against the pre-fix script with a binary that never listens: **86 rows ran and
+  10 of them PASSED**, including `FT.SEARCH does not error` and `FT.SEARCH stop-words-only
+  returns no documents` — an empty reply contains neither "err" nor "doc:", so those rows
+  are satisfied by nothing at all. The same condition now aborts with 0 rows attempted and
+  `moon failed to start (no PONG on its port after 10s)`.
+
+  The probes match the actual `PONG` rather than an exit code, so a foreign process holding
+  the port cannot fake liveness either, and they poll instead of a fixed `sleep 1` — a cold
+  first exec of a freshly built binary can take longer than that, which was the other half
+  of the same bug. `RUST_BINARY` is now `${MOON_BIN:-./target/release/moon}`, which makes
+  the guard reproducibly testable (`MOON_BIN=/usr/bin/false`) and lets the suite be pointed
+  at a known build instead of whatever happens to sit in `target/release`.
 - **FT query errors are classifiable by a client** (#691). `FT.SEARCH` / `FT.AGGREGATE`
   query errors reached the wire as bare snake_case tokens with no prefix —
   `-numeric_filter_invalid`, `-syntax_error`, `-unknown_field`.
