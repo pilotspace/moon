@@ -38,9 +38,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key position holding a non-string, more shards than the mask has bits — also still waits:
   wrongly waiting costs a batch boundary, wrongly proceeding corrupts data.
 
-  A co-located `{tag}` multi-key command still defers, and must: the coordinator executes it
-  inline rather than slotting it, so skipping the wait would re-open #507. Routing a
-  single-owner multi-key command into the slotted batch is tracked separately.
+  A co-located `{tag}` multi-key command still defers whenever its one shard is the shard with
+  pending work, and must: the coordinator executes a multi-key command inline rather than
+  slotting it, so skipping the wait there would re-open #507. Routing a single-owner multi-key
+  command into the slotted batch is the remaining scope of #513.
+
+  Workspace connections keep the old always-wait behaviour. `workspace_rewrite_args` rebinds
+  the argv *below* this guard, and the guard cannot move down there — the connection-level
+  intercepts it exists to hold back run in between — so the keys visible to it are the raw
+  ones. The workspace prefix is a hash *tag*, so every key in a workspace routes to one shard
+  however the raw names scatter, and a mask read off raw names called commands disjoint from
+  the very shard their writes were pending on (5 of 12 connections lost an `MGET`'s own batch
+  writes before this was caught). Treating every shard as pending makes the predicate answer
+  exactly as it did before the mask existed.
 
 ### Added
 - **`INFO stats` reports what the pipeline ordering guarantee costs** (`total_pipeline_remote_defer`,

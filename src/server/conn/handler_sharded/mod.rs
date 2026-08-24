@@ -818,12 +818,29 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // pending replies first, and the tail re-parses at the top
                     // of the next batch with `remote_groups` empty, so this
                     // cannot loop.
+                    // moon#513: a workspace connection's keys are rewritten to
+                    // `{<32-hex>}:<key>` BELOW this point (the `cmd_args` rebind), and
+                    // this guard cannot move down there — the connection-level
+                    // intercepts it exists to hold back run in between. So the keys
+                    // visible HERE are the raw ones, and they hash to the wrong
+                    // shards. Not by a little: the prefix is a hash TAG, so every key
+                    // in a workspace routes to ONE shard however the raw names
+                    // scatter, and a mask read off the raw names can call a command
+                    // disjoint from the very shard its writes are pending on
+                    // (measured: 5 of 12 connections lost an MGET's own batch writes).
+                    // Treating every shard as pending makes the predicate answer
+                    // exactly as it did before the mask existed.
+                    let effective_pending = if conn.workspace_id.is_some() {
+                        u64::MAX
+                    } else {
+                        pending_mask
+                    };
                     if pending_mask != 0
                         && crate::server::conn::shared::must_wait_for_pending_remote(
                             cmd,
                             cmd_args,
                             ctx.num_shards,
-                            pending_mask,
+                            effective_pending,
                         )
                     {
                         batch[frame_idx - 1] = frame;

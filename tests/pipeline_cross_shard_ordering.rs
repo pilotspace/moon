@@ -386,8 +386,9 @@ fn pco13_disjoint_shard_multikey_does_not_cut_the_batch() {
          {overlap_defers} on this same harness, so the guard is reachable)"
     );
 
-    // The relaxation must not cost the guarantee the guard exists for: a
-    // co-located MGET reading the keys its own batch just wrote still sees them.
+    // The relaxation must not cost the guarantee the guard exists for. These two
+    // keys are the WRITTEN ones — spanning shards 0 and 1, so the read meets
+    // whatever is pending — and the MGET must observe both values it just acked.
     let mut c = Conn::open(m.port);
     let r = c.pipeline(&[
         &["SET", &w[0], "11"],
@@ -398,6 +399,75 @@ fn pco13_disjoint_shard_multikey_does_not_cut_the_batch() {
         r.contains("$2\r\n11\r\n") && r.contains("$2\r\n22\r\n"),
         "an MGET reading the keys its own batch just wrote must observe them — \
          moon#507 is the whole reason the guard exists: {r:?}"
+    );
+    // And the same claim where the read is confined to ONE shard, which is the
+    // shape the mask is most tempted to wave through.
+    let one = on("pco13x", &[1]);
+    let r = c.pipeline(&[&["SET", &one[0], "33"], &["MGET", &one[0], &one[0]]]);
+    assert!(
+        r.contains("$2\r\n33\r\n"),
+        "a single-shard MGET must observe the write that acked before it in the \
+         same batch: {r:?}"
+    );
+}
+
+/// moon#513: inside a workspace, the guard must judge the keys the command will
+/// ACTUALLY run against.
+///
+/// `workspace_rewrite_args` rebinds `cmd_args` further down the batch loop than
+/// the ordering guard sits — and it cannot be moved below it, because the
+/// connection-level intercepts the guard exists to hold back (`AUTH`, `CLIENT`,
+/// `CONFIG`, `INFO`, `SELECT`, …) run in between. So the keys visible AT the
+/// guard are the raw ones, while routing later hashes the prefixed ones.
+///
+/// That is not a small discrepancy here. A workspace key is
+/// `{<32-hex>}:<key>` — a hash TAG — so every key in a workspace routes to one
+/// shard no matter how the raw names scatter. A shard mask read off the raw
+/// names can therefore say "touches nothing pending" about a command that in
+/// truth reads the very shard the batch's pending writes are going to, which is
+/// moon#507 reopened for exactly the connections that opted into isolation.
+///
+/// Asserted as CORRECTNESS across many connections rather than as a deferral
+/// count, because the count is only wrong when the workspace's shard is foreign
+/// to the connection, and `SO_REUSEPORT` decides that. The correctness claim
+/// holds for every connection, so twelve of them make the placement question
+/// moot.
+#[test]
+fn pco14_workspace_rewritten_keys_still_wait_for_their_own_batch() {
+    let m = spawn_moon(SHARDS);
+    let mut c0 = Conn::open(m.port);
+    let created = c0.send(&["WS", "CREATE", "pco14ws"]);
+    let Some(ws_id) = created
+        .strip_prefix('$')
+        .and_then(|r| r.split_once("\r\n"))
+        .and_then(|(_, rest)| rest.split("\r\n").next())
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+    else {
+        panic!("WS CREATE did not answer a workspace id: {created:?}");
+    };
+
+    let mut wrong = Vec::new();
+    for i in 0..12 {
+        let mut c = Conn::open(m.port);
+        let authed = c.send(&["WS", "AUTH", &ws_id]);
+        assert_eq!(authed, "+OK\r\n", "conn {i}: WS AUTH: {authed:?}");
+        // Raw names chosen to scatter across shards; the workspace prefix
+        // collapses them onto one. Whatever the guard reads, the MGET must
+        // observe the two writes that acked earlier in its own batch.
+        let (a, b) = (format!("pco14:{i}:aaaa"), format!("pco14:{i}:zzzz"));
+        let r = c.pipeline(&[&["SET", &a, "1"], &["SET", &b, "2"], &["MGET", &a, &b]]);
+        if !r.contains("$1\r\n1\r\n") || !r.contains("$1\r\n2\r\n") {
+            wrong.push(format!("  conn {i}: {r:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{}/12 workspace connections had an MGET miss a write from its own \
+         batch — the ordering guard judged the RAW keys while the command ran \
+         against the workspace-prefixed ones:\n{}",
+        wrong.len(),
+        wrong.join("\n")
     );
 }
 
