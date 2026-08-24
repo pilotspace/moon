@@ -23,9 +23,9 @@ use std::collections::HashSet;
 /// The list is spelled out here rather than pulled from a crate so that what moon silently
 /// discards is greppable, reviewable, and cannot change under a dependency bump.
 pub const DEFAULT_STOP_WORDS: [&str; 33] = [
-    "a", "is", "the", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in",
-    "into", "it", "no", "not", "of", "on", "or", "such", "that", "their", "then", "there",
-    "these", "they", "this", "to", "was", "will", "with",
+    "a", "is", "the", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into",
+    "it", "no", "not", "of", "on", "or", "such", "that", "their", "then", "there", "these", "they",
+    "this", "to", "was", "will", "with",
 ];
 
 /// Configurable text analysis pipeline.
@@ -67,10 +67,8 @@ impl AnalyzerPipeline {
             Some(rust_stemmers::Stemmer::create(language))
         };
 
-        let stop_words: HashSet<String> = DEFAULT_STOP_WORDS
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
+        let stop_words: HashSet<String> =
+            DEFAULT_STOP_WORDS.iter().map(|s| (*s).to_owned()).collect();
 
         Self {
             stemmer,

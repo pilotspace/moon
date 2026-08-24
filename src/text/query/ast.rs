@@ -89,9 +89,7 @@ impl QueryError {
             QueryError::Syntax => "unbalanced or unparseable query",
             QueryError::EmptyQuery => "the query is empty",
             QueryError::UnknownField(_) => "no such field in the index schema",
-            QueryError::NumericInvalid => {
-                "numeric filter bounds must be numbers with min <= max"
-            }
+            QueryError::NumericInvalid => "numeric filter bounds must be numbers with min <= max",
             QueryError::TagInvalid => "tag filter has no values",
         }
     }
@@ -128,13 +126,10 @@ impl QueryError {
             // whitespace so a CR/LF cannot reach here today, but a reply that desyncs the
             // connection is too sharp an edge to leave resting on a rule enforced somewhere
             // else: substitute every control byte rather than trust the parser to keep them out.
-            buf.extend(name.iter().map(|&b| {
-                if b < 0x20 || b == 0x7f {
-                    b'?'
-                } else {
-                    b
-                }
-            }));
+            buf.extend(
+                name.iter()
+                    .map(|&b| if b < 0x20 || b == 0x7f { b'?' } else { b }),
+            );
             buf.push(b')');
         }
         Bytes::from(buf)

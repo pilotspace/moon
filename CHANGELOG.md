@@ -44,11 +44,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   widening to every document, since RediSearch has no field-scoped match-all either.
   `*=>[KNN 10 @vec $q]` is untouched; it is still routed by the `[KNN` marker.
 
-  Unchanged: an index built from VECTOR fields alone has no inverted index, so `*` there
-  answers `ERR no such index` — exactly as every other text query on such an index already
-  did. That gap is pre-existing and uniform, not introduced here. `FT.AGGREGATE idx "*"`
-  was already correct (it short-circuits to the registry before the parser) and is not
-  touched.
+  Verified end-to-end at `--shards 4` as well as `--shards 1`, so the scatter path is
+  covered and not just the local one.
+
+  Still open, tracked as #695: an index built from VECTOR fields alone has no inverted
+  index, so `*` there answers `ERR no such index`. Enumerating it means routing the vector
+  engine's live key map through both the local handler path and `scatter_text_search` —
+  and a fix that covered only the local path would pass at `--shards 1` and silently
+  return nothing at `--shards 4`. `FT.AGGREGATE idx "*"` was already correct (it
+  short-circuits to the registry before the parser) and is not touched.
 - **`FT.SEARCH` can find ordinary English words again** (#690). Two independent defects
   produced one symptom — an empty result set, with no error and nothing for the user to
   act on.
