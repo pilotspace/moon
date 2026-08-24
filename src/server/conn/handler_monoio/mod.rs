@@ -1506,6 +1506,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
         let mut should_quit = false;
         responses.clear();
         remote_groups.clear();
+        // moon#513: one bit per shard `remote_groups` holds an entry for.
+        // Maintained beside the map so the ordering guard can ask "does this
+        // command touch a shard with pending work?" without walking it.
+        let mut pending_mask: u64 = 0;
         local_leg_write_idxs.clear();
         // The trailing bool marks a SHARDED publish. One batch map, split at flush:
         // the two namespaces share the fan-out plumbing but never the destination.
@@ -1674,8 +1678,30 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // phase 2 resolves the pending replies first, and the tail
             // re-parses at the top of the next batch with `remote_groups`
             // empty, so this cannot loop.
-            if !remote_groups.is_empty()
-                && crate::server::conn::shared::must_wait_for_pending_remote(cmd, cmd_args)
+            // moon#513: a workspace connection's keys are rewritten to
+            // `{<32-hex>}:<key>` BELOW this point (the `cmd_args` rebind), and
+            // this guard cannot move down there — the connection-level
+            // intercepts it exists to hold back run in between. So the keys
+            // visible HERE are the raw ones, and they hash to the wrong
+            // shards. Not by a little: the prefix is a hash TAG, so every key
+            // in a workspace routes to ONE shard however the raw names
+            // scatter, and a mask read off the raw names can call a command
+            // disjoint from the very shard its writes are pending on
+            // (measured: 5 of 12 connections lost an MGET's own batch writes).
+            // Treating every shard as pending makes the predicate answer
+            // exactly as it did before the mask existed.
+            let effective_pending = if conn.workspace_id.is_some() {
+                u64::MAX
+            } else {
+                pending_mask
+            };
+            if pending_mask != 0
+                && crate::server::conn::shared::must_wait_for_pending_remote(
+                    cmd,
+                    cmd_args,
+                    ctx.num_shards,
+                    effective_pending,
+                )
             {
                 frames[frame_idx - 1] = frame;
                 crate::admin::metrics_setup::record_pipeline_remote_defer();
@@ -3331,6 +3357,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     track_keys,
                     resp3_shape,
                 ));
+                pending_mask |= 1u64 << (target % u64::BITS as usize);
                 crate::admin::metrics_setup::record_dispatch_cross_spsc();
             }
         }

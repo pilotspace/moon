@@ -6,6 +6,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A pipelined multi-key command no longer cuts the batch over shards it never touches** (#513).
+
+  `must_wait_for_pending_remote`'s multi-key arm answered "wait" on the command NAME, without
+  asking where its keys were. But `remote_groups` only ever holds FOREIGN shards, so the #507
+  hazard — reading state a pending command is about to write, or writing state it then
+  overwrites — requires the two to meet on the *same* shard. An `MGET` reading shards the batch
+  has no pending work for was being cut for nothing.
+
+  The cut is not free: it ends the batch pass, and the phase-2b drain then dispatches one
+  `PipelineBatchSlotted` per target shard and awaits each reply slot in turn.
+
+  Measured on moon-dev (aarch64, 6 vCPU), `--shards 4`, 32 interleavings of
+  `SET`,`SET`,`MGET`, six fresh server starts per side interleaved:
+
+  | shape | before | after |
+  |---|---|---|
+  | `MGET` reads shards the writes never touch | 41,600 ops/s, 64 deferrals | 86,500 ops/s, **0** |
+  | `MGET` reads the shards being written | 34,300 ops/s, 64 deferrals | unchanged |
+
+  Fresh starts per measurement because `SO_REUSEPORT` decides which shard the connection lands
+  on, and that changes the shape's cost as much as the code does — one start per side compares
+  placements as much as binaries. The deferral counts are placement-independent and were 64/64
+  before and 0/0 after in every round.
+
+  Only the multi-key arm is refined; the other two still always wait, because neither can be
+  bounded by a key mask. An inline-intercepted command (`EVAL`, `SWAPDB`, …) executes against
+  the local slice whatever keys it declares, and a keyless command (`FLUSHALL`, `KEYS`, `SCAN`)
+  touches every shard. A key layout the shared walker cannot enumerate — `SORT ... BY w_*`, a
+  key position holding a non-string, more shards than the mask has bits — also still waits:
+  wrongly waiting costs a batch boundary, wrongly proceeding corrupts data.
+
+  A co-located `{tag}` multi-key command still defers whenever its one shard is the shard with
+  pending work, and must: the coordinator executes a multi-key command inline rather than
+  slotting it, so skipping the wait there would re-open #507. Routing a single-owner multi-key
+  command into the slotted batch is the remaining scope of #513.
+
+  Workspace connections keep the old always-wait behaviour. `workspace_rewrite_args` rebinds
+  the argv *below* this guard, and the guard cannot move down there — the connection-level
+  intercepts it exists to hold back run in between — so the keys visible to it are the raw
+  ones. The workspace prefix is a hash *tag*, so every key in a workspace routes to one shard
+  however the raw names scatter, and a mask read off raw names called commands disjoint from
+  the very shard their writes were pending on (5 of 12 connections lost an `MGET`'s own batch
+  writes before this was caught). Treating every shard as pending makes the predicate answer
+  exactly as it did before the mask existed.
+
 ### Added
 - **`INFO stats` reports what the pipeline ordering guarantee costs** (`total_pipeline_remote_defer`,
   and the `moon_pipeline_remote_defer_total` Prometheus counter) — groundwork for #513.
