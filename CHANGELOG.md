@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **FT query errors are classifiable by a client** (#691). `FT.SEARCH` / `FT.AGGREGATE`
+  query errors reached the wire as bare snake_case tokens with no prefix —
+  `-numeric_filter_invalid`, `-syntax_error`, `-unknown_field`.
+
+  A RESP error's first word is its *code*, and every client branches on it: redis-py
+  surfaces it through `ResponseError`, redis-rs matches `ErrorKind` off the leading token,
+  and all of them have rules for `ERR`, `WRONGTYPE`, `NOSCRIPT`, `MOVED`, `LOADING`. None
+  has a rule for `numeric_filter_invalid`, so the entire message was swallowed as the code
+  and nothing downstream could tell a client-side query mistake from a server fault.
+
+  They now read `ERR <token>: <what went wrong>` — e.g.
+  `ERR numeric_filter_invalid: numeric filter bounds must be numbers with min <= max`, and
+  the unknown-field error names the field the user actually typed, which matters in a query
+  with several `@field:` clauses. The five tokens are a frozen contract, so they are kept
+  verbatim inside the message rather than renamed out from under whatever still greps for
+  them; only the prefix and the detail are new.
+
+  The echoed field name is user input going into a frame that is written to the wire raw,
+  so every control byte in it is substituted. `is_term_byte` already excludes ASCII
+  whitespace, so a CR/LF could not reach it today — but a reply that can desync a
+  connection is not an edge worth resting on a rule enforced somewhere else.
 - **`FT.SEARCH <index> "*"` — the match-all query** (#693). `*` is how RediSearch says
   "every document in this index", and it is what every "show me what is in here" example
   uses. moon refused it on every index, and the refusal named KNN

@@ -78,4 +78,65 @@ impl QueryError {
             QueryError::TagInvalid => "tag_filter_invalid",
         }
     }
+
+    /// The human-readable half of the wire error — what the user got wrong, in words.
+    ///
+    /// Kept separate from [`Self::code`] so the frozen token stays a stable, greppable
+    /// identifier while the prose is free to improve.
+    #[inline]
+    fn detail(&self) -> &'static str {
+        match self {
+            QueryError::Syntax => "unbalanced or unparseable query",
+            QueryError::EmptyQuery => "the query is empty",
+            QueryError::UnknownField(_) => "no such field in the index schema",
+            QueryError::NumericInvalid => {
+                "numeric filter bounds must be numbers with min <= max"
+            }
+            QueryError::TagInvalid => "tag filter has no values",
+        }
+    }
+
+    /// The full RESP error string: `ERR <code>: <detail>`.
+    ///
+    /// moon#691: these used to reach the wire as bare snake_case tokens (`-numeric_filter_invalid`).
+    /// A RESP error's FIRST WORD is its code and every client branches on it — redis-py surfaces it
+    /// through `ResponseError`, redis-rs matches `ErrorKind` off the leading token — and no client
+    /// has a rule for `numeric_filter_invalid`, so the whole message was swallowed as the code and
+    /// nothing downstream could tell a client-side query mistake from a server fault.
+    ///
+    /// The five tokens are a frozen §3 contract (`fts-query-combinators`), so they are KEPT
+    /// verbatim inside the message rather than renamed out from under whatever still greps for
+    /// them. Only the prefix and the detail are new.
+    ///
+    /// Allocating here is fine: this is the parse-failure path, not the hot path.
+    pub fn wire_error(&self) -> Bytes {
+        let code = self.code();
+        let detail = self.detail();
+        let name: &[u8] = match self {
+            QueryError::UnknownField(n) => n.as_ref(),
+            _ => b"",
+        };
+        let mut buf = Vec::with_capacity(4 + code.len() + 2 + detail.len() + name.len() + 4);
+        buf.extend_from_slice(b"ERR ");
+        buf.extend_from_slice(code.as_bytes());
+        buf.extend_from_slice(b": ");
+        buf.extend_from_slice(detail.as_bytes());
+        if !name.is_empty() {
+            buf.extend_from_slice(b" (");
+            // The field name is USER INPUT being echoed into a frame that `serialize_frame`
+            // writes raw, terminating it with CRLF. `is_term_byte` already excludes ASCII
+            // whitespace so a CR/LF cannot reach here today, but a reply that desyncs the
+            // connection is too sharp an edge to leave resting on a rule enforced somewhere
+            // else: substitute every control byte rather than trust the parser to keep them out.
+            buf.extend(name.iter().map(|&b| {
+                if b < 0x20 || b == 0x7f {
+                    b'?'
+                } else {
+                    b
+                }
+            }));
+            buf.push(b')');
+        }
+        Bytes::from(buf)
+    }
 }

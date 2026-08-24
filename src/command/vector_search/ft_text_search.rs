@@ -1597,7 +1597,7 @@ pub fn run_text_query_on_index(
             build_text_response_with_total(&results, total, offset, count)
         }
         // The five frozen wire codes (fts-query-combinators §3); never panics on malformed input.
-        Err(e) => Frame::Error(Bytes::copy_from_slice(e.code().as_bytes())),
+        Err(e) => Frame::Error(e.wire_error()),
     }
 }
 
