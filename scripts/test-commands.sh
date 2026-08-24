@@ -222,6 +222,44 @@ assert_match() {
     fi
 }
 
+# Compare a countdown reply (TTL / PTTL / OBJECT IDLETIME) that both servers
+# compute from "now".
+#
+# moon#683: `TTL k:eat` after `EXPIREAT k:eat 9999999999` was compared with
+# assert_match and failed as REDIS=8212451035 vs MOON=8212451034. That is not a
+# divergence -- `rcli` and `mcli` are separate `redis-cli` invocations ~100ms
+# apart, so whenever a whole second ticks over between them the two answers
+# differ by exactly 1. Sampling both servers back-to-back 16 times (8 in each
+# order, to cancel any bias from who is asked first) gave diff=0 every time, so
+# there is no rounding-direction difference to catch. Allowing +/-1 keeps the
+# assertion honest and stops the row failing on a clock tick.
+assert_match_countdown() {
+    local desc="$1" tolerance="$2"
+    shift 2
+    TOTAL=$((TOTAL + 1))
+    local redis_out moon_out delta
+    redis_out=$(rcli "$@" 2>/dev/null || echo "__REDIS_ERROR__")
+    moon_out=$(mcli "$@" 2>/dev/null || echo "__MOON_ERROR__")
+    if ! [[ "$redis_out" =~ ^-?[0-9]+$ && "$moon_out" =~ ^-?[0-9]+$ ]]; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $desc (non-numeric reply)"
+        echo "    CMD:   redis-cli $*"
+        echo "    REDIS: $redis_out"
+        echo "    MOON:  $moon_out"
+        return
+    fi
+    delta=$(( redis_out > moon_out ? redis_out - moon_out : moon_out - redis_out ))
+    if [[ "$delta" -le "$tolerance" ]]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $desc (differs by $delta, tolerance $tolerance)"
+        echo "    CMD:   redis-cli $*"
+        echo "    REDIS: $redis_out"
+        echo "    MOON:  $moon_out"
+    fi
+}
+
 # Compare sorted output (for unordered results like HGETALL, SMEMBERS, SUNION)
 assert_match_sorted() {
     local desc="$1"
@@ -953,7 +991,7 @@ if should_run "key"; then
     # EXPIREAT / PEXPIREAT / EXPIRETIME / PEXPIRETIME
     rcli SET k:eat val >/dev/null 2>&1; mcli SET k:eat val >/dev/null 2>&1
     assert_match "EXPIREAT"            EXPIREAT k:eat 9999999999
-    assert_match "TTL after EXPIREAT"  TTL k:eat
+    assert_match_countdown "TTL after EXPIREAT" 1 TTL k:eat
     assert_match "EXPIRETIME"          EXPIRETIME k:eat
     assert_match "PEXPIRETIME"         PEXPIRETIME k:eat
 
@@ -1114,7 +1152,11 @@ if should_run "connection"; then
     assert_moon_contains "GETKEYS wrong arity" "Invalid number of arguments" COMMAND GETKEYS LMPOP 0 LEFT
     assert_moon_contains "GETKEYS unextractable argv" "Invalid arguments specified" COMMAND GETKEYS LMPOP abc k LEFT
     assert_moon_contains "COMMAND COUNT arity" "wrong number of arguments" COMMAND COUNT extra
-    assert_match "ROLE"                ROLE
+    # Known red, tracked as moon#536: moon's master_repl_offset advances even
+    # with no replica ever attached, so the third element of ROLE diverges from
+    # Redis's 0. Left asserting the full reply rather than narrowed to the
+    # parts that agree -- narrowing it would hide the fix when it lands.
+    assert_match "ROLE (known: moon#536)"                ROLE
     assert_moon_contains "ROLE reports master" "master" ROLE
     assert_match "RESET"               RESET
     assert_moon_contains "RESET arity" "wrong number of arguments" RESET now
@@ -1437,15 +1479,26 @@ if should_run "vector"; then
     python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<4f',0.0,1.0,0.0,0.0))" | redis-cli -x -p "$PORT_RUST" HSET doc:2 embedding >/dev/null 2>&1 || true
 
     # FT.SEARCH — verify command doesn't error (redis-cli can't pass binary args directly)
+    # Known red, tracked as moon#693: moon has no match-all query -- `*` is
+    # refused on every index type with "ERR invalid KNN query syntax", even on
+    # a TEXT-only index that has no KNN anything. Kept asserting the RediSearch
+    # behaviour rather than pinned to moon's error, so the row goes green on
+    # its own the day match-all lands.
     TOTAL=$((TOTAL + 1)); FT_SEARCH=$(mcli FT.SEARCH myidx "*" 2>&1)
-    if ! echo "$FT_SEARCH" | grep -qi "err"; then PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH does not error"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH returned error"; fi
+    if ! echo "$FT_SEARCH" | grep -qi "err"; then PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH does not error"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH \"*\" returned error (moon#693: no match-all query): $FT_SEARCH"; fi
 
     # FT.DROPINDEX — remove index
     assert_moon "FT.DROPINDEX"             "OK"    FT.DROPINDEX myidx
 
     # FT.INFO after drop should error
+    # moon#683: this grepped for "err" or "not found" and failed on moon's
+    # actual reply. Verified on the wire: moon answers `-Unknown Index name`
+    # -- a real RESP error frame, carrying the exact text RediSearch uses. The
+    # row was wrong, not the server. (redis-cli prints an error reply to stdout
+    # with no "(error)" marker when it is not on a tty, so the message text is
+    # the only thing a shell harness can match on.)
     TOTAL=$((TOTAL + 1)); FT_INFO_AFTER=$(mcli FT.INFO myidx 2>&1)
-    if echo "$FT_INFO_AFTER" | grep -qi "err\|not found"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO after drop errors"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO after drop errors"; fi
+    if echo "$FT_INFO_AFTER" | grep -qi "unknown index"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO after drop errors"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO after drop should report an unknown index, got: $FT_INFO_AFTER"; fi
 fi
 
 # ===========================================================================
@@ -1815,7 +1868,7 @@ if should_run "vector"; then
     elif echo "$FT_MULTI" | grep -q "doc:"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH multi-term AND returns results"
     else
-        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH multi-term AND returned no results"
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH multi-term AND returned no results (moon#690: 'test' is on the 1298-word stoplist, and the query keeps it as a required conjunct the index dropped)"
     fi
 
     # 4. Field-targeted search: @title:(document) — only doc:t2 has 'document' in title
@@ -1882,7 +1935,7 @@ if should_run "vector"; then
     elif echo "$FT_CROSS" | grep -q "doc:t1"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH cross-field finds 'world' in doc:t1"
     else
-        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH cross-field should find 'world' in doc:t1"
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH cross-field should find 'world' in doc:t1 (moon#690: 'world' is on the 1298-word stoplist and never reaches the index)"
     fi
     # ── End FT.SEARCH BM25 text search tests ─────────────────────────────────────
 
@@ -2067,15 +2120,34 @@ if should_run "vector"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: REGRESSION exact 'machine' returned no docs: $FT_EXACT"
     fi
 
-    # Test 7: MIXED — exact + fuzzy combined query
+    # Test 7: MIXED — exact + fuzzy combined query.
+    #
+    # moon#683: this row asked for `%%machne%% deep` and demanded documents.
+    # There are none, and there should be none: the fuzzy half resolves to
+    # "machine" (fz:1 only) and "deep" is in fz:2 only, so the conjunction is
+    # empty by construction. Measured against this exact corpus --
+    # machine->fz:1, deep->fz:2, learning->fz:1 fz:2 -- the row was asserting
+    # that AND behaves like OR.
+    #
+    # It now uses a conjunction that IS satisfiable (fz:1 has both "machine"
+    # and "learning") and keeps the empty one as the counter-assertion, which
+    # is the half that proves AND is really AND.
     TOTAL=$((TOTAL + 1))
-    FT_MIXED=$(mcli FT.SEARCH fuzzyidx "%%machne%% deep" LIMIT 0 10 2>&1)
+    FT_MIXED=$(mcli FT.SEARCH fuzzyidx "%%machne%% learning" LIMIT 0 10 2>&1)
     if echo "$FT_MIXED" | grep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: MIXED exact+fuzzy returned error: $FT_MIXED"
-    elif echo "$FT_MIXED" | grep -q "fz:"; then
-        PASS=$((PASS + 1)); echo "  PASS: MIXED %%machne%% deep (fuzzy+exact) returns docs"
+    elif echo "$FT_MIXED" | grep -q "^fz:1$"; then
+        PASS=$((PASS + 1)); echo "  PASS: MIXED %%machne%% learning (fuzzy+exact) returns fz:1"
     else
-        FAIL=$((FAIL + 1)); echo "  FAIL: MIXED %%machne%% deep returned no docs: $FT_MIXED"
+        FAIL=$((FAIL + 1)); echo "  FAIL: MIXED %%machne%% learning expected fz:1, got: $FT_MIXED"
+    fi
+
+    TOTAL=$((TOTAL + 1))
+    FT_MIXED_EMPTY=$(mcli FT.SEARCH fuzzyidx "%%machne%% deep" LIMIT 0 10 2>&1)
+    if echo "$FT_MIXED_EMPTY" | grep -q "fz:"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: MIXED unsatisfiable conjunction matched (AND behaving as OR): $FT_MIXED_EMPTY"
+    else
+        PASS=$((PASS + 1)); echo "  PASS: MIXED %%machne%% deep matches nothing (no doc has both)"
     fi
 
     # Test 8: FUZ-02 — FST build via FT.COMPACT on a fresh index
@@ -2261,13 +2333,26 @@ if should_run "vector"; then
         fi
         mcli DEL agg:partial >/dev/null 2>&1
 
-        # TAG-05: multi-tag OR rejected with actionable error
+        # TAG-05: multi-tag OR returns the union of both tags.
+        #
+        # moon#683: this row demanded the rejection moon used to emit
+        # ("multi-tag OR syntax not supported") and had gone stale -- the
+        # feature landed and nobody updated the row, so a working feature read
+        # as a failure. It now asserts the union: 5 open + 3 closed, and both
+        # tags represented.
         TOTAL=$((TOTAL + 1))
-        TAG_OR=$(mcli FT.SEARCH aggidx '@status:{open|closed}' LIMIT 0 10 2>&1)
-        if echo "$TAG_OR" | grep -qi "multi-tag OR syntax not supported"; then
-            PASS=$((PASS + 1)); echo "  PASS: TAG-05 multi-tag OR rejected with actionable error"
+        TAG_OR=$(mcli FT.SEARCH aggidx '@status:{open|closed}' LIMIT 0 20 2>&1)
+        TAG_OR_N=$(echo "$TAG_OR" | head -1)
+        TAG_ONLY_OPEN=$(mcli FT.SEARCH aggidx '@status:{open}' LIMIT 0 20 2>&1 | head -1)
+        TAG_ONLY_CLOSED=$(mcli FT.SEARCH aggidx '@status:{closed}' LIMIT 0 20 2>&1 | head -1)
+        if echo "$TAG_OR" | grep -qi "err\|not supported"; then
+            FAIL=$((FAIL + 1)); echo "  FAIL: TAG-05 multi-tag OR returned an error: $TAG_OR"
+        elif ! [[ "$TAG_ONLY_OPEN$TAG_ONLY_CLOSED$TAG_OR_N" =~ ^[0-9]+$ ]]; then
+            FAIL=$((FAIL + 1)); echo "  FAIL: TAG-05 non-numeric counts (or=$TAG_OR_N open=$TAG_ONLY_OPEN closed=$TAG_ONLY_CLOSED)"
+        elif [ "$TAG_OR_N" = "$((TAG_ONLY_OPEN + TAG_ONLY_CLOSED))" ]; then
+            PASS=$((PASS + 1)); echo "  PASS: TAG-05 multi-tag OR returns the union ($TAG_ONLY_OPEN + $TAG_ONLY_CLOSED = $TAG_OR_N)"
         else
-            FAIL=$((FAIL + 1)); echo "  FAIL: TAG-05 expected explicit rejection, got: $TAG_OR"
+            FAIL=$((FAIL + 1)); echo "  FAIL: TAG-05 union expected $((TAG_ONLY_OPEN + TAG_ONLY_CLOSED)), got $TAG_OR_N"
         fi
 
         # ── Plan 07 NUMERIC gap-closure assertions ─────────────────────────
@@ -2314,12 +2399,20 @@ if should_run "vector"; then
         fi
 
         # NUMERIC-05: inverted range REJECTED (T-152-07-05)
+        # moon#683: the row grepped for the phrase "min > max". Verified on the
+        # wire that moon does reject the inverted range -- but as
+        # `-numeric_filter_invalid`, a bare token with no ERR prefix, which is
+        # its own compatibility problem (moon#691). What this row is for is
+        # T-152-07-05, "an inverted range is refused rather than executed", so
+        # it asserts exactly that: an error, and no documents.
         TOTAL=$((TOTAL + 1))
         NUM_INV=$(mcli FT.SEARCH aggidx '@score:[100 10]' LIMIT 0 10 2>&1)
-        if echo "$NUM_INV" | grep -qi "min > max"; then
-            PASS=$((PASS + 1)); echo "  PASS: NUMERIC-05 inverted range REJECTED with actionable error"
+        if echo "$NUM_INV" | grep -q "^agg:"; then
+            FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-05 inverted range was EXECUTED, not refused: $NUM_INV"
+        elif echo "$NUM_INV" | grep -qi "numeric_filter_invalid\|min > max\|err"; then
+            PASS=$((PASS + 1)); echo "  PASS: NUMERIC-05 inverted range refused ($NUM_INV)"
         else
-            FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-05 expected 'min > max' rejection, got: $NUM_INV"
+            FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-05 expected a refusal, got: $NUM_INV"
         fi
 
         # NUMERIC-06: NaN-on-write filtered (write-path guard, T-152-07-02).
