@@ -865,6 +865,7 @@ pub static SUBCOMMAND_META: phf::Map<&'static str, &'static [SubcommandMeta]> = 
     ],
     "CLIENT" => &[
         SubcommandMeta { name: "GETNAME", arity: 2, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
+        SubcommandMeta { name: "HELP", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: CON },
         SubcommandMeta { name: "ID", arity: 2, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
         SubcommandMeta { name: "INFO", arity: 2, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
         SubcommandMeta { name: "KILL", arity: -3, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
@@ -900,11 +901,13 @@ pub static SUBCOMMAND_META: phf::Map<&'static str, &'static [SubcommandMeta]> = 
         SubcommandMeta { name: "COUNT", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
         SubcommandMeta { name: "DOCS", arity: -2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
         SubcommandMeta { name: "GETKEYS", arity: -3, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "HELP", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
         SubcommandMeta { name: "INFO", arity: -2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
         SubcommandMeta { name: "LIST", arity: -2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
     ],
     "CONFIG" => &[
         SubcommandMeta { name: "GET", arity: -3, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
+        SubcommandMeta { name: "HELP", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SRV },
         SubcommandMeta { name: "RESETSTAT", arity: 2, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
         SubcommandMeta { name: "REWRITE", arity: 2, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
         SubcommandMeta { name: "SET", arity: -4, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
@@ -912,6 +915,7 @@ pub static SUBCOMMAND_META: phf::Map<&'static str, &'static [SubcommandMeta]> = 
     "FUNCTION" => &[
         SubcommandMeta { name: "DELETE", arity: 3, flags: CommandFlags::WRITE.union(CommandFlags::NOSCRIPT), acl_categories: SCR },
         SubcommandMeta { name: "FLUSH", arity: -2, flags: CommandFlags::WRITE.union(CommandFlags::NOSCRIPT), acl_categories: SCR },
+        SubcommandMeta { name: "HELP", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SCR },
         SubcommandMeta { name: "LIST", arity: -2, flags: CommandFlags::NOSCRIPT, acl_categories: SCR },
         SubcommandMeta { name: "LOAD", arity: -3, flags: CommandFlags::WRITE.union(CommandFlags::NOSCRIPT), acl_categories: SCR },
     ],
@@ -937,6 +941,7 @@ pub static SUBCOMMAND_META: phf::Map<&'static str, &'static [SubcommandMeta]> = 
     ],
     "PUBSUB" => &[
         SubcommandMeta { name: "CHANNELS", arity: -2, flags: CommandFlags::PUBSUB.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: PUB },
+        SubcommandMeta { name: "HELP", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: PUB },
         SubcommandMeta { name: "NUMPAT", arity: 2, flags: CommandFlags::PUBSUB.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: PUB },
         SubcommandMeta { name: "NUMSUB", arity: -2, flags: CommandFlags::PUBSUB.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: PUB },
         SubcommandMeta { name: "SHARDCHANNELS", arity: -2, flags: CommandFlags::PUBSUB.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: PUB },
@@ -945,6 +950,7 @@ pub static SUBCOMMAND_META: phf::Map<&'static str, &'static [SubcommandMeta]> = 
     "SCRIPT" => &[
         SubcommandMeta { name: "EXISTS", arity: -3, flags: CommandFlags::NOSCRIPT, acl_categories: SCR },
         SubcommandMeta { name: "FLUSH", arity: -2, flags: CommandFlags::NOSCRIPT, acl_categories: SCR },
+        SubcommandMeta { name: "HELP", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: SCR },
         SubcommandMeta { name: "LOAD", arity: 3, flags: CommandFlags::NOSCRIPT.union(CommandFlags::STALE), acl_categories: SCR },
     ],
     "SLOWLOG" => &[
@@ -958,11 +964,13 @@ pub static SUBCOMMAND_META: phf::Map<&'static str, &'static [SubcommandMeta]> = 
         SubcommandMeta { name: "CREATECONSUMER", arity: 5, flags: CommandFlags::WRITE, acl_categories: STM },
         SubcommandMeta { name: "DELCONSUMER", arity: 5, flags: CommandFlags::WRITE, acl_categories: STM },
         SubcommandMeta { name: "DESTROY", arity: 4, flags: CommandFlags::WRITE, acl_categories: STM },
+        SubcommandMeta { name: "HELP", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: STM },
         SubcommandMeta { name: "SETID", arity: -5, flags: CommandFlags::WRITE, acl_categories: STM },
     ],
     "XINFO" => &[
         SubcommandMeta { name: "CONSUMERS", arity: 4, flags: CommandFlags::READONLY, acl_categories: STM },
         SubcommandMeta { name: "GROUPS", arity: 3, flags: CommandFlags::READONLY, acl_categories: STM },
+        SubcommandMeta { name: "HELP", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: STM },
         SubcommandMeta { name: "STREAM", arity: -3, flags: CommandFlags::READONLY, acl_categories: STM },
     ],
 };

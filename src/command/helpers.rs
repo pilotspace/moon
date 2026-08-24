@@ -110,3 +110,37 @@ pub fn err_unknown_subcommand(container: &str, sub: &[u8]) -> Frame {
     buf.extend_from_slice(b" HELP.");
     Frame::Error(Bytes::from(buf))
 }
+
+/// Build a `<CONTAINER> HELP` reply in Redis's shape — moon#698.
+///
+/// Redis's help replies are uniform across all 13 containers (measured against
+/// `redis-server 8.6.1`, 2026-08-24): an array of **simple** strings that opens
+/// with `<CONTAINER> <subcommand> [<arg> [value] [opt] ...]. Subcommands are:`
+/// and closes with `HELP` / `    Print this help.`
+///
+/// The header and the footer are emitted HERE rather than repeated in each
+/// container's table, so a container with a divergent shape is unrepresentable
+/// rather than merely untested. Callers supply only the body lines; see
+/// [`crate::command::help_text`].
+///
+/// Not a hot path — `HELP` is an introspection command — so building the header
+/// into a `Vec<u8>` and sizing the reply with `with_capacity` is the whole cost.
+pub fn help_reply(container: &str, body: &[&'static str]) -> Frame {
+    let mut out: Vec<Frame> = Vec::with_capacity(body.len() + 3);
+
+    let mut header = Vec::with_capacity(container.len() + 56);
+    header.extend_from_slice(container.as_bytes());
+    header.extend_from_slice(b" <subcommand> [<arg> [value] [opt] ...]. Subcommands are:");
+    out.push(Frame::SimpleString(Bytes::from(header)));
+
+    out.extend(
+        body.iter()
+            .map(|l| Frame::SimpleString(Bytes::from_static(l.as_bytes()))),
+    );
+
+    out.push(Frame::SimpleString(Bytes::from_static(b"HELP")));
+    out.push(Frame::SimpleString(Bytes::from_static(
+        b"    Print this help.",
+    )));
+    Frame::Array(out.into())
+}

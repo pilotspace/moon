@@ -292,28 +292,11 @@ pub fn debug_digest_shard_partials() -> Frame {
 }
 
 fn debug_help() -> Frame {
-    Frame::Array(framevec![
-        Frame::BulkString(Bytes::from_static(b"DEBUG OBJECT <key>")),
-        Frame::BulkString(Bytes::from_static(
-            b"  Show low-level info about a key's object.",
-        )),
-        Frame::BulkString(Bytes::from_static(b"DEBUG SLEEP <seconds>")),
-        Frame::BulkString(Bytes::from_static(
-            b"  Stall this shard for <seconds> (float, capped at 30).",
-        )),
-        Frame::BulkString(Bytes::from_static(b"DEBUG PANIC")),
-        Frame::BulkString(Bytes::from_static(
-            b"  Panic this shard thread (crash-handling test aid, as in Redis).",
-        )),
-        Frame::BulkString(Bytes::from_static(b"DEBUG DIGEST")),
-        Frame::BulkString(Bytes::from_static(
-            b"  SHA1 fingerprint of the whole dataset, every database and \
-              shard. Byte-compatible with Redis, so two servers can be \
-              compared in one round trip. Not available inside MULTI or Lua.",
-        )),
-        Frame::BulkString(Bytes::from_static(b"DEBUG HELP")),
-        Frame::BulkString(Bytes::from_static(b"  Return subcommand help.")),
-    ])
+    // moon#698: Redis refuses DEBUG outright unless `enable-debug-command` is
+    // set, so there is no oracle to match here — but routing it through the same
+    // constructor keeps DEBUG consistent with the twelve containers that do have
+    // one, rather than being the last place the old bulk-string shape survives.
+    crate::command::help_text::help_or_empty("DEBUG")
 }
 
 fn debug_object(db: &mut Database, args: &[Frame]) -> Frame {
@@ -838,20 +821,7 @@ fn get_vsz_bytes() -> usize {
 }
 
 fn memory_help() -> Frame {
-    Frame::Array(framevec![
-        Frame::BulkString(Bytes::from_static(b"MEMORY USAGE <key> [SAMPLES <count>]")),
-        Frame::BulkString(Bytes::from_static(
-            b"  Estimate memory usage of the key in bytes.",
-        )),
-        Frame::BulkString(Bytes::from_static(b"MEMORY STATS")),
-        Frame::BulkString(Bytes::from_static(
-            b"  Return a map of memory usage counters.",
-        )),
-        Frame::BulkString(Bytes::from_static(b"MEMORY DOCTOR")),
-        Frame::BulkString(Bytes::from_static(b"  Memory health report.")),
-        Frame::BulkString(Bytes::from_static(b"MEMORY HELP")),
-        Frame::BulkString(Bytes::from_static(b"  Return subcommand help.")),
-    ])
+    crate::command::help_text::help_or_empty("MEMORY")
 }
 
 fn memory_usage(db: &mut Database, args: &[Frame]) -> Frame {
@@ -2017,11 +1987,14 @@ mod tests {
             Frame::Array(v) => {
                 // At least OBJECT + SLEEP + HELP (3 pairs of label + description = 6 entries).
                 assert!(v.len() >= 6, "expected >=6 help lines, got {}", v.len());
+                // moon#698: help lines are SIMPLE strings, as Redis emits them.
+                // Matching on BulkString here would filter every line away and
+                // leave the `contains` assertions checking an empty string.
                 let joined: Vec<String> = v
                     .iter()
-                    .filter_map(|e| match e {
-                        Frame::BulkString(b) => Some(String::from_utf8_lossy(b).to_string()),
-                        _ => None,
+                    .map(|e| match e {
+                        Frame::SimpleString(b) => String::from_utf8_lossy(b).to_string(),
+                        other => panic!("help lines must be simple strings, got {other:?}"),
                     })
                     .collect();
                 let blob = joined.join("\n");
@@ -2030,6 +2003,56 @@ mod tests {
             }
             other => panic!("expected Array, got {other:?}"),
         }
+    }
+
+    /// DEBUG's help must not advertise a subcommand DEBUG refuses.
+    ///
+    /// The other twelve containers are covered by
+    /// `container_help_698.rs::ch2`, which walks `SUBCOMMAND_META` — but DEBUG
+    /// is deliberately absent from that table (it is not a Redis-published
+    /// container), so nothing tied its help to its dispatch. Two invented names
+    /// reached review before this test existed.
+    ///
+    /// Classifies rather than executes: `DEBUG PANIC` panics by design and
+    /// `DEBUG SLEEP` stalls the thread, so a test that actually dispatched every
+    /// advertised name would take the process down with it.
+    #[test]
+    fn debug_help_advertises_only_what_debug_dispatches() {
+        let mut db = Database::new();
+        let Frame::Array(lines) = debug(&mut db, &[bulk(b"HELP")]) else {
+            panic!("DEBUG HELP must be an array");
+        };
+        let mut checked = 0;
+        for line in lines.iter() {
+            let Frame::SimpleString(b) = line else {
+                panic!("help lines must be simple strings, got {line:?}");
+            };
+            let text = String::from_utf8_lossy(b);
+            // Body lines are indented; a flush-left line names a subcommand.
+            if text.starts_with(' ') || text.contains("Subcommands are:") {
+                continue;
+            }
+            let Some(name) = text.split_whitespace().next() else {
+                continue;
+            };
+            // `DEBUG DIGEST` classifies as Err by design — it is recognised only
+            // so this path can refuse it loudly and route to its intercept — so
+            // the assertion is on the ERROR TEXT, not on Ok/Err.
+            if let Err(e) = classify_debug(&[bulk(name.as_bytes())])
+                && let Frame::Error(msg) = &e
+            {
+                assert!(
+                    !msg.starts_with(b"ERR unknown subcommand"),
+                    "DEBUG HELP advertises {name}, which DEBUG does not dispatch (moon#698)"
+                );
+            }
+            checked += 1;
+        }
+        // A parser that matched nothing would pass every assertion above.
+        assert!(
+            checked >= 5,
+            "expected to check at least OBJECT/SLEEP/PANIC/DIGEST/HELP, checked {checked}"
+        );
     }
 
     #[test]

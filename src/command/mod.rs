@@ -10,6 +10,7 @@ pub mod geo;
 #[cfg(feature = "graph")]
 pub mod graph;
 pub mod hash;
+pub mod help_text;
 pub mod helpers;
 pub mod hll;
 pub mod identity;

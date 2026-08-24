@@ -300,6 +300,9 @@ pub fn xgroup(db: &mut Database, args: &[Frame]) -> Frame {
     // arity check, and from the SAME table the `MULTI` queue gate consults. An
     // arity error here reads to a client as "the subcommand exists, you called
     // it wrong", which is how `XGROUP BOGUS` used to answer.
+    if let Some(help) = crate::command::help_text::help_if_requested("XGROUP", subcmd) {
+        return help;
+    }
     if !crate::command::metadata::is_known_subcommand(b"XGROUP", subcmd) {
         {
             return crate::command::helpers::err_unknown_subcommand("XGROUP", subcmd);

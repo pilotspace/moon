@@ -29,7 +29,9 @@ pub fn handle_function(registry: &mut FunctionRegistry, args: &[Frame]) -> Frame
         }
     };
 
-    if sub.eq_ignore_ascii_case(b"LOAD") {
+    if let Some(help) = crate::command::help_text::help_if_requested("FUNCTION", sub) {
+        help
+    } else if sub.eq_ignore_ascii_case(b"LOAD") {
         handle_function_load(registry, &args[1..])
     } else if sub.eq_ignore_ascii_case(b"LIST") {
         handle_function_list(registry, &args[1..])

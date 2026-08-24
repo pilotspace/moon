@@ -495,6 +495,9 @@ pub fn xinfo(db: &mut Database, args: &[Frame]) -> Frame {
     let Some(subcmd) = args.first().and_then(extract_bytes) else {
         return err_wrong_args("XINFO");
     };
+    if let Some(help) = crate::command::help_text::help_if_requested("XINFO", subcmd) {
+        return help;
+    }
     if !crate::command::metadata::is_known_subcommand(b"XINFO", subcmd) {
         return crate::command::helpers::err_unknown_subcommand("XINFO", subcmd);
     }
@@ -867,6 +870,9 @@ pub fn xinfo_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms:
     let Some(subcmd) = args.first().and_then(extract_bytes) else {
         return err_wrong_args("XINFO");
     };
+    if let Some(help) = crate::command::help_text::help_if_requested("XINFO", subcmd) {
+        return help;
+    }
     if !crate::command::metadata::is_known_subcommand(b"XINFO", subcmd) {
         return crate::command::helpers::err_unknown_subcommand("XINFO", subcmd);
     }

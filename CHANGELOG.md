@@ -286,6 +286,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   survive a restart — `rebuild_from_manifest` is the only thing that re-indexes them.
 ### Fixed
 
+- **Every container command answers `HELP`, in Redis's shape** (#698). Redis gives all 13
+  container commands a `HELP` subcommand; Moon served it on five and refused it on eight,
+  each with a different error. Two of those (`PUBSUB`, `XINFO`) reported an *arity* problem,
+  which reads to a client as "the subcommand exists, you called it wrong", and three
+  (`CONFIG`, `COMMAND`, `FUNCTION`) refused the request with a message telling the client to
+  run the exact command it had just refused. `HELP` is how `redis-cli` and several driver
+  test suites discover a container's surface, and it is the fallback a user reaches for
+  after a typo — precisely the moment Moon's own error text pointed them at it.
+
+  The five that "already worked" were only correct under a type-blind reading. Measured
+  against `redis-server 8.6.1` by RESP *type*, every Redis help reply is an array of
+  **simple** strings opening with `<CONTAINER> <subcommand> [<arg> [value] [opt] ...].
+  Subcommands are:` and closing with `HELP` / `    Print this help.`; `OBJECT`, `MEMORY` and
+  `SLOWLOG` emitted bulk strings with no header line. All 13 now route through one
+  constructor that emits the header and footer itself, so a container with a divergent
+  shape is unrepresentable rather than merely untested.
+
+  The help body advertises what **Moon** dispatches, not what Redis does: copying Redis's
+  text verbatim would have advertised four `CLIENT KILL` filters Moon silently ignores
+  (`parse_kill_args` supports `ID`/`ADDR`/`USER` and the legacy `addr:port` only), plus
+  `COMMAND GETKEYSANDFLAGS` and the recognised-but-unimplemented `FUNCTION
+  DUMP`/`RESTORE`/`STATS`. Tests walk `SUBCOMMAND_META` in both directions so the two
+  tables cannot drift. Also removes a dead second `MEMORY HELP` in `key_extra.rs` that had
+  no callers and a different body, surviving only because `pub` silences `dead_code`.
+
+  Because the `HELP` name now appears in `SUBCOMMAND_META`, this also removes #670's one
+  known consequence: `<CONTAINER> HELP` inside `MULTI` queues and runs instead of aborting
+  the transaction. `FUNCTION` is the exception, blocked on #697, and is fenced by a test
+  that fails once #697 is fixed rather than silently skipping forever.
+
 - **Unknown container subcommands are refused at `MULTI` queue time, and every container
   refuses them with Redis's wording** (#670). Redis validates a container's *subcommand*
   before storing the command in a transaction: `CONFIG BOGUS` is refused on the `MULTI`
