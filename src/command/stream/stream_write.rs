@@ -296,6 +296,15 @@ pub fn xgroup(db: &mut Database, args: &[Frame]) -> Frame {
         Some(s) => s,
         None => return err_wrong_args("XGROUP"),
     };
+    // moon#670: an unknown subcommand is refused with Redis's shape BEFORE any
+    // arity check, and from the SAME table the `MULTI` queue gate consults. An
+    // arity error here reads to a client as "the subcommand exists, you called
+    // it wrong", which is how `XGROUP BOGUS` used to answer.
+    if !crate::command::metadata::is_known_subcommand(b"XGROUP", subcmd) {
+        {
+            return crate::command::helpers::err_unknown_subcommand("XGROUP", subcmd);
+        }
+    }
 
     if subcmd.eq_ignore_ascii_case(b"CREATE") {
         // XGROUP CREATE key group id [MKSTREAM]

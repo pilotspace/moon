@@ -489,13 +489,18 @@ fn group_info_frame(
 }
 
 pub fn xinfo(db: &mut Database, args: &[Frame]) -> Frame {
+    // moon#670: judge the SUBCOMMAND before the arity of the rest. `XINFO
+    // BOGUS` is one argument, so the old order answered "wrong number of
+    // arguments" — which reads as "the subcommand exists" and hid the defect.
+    let Some(subcmd) = args.first().and_then(extract_bytes) else {
+        return err_wrong_args("XINFO");
+    };
+    if !crate::command::metadata::is_known_subcommand(b"XINFO", subcmd) {
+        return crate::command::helpers::err_unknown_subcommand("XINFO", subcmd);
+    }
     if args.len() < 2 {
         return err_wrong_args("XINFO");
     }
-    let subcmd = match extract_bytes(&args[0]) {
-        Some(s) => s,
-        None => return err_wrong_args("XINFO"),
-    };
     let key = match extract_bytes(&args[1]) {
         Some(k) => k,
         None => return err_wrong_args("XINFO"),
@@ -852,16 +857,23 @@ pub fn xread_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms:
 
 /// XINFO STREAM|GROUPS|CONSUMERS key … — read-only twin.
 ///
-/// XINFO HELP / missing args → returns an arity error (executed locally).
+/// Missing args → an arity error (executed locally). An unknown subcommand —
+/// `XINFO HELP` among them, since Moon has no HELP yet (moon#698) — is refused
+/// as an unknown SUBCOMMAND before the arity is looked at (moon#670).
 pub fn xinfo_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms: u64) -> Frame {
+    // moon#670: judge the SUBCOMMAND before the arity of the rest. `XINFO
+    // BOGUS` is one argument, so the old order answered "wrong number of
+    // arguments" — which reads as "the subcommand exists" and hid the defect.
+    let Some(subcmd) = args.first().and_then(extract_bytes) else {
+        return err_wrong_args("XINFO");
+    };
+    if !crate::command::metadata::is_known_subcommand(b"XINFO", subcmd) {
+        return crate::command::helpers::err_unknown_subcommand("XINFO", subcmd);
+    }
     if args.len() < 2 {
         // XINFO HELP or bare XINFO — handle locally
         return err_wrong_args("XINFO");
     }
-    let subcmd = match extract_bytes(&args[0]) {
-        Some(s) => s,
-        None => return err_wrong_args("XINFO"),
-    };
     let key = match extract_bytes(&args[1]) {
         Some(k) => k,
         None => return err_wrong_args("XINFO"),

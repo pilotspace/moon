@@ -1225,10 +1225,9 @@ pub(super) fn try_handle_client_admin(
                 return true;
             }
             // Unknown CLIENT subcommand
-            responses.push(Frame::Error(Bytes::from(format!(
-                "ERR unknown subcommand '{}'",
-                String::from_utf8_lossy(&sub_bytes)
-            ))));
+            responses.push(crate::command::helpers::err_unknown_subcommand(
+                "CLIENT", &sub_bytes,
+            ));
             return true;
         }
     }

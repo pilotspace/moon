@@ -631,6 +631,13 @@ pub fn object(db: &mut Database, args: &[Frame]) -> Frame {
         Some(s) => s,
         None => return err_wrong_args("OBJECT"),
     };
+    // moon#670: an unknown subcommand is refused with Redis's shape BEFORE any
+    // arity check, and from the SAME table the `MULTI` queue gate consults. An
+    // arity error here reads to a client as "the subcommand exists, you called
+    // it wrong", which is how `OBJECT BOGUS` used to answer.
+    if !crate::command::metadata::is_known_subcommand(b"OBJECT", subcommand) {
+        return crate::command::helpers::err_unknown_subcommand("OBJECT", subcommand);
+    }
     if subcommand.eq_ignore_ascii_case(b"ENCODING") {
         if args.len() != 2 {
             return err_wrong_args("OBJECT");
@@ -712,6 +719,13 @@ pub fn object_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(s) => s,
         None => return err_wrong_args("OBJECT"),
     };
+    // moon#670: an unknown subcommand is refused with Redis's shape BEFORE any
+    // arity check, and from the SAME table the `MULTI` queue gate consults. An
+    // arity error here reads to a client as "the subcommand exists, you called
+    // it wrong", which is how `OBJECT BOGUS` used to answer.
+    if !crate::command::metadata::is_known_subcommand(b"OBJECT", subcommand) {
+        return crate::command::helpers::err_unknown_subcommand("OBJECT", subcommand);
+    }
     if subcommand.eq_ignore_ascii_case(b"HELP") {
         return object_help();
     }

@@ -490,10 +490,10 @@ pub fn handle_acl(
             Frame::BulkString(Bytes::from(hex[..hex_chars].to_string()))
         }
 
-        _ => Frame::Error(Bytes::from(format!(
-            "ERR unknown subcommand '{}'. Try ACL HELP.",
-            sub
-        ))),
+        // moon#670: already Redis's shape; routed through the shared helper so
+        // it cannot drift away from it, and so the echoed name is
+        // control-byte-substituted like every other container's.
+        _ => crate::command::helpers::err_unknown_subcommand("ACL", sub.as_bytes()),
     }
 }
 
