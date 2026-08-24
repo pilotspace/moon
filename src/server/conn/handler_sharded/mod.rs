@@ -597,6 +597,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                 let mut local_leg_write_idxs: Vec<usize> = Vec::new();
                 let mut should_quit = false;
                 let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, usize, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape)>> = HashMap::with_capacity(ctx.num_shards);
+                // moon#513: one bit per shard `remote_groups` holds an entry for.
+                // Maintained beside the map so the ordering guard can ask "does
+                // this command touch a shard with pending work?" without walking it.
+                let mut pending_mask: u64 = 0;
                 // Accumulate cross-shard PUBLISH pairs per target shard for batch dispatch
                 // Key: target shard ID -> Vec of (response_index, channel, message)
                 // Trailing bool marks a SHARDED publish. One batch map, split at flush:
@@ -814,8 +818,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // pending replies first, and the tail re-parses at the top
                     // of the next batch with `remote_groups` empty, so this
                     // cannot loop.
-                    if !remote_groups.is_empty()
-                        && crate::server::conn::shared::must_wait_for_pending_remote(cmd, cmd_args)
+                    if pending_mask != 0
+                        && crate::server::conn::shared::must_wait_for_pending_remote(
+                            cmd,
+                            cmd_args,
+                            ctx.num_shards,
+                            pending_mask,
+                        )
                     {
                         batch[frame_idx - 1] = frame;
                         crate::admin::metrics_setup::record_pipeline_remote_defer();
@@ -2657,6 +2666,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         let resp_idx = responses.len();
                         responses.push(Frame::Null);
                         remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(dispatch_frame), aof_bytes, conn.selected_db, track_keys, resp3_shape));
+                        pending_mask |= 1u64 << (target % u64::BITS as usize);
                         cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
                     }
                 }

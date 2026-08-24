@@ -1506,6 +1506,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
         let mut should_quit = false;
         responses.clear();
         remote_groups.clear();
+        // moon#513: one bit per shard `remote_groups` holds an entry for.
+        // Maintained beside the map so the ordering guard can ask "does this
+        // command touch a shard with pending work?" without walking it.
+        let mut pending_mask: u64 = 0;
         local_leg_write_idxs.clear();
         // The trailing bool marks a SHARDED publish. One batch map, split at flush:
         // the two namespaces share the fan-out plumbing but never the destination.
@@ -1674,8 +1678,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // phase 2 resolves the pending replies first, and the tail
             // re-parses at the top of the next batch with `remote_groups`
             // empty, so this cannot loop.
-            if !remote_groups.is_empty()
-                && crate::server::conn::shared::must_wait_for_pending_remote(cmd, cmd_args)
+            if pending_mask != 0
+                && crate::server::conn::shared::must_wait_for_pending_remote(
+                    cmd,
+                    cmd_args,
+                    ctx.num_shards,
+                    pending_mask,
+                )
             {
                 frames[frame_idx - 1] = frame;
                 crate::admin::metrics_setup::record_pipeline_remote_defer();
@@ -3331,6 +3340,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     track_keys,
                     resp3_shape,
                 ));
+                pending_mask |= 1u64 << (target % u64::BITS as usize);
                 crate::admin::metrics_setup::record_dispatch_cross_spsc();
             }
         }

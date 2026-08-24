@@ -261,6 +261,146 @@ fn pco12_the_ordering_guard_reports_what_it_costs() {
     );
 }
 
+/// moon#513: a multi-key command must not cut the batch over shards it never
+/// touches.
+///
+/// `must_wait_for_pending_remote`'s multi-key arm answered "wait" without asking
+/// WHERE the keys are. But `remote_groups` only ever holds FOREIGN shards — the
+/// slotting branch is `else if let Some(target) = target_shard`, and
+/// `target_shard` is `None` for a local key — so the moon#507 hazard (reading
+/// state a pending command is about to write, or writing state it then
+/// overwrites) requires the two to meet ON THE SAME SHARD. An `MGET` reading
+/// shards the batch has no pending work for cannot be in that hazard, and the
+/// cut buys nothing.
+///
+/// It is not free: a cut ends the batch pass, and the phase-2b drain then
+/// dispatches one `PipelineBatchSlotted` per target shard and awaits each reply
+/// slot in turn.
+///
+/// # Why the overlap leg is here
+///
+/// The connection lands on whichever shard `SO_REUSEPORT` gives it, and this
+/// test cannot choose. If every written key happened to be LOCAL, nothing would
+/// enter `remote_groups`, the guard would never be consulted, and the disjoint
+/// leg would pass while proving nothing. So the writes deliberately span two
+/// shards — at `--shards 4` at least one of them is foreign whatever shard the
+/// connection got — and the overlap leg asserts that an `MGET` reading THOSE
+/// shards still defers. A green disjoint leg means something only because the
+/// overlap leg is non-zero on the same harness.
+///
+/// The co-located case (`{tag}` keys, so the `MGET` and the pending writes share
+/// one shard) is deliberately NOT here: it must still defer, because the
+/// coordinator executes a multi-key command inline rather than slotting it, so
+/// skipping the wait would re-open moon#507. Routing a single-owner multi-key
+/// command into the slotted batch is the separate follow-up.
+#[test]
+fn pco13_disjoint_shard_multikey_does_not_cut_the_batch() {
+    fn defers(port: u16) -> u64 {
+        let mut c = Conn::open(port);
+        let info = c.send(&["INFO", "stats"]);
+        info.split("\r\n")
+            .find_map(|l| l.strip_prefix("total_pipeline_remote_defer:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| {
+                panic!("INFO stats has no total_pipeline_remote_defer field: {info:?}")
+            })
+    }
+
+    let shards: usize = SHARDS.parse().expect("SHARDS is a number");
+    assert!(
+        shards >= 4,
+        "this test needs >= 4 shards to build a disjoint pair of shard sets"
+    );
+    let owner = |k: &String| moon::shard::dispatch::key_to_shard(k.as_bytes(), shards);
+    // Probed, never assumed: a key set that silently collapsed onto one shard
+    // would turn the disjoint leg vacuous in exactly the way this test exists
+    // to prevent.
+    // ONE key per named shard, never "the first n keys landing in this set" —
+    // two keys that both hashed to shard 0 would make the overlap leg depend on
+    // which shard SO_REUSEPORT gave the connection: with the writes' shard-0 leg
+    // local, `remote_groups` would hold only shard 1, the shard-0-only MGET
+    // would be disjoint from it, and the leg would measure 0 for a reason that
+    // has nothing to do with the code under test.
+    let on = |prefix: &str, want: &[usize]| -> Vec<String> {
+        let keys: Vec<String> = want
+            .iter()
+            .map(|&s| {
+                (0..)
+                    .map(|i| format!("{prefix}{s}:{i}"))
+                    .find(|k| owner(k) == s)
+                    .expect("a key exists for every shard")
+            })
+            .collect();
+        let got: Vec<usize> = keys.iter().map(owner).collect();
+        assert_eq!(got, want, "probe put {prefix} on the wrong shards");
+        keys
+    };
+    // Writes and the overlap read both cover shards 0 AND 1. Whatever shard the
+    // connection landed on, at most one of those is local, so `remote_groups`
+    // always holds one of them and the overlap read always meets it.
+    let w = on("pco13w", &[0, 1]);
+    let overlap = on("pco13o", &[0, 1]);
+    // Reads only shards 2 and 3, which the writes never touch.
+    let disjoint = on("pco13d", &[2, 3]);
+
+    let m = spawn_moon(SHARDS);
+
+    // Runs the same 32 interleavings, reading `read` between each write pair.
+    let run = |read: &[String]| -> (u64, Vec<String>) {
+        let base = defers(m.port);
+        let mut c = Conn::open(m.port);
+        let mut wrong = Vec::new();
+        for i in 0..32 {
+            let r = c.pipeline(&[
+                &["SET", &w[0], "1"],
+                &["SET", &w[1], "2"],
+                &["MGET", &read[0], &read[1]],
+            ]);
+            if framed_len(r.as_bytes(), 3).is_none() {
+                wrong.push(format!("  i={i}: expected 3 framed replies, got {r:?}"));
+            }
+        }
+        drop(c);
+        (defers(m.port) - base, wrong)
+    };
+
+    let (overlap_defers, overlap_wrong) = run(&overlap);
+    assert!(overlap_wrong.is_empty(), "{}", overlap_wrong.join("\n"));
+    assert!(
+        overlap_defers > 0,
+        "the MGET reads the very shards the pending SETs are writing, so the \
+         moon#507 guard MUST still cut the batch. Zero here means the writes \
+         never reached `remote_groups` at all — the harness landed on a shard \
+         that made them local — and the disjoint leg below would prove nothing"
+    );
+
+    let (disjoint_defers, disjoint_wrong) = run(&disjoint);
+    assert!(disjoint_wrong.is_empty(), "{}", disjoint_wrong.join("\n"));
+    assert_eq!(
+        disjoint_defers, 0,
+        "the MGET reads shards 2 and 3 while the pending SETs write shards 0 \
+         and 1, so there is nothing for it to wait on — yet it cut the batch \
+         {disjoint_defers} times, once per interleaving, each a full drain \
+         cycle. The guard is still answering on the command NAME instead of on \
+         where its keys are (the overlap leg above measured \
+         {overlap_defers} on this same harness, so the guard is reachable)"
+    );
+
+    // The relaxation must not cost the guarantee the guard exists for: a
+    // co-located MGET reading the keys its own batch just wrote still sees them.
+    let mut c = Conn::open(m.port);
+    let r = c.pipeline(&[
+        &["SET", &w[0], "11"],
+        &["SET", &w[1], "22"],
+        &["MGET", &w[0], &w[1]],
+    ]);
+    assert!(
+        r.contains("$2\r\n11\r\n") && r.contains("$2\r\n22\r\n"),
+        "an MGET reading the keys its own batch just wrote must observe them — \
+         moon#507 is the whole reason the guard exists: {r:?}"
+    );
+}
+
 #[test]
 fn pco1_mget_sees_writes_from_its_own_batch() {
     let m = spawn_moon(SHARDS);

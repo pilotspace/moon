@@ -1597,10 +1597,88 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
 /// executed at the start of the next batch, which is always correct and costs
 /// one batch boundary. Wrongly calling something SAFE is the direction that
 /// corrupts data, so when in doubt, add it to the wait set.
-pub(crate) fn must_wait_for_pending_remote(cmd: &[u8], args: &[Frame]) -> bool {
-    is_multi_key_command(cmd, args)
-        || is_inline_intercepted(cmd)
-        || extract_primary_key(cmd, args).is_none()
+/// The shards a command's keys live on, as a bitmask — or `None` when the mask
+/// cannot be trusted and the caller must fall back to waiting.
+///
+/// `None` for: more shards than the mask has bits; a key position holding a
+/// non-string (a malformed argv, which must reach the command so it earns its
+/// own error rather than a routing decision); a layout the shared walker cannot
+/// enumerate; and `AtPlusComputed` (`SORT ... BY w_*`), where a key nobody can
+/// name would be missing from the mask — exactly the case that must keep
+/// waiting.
+///
+/// Uses the shared key-position walker (moon#582), the same one ACL, cache
+/// invalidation and [`cross_shard_multikey_rejection`] use, so `ZUNIONSTORE dst
+/// numkeys ...` is enumerated by the code that already knows that layout rather
+/// than by a second, drifting copy.
+#[must_use]
+fn command_shard_mask(cmd: &[u8], args: &[Frame], num_shards: usize) -> Option<u64> {
+    if num_shards > u64::BITS as usize {
+        return None;
+    }
+    let idx = match crate::acl::keyspec::command_key_positions(cmd, args) {
+        crate::acl::keyspec::KeyPositions::At(idx) => idx,
+        _ => return None,
+    };
+    let mut mask = 0u64;
+    for k in idx {
+        let key: &[u8] = match args.get(k.idx) {
+            Some(Frame::BulkString(b) | Frame::SimpleString(b)) => b.as_ref(),
+            _ => return None,
+        };
+        mask |= 1u64 << crate::shard::dispatch::key_to_shard(key, num_shards);
+    }
+    // An empty mask would read as "touches nothing" and skip the wait. A
+    // multi-key command that named no key at all is malformed, so wait.
+    (mask != 0).then_some(mask)
+}
+
+/// # moon#513: refined by WHERE the keys are
+///
+/// `pending` is the set of shards this batch still has undispatched commands
+/// for — one bit per shard, maintained alongside `remote_groups`. A zero mask
+/// means the caller should not be asking at all.
+///
+/// The hazard `must_wait_for_pending_remote` exists to stop is a command
+/// reading state a pending command is about to write, or writing state a
+/// pending command then overwrites. Both require the two to meet ON THE SAME
+/// SHARD. `remote_groups` holds only FOREIGN shards — the slotting branch is
+/// `else if let Some(target) = target_shard`, and `target_shard` is `None` for a
+/// local key — so a command whose keys avoid every pending shard cannot be in
+/// that hazard, and cutting the batch for it buys nothing.
+///
+/// It buys nothing at a real price: a cut ends the batch pass, and the phase-2b
+/// drain then dispatches one `PipelineBatchSlotted` per target shard and awaits
+/// each reply slot in turn. Measured at `--shards 4`, a `{tag}`-co-located
+/// `MGET` interleaved between writes — the co-location pattern the docs tell
+/// users to adopt — cut 32 times in 32 interleavings, each one a full drain cycle.
+///
+/// Only the multi-key arm is refined. The other two cannot be bounded by a key
+/// mask and are unchanged:
+///
+/// * an inline-intercepted command (EVAL, SWAPDB, …) executes against the LOCAL
+///   slice whatever keys it declares, so its declared keys do not describe the
+///   state it touches;
+/// * a keyless command (FLUSHALL, KEYS, SCAN, DBSIZE) aggregates across every
+///   shard, so its mask would be "all of them" anyway.
+///
+/// The conservative direction is unchanged too: every `None` from
+/// [`command_shard_mask`] waits.
+#[must_use]
+pub(crate) fn must_wait_for_pending_remote(
+    cmd: &[u8],
+    args: &[Frame],
+    num_shards: usize,
+    pending: u64,
+) -> bool {
+    if is_inline_intercepted(cmd) || extract_primary_key(cmd, args).is_none() {
+        return true;
+    }
+    if !is_multi_key_command(cmd, args) {
+        // Routed by its own single key — the fast path, unchanged.
+        return false;
+    }
+    command_shard_mask(cmd, args, num_shards).is_none_or(|mask| mask & pending != 0)
 }
 
 /// Commands handled INLINE by a `try_handle_*` interceptor before the routing
@@ -3686,6 +3764,118 @@ mod cross_shard_write_tests {
         assert!(
             cross_shard_multikey_rejection(b"RENAME", &[bulk("k"), bulk("k")], 64).is_none(),
             "RENAME k k names one key"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pending_shard_mask_tests {
+    //! moon#513: the guard now asks WHERE a multi-key command's keys are.
+    //!
+    //! Shard membership is searched for with the routing hash the server
+    //! itself uses, never written as a literal — a hardcoded key that drifted
+    //! onto a different shard would make these pass for the wrong reason.
+
+    use super::{command_shard_mask, must_wait_for_pending_remote};
+    use crate::protocol::Frame;
+    use crate::shard::dispatch::key_to_shard;
+    use bytes::Bytes;
+
+    const SHARDS: usize = 4;
+
+    fn bulk(s: &str) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s.as_bytes()))
+    }
+
+    /// Two keys owned by `want`, found by hashing rather than assumed.
+    fn keys_on(prefix: &str, want: usize) -> Vec<Frame> {
+        let found: Vec<Frame> = (0..10_000)
+            .map(|i| format!("{prefix}:{i}"))
+            .filter(|k| key_to_shard(k.as_bytes(), SHARDS) == want)
+            .take(2)
+            .map(|k| bulk(&k))
+            .collect();
+        assert_eq!(found.len(), 2, "no keys found for shard {want}");
+        found
+    }
+
+    fn mask_of(shards: &[usize]) -> u64 {
+        shards.iter().fold(0u64, |m, s| m | 1u64 << s)
+    }
+
+    #[test]
+    fn mask_names_every_shard_the_keys_touch() {
+        let mut args = keys_on("psm_a", 0);
+        args.extend(keys_on("psm_b", 3));
+        assert_eq!(
+            command_shard_mask(b"MGET", &args, SHARDS),
+            Some(mask_of(&[0, 3])),
+            "an MGET spanning shards 0 and 3 must report both"
+        );
+        assert_eq!(
+            command_shard_mask(b"MGET", &keys_on("psm_c", 2), SHARDS),
+            Some(mask_of(&[2])),
+            "keys that all hash to one shard must report one bit"
+        );
+    }
+
+    #[test]
+    fn unenumerable_argv_fails_closed() {
+        // A key position holding a non-string is a malformed invocation: it must
+        // reach the command and earn its own error, not a routing decision.
+        assert_eq!(
+            command_shard_mask(b"MGET", &[bulk("k"), Frame::Integer(7)], SHARDS),
+            None
+        );
+        // Nothing named at all — waiting is the only safe answer.
+        assert_eq!(command_shard_mask(b"MGET", &[], SHARDS), None);
+        // More shards than the mask has bits.
+        assert_eq!(
+            command_shard_mask(b"MGET", &keys_on("psm_d", 1), 65),
+            None,
+            "a shard id past bit 63 cannot be represented, so the mask must not \
+             claim to know"
+        );
+    }
+
+    #[test]
+    fn waits_only_when_the_shard_sets_meet() {
+        let on2 = keys_on("psm_e", 2);
+        assert!(
+            must_wait_for_pending_remote(b"MGET", &on2, SHARDS, mask_of(&[2])),
+            "reading shard 2 while shard 2 has pending work is the moon#507 \
+             hazard and must still wait"
+        );
+        assert!(
+            !must_wait_for_pending_remote(b"MGET", &on2, SHARDS, mask_of(&[0, 1, 3])),
+            "reading shard 2 while every OTHER shard has pending work touches \
+             nothing pending, so the batch must not be cut"
+        );
+        assert!(
+            must_wait_for_pending_remote(b"MGET", &[bulk("k"), Frame::Integer(7)], SHARDS, 1),
+            "an unenumerable argv falls back to waiting"
+        );
+    }
+
+    #[test]
+    fn the_other_two_arms_are_unchanged() {
+        let on2 = keys_on("psm_f", 2);
+        // Inline-intercepted: runs against the LOCAL slice whatever keys it
+        // declares, so its declared keys do not describe the state it touches.
+        assert!(
+            must_wait_for_pending_remote(b"EVAL", &on2, SHARDS, mask_of(&[0])),
+            "EVAL must wait even when its declared keys avoid every pending shard"
+        );
+        // Keyless: aggregates across every shard.
+        assert!(
+            must_wait_for_pending_remote(b"DBSIZE", &[], SHARDS, mask_of(&[0])),
+            "a keyless command touches every shard"
+        );
+        // Routed by its own single key: the fast path, never cut.
+        assert!(
+            !must_wait_for_pending_remote(b"GET", &on2[..1], SHARDS, u64::MAX),
+            "a single-key command routes by its own key and is ordered by the \
+             slotted batch itself"
         );
     }
 }
