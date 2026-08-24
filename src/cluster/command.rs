@@ -67,10 +67,14 @@ pub fn handle_cluster_command(
         b"FAILOVER" => handle_cluster_failover(&args[1..], cluster_state),
         b"REPLICAS" | b"SLAVES" => handle_cluster_replicas(&args[1..], cluster_state),
         b"COUNT-FAILURE-REPORTS" => handle_cluster_count_failure_reports(&args[1..], cluster_state),
-        _ => Frame::Error(Bytes::from(format!(
-            "ERR unknown subcommand '{}' for CLUSTER",
-            String::from_utf8_lossy(&subcmd_upper)
-        ))),
+        // moon#670: Redis's shape, and echoing what the CLIENT sent rather
+        // than the upper-cased copy this match happens to hold.
+        //
+        // Only the cluster-ENABLED path. With cluster support disabled Moon
+        // answers every CLUSTER subcommand — bogus ones included — with
+        // "cluster support disabled" before reaching here; changing that is out
+        // of scope and fenced by `csp7`.
+        _ => crate::command::helpers::err_unknown_subcommand("CLUSTER", &subcmd),
     }
 }
 

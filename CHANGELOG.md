@@ -190,6 +190,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as an answer. That shard also logs a warning, because cold keys with no manifest will not
   survive a restart — `rebuild_from_manifest` is the only thing that re-indexes them.
 ### Fixed
+
+- **Unknown container subcommands are refused at `MULTI` queue time, and every container
+  refuses them with Redis's wording** (#670). Redis validates a container's *subcommand*
+  before storing the command in a transaction: `CONFIG BOGUS` is refused on the `MULTI`
+  connection and the block is poisoned, so `EXEC` answers `-EXECABORT` and nothing runs.
+  Moon replied `+QUEUED` and only noticed at `EXEC`, so the transaction *ran* — a client
+  that treats `+QUEUED` as "this command is valid", which is what Redis guarantees, sent
+  the rest of a transaction Redis would have refused wholesale and then applied the
+  partial result.
+
+  The issue reported six containers. Sweeping all fourteen against a live
+  `redis-server 8.6.1` found the gate missed **fourteen**, and that ten of them also
+  spelled the rejection differently: `COMMAND` said `Unknown` with a capital U (a
+  one-character difference is still a different string to a client matching on it),
+  `SLOWLOG` and `XGROUP` never named the offending subcommand at all (`XGROUP` reported
+  a literal `'UNKNOWN'`), and `OBJECT` and `XINFO` reported an *arity* error — which
+  reads to a client as "the subcommand exists, you called it wrong".
+
+  All of it now goes through one `err_unknown_subcommand` helper producing Redis's
+  single shape, `ERR unknown subcommand '<as sent>'. Try <CONTAINER> HELP.`, with the
+  echoed name control-byte-substituted (a subcommand arrives as a bulk string, so an
+  un-substituted CRLF would end the error frame early and let the client read the
+  remainder as a second, attacker-chosen reply).
+
+  The queue gate and each container's own dispatch guard now read **one** predicate,
+  `is_known_subcommand`. That shared reading is the safety argument: the gate's contract
+  is *queueable iff dispatchable*, and gating on the raw `SUBCOMMAND_META` table instead
+  would have broken it — that table is a publication contract for `COMMAND DOCS`/`INFO`
+  and deliberately omits `FUNCTION DUMP`, which dispatch accepts and answers.
+
+  Two containers are deliberately ungated, each fenced by a test rather than a comment:
+  `CLUSTER`, because with cluster support disabled every subcommand including a bogus
+  one is answered "cluster support disabled" so dispatch never reports an unknown
+  subcommand; and `FUNCTION`, because of #697. Known consequence: `<CONTAINER> HELP` now
+  aborts a transaction on Moon where Redis would run it — that is Moon's missing `HELP`
+  (#698) surfacing earlier, and is the same treatment Moon already gave unknown
+  top-level commands.
 - **`scripts/test-commands.sh`: 26 failures down to 4, and the 4 name their issue** (#683).
   The suite's failures were mostly the suite. Eight distinct defects, each verified against a
   live server before touching the row:

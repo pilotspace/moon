@@ -74,10 +74,7 @@ pub fn module(args: &[Frame]) -> Frame {
         );
     }
 
-    Frame::Error(Bytes::from(format!(
-        "ERR unknown subcommand '{}'. Try MODULE HELP.",
-        String::from_utf8_lossy(sub)
-    )))
+    crate::command::helpers::err_unknown_subcommand("MODULE", sub)
 }
 
 #[cfg(test)]

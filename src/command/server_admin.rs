@@ -248,10 +248,13 @@ fn classify_debug(args: &[Frame]) -> Result<DebugCall<'_>, Frame> {
         // every shard; see `digest_off_path_error`.
         Err(digest_off_path_error())
     } else {
-        Err(Frame::Error(Bytes::from(format!(
-            "ERR DEBUG subcommand '{}' not supported",
-            String::from_utf8_lossy(sub),
-        ))))
+        // moon#670: the same shape as every other container. Redis refuses
+        // `DEBUG` outright unless `enable-debug-command` is set, so this one has
+        // no oracle reply to match — it is uniform with Moon's other containers
+        // by choice, not by measurement.
+        Err(crate::command::helpers::err_unknown_subcommand(
+            "DEBUG", sub,
+        ))
     }
 }
 
@@ -464,10 +467,12 @@ fn classify_memory(args: &[Frame]) -> Result<MemoryCall<'_>, Frame> {
     } else if sub.eq_ignore_ascii_case(b"HELP") {
         Ok(MemoryCall::Help)
     } else {
-        Err(Frame::Error(Bytes::from(format!(
-            "ERR MEMORY subcommand '{}' not supported",
-            String::from_utf8_lossy(sub),
-        ))))
+        // moon#670: Redis's shape, from the shared helper. `MEMORY` used to
+        // say "not supported", which reads as a capability gap rather than a
+        // typo.
+        Err(crate::command::helpers::err_unknown_subcommand(
+            "MEMORY", sub,
+        ))
     }
 }
 
@@ -1992,8 +1997,12 @@ mod tests {
         let mut db = Database::new();
         let args = [Frame::BulkString(Bytes::from_static(b"DIGEST-SHARD"))];
         match debug(&mut db, &args) {
-            Frame::Error(e) => assert!(
-                String::from_utf8_lossy(&e).contains("not supported"),
+            // moon#670 changed the wording, not the property: the assertion is
+            // now the EXACT string rather than a substring, so it also pins the
+            // shape a client matches on.
+            Frame::Error(e) => assert_eq!(
+                &e[..],
+                b"ERR unknown subcommand 'DIGEST-SHARD'. Try DEBUG HELP.",
                 "DIGEST-SHARD should read as an unknown subcommand to clients"
             ),
             other => panic!("DIGEST-SHARD answered a client: {other:?}"),
@@ -2028,7 +2037,10 @@ mod tests {
         let mut db = Database::new();
         let f = debug(&mut db, &[bulk(b"NUKE")]);
         match f {
-            Frame::Error(b) => assert!(b.starts_with(b"ERR DEBUG subcommand")),
+            // moon#670: one shape for every container, exact rather than prefix.
+            Frame::Error(b) => {
+                assert_eq!(&b[..], b"ERR unknown subcommand 'NUKE'. Try DEBUG HELP.")
+            }
             _ => panic!("expected ERR, got {f:?}"),
         }
     }
@@ -2099,7 +2111,11 @@ mod tests {
         let mut db = Database::new();
         let f = memory(&mut db, &[bulk(b"NUKE")]);
         match f {
-            Frame::Error(b) => assert!(b.starts_with(b"ERR MEMORY subcommand")),
+            // moon#670: was "ERR MEMORY subcommand 'NUKE' not supported", which
+            // read as a capability gap rather than a typo.
+            Frame::Error(b) => {
+                assert_eq!(&b[..], b"ERR unknown subcommand 'NUKE'. Try MEMORY HELP.")
+            }
             _ => panic!("expected ERR, got {f:?}"),
         }
     }

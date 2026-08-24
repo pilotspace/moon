@@ -51,10 +51,7 @@ pub fn handle_function(registry: &mut FunctionRegistry, args: &[Frame]) -> Frame
             b"ERR FUNCTION STATS not supported in this release (Phase 101 limitation)",
         ))
     } else {
-        Frame::Error(Bytes::from(format!(
-            "ERR unknown subcommand '{}'. Try FUNCTION HELP.",
-            String::from_utf8_lossy(sub)
-        )))
+        crate::command::helpers::err_unknown_subcommand("FUNCTION", sub)
     }
 }
 

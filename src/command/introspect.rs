@@ -478,10 +478,9 @@ pub fn command(args: &[Frame]) -> Frame {
         return getkeys(&args[1..]);
     }
 
-    Frame::Error(Bytes::from(format!(
-        "ERR Unknown subcommand '{}'. Try COMMAND HELP.",
-        String::from_utf8_lossy(&sub)
-    )))
+    // moon#670: Redis lower-cases "unknown" here. A one-character difference
+    // is still a different string to a client that matches on it.
+    crate::command::helpers::err_unknown_subcommand("COMMAND", &sub)
 }
 
 #[cfg(test)]

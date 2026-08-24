@@ -169,6 +169,16 @@ pub fn handle_slowlog(slowlog: &Slowlog, args: &[Frame]) -> Frame {
         }
     };
 
+    // moon#670: an unknown subcommand is refused with Redis's shape BEFORE any
+    // arity check, and from the SAME table the `MULTI` queue gate consults. An
+    // arity error here reads to a client as "the subcommand exists, you called
+    // it wrong", which is how `SLOWLOG BOGUS` used to answer.
+    if !crate::command::metadata::is_known_subcommand(b"SLOWLOG", subcmd) {
+        {
+            return crate::command::helpers::err_unknown_subcommand("SLOWLOG", subcmd);
+        }
+    }
+
     match subcmd {
         s if s.eq_ignore_ascii_case(b"GET") => {
             let count = if args.len() > 1 {
@@ -231,9 +241,10 @@ pub fn handle_slowlog(slowlog: &Slowlog, args: &[Frame]) -> Frame {
             ];
             Frame::Array(crate::protocol::FrameVec::from(help))
         }
-        _ => Frame::Error(Bytes::from_static(
-            b"ERR unknown slowlog subcommand. Try SLOWLOG HELP.",
-        )),
+        // Unreachable: the guard above already refused every name absent from
+        // `SUBCOMMAND_META`. Kept as the match's exhaustive arm, answering the
+        // same shape rather than a second spelling of it.
+        _ => crate::command::helpers::err_unknown_subcommand("SLOWLOG", subcmd),
     }
 }
 

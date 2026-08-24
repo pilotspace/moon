@@ -1279,6 +1279,54 @@ if should_run "transaction"; then
         echo "  FAIL: MULTI/DISCARD"
     fi
 
+    # --- Unknown container subcommands abort the transaction (moon#670) ---
+    #
+    # Redis validates a container's SUBCOMMAND at queue time: `CONFIG BOGUS` is
+    # refused on the MULTI connection and the block is poisoned, so EXEC answers
+    # -EXECABORT and NOTHING runs. Moon used to reply +QUEUED and only notice at
+    # EXEC, so the valid half of a mistyped transaction executed.
+    #
+    # The verdict is read from the KEY, not from EXEC's reply. That is what makes
+    # the row discriminating: pre-fix, `tx:sub670` exists and this FAILS; the
+    # error-text half alone would not catch a transaction that still ran.
+    TOTAL=$((TOTAL + 1))
+    mcli DEL tx:sub670 > /dev/null 2>&1
+    tx_sub=$(printf 'MULTI\nCONFIG BOGUS\nSET tx:sub670 ran\nEXEC\n' | redis-cli -p "$PORT_RUST" 2>/dev/null || true)
+    tx_sub_key=$(mcli GET tx:sub670 2>/dev/null || true)
+    if [ -n "$tx_sub_key" ]; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TXN-SUB-01 the transaction RAN despite a bogus subcommand (tx:sub670=$tx_sub_key)"
+    elif echo "$tx_sub" | grep -q "EXECABORT"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TXN-SUB-01 expected EXECABORT, got: $(echo "$tx_sub" | tr '\n' ' ')"
+    fi
+
+    # The queue-time refusal must carry Redis's exact shape, not just any error:
+    # clients branch on this string, and moon had ten spellings of it.
+    TOTAL=$((TOTAL + 1))
+    tx_sub_msg=$(mcli CONFIG BOGUS 2>&1 || true)
+    if echo "$tx_sub_msg" | grep -q "unknown subcommand 'BOGUS'. Try CONFIG HELP."; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TXN-SUB-02 wrong unknown-subcommand shape: $tx_sub_msg"
+    fi
+
+    # Discriminator for the widening direction: a REAL subcommand must still
+    # queue and the transaction must still run. A gate that refused every
+    # container subcommand would pass TXN-SUB-01 and be far worse than the bug.
+    TOTAL=$((TOTAL + 1))
+    mcli DEL tx:sub670ok > /dev/null 2>&1
+    printf 'MULTI\nCONFIG GET maxmemory\nSET tx:sub670ok ran\nEXEC\n' | redis-cli -p "$PORT_RUST" > /dev/null 2>&1 || true
+    if [ "$(mcli GET tx:sub670ok 2>/dev/null || true)" = "ran" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TXN-SUB-03 a valid container subcommand blocked the transaction"
+    fi
+
     # --- WATCH / UNWATCH optimistic locking -------------------------------
     #
     # A CAS conflict needs TWO connections interleaved: the transaction must

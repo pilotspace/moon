@@ -255,10 +255,7 @@ pub fn handle_script_subcommand(
         (Frame::SimpleString(Bytes::from_static(b"OK")), None)
     } else {
         (
-            Frame::Error(Bytes::from(format!(
-                "ERR unknown subcommand '{}' for 'script' command",
-                String::from_utf8_lossy(&sub)
-            ))),
+            crate::command::helpers::err_unknown_subcommand("SCRIPT", &sub),
             None,
         )
     }

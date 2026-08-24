@@ -67,3 +67,46 @@ pub fn err(msg: &str) -> Frame {
 pub fn expiry_ms_in_range(expires_at_ms: u64) -> bool {
     expires_at_ms <= i64::MAX as u64
 }
+
+/// Refuse an unknown container subcommand the way Redis does — moon#670.
+///
+/// One shape, every container:
+///
+/// ```text
+/// ERR unknown subcommand '<as sent>'. Try <CONTAINER> HELP.
+/// ```
+///
+/// Measured against `redis-server 8.6.1` on 2026-08-24 across all fifteen
+/// containers it exposes: the string is byte-identical apart from the two
+/// interpolations, and the subcommand is echoed **verbatim**, case included
+/// (`CONFIG MiXeD` reports `'MiXeD'`). That is the opposite of the arity error,
+/// which lower-cases the command name (moon#491) — a reviewer "correcting" one
+/// to match the other breaks whichever they touch.
+///
+/// This exists as one function because the alternative was measured: Moon had
+/// ten different spellings of this error, including `Unknown` with a capital U
+/// (`COMMAND`), two that never named the offending subcommand at all
+/// (`SLOWLOG`, and `XGROUP` which reported a literal `'UNKNOWN'`), and two that
+/// reported an ARITY problem instead (`OBJECT`, `XINFO`) — which reads to a
+/// client as "the subcommand exists, you called it wrong".
+///
+/// `container` is a static, uppercase, caller-supplied name; `sub` is UNTRUSTED
+/// client input.
+pub fn err_unknown_subcommand(container: &str, sub: &[u8]) -> Frame {
+    let mut buf = Vec::with_capacity(32 + container.len() + sub.len());
+    buf.extend_from_slice(b"ERR unknown subcommand '");
+    // A subcommand arrives as a bulk string, so it may legally contain CR, LF
+    // and NUL. `serialize_frame` writes an error's payload RAW and terminates
+    // it with CRLF, so an un-substituted CRLF here would end the frame early
+    // and let the client read the remainder as a second, attacker-chosen reply
+    // — desyncing that connection for the rest of its life. Substitute rather
+    // than trust the parser to have kept them out.
+    buf.extend(
+        sub.iter()
+            .map(|&b| if b < 0x20 || b == 0x7f { b'?' } else { b }),
+    );
+    buf.extend_from_slice(b"'. Try ");
+    buf.extend_from_slice(container.as_bytes());
+    buf.extend_from_slice(b" HELP.");
+    Frame::Error(Bytes::from(buf))
+}

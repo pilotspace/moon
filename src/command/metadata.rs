@@ -808,10 +808,14 @@ pub struct SubcommandMeta {
 ///
 /// **Measured, not copied.** Each name here was probed against a live Moon
 /// (2026-08-22) with a per-container BOGUS subcommand as the control, because
-/// five containers answer an unknown subcommand with something other than
-/// "unknown subcommand" — `MEMORY` says "not supported", `XGROUP` says "not
-/// recognized", and `OBJECT` / `XINFO` / `HOTKEYS` answer an ARITY error, which
-/// a naive probe reads as "it exists". The first sweep believed all 31 of
+/// at the time five containers answered an unknown subcommand with something
+/// other than "unknown subcommand" — `MEMORY` said "not supported", `XGROUP`
+/// said "not recognized", and `OBJECT` / `XINFO` / `HOTKEYS` answered an ARITY
+/// error, which a naive probe reads as "it exists". moon#670 has since unified
+/// every container onto Redis's one shape (`err_unknown_subcommand`), so a
+/// re-probe today would not hit those five traps — but it would still need the
+/// control, and `CLUSTER` still masks everything when cluster support is off.
+/// The first sweep believed all 31 of
 /// Redis's `CLUSTER` subcommands were present; with cluster support disabled
 /// every one of them answers "This instance has cluster support disabled", so
 /// the real count (18, measured with `--cluster-enabled`) was hidden.
@@ -984,6 +988,43 @@ pub fn lookup_subcommand(container: &[u8], sub: &[u8]) -> Option<&'static Subcom
     let subs = SUBCOMMAND_META.get(upper)?;
     subs.iter()
         .find(|s| s.name.as_bytes().eq_ignore_ascii_case(sub))
+}
+
+/// Subcommands dispatch RECOGNISES but [`SUBCOMMAND_META`] deliberately does
+/// not publish — moon#670.
+///
+/// The table above is a PUBLICATION contract: `COMMAND DOCS` and `COMMAND INFO`
+/// may only advertise names that dispatch and answer for real, so a name that
+/// refuses with "not supported in this release" has no business in it.
+/// [`is_known_subcommand`] needs the other set — everything dispatch will
+/// ACCEPT — because a queue-time gate built on the publication table would
+/// refuse to queue `FUNCTION DUMP`, which dispatch is perfectly willing to run
+/// (and answer with its own limitation). That is the same class of defect as
+/// moon#670 itself, pointing the other way.
+const RECOGNISED_UNPUBLISHED: &[(&str, &[&str])] = &[("FUNCTION", &["DUMP", "RESTORE", "STATS"])];
+
+/// Does dispatch recognise `container`'s `sub` as a subcommand at all?
+///
+/// The single source of truth shared by TWO consumers that must never disagree:
+/// each container's own dispatch guard, and the `MULTI` queue-time gate. That
+/// shared reading is the whole safety argument — the gate's existing contract is
+/// *queueable iff dispatchable*, and it holds for subcommands only because both
+/// sides ask this one question.
+///
+/// "Recognised" is not "implemented": `FUNCTION DUMP` is recognised and answers
+/// `not supported in this release`. Recognised is exactly the set for which
+/// dispatch does NOT reply "unknown subcommand".
+///
+/// Returns `false` for a container with no subcommand table, so callers must
+/// only ask about containers they know are in it.
+pub fn is_known_subcommand(container: &[u8], sub: &[u8]) -> bool {
+    if lookup_subcommand(container, sub).is_some() {
+        return true;
+    }
+    RECOGNISED_UNPUBLISHED.iter().any(|(c, subs)| {
+        c.as_bytes().eq_ignore_ascii_case(container)
+            && subs.iter().any(|s| s.as_bytes().eq_ignore_ascii_case(sub))
+    })
 }
 
 /// Total number of container subcommands the registry publishes.

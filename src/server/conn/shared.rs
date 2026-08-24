@@ -188,7 +188,10 @@ pub(crate) fn handle_config(
         Frame::BulkString(s) => s.as_ref(),
         Frame::SimpleString(s) => s.as_ref(),
         _ => {
-            return Frame::Error(Bytes::from_static(b"ERR unknown subcommand for CONFIG"));
+            // moon#670: a non-string subcommand is still an unknown one, and
+            // it must read like every other container's rejection. `b""` rather
+            // than the frame's bytes: there are none to echo.
+            return crate::command::helpers::err_unknown_subcommand("CONFIG", b"");
         }
     };
 
@@ -206,10 +209,10 @@ pub(crate) fn handle_config(
     } else if subcmd.eq_ignore_ascii_case(b"RESETSTAT") {
         config_cmd::config_resetstat()
     } else {
-        Frame::Error(Bytes::from(format!(
-            "ERR unknown subcommand '{}'. Try CONFIG GET, CONFIG SET, CONFIG REWRITE, CONFIG RESETSTAT.",
-            String::from_utf8_lossy(subcmd)
-        )))
+        // moon#670: Redis points at CONFIG HELP rather than enumerating the
+        // four names. Enumerating them here also went stale the moment a fifth
+        // was added.
+        crate::command::helpers::err_unknown_subcommand("CONFIG", subcmd)
     }
 }
 
@@ -2265,7 +2268,65 @@ pub(crate) fn queue_time_rejection(cmd: &[u8], args: &[Frame]) -> Option<Frame> 
             meta.name.to_lowercase()
         ))));
     }
+
+    // moon#670: a container's SUBCOMMAND is validated here too, because Redis
+    // validates it here.
+    //
+    // ```text
+    // MULTI / CONFIG BOGUS / SET k v / EXEC
+    //   redis -> -ERR unknown subcommand … then -EXECABORT   (nothing ran)
+    //   moon  -> +QUEUED                 then *2             (the SET ran)
+    // ```
+    //
+    // Measured across all fourteen containers on redis-server 8.6.1
+    // (2026-08-24): every one refuses at queue time and poisons the block. A
+    // client that treats `+QUEUED` as "this command is valid" — which is what
+    // Redis guarantees — sends the rest of a transaction Redis would have
+    // refused wholesale, then applies the partial result.
+    //
+    // `is_known_subcommand` is the SAME predicate each container's own dispatch
+    // guard consults, which is what keeps this half of the gate inside the
+    // queueable-iff-dispatchable contract stated above. Reading the raw
+    // `SUBCOMMAND_META` here instead would break it: that table is a
+    // publication contract and omits `FUNCTION DUMP`, which dispatch accepts.
+    if let Some(container) = gated_container(cmd)
+        && let Some(sub) = args.first().and_then(|f| match f {
+            Frame::BulkString(b) | Frame::SimpleString(b) => Some(b.as_ref()),
+            _ => None,
+        })
+        && !crate::command::metadata::is_known_subcommand(container.as_bytes(), sub)
+    {
+        return Some(crate::command::helpers::err_unknown_subcommand(
+            container, sub,
+        ));
+    }
     None
+}
+
+/// The containers whose subcommands are validated at `MULTI` queue time.
+///
+/// Returns the canonical uppercase name, which is also what the error echoes.
+///
+/// Two containers Moon has a subcommand table for are deliberately ABSENT, and
+/// each absence is fenced by a test in
+/// `tests/container_subcommand_parity_670.rs` rather than left to this comment:
+///
+///   * `CLUSTER` — with cluster support disabled every CLUSTER subcommand,
+///     bogus ones included, is answered "This instance has cluster support
+///     disabled". Dispatch never reports an unknown subcommand, so a gate that
+///     did would refuse to queue what dispatch would happily have run (`csp7`).
+///   * `FUNCTION` — moon#697: inside `MULTI` the executor answers EVERY
+///     `FUNCTION` subcommand with `ERR unknown command 'FUNCTION'`, valid ones
+///     included, so there is no agreed notion of "known" to gate on (`csp6`).
+fn gated_container(cmd: &[u8]) -> Option<&'static str> {
+    const GATED: &[&str] = &[
+        "ACL", "CLIENT", "COMMAND", "CONFIG", "MEMORY", "MODULE", "OBJECT", "PUBSUB", "SCRIPT",
+        "SLOWLOG", "XGROUP", "XINFO",
+    ];
+    GATED
+        .iter()
+        .find(|c| c.as_bytes().eq_ignore_ascii_case(cmd))
+        .copied()
 }
 
 /// The reply `EXEC` owes a transaction poisoned at queue time.

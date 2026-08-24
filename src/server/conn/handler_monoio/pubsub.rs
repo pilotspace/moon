@@ -391,9 +391,13 @@ pub(super) fn try_handle_pubsub_introspection(
             responses.push(Frame::Integer(patterns as i64));
         }
         _ => {
-            responses.push(Frame::Error(Bytes::from_static(
-                b"ERR unknown subcommand or wrong number of arguments for 'pubsub' command",
-            )));
+            // moon#670: naming the subcommand matters — the old message blended
+            // "unknown" and "wrong arity" into one string, so a client could not
+            // tell a typo from a mis-call, and never learned which name failed.
+            responses.push(crate::command::helpers::err_unknown_subcommand(
+                "PUBSUB",
+                subcmd.as_deref().unwrap_or(b""),
+            ));
         }
     }
     true

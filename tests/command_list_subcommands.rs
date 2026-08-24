@@ -211,12 +211,15 @@ fn cl2_previously_unlisted_but_implemented_commands_are_published() {
 /// the table from becoming a list of names the server does not answer — the
 /// same defect as the unlisted commands above, one level up.
 ///
-/// A per-container BOGUS control is required, not optional: five containers
-/// answer an unknown subcommand with something other than "unknown
-/// subcommand". `MEMORY` says "not supported", `XGROUP` says "not recognized",
-/// and `OBJECT` / `XINFO` answer an ARITY error, which a naive probe reads as
-/// "it exists". The control proves the probe can tell the two apart AT ALL for
-/// this container before any name is judged by it.
+/// A per-container BOGUS control is required, not optional. It was originally
+/// required because five containers refused an unknown subcommand in five
+/// different ways — `MEMORY` said "not supported", `XGROUP` said "not
+/// recognized", and `OBJECT` / `XINFO` answered an ARITY error, which a naive
+/// probe reads as "it exists". moon#670 unified all of them onto Redis's single
+/// shape, so that particular trap is gone; the control stays because it is the
+/// discipline, not the workaround. `CLUSTER` alone still masks every
+/// subcommand ("cluster support disabled") when cluster support is off, which
+/// is why this test also probes a cluster-enabled instance.
 #[test]
 fn cl3_every_published_subcommand_actually_dispatches() {
     let Some(m) = spawn_moon(false) else { return };
