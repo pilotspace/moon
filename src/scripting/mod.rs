@@ -218,6 +218,10 @@ pub fn handle_script_subcommand(
         }
     };
 
+    if let Some(help) = crate::command::help_text::help_if_requested("SCRIPT", &sub) {
+        return (help, None);
+    }
+
     if sub.eq_ignore_ascii_case(b"LOAD") {
         if args.len() != 2 {
             return (Frame::Error(Bytes::from_static(b"ERR syntax error")), None);

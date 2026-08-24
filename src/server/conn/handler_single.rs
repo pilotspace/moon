@@ -806,6 +806,12 @@ pub async fn handle_connection(
                                         continue;
                                     }
                                     // Unknown CLIENT subcommand
+                                    if let Some(help) =
+                                        crate::command::help_text::help_if_requested("CLIENT", &sub_bytes)
+                                    {
+                                        responses.push(help);
+                                        continue;
+                                    }
                                     responses.push(
                                         crate::command::helpers::err_unknown_subcommand(
                                             "CLIENT",

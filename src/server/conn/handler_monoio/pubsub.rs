@@ -391,12 +391,16 @@ pub(super) fn try_handle_pubsub_introspection(
             responses.push(Frame::Integer(patterns as i64));
         }
         _ => {
+            let sub = subcmd.as_deref().unwrap_or(b"");
+            if let Some(help) = crate::command::help_text::help_if_requested("PUBSUB", sub) {
+                responses.push(help);
+                return true;
+            }
             // moon#670: naming the subcommand matters — the old message blended
             // "unknown" and "wrong arity" into one string, so a client could not
             // tell a typo from a mis-call, and never learned which name failed.
             responses.push(crate::command::helpers::err_unknown_subcommand(
-                "PUBSUB",
-                subcmd.as_deref().unwrap_or(b""),
+                "PUBSUB", sub,
             ));
         }
     }

@@ -1353,6 +1353,43 @@ if should_run "transaction"; then
         echo "  FAIL: TXN-SUB-03 a valid container subcommand blocked the transaction"
     fi
 
+    # --- Container HELP (moon#698) ----------------------------------------
+    #
+    # Redis gives every container a HELP subcommand answering an array of SIMPLE
+    # strings. Moon refused it on eight containers, three of them with a message
+    # telling the client to run the very command it had just refused.
+    TOTAL=$((TOTAL + 1))
+    help_missing=""
+    for c in ACL CLIENT COMMAND CONFIG FUNCTION MEMORY MODULE OBJECT PUBSUB \
+             SCRIPT SLOWLOG XGROUP XINFO; do
+        # Word-splitting is off in zsh, so the subcommand is passed explicitly
+        # rather than through a single "$c HELP" string.
+        line=$(mcli "$c" HELP 2>&1 | head -1 || true)
+        case "$line" in
+            "$c <subcommand> "*) ;;
+            *) help_missing="$help_missing $c" ;;
+        esac
+    done
+    if [ -z "$help_missing" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: HELP-01 containers without Redis's help header:$help_missing"
+    fi
+
+    # HELP must survive the moon#670 queue gate — before #698 it was refused at
+    # QUEUE time and poisoned the transaction, so this reads the KEY, not EXEC.
+    TOTAL=$((TOTAL + 1))
+    mcli DEL tx:help698 > /dev/null 2>&1
+    printf 'MULTI\nCONFIG HELP\nSET tx:help698 ran\nEXEC\n' \
+        | redis-cli -p "$PORT_RUST" > /dev/null 2>&1 || true
+    if [ "$(mcli GET tx:help698 2>/dev/null || true)" = "ran" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: HELP-02 CONFIG HELP aborted the transaction (moon#698)"
+    fi
+
     # --- WATCH / UNWATCH optimistic locking -------------------------------
     #
     # A CAS conflict needs TWO connections interleaved: the transaction must

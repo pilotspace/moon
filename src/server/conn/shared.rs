@@ -197,7 +197,9 @@ pub(crate) fn handle_config(
 
     let sub_args = &args[1..];
 
-    if subcmd.eq_ignore_ascii_case(b"GET") {
+    if let Some(help) = crate::command::help_text::help_if_requested("CONFIG", subcmd) {
+        help
+    } else if subcmd.eq_ignore_ascii_case(b"GET") {
         let rt = runtime_config.read();
         config_cmd::config_get(&rt, server_config, sub_args)
     } else if subcmd.eq_ignore_ascii_case(b"SET") {

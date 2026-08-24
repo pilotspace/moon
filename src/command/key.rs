@@ -774,26 +774,10 @@ pub fn object_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
 /// Shared OBJECT HELP response.
 fn object_help() -> Frame {
-    Frame::Array(framevec![
-        Frame::BulkString(Bytes::from_static(b"OBJECT ENCODING <key>")),
-        Frame::BulkString(Bytes::from_static(
-            b"  Return the encoding of the object stored at <key>."
-        )),
-        Frame::BulkString(Bytes::from_static(b"OBJECT FREQ <key>")),
-        Frame::BulkString(Bytes::from_static(
-            b"  Return the access frequency of the object at <key>."
-        )),
-        Frame::BulkString(Bytes::from_static(b"OBJECT IDLETIME <key>")),
-        Frame::BulkString(Bytes::from_static(
-            b"  Return the idle time in seconds of the object at <key>."
-        )),
-        Frame::BulkString(Bytes::from_static(b"OBJECT REFCOUNT <key>")),
-        Frame::BulkString(Bytes::from_static(
-            b"  Return the reference count of the object at <key>."
-        )),
-        Frame::BulkString(Bytes::from_static(b"OBJECT HELP")),
-        Frame::BulkString(Bytes::from_static(b"  Return subcommand help.")),
-    ])
+    // Shape and body both live in the shared table (moon#698): the header line
+    // and the `HELP` footer are emitted by `help_reply`, so OBJECT cannot drift
+    // from the other twelve containers.
+    crate::command::help_text::help_or_empty("OBJECT")
 }
 
 /// Redis-compatible glob pattern matcher.
@@ -2723,9 +2707,16 @@ mod tests {
         match result {
             Frame::Array(ref arr) => {
                 assert!(!arr.is_empty());
-                // First line names the command family, matching Redis's
-                // "<CMD> <subcommand> ..." HELP convention.
-                assert!(matches!(&arr[0], Frame::BulkString(b) if b.starts_with(b"OBJECT")));
+                // moon#698: Redis's help header verbatim, as a SIMPLE string.
+                // Pinned exactly rather than by prefix — the old assertion
+                // passed on a bulk-string reply with no header line at all,
+                // which is precisely the divergence #698 fixed.
+                assert_eq!(
+                    &arr[0],
+                    &Frame::SimpleString(Bytes::from_static(
+                        b"OBJECT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"
+                    ))
+                );
             }
             other => panic!("expected array, got {other:?}"),
         }

@@ -478,6 +478,10 @@ pub fn command(args: &[Frame]) -> Frame {
         return getkeys(&args[1..]);
     }
 
+    if let Some(help) = crate::command::help_text::help_if_requested("COMMAND", &sub) {
+        return help;
+    }
+
     // moon#670: Redis lower-cases "unknown" here. A one-character difference
     // is still a different string to a client that matches on it.
     crate::command::helpers::err_unknown_subcommand("COMMAND", &sub)

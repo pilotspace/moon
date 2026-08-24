@@ -69,50 +69,11 @@ pub fn handle_acl(
         // This text advertises ONLY what Moon dispatches. Redis 8.6.1 also
         // lists `DRYRUN`, which Moon does not implement; advertising it would
         // reproduce the same defect one level up, so it is omitted rather than
-        // listed. `au6` walks every name in this array and asserts it
-        // dispatches, so the two cannot drift.
-        "HELP" => {
-            const LINES: [&str; 22] = [
-                "ACL <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
-                "CAT [<category>]",
-                "    List all commands that belong to <category>, or all command categories",
-                "    when no category is specified.",
-                "DELUSER <username> [<username> ...]",
-                "    Delete a list of users.",
-                "GETUSER <username>",
-                "    Get the user's details.",
-                "GENPASS [<bits>]",
-                "    Generate a secure 256-bit user password. The optional `bits` argument can",
-                "    be used to specify a different size.",
-                "LIST",
-                "    Show users details in config file format.",
-                "LOAD",
-                "    Reload users from the ACL file.",
-                "LOG [<count> | RESET]",
-                "    Show the ACL log entries.",
-                "SAVE",
-                "    Save the current config to the ACL file.",
-                "SETUSER <username> <attribute> [<attribute> ...]",
-                "    Create or modify a user with the specified attributes.",
-                "USERS",
-            ];
-            let mut out: Vec<Frame> = LINES
-                .iter()
-                .map(|l| Frame::SimpleString(Bytes::from_static(l.as_bytes())))
-                .collect();
-            out.push(Frame::SimpleString(Bytes::from_static(
-                b"    List all the registered usernames.",
-            )));
-            out.push(Frame::SimpleString(Bytes::from_static(b"WHOAMI")));
-            out.push(Frame::SimpleString(Bytes::from_static(
-                b"    Return the current connection username.",
-            )));
-            out.push(Frame::SimpleString(Bytes::from_static(b"HELP")));
-            out.push(Frame::SimpleString(Bytes::from_static(
-                b"    Print this help.",
-            )));
-            Frame::Array(out.into())
-        }
+        // listed. moon#698 moved the lines themselves to `command::help_text`,
+        // where one constructor owns the header and footer for all 13
+        // containers; `au6` still walks every name and asserts it dispatches, so
+        // the two cannot drift.
+        "HELP" => crate::command::help_text::help_or_empty("ACL"),
 
         "LIST" => {
             let Ok(table) = acl_table.read() else {

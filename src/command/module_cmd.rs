@@ -51,27 +51,8 @@ pub fn module(args: &[Frame]) -> Frame {
         return Frame::Error(Bytes::from_static(NOT_ALLOWED));
     }
 
-    if sub.eq_ignore_ascii_case(b"HELP") {
-        return Frame::Array(
-            vec![
-                Frame::SimpleString(Bytes::from_static(
-                    b"MODULE <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
-                )),
-                Frame::SimpleString(Bytes::from_static(b"LIST")),
-                Frame::SimpleString(Bytes::from_static(
-                    b"    Return a list of loaded modules. moon loads none, so this is always empty.",
-                )),
-                Frame::SimpleString(Bytes::from_static(b"LOAD <path> [<arg> ...]")),
-                Frame::SimpleString(Bytes::from_static(b"LOADEX <path> [<arg> ...]")),
-                Frame::SimpleString(Bytes::from_static(b"UNLOAD <name>")),
-                Frame::SimpleString(Bytes::from_static(
-                    b"    Not supported: moon has no module loader.",
-                )),
-                Frame::SimpleString(Bytes::from_static(b"HELP")),
-                Frame::SimpleString(Bytes::from_static(b"    Print this help.")),
-            ]
-            .into(),
-        );
+    if let Some(help) = crate::command::help_text::help_if_requested("MODULE", sub) {
+        return help;
     }
 
     crate::command::helpers::err_unknown_subcommand("MODULE", sub)

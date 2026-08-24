@@ -227,19 +227,10 @@ pub fn handle_slowlog(slowlog: &Slowlog, args: &[Frame]) -> Frame {
             Frame::SimpleString(Bytes::from_static(b"OK"))
         }
         s if s.eq_ignore_ascii_case(b"HELP") => {
-            let help = vec![
-                Frame::BulkString(Bytes::from_static(b"SLOWLOG GET [<count>]")),
-                Frame::BulkString(Bytes::from_static(
-                    b"    Return top <count> entries from the slowlog (default 10).",
-                )),
-                Frame::BulkString(Bytes::from_static(b"SLOWLOG LEN")),
-                Frame::BulkString(Bytes::from_static(
-                    b"    Return the number of entries in the slowlog.",
-                )),
-                Frame::BulkString(Bytes::from_static(b"SLOWLOG RESET")),
-                Frame::BulkString(Bytes::from_static(b"    Reset the slowlog.")),
-            ];
-            Frame::Array(crate::protocol::FrameVec::from(help))
+            // moon#698: shape and body both come from the shared table, which is
+            // what stopped SLOWLOG emitting bulk strings with no header line
+            // while Redis emits simple strings with one.
+            crate::command::help_text::help_or_empty("SLOWLOG")
         }
         // Unreachable: the guard above already refused every name absent from
         // `SUBCOMMAND_META`. Kept as the match's exhaustive arm, answering the

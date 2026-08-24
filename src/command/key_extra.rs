@@ -107,24 +107,6 @@ pub fn memory_doctor() -> Frame {
     Frame::BulkString(Bytes::from_static(b"Sam, I have no memory problems"))
 }
 
-/// MEMORY HELP — list MEMORY subcommands.
-pub fn memory_help() -> Frame {
-    Frame::Array(
-        vec![
-            Frame::BulkString(Bytes::from_static(
-                b"MEMORY DOCTOR - Return memory problems reports.",
-            )),
-            Frame::BulkString(Bytes::from_static(
-                b"MEMORY HELP - Return this help message.",
-            )),
-            Frame::BulkString(Bytes::from_static(
-                b"MEMORY USAGE <key> [SAMPLES <count>] - Return memory in bytes used by <key> and its value.",
-            )),
-        ]
-        .into(),
-    )
-}
-
 /// SORT key [BY pattern] [LIMIT offset count] [GET pattern ...] [ASC|DESC] [ALPHA] [STORE dest]
 ///
 /// Sort elements in a list, set, or sorted set.
