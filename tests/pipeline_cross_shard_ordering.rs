@@ -166,6 +166,101 @@ fn each_trial(port: u16, tag: &str, mut body: impl FnMut(&mut Conn, &str) -> Opt
 // ---------------------------------------------------------------------------
 
 /// moon#507 as reported: MGET returns nulls for keys its own batch just wrote.
+/// The ordering guarantee has a PRICE, and `INFO` now names it — moon#513.
+///
+/// Every other test in this file asserts the guarantee holds. This one asserts
+/// the cost of holding it is observable, because it was not: a client
+/// interleaving reads between write groups at `--shards >= 2` pays one extra
+/// dispatch/await boundary per interleaving, and nothing reported it. The
+/// throughput simply looked bad. Measured on moon-dev, `--shards 2`, one
+/// connection: an `MGET` after every two `SET`s runs at 49,203 ops/s against
+/// 1,122,573 for the same shape with single-key `GET`s.
+///
+/// It is also the acceptance criterion for moon#513, stated as a number rather
+/// than a description: letting multi-key commands join the slotted batch means
+/// `interleaved` stops deferring. When that lands, the assertion below flips
+/// from "> 0" to "== 0" and the test stays meaningful either way.
+///
+/// The `--shards 1` leg is what keeps it honest. There `remote_groups` is
+/// always empty, so the guard structurally cannot fire — a counter that moved
+/// there would be counting something else, and every claim built on it would
+/// be wrong.
+#[test]
+fn pco12_the_ordering_guard_reports_what_it_costs() {
+    fn defers(port: u16) -> u64 {
+        let mut c = Conn::open(port);
+        let info = c.send(&["INFO", "stats"]);
+        info.split("\r\n")
+            .find_map(|l| l.strip_prefix("total_pipeline_remote_defer:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| {
+                panic!("INFO stats has no total_pipeline_remote_defer field: {info:?}")
+            })
+    }
+
+    /// `MGET` after every two `SET`s — the shape that triggers the guard.
+    fn interleaved(c: &mut Conn, tag: &str, n: usize) {
+        for i in (0..n).step_by(2) {
+            let (a, b) = (format!("{tag}:{i}"), format!("{tag}:{}", i + 1));
+            c.pipeline(&[&["SET", &a, "v"], &["SET", &b, "v"], &["MGET", &a, &b]]);
+        }
+    }
+
+    /// The same shape with single-key reads, which route by their own key and
+    /// therefore never need to wait.
+    fn single_key(c: &mut Conn, tag: &str, n: usize) {
+        for i in (0..n).step_by(2) {
+            let (a, b) = (format!("{tag}:{i}"), format!("{tag}:{}", i + 1));
+            c.pipeline(&[&["SET", &a, "v"], &["SET", &b, "v"], &["GET", &a]]);
+        }
+    }
+
+    // --- shards = 1: the guard cannot fire, whatever the shape ---
+    {
+        let m = spawn_moon("1");
+        let base = defers(m.port);
+        let mut c = Conn::open(m.port);
+        interleaved(&mut c, "pco12s1", 64);
+        drop(c);
+        assert_eq!(
+            defers(m.port) - base,
+            0,
+            "at --shards 1 `remote_groups` is always empty, so the moon#507 \
+             guard cannot fire — a non-zero count here means the counter is \
+             measuring something other than the deferral"
+        );
+    }
+
+    // --- shards = 4: the interleaved shape defers, the single-key one does not ---
+    let m = spawn_moon(SHARDS);
+
+    let base = defers(m.port);
+    let mut c = Conn::open(m.port);
+    single_key(&mut c, "pco12ctl", 64);
+    drop(c);
+    let control_defers = defers(m.port) - base;
+    assert_eq!(
+        control_defers, 0,
+        "a pipeline of single-key commands routes every command by its own key \
+         and must never defer — {control_defers} deferrals means the guard is \
+         firing on the fast path, which would be a throughput regression for \
+         every pipelined client"
+    );
+
+    let base = defers(m.port);
+    let mut c = Conn::open(m.port);
+    interleaved(&mut c, "pco12int", 64);
+    drop(c);
+    let interleaved_defers = defers(m.port) - base;
+    assert!(
+        interleaved_defers > 0,
+        "an MGET interleaved between writes at --shards {SHARDS} must trigger \
+         the moon#507 guard, and INFO must say so. Zero here means either the \
+         counter is not wired to the deferral site, or moon#513 has landed — \
+         in which case flip this assertion to `== 0` rather than deleting it"
+    );
+}
+
 #[test]
 fn pco1_mget_sees_writes_from_its_own_batch() {
     let m = spawn_moon(SHARDS);

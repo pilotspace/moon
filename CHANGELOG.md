@@ -6,6 +6,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`INFO stats` reports what the pipeline ordering guarantee costs** (`total_pipeline_remote_defer`,
+  and the `moon_pipeline_remote_defer_total` Prometheus counter) — groundwork for #513.
+
+  #512 made a pipelined command that cannot route by its own single key wait for the batch's
+  pending cross-shard commands, which is what stopped the silent write loss of #507. It is also
+  expensive, and nothing said so: the only symptom was throughput that looked bad for no
+  visible reason.
+
+  Two things bound the cost, and the counter is what made both checkable:
+
+  - A deferral needs an **undispatched cross-shard command already in the batch** — the guard
+    is `!remote_groups.is_empty() && must_wait_for_pending_remote(..)`. A shard-spanning `MGET`
+    on its own never defers: 64 spread `MGET`s with no preceding writes measure **0**. A
+    preceding foreign *read* counts too, since the E2 read fast path is disabled and foreign
+    reads are slotted alongside writes.
+  - **At most one deferral per batch pass.** The cut re-parses the tail with `remote_groups`
+    cleared, so the command at the head of the next pass runs inline whatever its shape.
+
+  Together those explain why 64 interleavings produce fewer than 64 deferrals, and fewer still
+  at `--shards 2` (48) than at `--shards 4` (55) — with two shards, more of the preceding `SET`s
+  land locally and never reach `remote_groups` at all. The counts are shape- and
+  placement-specific, not constants: the same shape re-measured on a different key set gave 59.
+
+  Measured on moon-dev (aarch64, 6 vCPU), one connection, 9 reps alternating leg order, median:
+
+  | pipeline shape | shards=1 | shards=2 | shards=4 |
+  |---|---|---|---|
+  | `MGET` after every 2 `SET`s | 1,296,360 ops/s (0 deferrals) | 49,203 (48) | 38,856 (55) |
+  | 128 `SET`s then one `MGET` | 1,156,693 (0) | 659,436 (1) | 539,996 (1) |
+  | `SET`,`SET`,`GET` — routes by its own key | 1,700,287 (0) | 1,122,573 (0) | 993,784 (0) |
+
+  The deferral counts are the server's own, not inferred: reading the code suggested 64 for the
+  first shape and the counter says 48, which is exactly why it exists. The `--shards 1` column
+  is the control — `remote_groups` is always empty there, so the guard structurally cannot fire.
+
 ### Changed
 - **Sharded pub/sub channels are no longer workspace-scoped** (#703, fallout of #668). The
   hand-rolled workspace key walker had `PUBLISH`/`SUBSCRIBE`/`PSUBSCRIBE` in its no-key

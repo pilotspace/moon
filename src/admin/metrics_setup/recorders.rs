@@ -11,8 +11,8 @@ use metrics::{counter, gauge, histogram};
 
 use crate::admin::metrics_setup::{
     CONNECTED_CLIENTS, DISPATCH_CROSS_READ_SPSC_TOTAL, EVICTED_KEYS, EXPIRING_SPILL_SKIPPED,
-    KEYSPACE_HITS, KEYSPACE_MISSES, METRICS_INITIALIZED, SPILLED_KEYS, TOTAL_CONNECTIONS,
-    WAL_AGGRESSIVE_RECYCLE_BYTES_TOTAL, WAL_AGGRESSIVE_RECYCLE_SEGMENTS_TOTAL,
+    KEYSPACE_HITS, KEYSPACE_MISSES, METRICS_INITIALIZED, PIPELINE_REMOTE_DEFER_TOTAL, SPILLED_KEYS,
+    TOTAL_CONNECTIONS, WAL_AGGRESSIVE_RECYCLE_BYTES_TOTAL, WAL_AGGRESSIVE_RECYCLE_SEGMENTS_TOTAL,
 };
 
 // ── Connection metrics ──────────────────────────────────────────────────
@@ -322,6 +322,26 @@ pub fn record_xshard_reply_timeout(kind: &'static str) {
         return;
     }
     counter!("moon_xshard_reply_timeout_total", "kind" => kind).increment(1);
+}
+
+/// A pipeline batch was cut short by the moon#507 ordering guard.
+///
+/// Recorded at the two sites that set `deferred_tail_from` for
+/// `must_wait_for_pending_remote`: the command and the unconsumed tail move to
+/// the next loop iteration so the pending `remote_groups` resolve first.
+///
+/// Exists because the cost is invisible otherwise. A client interleaving reads
+/// between write groups at `--shards >= 2` pays one boundary per interleaving,
+/// and nothing in `INFO` said so — the throughput just looked bad. It is also
+/// what keeps a benchmark for moon#513 honest: a shape that claims to trigger
+/// the guard has to be able to PROVE it did, and how often.
+#[inline]
+pub fn record_pipeline_remote_defer() {
+    PIPELINE_REMOTE_DEFER_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_pipeline_remote_defer_total").increment(1);
 }
 
 /// Batched variant of `record_dispatch_cross_spsc`.
