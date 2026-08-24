@@ -261,14 +261,6 @@ fn ch4_help_queues_and_runs_inside_multi() {
     for shards in ["1", "4"] {
         let m = spawn_moon(shards);
         for container in CONTAINERS {
-            // moon#697: inside MULTI, Moon's executor answers `ERR unknown
-            // command 'FUNCTION'` for EVERY FUNCTION subcommand, valid ones
-            // included — a dispatch defect that has nothing to do with HELP.
-            // Fenced by `ch7` rather than silently skipped, so this exclusion
-            // fails loudly the moment #697 is fixed.
-            if *container == "FUNCTION" {
-                continue;
-            }
             // One FRESH connection per case: MULTI state is per-connection, and
             // a poisoned transaction left behind by a previous case would make
             // every later row report EXECABORT for the wrong reason.
@@ -331,22 +323,21 @@ fn ch6_a_bogus_subcommand_is_still_refused_and_still_aborts_the_transaction() {
     );
 }
 
-/// The fence for `ch4`'s one exclusion.
+/// `FUNCTION HELP` inside `MULTI` — the exclusion `ch4` used to carry.
 ///
-/// If this test starts failing, moon#697 has been fixed and `FUNCTION` must be
-/// removed from `ch4`'s skip list — an exclusion that outlives its cause is how
-/// a suite quietly stops covering something.
+/// Was a known-red fence for moon#697: every `FUNCTION` subcommand answered
+/// `ERR unknown command 'FUNCTION'` inside a transaction. moon#697 added
+/// FUNCTION to the connection-level intercepts, so `ch4` now covers all 13
+/// containers and this asserts the specific case that was excluded.
 #[test]
-fn ch7_function_inside_multi_still_hits_moon_697() {
+fn ch7_function_help_runs_inside_multi() {
     let m = spawn_moon("1");
     let mut c = Conn::open(m.port);
     assert_eq!(c.send(&["MULTI"]), "+OK\r\n");
     assert_eq!(c.send(&["FUNCTION", "HELP"]), "+QUEUED\r\n");
     let exec = c.send(&["EXEC"]);
     assert!(
-        exec.contains("unknown command 'FUNCTION'"),
-        "moon#697 appears fixed — FUNCTION now dispatches inside MULTI, so drop the \
-         FUNCTION skip in ch4 and let it assert the help array like every other \
-         container; got {exec:?}"
+        exec.starts_with("*1\r\n*") && exec.contains("FUNCTION <subcommand>"),
+        "moon#697 — FUNCTION HELP inside MULTI must answer the help array; got {exec:?}"
     );
 }

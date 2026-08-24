@@ -286,6 +286,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   survive a restart — `rebuild_from_manifest` is the only thing that re-indexes them.
 ### Fixed
 
+- **`FUNCTION` dispatches inside `MULTI` instead of reporting an unknown command** (#697).
+  Every `FUNCTION` subcommand — valid or not — was queued by `MULTI` and then answered at
+  `EXEC` with `ERR unknown command 'FUNCTION', with args beginning with: `, while the same
+  commands worked outside a transaction. `FUNCTION` was the only container with this
+  behaviour.
+
+  It broke the queue gate's safety argument, which is *queueable iff dispatchable*:
+  `COMMAND_META` has `FUNCTION`, so the gate queued it, but `shared::is_txn_connection_intercept`
+  did not list it, so the executor left no placeholder for the connection-owning caller to
+  fill and the command fell through to the keyspace `dispatch()`, which has no FUNCTION arm.
+  The fallback then *claimed the command did not exist* rather than failing loudly — the
+  #639 class, with a lie on the end of it.
+
+  The registry could not simply be rebuilt where it was needed. Its `RefCell` is shared with
+  the shard thread's SPSC drain loop, which applies inbound fan-outs, so it is
+  per-shard-thread and that sharing is what makes a loaded library visible server-wide. It is
+  threaded through `try_handle_multi_exec` → `fill_txn_intercept_slots` →
+  `run_txn_connection_intercept` in both runtimes, and the EXEC-side intercept runs the same
+  `function_fanout_op` + `function_registry_fanout` the live path does — a `FUNCTION LOAD`
+  that dispatched but skipped the broadcast would apply to one shard and answer with the
+  library name anyway. One implementation in `shared.rs` serves both runtimes rather than a
+  copy each.
+
+  `FUNCTION` consequently joins #670's queue-time gate: `FUNCTION BOGUS` is now refused
+  before it is stored and `EXEC` answers `-EXECABORT`. Measured against redis-server 8.6.1,
+  that is what Redis does — #697's own table claimed Redis answers `*1` + the error instead,
+  and taking it at face value would have left `FUNCTION` ungated "to match Redis" and
+  diverged in the opposite direction.
+
 - **Every container command answers `HELP`, in Redis's shape** (#698). Redis gives all 13
   container commands a `HELP` subcommand; Moon served it on five and refused it on eight,
   each with a different error. Two of those (`PUBSUB`, `XINFO`) reported an *arity* problem,

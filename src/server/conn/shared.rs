@@ -465,7 +465,7 @@ pub(crate) fn execute_transaction_sharded(
         // transaction body (all preceding writes applied first) and leave a
         // placeholder the caller patches with the receiver count.
         // moon#639: a connection-level intercept (CONFIG, CLIENT, ACL,
-        // CLUSTER, SCRIPT, WAIT, PUBSUB, AUTH, HELLO) queues like any other
+        // CLUSTER, SCRIPT, WAIT, PUBSUB, AUTH, HELLO, FUNCTION) queues like any other
         // command but cannot be replayed through `dispatch()`. Leave its slot
         // and let the caller — which HAS the connection — fill it in. Keeping
         // the slot here is what makes the EXEC array one-per-queued-command
@@ -2106,6 +2106,50 @@ pub(crate) fn is_transaction_control(cmd: &[u8]) -> bool {
     CONTROL.iter().any(|c| cmd.eq_ignore_ascii_case(c))
 }
 
+/// `FUNCTION` run from inside `EXEC` — moon#697.
+///
+/// Mirrors the live path (`try_handle_function_command`) rather than calling it:
+/// that one returns early when `conn.in_multi`, which is precisely the state
+/// this runs in.
+///
+/// The fan-out is NOT optional. The registry is per-shard-thread — its `RefCell`
+/// is shared with that thread's SPSC drain loop, which applies inbound fan-outs
+/// — so a `FUNCTION LOAD` that skipped the broadcast would land on ONE shard and
+/// still answer with the library name. `fim4` is the test that catches it, and
+/// only at `--shards 4`.
+pub(crate) async fn try_handle_function_in_txn(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    ctx: &super::core::ConnectionContext,
+    shutdown: &crate::runtime::cancel::CancellationToken,
+    func_registry: &std::rc::Rc<std::cell::RefCell<Option<crate::scripting::FunctionRegistry>>>,
+    out: &mut Vec<Frame>,
+) -> bool {
+    if !cmd.eq_ignore_ascii_case(b"FUNCTION") {
+        return false;
+    }
+    crate::server::conn::core::ensure_function_registry(func_registry, ctx);
+    // Borrow scoped and released BEFORE the fan-out await: the drain loop needs
+    // this cell to apply arriving libraries, and `await_holding_refcell_ref`
+    // rejects holding it across a yield even with a trailing `drop`.
+    let mut response = {
+        let mut guard = func_registry.borrow_mut();
+        #[allow(clippy::unwrap_used)]
+        // ensure_function_registry guarantees Some
+        crate::command::functions::handle_function(guard.as_mut().unwrap(), cmd_args)
+    };
+    if let Some(op) = function_fanout_op(cmd_args, &response)
+        && let Some(partial) = function_registry_fanout(ctx, shutdown, op).await
+    {
+        // A replay that did not reach every shard REPLACES the local reply, for
+        // the same reason it does on the live path: a `+OK` over a registry that
+        // answers differently per shard is the defect, not a shape to preserve.
+        response = partial;
+    }
+    out.push(response);
+    true
+}
+
 /// Commands that queue inside `MULTI` but are executed by the CONNECTION at
 /// `EXEC` time rather than by the transaction executor.
 ///
@@ -2138,9 +2182,25 @@ pub(crate) fn is_transaction_control(cmd: &[u8]) -> bool {
 /// the queue gate (they must be, to work unauthenticated). Their intercepts
 /// skip themselves while `conn.in_multi`, which is safe because being in a
 /// transaction already implies being authenticated.
+///
+/// `FUNCTION` joined in moon#697. Its absence was not a design choice: the
+/// executor fell through to the keyspace `dispatch()`, which has no FUNCTION
+/// arm, and answered `ERR unknown command 'FUNCTION'` — breaking this list's own
+/// "queueable iff dispatchable" invariant while claiming the command did not
+/// exist. Its handler needs the per-shard-thread registry, so that travels down
+/// to the filler with it (`try_handle_function_in_txn`).
 pub(crate) fn is_txn_connection_intercept(cmd: &[u8]) -> bool {
-    const CONNECTION_INTERCEPTS: [&[u8]; 9] = [
-        b"CONFIG", b"CLIENT", b"ACL", b"CLUSTER", b"SCRIPT", b"WAIT", b"PUBSUB", b"AUTH", b"HELLO",
+    const CONNECTION_INTERCEPTS: [&[u8]; 10] = [
+        b"CONFIG",
+        b"CLIENT",
+        b"ACL",
+        b"CLUSTER",
+        b"SCRIPT",
+        b"WAIT",
+        b"PUBSUB",
+        b"AUTH",
+        b"HELLO",
+        b"FUNCTION",
     ];
     CONNECTION_INTERCEPTS
         .iter()
@@ -2309,21 +2369,29 @@ pub(crate) fn queue_time_rejection(cmd: &[u8], args: &[Frame]) -> Option<Frame> 
 ///
 /// Returns the canonical uppercase name, which is also what the error echoes.
 ///
-/// Two containers Moon has a subcommand table for are deliberately ABSENT, and
-/// each absence is fenced by a test in
-/// `tests/container_subcommand_parity_670.rs` rather than left to this comment:
+/// One container Moon has a subcommand table for is deliberately ABSENT, and the
+/// absence is fenced by a test in `tests/container_subcommand_parity_670.rs`
+/// rather than left to this comment:
 ///
 ///   * `CLUSTER` — with cluster support disabled every CLUSTER subcommand,
 ///     bogus ones included, is answered "This instance has cluster support
 ///     disabled". Dispatch never reports an unknown subcommand, so a gate that
 ///     did would refuse to queue what dispatch would happily have run (`csp7`).
-///   * `FUNCTION` — moon#697: inside `MULTI` the executor answers EVERY
-///     `FUNCTION` subcommand with `ERR unknown command 'FUNCTION'`, valid ones
-///     included, so there is no agreed notion of "known" to gate on (`csp6`).
+///
+/// `FUNCTION` was a second absence until moon#697: its `EXEC` executor answered
+/// `ERR unknown command 'FUNCTION'` for every subcommand, so there was no agreed
+/// notion of "known" to gate on. It dispatches now, so it is gated, and `csp6`
+/// asserts that rather than fencing its absence.
 fn gated_container(cmd: &[u8]) -> Option<&'static str> {
+    // moon#697 added FUNCTION. Until then its EXEC executor answered `unknown
+    // command` for EVERY subcommand, so the gate's notion of a known subcommand
+    // and the executor's disagreed, and gating it would have swapped one
+    // queued-vs-dispatched divergence for another. FUNCTION now dispatches
+    // inside MULTI, so the "queueable iff dispatchable" invariant holds for it
+    // and it joins the other twelve.
     const GATED: &[&str] = &[
-        "ACL", "CLIENT", "COMMAND", "CONFIG", "MEMORY", "MODULE", "OBJECT", "PUBSUB", "SCRIPT",
-        "SLOWLOG", "XGROUP", "XINFO",
+        "ACL", "CLIENT", "COMMAND", "CONFIG", "FUNCTION", "MEMORY", "MODULE", "OBJECT", "PUBSUB",
+        "SCRIPT", "SLOWLOG", "XGROUP", "XINFO",
     ];
     GATED
         .iter()
