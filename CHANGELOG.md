@@ -22,6 +22,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefixing the SUBCOMMAND, and which work now).
 
 ### Fixed
+- **A flush issued from Lua reached neither every database nor every shard** (#685).
+  `redis.call('FLUSHALL')` cleared only the script's own database, and both
+  `redis.call('FLUSHALL')` and `redis.call('FLUSHDB')` cleared only the shard the script
+  happened to run on. Measured on `main`:
+
+  ```text
+  --shards 1, five databases seeded with one key each, from db0
+    plain FLUSHALL:                          db0=0 db1=0 db3=0 db7=0 db15=0
+    EVAL "return redis.call('FLUSHALL')" 0:  db0=0 db1=1 db3=1 db7=1 db15=1
+
+  --shards 4, db3 seeded with 40 keys
+    EVAL "return redis.call('FLUSHDB')"  0:  40 -> 29   (one shard of four)
+    EVAL "return redis.call('FLUSHALL')" 0:  29 -> 29   (nothing further)
+  ```
+
+  Both halves are structural, not a missing call: the bridge reaches the keyspace through
+  ONE `&mut Database` on ONE shard, so it can express neither "every database" (that needs
+  the slice its borrow came out of — the moon#677 shape) nor "every shard" (that needs to
+  `.await` a broadcast, inside a synchronous `redis.call`). The bridge now records what the
+  script asked for and the caller finishes it one frame up, where both are in scope again,
+  through a single `run_and_complete` helper the twelve script entry points (`EVAL`,
+  `EVALSHA`, `FCALL`, `FCALL_RO` × three handlers) all go through — `FCALL`/`FCALL_RO`
+  carried the same bug and are not mentioned in the issue.
+
+  Reaching every database is only safe together with the rest of what a flush means, so
+  the same completion drops the vector/text index CONTENTS (R3 — `FT.CREATE` definitions
+  survive, matching restart semantics) and tombstones the durable MQ streams (task #46).
+  Without those, a script's flush would have emptied sixteen databases on every shard
+  while leaving every flushed hash searchable as a ghost — a wider version of exactly the
+  inconsistency R3 exists to prevent.
+
+  The live server also disagreed with its own log. The AOF and replication planes were
+  already correct — the record says `FLUSHALL` and replay completes it across the set — so
+  a restart silently deleted four databases that had been readable a moment earlier, and a
+  primary and its replica diverged on any script that flushed. A script's flush now also
+  pushes the RESP3 flush invalidation to tracking clients, as the typed command has —
+  unconditionally, because the flush is real however the script ends: a script that
+  flushed and then returned an error left every tracking client caching keys that no
+  longer existed.
+
+  Still uncovered, deliberately: a script ROUTED to another shard for its declared keys
+  gets the database half and not the broadcast — `handle_shard_message_shared` is
+  synchronous and holds neither the SPSC producers nor the notifiers a broadcast needs, and
+  fanning out from inside a shard's own message loop is the wait cycle the `MULTI` path
+  documents. Measured at `--shards 4`: 6 to 10 of 12 keys survive, depending only on
+  where the script's declared key happens to hash. Tracked as #705.
+
 - **Three dispatch paths reached the keyspace without workspace key prefixing** (#702,
   #668). A workspace-bound connection that wrapped its commands in `MULTI`/`EXEC`
   addressed the raw, unprefixed keyspace — so it could read and overwrite **any other

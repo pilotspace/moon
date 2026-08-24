@@ -3017,23 +3017,19 @@ else
     # Reaching a known-empty state on BOTH servers, which every row below
     # depends on.
     #
-    # moon#677: moon's FLUSHALL clears only the SELECTED database, so it
-    # cannot get moon there -- the db3 key written by the "spans every
-    # database" row would survive on moon and not on redis, and every
-    # comparison after it would be judging two genuinely different datasets
-    # while blaming the digest. Simplify this back to `both FLUSHALL` once
-    # #677 lands.
+    # FLUSHALL on both, which is also what makes this a guard rather than
+    # only a setup step: redis carries state from every earlier section of
+    # this script -- including databases this one never touches -- so if
+    # either server's FLUSHALL stopped reaching every database on every
+    # shard, the very next digest row would diverge.
+    #
+    # This used to spell moon out one database at a time (moon#677, when
+    # moon's FLUSHALL was a synonym for FLUSHDB). moon#677 landed and
+    # moon#685 gave the Lua path the same reach, so the workaround is gone
+    # and the rows below exercise the real command again.
     dg_clear_every_db() {
-        local d
-        # redis's FLUSHALL is correct, and redis carries state from every
-        # earlier section of this script -- including databases this one never
-        # touches, which would show up as a digest difference against a
-        # freshly restarted moon.
         redis-cli -t 3 -p "$PORT_REDIS" FLUSHALL >/dev/null 2>&1 || true
-        # moon needs it spelled out, one database at a time.
-        for d in $(seq 0 15); do
-            redis-cli -t 3 -p "$PORT_RUST" -n "$d" FLUSHDB >/dev/null 2>&1 || true
-        done
+        redis-cli -t 3 -p "$PORT_RUST"  FLUSHALL >/dev/null 2>&1 || true
     }
 
     # One key of every type the digest walks, plus a TTL and a FIXED stream id
@@ -3121,9 +3117,10 @@ else
         redis-cli -t 3 -p "$PORT_RUST"  -n 3 SET dg:db3 v >/dev/null 2>&1 || true
         assert_both "[shards=$nshards] DEBUG DIGEST spans every database" DEBUG DIGEST
 
-        # Empty dataset is redis's all-zero sentinel, not an error. Clearing
-        # by db rather than by FLUSHALL for the moon#677 reason above -- the
-        # db3 key written just now is precisely what FLUSHALL fails to remove.
+        # Empty dataset is redis's all-zero sentinel, not an error. The db3
+        # key written just now is exactly what a FLUSHALL that reached only
+        # the selected database would leave behind, so this row doubles as
+        # the check that it no longer does (moon#677, moon#685).
         dg_clear_every_db
         assert_both "[shards=$nshards] DEBUG DIGEST of an empty dataset" DEBUG DIGEST
         assert_eq "[shards=$nshards] empty digest is the all-zero sentinel" \

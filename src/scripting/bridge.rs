@@ -554,6 +554,29 @@ pub fn make_redis_call_fn(
 
             let frame = db.execute_command(&cmd_bytes, &frames[1..], &mut db_idx, db_count);
 
+            // moon#685: a flush issued from Lua has to reach as far as the
+            // same flush issued on the connection — `FLUSHDB` the selected
+            // database on every shard, `FLUSHALL` every database on every
+            // shard. This closure holds ONE `&mut Database` on ONE shard, so
+            // it can do neither extra dimension: the keyspace half needs the
+            // slice this borrow came out of, and the shard half needs to
+            // `.await`. Record what was asked for; `pending_flush` finishes it
+            // one frame up, where both are in scope again.
+            //
+            // Deferring is not a compromise on ordering: `redis.call('SELECT')`
+            // is refused a few dozen lines above, and a script's writes are
+            // pinned to this shard, so nothing it does between here and its
+            // return can observe the databases still waiting to be cleared.
+            //
+            // Keyed on the command NAME rather than a flag passed down from
+            // the caller — `FLUSHDB` must keep its single-database scope, and
+            // a bool threaded through here is one inverted call from making it
+            // wipe the server (moon#677 made the same choice for the same
+            // reason).
+            if !matches!(frame, Frame::Error(_)) {
+                crate::scripting::pending_flush::arm(&cmd_bytes);
+            }
+
             // Wave A part 2 (task #34): dual-plane (AOF + replication)
             // emission of the effect, immediately after each successful
             // write — not batched to script end, so a partially-failing

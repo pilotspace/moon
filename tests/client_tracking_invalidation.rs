@@ -10,6 +10,8 @@
 //!    were queued into a channel nobody read (RESP3 invalidation never hit
 //!    the wire at all outside handler_single).
 //! 5. FLUSHALL/FLUSHDB never invalidated tracked keys.
+//! 6. A flush issued from LUA never invalidated them either, and still had to
+//!    once the script that issued it went on to fail (moon#685).
 //!
 //! Uses a raw TCP RESP3 client (redis-cli cannot observe async push frames
 //! in scripted mode). Spawns `--shards 4`. Skips gracefully when the moon
@@ -301,6 +303,87 @@ fn flushall_pushes_flush_invalidation() {
     assert!(
         reader.wait_for(INVALIDATE, Duration::from_secs(3)),
         "FLUSHALL must push a flush invalidation to tracking clients (got: {:?})",
+        String::from_utf8_lossy(&reader.buf)
+    );
+}
+
+/// A flush issued from Lua drops every cached key just as a typed one does —
+/// moon#685.
+///
+/// Before that fix the script path never invalidated at all: the bridge reaches
+/// the keyspace through `db.execute_command` and has no tracking hook, so a
+/// `redis.call('FLUSHALL')` emptied the server while every tracking client went
+/// on serving its cache.
+#[test]
+fn script_flushall_pushes_flush_invalidation() {
+    let m = spawn_moon_4shard();
+
+    let mut writer = Resp::connect(m.port);
+    writer.cmd(&["SET", "ct:sf", "v"]);
+    assert!(writer.saw(b"+OK"));
+
+    let mut reader = tracking_client(m.port);
+    reader.cmd(&["GET", "ct:sf"]);
+    assert!(reader.saw(b"v"));
+    reader.clear();
+
+    writer.cmd(&["EVAL", "return redis.call('FLUSHALL')", "0"]);
+    assert!(writer.saw(b"+OK"), "the script's FLUSHALL must succeed");
+
+    assert!(
+        reader.wait_for(INVALIDATE, Duration::from_secs(3)),
+        "moon#685 — a script-issued FLUSHALL must push a flush invalidation, \
+         exactly as the typed command does (got: {:?})",
+        String::from_utf8_lossy(&reader.buf)
+    );
+}
+
+/// ...and it must still push when the script goes on to FAIL.
+///
+/// The flush already happened — the keys are gone the moment `redis.call`
+/// returns — so gating the invalidation on the script's own reply leaves every
+/// tracking client caching keys that no longer exist. The natural way to write
+/// the completion hook (`if !matches!(response, Frame::Error(_))`) has exactly
+/// that bug, which is why this is a separate test and not a variant of the one
+/// above.
+#[test]
+fn script_flushall_then_error_still_pushes_flush_invalidation() {
+    let m = spawn_moon_4shard();
+
+    let mut writer = Resp::connect(m.port);
+    writer.cmd(&["SET", "ct:se", "v"]);
+    assert!(writer.saw(b"+OK"));
+
+    let mut reader = tracking_client(m.port);
+    reader.cmd(&["GET", "ct:se"]);
+    assert!(reader.saw(b"v"));
+    reader.clear();
+
+    writer.cmd(&[
+        "EVAL",
+        "redis.call('FLUSHALL'); return redis.error_reply('deliberate')",
+        "0",
+    ]);
+    assert!(
+        writer.wait_for(b"-deliberate", Duration::from_secs(3)),
+        "the script must report its own error (got: {:?})",
+        String::from_utf8_lossy(&writer.buf)
+    );
+
+    // The flush is real regardless of how the script ended.
+    let mut probe = Resp::connect(m.port);
+    probe.cmd(&["DBSIZE"]);
+    assert!(
+        probe.wait_for(b":0\r\n", Duration::from_secs(3)),
+        "the script's FLUSHALL must have emptied the keyspace even though the \
+         script then failed (got: {:?})",
+        String::from_utf8_lossy(&probe.buf)
+    );
+
+    assert!(
+        reader.wait_for(INVALIDATE, Duration::from_secs(3)),
+        "moon#685 — a script that flushed and THEN failed still emptied the \
+         keyspace, so tracking clients must be invalidated (got: {:?})",
         String::from_utf8_lossy(&reader.buf)
     );
 }

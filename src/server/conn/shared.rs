@@ -2399,6 +2399,66 @@ fn gated_container(cmd: &[u8]) -> Option<&'static str> {
         .copied()
 }
 
+/// Finish a flush a script issued — moon#685.
+///
+/// `pending_flush::run_and_complete` has already cleared every database this
+/// shard owns. What is left needs an `.await` and the connection's SPSC
+/// producers, neither of which exists inside `redis.call`:
+///
+///   * **the other shards.** `FLUSHDB`/`FLUSHALL` are keyless, so a script
+///     that calls one clears only the shard it happens to be running on. The
+///     same command typed on the connection has broadcast since D-2; measured
+///     at `--shards 4` before this fix, a script's `FLUSHDB` removed 11 of 40
+///     keys and its `FLUSHALL` removed none of the remaining 29.
+///   * **client-side caches.** A flush drops every tracked key, and the RESP3
+///     flush invalidation is pushed once, by the originating connection, for
+///     the whole server.
+///
+/// A failed broadcast leg REPLACES the script's own reply with the explicit
+/// partial-flush error, matching what the live path promises for a typed
+/// flush: a client that sees success can rely on it. Losing the script's
+/// return value is the intended trade — the alternative is answering `+OK`
+/// for a keyspace that is still half full.
+pub(crate) async fn finish_script_flush(
+    pending: Option<crate::scripting::pending_flush::PendingFlush>,
+    response: Frame,
+    db_index: usize,
+    ctx: &super::core::ConnectionContext,
+) -> Frame {
+    let Some(which) = pending else {
+        return response;
+    };
+    let mut response = response;
+    if ctx.num_shards > 1
+        && let Err(err) = crate::shard::coordinator::coordinate_flush_broadcast(
+            &crate::scripting::pending_flush::broadcast_frame(which),
+            ctx.shard_id,
+            ctx.num_shards,
+            db_index,
+            &ctx.dispatch_tx,
+            &ctx.spsc_notifiers,
+        )
+        .await
+    {
+        response = err;
+    }
+    // Unconditional, and neither of the two things it could have been gated on
+    // would have been right:
+    //
+    //   * NOT on the script's own reply. `pending` is armed only by a flush
+    //     that already SUCCEEDED, so the keys are gone by the time we get
+    //     here. A script that flushed and then returned an error — `return
+    //     redis.error_reply('x')`, or any Lua runtime error after the flush —
+    //     would leave every tracking client caching keys that no longer exist.
+    //   * NOT on the broadcast either. A failed leg means the flush was
+    //     PARTIAL, not absent: this shard's keys are still gone. Skipping the
+    //     invalidation there trades a correctness bug (clients serve deleted
+    //     keys) for a performance one (clients re-fetch keys that survived on
+    //     another shard), which is the wrong direction.
+    crate::tracking::invalidation::invalidate_flush(&ctx.tracking_table);
+    response
+}
+
 /// Rebuild an argv frame with `args` in place of everything after the command
 /// name.
 ///
