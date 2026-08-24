@@ -6,7 +6,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Sharded pub/sub channels are no longer workspace-scoped** (#703, fallout of #668). The
+  hand-rolled workspace key walker had `PUBLISH`/`SUBSCRIBE`/`PSUBSCRIBE` in its no-key
+  list, so their channels were never scoped — while `SPUBLISH`/`SSUBSCRIBE`/`SUNSUBSCRIBE`
+  were *not* in that list, so its single-key default prefixed `args[0]`, their channel. The
+  result was that sharded pub/sub was workspace-isolated and ordinary pub/sub was not,
+  purely as an artefact of which names somebody had remembered to add to a list. Nothing
+  tested either half.
+
+  A channel is not a key, the shared walker names none, and all six are global now.
+  Whether a workspace *should* be a pub/sub namespace is a product decision, tracked in
+  #703 along with the two other things a workspace does not partition (MQ queue names, and
+  `FUNCTION` libraries — which the old default broke outright inside a workspace by
+  prefixing the SUBCOMMAND, and which work now).
+
 ### Fixed
+- **Three dispatch paths reached the keyspace without workspace key prefixing** (#702,
+  #668). A workspace-bound connection that wrapped its commands in `MULTI`/`EXEC`
+  addressed the raw, unprefixed keyspace — so it could read and overwrite **any other
+  workspace's** keys, and the global keyspace with them. Measured on `main`: tenant B ran
+  `MULTI; GET {<tenant-a-hex>}:secret; SET {<tenant-a-hex>}:secret OVERWRITTEN-BY-B; EXEC`
+  and both succeeded; tenant A's own `GET secret` then answered `OVERWRITTEN-BY-B`. A Lua
+  script's whole `KEYS[]` vector escaped the same way.
+
+  The rewrite sat ~450 lines below the ACL gate behind a comment claiming it was "the ONLY
+  code path where workspace prefixing occurs". Three paths reached the keyspace above it
+  and prefixed nothing: the **MULTI queue gate** (the queue stores FRAMES and `EXEC`
+  replays those, not the shadowed `cmd_args`), the **`EVAL`/`EVALSHA` intercepts**, and
+  **cluster routing** (which computed a slot from a key name that does not exist). A
+  simpler symptom of the first, with no second tenant involved: `MULTI; SET k v; EXEC`
+  inside a workspace wrote the GLOBAL `k`, and the connection's own later `GET k` — which
+  *is* prefixed — answered nil. The transaction wrote somewhere its own writer could not
+  read.
+
+  The rewrite is now a labelled gate of its own, directly below the ACL gate and directly
+  above the MULTI queue gate, in both handlers. Above it, ACL keeps matching the
+  UNPREFIXED key the user typed (`test_workspace_acl_grant` pins that). Below it, every
+  path — queue gate, script intercepts, cluster routing, blocking, ordinary dispatch —
+  sees the prefixed argv. The one thing the hoist cannot fix on its own is the queue
+  itself, which stores frames rather than argvs: those are now rebuilt from the rewritten
+  `cmd_args`. The blocking branch of the same gate was broken identically and is fixed by
+  the hoist alone, since `queued_blocking_frame` already rebuilds from `cmd_args`
+  (moon#524) — measured pre-fix, a queued `BLPOP` popped off the GLOBAL list.
+
+  An argv whose key positions are indeterminate poisons the transaction at queue time like
+  any other queue-time rejection, so `EXEC` cannot apply the valid half against the global
+  keyspace. All eleven cases in `tests/workspace_isolation_668.rs` were confirmed to FAIL
+  against a build of the previous `main`.
+
+- **A workspace-bound connection can no longer reach the global keyspace** (#668).
+  `src/workspace/mod.rs` rewrote a command's key positions to prefix them with the
+  workspace hash tag using a SECOND, hand-rolled key walker — four hardcoded name lists
+  plus a handful of special cases, with a single-key `args[0]` default underneath. It had
+  drifted from `acl::keyspec::command_key_positions`, the shared walker moon#582
+  consolidated the ACL layer and cache-invalidation onto.
+
+  A registry-wide sweep — not a re-reading of the file — put the drift at **50 commands**,
+  in two flavours. Positions the list walker MISSED were left unprefixed, i.e. read or
+  written in the global keyspace from inside a workspace: `BITOP` (every position),
+  `SORT ... STORE`, `GEORADIUS*/... STORE|STOREDIST`, the SOURCE of `ZRANGESTORE` /
+  `GEOSEARCHSTORE` / `LCS`, everything after the first key of `BLPOP` / `BRPOP` /
+  `BLMOVE` / `BZPOPMIN` / `TOUCH` / `EXISTS`, all of `EVAL` / `EVALSHA`'s `KEYS[]`, and
+  the key behind the subcommand of `OBJECT` / `XINFO` / `MEMORY`. Since README sells
+  workspaces as enforced multi-tenant isolation (GA in v0.6.0), each of those is a tenant
+  break, not a cosmetic gap: `SORT k STORE dst` in workspace A wrote a global `dst` that
+  workspace B could read and overwrite.
+
+  Positions it INVENTED were the other half: the single-key default prefixed `args[0]` on
+  commands whose `args[0]` is not a key, so the command simply did not work inside a
+  workspace — the `numkeys` count of `ZUNION` / `ZINTER` / `ZDIFF` / `ZINTERCARD` /
+  `SINTERCARD` / `LMPOP` / `ZMPOP` / `BLMPOP` / `BZMPOP`, `BITOP`'s operation name,
+  `XGROUP`'s subcommand, `FCALL`'s function name, and `SCAN`'s cursor.
+
+  The lists are gone; the file now reads `command_key_positions` and prefixes exactly the
+  positions it reports. Three things a workspace partitions that ACL key patterns do not
+  are applied as explicit policy on top, each documented where it is applied: `FT.*` /
+  `GRAPH.*` index and graph names; the globs of `KEYS` and `SCAN ... MATCH` (a glob is not
+  a key, but an unscoped one enumerates every other tenant — `SCAN` gets a workspace-scoped
+  `MATCH` injected when the client supplied none); and `SORT ... BY|GET <pattern>`, whose
+  run-time-computed lookups land inside the workspace once the PATTERN is prefixed, since
+  it is expanded by plain `*` substitution. `BY nosort` and `GET #` are sentinels and are
+  left alone.
+
+  An argv whose key positions cannot be determined is now REFUSED
+  (`ERR workspace: refusing '<CMD>': its key positions could not be determined from this
+  argv`) rather than run against the global keyspace. In practice that is reachable only
+  through a malformed argv the command itself would have rejected a moment later; an
+  unregistered command name still passes through, so dispatch answers `unknown command`.
+
+  Fenced by `tests/workspace_key_walker_668.rs` (a registry-wide sweep, so the next command
+  added cannot re-open the gap by being forgotten, plus a curated corpus for every
+  `numkeys`-counted layout a synthetic argv cannot reach) and
+  `tests/workspace_isolation_668.rs` (a real server; every case uses a third, unbound
+  connection as the oracle, so an escaped key is observed where it escaped TO). All
+  eleven of the latter were confirmed to FAIL against a build of the previous `main`,
+  each reproducing its own defect — `BITOP` answering
+  `ERR BITOP requires AND, OR, XOR, or NOT` because its OPERATION had been prefixed,
+  `ZINTERCARD` answering `ERR numkeys can't be non-positive value`, `TOUCH` answering
+  `1` for a key that exists only in the global keyspace.
 - **`scripts/test-commands.sh` can no longer run a whole suite against a server that never
   started.** Both startup guards were structurally unreachable: `rcli`/`mcli` end in
   `|| true` — right for the ~500 assertion rows, fatal for the health checks built on them,

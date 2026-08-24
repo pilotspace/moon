@@ -114,92 +114,6 @@ pub fn strip_workspace_prefix<'a>(workspace_id: &WorkspaceId, key: &'a [u8]) -> 
     &key[PREFIX_LEN..]
 }
 
-/// Commands that take NO key arguments — return args unchanged.
-/// Checked case-insensitively.
-const NO_KEY_COMMANDS: &[&[u8]] = &[
-    b"PING",
-    b"INFO",
-    b"CLIENT",
-    b"AUTH",
-    b"SELECT",
-    b"MULTI",
-    b"EXEC",
-    b"DISCARD",
-    b"DBSIZE",
-    b"TIME",
-    b"RANDOMKEY",
-    b"QUIT",
-    b"COMMAND",
-    b"CONFIG",
-    b"DEBUG",
-    b"SLOWLOG",
-    b"CLUSTER",
-    b"WAIT",
-    b"SWAPDB",
-    b"MEMORY",
-    b"LATENCY",
-    b"SUBSCRIBE",
-    b"UNSUBSCRIBE",
-    b"PSUBSCRIBE",
-    b"PUNSUBSCRIBE",
-    b"PUBLISH",
-    b"TXN",
-    b"TEMPORAL",
-    b"WS",
-    b"MQ",
-    b"HELLO",
-    b"RESET",
-    b"ECHO",
-    b"OBJECT",
-    b"FLUSHALL",
-    b"FLUSHDB",
-    b"SAVE",
-    b"BGSAVE",
-    b"BGREWRITEAOF",
-    b"LASTSAVE",
-    b"SHUTDOWN",
-    b"REPLICAOF",
-    b"SLAVEOF",
-    b"REPLCONF",
-    b"PSYNC",
-    b"SCRIPT",
-    b"EVALSHA",
-    b"EVAL",
-    b"ACL",
-    b"MODULE",
-    b"XINFO",
-];
-
-/// Commands where ALL args are keys (prefix every arg).
-const ALL_KEYS_COMMANDS: &[&[u8]] = &[
-    b"MGET", b"DEL", b"UNLINK", b"EXISTS", b"WATCH", b"SINTER", b"SUNION", b"SDIFF", b"PFCOUNT",
-    b"PFMERGE",
-];
-
-/// Commands where args[0] and args[1] are both keys.
-const TWO_KEY_COMMANDS: &[&[u8]] = &[
-    b"RENAME",
-    b"RENAMENX",
-    b"COPY",
-    b"RPOPLPUSH",
-    b"LMOVE",
-    b"SMOVE",
-    b"BRPOPLPUSH",
-];
-
-/// Commands where the dest key is args[0] and source keys follow a numkeys pattern:
-/// args[0] = dest, args[1] = numkeys, args[2..2+numkeys] = source keys.
-const STORE_NUMKEYS_COMMANDS: &[&[u8]] = &[b"ZUNIONSTORE", b"ZINTERSTORE", b"ZDIFFSTORE"];
-
-/// Commands where dest is args[0], all remaining args are source keys.
-const STORE_ALL_COMMANDS: &[&[u8]] = &[b"SINTERSTORE", b"SUNIONSTORE", b"SDIFFSTORE"];
-
-/// Helper: case-insensitive membership check for command byte slices.
-#[inline]
-fn cmd_in(cmd: &[u8], list: &[&[u8]]) -> bool {
-    list.iter().any(|c| cmd.eq_ignore_ascii_case(c))
-}
-
 /// Prefix a single key frame with the workspace hash tag.
 ///
 /// If the frame is a `BulkString`, returns a new `BulkString` with the prefixed key.
@@ -212,158 +126,226 @@ fn prefix_frame(frame: &Frame, ws_id: &WorkspaceId) -> Frame {
     }
 }
 
+/// Clone `args`, prefixing exactly the positions in `positions`.
+fn prefix_at(args: &[Frame], positions: &[usize], ws_id: &WorkspaceId) -> Vec<Frame> {
+    let mut out = args.to_vec();
+    for &i in positions {
+        if let Some(slot) = out.get_mut(i) {
+            *slot = prefix_frame(&args[i], ws_id);
+        }
+    }
+    out
+}
+
+/// The error a workspace-bound connection gets when an argv's key positions
+/// cannot be determined.
+///
+/// Refusing is the only safe answer. Running the command unrewritten would let
+/// it read and write the GLOBAL keyspace from inside a workspace, which is the
+/// isolation break the rewrite exists to prevent; guessing a position would
+/// corrupt an argument instead. In practice this is reachable only through a
+/// malformed argv (an unparseable `numkeys`, a missing `STREAMS` token) that
+/// the command itself would have rejected a moment later.
+fn refuse_indeterminate(cmd: &[u8]) -> Frame {
+    let name = String::from_utf8_lossy(cmd).to_uppercase();
+    Frame::Error(Bytes::from(format!(
+        "ERR workspace: refusing '{name}': its key positions could not be determined from this argv"
+    )))
+}
+
+/// The positions of `SORT`/`SORT_RO`'s `BY`/`GET` PATTERNS.
+///
+/// These are the keys [`AtPlusComputed`](crate::acl::keyspec::KeyPositions::AtPlusComputed)
+/// reports as unnameable:
+/// `BY w_*` dereferences `w_<element>` once per element, and the element names
+/// are only known at run time. ACL has to treat that as indeterminate, but a
+/// workspace does not have to — the pattern is expanded by simple `*`
+/// substitution (`command::key_extra::apply_pattern`), so prefixing the PATTERN
+/// makes every expansion of it land inside the workspace:
+/// `{ws}:w_*` -> `{ws}:w_<element>`.
+///
+/// Two spellings are sentinels rather than patterns and must be left alone:
+/// `BY nosort` (skip sorting) and `GET #` (return the element itself).
+/// Prefixing either changes what the command DOES, not where it looks.
+///
+/// The walk deliberately mirrors `acl::keyspec::source_plus_store` token for
+/// token, including its `i += 2` skip past a `STORE` destination, so the two
+/// cannot drift into disagreeing about which slots hold keywords.
+fn sort_pattern_positions(cmd: &[u8], args: &[Frame]) -> smallvec::SmallVec<[usize; 4]> {
+    let mut out = smallvec::SmallVec::new();
+    if !(cmd.eq_ignore_ascii_case(b"SORT") || cmd.eq_ignore_ascii_case(b"SORT_RO")) {
+        return out;
+    }
+    let mut i = 1;
+    while i < args.len() {
+        let Frame::BulkString(tok) = &args[i] else {
+            i += 1;
+            continue;
+        };
+        if tok.eq_ignore_ascii_case(b"STORE") || tok.eq_ignore_ascii_case(b"STOREDIST") {
+            // The destination is already a NAMED key position.
+            i += 2;
+            continue;
+        }
+        if tok.eq_ignore_ascii_case(b"BY") || tok.eq_ignore_ascii_case(b"GET") {
+            if let Some(Frame::BulkString(pattern)) = args.get(i + 1)
+                && pattern.as_ref() != b"nosort"
+                && pattern.as_ref() != b"#"
+            {
+                out.push(i + 1);
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Scope `SCAN` to the workspace by prefixing (or injecting) its `MATCH` glob.
+///
+/// `SCAN` names no key, so the shared walker correctly reports no key positions
+/// — but an unscoped `SCAN` walks the WHOLE keyspace and would hand a
+/// workspace-bound client every other workspace's keys. The cursor must never
+/// be touched (it is a number, not a name); the glob must always be, and when
+/// the client supplied none, one is injected.
+fn scan_scoped(args: &[Frame], ws_id: &WorkspaceId) -> Vec<Frame> {
+    // Every SCAN option is a two-token pair (`MATCH g`, `COUNT n`, `TYPE t`)
+    // following the cursor at args[0].
+    let mut i = 1;
+    while i + 1 < args.len() {
+        if let Frame::BulkString(tok) = &args[i]
+            && tok.eq_ignore_ascii_case(b"MATCH")
+        {
+            return prefix_at(args, &[i + 1], ws_id);
+        }
+        i += 2;
+    }
+    let mut out = args.to_vec();
+    out.push(Frame::BulkString(Bytes::from_static(b"MATCH")));
+    out.push(Frame::BulkString(workspace_key(Some(ws_id), b"*")));
+    out
+}
+
 /// Rewrite command arguments to prefix key/index/graph name positions
 /// with the workspace hash tag `{ws_hex}:`.
 ///
 /// This is the **single injection point** for workspace key prefixing.
 /// Called once per command in the handler, before `extract_primary_key` / `key_to_shard`.
 ///
-/// # Strategy
-/// - No-key commands: return args as-is (cloned).
-/// - Multi-key commands: prefix all key positions per command-specific layout.
-/// - FT.* / GRAPH.*: prefix index/graph name in args[0].
-/// - Default (single-key): prefix args[0] only.
-pub fn workspace_rewrite_args(cmd: &[u8], args: &[Frame], ws_id: &WorkspaceId) -> Vec<Frame> {
-    // Empty args: nothing to rewrite.
+/// # Where the key positions come from
+///
+/// From [`acl::keyspec::command_key_positions`](crate::acl::keyspec::command_key_positions)
+/// — the shared walker (moon#582) that the ACL layer, cache-invalidation, and
+/// the cross-shard multi-key check already read. Until moon#668 this file
+/// carried a SECOND, hand-rolled walker: four hardcoded name lists plus a
+/// handful of special cases, with a single-key default underneath. It had
+/// drifted badly. A registry-wide sweep found **50** commands where the two
+/// walkers disagreed, in two flavours, both of which the sweep test now fences:
+///
+///   * *positions the list walker missed* — the key was left UNPREFIXED and so
+///     was read or written in the GLOBAL keyspace from inside a workspace.
+///     `BITOP dest src...` (every position), `SORT ... STORE dst`,
+///     `GEORADIUS* ... STORE|STOREDIST dst`, `ZRANGESTORE`/`GEOSEARCHSTORE`/
+///     `LCS` (the source), `BLPOP`/`BRPOP`/`BLMOVE`/`BZPOPMIN`/`TOUCH`
+///     (everything after the first key), `EVAL`/`EVALSHA` (all of `KEYS[]`),
+///     and `OBJECT`/`XINFO`/`MEMORY` (the key behind the subcommand).
+///   * *positions it invented* — the single-key default prefixed `args[0]` on
+///     commands whose `args[0]` is not a key at all, so the command broke
+///     outright inside a workspace: the `numkeys` count of `ZUNION`/`ZINTER`/
+///     `ZDIFF`/`ZINTERCARD`/`SINTERCARD`/`LMPOP`/`ZMPOP`/`BLMPOP`/`BZMPOP`,
+///     `BITOP`'s operation name, `XGROUP`'s subcommand, `FCALL`'s function
+///     name, and `SCAN`'s cursor.
+///
+/// # The policy this file adds on top of those facts
+///
+/// `command_key_positions` reports FACTS about keyspace keys; each caller
+/// applies its own POLICY. A workspace partitions three things the ACL layer
+/// does not, so they are handled HERE, before the shared walker:
+///
+///   * **`FT.*` / `GRAPH.*`** — index and graph names live in their own
+///     namespace, which ACL key patterns do not cover (the walker answers
+///     `None`). Workspaces do partition it: `args[0]` is the name.
+///   * **`KEYS <glob>` and `SCAN ... MATCH <glob>`** — a glob is not a key, but
+///     an unscoped one enumerates every OTHER workspace's keys.
+///   * **`SORT ... BY|GET <pattern>`** — see [`sort_pattern_positions`].
+///
+/// # What a workspace does NOT partition
+///
+/// Stated because the old lists partitioned some of it BY ACCIDENT, and the
+/// accident was neither consistent nor tested:
+///
+///   * **Pub/sub channels.** `PUBLISH`/`SUBSCRIBE`/`PSUBSCRIBE` were in the old
+///     no-key list and were never scoped; `SPUBLISH`/`SSUBSCRIBE`/`SUNSUBSCRIBE`
+///     were not, so the single-key default scoped THEIR channel — sharded
+///     pub/sub was workspace-isolated and ordinary pub/sub was not. A channel is
+///     not a key, the shared walker names none, and all six are now global.
+///   * **`MQ` queue names** — `MQ` was in the old no-key list, so these were
+///     never scoped and still are not.
+///   * **`FUNCTION` libraries** — the old default prefixed `args[0]`, the
+///     SUBCOMMAND, so `FUNCTION` did not work inside a workspace at all. It
+///     works now, and its libraries are server-wide.
+///   * **A Lua script's direct `redis.call('GET', 'k')`.** `KEYS[]` is
+///     prefixed (`EVAL`'s key vector is a named position); a literal key inside
+///     the script body is not reachable from the argv at all.
+///
+/// Tracked in moon#703.
+pub fn workspace_rewrite_args(
+    cmd: &[u8],
+    args: &[Frame],
+    ws_id: &WorkspaceId,
+) -> Result<Vec<Frame>, Frame> {
     if args.is_empty() {
-        return args.to_vec();
+        return Ok(args.to_vec());
     }
 
-    // No-key commands: passthrough.
-    if cmd_in(cmd, NO_KEY_COMMANDS) {
-        return args.to_vec();
-    }
-
-    // --- FT.* commands ---
+    // --- index / graph namespaces (policy, not keyspace keys) ---
     if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
         // FT._LIST has no index name arg — passthrough.
         if cmd.eq_ignore_ascii_case(b"FT._LIST") {
-            return args.to_vec();
+            return Ok(args.to_vec());
         }
-        // FT.CREATE, FT.SEARCH, FT.INFO, FT.DROPINDEX, FT.COMPACT,
-        // FT.CACHESEARCH, FT.CONFIG, FT.RECOMMEND, FT.NAVIGATE, FT.EXPAND,
-        // FT.AGGREGATE — args[0] is always the index name.
-        let mut out = args.to_vec();
-        out[0] = prefix_frame(&args[0], ws_id);
-        return out;
+        return Ok(prefix_at(args, &[0], ws_id));
     }
-
-    // --- GRAPH.* commands ---
     if cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.") {
         // GRAPH.LIST has no graph name arg — passthrough.
         if cmd.eq_ignore_ascii_case(b"GRAPH.LIST") {
-            return args.to_vec();
+            return Ok(args.to_vec());
         }
-        // GRAPH.QUERY, GRAPH.CREATE, GRAPH.DELETE, etc. — args[0] is graph name.
-        let mut out = args.to_vec();
-        out[0] = prefix_frame(&args[0], ws_id);
-        return out;
+        return Ok(prefix_at(args, &[0], ws_id));
     }
 
-    // --- MSET: even-indexed args (0, 2, 4, ...) are keys ---
-    if cmd.eq_ignore_ascii_case(b"MSET") || cmd.eq_ignore_ascii_case(b"MSETNX") {
-        let mut out = Vec::with_capacity(args.len());
-        for (i, arg) in args.iter().enumerate() {
-            if i % 2 == 0 {
-                out.push(prefix_frame(arg, ws_id));
-            } else {
-                out.push(arg.clone());
+    // --- keyspace globs (policy, not keyspace keys) ---
+    if cmd.eq_ignore_ascii_case(b"KEYS") {
+        return Ok(prefix_at(args, &[0], ws_id));
+    }
+    if cmd.eq_ignore_ascii_case(b"SCAN") {
+        return Ok(scan_scoped(args, ws_id));
+    }
+
+    // --- everything else: the one shared key walker ---
+    match crate::acl::keyspec::command_key_positions(cmd, args) {
+        crate::acl::keyspec::KeyPositions::None => Ok(args.to_vec()),
+        crate::acl::keyspec::KeyPositions::At(idx) => {
+            let positions: smallvec::SmallVec<[usize; 8]> = idx.iter().map(|k| k.idx).collect();
+            Ok(prefix_at(args, &positions, ws_id))
+        }
+        crate::acl::keyspec::KeyPositions::AtPlusComputed(idx) => {
+            let mut positions: smallvec::SmallVec<[usize; 8]> = idx.iter().map(|k| k.idx).collect();
+            positions.extend(sort_pattern_positions(cmd, args));
+            Ok(prefix_at(args, &positions, ws_id))
+        }
+        crate::acl::keyspec::KeyPositions::Unknown => {
+            // An unregistered name is not an indeterminate argv: dispatch is
+            // about to answer `unknown command`, which is a far better error
+            // than anything this layer could invent. Pass it through unchanged
+            // — it names no key precisely because it is not a command.
+            if crate::command::metadata::lookup(cmd).is_none() {
+                return Ok(args.to_vec());
             }
+            Err(refuse_indeterminate(cmd))
         }
-        return out;
     }
-
-    // --- All-keys commands (MGET, DEL, UNLINK, EXISTS, etc.) ---
-    if cmd_in(cmd, ALL_KEYS_COMMANDS) {
-        return args.iter().map(|a| prefix_frame(a, ws_id)).collect();
-    }
-
-    // --- Two-key commands (RENAME, COPY, RPOPLPUSH, LMOVE, SMOVE, etc.) ---
-    if cmd_in(cmd, TWO_KEY_COMMANDS) {
-        let mut out = args.to_vec();
-        out[0] = prefix_frame(&args[0], ws_id);
-        if args.len() > 1 {
-            out[1] = prefix_frame(&args[1], ws_id);
-        }
-        return out;
-    }
-
-    // --- STORE with numkeys (ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE) ---
-    // Layout: dest numkeys src1 src2 ... [WEIGHTS ...] [AGGREGATE ...]
-    if cmd_in(cmd, STORE_NUMKEYS_COMMANDS) {
-        let mut out = args.to_vec();
-        // args[0] = dest key
-        out[0] = prefix_frame(&args[0], ws_id);
-        // args[1] = numkeys
-        if let Some(Frame::BulkString(nk_bytes)) = args.get(1) {
-            if let Ok(nk_str) = std::str::from_utf8(nk_bytes) {
-                if let Ok(numkeys) = nk_str.parse::<usize>() {
-                    for i in 2..std::cmp::min(2 + numkeys, args.len()) {
-                        out[i] = prefix_frame(&args[i], ws_id);
-                    }
-                }
-            }
-        }
-        return out;
-    }
-
-    // --- STORE-all commands (SINTERSTORE, SUNIONSTORE, SDIFFSTORE) ---
-    // Layout: dest src1 src2 ...
-    if cmd_in(cmd, STORE_ALL_COMMANDS) {
-        return args.iter().map(|a| prefix_frame(a, ws_id)).collect();
-    }
-
-    // --- XREAD / XREADGROUP: keys appear after STREAMS keyword ---
-    if cmd.eq_ignore_ascii_case(b"XREAD") || cmd.eq_ignore_ascii_case(b"XREADGROUP") {
-        let mut out = args.to_vec();
-        // Find the STREAMS keyword position.
-        let streams_pos = args
-            .iter()
-            .position(|a| matches!(a, Frame::BulkString(b) if b.eq_ignore_ascii_case(b"STREAMS")));
-        if let Some(pos) = streams_pos {
-            // After STREAMS: keys come first, then IDs.
-            // Number of keys = (args.len() - pos - 1) / 2
-            let remaining = args.len() - pos - 1;
-            let num_keys = remaining / 2;
-            for i in 0..num_keys {
-                let idx = pos + 1 + i;
-                if idx < args.len() {
-                    out[idx] = prefix_frame(&args[idx], ws_id);
-                }
-            }
-        }
-        return out;
-    }
-
-    // --- SORT: args[0] is key ---
-    if cmd.eq_ignore_ascii_case(b"SORT") || cmd.eq_ignore_ascii_case(b"SORT_RO") {
-        let mut out = args.to_vec();
-        out[0] = prefix_frame(&args[0], ws_id);
-        return out;
-    }
-
-    // --- OBJECT subcommands: args[1] is key (args[0] is subcommand) ---
-    if cmd.eq_ignore_ascii_case(b"OBJECT") {
-        let mut out = args.to_vec();
-        if args.len() > 1 {
-            out[1] = prefix_frame(&args[1], ws_id);
-        }
-        return out;
-    }
-
-    // NOTE: every *STORE destination this file does not name above falls
-    // through to the single-key default below and is therefore NOT prefixed:
-    // `GEOSEARCHSTORE`, `ZRANGESTORE`, `PFMERGE`, `SORT ... STORE`, and
-    // (since moon#645) `GEORADIUS*/... STORE|STOREDIST`. That is one gap, not
-    // five: this list is a hand-rolled second key walker that has drifted from
-    // `acl::keyspec::command_key_positions`, which already knows all of these
-    // layouts. Tracked as its own issue — fixing it means replacing the list,
-    // not appending to it.
-
-    // --- Default: single-key command — prefix args[0] only ---
-    let mut out = args.to_vec();
-    out[0] = prefix_frame(&args[0], ws_id);
-    out
 }
 
 /// Strip workspace prefix from response frames for key-returning commands.
@@ -589,6 +571,21 @@ mod tests {
 
     // --- workspace_rewrite_args tests ---
 
+    /// `workspace_rewrite_args` for an argv that must NOT be refused.
+    ///
+    /// Every rewrite test goes through this rather than `.unwrap()`, so a
+    /// regression that starts refusing a well-formed argv fails with the error
+    /// text instead of a bare unwrap panic.
+    fn expect_rewrite(cmd: &[u8], args: &[Frame], ws: &WorkspaceId) -> Vec<Frame> {
+        match workspace_rewrite_args(cmd, args, ws) {
+            Ok(out) => out,
+            Err(err) => panic!(
+                "{} was refused inside a workspace: {err:?}",
+                String::from_utf8_lossy(cmd)
+            ),
+        }
+    }
+
     fn bs(s: &[u8]) -> Frame {
         Frame::BulkString(Bytes::copy_from_slice(s))
     }
@@ -604,7 +601,7 @@ mod tests {
     fn test_rewrite_args_get() {
         let ws = WorkspaceId::from_bytes([0u8; 16]);
         let args = vec![bs(b"mykey")];
-        let result = workspace_rewrite_args(b"GET", &args, &ws);
+        let result = expect_rewrite(b"GET", &args, &ws);
         assert_eq!(result.len(), 1);
         assert_eq!(
             extract_bs(&result[0]),
@@ -616,7 +613,7 @@ mod tests {
     fn test_rewrite_args_set() {
         let ws = WorkspaceId::from_bytes([0u8; 16]);
         let args = vec![bs(b"mykey"), bs(b"myvalue")];
-        let result = workspace_rewrite_args(b"SET", &args, &ws);
+        let result = expect_rewrite(b"SET", &args, &ws);
         assert_eq!(result.len(), 2);
         assert_eq!(
             extract_bs(&result[0]),
@@ -630,7 +627,7 @@ mod tests {
     fn test_rewrite_args_mget() {
         let ws = WorkspaceId::from_bytes([0u8; 16]);
         let args = vec![bs(b"k1"), bs(b"k2"), bs(b"k3")];
-        let result = workspace_rewrite_args(b"MGET", &args, &ws);
+        let result = expect_rewrite(b"MGET", &args, &ws);
         assert_eq!(result.len(), 3);
         for r in &result {
             assert!(extract_bs(r).starts_with(b"{00000000000000000000000000000000}:"));
@@ -644,7 +641,7 @@ mod tests {
     fn test_rewrite_args_mset() {
         let ws = WorkspaceId::from_bytes([0u8; 16]);
         let args = vec![bs(b"k1"), bs(b"v1"), bs(b"k2"), bs(b"v2")];
-        let result = workspace_rewrite_args(b"MSET", &args, &ws);
+        let result = expect_rewrite(b"MSET", &args, &ws);
         assert_eq!(result.len(), 4);
         // Keys (even indices) prefixed
         assert!(extract_bs(&result[0]).ends_with(b"k1"));
@@ -661,12 +658,12 @@ mod tests {
         let ws = WorkspaceId::from_bytes([0u8; 16]);
         // PING with no args
         let args: Vec<Frame> = vec![];
-        let result = workspace_rewrite_args(b"PING", &args, &ws);
+        let result = expect_rewrite(b"PING", &args, &ws);
         assert!(result.is_empty());
 
         // INFO with one arg
         let args = vec![bs(b"server")];
-        let result = workspace_rewrite_args(b"INFO", &args, &ws);
+        let result = expect_rewrite(b"INFO", &args, &ws);
         assert_eq!(extract_bs(&result[0]), b"server"); // unchanged
     }
 
@@ -674,7 +671,7 @@ mod tests {
     fn test_rewrite_args_ft_search() {
         let ws = WorkspaceId::from_bytes([0u8; 16]);
         let args = vec![bs(b"myindex"), bs(b"*")];
-        let result = workspace_rewrite_args(b"FT.SEARCH", &args, &ws);
+        let result = expect_rewrite(b"FT.SEARCH", &args, &ws);
         assert_eq!(result.len(), 2);
         assert_eq!(
             extract_bs(&result[0]),
@@ -688,7 +685,7 @@ mod tests {
     fn test_rewrite_args_ft_create() {
         let ws = WorkspaceId::from_bytes([0u8; 16]);
         let args = vec![bs(b"myindex"), bs(b"ON"), bs(b"HASH")];
-        let result = workspace_rewrite_args(b"FT.CREATE", &args, &ws);
+        let result = expect_rewrite(b"FT.CREATE", &args, &ws);
         assert_eq!(result.len(), 3);
         assert!(extract_bs(&result[0]).starts_with(b"{"));
         assert!(extract_bs(&result[0]).ends_with(b"myindex"));
@@ -701,7 +698,7 @@ mod tests {
     fn test_rewrite_args_ft_list() {
         let ws = WorkspaceId::from_bytes([0u8; 16]);
         let args: Vec<Frame> = vec![];
-        let result = workspace_rewrite_args(b"FT._LIST", &args, &ws);
+        let result = expect_rewrite(b"FT._LIST", &args, &ws);
         assert!(result.is_empty());
     }
 
@@ -709,7 +706,7 @@ mod tests {
     fn test_rewrite_args_graph_query() {
         let ws = WorkspaceId::from_bytes([0u8; 16]);
         let args = vec![bs(b"mygraph"), bs(b"MATCH (n) RETURN n")];
-        let result = workspace_rewrite_args(b"GRAPH.QUERY", &args, &ws);
+        let result = expect_rewrite(b"GRAPH.QUERY", &args, &ws);
         assert_eq!(result.len(), 2);
         assert_eq!(
             extract_bs(&result[0]),
@@ -723,7 +720,7 @@ mod tests {
     fn test_rewrite_args_graph_list() {
         let ws = WorkspaceId::from_bytes([0u8; 16]);
         let args: Vec<Frame> = vec![];
-        let result = workspace_rewrite_args(b"GRAPH.LIST", &args, &ws);
+        let result = expect_rewrite(b"GRAPH.LIST", &args, &ws);
         assert!(result.is_empty());
     }
 
@@ -731,7 +728,7 @@ mod tests {
     fn test_rewrite_args_del_multi() {
         let ws = WorkspaceId::from_bytes([0u8; 16]);
         let args = vec![bs(b"k1"), bs(b"k2")];
-        let result = workspace_rewrite_args(b"DEL", &args, &ws);
+        let result = expect_rewrite(b"DEL", &args, &ws);
         assert_eq!(result.len(), 2);
         assert!(extract_bs(&result[0]).ends_with(b"k1"));
         assert!(extract_bs(&result[1]).ends_with(b"k2"));
@@ -741,7 +738,7 @@ mod tests {
     fn test_rewrite_args_rename() {
         let ws = WorkspaceId::from_bytes([0u8; 16]);
         let args = vec![bs(b"old"), bs(b"new")];
-        let result = workspace_rewrite_args(b"RENAME", &args, &ws);
+        let result = expect_rewrite(b"RENAME", &args, &ws);
         assert_eq!(result.len(), 2);
         assert!(extract_bs(&result[0]).ends_with(b"old"));
         assert!(extract_bs(&result[0]).starts_with(b"{"));
@@ -762,7 +759,7 @@ mod tests {
             bs(b"1"),
             bs(b"2"),
         ];
-        let result = workspace_rewrite_args(b"ZUNIONSTORE", &args, &ws);
+        let result = expect_rewrite(b"ZUNIONSTORE", &args, &ws);
         assert_eq!(result.len(), 7);
         // dest prefixed
         assert!(extract_bs(&result[0]).ends_with(b"dest"));
@@ -793,7 +790,7 @@ mod tests {
             bs(b"0"),
             bs(b"0"),
         ];
-        let result = workspace_rewrite_args(b"XREAD", &args, &ws);
+        let result = expect_rewrite(b"XREAD", &args, &ws);
         assert_eq!(result.len(), 7);
         // COUNT and 10 unchanged
         assert_eq!(extract_bs(&result[0]), b"COUNT");
