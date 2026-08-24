@@ -6,6 +6,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`FT.SEARCH` can find ordinary English words again** (#690). Two independent defects
+  produced one symptom — an empty result set, with no error and nothing for the user to
+  act on.
+
+  The analyzer filtered against `stop_words::get(LANGUAGE::English)`, which resolves to the
+  **stopwords-iso** list: 1,298 entries, against RediSearch's 33. `hello`, `world`, `test`,
+  `name`, `order`, `open` and `index` were among the ~1,265 extra words discarded at index
+  time, so a document whose only word was `hello` indexed **zero terms** and was unreachable
+  by its own content. moon now ships RediSearch's 33-word list, spelled out in
+  `text::analyzer::DEFAULT_STOP_WORDS` rather than pulled from a crate, so what moon
+  discards is greppable and cannot change under a dependency bump. The `stop-words`
+  dependency is dropped.
+
+  Separately, a query token that analyzed to nothing evaluated to ∅ and was then
+  *intersected* into its conjunction, so a stop word anywhere in a query zeroed the entire
+  result set: on a corpus containing no stop words at all, `alpha` matched 2 documents and
+  `alpha the` matched 0. RediSearch removes stop words from the query; moon now does too.
+  The discriminator is "analyzed to nothing", not "matched nothing" — `alpha zzz` still
+  correctly matches nothing, and TAG/NUMERIC/fuzzy/prefix leaves are never dropped.
+
+  Each half is load-bearing and was proven so: with the list swapped but the query path
+  untouched, `alpha the` still returned 0; with the query path fixed but the list untouched,
+  `hello` was still unindexable.
+
+  **Existing indexes are not rewritten.** An index built before this change is missing the
+  ~1,265 terms the old list dropped; queries for them return 0 until the index is rebuilt
+  (`FT.DROPINDEX` + `FT.CREATE`, or a restart that re-indexes).
+
+  Not addressed here: `FT.CREATE ... STOPWORDS <count> <word>...` is still unimplemented,
+  so the list is not yet per-index configurable.
+
 ### Added
 - **`DEBUG DIGEST`** (#636). A SHA1 fingerprint of the whole dataset, so two servers can
   be compared in one round trip instead of key by key. The crash-matrix and replication

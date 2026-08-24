@@ -75,7 +75,11 @@ pub fn eval_set(node: &QueryNode, idx: &TextIndex) -> RoaringBitmap {
         }
 
         QueryNode::And(children) => {
-            let mut iter = children.iter();
+            // moon#690: a stop-word leaf is REMOVED from the conjunction, not intersected as
+            // ∅ — `alpha the` means `alpha`, which is what RediSearch does. Intersecting it
+            // zeroed every conjunction that happened to contain a stop word.
+            let mut iter = children.iter().filter(|c| !is_stop_word_only(c, idx));
+            // Every child was a stop word: nothing is being asked for, so nothing matches.
             let Some(first) = iter.next() else {
                 return RoaringBitmap::new();
             };
@@ -324,6 +328,47 @@ fn analyze_raw(
             }
         }
     }
+}
+
+/// Whether this node is a query token that ANALYZES TO NOTHING — i.e. a stop word.
+///
+/// The discriminator is "analyzed to nothing", NOT "matched nothing": a term that survives
+/// analysis but is absent from the index is a real, unsatisfied constraint and must still
+/// zero its conjunction. Only that distinction separates `alpha the` (means `alpha`) from
+/// `alpha zzz` (means nothing).
+///
+/// Narrow by construction — everything that is not provably a stop word answers `false`:
+///   * `Exact` only. Fuzzy/prefix terms bypass the stop-word filter entirely, so they can
+///     never be neutral.
+///   * TAG / NUMERIC / `Empty` carry real constraints and must never be dropped.
+///   * A term leaf on an index with no searchable TEXT field is a constraint that cannot be
+///     satisfied, not an absent one — dropping it would turn the query into match-all.
+///   * A field whose analyzer is missing (a schema/analyzer length mismatch) answers `false`
+///     rather than silently widening the query.
+fn is_stop_word_only(node: &QueryNode, idx: &TextIndex) -> bool {
+    let QueryNode::Term {
+        field,
+        token,
+        modifier,
+    } = node
+    else {
+        return false;
+    };
+    if !matches!(modifier, TermModifier::Exact) {
+        return false;
+    }
+    let Ok(raw_str) = std::str::from_utf8(token) else {
+        return false;
+    };
+    let fields = leaf_fields(idx, *field);
+    if fields.is_empty() {
+        return false;
+    }
+    fields.into_iter().all(|fidx| {
+        idx.field_analyzers
+            .get(fidx)
+            .is_some_and(|a| a.tokenize_with_positions(raw_str).is_empty())
+    })
 }
 
 /// The fields a term leaf scores against: its scoped field, or every non-NOINDEX text field.
