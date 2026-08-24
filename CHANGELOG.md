@@ -190,6 +190,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as an answer. That shard also logs a warning, because cold keys with no manifest will not
   survive a restart — `rebuild_from_manifest` is the only thing that re-indexes them.
 ### Fixed
+- **Client-compat freshness guard blamed files the binary never compiled** (#687). The
+  guard walks `src/` and refuses under `--strict` when any `.rs` is newer than the
+  binary — the right instinct (moon#461: a harness that tests the wrong binary reports a
+  confident, false green) applied to the wrong set of files. `src/` is not what went
+  into the binary: `handler_single.rs` is `#[cfg(feature = "runtime-tokio")]`, and the
+  compat job builds the default monoio runtime, so rustc never opens it. A checkout
+  stamped it 13 minutes newer than a binary cargo reported `Finished ... in 0.57s` for,
+  and the gate refused to run — twice, on two separate dispatches, on a binary that was
+  correct.
+
+  The guard now reads rustc's own dep-info (`<binary>.d`) — the record of every file it
+  actually opened — and compares mtimes only against those. On the real CI inputs that
+  is 438 of 478 `src/` files; the other 40 are the tokio handlers, the `console` admin
+  tree, the x86 SIMD kernels, the GPU module, and `#[cfg(test)]` files, none of which are
+  in the binary under test. Verified both directions against the exact runner paths that
+  failed: the CI binary is now accepted, and the same binary backdated three weeks is
+  still refused, naming a compiled file (`src/shard/spsc_handler.rs`).
+
+  Missing or unparsable dep-info falls back to the old full-tree walk rather than to an
+  empty set — an empty comparison set would read as "nothing can be stale", which is the
+  failure the guard exists to prevent. A newly added source is still caught: rustc cannot
+  see a file until some existing file declares `mod` for it, and that file is in the
+  dep-info.
+
 - **`scripts/test-commands.sh` runs to completion and prints its summary** (#679). The
   suite CLAUDE.md points at for every new command had never reported totals: it died
   partway through, silently, and the operator saw a truncated log rather than a result.
