@@ -2399,6 +2399,37 @@ fn gated_container(cmd: &[u8]) -> Option<&'static str> {
         .copied()
 }
 
+/// Rebuild an argv frame with `args` in place of everything after the command
+/// name.
+///
+/// moon#702: the MULTI queue stores FRAMES and `EXEC` replays them — it never
+/// sees the workspace-rewritten `cmd_args` the surrounding dispatch shadows in.
+/// A raw frame queued at the gate therefore reached the keyspace with no
+/// `{ws_hex}:` prefix on any key, so a workspace-bound `MULTI` addressed the
+/// GLOBAL keyspace and could name any OTHER tenant's prefixed key verbatim
+/// (measured: tenant B read and overwrote tenant A's private value).
+///
+/// The blocking half of the gate was equally broken and needed no separate fix:
+/// `queued_blocking_frame` already rebuilds its frame from `cmd_args` for an
+/// unrelated reason (moon#524), so hoisting the rewrite above the gate
+/// (moon#668) corrected it automatically. Before that hoist BOTH halves queued
+/// unprefixed keys — measured: a queued `BLPOP` popped from the GLOBAL list.
+pub(crate) fn reframe_argv(frame: &Frame, args: &[Frame]) -> Frame {
+    let Frame::Array(items) = frame else {
+        // `extract_command` rejects anything but an argv array before the gate
+        // is reached, so this is unreachable; returning the original is the
+        // fail-safe answer either way.
+        return frame.clone();
+    };
+    let Some(name) = items.first() else {
+        return frame.clone();
+    };
+    let mut out = Vec::with_capacity(1 + args.len());
+    out.push(name.clone());
+    out.extend_from_slice(args);
+    Frame::Array(out.into())
+}
+
 /// The reply `EXEC` owes a transaction poisoned at queue time.
 pub(crate) fn execabort_frame() -> Frame {
     Frame::Error(Bytes::from_static(

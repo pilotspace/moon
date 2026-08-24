@@ -946,6 +946,55 @@ pub(crate) async fn handle_connection_sharded_inner<
                         }
                     }
 
+                    // === WORKSPACE KEY PREFIX INJECTION — every intercept
+                    // that reads a KEY MUST sit below this ===
+                    //
+                    // Directly below the ACL gate, and directly above the MULTI
+                    // queue gate, on purpose. Above it, ACL keeps matching the
+                    // UNPREFIXED key the user actually typed
+                    // (`test_workspace_acl_grant`). Below it, EVERY path — the
+                    // queue gate, the script intercepts, cluster routing,
+                    // blocking, and ordinary dispatch — sees the prefixed argv,
+                    // and `key_to_shard` sees the `{ws_hex}:` hash tag that
+                    // co-locates a workspace.
+                    //
+                    // It used to sit ~550 lines further down, with a comment
+                    // claiming it was "the ONLY code path where workspace
+                    // prefixing occurs". Three paths reached the keyspace above
+                    // it and prefixed nothing: the MULTI queue gate (moon#702,
+                    // the queue stores frames and EXEC replays them), the
+                    // `EVAL`/`EVALSHA` intercepts (moon#668, a script's whole
+                    // `KEYS[]` vector), and cluster routing (which computed a
+                    // slot from a key name that does not exist).
+                    //
+                    // A no-key command is untouched, so the keyless intercepts
+                    // between here and dispatch are unaffected:
+                    // `workspace_rewrite_args` prefixes only positions the
+                    // shared key walker names.
+                    let rewritten = match conn.workspace_id.as_ref() {
+                        Some(ws_id) => match workspace_rewrite_args(cmd, cmd_args, ws_id) {
+                            Ok(rewritten) => Some(rewritten),
+                            // moon#668: the key positions of this argv could not
+                            // be determined, so there is no way to keep the
+                            // command inside the workspace. Running it
+                            // unrewritten would run it against the GLOBAL
+                            // keyspace — refuse instead.
+                            Err(err) => {
+                                // Inside a transaction this is a queue-time
+                                // rejection (Redis CLIENT_DIRTY_EXEC): poison it
+                                // so EXEC refuses everything rather than
+                                // applying the valid half.
+                                if conn.in_multi {
+                                    conn.multi_dirty = true;
+                                }
+                                responses.push(err);
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
+                    let cmd_args: &[Frame] = rewritten.as_deref().unwrap_or(cmd_args);
+
                     // === MULTI QUEUE GATE — every non-transactional intercept
                     // MUST sit below this ===
                     //
@@ -994,6 +1043,17 @@ pub(crate) async fn handle_connection_sharded_inner<
                         if crate::server::conn::blocking::is_blocking_command(cmd) {
                             conn.command_queue
                                 .push(queued_blocking_frame(cmd, cmd_args));
+                        } else if conn.workspace_id.is_some() {
+                            // moon#702: the queue stores FRAMES and `EXEC`
+                            // replays them, so the workspace-rewritten
+                            // `cmd_args` — not the raw `frame` the client sent —
+                            // is what has to be queued. The blocking arm above
+                            // needs no equivalent: it already rebuilds from
+                            // `cmd_args` (moon#524), so hoisting the rewrite
+                            // above this gate fixed it too.
+                            conn.command_queue.push(
+                                crate::server::conn::shared::reframe_argv(&frame, cmd_args),
+                            );
                         } else {
                             conn.command_queue.push(frame);
                         }
@@ -1487,16 +1547,6 @@ pub(crate) async fn handle_connection_sharded_inner<
                         }
                         continue;
                     }
-
-                    // --- Workspace key prefix injection ---
-                    // MUST happen before key_to_shard() so the {ws_id} hash tag determines
-                    // shard routing. This is the ONLY code path where workspace prefixing
-                    // occurs (WS-07, WS-12). All subsequent dispatch uses cmd_args (shadowed).
-                    let rewritten = conn
-                        .workspace_id
-                        .as_ref()
-                        .map(|ws_id| workspace_rewrite_args(cmd, cmd_args, ws_id));
-                    let cmd_args: &[Frame] = rewritten.as_deref().unwrap_or(cmd_args);
 
                     // --- BLOCKING COMMANDS ---
                     if crate::server::conn::blocking::is_blocking_command_args(cmd, cmd_args) {
