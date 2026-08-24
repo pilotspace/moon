@@ -30,7 +30,10 @@ SKIP_BENCH=false
 BENCH_ONLY=false
 MOON_ONLY=false
 CATEGORY_FILTER=""
-RUST_BINARY="./target/release/moon"
+# Overridable so the suite can be pointed at a specific build -- and so the
+# startup guard can be exercised (`MOON_BIN=/usr/bin/false` makes moon never
+# listen, which must abort the run, not produce vacuous passes).
+RUST_BINARY="${MOON_BIN:-./target/release/moon}"
 
 PASS=0
 FAIL=0
@@ -133,6 +136,29 @@ spans() {
 rcli() {
     # Run redis-cli against Redis
     redis-cli -p "$PORT_REDIS" "$@" 2>/dev/null || true
+}
+
+# Liveness probes that CAN fail.
+#
+# `rcli`/`mcli` end in `|| true` so an assertion row can compare output without
+# aborting the whole suite. That also makes them useless as health checks --
+# `mcli PING || exit 1` is a branch execution can never reach. These two do not
+# swallow the status, and they match the reply rather than just its exit code,
+# so a foreign process holding the port cannot fake liveness either.
+redis_is_up() { redis-cli -p "$PORT_REDIS" PING 2>/dev/null | grep -qx PONG; }
+moon_is_up()  { redis-cli -p "$PORT_RUST"  PING 2>/dev/null | grep -qx PONG; }
+
+# Poll rather than sleep a fixed amount: a cold first exec of a freshly built
+# binary can take well over a second, and the old `sleep 1` was the other half
+# of the same bug.
+await_up() {  # await_up <name> <probe-fn>
+    local name="$1" probe="$2" i
+    for i in $(seq 1 100); do
+        "$probe" && return 0
+        sleep 0.1
+    done
+    echo "$name failed to start (no PONG on its port after 10s)" >&2
+    return 1
 }
 
 mcli() {
@@ -573,13 +599,13 @@ RUST_LOG=warn "$RUST_BINARY" --port "$PORT_RUST" --shards "$SHARDS" --protected-
     --dir "$MOON_DATA_DIR" --disk-free-min-pct 0 &
 RUST_PID=$!
 
-sleep 1
-
-# Verify servers are up
+# Verify servers are up. These guards used to be `rcli PING || exit 1`, which
+# could never fire (see `moon_is_up`) -- a suite that ran to completion against
+# a server that was not listening reported 41 failures with every reply empty.
 if [[ "$MOON_ONLY" == "false" ]]; then
-    rcli PING >/dev/null 2>&1 || { echo "Redis failed to start"; exit 1; }
+    await_up "Redis" redis_is_up || exit 1
 fi
-mcli PING >/dev/null 2>&1 || { echo "moon failed to start"; exit 1; }
+await_up "moon" moon_is_up || exit 1
 
 log "Servers ready."
 
@@ -1479,13 +1505,20 @@ if should_run "vector"; then
     python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<4f',0.0,1.0,0.0,0.0))" | redis-cli -x -p "$PORT_RUST" HSET doc:2 embedding >/dev/null 2>&1 || true
 
     # FT.SEARCH — verify command doesn't error (redis-cli can't pass binary args directly)
-    # Known red, tracked as moon#693: moon has no match-all query -- `*` is
-    # refused on every index type with "ERR invalid KNN query syntax", even on
-    # a TEXT-only index that has no KNN anything. Kept asserting the RediSearch
-    # behaviour rather than pinned to moon's error, so the row goes green on
-    # its own the day match-all lands.
+    # moon#693 (PART DONE): `*` is the match-all query. It used to be refused on
+    # every index type with "ERR invalid KNN query syntax" -- even on a
+    # TEXT-only index with no KNN anything. It now works on every index with an
+    # inverted schema (TEXT / TAG / NUMERIC), which is where the document
+    # registry lives -- see the `FT.SEARCH "*" enumerates a TEXT index` row in
+    # the BM25 section, which passes.
+    #
+    # `myidx` here is VECTOR-ONLY, and that case is still open: the vector
+    # engine's live key map would have to be enumerable through BOTH the local
+    # handler path and `scatter_text_search`, which is its own change with its
+    # own multi-shard verification. Tracked as moon#695. Left asserting the
+    # RediSearch behaviour so it goes green on its own the day that lands.
     TOTAL=$((TOTAL + 1)); FT_SEARCH=$(mcli FT.SEARCH myidx "*" 2>&1)
-    if ! echo "$FT_SEARCH" | grep -qi "err"; then PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH does not error"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH \"*\" returned error (moon#693: no match-all query): $FT_SEARCH"; fi
+    if ! echo "$FT_SEARCH" | grep -qi "err"; then PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH does not error"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH \"*\" on a VECTOR-only index returned error (moon#695, the open half of moon#693): $FT_SEARCH"; fi
 
     # FT.DROPINDEX — remove index
     assert_moon "FT.DROPINDEX"             "OK"    FT.DROPINDEX myidx
@@ -1868,7 +1901,7 @@ if should_run "vector"; then
     elif echo "$FT_MULTI" | grep -q "doc:"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH multi-term AND returns results"
     else
-        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH multi-term AND returned no results (moon#690: 'test' is on the 1298-word stoplist, and the query keeps it as a required conjunct the index dropped)"
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH multi-term AND returned no results (regression of moon#690: 'test' back on the stoplist, or a stop word zeroing its conjunction again)"
     fi
 
     # 4. Field-targeted search: @title:(document) — only doc:t2 has 'document' in title
@@ -1927,6 +1960,38 @@ if should_run "vector"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH stop-words-only returns no documents"
     fi
 
+    # 7b. Match-all (moon#693): `*` enumerates every document in an inverted
+    # index -- INCLUDING documents no term query can reach. doc:t3's body is
+    # "Final body text here"; the row asserts the count, not a term, so it
+    # cannot pass by accident on a stray substring match.
+    TOTAL=$((TOTAL + 1))
+    FT_STAR=$(mcli FT.SEARCH textidx "*" LIMIT 0 0 2>&1)
+    if [[ "$FT_STAR" == "3" ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH \"*\" enumerates a TEXT index (3 docs)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH \"*\" on a TEXT index expected 3, got: $FT_STAR"
+    fi
+
+    # 7c. Ordinary English words are indexable (moon#690). Under the old
+    # 1298-word stopword list every one of these was discarded at index time.
+    TOTAL=$((TOTAL + 1))
+    FT_ORD=$(mcli FT.SEARCH textidx "hello" LIMIT 0 0 2>&1)
+    if [[ "$FT_ORD" == "1" ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH finds an ordinary word ('hello')"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH 'hello' expected 1 doc, got: $FT_ORD (moon#690 stoplist regression?)"
+    fi
+
+    # 7d. A stop word in a conjunction is REMOVED from the query, not
+    # intersected as the empty set (moon#690). `hello the` must equal `hello`.
+    TOTAL=$((TOTAL + 1))
+    FT_STOP=$(mcli FT.SEARCH textidx "hello the" LIMIT 0 0 2>&1)
+    if [[ "$FT_STOP" == "1" && "$FT_STOP" == "$FT_ORD" ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: a stop word drops out of the conjunction ('hello the' == 'hello')"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: 'hello the' returned $FT_STOP but 'hello' returned $FT_ORD (moon#690 asymmetry regression)"
+    fi
+
     # 8. Cross-field search: "world" appears in doc:t1 title — searches all TEXT fields
     TOTAL=$((TOTAL + 1))
     FT_CROSS=$(mcli FT.SEARCH textidx "world" 2>&1)
@@ -1935,7 +2000,7 @@ if should_run "vector"; then
     elif echo "$FT_CROSS" | grep -q "doc:t1"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH cross-field finds 'world' in doc:t1"
     else
-        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH cross-field should find 'world' in doc:t1 (moon#690: 'world' is on the 1298-word stoplist and never reaches the index)"
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH cross-field should find 'world' in doc:t1 (regression of moon#690: 'world' back on the stoplist)"
     fi
     # ── End FT.SEARCH BM25 text search tests ─────────────────────────────────────
 
@@ -2399,17 +2464,22 @@ if should_run "vector"; then
         fi
 
         # NUMERIC-05: inverted range REJECTED (T-152-07-05)
-        # moon#683: the row grepped for the phrase "min > max". Verified on the
-        # wire that moon does reject the inverted range -- but as
-        # `-numeric_filter_invalid`, a bare token with no ERR prefix, which is
-        # its own compatibility problem (moon#691). What this row is for is
-        # T-152-07-05, "an inverted range is refused rather than executed", so
-        # it asserts exactly that: an error, and no documents.
+        # moon#683: the row grepped for the phrase "min > max", which moon has
+        # never emitted. What it is FOR is T-152-07-05, "an inverted range is
+        # refused rather than executed", so it asserts exactly that: no
+        # documents, and the specific refusal.
+        #
+        # The refusal used to be the bare token `-numeric_filter_invalid`
+        # (moon#691), so this row had to accept a plain "err" to stay green --
+        # which made it match ANY error, including "no such index", and stop
+        # discriminating. Now that the reply is a real RESP error the row names
+        # the token AND requires the ERR prefix, so a regression in either the
+        # refusal or its wire form fails here.
         TOTAL=$((TOTAL + 1))
         NUM_INV=$(mcli FT.SEARCH aggidx '@score:[100 10]' LIMIT 0 10 2>&1)
         if echo "$NUM_INV" | grep -q "^agg:"; then
             FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-05 inverted range was EXECUTED, not refused: $NUM_INV"
-        elif echo "$NUM_INV" | grep -qi "numeric_filter_invalid\|min > max\|err"; then
+        elif echo "$NUM_INV" | grep -q "^ERR " && echo "$NUM_INV" | grep -q "numeric_filter_invalid"; then
             PASS=$((PASS + 1)); echo "  PASS: NUMERIC-05 inverted range refused ($NUM_INV)"
         else
             FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-05 expected a refusal, got: $NUM_INV"

@@ -11,6 +11,23 @@
 /// is disabled, a simple whitespace-based fallback is provided.
 use std::collections::HashSet;
 
+/// RediSearch's default English stop-word list — the 33 words a RediSearch index drops
+/// unless `FT.CREATE ... STOPWORDS` overrides it.
+///
+/// moon#690: this replaced `stop_words::get(stop_words::LANGUAGE::English)`, which resolves
+/// to the **stopwords-iso** list — 1,298 entries including `hello`, `world`, `test`, `name`,
+/// `order`, `open` and `index`. Those never reached the index, so a document whose only word
+/// was `hello` indexed zero terms and was unreachable by its own content, with no error and
+/// no warning to go on.
+///
+/// The list is spelled out here rather than pulled from a crate so that what moon silently
+/// discards is greppable, reviewable, and cannot change under a dependency bump.
+pub const DEFAULT_STOP_WORDS: [&str; 33] = [
+    "a", "is", "the", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into",
+    "it", "no", "not", "of", "on", "or", "such", "that", "their", "then", "there", "these", "they",
+    "this", "to", "was", "will", "with",
+];
+
 /// Configurable text analysis pipeline.
 ///
 /// Created once per TEXT field (not per document) to amortize stemmer
@@ -50,9 +67,8 @@ impl AnalyzerPipeline {
             Some(rust_stemmers::Stemmer::create(language))
         };
 
-        let stop_words_slice = stop_words::get(stop_words::LANGUAGE::English);
         let stop_words: HashSet<String> =
-            stop_words_slice.iter().map(|s| (*s).to_owned()).collect();
+            DEFAULT_STOP_WORDS.iter().map(|s| (*s).to_owned()).collect();
 
         Self {
             stemmer,

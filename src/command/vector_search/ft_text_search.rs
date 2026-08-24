@@ -1018,9 +1018,10 @@ pub struct TextQueryClause {
 /// string, so they are NOT visible here — routing defers them to `ft_search` via
 /// [`has_sparse_clause`] / `parse_hybrid_modifier` at the handler layer.
 pub fn is_text_query(query: &[u8]) -> bool {
-    if query == b"*" {
-        return false;
-    }
+    // moon#693: a bare `*` is RediSearch's match-all — a query the INVERTED index answers
+    // (the document registry lives there), not a malformed KNN query. It used to route to
+    // `ft_search`, which replied `ERR invalid KNN query syntax` even for an index with no
+    // vector field at all. `*=>[KNN …]` is unaffected: it is caught by the `[KNN` scan below.
     // The canonical dense-KNN form is `*=>[KNN k @vec $q]`; the `[KNN` bracket is the unambiguous
     // marker (a bare word "knn" in prose has no bracket). Case-insensitive byte scan, no allocation
     // beyond the uppercase copy.
@@ -1596,7 +1597,7 @@ pub fn run_text_query_on_index(
             build_text_response_with_total(&results, total, offset, count)
         }
         // The five frozen wire codes (fts-query-combinators §3); never panics on malformed input.
-        Err(e) => Frame::Error(Bytes::copy_from_slice(e.code().as_bytes())),
+        Err(e) => Frame::Error(e.wire_error()),
     }
 }
 
@@ -2054,7 +2055,8 @@ mod tests {
 
     #[test]
     fn is_text_query_match_all_is_not_text() {
-        assert!(!is_text_query(b"*"));
+        // moon#693: `*` is match-all and belongs to the text engine.
+        assert!(is_text_query(b"*"));
     }
 
     #[test]

@@ -6,6 +6,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`scripts/test-commands.sh` can no longer run a whole suite against a server that never
+  started.** Both startup guards were structurally unreachable: `rcli`/`mcli` end in
+  `|| true` — right for the ~500 assertion rows, fatal for the health checks built on them,
+  since `mcli PING >/dev/null 2>&1 || exit 1` can never take its failure branch.
+
+  Measured against the pre-fix script with a binary that never listens: **86 rows ran and
+  10 of them PASSED**, including `FT.SEARCH does not error` and `FT.SEARCH stop-words-only
+  returns no documents` — an empty reply contains neither "err" nor "doc:", so those rows
+  are satisfied by nothing at all. The same condition now aborts with 0 rows attempted and
+  `moon failed to start (no PONG on its port after 10s)`.
+
+  The probes match the actual `PONG` rather than an exit code, so a foreign process holding
+  the port cannot fake liveness either, and they poll instead of a fixed `sleep 1` — a cold
+  first exec of a freshly built binary can take longer than that, which was the other half
+  of the same bug. `RUST_BINARY` is now `${MOON_BIN:-./target/release/moon}`, which makes
+  the guard reproducibly testable (`MOON_BIN=/usr/bin/false`) and lets the suite be pointed
+  at a known build instead of whatever happens to sit in `target/release`.
+- **FT query errors are classifiable by a client** (#691). `FT.SEARCH` / `FT.AGGREGATE`
+  query errors reached the wire as bare snake_case tokens with no prefix —
+  `-numeric_filter_invalid`, `-syntax_error`, `-unknown_field`.
+
+  A RESP error's first word is its *code*, and every client branches on it: redis-py
+  surfaces it through `ResponseError`, redis-rs matches `ErrorKind` off the leading token,
+  and all of them have rules for `ERR`, `WRONGTYPE`, `NOSCRIPT`, `MOVED`, `LOADING`. None
+  has a rule for `numeric_filter_invalid`, so the entire message was swallowed as the code
+  and nothing downstream could tell a client-side query mistake from a server fault.
+
+  They now read `ERR <token>: <what went wrong>` — e.g.
+  `ERR numeric_filter_invalid: numeric filter bounds must be numbers with min <= max`, and
+  the unknown-field error names the field the user actually typed, which matters in a query
+  with several `@field:` clauses. The five tokens are a frozen contract, so they are kept
+  verbatim inside the message rather than renamed out from under whatever still greps for
+  them; only the prefix and the detail are new.
+
+  The echoed field name is user input going into a frame that is written to the wire raw,
+  so every control byte in it is substituted. `is_term_byte` already excludes ASCII
+  whitespace, so a CR/LF could not reach it today — but a reply that can desync a
+  connection is not an edge worth resting on a rule enforced somewhere else.
+- **`FT.SEARCH <index> "*"` — the match-all query** (#693). `*` is how RediSearch says
+  "every document in this index", and it is what every "show me what is in here" example
+  uses. moon refused it on every index, and the refusal named KNN
+  (`ERR invalid KNN query syntax`) even for an index with no vector field — so a user
+  trying to enumerate a TEXT index was told the vector syntax was wrong.
+
+  `*` now routes to the inverted index, which is where the document registry lives, and
+  answers from that registry rather than from a posting list. That matters for
+  enumeration: a document whose text analyzes to nothing is still *in* the index, and `*`
+  lists it where no term query can reach it.
+
+  Deliberately narrow. `alp*` is still a prefix query — only the token that is exactly `*`
+  is match-all — and `@field:*` keeps its existing syntax error rather than silently
+  widening to every document, since RediSearch has no field-scoped match-all either.
+  `*=>[KNN 10 @vec $q]` is untouched; it is still routed by the `[KNN` marker.
+
+  Verified end-to-end at `--shards 4` as well as `--shards 1`, so the scatter path is
+  covered and not just the local one.
+
+  Still open, tracked as #695: an index built from VECTOR fields alone has no inverted
+  index, so `*` there answers `ERR no such index`. Enumerating it means routing the vector
+  engine's live key map through both the local handler path and `scatter_text_search` —
+  and a fix that covered only the local path would pass at `--shards 1` and silently
+  return nothing at `--shards 4`. `FT.AGGREGATE idx "*"` was already correct (it
+  short-circuits to the registry before the parser) and is not touched.
+- **`FT.SEARCH` can find ordinary English words again** (#690). Two independent defects
+  produced one symptom — an empty result set, with no error and nothing for the user to
+  act on.
+
+  The analyzer filtered against `stop_words::get(LANGUAGE::English)`, which resolves to the
+  **stopwords-iso** list: 1,298 entries, against RediSearch's 33. `hello`, `world`, `test`,
+  `name`, `order`, `open` and `index` were among the ~1,265 extra words discarded at index
+  time, so a document whose only word was `hello` indexed **zero terms** and was unreachable
+  by its own content. moon now ships RediSearch's 33-word list, spelled out in
+  `text::analyzer::DEFAULT_STOP_WORDS` rather than pulled from a crate, so what moon
+  discards is greppable and cannot change under a dependency bump. The `stop-words`
+  dependency is dropped.
+
+  Separately, a query token that analyzed to nothing evaluated to ∅ and was then
+  *intersected* into its conjunction, so a stop word anywhere in a query zeroed the entire
+  result set: on a corpus containing no stop words at all, `alpha` matched 2 documents and
+  `alpha the` matched 0. RediSearch removes stop words from the query; moon now does too.
+  The discriminator is "analyzed to nothing", not "matched nothing" — `alpha zzz` still
+  correctly matches nothing, and TAG/NUMERIC/fuzzy/prefix leaves are never dropped.
+
+  Each half is load-bearing and was proven so: with the list swapped but the query path
+  untouched, `alpha the` still returned 0; with the query path fixed but the list untouched,
+  `hello` was still unindexable.
+
+  **Existing indexes are not rewritten.** An index built before this change is missing the
+  ~1,265 terms the old list dropped; queries for them return 0 until the index is rebuilt
+  (`FT.DROPINDEX` + `FT.CREATE`, or a restart that re-indexes).
+
+  Not addressed here: `FT.CREATE ... STOPWORDS <count> <word>...` is still unimplemented,
+  so the list is not yet per-index configurable.
+
 ### Added
 - **`DEBUG DIGEST`** (#636). A SHA1 fingerprint of the whole dataset, so two servers can
   be compared in one round trip instead of key by key. The crash-matrix and replication

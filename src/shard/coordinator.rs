@@ -2808,7 +2808,7 @@ pub async fn scatter_text_search(
                 Some(text_index) => {
                     let schema = QuerySchema::from_index(text_index);
                     match crate::text::query::parse_query(&query, &schema) {
-                        Err(e) => Err(Frame::Error(Bytes::copy_from_slice(e.code().as_bytes()))),
+                        Err(e) => Err(Frame::Error(e.wire_error())),
                         Ok(node) => {
                             let fq = collect_df_field_terms(&node, text_index);
                             let ts = collect_highlight_terms(&node, text_index);

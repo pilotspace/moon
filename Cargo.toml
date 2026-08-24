@@ -92,7 +92,6 @@ subtle = { version = "2.5", optional = true }
 unicode-segmentation = { version = "1.12", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
 rust-stemmers = { version = "1.2", optional = true }
-stop-words = { version = "0.10", optional = true }
 fst = { version = "0.4", features = ["levenshtein"], optional = true }
 levenshtein_automata = { version = "0.2", features = ["fst_automaton"], optional = true }
 
@@ -136,7 +135,6 @@ text-index = [
     "dep:unicode-segmentation",
     "dep:unicode-normalization",
     "dep:rust-stemmers",
-    "dep:stop-words",
     "dep:fst",
     "dep:levenshtein_automata",
 ]
