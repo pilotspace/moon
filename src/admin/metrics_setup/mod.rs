@@ -318,6 +318,12 @@ static WAL_AGGRESSIVE_RECYCLE_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 // SPSC (when fast-path is off) and writes. INFO exposes the unified total
 // as `total_dispatch_cross_spsc`.
 static DISPATCH_CROSS_READ_SPSC_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// moon#513: pipeline batches cut short because a command could not execute
+/// against shards whose earlier writes in the same batch were still pending.
+/// Each increment is one extra dispatch/await boundary — measured at ~57us on
+/// moon-dev — so this is the counter that says whether a slow pipeline is
+/// paying the moon#512 ordering guarantee or something else entirely.
+static PIPELINE_REMOTE_DEFER_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 // ── INFO-readable counter accessors ─────────────────────────────────────
 

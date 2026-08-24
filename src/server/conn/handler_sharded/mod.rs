@@ -818,6 +818,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         && crate::server::conn::shared::must_wait_for_pending_remote(cmd, cmd_args)
                     {
                         batch[frame_idx - 1] = frame;
+                        crate::admin::metrics_setup::record_pipeline_remote_defer();
                         deferred_tail_from = Some(frame_idx - 1);
                         break;
                     }
