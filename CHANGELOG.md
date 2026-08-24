@@ -190,6 +190,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as an answer. That shard also logs a warning, because cold keys with no manifest will not
   survive a restart — `rebuild_from_manifest` is the only thing that re-indexes them.
 ### Fixed
+- **`scripts/test-commands.sh`: 26 failures down to 4, and the 4 name their issue** (#683).
+  The suite's failures were mostly the suite. Eight distinct defects, each verified against a
+  live server before touching the row:
+
+  - **9 TXN rows probed a transaction across separate connections.** `mcli` spawns a fresh
+    `redis-cli` per command, so `MULTI`, the queued commands and `EXEC` each landed on a
+    different one; MULTI state is connection-scoped, so every row asserted against a
+    transaction the server had already discarded. Added `msession` (one connection, one
+    reply per line) and `mreply N`.
+  - **10 vector rows queried with truncated blobs.** The float32 vectors were built as
+    `"$(printf '\x00\x00\x80\x3f...')"` and command substitution drops NUL bytes — a
+    16-byte vector arrived as 2. Replaced with NUL-free patterns at file scope behind a
+    length guard that aborts the run if the shell ever eats one again.
+  - **`MIXED %%machne%% deep`** asserted that AND behaves like OR. Measured against its own
+    corpus: `machine`→fz:1, `deep`→fz:2, so the conjunction is empty by construction. Now
+    uses a satisfiable one (`%%machne%% learning`→fz:1) and keeps the impossible one as the
+    counter-assertion that proves AND is really AND.
+  - **`TTL after EXPIREAT`** compared a live countdown across two `redis-cli` invocations
+    ~100ms apart and failed whenever a second ticked over between them. Sampling both
+    servers back-to-back 16 times (8 in each order) gave diff=0 every time, so there is no
+    rounding difference to catch; new `assert_match_countdown` allows ±1.
+  - **`FT.INFO` after `FT.DROPINDEX`** grepped for "err" or "not found". moon answers
+    `-Unknown Index name` — a real error frame carrying RediSearch's exact text.
+  - **`TAG-05`** demanded the rejection moon used to emit for multi-tag OR; the feature
+    landed and the row went stale. Now asserts the union equals the sum of the two
+    single-tag queries.
+  - **`NUMERIC-05`** grepped for "min > max"; moon refuses the inverted range as
+    `-numeric_filter_invalid` (#691). Now asserts what the row is for: refused, not executed.
+  - **The stop-words row** unconditionally failed the `0` its own comment called acceptable.
+
+  What is left is 4 rows against real defects, each printing its issue number in the failure
+  line: #536 (ROLE offset), #693 (no match-all query), and two on #690 (the 1,298-word
+  stoplist). Triaging them is what surfaced #690, #691 and #693.
+
 - **Client-compat freshness guard blamed files the binary never compiled** (#687). The
   guard walks `src/` and refuses under `--strict` when any `.rs` is newer than the
   binary — the right instinct (moon#461: a harness that tests the wrong binary reports a
