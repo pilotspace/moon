@@ -69,6 +69,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (index and key counts read back after each restart, and the stripped leg asserted to actually
   log one `leaving unregistered` per stripped segment) so a run that silently indexed nothing
   cannot report a fast restart as a win.
+- **A warm segment directory whose `mvcc.mpf` is gone is now retired instead of re-warned about forever** (#546).
+
+  `register_warm_segments` decides which index owns a recovered warm segment by reading exactly
+  one file — `mvcc.mpf`, via `peek_key_hashes`. When that file is missing, no evidence exists,
+  no owner can be chosen, and the directory was left on disk with a warning. Nothing ever
+  removed it, so every subsequent restart re-read it and re-warned. Reproduced by stripping
+  `mvcc.mpf` from 6 of 12 warm segments and restarting three times: 6 warnings each time,
+  6/6 directories still present, `DBSIZE` unchanged at 2400 — the warning was permanent and the
+  disk cost was permanent with it. On the store that prompted the report this was 897 directories.
+
+  Such a directory is what a crash mid-creation, or a GC pass that emptied a directory without
+  removing it, leaves behind. It can never be attached to an index; the keys it might hold are
+  recovered by the keyspace rescan regardless. It is now removed, counted, and reported as
+  `retired as orphans with no mvcc.mpf` in the startup summary.
+
+  Retirement is gated strictly on `ErrorKind::NotFound`. Every other IO error keeps the old
+  warn-and-leave behavior: a transient EIO or a permissions problem can sit over perfectly good
+  vectors, and deleting on those would turn a recoverable blip into data loss. A present-but-
+  unparseable `mvcc.mpf` — truncated or corrupt — does not error at all; it reads as zero ids
+  and is likewise kept, because an unreadable id sidecar is not evidence that the codes beside
+  it are worthless. Both of those cases are pinned by tests that fail if the rule is widened.
+
 - **A pipelined multi-key command no longer cuts the batch over shards it never touches** (#513).
 
   `must_wait_for_pending_remote`'s multi-key arm answered "wait" on the command NAME, without

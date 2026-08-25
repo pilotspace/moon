@@ -1018,3 +1018,110 @@ fn warm_recovery_full_production_sequence_matches_real_boot_order() {
         );
     }
 }
+
+/// moon#546: a warm segment directory whose `mvcc.mpf` is GONE is dead weight.
+///
+/// The reported production restart logged 897 of these — segments left behind
+/// when GC removed a directory's contents but not the directory itself, or when
+/// a crash tore a segment mid-creation. They can never be attributed to an
+/// index (attribution reads exactly that file), so nothing ever uses them; the
+/// keys they held are re-indexed by the keyspace rescan instead. But nothing
+/// removed them either, so every subsequent restart re-read them, re-warned,
+/// and left them in place.
+///
+/// Measured before this fix, stripping `mvcc.mpf` from 6 of 12 warm segments
+/// and restarting three times:
+///
+/// ```text
+/// restart 1: warns=6  stripped dirs still present=6/6
+/// restart 2: warns=6  stripped dirs still present=6/6
+/// restart 3: warns=6  stripped dirs still present=6/6
+/// ```
+///
+/// Flat and forever — the same shape as every other tolerated inconsistency
+/// that turns into unbounded growth.
+#[test]
+fn warm_segment_missing_its_mvcc_is_retired_not_left_forever() {
+    let tmp = tempfile::tempdir().unwrap();
+    let seg = tmp.path().join("segment-42");
+    std::fs::create_dir_all(&seg).unwrap();
+    // Everything EXCEPT mvcc.mpf: this is what a half-swept directory looks like.
+    std::fs::write(seg.join("codes.bin"), b"leftover").unwrap();
+
+    let mut store = VectorStore::new();
+    store.set_persist_dir(tmp.path().to_path_buf());
+    store.register_warm_segments(vec![(42, seg.clone())]);
+
+    assert!(
+        !seg.exists(),
+        "a warm segment directory with no mvcc.mpf can never be attributed to an \
+         index, so leaving it on disk only guarantees the same warning on every \
+         future restart"
+    );
+}
+
+/// The other half of the contract: an mvcc.mpf that exists but cannot be READ
+/// must NOT be deleted.
+///
+/// A missing file is unambiguous. Any other error is not: a transient EIO or a
+/// permissions problem can sit over perfectly good data, and deleting a real
+/// segment because one read failed turns a recoverable blip into permanent
+/// loss — strictly worse than the disk leak the NotFound arm fixes.
+///
+/// The fixture is a *directory* named `mvcc.mpf`: `File::open` succeeds, the
+/// mmap then fails with `InvalidInput`, so this exercises the real non-NotFound
+/// error arm. (An empty or garbage file does NOT — both mmap fine and parse to
+/// zero ids; that case is pinned separately below.)
+#[test]
+fn an_unreadable_mvcc_is_left_alone_because_the_error_may_be_transient() {
+    let tmp = tempfile::tempdir().unwrap();
+    let seg = tmp.path().join("segment-43");
+    std::fs::create_dir_all(&seg).unwrap();
+    std::fs::create_dir_all(seg.join("mvcc.mpf")).unwrap();
+    std::fs::write(seg.join("codes.bin"), b"real data").unwrap();
+
+    let mut store = VectorStore::new();
+    store.set_persist_dir(tmp.path().to_path_buf());
+    store.register_warm_segments(vec![(43, seg.clone())]);
+
+    assert!(
+        seg.exists(),
+        "an mvcc.mpf that exists but failed to read may be a transient IO error \
+         over good data — deleting on anything but NotFound risks turning a blip \
+         into data loss"
+    );
+    assert!(
+        seg.join("codes.bin").exists(),
+        "the segment's data must be untouched"
+    );
+}
+
+/// A present-but-unparseable mvcc.mpf reads as *zero ids*, not as an error.
+///
+/// Truncation and corruption both land here (measured: a zero-length file and a
+/// garbage file each mmap successfully and parse to an empty id list), so this
+/// segment can never be attributed to an owner either — it looks exactly like
+/// the orphan above from the outside. It is still NOT retired, and that is
+/// deliberate: `codes.bin` may hold real vectors whose id sidecar was the only
+/// casualty of the crash. Anyone extending the retirement rule to cover it has
+/// to break this test first, and answer for that data.
+#[test]
+fn a_present_but_unparseable_mvcc_keeps_its_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (id, body) in [(44u64, &b""[..]), (45u64, &b"not a real mpf"[..])] {
+        let seg = tmp.path().join(format!("segment-{id}"));
+        std::fs::create_dir_all(&seg).unwrap();
+        std::fs::write(seg.join("mvcc.mpf"), body).unwrap();
+        std::fs::write(seg.join("codes.bin"), b"real data").unwrap();
+
+        let mut store = VectorStore::new();
+        store.set_persist_dir(tmp.path().to_path_buf());
+        store.register_warm_segments(vec![(id, seg.clone())]);
+
+        assert!(
+            seg.join("codes.bin").exists(),
+            "segment-{id}: an unparseable id sidecar is not evidence that the \
+             vectors beside it are worthless — retiring here would be data loss"
+        );
+    }
+}

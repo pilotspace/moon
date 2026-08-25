@@ -2653,15 +2653,48 @@ impl VectorStore {
 
         let mut loaded = 0usize;
         let mut retired_duplicates = 0usize;
+        let mut retired_orphans = 0usize;
         let mut unregistered = 0usize;
 
         for (segment_id, segment_dir) in &warm_segments {
             let seg_key_hashes = match peek_key_hashes(segment_dir) {
                 Ok(hs) => hs,
+                // moon#546: the file is GONE. Attribution reads exactly this
+                // file, so such a directory can never be attached to an index —
+                // its keys are re-indexed by the keyspace rescan instead. It is
+                // what GC leaves behind when it removes a directory's contents
+                // but not the directory, or what a crash leaves mid-creation.
+                // Left in place it is not just dead weight: every future restart
+                // re-reads it and re-warns, forever (measured on the reported
+                // store: 897 of them, and stable across repeated restarts).
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::info!(
+                        "warm segment {segment_id} at {segment_dir:?}: no mvcc.mpf — \
+                         retiring a partially-swept segment directory (its keys, if \
+                         any, are recovered by the keyspace rescan)"
+                    );
+                    if let Err(e) = std::fs::remove_dir_all(segment_dir) {
+                        tracing::warn!(
+                            "failed to retire orphaned warm segment directory \
+                             {segment_dir:?}: {e} (harmless: the next restart retries, \
+                             and once the directory is gone the #546a pass retires its \
+                             manifest entry too)"
+                        );
+                    }
+                    retired_orphans += 1;
+                    continue;
+                }
+                // Any OTHER error is ambiguous. A transient EIO or a permissions
+                // problem may sit over perfectly good data, and deleting a real
+                // segment because one read failed would turn a recoverable blip
+                // into permanent loss — strictly worse than the disk leak above.
+                // So only `NotFound` retires; everything else is left untouched.
                 Err(e) => {
                     tracing::warn!(
                         "warm segment {segment_id} at {segment_dir:?}: failed to read \
-                         mvcc.mpf for ownership attribution: {e} — leaving unregistered"
+                         mvcc.mpf for ownership attribution: {e} — leaving unregistered \
+                         (files intact: the error may be transient, so this is not \
+                         treated as an orphan)"
                     );
                     unregistered += 1;
                     continue;
@@ -2838,13 +2871,14 @@ impl VectorStore {
                 }
             }
         }
-        if loaded > 0 || retired_duplicates > 0 || unregistered > 0 {
+        if loaded > 0 || retired_duplicates > 0 || retired_orphans > 0 || unregistered > 0 {
             tracing::info!(
                 "Registered {}/{} warm segments on startup ({} retired as duplicates, \
-                 {} left unregistered)",
+                 {} retired as orphans with no mvcc.mpf, {} left unregistered)",
                 loaded,
                 warm_segments.len(),
                 retired_duplicates,
+                retired_orphans,
                 unregistered
             );
         }
