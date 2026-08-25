@@ -1816,6 +1816,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // (Redis marks both NO_AUTH).
             //
             // If you add a privileged intercept, add it BELOW this line.
+            // moon#476: refuse anything that would read a half-built index
+            // while this shard's recovery task is still running. Placed with the
+            // ACL gate because everything below this line -- intercepts,
+            // workspace rewrite, and all three dispatch paths -- flows through
+            // here, while AUTH/HELLO are handled above and must keep working so
+            // a client can authenticate during a restart.
+            if crate::shard::loading::is_loading()
+                && !crate::shard::loading::allowed_while_loading(cmd)
+            {
+                shaped!().push(crate::shard::loading::loading_error());
+                continue;
+            }
+
             if dispatch::try_enforce_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, shaped!()) {
                 continue;
             }

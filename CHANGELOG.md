@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A restarting server tells clients it is loading instead of hanging on them** (#476).
+
+  The per-shard listener was bound and its accept task spawned *before* index recovery, but
+  recovery was fully synchronous — no `.await` — so on a single-threaded shard runtime neither
+  the accept task nor the event loop was ever scheduled until it returned. The kernel completed
+  handshakes from the backlog by itself, so a client connected successfully and then waited out
+  the whole recovery in silence. Measured on moon-dev over 83,828 keys:
+
+  ```
+  connect() succeeded at     148.2 ms
+  PING sent at               148.3 ms
+  first byte back at        1376.6 ms   -> 1228 ms on an ACCEPTED socket
+  ```
+
+  Not refused, no error — the client holds what looks like a healthy connection and cannot tell
+  loading from wedged, so a health check hangs for as long as the store takes. The reported
+  production case was ~94 minutes.
+
+  Recovery now runs as a task on the shard's local executor while the event loop serves
+  normally. During it, commands that would read a half-built index get Redis's
+  `-LOADING moon is loading the dataset in memory`; `PING`/`INFO`/`CLIENT`/`CONFIG`/`AUTH`/`HELLO`
+  and the pub-sub family still answer, so clients can authenticate, diagnose, and fail over at
+  once. The reconcile loop yields between 1024-key chunks — `with_shard` takes a synchronous
+  closure, so chunking is what makes an `.await` possible at all — and the loading state is held
+  by a guard whose `Drop` clears it, so a panicking recovery task cannot leave a shard refusing
+  every command for the life of the process.
+
+  Both halves are proven necessary by mutation: disabling the gate fails the acceptance test
+  (and the command is then served off a half-built index at 166 ms), and running recovery inline
+  instead of spawned restores the original 715 ms hang. Green under tokio and under
+  monoio/io_uring, the shipped runtime.
+
 - **Recovery reports its progress instead of going silent for the whole reconcile** (#546).
 
   A production restart spent ~94 minutes inside the keyspace reconcile loop and logged nothing

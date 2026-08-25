@@ -9,6 +9,7 @@ pub mod event_loop;
 #[cfg(feature = "runtime-monoio")]
 pub(crate) mod idle_park;
 /// MA5: maintenance-window scheduler (cron-style budget multipliers).
+pub mod loading;
 pub mod maintenance_schedule;
 /// Wave 3: proactive RSS memory watchdog ("mem-full guard") — analogue of
 /// `disk_monitor` (MA12) for process RSS vs the detected system/cgroup limit.

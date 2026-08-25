@@ -940,6 +940,20 @@ pub(crate) async fn handle_connection_sharded_inner<
                     //
                     // If you add a privileged intercept, add it BELOW this line.
                     //
+                    // moon#476: refuse anything that would read a half-built
+                    // index while this shard's recovery task is still running.
+                    // Placed with the ACL gate because everything below this
+                    // line -- intercepts, workspace rewrite, and all three
+                    // dispatch paths -- flows through here, while AUTH/HELLO
+                    // are handled above and must keep working so a client can
+                    // authenticate during a restart.
+                    if crate::shard::loading::is_loading()
+                        && !crate::shard::loading::allowed_while_loading(cmd)
+                    {
+                        responses.push(crate::shard::loading::loading_error());
+                        continue;
+                    }
+
                     // Fast path: skip RwLock + HashMap for unrestricted users
                     // with a fresh cache.  Stale caches (after ACL SETUSER /
                     // DELUSER / LOAD) fall through to the full check.
