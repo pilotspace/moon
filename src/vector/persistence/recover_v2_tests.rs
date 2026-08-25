@@ -571,3 +571,81 @@ fn recover_finish_tombstones_keys_missing_from_rescan() {
 #[cfg(test)]
 #[path = "recover_v2_warm_tests.rs"]
 mod warm_tests;
+
+/// moon#546 hypothesis 3: a long reconcile must say it is still alive.
+///
+/// The production 94-minute recovery logged the sidecar-restore banner, then
+/// nothing at all until it finished. An operator watching that log cannot tell
+/// a slow repair from a wedged process, which is the difference between waiting
+/// and pulling the plug on a server that would have recovered.
+///
+/// The policy is emitted on a wall-clock interval rather than every N keys
+/// because the question is "is it still moving?" — a key-count trigger is
+/// silent for exactly as long as the keys are slow, which is precisely the
+/// case that needs a line.
+mod recovery_progress {
+    use crate::vector::persistence::recover_v2::RecoveryProgress;
+    use std::time::{Duration, Instant};
+
+    const IVL: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn a_fast_recovery_stays_silent() {
+        let t0 = Instant::now();
+        let mut p = RecoveryProgress::new(IVL, t0);
+        // 50k keys in under a second: the whole point is NOT to spam a log for
+        // a store that recovers before anyone could have looked at it.
+        for done in 1..=50_000u64 {
+            assert!(
+                !p.tick_at(done, t0 + Duration::from_millis(done / 100)),
+                "emitted at key {done} of a sub-second recovery"
+            );
+        }
+    }
+
+    #[test]
+    fn a_slow_recovery_reports_once_per_interval() {
+        let t0 = Instant::now();
+        let mut p = RecoveryProgress::new(IVL, t0);
+        let mut emits = 0;
+        // 60 simulated seconds, sampled every 1024 keys as the caller does.
+        for step in 1..=60_000u64 {
+            if step % 1024 != 0 {
+                continue;
+            }
+            if p.tick_at(step, t0 + Duration::from_millis(step)) {
+                emits += 1;
+            }
+        }
+        assert_eq!(emits, 5, "60s at one line per 10s should speak 5 times");
+    }
+
+    #[test]
+    fn the_interval_restarts_from_the_last_line_not_from_the_start() {
+        let t0 = Instant::now();
+        let mut p = RecoveryProgress::new(IVL, t0);
+        assert!(p.tick_at(1024, t0 + Duration::from_secs(11)));
+        // 9s after that line — inside the interval, so still quiet.
+        assert!(!p.tick_at(2048, t0 + Duration::from_secs(20)));
+        assert!(p.tick_at(3072, t0 + Duration::from_secs(22)));
+    }
+
+    #[test]
+    fn it_reports_the_rate_it_is_actually_achieving() {
+        let t0 = Instant::now();
+        let mut p = RecoveryProgress::new(IVL, t0);
+        let now = t0 + Duration::from_secs(20);
+        assert!(p.tick_at(50_000, now));
+        // 50k keys in 20s = 2500/s. An operator uses this to decide whether the
+        // remaining keys are minutes or hours away, so it must be the rate over
+        // the whole run, not since the last line.
+        assert_eq!(p.keys_per_sec(50_000, now).round(), 2500.0);
+    }
+
+    #[test]
+    fn a_zero_length_run_does_not_divide_by_zero() {
+        let t0 = Instant::now();
+        let p = RecoveryProgress::new(IVL, t0);
+        assert_eq!(p.keys_per_sec(0, t0), 0.0);
+    }
+}

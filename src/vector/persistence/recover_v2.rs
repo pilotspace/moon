@@ -71,6 +71,60 @@ pub struct IndexRecoveryCounters {
 /// All three phase methods assume they run from inside an already-open
 /// `with_shard` closure — none of them call `with_shard`/`with_shard_db`
 /// themselves (forbidden re-entrancy, see `crate::shard::slice`).
+/// Says "still moving" while a long recovery reconciles the keyspace.
+///
+/// moon#546: a production restart spent ~94 minutes inside the reconcile loop
+/// and logged nothing at all between the sidecar-restore banner and the final
+/// count. An operator reading that log cannot separate a slow repair from a
+/// wedged process, and the two call for opposite actions.
+///
+/// The trigger is wall-clock, not a key count: the recoveries that need a line
+/// are exactly the ones whose keys are individually slow, and a "every N keys"
+/// rule stays silent through precisely those. The interval restarts from the
+/// last line so a run that slows down mid-way doesn't earn a backlog of them.
+pub(crate) struct RecoveryProgress {
+    started: std::time::Instant,
+    last: std::time::Instant,
+    interval: std::time::Duration,
+}
+
+impl RecoveryProgress {
+    pub(crate) fn new(interval: std::time::Duration, now: std::time::Instant) -> Self {
+        Self {
+            started: now,
+            last: now,
+            interval,
+        }
+    }
+
+    /// Should a progress line be emitted now? Records the emission if so.
+    ///
+    /// `_done` is carried for the caller's message only; the decision is time-
+    /// based by design (see the type docs).
+    pub(crate) fn tick_at(&mut self, _done: u64, now: std::time::Instant) -> bool {
+        if now.duration_since(self.last) < self.interval {
+            return false;
+        }
+        self.last = now;
+        true
+    }
+
+    /// Keys per second over the WHOLE run — the number an operator multiplies
+    /// by the keys remaining to decide whether to keep waiting.
+    pub(crate) fn keys_per_sec(&self, done: u64, now: std::time::Instant) -> f64 {
+        let secs = now.duration_since(self.started).as_secs_f64();
+        if secs <= 0.0 {
+            return 0.0;
+        }
+        done as f64 / secs
+    }
+
+    /// Seconds since recovery started, for the progress line.
+    pub(crate) fn elapsed_secs(&self, now: std::time::Instant) -> f64 {
+        now.duration_since(self.started).as_secs_f64()
+    }
+}
+
 pub struct RecoveryState {
     /// Names of indexes that have durable state loaded from a manifest —
     /// eligible for the dedup rescan. Everything else (no manifest found,
