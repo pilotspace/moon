@@ -25,16 +25,32 @@ use moon::runtime::channel;
 use moon::server::listener;
 use moon::shard::Shard;
 use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
-use tokio::net::TcpListener;
+
+mod common;
 
 /// Start a full sharded Moon server on a random port.
 ///
 /// Uses the same shard-thread + `run_sharded` pattern as `main.rs`, so
 /// MQ.* handler intercepts are active.
 async fn start_mq_server(num_shards: usize) -> (u16, CancellationToken) {
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
+    // `common::reserve_port()`, not a bare bind-then-drop of :0.
+    //
+    // The raw probe closes no collision at all: it hands back a port the OS is
+    // free to hand to somebody else the moment the probe drops. That "somebody
+    // else" is real here — cargo and nextest run test binaries CONCURRENTLY,
+    // and within this binary 17 tests each start their own server at once.
+    // `reserve_port` closes both halves: `HANDED_OUT` dedupes inside this
+    // process, and a `DirLock` claims the port against every other moon test
+    // process on the machine.
+    //
+    // Observed 2026-08-25 on macOS/tokio: 12 of 17 tests here failed with
+    // `Connection refused (os error 61)` at connect(), and three survived all
+    // three nextest retries during a full-suite run. Not reproducible on
+    // demand — synthetic CPU load and a concurrent cold build both failed to
+    // trigger it — so this is the mechanism the code makes possible, not a
+    // mechanism proven to have fired. The bare probe is indefensible either
+    // way when the helper that fixes it already exists.
+    let port = common::reserve_port();
 
     let token = CancellationToken::new();
 
@@ -270,8 +286,32 @@ async fn start_mq_server(num_shards: usize) -> (u16, CancellationToken) {
         }
     });
 
-    // Give the server time to bind and start shards
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Wait for the listener to actually accept, rather than guessing.
+    //
+    // This was `sleep(200ms)`, which is a bet that the shards finish starting
+    // inside a fixed budget. The bet loses whenever the machine is busy —
+    // measured 2026-08-25 on a 12-core macOS host immediately after a full
+    // test suite: 12 of 17 tests in this file failed with
+    // `Connection refused (os error 61)` at connect(), and all 17 passed on
+    // the same commit once the machine was quiet. A fixed sleep turns "the
+    // host was loaded" into "this feature is broken", which costs far more to
+    // read than it ever saved in wall-clock.
+    //
+    // Polling connect() is the honest readiness signal: the thing the test is
+    // about to do is exactly the thing being probed.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(_) => break,
+            Err(e) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "mq test server never accepted on port {port} within 30s: {e}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
 
     (port, token)
 }
