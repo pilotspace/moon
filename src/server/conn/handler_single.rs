@@ -2083,7 +2083,7 @@ pub async fn handle_connection(
                                     } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
                                         crate::command::vector_search::ft_info(&*store, ts_mut, cmd_args, conn.selected_db as u8)
                                     } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
-                                        crate::command::vector_search::ft_list(&*store, conn.selected_db as u8)
+                                        crate::command::vector_search::ft_list(&*store, ts_mut, conn.selected_db as u8)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
                                         crate::command::vector_search::ft_compact(&mut *store, ts_mut, cmd_args, conn.selected_db as u8)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
@@ -2322,7 +2322,7 @@ pub async fn handle_connection(
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
                                             crate::command::vector_search::ft_info(&*store, ts_m2, d_args, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT._LIST") {
-                                            crate::command::vector_search::ft_list(&*store, conn.selected_db as u8)
+                                            crate::command::vector_search::ft_list(&*store, ts_m2, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
                                             crate::command::vector_search::ft_compact(&mut *store, ts_m2, d_args, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
@@ -2628,7 +2628,7 @@ pub async fn handle_connection(
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
                                             crate::command::vector_search::ft_info(&*store, ts_m3, d_args, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT._LIST") {
-                                            crate::command::vector_search::ft_list(&*store, conn.selected_db as u8)
+                                            crate::command::vector_search::ft_list(&*store, ts_m3, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
                                             crate::command::vector_search::ft_compact(&mut *store, ts_m3, d_args, conn.selected_db as u8)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {

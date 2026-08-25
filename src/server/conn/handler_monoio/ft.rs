@@ -483,7 +483,7 @@ async fn ft_command_inner(
         if cmd.eq_ignore_ascii_case(b"FT._LIST") {
             let db_index = conn.selected_db as u8;
             let response = crate::shard::slice::with_shard(|s| {
-                crate::command::vector_search::ft_list(&s.vector_store, db_index)
+                crate::command::vector_search::ft_list(&s.vector_store, &s.text_store, db_index)
             });
             responses.push(response);
             return true;
@@ -879,7 +879,7 @@ async fn ft_command_inner(
                     db_index,
                 )
             } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
-                crate::command::vector_search::ft_list(&s.vector_store, db_index)
+                crate::command::vector_search::ft_list(&s.vector_store, &s.text_store, db_index)
             } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
                 crate::command::vector_search::ft_compact(
                     &mut s.vector_store,
