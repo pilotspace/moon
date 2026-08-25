@@ -175,7 +175,7 @@ dry_ci_local() { # dry_ci_local <out-path>
 expect_run() { # expect_run <label> <want-exit> <grep-pattern> <env-prefix...>
   local label=$1 want=$2 pat=$3; shift 3
   local out rc
-  out=$(env "$@" bash "$DRY" --native 2>&1)
+  out=$(env CI_LOCAL_REPO="$REPO_HERE" "$@" bash "$DRY" --native 2>&1)
   rc=$?
   if [ "$rc" = "$want" ] && printf '%s' "$out" | grep -q "$pat"; then
     PASS=$((PASS + 1)); printf "  ok    %-46s exit=%s\n" "$label" "$rc"
@@ -203,6 +203,10 @@ DRY="$TMP/dry.sh"
 mkdir -p "$TMP/bin"
 printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/redis-server"
 chmod +x "$TMP/bin/redis-server"
+# CI_LOCAL_REPO: ci-local.sh hardcodes a macOS path and `cd`s to it, so on a
+# hosted runner EVERY invocation exited 2 before reaching any gate — and an
+# exit-2 test read that as its own verdict. Point it at this checkout.
+REPO_HERE=$(pwd)
 WITH_ORACLE="PATH=$TMP/bin:$PATH"
 NO_ORACLE="PATH=/usr/bin:/bin"
 
@@ -226,7 +230,7 @@ expect_run "a failing native step still exits 1"       1 "RESULT: FAIL" \
   "$WITH_ORACLE" "DRY_FAIL=native tokio suite"
 
 # An unknown flag is still rejected rather than silently treated as default.
-if bash scripts/ci-local.sh --bogus >/dev/null 2>&1; then
+if CI_LOCAL_REPO="$REPO_HERE" bash scripts/ci-local.sh --bogus >/dev/null 2>&1; then
   FAIL=$((FAIL + 1)); printf "  FAIL  %-46s unknown flag was accepted\n" "unknown flag exits 2"
 else
   rc=$?

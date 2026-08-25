@@ -51,7 +51,13 @@
 
 set -u -o pipefail
 
-REPO="/Volumes/Games/tindang-repo/moon"
+# Hardcoded on purpose: /Users/tindang/workspaces/tind-repo/moon is an OLD
+# second checkout, and a relative path has resolved there before. CI_LOCAL_REPO
+# overrides it for callers that legitimately live elsewhere — the pre-flight
+# test harness runs this script on a hosted runner, where the hardcoded path
+# does not exist and the `cd` below would exit 2 before any gate ran, which is
+# indistinguishable from a gate deciding to exit 2.
+REPO="${CI_LOCAL_REPO:-/Volumes/Games/tindang-repo/moon}"
 VM="moon-dev"
 MODE="default"
 case "${1:-}" in
