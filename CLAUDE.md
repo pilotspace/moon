@@ -271,7 +271,14 @@ legs run locally via `scripts/ci-local.sh` before every push, and again on Actio
 scripts/ci-local.sh            # host lint gates + VM monoio suite + VM tokio suite
 scripts/ci-local.sh --quick    # host lint gates only (fmt, audits, clippy ×2)
 scripts/ci-local.sh --full     # + client-compat harness (VM) + macOS host suite
+scripts/ci-local.sh --native   # NO VM: both suites + compat on the macOS host
 ```
+
+`--native` is the fallback when moon-dev is unavailable (or when a long testing phase should
+stay on one machine): it runs both full suites plus the client-compat harness on macOS. It is
+NOT equivalent — macOS drives monoio on kqueue, so the shipped Linux io_uring path, the
+`cfg(target_os = "linux")` code, Windows, and the MSRV pin all go untested. The mode prints
+those gaps instead of a bare PASS, and refuses (exit 2) if no `redis-server` oracle is on PATH.
 
 Run the default mode before every push — it covers exactly what the PR gate no longer runs
 (most importantly the **monoio suite, the runtime that ships**). The script captures every

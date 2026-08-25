@@ -12,9 +12,25 @@
 #             — no VM legs, so no disk pre-flight.
 #   --full  : default + client-compat harness (VM, real redis-server
 #             oracle) + macOS host test suite.
+#   --native: everything on the macOS HOST, no VM at all — host lint
+#             gates, BOTH full suites (monoio on kqueue + tokio), and the
+#             client-compat harness against brew's redis-server. For when
+#             the VM is unavailable, or to keep a long testing phase on
+#             one machine. See "What --native does NOT cover" below.
 #
 # Windows cannot run locally — before merging, still dispatch the hosted
 # matrix:  gh workflow run ci.yml --ref <branch>
+#
+# What --native does NOT cover, and why it is printed on every run rather
+# than left for the reader to remember:
+#   * io_uring. macOS runs monoio on kqueue. The whole point of the VM
+#     monoio leg is that the SHIPPED Linux path uses io_uring, and no
+#     amount of native testing exercises it.
+#   * Linux-only code behind cfg(target_os = "linux") — O_DIRECT, the
+#     spin governor's /proc sampling, connection migration.
+#   * Windows, and the MSRV toolchain pin.
+# A local gate that quietly implies full coverage is worse than no gate,
+# so --native ends by naming these instead of printing a bare PASS.
 #
 # Design notes (each guards against a failure this repo has actually hit):
 #   * Every step's exit code is captured directly — never through a pipe
@@ -35,14 +51,21 @@
 
 set -u -o pipefail
 
-REPO="/Volumes/Games/tindang-repo/moon"
+# Hardcoded on purpose: /Users/tindang/workspaces/tind-repo/moon is an OLD
+# second checkout, and a relative path has resolved there before. CI_LOCAL_REPO
+# overrides it for callers that legitimately live elsewhere — the pre-flight
+# test harness runs this script on a hosted runner, where the hardcoded path
+# does not exist and the `cd` below would exit 2 before any gate ran, which is
+# indistinguishable from a gate deciding to exit 2.
+REPO="${CI_LOCAL_REPO:-/Volumes/Games/tindang-repo/moon}"
 VM="moon-dev"
 MODE="default"
 case "${1:-}" in
-  --quick) MODE="quick" ;;
-  --full)  MODE="full" ;;
-  "")      ;;
-  *) echo "usage: $0 [--quick|--full]" >&2; exit 2 ;;
+  --quick)  MODE="quick" ;;
+  --full)   MODE="full" ;;
+  --native) MODE="native" ;;
+  "")       ;;
+  *) echo "usage: $0 [--quick|--full|--native]" >&2; exit 2 ;;
 esac
 
 # Library mode is sourced from anywhere — CI runs the pre-flight test on a
@@ -298,6 +321,22 @@ VM_TEST_MONOIO='if command -v cargo-nextest >/dev/null 2>&1; then
     echo "(nextest absent in VM — falling back to cargo test --no-fail-fast)"
     cargo test --no-fail-fast
   fi'
+# Host equivalents for --native. Same nextest-or-fallback shape as the VM
+# pair above: `--profile ci` gives the retry policy, and without nextest a
+# plain `cargo test --no-fail-fast` still runs everything (no retries, so a
+# flake then needs isolating by hand rather than being absorbed).
+HOST_TEST_MONOIO='if command -v cargo-nextest >/dev/null 2>&1; then
+    cargo nextest run --profile ci
+  else
+    echo "(nextest absent — falling back to cargo test --no-fail-fast)"
+    cargo test --no-fail-fast
+  fi'
+HOST_TEST_TOKIO='if command -v cargo-nextest >/dev/null 2>&1; then
+    cargo nextest run --profile ci --no-default-features --features runtime-tokio,jemalloc
+  else
+    cargo test --no-default-features --features runtime-tokio,jemalloc --no-fail-fast
+  fi'
+
 VM_TEST_TOKIO='if command -v cargo-nextest >/dev/null 2>&1; then
     cargo nextest run --profile ci --no-default-features --features runtime-tokio,jemalloc
   else
@@ -315,7 +354,7 @@ fi
 
 # The VM legs are the ones that need room; --quick is host-only. The host
 # repo volume is not checked: it carries 3G target dirs, not 34G ones.
-if [ "$MODE" != "quick" ]; then
+if [ "$MODE" != "quick" ] && [ "$MODE" != "native" ]; then
   run_step "disk pre-flight ($VM)" preflight_disk || exit 1
 fi
 
@@ -329,7 +368,7 @@ run_step "clippy (default)"   env CARGO_TARGET_DIR=target-clippy \
 run_step "clippy (tokio)"     env CARGO_TARGET_DIR=target-tokio \
   cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings || exit 1
 
-if [ "$MODE" != "quick" ]; then
+if [ "$MODE" != "quick" ] && [ "$MODE" != "native" ]; then
   # ── Phase 1: the two full suites, in the Linux VM ───────────────────
   # Sequential, monoio (shipped runtime) first: parallel VM builds of two
   # feature sets contend on memory and the shared-volume virtiofs.
@@ -341,6 +380,47 @@ if [ "$MODE" != "quick" ]; then
     vm "export CARGO_TARGET_DIR=\$HOME/ci-target/local-monoio MOON_DISK_FREE_MIN_PCT=0; $VM_TEST_MONOIO"
   run_step "VM tokio suite" \
     vm "export CARGO_TARGET_DIR=\$HOME/ci-target/local-tokio MOON_NO_URING=1 MOON_DISK_FREE_MIN_PCT=0; $VM_TEST_TOKIO"
+fi
+
+if [ "$MODE" = "native" ]; then
+  # ── Native phase 1: both full suites on the macOS host ─────────────
+  # Sequential and in separate target dirs: the two feature sets are not
+  # link-compatible, so sharing one dir makes each leg relink the world.
+  # The tokio leg reuses `target-tokio`, which the tokio clippy gate above
+  # already warmed; the monoio leg uses the default `target/`, shared with
+  # the release build below (the default clippy gate deliberately sits in
+  # `target-clippy` so a `-D warnings` run never invalidates it).
+  #
+  # Default features ARE runtime-monoio, which on macOS drives kqueue
+  # rather than io_uring. That is a real gap, not a substitution — it is
+  # named in the summary rather than papered over.
+  run_step "native monoio suite (kqueue, NOT io_uring)" \
+    env MOON_DISK_FREE_MIN_PCT=0 bash -c "$HOST_TEST_MONOIO"
+  run_step "native tokio suite" \
+    env MOON_NO_URING=1 CARGO_TARGET_DIR=target-tokio MOON_DISK_FREE_MIN_PCT=0 \
+    bash -c "$HOST_TEST_TOKIO"
+
+  # ── Native phase 2: client-compat against brew's redis-server ──────
+  # Refuses rather than skips when the oracle is missing: a compat gate
+  # that silently does not run is the exact "green because it never ran"
+  # shape this file exists to prevent.
+  if ! command -v redis-server >/dev/null 2>&1; then
+    echo "  ✗ client-compat needs a real redis-server oracle and none is on PATH."
+    echo "    brew install redis   (the harness diffs Moon against it byte for byte)"
+    exit 2
+  fi
+  run_step "native build release (for compat)" cargo build --release
+  # MOON_BIN is pinned to the binary built THIS run, and passed as an
+  # explicit flag rather than the env var: find_moon_binary()'s fallback
+  # has graded a stale quarantined binary before now.
+  run_step "native client-compat (strict + contexts)" \
+    env MOON_DISK_FREE_MIN_PCT=0 ./scripts/test-client-compat.sh --strict \
+      --contexts standalone,multi,pipeline \
+      --moon-bin "$REPO/target/release/moon"
+  run_step "native client-compat (INFO coverage)" \
+    env MOON_DISK_FREE_MIN_PCT=0 ./scripts/test-client-compat.sh \
+      --filter __none__ --info-manifest \
+      --moon-bin "$REPO/target/release/moon"
 fi
 
 if [ "$MODE" = "full" ]; then
@@ -385,6 +465,19 @@ if [ $FAILED -ne 0 ]; then
   echo "  RESULT: FAIL — re-run failing suites in isolation before"
   echo "  attributing (known load-flake classes: fixed ports, kill-9 timing)."
   exit 1
+fi
+if [ "$MODE" = "native" ]; then
+  # A pass here is a pass on THIS platform. Spelling out the gap is the
+  # whole reason the mode is allowed to exist: the failure it guards
+  # against is someone reading "RESULT: PASS" as "ready to merge".
+  echo "  RESULT: PASS (native/macOS) — this did NOT cover:"
+  echo "    · io_uring   — monoio ran on kqueue here; the shipped Linux"
+  echo "                   path is io_uring and is untested by this run"
+  echo "    · Linux-only cfg code (O_DIRECT, spin governor, migration)"
+  echo "    · Windows, and the MSRV 1.94 toolchain pin"
+  echo "  Dispatch the hosted matrix before merging:"
+  echo "    gh workflow run ci.yml --ref \$(git branch --show-current)"
+  exit 0
 fi
 echo "  RESULT: PASS — remember: Windows still needs the hosted matrix:"
 echo "    gh workflow run ci.yml --ref \$(git branch --show-current)"
