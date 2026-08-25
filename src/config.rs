@@ -722,7 +722,12 @@ pub struct ServerConfig {
     /// foreground writes are stalled with `MOONERR busy: compaction backlog`.
     ///
     /// This is Moon's analog of RocksDB's `level0_stop_writes_trigger`.
-    /// Background compaction (FT.COMPACT, GRAPH.COMPACT) is NOT affected.
+    ///
+    /// The BACKGROUND merge task is never gated by this. Client commands are,
+    /// with one exception: `FT.COMPACT` and `FT.CONFIG` are the remedies for a
+    /// backlog, so the backlog does not refuse them (moon#718). This comment
+    /// used to claim a `GRAPH.COMPACT` exemption as well; no such command
+    /// exists, and the `FT.COMPACT` exemption was never implemented.
     ///
     /// Default 20. Set to 0 to disable the stall guard.
     #[arg(long = "max-unflushed-immutable-segments", default_value_t = 20)]
