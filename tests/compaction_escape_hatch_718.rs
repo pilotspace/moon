@@ -35,8 +35,9 @@ const COMPACT_THRESHOLD: &str = "100";
 /// Documents per round. Comfortably over COMPACT_THRESHOLD so each round's
 /// explicit FT.COMPACT produces a segment.
 const DOCS_PER_ROUND: u16 = 150;
-/// Rounds. The stall needs MORE immutable segments than MAX_UNFLUSHED, so two
-/// rounds only reaches the boundary; three clears it.
+/// Maximum rounds. The stall needs MORE immutable segments than MAX_UNFLUSHED,
+/// so two rounds only reach the boundary and three clear it — but the loop
+/// stops as soon as the backlog exists, so this is a ceiling, not a target.
 const ROUNDS: u8 = 3;
 const DIM: usize = 4;
 
@@ -58,6 +59,25 @@ fn call(s: &mut TcpStream, parts: &[&[u8]]) -> String {
     let mut buf = [0u8; 8192];
     let n = s.read(&mut buf).expect("read");
     String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
+/// Poll until the segment-backlog stall is armed, or give up.
+///
+/// The stall bit is set by the 1s MVCC sweep (`run_mvcc_sweep` ->
+/// `update_segment_stall`), not by the write that pushed the immutable-segment
+/// count past the threshold. Its arrival therefore always has to be waited for
+/// rather than assumed — no amount of writing makes it synchronous.
+fn wait_for_stall(s: &mut TcpStream, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        if call(s, &[b"SET", b"eh718:probe", b"1"]).contains("compaction backlog") {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// FLOAT32 vector whose bytes are all printable ASCII — a blob containing NUL
@@ -137,14 +157,19 @@ fn eh718_a_compaction_backlog_does_not_refuse_its_own_remedy() {
 
     // Build the backlog. Background compaction does NOT fire on document count
     // alone — 350 documents at COMPACT_THRESHOLD 100 left `graph_segments 0` —
-    // so each round compacts explicitly. Three rounds because the stall needs
-    // MORE immutable segments than MAX_UNFLUSHED, not merely as many.
+    // so each round compacts explicitly.
     //
-    // Using FT.COMPACT to BUILD the fixture is safe on both sides of the fix:
-    // the stall cannot engage until two segments exist, which is the end of
-    // round 1, and the assertions below do not depend on round 2's compact
-    // succeeding.
+    // The stall arms at `imm_count > --max-unflushed-immutable-segments`
+    // (`update_segment_stall`), so with MAX_UNFLUSHED 1 it can arm the moment
+    // round 1's FT.COMPACT produces the SECOND segment. Loading a further round
+    // therefore races the sweep that arms it: a fast host finishes the round
+    // first, a slow one does not, which is why this passed on Linux/macOS and
+    // failed on the Windows runner. Rather than depend on winning that race,
+    // wait for the sweep after each compact and stop loading the moment the
+    // backlog exists — and read a mid-round refusal as that same signal instead
+    // of as fixture drift.
     let mut doc = 0u16;
+    let mut stalled = false;
     for round in 0..ROUNDS {
         let mut pipelined = Vec::new();
         for _ in 0..DOCS_PER_ROUND {
@@ -154,46 +179,54 @@ fn eh718_a_compaction_backlog_does_not_refuse_its_own_remedy() {
             doc += 1;
         }
         c.write_all(&pipelined).expect("write batch");
-        // Drain exactly one reply per HSET: `:0`/`:1` plus CRLF.
+        // Drain exactly one reply per HSET: `:0`/`:1` plus CRLF. A refusal is
+        // also one CRLF-terminated reply, so the round is drained in full
+        // either way — replies left on the wire would desync every probe below.
         let mut seen = 0usize;
+        let mut refused = false;
         let mut buf = [0u8; 1 << 16];
         while seen < usize::from(DOCS_PER_ROUND) {
             let n = c.read(&mut buf).expect("drain batch");
             assert!(n > 0, "connection closed while loading round {round}");
             let chunk = String::from_utf8_lossy(&buf[..n]);
-            assert!(
-                !chunk.contains("MOONERR"),
-                "an HSET was refused while building the fixture, so the probes \
-                 below would measure a different state: {chunk:?}"
-            );
+            if chunk.contains("MOONERR") {
+                // Round 0 runs against zero immutable segments, so the backlog
+                // under test cannot possibly refuse it. A refusal there is a
+                // real defect, or some OTHER guard (diskfull) firing, and must
+                // not be swallowed as "the fixture worked".
+                assert!(
+                    round > 0,
+                    "round 0 was refused before a single immutable segment \
+                     could exist, so this is not the backlog under test: {chunk:?}"
+                );
+                refused = true;
+            }
             seen += chunk.matches("\r\n").count();
+        }
+        if refused {
+            stalled = true;
+            break;
         }
         let compacted = call(&mut c, &[b"FT.COMPACT", b"eh718"]);
         assert!(
             compacted.contains("OK") || compacted.contains("busy"),
             "round {round} FT.COMPACT: {compacted:?}"
         );
+        if wait_for_stall(&mut c, Duration::from_secs(3)) {
+            stalled = true;
+            break;
+        }
     }
-
-    // The stall bit is set by the 1s MVCC sweep, not by the write itself.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let stalled = loop {
-        let r = call(&mut c, &[b"SET", b"eh718:probe", b"1"]);
-        if r.contains("compaction backlog") {
-            break true;
-        }
-        if Instant::now() >= deadline {
-            break false;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
 
     // Control. Without a real stall every assertion below passes vacuously, so
     // failing to REACH the outage is a failed test, not a skipped one.
+    if !stalled {
+        stalled = wait_for_stall(&mut c, Duration::from_secs(20));
+    }
     assert!(
         stalled,
-        "never reached the segment-backlog stall within 20s, so this test would \
-         prove nothing. Fixture drift: check that COMPACT_THRESHOLD \
+        "never reached the segment-backlog stall, so this test would prove \
+         nothing. Fixture drift: check that COMPACT_THRESHOLD \
          ({COMPACT_THRESHOLD}) still produces more than \
          --max-unflushed-immutable-segments ({MAX_UNFLUSHED}) immutable \
          segments for {ROUNDS} rounds of {DOCS_PER_ROUND} documents. stderr: {:?}",
