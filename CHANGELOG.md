@@ -42,6 +42,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Covered by four new cases in `scripts/test-ci-local-preflight.sh`; both guards were mutation-
   checked (deleting the oracle refusal, and hoisting the native summary above the failure check
   so a failing run would exit 0 — each makes its test fail).
+- **A failing `loading_state_476` test no longer orphans its server** (#476 follow-up).
+
+  The kill lived on the last line of the test body, so a failing `assert!` unwound straight
+  past it and left the server reparented to init. Measured after one afternoon of deliberately
+  failing mutation runs: five orphans, ~170% CPU each (834% combined) for 7.5 hours, answering
+  nothing on their ports and spending the time in syscalls (13:42 system vs 0:09 user). The
+  cost is not only the cores — every wall-clock-sensitive test that ran afterwards did so on a
+  machine under invisible load.
+
+  The child is now owned by a `ServerGuard` that kills it on drop, so an unwinding panic
+  reaps it. A regression test panics deliberately and asserts on the PID rather than the port:
+  a dead server frees its port either way, so connect-refused proves nothing about whether
+  anything is still running. Replacing the guard with `mem::forget` fails that test.
 
 - **A restarting server tells clients it is loading instead of hanging on them** (#476).
 

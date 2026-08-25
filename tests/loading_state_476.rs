@@ -100,16 +100,53 @@ fn spawn(dir: &std::path::Path, port: u16) -> Child {
         .expect("spawn moon")
 }
 
-fn kill(mut c: Child) {
-    let _ = c.kill();
-    let _ = c.wait();
+/// Kills the server when it leaves scope — including when the scope is left by
+/// an unwinding panic.
+///
+/// A test that calls `kill(child)` on its last line kills nothing when an
+/// earlier `assert!` fires: the panic unwinds straight past it and the server
+/// is reparented to init. Measured 2026-08-25, after a round of deliberately
+/// failing mutation runs of this very file: five orphans, each burning ~170%
+/// CPU (834% combined) for 7.5 hours, answering nothing on their ports and
+/// spending the time in syscalls (13:42 system vs 0:09 user). The cost is not
+/// just the cores — every wall-clock-sensitive test that ran afterwards did so
+/// on a machine under invisible load.
+///
+/// Deliberately kills rather than asking politely: these are throwaway data
+/// dirs under `/tmp`, and a hung server (the exact thing this file tests for)
+/// would ignore a graceful shutdown.
+struct ServerGuard(Option<Child>);
+
+impl ServerGuard {
+    fn new(c: Child) -> Self {
+        Self(Some(c))
+    }
+
+    /// Kill now, when the test needs the server *gone* rather than merely
+    /// doomed — here, so the store is closed before it is reopened.
+    fn kill_now(mut self) {
+        self.terminate();
+    }
+
+    fn terminate(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
 }
 
 /// Build a store with a TEXT index over `KEYS` hashes, so the restart has real
 /// index-reconcile work to do, and leave it on disk.
 fn build_store(dir: &std::path::Path, port: u16) {
     std::fs::create_dir_all(dir).expect("mkdir");
-    let child = spawn(dir, port);
+    let child = ServerGuard::new(spawn(dir, port));
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut s = loop {
         assert!(Instant::now() < deadline, "build server never accepted");
@@ -183,7 +220,7 @@ fn build_store(dir: &std::path::Path, port: u16) {
     let _ = read_line(&mut s);
     std::thread::sleep(Duration::from_millis(500));
     drop(s);
-    kill(child);
+    child.kill_now();
 }
 
 /// moon#476 acceptance: while indexes rebuild, data commands say `-LOADING`
@@ -196,6 +233,7 @@ fn lst476_loading_is_reported_not_hidden_behind_a_hang() {
     // would hit "Index already exists" -- so only the restart goes through it.
     build_store(&dir, common::reserve_port());
     let (child, port) = common::spawn_listening(|p| spawn(&dir, p));
+    let child = ServerGuard::new(child);
 
     // Connect as early as the kernel allows and sample continuously. Both
     // replies come from ONE connection so a -LOADING and a +PONG observed
@@ -270,6 +308,53 @@ fn lst476_loading_is_reported_not_hidden_behind_a_hang() {
         "after recovery the value must be served normally"
     );
 
-    kill(child);
+    child.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A panicking test must not leave its server behind.
+///
+/// This is the regression test for how this file produced five 170%-CPU
+/// orphans in one afternoon: the kill lived on the last line of the test, and
+/// a failing assert never reached it. The check is on the PROCESS, not on the
+/// port — a dead server's port frees up either way, so a connect-refused proves
+/// nothing about whether anything is still running.
+#[test]
+fn lst476_a_panicking_test_does_not_orphan_its_server() {
+    let dir = std::env::temp_dir().join(format!(
+        "moon-loading-476-{}-orphan-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    let port = common::reserve_port();
+    let child = spawn(&dir, port);
+    let pid = child.id();
+    let guard = ServerGuard::new(child);
+
+    // Exactly the shape of a failing assertion mid-test.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guard = guard;
+        panic!("a test failing before its explicit kill");
+    }));
+    assert!(outcome.is_err(), "the panic must actually have happened");
+
+    // `kill` + `wait` are synchronous, so by the time the unwind completes the
+    // child is reaped and its pid no longer names a live process.
+    let alive = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count() > 1)
+        .unwrap_or(false);
+    assert!(
+        !alive,
+        "server pid {pid} survived a panicking test — this is how orphans that \
+         spin at ~170% CPU for hours get created"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
