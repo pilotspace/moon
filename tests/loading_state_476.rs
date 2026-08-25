@@ -319,6 +319,14 @@ fn lst476_loading_is_reported_not_hidden_behind_a_hang() {
 /// a failing assert never reached it. The check is on the PROCESS, not on the
 /// port — a dead server's port frees up either way, so a connect-refused proves
 /// nothing about whether anything is still running.
+///
+/// Unix-only because the liveness probe is `ps`. Windows runs this suite too
+/// (`Check (Windows)` runs `cargo nextest run`), and there `Command::new("ps")`
+/// fails to spawn — a probe that cannot run would have reported "not alive"
+/// and passed without checking anything. A guarantee is only worth what its
+/// platform-specific primitive is worth, so the test declares the platform
+/// rather than quietly degrading on the others.
+#[cfg(unix)]
 #[test]
 fn lst476_a_panicking_test_does_not_orphan_its_server() {
     let dir = std::env::temp_dir().join(format!(
@@ -345,11 +353,14 @@ fn lst476_a_panicking_test_does_not_orphan_its_server() {
 
     // `kill` + `wait` are synchronous, so by the time the unwind completes the
     // child is reaped and its pid no longer names a live process.
-    let alive = std::process::Command::new("ps")
+    //
+    // A probe that failed to RUN must not read as "nothing is alive" — that
+    // turns a missing `ps` into a green test. It is an error, and it says so.
+    let probe = std::process::Command::new("ps")
         .args(["-p", &pid.to_string()])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count() > 1)
-        .unwrap_or(false);
+        .expect("`ps` must be available to probe process liveness");
+    let alive = String::from_utf8_lossy(&probe.stdout).lines().count() > 1;
     assert!(
         !alive,
         "server pid {pid} survived a panicking test — this is how orphans that \
