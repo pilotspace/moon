@@ -59,6 +59,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mask-based relaxation is added, instead of the relaxation silently escaping the sentinel.
 
 ### Fixed
+
+- **`FT.SEARCH <index> "*"` now enumerates a VECTOR-only index (moon#695).**
+
+  moon#693 made a bare `*` the match-all query and answered it from the **inverted** index,
+  because that is where the document registry lives. Every index with a TEXT, TAG or NUMERIC
+  field gained match-all — including mixed VECTOR+TEXT schemas. An index built from VECTOR
+  fields alone has no inverted index at all, so `*` fell through to the text engine and
+  answered `ERR no such index` for an index `FT._LIST` happily listed. Before #693 the same
+  call said `ERR invalid KNN query syntax`. Both were wrong, and neither told the user their
+  index had no way to be enumerated.
+
+  The vector engine has its own registry — `VectorIndex::key_hash_to_key` — and it is live:
+  filled on index, pruned in the same function body as the segment tombstone, so the two
+  cannot disagree. It is also the exact map KNN already resolves hits through, which bounds
+  this honestly: a document match-all misses is one KNN would report as a synthetic
+  `vec:<id>` rather than by name.
+
+  The routing, not the data, was the work. `is_text_query("*")` is true, so `*` reaches the
+  text path at all four FT.SEARCH sites, and a bare `*` is also the leading token of a HYBRID
+  or SPARSE query whose retriever clauses live in separate args. The gate therefore rejects
+  HYBRID/SPARSE itself rather than relying on where it is called from, and declines any index
+  the text store knows — so mixed schemas keep the path they already use. Multi-shard fans the
+  same enumeration out over the generic per-shard command channel and reuses the text merge,
+  which already sums per-shard totals; each shard is capped at `offset+count` rather than
+  handed the caller's own LIMIT, so paging cannot re-serve the same documents.
+
+  Verified at `--shards 1` **and** `--shards 4`, which is not ceremony: the first cut wired
+  the multi-shard branch and missed the single-shard one, and returning nothing at one shard
+  count would have been worse than the honest error it replaced. Also verified across a
+  restart, where `*` agrees with KNN exactly.
 - **A compaction backlog no longer refuses the commands that cure it (moon#718).**
 
   Reported as a permanent write outage with no in-band recovery. Background merges keep

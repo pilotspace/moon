@@ -1627,13 +1627,41 @@ if should_run "vector"; then
     # registry lives -- see the `FT.SEARCH "*" enumerates a TEXT index` row in
     # the BM25 section, which passes.
     #
-    # `myidx` here is VECTOR-ONLY, and that case is still open: the vector
-    # engine's live key map would have to be enumerable through BOTH the local
-    # handler path and `scatter_text_search`, which is its own change with its
-    # own multi-shard verification. Tracked as moon#695. Left asserting the
-    # RediSearch behaviour so it goes green on its own the day that lands.
+    # `myidx` here is VECTOR-ONLY, which used to answer `ERR no such index` --
+    # for an index FT._LIST lists -- because a VECTOR-only schema builds no
+    # inverted index for `*` to read. moon#695 enumerates the vector engine's
+    # own live key map instead. This row covers the EMPTY case; the block below
+    # covers a loaded index, which is where an empty answer could otherwise hide.
     TOTAL=$((TOTAL + 1)); FT_SEARCH=$(mcli FT.SEARCH myidx "*" 2>&1)
-    if ! echo "$FT_SEARCH" | grep -qi "err"; then PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH does not error"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH \"*\" on a VECTOR-only index returned error (moon#695, the open half of moon#693): $FT_SEARCH"; fi
+    if ! echo "$FT_SEARCH" | grep -qi "err"; then PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH does not error"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH \"*\" on a VECTOR-only index returned error (moon#695): $FT_SEARCH"; fi
+
+    # moon#695, the loaded case. The blob is 16 bytes of printable ASCII, which
+    # is a perfectly good 4-dim FLOAT32 vector (0x41414141 ~ 12.08). An ordinary
+    # float vector is full of NUL bytes and redis-cli cannot carry it, so the
+    # all-ASCII one is what lets this row assert a REAL enumeration rather than
+    # an empty one that would pass whether or not anything was found.
+    mcli FT.CREATE star695idx ON HASH PREFIX 1 s695: SCHEMA embedding VECTOR HNSW 6 DIM 4 DISTANCE_METRIC L2 TYPE FLOAT32 >/dev/null 2>&1
+    mcli HSET s695:1 embedding AAAABBBBCCCCDDDD >/dev/null 2>&1
+    mcli HSET s695:2 embedding EEEEFFFFGGGGHHHH >/dev/null 2>&1
+    FT_STAR_VEC=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        FT_STAR_VEC=$(mcli FT.SEARCH star695idx "*" LIMIT 0 0 2>&1)
+        [ "$FT_STAR_VEC" = "2" ] && break
+        sleep 0.3
+    done
+    TOTAL=$((TOTAL + 1))
+    if [ "$FT_STAR_VEC" = "2" ]; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH \"*\" enumerates a loaded VECTOR-only index (2 docs, moon#695)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH \"*\" on a loaded VECTOR-only index expected 2, got: $FT_STAR_VEC"
+    fi
+    TOTAL=$((TOTAL + 1)); FT_STAR_KEYS=$(mcli FT.SEARCH star695idx "*" 2>&1)
+    if echo "$FT_STAR_KEYS" | grep -q "s695:1" && echo "$FT_STAR_KEYS" | grep -q "s695:2"; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH \"*\" returns the real keys, not synthetic vec:<id> (moon#695)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH \"*\" on a VECTOR-only index lost the real keys: $FT_STAR_KEYS"
+    fi
+    mcli FT.DROPINDEX star695idx DD >/dev/null 2>&1
 
     # FT.DROPINDEX — remove index
     assert_moon "FT.DROPINDEX"             "OK"    FT.DROPINDEX myidx

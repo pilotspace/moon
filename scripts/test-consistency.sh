@@ -1830,6 +1830,29 @@ else
     FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO should show vecidx"
 fi
 
+# moon#695: `*` must enumerate a VECTOR-only index, and must give the SAME
+# answer at every shard count. This file runs at 1/4/12 shards, which is exactly
+# the axis the fix has to earn: the keys partition across shards, so the count is
+# only right if every shard is consulted and its reply merged. A local-only fix
+# passes at 1 and quietly under-reports at 4 and 12.
+#
+# Indexing is asynchronous, so settle before judging rather than asserting into a
+# race and calling the result a shard bug.
+FT_STAR=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    FT_STAR=$(redis-cli -p "$PORT_RUST" FT.SEARCH vecidx "*" LIMIT 0 0 2>&1)
+    [ "$FT_STAR" = "2" ] && break
+    sleep 0.3
+done
+assert_eq "FT.SEARCH \"*\" enumerates a VECTOR-only index (moon#695)" "2" "$FT_STAR"
+
+FT_STAR_KEYS=$(redis-cli -p "$PORT_RUST" FT.SEARCH vecidx "*" 2>&1)
+if echo "$FT_STAR_KEYS" | grep -q "vec:1" && echo "$FT_STAR_KEYS" | grep -q "vec:2"; then
+    PASS=$((PASS + 1))
+else
+    FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH \"*\" must return the real keys, not synthetic vec:<id>: $FT_STAR_KEYS"
+fi
+
 # FT.DROPINDEX
 FT_DROP=$(redis-cli -p "$PORT_RUST" FT.DROPINDEX vecidx 2>&1)
 assert_eq "FT.DROPINDEX" "OK" "$FT_DROP"

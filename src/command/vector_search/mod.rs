@@ -14,6 +14,7 @@ pub mod ft_create;
 pub mod ft_info;
 #[cfg(feature = "text-index")]
 pub mod ft_invalidate_range;
+pub mod ft_match_all;
 pub mod ft_search;
 pub mod ft_text_search;
 #[cfg(feature = "graph")]
@@ -38,6 +39,7 @@ pub use ft_create::ft_create;
 pub use ft_info::{ft_info, merge_ft_info_responses};
 #[cfg(feature = "text-index")]
 pub use ft_invalidate_range::ft_invalidate_range;
+pub use ft_match_all::{match_all_local, try_match_all_vector_only, vector_only_match_all_index};
 #[cfg(feature = "graph")]
 pub use ft_search::ft_search_with_graph;
 pub use ft_search::{

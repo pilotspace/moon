@@ -3382,6 +3382,16 @@ pub(crate) fn dispatch_vector_command(
         if query_bytes.map_or(false, vector_search::is_text_query)
             && !vector_search::has_sparse_clause(args)
         {
+            // moon#695: a bare `*` on a VECTOR-only index has no inverted index
+            // to answer it, and the text engine would report `ERR no such index`
+            // for an index that plainly exists. Gate ahead of it. This is the
+            // per-shard executor, so this arm is ALSO what lets a scattered
+            // match-all be answered on every remote shard.
+            if let Some(reply) =
+                vector_search::try_match_all_vector_only(text_store, vector_store, args, db_index)
+            {
+                return reply;
+            }
             return vector_search::ft_text_search(text_store, args, db_index);
         }
         // Existing vector search path (KNN / SPARSE / hybrid).
