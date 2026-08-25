@@ -366,7 +366,7 @@ fn used_memory_stays_bounded_at_steady_state_and_after_restart() {
     child.kill_now();
     common::wait_for_port_down(port);
 
-    let mut child2 = (start_moon_alive(port, &dir));
+    let mut child2 = start_moon_alive(port, &dir);
 
     // Sample immediately (and for a few seconds after) -- BEFORE issuing any
     // GET against the recovered keys, so nothing gets lazily promoted into

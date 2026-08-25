@@ -27,12 +27,12 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::Duration;
 use std::{fs, thread};
 
 /// Start moon with fault-injected AOF fsync failure. Returns (child, dir).
-fn spawn_moon_with_fsync_fail(port: u16, shards: u16) -> (Child, PathBuf) {
+fn spawn_moon_with_fsync_fail(port: u16, shards: u16) -> (common::ServerGuard, PathBuf) {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -68,7 +68,7 @@ fn spawn_moon_with_fsync_fail(port: u16, shards: u16) -> (Child, PathBuf) {
         .spawn()
         .expect("spawn moon — run `cargo build --release` first");
 
-    (child, dir)
+    (common::ServerGuard::new(child), dir)
 }
 
 /// Wait until the port is accepting connections, or panic after timeout.
@@ -148,8 +148,7 @@ fn assert_aof_fsync_err_before_subscribe_ok(port: u16, shards: u16) {
         );
     });
 
-    child.kill().ok();
-    child.wait().ok();
+    child.kill_now();
     fs::remove_dir_all(&dir).ok();
 
     if let Err(e) = result {

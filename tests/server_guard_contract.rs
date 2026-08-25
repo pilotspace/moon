@@ -112,7 +112,10 @@ fn sg3_taking_the_child_transfers_ownership() {
     let mut child = guard.take().expect("the child is present");
     drop(guard); // must NOT kill — ownership moved
 
-    assert!(is_alive(pid), "taking the child must transfer ownership, not reap");
+    assert!(
+        is_alive(pid),
+        "taking the child must transfer ownership, not reap"
+    );
     common::sigkill(&mut child);
     assert!(!is_alive(pid), "and the new owner can still reap it");
 }

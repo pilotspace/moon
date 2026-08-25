@@ -7,6 +7,8 @@
 //! Requires the `moon` binary to be built (`cargo build --release`).
 //! Marked `#[ignore]` because it depends on an external server binary.
 
+mod common;
+
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -44,7 +46,7 @@ fn find_moon_binary() -> String {
 }
 
 /// Start a Moon server on the given port with AOF appendfsync=always.
-fn start_server(port: u16, data_dir: &str) -> Child {
+fn start_server(port: u16, data_dir: &str) -> common::ServerGuard {
     let binary = find_moon_binary();
     let mut child = Command::new(&binary)
         .args([
@@ -95,7 +97,7 @@ fn start_server(port: u16, data_dir: &str) -> Child {
         thread::sleep(Duration::from_millis(100));
     }
 
-    child
+    common::ServerGuard::new(child)
 }
 
 /// SIGKILL the server process.
@@ -271,7 +273,7 @@ fn jepsen_lite_crash_recovery() {
 
         // SIGKILL the server (simulating crash).
         eprintln!("  SIGKILLing server...");
-        kill_server(&mut server);
+        kill_server(server.as_mut());
 
         // Signal writers to stop (they'll likely already be stopped due to broken pipe).
         stop.store(true, Ordering::Relaxed);
@@ -312,8 +314,7 @@ fn jepsen_lite_crash_recovery() {
     );
 
     // Graceful shutdown.
-    let _ = server.kill();
-    let _ = server.wait();
+    server.kill_now();
 
     eprintln!(
         "Jepsen-lite PASSED: {} keys verified, {} missing (ACK-lost), 0 violations across {} cycles",

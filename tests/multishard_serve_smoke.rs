@@ -29,7 +29,7 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 fn moon_binary() -> std::path::PathBuf {

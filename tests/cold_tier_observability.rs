@@ -33,7 +33,7 @@
 mod common;
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const MAXMEMORY_BYTES: usize = 8 * 1024 * 1024;
@@ -68,76 +68,80 @@ fn unique_dir(suffix: &str) -> std::path::PathBuf {
     ))
 }
 
-fn start_moon_no_offload(port: u16, dir: &std::path::Path) -> Child {
-    Command::new(common::find_moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--shards",
-            "1",
-            "--admin-port",
-            "0",
-            // Explicit: `--disk-offload` DEFAULTS to "enable", so omitting it
-            // would leave the tier on and this test would assert nothing.
-            "--disk-offload",
-            "disable",
-            "--disk-free-min-pct",
-            "0",
-            "--dir",
-        ])
-        .arg(dir)
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon (run `cargo build --release` first)")
+fn start_moon_no_offload(port: u16, dir: &std::path::Path) -> common::ServerGuard {
+    common::ServerGuard::new(
+        Command::new(common::find_moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--shards",
+                "1",
+                "--admin-port",
+                "0",
+                // Explicit: `--disk-offload` DEFAULTS to "enable", so omitting it
+                // would leave the tier on and this test would assert nothing.
+                "--disk-offload",
+                "disable",
+                "--disk-free-min-pct",
+                "0",
+                "--dir",
+            ])
+            .arg(dir)
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon (run `cargo build --release` first)"),
+    )
 }
 
-fn start_moon(port: u16, dir: &std::path::Path) -> Child {
+fn start_moon(port: u16, dir: &std::path::Path) -> common::ServerGuard {
     let off_dir = dir.join("off");
     std::fs::create_dir_all(&off_dir).expect("create off dir");
-    Command::new(common::find_moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--shards",
-            &SHARDS.to_string(),
-            "--admin-port",
-            "0",
-            "--maxmemory",
-            &MAXMEMORY_BYTES.to_string(),
-            "--maxmemory-policy",
-            "allkeys-lru",
-            "--disk-offload",
-            "enable",
-            "--disk-offload-dir",
-            off_dir.to_str().expect("off dir utf8"),
-            // Without a durability backstop `disk_offload_spill_inert` makes
-            // eviction plain-drop victims instead of spilling them, and this
-            // test would measure an empty cold tier and pass vacuously.
-            "--appendonly",
-            "yes",
-            "--disk-free-min-pct",
-            "0",
-            "--cold-orphan-sweep-interval-secs",
-            &SWEEP_SECS.to_string(),
-            "--dir",
-        ])
-        .arg(dir)
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
-        .spawn()
-        .expect("spawn moon (run `cargo build --release` first)")
+    common::ServerGuard::new(
+        Command::new(common::find_moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--shards",
+                &SHARDS.to_string(),
+                "--admin-port",
+                "0",
+                "--maxmemory",
+                &MAXMEMORY_BYTES.to_string(),
+                "--maxmemory-policy",
+                "allkeys-lru",
+                "--disk-offload",
+                "enable",
+                "--disk-offload-dir",
+                off_dir.to_str().expect("off dir utf8"),
+                // Without a durability backstop `disk_offload_spill_inert` makes
+                // eviction plain-drop victims instead of spilling them, and this
+                // test would measure an empty cold tier and pass vacuously.
+                "--appendonly",
+                "yes",
+                "--disk-free-min-pct",
+                "0",
+                "--cold-orphan-sweep-interval-secs",
+                &SWEEP_SECS.to_string(),
+                "--dir",
+            ])
+            .arg(dir)
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+            .spawn()
+            .expect("spawn moon (run `cargo build --release` first)"),
+    )
 }
 
 const RESTART_ATTEMPTS: usize = 6;
 
-fn start_moon_alive(port: u16, dir: &std::path::Path) -> Child {
+fn start_moon_alive(port: u16, dir: &std::path::Path) -> common::ServerGuard {
     for attempt in 1..=RESTART_ATTEMPTS {
         let mut child = start_moon(port, dir);
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut up = false;
         while Instant::now() < deadline {
-            if let Ok(Some(_status)) = child.try_wait() {
+            if let Ok(Some(_status)) = child.as_mut().try_wait() {
                 break;
             }
             if redis_cli(port, &["PING"]).as_deref() == Some("PONG") {
@@ -149,8 +153,7 @@ fn start_moon_alive(port: u16, dir: &std::path::Path) -> Child {
         if up {
             return child;
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill_now();
         if attempt < RESTART_ATTEMPTS {
             std::thread::sleep(Duration::from_millis(300));
         }
@@ -437,8 +440,7 @@ fn info_moonstore_reports_the_cold_tier_against_on_disk_ground_truth() {
         );
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -497,7 +499,6 @@ fn cold_fields_are_absent_not_zero_when_disk_offload_is_off() {
         );
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
     let _ = std::fs::remove_dir_all(&dir);
 }

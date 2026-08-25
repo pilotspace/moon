@@ -87,7 +87,7 @@ mod common;
 
 use std::collections::HashSet;
 use std::io::Write;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use moon::persistence::kv_page::read_datafile;
@@ -125,37 +125,43 @@ fn unique_dir(suffix: &str) -> std::path::PathBuf {
     ))
 }
 
-fn start_moon(port: u16, dir: &std::path::Path) -> Child {
+fn start_moon(port: u16, dir: &std::path::Path) -> common::ServerGuard {
     let off_dir = dir.join("off");
     std::fs::create_dir_all(&off_dir).expect("create off dir");
-    Command::new(common::find_moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--shards",
-            &SHARDS.to_string(),
-            "--maxmemory",
-            &MAXMEMORY_BYTES.to_string(),
-            "--maxmemory-policy",
-            "allkeys-lru",
-            "--disk-offload",
-            "enable",
-            "--disk-offload-dir",
-            off_dir.to_str().expect("off dir utf8"),
-            // The bug under test: NO AOF. Cold recovery must work anyway.
-            "--appendonly",
-            "no",
-            "--cold-orphan-sweep-interval-secs",
-            "60",
-            "--dir",
-        ])
-        .arg(dir)
-        // Captured to a log file so a CI flake produces a real diagnostic
-        // (see feedback_silenced_child_stdio_flake — never Stdio::null()).
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("create moon stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("create moon stderr log"))
-        .spawn()
-        .expect("spawn moon (run `cargo build --release` with default features first)")
+    common::ServerGuard::new(
+        Command::new(common::find_moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--shards",
+                &SHARDS.to_string(),
+                "--maxmemory",
+                &MAXMEMORY_BYTES.to_string(),
+                "--maxmemory-policy",
+                "allkeys-lru",
+                "--disk-offload",
+                "enable",
+                "--disk-offload-dir",
+                off_dir.to_str().expect("off dir utf8"),
+                // The bug under test: NO AOF. Cold recovery must work anyway.
+                "--appendonly",
+                "no",
+                "--cold-orphan-sweep-interval-secs",
+                "60",
+                "--dir",
+            ])
+            .arg(dir)
+            // Captured to a log file so a CI flake produces a real diagnostic
+            // (see feedback_silenced_child_stdio_flake — never Stdio::null()).
+            .stdout(
+                std::fs::File::create(dir.join("moon.stdout.log")).expect("create moon stdout log"),
+            )
+            .stderr(
+                std::fs::File::create(dir.join("moon.stderr.log")).expect("create moon stderr log"),
+            )
+            .spawn()
+            .expect("spawn moon (run `cargo build --release` with default features first)"),
+    )
 }
 
 fn wait_for_port(port: u16) {
@@ -224,14 +230,14 @@ const RESTART_ATTEMPTS: usize = 6;
 /// Retries if the freshly-spawned server self-terminates on a transient rebind
 /// EADDRINUSE (see `RESTART_ATTEMPTS`). Panics only if every attempt fails to
 /// come up — that would be a real start failure, not the benign rebind race.
-fn start_moon_alive(port: u16, dir: &std::path::Path) -> Child {
+fn start_moon_alive(port: u16, dir: &std::path::Path) -> common::ServerGuard {
     for attempt in 1..=RESTART_ATTEMPTS {
         let mut child = start_moon(port, dir);
         let mut up = false;
         // Poll up to ~8s for the server to either accept or self-terminate.
         for _ in 0..80 {
             // Did the server exit on its own (rebind EADDRINUSE self-shutdown)?
-            if let Ok(Some(_status)) = child.try_wait() {
+            if let Ok(Some(_status)) = child.as_mut().try_wait() {
                 break; // self-terminated — fall through to retry
             }
             if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
@@ -246,8 +252,7 @@ fn start_moon_alive(port: u16, dir: &std::path::Path) -> Child {
         }
         // Reap (no-op if already self-terminated) and back off so the kernel
         // finishes releasing the port before the next rebind attempt.
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill_now();
         if attempt < RESTART_ATTEMPTS {
             std::thread::sleep(Duration::from_millis(300));
         }
@@ -440,21 +445,6 @@ fn count_durable_probe_entries(dir: &std::path::Path) -> usize {
     probe_keys.len()
 }
 
-#[cfg(unix)]
-fn sigkill(child: &mut Child) {
-    let pid = child.id() as i32;
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-    }
-    let _ = child.wait();
-}
-
-#[cfg(not(unix))]
-fn sigkill(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 /// #22: cold keys spilled under `--appendonly no --disk-offload enable` must
 /// recover after a SIGKILL crash via the per-shard manifest (no AOF).
 #[test]
@@ -492,7 +482,7 @@ fn cold_keys_recover_after_crash_without_aof() {
     let durable_probes = count_durable_probe_entries(&dir);
 
     // SIGKILL — hard crash, no graceful drain.
-    sigkill(&mut child);
+    child.kill_now();
     // Wait until round 1 is fully down (port no longer accepting) before
     // restarting on it — otherwise round 2 races round 1's SO_REUSEPORT listener
     // teardown and the probes read round 1's empty post-eviction hot tier as 0
@@ -511,7 +501,7 @@ fn cold_keys_recover_after_crash_without_aof() {
 
     let post = count_probes_readable(port);
 
-    sigkill(&mut child2);
+    child2.kill_now();
 
     eprintln!(
         "cold_keys_recover_after_crash_without_aof: heap_files={} durable_probes(ground truth)={} \

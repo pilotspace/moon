@@ -277,23 +277,6 @@ fn redis_llen(port: u16, key: &str) -> i64 {
 
 /// SIGKILL via `kill -9` (Child::kill on Unix already sends SIGKILL but
 /// being explicit here documents intent and survives stdlib changes).
-#[cfg(unix)]
-fn sigkill(child: &mut Child) {
-    let pid = child.id() as i32;
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-    }
-    // Wait for the kernel to reap the process so its file handles are
-    // released and the next spawn can lock the AOF files.
-    let _ = child.wait();
-}
-
-#[cfg(not(unix))]
-fn sigkill(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 #[test]
 #[ignore] // Requires built release binary + redis-cli; run explicitly.
 fn crash_01_lite_per_shard_aof_recovers_after_sigkill() {
@@ -384,7 +367,8 @@ fn crash_01_lite_always_per_shard_aof_recovers_after_sigkill() {
     std::fs::create_dir_all(&dir).expect("create test dir");
 
     // -- Round 1 --------------------------------------------------------
-    let (mut child, port) = common::spawn_listening_guarded(|p| start_moon_with_fsync(p, &dir, "always"));
+    let (mut child, port) =
+        common::spawn_listening_guarded(|p| start_moon_with_fsync(p, &dir, "always"));
 
     let mut expected: std::collections::HashMap<String, String> =
         std::collections::HashMap::with_capacity(KEY_COUNT);
@@ -556,7 +540,8 @@ fn crash_133_swapdb_multishard_durability_after_sigkill() {
     std::fs::create_dir_all(&dir).expect("create test dir");
 
     // -- Round 1 --------------------------------------------------------
-    let (mut child, port) = common::spawn_listening_guarded(|p| start_moon_with_fsync(p, &dir, "always"));
+    let (mut child, port) =
+        common::spawn_listening_guarded(|p| start_moon_with_fsync(p, &dir, "always"));
 
     // `{a}` and `{b}` hash-tag to different shards (CRC16 mod 2) — writing
     // both in db0 and db1 guarantees the pre-swap content spans both

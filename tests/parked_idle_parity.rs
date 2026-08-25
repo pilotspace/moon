@@ -449,8 +449,9 @@ fn partial_frame_survives_a_park() {
 #[test]
 fn unauthenticated_conn_never_task_parks() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, port) =
-        common::spawn_listening_guarded(|p| spawn_moon_with(dir.path(), p, &["--requirepass", "park-f6"]));
+    let (mut child, port) = common::spawn_listening_guarded(|p| {
+        spawn_moon_with(dir.path(), p, &["--requirepass", "park-f6"])
+    });
 
     // Positive control: authenticated, then idle past the park threshold.
     let mut authed = connect_retry(port);

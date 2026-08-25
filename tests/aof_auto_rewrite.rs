@@ -71,7 +71,11 @@ fn start_moon(port: u16, dir: &std::path::Path, shards: usize, extra: &[&str]) -
         .expect("spawn moon (cargo build first; MOON_BIN to override)")
 }
 
-fn spawn_listening(dir: &std::path::Path, shards: usize, extra: &[&str]) -> (common::ServerGuard, u16) {
+fn spawn_listening(
+    dir: &std::path::Path,
+    shards: usize,
+    extra: &[&str],
+) -> (common::ServerGuard, u16) {
     common::spawn_listening_guarded(|port| start_moon(port, dir, shards, extra))
 }
 
@@ -94,16 +98,6 @@ fn incr(port: u16, key: &str) -> i64 {
     reply.parse().unwrap_or_else(|_| {
         panic!("INCR {key} not acked with a number — harness cannot count it: {reply:?}")
     })
-}
-
-fn sigkill(child: &mut Child) {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(child.id() as i32, libc::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// True when a base RDB with seq > `min_seq_exclusive` exists anywhere under

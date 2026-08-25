@@ -186,7 +186,8 @@ fn tls_idle_connection_serves_all_traffic_after_downshift() {
         return;
     }
     let tls_port = common::reserve_port();
-    let (mut child, _port) = common::spawn_listening_guarded(|p| spawn_moon_tls(dir.path(), p, tls_port));
+    let (mut child, _port) =
+        common::spawn_listening_guarded(|p| spawn_moon_tls(dir.path(), p, tls_port));
     // spawn_listening waits on the plain port; give the TLS listener a
     // moment if it comes up second.
     let mut conn = None;
