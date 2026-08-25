@@ -63,7 +63,7 @@ fn ping(stream: &mut TcpStream) {
 #[test]
 fn idle_connection_serves_all_traffic_after_downshift() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
+    let (mut child, port) = common::spawn_listening_guarded(|p| spawn_moon(dir.path(), p));
 
     let mut conn = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     conn.set_nodelay(true).ok();
@@ -109,8 +109,7 @@ fn idle_connection_serves_all_traffic_after_downshift() {
         "4 KiB value must survive the downshifted round trip"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
 }
 
 /// An active connection must be completely unaffected while an idle sibling
@@ -118,7 +117,7 @@ fn idle_connection_serves_all_traffic_after_downshift() {
 #[test]
 fn active_sibling_is_undisturbed_by_idle_downshift() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
+    let (mut child, port) = common::spawn_listening_guarded(|p| spawn_moon(dir.path(), p));
 
     let mut idle = TcpStream::connect(("127.0.0.1", port)).expect("connect idle");
     ping(&mut idle);
@@ -140,6 +139,5 @@ fn active_sibling_is_undisturbed_by_idle_downshift() {
     // The downshifted idle sibling still answers.
     ping(&mut idle);
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
 }

@@ -140,13 +140,13 @@ const RESTART_ATTEMPTS: usize = 6;
 /// Start moon and return a child that is alive AND accepting PING, retrying
 /// on a transient rebind EADDRINUSE self-termination (see
 /// tests/crash_recovery_disk_offload_no_aof.rs for the same pattern).
-fn start_moon_alive(port: u16, dir: &std::path::Path) -> Child {
+fn start_moon_alive(port: u16, dir: &std::path::Path) -> common::ServerGuard {
     for attempt in 1..=RESTART_ATTEMPTS {
-        let mut child = start_moon(port, dir);
+        let mut child = common::ServerGuard::new(start_moon(port, dir));
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut up = false;
         while Instant::now() < deadline {
-            if let Ok(Some(_status)) = child.try_wait() {
+            if let Ok(Some(_status)) = child.as_mut().try_wait() {
                 break; // self-terminated -- fall through to retry
             }
             if redis_cli(port, &["PING"]).as_deref() == Some("PONG") {
@@ -158,8 +158,7 @@ fn start_moon_alive(port: u16, dir: &std::path::Path) -> Child {
         if up {
             return child;
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill_now();
         if attempt < RESTART_ATTEMPTS {
             std::thread::sleep(Duration::from_millis(300));
         }
@@ -325,7 +324,7 @@ fn used_memory_stays_bounded_at_steady_state_and_after_restart() {
     let bound = (MAXMEMORY_BYTES as f64 * TRUTHFUL_MULTIPLE) as u64;
 
     // -- Round 1: populate past the cap, force real disk spill -----------
-    let (mut child, port) = common::spawn_listening(|p| start_moon(p, &dir));
+    let (mut child, port) = common::spawn_listening_guarded(|p| start_moon(p, &dir));
     wait_for_ping(port, Duration::from_secs(10));
 
     write_filler(port);
@@ -364,10 +363,10 @@ fn used_memory_stays_bounded_at_steady_state_and_after_restart() {
     );
 
     // -- SIGKILL + restart on the SAME dir/port ---------------------------
-    common::sigkill(&mut child);
+    child.kill_now();
     common::wait_for_port_down(port);
 
-    let mut child2 = start_moon_alive(port, &dir);
+    let mut child2 = (start_moon_alive(port, &dir));
 
     // Sample immediately (and for a few seconds after) -- BEFORE issuing any
     // GET against the recovered keys, so nothing gets lazily promoted into
@@ -386,7 +385,7 @@ fn used_memory_stays_bounded_at_steady_state_and_after_restart() {
         post_restart_last.0, post_restart_last.1
     );
 
-    common::sigkill(&mut child2);
+    child2.kill_now();
 
     assert!(
         !post_restart.is_empty(),

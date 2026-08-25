@@ -302,7 +302,7 @@ fn crash_01_lite_per_shard_aof_recovers_after_sigkill() {
     std::fs::create_dir_all(&dir).expect("create test dir");
 
     // -- Round 1 --------------------------------------------------------
-    let (mut child, port) = common::spawn_listening(|p| start_moon(p, &dir));
+    let (mut child, port) = common::spawn_listening_guarded(|p| start_moon(p, &dir));
 
     // Write KEY_COUNT keys. Use hash tags to deterministically spread
     // across both shards (half on each) — confirms per-shard files are
@@ -324,10 +324,10 @@ fn crash_01_lite_per_shard_aof_recovers_after_sigkill() {
 
     // SIGKILL — no graceful shutdown, no chance for in-flight buffers
     // to drain.
-    sigkill(&mut child);
+    child.kill_now();
 
     // -- Round 2 (recovery) ---------------------------------------------
-    let mut child2 = start_moon(port, &dir);
+    let mut child2 = common::ServerGuard::new(start_moon(port, &dir));
     wait_for_port(port);
 
     // Verify every key recovered. The everysec contract permits up to 1s
@@ -346,7 +346,7 @@ fn crash_01_lite_per_shard_aof_recovers_after_sigkill() {
 
     // Cleanup before any failure assertion so the temp dir isn't leaked
     // when the assertion fires.
-    sigkill(&mut child2);
+    child2.kill_now();
 
     assert!(
         missing.is_empty() && mismatched.is_empty(),
@@ -384,7 +384,7 @@ fn crash_01_lite_always_per_shard_aof_recovers_after_sigkill() {
     std::fs::create_dir_all(&dir).expect("create test dir");
 
     // -- Round 1 --------------------------------------------------------
-    let (mut child, port) = common::spawn_listening(|p| start_moon_with_fsync(p, &dir, "always"));
+    let (mut child, port) = common::spawn_listening_guarded(|p| start_moon_with_fsync(p, &dir, "always"));
 
     let mut expected: std::collections::HashMap<String, String> =
         std::collections::HashMap::with_capacity(KEY_COUNT);
@@ -398,10 +398,10 @@ fn crash_01_lite_always_per_shard_aof_recovers_after_sigkill() {
     }
 
     // NO quiescing sleep — H1 contract is that each +OK already saw fsync.
-    sigkill(&mut child);
+    child.kill_now();
 
     // -- Round 2 (recovery) ---------------------------------------------
-    let mut child2 = start_moon_with_fsync(port, &dir, "always");
+    let mut child2 = common::ServerGuard::new(start_moon_with_fsync(port, &dir, "always"));
     wait_for_port(port);
 
     let mut missing: Vec<String> = Vec::new();
@@ -416,7 +416,7 @@ fn crash_01_lite_always_per_shard_aof_recovers_after_sigkill() {
         }
     }
 
-    sigkill(&mut child2);
+    child2.kill_now();
 
     assert!(
         missing.is_empty() && mismatched.is_empty(),
@@ -466,7 +466,7 @@ fn pipeline_batch_no_double_write_after_crash_recovery() {
     std::fs::create_dir_all(&dir).expect("create test dir");
 
     // -- Round 1 --------------------------------------------------------
-    let (mut child, port) = common::spawn_listening(|p| start_moon(p, &dir));
+    let (mut child, port) = common::spawn_listening_guarded(|p| start_moon(p, &dir));
 
     // Pipeline N RPUSHes to list{a} (→ shard 1) and N to list{b} (→ shard 0)
     // in two separate pipelined bursts.  Each list should end up with exactly
@@ -477,16 +477,16 @@ fn pipeline_batch_no_double_write_after_crash_recovery() {
     // Wait > 1s so the everysec fsync window flushed all entries.
     std::thread::sleep(Duration::from_millis(1500));
 
-    sigkill(&mut child);
+    child.kill_now();
 
     // -- Round 2 (recovery) ---------------------------------------------
-    let mut child2 = start_moon(port, &dir);
+    let mut child2 = common::ServerGuard::new(start_moon(port, &dir));
     wait_for_port(port);
 
     let llen_a = redis_llen(port, "list{a}");
     let llen_b = redis_llen(port, "list{b}");
 
-    sigkill(&mut child2);
+    child2.kill_now();
 
     // Failure message identifies which list was doubled and the expected count
     // so the root cause is unambiguous in CI output.
@@ -556,7 +556,7 @@ fn crash_133_swapdb_multishard_durability_after_sigkill() {
     std::fs::create_dir_all(&dir).expect("create test dir");
 
     // -- Round 1 --------------------------------------------------------
-    let (mut child, port) = common::spawn_listening(|p| start_moon_with_fsync(p, &dir, "always"));
+    let (mut child, port) = common::spawn_listening_guarded(|p| start_moon_with_fsync(p, &dir, "always"));
 
     // `{a}` and `{b}` hash-tag to different shards (CRC16 mod 2) — writing
     // both in db0 and db1 guarantees the pre-swap content spans both
@@ -575,10 +575,10 @@ fn crash_133_swapdb_multishard_durability_after_sigkill() {
 
     // NO quiescing sleep — appendfsync=always means the +OK we just saw
     // MUST already be durable on disk for every shard.
-    sigkill(&mut child);
+    child.kill_now();
 
     // -- Round 2 (recovery) ---------------------------------------------
-    let mut child2 = start_moon_with_fsync(port, &dir, "always");
+    let mut child2 = common::ServerGuard::new(start_moon_with_fsync(port, &dir, "always"));
     wait_for_port(port);
 
     let got_db0_a = redis_get_db(port, 0, "swap:{a}");
@@ -586,7 +586,7 @@ fn crash_133_swapdb_multishard_durability_after_sigkill() {
     let got_db1_a = redis_get_db(port, 1, "swap:{a}");
     let got_db1_b = redis_get_db(port, 1, "swap:{b}");
 
-    sigkill(&mut child2);
+    child2.kill_now();
 
     let mut failures: Vec<String> = Vec::new();
     if got_db0_a.as_deref() != Some("db1-a") {

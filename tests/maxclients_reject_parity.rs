@@ -62,7 +62,7 @@ fn acquire_slot(port: u16) -> TcpStream {
 #[test]
 fn rejected_connection_receives_err_max_clients() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p, 1));
+    let (mut child, port) = common::spawn_listening_guarded(|p| spawn_moon(dir.path(), p, 1));
 
     // Conn A takes the single slot and must be fully served.
     let mut conn_a = acquire_slot(port);
@@ -99,13 +99,13 @@ fn rejected_connection_receives_err_max_clients() {
     );
 
     drop(conn_a);
-    common::sigkill(&mut child);
+    child.kill_now();
 }
 
 #[test]
 fn slot_frees_on_disconnect() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p, 1));
+    let (mut child, port) = common::spawn_listening_guarded(|p| spawn_moon(dir.path(), p, 1));
 
     let conn_a = acquire_slot(port);
     drop(conn_a);
@@ -123,5 +123,5 @@ fn slot_frees_on_disconnect() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    common::sigkill(&mut child);
+    child.kill_now();
 }
