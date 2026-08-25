@@ -830,17 +830,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // (measured: 5 of 12 connections lost an MGET's own batch writes).
                     // Treating every shard as pending makes the predicate answer
                     // exactly as it did before the mask existed.
-                    let effective_pending = if conn.workspace_id.is_some() {
-                        u64::MAX
-                    } else {
-                        pending_mask
-                    };
                     if pending_mask != 0
                         && crate::server::conn::shared::must_wait_for_pending_remote(
                             cmd,
                             cmd_args,
                             ctx.num_shards,
-                            effective_pending,
+                            pending_mask,
+                            conn.workspace_id.is_some(),
                         )
                     {
                         batch[frame_idx - 1] = frame;
@@ -1892,7 +1888,27 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- Multi-key commands ---
-                    if is_multi_key_command(cmd, cmd_args) {
+                    // moon#513 (A1): when ONE shard owns every key, this branch
+                    // stands aside and ordinary routing slots the command into
+                    // that shard's batch instead of executing it inline.
+                    // `extract_primary_key` hashes its first key, which names
+                    // that same owner, so the routing decision cannot disagree
+                    // with this one. A LOCAL owner stays on the coordinator: it
+                    // is already correct there, and `remote_groups` never holds
+                    // the local shard, so nothing is gained.
+                    //
+                    // Paired with the `count_ones() == 1` arm of
+                    // `must_wait_for_pending_remote` — that arm skips the wait
+                    // BECAUSE this branch stands aside and the command is
+                    // slotted.
+                    if is_multi_key_command(cmd, cmd_args)
+                        && !crate::server::conn::shared::single_owner_shard(
+                            cmd,
+                            cmd_args,
+                            ctx.num_shards,
+                        )
+                        .is_some_and(|owner| owner != ctx.shard_id)
+                    {
                         let mut local_barrier_pending = false;
                         let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, ctx.aof_pool.as_ref(), &ctx.repl_state, &mut local_barrier_pending, &()).await;
                         // Only successful writes join the barrier set — an error

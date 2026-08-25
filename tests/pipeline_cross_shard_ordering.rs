@@ -852,3 +852,135 @@ fn pco0_reply_framer_counts_top_level_replies() {
     assert_eq!(framed_len(b"+OK\r\n", 2), None);
     assert_eq!(framed_len(b"", 1), None);
 }
+
+/// moon#513 (A1): a multi-key command whose keys ALL live on one shard must
+/// join the slotted batch instead of cutting it.
+///
+/// [`pco13_disjoint_shard_multikey_does_not_cut_the_batch`] relaxed the guard
+/// for a multi-key command that reads shards the batch has nothing pending for.
+/// It deliberately left the CO-LOCATED case alone — an `MGET` reading the very
+/// shard the pending writes are going to — because the coordinator ran such a
+/// command INLINE, and waving it through while it still executed inline is
+/// exactly moon#507.
+///
+/// The fix is not to relax the guard further but to change where the command
+/// runs: a multi-key command whose key mask has exactly ONE bit has a single
+/// owner shard, so it can be appended to `remote_groups[owner]` like a
+/// single-key command. Ordering then comes from the slotted batch itself — the
+/// same property that has always made `SET k` + `GET k` correct — and the wait
+/// is genuinely unnecessary rather than merely skipped.
+///
+/// This is the shape `CLAUDE.md` tells users to adopt (`{tag}` co-location),
+/// so it is the shape most likely to be in a hot pipeline.
+///
+/// # Why the control leg is here
+///
+/// The connection lands on whichever shard `SO_REUSEPORT` gives it. A subject
+/// leg that measured zero because its shard happened to be LOCAL would prove
+/// nothing, so the subject runs once per shard — at `--shards 4` at least three
+/// of the four are foreign whatever the connection got — and a control leg
+/// using a SHARD-SPANNING read asserts the counter is reachable on this same
+/// harness. A green subject means something only because the control is
+/// non-zero.
+#[test]
+fn pco15_single_owner_multikey_joins_the_slotted_batch() {
+    fn defers(port: u16) -> u64 {
+        let mut c = Conn::open(port);
+        let info = c.send(&["INFO", "stats"]);
+        info.split("\r\n")
+            .find_map(|l| l.strip_prefix("total_pipeline_remote_defer:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| {
+                panic!("INFO stats has no total_pipeline_remote_defer field: {info:?}")
+            })
+    }
+
+    let shards: usize = SHARDS.parse().expect("SHARDS is a number");
+    let owner = |k: &String| moon::shard::dispatch::key_to_shard(k.as_bytes(), shards);
+    // `n` distinct keys that all hash to shard `s`. Probed, never assumed — a
+    // pair that silently landed on two shards would make the subject leg a
+    // re-run of pco13 rather than the co-located case.
+    let on = |prefix: &str, s: usize, n: usize| -> Vec<String> {
+        let keys: Vec<String> = (0..)
+            .map(|i| format!("{prefix}{s}:{i}"))
+            .filter(|k| owner(k) == s)
+            .take(n)
+            .collect();
+        assert_eq!(keys.len(), n, "could not find {n} keys on shard {s}");
+        keys
+    };
+
+    let m = spawn_moon(SHARDS);
+
+    // 32 interleavings of: write both keys, then read both in one MGET.
+    let run = |read: &[String], write: &[String]| -> (u64, Vec<String>) {
+        let base = defers(m.port);
+        let mut c = Conn::open(m.port);
+        let mut wrong = Vec::new();
+        for i in 0..32 {
+            let r = c.pipeline(&[
+                &["SET", &write[0], "1"],
+                &["SET", &write[1], "2"],
+                &["MGET", &read[0], &read[1]],
+            ]);
+            if framed_len(r.as_bytes(), 3).is_none() {
+                wrong.push(format!("  i={i}: expected 3 framed replies, got {r:?}"));
+            }
+        }
+        drop(c);
+        (defers(m.port) - base, wrong)
+    };
+
+    // --- control: a read SPANNING two shards still cuts, so the counter is live ---
+    let span_w = [on("pco15cw", 0, 1).remove(0), on("pco15cw", 1, 1).remove(0)];
+    let (control_defers, control_wrong) = run(&span_w, &span_w);
+    assert!(control_wrong.is_empty(), "{}", control_wrong.join("\n"));
+    assert!(
+        control_defers > 0,
+        "a two-shard MGET interleaved between writes to those same two shards \
+         must still cut the batch — A1 only claims the SINGLE-owner case. Zero \
+         here means the counter is not reachable on this harness and every \
+         subject leg below would pass vacuously"
+    );
+
+    // --- subject: one leg per shard, all keys co-located on that shard ---
+    let mut cut: Vec<String> = Vec::new();
+    for s in 0..shards {
+        let keys = on("pco15s", s, 2);
+        let (d, wrong) = run(&keys, &keys);
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        if d != 0 {
+            cut.push(format!("  shard {s}: {d} deferrals over 32 interleavings"));
+        }
+    }
+    assert!(
+        cut.is_empty(),
+        "every key in these batches lives on ONE shard, so the MGET has a single \
+         owner and belongs in that shard's slotted batch — appended BEHIND the \
+         pending writes, which is what makes it correct without a cut. Instead \
+         it cut the batch, each cut a full phase-2b drain cycle (control leg \
+         measured {control_defers} on this same harness, so the guard is \
+         reachable):\n{}",
+        cut.join("\n")
+    );
+
+    // --- the relaxation must not cost the ordering guarantee it replaces ---
+    // Read the keys this batch just wrote, on every shard, and demand the acked
+    // values. This is the moon#507 claim itself: slotting is only a valid reason
+    // to skip the wait if the slotted command really does observe the batch.
+    for s in 0..shards {
+        let keys = on("pco15v", s, 2);
+        let mut c = Conn::open(m.port);
+        let r = c.pipeline(&[
+            &["SET", &keys[0], "11"],
+            &["SET", &keys[1], "22"],
+            &["MGET", &keys[0], &keys[1]],
+        ]);
+        assert!(
+            r.contains("$2\r\n11\r\n") && r.contains("$2\r\n22\r\n"),
+            "shard {s}: a single-owner MGET must observe the writes that acked \
+             before it in its own batch — if slotting lost that, A1 has traded \
+             moon#507 back for throughput: {r:?}"
+        );
+    }
+}

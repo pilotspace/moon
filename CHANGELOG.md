@@ -6,6 +6,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **A multi-key command whose keys all live on one shard now joins the slotted batch instead of cutting it (moon#513).**
+
+  moon#512 made a pipelined command that does not route by its own single key wait for the
+  batch's already-deferred remote commands, because such a command executed INLINE while
+  earlier writes in the same batch were still undispatched — silent write loss, not a stale
+  read. moon#513's mask refinement then stopped the cut when the command's keys avoid every
+  pending shard. The CO-LOCATED case was deliberately left alone: an `MGET` reading the very
+  shard the pending writes are going to genuinely could not be waved through while it still
+  ran inline.
+
+  The fix is not a further relaxation of the guard but a change to where the command runs. A
+  multi-key command whose key mask has exactly one bit has a single owner shard, so the
+  multi-key coordinator now stands aside and ordinary routing appends it to
+  `remote_groups[owner]` like a single-key command. `extract_primary_key` hashes its first
+  key, which by definition names that same owner, so the two decisions cannot disagree.
+  Ordering then comes from the slotted batch itself — the property that has always made
+  `SET k` + `GET k` correct — so the wait is discharged rather than skipped.
+
+  This is the shape `CLAUDE.md` tells users to adopt (`{tag}` co-location), so it is the shape
+  most likely to sit in a hot pipeline. Measured at `--shards 4`, a co-located `MGET`
+  interleaved between co-located writes cut the batch 32 times in 32 interleavings on every
+  foreign shard, each cut a full phase-2b drain cycle.
+
+  A key set that genuinely spans shards is unchanged: it is still consumed inline by the
+  coordinator and still waits when it meets a pending shard.
+
+  The workspace exemption is now an explicit parameter rather than a `u64::MAX` sentinel
+  passed through `pending`. A workspace connection rewrites every key to a `{<32-hex>}:` hash
+  TAG *after* the guard runs, so raw names read at the guard hash to shards the command will
+  never touch — and a single-owner mask read off them would be the most confident wrong answer
+  available. Making it a parameter means the compiler names every call site when a new
+  mask-based relaxation is added, instead of the relaxation silently escaping the sentinel.
+
 ### Fixed
 - **`mq_integration` no longer races its own server on port or on startup.**
 

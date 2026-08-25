@@ -1670,6 +1670,15 @@ pub(crate) fn must_wait_for_pending_remote(
     args: &[Frame],
     num_shards: usize,
     pending: u64,
+    // moon#513: true when the caller will REWRITE this command's keys after
+    // the guard runs — a workspace connection prefixes every key with
+    // `{<32-hex>}:`, a hash TAG, so the raw names visible here hash to shards
+    // the command will never touch. A mask read off them can call a command
+    // disjoint from the very shard its batch is writing (measured: 5 of 12
+    // connections lost an MGET's own batch writes). Passed explicitly rather
+    // than folded into `pending` so that adding a mask-based relaxation cannot
+    // silently escape it — the compiler names every call site.
+    keys_may_be_rewritten: bool,
 ) -> bool {
     if is_inline_intercepted(cmd) || extract_primary_key(cmd, args).is_none() {
         return true;
@@ -1678,7 +1687,49 @@ pub(crate) fn must_wait_for_pending_remote(
         // Routed by its own single key — the fast path, unchanged.
         return false;
     }
-    command_shard_mask(cmd, args, num_shards).is_none_or(|mask| mask & pending != 0)
+    // The keys visible here are not the keys that will route (see
+    // `keys_may_be_rewritten` on the signature), so no mask read off them can
+    // justify skipping the wait.
+    if keys_may_be_rewritten {
+        return true;
+    }
+    match command_shard_mask(cmd, args, num_shards) {
+        // Mask untrustworthy — wait. Always the safe direction.
+        None => true,
+        // moon#513 (A1): ONE owner shard, so the coordinator hands it to normal
+        // routing and it is APPENDED to that shard's slotted batch, behind the
+        // pending commands rather than racing them. That is the same property
+        // that has always made `SET k` + `GET k` correct, so the wait is
+        // genuinely unnecessary here rather than merely skipped.
+        //
+        // This arm is only sound while the routing side agrees: see
+        // `single_owner_shard`, whose callers are the two coordinator
+        // fall-throughs. If a single-owner multi-key command ever went back to
+        // executing INLINE, this would be moon#507 reopened.
+        Some(mask) if mask.count_ones() == 1 => false,
+        // Genuinely spans shards: still consumed inline by the coordinator, so
+        // it must wait if it meets a pending shard (moon#513, mask arm).
+        Some(mask) => mask & pending != 0,
+    }
+}
+
+/// The one shard that owns EVERY key of `cmd`, or `None` when the keys span
+/// shards or the mask cannot be trusted.
+///
+/// This is the routing half of the moon#513 A1 pair. The multi-key coordinator
+/// consults it and declines the command when a single shard owns the whole key
+/// set, so the command falls through to ordinary routing —
+/// `extract_primary_key` hashes its first key, which by definition names that
+/// same owner — and is slotted like a single-key command.
+///
+/// Executing a multi-key command against one shard's slice is exactly what
+/// [`cross_shard_multikey_rejection`] (moon#592) already permits: it refuses
+/// only the SPANNING case, because a spanning command executed on one slice
+/// silently reads and writes the wrong table.
+#[must_use]
+pub(crate) fn single_owner_shard(cmd: &[u8], args: &[Frame], num_shards: usize) -> Option<usize> {
+    let mask = command_shard_mask(cmd, args, num_shards)?;
+    (mask.count_ones() == 1).then(|| mask.trailing_zeros() as usize)
 }
 
 /// Commands handled INLINE by a `try_handle_*` interceptor before the routing
@@ -3776,7 +3827,7 @@ mod pending_shard_mask_tests {
     //! itself uses, never written as a literal — a hardcoded key that drifted
     //! onto a different shard would make these pass for the wrong reason.
 
-    use super::{command_shard_mask, must_wait_for_pending_remote};
+    use super::{command_shard_mask, must_wait_for_pending_remote, single_owner_shard};
     use crate::protocol::Frame;
     use crate::shard::dispatch::key_to_shard;
     use bytes::Bytes;
@@ -3838,22 +3889,89 @@ mod pending_shard_mask_tests {
         );
     }
 
+    /// A key set that SPANS shards — the case that is still consumed inline by
+    /// the multi-key coordinator, and therefore still governed by the mask.
+    fn spanning(prefix: &str, a: usize, b: usize) -> Vec<Frame> {
+        vec![
+            keys_on(&format!("{prefix}a"), a).remove(0),
+            keys_on(&format!("{prefix}b"), b).remove(0),
+        ]
+    }
+
     #[test]
     fn waits_only_when_the_shard_sets_meet() {
-        let on2 = keys_on("psm_e", 2);
+        let span = spanning("psm_e", 2, 3);
         assert!(
-            must_wait_for_pending_remote(b"MGET", &on2, SHARDS, mask_of(&[2])),
-            "reading shard 2 while shard 2 has pending work is the moon#507 \
-             hazard and must still wait"
+            must_wait_for_pending_remote(b"MGET", &span, SHARDS, mask_of(&[2]), false),
+            "reading shards 2 and 3 while shard 2 has pending work is the \
+             moon#507 hazard and must still wait"
         );
         assert!(
-            !must_wait_for_pending_remote(b"MGET", &on2, SHARDS, mask_of(&[0, 1, 3])),
-            "reading shard 2 while every OTHER shard has pending work touches \
-             nothing pending, so the batch must not be cut"
+            !must_wait_for_pending_remote(b"MGET", &span, SHARDS, mask_of(&[0, 1]), false),
+            "reading shards 2 and 3 while only shards 0 and 1 have pending work \
+             touches nothing pending, so the batch must not be cut"
         );
         assert!(
-            must_wait_for_pending_remote(b"MGET", &[bulk("k"), Frame::Integer(7)], SHARDS, 1),
+            must_wait_for_pending_remote(
+                b"MGET",
+                &[bulk("k"), Frame::Integer(7)],
+                SHARDS,
+                1,
+                false
+            ),
             "an unenumerable argv falls back to waiting"
+        );
+    }
+
+    /// moon#513 (A1). This assertion used a CO-LOCATED pair and demanded a
+    /// wait, which was right while such a command executed inline. It no
+    /// longer does: [`single_owner_shard`] makes the coordinator decline it, so
+    /// it is slotted behind the pending commands on its owner shard. The wait
+    /// is not skipped, it is discharged by the slotted batch — which is why the
+    /// spanning half of the old assertion is kept above, unchanged in force.
+    #[test]
+    fn a_single_owner_multikey_does_not_wait_because_it_is_slotted() {
+        let on2 = keys_on("psm_g", 2);
+        assert_eq!(
+            single_owner_shard(b"MGET", &on2, SHARDS),
+            Some(2),
+            "both keys hash to shard 2, so one shard owns the whole key set"
+        );
+        assert!(
+            !must_wait_for_pending_remote(b"MGET", &on2, SHARDS, mask_of(&[2]), false),
+            "a single-owner multi-key command is appended to shard 2's slotted \
+             batch BEHIND the pending work, so cutting the batch buys nothing"
+        );
+        // The routing half must agree, or the guard above is skipping a wait
+        // for a command that still runs inline — moon#507 reopened.
+        assert_eq!(
+            single_owner_shard(b"MGET", &spanning("psm_h", 0, 1), SHARDS),
+            None,
+            "a spanning key set has no single owner and must stay on the \
+             coordinator"
+        );
+        assert_eq!(
+            single_owner_shard(b"MGET", &[bulk("k"), Frame::Integer(7)], SHARDS),
+            None,
+            "an unenumerable argv has no trustworthy owner"
+        );
+    }
+
+    /// The workspace flag must survive the A1 relaxation: a workspace
+    /// connection's keys are rewritten to a `{<32-hex>}:` hash tag AFTER the
+    /// guard runs, so every key routes to one shard however the raw names
+    /// scatter. Read off the RAW names, a co-located pair looks single-owner
+    /// and would wave the command through to a shard the batch is writing.
+    #[test]
+    fn rewritten_keys_never_take_a_mask_shortcut() {
+        let on2 = keys_on("psm_i", 2);
+        assert!(
+            must_wait_for_pending_remote(b"MGET", &on2, SHARDS, mask_of(&[2]), true),
+            "single-owner is read off keys this connection is about to rewrite"
+        );
+        assert!(
+            must_wait_for_pending_remote(b"MGET", &on2, SHARDS, mask_of(&[0, 1, 3]), true),
+            "nor may the disjoint arm fire on raw names"
         );
     }
 
@@ -3863,17 +3981,17 @@ mod pending_shard_mask_tests {
         // Inline-intercepted: runs against the LOCAL slice whatever keys it
         // declares, so its declared keys do not describe the state it touches.
         assert!(
-            must_wait_for_pending_remote(b"EVAL", &on2, SHARDS, mask_of(&[0])),
+            must_wait_for_pending_remote(b"EVAL", &on2, SHARDS, mask_of(&[0]), false),
             "EVAL must wait even when its declared keys avoid every pending shard"
         );
         // Keyless: aggregates across every shard.
         assert!(
-            must_wait_for_pending_remote(b"DBSIZE", &[], SHARDS, mask_of(&[0])),
+            must_wait_for_pending_remote(b"DBSIZE", &[], SHARDS, mask_of(&[0]), false),
             "a keyless command touches every shard"
         );
         // Routed by its own single key: the fast path, never cut.
         assert!(
-            !must_wait_for_pending_remote(b"GET", &on2[..1], SHARDS, u64::MAX),
+            !must_wait_for_pending_remote(b"GET", &on2[..1], SHARDS, u64::MAX, false),
             "a single-key command routes by its own key and is ordered by the \
              slotted batch itself"
         );

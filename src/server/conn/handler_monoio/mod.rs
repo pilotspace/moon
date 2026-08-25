@@ -1690,17 +1690,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // (measured: 5 of 12 connections lost an MGET's own batch writes).
             // Treating every shard as pending makes the predicate answer
             // exactly as it did before the mask existed.
-            let effective_pending = if conn.workspace_id.is_some() {
-                u64::MAX
-            } else {
-                pending_mask
-            };
             if pending_mask != 0
                 && crate::server::conn::shared::must_wait_for_pending_remote(
                     cmd,
                     cmd_args,
                     ctx.num_shards,
-                    effective_pending,
+                    pending_mask,
+                    conn.workspace_id.is_some(),
                 )
             {
                 frames[frame_idx - 1] = frame;
