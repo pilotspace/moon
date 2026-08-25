@@ -92,7 +92,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.8.5 by moon#588 (the gate scored an ID-set overlap, which is undefined when distances tie).
   This change is still needed, because *any* repeatedly-failing merge reaches the same trap.
 
-### Fixed
+- **Cypher writes narrow through the property index instead of scanning every node of the label (moon#719).**
+
+  The write executor reached `IndexScan` through the same match arm as `NodeScan` and threw the
+  planner's narrowing away — it visited every node carrying the label, then let the residual
+  `Filter` cut the result down. Output was therefore always correct, which is exactly why this
+  survived: a `MATCH (n:L {k: '…'}) SET …` and its read-only twin return identical rows, and only
+  the write one costs O(nodes already present). Building a graph one node at a time — the normal
+  shape of knowledge-graph ingest — was quadratic. The reporter measured a 50-statement batch
+  growing 9.07x between a 1,000-node and a 10,000-node graph while the byte-identical read grew
+  1.35x, and `GRAPH.PROFILE` could not show it because it refuses write statements outright.
+
+  The `IndexScan` arm now calls the read path's own `index_scan_keys` — shared, not a second copy
+  that can drift — with a context mirroring the visibility arguments the label scan passed one arm
+  up (`u64::MAX`, txn 0, no valid-time), so the candidate set is unchanged and only its size moves.
+
+  Because both plans return the same rows, correctness cannot catch a regression here. `ExecResult`
+  gained a `nodes_scanned` counter — the observable difference, and useful to any profiling caller
+  that wants to see a plan silently fall back — and the test asserts on it rather than on a timer:
+  one matching node among 5,000, scanned 5,000 before and fewer than 64 after. The test also guards
+  its own premise, failing if the planner ever stops emitting `IndexScan` for the shape.
+
+  The issue's second suspect — the property-index *update* on `SET` being O(N) — was checked and
+  ruled out: `MutablePropertyIndex::remove` is O(bucket), and a unique key's bucket holds one entry.
+
+  End-to-end, `scripts/bench-cypher-write-index-719.py` drives the issue's own discriminator
+  against two separately-built binaries (aarch64 macOS dev host; these are growth ratios, not
+  throughput numbers, and the legs are interleaved so a drifting machine cannot fake a win):
+
+  | 50-statement batch | 1,000 nodes | 10,000 nodes | growth |
+  |---|---|---|---|
+  | write, before | 5.52 / 7.49 ms | 84.67 / 105.35 ms | **14.69x** |
+  | write, after  | 0.75 / 0.92 ms | 0.99 / 1.22 ms | **1.33x** |
+  | read (in-run control, both) | ~0.8 ms | ~0.8 ms | ~1.0x |
+
+  The write now tracks the read. The 10,000-node batch is 86x faster, and the harness refuses to
+  print any of it if the two binaries share a sha256, if the port is answered by something that
+  is not moon, if the two binaries disagree on matched rows, or if the *control* binary fails to
+  exhibit the defect it is supposed to demonstrate.
+
 - **26 integration suites now own their server through a `Drop` guard, so a failing assert cannot orphan it.**
 
   Every one of these suites killed its server on the last line of the test body. That line is only
