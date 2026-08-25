@@ -14,7 +14,7 @@
 mod common;
 
 use moon::shard::dispatch::key_to_shard;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 const SHARDS: usize = 4;
 

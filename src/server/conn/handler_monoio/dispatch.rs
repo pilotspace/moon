@@ -958,21 +958,18 @@ pub(super) fn try_enforce_disk_full(
     cmd: &[u8],
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
-    if metadata::is_write(cmd) && crate::shard::segment_stall::is_any_write_stall_active() {
-        // dir-lost first: it also sets `is_write_paused`, and "diskfull"
-        // would send the operator hunting free space instead of the missing
-        // data directory (#366).
-        let msg: &'static [u8] = if crate::shard::disk_monitor::is_dir_lost() {
-            b"MOONERR dirmissing: data directory was removed; writes refused until it is restored"
-        } else if crate::shard::disk_monitor::is_write_paused() {
-            b"MOONERR diskfull: writes paused until free space recovers"
-        } else if crate::shard::mem_monitor::is_write_paused() {
-            b"MOONERR memfull: writes paused until memory pressure recovers"
-        } else {
-            b"MOONERR busy: compaction backlog; too many unflushed immutable segments"
-        };
-        responses.push(Frame::Error(Bytes::from_static(msg)));
-        return true;
+    if metadata::is_write(cmd) {
+        // moon#718: the ladder AND the backlog exemption live in
+        // `segment_stall::stall_refusal`, so both dispatch paths cannot drift
+        // apart — they previously carried byte-identical copies of the ladder,
+        // and a fix applied to one would have silently missed the other.
+        if let Some(msg) = crate::shard::segment_stall::stall_refusal(
+            cmd,
+            crate::shard::segment_stall::StallSources::current(),
+        ) {
+            responses.push(Frame::Error(Bytes::from_static(msg)));
+            return true;
+        }
     }
     false
 }

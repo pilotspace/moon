@@ -59,6 +59,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mask-based relaxation is added, instead of the relaxation silently escaping the sentinel.
 
 ### Fixed
+- **A compaction backlog no longer refuses the commands that cure it (moon#718).**
+
+  Reported as a permanent write outage with no in-band recovery. Background merges keep
+  failing, immutable segments accumulate to `--max-unflushed-immutable-segments`, and every
+  foreground write is refused with `MOONERR busy: compaction backlog`. Reads keep working, and
+  so does the server — but **both documented escapes are themselves foreground writes**.
+  `FT.COMPACT` drains the backlog; `FT.CONFIG SET <idx> MERGE_RECALL_TOLERANCE 0` relaxes the
+  recall gate a repeatedly-failing merge is stuck behind, and is the command the rejection log
+  line recommends by name. The registry flags both `W`, so the backlog refused its own remedy
+  and the only exit was a restart, which replays into the same state.
+
+  `src/shard/segment_stall.rs` had claimed this exemption already existed — "`FT.COMPACT` /
+  `GRAPH.COMPACT` commands bypass this guard so compaction can always proceed to drain the
+  backlog". It did not, and `GRAPH.COMPACT` is not a command at all. The same false claim
+  appeared in `config.rs` and in the sharded dispatch path; all three are corrected.
+
+  The decision now lives in one place, `segment_stall::stall_refusal`, which both dispatch
+  paths call — they previously carried byte-identical copies of the message ladder, so a fix
+  applied to one would silently have missed the other.
+
+  The exemption is deliberately narrow: it applies to the **segment backlog only**.
+  `dirmissing`, `diskfull` and `memfull` are answered first, so a compaction that would write
+  new segment files onto a full disk is still refused. A remedy for one stall is not a licence
+  to ignore the others. `VACUUM` needed no change — it is flagged `A`, not `W`, so no stall
+  ever saw it.
+
+  Ordinary writes are unaffected: `SET`, `HSET`, `FT.CREATE` and `FT.SEARCH` are still refused
+  by the backlog, which is what makes this a fix rather than a hole in the backpressure guard.
+
+  Note for anyone hitting the reported `recall 0.0000`: that specific trigger was fixed after
+  0.8.5 by moon#588 (the gate scored an ID-set overlap, which is undefined when distances tie).
+  This change is still needed, because *any* repeatedly-failing merge reaches the same trap.
+
+### Fixed
 - **26 integration suites now own their server through a `Drop` guard, so a failing assert cannot orphan it.**
 
   Every one of these suites killed its server on the last line of the test body. That line is only
