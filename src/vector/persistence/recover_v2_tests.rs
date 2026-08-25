@@ -608,9 +608,11 @@ mod recovery_progress {
         let t0 = Instant::now();
         let mut p = RecoveryProgress::new(IVL, t0);
         let mut emits = 0;
-        // 60 simulated seconds, sampled every 1024 keys as the caller does.
+        // 60 simulated seconds. The caller samples on a stride (see
+        // `clock_stride` in the reconcile loop); the policy must not depend on
+        // what that stride is, so sample coarsely here.
         for step in 1..=60_000u64 {
-            if step % 1024 != 0 {
+            if step % 128 != 0 {
                 continue;
             }
             if p.tick_at(step, t0 + Duration::from_millis(step)) {

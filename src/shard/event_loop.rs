@@ -1285,6 +1285,13 @@ impl super::Shard {
 
                     if !matching.is_empty() {
                         let total_in_db = matching.len();
+                        // How often to read the clock. Capped at 128 so a
+                        // million-key db pays ~8k clock reads instead of a
+                        // million, but never coarser than the db itself: a db
+                        // of 50 pathologically slow keys would otherwise never
+                        // reach any fixed stride and stay silent — which is the
+                        // exact failure #546 is about.
+                        let clock_stride = total_in_db.clamp(1, 128);
                         crate::shard::slice::with_shard(|s| {
                             for (i, (key, args)) in matching.iter().enumerate() {
                                 // B3 dedup rescan: verifies each matching
@@ -1305,7 +1312,7 @@ impl super::Shard {
                                 // Counter gate first: a recovery that finishes
                                 // in milliseconds must not pay `Instant::now()`
                                 // per key to prove it had nothing to say.
-                                if reindexed % 1024 == 0 {
+                                if (i + 1) % clock_stride == 0 {
                                     let now = std::time::Instant::now();
                                     if progress.tick_at(reindexed as u64, now) {
                                         info!(
