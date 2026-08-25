@@ -1055,303 +1055,23 @@ impl super::Shard {
         // Restore vector index metadata from sidecar file.
         // Set persist_dir so FT.CREATE/FT.DROPINDEX saves metadata for future recovery.
         // Try disk-offload dir first (higher priority), then main persistence dir.
+        // moon#476: index recovery is spawned, not run inline, so the event
+        // loop below starts serving immediately. Until it finishes, this shard
+        // answers -LOADING for anything that would read a half-built index.
         {
-            let vector_persist_dir = if server_config.disk_offload_enabled() {
-                Some(
-                    server_config
-                        .effective_disk_offload_dir()
-                        .join(format!("shard-{}", shard_id)),
-                )
-            } else {
-                persistence_dir.as_ref().map(|d| {
-                    std::path::PathBuf::from(d).join(format!("shard-{}-vectors", shard_id))
-                })
-            };
-
-            if let Some(ref vdir) = vector_persist_dir {
-                let _ = std::fs::create_dir_all(vdir);
-                crate::shard::slice::with_shard(|s| {
-                    s.vector_store.set_persist_dir(vdir.clone());
-                    s.text_store.set_persist_dir(vdir.clone());
-                });
-            }
-
-            // Try loading saved index metadata (with compaction weights) from the vector persist dir.
-            // W3-deep: load_index_metadata_with_weights returns (IndexMeta, f32) pairs so that
-            // persisted COMPACTION_WEIGHT values are restored into VectorIndex on startup.
-            let metas = vector_persist_dir.as_ref().and_then(|vdir| {
-                match crate::vector::index_persist::load_index_metadata_with_weights(vdir) {
-                    Ok(m) if !m.is_empty() => Some(m),
-                    _ => None,
-                }
-            });
-
-            // Try loading saved text index metadata from the same persist dir.
-            let text_metas = vector_persist_dir.as_ref().and_then(|vdir| {
-                match crate::text::index_persist::load_text_index_metadata(vdir) {
-                    Ok(m) if !m.is_empty() => Some(m),
-                    _ => None,
-                }
-            });
-
-            // B3 (vector-index durability): threaded through the index
-            // creation loop below, the rescan loop further down, and the
-            // finalize call at the end of this block. See
-            // `crate::vector::persistence::recover_v2` module docs for the
-            // full recovery contract (manifest/segment/keymap load + dedup
-            // rescan + deletion probe + orphan sweep).
-            let mut recovery_state = crate::vector::persistence::recover_v2::RecoveryState::new();
-
-            if let (Some(metas), Some(vdir)) = (&metas, &vector_persist_dir) {
-                crate::shard::slice::with_shard(|s| {
-                    info!(
-                        "Shard {}: restoring {} vector index(es) from sidecar",
-                        shard_id,
-                        metas.len()
-                    );
-                    for (meta, weight) in metas {
-                        recovery_state.create_index(&mut s.vector_store, vdir, meta);
-                        if *weight != 1.0 {
-                            if let Some(idx) = s.vector_store.get_index_mut(&meta.name) {
-                                idx.set_compaction_weight(*weight);
-                            }
-                        }
-                    }
-                });
-            }
-
-            // Reattach WARM-tier segments Stack A's v3 recovery discovered
-            // from the manifest (`Shard::restore_from_persistence`, staged on
-            // `self.recovered_warm_segments` because that pass populates a
-            // throwaway store discarded above). Without this, WARM's RSS win
-            // evaporated on every restart: the segment was still tracked by
-            // Stack B's manifest (a `disk_segment_id` never GC'd -- see the
-            // `persist_hook_after_install` call added to
-            // `try_warm_transitions_idle`), so `RecoveryState::finish` below
-            // reloaded it as a fully-materialized HOT/immutable segment
-            // instead of a WARM one.
-            //
-            // Ordering (PR review round 2, commit 4): this MUST run right
-            // here — after all `create_index` calls above (ownership
-            // decisions need every sidecar index to already exist), but
-            // BEFORE the keyspace dedup rescan below. Running it after
-            // `RecoveryState::finish()` (an earlier revision did) let the
-            // rescan see every WARM key as unknown — `key_hash_to_key`/
-            // `key_hash_to_global_id` are the only things `reconcile_key`
-            // consults, and `load_segments_and_keymap` never populates them
-            // for WARM keys (see `recover_v2`'s `segment_resident` gate) —
-            // forcing a full re-encode into the mutable segment for every
-            // WARM doc on every normal restart; the duplication check in
-            // `register_warm_segments` then saw those just-re-indexed keys
-            // as "already covered" and retired (deleted) the WARM segment.
-            // See `VectorStore::register_warm_segments`'s own docs for the
-            // full ordering rationale and the keymap-population fix.
             let recovered_warm_segments = std::mem::take(&mut self.recovered_warm_segments);
-            if !recovered_warm_segments.is_empty() {
-                let n = recovered_warm_segments.len();
-                crate::shard::slice::with_shard(|s| {
-                    s.vector_store
-                        .register_warm_segments(recovered_warm_segments);
-                });
-                info!(
-                    "Shard {}: reattached {} WARM vector segment(s) after restart",
-                    shard_id, n
-                );
-            }
-
-            // Phase 1.5: snapshot the deletion-probe baseline now that both
-            // Stack B's HOT/immutable load (`create_index`, above) AND WARM
-            // reattachment (just above) have settled — see
-            // `RecoveryState::snapshot_recovered_baseline`'s docs for why
-            // this can't happen any earlier without silently excluding
-            // every WARM key from `finish()`'s deletion probe. Must run
-            // before the rescan loop below (phase 2).
-            crate::shard::slice::with_shard(|s| {
-                recovery_state.snapshot_recovered_baseline(&s.vector_store);
-            });
-
-            // Restore text indexes from sidecar metadata.
-            #[cfg(feature = "text-index")]
-            if let Some(ref text_metas) = text_metas {
-                crate::shard::slice::with_shard(|s| {
-                    info!(
-                        "Shard {}: restoring {} text index(es) from sidecar",
-                        shard_id,
-                        text_metas.len()
-                    );
-                    for meta in text_metas {
-                        let mut text_index = crate::text::store::TextIndex::new(
-                            meta.name.clone(),
-                            meta.key_prefixes.clone(),
-                            meta.text_fields.clone(),
-                            meta.bm25_config,
-                        );
-                        // WS5a: carry the persisted db_index forward so a
-                        // restart doesn't silently re-home a restored text
-                        // index to db 0.
-                        text_index.db_index = meta.db_index;
-                        if let Err(e) = s.text_store.create_index(meta.name.clone(), text_index) {
-                            tracing::warn!(
-                                "Shard {}: failed to restore text index '{}': {}",
-                                shard_id,
-                                String::from_utf8_lossy(&meta.name),
-                                e
-                            );
-                        }
-                    }
-                });
-
-                // Kernel M4 (task #50): seed each restored text index's term
-                // dictionaries (and, where the sidecar validates cleanly,
-                // FST maps) from the `.tfst` combined sidecar BEFORE the
-                // keyspace rescan below runs any `index_document` calls.
-                // This MUST happen in this order -- see
-                // `TextStore::load_term_fst_sidecars`'s doc comment for why
-                // seeding after the rescan (or not at all) is exactly the
-                // stale-id-space corruption this closes.
-                crate::shard::slice::with_shard(|s| {
-                    s.text_store.load_term_fst_sidecars();
-                });
-            }
-
-            // Auto-reindex existing HASH keys that match vector or text index prefixes.
-            let has_indexes = metas.is_some() || text_metas.is_some();
-            if has_indexes {
-                let db_count = shard_databases.db_count();
-                let mut reindexed = 0usize;
-                // moon#546 hypothesis 3: the reported 94-minute recovery logged
-                // nothing between the sidecar banner and the final count, so an
-                // operator could not tell a slow repair from a wedged process.
-                let mut progress = crate::vector::persistence::recover_v2::RecoveryProgress::new(
-                    std::time::Duration::from_secs(10),
-                    std::time::Instant::now(),
-                );
-                for db_idx in 0..db_count {
-                    let collect_matching = |db: &crate::storage::Database| -> Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> {
-                        let mut matching: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = Vec::new();
-                        for (key, entry) in db.data().iter() {
-                            let key_bytes = key.as_bytes();
-                            let matches_vector = metas.as_ref().is_some_and(|ms| {
-                                ms.iter().any(|(m, _w)| {
-                                    m.key_prefixes.iter().any(|p| key_bytes.starts_with(p))
-                                })
-                            });
-                            let matches_text = text_metas.as_ref().is_some_and(|ms| {
-                                ms.iter().any(|m| {
-                                    m.key_prefixes.iter().any(|p| key_bytes.starts_with(p))
-                                })
-                            });
-                            if !matches_vector && !matches_text {
-                                continue;
-                            }
-                            let mut args = Vec::new();
-                            args.push(crate::protocol::Frame::BulkString(
-                                bytes::Bytes::copy_from_slice(key_bytes),
-                            ));
-                            match entry.as_redis_value() {
-                                crate::storage::compact_value::RedisValueRef::Hash(map) => {
-                                    for (field, value) in map.iter() {
-                                        args.push(crate::protocol::Frame::BulkString(
-                                            bytes::Bytes::copy_from_slice(field),
-                                        ));
-                                        args.push(crate::protocol::Frame::BulkString(
-                                            bytes::Bytes::copy_from_slice(value),
-                                        ));
-                                    }
-                                }
-                                crate::storage::compact_value::RedisValueRef::HashListpack(lp) => {
-                                    let entries: Vec<_> = lp.iter().collect();
-                                    let mut j = 0;
-                                    while j + 1 < entries.len() {
-                                        args.push(crate::protocol::Frame::BulkString(
-                                            bytes::Bytes::from(entries[j].as_bytes()),
-                                        ));
-                                        args.push(crate::protocol::Frame::BulkString(
-                                            bytes::Bytes::from(entries[j + 1].as_bytes()),
-                                        ));
-                                        j += 2;
-                                    }
-                                }
-                                _ => continue,
-                            }
-                            if args.len() > 1 {
-                                matching.push((key_bytes.to_vec(), args));
-                            }
-                        }
-                        matching
-                    };
-                    let matching =
-                        { crate::shard::slice::with_shard_db(db_idx, |db| collect_matching(db)) };
-
-                    if !matching.is_empty() {
-                        let total_in_db = matching.len();
-                        // How often to read the clock. Capped at 128 so a
-                        // million-key db pays ~8k clock reads instead of a
-                        // million, but never coarser than the db itself: a db
-                        // of 50 pathologically slow keys would otherwise never
-                        // reach any fixed stride and stay silent — which is the
-                        // exact failure #546 is about.
-                        let clock_stride = total_in_db.clamp(1, 128);
-                        crate::shard::slice::with_shard(|s| {
-                            for (i, (key, args)) in matching.iter().enumerate() {
-                                // B3 dedup rescan: verifies each matching
-                                // key against any recovered durable state
-                                // (manifest/segment/keymap) before deciding
-                                // whether to fully re-encode. Indexes with
-                                // no durable state (fresh/no manifest) fall
-                                // through to the same full-rescan behavior
-                                // this replaced. See `recover_v2` docs.
-                                recovery_state.reconcile_key(
-                                    &mut s.vector_store,
-                                    &mut s.text_store,
-                                    key,
-                                    args,
-                                    db_idx as u8,
-                                );
-                                reindexed += 1;
-                                // Counter gate first: a recovery that finishes
-                                // in milliseconds must not pay `Instant::now()`
-                                // per key to prove it had nothing to say.
-                                if (i + 1) % clock_stride == 0 {
-                                    let now = std::time::Instant::now();
-                                    if progress.tick_at(reindexed as u64, now) {
-                                        info!(
-                                            "Shard {}: recovery reconciling db {} \
-                                             key {}/{} ({} total, {:.0} keys/s, \
-                                             {:.0}s elapsed)",
-                                            shard_id,
-                                            db_idx,
-                                            i + 1,
-                                            total_in_db,
-                                            reindexed,
-                                            progress.keys_per_sec(reindexed as u64, now),
-                                            progress.elapsed_secs(now),
-                                        );
-                                    }
-                                }
-                            }
-                        });
-                    }
-                }
-                if reindexed > 0 {
-                    info!(
-                        "Shard {}: auto-reindexed {} HASH key(s) into restored vector/text indexes",
-                        shard_id, reindexed
-                    );
-                }
-            }
-
-            // B3 finalize: deletion probe (keymap keys no longer present
-            // anywhere in the keyspace) + orphan sweep (segment/staging/
-            // keymap files not referenced by the loaded manifest, and
-            // unknown `idx-*` dirs with no matching sidecar index) +
-            // per-index acceptance-signal log line. No-op (does nothing,
-            // logs nothing) when no index had durable state to recover.
-            if let Some(ref vdir) = vector_persist_dir {
-                crate::shard::slice::with_shard(|s| {
-                    recovery_state.finish(&mut s.vector_store, vdir);
-                });
-            }
+            // Acquired HERE, not inside the task: between spawn and the task's
+            // first poll the flag must already read true, or a command arriving
+            // in that window would be served against indexes not yet rebuilt.
+            let loading_guard = crate::shard::loading::LoadingGuard::acquire();
+            <Spawner as crate::runtime::traits::RuntimeSpawn>::spawn_local(recover_indexes_task(
+                shard_id,
+                server_config.clone(),
+                persistence_dir.clone(),
+                shard_databases.clone(),
+                recovered_warm_segments,
+                loading_guard,
+            ));
         }
 
         // NOTE: the old `pending_wakers` relay (register-waker, event-loop
@@ -2864,6 +2584,359 @@ impl super::Shard {
         // Databases now live in Arc<ShardDatabases>, no reclaim needed.
         self.databases.clear();
         self.pubsub_registry = std::mem::take(&mut *pubsub_arc.write());
+    }
+}
+
+#[cfg(feature = "runtime-monoio")]
+use crate::runtime::MonoioSpawner as Spawner;
+#[cfg(all(feature = "runtime-tokio", not(feature = "runtime-monoio")))]
+use crate::runtime::TokioSpawner as Spawner;
+
+/// Rebuild vector/text indexes after a restart, off the startup critical path.
+///
+/// moon#476: this used to run inline in `run()`, before the event loop began.
+/// It is fully synchronous work, so on a single-threaded shard runtime nothing
+/// else was ever scheduled while it ran — not the accept task, not the loop.
+/// The listener was already bound, so the kernel completed handshakes from the
+/// backlog and clients sat on connections that looked healthy and answered
+/// nothing (measured: 1,228 ms on 83,828 keys; the reported production case was
+/// ~94 minutes).
+///
+/// Now it is spawned onto the shard's local executor and `run()` proceeds
+/// straight to the loop. `crate::shard::loading` is set for the duration, so
+/// commands that would read a half-built index are refused with `-LOADING`
+/// rather than served wrong or silently queued. The reconcile loop yields
+/// between chunks (`cooperative_yield`), which is what actually lets the loop
+/// run — a self-waking task would re-queue itself and never let the runtime
+/// park, so the completion queue would never be reaped.
+///
+/// Everything here reaches shard state through `with_shard`, which is
+/// thread-local, so the task MUST stay on this thread: it is spawned with
+/// `spawn_local`, never `spawn`.
+#[allow(clippy::too_many_lines)]
+async fn recover_indexes_task(
+    shard_id: usize,
+    server_config: std::sync::Arc<crate::config::ServerConfig>,
+    persistence_dir: Option<String>,
+    shard_databases: std::sync::Arc<ShardDatabases>,
+    recovered_warm_segments: Vec<(u64, std::path::PathBuf)>,
+    // Dropped when this task ends -- by return, panic, or being dropped
+    // un-polled at shutdown -- which is what clears the -LOADING state.
+    _loading_guard: crate::shard::loading::LoadingGuard,
+) {
+    let vector_persist_dir = if server_config.disk_offload_enabled() {
+        Some(
+            server_config
+                .effective_disk_offload_dir()
+                .join(format!("shard-{}", shard_id)),
+        )
+    } else {
+        persistence_dir
+            .as_ref()
+            .map(|d| std::path::PathBuf::from(d).join(format!("shard-{}-vectors", shard_id)))
+    };
+
+    if let Some(ref vdir) = vector_persist_dir {
+        let _ = std::fs::create_dir_all(vdir);
+        crate::shard::slice::with_shard(|s| {
+            s.vector_store.set_persist_dir(vdir.clone());
+            s.text_store.set_persist_dir(vdir.clone());
+        });
+    }
+
+    // Try loading saved index metadata (with compaction weights) from the vector persist dir.
+    // W3-deep: load_index_metadata_with_weights returns (IndexMeta, f32) pairs so that
+    // persisted COMPACTION_WEIGHT values are restored into VectorIndex on startup.
+    let metas = vector_persist_dir.as_ref().and_then(|vdir| {
+        match crate::vector::index_persist::load_index_metadata_with_weights(vdir) {
+            Ok(m) if !m.is_empty() => Some(m),
+            _ => None,
+        }
+    });
+
+    // Try loading saved text index metadata from the same persist dir.
+    let text_metas = vector_persist_dir.as_ref().and_then(|vdir| {
+        match crate::text::index_persist::load_text_index_metadata(vdir) {
+            Ok(m) if !m.is_empty() => Some(m),
+            _ => None,
+        }
+    });
+
+    // B3 (vector-index durability): threaded through the index
+    // creation loop below, the rescan loop further down, and the
+    // finalize call at the end of this block. See
+    // `crate::vector::persistence::recover_v2` module docs for the
+    // full recovery contract (manifest/segment/keymap load + dedup
+    // rescan + deletion probe + orphan sweep).
+    let mut recovery_state = crate::vector::persistence::recover_v2::RecoveryState::new();
+
+    if let (Some(metas), Some(vdir)) = (&metas, &vector_persist_dir) {
+        crate::shard::slice::with_shard(|s| {
+            info!(
+                "Shard {}: restoring {} vector index(es) from sidecar",
+                shard_id,
+                metas.len()
+            );
+            for (meta, weight) in metas {
+                recovery_state.create_index(&mut s.vector_store, vdir, meta);
+                if *weight != 1.0 {
+                    if let Some(idx) = s.vector_store.get_index_mut(&meta.name) {
+                        idx.set_compaction_weight(*weight);
+                    }
+                }
+            }
+        });
+    }
+
+    // Reattach WARM-tier segments Stack A's v3 recovery discovered
+    // from the manifest (`Shard::restore_from_persistence`, staged on
+    // `self.recovered_warm_segments` because that pass populates a
+    // throwaway store discarded above). Without this, WARM's RSS win
+    // evaporated on every restart: the segment was still tracked by
+    // Stack B's manifest (a `disk_segment_id` never GC'd -- see the
+    // `persist_hook_after_install` call added to
+    // `try_warm_transitions_idle`), so `RecoveryState::finish` below
+    // reloaded it as a fully-materialized HOT/immutable segment
+    // instead of a WARM one.
+    //
+    // Ordering (PR review round 2, commit 4): this MUST run right
+    // here — after all `create_index` calls above (ownership
+    // decisions need every sidecar index to already exist), but
+    // BEFORE the keyspace dedup rescan below. Running it after
+    // `RecoveryState::finish()` (an earlier revision did) let the
+    // rescan see every WARM key as unknown — `key_hash_to_key`/
+    // `key_hash_to_global_id` are the only things `reconcile_key`
+    // consults, and `load_segments_and_keymap` never populates them
+    // for WARM keys (see `recover_v2`'s `segment_resident` gate) —
+    // forcing a full re-encode into the mutable segment for every
+    // WARM doc on every normal restart; the duplication check in
+    // `register_warm_segments` then saw those just-re-indexed keys
+    // as "already covered" and retired (deleted) the WARM segment.
+    // See `VectorStore::register_warm_segments`'s own docs for the
+    // full ordering rationale and the keymap-population fix.
+    // `recovered_warm_segments` now arrives as a parameter (moon#476).
+    if !recovered_warm_segments.is_empty() {
+        let n = recovered_warm_segments.len();
+        crate::shard::slice::with_shard(|s| {
+            s.vector_store
+                .register_warm_segments(recovered_warm_segments);
+        });
+        info!(
+            "Shard {}: reattached {} WARM vector segment(s) after restart",
+            shard_id, n
+        );
+    }
+
+    // Phase 1.5: snapshot the deletion-probe baseline now that both
+    // Stack B's HOT/immutable load (`create_index`, above) AND WARM
+    // reattachment (just above) have settled — see
+    // `RecoveryState::snapshot_recovered_baseline`'s docs for why
+    // this can't happen any earlier without silently excluding
+    // every WARM key from `finish()`'s deletion probe. Must run
+    // before the rescan loop below (phase 2).
+    crate::shard::slice::with_shard(|s| {
+        recovery_state.snapshot_recovered_baseline(&s.vector_store);
+    });
+
+    // Restore text indexes from sidecar metadata.
+    #[cfg(feature = "text-index")]
+    if let Some(ref text_metas) = text_metas {
+        crate::shard::slice::with_shard(|s| {
+            info!(
+                "Shard {}: restoring {} text index(es) from sidecar",
+                shard_id,
+                text_metas.len()
+            );
+            for meta in text_metas {
+                let mut text_index = crate::text::store::TextIndex::new(
+                    meta.name.clone(),
+                    meta.key_prefixes.clone(),
+                    meta.text_fields.clone(),
+                    meta.bm25_config,
+                );
+                // WS5a: carry the persisted db_index forward so a
+                // restart doesn't silently re-home a restored text
+                // index to db 0.
+                text_index.db_index = meta.db_index;
+                if let Err(e) = s.text_store.create_index(meta.name.clone(), text_index) {
+                    tracing::warn!(
+                        "Shard {}: failed to restore text index '{}': {}",
+                        shard_id,
+                        String::from_utf8_lossy(&meta.name),
+                        e
+                    );
+                }
+            }
+        });
+
+        // Kernel M4 (task #50): seed each restored text index's term
+        // dictionaries (and, where the sidecar validates cleanly,
+        // FST maps) from the `.tfst` combined sidecar BEFORE the
+        // keyspace rescan below runs any `index_document` calls.
+        // This MUST happen in this order -- see
+        // `TextStore::load_term_fst_sidecars`'s doc comment for why
+        // seeding after the rescan (or not at all) is exactly the
+        // stale-id-space corruption this closes.
+        crate::shard::slice::with_shard(|s| {
+            s.text_store.load_term_fst_sidecars();
+        });
+    }
+
+    // Auto-reindex existing HASH keys that match vector or text index prefixes.
+    let has_indexes = metas.is_some() || text_metas.is_some();
+    if has_indexes {
+        let db_count = shard_databases.db_count();
+        let mut reindexed = 0usize;
+        // moon#546 hypothesis 3: the reported 94-minute recovery logged
+        // nothing between the sidecar banner and the final count, so an
+        // operator could not tell a slow repair from a wedged process.
+        let mut progress = crate::vector::persistence::recover_v2::RecoveryProgress::new(
+            std::time::Duration::from_secs(10),
+            std::time::Instant::now(),
+        );
+        for db_idx in 0..db_count {
+            let collect_matching =
+                |db: &crate::storage::Database| -> Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> {
+                    let mut matching: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = Vec::new();
+                    for (key, entry) in db.data().iter() {
+                        let key_bytes = key.as_bytes();
+                        let matches_vector = metas.as_ref().is_some_and(|ms| {
+                            ms.iter().any(|(m, _w)| {
+                                m.key_prefixes.iter().any(|p| key_bytes.starts_with(p))
+                            })
+                        });
+                        let matches_text = text_metas.as_ref().is_some_and(|ms| {
+                            ms.iter()
+                                .any(|m| m.key_prefixes.iter().any(|p| key_bytes.starts_with(p)))
+                        });
+                        if !matches_vector && !matches_text {
+                            continue;
+                        }
+                        let mut args = Vec::new();
+                        args.push(crate::protocol::Frame::BulkString(
+                            bytes::Bytes::copy_from_slice(key_bytes),
+                        ));
+                        match entry.as_redis_value() {
+                            crate::storage::compact_value::RedisValueRef::Hash(map) => {
+                                for (field, value) in map.iter() {
+                                    args.push(crate::protocol::Frame::BulkString(
+                                        bytes::Bytes::copy_from_slice(field),
+                                    ));
+                                    args.push(crate::protocol::Frame::BulkString(
+                                        bytes::Bytes::copy_from_slice(value),
+                                    ));
+                                }
+                            }
+                            crate::storage::compact_value::RedisValueRef::HashListpack(lp) => {
+                                let entries: Vec<_> = lp.iter().collect();
+                                let mut j = 0;
+                                while j + 1 < entries.len() {
+                                    args.push(crate::protocol::Frame::BulkString(
+                                        bytes::Bytes::from(entries[j].as_bytes()),
+                                    ));
+                                    args.push(crate::protocol::Frame::BulkString(
+                                        bytes::Bytes::from(entries[j + 1].as_bytes()),
+                                    ));
+                                    j += 2;
+                                }
+                            }
+                            _ => continue,
+                        }
+                        if args.len() > 1 {
+                            matching.push((key_bytes.to_vec(), args));
+                        }
+                    }
+                    matching
+                };
+            let matching =
+                { crate::shard::slice::with_shard_db(db_idx, |db| collect_matching(db)) };
+
+            if !matching.is_empty() {
+                let total_in_db = matching.len();
+                // moon#476: `with_shard` takes a SYNCHRONOUS closure, so
+                // an `.await` cannot live inside it. Chunking lets the
+                // task yield BETWEEN chunks while each chunk still runs
+                // inside exactly one `with_shard` — which is also what
+                // `recover_v2`'s re-entrancy rule requires.
+                //
+                // 1024 keys is ~12 ms of reconcile at the measured
+                // ~12 us/key: short enough that a client's command is
+                // not visibly delayed, long enough that the yield's cost
+                // stays in the noise.
+                const YIELD_CHUNK: usize = 1024;
+                let mut done_in_db = 0usize;
+                // How often to read the clock. Capped at 128 so a
+                // million-key db pays ~8k clock reads instead of a
+                // million, but never coarser than the db itself: a db
+                // of 50 pathologically slow keys would otherwise never
+                // reach any fixed stride and stay silent — which is the
+                // exact failure #546 is about.
+                let clock_stride = total_in_db.clamp(1, 128);
+                for chunk in matching.chunks(YIELD_CHUNK) {
+                    crate::shard::slice::with_shard(|s| {
+                        for (key, args) in chunk.iter() {
+                            // B3 dedup rescan: verifies each matching
+                            // key against any recovered durable state
+                            // (manifest/segment/keymap) before deciding
+                            // whether to fully re-encode. Indexes with
+                            // no durable state (fresh/no manifest) fall
+                            // through to the same full-rescan behavior
+                            // this replaced. See `recover_v2` docs.
+                            recovery_state.reconcile_key(
+                                &mut s.vector_store,
+                                &mut s.text_store,
+                                key,
+                                args,
+                                db_idx as u8,
+                            );
+                            reindexed += 1;
+                            done_in_db += 1;
+                            // Counter gate first: a recovery that finishes
+                            // in milliseconds must not pay `Instant::now()`
+                            // per key to prove it had nothing to say.
+                            if done_in_db % clock_stride == 0 {
+                                let now = std::time::Instant::now();
+                                if progress.tick_at(reindexed as u64, now) {
+                                    info!(
+                                        "Shard {}: recovery reconciling db {} \
+                                             key {}/{} ({} total, {:.0} keys/s, \
+                                             {:.0}s elapsed)",
+                                        shard_id,
+                                        db_idx,
+                                        done_in_db,
+                                        total_in_db,
+                                        reindexed,
+                                        progress.keys_per_sec(reindexed as u64, now),
+                                        progress.elapsed_secs(now),
+                                    );
+                                }
+                            }
+                        }
+                    });
+                    // Hand the thread back so the event loop can serve the
+                    // connections this shard has already accepted.
+                    crate::runtime::cooperative_yield().await;
+                }
+            }
+        }
+        if reindexed > 0 {
+            info!(
+                "Shard {}: auto-reindexed {} HASH key(s) into restored vector/text indexes",
+                shard_id, reindexed
+            );
+        }
+    }
+
+    // B3 finalize: deletion probe (keymap keys no longer present
+    // anywhere in the keyspace) + orphan sweep (segment/staging/
+    // keymap files not referenced by the loaded manifest, and
+    // unknown `idx-*` dirs with no matching sidecar index) +
+    // per-index acceptance-signal log line. No-op (does nothing,
+    // logs nothing) when no index had durable state to recover.
+    if let Some(ref vdir) = vector_persist_dir {
+        crate::shard::slice::with_shard(|s| {
+            recovery_state.finish(&mut s.vector_store, vdir);
+        });
     }
 }
 

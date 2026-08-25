@@ -178,7 +178,8 @@ fn build_store(dir: &std::path::Path, port: u16) {
         }
     }
 
-    s.write_all(&enc(&[b"BGREWRITEAOF"])).expect("write bgrewrite");
+    s.write_all(&enc(&[b"BGREWRITEAOF"]))
+        .expect("write bgrewrite");
     let _ = read_line(&mut s);
     std::thread::sleep(Duration::from_millis(500));
     drop(s);
@@ -201,7 +202,10 @@ fn lst476_loading_is_reported_not_hidden_behind_a_hang() {
     // together prove the same live connection is being served.
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut s = loop {
-        assert!(Instant::now() < deadline, "restart never accepted a connection");
+        assert!(
+            Instant::now() < deadline,
+            "restart never accepted a connection"
+        );
         if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
             break s;
         }
