@@ -1286,6 +1286,7 @@ fn execute_write_plan(
                         nodes_created: r.nodes_created,
                         nodes_deleted: r.nodes_deleted,
                         properties_set: r.properties_set,
+                        nodes_scanned: r.nodes_scanned,
                         execution_time_us: r.execution_time_us,
                         mutations: Vec::new(), // moved out above
                     }),

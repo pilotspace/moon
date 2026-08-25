@@ -363,6 +363,14 @@ pub struct ExecResult {
     pub nodes_created: u64,
     pub nodes_deleted: u64,
     pub properties_set: u64,
+    /// Nodes visited by the plan's scan operators (`NodeScan` / `IndexScan`).
+    ///
+    /// moon#719: the observable difference between a narrowed `IndexScan`
+    /// and a degraded full label scan. Both produce identical rows (the
+    /// planner's residual `Filter` keeps output exact), so this counter is
+    /// what makes the narrowing testable — and what a profiling caller
+    /// needs to see a plan that silently fell back.
+    pub nodes_scanned: u64,
     pub execution_time_us: u64,
     /// Mutations performed during execute_mut, for WAL record generation.
     pub mutations: Vec<MutationRecord>,
@@ -971,6 +979,60 @@ mod tests {
             run_point_match(&store, 1).rows.len(),
             0,
             "old value must not match"
+        );
+    }
+
+    /// moon#719: a WRITE plan's `IndexScan` must narrow through the property
+    /// index, exactly as the read path does — it used to share the
+    /// `NodeScan` arm and degrade to a full label scan, so every
+    /// `MATCH (n:L {id: X}) SET ...` visited every node carrying the label
+    /// (a scripted create-then-set loop is then O(N^2)).
+    ///
+    /// Output is IDENTICAL either way — the planner's residual `Filter`
+    /// keeps the degraded scan exact — so correctness cannot catch this.
+    /// `nodes_scanned` is what makes the difference observable, and it is
+    /// deterministic where a timing assertion would be flaky.
+    #[test]
+    fn test_write_path_index_scan_narrows_moon719() {
+        const N: i64 = 5_000;
+        let mut store = GraphStore::new();
+        store
+            .create_graph(Bytes::from_static(b"test"), 64_000, 0)
+            .expect("create ok");
+        let graph_mut = store.get_graph_mut(b"test").expect("graph");
+        let label_id = label_to_id(b"N");
+        let id_pid = label_to_id(b"id");
+        for i in 0..N {
+            let mut props = SmallVec::new();
+            props.push((id_pid, PropertyValue::Int(i)));
+            graph_mut
+                .write_buf
+                .add_node(SmallVec::from_elem(label_id, 1), props, None, 1);
+        }
+
+        let parsed =
+            crate::graph::cypher::parse_cypher(b"MATCH (n:N {id: 4242}) SET n.hit = 1 RETURN n")
+                .expect("parse");
+        let plan = crate::graph::cypher::planner::compile(&parsed).expect("compile");
+        // Guard the premise: if the planner stopped emitting IndexScan the
+        // scan-count assertion below would pass for the wrong reason.
+        assert!(
+            plan.operators
+                .iter()
+                .any(|op| matches!(op, PhysicalOp::IndexScan { .. })),
+            "planner must emit an IndexScan for an inline literal property; ops = {:?}",
+            plan.operators
+        );
+
+        let graph = store.get_graph_mut(b"test").expect("graph");
+        let result = execute_mut(graph, &plan, &HashMap::new(), 0).expect("exec");
+        assert_eq!(result.properties_set, 1, "exactly one node matches id=4242");
+        assert_eq!(result.rows.len(), 1, "and exactly one row comes back");
+        assert!(
+            result.nodes_scanned < 64,
+            "write-path IndexScan must narrow through the property index; \
+             scanned {} of {N} nodes",
+            result.nodes_scanned
         );
     }
 

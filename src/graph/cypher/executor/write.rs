@@ -29,6 +29,7 @@ pub fn execute_mut(
     let mut columns = Vec::new();
     let mut projected_rows: Option<Vec<Vec<Value>>> = None;
     let mut nodes_created: u64 = 0;
+    let mut nodes_scanned: u64 = 0;
     let mut nodes_deleted: u64 = 0;
     let mut mutations: Vec<MutationRecord> = Vec::new();
     let mut properties_set: u64 = 0;
@@ -37,13 +38,8 @@ pub fn execute_mut(
         match op {
             // W2-2 copy-up: the write path scans BOTH tiers so SET/DELETE/
             // MERGE can target frozen rows (the mutation arms copy the row
-            // up into the write buffer first). The IndexScan arm degrades to
-            // the same label scan; the residual Filter the planner emits
-            // keeps results exact.
-            PhysicalOp::NodeScan { variable, label }
-            | PhysicalOp::IndexScan {
-                variable, label, ..
-            } => {
+            // up into the write buffer first).
+            PhysicalOp::NodeScan { variable, label } => {
                 let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
                 let committed = roaring::RoaringBitmap::new();
                 let view = crate::graph::view::MergedNodeView::new(&graph.write_buf, &csr_segs);
@@ -51,6 +47,53 @@ pub fn execute_mut(
                 view.for_each_visible_node(label_id, u64::MAX, 0, &committed, None, |k| {
                     keys.push(k)
                 });
+                nodes_scanned += keys.len() as u64;
+                let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
+                for row in &rows {
+                    for &key in &keys {
+                        let mut new_row = row.clone();
+                        new_row.insert(variable, Value::Node(key));
+                        new_rows.push(new_row);
+                    }
+                }
+                rows = new_rows;
+            }
+
+            // moon#719: narrow through the property index, sharing the READ
+            // path's `index_scan_keys` rather than keeping a second copy that
+            // can drift. This arm used to fall in with `NodeScan` above and
+            // scan every node of the label — output was still exact (the
+            // planner emits a residual Filter), but a `MATCH (n:L {id: X})
+            // SET ...` cost O(N) per statement, so a create-then-set loop was
+            // O(N^2).
+            //
+            // The context mirrors the visibility arguments the label scan
+            // passes literally one arm up (`u64::MAX`, txn 0, no valid-time)
+            // and the `u64::MAX` / `None` pair every `eval_expr` in this
+            // function uses, so the candidate set is unchanged — only its
+            // size is.
+            PhysicalOp::IndexScan {
+                variable,
+                label,
+                prop_eq,
+                prop_range,
+                text_pred,
+            } => {
+                let scan_ctx = ExecutionContext {
+                    snapshot_lsn: u64::MAX,
+                    ..Default::default()
+                };
+                let keys = super::read::index_scan_keys(
+                    &graph.write_buf,
+                    &csr_segs,
+                    label.as_ref(),
+                    prop_eq,
+                    prop_range,
+                    text_pred,
+                    params,
+                    &scan_ctx,
+                );
+                nodes_scanned += keys.len() as u64;
                 let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
                     for &key in &keys {
@@ -950,6 +993,7 @@ pub fn execute_mut(
         nodes_created,
         nodes_deleted,
         properties_set,
+        nodes_scanned,
         execution_time_us: elapsed,
         mutations,
     })

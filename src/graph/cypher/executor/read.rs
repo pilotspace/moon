@@ -206,7 +206,7 @@ fn try_project_aggregate(
 /// unaccelerated, matching the mutable tier's existing story for numeric
 /// properties before freeze.
 #[allow(clippy::too_many_arguments)]
-fn index_scan_keys(
+pub(super) fn index_scan_keys(
     memgraph: &crate::graph::memgraph::MemGraph,
     csr_segs: &[std::sync::Arc<crate::graph::csr::CsrStorage>],
     label: Option<&String>,
@@ -575,6 +575,7 @@ pub fn execute_with_slots(
     // After Project, rows are converted to positional arrays.
     let mut projected_rows: Option<Vec<Vec<Value>>> = None;
     let nodes_created: u64 = 0;
+    let mut nodes_scanned: u64 = 0;
     let nodes_deleted: u64 = 0;
     let properties_set: u64 = 0;
 
@@ -602,6 +603,7 @@ pub fn execute_with_slots(
                     ctx.valid_time_as_of,
                     |k| keys.push(k),
                 );
+                nodes_scanned += keys.len() as u64;
                 let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
                     for &key in &keys {
@@ -630,6 +632,7 @@ pub fn execute_with_slots(
                     params,
                     ctx,
                 );
+                nodes_scanned += keys.len() as u64;
                 let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
                     for &key in &keys {
@@ -1128,6 +1131,7 @@ pub fn execute_with_slots(
         nodes_created,
         nodes_deleted,
         properties_set,
+        nodes_scanned,
         execution_time_us: elapsed,
         mutations: Vec::new(),
     })
@@ -1178,6 +1182,7 @@ pub fn execute_profile(
     let mut columns = Vec::new();
     let mut projected_rows: Option<Vec<Vec<Value>>> = None;
     let nodes_created: u64 = 0;
+    let mut nodes_scanned: u64 = 0;
     let nodes_deleted: u64 = 0;
     let properties_set: u64 = 0;
     let mut profiles = Vec::with_capacity(plan.operators.len());
@@ -1207,6 +1212,7 @@ pub fn execute_profile(
                     ctx.valid_time_as_of,
                     |k| keys.push(k),
                 );
+                nodes_scanned += keys.len() as u64;
                 let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
                     for &key in &keys {
@@ -1235,6 +1241,7 @@ pub fn execute_profile(
                     params,
                     ctx,
                 );
+                nodes_scanned += keys.len() as u64;
                 let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
                     for &key in &keys {
@@ -1734,6 +1741,7 @@ pub fn execute_profile(
             nodes_created,
             nodes_deleted,
             properties_set,
+            nodes_scanned,
             execution_time_us: elapsed,
             mutations: Vec::new(),
         },
