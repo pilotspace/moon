@@ -6,6 +6,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **A multi-key command whose keys all live on one shard now joins the slotted batch instead of cutting it (moon#513).**
+
+  moon#512 made a pipelined command that does not route by its own single key wait for the
+  batch's already-deferred remote commands, because such a command executed INLINE while
+  earlier writes in the same batch were still undispatched — silent write loss, not a stale
+  read. moon#513's mask refinement then stopped the cut when the command's keys avoid every
+  pending shard. The CO-LOCATED case was deliberately left alone: an `MGET` reading the very
+  shard the pending writes are going to genuinely could not be waved through while it still
+  ran inline.
+
+  The fix is not a further relaxation of the guard but a change to where the command runs. A
+  multi-key command whose key mask has exactly one bit has a single owner shard, so the
+  multi-key coordinator now stands aside and ordinary routing appends it to
+  `remote_groups[owner]` like a single-key command. `extract_primary_key` hashes its first
+  key, which by definition names that same owner, so the two decisions cannot disagree.
+  Ordering then comes from the slotted batch itself — the property that has always made
+  `SET k` + `GET k` correct — so the wait is discharged rather than skipped.
+
+  This is the shape `CLAUDE.md` tells users to adopt (`{tag}` co-location), so it is the shape
+  most likely to sit in a hot pipeline. Measured on Linux (moon-dev, aarch64, `--shards 4`,
+  interleaved control/fix legs, `scripts/bench-single-owner-multikey.py`), a read-modify-write
+  loop over rotating tags:
+
+  | shape | control | fix | delta |
+  |---|---|---|---|
+  | round-trip (one batch pass per group) | 41,699 ops/s, 4,499 cuts/leg | 69,014 ops/s, 0 cuts | **+65.5%** (noise 8.4%) |
+  | one huge write | 1,470,418 ops/s, 8 cuts/leg | 1,516,643 ops/s, 0 cuts | +3.1% — inside the 11.9% noise floor |
+
+  Reproduced at +64.7% on a second run. The 4,499 cuts per 6,000 groups is 75%, exactly the
+  `1 - 1/shards` remote fraction at four shards, which is the harness saying it measured
+  placement rather than noise.
+
+  Two honest caveats. The bulk shape shows no effect because one huge write means few batch
+  passes and therefore few cuts — that is a fact about the shape, not about the fix. And a
+  connection that uses a FIXED tag self-heals on Linux without this change at all: the
+  connection-affinity tracker migrates it onto the owner shard after ~16 samples, every key
+  goes local, and the cuts stop. So the change earns its keep on connections migration cannot
+  help — ones spanning many tags (a cache layer keyed by user), or ineligible for migration
+  (inside `MULTI`, subscribed, tracking, replica). Connection migration is Linux-only, so on
+  macOS the fixed-tag case cuts on every interleaving.
+
+  A key set that genuinely spans shards is unchanged: it is still consumed inline by the
+  coordinator and still waits when it meets a pending shard.
+
+  The workspace exemption is now an explicit parameter rather than a `u64::MAX` sentinel
+  passed through `pending`. A workspace connection rewrites every key to a `{<32-hex>}:` hash
+  TAG *after* the guard runs, so raw names read at the guard hash to shards the command will
+  never touch — and a single-owner mask read off them would be the most confident wrong answer
+  available. Making it a parameter means the compiler names every call site when a new
+  mask-based relaxation is added, instead of the relaxation silently escaping the sentinel.
+
 ### Fixed
 - **26 integration suites now own their server through a `Drop` guard, so a failing assert cannot orphan it.**
 

@@ -1764,6 +1764,20 @@ pub(super) async fn try_handle_cross_shard_commands(
 
     // --- Multi-key commands: MGET, MSET, DEL, UNLINK, EXISTS ---
     if is_multi_key_command(cmd, cmd_args) {
+        // moon#513 (A1): when ONE shard owns every key, decline the command here
+        // and let ordinary routing slot it into that shard's batch instead of
+        // executing it inline. `extract_primary_key` hashes its first key, which
+        // names that same owner, so the routing decision cannot disagree with this
+        // one. A LOCAL owner stays on the coordinator: it is already correct there,
+        // `remote_groups` never holds the local shard, so nothing is gained.
+        //
+        // Paired with the `count_ones() == 1` arm of `must_wait_for_pending_remote`
+        // — that arm skips the wait BECAUSE this fall-through slots the command.
+        if crate::server::conn::shared::single_owner_shard(cmd, cmd_args, ctx.num_shards)
+            .is_some_and(|owner| owner != ctx.shard_id)
+        {
+            return false;
+        }
         let mut local_barrier_pending = false;
         let response = crate::shard::coordinator::coordinate_multi_key(
             cmd,
