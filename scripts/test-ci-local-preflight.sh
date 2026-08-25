@@ -187,29 +187,43 @@ expect_run() { # expect_run <label> <want-exit> <grep-pattern> <env-prefix...>
 
 echo ""
 echo "── ci-local.sh --native control flow ──"
-DRY=$(mktemp -t cilocal-dry)
-trap 'rm -f "$DRY"' EXIT
+# `mktemp -t NAME` is a BSD spelling: GNU mktemp requires X's in the
+# template and fails outright, which is how this file first went green on
+# macOS and red on the Ubuntu runner (empty $DRY -> exit 127, not the
+# exit 2 the test asserts). Give the full path and the X's explicitly --
+# that form is correct on both.
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/cilocal-test.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT
+DRY="$TMP/dry.sh"
+
+# The "oracle present" cases only need `command -v redis-server` to
+# succeed -- the dry run never executes it -- so a stub makes them run
+# everywhere instead of skipping on any machine without redis installed.
+# A skipped guard test is a guard nobody is testing.
+mkdir -p "$TMP/bin"
+printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/redis-server"
+chmod +x "$TMP/bin/redis-server"
+WITH_ORACLE="PATH=$TMP/bin:$PATH"
+NO_ORACLE="PATH=/usr/bin:/bin"
 
 dry_ci_local "$DRY"
 # A differential compat gate with no oracle proves nothing, so a missing
 # redis-server must REFUSE (exit 2), never skip to a green summary.
-expect_run "no redis-server oracle refuses, not skips"  2 "needs a real redis-server" PATH=/usr/bin:/bin
-if command -v redis-server >/dev/null 2>&1; then
-  # And a pass must name what it did not cover — the failure this guards
-  # against is reading "RESULT: PASS" as "ready to merge".
-  expect_run "a native pass names the io_uring gap"     0 "did NOT cover" "PATH=$PATH"
+if env $NO_ORACLE command -v redis-server >/dev/null 2>&1; then
+  # Asserting the absence would be asserting this machine's layout.
+  printf "  skip  %-46s (redis-server lives in /usr/bin here)\n" \
+    "no redis-server oracle refuses, not skips"
 else
-  printf "  skip  %-46s (no redis-server on PATH)\n" "a native pass names the io_uring gap"
+  expect_run "no redis-server oracle refuses, not skips"  2 "needs a real redis-server" "$NO_ORACLE"
 fi
+# And a pass must name what it did not cover — the failure this guards
+# against is reading "RESULT: PASS" as "ready to merge".
+expect_run "a native pass names the io_uring gap"     0 "did NOT cover" "$WITH_ORACLE"
 
 # The new native summary block sits after the failure check; if it ever
 # moves above it, every failing native run would exit 0.
-if command -v redis-server >/dev/null 2>&1; then
-  expect_run "a failing native step still exits 1"       1 "RESULT: FAIL" \
-    "PATH=$PATH" "DRY_FAIL=native tokio suite"
-else
-  printf "  skip  %-46s (no redis-server on PATH)\n" "a failing native step still exits 1"
-fi
+expect_run "a failing native step still exits 1"       1 "RESULT: FAIL" \
+  "$WITH_ORACLE" "DRY_FAIL=native tokio suite"
 
 # An unknown flag is still rejected rather than silently treated as default.
 if bash scripts/ci-local.sh --bogus >/dev/null 2>&1; then
