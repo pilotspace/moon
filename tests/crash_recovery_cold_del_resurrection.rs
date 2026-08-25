@@ -40,7 +40,7 @@
 mod common;
 
 use std::io::Write;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const PROBE_COUNT: usize = 200;
@@ -74,51 +74,57 @@ fn unique_dir(suffix: &str) -> std::path::PathBuf {
     ))
 }
 
-fn start_moon(port: u16, dir: &std::path::Path) -> Child {
+fn start_moon(port: u16, dir: &std::path::Path) -> common::ServerGuard {
     let off_dir = dir.join("off");
     std::fs::create_dir_all(&off_dir).expect("create off dir");
-    Command::new(common::find_moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--shards",
-            &SHARDS.to_string(),
-            "--maxmemory",
-            &MAXMEMORY_BYTES.to_string(),
-            "--maxmemory-policy",
-            "allkeys-lru",
-            "--disk-offload",
-            "enable",
-            "--disk-offload-dir",
-            off_dir.to_str().expect("off dir utf8"),
-            // `yes` is the bug surface: KV writes (incl. the DELs) are durably
-            // logged in the per-shard AOF and replayed at boot. Under
-            // `--appendonly no` the WAL writer is skipped entirely
-            // ("WAL skipped (appendonly=no)") — nothing replays, and cold
-            // resurrection there is the documented no-AOF RPO, not this bug.
-            "--appendonly",
-            "yes",
-            // Hold the pre-sweep window open for the whole test: the DEL's
-            // manifest tombstone is deferred to this sweep, and the bug under
-            // test lives precisely in the crash-before-sweep window.
-            "--cold-orphan-sweep-interval-secs",
-            "3600",
-            // The diskfull guard write-flags DEL/FLUSHALL too (documented
-            // trade-off) and dev/CI machines routinely sit under 5% free —
-            // with the guard active the DELs under test would be REJECTED
-            // (MOONERR diskfull) and never reach the AOF, silently gutting
-            // the test (redis-cli exits 0 on error replies).
-            "--disk-free-min-pct",
-            "0",
-            "--dir",
-        ])
-        .arg(dir)
-        // Captured to a log file so a CI flake produces a real diagnostic
-        // (never Stdio::null()).
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("create moon stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("create moon stderr log"))
-        .spawn()
-        .expect("spawn moon (run `cargo build --release` with default features first)")
+    common::ServerGuard::new(
+        Command::new(common::find_moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--shards",
+                &SHARDS.to_string(),
+                "--maxmemory",
+                &MAXMEMORY_BYTES.to_string(),
+                "--maxmemory-policy",
+                "allkeys-lru",
+                "--disk-offload",
+                "enable",
+                "--disk-offload-dir",
+                off_dir.to_str().expect("off dir utf8"),
+                // `yes` is the bug surface: KV writes (incl. the DELs) are durably
+                // logged in the per-shard AOF and replayed at boot. Under
+                // `--appendonly no` the WAL writer is skipped entirely
+                // ("WAL skipped (appendonly=no)") — nothing replays, and cold
+                // resurrection there is the documented no-AOF RPO, not this bug.
+                "--appendonly",
+                "yes",
+                // Hold the pre-sweep window open for the whole test: the DEL's
+                // manifest tombstone is deferred to this sweep, and the bug under
+                // test lives precisely in the crash-before-sweep window.
+                "--cold-orphan-sweep-interval-secs",
+                "3600",
+                // The diskfull guard write-flags DEL/FLUSHALL too (documented
+                // trade-off) and dev/CI machines routinely sit under 5% free —
+                // with the guard active the DELs under test would be REJECTED
+                // (MOONERR diskfull) and never reach the AOF, silently gutting
+                // the test (redis-cli exits 0 on error replies).
+                "--disk-free-min-pct",
+                "0",
+                "--dir",
+            ])
+            .arg(dir)
+            // Captured to a log file so a CI flake produces a real diagnostic
+            // (never Stdio::null()).
+            .stdout(
+                std::fs::File::create(dir.join("moon.stdout.log")).expect("create moon stdout log"),
+            )
+            .stderr(
+                std::fs::File::create(dir.join("moon.stderr.log")).expect("create moon stderr log"),
+            )
+            .spawn()
+            .expect("spawn moon (run `cargo build --release` with default features first)"),
+    )
 }
 
 fn wait_for_port(port: u16) {
@@ -161,12 +167,12 @@ const RESTART_ATTEMPTS: usize = 6;
 
 /// Start moon, retrying the transient rebind EADDRINUSE self-shutdown race
 /// (see crash_recovery_disk_offload_no_aof.rs for the full rationale).
-fn start_moon_alive(port: u16, dir: &std::path::Path) -> Child {
+fn start_moon_alive(port: u16, dir: &std::path::Path) -> common::ServerGuard {
     for attempt in 1..=RESTART_ATTEMPTS {
         let mut child = start_moon(port, dir);
         let mut up = false;
         for _ in 0..80 {
-            if let Ok(Some(_status)) = child.try_wait() {
+            if let Ok(Some(_status)) = child.as_mut().try_wait() {
                 break;
             }
             if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
@@ -179,8 +185,7 @@ fn start_moon_alive(port: u16, dir: &std::path::Path) -> Child {
         if up {
             return child;
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill_now();
         if attempt < RESTART_ATTEMPTS {
             std::thread::sleep(Duration::from_millis(300));
         }
@@ -352,8 +357,7 @@ fn run_scenario(suffix: &str, delete_fn: impl Fn(u16)) {
     std::thread::sleep(Duration::from_secs(SETTLE_AFTER_DEL));
 
     // Hard crash inside the pre-sweep window (sweep interval is 1h).
-    server.kill().expect("SIGKILL moon");
-    let _ = server.wait();
+    server.kill_now();
     wait_for_port_down(port);
 
     // Round 2: recover and check for resurrections.
@@ -370,8 +374,7 @@ fn run_scenario(suffix: &str, delete_fn: impl Fn(u16)) {
         }
     }
 
-    server2.kill().expect("kill moon round 2");
-    let _ = server2.wait();
+    server2.kill_now();
     // Keep the data dir + server logs for post-mortem when the assertion is
     // about to fail (or when explicitly requested via MOON_TEST_KEEP=1).
     if resurrected == 0 && std::env::var("MOON_TEST_KEEP").is_err() {

@@ -190,7 +190,7 @@ fn assert_sigterm_clean_exit_shards(
     ];
     base_args.extend(extra_args.iter().map(|s| s.to_string()));
 
-    let (mut child, port) = common::spawn_listening(|port| {
+    let (mut child, port) = common::spawn_listening_guarded(|port| {
         let mut args: Vec<String> = vec!["--port".into(), port.to_string()];
         args.extend(base_args.iter().cloned());
         Command::new(moon_binary())
@@ -207,11 +207,10 @@ fn assert_sigterm_clean_exit_shards(
     // ready_timeout() doc comment). wait_for_ready also fails fast on an
     // early process exit rather than burning the whole budget.
     let deadline = ready_timeout();
-    let outcome = wait_for_ready(&mut child, port, deadline);
+    let outcome = wait_for_ready(child.as_mut(), port, deadline);
     if !matches!(outcome, Readiness::Ready) {
         let msg = readiness_failure_message(label, port, &dir, deadline, &outcome);
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill_now();
         panic!("{msg}");
     }
 
@@ -238,12 +237,11 @@ fn assert_sigterm_clean_exit_shards(
 
     let deadline = Instant::now();
     let status = loop {
-        match child.try_wait().expect("try_wait") {
+        match child.as_mut().try_wait().expect("try_wait") {
             Some(s) => break s,
             None => {
                 if deadline.elapsed() >= Duration::from_secs(10) {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    child.kill_now();
                     panic!("[{}] server did not exit within 10s after SIGTERM", label);
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -330,7 +328,7 @@ fn sigterm_clean_exit_under_write_storm() {
     std::fs::create_dir_all(&dir).expect("mk tmpdir");
     let dir_str = dir.to_string_lossy().into_owned();
 
-    let (mut child, port) = common::spawn_listening(|port| {
+    let (mut child, port) = common::spawn_listening_guarded(|port| {
         Command::new(moon_binary())
             .args([
                 "--port",
@@ -350,11 +348,10 @@ fn sigterm_clean_exit_under_write_storm() {
     let pid = child.id();
 
     let deadline = ready_timeout();
-    let outcome = wait_for_ready(&mut child, port, deadline);
+    let outcome = wait_for_ready(child.as_mut(), port, deadline);
     if !matches!(outcome, Readiness::Ready) {
         let msg = readiness_failure_message("storm", port, &dir, deadline, &outcome);
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill_now();
         panic!("{msg}");
     }
 
@@ -401,13 +398,12 @@ fn sigterm_clean_exit_under_write_storm() {
 
     let deadline = Instant::now();
     let status = loop {
-        match child.try_wait().expect("try_wait") {
+        match child.as_mut().try_wait().expect("try_wait") {
             Some(s) => break s,
             None => {
                 if deadline.elapsed() >= Duration::from_secs(10) {
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    child.kill_now();
                     panic!("[storm] server did not exit within 10s after SIGTERM");
                 }
                 std::thread::sleep(Duration::from_millis(100));

@@ -26,7 +26,7 @@ mod common;
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 fn moon_bin() -> std::path::PathBuf {
@@ -38,42 +38,26 @@ fn moon_bin() -> std::path::PathBuf {
     common::find_moon_binary()
 }
 
-fn start_moon(port: u16, dir: &str, shards: usize) -> Child {
-    Command::new(moon_bin())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--shards",
-            &shards.to_string(),
-            "--dir",
-            dir,
-            "--appendonly",
-            "yes",
-            "--disk-free-min-pct",
-            "0",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("Failed to start moon (set MOON_BIN to a built binary)")
-}
-
-fn sigkill(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        let pid = child.id() as i32;
-        // SAFETY: kill(2) with a pid we own from Child::id; SIGKILL is the
-        // whole point of the crash test.
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
-        let _ = child.wait();
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+fn start_moon(port: u16, dir: &str, shards: usize) -> common::ServerGuard {
+    common::ServerGuard::new(
+        Command::new(moon_bin())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--shards",
+                &shards.to_string(),
+                "--dir",
+                dir,
+                "--appendonly",
+                "yes",
+                "--disk-free-min-pct",
+                "0",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Failed to start moon (set MOON_BIN to a built binary)"),
+    )
 }
 
 /// One persistent connection; sends inline commands and reads one reply each.
@@ -168,7 +152,7 @@ fn run_case(shards: usize) {
 
     // everysec fsync window.
     std::thread::sleep(Duration::from_millis(1600));
-    sigkill(&mut server);
+    server.kill_now();
 
     let mut server = start_moon(port, &dir_path, shards);
     wait_ready(&addr);
@@ -194,7 +178,7 @@ fn run_case(shards: usize) {
     assert_eq!(db0, ":21", "db0 size after recovery (shards={shards})");
     assert_eq!(db2, ":20", "db2 size after recovery (shards={shards})");
 
-    sigkill(&mut server);
+    server.kill_now();
 }
 
 /// TopLevel AOF writer (shards=1).
@@ -260,7 +244,7 @@ fn run_txn_case(shards: usize) {
     );
 
     std::thread::sleep(Duration::from_millis(1600));
-    sigkill(&mut server);
+    server.kill_now();
 
     let mut server = start_moon(port, &dir_path, shards);
     wait_ready(&addr);
@@ -287,7 +271,7 @@ fn run_txn_case(shards: usize) {
         "t2 recovery placement in db2 diverges from memory placement"
     );
 
-    sigkill(&mut server);
+    server.kill_now();
 }
 
 #[test]

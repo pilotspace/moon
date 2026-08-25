@@ -206,12 +206,12 @@ const RESTART_ATTEMPTS: usize = 6;
 /// for the full rationale). Deliberately NOT `common::spawn_listening` here:
 /// that helper reserves a fresh port on each retry, but a restart must reuse
 /// the exact port/dir this scenario already spawned on.
-fn restart_moon_alive(port: u16, dir: &std::path::Path) -> Child {
+fn restart_moon_alive(port: u16, dir: &std::path::Path) -> common::ServerGuard {
     for attempt in 1..=RESTART_ATTEMPTS {
-        let mut child = spawn_moon(port, dir);
+        let mut child = common::ServerGuard::new(spawn_moon(port, dir));
         let mut up = false;
         for _ in 0..80 {
-            if let Ok(Some(_status)) = child.try_wait() {
+            if let Ok(Some(_status)) = child.as_mut().try_wait() {
                 break;
             }
             if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
@@ -224,8 +224,7 @@ fn restart_moon_alive(port: u16, dir: &std::path::Path) -> Child {
         if up {
             return child;
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill_now();
         if attempt < RESTART_ATTEMPTS {
             std::thread::sleep(Duration::from_millis(300));
         }
@@ -239,7 +238,7 @@ fn single_shard_overwritten_cold_key_returns_new_value_after_crash() {
     let dir = unique_dir("overwrite");
     std::fs::create_dir_all(&dir).expect("create test dir");
 
-    let (mut server, port) = common::spawn_listening(|p| spawn_moon(p, &dir));
+    let (mut server, port) = common::spawn_listening_guarded(|p| spawn_moon(p, &dir));
 
     let v1 = "1".repeat(PROBE_VALUE_LEN);
     for i in 0..PROBE_COUNT {
@@ -266,7 +265,7 @@ fn single_shard_overwritten_cold_key_returns_new_value_after_crash() {
     );
     std::thread::sleep(Duration::from_secs(SETTLE_AFTER_OVERWRITE));
 
-    common::sigkill(&mut server);
+    server.kill_now();
     common::wait_for_port_down(port);
 
     let mut server2 = restart_moon_alive(port, &dir);
@@ -287,7 +286,7 @@ fn single_shard_overwritten_cold_key_returns_new_value_after_crash() {
         }
     }
 
-    common::sigkill(&mut server2);
+    server2.kill_now();
     if wrong == 0 && missing == 0 && std::env::var("MOON_TEST_KEEP").is_err() {
         let _ = std::fs::remove_dir_all(&dir);
     } else {

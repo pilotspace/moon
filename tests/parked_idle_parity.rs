@@ -122,7 +122,7 @@ fn command_reply(stream: &mut TcpStream, cmd: &str) -> String {
 #[test]
 fn parked_connection_serves_all_traffic_after_wake() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
+    let (mut child, port) = common::spawn_listening_guarded(|p| spawn_moon(dir.path(), p));
 
     let mut conn = connect_retry(port);
     conn.set_nodelay(true).ok();
@@ -164,8 +164,7 @@ fn parked_connection_serves_all_traffic_after_wake() {
         "4 KiB value must survive the park cycle"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
 }
 
 /// A parked connection must stay in CLIENT LIST, and CLIENT KILL must close
@@ -182,7 +181,7 @@ fn parked_connection_serves_all_traffic_after_wake() {
 #[test]
 fn parked_connection_visible_and_killable() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
+    let (mut child, port) = common::spawn_listening_guarded(|p| spawn_moon(dir.path(), p));
 
     // Victim: name itself so the control conn can find its id, then park.
     let mut victim = connect_retry(port);
@@ -239,8 +238,7 @@ fn parked_connection_visible_and_killable() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
 }
 
 /// Registry identity must survive a park/wake cycle unbroken: the resumed
@@ -250,7 +248,7 @@ fn parked_connection_visible_and_killable() {
 #[test]
 fn resumed_connection_keeps_registry_identity() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
+    let (mut child, port) = common::spawn_listening_guarded(|p| spawn_moon(dir.path(), p));
 
     let mut victim = connect_retry(port);
     victim.set_nodelay(true).ok();
@@ -295,8 +293,7 @@ fn resumed_connection_keeps_registry_identity() {
         );
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
 }
 
 /// A client that dies with an RST while its connection is parked must be
@@ -308,7 +305,7 @@ fn resumed_connection_keeps_registry_identity() {
 #[test]
 fn rst_while_parked_tears_down_promptly() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
+    let (mut child, port) = common::spawn_listening_guarded(|p| spawn_moon(dir.path(), p));
 
     let victim = connect_retry(port);
     {
@@ -355,15 +352,14 @@ fn rst_while_parked_tears_down_promptly() {
         "RST'd parked connection still registered:\n{list}"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
 }
 
 /// An active sibling must be undisturbed while its neighbor parks and wakes.
 #[test]
 fn active_sibling_undisturbed_by_parking() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
+    let (mut child, port) = common::spawn_listening_guarded(|p| spawn_moon(dir.path(), p));
 
     let mut idle = connect_retry(port);
     ping(&mut idle);
@@ -384,8 +380,7 @@ fn active_sibling_undisturbed_by_parking() {
     // The parked sibling still answers.
     ping(&mut idle);
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
 }
 
 /// c10k D2: a connection holding a PARTIAL frame must park, and the fragment
@@ -406,7 +401,7 @@ fn active_sibling_undisturbed_by_parking() {
 #[test]
 fn partial_frame_survives_a_park() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, port) = common::spawn_listening(|p| spawn_moon(dir.path(), p));
+    let (mut child, port) = common::spawn_listening_guarded(|p| spawn_moon(dir.path(), p));
 
     let mut conn = connect_retry(port);
     conn.set_nodelay(true).ok();
@@ -436,8 +431,7 @@ fn partial_frame_survives_a_park() {
     // must not have left stray bytes in the buffer.
     ping(&mut conn);
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
 }
 
 /// F6 (#438, sec L2): an UNAUTHENTICATED connection on an auth-enabled server
@@ -455,8 +449,9 @@ fn partial_frame_survives_a_park() {
 #[test]
 fn unauthenticated_conn_never_task_parks() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, port) =
-        common::spawn_listening(|p| spawn_moon_with(dir.path(), p, &["--requirepass", "park-f6"]));
+    let (mut child, port) = common::spawn_listening_guarded(|p| {
+        spawn_moon_with(dir.path(), p, &["--requirepass", "park-f6"])
+    });
 
     // Positive control: authenticated, then idle past the park threshold.
     let mut authed = connect_retry(port);
@@ -519,6 +514,5 @@ fn unauthenticated_conn_never_task_parks() {
     }
 
     drop(silent);
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
 }

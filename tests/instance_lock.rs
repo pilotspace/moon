@@ -106,9 +106,11 @@ fn second_instance_on_same_dir_is_refused_and_kill9_releases_the_lock() {
 
     // First instance: must come up normally.
     let port_a = common::reserve_port();
-    let mut a = moon_cmd(dir.path(), port_a, "moon-a")
-        .spawn()
-        .expect("spawn A");
+    let mut a = common::ServerGuard::new(
+        moon_cmd(dir.path(), port_a, "moon-a")
+            .spawn()
+            .expect("spawn A"),
+    );
     assert!(
         wait_ping(port_a, Duration::from_secs(30)),
         "first instance never became ready"
@@ -117,12 +119,14 @@ fn second_instance_on_same_dir_is_refused_and_kill9_releases_the_lock() {
     // Second instance, SAME --dir, different port: must exit non-zero,
     // quickly, with a diagnostic — not run alongside A.
     let port_b = common::reserve_port();
-    let mut b = moon_cmd(dir.path(), port_b, "moon-b")
-        .spawn()
-        .expect("spawn B");
+    let mut b = common::ServerGuard::new(
+        moon_cmd(dir.path(), port_b, "moon-b")
+            .spawn()
+            .expect("spawn B"),
+    );
     let b_deadline = Instant::now() + Duration::from_secs(15);
     let b_status = loop {
-        if let Some(status) = b.try_wait().expect("try_wait B") {
+        if let Some(status) = b.as_mut().try_wait().expect("try_wait B") {
             break status;
         }
         assert!(
@@ -151,22 +155,22 @@ fn second_instance_on_same_dir_is_refused_and_kill9_releases_the_lock() {
 
     // kill -9 A: no unlock code runs. An immediate same-dir restart must
     // succeed (the kernel released the flock with the process).
-    common::sigkill(&mut a);
+    a.kill_now();
     common::wait_for_port_down(port_a);
 
     let port_c = common::reserve_port();
-    let mut c = moon_cmd(dir.path(), port_c, "moon-c")
-        .spawn()
-        .expect("spawn C");
+    let mut c = common::ServerGuard::new(
+        moon_cmd(dir.path(), port_c, "moon-c")
+            .spawn()
+            .expect("spawn C"),
+    );
     assert!(
         wait_ping(port_c, Duration::from_secs(30)),
         "restart after kill -9 never became ready — stale lock? stderr:\n{}",
         std::fs::read_to_string(dir.path().join("moon-c.stderr.log")).unwrap_or_default()
     );
-    common::sigkill(&mut c);
-    let _ = c.wait();
-    let _ = a.wait();
-    let _ = b.wait();
+    // kill_now() kills AND reaps; a, b already exited on their own.
+    c.kill_now();
 }
 
 /// A `--disk-offload-dir` that spells the SAME directory as `--dir`
@@ -190,7 +194,7 @@ fn same_dir_offload_spelled_differently_does_not_self_conflict() {
         "--disk-offload-dir",
         &respelled.to_string_lossy(),
     ]);
-    let mut a = a.spawn().expect("spawn with respelled offload dir");
+    let mut a = common::ServerGuard::new(a.spawn().expect("spawn with respelled offload dir"));
     assert!(
         wait_ping(port, Duration::from_secs(30)),
         "startup self-conflicted on its own lock — same-dir --disk-offload-dir \
@@ -198,6 +202,5 @@ fn same_dir_offload_spelled_differently_does_not_self_conflict() {
          stderr:\n{}",
         std::fs::read_to_string(base.join("moon-respell.stderr.log")).unwrap_or_default()
     );
-    common::sigkill(&mut a);
-    let _ = a.wait();
+    a.kill_now();
 }

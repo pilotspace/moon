@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **26 integration suites now own their server through a `Drop` guard, so a failing assert cannot orphan it.**
+
+  Every one of these suites killed its server on the last line of the test body. That line is only
+  reached when the test passes: a failing `assert!` unwinds straight past it, the `Child` is
+  dropped without `kill()` (Rust's `Child::drop` deliberately does *not* reap), and the moon
+  process is reparented to init. It then runs forever — this is not a tidy-up nicety. Five such
+  orphans were measured on the dev host burning ~170% CPU each (834% combined) for 7.5 hours,
+  one thread showing 13:42 system time against 0:09 user.
+
+  `common::ServerGuard` owns the child and SIGKILLs it in `Drop`, so the reap happens on the
+  unwind path and on the success path alike; `kill_now()` is idempotent, and `take()` hands
+  ownership back for the suites that deliberately outlive their server. The 14 suites that go
+  through `common::spawn_listening` use the new `spawn_listening_guarded`; the other 12 wrap their
+  own `Command::spawn()` chains. Seven now-dead file-local `sigkill` copies are deleted.
+
+  `tests/server_guard_contract.rs` proves the guard rather than assuming it: a deliberately
+  panicking test must leave no live pid, an explicit `kill_now()` followed by `Drop` must not
+  double-kill, and `take()` must transfer ownership. The panic test is `#[cfg(unix)]` and its
+  `ps` probe `expect`s — on Windows the suite really runs, and a probe that could not spawn would
+  have reported "not alive" and passed vacuously. Mutation-checked: `mem::forget(guard)` fails it
+  with "server pid N survived a panicking test".
+
 - **`mq_integration` no longer races its own server on port or on startup.**
 
   The fixture reserved a port by binding `127.0.0.1:0` and immediately dropping the listener,

@@ -389,7 +389,7 @@ fn commit_barrier_covers_preceding_appends() {
 mod integration {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Command, Stdio};
     use std::time::Duration;
 
     fn unique_dir(suffix: &str) -> std::path::PathBuf {
@@ -405,24 +405,35 @@ mod integration {
         ))
     }
 
-    fn start_moon(port: u16, dir: &std::path::Path, shards: u16, fsync: &str) -> Child {
-        Command::new(super::common::find_moon_binary())
-            .args([
-                "--port",
-                &port.to_string(),
-                "--shards",
-                &shards.to_string(),
-                "--appendonly",
-                "yes",
-                "--appendfsync",
-                fsync,
-                "--dir",
-            ])
-            .arg(dir)
-            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("create stdout log"))
-            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("create stderr log"))
-            .spawn()
-            .expect("spawn moon — run `cargo build --release` first")
+    fn start_moon(
+        port: u16,
+        dir: &std::path::Path,
+        shards: u16,
+        fsync: &str,
+    ) -> super::common::ServerGuard {
+        super::common::ServerGuard::new(
+            Command::new(super::common::find_moon_binary())
+                .args([
+                    "--port",
+                    &port.to_string(),
+                    "--shards",
+                    &shards.to_string(),
+                    "--appendonly",
+                    "yes",
+                    "--appendfsync",
+                    fsync,
+                    "--dir",
+                ])
+                .arg(dir)
+                .stdout(
+                    std::fs::File::create(dir.join("moon.stdout.log")).expect("create stdout log"),
+                )
+                .stderr(
+                    std::fs::File::create(dir.join("moon.stderr.log")).expect("create stderr log"),
+                )
+                .spawn()
+                .expect("spawn moon — run `cargo build --release` first"),
+        )
     }
 
     fn wait_for_port(port: u16) {
@@ -434,16 +445,6 @@ mod integration {
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!("moon did not start within 8s on port {}", port);
-    }
-
-    fn sigkill(child: &mut Child) {
-        let pid = child.id() as i32;
-        // SAFETY: `pid` is this test's own freshly-spawned child; SIGKILL has no
-        // userspace side effects beyond terminating it. We then reap it.
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
-        let _ = child.wait();
     }
 
     /// Read one RESP reply line and return it trimmed (e.g. ":42", "+OK", "-ERR ...").
@@ -530,7 +531,7 @@ mod integration {
 
         // Every counted INCR was acked ⇒ fsynced under Always. Kill WITHOUT a
         // quiescing sleep: the durability contract is that each ack already saw disk.
-        sigkill(&mut child);
+        child.kill_now();
 
         // -- recover --
         let mut child2 = start_moon(port, &dir, shards, "always");
@@ -543,7 +544,7 @@ mod integration {
                 wrong.push(format!("{}: want={} got={}", key, want, got));
             }
         }
-        sigkill(&mut child2);
+        child2.kill_now();
 
         assert!(
             wrong.is_empty(),
@@ -587,12 +588,12 @@ mod integration {
 
         let acked = incr_acked(port, "lone:counter", 200);
         assert!(acked > 0, "lone writer made no progress");
-        sigkill(&mut child);
+        child.kill_now();
 
         let mut child2 = start_moon(port, &dir, 1, "always");
         wait_for_port(port);
         let got = get_int(port, "lone:counter");
-        sigkill(&mut child2);
+        child2.kill_now();
 
         assert_eq!(
             got, acked as i64,
@@ -648,7 +649,7 @@ mod integration {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = rewriter.join();
 
-        sigkill(&mut child);
+        child.kill_now();
 
         let mut child2 = start_moon(port, &dir, 4, "always");
         wait_for_port(port);
@@ -659,7 +660,7 @@ mod integration {
                 wrong.push(format!("{}: want={} got={}", key, want, got));
             }
         }
-        sigkill(&mut child2);
+        child2.kill_now();
 
         assert!(
             wrong.is_empty(),

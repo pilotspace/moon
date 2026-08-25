@@ -26,7 +26,7 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn moon_binary() -> Option<std::path::PathBuf> {
@@ -55,15 +55,14 @@ fn moon_binary() -> Option<std::path::PathBuf> {
 /// A running moon process bound to `port`, persisting into `dir`. Does NOT
 /// remove `dir` on drop — the durability test restarts against the same dir.
 struct Moon {
-    child: Child,
+    child: common::ServerGuard,
     port: u16,
 }
 
 impl Moon {
     fn kill9(mut self) {
         // Hard kill: exercise crash recovery, not graceful shutdown flush.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.kill_now();
     }
 }
 
@@ -115,7 +114,7 @@ fn wait_moon_ready(moon: Moon) -> Option<Moon> {
 fn spawn_moon_persistent_first(dir: &std::path::Path) -> Option<Moon> {
     let bin = moon_binary()?;
     let args = persistent_args(dir);
-    let (child, port) = common::spawn_listening(|port| {
+    let (child, port) = common::spawn_listening_guarded(|port| {
         Command::new(&bin)
             .args(["--port".to_string(), port.to_string()])
             .args(&args)
@@ -140,7 +139,10 @@ fn spawn_moon_persistent_restart(port: u16, dir: &std::path::Path) -> Option<Moo
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    wait_moon_ready(Moon { child, port })
+    wait_moon_ready(Moon {
+        child: common::ServerGuard::new(child),
+        port,
+    })
 }
 
 /// One parsed RESP2 reply — only the shapes these tests need.

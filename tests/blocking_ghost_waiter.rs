@@ -131,7 +131,7 @@ fn timed_out_cross_shard_blpop_does_not_swallow_the_next_push() {
         return;
     }
 
-    let (mut child, port) = common::spawn_listening(|port| {
+    let (mut child, port) = common::spawn_listening_guarded(|port| {
         let tmp_dir = std::env::temp_dir().join(format!("moon-ghost-waiter-{port}"));
         let _ = std::fs::create_dir_all(&tmp_dir);
         Command::new(&bin)
@@ -195,7 +195,7 @@ fn timed_out_cross_shard_blpop_does_not_swallow_the_next_push() {
         }
     });
 
-    common::sigkill(&mut child);
+    child.kill_now();
     let _ = std::fs::remove_dir_all(&tmp_dir);
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
@@ -213,7 +213,7 @@ fn woken_cross_shard_blpop_consumes_exactly_one_element() {
         return;
     }
 
-    let (mut child, port) = common::spawn_listening(|port| {
+    let (mut child, port) = common::spawn_listening_guarded(|port| {
         let tmp_dir = std::env::temp_dir().join(format!("moon-wake-once-{port}"));
         let _ = std::fs::create_dir_all(&tmp_dir);
         Command::new(&bin)
@@ -271,7 +271,7 @@ fn woken_cross_shard_blpop_consumes_exactly_one_element() {
         }
     });
 
-    common::sigkill(&mut child);
+    child.kill_now();
     let _ = std::fs::remove_dir_all(&tmp_dir);
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);

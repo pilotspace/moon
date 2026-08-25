@@ -388,6 +388,88 @@ pub fn find_moon_binary() -> PathBuf {
     );
 }
 
+/// Owns a spawned server and reaps it on drop — including when the scope is
+/// left by an unwinding panic (moon#713).
+///
+/// The pattern this replaces puts the kill on the last line of the test body:
+///
+/// ```ignore
+/// let mut child = spawn(port);
+/// assert_eq!(get(port, "k"), "v");   // <- fires
+/// common::sigkill(&mut child);       // <- never runs; the unwind goes past it
+/// ```
+///
+/// The orphan is not merely untidy. Measured 2026-08-25 after one afternoon of
+/// deliberately-failing runs of a single suite: five orphaned servers, ~170%
+/// CPU each (834% combined) for 7.5 hours, answering nothing on their ports and
+/// spending the time in syscalls (13:42 system vs 0:09 user on one thread).
+/// Every wall-clock-sensitive test that ran afterwards ran on a machine under
+/// invisible load.
+///
+/// SIGKILL, not a graceful shutdown: these are throwaway data dirs, and a hung
+/// server — often the very thing under test — would ignore a polite request.
+pub struct ServerGuard {
+    child: Option<Child>,
+    pid: u32,
+}
+
+impl ServerGuard {
+    pub fn new(child: Child) -> Self {
+        let pid = child.id();
+        Self {
+            child: Some(child),
+            pid,
+        }
+    }
+
+    /// The server's pid, still readable after the child has been reaped or
+    /// taken — assertions about orphans must name the PROCESS, since a dead
+    /// server's port frees up either way.
+    pub fn id(&self) -> u32 {
+        self.pid
+    }
+
+    /// Borrow the child for the things only a `Child` can answer:
+    /// `try_wait`, custom readiness loops, stdio handles.
+    pub fn as_mut(&mut self) -> &mut Child {
+        self.child
+            .as_mut()
+            .expect("server child was already taken or reaped")
+    }
+
+    /// Reap now, for a test that needs the server GONE rather than merely
+    /// doomed — a same-dir restart, or a lock the next server must acquire.
+    ///
+    /// Idempotent by construction: crash-recovery suites SIGKILL on purpose and
+    /// then restart, so "already reaped" is a normal state. A second call must
+    /// not re-`kill` a pid the OS is free to have recycled.
+    pub fn kill_now(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            sigkill(&mut child);
+        }
+    }
+
+    /// Hand the raw child back, transferring the duty to reap it. The guard
+    /// keeps the pid for assertions but will not touch the process again.
+    pub fn take(&mut self) -> Option<Child> {
+        self.child.take()
+    }
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        self.kill_now();
+    }
+}
+
+/// [`spawn_listening`] that hands back a [`ServerGuard`] instead of a bare
+/// `Child`, so a panic between here and the explicit kill cannot orphan the
+/// server.
+pub fn spawn_listening_guarded(spawn: impl FnMut(u16) -> Child) -> (ServerGuard, u16) {
+    let (child, port) = spawn_listening(spawn);
+    (ServerGuard::new(child), port)
+}
+
 /// SIGKILL a spawned child and reap it (never SIGTERM — SIGTERM +
 /// SO_REUSEPORT is a documented hang, see CLAUDE.md / the harness-speed
 /// gotcha ledger). `Child::kill()` is documented to send SIGKILL on Unix,

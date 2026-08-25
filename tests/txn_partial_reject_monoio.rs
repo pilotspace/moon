@@ -18,9 +18,9 @@ use std::process::{Child, Command, Stdio};
 
 const SHARDS: usize = 4;
 
-fn spawn_moon(dir: &std::path::Path) -> (Child, u16) {
+fn spawn_moon(dir: &std::path::Path) -> (common::ServerGuard, u16) {
     let bin = common::find_moon_binary();
-    common::spawn_listening(|port| {
+    common::spawn_listening_guarded(|port| {
         Command::new(&bin)
             .args([
                 "--bind",
@@ -120,7 +120,7 @@ fn monoio_txn_commit_aborts_when_ops_were_rejected() {
         "expected not-in-txn error, got: {again:?}"
     );
 
-    common::sigkill(&mut child);
+    child.kill_now();
 }
 
 /// Regression on the shipped runtime: a transaction with no rejected ops still
@@ -179,5 +179,5 @@ fn monoio_txn_commit_ok_when_no_op_was_rejected() {
         assert_eq!(conn.send(&["GET", key]), "$-1\r\n", "{key} must not exist");
     }
 
-    common::sigkill(&mut child);
+    child.kill_now();
 }

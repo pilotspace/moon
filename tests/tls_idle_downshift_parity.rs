@@ -186,7 +186,8 @@ fn tls_idle_connection_serves_all_traffic_after_downshift() {
         return;
     }
     let tls_port = common::reserve_port();
-    let (mut child, _port) = common::spawn_listening(|p| spawn_moon_tls(dir.path(), p, tls_port));
+    let (mut child, _port) =
+        common::spawn_listening_guarded(|p| spawn_moon_tls(dir.path(), p, tls_port));
     // spawn_listening waits on the plain port; give the TLS listener a
     // moment if it comes up second.
     let mut conn = None;
@@ -238,8 +239,7 @@ fn tls_idle_connection_serves_all_traffic_after_downshift() {
         "4 KiB value must survive the downshifted TLS round trip"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
 }
 
 /// c1M P1-TLS: task-exit parking must be invisible on the TLS wire. With
@@ -261,7 +261,7 @@ fn tls_parked_connection_serves_traffic_and_stays_killable() {
     }
     let tls_port = common::reserve_port();
     let (mut child, plain_port) =
-        common::spawn_listening(|p| spawn_moon_tls_park(dir.path(), p, tls_port, 2));
+        common::spawn_listening_guarded(|p| spawn_moon_tls_park(dir.path(), p, tls_port, 2));
     let mut conn = None;
     for _ in 0..50 {
         match std::panic::catch_unwind(|| TlsConn::connect(tls_port)) {
@@ -347,8 +347,7 @@ fn tls_parked_connection_serves_traffic_and_stays_killable() {
         Ok(n) => panic!("expected close, got {n} raw bytes"),
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
 }
 
 /// A TLS client that vanishes with a raw TCP FIN (no close_notify) while
@@ -368,7 +367,7 @@ fn tls_fin_while_parked_tears_down_promptly() {
     }
     let tls_port = common::reserve_port();
     let (mut child, plain_port) =
-        common::spawn_listening(|p| spawn_moon_tls_park(dir.path(), p, tls_port, 2));
+        common::spawn_listening_guarded(|p| spawn_moon_tls_park(dir.path(), p, tls_port, 2));
     let mut conn = None;
     for _ in 0..50 {
         match std::panic::catch_unwind(|| TlsConn::connect(tls_port)) {
@@ -417,6 +416,5 @@ fn tls_fin_while_parked_tears_down_promptly() {
         "FIN'd parked TLS connection still registered:\n{list}"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
 }

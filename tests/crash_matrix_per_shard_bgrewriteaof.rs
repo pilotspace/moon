@@ -29,7 +29,7 @@
 
 mod common;
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 fn unique_dir(suffix: &str) -> std::path::PathBuf {
@@ -45,38 +45,44 @@ fn unique_dir(suffix: &str) -> std::path::PathBuf {
     ))
 }
 
-fn start_moon(port: u16, dir: &std::path::Path) -> Child {
-    Command::new(common::find_moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--shards",
-            "2",
-            "--appendonly",
-            "yes",
-            "--appendfsync",
-            "everysec",
-            // F6: open the gate so BGREWRITEAOF routes to the per-shard
-            // fan-out coordinator instead of the refusal error.
-            "--experimental-per-shard-rewrite",
-            // Diskfull guard guts crash tests: on hosts hovering near the 5%
-            // free-space threshold the guard rejects mid-stream INCRs with
-            // MOONERR diskfull, and recovery then "loses" writes that were in
-            // fact never acked (observed: host at 3.9% free → recovered 191
-            // of 500 with the other 309 rejected). Crash harnesses always
-            // disable it.
-            "--disk-free-min-pct",
-            "0",
-            "--dir",
-        ])
-        .arg(dir)
-        // Pipe child stdio to log files — a silent connection-refused flake
-        // would otherwise hide the real startup error (see
-        // feedback_silenced_child_stdio_flake).
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("create moon stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("create moon stderr log"))
-        .spawn()
-        .expect("spawn moon (run `cargo build --release` with default features first)")
+fn start_moon(port: u16, dir: &std::path::Path) -> common::ServerGuard {
+    common::ServerGuard::new(
+        Command::new(common::find_moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--shards",
+                "2",
+                "--appendonly",
+                "yes",
+                "--appendfsync",
+                "everysec",
+                // F6: open the gate so BGREWRITEAOF routes to the per-shard
+                // fan-out coordinator instead of the refusal error.
+                "--experimental-per-shard-rewrite",
+                // Diskfull guard guts crash tests: on hosts hovering near the 5%
+                // free-space threshold the guard rejects mid-stream INCRs with
+                // MOONERR diskfull, and recovery then "loses" writes that were in
+                // fact never acked (observed: host at 3.9% free → recovered 191
+                // of 500 with the other 309 rejected). Crash harnesses always
+                // disable it.
+                "--disk-free-min-pct",
+                "0",
+                "--dir",
+            ])
+            .arg(dir)
+            // Pipe child stdio to log files — a silent connection-refused flake
+            // would otherwise hide the real startup error (see
+            // feedback_silenced_child_stdio_flake).
+            .stdout(
+                std::fs::File::create(dir.join("moon.stdout.log")).expect("create moon stdout log"),
+            )
+            .stderr(
+                std::fs::File::create(dir.join("moon.stderr.log")).expect("create moon stderr log"),
+            )
+            .spawn()
+            .expect("spawn moon (run `cargo build --release` with default features first)"),
+    )
 }
 
 fn wait_for_port(port: u16) {
@@ -139,21 +145,6 @@ fn bgrewriteaof(port: u16) -> String {
         reply
     );
     reply
-}
-
-#[cfg(unix)]
-fn sigkill(child: &mut Child) {
-    let pid = child.id() as i32;
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-    }
-    let _ = child.wait();
-}
-
-#[cfg(not(unix))]
-fn sigkill(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Count base RDB files under `appendonlydir/shard-*/` whose seq > 1. The
@@ -240,7 +231,7 @@ fn bgrewriteaof_straddle_crash_recovers_exact() {
         dir.display()
     );
 
-    sigkill(&mut child);
+    child.kill_now();
 
     // -- Round 2 (recovery) ---------------------------------------------
     let mut child2 = start_moon(port, &dir);
@@ -249,7 +240,7 @@ fn bgrewriteaof_straddle_crash_recovers_exact() {
     let got_a = redis_get_i64(port, key_a);
     let got_b = redis_get_i64(port, key_b);
 
-    sigkill(&mut child2);
+    child2.kill_now();
 
     assert_eq!(
         got_a, N,
@@ -325,7 +316,7 @@ fn bgrewriteaof_base_plus_incr_recovers_exact() {
     // Quiesce so the everysec window flushes the POST INCRs.
     std::thread::sleep(Duration::from_millis(1500));
 
-    sigkill(&mut child);
+    child.kill_now();
 
     // -- Round 2 (recovery) ---------------------------------------------
     let mut child2 = start_moon(port, &dir);
@@ -333,7 +324,7 @@ fn bgrewriteaof_base_plus_incr_recovers_exact() {
 
     let got = redis_get_i64(port, key);
 
-    sigkill(&mut child2);
+    child2.kill_now();
 
     assert_eq!(
         got,

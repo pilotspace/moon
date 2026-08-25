@@ -162,7 +162,7 @@ fn rewrite_under_pipelined_load_loses_no_acked_writes() {
 
     let dir = unique_dir("rewrite-flood");
     std::fs::create_dir_all(&dir).unwrap();
-    let (mut child, port) = common::spawn_listening(|p| start_moon(p, &dir, 2));
+    let (mut child, port) = common::spawn_listening_guarded(|p| start_moon(p, &dir, 2));
 
     let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
     sock.set_nodelay(true).ok();
@@ -223,9 +223,9 @@ fn rewrite_under_pipelined_load_loses_no_acked_writes() {
 
     // Quiesce past the everysec window + post-fold drains, then crash.
     std::thread::sleep(Duration::from_millis(2500));
-    common::sigkill(&mut child);
+    child.kill_now();
 
-    let (mut child2, port2) = common::spawn_listening(|p| start_moon(p, &dir, 2));
+    let (mut child2, port2) = common::spawn_listening_guarded(|p| start_moon(p, &dir, 2));
     let dbsize: usize = cli(port2, &["DBSIZE"])
         .parse()
         .expect("DBSIZE must be numeric after recovery");
@@ -248,6 +248,6 @@ fn rewrite_under_pipelined_load_loses_no_acked_writes() {
          (missing {} of {expected})",
         expected - dbsize.min(expected)
     );
-    common::sigkill(&mut child2);
+    child2.kill_now();
     let _ = std::fs::remove_dir_all(&dir);
 }

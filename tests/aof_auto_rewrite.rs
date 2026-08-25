@@ -71,8 +71,12 @@ fn start_moon(port: u16, dir: &std::path::Path, shards: usize, extra: &[&str]) -
         .expect("spawn moon (cargo build first; MOON_BIN to override)")
 }
 
-fn spawn_listening(dir: &std::path::Path, shards: usize, extra: &[&str]) -> (Child, u16) {
-    common::spawn_listening(|port| start_moon(port, dir, shards, extra))
+fn spawn_listening(
+    dir: &std::path::Path,
+    shards: usize,
+    extra: &[&str],
+) -> (common::ServerGuard, u16) {
+    common::spawn_listening_guarded(|port| start_moon(port, dir, shards, extra))
 }
 
 fn cli(port: u16, args: &[&str]) -> String {
@@ -94,16 +98,6 @@ fn incr(port: u16, key: &str) -> i64 {
     reply.parse().unwrap_or_else(|_| {
         panic!("INCR {key} not acked with a number — harness cannot count it: {reply:?}")
     })
-}
-
-fn sigkill(child: &mut Child) {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(child.id() as i32, libc::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// True when a base RDB with seq > `min_seq_exclusive` exists anywhere under
@@ -233,12 +227,12 @@ fn manual_bgrewriteaof_ungated_on_multi_shard() {
         incr(port, "cnt:{a}");
     }
     std::thread::sleep(Duration::from_millis(2000));
-    sigkill(&mut child);
+    child.kill_now();
 
     let (mut child2, port2) = spawn_listening(&dir, 2, &[]);
     assert_eq!(cli(port2, &["GET", "cnt:{a}"]), (N + 50).to_string());
     assert_eq!(cli(port2, &["GET", "cnt:{b}"]), N.to_string());
-    sigkill(&mut child2);
+    child2.kill_now();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -277,7 +271,7 @@ fn auto_rewrite_triggers_on_growth_multi_shard() {
         incr(port, "cnt:{a}");
     }
     std::thread::sleep(Duration::from_millis(2000));
-    sigkill(&mut child);
+    child.kill_now();
 
     let (mut child2, port2) = spawn_listening(&dir, 2, &[]);
     assert_eq!(
@@ -286,7 +280,7 @@ fn auto_rewrite_triggers_on_growth_multi_shard() {
         "auto rewrite dropped or double-applied acked INCRs for cnt:{{a}}"
     );
     assert_eq!(cli(port2, &["GET", "cnt:{b}"]), N.to_string());
-    sigkill(&mut child2);
+    child2.kill_now();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -323,10 +317,10 @@ fn auto_rewrite_triggers_on_growth_single_shard() {
          no in-place shrink of appendonly.aof)"
     );
     std::thread::sleep(Duration::from_millis(2000));
-    sigkill(&mut child);
+    child.kill_now();
     let (mut child2, port2) = spawn_listening(&dir, 1, &[]);
     assert_eq!(cli(port2, &["GET", "cnt:solo"]), N.to_string());
-    sigkill(&mut child2);
+    child2.kill_now();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -356,7 +350,7 @@ fn auto_rewrite_percentage_zero_disables() {
         1,
         "auto-aof-rewrite-percentage 0 must disable automatic rewrites"
     );
-    sigkill(&mut child);
+    child.kill_now();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -396,6 +390,6 @@ fn info_persistence_reports_real_aof_fields() {
         "50 INCRs were appended, aof_current_size ({current}) must exceed \
          aof_base_size ({base})"
     );
-    sigkill(&mut child);
+    child.kill_now();
     let _ = std::fs::remove_dir_all(&dir);
 }

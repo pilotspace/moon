@@ -40,7 +40,7 @@
 
 mod common;
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const SHARDS: usize = 1;
@@ -71,30 +71,36 @@ fn unique_dir(suffix: &str) -> std::path::PathBuf {
     ))
 }
 
-fn start_moon(port: u16, dir: &std::path::Path, off_dir: &std::path::Path) -> Child {
-    Command::new(common::find_moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--shards",
-            &SHARDS.to_string(),
-            "--disk-offload",
-            "enable",
-            "--disk-offload-dir",
-            off_dir.to_str().expect("off dir utf8"),
-            "--appendonly",
-            "no",
-            "--cold-orphan-sweep-interval-secs",
-            "60",
-            "--dir",
-        ])
-        .arg(dir)
-        // Captured to a log file so a CI flake produces a real diagnostic
-        // (see feedback_silenced_child_stdio_flake — never Stdio::null()).
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("create moon stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("create moon stderr log"))
-        .spawn()
-        .expect("spawn moon (run `cargo build --release` with default features first)")
+fn start_moon(port: u16, dir: &std::path::Path, off_dir: &std::path::Path) -> common::ServerGuard {
+    common::ServerGuard::new(
+        Command::new(common::find_moon_binary())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--shards",
+                &SHARDS.to_string(),
+                "--disk-offload",
+                "enable",
+                "--disk-offload-dir",
+                off_dir.to_str().expect("off dir utf8"),
+                "--appendonly",
+                "no",
+                "--cold-orphan-sweep-interval-secs",
+                "60",
+                "--dir",
+            ])
+            .arg(dir)
+            // Captured to a log file so a CI flake produces a real diagnostic
+            // (see feedback_silenced_child_stdio_flake — never Stdio::null()).
+            .stdout(
+                std::fs::File::create(dir.join("moon.stdout.log")).expect("create moon stdout log"),
+            )
+            .stderr(
+                std::fs::File::create(dir.join("moon.stderr.log")).expect("create moon stderr log"),
+            )
+            .spawn()
+            .expect("spawn moon (run `cargo build --release` with default features first)"),
+    )
 }
 
 /// Poll until a PING round-trips, or panic after `PING_BOUND`.
@@ -123,21 +129,6 @@ fn wait_for_ping_within(port: u16, bound: Duration) -> Duration {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-}
-
-#[cfg(unix)]
-fn sigkill(child: &mut Child) {
-    let pid = child.id() as i32;
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-    }
-    let _ = child.wait();
-}
-
-#[cfg(not(unix))]
-fn sigkill(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn shard_data_dir(off_dir: &std::path::Path, shard_id: usize) -> std::path::PathBuf {
@@ -187,7 +178,7 @@ fn readiness_not_gated_on_orphan_sweep_and_orphans_still_reclaimed() {
     //    every injected file below is unambiguously an orphan. -------------
     let mut child = start_moon(port, &dir, &off_dir);
     wait_for_ping_within(port, Duration::from_secs(10));
-    sigkill(&mut child);
+    child.kill_now();
 
     // Manifest must exist now — recovery only classifies orphans when it does
     // (see recovery.rs: `if manifest_path.exists()`).
@@ -214,7 +205,7 @@ fn readiness_not_gated_on_orphan_sweep_and_orphans_still_reclaimed() {
             break;
         }
         if reclaim_start.elapsed() > RECLAIM_BOUND {
-            sigkill(&mut child2);
+            child2.kill_now();
             panic!(
                 "background orphan sweep did not reclaim all {} injected orphans within {:?} \
                  ({} still present)",
@@ -224,7 +215,7 @@ fn readiness_not_gated_on_orphan_sweep_and_orphans_still_reclaimed() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    sigkill(&mut child2);
+    child2.kill_now();
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(

@@ -29,16 +29,16 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 fn moon_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
 }
 
-fn spawn_moon(dir: &std::path::Path, extra: &[&str]) -> (Child, u16) {
+fn spawn_moon(dir: &std::path::Path, extra: &[&str]) -> (common::ServerGuard, u16) {
     let extra_owned: Vec<String> = extra.iter().map(|e| (*e).to_string()).collect();
-    common::spawn_listening(|port| {
+    common::spawn_listening_guarded(|port| {
         let mut args: Vec<String> = vec![
             "--port".into(),
             port.to_string(),
@@ -113,8 +113,7 @@ fn run_serves(label: &str, extra: &[&str]) {
     // Hard deadline: a healthy server answers within ~1s; the hang never answers.
     let ok = ping_ok(port, Duration::from_secs(15));
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_now();
 
     if ok {
         let _ = std::fs::remove_dir_all(&dir);

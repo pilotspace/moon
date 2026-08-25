@@ -72,27 +72,29 @@ fn toplevel_manifest_with_multishard_exits_2_and_prints_refusing_to_start() {
     let stderr_log = dir.join("moon.stderr.log");
     let stdout_log = dir.join("moon.stdout.log");
 
-    let mut child = Command::new(common::find_moon_binary())
-        .args([
-            "--port",
-            "17399", // high port unlikely to clash
-            "--shards",
-            "2",
-            "--appendonly",
-            "yes",
-            "--dir",
-        ])
-        .arg(&dir)
-        .stdout(fs::File::create(&stdout_log).expect("create stdout log"))
-        .stderr(fs::File::create(&stderr_log).expect("create stderr log"))
-        .spawn()
-        .expect("spawn moon (run `cargo build --release` first)");
+    let mut child = common::ServerGuard::new(
+        Command::new(common::find_moon_binary())
+            .args([
+                "--port",
+                "17399", // high port unlikely to clash
+                "--shards",
+                "2",
+                "--appendonly",
+                "yes",
+                "--dir",
+            ])
+            .arg(&dir)
+            .stdout(fs::File::create(&stdout_log).expect("create stdout log"))
+            .stderr(fs::File::create(&stderr_log).expect("create stderr log"))
+            .spawn()
+            .expect("spawn moon (run `cargo build --release` first)"),
+    );
 
     // Moon should exit quickly (< 5 s) with code 2 — it does not even bind
     // the port before the manifest check runs.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        match child.try_wait().expect("try_wait") {
+        match child.as_mut().try_wait().expect("try_wait") {
             Some(status) => {
                 let code = status.code().expect("process terminated by signal");
                 assert_eq!(
@@ -104,7 +106,7 @@ fn toplevel_manifest_with_multishard_exits_2_and_prints_refusing_to_start() {
             }
             None => {
                 if std::time::Instant::now() >= deadline {
-                    child.kill().ok();
+                    child.kill_now();
                     panic!(
                         "moon did not exit within 5 s — it should have refused immediately. \
                          Check {}",
@@ -158,26 +160,28 @@ fn toplevel_manifest_with_single_shard_is_allowed() {
     let stderr_log = dir.join("moon.stderr.log");
     let stdout_log = dir.join("moon.stdout.log");
 
-    let mut child = Command::new(common::find_moon_binary())
-        .args([
-            "--port",
-            "17400",
-            "--shards",
-            "1",
-            "--appendonly",
-            "yes",
-            "--dir",
-        ])
-        .arg(&dir)
-        .stdout(fs::File::create(&stdout_log).expect("create stdout log"))
-        .stderr(fs::File::create(&stderr_log).expect("create stderr log"))
-        .spawn()
-        .expect("spawn moon");
+    let mut child = common::ServerGuard::new(
+        Command::new(common::find_moon_binary())
+            .args([
+                "--port",
+                "17400",
+                "--shards",
+                "1",
+                "--appendonly",
+                "yes",
+                "--dir",
+            ])
+            .arg(&dir)
+            .stdout(fs::File::create(&stdout_log).expect("create stdout log"))
+            .stderr(fs::File::create(&stderr_log).expect("create stderr log"))
+            .spawn()
+            .expect("spawn moon"),
+    );
 
     // Give it 3 s to either start or exit.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
-        match child.try_wait().expect("try_wait") {
+        match child.as_mut().try_wait().expect("try_wait") {
             Some(status) => {
                 let code = status.code().unwrap_or(-1);
                 // If it exited with code 2 it incorrectly refused a single-shard TopLevel boot.
@@ -194,7 +198,7 @@ fn toplevel_manifest_with_single_shard_is_allowed() {
             None => {
                 if std::time::Instant::now() >= deadline {
                     // Still running — which means it did NOT refuse. That's the correct outcome.
-                    child.kill().ok();
+                    child.kill_now();
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
