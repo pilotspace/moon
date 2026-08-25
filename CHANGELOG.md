@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`mq_integration` no longer races its own server on port or on startup.**
+
+  The fixture reserved a port by binding `127.0.0.1:0` and immediately dropping the listener,
+  then waited for the server with a fixed `sleep(200ms)`. Both are bets. The dropped probe hands
+  back a port the OS is free to reissue — and 17 tests in this file each start their own server,
+  under `cargo test` concurrently in one process and under nextest in 17 concurrent processes.
+  The fixed sleep bets that shard startup fits in 200 ms on a loaded machine.
+
+  Observed 2026-08-25 on a 12-core macOS host immediately after a full suite: 12 of 17 tests
+  failed with `Connection refused (os error 61)` at connect(), three of them surviving all three
+  nextest retries; all 17 passed on the same commit once the host was quiet. The trigger was not
+  reproducible on demand (synthetic CPU load and a concurrent cold build both failed to provoke
+  it), so the mechanism below is what the old code made possible, not a mechanism caught in the
+  act.
+
+  The fixture now uses `common::reserve_port()` — intra-process dedupe plus a cross-process
+  `DirLock` claim, the helper the rest of the suite already uses — and polls `connect()` to a
+  30 s deadline instead of sleeping. Removing the wait entirely fails the suite, so the poll is
+  load-bearing, not decoration.
+
 - **A restarting server tells clients it is loading instead of hanging on them** (#476).
 
   The per-shard listener was bound and its accept task spawned *before* index recovery, but
