@@ -26,6 +26,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DirLock` claim, the helper the rest of the suite already uses — and polls `connect()` to a
   30 s deadline instead of sleeping. Removing the wait entirely fails the suite, so the poll is
   load-bearing, not decoration.
+- **`scripts/ci-local.sh --native` runs the long legs on the macOS host, with the gaps printed.**
+
+  The merge bar's two full suites and the client-compat harness live in the moon-dev VM, so when
+  the VM is unavailable the long legs simply cannot run — and a testing phase that wants to stay
+  on one machine had no supported way to do it. `--native` runs both suites (monoio on kqueue,
+  tokio) plus the compat harness against a host `redis-server`.
+
+  It is deliberately not sold as equivalent. macOS does not have io_uring, so the shipped Linux
+  path is untested by a native run, as are `cfg(target_os = "linux")` code, Windows, and the MSRV
+  pin. The mode ends by naming those instead of printing a bare `RESULT: PASS`, and a missing
+  `redis-server` oracle **refuses with exit 2** rather than skipping — a differential harness with
+  no oracle proves nothing, and a green skip would be a lie.
+
+  Covered by four new cases in `scripts/test-ci-local-preflight.sh`; both guards were mutation-
+  checked (deleting the oracle refusal, and hoisting the native summary above the failure check
+  so a failing run would exit 0 — each makes its test fail).
 
 - **A restarting server tells clients it is loading instead of hanging on them** (#476).
 

@@ -149,6 +149,80 @@ else
   printf "  skip  %-46s (not macOS)\n" "reads the macOS Data volume"
 fi
 
+# ── --native mode control flow ────────────────────────────────────────
+# The mode runs the two full suites and the compat harness on the macOS
+# host, so its steps cost ~20 minutes and cannot be exercised for real in
+# a unit test. What CAN be tested is the control flow around them, which
+# is where a local gate goes wrong: a compat leg that silently skips when
+# no oracle is installed, or a summary that prints PASS over a failure.
+#
+# `dry_ci_local` rewrites run_step into a recorder that runs nothing, so
+# the script executes its real branching in about a second.
+dry_ci_local() { # dry_ci_local <out-path>
+  # DRY_FAIL (a substring of a step name) makes exactly that step fail, so
+  # a test can fail a NATIVE step. Failing a lint gate instead would prove
+  # nothing here: those carry `|| exit 1` and never reach the summary.
+  awk '
+    /^run_step\(\) \{/ { print "run_step() { local n=\"$1\"; shift; local rc=0;";
+                         print "  if [ -n \"${DRY_FAIL:-}\" ] && case \"$n\" in *\"$DRY_FAIL\"*) true;; *) false;; esac; then rc=7; FAILED=1; fi";
+                         print "  NAMES+=(\"$n\"); RCS+=($rc); SECS+=(0); echo \"  [dry] $n rc=$rc\"; return $rc; }";
+                         skip = 1; next }
+    skip && /^\}/       { skip = 0; next }
+    !skip               { print }
+  ' scripts/ci-local.sh > "$1"
+}
+
+expect_run() { # expect_run <label> <want-exit> <grep-pattern> <env-prefix...>
+  local label=$1 want=$2 pat=$3; shift 3
+  local out rc
+  out=$(env "$@" bash "$DRY" --native 2>&1)
+  rc=$?
+  if [ "$rc" = "$want" ] && printf '%s' "$out" | grep -q "$pat"; then
+    PASS=$((PASS + 1)); printf "  ok    %-46s exit=%s\n" "$label" "$rc"
+  else
+    FAIL=$((FAIL + 1)); printf "  FAIL  %-46s got exit=%s want=%s (pattern %s)\n" \
+      "$label" "$rc" "$want" "$pat"
+  fi
+}
+
+echo ""
+echo "── ci-local.sh --native control flow ──"
+DRY=$(mktemp -t cilocal-dry)
+trap 'rm -f "$DRY"' EXIT
+
+dry_ci_local "$DRY"
+# A differential compat gate with no oracle proves nothing, so a missing
+# redis-server must REFUSE (exit 2), never skip to a green summary.
+expect_run "no redis-server oracle refuses, not skips"  2 "needs a real redis-server" PATH=/usr/bin:/bin
+if command -v redis-server >/dev/null 2>&1; then
+  # And a pass must name what it did not cover — the failure this guards
+  # against is reading "RESULT: PASS" as "ready to merge".
+  expect_run "a native pass names the io_uring gap"     0 "did NOT cover" "PATH=$PATH"
+else
+  printf "  skip  %-46s (no redis-server on PATH)\n" "a native pass names the io_uring gap"
+fi
+
+# The new native summary block sits after the failure check; if it ever
+# moves above it, every failing native run would exit 0.
+if command -v redis-server >/dev/null 2>&1; then
+  expect_run "a failing native step still exits 1"       1 "RESULT: FAIL" \
+    "PATH=$PATH" "DRY_FAIL=native tokio suite"
+else
+  printf "  skip  %-46s (no redis-server on PATH)\n" "a failing native step still exits 1"
+fi
+
+# An unknown flag is still rejected rather than silently treated as default.
+if bash scripts/ci-local.sh --bogus >/dev/null 2>&1; then
+  FAIL=$((FAIL + 1)); printf "  FAIL  %-46s unknown flag was accepted\n" "unknown flag exits 2"
+else
+  rc=$?
+  if [ "$rc" = 2 ]; then
+    PASS=$((PASS + 1)); printf "  ok    %-46s exit=2\n" "unknown flag exits 2"
+  else
+    FAIL=$((FAIL + 1)); printf "  FAIL  %-46s got exit=%s want=2\n" "unknown flag exits 2" "$rc"
+  fi
+fi
+
 echo ""
 echo "  ${PASS} passed, ${FAIL} failed"
 [ $FAIL -eq 0 ] || exit 1
