@@ -92,6 +92,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.8.5 by moon#588 (the gate scored an ID-set overlap, which is undefined when distances tie).
   This change is still needed, because *any* repeatedly-failing merge reaches the same trap.
 
+- **`FT._LIST` enumerates both index stores, so a TEXT-only index is no longer invisible (moon#709).**
+
+  An index whose schema carries no `VECTOR` field lives only in the `TextStore`. `FT._LIST`
+  enumerated the vector store alone, so such an index never appeared — even though `FT.INFO`
+  and `FT.SEARCH` both work on it. `FT._LIST` is how tools and the Moon Console discover
+  indexes, so a TEXT-only index could not be listed, inspected in a UI, or picked up by
+  anything that enumerates before acting. It also silently broke any harness that used
+  `FT._LIST` to verify index creation: the one that found this reported "built 0 indexes"
+  after 50 successful `FT.CREATE`s.
+
+  The two stores are now unioned by sort-then-dedup rather than a membership scan — it
+  collapses the both-stores duplicate (an index carrying TEXT *and* VECTOR fields is
+  registered in both and must appear once) in O(n log n) instead of O(n^2), and it gives the
+  result a stable order that neither store's hashing provides on its own.
+
+  The `text_store` parameter was added rather than reached for locally, so the compiler
+  enumerated all seven call sites instead of leaving one behind. The sweep the issue asked
+  for came back clean: `FT.INFO` and `FLUSHALL`/`FLUSHDB` index-clearing already consult the
+  pair, and `FT._LIST` was the only enumerator reading one store.
+
+  Proven against a pre-fix binary rather than assumed: the e2e suite fails on `main`'s binary
+  with `left: ["both", "vec"], right: ["both", "txt", "vec"]`, and both of its premise guards
+  (`FT.INFO` and `FT.SEARCH` working on the TEXT-only index) pass on that same binary — which
+  is the issue's point. The suite also restarts on the same dir, so the TEXT-only index has to
+  come back from its sidecar and re-register.
+
 - **Cypher writes narrow through the property index instead of scanning every node of the label (moon#719).**
 
   The write executor reached `IndexScan` through the same match arm as `NodeScan` and threw the

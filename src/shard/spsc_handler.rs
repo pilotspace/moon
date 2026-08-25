@@ -3406,7 +3406,7 @@ pub(crate) fn dispatch_vector_command(
     } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
         vector_search::ft_info(vector_store, text_store, args, db_index)
     } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
-        vector_search::ft_list(vector_store, db_index)
+        vector_search::ft_list(vector_store, text_store, db_index)
     } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
         vector_search::ft_compact(vector_store, text_store, args, db_index)
     } else if cmd.eq_ignore_ascii_case(b"FT.AGGREGATE") {

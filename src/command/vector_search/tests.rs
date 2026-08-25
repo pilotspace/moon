@@ -4567,3 +4567,130 @@ fn test_ft_dropindex_extra_args_error() {
         "FT.DROPINDEX with extra args should return arity error"
     );
 }
+
+/// moon#709: `FT._LIST` enumerated the vector store only, so an index whose
+/// schema has no `VECTOR` field was invisible to it — even though `FT.INFO`
+/// and `FT.SEARCH` both work on such an index. `FT._LIST` is how tools and the
+/// Moon Console discover indexes, so a TEXT-only index could not be listed,
+/// inspected via a UI, or picked up by anything that enumerates before acting.
+///
+/// The three indexes are built through the real `ft_create` path rather than
+/// inserted into each store by hand: a fixture that placed them itself could
+/// not tell us which store `FT.CREATE` actually registers them in, which is
+/// the whole question.
+///
+/// Feature-gated because the fixture needs a TEXT index to exist at all:
+/// without `text-index`, `FT.CREATE ... SCHEMA body TEXT` answers
+/// `ERR TEXT fields require the text-index feature`, so there is nothing to
+/// union in and nothing to assert. `ft_list`'s union is gated the same way,
+/// so the un-featured build is correct by construction, not untested.
+#[cfg(feature = "text-index")]
+#[test]
+fn test_ft_list_includes_text_only_indexes_moon709() {
+    let _metrics_guard = METRICS_LOCK.read();
+    let mut vs = VectorStore::new();
+    let mut ts = crate::text::store::TextStore::new();
+
+    let vector_only = vec![
+        bulk(b"vec"),
+        bulk(b"ON"),
+        bulk(b"HASH"),
+        bulk(b"PREFIX"),
+        bulk(b"1"),
+        bulk(b"v0:"),
+        bulk(b"SCHEMA"),
+        bulk(b"emb"),
+        bulk(b"VECTOR"),
+        bulk(b"HNSW"),
+        bulk(b"6"),
+        bulk(b"TYPE"),
+        bulk(b"FLOAT32"),
+        bulk(b"DIM"),
+        bulk(b"4"),
+        bulk(b"DISTANCE_METRIC"),
+        bulk(b"L2"),
+    ];
+    let text_only = vec![
+        bulk(b"txt"),
+        bulk(b"ON"),
+        bulk(b"HASH"),
+        bulk(b"PREFIX"),
+        bulk(b"1"),
+        bulk(b"p0:"),
+        bulk(b"SCHEMA"),
+        bulk(b"body"),
+        bulk(b"TEXT"),
+    ];
+    // Registered in BOTH stores -- it must appear exactly once, not twice.
+    let mixed = vec![
+        bulk(b"both"),
+        bulk(b"ON"),
+        bulk(b"HASH"),
+        bulk(b"PREFIX"),
+        bulk(b"1"),
+        bulk(b"m0:"),
+        bulk(b"SCHEMA"),
+        bulk(b"body"),
+        bulk(b"TEXT"),
+        bulk(b"emb"),
+        bulk(b"VECTOR"),
+        bulk(b"HNSW"),
+        bulk(b"6"),
+        bulk(b"TYPE"),
+        bulk(b"FLOAT32"),
+        bulk(b"DIM"),
+        bulk(b"4"),
+        bulk(b"DISTANCE_METRIC"),
+        bulk(b"L2"),
+    ];
+    for args in [&vector_only, &text_only, &mixed] {
+        assert!(
+            matches!(ft_create(&mut vs, &mut ts, args, 0), Frame::SimpleString(_)),
+            "FT.CREATE must succeed for {:?}",
+            args.first()
+        );
+    }
+
+    // Guard the premise: if `ft_create` ever stopped putting a TEXT-only
+    // index in the text store, the union below would pass for the wrong
+    // reason (there would be nothing extra to union in).
+    assert!(
+        ts.get_index_for_db(b"txt", 0).is_some(),
+        "premise: a TEXT-only index must live in the text store"
+    );
+    assert!(
+        vs.get_index_for_db(&Bytes::from_static(b"txt"), 0)
+            .is_none(),
+        "premise: a TEXT-only index must NOT live in the vector store"
+    );
+
+    let listed: Vec<Vec<u8>> = match ft_list(&vs, &ts, 0) {
+        Frame::Array(items) => {
+            let mut v: Vec<Vec<u8>> = items
+                .iter()
+                .map(|f| match f {
+                    Frame::BulkString(b) => b.to_vec(),
+                    other => panic!("FT._LIST must return bulk strings, got {other:?}"),
+                })
+                .collect();
+            v.sort();
+            v
+        }
+        other => panic!("FT._LIST must return an array, got {other:?}"),
+    };
+
+    assert_eq!(
+        listed,
+        vec![b"both".to_vec(), b"txt".to_vec(), b"vec".to_vec()],
+        "FT._LIST must return every index exactly once, across both stores"
+    );
+
+    // db scoping survives the union: nothing created in db 0 leaks into db 1.
+    match ft_list(&vs, &ts, 1) {
+        Frame::Array(items) => assert!(
+            items.is_empty(),
+            "an index owned by db 0 must not be listed for db 1, got {items:?}"
+        ),
+        other => panic!("FT._LIST must return an array, got {other:?}"),
+    }
+}

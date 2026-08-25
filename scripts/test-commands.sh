@@ -1788,6 +1788,18 @@ if should_run "vector"; then
     # FT._LIST
     assert_moon_contains "FT._LIST" "testidx" FT._LIST
 
+    # FT._LIST must also enumerate an index with no VECTOR field (moon#709).
+    # Such an index lives only in the TEXT store; listing the vector store
+    # alone made it invisible to every tool that discovers indexes this way,
+    # even though FT.INFO and FT.SEARCH both work on it.
+    mcli FT.CREATE textonlyidx ON HASH PREFIX 1 tonly: SCHEMA body TEXT >/dev/null 2>&1
+    assert_moon_contains "FT._LIST includes TEXT-only index" "textonlyidx" FT._LIST
+    assert_moon_contains "FT.INFO on TEXT-only index" "textonlyidx" FT.INFO textonlyidx
+    # Dropped here on purpose: the "FT._LIST empty" assertion further down
+    # checks the list is empty after testidx goes, and now that FT._LIST can
+    # see TEXT-only indexes, leaving this one behind would break it.
+    mcli FT.DROPINDEX textonlyidx DD >/dev/null 2>&1
+
     # FT.COMPACT (should succeed even if nothing to compact)
     assert_moon_ok "FT.COMPACT" FT.COMPACT testidx
 

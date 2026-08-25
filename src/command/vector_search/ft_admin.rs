@@ -173,13 +173,38 @@ pub fn ft_compact(
 /// FT._LIST
 ///
 /// Returns an array of all index names owned by the caller's currently
-/// SELECTed db (WS5a). Compatible with the Redis `FT._LIST` internal
-/// command used by tools and the Moon Console.
-pub fn ft_list(store: &VectorStore, db_index: u8) -> Frame {
-    let names = store.index_names_for_db(db_index);
-    let elements: Vec<Frame> = names
+/// SELECTed db (WS5a), across BOTH index stores. Compatible with the Redis
+/// `FT._LIST` internal command used by tools and the Moon Console.
+///
+/// moon#709: this used to enumerate the vector store alone, so an index whose
+/// schema carries no `VECTOR` field — it lives only in the `TextStore` — was
+/// invisible here even though `FT.INFO` and `FT.SEARCH` both work on it. Since
+/// `FT._LIST` is how tools discover indexes, such an index could not be
+/// listed, inspected in a UI, or picked up by anything that enumerates before
+/// acting. An index carrying both TEXT and VECTOR fields is registered in both
+/// stores and must still appear exactly once.
+pub fn ft_list(
+    store: &VectorStore,
+    text_store: &crate::text::store::TextStore,
+    db_index: u8,
+) -> Frame {
+    let mut names: Vec<Bytes> = store
+        .index_names_for_db(db_index)
         .into_iter()
-        .map(|n| Frame::BulkString(n.clone()))
+        .cloned()
         .collect();
+
+    #[cfg(feature = "text-index")]
+    names.extend(text_store.index_names_for_db(db_index));
+    #[cfg(not(feature = "text-index"))]
+    let _ = text_store;
+
+    // Sort-then-dedup rather than a membership scan: it collapses the
+    // both-stores duplicate in O(n log n) instead of O(n^2), and it gives the
+    // union a stable order that neither store's hashing provides on its own.
+    names.sort_unstable();
+    names.dedup();
+
+    let elements: Vec<Frame> = names.into_iter().map(Frame::BulkString).collect();
     Frame::Array(FrameVec::from_vec(elements))
 }
