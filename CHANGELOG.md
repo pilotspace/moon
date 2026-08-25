@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Recovery reports its progress instead of going silent for the whole reconcile** (#546).
+
+  A production restart spent ~94 minutes inside the keyspace reconcile loop and logged nothing
+  between `restoring 2311 text index(es) from sidecar` and the final count. An operator watching
+  that log cannot tell a slow repair from a wedged process, and the two call for opposite
+  actions. Recovery now emits a line every 10 seconds with the key it is on, the total for that
+  db, the running rate, and elapsed time.
+
+  The trigger is wall-clock, not "every N keys": the recoveries that need a line are exactly the
+  ones whose keys are individually slow, and a key-count rule stays silent through precisely
+  those. A recovery that finishes inside one interval stays silent — verified end-to-end both
+  ways on a 20,000-key store (19 lines with the interval forced to zero; 0 lines at the shipped
+  10s).
+
+  While measuring this, the other two hypotheses in #546 were re-tested and do **not** reproduce
+  on current main. Restart-to-PONG is now *linear* in FT index count — 50→800 TEXT indexes holds
+  flat at ~0.5 ms/index (0.03s → 0.41s for 800 indexes over 32,000 docs) — and stripping every
+  warm segment's `mvcc.mpf`, the state that left 897 segments unregistered, costs nothing
+  measurable: A/B on one built store, 4–32 indexes over 8,000–84,000 keys, at both DIM 8 and
+  DIM 384, stripped/control ratios spanning 0.78–1.35 with the stripped leg faster as often as
+  slower (n=1 per configuration; consistent with run-to-run noise, and nowhere near the reported
+  behaviour). The 94-minute cost was dominated by
+  `TextIndex::remove_field`, which #613 made O(terms the document carried) rather than
+  O(vocabulary). What remains of #546 is the observability this adds, plus the partially-GC'd
+  segment directories themselves, which are still left on disk and re-warned about every restart.
+
+  Measured on moon-dev (aarch64, 6 vCPU) with `--shards 1`; harness verifies its own instrument
+  (index and key counts read back after each restart, and the stripped leg asserted to actually
+  log one `leaving unregistered` per stripped segment) so a run that silently indexed nothing
+  cannot report a fast restart as a win.
 - **A pipelined multi-key command no longer cuts the batch over shards it never touches** (#513).
 
   `must_wait_for_pending_remote`'s multi-key arm answered "wait" on the command NAME, without

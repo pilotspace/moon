@@ -1219,6 +1219,13 @@ impl super::Shard {
             if has_indexes {
                 let db_count = shard_databases.db_count();
                 let mut reindexed = 0usize;
+                // moon#546 hypothesis 3: the reported 94-minute recovery logged
+                // nothing between the sidecar banner and the final count, so an
+                // operator could not tell a slow repair from a wedged process.
+                let mut progress = crate::vector::persistence::recover_v2::RecoveryProgress::new(
+                    std::time::Duration::from_secs(10),
+                    std::time::Instant::now(),
+                );
                 for db_idx in 0..db_count {
                     let collect_matching = |db: &crate::storage::Database| -> Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> {
                         let mut matching: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = Vec::new();
@@ -1277,8 +1284,16 @@ impl super::Shard {
                         { crate::shard::slice::with_shard_db(db_idx, |db| collect_matching(db)) };
 
                     if !matching.is_empty() {
+                        let total_in_db = matching.len();
+                        // How often to read the clock. Capped at 128 so a
+                        // million-key db pays ~8k clock reads instead of a
+                        // million, but never coarser than the db itself: a db
+                        // of 50 pathologically slow keys would otherwise never
+                        // reach any fixed stride and stay silent — which is the
+                        // exact failure #546 is about.
+                        let clock_stride = total_in_db.clamp(1, 128);
                         crate::shard::slice::with_shard(|s| {
-                            for (key, args) in &matching {
+                            for (i, (key, args)) in matching.iter().enumerate() {
                                 // B3 dedup rescan: verifies each matching
                                 // key against any recovered durable state
                                 // (manifest/segment/keymap) before deciding
@@ -1294,6 +1309,26 @@ impl super::Shard {
                                     db_idx as u8,
                                 );
                                 reindexed += 1;
+                                // Counter gate first: a recovery that finishes
+                                // in milliseconds must not pay `Instant::now()`
+                                // per key to prove it had nothing to say.
+                                if (i + 1) % clock_stride == 0 {
+                                    let now = std::time::Instant::now();
+                                    if progress.tick_at(reindexed as u64, now) {
+                                        info!(
+                                            "Shard {}: recovery reconciling db {} \
+                                             key {}/{} ({} total, {:.0} keys/s, \
+                                             {:.0}s elapsed)",
+                                            shard_id,
+                                            db_idx,
+                                            i + 1,
+                                            total_in_db,
+                                            reindexed,
+                                            progress.keys_per_sec(reindexed as u64, now),
+                                            progress.elapsed_secs(now),
+                                        );
+                                    }
+                                }
                             }
                         });
                     }
