@@ -63,14 +63,6 @@ pub struct IndexRecoveryCounters {
     pub tombstoned: usize,
 }
 
-/// Threaded through the whole B3 startup sequence by `event_loop.rs`.
-///
-/// Lifecycle: construct once, call [`Self::create_index`] once per sidecar
-/// index definition, call [`Self::reconcile_key`] once per matching hash key
-/// found during the keyspace scan, then call [`Self::finish`] exactly once.
-/// All three phase methods assume they run from inside an already-open
-/// `with_shard` closure — none of them call `with_shard`/`with_shard_db`
-/// themselves (forbidden re-entrancy, see `crate::shard::slice`).
 /// Says "still moving" while a long recovery reconciles the keyspace.
 ///
 /// moon#546: a production restart spent ~94 minutes inside the reconcile loop
@@ -125,6 +117,14 @@ impl RecoveryProgress {
     }
 }
 
+/// Threaded through the whole B3 startup sequence by `event_loop.rs`.
+///
+/// Lifecycle: construct once, call [`Self::create_index`] once per sidecar
+/// index definition, call [`Self::reconcile_key`] once per matching hash key
+/// found during the keyspace scan, then call [`Self::finish`] exactly once.
+/// All three phase methods assume they run from inside an already-open
+/// `with_shard` closure — none of them call `with_shard`/`with_shard_db`
+/// themselves (forbidden re-entrancy, see `crate::shard::slice`).
 pub struct RecoveryState {
     /// Names of indexes that have durable state loaded from a manifest —
     /// eligible for the dedup rescan. Everything else (no manifest found,
