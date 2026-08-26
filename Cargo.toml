@@ -176,6 +176,40 @@ ureq = "3"
 hmac = "0.13"
 static_assertions = "1"
 
+# Dev/test builds keep LINE TABLES ONLY, not full DWARF (moon#655).
+#
+# `tests/` holds 253 integration files; each is its own crate statically linked
+# against the whole `moon` lib and every dependency, so the dep graph's debug
+# info is duplicated across 258 test executables. Measured on moon-dev
+# (aarch64 Linux, rustc 1.94.1) as a same-tree A/B — identical checkout,
+# identical `cargo nextest run --profile ci --no-run`, cold target dir on both
+# legs, the debug setting the only difference:
+#
+#                      debug = 2      line-tables-only     delta
+#   target dir         39.1 GiB          14.9 GiB         -62.0%
+#   258 test exes      34.1 GiB          11.0 GiB         -67.8%
+#   cold build           449 s             279 s          -37.9%
+#
+# That mattered because two full legs filled moon-dev's 159G root, and a full
+# root does not fail loudly: the leg exits rc=1 printing nothing and OrbStack
+# itself wedges (moon#658, moon#661). `scripts/ci-local.sh`'s disk pre-flight
+# constants were re-measured against the right-hand column in the same commit.
+#
+# Nothing here consumes full DWARF — no debugger, no core-dump inspection; a
+# grep for addr2line/gdb/lldb/coredump across scripts, .github, tests and src
+# finds nothing, and the `backtrace` crate is not a dependency. Panics keep
+# file:line regardless via #[track_caller], and line tables are exactly what a
+# RUST_BACKTRACE frame resolves against — verified on Linux with a panicking
+# two-frame program built both ways: every frame resolves to the same symbol,
+# file, line and column, and only the addresses and symbol hashes differ.
+#
+# `profile.test` inherits from `dev`, which is what carries this to the
+# integration-test binaries that hold the bulk of the target dir. The effect is
+# ELF-only: on macOS DWARF lives outside the executable, so a Mach-O A/B shows
+# byte-identical binaries and no saving.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 debug = false         # No debug symbols for smaller/faster binary
 lto = "fat"           # Full cross-crate LTO for maximum inlining

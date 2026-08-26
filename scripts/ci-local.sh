@@ -116,12 +116,29 @@ vm() { # vm <shell-command> — run inside the moon-dev VM at the repo
 # on a 97%-full root. The visible symptom was three unrelated-looking test
 # flakes; the cause was 4G of free space.
 #
-# Sizes measured on moon-dev 2026-08-22: root 124G, and each of the two
-# VM leg target dirs (~/ci-target/local-{monoio,tokio}) is 34G warm.
+# Re-measured on moon-dev 2026-08-26 after moon#655 set `[profile.dev]
+# debug = "line-tables-only"`. Same tree, same `cargo nextest run --no-run`,
+# only the debug setting differing, cold dir each time:
+#
+#            debug=2 (before)   line-tables-only   delta
+#   dir      41,993,138,176     15,958,941,696     -62.0%
+#   258 exe  36,592,516,376     11,783,054,240     -67.8%
+#   build    449s               279s               -37.9%
+#
+# The two constants that describe what a build WRITES move with that; the
+# warm-headroom warn line does not, because it describes free space a running
+# suite wants underneath it, which moon#655 did not change. Leaving the cold
+# figure at 36G would have refused legs that now genuinely fit -- and a
+# pre-flight that grounds healthy runs gets disabled, after which it guards
+# nothing (the failure mode an earlier draft of the host guard already hit).
 DISK_FLOOR_BYTES=$((8 * 1024 * 1024 * 1024))    # below this OrbStack itself wedges
-DISK_COLD_NEED_BYTES=$((36 * 1024 * 1024 * 1024)) # a leg with no target dir builds ~34G
+DISK_COLD_NEED_BYTES=$((18 * 1024 * 1024 * 1024)) # cold leg measured 14.9G + headroom
 DISK_WARM_WARN_BYTES=$((15 * 1024 * 1024 * 1024)) # warm leg: only headroom is needed
-DISK_COLD_DIR_BYTES=$((5 * 1024 * 1024 * 1024))   # a smaller dir is a stub, not a cache
+                                                  # (unchanged: moon#655 shrank what a
+                                                  # build WRITES, not the headroom a
+                                                  # running suite wants underneath it)
+DISK_COLD_DIR_BYTES=$((3 * 1024 * 1024 * 1024))   # a smaller dir is a stub, not a cache
+                                                  # (a full one is ~15G, not ~34G)
 
 # disk_verdict <avail-bytes> <leg-target-dir-bytes>
 # Echoes OK | WARN | FAIL and returns non-zero only for FAIL, so a caller
@@ -164,7 +181,8 @@ HOST_WARN_SLACK_BYTES=$((15 * 1024 * 1024 * 1024))  # cushion above the arithmet
 # Measured 2026-08-23 on moon-dev: one WARM tokio leg (full nextest suite,
 # 5143 tests) grew the image 90.2 -> 90.5 GB and moved host free space by
 # less than a gigabyte. A warm leg is cheap; a COLD one is not, because it
-# materializes a whole ~34G target dir that the image must back. An earlier
+# materializes a whole ~15G target dir that the image must back (it was ~34G
+# before moon#655 cut the debug info). An earlier
 # draft of this guard charged 12G per warm leg and refused to start a run on
 # a host with 33G free -- on a machine where ci-local had passed an hour
 # before. A pre-flight that grounds healthy runs gets disabled, and then it
@@ -299,7 +317,7 @@ preflight_disk() {
     echo "    A run started here fails with no error text and can wedge OrbStack."
     echo "    Biggest consumers:"
     orb run -m "$VM" bash -c 'du -sh ~/ci-target/* 2>/dev/null | sort -rh | head -6' 2>/dev/null | sed "s/^/      /"
-    echo "    Reclaim inside the VM (each dir rebuilds from scratch, ~34G and ~25min):"
+    echo "    Reclaim inside the VM (each dir rebuilds from scratch, ~15G and ~5min):"
     echo "      orb run -m $VM bash -c 'rm -rf ~/ci-target/local-tokio'"
     echo "      orb run -m $VM bash -c 'rm -rf ~/ci-target/local-monoio'"
     echo "    Then return those blocks TO THE HOST — an in-guest rm frees"

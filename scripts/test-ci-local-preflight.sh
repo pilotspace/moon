@@ -37,16 +37,30 @@ expect() { # expect <label> <want-verdict> <avail-gb> <target-gb>
 
 echo "── disk_verdict ──"
 # The wedge itself: below the floor nothing may start, warm dir or not.
-expect "3G free, warm 34G dir  (the 2026-08-22 wedge)" FAIL  3 34
-expect "7G free, warm 34G dir"                         FAIL  7 34
-# Cold build needs room for a whole ~34G target dir.
-expect "20G free, no target dir (cold build)"          FAIL 20  0
+expect "3G free, warm 15G dir  (the 2026-08-22 wedge)" FAIL  3 15
+expect "7G free, warm 15G dir"                         FAIL  7 15
+# Cold build needs room for a whole ~15G target dir (moon#655; it was ~34G,
+# and these expectations moved with the measurement, not to make a test pass).
+expect "12G free, no target dir (cold build)"          FAIL 12  0
 expect "40G free, no target dir (cold build)"          OK   40  0
-# Warm incremental: 34G is already spent, only headroom is needed.
-expect "24G free, warm 34G dir (today's VM)"           OK   24 34
-expect "10G free, warm 34G dir (thin but usable)"      WARN 10 34
+# The case that used to FAIL and now legitimately passes: 20G really does fit
+# a cold leg once the debug info is gone. Asserted so the improvement is
+# pinned, not merely no longer contradicted.
+expect "20G free, no target dir (cold build)"          OK   20  0
+# Warm incremental: the 15G is already spent, only headroom is needed.
+expect "24G free, warm 15G dir (today's VM)"           OK   24 15
+expect "9G free, warm 15G dir (thin but usable)"       WARN  9 15
+# The warm-headroom line is 15G and did NOT move with moon#655: 12G free is
+# enough to finish an incremental leg but not enough to be quiet about.
+expect "12G free, warm 15G dir"                        WARN 12 15
+expect "16G free, warm 15G dir"                        OK   16 15
 # A dir that exists but is a stub is still a cold build.
-expect "20G free, 2G stub dir"                         FAIL 20  2
+# A stub is judged against the NEW full size: under 3G, not under 5G.
+expect "12G free, 2G stub dir"                         FAIL 12  2
+# 4G is the discriminating size: a partially-warmed dir (deps built, tests not)
+# is a real cache under the post-moon#655 3G threshold. If that threshold ever
+# drifts back up, this row flips to FAIL and says so.
+expect "12G free, warm 4G dir (deps only)"             WARN 12  4
 
 # ── moon#661: the VM's number alone is not the answer ──────────────────
 # On 2026-08-22 the pre-flight printed a green light on precisely the
@@ -80,10 +94,11 @@ echo ""
 echo "── vm_growth_bytes (what the image will claim from the host) ──"
 # Measured 2026-08-23: one warm tokio leg grew the image 90.2 -> 90.5 GB.
 # A cold leg is the expensive one -- it materializes a whole target dir.
-expect_growth "two warm legs (cheap: nothing to build)"  4 34 34
-expect_growth "one cold, one warm"                      38  0 34
-expect_growth "two cold legs"                           72  0  0
-expect_growth "a stub dir counts as cold"               38  2 34
+expect_growth "two warm legs (cheap: nothing to build)"  4 15 15
+expect_growth "one cold, one warm"                      20  0 15
+expect_growth "two cold legs"                           36  0  0
+expect_growth "a stub dir counts as cold"               20  2 15
+expect_growth "a 4G dir is warm, not a stub"             4  4 15
 
 echo ""
 echo "── host_disk_verdict ──"
@@ -96,9 +111,9 @@ expect_host "9G host free, nothing to build"                FAIL   9  0
 expect_host "33G host free, warm run needs 4G (today)"      OK    33  4
 expect_host "20G host free, warm run needs 4G"              WARN  20  4
 # A cold run is the one that genuinely needs room for two target dirs.
-expect_host "60G host free, cold run needs 72G"             FAIL  60 72
-expect_host "85G host free, cold run needs 72G"             WARN  85 72
-expect_host "100G host free, cold run needs 72G"            OK   100 72
+expect_host "24G host free, cold run needs 36G"             FAIL  24 36
+expect_host "49G host free, cold run needs 36G"             WARN  49 36
+expect_host "64G host free, cold run needs 36G"             OK    64 36
 
 echo ""
 echo "── read_host_avail_bytes ──"
