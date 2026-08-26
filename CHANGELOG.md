@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Dev/test builds emit line tables instead of full DWARF, cutting the CI target dir 62% and the cold build 38% (moon#655).**
+
+  `tests/` holds 253 integration files. Each is its own crate statically linked against the
+  whole `moon` lib and every dependency, so the dependency graph's debug info is duplicated
+  across 258 test executables — the reason a single `ci-local.sh` leg's target dir had grown
+  to 39 GiB, two legs filled moon-dev's 159G root, and a full root does not fail loudly: the
+  leg exits `rc=1` printing nothing and OrbStack itself wedges (moon#658, moon#661).
+
+  `[profile.dev] debug = "line-tables-only"` (inherited by `profile.test`) keeps exactly the
+  information a `RUST_BACKTRACE` frame resolves against and drops the rest. Measured on
+  moon-dev as a same-tree A/B — identical checkout, identical `cargo nextest run --profile ci
+  --no-run`, cold target dir on both legs, the debug setting the only difference:
+
+  | | `debug = 2` | `line-tables-only` | delta |
+  |---|---:|---:|---:|
+  | target dir | 39.1 GiB | 14.9 GiB | −62.0% |
+  | 258 test executables | 34.1 GiB | 11.0 GiB | −67.8% |
+  | cold build | 449 s | 279 s | −37.9% |
+
+  Nothing in the tree consumes full DWARF: no debugger, no core-dump inspection, no
+  `backtrace` crate. Panic messages keep `file:line` via `#[track_caller]` regardless, and a
+  panicking two-frame program built both ways on Linux resolves every backtrace frame to the
+  same symbol, file, line and column — only addresses and symbol hashes differ.
+
+  `scripts/ci-local.sh`'s disk pre-flight hardcoded the pre-change sizes, so a healthy cold
+  leg would have been refused for wanting 36G it no longer needs. The two constants that
+  describe what a build *writes* are re-measured here (cold-leg need 36G → 18G, full-dir
+  size 5G → 3G); the warm-headroom warn line stays at 15G, because it describes free space
+  a running suite wants underneath it, which this change did not touch.
+  `scripts/test-ci-local-preflight.sh` gains rows at the moved boundaries — including a 4G
+  target dir, the size that separates a partially-warmed cache from a stub only under the
+  new threshold. Every constant was then mutated back to a wrong value to confirm the
+  harness reports it rather than passing regardless.
+
+  The effect is ELF-only: on macOS DWARF lives outside the executable, so a Mach-O A/B
+  produces byte-identical binaries and no saving.
+
 - **A multi-key command whose keys all live on one shard now joins the slotted batch instead of cutting it (moon#513).**
 
   moon#512 made a pipelined command that does not route by its own single key wait for the
