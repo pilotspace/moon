@@ -2761,6 +2761,157 @@ pub async fn scatter_ft_info(
     crate::command::vector_search::merge_ft_info_responses(local, &remote_responses)
 }
 
+/// Answer `FT.SEARCH <idx> "*"` when only the vector engine can (moon#695), or
+/// `None` to leave the query on its normal path.
+///
+/// The single entry point the connection handlers call. It has to be consulted
+/// BEFORE the text engine: `is_text_query("*")` is true, so a bare `*` reaches the
+/// text path at every routing site, and for a VECTOR-only index that path answers
+/// `ERR no such index` for an index `FT._LIST` lists. Every other query — text,
+/// KNN, SPARSE, HYBRID, and `*` on any index carrying a TEXT/TAG/NUMERIC field —
+/// returns `None` here and is completely unaffected.
+pub async fn ft_match_all_if_vector_only(
+    cmd_args: &[Frame],
+    my_shard: usize,
+    num_shards: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+    db_index: u8,
+) -> Option<Frame> {
+    let index_name = crate::shard::slice::with_shard(|s| {
+        crate::command::vector_search::vector_only_match_all_index(
+            &s.text_store,
+            &s.vector_store,
+            cmd_args,
+            db_index,
+        )
+    })?;
+    let (offset, count) = crate::command::vector_search::parse_limit_clause(cmd_args);
+
+    // One shard owns every key, so there is nothing to gather.
+    if num_shards == 1 {
+        return Some(crate::shard::slice::with_shard(|s| {
+            crate::command::vector_search::match_all_local(
+                &s.vector_store,
+                index_name.as_ref(),
+                db_index,
+                offset,
+                count,
+            )
+        }));
+    }
+
+    Some(
+        scatter_ft_match_all(
+            index_name,
+            offset,
+            count,
+            my_shard,
+            num_shards,
+            dispatch_tx,
+            spsc_notifiers,
+            db_index,
+        )
+        .await,
+    )
+}
+
+/// Scatter a vector-only `FT.SEARCH <idx> "*"` (moon#695) and merge the answers.
+///
+/// Keys partition to exactly one shard, so a match-all is the union of every
+/// shard's live key map. `merge_text_results` already sums per-shard `reply[0]`
+/// into the global total (C4), and because every match-all score is equal and its
+/// sort is stable it preserves the order the responses are collected in — so they
+/// are gathered in SHARD order rather than completion order, to keep the answer
+/// deterministic run to run.
+///
+/// The command forwarded to each shard is REWRITTEN to `LIMIT 0 (offset+count)`.
+/// Shipping the caller's own LIMIT would make every shard skip its own first
+/// `offset` documents and then the coordinator skip `offset` again. Capping each
+/// shard at `offset+count` is sufficient and not a silent truncation: the merged
+/// list is a concatenation in shard order, so no document past a shard's first
+/// `offset+count` can reach the requested page. With no LIMIT at all the clause is
+/// omitted entirely, so `*` returns every document at any shard count — the same
+/// answer the single-shard path gives.
+pub async fn scatter_ft_match_all(
+    index_name: Bytes,
+    offset: usize,
+    count: usize,
+    my_shard: usize,
+    num_shards: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+    db_index: u8,
+) -> Frame {
+    let mut parts = vec![
+        Frame::BulkString(Bytes::from_static(b"FT.SEARCH")),
+        Frame::BulkString(index_name),
+        Frame::BulkString(Bytes::from_static(b"*")),
+    ];
+    if count != usize::MAX {
+        parts.push(Frame::BulkString(Bytes::from_static(b"LIMIT")));
+        parts.push(Frame::BulkString(Bytes::from_static(b"0")));
+        parts.push(Frame::BulkString(Bytes::from(
+            offset.saturating_add(count).to_string(),
+        )));
+    }
+    let command = std::sync::Arc::new(Frame::Array(parts.into()));
+
+    let mut receivers = Vec::with_capacity(num_shards.saturating_sub(1));
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue;
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::VectorCommand {
+            command: command.clone(),
+            reply_tx,
+            db_index,
+        };
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        receivers.push((target, reply_rx));
+    }
+
+    let local = crate::shard::slice::with_shard(|s| {
+        crate::shard::spsc_handler::dispatch_vector_command(
+            &mut s.vector_store,
+            &mut s.text_store,
+            #[cfg(feature = "graph")]
+            Some(&s.graph_store),
+            &command,
+            None,
+            db_index,
+        )
+    });
+
+    let mut by_shard: Vec<Option<Frame>> = (0..num_shards).map(|_| None).collect();
+    if let Some(slot) = by_shard.get_mut(my_shard) {
+        *slot = Some(local);
+    }
+    for (target, rx) in receivers {
+        match rx.recv().await {
+            Ok(frame) => {
+                if let Some(slot) = by_shard.get_mut(target) {
+                    *slot = Some(frame);
+                }
+            }
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR FT.SEARCH: cross-shard reply channel closed during match-all",
+                ));
+            }
+        }
+    }
+    let responses: Vec<Frame> = by_shard.into_iter().flatten().collect();
+
+    let top_k = if count == usize::MAX {
+        usize::MAX
+    } else {
+        offset.saturating_add(count)
+    };
+    crate::command::vector_search::merge_text_results(&responses, top_k, offset, count)
+}
+
 /// Two-phase DFS scatter-gather for globally accurate BM25 text search (per D-04).
 ///
 /// **Phase 1** — DocFreq scatter: collect (term, df) + total N from every shard,

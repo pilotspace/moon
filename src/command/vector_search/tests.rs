@@ -4694,3 +4694,266 @@ fn test_ft_list_includes_text_only_indexes_moon709() {
         other => panic!("FT._LIST must return an array, got {other:?}"),
     }
 }
+// ---------------------------------------------------------------------------
+// moon#695 — FT.SEARCH "*" on a VECTOR-only index
+// ---------------------------------------------------------------------------
+
+/// FT.CREATE args for a VECTOR-only index named `vidx` over prefix `v:`.
+fn ft_create_vector_only_args() -> Vec<Frame> {
+    vec![
+        bulk(b"vidx"),
+        bulk(b"ON"),
+        bulk(b"HASH"),
+        bulk(b"PREFIX"),
+        bulk(b"1"),
+        bulk(b"v:"),
+        bulk(b"SCHEMA"),
+        bulk(b"e"),
+        bulk(b"VECTOR"),
+        bulk(b"HNSW"),
+        bulk(b"6"),
+        bulk(b"TYPE"),
+        bulk(b"FLOAT32"),
+        bulk(b"DIM"),
+        bulk(b"4"),
+        bulk(b"DISTANCE_METRIC"),
+        bulk(b"L2"),
+    ]
+}
+
+/// A VECTOR-only index carrying `keys` in its live key map.
+///
+/// Seeds `key_hash_to_key` directly rather than driving HSET: this exercises the
+/// ENUMERATOR in isolation, and the e2e test (`tests/ft_search_star_vector_only_695.rs`)
+/// is what proves the real indexing path fills that map.
+fn vector_only_store_with(keys: &[&[u8]]) -> VectorStore {
+    let mut store = VectorStore::new();
+    let created = ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &ft_create_vector_only_args(),
+        0,
+    );
+    assert!(
+        matches!(&created, Frame::SimpleString(s) if &s[..] == b"OK"),
+        "FT.CREATE must succeed for the fixture: {created:?}"
+    );
+    let idx = store.get_index_mut(b"vidx").expect("index just created");
+    for (i, k) in keys.iter().enumerate() {
+        idx.key_hash_to_key
+            .insert(1000 + i as u64, Bytes::from(k.to_vec()));
+    }
+    store
+}
+
+fn star_args(index: &[u8]) -> Vec<Frame> {
+    vec![bulk(index), bulk(b"*")]
+}
+
+/// Guards the premise of every test below: the index really is invisible to the
+/// text store, which is the whole reason `*` used to answer `ERR no such index`.
+#[test]
+fn moon695_vector_only_index_is_absent_from_the_text_store() {
+    // Serialised with the other index-creating tests: `ft_create` moves global
+    // atomic index counters, and a test asserting a counter DELTA cannot tell a
+    // concurrent creator's writes from its own.
+    let _metrics_guard = METRICS_LOCK.read();
+    let store = vector_only_store_with(&[b"v:0"]);
+    let ts = crate::text::store::TextStore::new();
+    assert!(
+        store.get_index_for_db(b"vidx", 0).is_some(),
+        "the vector store must know this index"
+    );
+    assert!(
+        ts.get_index_for_db(b"vidx", 0).is_none(),
+        "a VECTOR-only schema builds no TextIndex — that is the bug's premise"
+    );
+}
+
+#[test]
+fn moon695_star_enumerates_the_live_key_map() {
+    // Serialised with the other index-creating tests: `ft_create` moves global
+    // atomic index counters, and a test asserting a counter DELTA cannot tell a
+    // concurrent creator's writes from its own.
+    let _metrics_guard = METRICS_LOCK.read();
+    let store = vector_only_store_with(&[b"v:2", b"v:0", b"v:1"]);
+    let ts = crate::text::store::TextStore::new();
+    let reply = try_match_all_vector_only(&ts, &store, &star_args(b"vidx"), 0)
+        .expect("`*` on a VECTOR-only index must be claimed by the match-all path");
+    match reply {
+        Frame::Array(items) => {
+            assert_eq!(items[0], Frame::Integer(3), "reply[0] is the total matched");
+            // Sorted, so a shard answers the same way twice — and so LIMIT paging
+            // means something. Entries are (key, fields) pairs after the total.
+            let keys: Vec<&[u8]> = items[1..]
+                .iter()
+                .step_by(2)
+                .filter_map(|f| match f {
+                    Frame::BulkString(b) => Some(b.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(keys, vec![&b"v:0"[..], &b"v:1"[..], &b"v:2"[..]]);
+        }
+        other => panic!("expected an Array reply, got {other:?}"),
+    }
+}
+
+#[test]
+fn moon695_limit_pages_the_docs_but_reply0_stays_the_full_total() {
+    // Serialised with the other index-creating tests: `ft_create` moves global
+    // atomic index counters, and a test asserting a counter DELTA cannot tell a
+    // concurrent creator's writes from its own.
+    let _metrics_guard = METRICS_LOCK.read();
+    let store = vector_only_store_with(&[b"v:0", b"v:1", b"v:2", b"v:3"]);
+    let ts = crate::text::store::TextStore::new();
+    let mut args = star_args(b"vidx");
+    args.extend([bulk(b"LIMIT"), bulk(b"1"), bulk(b"2")]);
+    let reply = try_match_all_vector_only(&ts, &store, &args, 0).expect("claimed");
+    match reply {
+        Frame::Array(items) => {
+            assert_eq!(
+                items[0],
+                Frame::Integer(4),
+                "RediSearch semantics: reply[0] is the total MATCHED, not the page length"
+            );
+            assert_eq!(items.len(), 1 + 2 * 2, "LIMIT 1 2 emits two documents");
+            assert_eq!(items[1], Frame::BulkString(Bytes::from_static(b"v:1")));
+        }
+        other => panic!("expected an Array reply, got {other:?}"),
+    }
+}
+
+#[test]
+fn moon695_gate_declines_everything_that_is_not_a_bare_star() {
+    // Serialised with the other index-creating tests: `ft_create` moves global
+    // atomic index counters, and a test asserting a counter DELTA cannot tell a
+    // concurrent creator's writes from its own.
+    let _metrics_guard = METRICS_LOCK.read();
+    let store = vector_only_store_with(&[b"v:0"]);
+    let ts = crate::text::store::TextStore::new();
+
+    // A KNN query. `is_text_query` already rejects it, but the gate must not
+    // depend on being called only from behind that check.
+    let knn = vec![bulk(b"vidx"), bulk(b"*=>[KNN 3 @e $q]")];
+    assert!(vector_only_match_all_index(&ts, &store, &knn, 0).is_none());
+
+    // Prose, a prefix glob, and an empty query are all NOT match-all.
+    for q in [&b"hello"[..], &b"v*"[..], &b""[..], &b"**"[..]] {
+        let args = vec![bulk(b"vidx"), bulk(q)];
+        assert!(
+            vector_only_match_all_index(&ts, &store, &args, 0).is_none(),
+            "query {:?} must not be treated as match-all",
+            String::from_utf8_lossy(q)
+        );
+    }
+
+    // Unknown index: left alone, so the caller still reports `ERR no such index`.
+    assert!(vector_only_match_all_index(&ts, &store, &star_args(b"nope"), 0).is_none());
+
+    // Wrong db: WS5a scoping must hold here exactly as it does for the text path.
+    assert!(vector_only_match_all_index(&ts, &store, &star_args(b"vidx"), 1).is_none());
+}
+
+/// `*` is also the leading token of a HYBRID query, whose retriever clauses live
+/// in separate args. The gate is consulted from routing sites on BOTH sides of the
+/// HYBRID parse, so it has to reject those itself rather than rely on placement.
+#[test]
+fn moon695_gate_declines_hybrid_and_sparse_clauses() {
+    // Serialised with the other index-creating tests: `ft_create` moves global
+    // atomic index counters, and a test asserting a counter DELTA cannot tell a
+    // concurrent creator's writes from its own.
+    let _metrics_guard = METRICS_LOCK.read();
+    let store = vector_only_store_with(&[b"v:0"]);
+    let ts = crate::text::store::TextStore::new();
+
+    let mut hybrid = star_args(b"vidx");
+    hybrid.extend([
+        bulk(b"HYBRID"),
+        bulk(b"VECTOR"),
+        bulk(b"@e"),
+        bulk(b"$q"),
+        bulk(b"FUSION"),
+        bulk(b"RRF"),
+    ]);
+    assert!(
+        vector_only_match_all_index(&ts, &store, &hybrid, 0).is_none(),
+        "a HYBRID query must reach the hybrid engine, not the match-all path"
+    );
+
+    let mut sparse = star_args(b"vidx");
+    sparse.extend([bulk(b"SPARSE"), bulk(b"@e"), bulk(b"$q")]);
+    assert!(
+        vector_only_match_all_index(&ts, &store, &sparse, 0).is_none(),
+        "a SPARSE query must reach the sparse engine, not the match-all path"
+    );
+}
+
+#[test]
+fn moon695_match_all_local_on_an_unknown_index_errors_rather_than_reporting_empty() {
+    // Serialised with the other index-creating tests: `ft_create` moves global
+    // atomic index counters, and a test asserting a counter DELTA cannot tell a
+    // concurrent creator's writes from its own.
+    let _metrics_guard = METRICS_LOCK.read();
+    let store = vector_only_store_with(&[b"v:0"]);
+    let reply = match_all_local(&store, b"nope", 0, 0, usize::MAX);
+    match reply {
+        Frame::Error(e) => assert!(
+            e.as_ref().starts_with(b"ERR no such index"),
+            "got {:?}",
+            String::from_utf8_lossy(&e)
+        ),
+        other => {
+            panic!("a missing index must not read as a successful empty enumeration: {other:?}")
+        }
+    }
+}
+
+/// An index that DOES have an inverted half stays on the text path — otherwise
+/// this fix would silently take over mixed VECTOR+TEXT schemas, which already
+/// answer `*` correctly.
+#[cfg(feature = "text-index")]
+#[test]
+fn moon695_gate_leaves_a_text_backed_index_to_the_text_engine() {
+    // Serialised with the other index-creating tests: `ft_create` moves global
+    // atomic index counters, and a test asserting a counter DELTA cannot tell a
+    // concurrent creator's writes from its own.
+    let _metrics_guard = METRICS_LOCK.read();
+    let mut store = VectorStore::new();
+    let mut ts = crate::text::store::TextStore::new();
+    let mixed = vec![
+        bulk(b"midx"),
+        bulk(b"ON"),
+        bulk(b"HASH"),
+        bulk(b"PREFIX"),
+        bulk(b"1"),
+        bulk(b"m:"),
+        bulk(b"SCHEMA"),
+        bulk(b"title"),
+        bulk(b"TEXT"),
+        bulk(b"e"),
+        bulk(b"VECTOR"),
+        bulk(b"HNSW"),
+        bulk(b"6"),
+        bulk(b"TYPE"),
+        bulk(b"FLOAT32"),
+        bulk(b"DIM"),
+        bulk(b"4"),
+        bulk(b"DISTANCE_METRIC"),
+        bulk(b"L2"),
+    ];
+    let created = ft_create(&mut store, &mut ts, &mixed, 0);
+    assert!(
+        matches!(&created, Frame::SimpleString(s) if &s[..] == b"OK"),
+        "FT.CREATE mixed: {created:?}"
+    );
+    // Premise: this schema DOES build a TextIndex.
+    assert!(
+        ts.get_index_for_db(b"midx", 0).is_some(),
+        "a TEXT field must build an inverted index, or this test proves nothing"
+    );
+    assert!(
+        vector_only_match_all_index(&ts, &store, &star_args(b"midx"), 0).is_none(),
+        "a mixed index is answered by the text engine and must be left alone"
+    );
+}

@@ -1983,6 +1983,24 @@ pub async fn handle_connection(
                                                     ) && !crate::command::vector_search::has_sparse_clause(
                                                         cmd_args,
                                                     ) {
+                                                        // moon#695: `*` on a VECTOR-only index.
+                                                        // The text engine below has no inverted
+                                                        // index for such a schema and would answer
+                                                        // `ERR no such index` for an index that
+                                                        // FT._LIST lists. This handler is
+                                                        // non-sharded, so the local live key map
+                                                        // IS the whole answer — no scatter.
+                                                        if let Some(response) =
+                                                            crate::command::vector_search::try_match_all_vector_only(
+                                                                &*ts_mut,
+                                                                &store,
+                                                                cmd_args,
+                                                                conn.selected_db as u8,
+                                                            )
+                                                        {
+                                                            responses.push(response);
+                                                            continue;
+                                                        }
                                                         // Step 1: index_name.
                                                         let index_name = match cmd_args.first() {
                                                             Some(crate::protocol::Frame::BulkString(b)) => b.clone(),

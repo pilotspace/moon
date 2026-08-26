@@ -82,6 +82,30 @@ async fn ft_command_inner(
                 .map_or(false, |q| crate::command::vector_search::is_text_query(q))
                 && !crate::command::vector_search::has_sparse_clause(cmd_args);
 
+            // moon#695: a bare `*` on a VECTOR-only index. `is_text_query("*")`
+            // is true, so without this the query reaches the text engine — which
+            // has no inverted index for such a schema and answers
+            // `ERR no such index` for an index FT._LIST lists. Decided ahead of
+            // every other FT.SEARCH branch, and a no-op for every other query.
+            if is_text {
+                if let Some(mut response) = crate::shard::coordinator::ft_match_all_if_vector_only(
+                    cmd_args,
+                    ctx.shard_id,
+                    ctx.num_shards,
+                    &ctx.dispatch_tx,
+                    &ctx.spsc_notifiers,
+                    conn.selected_db as u8,
+                )
+                .await
+                {
+                    if let Some(ws_id) = conn.workspace_id.as_ref() {
+                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                    }
+                    responses.push(response);
+                    return true;
+                }
+            }
+
             // -- HYBRID multi-shard path (Phase 152 Plan 05, D-13) --
             // If the args contain a HYBRID clause, route through
             // scatter_hybrid_search (three-phase DFS -> fan-out -> RRF
@@ -358,6 +382,29 @@ async fn ft_command_inner(
         .await;
         responses.push(response);
         return true;
+    }
+    // moon#695: `*` on a VECTOR-only index, single-shard. Deliberately NOT
+    // gated on `text-index`: a vector-only schema builds no TextIndex at all,
+    // so this has to work in a build with no text engine compiled in. The
+    // predicate itself rejects HYBRID / SPARSE / KNN, so this only ever
+    // claims a bare match-all the text engine cannot answer.
+    if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+        if let Some(mut response) = crate::shard::coordinator::ft_match_all_if_vector_only(
+            cmd_args,
+            ctx.shard_id,
+            ctx.num_shards,
+            &ctx.dispatch_tx,
+            &ctx.spsc_notifiers,
+            conn.selected_db as u8,
+        )
+        .await
+        {
+            if let Some(ws_id) = conn.workspace_id.as_ref() {
+                strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+            }
+            responses.push(response);
+            return true;
+        }
     }
     //
     // -- 151-03 single-shard text FT.SEARCH fast path --
