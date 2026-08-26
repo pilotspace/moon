@@ -258,21 +258,36 @@ legs run locally via `scripts/ci-local.sh` before every push, and again on Actio
 - Memory steady-state gate
 - Fuzz (only with `ci-fuzz` label), Console Integration (only when console-relevant paths change), Integration Tests (only with `ci-full` label)
 
-**Main-push + `workflow_dispatch` only** (the pre-merge dispatch matrix):
-- Check (monoio — the shipped runtime; self-hosted, io_uring live; guarded by `tests/ci_covers_monoio.rs`)
-- Client compat (self-hosted, real redis-server oracle)
-- Check (macOS), Check (Windows), Check (console feature)
+**`workflow_dispatch` — the pre-merge matrix (moon#732):** only what no local gate can produce.
+- Check (Windows) — the one leg with no local equivalent, and the ~14m floor of any matrix
+- MSRV (1.94), Memory steady-state gate
+
+**Main-push only** (post-merge net, NOT a merge gate — `ci-local` gates these before the push):
+- Check (monoio — the shipped runtime; self-hosted, io_uring live; guarded by `tests/ci_covers_monoio.rs`,
+  which since #732 also asserts `ci-local` still runs a monoio suite — if neither does, nothing gates
+  the runtime that ships)
+- Client compat (self-hosted, real redis-server oracle), Check (macOS), Check (console feature)
+
+Measured before the cut (PR #731, 2026-08-26): 7 of 9 dispatch legs duplicated `ci-local`, and
+`check-monoio` + `client-compat` queued on the very moon-dev VM `ci-local` had just used.
 
 **Scheduled:** fuzz nightly 6h (18 targets, nightly compiler, `rust-toolchain.toml` removed for the job), Crash Matrix nightly + weekly soak, CodeQL weekly, supply-chain weekly.
 
 ### Local CI (the merge bar)
 
 ```bash
-scripts/ci-local.sh            # host lint gates + VM monoio suite + VM tokio suite
-scripts/ci-local.sh --quick    # host lint gates only (fmt, audits, clippy ×2)
-scripts/ci-local.sh --full     # + client-compat harness (VM) + macOS host suite
+scripts/ci-local.sh            # THE MERGE BAR: lint ×6 + VM monoio + VM tokio
+                               #   + client-compat + macOS host suite  (= --full)
+scripts/ci-local.sh --quick    # host lint gates only — NOT the merge bar
+scripts/ci-local.sh --fast     # pre-#732 default: lint + both VM suites, no
+                               #   compat/macOS — for iterating, NOT the merge bar
 scripts/ci-local.sh --native   # NO VM: both suites + compat on the macOS host
 ```
+
+The bare invocation is `--full` as of #732: the hosted matrix no longer runs macOS or
+client-compat, so if they are not gates here they are not gates anywhere until after merge.
+Each mode's verdict now names what it skipped — `--quick` and `--fast` say "NOT the merge bar"
+rather than printing the same `RESULT: PASS` a full run prints.
 
 `--native` is the fallback when moon-dev is unavailable (or when a long testing phase should
 stay on one machine): it runs both full suites plus the client-compat harness on macOS. It is
@@ -280,8 +295,9 @@ NOT equivalent — macOS drives monoio on kqueue, so the shipped Linux io_uring 
 `cfg(target_os = "linux")` code, Windows, and the MSRV pin all go untested. The mode prints
 those gaps instead of a bare PASS, and refuses (exit 2) if no `redis-server` oracle is on PATH.
 
-Run the default mode before every push — it covers exactly what the PR gate no longer runs
-(most importantly the **monoio suite, the runtime that ships**). The script captures every
+Run the default mode before every push — it is the merge bar, and since #732 it is the ONLY
+gate for the monoio suite (**the runtime that ships**), client-compat, macOS, and the console
+feature until a change reaches main. The script captures every
 exit code directly (no piped gates), keeps VM builds on VM-local target dirs, pins
 `MOON_BIN` for the compat harness, and fingerprints the tree at start/end — a branch switch
 or edit mid-run marks the whole result INVALID (exit 3) instead of reporting a false green.

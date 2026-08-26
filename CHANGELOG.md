@@ -43,6 +43,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The effect is ELF-only: on macOS DWARF lives outside the executable, so a Mach-O A/B
   produces byte-identical binaries and no saving.
+- **The pre-merge hosted matrix now runs only what no local gate can produce (moon#732).**
+
+  A merge cost ~59 minutes of gating: `ci-local` ~26m, then a push, then the PR gate 8.6m, then
+  a wait for it to settle, then a dispatch matrix of 24.5m. Nothing overlapped.
+
+  Measured per-job on PR #731, seven of the nine dispatch legs were re-running what `ci-local`
+  had just finished — and two of them, `check-monoio` and `client-compat`, are
+  `runs-on: [self-hosted, moon-dev]`, so the matrix queued on the very VM that had produced the
+  same results minutes earlier.
+
+  `workflow_dispatch` now runs Windows (835s, the only leg with no local equivalent and the
+  floor of any hosted matrix), MSRV, and the memory steady-state gate. macOS, monoio,
+  tokio-Check, client-compat, console and Lint stay on main-push as a post-merge net.
+
+  That is a real shift of responsibility, so two things move with it:
+
+  * `scripts/ci-local.sh` with no arguments is now `--full` — it runs client-compat and the
+    macOS suite, because after this change nothing else does before merge. client-compat is
+    not a formality; it is what caught the v0.8.6 inline-GET ACL bypass. `--fast` is the old
+    default, kept for iterating.
+  * Every mode's verdict now states what it did NOT run. Previously `--quick` — six lint gates
+    and not one test — printed the same `RESULT: PASS` line as a complete run.
+
+  `tests/ci_covers_monoio.rs` gains a test that follows the coverage rather than the job: it
+  asserts `ci-local` still runs a monoio suite, so the shipped runtime cannot fall out of both
+  gates at once. Mutation-tested — renaming the step makes it fail.
 
 - **A multi-key command whose keys all live on one shard now joins the slotted batch instead of cutting it (moon#513).**
 

@@ -231,3 +231,33 @@ fn the_tokio_job_is_still_covered() {
          must not remove tokio coverage.\n{tokio}"
     );
 }
+
+/// moon#732 moved `check-monoio` off the pre-merge dispatch matrix: it duplicated
+/// what `ci-local` had just run, on the same self-hosted VM. That is only safe
+/// while `ci-local` really does run the monoio suite — otherwise the shipped
+/// runtime silently leaves the merge bar entirely, which is the exact failure
+/// this file exists to prevent, just relocated from CI to the local script.
+///
+/// So the guard follows the coverage instead of the job: whichever gate owns
+/// monoio, something must assert it runs.
+#[test]
+fn the_local_merge_bar_runs_the_monoio_suite() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/ci-local.sh");
+    let sh = normalize_newlines(
+        &std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display())),
+    );
+    assert!(
+        sh.contains("VM monoio suite"),
+        "scripts/ci-local.sh no longer runs a monoio suite. Since moon#732 the \
+         hosted dispatch matrix does NOT run one either, so the runtime Moon \
+         ships would have no gate at all. Restore it here, or put check-monoio \
+         back on workflow_dispatch in .github/workflows/ci.yml."
+    );
+    // Not just present — reached. `--quick` skips the VM phases, so the suite
+    // must live in a mode the merge bar actually uses.
+    assert!(
+        sh.contains("$VM_TEST_MONOIO"),
+        "ci-local mentions a monoio suite but never invokes $VM_TEST_MONOIO"
+    );
+}

@@ -5,13 +5,16 @@
 # leg + memory gate). The heavyweight legs that used to serialize on the
 # single self-hosted runner run HERE instead, before every push:
 #
-#   default : host lint gates, then the two full test suites in the
-#             moon-dev VM — monoio (the SHIPPED runtime, io_uring live)
-#             and tokio (the CI-parity leg).
-#   --quick : host lint gates only (fmt, unsafe/unwrap audits, clippy x2)
+#   default : THE MERGE BAR (= --full since moon#732). Host lint gates, the
+#             two full suites in the moon-dev VM — monoio (the SHIPPED
+#             runtime, io_uring live) and tokio (the CI-parity leg) — then
+#             the client-compat harness and the macOS host suite.
+#   --quick : host lint gates only (fmt, unsafe/unwrap audits, clippy x3)
 #             — no VM legs, so no disk pre-flight.
-#   --full  : default + client-compat harness (VM, real redis-server
-#             oracle) + macOS host test suite.
+#   --fast  : the pre-#732 default — lint gates + the two VM suites, WITHOUT
+#             client-compat and the macOS suite. For iterating mid-change.
+#             Not the merge bar; the summary refuses to call it one.
+#   --full  : same as the default. Kept so existing docs and habits work.
 #   --native: everything on the macOS HOST, no VM at all — host lint
 #             gates, BOTH full suites (monoio on kqueue + tokio), and the
 #             client-compat harness against brew's redis-server. For when
@@ -59,13 +62,21 @@ set -u -o pipefail
 # indistinguishable from a gate deciding to exit 2.
 REPO="${CI_LOCAL_REPO:-/Volumes/Games/tindang-repo/moon}"
 VM="moon-dev"
-MODE="default"
+# The bare invocation is the MERGE BAR, and since moon#732 that means `full`.
+# The pre-merge hosted matrix no longer runs macOS or client-compat — they were
+# duplicating this script on a slower machine — so if they are not gates HERE
+# they are not gates anywhere until after merge. client-compat is not a
+# formality: it is what caught the v0.8.6 inline-GET ACL bypass. `--fast` is
+# the old default, kept for iterating mid-change; it is NOT the merge bar and
+# the summary says so.
+MODE="full"
 case "${1:-}" in
   --quick)  MODE="quick" ;;
+  --fast)   MODE="fast" ;;
   --full)   MODE="full" ;;
   --native) MODE="native" ;;
   "")       ;;
-  *) echo "usage: $0 [--quick|--full|--native]" >&2; exit 2 ;;
+  *) echo "usage: $0 [--quick|--fast|--full|--native]" >&2; exit 2 ;;
 esac
 
 # Library mode is sourced from anywhere — CI runs the pre-flight test on a
@@ -509,6 +520,26 @@ if [ "$MODE" = "native" ]; then
   echo "    gh workflow run ci.yml --ref \$(git branch --show-current)"
   exit 0
 fi
-echo "  RESULT: PASS — remember: Windows still needs the hosted matrix:"
+# Only the merge bar is allowed to read like the merge bar. Before moon#732
+# every mode printed this same line, so `--quick` — six lint gates and not one
+# test — announced "RESULT: PASS" exactly as a full run did. A verdict that
+# cannot distinguish what it ran from what it skipped is how a partial gate
+# gets mistaken for a complete one.
+case "$MODE" in
+  quick)
+    echo "  RESULT: PASS (quick) — LINT ONLY. NOT the merge bar."
+    echo "    No tests ran: no VM suites, no client-compat, no macOS suite."
+    echo "    Run \`scripts/ci-local.sh\` with no arguments before pushing."
+    exit 0 ;;
+  fast)
+    echo "  RESULT: PASS (fast) — NOT the merge bar."
+    echo "    Skipped: client-compat (the harness that caught the v0.8.6"
+    echo "    inline-GET ACL bypass) and the macOS host suite. Since moon#732"
+    echo "    the hosted matrix no longer runs either, so nothing has gated"
+    echo "    them. Run \`scripts/ci-local.sh\` with no arguments before pushing."
+    exit 0 ;;
+esac
+echo "  RESULT: PASS — merge bar satisfied except Windows, which cannot run"
+echo "  locally. Dispatch the hosted matrix (Windows + MSRV + memory gate):"
 echo "    gh workflow run ci.yml --ref \$(git branch --show-current)"
 exit 0
