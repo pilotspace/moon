@@ -208,6 +208,62 @@ pub fn reserve_cluster_port() -> u16 {
 /// when a wedged-but-alive server never listens (a real bug worth the wait).
 const ACCEPT_DEADLINE: Duration = Duration::from_secs(30);
 
+/// A `$TMPDIR` path that is unique across processes AND threads.
+///
+/// Suites used to build their own from `pid` + `SystemTime` nanos. That is
+/// not unique within one test binary: on macOS `SystemTime::now()` carries
+/// only MICROSECOND resolution (every nanos value it returns ends in `000`),
+/// so two `#[test]` threads that call it inside the same microsecond get the
+/// SAME path. Both servers then receive the same `--dir`, moon's instance
+/// flock correctly refuses the second, and it exits 1 before ever accepting.
+///
+/// The symptom is maximally misleading: `spawn_listening` reports
+/// `3 consecutive children exited before accepting — not a port race`
+/// (correct — it is a *directory* race), the closure it retries captured the
+/// colliding dir so all three attempts fail identically, and the winning
+/// test's `Drop` deletes the shared dir, so no evidence survives. Measured
+/// at 2 failures / 60 runs of `lua_vm_memory_published` under 6-way load on
+/// a macOS host; the two tests printed one identical dir on the failing run.
+///
+/// The per-process counter is what makes this sound — it cannot collide no
+/// matter what the clock's resolution turns out to be. pid and the timestamp
+/// stay in the name only so a leftover dir is still attributable to a run.
+pub fn unique_test_dir(prefix: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}-{seq}", std::process::id()))
+}
+
+/// stderr sink for a spawned `moon`, landing in the test's own `--dir`.
+///
+/// `spawn_listening`'s give-up panic instructs the reader to open "the server
+/// stderr log in the test's --dir". A suite that spawns with
+/// `Stdio::null()` makes that instruction unfollowable: the one artifact that
+/// distinguishes a bind race from a config rejection is thrown away, and the
+/// failure is only reproducible under full-suite load. Use this instead.
+///
+/// Opens in **append** mode on purpose — the closure passed to
+/// `spawn_listening` runs once per respawn attempt, and truncating would
+/// leave only the last attempt's reason.
+///
+/// Falls back to `Stdio::null()` if the log cannot be opened, so a
+/// read-only or full `--dir` degrades to today's behaviour rather than
+/// panicking inside the spawn closure.
+pub fn server_stderr(dir: &std::path::Path) -> std::process::Stdio {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("server.err"))
+    {
+        Ok(f) => std::process::Stdio::from(f),
+        Err(_) => std::process::Stdio::null(),
+    }
+}
+
 /// Spawn a server via `spawn(port)` and wait until it ACCEPTS a TCP
 /// connection on that port, respawning on a fresh [`reserve_port`] if the
 /// child exits first (the lost-the-bind-race case).
@@ -310,8 +366,14 @@ fn spawn_listening_inner(
         let _ = child.wait();
     }
     panic!(
-        "spawn_listening: {ATTEMPTS} consecutive children exited before accepting — \
-         not a port race; read the server stderr log in the test's --dir"
+        "spawn_listening: {ATTEMPTS} consecutive children exited before accepting. \
+         Each attempt used a fresh port, so this is not a port race. Two things \
+         look like this: (a) the server rejected its arguments or environment — \
+         spawn with `common::server_stderr(dir)` and read `server.err` in the \
+         test's --dir, which carries moon's own `Error: ...` line; (b) two tests \
+         in this binary were handed the SAME --dir and moon's instance flock \
+         refused the second — build the path with `common::unique_test_dir` \
+         rather than pid+timestamp (moon#741)"
     );
 }
 

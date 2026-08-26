@@ -25,7 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `windows-sys` 0.61.2 in `winsplit`.
 
 ### Fixed
-- **`wc4` waiter-cannibalisation test no longer reports a false failure when the CI box is loaded.**
+
+- **Test harness: two `#[test]` threads could be handed the same `--dir`, and moon's instance
+  flock correctly refused the second** (#741). Suites built their data dir as
+  `{prefix}-{pid}-{nanos}`. Both tests in a binary are threads of one process, so `pid` does not
+  discriminate them, and `SystemTime::now()` resolves to **microseconds** on macOS — every nanos
+  value ends in `000`. Two tests entering the spawn helper in the same microsecond got the
+  identical path; the second server exited 1 before binding. Four things then hid the cause:
+  `spawn_listening`'s panic asserted "not a port race" without admitting a *directory* race; the
+  retried closure captured the colliding dir so all three attempts failed identically; the suite
+  spawned with `Stdio::null()` so moon's `Error:` line was discarded even though the panic tells
+  you to read it; and the winning test's `Drop` deleted the shared dir. `tests/common` now
+  provides `unique_test_dir()` (per-process `AtomicU64` counter — cannot collide whatever the
+  clock does) and `server_stderr()` (append-mode log in the test's own `--dir`), the panic text
+  names both failure modes, and the three suites with no per-test discriminator
+  (`lua_vm_memory_published`, `dir_deleted_degraded`, `txn_kv_wiring`) were converted. Measured
+  on one macOS host under 6-way load, 120 runs per binary: **14 failures before, 0 after**.
+
+ **`wc4` waiter-cannibalisation test no longer reports a false failure when the CI box is loaded.**
 
   `wc4_a_list_push_must_not_destroy_a_zset_waiter_on_the_same_key` sent `BZPOPMIN`, slept
   150ms hoping the registration reached the owning shard, then raced an `RPUSH` against it.
