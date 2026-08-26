@@ -88,6 +88,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Routed scripts also never fired the client-side-cache invalidation a flush owes tracking
   clients; completing the flush through `finish_script_flush` fixes that in the same change.
 
+  A fifth `Execute` reply consumer lives on the admin console plane
+  (`admin/console_gateway.rs`) and compiles only under the `console` feature, which neither
+  the default nor the tokio build covers. It now completes the flush over its own producers
+  rather than dropping it — the one plane that runs scripts trusted was otherwise the one
+  place the partial flush would have survived this fix.
+
 - **`FT.SEARCH` on a missing index no longer reads as an empty listing in a build without `text-index` (moon#728).**
 
   A build compiled without the `text-index` feature — what CI's tokio leg compiles — answered
