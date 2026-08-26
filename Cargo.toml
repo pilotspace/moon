@@ -210,6 +210,30 @@ static_assertions = "1"
 [profile.dev]
 debug = "line-tables-only"
 
+# Dependencies carry NO debug info; only moon's own code keeps line tables
+# (moon#735). `"*"` matches every package that is not a workspace member.
+#
+# After moon#655 a median 53.8 MB test binary was still 96% debug info against
+# 2.9 MB of `.text` — because 272 test executables each statically link the
+# whole dep graph, amplifying a 0.61 GiB shared rlib set into 10.43 GiB. Most
+# of those bytes describe crates no one debugs. Measured on moon-dev, same
+# tree, cold dir, `cargo nextest run --profile ci --no-run`:
+# 11.67 -> 8.48 GiB (-27.4%) and 277 -> 239s (-13.7%).
+#
+# What this costs, verified on a real panicking moon test binary rather than
+# assumed: moon's own frames keep symbol AND `at file:line`; std frames keep
+# theirs (std ships its own debug info and `package."*"` does not touch it);
+# third-party crate frames keep symbols but lose file:line. Panic messages are
+# unaffected either way via #[track_caller]. The probe binary went 54 -> 6.1 MB.
+#
+# NOT set here: `split-debuginfo = "unpacked"`, worth a further 8.48 -> 6.81 GiB
+# and 239 -> 145s on Linux. A profile key would also apply to Windows, where
+# MSVC uses PDB and support differs, and to macOS, where dev already defaults
+# to `unpacked` — risking a platform for no gain. It is set per-leg as
+# CARGO_PROFILE_DEV_SPLIT_DEBUGINFO on the Linux CI legs instead.
+[profile.dev.package."*"]
+debug = 0
+
 [profile.release]
 debug = false         # No debug symbols for smaller/faster binary
 lto = "fat"           # Full cross-crate LTO for maximum inlining
