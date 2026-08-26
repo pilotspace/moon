@@ -6,6 +6,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`wc4` waiter-cannibalisation test no longer reports a false failure when the CI box is loaded.**
+
+  `wc4_a_list_push_must_not_destroy_a_zset_waiter_on_the_same_key` sent `BZPOPMIN`, slept
+  150ms hoping the registration reached the owning shard, then raced an `RPUSH` against it.
+  Under a loaded full-suite run (5309 tests, 6-CPU VM) that guess is wrong: the push lands
+  first, the key becomes a list, and the pop then answers `-WRONGTYPE` immediately — moon#556's
+  correct behavior — which the test read as a cannibalised waiter. It failed 3-of-3 that way
+  while passing 11-of-11 in isolation.
+
+  The test now asks the server instead of guessing, waiting on `blocked_clients` from
+  `INFO clients` — the same handshake `list_move_cross_shard.rs` already uses, whose helper
+  doc says outright why a sleep cannot do that job. `record_client_blocked()` fires when the
+  waiter takes a vacant `wait_keys` slot in the owning shard's registry, so the gauge moves on
+  registration, which is exactly the event being waited for, and it works cross-shard because
+  the counter is one process-wide atomic.
+
+  The gauge can only be read as "one more than before", so every blocker connection is now held
+  for the whole test rather than dropped per iteration — a dropped blocker unblocks
+  asynchronously, and under load those decrements land after the baseline is sampled. The first
+  version of this fix did drop them, and an interleaved under-load A/B caught it failing 2-of-4
+  on the sequence `before=3 -> 3 stale reaps -> 0 -> new waiter -> 1`, where `1 > 3` is never
+  true. With the blockers held: 6-of-6 at load average 10.5, and 14.79s instead of 17.5s since
+  the handshake beats twelve 150ms sleeps.
+
+  The guard was verified to still catch what it exists for: reverting the moon#535 fix in
+  `try_wake_list_waiter` (`pop_front_of_family(List)` back to the blind `pop_front`) makes the
+  test fail on **12 of 12** keys with waiters woken `*-1`. That is a different signature from
+  the load artifact above (`-WRONGTYPE`, 2 of 12), which is what distinguishes the two.
+
 ### Changed
 - **Dependency debug info is dropped from dev/test builds, halving the target dir again and cutting the cold build 60% (moon#735).**
 

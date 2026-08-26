@@ -193,6 +193,52 @@ fn cmd(s: &mut TcpStream, parts: &[&str]) -> String {
     read_reply(s).expect("read reply")
 }
 
+/// How many clients the server currently has PARKED on a blocking command.
+///
+/// Read from `INFO clients` — the server's own account of its registry, rather
+/// than the test's guess about how long a registration takes to get there.
+fn blocked_clients(port: u16) -> u32 {
+    let mut c = connect(port, Duration::from_secs(5));
+    cmd(&mut c, &["INFO", "clients"])
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("blocked_clients:")?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Wait until the server reports one MORE parked client than `baseline`.
+///
+/// A `sleep` cannot do this job, and its two failure directions are not
+/// symmetric. Sleeping too long only makes the test slow. Sleeping too short
+/// lets the `RPUSH` below reach the key BEFORE the `BZPOPMIN` does — and then
+/// the pop runs against a key that is already a list and answers
+/// `-WRONGTYPE` immediately, which is moon#556's correct behavior. This test
+/// reads that reply as "the waiter was cannibalised" and fails, having never
+/// set up the scenario it believes it is testing.
+///
+/// That is not hypothetical: with the old 150ms sleep wc4 failed 3-of-3 inside
+/// a loaded full-suite run (5309 tests, 6-CPU VM) while passing 11-of-11 in
+/// isolation, reporting exactly that WRONGTYPE string.
+///
+/// `blocked_clients` is one process-wide gauge, not a per-key one, so this can
+/// only be read as "one MORE than before" — which requires that nothing else
+/// DECREMENTS it while we wait. That is why the caller keeps every blocker
+/// connection alive for the whole test instead of dropping it per iteration:
+/// a dropped blocker unblocks asynchronously, and under load those decrements
+/// land after the baseline is sampled. Measured: with per-iteration drops this
+/// helper failed 2-of-4 under CPU oversubscription on the sequence
+/// `before=3 -> 3 stale reaps -> 0 -> new waiter -> 1`, where `1 > 3` is never
+/// true and the poll simply burns its deadline.
+fn await_one_more_blocked(port: u16, baseline: u32) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if blocked_clients(port) > baseline {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
 /// Issue `probe` against `KEYS` populated zsets and report EVERY key that
 /// answered a null instead of the member sitting in it.
 ///
@@ -282,16 +328,25 @@ fn wc4_a_list_push_must_not_destroy_a_zset_waiter_on_the_same_key() {
     let m = spawn_moon();
     let mut wrong = Vec::new();
     let mut usable = 0;
+    // Held for the whole test, never dropped per iteration: see
+    // `await_one_more_blocked` for why the gauge must not go down while a
+    // handshake is in flight.
+    let mut blockers: Vec<TcpStream> = Vec::new();
 
     for i in 0..KEYS {
         let key = format!("cannibal:mixed:{i}");
+        let before = blocked_clients(m.port);
         let mut blocker = connect(m.port, Duration::from_millis(1200));
         // The key does not exist yet, so this genuinely blocks.
         send(&mut blocker, &["BZPOPMIN", &key, "0"]);
-        // Give the registration time to land on the owning shard before the
-        // push races it; without this the push can precede the waiter and the
-        // test would pass for the wrong reason.
-        std::thread::sleep(Duration::from_millis(150));
+        // The registration must be ON the owning shard before the push races
+        // it. Ask the server; do not guess — see `await_one_more_blocked` for
+        // why a sleep gets this wrong in the direction that FAILS the test.
+        assert!(
+            await_one_more_blocked(m.port, before),
+            "{key}: BZPOPMIN never reached the blocking registry, so the push \
+             below would prove nothing about waiter cannibalisation"
+        );
 
         let mut pusher = connect(m.port, Duration::from_secs(10));
         let pushed = cmd(&mut pusher, &["RPUSH", &key, "v1"]);
@@ -304,6 +359,7 @@ fn wc4_a_list_push_must_not_destroy_a_zset_waiter_on_the_same_key() {
         // quietly become a test of zero keys. At --shards 4 roughly 3 in 4
         // keys are remote and therefore usable.
         if pushed.starts_with("-WRONGTYPE") {
+            blockers.push(blocker);
             continue;
         }
         assert_eq!(
@@ -323,6 +379,7 @@ fn wc4_a_list_push_must_not_destroy_a_zset_waiter_on_the_same_key() {
             Ok(reply) => wrong.push(format!("  {key} -> woken with {reply:?}")),
             Err(e) => wrong.push(format!("  {key} -> read failed: {e}")),
         }
+        blockers.push(blocker);
     }
 
     assert!(
