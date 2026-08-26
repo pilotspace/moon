@@ -5,7 +5,21 @@ on:
     branches: [main]
     types: [labeled]
   schedule:
-    - cron: '0 2 * * *'
+    # 16:00 UTC = 23:00 in this project's timezone (UTC+7), so the soak runs
+    # overnight LOCALLY and is done by ~04:50 local.
+    #
+    # It was '0 2 * * *' — 09:00 local, i.e. the start of the working day. The
+    # nightly matrix is 18 jobs with `fail-fast: false` and no `max-parallel`,
+    # each budgeted 5h, so it held 18 hosted runners from 09:00 to ~14:50 local
+    # every weekday. Measured 2026-08-26 (moon#732): with the fuzz run 2.5h in
+    # and all 18 jobs live, two CI runs sat `queued` for 35+ minutes while
+    # `Check (Windows)` — a separate runner pool — completed normally. Every PR
+    # raised in the morning paid that queue.
+    #
+    # Deliberately a reschedule and NOT a `max-parallel` cap: capping to 9 would
+    # double the wall clock to ~11h40m and push the tail back into working hours,
+    # which is the problem this is fixing.
+    - cron: '0 16 * * *'
 
 concurrency:
   group: fuzz-${{ github.ref }}

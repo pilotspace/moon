@@ -43,6 +43,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The effect is ELF-only: on macOS DWARF lives outside the executable, so a Mach-O A/B
   produces byte-identical binaries and no saving.
+- **The nightly fuzz soak no longer runs through the working day (moon#732).**
+
+  `fuzz.yml` was scheduled `'0 2 * * *'`. This project's timezone is UTC+7, so that is 09:00
+  local — the nightly matrix is 18 jobs with `fail-fast: false` and no `max-parallel`, each
+  budgeted 5 hours, so it occupied 18 hosted runners from 09:00 until ~14:50 local every day.
+
+  Measured 2026-08-26 with the run 2.5h in and all 18 jobs live: two CI runs sat `queued` for
+  35+ minutes, while `Check (Windows)` — which draws from a different runner pool — completed
+  normally. Every PR raised in the morning paid that queue, and it read as "CI is slow" rather
+  than as a scheduling collision.
+
+  Now `'0 16 * * *'` — 23:00 local, finishing ~04:50 local. Deliberately a reschedule rather
+  than a `max-parallel` cap: capping to 9 would double the wall clock and push the tail back
+  into working hours. `crash-matrix.yml` has the same 10:17-local schedule but runs entirely on
+  the self-hosted VM, so it costs no hosted capacity; its cron is also load-bearing
+  (`recall-canaries` matches the literal string), so it is left alone.
+
 - **The pre-merge hosted matrix now runs only what no local gate can produce (moon#732).**
 
   A merge cost ~59 minutes of gating: `ci-local` ~26m, then a push, then the PR gate 8.6m, then
