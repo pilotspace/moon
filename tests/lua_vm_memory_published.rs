@@ -52,14 +52,10 @@ impl Drop for Moon {
 
 fn spawn_moon() -> Moon {
     let bin = common::find_moon_binary();
-    let dir = std::env::temp_dir().join(format!(
-        "moon-506-lua-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    // Not pid+timestamp: both #[test]s here spawn concurrently, and macOS
+    // clocks tick in microseconds, so that shape handed BOTH of them the same
+    // --dir often enough to fail ~3% of loaded runs (moon#741).
+    let dir = common::unique_test_dir("moon-506-lua");
     std::fs::create_dir_all(&dir).expect("create test dir");
     let dir_arg = dir.clone();
     let (child, port) = common::spawn_listening(|port| {
@@ -75,7 +71,13 @@ fn spawn_moon() -> Moon {
                 "no",
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // `spawn_listening` tells you to read the server stderr log in the
+            // test's --dir when a child dies before accepting. Discarding
+            // stderr made that instruction unfollowable, which is exactly the
+            // state this suite was in the one time it failed on macOS. Append
+            // (not truncate): the closure runs once per respawn attempt, and
+            // the first attempt's reason is the one worth keeping.
+            .stderr(common::server_stderr(&dir_arg))
             .spawn()
             .expect("spawn moon")
     });

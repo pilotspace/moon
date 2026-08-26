@@ -86,14 +86,10 @@ fn process_cpu_ms(pid: u32) -> u64 {
 
 #[test]
 fn dir_deleted_latches_write_refusal_stays_responsive_and_self_heals() {
-    let data_dir: PathBuf = std::env::temp_dir().join(format!(
-        "moon-dir-deleted-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    // pid+timestamp is not unique across threads in one test binary (macOS
+    // clocks tick in microseconds — moon#741). One #[test] here today, but the
+    // shared helper makes adding a second one safe.
+    let data_dir: PathBuf = common::unique_test_dir("moon-dir-deleted");
     std::fs::create_dir_all(&data_dir).unwrap();
     let log_path = data_dir.with_extension("stderr.log");
 

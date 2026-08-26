@@ -1099,15 +1099,11 @@ async fn test_txn_commit_wal_crash_recovery() {
         return;
     };
 
-    // Unique temp dir so parallel test runs don't collide.
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "moon-wal-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos()
-    ));
+    // Unique temp dir so parallel test runs don't collide. `subsec_nanos()`
+    // did NOT deliver that: it repeats every second, and macOS resolves the
+    // clock to microseconds anyway, so two threads could share a --dir and
+    // trip moon's instance flock (moon#741).
+    let tmp_dir = common::unique_test_dir("moon-wal-test");
     std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
     // Ensure temp dir is cleaned up regardless of test outcome.
     let _tmp_guard = DirGuard(tmp_dir.clone());
