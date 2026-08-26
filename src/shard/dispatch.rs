@@ -587,6 +587,38 @@ pub struct PreparedShardSync {
     pub mq_blob: Vec<u8>,
 }
 
+/// What a routed [`ShardMessage::Execute`] sends back.
+///
+/// A bare `Frame` was enough until moon#705. A script routed here for its
+/// declared keys can also issue a KEYLESS `FLUSHDB`/`FLUSHALL`, and the owner
+/// shard cannot fan that out itself: `handle_shard_message_shared` is
+/// synchronous, holds neither the SPSC producers nor the notifiers, and
+/// broadcasting from inside a shard's own message loop is the shard-to-shard
+/// wait cycle `shared::execute_transaction_sharded` documents. So the owner
+/// reports what it flushed and the ORIGINATOR — which is in async context and
+/// holds the producers — completes it, exactly as the MULTI path does with
+/// [`TxnExecReply::exec_flushes`].
+pub struct ExecReply {
+    pub frame: Frame,
+    /// The flush this reply still owes the OTHER shards, if any.
+    ///
+    /// `None` for every reply that is not a script that successfully flushed —
+    /// which is nearly all of them, and is what [`ExecReply::plain`] states at
+    /// each such site rather than leaving it to be inferred.
+    pub script_flush: Option<crate::scripting::pending_flush::PendingFlush>,
+}
+
+impl ExecReply {
+    /// A reply that owes the other shards nothing.
+    #[must_use]
+    pub fn plain(frame: Frame) -> Self {
+        Self {
+            frame,
+            script_flush: None,
+        }
+    }
+}
+
 /// Messages sent to a shard via SPSC channels from the connection layer
 /// or from other shards for cross-shard operations.
 pub enum ShardMessage {
@@ -610,7 +642,7 @@ pub enum ShardMessage {
         /// does reach a shard through one of them, it is refused rather than
         /// run unchecked.
         script_acl: crate::acl::ScriptAcl,
-        reply_tx: channel::OneshotSender<Frame>,
+        reply_tx: channel::OneshotSender<ExecReply>,
     },
     /// Execute a multi-key sub-operation on this shard.
     MultiExecute {

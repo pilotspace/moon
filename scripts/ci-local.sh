@@ -367,6 +367,18 @@ run_step "clippy (default)"   env CARGO_TARGET_DIR=target-clippy \
   cargo clippy -- -D warnings                                          || exit 1
 run_step "clippy (tokio)"     env CARGO_TARGET_DIR=target-tokio \
   cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings || exit 1
+# The `console` feature compiles a module (src/admin/console_gateway.rs) that
+# NOTHING else here builds: not the default clippy above, not the tokio one,
+# and not either VM suite. On Actions it is checked only by `Check (console
+# feature)`, which runs on main-push and workflow_dispatch — never on a PR. So
+# a change to a shared type could pass every local gate AND the whole PR gate
+# and still break the build, which is what moon#705 did (E0308 in the gateway's
+# Execute-reply consumer, found only after the dispatch matrix ran). Seconds
+# here, against a whole dispatch cycle there. No pnpm build is needed: without
+# console/dist the rust_embed macro embeds nothing, which still type-checks.
+run_step "clippy (console)"   env CARGO_TARGET_DIR=target-console \
+  cargo clippy --no-default-features \
+  --features runtime-monoio,jemalloc,graph,text-index,console -- -D warnings || exit 1
 
 if [ "$MODE" != "quick" ] && [ "$MODE" != "native" ]; then
   # ── Phase 1: the two full suites, in the Linux VM ───────────────────

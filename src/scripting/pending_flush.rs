@@ -55,7 +55,7 @@ use crate::storage::Database;
 
 /// Which flush a script issued, and therefore how far it still has to reach.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum PendingFlush {
+pub enum PendingFlush {
     /// `FLUSHDB` — the bridge cleared the selected database on this shard;
     /// every other shard's copy of that database is still full.
     Db,
@@ -100,7 +100,7 @@ fn take() -> Option<PendingFlush> {
 }
 
 /// The command a remote shard has to run to match what the script did locally.
-pub(crate) fn broadcast_frame(which: PendingFlush) -> Frame {
+pub fn broadcast_frame(which: PendingFlush) -> Frame {
     let name: &'static [u8] = match which {
         PendingFlush::Db => b"FLUSHDB",
         PendingFlush::All => b"FLUSHALL",

@@ -165,10 +165,78 @@ impl ConsoleGateway {
         self.spsc_notifiers[shard_id].notify_one();
 
         // Await the response from the shard.
-        reply_rx
+        let reply = reply_rx
             .recv()
             .await
-            .map_err(|_| "shard dropped reply channel".to_string())
+            .map_err(|_| "shard dropped reply channel".to_string())?;
+
+        // moon#705: a script executed on ONE shard can still issue a keyless
+        // FLUSHDB/FLUSHALL, and the shard that ran it can only clear its own
+        // slice. The client planes hand that back to the originator to fan out;
+        // this plane IS the originator, and it already holds every producer and
+        // notifier, so it completes the flush here. Dropping `script_flush`
+        // would compile and would reintroduce the exact partial flush #705 is
+        // about — on the one plane that runs scripts trusted.
+        if let Some(which) = reply.script_flush {
+            let frame = crate::scripting::pending_flush::broadcast_frame(which);
+            self.broadcast_flush(db_index, shard_id, &frame).await?;
+        }
+        Ok(reply.frame)
+    }
+
+    /// Fan a script's flush out to every shard except the one that ran it.
+    ///
+    /// Mirrors `coordinate_flush_broadcast`, but over this plane's own
+    /// `Mutex<HeapProd>` producers rather than the shard-local
+    /// `Rc<RefCell<Vec<HeapProd>>>` mesh — and with no self-loop hazard, since
+    /// the admin thread is never itself a shard.
+    ///
+    /// A failed leg is reported rather than swallowed: a partially flushed
+    /// keyspace that answered OK is worse than one that said so.
+    async fn broadcast_flush(
+        &self,
+        db_index: usize,
+        flushed_shard: usize,
+        command: &Frame,
+    ) -> Result<(), String> {
+        let mut pending = Vec::with_capacity(self.num_shards.saturating_sub(1));
+        for target in 0..self.num_shards {
+            if target == flushed_shard {
+                continue;
+            }
+            let (reply_tx, reply_rx) = channel::oneshot();
+            let msg = ShardMessage::MultiExecute {
+                db_index,
+                // Keyless command: the routing key is unused by the flush arm.
+                commands: vec![(Bytes::new(), command.clone())],
+                reply_tx,
+            };
+            {
+                let mut prod = self.shard_producers[target].lock();
+                prod.try_push(msg).map_err(|_| {
+                    format!("shard {target} SPSC buffer full — keyspace partially flushed")
+                })?;
+            }
+            self.spsc_notifiers[target].notify_one();
+            pending.push((target, reply_rx));
+        }
+        for (target, reply_rx) in pending {
+            match reply_rx.recv().await {
+                Ok(frames) if frames.iter().all(|f| !matches!(f, Frame::Error(_))) => {}
+                _ => {
+                    tracing::error!(
+                        target,
+                        flushed_shard,
+                        "console flush broadcast: remote leg failed — keyspace partially flushed"
+                    );
+                    return Err(format!(
+                        "shard {target} flush leg failed — keyspace partially flushed; \
+                         retry the FLUSH command"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Build a RESP `Frame::Array` from a command name and arguments.

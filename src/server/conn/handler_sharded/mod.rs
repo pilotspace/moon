@@ -1236,6 +1236,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                             pending_flush,
                             response,
                             conn.selected_db,
+                            // The script ran on THIS connection's shard, so that is the
+                            // leg already cleared (moon#705).
+                            ctx.shard_id,
                             ctx,
                         )
                         .await;
@@ -1486,6 +1489,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 pending_flush,
                                 response,
                                 conn.selected_db,
+                                // The script ran on THIS connection's shard, so that is the
+                                // leg already cleared (moon#705).
+                                ctx.shard_id,
                                 ctx,
                             )
                             .await;
@@ -2471,6 +2477,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     if let Err(e) =
                                         crate::shard::coordinator::coordinate_flush_broadcast(
                                             &frame,
+                                            ctx.shard_id,
+                                            // Typed on this connection: the
+                                            // shard that ran it is this one.
                                             ctx.shard_id,
                                             ctx.num_shards,
                                             conn.selected_db,

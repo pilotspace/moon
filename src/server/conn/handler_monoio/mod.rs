@@ -2998,6 +2998,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             if let Err(e) = crate::shard::coordinator::coordinate_flush_broadcast(
                                 &frame,
                                 ctx.shard_id,
+                                // Typed on this connection: the shard that ran
+                                // it is this one.
+                                ctx.shard_id,
                                 ctx.num_shards,
                                 conn.selected_db,
                                 &ctx.dispatch_tx,

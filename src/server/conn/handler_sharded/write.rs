@@ -713,6 +713,10 @@ pub(super) async fn try_handle_multi_exec(
                                 crate::shard::coordinator::broadcast_txn_flushes(
                                     &mut routed_result,
                                     &r.exec_flushes,
+                                    // Sender is THIS connection's shard; the
+                                    // owner `s` ran the body and is the leg
+                                    // already flushed (moon#705).
+                                    ctx.shard_id,
                                     s,
                                     ctx.num_shards,
                                     &ctx.dispatch_tx,
@@ -855,6 +859,8 @@ pub(super) async fn try_handle_multi_exec(
             crate::shard::coordinator::broadcast_txn_flushes(
                 &mut result,
                 &exec_flushes,
+                ctx.shard_id,
+                // Local EXEC: the body ran on this connection's own shard.
                 ctx.shard_id,
                 ctx.num_shards,
                 &ctx.dispatch_tx,

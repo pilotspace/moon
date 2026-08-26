@@ -1830,7 +1830,7 @@ pub(crate) async fn route_script_elsewhere(
             parts.push(Frame::BulkString(Bytes::copy_from_slice(cmd)));
             parts.extend_from_slice(cmd_args);
             let command = std::sync::Arc::new(Frame::Array(parts.into()));
-            let reply = crate::shard::coordinator::coordinate_script(
+            let (reply, pending_flush) = crate::shard::coordinator::coordinate_script(
                 command,
                 target,
                 ctx.shard_id,
@@ -1850,7 +1850,19 @@ pub(crate) async fn route_script_elsewhere(
             // fan-out gap and cannot be acted on without resurrecting deleted
             // state. Divergence is prevented at publish time (acked fan-out)
             // and reported to the client, not patched up after the fact.
-            Some(reply)
+            //
+            // moon#705: a flush the script issued is the ONE thing that cannot
+            // travel verbatim. It is keyless, so it reached only the shard the
+            // script happened to run on, and that shard could not fan it out
+            // from inside its own message loop. Completing it here — in async
+            // context, holding the producers — is the same division of labour
+            // the MULTI path uses (`coordinator::broadcast_txn_flushes`).
+            //
+            // `target`, not `ctx.shard_id`, is the shard already flushed: the
+            // script ran THERE. Passing the originator would skip the one
+            // shard that still needs clearing and re-clear the one that does
+            // not — the precise inversion of the bug.
+            Some(finish_script_flush(pending_flush, reply, db_index, target, ctx).await)
         }
     }
 }
@@ -2548,10 +2560,18 @@ fn gated_container(cmd: &[u8]) -> Option<&'static str> {
 /// flush: a client that sees success can rely on it. Losing the script's
 /// return value is the intended trade — the alternative is answering `+OK`
 /// for a keyspace that is still half full.
+/// `flushed_shard` is the shard whose slice the script ALREADY cleared, and is
+/// the one leg the broadcast skips. For a script that ran on the connection's
+/// own shard that is `ctx.shard_id`; for one `route_script_elsewhere` sent
+/// away it is the OWNER (moon#705). Passing it explicitly rather than reading
+/// `ctx.shard_id` is deliberate: the two differ only on the routed path, which
+/// is exactly the path that was wrong, and a parameter forces every caller to
+/// state which it means.
 pub(crate) async fn finish_script_flush(
     pending: Option<crate::scripting::pending_flush::PendingFlush>,
     response: Frame,
     db_index: usize,
+    flushed_shard: usize,
     ctx: &super::core::ConnectionContext,
 ) -> Frame {
     let Some(which) = pending else {
@@ -2561,7 +2581,10 @@ pub(crate) async fn finish_script_flush(
     if ctx.num_shards > 1
         && let Err(err) = crate::shard::coordinator::coordinate_flush_broadcast(
             &crate::scripting::pending_flush::broadcast_frame(which),
+            // Sender: this connection's shard. Skipped: the one already
+            // cleared, which for a ROUTED script is not the same shard.
             ctx.shard_id,
+            flushed_shard,
             ctx.num_shards,
             db_index,
             &ctx.dispatch_tx,
