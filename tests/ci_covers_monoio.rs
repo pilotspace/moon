@@ -240,13 +240,13 @@ fn the_tokio_job_is_still_covered() {
 ///
 /// So the guard follows the coverage instead of the job: whichever gate owns
 /// monoio, something must assert it runs.
+///
+/// Cheap and cross-platform, but it only proves the text is PRESENT — the same
+/// match would come from a comment or a `--fast`-only branch. The executable
+/// proof is `the_default_merge_bar_actually_reaches_the_monoio_suite` below.
 #[test]
-fn the_local_merge_bar_runs_the_monoio_suite() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/ci-local.sh");
-    let sh = normalize_newlines(
-        &std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display())),
-    );
+fn the_local_merge_bar_mentions_the_monoio_suite() {
+    let sh = ci_local_source();
     assert!(
         sh.contains("VM monoio suite"),
         "scripts/ci-local.sh no longer runs a monoio suite. Since moon#732 the \
@@ -254,10 +254,77 @@ fn the_local_merge_bar_runs_the_monoio_suite() {
          ships would have no gate at all. Restore it here, or put check-monoio \
          back on workflow_dispatch in .github/workflows/ci.yml."
     );
-    // Not just present — reached. `--quick` skips the VM phases, so the suite
-    // must live in a mode the merge bar actually uses.
     assert!(
         sh.contains("$VM_TEST_MONOIO"),
         "ci-local mentions a monoio suite but never invokes $VM_TEST_MONOIO"
+    );
+}
+
+fn ci_local_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/ci-local.sh")
+}
+
+fn ci_local_source() -> String {
+    let path = ci_local_path();
+    normalize_newlines(
+        &std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display())),
+    )
+}
+
+/// The executable half: run the script's REAL control flow and read back which
+/// steps the default mode selects.
+///
+/// A text search cannot distinguish "the default merge bar runs the monoio
+/// suite" from "the string `VM monoio suite` appears somewhere in the file" —
+/// the step could sit behind a mode conditional no one reaches. `CI_LOCAL_DRY_RUN`
+/// executes every conditional and prints the chosen steps without running them,
+/// so this asserts selection rather than presence.
+///
+/// `cfg(unix)`: ci-local is a bash script that shells out to `orb`, and this
+/// suite also runs on windows-latest, where a bash that satisfies it is not
+/// guaranteed. The gate it protects is a unix-only workflow.
+#[cfg(unix)]
+#[test]
+fn the_default_merge_bar_actually_reaches_the_monoio_suite() {
+    use std::process::Command;
+
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let run = |args: &[&str]| -> String {
+        let out = Command::new("bash")
+            .arg(ci_local_path())
+            .args(args)
+            .env("CI_LOCAL_DRY_RUN", "1")
+            .env("CI_LOCAL_REPO", &repo)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run ci-local.sh: {e}"));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let default_mode = run(&[]);
+    assert!(
+        default_mode.contains("would run: VM monoio suite"),
+        "the DEFAULT `scripts/ci-local.sh` does not select the monoio suite. \
+         Since moon#732 the hosted matrix does not run it either, so nothing \
+         would gate the runtime Moon ships before a merge.\nSteps selected:\n{default_mode}"
+    );
+    // The cut also made client-compat and the macOS suite local-only gates.
+    for step in [
+        "VM client-compat",
+        "macOS host tokio suite",
+        "VM tokio suite",
+    ] {
+        assert!(
+            default_mode.contains(&format!("would run: {step}")),
+            "the default merge bar no longer selects `{step}`, which moon#732 \
+             removed from the pre-merge hosted matrix.\nSteps selected:\n{default_mode}"
+        );
+    }
+    // And the escape hatches must stay honest about not being the merge bar:
+    // a --quick that quietly grew test coverage would make its own warning lie.
+    let quick = run(&["--quick"]);
+    assert!(
+        !quick.contains("would run: VM monoio suite"),
+        "--quick now selects the monoio suite, but still prints \"LINT ONLY\""
     );
 }

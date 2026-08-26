@@ -101,6 +101,17 @@ declare -a NAMES RCS SECS
 run_step() { # run_step <name> <cmd...>
   local name=$1; shift
   local t0 t1 rc
+  # CI_LOCAL_DRY_RUN=1 walks the REAL control flow — every mode conditional
+  # below still decides — but executes nothing, printing the steps this mode
+  # would run. tests/ci_covers_monoio.rs uses it to prove the default merge bar
+  # actually reaches the monoio suite. A grep for the step name cannot: the
+  # string would match just as happily inside a comment or a `--fast`-only
+  # branch, and since moon#732 nothing else gates the shipped runtime pre-merge.
+  if [ -n "${CI_LOCAL_DRY_RUN:-}" ]; then
+    echo "would run: ${name}"
+    NAMES+=("$name"); RCS+=(0); SECS+=(0)
+    return 0
+  fi
   echo ""
   echo "━━━ ${name} ━━━"
   t0=$(date +%s)
@@ -539,7 +550,10 @@ case "$MODE" in
     echo "    them. Run \`scripts/ci-local.sh\` with no arguments before pushing."
     exit 0 ;;
 esac
-echo "  RESULT: PASS — merge bar satisfied except Windows, which cannot run"
-echo "  locally. Dispatch the hosted matrix (Windows + MSRV + memory gate):"
+echo "  RESULT: PASS — local merge bar satisfied. THREE hosted checks remain"
+echo "  and none of them ran here: Check (Windows), MSRV (1.94), and the"
+echo "  Memory steady-state gate. Dispatch them:"
 echo "    gh workflow run ci.yml --ref \$(git branch --show-current)"
+echo "  Dispatch immediately — it does NOT need to wait for the PR run."
+echo "  (Different concurrency groups; proven in moon#733.)"
 exit 0
