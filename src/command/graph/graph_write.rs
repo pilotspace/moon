@@ -482,8 +482,17 @@ fn parse_f64(frame: &Frame) -> Option<f64> {
     }
 }
 
+/// Does `s` have plain integer syntax — an optional sign then only digits?
+///
+/// Used to tell "this did not fit in an i64" apart from "this is a float".
+/// Borrows only; no allocation, since this sits on the command path.
+fn is_integer_syntax(s: &str) -> bool {
+    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+    !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit())
+}
+
 /// Parse a property value from a Frame. Tries integer, then float, then string.
-fn parse_property_value(frame: &Frame) -> PropertyValue {
+pub(super) fn parse_property_value(frame: &Frame) -> PropertyValue {
     match frame {
         Frame::Integer(n) => PropertyValue::Int(*n),
         Frame::Double(f) => PropertyValue::Float(*f),
@@ -494,8 +503,20 @@ fn parse_property_value(frame: &Frame) -> PropertyValue {
                 if let Ok(n) = s.parse::<i64>() {
                     return PropertyValue::Int(n);
                 }
-                if let Ok(f) = s.parse::<f64>() {
-                    return PropertyValue::Float(f);
+                // moon#724: an integer-syntax string that does NOT fit i64 is
+                // an identifier, not a number. Falling through to f64 keeps
+                // 15-17 significant digits and zeroes the rest, so a 32-digit
+                // key comes back as 12345678901234567000000000000000 and the
+                // node can no longer be found by the key it was created with.
+                //
+                // Only the integer case is withheld. The exact round-trip test
+                // suggested in moon#724 would also demote "3.0" and "1e5" to
+                // strings and break `MATCH (n {x: 3.0})`, so genuine float
+                // syntax still coerces exactly as before.
+                if !is_integer_syntax(s) {
+                    if let Ok(f) = s.parse::<f64>() {
+                        return PropertyValue::Float(f);
+                    }
                 }
             }
             PropertyValue::String(b.clone())

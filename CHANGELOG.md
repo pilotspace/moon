@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`GRAPH.ADDNODE`/`GRAPH.ADDEDGE` no longer corrupt integer-like string properties that overflow `i64` (moon#724).**
+
+  `parse_property_value` coerced any bulk string that parsed as `i64` or `f64` into a number. A
+  value too long for `i64` fell through to `f64`, which keeps 15–17 significant digits and zeroes
+  the rest — so a 32-digit key stored through `GRAPH.ADDNODE` came back as
+  `12345678901234567000000000000000`, and the node could no longer be found by the key it was
+  created with. Irreversible, and silent.
+
+  An integer-syntax string that does not fit `i64` is an identifier, not a number, so it now stays
+  a string. Verified end-to-end: the reported 32-digit key round-trips exactly and
+  `MATCH (n:Doc {_key: '<key>'})` finds it, where before it returned nothing.
+
+  Only the integer case is withheld. moon#724 suggested refusing whenever the round-trip is
+  inexact (`format!("{f}") != s`), but that also demotes `"3.0"` and `"1e5"` to strings and breaks
+  `MATCH (n {x: 3.0})`, so genuine float syntax still coerces exactly as before. `"42"` is still
+  `Int(42)`, `"3.14"` still `Float(3.14)`; `i64::MAX` still coerces and `i64::MAX + 1` no longer
+  does.
+
+  The Cypher path was never affected — it is fed by the grammar, which already knows the type.
+
 ### Changed
 - **Bump the async-runtime group: tokio 1.52.3 -> 1.53.1, tokio-stream 0.1.18 -> 0.1.19, tokio-util 0.7.18 -> 0.7.19 (moon#692).**
 

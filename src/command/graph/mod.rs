@@ -227,6 +227,7 @@ fn extract_command(frame: &Frame) -> Option<(&[u8], &[Frame])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::PropertyValue;
     use crate::protocol::FrameVec;
 
     fn make_cmd(parts: &[&[u8]]) -> Frame {
@@ -235,6 +236,60 @@ mod tests {
             .map(|p| Frame::BulkString(Bytes::from(p.to_vec())))
             .collect();
         Frame::Array(FrameVec::from_vec(frames))
+    }
+
+    /// moon#724: `GRAPH.ADDNODE g Doc _key <32 digits>` stored the value as an
+    /// f64, keeping 15 significant digits and zeroing the rest. The node then
+    /// could not be found by the key it was created with.
+    ///
+    /// RESP carries no type tag on a bulk string, so guessing is reasonable —
+    /// but a guess that CHANGES the value is not. An integer-syntax string
+    /// that does not fit i64 is an identifier, not a number.
+    #[test]
+    fn oversized_integer_strings_stay_strings_instead_of_losing_their_tail() {
+        let bulk = |v: &[u8]| Frame::BulkString(Bytes::from(v.to_vec()));
+        let pv = graph_write::parse_property_value;
+
+        // The reported value: 32 digits, overflows i64, parses as f64.
+        let key = b"12345678901234567890123456789012";
+        assert_eq!(
+            pv(&bulk(key)),
+            PropertyValue::String(Bytes::from(key.to_vec())),
+            "a 32-digit key must survive verbatim; as an f64 it comes back as \
+             12345678901234567000000000000000 and the node is unfindable"
+        );
+
+        // The boundary: i64::MAX fits and stays an Int; one past it does not.
+        assert_eq!(
+            pv(&bulk(b"9223372036854775807")),
+            PropertyValue::Int(i64::MAX)
+        );
+        assert_eq!(
+            pv(&bulk(b"9223372036854775808")),
+            PropertyValue::String(Bytes::from_static(b"9223372036854775808")),
+            "i64::MAX + 1 must not silently become 9223372036854775808.0"
+        );
+        assert_eq!(
+            pv(&bulk(b"-9223372036854775809")),
+            PropertyValue::String(Bytes::from_static(b"-9223372036854775809")),
+            "the negative boundary needs the same guard"
+        );
+
+        // Everything that already worked must keep working — this fix is not
+        // licence to stop coercing genuine numbers.
+        assert_eq!(pv(&bulk(b"42")), PropertyValue::Int(42));
+        assert_eq!(pv(&bulk(b"-42")), PropertyValue::Int(-42));
+        assert_eq!(pv(&bulk(b"0")), PropertyValue::Int(0));
+        assert_eq!(pv(&bulk(b"2.5")), PropertyValue::Float(2.5));
+        // Deliberately still floats: demoting these to strings would break
+        // `MATCH (n {x: 3.0})`, which is why the exact round-trip check
+        // suggested in moon#724 was not the rule chosen here.
+        assert_eq!(pv(&bulk(b"3.0")), PropertyValue::Float(3.0));
+        assert_eq!(pv(&bulk(b"1e5")), PropertyValue::Float(1e5));
+        assert_eq!(
+            pv(&bulk(b"hello")),
+            PropertyValue::String(Bytes::from_static(b"hello"))
+        );
     }
 
     #[test]
