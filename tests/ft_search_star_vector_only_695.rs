@@ -239,17 +239,32 @@ fn spawn_on(port: u16, shards: usize, dir: &std::path::Path) -> Child {
         .expect("spawn moon (run `cargo build --release` first)")
 }
 
+/// Wait until the server on `port` answers `PING`.
+///
+/// The probe is deliberately fallible rather than routed through [`Conn`]: on a
+/// same-port restart the kernel can still hand out a connection on the dying
+/// process's listener, and that connection is then RESET. `Conn::cmd` panics on
+/// a read error, so a readiness wait built on it turns a transient reset into a
+/// bare `ConnectionReset` that names neither the port nor the phase. Retry until
+/// the deadline instead, and give each probe its own read timeout so a server
+/// that accepts but never answers cannot park the wait past that deadline.
 fn await_ready(port: u16) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
-            drop(s);
-            let mut c = Conn::open(port);
-            if c.cmd(&[b"PING"]) == Resp::Simple("PONG".into()) {
+        if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = [0u8; 64];
+            if s.write_all(b"PING\r\n").is_ok()
+                && let Ok(n) = s.read(&mut buf)
+                && buf[..n].starts_with(b"+PONG")
+            {
                 return;
             }
         }
-        assert!(Instant::now() < deadline, "server never became ready");
+        assert!(
+            Instant::now() < deadline,
+            "server on port {port} never became ready"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -491,6 +506,13 @@ fn run_all(shards: usize) {
     // ── survives a restart ───────────────────────────────────────────────────
     drop(c);
     guard.kill_now();
+    // Required before rebinding the same port, not optional hygiene: moon's
+    // per-shard listeners are `SO_REUSEPORT`, so the replacement server binds
+    // successfully while the SIGKILLed one is still tearing its sockets down,
+    // and a client that connects in that window is RESET. Omitting this made
+    // both legs fail 6/6 on Linux while passing on macOS, where the teardown
+    // happens to win the race (moon#489 is the same signature).
+    common::wait_for_port_down(port);
     let mut guard = common::ServerGuard::new(spawn_on(port, shards, dir.path()));
     await_ready(port);
     let mut c = Conn::open(port);
