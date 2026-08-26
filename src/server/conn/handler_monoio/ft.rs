@@ -369,6 +369,17 @@ async fn ft_command_inner(
                 }
             }
 
+            // moon#728: NOT routed when there is no text engine. Without
+            // `text-index` every shard's text store is permanently empty, so the
+            // DFS scatter runs, finds nothing anywhere, and `merge_text_results`
+            // folds the replies into a SUCCESSFUL `[0]` — indistinguishable from
+            // an index that exists and holds nothing, and different from what the
+            // same build answers at `--shards 1`. Falling through instead lands
+            // in the KNN parser, which refuses a text-shaped query by name
+            // (`ft_search/dispatch.rs`), so BOTH shard counts give one answer.
+            // The moon#695 vector-only match-all above is deliberately ahead of
+            // this and stays ungated: a vector-only schema needs no text engine.
+            #[cfg(feature = "text-index")]
             if is_text {
                 // ── Text FT.SEARCH: two-phase DFS scatter-gather ──────────────────
                 let index_name = match cmd_args

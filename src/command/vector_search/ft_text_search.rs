@@ -1001,6 +1001,32 @@ pub struct TextQueryClause {
 }
 
 // ─── Query detection ─────────────────────────────────────────────────────────
+/// The refusal a text-shaped query earns in a build with no text engine (moon#728).
+///
+/// `Some(error)` only when `text-index` is compiled OUT **and** the query is one
+/// the text engine would have answered. Every KNN entry point consults this, and
+/// that is the point: a text-shaped query reaches a different entry point
+/// depending on shard count, and before this each of them answered differently —
+/// `ERR invalid KNN query syntax` at one shard, a SUCCESSFUL empty listing at
+/// more than one. Shard count is not part of the query, so the refusal cannot be
+/// allowed to vary with it. With `text-index` on, this is always `None` and the
+/// text engine answers as it always did.
+#[must_use]
+pub fn text_engine_absent_refusal(query: &[u8]) -> Option<crate::protocol::Frame> {
+    #[cfg(feature = "text-index")]
+    {
+        let _ = query;
+        None
+    }
+    #[cfg(not(feature = "text-index"))]
+    {
+        is_text_query(query).then(|| {
+            crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                b"ERR text-index feature not enabled",
+            ))
+        })
+    }
+}
 
 /// Returns `true` when the FT.SEARCH **query string** (`args[1]`) is a text query.
 ///

@@ -441,22 +441,22 @@ fn run_all(shards: usize) {
     // An index that really is missing must still be refused, never reported as a
     // successful empty listing.
     //
-    // Asserted only with `text-index`, the shipped default. WITHOUT it there is a
-    // pre-existing divergence this fix neither causes nor cures — proven by A/B
-    // against a build with this gate neutered to `return None`: at shards=1 the
-    // query falls through to the KNN parser (`ERR invalid KNN query syntax`), and
-    // at shards>1 `scatter_text_search` merges empty per-shard replies into a
-    // successful `[0]`, so a missing index reads as an empty one. Filed as
-    // moon#728; this assertion widens to both settings when that lands.
-    #[cfg(feature = "text-index")]
+    // Ungated since moon#728: a build without `text-index` used to answer
+    // `ERR invalid KNN query syntax` at one shard and a successful `[0]` at more
+    // than one. It now refuses by name at every shard count, so the wording — not
+    // just the fact of a refusal — is what this checks, in both feature sets.
     {
         let missing = c.cmd(&[b"FT.SEARCH", b"nosuch", b"*"]);
+        let expected = if cfg!(feature = "text-index") {
+            "no such index"
+        } else {
+            "text-index feature not enabled"
+        };
         assert!(
-            missing
-                .as_err()
-                .is_some_and(|e| e.contains("no such index")),
+            missing.as_err().is_some_and(|e| e.contains(expected)),
             "shards={shards}: an index that really is missing must still say so, \
-             rather than reading as an empty-but-successful enumeration: {missing:?}"
+             rather than reading as an empty-but-successful enumeration. Wanted \
+             {expected:?}, got {missing:?}"
         );
     }
 
