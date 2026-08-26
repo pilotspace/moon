@@ -194,6 +194,14 @@ pub fn parse_ft_search_args(
     let (k, _field_name, param_name) = match parse_knn_query(&query_str) {
         Some(parsed) => parsed,
         None => {
+            // moon#728: this is the entry point a text-shaped query reaches at
+            // `--shards > 1`; `ft_search/dispatch.rs` is the one it reaches at
+            // one shard. Both consult the same predicate so they cannot drift.
+            if let Some(refusal) =
+                crate::command::vector_search::text_engine_absent_refusal(query_str.as_ref())
+            {
+                return Err(refusal);
+            }
             return Err(Frame::Error(Bytes::from_static(
                 b"ERR invalid KNN query syntax",
             )));

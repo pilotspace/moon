@@ -122,6 +122,18 @@ pub fn ft_search(
 
     // Must have at least one retriever
     if knn_parsed.is_none() && sparse_clause.is_none() {
+        // moon#728: a text-shaped query arrives here with no retriever because
+        // it was never a KNN query — the handler's text fast path is compiled
+        // out in a build with no text engine, so the query falls through to
+        // this parser. `invalid KNN query syntax` blames the caller for a query
+        // that is perfectly valid, and it is not even what the same build
+        // answers at `--shards > 1`. Name the real reason instead, so the
+        // answer does not depend on shard count.
+        if let Some(refusal) =
+            crate::command::vector_search::text_engine_absent_refusal(query_str.as_ref())
+        {
+            return refusal;
+        }
         return Frame::Error(Bytes::from_static(b"ERR invalid KNN query syntax"));
     }
 

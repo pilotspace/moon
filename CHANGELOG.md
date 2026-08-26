@@ -59,6 +59,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mask-based relaxation is added, instead of the relaxation silently escaping the sentinel.
 
 ### Fixed
+- **`FT.SEARCH` on a missing index no longer reads as an empty listing in a build without `text-index` (moon#728).**
+
+  A build compiled without the `text-index` feature — what CI's tokio leg compiles — answered
+  a text-shaped `FT.SEARCH` on an unknown index two different ways depending on a deployment
+  knob the caller cannot see: `ERR invalid KNN query syntax` at `--shards 1`, and a
+  SUCCESSFUL empty array at `--shards > 1`. The second is the damaging one, because it is
+  indistinguishable from an index that exists and holds nothing.
+
+  Both answers came from the same root: with no text engine, the handler's single-shard text
+  fast path is compiled out entirely, so the query fell through to the KNN parser, while the
+  multi-shard branch still routed to `scatter_text_search`, whose `#[cfg(not(text-index))]`
+  arm skips the index-existence check its twin performs. The DFS scatter then ran against
+  permanently empty per-shard text stores and `merge_text_results` summed the replies into
+  `[0]`.
+
+  The multi-shard branch no longer routes to the text scatter when there is no text engine, so
+  both shard counts now converge on the KNN parser, and both of its entry points consult one
+  shared predicate (`text_engine_absent_refusal`) that names the real reason:
+  `ERR text-index feature not enabled`. Shard-count independence is now structural rather
+  than two error strings that happen to match. The `text-index` build is untouched, and the
+  moon#695 vector-only `*` enumeration — which deliberately needs no text engine — still
+  answers in both feature sets at both shard counts.
+
 
 - **`FT.SEARCH <index> "*"` now enumerates a VECTOR-only index (moon#695).**
 
