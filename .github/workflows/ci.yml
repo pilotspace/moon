@@ -23,8 +23,14 @@ on:
       - '.add/**'
       - 'mkdocs.yml'
       - 'LICENSE*'
-  # Manual trigger: lets the main-push-only jobs (check-macos,
-  # check-windows, check-console) run against any branch before merging.
+  # Manual trigger: the pre-merge matrix. It runs ONLY what no local gate can
+  # produce — Windows, the MSRV toolchain pin, and the memory steady-state
+  # gate (moon#732). Every other leg is either the PR gate (lint, check) or is
+  # covered by `scripts/ci-local.sh`, which runs the monoio + tokio suites, the
+  # console feature, the macOS host suite and client-compat before every push;
+  # those legs stay on main-push as a post-merge net rather than re-running
+  # here. Measured before the cut: 7 of 9 dispatch legs duplicated ci-local,
+  # and two of them queued on the very moon-dev VM ci-local had just used.
   workflow_dispatch: {}
 
 concurrency:
@@ -50,6 +56,9 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    # Runs on every PR, where it is the gate. On a workflow_dispatch it would
+    # only re-run what the PR gate already ran (moon#732).
+    if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -101,6 +110,9 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
+    # Runs on every PR, where it is the gate. On a workflow_dispatch it would
+    # only re-run what the PR gate already ran (moon#732).
+    if: github.event_name != 'workflow_dispatch'
     env:
       # tokio's io_uring bridge is off in CI (it floods errors under load).
       # Per-job, never workflow-level: `check-monoio` must not inherit it.
@@ -177,12 +189,14 @@ jobs:
   # self-hosted runner serialized this job behind `check` and `client-compat`
   # on every PR. Pre-push coverage of the shipped runtime now comes from
   # `scripts/ci-local.sh` (runs this exact suite in the moon-dev VM with
-  # io_uring live); this job remains the authoritative gate on every main
-  # push and on `gh workflow run ci.yml --ref <branch>` before a merge.
+  # io_uring live). moon#732: NO LONGER on workflow_dispatch — it was
+  # re-running, on this same VM, what ci-local had just finished. Main-push
+  # only now, as a post-merge net; the pre-merge gate is ci-local, and
+  # tests/ci_covers_monoio.rs asserts that script still selects the suite.
   check-monoio:
     name: Check (monoio — the shipped runtime)
     runs-on: [self-hosted, moon-dev]
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     env:
       # MUST differ from `check`'s dir: the two jobs build incompatible feature
       # sets from one checkout and can run concurrently on this runner.
@@ -208,11 +222,12 @@ jobs:
   # Main-push only (2026-07-13 queue-killer round): macOS runners are the
   # scarcest hosted pool and were the long pole on every PR. Development
   # happens on macOS locally anyway; regressions still surface on every
-  # main push, and any branch can opt in via workflow_dispatch.
+  # main push. moon#732: no longer opt-in via workflow_dispatch either — the
+  # default `scripts/ci-local.sh` runs the macOS host suite before every push.
   check-macos:
     name: Check (macOS)
     runs-on: macos-latest
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -300,11 +315,12 @@ jobs:
   # pnpm build MUST run before clippy: rust_embed embeds console/dist/ at
   # compile time; without it the console feature builds but embeds nothing.
   # Main-push only — console CI is also covered by console-integration.yml
-  # on PRs that touch console/ paths.
+  # on PRs that touch console/ paths, and by ci-local's `clippy (console)`
+  # gate before every push (moon#732 dropped it from workflow_dispatch).
   check-console:
     name: Check (console feature)
     runs-on: ubuntu-latest
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.94.1
@@ -418,14 +434,15 @@ jobs:
   # The manifest ships with a recorded BASELINE of waived, reasoned divergences,
   # so this job is a ratchet: a NEW divergence fails it, and `--strict` fails
   # the moment a waived one is fixed and its waiver goes stale.
-  # 2026-08 CI migration: main-push + dispatch, no longer per-PR (see
-  # check-monoio's note — same single-runner serialization). Run locally
-  # before push via `scripts/ci-local.sh --full` (the VM carries the same
-  # redis-server oracle this job insists on).
+  # 2026-08 CI migration: main-push, no longer per-PR (see check-monoio's
+  # note — same single-runner serialization). moon#732 also removed it from
+  # workflow_dispatch, so this is a post-merge net: the pre-merge gate is
+  # `scripts/ci-local.sh` with no arguments, which now runs this harness by
+  # default (the VM carries the same redis-server oracle this job insists on).
   client-compat:
     name: Client compat (RESP2/RESP3 diff vs Redis)
     runs-on: [self-hosted, moon-dev]
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     env:
       CARGO_TARGET_DIR: /home/tindang/ci-target/client-compat
       # Kept from when this was a workflow-level global, so this job's recorded

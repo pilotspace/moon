@@ -43,6 +43,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The effect is ELF-only: on macOS DWARF lives outside the executable, so a Mach-O A/B
   produces byte-identical binaries and no saving.
+- **The nightly fuzz soak no longer runs through the working day (moon#732).**
+
+  `fuzz.yml` was scheduled `'0 2 * * *'`. This project's timezone is UTC+7, so that is 09:00
+  local — the nightly matrix is 18 jobs with `fail-fast: false` and no `max-parallel`, each
+  budgeted 5 hours, so it occupied 18 hosted runners from 09:00 until ~14:50 local every day.
+
+  Measured 2026-08-26 with the run 2.5h in and all 18 jobs live: two CI runs sat `queued` for
+  35+ minutes, while `Check (Windows)` — which draws from a different runner pool — completed
+  normally. Every PR raised in the morning paid that queue, and it read as "CI is slow" rather
+  than as a scheduling collision.
+
+  Now `'0 16 * * *'` — 23:00 local, finishing ~04:50 local. Deliberately a reschedule rather
+  than a `max-parallel` cap: capping to 9 would double the wall clock and push the tail back
+  into working hours. `crash-matrix.yml` has the same 10:17-local schedule but runs entirely on
+  the self-hosted VM, so it costs no hosted capacity; its cron is also load-bearing
+  (`recall-canaries` matches the literal string), so it is left alone.
+
+  `fuzz.yml` also gains `workflow_dispatch`, with an optional `duration_seconds`. It had only
+  `schedule` and a `ci-fuzz`-labelled PR, so a nightly that needed to be cancelled — exactly
+  what the 2026-08-26 queue collision forced — could not be relaunched, only `gh run rerun`'d.
+  The input is clamped to the existing 18000s budget rather than merely defaulted to it: the
+  job's 350-minute ceiling has to outlast fuzzing *plus* the corpus archive, and a manual
+  trigger must not be able to reintroduce the overrun that ceiling exists to prevent.
+
+- **The pre-merge hosted matrix now runs only what no local gate can produce (moon#732).**
+
+  A merge cost ~59 minutes of gating: `ci-local` ~26m, then a push, then the PR gate 8.6m, then
+  a wait for it to settle, then a dispatch matrix of 24.5m. Nothing overlapped.
+
+  Measured per-job on PR #731, seven of the nine dispatch legs were re-running what `ci-local`
+  had just finished — and two of them, `check-monoio` and `client-compat`, are
+  `runs-on: [self-hosted, moon-dev]`, so the matrix queued on the very VM that had produced the
+  same results minutes earlier.
+
+  `workflow_dispatch` now runs Windows (835s, the only leg with no local equivalent and the
+  floor of any hosted matrix), MSRV, and the memory steady-state gate. macOS, monoio,
+  tokio-Check, client-compat, console and Lint stay on main-push as a post-merge net.
+
+  That is a real shift of responsibility, so two things move with it:
+
+  * `scripts/ci-local.sh` with no arguments is now `--full` — it runs client-compat and the
+    macOS suite, because after this change nothing else does before merge. client-compat is
+    not a formality; it is what caught the v0.8.6 inline-GET ACL bypass. `--fast` is the old
+    default, kept for iterating.
+  * Every mode's verdict now states what it did NOT run. Previously `--quick` — six lint gates
+    and not one test — printed the same `RESULT: PASS` line as a complete run.
+
+  `tests/ci_covers_monoio.rs` gains a test that follows the coverage rather than the job: it
+  asserts `ci-local` still runs a monoio suite, so the shipped runtime cannot fall out of both
+  gates at once. Mutation-tested — renaming the step makes it fail.
 
 - **A multi-key command whose keys all live on one shard now joins the slotted batch instead of cutting it (moon#513).**
 
