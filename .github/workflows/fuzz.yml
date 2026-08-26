@@ -174,6 +174,12 @@ jobs:
           # fail the job. `if` does not depend on statement order.
           budget="${BUDGET:-18000}"
           case "$budget" in ''|*[!0-9]*) budget=18000 ;; esac
+          # All-digits is not the same as comparable. A value wider than
+          # intmax_t makes `[ -gt ]` fail with "integer expression expected",
+          # BOTH clamps below then no-op, and the raw string reaches
+          # `cargo fuzz` uncapped -- verified with a 100-digit input. Bound the
+          # width first; 5 digits caps at 99999, which the -gt below reduces.
+          if [ "${#budget}" -gt 5 ]; then budget=18000; fi
           if [ "$budget" -gt 18000 ]; then budget=18000; fi
           if [ "$budget" -lt 60 ]; then budget=60; fi
           echo "fuzzing $TARGET for ${budget}s"
