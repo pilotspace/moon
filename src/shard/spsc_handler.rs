@@ -464,8 +464,10 @@ pub(crate) fn handle_shard_message_shared(
                 let (cmd, args) = match extract_command_static(&command) {
                     Some(pair) => pair,
                     None => {
-                        let _ = reply_tx.send(crate::protocol::Frame::Error(
-                            bytes::Bytes::from_static(b"ERR invalid command format"),
+                        let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(
+                            crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                b"ERR invalid command format",
+                            )),
                         ));
                         return;
                     }
@@ -490,16 +492,18 @@ pub(crate) fn handle_shard_message_shared(
                     || cmd.eq_ignore_ascii_case(b"EVALSHA_RO")
                 {
                     let Some(rt) = lua_rt else {
-                        let _ = reply_tx.send(crate::protocol::Frame::Error(
-                            bytes::Bytes::from_static(
+                        let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(
+                            crate::protocol::Frame::Error(bytes::Bytes::from_static(
                                 b"ERR scripting is unavailable on this shard",
-                            ),
+                            )),
                         ));
                         return;
                     };
                     let Some(vm) = rt.vm() else {
-                        let _ = reply_tx.send(crate::protocol::Frame::Error(
-                            bytes::Bytes::from_static(b"ERR Lua VM initialization failed"),
+                        let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(
+                            crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                b"ERR Lua VM initialization failed",
+                            )),
                         ));
                         return;
                     };
@@ -508,20 +512,19 @@ pub(crate) fn handle_shard_message_shared(
                     // routing is invisible to the client, so it must not
                     // decide how much of the keyspace a flush reaches.
                     //
-                    // The cross-shard BROADCAST half stops here and is
-                    // discarded on purpose: `handle_shard_message_shared` is
+                    // moon#705: the cross-shard BROADCAST half still cannot
+                    // happen HERE — `handle_shard_message_shared` is
                     // synchronous and holds neither the SPSC producers nor the
                     // notifiers `coordinate_flush_broadcast` needs, and fanning
                     // out from inside a shard's own message loop is the
                     // shard-to-shard wait cycle the MULTI path documents at
-                    // `shared::execute_transaction_sharded`. A script reaches
-                    // this arm only when `route_script_elsewhere` sent it here
-                    // for a DECLARED key on this shard, so the residue is "a
-                    // script that both declares a remote key and flushes",
-                    // which still clears only the owner shard — measured at
-                    // `--shards 4` (6 to 10 of 12 keys survive, depending on
-                    // where the declared key hashes) and tracked as moon#705.
-                    let (frame, _pending_flush) = crate::shard::slice::with_shard(|s| {
+                    // `shared::execute_transaction_sharded`. It is no longer
+                    // DISCARDED, though: the flush rides home on
+                    // `ExecReply::script_flush` and `route_script_elsewhere`
+                    // completes it in async context, skipping this shard —
+                    // the same division of labour
+                    // `coordinator::broadcast_txn_flushes` uses for MULTI.
+                    let (frame, pending_flush) = crate::shard::slice::with_shard(|s| {
                         let db_count = s.databases.len();
                         crate::scripting::pending_flush::run_and_complete(s, db_idx, |db| {
                             if is_plain_eval {
@@ -553,7 +556,12 @@ pub(crate) fn handle_shard_message_shared(
                             }
                         })
                     });
-                    let _ = reply_tx.send(frame);
+                    let _ = reply_tx.send(crate::shard::dispatch::ExecReply {
+                        frame,
+                        // moon#705: the flush this script issued, reported so
+                        // the ORIGINATOR can reach the other shards.
+                        script_flush: pending_flush,
+                    });
                     return;
                 }
 
@@ -565,10 +573,10 @@ pub(crate) fn handle_shard_message_shared(
                 let is_fcall = cmd.eq_ignore_ascii_case(b"FCALL");
                 if is_fcall || cmd.eq_ignore_ascii_case(b"FCALL_RO") {
                     let Some(rt) = lua_rt else {
-                        let _ = reply_tx.send(crate::protocol::Frame::Error(
-                            bytes::Bytes::from_static(
+                        let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(
+                            crate::protocol::Frame::Error(bytes::Bytes::from_static(
                                 b"ERR scripting is unavailable on this shard",
-                            ),
+                            )),
                         ));
                         return;
                     };
@@ -586,10 +594,10 @@ pub(crate) fn handle_shard_message_shared(
                     // shard if that ever stops being true.
                     {
                         let Ok(mut guard) = slot.try_borrow_mut() else {
-                            let _ = reply_tx.send(crate::protocol::Frame::Error(
-                                bytes::Bytes::from_static(
+                            let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(
+                                crate::protocol::Frame::Error(bytes::Bytes::from_static(
                                     b"ERR function registry busy on this shard",
-                                ),
+                                )),
                             ));
                             return;
                         };
@@ -600,22 +608,25 @@ pub(crate) fn handle_shard_message_shared(
                         }
                     }
                     let Ok(guard) = slot.try_borrow() else {
-                        let _ = reply_tx.send(crate::protocol::Frame::Error(
-                            bytes::Bytes::from_static(b"ERR function registry busy on this shard"),
+                        let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(
+                            crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                b"ERR function registry busy on this shard",
+                            )),
                         ));
                         return;
                     };
                     let Some(reg) = guard.as_ref() else {
-                        let _ = reply_tx.send(crate::protocol::Frame::Error(
-                            bytes::Bytes::from_static(
+                        let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(
+                            crate::protocol::Frame::Error(bytes::Bytes::from_static(
                                 b"ERR function registry unavailable on this shard",
-                            ),
+                            )),
                         ));
                         return;
                     };
-                    // moon#685: see the routed EVAL arm above, including
-                    // why the broadcast half stops here.
-                    let (frame, _pending_flush) = crate::shard::slice::with_shard(|s| {
+                    // moon#685 + moon#705: see the routed EVAL arm above,
+                    // including why the broadcast is REPORTED here rather than
+                    // performed here.
+                    let (frame, pending_flush) = crate::shard::slice::with_shard(|s| {
                         let db_count = s.databases.len();
                         crate::scripting::pending_flush::run_and_complete(s, db_idx, |db| {
                             // moon#569 + moon#514: the ACL that travels with
@@ -651,7 +662,12 @@ pub(crate) fn handle_shard_message_shared(
                         })
                     });
                     drop(guard);
-                    let _ = reply_tx.send(frame);
+                    let _ = reply_tx.send(crate::shard::dispatch::ExecReply {
+                        frame,
+                        // moon#705: the flush this script issued, reported so
+                        // the ORIGINATOR can reach the other shards.
+                        script_flush: pending_flush,
+                    });
                     return;
                 }
 
@@ -696,7 +712,7 @@ pub(crate) fn handle_shard_message_shared(
                             )
                         })
                     };
-                    let _ = reply_tx.send(frame);
+                    let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(frame));
                     return;
                 }
 
@@ -714,7 +730,7 @@ pub(crate) fn handle_shard_message_shared(
                                     db_idx as u8,
                                 )
                             });
-                            let _ = reply_tx.send(frame);
+                            let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(frame));
                             return;
                         }
                         #[cfg(feature = "graph")]
@@ -730,7 +746,7 @@ pub(crate) fn handle_shard_message_shared(
                                     )
                                 })
                             };
-                            let _ = reply_tx.send(frame);
+                            let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(frame));
                             return;
                         }
                     }
@@ -757,7 +773,7 @@ pub(crate) fn handle_shard_message_shared(
                             bytes::Bytes::from(record),
                         );
                     }
-                    let _ = reply_tx.send(frame);
+                    let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(frame));
                     return;
                 }
 
@@ -768,7 +784,7 @@ pub(crate) fn handle_shard_message_shared(
                     let frame = crate::shard::slice::with_shard(|s| {
                         crate::command::server_admin::kill_snapshot(&mut s.vector_store, args)
                     });
-                    let _ = reply_tx.send(frame);
+                    let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(frame));
                     return;
                 }
 
@@ -786,7 +802,7 @@ pub(crate) fn handle_shard_message_shared(
                             shard_id,
                         )
                     });
-                    let _ = reply_tx.send(frame);
+                    let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(frame));
                     return;
                 }
 
@@ -803,7 +819,8 @@ pub(crate) fn handle_shard_message_shared(
                             if sub_bytes.eq_ignore_ascii_case(b"DIGEST-SHARD") {
                                 let frame =
                                     crate::command::server_admin::debug_digest_shard_partials();
-                                let _ = reply_tx.send(frame);
+                                let _ =
+                                    reply_tx.send(crate::shard::dispatch::ExecReply::plain(frame));
                                 return;
                             }
                             if sub_bytes.eq_ignore_ascii_case(b"RECLAMATION") {
@@ -814,7 +831,8 @@ pub(crate) fn handle_shard_message_shared(
                                         wal_writer.as_ref(),
                                     )
                                 });
-                                let _ = reply_tx.send(frame);
+                                let _ =
+                                    reply_tx.send(crate::shard::dispatch::ExecReply::plain(frame));
                                 return;
                             }
                         }
@@ -832,7 +850,8 @@ pub(crate) fn handle_shard_message_shared(
                                     &mut autovacuum_daemon.maintenance_schedule,
                                     &args[1..],
                                 );
-                                let _ = reply_tx.send(frame);
+                                let _ =
+                                    reply_tx.send(crate::shard::dispatch::ExecReply::plain(frame));
                                 return;
                             }
                         }
@@ -886,7 +905,7 @@ pub(crate) fn handle_shard_message_shared(
                                 );
                             }
                         }
-                        let _ = reply_tx.send(response);
+                        let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(response));
                         return;
                     }
                     // COPY with no DB clause or same-db: fall through to
@@ -1049,7 +1068,7 @@ pub(crate) fn handle_shard_message_shared(
 
                 frame
             };
-            let _ = reply_tx.send(response);
+            let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(response));
         }
         ShardMessage::MultiExecute {
             db_index,

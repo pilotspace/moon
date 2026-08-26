@@ -59,6 +59,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mask-based relaxation is added, instead of the relaxation silently escaping the sentinel.
 
 ### Fixed
+- **A flush issued by a ROUTED script or transaction now reaches every shard (moon#705).**
+
+  `EVAL "return redis.call('FLUSHALL')" 1 <key>` at `--shards 4` answered `+OK` while leaving
+  7 to 10 of 12 keys alive. Which answer a caller got depended on where a key the script never
+  touches happened to hash — an implementation detail no client can see or control.
+
+  moon#685 gave a script-issued flush both dimensions the Lua bridge cannot reach on its own,
+  but the broadcast half stopped at the four routed entry points in `shard/spsc_handler.rs`:
+  the owner shard cannot fan out from inside its own message loop. It no longer tries to. The
+  flush now rides home on `ExecReply::script_flush` and `route_script_elsewhere` completes it
+  in async context — the same division of labour the `MULTI` path has used since c10k E2.
+
+  Two further defects were found and fixed while getting there:
+
+  * `coordinate_flush_broadcast` overloaded ONE parameter as both the SPSC **sender** and the
+    leg to **skip**. They coincide for a flush typed on a connection and differ for one
+    performed on an owner shard, so the first cut sent from a shard the caller was not running
+    on and left the caller's own slice full. They are now separate parameters.
+  * `broadcast_txn_flushes` had no sender parameter at all, so a **routed** `MULTI` carrying a
+    `FLUSHDB`/`FLUSHALL` had the same defect independently of scripts. Measured by reverting
+    only that fix: `EXEC` answers `[ok, ok]` with 3 keys surviving.
+
+  The SPSC mesh has no self-loop (`ChannelMesh::target_index` debug-asserts against it and in
+  release silently picks a neighbour), so the one leg that now lands on the caller's own shard
+  goes through the thread-local self queue the event loop already drains.
+
+  Routed scripts also never fired the client-side-cache invalidation a flush owes tracking
+  clients; completing the flush through `finish_script_flush` fixes that in the same change.
+
 - **`FT.SEARCH` on a missing index no longer reads as an empty listing in a build without `text-index` (moon#728).**
 
   A build compiled without the `text-index` feature — what CI's tokio leg compiles — answered

@@ -262,6 +262,9 @@ pub(super) async fn try_handle_evalsha(
         pending_flush,
         response,
         conn.selected_db,
+        // The script ran on THIS connection's shard, so that is the
+        // leg already cleared (moon#705).
+        ctx.shard_id,
         ctx,
     )
     .await;
@@ -328,6 +331,9 @@ pub(super) async fn try_handle_eval(
         pending_flush,
         response,
         conn.selected_db,
+        // The script ran on THIS connection's shard, so that is the
+        // leg already cleared (moon#705).
+        ctx.shard_id,
         ctx,
     )
     .await;
@@ -1644,6 +1650,9 @@ pub(super) async fn try_handle_functions(
             pending_flush,
             response,
             conn.selected_db,
+            // The script ran on THIS connection's shard, so that is the
+            // leg already cleared (moon#705).
+            ctx.shard_id,
             ctx,
         )
         .await;

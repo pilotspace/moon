@@ -1098,9 +1098,18 @@ async fn spsc_send_bounded(
 /// can observe shard A flushed while shard B is not yet — Redis-cluster-
 /// relaxed semantics. On any failed leg the caller receives an explicit
 /// partial-flush error naming the shard, never a silent partial `+OK`.
+/// `my_shard` is the SENDER — the shard this call runs on, which `spsc_send`
+/// needs to pick the right producer. `skip_shard` is the leg already flushed.
+///
+/// They are the same for a flush typed on a connection, and DIFFERENT for one
+/// a routed script or a routed MULTI performed on the owner shard (moon#705).
+/// Overloading one parameter for both silently sent from a shard the caller is
+/// not running on while leaving the caller's OWN shard full — measured at
+/// `--shards 4` as 5 of 12 keys surviving a routed script's `FLUSHALL`.
 pub(crate) async fn coordinate_flush_broadcast(
     command: &Frame,
     my_shard: usize,
+    skip_shard: usize,
     num_shards: usize,
     db_index: usize,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -1108,7 +1117,7 @@ pub(crate) async fn coordinate_flush_broadcast(
 ) -> Result<(), Frame> {
     let mut pending = Vec::with_capacity(num_shards.saturating_sub(1));
     for target in 0..num_shards {
-        if target == my_shard {
+        if target == skip_shard {
             continue;
         }
         let (reply_tx, reply_rx) = channel::oneshot();
@@ -1118,7 +1127,21 @@ pub(crate) async fn coordinate_flush_broadcast(
             commands: vec![(Bytes::new(), command.clone())],
             reply_tx,
         };
-        let outcome = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        // The SPSC mesh has NO self-loop — `ChannelMesh::target_index`
+        // debug-asserts `my_id != target_id`, and in release it silently
+        // computes a neighbour's index instead. Before moon#705 split
+        // `skip_shard` from `my_shard` this leg could not arise (the sender was
+        // always the skipped shard); now it can, and it has to go through the
+        // thread-local self queue the event loop drains ahead of the SPSC
+        // consumers. Measured while getting this wrong: a routed script's
+        // `FLUSHALL` cleared one shard twice and left the caller's own slice
+        // full, so 2 of 12 keys survived a `+OK`.
+        let outcome = if target == my_shard {
+            crate::shard::self_msg::push(msg);
+            crate::shard::dispatch::PushOutcome::Pushed
+        } else {
+            spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await
+        };
         pending.push((target, reply_rx, outcome));
     }
 
@@ -1170,9 +1193,15 @@ pub(crate) async fn coordinate_flush_broadcast(
 /// reader can see shard A flushed before shard B. `MULTI` does not and cannot
 /// change that in a shared-nothing engine — it bounds the report, not the
 /// visibility.
+/// `my_shard` is the shard this call RUNS on (the originator, always), and
+/// `exec_shard` is the shard that ran the body. They differ for a ROUTED
+/// transaction, and conflating them — as this did before moon#705 split the
+/// two roles in `coordinate_flush_broadcast` — sends from a shard the caller
+/// is not on and leaves the originator's own slice unflushed.
 pub(crate) async fn broadcast_txn_flushes(
     result: &mut Frame,
     exec_flushes: &[(usize, Frame, usize)],
+    my_shard: usize,
     exec_shard: usize,
     num_shards: usize,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -1184,6 +1213,7 @@ pub(crate) async fn broadcast_txn_flushes(
     for (result_index, command, db_index) in exec_flushes {
         if let Err(err) = coordinate_flush_broadcast(
             command,
+            my_shard,
             exec_shard,
             num_shards,
             *db_index,
@@ -1711,6 +1741,12 @@ async fn coordinate_multi_del_or_exists(
 /// The reply is passed through untouched, including errors — a `NOSCRIPT` from
 /// the target shard is a real answer about the target's script cache, and
 /// rewriting it here would hide a cache fan-out gap.
+///
+/// moon#705: the second return value is the flush the routed script issued but
+/// could NOT fan out from inside the owner's message loop. It is returned
+/// rather than acted on here because this function does not know which shard
+/// ran the body relative to the caller's own — `route_script_elsewhere` does,
+/// and completes it there.
 #[allow(clippy::too_many_arguments)]
 pub async fn coordinate_script(
     command: std::sync::Arc<Frame>,
@@ -1720,7 +1756,7 @@ pub async fn coordinate_script(
     script_acl: crate::acl::ScriptAcl,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
-) -> Frame {
+) -> (Frame, Option<crate::scripting::pending_flush::PendingFlush>) {
     let (reply_tx, reply_rx) = channel::oneshot();
     let msg = ShardMessage::Execute {
         db_index,
@@ -1735,14 +1771,20 @@ pub async fn coordinate_script(
     match spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await {
         crate::shard::dispatch::PushOutcome::Pushed => {}
         crate::shard::dispatch::PushOutcome::Backpressure => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR shard owning the script's keys is not draining; script not executed",
-            ));
+            return (
+                Frame::Error(Bytes::from_static(
+                    b"ERR shard owning the script's keys is not draining; script not executed",
+                )),
+                None,
+            );
         }
         crate::shard::dispatch::PushOutcome::Cancelled => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR shutting down; script not executed",
-            ));
+            return (
+                Frame::Error(Bytes::from_static(
+                    b"ERR shutting down; script not executed",
+                )),
+                None,
+            );
         }
     }
     // Past this point the script IS in the target's queue, so no failure here
@@ -1750,18 +1792,28 @@ pub async fn coordinate_script(
     // otherwise invites a client to re-send a non-idempotent script that
     // already applied its writes.
     match recv_reply_bounded_reason(reply_rx).await {
-        Ok(frame) => frame,
+        Ok(reply) => (reply.frame, reply.script_flush),
         Err(ReplyFailure::TimedOut) => {
             // Mirrors the handler reply paths, which already record this;
             // without it a wedged owner shard is invisible in metrics.
             crate::admin::metrics_setup::record_xshard_reply_timeout("script");
-            Frame::Error(Bytes::from_static(
-                b"ERR timeout waiting for the shard owning the script's keys; script execution status is unknown",
-            ))
+            // No flush note, and deliberately not an assumption that there was
+            // none: we never heard back, so there is nothing to complete and
+            // nothing that could be completed correctly. The reply already
+            // says the execution status is unknown.
+            (
+                Frame::Error(Bytes::from_static(
+                    b"ERR timeout waiting for the shard owning the script's keys; script execution status is unknown",
+                )),
+                None,
+            )
         }
-        Err(ReplyFailure::Closed) => Frame::Error(Bytes::from_static(
-            b"ERR cross-shard reply channel closed; script execution status is unknown",
-        )),
+        Err(ReplyFailure::Closed) => (
+            Frame::Error(Bytes::from_static(
+                b"ERR cross-shard reply channel closed; script execution status is unknown",
+            )),
+            None,
+        ),
     }
 }
 
@@ -1786,7 +1838,8 @@ pub async fn coordinate_keys(
     }
 
     let mut all_keys: Vec<Frame> = Vec::new();
-    let mut pending_shards: Vec<channel::OneshotReceiver<Frame>> = Vec::new();
+    let mut pending_shards: Vec<channel::OneshotReceiver<crate::shard::dispatch::ExecReply>> =
+        Vec::new();
 
     // Execute locally on this shard
     {
@@ -1828,7 +1881,7 @@ pub async fn coordinate_keys(
 
     // Collect remote results
     for reply_rx in pending_shards {
-        match recv_reply_bounded(reply_rx).await {
+        match recv_reply_bounded(reply_rx).await.map(|r| r.frame) {
             Ok(Frame::Array(keys)) => all_keys.extend(keys),
             Ok(_) => {} // Non-array response (e.g., error) — skip
             Err(_) => {
@@ -1915,7 +1968,7 @@ pub async fn coordinate_scan(
             reply_tx,
         };
         let _ = spsc_send(dispatch_tx, my_shard, target_shard_id, msg, spsc_notifiers).await;
-        match recv_reply_bounded(reply_rx).await {
+        match recv_reply_bounded(reply_rx).await.map(|r| r.frame) {
             Ok(frame) => frame,
             Err(_) => Frame::Error(Bytes::from_static(
                 b"ERR cross-shard reply channel closed during SCAN",
@@ -1976,7 +2029,8 @@ pub async fn coordinate_dbsize(
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     let mut total: i64 = 0;
-    let mut pending_shards: Vec<channel::OneshotReceiver<Frame>> = Vec::new();
+    let mut pending_shards: Vec<channel::OneshotReceiver<crate::shard::dispatch::ExecReply>> =
+        Vec::new();
 
     // Local shard. `logical_len`, NOT `len`: remote legs dispatch a real
     // DBSIZE (which counts hot + cold since issue #355), so an inlined
@@ -2007,7 +2061,7 @@ pub async fn coordinate_dbsize(
     }
 
     for reply_rx in pending_shards {
-        match recv_reply_bounded(reply_rx).await {
+        match recv_reply_bounded(reply_rx).await.map(|r| r.frame) {
             Ok(Frame::Integer(n)) => total += n,
             Ok(_) => {} // Non-integer response — skip
             Err(_) => {
@@ -2047,7 +2101,7 @@ pub async fn coordinate_debug_digest(
     let mut all: Vec<(usize, crate::command::debug_digest::Digest)> =
         crate::command::debug_digest::local_partials();
 
-    let mut pending: Vec<channel::OneshotReceiver<Frame>> = Vec::new();
+    let mut pending: Vec<channel::OneshotReceiver<crate::shard::dispatch::ExecReply>> = Vec::new();
     for target in 0..num_shards {
         if target == my_shard {
             continue;
@@ -2085,7 +2139,7 @@ pub async fn coordinate_debug_digest(
         // failures are different facts about the shard, and this error text
         // makes a claim about which one happened. A shard still grinding
         // through a large keyspace is not a shard that dropped its sender.
-        match recv_reply_bounded_reason(reply_rx).await {
+        match recv_reply_bounded_reason(reply_rx).await.map(|r| r.frame) {
             Ok(frame) => match crate::command::debug_digest::partials_from_frame(&frame) {
                 Some(partials) => all.extend(partials),
                 None => {
@@ -2151,8 +2205,8 @@ pub async fn coordinate_randomkey(
     }));
 
     let mut pending: Vec<(
-        channel::OneshotReceiver<Frame>,
-        channel::OneshotReceiver<Frame>,
+        channel::OneshotReceiver<crate::shard::dispatch::ExecReply>,
+        channel::OneshotReceiver<crate::shard::dispatch::ExecReply>,
     )> = Vec::with_capacity(num_shards.saturating_sub(1));
     for target in 0..num_shards {
         if target == my_shard {
@@ -2177,7 +2231,7 @@ pub async fn coordinate_randomkey(
     }
 
     for (size_rx, key_rx) in pending {
-        let count = match recv_reply_bounded(size_rx).await {
+        let count = match recv_reply_bounded(size_rx).await.map(|r| r.frame) {
             Ok(Frame::Integer(n)) if n > 0 => n as u64,
             Ok(_) => 0,
             Err(_) => {
@@ -2186,7 +2240,7 @@ pub async fn coordinate_randomkey(
                 ));
             }
         };
-        let candidate = match recv_reply_bounded(key_rx).await {
+        let candidate = match recv_reply_bounded(key_rx).await.map(|r| r.frame) {
             Ok(Frame::BulkString(key)) => Some(key),
             Ok(_) => None,
             Err(_) => {
@@ -2299,7 +2353,8 @@ pub async fn coordinate_hotkeys(
     // Remote shards: synthetic HOTKEYS COUNT <n> executes via normal dispatch.
     let mut count_buf = itoa::Buffer::new();
     let count_bytes = Bytes::copy_from_slice(count_buf.format(count).as_bytes());
-    let mut pending_shards: Vec<channel::OneshotReceiver<Frame>> = Vec::new();
+    let mut pending_shards: Vec<channel::OneshotReceiver<crate::shard::dispatch::ExecReply>> =
+        Vec::new();
     for target in 0..num_shards {
         if target == my_shard {
             continue;
@@ -2323,7 +2378,7 @@ pub async fn coordinate_hotkeys(
     }
 
     for reply_rx in pending_shards {
-        match recv_reply_bounded(reply_rx).await {
+        match recv_reply_bounded(reply_rx).await.map(|r| r.frame) {
             Ok(Frame::Array(entries)) => {
                 for entry in entries.iter() {
                     if let Frame::Array(pair) = entry
