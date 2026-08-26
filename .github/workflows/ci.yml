@@ -114,6 +114,14 @@ jobs:
     # only re-run what the PR gate already ran (moon#732).
     if: github.event_name != 'workflow_dispatch'
     env:
+      # moon#735: no incremental cache (a one-shot job never reads it back;
+      # 2.18 GiB and 85s per leg) and DWARF left beside the objects instead of
+      # copied into every test executable at link time. LINUX JOBS ONLY, set
+      # per-job rather than at workflow level: a workflow `env:` merges into
+      # every job and none can unset it, and `split-debuginfo=unpacked` is
+      # wrong for Windows (MSVC/PDB) and redundant on macOS (already default).
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
       # tokio's io_uring bridge is off in CI (it floods errors under load).
       # Per-job, never workflow-level: `check-monoio` must not inherit it.
       MOON_NO_URING: "1"
@@ -198,6 +206,14 @@ jobs:
     runs-on: [self-hosted, moon-dev]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     env:
+      # moon#735: no incremental cache (a one-shot job never reads it back;
+      # 2.18 GiB and 85s per leg) and DWARF left beside the objects instead of
+      # copied into every test executable at link time. LINUX JOBS ONLY, set
+      # per-job rather than at workflow level: a workflow `env:` merges into
+      # every job and none can unset it, and `split-debuginfo=unpacked` is
+      # wrong for Windows (MSVC/PDB) and redundant on macOS (already default).
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
       # MUST differ from `check`'s dir: the two jobs build incompatible feature
       # sets from one checkout and can run concurrently on this runner.
       CARGO_TARGET_DIR: /home/tindang/ci-target/check-monoio
@@ -320,6 +336,15 @@ jobs:
   check-console:
     name: Check (console feature)
     runs-on: ubuntu-latest
+    env:
+      # moon#735: no incremental cache (a one-shot job never reads it back;
+      # 2.18 GiB and 85s per leg) and DWARF left beside the objects instead of
+      # copied into every test executable at link time. LINUX JOBS ONLY, set
+      # per-job rather than at workflow level: a workflow `env:` merges into
+      # every job and none can unset it, and `split-debuginfo=unpacked` is
+      # wrong for Windows (MSVC/PDB) and redundant on macOS (already default).
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v7
@@ -444,6 +469,14 @@ jobs:
     runs-on: [self-hosted, moon-dev]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     env:
+      # moon#735: no incremental cache (a one-shot job never reads it back;
+      # 2.18 GiB and 85s per leg) and DWARF left beside the objects instead of
+      # copied into every test executable at link time. LINUX JOBS ONLY, set
+      # per-job rather than at workflow level: a workflow `env:` merges into
+      # every job and none can unset it, and `split-debuginfo=unpacked` is
+      # wrong for Windows (MSVC/PDB) and redundant on macOS (already default).
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
       CARGO_TARGET_DIR: /home/tindang/ci-target/client-compat
       # Kept from when this was a workflow-level global, so this job's recorded
       # waiver baseline stays comparable: the differ probes RESP wire shapes,

@@ -36,31 +36,39 @@ expect() { # expect <label> <want-verdict> <avail-gb> <target-gb>
 }
 
 echo "── disk_verdict ──"
+# Rows are set from MEASURED leg sizes, not round numbers: a full dir is ~7G
+# after moon#735 (7.01 monoio / 6.81 tokio), was ~15G after moon#655, ~34G
+# before it. Each row sits at a decision boundary so a constant that drifts
+# reports here instead of passing regardless.
+
 # The wedge itself: below the floor nothing may start, warm dir or not.
-expect "3G free, warm 15G dir  (the 2026-08-22 wedge)" FAIL  3 15
-expect "7G free, warm 15G dir"                         FAIL  7 15
-# Cold build needs room for a whole ~15G target dir (moon#655; it was ~34G,
-# and these expectations moved with the measurement, not to make a test pass).
-expect "12G free, no target dir (cold build)"          FAIL 12  0
+expect "3G free, warm 7G dir  (the 2026-08-22 wedge)"  FAIL  3  7
+expect "7G free, warm 7G dir"                          FAIL  7  7
+# Cold build: needs room for a whole ~7G dir plus headroom.
+expect "8G free, no target dir (cold build)"           FAIL  8  0
+# A cold leg that clears COLD_NEED returns OK outright -- it never reaches
+# the warm-headroom check, because the cold figure already covers the whole
+# dir. 10G is OK now and was FAIL at the pre-moon#735 18G constant.
+expect "10G free, no target dir (cold build)"           OK   10  0
 expect "40G free, no target dir (cold build)"          OK   40  0
-# The case that used to FAIL and now legitimately passes: 20G really does fit
-# a cold leg once the debug info is gone. Asserted so the improvement is
-# pinned, not merely no longer contradicted.
-expect "20G free, no target dir (cold build)"          OK   20  0
-# Warm incremental: the 15G is already spent, only headroom is needed.
-expect "24G free, warm 15G dir (today's VM)"           OK   24 15
-expect "9G free, warm 15G dir (thin but usable)"       WARN  9 15
-# The warm-headroom line is 15G and did NOT move with moon#655: 12G free is
-# enough to finish an incremental leg but not enough to be quiet about.
-expect "12G free, warm 15G dir"                        WARN 12 15
-expect "16G free, warm 15G dir"                        OK   16 15
-# A dir that exists but is a stub is still a cold build.
-# A stub is judged against the NEW full size: under 3G, not under 5G.
-expect "12G free, 2G stub dir"                         FAIL 12  2
-# 4G is the discriminating size: a partially-warmed dir (deps built, tests not)
-# is a real cache under the post-moon#655 3G threshold. If that threshold ever
-# drifts back up, this row flips to FAIL and says so.
-expect "12G free, warm 4G dir (deps only)"             WARN 12  4
+# The case that used to FAIL and now legitimately passes: 12G really does fit
+# a cold leg once the dependency debug info is gone. Asserted so the
+# improvement is pinned, not merely no longer contradicted.
+expect "12G free, no target dir (cold build)"           OK   12  0
+# Warm incremental: the 7G is already spent, only headroom is needed. The
+# warn line is 15G and has NOT moved with either profile change -- it
+# describes free space a RUNNING suite wants underneath it, not build output.
+expect "24G free, warm 7G dir (today's VM)"            OK   24  7
+expect "16G free, warm 7G dir"                         OK   16  7
+expect "12G free, warm 7G dir"                         WARN 12  7
+expect "9G free, warm 7G dir (thin but usable)"        WARN  9  7
+# A dir that exists but is a stub is still a cold build. The stub line moved
+# with the full size: under 1.5G, not under 3G.
+expect "8G free, 1G stub dir"                          FAIL  8  1
+# 2G is the discriminating size: a partially-warmed dir (deps built, tests
+# not) is a real cache under the post-moon#735 1.5G threshold. If that
+# threshold drifts back up, this row flips to FAIL and says so.
+expect "8G free, warm 2G dir (deps only)"              WARN  8  2
 
 # ── moon#661: the VM's number alone is not the answer ──────────────────
 # On 2026-08-22 the pre-flight printed a green light on precisely the
@@ -94,11 +102,11 @@ echo ""
 echo "── vm_growth_bytes (what the image will claim from the host) ──"
 # Measured 2026-08-23: one warm tokio leg grew the image 90.2 -> 90.5 GB.
 # A cold leg is the expensive one -- it materializes a whole target dir.
-expect_growth "two warm legs (cheap: nothing to build)"  4 15 15
-expect_growth "one cold, one warm"                      20  0 15
-expect_growth "two cold legs"                           36  0  0
-expect_growth "a stub dir counts as cold"               20  2 15
-expect_growth "a 4G dir is warm, not a stub"             4  4 15
+expect_growth "two warm legs (cheap: nothing to build)"  4  7  7
+expect_growth "one cold, one warm"                      11  0  7
+expect_growth "two cold legs"                           18  0  0
+expect_growth "a stub dir counts as cold"               11  1  7
+expect_growth "a 2G dir is warm, not a stub"             4  2  7
 
 echo ""
 echo "── host_disk_verdict ──"
@@ -111,9 +119,9 @@ expect_host "9G host free, nothing to build"                FAIL   9  0
 expect_host "33G host free, warm run needs 4G (today)"      OK    33  4
 expect_host "20G host free, warm run needs 4G"              WARN  20  4
 # A cold run is the one that genuinely needs room for two target dirs.
-expect_host "24G host free, cold run needs 36G"             FAIL  24 36
-expect_host "49G host free, cold run needs 36G"             WARN  49 36
-expect_host "64G host free, cold run needs 36G"             OK    64 36
+expect_host "24G host free, cold run needs 18G"             FAIL  24 18
+expect_host "30G host free, cold run needs 18G"             WARN  30 18
+expect_host "45G host free, cold run needs 18G"             OK    45 18
 
 echo ""
 echo "── read_host_avail_bytes ──"

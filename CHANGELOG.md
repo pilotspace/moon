@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Dependency debug info is dropped from dev/test builds, halving the target dir again and cutting the cold build 60% (moon#735).**
+
+  moon#655 took a CI target dir from 39.1 to 14.9 GiB. What remained was still overwhelmingly
+  debug info: a median 53.8 MB test binary was `.debug_line` 18.0 + `.debug_str` 13.8 +
+  `.debug_info` 12.3 + `.debug_ranges` 4.7 + `.debug_aranges` 2.5 MB against **2.9 MB of
+  `.text`** — 96% debug info, 5% code. The cause is structural: 272 test executables each
+  statically link the whole dependency graph, amplifying a 0.61 GiB shared rlib set into
+  10.43 GiB.
+
+  A six-leg same-tree matrix on moon-dev measured each lever separately (cold dir per leg,
+  identical `cargo nextest run --profile ci --no-run`):
+
+  | leg | total | build |
+  |---|---:|---:|
+  | baseline | 13.88 GiB | 362s |
+  | `CARGO_INCREMENTAL=0` | 11.67 GiB | 277s |
+  | + `[profile.dev.package."*"] debug = 0` | 8.48 GiB | 239s |
+  | `split-debuginfo = "unpacked"` alone | 9.13 GiB | 193s |
+  | **both** | **6.81 GiB** | **145s** |
+  | `debug = 0` entirely (floor, not a candidate) | 2.43 GiB | 114s |
+
+  All three ship. The real cold `ci-local` legs that followed landed at **7.01 GiB** (monoio)
+  and **6.81 GiB** (tokio) against 6.81 predicted, with cold suites at 453s and 446s versus
+  588s and 572s before. Cumulatively with moon#655: **41,993 MB → 7,313 MB (−82.6%)** and
+  **449s → 145s (−67.7%)**.
+
+  `debug/incremental` was 2.18 GiB of cache that a one-shot CI leg never reads back, and
+  building it cost 85s per leg. Local development keeps its cache — only CI legs opt out.
+
+  **What it costs, verified rather than assumed.** A real moon test binary was built under the
+  new configuration and panicked: moon's own frames keep symbol *and* `at file:line`, std
+  frames keep theirs (std ships its own debug info, which `package."*"` does not touch), and
+  third-party crate frames keep symbols but lose file:line — the intended trade. Panic messages
+  are unaffected via `#[track_caller]`. That probe binary went 54 MB → **6.1 MB**. Separately
+  confirmed that `split-debuginfo = "unpacked"` does not put line tables out of reach:
+  backtraces still resolve `file:line` with every `.dwo` file deleted, because
+  `line-tables-only` keeps `.debug_line` in the binary.
+
+  **`split-debuginfo` is set per-leg, not as a profile key.** In `[profile.dev]` it would also
+  apply to Windows, where MSVC uses PDB and support differs, and to macOS, where dev already
+  defaults to `unpacked` — risking a platform for no gain. It is a `CARGO_PROFILE_DEV_SPLIT_DEBUGINFO`
+  env var on the Linux legs only: `ci-local.sh`'s two VM suites and the four Linux jobs in
+  `ci.yml` (`check`, `check-monoio`, `check-console`, `client-compat`), set at **job** level
+  because a workflow-level `env:` merges into every job and none can unset it. Windows, macOS,
+  `lint`, `msrv` and the memory gate are untouched.
+
+  `ci-local.sh`'s disk pre-flight constants are re-measured from the real leg sizes (cold-leg
+  need 18G → 9G, full-dir size 3G → 1.5G); the warm-headroom warn line stays 15G, because it
+  describes free space a *running* suite wants underneath it, which this change does not touch.
+  `scripts/test-ci-local-preflight.sh` gains rows at the moved boundaries — including a 2G
+  target dir, the size that separates a partially-warmed cache from a stub only under the new
+  threshold — and all six constants were mutated back to wrong values to confirm the 31-row
+  harness reports them rather than passing regardless.
+
 - **Dev/test builds emit line tables instead of full DWARF, cutting the CI target dir 62% and the cold build 38% (moon#655).**
 
   `tests/` holds 253 integration files. Each is its own crate statically linked against the
