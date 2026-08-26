@@ -60,6 +60,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the self-hosted VM, so it costs no hosted capacity; its cron is also load-bearing
   (`recall-canaries` matches the literal string), so it is left alone.
 
+  `fuzz.yml` also gains `workflow_dispatch`, with an optional `duration_seconds`. It had only
+  `schedule` and a `ci-fuzz`-labelled PR, so a nightly that needed to be cancelled — exactly
+  what the 2026-08-26 queue collision forced — could not be relaunched, only `gh run rerun`'d.
+  The input is clamped to the existing 18000s budget rather than merely defaulted to it: the
+  job's 350-minute ceiling has to outlast fuzzing *plus* the corpus archive, and a manual
+  trigger must not be able to reintroduce the overrun that ceiling exists to prevent.
+
 - **The pre-merge hosted matrix now runs only what no local gate can produce (moon#732).**
 
   A merge cost ~59 minutes of gating: `ci-local` ~26m, then a push, then the PR gate 8.6m, then

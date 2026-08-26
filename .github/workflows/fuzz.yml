@@ -4,6 +4,17 @@ on:
   pull_request:
     branches: [main]
     types: [labeled]
+  # On demand. Without this, the nightly is reachable only by waiting for the
+  # cron or by labelling a PR `ci-fuzz` — so a cancelled nightly could not be
+  # relaunched, only `gh run rerun`'d. That made cancelling the run a one-way
+  # door on 2026-08-26, when the 02:00 UTC nightly held every hosted runner
+  # through the working day and two PRs sat QUEUED behind it.
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Seconds per target (default 18000 = 5h, clamped to 18000)"
+        required: false
+        default: "18000"
   schedule:
     # 16:00 UTC = 23:00 in this project's timezone (UTC+7), so the soak runs
     # overnight LOCALLY and is done by ~04:50 local.
@@ -89,7 +100,7 @@ jobs:
           TARGET: ${{ matrix.target }}
 
   fuzz-nightly:
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     name: Fuzz nightly
     runs-on: ubuntu-latest
     # GitHub hard-kills a hosted job at 6h. A 6h fuzz budget therefore consumed the
@@ -147,14 +158,30 @@ jobs:
           name: fuzz-corpus
           path: fuzz/corpus/
         continue-on-error: true
-      - name: Run fuzzer (5h, multi-process)
+      - name: Run fuzzer (multi-process)
         # Explicit --target: see fuzz-pr note (prebuilt musl cargo-fuzz).
         # 5h, not 6h: the job's 350-minute ceiling must outlast fuzzing PLUS the
         # corpus archive, or the archive is lost with the job. See timeout-minutes.
-        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$TARGET" -- -max_total_time=18000 -max_len=65536 -fork=2 -ignore_crashes=0
+        # A dispatch may shorten the budget but not lengthen it past 18000 --
+        # otherwise the manual trigger could silently reintroduce the exact
+        # archive-losing overrun that ceiling exists to prevent.
+        run: |
+          # `if`, not `[ ] && x`. Under `bash -e` (how Actions runs this) a
+          # failing test inside an AND-OR list is exempt from -e, so the `&&`
+          # form does survive today -- verified, not assumed. It survives only
+          # because another command follows it: were the clamp ever to end the
+          # block, its false branch would become the step's exit status and
+          # fail the job. `if` does not depend on statement order.
+          budget="${BUDGET:-18000}"
+          case "$budget" in ''|*[!0-9]*) budget=18000 ;; esac
+          if [ "$budget" -gt 18000 ]; then budget=18000; fi
+          if [ "$budget" -lt 60 ]; then budget=60; fi
+          echo "fuzzing $TARGET for ${budget}s"
+          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$TARGET" -- -max_total_time="$budget" -max_len=65536 -fork=2 -ignore_crashes=0
         env:
           MOON_NO_URING: "1"
           TARGET: ${{ matrix.target }}
+          BUDGET: ${{ inputs.duration_seconds }}
       - name: Archive corpus
         if: always()
         uses: actions/upload-artifact@v4
