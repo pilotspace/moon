@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Bump the async-runtime group: tokio 1.52.3 -> 1.53.1, tokio-stream 0.1.18 -> 0.1.19, tokio-util 0.7.18 -> 0.7.19 (moon#692).**
+
+  Lockfile only — no `Cargo.toml` requirement moved, and `cargo update` resolved these as the
+  "latest Rust 1.94 compatible versions", so the MSRV pin still binds the resolution.
+
+  The one behavioral change in tokio 1.53.0 does not reach moon: `mpsc::{Receiver,
+  UnboundedReceiver}` now drop their waker on drop even while senders live (tokio#8095), and
+  moon uses `tokio::sync::{broadcast, watch}` plus `std::sync::mpsc`, never `tokio::sync::mpsc`.
+  The queued-`reserve[_many]` wake fix (tokio#8260) is likewise mpsc-only.
+
+  Taking **1.53.1** rather than 1.53.0 is load-bearing: 1.53.1 restores MSRV by removing
+  `OnceLock::wait` from the Windows signal handler (tokio#8300), and moon pins MSRV 1.94 and
+  ships Windows.
+
+  Transitively pulls `socket2` 0.6.5 alongside the existing 0.5.10 (distinct dependents) and
+  `windows-sys` 0.61.2 in `winsplit`.
+
 ### Fixed
 - **`wc4` waiter-cannibalisation test no longer reports a false failure when the CI box is loaded.**
 
