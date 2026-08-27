@@ -14,6 +14,7 @@ strict: true
 # Scratch / internal docs kept in-repo but off the published site.
 exclude_docs: |
   perf/
+  internal/
   roadmap/
   W2-M2-FT-INVALIDATE-RANGE-SUMMARY.md
 
