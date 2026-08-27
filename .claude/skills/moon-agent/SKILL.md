@@ -141,12 +141,16 @@ alone treats every miss as a hit.
    hashes. An entry at `cache:q1` with an index on `agentmem:` is never found — `cache_hit` is
    permanently `False` and no error is raised.
 
-2. **`cache_hit` is inverted on `COSINE` / `INNER_PRODUCT` indexes** — moon#748, open as of
-   0.8.7. `cache_hit` is true when the nearest entry is *farther* than `threshold`, so a
-   near-identical query misses and an unrelated query hits. At the SDK default
-   `threshold=0.95` a COSINE cache is wrong for essentially every query.
-   **Until it is fixed: build the semantic cache on an `L2` index** (verified correct), or
-   ignore `cache_hit` and apply your own distance cut-off on `r.results[0].score`.
+2. **`threshold` is a distance ceiling, and the SDK default is far too loose.** An entry
+   matches when `distance <= threshold`, for every metric — there is no higher-is-better
+   metric in Moon. On COSINE the score runs 0.0 (identical) to 2.0 (opposed), so the SDK
+   default `threshold=0.95` admits entries roughly *orthogonal* to the query. Pass an
+   explicit value; 0.05-0.2 is a typical semantic-cache band.
+
+   That default dates from moon#748, where the server wrongly treated COSINE/IP as
+   similarities and `cache_hit` came back inverted on those indexes. **Fixed in 0.8.8** —
+   all three metrics now agree. On 0.8.7 and earlier, build the cache on `L2` (correct
+   there) or ignore `cache_hit` and apply your own cut-off to `r.results[0].score`.
 
 ### Full-text
 
@@ -212,7 +216,8 @@ Moon is IO — design for it failing:
 | Top hit has a *low* score | expected — score is a distance, ascending |
 | Cache "hits" every time | branched on `results` instead of `.cache_hit` |
 | Cache never hits, no error | cache key not under the index `PREFIX` |
-| COSINE cache hits on the *wrong* query | moon#748 — `cache_hit` inverted for COSINE/IP; use `L2` |
+| COSINE cache hits on the *wrong* query | moon#748, fixed in 0.8.8; on ≤0.8.7 use `L2` |
+| Cache hits almost every query | `threshold` is a distance ceiling — the `0.95` default is near-orthogonal on COSINE |
 | Stale indexes on start | empty `--dir` defaults to CWD; always pass one |
 | Search finds nothing right after write | text indexing is async; brief settle needed |
 
@@ -230,4 +235,5 @@ server, the SDK, or the calling code.
 > Behaviour here was verified against **moon 0.8.7 / moondb 0.1.1 / redis-py 8.1.0** on macOS
 > arm64 (2026-08-27): 26 of 29 flows passed first run; the three failures became the
 > single-shard `FILTER` constraint and the text-schema tuple shape documented above.
-> Probing the cache path then surfaced moon#748 (inverted `cache_hit` on COSINE/IP).
+> Probing the cache path then surfaced moon#748 (inverted `cache_hit` on COSINE/IP), which
+> also turned up the same inversion in `FT.SEARCH ... RANGE`; both are fixed in 0.8.8.

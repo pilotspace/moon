@@ -21,8 +21,8 @@ use crate::vector::store::VectorStore;
 use crate::vector::types::SearchResult;
 
 use super::execute::{
-    SearchRawResult, apply_range_filter, parse_sparse_query_blob, search_local_filtered,
-    search_local_raw,
+    ScoreOrder, SearchRawResult, apply_range_filter, parse_sparse_query_blob,
+    search_local_filtered, search_local_raw,
 };
 use super::parse::{
     extract_param_blob, parse_as_of_clause, parse_filter_clause, parse_inline_filter,
@@ -252,10 +252,14 @@ pub fn ft_search(
         let (mut fused, dense_count, sparse_count) =
             crate::vector::fusion::rrf_fuse(&dense_results, &sparse_results, k);
 
-        // Apply RANGE threshold filter to fused results (AGNT-05)
-        if let (Some(threshold), Some(metric)) = (range_threshold, range_metric) {
+        // Apply RANGE threshold filter to fused results (AGNT-05).
+        // `rrf_fuse` stores `distance = -score` precisely so that lower is
+        // better and `SearchResult::Ord` sorts correctly, so these compare the
+        // same way dense distances do — despite RRF itself being a
+        // higher-is-better score before negation.
+        if let (Some(threshold), Some(_)) = (range_threshold, range_metric) {
             let mut sv: SmallVec<[SearchResult; 32]> = fused.drain(..).collect();
-            apply_range_filter(&mut sv, threshold, metric);
+            apply_range_filter(&mut sv, threshold, ScoreOrder::LowerIsCloser);
             fused = sv.into_vec();
         }
 
@@ -320,10 +324,11 @@ pub fn ft_search(
         // Convert to SmallVec for build_hybrid_response
         let mut fused: Vec<SearchResult> = sparse_results;
 
-        // Apply RANGE threshold filter (AGNT-05)
-        if let (Some(threshold), Some(metric)) = (range_threshold, range_metric) {
+        // Apply RANGE threshold filter (AGNT-05).
+        // These are raw sparse dot products: higher is better.
+        if let (Some(threshold), Some(_)) = (range_threshold, range_metric) {
             let mut sv: SmallVec<[SearchResult; 32]> = fused.drain(..).collect();
-            apply_range_filter(&mut sv, threshold, metric);
+            apply_range_filter(&mut sv, threshold, ScoreOrder::HigherIsBetter);
             fused = sv.into_vec();
         }
 
@@ -410,9 +415,9 @@ pub fn ft_search(
                     &key_hash_to_key,
                 );
 
-                // Apply RANGE threshold filter (AGNT-05)
-                if let (Some(threshold), Some(metric)) = (range_threshold, range_metric) {
-                    apply_range_filter(&mut results, threshold, metric);
+                // Apply RANGE threshold filter (AGNT-05). Dense KNN distances.
+                if let (Some(threshold), Some(_)) = (range_threshold, range_metric) {
+                    apply_range_filter(&mut results, threshold, ScoreOrder::LowerIsCloser);
                 }
 
                 // Build response from filtered results
@@ -440,7 +445,7 @@ pub fn ft_search(
     // Standard dense-only path (no session)
     // When RANGE is set, use raw search + range filter + response build.
     // Otherwise, use the fused search_local_filtered for backward compat.
-    if let (Some(threshold), Some(metric)) = (range_threshold, range_metric) {
+    if let (Some(threshold), Some(_)) = (range_threshold, range_metric) {
         let raw = search_local_raw(
             store,
             &index_name,
@@ -458,7 +463,7 @@ pub fn ft_search(
                 mut results,
                 key_hash_to_key,
             } => {
-                apply_range_filter(&mut results, threshold, metric);
+                apply_range_filter(&mut results, threshold, ScoreOrder::LowerIsCloser);
                 build_search_response(&results, &key_hash_to_key, limit_offset, limit_count)
             }
         }

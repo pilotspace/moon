@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`FT.CACHESEARCH` and `FT.SEARCH ... RANGE` were inverted on `COSINE` / `IP` indexes
+  (moon#748).**
+
+  Three places tested `distance >= threshold` for the unit-sphere metrics, on the belief
+  that those return a *similarity* where higher is closer. They do not. Cosine and
+  InnerProduct are normalized at encode time and every dense scoring path runs through
+  `l2_f32`, so the score is `‖a−b‖² = 2 − 2·cos` — a monotonically increasing function of
+  cosine distance, ranked ascending exactly like L2. An exact self-match scores ~0.006
+  (not 0.0: vectors are stored quantized) and an orthogonal one ~2.0.
+
+  The effects were exact inversions:
+  - `FT.CACHESEARCH` reported a cache MISS for a query identical to a cached entry and a
+    HIT for an unrelated one. At the moondb default `threshold=0.95` a COSINE semantic
+    cache was wrong for essentially every query.
+  - Among entries that *were* inside the threshold, the best-candidate comparison picked
+    the FARTHEST one, so a hit could return the wrong cached answer with `cache_hit: true`.
+    That failure is silent — no flag reveals it.
+  - `FT.SEARCH ... RANGE <t>` discarded every near match and returned only the vectors
+    farthest from the query.
+
+  `L2` was always correct and is unchanged.
+
+  `apply_range_filter` turned out to be the harder half. It is applied to three different
+  score conventions while taking its direction from the index's **dense** metric in all of
+  them, which is meaningless for two: sparse results are raw dot products (higher is
+  better) and RRF fusion results are `-score` (negated on purpose so `SearchResult::Ord`
+  sorts best-first, i.e. lower is better). It now takes an explicit `ScoreOrder` naming the
+  convention at each call site, so each one is individually checkable instead of inheriting
+  an unrelated field's metric.
+
+  The `DistanceMetric` doc comments asserted the same wrong thing and are corrected; that
+  is where the belief propagated from.
+
+  CI could not catch any of this: the only tests called the predicate with hand-written
+  numbers chosen to match the wrong assumption, so they passed while the product was
+  broken. `tests/ft_cachesearch_metric_748.rs` closes the gap end-to-end against a live
+  server — hit direction, miss direction, *which* entry a hit returns, dense RANGE across
+  all three metrics, and hybrid RANGE to pin the negated-RRF direction.
+
+  Two things found on the way that are NOT fixed here, because they are separate problems:
+  `FT.CACHESEARCH` is local-only in every dispatch path (at `--shards > 1` it cannot see a
+  cache entry that lives on another shard), and `SparseStore::insert` has no production
+  caller at all — HSET never populates a sparse store, so the sparse-only search path
+  always returns nothing.
+
+  Note for existing users: `threshold` is a distance ceiling, so the moondb default of
+  `0.95` is very loose under the corrected semantics — on COSINE it admits entries roughly
+  orthogonal to the query. The default is unchanged (it is a public SDK API), but the
+  docstring now says so; pass an explicit value, typically 0.05-0.2.
 - **`GRAPH.ADDNODE`/`GRAPH.ADDEDGE` no longer corrupt integer-like string properties that overflow `i64` (moon#724).**
 
   `parse_property_value` coerced any bulk string that parsed as `i64` or `f64` into a number. A
