@@ -26,6 +26,8 @@ use moon::shard::Shard;
 use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
 use tokio::net::TcpListener;
 
+mod common;
+
 // ---------------------------------------------------------------------------
 // Harness — mirror of `tests/txn_graph_wiring.rs::start_txn_server`.
 // Duplicated per plan directive (no shared non-lib test helpers in Rust).
@@ -240,7 +242,9 @@ async fn start_moon_sharded(num_shards: usize) -> (u16, CancellationToken) {
         }
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    common::await_listening(port, std::time::Duration::from_secs(30))
+        .await
+        .expect("in-process server never started listening");
     (port, token)
 }
 

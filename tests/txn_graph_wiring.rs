@@ -40,6 +40,8 @@ use moon::shard::Shard;
 use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
 use tokio::net::TcpListener;
 
+mod common;
+
 // ---------------------------------------------------------------------------
 // Test server infrastructure (copy of txn_kv_wiring::start_txn_server;
 // txn_kv_wiring keeps it file-local so we duplicate per test file rather
@@ -269,7 +271,9 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
         }
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    common::await_listening(port, std::time::Duration::from_secs(30))
+        .await
+        .expect("in-process server never started listening");
     (port, token)
 }
 
