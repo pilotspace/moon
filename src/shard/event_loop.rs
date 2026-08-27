@@ -1064,10 +1064,53 @@ impl super::Shard {
             // first poll the flag must already read true, or a command arriving
             // in that window would be served against indexes not yet rebuilt.
             let loading_guard = crate::shard::loading::LoadingGuard::acquire();
+
+            // moon#743: `persist_dir` is assigned HERE, synchronously, and NOT
+            // inside the spawned task.
+            //
+            // `save_index_meta_sidecar` is a no-op while `persist_dir` is None,
+            // so a shard that ran `FT.CREATE` before the task's first poll
+            // created the index in memory, wrote no sidecar, and still acked
+            // `+OK`. On the next restart that shard had no index metadata, so
+            // recovery skipped the HASH rescan and its documents never re-entered
+            // the index -- permanently.
+            //
+            // The -LOADING gate cannot cover that window: `is_loading()` is a
+            // thread-local read on the *connection's* shard, while FT.CREATE fans
+            // out to every shard via `broadcast_vector_command`. Assigning the dir
+            // before the shard can serve anything removes the window instead of
+            // trying to police it. It costs one `create_dir_all` at startup.
+            let vector_persist_dir =
+                vector_persist_dir_for(&server_config, persistence_dir.as_deref(), shard_id);
+            if let Some(ref vdir) = vector_persist_dir {
+                // Not fatal: a shard that cannot create its index directory can
+                // still serve the keyspace, and an operator who never uses
+                // FT.* should not lose the whole server to it. But it must not
+                // be SILENT -- the pre-moon#743 code discarded this error with
+                // `let _ =`, and a failure here means every later
+                // `save_index_meta_sidecar` writes into a directory that does
+                // not exist. `persist_dir` is still installed on purpose: the
+                // save path warns per failed write, which is far louder than
+                // the no-op an unset `persist_dir` would silently produce.
+                if let Err(e) = std::fs::create_dir_all(vdir) {
+                    tracing::warn!(
+                        "Shard {}: cannot create vector index directory {}: {} \
+                         -- index definitions will not survive a restart on \
+                         this shard (moon#743)",
+                        shard_id,
+                        vdir.display(),
+                        e
+                    );
+                }
+                crate::shard::slice::with_shard(|s| {
+                    s.vector_store.set_persist_dir(vdir.clone());
+                    s.text_store.set_persist_dir(vdir.clone());
+                });
+            }
+
             <Spawner as crate::runtime::traits::RuntimeSpawn>::spawn_local(recover_indexes_task(
                 shard_id,
-                server_config.clone(),
-                persistence_dir.clone(),
+                vector_persist_dir,
                 shard_databases.clone(),
                 recovered_warm_segments,
                 loading_guard,
@@ -2613,18 +2656,18 @@ use crate::runtime::TokioSpawner as Spawner;
 /// Everything here reaches shard state through `with_shard`, which is
 /// thread-local, so the task MUST stay on this thread: it is spawned with
 /// `spawn_local`, never `spawn`.
-#[allow(clippy::too_many_lines)]
-async fn recover_indexes_task(
+/// Where this shard keeps its vector/text index sidecars, if anywhere.
+///
+/// Split out of `recover_indexes_task` for moon#743: the caller needs the same
+/// answer *before* spawning that task, so the stores can be given their persist
+/// dir before the shard serves its first command. One definition, two callers --
+/// a second copy of this branch is exactly how the two could drift apart.
+fn vector_persist_dir_for(
+    server_config: &crate::config::ServerConfig,
+    persistence_dir: Option<&str>,
     shard_id: usize,
-    server_config: std::sync::Arc<crate::config::ServerConfig>,
-    persistence_dir: Option<String>,
-    shard_databases: std::sync::Arc<ShardDatabases>,
-    recovered_warm_segments: Vec<(u64, std::path::PathBuf)>,
-    // Dropped when this task ends -- by return, panic, or being dropped
-    // un-polled at shutdown -- which is what clears the -LOADING state.
-    _loading_guard: crate::shard::loading::LoadingGuard,
-) {
-    let vector_persist_dir = if server_config.disk_offload_enabled() {
+) -> Option<std::path::PathBuf> {
+    if server_config.disk_offload_enabled() {
         Some(
             server_config
                 .effective_disk_offload_dir()
@@ -2632,25 +2675,45 @@ async fn recover_indexes_task(
         )
     } else {
         persistence_dir
-            .as_ref()
             .map(|d| std::path::PathBuf::from(d).join(format!("shard-{}-vectors", shard_id)))
-    };
-
-    if let Some(ref vdir) = vector_persist_dir {
-        let _ = std::fs::create_dir_all(vdir);
-        crate::shard::slice::with_shard(|s| {
-            s.vector_store.set_persist_dir(vdir.clone());
-            s.text_store.set_persist_dir(vdir.clone());
-        });
     }
+}
 
+#[allow(clippy::too_many_lines)]
+async fn recover_indexes_task(
+    shard_id: usize,
+    // Resolved by `vector_persist_dir_for` and already installed on both stores
+    // by the caller (moon#743) -- passed in, never recomputed here.
+    vector_persist_dir: Option<std::path::PathBuf>,
+    shard_databases: std::sync::Arc<ShardDatabases>,
+    recovered_warm_segments: Vec<(u64, std::path::PathBuf)>,
+    // Dropped when this task ends -- by return, panic, or being dropped
+    // un-polled at shutdown -- which is what clears the -LOADING state.
+    _loading_guard: crate::shard::loading::LoadingGuard,
+) {
     // Try loading saved index metadata (with compaction weights) from the vector persist dir.
     // W3-deep: load_index_metadata_with_weights returns (IndexMeta, f32) pairs so that
     // persisted COMPACTION_WEIGHT values are restored into VectorIndex on startup.
     let metas = vector_persist_dir.as_ref().and_then(|vdir| {
         match crate::vector::index_persist::load_index_metadata_with_weights(vdir) {
             Ok(m) if !m.is_empty() => Some(m),
-            _ => None,
+            // An empty sidecar is the ordinary first-boot state -- silence is
+            // correct. A read FAILURE is not: it costs this shard every index it
+            // had, skips the rescan below, and (moon#743) drops its documents out
+            // of the index for the life of the process. That must not be silent.
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(
+                    "Shard {}: could not read vector index metadata from {}: {} \
+                     -- this shard will answer searches with NO vector indexes \
+                     and its documents will be missing from every index until \
+                     they are re-created (moon#743)",
+                    shard_id,
+                    vdir.display(),
+                    e
+                );
+                None
+            }
         }
     });
 
@@ -2658,7 +2721,19 @@ async fn recover_indexes_task(
     let text_metas = vector_persist_dir.as_ref().and_then(|vdir| {
         match crate::text::index_persist::load_text_index_metadata(vdir) {
             Ok(m) if !m.is_empty() => Some(m),
-            _ => None,
+            // See the vector arm above: empty is normal, a read error is not.
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(
+                    "Shard {}: could not read text index metadata from {}: {} \
+                     -- this shard will answer searches with NO text indexes \
+                     (moon#743)",
+                    shard_id,
+                    vdir.display(),
+                    e
+                );
+                None
+            }
         }
     });
 

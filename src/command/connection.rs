@@ -482,7 +482,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         0
     };
     sections.push_str(&format!(
-        "loading:0\r\n\
+        "loading:{}\r\n\
          rdb_changes_since_last_save:{}\r\n\
          rdb_bgsave_in_progress:{}\r\n\
          rdb_last_save_time:{}\r\n\
@@ -504,6 +504,10 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          spill_failed_reinserted:{}\r\n\
          spill_completion_superseded:{}\r\n\
          spill_last_heartbeat_ms:{}\r\n",
+        // moon#744: was a hardcoded `loading:0`. `any_shard_loading()` is a
+        // process-wide counter precisely so INFO can answer this from a thread
+        // that is not the recovering shard's -- nothing had ever read it.
+        u8::from(crate::shard::loading::any_shard_loading()),
         // Keyspace mutations since the last COMPLETED save — the "is a save
         // worth doing" signal a backup script reads. A failed save does not
         // reset it: the dataset is still unpersisted.
@@ -1432,6 +1436,45 @@ pub fn hello(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// moon#744: `INFO persistence` reported a hardcoded `loading:0`.
+    ///
+    /// `shard::loading::any_shard_loading()` exists for exactly this -- its own
+    /// doc says the process-wide counter "exists only so `INFO` can answer 'is
+    /// anything still loading?' from any thread" -- but nothing ever read it,
+    /// so an operator watching a restart saw `loading:0` while shards were
+    /// still rebuilding their vector and text indexes. That is the signal a
+    /// client is supposed to poll before trusting a search result, and it was
+    /// a constant. Redis sets `loading:1` while the dataset is being read from
+    /// disk, so this is parity as well as diagnosability.
+    #[test]
+    fn info_persistence_reports_loading_while_a_shard_rebuilds_indexes_moon744() {
+        fn loading_line(db: &Database) -> String {
+            let Frame::BulkString(b) = info(db, &[]) else {
+                panic!("expected bulk string");
+            };
+            String::from_utf8_lossy(&b)
+                .lines()
+                .find(|l| l.starts_with("loading:"))
+                .unwrap_or("<absent>")
+                .to_string()
+        }
+
+        let db = Database::new();
+        assert_eq!(loading_line(&db), "loading:0", "idle server is not loading");
+
+        // The guard is what a recovering shard holds; INFO must see it even
+        // though it is answered from a different thread than the shard's.
+        let guard = crate::shard::loading::LoadingGuard::acquire();
+        assert_eq!(loading_line(&db), "loading:1");
+        drop(guard);
+
+        assert_eq!(
+            loading_line(&db),
+            "loading:0",
+            "the flag must clear when recovery ends"
+        );
+    }
 
     #[test]
     fn info_with_keyspace_lists_every_nonempty_db() {
