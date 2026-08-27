@@ -108,6 +108,13 @@ fn fatal_bind_failure_does_not_exit_zero() {
 /// still exit 0. Without this, "make bind failures non-zero" could be
 /// satisfied by making *everything* non-zero, which would break every
 /// supervisor and the SIGTERM contract in `tests/sigterm_shutdown.rs`.
+///
+/// Unix only — there is no SIGTERM and no `kill` on Windows, which is why
+/// `tests/sigterm_shutdown.rs` carries a file-level `#![cfg(unix)]`. The gate is
+/// on this test alone rather than the file: the bind-failure case above is
+/// platform-independent and a Windows service reading a failed start as success
+/// is just as wrong as a systemd unit doing so, so it must keep running there.
+#[cfg(unix)]
 #[test]
 fn clean_shutdown_still_exits_zero() {
     let dir = tempfile::tempdir().expect("tempdir");
