@@ -26,6 +26,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does.
 
   The Cypher path was never affected — it is fed by the grammar, which already knows the type.
+- **`FT.INFO` reported `Unknown Index name` for an index that exists, whenever any single shard
+  had lost its registration (moon#745).**
+
+  `merge_ft_info_responses` propagated the first `Frame::Error` it saw from any shard. A shard
+  that holds none of an index's documents can lose its registration without changing the search
+  result at all, so `FT._LIST` (answered from the connection's own shard) listed the index,
+  `FT.SEARCH` returned every document correctly, and `FT.INFO` said the index did not exist —
+  on the same connection, to the same instance. The mirror case was equally wrong: an error from
+  the *local* shard was returned even when remotes had the index, making the answer depend on
+  which shard happened to accept the connection.
+
+  `Unknown Index name` from a strict subset of shards is now treated as a coverage gap rather
+  than an error: the merge answers from the first shard that has the index and reports the gap
+  as `shards_missing_index`, emitted only when non-zero so a healthy cluster's reply shape is
+  unchanged (and so single-shard `FT.INFO`, which never reaches the merge, does not differ).
+  When *every* shard reports it the index really is absent and the error is returned. Any other
+  error stays fail-loud, including alongside a missing shard.
+
+- **`INFO persistence` reported a hardcoded `loading:0` while shards were still rebuilding their
+  indexes (moon#744).**
+
+  `shard::loading::any_shard_loading()` exists for exactly this — its own doc says the
+  process-wide counter "exists only so `INFO` can answer 'is anything still loading?' from any
+  thread" — but nothing ever read it. An operator (or client) polling `loading:` during a
+  restart was reading a constant. Redis sets `loading:1` while the dataset is being read from
+  disk, so this is parity as well as diagnosability. Verified end-to-end: a 4-shard server with
+  30k vector documents now reports `loading:1` through index recovery, then `loading:0`.
+
+  `tests/ft_search_star_vector_only_695.rs` now gates its post-restart assertion on that flag
+  instead of on `DBSIZE` alone. The old gate proved the keyspace recovered, not the index —
+  moon#743's permanently-broken instances all reported a full `DBSIZE` while the index was
+  missing documents forever, which is why a durability bug reached us disguised as an
+  intermittent test failure. That assertion also gained the `as_err()` guard its pre-restart
+  counterpart already had, so a refused query reads as a refused query instead of dying inside
+  `Resp::total()`.
+
 - **`FT.CREATE` acked `+OK` before every shard had persisted the index definition, so a restart
   permanently lost part of the index (moon#743).**
 

@@ -89,10 +89,10 @@ fn create_index_asap(port: u16) -> String {
             s.set_read_timeout(Some(Duration::from_secs(5))).ok();
             if s.write_all(b"PING\r\n").is_ok() {
                 let mut buf = [0u8; 64];
-                if let Ok(n) = s.read(&mut buf) {
-                    if buf[..n].starts_with(b"+PONG") {
-                        break s;
-                    }
+                if let Ok(n) = s.read(&mut buf)
+                    && buf[..n].starts_with(b"+PONG")
+                {
+                    break s;
                 }
             }
         }
@@ -139,15 +139,24 @@ fn ft_create_ack_means_every_shard_persisted_the_definition() {
             "round {round}: FT.CREATE did not succeed: {reply:?}"
         );
 
-        // The ack is the contract. Still, sleep past any plausible async flush
-        // before failing the build, so a slow-but-eventually-durable write is
-        // reported as what it is rather than as a lost one.
-        std::thread::sleep(Duration::from_secs(1));
-
+        // Checked at ACK TIME, with no settling delay: "+OK means durable" is
+        // the entire contract, and sleeping first would let a build that
+        // persists shortly *after* the ack pass a test written to forbid
+        // exactly that.
         let found = shards_with_sidecar(&dir);
         if found.len() != SHARDS {
+            // Only now, and only to classify a failure that has already been
+            // decided: a shard that persists a second late is a different bug
+            // from one that never persists, and the message should say which.
+            std::thread::sleep(Duration::from_secs(1));
+            let late = shards_with_sidecar(&dir);
+            let verdict = if late.len() == SHARDS {
+                "persisted late -- durable, but AFTER the ack".to_string()
+            } else {
+                format!("still only {}/{SHARDS} a second later", late.len())
+            };
             incomplete.push(format!(
-                "round {round}: {}/{SHARDS} shards persisted the index ({found:?})",
+                "round {round}: {}/{SHARDS} shards persisted at ack ({found:?}); {verdict}",
                 found.len()
             ));
         }

@@ -287,7 +287,12 @@ pub fn ft_info(
 /// (kernel M4, task #50 -- FT.INFO term-dict sidecar recovery coverage).
 ///
 /// Any `Frame::Error` (local or remote) is propagated unchanged (fail-loud,
-/// same semantics as `scatter_invalidate_range`).
+/// same semantics as `scatter_invalidate_range`) -- with one exception.
+/// `Unknown Index name` from a strict SUBSET of shards is NOT an error but a
+/// coverage gap: those shards hold no partition of an index the others do have
+/// (moon#745). It is merged over, and reported as the additive
+/// `shards_missing_index` counter, which is emitted only when non-zero. When
+/// EVERY shard reports it, the index really is absent and it is returned.
 pub fn merge_ft_info_responses(local: Frame, remotes: &[Frame]) -> Frame {
     const ADDITIVE_TOP: &[&[u8]] = &[
         b"num_docs",
@@ -306,15 +311,42 @@ pub fn merge_ft_info_responses(local: Frame, remotes: &[Frame]) -> Frame {
     ];
     const ADDITIVE_FIELD: &[&[u8]] = &[b"num_docs", b"mutable_vectors", b"immutable_segments"];
 
-    if matches!(local, Frame::Error(_)) {
-        return local;
+    // moon#745: `Unknown Index name` from SOME shards is not the cluster's
+    // answer -- it means those shards hold no partition of an index the others
+    // do have. Returning it verbatim told an operator the index did not exist
+    // while `FT._LIST` (answered from the connection's own shard) listed it,
+    // and in the observed case while `FT.SEARCH` was returning every document
+    // correctly: a shard holding none of the documents can lose its
+    // registration without changing the search result at all.
+    //
+    // Every OTHER error stays fail-loud, and a genuinely absent index -- every
+    // shard says unknown -- still reports unknown.
+    const UNKNOWN_INDEX: &[u8] = b"Unknown Index name";
+    fn is_unknown_index(f: &Frame) -> bool {
+        matches!(f, Frame::Error(e) if e.as_ref() == UNKNOWN_INDEX)
     }
-    if let Some(err) = remotes.iter().find(|r| matches!(r, Frame::Error(_))) {
+    let all = || std::iter::once(&local).chain(remotes.iter());
+
+    if let Some(err) = all().find(|r| matches!(r, Frame::Error(_)) && !is_unknown_index(r)) {
         return err.clone();
     }
-    let mut items: Vec<Frame> = match &local {
+    let missing = all().filter(|r| is_unknown_index(r)).count();
+    if missing == remotes.len() + 1 {
+        return Frame::Error(Bytes::from_static(UNKNOWN_INDEX));
+    }
+
+    // Whichever shard answered first is the config template -- the fields it
+    // supplies are identical on every shard by FT.CREATE-broadcast
+    // construction. Taking `local` unconditionally is what made the answer
+    // depend on which shard happened to accept the connection.
+    let mut present: Vec<&Frame> = all().filter(|r| !matches!(r, Frame::Error(_))).collect();
+    if present.is_empty() {
+        return Frame::Error(Bytes::from_static(UNKNOWN_INDEX));
+    }
+    let template = present.remove(0);
+    let mut items: Vec<Frame> = match template {
         Frame::Array(a) => a.to_vec(),
-        _ => return local,
+        _ => return template.clone(),
     };
 
     // Value-index of `key` in an alternating key/value frame list.
@@ -350,7 +382,7 @@ pub fn merge_ft_info_responses(local: Frame, remotes: &[Frame]) -> Frame {
         None
     }
 
-    for remote in remotes {
+    for remote in present {
         let r_items: &[Frame] = match remote {
             Frame::Array(a) => a,
             _ => continue,
@@ -400,6 +432,18 @@ pub fn merge_ft_info_responses(local: Frame, remotes: &[Frame]) -> Frame {
             }
             items[li] = Frame::Array(local_entries.into());
         }
+    }
+
+    // Reported ONLY when non-zero: its absence is what a healthy cluster looks
+    // like, and single-shard FT.INFO never reaches this merge at all, so an
+    // always-present counter would differ between 1 and N shards for no reason.
+    // Present and non-zero means some shard lost its registration for this
+    // index -- its documents are missing from every answer (moon#743).
+    if missing > 0 {
+        items.push(Frame::BulkString(Bytes::from_static(
+            b"shards_missing_index",
+        )));
+        items.push(Frame::Integer(missing as i64));
     }
 
     Frame::Array(items.into())
@@ -628,6 +672,94 @@ mod merge_tests {
         let remotes = [Frame::Error(Bytes::from_static(b"ERR boom"))];
         let merged = merge_ft_info_responses(local, &remotes);
         assert!(matches!(merged, Frame::Error(_)));
+    }
+
+    /// moon#745: one shard not knowing the index is not the cluster's answer.
+    ///
+    /// Observed after a multi-shard restart: `FT._LIST` (answered from the
+    /// connection's own shard) listed `vidx` while `FT.INFO vidx` said
+    /// `Unknown Index name` -- on the same connection, to the same instance,
+    /// and in one case while `FT.SEARCH` was returning every document
+    /// correctly. A shard holding none of the documents can lose its
+    /// registration without changing the search result at all, so the two
+    /// introspection commands an operator has contradicted each other while
+    /// nothing looked wrong.
+    #[test]
+    fn remote_missing_index_does_not_erase_a_present_index_moon745() {
+        let local = info_frame(10, 10, 4, 1);
+        let remotes = [
+            info_frame(5, 5, 2, 1),
+            Frame::Error(Bytes::from_static(b"Unknown Index name")),
+        ];
+        let merged = merge_ft_info_responses(local, &remotes);
+        assert!(
+            !matches!(merged, Frame::Error(_)),
+            "an index two shards DO have must not report as nonexistent"
+        );
+        assert_eq!(get_int(&merged, b"num_docs"), 15);
+        assert_eq!(
+            get_int(&merged, b"shards_missing_index"),
+            1,
+            "the anomaly must still be reported, not silently smoothed over"
+        );
+    }
+
+    /// The mirror image: the connection's OWN shard is the one missing the
+    /// index. Answering from a remote is what makes FT.INFO independent of
+    /// which shard happened to accept the connection.
+    #[test]
+    fn local_missing_index_still_answers_from_a_remote_moon745() {
+        let local = Frame::Error(Bytes::from_static(b"Unknown Index name"));
+        let remotes = [info_frame(10, 10, 4, 1), info_frame(5, 5, 2, 1)];
+        let merged = merge_ft_info_responses(local, &remotes);
+        assert!(!matches!(merged, Frame::Error(_)));
+        assert_eq!(get_int(&merged, b"num_docs"), 15);
+        assert_eq!(get_int(&merged, b"shards_missing_index"), 1);
+    }
+
+    /// An index that genuinely does not exist must still say so.
+    #[test]
+    fn index_absent_everywhere_still_reports_unknown_moon745() {
+        let unknown = || Frame::Error(Bytes::from_static(b"Unknown Index name"));
+        let merged = merge_ft_info_responses(unknown(), &[unknown(), unknown()]);
+        match merged {
+            Frame::Error(e) => assert_eq!(e.as_ref(), b"Unknown Index name"),
+            other => panic!("expected Unknown Index name, got {other:?}"),
+        }
+    }
+
+    /// Tolerating `Unknown Index name` must not tolerate anything else: a
+    /// real fault (closed channel, malformed reply) stays fail-loud, including
+    /// when it arrives alongside a shard that DOES have the index.
+    #[test]
+    fn a_real_error_still_propagates_past_a_missing_shard_moon745() {
+        let local = info_frame(10, 10, 4, 1);
+        let remotes = [
+            Frame::Error(Bytes::from_static(b"Unknown Index name")),
+            Frame::Error(Bytes::from_static(b"ERR boom")),
+        ];
+        match merge_ft_info_responses(local, &remotes) {
+            Frame::Error(e) => assert_eq!(e.as_ref(), b"ERR boom"),
+            other => panic!("expected the real error to win, got {other:?}"),
+        }
+    }
+
+    /// A healthy cluster must not grow a new field: `shards_missing_index` is
+    /// an anomaly flag, and its ABSENCE is what "every shard has it" looks
+    /// like. Single-shard FT.INFO never goes through the merge at all, so an
+    /// always-present counter would also differ between 1 and N shards.
+    #[test]
+    fn healthy_merge_reports_no_missing_shard_field_moon745() {
+        let merged = merge_ft_info_responses(info_frame(10, 10, 4, 1), &[info_frame(5, 5, 2, 1)]);
+        let Frame::Array(items) = &merged else {
+            panic!("expected an array");
+        };
+        assert!(
+            !items.iter().any(
+                |f| matches!(f, Frame::BulkString(k) if k.as_ref() == b"shards_missing_index")
+            ),
+            "healthy cluster must not carry the anomaly counter"
+        );
     }
 
     #[test]

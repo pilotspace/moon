@@ -1083,7 +1083,25 @@ impl super::Shard {
             let vector_persist_dir =
                 vector_persist_dir_for(&server_config, persistence_dir.as_deref(), shard_id);
             if let Some(ref vdir) = vector_persist_dir {
-                let _ = std::fs::create_dir_all(vdir);
+                // Not fatal: a shard that cannot create its index directory can
+                // still serve the keyspace, and an operator who never uses
+                // FT.* should not lose the whole server to it. But it must not
+                // be SILENT -- the pre-moon#743 code discarded this error with
+                // `let _ =`, and a failure here means every later
+                // `save_index_meta_sidecar` writes into a directory that does
+                // not exist. `persist_dir` is still installed on purpose: the
+                // save path warns per failed write, which is far louder than
+                // the no-op an unset `persist_dir` would silently produce.
+                if let Err(e) = std::fs::create_dir_all(vdir) {
+                    tracing::warn!(
+                        "Shard {}: cannot create vector index directory {}: {} \
+                         -- index definitions will not survive a restart on \
+                         this shard (moon#743)",
+                        shard_id,
+                        vdir.display(),
+                        e
+                    );
+                }
                 crate::shard::slice::with_shard(|s| {
                     s.vector_store.set_persist_dir(vdir.clone());
                     s.text_store.set_persist_dir(vdir.clone());

@@ -517,18 +517,52 @@ fn run_all(shards: usize) {
     await_ready(port);
     let mut c = Conn::open(port);
 
-    // Recovery re-indexes asynchronously; wait for the documents themselves
-    // before judging the enumeration, so a slow reload cannot read as data loss.
+    // Recovery re-indexes asynchronously, so this has to wait for readiness
+    // before judging the enumeration -- but on the INDEX, not the keyspace.
+    //
+    // moon#744: this used to spin on `DBSIZE` alone, with a comment claiming it
+    // waited "for the documents themselves ... so a slow reload cannot read as
+    // data loss". moon#743 showed `DBSIZE` does not carry that meaning: every
+    // permanently-broken instance measured there reported the full `DBSIZE`
+    // while `FT.SEARCH vidx "*"` was stuck at a fraction of the documents
+    // forever. The gate proved the keyspace recovered, not the index -- which
+    // is why a durability bug reached us disguised as an intermittent test
+    // failure.
+    //
+    // `INFO persistence`'s `loading:` flag is the index-side signal (it is held
+    // for exactly as long as a shard is rebuilding its indexes, and is
+    // process-wide so it covers shards other than this connection's). `DBSIZE`
+    // stays as the second half: together they say the keyspace is back AND no
+    // shard is still rebuilding, which is the precondition the assertion needs.
     let deadline = Instant::now() + Duration::from_secs(30);
-    while c.cmd(&[b"DBSIZE"]) != Resp::Int((DOCS - 1 + CONTROL_DOCS) as i64) {
+    loop {
+        let loading = match c.cmd(&[b"INFO", b"persistence"]) {
+            Resp::Bulk(b) => String::from_utf8_lossy(&b).contains("loading:1"),
+            other => panic!("shards={shards}: INFO persistence is not a bulk string: {other:?}"),
+        };
+        let keyspace_back = c.cmd(&[b"DBSIZE"]) == Resp::Int((DOCS - 1 + CONTROL_DOCS) as i64);
+        if !loading && keyspace_back {
+            break;
+        }
         assert!(
             Instant::now() < deadline,
-            "shards={shards}: the keyspace never came back after restart, so the \
-             enumeration assertion below would prove nothing"
+            "shards={shards}: after 30s the server still reports loading={loading} / \
+             keyspace_recovered={keyspace_back}, so the enumeration assertion below \
+             would prove nothing"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
     let after = c.cmd(&[b"FT.SEARCH", b"vidx", b"*"]);
+    // moon#744: guarded like the pre-restart assertion at the top of this
+    // function. Without it an error reply died inside `Resp::total()` as
+    // `expected an Array reply, got Err(...)`, which reads as a harness bug
+    // rather than as the server refusing the query.
+    assert!(
+        after.as_err().is_none(),
+        "shards={shards}: `*` was refused after a restart. The index is either \
+         missing from some shard (moon#743) or resolving against the wrong one: \
+         {after:?}"
+    );
     assert_eq!(
         after.total(),
         DOCS as i64 - 1,
