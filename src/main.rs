@@ -1963,11 +1963,29 @@ fn main() -> anyhow::Result<()> {
             .expect("failed to spawn cluster control-plane thread");
     }
 
+    // A fatal listener failure must reach the exit code, not just the log.
+    //
+    // `run_sharded` returns `Ok(())` when the listener stops because shutdown was
+    // requested, and `Err` when it could not serve at all (a bind that failed, a
+    // setup error). Both used to land in the same `tracing::error!` and then fall
+    // through to `Ok(())`, so a server that never bound a port exited 0 — the
+    // same observable as a clean `SIGTERM` stop. systemd `Restart=on-failure`
+    // never restarts it, and moon#751 spent its investigation hunting a phantom
+    // signal sender because exit 0 was read as proof the graceful path had been
+    // *asked* to run. Record the failure here and return it after the ordinary
+    // shutdown sequence has flushed and joined everything.
+    //
+    // The slot is shared because the listener runs inside a `block_on_local`
+    // closure that cannot return a value to `main`.
+    let listener_failure: std::sync::Arc<parking_lot::Mutex<Option<String>>> =
+        std::sync::Arc::new(parking_lot::Mutex::new(None));
+
     // Run the sharded listener on the main thread.
     // Under tokio: uses current_thread runtime with tokio::spawn for background tasks.
     // Under monoio: uses monoio RuntimeFactory (auto-save on its own thread).
     #[cfg(feature = "runtime-tokio")]
     {
+        let listener_failure = listener_failure.clone();
         let listener_rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2020,12 +2038,14 @@ fn main() -> anyhow::Result<()> {
             .await
             {
                 tracing::error!("Listener error: {}", e);
+                *listener_failure.lock() = Some(e.to_string());
             }
         });
     }
 
     #[cfg(feature = "runtime-monoio")]
     {
+        let listener_failure = listener_failure.clone();
         // Auto-save runs on a dedicated thread (same pattern as AOF writer).
         if config.save.is_some() {
             let rules = moon::persistence::auto_save::parse_save_rules(&config.save);
@@ -2075,6 +2095,7 @@ fn main() -> anyhow::Result<()> {
             .await
             {
                 tracing::error!("Listener error: {}", e);
+                *listener_failure.lock() = Some(e.to_string());
             }
         });
     }
@@ -2093,6 +2114,13 @@ fn main() -> anyhow::Result<()> {
         if let Err(e) = handle.join() {
             tracing::error!("shard thread panicked during shutdown: {e:?}");
         }
+    }
+
+    if let Some(err) = listener_failure.lock().take() {
+        // Shutdown ran to completion above (AOF flushed, shards joined), so the
+        // data path is clean; only the exit STATUS changes.
+        tracing::error!("Server shut down after a fatal listener failure: {err}");
+        return Err(anyhow::anyhow!("listener failed: {err}"));
     }
 
     info!("Server shut down");

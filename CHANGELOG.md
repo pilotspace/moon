@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A server that failed to bind its port exited 0 (moon#751).**
+
+  `main()` logged a fatal listener failure and then fell through to the ordinary
+  shutdown sequence and `Ok(())`:
+
+  ```rust
+  if let Err(e) = server::listener::run_sharded(...).await {
+      tracing::error!("Listener error: {}", e);   // logged, not propagated
+  }
+  ...
+  info!("Server shut down");
+  Ok(())                                          // <- exit 0, always
+  ```
+
+  So a server that never accepted a single connection produced exactly the same observable
+  as a clean `SIGTERM` stop: shard-shutdown lines, `Server shut down`, exit 0. Under systemd
+  `Restart=on-failure` it is never restarted; an orchestrator records a successful run; a
+  test readiness probe sees a graceful shutdown. Reproducible in one command — `moon --bind
+  203.0.113.7` (an unroutable TEST-NET-3 address) logged `Listener error: Can't assign
+  requested address` and exited 0.
+
+  A fatal listener failure is now recorded and returned after the shutdown sequence has run,
+  so the exit status is non-zero while the data path still flushes and joins exactly as
+  before. Only the reported status changes: this path was already terminating the process.
+  A clean `SIGTERM` shutdown still exits 0, which `tests/listener_bind_failure_exit_code.rs`
+  pins alongside the failure case — "make bind failures non-zero" must not become "make
+  everything non-zero".
+
+  This is what moon#751 was really looking at. That issue observed a test server shutting
+  down gracefully during startup and reasoned that exit 0 proved the process had been *asked*
+  to stop, which sent the investigation hunting a phantom `SIGTERM` sender. The inference did
+  not hold. The two cases are now distinguishable by exit code, and the readiness failure
+  message in `tests/sigterm_shutdown.rs` says which log line to look for in each case.
 - **`FT.CACHESEARCH` and `FT.SEARCH ... RANGE` were inverted on `COSINE` / `IP` indexes
   (moon#748).**
 
