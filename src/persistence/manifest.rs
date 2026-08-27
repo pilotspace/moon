@@ -292,32 +292,54 @@ pub struct ManifestRoot {
 /// process restart implies no in-flight readers holding old snapshot views.
 /// After the configured retention period both tombstone entries are
 /// physically removed from `active_root.entries` by `gc_tombstones`.
-/// Test-only injected delay inside [`ManifestIo::persist`], mirroring the
-/// `cold_read::TEST_INJECT_DELAY_MS` pattern: simulates a slow/contended
-/// device so tests can prove which thread pays for the sync.
+/// Test-only fault-injection and observation knobs for [`ManifestIo::persist`],
+/// scoped to **one** [`ShardManifest`].
+///
+/// These were three process-global statics. Rust runs a crate's unit tests
+/// concurrently in a single process, so a global that `persist()` reads is a
+/// channel between unrelated tests: while one test held the injected-error flag
+/// true, any other test's `commit()` failed with `"injected persist failure
+/// (test)"` — moon#750, observed once in `ci-local` as a failure of
+/// `test_overflow_compaction_bounds_growth`, a test that has nothing to do with
+/// fault injection. `TEST_AGENT_REGISTRY_LOCK` did not help: it serialises the
+/// tests that *set* the knobs against each other, while every test that merely
+/// commits a manifest is an unguarded *reader*.
+///
+/// Owning the knobs per-manifest removes the channel by construction, so a test
+/// added later cannot re-open the race by forgetting to take a lock.
+///
+/// The fields are `Arc<Atomic…>` rather than plain values because
+/// [`ShardManifest::enable_deferred_sync`] moves the [`ManifestIo`] onto the
+/// per-shard sync thread: the test still has to arm the knobs and read the
+/// count while the io lives over there. `ShardManifest` keeps a clone, so the
+/// handle stays valid across backend swaps.
 #[cfg(test)]
-pub(crate) static TEST_INJECT_SYNC_DELAY_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TestKnobs {
+    /// Injected delay inside `persist`, mirroring the
+    /// `cold_read::TEST_INJECT_DELAY_MS` pattern: simulates a slow/contended
+    /// device so tests can prove which thread pays for the sync.
+    pub(crate) sync_delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Count of `persist` executions on this manifest (for coalescing
+    /// assertions). Per-manifest, so it needs no before/after delta.
+    pub(crate) persist_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// When true, `persist` fails with an injected I/O error (simulating
+    /// ENOSPC/EIO on the manifest device) so the sync agent's failure latch
+    /// can be exercised.
+    pub(crate) inject_persist_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
 
-/// Test-only count of [`ManifestIo::persist`] executions (for coalescing
-/// assertions).
+/// Serializes tests that touch the **process-global** manifest-sync agent
+/// registry: `manifest_sync::AGENT_REGISTRY` and the `flush_all_agents()`
+/// barrier that walks it. A concurrently-registered agent from another test
+/// changes the registry length and can fail (or heal) the barrier, so any test
+/// asserting on either must hold this.
+///
+/// It deliberately does NOT cover fault injection any more — that is per
+/// manifest now (see [`TestKnobs`]). A lock only helps when every participant
+/// takes it, and the readers here (`commit()`) never did.
 #[cfg(test)]
-pub(crate) static TEST_PERSIST_COUNT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Test-only: make [`ManifestIo::persist`] fail with an injected I/O error
-/// (simulates ENOSPC/EIO on the manifest device) so the sync agent's
-/// failure latch can be exercised.
-#[cfg(test)]
-pub(crate) static TEST_INJECT_PERSIST_ERROR: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Serializes tests that use the injected sync delay / persist counter —
-/// `cargo test`'s default parallelism otherwise lets one test's injected
-/// delay leak into an unrelated concurrently-running test (same pattern as
-/// `cold_read::TEST_DELAY_LOCK`).
-#[cfg(test)]
-pub(crate) static TEST_SYNC_KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static TEST_AGENT_REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The file-I/O half of the manifest: the handle, the dual-slot alternation
 /// state, and the reopen bookkeeping that `persist`/`compact` maintain.
@@ -347,6 +369,10 @@ pub(crate) struct ManifestIo {
     /// recovery path without needing real fd/permission failures.
     #[cfg(test)]
     fail_compact_reopen: bool,
+    /// Test-only fault-injection/observation knobs, shared with the owning
+    /// [`ShardManifest`] so they survive this io moving to the sync thread.
+    #[cfg(test)]
+    knobs: TestKnobs,
 }
 
 /// Where a [`ShardManifest`]'s file I/O runs.
@@ -378,6 +404,11 @@ pub struct ShardManifest {
     /// after the commit flip — we record the pre-commit value so age = current - tombstone_epoch).
     /// `tombstoned_at` is a monotonic `Instant` for wall-clock retention.
     tombstone_registry: HashMap<u64, (u64, Instant)>,
+    /// Test-only knob handles, shared with this manifest's [`ManifestIo`]. Held
+    /// here as well as there so a test can arm injection and read the persist
+    /// count after `enable_deferred_sync` has moved the io to the sync thread.
+    #[cfg(test)]
+    knobs: TestKnobs,
 }
 
 impl ShardManifest {
@@ -416,6 +447,8 @@ impl ShardManifest {
             crate::persistence::fsync::fsync_directory(parent)?;
         }
 
+        #[cfg(test)]
+        let knobs = TestKnobs::default();
         Ok(Self {
             io: IoBackend::Inline(ManifestIo {
                 file,
@@ -424,10 +457,14 @@ impl ShardManifest {
                 needs_reopen: false,
                 #[cfg(test)]
                 fail_compact_reopen: false,
+                #[cfg(test)]
+                knobs: knobs.clone(),
             }),
             path: path.to_path_buf(),
             active_root: root,
             tombstone_registry: HashMap::new(),
+            #[cfg(test)]
+            knobs,
         })
     }
 
@@ -490,6 +527,8 @@ impl ShardManifest {
             }
         }
 
+        #[cfg(test)]
+        let knobs = TestKnobs::default();
         Ok(Self {
             io: IoBackend::Inline(ManifestIo {
                 file,
@@ -498,10 +537,14 @@ impl ShardManifest {
                 needs_reopen: false,
                 #[cfg(test)]
                 fail_compact_reopen: false,
+                #[cfg(test)]
+                knobs: knobs.clone(),
             }),
             path: path.to_path_buf(),
             active_root,
             tombstone_registry,
+            #[cfg(test)]
+            knobs,
         })
     }
 
@@ -759,6 +802,35 @@ impl ShardManifest {
         }
     }
 
+    /// Test-only: arm/disarm this manifest's persist fault injection.
+    ///
+    /// Scoped to `self` (moon#750) — arming it here cannot fail another
+    /// manifest's commit, including one running concurrently in another test.
+    /// Works in both io backends: the knob handle is shared with the
+    /// [`ManifestIo`], wherever that currently lives.
+    #[cfg(test)]
+    pub(crate) fn set_inject_persist_error(&mut self, armed: bool) {
+        self.knobs
+            .inject_persist_error
+            .store(armed, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: set this manifest's injected per-persist delay, in ms.
+    #[cfg(test)]
+    pub(crate) fn set_inject_sync_delay_ms(&mut self, ms: u64) {
+        self.knobs
+            .sync_delay_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: how many times this manifest's io has run `persist`.
+    #[cfg(test)]
+    pub(crate) fn persist_count(&self) -> u64 {
+        self.knobs
+            .persist_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Test-only: whether the inline io is flagged for reattach.
     #[cfg(test)]
     pub(crate) fn needs_reopen(&self) -> bool {
@@ -935,12 +1007,21 @@ impl ManifestIo {
     pub(crate) fn persist(&mut self, mut root: ManifestRoot) -> std::io::Result<()> {
         #[cfg(test)]
         {
-            TEST_PERSIST_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let ms = TEST_INJECT_SYNC_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst);
+            self.knobs
+                .persist_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let ms = self
+                .knobs
+                .sync_delay_ms
+                .load(std::sync::atomic::Ordering::SeqCst);
             if ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
-            if TEST_INJECT_PERSIST_ERROR.load(std::sync::atomic::Ordering::SeqCst) {
+            if self
+                .knobs
+                .inject_persist_error
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 return Err(std::io::Error::other("injected persist failure (test)"));
             }
         }
@@ -1888,5 +1969,48 @@ mod tests {
         let m2 = ShardManifest::open(&path).unwrap();
         assert_eq!(m2.files()[0].status, FileStatus::Sealed);
         assert_eq!(m2.files()[0].tier, StorageTier::Warm);
+    }
+
+    /// moon#750: fault injection must not escape the manifest that armed it.
+    ///
+    /// `TEST_INJECT_PERSIST_ERROR` was a process-global static read inside
+    /// `ManifestIo::persist`, and `cargo test` runs unit tests concurrently in
+    /// one process. `TEST_SYNC_KNOB_LOCK` serialised the tests that *set* it
+    /// against each other, but every test that merely *commits* a manifest is a
+    /// reader that never takes the lock — so for the window in which the
+    /// injecting test held the flag true, an unrelated `commit()` failed with
+    /// "injected persist failure (test)". That is exactly the panic #750
+    /// recorded, in `test_overflow_compaction_bounds_growth`.
+    ///
+    /// This test makes that leak deterministic instead of load-dependent: the
+    /// flag is held true across the victim's commit, so pre-fix it fails every
+    /// run rather than 1-in-many.
+    #[test]
+    fn injected_persist_failure_is_scoped_to_the_manifest_that_armed_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut victim =
+            ShardManifest::create(&tmp.path().join("victim.manifest")).expect("create victim");
+        let mut injector =
+            ShardManifest::create(&tmp.path().join("injector.manifest")).expect("create injector");
+
+        injector.set_inject_persist_error(true);
+
+        // The victim shares nothing with the injector but the process.
+        victim.add_file(make_entry(1));
+        victim
+            .commit()
+            .expect("another manifest's injected failure must not fail this commit");
+
+        // Control: the knob is actually armed. Without this, deleting the
+        // injection entirely would satisfy the assertion above.
+        injector.add_file(make_entry(1));
+        assert!(
+            injector.commit().is_err(),
+            "the manifest that armed injection must still fail its own persist"
+        );
+
+        // Disarming is scoped too, and heals only the injector.
+        injector.set_inject_persist_error(false);
+        injector.commit().expect("disarmed injector must persist");
     }
 }

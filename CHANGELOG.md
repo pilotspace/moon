@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Test fault injection leaked between concurrently-running unit tests (moon#750).**
+
+  `ManifestIo::persist` read three process-global `#[cfg(test)]` statics — an injected
+  error flag, an injected delay, and a persist counter. Rust runs a crate's unit tests
+  concurrently in one process, so those statics were a channel between unrelated tests:
+  while the injecting test held the error flag true, any other test's `commit()` failed
+  with `injected persist failure (test)`. That is the panic moon#750 recorded, in
+  `test_overflow_compaction_bounds_growth` — a test that has nothing to do with fault
+  injection and never touches the flag.
+
+  `TEST_SYNC_KNOB_LOCK` did not prevent it and could not: it serialised the tests that
+  *set* the knobs against each other, while every test that merely commits a manifest is
+  an unguarded *reader*. A lock only helps when every participant takes it.
+
+  The knobs now live on the `ShardManifest` that armed them (`TestKnobs`, held as shared
+  handles so they survive `enable_deferred_sync` moving the io to the sync thread), so one
+  test's injection cannot reach another manifest — and a test added later cannot re-open
+  the race by forgetting a lock. The lock survives, renamed `TEST_AGENT_REGISTRY_LOCK`,
+  for the state that genuinely must stay global: the manifest-sync agent registry and the
+  `flush_all_agents()` barrier that walks it. `flush_all_agents_is_noop_when_idle` now
+  takes it too — it was asserting on global registry state without holding it, the same
+  unguarded-reader shape.
+
+  Also fixed a vacuous assertion this uncovered: the coalescing test bounded the persist
+  count only from above (`< 20`), so a counter that always read 0 would have passed it.
+
 - **A server that failed to bind its port exited 0 (moon#751).**
 
   `main()` logged a fatal listener failure and then fell through to the ordinary

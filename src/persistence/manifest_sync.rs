@@ -347,20 +347,20 @@ mod tests {
     #[test]
     fn deferred_commit_does_not_block_caller_and_reaches_disk() {
         #[allow(clippy::unwrap_used)] // test-only; poisoning would already be a failed test
-        let _knob = super::super::manifest::TEST_SYNC_KNOB_LOCK.lock().unwrap();
+        let _registry = super::super::manifest::TEST_AGENT_REGISTRY_LOCK
+            .lock()
+            .unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("shard-0.manifest");
         let mut m = ShardManifest::create(&path).expect("create");
         m.enable_deferred_sync(0);
 
-        super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
-            .store(200, std::sync::atomic::Ordering::SeqCst);
+        m.set_inject_sync_delay_ms(200);
         let t0 = Instant::now();
         m.add_file(make_entry(1));
         m.commit_deferred().expect("deferred commit send");
         let elapsed = t0.elapsed();
-        super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+        m.set_inject_sync_delay_ms(0);
         assert!(
             elapsed < Duration::from_millis(100),
             "deferred commit must not block the caller for the injected sync \
@@ -381,20 +381,20 @@ mod tests {
     #[test]
     fn flush_all_agents_forces_pending_deferred_commit_durable() {
         #[allow(clippy::unwrap_used)] // test-only; poisoning would already be a failed test
-        let _knob = super::super::manifest::TEST_SYNC_KNOB_LOCK.lock().unwrap();
+        let _registry = super::super::manifest::TEST_AGENT_REGISTRY_LOCK
+            .lock()
+            .unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("shard-9.manifest");
         let mut m = ShardManifest::create(&path).expect("create");
         m.enable_deferred_sync(9);
 
-        super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
-            .store(100, std::sync::atomic::Ordering::SeqCst);
+        m.set_inject_sync_delay_ms(100);
         m.add_file(make_entry(41));
         m.commit_deferred().expect("deferred send");
         // Barrier must block until the deferred snapshot (or newer) is durable.
         super::flush_all_agents().expect("flush barrier");
-        super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+        m.set_inject_sync_delay_ms(0);
 
         // No shutdown flush — the barrier alone must have persisted it.
         let reopened = ShardManifest::open(&path).expect("reopen");
@@ -407,28 +407,38 @@ mod tests {
     }
 
     /// The barrier must not hang (and must succeed) when agents are idle.
+    ///
+    /// Takes the registry lock: `flush_all_agents` walks the process-global
+    /// registry, so a concurrently-registered agent from another test — worse,
+    /// one with a latched persist failure — would fail this assertion. It is
+    /// the same unguarded-reader shape as moon#750, in the one piece of state
+    /// that genuinely has to stay global.
     #[test]
     fn flush_all_agents_is_noop_when_idle() {
+        #[allow(clippy::unwrap_used)] // test-only; poisoning would already be a failed test
+        let _registry = super::super::manifest::TEST_AGENT_REGISTRY_LOCK
+            .lock()
+            .unwrap();
         super::flush_all_agents().expect("idle barrier must succeed");
     }
 
     #[test]
     fn durable_commit_blocks_until_persisted() {
         #[allow(clippy::unwrap_used)] // test-only; poisoning would already be a failed test
-        let _knob = super::super::manifest::TEST_SYNC_KNOB_LOCK.lock().unwrap();
+        let _registry = super::super::manifest::TEST_AGENT_REGISTRY_LOCK
+            .lock()
+            .unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("shard-1.manifest");
         let mut m = ShardManifest::create(&path).expect("create");
         m.enable_deferred_sync(1);
 
-        super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
-            .store(150, std::sync::atomic::Ordering::SeqCst);
+        m.set_inject_sync_delay_ms(150);
         let t0 = Instant::now();
         m.add_file(make_entry(7));
         m.commit().expect("durable commit");
         let elapsed = t0.elapsed();
-        super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+        m.set_inject_sync_delay_ms(0);
         assert!(
             elapsed >= Duration::from_millis(150),
             "durable commit must wait for the persist (took {elapsed:?})"
@@ -444,20 +454,19 @@ mod tests {
     #[test]
     fn queued_deferred_commits_coalesce_to_fewer_persists() {
         #[allow(clippy::unwrap_used)] // test-only; poisoning would already be a failed test
-        let _knob = super::super::manifest::TEST_SYNC_KNOB_LOCK.lock().unwrap();
+        let _registry = super::super::manifest::TEST_AGENT_REGISTRY_LOCK
+            .lock()
+            .unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("shard-2.manifest");
         let mut m = ShardManifest::create(&path).expect("create");
         m.enable_deferred_sync(2);
 
-        let before =
-            super::super::manifest::TEST_PERSIST_COUNT.load(std::sync::atomic::Ordering::SeqCst);
         // Get the worker INSIDE a stalled persist before the burst, and keep
         // every persist stalled until after the shutdown flush — otherwise
         // scheduling can let the worker race the burst commit-by-commit and
         // weaken the coalescing bound into flakiness.
-        super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
-            .store(100, std::sync::atomic::Ordering::SeqCst);
+        m.set_inject_sync_delay_ms(100);
         m.add_file(make_entry(99));
         m.commit_deferred().expect("priming deferred send");
         std::thread::sleep(Duration::from_millis(50));
@@ -466,14 +475,17 @@ mod tests {
             m.commit_deferred().expect("deferred send");
         }
         m.shutdown_deferred();
-        super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
-            .store(0, std::sync::atomic::Ordering::SeqCst);
-        let persists = super::super::manifest::TEST_PERSIST_COUNT
-            .load(std::sync::atomic::Ordering::SeqCst)
-            - before;
+        m.set_inject_sync_delay_ms(0);
+        // Per-manifest counter (moon#750): it starts at 0 for this manifest and
+        // no other test's commits can inflate it, so no before/after delta.
+        let persists = m.persist_count();
+        // Lower bound too: a counter that always read 0 would satisfy
+        // `< 20` while proving nothing. The priming commit plus the shutdown
+        // flush guarantee at least one persist actually ran.
         assert!(
-            persists < 20,
-            "20 queued deferred commits must coalesce (saw {persists} persists)"
+            (1..20).contains(&persists),
+            "20 queued deferred commits must coalesce into fewer persists, and \
+             at least one persist must actually have run (saw {persists})"
         );
 
         drop(m);
@@ -493,7 +505,9 @@ mod tests {
     #[test]
     fn burst_of_deferred_commits_never_blocks_the_caller() {
         #[allow(clippy::unwrap_used)] // test-only; poisoning would already be a failed test
-        let _knob = super::super::manifest::TEST_SYNC_KNOB_LOCK.lock().unwrap();
+        let _registry = super::super::manifest::TEST_AGENT_REGISTRY_LOCK
+            .lock()
+            .unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("shard-4.manifest");
         let mut m = ShardManifest::create(&path).expect("create");
@@ -504,8 +518,7 @@ mod tests {
         // consumed as fast as it is sent, which is why a plain burst never
         // reproduced the block. Blocking needs commits to arrive while the
         // worker is stuck in persist with no one draining.
-        super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
-            .store(400, std::sync::atomic::Ordering::SeqCst);
+        m.set_inject_sync_delay_ms(400);
         m.add_file(make_entry(999));
         m.commit_deferred().expect("priming deferred send");
         std::thread::sleep(Duration::from_millis(50));
@@ -516,8 +529,7 @@ mod tests {
             m.commit_deferred().expect("deferred send");
         }
         let elapsed = t0.elapsed();
-        super::super::manifest::TEST_INJECT_SYNC_DELAY_MS
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+        m.set_inject_sync_delay_ms(0);
         assert!(
             elapsed < Duration::from_millis(200),
             "a 100-commit burst against a stalled persist must not block the \
@@ -541,14 +553,15 @@ mod tests {
     #[test]
     fn failed_persist_latches_flush_barrier_until_superseded() {
         #[allow(clippy::unwrap_used)] // test-only; poisoning would already be a failed test
-        let _knob = super::super::manifest::TEST_SYNC_KNOB_LOCK.lock().unwrap();
+        let _registry = super::super::manifest::TEST_AGENT_REGISTRY_LOCK
+            .lock()
+            .unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("shard-5.manifest");
         let mut m = ShardManifest::create(&path).expect("create");
         m.enable_deferred_sync(5);
 
-        super::super::manifest::TEST_INJECT_PERSIST_ERROR
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        m.set_inject_persist_error(true);
         m.add_file(make_entry(1));
         m.commit_deferred().expect("deferred send");
         // Whether the failing round has already consumed the slot or the
@@ -565,8 +578,7 @@ mod tests {
         );
 
         // A newer snapshot that persists successfully heals the latch.
-        super::super::manifest::TEST_INJECT_PERSIST_ERROR
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        m.set_inject_persist_error(false);
         m.add_file(make_entry(2));
         m.commit_deferred().expect("deferred send");
         assert!(
@@ -583,7 +595,9 @@ mod tests {
     #[test]
     fn dropped_agent_without_shutdown_deregisters() {
         #[allow(clippy::unwrap_used)] // test-only; poisoning would already be a failed test
-        let _knob = super::super::manifest::TEST_SYNC_KNOB_LOCK.lock().unwrap();
+        let _registry = super::super::manifest::TEST_AGENT_REGISTRY_LOCK
+            .lock()
+            .unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
         let before = super::AGENT_REGISTRY.lock().len();
         {
@@ -606,7 +620,9 @@ mod tests {
     #[test]
     fn shutdown_reclaims_io_and_inline_commits_still_work() {
         #[allow(clippy::unwrap_used)] // test-only; poisoning would already be a failed test
-        let _knob = super::super::manifest::TEST_SYNC_KNOB_LOCK.lock().unwrap();
+        let _registry = super::super::manifest::TEST_AGENT_REGISTRY_LOCK
+            .lock()
+            .unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("shard-3.manifest");
         let mut m = ShardManifest::create(&path).expect("create");
