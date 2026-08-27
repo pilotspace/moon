@@ -127,8 +127,24 @@ fn readiness_failure_message(
     let stdout = read_log(&dir.join("moon.stdout.log"));
     let stderr = read_log(&dir.join("moon.stderr.log"));
     let what = match outcome {
+        // Name the discriminator explicitly. moon#751 read a bare "exit 0" as
+        // proof the server had been ASKED to shut down, and went looking for a
+        // signal sender that may never have existed: before that was fixed, a
+        // fatal listener failure ALSO exited 0. Since then the two are
+        // distinguishable, and the reader should not have to rediscover how.
         Readiness::Exited(status) => {
-            format!("server process exited with {status:?} before becoming ready")
+            let hint = match status.code() {
+                Some(0) => {
+                    " — exit 0 is the graceful path; look for \"Shutdown signal \
+                     received\" in the log to confirm a signal actually arrived"
+                }
+                Some(_) => {
+                    " — a non-zero exit is a startup FAILURE, not a shutdown; \
+                     look for \"Listener error\" in the log"
+                }
+                None => " — killed by a signal (no exit code), i.e. not a graceful stop",
+            };
+            format!("server process exited with {status:?} before becoming ready{hint}")
         }
         Readiness::TimedOut => {
             format!("server did not become ready within {deadline:?} (process still running)")
