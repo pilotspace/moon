@@ -27,6 +27,8 @@ use moon::shard::Shard;
 use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
 use tokio::net::TcpListener;
 
+mod common;
+
 // ---------------------------------------------------------------------------
 // Test server infrastructure — mirrors existing adversarial test harnesses.
 // ---------------------------------------------------------------------------
@@ -244,7 +246,9 @@ async fn start_server(num_shards: usize) -> (u16, CancellationToken) {
         }
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    common::await_listening(port, std::time::Duration::from_secs(30))
+        .await
+        .expect("in-process server never started listening");
     (port, token)
 }
 

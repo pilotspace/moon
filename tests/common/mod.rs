@@ -527,6 +527,39 @@ impl Drop for ServerGuard {
 /// [`spawn_listening`] that hands back a [`ServerGuard`] instead of a bare
 /// `Child`, so a panic between here and the explicit kill cannot orphan the
 /// server.
+/// Wait until `port` accepts a TCP connection, for suites that run the server
+/// **in-process** (`listener::run_sharded` / `run_with_shutdown` on a spawned
+/// thread) rather than as a child process.
+///
+/// `spawn_listening_guarded` cannot serve these: it watches a `Child` exit
+/// status, and an in-process listener has no child to watch. Before moon#752
+/// they instead slept a fixed 250ms and hoped — which fails as
+/// `Connection refused` whenever startup is slower than the guess (a loaded
+/// machine, a cold cache, high suite parallelism). A deadline is an upper
+/// bound that is rarely reached, not the wait itself: this returns as soon as
+/// the port answers, so the common case is *faster* than the old sleep.
+///
+/// Uses `std::net::TcpStream` deliberately — a refused connect on loopback
+/// returns immediately, and it keeps the helper free of any `tokio/net`
+/// feature requirement in dev-dependencies.
+pub async fn await_listening(port: u16, deadline: std::time::Duration) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    let mut attempts = 0u32;
+    loop {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return Ok(());
+        }
+        attempts += 1;
+        if start.elapsed() >= deadline {
+            return Err(format!(
+                "port {port} never accepted a connection within {deadline:?} \
+                 ({attempts} attempts); the in-process server failed to start"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 pub fn spawn_listening_guarded(spawn: impl FnMut(u16) -> Child) -> (ServerGuard, u16) {
     let (child, port) = spawn_listening(spawn);
     (ServerGuard::new(child), port)
