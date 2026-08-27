@@ -1,309 +1,124 @@
 # moon
 
-High-performance Redis-compatible server in Rust. See [README.md](README.md) for build/run/test commands, configuration flags, architecture diagram, and command reference.
+High-performance Redis-compatible server in Rust. See [README.md](README.md) for build/run/test commands, configuration flags, architecture diagram, and the command reference.
 
-Load specific skill that best fit for each user task. Like /senior-rust-engineer to do task related to rust implement.
+Load the skill that best fits the task — e.g. `/senior-rust-engineer` for Rust implementation.
 
-## MSRV
+## Architecture map
 
-Rust **1.94** (edition 2024). Enforced in CI.
+Thread-per-core, shared-nothing — each shard owns a keyspace slice on its own thread. Diagram and data-structure detail: [`docs/architecture.md`](docs/architecture.md).
 
-## Target Platform
+**Request path:** `server/` (listener, conn, codec, TLS, response slot) -> `protocol/` (RESP parse/serialize, zero-copy) -> `shard/` (`event_loop`, `dispatch`, `mesh` SPSC, `coordinator`) -> `command/` (`phf` tables, one module per command group) -> `storage/` (`dashtable`, `db`, `tiered`, CompactKey/CompactValue) -> `persistence/` (`wal_v3`, `aof`, `page_cache`, `checkpoint`, `dir_lock`).
 
-**Linux** (aarch64 primary, x86_64 secondary) and **macOS** (aarch64 Apple Silicon, x86_64 Intel).
+**Engines:** `vector/` HNSW + TurboQuant (FT.*) · `graph/` Cypher + CSR segments · `text/` FST term dict + BM25 · `scripting/` Lua sandbox · `mq/` queues + triggers.
 
-- **Linux**: Full feature set — io_uring (monoio), SO_REUSEPORT per-shard, O_DIRECT, connection migration.
-- **macOS**: Full feature set minus io_uring — uses kqueue (monoio) or epoll (tokio), SO_REUSEPORT per-shard, no O_DIRECT (pread fallback), no connection migration.
-- **Production benchmarks** MUST target Linux (OrbStack or GCloud). macOS numbers are for development only.
-- Both `runtime-monoio` (default) and `runtime-tokio` are supported on macOS.
+**Cross-cutting:** `acl/` · `pubsub/` + `notify*.rs` · `replication/` · `cluster/` · `blocking/` · `transaction/` · `tracking/` (client-side caching invalidation) · `cdc/` · `temporal/` · `workspace/` · `admin/` (HTTP console, metrics, memory treemap) · `monitor/` · `telemetry/`.
 
-## OrbStack Development Environment
+**Runtime & I/O:** `runtime/` (monoio <-> tokio abstraction) · `io/` (io_uring driver) · `config.rs` · `client_registry.rs` · `tls.rs` · `memory_ctl.rs` + `malloc_respawn.rs` (jemalloc conf re-exec).
 
-OrbStack is used for Linux-parity builds, production benchmarks, and io_uring testing on macOS hosts.
+## Platform & toolchain
 
-### Machine: `moon-dev`
+- **MSRV:** Rust **1.94**, edition 2024. Enforced in CI.
+- **Develop natively on macOS** (aarch64 Apple Silicon / x86_64) — a first-class target. Both `runtime-monoio` (default; kqueue here) and `runtime-tokio` build, test, and run on the host.
+- **Ship on Linux** (aarch64 primary, x86_64 secondary). io_uring, O_DIRECT, connection migration, and the spin governor's `/proc` sampling sit behind `cfg(target_os = "linux")` — **no amount of native testing exercises them**. Every benchmark number MUST come from a Linux host, never from a native run.
 
-- **OS:** Ubuntu 24.04 (kernel 6.17+, full io_uring support)
-- **Arch:** aarch64 (matches Apple Silicon host)
-- **Rust:** 1.94.1 (MSRV-pinned)
-- **Tools:** build-essential, pkg-config, libssl-dev, redis-server
-
-OrbStack auto-mounts the macOS filesystem (including `/Volumes/`) into the VM at the same paths — edit on macOS, compile on Linux. No rsync or Docker volumes needed. `orb run` preserves the caller's working directory, so commands run from the repo need no `cd` at all.
-
-> **⚠ Stale checkout trap:** `/Users/tindang/workspaces/tind-repo/moon` is an OLD second checkout (stuck at hash-ttl era). The live repo is `/Volumes/Games/tindang-repo/moon` — never `cd` to the old path in VM commands, and pin `MOON_BIN` explicitly for integration tests that spawn a server binary (`find_moon_binary()` falls back to `target/release/moon`, whose provenance is unknown).
-
-### Commands
+## Build · test · run
 
 ```bash
-# Build (release)
-orb run -m moon-dev bash -c 'source ~/.cargo/env && cd /Volumes/Games/tindang-repo/moon && cargo build --release'
-
-# Test (all)
-orb run -m moon-dev bash -c 'source ~/.cargo/env && cd /Volumes/Games/tindang-repo/moon && cargo test --release'
-
-# Test (tokio runtime, CI parity)
-orb run -m moon-dev bash -c 'source ~/.cargo/env && cd /Volumes/Games/tindang-repo/moon && cargo test --no-default-features --features runtime-tokio,jemalloc'
-
-# Clippy
-orb run -m moon-dev bash -c 'source ~/.cargo/env && cd /Volumes/Games/tindang-repo/moon && cargo clippy -- -D warnings'
-
-# Run server
-orb run -m moon-dev bash -c 'source ~/.cargo/env && cd /Volumes/Games/tindang-repo/moon && ./target/release/moon --port 6399 --shards 4'
-
-# Benchmark (redis-benchmark from macOS can reach moon-dev via OrbStack networking)
-orb run -m moon-dev bash -c 'source ~/.cargo/env && cd /Volumes/Games/tindang-repo/moon && cargo bench'
-
-# Interactive shell
-orb run -m moon-dev bash
+cargo build --release
+cargo test --release                                                 # default features (monoio)
+cargo test --no-default-features --features runtime-tokio,jemalloc   # tokio leg, CI parity
+cargo clippy --all-targets -- -D warnings
+cargo bench
+./target/release/moon --port 6399 --shards 4
 ```
 
-### Recreating the Machine
-
-If the machine is lost or corrupted:
-```bash
-orb delete moon-dev
-orb create ubuntu moon-dev
-orb run -m moon-dev bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.94.1'
-orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y -qq build-essential pkg-config libssl-dev redis-server'
-```
-
-### OrbStack Rules for Claude Code
-
-- **`cargo build`/`cargo test` on macOS is now fully supported** — macOS is a first-class target.
-- Use `orb run -m moon-dev` for Linux-specific testing (io_uring, O_DIRECT, connection migration).
-- All **benchmark numbers** MUST come from the Linux VM (or GCloud instances).
-- The VM path to the repo is the same as macOS: `/Volumes/Games/tindang-repo/moon`.
-- Use `source ~/.cargo/env &&` prefix in every `orb run` command.
-- Use `CARGO_TARGET_DIR=target-linux` for VM builds of the shared checkout so Linux ELF and macOS Mach-O artifacts never clobber each other (`/target-linux/` is gitignored).
-- **Diskfull guard:** Moon pauses writes (`MOONERR diskfull`) when the data dir's filesystem has <5% free. `/Volumes/Games` hovers near that line — run server-spawning suites (e.g. `scripts/test-consistency.sh`) from a VM-local clone (`git clone --depth 1 file:///Volumes/Games/tindang-repo/moon ~/moon-consistency`) or pass a fresh `--dir` on VM /tmp.
-- Don't edit sources on macOS while a VM build of the same checkout is compiling (shared fs → spurious compile errors).
+- `cargo check` does **not** compile tests — pass `--all-targets` after touching `#[cfg(test)]`. Use `--no-fail-fast` when you need every failing binary, not just the first.
+- Pin `MOON_BIN` for suites that spawn a server: `find_moon_binary()` falls back to `target/release/moon`, whose provenance is unknown.
+- The tokio leg drops default features — `graph` and `text-index` are absent there; `cfg!`-gate anything depending on them.
 
 ## Scripts
 
-- `scripts/bench-compare.sh` — Moon vs Redis side-by-side (all commands, pipeline 1–128, data 8B–64KB). Use `--requests 200000` for stable numbers.
-- `scripts/bench-production.sh` — 10 production scenarios (session, ratelimit, leaderboard, cache, queue, hash, connections, datasizes, memory, pipeline).
-- `scripts/bench-resources.sh` — RSS/memory bench. Starts a fresh server per row (RSS is a high-water mark; delta within one process is unreliable).
-- `scripts/test-commands.sh` — 504 rows across 13 categories (correctness vs Redis + throughput). `--skip-bench` for fast correctness-only. Honours `PORT_REDIS`/`PORT_RUST`, and refuses to start if either port is already held (it would otherwise compare against somebody else's server).
+Need `redis-server` / `redis-benchmark` on PATH (`brew install redis`).
+
+- `scripts/test-commands.sh` — 504 correctness+throughput rows vs Redis (`--skip-bench` for correctness only). Honours `PORT_REDIS`/`PORT_RUST`; refuses to start if either port is held.
 - `scripts/test-consistency.sh` — 132 data-consistency tests across 1/4/12 shard configs.
-- All scripts run inside `moon-dev` and need `redis-server` / `redis-benchmark` on PATH.
+- `scripts/bench-compare.sh` — Moon vs Redis, all commands, pipeline 1–128, 8B–64KB (`--requests 200000` for stable numbers). `scripts/bench-production.sh` — 10 production scenarios. `scripts/bench-resources.sh` — RSS, fresh server per row.
 
-## Environment Variables
+## Environment variables
 
-- `RUST_LOG=moon=debug` — enable tracing output (uses `tracing-subscriber` with `env-filter`)
-- `MOON_NO_URING=1` — force-disable io_uring everywhere (monoio runtime + tokio bridge); used in CI/containers/WSL where io_uring is unavailable. ⚠ Before 2026-07 this env was a silent NO-OP for the monoio driver (FusionDriver picked io_uring regardless); it now forces the epoll/kqueue LegacyDriver. CLI equivalent: `--io-driver epoll`. Empirically verify the driver via `ls -l /proc/<pid>/fd | grep io_uring` — monoio logs neither choice. **GCE ARM (c4a Axion): epoll beats io_uring by 2-4% at ALL pipeline depths for KV** (same-instance A/B 2026-07-03); other platforms favor io_uring — bench per platform.
-- `MOON_URING=1` — opt **into** the tokio→io_uring bridge. The bridge is **default-off under the tokio runtime** (it floods errors under load and can hang the accept loop); tokio shards run plain epoll/kqueue unless this is set. No effect on the monoio runtime, which always uses io_uring unless `MOON_NO_URING` is set.
-- `MOON_EPOLL_SPIN_US=<µs>` / CLI `--io-busy-poll-us <µs>` — poll-mode park (vendored-monoio patch, `vendor/monoio`, grep "moon patch"): the shard thread busy-loops zero-timeout readiness polls for the budget before blocking, deleting the per-op scheduler sleep+wake. Legacy (epoll/kqueue) driver only — the CLI flag forces it; io_uring CQEs are NOT observable from userspace without task participation (DEFER_TASKRUN posts only inside enter; TWA_SIGNAL kicks cost ~µs; SQPOLL doesn't run poll task_work on 6.17 — all measured 2026-07-03). **This is what flipped GCE p=1 c1 to a WIN vs Redis: ARM c4a 0.95→1.19/1.21, x86 c3 1.06→1.66** (same-instance A/Bs). Costs up to budget-µs CPU per idle park (~4%/core at 40µs vs 1ms timer parks; bounded by the 10ms idle-disengage). **O3 (2026-07-19): the spin is now self-gating** — each shard thread's 1s chore samples its own `nonvoluntary_ctxt_switches` (`/proc/thread-self/status`) and gates the spin via a per-thread flag in the vendored driver while the core is contended (>25 preempts/s one window = off; 5 quiet windows = on; `src/shard/spin_governor.rs`). The old "only judge spin on pinned disjoint cores" caveat now applies only to `MOON_SPIN_ADAPTIVE=0` (unconditional-spin A/B knob); `MOON_SPIN_MAX_PREEMPTS_PER_SEC` overrides the threshold. Non-Linux: no signal, governor inert, pre-O3 behavior.
-- `MOON_URING_SPIN_US`, `MOON_URING_SQPOLL[_CPU]`, `MOON_URING_PLAIN` — io_uring-side experiment gates kept as documented diagnostics; all dead ends for the p=1 path (see `tmp/KV-FULLPROOF.md` Round 2).
-- `MOON_IDLE_PARK=0` — disable the adaptive idle park (#373 phase 2): pins the monoio shard loop to its fixed 1ms periodic tick instead of stretching to 10ms after 64 provably-no-op ticks. Same-binary A/B knob for idle-CPU / latency benches. All counter-based chore cadences are multiples of the 10ms stretched period, so no chore timing changes either way; the only behavioral delta with the park ON is cached-clock staleness up to 10ms (vs 1ms) for a command arriving mid-park after ≥64ms of total shard quiet.
-- `MOON_XSHARD_SPIN_BUDGET` / `MOON_XSHARD_SPIN_GATE` / `MOON_XSHARD_SPIN_MAX_CONNS` — diagnostic overrides for the C2 reply-side spin (`src/shard/slice.rs`; defaults 4096 iters / gate 2 / **solo-conn 1**). Budget `0` disables the spin entirely (the same-instance A/B knob that proved the c8P1 convoy). ⚠ The solo-conn ceiling (spin only when the conn is ALONE on its shard thread) is the L1 convoy fix — raising `MAX_CONNS` re-creates the s4 c8P1 collapse (a spinning conn starves its sibling AND the shard's SPSC drain, 0.45× vs Redis; fixed = 2.75× better, see `tmp/MULTISHARD-REDESIGN.md`). Bench-only knobs: never set in production.
-- `RUSTFLAGS="-C target-cpu=native"` — enable CPU-specific optimizations for benchmarking
-- `_RJEM_MALLOC_CONF` — jemalloc's tuning knob (prefixed because `tikv-jemallocator` builds with the `_rjem_` symbol prefix; the unprefixed `MALLOC_CONF` has no effect). Moon bakes in `narenas:8,background_thread:true,metadata_thp:auto,dirty_decay_ms:1000,muzzy_decay_ms:5000,abort_conf:true` via a static `_rjem_malloc_conf` export (`src/main.rs`) — 1s dirty-page decay + a background reclaim thread so freed-but-idle pages return to the OS quickly instead of sitting in jemalloc's dirty/muzzy caches inflating RSS. `--memory-arenas-cap N` re-spawns the process (`execve`) with this exact string, narenas substituted, **before** jemalloc's one-time init reads it — `mallctl` after init is a documented no-op for `opt.narenas`. If `_RJEM_MALLOC_CONF` is already set in the environment, `--memory-arenas-cap` is a no-op (operator env wins, warns instead of clobbering). Only applies to `--features jemalloc` builds; `mimalloc` (the non-jemalloc default) has no equivalent decay knob in this codebase. `--memory-thp` composes into the SAME re-spawn/conf-string (`,thp:always` appended; `--memory-arenas-cap N --memory-thp` together still produce exactly one execve) — opts the value heap into transparent huge pages, real-PMU proven on GCE (GET +24.4% ARM / +12.1% x86, dTLB MPKI −35%/−98.4%, RSS +4.2% both; `tmp/GCE-PMU-RESULTS.md`), **permanently opt-in — the RSS-drift soak (2026-07-19, moon-dev VM, 45min mixed-size churn + idle decay) DISQUALIFIED a default flip**: active-churn RSS is flat, but once the workload quiets, khugepaged re-collapses the madvise'd heap into 2M pages and re-materializes every 4K hole jemalloc had purged — RSS climbed +27% over ~13 idle minutes (699→890MB at constant used_memory 539MB; non-THP control flat at 680MB) and plateaued there permanently (jemalloc never re-purges those ranges). Same-data RSS overhead settles at ~+31% vs non-THP after mixed-size churn (vs the +4.2% uniform-workload snapshot), silently eroding maxmemory eviction headroom. Enable only for uniform-value-size fleets with RSS headroom. **Linux-only**: jemalloc has no THP support on macOS and does NOT silently ignore `thp:always` there under `abort_conf:true` — it aborts the process at init (verified experimentally 2026-07-18), so `--memory-thp` warns and no-ops (not aborts) on non-Linux jemalloc builds while `--memory-arenas-cap` still applies if paired with it.
+Measured detail — spin governor, THP soak, io_uring dead ends — in [`docs/internal/env-knobs.md`](docs/internal/env-knobs.md).
 
-## Key Design Decisions
+- `RUST_LOG=moon=debug` — tracing output. `RUSTFLAGS="-C target-cpu=native"` — benchmarking only.
+- `MOON_NO_URING=1` / `--io-driver epoll` — force the epoll/kqueue driver. Bench per platform: GCE ARM c4a favours epoll by 2–4% at all pipeline depths.
+- `MOON_URING=1` — opt **into** the tokio→io_uring bridge (default-off; it floods errors under load).
+- `MOON_EPOLL_SPIN_US` / `--io-busy-poll-us <µs>` — poll-mode park, legacy driver only; what flipped p=1 c1 to a win vs Redis. Self-gating since O3 (`src/shard/spin_governor.rs`).
+- `MOON_IDLE_PARK=0` — disable the adaptive idle park (same-binary A/B knob).
+- `MOON_XSHARD_SPIN_*` — C2 reply-spin overrides. **Bench-only, never production**: raising `MAX_CONNS` past the solo-conn ceiling re-creates the s4 c8P1 convoy collapse.
+- `_RJEM_MALLOC_CONF` — jemalloc conf (prefixed; plain `MALLOC_CONF` is inert). `--memory-arenas-cap N` and `--memory-thp` re-exec before jemalloc init. THP stays **permanently opt-in** — a soak measured +27% idle RSS drift, ~+31% same-data overhead.
 
-- **Compact SSO types**: `CompactKey` stores keys up to 23 bytes inline; `CompactValue` stores values up to 12 bytes inline (heap beyond, via `HeapString(Vec<u8>)`). Eliminates significant per-key overhead vs naive `Arc<String>`.
-- **Per-shard WAL**: No global lock on writes. Low-latency append via in-memory buffer flushed on 1ms tick.
-- **Lazy Lua/backlog init**: Reduces baseline memory. Lua sandbox initialized on first EVAL.
-- **Lock-free channels (flume)**: Critical for pipeline throughput; avoids mutex contention on the hot path.
-- **Timestamp caching**: Reduces syscall overhead by not calling `Instant::now()` per-key.
-- **monoio default on Linux**: io_uring thread-per-core model; tokio for portability/CI.
+## Key design decisions
+
+- **Compact SSO types:** `CompactKey` inlines keys ≤23 bytes, `CompactValue` values ≤12 bytes.
+- **Per-shard WAL:** no global lock on writes; in-memory buffer flushed on a 1ms tick.
+- **Lock-free channels (flume):** critical for pipeline throughput. **Shard-cached timestamps** and **lazy Lua/backlog init** keep baseline cost down.
+- **monoio default on Linux:** io_uring thread-per-core; tokio for portability/CI.
 
 ## Gotchas
 
-- **Multi-shard scaling:** Single-shard gives best throughput for non-pipelined workloads. Adding shards causes sub-linear scaling because most keys route cross-shard (SPSC dispatch overhead dominates local DashTable lookup). Use `--shards 1` unless testing pipeline/AOF benefits.
-- **Hash tags for co-location:** `{tag}` in key names (e.g. `user:{1234}:name`) routes all tagged keys to the same shard, eliminating cross-shard dispatch for MGET/MSET operations.
-- **High client counts:** Testing with >1K clients may require `ulimit -n 65536`; 5K clients with pipeline can cause connection drops without it.
-- **AOF advantage grows with pipeline depth:** Per-shard WAL eliminates the global serialization bottleneck that Redis's single AOF file introduces at high pipeline depths.
-- **Use `--shards 1` for fair per-key memory comparison** against Redis.
-- **WAL sync kills write throughput ~11x** (135K → 12K ops/s). Always benchmark writes with `appendonly=no` first. The WAL writer is created whenever `persistence_dir` is set, so explicitly disable it when measuring raw write speed.
-- **Memory benchmarks need a fresh server + `redis-benchmark -r <N>`.** Without `-r`, all writes hit `__rand_key__` (1 real key). Delta measurement within one process is broken — RSS is a high-water mark, FLUSHALL does not return pages.
-- **redis-benchmark 8.x uses `\r` for progress lines.** Pipe through `tr '\r' '\n' | grep "requests per second" | tail -1 | awk '{print $2}'` before grepping RPS, or you'll parse the command name instead.
-- **`FT.COMPACT` is a silent no-op** when `mutable_len < compact_threshold`. Explicit user calls must route through `force_compact`, or set `COMPACT_THRESHOLD` ≥ expected dataset size so the one final compact happens.
-- **Vector recall on random Gaussian is misleading** at high dimensions (concentration of distances). Validate recall with real semantic embeddings (e.g. MiniLM) — Moon hits 0.96+ there vs ~0.73 on random.
+- **Multi-shard scaling is sub-linear** for non-pipelined workloads — cross-shard SPSC dispatch dominates the local DashTable lookup. Use `--shards 1` unless testing pipeline/AOF benefits, and for any per-key memory comparison against Redis. `{tag}` in a key co-locates all tagged keys on one shard.
+- **WAL sync costs ~11× write throughput** (135K → 12K ops/s). Benchmark writes with `appendonly=no` first — the WAL writer exists whenever `persistence_dir` is set.
+- **Memory benchmarks need a fresh server + `redis-benchmark -r <N>`** — without `-r` every write hits `__rand_key__` (1 real key), and FLUSHALL does not return pages.
+- **redis-benchmark 8.x uses `\r`** for progress lines: `tr '\r' '\n'` before grepping RPS, and match the number by position — `awk '{print $2}'` yields `summary:`.
+- **>1K clients** may need `ulimit -n 65536` or connections drop.
+- **`FT.COMPACT` is a silent no-op** below `compact_threshold` — user calls must route through `force_compact`.
+- **Vector recall on random Gaussian misleads** at high dimensions. Validate with real embeddings (MiniLM): 0.96+ there vs ~0.73 on random.
 
-## Coding Rules
+## Coding rules
 
-### Unsafe Code
-- Never introduce new `unsafe` blocks without explicit user approval.
-- Every `unsafe` block MUST have a `// SAFETY:` comment explaining the invariant.
-- Prefer safe abstractions. If unsafe is needed, isolate it in a dedicated module.
-- When modifying existing unsafe code, verify all SAFETY comments remain accurate.
-- Full policy, review checklist, approved patterns, and forbidden constructs:
-  see [`UNSAFE_POLICY.md`](UNSAFE_POLICY.md).
+**Unsafe.** Never introduce a new `unsafe` block without explicit user approval; every block carries a `// SAFETY:` comment, isolated in a dedicated module. Full policy and checklist: [`UNSAFE_POLICY.md`](UNSAFE_POLICY.md).
 
-### Allocations on Hot Paths
-- No `Box::new()`, `Vec::new()`, `String::new()`, `Arc::new()`, `clone()`, `format!()`, or `to_string()` in:
-  - Command dispatch (`src/command/`)
-  - Protocol parsing (`src/protocol/`)
-  - Shard event loops (`src/shard/event_loop.rs`)
-  - I/O drivers (`src/io/`)
-- Use `SmallVec`, `itoa`, `write!` to pre-allocated buffers, or borrow instead.
-- `Vec::with_capacity()` is acceptable for result building at the end of a command path.
+**Hot-path allocations.** No `Box/Vec/String/Arc::new()`, `clone()`, `format!()`, or `to_string()` in `src/command/`, `src/protocol/`, `src/shard/event_loop.rs`, or `src/io/`. Use `SmallVec`, `itoa`, `write!` into pre-allocated buffers, or borrow. `Vec::with_capacity()` is fine for a terminal result.
 
-### Lock Handling
-- Use `parking_lot::RwLock` / `parking_lot::Mutex` — never `std::sync` locks.
-- Never hold a lock across `.await` points.
-- Replace `.read().unwrap()` / `.write().unwrap()` with `.read()` / `.write()` (parking_lot doesn't poison).
-- Per-shard locks only — no global locks on the write path.
-- **monoio cross-thread wakers:** `monoio::spawn` creates `!Send` tasks; `Waker::wake()` from another OS thread does NOT reach them. The cross-shard **reply** path therefore has the connection **await a `flume` oneshot directly** (the target shard sends the reply on it after executing). The old `pending_wakers` relay ("register your waker, event loop drains it after SPSC") was retired when test `swf0` disproved its premise, and the vestigial plumbing was **deleted entirely** in the c10k wave (it had zero registrants). For cross-thread signalling, prefer `flume::bounded(1)` over custom atomic oneshots.
+**Locks.** `parking_lot` only — never `std::sync`, and no `.unwrap()` on `.read()`/`.write()` (it does not poison). Never hold a lock across `.await`. Per-shard locks only; no global lock on the write path. *monoio cross-thread wakers:* `monoio::spawn` tasks are `!Send`, so `Waker::wake()` from another OS thread never reaches them — the cross-shard reply path awaits a `flume` oneshot directly. Prefer `flume::bounded(1)` over custom atomic oneshots.
 
-### Error Handling
-- All command errors return `Frame::Error(Bytes)` — no `Result` types in dispatch paths.
-- No `unwrap()` or `expect()` in library code outside tests. Use pattern matching, `if let`, or `let-else`.
-- `anyhow` is only for `main.rs` and test code. Library code uses `thiserror` or `Frame::Error`.
-- **Parser defensiveness:** `parse_frame_zerocopy` returns `Frame::Null` on ANY parse failure instead of panicking. Never add `.unwrap()` to protocol parsing code — malformed client input must never crash the server.
-- If an unwrap is truly safe (post-insert get, atomic-invariant), add `#[allow(clippy::unwrap_used)]` with a one-line justification comment on the preceding line.
+**Errors.** Command errors return `Frame::Error(Bytes)` — no `Result` in dispatch paths. No `unwrap()`/`expect()` in library code; `anyhow` only in `main.rs` and tests, `thiserror` elsewhere. `parse_frame_zerocopy` returns `Frame::Null` on ANY parse failure — never add `.unwrap()` to protocol parsing; malformed input must never crash the server. A provably-safe unwrap needs `#[allow(clippy::unwrap_used)]` plus a one-line justification above it.
 
-### Feature Gates
-- All runtime-specific code must compile under both `runtime-tokio` and `runtime-monoio`.
-- Verify with: `cargo check --no-default-features --features runtime-tokio,jemalloc`
-- Linux-only code (io_uring, O_DIRECT, `libc::` calls) must have `#[cfg(target_os = "linux")]` guards with a stub/fallback for non-Linux (compile guard is sufficient — runtime fallback not required until macOS milestone).
-- New features use additive feature flags — never break the default feature set.
+**Feature gates.** Everything compiles under both runtimes — verify with `cargo check --no-default-features --features runtime-tokio,jemalloc`. Linux-only code needs a `#[cfg(target_os = "linux")]` guard and a non-Linux stub. New features are additive; never break the default set.
 
-### New Commands
-- Add to the `phf` dispatch table in the command registry.
-- Include ACL category annotation.
-- Add corresponding entries in `scripts/test-consistency.sh` and `scripts/test-commands.sh`.
-- Benchmark new commands with `scripts/bench-compare.sh` if they touch hot paths.
+**New commands.** Register in the `phf` dispatch table with an ACL category annotation, and add rows to both `scripts/test-consistency.sh` and `scripts/test-commands.sh`. Hot-path commands get a `scripts/bench-compare.sh` run. **There are three dispatch paths** — `command::dispatch` and `command::dispatch_read` (both `src/command/mod.rs`) and `server::conn::try_inline_dispatch` (`src/server/conn/blocking.rs`). A command wired into only some of them is silently wrong on the others, and CI does not catch the missing arm.
 
-### SIMD Code
-- Always provide a scalar fallback for non-x86_64 architectures.
-- Use `#[cfg(target_arch = "x86_64")]` with `#[target_feature(enable = "sse2")]` (baseline).
-- AVX2/AVX-512 paths require runtime detection via `is_x86_feature_detected!`.
-- Add unit tests for both SIMD and scalar paths.
+**SIMD.** Always ship a scalar fallback. `#[cfg(target_arch = "x86_64")]` with `sse2` baseline; AVX2/AVX-512 behind `is_x86_feature_detected!`. Unit-test both paths.
 
-### Performance Invariants
-- Timestamp caching: never call `Instant::now()` per-key — use the shard-cached timestamp.
-- Cross-shard dispatch: use `flume` channels, never `Arc<Mutex<>>` queues.
-- Protocol parsing: zero-copy where possible — use `Bytes::slice()` not `to_vec()`.
-- Response serialization: write directly to codec buffer, avoid intermediate `Vec<u8>`.
-- Profile first, optimize second. Use `perf record -F 999 -g` + `objdump` on the stripped binary and verify the assembly actually changed (e.g. serial `vaddss xmm0` chain → parallel `vaddss xmm3..8`). Easy to unroll the wrong function.
+**Performance invariants.** Shard-cached timestamps, never `Instant::now()` per key. `flume` for cross-shard dispatch, never `Arc<Mutex<>>`. `Bytes::slice()`, not `to_vec()`. Serialize straight into the codec buffer. Profile first — `perf record -F 999 -g` + `objdump` — and verify the assembly actually changed; it is easy to unroll the wrong function.
 
-### File Size
-- No single `.rs` file should exceed 1500 lines. Split into submodules if approaching this limit.
-- Command implementations for a single Redis command group can be larger, but split read/write operations into separate files when exceeding 1000 lines.
-- **Split convention:** command files become directory modules (`src/command/hash/` with `mod.rs`, `hash_read.rs`, `hash_write.rs`). The `mod.rs` re-exports via `pub use hash_read::*; pub use hash_write::*;` and holds shared helpers + tests.
+**Files & modules.** No `.rs` over 1500 lines (command groups may run larger, but split read/write past 1000). Split into a directory module — `src/command/hash/` = `mod.rs` + `hash_read.rs` + `hash_write.rs` — re-exported from `mod.rs`, `crate::` imports (not `super::super::`), tests staying in `mod.rs`.
 
-### Testing
-- Every new command needs at least one unit test and one consistency test entry.
-- Integration tests use real server instances — no mocking.
-- Benchmarks use Criterion with `black_box()` on inputs and outputs.
-- **Fuzzing:** 18 `cargo-fuzz` targets in `fuzz/fuzz_targets/`. Any new parser, decoder, or deserialization function MUST have a fuzz target, AND an entry in BOTH matrices in `.github/workflows/fuzz.yml` — a target that exists but is not listed never runs (`term_fst_sidecar` sat unlisted until moon#576). CI runs 15 min/target on PRs and 5h nightly (`-max_total_time=18000`; NOT 6h — a 6h budget hits the hosted 6h job ceiling, so the run is platform-cancelled before `Archive corpus` and the night's corpus is lost, measured 2026-08-14).
-- **Loom:** model tests in `tests/loom_response_slot.rs` for lock-free data structures. Any new atomic state machine MUST have a loom model.
+**Testing.** Every new command: ≥1 unit test and 1 consistency-test row. Integration tests use real server instances, no mocking. Criterion benches `black_box()` inputs *and* outputs. *Fuzzing:* 18 targets in `fuzz/fuzz_targets/`; any new parser, decoder, or deserializer needs a target AND an entry in **both** matrices in `.github/workflows/fuzz.yml` — an unlisted target never runs. Nightly budget is 5h (`-max_total_time=18000`); 6h hits the hosted job ceiling and the corpus is lost. *Loom:* any new atomic state machine needs a model in `tests/loom_response_slot.rs`.
 
-### Module Structure
-- Modules with subfiles use Rust directory-module convention: `src/command/hash/` → `mod.rs` + `hash_read.rs` + `hash_write.rs`.
-- Re-exports in `mod.rs` maintain the same public API paths (`hash::hget` resolves via `pub use hash_read::*`).
-- Submodule files use `crate::` imports (NOT `super::super::`).
-- Test code stays in `mod.rs`, not in split subfiles.
+**Clippy.** Many style lints are `#![allow(...)]`-ed in `src/lib.rs`; correctness and performance lints stay on. Do not add new allows without justification.
 
-## Vector Search (FT.*)
+## Subsystem references
 
-Moon ships a native HNSW + TurboQuant vector engine exposed via a RediSearch-compatible subset (`FT.CREATE`, `FT.DROPINDEX`, `FT.INFO`, `FT.SEARCH`, `FT.COMPACT`). Source: `src/vector/` and `src/command/vector_search/`.
+- Vector engine (FT.*) internals — segment lifecycle, exact-rerank sidecar, adaptive ef, quantization trade-offs: [`docs/internal/vector-engine-internals.md`](docs/internal/vector-engine-internals.md). User guide: [`docs/vector-search-guide.md`](docs/vector-search-guide.md).
+- GPU / CUDA (`--features gpu-cuda`, never default): [`docs/internal/gpu-cuda.md`](docs/internal/gpu-cuda.md).
 
-- **Per-index knobs:** `EF_RUNTIME` (recall/QPS trade-off), `COMPACT_THRESHOLD` (when to flush mutable → immutable segment), `MERGE_RECALL_TOLERANCE` (FT.CONFIG; recall gate for unattended GraphUnion merges, default 0.70).
-- **Segment lifecycle:** auto-indexed on HSET → mutable segment (brute force) → compact → immutable segment (HNSW graph + TQ codes). Immutable segments DO merge: `MERGE_MODE GRAPH_UNION` (the default) auto-merges at ≥16 segments or ≥20% dead, gated by a recall check (0.70 background / 0.90 manual FT.COMPACT). What is forbidden is *decode+re-encode* merging — re-quantizing accumulates error (tested, recall collapsed 0.73 → 0.0005); GraphUnion stitches graphs over the original codes instead. `MERGE_MODE KEEP_RAW` is rejected at FT.CREATE (unimplemented stub).
-- **Key hash map:** `key_hash_to_key: Arc<HashMap<u64, Bytes>>` (copy-on-write via `Arc::make_mut`) must be populated in `auto_index_hset` and propagated via `SearchResult.key_hash`; otherwise multi-segment search returns synthetic `vec:<id>` instead of original keys.
-- **FT.INFO `num_docs`** must sum across all segments (mutable + immutable), not just the mutable one — and across all shards: FT.INFO scatter-gathers via `scatter_ft_info` + `merge_ft_info_responses` (additive counters, per-field merge); a local-only answer under-reports by ~1/N.
-- **Exact rerank sidecar (HQ-1):** immutable segments keep an f16 copy of each original vector (`raw_f16.bin` on disk; built from the mutable segment's always-retained f16 buffer); the top 4·k beam candidates are re-scored with true metric distances before truncation, via runtime-detected SIMD kernels (NEON integer-rescale on aarch64, F16C+FMA on x86_64, scalar fallback everywhere; +8.6% QPS from the kernels alone, ~+13% cumulative with the per-query fixed-cost cleanup — thread-cached search scratch, Arc'd MVCC treemap snapshot, ryu score formatting). Segments reloaded from pre-sidecar dirs (or rebuilt without raw data) silently fall back to quantized ADC distances — recall degrades, doesn't break. Merge propagation is all-or-nothing, and a drop that discards a real sidecar is now LOUD: `tracing::warn!` with source / sources-with-sidecar counts, plus additive `FT.INFO` counters `graph_segments` / `segments_with_exact_rerank` (merged across shards; coverage < total ⇒ some segments answer ADC-only).
-- **Adaptive per-segment ef (AE-1):** at compact/GraphUnion time each immutable segment self-probes recall against its own exact f16 sidecar (leave-self-out, ef ladder 24..256); only a fully-saturated curve (flat ≈1.0 from the minimum rung) certifies the segment "trivially easy" and searches at min-ef (24) — every other segment keeps the full resolved ef. Applies only when `EF_RUNTIME` was heuristic-resolved (never overrides a user-pinned value) and is in-memory only (reloaded segments fall back to the full beam). A blanket `ef/√G` split (EF-SPLIT) was tried first and REJECTED — it silently cost gaussian 5-seg R@10 0.9915 → 0.9295; don't reintroduce it.
-- **FLUSHALL/FLUSHDB/HDEL keyspace parity:** FLUSHALL and FLUSHDB clear every vector + text index's CONTENTS while KEEPING the FT.CREATE definition (matches restart semantics; indexes are keyspace-global so FLUSHDB of any db clears all index contents) — previously flushed hashes stayed searchable as ghosts until restart. `HDEL key <vector-field>` now tombstones that key in exactly the indexes whose vector field was removed (sibling indexes on other fields keep their entry). Known follow-ups: a multi-vector-field index tombstones the whole document when any one of its vector fields is removed; TEXT/TAG/NUMERIC field removal is not yet re-indexed.
-- **TQ4 at 384d loses recall** (concentration of distances + quantization noise). Use **SQ8** or FP32 HNSW for ≤384d workloads; TQ4 shines at 768d+. (There is no TQ8 — SQ8 is the real 8-bit option: per-vector affine scalar quant, normalizes for the unit-sphere metrics Cosine + InnerProduct, validated across the full lifecycle — search/merge/persistence — at ~0.90 R@10 on real MiniLM 384d. PR #166.)
+## CI — the merge bar
 
-## GPU / CUDA Acceleration
-
-### When to Use GPU
-- Vector distance computation (L2, cosine, dot product) on batches > 1000 vectors.
-- Bulk SIMD operations that exceed CPU SIMD width benefits (e.g., 10K+ float32 comparisons).
-- Never for single-key operations — CPU + SIMD is always faster for individual lookups.
-
-### CUDA Integration Pattern
-- Use `cudarc` crate for safe Rust CUDA bindings (no raw FFI).
-- Feature-gated: `--features gpu-cuda` — never in the default feature set.
-- Kernels live in `src/gpu/kernels/` as `.cu` files, compiled at build time via `build.rs`.
-- CPU fallback is mandatory — GPU path is an optimization, not a requirement.
-- Device memory management: use pinned memory (`cuMemAllocHost`) for host-device transfers.
-- Batch operations: accumulate work in a queue, dispatch to GPU when batch is full or timeout fires.
-
-### GPU Memory Rules
-- Never allocate GPU memory per-request — use a pre-allocated pool.
-- Transfer data in batches (≥64KB) to amortize PCIe latency.
-- Pin host memory for DMA transfers when throughput matters.
-- Free GPU memory on shard shutdown, not per-operation.
-
-### Vector Search (Future)
-- Per-shard HNSW index — no cross-shard GPU sharing.
-- Distance kernels: `f32` precision, SIMD on CPU, CUDA on GPU.
-- Index building on GPU, serving on CPU (unless batch query mode).
-- Use half-precision (`f16`) for storage, promote to `f32` for computation.
-
-### Build Requirements
-- CUDA Toolkit ≥ 12.0, compute capability ≥ 7.0 (Volta+).
-- `build.rs` detects CUDA availability — graceful fallback to CPU if absent.
-- CI runs CPU-only (`--no-default-features --features runtime-tokio,jemalloc`) — GPU tested separately.
-
-## Clippy
-
-Many style lints are suppressed in `src/lib.rs` (`#![allow(...)]`). Correctness and performance lints remain enabled. Do not add new `#![allow(...)]` entries without justification.
-
-## CI
-
-**2026-08 CI migration**: the PR gate on GitHub Actions is hosted-only and fast; the heavyweight
-legs run locally via `scripts/ci-local.sh` before every push, and again on Actions at main-push.
-
-**Per-PR (GitHub-hosted, parallel, ~5–8m):**
-- Lint — `cargo fmt --check`, safety audits (`scripts/audit-unsafe.sh` + `scripts/audit-unwrap.sh`), CHANGELOG gate (`skip-changelog` label is the escape hatch)
-- Check — clippy ×3 (default / graph / tokio) + `cargo nextest run --profile ci --no-default-features --features runtime-tokio,jemalloc` on ubuntu-latest with `MOON_NO_URING=1`
-- MSRV check — `cargo build` with Rust 1.94 toolchain
-- Memory steady-state gate
-- Fuzz (only with `ci-fuzz` label), Console Integration (only when console-relevant paths change), Integration Tests (only with `ci-full` label)
-
-**`workflow_dispatch` — the pre-merge matrix (moon#732):** only what no local gate can produce.
-- Check (Windows) — the one leg with no local equivalent, and the ~14m floor of any matrix
-- MSRV (1.94), Memory steady-state gate
-
-**Main-push only** (post-merge net, NOT a merge gate — `ci-local` gates these before the push):
-- Check (monoio — the shipped runtime; self-hosted, io_uring live; guarded by `tests/ci_covers_monoio.rs`,
-  which since #732 also asserts `ci-local` still runs a monoio suite — if neither does, nothing gates
-  the runtime that ships)
-- Client compat (self-hosted, real redis-server oracle), Check (macOS), Check (console feature)
-
-Measured before the cut (PR #731, 2026-08-26): 7 of 9 dispatch legs duplicated `ci-local`, and
-`check-monoio` + `client-compat` queued on the very moon-dev VM `ci-local` had just used.
-
-**Scheduled:** fuzz nightly 5h (18 targets, nightly compiler, `rust-toolchain.toml` removed for the job), Crash Matrix nightly + weekly soak, CodeQL weekly, supply-chain weekly.
-
-### Local CI (the merge bar)
+`scripts/ci-local.sh` is the local gate and, since #732, the **only** gate for the monoio suite (*the runtime that ships*), client-compat, macOS, and the console feature until a change reaches main. Run it before every push.
 
 ```bash
-scripts/ci-local.sh            # THE MERGE BAR: lint ×6 + VM monoio + VM tokio
-                               #   + client-compat + macOS host suite  (= --full)
-scripts/ci-local.sh --quick    # host lint gates only — NOT the merge bar
-scripts/ci-local.sh --fast     # pre-#732 default: lint + both VM suites, no
-                               #   compat/macOS — for iterating, NOT the merge bar
-scripts/ci-local.sh --native   # NO VM: both suites + compat on the macOS host
+scripts/ci-local.sh           # = --full: lint ×6 + VM monoio + VM tokio + client-compat + macOS
+scripts/ci-local.sh --native  # NO VM: both suites + client-compat on the macOS host
+scripts/ci-local.sh --fast    # lint + both VM suites — NOT the merge bar
+scripts/ci-local.sh --quick   # host lint only — NOT the merge bar
 ```
 
-The bare invocation is `--full` as of #732: the hosted matrix no longer runs macOS or
-client-compat, so if they are not gates here they are not gates anywhere until after merge.
-Each mode's verdict now names what it skipped — `--quick` and `--fast` say "NOT the merge bar"
-rather than printing the same `RESULT: PASS` a full run prints.
+`--native` is the fallback when the VM is unavailable. It is **not** equivalent: it ends by naming what it skipped — io_uring, Linux-only `cfg` code, Windows, the MSRV pin — instead of a bare PASS, and exits 2 with no `redis-server` oracle on PATH. The script captures every exit code directly (no piped gates) and fingerprints the tree at start and end: a branch switch or edit mid-run marks the result INVALID (exit 3) rather than a false green.
 
-`--native` is the fallback when moon-dev is unavailable (or when a long testing phase should
-stay on one machine): it runs both full suites plus the client-compat harness on macOS. It is
-NOT equivalent — macOS drives monoio on kqueue, so the shipped Linux io_uring path, the
-`cfg(target_os = "linux")` code, Windows, and the MSRV pin all go untested. The mode prints
-those gaps instead of a bare PASS, and refuses (exit 2) if no `redis-server` oracle is on PATH.
+**Windows cannot run locally.** Before merging, always dispatch the hosted matrix — `gh workflow run ci.yml --ref <branch>` (add `console-integration.yml` / `crash-matrix.yml` when warranted). It runs only what no local gate can produce: Check (Windows), MSRV 1.94, memory steady-state.
 
-Run the default mode before every push — it is the merge bar, and since #732 it is the ONLY
-gate for the monoio suite (**the runtime that ships**), client-compat, macOS, and the console
-feature until a change reaches main. The script captures every
-exit code directly (no piped gates), keeps VM builds on VM-local target dirs, pins
-`MOON_BIN` for the compat harness, and fingerprints the tree at start/end — a branch switch
-or edit mid-run marks the whole result INVALID (exit 3) instead of reporting a false green.
-Windows cannot run locally: before merging, still dispatch the hosted matrix with
-`gh workflow run ci.yml --ref <branch>` (add `console-integration.yml` / `crash-matrix.yml`
-when the change warrants them).
+**Per-PR (hosted, ~5–8m):** Lint (`cargo fmt --check`, unsafe/unwrap audits, CHANGELOG gate — `skip-changelog` is the escape hatch) · Check (clippy ×3 + tokio nextest under `MOON_NO_URING=1`) · MSRV · memory steady-state. Fuzz, console, and integration legs run only behind labels. **Main-push** (post-merge net, not a gate): monoio self-hosted with io_uring live, client-compat against a real redis-server, macOS, console feature. **Scheduled:** fuzz nightly 5h, crash matrix nightly + weekly soak, CodeQL and supply-chain weekly.
 
 <!-- ADD:BEGIN — managed by `add.py sync-guidelines`; do not edit inside -->
 ## ADD — how to work in this repo
