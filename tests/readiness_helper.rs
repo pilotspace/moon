@@ -1,11 +1,15 @@
 //! Red/green cover for `common::await_listening` (moon#752).
 //!
-//! The bug this replaces: 23 suites spawned a server on a thread and then
-//! slept a fixed 250ms before connecting. When startup took longer than the
-//! guess, every test in the file died on `Connection refused`. These tests
-//! pin the two properties a readiness probe must have and a fixed sleep
-//! cannot: it waits as long as the server actually needs, and it gives up
-//! with a useful error instead of hanging.
+//! The bug this replaces: 25 call sites across 24 suites spawned a server on a
+//! thread and then slept a fixed 250ms before connecting. When startup took
+//! longer than the guess, every test in the file died on `Connection refused`.
+//! These tests pin the two properties a readiness probe must have and a fixed
+//! sleep cannot: it waits as long as the server actually needs, and it gives
+//! up with a useful error instead of hanging.
+//!
+//! Every upper time bound below is deliberately loose. They exist to catch a
+//! HANG, not to assert a latency, and a tight ceiling on a heavily parallel CI
+//! runner is exactly the wall-clock fragility this PR removes.
 
 mod common;
 
@@ -21,7 +25,9 @@ async fn await_listening_waits_for_a_slow_bind() {
     std::thread::spawn(move || {
         std::thread::sleep(bind_after);
         let _l = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind");
-        std::thread::sleep(Duration::from_secs(5));
+        // Outlive the ceiling asserted below, so a slow runner cannot drop the
+        // listener out from under the probe and fail for the wrong reason.
+        std::thread::sleep(Duration::from_secs(60));
     });
 
     let start = Instant::now();
@@ -35,8 +41,8 @@ async fn await_listening_waits_for_a_slow_bind() {
         "returned before the listener existed ({waited:?} < {bind_after:?})"
     );
     assert!(
-        waited < Duration::from_secs(5),
-        "took far longer than the bind delay ({waited:?})"
+        waited < Duration::from_secs(30),
+        "probe appears to hang rather than return after the bind ({waited:?})"
     );
 }
 
@@ -62,39 +68,49 @@ async fn await_listening_times_out_with_a_useful_error() {
         "gave up before the deadline ({waited:?} < {deadline:?})"
     );
     assert!(
-        waited < deadline * 8,
-        "overshot the deadline badly ({waited:?})"
+        waited < deadline * 20,
+        "probe appears to hang rather than honour its deadline ({waited:?})"
     );
 }
 
-/// The negative control, and the reason this change exists: under the SAME
-/// scenario `await_listening_waits_for_a_slow_bind` survives, the pattern this
-/// PR removed — sleep a fixed 250ms, then connect — provably loses the race.
+/// The negative control, and the reason this change exists: a single connect
+/// attempt made at a fixed moment fails when the server has not bound yet,
+/// while the probe succeeds as soon as it does.
 ///
-/// Without this test the file only proves the new helper works; it would not
-/// show the old one was broken. The 250ms literal is the exact value the 25
-/// replaced call sites used.
+/// Without this test the file would only prove the new helper works, not that
+/// the pattern it replaces was broken.
+///
+/// The "not yet listening" window is closed by an explicit gate rather than by
+/// hoping a sleep outlasts a bind delay. An earlier wall-clock version of this
+/// test FAILED on Windows CI (moon#753): under nextest's parallelism the 250ms
+/// sleep overshot the 600ms bind, the connect succeeded, and the control
+/// reported the opposite of the truth. That is precisely the fragility this PR
+/// removes from 25 call sites, so the control must not rely on it either.
 #[tokio::test]
-async fn fixed_250ms_sleep_loses_the_race_the_probe_wins() {
+async fn fixed_sleep_loses_the_race_the_probe_wins() {
     let port = common::reserve_port();
-    let bind_after = Duration::from_millis(600);
+    let (open_gate, gate) = std::sync::mpsc::channel::<()>();
 
     std::thread::spawn(move || {
-        std::thread::sleep(bind_after);
-        let _l = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind");
+        // Bind ONLY when the test says so, so "nothing is listening yet" is a
+        // guarantee at the moment of the connect below, not a race.
+        gate.recv().expect("gate closed before bind");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind");
         std::thread::sleep(Duration::from_secs(5));
+        drop(listener);
     });
 
-    // Exactly what every replaced call site did.
+    // Exactly what every replaced call site did: sleep, then connect once.
     tokio::time::sleep(Duration::from_millis(250)).await;
-    let old_pattern = std::net::TcpStream::connect(("127.0.0.1", port));
     assert!(
-        old_pattern.is_err(),
-        "the fixed 250ms sleep was supposed to lose this race; if it connected, \
-         this control is not discriminating and the premise of moon#752 is unproven"
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+        "a one-shot connect must fail while the server has not bound; if it \
+         succeeded, this control is not discriminating and the premise of \
+         moon#752 is unproven"
     );
 
-    // The replacement, same scenario, same thread: succeeds.
+    // Same scenario, same thread: the probe waits for the bind and finds it.
+    open_gate.send(()).expect("binder thread died");
     common::await_listening(port, Duration::from_secs(10))
         .await
         .expect("the readiness probe must win where the fixed sleep lost");
