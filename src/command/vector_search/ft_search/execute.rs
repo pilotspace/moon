@@ -8,7 +8,11 @@
 //! (`parse_sparse_query_blob`). Response building lives in `response.rs`;
 //! high-level orchestration in `dispatch.rs`.
 //!
-//! No behavior change relative to the original `ft_search.rs` — pure relocation.
+//! The split itself was a pure relocation. Behaviour has since changed here
+//! once: `apply_range_filter` now takes an explicit [`ScoreOrder`] instead of
+//! inferring the comparison direction from the index's dense metric, which was
+//! wrong for dense COSINE/IP and unrelated to the sparse and RRF scores it was
+//! also applied to (moon#748).
 
 use bytes::Bytes;
 use smallvec::SmallVec;
@@ -17,7 +21,7 @@ use crate::protocol::Frame;
 use crate::vector::filter::FilterExpr;
 use crate::vector::keymap::BucketedKeyMap;
 use crate::vector::store::VectorStore;
-use crate::vector::types::{DistanceMetric, SearchResult};
+use crate::vector::types::SearchResult;
 
 use super::response::build_search_response;
 
@@ -369,21 +373,48 @@ pub fn search_local_filtered(
 /// Maximum results from a RANGE query to prevent memory explosion.
 const RANGE_HARD_CAP: usize = 10_000;
 
-/// Apply range threshold filtering to search results based on distance metric.
+/// Which direction of a [`SearchResult::distance`] means "better".
 ///
-/// - L2: lower distance = more similar, keep `distance <= threshold`
-/// - Cosine/IP: higher score = more similar, keep `distance >= threshold`
+/// `SearchResult.distance` does not carry one convention. Three different kinds
+/// of score travel in that field, and only the call site knows which:
 ///
-/// Truncates to `RANGE_HARD_CAP` after filtering.
+/// - **dense KNN** — a true distance. Lower is closer, for *every* metric: the
+///   unit-sphere metrics normalize at encode time and score `‖a−b‖² = 2−2·cos`,
+///   which increases with cosine distance just as L2 does.
+/// - **sparse** — a raw dot product straight out of `SparseStore::search`,
+///   never negated. Higher is better.
+/// - **RRF fusion** — accumulated `1/(k+rank)` terms, but `rrf_fuse` stores
+///   `distance = -score` so `SearchResult::Ord` sorts best-first. Lower is
+///   better, like a dense distance.
+///
+/// Note how little the field name tells you: two of these three are "scores"
+/// and one of those is negated. A live probe, not the name, is what settles it.
+///
+/// This used to be inferred from the index's *dense* metric even when the
+/// values being filtered were sparse or fused scores, which is how moon#748
+/// stayed hidden: the dense branch was reversed, and the sparse/fused sites were
+/// right or wrong depending on an unrelated field's metric. Naming the
+/// convention at the call site is what makes each one checkable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ScoreOrder {
+    /// Dense KNN distances: keep `distance <= threshold`.
+    LowerIsCloser,
+    /// Sparse dot products and RRF fusion scores: keep `distance >= threshold`.
+    HigherIsBetter,
+}
+
+/// Apply the `RANGE <threshold>` filter, then truncate to [`RANGE_HARD_CAP`].
+///
+/// `order` must describe the scores actually in `results` — see [`ScoreOrder`].
 pub(super) fn apply_range_filter(
     results: &mut SmallVec<[SearchResult; 32]>,
     threshold: f32,
-    metric: DistanceMetric,
+    order: ScoreOrder,
 ) {
-    results.retain(|r| match metric {
-        DistanceMetric::L2 => r.distance <= threshold,
-        DistanceMetric::Cosine | DistanceMetric::InnerProduct => r.distance >= threshold,
-    });
+    match order {
+        ScoreOrder::LowerIsCloser => results.retain(|r| r.distance <= threshold),
+        ScoreOrder::HigherIsBetter => results.retain(|r| r.distance >= threshold),
+    }
     results.truncate(RANGE_HARD_CAP);
 }
 

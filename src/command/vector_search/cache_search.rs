@@ -171,16 +171,24 @@ fn parse_cachesearch_args(args: &[Frame]) -> Result<CacheSearchArgs, Frame> {
     })
 }
 
-/// Check whether a distance value is "within threshold" for a given metric.
+/// Check whether a distance value is "within threshold".
 ///
-/// - L2: distance <= threshold (lower is closer)
-/// - Cosine / InnerProduct: distance >= threshold (higher is more similar)
+/// `distance <= threshold` for every metric, because every metric this engine
+/// supports ranks by a distance where LOWER is closer (moon#748).
+///
+/// This used to branch on the metric, treating Cosine and InnerProduct as
+/// similarities where higher is closer. They are not. Both are unit-sphere
+/// metrics here — the vector is normalized at encode time — and every scoring
+/// path goes through `l2_f32`, so the score is `‖a−b‖² = 2 − 2·cos`, a
+/// monotonically increasing function of cosine distance. An exact self-match
+/// scores ~0 (not exactly 0: vectors are stored quantized) and an orthogonal
+/// vector scores ~2. `FT.SEARCH` sorts these ascending, nearest first.
+///
+/// The `metric` parameter is kept so that adding a genuine higher-is-closer
+/// metric later is a change to this function rather than to its callers.
 #[inline]
-fn is_within_threshold(distance: f32, threshold: f32, metric: DistanceMetric) -> bool {
-    match metric {
-        DistanceMetric::L2 => distance <= threshold,
-        DistanceMetric::Cosine | DistanceMetric::InnerProduct => distance >= threshold,
-    }
+fn is_within_threshold(distance: f32, threshold: f32, _metric: DistanceMetric) -> bool {
+    distance <= threshold
 }
 
 /// Probe the vector index for cache hits: entries whose Redis key starts with
@@ -263,13 +271,15 @@ fn cache_probe(
             // Extract score from the fields array
             let score = extract_score_from_fields(&items[pos + 1]);
             if is_within_threshold(score, threshold, metric) {
+                // Nearest wins, for every metric — same reasoning as
+                // `is_within_threshold`: these scores are distances, so the
+                // smallest one is the best cached answer (moon#748). This
+                // comparison used to mirror the reversed threshold test, which
+                // made a COSINE cache serve the FARTHEST entry inside the
+                // threshold instead of the nearest. That failure is silent:
+                // `cache_hit` is still true, just answering the wrong query.
                 let dominated = match &best {
-                    Some(prev) => match metric {
-                        DistanceMetric::L2 => score < prev.distance,
-                        DistanceMetric::Cosine | DistanceMetric::InnerProduct => {
-                            score > prev.distance
-                        }
-                    },
+                    Some(prev) => score < prev.distance,
                     None => true,
                 };
                 if dominated {

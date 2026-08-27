@@ -2619,36 +2619,92 @@ mod cache_search_tests {
 
     #[test]
     fn test_is_cache_hit_cosine_within() {
-        // Cosine: higher = more similar. Threshold 0.95 means distance >= 0.95 is a hit.
+        // Cosine is a DISTANCE here, not a similarity: the engine normalizes to
+        // the unit sphere and scores ‖a−b‖² = 2−2·cos, so lower is closer and an
+        // exact self-match lands near 0 (moon#748). These numbers are the ones
+        // the engine actually produces — an exact match (~0.006) and a 0.1-away
+        // neighbour — not hand-picked similarities.
         assert!(cache_search::is_within_threshold_for_test(
-            0.97,
-            0.95,
+            0.006,
+            0.5,
             DistanceMetric::Cosine
         ));
         assert!(cache_search::is_within_threshold_for_test(
-            0.95,
-            0.95,
+            0.1,
+            0.5,
+            DistanceMetric::Cosine
+        ));
+        // Boundary is inclusive, same as L2.
+        assert!(cache_search::is_within_threshold_for_test(
+            0.5,
+            0.5,
             DistanceMetric::Cosine
         ));
     }
 
     #[test]
     fn test_is_cache_hit_cosine_outside() {
+        // An orthogonal vector scores 1.0; an opposed one 2.0. Both are misses
+        // at a 0.5 threshold. Before moon#748 these were the only values that
+        // registered as HITS.
         assert!(!cache_search::is_within_threshold_for_test(
-            0.90,
-            0.95,
+            1.0,
+            0.5,
+            DistanceMetric::Cosine
+        ));
+        assert!(!cache_search::is_within_threshold_for_test(
+            2.0,
+            0.5,
             DistanceMetric::Cosine
         ));
     }
 
     #[test]
     fn test_is_cache_hit_ip_within() {
-        // InnerProduct: higher = more similar.
+        // InnerProduct is unit-sphere in this engine too — there is no true
+        // dot-product ranking anywhere — so it behaves exactly like Cosine.
         assert!(cache_search::is_within_threshold_for_test(
-            0.99,
-            0.9,
+            0.006,
+            0.5,
             DistanceMetric::InnerProduct
         ));
+        assert!(!cache_search::is_within_threshold_for_test(
+            1.0,
+            0.5,
+            DistanceMetric::InnerProduct
+        ));
+    }
+
+    /// The property that moon#748 violated: the threshold predicate does not
+    /// depend on the metric. Every metric ranks by a lower-is-closer distance,
+    /// so a score that is a hit under one must be a hit under all.
+    ///
+    /// This is the test that would have caught the original bug. The per-metric
+    /// tests above could not: each asserted its own metric in isolation, so a
+    /// reversed branch just meant reversed expectations, and CI stayed green.
+    #[test]
+    fn test_is_cache_hit_is_metric_independent() {
+        let metrics = [
+            DistanceMetric::L2,
+            DistanceMetric::Cosine,
+            DistanceMetric::InnerProduct,
+        ];
+        for &score in &[0.0f32, 0.006, 0.1, 0.5, 0.51, 1.0, 2.0, f32::MAX] {
+            let verdicts: Vec<bool> = metrics
+                .iter()
+                .map(|&m| cache_search::is_within_threshold_for_test(score, 0.5, m))
+                .collect();
+            assert!(
+                verdicts.iter().all(|&v| v == verdicts[0]),
+                "score {score} is a hit under some metrics and a miss under others: {verdicts:?}"
+            );
+            assert_eq!(
+                verdicts[0],
+                score <= 0.5,
+                "score {score} against threshold 0.5 should be {}",
+                score <= 0.5
+            );
+        }
     }
 
     #[test]

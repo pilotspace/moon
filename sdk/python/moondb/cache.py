@@ -62,7 +62,20 @@ class CacheCommands:
             index: Index name.
             cache_prefix: Key prefix for cache entries.
             query_vector: Query vector.
-            threshold: Distance threshold for cache hit (lower = stricter for L2).
+            threshold: Maximum distance for a cache hit, i.e. an entry matches
+                when ``distance <= threshold``. Lower is stricter, for **every**
+                metric — L2, COSINE and IP all score as distances where lower
+                means closer. On the unit-sphere metrics (COSINE, IP) the score
+                is ``2 - 2*cos``, so it runs 0.0 (identical) to 2.0 (opposed),
+                and an exact match lands near 0.006 rather than exactly 0.0
+                because vectors are stored quantized.
+
+                Note the ``0.95`` default is loose under these semantics: on a
+                COSINE index it admits entries roughly orthogonal to the query.
+                It was chosen when the server wrongly treated these metrics as
+                similarities (moon#748). Pass an explicit, much smaller value
+                (0.05-0.2 is a typical semantic-cache band) rather than relying
+                on it.
             fallback_k: Number of results on cache miss.
             k: K for the KNN query.
             field_name: Vector field name.

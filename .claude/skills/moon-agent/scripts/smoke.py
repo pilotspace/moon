@@ -111,27 +111,35 @@ CACHE_KEY, CACHE_PREFIX = "smem:cache:q1", "smem:cache:"
 
 
 def cache_hit_semantics():
-    """An exact-match query must report cache_hit=True.
+    """An exact-match query must HIT and an unrelated one must MISS.
 
-    Regression detector for moon#748: on COSINE/INNER_PRODUCT indexes cache_hit is
-    inverted (true when the nearest entry is FARTHER than threshold). Reported as a
-    SKIP while that issue is open; flips to PASS once it is fixed.
+    Regression guard for moon#748, fixed in 0.8.8: `cache_hit` used to be
+    inverted on COSINE/INNER_PRODUCT indexes (true when the nearest entry was
+    FARTHER than the threshold). Both directions are asserted, because checking
+    only the hit would still pass if the predicate were reversed AND the
+    threshold happened to admit everything.
+
+    This fails loudly rather than skipping. A silent skip is exactly how the
+    original bug stayed invisible.
     """
     c.cache.store(CACHE_KEY, vec(7), answer="42", ttl=300)
     time.sleep(0.4)
     r = c.cache.lookup("smokemem", CACHE_PREFIX, vec(7), threshold=0.5)
     top = round(r.results[0].score, 4) if r.results else None
     if not r.cache_hit:
-        far = c.cache.lookup("smokemem", CACHE_PREFIX, vec(9999), threshold=0.5)
-        if far.cache_hit:
-            raise Skip(f"moon#748: cache_hit inverted on COSINE "
-                       f"(exact score={top} -> miss, far query -> hit)")
-        raise AssertionError(f"exact-match query missed (top score={top})")
+        raise AssertionError(
+            f"exact-match query MISSED (top score={top}) -- moon#748 regression: "
+            f"the threshold predicate is reversed for this index's metric")
+    far = c.cache.lookup("smokemem", CACHE_PREFIX, vec(9999), threshold=0.5)
+    if far.cache_hit:
+        raise AssertionError(
+            "unrelated query reported a cache HIT -- moon#748 regression: "
+            "the threshold predicate is reversed for this index's metric")
     return f"hit, top score={top}"
 
 
 check("cache.store", lambda: c.cache.store(CACHE_KEY, vec(7), answer="42", ttl=300))
-check("cache.lookup semantics (moon#748)", cache_hit_semantics)
+check("cache.lookup hit/miss direction (moon#748)", cache_hit_semantics)
 check("cache.invalidate", lambda: c.cache.invalidate(CACHE_KEY))
 
 print("\n[F] full-text")

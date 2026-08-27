@@ -7,14 +7,28 @@
 pub struct VectorId(pub u32);
 
 /// Distance metric for similarity computation.
+///
+/// **Every variant scores as a distance: lower = more similar.** Cosine and
+/// InnerProduct are unit-sphere metrics in this engine — the vector is
+/// normalized at encode time and every scoring path goes through `l2_f32` — so
+/// the score is `‖a−b‖² = 2 − 2·cos`, which increases monotonically with cosine
+/// distance. There is no true dot-product (higher-is-better) ranking anywhere.
+///
+/// The docs here previously called Cosine and InnerProduct similarities where
+/// "higher = more similar". That was wrong, and `FT.CACHESEARCH` believed it:
+/// it tested `distance >= threshold` for those two metrics and so reported a
+/// cache MISS for an identical query and a HIT for an unrelated one (moon#748).
+/// Anything that compares two scores from this engine must treat smaller as
+/// closer, whatever the metric.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DistanceMetric {
-    /// Euclidean (L2 squared) distance. Lower = more similar.
+    /// Euclidean (L2 squared) distance over the raw vector. Lower = closer.
     L2 = 0,
-    /// Cosine similarity. Higher = more similar.
+    /// Cosine distance, `1 − cos(a, b)`, in `[0, 2]`. Lower = closer.
     Cosine = 1,
-    /// Inner (dot) product. Higher = more similar.
+    /// Inner product, normalized to the unit sphere — ranks identically to
+    /// [`DistanceMetric::Cosine`]. Lower = closer.
     InnerProduct = 2,
 }
 
