@@ -26,6 +26,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does.
 
   The Cypher path was never affected — it is fed by the grammar, which already knows the type.
+- **`FT.CREATE` acked `+OK` before every shard had persisted the index definition, so a restart
+  permanently lost part of the index (moon#743).**
+
+  `VectorStore::save_index_meta_sidecar` is a no-op while `persist_dir` is `None`, and
+  `persist_dir` was assigned only inside `recover_indexes_task` — which moon#476 made *spawned*
+  rather than inline, so the shard starts serving before it runs. A shard that handled
+  `FT.CREATE` in that window created the index in memory, wrote no `vector-indexes.meta`, and
+  still acked `+OK`.
+
+  The `-LOADING` gate could not cover it: `shard::loading::is_loading()` is a thread-local read
+  on the *connection's* shard, while `FT.CREATE` fans out to every shard via
+  `broadcast_vector_command`. The connection's own shard being ready says nothing about shard 3.
+
+  On the next start those shards found no index metadata, so recovery skipped the HASH rescan
+  entirely and their documents never re-entered the index — permanently, and with no log line
+  saying so. Measured symptom: an 8-document vector-only index restarting as
+  `FT.SEARCH vidx "*"` → 3 documents, forever, on 5 of 6 concurrently started servers.
+
+  `persist_dir` is now assigned synchronously, before the recovery task is spawned, so no shard
+  can serve `FT.CREATE` without one; the path is resolved once by a shared
+  `vector_persist_dir_for` helper rather than computed in two places. Separately, a sidecar that
+  fails to *read* now logs a warning instead of being swallowed by a catch-all `_ => None` —
+  an empty sidecar is ordinary first-boot state, but a read error costs that shard every index
+  it had and must not be silent.
+
+  Regression test: `tests/ft_create_durable_at_ack_743.rs` asserts the ack is durable on every
+  shard. It repeats the spawn because the defect is a startup race — pre-fix detection was
+  3/12 spawns at `--shards 4`, 5/10 at 8, 7/10 at 16, so the test uses 8 shards × 6 rounds
+  (~1.6% escape). Post-fix it is deterministic: 18/18 spawns, 144 shard-draws, zero misses.
 
 ### Changed
 - **Bump the async-runtime group: tokio 1.52.3 -> 1.53.1, tokio-stream 0.1.18 -> 0.1.19, tokio-util 0.7.18 -> 0.7.19 (moon#692).**
