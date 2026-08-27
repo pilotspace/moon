@@ -174,8 +174,24 @@ const NEAR: [f32; DIM] = [0.9, 0.435_889_9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 /// `THRESHOLD` under every metric, so a probe with this vector must MISS.
 const FAR: [f32; DIM] = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
-fn spawn_on(port: u16, dir: &std::path::Path) -> Child {
-    Command::new(common::find_moon_binary())
+/// Owns a spawned server and kills it on drop.
+///
+/// The kill MUST NOT be a plain statement at the end of a test: every fixture
+/// helper below asserts, and a panic in one skips straight past such a line and
+/// orphans the process. That is not hypothetical — a failing run during
+/// development left a server alive for 1h29m holding a port whose temp dir had
+/// already been deleted. `Drop` runs during unwind, so it covers every path.
+struct Server(Child);
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_on(port: u16, dir: &std::path::Path) -> Server {
+    let child = Command::new(common::find_moon_binary())
         .args([
             "--port",
             &port.to_string(),
@@ -189,7 +205,8 @@ fn spawn_on(port: u16, dir: &std::path::Path) -> Child {
         .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
         .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
         .spawn()
-        .expect("spawn moon (run `cargo build --release` first)")
+        .expect("spawn moon (run `cargo build --release` first)");
+    Server(child)
 }
 
 fn await_ready(port: u16) {
@@ -351,7 +368,7 @@ fn cache_hit_direction_is_the_same_for_every_metric() {
     for (metric, index) in [("L2", "idx_l2"), ("COSINE", "idx_cos"), ("IP", "idx_ip")] {
         let dir = tempfile::tempdir().expect("tempdir");
         let port = common::reserve_port();
-        let mut child = spawn_on(port, dir.path());
+        let _server = spawn_on(port, dir.path());
         await_ready(port);
 
         let mut c = Conn::open(port);
@@ -380,9 +397,6 @@ fn cache_hit_direction_is_the_same_for_every_metric() {
                  the threshold predicate is reversed for this metric"
             ));
         }
-
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     assert!(
@@ -406,7 +420,7 @@ fn range_filter_keeps_the_near_results_for_every_metric() {
     for (metric, index) in [("L2", "idx_l2"), ("COSINE", "idx_cos"), ("IP", "idx_ip")] {
         let dir = tempfile::tempdir().expect("tempdir");
         let port = common::reserve_port();
-        let mut child = spawn_on(port, dir.path());
+        let _server = spawn_on(port, dir.path());
         await_ready(port);
 
         let mut c = Conn::open(port);
@@ -429,9 +443,6 @@ fn range_filter_keeps_the_near_results_for_every_metric() {
                 show(&want)
             ));
         }
-
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     assert!(
@@ -464,7 +475,7 @@ fn range_filter_keeps_the_near_results_for_every_metric() {
 fn hybrid_range_keeps_the_high_scoring_documents() {
     let dir = tempfile::tempdir().expect("tempdir");
     let port = common::reserve_port();
-    let mut child = spawn_on(port, dir.path());
+    let _server = spawn_on(port, dir.path());
     await_ready(port);
 
     let mut c = Conn::open(port);
@@ -513,9 +524,6 @@ fn hybrid_range_keeps_the_high_scoring_documents() {
         i += 2;
     }
     keys.sort();
-
-    let _ = child.kill();
-    let _ = child.wait();
 
     assert_eq!(
         keys,
