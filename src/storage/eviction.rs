@@ -110,13 +110,68 @@ pub fn publish_maxmemory_hints(config: &RuntimeConfig) {
     MAXMEMORY_HINT.store(config.maxmemory, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// THE effective memory budget a write is held to — the single definition,
+/// shared by every path that enforces `maxmemory`.
+///
+/// Both the locked slow path (`evict_to_budget`) and the lock-free inline
+/// pre-gate (`inline_write_can_skip_eviction`) call this, so they cannot
+/// disagree on the cap: they do not merely apply the same formula, they run the
+/// same code. moon#475: they DID disagree. The pre-gate open-coded the budget
+/// and omitted the footprint divide, so one server enforced two different
+/// effective `maxmemory` caps depending on which dispatch path a command took —
+/// a plain `SET` (inline) was capped at `maxmemory`, while `HSET`/`EVAL` (the
+/// other two dispatch paths) were capped at `maxmemory / ratio`.
+///
+/// - `elastic`: the caller's budget override (`EvictionRun::budget`), capped at
+///   the instance `maxmemory`. Zero means "no override" → use `per_shard`.
+/// - `per_shard`: `RuntimeConfig::maxmemory_per_shard()`, the shared-nothing
+///   split of the instance limit.
+/// - `ratio`: an ALREADY-SAMPLED footprint correction (see
+///   [`crate::admin::metrics_setup::footprint_correction`] — one Relaxed atomic
+///   load). Never sample inside this function: PR #510 moved that sampling off
+///   the write path after it measured -57% on SET at c=8 P=16. A `ratio` of NaN
+///   or <= 1.0 is the identity, so an unsampled or nonsensical correction can
+///   only widen the budget back to the uncorrected value, never collapse it.
+///
+/// Scaling by the correction is what makes `maxmemory` bound REAL process
+/// footprint rather than the accounting figure — see the block comment in
+/// `evict_to_budget` for the measurement that motivated it.
+#[inline]
+pub(crate) fn effective_budget(elastic: usize, mm: usize, per_shard: usize, ratio: f64) -> usize {
+    let budget = if elastic > 0 {
+        elastic.min(mm)
+    } else {
+        per_shard
+    };
+    if ratio > 1.0 {
+        ((budget as f64) / ratio) as usize
+    } else {
+        budget
+    }
+}
+
 /// Lock-free pre-gate for the inline write path: `true` iff the slow path
 /// (`evict_to_budget`) would PROVABLY no-op, i.e. `maxmemory == 0` or
-/// `estimated_memory <= budget` with the budget computed exactly as the slow
-/// path does (`elastic_budget.min(maxmemory)`, else per-shard split). Any
-/// uncertainty (unpublished hints) returns `false` → caller takes the lock
-/// and runs the existing full path. Hint staleness is bounded by the same
-/// one-write-behind window the 100ms elastic-budget tick already accepts.
+/// `estimated_memory <= budget`, where `budget` comes from the shared
+/// [`effective_budget`] — the same function, on the same sampled ratio, that
+/// the slow path calls, so the two cannot enforce different caps. Any
+/// uncertainty (unpublished hints) returns `false` → caller takes the lock and
+/// runs the existing full path.
+///
+/// Cost: three Relaxed atomic loads (two `maxmemory` hints plus the cached
+/// footprint correction) and one predictable branch. NOTHING here samples the
+/// platform — the correction is republished once a second by shard 0's chore,
+/// because measuring it per write cost -57% on SET at c=8 P=16 (PR #510).
+///
+/// Staleness of all three reads is bounded by the same one-write-behind window
+/// the 100ms elastic-budget tick already accepts.
+///
+/// moon#475: this used to omit the footprint correction while the slow path
+/// applied it, so a plain `SET` (inline path) was capped at `maxmemory` while
+/// `HSET`/`EVAL` (the other two dispatch paths) were capped at
+/// `maxmemory / ratio`. One server, two effective limits, no error and no log
+/// line. Regression test:
+/// `test_inline_pre_gate_agrees_with_slow_path_under_footprint_correction`.
 #[inline]
 pub fn inline_write_can_skip_eviction(estimated_memory: usize, elastic_budget: usize) -> bool {
     can_skip_eviction(
@@ -124,6 +179,7 @@ pub fn inline_write_can_skip_eviction(estimated_memory: usize, elastic_budget: u
         MAXMEMORY_PER_SHARD_HINT.load(std::sync::atomic::Ordering::Relaxed),
         estimated_memory,
         elastic_budget,
+        crate::admin::metrics_setup::footprint_correction(),
     )
 }
 
@@ -137,6 +193,7 @@ fn can_skip_eviction(
     per_shard: usize,
     estimated_memory: usize,
     elastic_budget: usize,
+    footprint_ratio: f64,
 ) -> bool {
     if mm == usize::MAX {
         return false; // unpublished — fail safe
@@ -144,15 +201,13 @@ fn can_skip_eviction(
     if mm == 0 {
         return true; // unlimited: slow path early-returns
     }
-    let budget = if elastic_budget > 0 {
-        elastic_budget.min(mm)
-    } else {
-        if per_shard == usize::MAX {
-            return false;
-        }
-        per_shard
-    };
-    estimated_memory <= budget
+    if elastic_budget == 0 && per_shard == usize::MAX {
+        return false; // per-shard split needed but unpublished — fail safe
+    }
+    // moon#475: the SAME function the slow path uses, footprint correction
+    // included. Not a copied formula — one implementation, so the inline path
+    // cannot drift back into enforcing a different effective cap.
+    estimated_memory <= effective_budget(elastic_budget, mm, per_shard, footprint_ratio)
 }
 
 /// Reservoir-sample up to `samples` random keys from the database without
@@ -504,12 +559,6 @@ pub fn evict_to_budget(
 
     let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
 
-    let budget = if run.budget_override > 0 {
-        run.budget_override.min(config.maxmemory)
-    } else {
-        config.maxmemory_per_shard()
-    };
-
     // Scale the budget down by how far the OS-charged footprint exceeds what
     // the allocator says is live.
     //
@@ -539,11 +588,12 @@ pub fn evict_to_budget(
         // would inflate the ratio by roughly the shard count and evict N times
         // too aggressively at `--shards N`.
         let ratio = crate::admin::metrics_setup::footprint_correction();
-        if ratio > 1.0 {
-            ((budget as f64) / ratio) as usize
-        } else {
-            budget
-        }
+        effective_budget(
+            run.budget_override,
+            config.maxmemory,
+            config.maxmemory_per_shard(),
+            ratio,
+        )
     };
 
     let mut sink = run.sink;
@@ -3039,34 +3089,37 @@ mod tests {
     /// The lock-free inline-write pre-gate must skip the runtime-config lock
     /// ONLY when the slow path (`evict_to_budget`, no-op iff
     /// `total <= budget`) would provably do nothing. Tests the pure decision
-    /// core — the public wrapper only adds two Relaxed loads of the
-    /// process-global hints, which race with `CONFIG SET maxmemory` tests in
-    /// the parallel test binary and are therefore not asserted on here.
+    /// core — the public wrapper only adds three Relaxed loads (the two
+    /// process-global hints plus the cached footprint correction), which race
+    /// with `CONFIG SET maxmemory` tests in the parallel test binary and are
+    /// therefore not asserted on here. Every case below pins the neutral
+    /// correction 1.0; ratios > 1.0 are covered by
+    /// `test_inline_pre_gate_agrees_with_slow_path_under_footprint_correction`.
     #[test]
     fn test_inline_write_can_skip_eviction_gate() {
         const UNPUB: usize = usize::MAX;
 
         // Unpublished sentinel (either hint needed) → fail safe: slow path.
-        assert!(!can_skip_eviction(UNPUB, UNPUB, 0, 0));
-        assert!(!can_skip_eviction(UNPUB, 1000, 0, 0));
-        assert!(!can_skip_eviction(1000, UNPUB, 0, 0)); // per-shard needed, missing
+        assert!(!can_skip_eviction(UNPUB, UNPUB, 0, 0, 1.0));
+        assert!(!can_skip_eviction(UNPUB, 1000, 0, 0, 1.0));
+        assert!(!can_skip_eviction(1000, UNPUB, 0, 0, 1.0)); // per-shard needed, missing
 
         // maxmemory == 0 (unlimited): slow path early-returns → provable skip,
         // even if the per-shard hint is missing.
-        assert!(can_skip_eviction(0, UNPUB, usize::MAX, 0));
+        assert!(can_skip_eviction(0, UNPUB, usize::MAX, 0, 1.0));
 
         // maxmemory 1000, per-shard 1000 (1 shard), no elastic budget:
         // skip iff est <= 1000 (slow-path loop condition is `total > budget`).
-        assert!(can_skip_eviction(1000, 1000, 1000, 0));
-        assert!(!can_skip_eviction(1000, 1000, 1001, 0));
+        assert!(can_skip_eviction(1000, 1000, 1000, 0, 1.0));
+        assert!(!can_skip_eviction(1000, 1000, 1001, 0, 1.0));
 
         // Elastic budget overrides per-shard, capped at instance maxmemory —
         // mirror of `budget_override.min(config.maxmemory)` in the slow path.
         // (per-shard hint irrelevant when elastic > 0, even unpublished.)
-        assert!(can_skip_eviction(1000, UNPUB, 700, 800));
-        assert!(!can_skip_eviction(1000, UNPUB, 900, 800));
-        assert!(can_skip_eviction(1000, UNPUB, 999, 1500)); // cap: min(1500,1000)
-        assert!(!can_skip_eviction(1000, UNPUB, 1400, 1500));
+        assert!(can_skip_eviction(1000, UNPUB, 700, 800, 1.0));
+        assert!(!can_skip_eviction(1000, UNPUB, 900, 800, 1.0));
+        assert!(can_skip_eviction(1000, UNPUB, 999, 1500, 1.0)); // cap: min(1500,1000)
+        assert!(!can_skip_eviction(1000, UNPUB, 1400, 1500, 1.0));
 
         // Multi-shard: per-shard budget = ceil(maxmemory / num_shards), as
         // published from `maxmemory_per_shard()` (its rounding has its own
@@ -3077,8 +3130,96 @@ mod tests {
             ..Default::default()
         };
         let per_shard = rt.maxmemory_per_shard();
-        assert!(can_skip_eviction(1000, per_shard, 250, 0));
-        assert!(!can_skip_eviction(1000, per_shard, 251, 0));
+        assert!(can_skip_eviction(1000, per_shard, 250, 0, 1.0));
+        assert!(!can_skip_eviction(1000, per_shard, 251, 0, 1.0));
+    }
+
+    /// The slow path's own budget rule, derived from `evict_to_budget`:
+    /// `budget_override > 0 ? min(override, maxmemory) : maxmemory_per_shard`,
+    /// scaled by the footprint correction, and the loop no-ops iff
+    /// `total <= budget`. This is the ORACLE the lock-free pre-gate must agree
+    /// with — it is what actually decides whether a write is capped.
+    fn slow_path_would_noop(
+        mm: usize,
+        per_shard: usize,
+        est: usize,
+        elastic: usize,
+        ratio: f64,
+    ) -> bool {
+        if mm == 0 {
+            return true; // `evict_to_budget` early-returns Ok(())
+        }
+        est <= effective_budget(elastic, mm, per_shard, ratio)
+    }
+
+    /// moon#475 residual: the inline write path's pre-gate MUST agree with the
+    /// slow path once the OS-footprint correction is active.
+    ///
+    /// The pre-gate's contract is "true iff `evict_to_budget` would provably
+    /// no-op". A `true` that the slow path disagrees with is a write admitted
+    /// above the operator's effective `maxmemory` — silently, with no error and
+    /// no log line. The pre-gate is reachable ONLY from
+    /// `server::conn::try_inline_dispatch`, so a plain `SET` got the
+    /// uncorrected cap while `HSET`/`EVAL` (the other two dispatch paths, which
+    /// call `evict_to_budget` unconditionally) got the corrected one: one
+    /// server, two effective caps.
+    ///
+    /// Every ratio here is > 1.0 — the case the original ~20 assertions never
+    /// covered, which is exactly why the divergence shipped.
+    #[test]
+    fn test_inline_pre_gate_agrees_with_slow_path_under_footprint_correction() {
+        let rt = RuntimeConfig {
+            maxmemory: 1_000_000,
+            num_shards: 4,
+            ..Default::default()
+        };
+        let mm = rt.maxmemory;
+        let per_shard = rt.maxmemory_per_shard();
+
+        // Named regression: maxmemory 1000, correction 2.0 -> effective 500.
+        // 800 bytes is OVER the corrected cap, so the slow path would act and
+        // the pre-gate must NOT claim a provable no-op.
+        assert!(
+            !can_skip_eviction(1000, 1000, 800, 0, 2.0),
+            "moon#475: pre-gate skipped eviction at est=800 against a \
+             correction-scaled budget of 500 (maxmemory 1000 / ratio 2.0)"
+        );
+
+        // Exhaustive agreement sweep across the live ratio range. The
+        // correction is clamped to [1.0, 8.0] by `footprint::ratio_from`, and
+        // 2.3 is the ratio actually measured on the instance that motivated
+        // PR #478.
+        for &ratio in &[1.0f64, 1.05, 1.5, 2.0, 2.3, 4.0, 8.0] {
+            for &elastic in &[0usize, 1, per_shard, mm / 2, mm, mm * 2] {
+                for &est in &[
+                    0usize,
+                    1,
+                    per_shard / 2,
+                    per_shard,
+                    per_shard + 1,
+                    mm / 2,
+                    mm,
+                    mm + 1,
+                ] {
+                    let gate = can_skip_eviction(mm, per_shard, est, elastic, ratio);
+                    let oracle = slow_path_would_noop(mm, per_shard, est, elastic, ratio);
+                    assert_eq!(
+                        gate, oracle,
+                        "pre-gate/slow-path divergence: ratio={ratio} elastic={elastic} \
+                         est={est} per_shard={per_shard} mm={mm} -> gate={gate} oracle={oracle}"
+                    );
+                }
+            }
+        }
+
+        // The fail-safe sentinels stay fail-safe regardless of the ratio: an
+        // unpublished hint must never be rescued into a `true` by a correction.
+        for &ratio in &[1.0f64, 2.3, 8.0] {
+            assert!(!can_skip_eviction(usize::MAX, usize::MAX, 0, 0, ratio));
+            assert!(!can_skip_eviction(1000, usize::MAX, 0, 0, ratio));
+            // maxmemory == 0 is unlimited on BOTH paths, correction irrelevant.
+            assert!(can_skip_eviction(0, usize::MAX, usize::MAX, 0, ratio));
+        }
     }
 
     // ── W4: evict_to_budget (single entry point) behavior pins ────────────
