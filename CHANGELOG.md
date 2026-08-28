@@ -229,6 +229,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   why this shipped. `test_inline_pre_gate_agrees_with_slow_path_under_footprint_correction`
   sweeps ratios across the clamped `[1.0, 8.0]` range and asserts the pre-gate's decision equals
   the slow path's for every combination of elastic budget and estimated memory.
+- **Test harnesses reported spurious failures for any long-output command
+  (`set -o pipefail` + `grep -q`).**
+
+  `grep -q` exits on the FIRST match, closing the pipe. Under `set -o pipefail`
+  that SIGPIPEs the writer, so the *pipeline* reports failure even though grep
+  itself succeeded:
+
+  ```bash
+  set -euo pipefail
+  if echo "$long_output" | grep -qvE "^(\(error\)|ERR )"; then PASS; else FAIL; fi
+  #    ^ SIGPIPE -> pipefail -> non-zero pipeline -> spurious FAIL
+  ```
+
+  Any assertion whose output exceeded a pipe buffer failed regardless of what
+  moon returned, and both match polarities were affected — a positive-match
+  assert whose pattern hits early closes the pipe just as readily. The failure
+  could only manufacture false *failures*, never false passes, so nothing was
+  being hidden; but it silently understated the pass rate on every long-output
+  command.
+
+  Confirmed against `moon#683`'s remaining failures: `SSCAN` and `COMMAND` were
+  both reported as errors while returning correct results (`SSCAN` -> the cursor
+  plus all three members; `COMMAND` -> 3,948 lines across 273 commands). Both
+  were preceded in the log by `echo: write error: Broken pipe`.
+
+  Fixed with a `qgrep` helper that drains stdin before matching, so the writer
+  always completes and only grep's own verdict is reported. Applied to 156 call
+  sites across `test-commands.sh` (128), `test-consistency.sh` (17),
+  `test-vector-clients.sh` (6), `gcloud-benchmark.sh` (3) and `audit-unwrap.sh`
+  (2) — every harness that runs under `pipefail`. Remaining piped `grep -q` uses
+  match single-line output (`PING | grep -q PONG`) and cannot trip the bug.
+
+  `scripts/test-commands.sh --skip-bench`, same binary, before -> after:
+  517 total / 514 passed / 3 failed -> **517 total / 516 passed / 1 failed**.
+  The total is unchanged, so no row was skipped; the one remaining failure is
+  `ROLE`, tracked separately as moon#536.
+
+  This is the same family as the `set -u` defect that had `test-consistency.sh`
+  silently running about half its rows.
 
 - **`TXN ABORT` left torn state after a multi-key write (moon#500).**
 

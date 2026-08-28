@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# moon: `grep -q` exits on the FIRST match, closing the pipe. Under
+# `set -o pipefail` that SIGPIPEs the writer, so the PIPELINE reports failure
+# even though grep succeeded -- turning any assertion whose output is longer
+# than a pipe buffer into a spurious FAIL. `qgrep` drains stdin first, so the
+# writer always completes and only grep's own verdict is reported.
+qgrep() { local _in; _in=$(cat); grep "$@" <<< "$_in" > /dev/null; }
+
+
 ###############################################################################
 # test-consistency.sh -- Data consistency test: SET/GET, SETEX/GETEX, collections
 #
@@ -100,7 +108,7 @@ both() {
 wait_for_port() {
     local port=$1
     for ((i=0; i<30; i++)); do
-        redis-cli -p "$port" PING 2>/dev/null | grep -q PONG && return 0
+        redis-cli -p "$port" PING 2>/dev/null | qgrep -q PONG && return 0
         sleep 0.2
     done
     log "ERROR: port $port not ready"; return 1
@@ -1768,7 +1776,7 @@ assert_both "SWAPDB 0 0 (same-index no-op)" SWAPDB 0 0
 # would silently pass.
 redis_oor=$(redis-cli -p "$PORT_REDIS" SWAPDB 0 9999 2>&1) || true
 rust_oor=$(redis-cli -p "$PORT_RUST" SWAPDB 0 9999 2>&1) || true
-if echo "$redis_oor" | grep -qi "ERR" && echo "$rust_oor" | grep -qi "ERR"; then
+if echo "$redis_oor" | qgrep -qi "ERR" && echo "$rust_oor" | qgrep -qi "ERR"; then
     PASS=$((PASS + 1))
 else
     FAIL=$((FAIL + 1))
@@ -1797,7 +1805,7 @@ redis-cli -p "$PORT_RUST" SET hotk:probe v >/dev/null 2>&1
 # 128 keyed commands guarantee >= 2 sketch samples at the 1-in-64 rate.
 for _ in $(seq 1 128); do redis-cli -p "$PORT_RUST" GET hotk:probe >/dev/null 2>&1; done
 HOTKEYS_OUT=$(redis-cli -p "$PORT_RUST" HOTKEYS COUNT 5 2>&1)
-if echo "$HOTKEYS_OUT" | grep -q "hotk:probe"; then
+if echo "$HOTKEYS_OUT" | qgrep -q "hotk:probe"; then
     PASS=$((PASS + 1))
 else
     FAIL=$((FAIL + 1)); echo "  FAIL: HOTKEYS should report hotk:probe (got: $HOTKEYS_OUT)"
@@ -1824,7 +1832,7 @@ python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<4f',0.0,1.0
 
 # FT.INFO should show index
 FT_INFO=$(redis-cli -p "$PORT_RUST" FT.INFO vecidx 2>&1)
-if echo "$FT_INFO" | grep -q "vecidx"; then
+if echo "$FT_INFO" | qgrep -q "vecidx"; then
     PASS=$((PASS + 1))
 else
     FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO should show vecidx"
@@ -1847,7 +1855,7 @@ done
 assert_eq "FT.SEARCH \"*\" enumerates a VECTOR-only index (moon#695)" "2" "$FT_STAR"
 
 FT_STAR_KEYS=$(redis-cli -p "$PORT_RUST" FT.SEARCH vecidx "*" 2>&1)
-if echo "$FT_STAR_KEYS" | grep -q "vec:1" && echo "$FT_STAR_KEYS" | grep -q "vec:2"; then
+if echo "$FT_STAR_KEYS" | qgrep -q "vec:1" && echo "$FT_STAR_KEYS" | qgrep -q "vec:2"; then
     PASS=$((PASS + 1))
 else
     FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH \"*\" must return the real keys, not synthetic vec:<id>: $FT_STAR_KEYS"
@@ -2065,7 +2073,7 @@ for NSHARDS in 1 4 12; do
     # The library must be listable from a fresh connection on any shard.
     LIST_SEEN=0
     for i in $(seq 1 12); do
-        redis-cli -p "$PORT_RUST" FUNCTION LIST 2>&1 | grep -q consistlib && LIST_SEEN=$((LIST_SEEN + 1))
+        redis-cli -p "$PORT_RUST" FUNCTION LIST 2>&1 | qgrep -q consistlib && LIST_SEEN=$((LIST_SEEN + 1))
     done
     assert_eq "moon#514 shards=$NSHARDS: FUNCTION LIST sees the library everywhere" "12" "$LIST_SEEN"
 
@@ -2134,7 +2142,7 @@ for NSHARDS in 1 4 12; do
         # Verify node is still visible without VALID_AT filter
         QUERY_OUT=$(redis-cli -p "$PORT_RUST" GRAPH.QUERY tempgraph "MATCH (n:TempLabel) RETURN n" 2>&1)
         VISIBLE="no"
-        if echo "$QUERY_OUT" | grep -qiE "TempLabel|node|result"; then
+        if echo "$QUERY_OUT" | qgrep -qiE "TempLabel|node|result"; then
             VISIBLE="yes"
         fi
         case "$NSHARDS" in
@@ -2209,8 +2217,8 @@ PYEOF
     DECAY_Q="MATCH p = shortestPath((a:Person {name: 'A'})-[*..5]->(c:Person {name: 'C'})) RETURN p"
     DECAY_OFF=$(redis-cli -p "$PORT_RUST" GRAPH.QUERY decayg "$DECAY_Q" 2>&1)
     DECAY_ON=$(redis-cli -p "$PORT_RUST" GRAPH.QUERY decayg "$DECAY_Q" --decay 5 2>&1)
-    OFF_VIA_B="no"; echo "$DECAY_OFF" | grep -qE "^${DECAY_B}\$" && OFF_VIA_B="yes"
-    ON_VIA_B="no";  echo "$DECAY_ON"  | grep -qE "^${DECAY_B}\$" && ON_VIA_B="yes"
+    OFF_VIA_B="no"; echo "$DECAY_OFF" | qgrep -qE "^${DECAY_B}\$" && OFF_VIA_B="yes"
+    ON_VIA_B="no";  echo "$DECAY_ON"  | qgrep -qE "^${DECAY_B}\$" && ON_VIA_B="yes"
     case "$NSHARDS" in
         1)  DECAY_RESULT_1="off_via_b=$OFF_VIA_B|on_via_b=$ON_VIA_B" ;;
         4)  DECAY_RESULT_4="off_via_b=$OFF_VIA_B|on_via_b=$ON_VIA_B" ;;
@@ -2546,7 +2554,7 @@ for NSHARDS in 1 4 12; do
     # WS LIST consistency — should show the created workspace
     WS_LIST=$(redis-cli -p "$PORT_RUST" WS LIST 2>&1)
     LIST_HAS_WS="no"
-    echo "$WS_LIST" | grep -qF "testws" && LIST_HAS_WS="yes"
+    echo "$WS_LIST" | qgrep -qF "testws" && LIST_HAS_WS="yes"
 
     # Workspace isolation: unbound GET should not see workspace key.
     # One-shot redis-cli = fresh unbound connection; the SET above ran on a
@@ -2644,8 +2652,8 @@ for NSHARDS in 1 4 12; do
     MQ_PUSH2=$(redis-cli -p "$PORT_RUST" MQ PUSH mqconsist f2 v2 2>&1)
     MQ_POP=$(redis-cli -p "$PORT_RUST" MQ POP mqconsist COUNT 2 2>&1)
     # Check that POP contains our field names
-    POP_HAS_F1="no"; echo "$MQ_POP" | grep -qF "f1" && POP_HAS_F1="yes"
-    POP_HAS_F2="no"; echo "$MQ_POP" | grep -qF "f2" && POP_HAS_F2="yes"
+    POP_HAS_F1="no"; echo "$MQ_POP" | qgrep -qF "f1" && POP_HAS_F1="yes"
+    POP_HAS_F2="no"; echo "$MQ_POP" | qgrep -qF "f2" && POP_HAS_F2="yes"
     # Check DLQLEN is 0 (no dead letters yet)
     MQ_DLQLEN=$(redis-cli -p "$PORT_RUST" MQ DLQLEN mqconsist 2>&1)
     MQ_RESULT="$MQ_CREATE|$POP_HAS_F1|$POP_HAS_F2|$MQ_DLQLEN"
@@ -2678,7 +2686,7 @@ for NSHARDS in 1 4 12; do
     DRAIN_COUNT=0
     for _ in 1 2 3 4 5 6 7 8; do
         DRAIN_ONE=$(redis-cli -p "$PORT_RUST" MQ POP mqdrain COUNT 1 2>&1)
-        echo "$DRAIN_ONE" | grep -qF "body" || break
+        echo "$DRAIN_ONE" | qgrep -qF "body" || break
         DRAIN_COUNT=$((DRAIN_COUNT + 1))
     done
     case "$NSHARDS" in
@@ -2696,7 +2704,7 @@ for NSHARDS in 1 4 12; do
     for i in $(seq 1 20); do
         redis-cli -p "$PORT_RUST" SET "memusage:$i" "v$i" >/dev/null 2>&1
         MU=$(redis-cli -p "$PORT_RUST" MEMORY USAGE "memusage:$i" 2>&1)
-        echo "$MU" | grep -qE '^\(integer\) [1-9][0-9]*$|^[1-9][0-9]*$' && MEM_HITS=$((MEM_HITS + 1))
+        echo "$MU" | qgrep -qE '^\(integer\) [1-9][0-9]*$|^[1-9][0-9]*$' && MEM_HITS=$((MEM_HITS + 1))
     done
     case "$NSHARDS" in
         1)  MEM_USAGE_RESULT_1="$MEM_HITS" ;;
@@ -2731,7 +2739,7 @@ for NSHARDS_LABEL in 1 4 12; do
         12) DLQ_R="$MQ_DLQ_RESULT_12" ;;
     esac
     # redis-cli returns "(integer) 1" or just "1" depending on version
-    if ! echo "$DLQ_R" | grep -qE '(integer) 1|^1$'; then
+    if ! echo "$DLQ_R" | qgrep -qE '(integer) 1|^1$'; then
         MQ_DLQ_OK=false
     fi
 done

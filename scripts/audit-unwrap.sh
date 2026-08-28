@@ -11,6 +11,14 @@
 
 set -euo pipefail
 
+# moon: `grep -q` exits on the FIRST match, closing the pipe. Under
+# `set -o pipefail` that SIGPIPEs the writer, so the PIPELINE reports failure
+# even though grep succeeded -- turning any assertion whose output is longer
+# than a pipe buffer into a spurious FAIL. `qgrep` drains stdin first, so the
+# writer always completes and only grep's own verdict is reported.
+qgrep() { local _in; _in=$(cat); grep "$@" <<< "$_in" > /dev/null; }
+
+
 BASELINE=0  # Target: zero un-annotated unwrap/expect in hot-path modules
 
 COUNT=0
@@ -47,14 +55,14 @@ for mod in src/protocol src/command src/shard src/storage src/persistence src/se
         # Skip comment-only lines (// or ///)
         actual_line=$(sed -n "${lineno}p" "$file" 2>/dev/null)
         stripped=$(echo "$actual_line" | sed 's/^[[:space:]]*//')
-        if echo "$stripped" | grep -q '^//'; then
+        if echo "$stripped" | qgrep -q '^//'; then
             continue
         fi
 
         # Check preceding 30 lines for #[allow — covers function-level annotations
         start=$((lineno - 30))
         if [ "$start" -lt 1 ]; then start=1; fi
-        if sed -n "${start},${lineno}p" "$file" 2>/dev/null | grep -q '#\[allow.*clippy::unwrap_used\|#\[allow.*clippy::expect_used'; then
+        if sed -n "${start},${lineno}p" "$file" 2>/dev/null | qgrep -q '#\[allow.*clippy::unwrap_used\|#\[allow.*clippy::expect_used'; then
             continue
         fi
 

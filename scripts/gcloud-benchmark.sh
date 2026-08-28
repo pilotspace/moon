@@ -11,6 +11,14 @@
 
 set -euo pipefail
 
+# moon: `grep -q` exits on the FIRST match, closing the pipe. Under
+# `set -o pipefail` that SIGPIPEs the writer, so the PIPELINE reports failure
+# even though grep succeeded -- turning any assertion whose output is longer
+# than a pipe buffer into a spurious FAIL. `qgrep` drains stdin first, so the
+# writer always completes and only grep's own verdict is reported.
+qgrep() { local _in; _in=$(cat); grep "$@" <<< "$_in" > /dev/null; }
+
+
 MOON_BIN="${MOON_BIN:-$HOME/moon/target/release/moon}"
 MOON_PORT=6399
 REDIS_PORT=6379
@@ -34,7 +42,7 @@ kill_servers() {
 wait_for_port() {
     local port=$1 max=30
     for i in $(seq 1 $max); do
-        if redis-cli -p "$port" PING 2>/dev/null | grep -q PONG; then return 0; fi
+        if redis-cli -p "$port" PING 2>/dev/null | qgrep -q PONG; then return 0; fi
         sleep 0.5
     done
     echo "ERROR: Port $port not ready after ${max}s"
@@ -278,7 +286,7 @@ PYEOF
     MOON_SEARCH_OK=0
     while IFS= read -r hex_blob; do
         result=$(redis-cli -p $MOON_PORT FT.SEARCH idx "*=>[KNN 10 @embedding \$vec AS score]" PARAMS 2 vec "$(echo "$hex_blob" | xxd -r -p)" LIMIT 0 10 2>&1)
-        if echo "$result" | grep -q "doc:"; then
+        if echo "$result" | qgrep -q "doc:"; then
             MOON_SEARCH_OK=$((MOON_SEARCH_OK + 1))
         fi
     done < /tmp/vector-search-queries.txt
@@ -302,7 +310,7 @@ PYEOF
 
     # Try creating index - will fail if no search module
     if redis-cli -p $REDIS_PORT FT.CREATE idx ON HASH PREFIX 1 doc: \
-        SCHEMA content TEXT embedding VECTOR HNSW 6 TYPE FLOAT32 DIM $DIM DISTANCE_METRIC COSINE 2>&1 | grep -qi "unknown\|err"; then
+        SCHEMA content TEXT embedding VECTOR HNSW 6 TYPE FLOAT32 DIM $DIM DISTANCE_METRIC COSINE 2>&1 | qgrep -qi "unknown\|err"; then
         echo "  Redis: FT module not available, skipping vector benchmark"
         echo "redis_vector=NOT_AVAILABLE" >> "$RESULTS_DIR/s3-vector-results.txt"
         redis-cli -p $REDIS_PORT SHUTDOWN NOSAVE 2>/dev/null || true

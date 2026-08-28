@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# moon: `grep -q` exits on the FIRST match, closing the pipe. Under
+# `set -o pipefail` that SIGPIPEs the writer, so the PIPELINE reports failure
+# even though grep succeeded -- turning any assertion whose output is longer
+# than a pipe buffer into a spurious FAIL. `qgrep` drains stdin first, so the
+# writer always completes and only grep's own verdict is reported.
+qgrep() { local _in; _in=$(cat); grep "$@" <<< "$_in" > /dev/null; }
+
+
 ###############################################################################
 # test-commands.sh -- Comprehensive command coverage test
 #
@@ -119,7 +127,7 @@ trap cleanup EXIT
 # matches "open" followed by a later "25"); tightening it is a separate change
 # from making it run at all.
 spans() {
-    tr '\n' ' ' | grep -q "$1"
+    tr '\n' ' ' | qgrep -q "$1"
 }
 
 # The `|| true` on every client wrapper is load-bearing (moon#679).
@@ -145,8 +153,8 @@ rcli() {
 # `mcli PING || exit 1` is a branch execution can never reach. These two do not
 # swallow the status, and they match the reply rather than just its exit code,
 # so a foreign process holding the port cannot fake liveness either.
-redis_is_up() { redis-cli -p "$PORT_REDIS" PING 2>/dev/null | grep -qx PONG; }
-moon_is_up()  { redis-cli -p "$PORT_RUST"  PING 2>/dev/null | grep -qx PONG; }
+redis_is_up() { redis-cli -p "$PORT_REDIS" PING 2>/dev/null | qgrep -qx PONG; }
+moon_is_up()  { redis-cli -p "$PORT_RUST"  PING 2>/dev/null | qgrep -qx PONG; }
 
 # Poll rather than sleep a fixed amount: a cold first exec of a freshly built
 # binary can take well over a second, and the old `sleep 1` was the other half
@@ -370,7 +378,7 @@ assert_moon_contains() {
     TOTAL=$((TOTAL + 1))
     local moon_out
     moon_out=$(mcli "$@" 2>/dev/null || echo "__MOON_ERROR__")
-    if echo "$moon_out" | grep -qF "$expected"; then
+    if echo "$moon_out" | qgrep -qF "$expected"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -389,7 +397,7 @@ assert_moon_not_contains() {
     TOTAL=$((TOTAL + 1))
     local moon_out
     moon_out=$(mcli "$@" 2>&1)
-    if echo "$moon_out" | grep -qF "$forbidden"; then
+    if echo "$moon_out" | qgrep -qF "$forbidden"; then
         FAIL=$((FAIL + 1))
         echo "  FAIL: $desc (reply contains forbidden substring '$forbidden')"
         echo "    CMD:  redis-cli $*"
@@ -411,7 +419,7 @@ assert_moon_line() {
     TOTAL=$((TOTAL + 1))
     local moon_out
     moon_out=$(mcli "$@" 2>/dev/null || echo "__MOON_ERROR__")
-    if echo "$moon_out" | grep -qxF "$expected"; then
+    if echo "$moon_out" | qgrep -qxF "$expected"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -463,7 +471,7 @@ assert_moon_matches() {
     TOTAL=$((TOTAL + 1))
     local moon_out
     moon_out=$(mcli "$@" 2>/dev/null || echo "__MOON_ERROR__")
-    if echo "$moon_out" | grep -qE "$pattern"; then
+    if echo "$moon_out" | qgrep -qE "$pattern"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -480,7 +488,7 @@ assert_moon_ok() {
     TOTAL=$((TOTAL + 1))
     local moon_out
     moon_out=$(mcli "$@" 2>/dev/null || echo "__MOON_ERROR__")
-    if echo "$moon_out" | grep -qvE "^(\(error\)|ERR |__MOON_ERROR__)"; then
+    if echo "$moon_out" | qgrep -qvE "^(\(error\)|ERR |__MOON_ERROR__)"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -1287,7 +1295,7 @@ if should_run "transaction"; then
     # Test MULTI/EXEC via pipe (using \n not \r\n for redis-cli pipe mode)
     TOTAL=$((TOTAL + 1))
     tx_moon=$(printf 'MULTI\nSET tx:k1 v1\nSET tx:k2 v2\nGET tx:k1\nEXEC\n' | redis-cli -p "$PORT_RUST" 2>/dev/null || true)
-    if echo "$tx_moon" | grep -q "v1"; then
+    if echo "$tx_moon" | qgrep -q "v1"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -1298,7 +1306,7 @@ if should_run "transaction"; then
     # DISCARD (must be inside MULTI)
     TOTAL=$((TOTAL + 1))
     tx_discard=$(printf 'MULTI\nDISCARD\n' | redis-cli -p "$PORT_RUST" 2>/dev/null || true)
-    if echo "$tx_discard" | grep -q "OK"; then
+    if echo "$tx_discard" | qgrep -q "OK"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -1322,7 +1330,7 @@ if should_run "transaction"; then
     if [ -n "$tx_sub_key" ]; then
         FAIL=$((FAIL + 1))
         echo "  FAIL: TXN-SUB-01 the transaction RAN despite a bogus subcommand (tx:sub670=$tx_sub_key)"
-    elif echo "$tx_sub" | grep -q "EXECABORT"; then
+    elif echo "$tx_sub" | qgrep -q "EXECABORT"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -1333,7 +1341,7 @@ if should_run "transaction"; then
     # clients branch on this string, and moon had ten spellings of it.
     TOTAL=$((TOTAL + 1))
     tx_sub_msg=$(mcli CONFIG BOGUS 2>&1 || true)
-    if echo "$tx_sub_msg" | grep -q "unknown subcommand 'BOGUS'. Try CONFIG HELP."; then
+    if echo "$tx_sub_msg" | qgrep -q "unknown subcommand 'BOGUS'. Try CONFIG HELP."; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -1364,7 +1372,7 @@ if should_run "transaction"; then
     fn_exec=$(printf 'MULTI\nFUNCTION LIST\nSET tx:fn697 ran\nEXEC\n' \
         | redis-cli -p "$PORT_RUST" 2>/dev/null || true)
     if [ "$(mcli GET tx:fn697 2>/dev/null || true)" = "ran" ] \
-        && ! echo "$fn_exec" | grep -q "unknown command"; then
+        && ! echo "$fn_exec" | qgrep -q "unknown command"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -1375,8 +1383,8 @@ if should_run "transaction"; then
     TOTAL=$((TOTAL + 1))
     fn_bogus=$(printf 'MULTI\nFUNCTION BOGUS\nEXEC\n' \
         | redis-cli -p "$PORT_RUST" 2>&1 || true)
-    if echo "$fn_bogus" | grep -q "unknown subcommand 'BOGUS'. Try FUNCTION HELP." \
-        && echo "$fn_bogus" | grep -q "EXECABORT"; then
+    if echo "$fn_bogus" | qgrep -q "unknown subcommand 'BOGUS'. Try FUNCTION HELP." \
+        && echo "$fn_bogus" | qgrep -q "EXECABORT"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -1595,7 +1603,7 @@ if should_run "vector"; then
     # refusal explicitly rather than letting it hide inside a row that expected
     # success -- a gap that is asserted is a gap someone can find.
     TOTAL=$((TOTAL + 1)); FT_FLAT=$(mcli FT.CREATE flatidx ON HASH PREFIX 1 f: SCHEMA v VECTOR FLAT 6 DIM 4 DISTANCE_METRIC L2 TYPE FLOAT32 2>&1)
-    if echo "$FT_FLAT" | grep -q "expected HNSW algorithm"; then
+    if echo "$FT_FLAT" | qgrep -q "expected HNSW algorithm"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.CREATE VECTOR FLAT refused (moon implements HNSW only)"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.CREATE VECTOR FLAT expected 'expected HNSW algorithm', got: $FT_FLAT"
@@ -1613,7 +1621,7 @@ if should_run "vector"; then
 
     # FT.INFO — index metadata
     TOTAL=$((TOTAL + 1)); FT_INFO=$(mcli FT.INFO myidx 2>&1)
-    if echo "$FT_INFO" | grep -q "myidx"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO returns index name"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO returns index name"; fi
+    if echo "$FT_INFO" | qgrep -q "myidx"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO returns index name"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO returns index name"; fi
 
     # Insert vectors via HSET (auto-indexed) — use python3 to avoid null byte stripping in bash
     python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<4f',1.0,0.0,0.0,0.0))" | redis-cli -x -p "$PORT_RUST" HSET doc:1 embedding >/dev/null 2>&1 || true
@@ -1633,7 +1641,7 @@ if should_run "vector"; then
     # own live key map instead. This row covers the EMPTY case; the block below
     # covers a loaded index, which is where an empty answer could otherwise hide.
     TOTAL=$((TOTAL + 1)); FT_SEARCH=$(mcli FT.SEARCH myidx "*" 2>&1)
-    if ! echo "$FT_SEARCH" | grep -qi "err"; then PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH does not error"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH \"*\" on a VECTOR-only index returned error (moon#695): $FT_SEARCH"; fi
+    if ! echo "$FT_SEARCH" | qgrep -qi "err"; then PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH does not error"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH \"*\" on a VECTOR-only index returned error (moon#695): $FT_SEARCH"; fi
 
     # moon#695, the loaded case. The blob is 16 bytes of printable ASCII, which
     # is a perfectly good 4-dim FLOAT32 vector (0x41414141 ~ 12.08). An ordinary
@@ -1656,7 +1664,7 @@ if should_run "vector"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH \"*\" on a loaded VECTOR-only index expected 2, got: $FT_STAR_VEC"
     fi
     TOTAL=$((TOTAL + 1)); FT_STAR_KEYS=$(mcli FT.SEARCH star695idx "*" 2>&1)
-    if echo "$FT_STAR_KEYS" | grep -q "s695:1" && echo "$FT_STAR_KEYS" | grep -q "s695:2"; then
+    if echo "$FT_STAR_KEYS" | qgrep -q "s695:1" && echo "$FT_STAR_KEYS" | qgrep -q "s695:2"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH \"*\" returns the real keys, not synthetic vec:<id> (moon#695)"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH \"*\" on a VECTOR-only index lost the real keys: $FT_STAR_KEYS"
@@ -1674,7 +1682,7 @@ if should_run "vector"; then
     # with no "(error)" marker when it is not on a tty, so the message text is
     # the only thing a shell harness can match on.)
     TOTAL=$((TOTAL + 1)); FT_INFO_AFTER=$(mcli FT.INFO myidx 2>&1)
-    if echo "$FT_INFO_AFTER" | grep -qi "unknown index"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO after drop errors"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO after drop should report an unknown index, got: $FT_INFO_AFTER"; fi
+    if echo "$FT_INFO_AFTER" | qgrep -qi "unknown index"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO after drop errors"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO after drop should report an unknown index, got: $FT_INFO_AFTER"; fi
 fi
 
 # ===========================================================================
@@ -1882,7 +1890,7 @@ if should_run "vector"; then
     # KNNFILT-03: an unparseable prefilter is an ERROR, not a wider search.
     TOTAL=$((TOTAL + 1))
     KF_BAD=$(mcli FT.SEARCH knnfilt '@vt:[abc def]=>[KNN 4 @vec $q]' PARAMS 2 q "$KF_VEC" DIALECT 2 2>&1)
-    if echo "$KF_BAD" | grep -qi "invalid FILTER"; then
+    if echo "$KF_BAD" | qgrep -qi "invalid FILTER"; then
         PASS=$((PASS + 1)); echo "  PASS: KNNFILT-03 unparseable prefilter rejected"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: KNNFILT-03 expected an error, got: $KF_BAD"
@@ -1893,7 +1901,7 @@ if should_run "vector"; then
     TOTAL=$((TOTAL + 1))
     KF_INV=$(mcli FT.SEARCH knnfilt '@vt:[300 100]=>[KNN 4 @vec $q]' PARAMS 2 q "$KF_VEC" DIALECT 2 2>&1)
     KF_ALIVE=$(mcli PING 2>&1)
-    if echo "$KF_INV" | grep -qi "invalid FILTER" && echo "$KF_ALIVE" | grep -qi "PONG"; then
+    if echo "$KF_INV" | qgrep -qi "invalid FILTER" && echo "$KF_ALIVE" | qgrep -qi "PONG"; then
         PASS=$((PASS + 1)); echo "  PASS: KNNFILT-04 inverted prefilter rejected, server still alive"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: KNNFILT-04 reply='$KF_INV' ping='$KF_ALIVE' (empty ping = process aborted)"
@@ -1960,7 +1968,7 @@ if should_run "vector"; then
 
     # Test DD on non-existent index returns error
     TOTAL=$((TOTAL + 1)); DD_NONEXIST=$(mcli FT.DROPINDEX nonexistent_idx DD 2>&1)
-    if echo "$DD_NONEXIST" | grep -qi "unknown\|err"; then PASS=$((PASS + 1)); echo "  PASS: DD on non-existent index errors"; else FAIL=$((FAIL + 1)); echo "  FAIL: DD on non-existent should error (got: $DD_NONEXIST)"; fi
+    if echo "$DD_NONEXIST" | qgrep -qi "unknown\|err"; then PASS=$((PASS + 1)); echo "  PASS: DD on non-existent index errors"; else FAIL=$((FAIL + 1)); echo "  FAIL: DD on non-existent should error (got: $DD_NONEXIST)"; fi
 
     # ── End DD flag tests ────────────────────────────────────────────────────
 
@@ -2004,11 +2012,11 @@ if should_run "vector"; then
     fi
 
     TOTAL=$((TOTAL + 1))
-    if echo "$FT_TEXT_INFO" | grep -q "avg_doc_len"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO text avg_doc_len"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text avg_doc_len"; fi
+    if echo "$FT_TEXT_INFO" | qgrep -q "avg_doc_len"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO text avg_doc_len"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text avg_doc_len"; fi
     TOTAL=$((TOTAL + 1))
-    if echo "$FT_TEXT_INFO" | grep -q "bm25_k1"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO text bm25_k1"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text bm25_k1"; fi
+    if echo "$FT_TEXT_INFO" | qgrep -q "bm25_k1"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO text bm25_k1"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text bm25_k1"; fi
     TOTAL=$((TOTAL + 1))
-    if echo "$FT_TEXT_INFO" | grep -q "bytes_per_posting"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO text bytes_per_posting"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text bytes_per_posting"; fi
+    if echo "$FT_TEXT_INFO" | qgrep -q "bytes_per_posting"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO text bytes_per_posting"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO text bytes_per_posting"; fi
 
     # FT.CREATE with TEXT + NOSTEM
     assert_moon_ok "FT.CREATE NOSTEM index" FT.CREATE nostemidx ON HASH PREFIX 1 ns: SCHEMA content TEXT NOSTEM
@@ -2032,9 +2040,9 @@ if should_run "vector"; then
     # 1. Basic single-term text search: "document" matches doc:t1 and doc:t2 body fields
     TOTAL=$((TOTAL + 1))
     FT_BASIC=$(mcli FT.SEARCH textidx "document" 2>&1)
-    if echo "$FT_BASIC" | grep -qi "err"; then
+    if echo "$FT_BASIC" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH basic text returned error: $FT_BASIC"
-    elif echo "$FT_BASIC" | grep -q "doc:"; then
+    elif echo "$FT_BASIC" | qgrep -q "doc:"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH basic text returns results"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH basic text returned no results"
@@ -2042,7 +2050,7 @@ if should_run "vector"; then
 
     # 2. __bm25_score field must appear in response
     TOTAL=$((TOTAL + 1))
-    if echo "$FT_BASIC" | grep -q "__bm25_score"; then
+    if echo "$FT_BASIC" | qgrep -q "__bm25_score"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH text response contains __bm25_score"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH text response missing __bm25_score field"
@@ -2051,9 +2059,9 @@ if should_run "vector"; then
     # 3. Multi-term AND search: "test document" — both must appear in same doc (doc:t1 body)
     TOTAL=$((TOTAL + 1))
     FT_MULTI=$(mcli FT.SEARCH textidx "test document" 2>&1)
-    if echo "$FT_MULTI" | grep -qi "err"; then
+    if echo "$FT_MULTI" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH multi-term returned error: $FT_MULTI"
-    elif echo "$FT_MULTI" | grep -q "doc:"; then
+    elif echo "$FT_MULTI" | qgrep -q "doc:"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH multi-term AND returns results"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH multi-term AND returned no results (regression of moon#690: 'test' back on the stoplist, or a stop word zeroing its conjunction again)"
@@ -2062,9 +2070,9 @@ if should_run "vector"; then
     # 4. Field-targeted search: @title:(document) — only doc:t2 has 'document' in title
     TOTAL=$((TOTAL + 1))
     FT_FIELD=$(mcli FT.SEARCH textidx "@title:(document)" 2>&1)
-    if echo "$FT_FIELD" | grep -qi "err"; then
+    if echo "$FT_FIELD" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH field-targeted returned error: $FT_FIELD"
-    elif echo "$FT_FIELD" | grep -q "doc:"; then
+    elif echo "$FT_FIELD" | qgrep -q "doc:"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH @title:(document) returns results"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH @title:(document) returned no results"
@@ -2073,13 +2081,13 @@ if should_run "vector"; then
     # 5. Empty result for non-existent term
     TOTAL=$((TOTAL + 1))
     FT_EMPTY=$(mcli FT.SEARCH textidx "xyznonexistentterm" 2>&1)
-    if echo "$FT_EMPTY" | grep -qi "^err\b" | head -1; then
+    if echo "$FT_EMPTY" | qgrep -qi "^err\b" | head -1; then
         # Some ERR is acceptable (e.g. stop word) but the term is unique
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH nonexistent term returned error: $FT_EMPTY"
     else
         # Should return 0 results (not error)
         FT_EMPTY_COUNT=$(echo "$FT_EMPTY" | head -1 | tr -d '[:space:]')
-        if [ "$FT_EMPTY_COUNT" = "0" ] || echo "$FT_EMPTY" | grep -q "^(empty\|0)"; then
+        if [ "$FT_EMPTY_COUNT" = "0" ] || echo "$FT_EMPTY" | qgrep -q "^(empty\|0)"; then
             PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH nonexistent term returns 0 results"
         else
             PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH nonexistent term (no doc: in result)"
@@ -2090,7 +2098,7 @@ if should_run "vector"; then
     TOTAL=$((TOTAL + 1))
     FT_LIMIT=$(mcli FT.SEARCH textidx "document" LIMIT 0 1 2>&1)
     FT_LIMIT_DOC_COUNT=$(echo "$FT_LIMIT" | grep -c "doc:" || true)
-    if [ "$FT_LIMIT_DOC_COUNT" -le 1 ] && echo "$FT_LIMIT" | grep -q "doc:"; then
+    if [ "$FT_LIMIT_DOC_COUNT" -le 1 ] && echo "$FT_LIMIT" | qgrep -q "doc:"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH LIMIT 0 1 returns at most 1 result"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH LIMIT 0 1 should return exactly 1 result (got $FT_LIMIT_DOC_COUNT)"
@@ -2107,9 +2115,9 @@ if should_run "vector"; then
     # documents. A returned document would mean stop-word filtering is off.
     TOTAL=$((TOTAL + 1))
     FT_STOP=$(mcli FT.SEARCH textidx "the" 2>&1)
-    if echo "$FT_STOP" | grep -q "doc:"; then
+    if echo "$FT_STOP" | qgrep -q "doc:"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH stop-words-only matched documents: $FT_STOP"
-    elif echo "$FT_STOP" | grep -qi "err"; then
+    elif echo "$FT_STOP" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH stop-words-only errored instead of returning 0: $FT_STOP"
     else
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH stop-words-only returns no documents"
@@ -2150,9 +2158,9 @@ if should_run "vector"; then
     # 8. Cross-field search: "world" appears in doc:t1 title — searches all TEXT fields
     TOTAL=$((TOTAL + 1))
     FT_CROSS=$(mcli FT.SEARCH textidx "world" 2>&1)
-    if echo "$FT_CROSS" | grep -qi "err"; then
+    if echo "$FT_CROSS" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH cross-field returned error: $FT_CROSS"
-    elif echo "$FT_CROSS" | grep -q "doc:t1"; then
+    elif echo "$FT_CROSS" | qgrep -q "doc:t1"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH cross-field finds 'world' in doc:t1"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH cross-field should find 'world' in doc:t1 (regression of moon#690: 'world' back on the stoplist)"
@@ -2166,9 +2174,9 @@ if should_run "vector"; then
     # 1. HIGHLIGHT basic: verify <b> tag in response
     TOTAL=$((TOTAL + 1))
     FT_HL=$(mcli FT.SEARCH textidx "machine" HIGHLIGHT 2>&1)
-    if echo "$FT_HL" | grep -qi "err"; then
+    if echo "$FT_HL" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH HIGHLIGHT returned error: $FT_HL"
-    elif echo "$FT_HL" | grep -q "<b>"; then
+    elif echo "$FT_HL" | qgrep -q "<b>"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH HIGHLIGHT response contains <b> tag"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH HIGHLIGHT response missing <b> tag (got: $FT_HL)"
@@ -2177,9 +2185,9 @@ if should_run "vector"; then
     # 2. HIGHLIGHT FIELDS: only highlight specified field
     TOTAL=$((TOTAL + 1))
     FT_HL_FIELDS=$(mcli FT.SEARCH textidx "machine" HIGHLIGHT FIELDS 1 title 2>&1)
-    if echo "$FT_HL_FIELDS" | grep -qi "err"; then
+    if echo "$FT_HL_FIELDS" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH HIGHLIGHT FIELDS returned error: $FT_HL_FIELDS"
-    elif echo "$FT_HL_FIELDS" | grep -q "<b>\|machine"; then
+    elif echo "$FT_HL_FIELDS" | qgrep -q "<b>\|machine"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH HIGHLIGHT FIELDS 1 title returns result with match"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH HIGHLIGHT FIELDS 1 title returned no match (got: $FT_HL_FIELDS)"
@@ -2188,9 +2196,9 @@ if should_run "vector"; then
     # 3. HIGHLIGHT custom TAGS: verify custom open/close tags
     TOTAL=$((TOTAL + 1))
     FT_HL_TAGS=$(mcli FT.SEARCH textidx "machine" HIGHLIGHT TAGS "[[" "]]" 2>&1)
-    if echo "$FT_HL_TAGS" | grep -qi "err"; then
+    if echo "$FT_HL_TAGS" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH HIGHLIGHT TAGS returned error: $FT_HL_TAGS"
-    elif echo "$FT_HL_TAGS" | grep -q "\[\["; then
+    elif echo "$FT_HL_TAGS" | qgrep -q "\[\["; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH HIGHLIGHT TAGS [[ ]] response contains custom tag"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH HIGHLIGHT TAGS response missing custom tag (got: $FT_HL_TAGS)"
@@ -2199,9 +2207,9 @@ if should_run "vector"; then
     # 4. SUMMARIZE basic: verify response is returned without error
     TOTAL=$((TOTAL + 1))
     FT_SUM=$(mcli FT.SEARCH textidx "machine" SUMMARIZE 2>&1)
-    if echo "$FT_SUM" | grep -qi "err"; then
+    if echo "$FT_SUM" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH SUMMARIZE returned error: $FT_SUM"
-    elif echo "$FT_SUM" | grep -q "machine\|learning"; then
+    elif echo "$FT_SUM" | qgrep -q "machine\|learning"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH SUMMARIZE response contains match terms"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH SUMMARIZE response missing match terms (got: $FT_SUM)"
@@ -2210,9 +2218,9 @@ if should_run "vector"; then
     # 5. SUMMARIZE FIELDS: only summarize the body field
     TOTAL=$((TOTAL + 1))
     FT_SUM_FIELDS=$(mcli FT.SEARCH textidx "machine" SUMMARIZE FIELDS 1 body 2>&1)
-    if echo "$FT_SUM_FIELDS" | grep -qi "err"; then
+    if echo "$FT_SUM_FIELDS" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH SUMMARIZE FIELDS returned error: $FT_SUM_FIELDS"
-    elif echo "$FT_SUM_FIELDS" | grep -q "machine\|learning"; then
+    elif echo "$FT_SUM_FIELDS" | qgrep -q "machine\|learning"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH SUMMARIZE FIELDS 1 body returns result"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH SUMMARIZE FIELDS 1 body missing match (got: $FT_SUM_FIELDS)"
@@ -2221,7 +2229,7 @@ if should_run "vector"; then
     # 6. SUMMARIZE with LEN: fragment should be short (10 tokens)
     TOTAL=$((TOTAL + 1))
     FT_SUM_LEN=$(mcli FT.SEARCH textidx "machine" SUMMARIZE LEN 10 2>&1)
-    if echo "$FT_SUM_LEN" | grep -qi "err"; then
+    if echo "$FT_SUM_LEN" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH SUMMARIZE LEN returned error: $FT_SUM_LEN"
     else
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH SUMMARIZE LEN 10 does not error"
@@ -2230,9 +2238,9 @@ if should_run "vector"; then
     # 7. HIGHLIGHT + SUMMARIZE combined: title highlighted, body summarized
     TOTAL=$((TOTAL + 1))
     FT_BOTH=$(mcli FT.SEARCH textidx "machine" HIGHLIGHT FIELDS 1 title SUMMARIZE FIELDS 1 body 2>&1)
-    if echo "$FT_BOTH" | grep -qi "err"; then
+    if echo "$FT_BOTH" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH HIGHLIGHT + SUMMARIZE combined returned error: $FT_BOTH"
-    elif echo "$FT_BOTH" | grep -q "machine\|<b>"; then
+    elif echo "$FT_BOTH" | qgrep -q "machine\|<b>"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH HIGHLIGHT FIELDS 1 title SUMMARIZE FIELDS 1 body returns result"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH combined HIGHLIGHT+SUMMARIZE missing output (got: $FT_BOTH)"
@@ -2244,7 +2252,7 @@ if should_run "vector"; then
 
     # FT.INFO after drop should error
     TOTAL=$((TOTAL + 1)); FT_TEXT_AFTER=$(mcli FT.INFO textidx 2>&1)
-    if echo "$FT_TEXT_AFTER" | grep -qi "err\|not found\|unknown"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO after text drop errors"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO after text drop should error"; fi
+    if echo "$FT_TEXT_AFTER" | qgrep -qi "err\|not found\|unknown"; then PASS=$((PASS + 1)); echo "  PASS: FT.INFO after text drop errors"; else FAIL=$((FAIL + 1)); echo "  FAIL: FT.INFO after text drop should error"; fi
 
     # Cleanup remaining text indexes
     mcli FT.DROPINDEX nostemidx >/dev/null 2>&1
@@ -2277,9 +2285,9 @@ if should_run "vector"; then
     # Test 1: FUZ-01 — Fuzzy search distance 2 (%% syntax)
     TOTAL=$((TOTAL + 1))
     FT_FUZZY2=$(mcli FT.SEARCH fuzzyidx "%%machne%%" LIMIT 0 10 2>&1)
-    if echo "$FT_FUZZY2" | grep -qi "err"; then
+    if echo "$FT_FUZZY2" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-01 %%machne%% returned error: $FT_FUZZY2"
-    elif echo "$FT_FUZZY2" | grep -q "fz:"; then
+    elif echo "$FT_FUZZY2" | qgrep -q "fz:"; then
         PASS=$((PASS + 1)); echo "  PASS: FUZ-01 %%machne%% (fuzzy dist-2) returns docs"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-01 %%machne%% returned no docs: $FT_FUZZY2"
@@ -2288,9 +2296,9 @@ if should_run "vector"; then
     # Test 2: FUZ-01 — Fuzzy search distance 1 (% syntax)
     TOTAL=$((TOTAL + 1))
     FT_FUZZY1=$(mcli FT.SEARCH fuzzyidx "%machin%" LIMIT 0 10 2>&1)
-    if echo "$FT_FUZZY1" | grep -qi "err"; then
+    if echo "$FT_FUZZY1" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-01 %machin% returned error: $FT_FUZZY1"
-    elif echo "$FT_FUZZY1" | grep -q "fz:"; then
+    elif echo "$FT_FUZZY1" | qgrep -q "fz:"; then
         PASS=$((PASS + 1)); echo "  PASS: FUZ-01 %machin% (fuzzy dist-1) returns docs"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-01 %machin% returned no docs: $FT_FUZZY1"
@@ -2299,9 +2307,9 @@ if should_run "vector"; then
     # Test 3: FUZ-03 — Prefix search (mach* syntax)
     TOTAL=$((TOTAL + 1))
     FT_PREFIX=$(mcli FT.SEARCH fuzzyidx "mach*" LIMIT 0 10 2>&1)
-    if echo "$FT_PREFIX" | grep -qi "err"; then
+    if echo "$FT_PREFIX" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-03 mach* returned error: $FT_PREFIX"
-    elif echo "$FT_PREFIX" | grep -q "fz:"; then
+    elif echo "$FT_PREFIX" | qgrep -q "fz:"; then
         PASS=$((PASS + 1)); echo "  PASS: FUZ-03 mach* prefix search returns docs"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-03 mach* returned no docs: $FT_PREFIX"
@@ -2310,9 +2318,9 @@ if should_run "vector"; then
     # Test 4: FUZ-03 — Short prefix (ma*)
     TOTAL=$((TOTAL + 1))
     FT_SHORT_PREFIX=$(mcli FT.SEARCH fuzzyidx "ma*" LIMIT 0 10 2>&1)
-    if echo "$FT_SHORT_PREFIX" | grep -qi "err"; then
+    if echo "$FT_SHORT_PREFIX" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-03 ma* returned error: $FT_SHORT_PREFIX"
-    elif echo "$FT_SHORT_PREFIX" | grep -q "fz:"; then
+    elif echo "$FT_SHORT_PREFIX" | qgrep -q "fz:"; then
         PASS=$((PASS + 1)); echo "  PASS: FUZ-03 ma* short prefix returns docs"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-03 ma* returned no docs: $FT_SHORT_PREFIX"
@@ -2321,9 +2329,9 @@ if should_run "vector"; then
     # Test 5: FUZ-01 — Fuzzy search with field target @title:(%%machne%%)
     TOTAL=$((TOTAL + 1))
     FT_FIELD_FUZZY=$(mcli FT.SEARCH fuzzyidx "@title:(%%machne%%)" LIMIT 0 10 2>&1)
-    if echo "$FT_FIELD_FUZZY" | grep -qi "err"; then
+    if echo "$FT_FIELD_FUZZY" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-01 field-targeted fuzzy returned error: $FT_FIELD_FUZZY"
-    elif echo "$FT_FIELD_FUZZY" | grep -q "fz:"; then
+    elif echo "$FT_FIELD_FUZZY" | qgrep -q "fz:"; then
         PASS=$((PASS + 1)); echo "  PASS: FUZ-01 @title:(%%machne%%) field-targeted fuzzy returns docs"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-01 @title:(%%machne%%) returned no docs: $FT_FIELD_FUZZY"
@@ -2332,9 +2340,9 @@ if should_run "vector"; then
     # Test 6: REGRESSION — exact search still works after query parser changes
     TOTAL=$((TOTAL + 1))
     FT_EXACT=$(mcli FT.SEARCH fuzzyidx "machine" LIMIT 0 10 2>&1)
-    if echo "$FT_EXACT" | grep -qi "err"; then
+    if echo "$FT_EXACT" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: REGRESSION exact search returned error: $FT_EXACT"
-    elif echo "$FT_EXACT" | grep -q "fz:"; then
+    elif echo "$FT_EXACT" | qgrep -q "fz:"; then
         PASS=$((PASS + 1)); echo "  PASS: REGRESSION exact search still works (no regressions)"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: REGRESSION exact 'machine' returned no docs: $FT_EXACT"
@@ -2354,9 +2362,9 @@ if should_run "vector"; then
     # is the half that proves AND is really AND.
     TOTAL=$((TOTAL + 1))
     FT_MIXED=$(mcli FT.SEARCH fuzzyidx "%%machne%% learning" LIMIT 0 10 2>&1)
-    if echo "$FT_MIXED" | grep -qi "err"; then
+    if echo "$FT_MIXED" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: MIXED exact+fuzzy returned error: $FT_MIXED"
-    elif echo "$FT_MIXED" | grep -q "^fz:1$"; then
+    elif echo "$FT_MIXED" | qgrep -q "^fz:1$"; then
         PASS=$((PASS + 1)); echo "  PASS: MIXED %%machne%% learning (fuzzy+exact) returns fz:1"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: MIXED %%machne%% learning expected fz:1, got: $FT_MIXED"
@@ -2364,7 +2372,7 @@ if should_run "vector"; then
 
     TOTAL=$((TOTAL + 1))
     FT_MIXED_EMPTY=$(mcli FT.SEARCH fuzzyidx "%%machne%% deep" LIMIT 0 10 2>&1)
-    if echo "$FT_MIXED_EMPTY" | grep -q "fz:"; then
+    if echo "$FT_MIXED_EMPTY" | qgrep -q "fz:"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: MIXED unsatisfiable conjunction matched (AND behaving as OR): $FT_MIXED_EMPTY"
     else
         PASS=$((PASS + 1)); echo "  PASS: MIXED %%machne%% deep matches nothing (no doc has both)"
@@ -2378,9 +2386,9 @@ if should_run "vector"; then
 
     TOTAL=$((TOTAL + 1))
     FT_COMPACT_FUZZY=$(mcli FT.SEARCH fuzzyidx2 "%%machne%%" LIMIT 0 10 2>&1)
-    if echo "$FT_COMPACT_FUZZY" | grep -qi "err"; then
+    if echo "$FT_COMPACT_FUZZY" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-02 fuzzy after compact returned error: $FT_COMPACT_FUZZY"
-    elif echo "$FT_COMPACT_FUZZY" | grep -q "fzr:"; then
+    elif echo "$FT_COMPACT_FUZZY" | qgrep -q "fzr:"; then
         PASS=$((PASS + 1)); echo "  PASS: FUZ-02 fuzzy works after FT.COMPACT FST build"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FUZ-02 fuzzy after compact returned no docs: $FT_COMPACT_FUZZY"
@@ -2405,7 +2413,7 @@ if should_run "vector"; then
     # Setup: Plan 06 shipped TAG field-type; Plan 07 ships NUMERIC. Both are now
     # permanent baseline for the aggidx schema — no probe, no gating.
     FT_CREATE_RESULT=$(mcli FT.CREATE aggidx ON HASH PREFIX 1 agg: SCHEMA status TAG priority TAG assignee TAG score NUMERIC 2>&1)
-    if echo "$FT_CREATE_RESULT" | grep -qi "err"; then
+    if echo "$FT_CREATE_RESULT" | qgrep -qi "err"; then
         echo "  FAIL: FT.CREATE aggidx rejected by moon: $FT_CREATE_RESULT"
         SKIP_AGG=1
     else
@@ -2460,7 +2468,7 @@ if should_run "vector"; then
 
         TOTAL=$((TOTAL + 1))
         AGG_AVG=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @priority REDUCE AVG 1 @score AS avg_score 2>&1)
-        if echo "$AGG_AVG" | grep -qi "err"; then
+        if echo "$AGG_AVG" | qgrep -qi "err"; then
             FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 GROUPBY+AVG errored: $AGG_AVG"
         else
             PASS=$((PASS + 1)); echo "  PASS: AGG-03 GROUPBY+AVG returns rows"
@@ -2486,7 +2494,7 @@ if should_run "vector"; then
 
         TOTAL=$((TOTAL + 1))
         AGG_DISTINCT=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE COUNT_DISTINCT 1 @assignee AS uniq_users 2>&1)
-        if echo "$AGG_DISTINCT" | grep -qi "err"; then
+        if echo "$AGG_DISTINCT" | qgrep -qi "err"; then
             FAIL=$((FAIL + 1)); echo "  FAIL: AGG-04 COUNT_DISTINCT errored: $AGG_DISTINCT"
         else
             PASS=$((PASS + 1)); echo "  PASS: AGG-04 COUNT_DISTINCT returns rows"
@@ -2495,7 +2503,7 @@ if should_run "vector"; then
         # AGG-02b: SORTBY + LIMIT
         TOTAL=$((TOTAL + 1))
         AGG_LIMIT=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE COUNT 0 AS cnt SORTBY 2 @cnt DESC LIMIT 0 1 2>&1)
-        if echo "$AGG_LIMIT" | grep -q "open" && ! echo "$AGG_LIMIT" | grep -q "closed"; then
+        if echo "$AGG_LIMIT" | qgrep -q "open" && ! echo "$AGG_LIMIT" | qgrep -q "closed"; then
             PASS=$((PASS + 1)); echo "  PASS: AGG-02b SORTBY + LIMIT returns top-1 ('open')"
         else
             FAIL=$((FAIL + 1)); echo "  FAIL: AGG-02b SORTBY+LIMIT unexpected: $AGG_LIMIT"
@@ -2504,7 +2512,7 @@ if should_run "vector"; then
         # APPLY must be rejected in v1 (D-04 / Pitfall 10)
         TOTAL=$((TOTAL + 1))
         APPLY_REJECT=$(mcli FT.AGGREGATE aggidx '*' APPLY '@score+1' AS plus_one 2>&1)
-        if echo "$APPLY_REJECT" | grep -qE "APPLY.*not supported|not implemented|v1"; then
+        if echo "$APPLY_REJECT" | qgrep -qE "APPLY.*not supported|not implemented|v1"; then
             PASS=$((PASS + 1)); echo "  PASS: AGG APPLY rejected in v1"
         else
             FAIL=$((FAIL + 1)); echo "  FAIL: APPLY should be rejected: $APPLY_REJECT"
@@ -2546,7 +2554,7 @@ if should_run "vector"; then
         mcli HSET agg:partial status open priority high >/dev/null 2>&1
         mcli HSET agg:partial priority low >/dev/null 2>&1   # partial — status NOT touched
         SEARCH_PARTIAL=$(mcli FT.SEARCH aggidx '@status:{open}' LIMIT 0 100 2>&1)
-        if echo "$SEARCH_PARTIAL" | grep -q '^agg:partial$'; then
+        if echo "$SEARCH_PARTIAL" | qgrep -q '^agg:partial$'; then
             PASS=$((PASS + 1)); echo "  PASS: TAG-04 partial HSET preserved @status:open on agg:partial"
         else
             FAIL=$((FAIL + 1)); echo "  FAIL: TAG-04 partial HSET wiped prior status entry"
@@ -2565,7 +2573,7 @@ if should_run "vector"; then
         TAG_OR_N=$(echo "$TAG_OR" | head -1)
         TAG_ONLY_OPEN=$(mcli FT.SEARCH aggidx '@status:{open}' LIMIT 0 20 2>&1 | head -1)
         TAG_ONLY_CLOSED=$(mcli FT.SEARCH aggidx '@status:{closed}' LIMIT 0 20 2>&1 | head -1)
-        if echo "$TAG_OR" | grep -qi "err\|not supported"; then
+        if echo "$TAG_OR" | qgrep -qi "err\|not supported"; then
             FAIL=$((FAIL + 1)); echo "  FAIL: TAG-05 multi-tag OR returned an error: $TAG_OR"
         elif ! [[ "$TAG_ONLY_OPEN$TAG_ONLY_CLOSED$TAG_OR_N" =~ ^[0-9]+$ ]]; then
             FAIL=$((FAIL + 1)); echo "  FAIL: TAG-05 non-numeric counts (or=$TAG_OR_N open=$TAG_ONLY_OPEN closed=$TAG_ONLY_CLOSED)"
@@ -2632,9 +2640,9 @@ if should_run "vector"; then
         # refusal or its wire form fails here.
         TOTAL=$((TOTAL + 1))
         NUM_INV=$(mcli FT.SEARCH aggidx '@score:[100 10]' LIMIT 0 10 2>&1)
-        if echo "$NUM_INV" | grep -q "^agg:"; then
+        if echo "$NUM_INV" | qgrep -q "^agg:"; then
             FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-05 inverted range was EXECUTED, not refused: $NUM_INV"
-        elif echo "$NUM_INV" | grep -q "^ERR " && echo "$NUM_INV" | grep -q "numeric_filter_invalid"; then
+        elif echo "$NUM_INV" | qgrep -q "^ERR " && echo "$NUM_INV" | qgrep -q "numeric_filter_invalid"; then
             PASS=$((PASS + 1)); echo "  PASS: NUMERIC-05 inverted range refused ($NUM_INV)"
         else
             FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-05 expected a refusal, got: $NUM_INV"
@@ -2645,7 +2653,7 @@ if should_run "vector"; then
         TOTAL=$((TOTAL + 1))
         mcli HSET agg:nan status open priority high score NaN >/dev/null 2>&1
         NUM_NAN=$(mcli FT.SEARCH aggidx '@score:[-inf +inf]' LIMIT 0 20 2>&1)
-        if echo "$NUM_NAN" | grep -q '^agg:nan$'; then
+        if echo "$NUM_NAN" | qgrep -q '^agg:nan$'; then
             FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-06 NaN leaked into index: agg:nan appeared in [-inf +inf]"
         else
             PASS=$((PASS + 1)); echo "  PASS: NUMERIC-06 NaN filtered on write"
@@ -2720,9 +2728,9 @@ if should_run "vector"; then
     # HYB-01: two-way hybrid (BM25 + dense, no sparse clause) — D-16 fall-through
     TOTAL=$((TOTAL + 1))
     HYB_TWO=$(mcli FT.SEARCH hybidx "machine learning" HYBRID VECTOR @vec '$q' FUSION RRF LIMIT 0 5 PARAMS 2 q "$VQ" 2>&1)
-    if echo "$HYB_TWO" | grep -qi "err"; then
+    if echo "$HYB_TWO" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: HYB-01 two-way hybrid errored: $HYB_TWO"
-    elif echo "$HYB_TWO" | grep -q "hy:"; then
+    elif echo "$HYB_TWO" | qgrep -q "hy:"; then
         PASS=$((PASS + 1)); echo "  PASS: HYB-01 two-way BM25+dense returns docs"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: HYB-01 two-way returned no docs: $HYB_TWO"
@@ -2730,7 +2738,7 @@ if should_run "vector"; then
 
     # HYB-01: response carries __rrf_score
     TOTAL=$((TOTAL + 1))
-    if echo "$HYB_TWO" | grep -q "__rrf_score"; then
+    if echo "$HYB_TWO" | qgrep -q "__rrf_score"; then
         PASS=$((PASS + 1)); echo "  PASS: HYB-01 response contains __rrf_score"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: HYB-01 response missing __rrf_score: $HYB_TWO"
@@ -2739,9 +2747,9 @@ if should_run "vector"; then
     # HYB-03: WEIGHTS tuning — all three weights honored
     TOTAL=$((TOTAL + 1))
     HYB_WEIGHTS=$(mcli FT.SEARCH hybidx "machine" HYBRID VECTOR @vec '$q' FUSION RRF WEIGHTS 1.0 1.5 0.5 LIMIT 0 5 PARAMS 2 q "$VQ" 2>&1)
-    if echo "$HYB_WEIGHTS" | grep -qi "err"; then
+    if echo "$HYB_WEIGHTS" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: HYB-03 WEIGHTS errored: $HYB_WEIGHTS"
-    elif echo "$HYB_WEIGHTS" | grep -q "hy:"; then
+    elif echo "$HYB_WEIGHTS" | qgrep -q "hy:"; then
         PASS=$((PASS + 1)); echo "  PASS: HYB-03 WEIGHTS 1.0 1.5 0.5 returns docs"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: HYB-03 WEIGHTS returned no docs: $HYB_WEIGHTS"
@@ -2750,7 +2758,7 @@ if should_run "vector"; then
     # HYB-03: negative weight rejected (D-17)
     TOTAL=$((TOTAL + 1))
     HYB_NEG=$(mcli FT.SEARCH hybidx "machine" HYBRID VECTOR @vec '$q' FUSION RRF WEIGHTS 1.0 -1.0 1.0 LIMIT 0 5 PARAMS 2 q "$VQ" 2>&1)
-    if echo "$HYB_NEG" | grep -qiE "non-negative|finite|weight"; then
+    if echo "$HYB_NEG" | qgrep -qiE "non-negative|finite|weight"; then
         PASS=$((PASS + 1)); echo "  PASS: HYB-03 negative weight rejected"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: HYB-03 negative weight should reject: $HYB_NEG"
@@ -2759,7 +2767,7 @@ if should_run "vector"; then
     # HYB-03: NaN weight rejected
     TOTAL=$((TOTAL + 1))
     HYB_NAN=$(mcli FT.SEARCH hybidx "machine" HYBRID VECTOR @vec '$q' FUSION RRF WEIGHTS 1.0 NaN 1.0 LIMIT 0 5 PARAMS 2 q "$VQ" 2>&1)
-    if echo "$HYB_NAN" | grep -qiE "non-negative|finite|weight"; then
+    if echo "$HYB_NAN" | qgrep -qiE "non-negative|finite|weight"; then
         PASS=$((PASS + 1)); echo "  PASS: HYB-03 NaN weight rejected"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: HYB-03 NaN weight should reject: $HYB_NAN"
@@ -2768,7 +2776,7 @@ if should_run "vector"; then
     # HYB-02: non-RRF fusion rejected
     TOTAL=$((TOTAL + 1))
     HYB_FUSION=$(mcli FT.SEARCH hybidx "machine" HYBRID VECTOR @vec '$q' FUSION FOO LIMIT 0 5 PARAMS 2 q "$VQ" 2>&1)
-    if echo "$HYB_FUSION" | grep -qi "fusion"; then
+    if echo "$HYB_FUSION" | qgrep -qi "fusion"; then
         PASS=$((PASS + 1)); echo "  PASS: HYB-02 unknown FUSION mode rejected"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: HYB-02 unknown FUSION should reject: $HYB_FUSION"
@@ -2777,7 +2785,7 @@ if should_run "vector"; then
     # HYB-02: SPARSE on index without sparse field errors (D-16)
     TOTAL=$((TOTAL + 1))
     HYB_NOSPARSE=$(mcli FT.SEARCH hybidx "machine" HYBRID VECTOR @vec '$q' SPARSE @noexist '$qs' FUSION RRF LIMIT 0 5 PARAMS 4 q "$VQ" qs "$(printf '\x01\x00\x00\x00\x00\x00\x80\x3f')" 2>&1)
-    if echo "$HYB_NOSPARSE" | grep -qi "sparse"; then
+    if echo "$HYB_NOSPARSE" | qgrep -qi "sparse"; then
         PASS=$((PASS + 1)); echo "  PASS: HYB-02 SPARSE on index without sparse field errors (D-16)"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: HYB-02 missing sparse field should error: $HYB_NOSPARSE"
@@ -2786,7 +2794,7 @@ if should_run "vector"; then
     # HYB: backward-compat — FT.SEARCH without HYBRID keyword unchanged (D-18)
     TOTAL=$((TOTAL + 1))
     HYB_BC=$(mcli FT.SEARCH hybidx "machine" LIMIT 0 5 2>&1)
-    if echo "$HYB_BC" | grep -qi "err"; then
+    if echo "$HYB_BC" | qgrep -qi "err"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: HYB backward compat (no HYBRID) errored: $HYB_BC"
     else
         PASS=$((PASS + 1)); echo "  PASS: HYB backward compat (FT.SEARCH text, no HYBRID)"
@@ -2811,7 +2819,7 @@ if should_run "temporal"; then
     # TEMP-02: TEMPORAL.SNAPSHOT_AT wrong args — extra argument rejected
     TOTAL=$((TOTAL + 1))
     SNAP_ERR=$(mcli TEMPORAL.SNAPSHOT_AT extraarg 2>&1)
-    if echo "$SNAP_ERR" | grep -qi "wrong number of arguments"; then
+    if echo "$SNAP_ERR" | qgrep -qi "wrong number of arguments"; then
         PASS=$((PASS + 1)); echo "  PASS: TEMPORAL.SNAPSHOT_AT wrong args rejected"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: TEMPORAL.SNAPSHOT_AT wrong args should reject: $SNAP_ERR"
@@ -2825,7 +2833,7 @@ if should_run "temporal"; then
     if [[ -n "$NODE_ID" ]]; then
         TOTAL=$((TOTAL + 1))
         INV_OK=$(mcli TEMPORAL.INVALIDATE "$NODE_ID" NODE testgraph 2>&1)
-        if echo "$INV_OK" | grep -q "OK"; then
+        if echo "$INV_OK" | qgrep -q "OK"; then
             PASS=$((PASS + 1)); echo "  PASS: TEMPORAL.INVALIDATE basic OK (node_id=$NODE_ID)"
         else
             FAIL=$((FAIL + 1)); echo "  FAIL: TEMPORAL.INVALIDATE basic should return OK: $INV_OK"
@@ -2834,7 +2842,7 @@ if should_run "temporal"; then
         # Verify node is still visible (no VALID_AT filter = sees all)
         TOTAL=$((TOTAL + 1))
         QUERY_OUT=$(mcli GRAPH.QUERY testgraph "MATCH (n:TestLabel) RETURN n" 2>&1)
-        if echo "$QUERY_OUT" | grep -qiE "TestLabel|node|result"; then
+        if echo "$QUERY_OUT" | qgrep -qiE "TestLabel|node|result"; then
             PASS=$((PASS + 1)); echo "  PASS: TEMPORAL.INVALIDATE node still visible without VALID_AT"
         else
             FAIL=$((FAIL + 1)); echo "  FAIL: TEMPORAL.INVALIDATE node should be visible: $QUERY_OUT"
@@ -2848,7 +2856,7 @@ if should_run "temporal"; then
     # TEMP-04: TEMPORAL.INVALIDATE not found — nonexistent graph
     TOTAL=$((TOTAL + 1))
     INV_NOTFOUND=$(mcli TEMPORAL.INVALIDATE 999999 NODE nonexistent 2>&1)
-    if echo "$INV_NOTFOUND" | grep -qi "graph not found"; then
+    if echo "$INV_NOTFOUND" | qgrep -qi "graph not found"; then
         PASS=$((PASS + 1)); echo "  PASS: TEMPORAL.INVALIDATE graph not found"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: TEMPORAL.INVALIDATE should error graph not found: $INV_NOTFOUND"
@@ -2857,7 +2865,7 @@ if should_run "temporal"; then
     # TEMP-05: TEMPORAL.INVALIDATE wrong args — no arguments
     TOTAL=$((TOTAL + 1))
     INV_NOARGS=$(mcli TEMPORAL.INVALIDATE 2>&1)
-    if echo "$INV_NOARGS" | grep -qi "wrong number of arguments"; then
+    if echo "$INV_NOARGS" | qgrep -qi "wrong number of arguments"; then
         PASS=$((PASS + 1)); echo "  PASS: TEMPORAL.INVALIDATE wrong args (none)"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: TEMPORAL.INVALIDATE no args should reject: $INV_NOARGS"
@@ -2866,7 +2874,7 @@ if should_run "temporal"; then
     # TEMP-06: TEMPORAL.INVALIDATE bad entity kind — VERTEX not valid
     TOTAL=$((TOTAL + 1))
     INV_BADKIND=$(mcli TEMPORAL.INVALIDATE 42 VERTEX testgraph 2>&1)
-    if echo "$INV_BADKIND" | grep -qi "entity kind must be NODE or EDGE"; then
+    if echo "$INV_BADKIND" | qgrep -qi "entity kind must be NODE or EDGE"; then
         PASS=$((PASS + 1)); echo "  PASS: TEMPORAL.INVALIDATE bad entity kind rejected"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: TEMPORAL.INVALIDATE bad kind should reject: $INV_BADKIND"
@@ -2943,7 +2951,7 @@ PYEOF
     fi
 
     TOTAL=$((TOTAL + 1))
-    if echo "$ERR_MSG" | grep -q "no temporal snapshot registered"; then
+    if echo "$ERR_MSG" | qgrep -q "no temporal snapshot registered"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH AS_OF <unregistered> surfaces helper ERR"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH AS_OF unregistered should surface ERR; got: $ERR_MSG"
@@ -3055,7 +3063,7 @@ if should_run "temporal"; then
     # DECAY-01: without --decay the direct path wins (A -> C, no B)
     TOTAL=$((TOTAL + 1))
     OFF_OUT=$(mcli GRAPH.QUERY decayg "$DECAY_QUERY" 2>&1)
-    if echo "$OFF_OUT" | grep -qE "^${DECAY_C}\$" && ! echo "$OFF_OUT" | grep -qE "^${DECAY_B}\$"; then
+    if echo "$OFF_OUT" | qgrep -qE "^${DECAY_C}\$" && ! echo "$OFF_OUT" | qgrep -qE "^${DECAY_B}\$"; then
         PASS=$((PASS + 1)); echo "  PASS: GRAPH.QUERY shortestPath without --decay takes direct path (no B)"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: expected direct A->C path without --decay: $OFF_OUT"
@@ -3064,7 +3072,7 @@ if should_run "temporal"; then
     # DECAY-02: with --decay the fresh detour wins (A -> B -> C)
     TOTAL=$((TOTAL + 1))
     ON_OUT=$(mcli GRAPH.QUERY decayg "$DECAY_QUERY" --decay 5 2>&1)
-    if echo "$ON_OUT" | grep -qE "^${DECAY_B}\$"; then
+    if echo "$ON_OUT" | qgrep -qE "^${DECAY_B}\$"; then
         PASS=$((PASS + 1)); echo "  PASS: GRAPH.QUERY shortestPath --decay 5 prefers fresh detour (via B)"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: expected detour via B with --decay 5: $ON_OUT"
@@ -3073,7 +3081,7 @@ if should_run "temporal"; then
     # DECAY-03: --decay garbage value rejected
     TOTAL=$((TOTAL + 1))
     BAD_OUT=$(mcli GRAPH.QUERY decayg "$DECAY_QUERY" --decay abc 2>&1)
-    if echo "$BAD_OUT" | grep -qi "finite non-negative"; then
+    if echo "$BAD_OUT" | qgrep -qi "finite non-negative"; then
         PASS=$((PASS + 1)); echo "  PASS: GRAPH.QUERY --decay rejects non-numeric value"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: --decay abc should be rejected: $BAD_OUT"
@@ -3082,7 +3090,7 @@ if should_run "temporal"; then
     # DECAY-04: --time-weight without --decay rejected
     TOTAL=$((TOTAL + 1))
     TW_OUT=$(mcli GRAPH.QUERY decayg "$DECAY_QUERY" --time-weight 2.0 2>&1)
-    if echo "$TW_OUT" | grep -qi "requires --decay"; then
+    if echo "$TW_OUT" | qgrep -qi "requires --decay"; then
         PASS=$((PASS + 1)); echo "  PASS: GRAPH.QUERY --time-weight without --decay rejected"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: --time-weight alone should be rejected: $TW_OUT"
@@ -3091,7 +3099,7 @@ if should_run "temporal"; then
     # DECAY-05: FT.NAVIGATE DECAY strict validation (parses before index lookup)
     TOTAL=$((TOTAL + 1))
     NAV_BAD=$(mcli FT.NAVIGATE noidx "*" HOPS 2 DECAY notanumber 2>&1)
-    if echo "$NAV_BAD" | grep -qi "DECAY must be a finite non-negative number"; then
+    if echo "$NAV_BAD" | qgrep -qi "DECAY must be a finite non-negative number"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.NAVIGATE DECAY rejects non-numeric value"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: FT.NAVIGATE DECAY notanumber should be rejected: $NAV_BAD"
@@ -3101,7 +3109,7 @@ if should_run "temporal"; then
     # if any, is about the missing index — NOT about the DECAY value)
     TOTAL=$((TOTAL + 1))
     NAV_OK=$(mcli FT.NAVIGATE noidx "*" HOPS 2 DECAY 0.5 2>&1)
-    if echo "$NAV_OK" | grep -qi "DECAY"; then
+    if echo "$NAV_OK" | qgrep -qi "DECAY"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: valid DECAY 0.5 should not produce a DECAY error: $NAV_OK"
     else
         PASS=$((PASS + 1)); echo "  PASS: FT.NAVIGATE DECAY 0.5 accepted (no DECAY parse error)"
@@ -3111,7 +3119,7 @@ if should_run "temporal"; then
     # never silently ignored)
     TOTAL=$((TOTAL + 1))
     WR_OUT=$(mcli GRAPH.QUERY decayg "CREATE (:Person {name: 'X'})" --decay 0.5 2>&1)
-    if echo "$WR_OUT" | grep -qi "read-only"; then
+    if echo "$WR_OUT" | qgrep -qi "read-only"; then
         PASS=$((PASS + 1)); echo "  PASS: GRAPH.QUERY --decay on write query rejected"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: --decay on CREATE should be rejected: $WR_OUT"
@@ -3133,7 +3141,7 @@ if should_run "workspace"; then
     # WS-01: WS CREATE returns UUID
     TOTAL=$((TOTAL + 1))
     WS_ID=$(mcli WS CREATE myworkspace 2>&1)
-    if echo "$WS_ID" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    if echo "$WS_ID" | qgrep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
         PASS=$((PASS + 1)); echo "  PASS: WS CREATE returns UUID ($WS_ID)"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: WS CREATE should return UUID, got: $WS_ID"
@@ -3142,7 +3150,7 @@ if should_run "workspace"; then
     # WS-02: WS LIST returns workspace
     TOTAL=$((TOTAL + 1))
     WS_LIST=$(mcli WS LIST 2>&1)
-    if echo "$WS_LIST" | grep -qF "myworkspace"; then
+    if echo "$WS_LIST" | qgrep -qF "myworkspace"; then
         PASS=$((PASS + 1)); echo "  PASS: WS LIST contains myworkspace"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: WS LIST should contain myworkspace: $WS_LIST"
@@ -3151,7 +3159,7 @@ if should_run "workspace"; then
     # WS-03: WS INFO returns metadata
     TOTAL=$((TOTAL + 1))
     WS_INFO=$(mcli WS INFO "$WS_ID" 2>&1)
-    if echo "$WS_INFO" | grep -qF "myworkspace"; then
+    if echo "$WS_INFO" | qgrep -qF "myworkspace"; then
         PASS=$((PASS + 1)); echo "  PASS: WS INFO returns workspace metadata"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: WS INFO should contain name: $WS_INFO"
@@ -3169,7 +3177,7 @@ if should_run "workspace"; then
     TOTAL=$((TOTAL + 1))
     WS_ID2=$(mcli WS CREATE dropme 2>&1)
     DROP_OK=$(mcli WS DROP "$WS_ID2" 2>&1)
-    if echo "$DROP_OK" | grep -q "OK"; then
+    if echo "$DROP_OK" | qgrep -q "OK"; then
         PASS=$((PASS + 1)); echo "  PASS: WS DROP returns OK"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: WS DROP should return OK: $DROP_OK"
@@ -3178,7 +3186,7 @@ if should_run "workspace"; then
     # WS-07: WS LIST after drop no longer shows dropped workspace
     TOTAL=$((TOTAL + 1))
     WS_LIST2=$(mcli WS LIST 2>&1)
-    if echo "$WS_LIST2" | grep -qF "dropme"; then
+    if echo "$WS_LIST2" | qgrep -qF "dropme"; then
         FAIL=$((FAIL + 1)); echo "  FAIL: WS LIST should not contain 'dropme' after drop"
     else
         PASS=$((PASS + 1)); echo "  PASS: WS LIST does not contain dropped workspace"
@@ -3187,7 +3195,7 @@ if should_run "workspace"; then
     # WS-08: WS AUTH with invalid UUID
     TOTAL=$((TOTAL + 1))
     AUTH_ERR=$(mcli WS AUTH "not-a-uuid" 2>&1)
-    if echo "$AUTH_ERR" | grep -qi "ERR"; then
+    if echo "$AUTH_ERR" | qgrep -qi "ERR"; then
         PASS=$((PASS + 1)); echo "  PASS: WS AUTH invalid UUID rejected"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: WS AUTH invalid should error: $AUTH_ERR"
@@ -3196,7 +3204,7 @@ if should_run "workspace"; then
     # WS-09: WS CREATE with empty name
     TOTAL=$((TOTAL + 1))
     CREATE_ERR=$(mcli WS CREATE 2>&1)
-    if echo "$CREATE_ERR" | grep -qi "ERR"; then
+    if echo "$CREATE_ERR" | qgrep -qi "ERR"; then
         PASS=$((PASS + 1)); echo "  PASS: WS CREATE missing name rejected"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: WS CREATE no name should error: $CREATE_ERR"
@@ -3226,7 +3234,7 @@ if should_run "mq"; then
     # MQ-04: MQ PUSH returns stream ID
     TOTAL=$((TOTAL + 1))
     MQ_PUSH_ID=$(mcli MQ PUSH mqtest field1 value1 2>&1)
-    if echo "$MQ_PUSH_ID" | grep -qE '^[0-9]+-[0-9]+$'; then
+    if echo "$MQ_PUSH_ID" | qgrep -qE '^[0-9]+-[0-9]+$'; then
         PASS=$((PASS + 1)); echo "  PASS: MQ PUSH returns stream ID ($MQ_PUSH_ID)"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: MQ PUSH should return stream ID: $MQ_PUSH_ID"
@@ -3235,7 +3243,7 @@ if should_run "mq"; then
     # MQ-05: MQ POP returns message with fields
     TOTAL=$((TOTAL + 1))
     MQ_POP_OUT=$(mcli MQ POP mqtest 2>&1)
-    if echo "$MQ_POP_OUT" | grep -qF "field1"; then
+    if echo "$MQ_POP_OUT" | qgrep -qF "field1"; then
         PASS=$((PASS + 1)); echo "  PASS: MQ POP returns message with field"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: MQ POP should contain field1: $MQ_POP_OUT"
@@ -3247,7 +3255,7 @@ if should_run "mq"; then
     mcli MQ POP mqtest >/dev/null 2>&1
     TOTAL=$((TOTAL + 1))
     MQ_ACK_OUT=$(mcli MQ ACK mqtest "$MQ_ACK_ID" 2>&1)
-    if echo "$MQ_ACK_OUT" | grep -qE '(integer) 1|^1$'; then
+    if echo "$MQ_ACK_OUT" | qgrep -qE '(integer) 1|^1$'; then
         PASS=$((PASS + 1)); echo "  PASS: MQ ACK returns 1"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: MQ ACK should return 1: $MQ_ACK_OUT"
@@ -3256,7 +3264,7 @@ if should_run "mq"; then
     # MQ-07: MQ ACK non-existent returns 0
     TOTAL=$((TOTAL + 1))
     MQ_ACK_ZERO=$(mcli MQ ACK mqtest 999999999-999 2>&1)
-    if echo "$MQ_ACK_ZERO" | grep -qE '(integer) 0|^0$'; then
+    if echo "$MQ_ACK_ZERO" | qgrep -qE '(integer) 0|^0$'; then
         PASS=$((PASS + 1)); echo "  PASS: MQ ACK non-existent returns 0"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: MQ ACK non-existent should return 0: $MQ_ACK_ZERO"
@@ -3271,7 +3279,7 @@ if should_run "mq"; then
     mcli MQ POP mqdlqtest >/dev/null 2>&1
     TOTAL=$((TOTAL + 1))
     MQ_DLQ_LEN=$(mcli MQ DLQLEN mqdlqtest 2>&1)
-    if echo "$MQ_DLQ_LEN" | grep -qE '(integer) 1|^1$'; then
+    if echo "$MQ_DLQ_LEN" | qgrep -qE '(integer) 1|^1$'; then
         PASS=$((PASS + 1)); echo "  PASS: MQ DLQ routing (MAXDELIVERY 1 -> DLQ len 1)"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: MQ DLQLEN after DLQ routing should be 1: $MQ_DLQ_LEN"
@@ -3283,7 +3291,7 @@ if should_run "mq"; then
     # MQ-11: MQ unknown subcommand
     TOTAL=$((TOTAL + 1))
     MQ_UNK=$(mcli MQ FOOBAR 2>&1)
-    if echo "$MQ_UNK" | grep -qi "unknown MQ subcommand"; then
+    if echo "$MQ_UNK" | qgrep -qi "unknown MQ subcommand"; then
         PASS=$((PASS + 1)); echo "  PASS: MQ unknown subcommand rejected"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: MQ unknown sub should error: $MQ_UNK"
@@ -3292,7 +3300,7 @@ if should_run "mq"; then
     # MQ-12: MQ PUSH missing args
     TOTAL=$((TOTAL + 1))
     MQ_PUSH_ERR=$(mcli MQ PUSH 2>&1)
-    if echo "$MQ_PUSH_ERR" | grep -qi "wrong number of arguments"; then
+    if echo "$MQ_PUSH_ERR" | qgrep -qi "wrong number of arguments"; then
         PASS=$((PASS + 1)); echo "  PASS: MQ PUSH missing args rejected"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: MQ PUSH no args should error: $MQ_PUSH_ERR"
@@ -3301,7 +3309,7 @@ if should_run "mq"; then
     # MQ-13: MQ ACK invalid ID format
     TOTAL=$((TOTAL + 1))
     MQ_ACK_BAD=$(mcli MQ ACK mqtest not-a-valid-id 2>&1)
-    if echo "$MQ_ACK_BAD" | grep -qi "invalid message ID format"; then
+    if echo "$MQ_ACK_BAD" | qgrep -qi "invalid message ID format"; then
         PASS=$((PASS + 1)); echo "  PASS: MQ ACK invalid ID rejected"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: MQ ACK invalid ID should error: $MQ_ACK_BAD"
@@ -3311,7 +3319,7 @@ if should_run "mq"; then
     mcli XADD nondurable '*' f v >/dev/null 2>&1
     TOTAL=$((TOTAL + 1))
     MQ_NONDUR=$(mcli MQ PUSH nondurable f v 2>&1)
-    if echo "$MQ_NONDUR" | grep -qi "not a durable queue"; then
+    if echo "$MQ_NONDUR" | qgrep -qi "not a durable queue"; then
         PASS=$((PASS + 1)); echo "  PASS: MQ PUSH to non-durable stream rejected"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: MQ PUSH non-durable should error: $MQ_NONDUR"
@@ -3325,7 +3333,7 @@ if should_run "mq"; then
     TOTAL=$((TOTAL + 1))
     MQ_POP_CNT=$(mcli MQ POP mqcount COUNT 2 2>&1)
     # Should contain at least some data (not empty or error)
-    if echo "$MQ_POP_CNT" | grep -qE "f[0-9]|v[0-9]"; then
+    if echo "$MQ_POP_CNT" | qgrep -qE "f[0-9]|v[0-9]"; then
         PASS=$((PASS + 1)); echo "  PASS: MQ POP COUNT 2 returns messages"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: MQ POP COUNT 2 should return messages: $MQ_POP_CNT"
@@ -3560,7 +3568,7 @@ if should_run "eviction"; then
     ecli CONFIG SET maxmemory-policy noeviction >/dev/null 2>&1 || true
     ecli CONFIG SET maxmemory 65536 >/dev/null 2>&1 || true
     EV_OOM=$(ecli SET ev:refused "$EV_VAL" 2>&1)
-    if echo "$EV_OOM" | grep -qi "OOM"; then
+    if echo "$EV_OOM" | qgrep -qi "OOM"; then
         PASS=$((PASS + 1)); echo "  PASS: noeviction over budget returns OOM"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: noeviction should return OOM, got: $EV_OOM"
