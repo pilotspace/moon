@@ -247,17 +247,48 @@ fn pco12_the_ordering_guard_reports_what_it_costs() {
          every pipelined client"
     );
 
+    // --- the counter must still be reachable, or the leg below is vacuous ---
+    // A KEYLESS aggregation, not a multi-key read: since moon#513 A2a an `MGET`
+    // no longer defers whatever its keys do, so it can no longer prove the
+    // counter is live. `DBSIZE` touches every shard by construction and is in
+    // the guard's INTRINSIC set — it defers now and must keep deferring.
+    fn keyless(c: &mut Conn, tag: &str, n: usize) {
+        for i in (0..n).step_by(2) {
+            let (a, b) = (format!("{tag}:{i}"), format!("{tag}:{}", i + 1));
+            c.pipeline(&[&["SET", &a, "v"], &["SET", &b, "v"], &["DBSIZE"]]);
+        }
+    }
+    let base = defers(m.port);
+    let mut c = Conn::open(m.port);
+    keyless(&mut c, "pco12kl", 64);
+    drop(c);
+    let keyless_defers = defers(m.port) - base;
+    assert!(
+        keyless_defers > 0,
+        "a DBSIZE interleaved between writes at --shards {SHARDS} must trigger \
+         the moon#507 guard, and INFO must say so. Zero here means the counter \
+         is not wired to the deferral site, and the leg below would pass \
+         vacuously"
+    );
+
+    // --- moon#513 landed: the filed shape stops paying the boundary ---
+    // This assertion was `> 0` and is FLIPPED, not deleted, exactly as the
+    // comment that shipped with it instructed. It is now the acceptance
+    // criterion rather than the cost report: A1 (moon#721) took the co-located
+    // key sets and A2a took the spanning ones, so an `MGET` between writes
+    // routes into the slotted batch either way and the cut is gone.
     let base = defers(m.port);
     let mut c = Conn::open(m.port);
     interleaved(&mut c, "pco12int", 64);
     drop(c);
     let interleaved_defers = defers(m.port) - base;
-    assert!(
-        interleaved_defers > 0,
-        "an MGET interleaved between writes at --shards {SHARDS} must trigger \
-         the moon#507 guard, and INFO must say so. Zero here means either the \
-         counter is not wired to the deferral site, or moon#513 has landed — \
-         in which case flip this assertion to `== 0` rather than deleting it"
+    assert_eq!(
+        interleaved_defers, 0,
+        "an MGET interleaved between writes at --shards {SHARDS} must now join \
+         the slotted batch instead of cutting it (moon#513). It cut \
+         {interleaved_defers} times, each a full phase-2b drain cycle — the \
+         keyless leg measured {keyless_defers} on this same harness, so the \
+         counter is reachable and this is a real regression"
     );
 }
 
@@ -284,15 +315,26 @@ fn pco12_the_ordering_guard_reports_what_it_costs() {
 /// enter `remote_groups`, the guard would never be consulted, and the disjoint
 /// leg would pass while proving nothing. So the writes deliberately span two
 /// shards — at `--shards 4` at least one of them is foreign whatever shard the
-/// connection got — and the overlap leg asserts that an `MGET` reading THOSE
-/// shards still defers. A green disjoint leg means something only because the
-/// overlap leg is non-zero on the same harness.
+/// connection got — and the overlap leg asserts that a multi-key command
+/// touching THOSE shards still defers. A green disjoint leg means something
+/// only because the overlap leg is non-zero on the same harness.
 ///
-/// The co-located case (`{tag}` keys, so the `MGET` and the pending writes share
-/// one shard) is deliberately NOT here: it must still defer, because the
-/// coordinator executes a multi-key command inline rather than slotting it, so
-/// skipping the wait would re-open moon#507. Routing a single-owner multi-key
-/// command into the slotted batch is the separate follow-up.
+/// # Why the probe is an MSET
+///
+/// It was an `MGET` until moon#513 A2a, which routes a spanning multi-key READ
+/// into the slotted batch — so an `MGET` stopped consulting the mask arm at all
+/// and could no longer measure it in EITHER direction, silently emptying the
+/// overlap control. `MSET` is per-key decomposable but deliberately NOT split
+/// (that is A2b: splitting a write adds per-part AOF, replication and barrier
+/// work), so it still runs inline on the coordinator and is still judged by the
+/// mask. When A2b lands, this probe must move to a command that still takes the
+/// coordinator path — `MSETNX`, `BITOP` and `COPY` are not decomposable at all
+/// and never will be.
+///
+/// The co-located case (`{tag}` keys, so the multi-key command and the pending
+/// writes share one shard) is not here: it is
+/// [`pco15_single_owner_multikey_joins_the_slotted_batch`], and the spanning
+/// read is [`pco16_spanning_multikey_joins_the_slotted_batch`].
 #[test]
 fn pco13_disjoint_shard_multikey_does_not_cut_the_batch() {
     fn defers(port: u16) -> u64 {
@@ -345,7 +387,16 @@ fn pco13_disjoint_shard_multikey_does_not_cut_the_batch() {
 
     let m = spawn_moon(SHARDS);
 
-    // Runs the same 32 interleavings, reading `read` between each write pair.
+    // Runs the same 32 interleavings, touching `read` between each write pair.
+    //
+    // The probe is a spanning `MSET`, not the `MGET` this test shipped with.
+    // moon#513 A2a made a spanning MGET fan out into the slotted batch, so it
+    // stopped consulting the mask arm entirely and could no longer measure it —
+    // in either direction, which would have made the overlap control silently
+    // vacuous. `MSET` is per-key decomposable but NOT split (that is A2b, held
+    // back because splitting a write adds per-part AOF, replication and barrier
+    // work), so it still takes the coordinator's inline path and is still
+    // judged by the mask. Same command family, same guard arm, same claim.
     let run = |read: &[String]| -> (u64, Vec<String>) {
         let base = defers(m.port);
         let mut c = Conn::open(m.port);
@@ -354,7 +405,7 @@ fn pco13_disjoint_shard_multikey_does_not_cut_the_batch() {
             let r = c.pipeline(&[
                 &["SET", &w[0], "1"],
                 &["SET", &w[1], "2"],
-                &["MGET", &read[0], &read[1]],
+                &["MSET", &read[0], "x", &read[1], "y"],
             ]);
             if framed_len(r.as_bytes(), 3).is_none() {
                 wrong.push(format!("  i={i}: expected 3 framed replies, got {r:?}"));
@@ -368,17 +419,20 @@ fn pco13_disjoint_shard_multikey_does_not_cut_the_batch() {
     assert!(overlap_wrong.is_empty(), "{}", overlap_wrong.join("\n"));
     assert!(
         overlap_defers > 0,
-        "the MGET reads the very shards the pending SETs are writing, so the \
-         moon#507 guard MUST still cut the batch. Zero here means the writes \
-         never reached `remote_groups` at all — the harness landed on a shard \
-         that made them local — and the disjoint leg below would prove nothing"
+        "the MSET writes the very shards the pending SETs are writing, so the \
+         moon#507 guard MUST still cut the batch. Zero here means either the \
+         writes never reached `remote_groups` at all — the harness landed on a \
+         shard that made them local — or MSET stopped taking the coordinator's \
+         inline path (A2b), in which case this control has to move to another \
+         command that still does. Either way the disjoint leg below would \
+         prove nothing"
     );
 
     let (disjoint_defers, disjoint_wrong) = run(&disjoint);
     assert!(disjoint_wrong.is_empty(), "{}", disjoint_wrong.join("\n"));
     assert_eq!(
         disjoint_defers, 0,
-        "the MGET reads shards 2 and 3 while the pending SETs write shards 0 \
+        "the MSET writes shards 2 and 3 while the pending SETs write shards 0 \
          and 1, so there is nothing for it to wait on — yet it cut the batch \
          {disjoint_defers} times, once per interleaving, each a full drain \
          cycle. The guard is still answering on the command NAME instead of on \
@@ -931,16 +985,38 @@ fn pco15_single_owner_multikey_joins_the_slotted_batch() {
         (defers(m.port) - base, wrong)
     };
 
-    // --- control: a read SPANNING two shards still cuts, so the counter is live ---
+    // --- control: a command that still cuts, so the counter is live ---
+    // A SPANNING `MSET`, not the spanning `MGET` this leg shipped with: moon#513
+    // A2a routes a spanning multi-key READ into the slotted batch too, so an
+    // MGET no longer cuts for any key placement and cannot prove the counter is
+    // reachable. `MSET` is held back to A2b — splitting a write adds per-part
+    // AOF, replication and barrier work — so it still runs inline on the
+    // coordinator and still cuts. When A2b lands, move this to `MSETNX`,
+    // `BITOP` or `COPY`, which are not per-key decomposable at all.
     let span_w = [on("pco15cw", 0, 1).remove(0), on("pco15cw", 1, 1).remove(0)];
-    let (control_defers, control_wrong) = run(&span_w, &span_w);
-    assert!(control_wrong.is_empty(), "{}", control_wrong.join("\n"));
+    let control_defers = {
+        let base = defers(m.port);
+        let mut c = Conn::open(m.port);
+        for i in 0..32 {
+            let r = c.pipeline(&[
+                &["SET", &span_w[0], "1"],
+                &["SET", &span_w[1], "2"],
+                &["MSET", &span_w[0], "x", &span_w[1], "y"],
+            ]);
+            assert!(
+                framed_len(r.as_bytes(), 3).is_some(),
+                "control i={i}: expected 3 framed replies, got {r:?}"
+            );
+        }
+        drop(c);
+        defers(m.port) - base
+    };
     assert!(
         control_defers > 0,
-        "a two-shard MGET interleaved between writes to those same two shards \
-         must still cut the batch — A1 only claims the SINGLE-owner case. Zero \
-         here means the counter is not reachable on this harness and every \
-         subject leg below would pass vacuously"
+        "a two-shard MSET interleaved between writes to those same two shards \
+         must still cut the batch — it is still consumed inline by the \
+         coordinator. Zero here means the counter is not reachable on this \
+         harness and every subject leg below would pass vacuously"
     );
 
     // --- subject: one leg per shard, all keys co-located on that shard ---
@@ -982,5 +1058,224 @@ fn pco15_single_owner_multikey_joins_the_slotted_batch() {
              before it in its own batch — if slotting lost that, A1 has traded \
              moon#507 back for throughput: {r:?}"
         );
+    }
+}
+
+/// moon#513 (A2a): a multi-key READ whose keys SPAN shards must fan out into
+/// the slotted batch instead of cutting it.
+///
+/// A1 ([`pco15_single_owner_multikey_joins_the_slotted_batch`]) took the case
+/// where one shard owns every key: the command is simply appended to
+/// `remote_groups[owner]` like a single-key command. The genuinely SPANNING
+/// case had no single destination for the 1:1 `resp_idx -> reply` slot, so it
+/// stayed on the coordinator — which pushes its own message into the SPSC ring
+/// MID-LOOP, ahead of the batch's still-buffered earlier writes. That inversion
+/// is moon#507 itself, so the guard had to keep cutting the batch for it.
+///
+/// A2a removes the second push for the two SPLITTABLE reads, `MGET` and
+/// `EXISTS`: the command is decomposed per owner shard, each part is appended
+/// to that shard's `remote_groups` (or executed inline against the local slice)
+/// at the command's own position in the batch, and the parts are folded back
+/// into ONE client reply at the drain. Ordering is then per-key and comes from
+/// the slotted batch itself — for any key `k` every operation on `k` in this
+/// batch lands in `remote_groups[owner(k)]` in loop order, and the owner shard
+/// executes that vector in order.
+///
+/// # Both halves, or the test is worthless
+///
+/// A green deferral count alone would also be produced by a "fix" that simply
+/// stopped waiting while the coordinator kept running the command inline —
+/// which is moon#507 reopened. So the subject leg asserts BOTH that the batch
+/// was not cut AND that the command really took the fan-out route
+/// (`total_pipeline_multikey_fanout`), and then re-reads the values the same
+/// batch wrote.
+///
+/// # Why the control leg is KEYLESS
+///
+/// pco13's and pco15's controls used a shard-SPANNING `MGET` to prove the
+/// counter was reachable. A2a is precisely the change that makes that shape
+/// stop deferring, so it can no longer serve as a control. `DBSIZE` can: it is
+/// keyless, aggregates across every shard, and is named in the guard's
+/// INTRINSIC set — it must keep deferring after A2a and forever after.
+#[test]
+fn pco16_spanning_multikey_joins_the_slotted_batch() {
+    fn stat(port: u16, field: &str) -> u64 {
+        let mut c = Conn::open(port);
+        let info = c.send(&["INFO", "stats"]);
+        info.split("\r\n")
+            .find_map(|l| l.strip_prefix(field).and_then(|v| v.strip_prefix(':')))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("INFO stats has no {field} field: {info:?}"))
+    }
+    let defers = |port| stat(port, "total_pipeline_remote_defer");
+    let fanouts = |port| stat(port, "total_pipeline_multikey_fanout");
+
+    let shards: usize = SHARDS.parse().expect("SHARDS is a number");
+    assert!(
+        shards >= 4,
+        "this test needs >= 4 shards to build spanning pairs"
+    );
+    let owner = |k: &String| moon::shard::dispatch::key_to_shard(k.as_bytes(), shards);
+    // One key on each named shard. Probed, never assumed: a pair that quietly
+    // collapsed onto ONE shard would re-run pco15 instead of the spanning case
+    // this test exists for.
+    let on = |prefix: &str, want: &[usize]| -> Vec<String> {
+        let keys: Vec<String> = want
+            .iter()
+            .map(|&s| {
+                (0..)
+                    .map(|i| format!("{prefix}{s}:{i}"))
+                    .find(|k| owner(k) == s)
+                    .expect("a key exists for every shard")
+            })
+            .collect();
+        let got: Vec<usize> = keys.iter().map(owner).collect();
+        assert_eq!(got, want, "probe put {prefix} on the wrong shards");
+        keys
+    };
+
+    let m = spawn_moon(SHARDS);
+
+    // --- control: a KEYLESS aggregation still cuts, so the counter is live ---
+    {
+        let w = on("pco16cw", &[0, 1]);
+        let base = defers(m.port);
+        let mut c = Conn::open(m.port);
+        for _ in 0..32 {
+            let r = c.pipeline(&[&["SET", &w[0], "1"], &["SET", &w[1], "2"], &["DBSIZE"]]);
+            assert!(
+                framed_len(r.as_bytes(), 3).is_some(),
+                "expected 3 framed replies, got {r:?}"
+            );
+        }
+        drop(c);
+        let control = defers(m.port) - base;
+        assert!(
+            control > 0,
+            "DBSIZE aggregates across every shard, so the moon#507 guard MUST \
+             still cut the batch for it. Zero here means the counter is not \
+             reachable on this harness and every subject leg below would pass \
+             vacuously"
+        );
+    }
+
+    // --- subject: every spanning pair, read == written, 32 interleavings ---
+    let mut cut: Vec<String> = Vec::new();
+    let mut not_fanned: Vec<String> = Vec::new();
+    for a in 0..shards {
+        for b in (a + 1)..shards {
+            let k = on(&format!("pco16s{a}{b}"), &[a, b]);
+            let base_d = defers(m.port);
+            let base_f = fanouts(m.port);
+            let mut c = Conn::open(m.port);
+            for i in 0..32 {
+                let r = c.pipeline(&[
+                    &["SET", &k[0], "1"],
+                    &["SET", &k[1], "2"],
+                    &["MGET", &k[0], &k[1]],
+                ]);
+                assert!(
+                    framed_len(r.as_bytes(), 3).is_some(),
+                    "pair ({a},{b}) i={i}: expected 3 framed replies, got {r:?}"
+                );
+            }
+            drop(c);
+            let d = defers(m.port) - base_d;
+            let f = fanouts(m.port) - base_f;
+            if d != 0 {
+                cut.push(format!(
+                    "  pair ({a},{b}): {d} deferrals over 32 interleavings"
+                ));
+            }
+            if f != 32 {
+                not_fanned.push(format!("  pair ({a},{b}): {f} fan-outs, wanted 32"));
+            }
+        }
+    }
+    assert!(
+        cut.is_empty(),
+        "a spanning MGET is decomposable per owner shard, so each part belongs \
+         in its owner's slotted batch — appended BEHIND that shard's pending \
+         writes, which is what makes it correct without a cut. Instead it cut \
+         the batch, each cut a full phase-2b drain cycle:\n{}",
+        cut.join("\n")
+    );
+    assert!(
+        not_fanned.is_empty(),
+        "the batch was not cut, but the command did not take the fan-out route \
+         either — so something else stopped it waiting while it still ran \
+         INLINE on the coordinator, which is moon#507 reopened. Both halves \
+         must hold:\n{}",
+        not_fanned.join("\n")
+    );
+
+    // --- the fan-out must not cost the ordering guarantee it replaces ---
+    //
+    // The key order is INTERLEAVED and starts on the HIGHER shard, and every
+    // value is distinct. Both properties are load-bearing. The parts are built
+    // in ascending shard order, so a fold that simply CONCATENATED them would
+    // answer `hi0,hi1,lo0,lo1` — silently pairing every value with the wrong
+    // key, no error anywhere. A probe reading `[lo, hi]` cannot tell the two
+    // folds apart: concatenation and merge agree on it. (Measured: mutating the
+    // fold to concatenate left the two-key form of this leg green.)
+    for a in 0..shards {
+        for b in (a + 1)..shards {
+            // Distinct PREFIXES, not `&[a, a]`: `on` returns the first key it
+            // finds for each named shard, so repeating a shard under one prefix
+            // yields the SAME key twice and the assertion would compare a
+            // four-element reply built from two keys.
+            let lo = [
+                on(&format!("pco16vlA{a}{b}"), &[a]).remove(0),
+                on(&format!("pco16vlB{a}{b}"), &[a]).remove(0),
+            ];
+            let hi = [
+                on(&format!("pco16vhA{a}{b}"), &[b]).remove(0),
+                on(&format!("pco16vhB{a}{b}"), &[b]).remove(0),
+            ];
+            assert_ne!(lo[0], lo[1], "the two low-shard keys must be distinct");
+            assert_ne!(hi[0], hi[1], "the two high-shard keys must be distinct");
+            let mut c = Conn::open(m.port);
+            let r = c.pipeline(&[
+                &["SET", &hi[0], "h0"],
+                &["SET", &lo[0], "l0"],
+                &["SET", &hi[1], "h1"],
+                &["SET", &lo[1], "l1"],
+                &["MGET", &hi[0], &lo[0], &hi[1], &lo[1]],
+            ]);
+            assert!(
+                r.ends_with("*4\r\n$2\r\nh0\r\n$2\r\nl0\r\n$2\r\nh1\r\n$2\r\nl1\r\n"),
+                "pair ({a},{b}): a spanning MGET must observe the writes that \
+                 acked before it in its own batch, IN CLIENT KEY ORDER. Getting \
+                 h0,h1,l0,l1 means the fold concatenated the per-shard parts \
+                 instead of re-interleaving them, which mis-pairs every value \
+                 with its key and reports no error at all: {r:?}"
+            );
+        }
+    }
+
+    // --- EXISTS folds by SUM, and must also see its own batch ---
+    for a in 0..shards {
+        for b in (a + 1)..shards {
+            let k = on(&format!("pco16e{a}{b}"), &[a, b]);
+            let mut c = Conn::open(m.port);
+            let base_d = defers(m.port);
+            let r = c.pipeline(&[
+                &["SET", &k[0], "1"],
+                &["SET", &k[1], "2"],
+                &["EXISTS", &k[0], &k[1], &k[0]],
+            ]);
+            drop(c);
+            assert!(
+                r.ends_with(":3\r\n"),
+                "pair ({a},{b}): EXISTS over two keys this batch just wrote \
+                 (one named twice) must answer 3: {r:?}"
+            );
+            assert_eq!(
+                defers(m.port) - base_d,
+                0,
+                "pair ({a},{b}): a spanning EXISTS is per-key decomposable and \
+                 must not cut the batch"
+            );
+        }
     }
 }

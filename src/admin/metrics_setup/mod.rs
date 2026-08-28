@@ -324,6 +324,14 @@ static DISPATCH_CROSS_READ_SPSC_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// moon-dev — so this is the counter that says whether a slow pipeline is
 /// paying the moon#512 ordering guarantee or something else entirely.
 static PIPELINE_REMOTE_DEFER_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// moon#513 (A2a): multi-key READs decomposed per owner shard and folded back
+/// into one client reply, instead of running inline on the coordinator.
+///
+/// The counterpart to `PIPELINE_REMOTE_DEFER_TOTAL`, and load-bearing for more
+/// than curiosity: a fall in the defer counter alone is also what a "fix" that
+/// merely stopped waiting would produce, and that is moon#507 reopened. This
+/// says the command took the route that JUSTIFIES not waiting.
+static PIPELINE_MULTIKEY_FANOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 // ── INFO-readable counter accessors ─────────────────────────────────────
 

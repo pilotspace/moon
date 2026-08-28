@@ -11,8 +11,9 @@ use metrics::{counter, gauge, histogram};
 
 use crate::admin::metrics_setup::{
     CONNECTED_CLIENTS, DISPATCH_CROSS_READ_SPSC_TOTAL, EVICTED_KEYS, EXPIRING_SPILL_SKIPPED,
-    KEYSPACE_HITS, KEYSPACE_MISSES, METRICS_INITIALIZED, PIPELINE_REMOTE_DEFER_TOTAL, SPILLED_KEYS,
-    TOTAL_CONNECTIONS, WAL_AGGRESSIVE_RECYCLE_BYTES_TOTAL, WAL_AGGRESSIVE_RECYCLE_SEGMENTS_TOTAL,
+    KEYSPACE_HITS, KEYSPACE_MISSES, METRICS_INITIALIZED, PIPELINE_MULTIKEY_FANOUT_TOTAL,
+    PIPELINE_REMOTE_DEFER_TOTAL, SPILLED_KEYS, TOTAL_CONNECTIONS,
+    WAL_AGGRESSIVE_RECYCLE_BYTES_TOTAL, WAL_AGGRESSIVE_RECYCLE_SEGMENTS_TOTAL,
 };
 
 // ── Connection metrics ──────────────────────────────────────────────────
@@ -342,6 +343,27 @@ pub fn record_pipeline_remote_defer() {
         return;
     }
     counter!("moon_pipeline_remote_defer_total").increment(1);
+}
+
+/// moon#513 (A2a): a spanning multi-key READ was decomposed per owner shard
+/// and folded back into ONE client reply, instead of running inline on the
+/// coordinator.
+///
+/// One increment per COMMAND, not per part, so it is directly comparable with
+/// the interleaving count a benchmark or a test drives.
+///
+/// Recorded because the defer counter alone cannot tell a real fix from a
+/// dangerous one: a change that merely stopped waiting while the command still
+/// ran inline would also drive `moon_pipeline_remote_defer_total` to zero, and
+/// that is moon#507 — silent write loss — reopened. This counter says the
+/// command took the route that JUSTIFIES not waiting.
+#[inline]
+pub fn record_pipeline_multikey_fanout() {
+    PIPELINE_MULTIKEY_FANOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_pipeline_multikey_fanout_total").increment(1);
 }
 
 /// Batched variant of `record_dispatch_cross_spsc`.
