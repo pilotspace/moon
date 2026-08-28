@@ -2396,16 +2396,52 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
 
+            // moon#500: a multi-key WRITE inside an active TXN must not reach
+            // `try_handle_cross_shard_commands`. Its `coordinate_multi_key` arm
+            // executes across shards and returns consumed, bypassing BOTH the
+            // undo capture below and the cross-shard TXN guard that follows it —
+            // so `TXN ABORT` restored nothing at all (measured 0 of 4 keys at
+            // `--shards 4`, worse than the 1 of 4 the single-shard capture
+            // managed before this fix).
+            //
+            // Only a genuinely SPREAD key set is refused. A single-owner set
+            // falls through to ordinary routing, which already resolves it
+            // correctly either way: a local owner reaches the undo capture, a
+            // remote owner is refused by the existing cross-shard guard. The
+            // refusal reuses that guard's error and its #499 poisoning, because
+            // the reason is identical — there is no cross-shard undo log.
+            let txn_multikey_write = ctx.num_shards > 1
+                && conn.in_cross_txn()
+                && metadata::is_write(cmd)
+                && is_multi_key_command(cmd, cmd_args);
+            if txn_multikey_write
+                && crate::server::conn::shared::single_owner_shard(cmd, cmd_args, ctx.num_shards)
+                    .is_none()
+            {
+                conn.mark_cross_txn_rejected(cmd);
+                responses.push(Frame::Error(bytes::Bytes::from_static(
+                    crate::command::transaction::ERR_TXN_CROSS_SHARD,
+                )));
+                continue;
+            }
+
             // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE, RANDOMKEY + multi-key ---
-            if dispatch::try_handle_cross_shard_commands(
-                cmd,
-                cmd_args,
-                &conn,
-                ctx,
-                shaped!(),
-                &mut local_leg_write_idxs,
-            )
-            .await
+            // `!txn_multikey_write` keeps a single-owner multi-key write inside a
+            // TXN out of `coordinate_multi_key` (moon#500): that path bypasses the
+            // undo capture, so the command must instead fall through to ordinary
+            // routing, which captures it when the owner is local and refuses it
+            // via the cross-shard guard when it is not. Spread key sets were
+            // already refused above.
+            if !txn_multikey_write
+                && dispatch::try_handle_cross_shard_commands(
+                    cmd,
+                    cmd_args,
+                    &conn,
+                    ctx,
+                    shaped!(),
+                    &mut local_leg_write_idxs,
+                )
+                .await
             {
                 continue;
             }
@@ -2817,18 +2853,52 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                         }
                                     }
                                 }
-                            } else if let Some(key) =
-                                crate::server::conn::shared::extract_primary_key(cmd, cmd_args)
-                            {
-                                let old_entry = db.get(key.as_ref()).cloned();
+                            } else {
+                                // moon#500: this used to capture
+                                // `extract_primary_key`, which returns exactly
+                                // ONE key. A multi-key write (MSET, MSETNX,
+                                // BITOP, COPY, SINTERSTORE, ...) therefore
+                                // logged an undo record for its FIRST key only,
+                                // and `TXN ABORT` restored that one while
+                                // leaving the rest at their new values — an
+                                // acked abort landing a keyspace that is
+                                // neither the pre- nor the post-TXN image.
+                                //
+                                // `written_keys` walks the same key spec the
+                                // ACL and cache-invalidation paths use, and is
+                                // filtered to `KeyRole::Write`: reads are NOT
+                                // captured. That filter is load-bearing —
+                                // capturing read keys would inflate
+                                // `kv_write_intents`, which is the cross-shard
+                                // conflict surface, turning working
+                                // transactions into spurious conflicts.
                                 let lsn = txn.snapshot_lsn;
                                 let tid = txn.txn_id;
-                                match old_entry {
-                                    None => txn.kv_undo.record_insert(key.clone()),
-                                    Some(entry) => txn.kv_undo.record_update(key.clone(), entry),
+                                let mut written =
+                                    crate::tracking::invalidation::written_keys(cmd, cmd_args);
+                                // The walker reports nothing for an argv it
+                                // cannot enumerate. Fall back to the historical
+                                // single-key capture rather than silently
+                                // capturing nothing — fewer keys than before
+                                // would be a regression, not a fix.
+                                if written.is_empty()
+                                    && let Some(key) =
+                                        crate::server::conn::shared::extract_primary_key(
+                                            cmd, cmd_args,
+                                        )
+                                {
+                                    written.push(key.clone());
                                 }
-                                // Direct field access — see DEL/UNLINK arm above.
-                                s.kv_write_intents.record_write(key.clone(), lsn, tid);
+                                for key in written {
+                                    match db.get(key.as_ref()).cloned() {
+                                        None => txn.kv_undo.record_insert(key.clone()),
+                                        Some(entry) => {
+                                            txn.kv_undo.record_update(key.clone(), entry)
+                                        }
+                                    }
+                                    // Direct field access — see DEL/UNLINK arm above.
+                                    s.kv_write_intents.record_write(key, lsn, tid);
+                                }
                             }
                         }
 
