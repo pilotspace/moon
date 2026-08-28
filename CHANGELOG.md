@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`TXN ABORT` left torn state after a multi-key write (moon#500).**
+
+  The undo capture in both connection handlers recorded a single key per command:
+
+  ```rust
+  } else if let Some(key) = shared::extract_primary_key(cmd, cmd_args) {
+      match db.get(key.as_ref()).cloned() {
+          None => txn.kv_undo.record_insert(key.clone()),
+          Some(entry) => txn.kv_undo.record_update(key.clone(), entry),
+      }
+  }
+  ```
+
+  `extract_primary_key` returns exactly one key. `MSET k1 v1 k2 v2 k3 v3` mutates three and
+  logged an undo record for one, so `TXN ABORT` restored the first and left the rest at their
+  new values — an **acked abort** landing a keyspace that is neither the pre-TXN nor the
+  post-TXN image, produced by the one operation whose purpose is to prevent partial state. No
+  crash, no disk pressure and no concurrency required.
+
+  Measured across the matrix before the fix — keys restored out of 4:
+
+  ```text
+                      MSET      multi-key DEL
+    monoio shards=1    1/4          4/4
+    monoio shards=4    0/4          0/4
+    tokio  shards=1    0/4          0/4      <- even DEL, which has its own arm
+    tokio  shards=4    0/4          0/4
+  ```
+
+  Three causes hid in that table. The capture recorded one key (the 1/4). At `--shards > 1`
+  the command was intercepted by `coordinate_multi_key` before the capture ran, which also
+  bypassed the cross-shard TXN guard that exists precisely because there is no cross-shard
+  undo log (the 0/4). And `handler_sharded`'s multi-key branch, unlike its monoio twin, has no
+  `num_shards <= 1` early return, so on tokio the interception happened at one shard too and
+  swallowed `DEL` as well.
+
+  The capture now walks `written_keys` — the same key spec the ACL and cache-invalidation paths
+  use, filtered to `KeyRole::Write` so reads stay out of `kv_write_intents`, the cross-shard
+  conflict surface — and falls back to the old single-key capture for an argv the walker cannot
+  enumerate. A multi-key write inside a TXN no longer enters `coordinate_multi_key`: a
+  single-owner key set falls through to ordinary routing (captured when the owner is local,
+  refused by the existing cross-shard guard when it is not), and only a genuinely spread key
+  set is refused, with the same error and the same #499 poisoning a cross-shard single-key
+  write already got.
+
+  All four matrix cells now restore 4/4 for both `MSET` and `DEL`. Read-only `MGET` inside a
+  TXN is unaffected, and `MSET` outside a TXN is untouched.
+
+  **Behaviour change:** a multi-key write whose keys span shards is now refused inside a TXN
+  (`ERR TXN does not support cross-shard writes -- use hash tags {tag} to co-locate keys`)
+  instead of silently succeeding with no rollback. Co-locate the keys with a hash tag, or issue
+  the write outside a transaction.
+
 - **Test fault injection leaked between concurrently-running unit tests (moon#750).**
 
   `ManifestIo::persist` read three process-global `#[cfg(test)]` statics — an injected
