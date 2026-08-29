@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Performance
+- **Owner reads take a shared guard instead of an exclusive one (L4, S3).**
+
+  `with_shard_db_read` was added by the L4 plane skeleton and then had **zero callers** —
+  every owner read still went through `with_shard_db`, taking the db's write lock to serve a
+  `GET`. This wires the four owner read sites (`handler_monoio` and `handler_sharded`, each a
+  single-key read and the local part of a spanning multi-key read) onto the shared guard.
+
+  `dispatch_read` was already written for this access mode: its hot-key sketch uses a relaxed
+  `fetch_add` and a try-lock that drops the sample under contention, documented as being so
+  that "concurrent cross-shard fast-path reads never block here". The conversion is enforced
+  by the type system — the closure goes from `&mut Database` to `&Database`, so anything
+  needing mutation fails to compile.
+
+  No behaviour changes: an exclusive holder is replaced by a shared one on a thread that is
+  the sole writer, so nothing that was previously serialised becomes concurrent *yet*. The
+  win is unlocked by S4, which lets a foreign shard serve a read of this db instead of
+  hopping to the owner.
+
+  This does **not** extend to the SPSC batch loop. That loop uses the full `dispatch`, which
+  needs `&mut Database`; routing it through `dispatch_read` to justify a shared guard would
+  reintroduce the moon#610 cold-tier read-bug class.
+
 - **A spanning multi-key READ no longer cuts the pipeline batch (moon#513, A2a).**
 
   Since moon#512 fixed the moon#507 write-loss inversion, a multi-key command mid-pipeline

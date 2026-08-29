@@ -2031,7 +2031,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         continue;
                                     };
                                     let mut sel_db = conn.selected_db;
-                                    let reply = crate::shard::slice::with_shard_db(
+                                    let reply = crate::shard::slice::with_shard_db_read(
                                         conn.selected_db,
                                         |db| match dispatch_read(
                                             db,
@@ -2815,9 +2815,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                             conn.cmd_counter = conn.cmd_counter.wrapping_add(1);
                             let sample_latency = (conn.cmd_counter & 0xF) == 0;
                             let dispatch_start = sample_latency.then(std::time::Instant::now);
-                            let result = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                                dispatch_read(db, cmd, cmd_args, now_ms, &mut conn.selected_db, db_count)
-                            });
+                            let result = crate::shard::slice::with_shard_db_read(
+                                conn.selected_db,
+                                |db| {
+                                    dispatch_read(
+                                        db,
+                                        cmd,
+                                        cmd_args,
+                                        now_ms,
+                                        &mut conn.selected_db,
+                                        db_count,
+                                    )
+                                },
+                            );
                             if let Ok(cmd_str) = std::str::from_utf8(cmd) {
                                 if let Some(start) = dispatch_start {
                                     let elapsed_us = start.elapsed().as_micros() as u64;

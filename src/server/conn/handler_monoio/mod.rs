@@ -2514,7 +2514,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             };
                             let mut sel_db = conn.selected_db;
                             let reply =
-                                crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                                crate::shard::slice::with_shard_db_read(conn.selected_db, |db| {
                                     match dispatch_read(
                                         db,
                                         cmd,
@@ -3441,7 +3441,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let sample_latency = (conn.cmd_counter & 0xF) == 0;
                     let dispatch_start = sample_latency.then(std::time::Instant::now);
                     let mut sel_db = conn.selected_db;
-                    let result = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                    let result = crate::shard::slice::with_shard_db_read(conn.selected_db, |db| {
                         dispatch_read(db, cmd, cmd_args, now_ms, &mut sel_db, db_count)
                     });
                     let new_read_selected_db = sel_db;
