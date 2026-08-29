@@ -607,7 +607,10 @@ pub fn read_snapshot_metadata(path: &Path) -> Result<SnapshotMeta, MoonError> {
 /// Global checksum mismatch is a hard error (whole file suspect).
 /// Per-segment checksum mismatch and unknown tags use log+skip recovery:
 /// the corrupted segment is skipped and loading continues with the next segment.
-pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError> {
+pub fn shard_snapshot_load<D: std::borrow::BorrowMut<Database>>(
+    databases: &mut [D],
+    path: &Path,
+) -> Result<usize, MoonError> {
     let data = std::fs::read(path).map_err(|e| SnapshotError::Io {
         path: path.to_path_buf(),
         source: e,
@@ -866,7 +869,7 @@ pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> Result<us
                         continue;
                     }
                     if current_db < databases.len() {
-                        databases[current_db].set(key, entry);
+                        databases[current_db].borrow_mut().set(key, entry);
                         total_keys += 1;
                     }
                 }

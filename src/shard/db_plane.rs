@@ -53,6 +53,10 @@ use crate::storage::Database;
 
 /// One shard's databases, shared for the L4 read plane.
 pub struct ShardDbSet {
+    /// Which shard owns these databases. Diagnostics only — the panic message
+    /// on an out-of-range index names it, matching the message `with_shard_db`
+    /// documented before the databases moved behind this plane.
+    shard_id: usize,
     dbs: Box<[CachePadded<RwLock<Database>>]>,
 }
 
@@ -140,13 +144,110 @@ impl ShardDbSet {
         (0..self.dbs.len()).map(|i| self.write(i)).collect()
     }
 
+    /// OWNER ONLY — like [`ShardDbSet::write`] but `None` instead of a panic
+    /// when `idx` is out of range. The replacement for `get_mut(i)` at sites
+    /// that already handled a missing database.
+    #[inline]
+    pub fn try_write(&self, idx: usize) -> Option<DbWriteGuard<'_>> {
+        let cell = self.dbs.get(idx)?;
+        let _depth = guard_depth::acquire(idx);
+        Some(DbWriteGuard {
+            inner: cell.write(),
+            _depth,
+        })
+    }
+
+    /// OWNER ONLY — like [`ShardDbSet::read`] but `None` instead of a panic
+    /// when `idx` is out of range.
+    #[inline]
+    pub fn try_read_owned(&self, idx: usize) -> Option<DbReadGuard<'_>> {
+        let cell = self.dbs.get(idx)?;
+        let _depth = guard_depth::acquire(idx);
+        Some(DbReadGuard {
+            inner: cell.read(),
+            _depth,
+        })
+    }
+
+    /// OWNER ONLY — every database, ascending, under SHARED guards, for the
+    /// read-only multi-db consumers (RDB save, snapshot capture, `DEBUG
+    /// DIGEST`).
+    ///
+    /// Shared rather than exclusive so a concurrent foreign reader is not
+    /// excluded by a checkpoint; cross-db consistency still holds, because no
+    /// writer can interleave while every db is read-guarded.
+    pub fn read_all(&self) -> SmallVec<[DbReadGuard<'_>; 16]> {
+        (0..self.dbs.len()).map(|i| self.read(i)).collect()
+    }
+
+    /// OWNER ONLY — read-only counterpart of [`ShardDbSet::with_all`], for
+    /// helpers that take `&[Database]`.
+    pub fn with_all_read<R>(&self, f: impl FnOnce(&[&Database]) -> R) -> R {
+        let guards = self.read_all();
+        let refs: SmallVec<[&Database; 16]> = guards.iter().map(|g| &**g).collect();
+        f(&refs)
+    }
+
+    /// OWNER ONLY — exchange the CONTENTS of two databases (`SWAPDB`).
+    ///
+    /// Replaces the slice's `databases.swap(a, b)`. Swapping the contents
+    /// rather than the lock cells matters: a foreign reader holding
+    /// `try_read(a)` keeps reading db `a`'s lock, and sees the post-swap
+    /// contents once the write guard is released — the same visibility the
+    /// SPSC path gives today.
+    ///
+    /// A same-db swap is a no-op, matching `slice::swap`'s behaviour.
+    pub fn swap(&self, a: usize, b: usize) {
+        if a == b {
+            return;
+        }
+        self.with_pair(a, b, |da, db| std::mem::swap(da, db));
+    }
+
+    /// OWNER ONLY — exclusive access to EVERY database at once, as a slice of
+    /// mutable references, for the multi-db helpers that used to receive the
+    /// slice's `&mut [Database]` directly (`FLUSHALL` per moon#677, `SWAPDB`,
+    /// RDB save/load, `DEBUG DIGEST`, checkpoint capture).
+    ///
+    /// The guards are held for the whole closure, so the cross-db atomicity
+    /// these paths got for free from being single-threaded is preserved
+    /// exactly — a foreign reader cannot observe a half-flushed keyspace.
+    ///
+    /// Acquires ascending, per the module's single deadlock rule.
+    ///
+    /// # Panics
+    /// If this thread already holds a guard on any database.
+    pub fn with_all<R>(&self, f: impl FnOnce(&mut [&mut Database]) -> R) -> R {
+        let mut guards = self.write_all();
+        let mut refs: SmallVec<[&mut Database; 16]> = guards.iter_mut().map(|g| &mut **g).collect();
+        f(&mut refs)
+    }
+
+    /// OWNER ONLY — exclusive access to two databases as mutable references,
+    /// for `MOVE` / `COPY … DB n` / `SWAPDB`.
+    ///
+    /// Acquires ascending; the closure still receives them in `(a, b)` order.
+    ///
+    /// # Panics
+    /// If `a == b`, or on the re-entrancy contract.
+    pub fn with_pair<R>(
+        &self,
+        a: usize,
+        b: usize,
+        f: impl FnOnce(&mut Database, &mut Database) -> R,
+    ) -> R {
+        let (mut ga, mut gb) = self.write_pair(a, b);
+        f(&mut ga, &mut gb)
+    }
+
     #[inline]
     fn slot(&self, idx: usize) -> &CachePadded<RwLock<Database>> {
         match self.dbs.get(idx) {
             Some(cell) => cell,
             None => panic!(
-                "db index {idx} out of range (shard has {} databases)",
-                self.dbs.len()
+                "db_index {idx} out of bounds ({} databases on shard {})",
+                self.dbs.len(),
+                self.shard_id
             ),
         }
     }
@@ -258,7 +359,19 @@ static L4_REGISTRY: OnceLock<Box<[Arc<ShardDbSet>]>> = OnceLock::new();
 /// Returns `false` if a registry was already installed — the caller decides
 /// whether that is a fatal double-init or a benign re-entry in tests.
 pub fn install_registry(shard_databases: Vec<Vec<Database>>) -> bool {
-    L4_REGISTRY.set(build_sets(shard_databases)).is_ok()
+    install_registry_sets(build_sets(shard_databases))
+}
+
+/// Install pre-built sets. Returns `false` if a registry was already
+/// installed.
+///
+/// A second install is NOT fatal and must not panic: the test suite builds
+/// many servers in one process, and `ShardDatabases::new` runs once per
+/// server. The first registry keeps the plane; later servers simply do not
+/// publish theirs, so their foreign reads fall back to SPSC — correct, just
+/// not accelerated. Production calls this exactly once.
+pub fn install_registry_sets(sets: Box<[Arc<ShardDbSet>]>) -> bool {
+    L4_REGISTRY.set(sets).is_ok()
 }
 
 /// Build the per-shard sets without touching the global — the construction the
@@ -267,13 +380,17 @@ pub fn install_registry(shard_databases: Vec<Vec<Database>>) -> bool {
 pub(crate) fn build_sets(shard_databases: Vec<Vec<Database>>) -> Box<[Arc<ShardDbSet>]> {
     shard_databases
         .into_iter()
-        .map(|dbs| {
+        .enumerate()
+        .map(|(shard_id, dbs)| {
             let padded: Box<[CachePadded<RwLock<Database>>]> = dbs
                 .into_iter()
                 .map(|db| CachePadded::new(RwLock::new(db)))
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
-            Arc::new(ShardDbSet { dbs: padded })
+            Arc::new(ShardDbSet {
+                shard_id,
+                dbs: padded,
+            })
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
@@ -319,7 +436,27 @@ mod tests {
             .map(|_| CachePadded::new(RwLock::new(Database::new())))
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        ShardDbSet { dbs }
+        ShardDbSet { shard_id: 0, dbs }
+    }
+
+    #[test]
+    fn out_of_range_panic_keeps_the_message_with_shard_db_documented() {
+        let sets = build_sets(vec![vec![], (0..2).map(|_| Database::new()).collect()]);
+        let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = sets[1].write(99);
+        }))
+        .unwrap_err()
+        .downcast::<String>()
+        .map(|s| *s)
+        .unwrap_or_else(|_| String::from("<non-string>"));
+        assert!(
+            msg.contains("out of bounds"),
+            "slice::with_shard_db documents this wording: {msg:?}"
+        );
+        assert!(
+            msg.contains("on shard 1"),
+            "the message must name the owning shard: {msg:?}"
+        );
     }
 
     #[test]

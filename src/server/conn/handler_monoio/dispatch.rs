@@ -239,7 +239,7 @@ pub(super) async fn try_handle_evalsha(
         return true;
     }
     let (response, pending_flush) = crate::shard::slice::with_shard(|s| {
-        let db_count = s.databases.len();
+        let db_count = s.databases.db_count();
         // moon#685: `run_and_complete`, not a bare index, so a script's flush
         // finishes on the other fifteen databases — and reports what is left
         // for `finish_script_flush` to broadcast once this borrow has ended.
@@ -310,7 +310,7 @@ pub(super) async fn try_handle_eval(
         return true;
     }
     let (response, pending_flush) = crate::shard::slice::with_shard(|s| {
-        let db_count = s.databases.len();
+        let db_count = s.databases.db_count();
         // moon#685: see `try_handle_evalsha`.
         crate::scripting::pending_flush::run_and_complete(s, conn.selected_db, |db| {
             crate::scripting::handle_eval(
@@ -1616,7 +1616,7 @@ pub(super) async fn try_handle_functions(
             // ensure_function_registry guarantees Some
             let reg = guard.as_ref().unwrap();
             crate::shard::slice::with_shard(|s| {
-                let db_count = s.databases.len();
+                let db_count = s.databases.db_count();
                 // moon#685: a FUNCTION body reaches `redis.call` through the same
                 // bridge an EVAL does, so it needs the same completion.
                 crate::scripting::pending_flush::run_and_complete(s, conn.selected_db, |db| {

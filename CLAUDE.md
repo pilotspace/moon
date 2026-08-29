@@ -102,6 +102,7 @@ Measured detail — spin governor, THP soak, io_uring dead ends — in [`docs/in
 
 - Vector engine (FT.*) internals — segment lifecycle, exact-rerank sidecar, adaptive ef, quantization trade-offs: [`docs/internal/vector-engine-internals.md`](docs/internal/vector-engine-internals.md). User guide: [`docs/vector-search-guide.md`](docs/vector-search-guide.md).
 - GPU / CUDA (`--features gpu-cuda`, never default): [`docs/internal/gpu-cuda.md`](docs/internal/gpu-cuda.md).
+- Cross-shard performance — the per-park cost model, seven measured dead ends, five retracted claims: [`docs/internal/cross-shard-cost-model.md`](docs/internal/cross-shard-cost-model.md). **Read before proposing any cross-shard optimisation.**
 
 ## CI — the merge bar
 

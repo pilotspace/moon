@@ -60,7 +60,9 @@ const EOF_MARKER: u8 = 0xFF;
 ///
 /// Returns the complete RDB byte stream (header + entries + footer + CRC32).
 /// Used by both `save()` (file) and AOF RDB-preamble rewrite.
-pub fn save_to_bytes(databases: &[Database]) -> Result<Vec<u8>, MoonError> {
+pub fn save_to_bytes<D: std::borrow::Borrow<Database>>(
+    databases: &[D],
+) -> Result<Vec<u8>, MoonError> {
     let mut buf = Vec::new();
 
     // Header
@@ -71,6 +73,7 @@ pub fn save_to_bytes(databases: &[Database]) -> Result<Vec<u8>, MoonError> {
 
     // Databases
     for (db_idx, db) in databases.iter().enumerate() {
+        let db: &Database = db.borrow();
         let data = db.data();
         let live: Vec<_> = data
             .iter()

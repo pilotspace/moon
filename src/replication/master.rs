@@ -149,7 +149,6 @@ pub async fn handle_psync_inline_single_shard(
                 drop(g);
                 // Shard 0 is this thread's shard — use the thread-local slice.
                 crate::shard::slice::with_shard(|s| {
-                    let refs: Vec<&crate::storage::Database> = s.databases.iter().collect();
                     // v0.7 R0.5: carry vector/text index DEFINITIONS inside the
                     // snapshot as moon-private RDB aux fields (reusing the
                     // sidecar codecs), so a fresh replica can recreate the
@@ -221,11 +220,17 @@ pub async fn handle_psync_inline_single_shard(
                         crate::persistence::redis_rdb::MOON_AUX_MQ_REGISTRY,
                         &mq_blob[..],
                     ));
-                    crate::persistence::redis_rdb::write_rdb_refs_with_moon_aux(
-                        &refs,
-                        &moon_aux,
-                        &mut rdb_buf,
-                    );
+                    // Every database read-guarded for the whole RDB write, so
+                    // the capture is a single cross-db consistent point — the
+                    // same atomicity the single-threaded slice gave it, and the
+                    // property `snapshot_offset` is paired with.
+                    s.databases.with_all_read(|refs| {
+                        crate::persistence::redis_rdb::write_rdb_refs_with_moon_aux(
+                            refs,
+                            &moon_aux,
+                            &mut rdb_buf,
+                        );
+                    });
                 });
                 off
             };

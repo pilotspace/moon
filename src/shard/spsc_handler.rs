@@ -525,7 +525,7 @@ pub(crate) fn handle_shard_message_shared(
                     // the same division of labour
                     // `coordinator::broadcast_txn_flushes` uses for MULTI.
                     let (frame, pending_flush) = crate::shard::slice::with_shard(|s| {
-                        let db_count = s.databases.len();
+                        let db_count = s.databases.db_count();
                         crate::scripting::pending_flush::run_and_complete(s, db_idx, |db| {
                             if is_plain_eval {
                                 crate::scripting::handle_eval(
@@ -627,7 +627,7 @@ pub(crate) fn handle_shard_message_shared(
                     // including why the broadcast is REPORTED here rather than
                     // performed here.
                     let (frame, pending_flush) = crate::shard::slice::with_shard(|s| {
-                        let db_count = s.databases.len();
+                        let db_count = s.databases.db_count();
                         crate::scripting::pending_flush::run_and_complete(s, db_idx, |db| {
                             // moon#569 + moon#514: the ACL that travels with
                             // `ShardMessage::Execute` is the ORIGIN connection's, so a
@@ -696,11 +696,13 @@ pub(crate) fn handle_shard_message_shared(
                             // WS5a: use the message's own selected db, not a
                             // hardcoded db 0 — this is the ShardMessage::Execute
                             // console-gateway path, which carries a real db_index.
-                            let db_opt: Option<&mut crate::storage::db::Database> = if needs_db {
-                                s.databases.get_mut(db_idx)
+                            let mut db_guard = if needs_db {
+                                s.databases.try_write(db_idx)
                             } else {
                                 None
                             };
+                            let db_opt: Option<&mut crate::storage::db::Database> =
+                                db_guard.as_deref_mut();
                             dispatch_vector_command(
                                 &mut s.vector_store,
                                 &mut s.text_store,
@@ -870,7 +872,7 @@ pub(crate) fn handle_shard_message_shared(
                         crate::shard::spsc_two_db::try_two_db_intercept(
                             cmd,
                             args,
-                            &mut s.databases,
+                            &s.databases,
                             db_idx,
                             db_count,
                             cached_clock,
@@ -969,10 +971,10 @@ pub(crate) fn handle_shard_message_shared(
                         oom
                     } else {
                         crate::shard::slice::with_shard(|s| {
-                            let db = &mut s.databases[db_idx];
+                            let mut db = s.databases.write(db_idx);
                             db.refresh_now_from_cache(cached_clock);
                             let mut selected = db_idx;
-                            let result = cmd_dispatch(db, cmd, args, &mut selected, db_count);
+                            let result = cmd_dispatch(&mut db, cmd, args, &mut selected, db_count);
                             let frame = match result {
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => f,
@@ -1002,7 +1004,7 @@ pub(crate) fn handle_shard_message_shared(
                             if !matches!(frame, crate::protocol::Frame::Error(_)) {
                                 crate::blocking::wakeup::wake_producer(
                                     blocking_registry,
-                                    db,
+                                    &mut db,
                                     db_idx,
                                     cmd,
                                     args,
@@ -1011,7 +1013,10 @@ pub(crate) fn handle_shard_message_shared(
 
                             // moon#677: FLUSHALL empties every database on
                             // this shard, not just the dispatched one.
-                            flush_every_database_on_flushall(&mut s.databases, cmd, db_idx, &frame);
+                            // The sweep re-acquires EVERY db, `db_idx` included: release this
+                            // guard first (the old code ended its borrow of db_idx here too).
+                            drop(db);
+                            flush_every_database_on_flushall(&s.databases, cmd, db_idx, &frame);
 
                             // Auto-index: if HSET succeeded and key matches a vector index prefix,
                             // extract the vector field and append to mutable segment.
@@ -1079,7 +1084,9 @@ pub(crate) fn handle_shard_message_shared(
             let db_count = shard_databases.db_count();
             let db_idx = db_index.min(db_count.saturating_sub(1));
             crate::shard::slice::with_shard(|s| {
-                s.databases[db_idx].refresh_now_from_cache(cached_clock);
+                s.databases
+                    .write(db_idx)
+                    .refresh_now_from_cache(cached_clock);
                 // ONE backpressure budget for the whole batch: under sustained
                 // AOF backpressure the shard thread stalls at most BOUND total,
                 // not BOUND × batch-len (review finding, PR #211).
@@ -1103,7 +1110,7 @@ pub(crate) fn handle_shard_message_shared(
                         if let Some(response) = crate::shard::spsc_two_db::try_two_db_intercept(
                             cmd,
                             args,
-                            &mut s.databases,
+                            &s.databases,
                             db_idx,
                             db_count,
                             cached_clock,
@@ -1151,7 +1158,7 @@ pub(crate) fn handle_shard_message_shared(
                         // the generic single-db write path below.
                     }
 
-                    let guard = &mut s.databases[db_idx];
+                    let mut guard = s.databases.write(db_idx);
                     let is_write = metadata::is_write(cmd);
                     if is_write {
                         // M2 fix: same gate as the Execute arm, applied per
@@ -1162,7 +1169,7 @@ pub(crate) fn handle_shard_message_shared(
                             let mut reason_del_budget =
                                 crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                             if let Err(oom) = spsc_eviction_gate(
-                                guard,
+                                &mut guard,
                                 db_idx,
                                 shard_databases,
                                 shard_id,
@@ -1190,11 +1197,11 @@ pub(crate) fn handle_shard_message_shared(
                                 continue;
                             }
                         }
-                        cow_intercept(snapshot_state, guard, db_idx, cmd_frame);
+                        cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
                     }
 
                     let mut selected = db_idx;
-                    let result = cmd_dispatch(guard, cmd, args, &mut selected, db_count);
+                    let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
                     let frame = match result {
                         DispatchResult::Response(f) => f,
                         DispatchResult::Quit(f) => f,
@@ -1223,7 +1230,7 @@ pub(crate) fn handle_shard_message_shared(
 
                         crate::blocking::wakeup::wake_producer(
                             blocking_registry,
-                            guard,
+                            &mut guard,
                             db_idx,
                             cmd,
                             args,
@@ -1235,7 +1242,10 @@ pub(crate) fn handle_shard_message_shared(
                     // it is the arm that empties the OTHER shards. Outside the
                     // `is_write` block above only because `guard` is borrowed
                     // there; FLUSHALL is a write either way.
-                    flush_every_database_on_flushall(&mut s.databases, cmd, db_idx, &frame);
+                    // The sweep re-acquires EVERY db, `db_idx` included: release this
+                    // guard first (the old code ended its borrow of db_idx here too).
+                    drop(guard);
+                    flush_every_database_on_flushall(&s.databases, cmd, db_idx, &frame);
 
                     results.push(if aof_ok {
                         frame
@@ -1263,7 +1273,9 @@ pub(crate) fn handle_shard_message_shared(
                 // itself moves INSIDE the loop below (Gap A) so the MOVE/
                 // COPY-DB branch can borrow `&mut s.databases` (both src and
                 // dst) for the same command.
-                s.databases[db_idx].refresh_now_from_cache(cached_clock);
+                s.databases
+                    .write(db_idx)
+                    .refresh_now_from_cache(cached_clock);
                 // ONE backpressure budget for the whole batch: under sustained
                 // AOF backpressure the shard thread stalls at most BOUND total,
                 // not BOUND × batch-len (review finding, PR #211).
@@ -1288,7 +1300,7 @@ pub(crate) fn handle_shard_message_shared(
                         if let Some(response) = crate::shard::spsc_two_db::try_two_db_intercept(
                             cmd,
                             args,
-                            &mut s.databases,
+                            &s.databases,
                             db_idx,
                             db_count,
                             cached_clock,
@@ -1336,7 +1348,7 @@ pub(crate) fn handle_shard_message_shared(
                         // the generic single-db write path below.
                     }
 
-                    let guard = &mut s.databases[db_idx];
+                    let mut guard = s.databases.write(db_idx);
                     let is_write = metadata::is_write(cmd);
                     if is_write {
                         // M2 fix: same gate as the Execute arm, applied per
@@ -1347,7 +1359,7 @@ pub(crate) fn handle_shard_message_shared(
                             let mut reason_del_budget =
                                 crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                             if let Err(oom) = spsc_eviction_gate(
-                                guard,
+                                &mut guard,
                                 db_idx,
                                 shard_databases,
                                 shard_id,
@@ -1375,11 +1387,11 @@ pub(crate) fn handle_shard_message_shared(
                                 continue;
                             }
                         }
-                        cow_intercept(snapshot_state, guard, db_idx, cmd_frame);
+                        cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
                     }
 
                     let mut selected = db_idx;
-                    let result = cmd_dispatch(guard, cmd, args, &mut selected, db_count);
+                    let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
                     let frame = match result {
                         DispatchResult::Response(f) => f,
                         DispatchResult::Quit(f) => f,
@@ -1468,7 +1480,7 @@ pub(crate) fn handle_shard_message_shared(
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
                         crate::blocking::wakeup::wake_producer(
                             blocking_registry,
-                            guard,
+                            &mut guard,
                             db_idx,
                             cmd,
                             args,
@@ -1478,7 +1490,10 @@ pub(crate) fn handle_shard_message_shared(
                     // moon#677: keyspace half of the flush. Placed after the
                     // last use of `guard` (a `&mut s.databases[db_idx]`
                     // borrow) so the slice can be re-borrowed here.
-                    flush_every_database_on_flushall(&mut s.databases, cmd, db_idx, &frame);
+                    // The sweep re-acquires EVERY db, `db_idx` included: release this
+                    // guard first (the old code ended its borrow of db_idx here too).
+                    drop(guard);
+                    flush_every_database_on_flushall(&s.databases, cmd, db_idx, &frame);
 
                     results.push(if aof_ok {
                         frame
@@ -1517,7 +1532,7 @@ pub(crate) fn handle_shard_message_shared(
                     crate::shard::spsc_two_db::try_two_db_intercept(
                         cmd,
                         args,
-                        &mut s.databases,
+                        &s.databases,
                         db_idx,
                         db_count,
                         cached_clock,
@@ -1608,10 +1623,10 @@ pub(crate) fn handle_shard_message_shared(
                         oom
                     } else {
                         crate::shard::slice::with_shard(|s| {
-                            let db = &mut s.databases[db_idx];
+                            let mut db = s.databases.write(db_idx);
                             db.refresh_now_from_cache(cached_clock);
                             let mut selected = db_idx;
-                            let result = cmd_dispatch(db, cmd, args, &mut selected, db_count);
+                            let result = cmd_dispatch(&mut db, cmd, args, &mut selected, db_count);
                             let frame = match result {
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => f,
@@ -1639,7 +1654,7 @@ pub(crate) fn handle_shard_message_shared(
                             if !matches!(frame, crate::protocol::Frame::Error(_)) {
                                 crate::blocking::wakeup::wake_producer(
                                     blocking_registry,
-                                    db,
+                                    &mut db,
                                     db_idx,
                                     cmd,
                                     args,
@@ -1648,7 +1663,10 @@ pub(crate) fn handle_shard_message_shared(
 
                             // moon#677: FLUSHALL empties every database on
                             // this shard, not just the dispatched one.
-                            flush_every_database_on_flushall(&mut s.databases, cmd, db_idx, &frame);
+                            // The sweep re-acquires EVERY db, `db_idx` included: release this
+                            // guard first (the old code ended its borrow of db_idx here too).
+                            drop(db);
+                            flush_every_database_on_flushall(&s.databases, cmd, db_idx, &frame);
 
                             // Fail-loud: mutation applied, but the client must not
                             // see success for a write whose AOF record was dropped.
@@ -1676,7 +1694,9 @@ pub(crate) fn handle_shard_message_shared(
             let db_count = shard_databases.db_count();
             let db_idx = db_index.min(db_count.saturating_sub(1));
             crate::shard::slice::with_shard(|s| {
-                s.databases[db_idx].refresh_now_from_cache(cached_clock);
+                s.databases
+                    .write(db_idx)
+                    .refresh_now_from_cache(cached_clock);
                 // ONE backpressure budget for the whole batch: under sustained
                 // AOF backpressure the shard thread stalls at most BOUND total,
                 // not BOUND × batch-len (review finding, PR #211).
@@ -1700,7 +1720,7 @@ pub(crate) fn handle_shard_message_shared(
                         if let Some(response) = crate::shard::spsc_two_db::try_two_db_intercept(
                             cmd,
                             args,
-                            &mut s.databases,
+                            &s.databases,
                             db_idx,
                             db_count,
                             cached_clock,
@@ -1748,7 +1768,7 @@ pub(crate) fn handle_shard_message_shared(
                         // the generic single-db write path below.
                     }
 
-                    let guard = &mut s.databases[db_idx];
+                    let mut guard = s.databases.write(db_idx);
                     let is_write = metadata::is_write(cmd);
                     if is_write {
                         // M2 fix: same gate as the Execute arm, applied per
@@ -1759,7 +1779,7 @@ pub(crate) fn handle_shard_message_shared(
                             let mut reason_del_budget =
                                 crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                             if let Err(oom) = spsc_eviction_gate(
-                                guard,
+                                &mut guard,
                                 db_idx,
                                 shard_databases,
                                 shard_id,
@@ -1787,11 +1807,11 @@ pub(crate) fn handle_shard_message_shared(
                                 continue;
                             }
                         }
-                        cow_intercept(snapshot_state, guard, db_idx, cmd_frame);
+                        cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
                     }
 
                     let mut selected = db_idx;
-                    let result = cmd_dispatch(guard, cmd, args, &mut selected, db_count);
+                    let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
                     let frame = match result {
                         DispatchResult::Response(f) => f,
                         DispatchResult::Quit(f) => f,
@@ -1820,7 +1840,7 @@ pub(crate) fn handle_shard_message_shared(
 
                         crate::blocking::wakeup::wake_producer(
                             blocking_registry,
-                            guard,
+                            &mut guard,
                             db_idx,
                             cmd,
                             args,
@@ -1832,7 +1852,10 @@ pub(crate) fn handle_shard_message_shared(
                     // it is the arm that empties the OTHER shards. Outside the
                     // `is_write` block above only because `guard` is borrowed
                     // there; FLUSHALL is a write either way.
-                    flush_every_database_on_flushall(&mut s.databases, cmd, db_idx, &frame);
+                    // The sweep re-acquires EVERY db, `db_idx` included: release this
+                    // guard first (the old code ended its borrow of db_idx here too).
+                    drop(guard);
+                    flush_every_database_on_flushall(&s.databases, cmd, db_idx, &frame);
 
                     results.push(if aof_ok {
                         frame
@@ -1861,7 +1884,9 @@ pub(crate) fn handle_shard_message_shared(
                 // itself moves INSIDE the loop below (Gap A) so the MOVE/
                 // COPY-DB branch can borrow `&mut s.databases` (both src and
                 // dst) for the same command.
-                s.databases[db_idx].refresh_now_from_cache(cached_clock);
+                s.databases
+                    .write(db_idx)
+                    .refresh_now_from_cache(cached_clock);
                 // ONE backpressure budget for the whole batch: under sustained
                 // AOF backpressure the shard thread stalls at most BOUND total,
                 // not BOUND × batch-len (review finding, PR #211).
@@ -1886,7 +1911,7 @@ pub(crate) fn handle_shard_message_shared(
                         if let Some(response) = crate::shard::spsc_two_db::try_two_db_intercept(
                             cmd,
                             args,
-                            &mut s.databases,
+                            &s.databases,
                             db_idx,
                             db_count,
                             cached_clock,
@@ -1934,7 +1959,7 @@ pub(crate) fn handle_shard_message_shared(
                         // the generic single-db write path below.
                     }
 
-                    let guard = &mut s.databases[db_idx];
+                    let mut guard = s.databases.write(db_idx);
                     let is_write = metadata::is_write(cmd);
                     if is_write {
                         // M2 fix: same gate as the Execute arm, applied per
@@ -1945,7 +1970,7 @@ pub(crate) fn handle_shard_message_shared(
                             let mut reason_del_budget =
                                 crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                             if let Err(oom) = spsc_eviction_gate(
-                                guard,
+                                &mut guard,
                                 db_idx,
                                 shard_databases,
                                 shard_id,
@@ -1973,11 +1998,11 @@ pub(crate) fn handle_shard_message_shared(
                                 continue;
                             }
                         }
-                        cow_intercept(snapshot_state, guard, db_idx, cmd_frame);
+                        cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
                     }
 
                     let mut selected = db_idx;
-                    let result = cmd_dispatch(guard, cmd, args, &mut selected, db_count);
+                    let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
                     let frame = match result {
                         DispatchResult::Response(f) => f,
                         DispatchResult::Quit(f) => f,
@@ -2066,7 +2091,7 @@ pub(crate) fn handle_shard_message_shared(
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
                         crate::blocking::wakeup::wake_producer(
                             blocking_registry,
-                            guard,
+                            &mut guard,
                             db_idx,
                             cmd,
                             args,
@@ -2076,7 +2101,10 @@ pub(crate) fn handle_shard_message_shared(
                     // moon#677: keyspace half of the flush. Placed after the
                     // last use of `guard` (a `&mut s.databases[db_idx]`
                     // borrow) so the slice can be re-borrowed here.
-                    flush_every_database_on_flushall(&mut s.databases, cmd, db_idx, &frame);
+                    // The sweep re-acquires EVERY db, `db_idx` included: release this
+                    // guard first (the old code ended its borrow of db_idx here too).
+                    drop(guard);
+                    flush_every_database_on_flushall(&s.databases, cmd, db_idx, &frame);
 
                     results.push(if aof_ok {
                         frame
@@ -2280,10 +2308,11 @@ pub(crate) fn handle_shard_message_shared(
             // with DBSIZE under disk-offload (issue #355); costs an O(cold)
             // probe pass, same order as the `expires_count` scan beside it.
             let stats: Vec<(u64, u64)> = crate::shard::slice::with_shard(|s| {
-                s.databases
-                    .iter()
-                    .map(|db| (db.logical_len() as u64, db.expires_count() as u64))
-                    .collect()
+                s.databases.with_all_read(|dbs| {
+                    dbs.iter()
+                        .map(|db| (db.logical_len() as u64, db.expires_count() as u64))
+                        .collect()
+                })
             });
             let _ = reply_tx.send(stats);
         }
@@ -2434,10 +2463,15 @@ pub(crate) fn handle_shard_message_shared(
                                         crate::text::query::collect_highlight_terms(&n, text_index)
                                     })
                                     .unwrap_or_default();
-                                    let db = s
+                                    // `unwrap_or_else`, never `unwrap_or`: an
+                                    // eager db-0 fallback would take a SECOND
+                                    // guard on db 0 when `db_index == 0` and
+                                    // trip the re-entrancy assert.
+                                    let db_guard = s
                                         .databases
-                                        .get(db_index as usize)
-                                        .unwrap_or(&s.databases[0]);
+                                        .try_read_owned(db_index as usize)
+                                        .unwrap_or_else(|| s.databases.read(0));
+                                    let db: &crate::storage::Database = &db_guard;
                                     crate::command::vector_search::ft_text_search::apply_post_processing(
                                     &mut result,
                                     &term_strings,
@@ -2474,12 +2508,12 @@ pub(crate) fn handle_shard_message_shared(
                     let has_session = has_session_keyword(&command);
                     // WS5a: db_index comes from the originating connection
                     // (threaded through the message), not hardcoded db 0.
-                    let db_opt: Option<&mut crate::storage::db::Database> =
-                        if has_session || is_dropindex {
-                            s.databases.get_mut(db_index as usize)
-                        } else {
-                            None
-                        };
+                    let mut db_guard = if has_session || is_dropindex {
+                        s.databases.try_write(db_index as usize)
+                    } else {
+                        None
+                    };
+                    let db_opt: Option<&mut crate::storage::db::Database> = db_guard.as_deref_mut();
                     dispatch_vector_command(
                         &mut s.vector_store,
                         &mut s.text_store,
@@ -2619,10 +2653,14 @@ pub(crate) fn handle_shard_message_shared(
             // somehow exceeds the configured count (constructor-guaranteed).
             let response = {
                 crate::shard::slice::with_shard(|s| {
-                    let db = s
+                    // `unwrap_or_else`, never `unwrap_or`: an eager db-0
+                    // fallback would take a SECOND guard on db 0 whenever
+                    // `db_index == 0` and trip the re-entrancy assert.
+                    let db_guard = s
                         .databases
-                        .get(db_index as usize)
-                        .unwrap_or(&s.databases[0]);
+                        .try_read_owned(db_index as usize)
+                        .unwrap_or_else(|| s.databases.read(0));
+                    let db: &crate::storage::Database = &db_guard;
                     crate::command::vector_search::ft_aggregate::execute_local_partial(
                         &s.text_store,
                         &index_name,
@@ -2844,19 +2882,21 @@ pub(crate) fn handle_shard_message_shared(
             // docs/guides/isolation.md's "WS DROP" cost-note for the
             // large-keyspace / large---databases caveat.
             let deleted_count = crate::shard::slice::with_shard(|s| {
-                let mut total = 0u64;
-                for db in s.databases.iter_mut() {
-                    let keys_to_delete: Vec<Vec<u8>> = db
-                        .keys()
-                        .filter(|k| k.as_bytes().starts_with(prefix.as_ref()))
-                        .map(|k| k.as_bytes().to_vec())
-                        .collect();
-                    total += keys_to_delete.len() as u64;
-                    for key in &keys_to_delete {
-                        db.remove(key);
+                s.databases.with_all(|dbs| {
+                    let mut total = 0u64;
+                    for db in dbs.iter_mut() {
+                        let keys_to_delete: Vec<Vec<u8>> = db
+                            .keys()
+                            .filter(|k| k.as_bytes().starts_with(prefix.as_ref()))
+                            .map(|k| k.as_bytes().to_vec())
+                            .collect();
+                        total += keys_to_delete.len() as u64;
+                        for key in &keys_to_delete {
+                            db.remove(key);
+                        }
                     }
-                }
-                total
+                    total
+                })
             });
             // Ignore send failure: caller logs the count but the drop already
             // completed; losing the ack is harmless.
@@ -2959,20 +2999,25 @@ pub(crate) fn handle_shard_message_shared(
             }
             let now_ms = crate::storage::entry::current_time_ms();
             let snapshot = crate::shard::slice::with_shard(|s| {
-                let mut dbs = Vec::with_capacity(s.databases.len());
-                for db in s.databases.iter() {
-                    let mut entries = Vec::new();
-                    for (key, entry) in db.data().iter() {
-                        if !entry.is_expired_at(now_ms) {
-                            entries.push((key.clone(), entry.clone()));
+                // Shared guards on EVERY db for the whole capture: the same
+                // cross-db atomicity the single-threaded loop gave for free,
+                // and read-only exactly as the old `.iter()` was.
+                s.databases.with_all_read(|all| {
+                    let mut dbs = Vec::with_capacity(all.len());
+                    for db in all.iter() {
+                        let mut entries = Vec::new();
+                        for (key, entry) in db.data().iter() {
+                            if !entry.is_expired_at(now_ms) {
+                                entries.push((key.clone(), entry.clone()));
+                            }
                         }
+                        dbs.push(entries);
                     }
-                    dbs.push(entries);
-                }
-                crate::shard::dispatch::AofFoldSnapshot {
-                    dbs,
-                    pending_aof_count,
-                }
+                    crate::shard::dispatch::AofFoldSnapshot {
+                        dbs,
+                        pending_aof_count,
+                    }
+                })
             });
             // Ignore send failure: the AOF writer dropped its receiver
             // (e.g. rewrite aborted) — the snapshot is simply discarded.
@@ -3240,8 +3285,9 @@ pub(crate) fn handle_shard_message_shared(
             let mut graph_blob: Vec<u8> = Vec::new();
             let mut mq_blob: Vec<u8> = Vec::new();
             crate::shard::slice::with_shard(|s| {
-                let refs: Vec<&crate::storage::Database> = s.databases.iter().collect();
-                crate::persistence::redis_rdb::write_rdb_body_refs(&refs, &mut rdb_body);
+                s.databases.with_all_read(|refs| {
+                    crate::persistence::redis_rdb::write_rdb_body_refs(refs, &mut rdb_body);
+                });
                 // Index DEFINITIONS ride as moon aux (same as the single-shard
                 // path); contents stay in sync via the live stream + backfill.
                 let pairs = s.vector_store.collect_index_metas_with_weights();
@@ -3594,13 +3640,19 @@ pub fn auto_delete_vectors(
 /// destructive.
 #[inline]
 fn flush_every_database_on_flushall(
-    databases: &mut [Database],
+    databases: &crate::shard::db_plane::ShardDbSet,
     cmd: &[u8],
     db_idx: usize,
     frame: &crate::protocol::Frame,
 ) {
     if !matches!(frame, crate::protocol::Frame::Error(_)) && cmd.eq_ignore_ascii_case(b"FLUSHALL") {
-        crate::command::server_admin::flush_every_database(databases, db_idx);
+        // Guards are taken ONLY on the FLUSHALL path. Acquiring `with_all`
+        // unconditionally would put a db_count-wide lock acquire on every
+        // dispatched command — a cost the old `&mut [Database]` borrow
+        // never had.
+        databases.with_all(|dbs| {
+            crate::command::server_admin::flush_every_database(dbs, db_idx);
+        });
     }
 }
 

@@ -222,20 +222,28 @@ pub(crate) fn drain_into(snap: &mut SnapshotState) {
     let captured: Vec<(usize, Bytes, Entry)> =
         PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
     PENDING_KEYS.with(|k| k.borrow_mut().clear());
-    crate::shard::slice::with_shard(|s| drain_into_with_dbs(snap, &s.databases, captured));
+    crate::shard::slice::with_shard(|s| {
+        // Read guards only: the drain inspects each db's segment layout, it
+        // never mutates one. Held across every captured pre-image so the
+        // segment-index lookups all come from one consistent view, exactly as
+        // the single-threaded slice gave them.
+        s.databases
+            .with_all_read(|dbs| drain_into_with_dbs(snap, dbs, captured))
+    });
 }
 
 /// Testable core of [`drain_into`], parameterized on the database slice
 /// instead of reaching for the thread-local shard slice.
-fn drain_into_with_dbs(
+fn drain_into_with_dbs<D: std::borrow::Borrow<Database>>(
     snap: &mut SnapshotState,
-    databases: &[Database],
+    databases: &[D],
     captured: Vec<(usize, Bytes, Entry)>,
 ) {
     for (db_index, key, entry) in captured {
         let Some(db) = databases.get(db_index) else {
             continue;
         };
+        let db = db.borrow();
         let hash = crate::storage::dashtable::hash_key(&key);
         let seg_idx = db.data().segment_index_for_hash(hash);
         if snap.is_segment_pending(db_index, seg_idx) {

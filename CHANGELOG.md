@@ -55,6 +55,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — disabling the fan-out routing while leaving the guard relaxed passes the deferral
   assertion and is caught only by this counter (and, one test later, by an `MGET` reading stale
   values from its own batch).
+### Changed
+- **Shard databases moved behind a per-`(shard, db)` lock plane (L4 step 2,
+  moon#513).** `ShardSlice.databases` changed from `Box<[Database]>` to
+  `Arc<ShardDbSet>`, a registry of `CachePadded<RwLock<Database>>` built on the
+  main thread before any shard thread spawns.
+
+  This step is **behaviour-preserving and has no flag**: every site that had
+  exclusive access before has exclusive access after. It exists so a later step
+  can let a foreign shard serve a READ of a key this shard owns without the
+  cross-shard hop — and the park that costs. Measured on GCE t2a-standard-8
+  (aarch64, 8 vCPU), fitting per-command CPU against pipeline depth gives
+  `cost = 0.413 - 0.046*msgs/cmd + 2.488*parks/cmd` (CPU%/kops): **2.49 per
+  park, ~zero per message**, with the park term at 85% of the p=1 cost.
+
+  Why per-`(shard, db)` rather than one lock per shard: a write to db 0 must
+  not exclude a read of db 3, and no lock is taken on any per-key path — one
+  per command, not per key. `s8 x 16 dbs` costs 8 KB of padding and nothing per
+  key. Why locks at all rather than a seqlock or epoch/RCU: values are
+  heap-owning (`Bytes`, `HashMap`, `Listpack`) and `get_mut` mutates them in
+  place, so both alternatives need copy-on-write on the write hot path.
+
+  **No `unsafe` is introduced.** `Database` is `Send + Sync`, and the
+  `static L4_REGISTRY` now pins that as a compile-time contract: adding a
+  non-`Sync` field to `Database` breaks the build rather than silently making
+  the plane unsound. The slice's `!Send` marker is untouched, and vector, text,
+  graph and registry state never cross a thread.
+
+  Guards are handed out through `FnOnce` closures, so a guard cannot escape and
+  cannot cross an `.await` — "never hold a lock across `.await`" is enforced by
+  the type system here, not by review. A thread-local mask restores the loud
+  failure the `RefCell` used to give: re-acquiring a database inside its own
+  guard would DEADLOCK on a real `RwLock`, so it panics instead.
+
+  144 call sites across 20 files were converted. Four multi-database helpers
+  (`flush_every_database`, `rdb::save_to_bytes`, `redis_rdb::load_rdb`,
+  `snapshot::shard_snapshot_load`) became generic over `Borrow`/`BorrowMut<Database>`,
+  which left every existing caller unchanged.
+
+- **CI gained a `runtime-tokio + text-index` lint leg.** `handler_sharded` is
+  `cfg(runtime-tokio)`, so the default leg never compiles it; the tokio leg
+  drops `text-index`, so it never compiles the parts behind that cfg. Their
+  intersection was covered by no gate, local or hosted. Measured: a deliberate
+  type error at `handler_sharded/ft.rs:498` left BOTH standing legs reporting
+  zero errors. A real defect had been sitting in that blind spot.
+
+- **New `docs/internal/cross-shard-cost-model.md`** records the per-park cost
+  model, the profile breakdown (83% of moon's user time is not Redis work),
+  seven measured dead ends, and five retracted claims — so none of them are
+  re-derived.
 
 ### Fixed
 - **`TXN ABORT` left torn state after a multi-key write (moon#500).**

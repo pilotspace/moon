@@ -143,13 +143,22 @@ pub(crate) fn run_and_complete<R>(
     run: impl FnOnce(&mut Database) -> R,
 ) -> (R, Option<PendingFlush>) {
     let _ = take();
-    let out = run(&mut slice.databases[db_idx]);
+    // The guard is scoped tightly: `run` gets exclusive access, then the
+    // guard drops BEFORE the FLUSHALL branch below, which re-acquires every
+    // database through `with_all`. Holding both would trip the re-entrancy
+    // mask on `db_idx`.
+    let out = {
+        let mut db = slice.databases.write(db_idx);
+        run(&mut db)
+    };
     let pending = take();
     if let Some(which) = pending {
         if which == PendingFlush::All {
             // `db_idx` is the database the bridge already cleared, so it is
             // skipped — exactly the contract `flush_every_database` documents.
-            crate::command::server_admin::flush_every_database(&mut slice.databases, db_idx);
+            slice.databases.with_all(|dbs| {
+                crate::command::server_admin::flush_every_database(dbs, db_idx);
+            });
         }
         crate::shard::spsc_handler::auto_flush_indexes(
             &mut slice.vector_store,

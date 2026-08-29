@@ -21,8 +21,8 @@ use std::sync::Arc;
 use crate::command::keyspace::move_cmd as ksmv;
 use crate::config::RuntimeConfig;
 use crate::protocol::Frame;
+use crate::shard::db_plane::ShardDbSet;
 use crate::shard::shared_databases::ShardDatabases;
-use crate::storage::Database;
 use crate::storage::entry::CachedClock;
 use crate::storage::tiered::spill_thread::SpillRequest;
 
@@ -52,7 +52,7 @@ use crate::storage::tiered::spill_thread::SpillRequest;
 pub(crate) fn try_two_db_intercept(
     cmd: &[u8],
     args: &[Frame],
-    databases: &mut [Database],
+    databases: &ShardDbSet,
     db_idx: usize,
     db_count: usize,
     cached_clock: &CachedClock,
@@ -72,7 +72,7 @@ pub(crate) fn try_two_db_intercept(
                 // Refresh expiry clock on BOTH databases before the move so
                 // an expired source key behaves as "not found" and an
                 // expired destination key doesn't shadow the insert.
-                ksmv::with_two_slice_dbs(databases, db_idx, dst_db, |src, dst| {
+                databases.with_pair(db_idx, dst_db, |src, dst| {
                     src.refresh_now_from_cache(cached_clock);
                     dst.refresh_now_from_cache(cached_clock);
                     ksmv::move_core(src, dst, &key)
@@ -89,7 +89,7 @@ pub(crate) fn try_two_db_intercept(
         let copy_result = ksmv::parse_copy_db_args(args, db_idx, db_count)?;
         let response = match copy_result {
             Err(e) => e,
-            Ok(ca) => ksmv::with_two_slice_dbs(databases, db_idx, ca.dst_db, |src, dst| {
+            Ok(ca) => databases.with_pair(db_idx, ca.dst_db, |src, dst| {
                 // Refresh expiry clock on BOTH dbs to mirror the single-db
                 // write path: expired src/dst keys must resolve correctly
                 // before copy_core inspects them.

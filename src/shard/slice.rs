@@ -37,6 +37,7 @@ use crate::graph::store::GraphStore;
 use crate::mq::{DurableQueueRegistry, TriggerRegistry};
 use crate::persistence::wal_v3::record::WalRecordType;
 use crate::runtime::channel::MpscSender;
+use crate::shard::db_plane::ShardDbSet;
 use crate::shard::shared_databases::ShardStoreMemory;
 use crate::storage::Database;
 use crate::temporal::{TemporalKvIndex, TemporalRegistry};
@@ -63,9 +64,17 @@ use crate::vector::store::VectorStore;
 pub struct ShardSlice {
     /// Shard index (0..num_shards).
     pub shard_id: usize,
-    /// Per-shard databases (SELECT 0-15). Fixed-size box after init — no
-    /// reallocation during the shard lifetime. Indexed directly by db_index.
-    pub databases: Box<[Database]>,
+    /// Per-shard databases (SELECT 0-15), behind the L4 shared read plane.
+    ///
+    /// This is the ONE field of the slice that is reachable from another
+    /// thread: `Database` is `Send + Sync`, so a foreign shard can serve a
+    /// READ of a key this shard owns without an SPSC hop and the park that
+    /// costs. Everything else here stays thread-local behind `_not_send`.
+    ///
+    /// Access is guarded per (shard, db) — see `crate::shard::db_plane`. The
+    /// owner takes `write(i)` for mutating commands and `read(i)` for its own
+    /// reads; foreign readers take `try_read(i)` and NEVER park.
+    pub databases: Arc<ShardDbSet>,
     /// Per-shard vector store for FT.* commands.
     pub vector_store: VectorStore,
     /// Per-shard text store for full-text search indexes.
@@ -126,7 +135,7 @@ pub struct ShardSlice {
 /// the marker field.
 pub struct ShardSliceInit {
     pub shard_id: usize,
-    pub databases: Box<[Database]>,
+    pub databases: Arc<ShardDbSet>,
     pub vector_store: VectorStore,
     pub text_store: TextStore,
     #[cfg(feature = "graph")]
@@ -155,15 +164,15 @@ impl ShardSliceInit {
     /// into `shard_databases` before this point, and store recovery (vector/
     /// text/graph) happens on the shard thread after `init_shard`.
     pub fn build_all(
-        shard_databases: Vec<Vec<Database>>,
+        shard_db_sets: &[Arc<ShardDbSet>],
         memory_per_shard: &[Arc<AtomicUsize>],
         store_memory_per_shard: &[Arc<ShardStoreMemory>],
     ) -> Vec<ShardSliceInit> {
-        shard_databases
-            .into_iter()
+        shard_db_sets
+            .iter()
             .enumerate()
-            .map(|(shard_id, dbs)| {
-                let databases: Box<[Database]> = dbs.into_boxed_slice();
+            .map(|(shard_id, set)| {
+                let databases: Arc<ShardDbSet> = Arc::clone(set);
                 ShardSliceInit {
                     shard_id,
                     databases,
@@ -501,17 +510,53 @@ pub fn with_shard<R>(f: impl FnOnce(&mut ShardSlice) -> R) -> R {
 /// Use `try_with_shard` to guard against the uninitialized case first.
 #[inline]
 pub fn with_shard_db<R>(db_index: usize, f: impl FnOnce(&mut Database) -> R) -> R {
-    with_shard(|slice| {
-        let len = slice.databases.len();
-        #[allow(clippy::unwrap_used)] // the expect message identifies the programming error
-        let db = slice.databases.get_mut(db_index).unwrap_or_else(|| {
-            panic!(
-                "db_index {db_index} out of bounds ({len} databases on shard {})",
-                slice.shard_id
-            )
-        });
-        f(db)
-    })
+    let set = shard_db_set();
+    let mut guard = set.write(db_index);
+    f(&mut guard)
+}
+
+/// Execute a closure with a SHARED guard on one of this shard's databases.
+///
+/// The owner's read path. The owner is the sole writer, so this can only
+/// contend with other readers' count CAS — a retry, never a park — and while
+/// it is held a foreign shard may serve reads of the same db concurrently
+/// instead of hopping. That is the whole point of the plane.
+///
+/// # Panics
+/// Same contract as [`with_shard_db`]: out-of-range index, uninitialised
+/// shard thread, or re-acquiring a db from inside its own closure.
+#[inline]
+pub fn with_shard_db_read<R>(db_index: usize, f: impl FnOnce(&Database) -> R) -> R {
+    let set = shard_db_set();
+    let guard = set.read(db_index);
+    f(&guard)
+}
+
+/// The foreign fast path: serve a read of `shard`'s database on THIS thread.
+///
+/// Returns `None` — meaning the caller must fall through to the SPSC path it
+/// takes today — when the registry is absent, the shard/db index is out of
+/// range, or the owner holds the write lock. It NEVER parks: exactly one CAS.
+///
+/// `f` is a plain `FnOnce`, not an async closure, on purpose: the guard cannot
+/// escape it and cannot cross an `.await`. "Never hold a lock across `.await`"
+/// is enforced here by the type system rather than by review.
+#[inline]
+pub fn try_foreign_db_read<R>(
+    shard: usize,
+    db_index: usize,
+    f: impl FnOnce(&Database) -> R,
+) -> Option<R> {
+    let guard = crate::shard::db_plane::shard_dbs(shard)?.try_read(db_index)?;
+    Some(f(&guard))
+}
+
+/// This shard's database set. Cheap: one `Arc` clone out of the thread-local
+/// slice, so the guard below is not taken while the slice's `RefCell` borrow
+/// is live (which would forbid the closure from calling `with_shard`).
+#[inline]
+fn shard_db_set() -> Arc<ShardDbSet> {
+    with_shard(|slice| Arc::clone(&slice.databases))
 }
 
 /// Execute a closure with exclusive access to the current thread's `ShardSlice`,
@@ -591,7 +636,16 @@ pub(crate) mod test_support {
     use crate::vector::store::VectorStore;
 
     pub(crate) fn make_init(shard_id: usize, db_count: usize) -> ShardSliceInit {
-        let databases: Box<[Database]> = (0..db_count).map(|_| Database::new()).collect();
+        // Build a standalone set rather than installing a registry: the test
+        // binary runs many of these in one process, and the registry is a
+        // process-wide OnceLock that only the first caller could claim.
+        let databases: Arc<crate::shard::db_plane::ShardDbSet> =
+            crate::shard::db_plane::build_sets(vec![
+                (0..db_count).map(|_| Database::new()).collect(),
+            ])
+            .first()
+            .map(Arc::clone)
+            .expect("build_sets yields one set per shard");
         ShardSliceInit {
             shard_id,
             databases,
@@ -703,7 +757,7 @@ mod tests {
             init_shard(ShardSlice::new(make_init(7, 4)));
             assert!(is_initialized());
             assert_eq!(with_shard(|s| s.shard_id), 7);
-            assert_eq!(with_shard(|s| s.databases.len()), 4);
+            assert_eq!(with_shard(|s| s.databases.db_count()), 4);
         })
         .unwrap();
     }

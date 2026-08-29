@@ -708,7 +708,10 @@ pub fn read_moon_aux_all(data: &[u8], key: &[u8]) -> Vec<Vec<u8>> {
 ///
 /// Verifies magic bytes, version, and CRC64 checksum.
 /// Returns the total number of keys loaded.
-pub fn load_rdb(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usize> {
+pub fn load_rdb<D: std::borrow::BorrowMut<Database>>(
+    databases: &mut [D],
+    data: &[u8],
+) -> anyhow::Result<usize> {
     if data.len() < 9 + 1 + 8 {
         bail!("RDB data too short: {} bytes", data.len());
     }
@@ -789,7 +792,7 @@ pub fn load_rdb(databases: &mut [Database], data: &[u8]) -> anyhow::Result<usize
 
                 if current_db < databases.len() {
                     let key = Bytes::from(key_bytes);
-                    databases[current_db].set(key, entry);
+                    databases[current_db].borrow_mut().set(key, entry);
                     total_keys += 1;
                 }
             }

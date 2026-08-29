@@ -2210,8 +2210,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
                                 Ok((key, dst_db)) => {
                                     // Unconditional slice path: ShardSlice is always initialized.
+                                    // L4: `with_pair` is the exact contract
+                                    // `with_two_slice_dbs` had — asserts the
+                                    // indexes differ, panics out of range,
+                                    // acquires ascending, hands the closure
+                                    // (src, dst). The `dst_db == src_db` match
+                                    // arm above short-circuits, so the
+                                    // distinct-db assert cannot fire here.
                                     crate::shard::slice::with_shard(|s| {
-                                        ksmv::with_two_slice_dbs(&mut s.databases, src_db, dst_db, |src, dst| {
+                                        s.databases.with_pair(src_db, dst_db, |src, dst| {
                                             ksmv::move_core(src, dst, &key)
                                         })
                                     })
@@ -2275,8 +2282,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     Err(e) => e,
                                     Ok(ca) => {
                                         // Unconditional slice path: ShardSlice is always initialized.
+                                        // L4: see the MOVE arm. This file's own
+                                        // control flow supplies the
+                                        // distinct-index proof: the enclosing
+                                        // `if let Some(copy_result) =
+                                        // parse_copy_db_args(cmd_args, src_db,
+                                        // ..)` yields `None` when the parsed
+                                        // `dst_db == current_db` (== `src_db`),
+                                        // routing same-db COPY to the plain
+                                        // write path, so `ca.dst_db != src_db`
+                                        // holds on every path that reaches here.
                                         crate::shard::slice::with_shard(|s| {
-                                            ksmv::with_two_slice_dbs(&mut s.databases, src_db, ca.dst_db, |src, dst| {
+                                            s.databases.with_pair(src_db, ca.dst_db, |src, dst| {
                                                 ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
                                             })
                                         })
@@ -2348,14 +2365,25 @@ pub(crate) async fn handle_connection_sharded_inner<
                             let mut do_write = |s: &mut crate::shard::slice::ShardSlice,
                                                 conn: &mut super::core::ConnectionState|
                              -> WriteOutcome {
-                                let db_len = s.databases.len();
+                                let db_len = s.databases.db_count();
+                                let sel = conn.selected_db;
+                                let shard_id = s.shard_id;
+                                // L4: `try_write` is the `get_mut` replacement.
+                                // Kept over a bare `write()` so the original
+                                // panic text — which names the shard — survives
+                                // verbatim; `write()`'s own out-of-range panic
+                                // does not carry the shard id. This guard spans
+                                // eviction → undo capture → dispatch →
+                                // wake_producer, exactly the span the
+                                // `&mut Database` borrow covered, and drops when
+                                // `do_write` returns.
                                 #[allow(clippy::unwrap_used)] // mirror with_shard_db's panic semantics
-                                let db = s.databases.get_mut(conn.selected_db).unwrap_or_else(|| {
+                                let mut db_guard = s.databases.try_write(sel).unwrap_or_else(|| {
                                     panic!(
-                                        "db_index {} out of bounds ({db_len} databases on shard {})",
-                                        conn.selected_db, s.shard_id
+                                        "db_index {sel} out of bounds ({db_len} databases on shard {shard_id})"
                                     )
                                 });
+                                let db = &mut *db_guard;
                                 let rt = ctx.runtime_config.read();
                                 // Disk-offload: when a per-shard spill sender is wired
                                 // (ConnCtx populated by spawn_tokio_connection), evicted
@@ -2632,10 +2660,20 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     // same command to the other shards, where
                                     // the SPSC arm does the same thing.
                                     if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
-                                        crate::command::server_admin::flush_every_database(
-                                            &mut s.databases,
-                                            conn.selected_db,
-                                        );
+                                        // L4: every db under one ascending
+                                        // guard set, released on return —
+                                        // the cross-db atomicity the
+                                        // `&mut [Database]` walk had,
+                                        // preserved against a concurrent
+                                        // foreign reader. Guards are gone
+                                        // before `auto_drop_mq_streams_on_flush`
+                                        // re-enters `s` below.
+                                        s.databases.with_all(|dbs| {
+                                            crate::command::server_admin::flush_every_database(
+                                                dbs,
+                                                conn.selected_db,
+                                            );
+                                        });
                                     }
                                     crate::shard::spsc_handler::auto_flush_indexes(
                                         &mut s.vector_store,

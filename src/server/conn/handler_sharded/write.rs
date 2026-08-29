@@ -130,16 +130,23 @@ pub(super) async fn try_handle_ws_command(
                             // comment on the `WsDropCleanup` handler in
                             // src/shard/spsc_handler.rs.
                             crate::shard::slice::with_shard(|s| {
-                                for db in s.databases.iter_mut() {
-                                    let keys_to_delete: Vec<Vec<u8>> = db
-                                        .keys()
-                                        .filter(|k| k.as_bytes().starts_with(prefix.as_bytes()))
-                                        .map(|k| k.as_bytes().to_vec())
-                                        .collect();
-                                    for key in &keys_to_delete {
-                                        db.remove(key);
+                                // L4: `with_all` takes every db's write guard
+                                // ascending and holds them for the whole sweep
+                                // — same all-or-nothing view the
+                                // `&mut [Database]` walk had. Twin of the
+                                // monoio sweep in `handler_monoio/write.rs`.
+                                s.databases.with_all(|dbs| {
+                                    for db in dbs.iter_mut() {
+                                        let keys_to_delete: Vec<Vec<u8>> = db
+                                            .keys()
+                                            .filter(|k| k.as_bytes().starts_with(prefix.as_bytes()))
+                                            .map(|k| k.as_bytes().to_vec())
+                                            .collect();
+                                        for key in &keys_to_delete {
+                                            db.remove(key);
+                                        }
                                     }
-                                }
+                                });
                             });
                         } else {
                             // Foreign shard: hop via WsDropCleanup message.

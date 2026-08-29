@@ -693,7 +693,13 @@ pub(crate) fn execute_transaction_sharded(
                 // broadcast above carries the same FLUSHALL to the other
                 // shards, where the SPSC arm clears their databases.
                 if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
-                    crate::command::server_admin::flush_every_database(&mut s.databases, selected);
+                    // L4: `with_all` holds every db's write guard for the whole
+                    // closure, preserving the cross-db atomicity the slice's
+                    // `&mut [Database]` gave for free. Guards drop on return,
+                    // before `auto_drop_mq_streams_on_flush` re-enters `s`.
+                    s.databases.with_all(|dbs| {
+                        crate::command::server_admin::flush_every_database(dbs, selected);
+                    });
                 }
                 crate::shard::spsc_handler::auto_flush_indexes(
                     &mut s.vector_store,

@@ -70,8 +70,8 @@ pub async fn scatter_text_aggregate(
             #[allow(clippy::expect_used)]
             let db = s
                 .databases
-                .get(db_index as usize)
-                .or_else(|| s.databases.first())
+                .try_read_owned(db_index as usize)
+                .or_else(|| s.databases.try_read_owned(0))
                 .expect("shard slice must have at least db 0");
             crate::command::vector_search::ft_aggregate::execute_local_full(
                 &mut s.vector_store,
@@ -79,7 +79,7 @@ pub async fn scatter_text_aggregate(
                 &index_name,
                 &query,
                 &pipeline,
-                db,
+                &db,
                 db_index,
             )
         });
@@ -104,15 +104,15 @@ pub async fn scatter_text_aggregate(
                 #[allow(clippy::expect_used)]
                 let db = s
                     .databases
-                    .get(db_index as usize)
-                    .or_else(|| s.databases.first())
+                    .try_read_owned(db_index as usize)
+                    .or_else(|| s.databases.try_read_owned(0))
                     .expect("shard slice must have at least db 0");
                 crate::command::vector_search::ft_aggregate::execute_local_partial(
                     &s.text_store,
                     &index_name,
                     &query,
                     &pipeline,
-                    db,
+                    &db,
                     db_index,
                 )
             });

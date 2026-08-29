@@ -2775,13 +2775,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let response = match ksmv::parse_move_args(cmd_args, db_count) {
                         Err(e) => e,
                         Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
+                        // L4: `with_pair` is the exact contract
+                        // `with_two_slice_dbs` had — asserts the indexes
+                        // differ (the `dst_db == src_db` arm above
+                        // short-circuits), panics out of range, acquires
+                        // ascending, hands the closure (src, dst).
                         Ok((key, dst_db)) => crate::shard::slice::with_shard(|s| {
-                            ksmv::with_two_slice_dbs(
-                                &mut s.databases,
-                                src_db,
-                                dst_db,
-                                |src, dst| ksmv::move_core(src, dst, &key),
-                            )
+                            s.databases.with_pair(src_db, dst_db, |src, dst| {
+                                ksmv::move_core(src, dst, &key)
+                            })
                         }),
                     };
                     // AOF only on actual success (:1). Matches handler_single.
@@ -2856,21 +2858,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                         let response = match copy_result {
                             Err(e) => e,
+                            // L4: see the MOVE arm. `parse_copy_db_args`
+                            // returns `None` for a same-db COPY (falls
+                            // through to the plain write path), so
+                            // `ca.dst_db != src_db` holds here and
+                            // `with_pair`'s distinct-db assert cannot fire.
                             Ok(ca) => crate::shard::slice::with_shard(|s| {
-                                ksmv::with_two_slice_dbs(
-                                    &mut s.databases,
-                                    src_db,
-                                    ca.dst_db,
-                                    |src, dst| {
-                                        ksmv::copy_core(
-                                            src,
-                                            dst,
-                                            &ca.src_key,
-                                            &ca.dst_key,
-                                            ca.replace,
-                                        )
-                                    },
-                                )
+                                s.databases.with_pair(src_db, ca.dst_db, |src, dst| {
+                                    ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
+                                })
                             }),
                         };
                         // AOF only on actual success (:1). Matches handler_single
@@ -2947,7 +2943,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         Frame,
                     > = crate::shard::slice::with_shard(|s| {
                         let sel_db = conn.selected_db;
-                        let db = &mut s.databases[sel_db];
+                        // L4: one exclusive guard for the whole eviction +
+                        // undo-capture + dispatch span — the same span the
+                        // `&mut s.databases[sel_db]` borrow covered. It is
+                        // dropped explicitly right after `dispatch` so the
+                        // index hooks below (which re-enter `s` whole, and
+                        // may take their own guard on this db) never see a
+                        // guard already held on this thread.
+                        let mut db_guard = s.databases.write(sel_db);
+                        let db = &mut *db_guard;
 
                         if batch_eviction_active {
                             run_write_eviction_gate(ctx, db, sel_db, cmd)?;
@@ -3030,6 +3034,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // Dispatch
                         let mut new_sel_db = sel_db;
                         let result = dispatch(db, cmd, cmd_args, &mut new_sel_db, db_count);
+                        // L4: end of the keyspace mutation. Everything below
+                        // touches the index stores or re-enters `s`, so the
+                        // guard must not outlive this point.
+                        drop(db_guard);
                         let response_frame = match &result {
                             DispatchResult::Response(f) | DispatchResult::Quit(f) => f.clone(),
                         };
@@ -3097,10 +3105,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             // while their keys stay — the inconsistency that
                             // made the bug findable.
                             if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
-                                crate::command::server_admin::flush_every_database(
-                                    &mut s.databases,
-                                    sel_db,
-                                );
+                                // L4: every db under one ascending guard set,
+                                // released on return — the cross-db atomicity
+                                // the `&mut [Database]` walk had, preserved
+                                // against a concurrent foreign reader.
+                                s.databases.with_all(|dbs| {
+                                    crate::command::server_admin::flush_every_database(dbs, sel_db);
+                                });
                             }
                             crate::shard::spsc_handler::auto_flush_indexes(
                                 &mut s.vector_store,
@@ -3120,9 +3131,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             // a key THIS shard owns was never woken by a local
                             // write — while the same XADD arriving over SPSC
                             // woke it. Routing-dependent, so it read as a flake.
+                            // L4: fresh guard on the POST-dispatch db (a
+                            // queued SELECT may have moved it). The write-path
+                            // guard above was dropped after `dispatch`, so
+                            // this cannot be a recursive acquisition even when
+                            // `new_sel_db == sel_db`.
+                            let mut wake_guard = s.databases.write(new_sel_db);
                             crate::blocking::wakeup::wake_producer(
                                 &ctx.blocking_registry,
-                                &mut s.databases[new_sel_db],
+                                &mut wake_guard,
                                 new_sel_db,
                                 cmd,
                                 cmd_args,
