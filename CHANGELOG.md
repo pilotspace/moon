@@ -6,6 +6,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`--cross-shard-fast-path`: serve a foreign shard's read without an SPSC hop (L4, S4).**
+
+  A read whose key hashes to another shard previously always crossed that shard's SPSC
+  channel. It can now be served on the receiving thread under a shared read guard on the
+  owner's database — one CAS, no park.
+
+  `docs/production-guide.md` has documented this flag, an `auto` default, and three
+  Prometheus metrics for some time. **None of it existed:** the dispatch site was disabled
+  (`handler_monoio/mod.rs`, "ShardSlice is thread-local; foreign-shard data can only be
+  read via SPSC hop"), the metrics had zero references in `src/`, and the server rejected
+  the flag outright — an operator following that tuning advice got
+  `error: unexpected argument '--cross-shard-fast-path' found` instead of a running
+  server. The L4 plane removes the stated blocker, so this implements the flag under the
+  documented name and corrects the section to match what ships.
+
+  **Default `off`** until the L4 acceptance run clears it. The path also declines, falling
+  back to SPSC, whenever:
+
+  - the connection has in-flight remote work on that shard (read-your-own-writes, moon#507
+    / moon#512);
+  - the command spans shards — placement is read from `multikey_placement`, the same
+    function the router uses, so the two cannot drift (moon#592);
+  - the command is multi-key (conservative for v1: an all-on-one-shard `MGET` can still
+    have some keys cold, and the residency probe only covers the primary key);
+  - the key is not resident, since the read-only path does not consult the cold tier
+    (the moon#610 class);
+  - the owner holds the write lock — the guard is attempted, never waited on.
+
+  Observability: `moon_dispatch_path_total{path="cross_read_fast"}` and
+  `INFO stats` → `total_dispatch_cross_read_fast`. Measured at `--shards 4`, 200 scattered
+  GETs moved the counter 0 → 147 (73.5%, the expected 3-of-4 foreign fraction) while
+  `total_dispatch_cross_spsc` stayed flat.
+
 ### Performance
 - **Owner reads take a shared guard instead of an exclusive one (L4, S3).**
 

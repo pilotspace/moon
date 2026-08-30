@@ -44,6 +44,7 @@
 
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_utils::CachePadded;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -408,6 +409,26 @@ pub fn registry() -> Option<&'static [Arc<ShardDbSet>]> {
 #[inline]
 pub fn shard_dbs(shard_id: usize) -> Option<&'static Arc<ShardDbSet>> {
     registry()?.get(shard_id)
+}
+
+/// L4 S4 master switch, resolved once from `--cross-shard-fast-path`.
+///
+/// A process-global `AtomicBool` rather than a field threaded through the
+/// connection context, matching the existing
+/// `replication::state::fanout_hint_active()` hint: the read is one Relaxed
+/// load on the hot routing path, and the value never changes after startup.
+static CROSS_SHARD_FAST_PATH: AtomicBool = AtomicBool::new(false);
+
+/// Set the S4 master switch from config. Call once, before shards spawn.
+pub fn set_cross_shard_fast_path(enabled: bool) {
+    CROSS_SHARD_FAST_PATH.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether a cross-shard read may be served under a shared guard on the
+/// calling thread instead of hopping through SPSC.
+#[inline]
+pub fn cross_shard_fast_path_enabled() -> bool {
+    CROSS_SHARD_FAST_PATH.load(Ordering::Relaxed)
 }
 
 /// Number of shards the registry was built for. `0` when absent.

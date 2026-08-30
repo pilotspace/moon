@@ -708,51 +708,47 @@ benchmarks.
 
 ### Cross-shard fast path
 
-For read commands directed at a foreign shard (e.g. GET where the key hashes to shard 3
-but the connection is pinned to shard 0), Moon has two dispatch modes:
+For a read whose key hashes to a foreign shard (a `GET` on shard 3 arriving on a
+connection pinned to shard 0), Moon can either hop the command through that shard's SPSC
+channel or serve it in place under a shared read guard on the owner's database.
 
-| Mode | Behavior |
+| `--cross-shard-fast-path` | Behaviour |
 |---|---|
-| `auto` / `on` (default) | Acquire a short-lived `RwLock` read guard on the target shard's database directly, bypassing SPSC. Lower latency, but adds `RwLock` contention on the target shard. |
-| `off` | Route the read through the SPSC channel (same as a write). Eliminates `RwLock` contention at the cost of one extra channel round-trip (~2–5 µs). |
+| `off` (**default**) | Route the read through the SPSC channel, exactly like a write. One extra channel round-trip per read. |
+| `auto` / `on` | Serve the read on the receiving thread under a shared guard on the owner's database. No hop, no park — one CAS. Falls back to SPSC whenever any gate below declines. |
 
-#### When to use `--cross-shard-fast-path=off`
+The default is `off` while the L4 acceptance run is outstanding. Turn it on deliberately.
 
-Switch to `off` when you observe `moon_cross_shard_lock_contention_total` climbing in
-Prometheus, specifically when:
+#### What the fast path declines
 
-- `c < 25 × shards` (low-concurrency / over-sharded deployment)
-- Write-heavy workloads where the target shard's `RwLock` is frequently held by a writer
-- You see `moon_dispatch_cross_read_fastpath_latency_us` p99 > 50 µs
+It is not a blanket bypass. Each of these falls back to SPSC, silently and correctly:
 
-At `c ≥ 200` and typical shard counts (4–8), the fast path's `RwLock` contention is
-invisible in production profiling and the default `auto` mode is recommended.
+- **The connection has in-flight remote work on that shard.** Serving the read locally
+  would let it overtake this connection's own queued write — read-your-own-writes
+  (moon#507 / moon#512). Ordering wins; the read takes the hop.
+- **The command spans shards.** Placement is read from `multikey_placement`, the same
+  function the router uses, so the two cannot drift apart.
+- **The command is multi-key.** Conservative for now: an all-on-one-shard `MGET` can still
+  have some keys in the cold tier, and the residency probe only covers the primary key.
+- **The key is not resident.** The read-only dispatch path does not consult the cold tier,
+  so a cold key takes the SPSC path where the full dispatch promotes it.
+- **The owner is mid-write.** The guard is attempted, never waited on.
+
+Consequently the fast-path counter tracks well under the total cross-shard read count, and
+a workload that is write-heavy on the same keys may see almost no fast-path traffic. That
+is the design working, not a fault.
 
 #### Observability
 
-Two Prometheus metrics expose fast-path health:
+- `moon_dispatch_path_total{path="cross_read_fast"}` — reads served in place.
+- `moon_dispatch_path_total{path="cross_spsc"}` — cross-shard commands that took the hop
+  (reads and writes both).
+- `INFO stats` exposes the same two as `total_dispatch_cross_read_fast` and
+  `total_dispatch_cross_spsc`, so they are readable with `admin_port=0`.
 
-- `moon_dispatch_cross_read_fastpath_latency_us{target_shard=N}` — histogram of lock
-  acquisition time per target shard. Alert when p99 > 50 µs.
-- `moon_cross_shard_lock_contention_total{target_shard=N}` — incremented whenever lock
-  acquisition takes > 1 µs. A rising rate under low client counts indicates the fast path
-  is adding contention.
-- `moon_dispatch_path_total{path="cross_read_fast"}` — total fast-path dispatches (existing
-  counter, unchanged).
-
-#### Benchmarking the trade-off
-
-Use `scripts/bench-cross-shard-fastpath.sh` to run the full matrix on `moon-dev`:
-
-```bash
-orb run -m moon-dev bash -c '
-  source ~/.cargo/env &&
-  cd /Users/tindang/workspaces/tind-repo/moon &&
-  bash scripts/bench-cross-shard-fastpath.sh
-'
-```
-
-Results are written to `docs/benchmarks/cross-shard-fastpath-<date>.md`.
+`total_dispatch_cross_read_fast` is 0 whenever the flag is `off`. If it is 0 with the flag
+`on`, a gate above is declining every read — check whether the workload pipelines writes
+and reads of the same keys together.
 
 ### Future: shared-nothing architecture (Phase 4)
 

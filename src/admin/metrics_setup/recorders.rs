@@ -10,9 +10,9 @@ use std::sync::atomic::Ordering;
 use metrics::{counter, gauge, histogram};
 
 use crate::admin::metrics_setup::{
-    CONNECTED_CLIENTS, DISPATCH_CROSS_READ_SPSC_TOTAL, EVICTED_KEYS, EXPIRING_SPILL_SKIPPED,
-    KEYSPACE_HITS, KEYSPACE_MISSES, METRICS_INITIALIZED, PIPELINE_MULTIKEY_FANOUT_TOTAL,
-    PIPELINE_REMOTE_DEFER_TOTAL, SPILLED_KEYS, TOTAL_CONNECTIONS,
+    CONNECTED_CLIENTS, DISPATCH_CROSS_READ_FAST_TOTAL, DISPATCH_CROSS_READ_SPSC_TOTAL,
+    EVICTED_KEYS, EXPIRING_SPILL_SKIPPED, KEYSPACE_HITS, KEYSPACE_MISSES, METRICS_INITIALIZED,
+    PIPELINE_MULTIKEY_FANOUT_TOTAL, PIPELINE_REMOTE_DEFER_TOTAL, SPILLED_KEYS, TOTAL_CONNECTIONS,
     WAL_AGGRESSIVE_RECYCLE_BYTES_TOTAL, WAL_AGGRESSIVE_RECYCLE_SEGMENTS_TOTAL,
 };
 
@@ -298,6 +298,17 @@ pub fn record_dispatch_cross_spsc() {
         return;
     }
     counter!("moon_dispatch_path_total", "path" => "cross_spsc").increment(1);
+}
+
+/// L4 S4: a cross-shard read answered on this thread under a shared guard,
+/// with no SPSC hop and no park.
+#[inline]
+pub fn record_dispatch_cross_read_fast() {
+    DISPATCH_CROSS_READ_FAST_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_dispatch_path_total", "path" => "cross_read_fast").increment(1);
 }
 
 /// Cross-shard fan-out message dropped after bounded retry (c10k E1/E3):

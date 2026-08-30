@@ -301,6 +301,17 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    // L4 S4: resolve --cross-shard-fast-path once, before any shard spawns.
+    // Rejecting an unknown value here rather than silently defaulting keeps a
+    // typo from quietly costing an SPSC hop per cross-shard read.
+    match config.cross_shard_fast_path.as_str() {
+        "auto" | "on" | "yes" => moon::shard::db_plane::set_cross_shard_fast_path(true),
+        "off" | "no" => moon::shard::db_plane::set_cross_shard_fast_path(false),
+        other => {
+            anyhow::bail!("--cross-shard-fast-path must be one of auto|on|off (got {other:?})");
+        }
+    }
+
     // G1 memory guardrail: resolve --maxmemory before any RuntimeConfig is
     // built so an unset cap is auto-populated (cgroup-aware) and the startup
     // notice prints exactly once.

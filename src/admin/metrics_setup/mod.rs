@@ -318,6 +318,12 @@ static WAL_AGGRESSIVE_RECYCLE_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 // SPSC (when fast-path is off) and writes. INFO exposes the unified total
 // as `total_dispatch_cross_spsc`.
 static DISPATCH_CROSS_READ_SPSC_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// L4 S4: cross-shard reads served on the calling thread under a shared
+/// guard on the owner's database, without an SPSC hop. Published as
+/// `moon_dispatch_path_total{path="cross_read_fast"}` and as
+/// `total_dispatch_cross_read_fast` in INFO -- the name
+/// docs/production-guide.md already documents.
+static DISPATCH_CROSS_READ_FAST_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// moon#513: pipeline batches cut short because a command could not execute
 /// against shards whose earlier writes in the same batch were still pending.
 /// Each increment is one extra dispatch/await boundary — measured at ~57us on

@@ -661,6 +661,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         "total_commands_processed:{}\r\n\
          total_connections_received:{}\r\n\
          total_dispatch_cross_spsc:{}\r\n\
+         total_dispatch_cross_read_fast:{}\r\n\
          total_pipeline_remote_defer:{}\r\n\
          total_pipeline_multikey_fanout:{}\r\n\
          spsc_notify_wakes:{}\r\n\
@@ -670,6 +671,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         crate::admin::metrics_setup::total_commands_processed(),
         crate::admin::metrics_setup::total_connections_received(),
         crate::admin::metrics_setup::total_dispatch_cross_spsc(),
+        crate::admin::metrics_setup::total_dispatch_cross_read_fast(),
         crate::admin::metrics_setup::total_pipeline_remote_defer(),
         crate::admin::metrics_setup::total_pipeline_multikey_fanout(),
         crate::admin::metrics_setup::spsc_notify_wakes(),

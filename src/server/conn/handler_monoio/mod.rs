@@ -3515,18 +3515,102 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     )));
                     continue;
                 }
-                // SHARED-READ FAST PATH: bypass SPSC for cross-shard reads.
-                // Guard: skip if pending writes exist for this target (pipeline ordering).
-                // The fast path can be disabled via --cross-shard-fast-path=off to route
-                // all foreign-shard reads through SPSC (eliminates RwLock contention at
-                // the cost of one extra channel round-trip per read command).
-                // See docs/production-guide.md §Cross-shard fast path.
-                // E2: Cross-shard fast path disabled — ShardSlice is thread-local;
-                // foreign-shard data can only be read via SPSC hop. All cross-shard
-                // reads now route through the SPSC channel below regardless of
-                // is_dispatch_read_supported. The fast path can be re-enabled in a
-                // later wave when the cross-shard snapshot protocol is implemented.
-                // See shardslice-migration TASK.md § C6.
+                // SHARED-READ FAST PATH (L4 S4): serve a foreign shard's read on
+                // THIS thread instead of hopping through SPSC.
+                //
+                // The comment this replaces disabled the path because "ShardSlice
+                // is thread-local; foreign-shard data can only be read via SPSC
+                // hop". The L4 plane removes exactly that blocker: `Database` now
+                // lives behind a per-(shard, db) lock in a process-wide registry,
+                // is `Send + Sync`, and `try_foreign_db_read` takes it with one
+                // CAS and NEVER parks.
+                //
+                // Off by default (`--cross-shard-fast-path off`) until the L4
+                // acceptance run clears it. Every gate below guards a real,
+                // previously-measured failure:
+                //
+                //  * `pending_mask` — if this connection has in-flight remote work
+                //    on `target`, serving the read here lets it overtake the
+                //    connection's OWN earlier write. That is the moon#507/#512
+                //    write-loss class, so we fall through to SPSC and keep order.
+                //  * `single_owner_shard` — a spanning multi-key read executed
+                //    against one slice silently reads the wrong table (moon#592).
+                //    Slotted-only, read straight off `multikey_placement` so this
+                //    cannot drift from the routing decision it mirrors.
+                //  * `!is_multi_key_command` — conservative for v1. Even an
+                //    all-on-one-shard MGET can have SOME keys cold, and the
+                //    hotness probe below only covers the primary key.
+                //  * `db.is_hot` — `dispatch_read` does not consult the cold tier
+                //    (the moon#610 class), so a non-resident key must take the
+                //    SPSC path where the full `dispatch` promotes it.
+                //  * `try_foreign_db_read` returning `None` — the owner holds the
+                //    write lock. Fall through rather than park a foreign thread on
+                //    the owner's guard.
+                if crate::shard::db_plane::cross_shard_fast_path_enabled()
+                    && !metadata::is_write(cmd)
+                    && crate::command::is_dispatch_read_supported(cmd)
+                    && !crate::server::conn::shared::is_multi_key_command(cmd, cmd_args)
+                    && crate::server::conn::shared::single_owner_shard(
+                        cmd,
+                        cmd_args,
+                        ctx.num_shards,
+                    ) == Some(target)
+                    && pending_mask & (1u64 << (target % u64::BITS as usize)) == 0
+                {
+                    let fast_now_ms = ctx.cached_clock.ms();
+                    let fast_db_count = ctx.shard_databases.db_count();
+                    let mut fast_sel = conn.selected_db;
+                    let served =
+                        crate::shard::slice::try_foreign_db_read(target, conn.selected_db, |db| {
+                            let hot = extract_primary_key(cmd, cmd_args)
+                                .is_some_and(|key| db.is_hot(key.as_ref()));
+                            if !hot {
+                                return None;
+                            }
+                            match dispatch_read(
+                                db,
+                                cmd,
+                                cmd_args,
+                                fast_now_ms,
+                                &mut fast_sel,
+                                fast_db_count,
+                            ) {
+                                DispatchResult::Response(f) => Some(f),
+                                // A foreign read cannot be QUIT (keyless, so it
+                                // never routes here). Fall through rather than
+                                // swallow the quit signal if that ever changes.
+                                DispatchResult::Quit(_) => None,
+                            }
+                        })
+                        .flatten();
+                    if let Some(response) = served {
+                        conn.selected_db = fast_sel;
+                        // Post-processing mirrors the LOCAL read path exactly —
+                        // tracking registration, RESP3 shaping, workspace prefix
+                        // stripping. A fast path that skipped any of these would
+                        // answer differently from the slow path it replaces.
+                        if conn.tracking_state.enabled
+                            && !conn.tracking_state.bcast
+                            && !matches!(response, Frame::Error(_))
+                        {
+                            crate::tracking::invalidation::track_read_keys(
+                                &ctx.tracking_table,
+                                cmd,
+                                cmd_args,
+                                client_id,
+                                conn.tracking_state.noloop,
+                            );
+                        }
+                        let mut response =
+                            apply_resp3_conversion(cmd, cmd_args, response, conn.protocol_version);
+                        if let Some(ws_id) = conn.workspace_id.as_ref() {
+                            strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                        }
+                        responses.push(response);
+                        crate::admin::metrics_setup::record_dispatch_cross_read_fast();
+                        continue;
+                    }
+                }
                 // Cross-shard write: deferred SPSC dispatch.
                 // When workspace rewriting occurred, rebuild the frame with
                 // prefixed args so the target shard stores the correct key.

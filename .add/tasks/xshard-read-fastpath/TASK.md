@@ -704,3 +704,49 @@ What did this loop teach the foundation? One line each, tagged by competency
   synchronous spin could serialize pipelined reads") was the exact failure that materialized at verify —
   the pre-named, pre-reasoned risk turned a surprise regression into a targeted batch-depth-gate fix,
   not a redesign (evidence: §3 flag-#1 → VERIFY FINDING #3 → M1 RE-MEASURE).
+
+---
+
+## 8 · SUPERSEDED — D3 revisited by L4 S4 (2026-08-30)
+
+**What changed:** D3 hard-deleted the `--cross-shard-fast-path` surface
+("CHOSEN — breaking, cleanest" vs deprecate, declined) and left
+`tests/xshard_cleanup_shape.rs::dead_fastpath_surface_removed` as a
+`reject removed_flag_referenced` tripwire. That tripwire fired on the L4 S4
+commit, exactly as designed, and the decision was re-opened rather than the
+guard silenced (user decision, 2026-08-30).
+
+**Why the premise no longer holds.** §1 ground truth justified the deletion on
+the storage model:
+
+> the per-shard storage (DashTable/Database) is a plain `&mut self` structure
+> with NO interior concurrency — single-thread `!Send` ownership IS the safety;
+> a foreign lock-free read is storage-impossible in place, so SPSC is the only
+> door and we make IT cheaper, not bypass it.
+
+True as written in June 2026. The L4 shared-read plane changed precisely that
+structure: `Database` now sits behind a per-(shard, db) `RwLock` in a
+`Send + Sync` process-wide registry (`src/shard/db_plane.rs`), with
+`slice::try_foreign_db_read` performing the foreign read under a shared guard —
+one CAS, never parks. "Storage-impossible in place" was a property of the old
+model, not a law; the door D3 reasoned about now exists.
+
+Note the deletion still looks right for its own moment: the surface D3 removed
+was genuinely orphaned (`cross_read_fast_dispatches` hardcoded 0, no consumers),
+and shipping a dead flag is worse than shipping none. The failure D3 did NOT
+catch is that `docs/production-guide.md` kept documenting the flag, an `auto`
+default, three metrics, and a benchmark script — none of which existed. An
+operator following that page got
+`error: unexpected argument '--cross-shard-fast-path' found`. Deleting code
+without deleting the docs that sell it is the reusable lesson here.
+
+**Disposition:**
+- The flag is live again, default `off`, gated on `pending_mask` (moon#507/#512),
+  `multikey_placement` (moon#592), single-key only, hot-only (moon#610), and a
+  non-blocking `try_read`.
+- `dead_fastpath_surface_removed` keeps its five genuinely-orphaned symbols;
+  only `cross_shard_fast_path` was removed from the list.
+- A second pin, `live_fastpath_surface_is_still_wired`, now guards the other
+  direction — a future cleanup that deletes the dispatch site while leaving the
+  flag parsable would re-create the exact defect described above. Both pins were
+  mutation-checked (each made to fail on purpose, then restored).
