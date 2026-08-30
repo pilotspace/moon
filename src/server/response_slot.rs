@@ -9,7 +9,7 @@ use std::cell::UnsafeCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use atomic_waker::AtomicWaker;
@@ -18,6 +18,60 @@ use crate::protocol::Frame;
 
 const EMPTY: u8 = 0;
 const FILLED: u8 = 1;
+
+// ── D1 park instrumentation (moon#416) ──────────────────────────────────
+//
+// `docs/internal/cross-shard-cost-model.md` puts a park at ~24.9 core-us and
+// 85% of p=1 cost, but that figure was INFERRED by fitting a pipeline-depth
+// sweep -- parks were never counted. These count them, because the decision
+// "is cross-connection park batching worth building" turns entirely on two
+// numbers that inference cannot supply: how often an await actually parks,
+// and how many awaits sit parked simultaneously.
+//
+// Relaxed throughout: these are diagnostics, never read for control flow, and
+// an exact total is not worth an ordering constraint on the dispatch path.
+
+/// Every first poll of a cross-shard reply await.
+static REMOTE_AWAITS: AtomicU64 = AtomicU64::new(0);
+/// First polls that found the slot empty and therefore suspended. The reply had
+/// not arrived yet, so this await costs a wake later.
+static REMOTE_AWAITS_PARKED: AtomicU64 = AtomicU64::new(0);
+/// Polls after the first that were STILL pending -- spurious wakes. Counted
+/// apart from parks so they cannot inflate the number D1 is judged on.
+static REMOTE_AWAIT_REPOLLS: AtomicU64 = AtomicU64::new(0);
+/// Awaits currently parked. Signed so an unbalanced decrement shows up as a
+/// negative reading instead of wrapping to ~1.8e19 and looking plausible.
+static REMOTE_PARKED_INFLIGHT: AtomicI64 = AtomicI64::new(0);
+/// Sum of the in-flight depth observed at each park. `sum / parked` is the mean
+/// number of awaits parked at the moment of parking -- i.e. how many parks one
+/// batched wake could have replaced. ~1 means D1 has nothing to batch.
+static REMOTE_PARK_CONCURRENCY_SUM: AtomicU64 = AtomicU64::new(0);
+
+/// Total cross-shard reply awaits (parked or not).
+#[inline]
+pub fn total_remote_awaits() -> u64 {
+    REMOTE_AWAITS.load(Ordering::Relaxed)
+}
+/// Awaits that actually suspended. `parked / awaits` is the park rate.
+#[inline]
+pub fn total_remote_awaits_parked() -> u64 {
+    REMOTE_AWAITS_PARKED.load(Ordering::Relaxed)
+}
+/// Spurious wakes: re-polled while still empty.
+#[inline]
+pub fn total_remote_await_repolls() -> u64 {
+    REMOTE_AWAIT_REPOLLS.load(Ordering::Relaxed)
+}
+/// Awaits parked right now.
+#[inline]
+pub fn remote_parked_inflight() -> i64 {
+    REMOTE_PARKED_INFLIGHT.load(Ordering::Relaxed)
+}
+/// Sum of park-time depth; divide by `total_remote_awaits_parked()` for the mean.
+#[inline]
+pub fn total_remote_park_concurrency_sum() -> u64 {
+    REMOTE_PARK_CONCURRENCY_SUM.load(Ordering::Relaxed)
+}
 
 /// Lock-free single-producer single-consumer response slot.
 ///
@@ -171,13 +225,55 @@ impl Default for ResponseSlot {
 /// panic-unwind cross-shard reply UAF).
 pub struct ResponseSlotFuture {
     slot: Arc<ResponseSlot>,
+    /// False until the first poll, so a re-poll is never charged as a new await.
+    polled: bool,
+    /// True while this await is counted in `REMOTE_PARKED_INFLIGHT`. Drop uses it
+    /// to release the gauge when a future is abandoned mid-park (shutdown break,
+    /// panic-unwind) -- without that the mean depth drifts up forever.
+    parked: bool,
 }
 
 impl Future for ResponseSlotFuture {
     type Output = Vec<Frame>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.slot.poll_take(cx)
+        let this = self.get_mut();
+        let first = !this.polled;
+        this.polled = true;
+        if first {
+            REMOTE_AWAITS.fetch_add(1, Ordering::Relaxed);
+        }
+        match this.slot.poll_take(cx) {
+            Poll::Pending => {
+                if first {
+                    this.parked = true;
+                    REMOTE_AWAITS_PARKED.fetch_add(1, Ordering::Relaxed);
+                    let depth = REMOTE_PARKED_INFLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
+                    REMOTE_PARK_CONCURRENCY_SUM.fetch_add(depth as u64, Ordering::Relaxed);
+                } else {
+                    REMOTE_AWAIT_REPOLLS.fetch_add(1, Ordering::Relaxed);
+                }
+                Poll::Pending
+            }
+            Poll::Ready(data) => {
+                if this.parked {
+                    this.parked = false;
+                    REMOTE_PARKED_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+                }
+                Poll::Ready(data)
+            }
+        }
+    }
+}
+
+impl Drop for ResponseSlotFuture {
+    fn drop(&mut self) {
+        // Abandoned while parked (shutdown break / panic-unwind). Releasing here
+        // keeps the gauge honest; leaking it would make the mean depth -- the one
+        // number D1 is judged on -- climb without bound.
+        if self.parked {
+            REMOTE_PARKED_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -227,6 +323,8 @@ impl ResponseSlotPool {
     pub fn future_for(&self, target_shard: usize) -> ResponseSlotFuture {
         ResponseSlotFuture {
             slot: Arc::clone(&self.slots[target_shard]),
+            polled: false,
+            parked: false,
         }
     }
 }
@@ -236,6 +334,109 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use std::task::{Context, Poll};
+
+    /// The park counters are process-global and `cargo test` runs these in
+    /// threads, so the two tests below would read each other's increments and
+    /// fail on exact deltas. Serialise them rather than loosening the
+    /// assertions -- an exact delta is the whole point of a counter test.
+    static PARK_COUNTERS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// D1 instrumentation (moon#416). The cost model says a park costs ~24.9
+    /// core-us and is 85% of p=1 cost, but "parks" was INFERRED from a pipeline
+    /// sweep, never counted. These pin the counter's meaning:
+    ///
+    ///   * a slot already filled when first polled did NOT park -- the reply beat
+    ///     the await, which is the outcome D1 is trying to manufacture;
+    ///   * a slot empty when first polled DID park;
+    ///   * re-polls after a park are spurious wakes, counted separately, because
+    ///     charging them as parks would inflate the very number D1 is judged on.
+    #[test]
+    fn a_filled_slot_does_not_park_and_an_empty_one_does() {
+        let _serialised = PARK_COUNTERS.lock();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let a0 = total_remote_awaits();
+        let p0 = total_remote_awaits_parked();
+
+        // Reply already present: an await, but NOT a park.
+        let pool = ResponseSlotPool::new(2, 0);
+        pool.slot_for(1).fill(vec![Frame::Integer(1)]);
+        let mut ready = pool.future_for(1);
+        assert!(matches!(Pin::new(&mut ready).poll(&mut cx), Poll::Ready(_)));
+        assert_eq!(
+            total_remote_awaits() - a0,
+            1,
+            "every first poll is one await"
+        );
+        assert_eq!(
+            total_remote_awaits_parked() - p0,
+            0,
+            "a slot filled before the first poll must NOT be charged as a park"
+        );
+
+        // Slot empty: this is a park.
+        let mut pending = pool.future_for(1);
+        assert!(matches!(
+            Pin::new(&mut pending).poll(&mut cx),
+            Poll::Pending
+        ));
+        assert_eq!(total_remote_awaits() - a0, 2);
+        assert_eq!(total_remote_awaits_parked() - p0, 1, "an empty slot parks");
+
+        // A spurious re-poll while still empty is NOT a second park.
+        assert!(matches!(
+            Pin::new(&mut pending).poll(&mut cx),
+            Poll::Pending
+        ));
+        assert_eq!(
+            total_remote_awaits_parked() - p0,
+            1,
+            "re-polling a parked await must not double-count the park"
+        );
+    }
+
+    /// The number D1 lives or dies on: how many awaits are parked at the same
+    /// time. If it is ~1 there is nothing to batch and D1 is worthless; if it is
+    /// ~N there are N parks where physics needs one.
+    #[test]
+    fn concurrency_sum_tracks_simultaneously_parked_awaits() {
+        let _serialised = PARK_COUNTERS.lock();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let pool = ResponseSlotPool::new(4, 0);
+
+        let p0 = total_remote_awaits_parked();
+        let s0 = total_remote_park_concurrency_sum();
+
+        // Park three awaits on three different targets, all outstanding at once.
+        let mut f1 = pool.future_for(1);
+        let mut f2 = pool.future_for(2);
+        let mut f3 = pool.future_for(3);
+        assert!(matches!(Pin::new(&mut f1).poll(&mut cx), Poll::Pending));
+        assert!(matches!(Pin::new(&mut f2).poll(&mut cx), Poll::Pending));
+        assert!(matches!(Pin::new(&mut f3).poll(&mut cx), Poll::Pending));
+
+        assert_eq!(total_remote_awaits_parked() - p0, 3);
+        // Observed depth at each park: 1, then 2, then 3.
+        assert_eq!(
+            total_remote_park_concurrency_sum() - s0,
+            6,
+            "sum of in-flight depth at park time must be 1+2+3"
+        );
+
+        // Completing them must release the in-flight count, or the mean drifts up
+        // forever and the metric becomes fiction.
+        for (f, t) in [(&mut f1, 1usize), (&mut f2, 2), (&mut f3, 3)] {
+            pool.slot_for(t).fill(vec![Frame::Integer(t as i64)]);
+            assert!(matches!(Pin::new(f).poll(&mut cx), Poll::Ready(_)));
+        }
+        assert_eq!(
+            remote_parked_inflight(),
+            0,
+            "every completed await must decrement the in-flight gauge"
+        );
+    }
 
     #[test]
     fn test_fill_then_poll_take_single_frame() {
