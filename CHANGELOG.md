@@ -22,8 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server. The L4 plane removes the stated blocker, so this implements the flag under the
   documented name and corrects the section to match what ships.
 
-  **Default `off`** until the L4 acceptance run clears it. The path also declines, falling
-  back to SPSC, whenever:
+  **Default `off`.** Acceptance, two-box GCE ARM, same binary flag off-vs-on, ABBA-ordered,
+  n=10 reps/cell: at `--shards 8` pipeline 1, **−8.61% server CPU/op** (95% CI −11.55 …
+  −5.67) and **+12.03% throughput**, cheaper in 10 of 10 reps (sign test p=0.002), with
+  50.5% of reads served in place. The `--shards 1` negative control — where every read is
+  already local — fires the path 0.0% of the time and shows −0.05% (CI −0.82 … +0.72), as
+  it must. At pipeline 16 the effect is not measurable at this n and the enabled leg's
+  variance doubles rather than shifting, which is why the default stays off.
+
+  The path also declines, falling back to SPSC, whenever:
 
   - the connection has in-flight remote work on that shard (read-your-own-writes, moon#507
     / moon#512);

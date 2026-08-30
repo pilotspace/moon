@@ -717,7 +717,30 @@ channel or serve it in place under a shared read guard on the owner's database.
 | `off` (**default**) | Route the read through the SPSC channel, exactly like a write. One extra channel round-trip per read. |
 | `auto` / `on` | Serve the read on the receiving thread under a shared guard on the owner's database. No hop, no park — one CAS. Falls back to SPSC whenever any gate below declines. |
 
-The default is `off` while the L4 acceptance run is outstanding. Turn it on deliberately.
+The default is `off`. Turn it on deliberately, and only for the workload shape it was
+measured on.
+
+#### What it was measured to do
+
+Two-box GCE ARM (`t2a-standard-8` server, dedicated load generator), the same binary with
+the flag off vs on, ABBA-ordered, n=10 reps per cell, server-side CPU/op from
+`/proc/<pid>/stat`:
+
+| cell | CPU/op | 95% CI | throughput | reps cheaper | p | reads served in place |
+|---|---|---|---|---|---|---|
+| `--shards 1`, p=1 | −0.05% | −0.82 … +0.72 | +0.07% | 4/10 | 0.75 | 0.0% |
+| `--shards 8`, p=1 | **−8.61%** | −11.55 … −5.67 | **+12.03%** | 10/10 | **0.002** | 50.5% |
+| `--shards 8`, p=16 | +6.46% | −10.05 … +22.98 | +6.71% | 4/10 | 0.75 | 30.3% |
+
+The `--shards 1` row is the negative control, not a result: every read there is already
+local, so the path fires 0.0% of the time and must show nothing. It doesn't. That is what
+makes the `--shards 8` row credible.
+
+**The default is `off` because of the p=16 row, not because of doubt about p=1.** At depth
+16 the effect is not measurable at n=10, and the enabled leg's run-to-run variance roughly
+doubles (sd 1.24 vs 0.55 µs/op) instead of shifting — a contention signature rather than a
+uniform regression. Until that is understood, enable it for shallow-pipeline, multi-shard
+read workloads and measure your own before trusting it deeper.
 
 #### What the fast path declines
 

@@ -750,3 +750,39 @@ without deleting the docs that sell it is the reusable lesson here.
   direction — a future cleanup that deletes the dispatch site while leaving the
   flag parsable would re-create the exact defect described above. Both pins were
   mutation-checked (each made to fail on purpose, then restored).
+
+## 9. S4 acceptance matrix (2026-08-30)
+
+Raw data: `abba_s4_acceptance.csv` (120 legs, 0 failed).
+
+Rig: two-box GCE ARM — server on `moon-bench-arm` (t2a-standard-8), load
+generator on `moon-bench-x86`. Same binary both legs, toggled only by
+`--cross-shard-fast-path`. ABBA slot order (off, on, on, off) so linear drift
+cancels within each rep; the fixed-order matrix that preceded this showed a
+control binary drifting +1.22% purely for running last.
+
+| cell | CPU/op | 95% CI | rps | sign | p | fast% |
+|---|---|---|---|---|---|---|
+| s1 p1 | −0.05% | −0.82..+0.72 | +0.07% | 4/10 | 0.75 | 0.0% |
+| s8 p1 | −8.61% | −11.55..−5.67 | +12.03% | 10/10 | 0.0020 | 50.5% |
+| s8 p16 | +6.46% | −10.05..+22.98 | +6.71% | 4/10 | 0.75 | 30.3% |
+
+**s1 is the negative control and it passes**: the path fires 0.0% of the time
+where no read is foreign, and CPU/op's CI straddles zero. A win there would
+have invalidated the s8 row.
+
+**Decision: default stays `off`**, driven by s8 p16 rather than by any doubt
+about s8 p1. At depth 16 the enabled leg's variance doubles (sd 1.24 vs 0.55,
+max 7.55 vs 5.23) instead of shifting — contention, not uniform regression.
+
+Two open questions, both with real headroom, neither answered here:
+
+1. **Capture is only ~58% of eligible reads at p1** — 50.5% of all reads when
+   7/8 are foreign. No confirmed explanation. If recoverable, the p1 win is
+   roughly 1.7x larger than measured.
+2. **Capture falls to 30.3% at p16.** Hypothesis (untested): `pending_mask`
+   declines the fast path on any in-flight remote work for a target, so within
+   a pipelined batch one decline poisons every later command for that shard.
+   Narrowing the guard to writes only would raise capture substantially — but
+   that is precisely the moon#507/#512 silent-write-loss surface, so it needs
+   its own red test before anyone touches it.
