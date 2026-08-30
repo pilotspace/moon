@@ -717,6 +717,12 @@ channel or serve it in place under a shared read guard on the owner's database.
 | `off` (**default**) | Route the read through the SPSC channel, exactly like a write. One extra channel round-trip per read. |
 | `auto` / `on` | Serve the read on the receiving thread under a shared guard on the owner's database. No hop, no park — one CAS. Falls back to SPSC whenever any gate below declines. |
 
+> **monoio only.** The dispatch site is in the monoio connection handler — the runtime
+> that ships on Linux and macOS. A build using `--features runtime-tokio` accepts the flag
+> but ignores it: cross-shard reads still take the SPSC hop and
+> `total_dispatch_cross_read_fast` stays at 0. The server logs a warning at startup when
+> the flag is enabled on that runtime.
+
 The default is `off`. Turn it on deliberately, and only for the workload shape it was
 measured on.
 

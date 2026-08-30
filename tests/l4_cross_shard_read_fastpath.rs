@@ -18,6 +18,14 @@
 //!
 //! `--shards 4`, and the keys are plain `k:N` so they scatter across all four:
 //! with one connection pinned to one shard, ~3/4 of the reads are foreign.
+//!
+//! **monoio only.** The fast path is implemented in `handler_monoio`, the
+//! runtime that ships; `handler_sharded` (the tokio leg) still routes every
+//! cross-shard read through SPSC. Left ungated, test 1 fails on tokio — the
+//! counter cannot move — and tests 2 and 3 would pass *vacuously*, which is
+//! worse than skipping: they would report the ordering guard as verified on a
+//! runtime where the path they guard never executes. The tokio twin is S5.
+#![cfg(not(feature = "runtime-tokio"))]
 
 mod common;
 
