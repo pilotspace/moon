@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Ordinary keyspace commands skip the connection handler's name-dependent intercept
+  gates.** Every command walked 26 gates before dispatch; only six carried a `cmd_len`
+  pre-guard and twelve are `async fn`s whose futures were built and polled purely to
+  return `false`. `CommandFlags::NO_INTERCEPT` (free bit 14 of the existing `u16`) is
+  read from the same `COMMAND_META` entry the arity check already consults, and replaces
+  21 of those gate calls with one bit test. The gates and their **order are unchanged** —
+  the ordering comments in `handler_monoio/mod.rs` record real bugs (ACL above privileged
+  intercepts, workspace rewrite above key-readers, MULTI queue below ACL), and reordering
+  to save a branch would re-open them. The four *state* gates (ACL, cluster routing,
+  readonly, disk-full) apply to every command regardless of name and are deliberately not
+  guarded. The flag's sense is inverted on purpose: unmarked means "take the slow path",
+  so adding a command or an intercept can cost throughput but never correctness.
+  `tests/intercept_flag_drift.rs` guards the other direction and was verified to FAIL when
+  `WAIT` is marked. Expected recovery is ~3-5% of cycles on non-inlined commands; it does
+  not close the 0.43x deficit recorded in BENCHMARK.md §2.12.
+
 ### Documentation
 
 - **First Moon-vs-Redis benchmark since v0.6.0, and it corrects the headline framing.**
