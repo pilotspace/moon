@@ -2514,7 +2514,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             };
                             let mut sel_db = conn.selected_db;
                             let reply =
-                                crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                                crate::shard::slice::with_shard_db_read(conn.selected_db, |db| {
                                     match dispatch_read(
                                         db,
                                         cmd,
@@ -2775,13 +2775,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let response = match ksmv::parse_move_args(cmd_args, db_count) {
                         Err(e) => e,
                         Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
+                        // L4: `with_pair` is the exact contract
+                        // `with_two_slice_dbs` had — asserts the indexes
+                        // differ (the `dst_db == src_db` arm above
+                        // short-circuits), panics out of range, acquires
+                        // ascending, hands the closure (src, dst).
                         Ok((key, dst_db)) => crate::shard::slice::with_shard(|s| {
-                            ksmv::with_two_slice_dbs(
-                                &mut s.databases,
-                                src_db,
-                                dst_db,
-                                |src, dst| ksmv::move_core(src, dst, &key),
-                            )
+                            s.databases.with_pair(src_db, dst_db, |src, dst| {
+                                ksmv::move_core(src, dst, &key)
+                            })
                         }),
                     };
                     // AOF only on actual success (:1). Matches handler_single.
@@ -2856,21 +2858,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                         let response = match copy_result {
                             Err(e) => e,
+                            // L4: see the MOVE arm. `parse_copy_db_args`
+                            // returns `None` for a same-db COPY (falls
+                            // through to the plain write path), so
+                            // `ca.dst_db != src_db` holds here and
+                            // `with_pair`'s distinct-db assert cannot fire.
                             Ok(ca) => crate::shard::slice::with_shard(|s| {
-                                ksmv::with_two_slice_dbs(
-                                    &mut s.databases,
-                                    src_db,
-                                    ca.dst_db,
-                                    |src, dst| {
-                                        ksmv::copy_core(
-                                            src,
-                                            dst,
-                                            &ca.src_key,
-                                            &ca.dst_key,
-                                            ca.replace,
-                                        )
-                                    },
-                                )
+                                s.databases.with_pair(src_db, ca.dst_db, |src, dst| {
+                                    ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
+                                })
                             }),
                         };
                         // AOF only on actual success (:1). Matches handler_single
@@ -2947,7 +2943,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         Frame,
                     > = crate::shard::slice::with_shard(|s| {
                         let sel_db = conn.selected_db;
-                        let db = &mut s.databases[sel_db];
+                        // L4: one exclusive guard for the whole eviction +
+                        // undo-capture + dispatch span — the same span the
+                        // `&mut s.databases[sel_db]` borrow covered. It is
+                        // dropped explicitly right after `dispatch` so the
+                        // index hooks below (which re-enter `s` whole, and
+                        // may take their own guard on this db) never see a
+                        // guard already held on this thread.
+                        let mut db_guard = s.databases.write(sel_db);
+                        let db = &mut *db_guard;
 
                         if batch_eviction_active {
                             run_write_eviction_gate(ctx, db, sel_db, cmd)?;
@@ -3030,6 +3034,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // Dispatch
                         let mut new_sel_db = sel_db;
                         let result = dispatch(db, cmd, cmd_args, &mut new_sel_db, db_count);
+                        // L4: end of the keyspace mutation. Everything below
+                        // touches the index stores or re-enters `s`, so the
+                        // guard must not outlive this point.
+                        drop(db_guard);
                         let response_frame = match &result {
                             DispatchResult::Response(f) | DispatchResult::Quit(f) => f.clone(),
                         };
@@ -3097,10 +3105,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             // while their keys stay — the inconsistency that
                             // made the bug findable.
                             if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
-                                crate::command::server_admin::flush_every_database(
-                                    &mut s.databases,
-                                    sel_db,
-                                );
+                                // L4: every db under one ascending guard set,
+                                // released on return — the cross-db atomicity
+                                // the `&mut [Database]` walk had, preserved
+                                // against a concurrent foreign reader.
+                                s.databases.with_all(|dbs| {
+                                    crate::command::server_admin::flush_every_database(dbs, sel_db);
+                                });
                             }
                             crate::shard::spsc_handler::auto_flush_indexes(
                                 &mut s.vector_store,
@@ -3120,9 +3131,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             // a key THIS shard owns was never woken by a local
                             // write — while the same XADD arriving over SPSC
                             // woke it. Routing-dependent, so it read as a flake.
+                            // L4: fresh guard on the POST-dispatch db (a
+                            // queued SELECT may have moved it). The write-path
+                            // guard above was dropped after `dispatch`, so
+                            // this cannot be a recursive acquisition even when
+                            // `new_sel_db == sel_db`.
+                            let mut wake_guard = s.databases.write(new_sel_db);
                             crate::blocking::wakeup::wake_producer(
                                 &ctx.blocking_registry,
-                                &mut s.databases[new_sel_db],
+                                &mut wake_guard,
                                 new_sel_db,
                                 cmd,
                                 cmd_args,
@@ -3424,7 +3441,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let sample_latency = (conn.cmd_counter & 0xF) == 0;
                     let dispatch_start = sample_latency.then(std::time::Instant::now);
                     let mut sel_db = conn.selected_db;
-                    let result = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                    let result = crate::shard::slice::with_shard_db_read(conn.selected_db, |db| {
                         dispatch_read(db, cmd, cmd_args, now_ms, &mut sel_db, db_count)
                     });
                     let new_read_selected_db = sel_db;
@@ -3498,18 +3515,102 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     )));
                     continue;
                 }
-                // SHARED-READ FAST PATH: bypass SPSC for cross-shard reads.
-                // Guard: skip if pending writes exist for this target (pipeline ordering).
-                // The fast path can be disabled via --cross-shard-fast-path=off to route
-                // all foreign-shard reads through SPSC (eliminates RwLock contention at
-                // the cost of one extra channel round-trip per read command).
-                // See docs/production-guide.md §Cross-shard fast path.
-                // E2: Cross-shard fast path disabled — ShardSlice is thread-local;
-                // foreign-shard data can only be read via SPSC hop. All cross-shard
-                // reads now route through the SPSC channel below regardless of
-                // is_dispatch_read_supported. The fast path can be re-enabled in a
-                // later wave when the cross-shard snapshot protocol is implemented.
-                // See shardslice-migration TASK.md § C6.
+                // SHARED-READ FAST PATH (L4 S4): serve a foreign shard's read on
+                // THIS thread instead of hopping through SPSC.
+                //
+                // The comment this replaces disabled the path because "ShardSlice
+                // is thread-local; foreign-shard data can only be read via SPSC
+                // hop". The L4 plane removes exactly that blocker: `Database` now
+                // lives behind a per-(shard, db) lock in a process-wide registry,
+                // is `Send + Sync`, and `try_foreign_db_read` takes it with one
+                // CAS and NEVER parks.
+                //
+                // Off by default (`--cross-shard-fast-path off`) until the L4
+                // acceptance run clears it. Every gate below guards a real,
+                // previously-measured failure:
+                //
+                //  * `pending_mask` — if this connection has in-flight remote work
+                //    on `target`, serving the read here lets it overtake the
+                //    connection's OWN earlier write. That is the moon#507/#512
+                //    write-loss class, so we fall through to SPSC and keep order.
+                //  * `single_owner_shard` — a spanning multi-key read executed
+                //    against one slice silently reads the wrong table (moon#592).
+                //    Slotted-only, read straight off `multikey_placement` so this
+                //    cannot drift from the routing decision it mirrors.
+                //  * `!is_multi_key_command` — conservative for v1. Even an
+                //    all-on-one-shard MGET can have SOME keys cold, and the
+                //    hotness probe below only covers the primary key.
+                //  * `db.is_hot` — `dispatch_read` does not consult the cold tier
+                //    (the moon#610 class), so a non-resident key must take the
+                //    SPSC path where the full `dispatch` promotes it.
+                //  * `try_foreign_db_read` returning `None` — the owner holds the
+                //    write lock. Fall through rather than park a foreign thread on
+                //    the owner's guard.
+                if crate::shard::db_plane::cross_shard_fast_path_enabled()
+                    && !metadata::is_write(cmd)
+                    && crate::command::is_dispatch_read_supported(cmd)
+                    && !crate::server::conn::shared::is_multi_key_command(cmd, cmd_args)
+                    && crate::server::conn::shared::single_owner_shard(
+                        cmd,
+                        cmd_args,
+                        ctx.num_shards,
+                    ) == Some(target)
+                    && pending_mask & (1u64 << (target % u64::BITS as usize)) == 0
+                {
+                    let fast_now_ms = ctx.cached_clock.ms();
+                    let fast_db_count = ctx.shard_databases.db_count();
+                    let mut fast_sel = conn.selected_db;
+                    let served =
+                        crate::shard::slice::try_foreign_db_read(target, conn.selected_db, |db| {
+                            let hot = extract_primary_key(cmd, cmd_args)
+                                .is_some_and(|key| db.is_hot(key.as_ref()));
+                            if !hot {
+                                return None;
+                            }
+                            match dispatch_read(
+                                db,
+                                cmd,
+                                cmd_args,
+                                fast_now_ms,
+                                &mut fast_sel,
+                                fast_db_count,
+                            ) {
+                                DispatchResult::Response(f) => Some(f),
+                                // A foreign read cannot be QUIT (keyless, so it
+                                // never routes here). Fall through rather than
+                                // swallow the quit signal if that ever changes.
+                                DispatchResult::Quit(_) => None,
+                            }
+                        })
+                        .flatten();
+                    if let Some(response) = served {
+                        conn.selected_db = fast_sel;
+                        // Post-processing mirrors the LOCAL read path exactly —
+                        // tracking registration, RESP3 shaping, workspace prefix
+                        // stripping. A fast path that skipped any of these would
+                        // answer differently from the slow path it replaces.
+                        if conn.tracking_state.enabled
+                            && !conn.tracking_state.bcast
+                            && !matches!(response, Frame::Error(_))
+                        {
+                            crate::tracking::invalidation::track_read_keys(
+                                &ctx.tracking_table,
+                                cmd,
+                                cmd_args,
+                                client_id,
+                                conn.tracking_state.noloop,
+                            );
+                        }
+                        let mut response =
+                            apply_resp3_conversion(cmd, cmd_args, response, conn.protocol_version);
+                        if let Some(ws_id) = conn.workspace_id.as_ref() {
+                            strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                        }
+                        responses.push(response);
+                        crate::admin::metrics_setup::record_dispatch_cross_read_fast();
+                        continue;
+                    }
+                }
                 // Cross-shard write: deferred SPSC dispatch.
                 // When workspace rewriting occurred, rebuild the frame with
                 // prefixed args so the target shard stores the correct key.

@@ -88,6 +88,7 @@ async fn start_mq_server(num_shards: usize) -> (u16, CancellationToken) {
         tls_key_file: None,
         tls_ca_cert_file: None,
         tls_ciphersuites: None,
+        cross_shard_fast_path: "off".to_string(),
         disk_offload: "disable".to_string(),
         disk_offload_dir: None,
         disk_offload_threshold: 0.85,

@@ -148,6 +148,14 @@ jobs:
         run: cargo clippy --features graph -- -D warnings
       - name: Clippy (tokio)
         run: cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings
+      # `handler_sharded` is cfg(runtime-tokio), so the default/graph legs above
+      # never compile it; the tokio leg drops `text-index`, so it never compiles
+      # the parts of it behind that cfg. Their INTERSECTION was covered by no
+      # gate at all. Measured 2026-08-29: a deliberate type error at
+      # `handler_sharded/ft.rs:498` left both the default and tokio legs
+      # reporting zero errors — only this combination caught it.
+      - name: Clippy (tokio + text-index)
+        run: cargo clippy --no-default-features --features runtime-tokio,jemalloc,text-index -- -D warnings
 
       # Test — reuses .rlib artifacts from clippy's check compilation above.
       # Only the test harness + test binaries need building (incremental).

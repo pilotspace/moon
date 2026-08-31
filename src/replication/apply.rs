@@ -309,7 +309,7 @@ pub(crate) fn apply_local(
         };
     }
     let result = crate::shard::slice::try_with_shard(|s| -> bool {
-        let db_count = s.databases.len();
+        let db_count = s.databases.db_count();
         if db_count == 0 {
             return true;
         }
@@ -374,7 +374,7 @@ pub(crate) fn apply_local(
         // level") and `warn_on_error` only logs — so without this intercept
         // every streamed SWAPDB silently no-ops on the replica.
         if cmd.eq_ignore_ascii_case(b"SWAPDB") {
-            apply_swapdb(cmd, args, &mut s.databases);
+            apply_swapdb(cmd, args, &s.databases);
             return true;
         }
 
@@ -385,7 +385,7 @@ pub(crate) fn apply_local(
         // intercept here. A replica never evicts on apply (it follows the
         // master), so the destination-db eviction gate is skipped.
         if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
-            if let Some(resp) = apply_two_db(cmd, args, &mut s.databases, db_idx, db_count) {
+            if let Some(resp) = apply_two_db(cmd, args, &s.databases, db_idx, db_count) {
                 warn_on_error(cmd, &resp);
                 return true;
             }
@@ -393,13 +393,16 @@ pub(crate) fn apply_local(
         }
 
         let resp = {
-            let db = &mut s.databases[db_idx];
+            // Guard scoped to the dispatch alone — dropped before the
+            // index-parity hooks below, which take their own guards (a second
+            // guard on this db from inside this block would panic).
+            let mut db = s.databases.write(db_idx);
             // Replica applies off the shard's periodic clock tick; refresh
             // directly so command-relative expiries (EXPIRE/SETEX) compute
             // against real time.
             db.refresh_now();
             let mut selected = db_idx;
-            match cmd_dispatch(db, cmd, args, &mut selected, db_count) {
+            match cmd_dispatch(&mut db, cmd, args, &mut selected, db_count) {
                 DispatchResult::Response(f) | DispatchResult::Quit(f) => f,
             }
         };
@@ -486,16 +489,21 @@ fn apply_ws_drop(
     }
     let prefix = format!("{{{}}}:", id.as_hex());
     let prefix_bytes = prefix.into_bytes();
-    for db in s.databases.iter_mut() {
-        let keys_to_delete: Vec<Vec<u8>> = db
-            .keys()
-            .filter(|k| k.as_bytes().starts_with(&prefix_bytes[..]))
-            .map(|k| k.as_bytes().to_vec())
-            .collect();
-        for key in &keys_to_delete {
-            db.remove(key);
+    // Every db exclusively guarded for the whole sweep: dropping a workspace
+    // must not be observable half-done (db 0 swept, db 7 not), which is the
+    // atomicity this loop had for free while the slice was single-threaded.
+    s.databases.with_all(|dbs| {
+        for db in dbs.iter_mut() {
+            let keys_to_delete: Vec<Vec<u8>> = db
+                .keys()
+                .filter(|k| k.as_bytes().starts_with(&prefix_bytes[..]))
+                .map(|k| k.as_bytes().to_vec())
+                .collect();
+            for key in &keys_to_delete {
+                db.remove(key);
+            }
         }
-    }
+    });
     true
 }
 
@@ -515,10 +523,14 @@ fn apply_ft(
     if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
         ft_create::ft_create(&mut s.vector_store, &mut s.text_store, args, db_index)
     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
+        // `try_write` keeps `get_mut`'s out-of-range-is-None contract: a
+        // replica with fewer dbs than the master drops the index definition
+        // without a keyspace sweep, exactly as before.
+        let mut db_guard = s.databases.try_write(db_idx);
         ft_admin::ft_dropindex(
             &mut s.vector_store,
             &mut s.text_store,
-            s.databases.get_mut(db_idx),
+            db_guard.as_deref_mut(),
             args,
             db_index,
         )
@@ -599,7 +611,7 @@ fn apply_mq(s: &mut crate::shard::slice::ShardSlice, cmd: &[u8], args: &[Frame])
     // queue but never create the stream, and PUSH/POP/ACK would be dropped.
     // (Boot-time WAL replay never needs this — a shard replays its OWN
     // records, whose db indices are valid by construction.)
-    let db_count = s.databases.len();
+    let db_count = s.databases.db_count();
     fn clamp_mq_db(db_count: usize, db_index: u32) -> usize {
         let idx = (db_index as usize).min(db_count.saturating_sub(1));
         if idx != db_index as usize {
@@ -778,7 +790,11 @@ fn apply_index_parity_hooks(
         // divergence in fifteen databases, invisible until someone SELECTs
         // one of them.
         if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
-            crate::command::server_admin::flush_every_database(&mut s.databases, db_index as usize);
+            // moon#677 atomicity: all 16 dbs guarded together, so no reader
+            // can observe a partially-flushed keyspace.
+            s.databases.with_all(|dbs| {
+                crate::command::server_admin::flush_every_database(dbs, db_index as usize);
+            });
         }
         hooks::auto_flush_indexes(
             &mut s.vector_store,
@@ -806,33 +822,34 @@ fn warn_on_error(cmd: &[u8], resp: &Frame) {
 }
 
 /// Apply a streamed `SWAPDB a b` (#386) against the replica's full database
-/// slice — same slice-split swap as the WAL replay intercept
-/// (`persistence/replay.rs`). Out-of-range / same-index / malformed args skip
-/// with a warn: the replica must never poison its stream over an index the
-/// master accepted (e.g. a replica configured with fewer `--databases`), it
-/// just can't honor it.
-fn apply_swapdb(cmd: &[u8], args: &[Frame], databases: &mut [crate::storage::Database]) {
+/// set — `ShardDbSet::swap` exchanges the two databases' CONTENTS under an
+/// ascending-ordered pair of write guards, which is the same atomic
+/// two-database exchange the slice-split swap gave while the slice was
+/// single-threaded (and what the WAL replay intercept in
+/// `persistence/replay.rs` does). Out-of-range / same-index / malformed args
+/// skip with a warn: the replica must never poison its stream over an index
+/// the master accepted (e.g. a replica configured with fewer `--databases`),
+/// it just can't honor it.
+fn apply_swapdb(cmd: &[u8], args: &[Frame], databases: &crate::shard::db_plane::ShardDbSet) {
     let parse_idx = |f: &Frame| match f {
         Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse::<usize>().ok(),
         Frame::Integer(n) => usize::try_from(*n).ok(),
         _ => None,
     };
+    let db_count = databases.db_count();
     match (
         args.first().and_then(parse_idx),
         args.get(1).and_then(parse_idx),
     ) {
-        (Some(a), Some(b)) if a != b && a < databases.len() && b < databases.len() => {
-            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-            // Split the slice to get two non-overlapping mutable references.
-            let (left, right) = databases.split_at_mut(lo + 1);
-            std::mem::swap(&mut left[lo], &mut right[hi - lo - 1]);
+        (Some(a), Some(b)) if a != b && a < db_count && b < db_count => {
+            databases.swap(a, b);
         }
         (Some(a), Some(b)) if a == b => {} // same-index: no-op, matches Redis
         _ => {
             tracing::warn!(
                 "replication apply: skipping {} with unusable args (out of range for {} local dbs)",
                 String::from_utf8_lossy(cmd),
-                databases.len()
+                db_count
             );
         }
     }
@@ -845,17 +862,21 @@ fn apply_swapdb(cmd: &[u8], args: &[Frame], databases: &mut [crate::storage::Dat
 fn apply_two_db(
     cmd: &[u8],
     args: &[Frame],
-    databases: &mut [crate::storage::Database],
+    databases: &crate::shard::db_plane::ShardDbSet,
     db_idx: usize,
     db_count: usize,
 ) -> Option<Frame> {
     use crate::command::keyspace::move_cmd as ksmv;
 
+    // `with_pair` replaces `ksmv::with_two_slice_dbs`: same distinct-index and
+    // in-range preconditions (both assert/panic otherwise), same closure
+    // argument order, and it holds BOTH write guards for the whole move/copy
+    // so the two-database mutation stays atomic to any observer.
     if cmd.eq_ignore_ascii_case(b"MOVE") {
         let resp = match ksmv::parse_move_args(args, db_count) {
             Err(e) => e,
             Ok((_key, dst)) if dst == db_idx => Frame::Integer(0),
-            Ok((key, dst)) => ksmv::with_two_slice_dbs(databases, db_idx, dst, |src, dstdb| {
+            Ok((key, dst)) => databases.with_pair(db_idx, dst, |src, dstdb| {
                 src.refresh_now();
                 dstdb.refresh_now();
                 ksmv::move_core(src, dstdb, &key)
@@ -868,7 +889,7 @@ fn apply_two_db(
     let copy_result = ksmv::parse_copy_db_args(args, db_idx, db_count)?;
     let resp = match copy_result {
         Err(e) => e,
-        Ok(ca) => ksmv::with_two_slice_dbs(databases, db_idx, ca.dst_db, |src, dst| {
+        Ok(ca) => databases.with_pair(db_idx, ca.dst_db, |src, dst| {
             src.refresh_now();
             dst.refresh_now();
             ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
@@ -909,10 +930,18 @@ pub(crate) fn load_snapshot(
     // entry PER shard.
     let mq_blobs = redis_rdb::read_moon_aux_all(rdb, redis_rdb::MOON_AUX_MQ_REGISTRY);
     let result: anyhow::Result<usize> = match crate::shard::slice::try_with_shard(|s| {
-        for db in s.databases.iter_mut() {
-            db.clear();
-        }
-        let loaded = redis_rdb::load_rdb(&mut s.databases, rdb)?;
+        // Clear-then-load under ONE batch of write guards on every database:
+        // a full resync replaces the whole keyspace atomically, so no reader
+        // may observe the window where the old contents are gone and the new
+        // ones are not yet in. That window did not exist while the slice was
+        // single-threaded; splitting this into two `with_all` calls would
+        // create it.
+        let loaded = s.databases.with_all(|dbs| {
+            for db in dbs.iter_mut() {
+                db.clear();
+            }
+            redis_rdb::load_rdb(dbs, rdb)
+        })?;
         install_snapshot_index_defs(s, vec_defs.as_deref(), text_defs.as_deref());
         // v0.7 graph replication: install the master's whole graph store
         // (authoritative replace — an EMPTY blob drops replica-local graphs;
@@ -1159,7 +1188,7 @@ fn install_snapshot_index_defs(
     if prefixes.is_empty() {
         return;
     }
-    let db_count = s.databases.len();
+    let db_count = s.databases.db_count();
     let mut backfilled = 0usize;
     for db_idx in 0..db_count {
         let wanted: Vec<&bytes::Bytes> = prefixes
@@ -1170,9 +1199,13 @@ fn install_snapshot_index_defs(
         if wanted.is_empty() {
             continue;
         }
-        let matching = collect_matching_hash_args(&s.databases[db_idx], |key| {
-            wanted.iter().any(|p| key.starts_with(&p[..]))
-        });
+        // Shared guard, scoped to the scan only: `collect_matching_hash_args`
+        // returns owned data, so the guard is released before the
+        // `auto_index_hset_public` loop below (which must not hold one).
+        let matching = {
+            let db = s.databases.read(db_idx);
+            collect_matching_hash_args(&db, |key| wanted.iter().any(|p| key.starts_with(&p[..])))
+        };
         for (key, args) in &matching {
             let _ = crate::shard::spsc_handler::auto_index_hset_public(
                 &mut s.vector_store,
@@ -1553,54 +1586,73 @@ mod tests {
             .collect()
     }
 
+    /// The same markers, behind a `ShardDbSet` — `build_sets` constructs the
+    /// per-shard set WITHOUT touching the process-wide registry `OnceLock`, so
+    /// these tests stay independent of every other test in the binary.
+    fn db_set_with_markers(n: usize) -> std::sync::Arc<crate::shard::db_plane::ShardDbSet> {
+        let sets = crate::shard::db_plane::build_sets(vec![dbs_with_markers(n)]);
+        std::sync::Arc::clone(&sets[0])
+    }
+
     fn has_marker(db: &mut crate::storage::Database, origin: usize) -> bool {
         db.get(format!("marker:{origin}").as_bytes()).is_some()
     }
 
+    /// One guard at a time — the re-entrancy mask forbids holding two guards
+    /// on the same db, and each temporary here is dropped at the end of its
+    /// statement.
+    fn set_has_marker(
+        set: &crate::shard::db_plane::ShardDbSet,
+        db_idx: usize,
+        origin: usize,
+    ) -> bool {
+        has_marker(&mut set.write(db_idx), origin)
+    }
+
     #[test]
     fn apply_swapdb_swaps_databases() {
-        let mut dbs = dbs_with_markers(4);
+        let dbs = db_set_with_markers(4);
         let args = [
             Frame::BulkString(Bytes::from_static(b"0")),
             Frame::BulkString(Bytes::from_static(b"2")),
         ];
-        apply_swapdb(b"SWAPDB", &args, &mut dbs);
-        assert!(has_marker(&mut dbs[0], 2), "db0 must now hold db2's data");
-        assert!(has_marker(&mut dbs[2], 0), "db2 must now hold db0's data");
-        assert!(has_marker(&mut dbs[1], 1), "db1 untouched");
-        assert!(has_marker(&mut dbs[3], 3), "db3 untouched");
+        apply_swapdb(b"SWAPDB", &args, &dbs);
+        assert!(set_has_marker(&dbs, 0, 2), "db0 must now hold db2's data");
+        assert!(set_has_marker(&dbs, 2, 0), "db2 must now hold db0's data");
+        assert!(set_has_marker(&dbs, 1, 1), "db1 untouched");
+        assert!(set_has_marker(&dbs, 3, 3), "db3 untouched");
     }
 
     #[test]
     fn apply_swapdb_integer_args_and_reversed_order() {
-        let mut dbs = dbs_with_markers(3);
+        let dbs = db_set_with_markers(3);
         // Integer frames + b > a ordering must both work.
         let args = [Frame::Integer(2), Frame::Integer(1)];
-        apply_swapdb(b"SWAPDB", &args, &mut dbs);
-        assert!(has_marker(&mut dbs[1], 2));
-        assert!(has_marker(&mut dbs[2], 1));
+        apply_swapdb(b"SWAPDB", &args, &dbs);
+        assert!(set_has_marker(&dbs, 1, 2));
+        assert!(set_has_marker(&dbs, 2, 1));
     }
 
     #[test]
     fn apply_swapdb_out_of_range_and_same_index_are_noops() {
-        let mut dbs = dbs_with_markers(2);
+        let dbs = db_set_with_markers(2);
         // Out of range for this replica's db_count — skip, don't panic.
         let oor = [Frame::Integer(0), Frame::Integer(9)];
-        apply_swapdb(b"SWAPDB", &oor, &mut dbs);
-        assert!(has_marker(&mut dbs[0], 0));
+        apply_swapdb(b"SWAPDB", &oor, &dbs);
+        assert!(set_has_marker(&dbs, 0, 0));
         // Same index — no-op.
         let same = [Frame::Integer(1), Frame::Integer(1)];
-        apply_swapdb(b"SWAPDB", &same, &mut dbs);
-        assert!(has_marker(&mut dbs[1], 1));
+        apply_swapdb(b"SWAPDB", &same, &dbs);
+        assert!(set_has_marker(&dbs, 1, 1));
         // Malformed (missing / non-numeric args) — skip, don't panic.
-        apply_swapdb(b"SWAPDB", &[], &mut dbs);
+        apply_swapdb(b"SWAPDB", &[], &dbs);
         let junk = [
             Frame::BulkString(Bytes::from_static(b"x")),
             Frame::Integer(1),
         ];
-        apply_swapdb(b"SWAPDB", &junk, &mut dbs);
-        assert!(has_marker(&mut dbs[0], 0));
-        assert!(has_marker(&mut dbs[1], 1));
+        apply_swapdb(b"SWAPDB", &junk, &dbs);
+        assert!(set_has_marker(&dbs, 0, 0));
+        assert!(set_has_marker(&dbs, 1, 1));
     }
 
     #[test]

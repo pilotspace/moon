@@ -708,51 +708,76 @@ benchmarks.
 
 ### Cross-shard fast path
 
-For read commands directed at a foreign shard (e.g. GET where the key hashes to shard 3
-but the connection is pinned to shard 0), Moon has two dispatch modes:
+For a read whose key hashes to a foreign shard (a `GET` on shard 3 arriving on a
+connection pinned to shard 0), Moon can either hop the command through that shard's SPSC
+channel or serve it in place under a shared read guard on the owner's database.
 
-| Mode | Behavior |
+| `--cross-shard-fast-path` | Behaviour |
 |---|---|
-| `auto` / `on` (default) | Acquire a short-lived `RwLock` read guard on the target shard's database directly, bypassing SPSC. Lower latency, but adds `RwLock` contention on the target shard. |
-| `off` | Route the read through the SPSC channel (same as a write). Eliminates `RwLock` contention at the cost of one extra channel round-trip (~2–5 µs). |
+| `off` (**default**) | Route the read through the SPSC channel, exactly like a write. One extra channel round-trip per read. |
+| `auto` / `on` | Serve the read on the receiving thread under a shared guard on the owner's database. No hop, no park — one CAS. Falls back to SPSC whenever any gate below declines. |
 
-#### When to use `--cross-shard-fast-path=off`
+> **monoio only.** The dispatch site is in the monoio connection handler — the runtime
+> that ships on Linux and macOS. A build using `--features runtime-tokio` accepts the flag
+> but ignores it: cross-shard reads still take the SPSC hop and
+> `total_dispatch_cross_read_fast` stays at 0. The server logs a warning at startup when
+> the flag is enabled on that runtime.
 
-Switch to `off` when you observe `moon_cross_shard_lock_contention_total` climbing in
-Prometheus, specifically when:
+The default is `off`. Turn it on deliberately, and only for the workload shape it was
+measured on.
 
-- `c < 25 × shards` (low-concurrency / over-sharded deployment)
-- Write-heavy workloads where the target shard's `RwLock` is frequently held by a writer
-- You see `moon_dispatch_cross_read_fastpath_latency_us` p99 > 50 µs
+#### What it was measured to do
 
-At `c ≥ 200` and typical shard counts (4–8), the fast path's `RwLock` contention is
-invisible in production profiling and the default `auto` mode is recommended.
+Two-box GCE ARM (`t2a-standard-8` server, dedicated load generator), the same binary with
+the flag off vs on, ABBA-ordered, n=10 reps per cell, server-side CPU/op from
+`/proc/<pid>/stat`:
+
+| cell | CPU/op | 95% CI | throughput | reps cheaper | p | reads served in place |
+|---|---|---|---|---|---|---|
+| `--shards 1`, p=1 | −0.05% | −0.82 … +0.72 | +0.07% | 4/10 | 0.75 | 0.0% |
+| `--shards 8`, p=1 | **−8.61%** | −11.55 … −5.67 | **+12.03%** | 10/10 | **0.002** | 50.5% |
+| `--shards 8`, p=16 | +6.46% | −10.05 … +22.98 | +6.71% | 4/10 | 0.75 | 30.3% |
+
+The `--shards 1` row is the negative control, not a result: every read there is already
+local, so the path fires 0.0% of the time and must show nothing. It doesn't. That is what
+makes the `--shards 8` row credible.
+
+**The default is `off` because of the p=16 row, not because of doubt about p=1.** At depth
+16 the effect is not measurable at n=10, and the enabled leg's run-to-run variance roughly
+doubles (sd 1.24 vs 0.55 µs/op) instead of shifting — a contention signature rather than a
+uniform regression. Until that is understood, enable it for shallow-pipeline, multi-shard
+read workloads and measure your own before trusting it deeper.
+
+#### What the fast path declines
+
+It is not a blanket bypass. Each of these falls back to SPSC, silently and correctly:
+
+- **The connection has in-flight remote work on that shard.** Serving the read locally
+  would let it overtake this connection's own queued write — read-your-own-writes
+  (moon#507 / moon#512). Ordering wins; the read takes the hop.
+- **The command spans shards.** Placement is read from `multikey_placement`, the same
+  function the router uses, so the two cannot drift apart.
+- **The command is multi-key.** Conservative for now: an all-on-one-shard `MGET` can still
+  have some keys in the cold tier, and the residency probe only covers the primary key.
+- **The key is not resident.** The read-only dispatch path does not consult the cold tier,
+  so a cold key takes the SPSC path where the full dispatch promotes it.
+- **The owner is mid-write.** The guard is attempted, never waited on.
+
+Consequently the fast-path counter tracks well under the total cross-shard read count, and
+a workload that is write-heavy on the same keys may see almost no fast-path traffic. That
+is the design working, not a fault.
 
 #### Observability
 
-Two Prometheus metrics expose fast-path health:
+- `moon_dispatch_path_total{path="cross_read_fast"}` — reads served in place.
+- `moon_dispatch_path_total{path="cross_spsc"}` — cross-shard commands that took the hop
+  (reads and writes both).
+- `INFO stats` exposes the same two as `total_dispatch_cross_read_fast` and
+  `total_dispatch_cross_spsc`, so they are readable with `admin_port=0`.
 
-- `moon_dispatch_cross_read_fastpath_latency_us{target_shard=N}` — histogram of lock
-  acquisition time per target shard. Alert when p99 > 50 µs.
-- `moon_cross_shard_lock_contention_total{target_shard=N}` — incremented whenever lock
-  acquisition takes > 1 µs. A rising rate under low client counts indicates the fast path
-  is adding contention.
-- `moon_dispatch_path_total{path="cross_read_fast"}` — total fast-path dispatches (existing
-  counter, unchanged).
-
-#### Benchmarking the trade-off
-
-Use `scripts/bench-cross-shard-fastpath.sh` to run the full matrix on `moon-dev`:
-
-```bash
-orb run -m moon-dev bash -c '
-  source ~/.cargo/env &&
-  cd /Users/tindang/workspaces/tind-repo/moon &&
-  bash scripts/bench-cross-shard-fastpath.sh
-'
-```
-
-Results are written to `docs/benchmarks/cross-shard-fastpath-<date>.md`.
+`total_dispatch_cross_read_fast` is 0 whenever the flag is `off`. If it is 0 with the flag
+`on`, a gate above is declining every read — check whether the workload pipelines writes
+and reads of the same keys together.
 
 ### Future: shared-nothing architecture (Phase 4)
 

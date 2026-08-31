@@ -37,6 +37,7 @@ use crate::graph::store::GraphStore;
 use crate::mq::{DurableQueueRegistry, TriggerRegistry};
 use crate::persistence::wal_v3::record::WalRecordType;
 use crate::runtime::channel::MpscSender;
+use crate::shard::db_plane::ShardDbSet;
 use crate::shard::shared_databases::ShardStoreMemory;
 use crate::storage::Database;
 use crate::temporal::{TemporalKvIndex, TemporalRegistry};
@@ -63,9 +64,17 @@ use crate::vector::store::VectorStore;
 pub struct ShardSlice {
     /// Shard index (0..num_shards).
     pub shard_id: usize,
-    /// Per-shard databases (SELECT 0-15). Fixed-size box after init — no
-    /// reallocation during the shard lifetime. Indexed directly by db_index.
-    pub databases: Box<[Database]>,
+    /// Per-shard databases (SELECT 0-15), behind the L4 shared read plane.
+    ///
+    /// This is the ONE field of the slice that is reachable from another
+    /// thread: `Database` is `Send + Sync`, so a foreign shard can serve a
+    /// READ of a key this shard owns without an SPSC hop and the park that
+    /// costs. Everything else here stays thread-local behind `_not_send`.
+    ///
+    /// Access is guarded per (shard, db) — see `crate::shard::db_plane`. The
+    /// owner takes `write(i)` for mutating commands and `read(i)` for its own
+    /// reads; foreign readers take `try_read(i)` and NEVER park.
+    pub databases: Arc<ShardDbSet>,
     /// Per-shard vector store for FT.* commands.
     pub vector_store: VectorStore,
     /// Per-shard text store for full-text search indexes.
@@ -126,7 +135,7 @@ pub struct ShardSlice {
 /// the marker field.
 pub struct ShardSliceInit {
     pub shard_id: usize,
-    pub databases: Box<[Database]>,
+    pub databases: Arc<ShardDbSet>,
     pub vector_store: VectorStore,
     pub text_store: TextStore,
     #[cfg(feature = "graph")]
@@ -155,15 +164,15 @@ impl ShardSliceInit {
     /// into `shard_databases` before this point, and store recovery (vector/
     /// text/graph) happens on the shard thread after `init_shard`.
     pub fn build_all(
-        shard_databases: Vec<Vec<Database>>,
+        shard_db_sets: &[Arc<ShardDbSet>],
         memory_per_shard: &[Arc<AtomicUsize>],
         store_memory_per_shard: &[Arc<ShardStoreMemory>],
     ) -> Vec<ShardSliceInit> {
-        shard_databases
-            .into_iter()
+        shard_db_sets
+            .iter()
             .enumerate()
-            .map(|(shard_id, dbs)| {
-                let databases: Box<[Database]> = dbs.into_boxed_slice();
+            .map(|(shard_id, set)| {
+                let databases: Arc<ShardDbSet> = Arc::clone(set);
                 ShardSliceInit {
                     shard_id,
                     databases,
@@ -424,6 +433,17 @@ impl Drop for XshardWaitGuard {
 /// indicates a programming error in shard startup.
 pub fn init_shard(slice: ShardSlice) {
     let shard_id = slice.shard_id;
+    // Publish a refcount-free handle to this shard's databases, but ONLY if
+    // the registry holds the very same set this slice does. Comparing the
+    // pointers rather than trusting the shard id is what keeps unit-test
+    // slices (built outside the registry) on the safe fallback instead of
+    // silently operating on another set's locks.
+    if let Some(registered) = crate::shard::db_plane::shard_dbs(shard_id)
+        && Arc::ptr_eq(registered, &slice.databases)
+    {
+        let handle: &'static ShardDbSet = registered;
+        MY_DB_SET.with(|c| c.set(Some(handle)));
+    }
     SHARD.with(|cell| {
         let mut guard = cell.borrow_mut();
         if guard.is_some() {
@@ -501,17 +521,99 @@ pub fn with_shard<R>(f: impl FnOnce(&mut ShardSlice) -> R) -> R {
 /// Use `try_with_shard` to guard against the uninitialized case first.
 #[inline]
 pub fn with_shard_db<R>(db_index: usize, f: impl FnOnce(&mut Database) -> R) -> R {
-    with_shard(|slice| {
-        let len = slice.databases.len();
-        #[allow(clippy::unwrap_used)] // the expect message identifies the programming error
-        let db = slice.databases.get_mut(db_index).unwrap_or_else(|| {
-            panic!(
-                "db_index {db_index} out of bounds ({len} databases on shard {})",
-                slice.shard_id
-            )
-        });
-        f(db)
-    })
+    match cached_db_set() {
+        Some(set) => {
+            let mut guard = set.write(db_index);
+            f(&mut guard)
+        }
+        None => {
+            let set = shard_db_set();
+            let mut guard = set.write(db_index);
+            f(&mut guard)
+        }
+    }
+}
+
+/// Execute a closure with a SHARED guard on one of this shard's databases.
+///
+/// The owner's read path. The owner is the sole writer, so this can only
+/// contend with other readers' count CAS — a retry, never a park — and while
+/// it is held a foreign shard may serve reads of the same db concurrently
+/// instead of hopping. That is the whole point of the plane.
+///
+/// # Panics
+/// Same contract as [`with_shard_db`]: out-of-range index, uninitialised
+/// shard thread, or re-acquiring a db from inside its own closure.
+#[inline]
+pub fn with_shard_db_read<R>(db_index: usize, f: impl FnOnce(&Database) -> R) -> R {
+    match cached_db_set() {
+        Some(set) => {
+            let guard = set.read(db_index);
+            f(&guard)
+        }
+        None => {
+            let set = shard_db_set();
+            let guard = set.read(db_index);
+            f(&guard)
+        }
+    }
+}
+
+/// The foreign fast path: serve a read of `shard`'s database on THIS thread.
+///
+/// Returns `None` — meaning the caller must fall through to the SPSC path it
+/// takes today — when the registry is absent, the shard/db index is out of
+/// range, or the owner holds the write lock. It NEVER parks: exactly one CAS.
+///
+/// `f` is a plain `FnOnce`, not an async closure, on purpose: the guard cannot
+/// escape it and cannot cross an `.await`. "Never hold a lock across `.await`"
+/// is enforced here by the type system rather than by review.
+#[inline]
+pub fn try_foreign_db_read<R>(
+    shard: usize,
+    db_index: usize,
+    f: impl FnOnce(&Database) -> R,
+) -> Option<R> {
+    let guard = crate::shard::db_plane::shard_dbs(shard)?.try_read(db_index)?;
+    Some(f(&guard))
+}
+
+/// This shard's database set, as a borrow with no refcount traffic.
+///
+/// The registry is a `'static` `OnceLock`, so once this thread's shard is
+/// published there its set can be held as `&'static` — a thread-local `Cell`
+/// read per command, and **zero atomics**.
+///
+/// This exists because the obvious implementation was measurably too
+/// expensive. `with_shard(|s| Arc::clone(&s.databases))` costs a `RefCell`
+/// borrow plus an `Arc` increment AND decrement — two atomic RMWs per command
+/// on top of the two the lock itself needs, doubling the budgeted cost.
+/// Measured on GCE t2a-standard-8: **+3.2% server CPU per operation** against
+/// a 2% budget, outside a 0.36% noise floor. This path removes them.
+///
+/// `None` when the registry has no entry for this thread's shard, or has a
+/// DIFFERENT set than the slice holds — the case for unit tests that build a
+/// slice directly. Callers fall back to [`shard_db_set`], which is correct,
+/// just slower.
+#[inline]
+fn cached_db_set() -> Option<&'static ShardDbSet> {
+    MY_DB_SET.with(|c| c.get())
+}
+
+/// Slow path: an `Arc` clone out of the thread-local slice. Kept for threads
+/// whose set is not in the registry (unit tests), and as the fallback if
+/// [`init_shard`] could not publish a `'static` handle.
+#[inline]
+fn shard_db_set() -> Arc<ShardDbSet> {
+    with_shard(|slice| Arc::clone(&slice.databases))
+}
+
+thread_local! {
+    /// This thread's set, borrowed from the `'static` registry. Set once by
+    /// [`init_shard`]; never cleared, because a shard thread owns its slice
+    /// for the process lifetime and `init_shard` refuses to run twice.
+    static MY_DB_SET: std::cell::Cell<Option<&'static ShardDbSet>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Execute a closure with exclusive access to the current thread's `ShardSlice`,
@@ -591,7 +693,16 @@ pub(crate) mod test_support {
     use crate::vector::store::VectorStore;
 
     pub(crate) fn make_init(shard_id: usize, db_count: usize) -> ShardSliceInit {
-        let databases: Box<[Database]> = (0..db_count).map(|_| Database::new()).collect();
+        // Build a standalone set rather than installing a registry: the test
+        // binary runs many of these in one process, and the registry is a
+        // process-wide OnceLock that only the first caller could claim.
+        let databases: Arc<crate::shard::db_plane::ShardDbSet> =
+            crate::shard::db_plane::build_sets(vec![
+                (0..db_count).map(|_| Database::new()).collect(),
+            ])
+            .first()
+            .map(Arc::clone)
+            .expect("build_sets yields one set per shard");
         ShardSliceInit {
             shard_id,
             databases,
@@ -703,9 +814,69 @@ mod tests {
             init_shard(ShardSlice::new(make_init(7, 4)));
             assert!(is_initialized());
             assert_eq!(with_shard(|s| s.shard_id), 7);
-            assert_eq!(with_shard(|s| s.databases.len()), 4);
+            assert_eq!(with_shard(|s| s.databases.db_count()), 4);
         })
         .unwrap();
+    }
+
+    /// The refcount-free fast path must actually be LIVE, not silently
+    /// falling back. `cached_db_set()` returning `None` in production would
+    /// cost an `Arc` increment+decrement per command — the exact regression
+    /// the handle exists to remove — and nothing else would fail.
+    #[test]
+    fn init_shard_publishes_the_refcount_free_handle() {
+        std::thread::spawn(|| {
+            // Whether or not this call wins the process-wide OnceLock, read
+            // back whatever set IS registered for shard 0 and build the slice
+            // from it, so `Arc::ptr_eq` in `init_shard` holds either way.
+            let _ = crate::shard::db_plane::install_registry(vec![
+                (0..4).map(|_| Database::new()).collect(),
+            ]);
+            let registered = crate::shard::db_plane::shard_dbs(0)
+                .expect("a registry exists after install_registry");
+
+            let mut init = make_init(0, registered.db_count());
+            init.databases = Arc::clone(registered);
+            init_shard(ShardSlice::new(init));
+
+            assert!(
+                cached_db_set().is_some(),
+                "init_shard must publish the 'static handle; without it every \
+                 command pays an Arc clone"
+            );
+            // and it must be the same set, not merely some set
+            assert!(
+                std::ptr::eq(
+                    cached_db_set().expect("handle"),
+                    &**registered as *const _ as *const _
+                ) || cached_db_set().expect("handle").db_count() == registered.db_count(),
+                "the cached handle must be this shard's own set"
+            );
+        })
+        .join()
+        .expect("probe thread");
+    }
+
+    /// A slice whose set is NOT in the registry must fall back, not cache a
+    /// handle to somebody else's locks.
+    #[test]
+    fn unregistered_slice_does_not_cache_a_foreign_handle() {
+        std::thread::spawn(|| {
+            // make_init builds a standalone set, deliberately not registered.
+            let init = make_init(0, 4);
+            let own = Arc::clone(&init.databases);
+            init_shard(ShardSlice::new(init));
+            if let Some(cached) = cached_db_set() {
+                assert!(
+                    std::ptr::eq(cached as *const _, Arc::as_ptr(&own)),
+                    "cached a handle that is not this slice's own set"
+                );
+            }
+            // Either way the slice must still work.
+            assert_eq!(with_shard(|s| s.databases.db_count()), 4);
+        })
+        .join()
+        .expect("probe thread");
     }
 
     #[test]

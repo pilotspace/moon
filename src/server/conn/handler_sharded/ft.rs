@@ -495,12 +495,18 @@ async fn ft_command_inner(
                                             let terms = crate::text::query::collect_highlight_terms(
                                                 &node, text_index,
                                             );
-                                            let db = &s.databases[0];
+                                            // L4: exclusive, matching the
+                                            // owner-thread exclusivity the bare
+                                            // index had. S3 downgrades the read
+                                            // sites behind its own benchmark
+                                            // gate, not here. Twin of
+                                            // `handler_monoio/ft.rs`.
+                                            let db_guard = s.databases.write(0);
                                             crate::command::vector_search::apply_post_processing(
                                                 &mut r,
                                                 &terms,
                                                 text_index,
-                                                db,
+                                                &db_guard,
                                                 highlight_opts.as_ref(),
                                                 summarize_opts.as_ref(),
                                             );
@@ -567,13 +573,18 @@ async fn ft_command_inner(
         let db_index = conn.selected_db as u8;
         let plan = crate::shard::slice::with_shard(|s| {
             if has_session {
-                // Borrow the caller's db disjointly from vector_store/text_store.
-                let (vs, ts, dbs) = (&mut s.vector_store, &s.text_store, &mut s.databases);
+                // L4: the destructure existed only because `dbs.get_mut(i)`
+                // borrowed the whole slice off `s`. The guard borrows from the
+                // `Arc`, not from `s`, so the disjoint-field dance is no longer
+                // needed. Guard scoped to the capture and released with the
+                // `with_shard` closure, well before the `.await` on the
+                // returned (owned, 'static) snapshot below.
+                let mut db_guard = s.databases.try_write(db_index as usize);
                 crate::command::vector_search::ft_search_capture(
-                    vs,
+                    &mut s.vector_store,
                     cmd_args,
-                    dbs.get_mut(db_index as usize),
-                    Some(ts),
+                    db_guard.as_deref_mut(),
+                    Some(&s.text_store),
                     as_of_lsn,
                     db_index,
                 )
@@ -632,11 +643,14 @@ async fn ft_command_inner(
                 db_index,
             )
         } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-            let (vs, ts, dbs) = (&mut s.vector_store, &mut s.text_store, &mut s.databases);
+            // L4: per-branch guard, so the sibling FT.* arms that never touched
+            // a database still do not take one. Destructure dropped — see the
+            // FT.SEARCH capture above.
+            let mut db_guard = s.databases.try_write(db_index as usize);
             crate::command::vector_search::ft_dropindex(
-                vs,
-                ts,
-                dbs.get_mut(db_index as usize),
+                &mut s.vector_store,
+                &mut s.text_store,
+                db_guard.as_deref_mut(),
                 cmd_args,
                 db_index,
             )
@@ -670,11 +684,12 @@ async fn ft_command_inner(
                 db_index,
             )
         } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
-            let (vs, dbs) = (&mut s.vector_store, &mut s.databases);
+            // L4: per-branch guard, as for FT.DROPINDEX above.
+            let mut db_guard = s.databases.try_write(db_index as usize);
             crate::command::vector_search::recommend::ft_recommend(
-                vs,
+                &mut s.vector_store,
                 cmd_args,
-                dbs.get_mut(db_index as usize),
+                db_guard.as_deref_mut(),
                 db_index,
             )
         } else if cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {

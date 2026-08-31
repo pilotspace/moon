@@ -936,7 +936,12 @@ mod tests {
     use crate::vector::store::VectorStore;
 
     fn make_test_slice(db_count: usize) -> ShardSlice {
-        let databases: Box<[Database]> = (0..db_count).map(|_| Database::new()).collect();
+        let databases = crate::shard::db_plane::build_sets(vec![
+            (0..db_count).map(|_| Database::new()).collect(),
+        ])
+        .first()
+        .map(std::sync::Arc::clone)
+        .expect("build_sets yields one set per shard");
         ShardSlice::new(ShardSliceInit {
             shard_id: 0,
             databases,

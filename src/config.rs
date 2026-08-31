@@ -433,6 +433,18 @@ pub struct ServerConfig {
     #[arg(long = "ft-search-workers")]
     pub ft_search_workers: Option<usize>,
 
+    /// Cross-shard read dispatch mode: `auto`/`on` serves a foreign shard's
+    /// read on the calling thread under a shared guard (no SPSC hop); `off`
+    /// routes every cross-shard read through the SPSC channel.
+    ///
+    /// Defaults to `off`. docs/production-guide.md documented this flag and an
+    /// `auto` default for a path that was disabled in code and never took a
+    /// flag at all (the server rejected `--cross-shard-fast-path` outright).
+    /// The L4 shared-read plane makes the path implementable; the default
+    /// stays `off` until the L4 acceptance run clears it.
+    #[arg(long = "cross-shard-fast-path", default_value = "off")]
+    pub cross_shard_fast_path: String,
+
     // ── MoonStore v2: Disk Offload ──────────────────────────────────
     /// Enable disk offload (tiered storage: RAM -> mmap -> NVMe)
     #[arg(long = "disk-offload", default_value = "enable")]

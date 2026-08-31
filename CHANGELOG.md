@@ -6,7 +6,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`--cross-shard-fast-path`: serve a foreign shard's read without an SPSC hop (L4, S4).**
+
+  A read whose key hashes to another shard previously always crossed that shard's SPSC
+  channel. It can now be served on the receiving thread under a shared read guard on the
+  owner's database — one CAS, no park.
+
+  `docs/production-guide.md` has documented this flag, an `auto` default, and three
+  Prometheus metrics for some time. **None of it existed:** the dispatch site was disabled
+  (`handler_monoio/mod.rs`, "ShardSlice is thread-local; foreign-shard data can only be
+  read via SPSC hop"), the metrics had zero references in `src/`, and the server rejected
+  the flag outright — an operator following that tuning advice got
+  `error: unexpected argument '--cross-shard-fast-path' found` instead of a running
+  server. The L4 plane removes the stated blocker, so this implements the flag under the
+  documented name and corrects the section to match what ships.
+
+  **Default `off`.** Acceptance, two-box GCE ARM, same binary flag off-vs-on, ABBA-ordered,
+  n=10 reps/cell: at `--shards 8` pipeline 1, **−8.61% server CPU/op** (95% CI −11.55 …
+  −5.67) and **+12.03% throughput**, cheaper in 10 of 10 reps (sign test p=0.002), with
+  50.5% of reads served in place. The `--shards 1` negative control — where every read is
+  already local — fires the path 0.0% of the time and shows −0.05% (CI −0.82 … +0.72), as
+  it must. At pipeline 16 the effect is not measurable at this n and the enabled leg's
+  variance doubles rather than shifting, which is why the default stays off.
+
+  The path also declines, falling back to SPSC, whenever:
+
+  - the connection has in-flight remote work on that shard (read-your-own-writes, moon#507
+    / moon#512);
+  - the command spans shards — placement is read from `multikey_placement`, the same
+    function the router uses, so the two cannot drift (moon#592);
+  - the command is multi-key (conservative for v1: an all-on-one-shard `MGET` can still
+    have some keys cold, and the residency probe only covers the primary key);
+  - the key is not resident, since the read-only path does not consult the cold tier
+    (the moon#610 class);
+  - the owner holds the write lock — the guard is attempted, never waited on.
+
+  Observability: `moon_dispatch_path_total{path="cross_read_fast"}` and
+  `INFO stats` → `total_dispatch_cross_read_fast`. Measured at `--shards 4`, 200 scattered
+  GETs moved the counter 0 → 147 (73.5%, the expected 3-of-4 foreign fraction) while
+  `total_dispatch_cross_spsc` stayed flat.
+
 ### Performance
+- **Owner reads take a shared guard instead of an exclusive one (L4, S3).**
+
+  `with_shard_db_read` was added by the L4 plane skeleton and then had **zero callers** —
+  every owner read still went through `with_shard_db`, taking the db's write lock to serve a
+  `GET`. This wires the four owner read sites (`handler_monoio` and `handler_sharded`, each a
+  single-key read and the local part of a spanning multi-key read) onto the shared guard.
+
+  `dispatch_read` was already written for this access mode: its hot-key sketch uses a relaxed
+  `fetch_add` and a try-lock that drops the sample under contention, documented as being so
+  that "concurrent cross-shard fast-path reads never block here". The conversion is enforced
+  by the type system — the closure goes from `&mut Database` to `&Database`, so anything
+  needing mutation fails to compile.
+
+  No behaviour changes: an exclusive holder is replaced by a shared one on a thread that is
+  the sole writer, so nothing that was previously serialised becomes concurrent *yet*. The
+  win is unlocked by S4, which lets a foreign shard serve a read of this db instead of
+  hopping to the owner.
+
+  This does **not** extend to the SPSC batch loop. That loop uses the full `dispatch`, which
+  needs `&mut Database`; routing it through `dispatch_read` to justify a shared guard would
+  reintroduce the moon#610 cold-tier read-bug class.
+
 - **A spanning multi-key READ no longer cuts the pipeline batch (moon#513, A2a).**
 
   Since moon#512 fixed the moon#507 write-loss inversion, a multi-key command mid-pipeline
@@ -55,6 +118,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — disabling the fan-out routing while leaving the guard relaxed passes the deferral
   assertion and is caught only by this counter (and, one test later, by an `MGET` reading stale
   values from its own batch).
+### Changed
+- **Shard databases moved behind a per-`(shard, db)` lock plane (L4 step 2,
+  moon#513).** `ShardSlice.databases` changed from `Box<[Database]>` to
+  `Arc<ShardDbSet>`, a registry of `CachePadded<RwLock<Database>>` built on the
+  main thread before any shard thread spawns.
+
+  This step is **behaviour-preserving and has no flag**: every site that had
+  exclusive access before has exclusive access after. It exists so a later step
+  can let a foreign shard serve a READ of a key this shard owns without the
+  cross-shard hop — and the park that costs. Measured on GCE t2a-standard-8
+  (aarch64, 8 vCPU), fitting per-command CPU against pipeline depth gives
+  `cost = 0.413 - 0.046*msgs/cmd + 2.488*parks/cmd` (CPU%/kops): **2.49 per
+  park, ~zero per message**, with the park term at 85% of the p=1 cost.
+
+  Why per-`(shard, db)` rather than one lock per shard: a write to db 0 must
+  not exclude a read of db 3, and no lock is taken on any per-key path — one
+  per command, not per key. `s8 x 16 dbs` costs 8 KB of padding and nothing per
+  key. Why locks at all rather than a seqlock or epoch/RCU: values are
+  heap-owning (`Bytes`, `HashMap`, `Listpack`) and `get_mut` mutates them in
+  place, so both alternatives need copy-on-write on the write hot path.
+
+  **No `unsafe` is introduced.** `Database` is `Send + Sync`, and the
+  `static L4_REGISTRY` now pins that as a compile-time contract: adding a
+  non-`Sync` field to `Database` breaks the build rather than silently making
+  the plane unsound. The slice's `!Send` marker is untouched, and vector, text,
+  graph and registry state never cross a thread.
+
+  Guards are handed out through `FnOnce` closures, so a guard cannot escape and
+  cannot cross an `.await` — "never hold a lock across `.await`" is enforced by
+  the type system here, not by review. A thread-local mask restores the loud
+  failure the `RefCell` used to give: re-acquiring a database inside its own
+  guard would DEADLOCK on a real `RwLock`, so it panics instead.
+
+  144 call sites across 20 files were converted. Four multi-database helpers
+  (`flush_every_database`, `rdb::save_to_bytes`, `redis_rdb::load_rdb`,
+  `snapshot::shard_snapshot_load`) became generic over `Borrow`/`BorrowMut<Database>`,
+  which left every existing caller unchanged.
+
+- **CI gained a `runtime-tokio + text-index` lint leg.** `handler_sharded` is
+  `cfg(runtime-tokio)`, so the default leg never compiles it; the tokio leg
+  drops `text-index`, so it never compiles the parts behind that cfg. Their
+  intersection was covered by no gate, local or hosted. Measured: a deliberate
+  type error at `handler_sharded/ft.rs:498` left BOTH standing legs reporting
+  zero errors. A real defect had been sitting in that blind spot.
+
+- **New `docs/internal/cross-shard-cost-model.md`** records the per-park cost
+  model, the profile breakdown (83% of moon's user time is not Redis work),
+  seven measured dead ends, and five retracted claims — so none of them are
+  re-derived.
 
 ### Fixed
 - **`TXN ABORT` left torn state after a multi-key write (moon#500).**

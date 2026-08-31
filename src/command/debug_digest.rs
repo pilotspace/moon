@@ -352,14 +352,20 @@ pub fn db_partial(db: &crate::storage::Database, now_ms: u64) -> Option<Digest> 
 /// intercept in `spsc_handler` establishes the same pattern.
 pub fn local_partials() -> Vec<(usize, Digest)> {
     crate::shard::slice::with_shard(|slice| {
-        let mut out = Vec::new();
-        for (idx, db) in slice.databases.iter().enumerate() {
-            let now_ms = db.now_ms();
-            if let Some(partial) = db_partial(db, now_ms) {
-                out.push((idx, partial));
+        // Cross-db consistency: every database is read-guarded for the whole
+        // walk, so a foreign reader (and the digest itself) can never observe
+        // db 3 from after a write that db 0 was captured before. This is the
+        // atomicity the single-threaded slice gave this walk for free.
+        slice.databases.with_all_read(|dbs| {
+            let mut out = Vec::new();
+            for (idx, db) in dbs.iter().enumerate() {
+                let now_ms = db.now_ms();
+                if let Some(partial) = db_partial(db, now_ms) {
+                    out.push((idx, partial));
+                }
             }
-        }
-        out
+            out
+        })
     })
 }
 

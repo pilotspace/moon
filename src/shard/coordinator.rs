@@ -2295,12 +2295,13 @@ pub async fn coordinate_keyspace_info(
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Vec<(u64, u64)> {
     let mut totals: Vec<(u64, u64)> = crate::shard::slice::with_shard(|s| {
-        s.databases
-            .iter()
-            // logical_len: hot + cold, overlap once — keeps INFO # Keyspace
-            // consistent with DBSIZE under disk-offload (issue #355).
-            .map(|db| (db.logical_len() as u64, db.expires_count() as u64))
-            .collect()
+        s.databases.with_all_read(|dbs| {
+            dbs.iter()
+                // logical_len: hot + cold, overlap once — keeps INFO # Keyspace
+                // consistent with DBSIZE under disk-offload (issue #355).
+                .map(|db| (db.logical_len() as u64, db.expires_count() as u64))
+                .collect()
+        })
     });
     if num_shards <= 1 {
         return totals;
@@ -2626,11 +2627,13 @@ pub async fn broadcast_vector_command(
         _ => false,
     };
 
-    // Split borrows so rustc sees `&mut s.vector_store`,
-    // `&mut s.text_store`, `&s.graph_store`, and optional
-    // `&mut s.databases[0]` as four disjoint fields.
+    // Split borrows so rustc sees `&mut s.vector_store`, `&mut s.text_store`
+    // and `&s.graph_store` as disjoint fields. The database no longer needs to
+    // be one of them: its guard borrows from the L4 set behind the `Arc`, not
+    // from `s`, so cloning the handle first frees `s` for the store borrows.
     let local_result = crate::shard::slice::with_shard(|s| {
-        let (db_slice, vs, ts);
+        let db_set = std::sync::Arc::clone(&s.databases);
+        let (vs, ts);
         #[cfg(feature = "graph")]
         let graph_ref;
         {
@@ -2640,16 +2643,16 @@ pub async fn broadcast_vector_command(
             {
                 graph_ref = &s.graph_store;
             }
-            db_slice = &mut s.databases;
         }
         // WS5a / Gap 8: use the caller's real db, not a hardcoded db 0 —
         // FT.DROPINDEX DD deletes indexed docs from the SAME db the index
         // is scoped to.
-        let db_opt = if is_dropindex {
-            db_slice.get_mut(db_index as usize)
+        let mut db_guard = if is_dropindex {
+            db_set.try_write(db_index as usize)
         } else {
             None
         };
+        let db_opt = db_guard.as_deref_mut();
         crate::shard::spsc_handler::dispatch_vector_command(
             vs,
             ts,
@@ -3053,12 +3056,12 @@ pub async fn scatter_text_search(
                 );
                 if highlight_opts.is_some() || summarize_opts.is_some() {
                     // databases[db_index] borrowed disjointly from text_store — both live on `s`.
-                    if let Some(db) = s.databases.get_mut(db_index as usize) {
+                    if let Some(db) = s.databases.try_write(db_index as usize) {
                         crate::command::vector_search::ft_text_search::apply_post_processing(
                             &mut r,
                             &term_strings,
                             text_index,
-                            db,
+                            &db,
                             highlight_opts.as_ref(),
                             summarize_opts.as_ref(),
                         );
@@ -3162,12 +3165,12 @@ pub async fn scatter_text_search(
                                 top_k,
                             );
                             if highlight_opts.is_some() || summarize_opts.is_some() {
-                                if let Some(db) = s.databases.get_mut(db_index as usize) {
+                                if let Some(db) = s.databases.try_write(db_index as usize) {
                                     crate::command::vector_search::ft_text_search::apply_post_processing(
                                         &mut r,
                                         &term_strings,
                                         text_index,
-                                        db,
+                                        &db,
                                         highlight_opts.as_ref(),
                                         summarize_opts.as_ref(),
                                     );

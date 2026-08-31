@@ -594,10 +594,14 @@ async fn ft_command_inner(
             let db_index = conn.selected_db as u8;
             let response = crate::shard::slice::with_shard(|s| {
                 if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
+                    // L4: `try_write` is the `get_mut` replacement — `None` for
+                    // an out-of-range db, exactly as before. The guard lives
+                    // only for this branch's call.
+                    let mut db_guard = s.databases.try_write(db_index as usize);
                     crate::command::vector_search::recommend::ft_recommend(
                         &mut s.vector_store,
                         cmd_args,
-                        s.databases.get_mut(db_index as usize),
+                        db_guard.as_deref_mut(),
                         db_index,
                     )
                 } else if cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
@@ -797,12 +801,17 @@ async fn ft_command_inner(
                                                     crate::text::query::collect_highlight_terms(
                                                         &node, text_index,
                                                     );
-                                                let db = &s.databases[0];
+                                                // L4: exclusive, matching the
+                                                // owner-thread exclusivity the
+                                                // bare index had. S3 downgrades
+                                                // the read sites behind its own
+                                                // benchmark gate, not here.
+                                                let db_guard = s.databases.write(0);
                                                 crate::command::vector_search::apply_post_processing(
                                                     &mut r,
                                                     &terms,
                                                     text_index,
-                                                    db,
+                                                    &db_guard,
                                                     highlight_opts.as_ref(),
                                                     summarize_opts.as_ref(),
                                                 );
@@ -862,10 +871,14 @@ async fn ft_command_inner(
             let db_index = conn.selected_db as u8;
             let plan = crate::shard::slice::with_shard(|s| {
                 if has_session {
+                    // L4: guard scoped to the capture. It is released with the
+                    // `with_shard` closure, well before the `.await` on the
+                    // returned (owned, 'static) snapshot below.
+                    let mut db_guard = s.databases.try_write(db_index as usize);
                     crate::command::vector_search::ft_search_capture(
                         &mut s.vector_store,
                         cmd_args,
-                        s.databases.get_mut(db_index as usize),
+                        db_guard.as_deref_mut(),
                         Some(&s.text_store),
                         as_of_lsn,
                         db_index,
@@ -922,10 +935,13 @@ async fn ft_command_inner(
                     db_index,
                 )
             } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
+                // L4: per-branch guard, so the sibling FT.* arms that never
+                // touched a database still do not take one.
+                let mut db_guard = s.databases.try_write(db_index as usize);
                 crate::command::vector_search::ft_dropindex(
                     &mut s.vector_store,
                     &mut s.text_store,
-                    s.databases.get_mut(db_index as usize),
+                    db_guard.as_deref_mut(),
                     cmd_args,
                     db_index,
                 )
@@ -959,10 +975,12 @@ async fn ft_command_inner(
                     db_index,
                 )
             } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
+                // L4: per-branch guard, as for FT.DROPINDEX above.
+                let mut db_guard = s.databases.try_write(db_index as usize);
                 crate::command::vector_search::recommend::ft_recommend(
                     &mut s.vector_store,
                     cmd_args,
-                    s.databases.get_mut(db_index as usize),
+                    db_guard.as_deref_mut(),
                     db_index,
                 )
             } else if cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {

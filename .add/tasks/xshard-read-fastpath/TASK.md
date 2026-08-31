@@ -704,3 +704,85 @@ What did this loop teach the foundation? One line each, tagged by competency
   synchronous spin could serialize pipelined reads") was the exact failure that materialized at verify —
   the pre-named, pre-reasoned risk turned a surprise regression into a targeted batch-depth-gate fix,
   not a redesign (evidence: §3 flag-#1 → VERIFY FINDING #3 → M1 RE-MEASURE).
+
+---
+
+## 8 · SUPERSEDED — D3 revisited by L4 S4 (2026-08-30)
+
+**What changed:** D3 hard-deleted the `--cross-shard-fast-path` surface
+("CHOSEN — breaking, cleanest" vs deprecate, declined) and left
+`tests/xshard_cleanup_shape.rs::dead_fastpath_surface_removed` as a
+`reject removed_flag_referenced` tripwire. That tripwire fired on the L4 S4
+commit, exactly as designed, and the decision was re-opened rather than the
+guard silenced (user decision, 2026-08-30).
+
+**Why the premise no longer holds.** §1 ground truth justified the deletion on
+the storage model:
+
+> the per-shard storage (DashTable/Database) is a plain `&mut self` structure
+> with NO interior concurrency — single-thread `!Send` ownership IS the safety;
+> a foreign lock-free read is storage-impossible in place, so SPSC is the only
+> door and we make IT cheaper, not bypass it.
+
+True as written in June 2026. The L4 shared-read plane changed precisely that
+structure: `Database` now sits behind a per-(shard, db) `RwLock` in a
+`Send + Sync` process-wide registry (`src/shard/db_plane.rs`), with
+`slice::try_foreign_db_read` performing the foreign read under a shared guard —
+one CAS, never parks. "Storage-impossible in place" was a property of the old
+model, not a law; the door D3 reasoned about now exists.
+
+Note the deletion still looks right for its own moment: the surface D3 removed
+was genuinely orphaned (`cross_read_fast_dispatches` hardcoded 0, no consumers),
+and shipping a dead flag is worse than shipping none. The failure D3 did NOT
+catch is that `docs/production-guide.md` kept documenting the flag, an `auto`
+default, three metrics, and a benchmark script — none of which existed. An
+operator following that page got
+`error: unexpected argument '--cross-shard-fast-path' found`. Deleting code
+without deleting the docs that sell it is the reusable lesson here.
+
+**Disposition:**
+- The flag is live again, default `off`, gated on `pending_mask` (moon#507/#512),
+  `multikey_placement` (moon#592), single-key only, hot-only (moon#610), and a
+  non-blocking `try_read`.
+- `dead_fastpath_surface_removed` keeps its five genuinely-orphaned symbols;
+  only `cross_shard_fast_path` was removed from the list.
+- A second pin, `live_fastpath_surface_is_still_wired`, now guards the other
+  direction — a future cleanup that deletes the dispatch site while leaving the
+  flag parsable would re-create the exact defect described above. Both pins were
+  mutation-checked (each made to fail on purpose, then restored).
+
+## 9. S4 acceptance matrix (2026-08-30)
+
+Raw data: `abba_s4_acceptance.csv` (120 legs, 0 failed).
+
+Rig: two-box GCE ARM — server on `moon-bench-arm` (t2a-standard-8), load
+generator on `moon-bench-x86`. Same binary both legs, toggled only by
+`--cross-shard-fast-path`. ABBA slot order (off, on, on, off) so linear drift
+cancels within each rep; the fixed-order matrix that preceded this showed a
+control binary drifting +1.22% purely for running last.
+
+| cell | CPU/op | 95% CI | rps | sign | p | fast% |
+|---|---|---|---|---|---|---|
+| s1 p1 | −0.05% | −0.82..+0.72 | +0.07% | 4/10 | 0.75 | 0.0% |
+| s8 p1 | −8.61% | −11.55..−5.67 | +12.03% | 10/10 | 0.0020 | 50.5% |
+| s8 p16 | +6.46% | −10.05..+22.98 | +6.71% | 4/10 | 0.75 | 30.3% |
+
+**s1 is the negative control and it passes**: the path fires 0.0% of the time
+where no read is foreign, and CPU/op's CI straddles zero. A win there would
+have invalidated the s8 row.
+
+**Decision: default stays `off`**, driven by s8 p16 rather than by any doubt
+about s8 p1. At depth 16 the enabled leg's variance doubles (sd 1.24 vs 0.55,
+max 7.55 vs 5.23) instead of shifting — contention, not uniform regression.
+
+Two open questions, both with real headroom, neither answered here:
+
+1. **Capture is only ~58% of eligible reads at p1** — 50.5% of all reads when
+   7/8 are foreign. No confirmed explanation. If recoverable, the p1 win is
+   roughly 1.7x larger than measured.
+2. **Capture falls to 30.3% at p16.** Hypothesis (untested): `pending_mask`
+   declines the fast path on any in-flight remote work for a target, so within
+   a pipelined batch one decline poisons every later command for that shard.
+   Narrowing the guard to writes only would raise capture substantially — but
+   that is precisely the moon#507/#512 silent-write-loss surface, so it needs
+   its own red test before anyone touches it.

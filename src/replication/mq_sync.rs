@@ -219,7 +219,10 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     fn make_test_slice() -> ShardSlice {
-        let databases: Box<[Database]> = (0..1).map(|_| Database::new()).collect();
+        let databases = crate::shard::db_plane::build_sets(vec![vec![Database::new()]])
+            .first()
+            .map(std::sync::Arc::clone)
+            .expect("build_sets yields one set per shard");
         ShardSlice::new(ShardSliceInit {
             shard_id: 0,
             databases,

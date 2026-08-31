@@ -84,6 +84,7 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
             tls_key_file: None,
             tls_ca_cert_file: None,
             tls_ciphersuites: None,
+            cross_shard_fast_path: "off".to_string(),
             disk_offload: "disable".to_string(),
             disk_offload_dir: None,
             disk_offload_threshold: 0.85,

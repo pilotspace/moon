@@ -101,10 +101,13 @@ pub fn flushall(db: &mut Database, args: &[Frame]) -> Frame {
 /// drops the cold-tier index and the in-flight spill record as well as the
 /// hot table, so a flushed key cannot come back through a read-through or a
 /// spill that lands after the flush.
-pub fn flush_every_database(databases: &mut [Database], selected: usize) {
+pub fn flush_every_database<D: std::borrow::BorrowMut<Database>>(
+    databases: &mut [D],
+    selected: usize,
+) {
     for (idx, database) in databases.iter_mut().enumerate() {
         if idx != selected {
-            database.clear();
+            database.borrow_mut().clear();
         }
     }
 }

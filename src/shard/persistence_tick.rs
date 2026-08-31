@@ -71,10 +71,14 @@ pub(crate) fn handle_pending_snapshot(
                 snap_dir.join(format!("shard-{}.rrdshard", shard_id))
             };
             let segment_counts = crate::shard::slice::with_shard(|s| {
-                s.databases
-                    .iter()
-                    .map(|db| db.data().segment_count())
-                    .collect::<Vec<_>>()
+                // One consistent snapshot of every db's segment layout: the
+                // counts must all describe the same instant, or the bitmap
+                // sized here would not match the keyspace the capture walks.
+                s.databases.with_all_read(|dbs| {
+                    dbs.iter()
+                        .map(|db| db.data().segment_count())
+                        .collect::<Vec<_>>()
+                })
             });
             let db_count = shard_databases.db_count();
             let mut state = SnapshotState::new_from_metadata(
@@ -137,10 +141,14 @@ pub(crate) fn check_auto_save_trigger(
                 std::path::PathBuf::from(dir).join(format!("shard-{}.rrdshard", shard_id))
             };
             let segment_counts = crate::shard::slice::with_shard(|s| {
-                s.databases
-                    .iter()
-                    .map(|db| db.data().segment_count())
-                    .collect::<Vec<_>>()
+                // One consistent snapshot of every db's segment layout: the
+                // counts must all describe the same instant, or the bitmap
+                // sized here would not match the keyspace the capture walks.
+                s.databases.with_all_read(|dbs| {
+                    dbs.iter()
+                        .map(|db| db.data().segment_count())
+                        .collect::<Vec<_>>()
+                })
             });
             let db_count = shard_databases.db_count();
             let mut state = SnapshotState::new_from_metadata(
@@ -469,9 +477,11 @@ pub(crate) fn run_eviction_tick(
 
     {
         let rt = runtime_config.read();
-        // C5 / Phase 3: compute per-shard KV memory via ShardSlice without
-        // lock acquisitions (avoids per-DB read locks; estimated_memory() is
-        // an O(1) accumulator read). Published unconditionally: MEMORY DOCTOR
+        // C5 / Phase 3: compute per-shard KV memory via ShardSlice under one
+        // batch of SHARED db guards (estimated_memory() is an O(1) accumulator
+        // read, so the guards are held for a handful of loads and exclude
+        // nobody — a shared guard never blocks a foreign reader, and this IS
+        // the owner). Published unconditionally: MEMORY DOCTOR
         // and the Prometheus KV gauge read this atomic even when maxmemory is
         // unlimited — gating it on maxmemory > 0 left them at a permanent 0.
         //
@@ -484,13 +494,14 @@ pub(crate) fn run_eviction_tick(
         // stay untouched O(1) hot-path reads for the per-write eviction
         // pre-gate (inline_write_can_skip_eviction / evict_to_budget).
         let used = crate::shard::slice::with_shard(|s| {
-            s.databases
-                .iter()
-                .map(|db| {
-                    db.estimated_memory()
-                        + db.cold_index.as_ref().map_or(0, |ci| ci.resident_bytes())
-                })
-                .sum::<usize>()
+            s.databases.with_all_read(|dbs| {
+                dbs.iter()
+                    .map(|db| {
+                        db.estimated_memory()
+                            + db.cold_index.as_ref().map_or(0, |ci| ci.resident_bytes())
+                    })
+                    .sum::<usize>()
+            })
         });
         shard_databases.publish_memory(shard_id, used);
         // Elastic budgets only exist under a finite maxmemory cap.

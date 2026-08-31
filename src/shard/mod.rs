@@ -3,6 +3,8 @@ pub mod affinity;
 pub mod autovacuum;
 pub mod conn_accept;
 pub mod coordinator;
+/// L4 shared read plane: the per-(shard, db) lock registry.
+pub mod db_plane;
 pub mod disk_monitor;
 pub mod dispatch;
 pub mod event_loop;

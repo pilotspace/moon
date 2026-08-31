@@ -241,11 +241,18 @@ impl ShardDatabases {
             cold_per_shard,
         });
 
-        // Build one ShardSliceInit per shard, consuming the databases. The
-        // construction lives in slice.rs with the type it builds (the only
-        // per-shard state this module touches is the moment of handoff).
+        // Move the databases into the L4 shared read plane, then hand each
+        // shard an Arc into its own set. This happens on the MAIN thread,
+        // before any shard thread is spawned, so the registry can never race
+        // its readers into existence.
+        let sets = crate::shard::db_plane::build_sets(shard_databases);
+        crate::shard::db_plane::install_registry_sets(sets.clone());
+
+        // Build one ShardSliceInit per shard. The construction lives in
+        // slice.rs with the type it builds (the only per-shard state this
+        // module touches is the moment of handoff).
         let inits = crate::shard::slice::ShardSliceInit::build_all(
-            shard_databases,
+            &sets,
             &memory_per_shard,
             &store_memory_per_shard,
         );
@@ -622,7 +629,13 @@ fn warn_skip_mq_record(shard_id: usize, kind: &str, payload: &[u8], stats: &mut 
 /// lets `apply_mq_*` stay generic instead of existing twice: `replay_mq_wal`
 /// (boot) and `replication::apply::apply_mq` (live stream) share ONE engine.
 pub(crate) trait MqApplyTarget {
-    fn mq_databases_mut(&mut self) -> &mut [crate::storage::Database];
+    /// Exclusive access to one database, or `None` if `idx` is out of range.
+    ///
+    /// Was `mq_databases_mut() -> &mut [Database]` before the databases moved
+    /// behind the L4 shared read plane; a set of independent per-db locks
+    /// cannot produce a contiguous slice, and every caller indexed a single
+    /// database anyway.
+    fn mq_db(&mut self, idx: usize) -> Option<crate::shard::db_plane::DbWriteGuard<'_>>;
     fn mq_durable_queue_registry_mut(
         &mut self,
     ) -> &mut Option<Box<crate::mq::DurableQueueRegistry>>;
@@ -631,8 +644,8 @@ pub(crate) trait MqApplyTarget {
 
 impl MqApplyTarget for crate::shard::slice::ShardSliceInit {
     #[inline]
-    fn mq_databases_mut(&mut self) -> &mut [crate::storage::Database] {
-        &mut self.databases
+    fn mq_db(&mut self, idx: usize) -> Option<crate::shard::db_plane::DbWriteGuard<'_>> {
+        self.databases.try_write(idx)
     }
     #[inline]
     fn mq_durable_queue_registry_mut(
@@ -648,8 +661,8 @@ impl MqApplyTarget for crate::shard::slice::ShardSliceInit {
 
 impl MqApplyTarget for crate::shard::slice::ShardSlice {
     #[inline]
-    fn mq_databases_mut(&mut self) -> &mut [crate::storage::Database] {
-        &mut self.databases
+    fn mq_db(&mut self, idx: usize) -> Option<crate::shard::db_plane::DbWriteGuard<'_>> {
+        self.databases.try_write(idx)
     }
     #[inline]
     fn mq_durable_queue_registry_mut(
@@ -681,7 +694,7 @@ pub(crate) fn apply_mq_create<T: MqApplyTarget>(
         crate::mq::DurableStreamConfig::new(key_bytes, max_delivery_count),
     );
 
-    if let Some(db) = target.mq_databases_mut().get_mut(db_index) {
+    if let Some(mut db) = target.mq_db(db_index) {
         if let Ok(stream) = db.get_or_create_stream(key) {
             stream.durable = true;
             stream.max_delivery_count = max_delivery_count;
@@ -705,7 +718,7 @@ pub(crate) fn apply_mq_push<T: MqApplyTarget>(
     id: crate::storage::stream::StreamId,
     fields: Vec<(bytes::Bytes, bytes::Bytes)>,
 ) {
-    if let Some(db) = target.mq_databases_mut().get_mut(db_index) {
+    if let Some(mut db) = target.mq_db(db_index) {
         if let Ok(stream) = db.get_or_create_stream(key) {
             if !stream.entries.contains_key(&id) {
                 stream.add(id, fields);
@@ -754,7 +767,7 @@ pub(crate) fn apply_mq_pop<T: MqApplyTarget>(
         current_time_ms()
     };
 
-    let Some(db) = target.mq_databases_mut().get_mut(db_index) else {
+    let Some(mut db) = target.mq_db(db_index) else {
         return;
     };
 
@@ -845,7 +858,7 @@ pub(crate) fn apply_mq_ack<T: MqApplyTarget>(
     key: &[u8],
     id: crate::storage::stream::StreamId,
 ) {
-    if let Some(db) = target.mq_databases_mut().get_mut(db_index) {
+    if let Some(mut db) = target.mq_db(db_index) {
         if let Ok(Some(stream)) = db.get_stream_mut(key) {
             let group_name = bytes::Bytes::from_static(MQ_GROUP_NAME);
             let _ = stream.xack(&group_name, &[id]);
@@ -897,7 +910,7 @@ pub(crate) fn apply_mq_drop<T: MqApplyTarget>(target: &mut T, db_index: usize, k
     if let Some(reg) = target.mq_durable_queue_registry_mut().as_mut() {
         reg.remove(key);
     }
-    if let Some(db) = target.mq_databases_mut().get_mut(db_index) {
+    if let Some(mut db) = target.mq_db(db_index) {
         let _ = db.remove_counting_cold(key);
     }
 }
@@ -1956,7 +1969,7 @@ mod tests {
             5
         );
 
-        let db = inits[0].databases.get_mut(0).expect("db 0");
+        let mut db = inits[0].databases.try_write(0).expect("db 0");
         let stream = db
             .get_stream_mut(&queue_key)
             .expect("get_stream_mut")
@@ -2028,7 +2041,7 @@ mod tests {
 
         let mut dlq_key = queue_key.clone();
         dlq_key.extend_from_slice(b"::mq:dlq");
-        let db = inits[0].databases.get_mut(0).expect("db 0");
+        let mut db = inits[0].databases.try_write(0).expect("db 0");
         let dlq_stream = db
             .get_stream_mut(&dlq_key)
             .expect("get_stream_mut")
@@ -2110,7 +2123,7 @@ mod tests {
         // an earlier boot in the same process) — then wipe it exactly like
         // main.rs's AOF-authority path does.
         {
-            let db = inits[0].databases.get_mut(0).expect("db 0");
+            let mut db = inits[0].databases.try_write(0).expect("db 0");
             let _ = db.get_or_create_stream(&queue_key);
             db.clear();
             assert!(
@@ -2142,7 +2155,7 @@ mod tests {
 
         replay_mq_wal(&mut inits, tmp.path());
 
-        let db = inits[0].databases.get_mut(0).expect("db 0");
+        let mut db = inits[0].databases.try_write(0).expect("db 0");
         let stream = db
             .get_stream_mut(&queue_key)
             .expect("get_stream_mut")
@@ -2198,7 +2211,7 @@ mod tests {
             inits[0].durable_queue_registry.is_none(),
             "the malformed MqCreate must be skipped, not applied"
         );
-        let db = inits[0].databases.get_mut(0).expect("db 0");
+        let mut db = inits[0].databases.try_write(0).expect("db 0");
         assert_eq!(
             db.get_or_create_stream(&queue_key).unwrap().entries.len(),
             1,
@@ -2252,7 +2265,7 @@ mod tests {
                 .is_none_or(|reg| reg.get(&queue_key).is_none()),
             "MqDrop must remove the registry entry"
         );
-        let db = inits[0].databases.get_mut(0).expect("db 0");
+        let mut db = inits[0].databases.try_write(0).expect("db 0");
         assert!(
             db.get_stream_mut(&queue_key).unwrap().is_none(),
             "MqDrop must remove the stream from the db"
@@ -2319,7 +2332,7 @@ mod tests {
                 .is_some(),
             "the SECOND MqCreate must re-register the queue"
         );
-        let db = inits[0].databases.get_mut(0).expect("db 0");
+        let mut db = inits[0].databases.try_write(0).expect("db 0");
         let stream = db
             .get_stream_mut(&queue_key)
             .unwrap()
@@ -2377,7 +2390,7 @@ mod tests {
         // survive with the later well-formed Push applied.
         replay_mq_wal(&mut inits, tmp.path());
 
-        let db = inits[0].databases.get_mut(0).expect("db 0");
+        let mut db = inits[0].databases.try_write(0).expect("db 0");
         assert_eq!(
             db.get_or_create_stream(&queue_key).unwrap().entries.len(),
             1,

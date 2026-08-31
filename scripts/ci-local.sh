@@ -440,6 +440,18 @@ run_step "clippy (tokio)"     env CARGO_TARGET_DIR=target-tokio \
 run_step "clippy (console)"   env CARGO_TARGET_DIR=target-console \
   cargo clippy --no-default-features \
   --features runtime-monoio,jemalloc,graph,text-index,console -- -D warnings || exit 1
+# `handler_sharded` is `cfg(feature = "runtime-tokio")`, so the default leg
+# never compiles it; the tokio leg above drops `text-index`, so it never
+# compiles the parts of it behind that cfg. The intersection — tokio code
+# guarded by text-index — is built by NO gate on this machine and none on
+# Actions. Measured 2026-08-29: a deliberate `let _: u8 = "not a u8";` at
+# `handler_sharded/ft.rs:498` left BOTH the default and tokio legs reporting
+# zero errors, and only this combination caught it. The real defect that
+# exposed it (a `&s.databases[0]` left unconverted by the L4 migration) had
+# been sitting green in exactly that blind spot.
+run_step "clippy (tokio+text-index)" env CARGO_TARGET_DIR=target-tokio-text \
+  cargo clippy --no-default-features \
+  --features runtime-tokio,jemalloc,text-index -- -D warnings || exit 1
 
 if [ "$MODE" != "quick" ] && [ "$MODE" != "native" ]; then
   # ── Phase 1: the two full suites, in the Linux VM ───────────────────
