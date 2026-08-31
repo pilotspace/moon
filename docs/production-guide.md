@@ -714,8 +714,31 @@ channel or serve it in place under a shared read guard on the owner's database.
 
 | `--cross-shard-fast-path` | Behaviour |
 |---|---|
-| `off` (**default**) | Route the read through the SPSC channel, exactly like a write. One extra channel round-trip per read. |
-| `auto` / `on` | Serve the read on the receiving thread under a shared guard on the owner's database. No hop, no park — one CAS. Falls back to SPSC whenever any gate below declines. |
+| `auto` (**default**) | Serve the read in place when the path can actually fire — monoio handler, `--shards > 1`. Declines elsewhere rather than lighting a switch the leg ignores. |
+| `on` | Force it on regardless of shard count or runtime. |
+| `off` | Route the read through the SPSC channel, exactly like a write. One extra channel round-trip **and one park** per read. The rollback. |
+
+Measured at `--shards 8`, uniform keyspace, `GET` p=1, counter ratios from
+`INFO stats` (`total_dispatch_cross_read_fast` vs `total_dispatch_cross_spsc`
+vs `total_remote_awaits_parked`), same binary, one flag apart:
+
+| mode | served in place | parks/cmd |
+|---|---:|---:|
+| `off` | 0.0% | 0.87336 |
+| `auto` | 100.0% | 0.00023 |
+
+`docs/internal/cross-shard-cost-model.md` prices a park at ~24.9 core-us and at
+85% of p=1 cost, so this is the largest single lever on the cross-shard read
+path. **Reads only** — a cross-shard write still parks.
+
+The default shipped `off` while the only evidence was moon#768's `-8.61%` CPU/op
+and a doubled `s8 p16` variance. Both readings came from a half-populated
+keyspace: the path declines a key that is not resident (`dispatch_read` cannot
+consult the cold tier — the moon#610 class), and a declined read falls back to
+the hop. So the "in-place rate" was tracking the benchmark's key HIT rate, and a
+wandering hit rate is exactly the variance that held the default down. Against
+`DBSIZE`: 63,114 keys resident gives 62.9% in place, 98,169 gives 98.2%, 100,000
+gives 100.0%.
 
 > **monoio only.** The dispatch site is in the monoio connection handler — the runtime
 > that ships on Linux and macOS. A build using `--features runtime-tokio` accepts the flag

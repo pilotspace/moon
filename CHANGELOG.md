@@ -100,6 +100,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path never touches. Replaced by `DispatchResult::is_error()`, a borrow-only `matches!`
   over both variants. Semantics are unchanged by construction; the new method is unit-tested
   over `Response`/`Quit` × error/non-error.
+### Changed
+
+- **The cross-shard read fast path ships enabled (`--cross-shard-fast-path auto`).**
+  At `--shards 8` on a populated keyspace it now serves **100%** of foreign reads on the
+  calling thread and takes `parks/cmd` for `GET` at p=1 from **0.87336 to 0.00023** — same
+  binary, one flag apart, measured from `INFO stats`
+  (`total_dispatch_cross_read_fast` / `total_dispatch_cross_spsc` /
+  `total_remote_awaits_parked`). `docs/internal/cross-shard-cost-model.md` prices a park at
+  ~24.9 core-us and at 85% of p=1 cost, so this is the largest single lever on the
+  cross-shard read path. **Reads only** — a cross-shard write still parks, unchanged at
+  0.875/cmd.
+
+  It shipped `off` because the only evidence was moon#768's `-8.61%` CPU/op and a doubled
+  `s8 p16` variance. Both readings came from a **half-populated** keyspace. The path
+  declines a key that is not resident — `dispatch_read` cannot consult the cold tier, the
+  moon#610 class — and a declined read falls back to the SPSC hop, so the measured
+  "in-place rate" was tracking the benchmark's key **hit** rate, and a wandering hit rate
+  is precisely the variance that held the default down. Reproduced against `DBSIZE`:
+  63,114 keys resident gives 62.9% in place, 98,169 gives 98.2%, 100,000 gives 100.0%.
+  This also retires the standing question of why #768 measured 50.5% in place where the
+  model predicted 87.5%.
+
+  `auto` declines where the path cannot fire — `--shards 1` (every key is local) and the
+  tokio leg (`handler_sharded` has no fast-path site, moon#776) — so the switch never reads
+  as enabled on a leg that would ignore it. `on` forces it; **`off` is the rollback** and is
+  pinned by `l4_cross_shard_read_fastpath::the_fast_path_stays_dark_when_the_flag_is_off`.
 
 ### Documentation
 

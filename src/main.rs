@@ -301,31 +301,6 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // L4 S4: resolve --cross-shard-fast-path once, before any shard spawns.
-    // Rejecting an unknown value here rather than silently defaulting keeps a
-    // typo from quietly costing an SPSC hop per cross-shard read.
-    match config.cross_shard_fast_path.as_str() {
-        "auto" | "on" | "yes" => {
-            moon::shard::db_plane::set_cross_shard_fast_path(true);
-            // The dispatch site lives in `handler_monoio`. On the tokio leg
-            // `handler_sharded` still routes every cross-shard read through
-            // SPSC, so the flag would be accepted and do nothing at all --
-            // exactly the moon#776 failure this feature was written to fix.
-            // Say so rather than let an operator tune against a no-op.
-            #[cfg(feature = "runtime-tokio")]
-            tracing::warn!(
-                "--cross-shard-fast-path is enabled but has NO EFFECT on the tokio \
-                 runtime: the fast path is implemented only in the monoio connection \
-                 handler. Cross-shard reads will take the SPSC hop and \
-                 total_dispatch_cross_read_fast will stay at 0."
-            );
-        }
-        "off" | "no" => moon::shard::db_plane::set_cross_shard_fast_path(false),
-        other => {
-            anyhow::bail!("--cross-shard-fast-path must be one of auto|on|off (got {other:?})");
-        }
-    }
-
     // G1 memory guardrail: resolve --maxmemory before any RuntimeConfig is
     // built so an unset cap is auto-populated (cgroup-aware) and the startup
     // notice prints exactly once.
@@ -582,6 +557,40 @@ fn main() -> anyhow::Result<()> {
     // effect. Recorded before the listener binds, so no client can observe a
     // default in place of the real value.
     moon::command::connection::record_shard_count(num_shards);
+
+    // L4 S4: resolve --cross-shard-fast-path once, before any shard spawns.
+    // Rejecting an unknown value here rather than silently defaulting keeps a
+    // typo from quietly costing an SPSC hop per cross-shard read.
+    //
+    // Takes `num_shards`, NOT `config.shards`, for the same reason
+    // `record_shard_count` above does: those differ whenever `--shards 0`
+    // auto-detects, and reading the unresolved 0 would make `auto` decline on
+    // exactly the multi-core hosts the fast path exists for. `auto` otherwise
+    // declines where the path cannot fire, so the switch never reads as enabled
+    // on a leg that would ignore it. The policy is a pure function so it is
+    // unit-tested rather than asserted here.
+    let fast_path_on = moon::shard::db_plane::resolve_cross_shard_fast_path(
+        config.cross_shard_fast_path.as_str(),
+        num_shards,
+        cfg!(feature = "runtime-monoio"),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    moon::shard::db_plane::set_cross_shard_fast_path(fast_path_on);
+    // The dispatch site lives in `handler_monoio`. On the tokio leg
+    // `handler_sharded` still routes every cross-shard read through SPSC, so an
+    // explicit `on` there is accepted and does nothing at all -- exactly the
+    // moon#776 failure this feature was written to fix. Say so rather than let
+    // an operator tune against a no-op. `auto` cannot reach this: it resolves
+    // to `false` without the monoio handler.
+    #[cfg(feature = "runtime-tokio")]
+    if fast_path_on {
+        tracing::warn!(
+            "--cross-shard-fast-path is enabled but has NO EFFECT on the tokio \
+             runtime: the fast path is implemented only in the monoio connection \
+             handler. Cross-shard reads will take the SPSC hop and \
+             total_dispatch_cross_read_fast will stay at 0."
+        );
+    }
 
     // O5: record the non-shard core set BEFORE any auxiliary thread spawns
     // (AOF writers, the vector pools below, and — indirectly — the

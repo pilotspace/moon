@@ -54,6 +54,10 @@ const LIVE_SYMBOLS: &[(&str, &str)] = &[
         "the foreign shared-guard read itself",
     ),
     ("record_dispatch_cross_read_fast", "the fast-path counter"),
+    (
+        "resolve_cross_shard_fast_path",
+        "the auto/on/off policy behind the shipped default",
+    ),
 ];
 
 /// Recursively collect all `.rs` files under `src/` (relative to manifest root).
