@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **INCR/DECR/INCRBY/DECRBY no longer allocate a `String` per operation.** The new value
+  was stored as `Entry::new_string(Bytes::from(new_val.to_string()))` — a heap allocation
+  on the command hot path, which CLAUDE.md forbids outright — and `CompactValue` then
+  copied the digits out of it and freed it again immediately: a counter of up to twelve
+  digits inlines into the 12-byte SSO payload, so the allocation was never even the
+  storage. Now `itoa::Buffer` formats into a stack buffer and the new
+  `Entry::new_string_from_slice{,_with_expiry}` / `CompactValue::from_slice` constructors
+  take it by reference. Unit-tested against `i64::to_string` at every length from 0 to 32
+  bytes and at both i64 extremes, on both the plain and the TTL-preserving arm — the arms
+  differ, and the 12/13-byte SSO boundary sits inside the range an INCR can reach.
+
 - **`Database::set` borrows its key instead of demanding an owned `Bytes`.** Every use of
   `key` inside `set` was already by reference — `spill_inflight_forget`, `entry_overhead`,
   `hash_expiry_index_note_value`, `CompactKey::from` (which copies the bytes either way),

@@ -454,6 +454,63 @@ mod tests {
         assert!(entry.has_expiry());
     }
 
+    /// INCR now formats its new value with `itoa` into a stack buffer instead of
+    /// allocating a `String` per operation. The stored bytes must still be exactly
+    /// what `i64::to_string` produces at every magnitude — in particular across the
+    /// 12-byte SSO boundary, where `CompactValue` switches from inlining the digits
+    /// to heap-allocating them, and at the two i64 extremes.
+    #[test]
+    fn incr_stores_the_same_bytes_at_every_magnitude() {
+        for start in [
+            0i64,
+            -1,
+            8,
+            999_999_999_998,    // -> 999_999_999_999, 12 bytes, last inline
+            999_999_999_999,    // -> 1_000_000_000_000, 13 bytes, first heap
+            -1_000_000_000_001, // -> -1_000_000_000_000, 14 bytes with sign
+            i64::MAX - 1,
+            i64::MIN,
+        ] {
+            let mut db = make_db();
+            db.set_string(b"c", Bytes::from(start.to_string()));
+            let expected = start + 1;
+            assert_eq!(incr(&mut db, &[bs(b"c")]), Frame::Integer(expected));
+            let stored = db.get(b"c").unwrap().value.as_bytes().unwrap().to_vec();
+            assert_eq!(
+                stored,
+                expected.to_string().into_bytes(),
+                "stored bytes diverged from to_string at {start}"
+            );
+            // The stored bytes must parse back, or the next INCR fails.
+            if let Some(next) = expected.checked_add(1) {
+                assert_eq!(incr(&mut db, &[bs(b"c")]), Frame::Integer(next));
+            }
+        }
+    }
+
+    /// The TTL-preserving arm takes a different constructor, so it needs the same
+    /// boundary coverage as the plain one.
+    #[test]
+    fn incr_with_ttl_stores_the_same_bytes_at_every_magnitude() {
+        for start in [7i64, 999_999_999_999, -1_000_000_000_001] {
+            let mut db = make_db();
+            let exp_ms = current_time_ms() + 100_000;
+            db.set(
+                b"c",
+                Entry::new_string_with_expiry(Bytes::from(start.to_string()), exp_ms),
+            );
+            let expected = start + 1;
+            assert_eq!(incr(&mut db, &[bs(b"c")]), Frame::Integer(expected));
+            let entry = db.get(b"c").unwrap();
+            assert!(entry.has_expiry(), "TTL lost at {start}");
+            assert_eq!(
+                entry.value.as_bytes().unwrap().to_vec(),
+                expected.to_string().into_bytes(),
+                "stored bytes diverged from to_string at {start}"
+            );
+        }
+    }
+
     // --- INCRBYFLOAT tests ---
 
     #[test]

@@ -400,11 +400,20 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
         }
     };
 
-    // Store new value preserving existing TTL
+    // Store new value preserving existing TTL.
+    //
+    // `itoa` writes the decimal into a stack buffer. The previous
+    // `Bytes::from(new_val.to_string())` allocated a `String` per operation on
+    // the command hot path (which CLAUDE.md forbids outright) only for
+    // `CompactValue` to copy out of it and free it again immediately: a counter
+    // of up to twelve digits inlines into the SSO payload, so the allocation
+    // was never even the storage.
+    let mut itoa_buf = itoa::Buffer::new();
+    let printed = itoa_buf.format(new_val).as_bytes();
     let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(Bytes::from(new_val.to_string()), existing_expiry_ms)
+        Entry::new_string_from_slice_with_expiry(printed, existing_expiry_ms)
     } else {
-        Entry::new_string(Bytes::from(new_val.to_string()))
+        Entry::new_string_from_slice(printed)
     };
     entry.set_last_access(db.now());
     entry.set_access_counter(5);
