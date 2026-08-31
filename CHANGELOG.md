@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they are not vacuous. A new `resp_parse_fused` fuzz target runs the same differential and
   is registered in **both** matrices in `.github/workflows/fuzz.yml`.
 
+  The reserve for the scanned spans is capped at `buf.len() / 6`, not at the count off
+  the wire. Six bytes is the shortest an element can be, so the cap can never
+  under-allocate a scan that succeeds — and without it `*1048576\r\n`, ten bytes
+  against the default 1Mi `max_array_length`, would have reserved 8 MiB before the scan
+  discovered the frame was incomplete. The two-pass path never had that amplification
+  because it reaches `FrameVec::with_capacity` only after `validate_frame` has proved the
+  whole frame is present.
+
 - **INCR/DECR/INCRBY/DECRBY no longer allocate a `String` per operation.** The new value
   was stored as `Entry::new_string(Bytes::from(new_val.to_string()))` — a heap allocation
   on the command hot path, which CLAUDE.md forbids outright — and `CompactValue` then

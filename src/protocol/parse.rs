@@ -167,6 +167,24 @@ struct FlatScan {
     spans: SmallVec<[(u32, u32); 16]>,
 }
 
+/// How many argument spans to reserve for a claimed element count.
+///
+/// The count comes off the wire, so reserving `count` outright hands a client a
+/// memory amplifier: `*1048576\r\n` is ten bytes and `max_array_length`
+/// defaults to 1Mi, which would reserve 8 MiB before the scan discovered the
+/// frame was incomplete. The two-pass path never had this problem -- it reaches
+/// `FrameVec::with_capacity` only after `validate_frame` proved the whole frame
+/// is present, so the buffer bounds the count for free.
+///
+/// The shortest an element can be is six bytes (`$0\r\n` plus the two trailing
+/// bytes every bulk is charged), so `buf.len() / 6` is a hard ceiling on how
+/// many can possibly be there. Capping at it never under-allocates for a scan
+/// that goes on to succeed, and `SmallVec` grows anyway if it somehow did.
+#[inline]
+fn span_capacity(count: usize, buf_len: usize) -> usize {
+    count.min(buf_len / 6)
+}
+
 /// Scan a flat top-level `*N` of `$`-bulks in ONE pass, recording each
 /// argument's span.
 ///
@@ -225,7 +243,8 @@ fn scan_flat_multibulk(buf: &[u8], config: &ParseConfig) -> Option<FlatScan> {
         return None;
     }
 
-    let mut spans: SmallVec<[(u32, u32); 16]> = SmallVec::with_capacity(count);
+    let mut spans: SmallVec<[(u32, u32); 16]> =
+        SmallVec::with_capacity(span_capacity(count, buf.len()));
     for _ in 0..count {
         if buf.get(pos) != Some(&b'$') {
             return None;
@@ -1380,6 +1399,43 @@ mod tests {
             }
             other => panic!("expected Array, got {other:?}"),
         }
+    }
+
+    /// `*1048576\r\n` is ten bytes and `max_array_length` defaults to 1Mi, so a
+    /// naive `SmallVec::with_capacity(count)` would allocate 8 MiB before the scanner
+    /// discovered the frame was incomplete. The two-pass path never had that
+    /// amplification: `parse_frame_zerocopy` only reaches `FrameVec::with_capacity`
+    /// AFTER `validate_frame` proved the whole frame is present, so the buffer itself
+    /// bounds the count. The scanner allocates first, so it must bound the count itself.
+    ///
+    /// Six bytes is the shortest an element can be (`$0\r\n` + the two trailing bytes),
+    /// so a buffer can never hold more than `len / 6` of them and capping there can
+    /// never under-allocate for a scan that goes on to succeed.
+    #[test]
+    fn span_capacity_is_bounded_by_the_buffer_not_the_claimed_count() {
+        // The attack: a huge claimed count in a tiny buffer.
+        assert_eq!(span_capacity(1024 * 1024, b"*1048576\r\n".len()), 1);
+        assert_eq!(span_capacity(usize::MAX, 0), 0);
+        assert_eq!(span_capacity(1_000_000, 60), 10);
+
+        // Honest commands are unaffected: capacity still covers every argument.
+        for case in [
+            &b"*1\r\n$4\r\nPING\r\n"[..],
+            &b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"[..],
+            &b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"[..],
+            &b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$3\r\n100\r\n"[..],
+        ] {
+            let scan = scan_flat_multibulk(case, &ParseConfig::default())
+                .expect("honest command must still take the fast path");
+            assert!(
+                span_capacity(scan.spans.len(), case.len()) >= scan.spans.len(),
+                "capped capacity under-allocated for {:?}",
+                String::from_utf8_lossy(case)
+            );
+        }
+
+        // And end to end: the pathological header must be declined, not answered.
+        assert!(scan_flat_multibulk(b"*1048576\r\n", &ParseConfig::default()).is_none());
     }
 
     // === Simple String tests ===
