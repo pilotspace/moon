@@ -317,6 +317,7 @@ impl Database {
     /// Uses `DashTable::insert_or_update` for a single SIMD probe on both hit
     /// and miss paths. The old `get_mut` + `insert` pattern ran two probes on
     /// miss (PERF-08).
+    ///
     /// `key` is BORROWED on purpose. Every use below is by reference —
     /// `spill_inflight_forget`, `entry_overhead`, `hash_expiry_index_note_value`,
     /// `CompactKey::from` (which copies the bytes either way), `ColdIndex::remove`
