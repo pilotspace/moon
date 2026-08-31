@@ -1253,7 +1253,6 @@ dependencies = [
  "slotmap",
  "smallvec",
  "socket2",
- "stop-words",
  "thiserror",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
@@ -1917,15 +1916,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 dependencies = [
  "lock_api",
-]
-
-[[package]]
-name = "stop-words"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68df56303396bcfb639455b3c166804aeb7994005010aab5e9e8a1277b8871d"
-dependencies = [
- "serde_json",
 ]
 
 [[package]]

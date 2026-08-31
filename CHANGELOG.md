@@ -36,6 +36,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spent **1184s on the macOS suite**, and the verdict read "re-run failing suites in
   isolation" -- pointing at the tests rather than the missing machine. The two cases are now
   separated, and the refusal names the recreate recipe and `--native` as the meanwhile gate.
+- **`deserialize_term_fst_sidecar` no longer pre-allocates from an unchecked `term_count`.**
+  The per-field term count is a full `u32` read straight off disk and went to
+  `Vec::with_capacity` unvalidated, so a corrupt or truncated sidecar asked the allocator
+  for ~101 GB before reading a single term. `read_bytes` already refused to read past the
+  end of the input; what it could not do is stop the reservation. The count is now bounded
+  by the bytes actually remaining (6 per term, the tightest legal encoding) and fails closed
+  with `InvalidData`, matching the decoder's documented contract. Found by the nightly
+  `term_fst_sidecar` fuzz target, which has reported `AddressSanitizer: out of memory` on
+  every run since at least 2026-08-26.
+- **`mq_registry_blob` fuzz target compiles again.** It hand-copied a 20-field
+  `ShardSliceInit` literal, and that literal rotted **twice** without any gate noticing:
+  `ShardStoreMemory` gained `lua_vm` and then `pagecache`, and separately `databases` became
+  `Arc<ShardDbSet>` under the L4 read plane. The target has failed to *build* since at least
+  2026-07-17, running zero executions on every nightly since; `fuzz/Cargo.lock` was stale
+  enough to still list `stop-words`, dropped from moon by the #690 stoplist fix. Nothing in
+  CI compiles `fuzz/`, so none of it was visible.
+
+  Rather than patch the literal a third time, the target now shares moon's own
+  `shard::slice::test_support::make_init` fixture, exposed through a new additive `fuzzing`
+  feature that only `fuzz/` enables. A new field on any of those structs now breaks the
+  build in-tree, where a gate can see it. `ShardStoreMemory` also derives `Default`, and the
+  two remaining literals construct through it.
 
 ### Removed
 
@@ -45,6 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CI type-checks the `fuzz/` crate on every PR.** Nothing else in CI compiled it, which
+  is how two fuzz targets rotted unnoticed. Added to the Lint job, where it costs no PR
+  wall clock: Lint ran 51s against Check's 585s in the same run, so it has ~9 minutes of
+  slack before it could become the critical path.
 - **D3 W1: `try_foreign_db_write`, the exclusive twin of `try_foreign_db_read`.** Mutates a
   foreign shard's database on the calling thread under a non-blocking exclusive guard, or
   returns `None` so the caller falls through to SPSC. No production callers yet by design —

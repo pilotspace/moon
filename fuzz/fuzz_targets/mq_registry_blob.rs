@@ -1,15 +1,8 @@
 #![no_main]
-use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
-
 use libfuzzer_sys::fuzz_target;
 use moon::replication::mq_sync::install_mq_registry_many;
-use moon::shard::shared_databases::ShardStoreMemory;
-use moon::shard::slice::{ShardSlice, ShardSliceInit, init_shard, with_shard};
-use moon::storage::db::Database;
-use moon::text::store::TextStore;
-use moon::transaction::{DeferredHnswInserts, KvWriteIntents};
-use moon::vector::store::VectorStore;
+use moon::shard::slice::test_support::make_init;
+use moon::shard::slice::{ShardSlice, init_shard, with_shard};
 
 /// Fuzz the Wave B stage 2b MQ-registry FULLRESYNC blob decoder
 /// (`replication::mq_sync::install_mq_registry_many`), mirroring
@@ -41,29 +34,15 @@ fuzz_target!(|data: &[u8]| {
 });
 
 fn make_fuzz_slice() -> ShardSlice {
-    let databases: Box<[Database]> = (0..1).map(|_| Database::new()).collect();
-    ShardSlice::new(ShardSliceInit {
-        shard_id: 0,
-        databases,
-        vector_store: VectorStore::new(),
-        text_store: TextStore::new(),
-        // moon-fuzz always builds `moon` with the "graph" feature (see
-        // fuzz/Cargo.toml), so this field is unconditional here even
-        // though it's `#[cfg(feature = "graph")]` inside moon itself.
-        graph_store: moon::graph::store::GraphStore::new(),
-        kv_write_intents: KvWriteIntents::new(),
-        deferred_hnsw_inserts: DeferredHnswInserts::new(),
-        temporal_registry: None,
-        temporal_kv_index: None,
-        durable_queue_registry: None,
-        trigger_registry: None,
-        wal_append_tx: None,
-        estimated_memory: Arc::new(AtomicUsize::new(0)),
-        store_memory: Arc::new(ShardStoreMemory {
-            vector: AtomicUsize::new(0),
-            text: AtomicUsize::new(0),
-            graph: AtomicUsize::new(0),
-            lua: AtomicUsize::new(0),
-        }),
-    })
+    // `test_support::make_init` rather than a hand-written `ShardSliceInit`
+    // literal. The literal that used to live here rotted twice without any
+    // gate noticing -- `ShardStoreMemory` gained two fields, then `databases`
+    // became `Arc<ShardDbSet>` -- and this target failed to BUILD on every
+    // nightly since at least 2026-07-17, running zero executions the whole
+    // time. Sharing the fixture with moon's own tests means a new field
+    // breaks the build in-tree, where a gate can see it.
+    //
+    // make_init deliberately builds a STANDALONE db set: the L4 registry is a
+    // process-wide OnceLock, and a fuzz process runs many iterations.
+    ShardSlice::new(make_init(0, 1))
 }

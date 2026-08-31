@@ -73,6 +73,21 @@ jobs:
       # VM. It runs here so the thresholds cannot silently rot — the check
       # itself only ever runs on a developer's machine.
       - run: bash scripts/test-ci-local-preflight.sh
+      # Nothing else in CI compiles `fuzz/`, and it showed: `mq_registry_blob`
+      # failed to BUILD on every nightly from at least 2026-07-17 — running zero
+      # executions the whole time — because `ShardStoreMemory` gained two fields
+      # and no gate would ever have said so. The nightly is the only job that
+      # touches the crate, and a red nightly went unread for months.
+      #
+      # A type-check catches that entire class, and it is free in wall-clock
+      # terms rather than merely cheap: measured on PR #780, Lint took 51s
+      # against Check's 585s in the same run, so Lint has ~9 minutes of slack
+      # before it could become the critical path.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> fuzz/target"
+      - name: Fuzz targets still compile
+        run: cargo check --manifest-path fuzz/Cargo.toml --all-targets
       - name: CHANGELOG check
         if: github.event_name == 'pull_request'
         env:
