@@ -98,6 +98,18 @@ jobs:
         env:
           MOON_NO_URING: "1"
           TARGET: ${{ matrix.target }}
+      # Same reasoning as the nightly job's copy below: without this the
+      # reproducer for anything a `ci-fuzz` PR run finds dies with the runner,
+      # leaving only the ASan line in the log. This job archives nothing else,
+      # so there is no corpus artifact for it to collide with.
+      - name: Archive crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-pr-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/
+          retention-days: 30
+          if-no-files-found: ignore
 
   fuzz-nightly:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -188,6 +200,28 @@ jobs:
           MOON_NO_URING: "1"
           TARGET: ${{ matrix.target }}
           BUDGET: ${{ inputs.duration_seconds }}
+      # libFuzzer writes the minimal reproducer for a finding to
+      # fuzz/artifacts/<target>/crash-<sha>, prints the path, fails the job --
+      # and the runner is then destroyed with the file still on it. Only
+      # `fuzz/corpus/` was archived, so every finding this workflow has ever
+      # made was unreproducible afterwards: the term_fst_sidecar OOM had to be
+      # diagnosed from the one ASan line left in the log, and its reproducer is
+      # gone for good.
+      #
+      # A SEPARATE artifact, deliberately not a second entry in the corpus
+      # step's `path:`. upload-artifact@v4 re-roots a multi-path archive at the
+      # paths' common ancestor, so adding fuzz/artifacts/ there would move the
+      # corpus down one level and the next run's download -- which extracts
+      # into fuzz/corpus/ -- would land it in fuzz/corpus/corpus/, silently
+      # ending corpus seeding while still reporting success.
+      - name: Archive crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/
+          retention-days: 90
+          if-no-files-found: ignore
       - name: Archive corpus
         if: always()
         uses: actions/upload-artifact@v4
