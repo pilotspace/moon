@@ -47,6 +47,11 @@
 #   * A disk pre-flight runs before anything else: a full VM root makes
 #     legs fail with no error text and can wedge OrbStack outright, a
 #     signature that reads as test flakiness for hours.
+#   * A VM gate runs before even that (exit 4): the pre-flight steps aside
+#     when it cannot MEASURE the VM, which is right, but that also let a
+#     VANISHED VM through -- and then every VM leg fails at 0s while the
+#     run spends ~20 more minutes on the macOS suite before blaming the
+#     tests. "Cannot measure" and "cannot reach" are now separate.
 #   * The tree is fingerprinted at start and re-checked at the end: a
 #     branch switch or edit mid-run silently invalidates every result
 #     (suites compile from a mutating tree), so the run refuses to
@@ -61,7 +66,9 @@ set -u -o pipefail
 # does not exist and the `cd` below would exit 2 before any gate ran, which is
 # indistinguishable from a gate deciding to exit 2.
 REPO="${CI_LOCAL_REPO:-/Volumes/Games/tindang-repo/moon}"
-VM="moon-dev"
+# CI_LOCAL_VM exists for scripts/test-ci-local-preflight.sh, which points the
+# VM gate below at a name that cannot exist to prove it actually refuses.
+VM="${CI_LOCAL_VM:-moon-dev}"
 # The bare invocation is the MERGE BAR, and since moon#732 that means `full`.
 # The pre-merge hosted matrix no longer runs macOS or client-compat — they were
 # duplicating this script on a slower machine — so if they are not gates HERE
@@ -288,6 +295,28 @@ disk_facts() {
   esac
 }
 
+# vm_gate_verdict — pure: given the mode and whether the VM answered, say
+# whether this run may start. Split from the probe below for the same reason
+# `disk_verdict` is split from `preflight_disk`: the decision is testable
+# without a VM, and a decision no one can test is a decision that drifts.
+#
+# SKIP is not OK: --quick and --native never touch the VM, so its absence is
+# irrelevant to them and must not ground them.
+vm_gate_verdict() { # vm_gate_verdict <mode> <reachable 0=yes|1=no>
+  case "$1" in
+    quick|native) echo "SKIP"; return 0 ;;
+  esac
+  if [ "$2" -eq 0 ]; then echo "OK"; return 0; fi
+  echo "FAIL"
+  return 1
+}
+
+# vm_reachable — the I/O half: can we execute ANYTHING in the VM at all?
+# Deliberately not "does the machine exist": a stopped, wedged or deleted VM
+# are one condition here, because each makes every VM leg a guaranteed 0s
+# failure. Answers in well under a second either way.
+vm_reachable() { orb run -m "$VM" true >/dev/null 2>&1; }
+
 # preflight_disk — read the VM's real numbers, judge each leg in the order
 # it runs, and refuse to start a run that cannot finish. Failure to READ
 # the numbers is never itself a blocker: a pre-flight that can't measure
@@ -314,8 +343,10 @@ preflight_disk() {
     tgt=$(echo "$probe" | sed -n "${i}p"); i=$((i + 1))
     v=$(disk_verdict "$projected" "$tgt") || rc=1
     printf "  %-14s target %3sG  free %3sG  %s\n" "$leg" "$(as_gb "$tgt")" "$(as_gb "$projected")" "$v"
-    # A cold leg will consume its build before the next leg starts, so the
-    # next leg is judged against what will actually be left.
+    # A cold leg's build is still on disk when the other leg needs its own,
+    # so the second leg is judged against what will actually be left. The
+    # arithmetic is unchanged now that the two run CONCURRENTLY: the peak is
+    # both dirs materialised at once either way, which is what this models.
     if [ "$tgt" -lt "$DISK_COLD_DIR_BYTES" ]; then
       projected=$((projected - DISK_COLD_NEED_BYTES))
       [ "$projected" -lt 0 ] && projected=0
@@ -413,6 +444,44 @@ if [ -n "${CI_LOCAL_LIB_ONLY:-}" ]; then
   return 0 2>/dev/null || exit 0
 fi
 
+# ── VM gate: is there a VM at all? ────────────────────────────────────
+# The disk pre-flight below deliberately steps aside when it cannot READ the
+# numbers — an unreadable `df` must not ground a healthy run. But that same
+# branch also swallowed the case where the machine is GONE, and the two are
+# not alike: with no VM, all four VM legs fail at 0s and the run carries on
+# to spend ~20 minutes on the macOS suite before reporting "RESULT: FAIL —
+# re-run failing suites in isolation", which points the reader at their code.
+#
+# Measured 2026-08-31, the 4th time moon-dev has vanished: exactly that, 1184s
+# of macOS suite run after the verdict was already decided. So the two cases
+# are now separated — cannot-measure still steps aside, cannot-reach refuses.
+#
+# Skipped under CI_LOCAL_DRY_RUN: the dry run walks control flow on machines
+# that have no `orb` at all (tests/ci_covers_monoio.rs runs it on a hosted
+# runner), and it starts nothing that a missing VM could break.
+if [ -z "${CI_LOCAL_DRY_RUN:-}" ]; then
+  vm_reachable; VM_UP=$?
+  if [ "$(vm_gate_verdict "$MODE" "$VM_UP")" = "FAIL" ]; then
+    echo ""
+    echo "  ✗ VM '$VM' IS NOT REACHABLE — refusing to start."
+    echo "    Every VM leg would fail at 0s and the verdict would blame your tests."
+    echo "    This is infrastructure, not code. (An \`orb\` that is not on PATH"
+    echo "    counts as unreachable — every VM leg would fail the same way.)"
+    echo "    Check which one it is:"
+    echo "      orbctl list        # empty means the VM is gone -> recreate below"
+    echo "      orb start $VM   # listed means it is merely stopped"
+    echo "    Recreate (~15 min, then the first run is a cold build):"
+    echo "      orb create ubuntu $VM"
+    echo "      apt-get install build-essential pkg-config libssl-dev redis-server \\"
+    echo "                      git python3-redis libicu-dev curl"
+    echo "      rustup default stable; cargo-nextest from https://get.nexte.st"
+    echo "    The self-hosted Actions runner dies WITH the VM — reinstall it too,"
+    echo "    or the hosted monoio and client-compat legs queue forever."
+    echo "    To gate without a VM meanwhile: scripts/ci-local.sh --native"
+    exit 4
+  fi
+fi
+
 # The VM legs are the ones that need room; --quick is host-only. The host
 # repo volume is not checked: it carries 3G target dirs, not 34G ones.
 if [ "$MODE" != "quick" ] && [ "$MODE" != "native" ]; then
@@ -455,16 +524,58 @@ run_step "clippy (tokio+text-index)" env CARGO_TARGET_DIR=target-tokio-text \
 
 if [ "$MODE" != "quick" ] && [ "$MODE" != "native" ]; then
   # ── Phase 1: the two full suites, in the Linux VM ───────────────────
-  # Sequential, monoio (shipped runtime) first: parallel VM builds of two
-  # feature sets contend on memory and the shared-volume virtiofs.
+  # CONCURRENT since 2026-08-31. They ran sequentially because parallel VM
+  # builds of two feature sets were expected to contend on memory and on the
+  # shared-volume virtiofs. That was never re-measured after the 6-CPU cap and
+  # the moon#735 debug-info cuts, and it no longer holds.
+  #
+  # Measured ABBA on moon-dev, warm target dirs, 2 reps per arm:
+  #
+  #   sequential   469s, 453s   (mean 461s)
+  #   concurrent   256s, 256s   (mean 256s)   -44.5%
+  #
+  # with ZERO flaky tests and ZERO retries in all four arms. The mechanism is
+  # in the per-suite times: each suite slows only ~9% when sharing the VM
+  # (monoio 229 -> 250s, tokio 228 -> 249s), because neither saturates the 6
+  # vCPUs — both spend most of their wall clock waiting on spawned servers.
+  # Overlapping the waits is where the other half of the time goes.
+  #
+  # CI_LOCAL_VM_SEQUENTIAL=1 restores the old order without an edit: two reps
+  # are evidence, not proof, and a wall-clock-sensitive test that starts
+  # failing under the extra load needs a one-command A/B, not a bisect.
+  #
   # `export VAR=...;` (not a bare env prefix): $VM_TEST_* expands to an
   # `if` COMPOUND command, and `VAR=x if ...` is a bash syntax error —
   # phase 1 exited in <1s with rc=2 without running a single test the
   # first time --full was exercised (2026-08-19).
-  run_step "VM monoio suite (shipped runtime)" \
-    vm "export CARGO_TARGET_DIR=\$HOME/ci-target/local-monoio MOON_DISK_FREE_MIN_PCT=0 $CI_BUILD_ENV; $VM_TEST_MONOIO"
-  run_step "VM tokio suite" \
-    vm "export CARGO_TARGET_DIR=\$HOME/ci-target/local-tokio MOON_NO_URING=1 MOON_DISK_FREE_MIN_PCT=0 $CI_BUILD_ENV; $VM_TEST_TOKIO"
+  VM_MONOIO_CMD="export CARGO_TARGET_DIR=\$HOME/ci-target/local-monoio MOON_DISK_FREE_MIN_PCT=0 $CI_BUILD_ENV; $VM_TEST_MONOIO"
+  VM_TOKIO_CMD="export CARGO_TARGET_DIR=\$HOME/ci-target/local-tokio MOON_NO_URING=1 MOON_DISK_FREE_MIN_PCT=0 $CI_BUILD_ENV; $VM_TEST_TOKIO"
+
+  # Both legs' output is captured and replayed with an explicit rc per leg:
+  # interleaving two suites' stdout live would make a failure unreadable, and
+  # one row for two suites must never hide WHICH one failed.
+  vm_suites_concurrent() {
+    local ml tl pm pt rc_m rc_t
+    ml=$(mktemp "${TMPDIR:-/tmp}/cilocal-mono.XXXXXX")
+    tl=$(mktemp "${TMPDIR:-/tmp}/cilocal-toki.XXXXXX")
+    vm "$VM_MONOIO_CMD" > "$ml" 2>&1 & pm=$!
+    vm "$VM_TOKIO_CMD"  > "$tl" 2>&1 & pt=$!
+    wait $pm; rc_m=$?
+    wait $pt; rc_t=$?
+    echo "──── monoio suite (shipped runtime) — rc=$rc_m ────"
+    cat "$ml"
+    echo "──── tokio suite — rc=$rc_t ────"
+    cat "$tl"
+    command rm -f "$ml" "$tl"
+    [ "$rc_m" -eq 0 ] && [ "$rc_t" -eq 0 ]
+  }
+
+  if [ -n "${CI_LOCAL_VM_SEQUENTIAL:-}" ]; then
+    run_step "VM monoio suite (shipped runtime)" vm "$VM_MONOIO_CMD"
+    run_step "VM tokio suite"                    vm "$VM_TOKIO_CMD"
+  else
+    run_step "VM suites, concurrent (monoio + tokio)" vm_suites_concurrent
+  fi
 fi
 
 if [ "$MODE" = "native" ]; then
@@ -517,9 +628,27 @@ if [ "$MODE" = "full" ]; then
     vm "MOON_BIN=\$HOME/ci-target/local-compat/release/moon MOON_NO_URING=1 MOON_DISK_FREE_MIN_PCT=0 \
         ./scripts/test-client-compat.sh --strict --contexts standalone,multi,pipeline"
   # ── Phase 3: macOS host suite (tokio — kqueue) ──────────────────────
+  # Runs through HOST_TEST_TOKIO — the same nextest-or-fallback shape the VM
+  # legs and `--native` already use. This leg was the one place still on a
+  # plain `cargo test`, which runs each test binary end to end before starting
+  # the next; nextest schedules individual tests across all cores instead.
+  #
+  # Measured on this repo, same tree, target-tokio fully warm (the build was a
+  # 1.46s no-op, so this is execution time only): 264 test binaries took 561.5s
+  # sequentially and 148.4s under nextest — -73.6%, 5354 passed, no retries.
+  # The rest of the leg is codegen and linking those 264 binaries, which
+  # nextest does not change and which now dominates it: the `clippy (tokio)`
+  # gate above shares target-tokio but has no `--all-targets`, so it warms
+  # dependency rlibs and never builds a single test binary.
   run_step "macOS host tokio suite" \
     env MOON_NO_URING=1 CARGO_TARGET_DIR=target-tokio \
-    cargo test --no-default-features --features runtime-tokio,jemalloc --no-fail-fast
+    bash -c "$HOST_TEST_TOKIO"
+  # nextest does not run doctests — it says so and exits non-zero on `--doc`.
+  # Without this step the switch above would silently drop doctest coverage
+  # from the local bar. `ci.yml` splits them the same way for the same reason.
+  run_step "macOS host tokio doctests" \
+    env MOON_NO_URING=1 CARGO_TARGET_DIR=target-tokio \
+    cargo test --doc --no-default-features --features runtime-tokio,jemalloc
 fi
 
 # ── Tree-mutation tripwire ────────────────────────────────────────────
