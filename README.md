@@ -204,7 +204,7 @@ Full tutorials in [examples/](examples/): [RAG](examples/rag-quickstart/), [Sema
 
 Headline numbers vs Redis 8.6.1, peak throughput, co-located client/server.
 **Full methodology, ARM64, vector, graph, persistence, and latency tables
-are in [BENCHMARK.md](BENCHMARK.md)** and [docs/benchmarks.mdx](docs/benchmarks.mdx).
+are in [BENCHMARK.md](BENCHMARK.md)** and [docs/benchmarks.md](docs/benchmarks.md).
 
 ### Peak throughput (GCloud c3-standard-8, x86_64, monoio io_uring)
 
