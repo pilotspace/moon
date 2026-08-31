@@ -209,6 +209,37 @@ expect_run() { # expect_run <label> <want-exit> <grep-pattern> <env-prefix...>
 }
 
 echo ""
+echo "── vm_gate_verdict ──"
+# A vanished moon-dev VM used to reach the disk pre-flight, which cannot read
+# a machine that is not there, and that path was written to step aside rather
+# than block. So the run continued: four VM legs failed at 0s and the macOS
+# suite still ran for 1184s before the summary blamed the tests (2026-08-31,
+# the 4th vanish). These rows pin the split between "cannot measure" and
+# "cannot reach".
+expect_vm() { # expect_vm <label> <want-verdict> <mode> <reachable 0|1>
+  local label=$1 want=$2 mode=$3 up=$4 got rc
+  got=$(vm_gate_verdict "$mode" "$up")
+  rc=$?
+  # Same rule as disk_verdict: a FAIL that returns 0 stops nothing.
+  if [ "$got" = "$want" ] && { [ "$want" != "FAIL" ] || [ $rc -ne 0 ]; } \
+     && { [ "$want" = "FAIL" ] || [ $rc -eq 0 ]; }; then
+    PASS=$((PASS + 1)); printf "  ok    %-46s %s\n" "$label" "$got"
+  else
+    FAIL=$((FAIL + 1)); printf "  FAIL  %-46s got=%s(rc=%s) want=%s\n" "$label" "$got" "$rc" "$want"
+  fi
+}
+
+expect_vm "full + VM up"                    OK    full   0
+expect_vm "fast + VM up"                    OK    fast   0
+# The whole point: the merge bar must refuse, not run for 20 minutes first.
+expect_vm "full + VM unreachable"           FAIL  full   1
+expect_vm "fast + VM unreachable"           FAIL  fast   1
+# ...and the two modes that never touch the VM must be unaffected by it,
+# or a dead VM would ground the very fallbacks that exist for a dead VM.
+expect_vm "quick + VM unreachable (host only)"   SKIP  quick  1
+expect_vm "native + VM unreachable (the fallback)" SKIP native 1
+
+echo ""
 echo "── ci-local.sh --native control flow ──"
 # `mktemp -t NAME` is a BSD spelling: GNU mktemp requires X's in the
 # template and fails outright, which is how this file first went green on
@@ -262,6 +293,22 @@ else
   else
     FAIL=$((FAIL + 1)); printf "  FAIL  %-46s got exit=%s want=2\n" "unknown flag exits 2" "$rc"
   fi
+fi
+
+# The table above proves the DECISION; this proves the WIRING. A verdict
+# function nothing calls would pass every row and still gate nothing — the
+# same "selection, not presence" gap tests/ci_covers_monoio.rs exists for.
+# CI_LOCAL_VM names a machine that cannot exist, so this is deterministic on
+# a hosted runner (no `orb` at all) and on the dev Mac alike. It must exit
+# before Phase 0, so no gate actually runs here.
+out=$(env CI_LOCAL_REPO="$REPO_HERE" CI_LOCAL_VM="moon-dev-does-not-exist-$$" \
+        bash scripts/ci-local.sh --full 2>&1)
+rc=$?
+if [ "$rc" = 4 ] && printf '%s' "$out" | grep -q "IS NOT REACHABLE"; then
+  PASS=$((PASS + 1)); printf "  ok    %-46s exit=4\n" "unreachable VM refuses to start"
+else
+  FAIL=$((FAIL + 1)); printf "  FAIL  %-46s got exit=%s want=4\n" \
+    "unreachable VM refuses to start" "$rc"
 fi
 
 echo ""

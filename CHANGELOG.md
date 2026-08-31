@@ -6,6 +6,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`ci-local.sh` runs the two VM suites concurrently.** They were sequential because
+  parallel builds of two feature sets were expected to contend on memory and on the
+  shared-volume virtiofs — a rule set before the 6-CPU cap and the moon#735 debug-info cuts
+  and never re-measured since. Measured ABBA on moon-dev with warm target dirs, 2 reps per
+  arm: **sequential 469s/453s (mean 461s) vs concurrent 256s/256s (mean 256s), -44.5%**,
+  with zero flaky tests and zero retries in all four arms. The mechanism shows in the
+  per-suite times — each suite slows only ~9% when sharing the VM (monoio 229 -> 250s,
+  tokio 228 -> 249s) because neither saturates the 6 vCPUs; both spend most of their wall
+  clock waiting on spawned servers, and overlapping those waits is the other half.
+  `CI_LOCAL_VM_SEQUENTIAL=1` restores the old order without an edit.
+- **`ci-local.sh`: the macOS host tokio leg runs under nextest.** It was the one leg still
+  on a plain `cargo test`, which finishes each test binary before starting the next. Measured
+  same-tree with `target-tokio` warm (the build was a 1.46s no-op, so this is execution time
+  only): 264 test binaries, **561.5s sequential -> 148.4s under nextest (-73.6%)**, 5354
+  passed with no retries. Doctests moved to their own step, because nextest does not run them
+  and the switch would otherwise have dropped that coverage silently -- `ci.yml` already
+  splits them the same way.
+
+### Fixed
+
+- **`ci-local.sh` refuses to start when the moon-dev VM is unreachable (new exit 4).** The
+  disk pre-flight deliberately steps aside when it cannot *measure* the VM -- an unreadable
+  `df` must not ground a healthy run -- but the same branch also swallowed a VM that was
+  *gone*. Measured 2026-08-31, the 4th time moon-dev vanished: the pre-flight printed
+  `ok (0s)` for a machine that did not exist, all four VM legs failed at 0s, the run then
+  spent **1184s on the macOS suite**, and the verdict read "re-run failing suites in
+  isolation" -- pointing at the tests rather than the missing machine. The two cases are now
+  separated, and the refusal names the recreate recipe and `--native` as the meanwhile gate.
+
+### Removed
+
+- **`.github/workflows/claude.yml`.** It triggered on every issue comment, review, review
+  comment and issue open, then skipped unless the body contained `@claude`. Across the last
+  60 triggering events it ran 0 times and skipped 60. Recoverable from git history.
+
 ### Added
 
 - **D3 W1: `try_foreign_db_write`, the exclusive twin of `try_foreign_db_read`.** Mutates a
