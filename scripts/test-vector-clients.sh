@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# moon: `grep -q` exits on the FIRST match, closing the pipe. Under
+# `set -o pipefail` that SIGPIPEs the writer, so the PIPELINE reports failure
+# even though grep succeeded -- turning any assertion whose output is longer
+# than a pipe buffer into a spurious FAIL. `qgrep` drains stdin first, so the
+# writer always completes and only grep's own verdict is reported.
+qgrep() { local _in; _in=$(cat); grep "$@" <<< "$_in" > /dev/null; }
+
+
 ###############################################################################
 # test-vector-clients.sh -- Vector search (FT.*) smoke test via redis-cli
 #
@@ -45,7 +53,7 @@ trap cleanup EXIT
 
 wait_for_port() {
     for ((i=0; i<30; i++)); do
-        redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG && return 0
+        redis-cli -p "$PORT" PING 2>/dev/null | qgrep -q PONG && return 0
         sleep 0.2
     done
     log "ERROR: port $PORT not ready"; return 1
@@ -74,7 +82,7 @@ assert_contains() {
     TOTAL=$((TOTAL + 1))
     local actual
     actual=$(mcli "$@")
-    if echo "$actual" | grep -qi "$substring"; then
+    if echo "$actual" | qgrep -qi "$substring"; then
         PASS=$((PASS + 1))
         echo "  PASS: $label"
     else
@@ -89,7 +97,7 @@ assert_not_error() {
     TOTAL=$((TOTAL + 1))
     local actual
     actual=$(mcli "$@")
-    if ! echo "$actual" | grep -qi "^(error)"; then
+    if ! echo "$actual" | qgrep -qi "^(error)"; then
         PASS=$((PASS + 1))
         echo "  PASS: $label"
     else
@@ -104,7 +112,7 @@ assert_error() {
     TOTAL=$((TOTAL + 1))
     local actual
     actual=$(mcli "$@")
-    if echo "$actual" | grep -qi "err"; then
+    if echo "$actual" | qgrep -qi "err"; then
         PASS=$((PASS + 1))
         echo "  PASS: $label"
     else
@@ -227,12 +235,12 @@ echo "--- FT.INFO post-insert ---"
 TOTAL=$((TOTAL + 1))
 FT_INFO_RESULT=$(mcli FT.INFO vec_test)
 # num_docs should be >= 4
-if echo "$FT_INFO_RESULT" | grep -qE "(num_docs|4)"; then
+if echo "$FT_INFO_RESULT" | qgrep -qE "(num_docs|4)"; then
     PASS=$((PASS + 1))
     echo "  PASS: FT.INFO shows docs after insert"
 else
     # Even if we can't parse num_docs exactly, it shouldn't error
-    if ! echo "$FT_INFO_RESULT" | grep -qi "err"; then
+    if ! echo "$FT_INFO_RESULT" | qgrep -qi "err"; then
         PASS=$((PASS + 1))
         echo "  PASS: FT.INFO returns data (no error)"
     else
