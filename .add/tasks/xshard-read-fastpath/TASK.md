@@ -786,3 +786,86 @@ Two open questions, both with real headroom, neither answered here:
    Narrowing the guard to writes only would raise capture substantially — but
    that is precisely the moon#507/#512 silent-write-loss surface, so it needs
    its own red test before anyone touches it.
+
+## 10. D1 pre-flight — is the park cost per-SIGNAL or per-AWAIT?
+
+The artifact's D1 projection (24.5 -> 10.9 us/cmd) divides the whole 17.8 us
+park by a batch factor of 8.16. That only holds if the cost is a fixed per-park
+quantity. If it were per-command work inside the hop, batching the wake would
+buy nothing and D1 would land on the "per peer pair" row -- still behind Redis.
+The artifact itself says: get this detail right or skip the project.
+
+**Control.** Same connection counts, `--shards 1` (zero hops, zero parks) vs
+`--shards 8`. Commands-per-park `q` varies ~10x between P=1 and P=16, which is
+what separates a fixed per-park cost from per-command work. Legs interleaved
+with rotating order; 3 reps; two-box GCE (t2a-standard-8 server, c3-standard-8
+generator). Data: `d1_preflight.csv`.
+
+| c | P | s1 us/cmd | s8 us/cmd | hop/cmd | parks/cmd | cmd/park | depth | us/park |
+|---|---|---|---|---|---|---|---|---|
+| 50 | 1 | 8.91 | 34.15 | 25.24 | 0.8618 | 1.16 | 14.8 | 29.3 |
+| 200 | 1 | 8.87 | 24.47 | 15.60 | 0.8722 | 1.15 | 63.5 | 17.9 |
+| 800 | 1 | 9.11 | 21.84 | 12.73 | 0.8741 | 1.14 | 153.6 | 14.6 |
+| 200 | 16 | 0.96 | 4.30 | 3.34 | 0.0885 | 11.30 | 75.8 | 37.8 |
+| 800 | 16 | 1.00 | 4.20 | 3.20 | 0.0855 | 11.69 | 270.4 | 37.4 |
+
+Fitting `hop_us_per_cmd = S/q + w + L/depth` over all 15 per-rep points:
+
+    S = 13.23 us   fixed per park      (the only term a batched wake divides)
+    w = 0.45 us    per command in-hop  (survives any batching)
+    L = 197 us     per loop iteration, already amortised by parked depth
+    R^2 = 0.9937;  bootstrap S = 13.29, 90% CI [12.22, 14.28]
+
+**The S=0 null is refuted.** Forcing S=0 drops R^2 to 0.6882 and needs
+w = 5.80 us/cmd, which cannot reproduce the P=16 rows. A large fixed per-park
+cost is *required* by the data. S is real.
+
+### But S is NOT the wake signal, so D1 cannot capture it. DO NOT BUILD D1.
+
+`S` is "fixed cost per park". That is the sum of the cross-thread *signal* and
+the task *suspend/resume*. D1 batches only the signal. Two independent checks
+say the signal is already almost free:
+
+1. **monoio already coalesces the wake.** `EventWaker::wake()` (identically in
+   `driver/uring/waker.rs` and `driver/legacy/waker.rs`) opens with
+   `if self.awake.load(Acquire) { return Ok(()); }`. `awake` is cleared only
+   immediately before the driver sleeps, so under load the eventfd write is
+   skipped and a cross-thread wake costs one atomic load plus a `send_waker`
+   channel push.
+2. **Measured, not inferred.** Under io_uring, socket sends are ring ops, so
+   `/proc/<pid>/io:syscw` counts essentially only eventfd wakes. At c=200 P=1:
+
+   | shards | syscw/cmd | parks/cmd |
+   |---|---|---|
+   | 1 | 0.000 | 0.0000 |
+   | 8 | **0.111** | **0.8723** |
+
+   Only 12.7% of parks cost a syscall; monoio coalesces the other 87%.
+
+D1's entire ceiling is those 0.111 syscalls/cmd plus N-1 channel sends per
+drain -- order 1% of a 15.6 us hop, not the 2.2x the artifact projects. The
+artifact contradicted itself: its own SS03 says "it is not a futex wake --
+which is why 'make the wake cheaper' is the wrong instinct and eliminating the
+hop is the right one", and then SS05 recommends exactly a cheaper wake. SS03 was
+right.
+
+**Revised sequence: skip D1. Go to D2 (extend the landed shared-guard fast
+path, which eliminates the hop for reads) and then D3 (KV-only concurrent
+keyspace).** Both remove the hop rather than making its wake cheaper, which is
+what the measurement supports.
+
+### Caveats that the acceptance run must respect
+
+- **Regime.** At c>=200 the s8 server sits at ~6.9 of 8 cores and its
+  throughput ceiling (c=200 291k rps -> c=800 308k rps, +6% for 4x the
+  concurrency). Marginal-cost readings there are throughput-limited. An
+  unsaturated control at c=16 (both configs ~92k rps) puts the hop at
+  37.2 us/cmd, not 15.6 -- the hop cost is regime-dependent and any published
+  figure must name its regime.
+- The `L/depth` term does not hold at P=16 (per-park cost is flat at ~37.5 us
+  across a 3.6x depth change), so the model is misspecified there and the P=16
+  residuals run to 38%. S is robust to this; L is not.
+- `total_commands_processed` in INFO **never advances** on this build (0 across
+  GET/SET, shards 1 and 8, and plain redis-cli). The denominator here comes
+  from the generator's own "requests completed" line instead. Filed separately;
+  it is a monitoring-parity defect, not a benchmark artifact.

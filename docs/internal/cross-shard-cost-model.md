@@ -26,7 +26,7 @@ terms:
 | p=8  | 0.70 | — | — |
 | p=16 | 0.55 | — | — |
 
-```
+```text
 cost = 0.413 − 0.046·msgs/cmd + 2.488·parks/cmd        (CPU%/kops)
 ```
 

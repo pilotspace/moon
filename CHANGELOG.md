@@ -169,6 +169,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-derived.
 
 ### Fixed
+
+- **Cross-shard fast path: a thread outside the registered database plane could serve a
+  foreign read off the registry.** `try_foreign_db_read` resolved `shard_dbs(shard)` from
+  the process-wide L4 registry without first checking that the *calling* thread is part of
+  that registry. `init_shard` publishes `MY_DB_SET` only when the registry holds the very
+  same set the slice does, so a thread holding a slice built beside the registry would read
+  the registry's `Database` while its own writes landed in a different one — stale data
+  returned under a `+OK`, silently. The gate is now `cached_db_set()?` first; unregistered
+  threads fall through to SPSC, which is what they did before S4 landed. Covered by
+  `foreign_read_refuses_from_a_thread_outside_the_registered_plane`, which fails with
+  `Some(1)` against the previous code.
+- **`ResponseSlot` unit tests raced the process-global park counters.** `test_future_resolves_after_fill`
+  and `test_concurrent_fill_from_another_thread` poll a `ResponseSlotFuture`, moving
+  `REMOTE_AWAITS`/`REMOTE_AWAITS_PARKED`, while the two counter assertions ran in parallel
+  in the same binary. Both now take the same `PARK_COUNTERS` lock the counter tests hold.
 - **`TXN ABORT` left torn state after a multi-key write (moon#500).**
 
   The undo capture in both connection handlers recorded a single key per command:

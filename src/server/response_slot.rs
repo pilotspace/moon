@@ -565,6 +565,9 @@ mod tests {
 
     #[test]
     fn test_future_resolves_after_fill() {
+        // Polling a ResponseSlotFuture moves the process-global park counters,
+        // so this must not run beside the tests that assert on them.
+        let _serialised = PARK_COUNTERS.lock();
         let pool = ResponseSlotPool::new(4, 0);
         let slot = pool.slot_for(1);
         let future = pool.future_for(1);
@@ -579,6 +582,9 @@ mod tests {
 
     #[test]
     fn test_concurrent_fill_from_another_thread() {
+        // Same reason as above: this one actually parks, so it moves
+        // REMOTE_AWAITS_PARKED and the in-flight depth as well.
+        let _serialised = PARK_COUNTERS.lock();
         let pool = ResponseSlotPool::new(4, 0);
         // The cross-thread send is now an Arc clone (always Send) — no raw pointer.
         let in_flight = pool.slot_arc(2);
