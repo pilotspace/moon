@@ -453,6 +453,14 @@ pub(crate) async fn handle_connection_sharded_inner<
     // silently and not before the valid frames that preceded the fault in the
     // same read have been executed and answered — see the parse loop below.
     let mut proto_fault: Option<crate::protocol::ProtoFault> = None;
+    // moon#513 (A2a): batch-scoped fan-out buffers, hoisted OUT of the batch
+    // loop and `clear()`ed per batch — the batch loop is a hot path and must
+    // not allocate a plan per command. (Its `responses`/`remote_groups`
+    // neighbours are still built per batch here; this pair is not, so that the
+    // fan-out costs nothing on the overwhelming majority of batches that have
+    // none.)
+    let mut fanout_state = crate::server::conn::fanout::FanoutState::default();
+    let mut fanout_scratch: Vec<(usize, Frame, usize)> = Vec::with_capacity(ctx.num_shards);
     loop {
         // Check if CLIENT KILL targeted this connection (lock-free, QW8)
         if client_live.is_killed() {
@@ -596,7 +604,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // writes pending the batch-end fsync_barrier(ctx.shard_id).
                 let mut local_leg_write_idxs: Vec<usize> = Vec::new();
                 let mut should_quit = false;
-                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, usize, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape)>> = HashMap::with_capacity(ctx.num_shards);
+                // moon#513 (A2a): the leading index is a `ReplySink`, not a bare
+                // `responses` index — see the twin in `handler_monoio`.
+                let mut remote_groups: HashMap<usize, Vec<(crate::server::conn::fanout::ReplySink, std::sync::Arc<Frame>, Option<Bytes>, usize, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape)>> = HashMap::with_capacity(ctx.num_shards);
+                // moon#513 (A2a): reset the hoisted fan-out buffers for this
+                // batch, beside the `remote_groups` they are folded against.
+                fanout_state.clear();
                 // moon#513: one bit per shard `remote_groups` holds an entry for.
                 // Maintained beside the map so the ordering guard can ask "does
                 // this command touch a shard with pending work?" without walking it.
@@ -798,7 +811,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // shard-thread panic aborts the whole process. Defer this
                     // command and the unconsumed tail to the next batch
                     // iteration; phase 2 resolves the pending replies first.
-                    if (!remote_groups.is_empty() || !publish_batches.is_empty())
+                    // moon#513 (A2a): `fanout_state` joins the two — a fanned-out
+                    // command holds a placeholder in `responses` that only the
+                    // end-of-batch fold fills.
+                    if (!remote_groups.is_empty()
+                        || !publish_batches.is_empty()
+                        || !fanout_state.is_empty())
                         && (crate::server::conn::blocking::is_blocking_command_args(cmd, cmd_args)
                             || cmd.eq_ignore_ascii_case(b"SUBSCRIBE")
                             || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE"))
@@ -1954,6 +1972,104 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // moon#513 (A2a): a SPANNING multi-key READ joins the slotted
+                    // batch instead of cutting it — twin of the monoio site; see
+                    // `handler_monoio/mod.rs` for the full rationale. Gated on
+                    // `!in_cross_txn()` outright and placed strictly BELOW the
+                    // moon#500 refusal above.
+                    //
+                    // The monoio/sharded asymmetry is respected without a shard-count
+                    // check of its own: at `--shards 1` every key mask has exactly one
+                    // bit, so `multikey_placement` answers `Slotted` and this branch
+                    // is unreachable — whereas the monoio twin's enclosing
+                    // `try_handle_cross_shard_commands` returns early at
+                    // `num_shards <= 1`. Both therefore leave one-shard behaviour
+                    // bit-for-bit unchanged.
+                    if !conn.in_cross_txn()
+                        && is_multi_key_command(cmd, cmd_args)
+                        && let crate::server::conn::shared::MultiKeyPlacement::Fanout(kind) =
+                            crate::server::conn::shared::multikey_placement(
+                                cmd,
+                                cmd_args,
+                                ctx.num_shards,
+                                false,
+                            )
+                    {
+                        let resp_idx = responses.len();
+                        // Classified on the WHOLE command; applied to the FOLDED
+                        // reply, never to a part (moon#460).
+                        let resp3_shape = if conn.protocol_version >= 3 {
+                            resp3_shape_for(cmd, cmd_args)
+                        } else {
+                            crate::protocol::resp3::Resp3Shape::None
+                        };
+                        if crate::server::conn::fanout::plan(
+                            &mut fanout_state,
+                            &mut fanout_scratch,
+                            cmd,
+                            cmd_args,
+                            ctx.num_shards,
+                            resp_idx,
+                            kind,
+                            resp3_shape,
+                        ) {
+                            responses.push(Frame::Null); // filled by the fold
+                            if conn.tracking_state.enabled && !conn.tracking_state.bcast {
+                                crate::tracking::invalidation::track_read_keys(
+                                    &ctx.tracking_table,
+                                    cmd,
+                                    cmd_args,
+                                    client_id,
+                                    conn.tracking_state.noloop,
+                                );
+                            }
+                            let db_count = ctx.shard_databases.db_count();
+                            let now_ms = ctx.cached_clock.ms();
+                            for (target, sub_frame, part_idx) in fanout_scratch.drain(..) {
+                                if target == ctx.shard_id {
+                                    let Frame::Array(ref sub_args) = sub_frame else {
+                                        continue;
+                                    };
+                                    let mut sel_db = conn.selected_db;
+                                    let reply = crate::shard::slice::with_shard_db(
+                                        conn.selected_db,
+                                        |db| match dispatch_read(
+                                            db,
+                                            cmd,
+                                            &sub_args[1..],
+                                            now_ms,
+                                            &mut sel_db,
+                                            db_count,
+                                        ) {
+                                            DispatchResult::Response(f)
+                                            | DispatchResult::Quit(f) => f,
+                                        },
+                                    );
+                                    fanout_state.set_part(part_idx, reply);
+                                    local_dispatches = local_dispatches.saturating_add(1);
+                                } else {
+                                    remote_groups.entry(target).or_default().push((
+                                        crate::server::conn::fanout::ReplySink::Part(part_idx),
+                                        std::sync::Arc::new(sub_frame),
+                                        // Reads: no AOF bytes, no tracking
+                                        // invalidation. A2a touches neither the
+                                        // persistence nor the replication path.
+                                        None,
+                                        conn.selected_db,
+                                        None,
+                                        crate::protocol::resp3::Resp3Shape::None,
+                                    ));
+                                    pending_mask |= 1u64 << (target % u64::BITS as usize);
+                                    cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
+                                }
+                            }
+                            crate::admin::metrics_setup::record_pipeline_multikey_fanout();
+                            continue;
+                        }
+                        // Could not be split after all — fall through to the
+                        // coordinator, exactly as before A2a.
+                    }
+
                     if !txn_multikey_write
                         && is_multi_key_command(cmd, cmd_args)
                         && !crate::server::conn::shared::single_owner_shard(
@@ -2786,7 +2902,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         };
                         let resp_idx = responses.len();
                         responses.push(Frame::Null);
-                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(dispatch_frame), aof_bytes, conn.selected_db, track_keys, resp3_shape));
+                        remote_groups.entry(target).or_default().push((crate::server::conn::fanout::ReplySink::Direct(resp_idx), std::sync::Arc::new(dispatch_frame), aof_bytes, conn.selected_db, track_keys, resp3_shape));
                         pending_mask |= 1u64 << (target % u64::BITS as usize);
                         cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
                     }
@@ -2823,7 +2939,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // Phase 2: Dispatch deferred remote commands (zero-allocation via ResponseSlotPool)
                 if !remote_groups.is_empty() {
                     // moon#460: no command name — see the twin in handler_monoio.
-                    type RemoteMeta = (usize, Option<Bytes>, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape);
+                    type RemoteMeta = (crate::server::conn::fanout::ReplySink, Option<Bytes>, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape);
                     let mut reply_futures: Vec<(Vec<RemoteMeta>, usize)> = Vec::with_capacity(remote_groups.len());
                     for (target, entries) in remote_groups {
                         let slot_arc = response_pool.slot_arc(target);
@@ -2872,10 +2988,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     "Shard {}: cross-shard push to shard {} gave up ({:?}); rejecting batch",
                                     ctx.shard_id, target, outcome
                                 );
-                                for (resp_idx, _, _, _) in &meta {
-                                    responses[*resp_idx] = Frame::Error(Bytes::from_static(
+                                for (sink, _, _, _) in &meta {
+                                    crate::server::conn::fanout::fail_sink(
+                                        *sink,
+                                        &mut responses,
+                                        &mut fanout_state,
                                         b"ERR cross-shard dispatch backpressure",
-                                    ));
+                                    );
                                 }
                             }
                         }
@@ -2924,10 +3043,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 ctx.shard_id
                             );
                             crate::admin::metrics_setup::record_xshard_reply_timeout("dispatch");
-                            for (resp_idx, _, _, _) in &meta {
-                                responses[*resp_idx] = Frame::Error(Bytes::from_static(
+                            for (sink, _, _, _) in &meta {
+                                crate::server::conn::fanout::fail_sink(
+                                    *sink,
+                                    &mut responses,
+                                    &mut fanout_state,
                                     b"ERR cross-shard reply timeout",
-                                ));
+                                );
                             }
                             xshard_reply_fatal = true;
                             // Skip the fsync barrier too: with no reply there
@@ -2939,7 +3061,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // we can overwrite write responses on fsync failure below.
                         // aof_bytes is Some for write commands, None for reads.
                         let mut write_resp_idxs: Vec<usize> = Vec::new();
-                        for ((resp_idx, aof_bytes, track_keys, resp3_shape), resp) in meta.into_iter().zip(shard_responses) {
+                        for ((sink, aof_bytes, track_keys, resp3_shape), resp) in meta.into_iter().zip(shard_responses) {
+                            // moon#513 (A2a): a fan-out PART is an intermediate —
+                            // stored raw (the RESP3 shape belongs to the FOLDED
+                            // reply, moon#460), no AOF barrier and no tracking
+                            // invalidation, because A2a splits READS only.
+                            let resp_idx = match sink {
+                                crate::server::conn::fanout::ReplySink::Part(p) => {
+                                    fanout_state.set_part(p, resp);
+                                    continue;
+                                }
+                                crate::server::conn::fanout::ReplySink::Direct(i) => i,
+                            };
                             // C4-FOLD-FIX: AOF append for cross-shard writes is now done
                             // inside the SPSC arm (PipelineBatchSlotted / PipelineBatch),
                             // BEFORE the response slot is filled. Appending here (after
@@ -2986,6 +3119,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                             }
                         }
                     }
+                }
+
+                // moon#513 (A2a): fold every fanned-out command's parts into its
+                // ONE client reply. Runs AFTER phase 2 has drained (or errored)
+                // every part slot and BEFORE the responses are encoded, so no
+                // placeholder can reach the wire.
+                if !fanout_state.is_empty() {
+                    crate::server::conn::fanout::fold(
+                        &fanout_state,
+                        &mut responses,
+                        conn.protocol_version,
+                    );
                 }
 
                 // v3-5 GROUP-COMMIT BARRIER: coordinator LOCAL legs were enqueued

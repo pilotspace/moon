@@ -6,6 +6,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **A spanning multi-key READ no longer cuts the pipeline batch (moon#513, A2a).**
+
+  Since moon#512 fixed the moon#507 write-loss inversion, a multi-key command mid-pipeline
+  forced the batch tail to defer one dispatch boundary. moon#721 (A1) took the case where one
+  shard owns every key. This takes the genuinely SPANNING case for the two per-key
+  decomposable READS, `MGET` and `EXISTS`.
+
+  Measured at `--shards 4`, 32 interleavings of `SET,SET,MGET` per shard pair, deferrals read
+  from `INFO stats` (macOS, placement-only — no throughput number is claimed here):
+
+  ```text
+                      before   after
+    pair (0,1)         32/32     0/32
+    pair (0,2)         32/32     0/32
+    pair (0,3)         32/32     0/32
+    pair (1,2)         32/32     0/32
+    pair (1,3)         32/32     0/32
+    pair (2,3)         32/32     0/32
+  ```
+
+  The command is split per owner shard; each part is routed exactly like an ordinary
+  single-shard command **at the command's own position in the batch** — appended to
+  `remote_groups[owner]`, or executed inline against the local slice — and the parts are
+  folded back into one client reply at the drain. That removes the coordinator's second,
+  immediate SPSC push, which was the moon#507 inversion, rather than merely declining to wait
+  for it. Ordering is per-key: a key has exactly one owner, every operation on it in the batch
+  lands in that owner's vector in loop order, and one thread executes that vector in order.
+
+  `must_wait_for_pending_remote` and the routing side now consult ONE function,
+  `multikey_placement`, so the guard cannot say "safe" about a command routing still runs
+  inline. Everything uncertain resolves to `Coordinator` and keeps waiting: workspace
+  connections, an untrustworthy key mask, anything inside a cross-shard TXN, `MSETNX`/`BITOP`/
+  `COPY` (not decomposable at all), and `MSET`/`DEL`/`UNLINK` — decomposable, but splitting a
+  write adds per-part AOF, replication, group-commit and tracking-invalidation work and is
+  held back to A2b so a durability bug and a throughput change cannot bisect to one commit.
+
+  A part that fails for any reason — backpressure give-up, reply timeout, the shard's own
+  error, or a slot nothing ever wrote — fails the whole reply rather than assembling a partial
+  answer. Partial failure across parts is possible; `coordinate_multi_key` has the identical
+  exposure today for these same commands, and they are reads, so nothing is applied either way.
+
+  `INFO stats` gains `total_pipeline_multikey_fanout` (`moon_pipeline_multikey_fanout_total`),
+  one per fanned-out command. It exists because the deferral counter alone cannot separate a
+  real fix from a dangerous one: a change that merely stopped waiting while the command still
+  ran inline would drive deferrals to zero too, and that is moon#507 reopened. Mutation-tested
+  — disabling the fan-out routing while leaving the guard relaxed passes the deferral
+  assertion and is caught only by this counter (and, one test later, by an `MGET` reading stale
+  values from its own batch).
+
 ### Fixed
 - **`TXN ABORT` left torn state after a multi-key write (moon#500).**
 

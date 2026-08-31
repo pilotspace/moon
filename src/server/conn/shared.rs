@@ -1693,23 +1693,142 @@ pub(crate) fn must_wait_for_pending_remote(
     if keys_may_be_rewritten {
         return true;
     }
-    match command_shard_mask(cmd, args, num_shards) {
-        // Mask untrustworthy — wait. Always the safe direction.
-        None => true,
+    // ONE decision function, two consumers. The routing side asks
+    // `multikey_placement` where the command will go; this side asks the SAME
+    // function whether that destination makes the wait unnecessary. A second
+    // predicate here would be two answers to one question, and the direction
+    // that disagrees silently — guard says "safe", routing runs it inline — is
+    // moon#507 (acked writes vanishing) reopened.
+    match multikey_placement(cmd, args, num_shards, keys_may_be_rewritten) {
         // moon#513 (A1): ONE owner shard, so the coordinator hands it to normal
         // routing and it is APPENDED to that shard's slotted batch, behind the
         // pending commands rather than racing them. That is the same property
         // that has always made `SET k` + `GET k` correct, so the wait is
         // genuinely unnecessary here rather than merely skipped.
+        MultiKeyPlacement::Slotted(_) => false,
+        // moon#513 (A2a): spans shards, but every key is independent, so the
+        // command is SPLIT and each part appended to its own owner's slotted
+        // batch — again behind that shard's pending work. The ordering argument
+        // is per-key rather than global, which is all the guarantee ever
+        // required: for a key `k`, every operation on it in this batch lands in
+        // `remote_groups[owner(k)]` in loop order, and one thread executes that
+        // vector in order.
+        MultiKeyPlacement::Fanout(_) => false,
+        // Still consumed inline by the coordinator, whose immediate SPSC push
+        // is exactly the moon#507 inversion. Wait if it meets a pending shard;
+        // a mask that could not be trusted is `None` and waits unconditionally
+        // (moon#513 mask arm, #708).
         //
-        // This arm is only sound while the routing side agrees: see
-        // `single_owner_shard`, whose callers are the two coordinator
-        // fall-throughs. If a single-owner multi-key command ever went back to
-        // executing INLINE, this would be moon#507 reopened.
-        Some(mask) if mask.count_ones() == 1 => false,
-        // Genuinely spans shards: still consumed inline by the coordinator, so
-        // it must wait if it meets a pending shard (moon#513, mask arm).
-        Some(mask) => mask & pending != 0,
+        // The mask rides on the variant rather than being recomputed here: this
+        // arm is taken by every pipelined `MSET`/`DEL`/`UNLINK` whenever the
+        // batch has pending remotes, and re-deriving it would hash every key a
+        // second time on that path.
+        MultiKeyPlacement::Coordinator { mask } => mask.is_none_or(|m| m & pending != 0),
+    }
+}
+
+/// Where a multi-key command will actually run — the ONE question both the
+/// ordering guard and the routing side ask.
+///
+/// # Contract
+///
+/// Only meaningful for a command [`is_multi_key_command`] admits; every other
+/// command routes by its own single key and never reaches here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MultiKeyPlacement {
+    /// moon#513 A1 — one shard owns every key, so ordinary routing slots the
+    /// whole command into that shard's batch. Carries the owner.
+    Slotted(usize),
+    /// moon#513 A2a — the keys span shards but the command is per-key
+    /// decomposable, so it is split per owner and the parts folded back into
+    /// one client reply.
+    Fanout(crate::server::conn::fanout::FanoutKind),
+    /// Consumed inline by `coordinate_multi_key`, which pushes its own message
+    /// into the SPSC ring mid-loop. The only placement the ordering guard must
+    /// still wait for.
+    ///
+    /// `mask` is the shards the keys live on, or `None` when the mask could not
+    /// be trusted — the #708 refinement, carried on the variant so the guard
+    /// does not have to hash every key a second time to ask its own question.
+    /// `None` means "wait unconditionally".
+    Coordinator { mask: Option<u64> },
+}
+
+/// Decide where a multi-key command runs.
+///
+/// # The single invariant
+///
+/// The guard may skip the wait only for a placement that routing is GUARANTEED
+/// to put into `remote_groups` or the local slice — never into
+/// `coordinate_multi_key`'s immediate push. [`MultiKeyPlacement::Coordinator`]
+/// is the only placement that keeps waiting, and every uncertainty resolves to
+/// it.
+///
+/// # What never leaves the coordinator, and why
+///
+/// * `keys_may_be_rewritten` — a workspace connection prefixes every key with
+///   `{<32-hex>}:` BELOW the guard, so the raw names visible there hash to
+///   shards the command will never touch (moon#513, `pco14`);
+/// * an untrustworthy mask — more shards than the mask has bits, a key position
+///   holding a non-string, or `AtPlusComputed` (`SORT ... BY w_*`), where a key
+///   nobody can name would be missing from it;
+/// * `MSETNX` (atomic across the whole key set), `BITOP` and `COPY` (they
+///   COMPUTE across the key set) — not per-key decomposable at any shard count;
+/// * `MSET`, `DEL`, `UNLINK` — per-key decomposable, but splitting a WRITE adds
+///   per-part AOF serialization, per-part replication, a group-commit barrier
+///   for the local leg and per-part tracking invalidation. That is A2b, a
+///   separate change, so a durability bug and a throughput change cannot bisect
+///   to one commit.
+#[must_use]
+pub(crate) fn multikey_placement(
+    cmd: &[u8],
+    args: &[Frame],
+    num_shards: usize,
+    keys_may_be_rewritten: bool,
+) -> MultiKeyPlacement {
+    // The keys visible here are not the keys that will route, so no mask read
+    // off them can justify any placement at all — and `None` here also denies
+    // the guard the #708 refinement, which is the conservative direction.
+    if keys_may_be_rewritten {
+        return MultiKeyPlacement::Coordinator { mask: None };
+    }
+    let Some(mask) = command_shard_mask(cmd, args, num_shards) else {
+        return MultiKeyPlacement::Coordinator { mask: None };
+    };
+    if mask.count_ones() == 1 {
+        return MultiKeyPlacement::Slotted(mask.trailing_zeros() as usize);
+    }
+    match splittable_read_kind(cmd, args) {
+        Some(kind) => MultiKeyPlacement::Fanout(kind),
+        None => MultiKeyPlacement::Coordinator { mask: Some(mask) },
+    }
+}
+
+/// The multi-key READS whose reply is a pure per-key function, so a spanning
+/// invocation can be split and re-assembled without changing its answer.
+///
+/// READS ONLY by design — see [`multikey_placement`] on why the splittable
+/// writes are a separate change. The `args` check is not decoration: the split
+/// walks EVERY argument as a key, so a command whose argv holds anything else
+/// must stay whole and earn its own error.
+fn splittable_read_kind(
+    cmd: &[u8],
+    args: &[Frame],
+) -> Option<crate::server::conn::fanout::FanoutKind> {
+    use crate::server::conn::fanout::FanoutKind;
+    if cmd.is_empty() || args.len() < 2 {
+        return None;
+    }
+    if !args
+        .iter()
+        .all(|a| matches!(a, Frame::BulkString(_) | Frame::SimpleString(_)))
+    {
+        return None;
+    }
+    match (cmd.len(), cmd[0] | 0x20) {
+        (4, b'm') if cmd.eq_ignore_ascii_case(b"MGET") => Some(FanoutKind::Gather),
+        (6, b'e') if cmd.eq_ignore_ascii_case(b"EXISTS") => Some(FanoutKind::SumInteger),
+        _ => None,
     }
 }
 
@@ -1726,10 +1845,18 @@ pub(crate) fn must_wait_for_pending_remote(
 /// [`cross_shard_multikey_rejection`] (moon#592) already permits: it refuses
 /// only the SPANNING case, because a spanning command executed on one slice
 /// silently reads and writes the wrong table.
+///
+/// A thin reading of [`multikey_placement`] rather than a second mask walk of
+/// its own: the two used to be separate functions agreeing by inspection, which
+/// is the arrangement that lets a later edit move one and not the other.
 #[must_use]
 pub(crate) fn single_owner_shard(cmd: &[u8], args: &[Frame], num_shards: usize) -> Option<usize> {
-    let mask = command_shard_mask(cmd, args, num_shards)?;
-    (mask.count_ones() == 1).then(|| mask.trailing_zeros() as usize)
+    // `false`: every caller sits BELOW the workspace rewrite, so the args it
+    // passes are the ones that will route.
+    match multikey_placement(cmd, args, num_shards, false) {
+        MultiKeyPlacement::Slotted(owner) => Some(owner),
+        MultiKeyPlacement::Fanout(_) | MultiKeyPlacement::Coordinator { .. } => None,
+    }
 }
 
 /// Commands handled INLINE by a `try_handle_*` interceptor before the routing
@@ -3921,17 +4048,30 @@ mod pending_shard_mask_tests {
         ]
     }
 
+    /// The #708 mask arm, on a command that still takes the coordinator's
+    /// inline path.
+    ///
+    /// The probe was an `MGET` until moon#513 A2a made a spanning multi-key
+    /// READ fan out into the slotted batch — after which it stops consulting
+    /// the mask in EITHER direction and can no longer measure this arm at all.
+    /// A spanning `MSET` is per-key decomposable but deliberately NOT split
+    /// (A2b), so it is still consumed inline and still governed by the mask.
+    /// When A2b lands this must move to `MSETNX`, `BITOP` or `COPY`, which are
+    /// not decomposable at any shard count.
     #[test]
     fn waits_only_when_the_shard_sets_meet() {
+        // `MSET k v k v` — the values sit at odd positions and are not keys, so
+        // the pairs are built explicitly rather than by `spanning`.
         let span = spanning("psm_e", 2, 3);
+        let mset = vec![span[0].clone(), bulk("v"), span[1].clone(), bulk("v")];
         assert!(
-            must_wait_for_pending_remote(b"MGET", &span, SHARDS, mask_of(&[2]), false),
-            "reading shards 2 and 3 while shard 2 has pending work is the \
+            must_wait_for_pending_remote(b"MSET", &mset, SHARDS, mask_of(&[2]), false),
+            "writing shards 2 and 3 while shard 2 has pending work is the \
              moon#507 hazard and must still wait"
         );
         assert!(
-            !must_wait_for_pending_remote(b"MGET", &span, SHARDS, mask_of(&[0, 1]), false),
-            "reading shards 2 and 3 while only shards 0 and 1 have pending work \
+            !must_wait_for_pending_remote(b"MSET", &mset, SHARDS, mask_of(&[0, 1]), false),
+            "writing shards 2 and 3 while only shards 0 and 1 have pending work \
              touches nothing pending, so the batch must not be cut"
         );
         assert!(
@@ -3943,6 +4083,139 @@ mod pending_shard_mask_tests {
                 false
             ),
             "an unenumerable argv falls back to waiting"
+        );
+    }
+
+    /// moon#513 (A2a). A spanning multi-key READ no longer cuts the batch,
+    /// BECAUSE it is split per owner shard and each part is slotted behind that
+    /// shard's pending work. The two halves are asserted together on purpose:
+    /// the guard skipping the wait is only sound while the placement really is
+    /// `Fanout`, and a change that satisfied one without the other would be
+    /// moon#507 reopened.
+    #[test]
+    fn a_spanning_multikey_read_does_not_wait_because_it_is_fanned_out() {
+        use super::{MultiKeyPlacement, multikey_placement};
+        use crate::server::conn::fanout::FanoutKind;
+
+        let span = spanning("psm_j", 2, 3);
+        assert_eq!(
+            multikey_placement(b"MGET", &span, SHARDS, false),
+            MultiKeyPlacement::Fanout(FanoutKind::Gather),
+        );
+        assert_eq!(
+            multikey_placement(b"EXISTS", &span, SHARDS, false),
+            MultiKeyPlacement::Fanout(FanoutKind::SumInteger),
+        );
+        for pending in [mask_of(&[2]), mask_of(&[2, 3]), u64::MAX] {
+            assert!(
+                !must_wait_for_pending_remote(b"MGET", &span, SHARDS, pending, false),
+                "a fanned-out read is appended to each owner's slotted batch \
+                 behind that shard's pending work, so cutting the batch buys \
+                 nothing even when every shard is pending"
+            );
+            assert!(!must_wait_for_pending_remote(
+                b"EXISTS", &span, SHARDS, pending, false
+            ));
+        }
+    }
+
+    /// The WRITES stay on the coordinator until A2b, and the commands that are
+    /// not per-key decomposable stay there forever. Named individually so that
+    /// adding one to the splittable set cannot pass unnoticed.
+    #[test]
+    fn only_the_two_splittable_reads_fan_out() {
+        use super::{MultiKeyPlacement, multikey_placement};
+
+        let span = spanning("psm_k", 0, 1);
+        let pair = vec![span[0].clone(), bulk("v"), span[1].clone(), bulk("v")];
+        for (cmd, args) in [
+            // A2b — per-key decomposable, but splitting a WRITE adds per-part
+            // AOF, replication, barrier and invalidation work.
+            (&b"MSET"[..], &pair),
+            (&b"DEL"[..], &span),
+            (&b"UNLINK"[..], &span),
+            // Never decomposable: atomic across the key set, or computing
+            // across it.
+            (&b"MSETNX"[..], &pair),
+            (&b"COPY"[..], &span),
+        ] {
+            assert!(
+                matches!(
+                    multikey_placement(cmd, args, SHARDS, false),
+                    MultiKeyPlacement::Coordinator { mask: Some(_) }
+                ),
+                "{} must stay on the coordinator, with a mask the #708 \
+                 refinement can still use",
+                String::from_utf8_lossy(cmd)
+            );
+            assert!(
+                must_wait_for_pending_remote(cmd, args, SHARDS, mask_of(&[0]), false),
+                "{} still runs inline, so it must still wait on a shard it touches",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+    }
+
+    /// Everything uncertain resolves to `Coordinator` — the only placement that
+    /// keeps waiting.
+    #[test]
+    fn uncertainty_resolves_to_the_coordinator() {
+        use super::{MultiKeyPlacement, multikey_placement};
+
+        let span = spanning("psm_l", 0, 2);
+        // Every one of these carries `mask: None`, so the guard waits
+        // UNCONDITIONALLY rather than falling back on a mask it should not
+        // trust. A `Some(_)` here would be the #708 refinement firing on
+        // information the placement just declared unusable.
+        for (label, placement) in [
+            (
+                "a workspace connection rewrites these keys after the guard runs",
+                multikey_placement(b"MGET", &span, SHARDS, true),
+            ),
+            (
+                "a key position holding a non-string is a malformed invocation",
+                multikey_placement(b"MGET", &[bulk("k"), Frame::Integer(7)], SHARDS, false),
+            ),
+            (
+                "a shard id past bit 63 cannot be represented",
+                multikey_placement(b"MGET", &span, 65, false),
+            ),
+            (
+                "an MGET that named no key at all",
+                multikey_placement(b"MGET", &[], SHARDS, false),
+            ),
+        ] {
+            assert_eq!(
+                placement,
+                MultiKeyPlacement::Coordinator { mask: None },
+                "{label}"
+            );
+        }
+        // …and the guard really does wait for all of them, on every pending set.
+        assert!(must_wait_for_pending_remote(
+            b"MGET", &span, SHARDS, 1, true
+        ));
+        assert!(must_wait_for_pending_remote(
+            b"MGET",
+            &[bulk("k"), Frame::Integer(7)],
+            SHARDS,
+            1,
+            false
+        ));
+    }
+
+    /// At one shard nothing can span, so A2a is structurally unreachable and
+    /// `--shards 1` behaves exactly as before. This is the invariant that lets
+    /// the two handlers keep their `num_shards <= 1` asymmetry: the monoio twin
+    /// returns early, `handler_sharded` runs the branch at every shard count,
+    /// and both are correct because the placement is never `Fanout` here.
+    #[test]
+    fn one_shard_never_fans_out() {
+        use super::{MultiKeyPlacement, multikey_placement};
+        let args = [bulk("psm_m:a"), bulk("psm_m:z")];
+        assert_eq!(
+            multikey_placement(b"MGET", &args, 1, false),
+            MultiKeyPlacement::Slotted(0),
         );
     }
 

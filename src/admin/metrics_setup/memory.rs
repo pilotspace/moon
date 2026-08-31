@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use metrics::gauge;
 
 use crate::admin::metrics_setup::{
-    DISPATCH_CROSS_READ_SPSC_TOTAL, METRICS_INITIALIZED, PIPELINE_REMOTE_DEFER_TOTAL,
-    TOTAL_CONNECTIONS, total_commands_sum,
+    DISPATCH_CROSS_READ_SPSC_TOTAL, METRICS_INITIALIZED, PIPELINE_MULTIKEY_FANOUT_TOTAL,
+    PIPELINE_REMOTE_DEFER_TOTAL, TOTAL_CONNECTIONS, total_commands_sum,
 };
 
 // ── Memory metrics ──────────────────────────────────────────────────────
@@ -234,6 +234,13 @@ pub fn total_dispatch_cross_spsc() -> u64 {
 #[inline]
 pub fn total_pipeline_remote_defer() -> u64 {
     PIPELINE_REMOTE_DEFER_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Total spanning multi-key reads fanned out into the slotted batch (moon#513
+/// A2a). Always accurate — does not require Prometheus to be initialised.
+#[inline]
+pub fn total_pipeline_multikey_fanout() -> u64 {
+    PIPELINE_MULTIKEY_FANOUT_TOTAL.load(Ordering::Relaxed)
 }
 
 /// Read process CPU usage via `getrusage(RUSAGE_SELF)`.

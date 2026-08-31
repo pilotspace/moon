@@ -1777,8 +1777,18 @@ pub(super) async fn try_handle_cross_shard_commands(
         // one. A LOCAL owner stays on the coordinator: it is already correct there,
         // `remote_groups` never holds the local shard, so nothing is gained.
         //
-        // Paired with the `count_ones() == 1` arm of `must_wait_for_pending_remote`
-        // — that arm skips the wait BECAUSE this fall-through slots the command.
+        // Paired with the `Slotted` arm of `must_wait_for_pending_remote` — that
+        // arm skips the wait BECAUSE this fall-through slots the command.
+        // `single_owner_shard` is a reading of `multikey_placement`, the same
+        // function the guard consults, so the two cannot drift apart.
+        //
+        // moon#513 (A2a) NOTE: a `Fanout` placement is handled in the batch loop
+        // ABOVE this call and never arrives here. Do NOT add a fall-through for
+        // it: standing aside sends the command to ordinary routing, which hashes
+        // its FIRST key and runs the WHOLE spanning command against that one
+        // shard's slice — the moon#592 class, silently answering for keys that
+        // live elsewhere. Reaching this branch with a spanning key set means the
+        // coordinator, which is correct.
         if crate::server::conn::shared::single_owner_shard(cmd, cmd_args, ctx.num_shards)
             .is_some_and(|owner| owner != ctx.shard_id)
         {
