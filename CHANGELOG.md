@@ -21,7 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guarded. The flag's sense is inverted on purpose: unmarked means "take the slow path",
   so adding a command or an intercept can cost throughput but never correctness.
   `tests/intercept_flag_drift.rs` guards the other direction and was verified to FAIL when
-  `WAIT` is marked. Expected recovery is ~3-5% of cycles on non-inlined commands; it does
+  `WAIT` is marked. **Measured on Linux/ARM** (GCE t2a, two-box, `--shards 1`, 6 interleaved
+  reps, arms alternating every rep, noise floors 1.3-5.2%): INCR +11.5% at p8 and +16.8% at p64,
+  HSET +6.5/+12.0/+11.9% at p1/p8/p64, LPUSH +8.7/+10.9% at p8/p64, SADD +7.6/+11.0% at
+  p8/p64 — geometric mean +3.9% over all 18 cells, and the base/ni distributions do not
+  overlap at p64. GET and SET are unchanged (they are bimodal in both arms; the inline byte
+  path is what serves them). This is larger than the 3-5% originally predicted, but it does
   not close the 0.43x deficit recorded in BENCHMARK.md §2.12.
 
 ### Documentation
