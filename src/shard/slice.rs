@@ -723,8 +723,12 @@ pub fn assert_initialized(shard_id: usize) {
 /// test). Tests using `with_shard` MUST NOT rely on a `ShardSlice` left behind
 /// on the harness thread by an earlier test — that "passes" or panics
 /// depending on libtest thread scheduling (caught on Windows CI).
-#[cfg(test)]
-pub(crate) mod test_support {
+//
+// Also compiled under the `fuzzing` feature: fuzz targets need exactly this
+// fixture, and the one that hand-copied it instead rotted twice without any
+// gate noticing (see the feature's comment in Cargo.toml).
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod test_support {
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
@@ -734,7 +738,7 @@ pub(crate) mod test_support {
     use crate::transaction::{DeferredHnswInserts, KvWriteIntents};
     use crate::vector::store::VectorStore;
 
-    pub(crate) fn make_init(shard_id: usize, db_count: usize) -> ShardSliceInit {
+    pub fn make_init(shard_id: usize, db_count: usize) -> ShardSliceInit {
         // Build a standalone set rather than installing a registry: the test
         // binary runs many of these in one process, and the registry is a
         // process-wide OnceLock that only the first caller could claim.
@@ -760,14 +764,7 @@ pub(crate) mod test_support {
             trigger_registry: None,
             wal_append_tx: None,
             estimated_memory: Arc::new(AtomicUsize::new(0)),
-            store_memory: Arc::new(crate::shard::shared_databases::ShardStoreMemory {
-                vector: AtomicUsize::new(0),
-                text: AtomicUsize::new(0),
-                graph: AtomicUsize::new(0),
-                lua: AtomicUsize::new(0),
-                lua_vm: AtomicUsize::new(0),
-                pagecache: AtomicUsize::new(0),
-            }),
+            store_memory: Arc::new(crate::shard::shared_databases::ShardStoreMemory::default()),
         }
     }
 }

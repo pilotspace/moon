@@ -471,6 +471,22 @@ pub fn deserialize_term_fst_sidecar(data: &[u8]) -> io::Result<Vec<FieldTermFstS
         let next_id = read_u32(data, &mut cursor)?;
         let fst_high_water_mark = read_u32(data, &mut cursor)?;
         let term_count = read_u32(data, &mut cursor)? as usize;
+        // Bound the pre-allocation against what is actually left to read. The
+        // tightest legal term entry is 6 bytes (u16 length + a 1-byte term is
+        // already 7, and a 0-length term is 2 + 4), so a count above
+        // remaining/6 cannot be honest -- and honouring it meant asking the
+        // allocator for ~101 GB from a small file, which is how the nightly
+        // `term_fst_sidecar` fuzz target has failed every run since at least
+        // 2026-08-26 (it still passed on 2026-08-11).
+        // `read_bytes` already refuses to read past the end; what it cannot do
+        // is stop the Vec from being reserved before the first term is read.
+        const MIN_TERM_BYTES: usize = 6;
+        if term_count > (data.len() - cursor) / MIN_TERM_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "term-fst sidecar term count exceeds remaining input",
+            ));
+        }
         let mut terms = Vec::with_capacity(term_count);
         for _ in 0..term_count {
             let term_len = read_u16(data, &mut cursor)? as usize;
@@ -906,5 +922,60 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1, "expected exactly one file: {entries:?}");
         assert_eq!(entries[0].to_string_lossy(), "idx.tfst");
+    }
+
+    /// A `term_count` read straight off disk is a full u32 and was handed to
+    /// `Vec::with_capacity` unchecked. The nightly fuzzer found it: ASan
+    /// reported `out of memory: allocator is trying to allocate 0x179f80e020
+    /// bytes` (~101 GB), and `term_fst_sidecar` has failed every night since.
+    /// A sidecar is attacker-reachable as a corrupt or truncated file, so the
+    /// decoder must reject the count, not try to honour it.
+    ///
+    /// Asserts the error KIND, not a crash, because the crash is not portable:
+    /// Linux under ASan aborts on the reservation, while macOS backs it with
+    /// lazily-committed virtual pages, honours it, and only then hits EOF. So
+    /// without the bound this returns `UnexpectedEof` (verified by removing
+    /// it) and with the bound `InvalidData` -- exactly the difference between
+    /// "refused" and "reserved ~101 GB, then noticed".
+    #[test]
+    fn a_huge_term_count_is_rejected_instead_of_preallocated() {
+        let mut data = Vec::new();
+        data.extend_from_slice(TERM_FST_MAGIC);
+        data.push(TERM_FST_VERSION);
+        data.extend_from_slice(&1u16.to_le_bytes()); // field_count = 1
+        data.extend_from_slice(&0u32.to_le_bytes()); // next_id
+        data.extend_from_slice(&0u32.to_le_bytes()); // fst_high_water_mark
+        data.extend_from_slice(&u32::MAX.to_le_bytes()); // term_count — the bomb
+        let err = deserialize_term_fst_sidecar(&data)
+            .expect_err("a term_count of u32::MAX in a 19-byte sidecar must fail closed");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// The bound must not reject honest input: the tightest legal encoding is
+    /// a 1-byte term, so a count that exactly fills the remaining bytes has to
+    /// survive. A guard tuned one byte too strict would fail closed on real
+    /// sidecars and silently force a full rescan on every load.
+    #[test]
+    fn a_densely_packed_but_honest_term_count_still_loads() {
+        let mut data = Vec::new();
+        data.extend_from_slice(TERM_FST_MAGIC);
+        data.push(TERM_FST_VERSION);
+        data.extend_from_slice(&1u16.to_le_bytes()); // field_count = 1
+        data.extend_from_slice(&7u32.to_le_bytes()); // next_id
+        data.extend_from_slice(&3u32.to_le_bytes()); // fst_high_water_mark
+        data.extend_from_slice(&2u32.to_le_bytes()); // term_count = 2
+        for (term, id) in [("a", 1u32), ("b", 2u32)] {
+            data.extend_from_slice(&(term.len() as u16).to_le_bytes());
+            data.extend_from_slice(term.as_bytes());
+            data.extend_from_slice(&id.to_le_bytes());
+        }
+        data.extend_from_slice(&0u32.to_le_bytes()); // fst_len = 0
+        let fields = deserialize_term_fst_sidecar(&data).expect("honest sidecar must load");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].next_id, 7);
+        assert_eq!(
+            fields[0].terms,
+            vec![("a".to_string(), 1), ("b".to_string(), 2)]
+        );
     }
 }

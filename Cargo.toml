@@ -96,6 +96,13 @@ fst = { version = "0.4", features = ["levenshtein"], optional = true }
 levenshtein_automata = { version = "0.2", features = ["fst_automaton"], optional = true }
 
 [features]
+# Exposes `shard::slice::test_support` to out-of-tree test harnesses. Only the
+# `fuzz/` crate enables it. It exists because fuzz targets have to build a
+# `ShardSlice` and were doing it with a hand-copied 20-field struct literal,
+# which rotted twice unnoticed (`ShardStoreMemory` gaining fields, then
+# `databases` becoming `Arc<ShardDbSet>`) and left `mq_registry_blob` unable to
+# compile for months. Additive and off by default.
+fuzzing = []
 # Platform-aware defaults:
 #   Linux/macOS: Monoio is default (io_uring / kqueue, thread-per-core)
 #   Windows:     Tokio is default (IOCP, work-stealing fallback)

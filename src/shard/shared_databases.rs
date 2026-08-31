@@ -18,6 +18,14 @@ use crate::workspace::{WorkspaceId, WorkspaceMetadata, WorkspaceRegistry};
 ///
 /// Figures lag at most one tick (≤100 ms); this is documented and acceptable
 /// for observability paths.
+///
+/// `Default` is derived and is what out-of-tree constructors (the fuzz
+/// targets) use: this struct gained `lua_vm` and then `pagecache`, and each
+/// time every struct literal outside `src/` stopped compiling. Nothing in CI
+/// builds `fuzz/`, so `mq_registry_blob` failed to build on every nightly
+/// since at least 2026-07-17 without anyone noticing. Construct through
+/// `default()` and a new counter cannot silently retire a fuzz target again.
+#[derive(Default)]
 pub struct ShardStoreMemory {
     /// Combined resident bytes of all VectorStore segments (mutable + immutable).
     pub vector: AtomicUsize,
