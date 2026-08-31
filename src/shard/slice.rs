@@ -562,8 +562,17 @@ pub fn with_shard_db_read<R>(db_index: usize, f: impl FnOnce(&Database) -> R) ->
 /// The foreign fast path: serve a read of `shard`'s database on THIS thread.
 ///
 /// Returns `None` — meaning the caller must fall through to the SPSC path it
-/// takes today — when the registry is absent, the shard/db index is out of
-/// range, or the owner holds the write lock. It NEVER parks: exactly one CAS.
+/// takes today — when this thread is not itself inside the registered plane,
+/// the registry is absent, the shard/db index is out of range, or the owner
+/// holds the write lock. It NEVER parks: exactly one CAS.
+///
+/// The `cached_db_set()` check is the first gate on purpose. `init_shard`
+/// publishes `MY_DB_SET` only when the registry holds the very same set the
+/// slice does, so its presence is the process's own statement that this thread
+/// reads and writes through the registry rather than through a slice built
+/// beside it. Without the gate, a thread outside the plane resolves
+/// `shard_dbs(shard)` to the registry's copy while its own writes land in a
+/// different `Database`, and the read returns stale data under a `+OK`.
 ///
 /// `f` is a plain `FnOnce`, not an async closure, on purpose: the guard cannot
 /// escape it and cannot cross an `.await`. "Never hold a lock across `.await`"
@@ -574,6 +583,7 @@ pub fn try_foreign_db_read<R>(
     db_index: usize,
     f: impl FnOnce(&Database) -> R,
 ) -> Option<R> {
+    cached_db_set()?;
     let guard = crate::shard::db_plane::shard_dbs(shard)?.try_read(db_index)?;
     Some(f(&guard))
 }
@@ -855,6 +865,44 @@ mod tests {
         })
         .join()
         .expect("probe thread");
+    }
+
+    /// A thread that is not itself part of the registered database plane must
+    /// NOT serve foreign reads off the registry.
+    ///
+    /// `init_shard` publishes `MY_DB_SET` only when the registry holds the very
+    /// same set the slice does, so `cached_db_set()` is the process's own
+    /// statement that this thread is inside the live plane. Without that check
+    /// a thread holding a slice built outside the registry would read a
+    /// DIFFERENT `Database` than the one its own writes land in -- the registry
+    /// copy -- and return stale data under a `+OK`, silently.
+    #[test]
+    fn foreign_read_refuses_from_a_thread_outside_the_registered_plane() {
+        // Whichever install wins the process-wide OnceLock, we only need some
+        // registered shard that actually owns a database.
+        let _ = crate::shard::db_plane::install_registry(vec![
+            (0..4).map(|_| Database::new()).collect(),
+        ]);
+        let target = (0..crate::shard::db_plane::registry_shard_count())
+            .find(|s| crate::shard::db_plane::shard_dbs(*s).is_some_and(|d| d.db_count() > 0))
+            .expect("registry must hold a shard with at least one database");
+
+        // A fresh thread never called `init_shard`, so its `MY_DB_SET` is unset
+        // even though the registry is fully installed.
+        let served = std::thread::spawn(move || {
+            assert!(
+                cached_db_set().is_none(),
+                "probe thread must be outside the registered plane"
+            );
+            try_foreign_db_read(target, 0, |_db| 1u8)
+        })
+        .join()
+        .expect("probe thread");
+
+        assert_eq!(
+            served, None,
+            "a thread outside the registered plane must fall through to SPSC,              not read the registry's copy of another shard's database"
+        );
     }
 
     /// A slice whose set is NOT in the registry must fall back, not cache a
