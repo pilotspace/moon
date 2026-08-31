@@ -437,12 +437,31 @@ pub struct ServerConfig {
     /// read on the calling thread under a shared guard (no SPSC hop); `off`
     /// routes every cross-shard read through the SPSC channel.
     ///
-    /// Defaults to `off`. docs/production-guide.md documented this flag and an
-    /// `auto` default for a path that was disabled in code and never took a
-    /// flag at all (the server rejected `--cross-shard-fast-path` outright).
-    /// The L4 shared-read plane makes the path implementable; the default
-    /// stays `off` until the L4 acceptance run clears it.
-    #[arg(long = "cross-shard-fast-path", default_value = "off")]
+    /// Defaults to `auto` — enabled on the monoio handler at `--shards > 1`,
+    /// declined elsewhere (see `db_plane::resolve_cross_shard_fast_path`).
+    ///
+    /// It shipped `off` while the only evidence was moon#768's `-8.61%` CPU/op
+    /// and a doubled `s8 p16` variance. Both readings came from a HALF-POPULATED
+    /// keyspace: the path declines a key that is not resident, because
+    /// `dispatch_read` cannot consult the cold tier (the moon#610 class), and a
+    /// declined read falls back to the SPSC hop. So the "in-place rate" was
+    /// tracking the benchmark's key HIT rate, and a run whose hit rate wanders
+    /// produces exactly the variance that held the default down.
+    ///
+    /// Measured against `DBSIZE` at `--shards 8`, uniform keys, GET p=1
+    /// (counter ratios — `total_dispatch_cross_read_fast` vs
+    /// `total_dispatch_cross_spsc` vs `total_remote_awaits_parked`):
+    ///
+    /// | resident keys | served in place | parks/cmd |
+    /// |---------------|----------------:|----------:|
+    /// | 63,114        |           62.9% |     0.325 |
+    /// | 98,169        |           98.2% |     0.016 |
+    /// | 100,000       |          100.0% |     0.000 |
+    ///
+    /// On a populated keyspace the path removes EVERY foreign-read park, which
+    /// `docs/internal/cross-shard-cost-model.md` prices at ~24.9 core-us each
+    /// and at 85% of p=1 cost. `off` is the rollback.
+    #[arg(long = "cross-shard-fast-path", default_value = "auto")]
     pub cross_shard_fast_path: String,
 
     // ── MoonStore v2: Disk Offload ──────────────────────────────────
@@ -2077,6 +2096,16 @@ mod tests {
         // workloads and a deterministic persistence layout. `--shards 0`
         // remains the explicit auto-detect opt-in.
         assert_eq!(config.shards, 1);
+    }
+
+    /// The cross-shard read fast path ships ENABLED (`auto`) since the L4
+    /// acceptance measurement. `off` is the rollback, and it must keep working.
+    #[test]
+    fn cross_shard_fast_path_defaults_to_auto() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(config.cross_shard_fast_path, "auto");
+        let off = ServerConfig::parse_from(["moon", "--cross-shard-fast-path", "off"]);
+        assert_eq!(off.cross_shard_fast_path, "off");
     }
 
     #[test]

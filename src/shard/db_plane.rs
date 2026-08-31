@@ -440,6 +440,41 @@ pub fn set_cross_shard_fast_path(enabled: bool) {
     CROSS_SHARD_FAST_PATH.store(enabled, Ordering::Relaxed);
 }
 
+/// Resolve `--cross-shard-fast-path` into the master switch's value.
+///
+/// A pure function so the policy is unit-testable; `main.rs` calls it once,
+/// before any shard spawns, and turns an `Err` into a startup failure. An
+/// unknown value is an error rather than a silent default, so a typo cannot
+/// quietly cost an SPSC hop per cross-shard read.
+///
+/// # `auto`
+///
+/// Enabled when BOTH hold:
+///
+/// * `num_shards > 1` — at one shard every key is local, so the path is
+///   unreachable and the switch is noise;
+/// * the monoio handler is compiled in — the dispatch site lives in
+///   `handler_monoio`. On the tokio leg `handler_sharded` still routes every
+///   cross-shard read through SPSC, so enabling it there does nothing at all
+///   (moon#776). `auto` declines instead of lighting a switch that lies.
+///
+/// `on` forces it regardless, so the tokio leg can still be told to set the
+/// flag (and still gets `main.rs`'s no-op warning).
+pub fn resolve_cross_shard_fast_path(
+    mode: &str,
+    num_shards: usize,
+    monoio_handler: bool,
+) -> Result<bool, String> {
+    match mode {
+        "auto" => Ok(num_shards > 1 && monoio_handler),
+        "on" | "yes" => Ok(true),
+        "off" | "no" => Ok(false),
+        other => Err(format!(
+            "--cross-shard-fast-path must be one of auto|on|off (got {other:?})"
+        )),
+    }
+}
+
 /// Whether a cross-shard read may be served under a shared guard on the
 /// calling thread instead of hopping through SPSC.
 #[inline]
@@ -474,6 +509,53 @@ mod tests {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         ShardDbSet { shard_id: 0, dbs }
+    }
+
+    #[test]
+    fn auto_enables_the_fast_path_on_monoio_with_more_than_one_shard() {
+        // The measured reason this default flipped: at `--shards 8` with a
+        // POPULATED keyspace the path serves 100% of foreign reads in place and
+        // takes parks/cmd for GET at p=1 from 0.875 to 0.000. Counter ratios
+        // (`total_dispatch_cross_read_fast` vs `total_dispatch_cross_spsc`,
+        // `total_remote_awaits_parked`), reproduced against DBSIZE:
+        //
+        //   dbsize  63,114 -> 62.9% in place, parks/cmd 0.325
+        //   dbsize  98,169 -> 98.2% in place, parks/cmd 0.016
+        //   dbsize 100,000 -> 100.0% in place, parks/cmd 0.000
+        //
+        // The residual is the benchmark's key MISS rate, not lock contention.
+        assert_eq!(resolve_cross_shard_fast_path("auto", 8, true), Ok(true));
+    }
+
+    #[test]
+    fn auto_declines_where_the_path_cannot_fire() {
+        // One shard: every key is local, the branch is unreachable.
+        assert_eq!(resolve_cross_shard_fast_path("auto", 1, true), Ok(false));
+        // Tokio: `handler_sharded` has no fast-path site (moon#776). A switch
+        // that cannot change behaviour must not read as enabled.
+        assert_eq!(resolve_cross_shard_fast_path("auto", 8, false), Ok(false));
+    }
+
+    #[test]
+    fn on_forces_the_switch_and_off_clears_it_regardless_of_shape() {
+        for (mode, want) in [("on", true), ("yes", true), ("off", false), ("no", false)] {
+            assert_eq!(
+                resolve_cross_shard_fast_path(mode, 1, false),
+                Ok(want),
+                "{mode}"
+            );
+            assert_eq!(
+                resolve_cross_shard_fast_path(mode, 8, true),
+                Ok(want),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_mode_is_a_startup_error_not_a_silent_default() {
+        let err = resolve_cross_shard_fast_path("ON ", 8, true).unwrap_err();
+        assert!(err.contains("auto|on|off"), "{err}");
     }
 
     #[test]
