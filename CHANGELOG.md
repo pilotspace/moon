@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Fuzz crash reproducers are archived instead of discarded.** `fuzz.yml` uploaded only
+  `fuzz/corpus/`, so the minimal reproducer libFuzzer writes to
+  `fuzz/artifacts/<target>/crash-<sha>` was destroyed with the runner on every finding —
+  the recent `term_fst_sidecar` OOM had to be diagnosed from the single ASan line left in
+  the log, and its reproducer is gone for good. Both the nightly and the `ci-fuzz` PR job
+  now upload it on failure. Deliberately a separate artifact rather than a second entry in
+  the corpus step's `path:`: `upload-artifact@v4` re-roots a multi-path archive at the
+  common ancestor, which would have made the next run's download land the corpus in
+  `fuzz/corpus/corpus/` and silently stop seeding while still reporting success.
+
 ### Changed
 
 - **`ci-local.sh` runs the two VM suites concurrently.** They were sequential because
