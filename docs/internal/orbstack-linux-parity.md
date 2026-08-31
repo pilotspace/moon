@@ -8,10 +8,23 @@ OrbStack is used for Linux-parity builds, production benchmarks, and io_uring te
 
 ## Machine: `moon-dev`
 
-- **OS:** Ubuntu 24.04 (kernel 6.17+, full io_uring support)
+- **OS:** Ubuntu 26.04.1 LTS (kernel 6.17+, full io_uring support). `orb create ubuntu`
+  tracks the current release — it produced 24.04 when this doc was written and 26.04.1 on
+  2026-08-31. The apt `redis-server` is 8.0.5, so the compat oracle version is unaffected.
 - **Arch:** aarch64 (matches Apple Silicon host)
-- **Rust:** 1.94.1 (MSRV-pinned)
-- **Tools:** build-essential, pkg-config, libssl-dev, redis-server
+- **Rust:** stable via rustup, but `rust-toolchain.toml` pins **1.94.1** inside the repo, so
+  no toolchain pinning is needed at install time — `rustc --version` reads 1.94.1 in-tree
+  and the newer stable everywhere else.
+- **vCPU/RAM:** 6 / 12288 MiB, from OrbStack's **global** config. A wipe has reset it to 2
+  before now; verify with `orb config show`, and never raise it without asking — see
+  `CLAUDE.md` on the deliberate cap.
+- **Tools:** build-essential, pkg-config, libssl-dev, redis-server, **git**,
+  **python3-redis**, **libicu-dev**, curl, **cargo-nextest**. The last four are not
+  optional: `git` (VM-local `file://` clones fail with exit 127), `python3-redis`
+  (`scripts/test-consistency.sh` dies mid-suite with `ModuleNotFoundError`), `libicu-dev`
+  (GitHub Actions runner dependency), and nextest (every `ci-local` VM leg runs
+  `cargo nextest run --profile ci`; without it the legs fall back to a slower
+  `cargo test` with no flake retries).
 
 OrbStack auto-mounts the macOS filesystem (including `/Volumes/`) into the VM at the same paths — edit on macOS, compile on Linux. No rsync or Docker volumes needed. `orb run` preserves the caller's working directory, so commands run from the repo need no `cd` at all.
 
@@ -44,13 +57,60 @@ orb run -m moon-dev bash
 
 ## Recreating the Machine
 
-If the machine is lost or corrupted:
+**The machine really does vanish.** `orbctl list` has come back empty five times
+(2026-07-10, 08-19, 08-30, 08-31), twice *mid-run*. Two things break at once and only one
+of them is obvious:
+
+- `scripts/ci-local.sh` cannot run its VM legs. Since #781 it **refuses outright with
+  exit 4** rather than running the macOS suite for another ~20 minutes and then reporting a
+  failure that reads like a test failure. If you see that message, you are here.
+- **The self-hosted Actions runner dies with the VM**, so the hosted `check-monoio` and
+  `client-compat` legs queue forever with no error. Reinstalling the VM is not enough;
+  step 5 below is not optional.
+
+Full recreate, ~15 minutes end to end. The first `ci-local` afterwards is a cold build
+(VM-local `~/ci-target` caches are gone with the machine).
+
 ```bash
-orb delete moon-dev
+# 1. Machine. (No `orb delete` needed when it has already vanished.)
 orb create ubuntu moon-dev
-orb run -m moon-dev bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.94.1'
-orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y -qq build-essential pkg-config libssl-dev redis-server'
+orb config show | grep -E '^cpu|^memory_mib'   # expect 6 / 12288 — a wipe resets this
+
+# 2. System packages — all of these, see "Tools" above for why.
+orb run -m moon-dev bash -lc 'sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive \
+  apt-get install -y -qq build-essential pkg-config libssl-dev redis-server \
+                        git python3-redis libicu-dev curl'
+
+# 3. Rust. `rust-toolchain.toml` pins 1.94.1 in-tree, so install plain stable.
+orb run -m moon-dev bash -lc 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+  | sh -s -- -y --default-toolchain stable'
+
+# 4. nextest — every ci-local VM leg uses it.
+orb run -m moon-dev bash -lc 'source ~/.cargo/env && \
+  curl -LsSf https://get.nexte.st/latest/linux-arm | tar zxf - -C ~/.cargo/bin'
+
+# 5. GitHub Actions runner. Do this AFTER any VM suite finishes — a starting runner
+#    immediately drains the queued backlog and competes with whatever is running.
+TOKEN=$(gh api -X POST repos/pilotspace/moon/actions/runners/registration-token -q .token)
+orb run -m moon-dev bash -lc "mkdir -p ~/actions-runner && cd ~/actions-runner && \
+  curl -sL -o r.tar.gz https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-arm64-2.336.0.tar.gz && \
+  tar xzf r.tar.gz && rm r.tar.gz && \
+  sudo ./bin/installdependencies.sh && \
+  ./config.sh --url https://github.com/pilotspace/moon --token $TOKEN \
+              --name moon-dev-vm --labels moon-dev --unattended --replace && \
+  sudo ./svc.sh install \$(whoami) && sudo ./svc.sh start"
+
+# 6. Verify.
+gh api repos/pilotspace/moon/actions/runners -q '.runners[]|"\(.name) \(.status)"'
 ```
+
+`installdependencies.sh` must run **before** `config.sh`, not after. After an `orb stop`/
+`start` GitHub may show the runner offline while systemd reports the service active —
+`sudo systemctl restart actions.runner.pilotspace-moon.moon-dev-vm.service` re-registers it.
+
+Once the runner comes online it picks up everything that queued while the VM was down.
+Check for a long nightly (crash-matrix, fuzz) that would resume into working hours and
+hold the machine for hours before you start your own gates.
 
 ## OrbStack Rules for Claude Code
 

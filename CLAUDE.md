@@ -109,11 +109,21 @@ Measured detail — spin governor, THP soak, io_uring dead ends — in [`docs/in
 `scripts/ci-local.sh` is the local gate and, since #732, the **only** gate for the monoio suite (*the runtime that ships*), client-compat, macOS, and the console feature until a change reaches main. Run it before every push.
 
 ```bash
-scripts/ci-local.sh           # = --full: lint ×6 + VM monoio + VM tokio + client-compat + macOS
+scripts/ci-local.sh           # = --full: 13 legs, ~17 min warm — lint ×7 + both VM suites
+                              #   (CONCURRENT) + client-compat + macOS + doctests
 scripts/ci-local.sh --native  # NO VM: both suites + client-compat on the macOS host
 scripts/ci-local.sh --fast    # lint + both VM suites — NOT the merge bar
 scripts/ci-local.sh --quick   # host lint only — NOT the merge bar
 ```
+
+**Exit 4 = the moon-dev VM is unreachable**, and the run refuses before doing anything:
+with no VM every VM leg fails at 0s, and the old behaviour was to continue for ~20 more
+minutes and then blame your tests. Recreate it per
+[`docs/internal/orbstack-linux-parity.md`](docs/internal/orbstack-linux-parity.md) — and
+reinstall the Actions runner, which dies with the machine and otherwise leaves the hosted
+monoio and client-compat legs queued forever. `CI_LOCAL_VM_SEQUENTIAL=1` runs the two VM
+suites one after another again; they are concurrent by default (measured -44.5%, zero
+retries), and that knob is the rollback if a wall-clock-sensitive test starts failing.
 
 `--native` is the fallback when the VM is unavailable. It is **not** equivalent: it ends by naming what it skipped — io_uring, Linux-only `cfg` code, Windows, the MSRV pin — instead of a bare PASS, and exits 2 with no `redis-server` oracle on PATH. The script captures every exit code directly (no piped gates) and fingerprints the tree at start and end: a branch switch or edit mid-run marks the result INVALID (exit 3) rather than a false green.
 
