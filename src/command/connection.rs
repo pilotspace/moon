@@ -1604,7 +1604,7 @@ mod tests {
     fn test_info_with_keys() {
         let mut db = Database::new();
         db.set(
-            Bytes::from_static(b"key1"),
+            b"key1",
             crate::storage::Entry::new_string(Bytes::from_static(b"val")),
         );
         let result = info(&db, &[]);

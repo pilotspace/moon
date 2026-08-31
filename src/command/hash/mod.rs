@@ -475,10 +475,7 @@ mod tests {
     fn test_wrongtype_error() {
         let mut db = Database::new();
         // Set a string key
-        db.set_string(
-            Bytes::from_static(b"mystring"),
-            Bytes::from_static(b"hello"),
-        );
+        db.set_string(b"mystring", Bytes::from_static(b"hello"));
 
         // Try hash operations on string key
         let args = make_args(&[b"mystring", b"f1", b"v1"]);
@@ -599,7 +596,7 @@ mod tests {
     #[test]
     fn test_hexpire_wrong_type_returns_wrongtype() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"s"), Bytes::from_static(b"x"));
+        db.set_string(b"s", Bytes::from_static(b"x"));
         let args = make_args(&[b"s", b"60", b"FIELDS", b"1", b"f"]);
         let r = hexpire(&mut db, &args);
         assert!(matches!(r, Frame::Error(ref e) if e.starts_with(b"WRONGTYPE")));
@@ -1459,7 +1456,7 @@ mod tests {
     #[test]
     fn test_hgetdel_wrongtype_error() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"s"), Bytes::from_static(b"not_a_hash"));
+        db.set_string(b"s", Bytes::from_static(b"not_a_hash"));
         let r = hgetdel(&mut db, &make_args(&[b"s", b"FIELDS", b"1", b"f"]));
         assert!(
             matches!(&r, Frame::Error(e) if e.starts_with(b"WRONGTYPE")),
@@ -1647,7 +1644,7 @@ mod tests {
     #[test]
     fn test_hgetex_wrongtype_error() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"s"), Bytes::from_static(b"not_a_hash"));
+        db.set_string(b"s", Bytes::from_static(b"not_a_hash"));
         let r = hgetex(
             &mut db,
             &make_args(&[b"s", b"EX", b"60", b"FIELDS", b"1", b"f"]),
@@ -2008,7 +2005,7 @@ mod tests {
     #[test]
     fn hstrlen_rejects_a_wrong_type_and_a_bad_arity() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"str"), Bytes::from_static(b"v"));
+        db.set_string(b"str", Bytes::from_static(b"v"));
         assert!(
             matches!(hstrlen(&mut db, &make_args(&[b"str", b"f"])), Frame::Error(ref e)
                 if e.starts_with(b"WRONGTYPE")),
@@ -2035,7 +2032,7 @@ mod tests {
     fn hstrlen_readonly_matches_the_mutable_track() {
         let mut db = Database::new();
         hset(&mut db, &make_args(&[b"h", b"f", b"hello world"]));
-        db.set_string(Bytes::from_static(b"str"), Bytes::from_static(b"v"));
+        db.set_string(b"str", Bytes::from_static(b"v"));
         for argv in [
             vec![b"h".as_slice(), b"f"],
             vec![b"h".as_slice(), b"missing"],

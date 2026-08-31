@@ -182,7 +182,7 @@ pub fn restore(db: &mut Database, args: &[Frame]) -> Frame {
         entry.set_expires_at_ms(when);
     }
 
-    db.set(Bytes::copy_from_slice(key), entry);
+    db.set(key, entry);
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
@@ -238,10 +238,7 @@ mod tests {
     #[test]
     fn a_value_survives_dump_then_restore() {
         let mut db = db();
-        db.set(
-            Bytes::from_static(b"src"),
-            Entry::new_string(Bytes::from_static(b"hello")),
-        );
+        db.set(b"src", Entry::new_string(Bytes::from_static(b"hello")));
         let p = payload_of(&mut db, b"src");
         let r = restore(&mut db, &[bulk(b"dst"), bulk(b"0"), Frame::BulkString(p)]);
         assert_eq!(r, ok_frame(), "restore said {r:?}");
@@ -251,14 +248,8 @@ mod tests {
     #[test]
     fn restoring_onto_a_live_key_needs_replace() {
         let mut db = db();
-        db.set(
-            Bytes::from_static(b"src"),
-            Entry::new_string(Bytes::from_static(b"hello")),
-        );
-        db.set(
-            Bytes::from_static(b"taken"),
-            Entry::new_string(Bytes::from_static(b"old")),
-        );
+        db.set(b"src", Entry::new_string(Bytes::from_static(b"hello")));
+        db.set(b"taken", Entry::new_string(Bytes::from_static(b"old")));
         let p = payload_of(&mut db, b"src");
         match restore(
             &mut db,
@@ -308,10 +299,7 @@ mod tests {
     #[test]
     fn a_relative_ttl_becomes_an_expiry_in_the_future() {
         let mut db = db();
-        db.set(
-            Bytes::from_static(b"src"),
-            Entry::new_string(Bytes::from_static(b"v")),
-        );
+        db.set(b"src", Entry::new_string(Bytes::from_static(b"v")));
         let p = payload_of(&mut db, b"src");
         assert_eq!(
             restore(
@@ -330,10 +318,7 @@ mod tests {
         // Not an error in redis: +OK, and EXISTS answers 0. Treating it as an
         // error would break MIGRATE of a key whose deadline passed in flight.
         let mut db = db();
-        db.set(
-            Bytes::from_static(b"src"),
-            Entry::new_string(Bytes::from_static(b"v")),
-        );
+        db.set(b"src", Entry::new_string(Bytes::from_static(b"v")));
         let p = payload_of(&mut db, b"src");
         let r = restore(
             &mut db,
@@ -353,10 +338,7 @@ mod tests {
         // Accepting `FREQ 300` because the value is unused is the divergence
         // a client would notice; the range check is the whole contract here.
         let mut db = db();
-        db.set(
-            Bytes::from_static(b"src"),
-            Entry::new_string(Bytes::from_static(b"v")),
-        );
+        db.set(b"src", Entry::new_string(Bytes::from_static(b"v")));
         let p = payload_of(&mut db, b"src");
         let mk = |opt: &[u8], v: &[u8]| {
             vec![
@@ -384,10 +366,7 @@ mod tests {
     #[test]
     fn an_unknown_option_is_a_syntax_error() {
         let mut db = db();
-        db.set(
-            Bytes::from_static(b"src"),
-            Entry::new_string(Bytes::from_static(b"v")),
-        );
+        db.set(b"src", Entry::new_string(Bytes::from_static(b"v")));
         let p = payload_of(&mut db, b"src");
         match restore(
             &mut db,
@@ -446,7 +425,7 @@ mod dispatch_wiring_tests {
         // routed cross-shard went through `dispatch` instead.
         let mut db = Database::new();
         db.set(
-            Bytes::from_static(b"src"),
+            b"src",
             crate::storage::Entry::new_string(Bytes::from_static(b"v")),
         );
         let mut sel = 0usize;
@@ -555,7 +534,7 @@ mod dispatch_wiring_tests {
         let mut db = Database::new();
         let mut sel = 0usize;
         db.set(
-            Bytes::from_static(b"src"),
+            b"src",
             crate::storage::Entry::new_string(Bytes::from_static(b"v")),
         );
         let key = Frame::BulkString(Bytes::from_static(b"src"));

@@ -30,7 +30,7 @@ fn idle_volatile_db(n: u32) -> Database {
     let deadline = current_time_ms() + 3_600_000;
     for i in 0..n {
         db.set(
-            Bytes::from(format!("k{i}")),
+            &Bytes::from(format!("k{i}")),
             Entry::new_string_with_expiry(Bytes::from_static(b"value"), deadline),
         );
     }
@@ -45,7 +45,7 @@ fn field_ttl_db(n: u32, offset_ms: i64) -> Database {
     // BOTH sides of an A/B: the pre-#543 code gates the entire cycle on that
     // latch, and a leg that early-returns would measure nothing at all.
     db.set(
-        Bytes::from_static(b"__arm__"),
+        b"__arm__",
         Entry::new_string_with_expiry(Bytes::from_static(b"v"), base + 86_400_000),
     );
     if offset_ms >= 0 {
@@ -77,7 +77,7 @@ fn field_ttl_db(n: u32, offset_ms: i64) -> Database {
             ttls,
             min_expiry_ms: deadline,
         });
-        db.set(Bytes::from(format!("h{i}")), entry);
+        db.set(&Bytes::from(format!("h{i}")), entry);
     }
     db
 }
@@ -110,7 +110,7 @@ fn bench_one_due_key_among_field_ttl_hashes(c: &mut Criterion) {
                 // Re-arm one whole-key victim so the cycle is entered every
                 // iteration (the head-peek gate would otherwise skip it).
                 db.set(
-                    Bytes::from_static(b"__due__"),
+                    b"__due__",
                     Entry::new_string_with_expiry(
                         Bytes::from_static(b"v"),
                         current_time_ms().saturating_sub(1),

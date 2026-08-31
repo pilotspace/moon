@@ -792,7 +792,7 @@ pub fn load_rdb<D: std::borrow::BorrowMut<Database>>(
 
                 if current_db < databases.len() {
                     let key = Bytes::from(key_bytes);
-                    databases[current_db].borrow_mut().set(key, entry);
+                    databases[current_db].borrow_mut().set(&key, entry);
                     total_keys += 1;
                 }
             }
@@ -1059,7 +1059,7 @@ mod tests {
             let mut dbs = vec![Database::new(), Database::new(), Database::new()];
             for (db_idx, k, v) in pairs {
                 dbs[*db_idx].set(
-                    Bytes::copy_from_slice(k.as_bytes()),
+                    k.as_bytes(),
                     Entry::new_string(Bytes::copy_from_slice(v.as_bytes())),
                 );
             }
@@ -1250,10 +1250,7 @@ mod tests {
     #[test]
     fn test_write_rdb_single_string_entry() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"mykey"),
-            Entry::new_string(Bytes::from_static(b"myvalue")),
-        );
+        db.set(b"mykey", Entry::new_string(Bytes::from_static(b"myvalue")));
         let databases = vec![db];
         let mut buf = Vec::new();
         write_rdb(&databases, &mut buf);
@@ -1277,7 +1274,7 @@ mod tests {
         let mut db = Database::new();
         let expire_ms = current_time_ms() + 60_000;
         db.set(
-            Bytes::from_static(b"expkey"),
+            b"expkey",
             Entry::new_string_with_expiry(Bytes::from_static(b"val"), expire_ms),
         );
         let databases = vec![db];
@@ -1296,7 +1293,7 @@ mod tests {
             map.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
             map.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
         }
-        db.set(Bytes::from_static(b"myhash"), entry);
+        db.set(b"myhash", entry);
         let databases = vec![db];
         let mut buf = Vec::new();
         write_rdb(&databases, &mut buf);
@@ -1314,7 +1311,7 @@ mod tests {
             list.push_back(Bytes::from_static(b"b"));
             list.push_back(Bytes::from_static(b"c"));
         }
-        db.set(Bytes::from_static(b"mylist"), entry);
+        db.set(b"mylist", entry);
         let databases = vec![db];
         let mut buf = Vec::new();
         write_rdb(&databases, &mut buf);
@@ -1330,7 +1327,7 @@ mod tests {
             set.insert(Bytes::from_static(b"m1"));
             set.insert(Bytes::from_static(b"m2"));
         }
-        db.set(Bytes::from_static(b"myset"), entry);
+        db.set(b"myset", entry);
         let databases = vec![db];
         let mut buf = Vec::new();
         write_rdb(&databases, &mut buf);
@@ -1348,7 +1345,7 @@ mod tests {
             members.insert(Bytes::from_static(b"bob"), 2.5);
             scores.insert((OrderedFloat(2.5), Bytes::from_static(b"bob")), ());
         }
-        db.set(Bytes::from_static(b"myzset"), entry);
+        db.set(b"myzset", entry);
         let databases = vec![db];
         let mut buf = Vec::new();
         write_rdb(&databases, &mut buf);
@@ -1359,10 +1356,7 @@ mod tests {
     #[test]
     fn test_roundtrip_string() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"k1"),
-            Entry::new_string(Bytes::from_static(b"v1")),
-        );
+        db.set(b"k1", Entry::new_string(Bytes::from_static(b"v1")));
         let databases = vec![db];
         let mut buf = Vec::new();
         write_rdb(&databases, &mut buf);
@@ -1385,7 +1379,7 @@ mod tests {
         let mut db = Database::new();
         let expire_ms = current_time_ms() + 600_000; // 10 min in future
         db.set(
-            Bytes::from_static(b"ek"),
+            b"ek",
             Entry::new_string_with_expiry(Bytes::from_static(b"ev"), expire_ms),
         );
         let databases = vec![db];
@@ -1418,7 +1412,7 @@ mod tests {
             map.insert(Bytes::from_static(b"field1"), Bytes::from_static(b"val1"));
             map.insert(Bytes::from_static(b"field2"), Bytes::from_static(b"val2"));
         }
-        db.set(Bytes::from_static(b"h1"), entry);
+        db.set(b"h1", entry);
         let databases = vec![db];
         let mut buf = Vec::new();
         write_rdb(&databases, &mut buf);
@@ -1454,7 +1448,7 @@ mod tests {
             list.push_back(Bytes::from_static(b"b"));
             list.push_back(Bytes::from_static(b"c"));
         }
-        db.set(Bytes::from_static(b"l1"), entry);
+        db.set(b"l1", entry);
         let databases = vec![db];
         let mut buf = Vec::new();
         write_rdb(&databases, &mut buf);
@@ -1484,7 +1478,7 @@ mod tests {
             set.insert(Bytes::from_static(b"x"));
             set.insert(Bytes::from_static(b"y"));
         }
-        db.set(Bytes::from_static(b"s1"), entry);
+        db.set(b"s1", entry);
         let databases = vec![db];
         let mut buf = Vec::new();
         write_rdb(&databases, &mut buf);
@@ -1515,7 +1509,7 @@ mod tests {
             members.insert(Bytes::from_static(b"bob"), 2.5);
             scores.insert((OrderedFloat(2.5), Bytes::from_static(b"bob")), ());
         }
-        db.set(Bytes::from_static(b"z1"), entry);
+        db.set(b"z1", entry);
         let databases = vec![db];
         let mut buf = Vec::new();
         write_rdb(&databases, &mut buf);
@@ -1542,15 +1536,12 @@ mod tests {
         let mut db = Database::new();
 
         // String
-        db.set(
-            Bytes::from_static(b"str"),
-            Entry::new_string(Bytes::from_static(b"hello")),
-        );
+        db.set(b"str", Entry::new_string(Bytes::from_static(b"hello")));
 
         // String with TTL
         let expire_ms = current_time_ms() + 300_000;
         db.set(
-            Bytes::from_static(b"str_ttl"),
+            b"str_ttl",
             Entry::new_string_with_expiry(Bytes::from_static(b"world"), expire_ms),
         );
 
@@ -1559,7 +1550,7 @@ mod tests {
         if let Some(RedisValue::Hash(map)) = hash_entry.redis_value_mut() {
             map.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
         }
-        db.set(Bytes::from_static(b"hash"), hash_entry);
+        db.set(b"hash", hash_entry);
 
         // List
         let mut list_entry = Entry::new_list();
@@ -1567,14 +1558,14 @@ mod tests {
             list.push_back(Bytes::from_static(b"item1"));
             list.push_back(Bytes::from_static(b"item2"));
         }
-        db.set(Bytes::from_static(b"list"), list_entry);
+        db.set(b"list", list_entry);
 
         // Set
         let mut set_entry = Entry::new_set();
         if let Some(RedisValue::Set(set)) = set_entry.redis_value_mut() {
             set.insert(Bytes::from_static(b"member1"));
         }
-        db.set(Bytes::from_static(b"set"), set_entry);
+        db.set(b"set", set_entry);
 
         // Sorted set
         let mut zset_entry = Entry::new_sorted_set();
@@ -1583,7 +1574,7 @@ mod tests {
             members.insert(Bytes::from_static(b"z1"), 3.14);
             scores.insert((OrderedFloat(3.14), Bytes::from_static(b"z1")), ());
         }
-        db.set(Bytes::from_static(b"zset"), zset_entry);
+        db.set(b"zset", zset_entry);
 
         let databases = vec![db];
         let mut buf = Vec::new();

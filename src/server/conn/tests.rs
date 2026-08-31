@@ -32,10 +32,7 @@ fn make_rt_config() -> parking_lot::RwLock<crate::config::RuntimeConfig> {
 fn test_inline_get_hit() {
     let dbs = make_dbs();
     crate::shard::slice::with_shard_db(0, |db| {
-        db.set(
-            Bytes::from_static(b"foo"),
-            Entry::new_string(Bytes::from_static(b"bar")),
-        );
+        db.set(b"foo", Entry::new_string(Bytes::from_static(b"bar")));
     });
     let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"[..]);
     let mut write_buf = BytesMut::new();
@@ -73,10 +70,7 @@ fn test_inline_get_hit_byte_parity_sizes() {
         let dbs = make_dbs();
         let value: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
         crate::shard::slice::with_shard_db(0, |db| {
-            db.set(
-                Bytes::from_static(b"k"),
-                Entry::new_string(Bytes::from(value.clone())),
-            );
+            db.set(b"k", Entry::new_string(Bytes::from(value.clone())));
         });
         let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"[..]);
         let mut write_buf = BytesMut::new();
@@ -205,10 +199,7 @@ fn test_inline_get_hit_is_protocol_independent() {
     for resp3 in [false, true] {
         let dbs = make_dbs();
         crate::shard::slice::with_shard_db(0, |db| {
-            db.set(
-                Bytes::from_static(b"foo"),
-                Entry::new_string(Bytes::from_static(b"bar")),
-            );
+            db.set(b"foo", Entry::new_string(Bytes::from_static(b"bar")));
         });
         let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"[..]);
         let mut write_buf = BytesMut::new();
@@ -326,10 +317,7 @@ fn test_inline_set_captures_snapshot_pre_image() {
 
     let dbs = make_dbs();
     crate::shard::slice::with_shard_db(0, |db| {
-        db.set(
-            Bytes::from_static(b"foo"),
-            Entry::new_string(Bytes::from_static(b"old")),
-        );
+        db.set(b"foo", Entry::new_string(Bytes::from_static(b"old")));
     });
     let cmd = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nnew\r\n";
     let mut read_buf = BytesMut::from(&cmd[..]);
@@ -379,10 +367,7 @@ fn test_inline_get_captures_nothing_under_snapshot() {
 
     let dbs = make_dbs();
     crate::shard::slice::with_shard_db(0, |db| {
-        db.set(
-            Bytes::from_static(b"foo"),
-            Entry::new_string(Bytes::from_static(b"bar")),
-        );
+        db.set(b"foo", Entry::new_string(Bytes::from_static(b"bar")));
     });
     let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"[..]);
     let mut write_buf = BytesMut::new();
@@ -476,10 +461,7 @@ fn test_inline_fallthrough() {
 fn test_inline_mixed_batch() {
     let dbs = make_dbs();
     crate::shard::slice::with_shard_db(0, |db| {
-        db.set(
-            Bytes::from_static(b"foo"),
-            Entry::new_string(Bytes::from_static(b"bar")),
-        );
+        db.set(b"foo", Entry::new_string(Bytes::from_static(b"bar")));
     });
     // GET foo followed by PING
     let mut read_buf = BytesMut::new();
@@ -520,10 +502,7 @@ fn test_inline_mixed_batch() {
 fn test_inline_get_refused_when_reads_not_inlinable() {
     let dbs = make_dbs();
     crate::shard::slice::with_shard_db(0, |db| {
-        db.set(
-            Bytes::from_static(b"foo"),
-            Entry::new_string(Bytes::from_static(b"bar")),
-        );
+        db.set(b"foo", Entry::new_string(Bytes::from_static(b"bar")));
     });
     let mut read_buf = BytesMut::new();
     read_buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
@@ -564,10 +543,7 @@ fn test_inline_get_refused_when_reads_not_inlinable() {
 fn test_inline_case_insensitive() {
     let dbs = make_dbs();
     crate::shard::slice::with_shard_db(0, |db| {
-        db.set(
-            Bytes::from_static(b"foo"),
-            Entry::new_string(Bytes::from_static(b"baz")),
-        );
+        db.set(b"foo", Entry::new_string(Bytes::from_static(b"baz")));
     });
     let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nget\r\n$3\r\nfoo\r\n"[..]);
     let mut write_buf = BytesMut::new();
@@ -666,14 +642,8 @@ fn test_inline_set_with_aof_falls_through_when_writes_disabled() {
 fn test_inline_multiple_gets() {
     let dbs = make_dbs();
     crate::shard::slice::with_shard_db(0, |db| {
-        db.set(
-            Bytes::from_static(b"a"),
-            Entry::new_string(Bytes::from_static(b"1")),
-        );
-        db.set(
-            Bytes::from_static(b"b"),
-            Entry::new_string(Bytes::from_static(b"2")),
-        );
+        db.set(b"a", Entry::new_string(Bytes::from_static(b"1")));
+        db.set(b"b", Entry::new_string(Bytes::from_static(b"2")));
     });
     let mut read_buf = BytesMut::new();
     read_buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
@@ -710,10 +680,7 @@ fn test_inline_multiple_gets() {
 fn test_inline_loop_disabled_in_cluster_mode() {
     let dbs = make_dbs();
     crate::shard::slice::with_shard_db(0, |db| {
-        db.set(
-            Bytes::from_static(b"foo"),
-            Entry::new_string(Bytes::from_static(b"bar")),
-        );
+        db.set(b"foo", Entry::new_string(Bytes::from_static(b"bar")));
     });
     let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"[..]);
     let mut write_buf = BytesMut::new();

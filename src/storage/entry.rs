@@ -501,6 +501,31 @@ impl CompactEntry {
         }
     }
 
+    /// Create a new string entry from a borrowed slice, with no expiration.
+    ///
+    /// The `Bytes`-taking constructor makes a caller that holds only bytes —
+    /// `itoa` output, a stack buffer, a slice of a larger value — allocate one
+    /// just to hand it over, and `CompactValue` then copies out of it and drops
+    /// it. INCR did exactly that, once per operation.
+    pub fn new_string_from_slice(value: &[u8]) -> CompactEntry {
+        CompactEntry {
+            value: CompactValue::from_slice(value),
+            ttl_ms: 0,
+            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
+            last_access_secs: current_secs(),
+        }
+    }
+
+    /// Create a new string entry from a borrowed slice with an expiration (unix millis).
+    pub fn new_string_from_slice_with_expiry(value: &[u8], expires_at_ms: u64) -> CompactEntry {
+        CompactEntry {
+            value: CompactValue::from_slice(value),
+            ttl_ms: expires_at_ms,
+            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
+            last_access_secs: current_secs(),
+        }
+    }
+
     /// Create a new hash entry with an empty HashMap.
     pub fn new_hash() -> CompactEntry {
         CompactEntry {
@@ -633,6 +658,69 @@ impl CompactEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The borrowed-slice constructors must agree with the owned-`Bytes` ones on
+    /// EVERY length, especially across the 12-byte SSO boundary where one side
+    /// inlines and the other heap-allocates. INCR builds its reply value from
+    /// `itoa` bytes rather than a per-operation `String`, and an off-by-one here
+    /// would either trip `inline_string`'s `debug_assert` or silently truncate.
+    #[test]
+    fn new_string_from_slice_matches_owned_across_the_sso_boundary() {
+        // 0..=32 covers 12 (last inline), 13 (first heap) and the 20 bytes an
+        // i64 can print to, with room to spare.
+        for len in 0..=32usize {
+            let raw: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
+            let owned = Entry::new_string(Bytes::from(raw.clone()));
+            let borrowed = Entry::new_string_from_slice(&raw);
+            assert_eq!(
+                borrowed.value.as_bytes().map(|v| v.to_vec()),
+                owned.value.as_bytes().map(|v| v.to_vec()),
+                "len {len} diverged"
+            );
+            assert_eq!(borrowed.value.type_name(), "string", "len {len}");
+            assert!(!borrowed.has_expiry(), "len {len}");
+        }
+
+        // Every i64 an INCR can produce, printed exactly as Redis prints it.
+        for n in [
+            0i64,
+            -1,
+            9,
+            -9,
+            999_999_999_999,   // 12 digits — last inline
+            -999_999_999_999,  // 13 bytes with the sign — first heap
+            1_000_000_000_000, // 13 digits
+            i64::MAX,
+            i64::MIN,
+        ] {
+            let printed = n.to_string();
+            let owned = Entry::new_string(Bytes::from(printed.clone()));
+            let borrowed = Entry::new_string_from_slice(printed.as_bytes());
+            assert_eq!(
+                borrowed.value.as_bytes().map(|v| v.to_vec()),
+                owned.value.as_bytes().map(|v| v.to_vec()),
+                "{n} diverged"
+            );
+        }
+    }
+
+    #[test]
+    fn new_string_from_slice_with_expiry_keeps_the_deadline() {
+        let exp_ms = current_time_ms() + 60_000;
+        let short = Entry::new_string_from_slice_with_expiry(b"7", exp_ms);
+        let long = Entry::new_string_from_slice_with_expiry(b"-9223372036854775808", exp_ms);
+        for entry in [&short, &long] {
+            assert!(entry.has_expiry());
+            assert!(
+                (entry.expires_at_ms() as i64 - exp_ms as i64).unsigned_abs() < 1000,
+                "expiry round-trip drifted"
+            );
+            assert_eq!(entry.version(), INITIAL_VERSION);
+            assert_eq!(entry.access_counter(), LFU_INIT_VAL);
+        }
+        assert_eq!(short.value.as_bytes(), Some(&b"7"[..]));
+        assert_eq!(long.value.as_bytes(), Some(&b"-9223372036854775808"[..]));
+    }
 
     #[test]
     fn test_new_string_no_expiry() {

@@ -882,10 +882,7 @@ mod tests {
     fn an_empty_result_deletes_the_destination_and_answers_zero() {
         let mut db = Database::new();
         setup_sicily(&mut db);
-        db.set_string(
-            Bytes::from_static(b"dest"),
-            Bytes::from_static(b"i am in the way"),
-        );
+        db.set_string(b"dest", Bytes::from_static(b"i am in the way"));
         // Middle of the Atlantic — nothing within 1km.
         let got = georadius(
             &mut db,
@@ -1048,7 +1045,7 @@ mod tests {
             b"ERR unsupported unit provided. please use M, KM, FT, MI",
         ));
 
-        db.set_string(Bytes::from_static(b"dest"), Bytes::from_static(b"keep me"));
+        db.set_string(b"dest", Bytes::from_static(b"keep me"));
         let got = geosearchstore(
             &mut db,
             &[

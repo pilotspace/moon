@@ -1213,7 +1213,7 @@ mod tests {
         let mut dbs = vec![Database::new()];
 
         // String
-        dbs[0].set_string(Bytes::from_static(b"str"), Bytes::from_static(b"val"));
+        dbs[0].set_string(b"str", Bytes::from_static(b"val"));
         // Hash
         {
             let map = dbs[0].get_or_create_hash(b"h").unwrap();
@@ -1263,11 +1263,7 @@ mod tests {
     fn test_generate_rewrite_commands_with_ttl() {
         let mut dbs = vec![Database::new()];
         let future_ms = current_time_ms() + 3_600_000;
-        dbs[0].set_string_with_expiry(
-            Bytes::from_static(b"key"),
-            Bytes::from_static(b"val"),
-            future_ms,
-        );
+        dbs[0].set_string_with_expiry(b"key", Bytes::from_static(b"val"), future_ms);
 
         let commands = generate_rewrite_commands(&dbs);
 
@@ -1372,10 +1368,7 @@ mod tests {
 
         // Build a 1-key database with a string value.
         let mut db = Database::new();
-        db.set_string(
-            Bytes::from_static(b"rdb_key"),
-            Bytes::from_static(b"rdb_value"),
-        );
+        db.set_string(b"rdb_key", Bytes::from_static(b"rdb_value"));
         let dbs = vec![db];
 
         // Serialize via the production path (save_snapshot_to_bytes).
@@ -1405,8 +1398,8 @@ mod tests {
     #[test]
     fn test_generate_rewrite_round_trip_preserves_state() {
         let mut dbs = vec![Database::new()];
-        dbs[0].set_string(Bytes::from_static(b"a"), Bytes::from_static(b"1"));
-        dbs[0].set_string(Bytes::from_static(b"b"), Bytes::from_static(b"2"));
+        dbs[0].set_string(b"a", Bytes::from_static(b"1"));
+        dbs[0].set_string(b"b", Bytes::from_static(b"2"));
         {
             let list = dbs[0].get_or_create_list(b"mylist").unwrap();
             list.push_back(Bytes::from_static(b"x"));

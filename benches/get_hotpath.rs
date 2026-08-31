@@ -18,7 +18,7 @@ fn bench_get_hotpath(c: &mut Criterion) {
         let key = format!("key:{:0>10}", i);
         let val = "x".repeat(256);
         let entry = CompactEntry::new_string(Bytes::from(val));
-        db.set(Bytes::from(key), entry);
+        db.set(&Bytes::from(key), entry);
     }
 
     let lookup_key = Bytes::from("key:0000005000");

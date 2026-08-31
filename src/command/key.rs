@@ -976,7 +976,7 @@ pub fn rename(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Remove source, set as destination (preserves entire Entry including TTL)
     let entry = db.remove(src).unwrap();
-    db.set(Bytes::copy_from_slice(dst), entry);
+    db.set(dst, entry);
 
     // TWO events, not one: a consumer tracking key lifetimes needs to see the
     // source disappear and the destination appear, and the halves carry
@@ -1031,7 +1031,7 @@ pub fn renamenx(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     let entry = db.remove(src).unwrap();
-    db.set(Bytes::copy_from_slice(dst), entry);
+    db.set(dst, entry);
 
     Frame::Integer(1)
 }
@@ -1559,17 +1559,14 @@ mod tests {
 
     fn setup_db_with_key(key: &[u8], val: &[u8]) -> Database {
         let mut db = Database::new();
-        db.set(
-            Bytes::copy_from_slice(key),
-            Entry::new_string(Bytes::copy_from_slice(val)),
-        );
+        db.set(key, Entry::new_string(Bytes::copy_from_slice(val)));
         db
     }
 
     fn setup_db_with_expiry(key: &[u8], val: &[u8], expires_at_ms: u64) -> Database {
         let mut db = Database::new();
         db.set(
-            Bytes::copy_from_slice(key),
+            key,
             Entry::new_string_with_expiry(Bytes::copy_from_slice(val), expires_at_ms),
         );
         db
@@ -1614,7 +1611,7 @@ mod tests {
         let mut db = Database::new();
         for i in 0..100 {
             db.set(
-                Bytes::from(format!("stable:{i:03}")),
+                &Bytes::from(format!("stable:{i:03}")),
                 Entry::new_string(Bytes::from_static(b"v")),
             );
         }
@@ -1630,7 +1627,7 @@ mod tests {
                 if churn < 40 {
                     db.remove(k.as_ref());
                     db.set(
-                        Bytes::from(format!("churn:{churn:03}")),
+                        &Bytes::from(format!("churn:{churn:03}")),
                         Entry::new_string(Bytes::from_static(b"v")),
                     );
                     churn += 1;
@@ -1659,7 +1656,7 @@ mod tests {
         let mut db = Database::new();
         for i in 0..57 {
             db.set(
-                Bytes::from(format!("k:{i}")),
+                &Bytes::from(format!("k:{i}")),
                 Entry::new_string(Bytes::from_static(b"v")),
             );
         }
@@ -1687,7 +1684,7 @@ mod tests {
         let mut db = Database::new();
         for i in 0..20 {
             db.set(
-                Bytes::from(format!("k:{i}")),
+                &Bytes::from(format!("k:{i}")),
                 Entry::new_string(Bytes::from_static(b"v")),
             );
         }
@@ -1702,11 +1699,11 @@ mod tests {
         let mut db = Database::new();
         for i in 0..30 {
             db.set(
-                Bytes::from(format!("user:{i}")),
+                &Bytes::from(format!("user:{i}")),
                 Entry::new_string(Bytes::from_static(b"v")),
             );
             db.set(
-                Bytes::from(format!("other:{i}")),
+                &Bytes::from(format!("other:{i}")),
                 Entry::new_string(Bytes::from_static(b"v")),
             );
         }
@@ -1768,10 +1765,7 @@ mod tests {
     fn test_dbsize_counts_cold_entries() {
         use crate::storage::tiered::cold_index::ColdIndex;
         let mut db = setup_db_with_key(b"hot1", b"v");
-        db.set(
-            Bytes::from_static(b"hot2"),
-            Entry::new_string(Bytes::from_static(b"v")),
-        );
+        db.set(b"hot2", Entry::new_string(Bytes::from_static(b"v")));
         let mut ci = ColdIndex::new();
         ci.insert(Bytes::from_static(b"cold1"), cold_loc(1));
         ci.insert(Bytes::from_static(b"cold2"), cold_loc(2));
@@ -1796,10 +1790,7 @@ mod tests {
         db.cold_index = Some(ci);
         // …then a fresh SET over the cold-only key: `Inserted` arm, shadow
         // intentionally survives.
-        db.set(
-            Bytes::from_static(b"shadowed"),
-            Entry::new_string(Bytes::from_static(b"new")),
-        );
+        db.set(b"shadowed", Entry::new_string(Bytes::from_static(b"new")));
         assert!(db.is_hot(b"shadowed"));
         assert!(
             db.cold_index
@@ -1845,18 +1836,9 @@ mod tests {
     #[test]
     fn test_del_multiple() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"a"),
-            Entry::new_string(Bytes::from_static(b"1")),
-        );
-        db.set(
-            Bytes::from_static(b"b"),
-            Entry::new_string(Bytes::from_static(b"2")),
-        );
-        db.set(
-            Bytes::from_static(b"c"),
-            Entry::new_string(Bytes::from_static(b"3")),
-        );
+        db.set(b"a", Entry::new_string(Bytes::from_static(b"1")));
+        db.set(b"b", Entry::new_string(Bytes::from_static(b"2")));
+        db.set(b"c", Entry::new_string(Bytes::from_static(b"3")));
         let result = del(&mut db, &[bs(b"a"), bs(b"c")]);
         assert_eq!(result, Frame::Integer(2));
         assert!(db.exists(b"b"));
@@ -2194,18 +2176,9 @@ mod tests {
     #[test]
     fn test_keys_all() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"foo"),
-            Entry::new_string(Bytes::from_static(b"1")),
-        );
-        db.set(
-            Bytes::from_static(b"bar"),
-            Entry::new_string(Bytes::from_static(b"2")),
-        );
-        db.set(
-            Bytes::from_static(b"baz"),
-            Entry::new_string(Bytes::from_static(b"3")),
-        );
+        db.set(b"foo", Entry::new_string(Bytes::from_static(b"1")));
+        db.set(b"bar", Entry::new_string(Bytes::from_static(b"2")));
+        db.set(b"baz", Entry::new_string(Bytes::from_static(b"3")));
         let result = keys(&mut db, &[bs(b"*")]);
         match result {
             Frame::Array(arr) => assert_eq!(arr.len(), 3),
@@ -2216,18 +2189,9 @@ mod tests {
     #[test]
     fn test_keys_pattern() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"hello"),
-            Entry::new_string(Bytes::from_static(b"1")),
-        );
-        db.set(
-            Bytes::from_static(b"hallo"),
-            Entry::new_string(Bytes::from_static(b"2")),
-        );
-        db.set(
-            Bytes::from_static(b"world"),
-            Entry::new_string(Bytes::from_static(b"3")),
-        );
+        db.set(b"hello", Entry::new_string(Bytes::from_static(b"1")));
+        db.set(b"hallo", Entry::new_string(Bytes::from_static(b"2")));
+        db.set(b"world", Entry::new_string(Bytes::from_static(b"3")));
         let result = keys(&mut db, &[bs(b"h?llo")]);
         match result {
             Frame::Array(arr) => assert_eq!(arr.len(), 2),
@@ -2238,13 +2202,10 @@ mod tests {
     #[test]
     fn test_keys_expired_excluded() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"alive"),
-            Entry::new_string(Bytes::from_static(b"1")),
-        );
+        db.set(b"alive", Entry::new_string(Bytes::from_static(b"1")));
         let past_ms = current_time_ms() - 1000;
         db.set(
-            Bytes::from_static(b"dead"),
+            b"dead",
             Entry::new_string_with_expiry(Bytes::from_static(b"2"), past_ms),
         );
         let result = keys(&mut db, &[bs(b"*")]);
@@ -2300,14 +2261,8 @@ mod tests {
     #[test]
     fn test_rename_overwrites_dest() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"src"),
-            Entry::new_string(Bytes::from_static(b"srcval")),
-        );
-        db.set(
-            Bytes::from_static(b"dst"),
-            Entry::new_string(Bytes::from_static(b"dstval")),
-        );
+        db.set(b"src", Entry::new_string(Bytes::from_static(b"srcval")));
+        db.set(b"dst", Entry::new_string(Bytes::from_static(b"dstval")));
         rename(&mut db, &[bs(b"src"), bs(b"dst")]);
         assert!(!db.exists(b"src"));
         let entry = db.get(b"dst").unwrap();
@@ -2328,14 +2283,8 @@ mod tests {
     #[test]
     fn test_renamenx_dest_exists() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"src"),
-            Entry::new_string(Bytes::from_static(b"1")),
-        );
-        db.set(
-            Bytes::from_static(b"dst"),
-            Entry::new_string(Bytes::from_static(b"2")),
-        );
+        db.set(b"src", Entry::new_string(Bytes::from_static(b"1")));
+        db.set(b"dst", Entry::new_string(Bytes::from_static(b"2")));
         let result = renamenx(&mut db, &[bs(b"src"), bs(b"dst")]);
         assert_eq!(result, Frame::Integer(0));
         // Both keys should still exist
@@ -2356,18 +2305,9 @@ mod tests {
     #[test]
     fn test_unlink_multiple() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"a"),
-            Entry::new_string(Bytes::from_static(b"1")),
-        );
-        db.set(
-            Bytes::from_static(b"b"),
-            Entry::new_string(Bytes::from_static(b"2")),
-        );
-        db.set(
-            Bytes::from_static(b"c"),
-            Entry::new_string(Bytes::from_static(b"3")),
-        );
+        db.set(b"a", Entry::new_string(Bytes::from_static(b"1")));
+        db.set(b"b", Entry::new_string(Bytes::from_static(b"2")));
+        db.set(b"c", Entry::new_string(Bytes::from_static(b"3")));
         let result = unlink(&mut db, &[bs(b"a"), bs(b"c"), bs(b"missing")]);
         assert_eq!(result, Frame::Integer(2));
         assert!(db.exists(b"b"));
@@ -2385,7 +2325,7 @@ mod tests {
     #[test]
     fn test_type_hash() {
         let mut db = Database::new();
-        db.set(Bytes::from_static(b"h"), Entry::new_hash());
+        db.set(b"h", Entry::new_hash());
         let result = type_cmd(&mut db, &[bs(b"h")]);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"hash")));
     }
@@ -2393,7 +2333,7 @@ mod tests {
     #[test]
     fn test_type_list() {
         let mut db = Database::new();
-        db.set(Bytes::from_static(b"l"), Entry::new_list());
+        db.set(b"l", Entry::new_list());
         let result = type_cmd(&mut db, &[bs(b"l")]);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"list")));
     }
@@ -2401,7 +2341,7 @@ mod tests {
     #[test]
     fn test_type_set() {
         let mut db = Database::new();
-        db.set(Bytes::from_static(b"s"), Entry::new_set());
+        db.set(b"s", Entry::new_set());
         let result = type_cmd(&mut db, &[bs(b"s")]);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"set")));
     }
@@ -2409,7 +2349,7 @@ mod tests {
     #[test]
     fn test_type_zset() {
         let mut db = Database::new();
-        db.set(Bytes::from_static(b"z"), Entry::new_sorted_set());
+        db.set(b"z", Entry::new_sorted_set());
         let result = type_cmd(&mut db, &[bs(b"z")]);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"zset")));
     }
@@ -2419,18 +2359,9 @@ mod tests {
     #[test]
     fn test_scan_basic() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"key1"),
-            Entry::new_string(Bytes::from_static(b"v1")),
-        );
-        db.set(
-            Bytes::from_static(b"key2"),
-            Entry::new_string(Bytes::from_static(b"v2")),
-        );
-        db.set(
-            Bytes::from_static(b"key3"),
-            Entry::new_string(Bytes::from_static(b"v3")),
-        );
+        db.set(b"key1", Entry::new_string(Bytes::from_static(b"v1")));
+        db.set(b"key2", Entry::new_string(Bytes::from_static(b"v2")));
+        db.set(b"key3", Entry::new_string(Bytes::from_static(b"v3")));
 
         let result = scan(&mut db, &[bs(b"0")]);
         match result {
@@ -2455,7 +2386,7 @@ mod tests {
         let mut db = Database::new();
         for i in 0..20 {
             db.set(
-                Bytes::from(format!("key{:02}", i)),
+                &Bytes::from(format!("key{:02}", i)),
                 Entry::new_string(Bytes::from_static(b"v")),
             );
         }
@@ -2489,18 +2420,9 @@ mod tests {
     #[test]
     fn test_scan_with_match() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"user:1"),
-            Entry::new_string(Bytes::from_static(b"v")),
-        );
-        db.set(
-            Bytes::from_static(b"user:2"),
-            Entry::new_string(Bytes::from_static(b"v")),
-        );
-        db.set(
-            Bytes::from_static(b"post:1"),
-            Entry::new_string(Bytes::from_static(b"v")),
-        );
+        db.set(b"user:1", Entry::new_string(Bytes::from_static(b"v")));
+        db.set(b"user:2", Entry::new_string(Bytes::from_static(b"v")));
+        db.set(b"post:1", Entry::new_string(Bytes::from_static(b"v")));
 
         let result = scan(&mut db, &[bs(b"0"), bs(b"MATCH"), bs(b"user:*")]);
         match result {
@@ -2515,12 +2437,9 @@ mod tests {
     #[test]
     fn test_scan_with_type_filter() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"str"),
-            Entry::new_string(Bytes::from_static(b"v")),
-        );
-        db.set(Bytes::from_static(b"hash"), Entry::new_hash());
-        db.set(Bytes::from_static(b"list"), Entry::new_list());
+        db.set(b"str", Entry::new_string(Bytes::from_static(b"v")));
+        db.set(b"hash", Entry::new_hash());
+        db.set(b"list", Entry::new_list());
 
         let result = scan(&mut db, &[bs(b"0"), bs(b"TYPE"), bs(b"hash")]);
         match result {
@@ -2641,7 +2560,7 @@ mod tests {
         let mut db = Database::new();
         for i in 0..64u32 {
             db.set(
-                Bytes::from(format!("k{i}")),
+                &Bytes::from(format!("k{i}")),
                 Entry::new_string(Bytes::from_static(b"v")),
             );
         }
@@ -2665,10 +2584,7 @@ mod tests {
     #[test]
     fn test_touch() {
         let mut db = setup_db_with_key(b"a", b"1");
-        db.set(
-            Bytes::from_static(b"b"),
-            Entry::new_string(Bytes::from_static(b"2")),
-        );
+        db.set(b"b", Entry::new_string(Bytes::from_static(b"2")));
         let result = touch(&mut db, &[bs(b"a"), bs(b"b"), bs(b"missing")]);
         assert_eq!(result, Frame::Integer(2));
     }
@@ -2686,10 +2602,7 @@ mod tests {
     #[test]
     fn test_flushdb() {
         let mut db = setup_db_with_key(b"a", b"1");
-        db.set(
-            Bytes::from_static(b"b"),
-            Entry::new_string(Bytes::from_static(b"2")),
-        );
+        db.set(b"b", Entry::new_string(Bytes::from_static(b"2")));
         assert_eq!(db.len(), 2);
         let result = flushdb(&mut db, &[]);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
@@ -2750,10 +2663,7 @@ mod tests {
         fn db_with_planes(hot: &[&[u8]], cold: &[(&[u8], Option<u64>)]) -> Database {
             let mut db = Database::new();
             for k in hot {
-                db.set(
-                    Bytes::copy_from_slice(k),
-                    Entry::new_string(Bytes::from_static(b"v")),
-                );
+                db.set(k, Entry::new_string(Bytes::from_static(b"v")));
             }
             let mut ci = ColdIndex::new();
             for (i, (k, ttl_ms)) in cold.iter().enumerate() {
@@ -2975,10 +2885,7 @@ mod tests {
         #[test]
         fn keys_includes_cold_only_keys() {
             let mut db = db_with_planes(&[b"hot1"], &[(b"cold1", None), (b"both", None)]);
-            db.set(
-                Bytes::from_static(b"both"),
-                Entry::new_string(Bytes::from_static(b"v")),
-            );
+            db.set(b"both", Entry::new_string(Bytes::from_static(b"v")));
             let Frame::Array(arr) = keys(&mut db, &[bs(b"*")]) else {
                 panic!("KEYS did not return an array");
             };

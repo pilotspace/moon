@@ -1419,7 +1419,7 @@ async fn coordinate_mset(
             crate::shard::slice::with_shard_db(db_index, |db| {
                 db.refresh_now_from_cache(cached_clock);
                 for (key, value) in kv_pairs {
-                    db.set_string(key.clone(), value.clone());
+                    db.set_string(key, value.clone());
                 }
             });
         } else {
@@ -3819,8 +3819,8 @@ mod tests {
     async fn test_coordinate_mget_all_local() {
         use crate::storage::Database;
         let mut dbs = vec![Database::new()];
-        dbs[0].set_string(Bytes::from_static(b"a"), Bytes::from_static(b"1"));
-        dbs[0].set_string(Bytes::from_static(b"b"), Bytes::from_static(b"2"));
+        dbs[0].set_string(b"a", Bytes::from_static(b"1"));
+        dbs[0].set_string(b"b", Bytes::from_static(b"2"));
 
         let (shard_databases, mut inits) = ShardDatabases::new(vec![dbs]);
         // coordinate_mget uses with_shard_db for local keys; ShardSlice must be initialized.
@@ -3913,9 +3913,9 @@ mod tests {
     async fn test_coordinate_del_all_local() {
         use crate::storage::Database;
         let mut dbs = vec![Database::new()];
-        dbs[0].set_string(Bytes::from_static(b"a"), Bytes::from_static(b"1"));
-        dbs[0].set_string(Bytes::from_static(b"b"), Bytes::from_static(b"2"));
-        dbs[0].set_string(Bytes::from_static(b"c"), Bytes::from_static(b"3"));
+        dbs[0].set_string(b"a", Bytes::from_static(b"1"));
+        dbs[0].set_string(b"b", Bytes::from_static(b"2"));
+        dbs[0].set_string(b"c", Bytes::from_static(b"3"));
 
         let (shard_databases, mut inits) = ShardDatabases::new(vec![dbs]);
         // coordinate_multi_del_or_exists uses with_shard_db for local keys; ShardSlice must be initialized.

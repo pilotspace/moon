@@ -1024,7 +1024,7 @@ mod tests {
     #[test]
     fn test_zadd_wrongtype() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"str"), Bytes::from_static(b"val"));
+        db.set_string(b"str", Bytes::from_static(b"val"));
 
         let result = run_zadd(&mut db, &[b"str", b"1.0", b"a"]);
         match result {

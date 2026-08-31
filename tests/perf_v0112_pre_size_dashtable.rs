@@ -52,7 +52,7 @@ fn test_pre_sized_database_zero_splits_under_1m_inserts() {
     for i in 0..PRE_SIZED_KEYS {
         let key = Bytes::from(format!("pre_{:08}", i));
         let entry = Entry::new_string(Bytes::from(format!("v{}", i)));
-        db.set(key, entry);
+        db.set(&key, entry);
     }
 
     assert_eq!(
@@ -80,7 +80,7 @@ fn test_default_sized_database_does_split() {
     for i in 0..DEFAULT_SIZED_KEYS {
         let key = Bytes::from(format!("def_{:08}", i));
         let entry = Entry::new_string(Bytes::from(format!("v{}", i)));
-        db.set(key, entry);
+        db.set(&key, entry);
     }
 
     assert_eq!(db.data().len(), DEFAULT_SIZED_KEYS);

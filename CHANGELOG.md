@@ -28,6 +28,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overlap at p64. GET and SET are unchanged (they are bimodal in both arms; the inline byte
   path is what serves them). This is larger than the 3-5% originally predicted, but it does
   not close the 0.43x deficit recorded in BENCHMARK.md §2.12.
+- **A flat multibulk is now parsed in one pass instead of two.** `parse()` ran
+  `validate_frame` over the request bytes to compute the frame's total length — computing
+  every argument offset on the way and throwing all of them away — and then ran
+  `parse_frame_zerocopy` over the same bytes to re-derive exactly those offsets. For a
+  top-level `*N` of `$`-bulks, which is the shape of essentially every client command, a
+  new `scan_flat_multibulk` records each argument's span into a stack `SmallVec` while it
+  validates, and the `Frame` is built straight from the spans: one `memchr` walk and one
+  `strict_atoi` per token instead of two, and no recursive per-element call. Everything
+  else — RESP3 containers, nested arrays, null bulks (`$-1`), null arrays (`*-1`), inline
+  commands, and reply parsing — is untouched and still takes the two-pass path; the fast
+  path declines on anything it does not handle exactly.
+
+  Correctness is asserted differentially, not argued: `parse_reference_two_pass` (the old
+  pipeline, compiled only under `cfg(test)`/`feature = "fuzzing"`) is compared against
+  `parse()` over a corpus of ~50 hand-picked cases **and every truncation of each**, under
+  four `ParseConfig`s including degenerate limits, and across argc 0–20 × payload lengths
+  0–300. Five deliberate mutations of the scanner were confirmed to fail those tests, so
+  they are not vacuous. A new `resp_parse_fused` fuzz target runs the same differential and
+  is registered in **both** matrices in `.github/workflows/fuzz.yml`.
+
+  The reserve for the scanned spans is capped at `buf.len() / 6`, not at the count off
+  the wire. Six bytes is the shortest an element can be, so the cap can never
+  under-allocate a scan that succeeds — and without it `*1048576\r\n`, ten bytes
+  against the default 1Mi `max_array_length`, would have reserved 8 MiB before the scan
+  discovered the frame was incomplete. The two-pass path never had that amplification
+  because it reaches `FrameVec::with_capacity` only after `validate_frame` has proved the
+  whole frame is present.
+
+- **`benches/resp_parsing.rs` gains the `argc > 4` pair.** `FrameVec` is
+  `Box<SmallVec<[Frame; 4]>>`, so `FrameVec::with_capacity(count)` heap-spills past four
+  elements and a `*5` command pays two allocations where a `*3` pays one. BENCHMARK.md
+  attributes the `SET k v` (2.08x) vs `SET k v EX 100` (0.87x) step to the inline byte
+  path, but a second, independent step sits at exactly that boundary and nothing has
+  separated them. `parse_set_ex_5arg` (`*5`) pairs with the existing `parse_set_single`
+  (`*3`), and `parse_hset_4arg` / `parse_hset_6arg` are the clean control — same command,
+  same work per argument, only argc differs, and the inline path never touches HSET. No
+  numbers: these must be run on a Linux host.
+
+- **INCR/DECR/INCRBY/DECRBY no longer allocate a `String` per operation.** The new value
+  was stored as `Entry::new_string(Bytes::from(new_val.to_string()))` — a heap allocation
+  on the command hot path, which CLAUDE.md forbids outright — and `CompactValue` then
+  copied the digits out of it and freed it again immediately: a counter of up to twelve
+  digits inlines into the 12-byte SSO payload, so the allocation was never even the
+  storage. Now `itoa::Buffer` formats into a stack buffer and the new
+  `Entry::new_string_from_slice{,_with_expiry}` / `CompactValue::from_slice` constructors
+  take it by reference. Unit-tested against `i64::to_string` at every length from 0 to 32
+  bytes and at both i64 extremes, on both the plain and the TTL-preserving arm — the arms
+  differ, and the 12/13-byte SSO boundary sits inside the range an INCR can reach.
+
+- **`Database::set` borrows its key instead of demanding an owned `Bytes`.** Every use of
+  `key` inside `set` was already by reference — `spill_inflight_forget`, `entry_overhead`,
+  `hash_expiry_index_note_value`, `CompactKey::from` (which copies the bytes either way),
+  `ColdIndex::remove`, and both expiry-index writers all take `&[u8]`, and the `Bytes` was
+  never moved anywhere. The owned signature forced a `key.clone()` at each write command:
+  one `shared_v_clone` in and one `shared_v_drop` out, per command, producing nothing.
+  `set`, `set_string` and `set_string_with_expiry` now take `&[u8]`, which removes **32**
+  `Some(k) => k.clone()` key extractions across the string, hash, list, set and sorted-set
+  write families — the ten families Wave 0 measured as losing. It also deletes a real
+  allocation (not just a refcount) from RESTORE, COPY, RENAME, MOVE, the cold-tier promote,
+  WAL v3 replay and replication apply, all of which were building a throwaway
+  `Bytes::copy_from_slice(key)` purely to satisfy the signature. Six call sites genuinely
+  need ownership and keep their clone; the compiler identified them.
+
+- **The monoio local write path no longer clones the whole reply to read one bit.** After
+  every local dispatch the handler built `response_frame` by cloning the `DispatchResult`'s
+  `Frame`, then used it for exactly one thing — `matches!(response_frame, Frame::Error(_))`
+  — and dropped it. `response_frame` had those two occurrences and no others. For an
+  `Array` reply that clone is a fresh `FrameVec` box plus one `Bytes` refcount bump per
+  element plus the matching drops, paid per command on the write path that the inline byte
+  path never touches. Replaced by `DispatchResult::is_error()`, a borrow-only `matches!`
+  over both variants. Semantics are unchanged by construction; the new method is unit-tested
+  over `Response`/`Quit` × error/non-error.
 
 ### Documentation
 
@@ -67,6 +139,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ShardSliceInit` literal, build slices with `test_support::make_init`.
 
 ### Fixed
+
+- **`*-\r\n` would have parsed as an empty array on the new fast path.** Found by
+  `resp_parse_fused` within 90 seconds of its first run, before the change shipped.
+  `strict_atoi` reads a lone `-` (and `-0`) as **zero**, while `parse()`'s
+  `is_null_multibulk` gate keys on the raw byte `buf[1] == b'-'` rather than on the parsed
+  count — so the two-pass path silently consumes `*-\r\n` and reports no frame, where a
+  count-based check would have produced `*0`. The scanner now declines on the byte. No
+  released version is affected; recorded because the shape (`is_null_multibulk` testing a
+  byte, not a number) is a trap for any future fast path over the same bytes.
 
 - **Fuzz crash reproducers are archived instead of discarded.** `fuzz.yml` uploaded only
   `fuzz/corpus/`, so the minimal reproducer libFuzzer writes to

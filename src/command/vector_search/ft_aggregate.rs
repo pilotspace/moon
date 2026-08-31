@@ -455,14 +455,14 @@ pub fn materialize_rows(
     let mut rows: Vec<AggregateRow> = Vec::with_capacity(candidate_doc_ids.len());
     for doc_id in candidate_doc_ids {
         let key = match text_index.doc_id_to_key.get(&doc_id) {
-            Some(k) => k.clone(),
+            Some(k) => k,
             None => continue,
         };
         // db.get_hash_ref_if_alive returns Err on WRONGTYPE, Ok(None) when the key
         // is missing/expired, Ok(Some(HashRef)) on success. We silently skip the
         // first two cases — a doc that is indexed but whose hash was deleted out
         // from under the index is a race, not a fatal error.
-        let hash = match db.get_hash_ref_if_alive(&key, now_ms) {
+        let hash = match db.get_hash_ref_if_alive(key, now_ms) {
             Ok(Some(h)) => h,
             _ => continue,
         };

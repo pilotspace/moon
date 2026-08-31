@@ -702,7 +702,7 @@ mod tests {
         let mut db = Database::new();
         for i in 0..50 {
             db.set_string(
-                Bytes::from(format!("bystander:{i}")),
+                &Bytes::from(format!("bystander:{i}")),
                 Bytes::from(vec![0u8; 200]),
             );
         }
@@ -827,7 +827,7 @@ mod tests {
         let lua = crate::scripting::setup_lua_vm(LuaEvictionCtx::disabled()).unwrap();
         let cache = std::rc::Rc::new(std::cell::RefCell::new(crate::scripting::ScriptCache::new()));
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"cow517"), Bytes::from_static(b"old"));
+        db.set_string(b"cow517", Bytes::from_static(b"old"));
 
         snapshot_cow::arm();
         let args = vec![

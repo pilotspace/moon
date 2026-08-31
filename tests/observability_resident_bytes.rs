@@ -24,10 +24,7 @@ fn database_resident_bytes_zero_when_empty() {
 #[test]
 fn database_resident_bytes_grows_after_set() {
     let mut db = Database::new();
-    db.set(
-        Bytes::from_static(b"hello"),
-        Entry::new_string(Bytes::from_static(b"world")),
-    );
+    db.set(b"hello", Entry::new_string(Bytes::from_static(b"world")));
     assert!(
         db.resident_bytes() > 0,
         "Database::resident_bytes must grow after SET"
@@ -37,10 +34,7 @@ fn database_resident_bytes_grows_after_set() {
 #[test]
 fn database_resident_bytes_consistent_with_estimated_memory() {
     let mut db = Database::new();
-    db.set(
-        Bytes::from_static(b"k"),
-        Entry::new_string(Bytes::from_static(b"v")),
-    );
+    db.set(b"k", Entry::new_string(Bytes::from_static(b"v")));
     assert_eq!(
         db.resident_bytes(),
         db.estimated_memory(),

@@ -504,7 +504,7 @@ fn store_geo_matches(
             members: new_members,
         },
     );
-    db.set(dest, entry);
+    db.set(&dest, entry);
 
     Frame::Integer(matches.len() as i64)
 }

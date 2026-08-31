@@ -729,7 +729,7 @@ fn replay_xact_kv_ops(
                 let value = bytes::Bytes::copy_from_slice(&payload[offset..offset + value_len]);
                 offset += value_len;
 
-                db.set_string(key, value);
+                db.set_string(&key, value);
             }
             1 => {
                 // DEL
@@ -779,7 +779,7 @@ mod tests {
 
         // Committed state lives in db 3.
         let mut src_db = Database::new();
-        src_db.set_string(Bytes::from_static(b"txnkey"), Bytes::from_static(b"v3val"));
+        src_db.set_string(b"txnkey", Bytes::from_static(b"v3val"));
         let records = vec![UndoRecord::Insert {
             key: Bytes::from_static(b"txnkey"),
         }];
@@ -806,7 +806,7 @@ mod tests {
         use bytes::Bytes;
 
         let mut src_db = Database::new();
-        src_db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+        src_db.set_string(b"k", Bytes::from_static(b"v"));
         let records = vec![UndoRecord::Insert {
             key: Bytes::from_static(b"k"),
         }];

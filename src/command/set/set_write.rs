@@ -175,12 +175,12 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("SPOP");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("SPOP"),
     };
 
     // Clone the set to pick random members, then mutate
-    let set_clone = match db.get_set(&key) {
+    let set_clone = match db.get_set(key) {
         Ok(Some(s)) => s.clone(),
         Ok(None) => {
             return if args.len() == 1 {
@@ -208,7 +208,7 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
         let Some(chosen) = members.choose(&mut rng).cloned() else {
             return Frame::Null;
         };
-        let Ok(set) = db.get_or_create_set(&key) else {
+        let Ok(set) = db.get_or_create_set(key) else {
             return Frame::Null;
         };
         set.remove(&chosen);
@@ -216,7 +216,7 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
         // `set`'s borrow of `db` ends above.
         if empty {
             // Whole-key removal recomputes the (now-empty) entry cost.
-            db.remove(&key);
+            db.remove(key);
         } else {
             db.credit_memory(set_member_cost(&chosen));
         }
@@ -246,7 +246,7 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Remove chosen members from the set
     // Key confirmed as set type above via get_set(); get_or_create_set() cannot fail here
-    let Ok(set) = db.get_or_create_set(&key) else {
+    let Ok(set) = db.get_or_create_set(key) else {
         return Frame::Array(framevec![]);
     };
     for m in &chosen {
@@ -255,7 +255,7 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
     let empty = set.is_empty();
     // `set`'s borrow of `db` ends above.
     if empty {
-        db.remove(&key);
+        db.remove(key);
     } else {
         let credit: usize = chosen.iter().map(|m| set_member_cost(m)).sum();
         db.credit_memory(credit);
@@ -354,7 +354,7 @@ pub fn sinterstore(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("SINTERSTORE");
     }
     let dest = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("SINTERSTORE"),
     };
 
@@ -367,7 +367,7 @@ pub fn sinterstore(db: &mut Database, args: &[Frame]) -> Frame {
 
     let count = result.len() as i64;
     if result.is_empty() {
-        db.remove(&dest);
+        db.remove(dest);
     } else {
         let mut entry = Entry::new_set();
         if let Some(crate::storage::entry::RedisValue::Set(s)) = entry.value.as_redis_value_mut() {
@@ -388,7 +388,7 @@ pub fn sunionstore(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("SUNIONSTORE");
     }
     let dest = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("SUNIONSTORE"),
     };
 
@@ -400,7 +400,7 @@ pub fn sunionstore(db: &mut Database, args: &[Frame]) -> Frame {
 
     let count = result.len() as i64;
     if result.is_empty() {
-        db.remove(&dest);
+        db.remove(dest);
     } else {
         let mut entry = Entry::new_set();
         if let Some(crate::storage::entry::RedisValue::Set(s)) = entry.value.as_redis_value_mut() {
@@ -421,7 +421,7 @@ pub fn sdiffstore(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("SDIFFSTORE");
     }
     let dest = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("SDIFFSTORE"),
     };
 
@@ -433,7 +433,7 @@ pub fn sdiffstore(db: &mut Database, args: &[Frame]) -> Frame {
 
     let count = result.len() as i64;
     if result.is_empty() {
-        db.remove(&dest);
+        db.remove(dest);
     } else {
         let mut entry = Entry::new_set();
         if let Some(crate::storage::entry::RedisValue::Set(s)) = entry.value.as_redis_value_mut() {
@@ -454,11 +454,11 @@ pub fn smove(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("SMOVE");
     }
     let source = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("SMOVE"),
     };
     let destination = match extract_bytes(&args[1]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("SMOVE"),
     };
     let member = match extract_bytes(&args[2]) {
@@ -466,18 +466,18 @@ pub fn smove(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("SMOVE"),
     };
 
-    match db.get_set(&source) {
+    match db.get_set(source) {
         Ok(None) => return Frame::Integer(0),
         Err(e) => return e,
         Ok(Some(_)) => {}
     }
-    match db.get_set(&destination) {
+    match db.get_set(destination) {
         Ok(_) => {}
         Err(e) => return e,
     }
 
     if source == destination {
-        let src_set = match db.get_or_create_set(&source) {
+        let src_set = match db.get_or_create_set(source) {
             Ok(s) => s,
             Err(e) => return e,
         };
@@ -488,7 +488,7 @@ pub fn smove(db: &mut Database, args: &[Frame]) -> Frame {
         };
     }
 
-    let src_set = match db.get_or_create_set(&source) {
+    let src_set = match db.get_or_create_set(source) {
         Ok(s) => s,
         Err(e) => return e,
     };
@@ -500,12 +500,12 @@ pub fn smove(db: &mut Database, args: &[Frame]) -> Frame {
     if src_empty {
         // Whole-key removal recomputes the (now-empty) entry cost -- covers
         // the removed member too, so skip the standalone credit below.
-        db.remove(&source);
+        db.remove(source);
     } else {
         db.credit_memory(set_member_cost(&member));
     }
 
-    let dst_set = match db.get_or_create_set(&destination) {
+    let dst_set = match db.get_or_create_set(destination) {
         Ok(s) => s,
         Err(e) => return e,
     };

@@ -545,7 +545,7 @@ mod tests {
     #[test]
     fn test_wrongtype_on_string_key() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"mystr"), Bytes::from_static(b"hello"));
+        db.set_string(b"mystr", Bytes::from_static(b"hello"));
 
         let result = sadd(&mut db, &[bs(b"mystr"), bs(b"a")]);
         match result {
