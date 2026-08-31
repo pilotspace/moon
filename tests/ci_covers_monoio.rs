@@ -302,29 +302,50 @@ fn the_default_merge_bar_actually_reaches_the_monoio_suite() {
     };
 
     let default_mode = run(&[]);
+    // Since 2026-08-31 the two VM suites run CONCURRENTLY under one step, so
+    // the monoio suite is named inside that step rather than owning its own.
+    // Asserted by the step this mode really selects — matching either name
+    // would pass whether or not any monoio suite runs at all.
     assert!(
-        default_mode.contains("would run: VM monoio suite"),
+        default_mode.contains("would run: VM suites, concurrent (monoio + tokio)"),
         "the DEFAULT `scripts/ci-local.sh` does not select the monoio suite. \
          Since moon#732 the hosted matrix does not run it either, so nothing \
          would gate the runtime Moon ships before a merge.\nSteps selected:\n{default_mode}"
     );
     // The cut also made client-compat and the macOS suite local-only gates.
-    for step in [
-        "VM client-compat",
-        "macOS host tokio suite",
-        "VM tokio suite",
-    ] {
+    for step in ["VM client-compat", "macOS host tokio suite"] {
         assert!(
             default_mode.contains(&format!("would run: {step}")),
             "the default merge bar no longer selects `{step}`, which moon#732 \
              removed from the pre-merge hosted matrix.\nSteps selected:\n{default_mode}"
         );
     }
+    // The sequential fallback is the rollback path if concurrency ever proves
+    // flaky, so it has to keep working: an escape hatch that stopped selecting
+    // the suites would be discovered during an incident, which is the worst
+    // possible time.
+    let sequential = {
+        let out = Command::new("bash")
+            .arg(ci_local_path())
+            .env("CI_LOCAL_DRY_RUN", "1")
+            .env("CI_LOCAL_REPO", &repo)
+            .env("CI_LOCAL_VM_SEQUENTIAL", "1")
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run ci-local.sh: {e}"));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    for step in ["VM monoio suite (shipped runtime)", "VM tokio suite"] {
+        assert!(
+            sequential.contains(&format!("would run: {step}")),
+            "CI_LOCAL_VM_SEQUENTIAL=1 no longer selects `{step}`, so the \
+             rollback from concurrent VM suites does not work.\nSteps selected:\n{sequential}"
+        );
+    }
     // And the escape hatches must stay honest about not being the merge bar:
     // a --quick that quietly grew test coverage would make its own warning lie.
     let quick = run(&["--quick"]);
     assert!(
-        !quick.contains("would run: VM monoio suite"),
-        "--quick now selects the monoio suite, but still prints \"LINT ONLY\""
+        !quick.contains("would run: VM suites, concurrent"),
+        "--quick now selects the VM suites, but still prints \"LINT ONLY\""
     );
 }
