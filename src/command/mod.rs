@@ -51,6 +51,34 @@ pub enum DispatchResult {
     Quit(Frame),
 }
 
+impl DispatchResult {
+    /// True when the dispatched command produced an error reply.
+    ///
+    /// Borrow-only, deliberately. The monoio local write path asks this after
+    /// every dispatch to decide whether to run the auto-index / auto-delete
+    /// side effects, and it used to answer it by CLONING the whole reply first:
+    ///
+    /// ```text
+    /// let response_frame = match &result {
+    ///     DispatchResult::Response(f) | DispatchResult::Quit(f) => f.clone(),
+    /// };
+    /// let is_error = matches!(response_frame, Frame::Error(_));
+    /// ```
+    ///
+    /// `response_frame` had exactly those two occurrences, so the clone existed
+    /// only to test one discriminant. For an `Array` reply that is a deep clone:
+    /// a fresh `FrameVec` box plus one `Bytes` refcount bump per element, plus
+    /// the matching drops — per command, on the local write path.
+    #[inline]
+    #[must_use]
+    pub fn is_error(&self) -> bool {
+        matches!(
+            self,
+            DispatchResult::Response(Frame::Error(_)) | DispatchResult::Quit(Frame::Error(_))
+        )
+    }
+}
+
 /// Upper bound for the with-duplicates (negative COUNT) arms of
 /// SRANDMEMBER / HRANDFIELD / ZRANDMEMBER. Redis returns exactly |COUNT|
 /// elements; Moon honors that up to this cap and returns an error beyond it —
@@ -1727,6 +1755,37 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `is_error` answers the one-bit question the monoio write path asks after
+    /// every local dispatch. It must answer it from a BORROW: the previous call
+    /// site cloned the whole reply `Frame` first, which for an `Array` reply is
+    /// a fresh `FrameVec` box plus one `Bytes` refcount bump per element.
+    #[test]
+    fn dispatch_result_is_error_is_borrow_only() {
+        let err = DispatchResult::Response(Frame::Error(Bytes::from_static(b"ERR nope")));
+        assert!(err.is_error());
+
+        let quit_err = DispatchResult::Quit(Frame::Error(Bytes::from_static(b"ERR bye")));
+        assert!(quit_err.is_error());
+
+        let ok = DispatchResult::Response(Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert!(!ok.is_error());
+
+        let quit_ok = DispatchResult::Quit(Frame::SimpleString(Bytes::from_static(b"OK")));
+        assert!(!quit_ok.is_error());
+
+        let arr =
+            DispatchResult::Response(Frame::Array(crate::protocol::FrameVec::from_vec(vec![
+                Frame::BulkString(Bytes::from_static(b"a")),
+            ])));
+        assert!(!arr.is_error());
+
+        // The borrow must survive the call: a by-value or cloning signature
+        // would move or duplicate the reply and this would not compile.
+        let held = DispatchResult::Response(Frame::Integer(1));
+        assert!(!held.is_error());
+        assert!(matches!(held, DispatchResult::Response(Frame::Integer(1))));
+    }
 
     fn make_args(parts: &[&[u8]]) -> Vec<Frame> {
         parts

@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **The monoio local write path no longer clones the whole reply to read one bit.** After
+  every local dispatch the handler built `response_frame` by cloning the `DispatchResult`'s
+  `Frame`, then used it for exactly one thing — `matches!(response_frame, Frame::Error(_))`
+  — and dropped it. `response_frame` had those two occurrences and no others. For an
+  `Array` reply that clone is a fresh `FrameVec` box plus one `Bytes` refcount bump per
+  element plus the matching drops, paid per command on the write path that the inline byte
+  path never touches. Replaced by `DispatchResult::is_error()`, a borrow-only `matches!`
+  over both variants. Semantics are unchanged by construction; the new method is unit-tested
+  over `Response`/`Quit` × error/non-error.
+
 ### Documentation
 
 - **The `moon-dev` recreate recipe now works end to end.** `docs/internal/orbstack-linux-parity.md`

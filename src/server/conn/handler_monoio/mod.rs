@@ -3038,10 +3038,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // touches the index stores or re-enters `s`, so the
                         // guard must not outlive this point.
                         drop(db_guard);
-                        let response_frame = match &result {
-                            DispatchResult::Response(f) | DispatchResult::Quit(f) => f.clone(),
-                        };
-                        let is_error = matches!(response_frame, Frame::Error(_));
+                        // Borrow, never clone: this is a one-bit question and
+                        // the reply may be a whole `Frame::Array`.
+                        let is_error = result.is_error();
 
                         // HSET auto-index: disjoint field borrows (NLL)
                         // &mut s.vector_store + &mut s.text_store are separate
