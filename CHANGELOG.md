@@ -194,6 +194,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `test_concurrent_fill_from_another_thread` poll a `ResponseSlotFuture`, moving
   `REMOTE_AWAITS`/`REMOTE_AWAITS_PARKED`, while the two counter assertions ran in parallel
   in the same binary. Both now take the same `PARK_COUNTERS` lock the counter tests hold.
+- **The inline write path enforced a different `maxmemory` than every other dispatch path (moon#475).**
+
+  `maxmemory` is scaled by the OS-footprint correction so it bounds what the process actually
+  costs the OS rather than the allocator's accounting figure — a 2.3x gap on the instance that
+  motivated PR #478, most of it swapped. `evict_to_budget` applied that divide. The lock-free
+  pre-gate on the inline write path, `can_skip_eviction`, open-coded the budget and omitted it:
+
+  ```rust
+  let budget = if elastic_budget > 0 { elastic_budget.min(mm) } else { per_shard };
+  estimated_memory <= budget          // no `/ footprint_correction()`
+  ```
+
+  So one server enforced two effective caps at once. The pre-gate is reachable only from
+  `server::conn::try_inline_dispatch`, so a plain `SET` was held to `maxmemory` while `HSET`
+  and `EVAL` — which reach `command::dispatch` / `dispatch_read` and call `evict_to_budget`
+  unconditionally — were held to `maxmemory / ratio`. At the measured 2.3x that is a 2.3x
+  difference in the limit an operator configured, with no error and no log line.
+
+  Scope of the divergence, stated precisely: under an **evicting** policy the 100ms periodic
+  tick still runs the corrected slow path, so the overshoot is a lag bounded by that tick, not
+  unbounded growth. Under **`noeviction`** it is not covered at all, because the tick discards
+  the result (`let _ = evict_to_budget(...)`, `src/shard/timers.rs:207`) — an inline write that
+  should have been refused with `-OOM` is silently accepted.
+
+  Both paths now call one `effective_budget(elastic, mm, per_shard, ratio)`. They do not apply
+  matching formulas, they execute the same function, so the pre-gate cannot drift from the
+  limiter again. The pre-gate stays lock-free: the correction is read with the same cached
+  Relaxed atomic load `evict_to_budget` already used (`footprint_correction()`), adding one
+  load and no sampling — PR #510 moved that sampling off the write path after it measured -57%
+  on SET at c=8 P=16, and this does not reintroduce it.
+
+  The gate had ~20 assertions and every one of them pinned the neutral correction 1.0, which is
+  why this shipped. `test_inline_pre_gate_agrees_with_slow_path_under_footprint_correction`
+  sweeps ratios across the clamped `[1.0, 8.0]` range and asserts the pre-gate's decision equals
+  the slow path's for every combination of elastic budget and estimated memory.
+
 - **`TXN ABORT` left torn state after a multi-key write (moon#500).**
 
   The undo capture in both connection handlers recorded a single key per command:
