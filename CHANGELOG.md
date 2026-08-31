@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **A flat multibulk is now parsed in one pass instead of two.** `parse()` ran
+  `validate_frame` over the request bytes to compute the frame's total length — computing
+  every argument offset on the way and throwing all of them away — and then ran
+  `parse_frame_zerocopy` over the same bytes to re-derive exactly those offsets. For a
+  top-level `*N` of `$`-bulks, which is the shape of essentially every client command, a
+  new `scan_flat_multibulk` records each argument's span into a stack `SmallVec` while it
+  validates, and the `Frame` is built straight from the spans: one `memchr` walk and one
+  `strict_atoi` per token instead of two, and no recursive per-element call. Everything
+  else — RESP3 containers, nested arrays, null bulks (`$-1`), null arrays (`*-1`), inline
+  commands, and reply parsing — is untouched and still takes the two-pass path; the fast
+  path declines on anything it does not handle exactly.
+
+  Correctness is asserted differentially, not argued: `parse_reference_two_pass` (the old
+  pipeline, compiled only under `cfg(test)`/`feature = "fuzzing"`) is compared against
+  `parse()` over a corpus of ~50 hand-picked cases **and every truncation of each**, under
+  four `ParseConfig`s including degenerate limits, and across argc 0–20 × payload lengths
+  0–300. Five deliberate mutations of the scanner were confirmed to fail those tests, so
+  they are not vacuous. A new `resp_parse_fused` fuzz target runs the same differential and
+  is registered in **both** matrices in `.github/workflows/fuzz.yml`.
+
 - **INCR/DECR/INCRBY/DECRBY no longer allocate a `String` per operation.** The new value
   was stored as `Entry::new_string(Bytes::from(new_val.to_string()))` — a heap allocation
   on the command hot path, which CLAUDE.md forbids outright — and `CompactValue` then
@@ -61,6 +81,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ShardSliceInit` literal, build slices with `test_support::make_init`.
 
 ### Fixed
+
+- **`*-\r\n` would have parsed as an empty array on the new fast path.** Found by
+  `resp_parse_fused` within 90 seconds of its first run, before the change shipped.
+  `strict_atoi` reads a lone `-` (and `-0`) as **zero**, while `parse()`'s
+  `is_null_multibulk` gate keys on the raw byte `buf[1] == b'-'` rather than on the parsed
+  count — so the two-pass path silently consumes `*-\r\n` and reports no frame, where a
+  count-based check would have produced `*0`. The scanner now declines on the byte. No
+  released version is affected; recorded because the shape (`is_null_multibulk` testing a
+  byte, not a number) is a trap for any future fast path over the same bytes.
 
 - **Fuzz crash reproducers are archived instead of discarded.** `fuzz.yml` uploaded only
   `fuzz/corpus/`, so the minimal reproducer libFuzzer writes to

@@ -32,6 +32,11 @@ path = "fuzz_targets/resp_parse_differential.rs"
 doc = false
 
 [[bin]]
+name = "resp_parse_fused"
+path = "fuzz_targets/resp_parse_fused.rs"
+doc = false
+
+[[bin]]
 name = "inline_parse"
 path = "fuzz_targets/inline_parse.rs"
 doc = false
