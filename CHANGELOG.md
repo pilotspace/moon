@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+- **D3 W1: `try_foreign_db_write`, the exclusive twin of `try_foreign_db_read`.** Mutates a
+  foreign shard's database on the calling thread under a non-blocking exclusive guard, or
+  returns `None` so the caller falls through to SPSC. No production callers yet by design —
+  a KV write also owes a WAL append, an AOF append, a backlog append, an offset advance keyed
+  by the *owner's* shard id, and an ordered replica fan-out, and those must be enqueued inside
+  the guard. Design: `docs/internal/d3-concurrent-keyspace.md`.
+- **`ShardDbSet::try_write_foreign`.** `try_write`'s "try" is only its index bounds check — it
+  calls `write()` and BLOCKS on a held database, which is exactly what a foreign thread must
+  never do. The new method is a single non-blocking attempt, matching `try_read`.
 - **`--cross-shard-fast-path`: serve a foreign shard's read without an SPSC hop (L4, S4).**
 
   A read whose key hashes to another shard previously always crossed that shard's SPSC

@@ -112,6 +112,22 @@ impl ShardDbSet {
         self.dbs.get(idx)?.try_read()
     }
 
+    /// FOREIGN WRITERS ONLY — one CAS attempt for EXCLUSIVE access, **never
+    /// parks**. The D3 counterpart of [`ShardDbSet::try_read`].
+    ///
+    /// `None` means someone else holds the database (owner or another foreign
+    /// writer); the caller must fall through to the SPSC path. As with
+    /// `try_read`, no re-entrancy bookkeeping: a single non-blocking attempt
+    /// cannot deadlock, and a foreign thread never holds two guards.
+    ///
+    /// **Not to be confused with [`ShardDbSet::try_write`]**, whose "try" is
+    /// only about the index — it calls `write()` and BLOCKS on a held
+    /// database, which is exactly what a foreign thread must never do.
+    #[inline]
+    pub fn try_write_foreign(&self, idx: usize) -> Option<RwLockWriteGuard<'_, Database>> {
+        self.dbs.get(idx)?.try_write()
+    }
+
     /// OWNER ONLY — two databases at once (`MOVE`, `COPY … DB n`, `SWAPDB`).
     ///
     /// Always acquires in **ascending index order** — that ordering is the

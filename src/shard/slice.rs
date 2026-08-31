@@ -588,6 +588,38 @@ pub fn try_foreign_db_read<R>(
     Some(f(&guard))
 }
 
+/// The foreign fast path for WRITES: mutate `shard`'s database on THIS thread.
+///
+/// The exclusive twin of [`try_foreign_db_read`], and the D3 primitive
+/// (`docs/internal/d3-concurrent-keyspace.md`). Same refusal contract: `None`
+/// means "fall through to the SPSC path", never "the write failed" — the
+/// closure has not run and nothing was mutated. It NEVER parks: `try_write`
+/// either takes the lock uncontended or gives up.
+///
+/// # The caller still owes the owner every side effect
+///
+/// This applies the mutation and NOTHING else. A KV write also owes a WAL
+/// append, an AOF append, a replication-backlog append, a monotonic offset
+/// advance keyed by the OWNER's shard id, and a deferred replica fan-out —
+/// and the fan-out carries an ordering guarantee that per-shard
+/// single-threadedness supplies today. Callers MUST construct and enqueue
+/// those records *inside* `f`, while the guard is held, or two foreign writers
+/// can order the keyspace one way and the replica wire the other.
+///
+/// Until a dispatch path does that, this has no production callers by design.
+#[inline]
+pub fn try_foreign_db_write<R>(
+    shard: usize,
+    db_index: usize,
+    f: impl FnOnce(&mut Database) -> R,
+) -> Option<R> {
+    cached_db_set()?;
+    // `try_write_foreign`, NOT `try_write`: the latter's "try" is only the
+    // index bounds check and it blocks on a held database.
+    let mut guard = crate::shard::db_plane::shard_dbs(shard)?.try_write_foreign(db_index)?;
+    Some(f(&mut guard))
+}
+
 /// This shard's database set, as a borrow with no refcount traffic.
 ///
 /// The registry is a `'static` `OnceLock`, so once this thread's shard is
@@ -861,6 +893,151 @@ mod tests {
                     &**registered as *const _ as *const _
                 ) || cached_db_set().expect("handle").db_count() == registered.db_count(),
                 "the cached handle must be this shard's own set"
+            );
+        })
+        .join()
+        .expect("probe thread");
+    }
+
+    /// Join the registered plane on this thread, or report why it could not.
+    /// Mirrors `init_shard_publishes_the_refcount_free_handle`: whichever
+    /// install wins the process-wide `OnceLock`, build the slice from whatever
+    /// set IS registered so `Arc::ptr_eq` inside `init_shard` holds.
+    fn join_plane(db_count: usize) -> &'static Arc<ShardDbSet> {
+        let _ = crate::shard::db_plane::install_registry(vec![
+            (0..db_count).map(|_| Database::new()).collect(),
+        ]);
+        let registered =
+            crate::shard::db_plane::shard_dbs(0).expect("a registry exists after install_registry");
+        let mut init = make_init(0, registered.db_count());
+        init.databases = Arc::clone(registered);
+        init_shard(ShardSlice::new(init));
+        assert!(
+            cached_db_set().is_some(),
+            "probe thread must be inside the registered plane"
+        );
+        registered
+    }
+
+    /// D3 W1: the write actually lands, and a later foreign READ of the same
+    /// database observes it. Without this the primitive could refuse
+    /// everything and every other test here would still pass.
+    #[test]
+    fn foreign_write_applies_and_is_visible_to_a_foreign_read() {
+        std::thread::spawn(|| {
+            join_plane(4);
+            let applied = try_foreign_db_write(0, 0, |db| {
+                db.set_string(
+                    bytes::Bytes::from_static(b"d3:k"),
+                    bytes::Bytes::from_static(b"v"),
+                );
+                db.logical_len()
+            });
+            assert_eq!(
+                applied,
+                Some(1),
+                "the closure must run against the owner's Database and mutate it"
+            );
+
+            let seen = try_foreign_db_read(0, 0, |db| db.is_hot(b"d3:k"));
+            assert_eq!(
+                seen,
+                Some(true),
+                "a foreign read must observe the foreign write; if this is \
+                 Some(false) the write landed in a different Database"
+            );
+        })
+        .join()
+        .expect("probe thread");
+    }
+
+    /// Same plane gate as the read twin: a thread outside the registry must
+    /// not mutate the registry's copy of another shard's database.
+    #[test]
+    fn foreign_write_refuses_from_a_thread_outside_the_registered_plane() {
+        let _ = crate::shard::db_plane::install_registry(vec![
+            (0..4).map(|_| Database::new()).collect(),
+        ]);
+        let target = (0..crate::shard::db_plane::registry_shard_count())
+            .find(|s| crate::shard::db_plane::shard_dbs(*s).is_some_and(|d| d.db_count() > 0))
+            .expect("registry must hold a shard with at least one database");
+
+        let ran = std::thread::spawn(move || {
+            assert!(cached_db_set().is_none());
+            try_foreign_db_write(target, 0, |_db| true)
+        })
+        .join()
+        .expect("probe thread");
+
+        assert_eq!(
+            ran, None,
+            "a thread outside the registered plane must fall through to SPSC"
+        );
+    }
+
+    /// It must REFUSE, not park, when the owner holds the database. Parking a
+    /// foreign thread on the owner's guard is the failure this whole design
+    /// exists to avoid.
+    #[test]
+    fn foreign_write_refuses_rather_than_parking_when_the_db_is_held() {
+        std::thread::spawn(|| {
+            let registered = join_plane(4);
+            // The registry is a process-wide OnceLock shared with every other
+            // test in this binary, so THIS test's install may have lost and the
+            // db count is whatever the winner chose. Derive the index from the
+            // set that actually exists — a hardcoded index is out of range on
+            // a smaller registry, and `try_read` then returns None for a reason
+            // that has nothing to do with contention.
+            let db_count = registered.db_count();
+            assert!(
+                db_count > 0,
+                "registered set must own at least one database"
+            );
+            let idx = db_count - 1;
+
+            // A reader on ANOTHER thread, so this thread's re-entrancy mask is
+            // not what does the refusing.
+            let held = Arc::clone(registered);
+            let (tx, rx) = std::sync::mpsc::channel::<bool>();
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                // try_read, not read: a blocking acquire here would hang this
+                // test whenever any other test in the binary holds this db.
+                // Retry briefly — another test holding it is transient, and a
+                // single attempt turns that into a spurious failure.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut g = held.try_read(idx);
+                while g.is_none() && std::time::Instant::now() < deadline {
+                    std::thread::yield_now();
+                    g = held.try_read(idx);
+                }
+                let _ = tx.send(g.is_some());
+                let _ = done_rx.recv();
+                drop(g);
+            });
+            let acquired = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("holder reported back");
+            assert!(
+                acquired,
+                "holder could not take db {idx} within 5s; another test in this \
+                 binary is holding it far longer than expected"
+            );
+
+            let started = std::time::Instant::now();
+            let outcome = try_foreign_db_write(0, idx, |_db| true);
+            let waited = started.elapsed();
+
+            let _ = done_tx.send(());
+            holder.join().expect("holder thread");
+
+            assert_eq!(
+                outcome, None,
+                "a held database must be refused, not waited on"
+            );
+            assert!(
+                waited < std::time::Duration::from_millis(50),
+                "try_foreign_db_write blocked for {waited:?} — it must never park"
             );
         })
         .join()
