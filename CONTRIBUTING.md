@@ -128,28 +128,39 @@ src/command/hash.rs (1500+ lines)
 
 Every function that deserializes untrusted input MUST have a `cargo-fuzz` target:
 
-```
-fuzz/fuzz_targets/
-  resp_parse.rs              # RESP2/RESP3 protocol parser
-  resp_parse_differential.rs # Two-parse determinism invariant
-  inline_parse.rs            # Telnet-style command parser
-  wal_v3_record.rs           # WAL v3 record decoder
-  rdb_load.rs                # RDB snapshot loader
-  gossip_deser.rs            # Cluster gossip + roundtrip
-  acl_rule.rs                # ACL rule string parser
-```
+There are **20 targets** in `fuzz/fuzz_targets/` — protocol parsers (`resp_parse`,
+`resp_parse_differential`, `inline_parse`), on-disk and wire decoders (`wal_v3_record`,
+`rdb_load`, `redis_rdb_load`, `dump_payload`, `gossip_deser`, `mq_wal_record`,
+`mq_registry_blob`, `ws_registry_record`, `graph_props_record`, `csr_from_bytes`,
+`term_fst_sidecar`), and argument/rule parsers (`acl_rule`, `acl_keyspec`, `conf_parse`,
+`ft_create_args`, `fts_query_parse`, `cypher_parse`). `ls fuzz/fuzz_targets/` is the
+authority; this list is prose and will drift.
 
 **Adding a new fuzz target:**
 1. Create `fuzz/fuzz_targets/your_target.rs`
-2. Add `[[bin]]` entry to `fuzz/Cargo.toml`
-3. Add target name to `.github/workflows/fuzz.yml` matrix
-4. Create seed corpus in `fuzz/corpus/your_target/`
+2. Add a `[[bin]]` entry to `fuzz/Cargo.toml`
+3. Add the target name to **both** matrices in `.github/workflows/fuzz.yml` — the PR job
+   and the nightly job have separate lists, and **a target missing from one silently never
+   runs there**
+4. Create a seed corpus in `fuzz/corpus/your_target/`
 5. Run locally: `cargo +nightly fuzz run your_target -- -max_total_time=60`
+6. Confirm it compiles the way CI will: `cargo check --manifest-path fuzz/Cargo.toml --all-targets`
 
 **Fuzz target requirements:**
 - Use bounded configs to prevent OOM (e.g., `max_array_depth: 4`, `max_bulk_string_size: 64*1024`)
 - Must not panic on ANY input — the function under test should return errors, not crash
 - Differential targets: same input → two code paths → same result
+- **Never hand-copy a `ShardSliceInit` (or similar) struct literal into a target.** Build a
+  slice with `moon::shard::slice::test_support::make_init` (moon's `fuzzing` feature). A
+  copied literal rotted twice unnoticed — `ShardStoreMemory` gained fields, then `databases`
+  became `Arc<ShardDbSet>` — and `mq_registry_blob` failed to *build* on every nightly for
+  months, running zero executions. Sharing moon's own fixture makes a new field break the
+  build in-tree, where a gate can see it.
+
+**Reading a fuzz failure:** libFuzzer writes the minimised reproducer to
+`fuzz/artifacts/<target>/crash-<sha>`; CI uploads it as a `fuzz-crashes-<target>` artifact
+on failure. Replay it with
+`cargo +nightly fuzz run <target> fuzz/artifacts/<target>/crash-<sha>`.
 
 ### Lock-Free Data Structure Contract
 
@@ -163,17 +174,26 @@ Current loom-tested structures:
 
 ## CI Pipeline
 
+**The local gate comes first.** Since #732 the hosted per-PR matrix does *not* run the
+monoio suite, macOS, client-compat or the console feature — `scripts/ci-local.sh` is the
+only thing that gates them before a change reaches main. Run it before every push, and
+dispatch the hosted matrix (`gh workflow run ci.yml --ref <branch>`) for the three checks
+no local run can produce.
+
 | Job | What it checks | Blocks merge? |
 |---|---|---|
 | Format | `cargo fmt --check` | Yes |
 | Clippy (default) | `cargo clippy -- -D warnings` | Yes |
 | Clippy (tokio) | Same with `--no-default-features --features runtime-tokio,jemalloc` | Yes |
-| Test | `cargo test --no-default-features --features runtime-tokio,jemalloc` | Yes |
+| Test | `cargo nextest run --profile ci --no-default-features --features runtime-tokio,jemalloc`, plus a separate `--doc` step (nextest does not run doctests) | Yes |
 | MSRV | `cargo build` with Rust 1.94 | Yes |
 | Safety Audit | `scripts/audit-unsafe.sh` + `scripts/audit-unwrap.sh` | Yes |
-| Fuzz (PR) | 15 min/target on 7 fuzz targets (nightly compiler) | Yes (crash = fail) |
-| Fuzz (nightly) | 6h/target, corpus archived | No (advisory) |
-| CodeQL | Security analysis | Yes |
+| Fuzz crate compiles | `cargo check --manifest-path fuzz/Cargo.toml --all-targets` — nothing else in CI compiles `fuzz/` | Yes |
+| Memory steady-state | RSS gate | Yes |
+| CHANGELOG | An entry, unless the PR carries `skip-changelog` | Yes |
+| Fuzz (PR) | 15 min/target across all 20 targets — **only when the PR is labelled `ci-fuzz`** | No (opt-in) |
+| Fuzz (nightly) | 5h/target (`-max_total_time=18000`; 6h hits the hosted job ceiling and loses the corpus), corpus + crash reproducers archived | No (advisory) |
+| CodeQL | Security analysis — **main-push and weekly only**; PR runs were removed in 2026-07 as a 20-40 min job that is audit tooling, not a review gate | No |
 
 ## Production Contract
 

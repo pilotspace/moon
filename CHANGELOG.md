@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **The `moon-dev` recreate recipe now works end to end.** `docs/internal/orbstack-linux-parity.md`
+  was missing four packages that are each load-bearing (`git`, `python3-redis`, `libicu-dev`,
+  `cargo-nextest`) and omitted the GitHub Actions runner entirely — it dies with the VM, and
+  without step 5 the hosted monoio and client-compat legs queue forever with no error. Also
+  records that the machine has now vanished five times, that `ci-local` refuses with exit 4
+  when it has, and that `orb create ubuntu` tracks the current release (24.04 when the doc
+  was written, 26.04.1 now).
+- **`CONTRIBUTING.md` fuzz and CI sections re-checked against the workflows.** The target
+  list said 7 (there are 20); "add the target to the matrix" was singular where there are
+  **two** and a target missing from one silently never runs; the CI table claimed Fuzz (PR)
+  blocks merge (it is opt-in behind the `ci-fuzz` label), that the nightly budget is 6h (5h —
+  6h hits the hosted job ceiling and loses the corpus), and that CodeQL blocks merge (its PR
+  runs were removed in 2026-07). Adds the rule that cost two fuzz targets: never hand-copy a
+  `ShardSliceInit` literal, build slices with `test_support::make_init`.
+
 ### Fixed
 
 - **Fuzz crash reproducers are archived instead of discarded.** `fuzz.yml` uploaded only
