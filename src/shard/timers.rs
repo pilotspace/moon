@@ -783,7 +783,7 @@ mod tests {
             crate::shard::slice::with_shard_db(db_idx, |db| {
                 for i in 0..64u32 {
                     db.set_string(
-                        Bytes::from(format!("db{db_idx}:key:{i}")),
+                        &Bytes::from(format!("db{db_idx}:key:{i}")),
                         Bytes::from(vec![b'v'; 4096]),
                     );
                 }
@@ -856,7 +856,7 @@ mod tests {
 
         crate::shard::slice::with_shard_db(0, |db| {
             for i in 0..100u32 {
-                db.set_string(Bytes::from(format!("key:{i}")), Bytes::from(vec![b'v'; 64]));
+                db.set_string(format!("key:{i}").as_bytes(), Bytes::from(vec![b'v'; 64]));
             }
         });
 

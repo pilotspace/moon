@@ -360,7 +360,7 @@ mod tests {
                 );
             }
         }
-        db.set(bytes::Bytes::copy_from_slice(key), entry);
+        db.set(&bytes::Bytes::copy_from_slice(key), entry);
         db
     }
 

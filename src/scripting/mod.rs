@@ -640,7 +640,7 @@ mod tests {
         let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
         let mut db = Database::new();
         db.set(
-            Bytes::from_static(b"sk"),
+            b"sk",
             crate::storage::Entry::new_string(Bytes::from_static(b"not-a-number")),
         );
 
@@ -704,7 +704,7 @@ mod tests {
         let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
         let mut db = Database::new();
         // A LIST, so a string command against it is a type clash.
-        db.set(Bytes::from_static(b"lk"), crate::storage::Entry::new_list());
+        db.set(b"lk", crate::storage::Entry::new_list());
 
         let r = run_script(
             &lua,
@@ -1264,7 +1264,7 @@ mod tests {
         let cache = Rc::new(RefCell::new(ScriptCache::new()));
         let mut db = Database::new();
         db.set(
-            Bytes::from_static(b"rk"),
+            b"rk",
             crate::storage::Entry::new_string(Bytes::from_static(b"hello")),
         );
 

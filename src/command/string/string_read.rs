@@ -228,12 +228,12 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("GETEX");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("GETEX"),
     };
 
     // First, get value (returns None if key doesn't exist or expired)
-    let value = match db.get(&key) {
+    let value = match db.get(key) {
         Some(entry) => match entry.value.as_bytes_owned() {
             Some(v) => v,
             None => {
@@ -257,14 +257,14 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
         // GETEX was invisible to the active sweep forever) and the deadline
         // expiry index.
         if opt.eq_ignore_ascii_case(b"PERSIST") {
-            db.set_expiry(&key, 0);
+            db.set_expiry(key, 0);
         } else if opt.eq_ignore_ascii_case(b"EX") {
             if args.len() < 3 {
                 return Frame::Error(Bytes::from_static(b"ERR syntax error"));
             }
             match parse_positive_i64(&args[2]).and_then(|secs| (secs as u64).checked_mul(1000)) {
                 Some(ms) => {
-                    db.set_expiry(&key, current_time_ms().saturating_add(ms));
+                    db.set_expiry(key, current_time_ms().saturating_add(ms));
                 }
                 None => {
                     return Frame::Error(Bytes::from_static(
@@ -278,7 +278,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             }
             match parse_positive_i64(&args[2]) {
                 Some(ms) => {
-                    db.set_expiry(&key, current_time_ms() + ms as u64);
+                    db.set_expiry(key, current_time_ms() + ms as u64);
                 }
                 None => {
                     return Frame::Error(Bytes::from_static(
@@ -292,7 +292,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             }
             match parse_positive_i64(&args[2]).and_then(|ts| (ts as u64).checked_mul(1000)) {
                 Some(ms) => {
-                    db.set_expiry(&key, ms);
+                    db.set_expiry(key, ms);
                 }
                 None => {
                     return Frame::Error(Bytes::from_static(
@@ -306,7 +306,7 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             }
             match parse_positive_i64(&args[2]) {
                 Some(ts_ms) => {
-                    db.set_expiry(&key, ts_ms as u64);
+                    db.set_expiry(key, ts_ms as u64);
                 }
                 None => {
                     return Frame::Error(Bytes::from_static(

@@ -13,7 +13,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("SET");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("SET"),
     };
     let value = match extract_bytes(&args[1]) {
@@ -32,7 +32,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
         crate::notify::notify_keyspace_event(
             crate::notify::NotifyFlags::STRING,
             "set",
-            &key,
+            key,
             db.db_index,
         );
         db.set(key, entry);
@@ -161,7 +161,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Get old value if needed
     let old_value = if get_old {
-        db.get(&key).map(|e| match e.value.as_bytes_owned() {
+        db.get(key).map(|e| match e.value.as_bytes_owned() {
             Some(v) => Frame::BulkString(v),
             None => Frame::Error(Bytes::from_static(
                 b"WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -188,7 +188,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     // NX: only set if not exists
-    if nx && db.exists(&key) {
+    if nx && db.exists(key) {
         return if get_old {
             old_value.unwrap_or(Frame::Null)
         } else {
@@ -197,7 +197,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     // XX: only set if exists
-    if xx && !db.exists(&key) {
+    if xx && !db.exists(key) {
         return if get_old { Frame::Null } else { Frame::Null };
     }
 
@@ -206,7 +206,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
         expires_at_ms
     } else if keepttl {
         // Preserve existing TTL
-        db.get(&key).map(|e| e.expires_at_ms()).unwrap_or(0)
+        db.get(key).map(|e| e.expires_at_ms()).unwrap_or(0)
     } else {
         0
     };
@@ -235,7 +235,7 @@ pub fn mset(db: &mut Database, args: &[Frame]) -> Frame {
     }
     for pair in args.chunks(2) {
         let key = match extract_bytes(&pair[0]) {
-            Some(k) => k.clone(),
+            Some(k) => k,
             None => return err_wrong_args("MSET"),
         };
         let value = match extract_bytes(&pair[1]) {
@@ -272,7 +272,7 @@ pub fn msetnx(db: &mut Database, args: &[Frame]) -> Frame {
     // Phase 2: all keys absent -> set them all.
     for pair in args.chunks(2) {
         let key = match extract_bytes(&pair[0]) {
-            Some(k) => k.clone(),
+            Some(k) => k,
             None => return err_wrong_args("MSETNX"),
         };
         let value = match extract_bytes(&pair[1]) {
@@ -416,7 +416,7 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
         key,
         db.db_index,
     );
-    db.set(key.clone(), entry);
+    db.set(key, entry);
 
     Frame::Integer(new_val)
 }
@@ -489,7 +489,7 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
     };
     entry.set_last_access(db.now());
     entry.set_access_counter(5);
-    db.set(key.clone(), entry);
+    db.set(key, entry);
 
     Frame::BulkString(Bytes::from(formatted))
 }
@@ -500,7 +500,7 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("APPEND");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("APPEND"),
     };
     let append_val = match extract_bytes(&args[1]) {
@@ -509,7 +509,7 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     // Check if key exists, get existing data + expiry
-    let (existing_data, existing_expiry_ms) = match db.get(&key) {
+    let (existing_data, existing_expiry_ms) = match db.get(key) {
         Some(entry) => {
             let expiry = entry.expires_at_ms();
             match entry.value.as_bytes_owned() {
@@ -564,7 +564,7 @@ pub fn setrange(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("SETRANGE");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("SETRANGE"),
     };
     let offset = match parse_i64(&args[1]) {
@@ -578,7 +578,7 @@ pub fn setrange(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Redis compatibility: SETRANGE with empty value on missing key returns 0 without creating key
     if value.is_empty() {
-        return match db.get(&key) {
+        return match db.get(key) {
             Some(entry) => match entry.value.as_bytes() {
                 Some(v) => Frame::Integer(v.len() as i64),
                 None => Frame::Error(Bytes::from_static(
@@ -599,7 +599,7 @@ pub fn setrange(db: &mut Database, args: &[Frame]) -> Frame {
         }
     };
 
-    let (existing_data, existing_expiry_ms) = match db.get(&key) {
+    let (existing_data, existing_expiry_ms) = match db.get(key) {
         Some(entry) => {
             let expiry = entry.expires_at_ms();
             match entry.value.as_bytes() {
@@ -642,14 +642,14 @@ pub fn setnx(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("SETNX");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("SETNX"),
     };
     let value = match extract_bytes(&args[1]) {
         Some(v) => v.clone(),
         None => return err_wrong_args("SETNX"),
     };
-    if db.exists(&key) {
+    if db.exists(key) {
         Frame::Integer(0)
     } else {
         db.set_string(key, value);
@@ -664,7 +664,7 @@ pub fn setex(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("SETEX");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("SETEX"),
     };
     let seconds = match parse_i64(&args[1]) {
@@ -707,7 +707,7 @@ pub fn psetex(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("PSETEX");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("PSETEX"),
     };
     let millis = match parse_i64(&args[1]) {
@@ -748,7 +748,7 @@ pub fn getset(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("GETSET");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("GETSET"),
     };
     let value = match extract_bytes(&args[1]) {
@@ -756,7 +756,7 @@ pub fn getset(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("GETSET"),
     };
 
-    let old = db.get(&key).map(|e| match e.value.as_bytes_owned() {
+    let old = db.get(key).map(|e| match e.value.as_bytes_owned() {
         Some(v) => Frame::BulkString(v),
         None => Frame::Error(Bytes::from_static(
             b"WRONGTYPE Operation against a key holding the wrong kind of value",

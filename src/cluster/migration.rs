@@ -385,11 +385,11 @@ mod tests {
         use crate::storage::Entry;
         let mut db = Database::new();
         db.set(
-            bytes::Bytes::from_static(b"foo"),
+            &bytes::Bytes::from_static(b"foo"),
             Entry::new_string(bytes::Bytes::from_static(b"v1")),
         );
         db.set(
-            bytes::Bytes::from_static(b"bar"),
+            &bytes::Bytes::from_static(b"bar"),
             Entry::new_string(bytes::Bytes::from_static(b"v2")),
         );
 

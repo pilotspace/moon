@@ -167,14 +167,14 @@ pub fn hdel(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("HDEL");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("HDEL"),
     };
     let mut count: i64 = 0;
     let mut last_was_empty = false;
     for arg in &args[1..] {
         if let Some(field) = extract_bytes(arg) {
-            match db.hash_delete_field(&key, field) {
+            match db.hash_delete_field(key, field) {
                 Ok((removed, empty)) => {
                     if removed {
                         count += 1;
@@ -187,7 +187,7 @@ pub fn hdel(db: &mut Database, args: &[Frame]) -> Frame {
     }
     // If the last deletion left the hash empty, remove the key.
     if last_was_empty {
-        db.remove(&key);
+        db.remove(key);
     }
     Frame::Integer(count)
 }

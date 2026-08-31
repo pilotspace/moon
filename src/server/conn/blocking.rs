@@ -2745,7 +2745,7 @@ pub(crate) fn try_inline_dispatch(
                 &key,
                 selected_db,
             );
-            db.set(key, entry);
+            db.set(&key, entry);
         });
     }
 

@@ -72,7 +72,7 @@ fn store_hll(db: &mut Database, key: Bytes, hll: Hll) {
     let mut entry = Entry::new_string(hll.into_bytes());
     entry.set_last_access(db.now());
     entry.set_access_counter(5);
-    db.set(key, entry);
+    db.set(&key, entry);
 }
 
 /// PFADD key [element [element ...]]

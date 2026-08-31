@@ -93,7 +93,7 @@ pub fn copy(db: &mut Database, args: &[Frame]) -> Frame {
     // Clone the source entry (CompactEntry derives Clone)
     let entry = db.get(src).cloned();
     if let Some(cloned) = entry {
-        db.set(Bytes::copy_from_slice(dst), cloned);
+        db.set(dst, cloned);
         Frame::Integer(1)
     } else {
         // Source expired between exists() and get() — race with lazy expiry
@@ -185,7 +185,7 @@ pub fn sort(db: &mut Database, args: &[Frame]) -> Frame {
             return if let Some(dest) = store_dest {
                 // STORE with empty → create empty list
                 let entry = crate::storage::entry::Entry::new_list();
-                db.set(Bytes::copy_from_slice(dest), entry);
+                db.set(dest, entry);
                 Frame::Integer(0)
             } else {
                 Frame::Array(framevec![])
@@ -330,7 +330,7 @@ pub fn sort(db: &mut Database, args: &[Frame]) -> Frame {
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
             crate::storage::entry::RedisValue::List(list),
         );
-        db.set(Bytes::copy_from_slice(dest), entry);
+        db.set(dest, entry);
         Frame::Integer(count)
     } else {
         Frame::Array(results.into())
@@ -590,10 +590,7 @@ mod tests {
 
     fn setup_db_with_key(key: &[u8], val: &[u8]) -> Database {
         let mut db = Database::new();
-        db.set(
-            Bytes::copy_from_slice(key),
-            Entry::new_string(Bytes::copy_from_slice(val)),
-        );
+        db.set(key, Entry::new_string(Bytes::copy_from_slice(val)));
         db
     }
 
@@ -611,10 +608,7 @@ mod tests {
     #[test]
     fn test_copy_dest_exists_no_replace() {
         let mut db = setup_db_with_key(b"src", b"hello");
-        db.set(
-            Bytes::from_static(b"dst"),
-            Entry::new_string(Bytes::from_static(b"existing")),
-        );
+        db.set(b"dst", Entry::new_string(Bytes::from_static(b"existing")));
         let result = copy(&mut db, &[bs(b"src"), bs(b"dst")]);
         assert_eq!(result, Frame::Integer(0));
     }
@@ -622,10 +616,7 @@ mod tests {
     #[test]
     fn test_copy_with_replace() {
         let mut db = setup_db_with_key(b"src", b"hello");
-        db.set(
-            Bytes::from_static(b"dst"),
-            Entry::new_string(Bytes::from_static(b"existing")),
-        );
+        db.set(b"dst", Entry::new_string(Bytes::from_static(b"existing")));
         let result = copy(&mut db, &[bs(b"src"), bs(b"dst"), bs(b"REPLACE")]);
         assert_eq!(result, Frame::Integer(1));
     }
@@ -682,7 +673,7 @@ mod tests {
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
             crate::storage::entry::RedisValue::List(list),
         );
-        db.set(Bytes::copy_from_slice(key), entry);
+        db.set(key, entry);
     }
 
     #[test]
@@ -771,7 +762,7 @@ mod tests {
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
             crate::storage::entry::RedisValue::Set(s),
         );
-        db.set(Bytes::from_static(b"myset"), entry);
+        db.set(b"myset", entry);
         let result = sort(&mut db, &[bs(b"myset")]);
         assert_eq!(
             result,

@@ -263,7 +263,7 @@ fn snapshot_and_generate(db: &SharedDatabases) -> BytesMut {
     for entries in &snapshot {
         let mut db = Database::new();
         for (key, entry) in entries {
-            db.set(key.to_bytes(), entry.clone());
+            db.set(key.as_ref(), entry.clone());
         }
         temp_dbs.push(db);
     }
@@ -1132,7 +1132,7 @@ fn rewrite_aof_sync(db: &SharedDatabases, aof_path: &Path) -> Result<(), MoonErr
             let now_ms = current_time_ms();
             for (k, v) in guard.data().iter() {
                 if !v.is_expired_at(now_ms) {
-                    temp.set(k.to_bytes(), v.clone());
+                    temp.set(k.as_ref(), v.clone());
                 }
             }
             temp

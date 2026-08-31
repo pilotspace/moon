@@ -283,7 +283,7 @@ mod tests {
         for i in 0..10 {
             let key = Bytes::from(format!("expired_{}", i));
             db.set(
-                key,
+                &key,
                 Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms),
             );
         }
@@ -293,7 +293,7 @@ mod tests {
         for i in 0..5 {
             let key = Bytes::from(format!("alive_{}", i));
             db.set(
-                key,
+                &key,
                 Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms),
             );
         }
@@ -301,7 +301,7 @@ mod tests {
         // Add 3 keys without expiry
         for i in 0..3 {
             let key = Bytes::from(format!("noexpiry_{}", i));
-            db.set(key, Entry::new_string(Bytes::from_static(b"v")));
+            db.set(&key, Entry::new_string(Bytes::from_static(b"v")));
         }
 
         expire_cycle(&mut db, &mut |_| {});
@@ -505,7 +505,7 @@ mod tests {
         let now = current_time_ms();
         for i in 0..1_000u32 {
             db.set(
-                Bytes::from(format!("k{i}")),
+                &Bytes::from(format!("k{i}")),
                 Entry::new_string_with_expiry(Bytes::from_static(b"v"), now + 3_600_000),
             );
         }
@@ -517,7 +517,7 @@ mod tests {
 
         // One due key flips it.
         db.set(
-            Bytes::from_static(b"due"),
+            b"due",
             Entry::new_string_with_expiry(Bytes::from_static(b"v"), now - 1),
         );
         assert!(!nothing_due(&db));
@@ -548,7 +548,7 @@ mod tests {
         let mut db = Database::new();
         let now = current_time_ms();
         db.set(
-            Bytes::from_static(b"k"),
+            b"k",
             Entry::new_string_with_expiry(Bytes::from_static(b"v"), now + 3_600_000),
         );
 
@@ -563,7 +563,7 @@ mod tests {
 
         // Retarget into the past (SET with a new TTL re-indexes the pair).
         db.set(
-            Bytes::from_static(b"k"),
+            b"k",
             Entry::new_string_with_expiry(Bytes::from_static(b"v"), now - 1),
         );
         expire_cycle_direct(&mut db, &mut |_| removed += 1);
@@ -577,7 +577,7 @@ mod tests {
     fn skip_path_lowers_the_latch_when_both_indexes_are_empty() {
         let mut db = Database::new();
         db.set(
-            Bytes::from_static(b"k"),
+            b"k",
             Entry::new_string_with_expiry(Bytes::from_static(b"v"), current_time_ms() + 60_000),
         );
         db.remove(b"k");
@@ -604,14 +604,14 @@ mod tests {
         let future_ms = current_time_ms() + 3_600_000;
         for i in 0..10_000u32 {
             db.set(
-                Bytes::from(format!("live_{i}")),
+                &Bytes::from(format!("live_{i}")),
                 Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms),
             );
         }
         let past_ms = current_time_ms() - 1_000;
         for i in 0..50u32 {
             db.set(
-                Bytes::from(format!("due_{i}")),
+                &Bytes::from(format!("due_{i}")),
                 Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms),
             );
         }
@@ -640,7 +640,7 @@ mod tests {
         let mut db = Database::new();
         let future_ms = current_time_ms() + 3_600_000;
         db.set(
-            Bytes::from_static(b"k"),
+            b"k",
             Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms),
         );
         assert_eq!(db.expiry_index_len(), 1);
@@ -672,7 +672,7 @@ mod tests {
         use crate::protocol::Frame;
         let mut db = Database::new();
         for opt in [&b"EX"[..], &b"EXAT"[..]] {
-            db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+            db.set_string(b"k", Bytes::from_static(b"v"));
             let args = [
                 Frame::BulkString(Bytes::from_static(b"k")),
                 Frame::BulkString(Bytes::copy_from_slice(opt)),
@@ -695,7 +695,7 @@ mod tests {
     fn getex_ttl_participates_in_active_expiry() {
         use crate::protocol::Frame;
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+        db.set_string(b"k", Bytes::from_static(b"v"));
         assert!(!db.maybe_has_expiring_keys());
 
         let args = [
@@ -754,7 +754,7 @@ mod tests {
         let future_ms = current_time_ms() + 3_600_000;
         for i in 0..100_000u32 {
             db.set(
-                Bytes::from(format!("k{i}")),
+                &Bytes::from(format!("k{i}")),
                 Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms),
             );
         }
@@ -773,8 +773,8 @@ mod tests {
     #[test]
     fn test_expire_cycle_no_keys_with_expiry() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
-        db.set_string(Bytes::from_static(b"k2"), Bytes::from_static(b"v2"));
+        db.set_string(b"k1", Bytes::from_static(b"v1"));
+        db.set_string(b"k2", Bytes::from_static(b"v2"));
 
         expire_cycle(&mut db, &mut |_| {});
 
@@ -861,7 +861,7 @@ mod tests {
             let mut db = Database::new();
             let past_ms = current_time_ms() - 1_000;
             db.set(
-                Bytes::copy_from_slice(key),
+                key,
                 Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms),
             );
             // `get`/`exists` judge expiry against the db-cached clock.
@@ -928,10 +928,7 @@ mod tests {
         fn overwritten_key_is_not_deleted_by_the_drain() {
             let mut db = db_with_expired_key(b"k");
             assert!(db.get(b"k").is_none());
-            db.set(
-                Bytes::from_static(b"k"),
-                Entry::new_string(Bytes::from_static(b"fresh")),
-            );
+            db.set(b"k", Entry::new_string(Bytes::from_static(b"fresh")));
             let got = drained_keys(&mut db);
             assert!(
                 !got.iter().any(|k| k == b"k"),
@@ -950,7 +947,7 @@ mod tests {
             let n = crate::storage::db::PENDING_EXPIRED_CAP + 10;
             for i in 0..n {
                 db.set(
-                    Bytes::from(format!("k{i}")),
+                    &Bytes::from(format!("k{i}")),
                     Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms),
                 );
             }

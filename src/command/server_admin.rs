@@ -1915,7 +1915,7 @@ mod tests {
     fn debug_digest_is_refused_on_the_inline_path_rather_than_answered_partially() {
         let mut db = Database::new();
         db.set(
-            bytes::Bytes::from_static(b"k"),
+            &bytes::Bytes::from_static(b"k"),
             crate::storage::Entry::new_string(bytes::Bytes::from_static(b"v")),
         );
         let args = [Frame::BulkString(Bytes::from_static(b"DIGEST"))];

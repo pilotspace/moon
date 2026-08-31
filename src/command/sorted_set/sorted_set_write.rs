@@ -161,11 +161,11 @@ pub fn zrem(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("ZREM");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("ZREM"),
     };
 
-    let (members, scores) = match db.get_or_create_sorted_set(&key) {
+    let (members, scores) = match db.get_or_create_sorted_set(key) {
         Ok(pair) => pair,
         Err(e) => return e,
     };
@@ -188,7 +188,7 @@ pub fn zrem(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Remove key if empty
     if is_empty {
-        db.remove(&key);
+        db.remove(key);
     }
 
     Frame::Integer(removed)
@@ -248,7 +248,7 @@ pub fn zpopmin(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("ZPOPMIN");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("ZPOPMIN"),
     };
 
@@ -268,7 +268,7 @@ pub fn zpopmin(db: &mut Database, args: &[Frame]) -> Frame {
         1
     };
 
-    let (members, scores) = match db.get_or_create_sorted_set(&key) {
+    let (members, scores) = match db.get_or_create_sorted_set(key) {
         Ok(pair) => pair,
         Err(e) => return e,
     };
@@ -294,7 +294,7 @@ pub fn zpopmin(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Remove key if empty
     if is_empty {
-        db.remove(&key);
+        db.remove(key);
     }
 
     Frame::Array(result.into())
@@ -306,7 +306,7 @@ pub fn zpopmax(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("ZPOPMAX");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("ZPOPMAX"),
     };
 
@@ -326,7 +326,7 @@ pub fn zpopmax(db: &mut Database, args: &[Frame]) -> Frame {
         1
     };
 
-    let (members, scores) = match db.get_or_create_sorted_set(&key) {
+    let (members, scores) = match db.get_or_create_sorted_set(key) {
         Ok(pair) => pair,
         Err(e) => return e,
     };
@@ -352,7 +352,7 @@ pub fn zpopmax(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Remove key if empty
     if is_empty {
-        db.remove(&key);
+        db.remove(key);
     }
 
     Frame::Array(result.into())
@@ -378,7 +378,7 @@ fn zstore_impl(db: &mut Database, args: &[Frame], intersect: bool) -> Frame {
         return err_wrong_args(cmd_name);
     }
     let dest = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args(cmd_name),
     };
     let numkeys_bytes = match extract_bytes(&args[1]) {
@@ -527,10 +527,10 @@ fn zstore_impl(db: &mut Database, args: &[Frame], intersect: bool) -> Frame {
     let result_size = result_map.len() as i64;
 
     // Remove destination key first, then create new sorted set
-    db.remove(&dest);
+    db.remove(dest);
 
     if !result_map.is_empty() {
-        let (members, scores) = match db.get_or_create_sorted_set(&dest) {
+        let (members, scores) = match db.get_or_create_sorted_set(dest) {
             Ok(pair) => pair,
             Err(e) => return e,
         };
@@ -562,7 +562,7 @@ pub fn zrangestore(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("ZRANGESTORE");
     }
     let dst = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("ZRANGESTORE"),
     };
     let src = match extract_bytes(&args[1]) {
@@ -693,10 +693,10 @@ pub fn zrangestore(db: &mut Database, args: &[Frame]) -> Frame {
     let count = entries.len() as i64;
 
     // Replace dst with the result
-    db.remove(&dst);
+    db.remove(dst);
 
     if !entries.is_empty() {
-        let (dst_members, dst_scores) = match db.get_or_create_sorted_set(&dst) {
+        let (dst_members, dst_scores) = match db.get_or_create_sorted_set(dst) {
             Ok(pair) => pair,
             Err(e) => return e,
         };

@@ -1576,7 +1576,7 @@ mod tests {
             .map(|i| {
                 let mut db = crate::storage::Database::new();
                 db.set(
-                    Bytes::copy_from_slice(format!("marker:{i}").as_bytes()),
+                    format!("marker:{i}").as_bytes(),
                     crate::storage::Entry::new_string(Bytes::copy_from_slice(
                         format!("from-db-{i}").as_bytes(),
                     )),

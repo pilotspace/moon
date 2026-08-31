@@ -140,7 +140,7 @@ impl Database {
             return false;
         };
         self.spill_inflight_forget(key);
-        self.set(Bytes::copy_from_slice(key), entry);
+        self.set(key, entry);
         true
     }
 
@@ -205,7 +205,6 @@ impl Database {
         }
         match outcome {
             ColdReadOutcome::Hit(redis_value, ttl_ms) => {
-                let key_bytes = Bytes::copy_from_slice(key);
                 // Build an entry from the RedisValue (works for strings and collections).
                 let mut entry = Entry::new_string(Bytes::new()); // placeholder
                 entry.value =
@@ -213,7 +212,7 @@ impl Database {
                 if let Some(ttl) = ttl_ms {
                     entry.set_expires_at_ms(ttl);
                 }
-                self.set(key_bytes, entry);
+                self.set(key, entry);
                 if let Some(ref mut ci) = self.cold_index {
                     ci.remove(key);
                 }
@@ -318,7 +317,14 @@ impl Database {
     /// Uses `DashTable::insert_or_update` for a single SIMD probe on both hit
     /// and miss paths. The old `get_mut` + `insert` pattern ran two probes on
     /// miss (PERF-08).
-    pub fn set(&mut self, key: Bytes, entry: Entry) {
+    /// `key` is BORROWED on purpose. Every use below is by reference —
+    /// `spill_inflight_forget`, `entry_overhead`, `hash_expiry_index_note_value`,
+    /// `CompactKey::from` (which copies the bytes either way), `ColdIndex::remove`
+    /// and both expiry-index writers all take `&[u8]`, and the `Bytes` is never
+    /// moved anywhere. Taking `Bytes` forced a `key.clone()` at every write
+    /// command's call site: one `shared_v_clone` on the way in and one
+    /// `shared_v_drop` on the way out, per command, producing nothing.
+    pub fn set(&mut self, key: &[u8], entry: Entry) {
         crate::admin::metrics_setup::record_keyspace_change();
         // An overwrite makes any in-flight spill payload for this key stale.
         // Retiring the record here stops its completion publishing the OLD
@@ -327,16 +333,16 @@ impl Database {
         // demoted the hot copy (#459). One `is_empty()` load on the write
         // hot path when nothing is spilling, which is the normal case.
         if !self.spill_inflight_is_empty() {
-            self.spill_inflight_forget(&key);
+            self.spill_inflight_forget(key);
         }
-        let new_cost = entry_overhead(&key, &entry);
+        let new_cost = entry_overhead(key, &entry);
         let has_expiry = entry.has_expiry();
         let new_ttl = entry.expires_at_ms();
         // moon#543: a HashWithTtl value arriving whole (RESTORE, cold
         // promotion, replication apply) must be indexed for the hash-field
         // sweep — one discriminant match on the write path, no allocation
         // for every other value kind.
-        self.hash_expiry_index_note_value(&key, &entry);
+        self.hash_expiry_index_note_value(key, &entry);
         let mut old_cost: usize = 0;
         let mut old_ttl: u64 = 0;
 
@@ -355,11 +361,11 @@ impl Database {
         // a None value. Annotated for the hot-path unwrap ratchet.
         #[allow(clippy::expect_used)]
         let result = self.data.insert_or_update(
-            CompactKey::from(key.as_ref()), // borrow: CompactKey copies the bytes either way
+            CompactKey::from(key), // CompactKey copies the bytes either way
             |existing: &mut Entry| {
                 // Hit path: replace existing entry, bump version.
                 let new_entry = entry_cell.take().expect("update closure called once");
-                old_cost = entry_overhead(&key, existing);
+                old_cost = entry_overhead(key, existing);
                 old_ttl = existing.expires_at_ms();
                 let new_version = Entry::bump_version(existing.version());
                 *existing = new_entry;
@@ -408,7 +414,7 @@ impl Database {
                 // `storage::db::tests::test_second_write_invalidates_cold_shadow`
                 // for the unit-level proof.
                 if let Some(ci) = self.cold_index.as_mut() {
-                    ci.remove(&key);
+                    ci.remove(key);
                 }
             }
             InsertOrUpdate::Inserted(_) => {
@@ -423,10 +429,10 @@ impl Database {
         // `Inserted` arm leaves `old_ttl` at 0, so this covers both paths.
         if old_ttl != new_ttl {
             if old_ttl != 0 {
-                self.expiry_index_remove(old_ttl, &key);
+                self.expiry_index_remove(old_ttl, key);
             }
             if new_ttl != 0 {
-                self.expiry_index_insert(new_ttl, &key);
+                self.expiry_index_insert(new_ttl, key);
             }
         }
     }
@@ -1011,12 +1017,12 @@ impl Database {
     }
 
     /// Convenience: set a string value with no expiry.
-    pub fn set_string(&mut self, key: Bytes, value: Bytes) {
+    pub fn set_string(&mut self, key: &[u8], value: Bytes) {
         self.set(key, Entry::new_string(value));
     }
 
     /// Convenience: set a string value with an expiry (unix millis).
-    pub fn set_string_with_expiry(&mut self, key: Bytes, value: Bytes, expires_at_ms: u64) {
+    pub fn set_string_with_expiry(&mut self, key: &[u8], value: Bytes, expires_at_ms: u64) {
         self.set(key, Entry::new_string_with_expiry(value, expires_at_ms));
     }
 

@@ -335,7 +335,7 @@ fn partition_rdb_into_shards(
         for (key, entry) in db.data().iter() {
             let key_bytes = key.as_bytes();
             let shard_idx = crate::shard::dispatch::key_to_shard(key_bytes, num_shards as usize);
-            shard_dbs[shard_idx][db_idx].set(Bytes::copy_from_slice(key_bytes), entry.clone());
+            shard_dbs[shard_idx][db_idx].set(key_bytes, entry.clone());
             total_partitioned += 1;
         }
     }
@@ -883,7 +883,7 @@ mod tests {
         let keys: Vec<String> = (0..N_KEYS).map(|i| format!("rdb_key:{i}")).collect();
         for key in &keys {
             let entry = Entry::new_string(Bytes::copy_from_slice(format!("val_{key}").as_bytes()));
-            source_db[0].set(Bytes::copy_from_slice(key.as_bytes()), entry);
+            source_db[0].set(key.as_bytes(), entry);
         }
 
         // Serialize to RDB preamble bytes, then write as appendonly.aof.

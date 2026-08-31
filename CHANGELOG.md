@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`Database::set` borrows its key instead of demanding an owned `Bytes`.** Every use of
+  `key` inside `set` was already by reference — `spill_inflight_forget`, `entry_overhead`,
+  `hash_expiry_index_note_value`, `CompactKey::from` (which copies the bytes either way),
+  `ColdIndex::remove`, and both expiry-index writers all take `&[u8]`, and the `Bytes` was
+  never moved anywhere. The owned signature forced a `key.clone()` at each write command:
+  one `shared_v_clone` in and one `shared_v_drop` out, per command, producing nothing.
+  `set`, `set_string` and `set_string_with_expiry` now take `&[u8]`, which removes **32**
+  `Some(k) => k.clone()` key extractions across the string, hash, list, set and sorted-set
+  write families — the ten families Wave 0 measured as losing. It also deletes a real
+  allocation (not just a refcount) from RESTORE, COPY, RENAME, MOVE, the cold-tier promote,
+  WAL v3 replay and replication apply, all of which were building a throwaway
+  `Bytes::copy_from_slice(key)` purely to satisfy the signature. Six call sites genuinely
+  need ownership and keep their clone; the compiler identified them.
+
 - **The monoio local write path no longer clones the whole reply to read one bit.** After
   every local dispatch the handler built `response_frame` by cloning the `DispatchResult`'s
   `Frame`, then used it for exactly one thing — `matches!(response_frame, Frame::Error(_))`

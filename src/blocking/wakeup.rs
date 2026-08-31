@@ -876,7 +876,7 @@ mod dead_waiter_tests {
         let src = Bytes::from_static(b"src");
         let dst = Bytes::from_static(b"dst");
         db.set(
-            dst.clone(),
+            &dst,
             crate::storage::entry::Entry::new_string(Bytes::from_static(b"iam-a-string")),
         );
 

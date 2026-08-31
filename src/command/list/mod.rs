@@ -548,7 +548,7 @@ mod tests {
     #[test]
     fn test_wrongtype_on_string_key() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"mykey"), Bytes::from_static(b"val"));
+        db.set_string(b"mykey", Bytes::from_static(b"val"));
         let result = lpush(&mut db, &[bs(b"mykey"), bs(b"a")]);
         assert!(matches!(result, Frame::Error(ref e) if e.as_ref().starts_with(b"WRONGTYPE")));
     }
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn test_lmove_wrongtype_source() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"str"), Bytes::from_static(b"val"));
+        db.set_string(b"str", Bytes::from_static(b"val"));
         let result = lmove(&mut db, &[bs(b"str"), bs(b"dst"), bs(b"LEFT"), bs(b"LEFT")]);
         assert!(matches!(result, Frame::Error(ref e) if e.as_ref().starts_with(b"WRONGTYPE")));
     }
@@ -618,7 +618,7 @@ mod tests {
     fn test_lmove_wrongtype_destination() {
         let mut db = Database::new();
         setup_list(&mut db, b"src", &[b"a"]);
-        db.set_string(Bytes::from_static(b"str"), Bytes::from_static(b"val"));
+        db.set_string(b"str", Bytes::from_static(b"val"));
         let result = lmove(&mut db, &[bs(b"src"), bs(b"str"), bs(b"LEFT"), bs(b"LEFT")]);
         assert!(matches!(result, Frame::Error(ref e) if e.as_ref().starts_with(b"WRONGTYPE")));
     }

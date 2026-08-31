@@ -964,13 +964,52 @@ mod tests {
     use ordered_float::OrderedFloat;
     use std::collections::{HashSet, VecDeque};
 
+    /// `Database::set` uses its key exclusively by reference: `spill_inflight_forget`,
+    /// `entry_overhead`, `hash_expiry_index_note_value`, `CompactKey::from(key.as_ref())`,
+    /// `ColdIndex::remove`, and both expiry-index writers all take `&[u8]`. The `Bytes`
+    /// was never moved anywhere, so demanding ownership forced every write command in
+    /// `src/command/` into a `key.clone()` — a `shared_v_clone`/`shared_v_drop` pair per
+    /// command that produces nothing.
+    ///
+    /// This pins the borrowing signature. It does not compile against `set(key: Bytes, …)`:
+    /// there is no owned `Bytes` for the key anywhere in scope.
+    #[test]
+    fn set_takes_a_borrowed_key() {
+        let mut db = Database::new();
+        let owned = String::from("borrowed-key");
+        let key: &[u8] = owned.as_bytes();
+
+        db.set(key, Entry::new_string(Bytes::from_static(b"v1")));
+        assert!(matches!(
+            db.get(key).map(|e| e.value.as_redis_value()),
+            Some(RedisValueRef::String(v)) if v == b"v1"
+        ));
+
+        // Overwrite through the `Updated` arm, which is the one that touches
+        // `cold_index` and both expiry-index writers.
+        db.set(
+            key,
+            Entry::new_string_with_expiry(Bytes::from_static(b"v2"), 1),
+        );
+        assert_eq!(db.expires_count(), 1);
+        db.set(key, Entry::new_string(Bytes::from_static(b"v3")));
+        assert_eq!(db.expires_count(), 0);
+        assert!(matches!(
+            db.get(key).map(|e| e.value.as_redis_value()),
+            Some(RedisValueRef::String(v)) if v == b"v3"
+        ));
+
+        // The convenience wrappers borrow too.
+        db.set_string(b"k2", Bytes::from_static(b"v"));
+        db.set_string_with_expiry(b"k3", Bytes::from_static(b"v"), u64::MAX);
+        assert!(db.get(b"k2").is_some());
+        assert!(db.get(b"k3").is_some());
+    }
+
     #[test]
     fn test_set_and_get() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"key1"),
-            Entry::new_string(Bytes::from_static(b"value1")),
-        );
+        db.set(b"key1", Entry::new_string(Bytes::from_static(b"value1")));
         let entry = db.get(b"key1").unwrap();
         match entry.value.as_redis_value() {
             RedisValueRef::String(v) => assert_eq!(v, b"value1"),
@@ -987,10 +1026,7 @@ mod tests {
     #[test]
     fn test_remove_key() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"key1"),
-            Entry::new_string(Bytes::from_static(b"value1")),
-        );
+        db.set(b"key1", Entry::new_string(Bytes::from_static(b"value1")));
         let removed = db.remove(b"key1");
         assert!(removed.is_some());
         assert!(db.get(b"key1").is_none());
@@ -1009,13 +1045,13 @@ mod tests {
         let mut db = Database::new();
         // never-evicted key: no cold_index entry, must survive untouched.
         db.set(
-            Bytes::from_static(b"never_evicted"),
+            b"never_evicted",
             Entry::new_string(Bytes::from_static(b"live_value")),
         );
         // AOF-replay-shadowed key: also present in cold_index (as recovery
         // would have rebuilt it from the manifest before replay ran).
         db.set(
-            Bytes::from_static(b"replayed_shadow"),
+            b"replayed_shadow",
             Entry::new_string(Bytes::from_static(b"same_value_replay_reconstructed")),
         );
         let mut ci = ColdIndex::new();
@@ -1101,10 +1137,7 @@ mod tests {
         // Replay command #1: the ORIGINAL SET whose later eviction produced
         // the cold copy above (v1). First touch since the DashTable was
         // cleared -- ambiguous, left alone.
-        db.set(
-            Bytes::from_static(b"k"),
-            Entry::new_string(Bytes::from_static(b"v1")),
-        );
+        db.set(b"k", Entry::new_string(Bytes::from_static(b"v1")));
         assert!(
             db.cold_index.as_ref().unwrap().lookup(b"k").is_some(),
             "first touch must not disturb the cold shadow (still ambiguous)"
@@ -1114,10 +1147,7 @@ mod tests {
         // that produced the cold copy (still in the AOF -- eviction never
         // deletes AOF records). Second touch -- provably proves the cold
         // copy stale.
-        db.set(
-            Bytes::from_static(b"k"),
-            Entry::new_string(Bytes::from_static(b"v2")),
-        );
+        db.set(b"k", Entry::new_string(Bytes::from_static(b"v2")));
         assert!(
             db.cold_index.as_ref().unwrap().lookup(b"k").is_none(),
             "second touch must invalidate the now-stale cold shadow"
@@ -1149,7 +1179,7 @@ mod tests {
         // Set key with an expiry in the past
         let past_ms = current_time_ms() - 1000;
         db.set(
-            Bytes::from_static(b"expired"),
+            b"expired",
             Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms),
         );
         // moon#542: `get` HIDES the expired key (answers None) but must NOT
@@ -1170,7 +1200,7 @@ mod tests {
         let mut db = Database::new();
         let past_ms = current_time_ms() - 1000;
         db.set(
-            Bytes::from_static(b"expired"),
+            b"expired",
             Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms),
         );
         assert!(!db.exists(b"expired"));
@@ -1179,13 +1209,10 @@ mod tests {
     #[test]
     fn test_len_and_expires_count() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"k1"),
-            Entry::new_string(Bytes::from_static(b"v1")),
-        );
+        db.set(b"k1", Entry::new_string(Bytes::from_static(b"v1")));
         let future_ms = current_time_ms() + 3_600_000;
         db.set(
-            Bytes::from_static(b"k2"),
+            b"k2",
             Entry::new_string_with_expiry(Bytes::from_static(b"v2"), future_ms),
         );
         assert_eq!(db.len(), 2);
@@ -1209,10 +1236,7 @@ mod tests {
     #[test]
     fn test_get_mut() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"key"),
-            Entry::new_string(Bytes::from_static(b"old")),
-        );
+        db.set(b"key", Entry::new_string(Bytes::from_static(b"old")));
         let entry = db.get_mut(b"key").unwrap();
         entry.set_string_value(Bytes::from_static(b"new"));
         let entry = db.get(b"key").unwrap();
@@ -1239,7 +1263,7 @@ mod tests {
     #[test]
     fn test_hash_wrongtype() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+        db.set_string(b"k", Bytes::from_static(b"v"));
         let result = db.get_or_create_hash(b"k");
         assert!(result.is_err());
         let result = db.get_hash(b"k");
@@ -1284,13 +1308,9 @@ mod tests {
     #[test]
     fn test_keys_with_expiry() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        db.set_string(b"k1", Bytes::from_static(b"v1"));
         let future_ms = current_time_ms() + 3_600_000;
-        db.set_string_with_expiry(
-            Bytes::from_static(b"k2"),
-            Bytes::from_static(b"v2"),
-            future_ms,
-        );
+        db.set_string_with_expiry(b"k2", Bytes::from_static(b"v2"), future_ms);
         let keys = db.keys_with_expiry();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].as_ref(), b"k2");
@@ -1301,7 +1321,7 @@ mod tests {
         let mut db = Database::new();
         let past_ms = current_time_ms() - 1000;
         db.set(
-            Bytes::from_static(b"expired"),
+            b"expired",
             Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms),
         );
         assert!(db.is_key_expired(b"expired"));
@@ -1322,25 +1342,25 @@ mod tests {
 
         // set: fresh key with TTL
         db.set(
-            Bytes::from_static(b"a"),
+            b"a",
             Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms),
         );
         assert_eq!(db.expiry_index_len(), 1);
         assert!(db.debug_expiry_index_consistent());
 
         // set: fresh key without TTL
-        db.set_string(Bytes::from_static(b"b"), Bytes::from_static(b"v"));
+        db.set_string(b"b", Bytes::from_static(b"v"));
         assert_eq!(db.expiry_index_len(), 1);
         assert!(db.debug_expiry_index_consistent());
 
         // overwrite: TTL -> no TTL
-        db.set_string(Bytes::from_static(b"a"), Bytes::from_static(b"v2"));
+        db.set_string(b"a", Bytes::from_static(b"v2"));
         assert_eq!(db.expiry_index_len(), 0);
         assert!(db.debug_expiry_index_consistent());
 
         // overwrite: no TTL -> TTL
         db.set(
-            Bytes::from_static(b"b"),
+            b"b",
             Entry::new_string_with_expiry(Bytes::from_static(b"v2"), future_ms),
         );
         assert_eq!(db.expiry_index_len(), 1);
@@ -1348,7 +1368,7 @@ mod tests {
 
         // overwrite: TTL -> different TTL (old pair must go, not linger)
         db.set(
-            Bytes::from_static(b"b"),
+            b"b",
             Entry::new_string_with_expiry(Bytes::from_static(b"v3"), future_ms + 500),
         );
         assert_eq!(db.expiry_index_len(), 1);
@@ -1388,7 +1408,7 @@ mod tests {
 
         // clear
         db.set(
-            Bytes::from_static(b"d"),
+            b"d",
             Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms + 3_600_000),
         );
         db.clear();
@@ -1405,7 +1425,7 @@ mod tests {
         let mut db = Database::new();
         let future_ms = db.now_ms() + 1_000;
         db.set(
-            Bytes::from_static(b"k"),
+            b"k",
             Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms),
         );
         db.set_cached_now_ms_for_test(future_ms + 1);
@@ -1578,7 +1598,7 @@ mod tests {
                 min_expiry_ms: u64::MAX,
             },
         );
-        db.set(Bytes::from_static(b"h"), entry);
+        db.set(b"h", entry);
 
         assert_eq!(
             db.peek_due_hash_expiry(4_000),
@@ -1613,7 +1633,7 @@ mod tests {
                 min_expiry_ms: past,
             },
         );
-        db.set(Bytes::from_static(b"h"), entry);
+        db.set(b"h", entry);
         assert_eq!(db.len(), 1);
         assert!(db.expiry_index_is_empty(), "no whole-key TTL anywhere");
 
@@ -1662,7 +1682,7 @@ mod tests {
     #[test]
     fn test_data_accessor() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+        db.set_string(b"k", Bytes::from_static(b"v"));
         assert_eq!(db.data().len(), 1);
     }
 
@@ -1670,17 +1690,14 @@ mod tests {
     fn test_used_memory_tracking() {
         let mut db = Database::new();
         assert_eq!(db.estimated_memory(), 0);
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"val"));
+        db.set_string(b"key", Bytes::from_static(b"val"));
         assert!(db.estimated_memory() > 0);
         let mem_after_set = db.estimated_memory();
         db.remove(b"key");
         assert_eq!(db.estimated_memory(), 0);
         // Overwrite should not double-count
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"val"));
-        db.set_string(
-            Bytes::from_static(b"key"),
-            Bytes::from_static(b"longer_value"),
-        );
+        db.set_string(b"key", Bytes::from_static(b"val"));
+        db.set_string(b"key", Bytes::from_static(b"longer_value"));
         assert!(db.estimated_memory() > 0);
         // Should not equal 2x the original
         assert_ne!(db.estimated_memory(), mem_after_set * 2);
@@ -1691,11 +1708,11 @@ mod tests {
         let mut db = Database::new();
         // 0 is reserved for "key absent" so WATCH detects creation.
         assert_eq!(db.get_version(b"key"), 0);
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v1"));
+        db.set_string(b"key", Bytes::from_static(b"v1"));
         assert_eq!(db.get_version(b"key"), 1); // first creation draws ticket 1
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v2"));
+        db.set_string(b"key", Bytes::from_static(b"v2"));
         assert_eq!(db.get_version(b"key"), 2); // overwrite bumps
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v3"));
+        db.set_string(b"key", Bytes::from_static(b"v3"));
         assert_eq!(db.get_version(b"key"), 3);
     }
 
@@ -1706,12 +1723,12 @@ mod tests {
     #[test]
     fn test_recreated_key_never_reuses_its_old_version() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v0"));
+        db.set_string(b"k", Bytes::from_static(b"v0"));
         let watched = db.get_version(b"k");
 
         db.remove(b"k");
         assert_eq!(db.get_version(b"k"), 0, "removed key must read as absent");
-        db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v1"));
+        db.set_string(b"k", Bytes::from_static(b"v1"));
 
         assert_ne!(
             db.get_version(b"k"),
@@ -1726,8 +1743,8 @@ mod tests {
     #[test]
     fn test_birth_tickets_are_distinct_across_keys() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"a"), Bytes::from_static(b"v"));
-        db.set_string(Bytes::from_static(b"b"), Bytes::from_static(b"v"));
+        db.set_string(b"a", Bytes::from_static(b"v"));
+        db.set_string(b"b", Bytes::from_static(b"v"));
         assert_ne!(db.get_version(b"a"), db.get_version(b"b"));
     }
 
@@ -1766,7 +1783,7 @@ mod tests {
         let restored = db.get_version(b"restored");
         assert_ne!(restored, 0, "a loaded key must not read as absent");
 
-        db.set_string(Bytes::from_static(b"fresh"), Bytes::from_static(b"v"));
+        db.set_string(b"fresh", Bytes::from_static(b"v"));
         assert_ne!(db.get_version(b"fresh"), restored);
     }
 
@@ -1787,7 +1804,7 @@ mod tests {
     #[test]
     fn test_increment_version() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"v"));
+        db.set_string(b"key", Bytes::from_static(b"v"));
         assert_eq!(db.get_version(b"key"), 1);
         db.increment_version(b"key");
         assert_eq!(db.get_version(b"key"), 2);
@@ -2072,7 +2089,7 @@ mod tests {
     #[test]
     fn test_ref_accessors_wrongtype_on_hot_string() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"s"), Bytes::from_static(b"v"));
+        db.set_string(b"s", Bytes::from_static(b"v"));
         assert!(db.get_hash_ref_if_alive(b"s", 0).is_err());
         assert!(db.get_list_ref_if_alive(b"s", 0).is_err());
         assert!(db.get_set_ref_if_alive(b"s", 0).is_err());
@@ -2099,7 +2116,7 @@ mod tests {
                 min_expiry_ms: 1_000,
             },
         );
-        db.set(Bytes::from_static(b"h"), entry);
+        db.set(b"h", entry);
 
         // now_ms between the two field deadlines: "dead" filtered, "live" seen.
         let href = db.get_hash_ref_if_alive(b"h", 2_000).unwrap().unwrap();
@@ -2375,7 +2392,7 @@ mod tests {
         let k = bytes::Bytes::from_static(b"k");
         db.spill_inflight_mark(k.clone(), pending(1, b"old"));
 
-        db.set(k, Entry::new_string(bytes::Bytes::from_static(b"new")));
+        db.set(&k, Entry::new_string(bytes::Bytes::from_static(b"new")));
 
         assert!(
             !db.spill_inflight_is_newest(b"k", 1),
@@ -2497,10 +2514,7 @@ mod tests {
     #[test]
     fn test_pop_on_wrong_type_leaves_value_intact() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"s"),
-            Entry::new_string(Bytes::from_static(b"v")),
-        );
+        db.set(b"s", Entry::new_string(Bytes::from_static(b"v")));
         assert!(db.list_pop_front(b"s").is_none());
         assert!(db.zset_pop_min(b"s").is_none());
         assert_eq!(db.logical_len(), 1);

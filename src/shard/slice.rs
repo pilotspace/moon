@@ -925,7 +925,7 @@ mod tests {
             join_plane(4);
             let applied = try_foreign_db_write(0, 0, |db| {
                 db.set_string(
-                    bytes::Bytes::from_static(b"d3:k"),
+                    &bytes::Bytes::from_static(b"d3:k"),
                     bytes::Bytes::from_static(b"v"),
                 );
                 db.logical_len()
