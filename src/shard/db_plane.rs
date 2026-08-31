@@ -460,6 +460,13 @@ pub fn set_cross_shard_fast_path(enabled: bool) {
 ///
 /// `on` forces it regardless, so the tokio leg can still be told to set the
 /// flag (and still gets `main.rs`'s no-op warning).
+///
+/// # `num_shards` must be the RESOLVED count
+///
+/// Never `config.shards`, which is `0` for `--shards 0` (auto-detect). Passing
+/// the unresolved value makes `auto` decline on exactly the multi-core hosts
+/// this path exists for, and nothing else would notice. `0` therefore resolves
+/// to `false`, which is the safe direction and is pinned by a test.
 pub fn resolve_cross_shard_fast_path(
     mode: &str,
     num_shards: usize,
@@ -550,6 +557,14 @@ mod tests {
                 "{mode}"
             );
         }
+    }
+
+    /// `--shards 0` is auto-detect and leaves `config.shards == 0`. `main.rs`
+    /// must pass the RESOLVED count; if it ever regresses to `config.shards`,
+    /// `auto` silently disables the fast path on every auto-detect deployment.
+    #[test]
+    fn an_unresolved_shard_count_declines_rather_than_guessing() {
+        assert_eq!(resolve_cross_shard_fast_path("auto", 0, true), Ok(false));
     }
 
     #[test]

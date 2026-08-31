@@ -37,7 +37,15 @@ use common::{Conn, find_moon_binary, server_stderr, spawn_listening_guarded, uni
 /// missing field fails as "never fired" rather than panicking somewhere less
 /// informative.
 fn stat(c: &mut Conn, field: &str) -> u64 {
-    let info = c.send(&["INFO", "stats"]);
+    stat_in(c, "stats", field)
+}
+
+/// The same read against an arbitrary `INFO` section. `num_shards` lives in
+/// `server`, not `stats`, and asking the wrong section returns 0 -- which for
+/// this file reads as "the fast path never fired" rather than "you looked in
+/// the wrong place".
+fn stat_in(c: &mut Conn, section: &str, field: &str) -> u64 {
+    let info = c.send(&["INFO", section]);
     for line in info.lines() {
         let line = line.trim_end_matches('\r');
         if let Some(rest) = line.strip_prefix(field)
@@ -154,5 +162,73 @@ fn the_fast_path_stays_dark_when_the_flag_is_off() {
     assert!(
         stat(&mut c, "total_dispatch_cross_spsc") > 0,
         "with the fast path off, cross-shard reads must still be going somewhere"
+    );
+}
+
+/// The **shipped default**, on the **auto-detected** shard count.
+///
+/// The three tests above all pass `--shards 4` and an explicit flag, so every
+/// one of them stays green if `main.rs` resolves the mode against the wrong
+/// variable. `--shards 0` is the case that does not: `config.shards` is still
+/// `0` there and is only turned into a real count much later, so a resolver
+/// call sited before that point sees `0`, `auto` declines, and the fast path
+/// is silently dead on exactly the multi-core hosts it exists for. Nothing
+/// else in the suite -- or in production -- would report that.
+///
+/// No `--cross-shard-fast-path` argument at all: this asserts the DEFAULT.
+#[test]
+fn the_default_fires_on_an_auto_detected_shard_count() {
+    let dir = unique_test_dir("l4-fastpath-auto");
+    let bin = find_moon_binary();
+    let (_guard, port) = spawn_listening_guarded(|port| {
+        Command::new(&bin)
+            .args([
+                "--port",
+                &port.to_string(),
+                // Auto-detect. NOT "1", NOT "4" -- the unresolved 0 is the point.
+                "--shards",
+                "0",
+                "--dir",
+                dir.to_str().expect("utf8 dir"),
+                "--appendonly",
+                "no",
+            ])
+            .stderr(server_stderr(dir.as_path()))
+            .spawn()
+            .expect("moon spawns")
+    });
+    let mut c = Conn::open(port);
+
+    // A one-shard host has no foreign read to serve, so the counter cannot move
+    // for a reason that has nothing to do with the default. Say so rather than
+    // fail, and rather than pass vacuously.
+    let shards = stat_in(&mut c, "server", "num_shards");
+    assert!(shards > 0, "INFO server did not report num_shards at all");
+    if shards < 2 {
+        eprintln!(
+            "SKIP: auto-detect resolved to {shards} shard(s) on this host; \
+             there is no cross-shard read for the fast path to serve."
+        );
+        return;
+    }
+
+    const N: usize = 200;
+    for i in 0..N {
+        c.send(&["SET", &format!("k:{i}"), &format!("v{i}")]);
+    }
+    let before = stat(&mut c, "total_dispatch_cross_read_fast");
+    for i in 0..N {
+        let reply = c.send(&["GET", &format!("k:{i}")]);
+        assert!(reply.contains(&format!("v{i}")), "GET k:{i} -> {reply:?}");
+    }
+    let after = stat(&mut c, "total_dispatch_cross_read_fast");
+
+    assert!(
+        after > before,
+        "the default did not enable the fast path on an auto-detected \
+         {shards}-shard host: total_dispatch_cross_read_fast stayed at \
+         {before}. Either the default is no longer `auto`, or `main.rs` \
+         resolved it against `config.shards` -- still 0 under `--shards 0` -- \
+         instead of the resolved count."
     );
 }
