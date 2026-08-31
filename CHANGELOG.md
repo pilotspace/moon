@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **First Moon-vs-Redis benchmark since v0.6.0, and it corrects the headline framing.**
+  BENCHMARK.md §2.12 records v0.8.7 measured on both GCE arches (7 interleaved reps, Redis
+  7.0.15 re-measured every rep, 0 failures). Moon wins GET (2.40× x86 / 2.29× ARM) and SET
+  (1.78× / 2.02×) at P=64 and is at parity at p=1 — but **every non-inlined command family
+  (INCR/LPUSH/SPOP/HSET) runs 0.40–0.67× Redis at p≥8**. The boundary is the two-command
+  inline byte path, not the engine: `SET k v` runs 2.08× Redis while `SET k v EX 100` — same
+  work, one disqualifying option — runs 0.87×. §1, the exec-summary table and the README
+  benchmark section now carry that scope. The p=1 `--io-busy-poll-us 40` claim (1.65–1.66×
+  x86) is annotated as requiring **dedicated** cores; on shared-tenant instances it measures
+  1.06–1.08× x86 and within-noise on ARM, because the contention governor self-gates.
+- **§2.13: a 9–21% write-path regression since v0.6.0, in three steps.** A 9-point rebuild
+  sweep across the 326 commits in `v0.6.0..d63ffcd8` shows flat throughput for a month then
+  three separate drops; `git bisect` would have named the first and missed two thirds of the
+  loss. GET is the only read in the grid and the only family that lost nothing. `perf`
+  attributes +5.5 points of per-command cost to the dispatch/intercept region. Four candidate
+  mechanisms were tested and refuted rather than published — the intercept chain *shrank*
+  (28→26 gates), the `cmd_len == 4` guard theory reverses under an INCR-vs-INCRBY probe, the
+  `with_shard_db` fallback is never taken, and `ShardSlice` did not grow. Attribution is
+  bounded by fat LTO absorbing inlined closures into the `with_shard` symbol.
+
 - **The `moon-dev` recreate recipe now works end to end.** `docs/internal/orbstack-linux-parity.md`
   was missing four packages that are each load-bearing (`git`, `python3-redis`, `libicu-dev`,
   `cargo-nextest`) and omitted the GitHub Actions runner entirely — it dies with the VM, and
