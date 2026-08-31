@@ -982,6 +982,19 @@ mod tests {
     fn foreign_write_refuses_rather_than_parking_when_the_db_is_held() {
         std::thread::spawn(|| {
             let registered = join_plane(4);
+            // The registry is a process-wide OnceLock shared with every other
+            // test in this binary, so THIS test's install may have lost and the
+            // db count is whatever the winner chose. Derive the index from the
+            // set that actually exists — a hardcoded index is out of range on
+            // a smaller registry, and `try_read` then returns None for a reason
+            // that has nothing to do with contention.
+            let db_count = registered.db_count();
+            assert!(
+                db_count > 0,
+                "registered set must own at least one database"
+            );
+            let idx = db_count - 1;
+
             // A reader on ANOTHER thread, so this thread's re-entrancy mask is
             // not what does the refusing.
             let held = Arc::clone(registered);
@@ -990,21 +1003,29 @@ mod tests {
             let holder = std::thread::spawn(move || {
                 // try_read, not read: a blocking acquire here would hang this
                 // test whenever any other test in the binary holds this db.
-                let g = held.try_read(1);
+                // Retry briefly — another test holding it is transient, and a
+                // single attempt turns that into a spurious failure.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut g = held.try_read(idx);
+                while g.is_none() && std::time::Instant::now() < deadline {
+                    std::thread::yield_now();
+                    g = held.try_read(idx);
+                }
                 let _ = tx.send(g.is_some());
                 let _ = done_rx.recv();
                 drop(g);
             });
             let acquired = rx
-                .recv_timeout(std::time::Duration::from_secs(5))
+                .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("holder reported back");
             assert!(
                 acquired,
-                "holder could not take the guard; test inconclusive"
+                "holder could not take db {idx} within 5s; another test in this \
+                 binary is holding it far longer than expected"
             );
 
             let started = std::time::Instant::now();
-            let outcome = try_foreign_db_write(0, 1, |_db| true);
+            let outcome = try_foreign_db_write(0, idx, |_db| true);
             let waited = started.elapsed();
 
             let _ = done_tx.send(());
