@@ -739,7 +739,7 @@ the flag off vs on, ABBA-ordered, n=10 reps per cell, server-side CPU/op from
 | `--shards 8`, p=16 | +6.46% | −10.05 … +22.98 | +6.71% | 4/10 | 0.75 | 30.3% |
 
 The `--shards 1` row is the negative control, not a result: every read there is already
-local, so the path fires 0.0% of the time and must show nothing. It doesn't. That is what
+local, so the path fires 0.0% of the time and must show nothing. It does. That is what
 makes the `--shards 8` row credible.
 
 **The default is `off` because of the p=16 row, not because of doubt about p=1.** At depth
