@@ -36,6 +36,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because it reaches `FrameVec::with_capacity` only after `validate_frame` has proved the
   whole frame is present.
 
+- **`benches/resp_parsing.rs` gains the `argc > 4` pair.** `FrameVec` is
+  `Box<SmallVec<[Frame; 4]>>`, so `FrameVec::with_capacity(count)` heap-spills past four
+  elements and a `*5` command pays two allocations where a `*3` pays one. BENCHMARK.md
+  attributes the `SET k v` (2.08x) vs `SET k v EX 100` (0.87x) step to the inline byte
+  path, but a second, independent step sits at exactly that boundary and nothing has
+  separated them. `parse_set_ex_5arg` (`*5`) pairs with the existing `parse_set_single`
+  (`*3`), and `parse_hset_4arg` / `parse_hset_6arg` are the clean control — same command,
+  same work per argument, only argc differs, and the inline path never touches HSET. No
+  numbers: these must be run on a Linux host.
+
 - **INCR/DECR/INCRBY/DECRBY no longer allocate a `String` per operation.** The new value
   was stored as `Entry::new_string(Bytes::from(new_val.to_string()))` — a heap allocation
   on the command hot path, which CLAUDE.md forbids outright — and `CompactValue` then
