@@ -776,7 +776,11 @@ mod tests {
         // Bytes/key at the three fills that actually occur. A split halves a
         // segment, so live segments hold LOAD_THRESHOLD/2 .. LOAD_THRESHOLD
         // keys and the population mean is 3/4 of LOAD_THRESHOLD = 40.5.
-        assert_eq!(seg / LOAD_THRESHOLD, 64, "best case, at the split threshold");
+        assert_eq!(
+            seg / LOAD_THRESHOLD,
+            64,
+            "best case, at the split threshold"
+        );
         assert_eq!(
             seg * 4 / (LOAD_THRESHOLD * 3),
             85,
