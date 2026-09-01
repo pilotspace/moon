@@ -6,6 +6,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **`storage`: an empty `DashTable` no longer reserves 16 segments to hold one.**
+  `SegmentSlab::new` seeded its first slab at 16 segments, so `DashTable::new`
+  allocated `16 x size_of::<Segment<CompactKey, CompactEntry>>()` = **55,296 B to
+  store 3,456 B**. moon builds `--databases` (16) of these **per shard** at boot,
+  all empty, so every shard reserved **884,736 B** for segments that never exist
+  on an idle server — measured with a counting allocator at **84% of all
+  per-shard heap reservation, four times the entire SPSC mesh**. The first slab
+  is now sized to demand: 1 segment for `new()`, exactly `dir_size` for
+  `with_capacity()` (previously that path also rounded up to the fixed slab and
+  fragmented its segments across ~log2 slabs). The existing doubling growth is
+  unchanged, so a table that fills sees the same amortised curve, and slabs are
+  still never reallocated — segment pointers stay stable.
+
+  Measured, structural (allocation sizes; host-independent), for
+  `--appendonly no --disk-offload disable` with default features:
+
+  | per-shard term | before | after |
+  |---|---:|---:|
+  | one empty `Database` | 55,432 B | 3,592 B |
+  | 16 `Database`s (per shard) | 893,976 B | 64,536 B |
+  | `ChannelMesh::new` (unchanged) | 135,984 B | 135,984 B |
+  | **model total per extra shard** | **1,030,432 B** | **200,992 B** |
+
+  **The RSS effect is not claimed here.** Reserved bytes are an upper bound on
+  resident — untouched pages of a fresh mapping never become resident — and moon's
+  idle-RSS numbers must come from Linux, where jemalloc's `background_thread`
+  exists and retention differs. `tests/shard_idle_alloc_attribution.rs` is the
+  regression gate and prints the full attribution.
+
+
 ## [0.8.8] — 2026-09-01
 
 ### Documentation

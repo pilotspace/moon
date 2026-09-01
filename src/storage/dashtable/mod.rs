@@ -93,13 +93,38 @@ struct SegmentSlab<K, V> {
     next_slab_capacity: usize,
 }
 
+/// Largest slab, in segments. Growth doubles up to this and then repeats it.
+const MAX_SLAB_SEGMENTS: usize = 1024;
+
 impl<K, V> SegmentSlab<K, V> {
-    fn new() -> Self {
+    /// A slab store whose FIRST slab holds exactly `first_slab` segments.
+    ///
+    /// Callers that know their segment count up front (`DashTable::with_capacity`)
+    /// pass it and get a single right-sized slab. Callers that do not
+    /// (`DashTable::new`) pass 1 and pay for exactly the one segment they push.
+    ///
+    /// # Why this is not a fixed 16
+    ///
+    /// It was, and that made an EMPTY table reserve 16 slots to hold one
+    /// segment. `size_of::<Segment<CompactKey, CompactEntry>>()` is 3,456 B, so
+    /// an empty `DashTable` reserved 55,296 B to store 3,456 B — and moon
+    /// creates `--databases` (16) of them **per shard** at boot, all empty:
+    /// 884,736 B of reservation per shard, 93.75% of it for segments that
+    /// never exist on an idle server. It was the single largest allocation in
+    /// the whole startup path, four times the size of the entire SPSC mesh.
+    ///
+    /// The doubling below restores the original growth curve by the fifth
+    /// slab, so a table that actually fills sees the same amortised behaviour.
+    fn with_first_slab(first_slab: usize) -> Self {
         SegmentSlab {
             slabs: Vec::new(),
             index_map: Vec::new(),
-            next_slab_capacity: 16,
+            next_slab_capacity: first_slab.clamp(1, MAX_SLAB_SEGMENTS),
         }
+    }
+
+    fn new() -> Self {
+        Self::with_first_slab(1)
     }
 
     /// Add a segment, returning its flat index.
@@ -113,8 +138,8 @@ impl<K, V> SegmentSlab<K, V> {
         if needs_new_slab {
             let cap = self.next_slab_capacity;
             self.slabs.push(Vec::with_capacity(cap));
-            // Double for next time, cap at 1024
-            self.next_slab_capacity = (cap * 2).min(1024);
+            // Double for next time, cap at MAX_SLAB_SEGMENTS
+            self.next_slab_capacity = (cap * 2).min(MAX_SLAB_SEGMENTS);
         }
 
         let slab_idx = self.slabs.len() - 1;
@@ -129,6 +154,15 @@ impl<K, V> SegmentSlab<K, V> {
     #[inline]
     fn len(&self) -> usize {
         self.index_map.len()
+    }
+
+    /// Segment SLOTS reserved across every slab — allocated capacity, not
+    /// occupancy. `reserved() - len()` slots are memory the allocator has
+    /// handed out for segments that do not exist yet, and each slot is a full
+    /// `size_of::<Segment<K, V>>()` (3,456 B for the KV table).
+    #[inline]
+    fn reserved(&self) -> usize {
+        self.slabs.iter().map(Vec::capacity).sum()
     }
 
     #[inline]
@@ -235,7 +269,11 @@ impl<V> DashTable<CompactKey, V> {
         // the data itself and recouped by eliminating all split_segment CPU cost.
         let depth = base_depth + 1;
         let dir_size = 1usize << depth;
-        let mut segments = SegmentSlab::new();
+        // Exactly `dir_size` segments are pushed below, so size the first slab
+        // to hold all of them: one allocation, none spare. Letting the doubling
+        // growth reach `dir_size` instead would both fragment the segments
+        // across ~log2(dir_size) slabs and over-reserve the last one.
+        let mut segments = SegmentSlab::with_first_slab(dir_size);
         let mut directory = Vec::with_capacity(dir_size);
         for i in 0..dir_size {
             segments.push(Segment::new(depth));
@@ -266,6 +304,20 @@ impl<V> DashTable<CompactKey, V> {
     #[inline]
     pub fn segment_count(&self) -> usize {
         self.segments.len()
+    }
+
+    /// Segment slots the slab allocator has **reserved** — including slots no
+    /// segment occupies yet. Every reserved slot costs a full
+    /// `size_of::<Segment<K, V>>()` whether or not it holds a segment, so
+    /// `reserved_segment_slots() - segment_count()` is dead weight carried by
+    /// every table in the process.
+    ///
+    /// Exposed because a `Database` is created 16 times per shard at boot and
+    /// every one of them starts empty: over-reserving here multiplies by
+    /// `16 x shards` before a single key exists.
+    #[inline]
+    pub fn reserved_segment_slots(&self) -> usize {
+        self.segments.reserved()
     }
 
     /// Total number of `split_segment` invocations since construction.
@@ -1032,6 +1084,74 @@ mod tests {
         let table: DashTable<CompactKey, String> = DashTable::with_capacity(1000);
         assert_eq!(table.len(), 0);
         assert!(table.is_empty());
+    }
+
+    /// An EMPTY table must not pre-pay for segments it does not have.
+    ///
+    /// moon boots `--databases 16` tables **per shard**, all empty, so every
+    /// reserved-but-unoccupied segment slot is multiplied by `16 x shards`
+    /// before a single key exists. At `size_of::<Segment<CompactKey,
+    /// CompactEntry>>() == 3,456 B`, the historical 16-slot first slab cost
+    /// 55,296 B per database — 93.75% of it for segments that would never
+    /// exist on an idle server — i.e. ~874 KB per shard.
+    #[test]
+    fn empty_table_does_not_over_reserve_segment_slots() {
+        let table: DashTable<CompactKey, String> = DashTable::new();
+        assert_eq!(table.segment_count(), 1, "an empty table holds one segment");
+        assert!(
+            table.reserved_segment_slots() <= 2,
+            "an empty DashTable reserved {} segment slots for {} live segment(s); \
+             every spare slot is a full Segment of dead weight, charged 16x per shard",
+            table.reserved_segment_slots(),
+            table.segment_count()
+        );
+    }
+
+    /// Pre-sizing must reserve for the segments it actually creates, not round
+    /// up to a fixed slab size. `with_capacity(100)` needs 4 segments; a
+    /// 16-slot first slab reserves four times that.
+    #[test]
+    fn presized_table_does_not_over_reserve_segment_slots() {
+        let table: DashTable<CompactKey, String> = DashTable::with_capacity(100);
+        let live = table.segment_count();
+        assert!(live > 0, "pre-sizing must allocate at least one segment");
+        assert!(
+            table.reserved_segment_slots() <= live * 2,
+            "with_capacity(100) reserved {} segment slots for {live} live segments",
+            table.reserved_segment_slots()
+        );
+    }
+
+    /// Growth must stay pointer-stable: a slab is never reallocated, so a new
+    /// slab is pushed whenever the last one is full. Shrinking the first slab
+    /// must not break that — walk a table well past several slab boundaries
+    /// and confirm every key is still findable.
+    #[test]
+    fn growth_across_slab_boundaries_keeps_every_key() {
+        let mut table: DashTable<CompactKey, u64> = DashTable::new();
+        for i in 0..20_000u64 {
+            table.insert(CompactKey::from(format!("growth:key:{i}")), i);
+        }
+        assert_eq!(table.len(), 20_000);
+        assert!(
+            table.segment_count() > 16,
+            "the fixture must cross several slab boundaries, got {} segments",
+            table.segment_count()
+        );
+        for i in 0..20_000u64 {
+            let key = format!("growth:key:{i}");
+            assert_eq!(
+                table.get(key.as_bytes()),
+                Some(&i),
+                "key {i} lost across slab growth"
+            );
+        }
+        assert!(
+            table.reserved_segment_slots() < table.segment_count() * 2,
+            "growth reserved {} slots for {} segments",
+            table.reserved_segment_slots(),
+            table.segment_count()
+        );
     }
 
     #[test]
