@@ -39,6 +39,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ## [0.8.8] — 2026-09-01
+### Changed
+
+- **Every stored string value above the 12-byte SSO cutoff is 16 bytes/key smaller.**
+  The heap-string wrapper `Box<HeapString>` held a `Vec<u8>` — pointer, capacity and
+  length, 24 bytes. jemalloc's 64-bit small size classes are `8, 16, 32, 48, 64, 80, ...`
+  (verified with `nallocx`): there is no 24-byte class, so every one of those wrappers was
+  billed in the **32-byte** class and 8 bytes of it was pure slack. `HeapString` now holds
+  a `Box<[u8]>` — pointer and length, 16 bytes — landing exactly in the **16-byte** class.
+  The saving is flat, per key, on every value longer than 12 bytes, and it drops the
+  `capacity` field so a value built from an over-allocated buffer can no longer strand its
+  excess for the lifetime of the key. Nothing mutated the buffer's length in place —
+  `as_bytes_mut` had no callers at all and now hands out `&mut [u8]`, which also removes a
+  latent hazard, since `CompactValue::len_and_tag` caches the length beside the pointer and
+  an in-place resize would have desynchronised the two. `estimate_memory` (and through it
+  `used_memory`, the `--maxmemory` gate and per-db quotas) was charging a hardcoded 32 and
+  now reports the wrapper's real size.
+
+  Calibrated against the Linux per-key measurement of 2026-09-01 (moon `--shards 1` 90.9
+  B/key, Redis 7.0.15 103.2 B/key at 1M keys), a 16-byte key with a 64-byte value goes from
+  186.9 to 170.9 bytes/key against Redis's 168.4 — from 11% behind to 1.5% behind. The band
+  it actually flips is 13..128 bytes at the sizes that sit on a jemalloc class boundary
+  (13-16, 32, 45-48, 80, and everything from 128 up), because Redis's `embstr`
+  (`OBJ_ENCODING_EMBSTR_SIZE_LIMIT` 44) packs `robj` and `sds` into ONE rounded allocation
+  where moon pays two. Values just above a boundary (20-24, 40-44) stay 14-15% behind;
+  closing those needs the wrapper removed entirely, which needs `unsafe` and has not been
+  done. Analysis in `tmp/WAVE3_M_MEMORY.md`. Measured on Linux only: jemalloc on macOS
+  lacks `background_thread` and retains freed pages.
 
 ### Documentation
 
