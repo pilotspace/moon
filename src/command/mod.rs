@@ -2137,12 +2137,37 @@ mod tests {
     }
 
     #[test]
-    fn test_object_encoding_set_hashtable() {
+    fn test_object_encoding_set_listpack() {
         let mut db = Database::new();
         let mut selected = 0usize;
-        // SADD with non-integer members should create hashtable
+        // A small non-integer set is a LISTPACK, matching Redis. This
+        // assertion previously demanded `hashtable`, which codified moon#787:
+        // `SetListpack` existed but nothing produced one that survived, and
+        // the test locked the divergence in place. Verified against a redis
+        // 8.6.1 oracle: `SADD myset hello world` reports `listpack`.
         let args = make_args(&[b"myset", b"hello", b"world"]);
         dispatch(&mut db, b"SADD", &args, &mut selected, 16);
+        let args = make_args(&[b"ENCODING", b"myset"]);
+        match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from("listpack")));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_object_encoding_set_hashtable_past_threshold() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        // Past set-max-listpack-entries the set promotes to a hashtable —
+        // this is what keeps the `hashtable` encoding covered now that small
+        // sets are listpacks.
+        for i in 0..=crate::storage::db::LISTPACK_MAX_ENTRIES {
+            let m = format!("m{i:04}");
+            let args = make_args(&[b"myset", m.as_bytes()]);
+            dispatch(&mut db, b"SADD", &args, &mut selected, 16);
+        }
         let args = make_args(&[b"ENCODING", b"myset"]);
         match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
             DispatchResult::Response(f) => {

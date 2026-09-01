@@ -433,6 +433,73 @@ impl Database {
         }
     }
 
+    /// Get or create a set entry as a listpack. Creates new keys as `SetListpack`.
+    ///
+    /// Returns `Ok(Some(&mut Listpack))` when the key is a `SetListpack`,
+    /// `Ok(None)` when it already holds a full `HashSet` or a `SetIntset`
+    /// (the caller falls through to `get_or_create_set` / the intset path),
+    /// and `Err(WRONGTYPE)` for a non-set type.
+    ///
+    /// This is the accessor `SADD` was missing (moon#787). `SetListpack` was
+    /// wired end to end — `Entry::new_set_listpack`, the value codec, and
+    /// `SetKind::classify_hot`'s `SetRef::Listpack` arm all handle it — but
+    /// nothing ever produced one that survived, because `get_or_create_set`
+    /// calls `SetKind::upgrade`, which converts a listpack to a `HashSet`
+    /// unconditionally in the same call. So every string set was a hashtable
+    /// from birth, where Redis keeps one in a listpack up to
+    /// `set-max-listpack-entries` / `set-max-listpack-value`.
+    ///
+    /// Mirrors `get_or_create_hash_listpack` exactly, including the cold-tier
+    /// rule: cold storage never persists a compact encoding, so a promoted
+    /// value always decodes as `RedisValue::Set` and lands in the `Ok(None)`
+    /// arm rather than being fabricated over.
+    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
+    pub fn get_or_create_set_listpack(
+        &mut self,
+        key: &[u8],
+    ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
+        let now_ms = self.cached_now_ms;
+        self.drop_if_expired(key, now_ms);
+        if !self.data.contains_key(key) {
+            self.promote_cold_if_present(key, now_ms);
+            if !self.data.contains_key(key) {
+                let mut entry = Entry::new_set_listpack();
+                // Fresh incarnation: stamp the per-db creation ticket so a
+                // WATCHing client can tell this container from the one that
+                // occupied the key before (see `Database::birth_counter`).
+                entry.set_version(self.next_birth_version());
+                let k = CompactKey::from(key);
+                self.used_memory += entry_overhead(key, &entry);
+                self.data.insert(k, entry);
+            }
+        }
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::SetListpack(lp)) => Ok(Some(lp)),
+            Some(RedisValue::Set(_)) | Some(RedisValue::SetIntset(_)) => Ok(None),
+            _ => Err(Self::wrongtype_error()),
+        }
+    }
+
+    /// Upgrade a `SetListpack` to a full `HashSet`, returning a mutable ref to it.
+    ///
+    /// Infallible for a key that exists and holds a `SetListpack`; a key that
+    /// already holds a `HashSet` is returned unchanged, which is what makes
+    /// this safe to call unconditionally from the promotion branch.
+    #[allow(clippy::unwrap_used)] // caller guarantees key exists and is a set; upgrade is infallible
+    pub fn upgrade_set_listpack_to_set(&mut self, key: &[u8]) -> &mut HashSet<Bytes> {
+        let entry = self.data.get_mut(key).unwrap();
+        if let Some(RedisValue::SetListpack(lp)) = entry.value.as_redis_value_mut() {
+            let set = lp.to_hash_set();
+            *entry.value.as_redis_value_mut().unwrap() = RedisValue::Set(set);
+        }
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::Set(set)) => set,
+            _ => unreachable!("upgrade_set_listpack_to_set: expected Set after upgrade"),
+        }
+    }
+
     /// Get or create a sorted set entry. Returns mutable refs to both inner structures.
     ///
     /// New keys start with SortedSetBPTree encoding. Legacy SortedSet (BTreeMap)
