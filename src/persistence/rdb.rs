@@ -624,15 +624,15 @@ fn read_entry_zero_copy(
                     // decoded ttls map (not stored in the RDB file).
                     let min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
                     RedisValue::HashWithTtl {
-                        fields: map,
-                        ttls,
+                        fields: Box::new(map),
+                        ttls: Box::new(ttls),
                         min_expiry_ms,
                     }
                 } else {
-                    RedisValue::Hash(map)
+                    RedisValue::Hash(Box::new(map))
                 }
             } else {
-                RedisValue::Hash(map)
+                RedisValue::Hash(Box::new(map))
             }
         }
         TYPE_LIST => {
@@ -651,7 +651,7 @@ fn read_entry_zero_copy(
             for _ in 0..count {
                 set.insert(read_bytes(cursor)?);
             }
-            RedisValue::Set(set)
+            RedisValue::Set(Box::new(set))
         }
         TYPE_SORTED_SET => {
             let count = read_u32(cursor)? as usize;
@@ -666,7 +666,10 @@ fn read_entry_zero_copy(
                 members.insert(member.clone(), score);
                 tree.insert(OrderedFloat(score), member);
             }
-            RedisValue::SortedSetBPTree { tree, members }
+            RedisValue::SortedSetBPTree {
+                tree: Box::new(tree),
+                members: Box::new(members),
+            }
         }
         TYPE_STREAM => {
             // Stream parsing: reuse read_bytes (not zero-copy for this rare type)

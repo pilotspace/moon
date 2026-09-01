@@ -837,7 +837,7 @@ pub(crate) fn read_rdb_entry(
             }
             let mut entry = Entry::new_set();
             if let Some(rv) = entry.redis_value_mut() {
-                *rv = RedisValue::Set(set);
+                *rv = RedisValue::Set(Box::new(set));
             }
             entry
         }
@@ -852,7 +852,7 @@ pub(crate) fn read_rdb_entry(
             }
             let mut entry = Entry::new_hash();
             if let Some(rv) = entry.redis_value_mut() {
-                *rv = RedisValue::Hash(map);
+                *rv = RedisValue::Hash(Box::new(map));
             }
             entry
         }
@@ -872,7 +872,10 @@ pub(crate) fn read_rdb_entry(
             }
             let mut entry = Entry::new_sorted_set();
             if let Some(rv) = entry.redis_value_mut() {
-                *rv = RedisValue::SortedSet { members, scores };
+                *rv = RedisValue::SortedSet {
+                    members: Box::new(members),
+                    scores: Box::new(scores),
+                };
             }
             entry
         }
