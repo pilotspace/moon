@@ -41,9 +41,23 @@ const HEAP_TAG_STREAM: usize = 5;
 const HEAP_TAG_MASK: usize = 0x7;
 
 /// Thin wrapper for heap-allocated strings.
-/// At 24 bytes (Vec<u8>), this is smaller than RedisValue::String(Bytes) (~40 bytes)
-/// and avoids the enum discriminant + refcount overhead.
-struct HeapString(Vec<u8>);
+///
+/// Two words — pointer + length — so that the `Box<HeapString>` billed once per
+/// stored value lands exactly in jemalloc's **16-byte** size class. A `Vec<u8>`
+/// here would be three words (24 B) and round up to the **32-byte** class,
+/// costing 16 extra bytes on every key whose value exceeds [`SSO_MAX_LEN`].
+/// jemalloc's 64-bit small classes have no 24-byte entry:
+/// 8, 16, 32, 48, 64, 80, ... (verified with `nallocx`; see the unit test
+/// `heap_string_wrapper_fits_the_16_byte_jemalloc_class`).
+///
+/// Dropping `capacity` also removes a leak vector: a `Vec` built from an
+/// over-allocated buffer used to strand its unused capacity for the whole
+/// lifetime of the key. A boxed slice is always exactly `len` bytes.
+///
+/// The stored string is immutable in place-length terms — every writer
+/// (SET, APPEND, SETRANGE, GETSET) replaces the whole `CompactValue` — so the
+/// growable `Vec` this replaces bought nothing.
+struct HeapString(Box<[u8]>);
 
 /// Borrowed view of a CompactValue, for zero-copy read access.
 pub enum RedisValueRef<'a> {
@@ -238,7 +252,14 @@ impl CompactValue {
         let copy_len = str_len.min(4);
         prefix[..copy_len].copy_from_slice(&data[..copy_len]);
 
-        let hs = Box::new(HeapString(data));
+        // `into_boxed_slice` is a no-op when `capacity == len`, which is the case
+        // for every hot-path caller: `heap_string` copies via `to_vec`, and
+        // `heap_string_owned` goes through `Bytes -> Vec`, which copies into an
+        // exactly-sized buffer whenever the `Bytes` is shared (always true for a
+        // value parsed out of the connection's read buffer). When capacity does
+        // exceed len it reallocates once here, in exchange for not stranding the
+        // excess for the lifetime of the key.
+        let hs = Box::new(HeapString(data.into_boxed_slice()));
         let raw_ptr = Box::into_raw(hs) as usize;
         debug_assert!(
             raw_ptr & HEAP_TAG_MASK == 0,
@@ -382,8 +403,12 @@ impl CompactValue {
 
     /// Get a mutable reference to the heap string bytes.
     /// Returns None for non-string types and inline values.
-    /// Note: returns `Option<&mut Vec<u8>>` for the underlying byte buffer.
-    pub fn as_bytes_mut(&mut self) -> Option<&mut Vec<u8>> {
+    ///
+    /// The slice is fixed-length on purpose: `len_and_tag` caches the string
+    /// length alongside the pointer, so a caller that resized the buffer
+    /// in place would desynchronise the two. Writers that change the length
+    /// replace the whole `CompactValue`.
+    pub fn as_bytes_mut(&mut self) -> Option<&mut [u8]> {
         if self.is_inline() {
             None
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
@@ -472,8 +497,9 @@ impl CompactValue {
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
             // SAFETY: Tag verified as HEAP_TAG_STRING; pointer from Box::into_raw is valid and not freed.
             let hs = unsafe { &*self.heap_string_ptr() };
-            // HeapString overhead: Box(8) + Vec header(24) + data
-            32 + hs.0.len()
+            // One wrapper allocation (`Box<HeapString>`, two words, jemalloc's
+            // 16-byte class) plus the data buffer itself.
+            std::mem::size_of::<HeapString>() + hs.0.len()
         } else {
             // SAFETY: Tag is a collection type; pointer from Box::into_raw is valid and not freed.
             let rv = unsafe { &*self.heap_collection_ptr() };
@@ -547,6 +573,51 @@ mod tests {
     #[test]
     fn test_size_of_compact_value() {
         assert_eq!(std::mem::size_of::<CompactValue>(), 16);
+    }
+
+    /// Every stored string longer than `SSO_MAX_LEN` costs TWO allocations: the
+    /// data buffer, and one `Box<HeapString>` wrapper. The wrapper's size is
+    /// therefore billed once per key, rounded up to a jemalloc size class.
+    ///
+    /// jemalloc's 64-bit small classes, measured directly with `nallocx` on
+    /// aarch64 (identical on x86_64 — the table is a function of `LG_QUANTUM`,
+    /// which is 4 on both), are:
+    ///
+    ///     8, 16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, ...
+    ///
+    /// There is no 24-byte class. A `Vec<u8>` wrapper (ptr + cap + len = 24 B)
+    /// lands in the **32-byte** class and bills 32 bytes per key, 8 of them pure
+    /// slack. A `Box<[u8]>` wrapper (ptr + len = 16 B) lands in the **16-byte**
+    /// class exactly: 16 bytes per key, zero slack.
+    ///
+    /// That is a flat **16 bytes/key** saving on every string value above the
+    /// SSO cutoff, and it also drops the `capacity` field, so a value built from
+    /// an over-capacity `Vec` can no longer strand its excess for the lifetime
+    /// of the key.
+    #[test]
+    fn heap_string_wrapper_fits_the_16_byte_jemalloc_class() {
+        assert_eq!(
+            std::mem::size_of::<HeapString>(),
+            16,
+            "HeapString must be two words (ptr + len) so Box<HeapString> lands \
+             in jemalloc's 16-byte class; 24 bytes would round up to 32"
+        );
+    }
+
+    /// `estimate_memory` feeds `Database::used_memory`, which gates `--maxmemory`
+    /// and per-db quotas. It must bill the wrapper the allocator actually hands
+    /// out, not a stale constant.
+    #[test]
+    fn heap_string_estimate_memory_bills_the_real_wrapper() {
+        let data = vec![b'x'; 64];
+        let cv = CompactValue::heap_string(&data);
+        assert!(!cv.is_inline());
+        assert_eq!(
+            cv.estimate_memory(),
+            std::mem::size_of::<HeapString>() + 64,
+            "per-key charge must track the wrapper's real size"
+        );
+        assert_eq!(cv.estimate_memory(), 80);
     }
 
     #[test]

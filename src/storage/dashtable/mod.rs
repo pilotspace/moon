@@ -736,6 +736,63 @@ mod tests {
         format!("value_{}", n)
     }
 
+    /// Structural cost per stored key, pinned so a layout change cannot silently
+    /// inflate RSS on a 100M-key dataset.
+    ///
+    /// A `Segment<CompactKey, CompactEntry>` is the unit of allocation: one
+    /// cache line of control bytes, 8 bytes of metadata, then `TOTAL_SLOTS`
+    /// key slots and `TOTAL_SLOTS` value slots. Segments live in slab `Vec`s,
+    /// so there is no per-segment allocator rounding — the slab pays it once.
+    ///
+    /// Divide by the achieved fill to get bytes/key:
+    ///   * split at `LOAD_THRESHOLD` (54) leaves a segment holding 27..54 keys,
+    ///     so the population averages ~40.5 -> ~85 bytes/key;
+    ///   * `with_capacity` deliberately over-allocates one depth level, halving
+    ///     the fill to ~27 keys/segment -> ~128 bytes/key.
+    ///
+    /// Redis 7.0.15 for comparison, per key: `dictEntry` 24 B in jemalloc's
+    /// 32-byte class, plus ~12 B of `dictEntry*` bucket array (the table doubles
+    /// at load factor 1.0, so buckets/key averages ~1.5), plus a separately
+    /// allocated key `sds` — which moon does not pay at all for keys <= 23 bytes
+    /// because `CompactKey` inlines them into the slot counted here.
+    #[test]
+    fn segment_structural_cost_per_key_is_pinned() {
+        use crate::storage::entry::CompactEntry;
+
+        let seg = std::mem::size_of::<Segment<CompactKey, CompactEntry>>();
+
+        assert_eq!(std::mem::size_of::<CompactKey>(), 24);
+        assert_eq!(std::mem::size_of::<CompactEntry>(), 32);
+        assert_eq!(TOTAL_SLOTS, 60);
+        assert_eq!(LOAD_THRESHOLD, 54);
+
+        // 64 (ctrl) + 8 (count/depth) + 1 (has_non_home_keys) + padding
+        // + 60*24 (keys) + 60*32 (values), rounded to the 64-byte alignment.
+        assert_eq!(
+            seg, 3456,
+            "Segment layout changed; recompute the per-key memory ledger"
+        );
+
+        // Bytes/key at the three fills that actually occur. A split halves a
+        // segment, so live segments hold LOAD_THRESHOLD/2 .. LOAD_THRESHOLD
+        // keys and the population mean is 3/4 of LOAD_THRESHOLD = 40.5.
+        assert_eq!(
+            seg / LOAD_THRESHOLD,
+            64,
+            "best case, at the split threshold"
+        );
+        assert_eq!(
+            seg * 4 / (LOAD_THRESHOLD * 3),
+            85,
+            "organic fill, ~40.5 keys/segment"
+        );
+        assert_eq!(
+            seg * 2 / LOAD_THRESHOLD,
+            128,
+            "--initial-keyspace-hint: with_capacity adds a depth level, halving fill"
+        );
+    }
+
     #[test]
     fn test_insert_or_update_survives_skewed_double_split() {
         // Keys sharing the top 12 hash bits route to the same segment for
