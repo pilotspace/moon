@@ -8,6 +8,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`storage`: a heap string value is now ONE allocation, of exactly its own
+  length** — the shape Redis reaches with `embstr`. `CompactValue` stored a
+  `Box<HeapString>`, i.e. a *boxed* `Box<[u8]>` fat pointer. That wrapper is 16
+  bytes, lands in jemalloc's 16-byte size class, and was therefore billed in
+  full against **every key** whose value exceeds the 12-byte SSO cutoff. It
+  carried no information the entry did not already have: `CompactValue` has 12
+  bytes of payload, enough for both the pointer and the length. The pointer now
+  addresses the string buffer directly and the length lives in `len_and_tag`
+  (high 28 bits) plus `payload[8..12]` (low 32).
+
+  Measured with `nallocx`, requested bytes -> size class, per stored value:
+
+  | value | before (2 allocs) | after (1 alloc) | saved |
+  |---:|---:|---:|---:|
+  | 13 B | 16 + 16 = 32 | 16 | **-16** |
+  | 24 B | 16 + 32 = 48 | 32 | **-16** |
+  | 40 B | 16 + 48 = 64 | 48 | **-16** |
+  | 64 B | 16 + 64 = 80 | 64 | **-16** |
+  | 96 B | 16 + 96 = 112 | 96 | **-16** |
+
+  Note what an inline `[len: u32][data]` header would have done instead:
+  `class(N+4)` versus `16 + class(N)` saves **nothing** at 13 B (32 vs 32),
+  64 B (80 vs 80) or 96 B (112 vs 112), because the 4-byte header pushes the
+  block into the next class and gives back exactly what it saved. The saving
+  comes from deleting the length, not from relocating it.
+
+  Reads get shorter too: `as_bytes` no longer chases a wrapper allocation on
+  the way to the buffer.
+
+  **Type tag moved out of the pointer.** The tag used to live in the pointer's
+  low 3 bits, which is sound only while every heap payload is a `Box<T>` with
+  `align_of::<T>() >= 8`. A `[u8]` buffer has alignment 1 and carries no spare
+  bits by any language-level guarantee, so the tag now lives in bits 30..28 of
+  `len_and_tag` and the stored pointer is the raw address.
+
+  Unsafe added: 2 blocks (`&*` over a `*mut [u8]`, and `Box::from_raw` to
+  reclaim it), both private, both behind a safe API; `compact_value.rs` goes
+  from 16 unsafe blocks to 9 net, since the dead `as_bytes_mut` accessor (zero
+  callers) and six wrapper dereferences are gone. Verified under Miri (unit
+  tests and the allocation harness) and pinned by
+  `tests/compact_value_one_allocation.rs`, which asserts the allocation count
+  and size directly with a recording global allocator. No on-disk or wire
+  format changes: `CompactValue` is in-memory only and persistence uses only
+  its constructors.
+
 - **`storage`: an empty `DashTable` no longer reserves 16 segments to hold one.**
   `SegmentSlab::new` seeded its first slab at 16 segments, so `DashTable::new`
   allocated `16 x size_of::<Segment<CompactKey, CompactEntry>>()` = **55,296 B to

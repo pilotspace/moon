@@ -1,13 +1,45 @@
-//! CompactValue: 16-byte value representation with Small String Optimization (SSO)
-//! and tagged heap pointers for collection types.
+//! CompactValue: 16-byte value representation with Small String Optimization
+//! (SSO) for short strings and an owned heap pointer for everything else.
 //!
-//! Layout:
-//! - `len_and_tag: u32` -- high nibble encodes type tag, lower 28 bits encode length
-//! - `payload: [u8; 12]` -- inline data (SSO) or prefix + tagged heap pointer
+//! # Layout
 //!
-//! SSO path (strings <= 12 bytes): data stored inline in `payload[0..len]`
-//! Heap path (strings > 12 bytes or collections): `payload[0..4]` = prefix,
-//!   `payload[4..12]` = tagged pointer (raw_ptr | type_tag_in_low_3_bits)
+//! ```text
+//! len_and_tag: u32
+//!   bit 31      HEAP_BIT      1 = heap-allocated, 0 = inline (SSO)
+//!   bits 30..28 heap type tag string / hash / list / set / zset / stream
+//!   bits 27..0  inline: byte length (0..=12)
+//!               heap string: the HIGH 28 bits of the byte length
+//!               collection: 0
+//! payload: [u8; 12]
+//!   inline      bytes 0..len  the string data itself
+//!   heap        bytes 0..8    the raw, UNTAGGED owning pointer
+//!               bytes 8..12   heap string: the LOW 32 bits of the byte length
+//!                             collection: 0
+//! ```
+//!
+//! # One allocation per string, like Redis `embstr`
+//!
+//! A heap string owns **exactly one** allocation, of **exactly `len` bytes** —
+//! the string data and nothing else. There is no wrapper object and no inline
+//! length header, because `CompactValue` already has 12 bytes of payload in
+//! which to keep both the pointer and the length.
+//!
+//! The representation this replaced stored a `Box<HeapString>`, i.e. a boxed
+//! `Box<[u8]>` fat pointer. That is a second allocation of 16 bytes, which
+//! lands in jemalloc's 16-byte size class and is therefore billed in full
+//! against **every key** whose value exceeds [`SSO_MAX_LEN`] — a flat 16 B/key.
+//! An inline `[len: u32][data]` header would not have recovered it: at 13, 64
+//! and 96 bytes the 4-byte header pushes the block into the *next* size class
+//! and gives back exactly the 16 bytes it saved (measured with `nallocx`; see
+//! `tests/compact_value_one_allocation.rs` for the allocation-count harness).
+//!
+//! # Why the type tag is not in the pointer
+//!
+//! The old layout kept the tag in the pointer's low 3 bits. That was sound only
+//! while every heap payload was a `Box<T>` with `align_of::<T>() >= 8`. The
+//! string allocation is a `[u8]`, whose alignment is **1**, so its address
+//! carries no spare bits by any language-level guarantee. The tag therefore
+//! lives in `len_and_tag`, and the stored pointer is the raw address, untagged.
 
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
@@ -22,42 +54,55 @@ use super::stream::Stream as StreamData;
 
 // ---- Constants ----
 
-const HEAP_MARKER: u32 = 0xF0000000; // high nibble = 0xF means heap-allocated
-const TYPE_MASK: u32 = 0xF0000000; // high nibble of len_and_tag
-const LEN_MASK: u32 = 0x0FFFFFFF; // lower 28 bits = length
+/// Bit 31 of `len_and_tag`: set means the payload holds an owning heap pointer.
+const HEAP_BIT: u32 = 0x8000_0000;
+/// Bits 30..28 of `len_and_tag` hold the heap type tag.
+const HEAP_TAG_SHIFT: u32 = 28;
+const HEAP_TAG_BITS: u32 = 0x7;
+/// Bits 27..0 of `len_and_tag`: inline length, or a heap string's high length bits.
+const LEN_MASK: u32 = 0x0FFF_FFFF;
 const SSO_MAX_LEN: usize = 12;
 
-// Inline type tags (high nibble of len_and_tag, for SSO values)
-const TAG_STRING: u32 = 0x00000000; // 0 in high nibble
+// Inline tag bits (bit 31 clear, bits 30..28 zero).
+const TAG_STRING: u32 = 0x0000_0000;
 
-// Heap type tags (low 3 bits of pointer)
-// Tag 0 = raw string stored as Box<[u8]> (NOT Box<RedisValue>!)
-const HEAP_TAG_STRING: usize = 0;
-const HEAP_TAG_HASH: usize = 1;
-const HEAP_TAG_LIST: usize = 2;
-const HEAP_TAG_SET: usize = 3;
-const HEAP_TAG_ZSET: usize = 4;
-const HEAP_TAG_STREAM: usize = 5;
-const HEAP_TAG_MASK: usize = 0x7;
+// Heap type tags, stored in bits 30..28 of `len_and_tag` — never in the pointer.
+// Tag 0 = a raw byte buffer (NOT a Box<RedisValue>!).
+const HEAP_TAG_STRING: u32 = 0;
+const HEAP_TAG_HASH: u32 = 1;
+const HEAP_TAG_LIST: u32 = 2;
+const HEAP_TAG_SET: u32 = 3;
+const HEAP_TAG_ZSET: u32 = 4;
+const HEAP_TAG_STREAM: u32 = 5;
 
-/// Thin wrapper for heap-allocated strings.
+/// Widest heap string this encoding can represent: 28 high bits in
+/// `len_and_tag` plus 32 low bits in the payload = 60 bits, or 1 EiB.
 ///
-/// Two words — pointer + length — so that the `Box<HeapString>` billed once per
-/// stored value lands exactly in jemalloc's **16-byte** size class. A `Vec<u8>`
-/// here would be three words (24 B) and round up to the **32-byte** class,
-/// costing 16 extra bytes on every key whose value exceeds [`SSO_MAX_LEN`].
-/// jemalloc's 64-bit small classes have no 24-byte entry:
-/// 8, 16, 32, 48, 64, 80, ... (verified with `nallocx`; see the unit test
-/// `heap_string_wrapper_fits_the_16_byte_jemalloc_class`).
-///
-/// Dropping `capacity` also removes a leak vector: a `Vec` built from an
-/// over-allocated buffer used to strand its unused capacity for the whole
-/// lifetime of the key. A boxed slice is always exactly `len` bytes.
-///
-/// The stored string is immutable in place-length terms — every writer
-/// (SET, APPEND, SETRANGE, GETSET) replaces the whole `CompactValue` — so the
-/// growable `Vec` this replaces bought nothing.
-struct HeapString(Box<[u8]>);
+/// This is not a policy limit, it is a *structural* one, and it cannot be
+/// reached: the length is read back off a `Box<[u8]>` that was successfully
+/// allocated, and no 64-bit target moon builds for has more than 57 bits of
+/// virtual address space (x86-64 LA57; aarch64 tops out at 52). moon's own
+/// protocol cap is 512 MiB (`protocol::frame::DEFAULT_MAX_BULK_STRING_SIZE`),
+/// eight orders of magnitude below this. A 32-bit-only field would NOT have
+/// been safe: 4 GiB is reachable on real hardware, and a truncated length
+/// would make `Box::from_raw` free the wrong number of bytes.
+const MAX_HEAP_STR_LEN: usize = (1usize << 60) - 1;
+
+// The payload must be able to hold a pointer in its first 8 bytes.
+const _: () = assert!(std::mem::size_of::<usize>() == 8);
+
+/// Split a heap string length into (high bits for `len_and_tag`, low 4 bytes).
+#[inline]
+fn encode_str_len(len: usize) -> (u32, [u8; 4]) {
+    debug_assert!(len <= MAX_HEAP_STR_LEN);
+    (((len >> 32) as u32) & LEN_MASK, (len as u32).to_ne_bytes())
+}
+
+/// Inverse of [`encode_str_len`].
+#[inline]
+fn decode_str_len(len_and_tag: u32, low: [u8; 4]) -> usize {
+    (((len_and_tag & LEN_MASK) as usize) << 32) | u32::from_ne_bytes(low) as usize
+}
 
 /// Borrowed view of a CompactValue, for zero-copy read access.
 pub enum RedisValueRef<'a> {
@@ -136,7 +181,7 @@ impl CompactValue {
     /// Check if the value is stored inline (SSO).
     #[inline]
     pub fn is_inline(&self) -> bool {
-        (self.len_and_tag & TYPE_MASK) != HEAP_MARKER
+        (self.len_and_tag & HEAP_BIT) == 0
     }
 
     /// Return the inline length (only valid for SSO values).
@@ -204,20 +249,32 @@ impl CompactValue {
             RedisValue::String(_) => unreachable!(),
         };
 
-        let boxed = Box::new(value);
-        let raw_ptr = Box::into_raw(boxed) as usize;
-        debug_assert!(
-            raw_ptr & HEAP_TAG_MASK == 0,
-            "Box pointer insufficiently aligned"
-        );
-        let tagged_ptr = raw_ptr | heap_tag;
+        let raw_ptr = Box::into_raw(Box::new(value)).cast::<u8>();
+        // A collection has no length to carry: `RedisValue` knows its own.
+        Self::encode_heap(heap_tag, raw_ptr, 0)
+    }
 
+    /// Assemble the heap representation from its three components.
+    ///
+    /// The single place a `CompactValue` takes ownership of a raw pointer, and
+    /// the only place the tag/length encoding is written. `len` is meaningful
+    /// for [`HEAP_TAG_STRING`] only; every collection passes 0.
+    #[inline]
+    fn encode_heap(tag: u32, ptr: *mut u8, len: usize) -> Self {
+        debug_assert!(tag <= HEAP_TAG_BITS);
+        debug_assert!(!ptr.is_null());
+        let (len_hi, len_lo) = encode_str_len(len);
         let mut payload = [0u8; 12];
-        // No prefix for collections
-        payload[4..12].copy_from_slice(&tagged_ptr.to_ne_bytes());
-
+        // `expose_provenance` is the sanctioned counterpart to the
+        // `with_exposed_provenance_mut` in `heap_ptr`. The address has to make
+        // a round trip through an integer because it is stored *unaligned*, at
+        // byte offset 4 of a 16-byte struct: a real `*mut u8` field would force
+        // the payload to 8-byte alignment and blow `CompactValue` out to 24
+        // bytes, which is the entire point of this type.
+        payload[..8].copy_from_slice(&ptr.expose_provenance().to_ne_bytes());
+        payload[8..].copy_from_slice(&len_lo);
         CompactValue {
-            len_and_tag: HEAP_MARKER,
+            len_and_tag: HEAP_BIT | (tag << HEAP_TAG_SHIFT) | len_hi,
             payload,
         }
     }
@@ -235,8 +292,8 @@ impl CompactValue {
     }
 
     /// Create from an owned Vec<u8> directly — no copy, no refcount.
-    /// This is the fastest path: one Box allocation for the HeapString wrapper.
-    /// Public for RDB loader fast path.
+    /// The fastest path: the `Vec`'s own buffer becomes the value's single
+    /// allocation. Public for the RDB loader fast path.
     pub fn heap_string_vec_direct(data: Vec<u8>) -> Self {
         if data.len() <= SSO_MAX_LEN {
             return Self::inline_string(&data);
@@ -245,13 +302,6 @@ impl CompactValue {
     }
 
     fn heap_string_vec(data: Vec<u8>) -> Self {
-        debug_assert!(data.len() > SSO_MAX_LEN);
-        let str_len = data.len();
-
-        let mut prefix = [0u8; 4];
-        let copy_len = str_len.min(4);
-        prefix[..copy_len].copy_from_slice(&data[..copy_len]);
-
         // `into_boxed_slice` is a no-op when `capacity == len`, which is the case
         // for every hot-path caller: `heap_string` copies via `to_vec`, and
         // `heap_string_owned` goes through `Bytes -> Vec`, which copies into an
@@ -259,58 +309,119 @@ impl CompactValue {
         // value parsed out of the connection's read buffer). When capacity does
         // exceed len it reallocates once here, in exchange for not stranding the
         // excess for the lifetime of the key.
-        let hs = Box::new(HeapString(data.into_boxed_slice()));
-        let raw_ptr = Box::into_raw(hs) as usize;
-        debug_assert!(
-            raw_ptr & HEAP_TAG_MASK == 0,
-            "HeapString pointer insufficiently aligned"
-        );
-        let tagged_ptr = raw_ptr | HEAP_TAG_STRING;
-
-        let mut payload = [0u8; 12];
-        payload[..4].copy_from_slice(&prefix);
-        payload[4..12].copy_from_slice(&tagged_ptr.to_ne_bytes());
-
-        CompactValue {
-            len_and_tag: HEAP_MARKER | ((str_len as u32) & LEN_MASK),
-            payload,
-        }
+        Self::heap_string_boxed(data.into_boxed_slice())
     }
 
-    /// Get the tagged pointer from a heap-allocated value.
+    /// Take ownership of an exactly-sized byte buffer as the value's single
+    /// heap allocation.
+    fn heap_string_boxed(data: Box<[u8]>) -> Self {
+        let len = data.len();
+        debug_assert!(len > SSO_MAX_LEN);
+        // `Box::into_raw` yields a `*mut [u8]`; `cast` drops the length
+        // metadata, which `len_and_tag` + `payload[8..12]` now carry instead.
+        Self::encode_heap(HEAP_TAG_STRING, Box::into_raw(data).cast::<u8>(), len)
+    }
+
+    // ── Reading the heap payload back ─────────────────────────────────────
+    //
+    // Everything below decodes the three fields written by `encode_heap`.
+    // The decoders are safe; only `heap_str` and `take_heap_str` dereference.
+
+    /// The raw owning pointer, exactly as stored — no tag bits to mask off.
     #[inline]
-    #[allow(clippy::unwrap_used)] // payload[4..12] is exactly 8 bytes — try_into::<[u8; 8]> is infallible
-    fn heap_tagged_ptr(&self) -> usize {
+    #[allow(clippy::unwrap_used)] // payload[..8] is exactly 8 bytes — try_into::<[u8; 8]> is infallible
+    fn heap_ptr(&self) -> *mut u8 {
         debug_assert!(!self.is_inline());
-        usize::from_ne_bytes(self.payload[4..12].try_into().unwrap())
-    }
-
-    /// Get the raw (untagged) pointer.
-    /// For strings (tag 0): points to HeapString.
-    /// For collections: points to RedisValue.
-    #[inline]
-    fn heap_raw_usize(&self) -> usize {
-        self.heap_tagged_ptr() & !HEAP_TAG_MASK
+        let addr = usize::from_ne_bytes(self.payload[..8].try_into().unwrap());
+        // Recovers the provenance `encode_heap` exposed for this address. Note
+        // for future reviewers: because the pointer round-trips through an
+        // integer, Miri cannot track its provenance precisely and
+        // `-Zmiri-strict-provenance` will flag this line by design. The
+        // representation this replaced stored the address the same way.
+        std::ptr::with_exposed_provenance_mut::<u8>(addr)
     }
 
     /// Get the raw pointer to a heap RedisValue (collections only — NOT strings).
     #[inline]
     fn heap_collection_ptr(&self) -> *mut RedisValue {
         debug_assert!(self.heap_type_tag() != HEAP_TAG_STRING);
-        self.heap_raw_usize() as *mut RedisValue
+        self.heap_ptr().cast::<RedisValue>()
     }
 
-    /// Get the raw pointer to a HeapString (strings only).
+    /// Byte length of a heap string (only valid for [`HEAP_TAG_STRING`]).
     #[inline]
-    fn heap_string_ptr(&self) -> *mut HeapString {
+    #[allow(clippy::unwrap_used)] // payload[8..12] is exactly 4 bytes — try_into::<[u8; 4]> is infallible
+    fn heap_str_len(&self) -> usize {
         debug_assert!(self.heap_type_tag() == HEAP_TAG_STRING);
-        self.heap_raw_usize() as *mut HeapString
+        decode_str_len(self.len_and_tag, self.payload[8..12].try_into().unwrap())
     }
 
-    /// Get the heap type tag from the low 3 bits.
+    /// Fat pointer to the heap string buffer. Safe to build; not yet a borrow.
     #[inline]
-    fn heap_type_tag(&self) -> usize {
-        self.heap_tagged_ptr() & HEAP_TAG_MASK
+    fn heap_str_raw(&self) -> *mut [u8] {
+        std::ptr::slice_from_raw_parts_mut(self.heap_ptr(), self.heap_str_len())
+    }
+
+    /// Borrow the heap string buffer.
+    ///
+    /// # Where the invariant comes from
+    ///
+    /// The `(tag, pointer, length)` triple is written in exactly one place —
+    /// [`CompactValue::encode_heap`] — and [`HEAP_TAG_STRING`] is passed to it
+    /// from exactly one caller, [`CompactValue::heap_string_boxed`], alongside
+    /// the `Box::into_raw` address of a `Box<[u8]>` and that box's own length.
+    /// `Box::into_raw` guarantees the address is non-null, aligned for `u8`
+    /// (alignment 1) and valid for `len` bytes. No other code path writes
+    /// `len_and_tag` or `payload`, so a `HEAP_TAG_STRING` value always carries
+    /// a consistent triple.
+    ///
+    /// The allocation is released only by [`CompactValue::take_heap_str`],
+    /// which is private and reachable solely from `Drop` and
+    /// `into_redis_value` — both of which consume the value. It therefore
+    /// cannot have been freed while a `&self` borrow exists, and `&self` also
+    /// excludes any concurrent `&mut`, so the returned borrow (whose lifetime
+    /// is tied to `self`) never aliases a mutable one.
+    #[inline]
+    fn heap_str(&self) -> &[u8] {
+        debug_assert!(!self.is_inline() && self.heap_type_tag() == HEAP_TAG_STRING);
+        // SAFETY: per the type invariant above, the tag proves this pointer and
+        // length came from `Box::into_raw(Box<[u8]>)`, the block is unfreed, and
+        // `&self` bars a mutable alias. Otherwise: use-after-free / OOB read.
+        unsafe { &*self.heap_str_raw() }
+    }
+
+    /// Reclaim the heap string buffer, leaving `self` an empty inline string.
+    ///
+    /// # Where the invariant comes from
+    ///
+    /// Same triple as [`CompactValue::heap_str`]: `raw` is the exact
+    /// `Box::into_raw(Box<[u8]>)` pointer/length pair recorded by
+    /// [`CompactValue::heap_string_boxed`], so `Box::from_raw` rebuilds a box
+    /// over precisely the block, size and alignment the global allocator
+    /// handed out.
+    ///
+    /// Uniqueness comes from `&mut self`, which excludes every other
+    /// reference. This function is private and reachable only from `Drop` and
+    /// `into_redis_value`, both of which consume the value; on top of that it
+    /// resets `len_and_tag` to an empty inline string *before* the box
+    /// escapes, so a second call — or a `Drop` running after
+    /// `into_redis_value` — takes the inline branch and frees nothing.
+    #[inline]
+    fn take_heap_str(&mut self) -> Box<[u8]> {
+        debug_assert!(!self.is_inline() && self.heap_type_tag() == HEAP_TAG_STRING);
+        let raw = self.heap_str_raw();
+        self.len_and_tag = TAG_STRING;
+        // SAFETY: per the type invariant above, `raw` is the exact box this
+        // value owns, `&mut self` makes ownership unique, and the reset on the
+        // line above makes a repeat call impossible. Otherwise: double free.
+        unsafe { Box::from_raw(raw) }
+    }
+
+    /// Get the heap type tag out of `len_and_tag` (never out of the pointer).
+    #[inline]
+    fn heap_type_tag(&self) -> u32 {
+        debug_assert!(!self.is_inline());
+        (self.len_and_tag >> HEAP_TAG_SHIFT) & HEAP_TAG_BITS
     }
 
     /// Borrow the underlying RedisValue as a RedisValueRef for zero-copy reads.
@@ -319,11 +430,8 @@ impl CompactValue {
             let len = self.inline_len();
             RedisValueRef::String(&self.payload[..len])
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
-            // String path: HeapString (no RedisValue wrapper)
-            // SAFETY: Tag is HEAP_TAG_STRING, so the pointer was created from Box::into_raw(Box<HeapString>)
-            // and has not been freed. We hold &self so no mutable alias exists.
-            let hs = unsafe { &*self.heap_string_ptr() };
-            RedisValueRef::String(&hs.0)
+            // String path: the buffer itself, no wrapper object.
+            RedisValueRef::String(self.heap_str())
         } else {
             // Collection path: Box<RedisValue>
             // SAFETY: Tag is a collection type, so the pointer was created from Box::into_raw(Box<RedisValue>)
@@ -354,7 +462,7 @@ impl CompactValue {
                 }
                 RedisValue::SortedSetListpack(lp) => RedisValueRef::SortedSetListpack(lp),
                 RedisValue::Stream(s) => RedisValueRef::Stream(s),
-                RedisValue::String(_) => unreachable!("strings use HeapString path"),
+                RedisValue::String(_) => unreachable!("strings use the HEAP_TAG_STRING path"),
             }
         }
     }
@@ -365,16 +473,14 @@ impl CompactValue {
             let len = self.inline_len();
             Some(&self.payload[..len])
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
-            // SAFETY: Tag verified as HEAP_TAG_STRING; pointer from Box::into_raw is valid and not freed.
-            let hs = unsafe { &*self.heap_string_ptr() };
-            Some(&hs.0)
+            Some(self.heap_str())
         } else {
             None
         }
     }
 
     /// Fast path: get string bytes as owned Bytes.
-    /// For heap strings, copies from HeapString (Vec<u8> → Bytes).
+    /// For heap strings, copies out of the value's own buffer.
     /// For inline SSO strings (<=12 bytes), copies from inline buffer.
     /// Returns None for non-string types.
     pub fn as_bytes_owned(&self) -> Option<Bytes> {
@@ -382,9 +488,7 @@ impl CompactValue {
             let len = self.inline_len();
             Some(Bytes::copy_from_slice(&self.payload[..len]))
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
-            // SAFETY: Tag verified as HEAP_TAG_STRING; pointer from Box::into_raw is valid and not freed.
-            let hs = unsafe { &*self.heap_string_ptr() };
-            Some(Bytes::copy_from_slice(&hs.0))
+            Some(Bytes::copy_from_slice(self.heap_str()))
         } else {
             None
         }
@@ -401,29 +505,9 @@ impl CompactValue {
         }
     }
 
-    /// Get a mutable reference to the heap string bytes.
-    /// Returns None for non-string types and inline values.
-    ///
-    /// The slice is fixed-length on purpose: `len_and_tag` caches the string
-    /// length alongside the pointer, so a caller that resized the buffer
-    /// in place would desynchronise the two. Writers that change the length
-    /// replace the whole `CompactValue`.
-    pub fn as_bytes_mut(&mut self) -> Option<&mut [u8]> {
-        if self.is_inline() {
-            None
-        } else if self.heap_type_tag() == HEAP_TAG_STRING {
-            // SAFETY: Tag verified as HEAP_TAG_STRING; pointer from Box::into_raw is valid.
-            // We have &mut self so no other reference exists.
-            let hs = unsafe { &mut *self.heap_string_ptr() };
-            Some(&mut hs.0)
-        } else {
-            None
-        }
-    }
-
     /// Consuming conversion: returns the owned RedisValue.
     /// For inline strings, allocates a new Bytes.
-    /// For heap strings, converts HeapString → Bytes.
+    /// For heap strings, hands the owned buffer straight to `Bytes`.
     /// For collections, reconstructs the Box and extracts the value.
     pub fn into_redis_value(self) -> RedisValue {
         if self.is_inline() {
@@ -432,12 +516,10 @@ impl CompactValue {
             std::mem::forget(self);
             RedisValue::String(data)
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
-            let ptr = self.heap_string_ptr();
-            std::mem::forget(self);
-            // SAFETY: ptr was created from Box::into_raw(Box<HeapString>). We called forget(self)
-            // to prevent double-free, so Box::from_raw reclaims the unique allocation.
-            let hs = unsafe { *Box::from_raw(ptr) };
-            RedisValue::String(Bytes::from(hs.0))
+            // `take_heap_str` leaves `self` an empty inline string, so the
+            // `ManuallyDrop` is belt-and-braces: neither path can double free.
+            let mut me = std::mem::ManuallyDrop::new(self);
+            RedisValue::String(Bytes::from(me.take_heap_str()))
         } else {
             let ptr = self.heap_collection_ptr();
             std::mem::forget(self);
@@ -454,9 +536,7 @@ impl CompactValue {
             let len = self.inline_len();
             RedisValue::String(Bytes::copy_from_slice(&self.payload[..len]))
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
-            // SAFETY: Tag verified as HEAP_TAG_STRING; pointer from Box::into_raw is valid and not freed.
-            let hs = unsafe { &*self.heap_string_ptr() };
-            RedisValue::String(Bytes::from(hs.0.clone()))
+            RedisValue::String(Bytes::copy_from_slice(self.heap_str()))
         } else {
             // SAFETY: Tag is a collection type; pointer from Box::into_raw is valid and not freed.
             let rv = unsafe { &*self.heap_collection_ptr() };
@@ -495,11 +575,9 @@ impl CompactValue {
         if self.is_inline() {
             self.inline_len()
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
-            // SAFETY: Tag verified as HEAP_TAG_STRING; pointer from Box::into_raw is valid and not freed.
-            let hs = unsafe { &*self.heap_string_ptr() };
-            // One wrapper allocation (`Box<HeapString>`, two words, jemalloc's
-            // 16-byte class) plus the data buffer itself.
-            std::mem::size_of::<HeapString>() + hs.0.len()
+            // The value's whole heap footprint: one buffer of exactly `len`
+            // bytes. There is no longer a wrapper allocation to bill.
+            self.heap_str_len()
         } else {
             // SAFETY: Tag is a collection type; pointer from Box::into_raw is valid and not freed.
             let rv = unsafe { &*self.heap_collection_ptr() };
@@ -512,10 +590,7 @@ impl Drop for CompactValue {
     fn drop(&mut self) {
         if !self.is_inline() {
             if self.heap_type_tag() == HEAP_TAG_STRING {
-                // SAFETY: heap strings are Box<HeapString>
-                unsafe {
-                    drop(Box::from_raw(self.heap_string_ptr()));
-                }
+                drop(self.take_heap_str());
             } else {
                 // SAFETY: collections are Box<RedisValue>
                 unsafe {
@@ -534,9 +609,8 @@ impl Clone for CompactValue {
                 payload: self.payload,
             }
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
-            // SAFETY: Tag verified as HEAP_TAG_STRING; pointer from Box::into_raw is valid and not freed.
-            let hs = unsafe { &*self.heap_string_ptr() };
-            Self::heap_string(&hs.0)
+            // Deep copy into a fresh, independently owned buffer.
+            Self::heap_string_boxed(Box::<[u8]>::from(self.heap_str()))
         } else {
             // SAFETY: Tag is a collection type; pointer from Box::into_raw is valid and not freed.
             let rv = unsafe { &*self.heap_collection_ptr() };
@@ -561,8 +635,13 @@ impl fmt::Debug for CompactValue {
     }
 }
 
-// SAFETY: CompactValue is Send/Sync because Box<RedisValue> is Send/Sync
-// and inline values are just plain bytes.
+// SAFETY: the only thing a CompactValue owns beyond plain inline bytes is one
+// heap allocation — a `Box<[u8]>` for strings or a `Box<RedisValue>` for
+// collections — reached through a raw pointer that no other value aliases
+// (`Clone` deep-copies, and the two consuming paths reset the tag). Both boxed
+// types are `Send + Sync`, so moving the value between threads or sharing `&`
+// is exactly as sound as moving or sharing the box would be; the raw pointer
+// alone is what costs us the automatic impls.
 unsafe impl Send for CompactValue {}
 unsafe impl Sync for CompactValue {}
 
@@ -575,9 +654,10 @@ mod tests {
         assert_eq!(std::mem::size_of::<CompactValue>(), 16);
     }
 
-    /// Every stored string longer than `SSO_MAX_LEN` costs TWO allocations: the
-    /// data buffer, and one `Box<HeapString>` wrapper. The wrapper's size is
-    /// therefore billed once per key, rounded up to a jemalloc size class.
+    /// Every stored string longer than `SSO_MAX_LEN` used to cost TWO
+    /// allocations: the data buffer, plus a `Box<HeapString>` wrapper holding
+    /// the `Box<[u8]>` fat pointer. The wrapper is 16 bytes, so it was billed
+    /// once per key against a jemalloc size class.
     ///
     /// jemalloc's 64-bit small classes, measured directly with `nallocx` on
     /// aarch64 (identical on x86_64 — the table is a function of `LG_QUANTUM`,
@@ -585,39 +665,141 @@ mod tests {
     ///
     ///     8, 16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, ...
     ///
-    /// There is no 24-byte class. A `Vec<u8>` wrapper (ptr + cap + len = 24 B)
-    /// lands in the **32-byte** class and bills 32 bytes per key, 8 of them pure
-    /// slack. A `Box<[u8]>` wrapper (ptr + len = 16 B) lands in the **16-byte**
-    /// class exactly: 16 bytes per key, zero slack.
+    /// A 16-byte wrapper lands in the 16-byte class, so it cost a flat
+    /// **16 bytes on every key** above the SSO cutoff. There is now no wrapper
+    /// at all: `CompactValue` keeps the pointer in `payload[0..8]` and the
+    /// length across `len_and_tag` and `payload[8..12]`, so a string value is
+    /// ONE allocation of exactly `len` bytes.
     ///
-    /// That is a flat **16 bytes/key** saving on every string value above the
-    /// SSO cutoff, and it also drops the `capacity` field, so a value built from
-    /// an over-capacity `Vec` can no longer strand its excess for the lifetime
-    /// of the key.
+    /// Note what an inline `[len: u32][data]` header would have done instead:
+    /// `class(N + 4)` against the old `16 + class(N)` is a saving of zero at
+    /// N = 13 (32 vs 32), 64 (80 vs 80) and 96 (112 vs 112) — the header pushes
+    /// the block into the next class and gives back exactly what it saved.
+    ///
+    /// `tests/compact_value_one_allocation.rs` pins the allocation count and
+    /// size directly, with a recording global allocator.
     #[test]
-    fn heap_string_wrapper_fits_the_16_byte_jemalloc_class() {
+    fn heap_string_costs_no_wrapper_allocation() {
+        // The payload must hold an 8-byte pointer and 4 bytes of length, and
+        // the whole value must still be two words.
+        assert_eq!(std::mem::size_of::<CompactValue>(), 16);
+
+        let cv = CompactValue::heap_string(&[b'x'; 64]);
+        assert!(!cv.is_inline());
+        // The stored pointer IS the buffer address: no wrapper indirection,
+        // and no tag bits to mask off.
         assert_eq!(
-            std::mem::size_of::<HeapString>(),
-            16,
-            "HeapString must be two words (ptr + len) so Box<HeapString> lands \
-             in jemalloc's 16-byte class; 24 bytes would round up to 32"
+            cv.heap_ptr() as usize,
+            cv.as_bytes().expect("string").as_ptr() as usize,
+            "the payload pointer must be the data buffer itself"
         );
     }
 
-    /// `estimate_memory` feeds `Database::used_memory`, which gates `--maxmemory`
-    /// and per-db quotas. It must bill the wrapper the allocator actually hands
-    /// out, not a stale constant.
+    /// The type tag must live in `len_and_tag`, not in the pointer's low bits:
+    /// a `[u8]` allocation has alignment 1 and carries no spare bits.
     #[test]
-    fn heap_string_estimate_memory_bills_the_real_wrapper() {
-        let data = vec![b'x'; 64];
-        let cv = CompactValue::heap_string(&data);
+    fn type_tag_lives_in_len_and_tag_not_in_the_pointer() {
+        let cases: [(CompactValue, u32, &str); 5] = [
+            (
+                CompactValue::heap_string(&[b'x'; 40]),
+                HEAP_TAG_STRING,
+                "string",
+            ),
+            (
+                CompactValue::from_redis_value(RedisValue::Hash(HashMap::new())),
+                HEAP_TAG_HASH,
+                "hash",
+            ),
+            (
+                CompactValue::from_redis_value(RedisValue::List(VecDeque::new())),
+                HEAP_TAG_LIST,
+                "list",
+            ),
+            (
+                CompactValue::from_redis_value(RedisValue::Set(HashSet::new())),
+                HEAP_TAG_SET,
+                "set",
+            ),
+            (
+                CompactValue::from_redis_value(RedisValue::SortedSet {
+                    members: HashMap::new(),
+                    scores: BTreeMap::new(),
+                }),
+                HEAP_TAG_ZSET,
+                "zset",
+            ),
+        ];
+        for (cv, tag, name) in cases {
+            assert!(!cv.is_inline(), "{name} must be heap");
+            assert_eq!(cv.heap_type_tag(), tag, "{name} tag");
+            assert_eq!(cv.type_tag(), tag as u8, "{name} public tag");
+            assert_eq!(cv.type_name(), name);
+            // The pointer is stored exactly as the allocator returned it.
+            if tag == HEAP_TAG_STRING {
+                // For a string it IS the data buffer, with no indirection.
+                assert_eq!(
+                    cv.heap_ptr().cast_const(),
+                    cv.as_bytes().expect("string").as_ptr(),
+                    "{name}: stored pointer must be the buffer address"
+                );
+            } else {
+                // For a collection, `Box::into_raw` is 8-aligned. Under the old
+                // scheme a nonzero tag was OR-ed into these very bits; if any
+                // survived here, this alignment check would fail.
+                assert_eq!(
+                    cv.heap_ptr() as usize % std::mem::align_of::<RedisValue>(),
+                    0,
+                    "{name}: pointer must carry no tag bits"
+                );
+            }
+        }
+    }
+
+    /// The 60-bit length codec, exercised without allocating the lengths it
+    /// encodes. 32 bits alone would not have been safe: 4 GiB is reachable on
+    /// real hardware and a truncated length makes `Box::from_raw` free the
+    /// wrong size.
+    #[test]
+    fn heap_string_length_codec_round_trips_past_four_gib() {
+        for len in [
+            0usize,
+            1,
+            12,
+            13,
+            64,
+            u32::MAX as usize - 1,
+            u32::MAX as usize,
+            u32::MAX as usize + 1,
+            (1usize << 40) + 12345,
+            MAX_HEAP_STR_LEN,
+        ] {
+            let (hi, lo) = encode_str_len(len);
+            assert_eq!(
+                hi & !LEN_MASK,
+                0,
+                "{len}: high bits must fit the length field"
+            );
+            // The tag bits are OR-ed in beside `hi`; decoding must ignore them.
+            for tag in 0..=HEAP_TAG_BITS {
+                let word = HEAP_BIT | (tag << HEAP_TAG_SHIFT) | hi;
+                assert_eq!(decode_str_len(word, lo), len, "len={len} tag={tag}");
+                assert_eq!((word >> HEAP_TAG_SHIFT) & HEAP_TAG_BITS, tag);
+            }
+        }
+    }
+
+    /// `estimate_memory` feeds `Database::used_memory`, which gates
+    /// `--maxmemory` and per-db quotas. It must bill what the allocator
+    /// actually hands out — which no longer includes a wrapper.
+    #[test]
+    fn heap_string_estimate_memory_bills_only_the_buffer() {
+        let cv = CompactValue::heap_string(&[b'x'; 64]);
         assert!(!cv.is_inline());
         assert_eq!(
             cv.estimate_memory(),
-            std::mem::size_of::<HeapString>() + 64,
-            "per-key charge must track the wrapper's real size"
+            64,
+            "per-key charge is the buffer alone; the 16-byte wrapper is gone"
         );
-        assert_eq!(cv.estimate_memory(), 80);
     }
 
     #[test]
