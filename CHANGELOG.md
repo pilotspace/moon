@@ -6,6 +6,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **`storage`: `SADD` reaches its listpack encoding -- small string sets stop
+  being hashtables.** `SetListpack` existed as a storage encoding and `SADD`
+  already had an `INTSET` path, but nothing ever *created* a string-set
+  listpack: a small set of non-integer members went straight to `hashtable`.
+  The listpack guard does not live in `OwnedKind::upgrade` (all four impls are
+  unconditional) -- it lives one level up, in a per-type accessor the command
+  layer calls *instead* of the owned accessor, and the set one was missing:
+
+  ```
+  get_or_create_intset            EXISTS   <- SADD, integer members
+  get_or_create_hash_listpack     EXISTS   <- HSET
+  get_or_create_list_listpack     EXISTS   <- RPUSH
+  get_or_create_set_listpack      MISSING
+  ```
+
+  A unit test had pinned the defect **in its own name**
+  (`test_object_encoding_set_hashtable`, asserting *"SADD with non-integer
+  members should create hashtable"*); it is corrected here, with a new test
+  keeping the past-threshold hashtable case covered.
+
+  Measured on GCE `c3-standard-8`, `--shards 1`, fresh server per row, 200k
+  distinct keys, 3 interleaved reps, 60/60 rows valid -- **2.42x less memory per
+  set key**:
+
+  | type | before | after | vs redis 7.4.2 | vs redis 7.0.15 |
+  |---|---:|---:|:--:|:--:|
+  | **set** | 978.2 B/key | **404.5 B/key** | 4.48x -> **1.85x** | 1.96x -> **0.81x WIN** |
+
+  The other four types move by 0.01-0.05% against per-cell CVs of 0.02-1.32%,
+  i.e. they sit inside their own noise floor. Promotion past
+  `LISTPACK_MAX_ENTRIES` (128) or `LISTPACK_MAX_ELEMENT_SIZE` (64) is one-way,
+  matching Redis.
+
 ### Documentation
 
 - **The `moon-dev` recreate recipe now works end to end.** `docs/internal/orbstack-linux-parity.md`
