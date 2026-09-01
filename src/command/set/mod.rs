@@ -635,4 +635,76 @@ mod tests {
             "SPOP must credit the removed member: grown={grown} after={after}"
         );
     }
+
+    // ── #787: SADD must reach the listpack encoding ──────────────────────
+    //
+    // Redis keeps a string set in a listpack until it exceeds
+    // set-max-listpack-entries (128) or set-max-listpack-value (64); moon's
+    // `SetListpack` variant is wired end to end EXCEPT that nothing ever
+    // creates one, because `get_or_create_set` calls `SetKind::upgrade`
+    // unconditionally. Verified against a redis 8.6.1 oracle: `SADD s a b c d e`
+    // reports `listpack` there and `hashtable` here.
+
+    /// Helper: what `OBJECT ENCODING <key>` actually replies — asserted
+    /// through the real command handler, not a private field, so the test
+    /// checks the user-visible answer that diverges from Redis.
+    fn encoding_of(db: &mut Database, key: &[u8]) -> String {
+        match crate::command::key::object(db, &[bs(b"ENCODING"), bs(key)]) {
+            Frame::BulkString(b) => String::from_utf8_lossy(&b).into_owned(),
+            other => panic!("OBJECT ENCODING did not reply a bulk string: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sadd_small_string_set_stays_listpack() {
+        let mut db = Database::new();
+        sadd(
+            &mut db,
+            &[bs(b"s"), bs(b"a"), bs(b"b"), bs(b"c"), bs(b"d"), bs(b"e")],
+        );
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "listpack",
+            "a 5-member string set is far below set-max-listpack-entries (128); \
+             Redis reports `listpack` here"
+        );
+    }
+
+    #[test]
+    fn sadd_promotes_past_the_entry_threshold() {
+        let mut db = Database::new();
+        for i in 0..=crate::storage::db::LISTPACK_MAX_ENTRIES {
+            let m = format!("m{i:04}");
+            sadd(&mut db, &[bs(b"s"), bs(m.as_bytes())]);
+        }
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "hashtable",
+            "past LISTPACK_MAX_ENTRIES the set must promote to a hashtable"
+        );
+    }
+
+    #[test]
+    fn sadd_promotes_on_an_oversized_member() {
+        let mut db = Database::new();
+        let big = vec![b'x'; crate::storage::db::LISTPACK_MAX_ELEMENT_SIZE + 1];
+        sadd(&mut db, &[bs(b"s"), bs(b"small"), bs(&big)]);
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "hashtable",
+            "a member longer than set-max-listpack-value must promote"
+        );
+    }
+
+    #[test]
+    fn listpack_set_answers_reads_identically() {
+        let mut db = Database::new();
+        sadd(&mut db, &[bs(b"s"), bs(b"a"), bs(b"b"), bs(b"c")]);
+        assert_eq!(scard(&mut db, &[bs(b"s")]), Frame::Integer(3));
+        assert_eq!(sismember(&mut db, &[bs(b"s"), bs(b"b")]), Frame::Integer(1));
+        assert_eq!(sismember(&mut db, &[bs(b"s"), bs(b"z")]), Frame::Integer(0));
+        // duplicate insert must still be rejected while in listpack form
+        assert_eq!(sadd(&mut db, &[bs(b"s"), bs(b"a")]), Frame::Integer(0));
+        assert_eq!(scard(&mut db, &[bs(b"s")]), Frame::Integer(3));
+    }
 }

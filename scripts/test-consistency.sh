@@ -512,6 +512,26 @@ log "=== 8. Set operations ==="
 
 both SADD s:test a b c d e
 assert_both "SCARD" SCARD s:test
+
+# OBJECT ENCODING parity for containers (moon#787). moon reported `hashtable`
+# for a small string set from its first member while Redis reports `listpack`:
+# `SetListpack` was wired end to end but no accessor ever produced one that
+# survived. No row here probed encoding, so the divergence went unseen.
+both SADD s:enc:lp a b c
+both SADD s:enc:int 1 2 3
+both HSET h:enc:lp f1 v1 f2 v2
+both RPUSH l:enc:lp a b c
+assert_both "OBJECT ENCODING small string set"  OBJECT ENCODING s:enc:lp
+assert_both "OBJECT ENCODING small int set"     OBJECT ENCODING s:enc:int
+assert_both "OBJECT ENCODING small hash"        OBJECT ENCODING h:enc:lp
+assert_both "OBJECT ENCODING small list"        OBJECT ENCODING l:enc:lp
+# Past set-max-listpack-entries (128) both must report a hashtable.
+# One SADD, not 131 — each `both` spawns two redis-cli processes.
+both SADD s:enc:big $(seq -f 'm%.0f' 0 130)
+assert_both "OBJECT ENCODING set past threshold" OBJECT ENCODING s:enc:big
+# A member longer than set-max-listpack-value (64) forces promotion too.
+both SADD s:enc:bigval short "$(printf 'x%.0s' $(seq 1 65))"
+assert_both "OBJECT ENCODING set oversized member" OBJECT ENCODING s:enc:bigval
 assert_both "SISMEMBER a" SISMEMBER s:test a
 assert_both "SISMEMBER missing" SISMEMBER s:test z
 
