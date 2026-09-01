@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Small sorted sets are listpacks, not skiplists.** `ZADD` reported `skiplist` from its
+  first member where Redis keeps a zset in a listpack up to `zset-max-listpack-entries`
+  (128) / `zset-max-listpack-value` (64). `SortedSetListpack` was wired end to end — the
+  value codec, the RDB and AOF writers, `DEBUG DIGEST`, `MEMORY USAGE`, and the read-only
+  `SortedSetRef::Listpack` arm all handled it — but no accessor ever produced one, so the
+  variant was unreachable at runtime and every zset paid the full B+tree-plus-HashMap cost.
+  `ZADD` now routes through `get_or_create_zset_listpack` below both thresholds and promotes
+  past either, and `SortedSetKind::upgrade` gained the listpack arm that keeps every other
+  zset command correct on a key ZADD created compact. Verified command-by-command against a
+  redis 8.6.1 oracle. **ZADD only:** `ZREM`, `ZINCRBY`, `ZPOPMIN`/`ZPOPMAX` and the store
+  commands still promote to `skiplist`, so a zset touched by a removal reverts — a strict
+  improvement over "always a skiplist", but not full parity. The unit test
+  `test_object_encoding_sorted_set` asserted the divergence and is corrected.
+
 ### Documentation
 
 - **The `moon-dev` recreate recipe now works end to end.** `docs/internal/orbstack-linux-parity.md`

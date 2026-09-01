@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::storage::db::zset_member_cost;
+use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, zset_member_cost};
 
 use crate::command::helpers::{err, err_wrong_args, extract_bytes};
 
@@ -15,6 +15,24 @@ use super::{
 // ---------------------------------------------------------------------------
 // Write commands (mutate the database)
 // ---------------------------------------------------------------------------
+
+/// Parse a ZADD score argument, rejecting non-UTF-8, non-float, and NaN with
+/// the exact error Redis returns.
+///
+/// Shared by ZADD's listpack and B+tree paths so the two encodings cannot
+/// diverge on which score arguments they accept (moon#787).
+fn parse_zadd_score(raw: &[u8]) -> Result<f64, Frame> {
+    let Ok(s) = std::str::from_utf8(raw) else {
+        return Err(err("ERR value is not a valid float"));
+    };
+    let Ok(v) = s.parse::<f64>() else {
+        return Err(err("ERR value is not a valid float"));
+    };
+    if v.is_nan() {
+        return Err(err("ERR value is not a valid float"));
+    }
+    Ok(v)
+}
 
 /// ZADD key [NX|XX] [GT|LT] [CH] score member [score member ...]
 pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
@@ -74,6 +92,125 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("ZADD");
     }
 
+    // Listpack path for small sorted sets (moon#787). Redis keeps a zset in a
+    // listpack until it exceeds zset-max-listpack-entries (128) or
+    // zset-max-listpack-value (64); moon reported `skiplist` from the first
+    // member because no accessor ever produced a surviving
+    // `SortedSetListpack`. Only the MEMBER is measured against the value
+    // threshold — scores are floats and never approach 64 bytes. Verified
+    // against a redis 8.6.1 oracle: a 64-byte member is `listpack`, a 65-byte
+    // member is `skiplist`.
+    let has_large_member = remaining
+        .chunks_exact(2)
+        .any(|pair| extract_bytes(&pair[1]).is_some_and(|m| m.len() > LISTPACK_MAX_ELEMENT_SIZE));
+    if !has_large_member {
+        match db.get_or_create_zset_listpack(key) {
+            Ok(Some(lp)) => {
+                let mut added = 0i64;
+                let mut changed = 0i64;
+                // Listpack `estimate_memory()` is O(1) (capacity-based), so a
+                // before/after snapshot is cheap — no per-member formula.
+                let before = lp.estimate_memory();
+                let mut j = 0;
+                while j < remaining.len() {
+                    let score_bytes = match extract_bytes(&remaining[j]) {
+                        Some(b) => b,
+                        None => return err_wrong_args("ZADD"),
+                    };
+                    let member = match extract_bytes(&remaining[j + 1]) {
+                        Some(b) => b,
+                        None => return err_wrong_args("ZADD"),
+                    };
+                    let score = match parse_zadd_score(score_bytes) {
+                        Ok(s) => s,
+                        Err(e) => return e,
+                    };
+
+                    // Locate the member. A listpack zset is
+                    // `[member, score, member, score, …]`, so pair index `idx`
+                    // puts the member at `2*idx` and its score at `2*idx+1`.
+                    // Bounded by LISTPACK_MAX_ENTRIES, so this stays O(128).
+                    let mut found: Option<(usize, f64)> = None;
+                    for (idx, (m, s)) in lp.iter_pairs().enumerate() {
+                        if m.as_bytes() == member.as_ref() {
+                            found = Some((idx, s.as_score().unwrap_or(0.0)));
+                            break;
+                        }
+                    }
+
+                    let should_update = match found {
+                        None => !xx, // New member: add unless XX
+                        Some((_, old)) => {
+                            if nx {
+                                false // NX: never update existing
+                            } else if gt && lt {
+                                false // GT+LT together: never update
+                            } else if gt {
+                                score > old
+                            } else if lt {
+                                score < old
+                            } else {
+                                true // No flags: always update
+                            }
+                        }
+                    };
+
+                    if should_update {
+                        // Store the canonical rendering, not the raw argument:
+                        // `ZADD z 3.0 m` must answer `ZSCORE` with `3`, and
+                        // `format_score_bytes` is round-trip exact (Rust's
+                        // shortest `{}` for f64), so `as_score` recovers the
+                        // identical f64.
+                        let rendered = format_score_bytes(score);
+                        match found {
+                            Some((idx, old)) => {
+                                lp.replace_at(idx * 2 + 1, &rendered);
+                                if (old - score).abs() > f64::EPSILON {
+                                    changed += 1;
+                                }
+                            }
+                            None => {
+                                lp.push_back(member);
+                                lp.push_back(&rendered);
+                                added += 1;
+                                changed += 1;
+                            }
+                        }
+                    }
+
+                    j += 2;
+                }
+                let after = lp.estimate_memory();
+                // `lp.len()` counts member AND score entries, so the member
+                // count is half of it.
+                let should_upgrade = lp.len() / 2 > LISTPACK_MAX_ENTRIES;
+                // `lp`'s borrow of `db` ends here — safe to call back into
+                // `db` for accounting from this point on.
+                if after >= before {
+                    db.charge_memory(after - before);
+                } else {
+                    db.credit_memory(before - after);
+                }
+                if should_upgrade {
+                    // One-time cost-model swing (listpack -> BPTree + members
+                    // map), the same handoff `hset` and `rpush` perform.
+                    let (members, _tree) = db.upgrade_zset_listpack_to_bptree(key);
+                    let new_cost: usize = members.keys().map(|m| zset_member_cost(m)).sum();
+                    db.credit_memory(after);
+                    db.charge_memory(new_cost);
+                }
+                return if ch {
+                    Frame::Integer(changed)
+                } else {
+                    Frame::Integer(added)
+                };
+            }
+            // Already a full BPTree (or the legacy form): fall through.
+            Ok(None) => {}
+            Err(e) => return e, // WRONGTYPE
+        }
+    }
+
     let (members, scores) = match db.get_or_create_sorted_set(key) {
         Ok(pair) => pair,
         Err(e) => return e,
@@ -99,17 +236,10 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
             None => return err_wrong_args("ZADD"),
         };
 
-        let score_str = match std::str::from_utf8(score_bytes) {
-            Ok(s) => s,
-            Err(_) => return err("ERR value is not a valid float"),
-        };
-        let score: f64 = match score_str.parse() {
+        let score = match parse_zadd_score(score_bytes) {
             Ok(v) => v,
-            Err(_) => return err("ERR value is not a valid float"),
+            Err(e) => return e,
         };
-        if score.is_nan() {
-            return err("ERR value is not a valid float");
-        }
 
         let existing_score = members.get(&member).copied();
 

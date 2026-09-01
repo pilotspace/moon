@@ -47,6 +47,22 @@ impl ListpackEntry {
     pub fn to_bytes(&self) -> Bytes {
         Bytes::from(self.as_bytes())
     }
+
+    /// Interpret this entry as a sorted-set score.
+    ///
+    /// A zset listpack stores `[member, score, member, score, …]` with the
+    /// score as its canonical decimal rendering (`format_score_bytes`), which
+    /// the listpack re-encodes as `Integer` when it is integral. `None` means
+    /// the bytes are not a float at all — in-memory corruption, since the only
+    /// writer is the ZADD listpack path. Callers decide fail-closed vs.
+    /// fail-open; this is the single place the parsing lives so the encode
+    /// side (`format_score_bytes`) has exactly one inverse.
+    pub fn as_score(&self) -> Option<f64> {
+        match self {
+            ListpackEntry::Integer(v) => Some(*v as f64),
+            ListpackEntry::String(s) => std::str::from_utf8(s).ok().and_then(|s| s.parse().ok()),
+        }
+    }
 }
 
 /// Forward iterator over listpack entries.

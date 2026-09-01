@@ -1600,4 +1600,301 @@ mod tests {
             other => panic!("expected syntax error, got {other:?}"),
         }
     }
+
+    // ── #787: ZADD must reach the listpack encoding ───────────────────────
+    //
+    // Redis keeps a sorted set in a listpack until it exceeds
+    // zset-max-listpack-entries (128) or zset-max-listpack-value (64); moon's
+    // `SortedSetListpack` variant is wired end to end EXCEPT that nothing ever
+    // created one, so every zset was a `skiplist` from its first member.
+    // Verified against a redis 8.6.1 oracle:
+    //
+    //     127.0.0.1:7799> zadd z 1 a 2 b 3 c
+    //     (integer) 3
+    //     127.0.0.1:7799> object encoding z
+    //     "listpack"
+
+    /// What `OBJECT ENCODING <key>` actually replies — asserted through the
+    /// real command handler, not a private field, so the test checks the
+    /// user-visible answer that diverged from Redis.
+    fn encoding_of(db: &mut Database, key: &[u8]) -> String {
+        match crate::command::key::object(db, &[bulk(b"ENCODING"), bulk(key)]) {
+            Frame::BulkString(b) => String::from_utf8_lossy(&b).into_owned(),
+            other => panic!("OBJECT ENCODING did not reply a bulk string: {other:?}"),
+        }
+    }
+
+    /// ZSCORE through the shared-read dispatch twin — the one that reaches a
+    /// zset through `get_sorted_set_ref_if_alive`, which classifies every
+    /// encoding instead of forcing the owned one.
+    ///
+    /// The mutable twin `zscore` goes through `get_sorted_set`, whose
+    /// `OwnedKind::upgrade` promotes a listpack to the B+tree form — that is
+    /// the KNOWN LIMITATION of moon#787 (ZADD-only coverage), not a blessed
+    /// behaviour, and it is why these tests read through the twin that keeps
+    /// the encoding. `now_ms = 0` is safe: none of these keys carry a TTL.
+    fn ro_zscore(db: &Database, args: &[&[u8]]) -> Frame {
+        let frames: Vec<Frame> = args.iter().map(|a| bulk(a)).collect();
+        zscore_readonly(db, &frames, 0)
+    }
+
+    #[test]
+    fn zadd_small_zset_stays_listpack() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(
+            encoding_of(&mut db, b"z"),
+            "listpack",
+            "a 3-member zset is far below zset-max-listpack-entries (128); \
+             redis 8.6.1 reports `listpack` here"
+        );
+    }
+
+    #[test]
+    fn zadd_promotes_past_the_entry_threshold() {
+        let mut db = Database::new();
+        for i in 0..=crate::storage::db::LISTPACK_MAX_ENTRIES {
+            let m = format!("m{i:04}");
+            run_zadd(&mut db, &[b"z", b"1", m.as_bytes()]);
+        }
+        assert_eq!(
+            encoding_of(&mut db, b"z"),
+            "skiplist",
+            "past LISTPACK_MAX_ENTRIES the zset must promote to a skiplist"
+        );
+        assert_eq!(
+            run_zcard(&mut db, &[b"z"]),
+            Frame::Integer(crate::storage::db::LISTPACK_MAX_ENTRIES as i64 + 1),
+            "the promotion must not lose a member"
+        );
+    }
+
+    #[test]
+    fn zadd_promotes_on_an_oversized_member() {
+        let mut db = Database::new();
+        let big = vec![b'x'; crate::storage::db::LISTPACK_MAX_ELEMENT_SIZE + 1];
+        run_zadd(&mut db, &[b"z", b"1", b"small", b"2", &big]);
+        assert_eq!(
+            encoding_of(&mut db, b"z"),
+            "skiplist",
+            "a member longer than zset-max-listpack-value must promote"
+        );
+        assert_eq!(run_zcard(&mut db, &[b"z"]), Frame::Integer(2));
+        assert_eq!(
+            run_zscore(&mut db, &[b"z", &big]),
+            Frame::BulkString(Bytes::from_static(b"2"))
+        );
+    }
+
+    #[test]
+    fn listpack_zset_answers_reads_identically() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"z", b"3", b"c", b"1", b"a", b"2", b"b"]);
+        assert_eq!(encoding_of(&mut db, b"z"), "listpack");
+        // Read through the twins that classify every encoding — the mutable
+        // twins would promote to the B+tree form on the FIRST call and leave
+        // the rest of this test measuring a skiplist.
+        assert_eq!(zcard_readonly(&db, &[bulk(b"z")], 0), Frame::Integer(3));
+        assert_eq!(
+            ro_zscore(&db, &[b"z", b"b"]),
+            Frame::BulkString(Bytes::from_static(b"2"))
+        );
+        assert_eq!(ro_zscore(&db, &[b"z", b"zz"]), Frame::Null);
+        // Rank is score order, not insertion order.
+        assert_eq!(
+            zrank_readonly(&db, &[bulk(b"z"), bulk(b"a")], 0),
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            zrank_readonly(&db, &[bulk(b"z"), bulk(b"c")], 0),
+            Frame::Integer(2)
+        );
+        // ZRANGE 0 -1 WITHSCORES, score-ordered — matches the oracle's
+        // `zrange z 0 -1 withscores` => a 1 b 2 c 3.
+        match zrange_readonly(
+            &db,
+            &[bulk(b"z"), bulk(b"0"), bulk(b"-1"), bulk(b"WITHSCORES")],
+            0,
+        ) {
+            Frame::Array(items) => {
+                let got: Vec<Bytes> = items
+                    .iter()
+                    .map(|f| match f {
+                        Frame::BulkString(b) => b.clone(),
+                        other => panic!("expected bulk, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    got,
+                    vec![
+                        Bytes::from_static(b"a"),
+                        Bytes::from_static(b"1"),
+                        Bytes::from_static(b"b"),
+                        Bytes::from_static(b"2"),
+                        Bytes::from_static(b"c"),
+                        Bytes::from_static(b"3"),
+                    ]
+                );
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+        assert_eq!(
+            encoding_of(&mut db, b"z"),
+            "listpack",
+            "reads through the shared-read twins must not change the encoding"
+        );
+    }
+
+    #[test]
+    fn listpack_zset_updates_a_duplicate_member_in_place() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        // A repeated member is an UPDATE, not an insert: ZADD returns 0 added.
+        assert_eq!(run_zadd(&mut db, &[b"z", b"10", b"a"]), Frame::Integer(0));
+        // The update happens IN the listpack — no promotion, matching the
+        // oracle, which still reports `listpack` after `zadd z 10 a`.
+        assert_eq!(encoding_of(&mut db, b"z"), "listpack");
+        assert_eq!(
+            ro_zscore(&db, &[b"z", b"a"]),
+            Frame::BulkString(Bytes::from_static(b"10"))
+        );
+        // Cardinality and rank are unchanged by an in-place update — oracle
+        // `zrange z 0 -1 withscores` => `b 2 c 3 a 10`.
+        assert_eq!(
+            zcard_readonly(&db, &[bulk(b"z")], 0),
+            Frame::Integer(3),
+            "an update must not add a member"
+        );
+        assert_eq!(
+            zrank_readonly(&db, &[bulk(b"z"), bulk(b"a")], 0),
+            Frame::Integer(2),
+            "the new score re-orders `a` to last"
+        );
+        // …and reading did not silently promote it.
+        assert_eq!(encoding_of(&mut db, b"z"), "listpack");
+    }
+
+    #[test]
+    fn listpack_zset_normalises_scores_like_redis() {
+        // Scores round-trip through the listpack as their canonical rendering,
+        // exactly as the BPTree form does. Oracle (redis 8.6.1):
+        //     3.0    -> 3        1e3 -> 1000
+        //     3.5000 -> 3.5      inf -> inf
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"z", b"3.0", b"m"]);
+        run_zadd(&mut db, &[b"z", b"1e3", b"n"]);
+        run_zadd(&mut db, &[b"z", b"3.5000", b"o"]);
+        run_zadd(&mut db, &[b"z", b"inf", b"p"]);
+        run_zadd(&mut db, &[b"z", b"-inf", b"q"]);
+        assert_eq!(encoding_of(&mut db, b"z"), "listpack");
+        for (member, want) in [
+            (&b"m"[..], &b"3"[..]),
+            (b"n", b"1000"),
+            (b"o", b"3.5"),
+            (b"p", b"inf"),
+            (b"q", b"-inf"),
+        ] {
+            assert_eq!(
+                ro_zscore(&db, &[b"z", member]),
+                Frame::BulkString(Bytes::copy_from_slice(want)),
+                "score rendering for member {:?}",
+                String::from_utf8_lossy(member)
+            );
+        }
+        // A score that needs full precision must survive the string round trip.
+        run_zadd(&mut db, &[b"z", b"1.0000000000000002", b"r"]);
+        assert_eq!(
+            ro_zscore(&db, &[b"z", b"r"]),
+            Frame::BulkString(Bytes::from_static(b"1.0000000000000002"))
+        );
+        assert_eq!(encoding_of(&mut db, b"z"), "listpack");
+    }
+
+    #[test]
+    fn listpack_zset_honours_zadd_flags() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"z", b"5", b"a"]);
+        // NX must not overwrite an existing member.
+        assert_eq!(
+            run_zadd(&mut db, &[b"z", b"NX", b"9", b"a"]),
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            ro_zscore(&db, &[b"z", b"a"]),
+            Frame::BulkString(Bytes::from_static(b"5"))
+        );
+        // XX must not create a missing member.
+        assert_eq!(
+            run_zadd(&mut db, &[b"z", b"XX", b"1", b"zz"]),
+            Frame::Integer(0)
+        );
+        assert_eq!(ro_zscore(&db, &[b"z", b"zz"]), Frame::Null);
+        // GT only raises.
+        run_zadd(&mut db, &[b"z", b"GT", b"3", b"a"]);
+        assert_eq!(
+            ro_zscore(&db, &[b"z", b"a"]),
+            Frame::BulkString(Bytes::from_static(b"5"))
+        );
+        run_zadd(&mut db, &[b"z", b"GT", b"7", b"a"]);
+        assert_eq!(
+            ro_zscore(&db, &[b"z", b"a"]),
+            Frame::BulkString(Bytes::from_static(b"7"))
+        );
+        // LT only lowers.
+        run_zadd(&mut db, &[b"z", b"LT", b"9", b"a"]);
+        assert_eq!(
+            ro_zscore(&db, &[b"z", b"a"]),
+            Frame::BulkString(Bytes::from_static(b"7"))
+        );
+        run_zadd(&mut db, &[b"z", b"LT", b"2", b"a"]);
+        assert_eq!(
+            ro_zscore(&db, &[b"z", b"a"]),
+            Frame::BulkString(Bytes::from_static(b"2"))
+        );
+        // CH counts changed, not added.
+        assert_eq!(
+            run_zadd(&mut db, &[b"z", b"CH", b"4", b"a"]),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            run_zadd(&mut db, &[b"z", b"CH", b"4", b"a"]),
+            Frame::Integer(0)
+        );
+        assert_eq!(encoding_of(&mut db, b"z"), "listpack");
+    }
+
+    #[test]
+    fn listpack_zset_upgrades_transparently_on_a_non_zadd_write() {
+        // Every other zset command still goes through the owned accessor,
+        // which upgrades a listpack to the BPTree form in place. The upgrade
+        // must be lossless — this is the safety net that keeps ZREM, ZINCRBY,
+        // ZPOPMIN and friends correct on a key ZADD created as a listpack.
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(encoding_of(&mut db, b"z"), "listpack");
+        assert_eq!(run_zrem(&mut db, &[b"z", b"b"]), Frame::Integer(1));
+        assert_eq!(run_zcard(&mut db, &[b"z"]), Frame::Integer(2));
+        assert_eq!(
+            run_zscore(&mut db, &[b"z", b"c"]),
+            Frame::BulkString(Bytes::from_static(b"3"))
+        );
+        assert_eq!(run_zscore(&mut db, &[b"z", b"b"]), Frame::Null);
+    }
+
+    #[test]
+    fn zadd_listpack_rejects_a_wrong_type_key() {
+        let mut db = Database::new();
+        db.set(
+            Bytes::from_static(b"str"),
+            crate::storage::entry::Entry::new_string(Bytes::from_static(b"v")),
+        );
+        match run_zadd(&mut db, &[b"str", b"1", b"a"]) {
+            Frame::Error(e) => assert!(
+                e.starts_with(b"WRONGTYPE"),
+                "expected WRONGTYPE, got {:?}",
+                String::from_utf8_lossy(&e)
+            ),
+            other => panic!("expected WRONGTYPE error, got {other:?}"),
+        }
+    }
 }
