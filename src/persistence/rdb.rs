@@ -791,6 +791,13 @@ fn read_entry_zero_copy(
         _ => return Err(RdbError::UnsupportedType { type_tag }.into()),
     };
 
+    // Re-derive the compact encoding. `read_entry_zero_copy` is a SECOND,
+    // hand-rolled decoder that builds every container in its full form inline
+    // -- it does not go through `value_codec::decode_value_body`, so hooking
+    // that function alone left this path (the one a restart actually takes,
+    // including the AOF RDB preamble below) still flattening everything.
+    let value = crate::storage::value_codec::compact_after_decode(value);
+
     let mut entry = Entry::new_string(Bytes::new());
     entry.value = crate::storage::compact_value::CompactValue::from_redis_value(value);
     if expires_at_ms > 0 {
@@ -1078,7 +1085,7 @@ pub(crate) fn read_entry(
             } else {
                 HashTtlTrailer::Absent
             };
-            value_codec::decode_value_body(cursor, value_type, trailer).map_err(|e| {
+            value_codec::decode_value_body_compacting(cursor, value_type, trailer).map_err(|e| {
                 MoonError::from(RdbError::Corrupted {
                     detail: e.to_string(),
                 })
@@ -1246,13 +1253,17 @@ mod tests {
         let count = load(&mut loaded, &path).unwrap();
         assert_eq!(count, 1);
         let entry = loaded[0].get(b"myhash").unwrap();
+        // A 2-field hash reloads as a LISTPACK, not a hashtable: decode
+        // re-derives the compact encoding, matching what Redis preserves across
+        // DEBUG RELOAD. The data assertions below are unchanged.
         match entry.value.as_redis_value() {
-            RedisValueRef::Hash(map) => {
+            RedisValueRef::HashListpack(lp) => {
+                let map = lp.to_hash_map();
                 assert_eq!(map.len(), 2);
                 assert_eq!(map.get(&Bytes::from_static(b"f1")).unwrap().as_ref(), b"v1");
                 assert_eq!(map.get(&Bytes::from_static(b"f2")).unwrap().as_ref(), b"v2");
             }
-            _ => panic!("Expected hash"),
+            other => panic!("Expected hash listpack, got {:?}", other.encoding_name()),
         }
     }
 
@@ -1273,14 +1284,17 @@ mod tests {
         let count = load(&mut loaded, &path).unwrap();
         assert_eq!(count, 1);
         let entry = loaded[0].get(b"mylist").unwrap();
+        // A 3-element list reloads as a LISTPACK. Order must survive the
+        // re-derivation, which is exactly what these index assertions check.
         match entry.value.as_redis_value() {
-            RedisValueRef::List(list) => {
+            RedisValueRef::ListListpack(lp) => {
+                let list = lp.to_vec_deque();
                 assert_eq!(list.len(), 3);
                 assert_eq!(list[0].as_ref(), b"a");
                 assert_eq!(list[1].as_ref(), b"b");
                 assert_eq!(list[2].as_ref(), b"c");
             }
-            _ => panic!("Expected list"),
+            other => panic!("Expected list listpack, got {:?}", other.encoding_name()),
         }
     }
 
@@ -1301,14 +1315,17 @@ mod tests {
         let count = load(&mut loaded, &path).unwrap();
         assert_eq!(count, 1);
         let entry = loaded[0].get(b"myset").unwrap();
+        // A 3-member non-integer set reloads as a set LISTPACK (an all-integer
+        // one would reload as an intset).
         match entry.value.as_redis_value() {
-            RedisValueRef::Set(set) => {
+            RedisValueRef::SetListpack(lp) => {
+                let set = lp.to_hash_set();
                 assert_eq!(set.len(), 3);
                 assert!(set.contains(&Bytes::from_static(b"x")));
                 assert!(set.contains(&Bytes::from_static(b"y")));
                 assert!(set.contains(&Bytes::from_static(b"z")));
             }
-            _ => panic!("Expected set"),
+            other => panic!("Expected set listpack, got {:?}", other.encoding_name()),
         }
     }
 

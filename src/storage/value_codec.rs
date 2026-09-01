@@ -346,6 +346,101 @@ fn validate_count(
     Ok(())
 }
 
+/// Re-derive the compact encoding a freshly-decoded value is eligible for.
+///
+/// The wire format deliberately collapses every encoding of a type into a
+/// single [`ValueType`] — `Set | SetListpack | SetIntset` all become
+/// `ValueType::Set`. That is fine going out, because [`encode_value_body`] has
+/// an arm for each compact variant, but it leaves decode with no tag to tell it
+/// which form to rebuild, so it always produced the full one.
+///
+/// The measured consequence was that **a single restart flattened every
+/// container**: hash listpack -> hashtable, list listpack -> linkedlist, set
+/// intset -> hashtable, while redis preserves all three across `DEBUG RELOAD`.
+/// Every container memory figure was therefore a fresh-server best case that no
+/// long-running server ever saw.
+///
+/// This is a decode-side normalisation, **not** a format change: nothing about
+/// the bytes on disk changes, so old files stay readable by new builds and new
+/// files stay readable by old ones.
+///
+/// Thresholds are the ones the command layer already enforces, so a value
+/// reloaded from disk lands in exactly the encoding it would have had if the
+/// same commands had been replayed live.
+pub(crate) fn compact_after_decode(v: RedisValue) -> RedisValue {
+    use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
+
+    /// Maximum intset entries before a set uses a richer encoding. Mirrors
+    /// `INTSET_MAX_ENTRIES` in the set command layer.
+    const INTSET_MAX: usize = 512;
+
+    let fits = |b: &[u8]| b.len() <= LISTPACK_MAX_ELEMENT_SIZE;
+
+    match v {
+        // ── hash ──────────────────────────────────────────────────────────
+        // `HashWithTtl` is deliberately NOT compacted: a listpack carries no
+        // TTL sidecar, so a TTL'd hash has no compact form to return to.
+        RedisValue::Hash(map)
+            if map.len() <= LISTPACK_MAX_ENTRIES
+                && map.iter().all(|(f, val)| fits(f) && fits(val)) =>
+        {
+            let mut lp = crate::storage::listpack::Listpack::new();
+            for (f, val) in &map {
+                lp.push_back(f);
+                lp.push_back(val);
+            }
+            RedisValue::HashListpack(lp)
+        }
+
+        // ── list ──────────────────────────────────────────────────────────
+        // A list is ORDERED, so iterate the deque in order — unlike hash and
+        // set, where the source container's iteration order is arbitrary and
+        // the resulting listpack order is likewise unspecified (as it already
+        // is for those types today).
+        RedisValue::List(list)
+            if list.len() <= LISTPACK_MAX_ENTRIES && list.iter().all(|e| fits(e)) =>
+        {
+            let mut lp = crate::storage::listpack::Listpack::new();
+            for e in &list {
+                lp.push_back(e);
+            }
+            RedisValue::ListListpack(lp)
+        }
+
+        // ── set ───────────────────────────────────────────────────────────
+        // Integers first, matching the command layer's precedence: an
+        // all-integer set is an intset regardless of how few members it has.
+        RedisValue::Set(set) => {
+            let all_ints: Option<Vec<i64>> = if set.len() <= INTSET_MAX {
+                set.iter()
+                    .map(|m| std::str::from_utf8(m).ok()?.parse::<i64>().ok())
+                    .collect()
+            } else {
+                None
+            };
+            if let Some(ints) = all_ints {
+                let mut is = crate::storage::intset::Intset::new();
+                for i in ints {
+                    is.insert(i);
+                }
+                return RedisValue::SetIntset(is);
+            }
+            if set.len() <= LISTPACK_MAX_ENTRIES && set.iter().all(|m| fits(m)) {
+                let mut lp = crate::storage::listpack::Listpack::new();
+                for m in &set {
+                    lp.push_back(m);
+                }
+                return RedisValue::SetListpack(lp);
+            }
+            RedisValue::Set(set)
+        }
+
+        // Everything else — including zsets, which have no reachable compact
+        // encoding yet (moon#787) — passes through untouched.
+        other => other,
+    }
+}
+
 /// Decode a collection body of logical type `value_type` from `cursor`.
 ///
 /// The cursor is left positioned at the first byte after the body, so RDB
@@ -354,6 +449,27 @@ fn validate_count(
 /// Hashes decode to `Hash` or `HashWithTtl` depending on the TTL trailer —
 /// see [`HashTtlTrailer`] for per-container trailer semantics. Sorted sets
 /// always decode to `SortedSetBPTree` (the canonical full-size form).
+/// Decode, then re-derive the compact encoding — the **restart** path.
+///
+/// Use this wherever a value is being loaded back into the hot keyspace after
+/// a restart. Without it, reload flattens every container (measured: hash
+/// listpack -> hashtable, list listpack -> linkedlist, set intset ->
+/// hashtable) while redis preserves all three across `DEBUG RELOAD`.
+///
+/// **Deliberately NOT used by the cold/spill path.** `ValueKind::classify_cold`
+/// accepts only the canonical full forms — a cold-decoded `SetListpack` would
+/// fall through its `_ => Err(WrongType)` arm and answer WRONGTYPE for a
+/// perfectly valid set. Compacting the cold tier is a worthwhile follow-up but
+/// needs `classify_cold` widened first, so it is not bundled here.
+pub fn decode_value_body_compacting(
+    cursor: &mut Cursor<&[u8]>,
+    value_type: ValueType,
+    trailer: HashTtlTrailer,
+) -> Result<RedisValue, ValueCodecError> {
+    decode_value_body(cursor, value_type, trailer).map(compact_after_decode)
+}
+
+/// Decode the canonical full-size form, exactly as the bytes describe it.
 pub fn decode_value_body(
     cursor: &mut Cursor<&[u8]>,
     value_type: ValueType,
@@ -534,9 +650,22 @@ mod tests {
     use super::*;
     use crate::storage::listpack::Listpack;
 
+    /// Decode WITHOUT the compact-encoding re-derivation.
+    ///
+    /// The golden tests below pin the wire FORMAT, so they must observe the
+    /// canonical full form the bytes literally describe. Routing them through
+    /// the public decoder would make a change to the compaction thresholds
+    /// look like format drift, which is the one thing those tests exist to
+    /// catch. Use `decode_compacted` for the production path.
     fn decode(data: &[u8], vt: ValueType, trailer: HashTtlTrailer) -> RedisValue {
         let mut cursor = Cursor::new(data);
         decode_value_body(&mut cursor, vt, trailer).expect("decode")
+    }
+
+    /// Decode exactly as production does — this is what a restart runs.
+    fn decode_compacted(data: &[u8], vt: ValueType, trailer: HashTtlTrailer) -> RedisValue {
+        let mut cursor = Cursor::new(data);
+        decode_value_body_compacting(&mut cursor, vt, trailer).expect("decode")
     }
 
     /// Independent byte-level spec builders. These reconstruct the wire
@@ -794,7 +923,8 @@ mod tests {
             RedisValue::Hash(m) => assert_eq!(m.len(), 1),
             other => panic!("expected Hash, got {other:?}"),
         }
-        // Required (RDB v2): truncation is corruption.
+        // Required (RDB v2): truncation is corruption. Raw decoder — this
+        // pins trailer/cursor FORMAT behaviour, not encoding selection.
         let mut cursor = Cursor::new(blob.as_slice());
         assert!(decode_value_body(&mut cursor, ValueType::Hash, HashTtlTrailer::Required).is_err());
         // Absent (RDB v1): trailer bytes are not consumed at all.
@@ -882,5 +1012,156 @@ mod tests {
             RedisValue::SortedSetBPTree { members: m, .. } => assert_eq!(m, members),
             other => panic!("expected SortedSetBPTree, got {other:?}"),
         }
+    }
+
+    // ── Restart must not flatten compact encodings ───────────────────────
+    //
+    // The wire format collapses every encoding of a type into ONE `ValueType`
+    // (`Set | SetListpack | SetIntset -> ValueType::Set`), so decode has no tag
+    // to tell it which form to rebuild and historically always produced the
+    // full one. Measured consequence: after a single restart a hash went
+    // listpack -> hashtable, a list listpack -> linkedlist, and a set
+    // intset -> hashtable, while redis 8.6.1 preserves all three across
+    // DEBUG RELOAD. That made every container memory number a fresh-server
+    // best case. These tests pin the re-derivation.
+
+    fn round_trip(v: &RedisValueRef) -> RedisValue {
+        let mut buf = Vec::new();
+        encode_value_body(v, &mut buf).expect("encode");
+        decode_compacted(&buf, value_type_of(v), HashTtlTrailer::Absent)
+    }
+
+    #[test]
+    fn small_hash_round_trips_back_to_listpack() {
+        let mut map = std::collections::HashMap::new();
+        for i in 0..5 {
+            map.insert(Bytes::from(format!("f{i}")), Bytes::from(format!("v{i}")));
+        }
+        let out = round_trip(&RedisValueRef::Hash(&map));
+        assert_eq!(
+            out.encoding_name(),
+            "listpack",
+            "a 5-field hash must come back as a listpack, not a hashtable"
+        );
+        // and the CONTENTS must survive the re-encoding
+        match &out {
+            RedisValue::HashListpack(lp) => {
+                let got: std::collections::HashMap<Vec<u8>, Vec<u8>> = lp
+                    .iter_pairs()
+                    .map(|(f, v)| (f.as_bytes().to_vec(), v.as_bytes().to_vec()))
+                    .collect();
+                assert_eq!(got.len(), 5, "all five fields must survive");
+                for (k, v) in &map {
+                    assert_eq!(
+                        got.get(k.as_ref()).map(|x| x.as_slice()),
+                        Some(v.as_ref()),
+                        "field {k:?} must round-trip with its value"
+                    );
+                }
+            }
+            other => panic!("expected HashListpack, got {}", other.encoding_name()),
+        }
+    }
+
+    #[test]
+    fn small_list_round_trips_back_to_listpack_in_order() {
+        let list: std::collections::VecDeque<Bytes> =
+            (0..5).map(|i| Bytes::from(format!("e{i}"))).collect();
+        let out = round_trip(&RedisValueRef::List(&list));
+        assert_eq!(out.encoding_name(), "listpack");
+        match &out {
+            RedisValue::ListListpack(lp) => {
+                let got: Vec<Vec<u8>> = lp.iter().map(|e| e.as_bytes().to_vec()).collect();
+                let want: Vec<Vec<u8>> = list.iter().map(|e| e.to_vec()).collect();
+                // a list is ORDERED — unlike hash/set this must match exactly
+                assert_eq!(got, want, "list order must survive the round trip");
+            }
+            other => panic!("expected ListListpack, got {}", other.encoding_name()),
+        }
+    }
+
+    #[test]
+    fn small_string_set_round_trips_back_to_listpack() {
+        let set: std::collections::HashSet<Bytes> =
+            (0..5).map(|i| Bytes::from(format!("m{i}"))).collect();
+        let out = round_trip(&RedisValueRef::Set(&set));
+        assert_eq!(out.encoding_name(), "listpack");
+        match &out {
+            RedisValue::SetListpack(lp) => {
+                let got: std::collections::HashSet<Vec<u8>> =
+                    lp.iter().map(|e| e.as_bytes().to_vec()).collect();
+                let want: std::collections::HashSet<Vec<u8>> =
+                    set.iter().map(|e| e.to_vec()).collect();
+                assert_eq!(got, want, "all members must survive");
+            }
+            other => panic!("expected SetListpack, got {}", other.encoding_name()),
+        }
+    }
+
+    #[test]
+    fn all_integer_set_round_trips_back_to_intset() {
+        let set: std::collections::HashSet<Bytes> =
+            (0..5).map(|i| Bytes::from(format!("{i}"))).collect();
+        let out = round_trip(&RedisValueRef::Set(&set));
+        assert_eq!(
+            out.encoding_name(),
+            "intset",
+            "an all-integer set must come back as an intset, matching redis"
+        );
+    }
+
+    // ── the guards: these must NOT over-compact ──────────────────────────
+
+    #[test]
+    fn hash_past_the_entry_threshold_stays_a_hashtable() {
+        let mut map = std::collections::HashMap::new();
+        for i in 0..=crate::storage::db::LISTPACK_MAX_ENTRIES {
+            map.insert(Bytes::from(format!("f{i:04}")), Bytes::from_static(b"v"));
+        }
+        assert_eq!(
+            round_trip(&RedisValueRef::Hash(&map)).encoding_name(),
+            "hashtable"
+        );
+    }
+
+    #[test]
+    fn hash_with_an_oversized_element_stays_a_hashtable() {
+        let big = Bytes::from(vec![
+            b'x';
+            crate::storage::db::LISTPACK_MAX_ELEMENT_SIZE + 1
+        ]);
+        let mut map = std::collections::HashMap::new();
+        map.insert(Bytes::from_static(b"f"), big);
+        assert_eq!(
+            round_trip(&RedisValueRef::Hash(&map)).encoding_name(),
+            "hashtable"
+        );
+    }
+
+    #[test]
+    fn list_past_the_entry_threshold_stays_a_linkedlist() {
+        let list: std::collections::VecDeque<Bytes> = (0
+            ..=crate::storage::db::LISTPACK_MAX_ENTRIES)
+            .map(|i| Bytes::from(format!("e{i:04}")))
+            .collect();
+        assert_eq!(
+            round_trip(&RedisValueRef::List(&list)).encoding_name(),
+            "linkedlist"
+        );
+    }
+
+    #[test]
+    fn set_with_an_oversized_member_stays_a_hashtable() {
+        let mut set = std::collections::HashSet::new();
+        set.insert(Bytes::from_static(b"small"));
+        set.insert(Bytes::from(vec![
+            b'x';
+            crate::storage::db::LISTPACK_MAX_ELEMENT_SIZE
+                + 1
+        ]));
+        assert_eq!(
+            round_trip(&RedisValueRef::Set(&set)).encoding_name(),
+            "hashtable"
+        );
     }
 }
