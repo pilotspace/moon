@@ -543,6 +543,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `SADD z 000000012345 abcdefgh` is preserved on main only because it becomes
   a hashtable, and routing it into a listpack would have converted a latent
   encoding bug into a new data-loss path.
+### Fixed
+
+- **`persistence`: a restart no longer flattens every compact encoding.** RDB
+  decode rebuilt each container in its *full* form, so a listpack hash, a
+  listpack list, an intset and a set listpack all came back as
+  `hashtable`/`quicklist`/`hashtable` on the first reload. Redis preserves all
+  of them across `DEBUG RELOAD`. The memory cost is not incidental: the
+  `SADD`-builds-a-listpack win (set 404.5 B/key) reverted to 978.2 B/key --
+  1.96x -> 4.48x vs redis 7.4.2 -- the moment the server came back up.
+
+  The fix re-derives the compact encoding on the decode side against thresholds
+  already in the tree (`LISTPACK_MAX_ENTRIES`, `LISTPACK_MAX_ELEMENT_SIZE`,
+  `INTSET_MAX_ENTRIES`), with **no wire-format change**: every listpack variant
+  already maps to the same `ValueType` tag as its full form
+  (`value_codec::value_type_of`), so files stay readable in both directions --
+  an RDB written before this change reloads compact, and one written after
+  loads on a build without it. The files are not byte-*identical*, because a
+  listpack preserves insertion order where a `HashMap` does not; the type tag
+  and the field/value encoding are unchanged.
+
+  It is deliberately **not** wired into the cold/spill path.
+  `ValueKind::classify_cold` accepts only the canonical full forms, so a
+  cold-decoded `SetListpack` would fall through its `_ => Err(WrongType)` arm
+  and answer `WRONGTYPE` for a perfectly valid set -- the first attempt at this
+  fix did exactly that and turned 11 cold-tier tests red. Compaction is
+  therefore opt-in via `decode_value_body_compacting`, used only on the RDB
+  path; `HashWithTtl` is also left alone, because a listpack carries no TTL
+  sidecar. Widening `classify_cold` so the cold tier compacts too is a named
+  follow-up.
+
+  Guarded by `tests/restart_preserves_compact_encoding.rs`, which writes one
+  key of each compact type plus a 200-field hash as a negative control (without
+  it, a bug that compacted *everything* would pass), restarts a real server on
+  the same `--dir`, and asserts the target encoding of all five.
 
 ### Performance
 
