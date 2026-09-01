@@ -748,9 +748,9 @@ mod tests {
     /// so live segments hold `LOAD_THRESHOLD/2 .. LOAD_THRESHOLD` keys and the
     /// population mean sits at ~3/4 of the threshold. Measured over 200k
     /// 16-byte keys (the `redis-benchmark -r` shape), the fill ratio is 0.7503
-    /// at threshold 54 -- so the 3/4 rule is real, not assumed.
+    /// at threshold 54 and 0.7690 at 56 -- so the 3/4 rule is real, not assumed.
     ///
-    ///   * threshold 54 -> 40.52 keys/segment -> ~74 bytes/key;
+    ///   * threshold 56 -> 43.07 keys/segment -> ~70 bytes/key;
     ///   * `with_capacity` deliberately over-allocates one depth level, halving
     ///     the fill -> ~107 bytes/key.
     ///
@@ -777,7 +777,13 @@ mod tests {
              either way, so the 60-slot layout left 48 B of tail padding -- \
              exactly one more (key, value) pair. See segment_wastes_no_tail_padding."
         );
-        assert_eq!(LOAD_THRESHOLD, 54);
+        assert_eq!(
+            LOAD_THRESHOLD, 56,
+            "56, not 54: raising it lifts the measured fill from 40.52 to 43.07 \
+             keys/segment, worth 4.39 B/key. It is affordable only because the \
+             free 61st slot keeps overflow headroom at 5 -- non-home segments \
+             measured 1.10% here versus 1.42% at the old (60, 54)."
+        );
 
         // 64 (ctrl) + 8 (count/depth) + 1 (has_non_home_keys) + padding
         // + 61*24 (keys) + 61*24 (values) = 3008 exactly, no tail padding.
@@ -789,18 +795,18 @@ mod tests {
         // Bytes/key at the three fills that actually occur.
         assert_eq!(
             seg / LOAD_THRESHOLD,
-            55,
+            53,
             "best case, at the split threshold"
         );
         assert_eq!(
             seg * 4 / (LOAD_THRESHOLD * 3),
-            74,
-            "organic fill; measured 74.24 at 40.52 keys/segment. Was 85 with the \
-             32-byte entry."
+            71,
+            "organic fill; measured 69.85 at 43.07 keys/segment. Was 85 with the \
+             32-byte entry and 74 after the entry shrink alone."
         );
         assert_eq!(
             seg * 2 / LOAD_THRESHOLD,
-            111,
+            107,
             "--initial-keyspace-hint: with_capacity adds a depth level, halving fill"
         );
     }

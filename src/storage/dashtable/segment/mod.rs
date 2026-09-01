@@ -57,10 +57,23 @@ pub(super) const NUM_GROUPS: usize = 4;
 /// Slots 60-63 are padding (always EMPTY).
 pub(super) const CTRL_BYTES: usize = NUM_GROUPS * 16;
 
-/// Load threshold: 90% of 60 = 54 slots. Triggers split when reached.
-/// Higher threshold improves average fill factor (~67% vs ~62% at 85%),
-/// reducing per-key memory overhead by ~8% with minimal impact on probe length.
-pub const LOAD_THRESHOLD: usize = 54;
+/// Load threshold: 56 of 61 slots. Triggers a split when reached.
+///
+/// A split halves a segment, so the population mean fill is ~3/4 of this
+/// number. Measured over 200k 16-byte keys: 40.52 keys/segment at 54 versus
+/// 43.07 at 56, which is 74.24 -> 69.85 structural bytes per key.
+///
+/// The 4.39 B/key is not free. Packing tighter pushes more keys out of their
+/// home groups, and `has_non_home_keys` is sticky, so a single overflow makes
+/// every later lookup in that segment pay the fallback scan. Measured
+/// contamination: 1.42% of segments at the old (60 slots, 54), 1.10% at
+/// (61, 56), 1.48% at (61, 57). Paired A/B over 25 interleaved rounds put
+/// (61, 56) at roughly +2% on a table-local hit and +4% on a miss against
+/// (60, 54) -- small, and at the edge of what the harness resolves, but real.
+///
+/// 57 was measured and rejected: it buys only 1.58 B/key more and costs more
+/// on the hit path, which is the hot one.
+pub const LOAD_THRESHOLD: usize = 56;
 
 /// Extract the H2 fingerprint from a hash: top 7 bits, ensuring MSB is 0
 /// so the value (0x00..0x7F) is distinguishable from EMPTY (0xFF) and
