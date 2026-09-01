@@ -753,6 +753,7 @@ fn test_inline_get_declines_for_cold_key_instead_of_blocking() {
             b"coldkey",
             &entry,
             0,
+            0,
             &mut manifest,
             Some(&mut cold_index),
         )

@@ -760,7 +760,7 @@ mod tests {
         s.insert(Bytes::from_static(b"2"));
         let mut entry = Entry::new_set();
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
-            crate::storage::entry::RedisValue::Set(s),
+            crate::storage::entry::RedisValue::Set(Box::new(s)),
         );
         db.set(b"myset", entry);
         let result = sort(&mut db, &[bs(b"myset")]);

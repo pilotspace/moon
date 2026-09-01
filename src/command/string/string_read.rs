@@ -214,7 +214,7 @@ pub fn getdel(db: &mut Database, args: &[Frame]) -> Frame {
     }
     // Confirmed string — safe to remove and return its bytes.
     match db.remove(key) {
-        Some(entry) => match entry.value.as_bytes_owned() {
+        Some((entry, _ttl)) => match entry.value.as_bytes_owned() {
             Some(v) => Frame::BulkString(v),
             None => Frame::Null,
         },

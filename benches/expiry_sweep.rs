@@ -29,9 +29,10 @@ fn idle_volatile_db(n: u32) -> Database {
     let mut db = Database::new();
     let deadline = current_time_ms() + 3_600_000;
     for i in 0..n {
-        db.set(
+        db.set_with_expiry(
             &Bytes::from(format!("k{i}")),
-            Entry::new_string_with_expiry(Bytes::from_static(b"value"), deadline),
+            Entry::new_string(Bytes::from_static(b"value")),
+            deadline,
         );
     }
     db
@@ -44,9 +45,10 @@ fn field_ttl_db(n: u32, offset_ms: i64) -> Database {
     // One never-due whole-key TTL, so `maybe_has_expiring_keys` is armed on
     // BOTH sides of an A/B: the pre-#543 code gates the entire cycle on that
     // latch, and a leg that early-returns would measure nothing at all.
-    db.set(
+    db.set_with_expiry(
         b"__arm__",
-        Entry::new_string_with_expiry(Bytes::from_static(b"v"), base + 86_400_000),
+        Entry::new_string(Bytes::from_static(b"v")),
+        base + 86_400_000,
     );
     if offset_ms >= 0 {
         let deadline = base + offset_ms as u64;
@@ -73,8 +75,8 @@ fn field_ttl_db(n: u32, offset_ms: i64) -> Database {
         ttls.insert(Bytes::from_static(b"f"), deadline);
         let mut entry = Entry::new_string(Bytes::new());
         entry.value = CompactValue::from_redis_value(RedisValue::HashWithTtl {
-            fields,
-            ttls,
+            fields: Box::new(fields),
+            ttls: Box::new(ttls),
             min_expiry_ms: deadline,
         });
         db.set(&Bytes::from(format!("h{i}")), entry);
@@ -109,12 +111,10 @@ fn bench_one_due_key_among_field_ttl_hashes(c: &mut Criterion) {
             b.iter(|| {
                 // Re-arm one whole-key victim so the cycle is entered every
                 // iteration (the head-peek gate would otherwise skip it).
-                db.set(
+                db.set_with_expiry(
                     b"__due__",
-                    Entry::new_string_with_expiry(
-                        Bytes::from_static(b"v"),
-                        current_time_ms().saturating_sub(1),
-                    ),
+                    Entry::new_string(Bytes::from_static(b"v")),
+                    current_time_ms().saturating_sub(1),
                 );
                 expire_cycle_direct(black_box(&mut db), &mut |k| {
                     black_box(k);

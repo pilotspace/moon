@@ -59,7 +59,7 @@ thread_local! {
     /// `Cell<bool>` load when it is not.
     static ARMED: Cell<bool> = const { Cell::new(false) };
     /// Pre-images captured since the last drain: `(db_index, key, old_entry)`.
-    static PENDING: RefCell<Vec<(usize, Bytes, Entry)>> = const { RefCell::new(Vec::new()) };
+    static PENDING: RefCell<Vec<(usize, Bytes, Entry, u64)>> = const { RefCell::new(Vec::new()) };
     /// First-wins dedupe set for `PENDING`, same lifetime.
     static PENDING_KEYS: RefCell<HashSet<(usize, Bytes)>> =
         RefCell::new(HashSet::new());
@@ -88,7 +88,7 @@ pub(crate) fn is_armed() -> bool {
 /// to end (e.g. a Lua script) and need to assert the pre-image was taken
 /// without standing up a whole shard event loop to drain it.
 #[cfg(test)]
-pub(crate) fn pending_for_test() -> Vec<(usize, Bytes, Entry)> {
+pub(crate) fn pending_for_test() -> Vec<(usize, Bytes, Entry, u64)> {
     PENDING.with(|p| p.borrow().clone())
 }
 
@@ -199,9 +199,13 @@ fn capture_key(db: &Database, db_index: usize, key: &Bytes) {
         return;
     }
     if let Some(old_entry) = db.data().get(key) {
+        // The deadline is part of the pre-image: a snapshot that restored the
+        // epoch-start VALUE with the post-write TTL would be a state the
+        // database never had.
+        let old_ttl = db.entry_expires_at_ms(key, old_entry);
         PENDING.with(|p| {
             p.borrow_mut()
-                .push((db_index, key.clone(), old_entry.clone()))
+                .push((db_index, key.clone(), old_entry.clone(), old_ttl))
         });
     }
     // A key that does not exist yet needs no pre-image: the snapshot's
@@ -219,7 +223,7 @@ pub(crate) fn drain_into(snap: &mut SnapshotState) {
     if PENDING.with(|p| p.borrow().is_empty()) {
         return;
     }
-    let captured: Vec<(usize, Bytes, Entry)> =
+    let captured: Vec<(usize, Bytes, Entry, u64)> =
         PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
     PENDING_KEYS.with(|k| k.borrow_mut().clear());
     crate::shard::slice::with_shard(|s| {
@@ -237,9 +241,9 @@ pub(crate) fn drain_into(snap: &mut SnapshotState) {
 fn drain_into_with_dbs<D: std::borrow::Borrow<Database>>(
     snap: &mut SnapshotState,
     databases: &[D],
-    captured: Vec<(usize, Bytes, Entry)>,
+    captured: Vec<(usize, Bytes, Entry, u64)>,
 ) {
-    for (db_index, key, entry) in captured {
+    for (db_index, key, entry, expires_at_ms) in captured {
         let Some(db) = databases.get(db_index) else {
             continue;
         };
@@ -247,7 +251,7 @@ fn drain_into_with_dbs<D: std::borrow::Borrow<Database>>(
         let hash = crate::storage::dashtable::hash_key(&key);
         let seg_idx = db.data().segment_index_for_hash(hash);
         if snap.is_segment_pending(db_index, seg_idx) {
-            snap.capture_cow(db_index, seg_idx, key, entry);
+            snap.capture_cow(db_index, seg_idx, key, entry, expires_at_ms);
         }
     }
 }
@@ -351,11 +355,13 @@ mod tests {
                 0,
                 seg0_key.clone(),
                 dbs[0].data().get(&seg0_key).unwrap().clone(),
+                0,
             ),
             (
                 0,
                 seg1_key.clone(),
                 dbs[0].data().get(&seg1_key).unwrap().clone(),
+                0,
             ),
         ];
         drain_into_with_dbs(&mut state, &dbs, captured);

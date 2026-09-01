@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 mod accessors;
 mod hash_ttl;
 mod kv_ops;
@@ -141,7 +139,7 @@ fn promote_to_hash_with_ttl(rv: &mut RedisValue) {
     match rv {
         RedisValue::HashWithTtl { .. } => {}
         RedisValue::Hash(_) => {
-            let placeholder = RedisValue::Hash(HashMap::new());
+            let placeholder = RedisValue::Hash(Box::default());
             let owned = std::mem::replace(rv, placeholder);
             let RedisValue::Hash(fields) = owned else {
                 unreachable!("matched Hash above");
@@ -150,15 +148,15 @@ fn promote_to_hash_with_ttl(rv: &mut RedisValue) {
             // yet").  hash_set_field_ttl will update min on the first insert.
             *rv = RedisValue::HashWithTtl {
                 fields,
-                ttls: HashMap::new(),
+                ttls: Box::default(),
                 min_expiry_ms: u64::MAX,
             };
         }
         RedisValue::HashListpack(lp) => {
             let fields = lp.to_hash_map();
             *rv = RedisValue::HashWithTtl {
-                fields,
-                ttls: HashMap::new(),
+                fields: Box::new(fields),
+                ttls: Box::default(),
                 min_expiry_ms: u64::MAX,
             };
         }
@@ -307,6 +305,30 @@ pub struct Database {
     /// memory (~48B/pair) is metadata outside `used_memory`, like every
     /// other side table here.
     expiry_index: std::collections::BTreeSet<(u64, CompactKey)>,
+    /// Absolute expiry, unix milliseconds, for every HOT key that has one —
+    /// Redis's `db->expires`, and here for the same reason it exists there.
+    ///
+    /// The deadline used to be an inline `ttl_ms: u64` on `CompactEntry`.
+    /// That charged 8 bytes to every SLOT of every segment, occupied or not
+    /// (60 slots per segment), so a keyspace with no TTLs still paid ~11.8 B
+    /// per stored key for a field that was zero everywhere. Here, a key
+    /// without a TTL costs nothing at all.
+    ///
+    /// # Invariant (both directions), checked by [`Self::debug_expires_consistent`]
+    ///
+    /// A hot entry has [`crate::storage::entry::HAS_EXPIRY_BIT`] set **iff**
+    /// this map holds a deadline for its key. The bit is the fast path: a read
+    /// of a key without a TTL tests one bit already in the value's cache line
+    /// and never touches this map. Every writer flips the bit and the map in
+    /// the same statement — `set_with_expiry` / `set_expiry` /
+    /// `insert_for_load_with_expiry` / `remove_hot` / `clear` /
+    /// `recalculate_memory` ("sweep state writers, not command names").
+    ///
+    /// `expiry_index` is the deadline-ORDERED view of the same facts and is
+    /// not a substitute: it is keyed `(ts, key)`, so it cannot answer "what is
+    /// the TTL of key K", and it tolerates ghosts. This map is the
+    /// authoritative point-lookup, exactly as `ttl_ms` was.
+    expires: std::collections::HashMap<CompactKey, u64>,
     /// Deadline-ordered hash-FIELD expiry index (moon#543), the sibling of
     /// [`Self::expiry_index`]: one `(min_expiry_ms, key)` pair per hot
     /// `HashWithTtl` entry whose `ttls` sidecar is non-empty.
@@ -386,6 +408,7 @@ impl Database {
             spill_inflight_bytes: 0,
             birth_counter: 0,
             expiry_index: std::collections::BTreeSet::new(),
+            expires: std::collections::HashMap::new(),
             hash_expiry_index: std::collections::BTreeSet::new(),
         }
     }
@@ -417,6 +440,7 @@ impl Database {
             spill_inflight_bytes: 0,
             birth_counter: 0,
             expiry_index: std::collections::BTreeSet::new(),
+            expires: std::collections::HashMap::new(),
             hash_expiry_index: std::collections::BTreeSet::new(),
         }
     }
@@ -512,7 +536,7 @@ impl Database {
     /// `None` when the payload cannot be rehydrated (corrupt encoding); the
     /// caller then falls through to its normal path rather than serving a
     /// wrong value.
-    pub fn spill_inflight_entry(&self, key: &[u8], now_ms: u64) -> Option<Entry> {
+    pub fn spill_inflight_entry(&self, key: &[u8], now_ms: u64) -> Option<(Entry, u64)> {
         if self.spill_inflight.is_empty() {
             return None;
         }
@@ -659,6 +683,91 @@ impl Database {
         self.expiry_index.remove(&(ttl_ms, CompactKey::from(key)));
     }
 
+    // ── the whole-key expiry map (Redis's `db->expires`) ────────────────
+
+    /// Absolute expiry (unix milliseconds) recorded for `key`, or `0` when the
+    /// key has none — the exact contract the removed `Entry::expires_at_ms()`
+    /// had, including `0` as the no-expiry sentinel and full ms fidelity.
+    ///
+    /// Prefer [`Self::entry_expires_at_ms`] when an entry is already in hand:
+    /// it short-circuits on the entry's bit and hashes nothing.
+    #[inline]
+    pub fn expires_at_ms(&self, key: &[u8]) -> u64 {
+        self.expires.get(key).copied().unwrap_or(0)
+    }
+
+    /// Expiry of an entry the caller already holds.
+    ///
+    /// This is the read path. For a key with no TTL — the overwhelming
+    /// majority on any cache workload, and every key of the memory benchmark —
+    /// it is one mask-and-test against a word in the same cache line as the
+    /// value, and the map is never consulted.
+    #[inline]
+    pub fn entry_expires_at_ms(&self, key: &[u8], entry: &Entry) -> u64 {
+        if entry.has_expiry() {
+            self.expires_at_ms(key)
+        } else {
+            0
+        }
+    }
+
+    /// Is `key`'s entry expired at `now_ms`? `entry` must be the live entry
+    /// for `key`. Same predicate the removed `Entry::is_expired_at` applied:
+    /// a deadline exists and `now_ms >= deadline`.
+    #[inline]
+    pub fn entry_is_expired_at(&self, key: &[u8], entry: &Entry, now_ms: u64) -> bool {
+        entry.has_expiry() && self.expires.get(key).is_some_and(|&ts| now_ms >= ts)
+    }
+
+    /// Write the map half of the expiry state. `ms == 0` removes.
+    ///
+    /// Private on purpose: it is never correct on its own. Every caller must
+    /// flip the entry's [`crate::storage::entry::HAS_EXPIRY_BIT`] to match in
+    /// the same operation, or the invariant above breaks and a TTL either
+    /// never fires (bit clear, map set) or is silently lost (bit set, map
+    /// empty).
+    #[inline]
+    fn expires_map_write(&mut self, key: &[u8], ms: u64) {
+        if ms != 0 {
+            self.expires.insert(CompactKey::from(key), ms);
+        } else if !self.expires.is_empty() {
+            self.expires.remove(key);
+        }
+    }
+
+    /// Drop `key`'s deadline, returning what it was (`0` if none). Paired with
+    /// dropping the entry itself, where there is no bit left to clear.
+    #[inline]
+    pub(crate) fn expires_map_take(&mut self, key: &[u8]) -> u64 {
+        if self.expires.is_empty() {
+            return 0;
+        }
+        self.expires.remove(key).unwrap_or(0)
+    }
+
+    /// Number of hot keys carrying a deadline. O(1).
+    #[inline]
+    pub fn expires_map_len(&self) -> usize {
+        self.expires.len()
+    }
+
+    /// Test/debug oracle for the bit⇄map invariant, in BOTH directions.
+    ///
+    /// A one-directional check would pass through the two failures that
+    /// matter: a bit with no deadline (TTL silently lost — the key never
+    /// expires and `PTTL` reports -1) and a deadline with no bit (the key
+    /// never expires because nothing ever looks). O(N); tests only.
+    pub fn debug_expires_consistent(&self) -> bool {
+        for (key, entry) in self.data.iter() {
+            if entry.has_expiry() != self.expires.contains_key(key.as_bytes()) {
+                return false;
+            }
+        }
+        self.expires
+            .keys()
+            .all(|k| self.data.get(k.as_bytes()).is_some_and(Entry::has_expiry))
+    }
+
     // ── moon#543: deadline-ordered hash-FIELD expiry index ──────────────
 
     /// `true` iff at least one hash-field deadline is indexed, i.e. the
@@ -761,7 +870,7 @@ impl Database {
             .data
             .iter()
             .filter(|(_, e)| e.has_expiry())
-            .map(|(k, e)| (e.expires_at_ms(), k.clone()))
+            .map(|(k, _)| (self.expires_at_ms(k.as_bytes()), k.clone()))
             .collect();
         // moon#543: the hash-field index's LOWER-BOUND invariant — every
         // reapable hash must have SOME pair at or before its true minimum.
@@ -962,6 +1071,7 @@ mod tests {
     use crate::storage::stream::Stream as StreamData;
     use bytes::Bytes;
     use ordered_float::OrderedFloat;
+    use std::collections::HashMap;
     use std::collections::{HashSet, VecDeque};
 
     /// `Database::set` uses its key exclusively by reference: `spill_inflight_forget`,
@@ -987,10 +1097,7 @@ mod tests {
 
         // Overwrite through the `Updated` arm, which is the one that touches
         // `cold_index` and both expiry-index writers.
-        db.set(
-            key,
-            Entry::new_string_with_expiry(Bytes::from_static(b"v2"), 1),
-        );
+        db.set_with_expiry(key, Entry::new_string(Bytes::from_static(b"v2")), 1);
         assert_eq!(db.expires_count(), 1);
         db.set(key, Entry::new_string(Bytes::from_static(b"v3")));
         assert_eq!(db.expires_count(), 0);
@@ -1178,9 +1285,10 @@ mod tests {
         let mut db = Database::new();
         // Set key with an expiry in the past
         let past_ms = current_time_ms() - 1000;
-        db.set(
+        db.set_with_expiry(
             b"expired",
-            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms),
+            Entry::new_string(Bytes::from_static(b"val")),
+            past_ms,
         );
         // moon#542: `get` HIDES the expired key (answers None) but must NOT
         // physically remove it — deletion belongs to the active-expiry drain,
@@ -1199,9 +1307,10 @@ mod tests {
     fn test_exists_with_expiry() {
         let mut db = Database::new();
         let past_ms = current_time_ms() - 1000;
-        db.set(
+        db.set_with_expiry(
             b"expired",
-            Entry::new_string_with_expiry(Bytes::from_static(b"val"), past_ms),
+            Entry::new_string(Bytes::from_static(b"val")),
+            past_ms,
         );
         assert!(!db.exists(b"expired"));
     }
@@ -1211,9 +1320,10 @@ mod tests {
         let mut db = Database::new();
         db.set(b"k1", Entry::new_string(Bytes::from_static(b"v1")));
         let future_ms = current_time_ms() + 3_600_000;
-        db.set(
+        db.set_with_expiry(
             b"k2",
-            Entry::new_string_with_expiry(Bytes::from_static(b"v2"), future_ms),
+            Entry::new_string(Bytes::from_static(b"v2")),
+            future_ms,
         );
         assert_eq!(db.len(), 2);
         assert_eq!(db.expires_count(), 1);
@@ -1221,16 +1331,29 @@ mod tests {
 
     #[test]
     fn test_is_expired() {
-        let past_ms = current_time_ms() - 1000;
-        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms);
-        assert!(Database::is_expired(&entry));
+        let mut db = Database::new();
+        let now_ms = current_time_ms();
+        let past_ms = now_ms - 1000;
+        let future_ms = now_ms + 3_600_000;
 
-        let future_ms = current_time_ms() + 3_600_000;
-        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms);
-        assert!(!Database::is_expired(&entry));
+        db.set_with_expiry(
+            b"past",
+            Entry::new_string(Bytes::from_static(b"v")),
+            past_ms,
+        );
+        db.set_with_expiry(
+            b"future",
+            Entry::new_string(Bytes::from_static(b"v")),
+            future_ms,
+        );
+        db.set(b"none", Entry::new_string(Bytes::from_static(b"v")));
 
-        let entry = Entry::new_string(Bytes::from_static(b"v"));
-        assert!(!Database::is_expired(&entry));
+        for (key, want) in [(&b"past"[..], true), (b"future", false), (b"none", false)] {
+            // The entry is looked up out of `data` directly: `get` would apply
+            // the lazy hide and answer None for the expired one.
+            let entry = db.data().get(key).expect("present in the hot plane");
+            assert_eq!(db.entry_is_expired_at(key, entry, now_ms), want, "{key:?}");
+        }
     }
 
     #[test]
@@ -1320,15 +1443,190 @@ mod tests {
     fn test_is_key_expired() {
         let mut db = Database::new();
         let past_ms = current_time_ms() - 1000;
-        db.set(
+        db.set_with_expiry(
             b"expired",
-            Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms),
+            Entry::new_string(Bytes::from_static(b"v")),
+            past_ms,
         );
         assert!(db.is_key_expired(b"expired"));
         assert!(!db.is_key_expired(b"missing"));
     }
 
     // ── moon#541: deadline-ordered expiry index ──────────────────────────
+
+    // ── the whole-key `expires` map (Redis's `db->expires`) ─────────────
+
+    /// The bit⇄map invariant must hold after EVERY writer that can change a
+    /// key's TTL state — the same "sweep state writers, not command names"
+    /// discipline the deadline index is held to, for the same reason: a bit
+    /// with no map row is a TTL that never fires and a `PTTL` of -1; a map row
+    /// with no bit is a key that never expires because nothing ever looks.
+    #[test]
+    fn expires_map_mirrors_every_ttl_writer() {
+        let mut db = Database::new();
+        assert!(db.debug_expires_consistent());
+        let future_ms = current_time_ms() + 3_600_000;
+
+        // set_with_expiry: fresh key with a TTL
+        db.set_with_expiry(b"a", Entry::new_string(Bytes::from_static(b"v")), future_ms);
+        assert_eq!(db.expires_map_len(), 1);
+        assert_eq!(db.expires_at_ms(b"a"), future_ms);
+        assert!(db.get(b"a").unwrap().has_expiry());
+        assert!(db.debug_expires_consistent());
+
+        // set: fresh key without a TTL costs no map row at all
+        db.set_string(b"b", Bytes::from_static(b"v"));
+        assert_eq!(db.expires_map_len(), 1);
+        assert!(!db.get(b"b").unwrap().has_expiry());
+        assert!(db.debug_expires_consistent());
+
+        // overwrite TTL -> no TTL (a plain SET clears the deadline, as Redis does)
+        db.set_string(b"a", Bytes::from_static(b"v2"));
+        assert_eq!(db.expires_map_len(), 0);
+        assert_eq!(db.expires_at_ms(b"a"), 0);
+        assert!(!db.get(b"a").unwrap().has_expiry());
+        assert!(db.debug_expires_consistent());
+
+        // overwrite no TTL -> TTL
+        db.set_with_expiry(
+            b"b",
+            Entry::new_string(Bytes::from_static(b"v2")),
+            future_ms,
+        );
+        assert_eq!(db.expires_map_len(), 1);
+        assert!(db.debug_expires_consistent());
+
+        // overwrite TTL -> a DIFFERENT TTL
+        db.set_with_expiry(
+            b"b",
+            Entry::new_string(Bytes::from_static(b"v3")),
+            future_ms + 500,
+        );
+        assert_eq!(db.expires_map_len(), 1);
+        assert_eq!(db.expires_at_ms(b"b"), future_ms + 500);
+        assert!(db.debug_expires_consistent());
+
+        // set_expiry: retarget, then PERSIST (0)
+        assert!(db.set_expiry(b"b", future_ms + 1_000));
+        assert_eq!(db.expires_at_ms(b"b"), future_ms + 1_000);
+        assert!(db.debug_expires_consistent());
+        assert!(db.set_expiry(b"b", 0));
+        assert_eq!(db.expires_map_len(), 0);
+        assert!(!db.get(b"b").unwrap().has_expiry());
+        assert!(db.debug_expires_consistent());
+
+        // set_expiry: arm a plain key
+        assert!(db.set_expiry(b"a", future_ms));
+        assert_eq!(db.expires_map_len(), 1);
+        assert!(db.debug_expires_consistent());
+
+        // remove
+        db.remove(b"a");
+        assert_eq!(db.expires_map_len(), 0);
+        assert!(db.debug_expires_consistent());
+
+        // insert_for_load_with_expiry (bulk restore)
+        db.insert_for_load_with_expiry(
+            Bytes::from_static(b"c"),
+            Entry::new_string(Bytes::from_static(b"v")),
+            future_ms,
+        );
+        assert_eq!(db.expires_map_len(), 1);
+        assert_eq!(db.expires_at_ms(b"c"), future_ms);
+        assert!(db.debug_expires_consistent());
+
+        // write-path expired drop
+        db.set_cached_now_ms_for_test(future_ms + 1);
+        let _ = db.get_or_create_hash(b"c").expect("fresh hash");
+        assert_eq!(db.expires_map_len(), 0, "expired drop must unmap");
+        assert!(db.debug_expires_consistent());
+
+        // recalculate_memory is the healer, and must not lose deadlines
+        db.set_cached_now_ms_for_test(current_time_ms());
+        db.set_with_expiry(b"d", Entry::new_string(Bytes::from_static(b"v")), future_ms);
+        db.recalculate_memory();
+        assert_eq!(db.expires_at_ms(b"d"), future_ms);
+        assert_eq!(db.expiry_index_len(), 1);
+        assert!(db.debug_expires_consistent());
+
+        // clear
+        db.clear();
+        assert_eq!(db.expires_map_len(), 0);
+        assert!(db.debug_expires_consistent());
+    }
+
+    /// Attack the oracle: it must be ABLE to fail, in both directions.
+    /// A consistency check that cannot report its own failure proves nothing.
+    #[test]
+    fn the_expires_oracle_can_actually_fail() {
+        // Direction 1: a map row whose entry has no bit.
+        let mut db = Database::new();
+        db.set_string(b"k", Bytes::from_static(b"v"));
+        db.expires.insert(CompactKey::from(&b"k"[..]), 1);
+        assert!(
+            !db.debug_expires_consistent(),
+            "a deadline with no bit must be reported"
+        );
+
+        // Direction 2: an entry with the bit set and no map row.
+        let mut db = Database::new();
+        db.set_with_expiry(
+            b"k",
+            Entry::new_string(Bytes::from_static(b"v")),
+            current_time_ms() + 60_000,
+        );
+        assert!(db.debug_expires_consistent(), "setup must start consistent");
+        db.expires.clear();
+        assert!(
+            !db.debug_expires_consistent(),
+            "a bit with no deadline must be reported"
+        );
+    }
+
+    /// The deadline keeps FULL millisecond fidelity across the move out of the
+    /// entry — the property W3 introduced, restated where the value now lives.
+    /// A key must live at least the requested TTL: expiring at `t-1` would be
+    /// the sub-second truncation bug returning.
+    #[test]
+    fn ttl_millisecond_fidelity_survives_the_move() {
+        let mut db = Database::new();
+        let exp_ms = 10_000_500u64;
+        db.set_with_expiry(b"k", Entry::new_string(Bytes::from_static(b"v")), exp_ms);
+
+        assert_eq!(
+            db.expires_at_ms(b"k"),
+            exp_ms,
+            "PTTL must read back the exact expiry, not a second-truncated one"
+        );
+
+        let entry = db.data().get(b"k".as_ref()).expect("hot");
+        assert!(!db.entry_is_expired_at(b"k", entry, exp_ms - 300));
+        assert!(!db.entry_is_expired_at(b"k", entry, exp_ms - 1));
+        assert!(db.entry_is_expired_at(b"k", entry, exp_ms));
+
+        // u64 range is unchanged: a year-2255 deadline round-trips exactly.
+        // (On a live key — `k` above is a 1970 deadline, i.e. already gone.)
+        let far = 9_000_000_000_000u64;
+        db.set_string(b"far", Bytes::from_static(b"v"));
+        assert!(db.set_expiry(b"far", far));
+        assert_eq!(db.expires_at_ms(b"far"), far);
+        assert!(db.debug_expires_consistent());
+    }
+
+    /// A key with no TTL must not put ANYTHING in the map — that is the whole
+    /// point of moving the field out of the 60-slot value array.
+    #[test]
+    fn a_keyspace_without_ttls_pays_nothing() {
+        let mut db = Database::new();
+        for i in 0..1_000u32 {
+            db.set_string(&Bytes::from(format!("k{i}")), Bytes::from_static(b"v"));
+        }
+        assert_eq!(db.len(), 1_000);
+        assert_eq!(db.expires_map_len(), 0);
+        assert_eq!(db.expiry_index_len(), 0);
+        assert!(!db.maybe_has_expiring_keys());
+        assert!(db.debug_expires_consistent());
+    }
 
     /// Every writer that changes a key's TTL state must keep the expiry
     /// index in lock-step with the data map ("sweep state writers, not
@@ -1341,10 +1639,7 @@ mod tests {
         let future_ms = current_time_ms() + 3_600_000;
 
         // set: fresh key with TTL
-        db.set(
-            b"a",
-            Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms),
-        );
+        db.set_with_expiry(b"a", Entry::new_string(Bytes::from_static(b"v")), future_ms);
         assert_eq!(db.expiry_index_len(), 1);
         assert!(db.debug_expiry_index_consistent());
 
@@ -1359,17 +1654,19 @@ mod tests {
         assert!(db.debug_expiry_index_consistent());
 
         // overwrite: no TTL -> TTL
-        db.set(
+        db.set_with_expiry(
             b"b",
-            Entry::new_string_with_expiry(Bytes::from_static(b"v2"), future_ms),
+            Entry::new_string(Bytes::from_static(b"v2")),
+            future_ms,
         );
         assert_eq!(db.expiry_index_len(), 1);
         assert!(db.debug_expiry_index_consistent());
 
         // overwrite: TTL -> different TTL (old pair must go, not linger)
-        db.set(
+        db.set_with_expiry(
             b"b",
-            Entry::new_string_with_expiry(Bytes::from_static(b"v3"), future_ms + 500),
+            Entry::new_string(Bytes::from_static(b"v3")),
+            future_ms + 500,
         );
         assert_eq!(db.expiry_index_len(), 1);
         assert!(db.debug_expiry_index_consistent());
@@ -1393,9 +1690,10 @@ mod tests {
         assert!(db.debug_expiry_index_consistent());
 
         // insert_for_load (bulk restore path)
-        db.insert_for_load(
+        db.insert_for_load_with_expiry(
             Bytes::from_static(b"c"),
-            Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms),
+            Entry::new_string(Bytes::from_static(b"v")),
+            future_ms,
         );
         assert_eq!(db.expiry_index_len(), 1);
         assert!(db.debug_expiry_index_consistent());
@@ -1407,9 +1705,10 @@ mod tests {
         assert!(db.debug_expiry_index_consistent());
 
         // clear
-        db.set(
+        db.set_with_expiry(
             b"d",
-            Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms + 3_600_000),
+            Entry::new_string(Bytes::from_static(b"v")),
+            future_ms + 3_600_000,
         );
         db.clear();
         assert_eq!(db.expiry_index_len(), 0);
@@ -1424,10 +1723,7 @@ mod tests {
     fn set_expiry_on_lazily_expired_key_hides_and_queues() {
         let mut db = Database::new();
         let future_ms = db.now_ms() + 1_000;
-        db.set(
-            b"k",
-            Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms),
-        );
+        db.set_with_expiry(b"k", Entry::new_string(Bytes::from_static(b"v")), future_ms);
         db.set_cached_now_ms_for_test(future_ms + 1);
 
         assert!(
@@ -1592,8 +1888,8 @@ mod tests {
         let mut entry = Entry::new_string(Bytes::new());
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
             RedisValue::HashWithTtl {
-                fields,
-                ttls,
+                fields: Box::new(fields),
+                ttls: Box::new(ttls),
                 // Deliberately WRONG cached minimum: the index must not trust it.
                 min_expiry_ms: u64::MAX,
             },
@@ -1628,8 +1924,8 @@ mod tests {
         let mut entry = Entry::new_string(Bytes::new());
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
             RedisValue::HashWithTtl {
-                fields,
-                ttls,
+                fields: Box::new(fields),
+                ttls: Box::new(ttls),
                 min_expiry_ms: past,
             },
         );
@@ -1787,14 +2083,19 @@ mod tests {
         assert_ne!(db.get_version(b"fresh"), restored);
     }
 
-    /// The counter shares the entry's 24-bit version field, so it wraps —
+    /// The counter shares the entry's 23-bit version field, so it wraps —
     /// and must skip 0, which is the "key absent" sentinel. A wrapped ticket
     /// reading as 0 would make a live key invisible to WATCH.
+    ///
+    /// 23 bits, not 24, since the field's top bit became
+    /// `HAS_EXPIRY_BIT`: 8.4M intervening writes to the same key before the
+    /// WATCH/EXEC ABA window reopens, down from 16.7M and still four orders
+    /// of magnitude past the 256 it was before the field was widened.
     #[test]
     fn test_birth_ticket_wraps_without_ever_yielding_zero() {
         let mut db = Database::new();
-        db.birth_counter = 0xFF_FFFE;
-        assert_eq!(db.next_birth_version(), 0xFF_FFFF);
+        db.birth_counter = 0x7F_FFFE;
+        assert_eq!(db.next_birth_version(), 0x7F_FFFF);
         assert_eq!(
             db.next_birth_version(),
             crate::storage::entry::INITIAL_VERSION
@@ -1867,6 +2168,7 @@ mod tests {
             900,
             key,
             &entry,
+            0,
             0,
             &mut manifest,
             Some(&mut cold_index),
@@ -2004,7 +2306,11 @@ mod tests {
         let mut fields = HashMap::new();
         fields.insert(Bytes::from_static(b"color"), Bytes::from_static(b"red"));
         fields.insert(Bytes::from_static(b"size"), Bytes::from_static(b"large"));
-        let mut db = db_with_spilled_value(tmp.path(), b"myhash", TestRedisValue::Hash(fields));
+        let mut db = db_with_spilled_value(
+            tmp.path(),
+            b"myhash",
+            TestRedisValue::Hash(Box::new(fields)),
+        );
 
         // Precondition: nothing hot yet, key only exists cold.
         assert!(!db.is_hot(b"myhash"), "precondition: key must be cold-only");
@@ -2033,7 +2339,8 @@ mod tests {
             Bytes::from_static(b"old_field"),
             Bytes::from_static(b"old_value"),
         );
-        let mut db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+        let mut db =
+            db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(Box::new(fields)));
 
         // HSET h new_field new_value
         {
@@ -2065,7 +2372,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut fields = HashMap::new();
         fields.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
-        let db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+        let db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(Box::new(fields)));
 
         let href = db
             .get_hash_ref_if_alive(b"h", 0)
@@ -2111,8 +2418,8 @@ mod tests {
         let mut entry = Entry::new_hash();
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
             RedisValue::HashWithTtl {
-                fields,
-                ttls,
+                fields: Box::new(fields),
+                ttls: Box::new(ttls),
                 min_expiry_ms: 1_000,
             },
         );
@@ -2167,7 +2474,8 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(Bytes::from_static(b"m1"));
         set.insert(Bytes::from_static(b"m2"));
-        let mut db = db_with_spilled_value(tmp.path(), b"myset", TestRedisValue::Set(set));
+        let mut db =
+            db_with_spilled_value(tmp.path(), b"myset", TestRedisValue::Set(Box::new(set)));
 
         let s = db.get_or_create_set(b"myset").unwrap();
         assert_eq!(
@@ -2183,7 +2491,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut set = HashSet::new();
         set.insert(Bytes::from_static(b"m"));
-        let db = db_with_spilled_value(tmp.path(), b"s", TestRedisValue::Set(set));
+        let db = db_with_spilled_value(tmp.path(), b"s", TestRedisValue::Set(Box::new(set)));
 
         let sref = db
             .get_set_ref_if_alive(b"s", 0)
@@ -2203,7 +2511,10 @@ mod tests {
         let mut db = db_with_spilled_value(
             tmp.path(),
             b"myzset",
-            TestRedisValue::SortedSetBPTree { tree, members },
+            TestRedisValue::SortedSetBPTree {
+                tree: Box::new(tree),
+                members: Box::new(members),
+            },
         );
 
         let (members, _tree) = db.get_or_create_sorted_set(b"myzset").unwrap();
@@ -2225,7 +2536,10 @@ mod tests {
         let db = db_with_spilled_value(
             tmp.path(),
             b"z",
-            TestRedisValue::SortedSetBPTree { tree, members },
+            TestRedisValue::SortedSetBPTree {
+                tree: Box::new(tree),
+                members: Box::new(members),
+            },
         );
 
         let zref = db
@@ -2287,7 +2601,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut fields = HashMap::new();
         fields.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
-        let mut db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+        let mut db =
+            db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(Box::new(fields)));
 
         assert!(db.exists(b"h"), "cold-only key must count as existing");
         // Cheap presence check must not have promoted the key into hot RAM.
@@ -2359,7 +2674,7 @@ mod tests {
             1,
             "the key was acked to a client, so it must be counted"
         );
-        let entry = db
+        let (entry, _ttl) = db
             .spill_inflight_entry(b"k", 0)
             .expect("payload rehydrates from RAM");
         assert_eq!(entry.value.as_bytes(), Some(&b"hello"[..]));

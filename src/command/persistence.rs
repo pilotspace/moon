@@ -80,6 +80,7 @@ pub fn bgsave_start(db: SharedDatabases, dir: String, dbfilename: String) -> Fra
         Vec<(
             crate::storage::compact_key::CompactKey,
             crate::storage::entry::Entry,
+            u64,
         )>,
     > = db
         .iter()
@@ -88,7 +89,13 @@ pub fn bgsave_start(db: SharedDatabases, dir: String, dbfilename: String) -> Fra
             guard
                 .data()
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|(k, v)| {
+                    // The deadline is read here, under the same read guard as
+                    // the entry: it is no longer inside the entry to be cloned
+                    // with it.
+                    let ttl = guard.entry_expires_at_ms(k.as_bytes(), v);
+                    (k.clone(), v.clone(), ttl)
+                })
                 .collect()
         })
         .collect();
@@ -362,6 +369,7 @@ pub fn handle_save(db: &SharedDatabases, dir: &str, dbfilename: &str) -> Frame {
         Vec<(
             crate::storage::compact_key::CompactKey,
             crate::storage::entry::Entry,
+            u64,
         )>,
     > = db
         .iter()
@@ -370,7 +378,13 @@ pub fn handle_save(db: &SharedDatabases, dir: &str, dbfilename: &str) -> Frame {
             guard
                 .data()
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|(k, v)| {
+                    // The deadline is read here, under the same read guard as
+                    // the entry: it is no longer inside the entry to be cloned
+                    // with it.
+                    let ttl = guard.entry_expires_at_ms(k.as_bytes(), v);
+                    (k.clone(), v.clone(), ttl)
+                })
                 .collect()
         })
         .collect();

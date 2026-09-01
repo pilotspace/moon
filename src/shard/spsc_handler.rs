@@ -3007,8 +3007,9 @@ pub(crate) fn handle_shard_message_shared(
                     for db in all.iter() {
                         let mut entries = Vec::new();
                         for (key, entry) in db.data().iter() {
-                            if !entry.is_expired_at(now_ms) {
-                                entries.push((key.clone(), entry.clone()));
+                            if !db.entry_is_expired_at(key.as_bytes(), entry, now_ms) {
+                                let ttl = db.entry_expires_at_ms(key.as_bytes(), entry);
+                                entries.push((key.clone(), entry.clone(), ttl));
                             }
                         }
                         dbs.push(entries);
@@ -4201,7 +4202,8 @@ pub(crate) fn cow_intercept(
     let seg_idx = db.data().segment_index_for_hash(hash);
     if snap.is_segment_pending(db_index, seg_idx) {
         if let Some(old_entry) = db.data().get(key) {
-            snap.capture_cow(db_index, seg_idx, key.clone(), old_entry.clone());
+            let old_ttl = db.entry_expires_at_ms(key, old_entry);
+            snap.capture_cow(db_index, seg_idx, key.clone(), old_entry.clone(), old_ttl);
         }
     }
 }

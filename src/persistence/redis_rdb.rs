@@ -279,12 +279,11 @@ fn write_rdb_footer(buf: &mut Vec<u8>) {
 // ---------------------------------------------------------------------------
 
 /// Write a single entry in Redis RDB format.
-fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) {
+fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry, expires_at_ms: u64) {
     // TTL (if present)
-    if entry.has_expiry() {
-        let ms = entry.expires_at_ms();
+    if expires_at_ms != 0 {
         buf.push(RDB_OPCODE_EXPIRETIME_MS);
-        buf.extend_from_slice(&ms.to_le_bytes());
+        buf.extend_from_slice(&expires_at_ms.to_le_bytes());
     }
     write_typed_value(buf, Some(key), entry);
 }
@@ -575,7 +574,7 @@ pub fn write_rdb_body_refs(databases: &[&Database], buf: &mut Vec<u8>) {
         // Collect non-expired entries
         let live: Vec<_> = data
             .iter()
-            .filter(|(_, entry)| !entry.is_expired_at(now_ms))
+            .filter(|(key, entry)| !db.entry_is_expired_at(key.as_bytes(), entry, now_ms))
             .collect();
 
         if live.is_empty() {
@@ -595,7 +594,8 @@ pub fn write_rdb_body_refs(databases: &[&Database], buf: &mut Vec<u8>) {
         write_length(buf, expires_count as u64);
 
         for (key, entry) in &live {
-            write_rdb_entry(buf, key.as_bytes(), entry);
+            let expires_at_ms = db.entry_expires_at_ms(key.as_bytes(), entry);
+            write_rdb_entry(buf, key.as_bytes(), entry, expires_at_ms);
         }
     }
 }
@@ -788,11 +788,14 @@ pub fn load_rdb<D: std::borrow::BorrowMut<Database>>(
                 // This is a data entry
                 let key_bytes = read_redis_string(&mut cursor)?;
                 let entry = read_rdb_entry(&mut cursor, type_tag, pending_expiry_ms)?;
+                let expires_at_ms = pending_expiry_ms.unwrap_or(0);
                 pending_expiry_ms = None;
 
                 if current_db < databases.len() {
                     let key = Bytes::from(key_bytes);
-                    databases[current_db].borrow_mut().set(&key, entry);
+                    databases[current_db]
+                        .borrow_mut()
+                        .set_with_expiry(&key, entry, expires_at_ms);
                     total_keys += 1;
                 }
             }
@@ -837,7 +840,7 @@ pub(crate) fn read_rdb_entry(
             }
             let mut entry = Entry::new_set();
             if let Some(rv) = entry.redis_value_mut() {
-                *rv = RedisValue::Set(set);
+                *rv = RedisValue::Set(Box::new(set));
             }
             entry
         }
@@ -852,7 +855,7 @@ pub(crate) fn read_rdb_entry(
             }
             let mut entry = Entry::new_hash();
             if let Some(rv) = entry.redis_value_mut() {
-                *rv = RedisValue::Hash(map);
+                *rv = RedisValue::Hash(Box::new(map));
             }
             entry
         }
@@ -872,7 +875,10 @@ pub(crate) fn read_rdb_entry(
             }
             let mut entry = Entry::new_sorted_set();
             if let Some(rv) = entry.redis_value_mut() {
-                *rv = RedisValue::SortedSet { members, scores };
+                *rv = RedisValue::SortedSet {
+                    members: Box::new(members),
+                    scores: Box::new(scores),
+                };
             }
             entry
         }
@@ -1005,10 +1011,9 @@ pub(crate) fn read_rdb_entry(
         other => bail!("Unsupported RDB type tag: {}", other),
     };
 
-    // Apply expiry if present
-    if let Some(ms) = expiry_ms {
-        entry.set_expires_at_ms(ms);
-    }
+    // Mark (but do not store) the expiry: the deadline is the caller's to
+    // file under the key — see `CompactEntry`'s docs.
+    entry.set_has_expiry(expiry_ms.is_some_and(|ms| ms != 0));
 
     Ok(entry)
 }
@@ -1273,9 +1278,10 @@ mod tests {
     fn test_write_rdb_string_with_ttl() {
         let mut db = Database::new();
         let expire_ms = current_time_ms() + 60_000;
-        db.set(
+        db.set_with_expiry(
             b"expkey",
-            Entry::new_string_with_expiry(Bytes::from_static(b"val"), expire_ms),
+            Entry::new_string(Bytes::from_static(b"val")),
+            expire_ms,
         );
         let databases = vec![db];
         let mut buf = Vec::new();
@@ -1378,9 +1384,10 @@ mod tests {
     fn test_roundtrip_string_with_ttl() {
         let mut db = Database::new();
         let expire_ms = current_time_ms() + 600_000; // 10 min in future
-        db.set(
+        db.set_with_expiry(
             b"ek",
-            Entry::new_string_with_expiry(Bytes::from_static(b"ev"), expire_ms),
+            Entry::new_string(Bytes::from_static(b"ev")),
+            expire_ms,
         );
         let databases = vec![db];
         let mut buf = Vec::new();
@@ -1390,11 +1397,15 @@ mod tests {
         let count = load_rdb(&mut load_dbs, &buf).unwrap();
         assert_eq!(count, 1);
 
-        let data = load_dbs[0].data();
-        let entry = data.get(b"ek".as_ref()).expect("key ek not found");
-        assert!(entry.has_expiry());
+        assert!(
+            load_dbs[0]
+                .data()
+                .get(b"ek".as_ref())
+                .expect("key ek not found")
+                .has_expiry()
+        );
         // TTL should be approximately the same (within 1 second tolerance)
-        let loaded_ms = entry.expires_at_ms();
+        let loaded_ms = load_dbs[0].expires_at_ms(b"ek");
         let diff = (loaded_ms as i64 - expire_ms as i64).unsigned_abs();
         assert!(
             diff < 1000,
@@ -1540,9 +1551,10 @@ mod tests {
 
         // String with TTL
         let expire_ms = current_time_ms() + 300_000;
-        db.set(
+        db.set_with_expiry(
             b"str_ttl",
-            Entry::new_string_with_expiry(Bytes::from_static(b"world"), expire_ms),
+            Entry::new_string(Bytes::from_static(b"world")),
+            expire_ms,
         );
 
         // Hash
@@ -1722,7 +1734,7 @@ mod tests {
         }
 
         let mut buf = Vec::new();
-        write_rdb_entry(&mut buf, b"mystream", &entry);
+        write_rdb_entry(&mut buf, b"mystream", &entry, 0);
         assert_eq!(
             buf[0], RDB_TYPE_STREAM_MOON,
             "no TTL set, first byte is the type tag"
@@ -1782,7 +1794,7 @@ mod tests {
             *rv = RedisValue::Stream(Box::new(stream));
         }
         let mut full = Vec::new();
-        write_rdb_entry(&mut full, b"k", &entry);
+        write_rdb_entry(&mut full, b"k", &entry, 0);
 
         for cut in 1..full.len() {
             let mut cursor = Cursor::new(&full[1..cut.max(1)]);

@@ -527,7 +527,7 @@ mod tests {
     fn a_key_ttl_changes_the_digest_by_a_fixed_marker() {
         // SET str_exp withttl ; EXPIRE str_exp 9999
         let mut e = string_entry("withttl");
-        e.set_expires_at_ms(1_000_000_000_000);
+        e.set_has_expiry(true);
         assert_eq!(
             to_hex(&object_digest(&e)),
             "77c90aba73e11e26e94722d08db485ca000dbc61"
@@ -535,7 +535,7 @@ mod tests {
         // The marker encodes PRESENCE only: a different deadline is the same
         // digest, or the value would change on every second that passed.
         let mut e2 = string_entry("withttl");
-        e2.set_expires_at_ms(2_000_000_000_000);
+        e2.set_has_expiry(true);
         assert_eq!(object_digest(&e), object_digest(&e2));
         assert_ne!(object_digest(&e), object_digest(&string_entry("withttl")));
     }
@@ -571,7 +571,7 @@ mod tests {
             .map(|s| Bytes::copy_from_slice(&s[..]))
             .collect();
         assert_eq!(
-            to_hex(&object_digest(&entry_of(RedisValue::Set(set)))),
+            to_hex(&object_digest(&entry_of(RedisValue::Set(Box::new(set))))),
             "0fd9977d57e46b1b9b87439f5ac5b338416ccc24"
         );
     }
@@ -583,7 +583,7 @@ mod tests {
         map.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
         map.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
         assert_eq!(
-            to_hex(&object_digest(&entry_of(RedisValue::Hash(map)))),
+            to_hex(&object_digest(&entry_of(RedisValue::Hash(Box::new(map))))),
             "047cc60ea73a34cde6d08a2721a4a26d19ee6570"
         );
     }
@@ -597,7 +597,10 @@ mod tests {
             m.insert(b.clone(), *sc);
             scores.insert((OrderedFloat(*sc), b), ());
         }
-        entry_of(RedisValue::SortedSet { members: m, scores })
+        entry_of(RedisValue::SortedSet {
+            members: Box::new(m),
+            scores: Box::new(scores),
+        })
     }
 
     #[test]
@@ -655,14 +658,22 @@ mod tests {
         map.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
         map.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
         let mut exp = string_entry("withttl");
-        exp.set_expires_at_ms(1_000_000_000_000);
+        exp.set_has_expiry(true);
 
         accumulate_key(&mut acc, b"str_plain", &string_entry("hello"));
         accumulate_key(&mut acc, b"str_int", &string_entry("12345"));
         accumulate_key(&mut acc, b"str_exp", &exp);
         accumulate_key(&mut acc, b"mylist", &entry_of(RedisValue::List(list)));
-        accumulate_key(&mut acc, b"myset", &entry_of(RedisValue::Set(set)));
-        accumulate_key(&mut acc, b"myhash", &entry_of(RedisValue::Hash(map)));
+        accumulate_key(
+            &mut acc,
+            b"myset",
+            &entry_of(RedisValue::Set(Box::new(set))),
+        );
+        accumulate_key(
+            &mut acc,
+            b"myhash",
+            &entry_of(RedisValue::Hash(Box::new(map))),
+        );
         accumulate_key(&mut acc, b"myzset", &zset(&[(b"m1", 1.0), (b"m2", 2.0)]));
         accumulate_key(
             &mut acc,

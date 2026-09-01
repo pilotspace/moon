@@ -500,8 +500,8 @@ fn store_geo_matches(
     let mut entry = crate::storage::entry::Entry::new_sorted_set_bptree();
     entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
         crate::storage::entry::RedisValue::SortedSetBPTree {
-            tree: new_tree,
-            members: new_members,
+            tree: Box::new(new_tree),
+            members: Box::new(new_members),
         },
     );
     db.set(&dest, entry);

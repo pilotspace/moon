@@ -163,26 +163,27 @@ pub fn restore(db: &mut Database, args: &[Frame]) -> Frame {
         ));
     }
 
-    let mut entry = match dump_payload::decode(payload) {
+    let entry = match dump_payload::decode(payload) {
         Ok(entry) => entry,
         Err(e @ (DumpError::BadPayload | DumpError::UnsupportedEncoding(_))) => {
             return Frame::Error(Bytes::from(e.message()));
         }
     };
 
-    if ttl > 0 {
+    let expires_at_ms = if ttl > 0 {
         // A relative TTL is measured from now; ABSTTL is already absolute.
         // Saturating, because `RESTORE k 9223372036854775807` must not wrap
         // into a timestamp in the past and delete the key it just wrote.
-        let when = if absttl {
+        if absttl {
             ttl as u64
         } else {
             current_time_ms().saturating_add(ttl as u64)
-        };
-        entry.set_expires_at_ms(when);
-    }
+        }
+    } else {
+        0
+    };
 
-    db.set(key, entry);
+    db.set_with_expiry(key, entry, expires_at_ms);
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
@@ -308,9 +309,8 @@ mod tests {
             ),
             ok_frame()
         );
-        let entry = db.get(b"k").expect("restored key");
-        assert!(entry.has_expiry());
-        assert!(entry.expires_at_ms() > current_time_ms());
+        assert!(db.get(b"k").expect("restored key").has_expiry());
+        assert!(db.expires_at_ms(b"k") > current_time_ms());
     }
 
     #[test]
@@ -469,8 +469,8 @@ mod dispatch_wiring_tests {
         let mut entry = crate::storage::Entry::new_string(Bytes::new());
         entry.value =
             crate::storage::compact_value::CompactValue::from_redis_value(RedisValue::SortedSet {
-                members: members.clone(),
-                scores,
+                members: Box::new(members.clone()),
+                scores: Box::new(scores),
             });
 
         // Serialize exactly as the eviction path does, so the payload under

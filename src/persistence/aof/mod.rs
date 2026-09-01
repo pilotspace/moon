@@ -1141,9 +1141,8 @@ mod tests {
         assert_eq!(count, 2);
 
         let base_ts = dbs[0].base_timestamp();
-        let entry = dbs[0].get(b"mykey").unwrap();
-        assert!(entry.has_expiry());
-        let remaining_secs = (entry.expires_at_ms() - current_time_ms()) / 1000;
+        assert!(dbs[0].get(b"mykey").unwrap().has_expiry());
+        let remaining_secs = (dbs[0].expires_at_ms(b"mykey") - current_time_ms()) / 1000;
         assert!(remaining_secs >= 50); // Allow some tolerance
     }
 
@@ -1277,9 +1276,8 @@ mod tests {
         assert_eq!(count, 2); // SET + PEXPIRE
 
         let base_ts = loaded_dbs[0].base_timestamp();
-        let entry = loaded_dbs[0].get(b"key").unwrap();
-        assert!(entry.has_expiry());
-        let remaining_secs = (entry.expires_at_ms() - current_time_ms()) / 1000;
+        assert!(loaded_dbs[0].get(b"key").unwrap().has_expiry());
+        let remaining_secs = (loaded_dbs[0].expires_at_ms(b"key") - current_time_ms()) / 1000;
         assert!(remaining_secs > 3500);
     }
 
@@ -1292,6 +1290,7 @@ mod tests {
         Vec<(
             crate::storage::compact_key::CompactKey,
             crate::storage::entry::Entry,
+            u64,
         )>,
     > {
         let now_ms = crate::storage::entry::current_time_ms();
@@ -1299,8 +1298,11 @@ mod tests {
             .map(|db| {
                 db.data()
                     .iter()
-                    .filter(|(_, e)| !e.is_expired_at(now_ms))
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .filter(|(k, e)| !db.entry_is_expired_at(k.as_bytes(), e, now_ms))
+                    .map(|(k, v)| {
+                        let ttl = db.entry_expires_at_ms(k.as_bytes(), v);
+                        (k.clone(), v.clone(), ttl)
+                    })
                     .collect()
             })
             .collect()

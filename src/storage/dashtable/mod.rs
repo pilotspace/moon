@@ -744,11 +744,15 @@ mod tests {
     /// key slots and `TOTAL_SLOTS` value slots. Segments live in slab `Vec`s,
     /// so there is no per-segment allocator rounding — the slab pays it once.
     ///
-    /// Divide by the achieved fill to get bytes/key:
-    ///   * split at `LOAD_THRESHOLD` (54) leaves a segment holding 27..54 keys,
-    ///     so the population averages ~40.5 -> ~85 bytes/key;
+    /// Divide by the achieved fill to get bytes/key. A split halves a segment,
+    /// so live segments hold `LOAD_THRESHOLD/2 .. LOAD_THRESHOLD` keys and the
+    /// population mean sits at ~3/4 of the threshold. Measured over 200k
+    /// 16-byte keys (the `redis-benchmark -r` shape), the fill ratio is 0.7503
+    /// at threshold 54 and 0.7690 at 56 -- so the 3/4 rule is real, not assumed.
+    ///
+    ///   * threshold 56 -> 43.07 keys/segment -> ~70 bytes/key;
     ///   * `with_capacity` deliberately over-allocates one depth level, halving
-    ///     the fill to ~27 keys/segment -> ~128 bytes/key.
+    ///     the fill -> ~107 bytes/key.
     ///
     /// Redis 7.0.15 for comparison, per key: `dictEntry` 24 B in jemalloc's
     /// 32-byte class, plus ~12 B of `dictEntry*` bucket array (the table doubles
@@ -762,33 +766,47 @@ mod tests {
         let seg = std::mem::size_of::<Segment<CompactKey, CompactEntry>>();
 
         assert_eq!(std::mem::size_of::<CompactKey>(), 24);
-        assert_eq!(std::mem::size_of::<CompactEntry>(), 32);
-        assert_eq!(TOTAL_SLOTS, 60);
-        assert_eq!(LOAD_THRESHOLD, 54);
+        assert_eq!(
+            std::mem::size_of::<CompactEntry>(),
+            24,
+            "CompactEntry must stay 24 B: the 8-byte `ttl_ms` moved to the              Database-owned `expires` map (Redis's `db->expires`), because it              was charged to EVERY slot -- 60 per segment -- while fewer than              1 key in 1000 of a cache workload has a TTL at all."
+        );
+        assert_eq!(
+            TOTAL_SLOTS, 61,
+            "61, not 60: the 64-byte alignment rounds the segment up to 3008 B \
+             either way, so the 60-slot layout left 48 B of tail padding -- \
+             exactly one more (key, value) pair. See segment_wastes_no_tail_padding."
+        );
+        assert_eq!(
+            LOAD_THRESHOLD, 56,
+            "56, not 54: raising it lifts the measured fill from 40.52 to 43.07 \
+             keys/segment, worth 4.39 B/key. It is affordable only because the \
+             free 61st slot keeps overflow headroom at 5 -- non-home segments \
+             measured 1.10% here versus 1.42% at the old (60, 54)."
+        );
 
         // 64 (ctrl) + 8 (count/depth) + 1 (has_non_home_keys) + padding
-        // + 60*24 (keys) + 60*32 (values), rounded to the 64-byte alignment.
+        // + 61*24 (keys) + 61*24 (values) = 3008 exactly, no tail padding.
         assert_eq!(
-            seg, 3456,
+            seg, 3008,
             "Segment layout changed; recompute the per-key memory ledger"
         );
 
-        // Bytes/key at the three fills that actually occur. A split halves a
-        // segment, so live segments hold LOAD_THRESHOLD/2 .. LOAD_THRESHOLD
-        // keys and the population mean is 3/4 of LOAD_THRESHOLD = 40.5.
+        // Bytes/key at the three fills that actually occur.
         assert_eq!(
             seg / LOAD_THRESHOLD,
-            64,
+            53,
             "best case, at the split threshold"
         );
         assert_eq!(
             seg * 4 / (LOAD_THRESHOLD * 3),
-            85,
-            "organic fill, ~40.5 keys/segment"
+            71,
+            "organic fill; measured 69.85 at 43.07 keys/segment. Was 85 with the \
+             32-byte entry and 74 after the entry shrink alone."
         );
         assert_eq!(
             seg * 2 / LOAD_THRESHOLD,
-            128,
+            107,
             "--initial-keyspace-hint: with_capacity adds a depth level, halving fill"
         );
     }
@@ -1417,5 +1435,30 @@ mod tests {
                 i,
             );
         }
+    }
+
+    /// A segment is 64-byte aligned, so its footprint is rounded up. Any bytes
+    /// past the last value slot are pure waste: they are mapped, they are paid
+    /// for on every segment, and they store nothing.
+    ///
+    /// This pins the waste below one slot's worth. If it ever reaches a full
+    /// `(key, value)` pair, the segment is carrying a slot it refuses to use —
+    /// per-key overhead we are paying and not spending.
+    #[test]
+    fn segment_wastes_no_tail_padding() {
+        use crate::storage::entry::CompactEntry;
+
+        let seg = std::mem::size_of::<Segment<CompactKey, CompactEntry>>();
+        let values_at = std::mem::offset_of!(Segment<CompactKey, CompactEntry>, values);
+        let used = values_at + TOTAL_SLOTS * std::mem::size_of::<CompactEntry>();
+        let waste = seg - used;
+        let slot = std::mem::size_of::<CompactKey>() + std::mem::size_of::<CompactEntry>();
+
+        assert!(
+            waste < slot,
+            "segment is {seg} B, uses {used} B, wastes {waste} B of tail padding — \
+             enough for {} more slot(s) of {slot} B at zero extra memory",
+            waste / slot
+        );
     }
 }

@@ -204,22 +204,18 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
     // Determine final expiry
     let final_expires_at_ms = if expires_at_ms > 0 {
         expires_at_ms
-    } else if keepttl {
+    } else if keepttl && db.get(key).is_some_and(Entry::has_expiry) {
         // Preserve existing TTL
-        db.get(key).map(|e| e.expires_at_ms()).unwrap_or(0)
+        db.expires_at_ms(key)
     } else {
         0
     };
 
-    let mut entry = if final_expires_at_ms > 0 {
-        Entry::new_string_with_expiry(value, final_expires_at_ms)
-    } else {
-        Entry::new_string(value)
-    };
+    let mut entry = Entry::new_string(value);
     // Set last_access from db cached time (version will be set by db.set)
     entry.set_last_access(db.now());
     entry.set_access_counter(5);
-    db.set(key, entry);
+    db.set_with_expiry(key, entry, final_expires_at_ms);
 
     if get_old {
         old_value.unwrap_or(Frame::Null)
@@ -359,9 +355,9 @@ pub fn decrby(db: &mut Database, args: &[Frame]) -> Frame {
 /// Internal helper for INCR/DECR/INCRBY/DECRBY.
 fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
     // Get current value and existing expiry
-    let (current, existing_expiry_ms) = match db.get(key) {
+    let (current, had_expiry) = match db.get(key) {
         Some(entry) => {
-            let expiry = entry.expires_at_ms();
+            let had_expiry = entry.has_expiry();
             match entry.value.as_bytes() {
                 Some(v) => {
                     let s = match std::str::from_utf8(v) {
@@ -373,7 +369,7 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
                         }
                     };
                     match s.parse::<i64>() {
-                        Ok(n) => (n, expiry),
+                        Ok(n) => (n, had_expiry),
                         Err(_) => {
                             return Frame::Error(Bytes::from_static(
                                 b"ERR value is not an integer or out of range",
@@ -388,8 +384,10 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
                 }
             }
         }
-        None => (0, 0),
+        None => (0, false),
     };
+    // INCR keeps the deadline it found (Redis: the TTL survives a value edit).
+    let existing_expiry_ms = if had_expiry { db.expires_at_ms(key) } else { 0 };
 
     let new_val = match current.checked_add(delta) {
         Some(v) => v,
@@ -410,11 +408,7 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
     // was never even the storage.
     let mut itoa_buf = itoa::Buffer::new();
     let printed = itoa_buf.format(new_val).as_bytes();
-    let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_from_slice_with_expiry(printed, existing_expiry_ms)
-    } else {
-        Entry::new_string_from_slice(printed)
-    };
+    let mut entry = Entry::new_string_from_slice(printed);
     entry.set_last_access(db.now());
     entry.set_access_counter(5);
     // "incrby", not "incr": Redis names the internal operation, not the
@@ -425,7 +419,7 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
         key,
         db.db_index,
     );
-    db.set(key, entry);
+    db.set_with_expiry(key, entry, existing_expiry_ms);
 
     Frame::Integer(new_val)
 }
@@ -450,9 +444,9 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     // Get current value and existing expiry
-    let (current, existing_expiry_ms) = match db.get(key) {
+    let (current, had_expiry) = match db.get(key) {
         Some(entry) => {
-            let expiry = entry.expires_at_ms();
+            let had_expiry = entry.has_expiry();
             match entry.value.as_bytes() {
                 Some(v) => {
                     let s = match std::str::from_utf8(v) {
@@ -464,7 +458,7 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
                         }
                     };
                     match s.parse::<f64>() {
-                        Ok(f) => (f, expiry),
+                        Ok(f) => (f, had_expiry),
                         Err(_) => {
                             return Frame::Error(Bytes::from_static(
                                 b"ERR value is not a valid float",
@@ -479,8 +473,10 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
                 }
             }
         }
-        None => (0.0, 0),
+        None => (0.0, false),
     };
+    // INCRBYFLOAT keeps the deadline it found.
+    let existing_expiry_ms = if had_expiry { db.expires_at_ms(key) } else { 0 };
 
     let result = current + increment;
     if result.is_nan() || result.is_infinite() {
@@ -491,14 +487,10 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
 
     let formatted = format_float(result);
 
-    let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(Bytes::from(formatted.clone()), existing_expiry_ms)
-    } else {
-        Entry::new_string(Bytes::from(formatted.clone()))
-    };
+    let mut entry = Entry::new_string(Bytes::from(formatted.clone()));
     entry.set_last_access(db.now());
     entry.set_access_counter(5);
-    db.set(key, entry);
+    db.set_with_expiry(key, entry, existing_expiry_ms);
 
     Frame::BulkString(Bytes::from(formatted))
 }
@@ -518,11 +510,11 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     // Check if key exists, get existing data + expiry
-    let (existing_data, existing_expiry_ms) = match db.get(key) {
+    let (existing_data, had_expiry) = match db.get(key) {
         Some(entry) => {
-            let expiry = entry.expires_at_ms();
+            let had_expiry = entry.has_expiry();
             match entry.value.as_bytes_owned() {
-                Some(v) => (Some(v), expiry),
+                Some(v) => (Some(v), had_expiry),
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -530,8 +522,10 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
                 }
             }
         }
-        None => (None, 0),
+        None => (None, false),
     };
+    // APPEND keeps the deadline it found.
+    let existing_expiry_ms = if had_expiry { db.expires_at_ms(key) } else { 0 };
 
     // Enforce the 512MB max string size (matches SETRANGE/SETBIT); APPEND
     // previously let a string grow past the documented limit unbounded.
@@ -553,14 +547,10 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     let new_len = new_val.len() as i64;
-    let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(new_val, existing_expiry_ms)
-    } else {
-        Entry::new_string(new_val)
-    };
+    let mut entry = Entry::new_string(new_val);
     entry.set_last_access(db.now());
     entry.set_access_counter(5);
-    db.set(key, entry);
+    db.set_with_expiry(key, entry, existing_expiry_ms);
 
     Frame::Integer(new_len)
 }
@@ -608,11 +598,11 @@ pub fn setrange(db: &mut Database, args: &[Frame]) -> Frame {
         }
     };
 
-    let (existing_data, existing_expiry_ms) = match db.get(key) {
+    let (existing_data, had_expiry) = match db.get(key) {
         Some(entry) => {
-            let expiry = entry.expires_at_ms();
+            let had_expiry = entry.has_expiry();
             match entry.value.as_bytes() {
-                Some(v) => (Some(v.to_vec()), expiry),
+                Some(v) => (Some(v.to_vec()), had_expiry),
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -620,8 +610,10 @@ pub fn setrange(db: &mut Database, args: &[Frame]) -> Frame {
                 }
             }
         }
-        None => (None, 0),
+        None => (None, false),
     };
+    // SETRANGE keeps the deadline it found.
+    let existing_expiry_ms = if had_expiry { db.expires_at_ms(key) } else { 0 };
 
     let mut buf = existing_data.unwrap_or_default();
     // Extend with zero bytes if needed
@@ -633,14 +625,10 @@ pub fn setrange(db: &mut Database, args: &[Frame]) -> Frame {
 
     let new_len = buf.len() as i64;
     let new_val = Bytes::from(buf);
-    let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(new_val, existing_expiry_ms)
-    } else {
-        Entry::new_string(new_val)
-    };
+    let mut entry = Entry::new_string(new_val);
     entry.set_last_access(db.now());
     entry.set_access_counter(5);
-    db.set(key, entry);
+    db.set_with_expiry(key, entry, existing_expiry_ms);
 
     Frame::Integer(new_len)
 }

@@ -981,12 +981,12 @@ fn select_victim(
 /// could still have used.
 pub const SPILL_TTL_FLOOR_MS: u64 = 1_000;
 
-/// `true` when `entry` is so close to expiry that spilling it would be wasted
-/// IO (moon#553). Reads the TTL already in hand — no clock syscall, no
-/// allocation, no lookup.
+/// `true` when a victim is so close to expiry that spilling it would be
+/// wasted IO (moon#553). Takes the deadline the caller already read out of
+/// the database (`0` = no expiry) — no clock syscall, no allocation.
 #[inline]
-fn expiring_too_soon_to_spill(entry: &crate::storage::Entry, now_ms: u64) -> bool {
-    entry.has_expiry() && entry.expires_at_ms().saturating_sub(now_ms) < SPILL_TTL_FLOOR_MS
+fn expiring_too_soon_to_spill(expires_at_ms: u64, now_ms: u64) -> bool {
+    expires_at_ms != 0 && expires_at_ms.saturating_sub(now_ms) < SPILL_TTL_FLOOR_MS
 }
 
 /// Serialize a victim entry's value for spill (W2: the single implementation
@@ -1000,6 +1000,7 @@ fn expiring_too_soon_to_spill(entry: &crate::storage::Entry, now_ms: u64) -> boo
 /// body and evicted the key (silent data loss on reload).
 fn build_spill_payload(
     entry: &crate::storage::Entry,
+    expires_at_ms: u64,
 ) -> Option<(ValueType, Bytes, u8, Option<u64>)> {
     let val_ref = entry.as_redis_value();
     let (value_type, value_bytes): (ValueType, Bytes) = match val_ref {
@@ -1012,9 +1013,9 @@ fn build_spill_payload(
         }
     };
     let mut flags: u8 = 0;
-    let ttl_ms = if entry.has_expiry() {
+    let ttl_ms = if expires_at_ms != 0 {
         flags |= entry_flags::HAS_TTL;
-        Some(entry.expires_at_ms())
+        Some(expires_at_ms)
     } else {
         None
     };
@@ -1035,21 +1036,23 @@ fn build_spill_payload(
 /// Returns `None` only if the payload does not deserialize — impossible for
 /// bytes produced by `build_spill_payload` unless memory was corrupted in
 /// transit; the caller logs that loudly.
+/// Returns the rebuilt entry and its deadline (absolute unix ms, `0` = none).
+/// The deadline is returned ALONGSIDE rather than stored in the entry: a
+/// rehydrated entry is not a hot key, so it has no row in the database's
+/// `expires` map to read one back from.
 pub(crate) fn rehydrate_spill_payload(
     value_type: ValueType,
     value_bytes: &Bytes,
     ttl_ms: Option<u64>,
-) -> Option<crate::storage::Entry> {
+) -> Option<(crate::storage::Entry, u64)> {
     let redis_value = match value_type {
         ValueType::String => RedisValue::String(value_bytes.clone()),
         _ => kv_serde::deserialize_collection(value_bytes, value_type)?,
     };
     let mut entry = crate::storage::Entry::new_string(Bytes::new());
     entry.value = crate::storage::compact_value::CompactValue::from_redis_value(redis_value);
-    if let Some(ttl) = ttl_ms {
-        entry.set_expires_at_ms(ttl);
-    }
-    Some(entry)
+    entry.set_has_expiry(ttl_ms.is_some_and(|t| t != 0));
+    Some((entry, ttl_ms.unwrap_or(0)))
 }
 
 /// Batch-durable synchronous spill (W2: the ONE sync spill implementation).
@@ -1112,6 +1115,7 @@ fn evict_batch_durable(
         stall = 0;
         seen.insert(key.clone());
 
+        let victim_ttl = db.expires_at_ms(key.as_bytes());
         let Some(entry) = db.data().get(key.as_bytes()) else {
             // Race with expiry: nothing to spill for this key, but it is
             // already gone, so keep sampling for more victims.
@@ -1119,7 +1123,7 @@ fn evict_batch_durable(
         };
         // moon#553: about to expire — drop it now rather than pay a datafile
         // write plus a manifest commit for a cold entry nothing will reclaim.
-        if expiring_too_soon_to_spill(entry, now_ms) {
+        if expiring_too_soon_to_spill(victim_ttl, now_ms) {
             let before = db.estimated_memory();
             db.remove(key.as_bytes());
             crate::admin::metrics_setup::record_expiring_spill_skipped();
@@ -1134,7 +1138,8 @@ fn evict_batch_durable(
         // Fail-closed: an unserializable (corrupt) value is retained hot and
         // skipped — its `seen` entry stops the sampler from re-picking it
         // into this batch, and staging continues with other victims.
-        let Some((value_type, value_bytes, flags, ttl_ms)) = build_spill_payload(entry) else {
+        let Some((value_type, value_bytes, flags, ttl_ms)) = build_spill_payload(entry, victim_ttl)
+        else {
             warn!(
                 key = %String::from_utf8_lossy(key.as_bytes()),
                 "kv_spill: victim value cannot be serialized; retaining hot \
@@ -1250,10 +1255,11 @@ fn evict_one_async_spill(
 
     // Build SpillRequest from the entry BEFORE removing it from DashTable.
     // This is CPU work only -- no I/O on the event loop.
+    let victim_ttl = db.expires_at_ms(key.as_bytes());
     if let Some(entry) = db.data().get(key.as_bytes()) {
         // moon#553: about to expire — skip the queue/pwrite/manifest round
         // trip entirely and reclaim the RAM now.
-        if expiring_too_soon_to_spill(entry, db.now_ms()) {
+        if expiring_too_soon_to_spill(victim_ttl, db.now_ms()) {
             db.remove(key.as_bytes());
             crate::admin::metrics_setup::record_expiring_spill_skipped();
             crate::admin::metrics_setup::record_eviction();
@@ -1263,7 +1269,8 @@ fn evict_one_async_spill(
         // Fail-closed: a value that cannot be faithfully serialized must not
         // be evicted (pre-W2 this spilled an EMPTY body and dropped the key).
         // Bail; the caller surfaces OOM rather than losing data.
-        let Some((value_type, value_bytes, flags, ttl_ms)) = build_spill_payload(entry) else {
+        let Some((value_type, value_bytes, flags, ttl_ms)) = build_spill_payload(entry, victim_ttl)
+        else {
             warn!(
                 key = %String::from_utf8_lossy(key.as_bytes()),
                 "kv_spill: async-spill victim cannot be serialized; retaining \
@@ -1527,7 +1534,8 @@ fn find_victim_volatile_ttl(db: &mut Database) -> Option<CompactKey> {
         if db
             .data()
             .get(key.as_bytes())
-            .is_some_and(|e| e.expires_at_ms() == ts)
+            .is_some_and(crate::storage::Entry::has_expiry)
+            && db.expires_at_ms(key.as_bytes()) == ts
         {
             return Some(key);
         }
@@ -1582,15 +1590,17 @@ mod tests {
         let mut db = super::Database::new();
         let far_ms = current_time_ms() + 3_600_000;
         for i in 0..5_000u32 {
-            db.set(
+            db.set_with_expiry(
                 &Bytes::from(format!("far_{i}")),
-                Entry::new_string_with_expiry(Bytes::from_static(b"v"), far_ms + u64::from(i)),
+                Entry::new_string(Bytes::from_static(b"v")),
+                far_ms + u64::from(i),
             );
         }
         // Volatile and clearly the soonest, but NOT expired.
-        db.set(
+        db.set_with_expiry(
             b"soonest",
-            Entry::new_string_with_expiry(Bytes::from_static(b"v"), current_time_ms() + 60_000),
+            Entry::new_string(Bytes::from_static(b"v")),
+            current_time_ms() + 60_000,
         );
 
         assert!(evict_one_volatile_ttl(&mut db, 5));
@@ -1611,22 +1621,27 @@ mod tests {
         map.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
         let mut entry = Entry::new_string(Bytes::new());
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
-            crate::storage::entry::RedisValue::Hash(map.clone()),
+            crate::storage::entry::RedisValue::Hash(Box::new(map.clone())),
         );
-        entry.set_expires_at_ms(current_time_ms() + 60_000);
+        let deadline = current_time_ms() + 60_000;
+        entry.set_has_expiry(true);
 
-        let (vt, bytes, _flags, ttl) = build_spill_payload(&entry).expect("serializable");
-        let restored = rehydrate_spill_payload(vt, &bytes, ttl).expect("round-trip");
+        let (vt, bytes, _flags, ttl) = build_spill_payload(&entry, deadline).expect("serializable");
+        let (restored, restored_ttl) =
+            rehydrate_spill_payload(vt, &bytes, ttl).expect("round-trip");
         match restored.as_redis_value() {
             RedisValueRef::Hash(h) => assert_eq!(*h, map),
             _ => panic!("expected hash after rehydrate"),
         }
-        assert_eq!(restored.expires_at_ms(), entry.expires_at_ms());
+        assert_eq!(restored_ttl, deadline);
+        assert!(restored.has_expiry());
 
         // String payloads round-trip too.
         let s = Entry::new_string(Bytes::from_static(b"hello"));
-        let (vt, bytes, _f, ttl) = build_spill_payload(&s).expect("serializable");
-        let restored = rehydrate_spill_payload(vt, &bytes, ttl).expect("round-trip");
+        let (vt, bytes, _f, ttl) = build_spill_payload(&s, 0).expect("serializable");
+        let (restored, restored_ttl) =
+            rehydrate_spill_payload(vt, &bytes, ttl).expect("round-trip");
+        assert_eq!(restored_ttl, 0);
         match restored.as_redis_value() {
             RedisValueRef::String(v) => assert_eq!(v, b"hello"),
             _ => panic!("expected string after rehydrate"),
@@ -2768,9 +2783,9 @@ mod tests {
     /// the eviction paths expect (hot entry + indexed TTL).
     fn db_with_ttl_key(key: &'static [u8], remaining_ms: u64) -> Database {
         let mut db = Database::new();
-        let mut entry = crate::storage::Entry::new_string(Bytes::from_static(b"a-value"));
-        entry.set_expires_at_ms(db.now_ms() + remaining_ms);
-        db.set(key, entry);
+        let entry = crate::storage::Entry::new_string(Bytes::from_static(b"a-value"));
+        let deadline = db.now_ms() + remaining_ms;
+        db.set_with_expiry(key, entry, deadline);
         db
     }
 
@@ -2951,17 +2966,17 @@ mod tests {
     fn spill_ttl_floor_boundary_is_exclusive() {
         let db = db_with_ttl_key(b"k", SPILL_TTL_FLOOR_MS);
         let now = db.now_ms();
-        let at_floor = db.data().get(&b"k"[..]).expect("seeded").clone();
+        let at_floor = db.expires_at_ms(b"k");
         assert!(
-            !expiring_too_soon_to_spill(&at_floor, now),
+            !expiring_too_soon_to_spill(at_floor, now),
             "exactly at the floor still spills"
         );
 
         let db = db_with_ttl_key(b"k", SPILL_TTL_FLOOR_MS - 1);
         let now = db.now_ms();
-        let below = db.data().get(&b"k"[..]).expect("seeded").clone();
+        let below = db.expires_at_ms(b"k");
         assert!(
-            expiring_too_soon_to_spill(&below, now),
+            expiring_too_soon_to_spill(below, now),
             "one millisecond below the floor drops"
         );
     }
@@ -2979,9 +2994,9 @@ mod tests {
 
         let mut db = Database::new();
         for i in 0..32u32 {
-            let mut entry = crate::storage::Entry::new_string(Bytes::from_static(b"a-value"));
-            entry.set_expires_at_ms(db.now_ms() + 10);
-            db.set(format!("k{i}").as_bytes(), entry);
+            let entry = crate::storage::Entry::new_string(Bytes::from_static(b"a-value"));
+            let deadline = db.now_ms() + 10;
+            db.set_with_expiry(format!("k{i}").as_bytes(), entry, deadline);
         }
         let config = make_config(1, "allkeys-lru");
 
@@ -3416,12 +3431,10 @@ mod tests {
         let mut db = Database::new();
         let far_ms = current_time_ms() + 3_600_000;
         for i in 0..live_keys {
-            db.set(
+            db.set_with_expiry(
                 &Bytes::from(format!("live_{i:03}")),
-                Entry::new_string_with_expiry(
-                    Bytes::from_static(b"a_reasonably_sized_value_payload"),
-                    far_ms + i as u64,
-                ),
+                Entry::new_string(Bytes::from_static(b"a_reasonably_sized_value_payload")),
+                far_ms + i as u64,
             );
         }
         // The ghost: indexed, never present in `data`.

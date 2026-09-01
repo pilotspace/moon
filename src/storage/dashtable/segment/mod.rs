@@ -34,10 +34,21 @@ pub use ops::home_buckets;
 pub const REGULAR_SLOTS: usize = 56;
 
 /// Number of stash (overflow) bucket slots per segment.
-pub const STASH_SLOTS: usize = 4;
+///
+/// Five, not four. `Segment` is `align(64)`, so its footprint is rounded up to
+/// a multiple of 64 regardless of how many slots it declares. With a 24-byte
+/// `CompactKey` and a 24-byte `CompactEntry` the 60-slot layout measured
+/// 2960 B of content inside a 3008 B footprint — 48 B of tail padding, which
+/// is exactly one more `(key, value)` pair. The 61st slot is therefore free:
+/// same 3008 B, one more place to put a key. `segment_wastes_no_tail_padding`
+/// pins that, and will fail if a future layout change re-opens the gap.
+pub const STASH_SLOTS: usize = 5;
 
-/// Total slots per segment: 56 regular + 4 stash = 60.
+/// Total slots per segment: 56 regular + 5 stash = 61.
+///
+/// Must stay `<= CTRL_BYTES` (64) — every slot needs a control byte.
 pub const TOTAL_SLOTS: usize = REGULAR_SLOTS + STASH_SLOTS;
+const _: () = assert!(TOTAL_SLOTS <= CTRL_BYTES);
 
 /// Number of control byte groups (each group = 16 bytes for SIMD).
 pub(super) const NUM_GROUPS: usize = 4;
@@ -46,10 +57,23 @@ pub(super) const NUM_GROUPS: usize = 4;
 /// Slots 60-63 are padding (always EMPTY).
 pub(super) const CTRL_BYTES: usize = NUM_GROUPS * 16;
 
-/// Load threshold: 90% of 60 = 54 slots. Triggers split when reached.
-/// Higher threshold improves average fill factor (~67% vs ~62% at 85%),
-/// reducing per-key memory overhead by ~8% with minimal impact on probe length.
-pub const LOAD_THRESHOLD: usize = 54;
+/// Load threshold: 56 of 61 slots. Triggers a split when reached.
+///
+/// A split halves a segment, so the population mean fill is ~3/4 of this
+/// number. Measured over 200k 16-byte keys: 40.52 keys/segment at 54 versus
+/// 43.07 at 56, which is 74.24 -> 69.85 structural bytes per key.
+///
+/// The 4.39 B/key is not free. Packing tighter pushes more keys out of their
+/// home groups, and `has_non_home_keys` is sticky, so a single overflow makes
+/// every later lookup in that segment pay the fallback scan. Measured
+/// contamination: 1.42% of segments at the old (60 slots, 54), 1.10% at
+/// (61, 56), 1.48% at (61, 57). Paired A/B over 25 interleaved rounds put
+/// (61, 56) at roughly +2% on a table-local hit and +4% on a miss against
+/// (60, 54) -- small, and at the edge of what the harness resolves, but real.
+///
+/// 57 was measured and rejected: it buys only 1.58 B/key more and costs more
+/// on the hit path, which is the hot one.
+pub const LOAD_THRESHOLD: usize = 56;
 
 /// Extract the H2 fingerprint from a hash: top 7 bits, ensuring MSB is 0
 /// so the value (0x00..0x7F) is distinguishable from EMPTY (0xFF) and

@@ -37,20 +37,21 @@ use crate::storage::Database;
 /// - The caller holds exclusive (write) access to both
 pub fn move_core(src: &mut Database, dst: &mut Database, key: &[u8]) -> Frame {
     // Key must exist in src (lazy expiry applied inside `remove`)
-    let entry = match src.remove(key) {
-        Some(e) => e,
+    let (entry, ttl) = match src.remove(key) {
+        Some(pair) => pair,
         None => return Frame::Integer(0),
     };
 
     // Collision check: key must NOT exist in dst
     if dst.exists(key) {
-        // Restore the entry to src — the move did not happen
-        src.set(key, entry);
+        // Restore the entry to src — the move did not happen, so the deadline
+        // must come back with the value.
+        src.set_with_expiry(key, entry, ttl);
         return Frame::Integer(0);
     }
 
-    // Move: insert into dst, TTL is carried inside the Entry value
-    dst.set(key, entry);
+    // Move: insert into dst carrying the deadline (Redis MOVE keeps the TTL).
+    dst.set_with_expiry(key, entry, ttl);
     Frame::Integer(1)
 }
 
@@ -76,6 +77,10 @@ pub fn copy_core(
         Some(e) => e.clone(),
         None => return Frame::Integer(0),
     };
+    // COPY keeps the source's TTL on the destination (Redis semantics). It is
+    // read HERE, before `dst.exists` may borrow `dst`, and never travels
+    // inside the cloned entry.
+    let ttl = src.expires_at_ms(src_key);
 
     // Same src and dst key in different dbs is allowed; same key same db is
     // rejected by parse_copy_db_args. Nothing special needed here.
@@ -88,7 +93,7 @@ pub fn copy_core(
         // REPLACE: overwrite dst
     }
 
-    dst.set(dst_key, entry);
+    dst.set_with_expiry(dst_key, entry, ttl);
     Frame::Integer(1)
 }
 

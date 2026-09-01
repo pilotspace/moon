@@ -137,7 +137,7 @@ impl Database {
             PostReap::KeyDeleted => ReapOutcome::KeyDeleted,
             PostReap::NeedDowngrade(m) => {
                 // `rv` borrow from the previous match is gone; reassign safely.
-                *rv = RedisValue::Hash(m);
+                *rv = RedisValue::Hash(Box::new(m));
                 ReapOutcome::Downgraded
             }
             PostReap::FieldsRemoved => ReapOutcome::FieldsRemoved,

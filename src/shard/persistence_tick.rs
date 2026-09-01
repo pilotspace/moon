@@ -723,8 +723,8 @@ fn apply_completion_vec(
                         &req.value_bytes,
                         req.ttl_ms,
                     ) {
-                        Some(entry) => {
-                            db.set(&req.key, entry);
+                        Some((entry, expires_at_ms)) => {
+                            db.set_with_expiry(&req.key, entry, expires_at_ms);
                             crate::storage::tiered::spill_thread::record_spill_failed_reinserted();
                             tracing::error!(
                                 file_id = c.file_entry.file_id,

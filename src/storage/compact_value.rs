@@ -620,6 +620,47 @@ mod tests {
         assert_eq!(cv.estimate_memory(), 80);
     }
 
+    /// After boxing, each fat variant still reports its own heap type tag and
+    /// type name through `CompactValue`. The original commit also asserted the
+    /// stored pointer carries no tag bits via `heap_ptr()`; that helper belongs
+    /// to the branch's wrapper-less heap-string scheme, which main did not take
+    /// (#786 keeps a `HeapString` wrapper), so it is not expressible here and is
+    /// omitted rather than approximated.
+    #[test]
+    fn boxed_fat_variants_keep_their_type_tags() {
+        let cases: [(CompactValue, usize, &str); 4] = [
+            (
+                CompactValue::from_redis_value(RedisValue::Hash(Box::default())),
+                HEAP_TAG_HASH,
+                "hash",
+            ),
+            (
+                CompactValue::from_redis_value(RedisValue::List(VecDeque::new())),
+                HEAP_TAG_LIST,
+                "list",
+            ),
+            (
+                CompactValue::from_redis_value(RedisValue::Set(Box::default())),
+                HEAP_TAG_SET,
+                "set",
+            ),
+            (
+                CompactValue::from_redis_value(RedisValue::SortedSet {
+                    members: Box::default(),
+                    scores: Box::default(),
+                }),
+                HEAP_TAG_ZSET,
+                "zset",
+            ),
+        ];
+        for (cv, tag, name) in cases {
+            assert!(!cv.is_inline(), "{name} must be heap");
+            assert_eq!(cv.heap_type_tag(), tag, "{name} tag");
+            assert_eq!(cv.type_tag(), tag as u8, "{name} public tag");
+            assert_eq!(cv.type_name(), name);
+        }
+    }
+
     #[test]
     fn test_inline_string_small() {
         let cv = CompactValue::inline_string(b"hello");
@@ -666,7 +707,7 @@ mod tests {
     fn test_from_redis_value_hash() {
         let mut map = HashMap::new();
         map.insert(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
-        let rv = RedisValue::Hash(map);
+        let rv = RedisValue::Hash(Box::new(map));
         let cv = CompactValue::from_redis_value(rv);
         assert!(!cv.is_inline());
         assert_eq!(cv.type_name(), "hash");
@@ -690,7 +731,7 @@ mod tests {
     fn test_from_redis_value_set() {
         let mut set = HashSet::new();
         set.insert(Bytes::from_static(b"x"));
-        let rv = RedisValue::Set(set);
+        let rv = RedisValue::Set(Box::new(set));
         let cv = CompactValue::from_redis_value(rv);
         assert!(!cv.is_inline());
         assert_eq!(cv.type_name(), "set");
@@ -699,8 +740,8 @@ mod tests {
     #[test]
     fn test_from_redis_value_sorted_set() {
         let rv = RedisValue::SortedSet {
-            members: HashMap::new(),
-            scores: BTreeMap::new(),
+            members: Box::default(),
+            scores: Box::default(),
         };
         let cv = CompactValue::from_redis_value(rv);
         assert!(!cv.is_inline());
@@ -764,7 +805,7 @@ mod tests {
 
     #[test]
     fn test_as_redis_value_mut_heap() {
-        let rv = RedisValue::Hash(HashMap::new());
+        let rv = RedisValue::Hash(Box::default());
         let mut cv = CompactValue::from_redis_value(rv);
         let inner = cv.as_redis_value_mut().unwrap();
         if let RedisValue::Hash(map) = inner {

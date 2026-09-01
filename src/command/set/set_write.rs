@@ -371,7 +371,7 @@ pub fn sinterstore(db: &mut Database, args: &[Frame]) -> Frame {
     } else {
         let mut entry = Entry::new_set();
         if let Some(crate::storage::entry::RedisValue::Set(s)) = entry.value.as_redis_value_mut() {
-            *s = result;
+            **s = result;
         }
         db.set(dest, entry);
     }
@@ -404,7 +404,7 @@ pub fn sunionstore(db: &mut Database, args: &[Frame]) -> Frame {
     } else {
         let mut entry = Entry::new_set();
         if let Some(crate::storage::entry::RedisValue::Set(s)) = entry.value.as_redis_value_mut() {
-            *s = result;
+            **s = result;
         }
         db.set(dest, entry);
     }
@@ -437,7 +437,7 @@ pub fn sdiffstore(db: &mut Database, args: &[Frame]) -> Frame {
     } else {
         let mut entry = Entry::new_set();
         if let Some(crate::storage::entry::RedisValue::Set(s)) = entry.value.as_redis_value_mut() {
-            *s = result;
+            **s = result;
         }
         db.set(dest, entry);
     }
