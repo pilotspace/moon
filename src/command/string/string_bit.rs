@@ -94,7 +94,7 @@ pub fn setbit(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("SETBIT");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("SETBIT"),
     };
     let offset = match parse_i64(&args[1]) {
@@ -118,7 +118,7 @@ pub fn setbit(db: &mut Database, args: &[Frame]) -> Frame {
     let byte_idx = offset / 8;
     let bit_idx = 7 - (offset % 8);
 
-    let (existing_data, existing_expiry_ms) = match db.get(&key) {
+    let (existing_data, existing_expiry_ms) = match db.get(key) {
         Some(entry) => {
             let expiry = entry.expires_at_ms();
             match entry.value.as_bytes() {
@@ -413,7 +413,7 @@ pub fn bitop(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("BITOP"),
     };
     let destkey = match extract_bytes(&args[1]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("BITOP"),
     };
 
@@ -450,7 +450,7 @@ pub fn bitop(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => e,
         Ok(None) => {
             // All keys empty/missing — delete dest, return 0
-            db.remove(&destkey);
+            db.remove(destkey);
             Frame::Integer(0)
         }
         Ok(Some(result)) => {
@@ -778,11 +778,11 @@ pub fn bitfield(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("BITFIELD");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("BITFIELD"),
     };
 
-    let (existing_data, existing_expiry_ms) = match db.get(&key) {
+    let (existing_data, existing_expiry_ms) = match db.get(key) {
         Some(entry) => {
             let expiry = entry.expires_at_ms();
             match entry.value.as_bytes() {
@@ -1209,7 +1209,7 @@ mod tests {
     #[test]
     fn test_getbit_out_of_range() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"\xff"));
+        db.set_string(b"key", Bytes::from_static(b"\xff"));
         let result = getbit(&mut db, &[bs(b"key"), bs(b"100")]);
         assert_eq!(result, Frame::Integer(0));
     }
@@ -1228,7 +1228,7 @@ mod tests {
     #[test]
     fn test_setbit_clear() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"\xff"));
+        db.set_string(b"key", Bytes::from_static(b"\xff"));
         let result = setbit(&mut db, &[bs(b"key"), bs(b"0"), bs(b"0")]);
         assert_eq!(result, Frame::Integer(1)); // original was 1
         let result = getbit(&mut db, &[bs(b"key"), bs(b"0")]);
@@ -1250,7 +1250,7 @@ mod tests {
     fn test_bitcount_full_string() {
         let mut db = make_db();
         // "foobar" in bytes
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"foobar"));
+        db.set_string(b"key", Bytes::from_static(b"foobar"));
         let result = bitcount(&mut db, &[bs(b"key")]);
         assert_eq!(result, Frame::Integer(26)); // known count for "foobar"
     }
@@ -1258,7 +1258,7 @@ mod tests {
     #[test]
     fn test_bitcount_range() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"foobar"));
+        db.set_string(b"key", Bytes::from_static(b"foobar"));
         let result = bitcount(&mut db, &[bs(b"key"), bs(b"0"), bs(b"0")]);
         // 'f' = 0x66 = 01100110 → 4 bits
         assert_eq!(result, Frame::Integer(4));
@@ -1267,7 +1267,7 @@ mod tests {
     #[test]
     fn test_bitcount_negative_range() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"foobar"));
+        db.set_string(b"key", Bytes::from_static(b"foobar"));
         let result = bitcount(&mut db, &[bs(b"key"), bs(b"-1"), bs(b"-1")]);
         // 'r' = 0x72 = 01110010 → 4 bits
         assert_eq!(result, Frame::Integer(4));
@@ -1283,7 +1283,7 @@ mod tests {
     #[test]
     fn test_bitcount_bit_mode() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"\xff\x00"));
+        db.set_string(b"key", Bytes::from_static(b"\xff\x00"));
         // BIT mode: bits 0-7 are all 1 = 8 bits
         let result = bitcount(&mut db, &[bs(b"key"), bs(b"0"), bs(b"7"), bs(b"BIT")]);
         assert_eq!(result, Frame::Integer(8));
@@ -1294,8 +1294,8 @@ mod tests {
     #[test]
     fn test_bitop_and() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"a"), Bytes::from_static(b"\xff\x0f"));
-        db.set_string(Bytes::from_static(b"b"), Bytes::from_static(b"\x0f\xff"));
+        db.set_string(b"a", Bytes::from_static(b"\xff\x0f"));
+        db.set_string(b"b", Bytes::from_static(b"\x0f\xff"));
         let result = bitop(&mut db, &[bs(b"AND"), bs(b"dest"), bs(b"a"), bs(b"b")]);
         assert_eq!(result, Frame::Integer(2));
         let data = db.get(b"dest").unwrap().value.as_bytes().unwrap().to_vec();
@@ -1305,8 +1305,8 @@ mod tests {
     #[test]
     fn test_bitop_or() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"a"), Bytes::from_static(b"\xf0"));
-        db.set_string(Bytes::from_static(b"b"), Bytes::from_static(b"\x0f"));
+        db.set_string(b"a", Bytes::from_static(b"\xf0"));
+        db.set_string(b"b", Bytes::from_static(b"\x0f"));
         let result = bitop(&mut db, &[bs(b"OR"), bs(b"dest"), bs(b"a"), bs(b"b")]);
         assert_eq!(result, Frame::Integer(1));
         let data = db.get(b"dest").unwrap().value.as_bytes().unwrap().to_vec();
@@ -1316,8 +1316,8 @@ mod tests {
     #[test]
     fn test_bitop_xor() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"a"), Bytes::from_static(b"\xff"));
-        db.set_string(Bytes::from_static(b"b"), Bytes::from_static(b"\x0f"));
+        db.set_string(b"a", Bytes::from_static(b"\xff"));
+        db.set_string(b"b", Bytes::from_static(b"\x0f"));
         let result = bitop(&mut db, &[bs(b"XOR"), bs(b"dest"), bs(b"a"), bs(b"b")]);
         assert_eq!(result, Frame::Integer(1));
         let data = db.get(b"dest").unwrap().value.as_bytes().unwrap().to_vec();
@@ -1327,7 +1327,7 @@ mod tests {
     #[test]
     fn test_bitop_not() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"a"), Bytes::from_static(b"\x0f"));
+        db.set_string(b"a", Bytes::from_static(b"\x0f"));
         let result = bitop(&mut db, &[bs(b"NOT"), bs(b"dest"), bs(b"a")]);
         assert_eq!(result, Frame::Integer(1));
         let data = db.get(b"dest").unwrap().value.as_bytes().unwrap().to_vec();
@@ -1344,8 +1344,8 @@ mod tests {
     #[test]
     fn test_bitop_unequal_lengths() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"a"), Bytes::from_static(b"\xff\xff"));
-        db.set_string(Bytes::from_static(b"b"), Bytes::from_static(b"\x0f"));
+        db.set_string(b"a", Bytes::from_static(b"\xff\xff"));
+        db.set_string(b"b", Bytes::from_static(b"\x0f"));
         let result = bitop(&mut db, &[bs(b"AND"), bs(b"dest"), bs(b"a"), bs(b"b")]);
         assert_eq!(result, Frame::Integer(2));
         let data = db.get(b"dest").unwrap().value.as_bytes().unwrap().to_vec();
@@ -1358,7 +1358,7 @@ mod tests {
     #[test]
     fn test_bitpos_first_one() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"\x00\xff"));
+        db.set_string(b"key", Bytes::from_static(b"\x00\xff"));
         let result = bitpos(&mut db, &[bs(b"key"), bs(b"1")]);
         assert_eq!(result, Frame::Integer(8)); // first 1 bit at position 8
     }
@@ -1366,7 +1366,7 @@ mod tests {
     #[test]
     fn test_bitpos_first_zero() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"\xff\x00"));
+        db.set_string(b"key", Bytes::from_static(b"\xff\x00"));
         let result = bitpos(&mut db, &[bs(b"key"), bs(b"0")]);
         assert_eq!(result, Frame::Integer(8)); // first 0 bit at position 8
     }
@@ -1374,7 +1374,7 @@ mod tests {
     #[test]
     fn test_bitpos_no_one_found() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"\x00\x00"));
+        db.set_string(b"key", Bytes::from_static(b"\x00\x00"));
         let result = bitpos(&mut db, &[bs(b"key"), bs(b"1")]);
         assert_eq!(result, Frame::Integer(-1));
     }
@@ -1477,10 +1477,7 @@ mod tests {
     #[test]
     fn test_bitfield_ro_readonly_wrong_type() {
         let mut db = make_db();
-        db.set(
-            Bytes::from_static(b"key"),
-            crate::storage::entry::Entry::new_list(),
-        );
+        db.set(b"key", crate::storage::entry::Entry::new_list());
         let result = bitfield_ro_readonly(&db, &[bs(b"key"), bs(b"GET"), bs(b"u8"), bs(b"0")], 0);
         assert!(matches!(result, Frame::Error(_)));
     }

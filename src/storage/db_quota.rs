@@ -264,7 +264,7 @@ mod tests {
     fn fill(db: &mut Database, prefix: &str, count: usize) {
         for i in 0..count {
             db.set_string(
-                Bytes::from(format!("{prefix}{i}")),
+                &Bytes::from(format!("{prefix}{i}")),
                 Bytes::from(vec![0u8; 64]),
             );
         }

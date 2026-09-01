@@ -101,9 +101,24 @@ bare addresses.
 | 5 | Shrink the connection future to help re-poll | The future is **6,208 bytes**; shrinking it changed nothing measurable. |
 | 6 | Idle spin | Costs 2% CPU at **zero** clients; not a throughput lever. |
 | 7 | Connection steering to co-locate keys | Information-theoretically useless for uniform keys: a connection's next key is independent of its last. |
+| 8 | Shared guard for reads on the SPSC execute arms | In-place rate 62.7% -> 62.9% at p=1. The exclusive guard was **not** what made foreign `try_read` decline. |
 
 Dead ends 1, 4 and 7 are the ones most likely to be re-invented, because each
 sounds obviously correct before it is measured.
+
+Dead end 8 deserves its reasoning written out, because the argument for it was
+good. All four SPSC execute arms take `s.databases.write(db_idx)` for every
+command, reads included, so an SPSC-routed read holds the owner's database
+EXCLUSIVELY for its whole execution — exactly the condition under which a
+foreign reader's `db_plane::try_read` returns `None` and diverts to the SPSC
+path it was trying to avoid. That predicts a self-sustaining loop, and it
+predicts that the fast path's in-place rate is suppressed by its own fallbacks.
+
+Implemented (shared guard + `dispatch_read` for hot, read-supported commands,
+exclusive guard otherwise) and measured: **62.7% -> 62.9%** in place at
+`--shards 8` p=1. The premise is refuted; see §8 for what the shortfall
+actually was. The change was reverted rather than shipped, because a hot-path
+change with no measured effect is cost without evidence.
 
 ---
 
@@ -178,6 +193,32 @@ Each of these silently produced a plausible, wrong result at least once:
 - **Scraping `/metrics` costs throughput.** Enabling `--admin-port` and scraping
   depressed throughput 11% (327K vs 363K). Within-run comparisons stay valid;
   absolute and cross-run numbers do not.
+- **`redis-benchmark`'s built-in tests mostly use ONE key, and `-r` cannot
+  change it.** Verified against a live server by `FLUSHDB` + run + `DBSIZE`:
+  `lpush`, `rpush`, `lpop`, `rpop`, `sadd`, `spop`, `hset`, `zadd` all touch a
+  single literal key (`mylist` / `myset` / `myhash` / `myzset`) with or without
+  `-r` — `-r` randomises the *element*, not the key. Only `set`, `get`, `incr`
+  and `mset` take a randomised key, and only when `-r` is passed (without it
+  the key is the literal string `key:__rand_int__`).
+
+  For a shared-nothing server this is fatal to any scaling claim: a single key
+  is owned by a single shard, so `--shards N` executes the whole workload on one
+  thread however many threads exist, and `sN/s1 ~= 1.0` is the architecturally
+  correct answer rather than a finding. A 12-family matrix built on
+  `redis-benchmark -t` has **8 families whose answer is fixed at 1.0 before the
+  server is started**. Drive uniform workloads with an explicit command instead
+  — `redis-benchmark -r 100000 LPUSH list:__rand_int__ v` — and assert `DBSIZE`
+  afterwards.
+
+- **A p=1 leg that is not CPU-bound measures the network, and its ratios
+  collapse toward 1.0.** Symptom: throughput barely varies across command
+  families whose server cost varies several-fold. On one 12-family ARM matrix
+  the p=64 spread across families was 13.7x while the p=1 spread was 1.29x, and
+  every p=1 leg (both servers, both shard counts) sat in a 77-110K band — 3-4x
+  below what §7 measures for the same configuration at `c=200`. Check the
+  per-family spread at p=1 against the spread at p=64 before believing any p=1
+  ratio.
+
 - **`moon_dispatch_path_total` is not a remote-fraction metric.** The inline path
   records `path="local_inline"`, and the counter was absent on the prototype
   binary — it read a false 100%.
@@ -210,6 +251,85 @@ shard's accept+read path once more than a handful of connections are live
 (#772).
 
 ---
+
+---
+
+## 8. The cross-shard read fast path removes every foreign-read park
+
+Measured at `--shards 8`, uniform keyspace, `GET` p=1 c50, same binary, one flag
+apart. Counter ratios from `INFO stats` — no wall-clock number is quoted:
+
+| `--cross-shard-fast-path` | served in place | parks/cmd |
+|---|---:|---:|
+| `off` | 0.0% | 0.87336 |
+| `auto` | 100.0% | 0.00023 |
+
+Against the §1 fit that is `0.413 + 2.488 x parks/cmd` = **2.586 -> 0.413
+CPU%/kops**, a 6.3x predicted cut in per-op cost for cross-shard reads at p=1.
+§2.5's target of 0.486 parks/cmd is not merely met, it is bypassed. The default
+flipped to `auto` on this measurement.
+
+**Why it shipped `off` for so long — and why that reading was wrong.** The
+evidence was moon#768's `-8.61%` CPU/op and a doubled `s8 p16` variance, plus
+the standing puzzle that #768 measured only **50.5%** of reads served in place
+where the model predicted 87.5%. All three come from one cause: the fast path
+declines a key that is **not resident**, because `dispatch_read` cannot consult
+the cold tier (the moon#610 class), and a declined read falls back to the hop.
+So the "in-place rate" is the benchmark's **key hit rate**, not a measure of the
+mechanism. Populating 100k keys with N `SET`s leaves `1-exp(-N/100k)` of them
+resident, and the in-place rate tracks that curve to within 0.3 points:
+
+| resident keys (`DBSIZE`) | predicted coverage | served in place | parks/cmd |
+|---:|---:|---:|---:|
+| 63,114 | 63.2% | 62.9% | 0.325 |
+| 86,396 | 86.5% | 86.2% | 0.121 |
+| 98,169 | 98.2% | 98.2% | 0.016 |
+| 99,967 | 100.0% | 100.0% | 0.0003 |
+| 100,000 | 100.0% | 100.0% | 0.000 |
+
+A run whose hit rate wanders therefore produces exactly the run-to-run variance
+that held the default down. **Always populate to saturation before A/B-ing this
+flag,** and report `DBSIZE` with the result.
+
+**What this does NOT touch.** Writes. The gate is `!metadata::is_write(cmd)`, so
+`INCR`/`LPUSH`/`SADD`/`HSET`/`SET` stay at 0.875 parks/cmd at p=1 — measured
+unchanged with the flag on. The write side needs its own mechanism.
+
+### 8.1 The model itself is confirmed, exactly
+
+`INFO stats` counters at `--shards 8`, uniform keys, n=200,000 per cell, against
+the closed form derived from `handler_monoio`'s phase-2b batch structure
+(`msgs/cmd = (N-1)(1-(1-1/N)^P)/P`, `parks/cmd = (1-(1/N)^P)/P`):
+
+| P | msgs/cmd predicted | measured | parks/cmd predicted | measured |
+|---|---:|---:|---:|---:|
+| 1 | 0.8750 | 0.8721-0.8758 | 0.8750 | 0.8717-0.8755 |
+| 8 | 0.5744 | 0.5722-0.5755 | 0.1250 | 0.1250-0.1260 |
+| 64 | 0.1094 | 0.1093-0.1094 | 0.015625 | 0.015625 |
+
+Six command families, four significant figures, no free parameters. **Mean park
+depth is 12-18 at `c=50`**, not ~1 — parks overlap heavily, so the 24.9 core-us
+constant is a per-park CPU charge and not a serialized wait.
+
+### 8.2 The multi-key coordinator is invisible to every one of these counters
+
+Spanning multi-key writes (`MSET`, `MSETNX`, `BITOP`, `DEL`) do not take the
+slotted batch: `multikey_placement` returns `Coordinator`, and
+`coordinate_mset` awaits per-shard `MultiExecute` replies on freshly allocated
+oneshots **inline, mid-batch**. Measured `MSET` of 4 uniform keys at
+`--shards 8`: `total_dispatch_cross_spsc` 0.0016/cmd and `parks/cmd` 0.0016 —
+the park model scores it as already optimal — while `spsc_notify_wakes` runs
+**1.82, 1.61, 1.51 per command at p=1, p=8, p=64**. It does not amortise with
+pipeline depth at all, because every `MSET` is a batch boundary.
+
+That is consistent with the family's measured shape: `MSET` gains only **2.65x**
+from p=1 to p=64 where the other eleven families gain 6.79x-29.86x (median 7.6x). Fanning a spanning
+multi-key write into the slotted batch is the write-side counterpart of moon#768
+(`MGET`/`EXISTS`, `MultiKeyPlacement::Fanout`), which measured +1503% on the
+read side by removing exactly this batch boundary.
+
+**Do not score a cross-shard path with these counters without first checking
+that the path increments them.**
 
 ## See also
 

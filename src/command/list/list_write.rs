@@ -186,7 +186,7 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("LPOP");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("LPOP"),
     };
 
@@ -202,7 +202,7 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     // Check if the key exists first (for the no-list case)
-    match db.get_list(&key) {
+    match db.get_list(key) {
         Ok(None) => {
             // The count form's miss is a null ARRAY, not an EMPTY array: Redis
             // distinguishes "no such list" (`*-1`) from "a list that yielded
@@ -219,7 +219,7 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(Some(_)) => {}
     }
 
-    let list = match db.get_or_create_list(&key) {
+    let list = match db.get_or_create_list(key) {
         Ok(l) => l,
         Err(e) => return e,
     };
@@ -255,12 +255,12 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
     // fixed key/struct overhead — the popped elements were already credited
     // above, so there is no double count).
     if db
-        .get_list(&key)
+        .get_list(key)
         .ok()
         .flatten()
         .map_or(false, |l| l.is_empty())
     {
-        db.remove(&key);
+        db.remove(key);
     }
 
     result
@@ -276,7 +276,7 @@ pub fn rpop(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("RPOP");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("RPOP"),
     };
 
@@ -286,7 +286,7 @@ pub fn rpop(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
 
-    match db.get_list(&key) {
+    match db.get_list(key) {
         Ok(None) => {
             // The count form's miss is a null ARRAY, not an EMPTY array: Redis
             // distinguishes "no such list" (`*-1`) from "a list that yielded
@@ -303,7 +303,7 @@ pub fn rpop(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(Some(_)) => {}
     }
 
-    let list = match db.get_or_create_list(&key) {
+    let list = match db.get_or_create_list(key) {
         Ok(l) => l,
         Err(e) => return e,
     };
@@ -333,12 +333,12 @@ pub fn rpop(db: &mut Database, args: &[Frame]) -> Frame {
     db.credit_memory(credit);
 
     if db
-        .get_list(&key)
+        .get_list(key)
         .ok()
         .flatten()
         .map_or(false, |l| l.is_empty())
     {
-        db.remove(&key);
+        db.remove(key);
     }
 
     result
@@ -354,7 +354,7 @@ pub fn lset(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("LSET");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("LSET"),
     };
     let index = match parse_i64(&args[1]) {
@@ -370,7 +370,7 @@ pub fn lset(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("LSET"),
     };
 
-    let list = match db.get_or_create_list(&key) {
+    let list = match db.get_or_create_list(key) {
         Ok(l) => l,
         Err(e) => return e,
     };
@@ -407,7 +407,7 @@ pub fn linsert(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("LINSERT");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("LINSERT"),
     };
     let position = match extract_bytes(&args[1]) {
@@ -432,13 +432,13 @@ pub fn linsert(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     // If key doesn't exist, return 0
-    match db.get_list(&key) {
+    match db.get_list(key) {
         Ok(None) => return Frame::Integer(0),
         Err(e) => return e,
         Ok(Some(_)) => {}
     }
 
-    let list = match db.get_or_create_list(&key) {
+    let list = match db.get_or_create_list(key) {
         Ok(l) => l,
         Err(e) => return e,
     };
@@ -469,7 +469,7 @@ pub fn lrem(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("LREM");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("LREM"),
     };
     let count = match parse_i64(&args[1]) {
@@ -485,13 +485,13 @@ pub fn lrem(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("LREM"),
     };
 
-    match db.get_list(&key) {
+    match db.get_list(key) {
         Ok(None) => return Frame::Integer(0),
         Err(e) => return e,
         Ok(Some(_)) => {}
     }
 
-    let list = match db.get_or_create_list(&key) {
+    let list = match db.get_or_create_list(key) {
         Ok(l) => l,
         Err(e) => return e,
     };
@@ -536,7 +536,7 @@ pub fn lrem(db: &mut Database, args: &[Frame]) -> Frame {
 
     // If list is now empty, remove the key
     if is_empty {
-        db.remove(&key);
+        db.remove(key);
     }
 
     Frame::Integer(removed)
@@ -552,7 +552,7 @@ pub fn ltrim(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("LTRIM");
     }
     let key = match extract_bytes(&args[0]) {
-        Some(k) => k.clone(),
+        Some(k) => k,
         None => return err_wrong_args("LTRIM"),
     };
     let start = match parse_i64(&args[1]) {
@@ -572,13 +572,13 @@ pub fn ltrim(db: &mut Database, args: &[Frame]) -> Frame {
         }
     };
 
-    match db.get_list(&key) {
+    match db.get_list(key) {
         Ok(None) => return Frame::SimpleString(Bytes::from_static(b"OK")),
         Err(e) => return e,
         Ok(Some(_)) => {}
     }
 
-    let list = match db.get_or_create_list(&key) {
+    let list = match db.get_or_create_list(key) {
         Ok(l) => l,
         Err(e) => return e,
     };
@@ -620,7 +620,7 @@ pub fn ltrim(db: &mut Database, args: &[Frame]) -> Frame {
     db.credit_memory(credit);
 
     if is_empty {
-        db.remove(&key);
+        db.remove(key);
     }
 
     Frame::SimpleString(Bytes::from_static(b"OK"))

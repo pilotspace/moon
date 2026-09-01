@@ -2015,7 +2015,39 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
             crate::monitor::feed_frames(conn.selected_db, &peer_addr, cmd, cmd_args);
 
-            if cmd_len == 7 && dispatch::try_handle_cluster(cmd, cmd_args, ctx, shaped!()) {
+            // --- NAME-GATE SHORT CIRCUIT ---
+            //
+            // Below this point sit ~20 intercept gates that decide, one at a
+            // time, whether the command is theirs. Only six carry a `cmd_len`
+            // pre-guard and twelve are `async fn`s, so an ordinary keyspace
+            // command builds and polls twelve futures purely to be told "no".
+            //
+            // `NO_INTERCEPT` is one bit in the SAME `COMMAND_META` entry the
+            // arity check already reads, so this replaces all of them with one
+            // table lookup and a bit test. The gates and their ORDER are left
+            // exactly as they are: the ordering comments above and below record
+            // real bugs (ACL above privileged intercepts, workspace rewrite
+            // above key-readers, MULTI queue below ACL), and reordering them to
+            // save a branch would re-open those.
+            //
+            // The four STATE gates -- ACL, cluster routing, readonly and
+            // disk-full -- are deliberately NOT guarded by this: they apply to
+            // every command regardless of its name.
+            //
+            // Fail-safe by construction: an unknown command has no metadata and
+            // an unmarked one has no bit, so both take the full chain. Only an
+            // explicitly-marked command skips it.
+            let skip_name_gates = crate::command::metadata::lookup(cmd).is_some_and(|m| {
+                m.flags
+                    .contains(crate::command::metadata::CommandFlags::NO_INTERCEPT)
+            }) && !conn.in_multi
+                && conn.workspace_id.is_none()
+                && !conn.monitor_attached;
+
+            if !skip_name_gates
+                && cmd_len == 7
+                && dispatch::try_handle_cluster(cmd, cmd_args, ctx, shaped!())
+            {
                 continue;
             }
             // Lengths, not names: 7 is EVALSHA *and* EVAL_RO, 10 is
@@ -2044,7 +2076,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 continue;
             }
-            if cmd_len == 6 && dispatch::try_handle_config(cmd, cmd_args, ctx, shaped!()) {
+            if !skip_name_gates
+                && cmd_len == 6
+                && dispatch::try_handle_config(cmd, cmd_args, ctx, shaped!())
+            {
                 continue;
             }
             // REPLICAOF (9) or SLAVEOF (7)
@@ -2053,7 +2088,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 continue;
             }
-            if cmd_len == 8 && dispatch::try_handle_replconf(cmd, cmd_args, ctx, shaped!()) {
+            if !skip_name_gates
+                && cmd_len == 8
+                && dispatch::try_handle_replconf(cmd, cmd_args, ctx, shaped!())
+            {
                 // Likely a replica mid-handshake (PSYNC next): permanently
                 // exclude from task-parking — the resumed-parked path does
                 // not support the PSYNC hijack.
@@ -2109,13 +2147,18 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     continue;
                 }
             }
-            if cmd_len == 4 && dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, shaped!()).await
+            if !skip_name_gates
+                && cmd_len == 4
+                && dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, shaped!()).await
             {
                 continue;
             }
             // WAIT blocks on replica ACKs (R1) — must run at the connection
             // layer; generic dispatch is synchronous and used to answer :0.
-            if cmd_len == 4 && dispatch::try_handle_wait(cmd, cmd_args, ctx, shaped!()).await {
+            if !skip_name_gates
+                && cmd_len == 4
+                && dispatch::try_handle_wait(cmd, cmd_args, ctx, shaped!()).await
+            {
                 continue;
             }
             if dispatch::try_enforce_readonly(cmd, cmd_args, ctx, shaped!()) {
@@ -2183,14 +2226,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
                 pubsub::SubscribeResult::WriteError => return (MonoioHandlerResult::Done, None),
             }
-            if pubsub::try_handle_unsubscribe(cmd, &mut responses) {
+            if !skip_name_gates && pubsub::try_handle_unsubscribe(cmd, &mut responses) {
                 continue;
             }
-            if pubsub::try_handle_pubsub_introspection(cmd, cmd_args, ctx, &mut responses) {
+            if !skip_name_gates
+                && pubsub::try_handle_pubsub_introspection(cmd, cmd_args, ctx, &mut responses)
+            {
                 continue;
             }
             // --- Persistence + ACL gate + CLIENT admin + Functions ---
-            if dispatch::try_handle_persistence(cmd, ctx, shaped!()) {
+            if !skip_name_gates && dispatch::try_handle_persistence(cmd, ctx, shaped!()) {
                 continue;
             }
             // --- SHUTDOWN [NOSAVE|SAVE] ---
@@ -2208,10 +2253,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // of every privileged intercept. Its old comment claimed exactly
             // the invariant the code above it violated.
             // --- SWAPDB: handler-layer intercept (needs async + multi-db access) ---
-            if dispatch::try_handle_swapdb(cmd, cmd_args, &mut conn, ctx, shaped!()).await {
+            if !skip_name_gates
+                && dispatch::try_handle_swapdb(cmd, cmd_args, &mut conn, ctx, shaped!()).await
+            {
                 continue;
             }
-            if dispatch::try_handle_client_admin(cmd, cmd_args, client_id, &conn, shaped!()) {
+            if !skip_name_gates
+                && dispatch::try_handle_client_admin(cmd, cmd_args, client_id, &conn, shaped!())
+            {
                 continue;
             }
             // CLIENT TRACKING mutates server-side invalidation state — post-ACL
@@ -2231,50 +2280,74 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // CDC.READ (8) — stateless WAL reader, no shard state involved.
             // Post-ACL (H-3): it reads arbitrary WAL directories off disk, so
             // it must be deniable (-@dangerous / allow-list users).
-            if cmd_len == 8 && dispatch::try_handle_cdc_read(cmd, cmd_args, shaped!()) {
+            if !skip_name_gates
+                && cmd_len == 8
+                && dispatch::try_handle_cdc_read(cmd, cmd_args, shaped!())
+            {
                 continue;
             }
-            if dispatch::try_handle_functions(
-                cmd,
-                cmd_args,
-                &conn,
-                ctx,
-                &func_registry,
-                &shutdown,
-                shaped!(),
-            )
-            .await
+            if !skip_name_gates
+                && dispatch::try_handle_functions(
+                    cmd,
+                    cmd_args,
+                    &conn,
+                    ctx,
+                    &func_registry,
+                    &shutdown,
+                    shaped!(),
+                )
+                .await
             {
                 continue;
             }
 
             // --- TXN.BEGIN / TXN.COMMIT / TXN.ABORT ---
-            if txn::try_handle_txn_begin(cmd, cmd_args, &mut conn, ctx, &mut responses) {
+            if !skip_name_gates
+                && txn::try_handle_txn_begin(cmd, cmd_args, &mut conn, ctx, &mut responses)
+            {
                 continue;
             }
-            if txn::try_handle_txn_commit(cmd, cmd_args, &mut conn, ctx, &mut responses).await {
+            if !skip_name_gates
+                && txn::try_handle_txn_commit(cmd, cmd_args, &mut conn, ctx, &mut responses).await
+            {
                 continue;
             }
-            if txn::try_handle_txn_abort(cmd, cmd_args, &mut conn, ctx, &mut responses).await {
+            if !skip_name_gates
+                && txn::try_handle_txn_abort(cmd, cmd_args, &mut conn, ctx, &mut responses).await
+            {
                 continue;
             }
 
             // --- TEMPORAL.SNAPSHOT_AT / TEMPORAL.INVALIDATE ---
-            if txn::try_handle_temporal_snapshot_at(cmd, cmd_args, ctx, &mut responses) {
+            if !skip_name_gates
+                && txn::try_handle_temporal_snapshot_at(cmd, cmd_args, ctx, &mut responses)
+            {
                 continue;
             }
-            if txn::try_handle_temporal_invalidate(cmd, cmd_args, &frame, ctx, &mut responses).await
+            if !skip_name_gates
+                && txn::try_handle_temporal_invalidate(cmd, cmd_args, &frame, ctx, &mut responses)
+                    .await
             {
                 continue;
             }
 
             // --- WS.* ---
-            if write::try_handle_ws_command(cmd, cmd_args, &mut conn, ctx, &mut responses).await {
+            if !skip_name_gates
+                && write::try_handle_ws_command(cmd, cmd_args, &mut conn, ctx, &mut responses).await
+            {
                 continue;
             }
 
             // --- MQ.* ---
-            if write::try_handle_mq_command(cmd, cmd_args, &frame, &mut conn, ctx, &mut responses)
+            if !skip_name_gates
+                && write::try_handle_mq_command(
+                    cmd,
+                    cmd_args,
+                    &frame,
+                    &mut conn,
+                    ctx,
+                    &mut responses,
+                )
                 .await
             {
                 continue;
@@ -2282,18 +2355,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
             // --- MULTI / EXEC / DISCARD ---
             let mut exec_publishes: Vec<(usize, Bytes, Bytes)> = Vec::new();
-            if write::try_handle_multi_exec(
-                cmd,
-                cmd_args,
-                &mut conn,
-                ctx,
-                &mut responses,
-                &mut exec_publishes,
-                &shutdown,
-                &mut codec,
-                &func_registry,
-            )
-            .await
+            if !skip_name_gates
+                && write::try_handle_multi_exec(
+                    cmd,
+                    cmd_args,
+                    &mut conn,
+                    ctx,
+                    &mut responses,
+                    &mut exec_publishes,
+                    &shutdown,
+                    &mut codec,
+                    &func_registry,
+                )
+                .await
             {
                 // C2: PUBLISH queued inside MULTI fans out only now — after the
                 // transaction body has been applied — and its placeholder in the
@@ -2572,21 +2646,25 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
 
             // --- FT.* vector search commands ---
-            if ft::try_handle_ft_command(cmd, cmd_args, &frame, &conn, ctx, &mut responses).await {
+            if !skip_name_gates
+                && ft::try_handle_ft_command(cmd, cmd_args, &frame, &conn, ctx, &mut responses)
+                    .await
+            {
                 continue;
             }
 
             // --- GRAPH.* graph commands ---
             #[cfg(feature = "graph")]
-            if write::try_handle_graph_command(
-                cmd,
-                cmd_args,
-                &frame,
-                &mut conn,
-                ctx,
-                &mut responses,
-            )
-            .await
+            if !skip_name_gates
+                && write::try_handle_graph_command(
+                    cmd,
+                    cmd_args,
+                    &frame,
+                    &mut conn,
+                    ctx,
+                    &mut responses,
+                )
+                .await
             {
                 continue;
             }
@@ -3038,10 +3116,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // touches the index stores or re-enters `s`, so the
                         // guard must not outlive this point.
                         drop(db_guard);
-                        let response_frame = match &result {
-                            DispatchResult::Response(f) | DispatchResult::Quit(f) => f.clone(),
-                        };
-                        let is_error = matches!(response_frame, Frame::Error(_));
+                        // Borrow, never clone: this is a one-bit question and
+                        // the reply may be a whole `Frame::Array`.
+                        let is_error = result.is_error();
 
                         // HSET auto-index: disjoint field borrows (NLL)
                         // &mut s.vector_store + &mut s.text_store are separate

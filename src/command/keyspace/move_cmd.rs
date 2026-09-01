@@ -45,12 +45,12 @@ pub fn move_core(src: &mut Database, dst: &mut Database, key: &[u8]) -> Frame {
     // Collision check: key must NOT exist in dst
     if dst.exists(key) {
         // Restore the entry to src — the move did not happen
-        src.set(Bytes::copy_from_slice(key), entry);
+        src.set(key, entry);
         return Frame::Integer(0);
     }
 
     // Move: insert into dst, TTL is carried inside the Entry value
-    dst.set(Bytes::copy_from_slice(key), entry);
+    dst.set(key, entry);
     Frame::Integer(1)
 }
 
@@ -88,7 +88,7 @@ pub fn copy_core(
         // REPLACE: overwrite dst
     }
 
-    dst.set(Bytes::copy_from_slice(dst_key), entry);
+    dst.set(dst_key, entry);
     Frame::Integer(1)
 }
 
@@ -323,7 +323,7 @@ mod tests {
 
     fn set_str(db: &mut Database, key: &str, val: &str) {
         let entry = Entry::new_string(Bytes::from(val.to_owned()));
-        db.set(Bytes::from(key.to_owned()), entry);
+        db.set(key.as_bytes(), entry);
     }
 
     // ── move_core ───────────────────────────────────────────────────────────────

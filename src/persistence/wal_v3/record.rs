@@ -727,10 +727,7 @@ mod tests {
 
         // Set up a database with current committed state
         let mut db = Database::new();
-        db.set_string(
-            Bytes::from_static(b"key1"),
-            Bytes::from_static(b"committed_val"),
-        );
+        db.set_string(b"key1", Bytes::from_static(b"committed_val"));
         // key2 was deleted (will appear as DEL op)
 
         // Build undo records:

@@ -43,7 +43,7 @@ fn test_orphan_sweep_removes_hot_shadowed_key() {
 
     // 2. Hot DB contains K1 (simulates a SET that overwritten the cold entry)
     let mut db = Database::new();
-    db.set(Bytes::from_static(b"k1"), make_string_entry("hot_value"));
+    db.set(b"k1", make_string_entry("hot_value"));
     assert!(db.is_hot(b"k1"), "K1 should be hot after set");
 
     // 3. Run orphan sweep — K1 is hot, so cold entry is orphan
@@ -146,7 +146,7 @@ fn test_orphan_sweep_mixed_hot_and_cold_only() {
 
     // K1 is hot (overwritten)
     let mut db = Database::new();
-    db.set(Bytes::from_static(b"k1"), make_string_entry("v1_hot"));
+    db.set(b"k1", make_string_entry("v1_hot"));
 
     let stats = cold_index
         .orphan_sweep(&db, shard_dir, Some(&mut manifest))
@@ -205,7 +205,7 @@ fn test_orphan_sweep_manifests_tombstone() {
 
     // Hot overwrite
     let mut db = Database::new();
-    db.set(Bytes::from_static(b"kx"), make_string_entry("hot"));
+    db.set(b"kx", make_string_entry("hot"));
 
     cold_index
         .orphan_sweep(&db, shard_dir, Some(&mut manifest))

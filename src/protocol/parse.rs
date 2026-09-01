@@ -3,20 +3,72 @@ use atoi::FromRadix10SignedChecked;
 use memchr::memchr;
 
 use bytes::{Buf, Bytes, BytesMut};
+use smallvec::SmallVec;
 
 use super::frame::{Frame, FrameVec, ParseConfig, ParseError, ProtoFault};
 use super::inline;
 
-/// Attempt to parse one RESP2 frame from the buffer.
+/// Attempt to parse one RESP2/RESP3 frame from the buffer.
 ///
-/// Uses a two-pass approach for zero-copy argument extraction:
-/// 1. Validate structure and compute byte length (parse_single_frame, result discarded)
-/// 2. Freeze validated bytes and extract frame data via Bytes::slice (Arc refcount bump, no memcpy)
+/// A flat top-level `*N` of `$`-bulks -- the shape of essentially every client
+/// command -- is scanned in **one** pass: [`scan_flat_multibulk`] records each
+/// argument's span while it validates, and the `Frame` is built straight from
+/// those spans.
+///
+/// Everything else keeps the original two-pass approach:
+/// 1. Validate structure and compute byte length (`validate_frame`, offsets discarded)
+/// 2. Freeze validated bytes and extract frame data via `Bytes::slice`
+///    (Arc refcount bump, no memcpy)
+///
+/// The fast path declines -- falling through to the two-pass path -- on *anything*
+/// it does not handle exactly: incomplete input, malformed lengths, negative or
+/// out-of-range counts, null bulks, nested or non-bulk elements, RESP3
+/// containers, inline commands. Declining is always safe; answering differently
+/// never is, which is what `single_pass_multibulk_agrees_with_two_pass` and the
+/// `resp_parse_fused` fuzz target assert over arbitrary input.
 ///
 /// On success, advances the buffer past the consumed bytes and returns `Ok(Some(frame))`.
 /// Returns `Ok(None)` if the buffer doesn't contain a complete frame (need more data).
 /// Returns `Err` if the data violates the RESP2 protocol specification.
 pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, ParseError> {
+    match dispatch_prefix(buf, config)? {
+        PrefixOutcome::Done(frame) => return Ok(frame),
+        PrefixOutcome::Resp => {}
+    }
+    if let Some(frame) = parse_flat_multibulk(buf, config) {
+        return Ok(Some(frame));
+    }
+    parse_resp_two_pass(buf, config)
+}
+
+/// `parse` with the single-pass fast path removed -- the two-pass pipeline exactly
+/// as it stood before it was added.
+///
+/// Exists so the differential test and the `resp_parse_fused` fuzz target can
+/// assert byte-identical behaviour on arbitrary input. Not compiled into a
+/// release build.
+#[cfg(any(test, feature = "fuzzing"))]
+pub fn parse_reference_two_pass(
+    buf: &mut BytesMut,
+    config: &ParseConfig,
+) -> Result<Option<Frame>, ParseError> {
+    match dispatch_prefix(buf, config)? {
+        PrefixOutcome::Done(frame) => return Ok(frame),
+        PrefixOutcome::Resp => {}
+    }
+    parse_resp_two_pass(buf, config)
+}
+
+/// What [`dispatch_prefix`] decided about the head of the buffer.
+enum PrefixOutcome {
+    /// Answered outright (inline command, blank line, or empty buffer).
+    Done(Option<Frame>),
+    /// The buffer starts with a RESP type byte; the RESP parsers own it.
+    Resp,
+}
+
+/// Route the head of the buffer to the RESP parser or the inline splitter.
+fn dispatch_prefix(buf: &mut BytesMut, config: &ParseConfig) -> Result<PrefixOutcome, ParseError> {
     // Dispatch: RESP2/RESP3 prefixed bytes go to RESP parser, everything else
     // is inline.
     //
@@ -38,19 +90,19 @@ pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, 
     // byte of a line terminator, so the buffer strictly shrinks.
     loop {
         if buf.is_empty() {
-            return Ok(None);
+            return Ok(PrefixOutcome::Done(None));
         }
         match buf[0] {
             b'+' | b'-' | b':' | b'$' | b'*' // RESP2
             | b'%' | b'~' | b',' | b'#' | b'_' | b'=' | b'(' | b'>' // RESP3
-            => break, // fall through to RESP parsing below
+            => return Ok(PrefixOutcome::Resp), // the RESP parsers own it
             _ => {
                 let before = buf.len();
                 match inline::parse_inline(buf, config.max_inline_size)? {
-                    Some(frame) => return Ok(Some(frame)),
+                    Some(frame) => return Ok(PrefixOutcome::Done(Some(frame))),
                     // Nothing consumed => genuinely incomplete, so waiting for
                     // more bytes is correct and looping would spin.
-                    None if buf.len() == before => return Ok(None),
+                    None if buf.len() == before => return Ok(PrefixOutcome::Done(None)),
                     // Bytes consumed but no frame: an empty or whitespace-only
                     // line. Ask again — there may be a real command behind it.
                     None => continue,
@@ -58,7 +110,16 @@ pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, 
             }
         }
     }
+}
 
+/// The original two-pass RESP pipeline: validate, freeze, extract.
+///
+/// The caller has already established that `buf` is non-empty and starts with a
+/// RESP type byte.
+fn parse_resp_two_pass(
+    buf: &mut BytesMut,
+    config: &ParseConfig,
+) -> Result<Option<Frame>, ParseError> {
     // Pass 1: Validate structure and compute total byte length (zero allocations)
     let mut pos = 0;
     match validate_frame(&buf[..], &mut pos, config, 0) {
@@ -92,6 +153,140 @@ pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, 
         Err(ParseError::Incomplete) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// A completed single-pass scan of a flat top-level multibulk.
+struct FlatScan {
+    /// Total byte length of the frame, i.e. what `validate_frame` would have
+    /// left in `pos`.
+    total_len: usize,
+    /// `(offset, len)` of each argument's payload, relative to the frame start.
+    ///
+    /// Sixteen inline covers every command moon has; past that the spill costs
+    /// one allocation, which is still one fewer walk than the two-pass path.
+    spans: SmallVec<[(u32, u32); 16]>,
+}
+
+/// How many argument spans to reserve for a claimed element count.
+///
+/// The count comes off the wire, so reserving `count` outright hands a client a
+/// memory amplifier: `*1048576\r\n` is ten bytes and `max_array_length`
+/// defaults to 1Mi, which would reserve 8 MiB before the scan discovered the
+/// frame was incomplete. The two-pass path never had this problem -- it reaches
+/// `FrameVec::with_capacity` only after `validate_frame` proved the whole frame
+/// is present, so the buffer bounds the count for free.
+///
+/// The shortest an element can be is six bytes (`$0\r\n` plus the two trailing
+/// bytes every bulk is charged), so `buf.len() / 6` is a hard ceiling on how
+/// many can possibly be there. Capping at it never under-allocates for a scan
+/// that goes on to succeed, and `SmallVec` grows anyway if it somehow did.
+#[inline]
+fn span_capacity(count: usize, buf_len: usize) -> usize {
+    count.min(buf_len / 6)
+}
+
+/// Scan a flat top-level `*N` of `$`-bulks in ONE pass, recording each
+/// argument's span.
+///
+/// Returns `None` for **anything** that is not exactly that shape, complete and
+/// within `config`'s limits — incomplete input, a malformed count or length, a
+/// negative count (`*-1`, `*-9`), a null bulk (`$-1`), a nested or non-bulk
+/// element, an over-limit count or payload. The caller then runs the two-pass
+/// path, which owns every one of those cases and their exact error kinds.
+///
+/// Declining more often than strictly necessary is always safe; answering where
+/// the two-pass path would answer differently never is. Every rule below is a
+/// deliberate mirror of `validate_frame`'s `b'*'` and `b'$'` arms, including one
+/// piece of leniency that looks like a bug and is not: **the two bytes after a
+/// bulk payload are never checked**. `validate_frame` does `*pos += len + 2`
+/// without verifying they are CRLF, and `parse_frame_zerocopy` skips them the
+/// same way, so `*1\r\n$1\r\naXY` parses. Verifying them here would make the
+/// fast path stricter than the path it replaces.
+fn scan_flat_multibulk(buf: &[u8], config: &ParseConfig) -> Option<FlatScan> {
+    // Spans are recorded as u32. A buffer that large is not a client command.
+    if buf.len() > u32::MAX as usize {
+        return None;
+    }
+    if buf.first() != Some(&b'*') {
+        return None;
+    }
+
+    // Decline on the BYTE, not on the parsed count. `parse_resp_two_pass`'s
+    // `is_null_multibulk` gate keys on `buf[1] == b'-'`, and `strict_atoi` reads
+    // a lone `-` (and `-0`) as ZERO -- so `*-\r\n` has a non-negative count and
+    // is still silently consumed there while reporting no frame at all. Testing
+    // `count < 0` alone let the fast path answer `*0`-shaped where the two-pass
+    // path answers nothing. Found by the `resp_parse_fused` differential fuzz
+    // target within 90 seconds of its first run.
+    if buf.get(1) == Some(&b'-') {
+        return None;
+    }
+
+    let mut pos = 1usize;
+    let crlf = find_crlf(buf, pos)?;
+    let count = strict_atoi(&buf[pos..crlf])?;
+    pos = crlf + 2;
+
+    // `*-1` is the null array and anything below it is Redis's silently-consumed
+    // case; both live in `parse_resp_two_pass`, which spells them differently.
+    // Unreachable after the byte test above, and kept as the belt to its braces.
+    if count < 0 {
+        return None;
+    }
+    let count = count as usize;
+    if count > config.max_array_length {
+        return None;
+    }
+    // `validate_frame` validates the ELEMENTS at depth 1, so a non-empty array
+    // is a depth error when the limit is 0. Let the two-pass path raise it.
+    if count > 0 && config.max_array_depth < 1 {
+        return None;
+    }
+
+    let mut spans: SmallVec<[(u32, u32); 16]> =
+        SmallVec::with_capacity(span_capacity(count, buf.len()));
+    for _ in 0..count {
+        if buf.get(pos) != Some(&b'$') {
+            return None;
+        }
+        pos += 1;
+        let crlf = find_crlf(buf, pos)?;
+        let len = strict_atoi(&buf[pos..crlf])?;
+        pos = crlf + 2;
+        // `$-1` (null bulk) yields a `Frame::Null` element on the two-pass path.
+        if len < 0 {
+            return None;
+        }
+        let len = len as usize;
+        if len > config.max_bulk_string_size {
+            return None;
+        }
+        if buf.len() - pos < len + 2 {
+            return None; // incomplete
+        }
+        spans.push((pos as u32, len as u32));
+        pos += len + 2;
+    }
+
+    Some(FlatScan {
+        total_len: pos,
+        spans,
+    })
+}
+
+/// Consume and build a flat multibulk from a single scan, or leave `buf`
+/// untouched and return `None` so the caller falls through to the two-pass path.
+fn parse_flat_multibulk(buf: &mut BytesMut, config: &ParseConfig) -> Option<Frame> {
+    let scan = scan_flat_multibulk(&buf[..], config)?;
+    // Same freeze the two-pass path performs: one `Shared` promotion for the
+    // whole frame, amortised across the batch.
+    let frozen = buf.split_to(scan.total_len).freeze();
+    let mut items = FrameVec::with_capacity(scan.spans.len());
+    for (start, len) in scan.spans {
+        let start = start as usize;
+        items.push(Frame::BulkString(frozen.slice(start..start + len as usize)));
+    }
+    Some(Frame::Array(items))
 }
 
 /// Zero-copy frame extraction from a frozen `Bytes` buffer.
@@ -918,6 +1113,329 @@ mod tests {
         let mut buf = BytesMut::from(input);
         let result = parse(&mut buf, &ParseConfig::default());
         (result, buf)
+    }
+
+    // === Single-pass multibulk fast path: differential against the two-pass path ===
+
+    /// Every input, byte-identical outcome.
+    ///
+    /// `parse` now scans a flat top-level `*N` of `$`-bulks ONCE, recording the
+    /// argument spans as it validates, instead of walking the bytes twice
+    /// (`validate_frame` computing every offset and throwing them away, then
+    /// `parse_frame_zerocopy` re-deriving them). Everything else — RESP3
+    /// containers, nested arrays, null bulks, inline commands, reply parsing —
+    /// still takes the two-pass path unchanged.
+    ///
+    /// The contract is total: for ANY input the fast path must produce exactly
+    /// what the two-pass path produces — same `Ok`/`Err`, same frame, same
+    /// number of bytes consumed, same bytes left in the buffer.
+    fn assert_parse_agrees(input: &[u8], config: &ParseConfig) {
+        let mut fast_buf = BytesMut::from(input);
+        let mut ref_buf = BytesMut::from(input);
+        let shown = String::from_utf8_lossy(input);
+
+        // Drain the whole pipeline, not just the first frame: a divergence that
+        // only shows on the second frame is exactly what a single-frame
+        // comparison misses.
+        for step in 0..16 {
+            if fast_buf.is_empty() && ref_buf.is_empty() {
+                break;
+            }
+            let fast = parse(&mut fast_buf, config);
+            let slow = parse_reference_two_pass(&mut ref_buf, config);
+            match (&fast, &slow) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "frame diverged on {shown:?} at step {step}"),
+                // `Display` carries the wire fault name, the internal message and
+                // the byte offset -- the strongest comparison available without
+                // `PartialEq` on `ParseError`.
+                (Err(a), Err(b)) => assert_eq!(
+                    a.to_string(),
+                    b.to_string(),
+                    "error diverged on {shown:?} at step {step}"
+                ),
+                _ => panic!(
+                    "ok/err diverged on {shown:?} at step {step}: fast={:?} slow={:?}",
+                    fast.is_ok(),
+                    slow.is_ok()
+                ),
+            }
+            assert_eq!(
+                fast_buf.as_ref(),
+                ref_buf.as_ref(),
+                "buffer advancement diverged on {shown:?} at step {step}"
+            );
+            if !matches!(fast, Ok(Some(_))) {
+                break;
+            }
+        }
+    }
+
+    /// The corpus deliberately covers what the fast path must DECLINE as well as
+    /// what it must accept: a fast path that silently answered for `$-1` or a
+    /// nested array would be wrong, and a fast path that declined everything
+    /// would be useless — `flat_multibulk_fast_path_actually_fires` pins that.
+    fn differential_corpus() -> Vec<Vec<u8>> {
+        let mut v: Vec<Vec<u8>> = vec![
+            // Ordinary commands, argc 0..8 — the shape the fast path exists for.
+            b"*0\r\n".to_vec(),
+            b"*1\r\n$4\r\nPING\r\n".to_vec(),
+            b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n".to_vec(),
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n".to_vec(),
+            b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$3\r\n100\r\n".to_vec(),
+            b"*4\r\n$4\r\nHSET\r\n$1\r\nh\r\n$1\r\nf\r\n$1\r\nv\r\n".to_vec(),
+            // Empty bulk, and a bulk holding CRLF and NULs.
+            b"*2\r\n$3\r\nGET\r\n$0\r\n\r\n".to_vec(),
+            b"*1\r\n$4\r\na\r\nb\r\n".to_vec(),
+            b"*1\r\n$3\r\na\0b\r\n".to_vec(),
+            // Null array, null bulk element, negative-but-not--1 count.
+            b"*-1\r\n".to_vec(),
+            b"*-9\r\n".to_vec(),
+            b"*-1x\r\n".to_vec(),
+            // Found by the `resp_parse_fused` fuzz target. `strict_atoi` reads a
+            // LONE minus as 0, so `*-\r\n` scans as an empty array -- but
+            // `parse_resp_two_pass`'s `is_null_multibulk` gate keys on
+            // `buf[1] == b'-'`, not on the parsed count, and silently CONSUMES
+            // it while reporting no frame. The fast path must decline on the
+            // byte, not on the number.
+            b"*-\r\n".to_vec(),
+            b"*-\r\n*0\r\n".to_vec(),
+            b"*-0\r\n".to_vec(),
+            b"*-0\r\n*1\r\n$1\r\na\r\n".to_vec(),
+            b"*2\r\n$-1\r\n$1\r\nk\r\n".to_vec(),
+            b"*1\r\n$-1\r\n".to_vec(),
+            b"*1\r\n$-2\r\n".to_vec(),
+            // Nested and non-bulk elements: must fall through, not be answered.
+            b"*2\r\n*1\r\n$1\r\na\r\n$1\r\nb\r\n".to_vec(),
+            b"*2\r\n+OK\r\n$1\r\nb\r\n".to_vec(),
+            b"*2\r\n:1\r\n$1\r\nb\r\n".to_vec(),
+            b"*1\r\n_\r\n".to_vec(),
+            b"*1\r\n#t\r\n".to_vec(),
+            // Malformed headers and lengths.
+            b"*\r\n".to_vec(),
+            b"*abc\r\n".to_vec(),
+            b"* 2\r\n$1\r\na\r\n".to_vec(),
+            b"*+2\r\n$1\r\na\r\n$1\r\nb\r\n".to_vec(),
+            b"*2\r\n$abc\r\n".to_vec(),
+            b"*2\r\n$ 1\r\na\r\n".to_vec(),
+            b"*1\r\n$99999999999999999999\r\n".to_vec(),
+            b"*99999999999999999999\r\n".to_vec(),
+            // Bare \r and \n, and a missing terminator after the payload —
+            // `validate_frame` does NOT verify the two bytes after a bulk body,
+            // so the fast path must not verify them either.
+            b"*1\r\n$1\r\naXY".to_vec(),
+            b"*1\r\n$1\r\na\r\n".to_vec(),
+            b"*1\r$1\r\na\r\n".to_vec(),
+            b"*1\n$1\n a\n".to_vec(),
+            b"*1\r\n$5\ra\r\nbc\r\n".to_vec(),
+            // Trailing pipeline bytes must survive untouched.
+            b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n".to_vec(),
+            b"*1\r\n$4\r\nPING\r\nGARBAGE".to_vec(),
+            // Non-array RESP and RESP3 containers keep the two-pass path.
+            b"+OK\r\n".to_vec(),
+            b"-ERR bad\r\n".to_vec(),
+            b":42\r\n".to_vec(),
+            b"$3\r\nabc\r\n".to_vec(),
+            b"$-1\r\n".to_vec(),
+            b"%1\r\n$1\r\na\r\n$1\r\nb\r\n".to_vec(),
+            b"~2\r\n$1\r\na\r\n$1\r\nb\r\n".to_vec(),
+            b">2\r\n$1\r\na\r\n$1\r\nb\r\n".to_vec(),
+            b",1.5\r\n".to_vec(),
+            b"(12345\r\n".to_vec(),
+            b"=8\r\ntxt:abcd\r\n".to_vec(),
+            // Inline commands and blank lines share the pre-RESP funnel.
+            b"PING\r\n".to_vec(),
+            b"\r\n\r\nECHO hi\r\n".to_vec(),
+            b"".to_vec(),
+            b"\r\n".to_vec(),
+            // Unknown type byte.
+            b"@1\r\n".to_vec(),
+        ];
+
+        // Every truncation of every case above: the fast path must agree on
+        // "need more bytes" at every prefix length, not just on whole frames.
+        let whole = v.clone();
+        for case in &whole {
+            for cut in 0..case.len() {
+                v.push(case[..cut].to_vec());
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn single_pass_multibulk_agrees_with_two_pass() {
+        let config = ParseConfig::default();
+        for case in differential_corpus() {
+            assert_parse_agrees(&case, &config);
+        }
+    }
+
+    /// The limits are part of the contract: a fast path that applied its own
+    /// bounds, or none, would diverge exactly where a hostile client aims.
+    #[test]
+    fn single_pass_multibulk_agrees_under_tight_limits() {
+        let configs = [
+            ParseConfig {
+                max_bulk_string_size: 2,
+                max_array_depth: 4,
+                max_array_length: 256,
+                max_inline_size: 64,
+            },
+            ParseConfig {
+                max_bulk_string_size: 1024,
+                max_array_depth: 4,
+                max_array_length: 2,
+                max_inline_size: 64,
+            },
+            // Depth 0 forbids the ELEMENTS of a top-level array, so a `*1` must
+            // be rejected while `*0` is still fine.
+            ParseConfig {
+                max_bulk_string_size: 1024,
+                max_array_depth: 0,
+                max_array_length: 256,
+                max_inline_size: 64,
+            },
+            ParseConfig {
+                max_bulk_string_size: 0,
+                max_array_depth: 0,
+                max_array_length: 0,
+                max_inline_size: 0,
+            },
+        ];
+        for config in &configs {
+            for case in differential_corpus() {
+                assert_parse_agrees(&case, config);
+            }
+        }
+    }
+
+    /// A structured sweep over argc and payload length, including the `argc > 4`
+    /// boundary where `FrameVec`'s inline capacity spills and the 16-span
+    /// boundary where the scanner's own `SmallVec` spills.
+    #[test]
+    fn single_pass_multibulk_agrees_across_argc_and_length() {
+        let config = ParseConfig::default();
+        for argc in 0..=20usize {
+            for arglen in [0usize, 1, 3, 12, 13, 64, 300] {
+                let mut frame = format!("*{argc}\r\n").into_bytes();
+                for i in 0..argc {
+                    let payload = vec![b'a' + (i % 26) as u8; arglen];
+                    frame.extend_from_slice(format!("${arglen}\r\n").as_bytes());
+                    frame.extend_from_slice(&payload);
+                    frame.extend_from_slice(b"\r\n");
+                }
+                assert_parse_agrees(&frame, &config);
+                // and one byte short of complete
+                if !frame.is_empty() {
+                    assert_parse_agrees(&frame[..frame.len() - 1], &config);
+                }
+            }
+        }
+    }
+
+    /// A differential that both sides decline is worth nothing. This pins that
+    /// the fast path really answers the common command shapes, so the test above
+    /// is testing the new code and not the old code twice.
+    #[test]
+    fn flat_multibulk_fast_path_actually_fires() {
+        let config = ParseConfig::default();
+        let fires = [
+            &b"*0\r\n"[..],
+            &b"*1\r\n$4\r\nPING\r\n"[..],
+            &b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"[..],
+            &b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"[..],
+            &b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$3\r\n100\r\n"[..],
+            &b"*2\r\n$3\r\nGET\r\n$0\r\n\r\n"[..],
+        ];
+        for case in fires {
+            let mut buf = BytesMut::from(case);
+            assert!(
+                scan_flat_multibulk(&buf[..], &config).is_some(),
+                "fast path declined {:?} — the differential would be vacuous",
+                String::from_utf8_lossy(case)
+            );
+            // and it produces the frame, not just a scan
+            assert!(matches!(
+                parse_flat_multibulk(&mut buf, &config),
+                Some(Frame::Array(_))
+            ));
+        }
+
+        let declines = [
+            &b"*-1\r\n"[..],
+            &b"*2\r\n$-1\r\n$1\r\nk\r\n"[..],
+            &b"*2\r\n*1\r\n$1\r\na\r\n$1\r\nb\r\n"[..],
+            &b"*2\r\n+OK\r\n$1\r\nb\r\n"[..],
+            &b"*2\r\n$3\r\nGET\r\n"[..], // incomplete
+            &b"*abc\r\n"[..],
+        ];
+        for case in declines {
+            assert!(
+                scan_flat_multibulk(case, &config).is_none(),
+                "fast path accepted {:?}, which the two-pass path treats specially",
+                String::from_utf8_lossy(case)
+            );
+        }
+    }
+
+    /// The scanned spans must be the spans the zero-copy pass would have
+    /// derived — pointing INTO the frozen buffer, not copies.
+    #[test]
+    fn fast_path_slices_alias_the_frozen_buffer() {
+        let config = ParseConfig::default();
+        let mut buf = BytesMut::from(&b"*3\r\n$3\r\nSET\r\n$5\r\nhello\r\n$5\r\nworld\r\n"[..]);
+        let frame = parse(&mut buf, &config).unwrap().unwrap();
+        assert!(buf.is_empty(), "the whole frame must be consumed");
+        match frame {
+            Frame::Array(items) => {
+                let got: Vec<&[u8]> = items
+                    .iter()
+                    .map(|f| match f {
+                        Frame::BulkString(b) => b.as_ref(),
+                        other => panic!("expected BulkString, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(got, vec![&b"SET"[..], &b"hello"[..], &b"world"[..]]);
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    /// `*1048576\r\n` is ten bytes and `max_array_length` defaults to 1Mi, so a
+    /// naive `SmallVec::with_capacity(count)` would allocate 8 MiB before the scanner
+    /// discovered the frame was incomplete. The two-pass path never had that
+    /// amplification: `parse_frame_zerocopy` only reaches `FrameVec::with_capacity`
+    /// AFTER `validate_frame` proved the whole frame is present, so the buffer itself
+    /// bounds the count. The scanner allocates first, so it must bound the count itself.
+    ///
+    /// Six bytes is the shortest an element can be (`$0\r\n` + the two trailing bytes),
+    /// so a buffer can never hold more than `len / 6` of them and capping there can
+    /// never under-allocate for a scan that goes on to succeed.
+    #[test]
+    fn span_capacity_is_bounded_by_the_buffer_not_the_claimed_count() {
+        // The attack: a huge claimed count in a tiny buffer.
+        assert_eq!(span_capacity(1024 * 1024, b"*1048576\r\n".len()), 1);
+        assert_eq!(span_capacity(usize::MAX, 0), 0);
+        assert_eq!(span_capacity(1_000_000, 60), 10);
+
+        // Honest commands are unaffected: capacity still covers every argument.
+        for case in [
+            &b"*1\r\n$4\r\nPING\r\n"[..],
+            &b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"[..],
+            &b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"[..],
+            &b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$3\r\n100\r\n"[..],
+        ] {
+            let scan = scan_flat_multibulk(case, &ParseConfig::default())
+                .expect("honest command must still take the fast path");
+            assert!(
+                span_capacity(scan.spans.len(), case.len()) >= scan.spans.len(),
+                "capped capacity under-allocated for {:?}",
+                String::from_utf8_lossy(case)
+            );
+        }
+
+        // And end to end: the pathological header must be declined, not answered.
+        assert!(scan_flat_multibulk(b"*1048576\r\n", &ParseConfig::default()).is_none());
     }
 
     // === Simple String tests ===

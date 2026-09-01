@@ -142,6 +142,23 @@ impl CompactValue {
         }
     }
 
+    /// Create a string `CompactValue` from a borrowed slice.
+    ///
+    /// The same branch `from_redis_value` takes for `RedisValue::String`, minus the
+    /// owned `Bytes` the caller would otherwise have to build first. Both arms copy
+    /// the bytes anyway — SSO inlines them, and the heap arm reaches
+    /// `Bytes::into::<Vec<u8>>()`, which is only zero-copy at refcount 1 and a slice
+    /// of a shared read buffer never is — so nothing is lost by borrowing, and a
+    /// caller with `itoa` output or a stack buffer avoids an allocation entirely.
+    #[inline]
+    pub fn from_slice(data: &[u8]) -> Self {
+        if data.len() <= SSO_MAX_LEN {
+            Self::inline_string(data)
+        } else {
+            Self::heap_string(data)
+        }
+    }
+
     /// Create a CompactValue from a RedisValue.
     ///
     /// Strings > 12 bytes are stored as `Box<[u8]>` (raw bytes) to eliminate the

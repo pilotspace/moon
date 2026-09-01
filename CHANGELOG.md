@@ -6,7 +6,206 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **`storage`: an empty `DashTable` no longer reserves 16 segments to hold one.**
+  `SegmentSlab::new` seeded its first slab at 16 segments, so `DashTable::new`
+  allocated `16 x size_of::<Segment<CompactKey, CompactEntry>>()` = **55,296 B to
+  store 3,456 B**. moon builds `--databases` (16) of these **per shard** at boot,
+  all empty, so every shard reserved **884,736 B** for segments that never exist
+  on an idle server — measured with a counting allocator at **84% of all
+  per-shard heap reservation, four times the entire SPSC mesh**. The first slab
+  is now sized to demand: 1 segment for `new()`, exactly `dir_size` for
+  `with_capacity()` (previously that path also rounded up to the fixed slab and
+  fragmented its segments across ~log2 slabs). The existing doubling growth is
+  unchanged, so a table that fills sees the same amortised curve, and slabs are
+  still never reallocated — segment pointers stay stable.
+
+  Measured, structural (allocation sizes; host-independent), for
+  `--appendonly no --disk-offload disable` with default features:
+
+  | per-shard term | before | after |
+  |---|---:|---:|
+  | one empty `Database` | 55,432 B | 3,592 B |
+  | 16 `Database`s (per shard) | 893,976 B | 64,536 B |
+  | `ChannelMesh::new` (unchanged) | 135,984 B | 135,984 B |
+  | **model total per extra shard** | **1,030,432 B** | **200,992 B** |
+
+  **The RSS effect is not claimed here.** Reserved bytes are an upper bound on
+  resident — untouched pages of a fresh mapping never become resident — and moon's
+  idle-RSS numbers must come from Linux, where jemalloc's `background_thread`
+  exists and retention differs. `tests/shard_idle_alloc_attribution.rs` is the
+  regression gate and prints the full attribution.
+
+
+## [0.8.8] — 2026-09-01
+
 ### Documentation
+
+- **BENCHMARK.md §2.14 — moon `--shards 8` vs Redis `io-threads 8` on all three
+  dimensions, and two retractions.** Throughput is a win at pipeline depth on
+  **both** architectures (aarch64 1.26x / 2.74x, x86_64 1.32x / 2.91x at p=8 / p=64,
+  8/8 families on x86) and a **tie at p=1** — the rig is bimodal for Redis as well as
+  for moon, so p=1 must be mode-matched and never averaged. CPU per op is a **tie**
+  (10.55 vs 11.33 us; moon is 6.9% lower but that sits inside Redis's own 11.9%
+  run-to-run spread, and the durable difference is stability: moon's CV is 2.0%).
+  **Memory is not won:** 0.94x at 8-byte values, **1.16x worse at 64-byte values**,
+  0.97x at 256-byte, **1.26x worse on idle RSS**.
+
+  Two earlier claims are retracted in-tree, with their raw data kept. (1) "moon gains
+  nothing from eight shards" (s8/s1 = 0.97x) was a harness artifact: `redis-benchmark
+  -t lpush|sadd|hset|zadd` drives ONE literal key and `-r` randomises the *element*,
+  not the key, so eight of twelve families were asked to parallelise a single key.
+  Re-run with explicit `__rand_int__` keys and a `DBSIZE >= 50000` guard proven to fire,
+  real scaling is 1.42x / 2.14x / 3.79x. (2) The "0.90x per-key memory win" measured
+  `redis-benchmark`'s default **3-byte** value: both legs sat *below their own
+  arithmetic floor*, which is impossible. Re-measured across 8/64/256-byte values under
+  a `key + value + 24` floor check — verified to reject both historical numbers before
+  being trusted — the win is a **band, not a trend**, and it exists only below the
+  12-byte `CompactValue` inline cutoff.
+
+### Performance
+
+- **Ordinary keyspace commands skip the connection handler's name-dependent intercept
+  gates.** Every command walked 26 gates before dispatch; only six carried a `cmd_len`
+  pre-guard and twelve are `async fn`s whose futures were built and polled purely to
+  return `false`. `CommandFlags::NO_INTERCEPT` (free bit 14 of the existing `u16`) is
+  read from the same `COMMAND_META` entry the arity check already consults, and replaces
+  21 of those gate calls with one bit test. The gates and their **order are unchanged** —
+  the ordering comments in `handler_monoio/mod.rs` record real bugs (ACL above privileged
+  intercepts, workspace rewrite above key-readers, MULTI queue below ACL), and reordering
+  to save a branch would re-open them. The four *state* gates (ACL, cluster routing,
+  readonly, disk-full) apply to every command regardless of name and are deliberately not
+  guarded. The flag's sense is inverted on purpose: unmarked means "take the slow path",
+  so adding a command or an intercept can cost throughput but never correctness.
+  `tests/intercept_flag_drift.rs` guards the other direction and was verified to FAIL when
+  `WAIT` is marked. **Measured on Linux/ARM** (GCE t2a, two-box, `--shards 1`, 6 interleaved
+  reps, arms alternating every rep, noise floors 1.3-5.2%): INCR +11.5% at p8 and +16.8% at p64,
+  HSET +6.5/+12.0/+11.9% at p1/p8/p64, LPUSH +8.7/+10.9% at p8/p64, SADD +7.6/+11.0% at
+  p8/p64 — geometric mean +3.9% over all 18 cells, and the base/ni distributions do not
+  overlap at p64. GET and SET are unchanged (they are bimodal in both arms; the inline byte
+  path is what serves them). This is larger than the 3-5% originally predicted, but it does
+  not close the 0.43x deficit recorded in BENCHMARK.md §2.12.
+- **A flat multibulk is now parsed in one pass instead of two.** `parse()` ran
+  `validate_frame` over the request bytes to compute the frame's total length — computing
+  every argument offset on the way and throwing all of them away — and then ran
+  `parse_frame_zerocopy` over the same bytes to re-derive exactly those offsets. For a
+  top-level `*N` of `$`-bulks, which is the shape of essentially every client command, a
+  new `scan_flat_multibulk` records each argument's span into a stack `SmallVec` while it
+  validates, and the `Frame` is built straight from the spans: one `memchr` walk and one
+  `strict_atoi` per token instead of two, and no recursive per-element call. Everything
+  else — RESP3 containers, nested arrays, null bulks (`$-1`), null arrays (`*-1`), inline
+  commands, and reply parsing — is untouched and still takes the two-pass path; the fast
+  path declines on anything it does not handle exactly.
+
+  Correctness is asserted differentially, not argued: `parse_reference_two_pass` (the old
+  pipeline, compiled only under `cfg(test)`/`feature = "fuzzing"`) is compared against
+  `parse()` over a corpus of ~50 hand-picked cases **and every truncation of each**, under
+  four `ParseConfig`s including degenerate limits, and across argc 0–20 × payload lengths
+  0–300. Five deliberate mutations of the scanner were confirmed to fail those tests, so
+  they are not vacuous. A new `resp_parse_fused` fuzz target runs the same differential and
+  is registered in **both** matrices in `.github/workflows/fuzz.yml`.
+
+  The reserve for the scanned spans is capped at `buf.len() / 6`, not at the count off
+  the wire. Six bytes is the shortest an element can be, so the cap can never
+  under-allocate a scan that succeeds — and without it `*1048576\r\n`, ten bytes
+  against the default 1Mi `max_array_length`, would have reserved 8 MiB before the scan
+  discovered the frame was incomplete. The two-pass path never had that amplification
+  because it reaches `FrameVec::with_capacity` only after `validate_frame` has proved the
+  whole frame is present.
+
+- **`benches/resp_parsing.rs` gains the `argc > 4` pair.** `FrameVec` is
+  `Box<SmallVec<[Frame; 4]>>`, so `FrameVec::with_capacity(count)` heap-spills past four
+  elements and a `*5` command pays two allocations where a `*3` pays one. BENCHMARK.md
+  attributes the `SET k v` (2.08x) vs `SET k v EX 100` (0.87x) step to the inline byte
+  path, but a second, independent step sits at exactly that boundary and nothing has
+  separated them. `parse_set_ex_5arg` (`*5`) pairs with the existing `parse_set_single`
+  (`*3`), and `parse_hset_4arg` / `parse_hset_6arg` are the clean control — same command,
+  same work per argument, only argc differs, and the inline path never touches HSET. No
+  numbers: these must be run on a Linux host.
+
+- **INCR/DECR/INCRBY/DECRBY no longer allocate a `String` per operation.** The new value
+  was stored as `Entry::new_string(Bytes::from(new_val.to_string()))` — a heap allocation
+  on the command hot path, which CLAUDE.md forbids outright — and `CompactValue` then
+  copied the digits out of it and freed it again immediately: a counter of up to twelve
+  digits inlines into the 12-byte SSO payload, so the allocation was never even the
+  storage. Now `itoa::Buffer` formats into a stack buffer and the new
+  `Entry::new_string_from_slice{,_with_expiry}` / `CompactValue::from_slice` constructors
+  take it by reference. Unit-tested against `i64::to_string` at every length from 0 to 32
+  bytes and at both i64 extremes, on both the plain and the TTL-preserving arm — the arms
+  differ, and the 12/13-byte SSO boundary sits inside the range an INCR can reach.
+
+- **`Database::set` borrows its key instead of demanding an owned `Bytes`.** Every use of
+  `key` inside `set` was already by reference — `spill_inflight_forget`, `entry_overhead`,
+  `hash_expiry_index_note_value`, `CompactKey::from` (which copies the bytes either way),
+  `ColdIndex::remove`, and both expiry-index writers all take `&[u8]`, and the `Bytes` was
+  never moved anywhere. The owned signature forced a `key.clone()` at each write command:
+  one `shared_v_clone` in and one `shared_v_drop` out, per command, producing nothing.
+  `set`, `set_string` and `set_string_with_expiry` now take `&[u8]`, which removes **32**
+  `Some(k) => k.clone()` key extractions across the string, hash, list, set and sorted-set
+  write families — the ten families Wave 0 measured as losing. It also deletes a real
+  allocation (not just a refcount) from RESTORE, COPY, RENAME, MOVE, the cold-tier promote,
+  WAL v3 replay and replication apply, all of which were building a throwaway
+  `Bytes::copy_from_slice(key)` purely to satisfy the signature. Six call sites genuinely
+  need ownership and keep their clone; the compiler identified them.
+
+- **The monoio local write path no longer clones the whole reply to read one bit.** After
+  every local dispatch the handler built `response_frame` by cloning the `DispatchResult`'s
+  `Frame`, then used it for exactly one thing — `matches!(response_frame, Frame::Error(_))`
+  — and dropped it. `response_frame` had those two occurrences and no others. For an
+  `Array` reply that clone is a fresh `FrameVec` box plus one `Bytes` refcount bump per
+  element plus the matching drops, paid per command on the write path that the inline byte
+  path never touches. Replaced by `DispatchResult::is_error()`, a borrow-only `matches!`
+  over both variants. Semantics are unchanged by construction; the new method is unit-tested
+  over `Response`/`Quit` × error/non-error.
+### Changed
+
+- **The cross-shard read fast path ships enabled (`--cross-shard-fast-path auto`).**
+  At `--shards 8` on a populated keyspace it now serves **100%** of foreign reads on the
+  calling thread and takes `parks/cmd` for `GET` at p=1 from **0.87336 to 0.00023** — same
+  binary, one flag apart, measured from `INFO stats`
+  (`total_dispatch_cross_read_fast` / `total_dispatch_cross_spsc` /
+  `total_remote_awaits_parked`). `docs/internal/cross-shard-cost-model.md` prices a park at
+  ~24.9 core-us and at 85% of p=1 cost, so this is the largest single lever on the
+  cross-shard read path. **Reads only** — a cross-shard write still parks, unchanged at
+  0.875/cmd.
+
+  It shipped `off` because the only evidence was moon#768's `-8.61%` CPU/op and a doubled
+  `s8 p16` variance. Both readings came from a **half-populated** keyspace. The path
+  declines a key that is not resident — `dispatch_read` cannot consult the cold tier, the
+  moon#610 class — and a declined read falls back to the SPSC hop, so the measured
+  "in-place rate" was tracking the benchmark's key **hit** rate, and a wandering hit rate
+  is precisely the variance that held the default down. Reproduced against `DBSIZE`:
+  63,114 keys resident gives 62.9% in place, 98,169 gives 98.2%, 100,000 gives 100.0%.
+  This also retires the standing question of why #768 measured 50.5% in place where the
+  model predicted 87.5%.
+
+  `auto` declines where the path cannot fire — `--shards 1` (every key is local) and the
+  tokio leg (`handler_sharded` has no fast-path site, moon#776) — so the switch never reads
+  as enabled on a leg that would ignore it. `on` forces it; **`off` is the rollback** and is
+  pinned by `l4_cross_shard_read_fastpath::the_fast_path_stays_dark_when_the_flag_is_off`.
+
+### Documentation
+
+- **First Moon-vs-Redis benchmark since v0.6.0, and it corrects the headline framing.**
+  BENCHMARK.md §2.12 records v0.8.7 measured on both GCE arches (7 interleaved reps, Redis
+  7.0.15 re-measured every rep, 0 failures). Moon wins GET (2.40× x86 / 2.29× ARM) and SET
+  (1.78× / 2.02×) at P=64 and is at parity at p=1 — but **every non-inlined command family
+  (INCR/LPUSH/SPOP/HSET) runs 0.40–0.67× Redis at p≥8**. The boundary is the two-command
+  inline byte path, not the engine: `SET k v` runs 2.08× Redis while `SET k v EX 100` — same
+  work, one disqualifying option — runs 0.87×. §1, the exec-summary table and the README
+  benchmark section now carry that scope. The p=1 `--io-busy-poll-us 40` claim (1.65–1.66×
+  x86) is annotated as requiring **dedicated** cores; on shared-tenant instances it measures
+  1.06–1.08× x86 and within-noise on ARM, because the contention governor self-gates.
+- **§2.13: a 9–21% write-path regression since v0.6.0, in three steps.** A 9-point rebuild
+  sweep across the 326 commits in `v0.6.0..d63ffcd8` shows flat throughput for a month then
+  three separate drops; `git bisect` would have named the first and missed two thirds of the
+  loss. GET is the only read in the grid and the only family that lost nothing. `perf`
+  attributes +5.5 points of per-command cost to the dispatch/intercept region. Four candidate
+  mechanisms were tested and refuted rather than published — the intercept chain *shrank*
+  (28→26 gates), the `cmd_len == 4` guard theory reverses under an INCR-vs-INCRBY probe, the
+  `with_shard_db` fallback is never taken, and `ShardSlice` did not grow. Attribution is
+  bounded by fat LTO absorbing inlined closures into the `with_shard` symbol.
 
 - **The `moon-dev` recreate recipe now works end to end.** `docs/internal/orbstack-linux-parity.md`
   was missing four packages that are each load-bearing (`git`, `python3-redis`, `libicu-dev`,
@@ -24,6 +223,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ShardSliceInit` literal, build slices with `test_support::make_init`.
 
 ### Fixed
+
+- **`*-\r\n` would have parsed as an empty array on the new fast path.** Found by
+  `resp_parse_fused` within 90 seconds of its first run, before the change shipped.
+  `strict_atoi` reads a lone `-` (and `-0`) as **zero**, while `parse()`'s
+  `is_null_multibulk` gate keys on the raw byte `buf[1] == b'-'` rather than on the parsed
+  count — so the two-pass path silently consumes `*-\r\n` and reports no frame, where a
+  count-based check would have produced `*0`. The scanner now declines on the byte. No
+  released version is affected; recorded because the shape (`is_null_multibulk` testing a
+  byte, not a number) is a trap for any future fast path over the same bytes.
 
 - **Fuzz crash reproducers are archived instead of discarded.** `fuzz.yml` uploaded only
   `fuzz/corpus/`, so the minimal reproducer libFuzzer writes to

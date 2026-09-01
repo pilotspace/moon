@@ -218,6 +218,15 @@ are in [BENCHMARK.md](BENCHMARK.md)** and [docs/benchmarks.md](docs/benchmarks.m
 
 On **ARM64** (Neoverse-N1) Moon runs ~2.1–2.2× Redis on the same harness.
 
+> **Scope of the pipelined win — read before quoting these.** GET and SET are the
+> two commands moon serves from an inline byte path that bypasses frame
+> construction and the dispatch table. Re-measured on v0.8.7
+> ([BENCHMARK.md §2.12](BENCHMARK.md)), they beat Redis by 1.78–2.40× at p=64 —
+> but **every other command family (INCR, LPUSH, SPOP, HSET) runs 0.40–0.67×
+> Redis at p≥8.** The boundary is the fast path, not the engine: `SET k v` runs
+> 2.08× Redis while `SET k v EX 100` — same work, one disqualifying option —
+> runs 0.87×. At p=1 moon is at parity or slightly ahead across the board.
+
 Deep pipelines were always Moon's home turf; v0.5–v0.6 closed the two
 classic gaps too:
 
@@ -226,7 +235,10 @@ classic gaps too:
   `--io-busy-poll-us 40` poll-mode park (`--profile standalone`, or the
   annotated [`conf/moon-standalone.conf`](conf/moon-standalone.conf), sets it
   for you): **1.19–1.21×** Redis on ARM (c4a Axion), **1.65–1.66×** on x86
-  (c3), same-instance A/Bs, n=3. As of v0.8.1 the busy-poll **auto-gates on
+  (c3), same-instance A/Bs, n=3 — **on dedicated cores**. Re-measured on
+  ordinary shared-tenant GCE instances (v0.8.7, BENCHMARK.md §2.12) the same
+  flag yields 1.06–1.08× on x86 and nothing outside the noise floor on ARM,
+  because the contention governor below correctly self-gates there. As of v0.8.1 the busy-poll **auto-gates on
   shared cores** (per-shard contention governor), so the preset is safe on any
   host — not just pinned ones.
 - **Fully durable writes** (`appendfsync always`, p=16) went from 0.12× to

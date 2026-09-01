@@ -4352,8 +4352,8 @@ fn test_ft_dropindex_dd_deletes_docs() {
     // Insert document into database (simulating HSET)
     let key1 = Bytes::from_static(b"dd:1");
     let key2 = Bytes::from_static(b"dd:2");
-    db.set(key1.clone(), crate::storage::entry::Entry::new_hash());
-    db.set(key2.clone(), crate::storage::entry::Entry::new_hash());
+    db.set(&key1, crate::storage::entry::Entry::new_hash());
+    db.set(&key2, crate::storage::entry::Entry::new_hash());
 
     // Register keys in the vector index (simulating auto_index_hset)
     if let Some(idx) = store.get_index_mut(b"ddtest") {
@@ -4424,7 +4424,7 @@ fn test_ft_dropindex_preserves_docs() {
 
     // Insert document into database
     let key1 = Bytes::from_static(b"pres:1");
-    db.set(key1.clone(), crate::storage::entry::Entry::new_hash());
+    db.set(&key1, crate::storage::entry::Entry::new_hash());
 
     // Register key in vector index
     if let Some(idx) = store.get_index_mut(b"preservetest") {
@@ -4485,7 +4485,7 @@ fn test_ft_dropindex_dd_case_insensitive() {
         ft_create(&mut store, &mut text_store, &create_args, 0);
 
         let key = Bytes::from_static(b"c1:doc");
-        db.set(key.clone(), crate::storage::entry::Entry::new_hash());
+        db.set(&key, crate::storage::entry::Entry::new_hash());
         if let Some(idx) = store.get_index_mut(b"casetest1") {
             idx.key_hash_to_key
                 .insert(xxhash_rust::xxh64::xxh64(&key, 0), key.clone());
@@ -4536,7 +4536,7 @@ fn test_ft_dropindex_dd_case_insensitive() {
         ft_create(&mut store, &mut text_store, &create_args, 0);
 
         let key = Bytes::from_static(b"c2:doc");
-        db.set(key.clone(), crate::storage::entry::Entry::new_hash());
+        db.set(&key, crate::storage::entry::Entry::new_hash());
         if let Some(idx) = store.get_index_mut(b"casetest2") {
             idx.key_hash_to_key
                 .insert(xxhash_rust::xxh64::xxh64(&key, 0), key.clone());

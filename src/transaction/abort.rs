@@ -116,10 +116,10 @@ pub fn abort_cross_store_txn(
                         db.remove(&key);
                     }
                     UndoRecord::Update { key, old_entry } => {
-                        db.set(key, old_entry);
+                        db.set(&key, old_entry);
                     }
                     UndoRecord::Delete { key, old_entry } => {
-                        db.set(key, old_entry);
+                        db.set(&key, old_entry);
                     }
                 }
             }

@@ -52,7 +52,7 @@ fn filled_db(with_cold_index: bool) -> Database {
     }
     for i in 0..KEY_COUNT {
         db.set_string(
-            Bytes::from(format!("key:{i:04}")),
+            &Bytes::from(format!("key:{i:04}")),
             Bytes::from(vec![b'v'; VALUE_LEN]),
         );
     }

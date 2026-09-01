@@ -1583,13 +1583,13 @@ mod tests {
         let far_ms = current_time_ms() + 3_600_000;
         for i in 0..5_000u32 {
             db.set(
-                Bytes::from(format!("far_{i}")),
+                &Bytes::from(format!("far_{i}")),
                 Entry::new_string_with_expiry(Bytes::from_static(b"v"), far_ms + u64::from(i)),
             );
         }
         // Volatile and clearly the soonest, but NOT expired.
         db.set(
-            Bytes::from_static(b"soonest"),
+            b"soonest",
             Entry::new_string_with_expiry(Bytes::from_static(b"v"), current_time_ms() + 60_000),
         );
 
@@ -1747,7 +1747,7 @@ mod tests {
         for i in 0..50 {
             let key = bytes::Bytes::from(format!("k{i}"));
             let entry = Entry::new_string(bytes::Bytes::from(vec![0u8; 100]));
-            db.set(key, entry);
+            db.set(&key, entry);
         }
         let used = db.estimated_memory();
         assert!(
@@ -1790,7 +1790,7 @@ mod tests {
         for i in 0..50 {
             let key = bytes::Bytes::from(format!("k{i}"));
             let entry = Entry::new_string(bytes::Bytes::from(vec![0u8; 100]));
-            db.set(key, entry);
+            db.set(&key, entry);
         }
         let used = db.estimated_memory();
         assert!(used > 500);
@@ -1842,10 +1842,10 @@ mod tests {
         // whole-instance cap, but each shard enforces eviction independently.
         // Without per-shard division an N-shard server tolerates ~N×maxmemory.
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
-        db.set_string(Bytes::from_static(b"k2"), Bytes::from_static(b"v2"));
-        db.set_string(Bytes::from_static(b"k3"), Bytes::from_static(b"v3"));
-        db.set_string(Bytes::from_static(b"k4"), Bytes::from_static(b"v4"));
+        db.set_string(b"k1", Bytes::from_static(b"v1"));
+        db.set_string(b"k2", Bytes::from_static(b"v2"));
+        db.set_string(b"k3", Bytes::from_static(b"v3"));
+        db.set_string(b"k4", Bytes::from_static(b"v4"));
         let total = db.estimated_memory();
         assert!(total > 0);
 
@@ -1924,7 +1924,7 @@ mod tests {
     #[test]
     fn test_noeviction_returns_oom() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"value"));
+        db.set_string(b"key", Bytes::from_static(b"value"));
         let config = make_config(1, "noeviction");
         let result = evict_to_budget(&mut db, &config, EvictionRun::plain());
         assert!(result.is_err());
@@ -1939,7 +1939,7 @@ mod tests {
     #[test]
     fn test_no_eviction_when_unlimited() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"value"));
+        db.set_string(b"key", Bytes::from_static(b"value"));
         let config = make_config(0, "allkeys-lru");
         assert!(evict_to_budget(&mut db, &config, EvictionRun::plain()).is_ok());
     }
@@ -1947,7 +1947,7 @@ mod tests {
     #[test]
     fn test_no_eviction_when_under_limit() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"value"));
+        db.set_string(b"key", Bytes::from_static(b"value"));
         let config = make_config(1_000_000, "allkeys-lru");
         assert!(evict_to_budget(&mut db, &config, EvictionRun::plain()).is_ok());
         assert_eq!(db.len(), 1);
@@ -1966,15 +1966,15 @@ mod tests {
         let mut db = Database::new();
         let mut entry1 = Entry::new_string(Bytes::from_static(b"val1"));
         entry1.set_last_access(current_secs() - 100);
-        db.set(Bytes::from_static(b"old"), entry1);
+        db.set(b"old", entry1);
 
         let mut entry2 = Entry::new_string(Bytes::from_static(b"val2"));
         entry2.set_last_access(current_secs() - 50);
-        db.set(Bytes::from_static(b"medium"), entry2);
+        db.set(b"medium", entry2);
 
         let mut entry3 = Entry::new_string(Bytes::from_static(b"val3"));
         entry3.set_last_access(current_secs());
-        db.set(Bytes::from_static(b"new"), entry3);
+        db.set(b"new", entry3);
 
         // Drive eviction rounds until "old" is gone, bounded to prevent
         // infinite looping if the sampler is broken.
@@ -1999,9 +1999,9 @@ mod tests {
     #[test]
     fn test_allkeys_random_evicts() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
-        db.set_string(Bytes::from_static(b"k2"), Bytes::from_static(b"v2"));
-        db.set_string(Bytes::from_static(b"k3"), Bytes::from_static(b"v3"));
+        db.set_string(b"k1", Bytes::from_static(b"v1"));
+        db.set_string(b"k2", Bytes::from_static(b"v2"));
+        db.set_string(b"k3", Bytes::from_static(b"v3"));
 
         let config = make_config(1, "allkeys-random");
         let result = evict_to_budget(&mut db, &config, EvictionRun::plain());
@@ -2012,16 +2012,9 @@ mod tests {
     #[test]
     fn test_volatile_only_skips_persistent() {
         let mut db = Database::new();
-        db.set_string(
-            Bytes::from_static(b"persistent"),
-            Bytes::from_static(b"value"),
-        );
+        db.set_string(b"persistent", Bytes::from_static(b"value"));
         let future_ms = current_time_ms() + 3_600_000;
-        db.set_string_with_expiry(
-            Bytes::from_static(b"volatile"),
-            Bytes::from_static(b"value"),
-            future_ms,
-        );
+        db.set_string_with_expiry(b"volatile", Bytes::from_static(b"value"), future_ms);
 
         let result = evict_one_random(&mut db, true);
         assert!(result);
@@ -2039,16 +2032,8 @@ mod tests {
         // (worst case once the population shrinks to one key).
         let mut db = Database::new();
         let now_ms = current_time_ms();
-        db.set_string_with_expiry(
-            Bytes::from_static(b"soon"),
-            Bytes::from_static(b"v"),
-            now_ms + 10_000,
-        );
-        db.set_string_with_expiry(
-            Bytes::from_static(b"later"),
-            Bytes::from_static(b"v"),
-            now_ms + 3_600_000,
-        );
+        db.set_string_with_expiry(b"soon", Bytes::from_static(b"v"), now_ms + 10_000);
+        db.set_string_with_expiry(b"later", Bytes::from_static(b"v"), now_ms + 3_600_000);
 
         let mut evictions = 0;
         for _ in 0..50 {
@@ -2065,11 +2050,7 @@ mod tests {
             if db.data().get(b"later" as &[u8]).is_none()
                 && db.data().get(b"soon" as &[u8]).is_some()
             {
-                db.set_string_with_expiry(
-                    Bytes::from_static(b"later"),
-                    Bytes::from_static(b"v"),
-                    now_ms + 3_600_000,
-                );
+                db.set_string_with_expiry(b"later", Bytes::from_static(b"v"), now_ms + 3_600_000);
             }
         }
         assert!(
@@ -2094,10 +2075,7 @@ mod tests {
         let mut next_file_id = 1u64;
 
         let mut db = Database::new();
-        db.set_string(
-            Bytes::from_static(b"spill_key"),
-            Bytes::from_static(b"spill_val"),
-        );
+        db.set_string(b"spill_key", Bytes::from_static(b"spill_val"));
 
         let config = make_config(1, "allkeys-lru");
         let mut ctx = SpillContext {
@@ -2145,10 +2123,7 @@ mod tests {
         let mut next_file_id = 1u64;
 
         let mut db = Database::new();
-        db.set_string(
-            Bytes::from_static(b"db2_key"),
-            Bytes::from_static(b"db2_val"),
-        );
+        db.set_string(b"db2_key", Bytes::from_static(b"db2_val"));
 
         let config = make_config(1, "allkeys-lru");
         let mut ctx = SpillContext {
@@ -2186,7 +2161,7 @@ mod tests {
         let mut next_file_id = 1u64;
 
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        db.set_string(b"k1", Bytes::from_static(b"v1"));
 
         // Per-shard budget of 1 byte forces an eviction attempt for k1.
         // appendonly=yes: this test exercises the AOF-backstopped fast path's
@@ -2261,7 +2236,7 @@ mod tests {
 
         let mut db = Database::new();
         db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
-        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        db.set_string(b"k1", Bytes::from_static(b"v1"));
         let total = db.estimated_memory();
 
         let mut config = make_config(1, "allkeys-lru");
@@ -2354,7 +2329,7 @@ mod tests {
         let mut next_file_id = 1u64;
 
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        db.set_string(b"k1", Bytes::from_static(b"v1"));
         let total = db.estimated_memory();
 
         // budget of 1 byte: always over, for any non-empty value.
@@ -2402,7 +2377,7 @@ mod tests {
         let mut next_file_id = 1u64;
 
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        db.set_string(b"k1", Bytes::from_static(b"v1"));
 
         let mut config = make_config(1, "noeviction");
         config.appendonly = "no".to_string();
@@ -2441,7 +2416,7 @@ mod tests {
         let mut next_file_id = 1u64;
 
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"persistent"), Bytes::from_static(b"v"));
+        db.set_string(b"persistent", Bytes::from_static(b"v"));
         // Budget the persistent key alone comfortably fits under, but the
         // persistent+volatile total exceeds -- so eviction must stop exactly
         // once the volatile key is gone, without needing a "drop everything"
@@ -2451,11 +2426,7 @@ mod tests {
         let persistent_only_memory = db.estimated_memory();
 
         let future_ms = current_time_ms() + 3_600_000;
-        db.set_string_with_expiry(
-            Bytes::from_static(b"volatile"),
-            Bytes::from_static(b"v"),
-            future_ms,
-        );
+        db.set_string_with_expiry(b"volatile", Bytes::from_static(b"v"), future_ms);
         let total_with_both = db.estimated_memory();
         assert!(
             total_with_both > persistent_only_memory,
@@ -2520,7 +2491,7 @@ mod tests {
         let mut next_file_id = 1u64;
 
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        db.set_string(b"k1", Bytes::from_static(b"v1"));
         let total = db.estimated_memory();
 
         let mut config = make_config(1, "allkeys-lru");
@@ -2564,10 +2535,7 @@ mod tests {
         let mut next_file_id = 1u64;
 
         let mut db = Database::new();
-        db.set_string(
-            Bytes::from_static(b"spill_key"),
-            Bytes::from_static(b"spill_val"),
-        );
+        db.set_string(b"spill_key", Bytes::from_static(b"spill_val"));
 
         let config = make_config(1, "allkeys-lru");
         let mut ctx = SpillContext {
@@ -2684,7 +2652,7 @@ mod tests {
         db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
         for i in 0..40u8 {
             db.set_string(
-                Bytes::copy_from_slice(format!("batch_key_{i:02}").as_bytes()),
+                format!("batch_key_{i:02}").as_bytes(),
                 Bytes::from_static(b"batch_value_payload"),
             );
         }
@@ -2802,7 +2770,7 @@ mod tests {
         let mut db = Database::new();
         let mut entry = crate::storage::Entry::new_string(Bytes::from_static(b"a-value"));
         entry.set_expires_at_ms(db.now_ms() + remaining_ms);
-        db.set(Bytes::from_static(key), entry);
+        db.set(key, entry);
         db
     }
 
@@ -2906,7 +2874,7 @@ mod tests {
 
         let mut db = Database::new();
         db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
-        db.set_string(Bytes::from_static(b"forever"), Bytes::from_static(b"v"));
+        db.set_string(b"forever", Bytes::from_static(b"v"));
         let config = make_config(1, "allkeys-lru");
 
         let mut ctx = SpillContext {
@@ -3013,7 +2981,7 @@ mod tests {
         for i in 0..32u32 {
             let mut entry = crate::storage::Entry::new_string(Bytes::from_static(b"a-value"));
             entry.set_expires_at_ms(db.now_ms() + 10);
-            db.set(Bytes::from(format!("k{i}")), entry);
+            db.set(format!("k{i}").as_bytes(), entry);
         }
         let config = make_config(1, "allkeys-lru");
 
@@ -3036,8 +3004,8 @@ mod tests {
     #[test]
     fn test_evict_without_spill_unchanged() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
-        db.set_string(Bytes::from_static(b"k2"), Bytes::from_static(b"v2"));
+        db.set_string(b"k1", Bytes::from_static(b"v1"));
+        db.set_string(b"k2", Bytes::from_static(b"v2"));
 
         let config = make_config(1, "allkeys-random");
         let result = evict_to_budget(&mut db, &config, EvictionRun::sync_spill(None));
@@ -3230,7 +3198,7 @@ mod tests {
     fn evict_to_budget_plain_honors_policy_and_reports() {
         // noeviction: OOM, nothing removed.
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        db.set_string(b"k1", Bytes::from_static(b"v1"));
         let config = make_config(1, "noeviction");
         let result = evict_to_budget(&mut db, &config, EvictionRun::plain());
         assert!(result.is_err(), "noeviction over budget must OOM");
@@ -3240,7 +3208,7 @@ mod tests {
         let mut db = Database::new();
         for i in 0..8u8 {
             db.set_string(
-                Bytes::copy_from_slice(format!("pk{i}").as_bytes()),
+                format!("pk{i}").as_bytes(),
                 Bytes::from_static(b"value_payload"),
             );
         }
@@ -3269,7 +3237,7 @@ mod tests {
         db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
         for i in 0..40u8 {
             db.set_string(
-                Bytes::copy_from_slice(format!("w4_key_{i:02}").as_bytes()),
+                format!("w4_key_{i:02}").as_bytes(),
                 Bytes::from_static(b"batch_value_payload"),
             );
         }
@@ -3312,7 +3280,7 @@ mod tests {
     #[test]
     fn evict_to_budget_budget_override_respected() {
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"bk"), Bytes::from_static(b"bv"));
+        db.set_string(b"bk", Bytes::from_static(b"bv"));
         let used = db.estimated_memory();
 
         // Override comfortably above usage: nothing evicted.
@@ -3449,7 +3417,7 @@ mod tests {
         let far_ms = current_time_ms() + 3_600_000;
         for i in 0..live_keys {
             db.set(
-                Bytes::from(format!("live_{i:03}")),
+                &Bytes::from(format!("live_{i:03}")),
                 Entry::new_string_with_expiry(
                     Bytes::from_static(b"a_reasonably_sized_value_payload"),
                     far_ms + i as u64,
@@ -3567,7 +3535,7 @@ mod tests {
         let mut db = Database::new();
         for i in 0..4u8 {
             db.set_string(
-                Bytes::copy_from_slice(format!("pp{i}").as_bytes()),
+                format!("pp{i}").as_bytes(),
                 Bytes::from_static(b"probe_value_payload"),
             );
         }

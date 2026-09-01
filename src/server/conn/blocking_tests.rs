@@ -80,7 +80,7 @@ fn immediate_scan_surfaces_wrongtype_instead_of_blocking() {
         let mut db = Database::new();
         // The wrong type for BOTH families: a plain string.
         db.set(
-            Bytes::copy_from_slice(key.as_bytes()),
+            key.as_bytes(),
             Entry::new_string(Bytes::from_static(b"payload")),
         );
         let reply = immediate_scan(cmd, &argv, &keys(&[key]), &mut db, 0, 1);
@@ -137,10 +137,7 @@ fn immediate_scan_wrongtype_across_collection_families() {
 #[test]
 fn immediate_scan_errors_on_the_first_wrongtype_key_in_order() {
     let mut db = Database::new();
-    db.set(
-        Bytes::from_static(b"bad"),
-        Entry::new_string(Bytes::from_static(b"v")),
-    );
+    db.set(b"bad", Entry::new_string(Bytes::from_static(b"v")));
     db.list_push_back(b"good", Bytes::from_static(b"job"));
     let reply = immediate_scan(
         b"BLPOP",
@@ -206,7 +203,7 @@ fn immediate_blmove_rejects_a_wrongtype_destination_without_losing_the_element()
         let mut db = Database::new();
         db.list_push_back(b"src", Bytes::from_static(b"v1"));
         db.set(
-            Bytes::from_static(b"dst"),
+            b"dst",
             Entry::new_string(Bytes::from_static(b"iam-a-string")),
         );
         let reply = immediate_scan(cmd, &argv, &keys(&["src"]), &mut db, 0, 1);
@@ -224,10 +221,7 @@ fn immediate_blmove_rejects_a_wrongtype_destination_without_losing_the_element()
 #[test]
 fn immediate_blmove_with_absent_source_ignores_the_destination_type() {
     let mut db = Database::new();
-    db.set(
-        Bytes::from_static(b"dst"),
-        Entry::new_string(Bytes::from_static(b"s")),
-    );
+    db.set(b"dst", Entry::new_string(Bytes::from_static(b"s")));
     assert_eq!(
         immediate_scan(
             b"BLMOVE",
@@ -301,7 +295,7 @@ fn immediate_scan_ignores_keys_this_shard_does_not_own() {
     // a key whose real owner is another shard.
     let mut db = Database::new();
     db.set(
-        Bytes::copy_from_slice(remote.as_bytes()),
+        remote.as_bytes(),
         Entry::new_string(Bytes::from_static(b"v")),
     );
     assert_eq!(

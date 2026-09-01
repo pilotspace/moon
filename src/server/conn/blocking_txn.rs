@@ -388,10 +388,7 @@ mod tests {
     #[test]
     fn wrong_type_is_an_error_not_a_null() {
         let mut db = Database::new();
-        db.set(
-            Bytes::from_static(b"str"),
-            Entry::new_string(Bytes::from_static(b"v")),
-        );
+        db.set(b"str", Entry::new_string(Bytes::from_static(b"v")));
         let out = try_exec_blocking_in_txn(b"BLPOP", &args(&["str", "0"]), &mut db)
             .expect("BLPOP is executed here");
         match out.reply {

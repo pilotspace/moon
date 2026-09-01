@@ -26,12 +26,12 @@ fn make_hash_key(db: &mut Database, key: &[u8], fields: &[(&[u8], &[u8])]) {
             map.insert(Bytes::copy_from_slice(f), Bytes::copy_from_slice(v));
         }
     }
-    db.set(Bytes::copy_from_slice(key), entry);
+    db.set(key, entry);
 }
 
 fn make_string_key(db: &mut Database, key: &[u8], value: &[u8]) {
     let entry = Entry::new_string(Bytes::copy_from_slice(value));
-    db.set(Bytes::copy_from_slice(key), entry);
+    db.set(key, entry);
 }
 
 #[test]

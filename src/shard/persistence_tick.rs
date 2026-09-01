@@ -724,7 +724,7 @@ fn apply_completion_vec(
                         req.ttl_ms,
                     ) {
                         Some(entry) => {
-                            db.set(req.key.clone(), entry);
+                            db.set(&req.key, entry);
                             crate::storage::tiered::spill_thread::record_spill_failed_reinserted();
                             tracing::error!(
                                 file_id = c.file_entry.file_id,

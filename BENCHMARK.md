@@ -1,11 +1,15 @@
 # moon Benchmark Report
 
-**Release marker:** the numbers below are the benchmark record backing **v0.6.0**
+**Release marker:** §2.12–§2.13 are measured on **v0.8.7** (`d63ffcd8`). Everything
+else below is still the record backing **v0.6.0** and has NOT been re-verified against
+Redis since — see §2.12 before quoting any ratio.
+
+**Historical release marker (v0.6.0):** the numbers below are the benchmark record backing **v0.6.0**
 (README headline claims: peak GET/SET §2, p=1 busy-poll win §2.10, durability
 write-path §7.3, multi-shard convoy fix §6.6, vector time-to-green vs Qdrant §10.9,
 graph vs FalkorDB §11, engine-offload RSS reduction in `docs/guides/tuning.md`).
 
-**Last Updated:** 2026-07-08 (**new §7.3: durability write-path campaign (PRs #238–#242)** — closes the AOF-on deficits vs Redis. `appendfsync always` P16 SET 0.12×→**0.91×** (per-command fsync → per-batch group commit + one coalesced write), `everysec` P1 SET 0.80×→**0.99× parity** (park-free writer poll kills a 150k/run futex-wake storm on the shard thread), `everysec` P16 SET **1.32× WIN**, and pub/sub fan-out delivery 438 msg/s (near-total drops) → **5.09M msg/s, zero drops, ~1.04× Redis**. All GCE c3-standard-8, Redis 7.0.15, 3 alternated reps, provenance-probed. Prior 2026-07-04 §6.6: multi-shard multi-connection WIN — reply-convoy fix + slot-unified replies take s4 c8 P1 from 0.44–0.64× to 1.57–2.0× Redis and c64 to 2.5×, both arches; supersedes §6.5's c≥8 rows. Prior 2026-07-03: **§2.10: p=1 single-op WIN on both arches via `--io-busy-poll-us` poll-mode park** — ARM c4a 1.19–1.21×, x86 c3 1.65–1.66× vs Redis, n=3 instances/arch; supersedes the "loses p=1" rows in §2.7–2.9 when busy-poll is on. **§6.5: shards × busy-poll sweep** — busy-poll recovers +22–42% of the cross-shard hop but shards>1 still loses non-pipelined; `--shards 1 --io-busy-poll-us 40` is the p=1 config. Prior: 2026-06-16 4-feature concurrent-vs-competitor pass — §10.5 vector vs RediSearch, §11.4 graph vs FalkorDB, §12 Full-Text Search; §2.8 = v2-1/PR #189 `db61973` K=1024 re-measurement; v0.1.6 in §2.1–2.6; §2.7 on perf/shard-dispatch-hot-path)
+**Last Updated:** 2026-08-31 (**new §2.12: first Moon-vs-Redis matrix since v0.6.0** — v0.8.7 on both arches, 7 interleaved reps, 0 failures. Moon wins GET (2.40x x86 / 2.29x ARM) and SET (1.78x / 2.02x) at P=64 and sits at parity at p=1, but **every non-inlined command family (INCR/LPUSH/SPOP/HSET) runs 0.40–0.67x Redis at p>=8** — the pipelined win belongs to the two-command inline byte path, proven by `SET k v` 2.08x vs `SET k v EX 100` 0.87x. **New §2.13:** v0.6.0→v0.8.7 regression sweep — the deficit is long-standing, but a further **9–21% write-path loss** landed in three steps during the final three weeks; GET lost nothing. Four candidate mechanisms tested and refuted. Prior 2026-07-08: **new §7.3: durability write-path campaign (PRs #238–#242)** — closes the AOF-on deficits vs Redis. `appendfsync always` P16 SET 0.12×→**0.91×** (per-command fsync → per-batch group commit + one coalesced write), `everysec` P1 SET 0.80×→**0.99× parity** (park-free writer poll kills a 150k/run futex-wake storm on the shard thread), `everysec` P16 SET **1.32× WIN**, and pub/sub fan-out delivery 438 msg/s (near-total drops) → **5.09M msg/s, zero drops, ~1.04× Redis**. All GCE c3-standard-8, Redis 7.0.15, 3 alternated reps, provenance-probed. Prior 2026-07-04 §6.6: multi-shard multi-connection WIN — reply-convoy fix + slot-unified replies take s4 c8 P1 from 0.44–0.64× to 1.57–2.0× Redis and c64 to 2.5×, both arches; supersedes §6.5's c≥8 rows. Prior 2026-07-03: **§2.10: p=1 single-op WIN on both arches via `--io-busy-poll-us` poll-mode park** — ARM c4a 1.19–1.21×, x86 c3 1.65–1.66× vs Redis, n=3 instances/arch; supersedes the "loses p=1" rows in §2.7–2.9 when busy-poll is on. **§6.5: shards × busy-poll sweep** — busy-poll recovers +22–42% of the cross-shard hop but shards>1 still loses non-pipelined; `--shards 1 --io-busy-poll-us 40` is the p=1 config. Prior: 2026-06-16 4-feature concurrent-vs-competitor pass — §10.5 vector vs RediSearch, §11.4 graph vs FalkorDB, §12 Full-Text Search; §2.8 = v2-1/PR #189 `db61973` K=1024 re-measurement; v0.1.6 in §2.1–2.6; §2.7 on perf/shard-dispatch-hot-path)
 **Platforms:** Linux (GCloud x86_64 + ARM64), macOS (Apple M4 Pro)
 **Redis:** 8.6.1 in §2.1–2.6; 7.0.15 in §2.7
 **moon:** v0.1.6 in §2.1–2.6; perf/shard-dispatch-hot-path HEAD (commit `6582fa9`) in §2.7. Monoio runtime (io_uring on Linux, kqueue on macOS), fat LTO, codegen-units=1, target-cpu=native
@@ -43,14 +47,20 @@ The SET absolute number can differ 3-4× between methodologies. Only strict-vs-s
 
 | Metric | moon vs Redis | Conditions |
 |--------|:-------------------:|------------|
-| p=1 single-op GET/SET (x86) | **1.65-1.66x Redis** | `--io-busy-poll-us 40`, GCE c3 dedicated, n=3, §2.10 |
-| p=1 single-op GET/SET (ARM) | **1.19-1.21x Redis** | `--io-busy-poll-us 40`, GCE c4a dedicated, n=3, §2.10 |
-| Peak GET (Linux x86_64) | **5.11M ops/s (1.72x)** | GCloud c3-standard-8, P=64 |
-| Peak GET (Linux ARM64) | **3.47M ops/s (2.20x)** | GCloud t2a-standard-8, P=64 |
+| **Scope caveat (read first)** | **GET/SET only** | at p>=8 every OTHER command family runs **0.40-0.67x Redis** — §2.12 |
+| **s8 vs io-threads 8: throughput p=8 / p=64** | **1.26-1.32x / 2.74-2.91x** | ARM **and** x86, 8 families, uniform keys, §2.14 |
+| **s8 vs io-threads 8: throughput p=1** | **tie** (0.99x ARM, 0.93x x86) | both engines bimodal — mode-match, never average, §2.14 |
+| **s8 vs io-threads 8: CPU per op** | **tie** (10.55 vs 11.33 us) | inside Redis's 11.9% spread; moon 6x more stable, §2.14 |
+| **s8 vs io-threads 8: memory, 64B values** | **1.16x WORSE** | moon loses above the 12-byte inline cutoff, §2.14 |
+| **s8 vs io-threads 8: idle RSS** | **1.26x WORSE** | ~520 KB/shard, four threads per shard, §2.14 |
+| p=1 single-op GET/SET (x86) | **1.06-1.08x** (was 1.65-1.66x) | `--io-busy-poll-us 40`; 1.65x needs **dedicated** cores, §2.12 |
+| p=1 single-op GET/SET (ARM) | **within noise** (was 1.19-1.21x) | `--io-busy-poll-us 40` self-gates on shared cores, §2.12 |
+| Peak GET (Linux x86_64) | **2.40x** on v0.8.7 | c3-standard-8, P=64, §2.12 (was 1.72x on v0.1.6) |
+| Peak GET (Linux ARM64) | **2.29x** on v0.8.7 | t2a-standard-8, P=64, §2.12 (was 2.20x on v0.1.6) |
 | Peak GET (macOS) | **7.94M ops/s (2.59x)** | OrbStack, Apple M4 Pro, P=64 |
 | Production defaults GET | **1.93x Redis** | appendonly=yes, disk-offload, P=64 |
-| Memory (1KB+ values) | **27-35% less** | 1-shard, per-key RSS |
-| Memory (256B values) | Tied | 1-shard, per-key RSS |
+| Memory (1KB+ values) | **27-35% less** | 1-shard, per-key RSS — for `--shards 8` and 8/64/256B see §2.14 |
+| Memory (256B values) | Tied | 1-shard, per-key RSS — §2.14 supersedes for `--shards 8` |
 | Baseline RSS (empty) | **Identical (7.0 MB)** | 1-shard |
 | CPU efficiency at P=64 | **45x better** | 1.9% vs 43.9% CPU for similar RPS |
 | With AOF persistence | **2.75x Redis** | SET, P=64, per-shard WAL |
@@ -366,6 +376,351 @@ any effect is smaller than a noise floor of 3.6% (ARM) / 6.0% (x86).
 caveat; (2) RESP2 path only, since `redis-benchmark` cannot negotiate RESP3 — the converted RESP3
 path is covered for *correctness* by `tests/resp3_type_fidelity.rs` and the client-compat harness,
 not for throughput; (3) shards=1, loopback.
+
+---
+
+### 2.12 2026-08-31 v0.8.7 re-measurement vs Redis 7.0.15 — the inline-path split
+
+**This is the first Moon-vs-Redis matrix since v0.6.0.** The eight releases in
+between (v0.7.0 … v0.8.7, 112 commits to `src/`) were never measured against
+Redis, and this run says the report's one-number framing was hiding a large,
+systematic split.
+
+**Method.** §2.11's interleaved A/B, not the single-pass matrix §2.11 discarded:
+legs alternate order every rep, Redis is restarted and re-measured *every rep* as
+a live drift control, and the noise floor is the worst within-leg CV across the
+compared series. 7 reps, 50 clients, `--shards 1 --appendonly no --disk-offload
+disable`, Redis 7.0.15 `--save "" --appendonly no`. Request counts scale with
+depth (200k at p=1, 600k at p=8, 4M at p=64) so a p=64 point is a second of work
+rather than a measurement of process startup. Both binaries built `--release`
+(fat LTO, codegen-units=1) with `RUSTFLAGS="-C target-cpu=native"`. Provenance —
+binary sha256, both versions, CPU model — is written into the CSV header.
+0 failures / 266 rows per arch. Floors came in at **0.2–3.6%**, roughly 3× tighter
+than §2.11's, because of the larger request counts.
+
+#### x86_64 — GCE c3-standard-8 (Xeon 8481C), moon `d63ffcd8`
+
+| command | p=1 | p=8 | p=64 |
+|---------|:---:|:---:|:----:|
+| GET     | 1.02x | 0.94x | **2.40x** |
+| SET     | 1.03x | 1.07x | **1.78x** |
+| INCR    | 1.08x | **0.63x** | **0.43x** |
+| LPUSH   | 1.09x | **0.67x** | **0.49x** |
+| SPOP    | 1.09x | **0.65x** | **0.41x** |
+| HSET    | 1.10x | **0.62x** | **0.46x** |
+
+#### aarch64 — GCE t2a-standard-8 (Neoverse-N1)
+
+| command | p=1 | p=8 | p=64 |
+|---------|:---:|:---:|:----:|
+| GET     | 1.03x | 1.04x | **2.29x** |
+| SET     | 1.04x | 1.14x | **2.02x** |
+| INCR    | 1.02x* | **0.58x** | **0.43x** |
+| LPUSH   | 0.99x* | **0.64x** | **0.53x** |
+| SPOP    | 1.04x | **0.56x** | **0.40x** |
+| HSET    | 0.97x* | **0.59x** | **0.46x** |
+
+`*` within the noise floor for that row; every bolded figure is many floor-widths
+outside it.
+
+**Reading.** At p=1 Moon is at or just above parity on everything — the
+historical "wins p=1" claim survives, but at 1.0–1.1x, not the 1.19–1.66x of
+§2.10 (see below). From p=8 up the grid splits in two, identically on both
+architectures: GET and SET win, and **every other command family loses by
+40–60%**.
+
+#### The split is the inline fast path, not the engine
+
+`src/server/conn/blocking.rs` inlines "**GET or plain `SET key value`** only
+(exactly `*3` args, no NX/XX/EX/PX options)", processing those two straight from
+raw RESP bytes and bypassing `Frame` construction and the dispatch table. That
+predicts something specific and falsifiable: `SET k v EX 100` is the same command
+doing the same work, and is disqualified from the path by one option. If the
+inline path is the cause, that row alone should collapse.
+
+ARM, p=64, 2M requests, n=5 interleaved:
+
+| command | moon | redis | ratio | inline? |
+|---------|-----:|------:|:-----:|---------|
+| `SET k v`          | 2,898,551 | 1,394,700 | **2.08x** | yes |
+| `SET k v EX 100`   |   702,494 |   804,182 | **0.87x** | no — `EX` |
+| `GET k`            | 3,809,524 | 1,592,357 | **2.39x** | yes |
+| `INCR ctr`         |   725,689 | 1,643,385 | **0.44x** | no |
+
+Moon loses **76%** crossing that boundary; Redis loses 42%, which is the real
+cost of expiry bookkeeping. The pipelined win is therefore a property of the
+two-command byte path, not of the storage engine, and it does not generalise.
+
+**What this does and does not retract.** It does not retract the peak-GET
+numbers — measured *higher* here (2.40x x86 / 2.29x ARM) than §2.1's 1.72x/2.20x.
+It retracts the *framing*: §1 and the README present a two-command best case as
+if it characterised the server. Nothing in this report before today disclosed
+the p>=8 deficit on non-inlined commands, and §2.11 ran this exact grid three
+weeks earlier but only ever reduced it to Moon-branch-vs-Moon-main deltas, so
+the Moon-vs-Redis ratios were never computed.
+
+#### §2.10's p=1 busy-poll win does not reproduce here
+
+Third leg, `--io-busy-poll-us 40`, p=1 only:
+
+| arch | SET vs Redis | GET vs Redis | vs plain moon | verdict |
+|------|:---:|:---:|:---:|---|
+| x86  | 1.06x | 1.08x | 1.03–1.05x | outside floor, but far below §2.10's 1.65–1.66x |
+| ARM  | 1.01x | 1.00x | 0.96–0.97x | **within noise** |
+
+This is most likely a conditions difference rather than a regression: §2.10 was
+measured on *dedicated* cores, and `config.rs` records that the O3 contention
+governor now auto-gates the busy-poll on shared/oversubscribed cores. These are
+ordinary shared-tenant GCE instances. Either way, **the exec-summary line as
+written is not reproducible on a standard instance** and now carries its
+condition.
+
+### 2.13 2026-08-31 v0.6.0 → v0.8.7 regression sweep — a slope, not a cliff
+
+§2.12's ratios raised a question the report could not answer: is the non-inline
+deficit new? v0.6.0 was rebuilt on the same host, same toolchain, same
+`RUSTFLAGS`, and benchmarked against v0.8.7 and Redis interleaved, n=5.
+
+**The deficit itself is not new.** v0.6.0 already ran 0.51–0.76x Redis on
+INCR/LPUSH/SPOP/HSET at p>=8. Nothing regressed into existence; the ratios were
+simply never computed.
+
+**A real regression did land on top of it**, on the write path only:
+
+| test | pipe | v0.6.0 | v0.8.7 | delta |
+|------|:----:|:------:|:------:|:-----:|
+| GET   | p8 / p64 | 0.95x / 2.34x | 0.94x / 2.40x | unchanged / **+2.5%** |
+| SET   | p8       | 1.09x | 1.10x | +1.7% (at floor) |
+| SET   | p64      | 2.08x | 1.77x | **-14.9%** |
+| INCR  | p8 / p64 | 0.71x / 0.52x | 0.62x / 0.43x | **-13.5% / -17.5%** |
+| LPUSH | p8 / p64 | 0.73x / 0.56x | 0.66x / 0.49x | **-9.2% / -13.1%** |
+| SPOP  | p8 / p64 | 0.76x / 0.51x | 0.65x / 0.40x | **-14.9% / -21.4%** |
+| HSET  | p8 / p64 | 0.69x / 0.54x | 0.63x / 0.46x | **-9.7% / -14.7%** |
+
+Ten of twelve rows regressed against floors of 0.4–1.6%. **GET is the only read
+in the grid and the only family that lost nothing** — it gained.
+
+#### Shape: three steps, which is why this was not bisected
+
+A 9-point staircase across the 326 commits in `v0.6.0..d63ffcd8`, rebuilding at
+each point (INCR p=64, n=3, Redis re-measured at every point):
+
+| # | commit | date | INCR p64 | SET p64 |
+|---|--------|------|:--------:|:-------:|
+| 1 | `571c3099` | 07-10 | 0.532x | 2.074x |
+| 2 | `21081efe` | 07-12 | 0.514x | 2.074x |
+| 3 | `82b3bca3` | 07-15 | 0.517x | 2.053x |
+| 4 | `21fccea9` | 07-20 | 0.522x | 2.054x |
+| 5 | `a1c39936` | 08-11 | 0.511x | 2.113x |
+| 6 | `259f62e8` | 08-19 | **0.480x** | **2.000x** |
+| 7 | `9e487f73` | 08-21 | **0.431x** | 2.012x |
+| 8 | `2df733ab` | 08-25 | 0.438x | 2.001x |
+| 9 | `d63ffcd8` | 08-31 | 0.418x | **1.782x** |
+
+Flat for a month, then three separate drops in the final three weeks. `git
+bisect` assumes a single step change; run here it would have returned step 6 and
+presented it as *the* cause, missing two thirds of the loss. The sweep measures
+the shape instead of assuming it. (Cross-check: the sweep's HEAD point, n=3,
+gives SET 1.782x / INCR 0.418x against the independent 7-rep matrix's 1.78x /
+0.43x.)
+
+**Why per-PR gates could not catch it.** §2.11 gated PR #463 against its own
+merge-base at a 3.6–6.0% noise floor. A 9–21% loss spread over three steps and
+eight releases clears every individual gate. Nothing measures the cumulative
+total, and no Moon-vs-Redis matrix ran between v0.6.0 and today.
+
+#### Where the time went — and four hypotheses that did not survive
+
+`perf record -F 999 -g` on INCR p=64, both versions built with identical codegen
+plus DWARF and frame pointers (`CARGO_PROFILE_RELEASE_DEBUG=1`,
+`CARGO_PROFILE_RELEASE_STRIP=none`), ARM:
+
+| symbol | v0.6.0 | v0.8.7 | growth |
+|--------|:------:|:------:|:------:|
+| `shard::slice::with_shard`       | 2.07% | **4.99%** | 2.4x |
+| `command::metadata::lookup`      | 0.99% | 1.20% | 1.2x |
+| `conn::shared::extract_primary_key` | 0.42% | 1.01% | 2.4x |
+| `dispatch::try_handle_info`      | 0.41% | 0.64% | 1.6x |
+| `dispatch::try_handle_functions` | 0.12% | 0.56% | 4.7x |
+| `dispatch::try_handle_cluster_routing` | 0.21% | 0.46% | 2.2x |
+| `dispatch::try_enforce_acl`      | 0.21% | 0.44% | 2.1x |
+| `pubsub::try_handle_unsubscribe` | 0.24% | 0.32% | 1.3x |
+| `dispatch::try_handle_wait`      | absent | 0.52% | new |
+| **total** | **4.67%** | **10.14%** | **+5.5 pts** |
+
+Since v0.8.7 is the slower binary, equal share means more absolute time per
+operation; +5.5 points understates the per-op growth.
+
+Four mechanisms were proposed and **tested to destruction** rather than
+published:
+
+1. *"The intercept chain grew."* It shrank — 28 gates in v0.6.0, 26 at HEAD.
+   The chain did not lengthen; the same gates each cost about twice as much.
+2. *"The `cmd_len == 4` guard on `try_handle_info`/`try_handle_wait` lets 4-byte
+   commands through."* INCR/SPOP/HSET are 4 bytes and GET/SET are 3, which fits
+   the regression ordering. Refuted directly: INCR (4B) vs INCRBY (6B), same
+   work, n=5 interleaved — the 6-byte command is *slower* in both versions
+   (0.925x v0.6.0, 0.965x v0.8.7), the opposite of the prediction, and the gap
+   *narrows* at HEAD.
+3. *"`with_shard_db`'s fast path misses and falls back through `with_shard` +
+   `Arc::clone`."* `shard_db_set` never appears in the profile and
+   `Arc::drop_slow` is 0.01%. The fast path hits.
+4. *"`ShardSlice` grew, so `with_shard` touches colder memory."* Both versions
+   have 15 fields, and `perf annotate` shows byte-identical prologues (same
+   112-byte frame, same register saves).
+
+**What is established:** the loss is real, reproducible, write-path-only, and
+arrived in three steps; +5.5 points of per-command overhead moved into the
+dispatch/intercept region. **What is not established:** which commits caused
+which step. Attribution is limited by fat LTO — the `with_shard` symbol absorbs
+the closures inlined into it, so "`with_shard` is slower" and "the closures it
+runs do more work" are not separable from this profile. Settling it needs
+instrumented entry counts, not another sample.
+
+---
+
+### 2.14 2026-09-01 v0.8.8 — moon `--shards 8` vs Redis `io-threads 8`, all three dimensions
+
+The v0.8.x campaign asked one question: does moon's thread-per-core posture beat
+Redis's threaded-I/O posture at the same core count, on throughput **and** CPU
+**and** memory? This section is the answer, including the two dimensions where
+it is "no".
+
+**Setup.** GCE two-box, `t2a-standard-8` (Neoverse-N1) server and client, Ubuntu
+24.04, Redis 7.0.15, moon `bb66c1c1`. moon `--shards 8 --protected-mode no
+--appendonly no --disk-offload disable`; Redis `--io-threads 8
+--io-threads-do-reads yes --save "" --appendonly no`. Legs interleaved, order
+rotating every rep, each leg holding an ownership token re-verified after it
+finished. Confirmed on x86_64 as well — see the cross-arch table below.
+
+#### Throughput — moon wins at pipeline depth, ties at p=1
+
+| depth | moon-s8 / redis-io8 | families won | per-family range |
+|---|:--:|:--:|---|
+| p=1  | **0.99x** (tie) | 4/8 | 0.61-1.69 |
+| p=8  | **1.26x** | 7/8 | 0.97-1.52 |
+| p=64 | **2.74x** | 8/8 | 2.07-3.51 |
+
+Geometric mean over eight explicitly-keyed families (SET/GET/INCR/LPUSH/RPUSH/
+SADD/HSET/ZADD), 4 reps, `-c 50`. An independent 8-rep run puts p=8 at 1.22x.
+
+**p=1 is a tie, not a win or a loss, and the reason matters.** This rig is
+**bimodal**: p=1 throughput has two stable regimes ~1.6x apart, drawn at server
+start, for moon *and for Redis*. A mean or median over mixed modes reports
+whichever mode was sampled more often. Mode-matched, moon is 0.972x in the low
+mode and 1.017x in the high mode — the same answer twice. **Never average this
+rig at p=1.**
+
+#### Shard scaling — and the harness bug that inverted it
+
+| depth | moon s8/s1 | Redis io8/1 |
+|---|:--:|:--:|
+| p=1  | 1.42x | 1.19x |
+| p=8  | 2.14x | 1.23x |
+| p=64 | 3.79x | 1.08x |
+
+An earlier run of this matrix reported **s8/s1 = 0.97x** — "moon gains nothing
+from eight shards". That run was wrong, and the raw CSV is kept because the
+failure is instructive: `redis-benchmark -t lpush|sadd|hset|zadd|spop|...` drives
+**one literal key** (`mylist`/`myset`/`myhash`/`myzset`), and `-r` randomises the
+*element*, not the key. Eight shards cannot parallelise one key, so the matrix
+asked eight of twelve families to demonstrate an impossibility, and 0.97x was the
+tautological answer. Every command here is explicit and keyed by `__rand_int__`,
+and each leg now aborts unless `DBSIZE >= 50000` — a guard verified to fire
+(`dbsize=15 -> LEG_ABORT`).
+
+#### CPU per operation — a tie, and a stability difference
+
+| | moon-s8 | redis-io8 |
+|---|---:|---:|
+| CPU us/op | 10.55 | 11.33 |
+| run-to-run CV | **2.0%** | 11.9% |
+
+`utime+stime` from `/proc/<pid>/stat`, process-wide, 5 reps. moon is 6.9% lower
+— **but that sits inside Redis's own 11.9% spread (~0.6 sigma), so it is a tie,
+not a win.** The durable difference is stability: moon's CPU cost varies 2.0%
+run to run against Redis's 11.9%, which is `stopThreadedIOIfNeeded` engaging and
+disengaging io-threads under steady load.
+
+#### Memory — moon does NOT win, and the earlier claim was an artifact
+
+Fresh server per point, `-r 200000` (real distinct keys, `DBSIZE ~198,650`),
+3 reps, RSS from `VmRSS`, per-key = (loaded - idle) / DBSIZE.
+
+| value size | moon-s8 | redis-io8 | ratio | |
+|---|---:|---:|:--:|---|
+| 8 B    | 110.3 B/key | 117.3 B/key | **0.94x** | moon wins 6.0% |
+| **64 B**  | **210.9 B/key** | **181.3 B/key** | **1.16x** | **moon loses 16.3%** |
+| 256 B  | 408.8 B/key | 422.2 B/key | **0.97x** | moon wins 3.2% |
+| idle RSS | 15.26 MiB | 12.08 MiB | **1.26x** | **moon loses 26%** |
+
+Reps agree to +-0.5 B/key; idle RSS spread is 0.17 MiB (moon) and 0.02 MiB (Redis),
+and a second independent harness put the idle ratio at 1.267x.
+
+**An earlier campaign row claimed a flat 0.90x per-key win. It was wrong.** The
+arithmetic floor for a 16-byte key and a 64-byte value — every byte that must
+exist, zero allocator slack, load factor 1.0 — is ~135 B/key for Redis and ~136
+for moon. Both legs of that row measured *below their own floor*, which is
+physically impossible: the harness had used `redis-benchmark`'s default **3-byte**
+value. What it actually measured was `CompactValue` inlining (values <=12 bytes
+live inside the entry), which is a **band, not a trend**. Above the inline cutoff
+moon's per-entry overhead is the larger one, and 64 bytes — session tokens,
+UUIDs, small JSON — is the worst of the three sizes measured. The band
+between 13 and 255 bytes is sampled at exactly one point; its shape is not
+established. Every row above is now checked against
+`key + value + 24` and the check was confirmed to reject both historical numbers
+before being trusted.
+
+#### Verdict
+
+| dimension | result |
+|---|---|
+| throughput p>=8 | **WIN** (1.26x / 2.74x) |
+| throughput p=1 | tie |
+| CPU per op | tie (moon 6x more stable) |
+| memory, values <=12 B | win |
+| **memory, 64 B values** | **LOSS (16%)** |
+| **idle RSS** | **LOSS (26%)** |
+
+The goal "beat Redis io-threads 8 on performance, CPU and memory" is **met on
+throughput at pipeline depth, drawn on CPU, and not met on memory.** The idle-RSS
+loss localises cleanly: moon at `--shards 1` (11.68 MiB) already beats Redis
+(11.96 MiB), so the entire penalty is 3.58 MiB spread over 7 extra shards, 524 KB
+per shard, and it is threads rather than data structures — default config spawns
+four threads per shard (`shard-`, `spill-`, `manifest-sync-`, `aof-writer-`), two
+of which exist only because disk-offload defaults on.
+
+#### x86_64 confirmation — GCE `c3-standard-8` (Xeon 8481C), same binary, same method
+
+`moon-bench-x86` was out of stock for the whole campaign and came back for this
+release. 6 interleaved reps, 288 rows, zero NA, zero contaminated legs, every
+Redis leg attested.
+
+| depth | aarch64 (t2a) | x86_64 (c3) | families won on x86 |
+|---|:--:|:--:|:--:|
+| p=1  | 0.99x | 0.93x | 4/8 |
+| p=8  | 1.26x | **1.32x** | **8/8** |
+| p=64 | 2.74x | **2.91x** | **8/8** (range 2.41-3.93) |
+
+**The direction holds on both architectures**, and x86 is slightly the better of
+the two for moon. p=1 remains a tie rather than a win — 4/8 families, and the
+run-to-run CV is 23.0% (moon) against 21.5% (Redis), i.e. both engines are noisy
+at that depth, which is the bimodality again rather than a moon-specific defect.
+At p=8 the variance is asymmetric and not in moon's favour: CV 20.0% against
+Redis's 3.1%.
+
+**Certifying a Redis io-threads leg on x86 needs a different instrument.**
+`io_threads_active` is a flapping boolean under load — that was already known —
+but on the faster x86 host engagement turned out to be **bistable across whole
+runs**: the same `-c 50 -P 8` load measured a threaded-write fraction of **0.820
+and 0.006 on two identical runs**. A pre-benchmark probe therefore certifies a
+different run than the one being measured, and the first attempt at this table
+aborted every Redis leg for that reason. The fix is to bracket the counters
+around the **entire measured block**, so the fraction reported is the fraction
+that held while these numbers were produced; the six legs above attested at
+0.279-0.337. (A separate bug found the same way: the counters live in `INFO
+stats`, not `INFO threads`, and reading the wrong section yields a confident
+0.000 rather than an error.)
 
 ---
 

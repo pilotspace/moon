@@ -270,7 +270,7 @@ mod tests {
     fn capture_is_inert_when_disarmed() {
         disarm();
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"old"));
+        db.set_string(b"k", Bytes::from_static(b"old"));
         let cmd = [
             Frame::BulkString(Bytes::from_static(b"SET")),
             Frame::BulkString(Bytes::from_static(b"k")),
@@ -286,13 +286,13 @@ mod tests {
     fn capture_keeps_the_first_pre_image_only() {
         armed_guard();
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v0"));
+        db.set_string(b"k", Bytes::from_static(b"v0"));
         let cmd = [
             Frame::BulkString(Bytes::from_static(b"SET")),
             Frame::BulkString(Bytes::from_static(b"k")),
         ];
         capture_command_pre_image(&db, 0, &cmd);
-        db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v1"));
+        db.set_string(b"k", Bytes::from_static(b"v1"));
         capture_command_pre_image(&db, 0, &cmd);
 
         let captured = PENDING.with(|p| p.borrow().clone());
@@ -316,7 +316,7 @@ mod tests {
         let mut dbs = vec![Database::new()];
         for i in 0..100 {
             dbs[0].set_string(
-                Bytes::from(format!("cow_{:04}", i)),
+                &Bytes::from(format!("cow_{:04}", i)),
                 Bytes::from(format!("val_{:04}", i)),
             );
         }
@@ -362,8 +362,8 @@ mod tests {
 
         // Both keys are overwritten AFTER the capture, exactly as a script
         // write would have done.
-        dbs[0].set_string(seg0_key.clone(), Bytes::from_static(b"NEW_VALUE"));
-        dbs[0].set_string(seg1_key.clone(), Bytes::from_static(b"NEW_VALUE"));
+        dbs[0].set_string(&seg0_key, Bytes::from_static(b"NEW_VALUE"));
+        dbs[0].set_string(&seg1_key, Bytes::from_static(b"NEW_VALUE"));
 
         while !state.advance_one_segment(&dbs) {}
         state.finalize().unwrap();
@@ -403,7 +403,7 @@ mod tests {
     fn generic_dispatch_captures_local_write_pre_image() {
         disarm();
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"n"), Bytes::from_static(b"1"));
+        db.set_string(b"n", Bytes::from_static(b"1"));
         arm();
         let mut selected = 0usize;
         let args = [Frame::BulkString(Bytes::from_static(b"n"))];
@@ -503,7 +503,7 @@ mod tests {
             let mut db = Database::new();
             // A STRING pre-image is all this asserts on: the point is that the
             // gate LET THE COMMAND THROUGH, not that the command succeeded.
-            db.set_string(Bytes::from_static(b"n"), Bytes::from_static(b"1"));
+            db.set_string(b"n", Bytes::from_static(b"1"));
             arm();
             let frames: Vec<Frame> = args.into_iter().map(Frame::BulkString).collect();
             let mut selected = 0usize;
@@ -526,7 +526,7 @@ mod tests {
     fn generic_dispatch_does_not_capture_reads_or_keyless_commands() {
         disarm();
         let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"n"), Bytes::from_static(b"1"));
+        db.set_string(b"n", Bytes::from_static(b"1"));
         arm();
         let mut selected = 0usize;
         let key = [Frame::BulkString(Bytes::from_static(b"n"))];
@@ -557,7 +557,7 @@ mod tests {
         let mut dbs = vec![Database::new()];
         for i in 0..100 {
             dbs[0].set_string(
-                Bytes::from(format!("cow_{:04}", i)),
+                &Bytes::from(format!("cow_{:04}", i)),
                 Bytes::from(format!("{}", i)),
             );
         }

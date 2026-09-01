@@ -991,7 +991,7 @@ pub fn distribute_loaded_to_shards(
         for (key, entry) in db.data().iter() {
             let target_shard = key_to_shard(key.as_bytes(), num_shards);
             if target_shard < shard_dbs.len() && db_idx < shard_dbs[target_shard].len() {
-                shard_dbs[target_shard][db_idx].set(key.to_bytes(), entry.clone());
+                shard_dbs[target_shard][db_idx].set(key.as_ref(), entry.clone());
             }
         }
     }
@@ -1192,7 +1192,7 @@ mod tests {
     fn test_round_trip_string_no_ttl() {
         let (_dir, path) = rdb_path();
         let mut dbs = vec![Database::new()];
-        dbs[0].set_string(Bytes::from_static(b"hello"), Bytes::from_static(b"world"));
+        dbs[0].set_string(b"hello", Bytes::from_static(b"world"));
 
         save(&dbs, &path).unwrap();
 
@@ -1212,11 +1212,7 @@ mod tests {
         let (_dir, path) = rdb_path();
         let mut dbs = vec![Database::new()];
         let future_ms = current_time_ms() + 3_600_000;
-        dbs[0].set_string_with_expiry(
-            Bytes::from_static(b"key"),
-            Bytes::from_static(b"val"),
-            future_ms,
-        );
+        dbs[0].set_string_with_expiry(b"key", Bytes::from_static(b"val"), future_ms);
 
         save(&dbs, &path).unwrap();
 
@@ -1351,14 +1347,10 @@ mod tests {
         let mut dbs = vec![Database::new()];
 
         // String
-        dbs[0].set_string(Bytes::from_static(b"str"), Bytes::from_static(b"val"));
+        dbs[0].set_string(b"str", Bytes::from_static(b"val"));
         // String with TTL
         let future_ms = current_time_ms() + 600_000;
-        dbs[0].set_string_with_expiry(
-            Bytes::from_static(b"str_ttl"),
-            Bytes::from_static(b"expiring"),
-            future_ms,
-        );
+        dbs[0].set_string_with_expiry(b"str_ttl", Bytes::from_static(b"expiring"), future_ms);
         // Hash
         {
             let map = dbs[0].get_or_create_hash(b"h").unwrap();
@@ -1402,11 +1394,11 @@ mod tests {
         let mut dbs = vec![Database::new()];
 
         // Live key
-        dbs[0].set_string(Bytes::from_static(b"live"), Bytes::from_static(b"yes"));
+        dbs[0].set_string(b"live", Bytes::from_static(b"yes"));
         // Expired key
         let past_ms = current_time_ms() - 1000;
         dbs[0].set(
-            Bytes::from_static(b"dead"),
+            b"dead",
             Entry::new_string_with_expiry(Bytes::from_static(b"no"), past_ms),
         );
 
@@ -1423,7 +1415,7 @@ mod tests {
     fn test_crc32_catches_corruption() {
         let (_dir, path) = rdb_path();
         let mut dbs = vec![Database::new()];
-        dbs[0].set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+        dbs[0].set_string(b"k", Bytes::from_static(b"v"));
 
         save(&dbs, &path).unwrap();
 
@@ -1444,10 +1436,10 @@ mod tests {
         let mut dbs = vec![Database::new(), Database::new(), Database::new()];
 
         // DB 0
-        dbs[0].set_string(Bytes::from_static(b"k0"), Bytes::from_static(b"v0"));
+        dbs[0].set_string(b"k0", Bytes::from_static(b"v0"));
         // DB 1 is empty -- should be skipped
         // DB 2
-        dbs[2].set_string(Bytes::from_static(b"k2"), Bytes::from_static(b"v2"));
+        dbs[2].set_string(b"k2", Bytes::from_static(b"v2"));
 
         save(&dbs, &path).unwrap();
 
@@ -1467,7 +1459,7 @@ mod tests {
     fn test_save_leaves_no_leftover_temp_file() {
         let (dir, path) = rdb_path();
         let mut dbs = vec![Database::new()];
-        dbs[0].set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+        dbs[0].set_string(b"k", Bytes::from_static(b"v"));
 
         save(&dbs, &path).unwrap();
 

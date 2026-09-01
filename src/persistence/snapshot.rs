@@ -869,7 +869,7 @@ pub fn shard_snapshot_load<D: std::borrow::BorrowMut<Database>>(
                         continue;
                     }
                     if current_db < databases.len() {
-                        databases[current_db].borrow_mut().set(key, entry);
+                        databases[current_db].borrow_mut().set(&key, entry);
                         total_keys += 1;
                     }
                 }
@@ -999,9 +999,9 @@ mod tests {
     fn test_snapshot_round_trip_string() {
         let (_dir, path) = snap_path();
         let mut dbs = vec![Database::new()];
-        dbs[0].set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
-        dbs[0].set_string(Bytes::from_static(b"k2"), Bytes::from_static(b"v2"));
-        dbs[0].set_string(Bytes::from_static(b"k3"), Bytes::from_static(b"v3"));
+        dbs[0].set_string(b"k1", Bytes::from_static(b"v1"));
+        dbs[0].set_string(b"k2", Bytes::from_static(b"v2"));
+        dbs[0].set_string(b"k3", Bytes::from_static(b"v3"));
 
         shard_snapshot_save(0, 1, &dbs, &path).unwrap();
 
@@ -1023,7 +1023,7 @@ mod tests {
         let mut dbs = vec![Database::new()];
 
         // String
-        dbs[0].set_string(Bytes::from_static(b"str"), Bytes::from_static(b"val"));
+        dbs[0].set_string(b"str", Bytes::from_static(b"val"));
         // Hash
         {
             let map = dbs[0].get_or_create_hash(b"h").unwrap();
@@ -1065,15 +1065,11 @@ mod tests {
 
         // Key with future TTL
         let future_ms = current_time_ms() + 3_600_000;
-        dbs[0].set_string_with_expiry(
-            Bytes::from_static(b"live"),
-            Bytes::from_static(b"yes"),
-            future_ms,
-        );
+        dbs[0].set_string_with_expiry(b"live", Bytes::from_static(b"yes"), future_ms);
         // Key with past TTL (should be skipped)
         let past_ms = current_time_ms() - 1000;
         dbs[0].set(
-            Bytes::from_static(b"dead"),
+            b"dead",
             Entry::new_string_with_expiry(Bytes::from_static(b"no"), past_ms),
         );
 
@@ -1093,7 +1089,7 @@ mod tests {
         // Insert enough entries across at least 2 segments
         for i in 0..100 {
             dbs[0].set_string(
-                Bytes::from(format!("cow_{:04}", i)),
+                &Bytes::from(format!("cow_{:04}", i)),
                 Bytes::from(format!("val_{:04}", i)),
             );
         }
@@ -1118,7 +1114,7 @@ mod tests {
         state.capture_cow(0, 1, cow_key.to_bytes(), cow_old_entry);
 
         // Now overwrite the key in the live database (simulating a write during snapshot)
-        dbs[0].set_string(cow_key.to_bytes(), Bytes::from_static(b"NEW_VALUE"));
+        dbs[0].set_string(cow_key.as_ref(), Bytes::from_static(b"NEW_VALUE"));
 
         // Continue advancing until done
         while !state.advance_one_segment(&dbs) {}
@@ -1154,7 +1150,7 @@ mod tests {
         let mut dbs = vec![Database::new()];
         for i in 0..100 {
             dbs[0].set_string(
-                Bytes::from(format!("cow_{:04}", i)),
+                &Bytes::from(format!("cow_{:04}", i)),
                 Bytes::from(format!("val_{:04}", i)),
             );
         }
@@ -1169,13 +1165,13 @@ mod tests {
 
         // Write #1: capture the epoch-start value, then mutate.
         state.capture_cow(0, 1, key.clone(), first_entry);
-        dbs[0].set_string(key.clone(), Bytes::from_static(b"mid"));
+        dbs[0].set_string(&key, Bytes::from_static(b"mid"));
 
         // Write #2: a second capture of the SAME key, now holding "mid".
         #[allow(clippy::unwrap_used)]
         let second_entry = dbs[0].data().get(&key).unwrap().clone();
         state.capture_cow(0, 1, key.clone(), second_entry);
-        dbs[0].set_string(key.clone(), Bytes::from_static(b"NEW_VALUE"));
+        dbs[0].set_string(&key, Bytes::from_static(b"NEW_VALUE"));
 
         while !state.advance_one_segment(&dbs) {}
         #[allow(clippy::unwrap_used)]
@@ -1200,10 +1196,7 @@ mod tests {
         let (_dir, path) = snap_path();
         let mut dbs = vec![Database::new()];
         // Use a longer value so we can corrupt a data byte without hitting a tag
-        dbs[0].set_string(
-            Bytes::from_static(b"testkey"),
-            Bytes::from_static(b"testvalue_long_enough"),
-        );
+        dbs[0].set_string(b"testkey", Bytes::from_static(b"testvalue_long_enough"));
 
         shard_snapshot_save(0, 1, &dbs, &path).unwrap();
 
@@ -1248,8 +1241,8 @@ mod tests {
     fn test_snapshot_multi_database() {
         let (_dir, path) = snap_path();
         let mut dbs = vec![Database::new(), Database::new()];
-        dbs[0].set_string(Bytes::from_static(b"db0_k"), Bytes::from_static(b"v0"));
-        dbs[1].set_string(Bytes::from_static(b"db1_k"), Bytes::from_static(b"v1"));
+        dbs[0].set_string(b"db0_k", Bytes::from_static(b"v0"));
+        dbs[1].set_string(b"db1_k", Bytes::from_static(b"v1"));
 
         shard_snapshot_save(0, 1, &dbs, &path).unwrap();
 
@@ -1279,7 +1272,7 @@ mod tests {
         // Insert enough entries to have multiple segments
         for i in 0..100 {
             dbs[0].set_string(
-                Bytes::from(format!("yield_{:04}", i)),
+                &Bytes::from(format!("yield_{:04}", i)),
                 Bytes::from(format!("v_{:04}", i)),
             );
         }
@@ -1320,14 +1313,8 @@ mod tests {
     async fn test_finalize_async_writes_valid_file() {
         let (_dir, path) = snap_path();
         let mut dbs = vec![Database::new()];
-        dbs[0].set_string(
-            Bytes::from_static(b"async_k1"),
-            Bytes::from_static(b"async_v1"),
-        );
-        dbs[0].set_string(
-            Bytes::from_static(b"async_k2"),
-            Bytes::from_static(b"async_v2"),
-        );
+        dbs[0].set_string(b"async_k1", Bytes::from_static(b"async_v1"));
+        dbs[0].set_string(b"async_k2", Bytes::from_static(b"async_v2"));
 
         let mut state = SnapshotState::new(0, 1, &dbs, path.to_path_buf());
         while !state.advance_one_segment(&dbs) {}
@@ -1392,7 +1379,7 @@ mod tests {
     fn test_segment_entry_count_dos_rejected() {
         let (_dir, path) = snap_path();
         let mut dbs = vec![Database::new()];
-        dbs[0].set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+        dbs[0].set_string(b"k", Bytes::from_static(b"v"));
         shard_snapshot_save(0, 1, &dbs, &path).unwrap();
 
         let mut data = std::fs::read(&path).unwrap();

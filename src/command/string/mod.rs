@@ -77,7 +77,7 @@ mod tests {
     #[test]
     fn test_get_wrongtype_on_hash() {
         let mut db = make_db();
-        db.set(Bytes::from_static(b"myhash"), Entry::new_hash());
+        db.set(b"myhash", Entry::new_hash());
         let result = get(&mut db, &[bs(b"myhash")]);
         match result {
             Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
@@ -202,8 +202,8 @@ mod tests {
     #[test]
     fn test_mget_with_missing() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
-        db.set_string(Bytes::from_static(b"k3"), Bytes::from_static(b"v3"));
+        db.set_string(b"k1", Bytes::from_static(b"v1"));
+        db.set_string(b"k3", Bytes::from_static(b"v3"));
 
         let result = mget(&mut db, &[bs(b"k1"), bs(b"k2"), bs(b"k3")]);
         assert_eq!(
@@ -286,7 +286,7 @@ mod tests {
     fn test_msetnx_one_exists_sets_none() {
         // Atomic all-or-nothing: if ANY key exists, set NOTHING, return 0.
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"b"), Bytes::from_static(b"old"));
+        db.set_string(b"b", Bytes::from_static(b"old"));
         let r = msetnx(&mut db, &[bs(b"a"), bs(b"1"), bs(b"b"), bs(b"2")]);
         assert_eq!(r, Frame::Integer(0));
         assert_eq!(get(&mut db, &[bs(b"a")]), Frame::Null, "a must not be set");
@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn test_incr_existing() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"counter"), Bytes::from_static(b"10"));
+        db.set_string(b"counter", Bytes::from_static(b"10"));
         let result = incr(&mut db, &[bs(b"counter")]);
         assert_eq!(result, Frame::Integer(11));
     }
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn test_incr_non_integer() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"abc"));
+        db.set_string(b"key", Bytes::from_static(b"abc"));
         let result = incr(&mut db, &[bs(b"key")]);
         assert!(matches!(result, Frame::Error(_)));
     }
@@ -332,10 +332,7 @@ mod tests {
     #[test]
     fn test_incr_overflow() {
         let mut db = make_db();
-        db.set_string(
-            Bytes::from_static(b"key"),
-            Bytes::from(i64::MAX.to_string()),
-        );
+        db.set_string(b"key", Bytes::from(i64::MAX.to_string()));
         let result = incr(&mut db, &[bs(b"key")]);
         match result {
             Frame::Error(e) => {
@@ -348,7 +345,7 @@ mod tests {
     #[test]
     fn test_decr() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"counter"), Bytes::from_static(b"10"));
+        db.set_string(b"counter", Bytes::from_static(b"10"));
         let result = decr(&mut db, &[bs(b"counter")]);
         assert_eq!(result, Frame::Integer(9));
     }
@@ -356,7 +353,7 @@ mod tests {
     #[test]
     fn test_decrby() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"counter"), Bytes::from_static(b"10"));
+        db.set_string(b"counter", Bytes::from_static(b"10"));
         let result = decrby(&mut db, &[bs(b"counter"), bs(b"3")]);
         assert_eq!(result, Frame::Integer(7));
     }
@@ -366,7 +363,7 @@ mod tests {
         // DECRBY key i64::MIN negates to +2^63, which is unrepresentable -> must
         // return an error, not panic (debug) or wrap (release).
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"n"), Bytes::from_static(b"0"));
+        db.set_string(b"n", Bytes::from_static(b"0"));
         let arg = Frame::BulkString(Bytes::from(i64::MIN.to_string()));
         let result = decrby(&mut db, &[bs(b"n"), arg]);
         match result {
@@ -438,7 +435,7 @@ mod tests {
     #[test]
     fn test_incrby() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"counter"), Bytes::from_static(b"10"));
+        db.set_string(b"counter", Bytes::from_static(b"10"));
         let result = incrby(&mut db, &[bs(b"counter"), bs(b"5")]);
         assert_eq!(result, Frame::Integer(15));
     }
@@ -448,7 +445,7 @@ mod tests {
         let mut db = make_db();
         let exp_ms = current_time_ms() + 100_000;
         db.set(
-            Bytes::from_static(b"counter"),
+            b"counter",
             Entry::new_string_with_expiry(Bytes::from_static(b"5"), exp_ms),
         );
         let result = incr(&mut db, &[bs(b"counter")]);
@@ -457,12 +454,69 @@ mod tests {
         assert!(entry.has_expiry());
     }
 
+    /// INCR now formats its new value with `itoa` into a stack buffer instead of
+    /// allocating a `String` per operation. The stored bytes must still be exactly
+    /// what `i64::to_string` produces at every magnitude — in particular across the
+    /// 12-byte SSO boundary, where `CompactValue` switches from inlining the digits
+    /// to heap-allocating them, and at the two i64 extremes.
+    #[test]
+    fn incr_stores_the_same_bytes_at_every_magnitude() {
+        for start in [
+            0i64,
+            -1,
+            8,
+            999_999_999_998,    // -> 999_999_999_999, 12 bytes, last inline
+            999_999_999_999,    // -> 1_000_000_000_000, 13 bytes, first heap
+            -1_000_000_000_001, // -> -1_000_000_000_000, 14 bytes with sign
+            i64::MAX - 1,
+            i64::MIN,
+        ] {
+            let mut db = make_db();
+            db.set_string(b"c", Bytes::from(start.to_string()));
+            let expected = start + 1;
+            assert_eq!(incr(&mut db, &[bs(b"c")]), Frame::Integer(expected));
+            let stored = db.get(b"c").unwrap().value.as_bytes().unwrap().to_vec();
+            assert_eq!(
+                stored,
+                expected.to_string().into_bytes(),
+                "stored bytes diverged from to_string at {start}"
+            );
+            // The stored bytes must parse back, or the next INCR fails.
+            if let Some(next) = expected.checked_add(1) {
+                assert_eq!(incr(&mut db, &[bs(b"c")]), Frame::Integer(next));
+            }
+        }
+    }
+
+    /// The TTL-preserving arm takes a different constructor, so it needs the same
+    /// boundary coverage as the plain one.
+    #[test]
+    fn incr_with_ttl_stores_the_same_bytes_at_every_magnitude() {
+        for start in [7i64, 999_999_999_999, -1_000_000_000_001] {
+            let mut db = make_db();
+            let exp_ms = current_time_ms() + 100_000;
+            db.set(
+                b"c",
+                Entry::new_string_with_expiry(Bytes::from(start.to_string()), exp_ms),
+            );
+            let expected = start + 1;
+            assert_eq!(incr(&mut db, &[bs(b"c")]), Frame::Integer(expected));
+            let entry = db.get(b"c").unwrap();
+            assert!(entry.has_expiry(), "TTL lost at {start}");
+            assert_eq!(
+                entry.value.as_bytes().unwrap().to_vec(),
+                expected.to_string().into_bytes(),
+                "stored bytes diverged from to_string at {start}"
+            );
+        }
+    }
+
     // --- INCRBYFLOAT tests ---
 
     #[test]
     fn test_incrbyfloat_basic() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"10.5"));
+        db.set_string(b"key", Bytes::from_static(b"10.5"));
         let result = incrbyfloat(&mut db, &[bs(b"key"), bs(b"0.1")]);
         assert_eq!(result, Frame::BulkString(Bytes::from("10.6")));
     }
@@ -470,7 +524,7 @@ mod tests {
     #[test]
     fn test_incrbyfloat_trailing_zeros() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"10"));
+        db.set_string(b"key", Bytes::from_static(b"10"));
         let result = incrbyfloat(&mut db, &[bs(b"key"), bs(b"1")]);
         assert_eq!(result, Frame::BulkString(Bytes::from("11")));
     }
@@ -485,7 +539,7 @@ mod tests {
     #[test]
     fn test_incrbyfloat_negative() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"10"));
+        db.set_string(b"key", Bytes::from_static(b"10"));
         let result = incrbyfloat(&mut db, &[bs(b"key"), bs(b"-5")]);
         assert_eq!(result, Frame::BulkString(Bytes::from("5")));
     }
@@ -493,7 +547,7 @@ mod tests {
     #[test]
     fn test_incrbyfloat_non_numeric() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"abc"));
+        db.set_string(b"key", Bytes::from_static(b"abc"));
         let result = incrbyfloat(&mut db, &[bs(b"key"), bs(b"1.0")]);
         assert!(matches!(result, Frame::Error(_)));
     }
@@ -525,7 +579,7 @@ mod tests {
     #[test]
     fn test_append_existing() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"hello"));
+        db.set_string(b"key", Bytes::from_static(b"hello"));
         let result = append(&mut db, &[bs(b"key"), bs(b" world")]);
         assert_eq!(result, Frame::Integer(11));
         assert_eq!(
@@ -539,7 +593,7 @@ mod tests {
         let mut db = make_db();
         let exp_ms = current_time_ms() + 100_000;
         db.set(
-            Bytes::from_static(b"key"),
+            b"key",
             Entry::new_string_with_expiry(Bytes::from_static(b"hello"), exp_ms),
         );
         append(&mut db, &[bs(b"key"), bs(b" world")]);
@@ -552,7 +606,7 @@ mod tests {
     #[test]
     fn test_strlen_existing() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"hello"));
+        db.set_string(b"key", Bytes::from_static(b"hello"));
         let result = strlen(&mut db, &[bs(b"key")]);
         assert_eq!(result, Frame::Integer(5));
     }
@@ -580,7 +634,7 @@ mod tests {
     #[test]
     fn test_setnx_exists() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"old"));
+        db.set_string(b"key", Bytes::from_static(b"old"));
         let result = setnx(&mut db, &[bs(b"key"), bs(b"new")]);
         assert_eq!(result, Frame::Integer(0));
         assert_eq!(
@@ -633,7 +687,7 @@ mod tests {
     #[test]
     fn test_getset() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"old"));
+        db.set_string(b"key", Bytes::from_static(b"old"));
         let result = getset(&mut db, &[bs(b"key"), bs(b"new")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"old")));
         assert_eq!(
@@ -658,7 +712,7 @@ mod tests {
         let mut db = make_db();
         let exp_ms = current_time_ms() + 100_000;
         db.set(
-            Bytes::from_static(b"key"),
+            b"key",
             Entry::new_string_with_expiry(Bytes::from_static(b"old"), exp_ms),
         );
         getset(&mut db, &[bs(b"key"), bs(b"new")]);
@@ -671,7 +725,7 @@ mod tests {
         // Regression (data-loss): GETSET on a wrong-type key must return WRONGTYPE
         // and MUST NOT overwrite it. Previously db.set_string ran unconditionally.
         let mut db = make_db();
-        db.set(Bytes::from_static(b"myhash"), Entry::new_hash());
+        db.set(b"myhash", Entry::new_hash());
         let result = getset(&mut db, &[bs(b"myhash"), bs(b"newval")]);
         match result {
             Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
@@ -690,7 +744,7 @@ mod tests {
         // WRONGTYPE and perform NO write (precedence over NX/XX). Previously db.set
         // ran unconditionally, destroying the wrong-type value.
         let mut db = make_db();
-        db.set(Bytes::from_static(b"myhash"), Entry::new_hash());
+        db.set(b"myhash", Entry::new_hash());
         let result = set(&mut db, &[bs(b"myhash"), bs(b"newval"), bs(b"GET")]);
         match result {
             Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
@@ -707,7 +761,7 @@ mod tests {
     #[test]
     fn test_getdel() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"val"));
+        db.set_string(b"key", Bytes::from_static(b"val"));
         let result = getdel(&mut db, &[bs(b"key")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"val")));
         assert_eq!(get(&mut db, &[bs(b"key")]), Frame::Null);
@@ -726,7 +780,7 @@ mod tests {
         // and MUST NOT delete the key. Previously db.remove() fired before the type
         // check, destroying the key and then returning WRONGTYPE as if nothing happened.
         let mut db = make_db();
-        db.set(Bytes::from_static(b"myhash"), Entry::new_hash());
+        db.set(b"myhash", Entry::new_hash());
         let result = getdel(&mut db, &[bs(b"myhash")]);
         match result {
             Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
@@ -743,7 +797,7 @@ mod tests {
     #[test]
     fn test_getex_no_options() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"val"));
+        db.set_string(b"key", Bytes::from_static(b"val"));
         let result = getex(&mut db, &[bs(b"key")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"val")));
     }
@@ -760,7 +814,7 @@ mod tests {
         let mut db = make_db();
         let exp_ms = current_time_ms() + 100_000;
         db.set(
-            Bytes::from_static(b"key"),
+            b"key",
             Entry::new_string_with_expiry(Bytes::from_static(b"val"), exp_ms),
         );
         let result = getex(&mut db, &[bs(b"key"), bs(b"PERSIST")]);
@@ -772,7 +826,7 @@ mod tests {
     #[test]
     fn test_getex_ex() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"val"));
+        db.set_string(b"key", Bytes::from_static(b"val"));
         let result = getex(&mut db, &[bs(b"key"), bs(b"EX"), bs(b"10")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"val")));
         let entry = db.get(b"key").unwrap();
@@ -784,10 +838,7 @@ mod tests {
     #[test]
     fn test_getrange_basic() {
         let mut db = make_db();
-        db.set_string(
-            Bytes::from_static(b"key"),
-            Bytes::from_static(b"Hello, World!"),
-        );
+        db.set_string(b"key", Bytes::from_static(b"Hello, World!"));
         let result = getrange(&mut db, &[bs(b"key"), bs(b"0"), bs(b"4")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"Hello")));
     }
@@ -795,10 +846,7 @@ mod tests {
     #[test]
     fn test_getrange_negative_end() {
         let mut db = make_db();
-        db.set_string(
-            Bytes::from_static(b"key"),
-            Bytes::from_static(b"Hello, World!"),
-        );
+        db.set_string(b"key", Bytes::from_static(b"Hello, World!"));
         let result = getrange(&mut db, &[bs(b"key"), bs(b"0"), bs(b"-1")]);
         assert_eq!(
             result,
@@ -809,10 +857,7 @@ mod tests {
     #[test]
     fn test_getrange_negative_both() {
         let mut db = make_db();
-        db.set_string(
-            Bytes::from_static(b"key"),
-            Bytes::from_static(b"Hello, World!"),
-        );
+        db.set_string(b"key", Bytes::from_static(b"Hello, World!"));
         // len=13, -6 = 7, -1 = 12 → "World!"
         let result = getrange(&mut db, &[bs(b"key"), bs(b"-6"), bs(b"-1")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"World!")));
@@ -821,10 +866,7 @@ mod tests {
     #[test]
     fn test_getrange_middle() {
         let mut db = make_db();
-        db.set_string(
-            Bytes::from_static(b"key"),
-            Bytes::from_static(b"Hello, World!"),
-        );
+        db.set_string(b"key", Bytes::from_static(b"Hello, World!"));
         let result = getrange(&mut db, &[bs(b"key"), bs(b"7"), bs(b"-1")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"World!")));
     }
@@ -832,7 +874,7 @@ mod tests {
     #[test]
     fn test_getrange_out_of_range() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"Hello"));
+        db.set_string(b"key", Bytes::from_static(b"Hello"));
         // end beyond string length — clamped
         let result = getrange(&mut db, &[bs(b"key"), bs(b"0"), bs(b"100")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"Hello")));
@@ -841,7 +883,7 @@ mod tests {
     #[test]
     fn test_getrange_reversed() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"Hello"));
+        db.set_string(b"key", Bytes::from_static(b"Hello"));
         let result = getrange(&mut db, &[bs(b"key"), bs(b"3"), bs(b"1")]);
         assert_eq!(result, Frame::BulkString(Bytes::new()));
     }
@@ -856,7 +898,7 @@ mod tests {
     #[test]
     fn test_getrange_wrongtype() {
         let mut db = make_db();
-        db.set(Bytes::from_static(b"myhash"), Entry::new_hash());
+        db.set(b"myhash", Entry::new_hash());
         let result = getrange(&mut db, &[bs(b"myhash"), bs(b"0"), bs(b"-1")]);
         match result {
             Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
@@ -874,7 +916,7 @@ mod tests {
     #[test]
     fn test_getrange_empty_string() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::new());
+        db.set_string(b"key", Bytes::new());
         let result = getrange(&mut db, &[bs(b"key"), bs(b"0"), bs(b"-1")]);
         assert_eq!(result, Frame::BulkString(Bytes::new()));
     }
@@ -884,10 +926,7 @@ mod tests {
     #[test]
     fn test_setrange_basic() {
         let mut db = make_db();
-        db.set_string(
-            Bytes::from_static(b"key"),
-            Bytes::from_static(b"Hello, World!"),
-        );
+        db.set_string(b"key", Bytes::from_static(b"Hello, World!"));
         let result = setrange(&mut db, &[bs(b"key"), bs(b"7"), bs(b"Redis")]);
         assert_eq!(result, Frame::Integer(13));
         assert_eq!(
@@ -915,7 +954,7 @@ mod tests {
     #[test]
     fn test_setrange_extend() {
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"key"), Bytes::from_static(b"Hello"));
+        db.set_string(b"key", Bytes::from_static(b"Hello"));
         let result = setrange(&mut db, &[bs(b"key"), bs(b"5"), bs(b" World")]);
         assert_eq!(result, Frame::Integer(11));
         assert_eq!(
@@ -939,7 +978,7 @@ mod tests {
         let mut db = make_db();
         let exp_ms = current_time_ms() + 100_000;
         db.set(
-            Bytes::from_static(b"key"),
+            b"key",
             Entry::new_string_with_expiry(Bytes::from_static(b"Hello"), exp_ms),
         );
         setrange(&mut db, &[bs(b"key"), bs(b"0"), bs(b"Jello")]);
@@ -951,7 +990,7 @@ mod tests {
     #[test]
     fn test_setrange_wrongtype() {
         let mut db = make_db();
-        db.set(Bytes::from_static(b"myhash"), Entry::new_hash());
+        db.set(b"myhash", Entry::new_hash());
         let result = setrange(&mut db, &[bs(b"myhash"), bs(b"0"), bs(b"hi")]);
         match result {
             Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
@@ -983,10 +1022,7 @@ mod tests {
     fn test_substr_alias() {
         // SUBSTR uses the same getrange function, verify it produces identical results
         let mut db = make_db();
-        db.set_string(
-            Bytes::from_static(b"msg"),
-            Bytes::from_static(b"Hello, World!"),
-        );
+        db.set_string(b"msg", Bytes::from_static(b"Hello, World!"));
         // SUBSTR with same args as GETRANGE should produce identical output
         let getrange_result = getrange(&mut db, &[bs(b"msg"), bs(b"0"), bs(b"4")]);
         let substr_result = getrange(&mut db, &[bs(b"msg"), bs(b"0"), bs(b"4")]);
@@ -1010,7 +1046,7 @@ mod tests {
     fn test_setrange_empty_value_existing_key() {
         // Redis: SETRANGE on existing key with empty value returns current length
         let mut db = make_db();
-        db.set_string(Bytes::from_static(b"mykey"), Bytes::from_static(b"Hello"));
+        db.set_string(b"mykey", Bytes::from_static(b"Hello"));
         let result = setrange(&mut db, &[bs(b"mykey"), bs(b"5"), bs(b"")]);
         assert_eq!(result, Frame::Integer(5));
         // Key unchanged
@@ -1023,10 +1059,7 @@ mod tests {
     #[test]
     fn test_substr_negative_indices() {
         let mut db = make_db();
-        db.set_string(
-            Bytes::from_static(b"msg"),
-            Bytes::from_static(b"Hello, World!"),
-        );
+        db.set_string(b"msg", Bytes::from_static(b"Hello, World!"));
         // SUBSTR with negative indices (alias behavior)
         let result = getrange(&mut db, &[bs(b"msg"), bs(b"-6"), bs(b"-1")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"World!")));
