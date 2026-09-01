@@ -118,11 +118,11 @@ pub fn setbit(db: &mut Database, args: &[Frame]) -> Frame {
     let byte_idx = offset / 8;
     let bit_idx = 7 - (offset % 8);
 
-    let (existing_data, existing_expiry_ms) = match db.get(key) {
+    let (existing_data, had_expiry) = match db.get(key) {
         Some(entry) => {
-            let expiry = entry.expires_at_ms();
+            let had_expiry = entry.has_expiry();
             match entry.value.as_bytes() {
-                Some(v) => (Some(v.to_vec()), expiry),
+                Some(v) => (Some(v.to_vec()), had_expiry),
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -130,8 +130,10 @@ pub fn setbit(db: &mut Database, args: &[Frame]) -> Frame {
                 }
             }
         }
-        None => (None, 0),
+        None => (None, false),
     };
+    // SETBIT is an in-place edit: it must KEEP the deadline it found.
+    let existing_expiry_ms = if had_expiry { db.expires_at_ms(key) } else { 0 };
 
     let mut buf = existing_data.unwrap_or_default();
     // Extend with zero bytes if needed
@@ -150,14 +152,10 @@ pub fn setbit(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     let new_val = Bytes::from(buf);
-    let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(new_val, existing_expiry_ms)
-    } else {
-        Entry::new_string(new_val)
-    };
+    let mut entry = Entry::new_string(new_val);
     entry.set_last_access(db.now());
     entry.set_access_counter(5);
-    db.set(key, entry);
+    db.set_with_expiry(key, entry, existing_expiry_ms);
 
     Frame::Integer(original as i64)
 }
@@ -782,11 +780,11 @@ pub fn bitfield(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("BITFIELD"),
     };
 
-    let (existing_data, existing_expiry_ms) = match db.get(key) {
+    let (existing_data, had_expiry) = match db.get(key) {
         Some(entry) => {
-            let expiry = entry.expires_at_ms();
+            let had_expiry = entry.has_expiry();
             match entry.value.as_bytes() {
-                Some(v) => (v.to_vec(), expiry),
+                Some(v) => (v.to_vec(), had_expiry),
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -794,8 +792,10 @@ pub fn bitfield(db: &mut Database, args: &[Frame]) -> Frame {
                 }
             }
         }
-        None => (Vec::new(), 0),
+        None => (Vec::new(), false),
     };
+    // BITFIELD is an in-place edit: it must KEEP the deadline it found.
+    let existing_expiry_ms = if had_expiry { db.expires_at_ms(key) } else { 0 };
 
     let mut buf = existing_data;
     let mut results = Vec::new();
@@ -911,14 +911,10 @@ pub fn bitfield(db: &mut Database, args: &[Frame]) -> Frame {
 
     if modified {
         let new_val = Bytes::from(buf);
-        let mut entry = if existing_expiry_ms > 0 {
-            Entry::new_string_with_expiry(new_val, existing_expiry_ms)
-        } else {
-            Entry::new_string(new_val)
-        };
+        let mut entry = Entry::new_string(new_val);
         entry.set_last_access(db.now());
         entry.set_access_counter(5);
-        db.set(key, entry);
+        db.set_with_expiry(key, entry, existing_expiry_ms);
     }
 
     Frame::Array(results.into())

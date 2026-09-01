@@ -762,14 +762,18 @@ mod tests {
         let seg = std::mem::size_of::<Segment<CompactKey, CompactEntry>>();
 
         assert_eq!(std::mem::size_of::<CompactKey>(), 24);
-        assert_eq!(std::mem::size_of::<CompactEntry>(), 32);
+        assert_eq!(
+            std::mem::size_of::<CompactEntry>(),
+            24,
+            "CompactEntry must stay 24 B: the 8-byte `ttl_ms` moved to the              Database-owned `expires` map (Redis's `db->expires`), because it              was charged to EVERY slot -- 60 per segment -- while fewer than              1 key in 1000 of a cache workload has a TTL at all."
+        );
         assert_eq!(TOTAL_SLOTS, 60);
         assert_eq!(LOAD_THRESHOLD, 54);
 
         // 64 (ctrl) + 8 (count/depth) + 1 (has_non_home_keys) + padding
-        // + 60*24 (keys) + 60*32 (values), rounded to the 64-byte alignment.
+        // + 60*24 (keys) + 60*24 (values), rounded to the 64-byte alignment.
         assert_eq!(
-            seg, 3456,
+            seg, 3008,
             "Segment layout changed; recompute the per-key memory ledger"
         );
 
@@ -778,17 +782,17 @@ mod tests {
         // keys and the population mean is 3/4 of LOAD_THRESHOLD = 40.5.
         assert_eq!(
             seg / LOAD_THRESHOLD,
-            64,
+            55,
             "best case, at the split threshold"
         );
         assert_eq!(
             seg * 4 / (LOAD_THRESHOLD * 3),
-            85,
-            "organic fill, ~40.5 keys/segment"
+            74,
+            "organic fill, ~40.5 keys/segment (was 85 with the 32-byte entry)"
         );
         assert_eq!(
             seg * 2 / LOAD_THRESHOLD,
-            128,
+            111,
             "--initial-keyspace-hint: with_capacity adds a depth level, halving fill"
         );
     }

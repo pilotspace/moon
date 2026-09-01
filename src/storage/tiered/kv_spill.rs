@@ -135,6 +135,7 @@ pub fn spill_to_datafile(
     file_id: u64,
     key: &[u8],
     entry: &Entry,
+    expires_at_ms: u64,
     db_index: usize,
     manifest: &mut ShardManifest,
     cold_index: Option<&mut super::cold_index::ColdIndex>,
@@ -153,9 +154,9 @@ pub fn spill_to_datafile(
 
     // Determine flags and TTL
     let mut flags: u8 = 0;
-    let ttl_ms = if entry.has_expiry() {
+    let ttl_ms = if expires_at_ms != 0 {
         flags |= entry_flags::HAS_TTL;
-        Some(entry.expires_at_ms())
+        Some(expires_at_ms)
     } else {
         None
     };
@@ -585,7 +586,7 @@ mod tests {
         let mut manifest = ShardManifest::create(&manifest_path).unwrap();
 
         let entry = Entry::new_string(Bytes::from_static(b"hello world"));
-        spill_to_datafile(shard_dir, 1, b"mykey", &entry, 0, &mut manifest, None).unwrap();
+        spill_to_datafile(shard_dir, 1, b"mykey", &entry, 0, 0, &mut manifest, None).unwrap();
 
         // Verify file was created
         let file_path = shard_dir.join("data/heap-000001.mpf");
@@ -615,7 +616,7 @@ mod tests {
 
         // Registered spill: file 1 in manifest, must survive the sweep.
         let entry = Entry::new_string(Bytes::from_static(b"registered"));
-        spill_to_datafile(shard_dir, 1, b"livekey", &entry, 0, &mut manifest, None).unwrap();
+        spill_to_datafile(shard_dir, 1, b"livekey", &entry, 0, 0, &mut manifest, None).unwrap();
 
         // Crash orphan: heap file on disk but never registered in the manifest
         // (spill wrote the file, crash before manifest commit).
@@ -664,7 +665,7 @@ mod tests {
 
         // Registered spill: must be classified as NOT orphaned.
         let entry = Entry::new_string(Bytes::from_static(b"registered"));
-        spill_to_datafile(shard_dir, 1, b"livekey", &entry, 0, &mut manifest, None).unwrap();
+        spill_to_datafile(shard_dir, 1, b"livekey", &entry, 0, 0, &mut manifest, None).unwrap();
 
         let data_dir = shard_dir.join("data");
         // A larger batch of unregistered files, standing in for a
@@ -728,9 +729,19 @@ mod tests {
 
         let mut entry = Entry::new_string(Bytes::from_static(b"expiring"));
         let future_ms = current_time_ms() + 60_000;
-        entry.set_expires_at_ms(future_ms);
+        entry.set_has_expiry(true);
 
-        spill_to_datafile(shard_dir, 2, b"ttl_key", &entry, 0, &mut manifest, None).unwrap();
+        spill_to_datafile(
+            shard_dir,
+            2,
+            b"ttl_key",
+            &entry,
+            future_ms,
+            0,
+            &mut manifest,
+            None,
+        )
+        .unwrap();
 
         let file_path = shard_dir.join("data/heap-000002.mpf");
         let pages = read_datafile(&file_path).unwrap();
@@ -764,7 +775,7 @@ mod tests {
         }
         let entry = Entry::new_string(Bytes::from(big_value));
 
-        spill_to_datafile(shard_dir, 3, b"big_key", &entry, 0, &mut manifest, None).unwrap();
+        spill_to_datafile(shard_dir, 3, b"big_key", &entry, 0, 0, &mut manifest, None).unwrap();
 
         // File SHOULD now exist with overflow pages
         let file_path = shard_dir.join("data/heap-000003.mpf");
@@ -807,7 +818,17 @@ mod tests {
         let mut entry = Entry::new_string(Bytes::new());
         entry.value = CompactValue::from_redis_value(RedisValue::Hash(map));
 
-        spill_to_datafile(shard_dir, 10, b"hash_key", &entry, 0, &mut manifest, None).unwrap();
+        spill_to_datafile(
+            shard_dir,
+            10,
+            b"hash_key",
+            &entry,
+            0,
+            0,
+            &mut manifest,
+            None,
+        )
+        .unwrap();
 
         let file_path = shard_dir.join("data/heap-000010.mpf");
         assert!(file_path.exists(), "DataFile should exist for hash entry");
@@ -853,7 +874,17 @@ mod tests {
         let mut entry = Entry::new_string(Bytes::new());
         entry.value = CompactValue::from_redis_value(RedisValue::List(list));
 
-        spill_to_datafile(shard_dir, 11, b"list_key", &entry, 0, &mut manifest, None).unwrap();
+        spill_to_datafile(
+            shard_dir,
+            11,
+            b"list_key",
+            &entry,
+            0,
+            0,
+            &mut manifest,
+            None,
+        )
+        .unwrap();
 
         let file_path = shard_dir.join("data/heap-000011.mpf");
         assert!(file_path.exists(), "DataFile should exist for list entry");
@@ -903,6 +934,7 @@ mod tests {
             50,
             b"overflow_key",
             &entry,
+            0,
             0,
             &mut manifest,
             Some(&mut cold_index),

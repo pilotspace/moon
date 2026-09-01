@@ -4,7 +4,7 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::compact_key::CompactKey;
-use crate::storage::entry::current_time_ms;
+use crate::storage::entry::{Entry, current_time_ms};
 
 use super::helpers::{err_wrong_args, expiry_ms_in_range};
 
@@ -147,7 +147,8 @@ fn expire_condition_allows(
     let Some(entry) = db.get(key) else {
         return Ok(false);
     };
-    let current = entry.has_expiry().then(|| entry.expires_at_ms());
+    let has = entry.has_expiry();
+    let current = has.then(|| db.expires_at_ms(key));
     Ok(!expire_cond_blocks(f, current, when_ms))
 }
 
@@ -297,23 +298,20 @@ pub fn ttl(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("TTL"),
     };
-    match db.get(key) {
+    match db.get(key).map(Entry::has_expiry) {
         None => Frame::Integer(-2),
-        Some(entry) => {
-            if !entry.has_expiry() {
-                Frame::Integer(-1)
+        Some(false) => Frame::Integer(-1),
+        Some(true) => {
+            let now_ms = current_time_ms();
+            let exp_ms = db.expires_at_ms(key);
+            if now_ms >= exp_ms {
+                // Edge case: expired between get and now
+                Frame::Integer(-2)
             } else {
-                let now_ms = current_time_ms();
-                let exp_ms = entry.expires_at_ms();
-                if now_ms >= exp_ms {
-                    // Edge case: expired between get and now
-                    Frame::Integer(-2)
-                } else {
-                    // Redis rounds to the NEAREST second ((ms+500)/1000): a
-                    // fresh `EXPIRE k 100` answers TTL 100, not 99. Oracle-
-                    // diffed vs redis-server (moon#544 probe run).
-                    Frame::Integer(((exp_ms - now_ms + 500) / 1000) as i64)
-                }
+                // Redis rounds to the NEAREST second ((ms+500)/1000): a
+                // fresh `EXPIRE k 100` answers TTL 100, not 99. Oracle-
+                // diffed vs redis-server (moon#544 probe run).
+                Frame::Integer(((exp_ms - now_ms + 500) / 1000) as i64)
             }
         }
     }
@@ -330,19 +328,16 @@ pub fn pttl(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("PTTL"),
     };
-    match db.get(key) {
+    match db.get(key).map(Entry::has_expiry) {
         None => Frame::Integer(-2),
-        Some(entry) => {
-            if !entry.has_expiry() {
-                Frame::Integer(-1)
+        Some(false) => Frame::Integer(-1),
+        Some(true) => {
+            let now_ms = current_time_ms();
+            let exp_ms = db.expires_at_ms(key);
+            if now_ms >= exp_ms {
+                Frame::Integer(-2)
             } else {
-                let now_ms = current_time_ms();
-                let exp_ms = entry.expires_at_ms();
-                if now_ms >= exp_ms {
-                    Frame::Integer(-2)
-                } else {
-                    Frame::Integer((exp_ms - now_ms) as i64)
-                }
+                Frame::Integer((exp_ms - now_ms) as i64)
             }
         }
     }
@@ -500,15 +495,10 @@ pub fn expiretime(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("EXPIRETIME"),
     };
-    match db.get(key) {
+    match db.get(key).map(Entry::has_expiry) {
         None => Frame::Integer(-2),
-        Some(entry) => {
-            if !entry.has_expiry() {
-                Frame::Integer(-1)
-            } else {
-                Frame::Integer((entry.expires_at_ms() / 1000) as i64)
-            }
-        }
+        Some(false) => Frame::Integer(-1),
+        Some(true) => Frame::Integer((db.expires_at_ms(key) / 1000) as i64),
     }
 }
 
@@ -523,15 +513,10 @@ pub fn pexpiretime(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("PEXPIRETIME"),
     };
-    match db.get(key) {
+    match db.get(key).map(Entry::has_expiry) {
         None => Frame::Integer(-2),
-        Some(entry) => {
-            if !entry.has_expiry() {
-                Frame::Integer(-1)
-            } else {
-                Frame::Integer(entry.expires_at_ms() as i64)
-            }
-        }
+        Some(false) => Frame::Integer(-1),
+        Some(true) => Frame::Integer(db.expires_at_ms(key) as i64),
     }
 }
 
@@ -974,9 +959,10 @@ pub fn rename(db: &mut Database, args: &[Frame]) -> Frame {
         return Frame::SimpleString(Bytes::from_static(b"OK"));
     }
 
-    // Remove source, set as destination (preserves entire Entry including TTL)
-    let entry = db.remove(src).unwrap();
-    db.set(dst, entry);
+    // Remove source, set as destination. The deadline moves WITH the value:
+    // Redis's RENAME keeps the source's TTL on the destination.
+    let (entry, ttl) = db.remove(src).unwrap();
+    db.set_with_expiry(dst, entry, ttl);
 
     // TWO events, not one: a consumer tracking key lifetimes needs to see the
     // source disappear and the destination appear, and the halves carry
@@ -1030,8 +1016,9 @@ pub fn renamenx(db: &mut Database, args: &[Frame]) -> Frame {
         return Frame::Integer(0);
     }
 
-    let entry = db.remove(src).unwrap();
-    db.set(dst, entry);
+    // RENAMENX carries the deadline for the same reason RENAME does.
+    let (entry, ttl) = db.remove(src).unwrap();
+    db.set_with_expiry(dst, entry, ttl);
 
     Frame::Integer(1)
 }
@@ -1073,7 +1060,7 @@ pub fn unlink(db: &mut Database, args: &[Frame]) -> Frame {
             if removed {
                 count += 1;
             }
-            if let Some(entry) = hot {
+            if let Some((entry, _ttl)) = hot {
                 if should_async_drop(&entry) {
                     // Async drop for large collections: spawn a blocking
                     // task to avoid holding the event loop.
@@ -1565,9 +1552,10 @@ mod tests {
 
     fn setup_db_with_expiry(key: &[u8], val: &[u8], expires_at_ms: u64) -> Database {
         let mut db = Database::new();
-        db.set(
+        db.set_with_expiry(
             key,
-            Entry::new_string_with_expiry(Bytes::copy_from_slice(val), expires_at_ms),
+            Entry::new_string(Bytes::copy_from_slice(val)),
+            expires_at_ms,
         );
         db
     }
@@ -2204,9 +2192,10 @@ mod tests {
         let mut db = Database::new();
         db.set(b"alive", Entry::new_string(Bytes::from_static(b"1")));
         let past_ms = current_time_ms() - 1000;
-        db.set(
+        db.set_with_expiry(
             b"dead",
-            Entry::new_string_with_expiry(Bytes::from_static(b"2"), past_ms),
+            Entry::new_string(Bytes::from_static(b"2")),
+            past_ms,
         );
         let result = keys(&mut db, &[bs(b"*")]);
         match result {

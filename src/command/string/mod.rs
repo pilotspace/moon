@@ -444,9 +444,10 @@ mod tests {
     fn test_incr_preserves_ttl() {
         let mut db = make_db();
         let exp_ms = current_time_ms() + 100_000;
-        db.set(
+        db.set_with_expiry(
             b"counter",
-            Entry::new_string_with_expiry(Bytes::from_static(b"5"), exp_ms),
+            Entry::new_string(Bytes::from_static(b"5")),
+            exp_ms,
         );
         let result = incr(&mut db, &[bs(b"counter")]);
         assert_eq!(result, Frame::Integer(6));
@@ -495,9 +496,10 @@ mod tests {
         for start in [7i64, 999_999_999_999, -1_000_000_000_001] {
             let mut db = make_db();
             let exp_ms = current_time_ms() + 100_000;
-            db.set(
+            db.set_with_expiry(
                 b"c",
-                Entry::new_string_with_expiry(Bytes::from(start.to_string()), exp_ms),
+                Entry::new_string(Bytes::from(start.to_string())),
+                exp_ms,
             );
             let expected = start + 1;
             assert_eq!(incr(&mut db, &[bs(b"c")]), Frame::Integer(expected));
@@ -592,9 +594,10 @@ mod tests {
     fn test_append_preserves_ttl() {
         let mut db = make_db();
         let exp_ms = current_time_ms() + 100_000;
-        db.set(
+        db.set_with_expiry(
             b"key",
-            Entry::new_string_with_expiry(Bytes::from_static(b"hello"), exp_ms),
+            Entry::new_string(Bytes::from_static(b"hello")),
+            exp_ms,
         );
         append(&mut db, &[bs(b"key"), bs(b" world")]);
         let entry = db.get(b"key").unwrap();
@@ -711,9 +714,10 @@ mod tests {
     fn test_getset_removes_ttl() {
         let mut db = make_db();
         let exp_ms = current_time_ms() + 100_000;
-        db.set(
+        db.set_with_expiry(
             b"key",
-            Entry::new_string_with_expiry(Bytes::from_static(b"old"), exp_ms),
+            Entry::new_string(Bytes::from_static(b"old")),
+            exp_ms,
         );
         getset(&mut db, &[bs(b"key"), bs(b"new")]);
         let entry = db.get(b"key").unwrap();
@@ -813,9 +817,10 @@ mod tests {
     fn test_getex_persist() {
         let mut db = make_db();
         let exp_ms = current_time_ms() + 100_000;
-        db.set(
+        db.set_with_expiry(
             b"key",
-            Entry::new_string_with_expiry(Bytes::from_static(b"val"), exp_ms),
+            Entry::new_string(Bytes::from_static(b"val")),
+            exp_ms,
         );
         let result = getex(&mut db, &[bs(b"key"), bs(b"PERSIST")]);
         assert_eq!(result, Frame::BulkString(Bytes::from_static(b"val")));
@@ -977,9 +982,10 @@ mod tests {
     fn test_setrange_preserves_ttl() {
         let mut db = make_db();
         let exp_ms = current_time_ms() + 100_000;
-        db.set(
+        db.set_with_expiry(
             b"key",
-            Entry::new_string_with_expiry(Bytes::from_static(b"Hello"), exp_ms),
+            Entry::new_string(Bytes::from_static(b"Hello")),
+            exp_ms,
         );
         setrange(&mut db, &[bs(b"key"), bs(b"0"), bs(b"Jello")]);
         let entry = db.get(b"key").unwrap();

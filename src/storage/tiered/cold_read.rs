@@ -266,6 +266,7 @@ mod tests {
             b"myhash",
             &entry,
             0,
+            0,
             &mut manifest,
             Some(&mut cold_index),
         )
@@ -315,6 +316,7 @@ mod tests {
             21,
             b"cachekey",
             &entry,
+            0,
             0,
             &mut manifest,
             Some(&mut cold_index),
@@ -388,14 +390,13 @@ mod tests {
         let mut cold_index = ColdIndex::new();
 
         let mut entry = Entry::new_string(Bytes::copy_from_slice(value));
-        if let Some(ttl) = ttl_ms {
-            entry.set_expires_at_ms(ttl);
-        }
+        entry.set_has_expiry(ttl_ms.is_some());
         spill_to_datafile(
             shard_dir,
             40,
             key,
             &entry,
+            ttl_ms.unwrap_or(0),
             0,
             &mut manifest,
             Some(&mut cold_index),
@@ -587,6 +588,7 @@ mod tests {
             30,
             b"big_key",
             &entry,
+            0,
             0,
             &mut manifest,
             Some(&mut cold_index),

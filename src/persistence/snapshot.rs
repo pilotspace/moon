@@ -92,7 +92,7 @@ pub struct SnapshotState {
     output_buf: Vec<u8>,
     /// COW overflow buffer: (db_index, segment_storage_idx, key, entry) for entries
     /// modified before their segment was serialized.
-    overflow: Vec<(usize, usize, Bytes, Entry)>,
+    overflow: Vec<(usize, usize, Bytes, Entry, u64)>,
     /// Keys already present in `overflow`, so a key written twice inside one
     /// epoch keeps its FIRST pre-image (moon#517). Without this, the second
     /// capture appended a second record for the same key and
@@ -233,6 +233,7 @@ impl SnapshotState {
         segment_storage_idx: usize,
         key: Bytes,
         old_entry: Entry,
+        old_expires_at_ms: u64,
     ) {
         if !self
             .overflow_keys
@@ -240,8 +241,13 @@ impl SnapshotState {
         {
             return;
         }
-        self.overflow
-            .push((db_index, segment_storage_idx, key, old_entry));
+        self.overflow.push((
+            db_index,
+            segment_storage_idx,
+            key,
+            old_entry,
+            old_expires_at_ms,
+        ));
     }
 
     /// Advance the snapshot by one segment. Returns true when all segments are done.
@@ -298,29 +304,29 @@ impl SnapshotState {
         let segment = db.data().segment(seg_idx);
 
         // Collect overflow entries for this segment
-        let overflow_entries: Vec<(Bytes, Entry)> = self
+        let overflow_entries: Vec<(Bytes, Entry, u64)> = self
             .overflow
             .iter()
-            .filter(|(db_idx, s_idx, _, _)| *db_idx == self.current_db && *s_idx == seg_idx)
-            .map(|(_, _, k, e)| (k.clone(), e.clone()))
+            .filter(|(db_idx, s_idx, ..)| *db_idx == self.current_db && *s_idx == seg_idx)
+            .map(|(_, _, k, e, t)| (k.clone(), e.clone(), *t))
             .collect();
         let overflow_keys: HashSet<&[u8]> =
-            overflow_entries.iter().map(|(k, _)| k.as_ref()).collect();
+            overflow_entries.iter().map(|(k, ..)| k.as_ref()).collect();
 
         // Remove consumed overflow entries
         self.overflow
-            .retain(|(db_idx, s_idx, _, _)| !(*db_idx == self.current_db && *s_idx == seg_idx));
+            .retain(|(db_idx, s_idx, ..)| !(*db_idx == self.current_db && *s_idx == seg_idx));
 
         // Collect all entries for this segment: overflow + live (non-overlap, non-expired)
         let mut segment_entries: Vec<u8> = Vec::new();
         let mut entry_count: u32 = 0;
 
         // Write overflow entries first (these represent old values before modification)
-        for (key, entry) in &overflow_entries {
-            if entry.has_expiry() && entry.is_expired_at(now_ms) {
+        for (key, entry, expires_at_ms) in &overflow_entries {
+            if *expires_at_ms != 0 && now_ms >= *expires_at_ms {
                 continue;
             }
-            if let Err(e) = rdb::write_entry(&mut segment_entries, key, entry) {
+            if let Err(e) = rdb::write_entry(&mut segment_entries, key, entry, *expires_at_ms) {
                 tracing::warn!("Snapshot: skipping entry serialization error: {}", e);
                 continue;
             }
@@ -332,10 +338,13 @@ impl SnapshotState {
             if overflow_keys.contains(key.as_bytes()) {
                 continue;
             }
-            if entry.has_expiry() && entry.is_expired_at(now_ms) {
+            let expires_at_ms = db.entry_expires_at_ms(key.as_bytes(), entry);
+            if expires_at_ms != 0 && now_ms >= expires_at_ms {
                 continue;
             }
-            if let Err(e) = rdb::write_entry(&mut segment_entries, key.as_bytes(), entry) {
+            if let Err(e) =
+                rdb::write_entry(&mut segment_entries, key.as_bytes(), entry, expires_at_ms)
+            {
                 tracing::warn!("Snapshot: skipping entry serialization error: {}", e);
                 continue;
             }
@@ -802,7 +811,8 @@ pub fn shard_snapshot_load<D: std::borrow::BorrowMut<Database>>(
                 rdb::validate_count(&cursor, entry_count as usize, 17, "segment_entries")?;
 
                 // First pass: read entries, tracking bytes consumed
-                let mut entries: Vec<(Bytes, Entry)> = Vec::with_capacity(entry_count as usize);
+                let mut entries: Vec<(Bytes, Entry, u64)> =
+                    Vec::with_capacity(entry_count as usize);
                 let mut segment_parse_failed = false;
                 for _ in 0..entry_count {
                     let mut type_tag = [0u8; 1];
@@ -811,7 +821,7 @@ pub fn shard_snapshot_load<D: std::borrow::BorrowMut<Database>>(
                         break;
                     }
                     match rdb::read_entry(&mut cursor, type_tag[0], has_hash_ttl_trailer) {
-                        Ok((key, entry)) => entries.push((key, entry)),
+                        Ok((key, entry, ttl)) => entries.push((key, entry, ttl)),
                         Err(e) => {
                             tracing::warn!(
                                 "Snapshot load: entry parse error in segment {}: {}",
@@ -864,12 +874,16 @@ pub fn shard_snapshot_load<D: std::borrow::BorrowMut<Database>>(
                 }
 
                 // Insert non-expired entries into the database
-                for (key, entry) in entries {
-                    if entry.has_expiry() && entry.is_expired_at(now_ms) {
+                for (key, entry, expires_at_ms) in entries {
+                    if expires_at_ms != 0 && now_ms >= expires_at_ms {
                         continue;
                     }
                     if current_db < databases.len() {
-                        databases[current_db].borrow_mut().set(&key, entry);
+                        databases[current_db].borrow_mut().set_with_expiry(
+                            &key,
+                            entry,
+                            expires_at_ms,
+                        );
                         total_keys += 1;
                     }
                 }
@@ -1068,9 +1082,10 @@ mod tests {
         dbs[0].set_string_with_expiry(b"live", Bytes::from_static(b"yes"), future_ms);
         // Key with past TTL (should be skipped)
         let past_ms = current_time_ms() - 1000;
-        dbs[0].set(
+        dbs[0].set_with_expiry(
             b"dead",
-            Entry::new_string_with_expiry(Bytes::from_static(b"no"), past_ms),
+            Entry::new_string(Bytes::from_static(b"no")),
+            past_ms,
         );
 
         shard_snapshot_save(0, 1, &dbs, &path).unwrap();
@@ -1111,7 +1126,7 @@ mod tests {
         let cow_old_entry = cow_old_entry.clone();
 
         assert!(state.is_segment_pending(0, 1));
-        state.capture_cow(0, 1, cow_key.to_bytes(), cow_old_entry);
+        state.capture_cow(0, 1, cow_key.to_bytes(), cow_old_entry, 0);
 
         // Now overwrite the key in the live database (simulating a write during snapshot)
         dbs[0].set_string(cow_key.as_ref(), Bytes::from_static(b"NEW_VALUE"));
@@ -1164,13 +1179,13 @@ mod tests {
         assert!(state.is_segment_pending(0, 1));
 
         // Write #1: capture the epoch-start value, then mutate.
-        state.capture_cow(0, 1, key.clone(), first_entry);
+        state.capture_cow(0, 1, key.clone(), first_entry, 0);
         dbs[0].set_string(&key, Bytes::from_static(b"mid"));
 
         // Write #2: a second capture of the SAME key, now holding "mid".
         #[allow(clippy::unwrap_used)]
         let second_entry = dbs[0].data().get(&key).unwrap().clone();
-        state.capture_cow(0, 1, key.clone(), second_entry);
+        state.capture_cow(0, 1, key.clone(), second_entry, 0);
         dbs[0].set_string(&key, Bytes::from_static(b"NEW_VALUE"));
 
         while !state.advance_one_segment(&dbs) {}

@@ -1128,13 +1128,17 @@ pub struct TxnExecReply {
 /// builds today: live entries per db index. The writer feeds
 /// this directly to `rdb::save_snapshot_to_bytes` unchanged.
 pub struct AofFoldSnapshot {
-    /// One element per db: the live entries.
-    /// Entries are pre-filtered — expired entries (per `is_expired_at`) are
-    /// excluded at snapshot time by the shard thread.
+    /// One element per db: the live entries, each with its absolute expiry in
+    /// unix milliseconds (`0` = none). The deadline travels ALONGSIDE the
+    /// entry because it is not in the entry: it lives in the database's
+    /// `expires` map, which this detached snapshot does not carry.
+    /// Entries are pre-filtered — expired ones are excluded at snapshot time
+    /// by the shard thread.
     pub dbs: Vec<
         Vec<(
             crate::storage::compact_key::CompactKey,
             crate::storage::entry::Entry,
+            u64,
         )>,
     >,
     /// Number of messages in the AOF channel at the instant the shard read

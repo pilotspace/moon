@@ -195,6 +195,7 @@ mod tests {
             key,
             &entry,
             0,
+            0,
             &mut manifest,
             Some(&mut cold_index),
         )

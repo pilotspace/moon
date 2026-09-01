@@ -527,7 +527,7 @@ mod tests {
     fn a_key_ttl_changes_the_digest_by_a_fixed_marker() {
         // SET str_exp withttl ; EXPIRE str_exp 9999
         let mut e = string_entry("withttl");
-        e.set_expires_at_ms(1_000_000_000_000);
+        e.set_has_expiry(true);
         assert_eq!(
             to_hex(&object_digest(&e)),
             "77c90aba73e11e26e94722d08db485ca000dbc61"
@@ -535,7 +535,7 @@ mod tests {
         // The marker encodes PRESENCE only: a different deadline is the same
         // digest, or the value would change on every second that passed.
         let mut e2 = string_entry("withttl");
-        e2.set_expires_at_ms(2_000_000_000_000);
+        e2.set_has_expiry(true);
         assert_eq!(object_digest(&e), object_digest(&e2));
         assert_ne!(object_digest(&e), object_digest(&string_entry("withttl")));
     }
@@ -655,7 +655,7 @@ mod tests {
         map.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
         map.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
         let mut exp = string_entry("withttl");
-        exp.set_expires_at_ms(1_000_000_000_000);
+        exp.set_has_expiry(true);
 
         accumulate_key(&mut acc, b"str_plain", &string_entry("hello"));
         accumulate_key(&mut acc, b"str_int", &string_entry("12345"));

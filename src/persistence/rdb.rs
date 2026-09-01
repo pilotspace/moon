@@ -77,7 +77,7 @@ pub fn save_to_bytes<D: std::borrow::Borrow<Database>>(
         let data = db.data();
         let live: Vec<_> = data
             .iter()
-            .filter(|(_, entry)| !entry.is_expired_at(now_ms))
+            .filter(|(key, entry)| !db.entry_is_expired_at(key.as_bytes(), entry, now_ms))
             .collect();
         if live.is_empty() {
             continue;
@@ -87,7 +87,8 @@ pub fn save_to_bytes<D: std::borrow::Borrow<Database>>(
         buf.write_all(&[db_idx as u8])?;
 
         for (key, entry) in live {
-            write_entry(&mut buf, key.as_bytes(), entry)?;
+            let expires_at_ms = db.entry_expires_at_ms(key.as_bytes(), entry);
+            write_entry(&mut buf, key.as_bytes(), entry, expires_at_ms)?;
         }
     }
 
@@ -121,7 +122,7 @@ pub fn save(databases: &[Database], path: &Path) -> Result<(), MoonError> {
 ///
 /// Each element in `snapshot` is a Vec of (key, entry) for a database index.
 pub fn save_from_snapshot(
-    snapshot: &[Vec<(CompactKey, Entry)>],
+    snapshot: &[Vec<(CompactKey, Entry, u64)>],
     path: &Path,
 ) -> Result<(), MoonError> {
     let mut buf = Vec::new();
@@ -136,7 +137,7 @@ pub fn save_from_snapshot(
         // Filter expired and skip empty
         let live: Vec<_> = entries
             .iter()
-            .filter(|(_, e)| !e.is_expired_at(now_ms))
+            .filter(|(_, _, ttl)| *ttl == 0 || now_ms < *ttl)
             .collect();
         if live.is_empty() {
             continue;
@@ -145,8 +146,8 @@ pub fn save_from_snapshot(
         buf.write_all(&[DB_SELECTOR])?;
         buf.write_all(&[db_idx as u8])?;
 
-        for (key, entry) in live {
-            write_entry(&mut buf, key.as_bytes(), entry)?;
+        for (key, entry, expires_at_ms) in live {
+            write_entry(&mut buf, key.as_bytes(), entry, *expires_at_ms)?;
         }
     }
 
@@ -170,7 +171,9 @@ pub fn save_from_snapshot(
 ///
 /// Unlike `save_to_bytes(&[Database])`, this takes pre-cloned entry Vecs —
 /// used by AOF rewrite where entries are cloned into temporary storage.
-pub fn save_snapshot_to_bytes(snapshot: &[Vec<(CompactKey, Entry)>]) -> Result<Vec<u8>, MoonError> {
+pub fn save_snapshot_to_bytes(
+    snapshot: &[Vec<(CompactKey, Entry, u64)>],
+) -> Result<Vec<u8>, MoonError> {
     let mut buf = Vec::new();
 
     buf.write_all(RDB_MAGIC)?;
@@ -181,7 +184,7 @@ pub fn save_snapshot_to_bytes(snapshot: &[Vec<(CompactKey, Entry)>]) -> Result<V
     for (db_idx, entries) in snapshot.iter().enumerate() {
         let live: Vec<_> = entries
             .iter()
-            .filter(|(_, e)| !e.is_expired_at(now_ms))
+            .filter(|(_, _, ttl)| *ttl == 0 || now_ms < *ttl)
             .collect();
         if live.is_empty() {
             continue;
@@ -190,8 +193,8 @@ pub fn save_snapshot_to_bytes(snapshot: &[Vec<(CompactKey, Entry)>]) -> Result<V
         buf.write_all(&[DB_SELECTOR])?;
         buf.write_all(&[db_idx as u8])?;
 
-        for (key, entry) in live {
-            write_entry(&mut buf, key.as_bytes(), entry)?;
+        for (key, entry, expires_at_ms) in live {
+            write_entry(&mut buf, key.as_bytes(), entry, *expires_at_ms)?;
         }
     }
 
@@ -325,12 +328,16 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
             }
             type_tag => {
                 match read_entry_zero_copy(&mut cursor, type_tag, now_secs, has_hash_ttl_trailer) {
-                    Ok((key, entry)) => {
-                        if entry.has_expiry() && entry.is_expired_at(now_ms) {
+                    Ok((key, entry, expires_at_ms)) => {
+                        if expires_at_ms != 0 && now_ms >= expires_at_ms {
                             continue;
                         }
                         if current_db < db_count {
-                            temp_dbs[current_db].insert_for_load(key, entry);
+                            temp_dbs[current_db].insert_for_load_with_expiry(
+                                key,
+                                entry,
+                                expires_at_ms,
+                            );
                             total_keys += 1;
                         }
                     }
@@ -567,7 +574,7 @@ fn read_entry_zero_copy(
     type_tag: u8,
     cached_secs: u32,
     has_hash_ttl_trailer: bool,
-) -> Result<(Bytes, Entry), MoonError> {
+) -> Result<(Bytes, Entry, u64), MoonError> {
     let key = read_bytes(cursor)?;
 
     let mut ttl_buf = [0u8; 8];
@@ -590,12 +597,10 @@ fn read_entry_zero_copy(
             };
             let mut entry = Entry::new_string(Bytes::new());
             entry.value = cv;
-            if expires_at_ms > 0 {
-                entry.set_expires_at_ms(expires_at_ms);
-            }
+            entry.set_has_expiry(expires_at_ms > 0);
             entry.set_last_access(cached_secs);
             entry.set_access_counter(5);
-            return Ok((key, entry));
+            return Ok((key, entry, expires_at_ms));
         }
         TYPE_HASH => {
             let count = read_u32(cursor)? as usize;
@@ -793,13 +798,11 @@ fn read_entry_zero_copy(
 
     let mut entry = Entry::new_string(Bytes::new());
     entry.value = crate::storage::compact_value::CompactValue::from_redis_value(value);
-    if expires_at_ms > 0 {
-        entry.set_expires_at_ms(expires_at_ms);
-    }
+    entry.set_has_expiry(expires_at_ms > 0);
     entry.set_last_access(cached_secs);
     entry.set_access_counter(5);
 
-    Ok((key, entry))
+    Ok((key, entry, expires_at_ms))
 }
 
 /// Load an RDB snapshot from a byte slice (for AOF RDB-preamble format).
@@ -938,12 +941,16 @@ pub fn load_from_bytes(
             }
             type_tag => {
                 match read_entry_zero_copy(&mut cursor, type_tag, now_secs, has_hash_ttl_trailer) {
-                    Ok((key, entry)) => {
-                        if entry.has_expiry() && entry.is_expired_at(now_ms) {
+                    Ok((key, entry, expires_at_ms)) => {
+                        if expires_at_ms != 0 && now_ms >= expires_at_ms {
                             continue;
                         }
                         if current_db < db_count {
-                            temp_dbs[current_db].insert_for_load(key, entry);
+                            temp_dbs[current_db].insert_for_load_with_expiry(
+                                key,
+                                entry,
+                                expires_at_ms,
+                            );
                             total_keys += 1;
                         }
                     }
@@ -997,7 +1004,12 @@ pub fn distribute_loaded_to_shards(
     }
 }
 
-pub(crate) fn write_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) -> Result<(), MoonError> {
+pub(crate) fn write_entry(
+    buf: &mut Vec<u8>,
+    key: &[u8],
+    entry: &Entry,
+    expires_at_ms: u64,
+) -> Result<(), MoonError> {
     let val_ref = entry.value.as_redis_value();
 
     // Type tag -- compact variants serialize as the same type as their full-size counterparts
@@ -1015,11 +1027,7 @@ pub(crate) fn write_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry) -> Resul
     write_bytes(buf, key)?;
 
     // TTL as unix millis (0 = no expiry)
-    let ttl_ms: i64 = if entry.has_expiry() {
-        entry.expires_at_ms() as i64
-    } else {
-        0
-    };
+    let ttl_ms: i64 = expires_at_ms as i64;
     buf.write_all(&ttl_ms.to_le_bytes())?;
 
     // Value data -- strings inline, collections via the shared value codec
@@ -1045,7 +1053,7 @@ pub(crate) fn read_entry(
     cursor: &mut Cursor<&[u8]>,
     type_tag: u8,
     has_hash_ttl_trailer: bool,
-) -> Result<(Bytes, Entry), MoonError> {
+) -> Result<(Bytes, Entry, u64), MoonError> {
     // Key
     let key = read_bytes(cursor)?;
 
@@ -1085,20 +1093,14 @@ pub(crate) fn read_entry(
             })?
         }
     };
-    let mut entry = if expires_at_ms > 0 {
-        Entry::new_string(Bytes::new()) // placeholder, we'll replace value below
-    } else {
-        Entry::new_string(Bytes::new())
-    };
+    let mut entry = Entry::new_string(Bytes::new()); // placeholder, replaced below
     // Replace value with the correct one via CompactValue
     entry.value = crate::storage::compact_value::CompactValue::from_redis_value(value);
-    if expires_at_ms > 0 {
-        entry.set_expires_at_ms(expires_at_ms);
-    }
+    entry.set_has_expiry(expires_at_ms > 0);
     entry.set_last_access(current_secs());
     entry.set_access_counter(5);
 
-    Ok((key, entry))
+    Ok((key, entry, expires_at_ms))
 }
 
 pub(crate) fn write_bytes(buf: &mut Vec<u8>, data: &[u8]) -> Result<(), MoonError> {
@@ -1219,12 +1221,11 @@ mod tests {
         let mut loaded = vec![Database::new()];
         let count = load(&mut loaded, &path).unwrap();
         assert_eq!(count, 1);
-        let entry = loaded[0].get(b"key").unwrap();
-        assert!(entry.has_expiry());
+        assert!(loaded[0].get(b"key").unwrap().has_expiry());
         // W3: expiry round-trips with full millisecond fidelity — the old
         // seconds-truncated storage needed a 5s tolerance here.
         assert_eq!(
-            entry.expires_at_ms(),
+            loaded[0].expires_at_ms(b"key"),
             future_ms,
             "RDB round-trip must preserve the exact millisecond expiry"
         );
@@ -1397,9 +1398,10 @@ mod tests {
         dbs[0].set_string(b"live", Bytes::from_static(b"yes"));
         // Expired key
         let past_ms = current_time_ms() - 1000;
-        dbs[0].set(
+        dbs[0].set_with_expiry(
             b"dead",
-            Entry::new_string_with_expiry(Bytes::from_static(b"no"), past_ms),
+            Entry::new_string(Bytes::from_static(b"no")),
+            past_ms,
         );
 
         save(&dbs, &path).unwrap();
@@ -1667,7 +1669,7 @@ mod tests {
         let entry_bytes = build_entry_bytes(b"k", &body);
 
         let mut cursor = Cursor::new(&entry_bytes[..]);
-        let (_key, entry) = read_entry(&mut cursor, TYPE_STREAM, false)
+        let (_key, entry, _ttl) = read_entry(&mut cursor, TYPE_STREAM, false)
             .expect("legit 1-group/1-consumer/1-pel/1-pending stream must not be rejected");
         match entry.value.as_redis_value() {
             RedisValueRef::Stream(stream) => {

@@ -858,7 +858,7 @@ mod tests {
         );
         let captured = pending
             .iter()
-            .find(|(db_index, key, _)| *db_index == 0 && key.as_ref() == b"cow517")
+            .find(|(db_index, key, ..)| *db_index == 0 && key.as_ref() == b"cow517")
             .expect("a script write during a snapshot must capture the key's pre-image");
         match captured.2.value.as_redis_value() {
             crate::storage::compact_value::RedisValueRef::String(s) => {

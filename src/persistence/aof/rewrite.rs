@@ -30,7 +30,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 
         for (key, entry) in data {
             // Skip expired entries
-            if entry.is_expired_at(now_ms) {
+            if db.entry_is_expired_at(key.as_bytes(), entry, now_ms) {
                 continue;
             }
 
@@ -224,7 +224,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 
             // Generate PEXPIRE for keys with TTL
             if entry.has_expiry() {
-                let exp_ms = entry.expires_at_ms();
+                let exp_ms = db.entry_expires_at_ms(key.as_bytes(), entry);
                 if exp_ms > now_ms {
                     let remaining_ms = exp_ms - now_ms;
                     let pexpire_frame = Frame::Array(framevec![
@@ -897,6 +897,7 @@ pub(crate) fn do_rewrite_single(
         Vec<(
             crate::storage::compact_key::CompactKey,
             crate::storage::entry::Entry,
+            u64,
         )>,
     > = guards
         .iter()
@@ -904,8 +905,11 @@ pub(crate) fn do_rewrite_single(
             let entries: Vec<_> = guard
                 .data()
                 .iter()
-                .filter(|(_, v)| !v.is_expired_at(now_ms))
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .filter(|(k, v)| !guard.entry_is_expired_at(k.as_bytes(), v, now_ms))
+                .map(|(k, v)| {
+                    let ttl = guard.entry_expires_at_ms(k.as_bytes(), v);
+                    (k.clone(), v.clone(), ttl)
+                })
                 .collect();
             entries
         })
@@ -1131,8 +1135,9 @@ fn rewrite_aof_sync(db: &SharedDatabases, aof_path: &Path) -> Result<(), MoonErr
             let mut temp = Database::new();
             let now_ms = current_time_ms();
             for (k, v) in guard.data().iter() {
-                if !v.is_expired_at(now_ms) {
-                    temp.set(k.as_ref(), v.clone());
+                if !guard.entry_is_expired_at(k.as_bytes(), v, now_ms) {
+                    let ttl = guard.entry_expires_at_ms(k.as_bytes(), v);
+                    temp.set_with_expiry(k.as_ref(), v.clone(), ttl);
                 }
             }
             temp

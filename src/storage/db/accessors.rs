@@ -24,9 +24,17 @@ use crate::storage::db::{Database, entry_overhead, list_elem_cost};
 /// to prevent was twenty-five call sites that silently saw only one of them.
 pub enum EntryView<'a> {
     /// Resident in the hot plane.
-    Hot(&'a Entry),
+    Hot {
+        entry: &'a Entry,
+        /// Deadline read out of the database's `expires` map, `0` = none.
+        expires_at_ms: u64,
+    },
     /// Materialised from the cold tier. NOT inserted into the hot plane.
-    Cold(Entry),
+    ///
+    /// A cold or in-flight entry is NOT in `expires` — it is not a hot key —
+    /// so its deadline rides here, taken from the cold index or the in-flight
+    /// record. Dropping it made `TTL` answer -1 for a key written with `EX`.
+    Cold { entry: Entry, expires_at_ms: u64 },
 }
 
 impl EntryView<'_> {
@@ -34,8 +42,16 @@ impl EntryView<'_> {
     #[inline]
     pub fn entry(&self) -> &Entry {
         match self {
-            Self::Hot(e) => e,
-            Self::Cold(e) => e,
+            Self::Hot { entry, .. } => entry,
+            Self::Cold { entry, .. } => entry,
+        }
+    }
+
+    /// Absolute expiry in unix milliseconds, `0` when the key has none.
+    #[inline]
+    pub fn expires_at_ms(&self) -> u64 {
+        match self {
+            Self::Hot { expires_at_ms, .. } | Self::Cold { expires_at_ms, .. } => *expires_at_ms,
         }
     }
 }
@@ -71,7 +87,7 @@ impl Database {
     /// removal must still go through `remove_hot` so the expiry index stays
     /// in lock-step (moon#541).
     fn drop_if_expired(&mut self, key: &[u8], now_ms: u64) {
-        if Self::check_expired(&self.data, key, now_ms) {
+        if Self::check_expired(&self.data, &self.expires, key, now_ms) {
             self.remove_hot(key);
         }
     }
@@ -92,7 +108,7 @@ impl Database {
         now_ms: u64,
     ) -> Result<Option<K::Ref<'_>>, Frame> {
         if let Some(entry) = self.data.get(key) {
-            if entry.is_expired_at(now_ms) {
+            if self.entry_is_expired_at(key, entry, now_ms) {
                 return Ok(None);
             }
             return match K::classify_hot(entry.value.as_redis_value(), now_ms) {
@@ -465,7 +481,9 @@ impl Database {
     /// Check if a key exists and its expiry is in the past.
     pub fn is_key_expired(&self, key: &[u8]) -> bool {
         let now_ms = current_time_ms();
-        self.data.get(key).is_some_and(|e| e.is_expired_at(now_ms))
+        self.data
+            .get(key)
+            .is_some_and(|e| self.entry_is_expired_at(key, e, now_ms))
     }
 
     /// Read-only access to the data map (for SCAN iteration).
@@ -487,7 +505,7 @@ impl Database {
     /// [`Self::get_if_alive_any_plane`] instead (moon#610).
     pub fn get_if_alive(&self, key: &[u8], now_ms: u64) -> Option<&Entry> {
         let entry = self.data.get(key)?;
-        if entry.is_expired_at(now_ms) {
+        if self.entry_is_expired_at(key, entry, now_ms) {
             return None;
         }
         Some(entry)
@@ -517,10 +535,13 @@ impl Database {
     /// shard guard first — identical to the existing typed-access path.
     pub fn get_if_alive_any_plane(&self, key: &[u8], now_ms: u64) -> Option<EntryView<'_>> {
         if let Some(entry) = self.data.get(key) {
-            if entry.is_expired_at(now_ms) {
+            if self.entry_is_expired_at(key, entry, now_ms) {
                 return None;
             }
-            return Some(EntryView::Hot(entry));
+            return Some(EntryView::Hot {
+                entry,
+                expires_at_ms: self.entry_expires_at_ms(key, entry),
+            });
         }
         // The in-flight spill plane FIRST (#459): a key mid-spill has left
         // hot RAM but has no `cold_index` entry yet, and this is the only
@@ -528,20 +549,26 @@ impl Database {
         // Reaching it through `get_cold_value` instead yields the value with
         // the TTL dropped, so `TTL` answers -1 ("no expiry") for a key written
         // with `EX`: a different wrong answer, not a fix. Measured, not feared.
-        if let Some(entry) = self.spill_inflight_entry(key, now_ms) {
-            return Some(EntryView::Cold(entry));
+        if let Some((entry, expires_at_ms)) = self.spill_inflight_entry(key, now_ms) {
+            return Some(EntryView::Cold {
+                entry,
+                expires_at_ms,
+            });
         }
         let value = self.get_cold_value(key, now_ms)?;
         let mut entry = Entry::new_string(bytes::Bytes::new());
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(value);
         // Settled in the cold tier: the deadline rides in the cold index, so
         // restoring it costs no extra disk read.
-        if let Some((loc, _)) = self.cold_lookup_location(key) {
-            if let Some(ttl) = loc.ttl_ms {
-                entry.set_expires_at_ms(ttl);
-            }
-        }
-        Some(EntryView::Cold(entry))
+        let expires_at_ms = self
+            .cold_lookup_location(key)
+            .and_then(|(loc, _)| loc.ttl_ms)
+            .unwrap_or(0);
+        entry.set_has_expiry(expires_at_ms != 0);
+        Some(EntryView::Cold {
+            entry,
+            expires_at_ms,
+        })
     }
 
     /// Read-only cold storage lookup for evicted keys.
@@ -616,7 +643,7 @@ impl Database {
     /// mutate `self` to promote.
     pub fn exists_if_alive(&self, key: &[u8], now_ms: u64) -> bool {
         match self.data.get(key) {
-            Some(e) if !e.is_expired_at(now_ms) => true,
+            Some(e) if !self.entry_is_expired_at(key, e, now_ms) => true,
             _ => self.cold_contains_alive(key, now_ms),
         }
     }

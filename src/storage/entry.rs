@@ -331,46 +331,68 @@ pub fn lfu_decay(counter: u8, last_access: u32, lfu_decay_time: u64) -> u8 {
 /// WATCH and EXEC" from "key still absent" only if live entries never report 0.
 pub const INITIAL_VERSION: u32 = 1;
 
-/// Pack version (24 bits) and access_counter (8 bits) into a u32.
-/// Layout: [version:24 | access_counter:8]
+/// Bit 31 of `metadata`: this key has an expiry, recorded in the owning
+/// [`crate::storage::Database`]'s `expires` map under the key.
+///
+/// The bit is what makes the no-TTL read path free. `is_expired`/`TTL` first
+/// test this bit; only if it is SET does anything consult the map. A keyspace
+/// with no TTLs therefore performs exactly the work it did when the entry
+/// carried an inline `ttl_ms: u64` — one mask-and-test against a word that is
+/// already in the same cache line as the value.
+pub(crate) const HAS_EXPIRY_BIT: u32 = 0x8000_0000;
+
+/// Width of the packed `version` field: bits 30..8 of `metadata`.
+const VERSION_MASK: u32 = 0x7F_FFFF;
+const VERSION_SHIFT: u32 = 8;
+
+/// Pack version (23 bits) and access_counter (8 bits) into a u32.
+/// Layout: [has_expiry:1 | version:23 | access_counter:8]
 #[inline]
 fn pack_metadata_u32(version: u32, access_counter: u8) -> u32 {
-    ((version & 0xFF_FFFF) << 8) | (access_counter as u32)
+    ((version & VERSION_MASK) << VERSION_SHIFT) | (access_counter as u32)
 }
 
-/// A compact 32-byte entry in the database, wrapping a CompactValue with TTL and packed metadata.
+/// A compact 24-byte entry in the database, wrapping a CompactValue with packed metadata.
 ///
 /// Layout (repr(C)):
 /// - `value: CompactValue` (16 bytes, offset 0) -- SSO for small strings, tagged heap pointer otherwise
-/// - `ttl_ms: u64` (8 bytes, offset 16) -- 0 = no expiry, else absolute Unix milliseconds (u64
-///   milliseconds reach year ~584 million; the field was widened u32→u64 for the year-2106
-///   overflow fix, then W3 used the extra range to store milliseconds instead of seconds —
-///   PEXPIRE/PEXPIREAT precision previously truncated to whole seconds, expiring keys up to
-///   999ms EARLY and misreporting PTTL).
-/// - `metadata: u32` (4 bytes, offset 24) -- packed [version:24 | counter:8]
-/// - `last_access_secs: u32` (4 bytes, offset 28) -- full epoch-seconds LRU clock
-///   (formerly alignment padding; repurposed so LRU/LFU/IDLETIME are exact
-///   beyond the old 16-bit field's 18.2h wrap, at zero size cost). The freed
-///   16 metadata bits widened `version` 8→24 bits, pushing the WATCH/EXEC ABA
-///   window from 256 to 16.7M intervening writes.
+/// - `metadata: u32` (4 bytes, offset 16) -- packed [has_expiry:1 | version:23 | counter:8]
+/// - `last_access_secs: u32` (4 bytes, offset 20) -- full epoch-seconds LRU clock
+///   (repurposed from alignment padding so LRU/LFU/IDLETIME are exact beyond
+///   the old 16-bit field's 18.2h wrap, at zero size cost).
 ///
-/// NOTE: the size changed from 24 → 32 bytes when the TTL field was widened from u32 to u64.
-/// Memory overhead per key increases by 8 bytes (1/3 overhead on a 100M-key dataset = ~800 MB).
-/// The correctness gain (no silent TTL overflow, full ms fidelity) outweighs the cost for all
-/// realistic key counts.
+/// # Why the expiry is NOT here
+///
+/// The entry used to carry `ttl_ms: u64` at offset 16, documented `0 = no
+/// expiry`. That field was charged to **every slot of every segment** --
+/// `TOTAL_SLOTS` (60) of them per segment, occupied or not -- so a keyspace
+/// with no TTLs at all still paid 8 B per slot, 480 B per segment, ~11.8 B per
+/// stored key at the organic fill of ~40.5 keys/segment. Redis never pays it:
+/// expiries live in a separate `db->expires` dict and a key without a TTL has
+/// no entry in it.
+///
+/// moon now does the same. The absolute expiry (unix milliseconds, full
+/// fidelity, unchanged range and semantics) lives in the owning
+/// `Database`'s `expires: HashMap<CompactKey, u64>`, and [`HAS_EXPIRY_BIT`]
+/// in `metadata` says whether to look. Every read of a key without a TTL
+/// therefore does exactly what it did before -- test one bit of a word that
+/// shares a cache line with the value -- and never hashes anything.
+///
+/// The 24-bit `version` gave up its top bit to [`HAS_EXPIRY_BIT`]: the
+/// WATCH/EXEC ABA window is 8.4M intervening writes to the same key instead
+/// of 16.7M, which is still four orders of magnitude past the 256 it was
+/// before that field was widened.
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct CompactEntry {
     pub value: CompactValue,
-    /// Absolute expiry time in Unix milliseconds. 0 = no expiry.
-    pub ttl_ms: u64,
-    /// Packed metadata: [version:24 | access_counter:8]
-    pub metadata: u32,
+    /// Packed metadata: [has_expiry:1 | version:23 | access_counter:8]
+    metadata: u32,
     /// Last access time, full epoch seconds (`current_secs()` domain).
     last_access_secs: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<CompactEntry>() == 32);
+const _: () = assert!(std::mem::size_of::<CompactEntry>() == 24);
 
 /// Type alias for backward compatibility during migration.
 pub type Entry = CompactEntry;
@@ -378,10 +400,10 @@ pub type Entry = CompactEntry;
 impl CompactEntry {
     // --- Accessor methods for packed metadata ---
 
-    /// Get the version (24-bit, wraps to [`INITIAL_VERSION`], never 0).
+    /// Get the version (23-bit, wraps to [`INITIAL_VERSION`], never 0).
     #[inline]
     pub fn version(&self) -> u32 {
-        (self.metadata >> 8) & 0xFF_FFFF
+        (self.metadata >> VERSION_SHIFT) & VERSION_MASK
     }
 
     /// Get the last access time (full u32 epoch seconds).
@@ -396,10 +418,15 @@ impl CompactEntry {
         (self.metadata & 0xFF) as u8
     }
 
-    /// Set the version (24-bit, truncated to lower 24 bits).
+    /// Set the version (23-bit, truncated to lower 23 bits).
+    ///
+    /// Preserves BOTH neighbours in the word: the LFU counter in bits 7..0 and
+    /// [`HAS_EXPIRY_BIT`] in bit 31. Clobbering the latter here would strand a
+    /// live entry in the `expires` map -- a key with a TTL that never expires.
     #[inline]
     pub fn set_version(&mut self, v: u32) {
-        self.metadata = (self.metadata & 0xFF) | ((v & 0xFF_FFFF) << 8);
+        self.metadata = (self.metadata & !(VERSION_MASK << VERSION_SHIFT))
+            | ((v & VERSION_MASK) << VERSION_SHIFT);
     }
 
     /// Set the last access time (full u32 epoch seconds).
@@ -414,11 +441,11 @@ impl CompactEntry {
         self.metadata = (self.metadata & !0xFF) | (c as u32);
     }
 
-    /// Next version after `v`: 24-bit wrap that skips 0 (the WATCH
+    /// Next version after `v`: 23-bit wrap that skips 0 (the WATCH
     /// "key absent" sentinel — see [`INITIAL_VERSION`]).
     #[inline]
     pub fn bump_version(v: u32) -> u32 {
-        let n = (v + 1) & 0xFF_FFFF;
+        let n = (v + 1) & VERSION_MASK;
         if n == 0 { INITIAL_VERSION } else { n }
     }
 
@@ -429,35 +456,32 @@ impl CompactEntry {
     }
 
     // --- Expiry helpers ---
-    // TTL is stored as absolute Unix milliseconds (u64). 0 = no expiry.
+    //
+    // The expiry VALUE (absolute unix milliseconds, full fidelity) lives in
+    // the owning `Database`'s `expires` map; see the struct docs. All the
+    // entry itself knows is WHETHER there is one, and that answer is free.
 
-    /// Check if this entry is expired at the given time (unix millis).
-    #[inline]
-    pub fn is_expired_at(&self, now_ms: u64) -> bool {
-        self.ttl_ms != 0 && now_ms >= self.ttl_ms
-    }
-
-    /// Check if this entry has an expiry set.
+    /// Check if this entry has an expiry recorded for it.
+    ///
+    /// The whole no-TTL fast path: one mask-and-test, no hashing, no map.
+    /// A caller that needs the deadline itself asks the `Database`.
     #[inline]
     pub fn has_expiry(&self) -> bool {
-        self.ttl_ms != 0
+        self.metadata & HAS_EXPIRY_BIT != 0
     }
 
-    /// Get the absolute expiry time in milliseconds (for serialization/TTL commands).
-    #[inline]
-    pub fn expires_at_ms(&self) -> u64 {
-        self.ttl_ms
-    }
-
-    /// Set the expiry from absolute milliseconds. Pass 0 to remove expiry.
+    /// Record whether this entry has an expiry.
     ///
-    /// Full millisecond fidelity (W3): the value is stored as-is — the old
-    /// `(ms / 1000)` truncation expired keys up to 999ms EARLY and made PTTL
-    /// misreport. `0` remains the no-expiry sentinel, so a (nonsensical)
-    /// literal `PEXPIREAT key 0` is "remove expiry", same as before.
+    /// `Database` owns this bit: it is set/cleared in the same statement that
+    /// inserts into or removes from `expires`, so the bit and the map cannot
+    /// disagree. Nothing outside the storage layer may call it.
     #[inline]
-    pub fn set_expires_at_ms(&mut self, ms: u64) {
-        self.ttl_ms = ms;
+    pub(crate) fn set_has_expiry(&mut self, yes: bool) {
+        if yes {
+            self.metadata |= HAS_EXPIRY_BIT;
+        } else {
+            self.metadata &= !HAS_EXPIRY_BIT;
+        }
     }
 
     // --- Convenience value accessors ---
@@ -485,17 +509,6 @@ impl CompactEntry {
     pub fn new_string(value: Bytes) -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::String(value)),
-            ttl_ms: 0,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
-        }
-    }
-
-    /// Create a new string entry with an expiration time (unix millis).
-    pub fn new_string_with_expiry(value: Bytes, expires_at_ms: u64) -> CompactEntry {
-        CompactEntry {
-            value: CompactValue::from_redis_value(RedisValue::String(value)),
-            ttl_ms: expires_at_ms,
             metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
             last_access_secs: current_secs(),
         }
@@ -510,17 +523,6 @@ impl CompactEntry {
     pub fn new_string_from_slice(value: &[u8]) -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_slice(value),
-            ttl_ms: 0,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
-        }
-    }
-
-    /// Create a new string entry from a borrowed slice with an expiration (unix millis).
-    pub fn new_string_from_slice_with_expiry(value: &[u8], expires_at_ms: u64) -> CompactEntry {
-        CompactEntry {
-            value: CompactValue::from_slice(value),
-            ttl_ms: expires_at_ms,
             metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
             last_access_secs: current_secs(),
         }
@@ -530,7 +532,6 @@ impl CompactEntry {
     pub fn new_hash() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::Hash(HashMap::new())),
-            ttl_ms: 0,
             metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
             last_access_secs: current_secs(),
         }
@@ -540,7 +541,6 @@ impl CompactEntry {
     pub fn new_list() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::List(VecDeque::new())),
-            ttl_ms: 0,
             metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
             last_access_secs: current_secs(),
         }
@@ -550,7 +550,6 @@ impl CompactEntry {
     pub fn new_set() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::Set(HashSet::new())),
-            ttl_ms: 0,
             metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
             last_access_secs: current_secs(),
         }
@@ -563,7 +562,6 @@ impl CompactEntry {
                 members: HashMap::new(),
                 scores: BTreeMap::new(),
             }),
-            ttl_ms: 0,
             metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
             last_access_secs: current_secs(),
         }
@@ -573,7 +571,6 @@ impl CompactEntry {
     pub fn new_hash_listpack() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::HashListpack(Listpack::new())),
-            ttl_ms: 0,
             metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
             last_access_secs: current_secs(),
         }
@@ -583,7 +580,6 @@ impl CompactEntry {
     pub fn new_list_listpack() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::ListListpack(Listpack::new())),
-            ttl_ms: 0,
             metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
             last_access_secs: current_secs(),
         }
@@ -593,7 +589,6 @@ impl CompactEntry {
     pub fn new_set_listpack() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::SetListpack(Listpack::new())),
-            ttl_ms: 0,
             metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
             last_access_secs: current_secs(),
         }
@@ -603,7 +598,6 @@ impl CompactEntry {
     pub fn new_set_intset() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::SetIntset(Intset::new())),
-            ttl_ms: 0,
             metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
             last_access_secs: current_secs(),
         }
@@ -616,7 +610,6 @@ impl CompactEntry {
                 tree: BPTree::new(),
                 members: HashMap::new(),
             }),
-            ttl_ms: 0,
             metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
             last_access_secs: current_secs(),
         }
@@ -626,7 +619,6 @@ impl CompactEntry {
     pub fn new_sorted_set_listpack() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::SortedSetListpack(Listpack::new())),
-            ttl_ms: 0,
             metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
             last_access_secs: current_secs(),
         }
@@ -636,7 +628,6 @@ impl CompactEntry {
     pub fn new_stream() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::Stream(Box::new(StreamData::new()))),
-            ttl_ms: 0,
             metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
             last_access_secs: current_secs(),
         }
@@ -705,68 +696,58 @@ mod tests {
     }
 
     #[test]
-    fn new_string_from_slice_with_expiry_keeps_the_deadline() {
-        let exp_ms = current_time_ms() + 60_000;
-        let short = Entry::new_string_from_slice_with_expiry(b"7", exp_ms);
-        let long = Entry::new_string_from_slice_with_expiry(b"-9223372036854775808", exp_ms);
-        for entry in [&short, &long] {
-            assert!(entry.has_expiry());
-            assert!(
-                (entry.expires_at_ms() as i64 - exp_ms as i64).unsigned_abs() < 1000,
-                "expiry round-trip drifted"
-            );
-            assert_eq!(entry.version(), INITIAL_VERSION);
-            assert_eq!(entry.access_counter(), LFU_INIT_VAL);
-        }
-        assert_eq!(short.value.as_bytes(), Some(&b"7"[..]));
-        assert_eq!(long.value.as_bytes(), Some(&b"-9223372036854775808"[..]));
-    }
-
-    #[test]
     fn test_new_string_no_expiry() {
         let entry = Entry::new_string(Bytes::from_static(b"hello"));
         assert!(!entry.has_expiry());
-        assert_eq!(entry.ttl_ms, 0);
         assert_eq!(entry.value.type_name(), "string");
         assert_eq!(entry.version(), INITIAL_VERSION);
         assert_eq!(entry.access_counter(), LFU_INIT_VAL);
     }
 
+    /// The three packed fields share one `u32`, so every setter must leave the
+    /// other two alone. `set_version` clobbering [`HAS_EXPIRY_BIT`] would
+    /// strand a key in `expires`: a TTL that never fires. `set_access_counter`
+    /// clobbering it would do the same on every LFU touch — i.e. on reads.
     #[test]
-    fn test_new_string_with_expiry() {
-        let exp_ms = current_time_ms() + 60_000;
-        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"hello"), exp_ms);
-        assert!(entry.has_expiry());
-        assert!(entry.ttl_ms > 0);
-        // Verify round-trip: expires_at_ms should be approximately exp_ms
-        let recovered_ms = entry.expires_at_ms();
-        // Allow 1 second tolerance due to integer division
-        assert!((recovered_ms as i64 - exp_ms as i64).unsigned_abs() < 1000);
-        assert_eq!(entry.version(), INITIAL_VERSION);
-        assert_eq!(entry.access_counter(), LFU_INIT_VAL);
+    fn packed_metadata_fields_are_independent() {
+        let mut e = Entry::new_string(Bytes::from_static(b"v"));
+        e.set_has_expiry(true);
+        e.set_version(0x7F_FFFF);
+        e.set_access_counter(200);
+        assert!(
+            e.has_expiry(),
+            "set_version/set_access_counter dropped the bit"
+        );
+        assert_eq!(e.version(), 0x7F_FFFF);
+        assert_eq!(e.access_counter(), 200);
+
+        e.set_has_expiry(false);
+        assert!(!e.has_expiry());
+        assert_eq!(
+            e.version(),
+            0x7F_FFFF,
+            "set_has_expiry corrupted the version"
+        );
+        assert_eq!(e.access_counter(), 200);
+
+        // The version field is 23 bits: the 24th must not leak into the bit.
+        e.set_version(u32::MAX);
+        assert!(
+            !e.has_expiry(),
+            "an over-wide version reached HAS_EXPIRY_BIT"
+        );
+        assert_eq!(e.version(), 0x7F_FFFF);
     }
 
-    /// RED→GREEN (W3): TTLs must round-trip at millisecond fidelity.
-    /// `CompactEntry` stored `(ms / 1000)` in a u64 — a `PEXPIREAT
-    /// 10_000_500` key expired at 10_000_000 (up to 999ms EARLY, violating
-    /// Redis's "key lives at least the requested TTL"), and PTTL read back
-    /// the truncated value. The u64 is already paid for; store ms directly.
+    /// `bump_version` must stay inside the 23-bit field and skip 0, or a wrap
+    /// would set [`HAS_EXPIRY_BIT`] on a key with no TTL.
     #[test]
-    fn ttl_millisecond_fidelity() {
-        let exp_ms = 10_000_500u64;
-        let mut entry = Entry::new_string(Bytes::from_static(b"v"));
-        entry.set_expires_at_ms(exp_ms);
-        assert_eq!(
-            entry.expires_at_ms(),
-            exp_ms,
-            "PTTL must read back the exact expiry, not a second-truncated one"
-        );
-        assert!(
-            !entry.is_expired_at(exp_ms - 300),
-            "key expired 300ms early: sub-second TTL precision was truncated"
-        );
-        assert!(!entry.is_expired_at(exp_ms - 1));
-        assert!(entry.is_expired_at(exp_ms));
+    fn bump_version_wraps_inside_23_bits() {
+        assert_eq!(Entry::bump_version(0x7F_FFFE), 0x7F_FFFF);
+        assert_eq!(Entry::bump_version(0x7F_FFFF), INITIAL_VERSION);
+        let mut e = Entry::new_string(Bytes::from_static(b"v"));
+        e.set_version(Entry::bump_version(0x7F_FFFF));
+        assert!(!e.has_expiry());
     }
 
     #[test]
@@ -886,10 +867,10 @@ mod tests {
     }
 
     #[test]
-    fn test_increment_version_wraps_24bit_skipping_zero() {
+    fn test_increment_version_wraps_23bit_skipping_zero() {
         let mut entry = Entry::new_string(Bytes::from_static(b"test"));
-        entry.set_version(0xFF_FFFF);
-        assert_eq!(entry.version(), 0xFF_FFFF);
+        entry.set_version(0x7F_FFFF);
+        assert_eq!(entry.version(), 0x7F_FFFF);
         // Wrap must skip 0: version 0 is the WATCH "key absent" sentinel, so a
         // live entry may never report it.
         entry.increment_version();
@@ -929,27 +910,16 @@ mod tests {
     }
 
     #[test]
-    fn test_is_expired_at() {
-        let now_ms = current_time_ms();
-
-        // Entry expired in the past
-        let past_ms = now_ms - 1000;
-        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), past_ms);
-        assert!(entry.is_expired_at(now_ms));
-
-        // Entry expires in the future
-        let future_ms = now_ms + 60_000;
-        let entry = Entry::new_string_with_expiry(Bytes::from_static(b"v"), future_ms);
-        assert!(!entry.is_expired_at(now_ms));
-
-        // Entry with no expiry
-        let entry = Entry::new_string(Bytes::from_static(b"v"));
-        assert!(!entry.is_expired_at(now_ms));
-    }
-
-    #[test]
     fn test_compact_entry_size() {
-        assert_eq!(std::mem::size_of::<CompactEntry>(), 32);
+        // 16 (CompactValue) + 4 (packed metadata) + 4 (LRU clock). The
+        // 8-byte `ttl_ms` that used to sit at offset 16 now lives in the
+        // Database's `expires` map, where only keys that HAVE a TTL pay for
+        // it — see the struct docs. This number is multiplied by
+        // `TOTAL_SLOTS` (60) in every segment, occupied or not.
+        assert_eq!(std::mem::size_of::<CompactEntry>(), 24);
+        // No 8-byte field left, so the type aligns to 4 and nothing is
+        // wasted on tail padding.
+        assert_eq!(std::mem::align_of::<CompactEntry>(), 4);
     }
 
     #[test]
