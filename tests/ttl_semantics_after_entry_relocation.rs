@@ -24,6 +24,9 @@ use moon::protocol::Frame;
 use moon::storage::Database;
 use moon::storage::entry::{Entry, current_time_ms};
 
+/// One value-mutating command, boxed so a table can hold several shapes.
+type Edit = Box<dyn Fn(&mut Database)>;
+
 fn bulk(b: &[u8]) -> Frame {
     Frame::BulkString(Bytes::copy_from_slice(b))
 }
@@ -247,7 +250,7 @@ fn getex_arms_and_clears_exactly_like_expire_and_persist() {
 fn in_place_value_edits_keep_the_exact_deadline() {
     // Every one of these rebuilds the entry from scratch, so each is its own
     // chance to drop the TTL now that it no longer rides inside the entry.
-    let cases: Vec<(&str, Box<dyn Fn(&mut Database)>)> = vec![
+    let cases: Vec<(&str, Edit)> = vec![
         (
             "APPEND",
             Box::new(|db: &mut Database| {
@@ -286,7 +289,7 @@ fn in_place_value_edits_keep_the_exact_deadline() {
             "INCR",
             Box::new(|db: &mut Database| {
                 string_cmd::incr(db, &args(&[b"k"]));
-            }) as Box<dyn Fn(&mut Database)>,
+            }) as Edit,
         ),
         (
             "INCRBYFLOAT",
@@ -317,7 +320,7 @@ fn rename_and_renamenx_carry_the_exact_deadline() {
             "RENAME",
             Box::new(|db: &mut Database| {
                 key_cmd::rename(db, &args(&[b"src", b"dst"]));
-            }) as Box<dyn Fn(&mut Database)>,
+            }) as Edit,
         ),
         (
             "RENAMENX",
