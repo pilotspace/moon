@@ -6,6 +6,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`storage`: numeric strings with leading zeros or a leading `+` are no longer
+  rewritten (data loss).** `SADD s 000000012345` followed by `SMEMBERS` returned
+  **`12345`** — the caller's bytes were gone, not merely reformatted. The same
+  applied to `HSET`/`HGET` and `RPUSH`/`LRANGE`, so it affected intsets, hash
+  listpacks and list listpacks alike. Root cause: `try_encode_as_integer`
+  (listpack) and `try_parse_i64` (SADD) used a bare `parse::<i64>()`, which
+  accepts `000000012345`, `+5` and `-0`, then stored the *parsed* value.
+  Redis stores an integer encoding only when the decimal rendering reproduces
+  the input exactly.
+
+  Two further sites were found by sweeping for the same predicate rather than
+  fixing only the two the report named:
+
+  - `SetRef::contains` parsed the **query** the same way, so
+    `SISMEMBER s 000000012345` returned `1` against a stored `12345` — a false
+    positive that survived fixing the insert path.
+  - `OBJECT ENCODING` reported `int` for `"000000012345"`, where Redis reports
+    `embstr`.
+
+  All five now route through `storage::numeric::canonical_i64`, which accepts a
+  value only if `itoa` renders it back byte-identically. Verified 13/13 against
+  a live `redis-server 8.6.1`, including guards that canonical values still take
+  the compact encodings (`OBJECT ENCODING` on a pure-integer set is still
+  `intset`). New `listpack_roundtrip` fuzz target, registered in **both**
+  matrices in `fuzz.yml`; it reproduces the bug against the pre-fix code in
+  ~1,500 execs (`"00"` → `"0"`) and runs 600k execs clean against the fix.
+
+  This was also a merge blocker for the `SADD` listpack work: a mixed set such
+  as `SADD z 000000012345 abcdefgh` is preserved on main only because it becomes
+  a hashtable, and routing it into a listpack would have converted a latent
+  encoding bug into a new data-loss path.
+
 ### Performance
 
 - **`storage`: the listpack scan no longer allocates once per element walked.**

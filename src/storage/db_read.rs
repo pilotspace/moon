@@ -265,12 +265,12 @@ impl<'a> SetRef<'a> {
             SetRef::Hash(s) => s.contains(member),
             SetRef::Listpack(lp) => lp.find(member).is_some(),
             SetRef::Intset(is) => {
-                if let Ok(s) = std::str::from_utf8(member) {
-                    if let Ok(v) = s.parse::<i64>() {
-                        return is.contains(v);
-                    }
+                // Canonical forms only: `000000012345` is a *different* member
+                // from `12345`, so it must not match one stored in the intset.
+                match crate::storage::numeric::canonical_i64(member) {
+                    Some(v) => is.contains(v),
+                    None => false,
                 }
-                false
             }
             SetRef::Owned(s) => s.contains(member),
         }
@@ -425,6 +425,30 @@ impl<'a> std::ops::Deref for StreamRef<'a> {
         match self {
             StreamRef::Borrowed(s) => s,
             StreamRef::Owned(s) => s,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `SetRef::contains` parsed the *query* with a bare `parse::<i64>()`, so
+    /// `SISMEMBER s 000000012345` matched a stored intset member 12345.
+    /// Redis treats the two as different members and answers 0.
+    #[test]
+    fn intset_contains_rejects_non_canonical_query() {
+        let mut is = Intset::new();
+        is.insert(12345);
+        let sref = SetRef::Intset(&is);
+
+        assert!(sref.contains(b"12345"), "exact member must be found");
+        for probe in [&b"000000012345"[..], b"+12345"] {
+            assert!(
+                !sref.contains(probe),
+                "{:?} must not match a stored 12345",
+                std::str::from_utf8(probe).unwrap()
+            );
         }
     }
 }

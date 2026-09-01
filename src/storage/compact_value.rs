@@ -95,12 +95,7 @@ impl<'a> RedisValueRef<'a> {
     pub fn encoding_name(&self) -> &'static str {
         match self {
             RedisValueRef::String(s) => {
-                if s.len() <= 20
-                    && std::str::from_utf8(s)
-                        .ok()
-                        .and_then(|ss| ss.parse::<i64>().ok())
-                        .is_some()
-                {
+                if crate::storage::numeric::canonical_i64(s).is_some() {
                     "int"
                 } else {
                     "embstr"

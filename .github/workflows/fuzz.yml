@@ -49,6 +49,7 @@ jobs:
       matrix:
         target:
           - resp_parse
+          - listpack_roundtrip
           - resp_parse_differential
           - listpack_decoder_differential
           - resp_parse_fused
@@ -131,6 +132,7 @@ jobs:
       matrix:
         target:
           - resp_parse
+          - listpack_roundtrip
           - resp_parse_differential
           - listpack_decoder_differential
           - resp_parse_fused
