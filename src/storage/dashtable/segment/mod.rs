@@ -34,10 +34,21 @@ pub use ops::home_buckets;
 pub const REGULAR_SLOTS: usize = 56;
 
 /// Number of stash (overflow) bucket slots per segment.
-pub const STASH_SLOTS: usize = 4;
+///
+/// Five, not four. `Segment` is `align(64)`, so its footprint is rounded up to
+/// a multiple of 64 regardless of how many slots it declares. With a 24-byte
+/// `CompactKey` and a 24-byte `CompactEntry` the 60-slot layout measured
+/// 2960 B of content inside a 3008 B footprint — 48 B of tail padding, which
+/// is exactly one more `(key, value)` pair. The 61st slot is therefore free:
+/// same 3008 B, one more place to put a key. `segment_wastes_no_tail_padding`
+/// pins that, and will fail if a future layout change re-opens the gap.
+pub const STASH_SLOTS: usize = 5;
 
-/// Total slots per segment: 56 regular + 4 stash = 60.
+/// Total slots per segment: 56 regular + 5 stash = 61.
+///
+/// Must stay `<= CTRL_BYTES` (64) — every slot needs a control byte.
 pub const TOTAL_SLOTS: usize = REGULAR_SLOTS + STASH_SLOTS;
+const _: () = assert!(TOTAL_SLOTS <= CTRL_BYTES);
 
 /// Number of control byte groups (each group = 16 bytes for SIMD).
 pub(super) const NUM_GROUPS: usize = 4;
