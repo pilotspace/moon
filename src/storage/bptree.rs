@@ -174,7 +174,16 @@ impl BPTree {
     pub fn new() -> Self {
         let mut tree = Self {
             root: NIL,
-            nodes: Vec::new(),
+            // Seed the exact capacity the root leaf needs. `Vec::push` on an
+            // empty vec jumps straight to `RawVec::MIN_NON_ZERO_CAP`, which is
+            // 4 for any element <= 1024 B — and `size_of::<Node>()` is 784,
+            // because the enum is sized by `InternalNode` even for a leaf. So
+            // the old `Vec::new()` made a one-leaf tree reserve 4 x 784 =
+            // 3,136 B (jemalloc's 3,584 class). Measured on GCE, that was the
+            // dominant term in moon's 3,360 B fixed per-zset cost against
+            // Redis's 87 B. Growth past one node still doubles through
+            // MIN_NON_ZERO_CAP, so large trees are unaffected.
+            nodes: Vec::with_capacity(1),
             free_list: Vec::new(),
             len: 0,
             height: 0,
@@ -1030,6 +1039,61 @@ enum InsertResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-node tree must reserve one node slot, not four.
+    ///
+    /// `Node` is an enum sized by its largest variant (`InternalNode`, 784 B),
+    /// so `size_of::<Node>()` is 784 even for a leaf (the tag fits its padding). `Vec::push` on an empty
+    /// vec jumps straight to `RawVec::MIN_NON_ZERO_CAP`, which is **4** for any
+    /// element <= 1024 B — so `BPTree::new()` was allocating 4 x 784 = 3,136 B
+    /// (jemalloc's 3,584 class) for a tree holding a single leaf. Measured on
+    /// GCE, that is the dominant term in moon's 3,360 B fixed per-zset cost
+    /// against Redis's 87 B.
+    #[test]
+    fn new_tree_reserves_one_node_slot_not_four() {
+        let tree = BPTree::new();
+        assert_eq!(
+            tree.nodes.len(),
+            1,
+            "a fresh tree holds exactly its root leaf"
+        );
+        assert_eq!(
+            tree.nodes.capacity(),
+            1,
+            "RawVec::MIN_NON_ZERO_CAP is 4 for elements <= 1024 B; \
+             a one-node tree must not reserve four (size_of::<Node>() = {})",
+            std::mem::size_of::<Node>()
+        );
+    }
+
+    /// The saving above is only real if `Node` stays under the 1024 B cutoff
+    /// *and* the growth path still works. Guards the capacity change against a
+    /// future edit that reintroduces over-reservation on the second node.
+    #[test]
+    fn node_storage_grows_without_over_reserving() {
+        let mut tree = BPTree::new();
+        // LEAF_CAPACITY entries still fit one leaf.
+        for i in 0..LEAF_CAPACITY {
+            assert!(tree.insert(OrderedFloat(i as f64), Bytes::from(format!("m{i}"))));
+        }
+        assert_eq!(tree.nodes.len(), 1, "one leaf holds LEAF_CAPACITY entries");
+        // One more forces a split: root becomes internal, two leaves.
+        assert!(tree.insert(OrderedFloat(LEAF_CAPACITY as f64), Bytes::from("split")));
+        assert_eq!(tree.len(), LEAF_CAPACITY + 1);
+        assert!(
+            tree.nodes.len() >= 3,
+            "split allocates a second leaf and an internal root"
+        );
+        assert!(
+            tree.nodes.capacity() <= tree.nodes.len().next_power_of_two(),
+            "growth must double from the seeded capacity, not leap ahead"
+        );
+        // and the tree is still correct after the split
+        for i in 0..LEAF_CAPACITY {
+            assert!(tree.contains(OrderedFloat(i as f64), format!("m{i}").as_bytes()));
+        }
+        assert!(tree.contains(OrderedFloat(LEAF_CAPACITY as f64), b"split"));
+    }
 
     #[test]
     fn test_insert_single() {
