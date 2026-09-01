@@ -6,6 +6,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.8] — 2026-09-01
+
+### Documentation
+
+- **BENCHMARK.md §2.14 — moon `--shards 8` vs Redis `io-threads 8` on all three
+  dimensions, and two retractions.** Throughput is a win at pipeline depth on
+  **both** architectures (aarch64 1.26x / 2.74x, x86_64 1.32x / 2.91x at p=8 / p=64,
+  8/8 families on x86) and a **tie at p=1** — the rig is bimodal for Redis as well as
+  for moon, so p=1 must be mode-matched and never averaged. CPU per op is a **tie**
+  (10.55 vs 11.33 us; moon is 6.9% lower but that sits inside Redis's own 11.9%
+  run-to-run spread, and the durable difference is stability: moon's CV is 2.0%).
+  **Memory is not won:** 0.94x at 8-byte values, **1.16x worse at 64-byte values**,
+  0.97x at 256-byte, **1.26x worse on idle RSS**.
+
+  Two earlier claims are retracted in-tree, with their raw data kept. (1) "moon gains
+  nothing from eight shards" (s8/s1 = 0.97x) was a harness artifact: `redis-benchmark
+  -t lpush|sadd|hset|zadd` drives ONE literal key and `-r` randomises the *element*,
+  not the key, so eight of twelve families were asked to parallelise a single key.
+  Re-run with explicit `__rand_int__` keys and a `DBSIZE >= 50000` guard proven to fire,
+  real scaling is 1.42x / 2.14x / 3.79x. (2) The "0.90x per-key memory win" measured
+  `redis-benchmark`'s default **3-byte** value: both legs sat *below their own
+  arithmetic floor*, which is impossible. Re-measured across 8/64/256-byte values under
+  a `key + value + 24` floor check — verified to reject both historical numbers before
+  being trusted — the win is a **band, not a trend**, and it exists only below the
+  12-byte `CompactValue` inline cutoff.
+
 ### Performance
 
 - **Ordinary keyspace commands skip the connection handler's name-dependent intercept
