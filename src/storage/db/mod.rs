@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 mod accessors;
 mod hash_ttl;
 mod kv_ops;
@@ -141,7 +139,7 @@ fn promote_to_hash_with_ttl(rv: &mut RedisValue) {
     match rv {
         RedisValue::HashWithTtl { .. } => {}
         RedisValue::Hash(_) => {
-            let placeholder = RedisValue::Hash(HashMap::new());
+            let placeholder = RedisValue::Hash(Box::default());
             let owned = std::mem::replace(rv, placeholder);
             let RedisValue::Hash(fields) = owned else {
                 unreachable!("matched Hash above");
@@ -150,15 +148,15 @@ fn promote_to_hash_with_ttl(rv: &mut RedisValue) {
             // yet").  hash_set_field_ttl will update min on the first insert.
             *rv = RedisValue::HashWithTtl {
                 fields,
-                ttls: HashMap::new(),
+                ttls: Box::default(),
                 min_expiry_ms: u64::MAX,
             };
         }
         RedisValue::HashListpack(lp) => {
             let fields = lp.to_hash_map();
             *rv = RedisValue::HashWithTtl {
-                fields,
-                ttls: HashMap::new(),
+                fields: Box::new(fields),
+                ttls: Box::default(),
                 min_expiry_ms: u64::MAX,
             };
         }
@@ -1073,6 +1071,7 @@ mod tests {
     use crate::storage::stream::Stream as StreamData;
     use bytes::Bytes;
     use ordered_float::OrderedFloat;
+    use std::collections::HashMap;
     use std::collections::{HashSet, VecDeque};
 
     /// `Database::set` uses its key exclusively by reference: `spill_inflight_forget`,
@@ -1889,8 +1888,8 @@ mod tests {
         let mut entry = Entry::new_string(Bytes::new());
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
             RedisValue::HashWithTtl {
-                fields,
-                ttls,
+                fields: Box::new(fields),
+                ttls: Box::new(ttls),
                 // Deliberately WRONG cached minimum: the index must not trust it.
                 min_expiry_ms: u64::MAX,
             },
@@ -1925,8 +1924,8 @@ mod tests {
         let mut entry = Entry::new_string(Bytes::new());
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
             RedisValue::HashWithTtl {
-                fields,
-                ttls,
+                fields: Box::new(fields),
+                ttls: Box::new(ttls),
                 min_expiry_ms: past,
             },
         );
@@ -2307,7 +2306,11 @@ mod tests {
         let mut fields = HashMap::new();
         fields.insert(Bytes::from_static(b"color"), Bytes::from_static(b"red"));
         fields.insert(Bytes::from_static(b"size"), Bytes::from_static(b"large"));
-        let mut db = db_with_spilled_value(tmp.path(), b"myhash", TestRedisValue::Hash(fields));
+        let mut db = db_with_spilled_value(
+            tmp.path(),
+            b"myhash",
+            TestRedisValue::Hash(Box::new(fields)),
+        );
 
         // Precondition: nothing hot yet, key only exists cold.
         assert!(!db.is_hot(b"myhash"), "precondition: key must be cold-only");
@@ -2336,7 +2339,8 @@ mod tests {
             Bytes::from_static(b"old_field"),
             Bytes::from_static(b"old_value"),
         );
-        let mut db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+        let mut db =
+            db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(Box::new(fields)));
 
         // HSET h new_field new_value
         {
@@ -2368,7 +2372,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut fields = HashMap::new();
         fields.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
-        let db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+        let db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(Box::new(fields)));
 
         let href = db
             .get_hash_ref_if_alive(b"h", 0)
@@ -2414,8 +2418,8 @@ mod tests {
         let mut entry = Entry::new_hash();
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
             RedisValue::HashWithTtl {
-                fields,
-                ttls,
+                fields: Box::new(fields),
+                ttls: Box::new(ttls),
                 min_expiry_ms: 1_000,
             },
         );
@@ -2470,7 +2474,8 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(Bytes::from_static(b"m1"));
         set.insert(Bytes::from_static(b"m2"));
-        let mut db = db_with_spilled_value(tmp.path(), b"myset", TestRedisValue::Set(set));
+        let mut db =
+            db_with_spilled_value(tmp.path(), b"myset", TestRedisValue::Set(Box::new(set)));
 
         let s = db.get_or_create_set(b"myset").unwrap();
         assert_eq!(
@@ -2486,7 +2491,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut set = HashSet::new();
         set.insert(Bytes::from_static(b"m"));
-        let db = db_with_spilled_value(tmp.path(), b"s", TestRedisValue::Set(set));
+        let db = db_with_spilled_value(tmp.path(), b"s", TestRedisValue::Set(Box::new(set)));
 
         let sref = db
             .get_set_ref_if_alive(b"s", 0)
@@ -2506,7 +2511,10 @@ mod tests {
         let mut db = db_with_spilled_value(
             tmp.path(),
             b"myzset",
-            TestRedisValue::SortedSetBPTree { tree, members },
+            TestRedisValue::SortedSetBPTree {
+                tree: Box::new(tree),
+                members: Box::new(members),
+            },
         );
 
         let (members, _tree) = db.get_or_create_sorted_set(b"myzset").unwrap();
@@ -2528,7 +2536,10 @@ mod tests {
         let db = db_with_spilled_value(
             tmp.path(),
             b"z",
-            TestRedisValue::SortedSetBPTree { tree, members },
+            TestRedisValue::SortedSetBPTree {
+                tree: Box::new(tree),
+                members: Box::new(members),
+            },
         );
 
         let zref = db
@@ -2590,7 +2601,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut fields = HashMap::new();
         fields.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
-        let mut db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+        let mut db =
+            db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(Box::new(fields)));
 
         assert!(db.exists(b"h"), "cold-only key must count as existing");
         // Cheap presence check must not have promoted the key into hot RAM.

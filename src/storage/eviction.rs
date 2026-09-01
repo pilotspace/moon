@@ -1621,7 +1621,7 @@ mod tests {
         map.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
         let mut entry = Entry::new_string(Bytes::new());
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
-            crate::storage::entry::RedisValue::Hash(map.clone()),
+            crate::storage::entry::RedisValue::Hash(Box::new(map.clone())),
         );
         let deadline = current_time_ms() + 60_000;
         entry.set_has_expiry(true);

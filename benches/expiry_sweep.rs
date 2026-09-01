@@ -75,8 +75,8 @@ fn field_ttl_db(n: u32, offset_ms: i64) -> Database {
         ttls.insert(Bytes::from_static(b"f"), deadline);
         let mut entry = Entry::new_string(Bytes::new());
         entry.value = CompactValue::from_redis_value(RedisValue::HashWithTtl {
-            fields,
-            ttls,
+            fields: Box::new(fields),
+            ttls: Box::new(ttls),
             min_expiry_ms: deadline,
         });
         db.set(&Bytes::from(format!("h{i}")), entry);

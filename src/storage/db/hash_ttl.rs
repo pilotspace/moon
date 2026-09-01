@@ -1,7 +1,6 @@
 //! HEXPIRE-family per-field TTL storage primitives (split from db/mod.rs).
 
 use bytes::Bytes;
-use std::collections::HashMap;
 
 use crate::protocol::Frame;
 use crate::storage::compact_value::RedisValueRef;
@@ -75,7 +74,7 @@ impl Database {
                     // Promote to Hash to delete (listpack delete-by-key is awkward).
                     let mut map = lp.to_hash_map();
                     map.remove(field);
-                    *rv = RedisValue::Hash(map);
+                    *rv = RedisValue::Hash(Box::new(map));
                     let after = rv.estimate_memory();
                     credit = before.saturating_sub(after);
                 }
@@ -446,7 +445,7 @@ impl Database {
                     } else if ttls.is_empty() && fields.is_empty() {
                         // Both maps empty — leave an empty Hash shell; caller
                         // must call cleanup_empty_hash to remove the key.
-                        *rv = RedisValue::Hash(HashMap::new());
+                        *rv = RedisValue::Hash(Box::default());
                     } else if old_ttl == Some(*min_expiry_ms) {
                         // Removed field held the minimum; recompute.
                         *min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);

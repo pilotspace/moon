@@ -816,7 +816,7 @@ mod tests {
         map.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
 
         let mut entry = Entry::new_string(Bytes::new());
-        entry.value = CompactValue::from_redis_value(RedisValue::Hash(map));
+        entry.value = CompactValue::from_redis_value(RedisValue::Hash(Box::new(map)));
 
         spill_to_datafile(
             shard_dir,

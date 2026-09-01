@@ -381,7 +381,7 @@ pub fn decode_value_body(
                 },
             };
             if ttl_count == 0 {
-                return Ok(RedisValue::Hash(map));
+                return Ok(RedisValue::Hash(Box::new(map)));
             }
             validate_count(cursor, ttl_count, 12, "hash_ttls")?;
             let mut ttls = HashMap::with_capacity(ttl_count);
@@ -393,8 +393,8 @@ pub fn decode_value_body(
             // min_expiry_ms is purely in-memory; recompute after decode.
             let min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
             Ok(RedisValue::HashWithTtl {
-                fields: map,
-                ttls,
+                fields: Box::new(map),
+                ttls: Box::new(ttls),
                 min_expiry_ms,
             })
         }
@@ -414,7 +414,7 @@ pub fn decode_value_body(
             for _ in 0..count {
                 set.insert(get_len_bytes(cursor, "set member")?);
             }
-            Ok(RedisValue::Set(set))
+            Ok(RedisValue::Set(Box::new(set)))
         }
         ValueType::ZSet => {
             let count = get_u32(cursor, "zset count")? as usize;
@@ -427,7 +427,10 @@ pub fn decode_value_body(
                 members.insert(member.clone(), score);
                 tree.insert(OrderedFloat(score), member);
             }
-            Ok(RedisValue::SortedSetBPTree { tree, members })
+            Ok(RedisValue::SortedSetBPTree {
+                tree: Box::new(tree),
+                members: Box::new(members),
+            })
         }
         ValueType::Stream => {
             let entry_count = get_u64(cursor, "stream entry count")? as usize;
@@ -857,7 +860,7 @@ mod tests {
         let mut buf = Vec::new();
         encode_value_body(&RedisValueRef::Hash(&map), &mut buf).unwrap();
         match decode(&buf, ValueType::Hash, HashTtlTrailer::Lenient) {
-            RedisValue::Hash(m) => assert_eq!(m, map),
+            RedisValue::Hash(m) => assert_eq!(*m, map),
             other => panic!("expected Hash, got {other:?}"),
         }
 
@@ -879,7 +882,7 @@ mod tests {
         )
         .unwrap();
         match decode(&buf, ValueType::ZSet, HashTtlTrailer::Lenient) {
-            RedisValue::SortedSetBPTree { members: m, .. } => assert_eq!(m, members),
+            RedisValue::SortedSetBPTree { members: m, .. } => assert_eq!(*m, members),
             other => panic!("expected SortedSetBPTree, got {other:?}"),
         }
     }

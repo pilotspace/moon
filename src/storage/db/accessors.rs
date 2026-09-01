@@ -322,7 +322,7 @@ impl Database {
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::SetIntset(is)) => {
                 let set = is.to_hash_set();
-                *entry.value.as_redis_value_mut().unwrap() = RedisValue::Set(set);
+                *entry.value.as_redis_value_mut().unwrap() = RedisValue::Set(Box::new(set));
             }
             _ => {}
         }
@@ -381,7 +381,7 @@ impl Database {
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::HashListpack(lp)) => {
                 let map = lp.to_hash_map();
-                *entry.value.as_redis_value_mut().unwrap() = RedisValue::Hash(map);
+                *entry.value.as_redis_value_mut().unwrap() = RedisValue::Hash(Box::new(map));
             }
             _ => {}
         }

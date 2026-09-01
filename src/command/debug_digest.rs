@@ -571,7 +571,7 @@ mod tests {
             .map(|s| Bytes::copy_from_slice(&s[..]))
             .collect();
         assert_eq!(
-            to_hex(&object_digest(&entry_of(RedisValue::Set(set)))),
+            to_hex(&object_digest(&entry_of(RedisValue::Set(Box::new(set))))),
             "0fd9977d57e46b1b9b87439f5ac5b338416ccc24"
         );
     }
@@ -583,7 +583,7 @@ mod tests {
         map.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
         map.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
         assert_eq!(
-            to_hex(&object_digest(&entry_of(RedisValue::Hash(map)))),
+            to_hex(&object_digest(&entry_of(RedisValue::Hash(Box::new(map))))),
             "047cc60ea73a34cde6d08a2721a4a26d19ee6570"
         );
     }
@@ -597,7 +597,10 @@ mod tests {
             m.insert(b.clone(), *sc);
             scores.insert((OrderedFloat(*sc), b), ());
         }
-        entry_of(RedisValue::SortedSet { members: m, scores })
+        entry_of(RedisValue::SortedSet {
+            members: Box::new(m),
+            scores: Box::new(scores),
+        })
     }
 
     #[test]
@@ -661,8 +664,16 @@ mod tests {
         accumulate_key(&mut acc, b"str_int", &string_entry("12345"));
         accumulate_key(&mut acc, b"str_exp", &exp);
         accumulate_key(&mut acc, b"mylist", &entry_of(RedisValue::List(list)));
-        accumulate_key(&mut acc, b"myset", &entry_of(RedisValue::Set(set)));
-        accumulate_key(&mut acc, b"myhash", &entry_of(RedisValue::Hash(map)));
+        accumulate_key(
+            &mut acc,
+            b"myset",
+            &entry_of(RedisValue::Set(Box::new(set))),
+        );
+        accumulate_key(
+            &mut acc,
+            b"myhash",
+            &entry_of(RedisValue::Hash(Box::new(map))),
+        );
         accumulate_key(&mut acc, b"myzset", &zset(&[(b"m1", 1.0), (b"m2", 2.0)]));
         accumulate_key(
             &mut acc,
