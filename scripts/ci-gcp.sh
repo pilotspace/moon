@@ -61,11 +61,12 @@ echo "gating $BRANCH @ ${SHA:0:10} on $HOST ($ZONE)"
 # ── Pre-flight: reachable, tooled, and enough disk ────────────────────────
 say "pre-flight"
 PRE="$(remote "
-  export PATH=\$HOME/.cargo/bin:\$PATH
+  export PATH=\$HOME/bin:\$HOME/.cargo/bin:\$PATH
   echo ARCH=\$(uname -m)
   echo KERNEL=\$(uname -r)
   echo CARGO=\$(command -v cargo || echo MISSING)
   echo REDIS=\$(command -v redis-server || echo MISSING)
+  echo REDISVER=\$(redis-server --version 2>/dev/null | sed -n 's/.*v=\([0-9.]*\).*/\1/p' || echo 0)
   echo MSRV=\$(ls \$HOME/.rustup/toolchains 2>/dev/null | grep -c 1.94.0)
   echo FREEGB=\$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
   echo URING=\$(grep -c io_uring /proc/kallsyms 2>/dev/null || echo 0)
@@ -75,10 +76,24 @@ if [ -z "$PRE" ] || ! grep -q '^ARCH=' <<<"$PRE"; then
   echo "    gcloud compute instances list  # is it up?"
   exit 4
 fi
-eval "$(grep -E '^(ARCH|KERNEL|CARGO|REDIS|MSRV|FREEGB|URING)=' <<<"$PRE")"
-echo "  arch=$ARCH kernel=$KERNEL free=${FREEGB}G io_uring_syms=$URING"
+eval "$(grep -E '^(ARCH|KERNEL|CARGO|REDIS|REDISVER|MSRV|FREEGB|URING)=' <<<"$PRE")"
+echo "  arch=$ARCH kernel=$KERNEL free=${FREEGB}G io_uring_syms=$URING oracle=${REDISVER:-none}"
 [ "$CARGO" = MISSING ] && { bad "no cargo on $HOST"; exit 2; }
 [ "$REDIS" = MISSING ] && { bad "no redis-server on $HOST — the compat leg has no oracle"; exit 2; }
+# VERSION, not mere presence. scripts/test-client-compat.sh refuses to run below
+# 7.4.0 and prints `ERR_NO_ORACLE` — which does not start with "error", so the
+# original log-grep verdict reported that refusal as a PASS. The compat leg had
+# therefore NEVER run on this host: every "client-compat ok (229s)" was the
+# release build finishing, followed by the harness declining to start.
+ORACLE_FLOOR=7.4.0
+if [ "$(printf '%s\n' "$ORACLE_FLOOR" "${REDISVER:-0}" | sort -V | head -1)" != "$ORACLE_FLOOR" ]; then
+  bad "oracle redis-server is ${REDISVER:-unknown}, below the $ORACLE_FLOOR floor the compat harness requires"
+  echo "    the leg cannot run; build one (Ubuntu 24.04 ships only 7.0.15):"
+  echo "      cd \$HOME/src && curl -fsSLO https://download.redis.io/releases/redis-7.4.1.tar.gz"
+  echo "      tar xzf redis-7.4.1.tar.gz && cd redis-7.4.1 && make -j\$(nproc) MALLOC=libc"
+  echo "      cp src/redis-server src/redis-cli src/redis-benchmark \$HOME/bin/"
+  exit 2
+fi
 [ "$ARCH" = x86_64 ] || { bad "expected x86_64, got $ARCH"; exit 2; }
 [ "${URING:-0}" -lt 10 ] && { bad "kernel reports no io_uring symbols — the point of this host is gone"; exit 2; }
 if [ "${FREEGB:-0}" -lt "$MIN_FREE_GB" ]; then
@@ -188,7 +203,7 @@ leg() { # leg <name> <remote-shell-command>
 # **96% of it DWARF**, and two legs plus a release build do not fit in 48G.
 # Dropping debuginfo changes no test outcome; it only makes a backtrace less
 # readable, and a failing leg is re-run locally anyway.
-ENVBASE="export PATH=\$HOME/.cargo/bin:\$PATH MOON_DISK_FREE_MIN_PCT=0 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0; cd $REPO_REMOTE;"
+ENVBASE="export PATH=\$HOME/bin:\$HOME/.cargo/bin:\$PATH MOON_DISK_FREE_MIN_PCT=0 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0; cd $REPO_REMOTE;"
 
 # 1. THE leg --native cannot produce: monoio with io_uring live.
 leg "monoio suite (io_uring LIVE — the shipped runtime)" \
