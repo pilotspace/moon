@@ -358,12 +358,10 @@ impl Listpack {
 
 /// Try to parse bytes as an integer for compact encoding.
 fn try_encode_as_integer(value: &[u8]) -> Option<i64> {
-    if value.is_empty() || value.len() > 20 {
-        return None;
-    }
-    // Must be valid UTF-8 digits (optionally with leading '-')
-    let s = std::str::from_utf8(value).ok()?;
-    s.parse::<i64>().ok()
+    // Canonical forms only. A bare `parse::<i64>()` accepts `000000012345`
+    // and `+5`, and storing the parsed value re-renders them as `12345` and
+    // `5` -- the caller's bytes are gone. See `storage::numeric`.
+    crate::storage::numeric::canonical_i64(value)
 }
 
 /// Create an entry for comparison from raw bytes.
@@ -782,6 +780,65 @@ impl<'a> Iterator for ListpackPairIter<'a> {
 impl Default for Listpack {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod noncanonical_tests {
+    use super::*;
+
+    /// A listpack must preserve the caller's bytes. `try_encode_as_integer`
+    /// used a bare `parse::<i64>()`, so `000000012345` was stored as the
+    /// integer 12345 and read back as "12345" -- silent data loss for
+    /// zero-padded IDs, account numbers, zip codes.
+    #[test]
+    fn listpack_preserves_non_canonical_numeric_strings() {
+        let cases: [&[u8]; 6] = [b"000000012345", b"007", b"+5", b"-0", b"00", b"0000"];
+        for input in cases {
+            let mut lp = Listpack::new();
+            lp.push_back(input);
+            let got = lp.get_at(0).expect("entry present").to_bytes();
+            assert_eq!(
+                got.as_ref(),
+                input,
+                "listpack rewrote {:?} as {:?}",
+                std::str::from_utf8(input).unwrap(),
+                String::from_utf8_lossy(got.as_ref())
+            );
+        }
+    }
+
+    /// Canonical integers must still take the compact integer encoding --
+    /// the fix must not disable the optimisation it is protecting.
+    #[test]
+    fn listpack_still_integer_encodes_canonical_values() {
+        for input in [&b"0"[..], b"7", b"12345", b"-42"] {
+            assert!(
+                try_encode_as_integer(input).is_some(),
+                "canonical {:?} must still encode as an integer",
+                std::str::from_utf8(input).unwrap()
+            );
+        }
+        for input in [&b"000000012345"[..], b"+5", b"-0"] {
+            assert!(
+                try_encode_as_integer(input).is_none(),
+                "non-canonical {:?} must NOT encode as an integer",
+                std::str::from_utf8(input).unwrap()
+            );
+        }
+    }
+
+    /// Lookup must agree with storage: a non-canonical form is a *different*
+    /// member, so finding it must not match a stored canonical one.
+    #[test]
+    fn listpack_find_does_not_match_across_canonical_forms() {
+        let mut lp = Listpack::new();
+        lp.push_back(b"12345");
+        assert!(lp.find(b"12345").is_some(), "exact member must be found");
+        assert!(
+            lp.find(b"000000012345").is_none(),
+            "000000012345 must not match a stored 12345"
+        );
     }
 }
 

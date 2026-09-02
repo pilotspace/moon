@@ -20,7 +20,9 @@ const INTSET_MAX_ENTRIES: usize = 512;
 
 /// Try to parse a byte slice as an i64.
 fn try_parse_i64(b: &[u8]) -> Option<i64> {
-    std::str::from_utf8(b).ok()?.parse::<i64>().ok()
+    // Canonical forms only -- a member that does not render back to the
+    // caller's exact bytes must not go into an intset. See `storage::numeric`.
+    crate::storage::numeric::canonical_i64(b)
 }
 
 /// SADD command handler: add members to a set.
