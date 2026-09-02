@@ -47,7 +47,9 @@ The SET absolute number can differ 3-4× between methodologies. Only strict-vs-s
 
 | Metric | moon vs Redis | Conditions |
 |--------|:-------------------:|------------|
-| **Scope caveat (read first)** | **GET/SET only** | at p>=8 every OTHER command family runs **0.40-0.67x Redis** — §2.12 |
+| **Scope caveat (read first)** | **GET/SET only** | at p>=8 every OTHER command family runs **0.40-0.67x Redis** at `--shards 1` — §2.12 |
+| **Key cardinality caveat (read second)** | **swings ~2x** | container benchmarks (`-t sadd/hset/lpush`) use ONE key even with `-r`; HSET is 0.41x hot / **1.13x** distributed — §2.15 |
+| **Scaling: moon `--shards N` vs Redis `io-threads N`** | **2.5x vs flat-then-collapse** | distributed keys: moon 367K→917K (N=1→4); Redis 831K→915K→**401K** at io8 — §2.15.1 |
 | **s8 vs io-threads 8: throughput p=8 / p=64** | **1.26-1.32x / 2.74-2.91x** | ARM **and** x86, 8 families, uniform keys, §2.14 |
 | **s8 vs io-threads 8: throughput p=1** | **tie** (0.99x ARM, 0.93x x86) | both engines bimodal — mode-match, never average, §2.14 |
 | **s8 vs io-threads 8: CPU per op** | **tie** (10.55 vs 11.33 us) | inside Redis's 11.9% spread; moon 6x more stable, §2.14 |
@@ -721,6 +723,88 @@ that held while these numbers were produced; the six legs above attested at
 0.279-0.337. (A separate bug found the same way: the counters live in `INFO
 stats`, not `INFO threads`, and reading the wrong section yields a confident
 0.000 rather than an error.)
+
+---
+
+### 2.15 2026-09-02 — the container-command benchmarks measure ONE key, and that inverted a published conclusion
+
+§2.7.1 warns that `redis-benchmark -t SET` without `-r` writes every request to
+one key. **The container-command tests are worse: `-t sadd`, `-t hset`,
+`-t lpush` and `-t zadd` write to a single fixed key (`myset`, `myhash`,
+`mylist`, `myzset`) EVEN WITH `-r`.** `-r` randomizes only the member or field.
+Verified by dumping the keyspace after `-t sadd,hset,lpush,set -r 100000`:
+1,987 distinct `key:N`, and exactly one `myset` / `myhash` / `mylist`.
+
+This matters more here than for any single-threaded server: one key lives on one
+shard, so a `--shards 4` run measures thread-per-core with three of four cores
+structurally idle. A 19-command sweep built on `-t` reported moon at geomean
+**0.55x** Redis `io-threads 4` and that was published as a general loss. Running
+the *same commands* with the key randomized reverses it:
+
+| command | hot key (one key) | distributed key (`-r 100000`) |
+|---|---:|---:|
+| `SADD` | 0.57x | **1.10x** |
+| `HSET` | 0.41x | **1.13x** |
+| `LPUSH` | 0.49x | **1.09x** |
+
+Same binaries, same server config, same request count — only the key cardinality
+differs, and it moves the ratio ~2x. Report both, or neither.
+
+#### 2.15.1 The hot-key deficit is per-shard, not a sharding cost
+
+Sweeping both engines across N on a single hot key separates the two
+explanations. moon `--shards N` vs Redis `--io-threads N`, `-n 400000 -c 50
+-P 16`, GCE c3-standard-8:
+
+| N | moon hot | moon distributed | Redis hot | Redis distributed |
+|---|---:|---:|---:|---:|
+| 1 | 509,554 | 367,647 | 945,626 | 831,601 |
+| 2 | 507,614 | 641,026 | 1,055,409 | 907,029 |
+| 4 | 493,827 | **917,431** | 943,396 | 915,332 |
+| 8 | 458,190 | 710,480 | 460,830 | **401,606** |
+
+Two conclusions, and they point in opposite directions:
+
+1. **Thread-per-core converts cores into throughput and io-threads does not.**
+   On distributed keys moon scales 367K -> 917K (**2.5x**) from 1 to 4 shards.
+   Redis goes 831K -> 915K -> **401K**, i.e. ~10% at io2 and a **55% collapse**
+   at io8. moon `--shards 4` (917K) edges Redis's *best* configuration (io4,
+   915K). Comparing only at N=8, as §2.14 does, hides that Redis's io8 is far
+   below its own optimum — always sweep N for both engines.
+2. **The hot-key deficit is already there at `--shards 1`** (509K vs 945K =
+   0.54x). Sharding adds only the last ~10%. Per-thread CPU from
+   `/proc/<pid>/task/*/stat` over 600k HSET: moon shard-0 **2.250 us/op** vs
+   Redis **1.033 us/op**, with shard-0 burning 1.35s of a 1.36s run (99.3%
+   saturated, 11 of moon's 13 threads idle). It is per-op command-path work,
+   with no I/O-plane or cross-shard component.
+
+So §2.12's "every other command family runs 0.40-0.67x" is real but is a
+**single-shard command-path** result, not evidence against thread-per-core.
+
+#### 2.15.2 Benchmark traps — read before adding a row
+
+Each of these produced a wrong published number in this repository:
+
+- **`-t sadd|hset|lpush|zadd` ignore `-r` for the KEY.** See above. Spell the
+  command out: `redis-benchmark -r 100000 HSET h:__rand_int__ f:__rand_int__ v`.
+- **`-r` must PRECEDE the command.** `redis-benchmark ... HSET k f v -r 100000`
+  passes `-r` and `100000` as two extra HSET *arguments*; randomization silently
+  never happens. The tell is a flat curve across `--shards` plus an
+  `OBJECT ENCODING` lookup that finds no key.
+- **`__rand_int__` expands to a 12-digit zero-padded number,** so the keys are
+  `h:000000000036`, not `h:36`. Probing `h:1` afterwards finds nothing.
+- **redis-benchmark 8.x separates progress lines with `\r`.** Pipe through
+  `tr '\r' '\n'` before grepping, and match the RPS by position — `awk
+  '{print $2}'` on the summary line yields the literal string `summary:`.
+- **Grep the summary line, not the progress line.** `SPOP: rps=0.0` appears in
+  progress output; an A/B that parsed it reported 0.0 for every engine
+  *including Redis* before the parser was fixed.
+- **Pin `MOON_BIN`.** `find_moon_binary()` falls back to `target/release/moon`,
+  whose provenance is unknown; a green run against a stale binary has happened.
+- **Compare against moon's own baseline, not only Redis.** The listpack
+  regression (#801) was found because moon's listpack `HSET` was slower than
+  moon's *own hashtable* at every size — the Redis comparison alone showed only
+  "slower", not "backwards".
 
 ---
 
