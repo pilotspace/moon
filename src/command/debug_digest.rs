@@ -479,7 +479,7 @@ mod tests {
     use super::*;
     use crate::storage::entry::RedisValue;
     use bytes::Bytes;
-    use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+    use std::collections::{BTreeMap, HashMap, VecDeque};
 
     /// Every expectation below is a literal captured from a LIVE
     /// redis-server 8.6.1 (`--enable-debug-command yes`), not from moon's own
@@ -566,7 +566,7 @@ mod tests {
     fn a_set_digest_matches_redis_and_ignores_order() {
         // SADD myset x y z  -- HashSet iteration order is arbitrary, which is
         // the point: a set digest must not depend on it.
-        let set: HashSet<Bytes> = [b"x", b"y", b"z"]
+        let set: crate::storage::entry::SetValue = [b"x", b"y", b"z"]
             .iter()
             .map(|s| Bytes::copy_from_slice(&s[..]))
             .collect();
@@ -647,7 +647,7 @@ mod tests {
             .iter()
             .map(|s| Bytes::copy_from_slice(&s[..]))
             .collect();
-        let set: HashSet<Bytes> = [b"x", b"y", b"z"]
+        let set: crate::storage::entry::SetValue = [b"x", b"y", b"z"]
             .iter()
             .map(|s| Bytes::copy_from_slice(&s[..]))
             .collect();

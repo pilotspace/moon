@@ -754,7 +754,7 @@ mod tests {
     #[test]
     fn test_sort_set() {
         let mut db = Database::new();
-        let mut s = std::collections::HashSet::new();
+        let mut s = crate::storage::entry::SetValue::new();
         s.insert(Bytes::from_static(b"3"));
         s.insert(Bytes::from_static(b"1"));
         s.insert(Bytes::from_static(b"2"));

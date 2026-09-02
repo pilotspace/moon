@@ -148,7 +148,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     serialize::serialize(&Frame::Array(args.into()), &mut buf);
                 }
                 RedisValueRef::SetListpack(lp) => {
-                    let set = lp.to_hash_set();
+                    let set = lp.to_set_value();
                     if set.is_empty() {
                         continue;
                     }
@@ -162,7 +162,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     serialize::serialize(&Frame::Array(args.into()), &mut buf);
                 }
                 RedisValueRef::SetIntset(is) => {
-                    let set = is.to_hash_set();
+                    let set = is.to_set_value();
                     if set.is_empty() {
                         continue;
                     }

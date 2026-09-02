@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
 use rand::RngExt;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::bptree::BPTree;
@@ -160,6 +160,21 @@ impl Default for CachedClock {
     }
 }
 
+/// The unordered-set value type behind `SET` keys.
+///
+/// `IndexSet`, not `HashSet`, for one reason: `SPOP` and `SRANDMEMBER` must
+/// pick a member in O(1). A `HashSet` exposes no way to address the i-th
+/// element, so both commands walked the whole set -- `SRANDMEMBER` on a
+/// 100,000-member set ran at 506 ops/s against Redis's 129,032, because Redis
+/// samples a random bucket (`dictGetRandomKey`) while moon materialized every
+/// member to choose one. `IndexSet::get_index` makes that a single lookup.
+///
+/// The cost of the choice is that removal must use `swap_remove` (O(1),
+/// reorders) rather than `shift_remove` (O(n), order-preserving). Redis set
+/// iteration order is unspecified, so reordering is not observable behaviour --
+/// but it does mean nothing may depend on set iteration order.
+pub type SetValue = indexmap::IndexSet<Bytes>;
+
 /// The type of value stored in a Redis key.
 #[derive(Debug, Clone)]
 pub enum RedisValue {
@@ -195,7 +210,7 @@ pub enum RedisValue {
         min_expiry_ms: u64,
     },
     List(VecDeque<Bytes>),
-    Set(HashSet<Bytes>),
+    Set(SetValue),
     SortedSet {
         members: HashMap<Bytes, f64>,
         scores: BTreeMap<(OrderedFloat<f64>, Bytes), ()>,
@@ -544,7 +559,7 @@ impl CompactEntry {
     /// Create a new set entry with an empty HashSet.
     pub fn new_set() -> CompactEntry {
         CompactEntry {
-            value: CompactValue::from_redis_value(RedisValue::Set(HashSet::new())),
+            value: CompactValue::from_redis_value(RedisValue::Set(SetValue::new())),
             ttl_ms: 0,
             metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
             last_access_secs: current_secs(),
@@ -804,7 +819,7 @@ mod tests {
         );
         assert_eq!(RedisValue::Hash(HashMap::new()).type_name(), "hash");
         assert_eq!(RedisValue::List(VecDeque::new()).type_name(), "list");
-        assert_eq!(RedisValue::Set(HashSet::new()).type_name(), "set");
+        assert_eq!(RedisValue::Set(SetValue::new()).type_name(), "set");
         assert_eq!(
             RedisValue::SortedSet {
                 members: HashMap::new(),
@@ -834,7 +849,7 @@ mod tests {
     fn test_estimate_memory_empty() {
         assert_eq!(RedisValue::Hash(HashMap::new()).estimate_memory(), 0);
         assert_eq!(RedisValue::List(VecDeque::new()).estimate_memory(), 0);
-        assert_eq!(RedisValue::Set(HashSet::new()).estimate_memory(), 0);
+        assert_eq!(RedisValue::Set(SetValue::new()).estimate_memory(), 0);
     }
 
     #[test]

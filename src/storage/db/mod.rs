@@ -962,7 +962,7 @@ mod tests {
     use crate::storage::stream::Stream as StreamData;
     use bytes::Bytes;
     use ordered_float::OrderedFloat;
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::VecDeque;
 
     /// `Database::set` uses its key exclusively by reference: `spill_inflight_forget`,
     /// `entry_overhead`, `hash_expiry_index_note_value`, `CompactKey::from(key.as_ref())`,
@@ -2164,7 +2164,7 @@ mod tests {
     #[test]
     fn test_get_or_create_set_promotes_cold_instead_of_fabricating() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut set = HashSet::new();
+        let mut set = crate::storage::entry::SetValue::new();
         set.insert(Bytes::from_static(b"m1"));
         set.insert(Bytes::from_static(b"m2"));
         let mut db = db_with_spilled_value(tmp.path(), b"myset", TestRedisValue::Set(set));
@@ -2181,7 +2181,7 @@ mod tests {
     #[test]
     fn test_get_set_ref_if_alive_sees_cold_set_without_promoting() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut set = HashSet::new();
+        let mut set = crate::storage::entry::SetValue::new();
         set.insert(Bytes::from_static(b"m"));
         let db = db_with_spilled_value(tmp.path(), b"s", TestRedisValue::Set(set));
 

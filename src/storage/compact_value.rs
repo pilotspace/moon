@@ -11,7 +11,7 @@
 
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 
 use super::bptree::BPTree;
@@ -72,7 +72,7 @@ pub enum RedisValueRef<'a> {
         min_expiry_ms: u64,
     },
     List(&'a VecDeque<Bytes>),
-    Set(&'a HashSet<Bytes>),
+    Set(&'a crate::storage::entry::SetValue),
     SortedSet {
         members: &'a HashMap<Bytes, f64>,
         scores: &'a BTreeMap<(OrderedFloat<f64>, Bytes), ()>,
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn test_from_redis_value_set() {
-        let mut set = HashSet::new();
+        let mut set = crate::storage::entry::SetValue::new();
         set.insert(Bytes::from_static(b"x"));
         let rv = RedisValue::Set(set);
         let cv = CompactValue::from_redis_value(rv);

@@ -1794,6 +1794,7 @@ dependencies = [
  "hyper",
  "hyper-tungstenite",
  "hyper-util",
+ "indexmap",
  "io-uring 0.6.4",
  "io-uring 0.7.14",
  "itoa",

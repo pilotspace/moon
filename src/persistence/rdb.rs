@@ -10,7 +10,7 @@
 //! | `write_entry`, `write_bytes`, `read_bytes`, `read_u32` | **should-recover** (`Result<_, MoonError>`) | I/O helpers |
 //! | All `unwrap()` calls (54) | **test-only** | Only appear in `#[cfg(test)]` module |
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
@@ -647,7 +647,7 @@ fn read_entry_zero_copy(
         TYPE_SET => {
             let count = read_u32(cursor)? as usize;
             validate_count(cursor, count, 4, "set")?;
-            let mut set = HashSet::with_capacity(count);
+            let mut set = crate::storage::entry::SetValue::with_capacity(count);
             for _ in 0..count {
                 set.insert(read_bytes(cursor)?);
             }

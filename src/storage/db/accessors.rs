@@ -1,7 +1,7 @@
 //! Typed accessors: W5 ValueKind/OwnedKind generics, per-type delegators, read-only refs, blocking-hook helpers, streams (split from db/mod.rs).
 
 use bytes::Bytes;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use crate::protocol::Frame;
 use crate::storage::bptree::BPTree;
@@ -250,7 +250,10 @@ impl Database {
 
     /// Get or create a set entry. Returns mutable ref to inner HashSet.
     /// New keys start with full encoding. Upgrades compact encodings on access.
-    pub fn get_or_create_set(&mut self, key: &[u8]) -> Result<&mut HashSet<Bytes>, Frame> {
+    pub fn get_or_create_set(
+        &mut self,
+        key: &[u8],
+    ) -> Result<&mut crate::storage::entry::SetValue, Frame> {
         self.get_or_create::<db_kind::SetKind>(key)
     }
 
@@ -259,7 +262,10 @@ impl Database {
     ///
     /// Promotes a cold-spilled set back to hot RAM on miss (P0
     /// cold-collection-visibility fix) — this accessor takes `&mut self`.
-    pub fn get_set(&mut self, key: &[u8]) -> Result<Option<&HashSet<Bytes>>, Frame> {
+    pub fn get_set(
+        &mut self,
+        key: &[u8],
+    ) -> Result<Option<&crate::storage::entry::SetValue>, Frame> {
         self.get_promoted::<db_kind::SetKind>(key)
     }
 
@@ -301,11 +307,11 @@ impl Database {
     /// Upgrade an intset entry to a full HashSet and return mutable ref.
     /// Panics if the key doesn't exist or isn't a SetIntset.
     #[allow(clippy::unwrap_used)] // caller guarantees key exists and is SetIntset; upgrade is infallible
-    pub fn upgrade_intset_to_set(&mut self, key: &[u8]) -> &mut HashSet<Bytes> {
+    pub fn upgrade_intset_to_set(&mut self, key: &[u8]) -> &mut crate::storage::entry::SetValue {
         let entry = self.data.get_mut(key).unwrap();
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::SetIntset(is)) => {
-                let set = is.to_hash_set();
+                let set = is.to_set_value();
                 *entry.value.as_redis_value_mut().unwrap() = RedisValue::Set(set);
             }
             _ => {}

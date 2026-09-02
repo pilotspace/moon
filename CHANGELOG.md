@@ -75,6 +75,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   walked. The 192-field row is the negative control: once the hash promotes and
   no listpack scan runs, the change does nothing. `SET`/`GET`/`INCR`/`LPUSH`/
   `SADD` are unchanged at 0.99-1.02x.
+- **`storage`: `SPOP` and `SRANDMEMBER` become O(1) in set size.**
+  `SRANDMEMBER` on a 100,000-member set ran at **506 ops/s** against Redis's
+  129,032 — 255x slower, and perfectly linear in set size. Both dispatch paths
+  were O(n): the mutable one deep-cloned the entire set (`s.clone()`) and then
+  collected every member into a `Vec` to choose one; the read-only one skipped
+  the clone but called `SetRef::members()`, which clones every member anyway.
+
+  Redis is flat at any size because `dictGetRandomKey` samples a random bucket.
+  `std::collections::HashSet` exposes no way to address the i-th element, so
+  the representation had to change: `RedisValue::Set` is now
+  `SetValue = IndexSet<Bytes>`, and a new `SetRef::nth(idx)` addresses a member
+  on all four set representations without materializing any of them.
+
+  Measured on GCE x86_64 (`--shards 1`, `redis-benchmark -n 20000 -c 20`),
+  interleaved A/B against the parent commit:
+
+  | set size | before | after | speedup | vs redis 7.4.2 |
+  |---:|---:|---:|---:|---:|
+  | 100 | 125,000 | 125,000 | 1.0x | 0.97x |
+  | 1,000 | 39,526 | 125,786 | 3.2x | 0.97x |
+  | 10,000 | 5,057 | 125,000 | **24.7x** | 0.97x |
+  | 100,000 | 505 | 126,582 | **250.9x** | **0.97x** |
+
+  Throughput is now flat in set size, as Redis's is. `SPOP` improves **27.1x**
+  at 10,000 members (1.05x Redis) and **272.4x** at 100,000 (0.83x). Ordinary
+  set operations are unchanged: `SADD` 1.01x, `SISMEMBER` 0.99x, `SREM` 1.02x,
+  `SCARD` 0.99x.
+
+  **Cost, disclosed:** `IndexSet` keeps an entry vector *plus* an index table
+  where `HashSet` keeps one table, so set memory rises **+8.6%** on large sets
+  (95.7 -> 103.9 B/member, 20 x 50,000) and **+12%** on many small ones
+  (766.1 -> 858.5 B/key, 200,000 x 5). Once the set-listpack encoding of #787
+  lands, sets up to 128 members will not use this representation at all,
+  confining the cost to large sets — which is exactly where the 250x matters.
+
+  Removal moves to `swap_remove` (O(1), reorders) rather than `shift_remove`
+  (O(n), order-preserving). Redis set iteration order is unspecified, and all
+  5,136 lib tests pass, so nothing depended on it.
 
 - **`storage`: an empty `DashTable` no longer reserves 16 segments to hold one.**
   `SegmentSlab::new` seeded its first slab at 16 segments, so `DashTable::new`

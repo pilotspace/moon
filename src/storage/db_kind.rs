@@ -13,8 +13,9 @@
 //! every `K` is a concrete marker resolved at compile time, so the generated
 //! code is identical to the hand-written originals.
 
+use crate::storage::entry::SetValue;
 use bytes::Bytes;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use super::bptree::BPTree;
 use super::compact_value::{CompactValue, RedisValueRef};
@@ -228,8 +229,8 @@ impl ValueKind for SetKind {
 }
 
 impl OwnedKind for SetKind {
-    type Mut<'a> = &'a mut HashSet<Bytes>;
-    type Shared<'a> = &'a HashSet<Bytes>;
+    type Mut<'a> = &'a mut SetValue;
+    type Shared<'a> = &'a SetValue;
 
     fn new_entry() -> Entry {
         Entry::new_set()
@@ -239,11 +240,11 @@ impl OwnedKind for SetKind {
         if let Some(v) = entry.value.as_redis_value_mut() {
             match v {
                 RedisValue::SetListpack(lp) => {
-                    let set = lp.to_hash_set();
+                    let set = lp.to_set_value();
                     *v = RedisValue::Set(set);
                 }
                 RedisValue::SetIntset(is) => {
-                    let set = is.to_hash_set();
+                    let set = is.to_set_value();
                     *v = RedisValue::Set(set);
                 }
                 _ => {}

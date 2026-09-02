@@ -8,7 +8,7 @@
 //!
 //! CRC64 uses the Jones polynomial (0xAD93D23594C935A9), matching Redis source.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{Cursor, Read};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -830,7 +830,7 @@ pub(crate) fn read_rdb_entry(
         RDB_TYPE_SET => {
             let (count, _) = read_length(cursor)?;
             check_alloc_bound(cursor, count, 1, "set")?;
-            let mut set = HashSet::with_capacity(count as usize);
+            let mut set = crate::storage::entry::SetValue::with_capacity(count as usize);
             for _ in 0..count {
                 let member = read_redis_string(cursor)?;
                 set.insert(Bytes::from(member));
