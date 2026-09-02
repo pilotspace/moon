@@ -19,12 +19,29 @@
 //!     `ACL WHOAMI`, which Redis shows) and Redis feeds the whole EVAL family
 //!     despite flagging it `skip_monitor`. See `mon20`, which drives the
 //!     measured table row by row.
+//!
+//! # Reading the feed under load, deterministically
+//!
+//! Every socket read in this file waits on the PROTOCOL, never the clock.
+//! `frame_len` bounds a RESP reply/feed-line exactly, so `read_one_frame`
+//! returns the instant the promised bytes are complete, however long that
+//! takes — bounded only by `CEILING`, which exists solely to convert a
+//! genuine hang into a failure. The one thing that cannot be read off the
+//! protocol is an ABSENCE (a command that must never appear): there is no
+//! frame to wait for when nothing is coming. Those checks either wait for a
+//! `feed_barrier` — a fresh, distinguishable command dispatched only after
+//! everything under test has already been confirmed processed, whose own
+//! feed line proves nothing earlier is still in flight — or, for a
+//! connection that can never receive anything again (unattached/detached),
+//! bound the wait with `ABSENCE_GRACE` and accept "nothing arrived" as the
+//! passing outcome. See the doc comments on each helper below.
 
 mod common;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 struct Moon {
@@ -114,16 +131,107 @@ fn spawn_moon_opts(shards: &str, extra: &[&str]) -> Moon {
     panic!("moon never became ready on port {port} ({status})\n--- stderr ---\n{log}");
 }
 
-struct Conn(TcpStream);
+/// Ceiling for every deterministic wait in this file that expects a REAL,
+/// guaranteed event to eventually happen (a reply, a feed line). It exists
+/// ONLY to convert a genuine hang into a test failure — never to signal "no
+/// more data is coming", which the RESP frame parser (`frame_len`) already
+/// determines exactly. Sized to absorb a fully loaded 8-vCPU CI host running
+/// this suite alongside the rest of the monoio leg — the scenario this suite
+/// was seen to flake under, where the previous 600ms
+/// read-timeout-as-completion-signal treated a reply that was merely LATE as
+/// one that would never arrive.
+const CEILING: Duration = Duration::from_secs(20);
+
+/// Window for a check that expects NOTHING to ever arrive on a connection
+/// that is unattached or has been detached. There is no positive event to
+/// wait for in that case — absence is what's under test — so this is a
+/// deliberate, generous, but bounded compromise: far larger than the
+/// loopback delivery time it needs to cover, smaller than `CEILING` because
+/// there is no slow-but-real event behind it to wait out.
+const ABSENCE_GRACE: Duration = Duration::from_secs(3);
+
+/// Monotonically increasing token so concurrent tests (and repeated barriers
+/// within one test) never collide on a barrier's marker text.
+static BARRIER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The length, in bytes, of one complete RESP frame starting at `buf[0]`, or
+/// `None` if `buf` does not yet hold a complete frame. This is the single
+/// source of truth for "have the promised bytes arrived" everywhere in this
+/// file — every read loop below stops IMMEDIATELY once this returns `Some`,
+/// and never infers completion from a `read()` timing out. Recurses through
+/// containers (arrays/maps/sets/pushes) so a nested reply (e.g. `COMMAND
+/// INFO`) is bounded exactly, not guessed at.
+fn frame_len(buf: &[u8]) -> Option<usize> {
+    fn line_end(buf: &[u8], from: usize) -> Option<usize> {
+        buf.get(from..)?
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|p| from + p)
+    }
+    fn at(buf: &[u8], pos: usize) -> Option<usize> {
+        let tag = *buf.get(pos)?;
+        match tag {
+            // No length field: the line itself IS the whole frame.
+            b'+' | b'-' | b':' | b'_' | b'#' | b',' | b'(' => Some(line_end(buf, pos + 1)? + 2),
+            // Length-prefixed byte string: bulk string, bulk error, verbatim
+            // string. A negative length is a null with no body.
+            b'$' | b'!' | b'=' => {
+                let end = line_end(buf, pos + 1)?;
+                let len: i64 = std::str::from_utf8(&buf[pos + 1..end]).ok()?.parse().ok()?;
+                if len < 0 {
+                    return Some(end + 2);
+                }
+                let body_end = end + 2 + len as usize;
+                if buf.len() < body_end + 2 {
+                    return None;
+                }
+                Some(body_end + 2)
+            }
+            // Length-prefixed container: array, map (2N elements), set, push.
+            // A negative count is a null with no elements.
+            b'*' | b'%' | b'~' | b'>' => {
+                let end = line_end(buf, pos + 1)?;
+                let count: i64 = std::str::from_utf8(&buf[pos + 1..end]).ok()?.parse().ok()?;
+                let mut cursor = end + 2;
+                if count < 0 {
+                    return Some(cursor);
+                }
+                let elems = if tag == b'%' { count * 2 } else { count };
+                for _ in 0..elems {
+                    cursor = at(buf, cursor)?;
+                }
+                Some(cursor)
+            }
+            _ => None,
+        }
+    }
+    at(buf, 0)
+}
+
+struct Conn {
+    sock: TcpStream,
+    /// Bytes already read off the socket but not yet consumed as a complete
+    /// frame — carried across calls so a frame split across two `read()`s
+    /// (or a monitor line that arrives bundled with the next one) is never
+    /// mistaken for "nothing more coming".
+    carry: Vec<u8>,
+}
 
 impl Conn {
     fn open(port: u16) -> Self {
-        let s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        s.set_read_timeout(Some(Duration::from_millis(600)))
+        let sock = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        // Short: this is a POLLING granularity for the deadline-driven loops
+        // below, never the signal that a reply is complete. A read() timing
+        // out here just means "check the deadline and try again" — the
+        // frame parser (`frame_len`) is what decides "done".
+        sock.set_read_timeout(Some(Duration::from_millis(250)))
             .expect("read timeout");
-        s.set_write_timeout(Some(Duration::from_secs(5)))
+        sock.set_write_timeout(Some(Duration::from_secs(5)))
             .expect("write timeout");
-        Conn(s)
+        Conn {
+            sock,
+            carry: Vec::new(),
+        }
     }
 
     fn hello3(port: u16) -> Self {
@@ -144,39 +252,265 @@ impl Conn {
             out.extend_from_slice(p);
             out.extend_from_slice(b"\r\n");
         }
-        self.0.write_all(&out).expect("write command");
+        self.sock.write_all(&out).expect("write command");
     }
 
+    /// Send one command and read exactly the one RESP frame that is its
+    /// reply — no more, no less, however long it takes to arrive (bounded
+    /// only by `CEILING`, to catch a genuine hang).
     fn send(&mut self, parts: &[&str]) -> Vec<u8> {
         let owned: Vec<&[u8]> = parts.iter().map(|p| p.as_bytes()).collect();
         self.write_cmd(&owned);
-        self.drain()
+        self.read_one_frame(Instant::now() + CEILING)
     }
 
     /// Send a command whose arguments may contain arbitrary bytes.
     fn send_bytes(&mut self, parts: &[&[u8]]) -> Vec<u8> {
         self.write_cmd(parts);
-        self.drain()
+        self.read_one_frame(Instant::now() + CEILING)
     }
 
-    /// Read until the socket goes quiet for one timeout window.
-    fn drain(&mut self) -> Vec<u8> {
-        let mut got = Vec::new();
-        let mut buf = [0u8; 8192];
+    /// Send `parts`, then a distinguishing sentinel command on the SAME
+    /// connection, and assert `parts` was answered with NOTHING before the
+    /// sentinel's reply. Redis is measured to answer a second `MONITOR` with
+    /// total silence (no error, no reply) — that can't be waited out with a
+    /// timeout (there is nothing to wait FOR), so this proves it instead by
+    /// reading exactly one frame and requiring it to be the sentinel's:
+    /// since RESP frames are self-delimited, any stray reply to `parts`
+    /// would BE that frame instead, and the mismatch below names it.
+    fn send_expect_silence(&mut self, parts: &[&str]) {
+        let owned: Vec<&[u8]> = parts.iter().map(|p| p.as_bytes()).collect();
+        self.write_cmd(&owned);
+        let nonce = format!("MONSILENCE{}", BARRIER_SEQ.fetch_add(1, Ordering::Relaxed));
+        self.write_cmd(&[b"ECHO", nonce.as_bytes()]);
+        let want = format!("${}\r\n{}\r\n", nonce.len(), nonce);
+        let deadline = Instant::now() + CEILING;
         loop {
-            match self.0.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => got.extend_from_slice(&buf[..n]),
-                Err(_) => break,
+            let frame = self.read_one_frame(deadline);
+            let text = s(&frame);
+            if text == want {
+                // Found the sentinel's own reply. If `self` also monitors
+                // itself (it does whenever it is an attached MONITOR
+                // connection — a monitor sees its own traffic), the feed
+                // line for this same ECHO may still be in flight and would
+                // otherwise leak into whatever reads `self`'s feed next.
+                // Consume it here rather than trust an arrival order that
+                // isn't guaranteed (the feed line travels through a
+                // separate channel + consumer task from the direct reply).
+                let trailing = self.feed_bounded(Instant::now() + Duration::from_millis(500));
+                assert!(
+                    trailing.is_empty() || s(&trailing).contains(&nonce),
+                    "unexpected trailing data after the sentinel reply: {:?}",
+                    s(&trailing)
+                );
+                return;
             }
+            assert!(
+                text.contains(&nonce),
+                "{parts:?} must be answered with NOTHING before the sentinel \
+                 ECHO that follows it; a reply here means the silence \
+                 contract broke. Got {text:?}"
+            );
+            // A self-observed feed line for our own sentinel — expected
+            // when this connection also monitors itself; discard it and
+            // keep waiting for the actual ECHO reply.
+        }
+    }
+
+    /// Read exactly one complete RESP frame, however long it takes to
+    /// arrive. `deadline` exists ONLY to turn a genuine hang into a failure
+    /// — it is never the signal that the reply is finished; `frame_len` is.
+    fn read_one_frame(&mut self, deadline: Instant) -> Vec<u8> {
+        loop {
+            if let Some(n) = frame_len(&self.carry) {
+                return self.carry.drain(..n).collect();
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for a complete RESP frame; have {} \
+                     byte(s) buffered so far: {:?}",
+                    self.carry.len(),
+                    s(&self.carry)
+                );
+            }
+            if self.pump() {
+                panic!(
+                    "connection closed while waiting for a complete RESP \
+                     frame; have {} byte(s) buffered: {:?}",
+                    self.carry.len(),
+                    s(&self.carry)
+                );
+            }
+        }
+    }
+
+    /// Read exactly `n` complete RESP frames (e.g. `n` pipelined replies),
+    /// bounded by one shared `deadline` for the whole batch.
+    fn read_n_frames(&mut self, n: usize, deadline: Instant) -> Vec<u8> {
+        let mut got = Vec::new();
+        for _ in 0..n {
+            got.extend_from_slice(&self.read_one_frame(deadline));
         }
         got
     }
 
-    /// Drain with a longer settle, for a feed that may lag the command.
-    fn feed(&mut self) -> Vec<u8> {
-        std::thread::sleep(Duration::from_millis(120));
-        self.drain()
+    /// Read monitor feed lines until `done` is satisfied, returning
+    /// everything read so far. For presence/ordering assertions where the
+    /// exact final line count is not itself under test: `done` returns as
+    /// soon as the property holds, so a fast real answer is never held up.
+    fn feed_while(&mut self, deadline: Instant, mut done: impl FnMut(&[u8]) -> bool) -> Vec<u8> {
+        let mut got = Vec::new();
+        loop {
+            if done(&got) {
+                return got;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for the monitor feed condition; got {} \
+                     line(s) so far: {:?}",
+                    lines(&got).len(),
+                    s(&got)
+                );
+            }
+            got.extend_from_slice(&self.read_one_frame(deadline));
+        }
+    }
+
+    /// Read monitor feed lines until every command in `cmds` has appeared
+    /// (in any order) — the tool for pure presence checks, safe to use
+    /// regardless of shard count since it makes no cross-connection
+    /// ordering assumption (unlike `feed_barrier`).
+    fn feed_until_all_named(&mut self, cmds: &[&str], deadline: Instant) -> Vec<u8> {
+        self.feed_while(deadline, |got| cmds.iter().all(|c| names(got, c)))
+    }
+
+    /// Read monitor feed lines up to, but NOT including, the first line
+    /// naming `marker`. `marker` must be a command guaranteed to be fed and
+    /// to run strictly after everything already sent — see `feed_barrier`
+    /// for how that guarantee is built. This is the deterministic
+    /// replacement for "wait a while, then assume nothing else is coming":
+    /// everything returned arrived strictly before a provably-later,
+    /// provably-fed event, so it is safe for an EXACT line-count assertion,
+    /// not just a presence one.
+    fn feed_until_marker(&mut self, marker: &str, deadline: Instant) -> Vec<u8> {
+        let mut got = Vec::new();
+        loop {
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for barrier marker {marker:?}; got {} \
+                     line(s) so far: {:?}",
+                    lines(&got).len(),
+                    s(&got)
+                );
+            }
+            let frame = self.read_one_frame(deadline);
+            if s(&frame).contains(marker) {
+                return got;
+            }
+            got.extend_from_slice(&frame);
+        }
+    }
+
+    /// Fire a uniquely-tagged `ECHO` on `barrier_conn` — already
+    /// authenticated by the caller if the server requires it — and read
+    /// `self`'s feed up to (not including) that ECHO's line.
+    ///
+    /// Why this is an EXACT cutoff, not a guess: every call site sends the
+    /// commands under test with a blocking `send()` first, so by the time
+    /// the barrier connection is even opened, the server has already
+    /// generated a reply for each of them — which happens strictly AFTER
+    /// `monitor::feed_frames` runs for that command (feed is called before
+    /// dispatch). The barrier's own feed line then travels through the same
+    /// single-producer-per-shard channel to the same consumer task as
+    /// everything queued before it, so a single-shard MPSC preserves order:
+    /// seeing the barrier line on the wire proves every earlier line is
+    /// already on the wire too. This is the "exact cutoff" tool for tests
+    /// asserting an EXACT set of lines, not just presence — without ever
+    /// guessing at how long delivery takes under load.
+    fn feed_barrier_via(&mut self, barrier_conn: &mut Conn) -> Vec<u8> {
+        let nonce = format!("MONBARRIER{}", BARRIER_SEQ.fetch_add(1, Ordering::Relaxed));
+        let r = barrier_conn.send(&["ECHO", &nonce]);
+        assert_eq!(
+            s(&r),
+            format!("${}\r\n{}\r\n", nonce.len(), nonce),
+            "barrier ECHO must succeed before it can be used as a feed cutoff"
+        );
+        self.feed_until_marker(&nonce, Instant::now() + CEILING)
+    }
+
+    /// `feed_barrier_via` with a fresh, unauthenticated barrier connection —
+    /// the common case for every test whose server has no `--requirepass`.
+    fn feed_barrier(&mut self, port: u16) -> Vec<u8> {
+        let mut b = Conn::open(port);
+        self.feed_barrier_via(&mut b)
+    }
+
+    /// Read whatever complete feed lines arrive before `deadline`, WITHOUT
+    /// panicking if none do: for a check that expects the feed to stay
+    /// silent (an unattached or detached connection), hitting the deadline
+    /// with nothing captured IS the passing outcome. A real leak is still
+    /// caught the instant its frame completes, not only after the window
+    /// elapses — the deadline only bounds how long "nothing happened" takes
+    /// to conclude; it never manufactures a false absence the way the old
+    /// `drain()` did.
+    fn feed_bounded(&mut self, deadline: Instant) -> Vec<u8> {
+        loop {
+            if let Some(n) = frame_len(&self.carry) {
+                return self.carry.drain(..n).collect();
+            }
+            if Instant::now() >= deadline {
+                return Vec::new();
+            }
+            if self.pump() {
+                return Vec::new(); // closed with nothing buffered: still absent.
+            }
+        }
+    }
+
+    /// Discard every complete frame that arrives before `deadline`, unlike
+    /// `feed_bounded` (which stops at the FIRST one). Used only to clear a
+    /// backlog before a separate, explicit check — e.g. an EOF probe that
+    /// must not be confused by leftover buffered lines the peer sent before
+    /// this connection was dropped or before this test started reading.
+    /// Never an assertion in itself.
+    fn discard_until(&mut self, deadline: Instant) {
+        loop {
+            if let Some(n) = frame_len(&self.carry) {
+                self.carry.drain(..n);
+                continue;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            if self.pump() {
+                return;
+            }
+        }
+    }
+
+    /// One poll of the socket into `carry`. Returns `true` if the
+    /// connection looks closed (EOF or a non-timeout error), so a caller
+    /// looping on a deadline can stop immediately instead of spinning until
+    /// the clock runs out. A read timeout is just a polling tick — not
+    /// reported as closed.
+    fn pump(&mut self) -> bool {
+        let mut buf = [0u8; 8192];
+        match self.sock.read(&mut buf) {
+            Ok(0) => true,
+            Ok(n) => {
+                self.carry.extend_from_slice(&buf[..n]);
+                false
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                false
+            }
+            Err(_) => true,
+        }
     }
 }
 
@@ -221,7 +555,7 @@ fn mon1_monitor_replies_ok_and_attaches() {
     let mut c = Conn::open(m.port);
     c.send(&["SET", "k", "v"]);
 
-    let got = mon.feed();
+    let got = mon.feed_barrier(m.port);
     let ls = lines(&got);
     assert_eq!(
         ls.len(),
@@ -273,7 +607,7 @@ fn mon2_feed_is_simplestring_under_resp3() {
     let mut c = Conn::open(m.port);
     c.send(&["SET", "k", "v"]);
 
-    let got = mon.feed();
+    let got = mon.feed_barrier(m.port);
     assert!(!got.is_empty(), "the RESP3 monitor must receive the feed");
     assert_eq!(
         got[0],
@@ -290,7 +624,7 @@ fn mon3_reads_are_fed() {
     c.send(&["SET", "k", "v"]);
     let mut mon = attach(m.port);
     c.send(&["GET", "k"]);
-    let got = mon.feed();
+    let got = mon.feed_barrier(m.port);
     assert!(
         names(&got, "GET"),
         "reads are fed, not only writes; got {:?}",
@@ -305,8 +639,12 @@ fn mon4_db_follows_select() {
     let mut c = Conn::open(m.port);
     c.send(&["SELECT", "3"]);
     c.send(&["GET", "k"]);
-    let got = mon.feed();
+    let got = mon.feed_barrier(m.port);
     let ls = lines(&got);
+    assert!(
+        !ls.is_empty(),
+        "expected at least one feed line reporting db 3; got none"
+    );
     assert!(
         ls.iter().all(|l| l.contains("[3 ")),
         "both lines report the db AFTER SELECT; got {ls:?}"
@@ -323,7 +661,7 @@ fn mon5_admin_commands_are_not_fed() {
     c.send(&["CONFIG", "SET", "maxmemory", "0"]);
     c.send(&["DBSIZE"]);
 
-    let got = mon.feed();
+    let got = mon.feed_barrier(m.port);
     assert!(
         !names(&got, "CONFIG"),
         "CONFIG is administrative and must never reach a monitor; got {:?}",
@@ -344,7 +682,7 @@ fn mon6_monitor_is_absent_from_its_own_feed() {
     let mut mon_a = attach(m.port);
     let mut mon_b = attach(m.port);
 
-    let a = mon_a.feed();
+    let a = mon_a.feed_barrier(m.port);
     assert!(
         !names(&a, "MONITOR"),
         "MONITOR is administrative, so attaching a second monitor emits nothing; got {:?}",
@@ -354,10 +692,13 @@ fn mon6_monitor_is_absent_from_its_own_feed() {
     let mut c = Conn::open(m.port);
     c.send(&["SET", "k", "v"]);
     assert!(
-        names(&mon_a.feed(), "SET"),
+        names(&mon_a.feed_barrier(m.port), "SET"),
         "and both monitors are still live"
     );
-    assert!(names(&mon_b.feed(), "SET"), "including the second one");
+    assert!(
+        names(&mon_b.feed_barrier(m.port), "SET"),
+        "including the second one"
+    );
 }
 
 #[test]
@@ -369,7 +710,7 @@ fn mon7_rejected_commands_are_not_fed() {
     c.send(&["GET"]); // arity violation
     c.send(&["PING"]);
 
-    let got = mon.feed();
+    let got = mon.feed_barrier(m.port);
     assert!(
         !names(&got, "NOSUCHCMD"),
         "an unknown command never executes, so it is never fed; got {:?}",
@@ -397,7 +738,7 @@ fn mon8_auth_arguments_are_redacted() {
     c.send(&["AUTH", "hunter2"]);
     c.send(&["AUTH", "someuser", "s3cret-pw"]);
 
-    let got = mon.feed();
+    let got = mon.feed_barrier(m.port);
     let text = s(&got);
     // The assertion that matters is the ABSENCE of the secret, not the
     // presence of the placeholder: a formatter that appended "(redacted)"
@@ -427,7 +768,7 @@ fn mon9_hello_auth_redacts_only_credentials() {
     let mut c = Conn::open(m.port);
     c.send(&["HELLO", "3", "AUTH", "default", "sekrit"]);
 
-    let text = s(&mon.feed());
+    let text = s(&mon.feed_barrier(m.port));
     assert!(
         !text.contains("sekrit"),
         "the HELLO AUTH password must not appear in the feed; got {text:?}"
@@ -448,7 +789,7 @@ fn mon10_transaction_timing() {
     let mut c = Conn::open(m.port);
 
     c.send(&["MULTI"]);
-    let at_multi = mon.feed();
+    let at_multi = mon.feed_barrier(m.port);
     assert!(
         names(&at_multi, "MULTI"),
         "MULTI is fed when it is issued; got {:?}",
@@ -457,7 +798,13 @@ fn mon10_transaction_timing() {
 
     let q = c.send(&["SET", "q", "1"]);
     assert_eq!(s(&q), "+QUEUED\r\n");
-    let at_queue = mon.feed();
+    // Not a race, unlike the other absence checks in this file: M9 contracts
+    // that a queued command is fed at EXEC and NEVER at queue time, and the
+    // `+QUEUED` reply just received IS the proof it has not executed yet —
+    // structurally, nothing SET-shaped can appear here no matter how long we
+    // wait. `ABSENCE_GRACE` is used only so a regression that fed it early
+    // is still caught promptly.
+    let at_queue = mon.feed_bounded(Instant::now() + ABSENCE_GRACE);
     assert!(
         !names(&at_queue, "SET"),
         "a QUEUED command has not executed, so it must not be fed yet — this \
@@ -466,7 +813,7 @@ fn mon10_transaction_timing() {
     );
 
     c.send(&["EXEC"]);
-    let at_exec = mon.feed();
+    let at_exec = mon.feed_barrier(m.port);
     let ls = lines(&at_exec);
     let set_at = ls.iter().position(|l| l.contains("\"SET\""));
     let exec_at = ls.iter().position(|l| l.contains("\"EXEC\""));
@@ -488,8 +835,8 @@ fn mon11_two_monitors_both_receive() {
     let mut c = Conn::open(m.port);
     c.send(&["SET", "dual", "1"]);
 
-    let la = lines(&a.feed());
-    let lb = lines(&b.feed());
+    let la = lines(&a.feed_barrier(m.port));
+    let lb = lines(&b.feed_barrier(m.port));
     assert!(
         la.iter().any(|l| l.contains(r#""SET" "dual" "1""#)),
         "monitor A receives; got {la:?}"
@@ -512,7 +859,7 @@ fn mon12_argument_escaping_is_byte_exact() {
     c.send_bytes(&[b"SET", b"utf", "h\u{e9}llo".as_bytes()]);
     c.send_bytes(&[b"SET", b"empty", b""]);
 
-    let text = s(&mon.feed());
+    let text = s(&mon.feed_barrier(m.port));
     assert!(
         text.contains(r#""a\"b\\c\nd\re\tf\x00g\xffh""#),
         "quote, backslash, newline, CR, tab, NUL and a high byte each escape \
@@ -536,13 +883,19 @@ fn mon13_inline_fast_path_is_fed() {
     // different code path from everything else here. A feed hook missing there
     // is invisible to any test that uses another command — and GET/SET are
     // what most tests use. This is the shape of the v0.8.6 inline-GET P0.
+    //
+    // --shards 4: `feed_barrier`'s single-shard FIFO argument does not hold
+    // here (a fresh barrier connection could land on a different shard than
+    // "inline"'s), so this uses the shard-topology-agnostic presence wait
+    // instead — it only needs both commands to EVENTUALLY show up, not an
+    // exact cutoff.
     let m = spawn_moon("4");
     let mut mon = attach(m.port);
     let mut c = Conn::open(m.port);
     c.send(&["SET", "inline", "1"]);
     c.send(&["GET", "inline"]);
 
-    let got = mon.feed();
+    let got = mon.feed_until_all_named(&["SET", "GET"], Instant::now() + CEILING);
     assert!(
         names(&got, "SET"),
         "the inline SET must be fed at --shards 4; got {:?}",
@@ -577,10 +930,12 @@ fn mon14_non_admin_cannot_attach() {
     );
 
     // The security-relevant half: refusing the reply is worthless if the
-    // connection was attached anyway.
+    // connection was attached anyway. `lo` was never attached, so there is
+    // no barrier line it could ever see — bound the check with
+    // `ABSENCE_GRACE` instead and accept silence as the passing outcome.
     let mut c = Conn::open(m.port);
     c.send(&["SET", "secret", "value"]);
-    let leaked = lo.feed();
+    let leaked = lo.feed_bounded(Instant::now() + ABSENCE_GRACE);
     assert!(
         leaked.is_empty(),
         "a refused MONITOR must not be attached — this connection received \
@@ -601,8 +956,10 @@ fn mon15_monitor_rejects_arguments() {
     );
     let mut other = Conn::open(m.port);
     other.send(&["SET", "k", "v"]);
+    // `c` was never attached, so — as in mon14 — bound the wait and accept
+    // silence as the pass.
     assert!(
-        c.feed().is_empty(),
+        c.feed_bounded(Instant::now() + ABSENCE_GRACE).is_empty(),
         "and the connection was not attached by the failed call"
     );
 }
@@ -621,7 +978,7 @@ fn mon16_monitor_conn_cannot_touch_keyspace() {
     let mut c = Conn::open(m.port);
     c.send(&["SET", "still", "flowing"]);
     assert!(
-        names(&mon.feed(), "SET"),
+        names(&mon.feed_barrier(m.port), "SET"),
         "and the refusal does not break the feed"
     );
 }
@@ -630,17 +987,11 @@ fn mon16_monitor_conn_cannot_touch_keyspace() {
 fn mon17_second_monitor_is_silent() {
     let m = spawn_moon("1");
     let mut mon = attach(m.port);
-    let again = mon.send(&["MONITOR"]);
-    assert!(
-        again.is_empty(),
-        "MONITOR on an already-attached connection is answered with NOTHING — \
-         measured; Redis does not error here. Got {:?}",
-        s(&again)
-    );
+    mon.send_expect_silence(&["MONITOR"]);
 
     let mut c = Conn::open(m.port);
     c.send(&["SET", "once", "1"]);
-    let ls = lines(&mon.feed());
+    let ls = lines(&mon.feed_barrier(m.port));
     assert_eq!(
         ls.len(),
         1,
@@ -657,7 +1008,12 @@ fn mon18_reset_detaches() {
 
     let mut c = Conn::open(m.port);
     c.send(&["SET", "postreset", "1"]);
-    assert!(mon.feed().is_empty(), "RESET detaches: the feed stops");
+    // `mon` is detached — nothing can ever arrive on it again, so there is
+    // no later marker to wait for; bound with `ABSENCE_GRACE` as above.
+    assert!(
+        mon.feed_bounded(Instant::now() + ABSENCE_GRACE).is_empty(),
+        "RESET detaches: the feed stops"
+    );
     assert_eq!(
         s(&mon.send(&["GET", "postreset"])),
         "$1\r\n1\r\n",
@@ -728,7 +1084,7 @@ fn mon20_admin_audit_table() {
         let mut mon = attach(m.port);
         let mut c = Conn::open(m.port);
         c.send(cmd);
-        let got = mon.feed();
+        let got = mon.feed_barrier(m.port);
         let fed = names(&got, cmd[0]);
         if fed != *want_fed {
             failures.push(format!(
@@ -757,6 +1113,24 @@ fn mon21_slow_monitor_is_dropped_not_stalled() {
     // DROPPED, loudly. Not silent line-dropping (an operator cannot tell a
     // quiet server from a lossy feed) and never blocking (one slow TCP reader
     // must not stall every shard).
+    //
+    // The elapsed-time bound below (`BURST_CEILING`) is a genuine wall-clock
+    // assertion — there is no protocol-level marker for "did not block
+    // indefinitely" the way there is for "this reply arrived". It is
+    // deliberately NOT scaled to the burst size: dropping a slow reader is
+    // an O(1) decision (a bounded queue overflows or it doesn't), so a
+    // correct implementation should clear 20,000 pipelined commands in low
+    // single-digit seconds even on a loaded host, while the failure mode
+    // being guarded against — an indefinite block on a full channel/send
+    // buffer — blows through any reasonable ceiling by orders of magnitude.
+    // `BURST_CEILING` is widened from the original 20s for CI headroom, not
+    // because the property changed; `BURST_READ_CEILING` is a SEPARATE,
+    // much larger backstop that exists only to fail this test in finite
+    // time if the connection truly never unblocks, so it never masks a
+    // `BURST_CEILING` violation the way one shared deadline would.
+    const BURST_CEILING: Duration = Duration::from_secs(45);
+    const BURST_READ_CEILING: Duration = Duration::from_secs(180);
+
     let m = spawn_moon("1");
     let mon = attach(m.port);
     // Deliberately never read from `mon` again.
@@ -766,11 +1140,11 @@ fn mon21_slow_monitor_is_dropped_not_stalled() {
     for i in 0..20_000 {
         c.write_cmd(&[b"SET", b"burst", i.to_string().as_bytes()]);
     }
-    let _ = c.drain();
+    let _ = c.read_n_frames(20_000, Instant::now() + BURST_READ_CEILING);
     let elapsed = start.elapsed();
 
     assert!(
-        elapsed < Duration::from_secs(20),
+        elapsed < BURST_CEILING,
         "a monitor that stopped reading must never stall the publishing \
          connection; the burst took {elapsed:?}"
     );
@@ -790,13 +1164,18 @@ fn mon21_slow_monitor_is_dropped_not_stalled() {
     // the failure mode the policy exists to rule out. A closed socket answers
     // Ok(0) (or errors); a starved-but-open one blocks until the timeout.
     let mut mon = mon;
-    let _ = mon.drain();
-    mon.0
-        .set_read_timeout(Some(Duration::from_secs(5)))
+    // Whatever the OS already buffered from the burst is irrelevant to this
+    // check — only whether the socket is actually closed matters. Drain the
+    // WHOLE backlog (not just one line — `mon` never read during the burst,
+    // so plenty may be queued), stopping early if the connection closes
+    // while doing so.
+    mon.discard_until(Instant::now() + CEILING);
+    mon.sock
+        .set_read_timeout(Some(CEILING))
         .expect("read timeout");
-    let _ = mon.0.write_all(b"*1\r\n$4\r\nPING\r\n");
+    let _ = mon.sock.write_all(b"*1\r\n$4\r\nPING\r\n");
     let mut probe_buf = [0u8; 64];
-    let eof = matches!(mon.0.read(&mut probe_buf), Ok(0) | Err(_));
+    let eof = matches!(mon.sock.read(&mut probe_buf), Ok(0) | Err(_));
     assert!(
         eof,
         "the slow monitor's connection must be CLOSED, not silently starved \
@@ -837,7 +1216,7 @@ fn mon22_script_issued_commands_are_fed_with_the_lua_address() {
         s(&r)
     );
 
-    let feed = mon.feed();
+    let feed = mon.feed_barrier(m.port);
     let ls = lines(&feed);
 
     let eval_at = ls
@@ -968,7 +1347,11 @@ fn mon24_first_auth_of_a_session_is_fed_and_redacted() {
     let mut c = Conn::open(m.port);
     assert_eq!(s(&c.send(&["AUTH", "s3kr1t"])), "+OK\r\n");
 
-    let feed = mon.feed();
+    // The server requires a password, so the barrier connection must AUTH
+    // before its ECHO can run at all.
+    let mut barrier = Conn::open(m.port);
+    assert_eq!(s(&barrier.send(&["AUTH", "s3kr1t"])), "+OK\r\n");
+    let feed = mon.feed_barrier_via(&mut barrier);
     let text = s(&feed);
     assert!(
         names(&feed, "AUTH"),
@@ -996,7 +1379,9 @@ fn mon25_first_hello_auth_of_a_session_is_fed_and_redacted() {
     let r = c.send(&["HELLO", "3", "AUTH", "default", "s3kr1t"]);
     assert!(!r.is_empty() && r[0] != b'-', "HELLO AUTH must succeed");
 
-    let feed = mon.feed();
+    let mut barrier = Conn::open(m.port);
+    assert_eq!(s(&barrier.send(&["AUTH", "s3kr1t"])), "+OK\r\n");
+    let feed = mon.feed_barrier_via(&mut barrier);
     let text = s(&feed);
     assert!(names(&feed, "HELLO"), "got {text:?}");
     assert!(
@@ -1036,7 +1421,7 @@ fn mon26_plus_at_all_grants_monitor() {
     let mut c = Conn::open(m.port);
     c.send(&["SET", "k", "v"]);
     assert!(
-        names(&ops.feed(), "SET"),
+        names(&ops.feed_barrier(m.port), "SET"),
         "and the attach is real, not just an accepted reply"
     );
 }
@@ -1055,6 +1440,9 @@ fn mon27_monitor_connection_is_not_migration_eligible() {
     // Asserted from the outside, through the only observable the contract
     // gives: RESET detaches, and after RESET a new MONITOR must be answered
     // with `+OK` rather than the silence that means "already attached".
+    //
+    // --shards 4, same reasoning as mon13: no `feed_barrier` cross-connection
+    // ordering assumption, just presence.
     let m = spawn_moon("4");
     let mut mon = attach(m.port);
     assert_eq!(s(&mon.send(&["RESET"])), "+RESET\r\n");
@@ -1070,7 +1458,10 @@ fn mon27_monitor_connection_is_not_migration_eligible() {
     let mut c = Conn::open(m.port);
     c.send(&["SET", "k", "v"]);
     assert!(
-        names(&mon.feed(), "SET"),
+        names(
+            &mon.feed_until_all_named(&["SET"], Instant::now() + CEILING),
+            "SET"
+        ),
         "the re-attached monitor receives a live feed, not a dead sink"
     );
 }
