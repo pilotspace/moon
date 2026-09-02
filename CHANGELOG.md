@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`storage`: the listpack scan no longer allocates once per element walked.**
+  Every listpack lookup decoded each entry it passed into an owned
+  `ListpackEntry` — copying string payloads with `to_vec()`, and calling
+  `encode_backlen()` purely to read `.len()`, which heap-allocated a `Vec` on
+  **every entry decoded** in nine separate decode arms — then compared it and
+  dropped it. One `HSET` missing on a 128-field listpack ran on the order of
+  several hundred malloc/free pairs to answer one lookup, inside `src/command/`
+  where hot-path allocation is forbidden.
+
+  A borrowing twin of the decoder (`ListpackRef`, `iter_refs`,
+  `iter_pair_refs`, `find_pair_index`, `contains_element`, and a
+  `backlen_size()` that computes the width by arithmetic) now serves the lookup
+  paths: `HSET`, `HMSET`, `HGET`, `ZSCORE` on a listpack zset, and both
+  hash-TTL field probes. Only the entry that actually matches is materialized.
+  Integer entries still match only their canonical decimal spelling, rendered
+  through `itoa` into a stack buffer.
+
+  Measured on GCE x86_64 (8 vCPU, `--shards 1`, `redis-benchmark -n 150000
+  -c 50 -P 16`), interleaved A/B against the parent commit:
+
+  | HSET, fields | before | after | speedup |
+  |---:|---:|---:|---:|
+  | 8 | 545,455 | 641,026 | 1.18x |
+  | 32 | 311,203 | 517,241 | 1.66x |
+  | 64 | 225,225 | 414,365 | 1.84x |
+  | 128 (threshold) | 131,234 | 297,619 | **2.27x** |
+  | 192 (promoted to hashtable) | 697,674 | 691,244 | 0.99x |
+
+  `HGET` against a preloaded 121-field listpack improves **3.99x** (141,376 ->
+  563,910) — the read path materialized both field *and* value for every pair
+  walked. The 192-field row is the negative control: once the hash promotes and
+  no listpack scan runs, the change does nothing. `SET`/`GET`/`INCR`/`LPUSH`/
+  `SADD` are unchanged at 0.99-1.02x.
+
 - **`storage`: an empty `DashTable` no longer reserves 16 segments to hold one.**
   `SegmentSlab::new` seeded its first slab at 16 segments, so `DashTable::new`
   allocated `16 x size_of::<Segment<CompactKey, CompactEntry>>()` = **55,296 B to

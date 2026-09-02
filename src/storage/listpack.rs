@@ -49,6 +49,67 @@ impl ListpackEntry {
     }
 }
 
+/// A borrowed view of one listpack entry.
+///
+/// [`ListpackEntry`] owns its bytes: decoding a string entry copies it into a
+/// fresh `Vec`. That is the right shape when the caller keeps the value, but
+/// every hot-path *lookup* -- HSET locating a field, SADD testing membership,
+/// SISMEMBER -- decoded, allocated, compared, and immediately dropped the
+/// copy. Scanning a 128-entry hash cost several hundred malloc/free pairs to
+/// answer one boolean.
+///
+/// `ListpackRef` borrows instead, so a scan touches no allocator at all.
+/// Integers are still returned as integers: they are stored decoded, and
+/// [`ListpackRef::eq_bytes`] renders them into a stack buffer to compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListpackRef<'a> {
+    Integer(i64),
+    Str(&'a [u8]),
+}
+
+impl ListpackRef<'_> {
+    /// Compare against a byte string without allocating.
+    ///
+    /// An integer entry matches only its CANONICAL decimal spelling, which is
+    /// the same rule the encoder applies -- `7` is stored as an integer, so it
+    /// must answer to `b"7"`, while `007` and `+7` were never integer-encoded
+    /// in the first place and must not match one that was.
+    #[inline]
+    pub fn eq_bytes(&self, other: &[u8]) -> bool {
+        match self {
+            ListpackRef::Str(s) => *s == other,
+            ListpackRef::Integer(v) => {
+                let mut buf = itoa::Buffer::new();
+                buf.format(*v).as_bytes() == other
+            }
+        }
+    }
+
+    /// Materialize the entry. Only for callers that keep the bytes -- a lookup
+    /// should use [`ListpackRef::eq_bytes`] and stay allocation-free.
+    pub fn to_vec(&self) -> Vec<u8> {
+        match self {
+            ListpackRef::Str(s) => s.to_vec(),
+            ListpackRef::Integer(v) => {
+                let mut buf = itoa::Buffer::new();
+                buf.format(*v).as_bytes().to_vec()
+            }
+        }
+    }
+}
+
+/// Forward iterator over borrowed listpack entries.
+pub struct ListpackRefIter<'a> {
+    data: &'a [u8],
+    pos: usize,
+    remaining: usize,
+}
+
+/// Pair iterator over borrowed field/value entries.
+pub struct ListpackPairRefIter<'a> {
+    inner: ListpackRefIter<'a>,
+}
+
 /// Forward iterator over listpack entries.
 pub struct ListpackIter<'a> {
     data: &'a [u8],
@@ -195,6 +256,42 @@ impl Listpack {
             pos: self.data.len() - 1, // terminator position
             remaining: self.len(),
         }
+    }
+
+    /// Forward iterator yielding BORROWED entries -- no allocation per entry.
+    pub fn iter_refs(&self) -> ListpackRefIter<'_> {
+        ListpackRefIter {
+            data: &self.data,
+            pos: 6,
+            remaining: self.len(),
+        }
+    }
+
+    /// Pair iterator yielding borrowed (field, value) entries.
+    pub fn iter_pair_refs(&self) -> ListpackPairRefIter<'_> {
+        ListpackPairRefIter {
+            inner: self.iter_refs(),
+        }
+    }
+
+    /// Index of the pair whose FIELD equals `field`, or `None`.
+    ///
+    /// The returned index counts PAIRS, so the field sits at raw entry
+    /// `i * 2` and its value at `i * 2 + 1` -- which is what the HSET write
+    /// path needs in order to call `replace_at`. Values are skipped, so a
+    /// value that happens to equal `field` never produces a false hit.
+    pub fn find_pair_index(&self, field: &[u8]) -> Option<usize> {
+        for (i, (f, _v)) in self.iter_pair_refs().enumerate() {
+            if f.eq_bytes(field) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Whether any entry equals `value`, without allocating.
+    pub fn contains_element(&self, value: &[u8]) -> bool {
+        self.iter_refs().any(|e| e.eq_bytes(value))
     }
 
     /// Iterate as (field, value) pairs for hash usage.
@@ -366,6 +463,27 @@ fn encode_backlen(entry_len: usize) -> Vec<u8> {
     buf
 }
 
+/// Byte width of the backlen field for an entry of `entry_len` bytes.
+///
+/// This is `encode_backlen(entry_len).len()` without the `Vec`. The decoder
+/// only ever needs the WIDTH -- it walks forward and must know where the next
+/// entry starts -- so allocating the encoded bytes just to call `.len()` on
+/// them put one malloc/free on every entry decoded, on every scan.
+#[inline]
+fn backlen_size(entry_len: usize) -> usize {
+    if entry_len <= 127 {
+        1
+    } else {
+        let mut len = entry_len;
+        let mut n = 0;
+        while len > 0 {
+            len >>= 7;
+            n += 1;
+        }
+        n
+    }
+}
+
 /// Decode backlen reading backward from the byte at `pos - 1`.
 /// Returns (entry_len, backlen_size).
 fn decode_backlen(data: &[u8], pos: usize) -> (usize, usize) {
@@ -399,8 +517,7 @@ fn decode_entry_at(data: &[u8], pos: usize) -> (ListpackEntry, usize) {
         // 7-bit unsigned int: 0xxxxxxx
         let val = b0 as i64;
         let entry_len = 1;
-        let backlen_bytes = encode_backlen(entry_len);
-        let next = pos + entry_len + backlen_bytes.len();
+        let next = pos + entry_len + backlen_size(entry_len);
         (ListpackEntry::Integer(val), next)
     } else if b0 & 0xC0 == 0x80 {
         // 6-bit string: 10xxxxxx
@@ -408,8 +525,7 @@ fn decode_entry_at(data: &[u8], pos: usize) -> (ListpackEntry, usize) {
         let start = pos + 1;
         let str_data = data[start..start + len].to_vec();
         let entry_len = 1 + len;
-        let backlen_bytes = encode_backlen(entry_len);
-        let next = pos + entry_len + backlen_bytes.len();
+        let next = pos + entry_len + backlen_size(entry_len);
         (ListpackEntry::String(str_data), next)
     } else if b0 & 0xE0 == 0xC0 {
         // 13-bit signed int: 110xxxxx + 1 byte
@@ -422,8 +538,7 @@ fn decode_entry_at(data: &[u8], pos: usize) -> (ListpackEntry, usize) {
             raw as i64
         };
         let entry_len = 2;
-        let backlen_bytes = encode_backlen(entry_len);
-        let next = pos + entry_len + backlen_bytes.len();
+        let next = pos + entry_len + backlen_size(entry_len);
         (ListpackEntry::Integer(val), next)
     } else if b0 & 0xF0 == 0xE0 {
         // 12-bit string: 1110xxxx + 1 byte len
@@ -431,16 +546,14 @@ fn decode_entry_at(data: &[u8], pos: usize) -> (ListpackEntry, usize) {
         let start = pos + 2;
         let str_data = data[start..start + len].to_vec();
         let entry_len = 2 + len;
-        let backlen_bytes = encode_backlen(entry_len);
-        let next = pos + entry_len + backlen_bytes.len();
+        let next = pos + entry_len + backlen_size(entry_len);
         (ListpackEntry::String(str_data), next)
     } else {
         match b0 {
             LP_ENCODING_16BIT_INT => {
                 let val = i16::from_le_bytes([data[pos + 1], data[pos + 2]]) as i64;
                 let entry_len = 3;
-                let backlen_bytes = encode_backlen(entry_len);
-                let next = pos + entry_len + backlen_bytes.len();
+                let next = pos + entry_len + backlen_size(entry_len);
                 (ListpackEntry::Integer(val), next)
             }
             LP_ENCODING_24BIT_INT => {
@@ -451,8 +564,7 @@ fn decode_entry_at(data: &[u8], pos: usize) -> (ListpackEntry, usize) {
                     i32::from_le_bytes([b[0], b[1], b[2], 0x00]) as i64
                 };
                 let entry_len = 4;
-                let backlen_bytes = encode_backlen(entry_len);
-                let next = pos + entry_len + backlen_bytes.len();
+                let next = pos + entry_len + backlen_size(entry_len);
                 (ListpackEntry::Integer(val), next)
             }
             LP_ENCODING_32BIT_INT => {
@@ -463,8 +575,7 @@ fn decode_entry_at(data: &[u8], pos: usize) -> (ListpackEntry, usize) {
                     data[pos + 4],
                 ]) as i64;
                 let entry_len = 5;
-                let backlen_bytes = encode_backlen(entry_len);
-                let next = pos + entry_len + backlen_bytes.len();
+                let next = pos + entry_len + backlen_size(entry_len);
                 (ListpackEntry::Integer(val), next)
             }
             LP_ENCODING_64BIT_INT => {
@@ -479,8 +590,7 @@ fn decode_entry_at(data: &[u8], pos: usize) -> (ListpackEntry, usize) {
                     data[pos + 8],
                 ]);
                 let entry_len = 9;
-                let backlen_bytes = encode_backlen(entry_len);
-                let next = pos + entry_len + backlen_bytes.len();
+                let next = pos + entry_len + backlen_size(entry_len);
                 (ListpackEntry::Integer(val), next)
             }
             LP_ENCODING_32BIT_STR => {
@@ -493,12 +603,134 @@ fn decode_entry_at(data: &[u8], pos: usize) -> (ListpackEntry, usize) {
                 let start = pos + 5;
                 let str_data = data[start..start + len].to_vec();
                 let entry_len = 5 + len;
-                let backlen_bytes = encode_backlen(entry_len);
-                let next = pos + entry_len + backlen_bytes.len();
+                let next = pos + entry_len + backlen_size(entry_len);
                 (ListpackEntry::String(str_data), next)
             }
             _ => panic!("Unknown listpack encoding byte: 0x{:02X}", b0),
         }
+    }
+}
+
+/// Borrowing twin of [`decode_entry_at`].
+///
+/// Must stay byte-for-byte in agreement with it: `zero_alloc_scan_tests::
+/// refs_agree_with_owned_entries` asserts that on every encoding width, so a
+/// change to one decoder that is not mirrored in the other fails the suite.
+fn decode_entry_ref_at(data: &[u8], pos: usize) -> (ListpackRef<'_>, usize) {
+    let b0 = data[pos];
+
+    if b0 & 0x80 == 0 {
+        // 7-bit unsigned int: 0xxxxxxx
+        (ListpackRef::Integer(b0 as i64), pos + 1 + backlen_size(1))
+    } else if b0 & 0xC0 == 0x80 {
+        // 6-bit string: 10xxxxxx
+        let len = (b0 & 0x3F) as usize;
+        let start = pos + 1;
+        let entry_len = 1 + len;
+        (
+            ListpackRef::Str(&data[start..start + len]),
+            pos + entry_len + backlen_size(entry_len),
+        )
+    } else if b0 & 0xE0 == 0xC0 {
+        // 13-bit signed int: 110xxxxx + 1 byte
+        let raw = (((b0 & 0x1F) as u16) << 8) | (data[pos + 1] as u16);
+        let val = if raw & 0x1000 != 0 {
+            (raw | 0xE000) as i16 as i64
+        } else {
+            raw as i64
+        };
+        (ListpackRef::Integer(val), pos + 2 + backlen_size(2))
+    } else if b0 & 0xF0 == 0xE0 {
+        // 12-bit string: 1110xxxx + 1 byte len
+        let len = (((b0 & 0x0F) as usize) << 8) | (data[pos + 1] as usize);
+        let start = pos + 2;
+        let entry_len = 2 + len;
+        (
+            ListpackRef::Str(&data[start..start + len]),
+            pos + entry_len + backlen_size(entry_len),
+        )
+    } else {
+        match b0 {
+            LP_ENCODING_16BIT_INT => {
+                let val = i16::from_le_bytes([data[pos + 1], data[pos + 2]]) as i64;
+                (ListpackRef::Integer(val), pos + 3 + backlen_size(3))
+            }
+            LP_ENCODING_24BIT_INT => {
+                let b = [data[pos + 1], data[pos + 2], data[pos + 3]];
+                let val = if b[2] & 0x80 != 0 {
+                    i32::from_le_bytes([b[0], b[1], b[2], 0xFF]) as i64
+                } else {
+                    i32::from_le_bytes([b[0], b[1], b[2], 0x00]) as i64
+                };
+                (ListpackRef::Integer(val), pos + 4 + backlen_size(4))
+            }
+            LP_ENCODING_32BIT_INT => {
+                let val = i32::from_le_bytes([
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
+                ]) as i64;
+                (ListpackRef::Integer(val), pos + 5 + backlen_size(5))
+            }
+            LP_ENCODING_64BIT_INT => {
+                let val = i64::from_le_bytes([
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
+                    data[pos + 5],
+                    data[pos + 6],
+                    data[pos + 7],
+                    data[pos + 8],
+                ]);
+                (ListpackRef::Integer(val), pos + 9 + backlen_size(9))
+            }
+            LP_ENCODING_32BIT_STR => {
+                let len = u32::from_le_bytes([
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
+                ]) as usize;
+                let start = pos + 5;
+                let entry_len = 5 + len;
+                (
+                    ListpackRef::Str(&data[start..start + len]),
+                    pos + entry_len + backlen_size(entry_len),
+                )
+            }
+            // Mirrors `decode_entry_at`: the only writer is this module, so an
+            // unknown byte means in-memory corruption, not untrusted input.
+            _ => panic!("Unknown listpack encoding byte: 0x{:02X}", b0),
+        }
+    }
+}
+
+impl<'a> Iterator for ListpackRefIter<'a> {
+    type Item = ListpackRef<'a>;
+
+    fn next(&mut self) -> Option<ListpackRef<'a>> {
+        if self.remaining == 0
+            || self.pos >= self.data.len() - 1
+            || self.data[self.pos] == LP_TERMINATOR
+        {
+            return None;
+        }
+        let (entry, next_pos) = decode_entry_ref_at(self.data, self.pos);
+        self.pos = next_pos;
+        self.remaining -= 1;
+        Some(entry)
+    }
+}
+
+impl<'a> Iterator for ListpackPairRefIter<'a> {
+    type Item = (ListpackRef<'a>, ListpackRef<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let f = self.inner.next()?;
+        let v = self.inner.next()?;
+        Some((f, v))
     }
 }
 
@@ -806,5 +1038,169 @@ mod tests {
         lp2.push_back(b"128");
         let entry2 = lp2.get_at(0).unwrap();
         assert_eq!(entry2, ListpackEntry::Integer(128));
+    }
+}
+
+#[cfg(test)]
+mod zero_alloc_scan_tests {
+    use super::*;
+
+    /// The borrowed view must agree with the owning decoder on every entry,
+    /// for both the integer and the string encodings. If these ever diverge,
+    /// the zero-alloc scan would silently answer a different question than the
+    /// allocating one it replaces.
+    #[test]
+    fn refs_agree_with_owned_entries() {
+        let mut lp = Listpack::new();
+        // Cover every encoding width the decoder distinguishes.
+        let inputs: Vec<Vec<u8>> = vec![
+            b"0".to_vec(),
+            b"127".to_vec(),
+            b"-1".to_vec(),
+            b"4095".to_vec(),
+            b"-4096".to_vec(),
+            b"32767".to_vec(),
+            b"-32768".to_vec(),
+            b"8388607".to_vec(),
+            b"2147483647".to_vec(),
+            b"9223372036854775807".to_vec(),
+            b"-9223372036854775808".to_vec(),
+            b"".to_vec(),
+            b"short".to_vec(),
+            // NOTE: non-canonical integer spellings (`0123`, `+5`) are
+            // deliberately absent. On this branch the ENCODER still folds them
+            // to `123` / `5`, losing the original bytes -- that is bug #795,
+            // fixed separately in `try_encode_as_integer`. Asserting the
+            // correct round trip here would fail for a defect this change does
+            // not own. `find_pair_index_handles_integer_encoded_fields` still
+            // covers the LOOKUP side, which is what this change is responsible
+            // for: a non-canonical query must not match a canonical entry.
+            vec![b'x'; 63],   // 6-bit string boundary
+            vec![b'y'; 64],   // just past it
+            vec![b'z'; 4095], // 12-bit string boundary
+        ];
+        for v in &inputs {
+            lp.push_back(v);
+        }
+
+        let owned: Vec<ListpackEntry> = lp.iter().collect();
+        let borrowed: Vec<ListpackRef<'_>> = lp.iter_refs().collect();
+        assert_eq!(owned.len(), inputs.len(), "iter() lost entries");
+        assert_eq!(borrowed.len(), inputs.len(), "iter_refs() lost entries");
+
+        for (i, (o, b)) in owned.iter().zip(borrowed.iter()).enumerate() {
+            assert_eq!(
+                o.as_bytes(),
+                b.to_vec(),
+                "entry {i} decoded differently by iter_refs()"
+            );
+            // The comparison helper is the thing the hot paths actually call.
+            assert!(
+                b.eq_bytes(&inputs[i]),
+                "entry {i} ({:?}) failed eq_bytes against its own input",
+                inputs[i]
+            );
+            assert!(
+                !b.eq_bytes(b"\xffdefinitely-not-this"),
+                "entry {i} matched a value it does not hold"
+            );
+        }
+    }
+
+    /// `find_pair_index` replaces the allocating `iter_pairs()` scan in HSET.
+    /// It must return the FIELD index (not the raw entry index) and must only
+    /// ever match on field positions -- a value that happens to equal the
+    /// field being searched for must not produce a hit.
+    #[test]
+    fn find_pair_index_matches_fields_only() {
+        let mut lp = Listpack::new();
+        // field/value pairs where one VALUE collides with a later FIELD name.
+        for (f, v) in [
+            (&b"alpha"[..], &b"beta"[..]),
+            (&b"gamma"[..], &b"delta"[..]),
+            (&b"epsilon"[..], &b"zeta"[..]),
+        ] {
+            lp.push_back(f);
+            lp.push_back(v);
+        }
+
+        assert_eq!(lp.find_pair_index(b"alpha"), Some(0));
+        assert_eq!(lp.find_pair_index(b"gamma"), Some(1));
+        assert_eq!(lp.find_pair_index(b"epsilon"), Some(2));
+        assert_eq!(lp.find_pair_index(b"missing"), None);
+        // "beta" is a VALUE, never a field -- must not match.
+        assert_eq!(lp.find_pair_index(b"beta"), None);
+        assert_eq!(lp.find_pair_index(b"delta"), None);
+    }
+
+    /// Integer-encoded fields must be findable by their decimal spelling, and
+    /// only by their CANONICAL spelling -- `007` is a different field from `7`.
+    #[test]
+    fn find_pair_index_handles_integer_encoded_fields() {
+        let mut lp = Listpack::new();
+        lp.push_back(b"7");
+        lp.push_back(b"seven");
+        lp.push_back(b"-42");
+        lp.push_back(b"minus");
+
+        assert_eq!(lp.find_pair_index(b"7"), Some(0));
+        assert_eq!(lp.find_pair_index(b"-42"), Some(1));
+        assert_eq!(
+            lp.find_pair_index(b"007"),
+            None,
+            "non-canonical must not match"
+        );
+        assert_eq!(
+            lp.find_pair_index(b"+7"),
+            None,
+            "non-canonical must not match"
+        );
+    }
+
+    /// `contains_element` replaces the allocating `iter().any()` scan in SADD.
+    #[test]
+    fn contains_element_matches_any_position() {
+        let mut lp = Listpack::new();
+        for m in [&b"a"[..], &b"bb"[..], &b"123"[..]] {
+            lp.push_back(m);
+        }
+        assert!(lp.contains_element(b"a"));
+        assert!(lp.contains_element(b"bb"));
+        assert!(lp.contains_element(b"123"));
+        assert!(!lp.contains_element(b"c"));
+        assert!(!lp.contains_element(b"0123"));
+    }
+
+    /// The scan must stay correct on an empty listpack and on one holding a
+    /// single element, where the header/terminator arithmetic is tightest.
+    #[test]
+    fn degenerate_sizes() {
+        let empty = Listpack::new();
+        assert_eq!(empty.iter_refs().count(), 0);
+        assert_eq!(empty.find_pair_index(b"x"), None);
+        assert!(!empty.contains_element(b"x"));
+
+        let mut one = Listpack::new();
+        one.push_back(b"solo");
+        assert_eq!(one.iter_refs().count(), 1);
+        assert!(one.contains_element(b"solo"));
+        // A lone field with no value is not a complete pair.
+        assert_eq!(one.find_pair_index(b"solo"), None);
+    }
+
+    /// `backlen_size` is the non-allocating replacement for
+    /// `encode_backlen(n).len()`; it must agree with it exactly, including
+    /// across the 7-bit continuation boundaries.
+    #[test]
+    fn backlen_size_agrees_with_encode_backlen() {
+        for n in [
+            0usize, 1, 126, 127, 128, 129, 16383, 16384, 16385, 2097151, 2097152,
+        ] {
+            assert_eq!(
+                backlen_size(n),
+                encode_backlen(n).len(),
+                "backlen_size disagreed at entry_len={n}"
+            );
+        }
     }
 }

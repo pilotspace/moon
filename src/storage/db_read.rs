@@ -55,12 +55,12 @@ impl<'a> HashRef<'a> {
         match self {
             HashRef::Map(map) => map.get(field).cloned(),
             HashRef::Listpack(lp) => {
-                for (f, v) in lp.iter_pairs() {
-                    if f.as_bytes() == field {
-                        return Some(v.to_bytes());
-                    }
+                // Borrowed scan: only the value that actually matches is
+                // materialized, instead of every field walked past.
+                match lp.find_pair_index(field) {
+                    Some(idx) => lp.get_at(idx * 2 + 1).map(|v| v.to_bytes()),
+                    None => None,
                 }
-                None
             }
             HashRef::WithTtl {
                 fields,
@@ -336,17 +336,15 @@ impl<'a> SortedSetRef<'a> {
         match self {
             SortedSetRef::BPTree { members, .. } => members.get(member).copied(),
             SortedSetRef::Listpack(lp) => {
-                for (m, s) in lp.iter_score_member_pairs() {
-                    if m.as_bytes() == member {
-                        return match s {
-                            super::listpack::ListpackEntry::Integer(i) => Some(i as f64),
-                            super::listpack::ListpackEntry::String(ref b) => {
-                                std::str::from_utf8(b).ok().and_then(|s| s.parse().ok())
-                            }
-                        };
+                // Borrowed scan: walk members without materializing each one,
+                // then decode only the score that belongs to the match.
+                let idx = lp.find_pair_index(member)?;
+                match lp.get_at(idx * 2 + 1)? {
+                    super::listpack::ListpackEntry::Integer(i) => Some(i as f64),
+                    super::listpack::ListpackEntry::String(ref b) => {
+                        std::str::from_utf8(b).ok().and_then(|s| s.parse().ok())
                     }
                 }
-                None
             }
             SortedSetRef::Legacy { members, .. } => members.get(member).copied(),
             SortedSetRef::Owned { members, .. } => members.get(member).copied(),

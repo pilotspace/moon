@@ -52,19 +52,13 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
                         Some(v) => v,
                         None => return err_wrong_args("HSET"),
                     };
-                    // Search for existing field in listpack pairs
-                    let mut found = false;
-                    let mut idx = 0;
-                    for (f, _v) in lp.iter_pairs() {
-                        if f.as_bytes() == field.as_ref() {
-                            // Replace value at idx*2+1
-                            lp.replace_at(idx * 2 + 1, value);
-                            found = true;
-                            break;
-                        }
-                        idx += 1;
-                    }
-                    if !found {
+                    // Locate the field WITHOUT materializing every entry we
+                    // walk past: the old scan decoded each field into a fresh
+                    // `Vec` just to compare and drop it, so one HSET against a
+                    // 128-field listpack ran hundreds of malloc/free pairs.
+                    if let Some(idx) = lp.find_pair_index(field.as_ref()) {
+                        lp.replace_at(idx * 2 + 1, value);
+                    } else {
                         lp.push_back(field);
                         lp.push_back(value);
                         count += 1;
@@ -227,17 +221,9 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
                         Some(v) => v,
                         None => return err_wrong_args("HMSET"),
                     };
-                    let mut found = false;
-                    let mut idx = 0;
-                    for (f, _v) in lp.iter_pairs() {
-                        if f.as_bytes() == field.as_ref() {
-                            lp.replace_at(idx * 2 + 1, value);
-                            found = true;
-                            break;
-                        }
-                        idx += 1;
-                    }
-                    if !found {
+                    if let Some(idx) = lp.find_pair_index(field.as_ref()) {
+                        lp.replace_at(idx * 2 + 1, value);
+                    } else {
                         lp.push_back(field);
                         lp.push_back(value);
                     }
