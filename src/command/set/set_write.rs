@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use rand::seq::IndexedRandom;
+use rand::RngExt;
 use std::collections::HashSet;
 
 use crate::framevec;
@@ -147,7 +147,7 @@ pub fn srem(db: &mut Database, args: &[Frame]) -> Frame {
     let mut credit: usize = 0;
     for arg in &args[1..] {
         if let Some(member) = extract_bytes(arg) {
-            if set.remove(member) {
+            if set.swap_remove(member) {
                 removed += 1;
                 credit += set_member_cost(member);
             }
@@ -181,9 +181,11 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("SPOP"),
     };
 
-    // Clone the set to pick random members, then mutate
-    let set_clone = match db.get_set(key) {
-        Ok(Some(s)) => s.clone(),
+    // Index-first, no clone. The set is an `IndexSet`, so a member is
+    // addressable in O(1); the previous shape cloned the WHOLE set and then
+    // collected every member into a `Vec` just to choose one.
+    let len = match db.get_set(key) {
+        Ok(Some(s)) => s.len(),
         Ok(None) => {
             return if args.len() == 1 {
                 Frame::Null
@@ -194,7 +196,7 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
 
-    if set_clone.is_empty() {
+    if len == 0 {
         return if args.len() == 1 {
             Frame::Null
         } else {
@@ -202,18 +204,20 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
         };
     }
 
-    let members: Vec<Bytes> = set_clone.into_iter().collect();
     let mut rng = rand::rng();
 
     if args.len() == 1 {
-        // Single random member
-        let Some(chosen) = members.choose(&mut rng).cloned() else {
+        let idx = rng.random_range(0..len);
+        let Some(chosen) = (match db.get_set(key) {
+            Ok(Some(s)) => s.get_index(idx).cloned(),
+            _ => None,
+        }) else {
             return Frame::Null;
         };
         let Ok(set) = db.get_or_create_set(key) else {
             return Frame::Null;
         };
-        set.remove(&chosen);
+        set.swap_remove(&chosen);
         let empty = set.is_empty();
         // `set`'s borrow of `db` ends above.
         if empty {
@@ -243,8 +247,19 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
         return Frame::Array(framevec![]);
     }
 
-    let n = std::cmp::min(count, members.len());
-    let chosen: Vec<Bytes> = members.sample(&mut rng, n).cloned().collect();
+    // Draw n distinct INDICES in O(n), then resolve them to members. Note the
+    // indices must all be resolved BEFORE any removal: `swap_remove` moves the
+    // last element into the freed slot, so an index taken after a removal
+    // would address a different member than the one drawn.
+    let n = std::cmp::min(count, len);
+    let picks = rand::seq::index::sample(&mut rng, len, n);
+    let chosen: Vec<Bytes> = match db.get_set(key) {
+        Ok(Some(s)) => picks
+            .into_iter()
+            .filter_map(|i| s.get_index(i).cloned())
+            .collect(),
+        _ => return Frame::Array(framevec![]),
+    };
 
     // Remove chosen members from the set
     // Key confirmed as set type above via get_set(); get_or_create_set() cannot fail here
@@ -252,7 +267,7 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
         return Frame::Array(framevec![]);
     };
     for m in &chosen {
-        set.remove(m);
+        set.swap_remove(m);
     }
     let empty = set.is_empty();
     // `set`'s borrow of `db` ends above.
@@ -373,7 +388,9 @@ pub fn sinterstore(db: &mut Database, args: &[Frame]) -> Frame {
     } else {
         let mut entry = Entry::new_set();
         if let Some(crate::storage::entry::RedisValue::Set(s)) = entry.value.as_redis_value_mut() {
-            *s = result;
+            // Set algebra computes in a `HashSet`; the stored representation is
+            // an `IndexSet` so SPOP/SRANDMEMBER can address a member by index.
+            *s = result.into_iter().collect();
         }
         db.set(dest, entry);
     }
@@ -406,7 +423,9 @@ pub fn sunionstore(db: &mut Database, args: &[Frame]) -> Frame {
     } else {
         let mut entry = Entry::new_set();
         if let Some(crate::storage::entry::RedisValue::Set(s)) = entry.value.as_redis_value_mut() {
-            *s = result;
+            // Set algebra computes in a `HashSet`; the stored representation is
+            // an `IndexSet` so SPOP/SRANDMEMBER can address a member by index.
+            *s = result.into_iter().collect();
         }
         db.set(dest, entry);
     }
@@ -439,7 +458,9 @@ pub fn sdiffstore(db: &mut Database, args: &[Frame]) -> Frame {
     } else {
         let mut entry = Entry::new_set();
         if let Some(crate::storage::entry::RedisValue::Set(s)) = entry.value.as_redis_value_mut() {
-            *s = result;
+            // Set algebra computes in a `HashSet`; the stored representation is
+            // an `IndexSet` so SPOP/SRANDMEMBER can address a member by index.
+            *s = result.into_iter().collect();
         }
         db.set(dest, entry);
     }
@@ -494,7 +515,7 @@ pub fn smove(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(s) => s,
         Err(e) => return e,
     };
-    if !src_set.remove(&member) {
+    if !src_set.swap_remove(&member) {
         return Frame::Integer(0);
     }
     let src_empty = src_set.is_empty();

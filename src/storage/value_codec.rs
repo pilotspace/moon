@@ -32,7 +32,7 @@
 //! spill decoder (`kv_serde`) was missed by that fix and fed attacker-length
 //! counts straight into `Vec::with_capacity`.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{Cursor, Read};
 
 use bytes::Bytes;
@@ -198,14 +198,14 @@ pub fn encode_value_body(
             }
         }
         RedisValueRef::SetListpack(lp) => {
-            let set = lp.to_hash_set();
+            let set = lp.to_set_value();
             put_u32(buf, set.len() as u32);
             for member in &set {
                 put_len_bytes(buf, member);
             }
         }
         RedisValueRef::SetIntset(is) => {
-            let set = is.to_hash_set();
+            let set = is.to_set_value();
             put_u32(buf, set.len() as u32);
             for member in &set {
                 put_len_bytes(buf, member);
@@ -410,7 +410,7 @@ pub fn decode_value_body(
         ValueType::Set => {
             let count = get_u32(cursor, "set count")? as usize;
             validate_count(cursor, count, 4, "set")?;
-            let mut set = HashSet::with_capacity(count);
+            let mut set = crate::storage::entry::SetValue::with_capacity(count);
             for _ in 0..count {
                 set.insert(get_len_bytes(cursor, "set member")?);
             }
@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn golden_set_single_member_matches_spec() {
-        let mut set = std::collections::HashSet::new();
+        let mut set = crate::storage::entry::SetValue::new();
         set.insert(Bytes::from_static(b"m"));
         let mut buf = Vec::new();
         encode_value_body(&RedisValueRef::Set(&set), &mut buf).unwrap();

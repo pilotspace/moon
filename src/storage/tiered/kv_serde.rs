@@ -65,7 +65,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use ordered_float::OrderedFloat;
-    use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+    use std::collections::{BTreeMap, HashMap, VecDeque};
 
     use crate::storage::stream::{Stream as StreamData, StreamId};
 
@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn test_set_roundtrip() {
-        let mut set = HashSet::new();
+        let mut set = crate::storage::entry::SetValue::new();
         set.insert(Bytes::from_static(b"x"));
         set.insert(Bytes::from_static(b"y"));
         let val_ref = RedisValueRef::Set(&set);
@@ -229,7 +229,7 @@ mod tests {
         }
 
         // Empty set
-        let set = HashSet::new();
+        let set = crate::storage::entry::SetValue::new();
         let val_ref = RedisValueRef::Set(&set);
         let serialized = serialize_collection(&val_ref).unwrap();
         let deserialized = deserialize_collection(&serialized, ValueType::Set).unwrap();

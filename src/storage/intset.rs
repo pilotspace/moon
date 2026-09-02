@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use std::collections::HashSet;
 
 /// Encoding width for intset values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,7 +128,8 @@ impl Intset {
     }
 
     /// Convert to a HashSet of Bytes (string-encoded integers).
-    pub fn to_hash_set(&self) -> HashSet<Bytes> {
+    /// Promote to the full set representation.
+    pub fn to_set_value(&self) -> crate::storage::entry::SetValue {
         self.iter()
             .map(|v| Bytes::from(v.to_string().into_bytes()))
             .collect()
@@ -442,12 +442,12 @@ mod tests {
     }
 
     #[test]
-    fn test_to_hash_set() {
+    fn test_to_set_value() {
         let mut is = Intset::new();
         is.insert(1);
         is.insert(2);
         is.insert(3);
-        let hs = is.to_hash_set();
+        let hs = is.to_set_value();
         assert_eq!(hs.len(), 3);
         assert!(hs.contains(&Bytes::from("1")));
         assert!(hs.contains(&Bytes::from("2")));

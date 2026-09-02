@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 const LP_HDR_SIZE: usize = 7; // 4 bytes total_bytes + 2 bytes num_elements + 1 byte terminator
 const LP_TERMINATOR: u8 = 0xFF;
@@ -322,7 +322,8 @@ impl Listpack {
     }
 
     /// Convert to a HashSet.
-    pub fn to_hash_set(&self) -> HashSet<Bytes> {
+    /// Promote to the full set representation.
+    pub fn to_set_value(&self) -> crate::storage::entry::SetValue {
         self.iter().map(|e| e.to_bytes()).collect()
     }
 

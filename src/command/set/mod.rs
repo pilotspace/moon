@@ -75,7 +75,7 @@ pub(crate) fn collect_sets(
     let mut sets = Vec::with_capacity(keys.len());
     for key in keys {
         match db.get_set(key) {
-            Ok(Some(set)) => sets.push(Some(set.clone())),
+            Ok(Some(set)) => sets.push(Some(set.iter().cloned().collect())),
             Ok(None) => sets.push(None),
             Err(e) => return Err(e),
         }
@@ -486,6 +486,120 @@ mod tests {
 
         let result = spop(&mut db, &[bs(b"missing"), bs(b"3")]);
         assert_eq!(result, Frame::Array(framevec![]));
+    }
+
+    // ── Guards for index-based random selection ───────────────────────────
+    // SPOP/SRANDMEMBER now address members by index instead of materializing
+    // the set. Two failure modes come with that, and neither is caught by the
+    // existing tests above.
+
+    /// `swap_remove` moves the LAST member into the freed slot. If SPOP
+    /// resolved an index after a removal instead of before, it would return a
+    /// member it had already returned, or one it never drew. With a set of 50
+    /// and a count of 25, a shifted index is overwhelmingly likely.
+    #[test]
+    fn spop_count_returns_distinct_members_despite_swap_remove() {
+        for _ in 0..20 {
+            let mut db = Database::new();
+            let mut args = vec![bs(b"s")];
+            for i in 0..50u32 {
+                args.push(Frame::BulkString(Bytes::from(format!("m{i}"))));
+            }
+            sadd(&mut db, &args);
+
+            let out = spop(&mut db, &[bs(b"s"), bs(b"25")]);
+            let Frame::Array(items) = out else {
+                panic!("SPOP with count must return an array");
+            };
+            assert_eq!(items.len(), 25, "SPOP returned the wrong count");
+            let mut seen: Vec<Vec<u8>> = items
+                .iter()
+                .map(|f| match f {
+                    Frame::BulkString(b) => b.to_vec(),
+                    other => panic!("expected bulk string, got {other:?}"),
+                })
+                .collect();
+            seen.sort();
+            seen.dedup();
+            assert_eq!(seen.len(), 25, "SPOP returned duplicate members");
+            // and the set must have shrunk by exactly that many
+            assert_eq!(scard(&mut db, &[bs(b"s")]), Frame::Integer(25));
+        }
+    }
+
+    /// A fixed index would satisfy every distinctness assertion above while
+    /// being badly wrong: SPOP would always pop the same slot. Draw many times
+    /// and require more than one distinct answer.
+    #[test]
+    fn spop_single_is_not_deterministic() {
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..40 {
+            let mut db = Database::new();
+            let mut args = vec![bs(b"s")];
+            for i in 0..20u32 {
+                args.push(Frame::BulkString(Bytes::from(format!("m{i}"))));
+            }
+            sadd(&mut db, &args);
+            if let Frame::BulkString(b) = spop(&mut db, &[bs(b"s")]) {
+                distinct.insert(b.to_vec());
+            }
+        }
+        assert!(
+            distinct.len() > 1,
+            "SPOP returned the same member every time across 40 fresh sets —              the index is not actually random"
+        );
+    }
+
+    /// Same argument for SRANDMEMBER, which shares the primitive.
+    #[test]
+    fn srandmember_single_is_not_deterministic() {
+        let mut db = Database::new();
+        let mut args = vec![bs(b"s")];
+        for i in 0..20u32 {
+            args.push(Frame::BulkString(Bytes::from(format!("m{i}"))));
+        }
+        sadd(&mut db, &args);
+
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..40 {
+            if let Frame::BulkString(b) = srandmember(&mut db, &[bs(b"s")]) {
+                distinct.insert(b.to_vec());
+            }
+        }
+        assert!(
+            distinct.len() > 1,
+            "SRANDMEMBER returned the same member 40 times — index is not random"
+        );
+        // and it must not have mutated the set
+        assert_eq!(scard(&mut db, &[bs(b"s")]), Frame::Integer(20));
+    }
+
+    /// Popping exactly the whole set must yield every member once and delete
+    /// the key -- the boundary where `index::sample(len, len)` is a full
+    /// permutation and every `swap_remove` shifts something.
+    #[test]
+    fn spop_entire_set_yields_every_member_once() {
+        let mut db = Database::new();
+        let mut args = vec![bs(b"s")];
+        for i in 0..32u32 {
+            args.push(Frame::BulkString(Bytes::from(format!("m{i}"))));
+        }
+        sadd(&mut db, &args);
+
+        let Frame::Array(items) = spop(&mut db, &[bs(b"s"), bs(b"32")]) else {
+            panic!("expected array");
+        };
+        let mut seen: Vec<Vec<u8>> = items
+            .iter()
+            .map(|f| match f {
+                Frame::BulkString(b) => b.to_vec(),
+                other => panic!("expected bulk string, got {other:?}"),
+            })
+            .collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 32, "not every member came back exactly once");
+        assert_eq!(scard(&mut db, &[bs(b"s")]), Frame::Integer(0));
     }
 
     // --- SSCAN tests ---
