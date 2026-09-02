@@ -49,7 +49,7 @@ impl Database {
         // 2. Field-existence pre-check (avoids unnecessary promotion).
         let field_exists = match rv {
             RedisValue::Hash(map) => map.contains_key(field),
-            RedisValue::HashListpack(lp) => lp.iter_pairs().any(|(f, _)| f.as_bytes() == field),
+            RedisValue::HashListpack(lp) => lp.find_pair_index(field).is_some(),
             RedisValue::HashWithTtl { fields, .. } => fields.contains_key(field),
             _ => unreachable!("type-checked above"),
         };
@@ -172,7 +172,7 @@ impl Database {
                 }
             }
             RedisValueRef::HashListpack(lp) => {
-                if lp.iter_pairs().any(|(f, _)| f.as_bytes() == field) {
+                if lp.find_pair_index(field).is_some() {
                     FieldState::NoTtl
                 } else {
                     FieldState::Missing
@@ -307,14 +307,7 @@ impl Database {
                 // instead of tracking a per-element formula.
                 let before = lp.estimate_memory();
                 // Locate field among pairs, remove both field + value entries.
-                let mut found_idx: Option<usize> = None;
-                for (i, (f, _)) in lp.iter_pairs().enumerate() {
-                    if f.as_bytes() == field {
-                        found_idx = Some(i);
-                        break;
-                    }
-                }
-                if let Some(i) = found_idx {
+                if let Some(i) = lp.find_pair_index(field) {
                     // Each pair occupies two listpack slots: field at 2*i, value at 2*i+1.
                     // Remove value first (higher index) then field to keep indices stable.
                     lp.remove_at(i * 2 + 1);
@@ -411,15 +404,12 @@ impl Database {
             RedisValue::HashListpack(lp) => {
                 // Listpack cost is O(1) (capacity-based) — snapshot before/after.
                 let before = lp.estimate_memory();
-                // Locate the field-value pair by linear scan then remove both
-                // listpack slots (value first so the field index stays valid).
-                let mut found: Option<(usize, Bytes)> = None;
-                for (i, (f, v)) in lp.iter_pairs().enumerate() {
-                    if f.as_bytes() == field {
-                        found = Some((i, v.to_bytes()));
-                        break;
-                    }
-                }
+                // Locate the field-value pair by borrowed scan, then remove
+                // both listpack slots (value first so the field index stays
+                // valid). Only the matched value is materialized.
+                let found = lp
+                    .find_pair_index(field)
+                    .and_then(|i| lp.get_at(i * 2 + 1).map(|v| (i, v.to_bytes())));
                 if let Some((i, v)) = found {
                     lp.remove_at(i * 2 + 1); // value first (higher index)
                     lp.remove_at(i * 2); // then field
