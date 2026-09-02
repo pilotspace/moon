@@ -122,22 +122,58 @@ ok "remote checked out ${SHA:0:10}"
 
 # ── The legs ──────────────────────────────────────────────────────────────
 FAILED=0
+LEGN=0
+# A leg's verdict must come from the command's OWN exit status. Getting that
+# off a remote host is harder than it looks, and the first version of this
+# script got it wrong in three places at once:
+#
+#   1. `remote()` pipes gcloud through grep, so `rc=$?` after it is GREP's
+#      status, not the command's.
+#   2. every leg's command itself ended in `| tail -60`, so even a correct
+#      local capture would have read TAIL's status.
+#   3. with both dead, the only surviving check was `grep '^error'` on the
+#      last 60 lines -- which catches a cargo test failure (cargo prints
+#      `error: N targets failed`) but reports GREEN for a leg that was
+#      OOM-killed, or whose ssh dropped, because those print nothing at all.
+#
+# So: run the leg on the remote with its full output in a remote file, and
+# have the REMOTE echo the exit status as a sentinel line. No local pipe can
+# corrupt that, and a missing sentinel is itself a failure -- silence from a
+# dead leg is no longer indistinguishable from success.
 leg() { # leg <name> <remote-shell-command>
-  local name="$1" cmd="$2" start rc
+  local name="$1" cmd="$2" start rc out rlog
+  LEGN=$((LEGN + 1)); rlog="/tmp/cigcp-leg$LEGN.log"
   say "$name"
   start=$SECONDS
-  # Capture rc DIRECTLY — never through a pipe, which would report the
-  # exit status of `tail` and turn a red leg green.
-  remote "$cmd" > "/tmp/cigcp-$$.log" 2>&1
-  rc=$?
-  if [ $rc -eq 0 ] && ! grep -qE '^(error|test result: FAILED)' "/tmp/cigcp-$$.log"; then
-    ok "$name ok ($((SECONDS-start))s)"
-  else
-    bad "$name FAILED rc=$rc ($((SECONDS-start))s)"
-    tail -40 "/tmp/cigcp-$$.log"
+  # A SUBSHELL, not a brace group: a leg command that calls `exit` (the
+  # compat leg does) would otherwise kill the remote shell before the
+  # sentinel is echoed, turning a plain non-zero exit into the "no status
+  # came back" diagnosis and misreporting WHY the leg failed.
+  out="$(remote "( $cmd ) > $rlog 2>&1; echo __LEGRC=\$?; tail -40 $rlog")"
+  rc="$(sed -n 's/^__LEGRC=\([0-9][0-9]*\)$/\1/p' <<<"$out" | tail -1)"
+
+  if [ -z "$rc" ]; then
+    bad "$name FAILED -- no exit status came back ($((SECONDS-start))s)"
+    echo "    the leg did not report: ssh dropped, or the remote process was killed."
+    echo "    this is NOT a pass; the old gate reported it as one."
+    printf '%s\n' "$out" | tail -15
     FAILED=1
+    return
   fi
-  rm -f "/tmp/cigcp-$$.log"
+  if [ "$rc" -eq 0 ]; then
+    ok "$name ok ($((SECONDS-start))s)"
+    return
+  fi
+
+  bad "$name FAILED rc=$rc ($((SECONDS-start))s)"
+  # Show the EVIDENCE, not the last 40 lines. A cargo failure names the target
+  # at the very end but panics hundreds of lines earlier, so a bare tail sent
+  # the actual assertion to /dev/null and left the failure to be reproduced by
+  # hand -- which is exactly what happened the first time this fired.
+  remote "grep -nE 'panicked|assertion|^error|FAILED|^test result: FAILED|stderr' $rlog | head -40
+          echo '    ---- last 25 lines ----'
+          tail -25 $rlog" | sed 's/^/    /'
+  FAILED=1
 }
 
 # MOON_DISK_FREE_MIN_PCT=0: the suite spawns servers that refuse to start when
@@ -156,23 +192,23 @@ ENVBASE="export PATH=\$HOME/.cargo/bin:\$PATH MOON_DISK_FREE_MIN_PCT=0 CARGO_INC
 
 # 1. THE leg --native cannot produce: monoio with io_uring live.
 leg "monoio suite (io_uring LIVE — the shipped runtime)" \
-  "$ENVBASE export CARGO_TARGET_DIR=\$HOME/ci-target/gcp-monoio; cargo test --no-fail-fast 2>&1 | tail -60"
+  "$ENVBASE export CARGO_TARGET_DIR=\$HOME/ci-target/gcp-monoio; cargo test --no-fail-fast 2>&1"
 
 leg "tokio suite (MOON_NO_URING=1)" \
-  "$ENVBASE export CARGO_TARGET_DIR=\$HOME/ci-target/gcp-tokio MOON_NO_URING=1; cargo test --no-default-features --features runtime-tokio,jemalloc --no-fail-fast 2>&1 | tail -60"
+  "$ENVBASE export CARGO_TARGET_DIR=\$HOME/ci-target/gcp-tokio MOON_NO_URING=1; cargo test --no-default-features --features runtime-tokio,jemalloc --no-fail-fast 2>&1"
 
 # 3. client-compat needs a release binary; pin MOON_BIN to THIS build, never
 #    let find_moon_binary() fall back to a target/release/moon of unknown
 #    provenance (that has produced a green run against a stale binary before).
 leg "client-compat vs real redis-server" \
   "$ENVBASE export CARGO_TARGET_DIR=\$HOME/ci-target/gcp-rel;
-   cargo build --release 2>&1 | tail -5;
+   cargo build --release;
    export MOON_BIN=\$HOME/ci-target/gcp-rel/release/moon;
    test -x \$MOON_BIN || { echo 'error: MOON_BIN missing'; exit 1; };
-   ./scripts/test-client-compat.sh 2>&1 | tail -40"
+   ./scripts/test-client-compat.sh"
 
 leg "MSRV 1.94 (cargo check)" \
-  "$ENVBASE export CARGO_TARGET_DIR=\$HOME/ci-target/gcp-msrv; cargo +1.94.0 check --all-targets 2>&1 | tail -20"
+  "$ENVBASE export CARGO_TARGET_DIR=\$HOME/ci-target/gcp-msrv; cargo +1.94.0 check --all-targets"
 
 # ── Verdict, naming the gap rather than printing a bare PASS ──────────────
 say "verdict"
