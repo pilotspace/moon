@@ -103,6 +103,15 @@ GOT="$(remote "
   cd $REPO_REMOTE || exit 9
   git fetch /tmp/moon-gate.bundle '+HEAD:refs/heads/cigate' -f >/dev/null 2>&1
   git checkout -q --detach cigate 2>/dev/null
+  # Self-maintenance: every run fetches a bundle and those objects accumulate.
+  # Measured: .git reached 3.3G over a single session, pushed free space under
+  # the pre-flight threshold, and the gate began refusing its OWN runs. A gc
+  # once .git passes 2G brought it back to 357M in seconds.
+  if [ \"\$(du -sm .git 2>/dev/null | cut -f1)\" -gt 2048 ]; then
+    git branch -D cigate >/dev/null 2>&1
+    git reflog expire --expire=now --all >/dev/null 2>&1
+    git gc --prune=now --quiet >/dev/null 2>&1
+  fi
   git rev-parse HEAD
 " | tr -d '[:space:]')"
 if [ "$GOT" != "$SHA" ]; then
