@@ -50,6 +50,7 @@ jobs:
         target:
           - resp_parse
           - resp_parse_differential
+          - listpack_decoder_differential
           - resp_parse_fused
           - inline_parse
           - wal_v3_record
@@ -131,6 +132,7 @@ jobs:
         target:
           - resp_parse
           - resp_parse_differential
+          - listpack_decoder_differential
           - resp_parse_fused
           - inline_parse
           - wal_v3_record

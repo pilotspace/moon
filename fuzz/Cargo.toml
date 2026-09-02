@@ -128,3 +128,8 @@ doc = false
 name = "ft_create_args"
 path = "fuzz_targets/ft_create_args.rs"
 doc = false
+
+[[bin]]
+name = "listpack_decoder_differential"
+path = "fuzz_targets/listpack_decoder_differential.rs"
+doc = false
