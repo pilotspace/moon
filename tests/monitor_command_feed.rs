@@ -1161,8 +1161,14 @@ fn mon21_slow_monitor_is_dropped_not_stalled() {
     // Assert on END OF STREAM, not on an empty drain: `after.is_empty()` is
     // true whenever no line happened to be buffered, so an earlier version of
     // this assertion was satisfied by a STARVED BUT OPEN connection — exactly
-    // the failure mode the policy exists to rule out. A closed socket answers
-    // Ok(0) (or errors); a starved-but-open one blocks until the timeout.
+    // the failure mode the policy exists to rule out.
+    //
+    // Classifying the probe read as `Ok(0) | Err(_)` does not rule that out
+    // either, and that is the subtler bug: a starved-but-open socket answers
+    // the probe by BLOCKING until the read timeout, and a timeout is an
+    // `Err` — so the very state this assertion exists to catch was scored as
+    // a pass. The three outcomes have to be separated by error KIND, not
+    // collapsed into "not Ok(n>0)". See `classify_probe`.
     let mut mon = mon;
     // Whatever the OS already buffered from the burst is irrelevant to this
     // check — only whether the socket is actually closed matters. Drain the
@@ -1175,13 +1181,99 @@ fn mon21_slow_monitor_is_dropped_not_stalled() {
         .expect("read timeout");
     let _ = mon.sock.write_all(b"*1\r\n$4\r\nPING\r\n");
     let mut probe_buf = [0u8; 64];
-    let eof = matches!(mon.sock.read(&mut probe_buf), Ok(0) | Err(_));
-    assert!(
-        eof,
-        "the slow monitor's connection must be CLOSED, not silently starved \
-         of lines — a lossy feed an operator cannot detect is the failure mode \
-         this policy exists to avoid"
-    );
+    match classify_probe(mon.sock.read(&mut probe_buf)) {
+        ProbeState::Closed => {}
+        ProbeState::Starved => panic!(
+            "the slow monitor's connection is STARVED BUT OPEN: it accepted the \
+             probe and then answered nothing before the {CEILING:?} read timeout. \
+             A feed that goes quiet without closing is precisely the lossy-but-\
+             undetectable failure mode this policy exists to avoid — an operator \
+             cannot tell it from an idle server."
+        ),
+        ProbeState::Alive(n) => panic!(
+            "the slow monitor's connection must be CLOSED, not left serving: the \
+             probe got {n} byte(s) back, so the connection is still live and the \
+             server never shed the reader it could not keep up with."
+        ),
+    }
+}
+
+/// What a single probe read says about the far end of a socket we have just
+/// written to.
+///
+/// Kept as a pure function over the `io::Result` so the three states can be
+/// unit-tested without conjuring three real sockets in three real states —
+/// see `classify_probe_*` below. The distinction matters because two of them
+/// used to be spelled the same way (`Err(_)`), and the one that was silently
+/// absorbed was the failure this file's policy exists to detect.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeState {
+    /// Orderly close (`Ok(0)`) or a reset/abort/pipe error — the peer is gone.
+    Closed,
+    /// The read timed out: the socket is OPEN and the peer said nothing.
+    Starved,
+    /// The peer answered. Carries the byte count for the failure message.
+    Alive(usize),
+}
+
+fn classify_probe(res: std::io::Result<usize>) -> ProbeState {
+    use std::io::ErrorKind::*;
+    match res {
+        Ok(0) => ProbeState::Closed,
+        Ok(n) => ProbeState::Alive(n),
+        // A read timeout is reported as WouldBlock on some platforms and
+        // TimedOut on others; both mean "open, but nothing came".
+        Err(e) if matches!(e.kind(), WouldBlock | TimedOut) => ProbeState::Starved,
+        Err(e) if matches!(e.kind(), ConnectionReset | ConnectionAborted | BrokenPipe) => {
+            ProbeState::Closed
+        }
+        // Anything else is genuinely ambiguous. Fail closed — report it as the
+        // state that FAILS the test, so an unexpected errno surfaces as a red
+        // test with an errno in the message instead of a quiet pass.
+        Err(e) => panic!(
+            "probe read failed with an unclassifiable error: {e:?} ({:?})",
+            e.kind()
+        ),
+    }
+}
+
+#[test]
+fn classify_probe_orderly_close_is_closed() {
+    assert_eq!(classify_probe(Ok(0)), ProbeState::Closed);
+}
+
+#[test]
+fn classify_probe_reply_is_alive() {
+    assert_eq!(classify_probe(Ok(7)), ProbeState::Alive(7));
+}
+
+/// The regression this classifier exists for: before it, both of these were
+/// `Err(_)` and therefore scored as "connection closed" — a pass. A monitor
+/// that is open and silent is the exact failure `mon21` is written to catch.
+#[test]
+fn classify_probe_read_timeout_is_starved_not_closed() {
+    for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+        assert_eq!(
+            classify_probe(Err(std::io::Error::new(kind, "timed out"))),
+            ProbeState::Starved,
+            "{kind:?} means the socket is OPEN and silent, never that it closed"
+        );
+    }
+}
+
+#[test]
+fn classify_probe_peer_gone_errors_are_closed() {
+    for kind in [
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::ConnectionAborted,
+        std::io::ErrorKind::BrokenPipe,
+    ] {
+        assert_eq!(
+            classify_probe(Err(std::io::Error::new(kind, "gone"))),
+            ProbeState::Closed,
+            "{kind:?} means the peer is gone"
+        );
+    }
 }
 
 // ── contract: <addr> is the literal `lua` for script-issued commands ────────
