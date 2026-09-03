@@ -739,9 +739,17 @@ mod tests {
 
     #[test]
     fn test_segment_insert_or_update_at_probes_at_most_two_groups_on_miss() {
-        // On an empty segment, insert_or_update_at should scan at most 2 groups
-        // for h2 + 2 for empty = 4 SIMD probes. With fallback groups it can go
-        // up to 6. Assert ≤ 6.
+        // On an empty segment, insert_or_update_at scans at most 2 groups for
+        // h2 + the same 2 for empty/deleted = 4 SIMD probes (2 when bucket_a
+        // and bucket_b share a group). It must never revisit a group, and
+        // `has_non_home_keys` is false on a fresh segment so the fallback scan
+        // is skipped entirely — so 4 is the true bound, not 6.
+        //
+        // moon#789: this assertion, not the wall-clock ratio in
+        // `tests/perf_v0112_insert_or_update_single_probe.rs`, is the
+        // regression net for PERF-08's single-probe *structure*. The wall-clock
+        // ratio is arch-dependent (measured: aarch64 wins ~11% on the miss
+        // path, x86_64 loses ~17%); the probe count is not.
         let mut seg: Segment<Vec<u8>, u32> = Segment::new(0);
         let probes_before = seg.probe_count();
         let k = b"probe_test".to_vec();
@@ -752,8 +760,11 @@ mod tests {
         let probes_after = seg.probe_count();
         let delta = probes_after - probes_before;
         assert!(
-            delta <= 6,
-            "insert_or_update_at on empty segment did {} SIMD probes; expected <= 6",
+            delta <= 4,
+            "insert_or_update_at on empty segment did {} SIMD probes; expected <= 4 \
+             (2 home groups x {{h2, empty-or-deleted}}). More than that means the \
+             fused path is re-scanning a group — the PERF-08 single-probe \
+             property has regressed.",
             delta
         );
     }

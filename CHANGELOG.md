@@ -8,6 +8,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`test`: the PERF-08 single-probe timing net was measuring a page-fault
+  artifact, not the optimisation (moon#789).**
+  `tests/perf_v0112_insert_or_update_single_probe.rs` timed the legacy
+  `get_mut`+`insert` control and the fused `insert_or_update` back to back in
+  one process, always control first, and kept the **best** of five ratios. Its
+  comment claimed runner noise "can only *inflate* the ratio toward 1.0, never
+  deflate it". That was false. The first timed loop in the process takes ~5,000
+  minor page faults that no later loop takes (measured: `minflt = 5061` for
+  loop #1, `0` afterwards, on both arches), so the control was handicapped by
+  ~27% on rep 0 — and best-of-K deterministically *selected* that rep.
+  Swapping the loop order moved the artifact onto the test loop instead
+  (rep 0 ratio 0.779 → 1.190), proving it positional.
+
+  Consequences, both measured on GCE (`t2a-standard-8` Neoverse-N1 and
+  `c3-standard-8` Xeon 8481C), 1M keys, warmed, isolated, order-alternating:
+
+  - **The aarch64 pass was the artifact.** Warm the process up and the old
+    mixed workload gives a median of **0.975** on aarch64 — above its own 0.95
+    threshold. The regression net had been green on aarch64 for the wrong
+    reason since April 2026, so a real regression could have landed unnoticed.
+  - **The wall-clock win is arch-specific.** On the miss path — the only path
+    PERF-08 changes, compared at identical work — the fused probe is
+    **0.893×** (≈11% faster) on aarch64 and **1.166×** (≈17% *slower*) on
+    x86_64, despite issuing strictly fewer SIMD probes. This is codegen, not
+    extra work; tracked in moon#789. `Database::set` still issues one probe
+    everywhere, so nothing is functionally wrong.
+
+  The test now warms up, keeps exactly one table alive per measurement,
+  alternates loop order, measures the pure-miss workload (where both loops
+  build exactly one `CompactKey` per iteration, so the comparison is honest),
+  and asserts the **median** against a documented per-arch threshold instead of
+  the best-of-K minimum. The structural single-probe guarantee is gated
+  deterministically by
+  `test_segment_insert_or_update_at_probes_at_most_two_groups_on_miss`, whose
+  bound is tightened from `<= 6` to the true `<= 4`. The PERF-08 speed claim in
+  `Database::set`'s docs is corrected to say the probe-count reduction is
+  universal and the wall-clock win is not.
+
 - **`storage`: numeric strings with leading zeros or a leading `+` are no longer
   rewritten (data loss).** `SADD s 000000012345` followed by `SMEMBERS` returned
   **`12345`** — the caller's bytes were gone, not merely reformatted. The same
