@@ -366,6 +366,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing. Found by security review of this branch before it was opened, and
   guarded by the two `g6_*` tests.
 
+  A second obligation had to be added for the same reason, and this one was
+  caught by the existing suite rather than by review.
+  `segment_stall::stall_refusal` — the only producer of `-MOONERR memfull`,
+  the MA12 disk-free refusal and the moon#718 segment-stall refusal — has
+  exactly two call sites, both in generic dispatch. `try_inline_dispatch` has
+  none, so an inlined `SET` answered `+OK` for a write the server had already
+  committed to refusing under memory or disk pressure. Merge-base 7678156f
+  passes `tests/mem_watchdog.rs` and `tests/compaction_escape_hatch_718.rs`;
+  this branch failed all three of their cases until the inline path grew a
+  `is_any_write_stall_active()` bail-out next to the eviction one. It BAILS to
+  generic dispatch rather than answering the error itself: `stall_refusal`
+  exempts the commands that are a stall's own remedy, and re-deriving that here
+  is the drift the shared helper exists to prevent.
+
   The two previously-dead terms had no test at all, and both fail dangerously:
 
   - `!fanout_hint_active()` — deleting it makes a master with an attached

@@ -63,6 +63,14 @@
 //! | gut `Database::remove_cold_only` (`storage/db/kv_ops.rs`) | G3 |
 //! | drop `&& !monitored` from `can_inline_writes` | G4 monitor |
 //! | drop `&& !conn.in_cross_txn()` from `can_inline_writes` | G6 both (counter `2 -> 3`; `GET k` answers `"modified"` after `TXN ABORT`) |
+//! | delete the `is_any_write_stall_active()` bail-out in `blocking.rs` | NOT this file — `mem_watchdog` cases A and B, and `compaction_escape_hatch_718` (merge-base green, branch red) |
+//!
+//! The write-stall row is deliberately guarded OUTSIDE this file. The refusal
+//! it protects is produced by `segment_stall::stall_refusal`, whose exemptions
+//! (moon#718's escape hatch) and three sources already have dedicated suites;
+//! re-asserting them here would duplicate that coverage and drift from it. The
+//! row is recorded so the mutation ledger stays a complete index of what was
+//! proved, not only of what this file proves.
 //!
 //! The first of those is the precise WRONG fix this file exists to guard
 //! against — widening the gate without giving the inline path a way to stand
