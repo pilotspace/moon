@@ -84,11 +84,21 @@ pub fn record_session_results(
         Err(_) => return, // wrong type — silently skip (don't crash on user error)
     };
 
+    // moon#788: this recorder grows a sorted set through a raw `&mut`. It
+    // charged nothing, so a long-lived search session was invisible to
+    // `used_memory` and to the `--maxmemory` gate.
+    let mut mem_charge: usize = 0;
+    let table_before = crate::storage::db::zset_table_bytes(members, tree);
     for key in keys_to_record {
         // Only insert if not already present (idempotent)
         if !members.contains_key(&key) {
+            mem_charge += crate::storage::db::zset_member_cost(&key);
             members.insert(key.clone(), timestamp);
             tree.insert(ordered_float::OrderedFloat(timestamp), key);
         }
     }
+    let table_after = crate::storage::db::zset_table_bytes(members, tree);
+    // `members`/`tree`'s borrow of `db` ends above.
+    db.charge_memory(mem_charge);
+    db.adjust_memory(table_before, table_after);
 }

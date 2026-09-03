@@ -303,6 +303,13 @@ mod footprint_tests {
         // An unmeasured process must not be corrected. 1.0 is the only safe
         // default: the correction divides the budget, so anything above 1.0
         // here would evict on the strength of a measurement nobody took.
+        //
+        // `CORRECTION_BITS` is process-global and
+        // `correction_round_trips_a_published_ratio` writes 2.5 into it, so
+        // this must hold TEST_LOCK like every other test that touches a
+        // shared atomic here — without it the two race and this assertion
+        // reads the other test's 2.5 (~1 run in 6, measured).
+        let _guard = TEST_LOCK.lock();
         assert_eq!(f64::from_bits(0u64).to_bits(), 0);
         let saved = CORRECTION_BITS.swap(0, Ordering::Relaxed);
         assert_eq!(footprint_correction(), 1.0);
@@ -311,6 +318,7 @@ mod footprint_tests {
 
     #[test]
     fn correction_round_trips_a_published_ratio() {
+        let _guard = TEST_LOCK.lock();
         let saved = CORRECTION_BITS.swap(2.5f64.to_bits(), Ordering::Relaxed);
         assert_eq!(footprint_correction(), 2.5);
         CORRECTION_BITS.store(saved, Ordering::Relaxed);

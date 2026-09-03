@@ -334,7 +334,9 @@ impl Listpack {
 
     /// Estimate memory usage.
     pub fn estimate_memory(&self) -> usize {
-        std::mem::size_of::<Self>() + self.data.capacity()
+        // moon#788: the data buffer is a real heap allocation, so bill the
+        // jemalloc size class it lands in, not the exact capacity.
+        std::mem::size_of::<Self>() + crate::storage::mem_size::size_class(self.data.capacity())
     }
 
     // --- Internal helpers ---

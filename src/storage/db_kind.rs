@@ -58,7 +58,21 @@ pub trait OwnedKind {
     /// Exactly the conversions the hand-written accessors performed — e.g.
     /// sorted sets upgrade the legacy `BTreeMap` form but deliberately NOT
     /// `SortedSetListpack` (its upgrade lives in the zset command layer).
-    fn upgrade(entry: &mut Entry);
+    ///
+    /// Returns the signed byte delta the conversion made to this entry's
+    /// estimated size, for the caller to apply to `used_memory` (moon#788).
+    /// A compact encoding and the full one it becomes are different
+    /// allocations of very different size — a listpack is one flat buffer,
+    /// a `VecDeque<Bytes>` is a slot array plus one heap block per element —
+    /// so an unaccounted upgrade silently desynchronises the ledger from the
+    /// keyspace. LPOP hit exactly that: it upgraded a listpack, then credited
+    /// full-encoding element costs against a listpack-sized charge.
+    ///
+    /// Costs nothing when no conversion happens: the size is only measured
+    /// inside the branch that converts, where the walk is the same O(n) the
+    /// conversion itself already pays, once per key lifetime.
+    #[must_use]
+    fn upgrade(entry: &mut Entry) -> isize;
 
     /// Project the (post-upgrade) full encoding out of the value, mutably.
     fn project_mut(val: &mut RedisValue) -> Result<Self::Mut<'_>, WrongType>;
@@ -124,13 +138,18 @@ impl OwnedKind for HashKind {
         Entry::new_hash()
     }
 
-    fn upgrade(entry: &mut Entry) {
+    fn upgrade(entry: &mut Entry) -> isize {
         if let Some(v) = entry.value.as_redis_value_mut() {
-            if let RedisValue::HashListpack(lp) = v {
-                let map = lp.to_hash_map();
-                *v = RedisValue::Hash(map);
+            if matches!(v, RedisValue::HashListpack(_)) {
+                let before = v.estimate_memory();
+                if let RedisValue::HashListpack(lp) = v {
+                    let map = lp.to_hash_map();
+                    *v = RedisValue::Hash(map);
+                }
+                return v.estimate_memory() as isize - before as isize;
             }
         }
+        0
     }
 
     fn project_mut(val: &mut RedisValue) -> Result<Self::Mut<'_>, WrongType> {
@@ -182,13 +201,18 @@ impl OwnedKind for ListKind {
         Entry::new_list()
     }
 
-    fn upgrade(entry: &mut Entry) {
+    fn upgrade(entry: &mut Entry) -> isize {
         if let Some(v) = entry.value.as_redis_value_mut() {
-            if let RedisValue::ListListpack(lp) = v {
-                let list = lp.to_vec_deque();
-                *v = RedisValue::List(list);
+            if matches!(v, RedisValue::ListListpack(_)) {
+                let before = v.estimate_memory();
+                if let RedisValue::ListListpack(lp) = v {
+                    let list = lp.to_vec_deque();
+                    *v = RedisValue::List(list);
+                }
+                return v.estimate_memory() as isize - before as isize;
             }
         }
+        0
     }
 
     fn project_mut(val: &mut RedisValue) -> Result<Self::Mut<'_>, WrongType> {
@@ -236,20 +260,25 @@ impl OwnedKind for SetKind {
         Entry::new_set()
     }
 
-    fn upgrade(entry: &mut Entry) {
+    fn upgrade(entry: &mut Entry) -> isize {
         if let Some(v) = entry.value.as_redis_value_mut() {
-            match v {
-                RedisValue::SetListpack(lp) => {
-                    let set = lp.to_set_value();
-                    *v = RedisValue::Set(set);
+            if matches!(v, RedisValue::SetListpack(_) | RedisValue::SetIntset(_)) {
+                let before = v.estimate_memory();
+                match v {
+                    RedisValue::SetListpack(lp) => {
+                        let set = lp.to_set_value();
+                        *v = RedisValue::Set(set);
+                    }
+                    RedisValue::SetIntset(is) => {
+                        let set = is.to_set_value();
+                        *v = RedisValue::Set(set);
+                    }
+                    _ => {}
                 }
-                RedisValue::SetIntset(is) => {
-                    let set = is.to_set_value();
-                    *v = RedisValue::Set(set);
-                }
-                _ => {}
+                return v.estimate_memory() as isize - before as isize;
             }
         }
+        0
     }
 
     fn project_mut(val: &mut RedisValue) -> Result<Self::Mut<'_>, WrongType> {
@@ -307,7 +336,16 @@ impl OwnedKind for SortedSetKind {
     /// `SortedSetListpack` is deliberately NOT upgraded here — its upgrade
     /// path lives in the zset command layer (same as the hand-written
     /// accessor this replaces).
-    fn upgrade(entry: &mut Entry) {
+    fn upgrade(entry: &mut Entry) -> isize {
+        if !matches!(
+            entry.value.as_redis_value_mut(),
+            Some(RedisValue::SortedSet { .. })
+        ) {
+            return 0;
+        }
+        // Measured on the whole `CompactValue` because the conversion below
+        // replaces it wholesale rather than the inner `RedisValue`.
+        let before = entry.value.estimate_memory();
         if let Some(RedisValue::SortedSet { members, scores }) = entry.value.as_redis_value_mut() {
             let mut tree = BPTree::new();
             let new_members = std::mem::take(members);
@@ -320,6 +358,7 @@ impl OwnedKind for SortedSetKind {
                 members: new_members,
             });
         }
+        entry.value.estimate_memory() as isize - before as isize
     }
 
     fn project_mut(val: &mut RedisValue) -> Result<Self::Mut<'_>, WrongType> {
@@ -366,7 +405,9 @@ impl OwnedKind for StreamKind {
     }
 
     /// Streams have no compact encoding — nothing to upgrade.
-    fn upgrade(_entry: &mut Entry) {}
+    fn upgrade(_entry: &mut Entry) -> isize {
+        0
+    }
 
     fn project_mut(val: &mut RedisValue) -> Result<Self::Mut<'_>, WrongType> {
         match val {

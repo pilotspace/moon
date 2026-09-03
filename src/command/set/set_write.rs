@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::storage::db::set_member_cost;
+use crate::storage::db::{set_member_cost, set_table_bytes};
 use crate::storage::entry::Entry;
 
 use super::{collect_sets, parse_int};
@@ -87,7 +87,8 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                             set.insert(member.clone());
                         }
                     }
-                    let new_cost: usize = set.iter().map(|m| set_member_cost(m)).sum();
+                    let new_cost: usize = set_table_bytes(set)
+                        + set.iter().map(|m| set_member_cost(m)).sum::<usize>();
                     db.credit_memory(after);
                     db.charge_memory(new_cost);
                     // Recount: we need accurate count of new members
@@ -112,6 +113,11 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
     };
     let mut added = 0i64;
     let mut mem_delta: usize = 0;
+    // moon#788: the `IndexSet`'s own entries `Vec` and index table are charged
+    // from their REAL capacity, snapshotted around the mutation (O(1), two
+    // `capacity()` reads) — the same pattern the listpack/intset paths use.
+    // A per-member constant cannot model a doubling table.
+    let table_before = set_table_bytes(set);
     for arg in &args[1..] {
         if let Some(member) = extract_bytes(arg) {
             if set.insert(member.clone()) {
@@ -120,8 +126,10 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
             }
         }
     }
+    let table_after = set_table_bytes(set);
     // `set`'s borrow of `db` ends above.
     db.charge_memory(mem_delta);
+    db.adjust_memory(table_before, table_after);
     Frame::Integer(added)
 }
 
@@ -145,6 +153,7 @@ pub fn srem(db: &mut Database, args: &[Frame]) -> Frame {
     };
     let mut removed = 0i64;
     let mut credit: usize = 0;
+    let table_before = set_table_bytes(set);
     for arg in &args[1..] {
         if let Some(member) = extract_bytes(arg) {
             if set.swap_remove(member) {
@@ -153,8 +162,13 @@ pub fn srem(db: &mut Database, args: &[Frame]) -> Frame {
             }
         }
     }
+    // `swap_remove` does NOT shrink the table, so this normally nets zero —
+    // which is the truth the old per-member credit got wrong by handing back
+    // table bytes the allocator still holds.
+    let table_after = set_table_bytes(set);
     // `set`'s borrow of `db` ends above.
     db.credit_memory(credit);
+    db.adjust_memory(table_before, table_after);
     // Clean up empty set
     let key_clone = key.clone();
     if let Ok(Some(s)) = db.get_set(&key_clone) {
@@ -217,14 +231,21 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
         let Ok(set) = db.get_or_create_set(key) else {
             return Frame::Null;
         };
+        let table_before = set_table_bytes(set);
         set.swap_remove(&chosen);
         let empty = set.is_empty();
+        let table_after = set_table_bytes(set);
         // `set`'s borrow of `db` ends above.
+        // moon#788: credit the member and the table shrink FIRST, in every
+        // case. The empty branch used to lean on `db.remove` to "recompute
+        // the now-empty entry cost", but that recompute no longer sees the
+        // member just popped, and a hashbrown `capacity()` shrinks as entries
+        // are erased — so the last member's bytes and the table delta were
+        // stranded on every create/drain cycle.
+        db.credit_memory(set_member_cost(&chosen));
+        db.adjust_memory(table_before, table_after);
         if empty {
-            // Whole-key removal recomputes the (now-empty) entry cost.
             db.remove(key);
-        } else {
-            db.credit_memory(set_member_cost(&chosen));
         }
         return Frame::BulkString(chosen);
     }
@@ -266,16 +287,19 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
     let Ok(set) = db.get_or_create_set(key) else {
         return Frame::Array(framevec![]);
     };
+    let table_before = set_table_bytes(set);
     for m in &chosen {
         set.swap_remove(m);
     }
     let empty = set.is_empty();
+    let table_after = set_table_bytes(set);
     // `set`'s borrow of `db` ends above.
+    // Credit unconditionally -- see the note in the single-member branch.
+    let credit: usize = chosen.iter().map(|m| set_member_cost(m)).sum();
+    db.credit_memory(credit);
+    db.adjust_memory(table_before, table_after);
     if empty {
         db.remove(key);
-    } else {
-        let credit: usize = chosen.iter().map(|m| set_member_cost(m)).sum();
-        db.credit_memory(credit);
     }
 
     let result: Vec<Frame> = chosen.into_iter().map(Frame::BulkString).collect();
@@ -515,28 +539,32 @@ pub fn smove(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(s) => s,
         Err(e) => return e,
     };
+    let src_table_before = set_table_bytes(src_set);
     if !src_set.swap_remove(&member) {
         return Frame::Integer(0);
     }
     let src_empty = src_set.is_empty();
+    let src_table_after = set_table_bytes(src_set);
     // `src_set`'s borrow of `db` ends above.
+    // Credit unconditionally -- see the note in `spop`.
+    db.credit_memory(set_member_cost(&member));
+    db.adjust_memory(src_table_before, src_table_after);
     if src_empty {
-        // Whole-key removal recomputes the (now-empty) entry cost -- covers
-        // the removed member too, so skip the standalone credit below.
         db.remove(source);
-    } else {
-        db.credit_memory(set_member_cost(&member));
     }
 
     let dst_set = match db.get_or_create_set(destination) {
         Ok(s) => s,
         Err(e) => return e,
     };
+    let dst_table_before = set_table_bytes(dst_set);
     let inserted = dst_set.insert(member.clone());
+    let dst_table_after = set_table_bytes(dst_set);
     // `dst_set`'s borrow of `db` ends above.
     if inserted {
         db.charge_memory(set_member_cost(&member));
     }
+    db.adjust_memory(dst_table_before, dst_table_after);
 
     Frame::Integer(1)
 }

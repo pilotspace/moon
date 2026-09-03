@@ -149,6 +149,11 @@ enum Node {
     Leaf(LeafNode),
 }
 
+/// Bytes one arena slot occupies. `Node` is an enum, so EVERY slot — leaf or
+/// internal — is sized by the larger variant. This is the unit the allocator
+/// actually deals in; see [`BPTree::memory_bytes`] (moon#788).
+pub const NODE_BYTES: usize = std::mem::size_of::<Node>();
+
 // ---------------------------------------------------------------------------
 // BPTree
 // ---------------------------------------------------------------------------
@@ -196,6 +201,40 @@ impl BPTree {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Bytes this tree's node arena really costs (moon#788).
+    ///
+    /// The arena is a `Vec<Node>`, and `Node` is an enum sized by its LARGER
+    /// variant — [`NODE_BYTES`], currently ~800 B, because `InternalNode`
+    /// inlines 16 `(f64, Bytes)` separator keys plus two 17-wide arrays. A
+    /// leaf holding one member occupies a whole one of those slots, and
+    /// `Vec`'s minimum non-zero capacity for an element this size is 4, so an
+    /// empty `BPTree` already owns a multi-kilobyte allocation.
+    ///
+    /// The estimator used to charge `tree.len() * 80` — per *entry*, where
+    /// the allocation is per *node* — so a 5-member zset was billed 400 B
+    /// against a real 3584 B, and the fixed cost of the tree was invisible to
+    /// `used_memory` entirely. That is the 5.75x under-report moon#788
+    /// measured on Linux.
+    ///
+    /// O(1): two `capacity()` field reads and integer arithmetic. Safe to
+    /// snapshot before/after every mutation on the write path.
+    #[inline]
+    #[must_use]
+    pub fn memory_bytes(&self) -> usize {
+        use crate::storage::mem_size::vec_bytes;
+        vec_bytes(self.nodes.capacity(), NODE_BYTES)
+            + vec_bytes(self.free_list.capacity(), std::mem::size_of::<NodeId>())
+    }
+
+    /// Number of node slots the arena has allocated (live + free).
+    /// Exposed for the accounting tests, which assert the ledger covers the
+    /// real arena rather than a per-entry approximation.
+    #[inline]
+    #[must_use]
+    pub fn node_capacity(&self) -> usize {
+        self.nodes.capacity()
     }
 
     #[inline]

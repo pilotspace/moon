@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::collections::HashMap;
 
 mod accessors;
@@ -53,6 +54,57 @@ fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
 // per-element formula — simpler and just as cheap.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Allocator-truthful per-element costs (moon#788).
+//
+// The constants below used to be round numbers with no allocation behind
+// them — `member.len() + 24` for a `HashSet<Bytes>` member, `tree.len() * 80`
+// for a B+tree that allocates ~800 B per NODE. Measured on Linux
+// (c3-standard-8, 8 shards) the ledger under-reported sets by 2.91x and
+// sorted sets by 5.75x against real RSS, so `--maxmemory` could not bind
+// before the OOM killer arrived. Each constant now names the allocation it
+// stands for:
+//
+//   * the element's own bytes, rounded to the jemalloc size class that
+//     actually gets handed out (`mem_size::size_class`), and
+//   * the container's slot for it: `size_of` of the real slot type, scaled by
+//     the allocator's growth-cycle average (`mem_size::amortized_*_slot`).
+//
+// Where the container exposes an O(1) `capacity()` the table is charged
+// EXACTLY instead of per element — `set_table_bytes` and `zset_table_bytes`
+// below. Those two are the encodings the measurement showed as broken, and
+// exactness there is worth the before/after snapshot at their mutation sites
+// (the same pattern the listpack/intset paths already use, see the WS6 note).
+//
+// For `Hash`/`List` no such snapshot exists at every mutation site, so the
+// table share is folded into the per-element constant as a cycle average. A
+// single linear constant CANNOT track a doubling allocator exactly: the true
+// figure oscillates between 1.14x and 2.29x of the slot within each doubling.
+// The average is the honest choice; the constants are rounded up, never down.
+// ---------------------------------------------------------------------------
+
+use super::mem_size::{amortized_hash_slot, amortized_vec_slot, size_class};
+
+/// Slot cost of one `HashMap<Bytes, Bytes>` entry (`Hash`, `HashWithTtl.fields`).
+const HASH_FIELD_SLOT: usize = amortized_hash_slot(std::mem::size_of::<(Bytes, Bytes)>());
+/// Slot cost of one `HashMap<Bytes, u64>` entry (`HashWithTtl.ttls`).
+const HASH_TTL_SLOT: usize = amortized_hash_slot(std::mem::size_of::<(Bytes, u64)>());
+/// Slot cost of one `VecDeque<Bytes>` element (`List`).
+const LIST_ELEM_SLOT: usize = amortized_vec_slot(std::mem::size_of::<Bytes>());
+/// Slot cost of one entry in the LEGACY `SortedSet { members, scores }`
+/// encoding: a `HashMap<Bytes, f64>` slot plus a `BTreeMap` node share
+/// (`(OrderedFloat<f64>, Bytes)` keys, nodes roughly two-thirds full).
+const LEGACY_ZSET_SLOT: usize =
+    amortized_hash_slot(std::mem::size_of::<(Bytes, f64)>()) + std::mem::size_of::<(f64, Bytes)>();
+/// Slot cost of one `IndexSet<Bytes>` entry, for the `swap_remove` credit
+/// path only — the live table is charged from `capacity()` by
+/// [`set_table_bytes`], so this is ZERO and the member's own bytes are the
+/// whole per-member charge.
+const SET_MEMBER_SLOT: usize = 0;
+/// Slot cost of one `SortedSetBPTree.members` entry. Zero for the same
+/// reason: [`zset_table_bytes`] charges that map from its `capacity()`.
+const ZSET_MEMBER_SLOT: usize = 0;
+
 /// Per-field byte cost for a `RedisValue::Hash` / `HashWithTtl.fields` entry.
 /// MUST mirror the `Hash` arm of `RedisValue::estimate_memory` exactly.
 #[inline]
@@ -65,37 +117,89 @@ pub fn hash_field_cost(field: &[u8], value: &[u8]) -> usize {
 /// `Bytes::len()` is captured beforehand since it doesn't consume the value.
 #[inline]
 pub fn hash_field_cost_len(field_len: usize, value_len: usize) -> usize {
-    field_len + value_len + 64
+    size_class(field_len) + size_class(value_len) + HASH_FIELD_SLOT
 }
 
 /// Per-field TTL sidecar byte cost (`HashWithTtl.ttls`). MUST mirror the
 /// `HashWithTtl` arm's `ttls` term in `RedisValue::estimate_memory`.
+///
+/// The field `Bytes` here is a clone of the one already billed in `fields`,
+/// so its bytes are counted twice. That is deliberate over-reporting: a
+/// per-field TTL sidecar is the one shape where a shared-buffer clone can
+/// outlive its origin, and over-report is the safe direction for a gate.
 #[inline]
 pub fn hash_ttl_field_cost(field: &[u8]) -> usize {
-    field.len() + 8 + 32
+    size_class(field.len()) + HASH_TTL_SLOT
 }
 
 /// Per-element byte cost for `RedisValue::List`. MUST mirror the `List` arm
 /// of `RedisValue::estimate_memory`.
 #[inline]
 pub fn list_elem_cost(elem: &[u8]) -> usize {
-    elem.len() + 24
+    size_class(elem.len()) + LIST_ELEM_SLOT
 }
 
-/// Per-member byte cost for `RedisValue::Set`. MUST mirror the `Set` arm of
+/// Per-member byte cost for `RedisValue::Set` — the member's own heap bytes.
+/// The `IndexSet` table itself is charged separately and exactly by
+/// [`set_table_bytes`]. MUST mirror the `Set` arm of
 /// `RedisValue::estimate_memory`.
 #[inline]
 pub fn set_member_cost(member: &[u8]) -> usize {
-    member.len() + 24
+    size_class(member.len()) + SET_MEMBER_SLOT
 }
 
-/// Per-member byte cost for `RedisValue::SortedSetBPTree`: one fixed-size
-/// tree node (80B, `tree.len() * 80` in the estimator) plus one
-/// `members: HashMap<Bytes, f64>` entry (`member.len() + 40`). MUST mirror
-/// the `SortedSetBPTree` arm of `RedisValue::estimate_memory`.
+/// Bytes an `IndexSet<Bytes>` spends on its own two tables, from their real
+/// capacity (moon#788).
+///
+/// `IndexSet` is an entries `Vec<(HashValue, Bytes)>` plus a hashbrown index
+/// table of `usize`. Both are power-of-two/doubling allocations that the old
+/// `member.len() + 24` per-member constant did not model at all — measured
+/// per-element cost on Linux was 141.3 B for a ~14-byte member against a
+/// billed 38 B.
+///
+/// O(1): one `capacity()` read plus integer arithmetic. Call sites that
+/// mutate a set snapshot this before and after the mutation, exactly like the
+/// listpack/intset paths in the WS6 note above.
+#[inline]
+pub fn set_table_bytes(set: &crate::storage::entry::SetValue) -> usize {
+    // One entries slot: the stored `Bytes` plus indexmap's cached hash.
+    const ENTRY: usize = std::mem::size_of::<Bytes>() + std::mem::size_of::<usize>();
+    let cap = set.capacity().max(set.len());
+    super::mem_size::vec_bytes(cap, ENTRY)
+        + super::mem_size::hash_table_bytes(cap, std::mem::size_of::<usize>())
+}
+
+/// Per-member byte cost for `RedisValue::SortedSetBPTree` — the member's own
+/// heap bytes. The B+tree arena and the `members` map are charged from their
+/// real capacities by [`zset_table_bytes`]. MUST mirror the
+/// `SortedSetBPTree` arm of `RedisValue::estimate_memory`.
 #[inline]
 pub fn zset_member_cost(member: &[u8]) -> usize {
-    member.len() + 40 + 80
+    size_class(member.len()) + ZSET_MEMBER_SLOT
+}
+
+/// Per-member byte cost for the LEGACY `RedisValue::SortedSet` encoding.
+/// Nothing creates it any more (`ZADD` builds a `SortedSetBPTree`), but RDB
+/// and cold-tier decode paths can still materialise one.
+#[inline]
+pub fn legacy_zset_member_cost(member: &[u8]) -> usize {
+    size_class(member.len()) + LEGACY_ZSET_SLOT
+}
+
+/// Bytes a `SortedSetBPTree` spends on its own containers, from their real
+/// capacity (moon#788).
+///
+/// Two allocations, neither of which the old `tree.len() * 80` modelled:
+/// the B+tree's `Vec<Node>` arena (charged per NODE — a `Node` is ~800 B and
+/// `Vec`'s minimum capacity for an element that size is 4, so even a
+/// one-member zset owns a 3584-byte allocation) and the `members` hashbrown
+/// table.
+///
+/// O(1): two `capacity()` reads plus integer arithmetic.
+#[inline]
+pub fn zset_table_bytes(members: &HashMap<Bytes, f64>, tree: &super::bptree::BPTree) -> usize {
+    tree.memory_bytes()
+        + super::mem_size::hash_table_bytes(members.capacity(), std::mem::size_of::<(Bytes, f64)>())
 }
 
 // ---------------------------------------------------------------------------
@@ -2584,5 +2688,265 @@ mod tests {
         assert_eq!(db.logical_len(), 0, "emptied zset must be removed");
         assert!(db.zset_pop_max(b"z").is_none());
         assert_eq!(db.logical_len(), 0, "and the re-poll must not resurrect it");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// moon#788 — the incremental ledger must agree with a full recompute.
+//
+// `used_memory` is maintained as `entry_overhead(create) + sum(deltas)` and
+// credited back with `entry_overhead(remove)`. Any mutation site that grows a
+// container without charging the matching delta breaks that identity — the
+// WS6 hole of 2026-07-08, and the reason a capacity-snapshot term must be
+// snapshotted at EVERY site that can move the capacity. `recalculate_memory`
+// recomputes the ledger from the live data, so comparing the two is a direct,
+// non-circular check that no site was missed.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod ledger_consistency_788 {
+    use crate::protocol::Frame;
+    use crate::storage::Database;
+    use bytes::Bytes;
+
+    fn f(s: &[u8]) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s))
+    }
+
+    /// Assert the running ledger equals a from-scratch recompute, naming the
+    /// step that broke it.
+    fn assert_ledger_exact(db: &mut Database, step: &str) {
+        let running = db.estimated_memory();
+        db.recalculate_memory();
+        let recomputed = db.estimated_memory();
+        assert_eq!(
+            running, recomputed,
+            "{step}: running ledger {running} B != full recompute {recomputed} B — \
+             a mutation site charged the wrong delta (or none at all)"
+        );
+    }
+
+    #[test]
+    fn set_mutations_keep_the_ledger_exact() {
+        let mut db = Database::new();
+        // Enough members to force several table doublings, and non-integer so
+        // the intset encoding is not taken.
+        for i in 0..300u32 {
+            let m = format!("m:{i:08}");
+            crate::command::set::sadd(&mut db, &[f(b"s"), f(m.as_bytes())]);
+        }
+        assert_ledger_exact(&mut db, "after 300 SADD");
+
+        for i in 0..100u32 {
+            let m = format!("m:{i:08}");
+            crate::command::set::srem(&mut db, &[f(b"s"), f(m.as_bytes())]);
+        }
+        assert_ledger_exact(&mut db, "after 100 SREM");
+
+        for _ in 0..50 {
+            crate::command::set::spop(&mut db, &[f(b"s")]);
+        }
+        assert_ledger_exact(&mut db, "after 50 SPOP");
+
+        crate::command::set::spop(&mut db, &[f(b"s"), f(b"25")]);
+        assert_ledger_exact(&mut db, "after SPOP with count");
+
+        for i in 0..40u32 {
+            let m = format!("m:{i:08}");
+            crate::command::set::sadd(&mut db, &[f(b"src"), f(m.as_bytes())]);
+        }
+        for i in 0..20u32 {
+            let m = format!("m:{i:08}");
+            crate::command::set::smove(&mut db, &[f(b"src"), f(b"dst"), f(m.as_bytes())]);
+        }
+        assert_ledger_exact(&mut db, "after 20 SMOVE");
+
+        // Draining a set to empty takes a DIFFERENT path: the command removes
+        // the key itself, and the table charge must be credited back by
+        // `remove`'s `entry_overhead` recompute rather than by an `adjust`.
+        // Get that wrong in either direction and the ledger drifts on every
+        // create/drain cycle.
+        let mark = db.estimated_memory();
+        for i in 0..50u32 {
+            let m = format!("d:{i:08}");
+            crate::command::set::sadd(&mut db, &[f(b"drain"), f(m.as_bytes())]);
+        }
+        for i in 0..50u32 {
+            let m = format!("d:{i:08}");
+            crate::command::set::srem(&mut db, &[f(b"drain"), f(m.as_bytes())]);
+        }
+        assert_eq!(
+            db.estimated_memory(),
+            mark,
+            "SREM-to-empty auto-removed the key but left bytes charged"
+        );
+
+        // SPOP and SMOVE take a different empty branch: they call `db.remove`
+        // INSTEAD of crediting the member, so the whole cycle has to balance
+        // through `entry_overhead` alone.
+        for i in 0..40u32 {
+            let m = format!("p:{i:08}");
+            crate::command::set::sadd(&mut db, &[f(b"pop"), f(m.as_bytes())]);
+        }
+        crate::command::set::spop(&mut db, &[f(b"pop"), f(b"39")]);
+        crate::command::set::spop(&mut db, &[f(b"pop")]);
+        assert_eq!(
+            db.estimated_memory(),
+            mark,
+            "SPOP-to-empty auto-removed the key but left bytes charged"
+        );
+
+        for i in 0..40u32 {
+            let m = format!("v:{i:08}");
+            crate::command::set::sadd(&mut db, &[f(b"mvsrc"), f(m.as_bytes())]);
+        }
+        for i in 0..40u32 {
+            let m = format!("v:{i:08}");
+            crate::command::set::smove(&mut db, &[f(b"mvsrc"), f(b"mvdst"), f(m.as_bytes())]);
+        }
+        assert_ledger_exact(&mut db, "after SMOVE drained the source");
+        db.remove(b"mvdst");
+        assert_eq!(
+            db.estimated_memory(),
+            mark,
+            "SMOVE-to-empty auto-removed the source but left bytes charged"
+        );
+
+        db.remove(b"s");
+        db.remove(b"src");
+        db.remove(b"dst");
+        assert_eq!(
+            db.estimated_memory(),
+            0,
+            "removing every key must return the ledger to zero"
+        );
+    }
+
+    #[test]
+    fn sorted_set_mutations_keep_the_ledger_exact() {
+        let mut db = Database::new();
+        // 300 members forces the B+tree past its initial arena capacity, so
+        // the per-NODE growth term is exercised, not just the fixed cost.
+        for i in 0..300u32 {
+            let m = format!("m:{i:08}");
+            crate::command::sorted_set::zadd(
+                &mut db,
+                &[f(b"z"), f(i.to_string().as_bytes()), f(m.as_bytes())],
+            );
+        }
+        assert_ledger_exact(&mut db, "after 300 ZADD");
+
+        crate::command::sorted_set::zincrby(&mut db, &[f(b"z"), f(b"5"), f(b"m:00000001")]);
+        crate::command::sorted_set::zincrby(&mut db, &[f(b"z"), f(b"5"), f(b"brand-new")]);
+        assert_ledger_exact(&mut db, "after ZINCRBY");
+
+        for i in 0..100u32 {
+            let m = format!("m:{i:08}");
+            crate::command::sorted_set::zrem(&mut db, &[f(b"z"), f(m.as_bytes())]);
+        }
+        assert_ledger_exact(&mut db, "after 100 ZREM");
+
+        crate::command::sorted_set::zpopmin(&mut db, &[f(b"z"), f(b"30")]);
+        assert_ledger_exact(&mut db, "after ZPOPMIN 30");
+        crate::command::sorted_set::zpopmax(&mut db, &[f(b"z"), f(b"30")]);
+        assert_ledger_exact(&mut db, "after ZPOPMAX 30");
+
+        // Same drain-to-empty path for sorted sets: ZPOPMIN takes the last
+        // member, the command removes the key, and the B+tree arena — by far
+        // the largest term — has to be credited back exactly once.
+        let mark = db.estimated_memory();
+        for i in 0..50u32 {
+            let m = format!("d:{i:08}");
+            crate::command::sorted_set::zadd(
+                &mut db,
+                &[f(b"drain"), f(i.to_string().as_bytes()), f(m.as_bytes())],
+            );
+        }
+        crate::command::sorted_set::zpopmin(&mut db, &[f(b"drain"), f(b"50")]);
+        assert_eq!(
+            db.estimated_memory(),
+            mark,
+            "ZPOPMIN-to-empty auto-removed the key but left bytes charged"
+        );
+
+        db.remove(b"z");
+        assert_eq!(
+            db.estimated_memory(),
+            0,
+            "removing the only key must return the ledger to zero"
+        );
+    }
+
+    #[test]
+    fn hash_and_list_mutations_keep_the_ledger_exact() {
+        let mut db = Database::new();
+        // Past LISTPACK_MAX_ENTRIES so both the compact and the full encoding
+        // are exercised, including the one-time upgrade swing.
+        for i in 0..300u32 {
+            let fd = format!("f:{i:08}");
+            let v = format!("v:{i:08}");
+            crate::command::hash::hset(&mut db, &[f(b"h"), f(fd.as_bytes()), f(v.as_bytes())]);
+            let e = format!("e:{i:08}");
+            crate::command::list::rpush(&mut db, &[f(b"l"), f(e.as_bytes())]);
+        }
+        assert_ledger_exact(&mut db, "after 300 HSET + 300 RPUSH");
+
+        for i in 0..100u32 {
+            let fd = format!("f:{i:08}");
+            crate::command::hash::hdel(&mut db, &[f(b"h"), f(fd.as_bytes())]);
+        }
+        assert_ledger_exact(&mut db, "after 100 HDEL");
+
+        for _ in 0..100 {
+            crate::command::list::lpop(&mut db, &[f(b"l")]);
+        }
+        assert_ledger_exact(&mut db, "after 100 LPOP");
+
+        // Drain both to empty: the command removes the key itself, so the
+        // whole create/drain cycle has to net to zero or the ledger climbs on
+        // every cycle until the gate fires on memory nobody holds.
+        let mark = db.estimated_memory();
+        for i in 0..60u32 {
+            let fd = format!("g:{i:08}");
+            crate::command::hash::hset(&mut db, &[f(b"h2"), f(fd.as_bytes()), f(b"v")]);
+            let e = format!("g:{i:08}");
+            crate::command::list::rpush(&mut db, &[f(b"l2"), f(e.as_bytes())]);
+        }
+        for i in 0..60u32 {
+            let fd = format!("g:{i:08}");
+            crate::command::hash::hdel(&mut db, &[f(b"h2"), f(fd.as_bytes())]);
+            crate::command::list::lpop(&mut db, &[f(b"l2")]);
+        }
+        assert_eq!(
+            db.estimated_memory(),
+            mark,
+            "draining a hash and a list to empty left bytes charged"
+        );
+    }
+
+    /// GEOADD grows a sorted set through a raw `&mut`. Before moon#788 it
+    /// charged nothing at all, so a geo key was invisible to `--maxmemory`.
+    #[test]
+    fn geoadd_charges_the_sorted_set_it_grows() {
+        let mut db = Database::new();
+        let before = db.estimated_memory();
+        for i in 0..200u32 {
+            let m = format!("place:{i:08}");
+            let lon = format!("{}", (i as f64) / 100.0);
+            let lat = format!("{}", (i as f64) / 200.0);
+            crate::command::geo::geoadd(
+                &mut db,
+                &[
+                    f(b"geo"),
+                    f(lon.as_bytes()),
+                    f(lat.as_bytes()),
+                    f(m.as_bytes()),
+                ],
+            );
+        }
+        assert!(
+            db.estimated_memory() > before,
+            "GEOADD grew a sorted set by 200 members and charged nothing"
+        );
+        assert_ledger_exact(&mut db, "after 200 GEOADD");
     }
 }

@@ -142,7 +142,12 @@ impl Database {
                 b"ERR internal: lookup failed after insert",
             )));
         };
-        K::upgrade(entry);
+        // moon#788: a compact→full encoding upgrade changes the entry's real
+        // size; charge the difference or the ledger silently desynchronises
+        // from the keyspace. Disjoint field borrows: `entry` borrows
+        // `self.data`, the counter is a separate field.
+        let encoding_delta = K::upgrade(entry);
+        self.used_memory = self.used_memory.saturating_add_signed(encoding_delta);
         match entry.value.as_redis_value_mut() {
             Some(v) => match K::project_mut(v) {
                 Ok(m) => Ok(m),
@@ -177,7 +182,12 @@ impl Database {
         let Some(entry) = self.data.get_mut(key) else {
             return Ok(None);
         };
-        K::upgrade(entry);
+        // moon#788: a compact→full encoding upgrade changes the entry's real
+        // size; charge the difference or the ledger silently desynchronises
+        // from the keyspace. Disjoint field borrows: `entry` borrows
+        // `self.data`, the counter is a separate field.
+        let encoding_delta = K::upgrade(entry);
+        self.used_memory = self.used_memory.saturating_add_signed(encoding_delta);
         match entry.value.as_redis_value_mut() {
             Some(v) => match K::project_mut(v) {
                 Ok(m) => Ok(Some(m)),
@@ -202,7 +212,12 @@ impl Database {
             self.promote_cold_if_present(key, now_ms);
         }
         if let Some(entry) = self.data.get_mut(key) {
-            K::upgrade(entry);
+            // moon#788: a compact→full encoding upgrade changes the entry's real
+            // size; charge the difference or the ledger silently desynchronises
+            // from the keyspace. Disjoint field borrows: `entry` borrows
+            // `self.data`, the counter is a separate field.
+            let encoding_delta = K::upgrade(entry);
+            self.used_memory = self.used_memory.saturating_add_signed(encoding_delta);
         }
         match self.data.get(key) {
             None => Ok(None),

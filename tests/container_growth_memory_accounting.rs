@@ -564,3 +564,144 @@ fn test_hdel_self_recovery_past_db_maxmemory_boundary() {
          draining -- got {r:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Case F (moon#788): the fixed cost of a container must be visible to
+// `used_memory` through the real dispatch path, not just to a unit test.
+//
+// A sorted set is a `SortedSetBPTree`, and its node arena is a `Vec<Node>`
+// where `Node` is an enum sized by `InternalNode` (784 B) and `Vec`'s minimum
+// capacity for an element that size is 4 — so an EMPTY B+tree already owns a
+// 3136-byte allocation. The estimator charged `tree.len() * 80`, per entry,
+// which made that whole fixed cost invisible: a one-member zset billed 134 B.
+// Measured on Linux at 50k keys the ledger was 15.1x below real RSS, i.e. an
+// operator's `--maxmemory` gate could not fire before the OOM killer did.
+//
+// The floor below is deliberately far under the real arena (3136 B): it must
+// hold on every 64-bit target without tracking the exact node layout, while
+// still being an order of magnitude above the pre-fix 134 B.
+// ---------------------------------------------------------------------------
+
+/// Poll `INFO memory` until `want` accepts the value, or panic after 30s
+/// naming what never happened.
+/// Poll `used_memory` until `want` holds, returning the LAST value read rather
+/// than panicking when it never does.
+///
+/// `poll_used_memory` below is the right tool when the predicate is a
+/// convergence the test merely has to wait out. It is the WRONG tool when the
+/// predicate is the claim under test: `|v| v > before` is satisfied by the
+/// FIRST byte of growth, and `used_memory` sums a per-shard atomic republished
+/// on a periodic chore — so under a fully parallel suite the poll can return
+/// mid-publish, with some shards' growth counted and others not. The caller
+/// then divides a partial figure by the full key count and sees a per-key cost
+/// far under the real one. That is a false RED on a correct ledger, and it is
+/// how this test failed on the Linux tokio leg while passing alone.
+///
+/// Polling for the threshold itself removes the race: a correct ledger crosses
+/// it as soon as the chore catches up, and a broken one never does, so the
+/// deadline still produces a genuine failure — reported by the caller's own
+/// assertion, with the measured number, rather than by a generic timeout.
+fn poll_used_memory_until(c: &mut Client, want: impl Fn(u64) -> bool, deadline: Duration) -> u64 {
+    let start = Instant::now();
+    loop {
+        let v = used_memory(c);
+        if want(v) || start.elapsed() >= deadline {
+            return v;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn poll_used_memory(c: &mut Client, want: impl Fn(u64) -> bool, what: &str) -> u64 {
+    let start = Instant::now();
+    loop {
+        let v = used_memory(c);
+        if want(v) {
+            return v;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{what}: used_memory stayed at {v} for 30s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Read `used_memory` out of `INFO memory`.
+fn used_memory(c: &mut Client) -> u64 {
+    match c.cmd(&[b"INFO", b"memory"]) {
+        V::Bulk(b) => {
+            let text = String::from_utf8_lossy(&b);
+            for line in text.lines() {
+                if let Some(rest) = line.trim_end().strip_prefix("used_memory:") {
+                    return rest.trim().parse().expect("used_memory is an integer");
+                }
+            }
+            panic!("INFO memory carried no used_memory line:\n{text}");
+        }
+        other => panic!("INFO memory returned {other:?}"),
+    }
+}
+
+#[test]
+fn test_sorted_set_arena_is_visible_to_used_memory() {
+    const KEYS: u64 = 500;
+    /// Well under the 3136-byte arena a one-member B+tree really owns, and
+    /// well over the 134 B the pre-fix estimator charged.
+    const FLOOR_PER_KEY: u64 = 2048;
+
+    let dir = test_tmpdir();
+    // 512 MB: large enough that `noeviction` never fires for 500 tiny zsets,
+    // so this measures the ledger and not the gate.
+    let (_guard, port) = spawn_moon_maxmemory(dir.path(), 512 * 1024 * 1024);
+    let mut c = wait_ready(port);
+
+    let before = used_memory(&mut c);
+    for i in 0..KEYS {
+        let key = format!("z:{i:08}");
+        let member = format!("m:{i:08}");
+        let r = c.cmd(&[b"ZADD", key.as_bytes(), b"1", member.as_bytes()]);
+        assert_eq!(r, V::Integer(1), "ZADD {key} must add one member");
+    }
+    // `INFO`'s used_memory sums a PUBLISHED per-shard atomic refreshed on the
+    // periodic chore, not the live counter, so reading it immediately after
+    // the last ZADD returns the pre-write figure. Poll rather than sleep a
+    // fixed amount: an unpolled read here would report 0 B/key and fail this
+    // test for a reason that has nothing to do with the accounting.
+    // Poll for the FLOOR, not for "any growth at all" — see
+    // `poll_used_memory_until`. Waiting on `v > before` here returns on the
+    // first partially-published shard and divides that partial figure by all
+    // 500 keys.
+    let want = before + KEYS * FLOOR_PER_KEY;
+    let after = poll_used_memory_until(&mut c, |v| v >= want, Duration::from_secs(30));
+    let per_key = after.saturating_sub(before) / KEYS;
+
+    assert!(
+        per_key >= FLOOR_PER_KEY,
+        "a one-member sorted set was billed {per_key} B/key, but its B+tree \
+         node arena alone is over 3 KB — the fixed cost of the container is \
+         invisible to used_memory, so --maxmemory cannot bind (moon#788)"
+    );
+
+    // ...and removing the keys must give every byte back, or the ledger drifts
+    // upward until the gate fires on memory nobody holds.
+    for i in 0..KEYS {
+        let key = format!("z:{i:08}");
+        c.cmd(&[b"DEL", key.as_bytes()]);
+    }
+    // `used_memory` is deliberately wider than the KV ledger: it also carries
+    // the Lua VM heap, which moon initialises lazily and samples on a chore,
+    // so the idle figure steps between 0 and ~48 KB on its own. Assert the KV
+    // growth came back rather than demanding an exact return to `before` — a
+    // real leak here would be megabytes, not tens of kilobytes.
+    let charged = after - before;
+    let tolerance = charged / 20;
+    poll_used_memory(
+        &mut c,
+        |v| v.saturating_sub(before) <= tolerance,
+        &format!(
+            "deleting every zset must return the {charged} B charged to within \
+             {tolerance} B of the {before} B starting figure"
+        ),
+    );
+}

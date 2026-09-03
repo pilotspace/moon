@@ -276,28 +276,53 @@ impl RedisValue {
     pub fn estimate_memory(&self) -> usize {
         match self {
             RedisValue::String(b) => b.len(),
-            RedisValue::Hash(map) => map.iter().map(|(k, v)| k.len() + v.len() + 64).sum(),
-            // 64B/entry baseline + 32B per TTL'd field (HashMap entry overhead).
+            RedisValue::Hash(map) => map
+                .iter()
+                .map(|(k, v)| crate::storage::db::hash_field_cost(k, v))
+                .sum(),
             RedisValue::HashWithTtl { fields, ttls, .. } => {
-                let f: usize = fields.iter().map(|(k, v)| k.len() + v.len() + 64).sum();
-                let t: usize = ttls.iter().map(|(k, _)| k.len() + 8 + 32).sum();
+                let f: usize = fields
+                    .iter()
+                    .map(|(k, v)| crate::storage::db::hash_field_cost(k, v))
+                    .sum();
+                let t: usize = ttls
+                    .iter()
+                    .map(|(k, _)| crate::storage::db::hash_ttl_field_cost(k))
+                    .sum();
                 f + t
             }
-            RedisValue::List(list) => list.iter().map(|elem| elem.len() + 24).sum(),
-            RedisValue::Set(set) => set.iter().map(|member| member.len() + 24).sum(),
-            RedisValue::SortedSet { members, .. } => {
-                members.iter().map(|(member, _)| member.len() + 80).sum()
+            RedisValue::List(list) => list
+                .iter()
+                .map(|elem| crate::storage::db::list_elem_cost(elem))
+                .sum(),
+            // moon#788: the table an `IndexSet` allocates is charged from its
+            // real capacity, not guessed per member — see `set_table_bytes`.
+            RedisValue::Set(set) => {
+                crate::storage::db::set_table_bytes(set)
+                    + set
+                        .iter()
+                        .map(|member| crate::storage::db::set_member_cost(member))
+                        .sum::<usize>()
             }
+            RedisValue::SortedSet { members, .. } => members
+                .iter()
+                .map(|(member, _)| crate::storage::db::legacy_zset_member_cost(member))
+                .sum(),
             RedisValue::HashListpack(lp)
             | RedisValue::ListListpack(lp)
             | RedisValue::SetListpack(lp)
             | RedisValue::SortedSetListpack(lp) => lp.estimate_memory(),
             RedisValue::SetIntset(is) => is.estimate_memory(),
+            // moon#788: the BPTree arena is charged per NODE from the arena's
+            // real capacity (`tree.memory_bytes()`), not `tree.len() * 80`
+            // per entry — the old form left the fixed multi-kilobyte cost of
+            // an almost-empty tree invisible to `used_memory`.
             RedisValue::SortedSetBPTree { tree, members } => {
-                // BPTree nodes + member HashMap
-                let tree_mem = tree.len() * 80; // approximate per-entry overhead
-                let member_mem: usize = members.iter().map(|(member, _)| member.len() + 40).sum();
-                tree_mem + member_mem
+                crate::storage::db::zset_table_bytes(members, tree)
+                    + members
+                        .iter()
+                        .map(|(member, _)| crate::storage::db::zset_member_cost(member))
+                        .sum::<usize>()
             }
             RedisValue::Stream(s) => s.estimate_memory(),
         }
@@ -836,13 +861,24 @@ mod tests {
         assert_eq!(val.estimate_memory(), 5);
     }
 
+    /// moon#788: this used to assert the literal `key(3) + val(3) + 64 = 70`,
+    /// which was a restatement of the constant under test — it could only
+    /// ever fail when someone edited the constant, never when the constant
+    /// was WRONG, and the constant was wrong. Anchored on the real slot type
+    /// instead: one live field costs at least a whole `(Bytes, Bytes)` plus
+    /// the size classes the two buffers land in.
     #[test]
     fn test_estimate_memory_hash() {
         let mut map = HashMap::new();
         map.insert(Bytes::from_static(b"key"), Bytes::from_static(b"val"));
         let val = RedisValue::Hash(map);
-        // key(3) + val(3) + 64 = 70
-        assert_eq!(val.estimate_memory(), 70);
+        let floor =
+            crate::storage::mem_size::size_class(3) * 2 + std::mem::size_of::<(Bytes, Bytes)>();
+        assert!(
+            val.estimate_memory() >= floor,
+            "one hash field billed {} B against {floor} B of real slot + buffers",
+            val.estimate_memory()
+        );
     }
 
     #[test]
@@ -991,5 +1027,161 @@ mod tests {
         // Both see the same value because they share Arc
         assert_eq!(clock1.ms(), clock2.ms());
         assert_eq!(clock1.secs(), clock2.secs());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// moon#788 — the ledger must cover the allocation the container really made.
+//
+// `used_memory` gates `--maxmemory` and the per-db quotas. On Linux
+// (c3-standard-8, 8 shards, 50k keys, exact command streams) it under-reported
+// sets by 5.30x per element and sorted sets by 15.1x per key against real RSS,
+// while Redis tracked itself to within 1.01-1.07x on the same workloads.
+//
+// Every floor below is GROUND TRUTH taken from the container itself —
+// `size_of` of the real slot type, `capacity()` of the real table,
+// `node_capacity()` of the real arena — never from the constants under test.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod accounting_788 {
+    use super::*;
+    use crate::storage::bptree::NODE_BYTES;
+    use crate::storage::db::{hash_field_cost, hash_ttl_field_cost, list_elem_cost};
+    use crate::storage::mem_size::size_class;
+
+    fn member(i: usize) -> Bytes {
+        Bytes::from(format!("m:{i:012}"))
+    }
+
+    /// A `BPTree` allocates whole `Node` slots — one leaf holding a single
+    /// member occupies an entire ~800-byte slot, and `Vec`'s minimum capacity
+    /// for an element that size is four of them. The estimator charged
+    /// `tree.len() * 80`, per ENTRY, so the fixed cost of the arena was
+    /// invisible to `used_memory` at every cardinality.
+    #[test]
+    fn zset_estimate_covers_the_real_btree_arena() {
+        for n in [1usize, 10, 100, 1000] {
+            let mut tree = BPTree::new();
+            let mut members: HashMap<Bytes, f64> = HashMap::new();
+            for i in 0..n {
+                let m = member(i);
+                tree.insert(OrderedFloat(i as f64), m.clone());
+                members.insert(m, i as f64);
+            }
+            let arena = tree.node_capacity() * NODE_BYTES;
+            let member_bytes: usize = members.keys().map(|m| size_class(m.len())).sum();
+            let floor = arena + member_bytes;
+            let got = RedisValue::SortedSetBPTree { tree, members }.estimate_memory();
+            assert!(
+                got >= floor,
+                "n={n}: zset billed {got} B against {floor} B really allocated \
+                 ({arena} B of B+tree arena + {member_bytes} B of members)"
+            );
+        }
+    }
+
+    /// An `IndexSet<Bytes>` is an entries `Vec<(HashValue, Bytes)>` plus a
+    /// hashbrown index table — two doubling allocations the per-member
+    /// `member.len() + 24` constant did not model at all.
+    #[test]
+    fn set_estimate_covers_the_real_indexset_tables() {
+        // One entries slot: the stored `Bytes` plus indexmap's cached hash.
+        const SLOT: usize = std::mem::size_of::<Bytes>() + std::mem::size_of::<usize>();
+        for n in [1usize, 10, 100, 1000] {
+            let mut set = SetValue::new();
+            for i in 0..n {
+                set.insert(member(i));
+            }
+            let table = set.capacity() * SLOT;
+            let member_bytes: usize = set.iter().map(|m| size_class(m.len())).sum();
+            let floor = table + member_bytes;
+            let got = RedisValue::Set(set).estimate_memory();
+            assert!(
+                got >= floor,
+                "n={n}: set billed {got} B against {floor} B really allocated \
+                 ({table} B of entries table + {member_bytes} B of members)"
+            );
+        }
+    }
+
+    /// Every collection value lives behind a `Box<RedisValue>`, and the enum
+    /// is sized by its largest variant. That box is a real allocation on every
+    /// container key and the ledger charged nothing for it.
+    #[test]
+    fn every_container_bills_its_boxed_redis_value() {
+        let cases: [(&str, Entry); 8] = [
+            ("hash", Entry::new_hash()),
+            ("hash_listpack", Entry::new_hash_listpack()),
+            ("list", Entry::new_list()),
+            ("list_listpack", Entry::new_list_listpack()),
+            ("set", Entry::new_set()),
+            ("set_listpack", Entry::new_set_listpack()),
+            ("zset_bptree", Entry::new_sorted_set_bptree()),
+            ("zset_listpack", Entry::new_sorted_set_listpack()),
+        ];
+        let floor = std::mem::size_of::<RedisValue>();
+        for (name, entry) in cases {
+            let got = entry.value.estimate_memory();
+            assert!(
+                got >= floor,
+                "{name}: an empty container billed {got} B, but its \
+                 Box<RedisValue> alone is {floor} B of live heap"
+            );
+        }
+    }
+
+    /// A `HashMap<Bytes, Bytes>` entry occupies a whole `(Bytes, Bytes)` slot,
+    /// and the field/value buffers land in jemalloc size classes, not in
+    /// exactly `len` bytes.
+    #[test]
+    fn hash_field_cost_covers_the_hashmap_slot_and_size_classes() {
+        for (f, v) in [
+            (&b"f"[..], &b"v"[..]),
+            (&b"field:0001"[..], &b"value:0001"[..]),
+            (&b"a-much-longer-field-name-here"[..], &b"x"[..]),
+        ] {
+            let floor =
+                size_class(f.len()) + size_class(v.len()) + std::mem::size_of::<(Bytes, Bytes)>();
+            let got = hash_field_cost(f, v);
+            assert!(
+                got >= floor,
+                "field {} / value {} billed {got} B against {floor} B of real slot + buffers",
+                f.len(),
+                v.len()
+            );
+        }
+    }
+
+    /// The TTL sidecar is a second `HashMap<Bytes, u64>`; its slot is a whole
+    /// `(Bytes, u64)`.
+    #[test]
+    fn hash_ttl_field_cost_covers_its_own_hashmap_slot() {
+        for f in [&b"f"[..], &b"field:0001"[..]] {
+            let floor = size_class(f.len()) + std::mem::size_of::<(Bytes, u64)>();
+            let got = hash_ttl_field_cost(f);
+            assert!(
+                got >= floor,
+                "ttl field {} billed {got} B against {floor} B",
+                f.len()
+            );
+        }
+    }
+
+    /// A `VecDeque<Bytes>` slot is a whole `Bytes` — 32 B, not 24.
+    #[test]
+    fn list_elem_cost_covers_the_vecdeque_slot_and_size_classes() {
+        for e in [
+            &b"x"[..],
+            &b"element:0001"[..],
+            &b"a-considerably-longer-element"[..],
+        ] {
+            let floor = size_class(e.len()) + std::mem::size_of::<Bytes>();
+            let got = list_elem_cost(e);
+            assert!(
+                got >= floor,
+                "element {} billed {got} B against {floor} B",
+                e.len()
+            );
+        }
     }
 }

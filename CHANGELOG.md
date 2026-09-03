@@ -95,6 +95,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is measured, documented and printed, but no longer asserted by a clock. The
   PERF-08 speed claim in `Database::set`'s docs is corrected to say the
   probe-count reduction is universal and the wall-clock win is not.
+- **`storage`: `used_memory` under-reported every container type, so
+  `--maxmemory` could not bind (#788).** The ledger behind the global
+- **`storage`: `used_memory` under-reported every container type, up to 15.2x
+  (#788).** The ledger behind the global
+  `--maxmemory` gate and the per-db quotas was built from per-element constants
+  that did not correspond to any real allocation. Measured on Linux (GCE
+  c3-standard-8, 8 shards, 50k keys, RSS growth over what the ledger charged):
+  a one-member sorted set read **15.23x** low, a 64-member set **4.66x**,
+  hashes and lists 1.2–2.1x.
+
+  What that cost the gate, stated precisely rather than as the worst case: the
+  eviction budget is already divided by `maxmemory_footprint_correction`, a
+  measured RSS-over-accounted ratio republished once a second — so an
+  under-report inside that correction's range was absorbed. The correction is
+  **clamped to 8.0**. A 15.23x under-report is not, so a sorted-set workload
+  could hold roughly **1.9x the configured `--maxmemory`** before the gate
+  fired, and every under-report additionally overshoots by its own factor
+  within the correction's 1-second staleness window. Per-db quotas and the
+  `used_memory` an operator reads in `INFO` have no correction at all and were
+  wrong by the full factor.
+
+  Root causes, all four of them accounting that never matched an allocator:
+
+  - `zset_member_cost` billed `member.len() + 120` for a `SortedSetBPTree`
+    whose arena slot is 784 bytes and whose *minimum* allocation is four of
+    them — an empty B+tree already owns 3584 bytes. `tree_mem = tree.len() *
+    80` charged per ENTRY for a cost that is per NODE.
+  - `set_member_cost = member.len() + 24` modelled neither of the `IndexSet`'s
+    two tables (a 40-byte-per-slot entries `Vec` and a power-of-two hashbrown
+    index).
+  - `hash_field_cost_len` and `list_elem_cost` billed element buffers at `len`
+    rather than at the jemalloc size class actually handed out, and understated
+    the slot (24 where the tuple is 32, 32 where `Bytes` is 40).
+  - The `Box<RedisValue>` behind every collection value — 128 bytes on every
+    hash, list, set, sorted set and stream key — was never billed at all.
+
+  Fixed by sizing every charge from the allocator's own shape, in a new
+  `storage::mem_size` module (jemalloc size classes, hashbrown's power-of-two
+  7/8-load table, `Vec` doubling). Where a container exposes an O(1)
+  `capacity()` the table is charged EXACTLY, snapshotted before/after each
+  mutation — the same pattern the listpack and intset paths already used. Where
+  no snapshot exists at every site the table share is folded into the
+  per-element constant as the growth-cycle average, rounded up; a single linear
+  constant cannot track a doubling allocator, so that term oscillates between
+  1.14x and 2.29x of the slot and is deliberately biased to over-report.
+  Over-reporting wastes headroom; under-reporting is what makes the gate fail
+  open. Nothing added to the write path allocates, locks, or walks the heap.
+
+  Two mutation sites charged **nothing at all** and are now covered: `GEOADD`
+  (a 200-member geo key moved the ledger by 131 bytes against 26,931 bytes
+  real) and the vector-search session recorder.
+
+  Three further defects surfaced while testing the fix, each stranding bytes
+  that nothing gives back:
+
+  - A hashbrown `capacity()` SHRINKS as entries are erased (56 → 21 over a
+    50-member drain), so skipping the table adjust on the "container went
+    empty" branch left 1504 bytes charged per create/drain cycle.
+  - `SPOP` and `SMOVE` skipped the member credit on that same branch, relying
+    on a `db.remove` recompute that runs after the member is already gone.
+  - A compact→full encoding upgrade (`OwnedKind::upgrade`) charged nothing for
+    the size change, so `LPOP` credited full-encoding element costs against a
+    listpack-sized charge — 2536 bytes over-credited on a 60-element list, an
+    under-report of live memory.
+
+  Post-fix on the same Linux host (RSS growth / bytes charged; Redis 8.x on the
+  same box for scale):
+
+  | type   | elems | before | after | redis |
+  |--------|-------|--------|-------|-------|
+  | list   | 1/4/16/64 | 2.11 / 1.96 / 1.44 / 1.34 | 1.26 / 1.20 / 1.32 / 1.15 | 1.01–1.02 |
+  | hash   | 1/4/16/64 | 1.71 / 1.59 / 1.39 / 1.22 | 1.34 / 1.11 / 1.14 / 1.12 | 1.01–1.02 |
+  | set    | 1/4/16/64 | 3.51 / 3.79 / 4.35 / 4.66 | 1.16 / 1.50 / 1.54 / 1.56 | 1.03 |
+  | zset   | 1/4/16/64 | 15.23 / 6.87 / 3.03 / 2.80 | 1.00 / 1.09 / 1.22 / 1.14 | 1.01–1.02 |
+
+  Sets remain the one type outside Redis's ~1.0–1.25x band; the residual is not
+  yet attributed and is tracked separately. Plain strings gain only the size
+  class of their heap buffer (+2 B/key on this workload); their RSS column
+  could not be resolved on a contended host — interleaved base/fix pairs drifted
+  further apart than the two binaries differ — so no string claim is made here.
+
+  `MEMORY USAGE` and the `src/admin/` memory treemap use a different estimator
+  (`estimate_serialized_length`) and are untouched, so their pre-existing
+  divergence from `used_memory` widens rather than narrows.
 
 - **`storage`: numeric strings with leading zeros or a leading `+` are no longer
   rewritten (data loss).** `SADD s 000000012345` followed by `SMEMBERS` returned
