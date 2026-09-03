@@ -92,6 +92,7 @@ impl<K, V> Segment<K, V> {
         let mask = unsafe { self.ctrl[group_idx].match_empty_or_deleted() };
         #[cfg(not(target_arch = "x86_64"))]
         let mask = self.ctrl[group_idx].match_empty_or_deleted();
+        super::note_simd_probe();
 
         if let Some(pos) = mask.lowest_set_bit() {
             let slot = base + pos;
@@ -121,6 +122,7 @@ impl<K, V> Segment<K, V> {
     #[inline]
     fn bump_probe_count(&mut self) {
         self.probe_count += 1;
+        super::note_simd_probe();
     }
 
     /// No-op in non-test builds.

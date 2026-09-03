@@ -35,16 +35,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     extra work; tracked in moon#789. `Database::set` still issues one probe
     everywhere, so nothing is functionally wrong.
 
-  The test now warms up, keeps exactly one table alive per measurement,
-  alternates loop order, measures the pure-miss workload (where both loops
-  build exactly one `CompactKey` per iteration, so the comparison is honest),
-  and asserts the **median** against a documented per-arch threshold instead of
-  the best-of-K minimum. The structural single-probe guarantee is gated
-  deterministically by
-  `test_segment_insert_or_update_at_probes_at_most_two_groups_on_miss`, whose
-  bound is tightened from `<= 6` to the true `<= 4`. The PERF-08 speed claim in
-  `Database::set`'s docs is corrected to say the probe-count reduction is
-  universal and the wall-clock win is not.
+  A first fix (warm up, alternate order, take the median of whole-loop timings)
+  removed the bias but not the variance, and false-failed on a 12-core macOS
+  host under parallel-build load. Measuring the **A/A noise floor** — the same
+  legacy loop timed against itself, where the true ratio is exactly 1.000 —
+  showed why a median could not save it:
+
+  | estimator | host | condition | A/A min..max | spread |
+  |---|---|---|---|---|
+  | whole-loop | t2a aarch64 | idle | 0.973..1.046 | 0.073 |
+  | whole-loop | t2a aarch64 | 16 spinners / 8 vCPU | 0.880..1.179 | 0.299 |
+  | whole-loop | c3 x86_64 | idle | 0.899..1.045 | 0.146 |
+  | whole-loop | c3 x86_64 | 16 spinners / 8 vCPU | 0.559..1.795 | **1.236** |
+  | chunked | t2a aarch64 | 16 spinners / 8 vCPU | 0.950..1.057 | 0.107 |
+  | chunked | c3 x86_64 | 16 spinners / 8 vCPU | 0.867..1.093 | 0.227 |
+
+  Under load a whole-loop estimator returns ratios from **0.56 to 1.80 on
+  identical code** — so the previously committed x86_64 ceiling of 1.30 was not
+  safe either; it merely happened to pass on an idle host. The fix is a better
+  estimator, not more reps: the fill is split into 64 slices and the two sides
+  alternate slice by slice, so a scheduler steal lands inside both sides and
+  cancels in the paired difference. That is 3x tighter on aarch64 and 5x
+  tighter on x86_64 under load, and its A/A ratio centres on 1.00 (0.997 /
+  0.998), so it is unbiased rather than merely quiet.
+
+  Validated by running the real test 8 times per arch, idle and under 2x CPU
+  oversubscription: **16/16 green**, aarch64 medians 0.873-0.894 (threshold
+  0.95), x86_64 medians 1.110-1.156 (ceiling 1.30). The medians barely move
+  between idle and loaded, which is the paired estimator doing its job.
+
+  **PERF-08's claim moved off the wall clock entirely.** Two new deterministic
+  tests count control-byte group scans and assert the fused path scans strictly
+  fewer on a miss than `get_mut` + `insert`: one at the
+  `Segment::insert_or_update_at` level and one at the
+  `DashTable::insert_or_update` level that `Database::set` actually calls. The
+  second exists because the first would not notice `DashTable::insert_or_update`
+  being reimplemented as `get_mut` + `insert` on top of a healthy segment
+  helper — the very regression PERF-08 prevents. Both are exact,
+  arch-independent, load-independent and run in microseconds; forcing the
+  PERF-09 fallback scan makes them report "fused scanned 6, legacy scanned 5"
+  and fail on both arches.
+
+  To make that assertion possible the `#[cfg(test)]` SIMD-probe counter was
+  extended from `insert_or_update_at` to `find` and `find_free_slot_in_group`
+  via a thread-local, with a `#[cfg(not(test))]` `#[inline(always)]` empty
+  no-op so it compiles to nothing in production — it sits in the hottest probe
+  loops in the codebase. The old `probe_count <= 6` bound could be satisfied by
+  re-implementing `insert_or_update_at` in terms of `find`, because `find` was
+  not counted; it is tightened to the true `<= 4` and joined by the two
+  cross-pattern comparisons.
+
+  With the claim held deterministically, **both arms of the timing test are now
+  blow-up ceilings** (aarch64 1.02, x86_64 1.30) rather than one floor and one
+  ceiling. The earlier asymmetry — asserting a win on aarch64, the arch that
+  runs `ci-local.sh`'s VM suites and a hosted macOS leg that cannot be validated
+  from Linux — put a wall-clock floor exactly where a loaded runner does the
+  most damage. The ceilings still catch what the counters cannot: same scan
+  count, more time per scan (a lost `#[inline]`, an added copy). The win itself
+  is measured, documented and printed, but no longer asserted by a clock. The
+  PERF-08 speed claim in `Database::set`'s docs is corrected to say the
+  probe-count reduction is universal and the wall-clock win is not.
 
 - **`storage`: numeric strings with leading zeros or a leading `+` are no longer
   rewritten (data loss).** `SADD s 000000012345` followed by `SMEMBERS` returned

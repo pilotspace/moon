@@ -732,6 +732,53 @@ mod tests {
     use super::segment::{LOAD_THRESHOLD, TOTAL_SLOTS};
     use super::*;
 
+    /// moon#789: the deterministic gate for PERF-08 at the level
+    /// `Database::set` actually calls.
+    ///
+    /// The segment-level twin of this test
+    /// (`segment::tests::test_insert_or_update_scans_fewer_groups_than_get_mut_plus_insert`)
+    /// pins `Segment::insert_or_update_at`. It would NOT notice
+    /// `DashTable::insert_or_update` being reimplemented as `get_mut` + `insert`
+    /// on top of a still-healthy segment helper — which is exactly the
+    /// regression PERF-08 exists to prevent. This one closes that gap.
+    ///
+    /// Deterministic, arch-independent and load-independent, unlike the
+    /// wall-clock ratio in
+    /// `tests/perf_v0112_insert_or_update_single_probe.rs`.
+    #[test]
+    fn test_dashtable_insert_or_update_scans_fewer_groups_than_get_mut_plus_insert() {
+        let key = b"probe_test_key".as_slice();
+
+        // Legacy sequence on a miss: get_mut (a full probe) then insert (which
+        // probes again to dedupe, then scans for a free slot).
+        let mut legacy: DashTable<CompactKey, u32> = DashTable::new();
+        let _ = segment::take_simd_probes();
+        assert!(legacy.get_mut(key).is_none());
+        legacy.insert(CompactKey::from(key), 7u32);
+        let legacy_probes = segment::take_simd_probes();
+
+        // Fused path on the same miss.
+        let mut fused: DashTable<CompactKey, u32> = DashTable::new();
+        let _ = segment::take_simd_probes();
+        fused.insert_or_update(CompactKey::from(key), |v| *v = 7u32, || 7u32);
+        let fused_probes = segment::take_simd_probes();
+
+        // Both must actually have stored the key, or the counts describe two
+        // different operations.
+        assert_eq!(legacy.get(key), Some(&7u32));
+        assert_eq!(fused.get(key), Some(&7u32));
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(fused.len(), 1);
+
+        assert!(
+            fused_probes < legacy_probes,
+            "DashTable::insert_or_update scanned {fused_probes} control-byte groups on a \
+             miss; get_mut + insert scanned {legacy_probes}. The fused path must scan \
+             strictly fewer — that is the whole of PERF-08. Equal or greater means the \
+             single-probe fusion has regressed (moon#789)."
+        );
+    }
+
     fn test_value(n: u32) -> String {
         format!("value_{}", n)
     }
