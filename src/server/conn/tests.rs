@@ -38,8 +38,10 @@ fn make_rt_config() -> parking_lot::RwLock<crate::config::RuntimeConfig> {
 /// mentions. The `loading` twin does not need this — it drives a
 /// `thread_local!` — but it takes the lock anyway so the two stay symmetric.
 fn inline_test_lock() -> parking_lot::MutexGuard<'static, ()> {
-    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-    LOCK.lock()
+    // The SAME mutex `client_pause`'s own tests take — not a second one. Two
+    // disjoint mutexes would leave `test_pause_and_check`'s `pause(5000, ..)`
+    // free to run concurrently with an inline SET here and redden its CONTROL.
+    crate::client_pause::pause_test_lock()
 }
 
 #[test]
