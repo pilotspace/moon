@@ -1493,18 +1493,32 @@ pub(crate) async fn handle_connection_sharded_monoio<
             //
             // Eviction routing was NOT the only divergence. Inside an open
             // cross-store transaction the generic write leg captures an undo
-            // record (`txn.kv_undo.record_insert` / `record_update`, ~line
-            // 3101) and a write intent (`s.kv_write_intents.record_write`,
-            // ~line 3117) BEFORE dispatching. `try_inline_dispatch` does
+            // record (`txn.kv_undo.record_insert` / `record_update`) and a
+            // write intent (`s.kv_write_intents.record_write`) BEFORE
+            // dispatching — all three in the cross-txn arm further down THIS
+            // file; grep the names rather than trusting a line number, the
+            // two cited here had already drifted by ~120 lines once.
+            // `try_inline_dispatch` does
             // neither — grepping `cross_txn`/`kv_undo`/`write_intent` in
             // `server/conn/blocking.rs` returns nothing.
             //
             // Without the undo record `TXN ABORT` restores nothing
             // (`transaction/abort.rs:118` replays `UndoRecord::Update`), and
             // without the write intent the MVCC snapshot-visibility filter
-            // below (~line 3482) cannot hide the uncommitted value from a
-            // FOREIGN transaction's reads. Measured on this branch before the
-            // term was added, `--shards 1`, stock config, one connection:
+            // below cannot hide the uncommitted value from a FOREIGN
+            // transaction's reads.
+            //
+            // Only the FIRST half of that is demonstrated below. The undo gap
+            // is measured end-to-end and is what the `!conn.in_cross_txn()`
+            // term is justified by. The snapshot-visibility half is stated
+            // from the code, not from a measurement — and note that the inline
+            // READ path bypasses that same filter independently of this term
+            // (a dirty read, present identically on merge-base: moon#807). So
+            // do not read this term as closing the visibility hole; it closes
+            // the undo hole.
+            //
+            // Measured on this branch before the term was added, `--shards 1`,
+            // stock config, one connection:
             //
             //     SET k original -> +OK
             //     TXN BEGIN      -> +OK        (generic; `TXN` is *2, never inline-eligible)

@@ -66,6 +66,8 @@
 //! | delete the `is_any_write_stall_active()` bail-out in `blocking.rs` | NOT this file — `mem_watchdog` cases A and B, and `compaction_escape_hatch_718` (merge-base green, branch red) |
 //! | delete the `pause_possibly_active()` bail-out | NOT this file — `server::conn::tests::test_inline_set_stands_down_under_client_pause` |
 //! | delete the `loading::is_loading()` bail-out | NOT this file — `server::conn::tests::test_inline_set_stands_down_while_loading` |
+//! | delete the `refresh_now_from_cache` call ahead of `try_inline_dispatch_loop` | G7 clock (`OBJECT IDLETIME` reports the idle gap for a key written now) |
+//! | delete the `record_inline_commands` call | G7 counter (`total_commands_processed` flat while the inline counter climbs by 200) |
 //!
 //! The write-stall row is deliberately guarded OUTSIDE this file. The refusal
 //! it protects is produced by `segment_stall::stall_refusal`, whose exemptions
@@ -78,13 +80,26 @@
 //! against — widening the gate without giving the inline path a way to stand
 //! down. It is silent-data-loss class: the client still receives `+OK`.
 //!
-//! Two things this file does NOT claim. G1 at shards=4 does not redden under
-//! the bail-out mutation: most writes there are cross-shard and take the
-//! generic (spilling) path anyway, so the counters stay healthy. It is a
-//! coverage companion; **G1 shards=1 and G2 shards=4 carry the safety proof.**
-//! And G3's restart assertion alone does not discriminate the cold plane —
-//! under `--appendonly yes` the AOF replays `SET; SET; DEL` and the key dies
-//! regardless, which is why G3 asserts the LIVE state first.
+//! Three things this file does NOT claim.
+//!
+//! G1 at shards=4 does not redden under the bail-out mutation: most writes
+//! there are cross-shard and take the generic (spilling) path anyway, so the
+//! counters stay healthy. It is a coverage companion; **G1 shards=1 and G2
+//! carry the safety proof.**
+//!
+//! G2's slip bound applies at `shards=1` ONLY, and the reason is written out
+//! at the assertion itself: the elastic budget lets a lone hot shard borrow
+//! its idle siblings' headroom, so at `shards=4` the shard spends most of the
+//! window legitimately under budget and inlines most of it (measured on the
+//! Linux gate: 7719 of 8000, with at most 15 plain drops against 156 spills).
+//! That is the pre-gate working, not failing. G2's SAFETY assertion — victims
+//! spilled, not dropped — still runs at both shard counts.
+//!
+//! G3 is not a guard on this PR's change at all: `remove_cold_only` is
+//! unreachable from `try_inline_dispatch`, so G3 reddens identically on
+//! merge-base. It rides this fixture to check that the cold-plane delete is
+//! durable, and it is its RESTART assertion, not its live one, that carries
+//! that guard — see the measurement in its own doc comment.
 //!
 //! Run with:
 //!   cargo build --release
@@ -175,10 +190,74 @@ struct Cfg {
     /// `0` = start with no cap (inline writes eligible); tests that need
     /// pressure publish one at runtime with `CONFIG SET maxmemory`.
     maxmemory: u64,
-    admin_port: u16,
 }
 
-fn spawn_moon(dir: &std::path::Path, cfg: &Cfg) -> (ServerGuard, u16) {
+/// Spawn a moon under test and return `(guard, client_port, admin_port)`.
+///
+/// The admin port is reserved HERE, inside the retry, rather than by the
+/// caller. That is not tidiness — it is the fix for a gate failure. Every
+/// test in this file reads `local_inline_count(admin_port)`, so an admin port
+/// that is already held makes moon exit(1) at start-up. `spawn_listening`
+/// retries only the CLIENT port and polls the child exactly once
+/// (`settle = Duration::ZERO`, moon#811), so a foreign listener on the client
+/// port let it hand back a child that was already dead. The observable was
+/// `read_line` panicking with a bare "read byte" three frames deep in a test
+/// that looked like it was asserting something about eviction.
+///
+/// So this verifies the pair is genuinely SERVING — a `PING` on the client
+/// port and a `/metrics` fetch on the admin port — before handing it over,
+/// and retries the whole pair (fresh ports both) if not.
+fn spawn_moon(dir: &std::path::Path, cfg: &Cfg) -> (ServerGuard, u16, u16) {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let admin_port = common::reserve_port();
+        let (guard, port) = spawn_moon_once(dir, cfg, admin_port);
+        if server_is_serving(port, admin_port) {
+            return (guard, port, admin_port);
+        }
+        eprintln!(
+            "spawn_moon: attempt {attempt}/{ATTEMPTS} came up dead \
+             (client {port}, admin {admin_port}); retrying on fresh ports"
+        );
+        drop(guard);
+    }
+    panic!(
+        "moon never came up serving after {ATTEMPTS} attempts; stderr tail:\n{}",
+        std::fs::read_to_string(dir.join("moon.stderr.log")).unwrap_or_default()
+    );
+}
+
+/// True iff BOTH planes answer: the client port replies to `PING` and the
+/// admin port serves `/metrics`. Binding is not serving — that distinction is
+/// the whole point (moon#811).
+fn server_is_serving(port: u16, admin_port: u16) -> bool {
+    server_is_serving_client_port(port) && !http_get(admin_port, "/metrics").is_empty()
+}
+
+/// The client half of [`server_is_serving`]: poll until a real `+PONG` comes
+/// back, not merely until `connect` succeeds.
+fn server_is_serving_client_port(port: u16) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if let Ok(mut s) = TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_millis(200),
+        ) {
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = [0u8; 7];
+            if s.write_all(b"PING\r\n").is_ok()
+                && s.read_exact(&mut buf).is_ok()
+                && buf.starts_with(b"+PONG")
+            {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+fn spawn_moon_once(dir: &std::path::Path, cfg: &Cfg, admin_port: u16) -> (ServerGuard, u16) {
     let off_dir = dir.join("off");
     std::fs::create_dir_all(&off_dir).expect("create off dir");
     let (child, port) = common::spawn_listening(|port| {
@@ -215,7 +294,7 @@ fn spawn_moon(dir: &std::path::Path, cfg: &Cfg) -> (ServerGuard, u16) {
                 "--protected-mode",
                 "no",
                 "--admin-port",
-                &cfg.admin_port.to_string(),
+                &admin_port.to_string(),
             ])
             .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
             .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
@@ -288,7 +367,18 @@ impl Client {
         let mut line = Vec::new();
         let mut b = [0u8; 1];
         loop {
-            self.reader.read_exact(&mut b).expect("read byte");
+            // A bare `.expect("read byte")` here cost a full CI cycle: the
+            // Linux gate reported only `panicked at ...:291:44: read byte`,
+            // which says nothing about WHICH server died or what it had
+            // already sent. Every byte read so far is the useful evidence.
+            if let Err(e) = self.reader.read_exact(&mut b) {
+                panic!(
+                    "connection to moon broke mid-reply ({e}); partial line so \
+                     far = {:?}. The server died, was replaced on its port, or \
+                     never finished starting.",
+                    String::from_utf8_lossy(&line)
+                );
+            }
             if b[0] == b'\n' {
                 break;
             }
@@ -562,14 +652,25 @@ fn readable_probes(c: &mut Client) -> usize {
 /// `evicted_keys` climbs, and `readable_probes` falls far below `PROBE_COUNT`.
 fn spill_not_drop_body(shards: u32) {
     let dir = test_tmpdir();
-    let admin_port = common::reserve_port();
     let cfg = Cfg {
         shards,
         appendonly: "yes",
         maxmemory: MAXMEMORY_BYTES,
-        admin_port,
     };
-    let (_guard, port) = spawn_moon(dir.path(), &cfg);
+    let (_guard, port, admin_port) = spawn_moon(dir.path(), &cfg);
+
+    // (0) CONTROL — the inline write path is LIVE on this server.
+    //
+    // Everything below is a claim about what the inline path does under
+    // pressure, but nothing below reads the inline counter, so this test used
+    // to pass unchanged with inline writes disabled outright (confirmed by
+    // mutation: force `can_inline_writes = false` and G1 stays green). It
+    // would then be re-proving that the GENERIC path spills its victims, which
+    // was never in doubt. `pin_to_local_shard` panics unless a plain SET
+    // actually takes the inline path, so calling it here is the control; it
+    // runs before any filler because its own precondition is "no pressure yet".
+    drop(pin_to_local_shard(port, admin_port, shards));
+
     let mut c = Client::connect(port);
 
     write_probes(&mut c);
@@ -745,14 +846,12 @@ fn write_tagged_chunk(c: &mut Client, tag: &str, from: usize, count: usize) {
 
 fn bail_out_body(shards: u32) {
     let dir = test_tmpdir();
-    let admin_port = common::reserve_port();
     let cfg = Cfg {
         shards,
         appendonly: "yes",
         maxmemory: MAXMEMORY_BYTES,
-        admin_port,
     };
-    let (_guard, port) = spawn_moon(dir.path(), &cfg);
+    let (_guard, port, admin_port) = spawn_moon(dir.path(), &cfg);
 
     // ---- phase A: no pressure, live spill sender -> inline runs ----
     let Pinned { mut c, tag } = pin_to_local_shard(port, admin_port, shards);
@@ -791,7 +890,9 @@ fn bail_out_body(shards: u32) {
     // and PROVES from inside the window that eviction fired during it:
     // `spilled_keys` must climb across the window, and the only traffic on
     // this server is this connection's tagged writes, which all land on this
-    // one shard. Over that same window not one write may inline.
+    // one shard. What the window then bounds is stated at the assertions
+    // themselves: victims must be SPILLED and not DROPPED (both shard counts),
+    // and at `shards=1` the inline counter must stay essentially flat.
     //
     // The `+OK` assertions inside `write_tagged_chunk` are not decoration:
     // they are the proof that the bail-out did not CONSUME the command.
@@ -868,16 +969,49 @@ fn bail_out_body(shards: u32) {
     // So this bounds the slip instead of forbidding it. A regression that
     // genuinely disabled the bail-out does not slip 0.25%; it inlines the
     // whole window, which this still catches by two orders of magnitude.
+    // ...and it is bounded ONLY at `shards=1`, because only there does the
+    // test control the precondition the bound needs.
+    //
+    // The bail-out fires when the shard is over its EFFECTIVE budget. The slip
+    // ratio therefore measures what fraction of the window's writes found the
+    // shard over budget — a property of the workload and the budget shape, not
+    // of the bail-out. At `shards=1` that fraction is ~1 by construction: the
+    // single shard has no sibling to borrow from, so once the filler has
+    // pinned it against `maxmemory` it STAYS there and essentially every
+    // measurement write is over budget (measured on the Linux gate: 5 of 2000
+    // inlined, 0.25%).
+    //
+    // At `shards=4` it is not, and cannot be made so from outside. The elastic
+    // budget lets this one hot shard borrow all three idle siblings' headroom
+    // up to the whole instance `maxmemory`, so it spends most of the window
+    // legitimately UNDER budget, evicting only at the moments it crosses.
+    // Measured on the Linux gate: 7719 of 8000 writes inlined (96.5%) in a
+    // window where eviction fired 156 times and `evicted_keys` moved by at
+    // most 15 — i.e. every eviction that ran chose the SPILL sink, which is
+    // exactly correct, and the writes that skipped did so because there was
+    // genuinely room. An earlier revision asserted a 1% ceiling here and the
+    // gate rejected it; the assertion was wrong, not the server.
+    //
+    // Nothing is lost by scoping it: the bail-out is shard-count-independent
+    // code, `shards=1` exercises it under a precondition that actually holds,
+    // and the safety property above — the one guarding against silent data
+    // loss — still runs at BOTH shard counts.
     let inline_delta = inline_after - inline_before;
-    let slip_ceiling = (w as u64) / 100; // 1% of the writes actually issued
-    assert!(
-        inline_delta <= slip_ceiling,
-        "shards={shards}: {inline_delta} of {w} writes inlined during a window \
-         in which eviction demonstrably fired ({inline_before} -> \
-         {inline_after}, spilled {spilled_before} -> {spilled_after}). \
-         Published-hint staleness explains a slip of a few writes; more than \
-         {slip_ceiling} means the bail-out is not firing at all."
-    );
+    if shards == 1 {
+        // 2% of the writes actually issued. Eight times the measured 0.25%, so
+        // hint staleness cannot redden it; still two orders of magnitude below
+        // a bail-out that has stopped firing (which inlines the whole window),
+        // and 4x below the 8% a HALF-disabled bail-out was measured to produce.
+        let slip_ceiling = (w as u64) / 50;
+        assert!(
+            inline_delta <= slip_ceiling,
+            "shards={shards}: {inline_delta} of {w} writes inlined during a \
+             window in which eviction demonstrably fired ({inline_before} -> \
+             {inline_after}, spilled {spilled_before} -> {spilled_after}). \
+             Published-hint staleness explains a slip of a few writes; more \
+             than {slip_ceiling} means the bail-out is not firing at all."
+        );
+    }
 
     // The safety consequence, restated end-to-end: nothing was lost while the
     // fallback was carrying the load.
@@ -942,19 +1076,32 @@ fn g2_bail_out_fires_under_pressure_shards4() {
 ///
 /// Reddening mutation: gut `Database::remove_cold_only`
 /// (`src/storage/db/kv_ops.rs`) to a no-op — the delete then reaches only the
-/// hot plane, and every probe that was cold answers its old value from the
-/// cold read-through on the very next `GET`.
+/// hot plane, and a probe that was cold answers its old value from the cold
+/// read-through.
+///
+/// Two honest caveats about that mutation, both measured rather than assumed:
+///
+///   * It is the RESTART assertion that carries the guard, not the LIVE one.
+///     Under the mutation the restart assertion reddens on every run (11-12 of
+///     200 probes resurrect); the LIVE assertion passes outright about half
+///     the time, because whether any given probe is cold at the instant of its
+///     DEL is `allkeys-lru` sampling. An earlier version of this comment had
+///     that backwards and credited the live assertion.
+///   * `remove_cold_only` is NOT reachable from `try_inline_dispatch` — DEL
+///     has no inline arm — so this test reddens identically on merge-base. It
+///     is a cold-plane delete-durability guard that this PR must not break,
+///     not a guard on the bail-out this PR adds. It is in this file because
+///     the fixture (disk offload live, keys tiered under pressure) is the same
+///     one; do not read it as evidence for the inline change.
 #[test]
 fn g3_del_of_spilled_keys_stays_dead_live_and_across_restart() {
     let dir = test_tmpdir();
-    let admin_port = common::reserve_port();
     let cfg = Cfg {
         shards: 1,
         appendonly: "yes",
         maxmemory: MAXMEMORY_BYTES,
-        admin_port,
     };
-    let (mut guard, port) = spawn_moon(dir.path(), &cfg);
+    let (mut guard, port, _admin_port) = spawn_moon(dir.path(), &cfg);
     let mut c = Client::connect(port);
 
     // (1) probes v1, (2) filler to push them out of RAM.
@@ -1054,6 +1201,17 @@ fn g3_del_of_spilled_keys_stays_dead_live_and_across_restart() {
         .expect("restart moon");
     let _restart_guard = ServerGuard(restart);
 
+    // The restarted server replays the AOF and rebuilds the cold index before
+    // it can answer truthfully, and NOTHING here used to wait for that.
+    // `Client::connect` only proves the listener accepts; moon's client
+    // listeners use SO_REUSEPORT, so accepting does not even prove the peer is
+    // the process we just spawned. Waiting for a real `PONG` is the cheapest
+    // check that distinguishes "serving" from "bound".
+    assert!(
+        server_is_serving_client_port(port),
+        "restarted moon on port {port} never answered PING; the resurrection \
+         assertions below would be measuring a server that is not up"
+    );
     let mut c2 = Client::connect(port);
     // (8) end-to-end: the cold rebuild must not hand any of them back.
     let revived = readable_probes(&mut c2);
@@ -1086,14 +1244,12 @@ fn g3_del_of_spilled_keys_stays_dead_live_and_across_restart() {
 /// (gotcha_fresh_connection_per_probe_hides_shard_local_bugs).
 fn assert_no_inline_with(label: &str, setup: impl FnOnce(u16, &mut Client) -> Vec<Client>) {
     let dir = test_tmpdir();
-    let admin_port = common::reserve_port();
     let cfg = Cfg {
         shards: 1,
         appendonly: "yes",
         maxmemory: 0,
-        admin_port,
     };
-    let (_guard, port) = spawn_moon(dir.path(), &cfg);
+    let (_guard, port, admin_port) = spawn_moon(dir.path(), &cfg);
 
     // Control first: prove that on THIS server, in THIS configuration, a plain
     // SET on an unencumbered connection DOES inline. Without this the test
@@ -1286,28 +1442,24 @@ struct Pair {
 fn spawn_pair() -> Pair {
     let mdir = test_tmpdir();
     let rdir = test_tmpdir();
-    let m_admin = common::reserve_port();
-    let r_admin = common::reserve_port();
     // `appendonly no`: GROUP 5 is about replication fan-out, not the eviction
     // routing divergence, so the AOF is dead weight here. `maxmemory 0` keeps
     // the eviction pre-gate permanently satisfied, so the ONLY thing that can
     // suppress inlining in these tests is the gate term under test.
-    let (mguard, m_port) = spawn_moon(
+    let (mguard, m_port, m_admin) = spawn_moon(
         mdir.path(),
         &Cfg {
             shards: 1,
             appendonly: "no",
             maxmemory: 0,
-            admin_port: m_admin,
         },
     );
-    let (rguard, r_port) = spawn_moon(
+    let (rguard, r_port, r_admin) = spawn_moon(
         rdir.path(),
         &Cfg {
             shards: 1,
             appendonly: "no",
             maxmemory: 0,
-            admin_port: r_admin,
         },
     );
     Pair {
@@ -1544,14 +1696,12 @@ fn g6_cross_txn_still_suppresses_inline() {
 #[test]
 fn g6_inline_write_inside_txn_is_rolled_back_by_abort() {
     let dir = test_tmpdir();
-    let admin_port = common::reserve_port();
     let cfg = Cfg {
         shards: 1,
         appendonly: "yes",
         maxmemory: 0,
-        admin_port,
     };
-    let (_guard, port) = spawn_moon(dir.path(), &cfg);
+    let (_guard, port, admin_port) = spawn_moon(dir.path(), &cfg);
 
     // ONE connection throughout: `active_cross_txn` is per-connection state,
     // and a fresh connection per command would leave the TXN on a dead socket
@@ -1591,5 +1741,121 @@ fn g6_inline_write_inside_txn_is_rolled_back_by_abort() {
         V::Bulk(b"original".to_vec()),
         "TXN ABORT did not restore the pre-transaction value — the in-TXN SET \
          bypassed undo capture via the inline write path"
+    );
+}
+
+// ===========================================================================
+// GROUP 7 — THE OBLIGATIONS THE INLINE PATH OWES BESIDES CORRECT ROUTING.
+// ===========================================================================
+//
+// Both of these were added late, as fixes for review findings, and both
+// shipped with NO test. A test-integrity pass then showed the whole file
+// stayed green with both deletions applied — the exact "fix without a guard"
+// gap this file exists to close. These are those guards.
+
+/// The inline path must refresh the shard database's cached clock before it
+/// stamps anything.
+///
+/// `try_inline_dispatch_loop` writes keys using the DATABASE's cached `now`,
+/// which the generic dispatch path refreshes on entry and the inline path did
+/// not. On a connection that had been idle, every inline write therefore
+/// stamped its key with a timestamp frozen at the last generic command.
+/// Measured before the fix: idle 10 s, then `SET k v` immediately followed by
+/// `OBJECT IDLETIME k` answered **18** for a key written microseconds earlier.
+/// Under `allkeys-lru` that misreports exactly the keys eviction is choosing
+/// between.
+///
+/// Reddening mutation: delete the `refresh_now_from_cache` call added ahead of
+/// `try_inline_dispatch_loop` in `src/server/conn/handler_monoio/mod.rs`.
+#[test]
+fn g7_inline_write_stamps_a_fresh_clock_after_an_idle_connection() {
+    let dir = test_tmpdir();
+    // `maxmemory: 0` keeps the eviction pre-gate permanently satisfied, so the
+    // only thing under test here is the clock.
+    let cfg = Cfg {
+        shards: 1,
+        appendonly: "no",
+        maxmemory: 0,
+    };
+    let (_guard, port, admin_port) = spawn_moon(dir.path(), &cfg);
+    let mut c = Client::connect(port);
+
+    // Warm the connection with a generic command, then go quiet. The database's
+    // cached `now` is fresh as of this moment and, without the fix, stays here.
+    assert_eq!(c.cmd(&[b"SET", b"warm", b"v"]), V::Simple("OK".into()));
+    let idle = Duration::from_secs(5);
+    std::thread::sleep(idle);
+
+    // The write under test. It must take the INLINE path for this to mean
+    // anything, which the counter confirms rather than assumes.
+    let before = local_inline_count(admin_port);
+    assert_eq!(c.cmd(&[b"SET", b"fresh", b"v"]), V::Simple("OK".into()));
+    let inlined = local_inline_count(admin_port) - before;
+    assert!(
+        inlined > 0,
+        "the SET under test did not take the inline path (local_inline \
+         {before} -> {}), so this test would pass on a frozen clock too",
+        local_inline_count(admin_port)
+    );
+
+    match c.cmd(&[b"OBJECT", b"IDLETIME", b"fresh"]) {
+        V::Int(secs) => assert!(
+            secs <= 1,
+            "a key written microseconds ago reports IDLETIME {secs}s after a \
+             {idle:?} idle period — the inline path stamped it with the \
+             database's frozen cached clock instead of refreshing it first"
+        ),
+        other => panic!("OBJECT IDLETIME answered {other:?}"),
+    }
+}
+
+/// Inline writes must be counted as commands.
+///
+/// `total_commands_processed` is not merely cosmetic here: the same per-thread
+/// counter is what `this_thread_commands()` reads, and that is the activity
+/// signal the adaptive idle park (moon#373) uses to decide whether a shard is
+/// busy. A shard serving nothing but inline writes looked completely idle,
+/// so the park would sleep a shard that was under full load.
+///
+/// Reddening mutation: delete the `record_inline_commands` call in
+/// `src/server/conn/handler_monoio/mod.rs`. The delta collapses to ~0 while
+/// the inline counter still climbs by `N`.
+#[test]
+fn g7_inline_writes_are_counted_as_commands_processed() {
+    let dir = test_tmpdir();
+    let cfg = Cfg {
+        shards: 1,
+        appendonly: "no",
+        maxmemory: 0,
+    };
+    let (_guard, port, admin_port) = spawn_moon(dir.path(), &cfg);
+    let mut c = Client::connect(port);
+
+    const N: u64 = 200;
+    let inline_before = local_inline_count(admin_port);
+    let cmds_before = info_field(&c.info_stats(), "total_commands_processed");
+    for i in 0..N {
+        assert_eq!(
+            c.cmd(&[b"SET", format!("counted:{i}").as_bytes(), b"v"]),
+            V::Simple("OK".into()),
+            "SET {i} should succeed"
+        );
+    }
+    let inline_delta = local_inline_count(admin_port) - inline_before;
+    let cmds_delta = info_field(&c.info_stats(), "total_commands_processed") - cmds_before;
+
+    // Non-vacuity first: if these did not inline, the counter would advance via
+    // the generic path and the assertion below would pass for the wrong reason.
+    assert!(
+        inline_delta >= N,
+        "only {inline_delta} of {N} SETs took the inline path; this test \
+         cannot distinguish a counted inline write from a generic one"
+    );
+    assert!(
+        cmds_delta >= N,
+        "{N} inline SETs advanced total_commands_processed by only \
+         {cmds_delta} (inline counter moved {inline_delta}). Inline writes are \
+         invisible to the command counter, which is also the adaptive idle \
+         park's activity signal (moon#373)."
     );
 }
