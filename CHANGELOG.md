@@ -97,14 +97,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   probe-count reduction is universal and the wall-clock win is not.
 - **`storage`: `used_memory` under-reported every container type, so
   `--maxmemory` could not bind (#788).** The ledger behind the global
+- **`storage`: `used_memory` under-reported every container type, up to 15.2x
+  (#788).** The ledger behind the global
   `--maxmemory` gate and the per-db quotas was built from per-element constants
   that did not correspond to any real allocation. Measured on Linux (GCE
   c3-standard-8, 8 shards, 50k keys, RSS growth over what the ledger charged):
   a one-member sorted set read **15.23x** low, a 64-member set **4.66x**,
-  hashes and lists 1.2–2.1x. An operator who set `--maxmemory` as an OOM guard
-  got the OOM killer instead of the eviction gate; with moon's auto-maxmemory
-  default of 75% of RAM, a zset-heavy workload held ~431% of RAM while the
-  ledger read 75%.
+  hashes and lists 1.2–2.1x.
+
+  What that cost the gate, stated precisely rather than as the worst case: the
+  eviction budget is already divided by `maxmemory_footprint_correction`, a
+  measured RSS-over-accounted ratio republished once a second — so an
+  under-report inside that correction's range was absorbed. The correction is
+  **clamped to 8.0**. A 15.23x under-report is not, so a sorted-set workload
+  could hold roughly **1.9x the configured `--maxmemory`** before the gate
+  fired, and every under-report additionally overshoots by its own factor
+  within the correction's 1-second staleness window. Per-db quotas and the
+  `used_memory` an operator reads in `INFO` have no correction at all and were
+  wrong by the full factor.
 
   Root causes, all four of them accounting that never matched an allocator:
 
