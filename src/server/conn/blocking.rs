@@ -2648,6 +2648,59 @@ pub(crate) fn try_inline_dispatch(
         return 0;
     }
 
+    // ---- CLIENT PAUSE pre-gate (moon#660: MUST precede `read_buf` consumption) ----
+    //
+    // `client_pause::check_pause` is consulted once per FRAME in the generic
+    // loop (`handler_monoio/mod.rs`), which is BELOW the inline-dispatch block
+    // — and that block `continue`s when it consumed the whole buffer. So an
+    // inlined `SET` never reached the pause gate at all.
+    //
+    // Measured on one binary, `--shards 1`, stock config, `CLIENT PAUSE 3000 WRITE`:
+    //
+    //     inline `SET`                        0.027 s   <- applied and acked
+    //     generic `SET` (MONITOR attached)    2.999 s   <- held, correct
+    //     `HSET` (never inline-eligible)      2.002 s   <- held, correct
+    //
+    // The pause mechanism works; the inline leg escaped it. `CLIENT PAUSE` is
+    // the primitive an operator uses to freeze the write plane before a
+    // failover or backup, so a write that lands anyway silently voids the one
+    // guarantee the command exists to provide.
+    //
+    // Gated on the lock-free `pause_possibly_active()` rather than
+    // `check_pause` itself: the latter takes a global `RwLock` read, and a
+    // global lock on the write path is exactly what this fast path exists to
+    // avoid. The hint is conservative in the safe direction only — a stale
+    // `true` costs one command its fast leg, a stale `false` cannot happen.
+    //
+    // As with the stall gate, this BAILS rather than answering: `check_pause`
+    // owns mode (ALL vs WRITE), expiry and the remaining duration, and
+    // re-deriving any of that here is the drift these bail-outs exist to
+    // prevent. Generic dispatch also runs `expire_if_needed`, which clears the
+    // hint — so once a pause lapses the inline path re-arms on its own.
+    //
+    // Reads are unaffected: this is the SET-only branch. Inline `GET` bypasses
+    // the pause too, but it does so on `main` as well — a separate pre-existing
+    // bug, filed rather than folded into this change.
+    if crate::client_pause::pause_possibly_active() {
+        return 0;
+    }
+
+    // ---- `-LOADING` pre-gate (moon#660: MUST precede `read_buf` consumption) ----
+    //
+    // Same shape: the moon#476 gate (`is_loading() && !allowed_while_loading`)
+    // lives in the generic frame loop, so an inlined `SET` was served against a
+    // shard whose index recovery was still running. Measured across a restart
+    // with a 40k-document FT index, 6/6 probes while `loading:1`:
+    // `main` answers `-LOADING`, this branch answered `+OK`.
+    //
+    // `SET` writes a string and touches no index, so this is a contract
+    // violation rather than corruption — but a client library that keys its
+    // "server ready" decision on `-LOADING` proceeds against a half-recovered
+    // server. `is_loading()` is a thread-local `Cell` read, so the check is free.
+    if crate::shard::loading::is_loading() {
+        return 0;
+    }
+
     // ---- Write-stall pre-gate (moon#660: MUST precede `read_buf` consumption) ----
     //
     // `segment_stall::stall_refusal` — the ONLY producer of
@@ -2676,9 +2729,16 @@ pub(crate) fn try_inline_dispatch(
     // `tests/mem_watchdog.rs` case B asserts GET stays answerable while
     // memfull is engaged.
     //
-    // Cost: three `Relaxed` `AtomicBool` loads, all false on an unstalled
-    // server — the shape `segment_stall`'s own module doc calls "no measurable
-    // overhead".
+    // Cost, corrected after review measured it: NOT "three Relaxed AtomicBool
+    // loads" as this comment first claimed. `is_any_write_stall_active` ORs
+    // three sources, and two of them (`disk_monitor`, `mem_monitor`) reach
+    // their state through a `OnceLock::get()` (Acquire) plus an `Arc` pointer
+    // chase; only `segment_stall` is a bare static load. Measured shape: ~7
+    // loads, 2 of them Acquire, across ~4 cache lines with 2 pointer chases —
+    // roughly 2x what was written here. No false sharing (the writers are 1 s
+    // ticks) and still no lock, no allocation. Collapsing the three sources
+    // into one published process-global `AtomicBool` would restore the
+    // originally-claimed cost; filed rather than folded in here.
     if crate::shard::segment_stall::is_any_write_stall_active() {
         return 0;
     }

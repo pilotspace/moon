@@ -1529,6 +1529,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && !crate::tracking::tracking_active()
                 && !is_replica
                 && !crate::replication::state::fanout_hint_active();
+            // moon#660: refresh the shard's cached clock once per batch, the
+            // SAME cadence the generic leg uses (`refresh_now_from_cache`
+            // above). The inline path calls `entry.set_last_access(db.now())`,
+            // which reads the STORED clock — nothing on that path refreshed it,
+            // so on a connection that had been idle every inline write stamped
+            // keys with a frozen timestamp. Measured: idle 10 s, then
+            // `SET stale:k v` immediately followed by `OBJECT IDLETIME stale:k`
+            // answered 18 (a key written just now, reported as long-cold). Under
+            // `allkeys-lru` that degrades victim selection exactly when
+            // eviction matters. Two Relaxed atomic loads per batch.
+            crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                db.refresh_now_from_cache(&ctx.cached_clock);
+            });
             let inlined = try_inline_dispatch_loop(
                 &mut read_buf,
                 &mut write_buf,
@@ -1555,6 +1568,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 spill_sender_active,
             );
             crate::admin::metrics_setup::record_dispatch_local_inline(inlined as u64);
+            // moon#660: inlined commands never reach the generic leg's
+            // `record_command*` calls, so without this they are absent from
+            // `total_commands_processed` AND from the adaptive idle park's
+            // activity signal. See `record_inline_commands`.
+            crate::admin::metrics_setup::record_inline_commands(inlined as u64);
             if inlined > 0 && read_buf.is_empty() {
                 // All commands were inlined -- flush write_buf and continue
                 if !write_buf.is_empty() {

@@ -380,6 +380,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exempts the commands that are a stall's own remedy, and re-deriving that here
   is the drift the shared helper exists to prevent.
 
+  **Adversarial review then found two more, and a performance review two
+  beyond that.** Same class every time: an obligation the generic leg carries
+  that the inline path does not.
+
+  - **`CLIENT PAUSE` was bypassed.** `check_pause` is consulted once per frame
+    in the generic loop, which sits BELOW the inline block — and that block
+    `continue`s when it consumed the buffer. Measured on one binary under
+    `CLIENT PAUSE 3000 WRITE`: inline `SET` returned in 0.027 s, generic `SET`
+    (MONITOR attached, forcing the slow path) in 2.999 s, `HSET` in 2.002 s.
+    The pause worked; the inline leg escaped it. This silently voids the one
+    guarantee the command exists to provide before a failover or backup.
+  - **The `-LOADING` gate was bypassed.** Across a restart with a 40k-document
+    FT index, 6/6 probes while `loading:1` answered `+OK` here and `-LOADING`
+    on `main`. `SET` touches no index, so this is contract violation rather
+    than corruption — but a client keying "server ready" on `-LOADING`
+    proceeds against a half-recovered server.
+  - **Inlined commands were invisible to `total_commands_processed`** — 200
+    plain `SET`s moved it by 0. Not merely an `INFO` inaccuracy:
+    `this_thread_commands` is the adaptive idle park's (#373) activity signal,
+    so a shard serving nothing but inlined commands read zero commands/tick and
+    could be classified IDLE under full load.
+  - **The shard's cached clock was never refreshed on the inline path.** The
+    generic leg calls `refresh_now_from_cache` once per batch; the inline path
+    called `set_last_access(db.now())` against whatever the stored clock last
+    held. Measured: idle 10 s, then `SET stale:k v` immediately followed by
+    `OBJECT IDLETIME stale:k` answered **18**. Under `allkeys-lru` every
+    inline-written key carried a frozen stamp, degrading victim selection
+    exactly under memory pressure. Fixed at the same per-batch cadence the
+    generic leg uses.
+
+  **Scope of the win, measured rather than assumed.** Interleaved A/B against
+  `5092e4db` in the shipped default, with `moon_dispatch_path_total` proving
+  each leg took the path it claims (noise floor 0.934 A-vs-A):
+
+  | config | ratio |
+  |---|---|
+  | `--shards 1`, P=16 | **1.84–1.97x** |
+  | `--shards 1`, P=16, `--appendonly yes` | **1.79x** |
+  | `--shards 1`, P=1 | 0.97 — no win |
+  | `--shards 4`, P=16 | 0.996 — no win |
+
+  The multi-shard result is structural, not tuning: `try_inline_dispatch`
+  returns 0 on a remote key and the loop BREAKS, so one remote key in a batch
+  ends inlining for the rest of it. At `--shards 4`, P=16 only 2.0% of writes
+  inline (10,400 of 520,000), matching the `(1/N)/(1-1/N)/P` prediction of
+  2.08%. **This change helps `--shards 1` pipelined workloads and is neutral
+  elsewhere** — it is not a general throughput win, and the tuning guide's
+  `--shards 4` recommendation for 8+ connections lands exactly where the
+  benefit is absent. (macOS A/B; every published figure must come from Linux.)
+
   The two previously-dead terms had no test at all, and both fail dangerously:
 
   - `!fanout_hint_active()` — deleting it makes a master with an attached
