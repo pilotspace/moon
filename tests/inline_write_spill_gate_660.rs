@@ -1117,11 +1117,16 @@ fn g3_del_of_spilled_keys_stays_dead_live_and_across_restart() {
     // (3) overwrite HALF of them: a hot value landing over a cold copy, which
     //     is the `Database::set` `Updated`-arm / `spill_inflight_forget` seam.
     for i in (0..PROBE_COUNT).step_by(2) {
-        assert_eq!(
-            c.cmd(&[b"SET", &probe_key(i), &vec![b'2'; PROBE_VALUE_LEN]]),
-            V::Simple("OK".into()),
-            "overwrite SET should succeed"
-        );
+        // NOT a strict `+OK`. These run after `write_filler`, so the shard is
+        // already under pressure with `--appendonly yes`, where the inline
+        // path's fail-loud `-MOONERR AOF backpressure` reply is a legitimate
+        // outcome (~1 run in 3 at `--shards 1`, recorded in this file's doc).
+        // The property this step needs is that the command was ANSWERED, not
+        // that it was durable — every one of these keys is DEL'd immediately
+        // below, and the ground-truth assertion after the loop is what
+        // establishes what was actually written.
+        let r = c.cmd(&[b"SET", &probe_key(i), &vec![b'2'; PROBE_VALUE_LEN]]);
+        assert_filler_accepted(&r, "overwrite SET");
     }
 
     // Ground truth: every probe is still retrievable right before the DEL, so
