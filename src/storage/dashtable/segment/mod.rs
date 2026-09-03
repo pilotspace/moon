@@ -118,6 +118,42 @@ const _: () = {
     assert!(std::mem::align_of::<Segment<u64, u64>>() >= 64);
 };
 
+// Per-thread SIMD control-byte scan counter (test builds only).
+//
+// `Segment::probe_count` cannot cover `find`, which takes `&self`. This
+// thread-local can, so it is the counter that spans a whole *sequence* of
+// segment calls — which is what PERF-08's claim is about: the fused
+// `insert_or_update_at` must scan fewer control-byte groups than
+// `get_mut` + `insert` does on a miss. See
+// `test_insert_or_update_scans_fewer_groups_than_get_mut_plus_insert`.
+//
+// Plain `//` comments, not `///`: a doc comment on a macro invocation trips
+// `unused_doc_comments`, which is denied in CI.
+//
+// Compiles to nothing outside `cfg(test)` (moon#789).
+#[cfg(test)]
+thread_local! {
+    static SIMD_PROBES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Record one SIMD control-byte group scan. No-op outside test builds.
+#[cfg(test)]
+#[inline]
+pub(super) fn note_simd_probe() {
+    SIMD_PROBES.with(|c| c.set(c.get() + 1));
+}
+
+/// No-op in non-test builds — zero production cost.
+#[cfg(not(test))]
+#[inline(always)]
+pub(super) fn note_simd_probe() {}
+
+/// Read and reset the per-thread scan counter.
+#[cfg(test)]
+pub(super) fn take_simd_probes() -> u32 {
+    SIMD_PROBES.with(|c| c.replace(0))
+}
+
 /// Prefetch the key data at the given slot index into L1 cache.
 ///
 /// On x86_64: uses `_mm_prefetch` with `_MM_HINT_T0` (all cache levels).
@@ -739,9 +775,17 @@ mod tests {
 
     #[test]
     fn test_segment_insert_or_update_at_probes_at_most_two_groups_on_miss() {
-        // On an empty segment, insert_or_update_at should scan at most 2 groups
-        // for h2 + 2 for empty = 4 SIMD probes. With fallback groups it can go
-        // up to 6. Assert ≤ 6.
+        // On an empty segment, insert_or_update_at scans at most 2 groups for
+        // h2 + the same 2 for empty/deleted = 4 SIMD probes (2 when bucket_a
+        // and bucket_b share a group). It must never revisit a group, and
+        // `has_non_home_keys` is false on a fresh segment so the fallback scan
+        // is skipped entirely — so 4 is the true bound, not 6.
+        //
+        // moon#789: this assertion, not the wall-clock ratio in
+        // `tests/perf_v0112_insert_or_update_single_probe.rs`, is the
+        // regression net for PERF-08's single-probe *structure*. The wall-clock
+        // ratio is arch-dependent (measured: aarch64 wins ~11% on the miss
+        // path, x86_64 loses ~17%); the probe count is not.
         let mut seg: Segment<Vec<u8>, u32> = Segment::new(0);
         let probes_before = seg.probe_count();
         let k = b"probe_test".to_vec();
@@ -752,9 +796,60 @@ mod tests {
         let probes_after = seg.probe_count();
         let delta = probes_after - probes_before;
         assert!(
-            delta <= 6,
-            "insert_or_update_at on empty segment did {} SIMD probes; expected <= 6",
+            delta <= 4,
+            "insert_or_update_at on empty segment did {} SIMD probes; expected <= 4 \
+             (2 home groups x {{h2, empty-or-deleted}}). More than that means the \
+             fused path is re-scanning a group — the PERF-08 single-probe \
+             property has regressed.",
             delta
+        );
+    }
+
+    /// moon#789: the deterministic gate for PERF-08.
+    ///
+    /// The wall-clock ratio in
+    /// `tests/perf_v0112_insert_or_update_single_probe.rs` is arch-dependent
+    /// and load-sensitive, so it can only assert a blow-up ceiling. THIS is the
+    /// assertion that holds the actual claim: on a miss, the fused
+    /// `insert_or_update_at` must scan strictly fewer control-byte groups than
+    /// the `get_mut` + `insert` sequence it replaced.
+    ///
+    /// It is deterministic, arch-independent and load-independent, and unlike a
+    /// bare `probe_count <= 4` bound it cannot be satisfied by re-implementing
+    /// `insert_or_update_at` in terms of `find` — the counter spans `find` too.
+    #[test]
+    fn test_insert_or_update_scans_fewer_groups_than_get_mut_plus_insert() {
+        let k = b"probe_test".to_vec();
+        let hash = simple_hash(&k);
+        let h2_val = h2(hash);
+        let (ba, bb) = home_buckets(hash);
+
+        // Legacy sequence on a miss: get_mut (a full find) then insert (which
+        // finds again to dedupe, then scans for a free slot).
+        let mut legacy: Segment<Vec<u8>, u32> = Segment::new(0);
+        let _ = take_simd_probes();
+        assert!(legacy.get_mut(h2_val, k.as_slice(), ba, bb).is_none());
+        let _ = legacy.insert(h2_val, k.clone(), 1u32, ba, bb);
+        let legacy_probes = take_simd_probes();
+
+        // Fused single-probe path on the same miss.
+        let mut fused: Segment<Vec<u8>, u32> = Segment::new(0);
+        let _ = take_simd_probes();
+        let _ =
+            fused.insert_or_update_at(h2_val, k.as_slice(), ba, bb, |_| {}, || (k.clone(), 1u32));
+        let fused_probes = take_simd_probes();
+
+        // Both must actually have stored the key — otherwise we are comparing
+        // the probe counts of two different operations.
+        assert_eq!(legacy.get(h2_val, k.as_slice(), ba, bb), Some(&1u32));
+        assert_eq!(fused.get(h2_val, k.as_slice(), ba, bb), Some(&1u32));
+
+        assert!(
+            fused_probes < legacy_probes,
+            "insert_or_update_at scanned {fused_probes} control-byte groups on a miss; \
+             get_mut + insert scanned {legacy_probes}. The fused path must scan strictly \
+             fewer — that is the whole of PERF-08. Equal or greater means the single-probe \
+             fusion has regressed (moon#789)."
         );
     }
 

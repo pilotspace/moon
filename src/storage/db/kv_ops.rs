@@ -318,6 +318,14 @@ impl Database {
     /// and miss paths. The old `get_mut` + `insert` pattern ran two probes on
     /// miss (PERF-08).
     ///
+    /// The probe *count* reduction is structural and holds everywhere. The
+    /// wall-clock win is not: measured on 1M keys, moon @ 7678156f, the fused
+    /// miss path is ~11% faster on aarch64 (Neoverse-N1) and ~17% *slower* on
+    /// x86_64 (Xeon 8481C) than `get_mut` + `insert`, despite issuing strictly
+    /// fewer SIMD probes. Do not quote PERF-08 as an unqualified speed-up.
+    /// See moon#789 and the module docs of
+    /// `tests/perf_v0112_insert_or_update_single_probe.rs`.
+    ///
     /// `key` is BORROWED on purpose. Every use below is by reference —
     /// `spill_inflight_forget`, `entry_overhead`, `hash_expiry_index_note_value`,
     /// `CompactKey::from` (which copies the bytes either way), `ColdIndex::remove`

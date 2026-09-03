@@ -31,6 +31,7 @@ impl<K, V> Segment<K, V> {
         let mask_a = unsafe { self.ctrl[group_a].match_h2(h2) };
         #[cfg(not(target_arch = "x86_64"))]
         let mask_a = self.ctrl[group_a].match_h2(h2);
+        super::note_simd_probe();
 
         // Prefetch key data for the first H2 match to hide memory latency
         if let Some(first_pos) = mask_a.lowest_set_bit() {
@@ -66,6 +67,7 @@ impl<K, V> Segment<K, V> {
             let mask_b = unsafe { self.ctrl[group_b].match_h2(h2) };
             #[cfg(not(target_arch = "x86_64"))]
             let mask_b = self.ctrl[group_b].match_h2(h2);
+            super::note_simd_probe();
 
             // Prefetch key data for the first H2 match in group_b
             if let Some(first_pos) = mask_b.lowest_set_bit() {
@@ -127,6 +129,7 @@ impl<K, V> Segment<K, V> {
             let mask = unsafe { self.ctrl[g].match_h2(h2) };
             #[cfg(not(target_arch = "x86_64"))]
             let mask = self.ctrl[g].match_h2(h2);
+            super::note_simd_probe();
 
             for pos in mask {
                 let slot = base + pos;
