@@ -861,13 +861,24 @@ mod tests {
         assert_eq!(val.estimate_memory(), 5);
     }
 
+    /// moon#788: this used to assert the literal `key(3) + val(3) + 64 = 70`,
+    /// which was a restatement of the constant under test — it could only
+    /// ever fail when someone edited the constant, never when the constant
+    /// was WRONG, and the constant was wrong. Anchored on the real slot type
+    /// instead: one live field costs at least a whole `(Bytes, Bytes)` plus
+    /// the size classes the two buffers land in.
     #[test]
     fn test_estimate_memory_hash() {
         let mut map = HashMap::new();
         map.insert(Bytes::from_static(b"key"), Bytes::from_static(b"val"));
         let val = RedisValue::Hash(map);
-        // key(3) + val(3) + 64 = 70
-        assert_eq!(val.estimate_memory(), 70);
+        let floor = crate::storage::mem_size::size_class(3) * 2
+            + std::mem::size_of::<(Bytes, Bytes)>();
+        assert!(
+            val.estimate_memory() >= floor,
+            "one hash field billed {} B against {floor} B of real slot + buffers",
+            val.estimate_memory()
+        );
     }
 
     #[test]

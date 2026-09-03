@@ -69,22 +69,30 @@ pub const fn vec_bytes(cap: usize, elem: usize) -> usize {
     size_class(cap * elem)
 }
 
-/// Number of hashbrown buckets behind a reported `HashMap`/`HashSet`
-/// `capacity()`.
+/// Number of hashbrown buckets needed to hold `capacity` live items.
 ///
 /// hashbrown sizes its table as a power of two and grows when the table is
-/// 7/8 full, so `capacity() == buckets / 8 * 7` for `buckets >= 8` and
-/// `capacity() == buckets - 1` below that. This inverts that mapping exactly.
+/// 7/8 full, so it needs `next_pow2(ceil(capacity * 8 / 7))` buckets, with a
+/// floor of 4.
+///
+/// Deliberately expressed as "buckets NEEDED for this many items" rather than
+/// as an inverse of `capacity()`: callers pass a capacity that did not always
+/// come from a hashbrown table. `IndexSet::capacity()`, for instance, is
+/// `min(entries_vec.capacity(), indices.capacity())` and is usually the Vec's
+/// figure, which is not a hashbrown capacity at all. Inverting
+/// `capacity / 7 * 8` on such a value silently produced a non-power-of-two
+/// bucket count and under-billed the index table by up to 2x.
 #[inline]
 #[must_use]
 pub const fn hash_buckets(capacity: usize) -> usize {
     if capacity == 0 {
-        0
-    } else if capacity < 8 {
-        // 3 -> 4, 7 -> 8; both are the only reachable sub-8 capacities.
-        capacity + 1
+        return 0;
+    }
+    let needed = capacity.div_ceil(7) * 8;
+    if needed < 4 {
+        4
     } else {
-        capacity / 7 * 8
+        needed.next_power_of_two()
     }
 }
 
@@ -224,9 +232,10 @@ mod tests {
         }
     }
 
-    /// `hash_buckets` must invert hashbrown's own capacity mapping.
+    /// `hash_buckets` must cover hashbrown's own table: at least as many
+    /// power-of-two buckets as its 7/8 load factor needs for the live items.
     #[test]
-    fn hash_buckets_inverts_hashbrown_capacity() {
+    fn hash_buckets_covers_hashbrowns_real_table() {
         use std::collections::HashMap;
         for n in [0usize, 1, 3, 7, 8, 14, 28, 100, 1000, 10_000] {
             let mut m: HashMap<u64, u64> = HashMap::new();
