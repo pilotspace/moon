@@ -336,7 +336,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   REACHABLE, and an operator running `--appendonly yes` at this throughput may
   see it. The AOF writer's capacity, not this gate, is the thing to raise.
 
-  New suite `tests/inline_write_spill_gate_660.rs`, thirteen tests over
+  New suite `tests/inline_write_spill_gate_660.rs`, fifteen tests over
   `--shards 1` and `--shards 4`, resting on the fact that `evicted_keys` (key
   left the keyspace) and `spilled_keys` (key moved to disk, still readable) are
   never both incremented for one victim. Widening the gate WITHOUT the bail-out
@@ -344,6 +344,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `spilled_keys` flat at 0; restoring the old gate turns it red with no
   connection inlining at all, and takes every gate-term test down at its own
   vacuity control.
+
+  Review follow-up, all of it driven by findings rather than by design. A
+  test-integrity pass showed the two most recent fixes — refreshing the shard
+  database's cached clock before an inline write, and counting inline writes in
+  `total_commands_processed` — had shipped with NO guard: deleting both left
+  the whole suite green. GROUP 7 covers them (`OBJECT IDLETIME` after a 5 s
+  idle; the command counter against 200 inline SETs). G1 gained an inline-path
+  CONTROL, having previously passed unchanged with inline writes disabled
+  outright, and `spill_sender_active: true` — the operand that makes the
+  bail-out fire — gained its first unit test; every existing one passed
+  `false`. The unit tests that drive `try_inline_dispatch` are now serialised,
+  because the `CLIENT PAUSE` guard mutates process-global state that the other
+  twenty-one read.
+
+  Two claims were WITHDRAWN rather than defended. G2's slip bound now applies
+  at `--shards 1` only: the elastic budget lets a lone hot shard borrow its
+  idle siblings' headroom, so at `--shards 4` it spends most of a window
+  legitimately under budget and inlines most of it — measured on the Linux
+  gate at 7,719 of 8,000 writes, with at most 15 plain drops against 156
+  spills. That is the pre-gate working. G2's safety assertion, the one that
+  guards against silent data loss, still runs at both shard counts. And G3 is
+  documented as what it is: `remove_cold_only` is unreachable from
+  `try_inline_dispatch`, so G3 reddens identically on merge-base and is a
+  cold-plane guard riding this fixture, not evidence for the inline change.
+
+  Two harness defects surfaced by the same gate are fixed here: `spawn_moon`
+  reserved its admin port OUTSIDE the retry loop (a held admin port made moon
+  exit at start-up while `spawn_listening` — which polls the child once,
+  moon#811 — handed back the corpse), and the crash-restart leg had no
+  readiness check at all, only `Client::connect`, which proves a listener
+  accepts and, under `SO_REUSEPORT`, not even that the peer is the process just
+  spawned. Both now wait for a real `+PONG`.
 
   **A term had to be ADDED, and two more are covered for the first time,
   because this change is what makes them reachable.** `can_inline_writes` is a
