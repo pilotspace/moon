@@ -663,14 +663,12 @@ fn test_sorted_set_arena_is_visible_to_used_memory() {
     // real leak here would be megabytes, not tens of kilobytes.
     let charged = after - before;
     let tolerance = charged / 20;
-    let end = poll_used_memory(
+    poll_used_memory(
         &mut c,
         |v| v.saturating_sub(before) <= tolerance,
-        "credit-back after 500 DEL",
-    );
-    assert!(
-        end.saturating_sub(before) <= tolerance,
-        "deleting every zset left {} B of the {charged} B charged still on the          ledger (tolerance {tolerance} B)",
-        end.saturating_sub(before)
+        &format!(
+            "deleting every zset must return the {charged} B charged to within \
+             {tolerance} B of the {before} B starting figure"
+        ),
     );
 }

@@ -511,9 +511,10 @@ impl CompactValue {
             let rv = unsafe { &*self.heap_collection_ptr() };
             // moon#788: EVERY container value is a `Box<RedisValue>`, and the
             // enum is sized by its largest variant. That box is a real
-            // allocation the ledger never billed — 160 B per container key on
-            // 64-bit, invisible to `--maxmemory` for hashes, lists, sets,
-            // sorted sets and streams alike. It is a constant for the whole
+            // allocation the ledger never billed — `size_of::<RedisValue>()`
+            // rounded to a size class, 128 B on the 64-bit targets moon ships
+            // on — invisible to `--maxmemory` for hashes, lists, sets, sorted
+            // sets and streams alike. It is a constant for the whole
             // life of the value, so charging it here keeps
             // `entry_overhead(create) + deltas == entry_overhead(remove)`
             // exactly (the WS6 mirror invariant).
