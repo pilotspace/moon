@@ -2648,6 +2648,41 @@ pub(crate) fn try_inline_dispatch(
         return 0;
     }
 
+    // ---- Write-stall pre-gate (moon#660: MUST precede `read_buf` consumption) ----
+    //
+    // `segment_stall::stall_refusal` — the ONLY producer of
+    // `-MOONERR memfull: writes paused until memory pressure recovers`, the
+    // MA12 disk-free refusal, and the moon#718 segment-stall refusal — has
+    // exactly two call sites, both in GENERIC dispatch
+    // (`handler_monoio/dispatch.rs`, `handler_sharded/dispatch.rs`). This path
+    // has none, so a plain `SET` inlined while a stall is active answers `+OK`
+    // for a write the server has committed to refusing.
+    //
+    // Measured: merge-base 7678156f passes `tests/mem_watchdog.rs` (case A:
+    // "expected MOONERR memfull on the first write with a 1MB fake limit at
+    // 50% threshold") and `tests/compaction_escape_hatch_718.rs`; widening
+    // `can_inline_writes` without this bail-out fails all three. Introduced
+    // here, not exposed here — the same class as the `!conn.in_cross_txn()`
+    // term: an obligation the generic leg carries that this path does not.
+    //
+    // Bailing to generic dispatch rather than answering the error HERE is
+    // deliberate. `stall_refusal` is not a plain boolean — it exempts the
+    // commands that are a stall's own remedy (moon#718's escape hatch) and
+    // distinguishes the three sources. Re-deriving that here is precisely the
+    // drift the shared helper exists to prevent, so this path defers the whole
+    // decision to the leg that already owns it.
+    //
+    // Reads are untouched: this is the SET-only branch, and
+    // `tests/mem_watchdog.rs` case B asserts GET stays answerable while
+    // memfull is engaged.
+    //
+    // Cost: three `Relaxed` `AtomicBool` loads, all false on an unstalled
+    // server — the shape `segment_stall`'s own module doc calls "no measurable
+    // overhead".
+    if crate::shard::segment_stall::is_any_write_stall_active() {
+        return 0;
+    }
+
     // ---- Eviction pre-gate (moon#660: MUST precede `read_buf` consumption) ----
     //
     // The lock-free pre-gate proves the common case (no memory pressure / no
