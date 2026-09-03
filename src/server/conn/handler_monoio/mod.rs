@@ -215,17 +215,27 @@ pub enum MonoioHandlerResult {
 ///
 /// Task #34 review (defect 1 follow-through): this gate has no
 /// `ShardManifest` handle (only the tick-driven memory-pressure cascade in
-/// `persistence_tick.rs` does), so under `--disk-offload enable` the
-/// spill-sender branch below reliably takes the "no manifest reachable"
-/// plain-drop fallback inside
-/// `evict_to_budget` for EVERY
-/// write past `maxmemory` — this is, empirically, the actual eviction path a
-/// live server hits on ordinary writes (HSET, SET, ...) under disk-offload,
-/// not the sync `SpillContext` path. It previously called the non-reporting
-/// wrapper (hardcoded no-op sink), so those plain-drops never reached
-/// `record_reason_del_conn` — silently unreported eviction under the single
-/// most common disk-offload deployment shape. Now wired to the same sink the
-/// no-spill-sender branch below already uses.
+/// `persistence_tick.rs` does), so it passes `manifest: None` to
+/// [`EvictionRun::async_spill`] below.
+///
+/// What that costs depends on `appendonly`, and ONLY on it — see the
+/// `EvictionSink::AsyncSpill` arm of `evict_to_budget`:
+///
+///   * `--appendonly yes`: no cost. The arm ignores the manifest entirely and
+///     calls `evict_one_async_spill`, handing every victim to the
+///     `SpillThread`; the AOF is the durability backstop. Victims are SPILLED
+///     and stay cold-readable. (moon#660 measured this: `spilled_keys` climbs
+///     while `evicted_keys` stays near zero — `tests/inline_write_spill_gate_660.rs`.)
+///   * `--appendonly no`: with no manifest AND no AOF backstop a durable spill
+///     is impossible here, so the arm falls back to
+///     `evict_one_with_spill(.., None, ..)` — evicting policies PLAIN-DROP,
+///     `noeviction` OOMs. The cap is still enforced; the tick-driven cascade
+///     with its manifest picks up durable spilling within 100ms.
+///
+/// This wrapper previously used the non-reporting variant (hardcoded no-op
+/// sink), so plain-drops taken on that second path never reached
+/// `record_reason_del_conn` — silently unreported eviction. Now wired to the
+/// same sink the no-spill-sender branch below already uses.
 #[cfg(feature = "runtime-monoio")]
 fn run_write_eviction_gate(
     ctx: &super::core::ConnectionContext,
@@ -1376,9 +1386,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // `handler_monoio::ft::replication_fanout_active` uses as its
             // first gate — forces plain SET onto the generic dispatch path
             // for the rest of the process once any replica has ever begun
-            // attaching, matching the existing `ctx.spill_sender.is_none()`
-            // precedent of "fall back to the full path when it must do more
-            // than this fast path knows how to do". These write-only
+            // attaching, on the same precedent as every other term here:
+            // "fall back to the full path when it must do more than this fast
+            // path knows how to do". (That precedent used to be named as
+            // `ctx.spill_sender.is_none()`; moon#660 replaced that term with a
+            // per-write bail-out — see the block comment on
+            // `can_inline_writes` below. The precedent stands, but the
+            // spill case is now decided by eviction STATE, not by whether a
+            // sender exists.) These write-only
             // conditions do not gate GET, which has its own `can_inline_reads`
             // gate below — reads must never be inlined for a restricted or
             // tracking connection, but a replica/spill/fanout master may still
@@ -1420,13 +1435,99 @@ pub(crate) async fn handle_connection_sharded_monoio<
             let monitored = crate::monitor::any_attached();
             let can_inline_reads =
                 acl_unrestricted && !conn.in_multi && !conn.tracking_state.enabled && !monitored;
+            // moon#660: this term used to be `ctx.spill_sender.is_none()`, a
+            // CONFIG predicate standing in for a STATE one. `--disk-offload`
+            // defaults to `enable`, which spawns a per-shard `SpillThread` and
+            // hands every connection a live sender, so the term was false out
+            // of the box and inline writes never ran in the default
+            // configuration.
+            //
+            // What the sender actually guards is EVICTION ROUTING, and only
+            // that. A plain `SET k v` has no other divergence between the two
+            // paths: `string::set`'s `args.len() == 2` fast path and the inline
+            // path both build the same `Entry`, queue the same `set`
+            // keyspace notification, and call the SAME `Database::set` — which
+            // is where every cold-tier obligation lives (`spill_inflight_forget`
+            // retires an in-flight spill payload, #459; the `Updated` arm drops
+            // the stale `cold_index` shadow, task #56). Neither path promotes
+            // or consults the cold tier for a write; the cold hooks in this
+            // file are all on the GET/MGET read path.
+            //
+            // The routing divergence is real, though: with a live sender
+            // `run_write_eviction_gate` builds `EvictionRun::async_spill(..)`,
+            // whose victims are SPILLED under `--appendonly yes`, while the
+            // inline path builds `EvictionRun::plain()`, whose victims are
+            // DROPPED. Inlining a write while eviction is firing would convert
+            // "evict to disk" into "drop": data loss under memory pressure.
+            //
+            // So the invariant is not "no sender exists" but:
+            //
+            //     the inline write path may run only when it will produce the
+            //     same observable state transition as generic dispatch —
+            //     i.e. only when EVICTION PROVABLY WILL NOT FIRE on this write.
+            //
+            // That is a per-write, state-level question, and it is answered
+            // per-write inside `try_inline_dispatch` by the lock-free
+            // `inline_write_can_skip_eviction` pre-gate it already ran. It is
+            // deliberately NOT answered here: a per-batch snapshot would let a
+            // pipeline cross the budget mid-batch and plain-drop the rest.
+            // This gate therefore only TELLS the inline path whether a sender
+            // is live; the inline path bails out to generic dispatch (leaving
+            // `read_buf` untouched) the moment the pre-gate reports pressure.
+            //
+            // Deliberately NOT used as the condition here:
+            //   * `Config::disk_offload_spill_inert()` — a startup-config
+            //     predicate (`disk_offload_enabled && appendonly != "yes" &&
+            //     save.is_none()`). It is true for exactly the `--appendonly no`
+            //     benchmark shape and false for the durable production one, so
+            //     it would recover throughput only where it does not matter.
+            //     It is also unsound across restarts: a server run with
+            //     `--appendonly yes` spills cold data to `--dir`, and a restart
+            //     of that same dir under `--appendonly no` loads that cold data
+            //     at Phase 3 recovery while the predicate now reads "inert".
+            //   * `maxmemory_is_set()` — moon's auto-maxmemory default is 75%
+            //     of RAM, so it is true out of the box and discriminates
+            //     nothing. The live pressure COMPARISON is the discriminator.
+            let spill_sender_active = ctx.spill_sender.is_some();
+            // moon#660 review follow-up: `!conn.in_cross_txn()`.
+            //
+            // Eviction routing was NOT the only divergence. Inside an open
+            // cross-store transaction the generic write leg captures an undo
+            // record (`txn.kv_undo.record_insert` / `record_update`, ~line
+            // 3101) and a write intent (`s.kv_write_intents.record_write`,
+            // ~line 3117) BEFORE dispatching. `try_inline_dispatch` does
+            // neither — grepping `cross_txn`/`kv_undo`/`write_intent` in
+            // `server/conn/blocking.rs` returns nothing.
+            //
+            // Without the undo record `TXN ABORT` restores nothing
+            // (`transaction/abort.rs:118` replays `UndoRecord::Update`), and
+            // without the write intent the MVCC snapshot-visibility filter
+            // below (~line 3482) cannot hide the uncommitted value from a
+            // FOREIGN transaction's reads. Measured on this branch before the
+            // term was added, `--shards 1`, stock config, one connection:
+            //
+            //     SET k original -> +OK
+            //     TXN BEGIN      -> +OK        (generic; `TXN` is *2, never inline-eligible)
+            //     SET k modified -> +OK        (local_inline 1 -> 2: INLINED)
+            //     TXN ABORT      -> +OK        (undo log empty)
+            //     GET k          -> "modified" (contract says "original")
+            //
+            // and on merge-base 7678156f the same sequence answers
+            // "original" with local_inline flat at 0 for that SET. So this is
+            // introduced here, not exposed here: before this change
+            // `--disk-offload enable` held `can_inline_writes` false in the
+            // shipped default, and the SET went generic.
+            //
+            // Same class as `!is_replica` above — a term the conjunction
+            // never needed while one of its members was false by default —
+            // except this one did not exist at all.
             let can_inline_writes = acl_unrestricted
                 && !monitored
                 && !conn.in_multi
+                && !conn.in_cross_txn()
                 && !conn.tracking_state.enabled
                 && !crate::tracking::tracking_active()
                 && !is_replica
-                && ctx.spill_sender.is_none()
                 && !crate::replication::state::fanout_hint_active();
             let inlined = try_inline_dispatch_loop(
                 &mut read_buf,
@@ -1448,6 +1549,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // null spelling depended on which shard owned the key.
                 conn.protocol_version >= 3,
                 &ctx.runtime_config,
+                // moon#660: eviction on this connection routes victims to the
+                // spill thread, so the inline path must NOT resolve eviction
+                // itself — it stands down to generic dispatch under pressure.
+                spill_sender_active,
             );
             crate::admin::metrics_setup::record_dispatch_local_inline(inlined as u64);
             if inlined > 0 && read_buf.is_empty() {
