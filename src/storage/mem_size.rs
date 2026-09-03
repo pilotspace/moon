@@ -235,6 +235,34 @@ mod tests {
     /// `hash_buckets` must cover hashbrown's own table: at least as many
     /// power-of-two buckets as its 7/8 load factor needs for the live items.
     #[test]
+    /// The test above only ever feeds `hash_buckets` a capacity that CAME
+    /// from a hashbrown table, and those are already `buckets * 7 / 8` — so
+    /// `div_ceil(7) * 8` reproduces the bucket count exactly and the rounding
+    /// step is a no-op. Deleting `next_power_of_two()` left it green, which
+    /// means it never guarded the one thing this function exists to do.
+    ///
+    /// The capacities in production are NOT all hashbrown's own:
+    /// `IndexSet::capacity()` reports `min(entries_vec.capacity(),
+    /// indices.capacity())`, usually the Vec's figure. Any reported capacity
+    /// must still land on a table hashbrown could really have allocated.
+    #[test]
+    fn hash_buckets_rounds_any_reported_capacity_to_a_real_table() {
+        for c in 1usize..=512 {
+            let b = hash_buckets(c);
+            assert!(
+                b.is_power_of_two(),
+                "capacity {c}: {b} buckets is not a power of two, so no \
+                 hashbrown table is that size"
+            );
+            assert!(
+                b * 7 >= c * 8,
+                "capacity {c}: {b} buckets is below hashbrown's 7/8 load factor"
+            );
+            assert!(b >= 4, "capacity {c}: hashbrown's smallest table is 4 buckets, got {b}");
+        }
+    }
+
+    #[test]
     fn hash_buckets_covers_hashbrowns_real_table() {
         use std::collections::HashMap;
         for n in [0usize, 1, 3, 7, 8, 14, 28, 100, 1000, 10_000] {
