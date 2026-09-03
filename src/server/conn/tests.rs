@@ -53,6 +53,7 @@ fn test_inline_get_hit() {
         false, // can_inline_writes
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     assert_eq!(result, 1);
     assert!(read_buf.is_empty());
@@ -91,6 +92,7 @@ fn test_inline_get_hit_byte_parity_sizes() {
             false, // can_inline_writes
             false, // resp3: a RESP2 connection (moon#522)
             &rt_config,
+            false, // spill_sender_active (moon#660): no spill thread in unit tests
         );
 
         let mut expected = Vec::new();
@@ -138,6 +140,7 @@ fn test_inline_get_miss() {
         false, // can_inline_writes
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     assert_eq!(result, 1);
     assert!(read_buf.is_empty());
@@ -176,6 +179,7 @@ fn test_inline_get_miss_null_spelling_follows_protocol() {
             false, // can_inline_writes
             resp3,
             &rt_config,
+            false, // spill_sender_active (moon#660): no spill thread in unit tests
         );
 
         assert_eq!(result, 1, "resp3={resp3}: the miss must still inline");
@@ -220,6 +224,7 @@ fn test_inline_get_hit_is_protocol_independent() {
             false, // can_inline_writes
             resp3,
             &rt_config,
+            false, // spill_sender_active (moon#660): no spill thread in unit tests
         );
         assert_eq!(result, 1);
         assert_eq!(
@@ -255,6 +260,7 @@ fn test_inline_set_falls_through_when_writes_disabled() {
         false, // can_inline_writes
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     assert_eq!(result, 0, "SET should fall through inline dispatch");
     assert_eq!(read_buf.len(), original_len, "buffer should be untouched");
@@ -285,6 +291,7 @@ fn test_inline_set_executes_when_writes_enabled() {
         true,  // can_inline_writes
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     assert_eq!(result, 1, "SET should be inlined");
     assert!(read_buf.is_empty(), "buffer should be consumed");
@@ -342,6 +349,7 @@ fn test_inline_set_captures_snapshot_pre_image() {
         true,  // can_inline_writes
         false, // resp3
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     let pending = snapshot_cow::pending_for_test();
     snapshot_cow::disarm();
@@ -390,6 +398,7 @@ fn test_inline_get_captures_nothing_under_snapshot() {
         true,
         false,
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     let pending = snapshot_cow::pending_for_test();
     snapshot_cow::disarm();
@@ -422,6 +431,7 @@ fn test_inline_set_with_options_falls_through() {
         true,  // can_inline_writes
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     assert_eq!(result, 0, "SET with options should fall through");
     assert_eq!(read_buf.len(), original_len);
@@ -451,6 +461,7 @@ fn test_inline_fallthrough() {
         false, // can_inline_writes
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     assert_eq!(result, 0);
     assert_eq!(read_buf.len(), original_len);
@@ -487,6 +498,7 @@ fn test_inline_mixed_batch() {
         false, // cluster_enabled
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     assert_eq!(total, 1);
     assert_eq!(&write_buf[..], b"$3\r\nbar\r\n");
@@ -526,6 +538,7 @@ fn test_inline_get_refused_when_reads_not_inlinable() {
         false, // cluster_enabled
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     assert_eq!(total, 0, "GET must not be inlined when reads are gated off");
     assert_eq!(
@@ -564,6 +577,7 @@ fn test_inline_case_insensitive() {
         false, // can_inline_writes
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     assert_eq!(result, 1);
     assert!(read_buf.is_empty());
@@ -594,6 +608,7 @@ fn test_inline_partial() {
         false, // can_inline_writes
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     assert_eq!(result, 0);
     assert_eq!(read_buf.len(), original_len);
@@ -629,6 +644,7 @@ fn test_inline_set_with_aof_falls_through_when_writes_disabled() {
         false, // can_inline_writes
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     assert_eq!(
         result, 0,
@@ -667,6 +683,7 @@ fn test_inline_multiple_gets() {
         false, // cluster_enabled
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     assert_eq!(total, 2);
     assert!(read_buf.is_empty());
@@ -702,6 +719,7 @@ fn test_inline_loop_disabled_in_cluster_mode() {
         true,  // ...cluster mode wins: nothing may inline
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     assert_eq!(
         total, 0,
@@ -783,6 +801,7 @@ fn test_inline_get_declines_for_cold_key_instead_of_blocking() {
         false, // can_inline_writes
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     let elapsed = start.elapsed();
 
@@ -836,6 +855,7 @@ fn test_inline_get_genuine_miss_still_answers_inline() {
         false, // can_inline_writes
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
     );
     assert_eq!(result, 1);
     assert!(read_buf.is_empty());

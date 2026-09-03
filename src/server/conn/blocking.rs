@@ -2376,6 +2376,15 @@ pub(crate) fn try_inline_dispatch(
     // client received the RESP2 null bulk for any key its own shard owned.
     resp3: bool,
     runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
+    // moon#660: `true` when this connection has a live `spill_sender`, i.e.
+    // generic dispatch would route eviction victims to the `SpillThread`
+    // (`EvictionRun::async_spill`) instead of dropping them
+    // (`EvictionRun::plain`). This path can only ever build the `plain` sink,
+    // so when this is `true` it MUST NOT resolve eviction itself: it stands
+    // down to generic dispatch the moment the lock-free pre-gate reports
+    // pressure, leaving `read_buf` untouched. See the block comment on
+    // `can_inline_writes` in `handler_monoio/mod.rs` for the full invariant.
+    spill_sender_active: bool,
 ) -> usize {
     let buf = &read_buf[..];
     let len = buf.len();
@@ -2639,6 +2648,65 @@ pub(crate) fn try_inline_dispatch(
         return 0;
     }
 
+    // ---- Eviction pre-gate (moon#660: MUST precede `read_buf` consumption) ----
+    //
+    // The lock-free pre-gate proves the common case (no memory pressure / no
+    // limit) without the per-SET `runtime_config.read()` lock pair; only under
+    // pressure — or before the hints are published — is there anything to do.
+    //
+    // It is evaluated HERE, before `split_to` below takes the command bytes out
+    // of `read_buf`, so that the bail-out is a true "not handled": returning 0
+    // with `read_buf` byte-for-byte intact hands this command to generic
+    // dispatch, which re-parses it from the front of the same buffer. Bailing
+    // AFTER the split would consume a command nothing then executes — a
+    // silently lost write. This is the "do not half-inline and then diverge"
+    // constraint, enforced by ordering rather than by a comment.
+    //
+    // `budget` and `est` were already computed on this path; only the branch
+    // below is new.
+    let budget = shard_databases.elastic_budget(shard_id);
+    let est = crate::shard::slice::with_shard_db(selected_db, |db| db.estimated_memory());
+    let needs_eviction = !crate::storage::eviction::inline_write_can_skip_eviction(est, budget);
+
+    // moon#660: THE safety condition. With a live `spill_sender`, generic
+    // dispatch routes victims through `EvictionRun::async_spill` — under
+    // `--appendonly yes` they are handed to the `SpillThread` and stay
+    // cold-readable. This path can only build `EvictionRun::plain`, which
+    // DROPS them. So when eviction may fire and a sender is live, this path
+    // stands down rather than substituting a drop for a spill.
+    //
+    // Note the asymmetry with the branch below, and why it is not redundant:
+    // when NO sender is live the generic gate itself builds
+    // `EvictionRun::plain().report(record_reason_del_conn)` — the exact
+    // construction this path builds — so resolving eviction here is
+    // observably identical and the fast path keeps it (task #34's plain-drop
+    // reporting stays wired and reachable).
+    //
+    // Liveness: under sustained pressure every SET bails and the generic gate
+    // reclaims, which lowers `est` and re-arms this path. Worst case is the
+    // pre-#660 behaviour (always generic), never a livelock.
+    //
+    // Cost of the bail itself: the SET shape has already been parsed by the
+    // time we get here, so a bailing write pays that parse plus this pre-gate
+    // (one budget load, one `estimated_memory` field read, three Relaxed
+    // atomics) before generic dispatch re-parses it. NOT MEASURED — a write
+    // path that is evicting is dominated by victim selection and the spill
+    // queue, and driving a bench into that regime hits AOF backpressure first
+    // (see `tests/inline_write_spill_gate_660.rs`). To quantify it:
+    // `redis-benchmark -n 400000 -c 50 -P 16 -r 100000 SET k:__rand_int__ v`
+    // against `--maxmemory <just under steady-state RSS> --maxmemory-policy
+    // allkeys-lru --appendonly no`, A/B interleaved.
+    //
+    // This branch does NOT consult `appendonly`, though under
+    // `--appendonly no` the generic gate plain-drops too (it passes
+    // `manifest: None`), so the bail buys nothing there. Deliberate: keying
+    // the safety condition on a startup config value is the exact mistake this
+    // change removes, and it would be unsound across a restart that flips
+    // `appendonly` on a dir that already holds cold data.
+    if needs_eviction && spill_sender_active {
+        return 0;
+    }
+
     // Freeze the consumed prefix of `read_buf` into an Arc-backed `Bytes`.
     // This replaces the BytesMut prefix with a refcounted view over the SAME
     // allocation, so `key`, `value`, and the AOF record can all be extracted
@@ -2648,14 +2716,9 @@ pub(crate) fn try_inline_dispatch(
     // We must not index into `buf` after this point — use `frozen` instead.
     let frozen = read_buf.split_to(consumed).freeze();
 
-    // Eviction check + write via the thread-local slice. The lock-free
-    // pre-gate proves the common case (no memory pressure / no limit) without
-    // the per-SET `runtime_config.read()` lock pair; only under pressure —
-    // or before the hints are published — does the full locked path run.
+    // Eviction + write via the thread-local slice.
     {
-        let budget = shard_databases.elastic_budget(shard_id);
-        let est = crate::shard::slice::with_shard_db(selected_db, |db| db.estimated_memory());
-        if !crate::storage::eviction::inline_write_can_skip_eviction(est, budget) {
+        if needs_eviction {
             let rt = runtime_config.read();
             let oom = crate::shard::slice::with_shard_db(selected_db, |db| {
                 crate::storage::eviction::evict_to_budget(
@@ -2813,6 +2876,8 @@ pub(crate) fn try_inline_dispatch_loop(
     // `try_inline_dispatch` so its self-framed GET miss picks the right null.
     resp3: bool,
     runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
+    // moon#660: forwarded verbatim to `try_inline_dispatch`.
+    spill_sender_active: bool,
 ) -> usize {
     if cluster_enabled {
         return 0;
@@ -2833,6 +2898,7 @@ pub(crate) fn try_inline_dispatch_loop(
             can_inline_writes,
             resp3,
             runtime_config,
+            spill_sender_active,
         );
         if n == 0 {
             break;

@@ -258,6 +258,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`server`: inline writes are no longer disabled by the default
+  `--disk-offload enable`.** `can_inline_writes` carried the term
+  `ctx.spill_sender.is_none()`. `--disk-offload` defaults to `enable`, which
+  spawns a per-shard `SpillThread` and hands **every** connection a live
+  sender — so that term was false out of the box and the inline `SET` fast path
+  never ran in the default configuration. (`GET` was unaffected: it is gated by
+  `can_inline_reads`, which never carried the term.)
+
+  The term was a **config** predicate standing in for a **state** one. What a
+  live sender changes is eviction ROUTING, and only that: with one,
+  `run_write_eviction_gate` builds `EvictionRun::async_spill`, whose victims are
+  handed to the `SpillThread` under `--appendonly yes`; the inline path can only
+  build `EvictionRun::plain`, whose victims are DELETED. Inlining a write while
+  eviction fires would silently substitute a drop for a spill.
+
+  Nothing else diverges. `string::set`'s `args.len() == 2` fast path and the
+  inline path build the same `Entry`, queue the same `set` keyspace
+  notification, and call the same `Database::set` — which is where the
+  cold-tier obligations live (`spill_inflight_forget` retires an in-flight
+  spill payload; the `Updated` arm drops a stale `cold_index` shadow). Neither
+  path consults or promotes the cold tier on a write.
+
+  So the gate now enforces the actual invariant — *the inline write path may run
+  only when eviction provably will not fire* — instead of a proxy for it. The
+  lock-free `inline_write_can_skip_eviction` pre-gate the path already ran is
+  hoisted **above** the point where the command bytes leave `read_buf`, so
+  under pressure with a live sender the path returns "not handled" with the
+  buffer byte-for-byte intact and generic dispatch executes the write with the
+  spill-aware evictor. Bailing after the split would have consumed a command
+  nothing then ran — a silently lost write — so the ordering, not a comment,
+  is what enforces it. Cost on the hot path is one bool parameter and one
+  predictable branch; no lock, no allocation.
+
+  Deliberately **not** used as the condition: `disk_offload_spill_inert()` (a
+  startup-config predicate that is true for exactly the `--appendonly no`
+  benchmark shape and false for the durable production one — and unsound across
+  a restart that changes `appendonly` on a dir holding cold data), and
+  `maxmemory_is_set()` (moon's auto-maxmemory default is 75% of RAM, so it is
+  true out of the box and discriminates nothing).
+
+  Measured on the GCE x86_64 Linux host (8 vCPU), `--shards 1 --appendonly no
+  --protected-mode no --disk-free-min-pct 0`, disk-offload left at its default,
+  `redis-benchmark -n 400000 -c 50 -P 16 -r 100000 SET k:__rand_int__ v` after a
+  100k warm-up, A and B legs **interleaved**, 5 reps:
+
+  | rep | before | after | ratio |
+  |-----|--------|-------|-------|
+  | 1 | 770,713 | 1,384,083 | 1.80x |
+  | 2 | 760,456 | 1,369,863 | 1.80x |
+  | 3 | 754,717 | 1,360,544 | 1.80x |
+  | 4 | 759,013 | 1,369,863 | 1.81x |
+  | 5 | 766,284 | 1,365,188 | 1.78x |
+
+  Mean **762,237 -> 1,369,908 ops/s, 1.80x**, no overlap between the two sets.
+  Under `--appendonly yes` (5 further interleaved reps): 620,777 -> 1,266,722,
+  **2.04x**. The mechanism is confirmed, not inferred:
+  `moon_dispatch_path_total{path="local_inline"}` reads **0** on every before-leg
+  and exactly **500,000** (100k warm-up + 400k measured) on every after-leg.
+  `HSET` has no inline path and is unaffected.
+
+  A first measurement run on the same host read 351,518 -> 614,799 (1.75x) with
+  a 15-minute load average of 1.89 — the host was not idle, and a follow-up
+  probe on the quiet host read 2.5x the absolute throughput for the same
+  command. Interleaving preserved the RATIO across both runs; only the table
+  above, taken with the load recorded per leg (0.38-0.67) and zero leaked
+  server processes, is quoted as the absolute number.
+
+  **Known consequence, fail-loud not silent.** A faster write path can outrun
+  the AOF writer. On `--appendonly yes` at `--shards 1`, a sustained pipelined
+  write burst now reaches `AofWriterPool`'s channel bound often enough to
+  surface `-MOONERR AOF backpressure: write applied in memory but not queued
+  for persistence` — the existing PR #211 behaviour, which answers an error
+  rather than a lying `+OK`. Observed on roughly 1 test run in 3 locally, and
+  once as an aborted `redis-benchmark` leg on the Linux host (0 of 16 legs on
+  an idle host). It is not new code and not data loss, but it is newly
+  REACHABLE, and an operator running `--appendonly yes` at this throughput may
+  see it. The AOF writer's capacity, not this gate, is the thing to raise.
+
+  New suite `tests/inline_write_spill_gate_660.rs`, thirteen tests over
+  `--shards 1` and `--shards 4`, resting on the fact that `evicted_keys` (key
+  left the keyspace) and `spilled_keys` (key moved to disk, still readable) are
+  never both incremented for one victim. Widening the gate WITHOUT the bail-out
+  turns it red at **1,093 keys deleted where they should have been spilled**,
+  `spilled_keys` flat at 0; restoring the old gate turns it red with no
+  connection inlining at all, and takes every gate-term test down at its own
+  vacuity control.
+
+  **A term had to be ADDED, and two more are covered for the first time,
+  because this change is what makes them reachable.** `can_inline_writes` is a
+  conjunction, and `ctx.spill_sender.is_none()` was false in the shipped
+  default — so the whole conjunction was false, the inline write path never
+  ran, and every *other* term in it was dead code unless an operator passed
+  `--disk-offload disable`.
+
+  The added term is `!conn.in_cross_txn()`, and unlike the rest this defect is
+  **introduced by this change, not merely exposed by it.** Inside an open `TXN`
+  the generic write leg captures an undo record (`txn.kv_undo.record_update`)
+  and a write intent (`s.kv_write_intents.record_write`) before dispatching;
+  `try_inline_dispatch` does neither. Without the undo record `TXN ABORT`
+  restores nothing, and without the write intent the MVCC snapshot-visibility
+  filter cannot hide the uncommitted value from a foreign transaction. Measured
+  on the release binary at `--shards 1`, stock config, one connection —
+  `SET k original; TXN BEGIN; SET k modified; TXN ABORT; GET k` answers
+  `"original"` with the term and `"modified"` without it, the in-TXN `SET`
+  having been inlined (`local_inline` +1). An acked `TXN ABORT` that rolls back
+  nothing. Found by security review of this branch before it was opened, and
+  guarded by the two `g6_*` tests.
+
+  The two previously-dead terms had no test at all, and both fail dangerously:
+
+  - `!fanout_hint_active()` — deleting it makes a master with an attached
+    replica ack 50 plain `SET`s with `+OK` and deliver none of them. That is
+    not a hypothetical: the task #34 comment above the gate records the same
+    bug being found and fixed once already, in the only configuration that
+    could then reach it.
+  - `!is_replica` — deleting it makes a client `SET` against a **read-only
+    replica** answer `+OK` and land. `try_inline_dispatch` has no read-only
+    guard of its own; the `-READONLY` error is produced exclusively by generic
+    dispatch, so this term is the only thing enforcing it.
+
+  The suite also now carries a crate-level `#![cfg(feature = "runtime-monoio")]`.
+  `record_dispatch_local_inline` has exactly one production call site, in the
+  monoio handler, so under a tokio build the `local_inline` counter is
+  permanently 0 and every control block in the file would have failed. Gating
+  the suite rather than each assertion is deliberate: a test that cannot
+  observe the mechanism it asserts on is not a weaker guard, it is a false
+  one.
+
 - **`storage`: the listpack scan no longer allocates once per element walked.**
   Every listpack lookup decoded each entry it passed into an owned
   `ListpackEntry` — copying string payloads with `to_vec()`, and calling
