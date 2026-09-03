@@ -2586,3 +2586,173 @@ mod tests {
         assert_eq!(db.logical_len(), 0, "and the re-poll must not resurrect it");
     }
 }
+
+// ---------------------------------------------------------------------------
+// moon#788 — the incremental ledger must agree with a full recompute.
+//
+// `used_memory` is maintained as `entry_overhead(create) + sum(deltas)` and
+// credited back with `entry_overhead(remove)`. Any mutation site that grows a
+// container without charging the matching delta breaks that identity — the
+// WS6 hole of 2026-07-08, and the reason a capacity-snapshot term must be
+// snapshotted at EVERY site that can move the capacity. `recalculate_memory`
+// recomputes the ledger from the live data, so comparing the two is a direct,
+// non-circular check that no site was missed.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod ledger_consistency_788 {
+    use crate::protocol::Frame;
+    use crate::storage::Database;
+    use bytes::Bytes;
+
+    fn f(s: &[u8]) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s))
+    }
+
+    /// Assert the running ledger equals a from-scratch recompute, naming the
+    /// step that broke it.
+    fn assert_ledger_exact(db: &mut Database, step: &str) {
+        let running = db.estimated_memory();
+        db.recalculate_memory();
+        let recomputed = db.estimated_memory();
+        assert_eq!(
+            running, recomputed,
+            "{step}: running ledger {running} B != full recompute {recomputed} B — \
+             a mutation site charged the wrong delta (or none at all)"
+        );
+    }
+
+    #[test]
+    fn set_mutations_keep_the_ledger_exact() {
+        let mut db = Database::new();
+        // Enough members to force several table doublings, and non-integer so
+        // the intset encoding is not taken.
+        for i in 0..300u32 {
+            let m = format!("m:{i:08}");
+            crate::command::set::sadd(&mut db, &[f(b"s"), f(m.as_bytes())]);
+        }
+        assert_ledger_exact(&mut db, "after 300 SADD");
+
+        for i in 0..100u32 {
+            let m = format!("m:{i:08}");
+            crate::command::set::srem(&mut db, &[f(b"s"), f(m.as_bytes())]);
+        }
+        assert_ledger_exact(&mut db, "after 100 SREM");
+
+        for _ in 0..50 {
+            crate::command::set::spop(&mut db, &[f(b"s")]);
+        }
+        assert_ledger_exact(&mut db, "after 50 SPOP");
+
+        crate::command::set::spop(&mut db, &[f(b"s"), f(b"25")]);
+        assert_ledger_exact(&mut db, "after SPOP with count");
+
+        for i in 0..40u32 {
+            let m = format!("m:{i:08}");
+            crate::command::set::sadd(&mut db, &[f(b"src"), f(m.as_bytes())]);
+        }
+        for i in 0..20u32 {
+            let m = format!("m:{i:08}");
+            crate::command::set::smove(&mut db, &[f(b"src"), f(b"dst"), f(m.as_bytes())]);
+        }
+        assert_ledger_exact(&mut db, "after 20 SMOVE");
+
+        db.remove(b"s");
+        db.remove(b"src");
+        db.remove(b"dst");
+        assert_eq!(
+            db.estimated_memory(),
+            0,
+            "removing every key must return the ledger to zero"
+        );
+    }
+
+    #[test]
+    fn sorted_set_mutations_keep_the_ledger_exact() {
+        let mut db = Database::new();
+        // 300 members forces the B+tree past its initial arena capacity, so
+        // the per-NODE growth term is exercised, not just the fixed cost.
+        for i in 0..300u32 {
+            let m = format!("m:{i:08}");
+            crate::command::sorted_set::zadd(
+                &mut db,
+                &[f(b"z"), f(i.to_string().as_bytes()), f(m.as_bytes())],
+            );
+        }
+        assert_ledger_exact(&mut db, "after 300 ZADD");
+
+        crate::command::sorted_set::zincrby(&mut db, &[f(b"z"), f(b"5"), f(b"m:00000001")]);
+        crate::command::sorted_set::zincrby(&mut db, &[f(b"z"), f(b"5"), f(b"brand-new")]);
+        assert_ledger_exact(&mut db, "after ZINCRBY");
+
+        for i in 0..100u32 {
+            let m = format!("m:{i:08}");
+            crate::command::sorted_set::zrem(&mut db, &[f(b"z"), f(m.as_bytes())]);
+        }
+        assert_ledger_exact(&mut db, "after 100 ZREM");
+
+        crate::command::sorted_set::zpopmin(&mut db, &[f(b"z"), f(b"30")]);
+        assert_ledger_exact(&mut db, "after ZPOPMIN 30");
+        crate::command::sorted_set::zpopmax(&mut db, &[f(b"z"), f(b"30")]);
+        assert_ledger_exact(&mut db, "after ZPOPMAX 30");
+
+        db.remove(b"z");
+        assert_eq!(
+            db.estimated_memory(),
+            0,
+            "removing the only key must return the ledger to zero"
+        );
+    }
+
+    #[test]
+    fn hash_and_list_mutations_keep_the_ledger_exact() {
+        let mut db = Database::new();
+        // Past LISTPACK_MAX_ENTRIES so both the compact and the full encoding
+        // are exercised, including the one-time upgrade swing.
+        for i in 0..300u32 {
+            let fd = format!("f:{i:08}");
+            let v = format!("v:{i:08}");
+            crate::command::hash::hset(&mut db, &[f(b"h"), f(fd.as_bytes()), f(v.as_bytes())]);
+            let e = format!("e:{i:08}");
+            crate::command::list::rpush(&mut db, &[f(b"l"), f(e.as_bytes())]);
+        }
+        assert_ledger_exact(&mut db, "after 300 HSET + 300 RPUSH");
+
+        for i in 0..100u32 {
+            let fd = format!("f:{i:08}");
+            crate::command::hash::hdel(&mut db, &[f(b"h"), f(fd.as_bytes())]);
+        }
+        assert_ledger_exact(&mut db, "after 100 HDEL");
+
+        for _ in 0..100 {
+            crate::command::list::lpop(&mut db, &[f(b"l")]);
+        }
+        assert_ledger_exact(&mut db, "after 100 LPOP");
+    }
+
+    /// GEOADD grows a sorted set through a raw `&mut`. Before moon#788 it
+    /// charged nothing at all, so a geo key was invisible to `--maxmemory`.
+    #[test]
+    fn geoadd_charges_the_sorted_set_it_grows() {
+        let mut db = Database::new();
+        let before = db.estimated_memory();
+        for i in 0..200u32 {
+            let m = format!("place:{i:08}");
+            let lon = format!("{}", (i as f64) / 100.0);
+            let lat = format!("{}", (i as f64) / 200.0);
+            crate::command::geo::geoadd(
+                &mut db,
+                &[
+                    f(b"geo"),
+                    f(lon.as_bytes()),
+                    f(lat.as_bytes()),
+                    f(m.as_bytes()),
+                ],
+            );
+        }
+        assert!(
+            db.estimated_memory() > before,
+            "GEOADD grew a sorted set by 200 members and charged nothing"
+        );
+        assert_ledger_exact(&mut db, "after 200 GEOADD");
+    }
+}

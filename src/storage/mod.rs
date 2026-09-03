@@ -15,6 +15,7 @@ pub mod hll;
 pub mod hotkey;
 pub mod intset;
 pub mod listpack;
+pub mod mem_size;
 pub mod numeric;
 pub mod stream;
 pub mod tier;
