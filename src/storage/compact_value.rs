@@ -504,8 +504,7 @@ impl CompactValue {
             // One wrapper allocation (`Box<HeapString>`, two words, jemalloc's
             // 16-byte class) plus the data buffer itself — the buffer rounded
             // to the class jemalloc actually hands out (moon#788).
-            std::mem::size_of::<HeapString>()
-                + crate::storage::mem_size::size_class(hs.0.len())
+            std::mem::size_of::<HeapString>() + crate::storage::mem_size::size_class(hs.0.len())
         } else {
             // SAFETY: Tag is a collection type; pointer from Box::into_raw is valid and not freed.
             let rv = unsafe { &*self.heap_collection_ptr() };

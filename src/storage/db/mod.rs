@@ -199,10 +199,7 @@ pub fn legacy_zset_member_cost(member: &[u8]) -> usize {
 #[inline]
 pub fn zset_table_bytes(members: &HashMap<Bytes, f64>, tree: &super::bptree::BPTree) -> usize {
     tree.memory_bytes()
-        + super::mem_size::hash_table_bytes(
-            members.capacity(),
-            std::mem::size_of::<(Bytes, f64)>(),
-        )
+        + super::mem_size::hash_table_bytes(members.capacity(), std::mem::size_of::<(Bytes, f64)>())
 }
 
 // ---------------------------------------------------------------------------
@@ -2953,9 +2950,3 @@ mod ledger_consistency_788 {
         assert_ledger_exact(&mut db, "after 200 GEOADD");
     }
 }
-
-
-
-
-
-

@@ -584,6 +584,34 @@ fn test_hdel_self_recovery_past_db_maxmemory_boundary() {
 
 /// Poll `INFO memory` until `want` accepts the value, or panic after 30s
 /// naming what never happened.
+/// Poll `used_memory` until `want` holds, returning the LAST value read rather
+/// than panicking when it never does.
+///
+/// `poll_used_memory` below is the right tool when the predicate is a
+/// convergence the test merely has to wait out. It is the WRONG tool when the
+/// predicate is the claim under test: `|v| v > before` is satisfied by the
+/// FIRST byte of growth, and `used_memory` sums a per-shard atomic republished
+/// on a periodic chore — so under a fully parallel suite the poll can return
+/// mid-publish, with some shards' growth counted and others not. The caller
+/// then divides a partial figure by the full key count and sees a per-key cost
+/// far under the real one. That is a false RED on a correct ledger, and it is
+/// how this test failed on the Linux tokio leg while passing alone.
+///
+/// Polling for the threshold itself removes the race: a correct ledger crosses
+/// it as soon as the chore catches up, and a broken one never does, so the
+/// deadline still produces a genuine failure — reported by the caller's own
+/// assertion, with the measured number, rather than by a generic timeout.
+fn poll_used_memory_until(c: &mut Client, want: impl Fn(u64) -> bool, deadline: Duration) -> u64 {
+    let start = Instant::now();
+    loop {
+        let v = used_memory(c);
+        if want(v) || start.elapsed() >= deadline {
+            return v;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn poll_used_memory(c: &mut Client, want: impl Fn(u64) -> bool, what: &str) -> u64 {
     let start = Instant::now();
     loop {
@@ -640,8 +668,13 @@ fn test_sorted_set_arena_is_visible_to_used_memory() {
     // the last ZADD returns the pre-write figure. Poll rather than sleep a
     // fixed amount: an unpolled read here would report 0 B/key and fail this
     // test for a reason that has nothing to do with the accounting.
-    let after = poll_used_memory(&mut c, |v| v > before, "growth after 500 ZADD");
-    let per_key = (after - before) / KEYS;
+    // Poll for the FLOOR, not for "any growth at all" — see
+    // `poll_used_memory_until`. Waiting on `v > before` here returns on the
+    // first partially-published shard and divides that partial figure by all
+    // 500 keys.
+    let want = before + KEYS * FLOOR_PER_KEY;
+    let after = poll_used_memory_until(&mut c, |v| v >= want, Duration::from_secs(30));
+    let per_key = after.saturating_sub(before) / KEYS;
 
     assert!(
         per_key >= FLOOR_PER_KEY,

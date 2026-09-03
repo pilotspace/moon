@@ -87,8 +87,8 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                             set.insert(member.clone());
                         }
                     }
-                    let new_cost: usize =
-                        set_table_bytes(set) + set.iter().map(|m| set_member_cost(m)).sum::<usize>();
+                    let new_cost: usize = set_table_bytes(set)
+                        + set.iter().map(|m| set_member_cost(m)).sum::<usize>();
                     db.credit_memory(after);
                     db.charge_memory(new_cost);
                     // Recount: we need accurate count of new members

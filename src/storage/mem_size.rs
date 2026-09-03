@@ -56,7 +56,11 @@ pub const fn size_class(n: usize) -> usize {
     // Four classes per group means the spacing is base/4, floored at the
     // 16-byte quantum.
     let prev_pow2 = 1usize << (usize::BITS - 1 - (n - 1).leading_zeros());
-    let delta = if prev_pow2 >> 2 > 16 { prev_pow2 >> 2 } else { 16 };
+    let delta = if prev_pow2 >> 2 > 16 {
+        prev_pow2 >> 2
+    } else {
+        16
+    };
     // Round `n` up to the next multiple of `delta`. `n <= usize::MAX - delta`
     // holds for every allocation that could have succeeded.
     n.div_ceil(delta) * delta
@@ -220,7 +224,10 @@ mod tests {
         let mut prev = 0;
         for n in 1..40_000usize {
             let c = size_class(n);
-            assert!(c >= n, "size_class({n}) = {c} must not be below the request");
+            assert!(
+                c >= n,
+                "size_class({n}) = {c} must not be below the request"
+            );
             assert!(c >= prev, "size_class must be monotone at {n}");
             if n > 64 {
                 assert!(
@@ -255,7 +262,10 @@ mod tests {
                 b * 7 >= c * 8,
                 "capacity {c}: {b} buckets is below hashbrown's 7/8 load factor"
             );
-            assert!(b >= 4, "capacity {c}: hashbrown's smallest table is 4 buckets, got {b}");
+            assert!(
+                b >= 4,
+                "capacity {c}: hashbrown's smallest table is 4 buckets, got {b}"
+            );
         }
     }
 

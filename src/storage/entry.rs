@@ -872,8 +872,8 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(Bytes::from_static(b"key"), Bytes::from_static(b"val"));
         let val = RedisValue::Hash(map);
-        let floor = crate::storage::mem_size::size_class(3) * 2
-            + std::mem::size_of::<(Bytes, Bytes)>();
+        let floor =
+            crate::storage::mem_size::size_class(3) * 2 + std::mem::size_of::<(Bytes, Bytes)>();
         assert!(
             val.estimate_memory() >= floor,
             "one hash field billed {} B against {floor} B of real slot + buffers",
