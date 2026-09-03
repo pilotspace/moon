@@ -480,6 +480,49 @@ async fn run_on_owner_persist(
     resp
 }
 
+/// Single-shard (`num_shards == 1`) local dispatch that still honours the
+/// [`persist_local_leg`] contract.
+///
+/// `run_local` alone mutates the keyspace and returns: it takes no `aof_pool`
+/// and no `repl_state`, so it appends nothing and issues no replication LSN.
+/// For a WRITE that is silent data loss — the value is acked, reads back
+/// correctly, and is gone after a restart.
+///
+/// Measured before this helper existed, at `--shards 1 --appendonly yes
+/// --appendfsync everysec` on the **tokio** runtime: `COPY src dst` answered
+/// `:1`, `GET dst` returned the value, and after `SIGKILL` + recovery `GET dst`
+/// answered nil — 6 runs out of 6. The AOF held only the plain `SET`s; the
+/// `COPY` was never in it. `BITOP` behaved identically. The monoio handler
+/// appends these commands on its own path, which is why the same probe was
+/// 0-of-6 there and why no CI leg but the tokio one ever saw it.
+#[allow(clippy::too_many_arguments)]
+async fn run_local_persist(
+    cmd: &'static [u8],
+    args: &[Frame],
+    my_shard: usize,
+    db_index: usize,
+    shard_databases: &Arc<ShardDatabases>,
+    cached_clock: &CachedClock,
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: ReplStateRef<'_>,
+    local_barrier_pending: &mut bool,
+    persist_if: impl Fn(&Frame) -> bool,
+) -> Frame {
+    let resp = run_local(shard_databases, db_index, cached_clock, cmd, args);
+    if matches!(resp, Frame::Error(_)) || !persist_if(&resp) {
+        return resp;
+    }
+    let mut parts: Vec<Frame> = Vec::with_capacity(args.len() + 1);
+    parts.push(bulk_static(cmd));
+    parts.extend_from_slice(args);
+    let serialized = crate::persistence::aof::serialize_command(&Frame::Array(parts.into()));
+    match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
+        Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
+        Err(()) => return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR)),
+    }
+    resp
+}
+
 /// Type of the replication-state handle threaded into the coordinator's local
 /// persistence path (same shape `AofWriterPool::issue_append_lsn` expects).
 type ReplStateRef<'a> =
@@ -576,9 +619,25 @@ async fn coordinate_bitop(
     _response_pool: &(),
 ) -> Frame {
     // Single-shard server: straight to local dispatch — zero coordinator
-    // overhead (no key vec, no owner hashing) on the 1-shard hot path.
+    // overhead (no key vec, no owner hashing) on the 1-shard hot path. It must
+    // STILL persist: `run_local` alone loses the write on restart (see
+    // `run_local_persist`).
     if num_shards == 1 {
-        return run_local(shard_databases, db_index, cached_clock, b"BITOP", args);
+        return run_local_persist(
+            b"BITOP",
+            args,
+            my_shard,
+            db_index,
+            shard_databases,
+            cached_clock,
+            aof_pool,
+            repl_state,
+            local_barrier_pending,
+            // BITOP always writes DEST on success (SET, or DEL when the
+            // combine is empty), so every non-error response is persisted.
+            |_| true,
+        )
+        .await;
     }
     if args.len() < 3 {
         return Frame::Error(Bytes::from_static(
@@ -786,9 +845,23 @@ async fn coordinate_copy(
     _response_pool: &(),
 ) -> Frame {
     // Single-shard server: straight to local dispatch — zero coordinator
-    // overhead on the 1-shard hot path.
+    // overhead on the 1-shard hot path. It must STILL persist: `run_local`
+    // alone loses the write on restart (see `run_local_persist`).
     if num_shards == 1 {
-        return run_local(shard_databases, db_index, cached_clock, b"COPY", args);
+        return run_local_persist(
+            b"COPY",
+            args,
+            my_shard,
+            db_index,
+            shard_databases,
+            cached_clock,
+            aof_pool,
+            repl_state,
+            local_barrier_pending,
+            // COPY :0 = refused (dst exists, no REPLACE) — nothing written.
+            |r| matches!(r, Frame::Integer(1)),
+        )
+        .await;
     }
     if args.len() < 2 {
         return Frame::Error(Bytes::from_static(
