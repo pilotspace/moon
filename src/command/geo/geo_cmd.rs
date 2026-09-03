@@ -69,6 +69,11 @@ pub fn geoadd(db: &mut Database, args: &[Frame]) -> Frame {
 
     let mut added = 0i64;
     let mut changed = 0i64;
+    // moon#788: GEOADD grows a sorted set through a raw `&mut` and charged
+    // NOTHING for it — the same WS6 hole HSET/LPUSH had, still open for the
+    // geo family. A geo key could grow without limit under `--maxmemory`.
+    let mut mem_charge: usize = 0;
+    let table_before = crate::storage::db::zset_table_bytes(members, tree);
 
     for chunk in remaining.chunks_exact(3) {
         let lon = match parse_f64(&chunk[0]) {
@@ -112,11 +117,16 @@ pub fn geoadd(db: &mut Database, args: &[Frame]) -> Frame {
             }
         } else {
             tree.insert(OrderedFloat(score), member.clone());
+            mem_charge += crate::storage::db::zset_member_cost(&member);
             members.insert(member, score);
             added += 1;
             changed += 1;
         }
     }
+    let table_after = crate::storage::db::zset_table_bytes(members, tree);
+    // `members`/`tree`'s borrow of `db` ends above.
+    db.charge_memory(mem_charge);
+    db.adjust_memory(table_before, table_after);
 
     Frame::Integer(if ch { changed } else { added })
 }

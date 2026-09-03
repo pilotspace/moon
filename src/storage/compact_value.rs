@@ -59,6 +59,15 @@ const HEAP_TAG_MASK: usize = 0x7;
 /// growable `Vec` this replaces bought nothing.
 struct HeapString(Box<[u8]>);
 
+/// Bytes the `Box<RedisValue>` behind every collection value really costs
+/// (moon#788).
+///
+/// `RedisValue` is an enum sized by its largest variant, and jemalloc rounds
+/// the box up to a size class. The ledger charged nothing for it — one
+/// unbilled allocation on every hash, list, set, sorted-set and stream key.
+const BOXED_REDIS_VALUE_BYTES: usize =
+    crate::storage::mem_size::size_class(std::mem::size_of::<RedisValue>());
+
 /// Borrowed view of a CompactValue, for zero-copy read access.
 pub enum RedisValueRef<'a> {
     String(&'a [u8]),
@@ -493,12 +502,22 @@ impl CompactValue {
             // SAFETY: Tag verified as HEAP_TAG_STRING; pointer from Box::into_raw is valid and not freed.
             let hs = unsafe { &*self.heap_string_ptr() };
             // One wrapper allocation (`Box<HeapString>`, two words, jemalloc's
-            // 16-byte class) plus the data buffer itself.
-            std::mem::size_of::<HeapString>() + hs.0.len()
+            // 16-byte class) plus the data buffer itself — the buffer rounded
+            // to the class jemalloc actually hands out (moon#788).
+            std::mem::size_of::<HeapString>()
+                + crate::storage::mem_size::size_class(hs.0.len())
         } else {
             // SAFETY: Tag is a collection type; pointer from Box::into_raw is valid and not freed.
             let rv = unsafe { &*self.heap_collection_ptr() };
-            rv.estimate_memory()
+            // moon#788: EVERY container value is a `Box<RedisValue>`, and the
+            // enum is sized by its largest variant. That box is a real
+            // allocation the ledger never billed — 160 B per container key on
+            // 64-bit, invisible to `--maxmemory` for hashes, lists, sets,
+            // sorted sets and streams alike. It is a constant for the whole
+            // life of the value, so charging it here keeps
+            // `entry_overhead(create) + deltas == entry_overhead(remove)`
+            // exactly (the WS6 mirror invariant).
+            BOXED_REDIS_VALUE_BYTES + rv.estimate_memory()
         }
     }
 }

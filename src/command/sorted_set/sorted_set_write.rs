@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::storage::db::zset_member_cost;
+use crate::storage::db::{zset_member_cost, zset_table_bytes};
 
 use crate::command::helpers::{err, err_wrong_args, extract_bytes};
 
@@ -87,6 +87,12 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     // entry); an existing member's score-only update costs nothing (the
     // `SortedSetBPTree` estimator doesn't factor in score values).
     let mut mem_charge: usize = 0;
+    // moon#788: the B+tree arena and the `members` table are charged from
+    // their REAL capacity, snapshotted around the mutation (O(1), three
+    // `capacity()` reads). The old per-member `+ 80` billed a fictitious
+    // 80-byte node against an arena whose slot is ~800 B and whose minimum
+    // allocation is four of them.
+    let table_before = zset_table_bytes(members, scores);
 
     let mut j = 0;
     while j < remaining.len() {
@@ -145,8 +151,10 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
         j += 2;
     }
 
+    let table_after = zset_table_bytes(members, scores);
     // `members`/`scores`' borrow of `db` ends above.
     db.charge_memory(mem_charge);
+    db.adjust_memory(table_before, table_after);
 
     if ch {
         Frame::Integer(changed)
@@ -172,6 +180,7 @@ pub fn zrem(db: &mut Database, args: &[Frame]) -> Frame {
 
     let mut removed = 0i64;
     let mut credit: usize = 0;
+    let table_before = zset_table_bytes(members, scores);
     for arg in &args[1..] {
         let member = match extract_bytes(arg) {
             Some(b) => b,
@@ -183,8 +192,12 @@ pub fn zrem(db: &mut Database, args: &[Frame]) -> Frame {
         }
     }
     let is_empty = members.is_empty();
+    let table_after = zset_table_bytes(members, scores);
     // `members`/`scores`' borrow of `db` ends above.
     db.credit_memory(credit);
+    if !is_empty {
+        db.adjust_memory(table_before, table_after);
+    }
 
     // Remove key if empty
     if is_empty {
@@ -233,11 +246,14 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
     let new_score = current + increment;
 
     let member_cost = zset_member_cost(&member);
+    let table_before = zset_table_bytes(members, scores);
     let is_new = zadd_member(members, scores, member, new_score);
+    let table_after = zset_table_bytes(members, scores);
     // `members`/`scores`' borrow of `db` ends above.
     if is_new {
         db.charge_memory(member_cost);
     }
+    db.adjust_memory(table_before, table_after);
 
     Frame::BulkString(Bytes::from(format_score(new_score)))
 }
@@ -275,6 +291,7 @@ pub fn zpopmin(db: &mut Database, args: &[Frame]) -> Frame {
 
     let mut result = Vec::new();
     let mut credit: usize = 0;
+    let table_before = zset_table_bytes(members, scores);
     for _ in 0..count {
         let first = scores.iter().next().map(|(s, m)| (s, m.clone()));
         match first {
@@ -289,8 +306,12 @@ pub fn zpopmin(db: &mut Database, args: &[Frame]) -> Frame {
         }
     }
     let is_empty = members.is_empty();
+    let table_after = zset_table_bytes(members, scores);
     // `members`/`scores`' borrow of `db` ends above.
     db.credit_memory(credit);
+    if !is_empty {
+        db.adjust_memory(table_before, table_after);
+    }
 
     // Remove key if empty
     if is_empty {
@@ -333,6 +354,7 @@ pub fn zpopmax(db: &mut Database, args: &[Frame]) -> Frame {
 
     let mut result = Vec::new();
     let mut credit: usize = 0;
+    let table_before = zset_table_bytes(members, scores);
     for _ in 0..count {
         let last = scores.iter_rev().next().map(|(s, m)| (s, m.clone()));
         match last {
@@ -347,8 +369,12 @@ pub fn zpopmax(db: &mut Database, args: &[Frame]) -> Frame {
         }
     }
     let is_empty = members.is_empty();
+    let table_after = zset_table_bytes(members, scores);
     // `members`/`scores`' borrow of `db` ends above.
     db.credit_memory(credit);
+    if !is_empty {
+        db.adjust_memory(table_before, table_after);
+    }
 
     // Remove key if empty
     if is_empty {
@@ -539,12 +565,15 @@ fn zstore_impl(db: &mut Database, args: &[Frame], intersect: bool) -> Frame {
         // new -- charge each unconditionally (O(1) per member, no full
         // recompute of the destination sorted set).
         let mut mem_charge: usize = 0;
+        let table_before = zset_table_bytes(members, scores);
         for (member, score) in result_map {
             mem_charge += zset_member_cost(&member);
             zadd_member(members, scores, member, score);
         }
+        let table_after = zset_table_bytes(members, scores);
         // `members`/`scores`' borrow of `db` ends above.
         db.charge_memory(mem_charge);
+        db.adjust_memory(table_before, table_after);
     }
 
     Frame::Integer(result_size)
@@ -702,12 +731,15 @@ pub fn zrangestore(db: &mut Database, args: &[Frame]) -> Frame {
         };
         // `dst` was just removed/recreated above, so every entry is new.
         let mut mem_charge: usize = 0;
+        let table_before = zset_table_bytes(dst_members, dst_scores);
         for (member, score) in entries {
             mem_charge += zset_member_cost(&member);
             zadd_member(dst_members, dst_scores, member, score);
         }
+        let table_after = zset_table_bytes(dst_members, dst_scores);
         // `dst_members`/`dst_scores`' borrow of `db` ends above.
         db.charge_memory(mem_charge);
+        db.adjust_memory(table_before, table_after);
     }
 
     Frame::Integer(count)
@@ -812,6 +844,7 @@ pub fn zmpop(db: &mut Database, args: &[Frame]) -> Frame {
         // (matches LMPOP's count.min(list_len); loop already breaks when empty).
         let mut popped = Vec::with_capacity(pop_count.min(card));
         let mut credit: usize = 0;
+        let table_before = zset_table_bytes(members, scores);
         for _ in 0..pop_count {
             let entry = if is_min {
                 scores.iter().next().map(|(s, m)| (s, m.clone()))
@@ -832,8 +865,12 @@ pub fn zmpop(db: &mut Database, args: &[Frame]) -> Frame {
             }
         }
         let is_empty = members.is_empty();
+        let table_after = zset_table_bytes(members, scores);
         // `members`/`scores`' borrow of `db` ends above.
         db.credit_memory(credit);
+        if !is_empty {
+            db.adjust_memory(table_before, table_after);
+        }
 
         if is_empty {
             db.remove(key);

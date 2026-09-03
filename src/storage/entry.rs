@@ -276,28 +276,53 @@ impl RedisValue {
     pub fn estimate_memory(&self) -> usize {
         match self {
             RedisValue::String(b) => b.len(),
-            RedisValue::Hash(map) => map.iter().map(|(k, v)| k.len() + v.len() + 64).sum(),
-            // 64B/entry baseline + 32B per TTL'd field (HashMap entry overhead).
+            RedisValue::Hash(map) => map
+                .iter()
+                .map(|(k, v)| crate::storage::db::hash_field_cost(k, v))
+                .sum(),
             RedisValue::HashWithTtl { fields, ttls, .. } => {
-                let f: usize = fields.iter().map(|(k, v)| k.len() + v.len() + 64).sum();
-                let t: usize = ttls.iter().map(|(k, _)| k.len() + 8 + 32).sum();
+                let f: usize = fields
+                    .iter()
+                    .map(|(k, v)| crate::storage::db::hash_field_cost(k, v))
+                    .sum();
+                let t: usize = ttls
+                    .iter()
+                    .map(|(k, _)| crate::storage::db::hash_ttl_field_cost(k))
+                    .sum();
                 f + t
             }
-            RedisValue::List(list) => list.iter().map(|elem| elem.len() + 24).sum(),
-            RedisValue::Set(set) => set.iter().map(|member| member.len() + 24).sum(),
-            RedisValue::SortedSet { members, .. } => {
-                members.iter().map(|(member, _)| member.len() + 80).sum()
+            RedisValue::List(list) => list
+                .iter()
+                .map(|elem| crate::storage::db::list_elem_cost(elem))
+                .sum(),
+            // moon#788: the table an `IndexSet` allocates is charged from its
+            // real capacity, not guessed per member — see `set_table_bytes`.
+            RedisValue::Set(set) => {
+                crate::storage::db::set_table_bytes(set)
+                    + set
+                        .iter()
+                        .map(|member| crate::storage::db::set_member_cost(member))
+                        .sum::<usize>()
             }
+            RedisValue::SortedSet { members, .. } => members
+                .iter()
+                .map(|(member, _)| crate::storage::db::legacy_zset_member_cost(member))
+                .sum(),
             RedisValue::HashListpack(lp)
             | RedisValue::ListListpack(lp)
             | RedisValue::SetListpack(lp)
             | RedisValue::SortedSetListpack(lp) => lp.estimate_memory(),
             RedisValue::SetIntset(is) => is.estimate_memory(),
+            // moon#788: the BPTree arena is charged per NODE from the arena's
+            // real capacity (`tree.memory_bytes()`), not `tree.len() * 80`
+            // per entry — the old form left the fixed multi-kilobyte cost of
+            // an almost-empty tree invisible to `used_memory`.
             RedisValue::SortedSetBPTree { tree, members } => {
-                // BPTree nodes + member HashMap
-                let tree_mem = tree.len() * 80; // approximate per-entry overhead
-                let member_mem: usize = members.iter().map(|(member, _)| member.len() + 40).sum();
-                tree_mem + member_mem
+                crate::storage::db::zset_table_bytes(members, tree)
+                    + members
+                        .iter()
+                        .map(|(member, _)| crate::storage::db::zset_member_cost(member))
+                        .sum::<usize>()
             }
             RedisValue::Stream(s) => s.estimate_memory(),
         }
