@@ -232,11 +232,8 @@ mod tests {
         }
     }
 
-    /// `hash_buckets` must cover hashbrown's own table: at least as many
-    /// power-of-two buckets as its 7/8 load factor needs for the live items.
-    #[test]
-    /// The test above only ever feeds `hash_buckets` a capacity that CAME
-    /// from a hashbrown table, and those are already `buckets * 7 / 8` — so
+    /// The companion test below only ever feeds `hash_buckets` a capacity that
+    /// CAME from a hashbrown table, and those are already `buckets * 7 / 8` — so
     /// `div_ceil(7) * 8` reproduces the bucket count exactly and the rounding
     /// step is a no-op. Deleting `next_power_of_two()` left it green, which
     /// means it never guarded the one thing this function exists to do.
@@ -262,6 +259,8 @@ mod tests {
         }
     }
 
+    /// `hash_buckets` must cover hashbrown's own table: at least as many
+    /// power-of-two buckets as its 7/8 load factor needs for the live items.
     #[test]
     fn hash_buckets_covers_hashbrowns_real_table() {
         use std::collections::HashMap;
