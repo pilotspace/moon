@@ -112,6 +112,12 @@ fn spawn_moon_first(tmp_dir: &std::path::Path, shards: usize) -> Option<Moon> {
                 "0",
                 "--appendonly",
                 "no",
+                // moon#660: explicit — see the note on `spawn_moon_at`. Both
+                // spawn helpers must agree, or the restart test would create
+                // its index under one persistence path and look for it under
+                // another.
+                "--disk-offload",
+                "enable",
                 "--dir",
                 &dir_s,
             ])
@@ -159,6 +165,117 @@ fn spawn_moon(shards: usize, tag: &str) -> Option<Moon> {
     spawn_moon_first(&tmp_dir, shards)
 }
 
+/// Spawn for [`ft_index_survives_restart_without_disk_offload`]: the tier OFF
+/// (the moon#660 default) with AOF durability ON, which is the combination
+/// that must keep index definitions.
+fn spawn_moon_no_offload(tmp_dir: &std::path::Path, port: u16) -> Option<Moon> {
+    let bin = release_binary();
+    let child = Command::new(&bin)
+        .args([
+            "--port",
+            &port.to_string(),
+            "--shards",
+            "1",
+            "--admin-port",
+            "0",
+            "--disk-offload",
+            "disable",
+            "--appendonly",
+            "yes",
+            "--appendfsync",
+            "everysec",
+            "--dir",
+            tmp_dir.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let moon = Moon {
+        child,
+        port,
+        tmp_dir: tmp_dir.to_path_buf(),
+    };
+    wait_ready(port).then_some(moon)
+}
+
+/// moon#660: index definitions survive a restart with the disk-offload tier
+/// OFF — the new default — provided durability is configured at all.
+///
+/// This is the contract the flip creates, and it needed stating because the
+/// flip's blast radius ran straight through here. `vector_persist_dir_for`
+/// (`src/shard/event_loop.rs`) resolves the index-metadata directory to the
+/// disk-offload dir when the tier is on and to `persistence_dir` otherwise —
+/// and `persistence_dir` is `None` under `--appendonly no` with no `--save`.
+/// So for the whole life of the flag, a server with NO durability configured
+/// still persisted its FT index definitions, purely because `--disk-offload`
+/// defaulted to `enable`. Measured on one binary with the flag explicit on
+/// both sides:
+///
+/// | config                                    | index after restart |
+/// |-------------------------------------------|---------------------|
+/// | `--disk-offload disable --appendonly yes`  | survives            |
+/// | `--disk-offload enable  --appendonly no`   | survives            |
+/// | `--disk-offload disable --appendonly no`   | **lost**            |
+///
+/// Only the third row changes behaviour, and it is the row where the operator
+/// asked for no durability at all. This test pins the FIRST row, because that
+/// is the one an upgrading deployment lands on and the one nothing covered.
+///
+/// Reddening mutation: make the `else` arm of `vector_persist_dir_for` return
+/// `None`. `FT.INFO` then answers `Unknown Index name` after the restart.
+#[test]
+fn ft_index_survives_restart_without_disk_offload() {
+    let bin = release_binary();
+    assert!(
+        bin.exists(),
+        "moon binary missing at {} — a skipped spawn must FAIL, not silently pass",
+        bin.display()
+    );
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("moon-db-isolation-no-offload-")
+        .tempdir()
+        .expect("tempdir")
+        .keep();
+
+    let port = common::reserve_port();
+    let Some(mut moon) = spawn_moon_no_offload(&tmp_dir, port) else {
+        panic!("moon did not come up on port {port} with the tier disabled");
+    };
+    {
+        let mut c1 = moon.conn(1);
+        assert_eq!(ft_create(&mut c1, "no_offload_idx", "n:").unwrap(), "OK");
+        hset_vec(&mut c1, "n:1", [1.0, 0.0, 0.0, 0.0]).unwrap();
+        let _: redis::Value = redis::cmd("FT.COMPACT")
+            .arg("no_offload_idx")
+            .query(&mut c1)
+            .unwrap_or(redis::Value::Nil);
+    }
+    moon.kill_keep_dir();
+
+    let Some(moon2) = spawn_moon_no_offload(&tmp_dir, port) else {
+        panic!("moon did not restart on port {port}");
+    };
+    let mut c1 = moon2.conn(1);
+    let info: redis::Value = redis::cmd("FT.INFO")
+        .arg("no_offload_idx")
+        .query(&mut c1)
+        .expect(
+            "FT.INFO must succeed after a restart with --disk-offload disable \
+             and --appendonly yes: index metadata persists to \
+             persistence_dir/shard-N-vectors when the tier is off, and the \
+             moon#660 default must not cost an AOF-durable server its indexes",
+        );
+    assert!(
+        !matches!(info, redis::Value::Nil),
+        "no_offload_idx must reload bound to db 1 with the tier disabled"
+    );
+
+    drop(c1);
+    drop(moon2);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
 /// Restart on a caller-chosen, already-freed port + dir — used ONLY by
 /// same-port restart tests (`restart_round_trip_preserves_db_binding`).
 /// Per the port-flake-sweep hard rules, a deliberate same-port restart keeps
@@ -177,6 +294,26 @@ fn spawn_moon_at(tmp_dir: &std::path::Path, port: u16, shards: usize) -> Option<
             "0",
             "--appendonly",
             "no",
+            // moon#660: EXPLICIT, because it used to be the default.
+            //
+            // Vector/text index metadata is persisted to
+            // `vector_persist_dir_for(..)`, which resolves to the disk-offload
+            // dir when the tier is on and to `persistence_dir` otherwise. With
+            // `--appendonly no` and no `--save`, `persistence_dir` is `None`,
+            // so this suite's index persistence rode ENTIRELY on
+            // `--disk-offload` defaulting to `enable`. Making that opt-in
+            // turned `FT.INFO` after the restart in
+            // `restart_round_trip_preserves_db_binding` into
+            // `Unknown Index name`.
+            //
+            // Pinning the flag preserves exactly the environment these tests
+            // were written against, rather than quietly re-pointing them at a
+            // different persistence path. The NEW default's own contract —
+            // indexes survive a restart with the tier off as long as some
+            // durability is configured — is pinned separately in
+            // `ft_index_survives_restart_without_disk_offload`.
+            "--disk-offload",
+            "enable",
             "--dir",
             tmp_dir.to_str().unwrap(),
         ])

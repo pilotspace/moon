@@ -150,10 +150,52 @@ These are same-binary A/B / diagnostic overrides, not production tuning:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--disk-offload` | `enable` | Enable disk offload (RAM → mmap → NVMe) |
+| `--disk-offload` | `disable` | Enable disk offload (RAM → mmap → NVMe). **Opt-in since moon#660** — see [Disk offload is opt-in](#disk-offload-is-opt-in) below. |
 | `--disk-offload-dir` | *(same as `--dir`)* | Directory for disk offload files |
 | `--disk-offload-threshold` | `0.85` | RAM pressure threshold to trigger offload (0.0-1.0) |
 | `--segment-warm-after` | `3600` | Seconds before sealed segments transition to warm tier |
+
+### Disk offload is opt-in
+
+`--disk-offload` shipped default-on and became **opt-in in moon#660**. Nothing
+about the tier changed — it is fully supported, and `--disk-offload enable`
+turns it on.
+
+The reason is reconciliation, not a double-write conflict with the WAL. Spilled
+segments are independently self-durable and recover on their own; the hazard is
+that recovery runs in two phases — Phase 3 rebuilds `cold_index` from the
+manifest, Phase 4 replays the WAL on top with hot shadowing cold — and every
+bug found in that seam so far has been silent-data-loss class:
+
+- DEL/FLUSH resurrection and expired-cold leak (#212)
+- BITOP/COPY/DEL/UNLINK resurrection (#213)
+- a spill completion resurrecting a `DEL`'d key (#459)
+
+Each was caught by soak or adversarial review. The invariant now also has a
+proof rather than only examples: `tests/cold_reconciliation_property_660.rs`
+drives seeded random write/delete/expire sequences under real memory pressure
+and checks the keyspace against a model both live and across a `SIGKILL` plus
+full Phase-3/Phase-4 recovery.
+
+**If you enable it, enable durability with it.** `--disk-offload enable` with
+`appendonly no` and no `--save` leaves the spill path inert: victims are
+DROPPED rather than tiered, and the server logs a warning at start-up saying
+so. Pair it with `--appendonly yes` or `--save`.
+
+**FT / text index definitions.** Index metadata is written to the disk-offload
+directory when the tier is on, and to the persistence directory otherwise. A
+server with `--appendonly no` and no `--save` has neither, so with the tier off
+its `FT.*` index definitions do not survive a restart — where previously they
+did, because the tier was on by default. If you use `FT.*`, configure
+durability (`--appendonly yes` or `--save`) or enable the tier; with either,
+index definitions persist as before.
+
+**Upgrading from a release where it was default-on:** a server that was
+relying on the default now starts without the tier and holds its whole
+keyspace in RAM, so it will evict (or answer `-OOM` under `noeviction`) at
+`--maxmemory` where it previously spilled. Add `--disk-offload enable`
+explicitly to keep the old behaviour. Existing offload files on disk are left
+untouched and are picked up again when you re-enable it.
 
 ## WAL (Write-Ahead Log)
 

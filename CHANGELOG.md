@@ -6,6 +6,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (default): KV disk offload is now OPT-IN (moon#660).**
+  `--disk-offload` shipped `enable` and now defaults to `disable`. A decision
+  taken 2026-07-10 to make it opt-in was recorded and never executed; #660
+  filed that gap and this executes all three of its steps — the default, the
+  missing proof, and the docs.
+
+  **Nothing about the tier changed and nothing is deprecated.**
+  `--disk-offload enable` turns it on, existing offload files on disk are left
+  untouched, and they are picked up again when it is re-enabled.
+
+  The reason is not a double-write conflict with the WAL — spilled segments are
+  independently self-durable and recover on their own. It is RECONCILIATION.
+  Recovery runs Phase 3 (rebuild `cold_index` from the manifest) then Phase 4
+  (WAL replay on top, hot shadowing cold), and every bug found in that seam so
+  far has been silent-data-loss class: DEL/FLUSH resurrection and expired-cold
+  leak (#212), BITOP/COPY/DEL/UNLINK resurrection (#213), a spill completion
+  resurrecting a `DEL`'d key (#459). Each was caught by soak or adversarial
+  review, none by a proof. Default-on plus that history is the combination the
+  decision reacted to, and it sat oddly against the deliberately conservative
+  vector-COLD posture, where DiskANN COLD ships as a stub valve with the real
+  engine gated.
+
+  **Operator impact, part 1 — memory.** A server that relied on the default now
+  holds its whole keyspace in RAM, so it evicts — or answers `-OOM` under
+  `noeviction` — at `--maxmemory` where it previously spilled. Add
+  `--disk-offload enable` explicitly to keep the old behaviour, and pair it
+  with `--appendonly yes` or `--save`: without a durability backstop the spill
+  path is inert, victims are dropped rather than tiered, and the server already
+  logs a warning saying so.
+
+  **Operator impact, part 2 — FT/text index definitions, and this one was not
+  obvious.** `vector_persist_dir_for` (`src/shard/event_loop.rs`) resolves the
+  index-metadata directory to the disk-offload dir when the tier is on, and to
+  `persistence_dir` otherwise — and `persistence_dir` is `None` under
+  `--appendonly no` with no `--save`. So a server with NO durability configured
+  still persisted its `FT.*` index definitions, purely because `--disk-offload`
+  defaulted to `enable`. Measured on one binary with the flag explicit on both
+  sides of a restart:
+
+  | config | index after restart |
+  |--------|---------------------|
+  | `--disk-offload disable --appendonly yes` | survives |
+  | `--disk-offload enable  --appendonly no`  | survives |
+  | `--disk-offload disable --appendonly no`  | **lost** |
+
+  Only the third row changes, and it is the row where the operator asked for no
+  durability at all — so the new behaviour is the consistent one. It is called
+  out here because it was invisible before: `tests/vector_db_isolation.rs` was
+  written against the old default and went red on the flip, which is how it was
+  found. That suite now pins `--disk-offload enable` explicitly rather than
+  riding a default, and a new
+  `ft_index_survives_restart_without_disk_offload` pins the row an upgrading
+  deployment actually lands on — tier off, AOF on, indexes survive — which
+  nothing covered. Reddening mutation recorded on it: make the non-offload arm
+  of `vector_persist_dir_for` return `None`.
+
+  **This flip could not have shipped on its own.** `can_inline_writes` carried
+  the term `ctx.spill_sender.is_none()`, which was false out of the box
+  precisely BECAUSE the tier was default-on — so flipping the default alone
+  would have switched the inline write fast path on in the default
+  configuration while it still had no cross-transaction undo capture, no
+  `CLIENT PAUSE` gate, no `-LOADING` gate, no write-stall gate, a frozen cached
+  clock and an uncounted command counter. The inline-write work below is what
+  makes this default safe to move, which is why the two land together.
+
+  New `tests/cold_reconciliation_property_660.rs` supplies step 2, the piece
+  #660 records as worth having regardless of what happens to the default: the
+  invariant had only ever been pinned by examples reproducing bugs already
+  found. It drives seeded random `SET`/`SET PX`/`DEL`/`UNLINK`/`COPY`/`FLUSHDB`
+  sequences over a deliberately small keyspace under real memory pressure, then
+  checks every key the sequence ever touched against a model — both live and
+  again after a `SIGKILL` and a full Phase-3/Phase-4 recovery. The three
+  failure shapes are named separately because all three have shipped:
+  resurrection, expired-cold leak, and lost/stale write. It refuses a vacuous
+  pass (`spilled_keys` summed over all seeds must be non-zero), prints the seed
+  on failure, and `MOON_660_SEEDS=<n>` re-runs one case alone. No `proptest`
+  dependency was added — a durability default is not the place to also widen
+  the supply chain.
+
 ### Fixed
 
 - **`shard`: `COPY` and `BITOP` were silently lost across restart at
