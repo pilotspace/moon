@@ -7,6 +7,7 @@
 
 use parking_lot::RwLock;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -29,8 +30,32 @@ static PAUSE: LazyLock<RwLock<PauseState>> = LazyLock::new(|| {
     })
 });
 
+/// Lock-free "a pause may be active" hint, for hot paths that must not take
+/// the `PAUSE` lock on every command (moon#660).
+///
+/// Set alongside `PAUSE.active` and cleared with it. It is deliberately
+/// CONSERVATIVE in one direction only: `check_pause` treats a pause whose
+/// deadline has passed as inactive without clearing `active`, so this flag can
+/// read `true` for an already-expired pause until `expire_if_needed` runs. A
+/// stale `true` costs a fast path its fast leg for one command; a stale `false`
+/// would let a paused write through, and cannot happen — every site that sets
+/// `active = true` sets this first.
+static PAUSE_ANY: AtomicBool = AtomicBool::new(false);
+
+/// Lock-free: is a pause POSSIBLY active?
+///
+/// `false` is authoritative — no pause is active, and the caller may take its
+/// fast path. `true` means "ask [`check_pause`]", which owns the real decision
+/// (mode, expiry, remaining duration). Callers must not re-derive that here.
+#[inline]
+#[must_use]
+pub fn pause_possibly_active() -> bool {
+    PAUSE_ANY.load(Ordering::Relaxed)
+}
+
 /// Activate pause for the given duration and mode.
 pub fn pause(duration_ms: u64, mode: PauseMode) {
+    PAUSE_ANY.store(true, Ordering::Relaxed);
     let mut state = PAUSE.write();
     state.active = true;
     state.mode = mode;
@@ -41,6 +66,7 @@ pub fn pause(duration_ms: u64, mode: PauseMode) {
 pub fn unpause() {
     let mut state = PAUSE.write();
     state.active = false;
+    PAUSE_ANY.store(false, Ordering::Relaxed);
 }
 
 /// Check if the server is currently paused. Returns the remaining duration
@@ -68,6 +94,7 @@ pub fn expire_if_needed() {
     let mut state = PAUSE.write();
     if state.active && Instant::now() >= state.until {
         state.active = false;
+        PAUSE_ANY.store(false, Ordering::Relaxed);
     }
 }
 

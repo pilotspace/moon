@@ -939,3 +939,158 @@ fn migration_eligibility_gate() {
         "replica handshake must block migration"
     );
 }
+
+/// moon#660: a plain `SET` must NOT inline while `CLIENT PAUSE` is in force.
+///
+/// `client_pause::check_pause` is consulted once per frame in the GENERIC loop,
+/// which sits below the inline-dispatch block — and that block `continue`s when
+/// it consumed the whole buffer. So an inlined `SET` never reached the pause
+/// gate at all. Measured end-to-end on one binary, `CLIENT PAUSE 3000 WRITE`:
+/// inline `SET` returned in 0.027 s, generic `SET` (MONITOR attached) in
+/// 2.999 s, `HSET` in 2.002 s — the pause worked, the inline leg escaped it.
+///
+/// This asserts the pre-gate directly: the command must be left in `read_buf`
+/// for generic dispatch, which owns the real decision (mode, expiry, duration).
+#[test]
+fn test_inline_set_stands_down_under_client_pause() {
+    let dbs = make_dbs();
+    let cmd = b"*3\r\n$3\r\nSET\r\n$6\r\npkey01\r\n$3\r\nbar\r\n";
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
+    let rt_config = make_rt_config();
+
+    // CONTROL first: unpaused, this exact command inlines. Without it a green
+    // here could mean the command was never inline-eligible to begin with.
+    crate::client_pause::unpause();
+    let mut read_buf = BytesMut::from(&cmd[..]);
+    let mut write_buf = BytesMut::new();
+    let control = try_inline_dispatch(
+        &mut read_buf,
+        &mut write_buf,
+        &dbs,
+        0,
+        0,
+        &aof_pool,
+        &None,
+        0,
+        1,
+        true,
+        true,
+        false,
+        &rt_config,
+        false,
+    );
+    assert_eq!(control, 1, "CONTROL: an unpaused plain SET must inline");
+    assert!(read_buf.is_empty(), "CONTROL: buffer should be consumed");
+
+    // Now paused: the same command must be declined, buffer intact.
+    crate::client_pause::pause(5_000, crate::client_pause::PauseMode::Write);
+    let mut read_buf = BytesMut::from(&cmd[..]);
+    let mut write_buf = BytesMut::new();
+    let result = try_inline_dispatch(
+        &mut read_buf,
+        &mut write_buf,
+        &dbs,
+        0,
+        0,
+        &aof_pool,
+        &None,
+        0,
+        1,
+        true,
+        true,
+        false,
+        &rt_config,
+        false,
+    );
+    crate::client_pause::unpause();
+
+    assert_eq!(
+        result, 0,
+        "a plain SET was inlined while CLIENT PAUSE WRITE was in force, so the \
+         write landed during a window an operator believes is frozen"
+    );
+    assert_eq!(
+        read_buf.len(),
+        cmd.len(),
+        "the declined command must be left byte-for-byte in read_buf for \
+         generic dispatch to re-parse — bailing after the split loses the write"
+    );
+    assert!(
+        write_buf.is_empty(),
+        "the inline path must not answer at all when it stands down"
+    );
+}
+
+/// moon#660: a plain `SET` must NOT inline while this shard is still loading.
+///
+/// The moon#476 `-LOADING` gate also lives in the generic frame loop, so an
+/// inlined `SET` was served against a shard whose index recovery was still
+/// running. Measured across a restart with a 40k-document FT index: 6/6 probes
+/// while `loading:1` answered `+OK` on this branch and `-LOADING` on `main`.
+///
+/// `SET` writes a string and touches no index, so the harm is contract
+/// violation rather than corruption — but a client that keys its "server ready"
+/// decision on `-LOADING` proceeds against a half-recovered server.
+#[test]
+fn test_inline_set_stands_down_while_loading() {
+    let dbs = make_dbs();
+    let cmd = b"*3\r\n$3\r\nSET\r\n$6\r\nlkey01\r\n$3\r\nbar\r\n";
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
+    let rt_config = make_rt_config();
+
+    // CONTROL: not loading -> inlines.
+    crate::shard::loading::set_loading(false);
+    let mut read_buf = BytesMut::from(&cmd[..]);
+    let mut write_buf = BytesMut::new();
+    let control = try_inline_dispatch(
+        &mut read_buf,
+        &mut write_buf,
+        &dbs,
+        0,
+        0,
+        &aof_pool,
+        &None,
+        0,
+        1,
+        true,
+        true,
+        false,
+        &rt_config,
+        false,
+    );
+    assert_eq!(control, 1, "CONTROL: a SET must inline when not loading");
+
+    // Loading: declined, buffer intact.
+    crate::shard::loading::set_loading(true);
+    let mut read_buf = BytesMut::from(&cmd[..]);
+    let mut write_buf = BytesMut::new();
+    let result = try_inline_dispatch(
+        &mut read_buf,
+        &mut write_buf,
+        &dbs,
+        0,
+        0,
+        &aof_pool,
+        &None,
+        0,
+        1,
+        true,
+        true,
+        false,
+        &rt_config,
+        false,
+    );
+    crate::shard::loading::set_loading(false);
+
+    assert_eq!(
+        result, 0,
+        "a plain SET was inlined while the shard was still loading, so the \
+         client was told +OK where the contract requires -LOADING"
+    );
+    assert_eq!(
+        read_buf.len(),
+        cmd.len(),
+        "the declined command must be left byte-for-byte in read_buf"
+    );
+    assert!(write_buf.is_empty());
+}
