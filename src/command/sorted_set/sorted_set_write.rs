@@ -83,9 +83,10 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     let mut changed = 0i64;
     // Net O(1) byte charge across all members in this call — see the WS6
     // accounting note above `entry_overhead` in storage/db.rs. A brand-new
-    // member costs `zset_member_cost` (one BPTree node + one `members` map
-    // entry); an existing member's score-only update costs nothing (the
-    // `SortedSetBPTree` estimator doesn't factor in score values).
+    // member costs `zset_member_cost`, which is the member BUFFER only: the
+    // `members` table and the B+tree arena are charged separately from their
+    // real capacity by the snapshot below. An existing member's score-only
+    // update costs nothing (scores are inline `f64`s in slots already billed).
     let mut mem_charge: usize = 0;
     // moon#788: the B+tree arena and the `members` table are charged from
     // their REAL capacity, snapshotted around the mutation (O(1), three
@@ -195,9 +196,12 @@ pub fn zrem(db: &mut Database, args: &[Frame]) -> Frame {
     let table_after = zset_table_bytes(members, scores);
     // `members`/`scores`' borrow of `db` ends above.
     db.credit_memory(credit);
-    if !is_empty {
-        db.adjust_memory(table_before, table_after);
-    }
+    // Unconditional, even when the set just went empty: `db.remove` below
+    // credits `entry_overhead` recomputed from the CURRENT value, and a
+    // hashbrown table's reported `capacity()` shrinks as entries are erased.
+    // Skipping the adjust here left the shrink uncredited — measured 1504 B
+    // stranded per create/drain cycle, which accumulates without bound.
+    db.adjust_memory(table_before, table_after);
 
     // Remove key if empty
     if is_empty {
@@ -309,9 +313,12 @@ pub fn zpopmin(db: &mut Database, args: &[Frame]) -> Frame {
     let table_after = zset_table_bytes(members, scores);
     // `members`/`scores`' borrow of `db` ends above.
     db.credit_memory(credit);
-    if !is_empty {
-        db.adjust_memory(table_before, table_after);
-    }
+    // Unconditional, even when the set just went empty: `db.remove` below
+    // credits `entry_overhead` recomputed from the CURRENT value, and a
+    // hashbrown table's reported `capacity()` shrinks as entries are erased.
+    // Skipping the adjust here left the shrink uncredited — measured 1504 B
+    // stranded per create/drain cycle, which accumulates without bound.
+    db.adjust_memory(table_before, table_after);
 
     // Remove key if empty
     if is_empty {
@@ -372,9 +379,12 @@ pub fn zpopmax(db: &mut Database, args: &[Frame]) -> Frame {
     let table_after = zset_table_bytes(members, scores);
     // `members`/`scores`' borrow of `db` ends above.
     db.credit_memory(credit);
-    if !is_empty {
-        db.adjust_memory(table_before, table_after);
-    }
+    // Unconditional, even when the set just went empty: `db.remove` below
+    // credits `entry_overhead` recomputed from the CURRENT value, and a
+    // hashbrown table's reported `capacity()` shrinks as entries are erased.
+    // Skipping the adjust here left the shrink uncredited — measured 1504 B
+    // stranded per create/drain cycle, which accumulates without bound.
+    db.adjust_memory(table_before, table_after);
 
     // Remove key if empty
     if is_empty {
@@ -868,9 +878,8 @@ pub fn zmpop(db: &mut Database, args: &[Frame]) -> Frame {
         let table_after = zset_table_bytes(members, scores);
         // `members`/`scores`' borrow of `db` ends above.
         db.credit_memory(credit);
-        if !is_empty {
-            db.adjust_memory(table_before, table_after);
-        }
+        // Unconditional — see the note in `zrem`.
+        db.adjust_memory(table_before, table_after);
 
         if is_empty {
             db.remove(key);

@@ -236,12 +236,16 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
         let empty = set.is_empty();
         let table_after = set_table_bytes(set);
         // `set`'s borrow of `db` ends above.
+        // moon#788: credit the member and the table shrink FIRST, in every
+        // case. The empty branch used to lean on `db.remove` to "recompute
+        // the now-empty entry cost", but that recompute no longer sees the
+        // member just popped, and a hashbrown `capacity()` shrinks as entries
+        // are erased — so the last member's bytes and the table delta were
+        // stranded on every create/drain cycle.
+        db.credit_memory(set_member_cost(&chosen));
+        db.adjust_memory(table_before, table_after);
         if empty {
-            // Whole-key removal recomputes the (now-empty) entry cost.
             db.remove(key);
-        } else {
-            db.credit_memory(set_member_cost(&chosen));
-            db.adjust_memory(table_before, table_after);
         }
         return Frame::BulkString(chosen);
     }
@@ -290,12 +294,12 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
     let empty = set.is_empty();
     let table_after = set_table_bytes(set);
     // `set`'s borrow of `db` ends above.
+    // Credit unconditionally -- see the note in the single-member branch.
+    let credit: usize = chosen.iter().map(|m| set_member_cost(m)).sum();
+    db.credit_memory(credit);
+    db.adjust_memory(table_before, table_after);
     if empty {
         db.remove(key);
-    } else {
-        let credit: usize = chosen.iter().map(|m| set_member_cost(m)).sum();
-        db.credit_memory(credit);
-        db.adjust_memory(table_before, table_after);
     }
 
     let result: Vec<Frame> = chosen.into_iter().map(Frame::BulkString).collect();
@@ -542,13 +546,11 @@ pub fn smove(db: &mut Database, args: &[Frame]) -> Frame {
     let src_empty = src_set.is_empty();
     let src_table_after = set_table_bytes(src_set);
     // `src_set`'s borrow of `db` ends above.
+    // Credit unconditionally -- see the note in `spop`.
+    db.credit_memory(set_member_cost(&member));
+    db.adjust_memory(src_table_before, src_table_after);
     if src_empty {
-        // Whole-key removal recomputes the (now-empty) entry cost -- covers
-        // the removed member too, so skip the standalone credit below.
         db.remove(source);
-    } else {
-        db.credit_memory(set_member_cost(&member));
-        db.adjust_memory(src_table_before, src_table_after);
     }
 
     let dst_set = match db.get_or_create_set(destination) {

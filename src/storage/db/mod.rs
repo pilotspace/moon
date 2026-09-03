@@ -2763,6 +2763,57 @@ mod ledger_consistency_788 {
         }
         assert_ledger_exact(&mut db, "after 20 SMOVE");
 
+        // Draining a set to empty takes a DIFFERENT path: the command removes
+        // the key itself, and the table charge must be credited back by
+        // `remove`'s `entry_overhead` recompute rather than by an `adjust`.
+        // Get that wrong in either direction and the ledger drifts on every
+        // create/drain cycle.
+        let mark = db.estimated_memory();
+        for i in 0..50u32 {
+            let m = format!("d:{i:08}");
+            crate::command::set::sadd(&mut db, &[f(b"drain"), f(m.as_bytes())]);
+        }
+        for i in 0..50u32 {
+            let m = format!("d:{i:08}");
+            crate::command::set::srem(&mut db, &[f(b"drain"), f(m.as_bytes())]);
+        }
+        assert_eq!(
+            db.estimated_memory(),
+            mark,
+            "SREM-to-empty auto-removed the key but left bytes charged"
+        );
+
+        // SPOP and SMOVE take a different empty branch: they call `db.remove`
+        // INSTEAD of crediting the member, so the whole cycle has to balance
+        // through `entry_overhead` alone.
+        for i in 0..40u32 {
+            let m = format!("p:{i:08}");
+            crate::command::set::sadd(&mut db, &[f(b"pop"), f(m.as_bytes())]);
+        }
+        crate::command::set::spop(&mut db, &[f(b"pop"), f(b"39")]);
+        crate::command::set::spop(&mut db, &[f(b"pop")]);
+        assert_eq!(
+            db.estimated_memory(),
+            mark,
+            "SPOP-to-empty auto-removed the key but left bytes charged"
+        );
+
+        for i in 0..40u32 {
+            let m = format!("v:{i:08}");
+            crate::command::set::sadd(&mut db, &[f(b"mvsrc"), f(m.as_bytes())]);
+        }
+        for i in 0..40u32 {
+            let m = format!("v:{i:08}");
+            crate::command::set::smove(&mut db, &[f(b"mvsrc"), f(b"mvdst"), f(m.as_bytes())]);
+        }
+        assert_ledger_exact(&mut db, "after SMOVE drained the source");
+        db.remove(b"mvdst");
+        assert_eq!(
+            db.estimated_memory(),
+            mark,
+            "SMOVE-to-empty auto-removed the source but left bytes charged"
+        );
+
         db.remove(b"s");
         db.remove(b"src");
         db.remove(b"dst");
@@ -2802,6 +2853,24 @@ mod ledger_consistency_788 {
         crate::command::sorted_set::zpopmax(&mut db, &[f(b"z"), f(b"30")]);
         assert_ledger_exact(&mut db, "after ZPOPMAX 30");
 
+        // Same drain-to-empty path for sorted sets: ZPOPMIN takes the last
+        // member, the command removes the key, and the B+tree arena — by far
+        // the largest term — has to be credited back exactly once.
+        let mark = db.estimated_memory();
+        for i in 0..50u32 {
+            let m = format!("d:{i:08}");
+            crate::command::sorted_set::zadd(
+                &mut db,
+                &[f(b"drain"), f(i.to_string().as_bytes()), f(m.as_bytes())],
+            );
+        }
+        crate::command::sorted_set::zpopmin(&mut db, &[f(b"drain"), f(b"50")]);
+        assert_eq!(
+            db.estimated_memory(),
+            mark,
+            "ZPOPMIN-to-empty auto-removed the key but left bytes charged"
+        );
+
         db.remove(b"z");
         assert_eq!(
             db.estimated_memory(),
@@ -2834,6 +2903,27 @@ mod ledger_consistency_788 {
             crate::command::list::lpop(&mut db, &[f(b"l")]);
         }
         assert_ledger_exact(&mut db, "after 100 LPOP");
+
+        // Drain both to empty: the command removes the key itself, so the
+        // whole create/drain cycle has to net to zero or the ledger climbs on
+        // every cycle until the gate fires on memory nobody holds.
+        let mark = db.estimated_memory();
+        for i in 0..60u32 {
+            let fd = format!("g:{i:08}");
+            crate::command::hash::hset(&mut db, &[f(b"h2"), f(fd.as_bytes()), f(b"v")]);
+            let e = format!("g:{i:08}");
+            crate::command::list::rpush(&mut db, &[f(b"l2"), f(e.as_bytes())]);
+        }
+        for i in 0..60u32 {
+            let fd = format!("g:{i:08}");
+            crate::command::hash::hdel(&mut db, &[f(b"h2"), f(fd.as_bytes())]);
+            crate::command::list::lpop(&mut db, &[f(b"l2")]);
+        }
+        assert_eq!(
+            db.estimated_memory(),
+            mark,
+            "draining a hash and a list to empty left bytes charged"
+        );
     }
 
     /// GEOADD grows a sorted set through a raw `&mut`. Before moon#788 it
@@ -2863,3 +2953,9 @@ mod ledger_consistency_788 {
         assert_ledger_exact(&mut db, "after 200 GEOADD");
     }
 }
+
+
+
+
+
+
