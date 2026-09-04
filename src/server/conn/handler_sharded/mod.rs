@@ -1683,7 +1683,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             &mut stream, &mut read_buf,
                         ).await;
                         drop(blocked_guard);
-                        let blocking_response = match blocking_outcome {
+                        let mut blocking_response = match blocking_outcome {
                             crate::server::conn::blocking::BlockingOutcome::Reply(frame) => frame,
                             // Peer vanished mid-block: registrations are torn
                             // down, nothing to reply to, close the connection.
@@ -1705,6 +1705,65 @@ pub(crate) async fn handle_connection_sharded_inner<
                         &blocking_response,
                         conn.client_id,
                     );
+
+                    // moon#827: the blocking path is an INTERCEPT — exactly
+                    // like the tracking invalidation above, it short-circuits
+                    // the dispatch exit where every other write meets the AOF,
+                    // so it has to feed it itself. It did not: a blocking pop
+                    // that actually popped was acked to the client, applied on
+                    // the master, and propagated NOWHERE — it came back on the
+                    // next restart and never happened on a replica.
+                    //
+                    // Placed beside the invalidation and BEFORE the RESP3
+                    // conversion for the same reason that one is: the record
+                    // is derived from the RESP2 shapes, and which key served
+                    // must not depend on the protocol the client negotiated.
+                    //
+                    // The record is the synthesised non-blocking sibling,
+                    // never the command itself — a replica applying a literal
+                    // `BLPOP` would park its apply loop. `None` whenever
+                    // nothing was written, so a non-write reaches neither
+                    // plane.
+                    if let Some(effect) =
+                        crate::server::conn::blocking_effect::blocking_effect_record(
+                            cmd,
+                            cmd_args,
+                            &blocking_response,
+                        )
+                        && let Some(ref pool) = ctx.aof_pool
+                    {
+                        let bytes = aof::serialize_command_for_log(&effect);
+                        let lsn = aof::AofWriterPool::issue_append_lsn(
+                            &ctx.repl_state,
+                            ctx.shard_id,
+                            bytes.len(),
+                        );
+                        match pool
+                            .send_append_group(ctx.shard_id, lsn, conn.selected_db, bytes)
+                            .await
+                        {
+                            // `appendfsync always`: the element is already out
+                            // of the keyspace and already promised to this
+                            // client, so the fsync is awaited HERE rather than
+                            // deferred to the batch barrier — the reply is
+                            // pushed immediately below, with no later frame to
+                            // carry it.
+                            Ok(true) => {
+                                if pool.fsync_barrier(ctx.shard_id).await.is_err() {
+                                    blocking_response =
+                                        Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR));
+                                }
+                            }
+                            Ok(false) => {}
+                            // Fail loud (PR #211): applied in memory but not
+                            // queued for persistence. Telling the client it
+                            // succeeded is how the element goes missing.
+                            Err(_) => {
+                                blocking_response =
+                                    Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR));
+                            }
+                        }
+                    }
                         let blocking_response = apply_resp3_conversion(
                             cmd,
                             cmd_args,

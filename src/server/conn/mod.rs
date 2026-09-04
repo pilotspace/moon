@@ -1,5 +1,6 @@
 pub mod affinity;
 pub mod blocking;
+pub mod blocking_effect;
 /// moon#556/#557: runtime-agnostic tests for the blocking pre-registration
 /// scan. Separate from `tests` below, which only compiles under monoio.
 #[cfg(test)]

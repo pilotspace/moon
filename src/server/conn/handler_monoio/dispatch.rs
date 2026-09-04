@@ -1946,7 +1946,7 @@ pub(super) async fn try_handle_blocking<
     .await;
     drop(blocked_guard);
 
-    let blocking_response = match outcome {
+    let mut blocking_response = match outcome {
         crate::server::conn::blocking::BlockingOutcome::Reply(frame) => frame,
         crate::server::conn::blocking::BlockingOutcome::PeerGone => {
             responses.clear();
@@ -1967,6 +1967,75 @@ pub(super) async fn try_handle_blocking<
         &blocking_response,
         conn.client_id,
     );
+
+    // moon#827: the blocking path is an INTERCEPT — exactly like the tracking
+    // invalidation above, it short-circuits the dispatch exit where every
+    // other write meets the AOF and the replication stream, so it has to feed
+    // them itself. It did not: a blocking pop that actually popped was acked
+    // to the client, applied on the master, and propagated NOWHERE. It came
+    // back on the next restart and never happened on a replica.
+    //
+    // Placed beside the invalidation and BEFORE the RESP3 conversion for the
+    // same reason that one is: the record is derived from the RESP2 shapes,
+    // and which key served must not depend on the protocol the client
+    // negotiated.
+    //
+    // The record is the synthesised non-blocking sibling, never the command
+    // itself — a replica applying a literal `BLPOP` would park its apply loop.
+    // `None` whenever nothing was written (timeout, error, miss), so a
+    // non-write reaches neither plane.
+    if let Some(effect) = crate::server::conn::blocking_effect::blocking_effect_record(
+        cmd,
+        cmd_args,
+        &blocking_response,
+    ) {
+        let repl_active = super::ft::replication_fanout_active(ctx);
+        if repl_active || ctx.aof_pool.is_some() {
+            let serialized = crate::persistence::aof::serialize_command_for_log(&effect);
+            // Same contract as the other local-leg writes: when replication is
+            // live the backlog owns the offset and the AOF leg must not
+            // double-advance it (lsn = 0).
+            let lsn = if repl_active {
+                super::ft::record_local_write_db(ctx, conn.selected_db, serialized.clone());
+                0
+            } else {
+                crate::persistence::aof::AofWriterPool::issue_append_lsn(
+                    &ctx.repl_state,
+                    ctx.shard_id,
+                    serialized.len(),
+                )
+            };
+            if let Some(ref pool) = ctx.aof_pool {
+                match pool
+                    .send_append_group(ctx.shard_id, lsn, conn.selected_db, serialized)
+                    .await
+                {
+                    // `appendfsync always`: the element is already out of the
+                    // keyspace and already promised to this client, so the
+                    // fsync is awaited HERE rather than deferred to a batch
+                    // barrier — there is no later frame in this batch to carry
+                    // it, the reply is written immediately below.
+                    Ok(true) => {
+                        if pool.fsync_barrier(ctx.shard_id).await.is_err() {
+                            blocking_response = Frame::Error(bytes::Bytes::from_static(
+                                crate::persistence::aof::AOF_FSYNC_ERR,
+                            ));
+                        }
+                    }
+                    Ok(false) => {}
+                    // Fail loud (PR #211): the pop is applied in memory but
+                    // did not reach the durability machinery. Telling the
+                    // client it succeeded is how the element goes missing
+                    // silently.
+                    Err(_) => {
+                        blocking_response = Frame::Error(bytes::Bytes::from_static(
+                            crate::persistence::aof::AOF_FSYNC_ERR,
+                        ));
+                    }
+                }
+            }
+        }
+    }
 
     // moon#559 / moon#462: this is an INTERCEPT — it short-circuits the
     // dispatch exit where every other reply meets the RESP3 policy — so it
