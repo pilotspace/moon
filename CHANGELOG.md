@@ -57,6 +57,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`storage`: `ZADD` and `GEOADD` stranded their memory charge on any argument
+  error, driving `used_memory` monotonically to zero (#814).** Both commands
+  parsed **and** mutated in the same loop and returned on the first bad
+  argument from *inside* the `table_before … db.charge_memory()` window.
+  Members already inserted stayed in the keyspace with their charge never
+  applied.
+
+  It compounded through DELETE, which is what made it unbounded rather than a
+  one-off under-count: `db.remove` credits an `entry_overhead` recomputed from
+  the CURRENT value, so a delete afterwards credited back memory that was never
+  charged. Measured, 300 unrelated keys held constant, rounds of
+  50 x (partial `ZADD` + `DEL`):
+
+  ```
+  floor with 300 held keys = 6,487,257
+    after churn round 1: used_memory=5,602,457   drift=  -884,800
+    after churn round 2: used_memory=4,717,657   drift=-1,769,600
+    after churn round 3: used_memory=3,832,857   drift=-2,654,400
+  ```
+
+  -884,800 B per round = exactly 50 x 17,696, monotone and unrecoverable, and
+  driveable by any unprivileged client. `used_memory` reaches 0 with an
+  arbitrarily large keyspace resident, at which point `--maxmemory` never
+  fires. A single 100-pair `ZADD` with a bad tail billed 3,846 B — the empty
+  container cost alone — against 21,541 B of real content.
+
+  Fixed by validating every pair/triple **before** touching the keyspace, which
+  is also Redis parity twice over: real Redis's `ZADD` is all-or-nothing, and
+  it does not create the key when the command errors. moon previously did both.
+  Two passes rather than a parsed `Vec`, because `src/command/` is a
+  no-allocation path and parsing an `f64` twice is far cheaper than the B+tree
+  insert it guards.
+
+  Found by a post-hoc adversarial review of #810, which had been admin-merged
+  with no human reader. `ledger_consistency_788` drained every container but
+  never exercised an error-mid-command path, which is why it was green; it now
+  has four cases that do, including the delete-churn compounding.
+
 - **`shard`: `COPY` and `BITOP` were silently lost across restart at
   `--shards 1` (data loss).**
   `coordinate_copy` and `coordinate_bitop` each opened with a

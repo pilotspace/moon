@@ -16,6 +16,43 @@ fn parse_f64(frame: &Frame) -> Option<f64> {
     std::str::from_utf8(b).ok()?.parse().ok()
 }
 
+/// The longitude range GEOADD accepts. Shared by the validation pre-pass and
+/// the mutation loop so the two cannot drift apart — see `parse_geoadd_triple`.
+const GEO_LON_MIN: f64 = -180.0;
+const GEO_LON_MAX: f64 = 180.0;
+/// The Web-Mercator latitude clamp, matching Redis's `GEO_LAT_MIN`/`MAX`.
+const GEO_LAT_MIN: f64 = -85.05112878;
+const GEO_LAT_MAX: f64 = 85.05112878;
+
+const GEO_BAD_FLOAT: &[u8] = b"ERR value is not a valid float or out of range";
+
+/// Parse one `longitude latitude member` triple of a `GEOADD`.
+///
+/// The single source of truth for what `GEOADD` accepts. Both the validation
+/// pre-pass and the mutation loop call it, and that is load-bearing rather
+/// than tidy: the moment the two disagree — the pre-pass accepting something
+/// the loop then rejects — moon#814 returns, because the loop's error arms
+/// return from inside the `table_before … charge_memory()` window and strand
+/// the charge for every member already inserted.
+#[inline]
+fn parse_geoadd_triple(chunk: &[Frame]) -> Result<(f64, f64, &[u8]), Frame> {
+    let [lon_arg, lat_arg, member_arg] = chunk else {
+        // `chunks_exact(3)` yields nothing else; the guard in `geoadd` already
+        // rejected a length that is not a multiple of three.
+        return Err(err_wrong_args("GEOADD"));
+    };
+    let Some(lon) = parse_f64(lon_arg).filter(|v| (GEO_LON_MIN..=GEO_LON_MAX).contains(v)) else {
+        return Err(Frame::Error(Bytes::from_static(GEO_BAD_FLOAT)));
+    };
+    let Some(lat) = parse_f64(lat_arg).filter(|v| (GEO_LAT_MIN..=GEO_LAT_MAX).contains(v)) else {
+        return Err(Frame::Error(Bytes::from_static(GEO_BAD_FLOAT)));
+    };
+    let Some(member) = extract_bytes(member_arg) else {
+        return Err(err_wrong_args("GEOADD"));
+    };
+    Ok((lon, lat, member))
+}
+
 /// GEOADD key [NX|XX] [CH] longitude latitude member [longitude latitude member ...]
 pub fn geoadd(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 4 {
@@ -62,6 +99,18 @@ pub fn geoadd(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("GEOADD");
     }
 
+    // moon#814: validate EVERY triple BEFORE touching the keyspace — same
+    // window, same consequence as ZADD. Returning from inside the mutation
+    // loop below left members inserted with `mem_charge` never applied, and a
+    // later delete credited back memory that was never charged, drifting
+    // `used_memory` monotonically down. Validating first is also Redis parity:
+    // the key is not created when the command errors.
+    for chunk in remaining.chunks_exact(3) {
+        if let Err(e) = parse_geoadd_triple(chunk) {
+            return e;
+        }
+    }
+
     let (members, tree) = match db.get_or_create_sorted_set(key) {
         Ok(pair) => pair,
         Err(e) => return e,
@@ -76,26 +125,15 @@ pub fn geoadd(db: &mut Database, args: &[Frame]) -> Frame {
     let table_before = crate::storage::db::zset_table_bytes(members, tree);
 
     for chunk in remaining.chunks_exact(3) {
-        let lon = match parse_f64(&chunk[0]) {
-            Some(v) if (-180.0..=180.0).contains(&v) => v,
-            _ => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR value is not a valid float or out of range",
-                ));
-            }
+        // Cannot fail: the pre-pass above validated every triple with this
+        // exact function before the keyspace was touched. Kept as a real match
+        // anyway — a bare `unwrap` here would be the one place the two passes
+        // could silently diverge.
+        let (lon, lat, member) = match parse_geoadd_triple(chunk) {
+            Ok(parsed) => parsed,
+            Err(e) => return e,
         };
-        let lat = match parse_f64(&chunk[1]) {
-            Some(v) if (-85.05112878..=85.05112878).contains(&v) => v,
-            _ => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR value is not a valid float or out of range",
-                ));
-            }
-        };
-        let member = match extract_bytes(&chunk[2]) {
-            Some(m) => Bytes::copy_from_slice(m),
-            None => return err_wrong_args("GEOADD"),
-        };
+        let member = Bytes::copy_from_slice(member);
 
         let score = geohash_encode(lon, lat);
         let exists = members.contains_key(&member);
