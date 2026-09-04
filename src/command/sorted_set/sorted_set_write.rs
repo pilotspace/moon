@@ -16,6 +16,35 @@ use super::{
 // Write commands (mutate the database)
 // ---------------------------------------------------------------------------
 
+/// Parse one `score member` pair of a `ZADD`.
+///
+/// The single source of truth for what `ZADD` accepts. Both the validation
+/// pre-pass and the mutation loop call it, and that is load-bearing rather
+/// than tidy: the moment the two disagree — the pre-pass accepting something
+/// the loop then rejects — moon#814 returns, because the loop's error arms
+/// return from inside the `table_before … charge_memory()` window and strand
+/// the charge for every member already inserted.
+#[inline]
+fn parse_zadd_pair<'a>(
+    score_arg: &Frame,
+    member_arg: &'a Frame,
+) -> Result<(f64, &'a Bytes), Frame> {
+    let (Some(score_bytes), Some(member)) = (extract_bytes(score_arg), extract_bytes(member_arg))
+    else {
+        return Err(err_wrong_args("ZADD"));
+    };
+    let Ok(score_str) = std::str::from_utf8(score_bytes) else {
+        return Err(err("ERR value is not a valid float"));
+    };
+    let Ok(score) = score_str.parse::<f64>() else {
+        return Err(err("ERR value is not a valid float"));
+    };
+    if score.is_nan() {
+        return Err(err("ERR value is not a valid float"));
+    }
+    Ok((score, member))
+}
+
 /// ZADD key [NX|XX] [GT|LT] [CH] score member [score member ...]
 pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 3 {
@@ -93,25 +122,14 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     // Two passes rather than a parsed `Vec`: `src/command/` is a no-allocation
     // path, and parsing an f64 twice is far cheaper than the B+tree insert it
     // guards.
-    {
-        let mut j = 0;
-        while j < remaining.len() {
-            let Some(score_bytes) = extract_bytes(&remaining[j]) else {
-                return err_wrong_args("ZADD");
-            };
-            if extract_bytes(&remaining[j + 1]).is_none() {
-                return err_wrong_args("ZADD");
-            }
-            let Ok(score_str) = std::str::from_utf8(score_bytes) else {
-                return err("ERR value is not a valid float");
-            };
-            let Ok(score) = score_str.parse::<f64>() else {
-                return err("ERR value is not a valid float");
-            };
-            if score.is_nan() {
-                return err("ERR value is not a valid float");
-            }
-            j += 2;
+    for pair in remaining.chunks_exact(2) {
+        let [score_arg, member_arg] = pair else {
+            // `chunks_exact(2)` yields nothing else; the guard above already
+            // rejected an odd tail.
+            return err_wrong_args("ZADD");
+        };
+        if let Err(e) = parse_zadd_pair(score_arg, member_arg) {
+            return e;
         }
     }
 
@@ -136,28 +154,19 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     // allocation is four of them.
     let table_before = zset_table_bytes(members, scores);
 
-    let mut j = 0;
-    while j < remaining.len() {
-        let score_bytes = match extract_bytes(&remaining[j]) {
-            Some(b) => b,
-            None => return err_wrong_args("ZADD"),
+    for pair in remaining.chunks_exact(2) {
+        let [score_arg, member_arg] = pair else {
+            return err_wrong_args("ZADD");
         };
-        let member = match extract_bytes(&remaining[j + 1]) {
-            Some(b) => b.clone(),
-            None => return err_wrong_args("ZADD"),
+        // Cannot fail: the pre-pass above validated every pair with this exact
+        // function before the keyspace was touched. Kept as a real match
+        // anyway — a bare `unwrap` here would be the one place the two passes
+        // could silently diverge.
+        let (score, member) = match parse_zadd_pair(score_arg, member_arg) {
+            Ok(parsed) => parsed,
+            Err(e) => return e,
         };
-
-        let score_str = match std::str::from_utf8(score_bytes) {
-            Ok(s) => s,
-            Err(_) => return err("ERR value is not a valid float"),
-        };
-        let score: f64 = match score_str.parse() {
-            Ok(v) => v,
-            Err(_) => return err("ERR value is not a valid float"),
-        };
-        if score.is_nan() {
-            return err("ERR value is not a valid float");
-        }
+        let member = member.clone();
 
         let existing_score = members.get(&member).copied();
 
@@ -189,8 +198,6 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                 changed += 1;
             }
         }
-
-        j += 2;
     }
 
     let table_after = zset_table_bytes(members, scores);
