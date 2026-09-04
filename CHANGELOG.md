@@ -57,6 +57,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`stream`: every rejected `XADD` ID left a phantom stream in the keyspace
+  that was charged and never persisted (#823).** `db.get_or_create_stream(key)`
+  ran BEFORE the ID was parsed, so it inserted the entry, charged
+  `entry_overhead` and burned a birth version; the ID errors then returned, and
+  propagation is gated on the reply not being an error, so nothing reached the
+  AOF or a replica. Measured: all five of `bogus`, `0-0`, `1-1-1`, `abc-1` and
+  `-5` created the key, and 3,000 rejected `XADD`s cost 1.46 MB that nothing
+  credits back — an unbounded memory-growth primitive available to any client,
+  through a command that only ever answers an error. Unlike the Lua case above
+  it needs no odd frame: plain `redis-cli` reaches it. Real Redis parses the ID
+  first and creates nothing.
+
+  Fixed by resolving the ID before the key can be created, peeking `last_id`
+  from the existing stream (`0-0` when absent).
+  `StreamData::validate_explicit_id` now delegates to a free
+  `validate_explicit_id_against(last_id, id)` that the pre-check also calls, so
+  the two cannot drift apart. `*` still resolves after creation — it reads the
+  shard clock and cannot fail.
+
+- **`scripting`: a non-string Lua argument reached command argv, and nine
+  commands wrote part of a command before refusing it — silent data loss
+  across restart, and permanent replica divergence (#823).**
+  `redis.call`/`redis.pcall` converted a Lua `nil`, boolean or table argument
+  into `Frame::Null`/`Frame::Integer` and handed it to `dispatch`. No wire
+  client can put those shapes in an argv, so command parsers do not expect
+  them: `extract_bytes` returns `None`, and `HSET`, `HMSET`, `LPUSH`, `RPUSH`,
+  `LPUSHX`, `RPUSHX`, `ZREM`, `MSET` and `MSETNX` each discovered that from
+  INSIDE their mutation loop and returned an arity error with part of the
+  command already written.
+
+  That alone would be the memory-ledger drift of #814. It was worse, because
+  propagation is gated on the reply not being an error: the partial write was
+  applied on the master and **never appended to the AOF and never sent to a
+  replica**. Measured, single shard, `--appendonly yes`:
+
+  ```
+  EVAL "return redis.pcall('LPUSH','mylist','a','b',true)" 0
+    -> ERR wrong number of arguments for 'lpush' command
+  LLEN mylist = 2          <- the error was a lie; two elements are resident
+  [restart]
+  LLEN mylist = 0          <- gone. An unrelated SET in the same session survived.
+  ```
+
+  `EVAL` is how this was found, but it is not the only trigger. `validate_frame`
+  (`src/protocol/parse.rs`) accepts `+`, `-`, `(`, `:`, `,` and `#` as top-level
+  array elements, so a RAW WIRE client reaches the same code with no Lua at all:
+  `*5\r\n$4\r\nMSET\r\n$3\r\nwa1\r\n$1\r\n1\r\n$3\r\nwb1\r\n:7\r\n` is
+  delivered to `mset`, where real Redis answers `ERR Protocol error: expected
+  '$', got ':'` and closes the connection. That protocol-layer divergence is
+  filed separately and is NOT fixed here — which is precisely why the
+  per-command validation matters independently of the Lua boundary. Verified:
+  after this change the wire probe above leaves nothing behind.
+
+  Real Redis 8.6.1 refuses the Lua call outright — `ERR Lua redis lib command
+  arguments must be strings or integers` — writing nothing; moon now returns
+  that same error from the same boundary.
+
+  Fixed in two independent layers, because they protect different things.
+  `lua_arg_to_frame` refuses every non-string, non-number argument, which is
+  Redis parity and closes the whole class at the one place that should never
+  have let the shape through. The nine commands additionally validate their
+  whole argv before the mutation window opens, so the keyspace is safe even if
+  some future caller reintroduces the shape. Mutation-tested both ways: with
+  only the boundary reverted, **zero** partial writes occur and only the error
+  message regresses; with both reverted, all nine commands write and the
+  restart check reports nine divergences.
+
+  The old fall-through was reasoned about — the comment argued a nil/boolean
+  argument is un-nameable in a KEY position and the ACL walker denies it. That
+  is true, and it is why this survived. It says nothing about the VALUE
+  position, which is where the writes happened.
+
+  Found by the adversarial review of #820, which observed that #814 was one
+  instance of a class.
+
 - **`storage`: `ZADD` and `GEOADD` stranded their memory charge on any argument
   error, driving `used_memory` monotonically to zero (#814).** Both commands
   parsed **and** mutated in the same loop and returned on the first bad

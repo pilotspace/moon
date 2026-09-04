@@ -141,12 +141,7 @@ impl Stream {
 
     /// Validate an explicit ID (must be > last_id, or for 0-0 stream first entry must be > 0-0).
     pub fn validate_explicit_id(&self, id: StreamId) -> Result<StreamId, &'static str> {
-        if id <= self.last_id {
-            return Err(
-                "ERR The ID specified in XADD is equal or smaller than the target stream top item",
-            );
-        }
-        Ok(id)
+        validate_explicit_id_against(self.last_id, id)
     }
 
     /// Add an entry. Returns the assigned ID. Caller must ensure id > last_id.
@@ -684,6 +679,26 @@ impl Stream {
         }
         mem
     }
+}
+
+/// The ordering rule `XADD` enforces on an explicit ID, taking `last_id` rather
+/// than `&self`.
+///
+/// Factored out of [`Stream::validate_explicit_id`] for moon#823: `xadd`
+/// has to apply this rule BEFORE `get_or_create_stream`, or every rejected ID
+/// leaves a phantom stream in the keyspace that is charged, `DBSIZE`-visible,
+/// and never written to the AOF. `validate_explicit_id` now delegates here, so
+/// the pre-check and the post-check cannot drift apart.
+pub fn validate_explicit_id_against(
+    last_id: StreamId,
+    id: StreamId,
+) -> Result<StreamId, &'static str> {
+    if id <= last_id {
+        return Err(
+            "ERR The ID specified in XADD is equal or smaller than the target stream top item",
+        );
+    }
+    Ok(id)
 }
 
 #[cfg(test)]

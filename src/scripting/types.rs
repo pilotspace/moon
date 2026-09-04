@@ -20,15 +20,42 @@ use crate::protocol::{Frame, FrameVec};
 ///
 /// Float truncation matches what moon already did (`3.7` -> `3`); only the
 /// frame TYPE changes.
-pub fn lua_arg_to_frame(lua: &Lua, value: &LuaValue) -> mlua::Result<Frame> {
+/// The message real Redis returns when a `redis.call`/`redis.pcall` argument is
+/// not a string or a number. Verified against Redis 8.6.1.
+pub(crate) const LUA_ARG_TYPE_ERR: &str =
+    "ERR Lua redis lib command arguments must be strings or integers";
+
+// `_lua` is unused now that every accepted shape converts without allocating
+// through the Lua state, but the parameter stays: it keeps this symmetric with
+// `lua_value_to_frame`, and every call site passes it already.
+pub fn lua_arg_to_frame(_lua: &Lua, value: &LuaValue) -> mlua::Result<Frame> {
     let n = match value {
         LuaValue::Integer(n) => *n,
         LuaValue::Number(f) => *f as i64,
-        // Strings, and the non-numeric types, keep their existing handling.
-        // A nil/boolean/table argument stays whatever `lua_value_to_frame`
-        // makes of it; landing in a key position it is simply un-nameable,
-        // which the ACL walker reports as indeterminate and therefore denies.
-        other => return lua_value_to_frame(lua, other),
+        // Strings are already wire-shaped.
+        LuaValue::String(s) => {
+            return Ok(Frame::BulkString(Bytes::copy_from_slice(&s.as_bytes())));
+        }
+        // moon#823: everything else is REFUSED, as real Redis refuses it.
+        //
+        // This used to fall through to `lua_value_to_frame`, on the reasoning
+        // that a nil/boolean/table argument is un-nameable in a key position
+        // and the ACL walker therefore denies it. That reasoning is sound and
+        // it covers the KEY position. It does not cover the VALUE position,
+        // which is where the damage was: `Frame::Null`/`Frame::Integer` in an
+        // argv makes `extract_bytes` return `None` halfway through a command's
+        // mutation loop, and HSET/HMSET/LPUSH/RPUSH/LPUSHX/RPUSHX/ZREM/MSET all
+        // return their arity error from INSIDE the memory-charge window with
+        // part of the command already written. Propagation is gated on the
+        // reply not being an error, so those writes were applied on the master
+        // and never reached the AOF or a replica — silent data loss across
+        // restart, and permanent `DEBUG DIGEST` divergence, driveable by any
+        // client that can EVAL.
+        //
+        // The commands are hardened too (validate-before-mutate), but this is
+        // the boundary that should never have let the shape through, and it is
+        // the one place that fixes the whole class at once.
+        _ => return Err(mlua::Error::RuntimeError(LUA_ARG_TYPE_ERR.to_string())),
     };
     let mut buf = itoa::Buffer::new();
     Ok(Frame::BulkString(Bytes::copy_from_slice(
@@ -147,6 +174,91 @@ pub fn frame_to_lua_value(lua: &Lua, frame: &Frame) -> mlua::Result<LuaValue> {
 mod tests {
     use super::*;
     use crate::framevec;
+
+    // ── moon#823: the argument boundary ────────────────────────────────
+    //
+    // `lua_arg_to_frame` is the ONLY place a non-wire-shaped frame can enter a
+    // command's argv. Every command parser assumes argv is bulk strings,
+    // because that is all a wire client can send; several of them discover
+    // otherwise halfway through a mutation loop and return an error from
+    // inside their memory-charge window, having already written part of the
+    // command. Propagation is gated on the reply not being an error, so those
+    // writes are applied on the master and never reach the AOF or a replica.
+    //
+    // Real Redis refuses the call outright rather than defending eight command
+    // parsers, and so do we. Verified against Redis 8.6.1.
+
+    #[test]
+    fn a_boolean_argument_is_refused_not_converted() {
+        let lua = Lua::new();
+        for v in [LuaValue::Boolean(true), LuaValue::Boolean(false)] {
+            let err = lua_arg_to_frame(&lua, &v)
+                .expect_err("a boolean argument must be refused, not converted");
+            assert!(
+                err.to_string().contains(LUA_ARG_TYPE_ERR),
+                "wrong message for {v:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_nil_argument_is_refused_not_converted() {
+        let lua = Lua::new();
+        let err = lua_arg_to_frame(&lua, &LuaValue::Nil)
+            .expect_err("a nil argument must be refused, not converted");
+        assert!(err.to_string().contains(LUA_ARG_TYPE_ERR), "{err}");
+    }
+
+    #[test]
+    fn a_table_argument_is_refused_not_converted() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        let err = lua_arg_to_frame(&lua, &LuaValue::Table(t))
+            .expect_err("a table argument must be refused, not converted");
+        assert!(err.to_string().contains(LUA_ARG_TYPE_ERR), "{err}");
+        // An {err=..} table is a RETURN shape, never an argument shape: it must
+        // be refused too, not smuggled in as `Frame::Error`.
+        let t = lua.create_table().unwrap();
+        t.set("err", "boom").unwrap();
+        let err = lua_arg_to_frame(&lua, &LuaValue::Table(t))
+            .expect_err("an {err=..} table argument must be refused");
+        assert!(err.to_string().contains(LUA_ARG_TYPE_ERR), "{err}");
+    }
+
+    #[test]
+    fn strings_and_numbers_still_pass_through_as_bulk_strings() {
+        let lua = Lua::new();
+        // The moon#569 contract: numbers stringify, they do not stay integers.
+        assert!(matches!(
+            lua_arg_to_frame(&lua, &LuaValue::Integer(42)).unwrap(),
+            Frame::BulkString(b) if b == &Bytes::from_static(b"42")
+        ));
+        assert!(matches!(
+            lua_arg_to_frame(&lua, &LuaValue::Number(3.7)).unwrap(),
+            Frame::BulkString(b) if b == &Bytes::from_static(b"3")
+        ));
+        let s = lua.create_string(b"hello").unwrap();
+        assert!(matches!(
+            lua_arg_to_frame(&lua, &LuaValue::String(s)).unwrap(),
+            Frame::BulkString(b) if b == &Bytes::from_static(b"hello")
+        ));
+    }
+
+    #[test]
+    fn the_return_value_converter_is_unchanged_by_the_argument_rule() {
+        // `lua_value_to_frame` converts a script's RETURN value, where nil,
+        // booleans and tables are all legal and carry meaning. Tightening the
+        // ARGUMENT path must not touch it.
+        let lua = Lua::new();
+        assert!(matches!(
+            lua_value_to_frame(&lua, &LuaValue::Nil).unwrap(),
+            Frame::Null
+        ));
+        assert!(matches!(
+            lua_value_to_frame(&lua, &LuaValue::Boolean(true)).unwrap(),
+            Frame::Integer(1)
+        ));
+    }
 
     #[test]
     fn test_lua_nil_to_frame() {

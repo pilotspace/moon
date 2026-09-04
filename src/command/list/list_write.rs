@@ -6,7 +6,7 @@ use crate::storage::Database;
 use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, list_elem_cost};
 
 use super::{parse_i64, resolve_index};
-use crate::command::helpers::{err_wrong_args, extract_bytes};
+use crate::command::helpers::{all_args_are_bytes, err_wrong_args, extract_bytes};
 
 // ---------------------------------------------------------------------------
 // LPUSH key element [element ...]
@@ -22,6 +22,15 @@ pub fn lpush(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("LPUSH"),
     };
+
+    // moon#823: refuse a non-argument-shaped frame BEFORE the mutation window
+    // opens. The loop below bails on the first one `extract_bytes` rejects,
+    // and by then it has already written part of the command — a partial write
+    // that is applied on the master and, because propagation is gated on the
+    // reply not being an error, never reaches the AOF or a replica.
+    if !all_args_are_bytes(&args[1..]) {
+        return err_wrong_args("LPUSH");
+    }
 
     let has_large_element = args[1..].iter().any(|a| {
         extract_bytes(a)
@@ -97,6 +106,15 @@ pub fn rpush(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("RPUSH"),
     };
+
+    // moon#823: refuse a non-argument-shaped frame BEFORE the mutation window
+    // opens. The loop below bails on the first one `extract_bytes` rejects,
+    // and by then it has already written part of the command — a partial write
+    // that is applied on the master and, because propagation is gated on the
+    // reply not being an error, never reaches the AOF or a replica.
+    if !all_args_are_bytes(&args[1..]) {
+        return err_wrong_args("RPUSH");
+    }
 
     let has_large_element = args[1..].iter().any(|a| {
         extract_bytes(a)
@@ -767,6 +785,15 @@ pub fn lpushx(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("LPUSHX"),
     };
 
+    // moon#823: refuse a non-argument-shaped frame BEFORE the mutation window
+    // opens. The loop below bails on the first one `extract_bytes` rejects,
+    // and by then it has already written part of the command — a partial write
+    // that is applied on the master and, because propagation is gated on the
+    // reply not being an error, never reaches the AOF or a replica.
+    if !all_args_are_bytes(&args[1..]) {
+        return err_wrong_args("LPUSHX");
+    }
+
     match db.get_list(key) {
         Ok(None) => return Frame::Integer(0),
         Err(e) => return e,
@@ -806,6 +833,15 @@ pub fn rpushx(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("RPUSHX"),
     };
+
+    // moon#823: refuse a non-argument-shaped frame BEFORE the mutation window
+    // opens. The loop below bails on the first one `extract_bytes` rejects,
+    // and by then it has already written part of the command — a partial write
+    // that is applied on the master and, because propagation is gated on the
+    // reply not being an error, never reaches the AOF or a replica.
+    if !all_args_are_bytes(&args[1..]) {
+        return err_wrong_args("RPUSHX");
+    }
 
     match db.get_list(key) {
         Ok(None) => return Frame::Integer(0),

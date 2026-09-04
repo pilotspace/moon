@@ -5,7 +5,7 @@ use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::db::{zset_member_cost, zset_table_bytes};
 
-use crate::command::helpers::{err, err_wrong_args, extract_bytes};
+use crate::command::helpers::{all_args_are_bytes, err, err_wrong_args, extract_bytes};
 
 use super::{
     AggregateOp, format_score, format_score_bytes, zadd_member, zrange_by_lex, zrange_by_rank,
@@ -221,6 +221,15 @@ pub fn zrem(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("ZREM"),
     };
+
+    // moon#823: refuse a non-argument-shaped frame BEFORE the mutation window
+    // opens. The loop below bails on the first one `extract_bytes` rejects,
+    // and by then it has already written part of the command — a partial write
+    // that is applied on the master and, because propagation is gated on the
+    // reply not being an error, never reaches the AOF or a replica.
+    if !all_args_are_bytes(&args[1..]) {
+        return err_wrong_args("ZREM");
+    }
 
     let (members, scores) = match db.get_or_create_sorted_set(key) {
         Ok(pair) => pair,

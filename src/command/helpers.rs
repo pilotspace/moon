@@ -45,6 +45,27 @@ pub fn extract_bytes(frame: &Frame) -> Option<&Bytes> {
     }
 }
 
+/// True when every frame is argument-shaped — i.e. something a wire client
+/// could actually have sent.
+///
+/// moon#823: a command that walks its argv inside a mutation loop and bails on
+/// the first frame `extract_bytes` rejects has ALREADY written part of the
+/// command by the time it returns the error. Propagation is gated on the reply
+/// not being an error, so that partial write is applied on the master and
+/// never reaches the AOF or a replica: silent loss across restart, permanent
+/// replica divergence.
+///
+/// The boundary that let a non-bulk frame into an argv at all is
+/// `scripting::types::lua_arg_to_frame`, and it now refuses — so on today's
+/// code this check cannot fail. It is kept as a cheap, explicit guard in front
+/// of each mutation window rather than an invariant a future caller has to
+/// know about, because the failure mode is silent data loss and the check is
+/// one pointer comparison per argument on a path that already walks them.
+#[inline]
+pub fn all_args_are_bytes(args: &[Frame]) -> bool {
+    args.iter().all(|a| extract_bytes(a).is_some())
+}
+
 /// OK response.
 pub fn ok() -> Frame {
     Frame::SimpleString(Bytes::from_static(b"OK"))
