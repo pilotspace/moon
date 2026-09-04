@@ -57,9 +57,14 @@ stop-the-world rehash.
 allocation); `CompactValue` is a 16-byte representation that keeps strings ≤ 12 bytes
 inline and uses tagged pointers for collections. Small collections use dense
 encodings — listpack, intset, B+ trees for sorted sets — just like Redis, but with
-Rust's layout control. Net effect, measured: **27–35% less resident memory than Redis
-at values ≥ 1 KB** (below ~64 B, Redis/Valkey small-string encodings are tighter —
-stated in the README benchmarks too).
+Rust's layout control. **This does not currently add up to a memory win over Redis.**
+The "27–35% less resident memory at ≥ 1 KB values" figure previously stated here was
+measured on an Apple M4 Pro development rig and never reproduced on Linux; the Linux
+measurement (`BENCHMARK.md` §2.14 — GCE t2a-standard-8, moon `--shards 8` vs Redis
+`--io-threads 8 --io-threads-do-reads yes`) puts moon at 0.94× at 8 B, **1.16× worse
+at 64 B**, 0.97× at 256 B, and **1.26× worse on idle RSS**. The inline cutoff is the
+whole story: below 12 bytes moon wins, above it moon's per-entry overhead is the
+larger one. Per-key memory at 1 KB+ values has not been re-measured on Linux.
 
 **No hidden costs per operation.** Protocol parsing is zero-copy (`Bytes` slices off
 the read buffer), expiry checks read a shard-cached timestamp instead of calling

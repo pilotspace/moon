@@ -55,7 +55,9 @@ below are unticked). Headline, evidence-cited numbers as of v0.6.0:
 
 | Area | Standing | Source |
 |---|---|---|
-| Pipelined KV throughput | 1.7–2.6× Redis at P=64 across x86/ARM/macOS | `BENCHMARK.md` §1 |
+| Pipelined GET/SET throughput (**Linux only**) | GET 2.40× x86 / 2.29× ARM, SET 1.78× / 2.02× at P=64, v0.8.7 | `BENCHMARK.md` §2.12 |
+| Every non-GET/SET command family | **0.40–0.67× Redis** at p≥8, both arches | `BENCHMARK.md` §2.12 |
+| Per-key memory / idle RSS (**Linux**) | **Not won**: 1.16× worse at 64 B, 1.26× worse idle, vs Redis `io-threads 8` | `BENCHMARK.md` §2.14 |
 | p=1 single-op | Wins x86 +4.7% (n=3); ARM needs `--io-busy-poll-us` | `tmp/KV-FULLPROOF.md` |
 | Vector vs Qdrant | 8.9–10.9× ingest, 2.5–3.4× search QPS at iso-recall ≥0.999 | `BENCHMARK.md` §10.7–10.9 |
 | Graph vs FalkorDB | 21–26× build; wins/ties point queries | `BENCHMARK.md` §11 |

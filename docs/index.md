@@ -10,22 +10,35 @@ hide:
 
 # Moon
 
-<p class="moon-hero__tagline">The Redis-compatible in-memory data store, reimagined in Rust — 250+ commands, vector + full-text search, and cross-store ACID, at up to <strong>2.2× Redis throughput</strong>.</p>
+<p class="moon-hero__tagline">The Redis-compatible in-memory data store, reimagined in Rust — 250+ commands, vector + full-text search, and cross-store ACID, with a thread-per-core core that reaches <strong>2.29–2.40× Redis on pipelined GET</strong>.</p>
 
 [Get started](quickstart.md){ .md-button .md-button--primary }
 [View on GitHub](https://github.com/pilotspace/moon){ .md-button }
 
 <div class="moon-stats" markdown>
-<div markdown>**5.11M** GET ops/sec</div>
-<div markdown>**3.50M** SET ops/sec</div>
-<div markdown>**27–35%** less memory</div>
+<div markdown>**2.40×** Redis, GET p=64</div>
+<div markdown>**1.78×** Redis, SET p=64</div>
 <div markdown>**132/132** consistency tests</div>
+<div markdown>**2613+** correctness tests</div>
 </div>
+
+<p class="moon-hero__tagline" style="font-size:0.8rem;opacity:0.85;margin-top:0.6rem" markdown>Measured on Linux — GCE c3-standard-8 x86_64, Redis 7.0.15, <code>--shards 1</code>, c=50, p=64. <strong>GET and SET only:</strong> every other command family runs 0.40–0.67× Redis at p≥8. <a href="benchmarks/">Conditions and full matrix</a>.</p>
 
 </div>
 </div>
 
-Moon is a Redis-compatible in-memory data store built from scratch in Rust. It implements 250+ commands with a thread-per-core shared-nothing architecture, achieving up to **1.7–2.2× Redis throughput** while using **27–35% less memory** for real-world value sizes. Beyond Redis compatibility, Moon provides cross-store ACID transactions, HNSW vector + BM25 full-text search, a Cypher property graph, workspace partitioning, durable message queues, and bi-temporal MVCC.
+Moon is a Redis-compatible in-memory data store built from scratch in Rust. It implements 250+ commands with a thread-per-core shared-nothing architecture. Beyond Redis compatibility, Moon provides cross-store ACID transactions, HNSW vector + BM25 full-text search, a Cypher property graph, workspace partitioning, durable message queues, and bi-temporal MVCC.
+
+!!! warning "Before quoting any performance number from this site"
+    Every published figure must come from a **Linux** host per `CLAUDE.md`, and
+    every ratio depends on conditions that change it by more than the ratio
+    itself. Two in particular: the pipelined win is **GET/SET only** — on Linux,
+    INCR, LPUSH, SPOP and HSET all run **0.40–0.67× Redis at p≥8** — and moon
+    does **not** currently win on memory against a properly-configured Redis: at
+    `--shards 8` vs `--io-threads 8` it is **1.16× worse at 64-byte values and
+    1.26× worse on idle RSS**. The [benchmarks page](benchmarks.md) labels the
+    host on every table; anything marked *macOS dev reference* is a development
+    record, not a result.
 
 !!! note
     **Production-grade architecture, pre-1.0 maturity.** Single-node Moon (v0.2.0) is recommended for production caching, AI workloads, and Redis-compatible OLTP. Multi-node clustering and multi-shard master PSYNC are **alpha** — see the [production contract](configuration.md) for the honest GA matrix. Wire protocol and on-disk format are LTS as of v0.2; CLI flags may still evolve until v1.0.
@@ -122,7 +135,7 @@ Everything Moon ships today, grouped by area. **252 commands** (per the `COMMAND
 
 | Feature | What it does | Docs |
 |---------|--------------|------|
-| **Vector search** | Native HNSW + TurboQuant (4-bit) index — COSINE/L2/IP, `EF_RUNTIME` tuning, up to 8.5× less memory/vector (11 `FT.*` ops). | [Vector search](vector-search-guide.md) |
+| **Vector search** | Native HNSW + TurboQuant (4-bit) index — COSINE/L2/IP, `EF_RUNTIME` tuning (11 `FT.*` ops). Light mode measured at 452 B/vector vs Redis Stack's 3,840 B on a macOS dev reference rig; not reproduced on Linux. | [Vector search](vector-search-guide.md) |
 | **Full-text search** | BM25 inverted index over `TEXT`/`TAG`/`NUMERIC` fields with typo tolerance. | [Full-text search](guides/full-text-search.md) |
 | **Hybrid fusion** | Three-way BM25 + dense + sparse retrieval fused via Reciprocal Rank Fusion (RRF). | [Full-text search](guides/full-text-search.md) |
 | **Aggregations** | `FT.AGGREGATE` pipelines — `GROUPBY`, `REDUCE`, `SORTBY`, `FILTER`, `LIMIT`. | [Full-text search](guides/full-text-search.md) |
@@ -155,7 +168,7 @@ Everything Moon ships today, grouped by area. **252 commands** (per the `COMMAND
 |---------|--------------|------|
 | **Thread-per-core** | Shared-nothing design with per-shard event loops and SO_REUSEPORT. | [Architecture](architecture.md) |
 | **Dual runtime** | Monoio (io_uring on Linux, kqueue on macOS) for peak throughput; Tokio for portability. | [Architecture](architecture.md#dual-runtime) |
-| **Compact SSO types** | Inline keys (≤23 B) and values (≤12 B) — 27–35% less memory on real-world sizes. | [Architecture](architecture.md) |
+| **Compact SSO types** | Inline keys (≤23 B) and values (≤12 B) — no heap allocation below the cutoff. The Linux per-key memory comparison against Redis `io-threads 8` is a **loss** above 12 bytes; see [benchmarks](benchmarks.md). | [Architecture](architecture.md) |
 | **Lock-free hot path** | DashTable SIMD probing and `flume` channels — no global locks on writes. | [Architecture](architecture.md) |
 
 ### Operations & deployment
@@ -171,15 +184,21 @@ Everything Moon ships today, grouped by area. **252 commands** (per the `COMMAND
 
 ## Key metrics
 
-Headline numbers vs Redis 8.6.1 on GCloud c3-standard-8 (x86_64), peak throughput. Full report: see [benchmarks](benchmarks.md).
+Linux only, each row with the conditions that produced it. Full report and the
+macOS development tables: [benchmarks](benchmarks.md).
 
 | Metric | Result | Conditions |
 |--------|--------|------------|
-| Peak GET throughput | **5.11M ops/sec** | GCloud x86_64, p=64 (1.72× Redis) |
-| Peak SET throughput | **3.50M ops/sec** | GCloud x86_64, p=64 (1.92× Redis) |
-| Peak GET (ARM64) | **3.47M ops/sec** | GCloud Neoverse-N1, p=64 (2.20× Redis) |
-| Memory (1KB+ values) | **27-35% less** | per-key RSS measurement |
-| Vector search (384d) | **12.7K QPS** | HNSW + TurboQuant, COSINE |
+| Peak GET (v0.8.7) | **2.40× Redis** | GCE c3-standard-8 x86_64, Redis 7.0.15, `--shards 1`, c=50, p=64 |
+| Peak GET, ARM64 (v0.8.7) | **2.29× Redis** | GCE t2a-standard-8 Neoverse-N1, same config |
+| Peak SET (v0.8.7) | **1.78× x86 / 2.02× ARM** | same runs |
+| Every other command family | **0.40–0.67× Redis** | INCR/LPUSH/SPOP/HSET at p≥8, both arches |
+| Peak GET, absolute (v0.1.6) | **5.11M ops/sec (1.72×)** | GCloud c3-standard-8 x86_64, p=64; Redis `io-threads` and payload size not recorded |
+| Memory, 64 B values | **1.16× worse than Redis** | GCE t2a-standard-8, `--shards 8` vs Redis `--io-threads 8` |
+| Idle RSS | **1.26× worse than Redis** | same run |
+| CPU per operation | **tie** (10.55 vs 11.33 µs) | same run; moon 6× more stable run to run |
+| Shard scaling (8 shards / 1 shard) | **1.42× / 2.14× / 3.79×** | p=1 / p=8 / p=64, explicitly-keyed families |
+| Vector search (384d) | **12.7K QPS** | GCloud c3-standard-8 x86_64, HNSW + TurboQuant 8-bit, COSINE, 50K vectors, K=10 |
 | Data correctness | **132/132 tests** | all types, 1/4/12 shards |
 
 ## Quick start

@@ -5,26 +5,61 @@ description: "Performance results, methodology, and reproduction steps."
 
 # Benchmarks
 
-!!! note
-    Production benchmark numbers are measured on **Linux (GCloud c3-standard-8 x86_64 / t2a-standard-8 ARM64)** — see the canonical [**BENCHMARK.md**](https://github.com/pilotspace/moon/blob/main/BENCHMARK.md) for the full report (raw throughput, persistence, vector, graph, latency, variance notes). The detailed per-table figures **below** are an Apple M4 Pro (12 cores, 24 GB) development reference; absolute numbers differ from the Linux production figures, but the Moon/Redis ratios are representative. All runs co-locate client and server using `redis-benchmark`, fresh server instance per memory data point.
+!!! warning "Read the provenance label on every table"
+    `CLAUDE.md` requires every published benchmark number to come from a **Linux**
+    host. Only the tables on this page explicitly marked *Linux* satisfy that.
+    Every table marked **macOS dev reference** was measured on an Apple M4 Pro
+    (12 cores, 24 GB) and is kept as a development record only — it must not be
+    quoted as a production result, and its ratios are **not** assumed to carry
+    over to Linux. Two of them demonstrably do not: on Linux, per-key memory is a
+    *loss* (BENCHMARK.md §2.14) and every non-GET/SET command family runs
+    0.40–0.67× Redis at p≥8 (§2.12). All runs co-locate client and server using
+    `redis-benchmark` — a closed-loop tool — with a fresh server instance per
+    memory data point. The canonical report is
+    [**BENCHMARK.md**](https://github.com/pilotspace/moon/blob/main/BENCHMARK.md).
 
-## Executive summary
+## Executive summary — Linux only
 
-Headline figures vs Redis 8.6.1 on the Linux production reference (GCloud c3-standard-8 x86_64, peak throughput):
+Every row below was measured on Linux. Where a condition is not recorded in the
+source report, this table says so rather than filling it in.
 
 | Metric | Moon vs Redis | Conditions |
 |--------|:---:|------------|
-| Peak throughput (GET) | **5.11M ops/sec (1.72×)** | GCloud x86_64, p=64 |
-| Peak throughput (SET) | **3.50M ops/sec (1.92×)** | GCloud x86_64, p=64 |
-| Peak GET (ARM64) | **3.47M ops/sec (2.20×)** | GCloud Neoverse-N1, p=64 |
-| Memory (1KB+ values) | **27-35% less** | 1-shard, per-key RSS |
-| Vector search (384d) | **12.7K QPS** | HNSW + TurboQuant, COSINE |
-| With AOF persistence | **~1.9× Redis** | SET, pipeline=64 |
+| Peak GET (v0.8.7) | **2.40×** | GCE c3-standard-8 x86_64, Redis 7.0.15, `--shards 1`, c=50, p=64 — BENCHMARK.md §2.12 |
+| Peak GET (ARM64, v0.8.7) | **2.29×** | GCE t2a-standard-8 Neoverse-N1, Redis 7.0.15, `--shards 1`, c=50, p=64 — §2.12 |
+| Peak SET (v0.8.7) | **1.78× x86 / 2.02× ARM** | same runs as above — §2.12 |
+| Every other command family | **0.40–0.67×** | INCR/LPUSH/SPOP/HSET at p≥8, both arches — §2.12 |
+| Peak GET (v0.1.6, absolute) | **5.11M ops/sec (1.72×)** | GCloud c3-standard-8 x86_64, p=64. Redis `io-threads` setting and payload size **not recorded** — §2.1 |
+| Peak SET (v0.1.6, absolute) | **3.50M ops/sec (1.92×)** | same run — §2.1 |
+| Memory, 64 B values | **1.16× worse than Redis** | GCE t2a-standard-8, moon `--shards 8` vs Redis `--io-threads 8 --io-threads-do-reads yes`, `-r 200000` — §2.14 |
+| Idle RSS | **1.26× worse than Redis** | same run — §2.14 |
+| CPU per operation | **tie** | 10.55 µs vs 11.33 µs, inside Redis's own 11.9% spread — §2.14 |
+| Shard scaling (s8/s1) | **1.42× / 2.14× / 3.79×** | p=1 / p=8 / p=64, explicitly-keyed families — §2.14 |
+| AOF `everysec` SET p=16 | **1.32× Redis** | GCE c3-standard-8, Redis 7.0.15, `--shards 2` — §7.3 |
+| AOF `always` SET p=16 | **0.91× Redis** | same run — §7.3 |
+| Vector search (384d) | **12.7K QPS** | GCloud c3-standard-8 x86_64, HNSW + TurboQuant 8-bit, COSINE, 50K vectors, K=10 — §10.1 |
 | Data correctness | **132/132 tests** | All types, 1/4/12 shards |
+
+!!! warning "Scope of the pipelined GET/SET win"
+    GET and SET are the two commands Moon serves from an inline byte path that
+    bypasses frame construction and the dispatch table. `SET k v` runs 2.08×
+    Redis while `SET k v EX 100` — same work, one disqualifying option — runs
+    0.87×. The boundary is the fast path, not the engine. See BENCHMARK.md §2.12.
 
 ## Memory efficiency
 
-### Per-key memory (1-shard, string keys)
+!!! danger "macOS dev reference — and Linux disagrees with it"
+    The two tables in this subsection were measured on an **Apple M4 Pro
+    (12 cores, 24 GB)**, not on Linux. The Linux measurement
+    (BENCHMARK.md §2.14: GCE t2a-standard-8, moon `--shards 8` vs Redis
+    `--io-threads 8 --io-threads-do-reads yes`, `-r 200000`, 3 reps) reaches the
+    **opposite** conclusion — 0.94× at 8 B, **1.16× worse at 64 B**, 0.97× at
+    256 B, and **1.26× worse on idle RSS** — and it retracts an earlier per-key
+    memory win as an artifact of `redis-benchmark`'s default 3-byte value.
+    Per-key memory has **not** been re-measured on Linux at `--shards 1` for
+    1 KB+ values, so the "27–35% less" figure below has no Linux backing at all.
+
+### Per-key memory (macOS dev reference, 1-shard, string keys)
 
 | Value size | Keys | Redis/key | Moon/key | Winner | Ratio |
 |:---:|:---:|:---:|:---:|:---:|:---:|
@@ -44,7 +79,7 @@ At 1M keys:
 !!! tip
     Moon's advantage comes from `HeapString(Vec<u8>)` (48 bytes overhead) vs Redis's `robj` + SDS chain (~64-80 bytes overhead). TTL is packed as a 4-byte delta inside `CompactEntry` at zero extra cost, while Redis allocates a separate 24-byte `dictEntry` per expiring key.
 
-### Baseline RSS
+### Baseline RSS (macOS dev reference)
 
 | Server | RSS |
 |--------|-----|
@@ -54,7 +89,12 @@ At 1M keys:
 
 ## Throughput
 
-### Single-shard SET (pipeline=16, 50 clients)
+!!! note "macOS dev reference"
+    Both tables in this subsection were measured on an Apple M4 Pro, not on
+    Linux. The Linux throughput matrix is the executive summary above
+    (BENCHMARK.md §2.12 / §2.14).
+
+### Single-shard SET (macOS dev reference, pipeline=16, 50 clients)
 
 | Value size | Redis SET/s | Moon SET/s | Ratio |
 |:---:|:---:|:---:|:---:|
@@ -63,7 +103,7 @@ At 1M keys:
 | 1,024 B | 1,010,101 | **1,030,928** | 1.02x |
 | 4,096 B | 540,541 | **571,429** | 1.06x |
 
-### Multi-shard peak throughput
+### Multi-shard peak throughput (macOS dev reference)
 
 | Config | Moon | Redis | Ratio |
 |--------|:---:|:---:|:---:|
@@ -73,16 +113,26 @@ At 1M keys:
 
 ## CPU efficiency
 
-| Pipeline | Redis CPU | Moon CPU | Redis RPS | Moon RPS | RPS ratio |
-|:---:|:---:|:---:|:---:|:---:|:---:|
-| p=1 | 97.2% | 91.1% | 169K | 148K | 0.87x |
-| p=8 | 100.0% | **3.3%** | 1.14M | 1.11M | 0.97x |
-| p=16 | 100.0% | **1.9%** | 1.95M | **1.97M** | **1.01x** |
-| p=64 | 43.9% | **1.9%** | 2.42M | **4.13M** | **1.71x** |
+**On Linux, CPU per operation is a tie.** BENCHMARK.md §2.14 measures 10.55 µs/op
+for moon `--shards 8` against 11.33 µs/op for Redis `--io-threads 8`
+(GCE t2a-standard-8, `utime+stime` from `/proc/<pid>/stat`, 5 reps). Moon's 6.9%
+edge sits inside Redis's own 11.9% run-to-run spread, so it is not a win. The
+durable difference is stability: moon's CPU cost varies 2.0% run to run against
+Redis's 11.9%.
 
-At pipeline=64, Moon delivers **1.71x the throughput of Redis while using 23x less CPU**.
+The "45× / 23× better CPU" figure this page used to publish has been **removed**.
+It was derived from an Apple M4 Pro table whose CPU column was sampled with
+`ps -o %cpu=` — a process-lifetime average, not steady-state load — and whose CPU
+and RPS columns were not taken in the same run. The underlying macOS table is kept
+in BENCHMARK.md §5.1 as a development record, with no ratio derived from it.
 
 ## Persistence (AOF) performance
+
+!!! note "macOS dev reference — the Linux figures are the campaign table below"
+    This first table was measured on an Apple M4 Pro. The Linux write-path
+    measurement (GCE c3-standard-8, Redis 7.0.15, `--shards 2`, 3 alternated
+    reps) is the max-durability table that follows it: **1.32×** for `everysec`
+    SET p=16 and **0.91×** for `always` SET p=16.
 
 | Pipeline | Moon SET/s | vs Redis (no AOF) | vs Redis (AOF everysec) |
 |:---:|:---:|:---:|:---:|
@@ -110,13 +160,23 @@ The wins come from per-batch group commit (one fsync per pipeline batch, not per
 
 ## Latency
 
-| Metric | Redis | Moon | Improvement |
-|--------|:---:|:---:|:---:|
-| p50 latency (8-shard) | 0.26-0.33 ms | **0.031 ms** | **8-10x lower** |
+No Moon-vs-Redis latency comparison has been measured on Linux. The 8-shard p50
+figure this page used to publish was an Apple M4 Pro development reference, taken
+with `redis-benchmark` — a closed-loop tool, which under-reports latency once the
+server saturates (see [Coordinated Omission](references.md)). It is retained with
+its provenance in BENCHMARK.md §9.1 and is **not** republished here as a result.
 
-Multi-core parallelism reduces per-shard queue depth, so the median request sees less waiting time.
+Architecturally, multi-core parallelism reduces per-shard queue depth, so the
+median request should wait less. That expectation has not been confirmed on a
+Linux host.
 
-## Production workload patterns
+## Production workload patterns (macOS dev reference)
+
+!!! warning
+    Measured on an Apple M4 Pro, not on Linux, and not reproduced there. On Linux,
+    BENCHMARK.md §2.12 measures several of these command families (INCR, LPUSH,
+    HSET) at **0.40–0.67× Redis** at p≥8, so these ratios should not be read as
+    production expectations.
 
 | Scenario | Description | Moon vs Redis |
 |----------|-------------|:---:|
