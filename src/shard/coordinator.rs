@@ -512,6 +512,14 @@ async fn run_local_persist(
     if matches!(resp, Frame::Error(_)) || !persist_if(&resp) {
         return resp;
     }
+    // Skip the `Vec` + `serialize_command` allocation entirely when there is
+    // nothing to append to — `persist_local_leg` short-circuits on a `None`
+    // pool anyway, so building the command first would be pure waste on the
+    // `appendonly=no` path this early return exists to keep cheap. Same idiom
+    // as `wal_fanout_has_work`.
+    if aof_pool.is_none() {
+        return resp;
+    }
     let mut parts: Vec<Frame> = Vec::with_capacity(args.len() + 1);
     parts.push(bulk_static(cmd));
     parts.extend_from_slice(args);
@@ -633,8 +641,14 @@ async fn coordinate_bitop(
             aof_pool,
             repl_state,
             local_barrier_pending,
-            // BITOP always writes DEST on success (SET, or DEL when the
-            // combine is empty), so every non-error response is persisted.
+            // Deliberately over-log rather than guess. BITOP writes DEST on
+            // success (SET, or DEL when the combine is empty) EXCEPT when the
+            // combine is empty and DEST did not exist — there the `db.remove`
+            // touches nothing, and `:0` cannot distinguish that case from
+            // "deleted a real DEST". Skipping on `:0` would therefore risk
+            // dropping a real delete, which is data loss; logging the extra
+            // no-op costs a record and replays as a harmless delete of an
+            // absent key.
             |_| true,
         )
         .await;
