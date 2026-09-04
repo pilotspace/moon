@@ -6,6 +6,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`test`: the hot/cold/WAL reconciliation invariant, as a property
+  (moon#660 step 2).** Disk offload is a two-source-of-truth durability path.
+  The hazard is not a double-write conflict with the WAL — spilled segments are
+  independently self-durable — it is RECONCILIATION: recovery runs Phase 3
+  (rebuild `cold_index` from the manifest) then Phase 4 (WAL replay on top,
+  hot shadowing cold). Every bug found in that seam so far has been
+  silent-data-loss class — DEL/FLUSH resurrection and expired-cold leak
+  (#212), BITOP/COPY/DEL/UNLINK resurrection (#213), a spill completion
+  resurrecting a DEL'd key (#459) — and every one was caught by soak or
+  adversarial review, never by a proof that the invariant holds in general.
+
+  `tests/cold_reconciliation_property_660.rs` is that proof: a seeded
+  generator drives writes, deletes and expiries under real memory pressure and
+  asserts the server's answer for every key matches a model, both while
+  running and again after `SIGKILL` + full Phase-3/Phase-4 recovery. Failures
+  are named by shape (RESURRECTION, EXPIRED-COLD LEAK, LOST WRITE) and every
+  seed is replayable via `MOON_660_SEEDS`.
+
+  It earned its keep immediately: it is what surfaced the `COPY`/`BITOP`
+  single-shard durability bug fixed in this same release, as a deterministic
+  3-of-3 CI failure rather than a soak-only ghost.
+
+  The generator is hand-rolled rather than `proptest` on purpose — a
+  durability default is not the place to also widen the supply chain, and the
+  part that matters here is reproducibility, not shrinking.
+
+### Changed
+
+- **`config`: `--disk-offload` now rejects values other than `enable` and
+  `disable`.** Only the exact string `enable` ever turned the tier on, so a
+  typo (`--disk-offload enabled`) silently meant "without the tier". Failing at
+  parse time is the difference between a startup error and a cluster quietly
+  holding its whole keyspace in RAM.
+
+  The default is **unchanged** (`enable`). moon#660 proposes making the tier
+  opt-in; that change is held back until it can fail loudly rather than
+  silently — an operator upgrading with existing offload state on disk
+  currently gets no warning, no error and no `INFO` field, only a smaller
+  keyspace. Tracked separately.
+
+- **`test`: `tests/vector_db_isolation.rs` pins `--disk-offload` explicitly**
+  rather than inheriting the default, and adds
+  `ft_index_survives_restart_without_disk_offload`. FT index definitions
+  persist via the offload dir when the tier is on; with it off they need
+  `--appendonly yes` or `--save`. Measured: the index survives with either
+  backstop, and is lost only when the operator configured neither.
+
 ### Fixed
 
 - **`shard`: `COPY` and `BITOP` were silently lost across restart at
