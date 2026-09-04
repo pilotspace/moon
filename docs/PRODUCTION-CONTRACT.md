@@ -57,7 +57,9 @@ below are unticked). Headline, evidence-cited numbers as of v0.6.0:
 |---|---|---|
 | Pipelined GET/SET throughput (**Linux only**) | GET 2.40× x86 / 2.29× ARM, SET 1.78× / 2.02× at P=64, v0.8.7 | `BENCHMARK.md` §2.12 |
 | Every non-GET/SET command family | **0.40–0.67× Redis** at p≥8, both arches | `BENCHMARK.md` §2.12 |
-| Per-key memory / idle RSS (**Linux**) | **Not won**: 1.16× worse at 64 B, 1.26× worse idle, vs Redis `io-threads 8` | `BENCHMARK.md` §2.14 |
+| Per-key memory, values ≥ 1 KB (**Linux x86_64**) | **15–17% less than Redis** (9.5% at the smallest key count), `--shards 1` vs Redis 7.4.2/jemalloc | `BENCHMARK.md` §3.2 |
+| Per-key memory, values ≤ 64 B (**Linux**) | **Not won**: 11–51% worse at 32 B (x86_64, §3.2); 16% worse at 64 B (aarch64, `--shards 8`, §2.14) | `BENCHMARK.md` §3.2, §2.14 |
+| Empty-server RSS (**Linux**) | **Not won**: 12.6–12.9 MB vs Redis 7.5–7.7 MB (~1.7×); cause unknown, tracked in #821 | `BENCHMARK.md` §3.1 |
 | p=1 single-op | Wins x86 +4.7% (n=3); ARM needs `--io-busy-poll-us` | `tmp/KV-FULLPROOF.md` |
 | Vector vs Qdrant | 8.9–10.9× ingest, 2.5–3.4× search QPS at iso-recall ≥0.999 | `BENCHMARK.md` §10.7–10.9 |
 | Graph vs FalkorDB | 21–26× build; wins/ties point queries | `BENCHMARK.md` §11 |

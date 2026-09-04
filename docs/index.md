@@ -18,11 +18,11 @@ hide:
 <div class="moon-stats" markdown>
 <div markdown>**2.40×** Redis, GET p=64</div>
 <div markdown>**1.78×** Redis, SET p=64</div>
+<div markdown>**15–17%** less memory, ≥1 KB values</div>
 <div markdown>**132/132** consistency tests</div>
-<div markdown>**2613+** correctness tests</div>
 </div>
 
-<p class="moon-hero__tagline" style="font-size:0.8rem;opacity:0.85;margin-top:0.6rem" markdown>Measured on Linux — GCE c3-standard-8 x86_64, Redis 7.0.15, <code>--shards 1</code>, c=50, p=64. <strong>GET and SET only:</strong> every other command family runs 0.40–0.67× Redis at p≥8. <a href="benchmarks/">Conditions and full matrix</a>.</p>
+<p class="moon-hero__tagline" style="font-size:0.8rem;opacity:0.85;margin-top:0.6rem" markdown>Measured on Linux, x86_64 — GCE c3-standard-8, <code>--shards 1</code>, c=50. Throughput vs Redis 7.0.15 at p=64; <strong>GET and SET only</strong> — every other command family runs 0.40–0.67× Redis at p≥8. Memory vs Redis 7.4.2/jemalloc, per-key RSS; Moon is <strong>worse</strong> below 256 B values and 1.7× worse when empty. <a href="benchmarks/">Conditions and full matrix</a>.</p>
 
 </div>
 </div>
@@ -33,12 +33,13 @@ Moon is a Redis-compatible in-memory data store built from scratch in Rust. It i
     Every published figure must come from a **Linux** host per `CLAUDE.md`, and
     every ratio depends on conditions that change it by more than the ratio
     itself. Two in particular: the pipelined win is **GET/SET only** — on Linux,
-    INCR, LPUSH, SPOP and HSET all run **0.40–0.67× Redis at p≥8** — and moon
-    does **not** currently win on memory against a properly-configured Redis: at
-    `--shards 8` vs `--io-threads 8` it is **1.16× worse at 64-byte values and
-    1.26× worse on idle RSS**. The [benchmarks page](benchmarks.md) labels the
-    host on every table; anything marked *macOS dev reference* is a development
-    record, not a result.
+    INCR, LPUSH, SPOP and HSET all run **0.40–0.67× Redis at p≥8** — and the
+    memory win is **large-value only**: 15–17% less per key at ≥1 KB values, but
+    **11–51% *more* at 32 B**, and an empty moon server uses **1.7× the RSS of an
+    empty Redis** ([#821](https://github.com/pilotspace/moon/issues/821)). All of
+    it is x86_64; on aarch64 at `--shards 8` moon is 16% worse at 64 B. The
+    [benchmarks page](benchmarks.md) labels the host on every table; anything
+    marked *macOS dev reference* is a development record, not a result.
 
 !!! note
     **Production-grade architecture, pre-1.0 maturity.** Single-node Moon (v0.2.0) is recommended for production caching, AI workloads, and Redis-compatible OLTP. Multi-node clustering and multi-shard master PSYNC are **alpha** — see the [production contract](configuration.md) for the honest GA matrix. Wire protocol and on-disk format are LTS as of v0.2; CLI flags may still evolve until v1.0.
@@ -168,7 +169,7 @@ Everything Moon ships today, grouped by area. **252 commands** (per the `COMMAND
 |---------|--------------|------|
 | **Thread-per-core** | Shared-nothing design with per-shard event loops and SO_REUSEPORT. | [Architecture](architecture.md) |
 | **Dual runtime** | Monoio (io_uring on Linux, kqueue on macOS) for peak throughput; Tokio for portability. | [Architecture](architecture.md#dual-runtime) |
-| **Compact SSO types** | Inline keys (≤23 B) and values (≤12 B) — no heap allocation below the cutoff. The Linux per-key memory comparison against Redis `io-threads 8` is a **loss** above 12 bytes; see [benchmarks](benchmarks.md). | [Architecture](architecture.md) |
+| **Compact SSO types** | Inline keys (≤23 B) and values (≤12 B) — no heap allocation below the cutoff. Per-key memory on Linux x86_64: **15–17% less than Redis at ≥1 KB values, 11–51% more at 32 B**; see [benchmarks](benchmarks.md). | [Architecture](architecture.md) |
 | **Lock-free hot path** | DashTable SIMD probing and `flume` channels — no global locks on writes. | [Architecture](architecture.md) |
 
 ### Operations & deployment
@@ -194,8 +195,11 @@ macOS development tables: [benchmarks](benchmarks.md).
 | Peak SET (v0.8.7) | **1.78× x86 / 2.02× ARM** | same runs |
 | Every other command family | **0.40–0.67× Redis** | INCR/LPUSH/SPOP/HSET at p≥8, both arches |
 | Peak GET, absolute (v0.1.6) | **5.11M ops/sec (1.72×)** | GCloud c3-standard-8 x86_64, p=64; Redis `io-threads` and payload size not recorded |
-| Memory, 64 B values | **1.16× worse than Redis** | GCE t2a-standard-8, `--shards 8` vs Redis `--io-threads 8` |
-| Idle RSS | **1.26× worse than Redis** | same run |
+| Memory, ≥1 KB values | **15–17% less than Redis** | GCE c3-standard-8 x86_64, `--shards 1`, Redis 7.4.2/jemalloc, per-key RSS (9.5% at 63K keys) |
+| Memory, 256 B values | tie (±8%) | same run |
+| Memory, 32 B values | **11–51% worse than Redis** | same run |
+| Empty-server RSS | **1.7× worse than Redis** | same run — 12.6–12.9 MB vs 7.5–7.7 MB ([#821](https://github.com/pilotspace/moon/issues/821)) |
+| Memory, 64 B values (aarch64) | **1.16× worse than Redis** | GCE t2a-standard-8, `--shards 8` vs Redis `--io-threads 8` |
 | CPU per operation | **tie** (10.55 vs 11.33 µs) | same run; moon 6× more stable run to run |
 | Shard scaling (8 shards / 1 shard) | **1.42× / 2.14× / 3.79×** | p=1 / p=8 / p=64, explicitly-keyed families |
 | Vector search (384d) | **12.7K QPS** | GCloud c3-standard-8 x86_64, HNSW + TurboQuant 8-bit, COSINE, 50K vectors, K=10 |
