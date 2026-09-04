@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.9] — 2026-09-04
+
 ### Added
 
 - **`test`: the hot/cold/WAL reconciliation invariant, as a property
@@ -333,8 +335,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is measured, documented and printed, but no longer asserted by a clock. The
   PERF-08 speed claim in `Database::set`'s docs is corrected to say the
   probe-count reduction is universal and the wall-clock win is not.
-- **`storage`: `used_memory` under-reported every container type, so
-  `--maxmemory` could not bind (#788).** The ledger behind the global
 - **`storage`: `used_memory` under-reported every container type, up to 15.2x
   (#788).** The ledger behind the global
   `--maxmemory` gate and the per-db quotas was built from per-element constants
