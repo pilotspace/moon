@@ -46,8 +46,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never exercised an error-mid-command path, which is why it was green; it now
   has four cases that do, including the delete-churn compounding.
 
-### Fixed
-
 - **`shard`: `COPY` and `BITOP` were silently lost across restart at
   `--shards 1` (data loss).**
   `coordinate_copy` and `coordinate_bitop` each opened with a
