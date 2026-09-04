@@ -963,8 +963,9 @@ At 1M keys — **the source of the retired claim**:
 | 256 B | 231.5 MB | 234.4 MB | 372 B | 376 B | Tied |
 | 1,024 B | 954.2 MB | 703.0 MB | 1,571 B | 1,153 B | moon |
 
-The 1,024 B row is the one that became "27-35% less". §3.2 re-measures the same
-cell on Linux against a jemalloc Redis at Redis 1,380 B / moon 1,172 B.
+The two 1,024 B rows are where "27-35% less" came from: 1,153/1,571 = 26.6% at
+1M keys and 1,168/1,786 = 34.6% at 500K. §3.2 re-measures the 1M cell on Linux
+against a jemalloc Redis at Redis 1,380 B / moon 1,172 B — 15.1%.
 
 ### 3.3 Why moon Uses Less Memory at Larger Values (and more at small ones)
 
