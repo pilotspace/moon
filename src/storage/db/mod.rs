@@ -2725,6 +2725,107 @@ mod ledger_consistency_788 {
         );
     }
 
+    /// moon#814: a command that errors PART WAY THROUGH must not strand the
+    /// charge for what it already inserted.
+    ///
+    /// `ZADD` parsed and mutated in one loop and returned on the first bad
+    /// score from INSIDE the `table_before … charge_memory()` window, so
+    /// members already inserted stayed in the keyspace with their charge never
+    /// applied. Measured before the fix: a 100-pair `ZADD` with a bad tail
+    /// billed 3,846 B (the empty-container cost alone) against 21,541 B of
+    /// real content — 82% stranded — and because `db.remove` credits an
+    /// `entry_overhead` recomputed from the CURRENT value, a delete afterwards
+    /// credited back memory that was never charged. That drives `used_memory`
+    /// monotonically DOWN, without bound, driveable by any unprivileged
+    /// client, until `--maxmemory` can never fire.
+    #[test]
+    fn zadd_that_errors_mid_command_keeps_the_ledger_exact() {
+        let mut db = Database::new();
+        let r = crate::command::sorted_set::zadd(
+            &mut db,
+            &[f(b"z"), f(b"1"), f(b"a"), f(b"notanum"), f(b"b")],
+        );
+        assert!(
+            matches!(r, Frame::Error(_)),
+            "a non-float score must be an error, got {r:?}"
+        );
+        assert_ledger_exact(&mut db, "after ZADD that errored mid-command");
+    }
+
+    /// Redis parity, and the reason the fix is a validation pre-pass rather
+    /// than a scope guard: real Redis's `ZADD` is all-or-nothing — it checks
+    /// every score before applying any — so a bad score anywhere means NOTHING
+    /// is inserted. moon inserted the prefix.
+    #[test]
+    fn zadd_with_a_bad_score_inserts_nothing() {
+        let mut db = Database::new();
+        crate::command::sorted_set::zadd(
+            &mut db,
+            &[f(b"z"), f(b"1"), f(b"a"), f(b"notanum"), f(b"b")],
+        );
+        let card = crate::command::sorted_set::zcard(&mut db, &[f(b"z")]);
+        assert_eq!(
+            card,
+            Frame::Integer(0),
+            "ZADD with a bad score must insert nothing (Redis is all-or-nothing), \
+             but ZCARD answered {card:?}"
+        );
+    }
+
+    /// Same window, same consequence, in `GEOADD`.
+    #[test]
+    fn geoadd_that_errors_mid_command_keeps_the_ledger_exact() {
+        let mut db = Database::new();
+        let r = crate::command::geo::geoadd(
+            &mut db,
+            &[
+                f(b"g"),
+                f(b"13.361"),
+                f(b"38.115"),
+                f(b"p1"),
+                f(b"999"),
+                f(b"38.115"),
+                f(b"p2"),
+            ],
+        );
+        assert!(
+            matches!(r, Frame::Error(_)),
+            "longitude 999 is out of range and must be an error, got {r:?}"
+        );
+        assert_ledger_exact(&mut db, "after GEOADD that errored mid-command");
+    }
+
+    /// The compounding half, which is what makes it unbounded rather than a
+    /// one-off under-count: churning partial writes and deleting them must
+    /// leave the ledger where it started.
+    #[test]
+    fn churning_partial_writes_does_not_drift_the_ledger() {
+        let mut db = Database::new();
+        for i in 0..40u32 {
+            let k = format!("hold:{i}");
+            crate::command::sorted_set::zadd(&mut db, &[f(k.as_bytes()), f(b"1"), f(b"m")]);
+        }
+        assert_ledger_exact(&mut db, "floor");
+
+        for round in 0..3 {
+            for i in 0..25u32 {
+                let k = format!("churn:{i}");
+                // A long valid prefix, then a bad score.
+                let mut args = vec![f(k.as_bytes())];
+                for m in 0..20u32 {
+                    let mem = format!("m:{m:04}");
+                    args.push(f(b"1"));
+                    args.push(f(mem.as_bytes()));
+                }
+                args.push(f(b"notanum"));
+                args.push(f(b"tail"));
+                crate::command::sorted_set::zadd(&mut db, &args);
+                crate::command::key::del(&mut db, &[f(k.as_bytes())]);
+            }
+            assert_ledger_exact(&mut db, &format!("after churn round {round}"));
+        }
+    }
+
     #[test]
     fn set_mutations_keep_the_ledger_exact() {
         let mut db = Database::new();

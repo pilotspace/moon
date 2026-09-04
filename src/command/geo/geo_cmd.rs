@@ -62,6 +62,38 @@ pub fn geoadd(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("GEOADD");
     }
 
+    // moon#814: validate EVERY triple BEFORE touching the keyspace — same
+    // window, same consequence as ZADD. Returning from inside the mutation
+    // loop below left members inserted with `mem_charge` never applied, and a
+    // later delete credited back memory that was never charged, drifting
+    // `used_memory` monotonically down. Validating first is also Redis parity:
+    // the key is not created when the command errors.
+    for chunk in remaining.chunks_exact(3) {
+        let Some(lon) = parse_f64(&chunk[0]) else {
+            return Frame::Error(Bytes::from_static(
+                b"ERR value is not a valid float or out of range",
+            ));
+        };
+        if !(-180.0..=180.0).contains(&lon) {
+            return Frame::Error(Bytes::from_static(
+                b"ERR value is not a valid float or out of range",
+            ));
+        }
+        let Some(lat) = parse_f64(&chunk[1]) else {
+            return Frame::Error(Bytes::from_static(
+                b"ERR value is not a valid float or out of range",
+            ));
+        };
+        if !(-85.05112878..=85.05112878).contains(&lat) {
+            return Frame::Error(Bytes::from_static(
+                b"ERR value is not a valid float or out of range",
+            ));
+        }
+        if extract_bytes(&chunk[2]).is_none() {
+            return err_wrong_args("GEOADD");
+        }
+    }
+
     let (members, tree) = match db.get_or_create_sorted_set(key) {
         Ok(pair) => pair,
         Err(e) => return e,

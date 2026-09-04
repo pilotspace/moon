@@ -74,6 +74,47 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("ZADD");
     }
 
+    // moon#814: validate EVERY pair BEFORE touching the keyspace.
+    //
+    // The mutation loop below runs inside the `table_before … charge_memory()`
+    // window, so returning an error from inside it left members inserted with
+    // their charge never applied. Because `db.remove` later credits an
+    // `entry_overhead` recomputed from the CURRENT value, a delete afterwards
+    // credited back memory that was never charged — driving `used_memory`
+    // monotonically DOWN, without bound, on a path any unprivileged client can
+    // trigger, until `--maxmemory` can never fire. Measured before this fix: a
+    // 100-pair ZADD with a bad tail billed 3,846 B against 21,541 B of real
+    // content, and 25 churn rounds drifted the ledger by 42,400 B each.
+    //
+    // Validating first is also Redis parity: real Redis's ZADD is
+    // all-or-nothing, and it does not create the key when the command errors —
+    // which is why this sits above `get_or_create_sorted_set`.
+    //
+    // Two passes rather than a parsed `Vec`: `src/command/` is a no-allocation
+    // path, and parsing an f64 twice is far cheaper than the B+tree insert it
+    // guards.
+    {
+        let mut j = 0;
+        while j < remaining.len() {
+            let Some(score_bytes) = extract_bytes(&remaining[j]) else {
+                return err_wrong_args("ZADD");
+            };
+            if extract_bytes(&remaining[j + 1]).is_none() {
+                return err_wrong_args("ZADD");
+            }
+            let Ok(score_str) = std::str::from_utf8(score_bytes) else {
+                return err("ERR value is not a valid float");
+            };
+            let Ok(score) = score_str.parse::<f64>() else {
+                return err("ERR value is not a valid float");
+            };
+            if score.is_nan() {
+                return err("ERR value is not a valid float");
+            }
+            j += 2;
+        }
+    }
+
     let (members, scores) = match db.get_or_create_sorted_set(key) {
         Ok(pair) => pair,
         Err(e) => return e,
