@@ -6,6 +6,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`test`: the hot/cold/WAL reconciliation invariant, as a property
+  (moon#660 step 2).** Disk offload is a two-source-of-truth durability path.
+  The hazard is not a double-write conflict with the WAL — spilled segments are
+  independently self-durable — it is RECONCILIATION: recovery runs Phase 3
+  (rebuild `cold_index` from the manifest) then Phase 4 (WAL replay on top,
+  hot shadowing cold). Every bug found in that seam so far has been
+  silent-data-loss class — DEL/FLUSH resurrection and expired-cold leak
+  (#212), BITOP/COPY/DEL/UNLINK resurrection (#213), a spill completion
+  resurrecting a DEL'd key (#459) — and every one was caught by soak or
+  adversarial review, never by a proof that the invariant holds in general.
+
+  `tests/cold_reconciliation_property_660.rs` is that proof: a seeded
+  generator drives writes, deletes and expiries under real memory pressure and
+  asserts the server's answer for every key matches a model, both while
+  running and again after `SIGKILL` + full Phase-3/Phase-4 recovery. Failures
+  are named by shape (RESURRECTION, EXPIRED-COLD LEAK, LOST WRITE) and every
+  seed is replayable via `MOON_660_SEEDS`.
+
+  It earned its keep immediately: it is what surfaced the `COPY`/`BITOP`
+  single-shard durability bug fixed in this same release, as a deterministic
+  3-of-3 CI failure rather than a soak-only ghost.
+
+  The generator is hand-rolled rather than `proptest` on purpose — a
+  durability default is not the place to also widen the supply chain, and the
+  part that matters here is reproducibility, not shrinking.
+
+### Changed
+
+- **`config`: `--disk-offload` now rejects values other than `enable` and
+  `disable`.** Only the exact string `enable` ever turned the tier on, so a
+  typo (`--disk-offload enabled`) silently meant "without the tier". Failing at
+  parse time is the difference between a startup error and a cluster quietly
+  holding its whole keyspace in RAM.
+
+  The default is **unchanged** (`enable`). moon#660 proposes making the tier
+  opt-in; that change is held back until it can fail loudly rather than
+  silently — an operator upgrading with existing offload state on disk
+  currently gets no warning, no error and no `INFO` field, only a smaller
+  keyspace. Tracked separately.
+
+- **`test`: `tests/vector_db_isolation.rs` pins `--disk-offload` explicitly**
+  rather than inheriting the default, and adds
+  `ft_index_survives_restart_without_disk_offload`. FT index definitions
+  persist via the offload dir when the tier is on; with it off they need
+  `--appendonly yes` or `--save`. Measured: the index survives with either
+  backstop, and is lost only when the operator configured neither.
+
 ### Fixed
 
 - **`shard`: `COPY` and `BITOP` were silently lost across restart at
@@ -257,6 +306,230 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   encoding bug into a new data-loss path.
 
 ### Performance
+
+- **`server`: inline writes are no longer disabled by the default
+  `--disk-offload enable`.** `can_inline_writes` carried the term
+  `ctx.spill_sender.is_none()`. `--disk-offload` defaults to `enable`, which
+  spawns a per-shard `SpillThread` and hands **every** connection a live
+  sender — so that term was false out of the box and the inline `SET` fast path
+  never ran in the default configuration. (`GET` was unaffected: it is gated by
+  `can_inline_reads`, which never carried the term.)
+
+  The term was a **config** predicate standing in for a **state** one. What a
+  live sender changes is eviction ROUTING, and only that: with one,
+  `run_write_eviction_gate` builds `EvictionRun::async_spill`, whose victims are
+  handed to the `SpillThread` under `--appendonly yes`; the inline path can only
+  build `EvictionRun::plain`, whose victims are DELETED. Inlining a write while
+  eviction fires would silently substitute a drop for a spill.
+
+  Nothing else diverges. `string::set`'s `args.len() == 2` fast path and the
+  inline path build the same `Entry`, queue the same `set` keyspace
+  notification, and call the same `Database::set` — which is where the
+  cold-tier obligations live (`spill_inflight_forget` retires an in-flight
+  spill payload; the `Updated` arm drops a stale `cold_index` shadow). Neither
+  path consults or promotes the cold tier on a write.
+
+  So the gate now enforces the actual invariant — *the inline write path may run
+  only when eviction provably will not fire* — instead of a proxy for it. The
+  lock-free `inline_write_can_skip_eviction` pre-gate the path already ran is
+  hoisted **above** the point where the command bytes leave `read_buf`, so
+  under pressure with a live sender the path returns "not handled" with the
+  buffer byte-for-byte intact and generic dispatch executes the write with the
+  spill-aware evictor. Bailing after the split would have consumed a command
+  nothing then ran — a silently lost write — so the ordering, not a comment,
+  is what enforces it. Cost on the hot path is one bool parameter and one
+  predictable branch; no lock, no allocation.
+
+  Deliberately **not** used as the condition: `disk_offload_spill_inert()` (a
+  startup-config predicate that is true for exactly the `--appendonly no`
+  benchmark shape and false for the durable production one — and unsound across
+  a restart that changes `appendonly` on a dir holding cold data), and
+  `maxmemory_is_set()` (moon's auto-maxmemory default is 75% of RAM, so it is
+  true out of the box and discriminates nothing).
+
+  Measured on the GCE x86_64 Linux host (8 vCPU), `--shards 1 --appendonly no
+  --protected-mode no --disk-free-min-pct 0`, disk-offload left at its default,
+  `redis-benchmark -n 400000 -c 50 -P 16 -r 100000 SET k:__rand_int__ v` after a
+  100k warm-up, A and B legs **interleaved**, 5 reps:
+
+  | rep | before | after | ratio |
+  |-----|--------|-------|-------|
+  | 1 | 770,713 | 1,384,083 | 1.80x |
+  | 2 | 760,456 | 1,369,863 | 1.80x |
+  | 3 | 754,717 | 1,360,544 | 1.80x |
+  | 4 | 759,013 | 1,369,863 | 1.81x |
+  | 5 | 766,284 | 1,365,188 | 1.78x |
+
+  Mean **762,237 -> 1,369,908 ops/s, 1.80x**, no overlap between the two sets.
+  Under `--appendonly yes` (5 further interleaved reps): 620,777 -> 1,266,722,
+  **2.04x**. The mechanism is confirmed, not inferred:
+  `moon_dispatch_path_total{path="local_inline"}` reads **0** on every before-leg
+  and exactly **500,000** (100k warm-up + 400k measured) on every after-leg.
+  `HSET` has no inline path and is unaffected.
+
+  A first measurement run on the same host read 351,518 -> 614,799 (1.75x) with
+  a 15-minute load average of 1.89 — the host was not idle, and a follow-up
+  probe on the quiet host read 2.5x the absolute throughput for the same
+  command. Interleaving preserved the RATIO across both runs; only the table
+  above, taken with the load recorded per leg (0.38-0.67) and zero leaked
+  server processes, is quoted as the absolute number.
+
+  **Known consequence, fail-loud not silent.** A faster write path can outrun
+  the AOF writer. On `--appendonly yes` at `--shards 1`, a sustained pipelined
+  write burst now reaches `AofWriterPool`'s channel bound often enough to
+  surface `-MOONERR AOF backpressure: write applied in memory but not queued
+  for persistence` — the existing PR #211 behaviour, which answers an error
+  rather than a lying `+OK`. Observed on roughly 1 test run in 3 locally, and
+  once as an aborted `redis-benchmark` leg on the Linux host (0 of 16 legs on
+  an idle host). It is not new code and not data loss, but it is newly
+  REACHABLE, and an operator running `--appendonly yes` at this throughput may
+  see it. The AOF writer's capacity, not this gate, is the thing to raise.
+
+  New suite `tests/inline_write_spill_gate_660.rs`, fifteen tests over
+  `--shards 1` and `--shards 4`, resting on the fact that `evicted_keys` (key
+  left the keyspace) and `spilled_keys` (key moved to disk, still readable) are
+  never both incremented for one victim. Widening the gate WITHOUT the bail-out
+  turns it red at **1,093 keys deleted where they should have been spilled**,
+  `spilled_keys` flat at 0; restoring the old gate turns it red with no
+  connection inlining at all, and takes every gate-term test down at its own
+  vacuity control.
+
+  Review follow-up, all of it driven by findings rather than by design. A
+  test-integrity pass showed the two most recent fixes — refreshing the shard
+  database's cached clock before an inline write, and counting inline writes in
+  `total_commands_processed` — had shipped with NO guard: deleting both left
+  the whole suite green. GROUP 7 covers them (`OBJECT IDLETIME` after a 5 s
+  idle; the command counter against 200 inline SETs). G1 gained an inline-path
+  CONTROL, having previously passed unchanged with inline writes disabled
+  outright, and `spill_sender_active: true` — the operand that makes the
+  bail-out fire — gained its first unit test; every existing one passed
+  `false`. The unit tests that drive `try_inline_dispatch` are now serialised,
+  because the `CLIENT PAUSE` guard mutates process-global state that the other
+  twenty-one read.
+
+  Two claims were WITHDRAWN rather than defended. G2's slip bound now applies
+  at `--shards 1` only: the elastic budget lets a lone hot shard borrow its
+  idle siblings' headroom, so at `--shards 4` it spends most of a window
+  legitimately under budget and inlines most of it — measured on the Linux
+  gate at 7,719 of 8,000 writes, with at most 15 plain drops against 156
+  spills. That is the pre-gate working. G2's safety assertion, the one that
+  guards against silent data loss, still runs at both shard counts. And G3 is
+  documented as what it is: `remove_cold_only` is unreachable from
+  `try_inline_dispatch`, so G3 reddens identically on merge-base and is a
+  cold-plane guard riding this fixture, not evidence for the inline change.
+
+  Two harness defects surfaced by the same gate are fixed here: `spawn_moon`
+  reserved its admin port OUTSIDE the retry loop (a held admin port made moon
+  exit at start-up while `spawn_listening` — which polls the child once,
+  moon#811 — handed back the corpse), and the crash-restart leg had no
+  readiness check at all, only `Client::connect`, which proves a listener
+  accepts and, under `SO_REUSEPORT`, not even that the peer is the process just
+  spawned. Both now wait for a real `+PONG`.
+
+  **A term had to be ADDED, and two more are covered for the first time,
+  because this change is what makes them reachable.** `can_inline_writes` is a
+  conjunction, and `ctx.spill_sender.is_none()` was false in the shipped
+  default — so the whole conjunction was false, the inline write path never
+  ran, and every *other* term in it was dead code unless an operator passed
+  `--disk-offload disable`.
+
+  The added term is `!conn.in_cross_txn()`, and unlike the rest this defect is
+  **introduced by this change, not merely exposed by it.** Inside an open `TXN`
+  the generic write leg captures an undo record (`txn.kv_undo.record_update`)
+  and a write intent (`s.kv_write_intents.record_write`) before dispatching;
+  `try_inline_dispatch` does neither. Without the undo record `TXN ABORT`
+  restores nothing, and without the write intent the MVCC snapshot-visibility
+  filter cannot hide the uncommitted value from a foreign transaction. Measured
+  on the release binary at `--shards 1`, stock config, one connection —
+  `SET k original; TXN BEGIN; SET k modified; TXN ABORT; GET k` answers
+  `"original"` with the term and `"modified"` without it, the in-TXN `SET`
+  having been inlined (`local_inline` +1). An acked `TXN ABORT` that rolls back
+  nothing. Found by security review of this branch before it was opened, and
+  guarded by the two `g6_*` tests.
+
+  A second obligation had to be added for the same reason, and this one was
+  caught by the existing suite rather than by review.
+  `segment_stall::stall_refusal` — the only producer of `-MOONERR memfull`,
+  the MA12 disk-free refusal and the moon#718 segment-stall refusal — has
+  exactly two call sites, both in generic dispatch. `try_inline_dispatch` has
+  none, so an inlined `SET` answered `+OK` for a write the server had already
+  committed to refusing under memory or disk pressure. Merge-base 7678156f
+  passes `tests/mem_watchdog.rs` and `tests/compaction_escape_hatch_718.rs`;
+  this branch failed all three of their cases until the inline path grew a
+  `is_any_write_stall_active()` bail-out next to the eviction one. It BAILS to
+  generic dispatch rather than answering the error itself: `stall_refusal`
+  exempts the commands that are a stall's own remedy, and re-deriving that here
+  is the drift the shared helper exists to prevent.
+
+  **Adversarial review then found two more, and a performance review two
+  beyond that.** Same class every time: an obligation the generic leg carries
+  that the inline path does not.
+
+  - **`CLIENT PAUSE` was bypassed.** `check_pause` is consulted once per frame
+    in the generic loop, which sits BELOW the inline block — and that block
+    `continue`s when it consumed the buffer. Measured on one binary under
+    `CLIENT PAUSE 3000 WRITE`: inline `SET` returned in 0.027 s, generic `SET`
+    (MONITOR attached, forcing the slow path) in 2.999 s, `HSET` in 2.002 s.
+    The pause worked; the inline leg escaped it. This silently voids the one
+    guarantee the command exists to provide before a failover or backup.
+  - **The `-LOADING` gate was bypassed.** Across a restart with a 40k-document
+    FT index, 6/6 probes while `loading:1` answered `+OK` here and `-LOADING`
+    on `main`. `SET` touches no index, so this is contract violation rather
+    than corruption — but a client keying "server ready" on `-LOADING`
+    proceeds against a half-recovered server.
+  - **Inlined commands were invisible to `total_commands_processed`** — 200
+    plain `SET`s moved it by 0. Not merely an `INFO` inaccuracy:
+    `this_thread_commands` is the adaptive idle park's (#373) activity signal,
+    so a shard serving nothing but inlined commands read zero commands/tick and
+    could be classified IDLE under full load.
+  - **The shard's cached clock was never refreshed on the inline path.** The
+    generic leg calls `refresh_now_from_cache` once per batch; the inline path
+    called `set_last_access(db.now())` against whatever the stored clock last
+    held. Measured: idle 10 s, then `SET stale:k v` immediately followed by
+    `OBJECT IDLETIME stale:k` answered **18**. Under `allkeys-lru` every
+    inline-written key carried a frozen stamp, degrading victim selection
+    exactly under memory pressure. Fixed at the same per-batch cadence the
+    generic leg uses.
+
+  **Scope of the win, measured rather than assumed.** Interleaved A/B against
+  `5092e4db` in the shipped default, with `moon_dispatch_path_total` proving
+  each leg took the path it claims (noise floor 0.934 A-vs-A):
+
+  | config | ratio |
+  |---|---|
+  | `--shards 1`, P=16 | **1.84–1.97x** |
+  | `--shards 1`, P=16, `--appendonly yes` | **1.79x** |
+  | `--shards 1`, P=1 | 0.97 — no win |
+  | `--shards 4`, P=16 | 0.996 — no win |
+
+  The multi-shard result is structural, not tuning: `try_inline_dispatch`
+  returns 0 on a remote key and the loop BREAKS, so one remote key in a batch
+  ends inlining for the rest of it. At `--shards 4`, P=16 only 2.0% of writes
+  inline (10,400 of 520,000), matching the `(1/N)/(1-1/N)/P` prediction of
+  2.08%. **This change helps `--shards 1` pipelined workloads and is neutral
+  elsewhere** — it is not a general throughput win, and the tuning guide's
+  `--shards 4` recommendation for 8+ connections lands exactly where the
+  benefit is absent. (macOS A/B; every published figure must come from Linux.)
+
+  The two previously-dead terms had no test at all, and both fail dangerously:
+
+  - `!fanout_hint_active()` — deleting it makes a master with an attached
+    replica ack 50 plain `SET`s with `+OK` and deliver none of them. That is
+    not a hypothetical: the task #34 comment above the gate records the same
+    bug being found and fixed once already, in the only configuration that
+    could then reach it.
+  - `!is_replica` — deleting it makes a client `SET` against a **read-only
+    replica** answer `+OK` and land. `try_inline_dispatch` has no read-only
+    guard of its own; the `-READONLY` error is produced exclusively by generic
+    dispatch, so this term is the only thing enforcing it.
+
+  The suite also now carries a crate-level `#![cfg(feature = "runtime-monoio")]`.
+  `record_dispatch_local_inline` has exactly one production call site, in the
+  monoio handler, so under a tokio build the `local_inline` counter is
+  permanently 0 and every control block in the file would have failed. Gating
+  the suite rather than each assertion is deliberate: a test that cannot
+  observe the mechanism it asserts on is not a weaker guard, it is a false
+  one.
 
 - **`storage`: the listpack scan no longer allocates once per element walked.**
   Every listpack lookup decoded each entry it passed into an owned

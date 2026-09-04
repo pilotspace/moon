@@ -465,8 +465,20 @@ pub struct ServerConfig {
     pub cross_shard_fast_path: String,
 
     // ── MoonStore v2: Disk Offload ──────────────────────────────────
-    /// Enable disk offload (tiered storage: RAM -> mmap -> NVMe)
-    #[arg(long = "disk-offload", default_value = "enable")]
+    /// Enable disk offload (tiered storage: RAM -> mmap -> NVMe).
+    ///
+    /// Still DEFAULT-ON. moon#660 proposes making this opt-in; that change is
+    /// held back until it can fail loudly rather than silently — see the
+    /// tracking issue. What lands here is the part that is safe on its own:
+    /// the reconciliation PROOF (`tests/cold_reconciliation_property_660.rs`)
+    /// and argument validation.
+    ///
+    /// `value_parser` matters whichever way the default goes. Only the exact
+    /// string `enable` turns the tier on, so a typo (`--disk-offload enabled`)
+    /// silently means "without the tier". Failing at parse time is the
+    /// difference between a startup error and a cluster quietly holding its
+    /// whole keyspace in RAM.
+    #[arg(long = "disk-offload", default_value = "enable", value_parser = ["enable", "disable"])]
     pub disk_offload: String,
 
     /// Directory for disk offload files (default: same as --dir)
@@ -2759,15 +2771,24 @@ mod tests {
 
     #[test]
     fn disk_offload_spill_inert_true_without_durability_backstop() {
-        // disk-offload defaults to enabled; explicitly turning off both AOF
-        // and RDB durability with no backstop leaves cold-spill inert.
-        let config = ServerConfig::parse_from(["moon", "--appendonly", "no"]);
+        // moon#660: `--disk-offload enable` is now EXPLICIT here. It used to
+        // ride the default, and once that default flipped this test failed —
+        // correctly, because the predicate requires the tier to be on.
+        let config =
+            ServerConfig::parse_from(["moon", "--disk-offload", "enable", "--appendonly", "no"]);
         assert!(config.disk_offload_spill_inert());
     }
 
     #[test]
     fn disk_offload_spill_inert_false_when_appendonly_yes() {
-        let config = ServerConfig::parse_from(["moon", "--appendonly", "yes"]);
+        // The tier is pinned on EXPLICITLY rather than relying on the
+        // default. `spill_inert` requires `disk_offload_enabled()`, so if the
+        // default ever goes off this assertion would read false no matter what
+        // `--appendonly` says — it would hold with the AOF argument deleted
+        // entirely. Pinning states what the test actually checks: that a
+        // durability backstop is what makes spill live.
+        let config =
+            ServerConfig::parse_from(["moon", "--disk-offload", "enable", "--appendonly", "yes"]);
         assert!(!config.disk_offload_spill_inert());
     }
 

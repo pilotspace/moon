@@ -2376,6 +2376,15 @@ pub(crate) fn try_inline_dispatch(
     // client received the RESP2 null bulk for any key its own shard owned.
     resp3: bool,
     runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
+    // moon#660: `true` when this connection has a live `spill_sender`, i.e.
+    // generic dispatch would route eviction victims to the `SpillThread`
+    // (`EvictionRun::async_spill`) instead of dropping them
+    // (`EvictionRun::plain`). This path can only ever build the `plain` sink,
+    // so when this is `true` it MUST NOT resolve eviction itself: it stands
+    // down to generic dispatch the moment the lock-free pre-gate reports
+    // pressure, leaving `read_buf` untouched. See the block comment on
+    // `can_inline_writes` in `handler_monoio/mod.rs` for the full invariant.
+    spill_sender_active: bool,
 ) -> usize {
     let buf = &read_buf[..];
     let len = buf.len();
@@ -2639,6 +2648,160 @@ pub(crate) fn try_inline_dispatch(
         return 0;
     }
 
+    // ---- CLIENT PAUSE pre-gate (moon#660: MUST precede `read_buf` consumption) ----
+    //
+    // `client_pause::check_pause` is consulted once per FRAME in the generic
+    // loop (`handler_monoio/mod.rs`), which is BELOW the inline-dispatch block
+    // — and that block `continue`s when it consumed the whole buffer. So an
+    // inlined `SET` never reached the pause gate at all.
+    //
+    // Measured on one binary, `--shards 1`, stock config, `CLIENT PAUSE 3000 WRITE`:
+    //
+    //     inline `SET`                        0.027 s   <- applied and acked
+    //     generic `SET` (MONITOR attached)    2.999 s   <- held, correct
+    //     `HSET` (never inline-eligible)      2.002 s   <- held, correct
+    //
+    // The pause mechanism works; the inline leg escaped it. `CLIENT PAUSE` is
+    // the primitive an operator uses to freeze the write plane before a
+    // failover or backup, so a write that lands anyway silently voids the one
+    // guarantee the command exists to provide.
+    //
+    // Gated on the lock-free `pause_possibly_active()` rather than
+    // `check_pause` itself: the latter takes a global `RwLock` read, and a
+    // global lock on the write path is exactly what this fast path exists to
+    // avoid. The hint is conservative in the safe direction only — a stale
+    // `true` costs one command its fast leg, a stale `false` cannot happen.
+    //
+    // As with the stall gate, this BAILS rather than answering: `check_pause`
+    // owns mode (ALL vs WRITE), expiry and the remaining duration, and
+    // re-deriving any of that here is the drift these bail-outs exist to
+    // prevent. Generic dispatch also runs `expire_if_needed`, which clears the
+    // hint — so once a pause lapses the inline path re-arms on its own.
+    //
+    // Reads are unaffected: this is the SET-only branch. Inline `GET` bypasses
+    // the pause too, but it does so on `main` as well — a separate pre-existing
+    // bug, filed rather than folded into this change.
+    if crate::client_pause::pause_possibly_active() {
+        return 0;
+    }
+
+    // ---- `-LOADING` pre-gate (moon#660: MUST precede `read_buf` consumption) ----
+    //
+    // Same shape: the moon#476 gate (`is_loading() && !allowed_while_loading`)
+    // lives in the generic frame loop, so an inlined `SET` was served against a
+    // shard whose index recovery was still running. Measured across a restart
+    // with a 40k-document FT index, 6/6 probes while `loading:1`:
+    // `main` answers `-LOADING`, this branch answered `+OK`.
+    //
+    // `SET` writes a string and touches no index, so this is a contract
+    // violation rather than corruption — but a client library that keys its
+    // "server ready" decision on `-LOADING` proceeds against a half-recovered
+    // server. `is_loading()` is a thread-local `Cell` read, so the check is free.
+    if crate::shard::loading::is_loading() {
+        return 0;
+    }
+
+    // ---- Write-stall pre-gate (moon#660: MUST precede `read_buf` consumption) ----
+    //
+    // `segment_stall::stall_refusal` — the ONLY producer of
+    // `-MOONERR memfull: writes paused until memory pressure recovers`, the
+    // MA12 disk-free refusal, and the moon#718 segment-stall refusal — has
+    // exactly two call sites, both in GENERIC dispatch
+    // (`handler_monoio/dispatch.rs`, `handler_sharded/dispatch.rs`). This path
+    // has none, so a plain `SET` inlined while a stall is active answers `+OK`
+    // for a write the server has committed to refusing.
+    //
+    // Measured: merge-base 7678156f passes `tests/mem_watchdog.rs` (case A:
+    // "expected MOONERR memfull on the first write with a 1MB fake limit at
+    // 50% threshold") and `tests/compaction_escape_hatch_718.rs`; widening
+    // `can_inline_writes` without this bail-out fails all three. Introduced
+    // here, not exposed here — the same class as the `!conn.in_cross_txn()`
+    // term: an obligation the generic leg carries that this path does not.
+    //
+    // Bailing to generic dispatch rather than answering the error HERE is
+    // deliberate. `stall_refusal` is not a plain boolean — it exempts the
+    // commands that are a stall's own remedy (moon#718's escape hatch) and
+    // distinguishes the three sources. Re-deriving that here is precisely the
+    // drift the shared helper exists to prevent, so this path defers the whole
+    // decision to the leg that already owns it.
+    //
+    // Reads are untouched: this is the SET-only branch, and
+    // `tests/mem_watchdog.rs` case B asserts GET stays answerable while
+    // memfull is engaged.
+    //
+    // Cost, corrected after review measured it: NOT "three Relaxed AtomicBool
+    // loads" as this comment first claimed. `is_any_write_stall_active` ORs
+    // three sources, and two of them (`disk_monitor`, `mem_monitor`) reach
+    // their state through a `OnceLock::get()` (Acquire) plus an `Arc` pointer
+    // chase; only `segment_stall` is a bare static load. Measured shape: ~7
+    // loads, 2 of them Acquire, across ~4 cache lines with 2 pointer chases —
+    // roughly 2x what was written here. No false sharing (the writers are 1 s
+    // ticks) and still no lock, no allocation. Collapsing the three sources
+    // into one published process-global `AtomicBool` would restore the
+    // originally-claimed cost; filed rather than folded in here.
+    if crate::shard::segment_stall::is_any_write_stall_active() {
+        return 0;
+    }
+
+    // ---- Eviction pre-gate (moon#660: MUST precede `read_buf` consumption) ----
+    //
+    // The lock-free pre-gate proves the common case (no memory pressure / no
+    // limit) without the per-SET `runtime_config.read()` lock pair; only under
+    // pressure — or before the hints are published — is there anything to do.
+    //
+    // It is evaluated HERE, before `split_to` below takes the command bytes out
+    // of `read_buf`, so that the bail-out is a true "not handled": returning 0
+    // with `read_buf` byte-for-byte intact hands this command to generic
+    // dispatch, which re-parses it from the front of the same buffer. Bailing
+    // AFTER the split would consume a command nothing then executes — a
+    // silently lost write. This is the "do not half-inline and then diverge"
+    // constraint, enforced by ordering rather than by a comment.
+    //
+    // `budget` and `est` were already computed on this path; only the branch
+    // below is new.
+    let budget = shard_databases.elastic_budget(shard_id);
+    let est = crate::shard::slice::with_shard_db(selected_db, |db| db.estimated_memory());
+    let needs_eviction = !crate::storage::eviction::inline_write_can_skip_eviction(est, budget);
+
+    // moon#660: THE safety condition. With a live `spill_sender`, generic
+    // dispatch routes victims through `EvictionRun::async_spill` — under
+    // `--appendonly yes` they are handed to the `SpillThread` and stay
+    // cold-readable. This path can only build `EvictionRun::plain`, which
+    // DROPS them. So when eviction may fire and a sender is live, this path
+    // stands down rather than substituting a drop for a spill.
+    //
+    // Note the asymmetry with the branch below, and why it is not redundant:
+    // when NO sender is live the generic gate itself builds
+    // `EvictionRun::plain().report(record_reason_del_conn)` — the exact
+    // construction this path builds — so resolving eviction here is
+    // observably identical and the fast path keeps it (task #34's plain-drop
+    // reporting stays wired and reachable).
+    //
+    // Liveness: under sustained pressure every SET bails and the generic gate
+    // reclaims, which lowers `est` and re-arms this path. Worst case is the
+    // pre-#660 behaviour (always generic), never a livelock.
+    //
+    // Cost of the bail itself: the SET shape has already been parsed by the
+    // time we get here, so a bailing write pays that parse plus this pre-gate
+    // (one budget load, one `estimated_memory` field read, three Relaxed
+    // atomics) before generic dispatch re-parses it. NOT MEASURED — a write
+    // path that is evicting is dominated by victim selection and the spill
+    // queue, and driving a bench into that regime hits AOF backpressure first
+    // (see `tests/inline_write_spill_gate_660.rs`). To quantify it:
+    // `redis-benchmark -n 400000 -c 50 -P 16 -r 100000 SET k:__rand_int__ v`
+    // against `--maxmemory <just under steady-state RSS> --maxmemory-policy
+    // allkeys-lru --appendonly no`, A/B interleaved.
+    //
+    // This branch does NOT consult `appendonly`, though under
+    // `--appendonly no` the generic gate plain-drops too (it passes
+    // `manifest: None`), so the bail buys nothing there. Deliberate: keying
+    // the safety condition on a startup config value is the exact mistake this
+    // change removes, and it would be unsound across a restart that flips
+    // `appendonly` on a dir that already holds cold data.
+    if needs_eviction && spill_sender_active {
+        return 0;
+    }
+
     // Freeze the consumed prefix of `read_buf` into an Arc-backed `Bytes`.
     // This replaces the BytesMut prefix with a refcounted view over the SAME
     // allocation, so `key`, `value`, and the AOF record can all be extracted
@@ -2648,14 +2811,9 @@ pub(crate) fn try_inline_dispatch(
     // We must not index into `buf` after this point — use `frozen` instead.
     let frozen = read_buf.split_to(consumed).freeze();
 
-    // Eviction check + write via the thread-local slice. The lock-free
-    // pre-gate proves the common case (no memory pressure / no limit) without
-    // the per-SET `runtime_config.read()` lock pair; only under pressure —
-    // or before the hints are published — does the full locked path run.
+    // Eviction + write via the thread-local slice.
     {
-        let budget = shard_databases.elastic_budget(shard_id);
-        let est = crate::shard::slice::with_shard_db(selected_db, |db| db.estimated_memory());
-        if !crate::storage::eviction::inline_write_can_skip_eviction(est, budget) {
+        if needs_eviction {
             let rt = runtime_config.read();
             let oom = crate::shard::slice::with_shard_db(selected_db, |db| {
                 crate::storage::eviction::evict_to_budget(
@@ -2813,6 +2971,8 @@ pub(crate) fn try_inline_dispatch_loop(
     // `try_inline_dispatch` so its self-framed GET miss picks the right null.
     resp3: bool,
     runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
+    // moon#660: forwarded verbatim to `try_inline_dispatch`.
+    spill_sender_active: bool,
 ) -> usize {
     if cluster_enabled {
         return 0;
@@ -2833,6 +2993,7 @@ pub(crate) fn try_inline_dispatch_loop(
             can_inline_writes,
             resp3,
             runtime_config,
+            spill_sender_active,
         );
         if n == 0 {
             break;
