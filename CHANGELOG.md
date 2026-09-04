@@ -6,6 +6,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Every published performance claim now names the host it was measured on, and
+  the macOS-sourced ones are no longer presented as Linux results (#817).**
+  `docs/benchmarks.md:9` already labelled its per-table figures an Apple M4 Pro
+  development reference; `docs/journey.md` re-published the same values under a
+  preamble asserting they came from GCloud Linux hosts, and `README.md`,
+  `docs/index.md`, `docs/design-advantages.md` and `docs/comparison-valkey.md`
+  quoted them with no host at all. `CLAUDE.md` and `docs/PRODUCTION-CONTRACT.md`
+  both require every benchmark number to come from a Linux host.
+
+  Three claims are **withdrawn** rather than relabelled, because no defensible
+  provenance exists for them:
+
+  - **"45x / 23x better CPU"** — macOS-measured, sampled with `ps -o %cpu=`
+    (a process-lifetime average, not steady-state load), and computed from a CPU
+    numerator and an RPS denominator taken in different runs. The Linux
+    comparison (§2.14) is a **tie**: 10.55 vs 11.33 us/op, inside Redis's own
+    11.9% spread. The underlying table stays in BENCHMARK.md §5.1 as a
+    development record with no ratio derived from it.
+  - **"p50 latency 8-10x lower"** — macOS-measured and taken with
+    `redis-benchmark`, a closed-loop tool. No Linux latency comparison exists.
+    Raw numbers retained in BENCHMARK.md §9.1.
+  - **"27-35% less memory"** — macOS-measured at `--shards 1`, and contradicted
+    by the Linux measurement it was published alongside: §2.14 concludes
+    "memory is not won" (1.16x worse at 64 B, 1.26x worse on idle RSS) and
+    formally retracts the per-key memory win as an artifact of
+    `redis-benchmark`'s default 3-byte value. Removed from eight sites; the
+    `--shards 1` 1 KB+ tables are kept in BENCHMARK.md §3.2 labelled macOS.
+
+  Also corrected: `docs/journey.md`'s retracted "1->8 shards is
+  flat-to-slightly negative" now states the corrected Linux scaling of
+  **1.42x / 2.14x / 3.79x** (§2.14); `README.md`'s "hash-field TTL
+  (Valkey-parity)" now says feature parity and 4-10% behind Valkey, which is
+  what `docs/perf/2026-05-27-hash-ttl-3way-bench.md` measured; the
+  Moon-vs-Valkey throughput ratio is withdrawn as structurally asymmetric
+  (different hardware, pipeline depth, payload and thread counts); and
+  `docs/references.md` no longer claims open-loop methodology for figures
+  produced by a closed-loop tool. `docs/index.md` gained the scope caveat it
+  had none of. No new measurements were taken and no number was invented,
+  adjusted or extrapolated — every surviving figure already existed in the tree.
+
 ### Fixed
 
 - **`test`: the PERF-08 single-probe timing net was measuring a page-fault
@@ -95,8 +137,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is measured, documented and printed, but no longer asserted by a clock. The
   PERF-08 speed claim in `Database::set`'s docs is corrected to say the
   probe-count reduction is universal and the wall-clock win is not.
-- **`storage`: `used_memory` under-reported every container type, so
-  `--maxmemory` could not bind (#788).** The ledger behind the global
 - **`storage`: `used_memory` under-reported every container type, up to 15.2x
   (#788).** The ledger behind the global
   `--maxmemory` gate and the per-db quotas was built from per-element constants

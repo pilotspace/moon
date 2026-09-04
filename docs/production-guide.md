@@ -301,7 +301,7 @@ moon --appendonly yes --appendfsync everysec --dir /data
 | `everysec` | RPO <= 1 second | Recommended default; **P16 SET ~1.32x Redis**, P1 at parity |
 | `no` | OS flush window (minutes) | Cache-mode only; do not use for primary storage |
 
-Moon's per-shard WAL avoids the global serialization bottleneck that Redis's single AOF file creates. The AOF advantage over Redis **grows** with pipeline depth (2.75x at p=64).
+Moon's per-shard WAL avoids the global serialization bottleneck that Redis's single AOF file creates. The AOF advantage over Redis **grows** with pipeline depth; the Linux measurement is the `everysec` P16 **1.32x** in the table above (`BENCHMARK.md` §7.3). A "2.75x at p=64" figure also circulates — it is an Apple M4 Pro development reference (§7.1), never reproduced on Linux.
 
 **Write-path internals (how the AOF writer keeps up).** These are automatic — no
 tuning knobs — but understanding them explains the durability/throughput tradeoff:

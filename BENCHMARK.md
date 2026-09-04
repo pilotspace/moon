@@ -61,17 +61,16 @@ The SET absolute number can differ 3-4× between methodologies. Only strict-vs-s
 | Peak GET (Linux ARM64) | **2.29x** on v0.8.7 | t2a-standard-8, P=64, §2.12 (was 2.20x on v0.1.6) |
 | Peak GET (macOS) | **7.94M ops/s (2.59x)** | OrbStack, Apple M4 Pro, P=64 |
 | Production defaults GET | **1.93x Redis** | appendonly=yes, disk-offload, P=64 |
-| Memory (1KB+ values) | **27-35% less** | 1-shard, per-key RSS — for `--shards 8` and 8/64/256B see §2.14 |
-| Memory (256B values) | Tied | 1-shard, per-key RSS — §2.14 supersedes for `--shards 8` |
-| Baseline RSS (empty) | **Identical (7.0 MB)** | 1-shard |
-| CPU efficiency at P=64 | **45x better** | 1.9% vs 43.9% CPU for similar RPS |
-| With AOF persistence | **2.75x Redis** | SET, P=64, per-shard WAL |
+| Memory (1KB+ values) | **27-35% less** | **macOS dev reference** (Apple M4 Pro), 1-shard, per-key RSS, §3.2 — **not a Linux figure**. The Linux measurement is §2.14, where moon *loses*: 1.16x worse at 64 B, 1.26x worse on idle RSS |
+| Memory (256B values) | Tied | **macOS dev reference**, 1-shard, per-key RSS, §3.2 — §2.14 is the Linux measurement |
+| Baseline RSS (empty) | **Identical (7.0 MB)** | **macOS dev reference**, 1-shard, §3.1 — on Linux, §2.14 puts moon-s8 idle RSS **1.26x worse** than Redis io-threads 8 |
+| With AOF persistence | **2.75x Redis** | **macOS dev reference**, SET, P=64, per-shard WAL, §7.1 — the Linux write-path figures are §7.3 |
 | AOF everysec SET P16 | **1.32x Redis** | group commit + coalesced write, §7.3 |
 | AOF everysec SET P1 | **0.99x (parity)** | park-free writer poll, §7.3 (was 0.80x) |
 | AOF always SET P16 | **0.91x Redis** | per-batch group commit, §7.3 (was 0.12x) |
 | Pub/sub fan-out delivery | **5.09M msg/s, 1.04x Redis, 0 drops** | 8 subs, coalesced writes, §7.3 (was 438 msg/s) |
-| Multi-shard (8s P=16) | **1.84-1.99x Redis** | GET / SET |
-| p50 latency (8-shard) | **8-10x lower** | 0.031ms vs 0.26ms |
+| Multi-shard (8s P=16) | **1.84-1.99x Redis** | **macOS dev reference**, GET / SET, c=50, §4.2 |
+| p50 latency (8-shard) | **8-10x lower** | **macOS dev reference**, 0.031ms vs 0.26ms, §9.1 — `redis-benchmark` is closed-loop, so this is a median under load, not a tail-latency result |
 | Data correctness | **2613+ tests pass** | All types, 1/4/12 shards |
 | Vector insert (384d) | **6–20× RediSearch** | GCloud, 8-thread concurrent, §10.5 |
 | Vector search (384d) | RediSearch ~16× QPS; recall 0.86 vs 0.96 | concurrent vs RediSearch, §10.5 |
@@ -89,6 +88,15 @@ The SET absolute number can differ 3-4× between methodologies. Only strict-vs-s
 ### 2.1 Raw Throughput (no persistence)
 
 Moon started with `--appendonly no --disk-offload disable`.
+
+> **Conditions this table does not record, and nobody should assume:** the Redis
+> build's `io-threads` setting and the `redis-benchmark` payload size are both
+> absent from this run's provenance, so these ratios are against a Redis whose
+> threading configuration is unknown. The one measurement taken against a Redis
+> explicitly configured with `--io-threads 8 --io-threads-do-reads yes` is
+> §2.14. These v0.1.6 figures are also **superseded for the current tree** by
+> the v0.8.7 re-measurement in §2.12 (GET 2.40x x86 / 2.29x ARM), which also
+> shows every non-inlined command family running 0.40-0.67x Redis at p>=8.
 
 | Metric | x86_64 | ARM64 | Redis (x86_64) | Redis (ARM64) | Ratio (x86) | Ratio (ARM) |
 |--------|:------:|:-----:|:--------------:|:-------------:|:-----------:|:-----------:|
@@ -274,6 +282,12 @@ Reads are free under persistence (GET p=64 2.0-2.2×, matching §2.2). **Single-
 | ARM | 1 | 1.01M | 1.40M | 3.60M | 2.52M |
 | ARM | 4 | 1.00M | 1.38M | 3.45M | 2.42M |
 | ARM | 8 | 969K | 1.33M | 3.42M | 2.41M |
+
+> **Superseded 2026-09-01 (§2.14):** with explicitly-keyed families under a
+> `DBSIZE >= 50000` guard, moon's real s8/s1 scaling is **1.42x at p=1, 2.14x at
+> p=8, 3.79x at p=64**. The paragraph below remains true only for a genuinely
+> *uniform single-key* workload, which cannot be sharded by construction — it is
+> not the general shard-scaling result and was read as one.
 
 Scaling 1→8 shards is **flat-to-slightly-negative** for uniform single-key GET/SET at c=50: x86 GET p=64 holds at 4.7M (loopback-network ceiling), GET p=16 dips −2% (cross-shard SPSC dispatch cost); ARM dips −4 to −5%. This **confirms the CLAUDE.md gotcha** — most keys route cross-shard, so SPSC dispatch overhead dominates the local DashTable lookup; use `--shards 1` unless exploiting pipeline/AOF parallelism or hash-tag co-location. It refines §4.4's optimistic 1.46×-at-8-shards figure, which reflected a different (non-uniform / higher-concurrency) workload, not uniform-key GCloud routing.
 
@@ -810,6 +824,16 @@ Each of these produced a wrong published number in this repository:
 
 ## 3. Memory Efficiency
 
+> **Provenance: §3.1-§3.5 are an Apple M4 Pro (12 cores, 24 GB) development
+> reference, not Linux production measurements.** `CLAUDE.md` requires every
+> published benchmark number to come from a Linux host; these do not, so they
+> must never be quoted as Linux results. **The Linux per-key memory measurement
+> is §2.14, and it disagrees with this section**: at `--shards 8` vs Redis
+> `io-threads 8`, moon is 1.16x *worse* at 64-byte values and 1.26x *worse* on
+> idle RSS. §2.14 also retracts an earlier per-key memory win as an artifact of
+> `redis-benchmark`'s default 3-byte value. Treat the tables below as a record
+> of what the macOS rig measured, superseded on Linux by §2.14.
+
 ### 3.1 Baseline RSS (Empty Server)
 
 | Server | RSS | Notes |
@@ -881,6 +905,12 @@ Per-shard overhead includes: DashTable segments, event loop state, SPSC channels
 
 ## 4. Throughput
 
+> **Provenance: §4.1-§4.4 are an Apple M4 Pro (12 cores, 24 GB) development
+> reference, not Linux production measurements** (§4.3 already says so; it
+> applies to all four). The Linux throughput measurements are §2.1-§2.4 (v0.1.6),
+> §2.12 (v0.8.7, the current tree) and §2.14 (vs Redis `io-threads 8`). §4.5 is
+> a separate cross-arch GCloud pass and is labelled as such.
+
 ### 4.1 Single-Shard SET Throughput (P=16, c=50)
 
 | Value Size | Redis SET/s | moon SET/s | Ratio |
@@ -923,6 +953,13 @@ GETRANGE extracts a 13-byte substring from an 85-byte string. SETRANGE overwrite
 
 Scaling is sub-linear due to cross-shard SPSC dispatch overhead and shared loopback network bandwidth. Separate-machine benchmarks with dedicated NICs would show closer to linear scaling.
 
+> **Corrected 2026-09-01 (§2.14):** the "1→8 shards gains nothing" reading was a
+> harness artifact — `redis-benchmark -t lpush|sadd|hset|zadd` drives ONE literal
+> key and `-r` randomises the *element*, not the key. Re-run with explicit
+> `__rand_int__` keys under a `DBSIZE >= 50000` guard, moon's real s8/s1 scaling
+> is **1.42x at p=1, 2.14x at p=8, 3.79x at p=64** (§2.14). The note below is
+> kept for the record; §2.14 supersedes it.
+>
 > **Refined 2026-06-15 (§2.8.4):** on GCloud c3/t2a with a **uniform single-key** GET/SET workload at c=50, 1→8 shards is flat-to-slightly-negative (x86 GET p=64 holds ~4.7M, p=16 −2%; ARM −4–5%), not the +1.46× above. The positive scaling here reflects a non-uniform / higher-concurrency workload; for uniform cross-shard routing, single-shard is best (CLAUDE.md gotcha). Multi-shard wins come from pipeline/AOF parallelism and hash-tag co-location, not raw uniform-key fan-out.
 
 ### 4.5 2026-06-17 data-structure coverage (cross-arch, shards=1, p=1)
@@ -938,6 +975,15 @@ ZPOPMIN 0.72× (x86). ARM shows several structures at/above parity at p=1 (ZPOPM
 
 ## 5. CPU Efficiency
 
+> **Provenance: §5.1 is an Apple M4 Pro development reference, not a Linux
+> measurement, and no CPU ratio should be derived from it.** The CPU% column was
+> sampled with `ps -o %cpu=`, which reports a process-lifetime average rather
+> than steady-state load, and the CPU and RPS columns were not taken in the same
+> run. **The Linux CPU-per-operation comparison is §2.14, and it is a tie**:
+> 10.55 us/op (moon `--shards 8`) vs 11.33 us/op (Redis `io-threads 8`), with
+> moon's 6.9% edge sitting inside Redis's own 11.9% run-to-run spread. The
+> durable difference there is stability, not cost.
+
 ### 5.1 CPU% and Throughput by Pipeline Depth (1-shard, 200K pre-loaded keys)
 
 | Pipeline | Redis CPU% | moon CPU% | Redis RPS | moon RPS | RPS Ratio | CPU/100K-ops (Redis) | CPU/100K-ops (moon) |
@@ -947,7 +993,9 @@ ZPOPMIN 0.72× (x86). ARM shows several structures at/above parity at p=1 (ZPOPM
 | P=16 | 100.0% | **1.9%** | 1.95M | **1.97M** | **1.01x** | 5.1% | **0.10%** |
 | P=64 | 43.9% | **1.9%** | 2.42M | **4.13M** | **1.71x** | 1.8% | **0.05%** |
 
-At P=64, moon delivers **1.71x the throughput of Redis while using 23x less CPU**.
+No "Nx less CPU" ratio is published from this table: the two columns it would be
+computed from were not sampled in the same run, and the sampling method averages
+over process lifetime. See §2.14 for the Linux CPU comparison.
 
 ### 5.2 Why moon Is More CPU-Efficient
 
@@ -1093,6 +1141,10 @@ Readings:
 
 ### 7.1 With AOF Everysec, Advantage Grows
 
+> **Apple M4 Pro development reference, not a Linux measurement.** The Linux
+> durability write-path numbers are §7.3 (GCE c3-standard-8, Redis 7.0.15,
+> `--shards 2`, 3 alternated reps).
+
 | Pipeline | SET ops/s (moon) | vs Redis (no AOF) | vs Redis (AOF everysec) |
 |:--------:|:----------------------:|:------------------:|:-----------------------:|
 | P=1 | 146K | 0.95x | 0.95x |
@@ -1155,6 +1207,10 @@ Full method notes and per-rep tables: `tmp/MOON-VS-REDIS-DURABILITY.md`, `tmp/WA
 
 ## 8. Production Workload Patterns
 
+> **Apple M4 Pro development reference, not a Linux measurement.** Ratios here
+> have not been reproduced on a Linux host, and §2.12 measures several of these
+> command families (INCR, LPUSH, HSET) at 0.40-0.67x Redis at p>=8 on Linux.
+
 From `scripts/bench-production.sh` (10 scenarios):
 
 | Scenario | Description | moon vs Redis |
@@ -1186,6 +1242,12 @@ Larger values amplify the io_uring zero-copy and writev scatter-gather advantage
 ---
 
 ## 9. Latency
+
+> **Apple M4 Pro development reference, not a Linux measurement.** It is also a
+> closed-loop `redis-benchmark` median: under coordinated omission a closed-loop
+> harness under-reports latency once the server saturates, so this is a
+> median-under-load figure and says nothing about the tail. No Linux latency
+> comparison has been taken.
 
 ### 9.1 p50 Latency (8-shard)
 
