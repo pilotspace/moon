@@ -198,42 +198,54 @@ from `redis-benchmark`, a closed-loop tool that under-reports latency once the
 server saturates. The raw macOS numbers are kept, correctly labelled, in
 BENCHMARK.md §9.1.
 
-### Memory: a macOS win that Linux did not reproduce
+### Memory: a real win at large values, and half the number we published
 
-!!! danger "Provenance — these two rows are a macOS development reference"
-    They were measured on an Apple M4 Pro, not on Linux, and the Linux
-    measurement reaches the opposite conclusion. **BENCHMARK.md §2.14**
-    (GCE t2a-standard-8, moon `--shards 8` vs Redis
-    `--io-threads 8 --io-threads-do-reads yes`, `-r 200000`, 3 reps) puts moon at
-    0.94× at 8-byte values, **1.16× *worse* at 64-byte values**, 0.97× at
-    256-byte, and **1.26× *worse* on idle RSS** — and it retracts an earlier
-    per-key memory win as an artifact of `redis-benchmark`'s default 3-byte
-    value, where both legs measured below their own arithmetic floor. Per-key
-    memory at 1 KB+ values has **not** been re-measured on Linux, so the rows
-    below have no Linux backing.
+The shape held. The headline number did not. Re-measured on Linux
+(**BENCHMARK.md §3** — GCE `c3-standard-8`, x86_64, moon `d5f3501b` at
+`--shards 1`, against **Redis 7.4.2 built with jemalloc 5.3.0**, fresh server per
+point, `redis-benchmark -r N`):
 
-| Value size (1M keys) | Redis/key | Moon/key | Result | Host |
-|---|:---:|:---:|:---:|:---:|
-| 1,024 B | 1,571 B | **1,153 B** | **27% less** | macOS dev reference |
-| 1,024 B (63K keys) | 1,879 B | **1,207 B** | **1.56×** | macOS dev reference |
+| Value size | Keys | Redis/key | Moon/key | Result |
+|---|:---:|---:|---:|:---|
+| 32 B | 63K–632K | 123–129 B | 143–186 B | **Moon 11–51% worse** |
+| 256 B | 63K–632K | 408–410 B | 377–418 B | tie (±8%) |
+| 1 KB | 63K–632K | 1,380–1,388 B | 1,155–1,256 B | **Moon 9.5–16.4% less** |
+| 4 KB | 63K–632K | 5,259–5,266 B | 4,352–4,404 B | **Moon 16.4–17.2% less** |
+
+!!! danger "This page used to say 27–35%. The number that moved was Redis's."
+    The old 1M × 1 KB row was Redis 1,571 B / Moon 1,153 B, measured on an Apple
+    M4 Pro. Measured again on Linux against a jemalloc Redis: Redis **1,380 B**,
+    Moon **1,172 B**. Moon's own number moved **1.6%**; Redis's moved **12%**.
+    Both Redis binaries already on the benchmark host were libc-malloc builds —
+    which inflate Redis RSS and would have biased the comparison in Moon's
+    favour — so Redis was rebuilt against jemalloc for the run. The claim was
+    never a Moon regression; it was an unrepresentative baseline. **x86_64 only.**
 
 ![Bytes per key vs value size — Moon vs Redis](assets/journey-memory.png){ loading=lazy }
 
-*Per-key memory vs value size on the Apple M4 Pro development rig: Redis wins at
-tiny 32 B values, the lines cross near 256 B, and Moon pulls ahead from there.
-The Linux measurement (BENCHMARK.md §2.14) does not reproduce this shape — there
-the crossover runs the other way and Moon loses at 64 B.*
+*Per-key memory vs value size, measured on the Apple M4 Pro development rig:
+Redis wins at tiny 32 B values, the lines cross near 256 B, and Moon pulls ahead
+from there. The Linux measurement above reproduces that **shape** — loss at 32 B,
+tie at 256 B, win from 1 KB. What it does not reproduce is the size of the 1 KB
+win: 15% on Linux against the 27% plotted here. (At 4 KB the two agree, 17% vs
+15%.) The plotted values are the superseded macOS ones.*
 
 `CompactKey` stores keys up to 23 bytes inline and `CompactValue` up to 12
 bytes; larger payloads use `HeapString(Vec<u8>)` (48 B overhead) versus Redis's
 `robj` + SDS chain (64–80 B). TTL packs as a 4-byte delta inside the entry at
 zero extra cost, where Redis allocates a separate 24-byte `dictEntry` per
-expiring key. (At tiny 32 B values Redis still wins on per-key overhead — Moon
-is honest about that; the crossover is ~256 B.) Baseline RSS measured identical
-on the same macOS rig (7.0 MB empty) — on Linux, §2.14 puts moon's 8-shard idle
-RSS **1.26× above** Redis's, roughly 520 KB per extra shard, four threads per
-shard. Tuned jemalloc decay (1 s dirty, background reclaim) returns
-freed pages to the OS instead of hoarding them.
+expiring key. That model explains the large-value win and **not** the 32 B loss,
+where the same arithmetic predicts Moon should win; no cause is asserted.
+Tuned jemalloc decay (1 s dirty, background reclaim) returns freed pages to the
+OS instead of hoarding them.
+
+Baseline RSS is the one that got worse under measurement. This page's ancestor
+claimed 7.0 MB empty for both servers, measured on macOS. On Linux, across all 12
+points of the run above: **Redis 7.5–7.7 MB, Moon 12.6–12.9 MB — ~1.7× worse.**
+Nobody was watching that number; it is now tracked as
+[#821](https://github.com/pilotspace/moon/issues/821). On aarch64 at
+`--shards 8`, BENCHMARK.md §2.14 separately measures idle RSS **1.26× above**
+Redis's, roughly 520 KB per extra shard, four threads per shard.
 
 ### Durability: making it free
 

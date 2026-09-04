@@ -8,6 +8,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **The "27-35% less memory" claim is corrected to a measured 15-17%, on Linux,
+  against a jemalloc Redis (#817, #821).** The figure was re-measured on GCE
+  `c3-standard-8` (Linux 6.17, **x86_64**, 8 vCPU / 31 GB), moon `d5f3501b` at
+  `--shards 1`, via `scripts/bench-resources.sh` with a fresh server per data
+  point and `redis-benchmark -r N` for unique keys. Per-key =
+  (loaded RSS - baseline RSS) / `DBSIZE`. The full twelve-point table and the
+  method are in **BENCHMARK.md §3**, and every other document now links there
+  rather than restating a number.
+
+  Result: **15-17% less memory per key at values >= 1 KB** (9.5% at the smallest
+  key count tested, 63K x 1 KB); a tie at 256 B (0.92-1.02x); and a **loss of
+  11-51% at 32 B**, which is published alongside the win rather than omitted.
+
+  **The old number was wrong because of the oracle, not because of moon.** The
+  previously published 1M x 1 KB row was Redis 1,571 B/key against moon
+  1,153 B/key. Re-measured: Redis **1,380** B/key, moon **1,172** B/key. moon's
+  own figure moved 1.6%; Redis's moved 12%. Both Redis binaries already
+  installed on the benchmark host were **libc-malloc** builds, which inflate
+  Redis RSS and would have biased the comparison in moon's favour, so Redis
+  7.4.2 was rebuilt from source against jemalloc 5.3.0 for this run. The
+  inflation in the retired claim came from a Redis baseline measured on macOS
+  and/or without jemalloc.
+
+  Scope, stated so it is not over-read: `--shards 1`, **x86_64 only** — nothing
+  here may be restated as an ARM result — string values, one data point per
+  (value size, key count) cell with no repetitions, and no sampling between
+  32 B and 256 B. Throughput and CPU columns from the same harness run are
+  **not** published: that harness measures them incidentally and they are not a
+  clean benchmark.
+
+- **BENCHMARK.md §3.1's empty-server RSS is corrected, against moon's interest
+  (#821).** The published "Redis 7.0 MB / moon 1 shard 7.0 MB — identical" was
+  an Apple M4 Pro development reference. Measured on all 12 points of the run
+  above: **Redis 7.5-7.7 MB, moon 12.6-12.9 MB — moon is ~1.7x worse.** The
+  cause is not known and is tracked in #821. The "moon (12 shards) 15.7 MB" row
+  is kept but marked **unverified / stale**: this run did not measure it.
+
+  BENCHMARK.md §3.4's TTL-overhead claim is marked **unverified** for the same
+  reason it could not be confirmed: that section of `scripts/bench-resources.sh`
+  omits `redis-benchmark -r`, so every `SETEX` hits `__rand_key__` and **one**
+  key is loaded instead of 500,000. The structural description is retained as a
+  reading of the source, not as a measurement.
+
 - **Every published performance claim now names the host it was measured on, and
   the macOS-sourced ones are no longer presented as Linux results (#817).**
   `docs/benchmarks.md:9` already labelled its per-table figures an Apple M4 Pro
@@ -17,7 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quoted them with no host at all. `CLAUDE.md` and `docs/PRODUCTION-CONTRACT.md`
   both require every benchmark number to come from a Linux host.
 
-  Three claims are **withdrawn** rather than relabelled, because no defensible
+  Two claims are **withdrawn** rather than relabelled, because no defensible
   provenance exists for them:
 
   - **"45x / 23x better CPU"** — macOS-measured, sampled with `ps -o %cpu=`
@@ -29,12 +72,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **"p50 latency 8-10x lower"** — macOS-measured and taken with
     `redis-benchmark`, a closed-loop tool. No Linux latency comparison exists.
     Raw numbers retained in BENCHMARK.md §9.1.
-  - **"27-35% less memory"** — macOS-measured at `--shards 1`, and contradicted
-    by the Linux measurement it was published alongside: §2.14 concludes
-    "memory is not won" (1.16x worse at 64 B, 1.26x worse on idle RSS) and
-    formally retracts the per-key memory win as an artifact of
-    `redis-benchmark`'s default 3-byte value. Removed from eight sites; the
-    `--shards 1` 1 KB+ tables are kept in BENCHMARK.md §3.2 labelled macOS.
 
   Also corrected: `docs/journey.md`'s retracted "1->8 shards is
   flat-to-slightly negative" now states the corrected Linux scaling of
@@ -45,8 +82,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (different hardware, pipeline depth, payload and thread counts); and
   `docs/references.md` no longer claims open-loop methodology for figures
   produced by a closed-loop tool. `docs/index.md` gained the scope caveat it
-  had none of. No new measurements were taken and no number was invented,
-  adjusted or extrapolated — every surviving figure already existed in the tree.
+  had none of. **For the changes in this bullet** no new measurements were taken
+  and no number was invented, adjusted or extrapolated — every surviving figure
+  already existed in the tree. The per-key memory and baseline-RSS corrections
+  above are the exception: those are a new Linux measurement, and their host,
+  build, oracle and method are stated in BENCHMARK.md §3.
 
 ### Fixed
 
