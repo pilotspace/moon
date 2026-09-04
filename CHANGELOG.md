@@ -57,6 +57,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`server`: a blocking pop propagated NOTHING outside `MULTI` — acked writes
+  undone by restart, replicas permanently diverged (moon#827).** `BLPOP`,
+  `BRPOP`, `BLMOVE`, `BRPOPLPUSH`, `BZPOPMIN`, `BZPOPMAX`, `BLMPOP` and
+  `BZMPOP` mutate the keyspace and ack the client, but the blocking path is an
+  INTERCEPT: it short-circuits the dispatch exit where every other write meets
+  the AOF and the replication stream. Nothing fed them. Measured across all
+  eight commands on both the immediately-satisfiable and the parked-then-woken
+  path — sixteen cases, sixteen losses; the incremental AOF held the sixteen
+  setup records and not one pop. A queue consumer on `BLPOP` — the
+  overwhelmingly common use — redelivered every message it had already consumed
+  after a master restart or on failover.
+
+  The propagated record is the SYNTHESISED non-blocking sibling (`BLPOP` ->
+  `LPOP`, `BZPOPMIN` -> `ZPOPMIN`, `BLMOVE` -> `LMOVE`, …), never the command
+  itself: a replica applying a literal `BLPOP` would park its apply loop and an
+  AOF replaying one would stall recovery. It is derived from the REPLY, not the
+  arguments — a blocking pop takes many keys and only the reply says which one
+  served — which also makes the immediate and parked paths one case rather than
+  two, since both converge on the same reply frame. For `BLMPOP`/`BZMPOP` the
+  record carries the count ACTUALLY popped, never the requested one: a
+  `COUNT 10` that popped 3 must not replay as 10 against a replica that has
+  since received more elements.
+
+  moon already knew this rule and already implemented it — but only for the
+  queued-in-`MULTI` path (`blocking_txn.rs`). The A/B that localised it: same
+  server, same command, only `MULTI` differs — `BLPOP standalone 0` logged
+  nothing, `MULTI / BLPOP intxn 0 / EXEC` logged `LPOP intxn`. Wired at both
+  runtime handlers, beside the moon#644 tracking invalidation that fixed the
+  same structural gap on the same path. Non-writes (timeout, `WRONGTYPE`, a
+  miss) still reach neither plane, and the moon#539 phantom-key guard is
+  unaffected — both verified against the AOF bytes.
+
 - **`stream`: every rejected `XADD` ID left a phantom stream in the keyspace
   that was charged and never persisted (#823).** `db.get_or_create_stream(key)`
   ran BEFORE the ID was parsed, so it inserted the entry, charged
