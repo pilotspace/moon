@@ -8,7 +8,7 @@ use crate::storage::db::{
     hash_field_cost_len,
 };
 
-use crate::command::helpers::{err_wrong_args, extract_bytes, ok};
+use crate::command::helpers::{all_args_are_bytes, err_wrong_args, extract_bytes, ok};
 
 /// HSET key field value [field value ...]
 ///
@@ -23,6 +23,15 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k.as_ref(),
         None => return err_wrong_args("HSET"),
     };
+
+    // moon#823: refuse a non-argument-shaped frame BEFORE the mutation window
+    // opens. The loop below bails on the first one `extract_bytes` rejects,
+    // and by then it has already written part of the command — a partial write
+    // that is applied on the master and, because propagation is gated on the
+    // reply not being an error, never reaches the AOF or a replica.
+    if !all_args_are_bytes(&args[1..]) {
+        return err_wrong_args("HSET");
+    }
 
     // Check if any field or value exceeds LISTPACK_MAX_ELEMENT_SIZE
     let has_large_element = args[1..].iter().any(|a| {
@@ -197,6 +206,15 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k.as_ref(),
         None => return err_wrong_args("HMSET"),
     };
+
+    // moon#823: refuse a non-argument-shaped frame BEFORE the mutation window
+    // opens. The loop below bails on the first one `extract_bytes` rejects,
+    // and by then it has already written part of the command — a partial write
+    // that is applied on the master and, because propagation is gated on the
+    // reply not being an error, never reaches the AOF or a replica.
+    if !all_args_are_bytes(&args[1..]) {
+        return err_wrong_args("HMSET");
+    }
 
     // Check if any field or value exceeds LISTPACK_MAX_ELEMENT_SIZE
     let has_large_element = args[1..].iter().any(|a| {

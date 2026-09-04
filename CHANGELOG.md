@@ -57,6 +57,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`scripting`: a non-string Lua argument reached command argv, and nine
+  commands wrote part of a command before refusing it — silent data loss
+  across restart, and permanent replica divergence (#823).**
+  `redis.call`/`redis.pcall` converted a Lua `nil`, boolean or table argument
+  into `Frame::Null`/`Frame::Integer` and handed it to `dispatch`. No wire
+  client can put those shapes in an argv, so command parsers do not expect
+  them: `extract_bytes` returns `None`, and `HSET`, `HMSET`, `LPUSH`, `RPUSH`,
+  `LPUSHX`, `RPUSHX`, `ZREM`, `MSET` and `MSETNX` each discovered that from
+  INSIDE their mutation loop and returned an arity error with part of the
+  command already written.
+
+  That alone would be the memory-ledger drift of #814. It was worse, because
+  propagation is gated on the reply not being an error: the partial write was
+  applied on the master and **never appended to the AOF and never sent to a
+  replica**. Measured, single shard, `--appendonly yes`:
+
+  ```
+  EVAL "return redis.pcall('LPUSH','mylist','a','b',true)" 0
+    -> ERR wrong number of arguments for 'lpush' command
+  LLEN mylist = 2          <- the error was a lie; two elements are resident
+  [restart]
+  LLEN mylist = 0          <- gone. An unrelated SET in the same session survived.
+  ```
+
+  Driveable by any client that can `EVAL`. Real Redis 8.6.1 refuses the call
+  outright — `ERR Lua redis lib command arguments must be strings or integers`
+  — writing nothing; moon now returns that same error from the same boundary.
+
+  Fixed in two independent layers, because they protect different things.
+  `lua_arg_to_frame` refuses every non-string, non-number argument, which is
+  Redis parity and closes the whole class at the one place that should never
+  have let the shape through. The nine commands additionally validate their
+  whole argv before the mutation window opens, so the keyspace is safe even if
+  some future caller reintroduces the shape. Mutation-tested both ways: with
+  only the boundary reverted, **zero** partial writes occur and only the error
+  message regresses; with both reverted, all nine commands write and the
+  restart check reports nine divergences.
+
+  The old fall-through was reasoned about — the comment argued a nil/boolean
+  argument is un-nameable in a KEY position and the ACL walker denies it. That
+  is true, and it is why this survived. It says nothing about the VALUE
+  position, which is where the writes happened.
+
+  Found by the adversarial review of #820, which observed that #814 was one
+  instance of a class.
+
 - **`storage`: `ZADD` and `GEOADD` stranded their memory charge on any argument
   error, driving `used_memory` monotonically to zero (#814).** Both commands
   parsed **and** mutated in the same loop and returned on the first bad

@@ -5,7 +5,9 @@ use crate::storage::Database;
 use crate::storage::entry::{Entry, current_time_ms};
 
 use super::{format_float, parse_f64, parse_i64, parse_positive_i64};
-use crate::command::helpers::{err_wrong_args, expiry_ms_in_range, extract_bytes, ok};
+use crate::command::helpers::{
+    all_args_are_bytes, err_wrong_args, expiry_ms_in_range, extract_bytes, ok,
+};
 
 /// SET command handler with EX/PX/EXAT/PXAT/NX/XX/KEEPTTL/GET options.
 pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
@@ -233,6 +235,15 @@ pub fn mset(db: &mut Database, args: &[Frame]) -> Frame {
     if args.is_empty() || !args.len().is_multiple_of(2) {
         return err_wrong_args("MSET");
     }
+
+    // moon#823: refuse a non-argument-shaped frame BEFORE the mutation window
+    // opens. The loop below bails on the first one `extract_bytes` rejects,
+    // and by then it has already written part of the command — a partial write
+    // that is applied on the master and, because propagation is gated on the
+    // reply not being an error, never reaches the AOF or a replica.
+    if !all_args_are_bytes(args) {
+        return err_wrong_args("MSET");
+    }
     for pair in args.chunks(2) {
         let key = match extract_bytes(&pair[0]) {
             Some(k) => k,
@@ -257,6 +268,15 @@ pub fn mset(db: &mut Database, args: &[Frame]) -> Frame {
 /// keys span shards (CROSSSLOT); see `coordinate_msetnx`.
 pub fn msetnx(db: &mut Database, args: &[Frame]) -> Frame {
     if args.is_empty() || !args.len().is_multiple_of(2) {
+        return err_wrong_args("MSETNX");
+    }
+
+    // moon#823: refuse a non-argument-shaped frame BEFORE the mutation window
+    // opens. The loop below bails on the first one `extract_bytes` rejects,
+    // and by then it has already written part of the command — a partial write
+    // that is applied on the master and, because propagation is gated on the
+    // reply not being an error, never reaches the AOF or a replica.
+    if !all_args_are_bytes(args) {
         return err_wrong_args("MSETNX");
     }
     // Phase 1: verify NONE of the keys exist.
