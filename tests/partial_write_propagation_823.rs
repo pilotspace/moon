@@ -1,4 +1,4 @@
-//! moon#823 — a non-string Lua argument must never reach a command's argv.
+//! moon#823 — a command must not write anything it cannot propagate.
 //!
 //! ## The bug this file exists to keep closed
 //!
@@ -29,6 +29,26 @@
 //! `ERR Lua redis lib command arguments must be strings or integers`, writing
 //! nothing.
 //!
+//! ## Two triggers, not one
+//!
+//! `EVAL` is the trigger that exposed this, but it is not the only one.
+//! `validate_frame` (`src/protocol/parse.rs`) accepts `+`, `-`, `(`, `:`, `,`
+//! and `#` as top-level array elements, so a RAW WIRE client can put an
+//! integer frame where a bulk string belongs and reach the same code with no
+//! Lua anywhere. Verified: `*5\\r\\n$4\\r\\nMSET\\r\\n$3\\r\\nwa1\\r\\n$1\\r\\n1\\r\\n$3\\r\\nwb1\\r\\n:7\\r\\n`
+//! reaches `mset`, where real Redis answers
+//! `ERR Protocol error: expected '$', got ':'` and closes the connection.
+//! That protocol-layer divergence is filed separately; it is why the
+//! per-command validation below matters independently of the Lua boundary.
+//!
+//! ## And a trigger that needs no odd frame at all
+//!
+//! `XADD` reaches the same shape from plain `redis-cli`: it calls
+//! `db.get_or_create_stream(key)` and only THEN parses the ID, so every
+//! malformed or out-of-order ID creates and charges an empty stream that is
+//! never logged. `xadd_does_not_create_the_key_when_the_id_is_rejected`
+//! covers it.
+//!
 //! ## What each test proves
 //!
 //! * `every_partial_write_command_refuses_a_non_string_argument` — the reply is
@@ -41,7 +61,7 @@
 //!
 //! Both run under either runtime; the boundary is runtime-independent.
 //!
-//! Run alone with: cargo test --test lua_arg_partial_write_823
+//! Run alone with: cargo test --test partial_write_propagation_823
 
 mod common;
 
@@ -294,6 +314,85 @@ fn a_refused_script_write_does_not_reappear_or_vanish_across_restart() {
     assert!(
         failures.is_empty(),
         "a refused script write left the master diverged from its own AOF:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// Every `XADD` ID-rejection path used to create and charge the stream first.
+///
+/// `db.get_or_create_stream(key)` ran BEFORE the ID was parsed, so a malformed
+/// or out-of-order ID left an empty stream in the keyspace with a birth version
+/// burned and an `entry_overhead` charged — and, because propagation is gated
+/// on the reply not being an error, never written to the AOF. Unlike the rest
+/// of this file it needs no Lua and no odd wire frame: plain `redis-cli`
+/// reaches it.
+///
+/// Real Redis 8.6.1 parses the ID first and creates nothing:
+/// `XADD s1 bogus f v` -> error, `EXISTS s1` = 0, `DBSIZE` = 0.
+///
+/// All five shapes below were measured creating the key before the fix.
+#[test]
+fn xadd_does_not_create_the_key_when_the_id_is_rejected() {
+    let dir = unique_test_dir("xadd-823-nocreate");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let (_guard, port) = spawn_listening_guarded(|p| spawn(p, &dir));
+    let mut c = Conn::open(port);
+
+    let mut failures = Vec::new();
+
+    // A fresh key per shape, so one failure cannot mask another.
+    for (i, bad_id) in ["bogus", "0-0", "1-1-1", "abc-1", "-5"].iter().enumerate() {
+        let key = format!("x823:{i}");
+        let reply = c.send(&["XADD", &key, bad_id, "f", "v"]);
+        if !reply.starts_with('-') {
+            failures.push(format!("XADD {bad_id}: expected an error, got {reply:?}"));
+        }
+        let exists = c.send(&["EXISTS", &key]);
+        if exists != ":0\r\n" {
+            failures.push(format!(
+                "XADD {bad_id}: rejected the ID but CREATED {key} — EXISTS answered {exists:?}"
+            ));
+        }
+    }
+
+    // An out-of-order ID against an EXISTING stream must leave it untouched.
+    // This path never created a key (the stream was already there), but it is
+    // the case a fix could plausibly break, so it is pinned.
+    assert!(
+        c.send(&["XADD", "x823:ex", "5-5", "f", "v"])
+            .starts_with('$')
+    );
+    let reply = c.send(&["XADD", "x823:ex", "1-1", "f", "v"]);
+    if !reply.contains("equal or smaller") {
+        failures.push(format!("XADD 1-1 on an existing stream: got {reply:?}"));
+    }
+    let len = c.send(&["XLEN", "x823:ex"]);
+    if len != ":1\r\n" {
+        failures.push(format!("XADD 1-1 changed XLEN: {len:?}"));
+    }
+
+    // And a VALID id must still work — a fix that rejects everything passes
+    // every assertion above.
+    assert!(
+        c.send(&["XADD", "x823:ok", "1-1", "f", "v"])
+            .starts_with('$'),
+        "a valid explicit ID must still be accepted"
+    );
+    assert_eq!(c.send(&["XLEN", "x823:ok"]), ":1\r\n");
+    assert!(
+        c.send(&["XADD", "x823:auto", "*", "f", "v"])
+            .starts_with('$'),
+        "auto-generated IDs must still work"
+    );
+    assert!(
+        c.send(&["XADD", "x823:seq", "7-*", "f", "v"])
+            .starts_with('$'),
+        "the ms-* auto-sequence form must still work"
+    );
+
+    assert!(
+        failures.is_empty(),
+        "XADD created or mutated state it could not propagate:\n  {}",
         failures.join("\n  ")
     );
 }

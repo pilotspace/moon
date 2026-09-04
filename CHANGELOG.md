@@ -57,6 +57,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`stream`: every rejected `XADD` ID left a phantom stream in the keyspace
+  that was charged and never persisted (#823).** `db.get_or_create_stream(key)`
+  ran BEFORE the ID was parsed, so it inserted the entry, charged
+  `entry_overhead` and burned a birth version; the ID errors then returned, and
+  propagation is gated on the reply not being an error, so nothing reached the
+  AOF or a replica. Measured: all five of `bogus`, `0-0`, `1-1-1`, `abc-1` and
+  `-5` created the key, and 3,000 rejected `XADD`s cost 1.46 MB that nothing
+  credits back — an unbounded memory-growth primitive available to any client,
+  through a command that only ever answers an error. Unlike the Lua case above
+  it needs no odd frame: plain `redis-cli` reaches it. Real Redis parses the ID
+  first and creates nothing.
+
+  Fixed by resolving the ID before the key can be created, peeking `last_id`
+  from the existing stream (`0-0` when absent).
+  `StreamData::validate_explicit_id` now delegates to a free
+  `validate_explicit_id_against(last_id, id)` that the pre-check also calls, so
+  the two cannot drift apart. `*` still resolves after creation — it reads the
+  shard clock and cannot fail.
+
 - **`scripting`: a non-string Lua argument reached command argv, and nine
   commands wrote part of a command before refusing it — silent data loss
   across restart, and permanent replica divergence (#823).**
@@ -81,9 +100,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LLEN mylist = 0          <- gone. An unrelated SET in the same session survived.
   ```
 
-  Driveable by any client that can `EVAL`. Real Redis 8.6.1 refuses the call
-  outright — `ERR Lua redis lib command arguments must be strings or integers`
-  — writing nothing; moon now returns that same error from the same boundary.
+  `EVAL` is how this was found, but it is not the only trigger. `validate_frame`
+  (`src/protocol/parse.rs`) accepts `+`, `-`, `(`, `:`, `,` and `#` as top-level
+  array elements, so a RAW WIRE client reaches the same code with no Lua at all:
+  `*5\r\n$4\r\nMSET\r\n$3\r\nwa1\r\n$1\r\n1\r\n$3\r\nwb1\r\n:7\r\n` is
+  delivered to `mset`, where real Redis answers `ERR Protocol error: expected
+  '$', got ':'` and closes the connection. That protocol-layer divergence is
+  filed separately and is NOT fixed here — which is precisely why the
+  per-command validation matters independently of the Lua boundary. Verified:
+  after this change the wire probe above leaves nothing behind.
+
+  Real Redis 8.6.1 refuses the Lua call outright — `ERR Lua redis lib command
+  arguments must be strings or integers` — writing nothing; moon now returns
+  that same error from the same boundary.
 
   Fixed in two independent layers, because they protect different things.
   `lua_arg_to_frame` refuses every non-string, non-number argument, which is

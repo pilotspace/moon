@@ -109,51 +109,75 @@ pub fn xadd(db: &mut Database, args: &[Frame]) -> Frame {
         idx += 2;
     }
 
-    // NOMKSTREAM: if key doesn't exist, return Null
-    if nomkstream {
-        match db.get_stream(key) {
-            Ok(None) => return Frame::Null,
-            Err(e) => return e,
-            Ok(Some(_)) => {} // exists, proceed
+    // moon#823: resolve the ID BEFORE the key can be created.
+    //
+    // `get_or_create_stream` inserts the entry, charges `entry_overhead` and
+    // burns a birth version. Every ID error below used to return AFTER that
+    // call, so a rejected `XADD` left an empty stream in the keyspace —
+    // charged, `DBSIZE`-visible, and, because propagation is gated on the
+    // reply not being an error, never written to the AOF or sent to a replica.
+    // It vanished on the next restart. Measured: all five of `bogus`, `0-0`,
+    // `1-1-1`, `abc-1` and `-5` created the key; 3,000 rejected XADDs cost
+    // 1.46 MB that nothing ever credits back, on a command that only ever
+    // answers an error. Real Redis parses the ID first and creates nothing.
+    //
+    // `last_id` is peeked from the existing stream (`0-0` when there is none),
+    // which is exactly what `validate_explicit_id` compares against, so the
+    // pre-resolution and the stream's own rule cannot disagree — they are the
+    // same function.
+    let last_id = match db.get_stream(key) {
+        Ok(Some(s)) => s.last_id,
+        Ok(None) => {
+            // NOMKSTREAM: if key doesn't exist, return Null.
+            if nomkstream {
+                return Frame::Null;
+            }
+            StreamId { ms: 0, seq: 0 }
         }
-    }
-
-    // Get or create the stream
-    let stream = match db.get_or_create_stream(key) {
-        Ok(s) => s,
         Err(e) => return e,
     };
 
-    // Generate or validate ID
-    let id = if id_arg.as_ref() == b"*" {
-        stream.next_auto_id()
+    // `*` is resolved from the shard clock once the stream exists; it cannot
+    // fail, so it is the one form that may stay below the create.
+    let resolved_id = if id_arg.as_ref() == b"*" {
+        None
     } else {
-        // Check for "ms-*" pattern (auto-seq for explicit ms)
         match StreamId::parse(id_arg, 0) {
             Ok(parsed) => {
-                // For "ms-*", we need auto-seq: if ms == last_id.ms, seq = last_id.seq + 1
+                // "ms-*" takes the sequence from last_id.
                 let s_str = std::str::from_utf8(id_arg).unwrap_or("");
                 if s_str.ends_with("-*") {
                     let ms = parsed.ms;
-                    let seq = if ms == stream.last_id.ms {
-                        stream.last_id.seq + 1
-                    } else if ms > stream.last_id.ms {
+                    let seq = if ms == last_id.ms {
+                        last_id.seq + 1
+                    } else if ms > last_id.ms {
                         0
                     } else {
                         return Frame::Error(Bytes::from_static(
                             b"ERR The ID specified in XADD is equal or smaller than the target stream top item",
                         ));
                     };
-                    StreamId { ms, seq }
+                    Some(StreamId { ms, seq })
                 } else {
-                    match stream.validate_explicit_id(parsed) {
-                        Ok(id) => id,
+                    match crate::storage::stream::validate_explicit_id_against(last_id, parsed) {
+                        Ok(id) => Some(id),
                         Err(e) => return Frame::Error(Bytes::from(e)),
                     }
                 }
             }
             Err(e) => return Frame::Error(Bytes::from(e)),
         }
+    };
+
+    // Get or create the stream — from here on nothing may return an error.
+    let stream = match db.get_or_create_stream(key) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    let id = match resolved_id {
+        Some(id) => id,
+        None => stream.next_auto_id(),
     };
 
     let result_id = stream.add(id, fields);
