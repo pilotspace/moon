@@ -27,13 +27,20 @@ AOF logs every write operation to per-shard WAL files. This is the recommended p
 
 Unlike Redis's single global AOF file, Moon writes a separate WAL per shard. This eliminates the global serialization bottleneck:
 
-| Pipeline depth | Moon vs Redis (with AOF) |
-|:-:|:-:|
-| p=1 | 0.95x (parity) |
-| p=16 | **2.21x** |
-| p=64 | **2.75x** |
+Measured on Linux (GCE c3-standard-8, Redis 7.0.15, moon `--shards 2`, 3
+alternated reps — `BENCHMARK.md` §7.3):
 
-The advantage grows with pipeline depth because each shard appends independently with no lock contention.
+| `appendfsync` / depth | Moon vs Redis |
+|:-:|:-:|
+| `everysec` SET p=1 | 0.99x (parity) |
+| `everysec` SET p=16 | **1.32x** |
+| `always` SET p=1 | parity (fsync-device-bound) |
+| `always` SET p=16 | 0.91x |
+
+The advantage grows with pipeline depth because each shard appends independently
+with no lock contention. A higher set of ratios (2.21x at p=16, 2.75x at p=64)
+appears in `BENCHMARK.md` §7.1; that table is an Apple M4 Pro development
+reference and has not been reproduced on Linux.
 
 ### WAL v3 format
 

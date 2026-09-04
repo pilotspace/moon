@@ -69,7 +69,7 @@ and how they compose.
 - **Forkless persistence.** RDB snapshots iterate DashTable segments incrementally — no `fork()`, no COW memory spike. AOF is a per-shard WAL v3 with batched fsync; the advantage over Redis grows with pipeline depth.
 - **Tiered disk offload — for data AND engines.** Keys evicted under `maxmemory` spill to NVMe instead of being deleted, with async write and read-through; idle vector-index segments demote HOT→WARM (mmap)→COLD (unloaded stub, reload-on-search) and give the memory back — measured **−26% process RSS** on a 40K×768d corpus with identical search results after reload. 100% crash recovery across all tiers.
 - **Multi-tenant isolation that's actually enforced.** Logical dbs get their own `FT.*`/graph/full-text indexes (db 1's indexes are invisible to db 0 — across shards, restarts, and recovery), per-db memory quotas (`--db-maxmemory`) with Redis-style deny-OOM semantics (shrink commands always pass — a tenant can never wedge itself), and workspace key-prefix namespaces on top.
-- **Memory-optimized types.** `CompactKey` (23-byte SSO), `CompactValue` (16-byte SSO with inline TTL), `HeapString`, B+ tree sorted sets, and per-request bumpalo arenas — **27–35% less RSS** than Redis at 1 KB+ values.
+- **Memory-optimized types.** `CompactKey` (23-byte SSO), `CompactValue` (16-byte SSO with inline TTL), `HeapString`, B+ tree sorted sets, and per-request bumpalo arenas — no heap allocation for keys ≤23 B or values ≤12 B. Memory is **not** currently a win against a properly-configured Redis: on Linux at `--shards 8` vs `--io-threads 8`, moon is 1.16× worse at 64-byte values and 1.26× worse on idle RSS ([BENCHMARK.md §2.14](BENCHMARK.md)).
 - **AI-native, in-core.** Vector search (HNSW + TurboQuant), BM25 full-text with three-way RRF hybrid fusion, a Cypher property-graph engine, cross-store ACID, workspaces, durable queues, and bi-temporal MVCC — one binary, no module loader.
 
 <p align="center">
@@ -206,15 +206,30 @@ Headline numbers vs Redis 8.6.1, peak throughput, co-located client/server.
 **Full methodology, ARM64, vector, graph, persistence, and latency tables
 are in [BENCHMARK.md](BENCHMARK.md)** and [docs/benchmarks.md](docs/benchmarks.md).
 
-### Peak throughput (GCloud c3-standard-8, x86_64, monoio io_uring)
+### Peak throughput (Linux — GCloud c3-standard-8, x86_64, monoio io_uring, v0.1.6)
+
+> Absolute figures from BENCHMARK.md §2.1. That run does not record the Redis
+> build's `io-threads` setting or the `redis-benchmark` payload size. The
+> current tree was re-measured as ratios on v0.8.7 (§2.12, Redis 7.0.15,
+> `--shards 1`, c=50): GET **2.40×** x86 / **2.29×** ARM, SET **1.78×** /
+> **2.02×** at p=64.
 
 | Workload                            |   Moon | Redis 8.6.1 |
 |-------------------------------------|-------:|------------:|
 | Peak GET (c=50, p=64)               | 5.11M  | 2.98M (1.72×) |
 | Peak SET (c=50, p=64)               | 3.50M  | 1.82M (1.92×) |
 | GET, production defaults (AOF + offload) | 4.76M | 2.46M (1.93×) |
-| Memory, values ≥ 1 KB               |   —    | **27–35% less** |
 | Crash recovery (SIGKILL, 5K keys)   | 100%   | 100% (parity) |
+
+> **Memory is not a win, and the older claim is retracted.** This table used to
+> carry "27–35% less memory at values ≥ 1 KB". That figure was measured on an
+> Apple M4 Pro development rig, never on Linux. The Linux measurement
+> ([BENCHMARK.md §2.14](BENCHMARK.md) — GCE t2a-standard-8, moon `--shards 8`
+> vs Redis `--io-threads 8 --io-threads-do-reads yes`, `-r 200000`) puts moon at
+> 0.94× at 8 B, **1.16× worse at 64 B**, 0.97× at 256 B, and **1.26× worse on
+> idle RSS**; §2.14 also retracts an earlier per-key memory win as an artifact
+> of `redis-benchmark`'s default 3-byte value. Per-key memory at 1 KB+ values
+> has not been re-measured on Linux.
 
 On **ARM64** (Neoverse-N1) Moon runs ~2.1–2.2× Redis on the same harness.
 
@@ -249,8 +264,14 @@ classic gaps too:
 
 For **vector** (12.7K search QPS @ 384d), **graph** (23× FalkorDB bulk
 insert, 2.4× Cypher QPS; 2.78× on point-filter after the mutable property
-index), and **hash-field TTL** (Valkey-parity) benchmarks, see
-[BENCHMARK.md](BENCHMARK.md).
+index), and **hash-field TTL** benchmarks, see [BENCHMARK.md](BENCHMARK.md).
+Hash-field TTL is a **feature** parity with Valkey, not a performance parity:
+the three-way bench
+([docs/perf/2026-05-27-hash-ttl-3way-bench.md](docs/perf/2026-05-27-hash-ttl-3way-bench.md))
+measures Valkey 9.1.0 ahead of Moon on **every** HEXPIRE-family scenario —
+5–10% at p=16, 4–8% at p=1, with HGETEX the lone exception at 0.99× — and
+records that no command in that section shows Moon leading both Redis and
+Valkey.
 
 > Valkey is not yet head-to-head benched on this harness; its vendor-published
 > 2.1M RPS (9 I/O threads, p=10) is quoted for context in the comparison below.
@@ -272,13 +293,13 @@ reference but ships under SSPL since 2024. Full traced review:
 | Snapshot                   | **Forkless** (segment COW)       | `fork()` + COW              | `fork()` + COW            |
 | Vector / BM25 / graph      | **In-core** (HNSW+TQ, BM25, Cypher) | `valkey-search` module   | RediSearch module / none  |
 | Cross-store ACID           | `TXN.BEGIN/COMMIT/ABORT`         | None                        | None                      |
-| Hash-field TTL             | **Yes** (Valkey-parity)          | **Yes** (9.0+)              | No                        |
+| Hash-field TTL             | **Yes** (feature parity; 4–10% slower than Valkey) | **Yes** (9.0+)              | No                        |
 | Tiered NVMe offload        | **Yes** (KV under `maxmemory` + idle engine segments) | No (OSS)   | No (OSS)                  |
 | Multi-tenant isolation     | **Per-db quotas + db-scoped indexes + workspaces** | ACL only  | ACL only                  |
 | Multi-node cluster (GA)    | **Alpha** (single-node GA today) | **Production**              | **Production**            |
-| Peak single-server GET     | **5.11M/s** (c3-8 x86_64)        | 2.1M RPS (vendor, p=10)     | 2.98M/s (same harness)    |
+| Peak single-server GET     | **5.11M/s** (c3-8 x86_64, p=64)  | 2.1M RPS (vendor, 9 I/O threads, p=10, 512 B) | 2.98M/s (same harness as Moon, p=64) |
 
-- **Choose Moon** for single-node peak throughput, ≥1 KB memory efficiency, forkless snapshots, or AI-native workloads (vector / GraphRAG / hybrid retrieval) with cross-store ACID.
+- **Choose Moon** for single-node peak pipelined GET/SET throughput, forkless snapshots, or AI-native workloads (vector / GraphRAG / hybrid retrieval) with cross-store ACID. Not for memory footprint — see the note above the benchmark table.
 - **Choose Valkey** for proven multi-node clusters, managed-cloud-only deployments, or strict Redis 7.2 module-ecosystem compatibility under LF governance.
 - **Stay on Redis OSS** for existing RediSearch/RedisJSON/RedisBloom investments or Redis Enterprise features (CRDT active-active, Redis Flash).
 

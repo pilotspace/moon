@@ -1,6 +1,6 @@
 # Moon Vector Search — User Guide
 
-Moon provides Redis-compatible vector search with TurboQuant 4-bit compression, achieving up to 8.5× less memory per vector than Redis while matching its search QPS.
+Moon provides Redis-compatible vector search with TurboQuant 4-bit compression. On the macOS development rig described under [Performance Benchmarks](#performance-benchmarks) it stores a 384-d vector in 452 B against Redis Stack's 3,840 B (8.5×) while matching its search QPS; that comparison has **not** been reproduced on a Linux host.
 
 ## Quick Start
 
@@ -193,7 +193,10 @@ Triggered automatically on first search when mutable segment has ≥ `COMPACT_TH
 | Redis Stack (FP32) | — | — | ~3,840 B/vec |
 | Qdrant (FP32) | — | — | ~1,536 B/vec |
 
-**Moon Light uses 8.5× less memory per vector than Redis.**
+**Moon Light stored 8.5× less memory per vector than Redis Stack on the macOS M4 Pro
+rig below (452 B vs 3,840 B).** Not reproduced on Linux; `CLAUDE.md` requires
+production numbers to come from a Linux host, so treat this as a development
+reference rather than a production figure.
 
 ## Performance Benchmarks
 
@@ -210,7 +213,7 @@ Measured on macOS M4 Pro, single-client TCP, all-MiniLM-L6-v2 (384d, 10K vectors
 
 ### Key Trade-offs
 
-- **Moon Light**: Matches Redis QPS (3K), 6.7× faster insert, 8.5× less memory. Trades ~6% R@10 vs Redis.
+- **Moon Light**: Matches Redis QPS (3K), 6.7× faster insert, 8.5× less memory — all on the macOS rig above. Trades ~6% R@10 vs Redis.
 - **Moon Exact**: 1.4× faster QPS than Qdrant, 4.7× faster insert, 2.4× less memory. Trades ~4% R@10.
 - **First search latency**: Light ~1.6s, Exact ~8.6s (HNSW compaction). Subsequent searches are fast.
 
