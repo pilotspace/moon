@@ -8,6 +8,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`shard`: `COPY` and `BITOP` were silently lost across restart at
+  `--shards 1` (data loss).**
+  `coordinate_copy` and `coordinate_bitop` each opened with a
+  `num_shards == 1` fast path that returned `run_local(..)` directly — "zero
+  coordinator overhead on the 1-shard hot path". `run_local` mutates the
+  keyspace and returns; it takes no `aof_pool` and no `repl_state`, so it
+  appended nothing to the AOF/WAL and issued no replication LSN. The write was
+  acked, read back correctly, and was gone after a restart.
+
+  This violated a contract documented 300 lines above it in the same file, on
+  `persist_local_leg`: *"the coordinator's in-process local legs (`run_local`,
+  ..) MUST call this or their writes are lost on restart while the remote legs
+  survive."*
+
+  Measured at `--shards 1 --appendonly yes --appendfsync everysec`, isolated
+  per-runtime binaries, same host and script:
+
+  | runtime | COPY destination lost after SIGKILL + recovery |
+  |---------|-----------------------------------------------|
+  | monoio  | 0 / 6                                         |
+  | tokio   | **6 / 6**                                     |
+
+  On tokio, after `SET k` / `COPY k k2` / `SET k3` the AOF is 55 bytes holding
+  only the two `set`s, and recovery logs `replayed 2 AOF commands` for three
+  writes. `BITOP` behaves identically. The monoio connection handler appends
+  these commands on its own path, which is why the same probe is 0-of-6 there
+  and why only the tokio CI leg ever saw it.
+
+  Fixed with `run_local_persist`: dispatch locally, then honour the same
+  `persist_local_leg` contract the multi-shard same-owner branch already
+  honours via `run_on_owner_persist`. `COPY` persists only on `:1` (`:0` is a
+  refusal that writes nothing); `BITOP` persists on any non-error, since it
+  always writes DEST (SET, or DEL when the combine is empty).
+
+- **`test`: the local-leg durability suite could not see the bug it was named
+  for.** `tests/coordinator_local_leg_durability.rs` already contained
+  `copy_dst_local_leg_persists_across_restart` and had been green throughout,
+  because `const SHARDS: u32 = 4` scoped every case to the one shard count
+  where the coordinator routes through `run_on_owner_persist` and the bug
+  cannot occur. That constant is now `SHARD_MATRIX = [1, 4]` and all seven
+  cases run at both counts (14 tests). With the fix reverted, exactly
+  `copy_dst_local_leg_..._s1` and `bitop_dest_local_leg_..._s1` fail while all
+  twelve others pass, including both `_s4` controls.
+
 - **`test`: the PERF-08 single-probe timing net was measuring a page-fault
   artifact, not the optimisation (moon#789).**
   `tests/perf_v0112_insert_or_update_single_probe.rs` timed the legacy

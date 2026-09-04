@@ -48,7 +48,25 @@ use moon::shard::dispatch::key_to_shard;
 // crash_matrix_per_shard_aof.rs)
 // ---------------------------------------------------------------------------
 
-const SHARDS: u32 = 4;
+/// Shard counts every case below runs at.
+///
+/// This suite pinned `shards = 4` from #284 until 2026-09, and that single
+/// constant is why it never caught the bug it is named for. At `--shards 4`
+/// the coordinator's same-owner branch routes through `run_on_owner_persist`,
+/// which persists. At `--shards 1` `coordinate_copy`/`coordinate_bitop` took
+/// an early return straight to `run_local`, which does not — so `COPY` and
+/// `BITOP` destinations were acked, read back, and then silently gone after a
+/// restart. Measured on the tokio runtime: 6 restarts out of 6 lost the COPY
+/// destination at `--shards 1`, 0 of 6 at `--shards 4`.
+///
+/// **The `_s1` COPY/BITOP cases discriminate only under `runtime-tokio`.** On
+/// monoio, `handler_monoio/dispatch.rs` returns early from the coordinator
+/// path at `num_shards <= 1`, so `run_local_persist` is never reached and the
+/// connection handler logs the command itself — which is exactly why the bug
+/// was invisible for months. Those two cases pass on monoio whether the fix is
+/// present or not, so a green monoio run (including `scripts/ci-local.sh`) is
+/// NOT evidence that this fix still works. Run the tokio leg.
+const SHARD_MATRIX: [u32; 2] = [1, 4];
 /// Keys per co-located group (a multi-key MSET/MSETNX, not a single SET).
 const GROUP_SIZE: usize = 3;
 
@@ -60,7 +78,27 @@ fn moon_binary() -> std::path::PathBuf {
 /// a 1.5s quiescing sleep before the kill gives 100% durability for everything
 /// that was actually appended — so the only pre-fix loss is the local leg that
 /// was never appended at all.
+///
+/// `--disk-free-min-pct 0` disables the disk-free write guard, as ~10 other
+/// durability/crash suites already do. Without it every write on a host below
+/// the ~5%-free threshold answers `MOONERR diskfull`, and this suite either
+/// takes its `is_diskfull` SKIP branches or fails on the replies those
+/// branches do not cover — either way the durability assertions never run. A
+/// guard that quietly stops running on a full developer disk is not a guard.
 fn spawn_moon_aof(port: u16, dir: &std::path::Path, shards: u32) -> Child {
+    spawn_moon_aof_fsync(port, dir, shards, "everysec")
+}
+
+/// As `spawn_moon_aof`, with an explicit `--appendfsync` mode.
+///
+/// `always` is what makes the BARRIER half of the local-leg contract testable.
+/// Under `everysec`, `send_append_group` always returns `Ok(false)`, so
+/// `needs_barrier` is false on every path and
+/// `*local_barrier_pending |= needs_barrier` could be deleted with no test
+/// noticing. Under `always` it returns `Ok(true)` and the caller owes one
+/// `fsync_barrier` before the client is acked — so a kill with NO quiescing
+/// sleep discriminates: an acked write must already be on disk.
+fn spawn_moon_aof_fsync(port: u16, dir: &std::path::Path, shards: u32, fsync: &str) -> Child {
     Command::new(moon_binary())
         .args([
             "--port",
@@ -72,7 +110,9 @@ fn spawn_moon_aof(port: u16, dir: &std::path::Path, shards: u32) -> Child {
             "--appendonly",
             "yes",
             "--appendfsync",
-            "everysec",
+            fsync,
+            "--disk-free-min-pct",
+            "0",
         ])
         .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
         .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
@@ -290,12 +330,13 @@ fn assert_all_survive_restart(
     child1: Child,
     expected: &[(String, String)],
     what: &str,
+    shards: u32,
 ) {
     // > 1s so the everysec fsync window flushed every append that WAS made.
     std::thread::sleep(Duration::from_millis(1500));
     sigkill(child1);
 
-    let _guard = ServerGuard(spawn_moon_aof(port, dir, SHARDS));
+    let _guard = ServerGuard(spawn_moon_aof(port, dir, shards));
     wait_ready(port);
 
     let mut c = Conn::open(port);
@@ -331,18 +372,17 @@ fn assert_all_survive_restart(
 // && contains_key(&my_shard)` fast path → `string::mset(db, args)` with no AOF.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn mset_colocated_local_leg_persists_across_restart() {
+fn mset_colocated_local_leg_persists_across_restart_at(shards: u32) {
     let dir = tempfile::tempdir().expect("tempdir");
     // Only the FIRST spawn of this server's lifecycle goes through
     // spawn_listening; the post-SIGKILL restart below reuses the SAME port
     // via a direct spawn_moon_aof call (port continuity is part of the
     // test's semantics — see assert_all_survive_restart /
     // assert_state_after_restart).
-    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), SHARDS));
+    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), shards));
     wait_ready(port);
 
-    let tags = tags_per_shard(SHARDS as usize);
+    let tags = tags_per_shard(shards as usize);
     let mut expected: Vec<(String, String)> = Vec::new();
 
     // ONE connection for the whole write phase → my_shard is stable.
@@ -377,6 +417,7 @@ fn mset_colocated_local_leg_persists_across_restart() {
         child1,
         &expected,
         "MSET co-located fast-path",
+        shards,
     );
 }
 
@@ -386,18 +427,17 @@ fn mset_colocated_local_leg_persists_across_restart() {
 // other slices scatter remotely (persisted).
 // ---------------------------------------------------------------------------
 
-#[test]
-fn mset_scatter_local_slice_persists_across_restart() {
+fn mset_scatter_local_slice_persists_across_restart_at(shards: u32) {
     let dir = tempfile::tempdir().expect("tempdir");
     // Only the FIRST spawn of this server's lifecycle goes through
     // spawn_listening; the post-SIGKILL restart below reuses the SAME port
     // via a direct spawn_moon_aof call (port continuity is part of the
     // test's semantics — see assert_all_survive_restart /
     // assert_state_after_restart).
-    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), SHARDS));
+    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), shards));
     wait_ready(port);
 
-    let tags = tags_per_shard(SHARDS as usize);
+    let tags = tags_per_shard(shards as usize);
     // One key per shard, all in a single MSET → guaranteed multi-shard scatter
     // with a local slice on whichever shard the connection landed on.
     let expected: Vec<(String, String)> = tags
@@ -432,6 +472,7 @@ fn mset_scatter_local_slice_persists_across_restart() {
         child1,
         &expected,
         "MSET scatter local-slice",
+        shards,
     );
 }
 
@@ -450,11 +491,12 @@ fn assert_state_after_restart(
     present: &[(String, String)],
     absent: &[String],
     what: &str,
+    shards: u32,
 ) {
     std::thread::sleep(Duration::from_millis(1500));
     sigkill(child1);
 
-    let _guard = ServerGuard(spawn_moon_aof(port, dir, SHARDS));
+    let _guard = ServerGuard(spawn_moon_aof(port, dir, shards));
     wait_ready(port);
 
     let mut c = Conn::open(port);
@@ -489,18 +531,17 @@ fn assert_state_after_restart(
 // pre-fix the deleted keys RESURRECT from the seed MSET on restart.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn del_scatter_local_leg_persists_across_restart() {
+fn del_scatter_local_leg_persists_across_restart_at(shards: u32) {
     let dir = tempfile::tempdir().expect("tempdir");
     // Only the FIRST spawn of this server's lifecycle goes through
     // spawn_listening; the post-SIGKILL restart below reuses the SAME port
     // via a direct spawn_moon_aof call (port continuity is part of the
     // test's semantics — see assert_all_survive_restart /
     // assert_state_after_restart).
-    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), SHARDS));
+    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), shards));
     wait_ready(port);
 
-    let tags = tags_per_shard(SHARDS as usize);
+    let tags = tags_per_shard(shards as usize);
     let mut c = Conn::open(port);
 
     // Seed one co-located group per shard (MSET local leg persists post-v3-4).
@@ -531,7 +572,7 @@ fn del_scatter_local_leg_persists_across_restart() {
     }
     assert_eq!(
         c.cmd(&argv),
-        Resp::Int(SHARDS as i64),
+        Resp::Int(shards as i64),
         "scatter DEL should count one key per shard"
     );
     drop(c);
@@ -543,6 +584,7 @@ fn del_scatter_local_leg_persists_across_restart() {
         &kept,
         &to_delete,
         "DEL scatter local-slice",
+        shards,
     );
 }
 
@@ -552,18 +594,17 @@ fn del_scatter_local_leg_persists_across_restart() {
 // fast path (cmd_dispatch in-process, no AOF) → resurrection pre-fix.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn unlink_colocated_fastpath_persists_across_restart() {
+fn unlink_colocated_fastpath_persists_across_restart_at(shards: u32) {
     let dir = tempfile::tempdir().expect("tempdir");
     // Only the FIRST spawn of this server's lifecycle goes through
     // spawn_listening; the post-SIGKILL restart below reuses the SAME port
     // via a direct spawn_moon_aof call (port continuity is part of the
     // test's semantics — see assert_all_survive_restart /
     // assert_state_after_restart).
-    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), SHARDS));
+    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), shards));
     wait_ready(port);
 
-    let tags = tags_per_shard(SHARDS as usize);
+    let tags = tags_per_shard(shards as usize);
     let mut c = Conn::open(port);
 
     let mut deleted: Vec<String> = Vec::new();
@@ -603,6 +644,7 @@ fn unlink_colocated_fastpath_persists_across_restart() {
         &[],
         &deleted,
         "UNLINK co-located fast-path",
+        shards,
     );
 }
 
@@ -613,18 +655,17 @@ fn unlink_colocated_fastpath_persists_across_restart() {
 // shard. Fast-path shape: all keys co-located → whole BITOP via run_on_owner.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn bitop_dest_local_leg_persists_across_restart() {
+fn bitop_dest_local_leg_persists_across_restart_at(shards: u32) {
     let dir = tempfile::tempdir().expect("tempdir");
     // Only the FIRST spawn of this server's lifecycle goes through
     // spawn_listening; the post-SIGKILL restart below reuses the SAME port
     // via a direct spawn_moon_aof call (port continuity is part of the
     // test's semantics — see assert_all_survive_restart /
     // assert_state_after_restart).
-    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), SHARDS));
+    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), shards));
     wait_ready(port);
 
-    let tags = tags_per_shard(SHARDS as usize);
+    let tags = tags_per_shard(shards as usize);
     let n = tags.len();
     let mut c = Conn::open(port);
     let mut expected: Vec<(String, String)> = Vec::new();
@@ -674,7 +715,14 @@ fn bitop_dest_local_leg_persists_across_restart() {
     }
     drop(c);
 
-    assert_all_survive_restart(port, dir.path(), child1, &expected, "BITOP dest leg");
+    assert_all_survive_restart(
+        port,
+        dir.path(),
+        child1,
+        &expected,
+        "BITOP dest leg",
+        shards,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -684,18 +732,17 @@ fn bitop_dest_local_leg_persists_across_restart() {
 // via run_on_owner (un-persisted local case).
 // ---------------------------------------------------------------------------
 
-#[test]
-fn copy_dst_local_leg_persists_across_restart() {
+fn copy_dst_local_leg_persists_across_restart_at(shards: u32) {
     let dir = tempfile::tempdir().expect("tempdir");
     // Only the FIRST spawn of this server's lifecycle goes through
     // spawn_listening; the post-SIGKILL restart below reuses the SAME port
     // via a direct spawn_moon_aof call (port continuity is part of the
     // test's semantics — see assert_all_survive_restart /
     // assert_state_after_restart).
-    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), SHARDS));
+    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), shards));
     wait_ready(port);
 
-    let tags = tags_per_shard(SHARDS as usize);
+    let tags = tags_per_shard(shards as usize);
     let n = tags.len();
     let mut c = Conn::open(port);
     let mut expected: Vec<(String, String)> = Vec::new();
@@ -736,21 +783,20 @@ fn copy_dst_local_leg_persists_across_restart() {
     }
     drop(c);
 
-    assert_all_survive_restart(port, dir.path(), child1, &expected, "COPY dst leg");
+    assert_all_survive_restart(port, dir.path(), child1, &expected, "COPY dst leg", shards);
 }
 
-#[test]
-fn msetnx_colocated_local_leg_persists_across_restart() {
+fn msetnx_colocated_local_leg_persists_across_restart_at(shards: u32) {
     let dir = tempfile::tempdir().expect("tempdir");
     // Only the FIRST spawn of this server's lifecycle goes through
     // spawn_listening; the post-SIGKILL restart below reuses the SAME port
     // via a direct spawn_moon_aof call (port continuity is part of the
     // test's semantics — see assert_all_survive_restart /
     // assert_state_after_restart).
-    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), SHARDS));
+    let (child1, port) = common::spawn_listening(|port| spawn_moon_aof(port, dir.path(), shards));
     wait_ready(port);
 
-    let tags = tags_per_shard(SHARDS as usize);
+    let tags = tags_per_shard(shards as usize);
     let mut expected: Vec<(String, String)> = Vec::new();
 
     let mut c = Conn::open(port);
@@ -784,5 +830,190 @@ fn msetnx_colocated_local_leg_persists_across_restart() {
         child1,
         &expected,
         "MSETNX co-located local leg",
+        shards,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test matrix: every case above, at every shard count in SHARD_MATRIX.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mset_colocated_local_leg_persists_across_restart_s1() {
+    mset_colocated_local_leg_persists_across_restart_at(SHARD_MATRIX[0]);
+}
+
+#[test]
+fn mset_colocated_local_leg_persists_across_restart_s4() {
+    mset_colocated_local_leg_persists_across_restart_at(SHARD_MATRIX[1]);
+}
+
+#[test]
+fn mset_scatter_local_slice_persists_across_restart_s1() {
+    mset_scatter_local_slice_persists_across_restart_at(SHARD_MATRIX[0]);
+}
+
+#[test]
+fn mset_scatter_local_slice_persists_across_restart_s4() {
+    mset_scatter_local_slice_persists_across_restart_at(SHARD_MATRIX[1]);
+}
+
+#[test]
+fn del_scatter_local_leg_persists_across_restart_s1() {
+    del_scatter_local_leg_persists_across_restart_at(SHARD_MATRIX[0]);
+}
+
+#[test]
+fn del_scatter_local_leg_persists_across_restart_s4() {
+    del_scatter_local_leg_persists_across_restart_at(SHARD_MATRIX[1]);
+}
+
+#[test]
+fn unlink_colocated_fastpath_persists_across_restart_s1() {
+    unlink_colocated_fastpath_persists_across_restart_at(SHARD_MATRIX[0]);
+}
+
+#[test]
+fn unlink_colocated_fastpath_persists_across_restart_s4() {
+    unlink_colocated_fastpath_persists_across_restart_at(SHARD_MATRIX[1]);
+}
+
+#[test]
+fn bitop_dest_local_leg_persists_across_restart_s1() {
+    bitop_dest_local_leg_persists_across_restart_at(SHARD_MATRIX[0]);
+}
+
+#[test]
+fn bitop_dest_local_leg_persists_across_restart_s4() {
+    bitop_dest_local_leg_persists_across_restart_at(SHARD_MATRIX[1]);
+}
+
+#[test]
+fn copy_dst_local_leg_persists_across_restart_s1() {
+    copy_dst_local_leg_persists_across_restart_at(SHARD_MATRIX[0]);
+}
+
+#[test]
+fn copy_dst_local_leg_persists_across_restart_s4() {
+    copy_dst_local_leg_persists_across_restart_at(SHARD_MATRIX[1]);
+}
+
+#[test]
+fn msetnx_colocated_local_leg_persists_across_restart_s1() {
+    msetnx_colocated_local_leg_persists_across_restart_at(SHARD_MATRIX[0]);
+}
+
+#[test]
+fn msetnx_colocated_local_leg_persists_across_restart_s4() {
+    msetnx_colocated_local_leg_persists_across_restart_at(SHARD_MATRIX[1]);
+}
+
+// ---------------------------------------------------------------------------
+// appendfsync=always — COPY/BITOP durability with no grace period.
+//
+// WHAT THESE PROVE: a COPY/BITOP destination acked under `appendfsync always`
+// at `--shards 1` survives a SIGKILL issued with NO quiescing sleep. The
+// `everysec` cases above all sleep 1.5s before the kill, so this is the only
+// coverage of the zero-grace-period path.
+//
+// WHAT THESE DO **NOT** PROVE, measured rather than assumed: they do not
+// discriminate `*local_barrier_pending |= needs_barrier` in
+// `run_local_persist`. Deleting that line (`Ok(_) => {}`) and rebuilding the
+// tokio binary leaves this whole file green, 16/16. The reason is that the ack
+// is followed by a `GET` round-trip before the kill, which gives the AOF
+// writer ample time to fsync on its own; isolating the barrier needs a kill
+// landing between the ack and the writer's own fsync, which a black-box test
+// cannot reliably hit, and there is no barrier counter to assert on instead.
+//
+// So the barrier propagation is currently covered by code-read plus the unit
+// tests on the pool itself (`aof::pool` — `fsync_barrier_everysec_is_noop`,
+// `fsync_barrier_always_writer_acks_synced_returns_ok`), NOT end-to-end.
+// Tracked for a proper mechanism counter.
+//
+// NOTE ON DISCRIMINATION: like the `_s1` cases above, these exercise
+// `run_local_persist` only under `runtime-tokio`. On monoio,
+// `handler_monoio/dispatch.rs` returns early from the coordinator path at
+// `num_shards <= 1`, so the connection handler logs the command on its own
+// path and these pass regardless of the coordinator. Run the tokio leg to
+// discriminate.
+// ---------------------------------------------------------------------------
+
+/// Kill with NO quiescing sleep: under `always` the ack itself is the
+/// durability claim.
+fn survives_immediate_kill_under_always(cmd_label: &str, seed: &[&[&str]], dest: &str, want: &str) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child1, port) =
+        common::spawn_listening(|port| spawn_moon_aof_fsync(port, dir.path(), 1, "always"));
+    wait_ready(port);
+
+    {
+        let mut c = Conn::open(port);
+        for parts in seed {
+            let r = c.cmd(parts);
+            if is_diskfull(&r) {
+                eprintln!("SKIP {cmd_label} always-case: MOONERR diskfull");
+                return;
+            }
+        }
+        // Read the destination back so the write is unambiguously acked and
+        // visible before the kill.
+        match c.cmd(&["GET", dest]) {
+            Resp::Bulk(Some(got)) if got.starts_with(want.as_bytes()) => {}
+            other => panic!(
+                "[{cmd_label}] destination not visible while running: GET {dest} \
+                 answered {other:?}, expected a bulk starting with {want:?}"
+            ),
+        }
+    }
+
+    // NO sleep. `always` means the ack already implies the fsync.
+    sigkill(child1);
+    let _guard = ServerGuard(spawn_moon_aof_fsync(port, dir.path(), 1, "always"));
+    wait_ready(port);
+
+    let mut c = Conn::open(port);
+    let after = c.cmd(&["GET", dest]);
+    match &after {
+        Resp::Bulk(Some(got)) if got.starts_with(want.as_bytes()) => {}
+        _ => panic!(
+            "[{cmd_label}] LOST WRITE under appendfsync=always at --shards 1: {dest} \
+             was acked and read back, then killed with no grace period, and after \
+             recovery GET answered {after:?} (expected a bulk starting with {want:?}). \
+             Under `always` the ack is the durability claim, so the local leg's fsync \
+             barrier was never issued."
+        ),
+    }
+}
+
+#[test]
+fn copy_dst_local_leg_barrier_holds_under_appendfsync_always() {
+    survives_immediate_kill_under_always(
+        "COPY",
+        &[
+            &["SET", "always:copy:src", "COPYVALUE"],
+            &["COPY", "always:copy:src", "always:copy:dst"],
+        ],
+        "always:copy:dst",
+        "COPYVALUE",
+    );
+}
+
+#[test]
+fn bitop_dest_local_leg_barrier_holds_under_appendfsync_always() {
+    survives_immediate_kill_under_always(
+        "BITOP",
+        &[
+            &["SET", "always:bitop:x", "abc"],
+            &["SET", "always:bitop:y", "abd"],
+            &[
+                "BITOP",
+                "AND",
+                "always:bitop:dst",
+                "always:bitop:x",
+                "always:bitop:y",
+            ],
+        ],
+        "always:bitop:dst",
+        "ab",
     );
 }
