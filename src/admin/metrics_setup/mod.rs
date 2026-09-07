@@ -480,9 +480,95 @@ pub fn sample_ops_per_sec() {
     OPS_PER_SEC.store(total.saturating_sub(prev), Ordering::Relaxed);
 }
 
+/// Test-only probe (moon#774): the addresses of the words *this thread's*
+/// increments of the five per-command observability counters land on.
+///
+/// Order: `keyspace_hits`, `keyspace_misses`, `expired_keys`,
+/// `dispatch_cross_spsc`, `dispatch_cross_read_fast`.
+///
+/// The invariant these addresses pin is not "the counter is cheap" — it is
+/// that two DIFFERENT threads never increment into the same 64-byte line,
+/// while the counters ONE thread touches for a single command stay on one
+/// line it already owns.
+#[cfg(test)]
+pub(crate) fn hot_counter_slot_addrs() -> [usize; 5] {
+    [
+        std::ptr::addr_of!(KEYSPACE_HITS) as usize,
+        std::ptr::addr_of!(KEYSPACE_MISSES) as usize,
+        std::ptr::addr_of!(EXPIRED_KEYS) as usize,
+        std::ptr::addr_of!(DISPATCH_CROSS_READ_SPSC_TOTAL) as usize,
+        std::ptr::addr_of!(DISPATCH_CROSS_READ_FAST_TOTAL) as usize,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── moon#774: per-command observability counters must not false-share ──
+    //
+    // Every command on every deployment walks these. `record_keyspace_hit`
+    // and `record_dispatch_cross_spsc` are also UNGATED by design — they back
+    // INFO fields that must be right with `--admin-port 0` — so the cost is
+    // paid whether or not anyone scrapes Prometheus. That makes the cache
+    // line they live on the thing that matters: at `--shards 8`, GET p=1
+    // c200 measured 87.54% cross-shard on 332,779 ops/s, i.e. ~291K RMWs/s
+    // from 8 shard threads onto ONE line.
+    //
+    // The names below are addresses, not values, because the value is
+    // correct today — the defect is invisible to any assertion on the count.
+
+    /// Two threads must never increment into the same 64-byte line.
+    #[test]
+    fn hot_counters_do_not_false_share_across_threads() {
+        let a = std::thread::spawn(hot_counter_slot_addrs)
+            .join()
+            .expect("probe thread a");
+        let b = std::thread::spawn(hot_counter_slot_addrs)
+            .join()
+            .expect("probe thread b");
+
+        const NAMES: [&str; 5] = [
+            "keyspace_hits",
+            "keyspace_misses",
+            "expired_keys",
+            "dispatch_cross_spsc",
+            "dispatch_cross_read_fast",
+        ];
+        for (i, &x) in a.iter().enumerate() {
+            for (j, &y) in b.iter().enumerate() {
+                assert_ne!(
+                    x / 64,
+                    y / 64,
+                    "thread A's {} ({x:#x}) and thread B's {} ({y:#x}) share cache \
+                     line {}: every shard core RMWs the same line on the command \
+                     hot path (moon#774)",
+                    NAMES[i],
+                    NAMES[j],
+                    x / 64,
+                );
+            }
+        }
+    }
+
+    /// The counters ONE thread bumps for a single command must stay on the
+    /// one line that thread already owns. A cross-shard GET bumps a keyspace
+    /// counter AND a dispatch-path counter; splitting them across lines would
+    /// trade one contended line for two private misses.
+    #[test]
+    fn hot_counters_of_one_thread_share_one_line() {
+        let addrs = hot_counter_slot_addrs();
+        let line = addrs[0] / 64;
+        for (i, &x) in addrs.iter().enumerate() {
+            assert_eq!(
+                x / 64,
+                line,
+                "counter {i} at {x:#x} is on line {} but counter 0 is on line {line}: \
+                 this thread pays two cache misses per command where it should pay one",
+                x / 64,
+            );
+        }
+    }
 
     // Smoke tests for the dispatch-path counters added in Phase 177, Step 6.
     // A full assertion on the prometheus state would require initialising a
