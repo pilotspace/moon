@@ -289,6 +289,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per command at p=1 — for a value that changes once per millisecond.
   `slice::refresh_db_clock` replaces both sites. Pinned by
   `refresh_db_clock_takes_no_exclusive_guard_when_the_clock_is_unchanged`.
+- **`perf(storage)`: `DashTable::split_segment` repoints its directory in
+  O(block), not O(directory).** Every segment split scanned the whole
+  directory (`for i in 0..directory.len()`) to find the slots routing to the
+  split segment — O(2^depth) per split, O(N^2 / segment_capacity) over a
+  fill. Extendible hashing guarantees those slots are one aligned block of
+  `2^(depth - local_depth)` entries, of which only the upper half moves, so
+  the update is now one or two writes. Measured on moon-bench-x86: a 2M-key
+  fill spent 65% of its wall clock in that scan (G1 §6.4); with the fix the
+  fill goes 2,414/2,398 ms -> 953/954 ms (2.53x) and lands within 14% of a
+  presized zero-split table, with identical `split_count` (58,900),
+  `segment_count` (58,901) and `len`; `split_segment` falls from 7.4-7.7% to
+  0.6-0.7% of growth-phase shard-0 samples; a client-driven 2M fresh-key
+  `SET` fill goes 664K -> 997K rps (+50%, spread < 0.1% over 3 fresh-server
+  reps). Steady state is unchanged (the scan was 0.7-0.9% there); every bulk
+  load, restart and fresh-key benchmark paid it. Under `cfg(test)` the old scan is kept as the
+  oracle and every split is checked against it
+  (`split_directory_repoint_matches_full_scan_across_200k_fill`); the
+  aligned-block invariant is asserted from first principles alongside.
+  `examples/dashtable_growth.rs` is the growth micro-bench that measured it.
+  `DashTable::split_count`'s doc no longer claims `MEMORY DOCTOR` reads it
+  (nothing on the command path does).
 
 ## [0.8.9] — 2026-09-04
 

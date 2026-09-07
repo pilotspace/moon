@@ -222,8 +222,9 @@ pub struct DashTable<K, V> {
     /// Total entry count across all segments.
     len: usize,
     /// Cumulative number of `split_segment` invocations since construction.
-    /// Used by perf-regression tests and `MEMORY DOCTOR` to verify pre-sizing
-    /// successfully eliminated split cost on production keyspaces.
+    /// Read by the perf-regression tests and `examples/dashtable_growth.rs`
+    /// to verify pre-sizing (`with_capacity`) eliminated split cost; nothing
+    /// on the command path reads it.
     split_count: u64,
 }
 
@@ -321,8 +322,11 @@ impl<V> DashTable<CompactKey, V> {
     }
 
     /// Total number of `split_segment` invocations since construction.
-    /// Used by perf-regression tests and `MEMORY DOCTOR` to verify pre-sizing
-    /// successfully eliminated split cost on production keyspaces.
+    ///
+    /// Read by the perf-regression tests and `examples/dashtable_growth.rs`
+    /// (the G1/L4 growth micro-bench) to verify pre-sizing eliminated split
+    /// cost, and by `split_segment`'s own `cfg(test)` differential check.
+    /// Reachable from a `Database` as `db.data().split_count()`.
     #[inline]
     pub fn split_count(&self) -> u64 {
         self.split_count
@@ -674,7 +678,22 @@ impl<V> DashTable<CompactKey, V> {
     /// Algorithm:
     /// 1. Call segment.split(hasher) to produce a new segment
     /// 2. If new segment's depth > global depth, double the directory
-    /// 3. Update directory entries to point to the new segment
+    /// 3. Repoint the upper half of the split segment's directory block at
+    ///    the new segment
+    ///
+    /// Step 3 is O(block), not O(directory). Extendible hashing keeps the
+    /// invariant the whole table rests on: the directory slots routing to a
+    /// segment `S` of local depth `d` are exactly the aligned block of
+    /// `2^(depth - d)` consecutive slots whose top `d` bits are `S`'s prefix.
+    /// `Segment::split` raises `S` to depth `d + 1` and moves the keys whose
+    /// next hash bit is 1, so the new segment owns the upper half of that
+    /// block — the slots with bit `(depth - (d + 1))` set — and no other slot
+    /// changes. Before G1/L4 this scanned every directory slot per split,
+    /// O(2^depth): on a 2M-key fill that scan was 65% of the wall clock and
+    /// grew as O(N^2 / segment_capacity) (moon-bench-x86, G1 §6.4).
+    ///
+    /// Under `cfg(test)` the old scan is kept as the oracle
+    /// (`repoint_by_full_scan`) and every split is checked against it.
     fn split_segment(&mut self, dir_idx: usize) {
         self.split_count += 1;
         let seg_store_idx = self.directory[dir_idx];
@@ -685,7 +704,10 @@ impl<V> DashTable<CompactKey, V> {
         // Add new segment to the slab store
         let new_store_idx = self.segments.push(new_seg);
 
-        // Double directory if needed
+        // Double directory if needed. Each doubling maps slot `i` to `2i` and
+        // `2i + 1`, so `dir_idx` lands at `dir_idx << doublings` afterwards.
+        // At most one doubling happens per split (`new_depth <= depth + 1`).
+        let mut doublings = 0u32;
         while new_depth > self.depth {
             let old_len = self.directory.len();
             let mut new_dir = Vec::with_capacity(old_len * 2);
@@ -695,27 +717,84 @@ impl<V> DashTable<CompactKey, V> {
             }
             self.directory = new_dir;
             self.depth += 1;
+            doublings += 1;
         }
 
-        // Update directory entries: entries that should point to the new segment
-        // are those whose index has bit (new_depth-1) set when looking at the
-        // portion of the index that routes to this segment.
-        let bit_pos = new_depth - 1;
-        for i in 0..self.directory.len() {
-            if self.directory[i] == seg_store_idx {
-                // Check if this directory index should route to the new segment.
-                // The directory index's bit at position `bit_pos` (from MSB of the
-                // depth-bit index) determines which segment to use.
-                // In our scheme, directory index `i` corresponds to the top `depth`
-                // bits of the hash. Bit at position `bit_pos` from the top maps to
-                // bit `(depth - 1 - bit_pos)` in the directory index.
-                let bit_in_idx = self.depth - 1 - bit_pos;
-                if (i >> bit_in_idx) & 1 == 1 {
-                    self.directory[i] = new_store_idx;
-                }
+        #[cfg(test)]
+        let reference = repoint_by_full_scan(
+            &self.directory,
+            self.depth,
+            new_depth,
+            seg_store_idx,
+            new_store_idx,
+        );
+
+        // The split segment had local depth `new_depth - 1`, so its slots are
+        // the aligned block of `span = 2^(depth - (new_depth - 1))` containing
+        // `dir_idx` (mapped through the doubling). The upper half of that
+        // block — bit `(depth - new_depth)` set — now routes to the new
+        // segment; the lower half keeps routing to the old one.
+        let old_local_depth = new_depth - 1;
+        let span = 1usize << (self.depth - old_local_depth);
+        let block_start = (dir_idx << doublings) & !(span - 1);
+        for slot in &mut self.directory[block_start + span / 2..block_start + span] {
+            debug_assert_eq!(
+                *slot, seg_store_idx,
+                "directory block invariant violated: a slot in the split segment's block \
+                 routed elsewhere (dir_idx={dir_idx}, span={span}, block_start={block_start})"
+            );
+            *slot = new_store_idx;
+        }
+
+        #[cfg(test)]
+        {
+            if let Some(i) = (0..self.directory.len()).find(|&i| self.directory[i] != reference[i])
+            {
+                panic!(
+                    "split #{}: directory repoint diverged from the full-scan reference at slot {i} \
+                     (got {}, reference {}; dir_idx={dir_idx}, depth={}, new_depth={new_depth}, \
+                     seg={seg_store_idx}, new={new_store_idx})",
+                    self.split_count, self.directory[i], reference[i], self.depth
+                );
+            }
+            DIFFERENTIAL_CHECKS.with(|c| c.set(c.get() + 1));
+        }
+    }
+}
+
+/// The pre-G1/L4 directory update — a scan of EVERY directory slot per
+/// split — kept verbatim as the differential oracle for `split_segment`.
+/// Returns what that scan would have produced from the already-doubled
+/// directory. Test-only: it is O(2^depth) per split, which is exactly the
+/// cost L4 removed.
+#[cfg(test)]
+fn repoint_by_full_scan(
+    directory: &[usize],
+    depth: u32,
+    new_depth: u32,
+    seg_store_idx: usize,
+    new_store_idx: usize,
+) -> Vec<usize> {
+    let mut out = directory.to_vec();
+    let bit_pos = new_depth - 1;
+    for (i, slot) in out.iter_mut().enumerate() {
+        if *slot == seg_store_idx {
+            let bit_in_idx = depth - 1 - bit_pos;
+            if (i >> bit_in_idx) & 1 == 1 {
+                *slot = new_store_idx;
             }
         }
     }
+    out
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Number of `split_segment` calls on this thread whose directory was
+    /// checked against `repoint_by_full_scan`. Lets the differential test
+    /// prove the comparison ran once per split rather than trusting that it
+    /// did.
+    static DIFFERENTIAL_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl<'a, V> IntoIterator for &'a DashTable<CompactKey, V> {
@@ -1464,5 +1543,170 @@ mod tests {
                 i,
             );
         }
+    }
+
+    /// Every directory entry routing to a segment `S` must form ONE aligned
+    /// block of `2^(depth - S.depth)` consecutive slots. This is the
+    /// extendible-hashing invariant `split_segment`'s O(block) repoint (G1/L4)
+    /// relies on, checked here from first principles — without reference to
+    /// either the old scan or the new arithmetic.
+    fn assert_directory_block_invariant<V>(table: &DashTable<CompactKey, V>) {
+        let depth = table.depth;
+        assert_eq!(
+            table.directory.len(),
+            1usize << depth,
+            "directory length is 2^depth"
+        );
+        // (first slot, last slot, slot count) per segment store index.
+        let mut spans: std::collections::HashMap<usize, (usize, usize, usize)> =
+            std::collections::HashMap::new();
+        for (i, &seg) in table.directory.iter().enumerate() {
+            let e = spans.entry(seg).or_insert((i, i, 0));
+            e.1 = i;
+            e.2 += 1;
+        }
+        assert_eq!(
+            spans.len(),
+            table.segment_count(),
+            "every stored segment must be reachable from the directory"
+        );
+        for (&seg, &(first, last, count)) in &spans {
+            let local = table.segments.get(seg).depth();
+            assert!(
+                local <= depth,
+                "segment {seg}: local depth {local} > global depth {depth}"
+            );
+            let span = 1usize << (depth - local);
+            assert_eq!(
+                count, span,
+                "segment {seg} (depth {local}): {count} slots, expected {span}"
+            );
+            assert_eq!(
+                last - first + 1,
+                span,
+                "segment {seg}: slots {first}..={last} are not contiguous for span {span}"
+            );
+            assert_eq!(
+                first % span,
+                0,
+                "segment {seg}: block start {first} not aligned to {span}"
+            );
+        }
+    }
+
+    /// 16-byte keys shaped like redis-benchmark's `key:__rand_int__`, the
+    /// same generator as `examples/dashtable_growth.rs`.
+    fn growth_key(x: &mut u64) -> CompactKey {
+        *x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut key = *b"key:000000000000";
+        let mut id = (*x >> 24) % 1_000_000_000_000u64;
+        for d in (4..16).rev() {
+            key[d] = b'0' + (id % 10) as u8;
+            id /= 10;
+        }
+        CompactKey::from(&key[..])
+    }
+
+    /// G1/L4 differential guard: across a 200K-key fill through the
+    /// production entry point (`insert_or_update`), the directory after EVERY
+    /// split must be byte-identical to what the pre-L4 full scan
+    /// (`repoint_by_full_scan`) would have produced. The comparison itself
+    /// runs inside `split_segment` under `cfg(test)`; this test proves it ran
+    /// once per split (`DIFFERENTIAL_CHECKS`), that the aligned-block
+    /// invariant holds at checkpoints, and that no key was lost.
+    ///
+    /// Proven able to fail: dropping the `<< doublings` from `block_start`
+    /// panics on the first split that doubles the directory (see
+    /// tmp/perf-campaign/WAVE1-L4-L3A.md for the captured output).
+    #[test]
+    fn split_directory_repoint_matches_full_scan_across_200k_fill() {
+        const N: u64 = 200_000;
+        let checks_before = DIFFERENTIAL_CHECKS.with(|c| c.get());
+        let mut table: DashTable<CompactKey, u64> = DashTable::new();
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut keys = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            let key = growth_key(&mut x);
+            keys.push(key.clone());
+            let _ = table.insert_or_update(key, |v| *v = i, || i);
+            if (i + 1) % 20_000 == 0 {
+                assert_directory_block_invariant(&table);
+            }
+        }
+        assert_directory_block_invariant(&table);
+        let splits = table.split_count();
+        assert!(
+            splits >= 1_000,
+            "fixture must split thousands of times, got {splits}"
+        );
+        assert_eq!(
+            table.segment_count() as u64,
+            splits + 1,
+            "one new segment per split"
+        );
+        assert!(
+            table.directory_depth() >= 10,
+            "directory must have doubled repeatedly"
+        );
+        assert_eq!(
+            DIFFERENTIAL_CHECKS.with(|c| c.get()) - checks_before,
+            splits,
+            "the full-scan comparison must have run on every split"
+        );
+        // Duplicate keys from the generator collapse into updates: len is the
+        // distinct count, and every key must still route to its value.
+        let mut distinct = std::collections::HashSet::new();
+        let mut last_value = std::collections::HashMap::new();
+        for (i, key) in keys.iter().enumerate() {
+            distinct.insert(key.as_ref().to_vec());
+            last_value.insert(key.as_ref().to_vec(), i as u64);
+        }
+        assert_eq!(table.len(), distinct.len());
+        for (key, value) in &last_value {
+            assert_eq!(table.get(key), Some(value), "key {key:?} lost or misrouted");
+        }
+    }
+
+    /// The `with_capacity` path starts every segment at local depth ==
+    /// global depth, so the FIRST split of any segment doubles the directory
+    /// (`doublings == 1`) — the case where `block_start` must map `dir_idx`
+    /// through the doubling. Overfill a presized table and check the
+    /// invariant plus the per-split differential.
+    #[test]
+    fn split_after_presize_doubles_directory_and_keeps_block_invariant() {
+        let checks_before = DIFFERENTIAL_CHECKS.with(|c| c.get());
+        let mut table: DashTable<CompactKey, u64> = DashTable::with_capacity(10_000);
+        let depth0 = table.directory_depth();
+        assert_eq!(table.split_count(), 0);
+        let mut x: u64 = 0x1234_5678_9ABC_DEF0;
+        for i in 0..60_000u64 {
+            let _ = table.insert_or_update(growth_key(&mut x), |v| *v = i, || i);
+        }
+        assert!(
+            table.split_count() > 0,
+            "overfilling a presized table must split"
+        );
+        assert!(
+            table.directory_depth() > depth0,
+            "the first split past presize doubles"
+        );
+        assert_directory_block_invariant(&table);
+        assert_eq!(
+            DIFFERENTIAL_CHECKS.with(|c| c.get()) - checks_before,
+            table.split_count()
+        );
+    }
+
+    /// `repoint_by_full_scan` is the oracle; pin its own semantics on a
+    /// hand-built directory so a broken oracle cannot silently agree with a
+    /// broken repoint. depth 3, segment 5 owns slots 4..8 (local depth 1),
+    /// splitting to local depth 2: slots 6 and 7 move.
+    #[test]
+    fn full_scan_oracle_moves_only_the_upper_half_of_the_block() {
+        let dir = vec![0, 0, 1, 1, 5, 5, 5, 5];
+        let out = repoint_by_full_scan(&dir, 3, 2, 5, 9);
+        assert_eq!(out, vec![0, 0, 1, 1, 5, 5, 9, 9]);
     }
 }
