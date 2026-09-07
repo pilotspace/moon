@@ -52,8 +52,10 @@
 //! bridge module docs), so every successfully-executed inner write command
 //! reached NEITHER plane before this. `record_effect_write` shares
 //! `record_reason_del_conn`'s exact emission mechanics (extracted into
-//! `record_bytes_conn` below) but records the verbatim `cmd + args` the
-//! script issued instead of a synthetic `DEL`.
+//! `record_bytes_conn` below) but records the `cmd + args` the script issued
+//! — rewritten to its effect by `aof::serialize_effect_for_log` (moon#825:
+//! a script's `SPOP` / `XADD … '*'` re-rolls on replay exactly like the
+//! connection form) — instead of a synthetic `DEL`.
 //!
 //! moon#517: `record_effect_write` is the one entry point here that is NOT
 //! monoio-only. Its AOF leg runs on every runtime (see
@@ -227,6 +229,7 @@ pub(crate) fn record_effect_write(
     aof_pool: Option<&std::sync::Arc<AofWriterPool>>,
     db: usize,
     cmd_and_args: &[Frame],
+    reply: &Frame,
 ) {
     // Task #34 review (defect 2): see `conn_has_work` doc comment. Skip the
     // `Frame::Array`/`cmd_and_args.to_vec()`/`serialize_command` allocations
@@ -237,7 +240,13 @@ pub(crate) fn record_effect_write(
         return;
     }
     let frame = Frame::Array(crate::protocol::FrameVec::from_vec(cmd_and_args.to_vec()));
-    let serialized = serialize_command(&frame);
+    // moon#825: a script's `redis.call('SPOP', …)` / `XADD … '*'` is an
+    // effect only together with its reply — the raw inner frame re-rolls on
+    // replay exactly like the same command sent from a connection would.
+    // `None` means the reply proves the inner command wrote nothing.
+    let Some(serialized) = crate::persistence::aof::serialize_effect_for_log(&frame, reply) else {
+        return;
+    };
     record_bytes_conn(repl_state, shard_id, num_shards, aof_pool, db, serialized);
 }
 

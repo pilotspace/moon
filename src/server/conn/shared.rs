@@ -339,24 +339,21 @@ pub(crate) fn execute_transaction(
         // the caller attributes every entry to that one db.
         let is_write = metadata::is_persisted_write(cmd);
 
-        // Serialize for AOF before dispatch
-        let aof_bytes = if is_write {
-            let mut buf = BytesMut::new();
-            crate::protocol::serialize::serialize(cmd_frame, &mut buf);
-            Some(buf.freeze())
-        } else {
-            None
-        };
-
         let result = dispatch(&mut *guard, cmd, cmd_args, selected_db, db_count);
         let response = match result {
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f, // QUIT inside MULTI just returns OK
         };
 
-        // Collect AOF entry for successful writes (not error responses)
-        if let Some(bytes) = aof_bytes {
-            if !matches!(&response, Frame::Error(_)) {
+        // Collect the AOF entry for a successful write. moon#825: serialized
+        // AFTER dispatch, from the frame AND the reply — a queued `SPOP` or
+        // `XADD key *` does not reproduce itself, and this executor used to
+        // write the raw frame, bypassing even the expire rewrite. `None`
+        // means the reply proves nothing was written.
+        if is_write && !matches!(&response, Frame::Error(_)) {
+            if let Some(bytes) =
+                crate::persistence::aof::serialize_effect_for_log(cmd_frame, &response)
+            {
                 aof_entries.push(bytes);
             }
         }
@@ -572,13 +569,7 @@ pub(crate) fn execute_transaction_sharded(
         // `is_persisted_write` (PR #282 review): a queued literal SELECT is
         // connection/txn state only — persisting it shifts the stream's db
         // context under other records (task #35).
-        let aof_bytes = if crate::command::metadata::is_persisted_write(cmd) {
-            let mut buf = bytes::BytesMut::new();
-            crate::protocol::serialize::serialize(cmd_frame, &mut buf);
-            Some(buf.freeze())
-        } else {
-            None
-        };
+        let is_write = crate::command::metadata::is_persisted_write(cmd);
         // The db THIS command executes in — captured before dispatch (a
         // queued SELECT mutates `selected` for the commands after it, never
         // for itself, and no persisted write mutates it mid-dispatch).
@@ -595,8 +586,14 @@ pub(crate) fn execute_transaction_sharded(
 
         // Only log the write if it actually succeeded (parity with the
         // single-shard path — an errored write must not reach the AOF).
-        if let Some(bytes) = aof_bytes {
-            if !matches!(&response, Frame::Error(_)) {
+        // moon#825: serialized AFTER dispatch, from the frame AND the reply —
+        // a queued `SPOP` or `XADD key *` does not reproduce itself, and this
+        // executor used to write the raw frame, bypassing even the expire
+        // rewrite. `None` means the reply proves nothing was written.
+        if is_write && !matches!(&response, Frame::Error(_)) {
+            if let Some(bytes) =
+                crate::persistence::aof::serialize_effect_for_log(cmd_frame, &response)
+            {
                 aof_entries.push((entry_db, bytes));
             }
         }

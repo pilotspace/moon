@@ -3504,8 +3504,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // contract as wal_append_and_fanout's cross-shard
                         // legs).
                         let repl_active = ft::replication_fanout_active(ctx);
-                        if repl_active || ctx.aof_pool.is_some() {
-                            let serialized = aof::serialize_command_for_log(&frame);
+                        // moon#825: the record is derived from the REPLY, never
+                        // the verbatim frame — `SPOP`/`XADD *` and the relative-
+                        // TTL family do not reproduce themselves on replay.
+                        // `None` means the reply proves nothing was written.
+                        let serialized = if repl_active || ctx.aof_pool.is_some() {
+                            aof::serialize_effect_for_log(&frame, &response)
+                        } else {
+                            None
+                        };
+                        if let Some(serialized) = serialized {
                             let lsn = if repl_active {
                                 ft::record_local_write_db(
                                     ctx,

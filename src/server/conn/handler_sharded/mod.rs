@@ -2253,7 +2253,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                     let is_write = if ctx.aof_pool.is_some() || conn.tracking_state.enabled { metadata::is_write(cmd) } else { false };
                     // `is_persisted_write`: never AOF a literal client SELECT
                     // (task #35 — poisons the stream db context).
-                    let aof_bytes = if is_write && ctx.aof_pool.is_some() && metadata::is_persisted_write(cmd) { Some(aof::serialize_command_for_log(&frame)) } else { None };
+                    let aof_wanted = is_write && ctx.aof_pool.is_some() && metadata::is_persisted_write(cmd);
+                    // moon#825: the generic LOCAL write leg derives its record
+                    // from the REPLY (below, after dispatch) — pre-serializing
+                    // the frame here would be wasted work for it. The two-db
+                    // intercepts (`:1`-gated, deterministic) and the remote
+                    // leg (barrier bookkeeping only; the owner's SPSC arm owns
+                    // the append) keep the frame-only form.
+                    let is_two_db = cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY");
+                    let aof_bytes = if aof_wanted && (!is_local || is_two_db) { Some(aof::serialize_command_for_log(&frame)) } else { None };
 
                     if is_local {
                         // LOCAL PATH: split into read/write to avoid exclusive lock on reads.
@@ -2814,6 +2822,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // awaited its own fsync (the 8x P16 deficit vs Redis).
                             let mut aof_failed = false;
                             let mut aof_barrier_pending = false;
+                            // moon#825: reply-derived record; `None` when the reply
+                            // proves nothing was written (see `aof_wanted` above).
+                            let aof_bytes = if aof_wanted { aof::serialize_effect_for_log(&frame, &response) } else { None };
                             if let Some(bytes) = aof_bytes {
                                 if !matches!(response, Frame::Error(_)) {
                                     if let Some(ref pool) = ctx.aof_pool {
