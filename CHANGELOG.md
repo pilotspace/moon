@@ -269,6 +269,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waiver, so a truncated run can never be waived. `--self-test` covers six
   cases (clean / waived / different-single-failure / waived-plus-another /
   truncated / short) and runs in the hosted Lint job.
+- **`test`: ten lib tests shared fixed temp paths, so two concurrent test runs
+  corrupted each other (#822).** `std::env::temp_dir().join("moon_test_datafile")`
+  and nine siblings named their scratch path with a string literal, so every
+  concurrent `cargo test` process on the host picked the *same* directory and
+  one run's `remove_dir_all` teardown deleted it under another's feet.
+  `scripts/ci-local.sh` runs the monoio and tokio VM suites concurrently by
+  default, so this is the normal case. Measured at `ae6cd003` on the macOS
+  host, two processes looping one test:
+  `persistence::kv_page::tests::test_datafile_roundtrip` 0/40 solo →
+  **13/80 concurrent**; `tls::tests::test_reload_tls_config_swaps_config`
+  0/20 solo → **24/50 concurrent**. The TLS one is the dangerous case: it does
+  not report a missing file, it reports
+  `TLS config: keys may not be consistent: KeyMismatch` — one run reading
+  *another run's* cert against its own key, a harness defect that reads as a
+  TLS bug. `tests/common/mod.rs::unique_test_dir` had already solved this for
+  the integration suites; lib tests cannot use `tests/common`, which is how the
+  fix failed to reach them. Adds the same construction crate-side as
+  `crate::util::test_temp::unique_test_dir` (pid + nanos + a process-local
+  atomic counter — the counter is the part that cannot collide, because macOS
+  `SystemTime::now()` has only microsecond resolution) and switches all ten
+  call sites in `src/tls.rs`, `src/persistence/kv_page.rs`,
+  `src/admin/footprint.rs` and `src/config/conf_file.rs`. Guarded by
+  `scripts/audit-test-tempdirs.sh`, wired into the hosted Lint job and
+  `ci-local.sh`; it ships a `--self-test` leg that plants a violation and
+  asserts the scanner reports it, so a scanner that stopped matching fails
+  instead of passing. Green after the fix: 0/80 and 0/50 under the same
+  concurrency, and 3× two concurrent full `--lib` suites with only the
+  pre-existing #856 failure.
 
 - **`ci`: clippy now lints tests, benches and examples.** Every clippy
   invocation in `ci.yml` was lib-only, so `--all-targets` code was never

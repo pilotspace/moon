@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn merge_positional_conf_path_stripped() {
         // Write a tiny temp conf.
-        let dir = std::env::temp_dir();
+        let dir = crate::util::test_temp::unique_test_dir("moon-conf-positional");
         let path = dir.join("moon_test_positional.conf");
         std::fs::write(&path, "port 6399\n").unwrap();
 
@@ -527,12 +527,12 @@ mod tests {
         // conf path must NOT appear in merged (stripped)
         assert!(!merged.contains(&path.to_str().unwrap().to_string()));
 
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn merge_config_flag_stripped() {
-        let dir = std::env::temp_dir();
+        let dir = crate::util::test_temp::unique_test_dir("moon-conf-flag");
         let path = dir.join("moon_test_config_flag.conf");
         std::fs::write(&path, "port 6400\n").unwrap();
 
@@ -544,7 +544,7 @@ mod tests {
         assert!(merged.contains(&"--port".to_string()));
         assert!(merged.contains(&"6400".to_string()));
 
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -563,7 +563,7 @@ mod tests {
     fn merge_cli_after_conf_so_cli_wins() {
         // Verify that real CLI args come AFTER conf tokens so clap last-wins
         // gives CLI priority.
-        let dir = std::env::temp_dir();
+        let dir = crate::util::test_temp::unique_test_dir("moon-conf-cli-wins");
         let path = dir.join("moon_test_cli_wins.conf");
         std::fs::write(&path, "port 6401\n").unwrap();
 
@@ -582,7 +582,7 @@ mod tests {
             "CLI --port should be last (wins)"
         );
 
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── clap-level parse tests (require args_override_self = true) ───────────

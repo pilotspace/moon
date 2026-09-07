@@ -860,8 +860,7 @@ mod tests {
 
     #[test]
     fn test_datafile_roundtrip() {
-        let dir = std::env::temp_dir().join("moon_test_datafile");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = crate::util::test_temp::unique_test_dir("moon-test-datafile");
         let path = dir.join("test-heap.mpf");
 
         let mut p1 = KvLeafPage::new(0, 1);
@@ -888,8 +887,7 @@ mod tests {
         assert_eq!(e2.ttl_ms, Some(5000));
 
         // Cleanup
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Task #49: `write_datafile` / `write_datafile_mixed` must go through

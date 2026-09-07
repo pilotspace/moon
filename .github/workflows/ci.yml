@@ -83,6 +83,11 @@ jobs:
       - run: cargo fmt --check
       - run: bash scripts/audit-unsafe.sh
       - run: bash scripts/audit-unwrap.sh
+      # moon#822: a fixed-name scratch path is shared by every concurrent
+      # `cargo test` process on the host. --self-test first, so a scanner
+      # that silently stopped matching fails here instead of passing.
+      - run: bash scripts/audit-test-tempdirs.sh --self-test
+      - run: bash scripts/audit-test-tempdirs.sh
       # ci-local.sh's disk pre-flight is pure bash and testable without a
       # VM. It runs here so the thresholds cannot silently rot — the check
       # itself only ever runs on a developer's machine.

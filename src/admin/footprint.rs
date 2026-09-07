@@ -499,13 +499,19 @@ mod footprint_tests {
         // the two fields must move differently.
         let _g = TEST_LOCK.lock();
         const LEN: usize = 64 << 20;
-        let path = std::env::temp_dir().join("moon_footprint_probe.bin");
+        let probe_dir = crate::util::test_temp::unique_test_dir("moon-footprint-probe");
+        let path = probe_dir.join("probe.bin");
         if std::fs::write(&path, vec![0u8; LEN]).is_err() {
-            return; // no writable tmp — nothing to assert, don't fail the run
+            // no writable tmp — nothing to assert, don't fail the run
+            let _ = std::fs::remove_dir_all(&probe_dir);
+            return;
         }
         let file = match std::fs::File::open(&path) {
             Ok(f) => f,
-            Err(_) => return,
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&probe_dir);
+                return;
+            }
         };
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
 
@@ -539,7 +545,7 @@ mod footprint_tests {
         let fp_after = process_footprint_bytes();
         // SAFETY: unmapping exactly the region returned by the mmap above.
         unsafe { libc::munmap(p, LEN) };
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&probe_dir);
 
         let rss_growth = rss_after.saturating_sub(rss_before);
         let fp_growth = fp_after.saturating_sub(fp_before);
