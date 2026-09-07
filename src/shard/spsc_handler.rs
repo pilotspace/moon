@@ -167,22 +167,24 @@ pub(crate) fn drain_spsc_shared(
 
     // Batch-level eviction gate (perf parity with handler_monoio's
     // `batch_eviction_active`): snapshot "is maxmemory set?" once per drain
-    // cycle from the process-global atomic (Gap C) instead of taking
-    // `runtime_config.read()` per drain cycle. When neither maxmemory nor
-    // disk-offload is configured — the common non-memory-bound path — every
+    // cycle from the process-global atomics (Gap C) instead of taking
+    // `runtime_config.read()` per drain cycle. When neither maxmemory nor a
+    // per-db quota is configured — the common non-memory-bound path — every
     // write arm below skips the eviction call (and any lock acquire)
     // entirely. `runtime_config` is still threaded through for the actual
     // eviction pass (`spsc_eviction_gate`) when this is true.
     //
-    // WS5b fix-first review: MUST also consult the per-db quota atomic —
-    // this gate skips the call to `spsc_eviction_gate` entirely (which is
-    // where the db-quota check for cross-shard write legs lives), so without
-    // this term a server with `--maxmemory 0` and no spill sender never
+    // WS5b fix-first review: the predicate MUST also consult the per-db
+    // quota atomic — this gate skips the call to `spsc_eviction_gate`
+    // entirely (which is where the db-quota check for cross-shard write legs
+    // lives), so without that term a server with `--maxmemory 0` never
     // enforces `--db-maxmemory` on any remote-shard write leg either. Same
     // bug class as the `batch_eviction_active` fix in handler_monoio/mod.rs.
-    let evict_active = spill_sender.is_some()
-        || crate::storage::eviction::maxmemory_is_set()
-        || crate::storage::db_quota::db_maxmemory_any_set();
+    //
+    // G1/L3a: `spill_sender.is_some()` is no longer a term — a wired sender
+    // only changes where a victim goes, and there is no victim without a
+    // limit. See `eviction::write_gate_active`.
+    let evict_active = crate::storage::eviction::write_gate_active();
 
     // Collect all messages first, then batch Execute/PipelineBatch under single borrow.
     //

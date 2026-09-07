@@ -246,6 +246,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`--cross-shard-fast-path off`, the actual hop) alongside `s4-c1-GET`
   (default `auto`), and a `--self-test` gate fails closed if the passthrough
   ever stops reaching the server process.
+- **`perf(server)`: the per-write eviction gate is keyed on STATE — a
+  configured `maxmemory` or per-db quota — not on whether a spill sender is
+  wired.** `eviction::write_gate_active()` is now the one predicate behind
+  all four write-path gates: the monoio batch flag (`batch_eviction_active`),
+  the SPSC drain (`evict_active`), the Lua bridge (`LuaEvictionCtx::gate`)
+  and the tokio per-write check (which had no gate at all). Each of the first
+  three carried `spill_sender.is_some()` as a term, which is true on every
+  default server (`--disk-offload enable`), so every non-inline write paid
+  `run_write_eviction_gate` — a `RuntimeConfig` read-lock pair, an
+  `elastic_budget` load, an `EvictionRun` build and `evict_to_budget`'s
+  early return — for nothing: a wired sender only changes where a VICTIM goes
+  (spilled vs plain-dropped), and `evict_to_budget` selects no victim when
+  `maxmemory == 0`. Under any configured limit nothing changes: the gate
+  runs, builds the same `EvictionRun` for the same sender, and routes exactly
+  as before. Also drops the per-batch `runtime_config.read()` the monoio flag
+  took. Scope, measured: a default `moon` auto-caps `maxmemory` at ~80% of
+  RAM (`--maxmemory` omitted != `--maxmemory 0`), so on a default server the
+  gate is active through `maxmemory_is_set()` regardless of this change and
+  its 2.8-3.5% + 0.7-1.3% of shard-0 cycles on `-t hset` (a configured but
+  un-breached limit) remain — client-driven `-t hset` is 920K rps on both
+  binaries. Under an explicit `--maxmemory 0` the gate symbol disappears from
+  the profile. Recovering the default-server cost needs the finer per-write
+  "configured but un-breached" skip, which is a separate change. Guarded by
+  `gate_is_skipped_with_spill_sender_when_no_limit_is_configured` on a
+  test-only `evict_to_budget` entry probe; `tests/oom_bypass_closure.rs`
+  still enforces the publish contract the predicate relies on.
 
 ## [0.8.9] — 2026-09-04
 

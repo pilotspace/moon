@@ -1694,9 +1694,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // the separate, correctly-gated inline fast path in blocking.rs).
         // Mirrors the Lua bridge's early-exit gate in scripting/bridge.rs,
         // which already included this term.
-        let batch_eviction_active = ctx.spill_sender.is_some()
-            || ctx.runtime_config.read().maxmemory != 0
-            || crate::storage::db_quota::db_maxmemory_any_set();
+        //
+        // G1/L3a: keyed on STATE, not config. `ctx.spill_sender.is_some()`
+        // used to be the first term — true on every default server
+        // (`--disk-offload enable` wires the sender) — so every non-inline
+        // write paid `run_write_eviction_gate` for nothing: a wired sender
+        // only changes where a victim goes, and no victim exists without a
+        // limit. The predicate also drops the per-batch
+        // `runtime_config.read()`; see `eviction::write_gate_active`.
+        let batch_eviction_active = crate::storage::eviction::write_gate_active();
 
         let mut auth_delay_ms: u64 = 0;
 

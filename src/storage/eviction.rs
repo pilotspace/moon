@@ -97,6 +97,90 @@ pub fn maxmemory_is_set() -> bool {
     MAXMEMORY_GLOBAL.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only probe: `evict_to_budget` entries on this thread. A skipped
+    /// no-op gate call has no other observable, so the gate tests assert on
+    /// this instead of on timing. Thread-local so parallel tests in the same
+    /// binary cannot bleed into each other's count. Compiled out of every
+    /// non-test build.
+    static EVICT_TO_BUDGET_ENTRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: how many times `evict_to_budget` has been entered on this
+/// thread. See `EVICT_TO_BUDGET_ENTRIES`.
+#[cfg(test)]
+pub(crate) fn evict_to_budget_entries_on_this_thread() -> u64 {
+    EVICT_TO_BUDGET_ENTRIES.with(|c| c.get())
+}
+
+/// `true` iff the per-write eviction/OOM gate can have any effect: an
+/// instance-wide `maxmemory` or at least one per-db quota is configured.
+///
+/// THE state predicate every write-path gate is keyed on — the monoio batch
+/// flag (`batch_eviction_active`), the SPSC drain snapshot (`evict_active`),
+/// the Lua bridge fast path (`LuaEvictionCtx::gate`) and the tokio per-write
+/// check. When it is `false` the gate provably does nothing: `evict_to_budget`
+/// returns before it parses a policy or selects a victim when
+/// `maxmemory == 0`, and `check_db_maxmemory*` is a no-op with no quota. So
+/// nothing can be evicted, spilled or rejected, and skipping the call is
+/// exact.
+///
+/// Whether a spill sender is wired (`--disk-offload`, on by default) is
+/// deliberately NOT a term: a sender changes only where a VICTIM goes
+/// (spilled vs plain-dropped), and no victim exists without a limit. It used
+/// to be one — a CONFIG predicate standing in for this STATE one, the same
+/// substitution #812 removed from `can_inline_writes` — which made every
+/// non-inline write on a default server pay a `RuntimeConfig` read-lock
+/// pair, an `elastic_budget` load and an `EvictionRun` build for nothing
+/// (G1 §3: 2.8-3.0% + 1.0-1.3% of shard-0 cycles on `-t hset`).
+///
+/// Lock-free: two Relaxed loads. `CONFIG SET maxmemory` / `CONFIG SET
+/// db-maxmemory` republish both atomics (`publish_maxmemory`,
+/// `db_quota::publish_db_maxmemory_any_set`), so a limit configured at
+/// runtime is seen by the next batch / drain cycle / script call.
+#[inline]
+#[must_use]
+pub fn write_gate_active() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = WRITE_GATE_OVERRIDE.with(|c| c.get()) {
+        return forced;
+    }
+    maxmemory_is_set() || crate::storage::db_quota::db_maxmemory_any_set()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for `write_gate_active`. The two atomics it reads
+    /// are process-global and published by other tests in the same binary;
+    /// a test that needs the gate OPEN regardless (e.g. to observe eviction
+    /// reporting) forces it here instead of racing them. Thread-local, so it
+    /// cannot leak into a parallel test; cleared by `ForceWriteGate::drop`.
+    static WRITE_GATE_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only RAII guard from [`force_write_gate`]; restores the previous
+/// override on drop.
+#[cfg(test)]
+pub(crate) struct ForceWriteGate(Option<bool>);
+
+#[cfg(test)]
+impl Drop for ForceWriteGate {
+    fn drop(&mut self) {
+        WRITE_GATE_OVERRIDE.with(|c| c.set(self.0));
+    }
+}
+
+/// Test-only: force `write_gate_active()` to `active` on this thread until
+/// the returned guard drops.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn force_write_gate(active: bool) -> ForceWriteGate {
+    let prev = WRITE_GATE_OVERRIDE.with(|c| c.replace(Some(active)));
+    ForceWriteGate(prev)
+}
+
 /// Publish the maxmemory hints. MUST be called wherever `maxmemory` (or the
 /// shard count it is divided by) changes: server startup after the resolved
 /// `num_shards` is written, and `CONFIG SET maxmemory`. A missed publish is
@@ -553,6 +637,8 @@ pub fn evict_to_budget(
     config: &RuntimeConfig,
     run: EvictionRun<'_, '_, '_>,
 ) -> Result<(), Frame> {
+    #[cfg(test)]
+    EVICT_TO_BUDGET_ENTRIES.with(|c| c.set(c.get() + 1));
     if config.maxmemory == 0 {
         return Ok(());
     }
@@ -1655,6 +1741,35 @@ mod tests {
     // -----------------------------------------------------------------
     // MAXMEMORY_GLOBAL atomic (Gap C)
     // -----------------------------------------------------------------
+
+    /// G1/L3a: the shared write-gate predicate follows the two published
+    /// atomics and nothing else. The bridge's
+    /// `gate_is_skipped_with_spill_sender_when_no_limit_is_configured` pins
+    /// the "nothing else" half against a real spill sender.
+    #[test]
+    fn write_gate_active_tracks_maxmemory_and_db_quota_atomics() {
+        use crate::storage::db_quota::publish_db_maxmemory_any_set;
+        publish_maxmemory(0);
+        publish_db_maxmemory_any_set(&RuntimeConfig::default());
+        assert!(!write_gate_active(), "no limit published: gate inactive");
+        publish_maxmemory(1);
+        assert!(write_gate_active(), "maxmemory published: gate active");
+        publish_maxmemory(0);
+        let quota = RuntimeConfig {
+            db_maxmemory: vec![0, 4096],
+            ..RuntimeConfig::default()
+        };
+        publish_db_maxmemory_any_set(&quota);
+        assert!(write_gate_active(), "a db quota alone activates the gate");
+        publish_db_maxmemory_any_set(&RuntimeConfig::default());
+        assert!(!write_gate_active());
+        // The test override wins in both directions and is undone on drop.
+        {
+            let _forced = force_write_gate(true);
+            assert!(write_gate_active());
+        }
+        assert!(!write_gate_active());
+    }
 
     #[test]
     fn maxmemory_publish_and_is_set_roundtrip() {
