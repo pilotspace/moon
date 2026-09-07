@@ -6,8 +6,13 @@
 //! - `payload: [u8; 12]` -- inline data (SSO) or prefix + tagged heap pointer
 //!
 //! SSO path (strings <= 12 bytes): data stored inline in `payload[0..len]`
-//! Heap path (strings > 12 bytes or collections): `payload[0..4]` = prefix,
-//!   `payload[4..12]` = tagged pointer (raw_ptr | type_tag_in_low_3_bits)
+//! Heap path (strings > 12 bytes or collections):
+//!   `payload[4..12]` = tagged pointer (raw_ptr | type_tag_in_low_3_bits);
+//!   for heap STRINGS `payload[0..4]` = low 32 bits of the length and the
+//!   28 `LEN_MASK` bits of `len_and_tag` = the high bits (see
+//!   [`CompactValue::heap_string_len`]), so the length of a heap string is
+//!   readable without dereferencing the pointer. Collections leave
+//!   `payload[0..4]` zero.
 
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
@@ -39,6 +44,37 @@ const HEAP_TAG_SET: usize = 3;
 const HEAP_TAG_ZSET: usize = 4;
 const HEAP_TAG_STREAM: usize = 5;
 const HEAP_TAG_MASK: usize = 0x7;
+
+// The heap layout packs an 8-byte pointer into `payload[4..12]`; the
+// 60-bit length split below assumes the same word size.
+const _: () = assert!(std::mem::size_of::<usize>() == 8);
+
+/// Split a heap string's length into the two places it is stored: the 28
+/// `LEN_MASK` bits of `len_and_tag` (high part) and `payload[0..4]` (low 32
+/// bits, native-endian).
+///
+/// 60 bits is not the full `usize` range, so this is a precondition, not a
+/// tautology: `len` is the length of a `[u8]` that is ALLOCATED, and no
+/// 64-bit target moon ships on can address 2^60 bytes (x86-64 with 5-level
+/// paging stops at 2^57, aarch64 at 2^52), so an allocation of that length
+/// cannot exist — a request for one aborts in `handle_alloc_error` long
+/// before reaching here. The `debug_assert` pins the argument.
+#[inline]
+fn encode_heap_len(len: usize) -> (u32, [u8; 4]) {
+    debug_assert!(
+        (len >> 60) == 0,
+        "a heap string longer than 2^60 bytes cannot be allocated"
+    );
+    let hi = ((len >> 32) as u32) & LEN_MASK;
+    let lo = (len as u32).to_ne_bytes();
+    (hi, lo)
+}
+
+/// Inverse of [`encode_heap_len`]. `hi` must already be masked to `LEN_MASK`.
+#[inline]
+fn decode_heap_len(hi: u32, lo: u32) -> usize {
+    ((hi as usize) << 32) | (lo as usize)
+}
 
 /// Thin wrapper for heap-allocated strings.
 ///
@@ -251,10 +287,7 @@ impl CompactValue {
     fn heap_string_vec(data: Vec<u8>) -> Self {
         debug_assert!(data.len() > SSO_MAX_LEN);
         let str_len = data.len();
-
-        let mut prefix = [0u8; 4];
-        let copy_len = str_len.min(4);
-        prefix[..copy_len].copy_from_slice(&data[..copy_len]);
+        let (len_hi, len_lo) = encode_heap_len(str_len);
 
         // `into_boxed_slice` is a no-op when `capacity == len`, which is the case
         // for every hot-path caller: `heap_string` copies via `to_vec`, and
@@ -272,13 +305,35 @@ impl CompactValue {
         let tagged_ptr = raw_ptr | HEAP_TAG_STRING;
 
         let mut payload = [0u8; 12];
-        payload[..4].copy_from_slice(&prefix);
+        payload[..4].copy_from_slice(&len_lo);
         payload[4..12].copy_from_slice(&tagged_ptr.to_ne_bytes());
 
         CompactValue {
-            len_and_tag: HEAP_MARKER | ((str_len as u32) & LEN_MASK),
+            len_and_tag: HEAP_MARKER | len_hi,
             payload,
         }
+    }
+
+    /// Length of a heap string, read from the 16-byte value itself — never
+    /// from the heap.
+    ///
+    /// The overwrite path (`Database::set`'s update closure) bills the OLD
+    /// value through `estimate_memory` before dropping it; when that read went
+    /// through the pointer it was a second cache miss on every overwrite, for
+    /// a number that was already sitting next to the pointer (moon perf
+    /// campaign, G1 §5). Low 32 bits live in `payload[0..4]`, the high bits in
+    /// the 28 `LEN_MASK` bits of `len_and_tag` — 60 bits, which no allocation
+    /// on a 64-bit target can exceed.
+    #[inline]
+    fn heap_string_len(&self) -> usize {
+        debug_assert!(!self.is_inline() && self.heap_type_tag() == HEAP_TAG_STRING);
+        let lo = u32::from_ne_bytes([
+            self.payload[0],
+            self.payload[1],
+            self.payload[2],
+            self.payload[3],
+        ]);
+        decode_heap_len(self.len_and_tag & LEN_MASK, lo)
     }
 
     /// Get the tagged pointer from a heap-allocated value.
@@ -499,12 +554,12 @@ impl CompactValue {
         if self.is_inline() {
             self.inline_len()
         } else if self.heap_type_tag() == HEAP_TAG_STRING {
-            // SAFETY: Tag verified as HEAP_TAG_STRING; pointer from Box::into_raw is valid and not freed.
-            let hs = unsafe { &*self.heap_string_ptr() };
             // One wrapper allocation (`Box<HeapString>`, two words, jemalloc's
             // 16-byte class) plus the data buffer itself — the buffer rounded
-            // to the class jemalloc actually hands out (moon#788).
-            std::mem::size_of::<HeapString>() + crate::storage::mem_size::size_class(hs.0.len())
+            // to the class jemalloc actually hands out (moon#788). The length
+            // comes from the value, not the heap: no pointer chase here.
+            std::mem::size_of::<HeapString>()
+                + crate::storage::mem_size::size_class(self.heap_string_len())
         } else {
             // SAFETY: Tag is a collection type; pointer from Box::into_raw is valid and not freed.
             let rv = unsafe { &*self.heap_collection_ptr() };
@@ -632,6 +687,178 @@ mod tests {
             "per-key charge must track the wrapper's real size"
         );
         assert_eq!(cv.estimate_memory(), 80);
+    }
+
+    /// The size spectrum every string layout change must survive: empty, one
+    /// byte, the SSO cutoff and its two neighbours, the first heap size, a
+    /// few jemalloc class boundaries (the accounting seam), a value with
+    /// interior NULs (the layout must never treat the payload as C-string),
+    /// and a large value. Each one round-trips through every read API and
+    /// through `Clone`, `into_redis_value` and `to_redis_value`.
+    ///
+    /// Byte `i` of the fixture is `i ^ 0xA5`, so no two positions repeat
+    /// within 256 bytes and a length/pointer mix-up shows as a mismatch, not
+    /// as a lucky equality.
+    #[test]
+    fn string_round_trips_across_the_size_spectrum() {
+        let sizes: &[usize] = &[
+            0,
+            1,
+            SSO_MAX_LEN - 1,
+            SSO_MAX_LEN,
+            SSO_MAX_LEN + 1,
+            13,
+            15,
+            16,
+            17,
+            31,
+            32,
+            33,
+            63,
+            64,
+            65,
+            100,
+            127,
+            128,
+            129,
+            255,
+            256,
+            257,
+            4_095,
+            4_096,
+            4_097,
+            65_536,
+            1 << 20,
+        ];
+        for &len in sizes {
+            let data: Vec<u8> = (0..len).map(|i| (i as u8) ^ 0xA5).collect();
+
+            let by_slice = CompactValue::from_slice(&data);
+            let by_value =
+                CompactValue::from_redis_value(RedisValue::String(Bytes::from(data.clone())));
+            let by_vec = CompactValue::heap_string_vec_direct(data.clone());
+
+            for (which, cv) in [("slice", by_slice), ("value", by_value), ("vec", by_vec)] {
+                assert_eq!(cv.is_inline(), len <= SSO_MAX_LEN, "{which} len={len}");
+                assert_eq!(
+                    cv.as_bytes(),
+                    Some(&data[..]),
+                    "{which} len={len}: as_bytes"
+                );
+                assert_eq!(
+                    cv.as_bytes_owned().as_deref(),
+                    Some(&data[..]),
+                    "{which} len={len}: as_bytes_owned"
+                );
+                match cv.as_redis_value() {
+                    RedisValueRef::String(s) => {
+                        assert_eq!(s, &data[..], "{which} len={len}: as_redis_value")
+                    }
+                    _ => panic!("{which} len={len}: not a string ref"),
+                }
+                assert_eq!(cv.type_name(), "string");
+                assert_eq!(cv.type_tag(), 0);
+
+                let cloned = cv.clone();
+                assert_eq!(
+                    cloned.as_bytes(),
+                    Some(&data[..]),
+                    "{which} len={len}: clone"
+                );
+                match cv.to_redis_value() {
+                    RedisValue::String(s) => assert_eq!(&s[..], &data[..]),
+                    _ => panic!("{which} len={len}: to_redis_value"),
+                }
+                match cv.into_redis_value() {
+                    RedisValue::String(s) => assert_eq!(&s[..], &data[..]),
+                    _ => panic!("{which} len={len}: into_redis_value"),
+                }
+                drop(cloned);
+            }
+        }
+
+        // Interior NULs and 0xFF, at a heap size.
+        let nul = [0u8, 0xFF, 0, b'a', 0, 0, 0xFF, 0, b'z', 0, 0, 0, 0, 0xFF, 0];
+        let cv = CompactValue::from_slice(&nul);
+        assert!(!cv.is_inline());
+        assert_eq!(cv.as_bytes(), Some(&nul[..]));
+        assert_eq!(cv.estimate_memory(), cv.clone().estimate_memory());
+    }
+
+    /// In-place mutation through `as_bytes_mut` keeps the length and the
+    /// bytes consistent (SETRANGE without growth uses this path).
+    #[test]
+    fn as_bytes_mut_edits_in_place_at_every_heap_size() {
+        for len in [13usize, 16, 17, 64, 65, 4_096] {
+            let mut cv = CompactValue::from_slice(&vec![b'a'; len]);
+            {
+                let m = cv.as_bytes_mut().expect("heap string is mutable");
+                assert_eq!(m.len(), len);
+                m[0] = b'X';
+                m[len - 1] = b'Y';
+            }
+            let got = cv.as_bytes().unwrap();
+            assert_eq!(got.len(), len);
+            assert_eq!(got[0], b'X');
+            assert_eq!(got[len - 1], b'Y');
+            assert!(got[1..len - 1].iter().all(|&b| b == b'a'));
+        }
+        assert!(
+            CompactValue::inline_string(b"short")
+                .as_bytes_mut()
+                .is_none()
+        );
+    }
+
+    /// The length of a heap string is split across `len_and_tag` (high 28
+    /// bits) and `payload[0..4]` (low 32 bits). The codec must be exact at
+    /// every boundary of that split — a 4 GiB value cannot be allocated in a
+    /// unit test, so the pure functions are tested directly.
+    #[test]
+    fn heap_len_codec_is_exact_across_60_bits() {
+        let cases: &[usize] = &[
+            SSO_MAX_LEN + 1,
+            u32::MAX as usize - 1,
+            u32::MAX as usize,
+            u32::MAX as usize + 1,
+            1 << 32,
+            (1 << 32) + 12_345,
+            (1 << 40) | 0xDEAD_BEEF,
+            (1 << 60) - 1,
+        ];
+        for &len in cases {
+            let (hi, lo) = encode_heap_len(len);
+            assert_eq!(hi & !LEN_MASK, 0, "high part must fit in LEN_MASK");
+            assert_eq!(
+                decode_heap_len(hi, u32::from_ne_bytes(lo)),
+                len,
+                "len={len:#x}"
+            );
+        }
+        // The high nibble is the type marker and must never be touched by
+        // the length, whatever the length is.
+        let (hi, _) = encode_heap_len((1 << 60) - 1);
+        assert_eq!(hi & TYPE_MASK, 0);
+    }
+
+    /// `estimate_memory` on a heap string must be a function of the 16-byte
+    /// value alone. The proof: the value reports the same figure after its
+    /// heap buffer has been overwritten byte-for-byte through `as_bytes_mut`
+    /// — nothing on the heap encodes the length, so nothing on the heap can
+    /// feed the estimate.
+    #[test]
+    fn heap_string_estimate_is_read_from_the_value_not_the_heap() {
+        for len in [13usize, 64, 100, 4_097] {
+            let mut cv = CompactValue::from_slice(&vec![0u8; len]);
+            let before = cv.estimate_memory();
+            cv.as_bytes_mut().unwrap().fill(0xFF);
+            assert_eq!(cv.estimate_memory(), before, "len={len}");
+            assert_eq!(cv.heap_string_len(), len);
+            assert!(
+                cv.estimate_memory() >= crate::storage::mem_size::size_class(len),
+                "must bill at least the data buffer's size class"
+            );
+        }
     }
 
     #[test]
