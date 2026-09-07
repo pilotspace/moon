@@ -222,6 +222,15 @@ Each of these silently produced a plausible, wrong result at least once:
 - **`moon_dispatch_path_total` is not a remote-fraction metric.** The inline path
   records `path="local_inline"`, and the counter was absent on the prototype
   binary — it read a false 100%.
+- **A same-host `redis-benchmark --threads 4` inflates the read fast path's
+  SPSC residual 15x.** Same binary, same c200 p=1 saturated-keyspace fixture:
+  `cross_spsc` 13.5-15.1% of commands with the client on the server's 8 vCPUs,
+  **0.90%** with the client on `moon-bench-client`. The `off` control reads
+  87.5% either way. Twelve runnable threads on eight vCPUs preempt a shard
+  thread while it holds the exclusive guard, and every foreign `try_read` that
+  lands in that quantum declines to SPSC (§8.3). Score the fast path only from a
+  dedicated load generator, and treat any same-host residual above ~1% as
+  oversubscription, not as the mechanism.
 - **redis-benchmark 8.x emits `\r`** for progress lines: `tr '\r' '\n'` before
   grepping, and match the RPS by position — `awk '{print $2}'` yields
   `summary:`.
@@ -330,6 +339,133 @@ read side by removing exactly this batch boundary.
 
 **Do not score a cross-shard path with these counters without first checking
 that the path increments them.**
+
+### 8.3 Re-take at moon#773's fixture (2026-09-07): the residual is the owner's exclusive guard, and a same-host client inflates it 15x
+
+The §8 table is c50, n=200k. moon#773's 87.54% was c200. Re-measured at HEAD
+(`6251429f`, `release-fast`, monoio, `--shards 8 --appendonly no --admin-port
+9413`, 2M `SET`s over `-r 100000` so `DBSIZE` = 100,000 and `keyspace_misses`
+= 0 in every leg, GET p=1 n=2M, counters as deltas because `CONFIG RESETSTAT`
+does not reset them). Two load-generator placements, same binary:
+
+| client | c | `local_inline` | `cross_read_fast` | `cross_spsc` | parks/cmd | rps |
+|---|---:|---:|---:|---:|---:|---:|
+| same host, `--threads 4` | 200 `auto` | 12.5% | 72.3-74.0% | **13.5-15.1%** | 0.135-0.151 | 250-286K |
+| same host, `--threads 4` | 200 `off`  | 12.5% | 0 | 87.5% | 0.872 | 228K |
+| same host, `--threads 4` | 25 / 50 / 100 / 400 `auto` | 12.5% | — | 2.4 / 4.2 / 7.8 / 20.1% | = `cross_spsc` | 250-296K |
+| same host, single thread | 50 `auto` | 12.5% | 86.7% | **0.71-0.91%** | 0.007-0.009 | 100K |
+| **`moon-bench-client`, `--threads 4`** | **200 `auto`** | 12.5% | **86.63%** | **0.90%** | **0.0089** | 275K |
+| `moon-bench-client`, `--threads 4` | 200 `off` | 12.5% | 0 | 87.52% | 0.866 | 266K |
+| `moon-bench-client`, `--threads 4` | 50 `auto` | 12.5% | 86.89% | 0.62% | 0.0062 | 235K |
+
+Three reps at c200 same-host, two per point on the sweep, one per two-host
+cell; spreads are the ranges shown. `total_remote_awaits_parked` equals the
+`cross_spsc` delta to within 0.1% in every `auto` leg: **every read that
+declines the fast path still parks** — the residual is pure park, never a
+cheaper message.
+
+What the residual is. `keyspace_misses` = 0 rules out the cold-key decline
+(a); p=1 with `pending_mask` reset per batch rules out (b); a single-key `GET`
+rules out (c); the binary is monoio, ruling out (e). What is left is (d),
+`try_foreign_db_read` returning `None` because the owner holds the exclusive
+guard — and the owner takes it for its *reads*: the inline `GET` at
+`server/conn/blocking.rs:2515` goes through `with_shard_db` (`set.write()`)
+because `promote_inflight_if_present` needs `&mut`, and every SPSC execute arm
+takes `databases.write()` (§3 dead end 8). On a dedicated 8-vCPU server that
+hold is ~100 ns and collides 0.6-0.9% of the time. With four client threads
+sharing those vCPUs, a holder is preempted mid-hold and the window becomes a
+scheduler quantum, which is why the same-host residual tracks client CPU
+(`--threads 4` vs one thread: 4.2% vs 0.75% at c50) and connection count (the
+sweep), not n (200k vs 2M: identical). §3 dead end 8 tested the SPSC arms at
+63% keyspace coverage, where cold keys masked everything; it never tested the
+inline path, and it never tested at saturation.
+
+**Corrected claim.** "100% in place / 0.0003 parks/cmd" holds at c50 with a
+light client. The citable HEAD number for the #773 fixture is **99.0% of
+foreign reads in place at c200 (0.9% residual, 0.0089 parks/cmd) from a
+dedicated load generator**, against 0.866 parks/cmd with the flag off. The
+same-host 13.5% is a measurement artifact (§6) and must not be quoted as the
+mechanism's rate.
+
+Raw outputs: `tmp/perf-campaign/G2-DELETE.md` (this repo's campaign
+directory), copied from `retake773*.out` on `moon-bench-x86`.
+
+## 9. Cross-connection read coalescing (C3) — retired unbuilt
+
+`src/shard/dispatch.rs` carried a `CoalescedReadBatch` type from 2026-06-13
+(ADD task `xshard-read-fastpath`, C1) until 2026-09-07. It had **no producer and
+no consumer** for its entire life: no `ShardMessage` arm, no `spsc_handler` arm,
+no config, no metric. Its only references were its own definition and a
+type-existence test. PR #177 shipped C1 (types) and C2 (idle-gated reply spin)
+and deferred C3; the follow-up task was never created. This section records why
+the line is closed, so the idea is not re-invented from the type's absence.
+
+**The design.** Accumulate N independent single-key foreign reads from DIFFERENT
+connections on the origin shard into one message to a single owner shard, and
+route each result back to its own connection's `ResponseSlot`.
+
+**The ordering invariant it asserted** (worth preserving — any future
+cross-connection batching owes the same proof, and §5.4 of the G2 analysis
+states it as a formal obligation): coalescing groups reads ACROSS connections
+only. Within one connection, submission order and read-your-writes hold exactly
+as on the un-batched path — a read is never reordered before that connection's
+own acked write. The oracle for this is the consistency suite
+(`scripts/test-consistency.sh` at 1/4/12 shards), not a unit test.
+
+**Why it was retired.** Three independent lines, none of them opinion:
+
+1. **It attacks the term measured at zero.** Coalescing reduces `msgs/cmd`.
+   Each of the N connections still parks on its own `ResponseSlot` and is still
+   woken individually by `slot.fill`, so `parks/cmd` is unchanged. Under the §1
+   fit (`cost = 0.413 - 0.046*msgs/cmd + 2.488*parks/cmd`) the best case is
+   `0.046 x 0.875 = 0.04` CPU%/kops out of 2.586 — about 1.5%. This is
+   **dead end #1 restated**, and #1 was already predicted at 0.99x.
+2. **Batching the wake instead does not help either.** That variant is D1, and it
+   was pre-flighted and retired in #778: monoio's `EventWaker` already coalesces
+   87% of cross-thread wakes (0.111 `syscw`/cmd against 0.872 parks/cmd at c200
+   p=1 s8). The park is a fixed 13.29 us (bootstrap, 90% CI [12.22, 14.28], 30
+   rows in `.add/tasks/xshard-read-fastpath/d1_preflight.csv`); forcing that term
+   to zero collapses the fit's R^2 from 0.9937 to 0.69. The signal is not the cost.
+3. **Its premise stopped being true.** C3 was justified by
+   "a foreign lock-free read is storage-impossible in place, so SPSC is the only
+   door and we make IT cheaper" (`TASK.md:32-36`). L4 made `Database`
+   `Send + Sync` behind a per-`(shard, db)` `RwLock` (`src/shard/db_plane.rs`,
+   static assertion at `:498-506`), and `try_foreign_db_read`
+   (`src/shard/slice.rs:581-589`) now serves the read on the calling thread with
+   one CAS. C3 would have been optimising the fallback. §8 measures the
+   replacement at 100% served in place, 0.0003 parks/cmd on a saturated
+   keyspace — **at c50 with a light client**. The 2026-09-07 re-take at #773's
+   own fixture (c200, n=2M, `--threads 4`, `DBSIZE` 100,000, §8.3) measures
+   **99.0% of foreign reads in place, 0.90% of commands still on SPSC, 0.0089
+   parks/cmd** from a dedicated load generator, against 87.5% / 0.866 with the
+   flag off. (A same-host client reads 13.5-15.1% instead — lock-holder
+   preemption on an oversubscribed box, §6/§8.3, not the mechanism.) The
+   residual is the owner's exclusive guard (decline (d)) and each of its reads
+   still parks on its own slot, so it is not something coalescing could touch
+   either: batching the residual's messages would leave every one of its parks
+   in place — dead end #1 again, on under 1% of traffic instead of 87.5%.
+
+**The hazard it also removes.** After #768, reply assembly for spanning
+multi-key reads goes through `ReplySink::Part` + the `fanout_state` fold, with
+`multikey_placement` as the ONE placement decision function. A cross-connection
+C3 producer would have had to understand that fold too, giving reply assembly
+two answers to the same question — the exact shape #708 and #768 built
+`multikey_placement` to close.
+
+**Where the energy goes instead.** Every remaining lever removes a *park* (the
+2.488 coefficient) or a *batch cut*, never a message: cross-shard **writes**,
+still at 0.875 parks/cmd because the fast path is gated on `!is_write` (§8
+"What this does NOT touch"; D3, `docs/internal/d3-concurrent-keyspace.md`); the
+**owner's exclusive guard on its own read paths** (§8.3 — the inline GET at
+`server/conn/blocking.rs:2515` and every SPSC execute arm take
+`databases.write()`, and each such hold turns a concurrent foreign `try_read`
+into a parked SPSC hop — 0.6-0.9% of commands on a dedicated host, and the
+whole of the fast path's remaining park budget); the **tokio/Windows**
+handler, which has no fast-path twin and still routes every foreign read
+through SPSC; narrowing `pending_mask` to writes only; and serving #768's
+spanning-read parts through `try_foreign_db_read`.
+
+---
 
 ## See also
 

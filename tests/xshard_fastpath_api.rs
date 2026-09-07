@@ -3,7 +3,11 @@
 //!
 //! These are RED until §5 BUILD defines the symbols:
 //!   - `moon::shard::slice::xshard_may_spin` / `XshardWaitGuard` / `XSHARD_SPIN_GATE`
-//!   - `moon::shard::dispatch::CoalescedReadBatch`
+//!
+//! The C3 pin (`moon::shard::dispatch::CoalescedReadBatch`) was REMOVED with the
+//! type itself — cross-connection read coalescing was retired unbuilt, superseded
+//! by the L4 foreign-read fast path. See `docs/internal/cross-shard-cost-model.md`
+//! §9 for the reasoning and the measurement that closed the line.
 //!
 //! Before build the imports below are UNRESOLVED → this test crate fails to compile.
 //! That compile failure IS the red signal for this file (the other test crates are
@@ -152,14 +156,4 @@ fn batch_gate_and_inflight_gate_compose() {
         xshard_should_spin(1),
         "singleton read on a now-idle shard spins again once waiters drain"
     );
-}
-
-/// xrf2 — the cross-connection coalescing message type exists and is referenceable.
-/// Routing CORRECTNESS (read-your-writes, per-connection submission order) is proven
-/// by the consistency suite (`scripts/test-consistency.sh` 197/197 @1/4/12), NOT here:
-/// the frozen contract names the 197-suite + xrf-ryw as the oracle for C3.
-#[test]
-fn coalesced_read_batch_type_exists() {
-    fn _assert_type_exists<T>() {}
-    _assert_type_exists::<moon::shard::dispatch::CoalescedReadBatch>();
 }

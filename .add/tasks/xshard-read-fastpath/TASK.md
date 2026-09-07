@@ -92,6 +92,20 @@ Must:
     into fewer SPSC messages; the s4 P1 GET cell recovers measurably toward parity
     vs the M0 baseline. Coalescing preserves per-connection command order and
     read-your-writes exactly as the lock-free path does today.
+    [RETIRED 2026-09-07 — not built, and will not be. Superseded by the L4 S4
+    foreign-read fast path (#777, default-`auto` since #785), which removes the
+    hop entirely rather than making it cheaper: on a saturated keyspace 99.0%
+    of foreign reads served in place at #773's c200 fixture from a dedicated
+    load generator (0.0089 parks/cmd vs 0.866 with the flag off, cost model
+    §8.3; §8's "100%" is the c50 light-client number), the remainder declining
+    on the owner's exclusive guard, not on anything a batch could fix. The
+    wake-batching variant
+    (D1) was separately retired by measurement in #778. Coalescing optimises
+    `msgs/cmd`, whose fitted coefficient is ~0 — this is dead end #1. The
+    `CoalescedReadBatch` type and its xrf2 type-pin test were deleted; the
+    reasoning and the ordering invariant are preserved in
+    `docs/internal/cross-shard-cost-model.md` §9. History above is left as
+    written.]
   - M3 (cleanup, hard-remove): `--cross-shard-fast-path` (the `cross_shard_fast_path`
     field + `CrossShardFastPath` enum + `cross_shard_fast_path_enabled`), the
     `moon_cross_shard_lock_contention_total` metric, the

@@ -201,6 +201,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   A `record_dispatch_cross_read_fast_batch` counterpart was added for the L4
   shared-guard read path, which had no batched variant.
+### Removed
+
+- **`shard`: `CoalescedReadBatch`, the cross-connection read-coalescing type
+  that never had a producer or a consumer (moon#773).** Defined in PR #177 with
+  the `xshard-read-fastpath` C1 types and deferred at C3, it sat in
+  `src/shard/dispatch.rs` for three months with no `ShardMessage` arm, no
+  `spsc_handler` arm, no config and no metric — its only references were its own
+  definition and a type-existence test. In the type index and in code review it
+  read as a shipped cross-shard optimisation. It was not one.
+
+  It is deleted rather than wired up because all three arguments for building it
+  have since failed. Its stated premise — "a foreign lock-free read is
+  storage-impossible in place, so SPSC is the only door" — stopped being true
+  when L4 made `Database` `Send + Sync` and `try_foreign_db_read` began serving
+  foreign reads on the calling thread with one CAS (#777, default `auto` since
+  #785); coalescing would now be optimising the fallback. It also attacks the
+  wrong term: it reduces `msgs/cmd`, whose fitted coefficient in the cost model
+  is ~0, while every connection still parks on its own `ResponseSlot` — that is
+  dead end #1, predicted 0.99x. And the variant that batches the *wake* instead
+  was pre-flighted and retired in #778, because monoio's `EventWaker` already
+  coalesces 87% of cross-thread wakes.
+
+  The reasoning, the load-bearing ordering invariant the type's doc comment
+  asserted, and the pointer to where the remaining cross-shard work actually is
+  (writes at 0.875 parks/cmd, the tokio handler, the read-side declines) are
+  preserved in `docs/internal/cross-shard-cost-model.md` §9. No behaviour
+  changes: nothing constructed, sent or matched on this type.
+
+### Fixed
+
+- **`bench`: `scripts/gcloud-xshard-absolute.sh` could not toggle the
+  cross-shard fast path, so its `s4-c1-GET` cell silently stopped measuring the
+  thing it is named for (moon#416).** `start_moon` passed a fixed server-argument
+  list. Since #785 flipped `--cross-shard-fast-path` to `auto` by default, that
+  cell on a populated keyspace is served in place by the L4 fast path — it was
+  reporting the fast path while the harness, the CSV and the frozen
+  XSHARD-READ-01 contract row all still called it the SPSC hop.
+
+  `start_moon` and `cell` now take an optional extra-server-args string, and
+  `--extra-args` / `MOON_EXTRA_ARGS` plumb it from the command line, so the hop
+  and the fast path can be measured as two cells of one A/B instead of one
+  ambiguous number. The default cell set now runs `s4-c1-GET-hop`
+  (`--cross-shard-fast-path off`, the actual hop) alongside `s4-c1-GET`
+  (default `auto`), and a `--self-test` gate fails closed if the passthrough
+  ever stops reaching the server process.
 
 ## [0.8.9] — 2026-09-04
 
