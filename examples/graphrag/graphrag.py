@@ -98,8 +98,10 @@ PROJECTS = [
         "text": (
             "Moon is a high-performance Redis-compatible server written in Rust. "
             "It features a thread-per-core architecture, dual runtime support "
-            "(monoio + tokio), forkless persistence, and 27-35% less memory "
-            "than Redis at 1KB+ values."
+            "(monoio + tokio), forkless persistence, and 15-17% less memory "
+            "per key than Redis at values of 1KB and up (Linux x86_64, "
+            "--shards 1, vs Redis built with jemalloc; see BENCHMARK.md "
+            "section 3)."
         ),
     },
     {

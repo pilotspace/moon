@@ -28,5 +28,4 @@ EXACTLY FOUR pencil annotations with thin leader lines, each used once, nowhere 
 CONNECTIONS: thin solid pencil arrows for request flow left to right;
 one thin dashed pencil line between router and lanes labeled "SPSC channels".
 
-Bottom-left corner: small box "27-35% less memory than Redis at values >= 1 KB"
 Bottom-right corner: legend "solid = request flow · dashed = cross-shard messages"

@@ -87,7 +87,9 @@ DOCUMENTS = [
         "id": "doc:6",
         "title": "Memory optimization",
         "text": (
-            "Moon achieves 27-35% less RSS than Redis at 1KB+ values through "
+            "Moon uses 15-17% less RSS per key than Redis (jemalloc build) at values "
+            "of 1KB and up, measured on Linux x86_64 at --shards 1 (BENCHMARK.md "
+            "section 3); at 32-byte values it uses more. The savings come from "
             "CompactKey (23-byte SSO), CompactValue (16-byte SSO with inline TTL), "
             "HeapString, B+ tree sorted sets, and per-request bumpalo arenas."
         ),

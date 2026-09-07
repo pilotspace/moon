@@ -184,7 +184,7 @@ DOCUMENTS = [
     {"id": "doc:vector", "title": "Vector Search", "text": "Moon's vector engine uses HNSW with TurboQuant 4-bit quantization for fast similarity search."},
     {"id": "doc:graph", "title": "Graph Engine", "text": "Moon's graph engine supports 14 GRAPH.* commands with a Cypher subset for knowledge graphs."},
     {"id": "doc:persist", "title": "Persistence", "text": "Moon uses forkless persistence with per-shard WAL for crash recovery without fork() overhead."},
-    {"id": "doc:memory", "title": "Memory Optimization", "text": "CompactKey (23-byte SSO) and CompactValue reduce RSS by 27-35% vs Redis at 1KB+ values."},
+    {"id": "doc:memory", "title": "Memory Optimization", "text": "CompactKey (23-byte SSO) and CompactValue reduce per-key RSS by 15-17% vs Redis (jemalloc) at values of 1KB and up, measured on Linux x86_64 at --shards 1; moon uses more memory than Redis at 32-byte values. See BENCHMARK.md section 3."},
     {"id": "doc:cache", "title": "Semantic Cache", "text": "FT.CACHESEARCH checks vector-similar cache entries before falling back to full KNN search."},
     {"id": "doc:session", "title": "Session Search", "text": "Session-aware search deduplicates results across multiple queries in a conversation."},
     {"id": "doc:console", "title": "Web Console", "text": "Moon ships a 7-view web console with Dashboard, Browser, Console, Vectors, Graph, Memory, Help."},
