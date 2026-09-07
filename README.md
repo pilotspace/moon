@@ -245,7 +245,13 @@ classic gaps too:
   flag yields 1.06–1.08× on x86 and nothing outside the noise floor on ARM,
   because the contention governor below correctly self-gates there. As of v0.8.1 the busy-poll **auto-gates on
   shared cores** (per-shard contention governor), so the preset is safe on any
-  host — not just pinned ones.
+  host — not just pinned ones. **This is a single-connection result and does
+  not generalise to concurrency** — `--profile standalone` also sets
+  `--shards 1`, and moon#772 measured it at **-80%** vs stock `--shards N` at
+  200 concurrent connections (64,891 vs 332,779 ops/s, GCE t2a-standard-8).
+  Use the preset for a handful of latency-sensitive connections (sessions,
+  rate limiting); at dozens-to-hundreds of connections, stock `--shards N`
+  (N = physical cores) is the throughput-correct choice.
 - **Fully durable writes** (`appendfsync always`, p=16) went from 0.12× to
   **0.91× Redis** via per-batch group commit + coalesced writes, while
   `everysec` p=16 is a **1.32× win** — with kill-9-lossless recovery.

@@ -183,6 +183,15 @@ fn main() -> anyhow::Result<()> {
                      host with dedicated/pinned CPU cores for the moon \
                      process. See docs/guides/tuning.md#profiles."
                 );
+                tracing::warn!(
+                    "--profile standalone is scoped to LOW connection \
+                     counts (sessions, rate limiting) -- it also sets \
+                     --shards 1, forfeiting the other cores. moon#772 \
+                     measured -80% throughput vs stock --shards N at 200 \
+                     concurrent connections. For dozens-to-hundreds of \
+                     connections, use stock --shards N (N = physical \
+                     cores) instead. See docs/guides/tuning.md#profiles."
+                );
             }
         }
         Ok(moon::config::ProfileOutcome::None) => {}

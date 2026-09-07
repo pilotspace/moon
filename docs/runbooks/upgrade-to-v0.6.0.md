@@ -82,11 +82,15 @@ redis-cli -p 6379 -n <n> --scan --pattern '<ws-uuid>:*'
 
 ## 5. New tuning shortcut
 
-For single-instance deployments, `--profile standalone` fills in the measured
-best flags for a shard-1 node (`--shards 1 --io-busy-poll-us 40 --io-driver
-epoll`) without overriding anything you set explicitly. Only use busy-poll on
+For single-instance deployments with a **low connection count** (sessions, rate
+limiting), `--profile standalone` fills in the measured best flags for a
+shard-1 node (`--shards 1 --io-busy-poll-us 40 --io-driver epoll`) without
+overriding anything you set explicitly. Only use busy-poll on
 pinned/dedicated cores — on shared/oversubscribed hosts it regresses (see
-`docs/guides/tuning.md`).
+`docs/guides/tuning.md`). It does not scale to high connection counts: it also
+sets `--shards 1`, and moon#772 measured -80% vs stock `--shards N` at 200
+concurrent connections — use stock `--shards N` (N = physical cores) instead
+at that concurrency.
 
 ## Rollback
 
