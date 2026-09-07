@@ -71,12 +71,55 @@ fn encoding(port: u16, key: &str) -> String {
         .to_string()
 }
 
-/// The AOF manifest's `seq` line. A completed rewrite publishes a new
-/// `moon.aof.<seq>.base.rdb` and bumps this; nothing else does.
-fn manifest_seq(dir: &std::path::Path) -> Option<u64> {
-    let text = std::fs::read_to_string(dir.join("appendonlydir").join("moon.aof.manifest")).ok()?;
-    text.lines()
-        .find_map(|l| l.strip_prefix("seq ")?.trim().parse().ok())
+/// A layout-independent fingerprint of the AOF base that a completed rewrite
+/// advances.
+///
+/// The two runtimes write DIFFERENT layouts, and the test runs on both:
+/// the monoio writers use the `appendonlydir` manifest layout, while the tokio
+/// TopLevel writer appends to one flat `<dir>/appendonly.aof`
+/// (`src/persistence/aof/auto_rewrite.rs:59-62` — "they never coexist for one
+/// server"). Watching only the manifest made this test hang for its full 30 s
+/// timeout on the hosted tokio Check leg, where `appendonlydir` never exists
+/// and the seq read is `None` forever.
+#[derive(Debug, PartialEq)]
+enum Base {
+    /// monoio: the manifest `seq`. A completed rewrite publishes a new
+    /// `moon.aof.<seq>.base.rdb` and bumps this; nothing else does.
+    Manifest(u64),
+    /// tokio: (len, mtime) of the flat file. A rewrite replaces it wholesale.
+    Flat(u64, Option<std::time::SystemTime>),
+    /// Neither layout present yet.
+    Absent,
+}
+
+fn read_base(dir: &std::path::Path) -> Base {
+    let manifest = dir.join("appendonlydir").join("moon.aof.manifest");
+    if let Ok(text) = std::fs::read_to_string(&manifest) {
+        if let Some(seq) = text
+            .lines()
+            .find_map(|l| l.strip_prefix("seq ")?.trim().parse().ok())
+        {
+            return Base::Manifest(seq);
+        }
+    }
+    if let Ok(md) = std::fs::metadata(dir.join("appendonly.aof")) {
+        return Base::Flat(md.len(), md.modified().ok());
+    }
+    Base::Absent
+}
+
+/// True once `after` shows a rewrite has landed relative to `before`.
+fn base_advanced(before: &Base, after: &Base) -> bool {
+    match (before, after) {
+        (Base::Manifest(b), Base::Manifest(a)) => a > b,
+        // The flat file is replaced wholesale by a rewrite: any change to its
+        // size or mtime is the completion signal. Compared as a whole so a
+        // same-size rewrite is still caught by mtime.
+        (Base::Flat(..), Base::Flat(..)) => before != after,
+        // Layout appeared during the wait (first rewrite on a fresh dir).
+        (Base::Absent, Base::Manifest(_) | Base::Flat(..)) => true,
+        _ => false,
+    }
 }
 
 /// Wait until the rewrite kicked off by `BGREWRITEAOF` has published its new
@@ -86,29 +129,31 @@ fn manifest_seq(dir: &std::path::Path) -> Option<u64> {
 /// (measured: 66 before and after a rewrite that wrote a 3 KB base). The
 /// manifest `seq` advancing is what the loader itself trusts, so it is what
 /// this waits on. Panics with the last observation on timeout.
-fn wait_for_rewrite(port: u16, dir: &std::path::Path, seq_before: u64) {
+fn wait_for_rewrite(port: u16, dir: &std::path::Path, before: &Base) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let mut last = (None, String::new());
+    let mut last = (Base::Absent, String::new());
     while std::time::Instant::now() < deadline {
         let mut c = common::Conn::open(port);
         let info = c.send(&["INFO", "persistence"]);
-        let seq = manifest_seq(dir);
-        let base_exists = seq.is_some_and(|s| {
-            dir.join("appendonlydir")
+        let now = read_base(dir);
+        // On the manifest layout the published base file must also exist --
+        // the seq line lands before the file is fsynced into place.
+        let base_ready = match &now {
+            Base::Manifest(s) => dir
+                .join("appendonlydir")
                 .join(format!("moon.aof.{s}.base.rdb"))
-                .exists()
-        });
-        if info.contains("aof_rewrite_in_progress:0")
-            && seq.is_some_and(|s| s > seq_before)
-            && base_exists
-        {
+                .exists(),
+            Base::Flat(..) => true,
+            Base::Absent => false,
+        };
+        if info.contains("aof_rewrite_in_progress:0") && base_advanced(before, &now) && base_ready {
             return;
         }
-        last = (seq, info);
+        last = (now, info);
         std::thread::sleep(Duration::from_millis(100));
     }
     panic!(
-        "BGREWRITEAOF did not publish a new base within 30s (manifest seq before {seq_before}, \
+        "BGREWRITEAOF did not publish a new base within 30s (base before {before:?}, \
          last seen {:?}); last INFO persistence:\n{}",
         last.0, last.1
     );
@@ -180,7 +225,7 @@ fn compact_encodings_survive_a_restart() {
     // every key live and prove nothing about reload). Then take the server
     // down and bring it back on the same --dir: the exact sequence that used
     // to flatten everything.
-    let seq_before = manifest_seq(&dir).unwrap_or(0);
+    let base_before = read_base(&dir);
     {
         let mut c = common::Conn::open(port);
         let reply = c.send(&["BGREWRITEAOF"]);
@@ -189,7 +234,7 @@ fn compact_encodings_survive_a_restart() {
             "BGREWRITEAOF was refused: {reply:?}"
         );
     }
-    wait_for_rewrite(port, &dir, seq_before);
+    wait_for_rewrite(port, &dir, &base_before);
     guard.kill_now();
     common::wait_for_port_down(port);
 
