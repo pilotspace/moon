@@ -6,7 +6,7 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::db::{INTSET_MAX_ENTRIES, set_member_cost, set_table_bytes};
-use crate::storage::entry::Entry;
+use crate::storage::entry::{Entry, boxed_payload_block};
 
 use super::{collect_sets, parse_int};
 use crate::command::helpers::{err_wrong_args, extract_bytes};
@@ -84,7 +84,11 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                             set.insert(member.clone());
                         }
                     }
-                    let new_cost: usize = set_table_bytes(set)
+                    // `boxed_payload_block`: the `IndexSet` the members move
+                    // into is a boxed payload of its own — 80 B the intset did
+                    // not have. See the matching note in hash_write.rs.
+                    let new_cost: usize = boxed_payload_block(set)
+                        + set_table_bytes(set)
                         + set.iter().map(|m| set_member_cost(m)).sum::<usize>();
                     db.credit_memory(after);
                     db.charge_memory(new_cost);

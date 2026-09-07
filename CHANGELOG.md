@@ -36,6 +36,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **1 rps**. Both reproduced against live `redis-benchmark` 8.x output before
   and after the fix; the parser now anchors on the position of the words
   `requests per second` and takes the last match.
+- **`storage`: `used_memory` bills the boxed payload block of every fat
+  `RedisValue` variant.** `CompactValue::estimate_memory` charged
+  `size_class(size_of::<RedisValue>())` for the outer `Box<RedisValue>` and
+  nothing for the payload blocks *inside* it. Two consequences, both measured:
+
+  - `RedisValue::Stream` has carried a `Box<StreamData>` since it was written,
+    and its **112-byte block was never billed** — a pre-existing under-count on
+    every stream key, independent of the boxing above.
+  - After boxing the fat variants the gap widens to all six: a `Set` key's
+    ledger would fall 80 B while its RSS did not move at all, and a
+    `SortedSetBPTree` key's would fall 128 B while its RSS rose 48 B. That is
+    `used_memory` moving *away* from RSS — the exact failure mode moon#788
+    exists to prevent, because a ledger that drifts makes `--maxmemory` unable
+    to bind.
+
+  `estimate_memory` now adds `boxed_payload_bytes()`, one `size_class` term per
+  boxed field, derived with `size_of_val` of the pointee so it follows the
+  declared field type rather than a copied constant.
+
+  Three encoding-upgrade sites in the command layer (`HSET`/`HSETNX` listpack
+  -> `Hash`, `SADD` intset -> `Set`) re-derived the post-upgrade cost by hand
+  and so missed the new block; `hash_and_list_mutations_keep_the_ledger_exact`
+  caught the 48 B drift between the running ledger and a full recompute. All
+  three now call the same `boxed_payload_block` the value itself uses.
+
+  `every_boxed_payload_block_is_billed` covers all six variants and fails on
+  each of them without the fix.
 
 - **`ci`: clippy now lints tests, benches and examples.** Every clippy
   invocation in `ci.yml` was lib-only, so `--all-targets` code was never
@@ -1461,98 +1488,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Removal moves to `swap_remove` (O(1), reorders) rather than `shift_remove`
   (O(n), order-preserving). Redis set iteration order is unspecified, and all
   5,136 lib tests pass, so nothing depended on it.
-- **`storage`: every container key stops allocating 128 B to hold as little as
-  24 B.** `CompactValue::from_redis_value` stores a collection as a
-  `Box<RedisValue>`, so the block charged to a container key is
-  `size_of::<RedisValue>()` — the width of the enum's *widest* variant — no
-  matter which variant the key actually holds. One variant set that width:
+- **`storage`: the block a container key allocates is priced by the variant it
+  holds, not by the widest variant in the enum.**
+  `CompactValue::from_redis_value` stores a collection as a `Box<RedisValue>`,
+  so the block charged to a container key was `size_of::<RedisValue>()` — the
+  width of the enum's *widest* variant — no matter which variant the key
+  actually holds. One variant set that width:
 
   | variant | payload |
   |---|---:|
   | `HashListpack` / `ListListpack` / `SetListpack` | 24 |
   | `String(Bytes)` / `List` / `SetIntset` | 32 |
-  | `Hash` / `Set` | 48 |
+  | `Hash` | 48 |
+  | `Set` (`IndexSet`) | 72 |
   | `SortedSet { members, scores }` | 72 |
   | `HashWithTtl { fields, ttls, min }` | 104 |
   | `SortedSetBPTree { tree, members }` | **128 <- sets the enum** |
 
   A hash small enough to live in a listpack — the common case — was billed the
   128 bytes that a large B+tree zset needs. The five fat payloads are now
-  boxed, taking the enum from **128 B to 40 B**. Against jemalloc's 64-bit
-  small classes (8, 16, 32, 48, 64, 80, 96, 112, 128, …) that moves the
-  allocation from the 128-byte class to the 48-byte one: **80 B saved per
-  container key**, on hashes, lists, sets, zsets and streams alike.
+  boxed, taking the enum from **128 B to 40 B** and its jemalloc class from 128
+  to 48.
 
-  Boxing `SortedSetBPTree` alone would have bought only 16 B, because
-  `HashWithTtl` (104) becomes the next ceiling — the whole set is needed.
+  **What that is worth, per container key, is not one number.** Boxing a
+  payload does not delete it: it moves it into a *second* block. Summing the
+  blocks a key really holds:
 
-  The boxes are on the *fields*, not on newtype wrappers around each struct
-  variant, so every existing `match` arm binds the same names and `Box<T>`
-  derefs to `T` at each use; only construction sites changed. It also costs no
-  extra heap, because two boxes land in the same classes one bigger box would:
-  `SortedSet` 48 + 32 = 80 against a single 72-byte box's 80, `SortedSetBPTree`
-  80 + 48 = 128 against 128, and `HashWithTtl` is strictly *cheaper* at
-  48 + 48 = 96 against a single 104-byte box's 112. The cost is one extra
-  `malloc` when a collection is promoted out of its listpack encoding — a
-  cold, once-per-key event.
+  | key holds | before | after | delta |
+  |---|---:|---:|---:|
+  | `HashListpack` / `ListListpack` / `SetListpack` / `SortedSetListpack` | 128 | 48 | **-80** |
+  | `SetIntset` | 128 | 48 | **-80** |
+  | `List` (`VecDeque`, stays inline) | 128 | 48 | **-80** |
+  | `Stream` (already boxed; its 112 B block was never billed) | 240 | 160 | **-80** |
+  | `Hash` | 128 | 48 + 48 = 96 | -32 |
+  | `Set` (`IndexSet`, 72 -> class 80) | 128 | 48 + 80 = 128 | 0 |
+  | `SortedSet` (legacy) | 128 | 48 + 48 + 32 = 128 | 0 |
+  | `HashWithTtl` | 128 | 48 + 48 + 48 = 144 | **+16** |
+  | `SortedSetBPTree` | 128 | 48 + 80 + 48 = 176 | **+48** |
+
+  So the win is real and 80 B on the compact encodings, plain lists and
+  streams — where the overwhelming majority of small keys live — and the two
+  regressions land on the two heaviest variants, where 16 B and 48 B sit
+  against a table that is already kilobytes. `String(Bytes)` is unaffected: a
+  string value is never stored behind a `Box<RedisValue>` at all.
 
   `String(Bytes)`, the three listpack variants and `SetIntset` deliberately
   stay **inline**: strings are the hot path and the one dimension moon already
-  wins on (0.83x vs Redis), and the compact encodings are where small
-  collections live. `HashWithTtl::min_expiry_ms` stays inline too, so the
-  "has any field expired?" fast path still reads a plain `u64` with no pointer
-  chase. `test_hot_variants_stay_inline` pins that at compile time by binding
-  each payload to its exact unboxed type, and a `const` assertion plus
+  wins on, and the compact encodings are where small collections live.
+  `HashWithTtl::min_expiry_ms` stays inline too, so the "has any field
+  expired?" fast path still reads a plain `u64` with no pointer chase.
+  `test_hot_variants_stay_inline` pins that at compile time by binding each
+  payload to its exact unboxed type, and a `const` assertion plus
   `test_redis_value_fits_48_byte_size_class` pin the 48-byte ceiling.
 
-  Structural (struct sizes and size classes; host-independent). No RSS number
-  is claimed here — that must be measured on Linux. No on-disk or wire format
-  changes: `RedisValue` is in-memory only.
+  The boxes are on the *fields*, not on newtype wrappers around each struct
+  variant, so every existing `match` arm binds the same names and `Box<T>`
+  derefs to `T` at each use; only construction sites changed. The cost is one
+  extra `malloc` when a collection is promoted out of its listpack encoding — a
+  cold, once-per-key event.
 
-- **`storage`: a heap string value is now ONE allocation, of exactly its own
-  length** — the shape Redis reaches with `embstr`. `CompactValue` stored a
-  `Box<HeapString>`, i.e. a *boxed* `Box<[u8]>` fat pointer. That wrapper is 16
-  bytes, lands in jemalloc's 16-byte size class, and was therefore billed in
-  full against **every key** whose value exceeds the 12-byte SSO cutoff. It
-  carried no information the entry did not already have: `CompactValue` has 12
-  bytes of payload, enough for both the pointer and the length. The pointer now
-  addresses the string buffer directly and the length lives in `len_and_tag`
-  (high 28 bits) plus `payload[8..12]` (low 32).
-
-  Measured with `nallocx`, requested bytes -> size class, per stored value:
-
-  | value | before (2 allocs) | after (1 alloc) | saved |
-  |---:|---:|---:|---:|
-  | 13 B | 16 + 16 = 32 | 16 | **-16** |
-  | 24 B | 16 + 32 = 48 | 32 | **-16** |
-  | 40 B | 16 + 48 = 64 | 48 | **-16** |
-  | 64 B | 16 + 64 = 80 | 64 | **-16** |
-  | 96 B | 16 + 96 = 112 | 96 | **-16** |
-
-  Note what an inline `[len: u32][data]` header would have done instead:
-  `class(N+4)` versus `16 + class(N)` saves **nothing** at 13 B (32 vs 32),
-  64 B (80 vs 80) or 96 B (112 vs 112), because the 4-byte header pushes the
-  block into the next class and gives back exactly what it saved. The saving
-  comes from deleting the length, not from relocating it.
-
-  Reads get shorter too: `as_bytes` no longer chases a wrapper allocation on
-  the way to the buffer.
-
-  **Type tag moved out of the pointer.** The tag used to live in the pointer's
-  low 3 bits, which is sound only while every heap payload is a `Box<T>` with
-  `align_of::<T>() >= 8`. A `[u8]` buffer has alignment 1 and carries no spare
-  bits by any language-level guarantee, so the tag now lives in bits 30..28 of
-  `len_and_tag` and the stored pointer is the raw address.
-
-  Unsafe added: 2 blocks (`&*` over a `*mut [u8]`, and `Box::from_raw` to
-  reclaim it), both private, both behind a safe API; `compact_value.rs` goes
-  from 16 unsafe blocks to 9 net, since the dead `as_bytes_mut` accessor (zero
-  callers) and six wrapper dereferences are gone. Verified under Miri (unit
-  tests and the allocation harness) and pinned by
-  `tests/compact_value_one_allocation.rs`, which asserts the allocation count
-  and size directly with a recording global allocator. No on-disk or wire
-  format changes: `CompactValue` is in-memory only and persistence uses only
-  its constructors.
+  No on-disk or wire format changes: `RedisValue` is in-memory only.
 
 - **`storage`: an empty `DashTable` no longer reserves 16 segments to hold one.**
   `SegmentSlab::new` seeded its first slab at 16 segments, so `DashTable::new`

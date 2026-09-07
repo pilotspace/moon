@@ -175,6 +175,18 @@ impl Default for CachedClock {
 /// but it does mean nothing may depend on set iteration order.
 pub type SetValue = indexmap::IndexSet<Bytes>;
 
+/// The heap block a **boxed payload** of a fat [`RedisValue`] variant occupies.
+///
+/// One definition of the rule, used by [`RedisValue::estimate_memory`] and by
+/// the encoding-upgrade sites in the command layer, which hold the payload
+/// after the enum it came out of is gone. Keeping both on this function is what
+/// makes `used_memory` survive a change to any of those field types.
+#[inline]
+#[must_use]
+pub fn boxed_payload_block<T: ?Sized>(payload: &T) -> usize {
+    crate::storage::mem_size::size_class(std::mem::size_of_val(payload))
+}
+
 /// The type of value stored in a Redis key.
 ///
 /// # Why the fat variants are boxed
@@ -312,8 +324,55 @@ impl RedisValue {
         }
     }
 
+    /// Bytes of heap the value's own **boxed payloads** occupy, on top of the
+    /// `Box<RedisValue>` that [`CompactValue::estimate_memory`] charges once
+    /// per container key.
+    ///
+    /// Boxing a fat variant's fields does not delete those fields — it moves
+    /// them into a *second* block the allocator hands out separately. Charging
+    /// only the outer box would let `used_memory` fall by 80 B on a key whose
+    /// RSS did not move at all (`Set`), or rise by 48 B (`SortedSetBPTree`).
+    /// That is the exact failure mode moon#788 exists to prevent: a ledger that
+    /// drifts away from RSS makes `--maxmemory` unable to bind.
+    ///
+    /// Each term is `size_of_val` of the pointee, so it follows the declared
+    /// field type: swapping `HashSet` for `IndexSet` (72 B, class 80) or
+    /// growing `BPTree` re-prices the bill with no edit here.
+    #[inline]
+    fn boxed_payload_bytes(&self) -> usize {
+        match self {
+            RedisValue::Hash(map) => boxed_payload_block(&**map),
+            RedisValue::HashWithTtl { fields, ttls, .. } => {
+                boxed_payload_block(&**fields) + boxed_payload_block(&**ttls)
+            }
+            RedisValue::Set(set) => boxed_payload_block(&**set),
+            RedisValue::SortedSet { members, scores } => {
+                boxed_payload_block(&**members) + boxed_payload_block(&**scores)
+            }
+            RedisValue::SortedSetBPTree { tree, members } => {
+                boxed_payload_block(&**tree) + boxed_payload_block(&**members)
+            }
+            RedisValue::Stream(s) => boxed_payload_block(&**s),
+            // Deliberately unboxed: the hot string path and the compact
+            // encodings small collections live in. Nothing extra to bill.
+            RedisValue::String(_)
+            | RedisValue::List(_)
+            | RedisValue::HashListpack(_)
+            | RedisValue::ListListpack(_)
+            | RedisValue::SetListpack(_)
+            | RedisValue::SetIntset(_)
+            | RedisValue::SortedSetListpack(_) => 0,
+        }
+    }
+
     /// Estimate memory usage of this value in bytes.
     pub fn estimate_memory(&self) -> usize {
+        self.boxed_payload_bytes() + self.contents_bytes()
+    }
+
+    /// Everything `estimate_memory` bills except the boxed payload blocks:
+    /// the members, fields, tables and buffers the value itself owns.
+    fn contents_bytes(&self) -> usize {
         match self {
             RedisValue::String(b) => b.len(),
             RedisValue::Hash(map) => map
@@ -921,11 +980,19 @@ mod tests {
         );
     }
 
+    /// An empty container is not free: a boxed variant still holds the block
+    /// its payload was moved into. `List` is unboxed, so it alone bills zero.
     #[test]
     fn test_estimate_memory_empty() {
-        assert_eq!(RedisValue::Hash(Box::default()).estimate_memory(), 0);
+        assert_eq!(
+            RedisValue::Hash(Box::default()).estimate_memory(),
+            boxed_payload_block(&HashMap::<Bytes, Bytes>::new())
+        );
         assert_eq!(RedisValue::List(VecDeque::new()).estimate_memory(), 0);
-        assert_eq!(RedisValue::Set(Box::default()).estimate_memory(), 0);
+        assert_eq!(
+            RedisValue::Set(Box::default()).estimate_memory(),
+            boxed_payload_block(&SetValue::new())
+        );
     }
 
     #[test]
@@ -1210,6 +1277,99 @@ mod accounting_788 {
                  ({table} B of entries table + {member_bytes} B of members)"
             );
         }
+    }
+
+    /// Boxing a variant's payload does not make the payload free: it moves the
+    /// bytes out of the `Box<RedisValue>` into a **second** block the allocator
+    /// hands out separately. The ledger charged only the first one, so every
+    /// boxed container under-reported by the whole inner block — 48 B for a
+    /// `Hash`, 80 B for a `Set`, 128 B for a B+tree zset, 112 B for a stream —
+    /// and `used_memory` moved *away* from RSS instead of tracking it.
+    ///
+    /// Each case is an **empty** container, so the only thing left to bill is
+    /// the block structure itself, and the contents term is either zero or
+    /// computed here from the same public helper `estimate_memory` uses — never
+    /// from `estimate_memory`, which is what is on trial.
+    #[test]
+    fn every_boxed_payload_block_is_billed() {
+        fn cls<T: ?Sized>(v: &T) -> usize {
+            size_class(std::mem::size_of_val(v))
+        }
+        let map_cls = cls(&HashMap::<Bytes, Bytes>::new());
+        let ttl_cls = cls(&HashMap::<Bytes, u64>::new());
+        let f64map_cls = cls(&HashMap::<Bytes, f64>::new());
+        let scores_cls = cls(&BTreeMap::<(OrderedFloat<f64>, Bytes), ()>::new());
+        let set_cls = cls(&SetValue::new());
+        let tree_cls = cls(&crate::storage::bptree::BPTree::new());
+        let stream_cls = cls(&crate::storage::stream::Stream::new());
+
+        // An empty B+tree zset and an empty stream are not free even when
+        // empty; both costs come from helpers independent of the code on trial.
+        let bptree_contents = crate::storage::db::zset_table_bytes(
+            &HashMap::<Bytes, f64>::new(),
+            &crate::storage::bptree::BPTree::new(),
+        );
+        let stream_contents = crate::storage::stream::Stream::new().estimate_memory();
+
+        // (name, empty value, inner Box blocks, contents billed independently)
+        let cases: Vec<(&str, RedisValue, usize, usize)> = vec![
+            ("Hash", RedisValue::Hash(Box::default()), map_cls, 0),
+            (
+                "HashWithTtl",
+                RedisValue::HashWithTtl {
+                    fields: Box::default(),
+                    ttls: Box::default(),
+                    min_expiry_ms: u64::MAX,
+                },
+                map_cls + ttl_cls,
+                0,
+            ),
+            ("Set", RedisValue::Set(Box::default()), set_cls, 0),
+            (
+                "SortedSet",
+                RedisValue::SortedSet {
+                    members: Box::default(),
+                    scores: Box::default(),
+                },
+                f64map_cls + scores_cls,
+                0,
+            ),
+            (
+                "SortedSetBPTree",
+                RedisValue::SortedSetBPTree {
+                    tree: Box::default(),
+                    members: Box::default(),
+                },
+                tree_cls + f64map_cls,
+                bptree_contents,
+            ),
+            (
+                "Stream",
+                RedisValue::Stream(Box::new(crate::storage::stream::Stream::new())),
+                stream_cls,
+                stream_contents,
+            ),
+        ];
+
+        let mut shortfalls: Vec<String> = Vec::new();
+        for (name, value, inner_blocks, contents) in cases {
+            let floor = inner_blocks + contents;
+            let got = value.estimate_memory();
+            if got < floor {
+                shortfalls.push(format!(
+                    "{name}: billed {got} B against {floor} B really allocated \
+                     ({inner_blocks} B of boxed payload blocks + {contents} B of \
+                     contents) — under-count {} B",
+                    floor - got
+                ));
+            }
+        }
+        assert!(
+            shortfalls.is_empty(),
+            "the ledger under-counts {} of the 6 boxed variants:\n  {}",
+            shortfalls.len(),
+            shortfalls.join("\n  ")
+        );
     }
 
     /// Every collection value lives behind a `Box<RedisValue>`, and the enum
