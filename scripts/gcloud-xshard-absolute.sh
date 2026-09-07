@@ -34,6 +34,18 @@ STEAL_MAX="${STEAL_MAX:-1}"          # vCPU steal-% gate (~0 on dedicated cores)
 NOISE_PCT="${NOISE_PCT:-8}"          # s1-LOCAL "flat" tolerance + guard-cell regression tolerance
 SERVER_CORES="${SERVER_CORES:-0-3}"  # moon shards: 4 cores
 CLIENT_CORES="${CLIENT_CORES:-4-7}"  # redis-benchmark: disjoint 4 cores
+MOON_EXTRA_ARGS="${MOON_EXTRA_ARGS:-}"       # extra server args appended to every moon start (per-cell override)
+# moon#416: populate before a read cell. The L4 cross-shard fast path DECLINES a
+# key that is not resident (the moon#610 class: `dispatch_read` cannot consult the
+# cold tier), so on the EMPTY keyspace this harness used to benchmark, every GET
+# missed, every read declined to the SPSC hop, and `--cross-shard-fast-path`
+# made no difference at all. Cost model §8: the in-place rate tracks the key HIT
+# rate to within 0.3 points, so an unpopulated read cell scores a working
+# mechanism as a broken one. POPULATE_FACTOR is N/keyspace for the SET preload:
+# coverage is 1-exp(-factor), so 8 => 99.97%. Set POPULATE=0 to reproduce the
+# pre-2026-09 (empty-keyspace) cells — they are NOT comparable to populated ones.
+POPULATE="${POPULATE:-1}"
+POPULATE_FACTOR="${POPULATE_FACTOR:-8}"
 # cores 8-15 on a 16-vCPU instance left IDLE as a steal-time buffer (C2 sizing rationale)
 
 # GCloud (C2 instrument — AMENDED 2026-06-23): c2-standard-16 blocked by C2_CPUS quota=8;
@@ -96,6 +108,30 @@ self_test() {
   [[ "$(us_per_op 25000)" == "40.00" ]] && _ok "us_per_op 25000 -> 40.00us" || _bad "us_per_op 25000 should be 40.00 (got $(us_per_op 25000))"
   grep -q 's4-c1-GET' "$0" && grep -q 's1-LOCAL' "$0" && _ok "harness declares the frozen cells" || _bad "harness must declare the cells"
 
+  # ---- moon#416: the extra-server-args passthrough ------------------------
+  # These gates exist because the harness previously ACCEPTED no flag at all and
+  # its s4-c1-GET cell was labelled "the SPSC hop" while measuring whatever the
+  # build's default happened to be. Each gate below fails closed if the argv
+  # builder stops carrying the flag through to the server process.
+  local argv
+  argv="$(moon_argv /bin/moon 4 /tmp/d --cross-shard-fast-path off | tr '\n' ' ')"
+  [[ "$argv" == *"--cross-shard-fast-path off"* ]] \
+    && _ok "extra server args reach moon's argv (the moon#416 passthrough)" \
+    || _bad "extra server args DROPPED from argv (moon#416 regression): $argv"
+  [[ "$argv" == *"--admin-port 0"* && "$argv" == *"--shards 4"* && "$argv" == *"--appendonly no"* ]] \
+    && _ok "argv keeps the fixed cell args alongside the extras" \
+    || _bad "argv lost a fixed cell arg: $argv"
+  argv="$(moon_argv /bin/moon 4 /tmp/d | tr '\n' ' ')"
+  [[ "$argv" == *"--cross-shard-fast-path"* ]] \
+    && _bad "argv invented a flag with no extras passed: $argv" \
+    || _ok "no extras => argv carries no fast-path flag (negative control)"
+  grep -q 's4-c1-GET-hop' "$0" && grep -q -- '--cross-shard-fast-path off' "$0" \
+    && _ok "harness declares the hop cell with the fast path OFF (XSHARD-READ-01)" \
+    || _bad "harness must declare an s4-c1-GET-hop cell pinning --cross-shard-fast-path off"
+  grep -q 'populate_keyspace' "$0" && [[ "$POPULATE_FACTOR" -ge 3 ]] \
+    && _ok "read cells populate the keyspace (cost model §8: in-place rate == hit rate)" \
+    || _bad "read cells must populate to saturation; POPULATE_FACTOR=$POPULATE_FACTOR too low"
+
   if [[ "$fails" -eq 0 ]]; then log "=== self-test PASS (all gates fail-closed correctly) ==="; return 0; fi
   log "=== self-test FAIL ($fails) ==="; return 1
 }
@@ -137,21 +173,47 @@ build() {  # build <commit> <runtime> -> echoes binary path  (read-only checkout
   mkdir -p "$BINS"; cp "$WORK/target/release/moon" "$out"; echo "$out"
 }
 
-start_moon() {  # start_moon <bin> <shards>
-  local bin="$1" shards="$2"; cleanup
+# Pure argv builder, so --self-test can PROVE the extra-args passthrough reaches
+# the server process. moon#416's whole failure mode was a flag that the harness
+# accepted and silently dropped, leaving a cell labelled "the SPSC hop" while it
+# measured something else. A guard that cannot observe the argv cannot catch that.
+moon_argv() {  # moon_argv <bin> <shards> <dir> [extra...] -> one arg per line
+  local bin="$1" shards="$2" dir="$3"; shift 3
+  printf '%s\n' "$bin" --port "$PORT" --shards "$shards" --dir "$dir" \
+    --appendonly no --admin-port 0 "$@"
+}
+
+start_moon() {  # start_moon <bin> <shards> [extra_server_args]
+  local bin="$1" shards="$2" extra="${3-$MOON_EXTRA_ARGS}"; cleanup
   local dir; dir="$(mktemp -d /tmp/moon-abs.XXXXXX)"
-  taskset -c "$SERVER_CORES" "$bin" --port "$PORT" --shards "$shards" --dir "$dir" \
-    --appendonly no --admin-port 0 >/dev/null 2>&1 &
+  local xa=(); [[ -n "$extra" ]] && read -ra xa <<< "$extra"
+  local argv=() a
+  while IFS= read -r a; do argv+=("$a"); done < <(moon_argv "$bin" "$shards" "$dir" "${xa[@]+"${xa[@]}"}")
+  taskset -c "$SERVER_CORES" "${argv[@]}" >/dev/null 2>&1 &
   MOON_PID=$!
   local deadline=$((SECONDS+10))
   until redis-cli -p "$PORT" ping >/dev/null 2>&1; do
     if ! kill -0 "$MOON_PID" 2>/dev/null; then
-      taskset -c "$SERVER_CORES" "$bin" --port "$PORT" --shards "$shards" --dir "$dir" --appendonly no >/dev/null 2>&1 &
+      # Same argv on retry. It used to drop --admin-port 0, so a cell that hit
+      # the retry path silently paid the metrics-endpoint cost (~11%, §6).
+      taskset -c "$SERVER_CORES" "${argv[@]}" >/dev/null 2>&1 &
       MOON_PID=$!
     fi
     [[ $SECONDS -ge $deadline ]] && { log "  ERROR moon did not start"; return 1; }
     sleep 0.1
   done
+}
+
+# Preload the keyspace with the SAME key distribution the read cell will query
+# (redis-benchmark -r expands __rand_int__ identically for -t set and -t get, so
+# DEBUG POPULATE would NOT match). Echoes the resulting DBSIZE, which must be
+# reported with any read cell: cost model §8 requires it.
+populate_keyspace() {
+  [[ "$POPULATE" != "1" ]] && { redis-cli -p "$PORT" DBSIZE 2>/dev/null | tr -d '\r'; return 0; }
+  local n=$((KEYSPACE*POPULATE_FACTOR))
+  taskset -c "$CLIENT_CORES" redis-benchmark -p "$PORT" -t set -n "$n" -r "$KEYSPACE" \
+    -c 50 -P 64 -q >/dev/null 2>&1
+  redis-cli -p "$PORT" DBSIZE 2>/dev/null | tr -d '\r'
 }
 
 bench_rps() {  # bench_rps <c> <p> <cmd>
@@ -160,19 +222,21 @@ bench_rps() {  # bench_rps <c> <p> <cmd>
     | tr '\r' '\n' | grep "\"${3}\"" | awk -F',' '{gsub(/"/,"",$2); printf "%.0f\n",$2}' | tail -1
 }
 
-cell() {  # cell <bin> <shards> <c> <p> <cmd> <name> -> "name|best|reps_csv|n"
-  local bin="$1" shards="$2" c="$3" p="$4" cmd="$5" name="$6" vals=() n=0 attempts=0 r
+cell() {  # cell <bin> <shards> <c> <p> <cmd> <name> [extra_server_args] -> "name|best|reps_csv|n|dbsize"
+  local bin="$1" shards="$2" c="$3" p="$4" cmd="$5" name="$6" extra="${7-$MOON_EXTRA_ARGS}"
+  local vals=() n=0 attempts=0 r db=""
   local max_attempts=$((BEST_OF_N*3))   # bounded retries so a flaky rep can't loop forever
   while [[ "$n" -lt "$BEST_OF_N" && "$attempts" -lt "$max_attempts" ]]; do
     attempts=$((attempts+1))
     wait_quiesced                                   # BLOCK until load decays (not skip) — the c2d-VOID fix
-    start_moon "$bin" "$shards" || { sleep 2; continue; }
+    start_moon "$bin" "$shards" "$extra" || { sleep 2; continue; }
+    db="$(populate_keyspace)"                       # moon#416: read cells need a resident keyspace
     r="$(bench_rps "$c" "$p" "$cmd" || echo 0)"; cleanup
     [[ -z "$r" || "$r" -le 0 ]] 2>/dev/null && { log "  retry $name (bad rep: '$r')"; continue; }
     vals+=("$r"); n=$((n+1))
   done
   local best=0; [[ "$n" -gt 0 ]] && best=$(printf '%s\n' "${vals[@]}" | sort -n | tail -1)
-  printf '%s|%s|%s|%s\n' "$name" "$best" "$(IFS=,;echo "${vals[*]:-}")" "$n"
+  printf '%s|%s|%s|%s|%s\n' "$name" "$best" "$(IFS=,;echo "${vals[*]:-}")" "$n" "${db:-0}"
 }
 
 measure() {
@@ -193,21 +257,28 @@ measure() {
 
   log "=== gates OK (steal=$steal%, clean) — measuring on $(uname -srm) ==="
   echo "# absolute cells (raw)"
-  echo "# machine|runtime|commit|cell|best_rps|us_per_op|reps|n"
+  echo "# machine|runtime|commit|cell|best_rps|us_per_op|reps|n|dbsize"
   declare -gA BEST
   local rt commit
   for rt in $RUNTIMES; do
     for commit in $COMMITS; do
       local bin; bin=$(build "$commit" "$rt") || die "build $commit/$rt"
       [[ "$SETTLE_AFTER_BUILD" == "1" ]] && { log "  settling compile heat before cells..."; wait_quiesced; }
-      while IFS='|' read -r name best reps n; do
+      while IFS='|' read -r name best reps n db; do
         BEST["$rt|$commit|$name"]="$best"
-        printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "${GCE_MACHINE:-local}" "$rt" "$commit" "$name" "$best" "$(us_per_op "$best")" "$reps" "$n"
+        printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "${GCE_MACHINE:-local}" "$rt" "$commit" "$name" "$best" "$(us_per_op "$best")" "$reps" "$n" "$db"
       done < <(
         cell "$bin" 1 1   1  GET "s1-LOCAL"
-        cell "$bin" 4 1   1  GET "s4-c1-GET"
+        # moon#416 / G2 §6: the read hop and the L4 fast path are now TWO cells of
+        # one A/B, not one ambiguous number. XSHARD-READ-01 is the -hop cell.
+        cell "$bin" 4 1   1  GET "s4-c1-GET-hop" "--cross-shard-fast-path off"
+        cell "$bin" 4 1   1  GET "s4-c1-GET"     ""
         cell "$bin" 4 1   16 GET "s4-P16"
         cell "$bin" 4 100 1  GET "s4-c100-GET"
+        # The write hop, which the fast path does NOT touch (gate is !is_write) and
+        # which D3 targets. G2 §6 proposes this as XSHARD-READ-01's replacement in
+        # docs/PRODUCTION-CONTRACT.md once it has a measured value.
+        cell "$bin" 4 1   1  SET "s4-c1-SET"
       )
     done
   done
@@ -283,6 +354,12 @@ gcloud_sweep() {  # run gcloud_run_one for each machine in MACHINES, each in its
 }
 
 # ============================================================================= dispatch
+# --extra-args "<args>" sets MOON_EXTRA_ARGS for every cell that does not pin its
+# own (moon#416). Consumed before the subcommand so either order works.
+if [[ "${1:-}" == "--extra-args" ]]; then
+  MOON_EXTRA_ARGS="${2:-}"; shift 2
+fi
+
 case "${1:---gcloud}" in
   --self-test) self_test ;;
   --measure)   measure ;;
