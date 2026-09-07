@@ -79,6 +79,8 @@ Redis: dictEntry(24B) → robj(16B) → SDS(8-17B + data) + jemalloc rounding
 
 TTL is packed as a 4-byte delta inside `CompactEntry`, costing zero extra bytes per expiring key. Redis maintains a separate `expires` hash table with a full `dictEntry` (24 bytes) per expiring key.
 
+Measured, on Linux x86_64 at `--shards 1` against Redis 7.4.2/jemalloc: **15–17% less memory per key at values ≥ 1 KB**. The model above does **not** explain the small-value end — at 32 B values Moon measures **11–51% *more* per key** than Redis, where the same arithmetic predicts a win, and no cause for that is established. See [benchmarks](benchmarks.md#memory-efficiency).
+
 ## Dual runtime
 
 Moon supports two async runtimes:

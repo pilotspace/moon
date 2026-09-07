@@ -6,6 +6,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **The "27-35% less memory" claim is corrected to a measured 15-17%, on Linux,
+  against a jemalloc Redis (#817, #821).** The figure was re-measured on GCE
+  `c3-standard-8` (Linux 6.17, **x86_64**, 8 vCPU / 31 GB), moon `d5f3501b` at
+  `--shards 1`, via `scripts/bench-resources.sh` with a fresh server per data
+  point and `redis-benchmark -r N` for unique keys. Per-key =
+  (loaded RSS - baseline RSS) / `DBSIZE`. The full twelve-point table and the
+  method are in **BENCHMARK.md §3**, and the user-facing documents (`README.md`,
+  `docs/index.md`, `docs/benchmarks.md`, `docs/journey.md`,
+  `docs/design-advantages.md`, `docs/comparison-valkey.md`) state the measured
+  number with its provenance and link there. The three example programs that
+  republished the retired figure as a *retrieval document at runtime*
+  (`examples/ai-agent-tools/agent_tools.py`, `examples/rag-quickstart/
+  rag_quickstart.py`, `examples/graphrag/graphrag.py`) now carry the measured
+  figure, its scope, and the loss at 32 B. The retired number was also baked
+  into the pixels of `docs/images/diagrams/moon-memory-engine.png` (published
+  on `docs/design-advantages.md` directly above the paragraph that corrects
+  it); that box is removed from the image and from its regeneration prompt
+  (`docs/images/diagrams/prompts/2-memory.txt`), so a regenerate no longer
+  reproduces it. The historical CHANGELOG entries that recorded the claim at
+  the time are left as a dated record, alongside this retraction.
+
+  Result: **15-17% less memory per key at values >= 1 KB** (9.5% at the smallest
+  key count tested, 63K x 1 KB); a tie at 256 B (0.92-1.02x); and a **loss of
+  11-51% at 32 B**, which is published alongside the win rather than omitted.
+
+  **The old number was wrong because of the oracle, not because of moon.** The
+  previously published 1M x 1 KB row was Redis 1,571 B/key against moon
+  1,153 B/key. Re-measured: Redis **1,380** B/key, moon **1,172** B/key. moon's
+  own figure moved 1.6%; Redis's moved 12%. Both Redis binaries already
+  installed on the benchmark host were **libc-malloc** builds, which inflate
+  Redis RSS and would have biased the comparison in moon's favour, so Redis
+  7.4.2 was rebuilt from source against jemalloc 5.3.0 for this run. The
+  inflation in the retired claim came from a Redis baseline measured on macOS
+  and/or without jemalloc.
+
+  Scope, stated so it is not over-read: `--shards 1`, **x86_64 only** — nothing
+  here may be restated as an ARM result — string values, one data point per
+  (value size, key count) cell with no repetitions, and no sampling between
+  32 B and 256 B. Throughput and CPU columns from the same harness run are
+  **not** published: that harness measures them incidentally and they are not a
+  clean benchmark.
+
+- **BENCHMARK.md §3.1's empty-server RSS is corrected, against moon's interest
+  (#821).** The published "Redis 7.0 MB / moon 1 shard 7.0 MB — identical" was
+  an Apple M4 Pro development reference. Measured on all 12 points of the run
+  above: **Redis 7.5-7.7 MB, moon 12.6-12.9 MB — moon is ~1.7x worse.** The
+  cause is not known and is tracked in #821. The "moon (12 shards) 15.7 MB" row
+  is kept but marked **unverified / stale**: this run did not measure it.
+
+  BENCHMARK.md §3.4's TTL-overhead claim is marked **unverified** for the same
+  reason it could not be confirmed: that section of `scripts/bench-resources.sh`
+  omits `redis-benchmark -r`, so every `SETEX` hits `__rand_key__` and **one**
+  key is loaded instead of 500,000. The structural description is retained as a
+  reading of the source, not as a measurement.
+
+- **Every published performance claim now names the host it was measured on, and
+  the macOS-sourced ones are no longer presented as Linux results (#817).**
+  `docs/benchmarks.md:9` already labelled its per-table figures an Apple M4 Pro
+  development reference; `docs/journey.md` re-published the same values under a
+  preamble asserting they came from GCloud Linux hosts, and `README.md`,
+  `docs/index.md`, `docs/design-advantages.md` and `docs/comparison-valkey.md`
+  quoted them with no host at all. `CLAUDE.md` and `docs/PRODUCTION-CONTRACT.md`
+  both require every benchmark number to come from a Linux host.
+
+  Two claims are **withdrawn** rather than relabelled, because no defensible
+  provenance exists for them:
+
+  - **"45x / 23x better CPU"** — macOS-measured, sampled with `ps -o %cpu=`
+    (a process-lifetime average, not steady-state load), and computed from a CPU
+    numerator and an RPS denominator taken in different runs. The Linux
+    comparison (§2.14) is a **tie**: 10.55 vs 11.33 us/op, inside Redis's own
+    11.9% spread. The underlying table stays in BENCHMARK.md §5.1 as a
+    development record with no ratio derived from it.
+  - **"p50 latency 8-10x lower"** — macOS-measured and taken with
+    `redis-benchmark`, a closed-loop tool. No Linux latency comparison exists.
+    Raw numbers retained in BENCHMARK.md §9.1.
+
+  Also corrected: `docs/journey.md`'s retracted "1->8 shards is
+  flat-to-slightly negative" now states the corrected Linux scaling of
+  **1.42x / 2.14x / 3.79x** (§2.14); `README.md`'s "hash-field TTL
+  (Valkey-parity)" now says feature parity and 4-10% behind Valkey, which is
+  what `docs/perf/2026-05-27-hash-ttl-3way-bench.md` measured; the
+  Moon-vs-Valkey throughput ratio is withdrawn as structurally asymmetric
+  (different hardware, pipeline depth, payload and thread counts); and
+  `docs/references.md` no longer claims open-loop methodology for figures
+  produced by a closed-loop tool. `docs/index.md` gained the scope caveat it
+  had none of. **For the changes in this bullet** no new measurements were taken
+  and no number was invented, adjusted or extrapolated — every surviving figure
+  already existed in the tree. The per-key memory and baseline-RSS corrections
+  above are the exception: those are a new Linux measurement, and their host,
+  build, oracle and method are stated in BENCHMARK.md §3.
+
 ## [0.8.9] — 2026-09-04
 
 ### Added

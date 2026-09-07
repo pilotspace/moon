@@ -61,17 +61,17 @@ The SET absolute number can differ 3-4× between methodologies. Only strict-vs-s
 | Peak GET (Linux ARM64) | **2.29x** on v0.8.7 | t2a-standard-8, P=64, §2.12 (was 2.20x on v0.1.6) |
 | Peak GET (macOS) | **7.94M ops/s (2.59x)** | OrbStack, Apple M4 Pro, P=64 |
 | Production defaults GET | **1.93x Redis** | appendonly=yes, disk-offload, P=64 |
-| Memory (1KB+ values) | **27-35% less** | 1-shard, per-key RSS — for `--shards 8` and 8/64/256B see §2.14 |
-| Memory (256B values) | Tied | 1-shard, per-key RSS — §2.14 supersedes for `--shards 8` |
-| Baseline RSS (empty) | **Identical (7.0 MB)** | 1-shard |
-| CPU efficiency at P=64 | **45x better** | 1.9% vs 43.9% CPU for similar RPS |
-| With AOF persistence | **2.75x Redis** | SET, P=64, per-shard WAL |
+| Memory (>=1 KB values) | **15-17% less** | Linux, GCE c3-standard-8 **x86_64**, `--shards 1`, vs Redis 7.4.2/jemalloc, per-key RSS, §3.2. Falls to 9.5% at the smallest key count tested. Supersedes the retired "27-35% less" |
+| Memory (256 B values) | Tied (0.92-1.02x) | same run, §3.2 |
+| Memory (32 B values) | **moon 11-51% worse** | same run, §3.2 — moon loses below ~256 B; §2.14 measures a comparable 16% loss at 64 B on aarch64 |
+| Baseline RSS (empty) | **moon 1.7x worse** (12.6-12.9 MB vs 7.5-7.7 MB) | same run, §3.1 — corrects the retired "identical 7.0 MB"; cause tracked in [#821](https://github.com/pilotspace/moon/issues/821) |
+| With AOF persistence | **2.75x Redis** | **macOS dev reference**, SET, P=64, per-shard WAL, §7.1 — the Linux write-path figures are §7.3 |
 | AOF everysec SET P16 | **1.32x Redis** | group commit + coalesced write, §7.3 |
 | AOF everysec SET P1 | **0.99x (parity)** | park-free writer poll, §7.3 (was 0.80x) |
 | AOF always SET P16 | **0.91x Redis** | per-batch group commit, §7.3 (was 0.12x) |
 | Pub/sub fan-out delivery | **5.09M msg/s, 1.04x Redis, 0 drops** | 8 subs, coalesced writes, §7.3 (was 438 msg/s) |
-| Multi-shard (8s P=16) | **1.84-1.99x Redis** | GET / SET |
-| p50 latency (8-shard) | **8-10x lower** | 0.031ms vs 0.26ms |
+| Multi-shard (8s P=16) | **1.84-1.99x Redis** | **macOS dev reference**, GET / SET, c=50, §4.2 |
+| p50 latency (8-shard) | **8-10x lower** | **macOS dev reference**, 0.031ms vs 0.26ms, §9.1 — `redis-benchmark` is closed-loop, so this is a median under load, not a tail-latency result |
 | Data correctness | **2613+ tests pass** | All types, 1/4/12 shards |
 | Vector insert (384d) | **6–20× RediSearch** | GCloud, 8-thread concurrent, §10.5 |
 | Vector search (384d) | RediSearch ~16× QPS; recall 0.86 vs 0.96 | concurrent vs RediSearch, §10.5 |
@@ -89,6 +89,15 @@ The SET absolute number can differ 3-4× between methodologies. Only strict-vs-s
 ### 2.1 Raw Throughput (no persistence)
 
 Moon started with `--appendonly no --disk-offload disable`.
+
+> **Conditions this table does not record, and nobody should assume:** the Redis
+> build's `io-threads` setting and the `redis-benchmark` payload size are both
+> absent from this run's provenance, so these ratios are against a Redis whose
+> threading configuration is unknown. The one measurement taken against a Redis
+> explicitly configured with `--io-threads 8 --io-threads-do-reads yes` is
+> §2.14. These v0.1.6 figures are also **superseded for the current tree** by
+> the v0.8.7 re-measurement in §2.12 (GET 2.40x x86 / 2.29x ARM), which also
+> shows every non-inlined command family running 0.40-0.67x Redis at p>=8.
 
 | Metric | x86_64 | ARM64 | Redis (x86_64) | Redis (ARM64) | Ratio (x86) | Ratio (ARM) |
 |--------|:------:|:-----:|:--------------:|:-------------:|:-----------:|:-----------:|
@@ -274,6 +283,12 @@ Reads are free under persistence (GET p=64 2.0-2.2×, matching §2.2). **Single-
 | ARM | 1 | 1.01M | 1.40M | 3.60M | 2.52M |
 | ARM | 4 | 1.00M | 1.38M | 3.45M | 2.42M |
 | ARM | 8 | 969K | 1.33M | 3.42M | 2.41M |
+
+> **Superseded 2026-09-01 (§2.14):** with explicitly-keyed families under a
+> `DBSIZE >= 50000` guard, moon's real s8/s1 scaling is **1.42x at p=1, 2.14x at
+> p=8, 3.79x at p=64**. The paragraph below remains true only for a genuinely
+> *uniform single-key* workload, which cannot be sharded by construction — it is
+> not the general shard-scaling result and was read as one.
 
 Scaling 1→8 shards is **flat-to-slightly-negative** for uniform single-key GET/SET at c=50: x86 GET p=64 holds at 4.7M (loopback-network ceiling), GET p=16 dips −2% (cross-shard SPSC dispatch cost); ARM dips −4 to −5%. This **confirms the CLAUDE.md gotcha** — most keys route cross-shard, so SPSC dispatch overhead dominates the local DashTable lookup; use `--shards 1` unless exploiting pipeline/AOF parallelism or hash-tag co-location. It refines §4.4's optimistic 1.46×-at-8-shards figure, which reflected a different (non-uniform / higher-concurrency) workload, not uniform-key GCloud routing.
 
@@ -673,6 +688,14 @@ established. Every row above is now checked against
 `key + value + 24` and the check was confirmed to reject both historical numbers
 before being trusted.
 
+**Scope of this memory result — it is not "moon never wins on memory".** These
+rows stop at 256 B, on aarch64, at `--shards 8`. The 2026-09-04 x86_64 run at
+`--shards 1` (§3.2) extends the curve upward and finds moon **15-17% ahead at
+values >= 1 KB**, while agreeing with this table below 256 B: moon loses at 32 B
+there as it loses at 64 B here. The two runs are consistent — a small-value loss
+and a large-value win — and neither has been reproduced on the other's
+architecture.
+
 #### Verdict
 
 | dimension | result |
@@ -683,14 +706,25 @@ before being trusted.
 | memory, values <=12 B | win |
 | **memory, 64 B values** | **LOSS (16%)** |
 | **idle RSS** | **LOSS (26%)** |
+| memory, values >= 1 KB | *not measured here* — see §3.2 (win, 15-17%, x86_64 `--shards 1`) |
 
 The goal "beat Redis io-threads 8 on performance, CPU and memory" is **met on
-throughput at pipeline depth, drawn on CPU, and not met on memory.** The idle-RSS
-loss localises cleanly: moon at `--shards 1` (11.68 MiB) already beats Redis
-(11.96 MiB), so the entire penalty is 3.58 MiB spread over 7 extra shards, 524 KB
-per shard, and it is threads rather than data structures — default config spawns
-four threads per shard (`shard-`, `spill-`, `manifest-sync-`, `aof-writer-`), two
-of which exist only because disk-offload defaults on.
+throughput at pipeline depth, drawn on CPU, and — at the value sizes measured
+here, all <= 256 B — not met on memory.** (§3.2 measures >= 1 KB values on
+x86_64 and finds a 15-17% win there.) The idle-RSS loss localises cleanly on this
+host: moon at `--shards 1` (11.68 MiB) already beats Redis (11.96 MiB), so the
+entire penalty is 3.58 MiB spread over 7 extra shards, 524 KB per shard, and it
+is threads rather than data structures — default config spawns four threads per
+shard (`shard-`, `spill-`, `manifest-sync-`, `aof-writer-`), two of which exist
+only because disk-offload defaults on.
+
+> **That `--shards 1` idle comparison does not hold on the x86_64 host.** §3.1
+> measures moon `--shards 1` at 12.6-12.9 MB against Redis 7.4.2/jemalloc at
+> 7.5-7.7 MB — moon ~1.7x *worse* — on GCE `c3-standard-8`. The runs differ in
+> architecture, Redis version and allocator, and nothing here explains why Redis
+> idled at ~12 MiB on t2a and ~7.6 MB on c3. Do not read "moon s1 beats Redis on
+> idle RSS" as a general result; it is this host's result. Tracked in
+> [#821](https://github.com/pilotspace/moon/issues/821).
 
 #### x86_64 confirmation — GCE `c3-standard-8` (Xeon 8481C), same binary, same method
 
@@ -810,42 +844,130 @@ Each of these produced a wrong published number in this repository:
 
 ## 3. Memory Efficiency
 
-### 3.1 Baseline RSS (Empty Server)
+> **Canonical provenance for every memory claim published anywhere in this
+> repository.** §3.1 and §3.2 are the 2026-09-04 Linux measurement described
+> below; every other document that states a memory number links here rather than
+> restating the method. **§3.5 and the superseded tables in §3.2a are an Apple
+> M4 Pro (12 cores, 24 GB) development reference and are NOT Linux production
+> measurements** — `CLAUDE.md` requires every published benchmark number to come
+> from a Linux host, so they must never be quoted as production results. §3.3 is
+> a structural model, not a measurement, and §3.4 is **unverified**.
 
-| Server | RSS | Notes |
-|--------|-----|-------|
-| Redis 8.6.1 | 7.0 MB | Single-threaded |
-| moon (1 shard) | 7.0 MB | Lazy Lua VM + lazy replication backlog |
-| moon (12 shards) | 15.7 MB | Per-shard overhead: ~0.7 MB |
+### 3.0 Measurement provenance (2026-09-04)
 
-### 3.2 Per-Key Memory (1-Shard, String Keys)
+| | |
+|---|---|
+| Host | GCE `c3-standard-8`, Linux 6.17.0-1022-gcp, **x86_64**, 8 vCPU, 31 GB |
+| moon | commit `d5f3501b` (main, post-#786 "one jemalloc size class per heap string value"), `--shards 1` |
+| Oracle | **Redis 7.4.2, `malloc=jemalloc-5.3.0`** |
+| Harness | `scripts/bench-resources.sh`, fresh server instance per data point, `redis-benchmark -r N` for unique keys |
+| Per-key formula | `(loaded RSS - baseline RSS) / DBSIZE` |
+| Not measured | **aarch64.** This run was x86_64 only; nothing here may be restated as an ARM result. |
 
-Measured with fresh server instances. `redis-benchmark -r N` for unique keys.
+**The oracle had to be rebuilt to make this comparison legitimate.** Both Redis
+binaries already installed on the host were **libc-malloc** builds. libc malloc
+inflates Redis's RSS, and every ratio taken against it would have been biased
+**in moon's favour**. Redis 7.4.2 was rebuilt from source against jemalloc 5.3.0
+for this run, and that is the only Redis these numbers are against.
 
-| Value Size | Keys Loaded | Redis/Key | moon/Key | Winner | Ratio |
-|:----------:|:-----------:|:---------:|:--------------:|:------:|:-----:|
-| 32 B | ~63K | 118 B | 147 B | Redis | 0.80x |
-| 256 B | ~63K | 412 B | 407 B | **Tied** | 1.01x |
-| 1,024 B | ~63K | 1,879 B | **1,207 B** | **moon** | **1.56x** |
-| 4,096 B | ~63K | 5,131 B | **4,352 B** | **moon** | **1.18x** |
+**Why the previously published "27-35% less memory" was wrong — and it was not
+moon that changed.** The old published 1M x 1 KB row was Redis 1,571 B/key,
+moon 1,153 B/key. Re-measured here: Redis **1,380** B/key, moon **1,172** B/key.
+moon's own figure moved **1.6%**; the *oracle* moved **12%**. The inflation came
+from a Redis baseline measured on macOS and/or without jemalloc, not from any
+regression or improvement in moon. The measured figure is **15-17%** at values
+>= 1 KB — 9.5% at the smallest key count tested — not 27-35%.
+
+### 3.1 Baseline RSS (Empty Server) — CORRECTED
+
+Measured on all 12 data points of the 2026-09-04 run (§3.0), each a freshly
+started server with an empty keyspace:
+
+| Server | RSS (measured 2026-09-04) | Previously published | Notes |
+|--------|---------------------------|----------------------|-------|
+| Redis 7.4.2 (jemalloc) | **7.5 - 7.7 MB** | 7.0 MB | 12/12 points in range |
+| moon (1 shard) | **12.6 - 12.9 MB** | 7.0 MB | 12/12 points in range; **~1.7x Redis** |
+| moon (12 shards) | *not measured* | 15.7 MB | **Unverified / stale** — macOS dev reference, not re-measured on Linux |
+
+**This is a correction against moon's interest, and the cause is not yet known.**
+The "identical 7.0 MB" row was an Apple M4 Pro development reference. It is
+tracked as [#821](https://github.com/pilotspace/moon/issues/821); do not quote
+7.0 MB anywhere.
+
+One thing this run does **not** resolve: §2.14 measured moon `--shards 1` idle at
+11.68 MiB against a Redis idle of 11.96 MiB on GCE `t2a-standard-8` (aarch64,
+Redis 7.0.15) — i.e. Redis idled ~12 MiB there and ~7.6 MB here. The two runs
+differ in architecture, Redis version and allocator, and nothing in this run
+explains the gap. Treat the *absolute* idle figures as host-specific and the
+**moon-vs-Redis direction on x86_64 (moon ~1.7x worse) as the measured result**.
+
+### 3.2 Per-Key Memory (Linux x86_64, 1-Shard, String Keys) — 2026-09-04
+
+Method and host: §3.0. Per-key = `(loaded RSS - baseline RSS) / DBSIZE`. "Keys"
+is the actual `DBSIZE` after load, not the requested count.
+
+| Value size | Keys | Redis/key | moon/key | moon / Redis | Result |
+|:----------:|:----:|----------:|---------:|:------------:|--------|
+| 32 B | 63K | 123 B | 186 B | **1.51x** | **moon uses 51% MORE** |
+| 32 B | 316K | 127 B | 147 B | **1.16x** | **moon uses 16% MORE** |
+| 32 B | 632K | 129 B | 143 B | **1.11x** | **moon uses 11% MORE** |
+| 256 B | 63K | 408 B | 418 B | 1.02x | moon 2.5% more — a tie |
+| 256 B | 316K | 410 B | 383 B | 0.93x | moon 6.6% less |
+| 256 B | 632K | 409 B | 377 B | 0.92x | moon 7.8% less |
+| 1 KB | 63K | 1,388 B | 1,256 B | 0.90x | moon 9.5% less |
+| 1 KB | 316K | 1,382 B | 1,155 B | 0.84x | **moon 16.4% less** |
+| 1 KB | 632K | 1,380 B | 1,172 B | 0.85x | **moon 15.1% less** |
+| 4 KB | 63K | 5,266 B | 4,404 B | 0.84x | **moon 16.4% less** |
+| 4 KB | 316K | 5,261 B | 4,360 B | 0.83x | **moon 17.1% less** |
+| 4 KB | 632K | 5,259 B | 4,352 B | 0.83x | **moon 17.2% less** |
+
+**Headline, stated with its boundaries:** at values **>= 1 KB** moon uses
+**15-17% less memory per key** than Redis 7.4.2/jemalloc, falling to **9.5%** at
+the smallest key count tested (63K x 1 KB). At **256 B** the two are within
++-8%. At **32 B moon loses**, by 11-51% depending on key count, worst at the
+smallest key count. No cause is asserted for the 32 B loss; see §3.3.
+
+Scope limits a reader should hold this table to: `--shards 1`, x86_64 only,
+string values only, one point per (size, count) cell — no repetition, so no
+run-to-run spread is reported. The band between 32 B and 256 B is not sampled at
+all. The 12-shard configuration was not measured.
+
+### 3.2a Superseded: per-key memory, macOS dev reference (1-shard)
+
+> **Kept only so the retired "27-35% less" claim can be traced to the numbers it
+> came from.** Measured on an Apple M4 Pro (12 cores, 24 GB), not on Linux. §3.2
+> supersedes every row here. Do not quote these.
+
+At ~63K keys:
+
+| Value Size | Redis/Key | moon/Key | Winner | Ratio |
+|:----------:|:---------:|:--------:|:------:|:-----:|
+| 32 B | 118 B | 147 B | Redis | 0.80x |
+| 256 B | 412 B | 407 B | Tied | 1.01x |
+| 1,024 B | 1,879 B | 1,207 B | moon | 1.56x |
+| 4,096 B | 5,131 B | 4,352 B | moon | 1.18x |
 
 At 500K keys:
 
 | Value Size | Redis/Key | moon/Key | Winner | Ratio |
-|:----------:|:---------:|:--------------:|:------:|:-----:|
+|:----------:|:---------:|:--------:|:------:|:-----:|
 | 32 B | 118 B | 149 B | Redis | 0.79x |
-| 256 B | 379 B | 379 B | **Tied** | 1.00x |
-| 1,024 B | 1,786 B | **1,168 B** | **moon** | **1.53x** |
+| 256 B | 379 B | 379 B | Tied | 1.00x |
+| 1,024 B | 1,786 B | 1,168 B | moon | 1.53x |
 
-At 1M keys:
+At 1M keys — **the source of the retired claim**:
 
 | Value Size | Redis RSS | moon RSS | Redis/Key | moon/Key | Winner |
-|:----------:|:---------:|:--------------:|:---------:|:--------------:|:------:|
+|:----------:|:---------:|:--------:|:---------:|:--------:|:------:|
 | 32 B | 78.2 MB | 95.8 MB | 118 B | 147 B | Redis |
-| 256 B | 231.5 MB | 234.4 MB | 372 B | 376 B | **Tied** |
-| 1,024 B | 954.2 MB | **703.0 MB** | 1,571 B | **1,153 B** | **moon** |
+| 256 B | 231.5 MB | 234.4 MB | 372 B | 376 B | Tied |
+| 1,024 B | 954.2 MB | 703.0 MB | 1,571 B | 1,153 B | moon |
 
-### 3.3 Why moon Uses Less Memory at Larger Values
+The two 1,024 B rows are where "27-35% less" came from: 1,153/1,571 = 26.6% at
+1M keys and 1,168/1,786 = 34.6% at 500K. §3.2 re-measures the 1M cell on Linux
+against a jemalloc Redis at Redis 1,380 B / moon 1,172 B — 15.1%.
+
+### 3.3 Why moon Uses Less Memory at Larger Values (and more at small ones)
 
 moon stores heap strings as `HeapString(Vec<u8>)` (24 bytes + data) instead of Redis's `robj` + SDS chain:
 
@@ -859,16 +981,35 @@ Redis:       dictEntry(24B) -> robj(16B) -> SDS(header 8-17B + data) + jemalloc 
 
 For small strings (<=12 bytes), moon uses SSO (Small String Optimization) — the value is stored inline in the 16-byte `CompactValue` struct with zero heap allocation. Redis still allocates `robj` + SDS for all strings.
 
-### 3.4 TTL Memory Overhead
+**This model explains the >= 1 KB direction and does NOT explain the 32 B loss.**
+A 32-byte value is above moon's 12-byte inline cutoff, so it heap-allocates, and
+the overhead arithmetic above would predict moon winning there too. §3.2 measures
+the opposite: moon costs 11-51% more per key at 32 B. Whatever accounts for that
+— per-entry metadata, DashTable load factor, or allocator size-class rounding on
+small heap strings — is not captured by this diagram, and no cause is asserted
+here. §2.14 reaches the same conclusion independently at 64 B on aarch64
+(moon 1.16x worse). Read the diagram as the large-value mechanism only.
+
+### 3.4 TTL Memory Overhead — UNVERIFIED
+
+> **This claim has no measurement behind it and must not be quoted.** The
+> 2026-09-04 run's TTL section is void: that part of `scripts/bench-resources.sh`
+> omits `redis-benchmark -r`, so every `SETEX` hit the single literal key
+> `__rand_key__` and **1 key** was loaded on both sides instead of 500,000. The
+> structural description below is a reading of the source, not a measurement.
 
 moon packs TTL as a 4-byte delta inside `CompactEntry`. Redis maintains a separate `expires` hash table with a full `dictEntry` (24 bytes) per expiring key.
 
-| Server | TTL Implementation | Extra Memory Per Expiring Key |
+| Server | TTL Implementation | Extra Memory Per Expiring Key (structural, not measured) |
 |--------|-------------------|-------------------------------|
 | Redis | Separate `expires` dict | ~24 bytes (dictEntry) |
-| moon | 4-byte delta in CompactEntry | **0 bytes** (already included) |
+| moon | 4-byte delta in CompactEntry | 0 bytes (already included) |
 
-### 3.5 Multi-Shard Memory (12 shards, 1M keys x 64B)
+### 3.5 Multi-Shard Memory (12 shards, 1M keys x 64B) — macOS dev reference
+
+> **Apple M4 Pro development reference, not a Linux measurement.** The
+> 2026-09-04 Linux run (§3.0) measured `--shards 1` only; no multi-shard memory
+> figure has been taken on Linux.
 
 | Server | RSS |
 |--------|-----|
@@ -880,6 +1021,12 @@ Per-shard overhead includes: DashTable segments, event loop state, SPSC channels
 ---
 
 ## 4. Throughput
+
+> **Provenance: §4.1-§4.4 are an Apple M4 Pro (12 cores, 24 GB) development
+> reference, not Linux production measurements** (§4.3 already says so; it
+> applies to all four). The Linux throughput measurements are §2.1-§2.4 (v0.1.6),
+> §2.12 (v0.8.7, the current tree) and §2.14 (vs Redis `io-threads 8`). §4.5 is
+> a separate cross-arch GCloud pass and is labelled as such.
 
 ### 4.1 Single-Shard SET Throughput (P=16, c=50)
 
@@ -923,6 +1070,13 @@ GETRANGE extracts a 13-byte substring from an 85-byte string. SETRANGE overwrite
 
 Scaling is sub-linear due to cross-shard SPSC dispatch overhead and shared loopback network bandwidth. Separate-machine benchmarks with dedicated NICs would show closer to linear scaling.
 
+> **Corrected 2026-09-01 (§2.14):** the "1→8 shards gains nothing" reading was a
+> harness artifact — `redis-benchmark -t lpush|sadd|hset|zadd` drives ONE literal
+> key and `-r` randomises the *element*, not the key. Re-run with explicit
+> `__rand_int__` keys under a `DBSIZE >= 50000` guard, moon's real s8/s1 scaling
+> is **1.42x at p=1, 2.14x at p=8, 3.79x at p=64** (§2.14). The note below is
+> kept for the record; §2.14 supersedes it.
+>
 > **Refined 2026-06-15 (§2.8.4):** on GCloud c3/t2a with a **uniform single-key** GET/SET workload at c=50, 1→8 shards is flat-to-slightly-negative (x86 GET p=64 holds ~4.7M, p=16 −2%; ARM −4–5%), not the +1.46× above. The positive scaling here reflects a non-uniform / higher-concurrency workload; for uniform cross-shard routing, single-shard is best (CLAUDE.md gotcha). Multi-shard wins come from pipeline/AOF parallelism and hash-tag co-location, not raw uniform-key fan-out.
 
 ### 4.5 2026-06-17 data-structure coverage (cross-arch, shards=1, p=1)
@@ -938,6 +1092,15 @@ ZPOPMIN 0.72× (x86). ARM shows several structures at/above parity at p=1 (ZPOPM
 
 ## 5. CPU Efficiency
 
+> **Provenance: §5.1 is an Apple M4 Pro development reference, not a Linux
+> measurement, and no CPU ratio should be derived from it.** The CPU% column was
+> sampled with `ps -o %cpu=`, which reports a process-lifetime average rather
+> than steady-state load, and the CPU and RPS columns were not taken in the same
+> run. **The Linux CPU-per-operation comparison is §2.14, and it is a tie**:
+> 10.55 us/op (moon `--shards 8`) vs 11.33 us/op (Redis `io-threads 8`), with
+> moon's 6.9% edge sitting inside Redis's own 11.9% run-to-run spread. The
+> durable difference there is stability, not cost.
+
 ### 5.1 CPU% and Throughput by Pipeline Depth (1-shard, 200K pre-loaded keys)
 
 | Pipeline | Redis CPU% | moon CPU% | Redis RPS | moon RPS | RPS Ratio | CPU/100K-ops (Redis) | CPU/100K-ops (moon) |
@@ -947,7 +1110,9 @@ ZPOPMIN 0.72× (x86). ARM shows several structures at/above parity at p=1 (ZPOPM
 | P=16 | 100.0% | **1.9%** | 1.95M | **1.97M** | **1.01x** | 5.1% | **0.10%** |
 | P=64 | 43.9% | **1.9%** | 2.42M | **4.13M** | **1.71x** | 1.8% | **0.05%** |
 
-At P=64, moon delivers **1.71x the throughput of Redis while using 23x less CPU**.
+No "Nx less CPU" ratio is published from this table: the two columns it would be
+computed from were not sampled in the same run, and the sampling method averages
+over process lifetime. See §2.14 for the Linux CPU comparison.
 
 ### 5.2 Why moon Is More CPU-Efficient
 
@@ -1093,6 +1258,10 @@ Readings:
 
 ### 7.1 With AOF Everysec, Advantage Grows
 
+> **Apple M4 Pro development reference, not a Linux measurement.** The Linux
+> durability write-path numbers are §7.3 (GCE c3-standard-8, Redis 7.0.15,
+> `--shards 2`, 3 alternated reps).
+
 | Pipeline | SET ops/s (moon) | vs Redis (no AOF) | vs Redis (AOF everysec) |
 |:--------:|:----------------------:|:------------------:|:-----------------------:|
 | P=1 | 146K | 0.95x | 0.95x |
@@ -1155,6 +1324,10 @@ Full method notes and per-rep tables: `tmp/MOON-VS-REDIS-DURABILITY.md`, `tmp/WA
 
 ## 8. Production Workload Patterns
 
+> **Apple M4 Pro development reference, not a Linux measurement.** Ratios here
+> have not been reproduced on a Linux host, and §2.12 measures several of these
+> command families (INCR, LPUSH, HSET) at 0.40-0.67x Redis at p>=8 on Linux.
+
 From `scripts/bench-production.sh` (10 scenarios):
 
 | Scenario | Description | moon vs Redis |
@@ -1186,6 +1359,12 @@ Larger values amplify the io_uring zero-copy and writev scatter-gather advantage
 ---
 
 ## 9. Latency
+
+> **Apple M4 Pro development reference, not a Linux measurement.** It is also a
+> closed-loop `redis-benchmark` median: under coordinated omission a closed-loop
+> harness under-reports latency once the server saturates, so this is a
+> median-under-load figure and says nothing about the tail. No Linux latency
+> comparison has been taken.
 
 ### 9.1 p50 Latency (8-shard)
 

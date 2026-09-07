@@ -15,9 +15,13 @@ required to keep. This page is the story of how Moon got there — and, just as
 importantly, the ideas it **measured and threw away** along the road, because
 "real efficiency" is what survives a benchmark, not what sounds fast.
 
-Every number below is a measured result. Absolute figures come from the Linux
-production reference (GCloud `c3-standard-8` x86_64 and `t2a-standard-8` ARM64,
-vs Redis 8.6.1); the [Benchmarks](benchmarks.md) page and
+Every number below is a measured result, and **every one of them names the host
+it was measured on.** Figures marked *Linux* come from the production reference
+(GCloud `c3-standard-8` x86_64 and `t2a-standard-8` ARM64); figures marked
+*macOS dev reference* were measured on an Apple M4 Pro and are development
+records only — `CLAUDE.md` forbids publishing them as production results, and
+where Linux has since disagreed with one, this page says so instead of quietly
+keeping the flattering number. The [Benchmarks](benchmarks.md) page and
 [`BENCHMARK.md`](https://github.com/pilotspace/moon/blob/main/BENCHMARK.md)
 carry the full methodology and raw data.
 
@@ -104,54 +108,79 @@ crash-lossless storage kernel with replication — one binary, growing.*
 
 | Metric | Moon | vs Redis | Conditions |
 |---|---:|:---:|---|
-| Peak GET | **5.11M ops/sec** | **1.72×** | GCloud x86_64, p=64 |
-| Peak SET | **3.50M ops/sec** | **1.92×** | GCloud x86_64, p=64 |
-| Peak GET (ARM64) | **3.47M ops/sec** | **2.20×** | Neoverse-N1, p=64 |
-| 8-shard SET p=16 | 2.52M ops/sec | **1.99×** | c=50 |
+| Peak GET (v0.1.6) | **5.11M ops/sec** | **1.72×** | **Linux**, GCloud c3-standard-8 x86_64, p=64. Redis `io-threads` setting and payload size not recorded — BENCHMARK.md §2.1 |
+| Peak SET (v0.1.6) | **3.50M ops/sec** | **1.92×** | same run — §2.1 |
+| Peak GET (ARM64, v0.1.6) | **3.47M ops/sec** | **2.20×** | **Linux**, GCloud t2a-standard-8 Neoverse-N1, p=64 — §2.1 |
+| Peak GET (v0.8.7, current tree) | ratio only | **2.40× x86 / 2.29× ARM** | **Linux**, GCE c3/t2a, Redis 7.0.15, `--shards 1`, c=50, p=64 — §2.12 |
+| 8-shard SET p=16 | 2.52M ops/sec | **1.99×** | **macOS dev reference** (Apple M4 Pro), c=50 — §4.2 |
+
+!!! warning "Scope: this is the GET/SET inline path, not the whole command surface"
+    On Linux, v0.8.7 measures **every non-inlined command family — INCR, LPUSH,
+    SPOP, HSET — at 0.40–0.67× Redis at p≥8** (BENCHMARK.md §2.12). `SET k v`
+    runs 2.08× Redis; `SET k v EX 100`, the same work with one disqualifying
+    option, runs 0.87×. The boundary is the fast path, not the engine.
 
 ![Peak throughput vs Redis](assets/journey-throughput.png){ loading=lazy }
 
 *Peak throughput vs Redis 8.6.1 on the GCloud production reference (pipeline=64).*
 
-The shared-nothing payoff shows up at **pipeline depth**, not at raw shard
-count: for a uniform single-key workload, 1→8 shards is flat-to-slightly
-negative (most keys route cross-shard, so SPSC dispatch cost dominates the
-local lookup — single-shard is best). The multi-shard win comes from the
-per-shard WAL and independent event loops parallelizing *pipelined* and durable
-work, plus hash-tag co-location:
+Sharding does scale, and an earlier version of this page said otherwise. The
+claim that "1→8 shards is flat-to-slightly negative" was a **harness artifact**:
+`redis-benchmark -t lpush|sadd|hset|zadd` drives ONE literal key and `-r`
+randomises the *element*, not the key — so eight of twelve command families were
+being asked to parallelise a single key, and 0.97× was the tautological answer.
+Re-run on Linux with explicit `__rand_int__` keys under a `DBSIZE ≥ 50000` guard
+proven to fire, moon's real 8-shard-over-1-shard scaling is **1.42× at p=1,
+2.14× at p=8, and 3.79× at p=64** (BENCHMARK.md §2.14; Redis `io-threads` 8-over-1
+over the same matrix is 1.19× / 1.23× / 1.08×). A genuinely single-hot-key
+workload still cannot be sharded — that part was always true — and the
+multi-shard win is amplified further by the per-shard WAL and independent event
+loops parallelizing *pipelined* and durable work, plus hash-tag co-location:
 
 ![Multi-shard pipelined throughput vs Redis](assets/journey-multishard.png){ loading=lazy }
 
 *At pipeline depth, the per-shard WAL parallelizes work that Redis's single
-event loop serializes — 1.48–1.99× across multi-shard configs.*
+event loop serializes — 1.48–1.99× across multi-shard configs. Apple M4 Pro
+development reference (BENCHMARK.md §4.2); not reproduced on Linux.*
 
-### CPU efficiency: more work, far less silicon
+### CPU efficiency: a tie on cost, a win on stability
 
-The number that best captures the architecture:
+**On Linux, CPU per operation is a tie.** Moon `--shards 8` costs 10.55 µs/op
+against Redis `--io-threads 8`'s 11.33 µs/op (GCE t2a-standard-8,
+`utime+stime` from `/proc/<pid>/stat`, 5 reps, BENCHMARK.md §2.14). Moon's 6.9%
+edge sits inside Redis's own 11.9% run-to-run spread, so it is not a win. What
+*is* durable is stability: moon's CPU cost varies 2.0% run to run against
+Redis's 11.9%, the latter being `stopThreadedIOIfNeeded` engaging and
+disengaging io-threads under steady load.
 
-> At pipeline=64, Moon delivers **1.71× the throughput of Redis while using
-> 23× less CPU** (1.9% vs 43.9% of a core for the same offered load).
+This page previously claimed "23× less CPU" here. That figure has been
+**withdrawn**: it came from an Apple M4 Pro table, its CPU column was sampled
+with `ps -o %cpu=` (a process-lifetime average, not steady-state load), and its
+CPU and RPS columns were not taken in the same run. Three independent reasons
+not to publish it, and it was published under a Linux heading.
 
-![CPU efficiency — Moon vs Redis](assets/journey-cpu.png){ loading=lazy }
-
-*Same offered load, pipeline=64: Redis burns 43.9% of a core, Moon 1.9% — and
-still serves 1.71× the throughput.*
-
-That efficiency is engineered, not incidental: lock-free oneshot channels
+The engineering behind the cost that *is* measured is real, not incidental: lock-free oneshot channels
 removed ~12% CPU of `pthread_mutex` contention, the cached shard clock removed
 ~4% of `clock_gettime` syscalls, and zero-copy parsing keeps the hot path
 allocation-free. Idle cost was hunted just as hard — the adaptive idle-park and
 an O(1) page-cache resident counter trimmed idle-shard CPU from **3.1% to
 ~0.5–0.9%**, and the O3 contention governor makes the busy-poll spin
 *self-disengaging* on contended cores. Efficiency that shows up on the
-electricity bill, not just the benchmark.
+electricity bill, not just the benchmark. Those component figures are profile
+deltas from the optimisation work, not a Moon-vs-Redis ratio.
 
 ### The p=1 conquest — Redis's home turf
 
 Unpipelined, single-connection request/response was historically Redis's best
 case and Moon's weakest. The `--io-busy-poll-us` poll-mode park closed it:
 
-- **1.19–1.21× Redis on ARM** (c4a Axion), **1.65–1.66× on x86** (c3) — same-instance A/B, n=3.
+- **1.19–1.21× Redis on ARM** (c4a Axion), **1.65–1.66× on x86** (c3) — Linux,
+  same-instance A/B, n=3, **on dedicated cores**.
+
+Re-measured on ordinary shared-tenant GCE instances (v0.8.7, BENCHMARK.md §2.12)
+the same flag yields **1.06–1.08× on x86 and nothing outside the noise floor on
+ARM**, because the contention governor correctly self-gates there. Quote the
+dedicated-core figures only with that word attached.
 
 The honest catch was that the spin regressed on shared cores. **v0.8.1's O3
 governor removed the catch**: each shard samples its own involuntary-preemption
@@ -159,35 +188,64 @@ rate and gates the spin automatically, so the win is safe on any host. One
 flag — `--profile standalone` (or [`conf/moon-standalone.conf`](https://github.com/pilotspace/moon/blob/main/conf/moon-standalone.conf)) —
 now delivers the best single-shard tuning everywhere.
 
-### Latency: lower queue depth, lower tail
-
-| Metric | Redis | Moon | Improvement |
-|---|:---:|:---:|:---:|
-| p50 latency (8-shard) | 0.26–0.33 ms | **0.031 ms** | **8–10× lower** |
+### Latency: lower queue depth, unmeasured on Linux
 
 Multi-core parallelism reduces per-shard queue depth, so the median request
-waits less.
+should wait less. **That has not been measured on a Linux host**, and the
+"8–10× lower p50" figure this page used to carry has been withdrawn: it was an
+Apple M4 Pro development reference published under a Linux heading, and it came
+from `redis-benchmark`, a closed-loop tool that under-reports latency once the
+server saturates. The raw macOS numbers are kept, correctly labelled, in
+BENCHMARK.md §9.1.
 
-### Memory: compact by construction
+### Memory: a real win at large values, and half the number we published
 
-| Value size (1M keys) | Redis/key | Moon/key | Result |
-|---|:---:|:---:|:---:|
-| 1,024 B | 1,571 B | **1,153 B** | **27% less** |
-| 1,024 B (63K keys) | 1,879 B | **1,207 B** | **1.56×** |
+The shape held. The headline number did not. Re-measured on Linux
+(**BENCHMARK.md §3** — GCE `c3-standard-8`, x86_64, moon `d5f3501b` at
+`--shards 1`, against **Redis 7.4.2 built with jemalloc 5.3.0**, fresh server per
+point, `redis-benchmark -r N`):
+
+| Value size | Keys | Redis/key | Moon/key | Result |
+|---|:---:|---:|---:|:---|
+| 32 B | 63K–632K | 123–129 B | 143–186 B | **Moon 11–51% worse** |
+| 256 B | 63K–632K | 408–410 B | 377–418 B | tie (±8%) |
+| 1 KB | 63K–632K | 1,380–1,388 B | 1,155–1,256 B | **Moon 9.5–16.4% less** |
+| 4 KB | 63K–632K | 5,259–5,266 B | 4,352–4,404 B | **Moon 16.4–17.2% less** |
+
+!!! danger "This page used to say 27–35%. The number that moved was Redis's."
+    The old 1M × 1 KB row was Redis 1,571 B / Moon 1,153 B, measured on an Apple
+    M4 Pro. Measured again on Linux against a jemalloc Redis: Redis **1,380 B**,
+    Moon **1,172 B**. Moon's own number moved **1.6%**; Redis's moved **12%**.
+    Both Redis binaries already on the benchmark host were libc-malloc builds —
+    which inflate Redis RSS and would have biased the comparison in Moon's
+    favour — so Redis was rebuilt against jemalloc for the run. The claim was
+    never a Moon regression; it was an unrepresentative baseline. **x86_64 only.**
 
 ![Bytes per key vs value size — Moon vs Redis](assets/journey-memory.png){ loading=lazy }
 
-*Per-key memory vs value size. Redis wins at tiny 32 B values; the lines cross
-near 256 B and Moon pulls steadily ahead from there.*
+*Per-key memory vs value size, measured on the Apple M4 Pro development rig:
+Redis wins at tiny 32 B values, the lines cross near 256 B, and Moon pulls ahead
+from there. The Linux measurement above reproduces that **shape** — loss at 32 B,
+tie at 256 B, win from 1 KB. What it does not reproduce is the size of the 1 KB
+win: 15% on Linux against the 27% plotted here. (At 4 KB the two agree, 17% vs
+15%.) The plotted values are the superseded macOS ones.*
 
 `CompactKey` stores keys up to 23 bytes inline and `CompactValue` up to 12
 bytes; larger payloads use `HeapString(Vec<u8>)` (48 B overhead) versus Redis's
 `robj` + SDS chain (64–80 B). TTL packs as a 4-byte delta inside the entry at
 zero extra cost, where Redis allocates a separate 24-byte `dictEntry` per
-expiring key. (At tiny 32 B values Redis still wins on per-key overhead — Moon
-is honest about that; the crossover is ~256 B.) Baseline RSS is identical
-(7.0 MB empty), and tuned jemalloc decay (1 s dirty, background reclaim) returns
-freed pages to the OS instead of hoarding them.
+expiring key. That model explains the large-value win and **not** the 32 B loss,
+where the same arithmetic predicts Moon should win; no cause is asserted.
+Tuned jemalloc decay (1 s dirty, background reclaim) returns freed pages to the
+OS instead of hoarding them.
+
+Baseline RSS is the one that got worse under measurement. This page's ancestor
+claimed 7.0 MB empty for both servers, measured on macOS. On Linux, across all 12
+points of the run above: **Redis 7.5–7.7 MB, Moon 12.6–12.9 MB — ~1.7× worse.**
+Nobody was watching that number; it is now tracked as
+[#821](https://github.com/pilotspace/moon/issues/821). On aarch64 at
+`--shards 8`, BENCHMARK.md §2.14 separately measures idle RSS **1.26× above**
+Redis's, roughly 520 KB per extra shard, four threads per shard.
 
 ### Durability: making it free
 

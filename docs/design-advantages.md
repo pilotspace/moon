@@ -57,9 +57,23 @@ stop-the-world rehash.
 allocation); `CompactValue` is a 16-byte representation that keeps strings ≤ 12 bytes
 inline and uses tagged pointers for collections. Small collections use dense
 encodings — listpack, intset, B+ trees for sorted sets — just like Redis, but with
-Rust's layout control. Net effect, measured: **27–35% less resident memory than Redis
-at values ≥ 1 KB** (below ~64 B, Redis/Valkey small-string encodings are tighter —
-stated in the README benchmarks too).
+Rust's layout control. **This is a win at large values and a loss at small ones.**
+Measured on Linux x86_64 (GCE `c3-standard-8`, moon `--shards 1`, vs Redis 7.4.2
+built against jemalloc 5.3.0, 2026-09-04 — `BENCHMARK.md` §3.2): moon uses
+**15–17% less memory per key at values ≥ 1 KB** (9.5% at the smallest key count
+tested), is within ±8% at 256 B, and uses **11–51% *more* at 32 B**. An empty moon
+server holds **1.7× the RSS of an empty Redis** (12.6–12.9 MB vs 7.5–7.7 MB), cause
+unknown, tracked in [#821](https://github.com/pilotspace/moon/issues/821).
+
+This page previously stated **27–35%** at ≥ 1 KB. That figure came from an Apple M4
+Pro development rig, and its Redis side is the half that does not reproduce: moon's
+own per-key number is within **1.6%** of what it published, while the *oracle* moved
+**12%**. The correction is to the baseline — a Redis measured on macOS and/or
+without jemalloc — not to moon.
+
+The x86_64 result is the only per-key measurement at 1 KB+ values. On aarch64 at
+`--shards 8`, `BENCHMARK.md` §2.14 separately measures moon **16% worse at 64 B**
+and **26% worse on idle RSS** — consistent with the small-value loss above.
 
 **No hidden costs per operation.** Protocol parsing is zero-copy (`Bytes` slices off
 the read buffer), expiry checks read a shard-cached timestamp instead of calling
