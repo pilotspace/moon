@@ -1,22 +1,17 @@
 {
-  "platform": {
-    "os": "Linux",
-    "arch": "x86_64",
-    "profile": "debug"
-  },
-  "rss": 112492544,
+  "rss": 83034112,
   "kinds": {
     "dashtable": {
-      "doctor": 96668221,
-      "prom": 96668301
+      "doctor": 144661544,
+      "prom": 144657903
     },
     "hnsw": {
-      "doctor": 1205862,
-      "prom": 1203052
+      "doctor": 600002,
+      "prom": 600000
     },
     "csr": {
-      "doctor": 50298,
-      "prom": 50304
+      "doctor": 54865,
+      "prom": 54864
     },
     "wal": {
       "doctor": 0,
@@ -32,7 +27,7 @@
     },
     "allocator_overhead": {
       "doctor": 0,
-      "prom": 14260002
+      "prom": 0
     }
   }
 }

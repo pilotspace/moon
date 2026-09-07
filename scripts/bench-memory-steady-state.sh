@@ -36,6 +36,11 @@ THRESHOLD=5
 SELF_TEST=false
 WRITE_BASELINE=""
 SKIP_BUILD=false
+# Written unconditionally, every run, pass or fail, self-test or
+# --write-baseline (moon#764 follow-up). Before this the only way to see
+# what a run actually measured was to read the failure text out of a CI log
+# -- CI now uploads this path as an artifact on every invocation.
+SNAPSHOT_OUT_PATH="/tmp/moon-memory-snapshot.json"
 
 PORT=6391
 ADMIN_PORT=9091
@@ -285,13 +290,46 @@ else:
     # the same platform. RSS, allocator behaviour and struct padding all differ
     # across OS and arch, so a cross-platform delta measures the runner, not the
     # code.
-    local prov_os prov_arch
+    #
+    # os/arch alone is NOT enough (moon#764 follow-up): a GCE c3-standard-8
+    # and a GitHub-hosted `ubuntu-latest` runner are both Linux/x86_64 and
+    # still produced a 243% "allocator_overhead regression" that was purely
+    # the machine, not the code (RSS +30.51%, allocator_overhead +243.22%,
+    # while dashtable -- unaffected by machine class -- held at -0.14%).
+    # cpu_count is the field that would have caught it: GCE c3-standard-8 is
+    # 8 vCPU, GitHub's hosted `ubuntu-latest` is a fixed, documented, smaller
+    # vCPU count. runner_environment/runner_name are recorded for a human
+    # reading a failure to see AT A GLANCE which runner produced which
+    # number; they are not gated on (RUNNER_NAME is a fresh random string
+    # every single hosted run by design, so gating on it would make the gate
+    # permanently exit 2).
+    local prov_os prov_arch prov_cpu_model prov_cpu_count prov_mem_kb
+    local prov_runner_env prov_runner_name
     prov_os=$(uname -s)
     prov_arch=$(uname -m)
+    if [[ "$prov_os" == "Linux" ]]; then
+        prov_cpu_model=$(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//')
+        prov_cpu_count=$(nproc 2>/dev/null || echo 0)
+        prov_mem_kb=$(grep -m1 '^MemTotal' /proc/meminfo 2>/dev/null | awk '{print $2}')
+    elif [[ "$prov_os" == "Darwin" ]]; then
+        prov_cpu_model=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
+        prov_cpu_count=$(sysctl -n hw.ncpu 2>/dev/null || echo 0)
+        prov_mem_kb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 ))
+    fi
+    prov_cpu_model="${prov_cpu_model:-unknown}"
+    prov_cpu_count="${prov_cpu_count:-0}"
+    prov_mem_kb="${prov_mem_kb:-0}"
+    prov_runner_env="${RUNNER_ENVIRONMENT:-unknown}"
+    prov_runner_name="${RUNNER_NAME:-unknown}"
 
     snapshot=$(jq -n \
         --arg prov_os "$prov_os" \
         --arg prov_arch "$prov_arch" \
+        --arg prov_cpu_model "$prov_cpu_model" \
+        --argjson prov_cpu_count "$prov_cpu_count" \
+        --argjson prov_mem_kb "$prov_mem_kb" \
+        --arg prov_runner_env "$prov_runner_env" \
+        --arg prov_runner_name "$prov_runner_name" \
         --argjson rss "$rss_bytes" \
         --argjson dt_d "${doc_dashtable}" \
         --argjson dt_p "${prom_dashtable}" \
@@ -308,7 +346,12 @@ else:
         --argjson ao_d "${doc_alloc}" \
         --argjson ao_p "${prom_alloc}" \
         '{
-            platform: { os: $prov_os, arch: $prov_arch, profile: "debug" },
+            platform: {
+                os: $prov_os, arch: $prov_arch, profile: "debug",
+                cpu_model: $prov_cpu_model, cpu_count: $prov_cpu_count,
+                mem_total_kb: $prov_mem_kb,
+                runner_environment: $prov_runner_env, runner_name: $prov_runner_name
+            },
             rss: $rss,
             kinds: {
                 dashtable:          { doctor: $dt_d,   prom: $dt_p },
@@ -419,7 +462,63 @@ check_baseline_provenance() {
         return 2
     fi
 
-    log "Baseline provenance OK: ${b_os}/${b_arch}"
+    # os/arch alone is NOT enough (moon#764 follow-up): a GCE c3-standard-8
+    # and GitHub's hosted `ubuntu-latest` are both Linux/x86_64 and still
+    # produced a 243% "allocator_overhead regression" that was purely the
+    # machine (RSS +30.51%, allocator_overhead +243.22%), not the code
+    # (dashtable, unaffected by machine class, held at -0.14% on that same
+    # run). cpu_count is the strongest, most stable signal available: GitHub
+    # documents a fixed vCPU count per hosted runner label, so gating on it
+    # will not flap red across legitimate ubuntu-latest reruns the way
+    # gating on the ephemeral, always-different RUNNER_NAME would.
+    local b_cpu_count m_cpu_count b_cpu_model m_cpu_model
+    local b_runner_env b_runner_name m_runner_env m_runner_name
+    b_cpu_count=$(jq -r '.platform.cpu_count // "MISSING"' "$baseline_file")
+    m_cpu_count=$(echo "$snapshot" | jq -r '.platform.cpu_count // "MISSING"')
+    b_cpu_model=$(jq -r '.platform.cpu_model // "MISSING"' "$baseline_file")
+    m_cpu_model=$(echo "$snapshot" | jq -r '.platform.cpu_model // "MISSING"')
+    b_runner_env=$(jq -r '.platform.runner_environment // "unknown"' "$baseline_file")
+    b_runner_name=$(jq -r '.platform.runner_name // "unknown"' "$baseline_file")
+    m_runner_env=$(echo "$snapshot" | jq -r '.platform.runner_environment // "unknown"')
+    m_runner_name=$(echo "$snapshot" | jq -r '.platform.runner_name // "unknown"')
+
+    if [[ "$b_cpu_count" == "MISSING" ]]; then
+        log "GATE CANNOT RUN: $baseline_file has os/arch but no cpu_count."
+        log "  It predates the machine-class provenance check (moon#764"
+        log "  follow-up), so an os/arch match alone cannot prove it came"
+        log "  from a comparable machine -- that gap is exactly what let a"
+        log "  GCE box silently pass as a stand-in for ubuntu-latest once."
+        log "  Regenerate on the runner this gate actually runs on:"
+        log "    bash scripts/bench-memory-steady-state.sh --write-baseline $baseline_file"
+        return 2
+    fi
+
+    if [[ "$b_cpu_count" != "$m_cpu_count" ]]; then
+        log "GATE CANNOT RUN: baseline/runner machine-class mismatch (cpu_count)."
+        log "  baseline: cpu_count=${b_cpu_count} cpu_model=${b_cpu_model} runner=${b_runner_env}/${b_runner_name}"
+        log "  measured: cpu_count=${m_cpu_count} cpu_model=${m_cpu_model} runner=${m_runner_env}/${m_runner_name}"
+        log "  Same os/arch, different machine class -- RSS and allocator"
+        log "  overhead do not transfer (this is the exact failure mode that"
+        log "  motivated this check: a GCE c3-standard-8 baseline compared"
+        log "  against ubuntu-latest read +243% allocator_overhead)."
+        log "  Regenerate on this machine class:"
+        log "    bash scripts/bench-memory-steady-state.sh --write-baseline $baseline_file"
+        return 2
+    fi
+
+    # cpu_model is logged and compared, but only WARNED on, not gated: GitHub
+    # does not document (or guarantee stability of) the exact CPU SKU behind
+    # a hosted runner label the way it documents vCPU count, so hard-failing
+    # here risked the opposite failure mode -- a gate that goes permanently
+    # red because the hosted fleet legitimately rotated silicon under an
+    # unchanged runner label, which is not a code regression either.
+    if [[ "$b_cpu_model" != "MISSING" && "$m_cpu_model" != "MISSING" && "$b_cpu_model" != "$m_cpu_model" ]]; then
+        log "WARN: cpu_model differs (same cpu_count, comparing anyway):"
+        log "  baseline: ${b_cpu_model}"
+        log "  measured: ${m_cpu_model}"
+    fi
+
+    log "Baseline provenance OK: ${b_os}/${b_arch}, cpu_count=${m_cpu_count} (baseline runner=${b_runner_env}/${b_runner_name}, this runner=${m_runner_env}/${m_runner_name})"
     return 0
 }
 
@@ -585,6 +684,12 @@ main() {
 
     log "Captured snapshot:"
     echo "$snapshot" | jq . >&2
+
+    # Always written, regardless of mode or outcome, so CI can upload it as
+    # an artifact unconditionally -- pass, fail, self-test, or
+    # --write-baseline all produce the same measured-this-run record.
+    echo "$snapshot" | jq . > "$SNAPSHOT_OUT_PATH"
+    log "Snapshot written to $SNAPSHOT_OUT_PATH"
 
     # Cross-reporter check (warnings only, non-fatal)
     check_cross_reporter "$snapshot"

@@ -20,6 +20,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lint pass cannot substitute for it. Verified it can fail: reverting the
   collapsed `if` gives `RC=101`, `2 errors`.
 
+- **`ci`: the memory steady-state gate never compared against its baseline,
+  and its baseline was never comparable in the first place (moon#764).**
+  Three compounding defects, found by chasing the gate's own green:
+  1. `--self-test` `exit 0`'d immediately after proving its own injection
+     check worked, one branch above the `compare_snapshot` call against
+     `tests/fixtures/memory-baseline.json` -- the only place the committed
+     baseline was ever read. `ci.yml` invokes exactly `--self-test
+     --skip-build`, so that comparison had never executed in CI. Fixed:
+     `--self-test` is now a phase, not a mode -- it falls through to the
+     real comparison instead of returning early.
+  2. The committed baseline was captured on macOS aarch64/debug while the
+     gate runs on `ubuntu-latest` (Linux), so even with (1) fixed the
+     comparison would have measured the runner, not the code, on every PR.
+     A new `check_baseline_provenance` refuses to compare (exit 2) when a
+     baseline's platform doesn't match the runner's.
+  3. Regenerating a baseline on a real machine surfaced that os/arch-level
+     provenance was not enough either: a GCE `c3-standard-8` and GitHub's
+     hosted `ubuntu-latest` are both Linux/x86_64 and still produced a
+     false 243% `allocator_overhead` "regression" from machine differences
+     alone (RSS +30.51%, `allocator_overhead` +243.22%, while `dashtable` --
+     unaffected by machine class -- held at -0.14% on the same run).
+     `check_baseline_provenance` now also records and gates on `cpu_count`
+     (hard, exit 2 on mismatch -- GitHub documents a fixed vCPU count per
+     runner label) and records `cpu_model`/`mem_total_kb`/runner identity
+     for warning and audit, without hard-failing on them (GitHub does not
+     guarantee CPU-model stability within a runner label, so gating there
+     risked trading a silent-wrong-machine-pass for a permanent false-red
+     instead). Separately, real runs on that same GCE host showed `hnsw`
+     and `allocator_overhead` are genuinely noisy run-to-run with **zero**
+     code changes (~±16% / ~±19% measured over 10+ runs) -- the old flat
+     ±5% tolerance would have failed the gate on those two kinds roughly
+     every other real run for reasons having nothing to do with the PR
+     under test. `compare_snapshot` now applies a wider, evidence-based
+     floor to just those two kinds (±20% / ±25%); the other five kinds and
+     RSS are unchanged. Every run now also uploads its captured snapshot as
+     an artifact unconditionally (pass, fail, or baseline capture), and a
+     `workflow_dispatch` input regenerates the baseline on the actual
+     runner instead of an out-of-band machine.
+
 ### Documentation
 
 - **The "27-35% less memory" claim is corrected to a measured 15-17%, on Linux,
