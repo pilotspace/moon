@@ -1994,13 +1994,21 @@ pub(crate) fn blocking_pop_family(cmd: &[u8]) -> Option<crate::blocking::WaitFam
 /// `None`, and nothing here mutates the keyspace. The in-MULTI path
 /// ([`super::blocking_txn`]) has had this gate since moon#524; this is the
 /// live path catching up to it.
+///
+/// moon#832: "nothing here mutates the keyspace" was not true for lists.
+/// `Database::get_list` routes through `get_promoted`, which upgrades a
+/// compact encoding unconditionally — so this gate, whose whole job is to
+/// *look at* the type before parking a client, permanently flattened a
+/// `listpack` list every time a `BLPOP` was about to block on it. The
+/// shared-borrow accessor answers the same question without the rewrite.
 pub(crate) fn blocking_wrongtype_error(
     cmd: &[u8],
     db: &mut Database,
     key: &Bytes,
 ) -> Option<Frame> {
+    let now_ms = db.now_ms();
     match blocking_pop_family(cmd)? {
-        crate::blocking::WaitFamily::List => db.get_list(key).err(),
+        crate::blocking::WaitFamily::List => db.get_list_ref_if_alive(key, now_ms).err(),
         crate::blocking::WaitFamily::ZSet => db.get_sorted_set(key).err(),
         // moon#595: it does now. `XREAD BLOCK 1500 STREAMS <string-key> $` is
         // an immediate `-WRONGTYPE` in Redis (measured), not a 1.5 s park —
@@ -2113,15 +2121,20 @@ fn move_endpoints(cmd: &[u8], args: &[Frame]) -> Option<(Bytes, Bytes)> {
 ///
 /// `source == destination` is the rotate form: same key, therefore same type,
 /// nothing to check.
+///
+/// moon#832: both probes are pure inspection — when the source is empty or
+/// the destination is the wrong type nothing is moved at all — so they read
+/// through the shared-borrow accessor, which cannot upgrade the encoding.
 fn move_destination_error(db: &mut Database, source: &Bytes, dest: &Bytes) -> Option<Frame> {
     if source == dest {
         return None;
     }
-    match db.get_list(source) {
+    let now_ms = db.now_ms();
+    match db.get_list_ref_if_alive(source, now_ms) {
         Ok(Some(list)) if !list.is_empty() => {}
         _ => return None,
     }
-    db.get_list(dest).err()
+    db.get_list_ref_if_alive(dest, now_ms).err()
 }
 
 /// Try to pop data immediately (non-blocking fast path).

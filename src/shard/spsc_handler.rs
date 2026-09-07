@@ -2278,7 +2278,14 @@ pub(crate) fn handle_shard_message_shared(
             let type_error = if sole_key {
                 crate::shard::slice::with_shard_db(db_index, |guard| {
                     match cmd.family() {
-                        crate::blocking::WaitFamily::List => guard.get_list(&key).err(),
+                        // moon#832: a type probe before parking a waiter must
+                        // not rewrite the value it is probing — `get_list`
+                        // (via `get_promoted`) flattened the list's compact
+                        // encoding on every remote blocking registration.
+                        crate::blocking::WaitFamily::List => {
+                            let now_ms = guard.now_ms();
+                            guard.get_list_ref_if_alive(&key, now_ms).err()
+                        }
                         crate::blocking::WaitFamily::ZSet => guard.get_sorted_set(&key).err(),
                         // moon#595: `-WRONGTYPE` for a stream read on the
                         // wrong type, plus XREADGROUP's missing-key and

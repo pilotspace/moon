@@ -202,6 +202,24 @@ impl Database {
     /// `&mut self` — unlike the enum-based `get_ref_if_alive` it can
     /// promote directly instead of decoding a throwaway copy per call) and
     /// upgrading the kind's compact encoding(s) in place when present.
+    ///
+    /// # This REWRITES the value. Do not call it to read (moon#832).
+    ///
+    /// The return type is `K::Shared` — a *shared* reference — but getting
+    /// one costs an unconditional, one-way `K::upgrade`: nothing in the tree
+    /// ever downgrades, so the first call flattens the key's compact encoding
+    /// for the rest of its lifetime. Measured on b04e8990: 1000 eight-member
+    /// integer sets went 333,055 → 1,149,055 bytes of `used_memory` (3.45×)
+    /// after one `SCARD` each; `OBJECT ENCODING` went `intset → hashtable`,
+    /// and a three-element list `listpack → linkedlist` after one `LLEN`.
+    ///
+    /// That is only acceptable for a caller that is *about to mutate* and
+    /// therefore needs the full form anyway. A caller that only reads — a
+    /// length probe, a membership test, a `-WRONGTYPE` gate — must go through
+    /// [`Self::get_ref_if_alive`] (`get_hash_ref_if_alive`,
+    /// `get_list_ref_if_alive`, `get_set_ref_if_alive`, …), whose `&self`
+    /// receiver makes the rewrite unrepresentable rather than merely
+    /// discouraged.
     pub fn get_promoted<K: OwnedKind>(
         &mut self,
         key: &[u8],
@@ -244,6 +262,10 @@ impl Database {
     /// cold-collection-visibility fix) — this accessor takes `&mut self`, so
     /// unlike the enum-based `get_hash_ref_if_alive` it can promote directly
     /// instead of decoding a throwaway copy on every call.
+    ///
+    /// **Flattens the compact encoding (moon#832).** Writers only —
+    /// see [`Self::get_promoted`]. Pure reads take
+    /// [`Self::get_hash_ref_if_alive`].
     pub fn get_hash(&mut self, key: &[u8]) -> Result<Option<&HashMap<Bytes, Bytes>>, Frame> {
         self.get_promoted::<db_kind::HashKind>(key)
     }
@@ -259,6 +281,10 @@ impl Database {
     ///
     /// Promotes a cold-spilled list back to hot RAM on miss (P0
     /// cold-collection-visibility fix) — this accessor takes `&mut self`.
+    ///
+    /// **Flattens the compact encoding (moon#832).** Writers only —
+    /// see [`Self::get_promoted`]. Pure reads take
+    /// [`Self::get_list_ref_if_alive`].
     pub fn get_list(&mut self, key: &[u8]) -> Result<Option<&VecDeque<Bytes>>, Frame> {
         self.get_promoted::<db_kind::ListKind>(key)
     }
@@ -277,6 +303,10 @@ impl Database {
     ///
     /// Promotes a cold-spilled set back to hot RAM on miss (P0
     /// cold-collection-visibility fix) — this accessor takes `&mut self`.
+    ///
+    /// **Flattens the compact encoding (moon#832).** Writers only —
+    /// see [`Self::get_promoted`]. Pure reads take
+    /// [`Self::get_set_ref_if_alive`].
     pub fn get_set(
         &mut self,
         key: &[u8],

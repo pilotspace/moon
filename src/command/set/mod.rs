@@ -749,4 +749,105 @@ mod tests {
             "SPOP must credit the removed member: grown={grown} after={after}"
         );
     }
+    // ── moon#832: a read on the MUTABLE path must not flatten the encoding ──
+    //
+    // Red on b04e8990: every one of these handlers reached the set through
+    // `Database::get_set` -> `get_promoted` -> `SetKind::upgrade`, an
+    // unconditional one-way conversion. `SADD s 1 2 3` then `SCARD s` on the
+    // mutable path left the key a `hashtable` forever. Measured cost of that
+    // on the unmodified binary: 1000 eight-member integer sets went
+    // 333,055 -> 1,149,055 bytes of `used_memory` (3.45x) after one SCARD each.
+    //
+    // These call the handlers DIRECTLY, which is what `command::dispatch`,
+    // the MULTI/EXEC executor, the Lua bridge and `try_inline_dispatch` all
+    // ultimately do -- so one assertion covers every mutable entry point.
+
+    fn encoding_of(db: &mut Database, key: &[u8]) -> &'static str {
+        db.get(key)
+            .map(|e| e.value.as_redis_value().encoding_name())
+            .unwrap_or("<missing>")
+    }
+
+    #[allow(clippy::type_complexity)]
+    const READ_HANDLERS_832: &[(&str, fn(&mut Database))] = &[
+        ("SMEMBERS", |db| {
+            smembers(db, &[bs(b"s")]);
+        }),
+        ("SCARD", |db| {
+            scard(db, &[bs(b"s")]);
+        }),
+        ("SISMEMBER", |db| {
+            sismember(db, &[bs(b"s"), bs(b"1")]);
+        }),
+        ("SMISMEMBER", |db| {
+            smismember(db, &[bs(b"s"), bs(b"1"), bs(b"2")]);
+        }),
+        ("SRANDMEMBER", |db| {
+            srandmember(db, &[bs(b"s")]);
+        }),
+        ("SSCAN", |db| {
+            sscan(db, &[bs(b"s"), bs(b"0")]);
+        }),
+        ("SINTER", |db| {
+            sinter(db, &[bs(b"s")]);
+        }),
+        ("SUNION", |db| {
+            sunion(db, &[bs(b"s")]);
+        }),
+        ("SDIFF", |db| {
+            sdiff(db, &[bs(b"s")]);
+        }),
+        ("SINTERCARD", |db| {
+            sintercard(db, &[bs(b"1"), bs(b"s")]);
+        }),
+    ];
+
+    #[test]
+    fn read_on_mutable_path_keeps_intset_encoding() {
+        for (name, call) in READ_HANDLERS_832 {
+            let mut db = Database::new();
+            setup_set(&mut db, b"s", &[b"1", b"2", b"3"]);
+            assert_eq!(
+                encoding_of(&mut db, b"s"),
+                "intset",
+                "{name}: fixture must start compact, or the test proves nothing"
+            );
+            call(&mut db);
+            assert_eq!(
+                encoding_of(&mut db, b"s"),
+                "intset",
+                "{name} flattened the set: a read on the mutable dispatch path rewrote the encoding (moon#832)"
+            );
+        }
+    }
+
+    /// The read must still ANSWER correctly from the compact form — a fix that
+    /// preserved the encoding by not reading the set would pass the test above.
+    #[test]
+    fn read_on_mutable_path_still_answers_from_the_compact_form() {
+        let mut db = Database::new();
+        setup_set(&mut db, b"s", &[b"1", b"2", b"3"]);
+        assert_eq!(scard(&mut db, &[bs(b"s")]), Frame::Integer(3));
+        assert_eq!(sismember(&mut db, &[bs(b"s"), bs(b"2")]), Frame::Integer(1));
+        assert_eq!(sismember(&mut db, &[bs(b"s"), bs(b"9")]), Frame::Integer(0));
+        let Frame::Array(members) = smembers(&mut db, &[bs(b"s")]) else {
+            panic!("SMEMBERS must answer an array");
+        };
+        assert_eq!(members.len(), 3);
+        assert_eq!(encoding_of(&mut db, b"s"), "intset");
+    }
+
+    /// A WRITE still upgrades — the fix must not have disabled `K::upgrade`.
+    #[test]
+    fn write_on_mutable_path_still_upgrades() {
+        let mut db = Database::new();
+        setup_set(&mut db, b"s", &[b"1", b"2", b"3"]);
+        assert_eq!(encoding_of(&mut db, b"s"), "intset");
+        sadd(&mut db, &[bs(b"s"), bs(b"not-an-int")]);
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "hashtable",
+            "a non-integer member has no intset form; the write must upgrade"
+        );
+    }
 }

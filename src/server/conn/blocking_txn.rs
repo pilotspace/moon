@@ -158,7 +158,12 @@ pub(crate) fn try_exec_blocking_in_txn(
                 Ok(found) => found.is_some(),
             }
         } else {
-            match db.get_list(&key) {
+            // moon#832: a presence + type probe, not an access. Reading it
+            // through `get_list` (i.e. `get_promoted`) permanently flattened
+            // the list's compact encoding for a question the shared-borrow
+            // accessor answers identically.
+            let now_ms = db.now_ms();
+            match db.get_list_ref_if_alive(&key, now_ms) {
                 Err(e) => return Some(BlockingTxnOutcome::reply_only(e)),
                 Ok(found) => found.is_some(),
             }
