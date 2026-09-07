@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ci`: clippy now lints tests, benches and examples.** Every clippy
+  invocation in `ci.yml` was lib-only, so `--all-targets` code was never
+  linted anywhere: moon#835's two errors (`tests/busy_poll_idle.rs`,
+  `src/io/fd_table.rs`) survived for weeks, and moon#840 added a third
+  (`tests/restart_preserves_compact_encoding.rs`, `collapsible_if`) the same
+  day it merged. moon#849 fixed the two errors but added no gate, so nothing
+  stopped the next one. This adds the `--all-targets` leg and fixes #840's
+  lint. The leg runs on ubuntu deliberately: `fd_table.rs` is
+  `cfg(target_os = "linux")` and is invisible to any macOS run, so a local
+  lint pass cannot substitute for it. Verified it can fail: reverting the
+  collapsed `if` gives `RC=101`, `2 errors`.
+
 ### Documentation
 
 - **The "27-35% less memory" claim is corrected to a measured 15-17%, on Linux,
