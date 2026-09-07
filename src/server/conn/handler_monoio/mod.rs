@@ -1700,6 +1700,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
         let mut auth_delay_ms: u64 = 0;
 
+        // moon#774: per-batch dispatch-path accumulators, flushed once at the
+        // end of the batch so we pay one atomic per path instead of N. Mirrors
+        // handler_sharded, which has done this since the batched recorders
+        // landed; monoio — the runtime that SHIPS — was still doing it
+        // per-command. u32 with saturating_add: a batch can never approach
+        // 2^32 frames, and saturating beats wrapping if it somehow did.
+        let mut local_dispatches: u32 = 0;
+        let mut cross_spsc_dispatches: u32 = 0;
+        let mut fast_read_dispatches: u32 = 0;
+
         // #438 batch-tail hardening: index-based iteration (not
         // `frames.drain(..)`) so early-flush arms (blocking / SUBSCRIBE /
         // PSYNC) can defer themselves plus the unconsumed tail to the next
@@ -2738,7 +2748,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     }
                                 });
                             fanout_state.set_part(part_idx, reply);
-                            crate::admin::metrics_setup::record_dispatch_local();
+                            local_dispatches = local_dispatches.saturating_add(1);
                         } else {
                             remote_groups.entry(target).or_default().push((
                                 crate::server::conn::fanout::ReplySink::Part(part_idx),
@@ -2751,7 +2761,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 crate::protocol::resp3::Resp3Shape::None,
                             ));
                             pending_mask |= 1u64 << (target % u64::BITS as usize);
-                            crate::admin::metrics_setup::record_dispatch_cross_spsc();
+                            cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
                         }
                     }
                     crate::admin::metrics_setup::record_pipeline_multikey_fanout();
@@ -2964,7 +2974,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             };
 
             if is_local {
-                crate::admin::metrics_setup::record_dispatch_local();
+                local_dispatches = local_dispatches.saturating_add(1);
 
                 // T2.2 MOVE / T2.3 COPY ... DB n — intercept before write-path
                 // (needs two dbs). Direct name checks below subsume the outer
@@ -3821,7 +3831,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
                         }
                         responses.push(response);
-                        crate::admin::metrics_setup::record_dispatch_cross_read_fast();
+                        fast_read_dispatches = fast_read_dispatches.saturating_add(1);
                         continue;
                     }
                 }
@@ -3880,9 +3890,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     resp3_shape,
                 ));
                 pending_mask |= 1u64 << (target % u64::BITS as usize);
-                crate::admin::metrics_setup::record_dispatch_cross_spsc();
+                cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
             }
         }
+
+        // Flush per-batch dispatch-path counters — one atomic per path instead
+        // of N per batch (moon#774). Short-circuits on 0. Placed after the
+        // frame loop so every `break` arm (blocking / SUBSCRIBE / deferred
+        // tail) still flushes what it accounted for; the two PSYNC-hijack
+        // `return`s above bypass it, exactly as they do in handler_sharded,
+        // and cost at most one replica handshake's worth of counts.
+        crate::admin::metrics_setup::record_dispatch_local_batch(local_dispatches as u64);
+        crate::admin::metrics_setup::record_dispatch_cross_spsc_batch(cross_spsc_dispatches as u64);
+        crate::admin::metrics_setup::record_dispatch_cross_read_fast_batch(
+            fast_read_dispatches as u64,
+        );
 
         // #438: re-encode any deferred batch tail back into the FRONT of
         // read_buf and skip the next socket read — the frames re-parse on the

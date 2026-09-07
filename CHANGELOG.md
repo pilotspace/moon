@@ -167,6 +167,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tracing::warn!` (`src/main.rs`), README.md, `docs/guides/tuning.md`,
   `docs/configuration.md`, and `docs/runbooks/upgrade-to-v0.6.0.md`. No
   behavior change — flags set by the preset are unchanged.
+- **`metrics`: the per-command observability counters no longer bounce one
+  cache line across every shard core (moon#774).** `keyspace_hits`,
+  `keyspace_misses`, `expired_keys`, `total_dispatch_cross_spsc` and
+  `total_dispatch_cross_read_fast` were plain global atomics — the first three
+  8 bytes apart in one line — RMW'd once per command by every shard thread.
+  Measured shape: GET p=1 c200 at `--shards 8` moved 332,779 ops/s with 87.54%
+  cross-shard, i.e. ~291K contended RMWs/s onto that line, plus one keyspace
+  RMW per lookup.
+
+  They now live in a 64-byte-aligned per-thread slot, reusing the scheme the
+  total-commands counter has used since QW4; readers sum the slots and the sum
+  is exact. All five share ONE line per thread on purpose: a cross-shard GET
+  bumps a keyspace counter *and* a dispatch counter in the same command, and
+  splitting them would trade one contended line for two private misses.
+
+  The increments stay **ungated**. These atomics back INFO fields that must be
+  right with `--admin-port 0`, so gating them on `METRICS_INITIALIZED` would
+  swap a performance defect for a correctness one. What changed is the
+  contention, not the cost of the instruction. No INFO field changes value.
+
+- **`server`: the monoio connection handler batches its dispatch-path
+  counters, as the tokio one already did (moon#774).** Batched recorders
+  landed on `handler_sharded` and never on `handler_monoio` — *the runtime
+  that ships* — so the runtime nobody deploys got the optimisation and the
+  deployed one paid N global atomics per pipeline batch instead of one. Both
+  handlers now accumulate per batch and flush once.
+
+  Nothing caught this: both spellings produce the same counter value, so every
+  INFO assertion and Prometheus scrape stayed green.
+  `tests/dispatch_recorder_drift.rs` now pins it as a source-level invariant,
+  since the call site is the only observable.
+
+  A `record_dispatch_cross_read_fast_batch` counterpart was added for the L4
+  shared-guard read path, which had no batched variant.
 
 ## [0.8.9] — 2026-09-04
 
