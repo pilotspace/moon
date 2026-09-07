@@ -310,6 +310,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `examples/dashtable_growth.rs` is the growth micro-bench that measured it.
   `DashTable::split_count`'s doc no longer claims `MEMORY DOCTOR` reads it
   (nothing on the command path does).
+- **`storage`: a heap string is one allocation, and nothing on the heap is
+  read to drop or overwrite it** (perf campaign G1 §5, lever 5). A string
+  value longer than the 12-byte SSO cutoff used to be
+  `Box<HeapString(Box<[u8]>)>`: a 16-byte wrapper allocation holding the
+  pointer and length of the data allocation. `Database::set`'s overwrite
+  closure — the largest symbol in every steady-state `-t set` profile —
+  dereferenced that wrapper to bill and then to free the old value: a second
+  cache miss per overwrite, plus one `malloc`/`free` pair per write for the
+  wrapper itself.
+
+  `CompactValue` now stores the string's thin pointer and its length in its
+  own 16 bytes: the previously unread 4-byte prefix in `payload[0..4]` holds
+  the low 32 bits of the length and the 28 `LEN_MASK` bits of `len_and_tag`
+  the high bits (60 bits; the 256 MiB cliff a 28-bit length would have had
+  does not exist). The kind of a heap value moved out of the pointer's low
+  bits into `len_and_tag`'s high nibble (`0xE` = heap string, `0xF` = heap
+  collection), so the string pointer is **untagged** and the layout assumes
+  nothing about the alignment the allocator gives an align-1 `[u8]`. Drop
+  rebuilds `Box<[u8]>` from `(ptr, len)`; `sdallocx` needs nothing from the
+  object.
+
+  `used_memory` bills a heap string as `size_class(len)` through `mem_size`
+  (#810), 16 bytes less per key than before, and
+  `tests/compact_value_alloc_accounting.rs` proves against a counting
+  allocator that the value is exactly one request of `len` bytes, freed
+  exactly once, at every jemalloc class boundary. The string path's
+  `unsafe` surface went from nine blocks to three (`heap_str`,
+  `heap_str_mut`, `take_heap_string`), each citing the numbered invariants
+  on the type; every constructor establishes them in one function.
 
 ## [0.8.9] — 2026-09-04
 
