@@ -184,10 +184,9 @@ impl LuaEvictionCtx {
         };
         // Lock-free fast path: a script issuing thousands of writes checks
         // process-global atomics (Gap C + WS5b), not the RuntimeConfig lock.
-        if inner.spill_sender.is_none()
-            && !crate::storage::eviction::maxmemory_is_set()
-            && !crate::storage::db_quota::db_maxmemory_any_set()
-        {
+        // G1/L3a: whether a spill sender is wired is not a term — it only
+        // routes a victim, and there is none without a limit.
+        if !crate::storage::eviction::write_gate_active() {
             return Ok(());
         }
         let rt = inner.runtime_config.read();
@@ -660,22 +659,22 @@ mod tests {
     #[test]
     #[cfg(feature = "runtime-monoio")]
     fn gate_reports_bystander_eviction_to_aof() {
-        // Deliberately give the ctx a real `spill_sender` (`Some(..)`) so
-        // `gate`'s lock-free fast path (`spill_sender.is_none() && !
-        // maxmemory_is_set() && !db_maxmemory_any_set()`) is false by
-        // construction, regardless of `MAXMEMORY_GLOBAL`'s CURRENT value —
-        // that atomic is process-global and mutated by other tests running
-        // concurrently in this same `cargo test --lib` binary
+        // Hold the gate OPEN for this thread regardless of
+        // `MAXMEMORY_GLOBAL`'s CURRENT value — that atomic is process-global
+        // and mutated by other tests running concurrently in this same
+        // `cargo test --lib` binary
         // (`eviction::tests::maxmemory_publish_and_is_set_roundtrip`), so
-        // depending on its value here would be flaky under parallel test
-        // execution. `manifest` is always `None` at this call site (real
-        // production behavior, not a test shortcut — see
-        // `EvictionSink::AsyncSpill`'s doc comment),
-        // and `config.appendonly == "no"` (the `make_config` default), so
-        // this deterministically takes the "no manifest reachable" plain-
-        // drop fallback inside `evict_to_budget`
-        // — the sender/shard_dir below are never actually touched by that
-        // branch, just required by the signature.
+        // depending on it here would be flaky under parallel execution.
+        // Before G1/L3a a wired `spill_sender` bypassed the fast path by
+        // itself; the gate is now keyed on `write_gate_active()` alone.
+        // `manifest` is always `None` at this call site (real production
+        // behavior, not a test shortcut — see `EvictionSink::AsyncSpill`'s
+        // doc comment), and `config.appendonly == "no"` (the `make_config`
+        // default), so this deterministically takes the "no manifest
+        // reachable" plain-drop fallback inside `evict_to_budget` — the
+        // sender/shard_dir below are never actually touched by that branch,
+        // just required by the signature.
+        let _gate_open = crate::storage::eviction::force_write_gate(true);
         let (shard_databases, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
         let runtime_config = Arc::new(parking_lot::RwLock::new(make_config(1, "allkeys-lru")));
 
@@ -730,6 +729,85 @@ mod tests {
         assert!(
             saw_del_for_bystander,
             "bystander eviction inside the Lua gate must emit a DEL record to the AOF plane"
+        );
+    }
+
+    /// G1/L3a: with no `maxmemory` and no per-db quota configured, a wired
+    /// spill sender must NOT pull every script write through
+    /// `evict_to_budget`. Eviction ROUTING (spill vs plain drop) only exists
+    /// once a victim is selected, and `evict_to_budget` selects none when
+    /// `maxmemory == 0` — so the call was a pure no-op costing a
+    /// `RuntimeConfig` read-lock pair, an `elastic_budget` load and an
+    /// `EvictionRun` build per `redis.call` on every default server
+    /// (`--disk-offload enable` wires the sender).
+    ///
+    /// RED (before L3a): the fast path was keyed on `spill_sender.is_none()`
+    /// — a CONFIG predicate — so `Some(sender)` entered the gate on every
+    /// write. GREEN: keyed on the STATE predicate
+    /// `eviction::write_gate_active()`.
+    ///
+    /// `MAXMEMORY_GLOBAL` / `DB_MAXMEMORY_ANY_SET` are process-global and
+    /// other tests in this binary publish them, so each attempt samples both
+    /// before and after the gate call and only counts when they were unset
+    /// throughout. The probe counter is thread-local, so it cannot be moved
+    /// by another test's `evict_to_budget` call.
+    #[test]
+    fn gate_is_skipped_with_spill_sender_when_no_limit_is_configured() {
+        use crate::storage::db_quota::db_maxmemory_any_set;
+        use crate::storage::eviction::{evict_to_budget_entries_on_this_thread, maxmemory_is_set};
+
+        let (shard_databases, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
+        let runtime_config = Arc::new(parking_lot::RwLock::new(make_config(0, "allkeys-lru")));
+        let (spill_tx, _spill_rx) =
+            flume::bounded::<crate::storage::tiered::spill_thread::SpillRequest>(4);
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = LuaEvictionCtx::new(
+            shard_databases,
+            runtime_config,
+            0,
+            Some(spill_tx),
+            Rc::new(Cell::new(1)),
+            Some(tmp.path().to_path_buf()),
+            1,
+            None,
+            None,
+        );
+        let mut db = Database::new();
+        for i in 0..8 {
+            db.set_string(&Bytes::from(format!("k:{i}")), Bytes::from(vec![0u8; 64]));
+        }
+        let len_before = db.len();
+
+        for _attempt in 0..100 {
+            let limit_before = maxmemory_is_set() || db_maxmemory_any_set();
+            let entries_before = evict_to_budget_entries_on_this_thread();
+            let result = ctx.gate(&mut db, 0);
+            let entries_after = evict_to_budget_entries_on_this_thread();
+            let limit_after = maxmemory_is_set() || db_maxmemory_any_set();
+            assert!(
+                result.is_ok(),
+                "no limit configured: the gate must never reject"
+            );
+            if limit_before || limit_after {
+                // Another test had a limit published during this attempt;
+                // the skip is not expected then. Try again.
+                std::thread::yield_now();
+                continue;
+            }
+            assert_eq!(
+                db.len(),
+                len_before,
+                "nothing may be evicted without a limit"
+            );
+            assert_eq!(
+                entries_after, entries_before,
+                "no maxmemory and no db quota: the Lua write gate must not enter \
+                 evict_to_budget just because a spill sender is wired"
+            );
+            return;
+        }
+        panic!(
+            "could not observe an unset maxmemory in 100 attempts; check for a test leaking a published limit"
         );
     }
 

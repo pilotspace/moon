@@ -2443,76 +2443,85 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     )
                                 });
                                 let db = &mut *db_guard;
-                                let rt = ctx.runtime_config.read();
-                                // Disk-offload: when a per-shard spill sender is wired
-                                // (ConnCtx populated by spawn_tokio_connection), evicted
-                                // KVs are spilled to the cold tier on the background spill
-                                // thread instead of being deleted — mirrors handler_monoio.
-                                // Without the sender (disk-offload disabled) fall back to
-                                // delete-only eviction. Both evictors run under this shard's
-                                // db write lock, so they cannot race the persistence-tick
-                                // cascade on the same key.
-                                let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
-                                let evict_result = if let Some(ref sender) = ctx.spill_sender {
-                                    let mut fid = ctx.spill_file_id.get();
-                                    let dir = ctx
-                                        .disk_offload_dir
-                                        .as_deref()
-                                        .unwrap_or(std::path::Path::new("."));
-                                    let res = evict_to_budget(
-                                        db,
-                                        &rt,
-                                        EvictionRun::async_spill(
-                                            sender,
-                                            dir,
-                                            &mut fid,
+                                // G1/L3a: the eviction + db-quota gate can only act when a
+                                // limit is configured (`eviction::write_gate_active`); the
+                                // monoio handler gates the same span per batch
+                                // (`batch_eviction_active`). Skipping it here is exact — no
+                                // victim can be selected without a limit, so a wired spill
+                                // sender has nothing to route — and drops a `RuntimeConfig`
+                                // read-lock pair per write on a default server.
+                                if crate::storage::eviction::write_gate_active() {
+                                    let rt = ctx.runtime_config.read();
+                                    // Disk-offload: when a per-shard spill sender is wired
+                                    // (ConnCtx populated by spawn_tokio_connection), evicted
+                                    // KVs are spilled to the cold tier on the background spill
+                                    // thread instead of being deleted — mirrors handler_monoio.
+                                    // Without the sender (disk-offload disabled) fall back to
+                                    // delete-only eviction. Both evictors run under this shard's
+                                    // db write lock, so they cannot race the persistence-tick
+                                    // cascade on the same key.
+                                    let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
+                                    let evict_result = if let Some(ref sender) = ctx.spill_sender {
+                                        let mut fid = ctx.spill_file_id.get();
+                                        let dir = ctx
+                                            .disk_offload_dir
+                                            .as_deref()
+                                            .unwrap_or(std::path::Path::new("."));
+                                        let res = evict_to_budget(
+                                            db,
+                                            &rt,
+                                            EvictionRun::async_spill(
+                                                sender,
+                                                dir,
+                                                &mut fid,
+                                                conn.selected_db,
+                                                None,
+                                            )
+                                            .budget(budget),
+                                        );
+                                        ctx.spill_file_id.set(fid);
+                                        res
+                                    } else {
+                                        evict_to_budget(db, &rt, EvictionRun::plain().budget(budget))
+                                    };
+                                    // WS6 fix (HIGH, adversarial review 2026-07-08): a
+                                    // command that can only shrink memory (HDEL, SREM,
+                                    // LPOP, ...) must never be REJECTED by either gate
+                                    // below, or a key/db that crosses its noeviction
+                                    // boundary has no self-recovery path. Eviction is
+                                    // still attempted above; only the reject is
+                                    // bypassed. See `db_quota::is_shrink_only_command`.
+                                    let shrink_only =
+                                        crate::storage::db_quota::is_shrink_only_command(cmd);
+                                    if !shrink_only {
+                                        if let Err(oom_frame) = evict_result {
+                                            drop(rt);
+                                            return Err(oom_frame);
+                                        }
+                                    }
+                                    // WS5b: per-db quota, additive and finer-grained
+                                    // than the whole-instance maxmemory gate above.
+                                    // Zero-cost when unconfigured for this db.
+                                    // `_for_command` exempts SELECT/SWAPDB (this
+                                    // chokepoint runs on `metadata::is_write`-flagged
+                                    // commands, which includes SELECT despite it not
+                                    // writing to the current db — see
+                                    // `db_quota::command_exempt_from_db_quota`).
+                                    let db_quota_result =
+                                        crate::storage::db_quota::check_db_maxmemory_for_command(
+                                            db,
                                             conn.selected_db,
-                                            None,
-                                        )
-                                        .budget(budget),
-                                    );
-                                    ctx.spill_file_id.set(fid);
-                                    res
-                                } else {
-                                    evict_to_budget(db, &rt, EvictionRun::plain().budget(budget))
-                                };
-                                // WS6 fix (HIGH, adversarial review 2026-07-08): a
-                                // command that can only shrink memory (HDEL, SREM,
-                                // LPOP, ...) must never be REJECTED by either gate
-                                // below, or a key/db that crosses its noeviction
-                                // boundary has no self-recovery path. Eviction is
-                                // still attempted above; only the reject is
-                                // bypassed. See `db_quota::is_shrink_only_command`.
-                                let shrink_only =
-                                    crate::storage::db_quota::is_shrink_only_command(cmd);
-                                if !shrink_only {
-                                    if let Err(oom_frame) = evict_result {
-                                        drop(rt);
-                                        return Err(oom_frame);
+                                            &rt,
+                                            cmd,
+                                        );
+                                    if !shrink_only {
+                                        if let Err(oom_frame) = db_quota_result {
+                                            drop(rt);
+                                            return Err(oom_frame);
+                                        }
                                     }
+                                    drop(rt);
                                 }
-                                // WS5b: per-db quota, additive and finer-grained
-                                // than the whole-instance maxmemory gate above.
-                                // Zero-cost when unconfigured for this db.
-                                // `_for_command` exempts SELECT/SWAPDB (this
-                                // chokepoint runs on `metadata::is_write`-flagged
-                                // commands, which includes SELECT despite it not
-                                // writing to the current db — see
-                                // `db_quota::command_exempt_from_db_quota`).
-                                let db_quota_result =
-                                    crate::storage::db_quota::check_db_maxmemory_for_command(
-                                        db,
-                                        conn.selected_db,
-                                        &rt,
-                                        cmd,
-                                    );
-                                if !shrink_only {
-                                    if let Err(oom_frame) = db_quota_result {
-                                        drop(rt);
-                                        return Err(oom_frame);
-                                    }
-                                }
-                                drop(rt);
 
                                 // KV undo-log capture for active cross-store transactions.
                                 // MUST happen BEFORE dispatch() overwrites the database entry.
