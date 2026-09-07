@@ -453,6 +453,111 @@ fn test_inline_set_executes_when_writes_enabled() {
     });
 }
 
+/// moon#838: when the AOF writer channel is full, a plain SET must NOT be
+/// applied by this path. Before the fix it was applied, the path then
+/// blocked the shard thread for `AOF_SPSC_BACKPRESSURE_BOUND` (5 ms) and
+/// answered `-MOONERR AOF backpressure` for a write that stood in memory —
+/// the shipped default's routine failure under pipelined load since
+/// moon#812. The contract now: probe the writer BEFORE consuming the bytes,
+/// and stand down to generic dispatch — which awaits the channel under the
+/// 2 s `--aof-fsync-timeout-ms` bound — with `read_buf` intact and the key
+/// untouched. The moment the writer drains a slot the same bytes inline again.
+///
+/// RED before the fix: `result == 1`, `read_buf` empty, `write_buf` holds the
+/// backpressure error, and `foo` exists.
+#[test]
+fn test_inline_set_stands_down_when_aof_writer_is_full() {
+    let _serial = inline_test_lock();
+    let dbs = make_dbs();
+    let cmd = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+    let mut read_buf = BytesMut::from(&cmd[..]);
+    let mut write_buf = BytesMut::new();
+    let rt_config = make_rt_config();
+
+    // A one-slot writer channel, already full: the writer is "stalled".
+    let (tx, rx) = channel::mpsc_bounded::<AofMessage>(1);
+    let pool = crate::persistence::aof::AofWriterPool::top_level(tx);
+    assert!(pool.try_send_append(0, 1, 0, Bytes::from_static(b"fill")));
+    let aof_pool = Some(pool);
+
+    let started = std::time::Instant::now();
+    let result = try_inline_dispatch(
+        &mut read_buf,
+        &mut write_buf,
+        &dbs,
+        0,
+        0,
+        &aof_pool,
+        &None,
+        0,
+        1,
+        true,  // can_inline_reads
+        true,  // can_inline_writes
+        false, // resp3
+        &rt_config,
+        false, // spill_sender_active
+    );
+    let took = started.elapsed();
+    assert_eq!(
+        result,
+        0,
+        "a SET the writer cannot take must be handed to generic dispatch, not \
+         applied-then-refused (write_buf={:?})",
+        String::from_utf8_lossy(&write_buf)
+    );
+    assert_eq!(
+        &read_buf[..],
+        &cmd[..],
+        "read_buf must be byte-for-byte intact"
+    );
+    assert!(
+        write_buf.is_empty(),
+        "nothing may be answered by a path that stood down"
+    );
+    assert!(
+        took < std::time::Duration::from_millis(4),
+        "standing down must not pay the 5 ms bounded block (took {took:?})"
+    );
+    crate::shard::slice::with_shard_db(0, |db| {
+        assert!(
+            db.get_if_alive(b"foo", 0).is_none(),
+            "a write that was not queued for persistence must not be applied"
+        );
+    });
+
+    // Writer drains a slot: the very same bytes inline on the next pass and
+    // the record reaches the channel.
+    assert!(matches!(rx.recv(), Ok(AofMessage::Append { lsn: 1, .. })));
+    let result = try_inline_dispatch(
+        &mut read_buf,
+        &mut write_buf,
+        &dbs,
+        0,
+        0,
+        &aof_pool,
+        &None,
+        0,
+        1,
+        true,
+        true,
+        false,
+        &rt_config,
+        false,
+    );
+    assert_eq!(result, 1, "with room in the channel the SET inlines");
+    assert!(read_buf.is_empty());
+    assert_eq!(&write_buf[..], b"+OK\r\n");
+    assert!(
+        matches!(rx.try_recv(), Ok(AofMessage::Append { db: 0, ref bytes, .. }) if bytes.as_ref() == &cmd[..]),
+        "the applied SET's record must be in the writer channel"
+    );
+    crate::shard::slice::with_shard_db(0, |db| {
+        #[allow(clippy::expect_used)]
+        let entry = db.get_if_alive(b"foo", 0).expect("key set once queued");
+        assert_eq!(entry.value.as_bytes(), Some(&b"bar"[..]));
+    });
+}
+
 /// moon#558: the monoio inline fast path answers a plain `SET k v` entirely
 /// by itself — it never reaches `command::dispatch`, never reaches
 /// `spsc_handler::cow_intercept`, and has no `SnapshotState` in scope. While

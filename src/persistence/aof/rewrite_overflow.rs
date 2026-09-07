@@ -146,6 +146,16 @@ impl RewriteOverflow {
         self.buf.lock().len()
     }
 
+    /// `true` between `arm` and the fold's `finish_*`/disarm — i.e. while a
+    /// producer that finds the writer channel full can `try_spill` here
+    /// instead of blocking or dropping (moon#838: the inline SET fast path's
+    /// `append_would_block` probe). Distinct from [`Self::spill_first`],
+    /// which additionally requires the buffer to be non-empty.
+    #[inline]
+    pub(crate) fn is_armed(&self) -> bool {
+        self.armed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Producer fast-path gate: true when the producer must spill directly
     /// (skip `try_send`) to preserve order — see ordering rule 1.
     #[inline]
