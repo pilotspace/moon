@@ -1553,9 +1553,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // answered 18 (a key written just now, reported as long-cold). Under
             // `allkeys-lru` that degrades victim selection exactly when
             // eviction matters. Two Relaxed atomic loads per batch.
-            crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                db.refresh_now_from_cache(&ctx.cached_clock);
-            });
+            crate::shard::slice::refresh_db_clock(conn.selected_db, &ctx.cached_clock);
             let inlined = try_inline_dispatch_loop(
                 &mut read_buf,
                 &mut write_buf,
@@ -1666,9 +1664,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         > = std::collections::HashMap::new();
 
         // Refresh time once per batch — sub-millisecond accuracy not needed per-command.
-        crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-            db.refresh_now_from_cache(&ctx.cached_clock);
-        });
+        crate::shard::slice::refresh_db_clock(conn.selected_db, &ctx.cached_clock);
 
         // Batch-level eviction gate: snapshot `maxmemory != 0` once per batch
         // (and cache the spill-sender presence check). When neither is set —
