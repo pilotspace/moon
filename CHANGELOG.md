@@ -147,6 +147,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes lost across kill -9; every write-script arm answers the injected
   fsync failure. Pinned by `tests/script_write_fsync_barrier_831.rs`.
 
+- **`replication`/`persistence`: a non-deterministic write now propagates its
+  EFFECT, not itself (#825).** `SPOP` and `XADD key *` were written to the AOF
+  and streamed to replicas verbatim; replay re-rolled the RNG and re-read the
+  clock, so the member the client was told it removed came back after a
+  restart (and a different one vanished), and a stored stream ID could never
+  find its entry — with no error anywhere. Enumerated from the state writers
+  rather than the two reported names, the same class covered `EXPIRE`/`PEXPIRE`
+  with a `NX|XX|GT|LT` flag (the frame-only expire rewrite bails on the fourth
+  argument), `HEXPIRE`/`HPEXPIRE`/`HGETEX EX|PX` (relative hash-field
+  deadlines, never rewritten) and `RESTORE` with a relative TTL. Orthogonally,
+  the owner-shard SPSC arm, both `MULTI`/`EXEC` executors, the Lua effect
+  plane and the embedded single-shard handler serialized the raw frame and
+  bypassed the existing expire rewrite entirely, so *every* relative-TTL
+  command was propagated with a restarting countdown on the cross-shard,
+  transactional and scripted paths. A new reply-aware rewrite
+  (`replication::effect_rewrite`, `(frame, reply, now_ms)`) evaluated on the
+  executing shard turns each into its deterministic form — `SREM key
+  <popped>`, `XADD key <assigned-id>`, `PEXPIREAT`/`DEL`, `HPEXPIREAT … FIELDS
+  <touched>`, `RESTORE … ABSTTL` — or into nothing when the reply proves
+  nothing was written; every propagation site now routes through
+  `aof::serialize_effect_for_log`, which chains it with the expire rewrite.
+  Covered by `tests/nondeterministic_propagation_825.rs` (restart, `DEBUG
+  DIGEST` as the aggregate oracle, single- and four-shard). Not touched, by
+  design: `INCRBYFLOAT`/`HINCRBYFLOAT` (moon's `f64` replay is deterministic —
+  measured stable across a restart) and the `XCLAIM`/`XAUTOCLAIM`/`XREADGROUP`
+  PEL delivery-time family (needs `XCLAIM … TIME/FORCE/JUSTID` support first;
+  filed separately).
 - **`persistence`: a restart no longer flattens every compact encoding.** RDB
   decode rebuilt each container in its *full* form, so a listpack hash, a
   listpack list, an intset and a set listpack all came back as

@@ -1186,7 +1186,7 @@ pub async fn handle_connection(
                                 let mut guard = db[conn.selected_db].write();
                                 guard.refresh_now();
                                 let db_count = db.len();
-                                for (resp_idx, disp_frame, is_write, aof_bytes) in dispatchable.drain(..) {
+                                for (resp_idx, disp_frame, is_write, _aof_bytes) in dispatchable.drain(..) {
                                     #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
                                     let (d_cmd, d_args) = extract_command(&disp_frame).unwrap();
                                     if is_write {
@@ -1248,8 +1248,16 @@ pub async fn handle_connection(
                                         DispatchResult::Response(f) => (f, false),
                                         DispatchResult::Quit(f) => (f, true),
                                     };
-                                    if let Some(bytes) = aof_bytes {
-                                        if !matches!(&response, Frame::Error(_)) {
+                                    // moon#825: reply-derived record (`_aof_bytes` is
+                                    // pre-filled only for the two-db intercepts, which
+                                    // never reach this loop); `None` when the reply
+                                    // proves nothing was written.
+                                    if is_write
+                                        && aof_pool.is_some()
+                                        && metadata::is_persisted_write(d_cmd)
+                                        && !matches!(&response, Frame::Error(_))
+                                    {
+                                        if let Some(bytes) = crate::persistence::aof::serialize_effect_for_log(&disp_frame, &response) {
                                             // Carry resp_idx so the Always-policy flush can
                                             // patch responses[resp_idx] on fsync failure.
                                             aof_entries.push((resp_idx, conn.selected_db, bytes));
@@ -2241,10 +2249,16 @@ pub async fn handle_connection(
                             // Serialize for AOF before dispatch.
                             // `is_persisted_write`: never AOF a literal client
                             // SELECT (task #35 — poisons the stream db context).
-                            let aof_bytes = if metadata::is_persisted_write(cmd) && aof_pool.is_some() {
-                                let mut buf = BytesMut::new();
-                                crate::protocol::serialize::serialize(&frame, &mut buf);
-                                Some(buf.freeze())
+                            // moon#825: pre-serialized ONLY for the two-db
+                            // intercepts (MOVE / COPY … DB, `:1`-gated and
+                            // deterministic). Every other write derives its
+                            // record from the REPLY after dispatch — see the
+                            // `serialize_effect_for_log` sites in phase 2.
+                            let aof_bytes = if metadata::is_persisted_write(cmd)
+                                && aof_pool.is_some()
+                                && (cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY"))
+                            {
+                                Some(crate::persistence::aof::serialize_command_for_log(&frame))
                             } else {
                                 None
                             };
@@ -3037,8 +3051,12 @@ pub async fn handle_connection(
                                             &tracking_table,
                                         );
                                     }
-                                    if let Some(bytes) = aof_bytes {
-                                        aof_entries.push((resp_idx, conn.selected_db, bytes.clone()));
+                                    // moon#825: reply-derived record; `None` when the
+                                    // reply proves nothing was written.
+                                    if metadata::is_persisted_write(d_cmd) && aof_pool.is_some() {
+                                        if let Some(bytes) = crate::persistence::aof::serialize_effect_for_log(disp_frame, &response) {
+                                            aof_entries.push((resp_idx, conn.selected_db, bytes));
+                                        }
                                     }
                                 }
                                 // Apply RESP3 response conversion if needed

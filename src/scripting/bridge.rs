@@ -263,7 +263,11 @@ impl LuaEvictionCtx {
     /// `shard::self_msg` relay it rides on do not exist under tokio — no
     /// ordinary tokio write replicates either, so this is parity, not a
     /// remaining script-specific gap).
-    fn emit_effect(&self, db_index: usize, cmd_and_args: &[Frame]) {
+    ///
+    /// moon#825: `reply` is what the inner command answered — the record is
+    /// derived from frame AND reply, so `redis.call('SPOP', k)` propagates as
+    /// `SREM k <member>` and `redis.call('XADD', k, '*', …)` with its ID.
+    fn emit_effect(&self, db_index: usize, cmd_and_args: &[Frame], reply: &Frame) {
         let Some(inner) = self.0.as_ref() else {
             return;
         };
@@ -274,6 +278,7 @@ impl LuaEvictionCtx {
             inner.aof_pool.as_ref(),
             db_index,
             cmd_and_args,
+            reply,
         );
     }
 }
@@ -603,7 +608,7 @@ pub fn make_redis_call_fn(
             // gate above already passed, so a write here only happens in a
             // normal read-write script).
             if cmd_is_write && !matches!(frame, Frame::Error(_)) {
-                eviction_ctx.emit_effect(db_idx, &frames);
+                eviction_ctx.emit_effect(db_idx, &frames, &frame);
             }
 
             Ok(frame)
@@ -1012,7 +1017,7 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"lua517")),
             Frame::BulkString(Bytes::from_static(b"v")),
         ];
-        ctx.emit_effect(0, &effect);
+        ctx.emit_effect(0, &effect, &Frame::SimpleString(Bytes::from_static(b"OK")));
 
         let mut saw_effect = false;
         while let Ok(crate::persistence::aof::AofMessage::Append { bytes, .. }) = rx.try_recv() {

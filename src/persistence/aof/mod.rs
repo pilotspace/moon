@@ -685,10 +685,41 @@ pub fn serialize_command(frame: &Frame) -> Bytes {
 /// already-absolute commands (`PEXPIREAT`, `EXPIREAT`, `EXAT`, `PXAT`,
 /// `PERSIST`, past-time deletes) serialize verbatim.
 pub fn serialize_command_for_log(frame: &Frame) -> Bytes {
-    let now_ms = crate::storage::entry::current_time_ms();
+    serialize_command_for_log_at(frame, crate::storage::entry::current_time_ms())
+}
+
+fn serialize_command_for_log_at(frame: &Frame, now_ms: u64) -> Bytes {
     match crate::replication::expire_rewrite::rewrite_expire_for_propagation(frame, now_ms) {
         Some(rewritten) => serialize_command(&rewritten),
         None => serialize_command(frame),
+    }
+}
+
+/// Serialize a write for the durable log **and** the replication stream from
+/// the command AND the reply it answered (moon#825).
+///
+/// This is the one entry point every propagation site that has the reply in
+/// scope must use. A command whose effect is not a function of its bytes —
+/// `SPOP` (RNG), `XADD key *` (clock), `EXPIRE … NX` (clock-conditioned),
+/// `HEXPIRE`/`HGETEX EX` (relative field deadlines), `RESTORE` with a
+/// relative TTL — is rewritten to the effect the master actually applied
+/// (`replication::effect_rewrite`), then the frame-only expire rewrite runs
+/// on whatever propagates verbatim. Returns `None` when the reply proves
+/// nothing was written (an error, a `Null` `SPOP`, a refused `EXPIRE … NX`):
+/// a no-op must reach neither plane, and an empty payload is the writer's
+/// fsync-barrier marker, so the caller MUST skip the append rather than
+/// append an empty record.
+///
+/// Must run on the shard that executed the command, in the same tick: the
+/// absolute deadlines are recomputed from `current_time_ms()`, which
+/// `CachedClock::update` writes from the same read as `Database::now_ms`.
+pub fn serialize_effect_for_log(frame: &Frame, reply: &Frame) -> Option<Bytes> {
+    use crate::replication::effect_rewrite::{Propagation, rewrite_effect_for_propagation};
+    let now_ms = crate::storage::entry::current_time_ms();
+    match rewrite_effect_for_propagation(frame, reply, now_ms) {
+        Propagation::Skip => None,
+        Propagation::Rewritten(effect) => Some(serialize_command(&effect)),
+        Propagation::Verbatim => Some(serialize_command_for_log_at(frame, now_ms)),
     }
 }
 
