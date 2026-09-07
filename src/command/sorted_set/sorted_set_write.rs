@@ -3,7 +3,11 @@ use std::collections::HashMap;
 
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::storage::db::{zset_member_cost, zset_table_bytes};
+use crate::storage::db::{
+    LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, zset_member_cost, zset_table_bytes,
+};
+use crate::storage::listpack::Listpack;
+use crate::storage::zset_score::{ScoreBuf, render_score};
 
 use crate::command::helpers::{all_args_are_bytes, err, err_wrong_args, extract_bytes};
 
@@ -43,6 +47,28 @@ fn parse_zadd_pair<'a>(
         return Err(err("ERR value is not a valid float"));
     }
     Ok((score, member))
+}
+
+/// Locate `member` in a zset listpack: the PAIR index and the member's
+/// current score.
+///
+/// A zset listpack is `[member, score, member, score, …]`, so pair index `i`
+/// puts the member at raw entry `2*i` and its score at `2*i + 1` — which is
+/// what `replace_at` needs. Borrowed scan over `iter_pair_refs`: nothing is
+/// materialised for the entries walked past. The owning `iter_pairs()` +
+/// `as_bytes()` shape allocated twice per pair walked — the exact lookup
+/// moon#801 removed from HSET — and must not come back here. Bounded by
+/// `LISTPACK_MAX_ENTRIES`, so this stays O(128) worst case.
+///
+/// An unparseable stored score is in-memory corruption (every writer goes
+/// through `render_score`); it is read as 0.0 so the member is still FOUND
+/// and updated in place rather than duplicated.
+#[inline]
+fn listpack_zset_find(lp: &Listpack, member: &[u8]) -> Option<(usize, f64)> {
+    lp.iter_pair_refs().enumerate().find_map(|(idx, (m, s))| {
+        m.eq_bytes(member)
+            .then(|| (idx, s.as_score().unwrap_or(0.0)))
+    })
 }
 
 /// ZADD key [NX|XX] [GT|LT] [CH] score member [score member ...]
@@ -130,6 +156,116 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
         };
         if let Err(e) = parse_zadd_pair(score_arg, member_arg) {
             return e;
+        }
+    }
+
+    // Listpack path for small sorted sets (moon#787). Redis keeps a zset in a
+    // listpack until it exceeds zset-max-listpack-entries (128) or
+    // zset-max-listpack-value (64); moon reported `skiplist` from the first
+    // member because no accessor ever produced a surviving
+    // `SortedSetListpack`. Only the MEMBER is measured against the value
+    // threshold, as in Redis (a score is stored as its rendering, and an
+    // extreme one like 1e300 renders long, but that is not what the threshold
+    // governs). Verified against a redis 8.6.1 oracle: a 64-byte member is
+    // `listpack`, a 65-byte member is `skiplist`.
+    //
+    // This branch sits BELOW the moon#814 pre-pass and ABOVE
+    // `get_or_create_sorted_set`, for the same reason the pre-pass does:
+    // every pair is already proven parseable, so nothing in the loop can
+    // return from inside the `before … adjust_memory` window with members
+    // pushed and never charged, and an erroring ZADD never creates the key.
+    // The first version of this branch was inserted ABOVE the pre-pass and
+    // re-introduced moon#814 on the listpack path; `ledger_consistency_788`
+    // now pins both the ledger and the all-or-nothing reply for it.
+    let has_large_member = remaining
+        .chunks_exact(2)
+        .any(|pair| extract_bytes(&pair[1]).is_some_and(|m| m.len() > LISTPACK_MAX_ELEMENT_SIZE));
+    if !has_large_member {
+        match db.get_or_create_zset_listpack(key) {
+            Ok(Some(lp)) => {
+                let mut added = 0i64;
+                let mut changed = 0i64;
+                // Listpack `estimate_memory()` is O(1) (capacity-based), so a
+                // before/after snapshot is cheap — no per-member formula.
+                let before = lp.estimate_memory();
+                // One stack buffer for every rendered score in this call.
+                let mut rendered = ScoreBuf::new();
+                for pair in remaining.chunks_exact(2) {
+                    let [score_arg, member_arg] = pair else {
+                        return err_wrong_args("ZADD");
+                    };
+                    // Cannot fail: the pre-pass above validated every pair
+                    // with this exact function before the keyspace was
+                    // touched. Kept as a real match anyway, as the B+tree
+                    // loop below does.
+                    let (score, member) = match parse_zadd_pair(score_arg, member_arg) {
+                        Ok(parsed) => parsed,
+                        Err(e) => return e,
+                    };
+
+                    let found = listpack_zset_find(lp, member);
+                    let should_update = match found {
+                        None => !xx, // New member: add unless XX
+                        Some((_, old)) => {
+                            if nx {
+                                false // NX: never update existing
+                            } else if gt && lt {
+                                false // GT+LT together: never update
+                            } else if gt {
+                                score > old
+                            } else if lt {
+                                score < old
+                            } else {
+                                true // No flags: always update
+                            }
+                        }
+                    };
+
+                    if should_update {
+                        // Store the canonical rendering, not the raw argument:
+                        // `ZADD z 3.0 m` must answer `ZSCORE` with `3`, and
+                        // `render_score` is round-trip exact, so `as_score`
+                        // recovers the identical f64.
+                        render_score(score, &mut rendered);
+                        match found {
+                            Some((idx, old)) => {
+                                lp.replace_at(idx * 2 + 1, &rendered);
+                                if (old - score).abs() > f64::EPSILON {
+                                    changed += 1;
+                                }
+                            }
+                            None => {
+                                lp.push_back(member);
+                                lp.push_back(&rendered);
+                                added += 1;
+                                changed += 1;
+                            }
+                        }
+                    }
+                }
+                let after = lp.estimate_memory();
+                // `lp.len()` counts member AND score entries, so the member
+                // count is half of it.
+                let should_upgrade = lp.len() / 2 > LISTPACK_MAX_ENTRIES;
+                // `lp`'s borrow of `db` ends here — safe to call back into
+                // `db` for accounting from this point on.
+                db.adjust_memory(before, after);
+                if should_upgrade {
+                    // One-time cost-model swing (listpack -> B+tree + members
+                    // map). The accessor bills it itself through
+                    // `SortedSetKind::upgrade`, so the arena and the table are
+                    // charged from their real capacity (moon#788/#810).
+                    db.upgrade_zset_listpack_to_bptree(key);
+                }
+                return if ch {
+                    Frame::Integer(changed)
+                } else {
+                    Frame::Integer(added)
+                };
+            }
+            // Already a full BPTree (or the legacy form): fall through.
+            Ok(None) => {}
+            Err(e) => return e, // WRONGTYPE
         }
     }
 

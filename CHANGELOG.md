@@ -672,6 +672,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is gated on the reader's own transaction and non-transactional operations
   bypass the intent table by design — and that contract is unchanged here.
   `tests/inline_read_txn_visibility_807.rs` (monoio; red on `b04e8990`).
+- **`storage`: `ZADD` reaches its listpack encoding -- small sorted sets stop
+  being skiplists (moon#787).** `ZADD` reported `skiplist` from its first
+  member where Redis keeps a zset in a listpack up to
+  `zset-max-listpack-entries` (128) / `zset-max-listpack-value` (64).
+  `SortedSetListpack` was wired end to end -- the value codec, the RDB and AOF
+  writers, `DEBUG DIGEST`, `MEMORY USAGE`, and the read-only
+  `SortedSetRef::Listpack` arm all handled it -- but no accessor ever produced
+  one, so the variant was unreachable at runtime and every zset paid the full
+  B+tree-plus-HashMap cost. `ZADD` now routes through
+  `get_or_create_zset_listpack` below both thresholds and promotes past either;
+  `SortedSetKind::upgrade` gained the listpack arm that keeps every other zset
+  command correct on a key `ZADD` created compact; and the restart-side
+  re-derivation (`compact_after_decode`) gained its zset arm in the same
+  change, flipping the tripwire the restart fix pinned -- so a listpack zset
+  now **survives a restart** instead of reloading as a skiplist. The unit test
+  `test_object_encoding_sorted_set` asserted the divergence and is corrected.
+
+  The listpack branch sits **below** the moon#814/#820 validation pre-pass, so
+  an erroring `ZADD` still creates no key, writes no prefix and strands no
+  charge; its first draft sat above it and re-created that regression on the
+  new path, and `ledger_consistency_788` now pins both halves for the listpack
+  form. Scores are stored as the canonical text `ZSCORE` replies with
+  (`storage::zset_score::render_score`, byte-identical to
+  `format_score_bytes` and round-trip exact, both pinned by tests) into a stack
+  buffer; the member lookup is a borrowed scan (`iter_pair_refs`), so the path
+  allocates nothing per entry walked. The listpack -> B+tree swing is billed by
+  `SortedSetKind::upgrade` from the arena's real capacity (moon#788/#810).
+
+  **Scope -- what this does and does not buy (moon#832).** `ZADD` is the only
+  zset command that mutates a listpack in place. Everything on the *mutable*
+  dispatch path -- `ZREM`, `ZINCRBY`, `ZPOPMIN`/`ZPOPMAX`, the store commands,
+  every zset command inside `MULTI`/`EXEC` or a Lua script, and the reads that
+  are not in `dispatch_read` at all (`ZRANGEBYLEX`, `ZREVRANGEBYLEX`,
+  `ZRANDMEMBER`, `ZINTERCARD`) -- reaches the value through `get_promoted`,
+  which upgrades unconditionally, and nothing ever downgrades. A zset is
+  therefore flattened to a skiplist on its first such touch. The saving is a
+  **write-only-workload** figure. Measured on Linux (moon-bench-x86, x86_64,
+  load < 1.0, `--shards 1`, fresh server per row, 200 000 keys x `ZADD z:i 1
+  alpha 2.5 beta 3 gamma`, RSS delta / key, two reps): **4165 -> 295 B/key**
+  (-93%); Redis 7.4.2 measures 108 B/key on the same probe, the remaining gap
+  being moon's per-key envelope, not the encoding.
+  `ZADD z XX 1 a` on a missing key still leaves an empty zset behind -- the
+  moon#830 `get_or_create_*` class, now with one more site. A replica also
+  loses the encoding across a FULLRESYNC (`redis_rdb::load_rdb` rebuilds
+  `RDB_TYPE_ZSET_2` as a `SortedSetBPTree`) -- pre-existing and class-wide,
+  tracked as moon#863.
+
+  `tests/container_growth_memory_accounting.rs`'s
+  `test_sorted_set_arena_is_visible_to_used_memory` (moon#788) had its premise
+  removed here: it billed 500 ONE-member zsets and required >= 2048 B/key to
+  prove the B+tree node arena reaches `used_memory`, and a one-member zset is
+  now a listpack that owns no arena at all (measured 386 B/key -- a correct
+  figure for the new encoding, and a red test). The invariant is not dropped:
+  the fixture is moved past the listpack boundary with a single 65-byte member
+  (one over `zset-max-listpack-value`), which is still a ONE-member zset, so
+  the fixed arena cost still dominates the per-key figure and the 2048 B floor
+  still discriminates. The test now asserts `OBJECT ENCODING` is `skiplist`
+  before it measures, so a future boundary change fails loudly instead of
+  measuring the wrong container. Proved it can still fail: dropping
+  `tree.memory_bytes()` from `zset_table_bytes` takes it to 778 B/key, red.
 
 - **`persistence`: a restart no longer flattens every compact encoding.** RDB
   decode rebuilt each container in its *full* form, so a listpack hash, a
@@ -701,8 +761,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sidecar. Widening `classify_cold` so the cold tier compacts too is a named
   follow-up.
 
-  **Zsets are deliberately not compacted on reload**, and a unit test pins the
-  exclusion so lifting it is a decision: `SortedSetKind::project_mut` /
+  **Zsets were deliberately not compacted on reload** by this fix (the
+  exclusion is lifted by the `ZADD`-listpack entry above), and a unit test
+  pinned the exclusion so lifting it was a decision: `SortedSetKind::project_mut` /
   `project_ref` accept only `SortedSetBPTree` and `SortedSetKind::upgrade`
   leaves `SortedSetListpack` alone, so a zset compacted here would answer
   WRONGTYPE to every zset command on the mutable dispatch path -- `ZADD`

@@ -174,6 +174,9 @@ fn compact_encodings_survive_a_restart() {
         c.send(&["RPUSH", "l", "a", "b", "c", "d", "e"]);
         c.send(&["SADD", "s", "alpha", "beta", "gamma"]);
         c.send(&["SADD", "si", "1", "2", "3"]);
+        // moon#787: ZADD now builds a listpack too, and the restart must keep
+        // it -- this key is what lifted the zset exclusion from the fix.
+        c.send(&["ZADD", "z", "1", "a", "2.5", "b", "3", "c"]);
         // A hash big enough to stay a hashtable — the negative control. Without
         // it a bug that compacts EVERYTHING would pass this test.
         let mut big: Vec<String> = vec!["HSET".into(), "hbig".into()];
@@ -195,6 +198,7 @@ fn compact_encodings_survive_a_restart() {
         ("l", encoding(port, "l")),
         ("s", encoding(port, "s")),
         ("si", encoding(port, "si")),
+        ("z", encoding(port, "z")),
         ("hbig", encoding(port, "hbig")),
     ];
     assert_eq!(
@@ -215,7 +219,11 @@ fn compact_encodings_survive_a_restart() {
         "precondition: all-integer set is an intset"
     );
     assert_eq!(
-        before[4].1, "hashtable",
+        before[4].1, "listpack",
+        "precondition: small zset is a listpack"
+    );
+    assert_eq!(
+        before[5].1, "hashtable",
         "precondition: a 200-field hash is a hashtable"
     );
 
@@ -249,6 +257,7 @@ fn compact_encodings_survive_a_restart() {
         ("l", "listpack"),
         ("s", "listpack"),
         ("si", "intset"),
+        ("z", "listpack"),
         ("hbig", "hashtable"),
     ];
     let mut failures = Vec::new();
@@ -260,8 +269,21 @@ fn compact_encodings_survive_a_restart() {
             ));
         }
     }
+    // The VALUE behind the compact zset, checked LAST: `ZSCORE` may take the
+    // promoting mutable path (moon#832) and must not flatten `z` before its
+    // encoding was recorded above. `2.5` is the non-integral score, so a
+    // re-derivation that truncated or mis-parsed it would show here.
+    let score = {
+        let mut c = common::Conn::open(port2);
+        c.send(&["ZSCORE", "z", "b"])
+    };
     guard2.kill_now();
     let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        score.contains("2.5"),
+        "ZSCORE z b after restart must be 2.5, got {score:?}"
+    );
 
     assert!(
         failures.is_empty(),

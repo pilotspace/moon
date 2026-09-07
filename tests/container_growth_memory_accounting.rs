@@ -569,17 +569,32 @@ fn test_hdel_self_recovery_past_db_maxmemory_boundary() {
 // Case F (moon#788): the fixed cost of a container must be visible to
 // `used_memory` through the real dispatch path, not just to a unit test.
 //
-// A sorted set is a `SortedSetBPTree`, and its node arena is a `Vec<Node>`
-// where `Node` is an enum sized by `InternalNode` (784 B) and `Vec`'s minimum
-// capacity for an element that size is 4 — so an EMPTY B+tree already owns a
-// 3136-byte allocation. The estimator charged `tree.len() * 80`, per entry,
-// which made that whole fixed cost invisible: a one-member zset billed 134 B.
-// Measured on Linux at 50k keys the ledger was 15.1x below real RSS, i.e. an
-// operator's `--maxmemory` gate could not fire before the OOM killer did.
+// A sorted set in the `SortedSetBPTree` encoding owns a node arena that is a
+// `Vec<Node>`, where `Node` is an enum sized by `InternalNode` (784 B) and
+// `Vec`'s minimum capacity for an element that size is 4 — so an EMPTY B+tree
+// already owns a 3136-byte allocation. The estimator charged
+// `tree.len() * 80`, per entry, which made that whole fixed cost invisible: a
+// one-member zset billed 134 B. Measured on Linux at 50k keys the ledger was
+// 15.1x below real RSS, i.e. an operator's `--maxmemory` gate could not fire
+// before the OOM killer did.
 //
 // The floor below is deliberately far under the real arena (3136 B): it must
 // hold on every 64-bit target without tracking the exact node layout, while
 // still being an order of magnitude above the pre-fix 134 B.
+//
+// **Reaching the arena at all (moon#787).** Since ZADD gained its listpack
+// encoding, a small zset is a `SortedSetListpack` and owns NO node arena —
+// there is no fixed cost to bill, and this test's original fixture
+// (`ZADD z 1 m:00000000`) now measures the listpack, not the B+tree. The
+// invariant under test is unchanged and still worth guarding: whenever the
+// B+tree form IS in play, its fixed container cost must reach `used_memory`.
+// So the fixture is built past the listpack boundary instead of being
+// deleted — `zset-max-listpack-value` is 64, so a single member of 65 bytes
+// puts the key in the B+tree form while keeping it a ONE-member zset, which
+// is what makes the fixed arena cost dominate the per-key figure and keeps
+// the 2048 B floor discriminating. The test asserts the encoding it depends
+// on before it measures anything, so a future change that moved the boundary
+// would fail here loudly instead of quietly measuring the wrong container.
 // ---------------------------------------------------------------------------
 
 /// Poll `INFO memory` until `want` accepts the value, or panic after 30s
@@ -643,6 +658,20 @@ fn used_memory(c: &mut Client) -> u64 {
     }
 }
 
+/// `zset-max-listpack-value`: a member longer than this puts the key in the
+/// `SortedSetBPTree` form, which is the encoding whose fixed arena cost this
+/// case is about. Mirrors `storage::db::LISTPACK_MAX_ELEMENT_SIZE`, which is
+/// not public to an integration test.
+const ZSET_MAX_LISTPACK_VALUE: usize = 64;
+
+/// Read `OBJECT ENCODING <key>`.
+fn object_encoding(c: &mut Client, key: &[u8]) -> String {
+    match c.cmd(&[b"OBJECT", b"ENCODING", key]) {
+        V::Bulk(b) => String::from_utf8_lossy(&b).into_owned(),
+        other => panic!("OBJECT ENCODING did not reply a bulk string: {other:?}"),
+    }
+}
+
 #[test]
 fn test_sorted_set_arena_is_visible_to_used_memory() {
     const KEYS: u64 = 500;
@@ -656,13 +685,32 @@ fn test_sorted_set_arena_is_visible_to_used_memory() {
     let (_guard, port) = spawn_moon_maxmemory(dir.path(), 512 * 1024 * 1024);
     let mut c = wait_ready(port);
 
+    // One member per key, but one byte past `zset-max-listpack-value`, so the
+    // key takes the B+tree form. Keeping it to a SINGLE member is the point:
+    // the arena is a FIXED cost, so with one member it dominates the per-key
+    // figure and the floor below stays discriminating. Pack the per-key
+    // suffix in front of a constant filler so members stay distinct.
+    let member_len = ZSET_MAX_LISTPACK_VALUE + 1;
+    let filler = "x".repeat(member_len - "m:00000000".len());
+
     let before = used_memory(&mut c);
     for i in 0..KEYS {
         let key = format!("z:{i:08}");
-        let member = format!("m:{i:08}");
+        let member = format!("m:{i:08}{filler}");
+        assert_eq!(member.len(), member_len);
         let r = c.cmd(&[b"ZADD", key.as_bytes(), b"1", member.as_bytes()]);
         assert_eq!(r, V::Integer(1), "ZADD {key} must add one member");
     }
+    // The fixture must actually BE a B+tree, or this case measures the fixed
+    // cost of a container that was never allocated and passes for the wrong
+    // reason (moon#787 made small zsets listpacks, which own no node arena).
+    let enc = object_encoding(&mut c, b"z:00000000");
+    assert_eq!(
+        enc, "skiplist",
+        "fixture must be in the B+tree encoding or this test proves nothing: \
+         a {member_len}-byte member is past zset-max-listpack-value \
+         ({ZSET_MAX_LISTPACK_VALUE}) and must not be a listpack"
+    );
     // `INFO`'s used_memory sums a PUBLISHED per-shard atomic refreshed on the
     // periodic chore, not the live counter, so reading it immediately after
     // the last ZADD returns the pre-write figure. Poll rather than sleep a
@@ -678,9 +726,10 @@ fn test_sorted_set_arena_is_visible_to_used_memory() {
 
     assert!(
         per_key >= FLOOR_PER_KEY,
-        "a one-member sorted set was billed {per_key} B/key, but its B+tree \
-         node arena alone is over 3 KB — the fixed cost of the container is \
-         invisible to used_memory, so --maxmemory cannot bind (moon#788)"
+        "a one-member sorted set in the {enc} encoding was billed {per_key} \
+         B/key, but its B+tree node arena alone is over 3 KB — the fixed cost \
+         of the container is invisible to used_memory, so --maxmemory cannot \
+         bind (moon#788)"
     );
 
     // ...and removing the keys must give every byte back, or the ledger drifts

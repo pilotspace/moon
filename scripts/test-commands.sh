@@ -838,6 +838,23 @@ if should_run "sorted_set"; then
     assert_match "ZADD"                ZADD z:k1 1 a 2 b 3 c 4 d 5 e
     assert_match "ZADD update"         ZADD z:k1 10 a
     assert_match "ZCARD"               ZCARD z:k1
+    # OBJECT ENCODING parity (moon#787): a small zset is a listpack on both,
+    # and promotes past zset-max-listpack-entries (128) /
+    # zset-max-listpack-value (64). moon reported `skiplist` from the first
+    # member until ZADD gained a listpack path.
+    assert_match "ZADD encoding listpack"  OBJECT ENCODING z:k1
+    rcli ZADD z:enc:big $(seq 0 128 | awk '{print $1, "m"$1}') >/dev/null 2>&1
+    mcli ZADD z:enc:big $(seq 0 128 | awk '{print $1, "m"$1}') >/dev/null 2>&1
+    assert_match "ZADD encoding past 128"  OBJECT ENCODING z:enc:big
+    rcli ZADD z:enc:bigval 1 "$(printf 'x%.0s' $(seq 1 65))" >/dev/null 2>&1
+    mcli ZADD z:enc:bigval 1 "$(printf 'x%.0s' $(seq 1 65))" >/dev/null 2>&1
+    assert_match "ZADD encoding big member" OBJECT ENCODING z:enc:bigval
+    # Scores round-trip through the listpack as their canonical rendering.
+    rcli ZADD z:enc:sc 3.0 m 1e3 n 3.5000 o >/dev/null 2>&1
+    mcli ZADD z:enc:sc 3.0 m 1e3 n 3.5000 o >/dev/null 2>&1
+    assert_match "listpack ZSCORE 3.0"     ZSCORE z:enc:sc m
+    assert_match "listpack ZSCORE 1e3"     ZSCORE z:enc:sc n
+    assert_match "listpack ZSCORE 3.5000"  ZSCORE z:enc:sc o
     assert_match "ZSCORE"              ZSCORE z:k1 a
     assert_match "ZSCORE (missing)"    ZSCORE z:k1 missing
     assert_match "ZRANK"               ZRANK z:k1 b
