@@ -94,19 +94,10 @@ pub(super) fn record_local_write(
     shard_id: usize,
     bytes: Bytes,
 ) {
-    // Per-shard offset AFTER this record — the fan-out arm compares it
-    // against each replica's snapshot cut (`ReplicaFanout::cut`) so a record
-    // already inside a FULLRESYNC body is never live-delivered again.
-    if let Some(slot) = g.per_shard_backlogs.get(shard_id) {
-        if let Some(backlog) = slot.lock().as_mut() {
-            backlog.append(&bytes);
-        }
-    }
-    let end_offset = g.increment_shard_offset(shard_id, bytes.len() as u64);
-    crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout {
-        bytes,
-        end_offset,
-    });
+    // One implementation for every producer (moon#815): the coordinator's
+    // local legs record through the same function, so the handler and the
+    // coordinator cannot drift apart on what a replication record does.
+    crate::replication::state::record_local_write_on(g, shard_id, bytes);
 }
 
 /// Db-aware variant of [`record_local_write`] (HIGH-2, task #22): prepends a
@@ -135,55 +126,14 @@ pub(super) fn record_local_write_db(ctx: &ConnectionContext, db: usize, bytes: B
         return;
     };
     let g = rs.read();
-
     // R2 (task #20): multi-shard masters merge N shard streams onto one
-    // replica wire, so the per-shard `stream_db` context tracking below is
-    // meaningless there — another shard may have moved the wire's db context
-    // between any two of this shard's records. Instead EVERY db-scoped record
-    // is framed with its own `SELECT <db>` prefix, fused into ONE record so
-    // no cross-shard interleave can split them. Gated on the fanout hint: a
-    // multi-shard master that never had a replica attach pays nothing, and
-    // the hint flips (process-global, then re-asserted by each shard's
-    // `PrepareReplicaSync` arm BEFORE that shard's snapshot offset is
-    // captured) before any of this shard's records can reach a wire.
-    if ctx.num_shards > 1 {
-        if crate::replication::state::fanout_hint_active() {
-            let select = serialize_select(db);
-            let mut combined = Vec::with_capacity(select.len() + bytes.len());
-            combined.extend_from_slice(&select);
-            combined.extend_from_slice(&bytes);
-            record_local_write(&g, ctx.shard_id, Bytes::from(combined));
-        } else {
-            record_local_write(&g, ctx.shard_id, bytes);
-        }
-        return;
-    }
-    let needs_select = g.stream_db.get(ctx.shard_id).is_some_and(|slot| {
-        if slot.load(std::sync::atomic::Ordering::Relaxed) != db as i64 {
-            slot.store(db as i64, std::sync::atomic::Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
-    });
-    if needs_select {
-        record_local_write(&g, ctx.shard_id, Bytes::from(serialize_select(db)));
-    }
-    record_local_write(&g, ctx.shard_id, bytes);
-}
-
-/// RESP-serialize `SELECT <db>` for the replication stream.
-fn serialize_select(db: usize) -> Vec<u8> {
-    let mut n = itoa::Buffer::new();
-    let db_str = n.format(db);
-    let mut ln = itoa::Buffer::new();
-    let mut buf = Vec::with_capacity(32);
-    buf.extend_from_slice(b"*2\r\n$6\r\nSELECT\r\n$");
-    buf.extend_from_slice(ln.format(db_str.len()).as_bytes());
-    buf.extend_from_slice(b"\r\n");
-    buf.extend_from_slice(db_str.as_bytes());
-    buf.extend_from_slice(b"\r\n");
-    buf
+    // replica wire, so every db-scoped record carries its own fused
+    // `SELECT <db>` prefix; single-shard masters emit `SELECT` on change.
+    // Both branches live in `record_local_write_db_on` — the ONE
+    // implementation the coordinator's local legs also use (moon#815).
+    // `ReplicationState::num_shards()` is `ctx.num_shards` (both come from
+    // the boot-time shard count), so the topology decision is unchanged.
+    crate::replication::state::record_local_write_db_on(&g, ctx.shard_id, db, bytes);
 }
 
 /// Handle FT.* commands. Returns `true` if the command was consumed.
