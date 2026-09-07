@@ -377,6 +377,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   macOS** — `rflag[@]: unbound variable`: an empty array is "unbound" to
   `set -u` on bash < 4.4, and macOS ships 3.2 (the #634 class). The `-r`
   expansion is now `${rflag[@]+"${rflag[@]}"}`.
+- **`server`: a default-config server refused pipelined writes with `-MOONERR AOF
+  backpressure` (moon#838, regression from moon#812 in v0.8.9).** With no flags
+  at all (`--appendonly yes`, `everysec`, `--disk-offload enable`) a routine
+  `redis-benchmark -t set -c 50 -P 16` aborted 5/5 on GCE; no benchmark script
+  could see it because every one passes `--appendonly no` (moon#833).
+
+  Two write paths, one condition, two bounds: the inline SET fast path enqueued
+  its AOF record with a synchronous 5 ms bounded block on the shard thread
+  (`AOF_SPSC_BACKPRESSURE_BOUND`) and failed loud AFTER applying the write,
+  while the generic leg awaits the same channel for `--aof-fsync-timeout-ms`
+  (2 s) and blocks nothing. Until #812 no default-config SET could reach the
+  5 ms bound; #812 put every default SET on it, and any writer hiccup of ~10 ms
+  at ~1M rps (a 50 ms idle-escalated poll step on the first burst after idle, a
+  slow everysec fsync) filled the 10k channel and refused the burst.
+
+  The inline path now probes the writer (`AofWriterPool::append_would_block`)
+  BEFORE consuming the command bytes and stands down to generic dispatch when
+  the channel is full — the moon#660 pre-gate shape. It never applies a write it
+  cannot queue; the leg that can wait takes it, and the bytes inline again the
+  moment a slot frees. Not consulted under `--appendonly no`. The 5 ms bound
+  itself is unchanged: raising it would trade a loud refusal for a shard thread
+  parked for seconds (moon#769's SPSC-arm bound is a queue-depth × fsync-stall
+  problem with its own design).
+
+  Guarded by `tests/default_config_aof_backpressure_838.rs` (shipped flags,
+  hook-free first-burst-after-idle; a deterministic everysec stall via the new
+  writer-side test hook `MOON_TEST_AOF_FSYNC_STALL_MS`; and a pin that a
+  default server's refusal, when a stall outlasts `--aof-fsync-timeout-ms`,
+  comes from the generic leg, is applied-first and loud) plus unit tests on the
+  probe and on the inline path standing down with `read_buf` intact and the key
+  untouched. All red on `6251429f`.
 
 ## [0.8.9] — 2026-09-04
 

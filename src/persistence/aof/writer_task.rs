@@ -63,6 +63,29 @@ const AOF_IDLE_WAIT_STEPS: &[std::time::Duration] = &[
     std::time::Duration::from_secs(1),
 ];
 
+/// Test-only stall injection for the EverySec proactive fsync (moon#838 /
+/// moon#769 pinning tests): `MOON_TEST_AOF_FSYNC_STALL_MS=<ms>` holds the
+/// writer thread for that long immediately before each proactive
+/// `sync_data`, inside the window the fsync metric measures, so a slow
+/// device — the one condition that reliably fills the 10k writer channel
+/// under pipelined load — can be modelled deterministically on any host.
+/// While it holds, nothing drains: exactly what a real inline fsync stall
+/// does to this loop. Read once; unset or unparsable is a no-op. Production
+/// cost: one `OnceLock` load per proactive fsync (≤ 1/s).
+fn stall_everysec_fsync_for_test() {
+    static STALL: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    let stall = *STALL.get_or_init(|| {
+        std::env::var("MOON_TEST_AOF_FSYNC_STALL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(std::time::Duration::ZERO)
+    });
+    if !stall.is_zero() {
+        std::thread::sleep(stall);
+    }
+}
+
 /// Park-free bounded receive for the std-thread writer loops under
 /// `FsyncPolicy::EverySec`/`No`.
 ///
@@ -669,6 +692,7 @@ pub async fn aof_writer_task(
                 && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
             {
                 let t = Instant::now();
+                stall_everysec_fsync_for_test();
                 if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
                     error!("AOF sync failed (seq {}, everysec): {}", manifest.seq, e);
                     crate::persistence::aof::record_everysec_fsync_result(0, false);
@@ -996,6 +1020,7 @@ pub async fn aof_writer_task(
                 && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
             {
                 let t = Instant::now();
+                stall_everysec_fsync_for_test();
                 let res = match writer.flush().await {
                     Ok(()) => writer.get_ref().sync_data().await,
                     Err(e) => Err(e),
@@ -1470,6 +1495,7 @@ pub async fn per_shard_aof_writer_task(
                 && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
             {
                 let t = Instant::now();
+                stall_everysec_fsync_for_test();
                 let res = match writer.flush().await {
                     Ok(()) => writer.get_ref().sync_data().await,
                     Err(e) => Err(e),
@@ -1908,6 +1934,7 @@ pub async fn per_shard_aof_writer_task(
                     last_fsync.elapsed().as_secs_f64()
                 );
                 let t = Instant::now();
+                stall_everysec_fsync_for_test();
                 if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
                     error!(
                         "AOF EverySec proactive sync failed shard {} (seq {}): {}",

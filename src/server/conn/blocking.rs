@@ -2824,6 +2824,40 @@ pub(crate) fn try_inline_dispatch(
         return 0;
     }
 
+    // ---- AOF writer-capacity pre-gate (moon#838: MUST precede `read_buf` consumption) ----
+    //
+    // This path enqueues its AOF record with `send_append_bounded_blocking`
+    // (below): a synchronous `try_send` that, when the writer channel is
+    // full, blocks the WHOLE shard thread for `AOF_SPSC_BACKPRESSURE_BOUND`
+    // (5 ms) and then answers `-MOONERR AOF backpressure` for a SET it has
+    // already applied. The generic leg enqueues the same record through
+    // `send_append_group` → `send_async` awaited under `--aof-fsync-timeout-ms`
+    // (2 s), parking only this connection's task. Same condition, two bounds
+    // — and until moon#812 no default-config SET could reach the 5 ms one,
+    // because `--disk-offload enable` kept `can_inline_writes` false. #812
+    // fixed that predicate and moved every default SET onto the bound the
+    // path cannot meet: a writer hiccup of ~10 ms at ~1M rps fills the 10k
+    // channel, and a pipelined burst is refused (moon#838, 5/5 on GCE with no
+    // flags at all).
+    //
+    // So this path asks the STATE question — can the writer take this record
+    // right now? — and when the answer is no it stands down, `read_buf`
+    // byte-for-byte intact, to the leg that can wait. Ordering is the point,
+    // exactly as for the two pre-gates above: evaluated before `split_to`
+    // takes the bytes, so the bail is a true "not handled" and the write is
+    // never applied-then-refused here. `append_would_block` is one flume
+    // queue-length read when the channel has room (the common case).
+    //
+    // Not consulted under `--appendonly no` (`aof_pool` is `None`), so the
+    // tuned benchmark rows pay nothing. Under a rewrite fold the overflow
+    // buffer absorbs the append and the probe answers `false` — the fast
+    // path keeps running through BGREWRITEAOF exactly as before.
+    if let Some(pool) = aof_pool
+        && pool.append_would_block(shard_id)
+    {
+        return 0;
+    }
+
     // Freeze the consumed prefix of `read_buf` into an Arc-backed `Bytes`.
     // This replaces the BytesMut prefix with a refcounted view over the SAME
     // allocation, so `key`, `value`, and the AOF record can all be extracted

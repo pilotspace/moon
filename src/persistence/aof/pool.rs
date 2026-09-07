@@ -544,6 +544,39 @@ impl AofWriterPool {
         }
     }
 
+    /// `true` when an `Append` for `shard_id` could NOT be enqueued right now
+    /// without blocking: the writer channel is full and no rewrite fold has
+    /// the overflow armed to absorb it (moon#838). Mirrors the decision
+    /// [`Self::send_append_bounded_blocking`] makes once it holds the record:
+    /// `try_send`, else `try_spill` (succeeds iff armed and under cap), else
+    /// block. A cap-exceeded spill drops on every path alike and is not a
+    /// blocking question, so it is not asked here.
+    ///
+    /// This is the *state* predicate the inline SET fast path
+    /// (`server::conn::try_inline_dispatch`) consults BEFORE it consumes the
+    /// command bytes and applies the write. That path is synchronous and can
+    /// only ever block the whole shard thread for
+    /// [`AOF_SPSC_BACKPRESSURE_BOUND`](super::AOF_SPSC_BACKPRESSURE_BOUND)
+    /// (5 ms) and then fail loud on a write it has already applied; the
+    /// generic leg awaits `send_async` under `fsync_timeout` (2 s by default)
+    /// and blocks nothing. Probing here lets the fast path stand down to the
+    /// leg that can wait instead of applying-then-refusing.
+    ///
+    /// Cost on the hot path: one flume queue-length read (an uncontended
+    /// spinlock acquire on the same line `try_send` touches a few hundred ns
+    /// later) — the overflow's armed flag is only read once the channel is
+    /// full.
+    ///
+    /// Race: at `--shards 1` (the shipped default) every producer for this
+    /// writer runs on the calling thread, so a `false` here is exact for the
+    /// `try_send` that follows. Under PerShard layout other shards' timers
+    /// can fill the channel between probe and send; that residual is bounded
+    /// by the existing 5 ms block + loud error, now rare instead of routine.
+    #[inline]
+    pub fn append_would_block(&self, shard_id: usize) -> bool {
+        self.sender(shard_id).is_full() && !self.overflow_for(shard_id).is_armed()
+    }
+
     /// Append with bounded *blocking* backpressure — for synchronous callers
     /// (the shard event loop's SPSC drain) that cannot await.
     ///
@@ -2469,6 +2502,53 @@ mod pool_tests {
             !super::super::AOF_LAST_APPEND_OK.load(std::sync::atomic::Ordering::Relaxed),
             "a dropped acked append must latch aof_last_append_status:err"
         );
+    }
+
+    /// moon#838: the inline SET fast path's pre-gate. Must answer `true`
+    /// only while an append could not be enqueued without blocking — a full
+    /// channel with no rewrite overflow armed — and flip back the moment the
+    /// writer drains a slot or a fold arms the overflow.
+    #[test]
+    fn append_would_block_tracks_channel_and_spill_state() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(1);
+        let pool = AofWriterPool::top_level(tx);
+        assert!(!pool.append_would_block(0), "empty channel: never blocks");
+
+        assert!(pool.try_send_append(0, 1, 0, Bytes::from_static(b"fill")));
+        assert!(
+            pool.append_would_block(0),
+            "full channel, no fold: would block"
+        );
+
+        // A rewrite fold arms the overflow: the append spills, no block —
+        // from the very first spill (`spill_first` is false while the buffer
+        // is still empty; the probe must key on `is_armed`, not on it).
+        {
+            let _armed = pool.overflow_for(0).arm_scoped();
+            assert!(
+                !pool.append_would_block(0),
+                "full channel under a fold: the overflow absorbs it, no block"
+            );
+            let mut budget = Duration::ZERO;
+            assert!(
+                pool.send_append_bounded_blocking(
+                    0,
+                    2,
+                    0,
+                    Bytes::from_static(b"spilled"),
+                    &mut budget
+                ),
+                "sanity: the send the probe vouched for really does not block or drop"
+            );
+        }
+        assert!(
+            pool.append_would_block(0),
+            "fold finished: back to would-block"
+        );
+
+        // The writer drains one slot: room again.
+        assert!(matches!(rx.recv(), Ok(AofMessage::Append { lsn: 1, .. })));
+        assert!(!pool.append_would_block(0), "slot freed: no block");
     }
 
     /// Sync SPSC-path variant: `send_append_bounded_blocking` blocks up to
