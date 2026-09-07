@@ -4,11 +4,20 @@
 
 ## Capture Details
 
-- **Date:** 2026-04-27
-- **Host:** macOS aarch64 (Apple Silicon)
-- **Features:** `runtime-tokio,jemalloc,graph,text-index`
-- **Build:** debug profile (unoptimized)
+- **Date:** 2026-09-08
+- **Host:** GCE `moon-bench-x86` (`c3-standard-8`), Ubuntu 24.04.4 LTS,
+  kernel `6.17.0-1022-gcp`, `x86_64` -- matches `runs-on: ubuntu-latest` in
+  `ci.yml` (Linux/x86_64; exact kernel build need not match, only OS/arch,
+  per `check_baseline_provenance`). Idle host, load average 0.00 at capture.
+- **Toolchain:** `rustc 1.94.1` (`dtolnay/rust-toolchain@1.94.1`, same pin as CI)
+- **Build:** `cargo build --no-default-features --features runtime-tokio,jemalloc,graph,text-index`
+  -- the exact `Build moon` step in `ci.yml`'s `memory-steady-state` job,
+  debug profile (unoptimized)
+- **Env:** `MOON_NO_URING=1` (matches the job's env block)
 - **Shards:** 1
+- **Superseded a macOS aarch64 / debug baseline** (captured 2026-04-27, no
+  `platform` field) that predated moon#764's provenance guard and could
+  never legitimately compare against the `ubuntu-latest` runner.
 
 ## Workload
 
@@ -60,11 +69,39 @@ baseline carries no provenance, or when its platform differs from the machine
 measuring now. Exit 2 means "the gate cannot run", which is distinct from exit 1,
 "a kind regressed".
 
-> **This fixture predates the provenance field and was captured on macOS aarch64
-> (see Capture Details above), while the CI job runs on `ubuntu-latest`.** It must
-> be regenerated on the platform the gate runs on before the comparison can do
-> anything. Until then the job exits 2 and says so -- which is the honest state,
-> not a new breakage: the comparison had never run at all (see below).
+> This fixture now carries `"platform": {"os": "Linux", "arch": "x86_64", ...}`,
+> captured on `moon-bench-x86` (see Capture Details above) to match the
+> `ubuntu-latest` runner `ci.yml` actually uses.
+
+## Per-kind noise floor (moon#764 follow-up)
+
+`hnsw` and `allocator_overhead` are not measured directly. `hnsw`'s
+Prometheus value tracks a growable mutable buffer whose realized jemalloc
+size class depends on concurrent insertion ordering -- the MEMORY DOCTOR
+estimate for the same kind is bit-identical run over run; only the real
+allocation isn't. `allocator_overhead` is `max(0, RSS - sum(other 6))`, a
+residual that inherits every other kind's noise plus RSS's own page-level
+jitter.
+
+Measured on `moon-bench-x86` (see Capture Details), 10+ back-to-back real
+runs of this exact workload with **zero code changes between runs**:
+`dashtable`/`rss`/`csr` held under 2% every time; `hnsw` swung
+-13.55%..+15.68% and `allocator_overhead` swung -18.98%..+9.15% -- purely
+from run-to-run noise. A flat +/-5% would fail this gate on these two kinds
+roughly every other real run, which trains reviewers to re-run without
+reading the failure -- a different route to the same "nobody trusts this
+gate" outcome moon#764 was filed over.
+
+`compare_snapshot`'s `kind_threshold()` therefore applies a wider floor to
+just these two kinds -- `hnsw`: +/-20%, `allocator_overhead`: +/-25% --
+comfortably above the measured noise ceiling (~16% / ~19%) so a real
+regression several times the noise floor is still caught. `dashtable`,
+`csr`, `rss`, `wal`, `sealed`, and `replication_backlog` are unaffected and
+stay at the requested `--threshold` (5% by default). Verified: a real
+mutated-baseline run with `hnsw` regressed 100% (well past the 20% floor)
+still failed the gate (`FAIL: hnsw delta=72.89%`); the self-test's +6%
+`dashtable` injection is still caught every time. Full transcripts:
+`tmp/perf-campaign/FIX-764.md`.
 
 ## CI Gate
 

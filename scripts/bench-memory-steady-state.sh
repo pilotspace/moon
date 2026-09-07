@@ -424,6 +424,43 @@ check_baseline_provenance() {
 }
 
 # ---------------------------------------------------------------------------
+# Per-kind noise floor (moon#764 follow-up)
+# ---------------------------------------------------------------------------
+# `hnsw` and `allocator_overhead` are not measured directly -- `hnsw`'s prom
+# value tracks a growable mutable buffer whose realized jemalloc size class
+# depends on concurrent insertion ordering (the doctor-computed estimate for
+# the same kind is bit-identical run over run; only the real allocation
+# isn't), and `allocator_overhead` is `max(0, RSS - sum(other 6))`, a residual
+# that inherits every other kind's noise plus RSS's own page-level jitter.
+#
+# Measured on moon-bench-x86 (GCE c3-standard-8, Ubuntu 24.04.4,
+# Linux 6.17.0-1022-gcp, x86_64, debug build, idle host, 10 back-to-back
+# real runs of this exact workload, 2026-09-08): dashtable/rss/csr held
+# under 2% every time; hnsw swung -13.55%..+15.68% and allocator_overhead
+# swung -18.98%..+9.15%, purely from run-to-run noise with ZERO code change
+# between runs. A flat +/-5% would make this gate report a regression on
+# these two kinds roughly every other real run -- a false-positive rate
+# that trains reviewers to click "re-run" without reading the failure,
+# which is a different route to the same outcome #764 was filed over: a
+# gate nobody trusts. See tmp/perf-campaign/FIX-764.md for the raw
+# transcripts this floor is derived from.
+#
+# The floor sits comfortably above the measured noise ceiling (~16% / ~19%)
+# so a real regression several times the noise floor is still caught; it
+# does NOT touch the other 5 kinds or RSS, which stayed noise-free.
+kind_threshold() {
+    local kind="$1"
+    local base="$2"
+    local floor=0
+    case "$kind" in
+        hnsw)                floor=20 ;;
+        allocator_overhead)  floor=25 ;;
+        *)                   floor=0  ;;
+    esac
+    python3 -c "print($base if $base > $floor else $floor)"
+}
+
+# ---------------------------------------------------------------------------
 # Compare snapshot against baseline
 # Returns 0 if all within threshold, 1 if any regression detected
 # ---------------------------------------------------------------------------
@@ -442,7 +479,7 @@ compare_snapshot() {
     local baseline
     baseline=$(cat "$baseline_file")
 
-    log "Comparing against baseline (threshold: +/-${threshold}%)..."
+    log "Comparing against baseline (threshold: +/-${threshold}%, wider floor for hnsw/allocator_overhead -- see kind_threshold())..."
 
     # Compare RSS
     local measured_rss baseline_rss
@@ -471,9 +508,10 @@ print(round((m - b) / b * 100, 2))
 
     # Compare each kind (use prom value for comparison)
     for kind in dashtable hnsw csr wal sealed replication_backlog allocator_overhead; do
-        local measured_val baseline_val
+        local measured_val baseline_val kind_thr
         measured_val=$(echo "$snapshot" | jq -r ".kinds.${kind}.prom")
         baseline_val=$(echo "$baseline" | jq -r ".kinds.${kind}.prom")
+        kind_thr=$(kind_threshold "$kind" "$threshold")
 
         # Handle baseline=0: if measured > 1024 bytes, flag as regression
         if [[ "$baseline_val" == "0" ]]; then
@@ -495,13 +533,13 @@ print(round((m - b) / b * 100, 2))
         local abs_delta
         abs_delta=$(python3 -c "print(abs($delta_pct))")
         local exceeds
-        exceeds=$(python3 -c "print('yes' if $abs_delta > $threshold else 'no')")
+        exceeds=$(python3 -c "print('yes' if $abs_delta > $kind_thr else 'no')")
 
         if [[ "$exceeds" == "yes" ]]; then
-            failure_msgs="${failure_msgs}  FAIL: ${kind} delta=${delta_pct}% (measured=$measured_val, baseline=$baseline_val)\n"
+            failure_msgs="${failure_msgs}  FAIL: ${kind} delta=${delta_pct}% (measured=$measured_val, baseline=$baseline_val, threshold=+/-${kind_thr}%)\n"
             failures=$((failures + 1))
         else
-            log "  OK: ${kind} delta=${delta_pct}% (within +/-${threshold}%)"
+            log "  OK: ${kind} delta=${delta_pct}% (within +/-${kind_thr}%)"
         fi
     done
 
