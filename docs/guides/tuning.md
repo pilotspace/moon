@@ -137,6 +137,20 @@ Expands to (only for flags left unset):
 > GCE, 2026-07) and costs at most ~one sampling window of spin on a contended one — it is
 > no longer a pinned-cores-only preset.
 >
+> **Scoped to LOW connection counts — this is not a general-purpose "fast" preset.**
+> The p=1 win above is a *single-connection* result, and `--profile standalone` also
+> sets `--shards 1`, which forfeits every other core. moon#772 measured this preset
+> at c=200 on GCE `t2a-standard-8` (n=3): **-80%** vs stock `--shards 8` at p=1
+> (64,891 vs 332,779 ops/s) and **-57%** at p=16 (858,701 vs 1,999,000 ops/s).
+> Mechanism: at c=200 the shard thread is already CPU-saturated serving requests
+> (~777% of 8 cores), so the busy-poll spin steals cycles from the work itself
+> instead of trading idle CPU for latency — the auto-gating governor above reacts
+> to *involuntary preemption*, not to queueing under one busy shard, so it does not
+> catch this case. **Use `standalone` for a handful of latency-sensitive
+> connections** (sessions, rate limiting — see the recipe table above); at
+> dozens-to-hundreds of concurrent connections, stock `--shards N` (N = physical
+> cores, no `--io-busy-poll-us`) is the throughput-correct choice.
+>
 > **jemalloc arena cap is CLI-only.** `--memory-arenas-cap` is read before the config
 > file is parsed (the allocator initialises first), so the profile can only fill it when
 > you pass `--profile standalone` on the **command line**. A conf-file `profile standalone`

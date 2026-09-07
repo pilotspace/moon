@@ -155,6 +155,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--test` target, so an ignored test here would have run nowhere. Shown red
   against the pre-fix binary (`h: was listpack, after restart hashtable`,
   `l: ... linkedlist`, `si: ... hashtable`) and green with the fix.
+### Changed
+
+- **`docs`: `--profile standalone` is scoped to low connection counts
+  (moon#772).** The preset's p=1 win is a single-connection result; moon#772
+  measured it at c=200 on GCE `t2a-standard-8`: **-80%** vs stock
+  `--shards N` at p=1 and -57% at p=16, because the preset's `--shards 1`
+  forfeits the other cores and its busy-poll spin steals cycles from an
+  already-saturated shard rather than trading idle CPU for latency. Clarified
+  in the `--profile` doc comment (`src/config.rs`), a second startup
+  `tracing::warn!` (`src/main.rs`), README.md, `docs/guides/tuning.md`,
+  `docs/configuration.md`, and `docs/runbooks/upgrade-to-v0.6.0.md`. No
+  behavior change — flags set by the preset are unchanged.
 
 ## [0.8.9] — 2026-09-04
 

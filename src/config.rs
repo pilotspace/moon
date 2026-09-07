@@ -414,7 +414,19 @@ pub struct ServerConfig {
     /// now auto-gates the busy-poll on shared/oversubscribed cores (per-shard
     /// involuntary-preemption sampling), so the preset no longer requires
     /// pinned CPUs — it simply delivers its full win on dedicated cores and
-    /// costs at most ~one window of spin on a contended one. See
+    /// costs at most ~one window of spin on a contended one.
+    ///
+    /// **Scoped to LOW connection counts.** The p=1 win is a single-connection
+    /// result. moon#772 measured this preset at c=200 (GCE t2a-standard-8,
+    /// n=3): **-80%** vs stock `--shards 8` at p=1 (64,891 vs 332,779 ops/s)
+    /// and -57% at p=16. Mechanism: at c=200 the shard is already
+    /// CPU-saturated serving requests, so busy-poll parking steals cycles
+    /// from the work itself instead of trading idle CPU for latency, and
+    /// `--shards 1` forfeits the other 7 cores a high-connection-count
+    /// workload could use. Use this profile for a few latency-sensitive
+    /// connections (sessions, rate limiting); at dozens-to-hundreds of
+    /// concurrent connections, stock `--shards N` (N = physical cores) is
+    /// the correct choice for throughput. See
     /// docs/guides/tuning.md#profiles. Unknown profile names are a startup
     /// error.
     #[arg(long)]

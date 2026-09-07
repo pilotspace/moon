@@ -127,7 +127,7 @@ promotion (`REPLICAOF NO ONE`), and the replica TTL caveat: see the
 | `--tcp-keepalive` | `300` | TCP keepalive interval in seconds (0 = disabled) |
 | `--slowlog-log-slower-than` | `10000` | Slowlog threshold in microseconds |
 | `--slowlog-max-len` | `128` | Maximum slowlog entries |
-| `--profile` | *(none)* | Apply a named tuning preset (currently `standalone`). Only fills flags left at their default — an explicit flag always wins. Logs exactly what it set. Safe on any host (busy-poll auto-gates on shared cores). See the [tuning guide](guides/tuning.md#profiles) |
+| `--profile` | *(none)* | Apply a named tuning preset (currently `standalone`). Only fills flags left at their default — an explicit flag always wins. Logs exactly what it set. Safe on any host (busy-poll auto-gates on shared cores), but scoped to LOW connection counts — it also sets `--shards 1`, and moon#772 measured **-80%** vs stock `--shards N` at 200 concurrent connections. See the [tuning guide](guides/tuning.md#profiles) |
 | `--io-driver` | `auto` | I/O driver: `auto` (io_uring on Linux, kqueue on macOS) or `epoll` |
 | `--io-busy-poll-us` | `0` (off) | Busy-poll the I/O driver for N µs before parking. Large single-op latency win on dedicated cores; **auto-disables on shared/oversubscribed cores** via the per-shard contention governor, so it no longer regresses there. See the [tuning guide](guides/tuning.md#busy-polling-single-op-latency-on-dedicated-cores) |
 | `--initial-keyspace-hint` | `0` | Pre-size the keyspace (e.g. `1000000`) to avoid rehash pauses during bulk loads |
