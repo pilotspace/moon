@@ -840,4 +840,67 @@ mod tests {
         assert_eq!(llen(&mut db, &[bs(b"ghost")]), Frame::Integer(0));
         assert_eq!(llen(&mut db, &[bs(b"ghost2")]), Frame::Integer(0));
     }
+    // ── moon#832: a read on the MUTABLE path must not flatten the encoding ──
+    //
+    // Red on b04e8990: LLEN/LINDEX/LRANGE/LPOS reached the list through
+    // `Database::get_list` -> `get_promoted` -> `ListKind::upgrade`, an
+    // unconditional one-way conversion. `RPUSH l a b c` then `LLEN l` on the
+    // mutable path left the key a `linkedlist` forever (verified against a
+    // live server: `listpack` after RPUSH, `listpack` after a plain LLEN,
+    // `linkedlist` after the same LLEN inside MULTI/EXEC).
+
+    fn encoding_of_832(db: &mut Database, key: &[u8]) -> &'static str {
+        db.get(key)
+            .map(|e| e.value.as_redis_value().encoding_name())
+            .unwrap_or("<missing>")
+    }
+
+    #[test]
+    fn read_on_mutable_path_keeps_listpack_encoding() {
+        #[allow(clippy::type_complexity)]
+        let handlers: &[(&str, fn(&mut Database))] = &[
+            ("LLEN", |db| {
+                llen(db, &[bs(b"l")]);
+            }),
+            ("LINDEX", |db| {
+                lindex(db, &[bs(b"l"), bs(b"0")]);
+            }),
+            ("LRANGE", |db| {
+                lrange(db, &[bs(b"l"), bs(b"0"), bs(b"-1")]);
+            }),
+            ("LPOS", |db| {
+                lpos(db, &[bs(b"l"), bs(b"b")]);
+            }),
+        ];
+        for (name, call) in handlers {
+            let mut db = Database::new();
+            rpush(&mut db, &[bs(b"l"), bs(b"a"), bs(b"b"), bs(b"c")]);
+            assert_eq!(
+                encoding_of_832(&mut db, b"l"),
+                "listpack",
+                "{name}: fixture must start compact, or the test proves nothing"
+            );
+            call(&mut db);
+            assert_eq!(
+                encoding_of_832(&mut db, b"l"),
+                "listpack",
+                "{name} flattened the list: a read on the mutable dispatch path rewrote the encoding (moon#832)"
+            );
+        }
+    }
+
+    /// The reads must still ANSWER correctly straight off the listpack.
+    #[test]
+    fn read_on_mutable_path_still_answers_from_the_listpack() {
+        let mut db = Database::new();
+        rpush(&mut db, &[bs(b"l"), bs(b"a"), bs(b"b"), bs(b"c")]);
+        assert_eq!(llen(&mut db, &[bs(b"l")]), Frame::Integer(3));
+        assert_eq!(lindex(&mut db, &[bs(b"l"), bs(b"1")]), bs(b"b"));
+        assert_eq!(lpos(&mut db, &[bs(b"l"), bs(b"c")]), Frame::Integer(2));
+        let Frame::Array(items) = lrange(&mut db, &[bs(b"l"), bs(b"0"), bs(b"-1")]) else {
+            panic!("LRANGE must answer an array");
+        };
+        assert_eq!(items.len(), 3);
+        assert_eq!(encoding_of_832(&mut db, b"l"), "listpack");
+    }
 }

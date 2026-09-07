@@ -174,6 +174,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measured stable across a restart) and the `XCLAIM`/`XAUTOCLAIM`/`XREADGROUP`
   PEL delivery-time family (needs `XCLAIM … TIME/FORCE/JUSTID` support first;
   filed separately).
+- **`storage`: a *read* no longer flattens a compact encoding (#832).**
+  `Database::get_promoted` returns `K::Shared<'_>` -- a shared reference -- but
+  obtaining one called `K::upgrade` unconditionally, and nothing in the tree
+  ever downgrades. So a single read taken on the mutable dispatch path (inside
+  `MULTI`/`EXEC`, inside a Lua script, or from `try_inline_dispatch`)
+  permanently converted a `listpack`/`intset` key to its full form for the rest
+  of its life -- and whether that happened depended on which of moon's three
+  dispatch paths the command took, not on what the command did. `OBJECT
+  ENCODING` became observation-dependent, and `used_memory` moved on a command
+  the user believed was read-only.
+
+  Measured on the unmodified binary (`--shards 1`, `used_memory` ledger): 1000
+  eight-member integer sets went **333,055 -> 1,149,055 bytes (3.45x) after one
+  `SCARD` each**, `intset -> hashtable`; a three-element list went
+  `listpack -> linkedlist` after one `LLEN`. That put a ceiling on every
+  container memory figure, making them write-only-workload numbers.
+
+  All fourteen affected read handlers (`SMEMBERS`, `SCARD`, `SISMEMBER`,
+  `SMISMEMBER`, `SINTER`, `SUNION`, `SDIFF`, `SRANDMEMBER`, `SSCAN`,
+  `SINTERCARD`, `LLEN`, `LRANGE`, `LINDEX`, `LPOS`) now take their read through
+  the `&Database` implementation that already backed `dispatch_read`, so the
+  compiler makes the rewrite unrepresentable rather than merely discouraged --
+  and the two implementations of each command collapse into one, which is the
+  divergence #610 came from. Five `-WRONGTYPE`/presence probes in the blocking
+  machinery, which flattened a list purely to *look at* its type before parking
+  a client, do the same. After the fix the same probe measures **1.00x**.
+
+  The hash family was already correct (it moved to `get_hash_ref_if_alive`
+  earlier) and is covered by the new gate too.
+  `tests/read_preserves_compact_encoding.rs` asserts the encoding survives on
+  all three dispatch paths; 19 of its 52 cases fail on the pre-fix binary.
+
 - **`persistence`: a restart no longer flattens every compact encoding.** RDB
   decode rebuilt each container in its *full* form, so a listpack hash, a
   listpack list, an intset and a set listpack all came back as

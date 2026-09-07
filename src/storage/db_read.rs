@@ -208,6 +208,15 @@ impl<'a> ListRef<'a> {
         }
     }
 
+    /// Whether the list holds no elements.
+    ///
+    /// moon#832: the blocking-move gate needs "is there anything to move?"
+    /// WITHOUT `&mut Database` — asking through `Database::get_list` used to
+    /// flatten the list's compact encoding just to answer it.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Get element at index.
     pub fn get(&self, index: usize) -> Option<Bytes> {
         match self {

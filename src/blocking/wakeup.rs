@@ -245,7 +245,10 @@ pub fn try_wake_list_waiter(
                 } else if destination == key {
                     None
                 } else {
-                    db.get_list(destination).err()
+                    // moon#832: type probe only — when it fails nothing moves,
+                    // so it must not flatten the destination's encoding.
+                    let now_ms = db.now_ms();
+                    db.get_list_ref_if_alive(destination, now_ms).err()
                 };
                 if let Some(err) = dest_err {
                     // No undo: nothing was popped.

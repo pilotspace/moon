@@ -6,409 +6,152 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 
-use super::{collect_sets, glob_match, parse_int};
+use super::{glob_match, parse_int};
 use crate::command::helpers::{err_wrong_args, extract_bytes};
 
 // ---------------------------------------------------------------------------
 // SMEMBERS key
 // ---------------------------------------------------------------------------
 
-/// SMEMBERS command handler: return all members of a set.
+// ---------------------------------------------------------------------------
+// moon#832 -- the mutable dispatch path reads through the SHARED one
+//
+// Every handler below is a pure read, and every one used to reach the set
+// through `Database::get_set`, whose `get_promoted` core calls `K::upgrade`
+// unconditionally. That conversion is one-way -- nothing ever downgrades --
+// so a single SCARD taken on the mutable path (inside MULTI/EXEC, inside a
+// Lua script, or from `try_inline_dispatch`) permanently flattened an
+// `intset`/`listpack` set to a `hashtable` for the rest of its life.
+// Measured on the unmodified binary: 1000 eight-member integer sets went
+// 333,055 -> 1,149,055 bytes of `used_memory` (3.45x) after ONE `SCARD` each,
+// and `OBJECT ENCODING` went `intset -> hashtable`.
+//
+// The fix is to take the read through `&Database`. That is not a convention:
+// a shared borrow CANNOT reach `K::upgrade`, so the compiler enforces the
+// invariant that reading does not rewrite. It also collapses the two
+// implementations of every one of these commands into one, which removes the
+// divergence #610 came from -- the answer no longer depends on which of
+// moon's three dispatch paths the command took.
+//
+// What is deliberately NOT preserved: the mutable path used to reclaim an
+// expired key and to promote a cold-tier hit back into hot RAM as a side
+// effect of the read. Neither is a correctness property -- `get_ref_if_alive`
+// still treats an expired key as absent and still reads the cold tier
+// through -- and the hash family (`hash_read.rs`) has shipped exactly this
+// shape since it moved to `get_hash_ref_if_alive`. Active expiry and the
+// write paths still reclaim.
+// ---------------------------------------------------------------------------
+/// SMEMBERS key -- all members of a set.
+///
+/// Reads through the shared-borrow implementation so the set's compact
+/// encoding survives the read (moon#832 -- see the block above).
 pub fn smembers(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() != 1 {
-        return err_wrong_args("SMEMBERS");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("SMEMBERS"),
-    };
-    match db.get_set(key) {
-        Ok(Some(set)) => {
-            let members: Vec<Frame> = set.iter().map(|m| Frame::BulkString(m.clone())).collect();
-            Frame::Array(members.into())
-        }
-        Ok(None) => Frame::Array(framevec![]),
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    smembers_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
 // SCARD key
 // ---------------------------------------------------------------------------
 
-/// SCARD command handler: return the cardinality of a set.
+/// SCARD key -- cardinality of a set.
+///
+/// Reads through the shared-borrow implementation so the set's compact
+/// encoding survives the read (moon#832 -- see the block above).
 pub fn scard(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() != 1 {
-        return err_wrong_args("SCARD");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("SCARD"),
-    };
-    match db.get_set(key) {
-        Ok(Some(set)) => Frame::Integer(set.len() as i64),
-        Ok(None) => Frame::Integer(0),
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    scard_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
 // SISMEMBER key member
 // ---------------------------------------------------------------------------
 
-/// SISMEMBER command handler: check if member is in a set.
+/// SISMEMBER key member -- membership test.
+///
+/// Reads through the shared-borrow implementation so the set's compact
+/// encoding survives the read (moon#832 -- see the block above).
 pub fn sismember(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() != 2 {
-        return err_wrong_args("SISMEMBER");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("SISMEMBER"),
-    };
-    let member = match extract_bytes(&args[1]) {
-        Some(m) => m,
-        None => return err_wrong_args("SISMEMBER"),
-    };
-    match db.get_set(key) {
-        Ok(Some(set)) => {
-            if set.contains(member) {
-                Frame::Integer(1)
-            } else {
-                Frame::Integer(0)
-            }
-        }
-        Ok(None) => Frame::Integer(0),
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    sismember_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
 // SMISMEMBER key member [member ...]
 // ---------------------------------------------------------------------------
 
-/// SMISMEMBER command handler: check if multiple members are in a set.
+/// SMISMEMBER key member [member ...] -- multi membership test.
+///
+/// Reads through the shared-borrow implementation so the set's compact
+/// encoding survives the read (moon#832 -- see the block above).
 pub fn smismember(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() < 2 {
-        return err_wrong_args("SMISMEMBER");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("SMISMEMBER"),
-    };
-    match db.get_set(key) {
-        Ok(maybe_set) => {
-            let results: Vec<Frame> = args[1..]
-                .iter()
-                .map(|arg| {
-                    let member = extract_bytes(arg);
-                    match (maybe_set, member) {
-                        (Some(set), Some(m)) => {
-                            if set.contains(m) {
-                                Frame::Integer(1)
-                            } else {
-                                Frame::Integer(0)
-                            }
-                        }
-                        _ => Frame::Integer(0),
-                    }
-                })
-                .collect();
-            Frame::Array(results.into())
-        }
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    smismember_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
 // SINTER key [key ...]
 // ---------------------------------------------------------------------------
 
-/// SINTER command handler: intersection of all sets.
-/// If any key is missing, result is empty.
+/// SINTER key [key ...] -- intersection of all sets.
+///
+/// Reads through the shared-borrow implementation so the set's compact
+/// encoding survives the read (moon#832 -- see the block above).
 pub fn sinter(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.is_empty() {
-        return err_wrong_args("SINTER");
-    }
-    let keys: Vec<&Bytes> = args.iter().filter_map(extract_bytes).collect();
-    if keys.len() != args.len() {
-        return err_wrong_args("SINTER");
-    }
-
-    let sets = match collect_sets(db, &keys) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    // If any key is missing, intersection is empty
-    let mut concrete: Vec<HashSet<Bytes>> = Vec::new();
-    for s in sets {
-        match s {
-            Some(set) => concrete.push(set),
-            None => return Frame::Array(framevec![]),
-        }
-    }
-
-    if concrete.is_empty() {
-        return Frame::Array(framevec![]);
-    }
-
-    // Start with the smallest set for efficiency
-    concrete.sort_by_key(|s| s.len());
-    let mut result = concrete[0].clone();
-    for other in &concrete[1..] {
-        result.retain(|m| other.contains(m));
-    }
-
-    let members: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
-    Frame::Array(members.into())
+    let now_ms = db.now_ms();
+    sinter_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
 // SUNION key [key ...]
 // ---------------------------------------------------------------------------
 
-/// SUNION command handler: union of all sets. Missing keys treated as empty.
+/// SUNION key [key ...] -- union of all sets.
+///
+/// Reads through the shared-borrow implementation so the set's compact
+/// encoding survives the read (moon#832 -- see the block above).
 pub fn sunion(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.is_empty() {
-        return err_wrong_args("SUNION");
-    }
-    let keys: Vec<&Bytes> = args.iter().filter_map(extract_bytes).collect();
-    if keys.len() != args.len() {
-        return err_wrong_args("SUNION");
-    }
-
-    let sets = match collect_sets(db, &keys) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    let mut result = HashSet::new();
-    for s in sets {
-        if let Some(set) = s {
-            result.extend(set);
-        }
-    }
-
-    let members: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
-    Frame::Array(members.into())
+    let now_ms = db.now_ms();
+    sunion_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
 // SDIFF key [key ...]
 // ---------------------------------------------------------------------------
 
-/// SDIFF command handler: first set minus all others. Missing keys treated as empty.
+/// SDIFF key [key ...] -- first set minus all others.
+///
+/// Reads through the shared-borrow implementation so the set's compact
+/// encoding survives the read (moon#832 -- see the block above).
 pub fn sdiff(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.is_empty() {
-        return err_wrong_args("SDIFF");
-    }
-    let keys: Vec<&Bytes> = args.iter().filter_map(extract_bytes).collect();
-    if keys.len() != args.len() {
-        return err_wrong_args("SDIFF");
-    }
-
-    let sets = match collect_sets(db, &keys) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    let mut result = match &sets[0] {
-        Some(set) => set.clone(),
-        None => return Frame::Array(framevec![]),
-    };
-
-    for s in &sets[1..] {
-        if let Some(set) = s {
-            result.retain(|m| !set.contains(m));
-        }
-    }
-
-    let members: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
-    Frame::Array(members.into())
+    let now_ms = db.now_ms();
+    sdiff_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
 // SRANDMEMBER key [count]
 // ---------------------------------------------------------------------------
 
-/// SRANDMEMBER command handler: return random members.
-/// Without count: return one random BulkString or Null.
-/// Positive count: return distinct elements (up to set size).
-/// Negative count: return abs(count) elements with possible duplicates.
+/// SRANDMEMBER key [count] -- random member(s), no removal.
+///
+/// Reads through the shared-borrow implementation so the set's compact
+/// encoding survives the read (moon#832 -- see the block above).
 pub fn srandmember(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.is_empty() || args.len() > 2 {
-        return err_wrong_args("SRANDMEMBER");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("SRANDMEMBER"),
-    };
-
-    // Index-first: the set is an `IndexSet`, so a member is addressable in
-    // O(1). The previous shape cloned the ENTIRE set (`s.clone()`) and then
-    // collected every member into a `Vec` to pick one -- 100,000 clones to
-    // answer one SRANDMEMBER, measured at 506 ops/s against Redis's 129,032.
-    let len = match db.get_set(key) {
-        Ok(Some(s)) => s.len(),
-        Ok(None) => {
-            return if args.len() == 1 {
-                Frame::Null
-            } else {
-                Frame::Array(framevec![])
-            };
-        }
-        Err(e) => return e,
-    };
-
-    if len == 0 {
-        return if args.len() == 1 {
-            Frame::Null
-        } else {
-            Frame::Array(framevec![])
-        };
-    }
-
-    let mut rng = rand::rng();
-
-    if args.len() == 1 {
-        let idx = rng.random_range(0..len);
-        return match db.get_set(key) {
-            Ok(Some(s)) => match s.get_index(idx) {
-                Some(m) => Frame::BulkString(m.clone()),
-                None => Frame::Null,
-            },
-            _ => Frame::Null,
-        };
-    }
-
-    let count = match parse_int(&args[1]) {
-        Some(c) => c,
-        None => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR value is not an integer or out of range",
-            ));
-        }
-    };
-
-    if count == 0 {
-        return Frame::Array(framevec![]);
-    }
-
-    if count > 0 {
-        // Distinct elements. `index::sample` draws n distinct indices in
-        // O(n) -- it does not walk the set -- so the cost tracks the COUNT
-        // asked for, not how large the set happens to be.
-        let n = std::cmp::min(count as usize, len);
-        let picks = rand::seq::index::sample(&mut rng, len, n);
-        let set = match db.get_set(key) {
-            Ok(Some(s)) => s,
-            _ => return Frame::Array(framevec![]),
-        };
-        let chosen: Vec<Frame> = picks
-            .into_iter()
-            .filter_map(|i| set.get_index(i).map(|m| Frame::BulkString(m.clone())))
-            .collect();
-        Frame::Array(chosen.into())
-    } else {
-        // Allow duplicates
-        // DoS guard: refuse a huge negative COUNT loudly instead of letting it
-        // drive an unbounded Vec::with_capacity -> allocator abort. Within the
-        // cap, Redis semantics apply: exactly |COUNT| elements, duplicates ok.
-        let n = count.unsigned_abs() as usize;
-        if n > crate::command::RAND_DUP_COUNT_MAX {
-            return Frame::Error(Bytes::from_static(crate::command::ERR_RAND_COUNT_RANGE));
-        }
-        let picks: Vec<usize> = (0..n).map(|_| rng.random_range(0..len)).collect();
-        let set = match db.get_set(key) {
-            Ok(Some(s)) => s,
-            _ => return Frame::Array(framevec![]),
-        };
-        let mut result = Vec::with_capacity(n);
-        for i in picks {
-            if let Some(m) = set.get_index(i) {
-                result.push(Frame::BulkString(m.clone()));
-            }
-        }
-        Frame::Array(result.into())
-    }
+    let now_ms = db.now_ms();
+    srandmember_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
 // SSCAN key cursor [MATCH pattern] [COUNT count]
 // ---------------------------------------------------------------------------
 
-/// SSCAN command handler: incrementally iterate set members.
+/// SSCAN key cursor [MATCH pattern] [COUNT count] -- iterate members.
+///
+/// Reads through the shared-borrow implementation so the set's compact
+/// encoding survives the read (moon#832 -- see the block above).
 pub fn sscan(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() < 2 {
-        return err_wrong_args("SSCAN");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("SSCAN"),
-    };
-
-    // Parse cursor
-    let cursor: usize = match extract_bytes(&args[1])
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .and_then(|s| s.parse().ok())
-    {
-        Some(c) => c,
-        None => {
-            return Frame::Error(Bytes::from_static(b"ERR invalid cursor"));
-        }
-    };
-
-    // One parser for the whole family — see `command::scan_options`.
-    let opts = match crate::command::scan_options::parse_scan_options(
-        crate::command::scan_options::ScanKind::Set,
-        &args[2..],
-    ) {
-        Ok(o) => o,
-        Err(e) => return e,
-    };
-    let match_pattern = opts.pattern;
-    let count = opts.count;
-
-    // Get the set
-    let members: Vec<Bytes> = match db.get_set(key) {
-        Ok(Some(set)) => {
-            let mut v: Vec<Bytes> = set.iter().cloned().collect();
-            v.sort(); // Deterministic ordering
-            v
-        }
-        Ok(None) => vec![],
-        Err(e) => return e,
-    };
-
-    let total = members.len();
-    let mut results = Vec::new();
-    let mut pos = cursor;
-
-    let mut checked = 0;
-    while pos < total && checked < count {
-        let member = &members[pos];
-        pos += 1;
-        checked += 1;
-
-        if let Some(pattern) = match_pattern {
-            if !glob_match(pattern, member) {
-                continue;
-            }
-        }
-
-        results.push(Frame::BulkString(member.clone()));
-    }
-
-    let next_cursor = if pos >= total {
-        Bytes::from_static(b"0")
-    } else {
-        Bytes::from(pos.to_string())
-    };
-
-    Frame::Array(framevec![
-        Frame::BulkString(next_cursor),
-        Frame::Array(results.into()),
-    ])
+    let now_ms = db.now_ms();
+    sscan_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -748,82 +491,13 @@ pub fn sscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 // SINTERCARD numkeys key [key ...] [LIMIT limit]
 // ---------------------------------------------------------------------------
 
-/// SINTERCARD numkeys key [key ...] [LIMIT limit]
+/// SINTERCARD numkeys key [key ...] [LIMIT limit] -- size of the intersection.
+///
+/// Reads through the shared-borrow implementation so the set's compact
+/// encoding survives the read (moon#832 -- see the block above).
 pub fn sintercard(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() < 2 {
-        return err_wrong_args("SINTERCARD");
-    }
-    let numkeys = match parse_int(&args[0]) {
-        Some(n) if n > 0 => n as usize,
-        _ => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR numkeys can't be non-positive value",
-            ));
-        }
-    };
-    if args.len() < 1 + numkeys {
-        return err_wrong_args("SINTERCARD");
-    }
-
-    let mut limit: usize = 0;
-    let remaining = &args[1 + numkeys..];
-    if remaining.len() >= 2 {
-        let kw = match extract_bytes(&remaining[0]) {
-            Some(b) => b,
-            None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
-        };
-        if kw.eq_ignore_ascii_case(b"LIMIT") {
-            match parse_int(&remaining[1]) {
-                Some(l) if l >= 0 => limit = l as usize,
-                _ => {
-                    return Frame::Error(Bytes::from_static(b"ERR LIMIT can't be negative"));
-                }
-            }
-        } else {
-            return Frame::Error(Bytes::from_static(b"ERR syntax error"));
-        }
-    } else if !remaining.is_empty() {
-        return Frame::Error(Bytes::from_static(b"ERR syntax error"));
-    }
-
-    let key_frames = &args[1..1 + numkeys];
-    let keys: Vec<&Bytes> = key_frames.iter().filter_map(extract_bytes).collect();
-    if keys.len() != numkeys {
-        return err_wrong_args("SINTERCARD");
-    }
-
-    let sets = match collect_sets(db, &keys) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    let mut concrete: Vec<HashSet<Bytes>> = Vec::new();
-    for s in sets {
-        match s {
-            Some(set) => concrete.push(set),
-            None => return Frame::Integer(0),
-        }
-    }
-
-    if concrete.is_empty() {
-        return Frame::Integer(0);
-    }
-
-    concrete.sort_by_key(|s| s.len());
-    let smallest = &concrete[0];
-    let rest = &concrete[1..];
-
-    let mut count: usize = 0;
-    for member in smallest {
-        if rest.iter().all(|s| s.contains(member)) {
-            count += 1;
-            if limit > 0 && count >= limit {
-                break;
-            }
-        }
-    }
-
-    Frame::Integer(count as i64)
+    let now_ms = db.now_ms();
+    sintercard_readonly(db, args, now_ms)
 }
 
 /// SINTERCARD readonly path
