@@ -77,6 +77,126 @@ fn test_inline_get_hit() {
     assert_eq!(&write_buf[..], b"$3\r\nbar\r\n");
 }
 
+/// The owner's inline GET is a READ, so it must take the SHARED guard on its
+/// own database — the guard the batch path's `dispatch_read` already takes.
+///
+/// Under the exclusive guard this path used to take, a foreign shard serving
+/// one of this shard's keys through `try_foreign_db_read` (the L4 fast path)
+/// declined for the length of the hold and parked on SPSC instead; and, the
+/// other way round, the owner's `write()` waited behind any foreign reader
+/// already inside. This pins the second half, which is the deterministic one:
+/// a reader holds the shared guard and the inline GET must answer without
+/// waiting for it. Red on the exclusive guard: `set.write(0)` blocks until
+/// the holder's 5 s timeout lets go, and `waited` comes back at ~5 s.
+#[test]
+fn test_inline_get_does_not_wait_behind_a_shared_reader() {
+    let _serial = inline_test_lock();
+    let dbs = make_dbs();
+    crate::shard::slice::with_shard_db(0, |db| {
+        db.set(b"foo", Entry::new_string(Bytes::from_static(b"bar")));
+    });
+    let set = crate::shard::slice::with_shard(|s| std::sync::Arc::clone(&s.databases));
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        // A foreign reader: shared guard on db 0, held until released — or
+        // for 5 s, which is what an exclusive-guard GET ends up waiting.
+        let _guard = set.read(0);
+        let _ = held_tx.send(());
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+    });
+    held_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("holder reported back");
+
+    let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"[..]);
+    let mut write_buf = BytesMut::new();
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
+    let rt_config = make_rt_config();
+    let started = std::time::Instant::now();
+    let result = try_inline_dispatch(
+        &mut read_buf,
+        &mut write_buf,
+        &dbs,
+        0,
+        0,
+        &aof_pool,
+        &None,
+        0,
+        1,
+        true,  // can_inline_reads
+        false, // can_inline_writes
+        false, // resp3: a RESP2 connection (moon#522)
+        &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
+    );
+    let waited = started.elapsed();
+    let _ = release_tx.send(());
+    holder.join().expect("holder thread");
+
+    assert_eq!(result, 1);
+    assert_eq!(&write_buf[..], b"$3\r\nbar\r\n");
+    assert!(
+        waited < std::time::Duration::from_secs(2),
+        "inline GET waited {waited:?} behind a shared reader — it took the EXCLUSIVE guard"
+    );
+}
+
+/// #459 twin of the shared-guard test above. The one thing the inline GET
+/// still needs `&mut Database` for is pulling a MID-SPILL key back from the
+/// in-flight plane, so the shared-guard path must notice a non-empty
+/// in-flight set and retake the exclusive guard — or a key that `EXISTS`
+/// reports as present answers `$-1` here. Green on both guards; it exists so
+/// the exclusive retake cannot be dropped silently.
+#[test]
+fn test_inline_get_answers_a_mid_spill_key() {
+    let _serial = inline_test_lock();
+    let dbs = make_dbs();
+    crate::shard::slice::with_shard_db(0, |db| {
+        // In flight only: absent from hot RAM, payload pinned by the record.
+        db.spill_inflight_mark(
+            Bytes::from_static(b"foo"),
+            crate::storage::db::PendingSpill {
+                req_id: 1,
+                value_type: crate::persistence::kv_page::ValueType::String,
+                value_bytes: Bytes::from_static(b"bar"),
+                ttl_ms: None,
+            },
+        );
+        assert!(!db.is_hot(b"foo"), "fixture: the key must start mid-spill");
+    });
+    let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"[..]);
+    let mut write_buf = BytesMut::new();
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
+    let rt_config = make_rt_config();
+    let result = try_inline_dispatch(
+        &mut read_buf,
+        &mut write_buf,
+        &dbs,
+        0,
+        0,
+        &aof_pool,
+        &None,
+        0,
+        1,
+        true,  // can_inline_reads
+        false, // can_inline_writes
+        false, // resp3: a RESP2 connection (moon#522)
+        &rt_config,
+        false, // spill_sender_active (moon#660): no spill thread in unit tests
+    );
+    assert_eq!(result, 1);
+    assert_eq!(
+        &write_buf[..],
+        b"$3\r\nbar\r\n",
+        "a mid-spill key must be answered inline, not reported missing"
+    );
+    assert!(
+        crate::shard::slice::with_shard_db_read(0, |db| db.is_hot(b"foo")),
+        "the inline GET must have promoted the in-flight payload back to hot RAM"
+    );
+}
+
 /// Byte-parity guard for the inline GET hit across the `CompactValue` SSO
 /// boundary (12B inline / 13B heap) and up to a large value. The reply must be
 /// exactly `$<len>\r\n<bytes>\r\n` for every size — this pins the response

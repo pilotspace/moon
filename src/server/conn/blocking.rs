@@ -812,7 +812,7 @@ where
     let mut peer_scratch: Vec<u8> = Vec::new();
 
     // --- Non-blocking fast path: try to get data immediately ---
-    // Use with_shard_db (thread-local ShardSlice) — no RwLock guard needed.
+    // Exclusive guard on purpose: `immediate_scan` POPS when it finds data.
     {
         let immediate_result = crate::shard::slice::with_shard_db(selected_db, |db| {
             immediate_scan(cmd, args, &keys, db, shard_id, num_shards)
@@ -2512,17 +2512,19 @@ pub(crate) fn try_inline_dispatch(
             // Absent locally: consult the cold tier below (`cold_loc` carries where).
             Miss,
         }
-        let (outcome, cold_loc) = crate::shard::slice::with_shard_db(selected_db, |db| {
+        // The lookup itself, `&Database` only. Everything it calls is a
+        // shared-guard read — the hot-key sketch is atomics, `get_if_alive`
+        // neither expires nor promotes nor touches LRU, and the cold-index
+        // probe is a map lookup — so the OWNER takes the SHARED guard for its
+        // own GET below, the same guard the batch path's `dispatch_read`
+        // takes. Under the exclusive guard this path used to take, every
+        // foreign shard's `try_foreign_db_read` of this database declined for
+        // the length of the hold and parked on SPSC instead, and the owner
+        // itself waited behind any foreign reader already inside.
+        let mut serve = |db: &crate::storage::Database| {
             if db.hot_keys().tick() {
                 db.hot_keys().observe(key_bytes);
             }
-            // #459: a key mid-spill is in neither hot nor cold, so the miss
-            // arm below would frame `$-1` inline for a key that exists and
-            // that EXISTS reports as present. Pull it back first — RAM only,
-            // no disk read — so the hot lookup answers it. Costs one
-            // `is_empty()` load per inline GET on a server that is not
-            // spilling, which is every server without --disk-offload.
-            db.promote_inflight_if_present(key_bytes, now_ms);
             match db.get_if_alive(key_bytes, now_ms) {
                 Some(entry) => match entry.value.as_bytes() {
                     Some(val) => {
@@ -2553,7 +2555,27 @@ pub(crate) fn try_inline_dispatch(
                     (GetOutcome::Miss, loc)
                 }
             }
+        };
+        let served = crate::shard::slice::with_shard_db_read(selected_db, |db| {
+            // #459: a key mid-spill is in neither hot nor cold, so the miss
+            // arm would frame `$-1` inline for a key that exists and that
+            // EXISTS reports as present. Pulling it back (RAM only, no disk
+            // read) mutates, so it is the one case that still needs the
+            // exclusive guard — retaken below. Costs one `is_empty()` load
+            // per inline GET on a server that is not spilling, which is
+            // every server without --disk-offload.
+            if !db.spill_inflight_is_empty() {
+                return None;
+            }
+            Some(serve(db))
         });
+        let (outcome, cold_loc) = match served {
+            Some(served) => served,
+            None => crate::shard::slice::with_shard_db(selected_db, |db| {
+                db.promote_inflight_if_present(key_bytes, now_ms);
+                serve(&*db)
+            }),
+        };
         match outcome {
             GetOutcome::Handled => {
                 let _ = read_buf.split_to(consumed);
