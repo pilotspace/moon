@@ -272,6 +272,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gate_is_skipped_with_spill_sender_when_no_limit_is_configured` on a
   test-only `evict_to_budget` entry probe; `tests/oom_bypass_closure.rs`
   still enforces the publish contract the predicate relies on.
+- **`perf(shard)`: the owner's inline GET takes the SHARED guard on its own
+  database.** `try_inline_dispatch`'s GET ran under `with_shard_db` — since the
+  L4 plane that is `ShardDbSet::write`, an exclusive guard for a lookup that
+  mutates nothing (`get_if_alive` neither expires nor promotes nor touches LRU).
+  While it was held, every foreign shard's `try_foreign_db_read` of that database
+  declined and parked on SPSC, and the owner itself waited behind any foreign
+  reader already inside. The lookup now runs under `with_shard_db_read`; the one
+  mutating case (a key mid-spill, #459) is detected under the shared guard and
+  retaken exclusive, so it still answers. Pinned by
+  `test_inline_get_does_not_wait_behind_a_shared_reader` and
+  `test_inline_get_answers_a_mid_spill_key`.
+- **`perf(shard)`: the per-batch clock refresh probes under a shared guard and
+  takes the exclusive guard only when the clock moved.** The monoio handler
+  refreshed the database clock through `with_shard_db` once or twice per batch —
+  per command at p=1 — for a value that changes once per millisecond.
+  `slice::refresh_db_clock` replaces both sites. Pinned by
+  `refresh_db_clock_takes_no_exclusive_guard_when_the_clock_is_unchanged`.
 
 ## [0.8.9] — 2026-09-04
 

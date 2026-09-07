@@ -559,6 +559,28 @@ pub fn with_shard_db_read<R>(db_index: usize, f: impl FnOnce(&Database) -> R) ->
     }
 }
 
+/// Refresh `db_index`'s cached clock from `clock`, taking the EXCLUSIVE guard
+/// only when the clock has actually moved.
+///
+/// Every batch refreshes the database clock before dispatch. The clock ticks
+/// once per millisecond while a saturated shard starts tens of batches per
+/// millisecond, so the refresh is a no-op almost every time — yet it took the
+/// exclusive guard for it, and for the length of that hold (and of the wait
+/// behind any foreign reader already inside) every foreign
+/// `try_foreign_db_read` of this database declined and parked on SPSC. A
+/// shared probe answers the common case; the exclusive guard is taken only
+/// on a millisecond boundary. If the clock ticks between the probe and the
+/// refresh, the refresh simply reads the newer value.
+#[inline]
+pub fn refresh_db_clock(db_index: usize, clock: &crate::storage::entry::CachedClock) {
+    let secs = clock.secs();
+    let ms = clock.ms();
+    let fresh = with_shard_db_read(db_index, |db| db.now() == secs && db.now_ms() == ms);
+    if !fresh {
+        with_shard_db(db_index, |db| db.refresh_now_from_cache(clock));
+    }
+}
+
 /// The foreign fast path: serve a read of `shard`'s database on THIS thread.
 ///
 /// Returns `None` — meaning the caller must fall through to the SPSC path it
@@ -942,6 +964,59 @@ mod tests {
                 Some(true),
                 "a foreign read must observe the foreign write; if this is \
                  Some(false) the write landed in a different Database"
+            );
+        })
+        .join()
+        .expect("probe thread");
+    }
+
+    /// The per-batch clock refresh is a no-op in every batch but one per
+    /// millisecond, so it must not take the EXCLUSIVE guard for the no-op: a
+    /// foreign reader inside would make the owner wait, and every other
+    /// foreign reader would decline and park for the length of the hold. Red
+    /// on the exclusive refresh: the second call blocks behind the holder
+    /// for ~5 s. Runs on a PRIVATE two-database slice, not the process-wide
+    /// registry: sibling tests hold registry databases for seconds at a time,
+    /// and the registry's shape is whichever install won the `OnceLock`.
+    #[test]
+    fn refresh_db_clock_takes_no_exclusive_guard_when_the_clock_is_unchanged() {
+        std::thread::spawn(|| {
+            reset_test_shard(ShardSlice::new(make_init(0, 2)));
+            let registered = with_shard(|s| Arc::clone(&s.databases));
+            let clock = crate::storage::entry::CachedClock::new();
+            clock.update();
+            // First call: the database was stamped by its own constructor, so
+            // this one is allowed to (and may need to) take the exclusive guard.
+            refresh_db_clock(1, &clock);
+            assert!(
+                with_shard_db_read(1, |db| db.now() == clock.secs()
+                    && db.now_ms() == clock.ms()),
+                "the refresh must land the clock's value in the database"
+            );
+
+            // A foreign reader holds db 1 SHARED until released, or for 5 s.
+            let held = Arc::clone(&registered);
+            let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                let _guard = held.read(1);
+                let _ = held_tx.send(());
+                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            });
+            held_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("holder reported back");
+
+            let started = std::time::Instant::now();
+            refresh_db_clock(1, &clock);
+            let waited = started.elapsed();
+            let _ = release_tx.send(());
+            holder.join().expect("holder thread");
+
+            assert!(
+                waited < std::time::Duration::from_secs(2),
+                "an unchanged-clock refresh waited {waited:?} behind a shared reader — \
+                 it took the EXCLUSIVE guard"
             );
         })
         .join()
