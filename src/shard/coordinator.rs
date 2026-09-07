@@ -1843,7 +1843,7 @@ pub async fn coordinate_script(
     script_acl: crate::acl::ScriptAcl,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
-) -> (Frame, Option<crate::scripting::pending_flush::PendingFlush>) {
+) -> RoutedScriptReply {
     let (reply_tx, reply_rx) = channel::oneshot();
     let msg = ShardMessage::Execute {
         db_index,
@@ -1858,20 +1858,14 @@ pub async fn coordinate_script(
     match spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await {
         crate::shard::dispatch::PushOutcome::Pushed => {}
         crate::shard::dispatch::PushOutcome::Backpressure => {
-            return (
-                Frame::Error(Bytes::from_static(
-                    b"ERR shard owning the script's keys is not draining; script not executed",
-                )),
-                None,
-            );
+            return RoutedScriptReply::not_run(Frame::Error(Bytes::from_static(
+                b"ERR shard owning the script's keys is not draining; script not executed",
+            )));
         }
         crate::shard::dispatch::PushOutcome::Cancelled => {
-            return (
-                Frame::Error(Bytes::from_static(
-                    b"ERR shutting down; script not executed",
-                )),
-                None,
-            );
+            return RoutedScriptReply::not_run(Frame::Error(Bytes::from_static(
+                b"ERR shutting down; script not executed",
+            )));
         }
     }
     // Past this point the script IS in the target's queue, so no failure here
@@ -1879,7 +1873,11 @@ pub async fn coordinate_script(
     // otherwise invites a client to re-send a non-idempotent script that
     // already applied its writes.
     match recv_reply_bounded_reason(reply_rx).await {
-        Ok(reply) => (reply.frame, reply.script_flush),
+        Ok(reply) => RoutedScriptReply {
+            frame: reply.frame,
+            pending_flush: reply.script_flush,
+            wrote: reply.script_wrote,
+        },
         Err(ReplyFailure::TimedOut) => {
             // Mirrors the handler reply paths, which already record this;
             // without it a wedged owner shard is invisible in metrics.
@@ -1888,19 +1886,40 @@ pub async fn coordinate_script(
             // none: we never heard back, so there is nothing to complete and
             // nothing that could be completed correctly. The reply already
             // says the execution status is unknown.
-            (
-                Frame::Error(Bytes::from_static(
-                    b"ERR timeout waiting for the shard owning the script's keys; script execution status is unknown",
-                )),
-                None,
-            )
+            RoutedScriptReply::not_run(Frame::Error(Bytes::from_static(
+                b"ERR timeout waiting for the shard owning the script's keys; script execution status is unknown",
+            )))
         }
-        Err(ReplyFailure::Closed) => (
-            Frame::Error(Bytes::from_static(
-                b"ERR cross-shard reply channel closed; script execution status is unknown",
-            )),
-            None,
-        ),
+        Err(ReplyFailure::Closed) => RoutedScriptReply::not_run(Frame::Error(Bytes::from_static(
+            b"ERR cross-shard reply channel closed; script execution status is unknown",
+        ))),
+    }
+}
+
+/// What [`coordinate_script`] hands back to the originator.
+pub struct RoutedScriptReply {
+    /// The owner shard's reply, verbatim.
+    pub frame: Frame,
+    /// moon#705: the keyless flush the script issued, still owed to the
+    /// OTHER shards.
+    pub pending_flush: Option<crate::scripting::pending_flush::PendingFlush>,
+    /// moon#831: the script issued a `WRITE`-flagged `redis.call` on the
+    /// owner. Its effect records sit fire-and-forget in the OWNER's AOF
+    /// writer; under `appendfsync always` the originator must
+    /// `fsync_barrier(owner)` before it serializes `frame`.
+    pub wrote: bool,
+}
+
+impl RoutedScriptReply {
+    /// A reply for a script that never ran (or whose run is unknown): no
+    /// flush to complete and nothing durable to confirm — the frame is an
+    /// error either way.
+    fn not_run(frame: Frame) -> Self {
+        Self {
+            frame,
+            pending_flush: None,
+            wrote: false,
+        }
     }
 }
 

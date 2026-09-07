@@ -563,6 +563,9 @@ pub(crate) fn handle_shard_message_shared(
                         // moon#705: the flush this script issued, reported so
                         // the ORIGINATOR can reach the other shards.
                         script_flush: pending_flush,
+                        // moon#831: and whether it wrote, so the originator
+                        // barriers THIS shard's writer before replying.
+                        script_wrote: crate::scripting::bridge::take_script_had_write(),
                     });
                     return;
                 }
@@ -669,6 +672,8 @@ pub(crate) fn handle_shard_message_shared(
                         // moon#705: the flush this script issued, reported so
                         // the ORIGINATOR can reach the other shards.
                         script_flush: pending_flush,
+                        // moon#831: see the EVAL arm above.
+                        script_wrote: crate::scripting::bridge::take_script_had_write(),
                     });
                     return;
                 }

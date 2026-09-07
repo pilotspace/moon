@@ -1963,7 +1963,7 @@ pub(crate) async fn route_script_elsewhere(
             parts.push(Frame::BulkString(Bytes::copy_from_slice(cmd)));
             parts.extend_from_slice(cmd_args);
             let command = std::sync::Arc::new(Frame::Array(parts.into()));
-            let (reply, pending_flush) = crate::shard::coordinator::coordinate_script(
+            let routed = crate::shard::coordinator::coordinate_script(
                 command,
                 target,
                 ctx.shard_id,
@@ -1977,6 +1977,12 @@ pub(crate) async fn route_script_elsewhere(
                 &ctx.spsc_notifiers,
             )
             .await;
+            let pending_flush = routed.pending_flush;
+            // moon#831: the script's effect records were enqueued
+            // fire-and-forget on the OWNER's AOF writer. Confirm them on
+            // that writer before this reply can be serialized — the
+            // connection-local batch barrier covers `ctx.shard_id` only.
+            let reply = confirm_routed_script_write(ctx, target, routed.wrote, routed.frame).await;
             // The target's reply is returned VERBATIM. There is deliberately
             // no repair leg here — see `fanout_to_other_shards` for why
             // "target says NOSCRIPT / Function not found" is not evidence of a
@@ -3355,6 +3361,55 @@ mod as_of_tests {
     }
 }
 
+/// moon#831: does the script that JUST ran on this thread owe the batch-end
+/// `fsync_barrier` (`resolve_local_leg_barrier`) before its reply is sent?
+///
+/// `wrote` is `bridge::take_script_had_write()`, which the caller MUST read
+/// immediately after the VM returns and BEFORE any `.await` — the flag is a
+/// thread-local, and on a thread-per-core runtime another connection's
+/// script can run on this thread during any yield.
+///
+/// Same convention as every other local-leg write: only a successful reply
+/// joins the barrier set, so a script's own error is never overwritten by a
+/// barrier failure. A script that wrote and then errored still has its
+/// effect records in the writer channel; they are covered by the next
+/// barrier on this shard or by the writer's own cadence, exactly like a
+/// failed ordinary write's bystander records.
+#[inline]
+pub(crate) fn script_write_joins_barrier(wrote: bool, response: &Frame) -> bool {
+    wrote && !matches!(response, Frame::Error(_))
+}
+
+/// moon#831: durability leg for a script that ran on the shard OWNING its
+/// keys (`route_script_elsewhere`). The owner's message loop is synchronous
+/// and cannot await its writer, so the originator — in async context —
+/// issues the barrier on the OWNER's writer here, the same division of
+/// labour `coordinate_multi_key`'s remote legs use (`fsync_barrier(target)`
+/// after the reply is collected).
+///
+/// A no-op when the script wrote nothing, when its reply is already an
+/// error, or when AOF is off; `fsync_barrier` itself is a no-op under
+/// `everysec`/`no`. On barrier failure the reply becomes `AOF_FSYNC_ERR`:
+/// the write is applied on the owner but its durability is unconfirmed,
+/// and the client must not be told otherwise.
+pub(crate) async fn confirm_routed_script_write(
+    ctx: &super::core::ConnectionContext,
+    owner: usize,
+    wrote: bool,
+    reply: Frame,
+) -> Frame {
+    if !script_write_joins_barrier(wrote, &reply) {
+        return reply;
+    }
+    let Some(ref pool) = ctx.aof_pool else {
+        return reply;
+    };
+    if pool.fsync_barrier(owner).await.is_err() {
+        return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
+    }
+    reply
+}
+
 /// Resolve the pending v3-5 local-leg group-commit barrier, if any.
 ///
 /// Coordinator local-leg writes (MSET/MSETNX/BITOP/COPY/DEL/UNLINK legs owned
@@ -3369,6 +3424,9 @@ mod as_of_tests {
 ///
 /// Always drains `idxs`. On barrier failure every recorded response is
 /// overwritten with `AOF_FSYNC_ERR` — never a false `+OK`.
+///
+/// moon#831: script arms (`EVAL`/`EVALSHA`/`FCALL`) that wrote join the same
+/// set — see [`script_write_joins_barrier`].
 pub async fn resolve_local_leg_barrier(
     aof_pool: &Option<Arc<crate::persistence::aof::AofWriterPool>>,
     shard_id: usize,
