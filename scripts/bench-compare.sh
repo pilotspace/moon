@@ -89,7 +89,9 @@ bench() {
     shift
     local rflag=()
     [[ -n "$KEYSPACE" ]] && rflag=(-r "$KEYSPACE")   # large-scale: spread ops across a real keyspace
-    redis-benchmark -p "$port" -n "$REQUESTS" -c "$CLIENTS" -q "${rflag[@]}" "$@" 2>/dev/null | parse_rps
+    # `${arr[@]+"${arr[@]}"}`: an EMPTY array is "unbound" to `set -u` on bash < 4.4
+    # (macOS ships 3.2), which aborted the first bench() call — the #634 class.
+    redis-benchmark -p "$port" -n "$REQUESTS" -c "$CLIENTS" -q ${rflag[@]+"${rflag[@]}"} "$@" 2>/dev/null | parse_rps
 }
 
 ratio_of() {

@@ -373,6 +373,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `clippy::manual_contains` at `src/io/fd_table.rs:153`, both in
   Linux-only files, so a macOS run was green and the hosted Check job (which
   runs clippy without `--all-targets`) never saw them. Two one-line fixes.
+- **`bench`: `scripts/bench-compare.sh` aborted its first `bench()` call on
+  macOS** — `rflag[@]: unbound variable`: an empty array is "unbound" to
+  `set -u` on bash < 4.4, and macOS ships 3.2 (the #634 class). The `-r`
+  expansion is now `${rflag[@]+"${rflag[@]}"}`.
 
 ## [0.8.9] — 2026-09-04
 
