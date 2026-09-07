@@ -368,11 +368,7 @@ fn validate_count(
 /// reloaded from disk lands in exactly the encoding it would have had if the
 /// same commands had been replayed live.
 pub(crate) fn compact_after_decode(v: RedisValue) -> RedisValue {
-    use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
-
-    /// Maximum intset entries before a set uses a richer encoding. Mirrors
-    /// `INTSET_MAX_ENTRIES` in the set command layer.
-    const INTSET_MAX: usize = 512;
+    use crate::storage::db::{INTSET_MAX_ENTRIES, LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
 
     let fits = |b: &[u8]| b.len() <= LISTPACK_MAX_ELEMENT_SIZE;
 
@@ -411,7 +407,7 @@ pub(crate) fn compact_after_decode(v: RedisValue) -> RedisValue {
         // Integers first, matching the command layer's precedence: an
         // all-integer set is an intset regardless of how few members it has.
         RedisValue::Set(set) => {
-            let all_ints: Option<Vec<i64>> = if set.len() <= INTSET_MAX {
+            let all_ints: Option<Vec<i64>> = if set.len() <= INTSET_MAX_ENTRIES {
                 set.iter()
                     .map(|m| std::str::from_utf8(m).ok()?.parse::<i64>().ok())
                     .collect()
@@ -435,8 +431,16 @@ pub(crate) fn compact_after_decode(v: RedisValue) -> RedisValue {
             RedisValue::Set(set)
         }
 
-        // Everything else — including zsets, which have no reachable compact
-        // encoding yet (moon#787) — passes through untouched.
+        // Everything else passes through untouched. Zsets are excluded ON
+        // PURPOSE, not for lack of a threshold: `SortedSetKind::project_mut` /
+        // `project_ref` (`db_kind.rs`) accept only `SortedSetBPTree`, and
+        // `SortedSetKind::upgrade` deliberately does not convert
+        // `SortedSetListpack`. A zset compacted here would answer WRONGTYPE to
+        // every zset command on the mutable dispatch path -- ZADD included --
+        // after the very restart that compacted it. The zset arm belongs with
+        // the write-side upgrade (moon#787, the ZADD-listpack change), and
+        // `small_zset_is_left_in_full_form_until_the_write_path_accepts_a_listpack`
+        // below is the tripwire that makes lifting the exclusion a decision.
         other => other,
     }
 }
@@ -1082,7 +1086,7 @@ mod tests {
 
     #[test]
     fn small_string_set_round_trips_back_to_listpack() {
-        let set: std::collections::HashSet<Bytes> =
+        let set: crate::storage::entry::SetValue =
             (0..5).map(|i| Bytes::from(format!("m{i}"))).collect();
         let out = round_trip(&RedisValueRef::Set(&set));
         assert_eq!(out.encoding_name(), "listpack");
@@ -1100,7 +1104,7 @@ mod tests {
 
     #[test]
     fn all_integer_set_round_trips_back_to_intset() {
-        let set: std::collections::HashSet<Bytes> =
+        let set: crate::storage::entry::SetValue =
             (0..5).map(|i| Bytes::from(format!("{i}"))).collect();
         let out = round_trip(&RedisValueRef::Set(&set));
         assert_eq!(
@@ -1150,9 +1154,46 @@ mod tests {
         );
     }
 
+    /// Zsets are deliberately NOT compacted on reload -- and this pins it so
+    /// lifting the exclusion is a visible decision rather than an accident.
+    ///
+    /// On main, `SortedSetKind::project_mut` / `project_ref`
+    /// (`src/storage/db_kind.rs`) accept only `SortedSetBPTree`, and
+    /// `SortedSetKind::upgrade` explicitly leaves `SortedSetListpack` alone.
+    /// A zset compacted here would therefore answer WRONGTYPE to every zset
+    /// command on the mutable dispatch path -- ZADD included -- after the very
+    /// restart that compacted it. `SortedSetListpack` is unreachable from every
+    /// load path today (`value_codec`, `redis_rdb`, DUMP/RESTORE all rebuild
+    /// the full form), so this arm would CREATE that hazard, not inherit it.
+    ///
+    /// The zset arm must land together with the write-side upgrade arm
+    /// (moon#787 -- the ZADD-listpack change); that is the commit at which this
+    /// assertion flips to `"listpack"`. Until then the 20.5x zset memory win is
+    /// restart-transient, and this test says so out loud.
+    #[test]
+    fn small_zset_is_left_in_full_form_until_the_write_path_accepts_a_listpack() {
+        let mut members = HashMap::new();
+        let mut tree = BPTree::new();
+        for i in 0..5 {
+            let m = Bytes::from(format!("m{i}"));
+            members.insert(m.clone(), i as f64);
+            tree.insert(OrderedFloat(i as f64), m);
+        }
+        let out = round_trip(&RedisValueRef::SortedSetBPTree {
+            members: &members,
+            tree: &tree,
+        });
+        assert_eq!(
+            out.encoding_name(),
+            "skiplist",
+            "a reloaded zset must stay in the full form while the mutable zset \
+             path rejects SortedSetListpack -- see SortedSetKind::project_mut"
+        );
+    }
+
     #[test]
     fn set_with_an_oversized_member_stays_a_hashtable() {
-        let mut set = std::collections::HashSet::new();
+        let mut set = crate::storage::entry::SetValue::new();
         set.insert(Bytes::from_static(b"small"));
         set.insert(Bytes::from(vec![
             b'x';

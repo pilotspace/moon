@@ -17,8 +17,11 @@ pub const LISTPACK_MAX_ENTRIES: usize = 128;
 /// Maximum element size in bytes before upgrading a listpack to full encoding.
 pub const LISTPACK_MAX_ELEMENT_SIZE: usize = 64;
 /// Maximum number of entries in an intset before upgrading to full encoding.
-#[allow(dead_code)]
-const INTSET_MAX_ENTRIES: usize = 512;
+///
+/// The single definition: the `SADD` path and the RDB decode-side
+/// re-derivation (`value_codec::compact_after_decode`) both read it, so a
+/// value reloaded from disk lands in the encoding a live `SADD` would give it.
+pub const INTSET_MAX_ENTRIES: usize = 512;
 
 /// Estimate per-entry overhead: key length + value memory + struct overhead.
 fn entry_overhead(key: &[u8], entry: &Entry) -> usize {

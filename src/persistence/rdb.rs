@@ -1319,7 +1319,7 @@ mod tests {
         // one would reload as an intset).
         match entry.value.as_redis_value() {
             RedisValueRef::SetListpack(lp) => {
-                let set = lp.to_hash_set();
+                let set = lp.to_set_value();
                 assert_eq!(set.len(), 3);
                 assert!(set.contains(&Bytes::from_static(b"x")));
                 assert!(set.contains(&Bytes::from_static(b"y")));

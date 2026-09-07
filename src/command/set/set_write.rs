@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::storage::db::{set_member_cost, set_table_bytes};
+use crate::storage::db::{INTSET_MAX_ENTRIES, set_member_cost, set_table_bytes};
 use crate::storage::entry::Entry;
 
 use super::{collect_sets, parse_int};
@@ -14,9 +14,6 @@ use crate::command::helpers::{err_wrong_args, extract_bytes};
 // ---------------------------------------------------------------------------
 // SADD key member [member ...]
 // ---------------------------------------------------------------------------
-
-/// Maximum intset entries before upgrading to full HashSet encoding.
-const INTSET_MAX_ENTRIES: usize = 512;
 
 /// Try to parse a byte slice as an i64.
 fn try_parse_i64(b: &[u8]) -> Option<i64> {

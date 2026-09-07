@@ -12,9 +12,23 @@
 //! case: the SADD-listpack win (978.2 -> 404.5 B/key on Linux) reverts entirely
 //! after one restart. This test is the regression gate.
 //!
-//! Run:
-//!   cargo build --release
-//!   cargo test --release --test restart_preserves_compact_encoding -- --ignored
+//! It is NOT `#[ignore]`d. Every `--ignored` invocation in `.github/workflows/`
+//! names a specific `--test` target, so an ignored test here would never run
+//! anywhere -- and a gate that cannot fire is worse than no gate. It spawns
+//! one server twice on a reserved port in a unique `--dir`, like the ~60 other
+//! un-ignored suites under `tests/` that do the same, so it runs in every leg
+//! that runs `cargo nextest run` / `cargo test`: the hosted tokio Check leg,
+//! the self-hosted monoio leg, and both VM suites of `scripts/ci-local.sh`.
+//!
+//! Probe choice (moon#832): `OBJECT ENCODING` reads `entry.value` through
+//! `Database::get` / `get_if_alive_any_plane` on both dispatch paths -- neither
+//! goes through `get_promoted`, so asking about the encoding cannot itself
+//! flatten it. A probe routed through a `get_promoted` accessor (any mutable
+//! container read) would upgrade the key on the first call and this test
+//! would be measuring #832, not the restart.
+//!
+//! Run alone:
+//!   cargo test --release --test restart_preserves_compact_encoding
 
 mod common;
 
@@ -57,8 +71,50 @@ fn encoding(port: u16, key: &str) -> String {
         .to_string()
 }
 
+/// The AOF manifest's `seq` line. A completed rewrite publishes a new
+/// `moon.aof.<seq>.base.rdb` and bumps this; nothing else does.
+fn manifest_seq(dir: &std::path::Path) -> Option<u64> {
+    let text = std::fs::read_to_string(dir.join("appendonlydir").join("moon.aof.manifest")).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("seq ")?.trim().parse().ok())
+}
+
+/// Wait until the rewrite kicked off by `BGREWRITEAOF` has published its new
+/// base. `BGREWRITEAOF` acks at enqueue, and `INFO persistence` alone is not a
+/// completion signal: `aof_rewrite_in_progress:0` can be observed BEFORE the
+/// rewrite starts, and `aof_base_size` does not move when it finishes
+/// (measured: 66 before and after a rewrite that wrote a 3 KB base). The
+/// manifest `seq` advancing is what the loader itself trusts, so it is what
+/// this waits on. Panics with the last observation on timeout.
+fn wait_for_rewrite(port: u16, dir: &std::path::Path, seq_before: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut last = (None, String::new());
+    while std::time::Instant::now() < deadline {
+        let mut c = common::Conn::open(port);
+        let info = c.send(&["INFO", "persistence"]);
+        let seq = manifest_seq(dir);
+        let base_exists = seq.is_some_and(|s| {
+            dir.join("appendonlydir")
+                .join(format!("moon.aof.{s}.base.rdb"))
+                .exists()
+        });
+        if info.contains("aof_rewrite_in_progress:0")
+            && seq.is_some_and(|s| s > seq_before)
+            && base_exists
+        {
+            return;
+        }
+        last = (seq, info);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "BGREWRITEAOF did not publish a new base within 30s (manifest seq before {seq_before}, \
+         last seen {:?}); last INFO persistence:\n{}",
+        last.0, last.1
+    );
+}
+
 #[test]
-#[ignore = "spawns a real server and restarts it; run with --ignored"]
 fn compact_encodings_survive_a_restart() {
     let dir = common::unique_test_dir("restart-encoding");
     std::fs::create_dir_all(&dir).expect("create dir");
@@ -119,13 +175,21 @@ fn compact_encodings_survive_a_restart() {
         "precondition: a 200-field hash is a hashtable"
     );
 
-    // Flush to disk, then take the server down cleanly and bring it back on the
-    // same --dir. This is the exact sequence that used to flatten everything.
+    // Rewrite the AOF so the restart loads an RDB preamble -- the decode path
+    // under test -- rather than replaying the command log (which would rebuild
+    // every key live and prove nothing about reload). Then take the server
+    // down and bring it back on the same --dir: the exact sequence that used
+    // to flatten everything.
+    let seq_before = manifest_seq(&dir).unwrap_or(0);
     {
         let mut c = common::Conn::open(port);
-        c.send(&["BGREWRITEAOF"]);
+        let reply = c.send(&["BGREWRITEAOF"]);
+        assert!(
+            reply.contains("rewriting started") || reply.contains("scheduled"),
+            "BGREWRITEAOF was refused: {reply:?}"
+        );
     }
-    std::thread::sleep(Duration::from_secs(3));
+    wait_for_rewrite(port, &dir, seq_before);
     guard.kill_now();
     common::wait_for_port_down(port);
 
