@@ -1,17 +1,27 @@
 {
-  "rss": 83034112,
+  "platform": {
+    "os": "Linux",
+    "arch": "x86_64",
+    "profile": "debug",
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "cpu_count": 4,
+    "mem_total_kb": 16373452,
+    "runner_environment": "github-hosted",
+    "runner_name": "GitHub Actions 1000044950"
+  },
+  "rss": 144723968,
   "kinds": {
     "dashtable": {
-      "doctor": 144661544,
-      "prom": 144657903
+      "doctor": 96657735,
+      "prom": 96653601
     },
     "hnsw": {
-      "doctor": 600002,
-      "prom": 600000
+      "doctor": 1205862,
+      "prom": 1203052
     },
     "csr": {
-      "doctor": 54865,
-      "prom": 54864
+      "doctor": 50298,
+      "prom": 50304
     },
     "wal": {
       "doctor": 0,
@@ -27,7 +37,7 @@
     },
     "allocator_overhead": {
       "doctor": 0,
-      "prom": 0
+      "prom": 46612622
     }
   }
 }
