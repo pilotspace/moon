@@ -715,8 +715,15 @@ mod tests {
             let m = format!("member-{i:03}");
             sadd(&mut db, &[bs(b"s"), bs(m.as_bytes())]);
         }
+        // moon#787: 50 string members is a listpack, and the first SREM
+        // promotes it to the IndexSet form (moon#832: every non-SADD write
+        // takes the owned accessor), whose tables cost more than the whole
+        // listpack did. Snapshot AFTER that swing; the claim under test is
+        // that removals credit the ledger, not that promotion is free.
+        srem(&mut db, &[bs(b"s"), bs(b"member-000")]);
+        assert_eq!(encoding_of(&mut db, b"s"), "hashtable");
         let grown = db.estimated_memory();
-        for i in 0..49 {
+        for i in 1..49 {
             let m = format!("member-{i:03}");
             srem(&mut db, &[bs(b"s"), bs(m.as_bytes())]);
         }
@@ -741,6 +748,10 @@ mod tests {
             let m = format!("member-{i:03}");
             sadd(&mut db, &[bs(b"s"), bs(m.as_bytes())]);
         }
+        // moon#787 / moon#832: the first SPOP promotes the listpack to the
+        // IndexSet form and is charged for it; snapshot after that swing.
+        spop(&mut db, &[bs(b"s")]);
+        assert_eq!(encoding_of(&mut db, b"s"), "hashtable");
         let grown = db.estimated_memory();
         spop(&mut db, &[bs(b"s")]);
         let after = db.estimated_memory();
@@ -749,6 +760,7 @@ mod tests {
             "SPOP must credit the removed member: grown={grown} after={after}"
         );
     }
+
     // ── moon#832: a read on the MUTABLE path must not flatten the encoding ──
     //
     // Red on b04e8990: every one of these handlers reached the set through
@@ -761,12 +773,10 @@ mod tests {
     // These call the handlers DIRECTLY, which is what `command::dispatch`,
     // the MULTI/EXEC executor, the Lua bridge and `try_inline_dispatch` all
     // ultimately do -- so one assertion covers every mutable entry point.
-
-    fn encoding_of(db: &mut Database, key: &[u8]) -> &'static str {
-        db.get(key)
-            .map(|e| e.value.as_redis_value().encoding_name())
-            .unwrap_or("<missing>")
-    }
+    //
+    // These share the `encoding_of` probe defined with the #787 listpack
+    // tests below: it asks `OBJECT ENCODING`, which reads `entry.value`
+    // through `Database::get` and so cannot itself flatten the encoding.
 
     #[allow(clippy::type_complexity)]
     const READ_HANDLERS_832: &[(&str, fn(&mut Database))] = &[
@@ -849,5 +859,272 @@ mod tests {
             "hashtable",
             "a non-integer member has no intset form; the write must upgrade"
         );
+    }
+
+    // ── #787: SADD must reach the listpack encoding ──────────────────────
+    //
+    // Redis keeps a string set in a listpack until it exceeds
+    // set-max-listpack-entries (128) or set-max-listpack-value (64); moon's
+    // `SetListpack` variant is wired end to end EXCEPT that nothing ever
+    // created one, because `get_or_create_set` calls `SetKind::upgrade`
+    // unconditionally. Verified against a redis 8.6.1 oracle: `SADD s a b c d e`
+    // reports `listpack` there and `hashtable` here.
+    //
+    // Probe choice (moon#832): `OBJECT ENCODING` reads `entry.value` through
+    // `Database::get`, which does not route through `get_promoted`, so asking
+    // about the encoding cannot itself flatten it. Every READ below goes
+    // through the `_readonly` twins for the same reason — the mutable
+    // `scard`/`sismember`/`smembers` take `get_set` = `get_promoted`, which
+    // upgrades a listpack to an `IndexSet` on the FIRST call and would leave
+    // the rest of the test measuring a hashtable. `now_ms = 0` is safe: none
+    // of these keys carries a TTL.
+
+    /// What `OBJECT ENCODING <key>` actually replies — asserted through the
+    /// real command handler, not a private field, so the test checks the
+    /// user-visible answer that diverges from Redis.
+    fn encoding_of(db: &mut Database, key: &[u8]) -> String {
+        match crate::command::key::object(db, &[bs(b"ENCODING"), bs(key)]) {
+            Frame::BulkString(b) => String::from_utf8_lossy(&b).into_owned(),
+            // A key that is not there has no encoding; say so rather than
+            // panicking, so a test that loses its fixture fails on the
+            // assertion it wrote instead of inside the probe.
+            Frame::Null => "<missing>".to_string(),
+            other => panic!("OBJECT ENCODING did not reply a bulk string: {other:?}"),
+        }
+    }
+
+    /// `SMEMBERS` through the shared-read twin, sorted so the assertion does
+    /// not depend on listpack (insertion) vs `IndexSet` (swap-remove) order.
+    fn ro_members_sorted(db: &Database, key: &[u8]) -> Vec<Vec<u8>> {
+        match smembers_readonly(db, &[bs(key)], 0) {
+            Frame::Array(items) => {
+                let mut v: Vec<Vec<u8>> = items
+                    .iter()
+                    .map(|f| match f {
+                        Frame::BulkString(b) => b.to_vec(),
+                        other => panic!("expected bulk, got {other:?}"),
+                    })
+                    .collect();
+                v.sort();
+                v
+            }
+            other => panic!("SMEMBERS did not reply an array: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sadd_small_string_set_stays_listpack() {
+        let mut db = Database::new();
+        sadd(
+            &mut db,
+            &[bs(b"s"), bs(b"a"), bs(b"b"), bs(b"c"), bs(b"d"), bs(b"e")],
+        );
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "listpack",
+            "a 5-member string set is far below set-max-listpack-entries (128); \
+             Redis reports `listpack` here"
+        );
+    }
+
+    #[test]
+    fn sadd_promotes_past_the_entry_threshold() {
+        let mut db = Database::new();
+        for i in 0..crate::storage::db::LISTPACK_MAX_ENTRIES {
+            let m = format!("m{i:04}");
+            sadd(&mut db, &[bs(b"s"), bs(m.as_bytes())]);
+        }
+        // Exactly at the threshold it is still a listpack (Redis: 128 is
+        // inclusive) — this is the half of the boundary the pre-fix binary
+        // gets wrong, so the test cannot pass vacuously.
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "listpack",
+            "exactly LISTPACK_MAX_ENTRIES members must still be a listpack"
+        );
+        sadd(&mut db, &[bs(b"s"), bs(b"one-more")]);
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "hashtable",
+            "past LISTPACK_MAX_ENTRIES the set must promote to a hashtable"
+        );
+        // The promotion must not lose or duplicate a member.
+        assert_eq!(
+            scard_readonly(&db, &[bs(b"s")], 0),
+            Frame::Integer(crate::storage::db::LISTPACK_MAX_ENTRIES as i64 + 1)
+        );
+        assert_eq!(
+            sismember_readonly(&db, &[bs(b"s"), bs(b"m0000")], 0),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            sismember_readonly(&db, &[bs(b"s"), bs(b"one-more")], 0),
+            Frame::Integer(1)
+        );
+    }
+
+    #[test]
+    fn sadd_promotes_on_an_oversized_member() {
+        let mut db = Database::new();
+        let at_limit = vec![b'y'; crate::storage::db::LISTPACK_MAX_ELEMENT_SIZE];
+        sadd(&mut db, &[bs(b"s"), bs(b"small"), bs(&at_limit)]);
+        // Exactly set-max-listpack-value bytes is still a listpack — the
+        // pre-fix binary answers `hashtable` here, so this half cannot pass
+        // vacuously.
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "listpack",
+            "a member of exactly LISTPACK_MAX_ELEMENT_SIZE bytes fits a listpack"
+        );
+        let big = vec![b'x'; crate::storage::db::LISTPACK_MAX_ELEMENT_SIZE + 1];
+        sadd(&mut db, &[bs(b"s"), bs(&big)]);
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "hashtable",
+            "a member longer than set-max-listpack-value must promote"
+        );
+        assert_eq!(scard_readonly(&db, &[bs(b"s")], 0), Frame::Integer(3));
+        assert_eq!(
+            sismember_readonly(&db, &[bs(b"s"), bs(&big)], 0),
+            Frame::Integer(1)
+        );
+    }
+
+    #[test]
+    fn listpack_set_answers_reads_identically() {
+        let mut db = Database::new();
+        // A mixed bag: `7` is stored as a listpack INTEGER entry and must
+        // still answer to its decimal spelling; `007` is a string.
+        assert_eq!(
+            sadd(
+                &mut db,
+                &[bs(b"s"), bs(b"a"), bs(b"b"), bs(b"c"), bs(b"7"), bs(b"007")]
+            ),
+            Frame::Integer(5)
+        );
+        assert_eq!(encoding_of(&mut db, b"s"), "listpack");
+        // The VALUE, not just the encoding: every member present, none
+        // invented, through the twin that classifies the listpack form.
+        assert_eq!(
+            ro_members_sorted(&db, b"s"),
+            vec![
+                b"007".to_vec(),
+                b"7".to_vec(),
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec()
+            ]
+        );
+        assert_eq!(scard_readonly(&db, &[bs(b"s")], 0), Frame::Integer(5));
+        assert_eq!(
+            sismember_readonly(&db, &[bs(b"s"), bs(b"b")], 0),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            sismember_readonly(&db, &[bs(b"s"), bs(b"7")], 0),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            sismember_readonly(&db, &[bs(b"s"), bs(b"z")], 0),
+            Frame::Integer(0)
+        );
+        // A duplicate insert must be rejected WHILE in listpack form — both
+        // the string and the integer-encoded member — and must not promote.
+        assert_eq!(sadd(&mut db, &[bs(b"s"), bs(b"a")]), Frame::Integer(0));
+        assert_eq!(sadd(&mut db, &[bs(b"s"), bs(b"7")]), Frame::Integer(0));
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "listpack",
+            "a duplicate SADD must neither grow nor promote the set"
+        );
+        assert_eq!(scard_readonly(&db, &[bs(b"s")], 0), Frame::Integer(5));
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "listpack",
+            "reads through the shared-read twins must not change the encoding"
+        );
+    }
+
+    /// A listpack stores an integer-shaped member in its INTEGER encoding, so
+    /// the member's identity survives only if the encode step refuses
+    /// non-canonical spellings. `000000012345` re-rendered from an `i64` is
+    /// `12345` — a different member. This pins the whole mixed batch
+    /// byte-exact: the class recurred once already (moon#802, commit
+    /// 038819f3, "stop rewriting numeric strings with leading zeros or '+'"),
+    /// and the listpack set path is a NEW caller of that guard.
+    #[test]
+    fn sadd_listpack_preserves_non_canonical_integer_spellings() {
+        let mut db = Database::new();
+        // One canonical integer (really stored as a listpack integer), three
+        // non-canonical spellings that must stay strings, and a plain string.
+        assert_eq!(
+            sadd(
+                &mut db,
+                &[
+                    bs(b"s"),
+                    bs(b"000000012345"),
+                    bs(b"abcdefgh"),
+                    bs(b"+5"),
+                    bs(b"-0"),
+                    bs(b"12345"),
+                ]
+            ),
+            Frame::Integer(5),
+            "all five spellings are distinct members"
+        );
+        assert_eq!(encoding_of(&mut db, b"s"), "listpack");
+        assert_eq!(
+            ro_members_sorted(&db, b"s"),
+            vec![
+                b"+5".to_vec(),
+                b"-0".to_vec(),
+                b"000000012345".to_vec(),
+                b"12345".to_vec(),
+                b"abcdefgh".to_vec(),
+            ],
+            "SMEMBERS must return every member byte-for-byte as written"
+        );
+        // Identity, not just the byte dump: the padded spelling and the
+        // canonical one are DIFFERENT members and neither answers for the
+        // other.
+        for m in [&b"000000012345"[..], b"12345", b"+5", b"-0", b"abcdefgh"] {
+            assert_eq!(
+                sismember_readonly(&db, &[bs(b"s"), bs(m)], 0),
+                Frame::Integer(1),
+                "{} must be a member",
+                String::from_utf8_lossy(m)
+            );
+        }
+        for m in [&b"5"[..], b"0", b"0000012345"] {
+            assert_eq!(
+                sismember_readonly(&db, &[bs(b"s"), bs(m)], 0),
+                Frame::Integer(0),
+                "{} was never added; a re-rendered integer must not answer for it",
+                String::from_utf8_lossy(m)
+            );
+        }
+        // A duplicate of the non-canonical spelling is still a duplicate.
+        assert_eq!(
+            sadd(&mut db, &[bs(b"s"), bs(b"000000012345")]),
+            Frame::Integer(0)
+        );
+        assert_eq!(scard_readonly(&db, &[bs(b"s")], 0), Frame::Integer(5));
+    }
+
+    #[test]
+    fn sadd_listpack_rejects_a_wrong_type_key() {
+        let mut db = Database::new();
+        db.set(
+            b"str",
+            crate::storage::entry::Entry::new_string(Bytes::from_static(b"v")),
+        );
+        match sadd(&mut db, &[bs(b"str"), bs(b"a")]) {
+            Frame::Error(e) => assert!(
+                e.starts_with(b"WRONGTYPE"),
+                "expected WRONGTYPE, got {:?}",
+                String::from_utf8_lossy(&e)
+            ),
+            other => panic!("expected WRONGTYPE error, got {other:?}"),
+        }
     }
 }

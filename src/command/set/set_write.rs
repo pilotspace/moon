@@ -5,7 +5,10 @@ use std::collections::HashSet;
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::storage::db::{INTSET_MAX_ENTRIES, set_member_cost, set_table_bytes};
+use crate::storage::db::{
+    INTSET_MAX_ENTRIES, LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, listpack_batch_fits,
+    set_member_cost, set_table_bytes,
+};
 use crate::storage::entry::{Entry, boxed_payload_block};
 
 use super::{collect_sets, parse_int};
@@ -103,6 +106,62 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                 // Key exists but is not an intset (it's a HashSet or SetListpack)
                 // Fall through to normal path
             }
+            Err(e) => return e, // WRONGTYPE
+        }
+    }
+
+    // Listpack path for small string sets (moon#787). Mirrors HSET/RPUSH:
+    // Redis keeps a set in a listpack until it exceeds set-max-listpack-entries
+    // (128) or set-max-listpack-value (64), and moon reported `hashtable` from
+    // the first member because no accessor ever produced a surviving
+    // `SetListpack`. Skipped when any member is oversized, exactly as `hset`
+    // pre-checks LISTPACK_MAX_ELEMENT_SIZE.
+    let has_large_member = args[1..]
+        .iter()
+        .any(|a| extract_bytes(a).is_some_and(|b| b.len() > LISTPACK_MAX_ELEMENT_SIZE));
+    if !has_large_member {
+        match db.get_or_create_set_listpack(key) {
+            Ok(Some(lp)) => {
+                let mut added = 0i64;
+                // Listpack `estimate_memory()` is O(1) (capacity-based), so a
+                // before/after snapshot is cheap — no per-element formula.
+                let before = lp.estimate_memory();
+                for arg in &args[1..] {
+                    // Same skip the standard path below applies. A non-bulk
+                    // frame is never an error from INSIDE this loop: that
+                    // would return from the `before … adjust_memory` window
+                    // with members already pushed and never charged — the
+                    // moon#814 shape — and moon#823 closed the only source
+                    // of such a frame at the Lua boundary anyway.
+                    let Some(member) = extract_bytes(arg) else {
+                        continue;
+                    };
+                    // Borrowed scan: `contains_element` compares against each
+                    // entry in place. The owning `iter().any(as_bytes ==)`
+                    // shape allocated one `Vec` per entry walked — the exact
+                    // lookup moon#801 removed — so it must not come back here.
+                    if !lp.contains_element(member) {
+                        lp.push_back(member);
+                        added += 1;
+                    }
+                }
+                let after = lp.estimate_memory();
+                let should_upgrade = lp.len() > LISTPACK_MAX_ENTRIES;
+                // `lp`'s borrow of `db` ends here — safe to call back into
+                // `db` for accounting from this point on.
+                db.adjust_memory(before, after);
+                if should_upgrade {
+                    // One-time cost-model swing (listpack -> IndexSet). The
+                    // accessor bills it itself through `SetKind::upgrade`, so
+                    // the entries `Vec` and the index table are charged from
+                    // their real capacity (moon#788/#810), not a per-member
+                    // guess that under-counts the whole table.
+                    db.upgrade_set_listpack_to_set(key);
+                }
+                return Frame::Integer(added);
+            }
+            // Already an IndexSet or a SetIntset: fall through.
+            Ok(None) => {}
             Err(e) => return e, // WRONGTYPE
         }
     }

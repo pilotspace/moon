@@ -952,6 +952,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comes from the generic leg, is applied-first and loud) plus unit tests on the
   probe and on the inline path standing down with `read_buf` intact and the key
   untouched. All red on `6251429f`.
+- **`storage`: `SADD` reaches its listpack encoding -- small string sets stop
+  being hashtables (moon#787).** `SetListpack` existed as a storage encoding
+  and `SADD` already had an intset path, but nothing ever *created* a string
+  set listpack: a small set of non-integer members went straight to
+  `hashtable`, where Redis keeps one in a listpack up to
+  `set-max-listpack-entries` (128) / `set-max-listpack-value` (64). The guard
+  does not live in `OwnedKind::upgrade` (every impl is unconditional) -- it
+  lives one level up, in a per-type accessor the command layer calls *instead*
+  of the owned accessor, and the set one was missing:
+
+  ```text
+  get_or_create_intset            EXISTS   <- SADD, integer members
+  get_or_create_hash_listpack     EXISTS   <- HSET
+  get_or_create_list_listpack     EXISTS   <- RPUSH
+  get_or_create_set_listpack      MISSING
+  ```
+
+  A unit test had pinned the defect **in its own name**
+  (`test_object_encoding_set_hashtable`, asserting *"SADD with non-integer
+  members should create hashtable"*); it is corrected, with a new test keeping
+  the past-threshold hashtable case covered. Promotion past either threshold
+  is one-way, matching Redis; the listpack -> `IndexSet` swing is billed by
+  `SetKind::upgrade` (the same conversion `get_or_create` runs), so the entries
+  `Vec` and index table are charged from their real capacity (moon#788/#810),
+  and a `ledger_consistency_788` case walks create / duplicate / promote /
+  delete against a full recompute. The membership scan uses
+  `Listpack::contains_element` -- the borrowed comparison moon#801 introduced
+  for exactly this lookup -- so the path allocates nothing per entry walked.
+
+  **Scope -- what this does and does not buy (moon#832).** `Database::get_set`
+  is `get_promoted`, which calls `SetKind::upgrade` unconditionally, and
+  nothing ever downgrades: any set command on the *mutable* dispatch path --
+  `SCARD`/`SISMEMBER`/`SMEMBERS` outside `dispatch_read`, every command inside
+  `MULTI`/`EXEC` or a Lua script, `SREM`, `SPOP`, `SMOVE`, the store commands
+  -- permanently flattens the listpack on its first touch. The saving is a
+  **write-only-workload** figure; a read-mixed workload reverts key by key.
+  An existing intset that receives a string member still promotes straight to
+  `hashtable` (Redis 7.2+ converts it to a listpack) -- a named residual, not
+  covered here. A **replica loses the encoding across a FULLRESYNC**:
+  `redis_rdb::load_rdb` rebuilds `RDB_TYPE_SET` as `RedisValue::Set`, so the
+  key comes back a `hashtable` until it is rewritten. That is pre-existing and
+  class-wide -- intsets, hash listpacks and list listpacks are flattened by the
+  same loader on today's `main` -- so it is filed as moon#863 rather than fixed
+  here; this change only widens the set of keys it reaches. Measured on Linux (moon-bench-x86, x86_64, load < 1.0,
+  `--shards 1`, fresh server per row, 200 000 keys x `SADD s:i alpha beta
+  gamma`, RSS delta / key, two reps): **562 -> 264 B/key** (-53%); Redis 7.4.2
+  measures 106 B/key on the same probe, the remaining gap being moon's per-key
+  envelope, not the encoding.
 
 ## [0.8.9] — 2026-09-04
 
