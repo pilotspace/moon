@@ -150,7 +150,7 @@ mod tests {
         let slice = table.as_slice();
         assert_eq!(slice.len(), 3);
         // At least one slot should have value 10
-        assert!(slice.iter().any(|&fd| fd == 10));
+        assert!(slice.contains(&10));
     }
 
     #[test]

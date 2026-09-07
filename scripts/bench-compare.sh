@@ -7,12 +7,28 @@ set -euo pipefail
 # Usage:
 #   ./scripts/bench-compare.sh                # Full run
 #   ./scripts/bench-compare.sh --requests N   # Custom request count
-#   ./scripts/bench-compare.sh --shards N     # Moon shard count
+#   ./scripts/bench-compare.sh --shards N     # Moon shard count (tuned row only)
 #   ./scripts/bench-compare.sh --clients N    # Client count
+#   ./scripts/bench-compare.sh --skip-default # Omit the default-config moon row
+#
+# Two moon rows (moon#833). The TUNED row is the historical one: `--shards N
+# --protected-mode no --appendonly no --disk-offload disable`, i.e. Redis's
+# in-memory shape. The DEFAULT row is what a user gets from `moon --port N`
+# with no tuning flags: `--shards 1`, `--appendonly yes` (everysec),
+# `--disk-offload enable`, `--maxmemory` auto-capped by the guardrail. The
+# only flag it adds is `--dir <fresh tempdir>`, because an omitted --dir
+# resolves to the platform user-data directory, where a second default
+# instance collides on the dir lock and reloads whatever the last run left.
+#
+# The delta between the two rows is the signal this script exists to show:
+# for months every benchmark passed `--disk-offload disable`, which is the one
+# flag that hid a ~53% default-only SET deficit (moon#812).
 ###############################################################################
 
 PORT_REDIS=6399
 PORT_MOON=6400
+PORT_MOON_DEFAULT=6401
+SKIP_DEFAULT=0
 REQUESTS=100000
 CLIENTS=50
 SHARDS=1
@@ -21,6 +37,8 @@ RUST_BINARY="./target/release/moon"
 
 REDIS_PID=""
 MOON_PID=""
+MOON_DEFAULT_PID=""
+MOON_DEFAULT_DIR=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -39,6 +57,8 @@ while [[ $# -gt 0 ]]; do
                 echo "Error: --clients requires a numeric value"; exit 1
             fi
             CLIENTS="$2"; shift 2 ;;
+        --skip-default)
+            SKIP_DEFAULT=1; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -48,6 +68,8 @@ log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 cleanup() {
     log "Cleaning up..."
     [[ -n "${MOON_PID:-}" ]] && kill "$MOON_PID" 2>/dev/null; wait "$MOON_PID" 2>/dev/null || true
+    [[ -n "${MOON_DEFAULT_PID:-}" ]] && kill "$MOON_DEFAULT_PID" 2>/dev/null; wait "$MOON_DEFAULT_PID" 2>/dev/null || true
+    [[ -n "${MOON_DEFAULT_DIR:-}" ]] && rm -rf "$MOON_DEFAULT_DIR"
     [[ -n "${REDIS_PID:-}" ]] && kill "$REDIS_PID" 2>/dev/null; wait "$REDIS_PID" 2>/dev/null || true
     pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
     pkill -f "moon.*${PORT_MOON}" 2>/dev/null || true
@@ -67,23 +89,50 @@ bench() {
     shift
     local rflag=()
     [[ -n "$KEYSPACE" ]] && rflag=(-r "$KEYSPACE")   # large-scale: spread ops across a real keyspace
-    redis-benchmark -p "$port" -n "$REQUESTS" -c "$CLIENTS" -q "${rflag[@]}" "$@" 2>/dev/null | parse_rps
+    # `${arr[@]+"${arr[@]}"}`: an EMPTY array is "unbound" to `set -u` on bash < 4.4
+    # (macOS ships 3.2), which aborted the first bench() call — the #634 class.
+    redis-benchmark -p "$port" -n "$REQUESTS" -c "$CLIENTS" -q ${rflag[@]+"${rflag[@]}"} "$@" 2>/dev/null | parse_rps
+}
+
+ratio_of() {
+    # $1 / $2 to two decimals, or N/A when either side is missing.
+    if [[ "${1:-0}" != "0" ]] && [[ "${2:-0}" != "0" ]]; then
+        awk "BEGIN { printf \"%.2f\", $1 / $2 }"
+    else
+        echo "N/A"
+    fi
+}
+
+table_header() {
+    local first_col="$1"
+    if (( SKIP_DEFAULT )); then
+        printf "| %-30s | %12s | %12s | %7s |\n" "$first_col" "Redis RPS" "Moon RPS" "Ratio"
+        printf "|%-32s|%14s|%14s|%9s|\n" "--------------------------------" "--------------" "--------------" "---------"
+    else
+        printf "| %-30s | %12s | %14s | %16s | %11s | %13s |\n" \
+            "$first_col" "Redis RPS" "Moon tuned RPS" "Moon default RPS" "tuned/Redis" "default/tuned"
+        printf "|%-32s|%14s|%16s|%18s|%13s|%15s|\n" \
+            "--------------------------------" "--------------" "----------------" "------------------" "-------------" "---------------"
+    fi
 }
 
 bench_cmd() {
     local desc="$1"
     shift
-    local redis_rps moon_rps ratio
+    local redis_rps moon_rps default_rps
     redis_rps=$(bench "$PORT_REDIS" "$@")
     moon_rps=$(bench "$PORT_MOON" "$@")
     redis_rps="${redis_rps:-0}"
     moon_rps="${moon_rps:-0}"
-    if [[ "$redis_rps" != "0" ]] && [[ "$moon_rps" != "0" ]]; then
-        ratio=$(awk "BEGIN { printf \"%.2f\", $moon_rps / $redis_rps }")
-    else
-        ratio="N/A"
+    if (( SKIP_DEFAULT )); then
+        printf "| %-30s | %12s | %12s | %6sx |\n" "$desc" "$redis_rps" "$moon_rps" "$(ratio_of "$moon_rps" "$redis_rps")"
+        return
     fi
-    printf "| %-30s | %12s | %12s | %6sx |\n" "$desc" "$redis_rps" "$moon_rps" "$ratio"
+    default_rps=$(bench "$PORT_MOON_DEFAULT" "$@")
+    default_rps="${default_rps:-0}"
+    printf "| %-30s | %12s | %14s | %16s | %10sx | %12sx |\n" \
+        "$desc" "$redis_rps" "$moon_rps" "$default_rps" \
+        "$(ratio_of "$moon_rps" "$redis_rps")" "$(ratio_of "$default_rps" "$moon_rps")"
 }
 
 # ===========================================================================
@@ -103,6 +152,21 @@ log "Starting moon on port $PORT_MOON ($SHARDS shards)..."
 RUST_LOG=warn "$RUST_BINARY" --port "$PORT_MOON" --shards "$SHARDS" --protected-mode no --appendonly no --disk-offload disable >/dev/null 2>&1 &
 MOON_PID=$!
 
+if (( ! SKIP_DEFAULT )); then
+    # moon#833: the SHIPPED DEFAULT, alongside the tuned row. No `--shards`, no
+    # persistence or offload flags — whatever `moon --port N` resolves to on
+    # this host is what gets measured. `--dir` is the one addition, and it is
+    # not a tuning flag: without it the server takes the dir lock in the
+    # platform user-data directory (colliding with any default instance already
+    # running there) and reloads whatever AOF the previous run left behind.
+    # AOF is ON in this row, so expect the auto-rewrite (64mb floor, 100%
+    # growth) to fire mid-run on long SET legs — that is part of the default.
+    MOON_DEFAULT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/moon-bench-default-XXXXXX")
+    log "Starting moon DEFAULT CONFIG on port $PORT_MOON_DEFAULT (no tuning flags; --dir $MOON_DEFAULT_DIR)..."
+    RUST_LOG=warn "$RUST_BINARY" --port "$PORT_MOON_DEFAULT" --dir "$MOON_DEFAULT_DIR" >/dev/null 2>&1 &
+    MOON_DEFAULT_PID=$!
+fi
+
 # Wait for servers with retry loop (max 10s)
 wait_for_server() {
     local port="$1" name="$2" max_wait=10 elapsed=0
@@ -119,6 +183,7 @@ wait_for_server() {
 
 wait_for_server "$PORT_REDIS" "Redis"
 wait_for_server "$PORT_MOON" "Moon"
+(( SKIP_DEFAULT )) || wait_for_server "$PORT_MOON_DEFAULT" "Moon (default config)"
 
 log "Servers ready."
 
@@ -136,7 +201,16 @@ echo "# Moon vs Redis Benchmark"
 echo ""
 echo "**Date:** $(date +%Y-%m-%d)"
 echo "**Redis:** $REDIS_VER"
-echo "**Moon:** $SHARDS shard(s)"
+echo "**Moon tuned:** \`--shards $SHARDS --protected-mode no --appendonly no --disk-offload disable\`"
+if (( ! SKIP_DEFAULT )); then
+    DEFAULT_MAXMEM=$(redis-cli -p "$PORT_MOON_DEFAULT" CONFIG GET maxmemory 2>/dev/null | tail -1 | tr -d '\r')
+    DEFAULT_POLICY=$(redis-cli -p "$PORT_MOON_DEFAULT" CONFIG GET maxmemory-policy 2>/dev/null | tail -1 | tr -d '\r')
+    DEFAULT_SHARDS=$(redis-cli -p "$PORT_MOON_DEFAULT" INFO server 2>/dev/null | tr -d '\r' | sed -n 's/^num_shards://p')
+    echo "**Moon default:** no tuning flags (\`--port $PORT_MOON_DEFAULT --dir <tempdir>\`) — resolved on this host to shards=${DEFAULT_SHARDS:-?}, appendonly=yes/everysec, disk-offload=enable, maxmemory=${DEFAULT_MAXMEM:-?} (${DEFAULT_POLICY:-?})"
+    if [[ "$SHARDS" != "1" ]]; then
+        echo "**Note:** the tuned row runs $SHARDS shards, the default row runs the shipped default (1); the default/tuned column mixes the shard count into the delta."
+    fi
+fi
 echo "**Requests:** $REQUESTS per test, $CLIENTS clients"
 echo "**Platform:** $PLATFORM"
 echo ""
@@ -149,8 +223,7 @@ log "Benchmarking core commands..."
 
 echo "## Core Commands (p=1, $CLIENTS clients)"
 echo ""
-printf "| %-30s | %12s | %12s | %7s |\n" "Command" "Redis RPS" "Moon RPS" "Ratio"
-printf "|%-32s|%14s|%14s|%9s|\n" "--------------------------------" "--------------" "--------------" "---------"
+table_header "Command"
 
 bench_cmd "PING inline"               -t ping_inline
 bench_cmd "PING mbulk"                -t ping_mbulk
@@ -181,8 +254,7 @@ log "Benchmarking pipeline scaling..."
 echo ""
 echo "## Pipeline Scaling (SET)"
 echo ""
-printf "| %-30s | %12s | %12s | %7s |\n" "Pipeline Depth" "Redis RPS" "Moon RPS" "Ratio"
-printf "|%-32s|%14s|%14s|%9s|\n" "--------------------------------" "--------------" "--------------" "---------"
+table_header "Pipeline Depth"
 
 for p in 1 2 4 8 16 32 64 128; do
     bench_cmd "SET p=$p" -t set -P "$p"
@@ -191,8 +263,7 @@ done
 echo ""
 echo "## Pipeline Scaling (GET)"
 echo ""
-printf "| %-30s | %12s | %12s | %7s |\n" "Pipeline Depth" "Redis RPS" "Moon RPS" "Ratio"
-printf "|%-32s|%14s|%14s|%9s|\n" "--------------------------------" "--------------" "--------------" "---------"
+table_header "Pipeline Depth"
 
 for p in 1 2 4 8 16 32 64 128; do
     bench_cmd "GET p=$p" -t get -P "$p"
@@ -207,8 +278,7 @@ log "Benchmarking data sizes..."
 echo ""
 echo "## Data Size Scaling (SET)"
 echo ""
-printf "| %-30s | %12s | %12s | %7s |\n" "Value Size" "Redis RPS" "Moon RPS" "Ratio"
-printf "|%-32s|%14s|%14s|%9s|\n" "--------------------------------" "--------------" "--------------" "---------"
+table_header "Value Size"
 
 for size in 8 64 256 1024 4096 16384 65536; do
     bench_cmd "SET ${size}B" -t set -d "$size"
@@ -217,13 +287,13 @@ done
 echo ""
 echo "## Data Size Scaling (GET)"
 echo ""
-printf "| %-30s | %12s | %12s | %7s |\n" "Value Size" "Redis RPS" "Moon RPS" "Ratio"
-printf "|%-32s|%14s|%14s|%9s|\n" "--------------------------------" "--------------" "--------------" "---------"
+table_header "Value Size"
 
 for size in 8 64 256 1024 4096 16384 65536; do
     # Seed data: run a quick SET pass so GET reads real values (not nils)
     redis-benchmark -p "$PORT_REDIS" -n "$REQUESTS" -t set -d "$size" -q >/dev/null 2>&1
     redis-benchmark -p "$PORT_MOON" -n "$REQUESTS" -t set -d "$size" -q >/dev/null 2>&1
+    (( SKIP_DEFAULT )) || redis-benchmark -p "$PORT_MOON_DEFAULT" -n "$REQUESTS" -t set -d "$size" -q >/dev/null 2>&1
     bench_cmd "GET ${size}B" -t get -d "$size"
 done
 
@@ -236,8 +306,7 @@ log "Benchmarking connection scaling..."
 echo ""
 echo "## Connection Scaling (SET)"
 echo ""
-printf "| %-30s | %12s | %12s | %7s |\n" "Clients" "Redis RPS" "Moon RPS" "Ratio"
-printf "|%-32s|%14s|%14s|%9s|\n" "--------------------------------" "--------------" "--------------" "---------"
+table_header "Clients"
 
 for c in 1 10 50 100 200 500; do
     bench_cmd "SET c=$c" -t set -c "$c"
