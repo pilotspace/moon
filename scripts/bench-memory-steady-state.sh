@@ -120,13 +120,33 @@ start_server() {
     pkill -f "moon.*--port ${PORT}" 2>/dev/null || true
     sleep 0.3
 
+    # --memory-arenas-cap 2 (moon#764 follow-up): this gate runs --shards 1,
+    # i.e. one hot allocator thread, but the binary's baked-in default is
+    # narenas:8 -- sized for the multi-shard thread-per-core layout (see
+    # src/malloc_respawn.rs's STANDALONE_PROFILE_ARENAS comment: "2 arenas
+    # cut the allocator's per-arena metadata and dirty-page cache RSS
+    # baseline with no contention cost at this concurrency"). Real hosted-
+    # runner samples showed a same-machine, same-code RSS spread of ~5.5%
+    # (146,817,024 / 144,723,968 / 152,678,400 across 3 runs) -- a
+    # PREFER-CONTROLLING-OVER-WIDENING candidate cause, not yet confirmed:
+    # 8 arenas contending over 4 real vCPUs (this runner's cpu_count) gives
+    # jemalloc's thread-to-arena assignment more room for run-to-run
+    # variance in which arena(s) accumulate dirty-page cache. This flag
+    # already exists and is already tested (src/malloc_respawn.rs); it is
+    # not new/unsafe code. If the next sample batch shows tighter spread
+    # under this flag, keep it and lower the rss floor accordingly; if not,
+    # remove it and fall back to widening with the measured margin instead
+    # -- either way, re-baseline is required, since this flag also changes
+    # the absolute RSS/allocator_overhead values, not just their variance.
     MOON_NO_URING=1 "$MOON_BINARY" \
         --port "$PORT" \
         --admin-port "$ADMIN_PORT" \
         --shards "$SHARDS" \
         --disk-offload disable \
         --appendonly no \
-        --protected-mode no &>/dev/null &
+        --protected-mode no \
+        --memory-arenas-cap 2 \
+        &>/dev/null &
     SERVER_PID=$!
 
     wait_for_server
