@@ -599,6 +599,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --scenario) SCENARIO_FILTER="$2"; shift 2 ;;
         --shards) SHARDS="$2"; shift 2 ;;
+        --default-config) MOON_DEFAULT_CONFIG=1; shift ;;
         --duration) DURATION="$2"; shift 2 ;;
         --output) OUTPUT_FILE="$2"; shift 2 ;;
         --list)
@@ -642,7 +643,20 @@ log "Starting moon on port $PORT_RUST ($SHARDS shards)..."
 # comparison is AOF-off on both sides (Redis above runs no-AOF). Without this, moon runs
 # AOF-on under SET load, saturating its AOF channel (floods "AOF append dropped" WARNs) and
 # is unfairly handicapped. Redirect moon's output to keep the report clean.
-RUST_LOG=warn $RUST_BINARY --port "$PORT_RUST" --shards "$SHARDS" --appendonly no --disk-offload disable >/dev/null 2>&1 &
+if (( MOON_DEFAULT_CONFIG )); then
+    # moon#833: measure the SHIPPED DEFAULT instead of the tuned shape. No
+    # `--shards`, no persistence or offload flags; `--dir` is the one addition
+    # (an omitted --dir takes the dir lock in the platform user-data directory
+    # and reloads whatever the previous run left there). Run this script twice
+    # — once tuned, once with --default-config — and diff the two reports; the
+    # ten scenarios here are too entangled with $PORT_RUST to host a third
+    # server per row the way bench-compare.sh does.
+    MOON_DEFAULT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/moon-bench-default-XXXXXX")
+    log "moon DEFAULT CONFIG: no tuning flags (--dir $MOON_DEFAULT_DIR)"
+    RUST_LOG=warn $RUST_BINARY --port "$PORT_RUST" --dir "$MOON_DEFAULT_DIR" >/dev/null 2>&1 &
+else
+    RUST_LOG=warn $RUST_BINARY --port "$PORT_RUST" --shards "$SHARDS" --appendonly no --disk-offload disable >/dev/null 2>&1 &
+fi
 RUST_PID=$!
 wait_for_server "$PORT_RUST" "moon"
 
@@ -655,7 +669,11 @@ REDIS_VERSION=$(redis-cli -p "$PORT_REDIS" INFO server 2>/dev/null | grep redis_
     echo "**Date:** $(date '+%Y-%m-%d %H:%M')"
     echo "**Machine:** $(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)"
     echo "**Redis:** ${REDIS_VERSION}"
-    echo "**moon:** ${SHARDS} shard(s), Tokio runtime"
+    if (( MOON_DEFAULT_CONFIG )); then
+        echo "**moon:** DEFAULT CONFIG — no tuning flags (moon#833); resolved shards=$(redis-cli -p "$PORT_REDIS" ping >/dev/null 2>&1; redis-cli -p "$PORT_RUST" INFO server 2>/dev/null | tr -d '\r' | sed -n 's/^num_shards://p')"
+    else
+        echo "**moon:** ${SHARDS} shard(s), tuned (\`--appendonly no --disk-offload disable\`)"
+    fi
     echo "**Tool:** redis-benchmark (co-located)"
     echo "**Requests:** $(format_number $REQUESTS) per test"
     echo ""

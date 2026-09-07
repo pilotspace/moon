@@ -339,6 +339,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `unsafe` surface went from nine blocks to three (`heap_str`,
   `heap_str_mut`, `take_heap_string`), each citing the numbered invariants
   on the type; every constructor establishes them in one function.
+### Added
+
+- **`test`/`bench`: the shipped default is now measured, and its dispatch
+  path is guarded (moon#833).** Every general-purpose benchmark script started
+  moon with `--disk-offload disable`; the default is `enable`. That one flag is
+  what hid moon#812 for months — on a default server plain `SET` never took
+  the inline fast path (`can_inline_writes` carried `ctx.spill_sender.is_none()`,
+  a config predicate standing in for a state one), a ~53% SET deficit that no
+  benchmark could see because none ran the default.
+
+  `tests/default_config_dispatch_path_833.rs` starts moon with no tuning flags
+  (only `--port`, `--admin-port` as the instrument, and `--dir` to a fresh
+  tempdir) and asserts from `moon_dispatch_path_total` that plain `SET`, plain
+  `GET`, and a pipelined SET+GET batch are served `local_inline` at the default
+  `--shards 1`. Proved to redden against the pre-moon#812 binary (`29fc5fce`):
+  both SET tests fail with `local_inline +0, local +200`; GET stays green, as
+  it should — `can_inline_reads` never carried the term.
+
+  `scripts/bench-compare.sh` now runs a third server, **Moon default**
+  (`moon --port N --dir <tempdir>`, nothing else), and reports it in every
+  table beside the tuned row with a `default/tuned` ratio, so the delta between
+  the configuration we publish numbers for and the one we ship is visible by
+  construction. `--skip-default` restores the old two-server run.
+  `scripts/bench-production.sh` gains `--default-config` (its ten scenarios are
+  too entangled with one port to host a third server per row): run it twice
+  and diff.
+
+### Fixed
+
+- **`lint`: `cargo clippy --all-targets -- -D warnings` failed on Linux on
+  pristine `main`** — `clippy::collapsible_if` at `tests/busy_poll_idle.rs:83`
+  and `clippy::manual_contains` at `src/io/fd_table.rs:153`, both in
+  Linux-only files, so a macOS run was green and the hosted Check job (which
+  runs clippy without `--all-targets`) never saw them. Two one-line fixes.
 
 ## [0.8.9] — 2026-09-04
 
