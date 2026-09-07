@@ -10,10 +10,10 @@ use std::sync::atomic::Ordering;
 use metrics::{counter, gauge, histogram};
 
 use crate::admin::metrics_setup::{
-    CONNECTED_CLIENTS, DISPATCH_CROSS_READ_FAST_TOTAL, DISPATCH_CROSS_READ_SPSC_TOTAL,
-    EVICTED_KEYS, EXPIRING_SPILL_SKIPPED, KEYSPACE_HITS, KEYSPACE_MISSES, METRICS_INITIALIZED,
+    CONNECTED_CLIENTS, EVICTED_KEYS, EXPIRING_SPILL_SKIPPED, METRICS_INITIALIZED,
     PIPELINE_MULTIKEY_FANOUT_TOTAL, PIPELINE_REMOTE_DEFER_TOTAL, SPILLED_KEYS, TOTAL_CONNECTIONS,
     WAL_AGGRESSIVE_RECYCLE_BYTES_TOTAL, WAL_AGGRESSIVE_RECYCLE_SEGMENTS_TOTAL,
+    bump_dispatch_cross_read_fast, bump_dispatch_cross_spsc, bump_keyspace_hit, bump_keyspace_miss,
 };
 
 // ── Connection metrics ──────────────────────────────────────────────────
@@ -120,7 +120,10 @@ pub fn try_accept_connection(maxclients: usize) -> bool {
 /// Record keyspace hit/miss.
 #[inline]
 pub fn record_keyspace_hit() {
-    KEYSPACE_HITS.fetch_add(1, Ordering::Relaxed);
+    // Ungated on purpose: `keyspace_hits` is an INFO field, and INFO must be
+    // right with `--admin-port 0`. moon#774 made the increment land on this
+    // THREAD's cache line so the cost is a private RMW, not a contended one.
+    bump_keyspace_hit();
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -129,7 +132,8 @@ pub fn record_keyspace_hit() {
 
 #[inline]
 pub fn record_keyspace_miss() {
-    KEYSPACE_MISSES.fetch_add(1, Ordering::Relaxed);
+    // Ungated on purpose — see `record_keyspace_hit`.
+    bump_keyspace_miss();
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -292,8 +296,9 @@ pub fn record_dispatch_local_batch(count: u64) {
 /// counter exists — all non-fast-path cross-shard traffic goes here).
 #[inline]
 pub fn record_dispatch_cross_spsc() {
-    // Always increment the INFO-visible atomic (works even with admin_port=0).
-    DISPATCH_CROSS_READ_SPSC_TOTAL.fetch_add(1, Ordering::Relaxed);
+    // Always increment the INFO-visible atomic (works even with admin_port=0);
+    // moon#774 put it on this thread's private line.
+    bump_dispatch_cross_spsc(1);
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -304,7 +309,7 @@ pub fn record_dispatch_cross_spsc() {
 /// with no SPSC hop and no park.
 #[inline]
 pub fn record_dispatch_cross_read_fast() {
-    DISPATCH_CROSS_READ_FAST_TOTAL.fetch_add(1, Ordering::Relaxed);
+    bump_dispatch_cross_read_fast(1);
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -384,11 +389,27 @@ pub fn record_dispatch_cross_spsc_batch(count: u64) {
         return;
     }
     // Always increment the INFO-visible atomic (works even with admin_port=0).
-    DISPATCH_CROSS_READ_SPSC_TOTAL.fetch_add(count, Ordering::Relaxed);
+    bump_dispatch_cross_spsc(count);
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
     counter!("moon_dispatch_path_total", "path" => "cross_spsc").increment(count);
+}
+
+/// Batched variant of [`record_dispatch_cross_read_fast`]: one increment per
+/// pipeline batch instead of one per command (moon#774). Short-circuits on
+/// `count == 0` so a batch with no shared-guard reads pays nothing.
+#[inline]
+pub fn record_dispatch_cross_read_fast_batch(count: u64) {
+    if count == 0 {
+        return;
+    }
+    // Always increment the INFO-visible atomic (works even with admin_port=0).
+    bump_dispatch_cross_read_fast(count);
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_dispatch_path_total", "path" => "cross_read_fast").increment(count);
 }
 
 /// Command handled by the inline GET/SET fast path

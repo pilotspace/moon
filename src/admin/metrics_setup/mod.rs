@@ -63,9 +63,10 @@ static FT_SEARCH_COOPERATIVE_YIELDS: AtomicU64 = AtomicU64::new(0);
 // must report these whether or not anyone scraped Prometheus, so each has an
 // ungated atomic alongside it. Relaxed ordering: these are monotonic
 // observability counters, never used to synchronise anything.
-static KEYSPACE_HITS: AtomicU64 = AtomicU64::new(0);
-static KEYSPACE_MISSES: AtomicU64 = AtomicU64::new(0);
-static EXPIRED_KEYS: AtomicU64 = AtomicU64::new(0);
+//
+// The three PER-COMMAND members of this family (keyspace hits/misses and
+// expired keys) live in [`HOT_COUNTERS`] instead of here — see the moon#774
+// note there. The rest fire at sweep or handshake rate and stay plain.
 static EVICTED_KEYS: AtomicU64 = AtomicU64::new(0);
 static EXPIRING_SPILL_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
@@ -221,6 +222,116 @@ pub fn record_replica_apply() {
     bump_total_commands();
 }
 
+// ── moon#774: the per-COMMAND observability counters ────────────────────
+//
+// Five counters are bumped once (or more) for EVERY command on EVERY
+// deployment. As plain globals they were three adjacent `AtomicU64`s in one
+// cache line plus two more in another, and every shard core RMW'd them:
+// GET p=1 c200 at `--shards 8` measured 332,779 ops/s with 87.54% cross-shard
+// (`moon_dispatch_path_total`) ≈ 291K contended RMWs/s on one line, plus one
+// keyspace RMW per lookup.
+//
+// The increments are UNGATED on purpose and stay that way. These atomics back
+// INFO fields (`keyspace_hits`, `keyspace_misses`, `expired_keys`,
+// `total_dispatch_cross_spsc`, `total_dispatch_cross_read_fast`) that must be
+// right with `--admin-port 0`, so gating them on `METRICS_INITIALIZED` would
+// trade a performance defect for a correctness one. What sharding removes is
+// not the RMW but its CONTENTION: each OS thread owns one 64-byte line and
+// nobody else writes it. Readers sum all slots, and the sum is exact — every
+// increment lands in exactly one slot.
+//
+// The five counters share ONE line per thread rather than taking a line each.
+// A cross-shard GET bumps a keyspace counter AND a dispatch-path counter in
+// the same command; on separate lines that would be two private cache misses
+// where one suffices. 5 × 8 = 40 bytes used, 24 bytes of padding — and the
+// padding is the point, since it is what keeps this thread's line off every
+// other thread's.
+#[repr(align(64))]
+struct HotCounterSlot {
+    keyspace_hits: AtomicU64,
+    keyspace_misses: AtomicU64,
+    expired_keys: AtomicU64,
+    dispatch_cross_spsc: AtomicU64,
+    dispatch_cross_read_fast: AtomicU64,
+}
+
+#[allow(clippy::declare_interior_mutable_const)] // template for static array init only
+const HOT_COUNTER_SLOT_ZERO: HotCounterSlot = HotCounterSlot {
+    keyspace_hits: AtomicU64::new(0),
+    keyspace_misses: AtomicU64::new(0),
+    expired_keys: AtomicU64::new(0),
+    dispatch_cross_spsc: AtomicU64::new(0),
+    dispatch_cross_read_fast: AtomicU64::new(0),
+};
+
+static HOT_COUNTERS: [HotCounterSlot; COMMAND_COUNTER_SLOTS] =
+    [HOT_COUNTER_SLOT_ZERO; COMMAND_COUNTER_SLOTS];
+
+// A slot that outgrew its line would silently re-introduce the defect: two
+// threads' counters would land on one line again. Fail the build instead.
+const _: () = assert!(
+    core::mem::size_of::<HotCounterSlot>() == 64,
+    "HotCounterSlot must occupy exactly one 64-byte cache line"
+);
+
+/// Add to one field of THIS thread's hot-counter slot. Hot path: one TLS
+/// read + one uncontended relaxed `fetch_add`, no allocation, no lock.
+///
+/// `select` is a monomorphised field projection, so this compiles to the same
+/// instruction sequence a direct `SOME_STATIC.fetch_add(n, Relaxed)` would —
+/// only on an address no other thread writes.
+#[inline]
+fn bump_hot<F>(select: F, n: u64)
+where
+    F: Fn(&HotCounterSlot) -> &AtomicU64,
+{
+    COMMAND_COUNTER_SLOT.with(|&slot| {
+        select(&HOT_COUNTERS[slot]).fetch_add(n, Ordering::Relaxed);
+    });
+}
+
+/// Exact sum of one hot counter across every slot. O(64) relaxed loads —
+/// read paths only (INFO, the 1s server_stats tick), never a command path.
+///
+/// Exact, not approximate: an increment is one `fetch_add` into exactly one
+/// slot, so the sum counts every increment once. It is not a consistent
+/// SNAPSHOT — concurrent increments to already-visited slots are missed until
+/// the next read — which is the same monotone-lower-bound guarantee a single
+/// relaxed global gave, and all any of these INFO fields ever promised.
+fn sum_hot<F>(select: F) -> u64
+where
+    F: Fn(&HotCounterSlot) -> &AtomicU64,
+{
+    HOT_COUNTERS
+        .iter()
+        .map(|s| select(s).load(Ordering::Relaxed))
+        .sum()
+}
+
+/// Record one successful key lookup. See [`bump_hot`].
+#[inline]
+pub(crate) fn bump_keyspace_hit() {
+    bump_hot(|s| &s.keyspace_hits, 1);
+}
+
+/// Record one lookup that found no key. See [`bump_hot`].
+#[inline]
+pub(crate) fn bump_keyspace_miss() {
+    bump_hot(|s| &s.keyspace_misses, 1);
+}
+
+/// Add `n` to the cross-shard SPSC dispatch total. See [`bump_hot`].
+#[inline]
+pub(crate) fn bump_dispatch_cross_spsc(n: u64) {
+    bump_hot(|s| &s.dispatch_cross_spsc, n);
+}
+
+/// Add `n` to the cross-shard shared-guard read total. See [`bump_hot`].
+#[inline]
+pub(crate) fn bump_dispatch_cross_read_fast(n: u64) {
+    bump_hot(|s| &s.dispatch_cross_read_fast, n);
+}
+
 /// Exact sum across all counter slots. O(64) loads — read paths only
 /// (INFO, the 1s server_stats tick), never the command hot path.
 fn total_commands_sum() -> u64 {
@@ -343,14 +454,11 @@ static WAL_AGGRESSIVE_RECYCLE_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 // Note: a separate write-SPSC counter does not exist in the codebase —
 // the existing `record_dispatch_cross_spsc` covers both reads routed via
 // SPSC (when fast-path is off) and writes. INFO exposes the unified total
-// as `total_dispatch_cross_spsc`.
-static DISPATCH_CROSS_READ_SPSC_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// L4 S4: cross-shard reads served on the calling thread under a shared
-/// guard on the owner's database, without an SPSC hop. Published as
-/// `moon_dispatch_path_total{path="cross_read_fast"}` and as
-/// `total_dispatch_cross_read_fast` in INFO -- the name
-/// docs/production-guide.md already documents.
-static DISPATCH_CROSS_READ_FAST_TOTAL: AtomicU64 = AtomicU64::new(0);
+// as `total_dispatch_cross_spsc`. Both cross-shard dispatch counters, and
+// the `cross_read_fast` counter that docs/production-guide.md documents as
+// `total_dispatch_cross_read_fast`, live in [`HOT_COUNTERS`] (moon#774) —
+// they are per-COMMAND, so a single shared line bounced across every shard
+// core at full dispatch rate.
 /// moon#513: pipeline batches cut short because a command could not execute
 /// against shards whose earlier writes in the same batch were still pending.
 /// Each increment is one extra dispatch/await boundary — measured at ~57us on
@@ -369,18 +477,20 @@ static PIPELINE_MULTIKEY_FANOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
 // ── INFO-readable counter accessors ─────────────────────────────────────
 
 /// Number of successful key lookups since start.
+///
+/// Summed across every thread's [`HOT_COUNTERS`] slot (moon#774).
 pub fn keyspace_hits() -> u64 {
-    KEYSPACE_HITS.load(Ordering::Relaxed)
+    sum_hot(|s| &s.keyspace_hits)
 }
 
 /// Number of lookups that found no key since start.
 pub fn keyspace_misses() -> u64 {
-    KEYSPACE_MISSES.load(Ordering::Relaxed)
+    sum_hot(|s| &s.keyspace_misses)
 }
 
 /// Keys removed because their TTL elapsed.
 pub fn expired_keys() -> u64 {
-    EXPIRED_KEYS.load(Ordering::Relaxed)
+    sum_hot(|s| &s.expired_keys)
 }
 
 /// Keys REMOVED FROM THE KEYSPACE by the maxmemory eviction policy.
@@ -449,7 +559,7 @@ pub fn instantaneous_ops_per_sec() -> u64 {
 /// Record an expired key.
 #[inline]
 pub fn record_expired_key() {
-    EXPIRED_KEYS.fetch_add(1, Ordering::Relaxed);
+    bump_hot(|s| &s.expired_keys, 1);
 }
 
 /// Record a refused connection.
@@ -492,13 +602,16 @@ pub fn sample_ops_per_sec() {
 /// line it already owns.
 #[cfg(test)]
 pub(crate) fn hot_counter_slot_addrs() -> [usize; 5] {
-    [
-        std::ptr::addr_of!(KEYSPACE_HITS) as usize,
-        std::ptr::addr_of!(KEYSPACE_MISSES) as usize,
-        std::ptr::addr_of!(EXPIRED_KEYS) as usize,
-        std::ptr::addr_of!(DISPATCH_CROSS_READ_SPSC_TOTAL) as usize,
-        std::ptr::addr_of!(DISPATCH_CROSS_READ_FAST_TOTAL) as usize,
-    ]
+    COMMAND_COUNTER_SLOT.with(|&slot| {
+        let s = &HOT_COUNTERS[slot];
+        [
+            std::ptr::addr_of!(s.keyspace_hits) as usize,
+            std::ptr::addr_of!(s.keyspace_misses) as usize,
+            std::ptr::addr_of!(s.expired_keys) as usize,
+            std::ptr::addr_of!(s.dispatch_cross_spsc) as usize,
+            std::ptr::addr_of!(s.dispatch_cross_read_fast) as usize,
+        ]
+    })
 }
 
 #[cfg(test)]
@@ -549,6 +662,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The summation must be EXACT across threads. A single global atomic was
+    /// exact for free; sharding buys the hot path a private line and owes the
+    /// read path a correct sum in exchange. A broken sum (a missed slot, a
+    /// stale slot index, a thread whose slot nobody reads) would show up here
+    /// and NOWHERE else — a single-shard test passes with a summation that
+    /// only ever reads slot 0.
+    #[test]
+    fn hot_counter_sum_is_exact_across_many_threads() {
+        // A private counter array is not available (the slot scheme is
+        // process-global by design), so drive a counter no other test in this
+        // binary touches and assert on the DELTA. `expired_keys` is bumped
+        // only by `record_expired_key`, which no other unit test calls.
+        const THREADS: u64 = 8;
+        const PER_THREAD: u64 = 5_000;
+
+        let before = expired_keys();
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..PER_THREAD {
+                        record_expired_key();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread");
+        }
+        let after = expired_keys();
+
+        assert_eq!(
+            after - before,
+            THREADS * PER_THREAD,
+            "{THREADS} threads x {PER_THREAD} increments must sum to exactly \
+             {} — got {}. Every increment lands in exactly one slot, so the \
+             sum over all slots counts each one once.",
+            THREADS * PER_THREAD,
+            after - before,
+        );
+    }
+
+    /// More threads than slots must still sum exactly. Slot assignment is
+    /// round-robin modulo 64, so thread 65 SHARES a line with thread 1 — that
+    /// costs contention, never correctness, and the arithmetic must not care.
+    #[test]
+    fn hot_counter_sum_is_exact_when_threads_outnumber_slots() {
+        const THREADS: u64 = 96; // > COMMAND_COUNTER_SLOTS (64)
+        const PER_THREAD: u64 = 500;
+
+        let before = keyspace_misses();
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..PER_THREAD {
+                        record_keyspace_miss();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread");
+        }
+
+        assert_eq!(
+            keyspace_misses() - before,
+            THREADS * PER_THREAD,
+            "colliding slots must still sum exactly"
+        );
     }
 
     /// The counters ONE thread bumps for a single command must stay on the

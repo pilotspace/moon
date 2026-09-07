@@ -9,9 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use metrics::gauge;
 
 use crate::admin::metrics_setup::{
-    DISPATCH_CROSS_READ_FAST_TOTAL, DISPATCH_CROSS_READ_SPSC_TOTAL, METRICS_INITIALIZED,
-    PIPELINE_MULTIKEY_FANOUT_TOTAL, PIPELINE_REMOTE_DEFER_TOTAL, TOTAL_CONNECTIONS,
-    total_commands_sum,
+    METRICS_INITIALIZED, PIPELINE_MULTIKEY_FANOUT_TOTAL, PIPELINE_REMOTE_DEFER_TOTAL,
+    TOTAL_CONNECTIONS, sum_hot, total_commands_sum,
 };
 
 // ── Memory metrics ──────────────────────────────────────────────────────
@@ -225,14 +224,14 @@ pub fn total_connections_received() -> u64 {
 /// Always accurate — does not require Prometheus to be initialised.
 #[inline]
 pub fn total_dispatch_cross_spsc() -> u64 {
-    DISPATCH_CROSS_READ_SPSC_TOTAL.load(Ordering::Relaxed)
+    sum_hot(|s| &s.dispatch_cross_spsc)
 }
 
 /// Total cross-shard reads served locally under a shared guard (L4 S4),
 /// with no SPSC hop. Zero whenever `--cross-shard-fast-path off`.
 #[inline]
 pub fn total_dispatch_cross_read_fast() -> u64 {
-    DISPATCH_CROSS_READ_FAST_TOTAL.load(Ordering::Relaxed)
+    sum_hot(|s| &s.dispatch_cross_read_fast)
 }
 
 /// Total pipeline batches cut short by the moon#507 ordering guard (moon#513).
