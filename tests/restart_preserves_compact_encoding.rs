@@ -94,13 +94,12 @@ enum Base {
 
 fn read_base(dir: &std::path::Path) -> Base {
     let manifest = dir.join("appendonlydir").join("moon.aof.manifest");
-    if let Ok(text) = std::fs::read_to_string(&manifest) {
-        if let Some(seq) = text
+    if let Ok(text) = std::fs::read_to_string(&manifest)
+        && let Some(seq) = text
             .lines()
             .find_map(|l| l.strip_prefix("seq ")?.trim().parse().ok())
-        {
-            return Base::Manifest(seq);
-        }
+    {
+        return Base::Manifest(seq);
     }
     if let Ok(md) = std::fs::metadata(dir.join("appendonly.aof")) {
         return Base::Flat(md.len(), md.modified().ok());

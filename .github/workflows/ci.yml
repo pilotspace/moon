@@ -159,6 +159,14 @@ jobs:
       # Clippy (3 feature configurations — shares compilation between runs)
       - name: Clippy (default)
         run: cargo clippy -- -D warnings
+      # `--all-targets` or tests, benches and examples are never linted at all.
+      # moon#835: two errors sat in `tests/` and `src/io/fd_table.rs` for weeks
+      # because every clippy invocation here is lib-only, and moon#840 then
+      # added a third the same day it merged. Linux-gated files (`fd_table.rs`
+      # is `cfg(target_os = "linux")`) are ALSO invisible to a macOS run, so
+      # this leg on ubuntu is the only thing that sees them.
+      - name: Clippy (all targets — tests, benches, examples)
+        run: cargo clippy --all-targets -- -D warnings
       - name: Clippy (graph)
         run: cargo clippy --features graph -- -D warnings
       - name: Clippy (tokio)
