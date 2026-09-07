@@ -115,6 +115,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build, oracle and method are stated in BENCHMARK.md §3.
 ### Fixed
 
+- **`scripting`/`persistence`: a Lua or Functions script write under
+  `appendfsync always` is acknowledged only after the fsync that covers it
+  (#831).** `EVAL`/`EVALSHA` carry no `WRITE` flag by design — the bridge
+  emits one effect record per successful inner `redis.call`, fire-and-forget
+  into the shard's AOF writer — but the script arms never joined the
+  batch-end barrier set that every ordinary write joins, so a batch holding
+  only script writes issued zero fsyncs before its reply. The records were
+  durable by accident of the writer's policy-driven fsync landing first,
+  which is exactly what #763's waiter-gated fsync removes; #831 therefore
+  blocked #763.
+
+  Reproduced on `main@b04e8990` (macOS aarch64, monoio, `--shards 1`): with
+  a second connection keeping the writer busy, an `EVAL` that `SET`s was
+  acked `:1` and the key was gone after `kill -9` + restart in **9 of 16**
+  attempts; the identical shape with a plain `SET` lost **0 of 16**. Under
+  `MOON_TEST_AOF_FSYNC_FAIL=1` a plain `SET` answered `AOF_FSYNC_ERR` while
+  `EVAL`, `EVALSHA` and `FCALL` answered their script's `:1` — 32 of 32 at
+  `--shards 4`, routed arms included.
+
+  The fix: every script arm reads the bridge's per-script write flag
+  (`take_script_had_write`, consumed immediately after the VM returns and
+  before any `.await`) and, when the script wrote and its reply is not an
+  error, pushes the reply slot into `local_leg_write_idxs` so
+  `resolve_local_leg_barrier` covers it with the batch's ONE `fsync_barrier`
+  — the same group commit a `SET` gets, on both the monoio and the tokio
+  sharded handler. A script routed to the shard owning its keys reports the
+  flag in `ExecReply::script_wrote`, and the originator awaits
+  `fsync_barrier(owner)` before serializing the reply. Read-only scripts and
+  `EVAL_RO`/`FCALL_RO` are untouched. After the fix: 0 of 16 acked script
+  writes lost across kill -9; every write-script arm answers the injected
+  fsync failure. Pinned by `tests/script_write_fsync_barrier_831.rs`.
+
 - **`persistence`: a restart no longer flattens every compact encoding.** RDB
   decode rebuilt each container in its *full* form, so a listpack hash, a
   listpack list, an intset and a set listpack all came back as

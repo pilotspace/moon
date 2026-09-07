@@ -214,6 +214,9 @@ pub(super) async fn try_handle_evalsha(
     conn: &ConnectionState,
     ctx: &ConnectionContext,
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
+    // moon#831: reply slots of local-leg writes pending the batch-end
+    // `fsync_barrier(ctx.shard_id)` — a script that wrote joins it.
+    local_leg_write_idxs: &mut Vec<usize>,
 ) -> bool {
     // `EVALSHA_RO` is `EVALSHA` with writes refused, and shares every step
     // below — resolving the caller, routing, the cached body. The ONE
@@ -258,6 +261,10 @@ pub(super) async fn try_handle_evalsha(
             )
         })
     });
+    // moon#831: read the write flag BEFORE the await below — it is a
+    // thread-local and another connection's script may run on this thread
+    // during the yield.
+    let wrote = crate::scripting::bridge::take_script_had_write();
     let response = crate::server::conn::shared::finish_script_flush(
         pending_flush,
         response,
@@ -268,6 +275,12 @@ pub(super) async fn try_handle_evalsha(
         ctx,
     )
     .await;
+    // moon#831: a script that wrote is a local-leg write. Its effect records
+    // are already in this shard's AOF writer (fire-and-forget from the
+    // bridge); the reply must wait for the batch-end barrier like any SET.
+    if crate::server::conn::shared::script_write_joins_barrier(wrote, &response) {
+        local_leg_write_idxs.push(responses.len());
+    }
     responses.push(response);
     true
 }
@@ -284,6 +297,8 @@ pub(super) async fn try_handle_eval(
     ctx: &ConnectionContext,
     shutdown: &crate::runtime::cancel::CancellationToken,
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
+    // moon#831: see `try_handle_evalsha`.
+    local_leg_write_idxs: &mut Vec<usize>,
 ) -> bool {
     // `EVAL_RO` — see `try_handle_evalsha`.
     let read_only = cmd.eq_ignore_ascii_case(b"EVAL_RO");
@@ -327,6 +342,10 @@ pub(super) async fn try_handle_eval(
             )
         })
     });
+    // moon#831: read the write flag BEFORE the await below — it is a
+    // thread-local and another connection's script may run on this thread
+    // during the yield.
+    let wrote = crate::scripting::bridge::take_script_had_write();
     let response = crate::server::conn::shared::finish_script_flush(
         pending_flush,
         response,
@@ -337,6 +356,12 @@ pub(super) async fn try_handle_eval(
         ctx,
     )
     .await;
+    // moon#831: a script that wrote is a local-leg write. Its effect records
+    // are already in this shard's AOF writer (fire-and-forget from the
+    // bridge); the reply must wait for the batch-end barrier like any SET.
+    if crate::server::conn::shared::script_write_joins_barrier(wrote, &response) {
+        local_leg_write_idxs.push(responses.len());
+    }
     responses.push(response);
     true
 }
@@ -1549,6 +1574,9 @@ pub(super) async fn try_handle_functions(
     func_registry: &Rc<RefCell<Option<crate::scripting::FunctionRegistry>>>,
     shutdown: &crate::runtime::cancel::CancellationToken,
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
+    // moon#831: see `try_handle_evalsha` — an FCALL that wrote joins the
+    // batch barrier.
+    local_leg_write_idxs: &mut Vec<usize>,
 ) -> bool {
     if conn.in_multi {
         return false;
@@ -1646,6 +1674,8 @@ pub(super) async fn try_handle_functions(
                 })
             })
         };
+        // moon#831: read BEFORE the await — see `try_handle_eval`.
+        let wrote = crate::scripting::bridge::take_script_had_write();
         let response = crate::server::conn::shared::finish_script_flush(
             pending_flush,
             response,
@@ -1656,6 +1686,9 @@ pub(super) async fn try_handle_functions(
             ctx,
         )
         .await;
+        if crate::server::conn::shared::script_write_joins_barrier(wrote, &response) {
+            local_leg_write_idxs.push(responses.len());
+        }
         responses.push(response);
         return true;
     }

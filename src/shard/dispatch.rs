@@ -586,6 +586,12 @@ pub struct ExecReply {
     /// which is nearly all of them, and is what [`ExecReply::plain`] states at
     /// each such site rather than leaving it to be inferred.
     pub script_flush: Option<crate::scripting::pending_flush::PendingFlush>,
+    /// moon#831: the routed script issued at least one `WRITE`-flagged
+    /// `redis.call`. Its effect records were enqueued fire-and-forget on the
+    /// OWNER shard's AOF writer, so under `appendfsync always` the ORIGINATOR
+    /// must confirm them with one `fsync_barrier(owner)` before it serializes
+    /// this reply — the owner's synchronous message loop cannot await one.
+    pub script_wrote: bool,
 }
 
 impl ExecReply {
@@ -595,6 +601,7 @@ impl ExecReply {
         Self {
             frame,
             script_flush: None,
+            script_wrote: false,
         }
     }
 }

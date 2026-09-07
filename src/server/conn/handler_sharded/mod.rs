@@ -1250,6 +1250,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 },
                             )
                         });
+                        // moon#831: read the write flag BEFORE the await —
+                        // thread-local; another connection's script can run
+                        // on this thread during the yield.
+                        let wrote = crate::scripting::bridge::take_script_had_write();
                         let response = crate::server::conn::shared::finish_script_flush(
                             pending_flush,
                             response,
@@ -1260,6 +1264,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                             ctx,
                         )
                         .await;
+                        // moon#831: a script that wrote is a local-leg write;
+                        // its reply waits for the batch-end barrier like a SET.
+                        if crate::server::conn::shared::script_write_joins_barrier(
+                            wrote, &response,
+                        ) {
+                            local_leg_write_idxs.push(responses.len());
+                        }
                         responses.push(response);
                         continue;
                     }
@@ -1503,6 +1514,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 )
                             })
                             };
+                            // moon#831: read BEFORE the await — see the EVAL arm.
+                            let wrote = crate::scripting::bridge::take_script_had_write();
                             let response = crate::server::conn::shared::finish_script_flush(
                                 pending_flush,
                                 response,
@@ -1513,6 +1526,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 ctx,
                             )
                             .await;
+                            if crate::server::conn::shared::script_write_joins_barrier(
+                                wrote, &response,
+                            ) {
+                                local_leg_write_idxs.push(responses.len());
+                            }
                             responses.push(response);
                             continue;
                         }

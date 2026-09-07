@@ -343,6 +343,25 @@ pub fn script_had_write() -> bool {
     SCRIPT_HAD_WRITE.with(|c| c.get())
 }
 
+/// moon#831: read AND reset the write flag of the script that just ran.
+///
+/// The script arms call this once, right after the VM returns, to decide
+/// whether the reply must wait for the batch-end `fsync_barrier` under
+/// `appendfsync always`. `set_script_db` resets the flag at the START of
+/// every script, so a plain read would be exact for a script that ran —
+/// but an arm that answers WITHOUT running the VM (`NOSCRIPT`, a parse
+/// error) would otherwise read the previous script's value. Consuming it
+/// here makes a stale `true` impossible by construction.
+///
+/// The flag is set on every `WRITE`-flagged `redis.call`, before the OOM
+/// gate and before execution: a superset of "an effect record was
+/// emitted". Over-arming costs one fsync that was already owed to the
+/// batch; under-arming is the moon#831 defect. The superset is the safe
+/// side.
+pub fn take_script_had_write() -> bool {
+    SCRIPT_HAD_WRITE.with(|c| c.replace(false))
+}
+
 /// Create a Lua function that bridges redis.call/redis.pcall to the Rust dispatch().
 ///
 /// If `propagate_errors` is true (redis.call), Frame::Error results are raised as Lua errors.
