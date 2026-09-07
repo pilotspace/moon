@@ -64,14 +64,13 @@ Moon uses specialized compact types to minimize per-key overhead:
 |--------|------|-------------|
 | CompactKey | 24 B | Inline keys up to 23 bytes (zero heap allocation) |
 | CompactEntry | 24 B | CompactValue (16B) + TTL delta (4B) + metadata (4B) |
-| CompactValue | 16 B | SSO for values up to 12 bytes inline |
-| HeapString | 24 B | `Vec<u8>` with no Arc overhead for non-shared values |
+| CompactValue | 16 B | SSO for values up to 12 bytes inline; larger strings are one `Box<[u8]>` whose pointer AND length both live in the 16 bytes |
 
 ### Why Moon uses less memory at larger values
 
 ```
-Moon:  CompactValue(16B) → Box<HeapString> → Vec<u8>(24B) → data
-       Total overhead: 48 bytes + data
+Moon:  CompactValue(16B) → data          (one allocation of exactly len bytes;
+       Total overhead: 16 bytes + data      no wrapper, no length word on the heap)
 
 Redis: dictEntry(24B) → robj(16B) → SDS(8-17B + data) + jemalloc rounding
        Total overhead: ~64-80 bytes + data
