@@ -10,11 +10,19 @@ set -euo pipefail
 #
 # Exits 0 when every kind and RSS are within +/-5% of baseline.
 # Exits 1 when ANY kind grows >5% (prints the offending kind + delta).
-# Exits 2 when --self-test detects that the gate itself is broken.
+# Exits 2 when the gate CANNOT run: --self-test found the comparison broken,
+#   or the committed baseline was captured on a different platform than the one
+#   measuring now (comparing a Linux snapshot to a macOS baseline is noise, not
+#   a regression signal).
+#
+# --self-test is a PHASE, not a mode: it proves the comparison can detect an
+# injected regression, then falls through to the real baseline comparison. It
+# used to `exit 0` right after the injection check, so CI ran the gate for
+# months without ever comparing against the committed baseline (moon#764).
 #
 # Usage:
 #   bash scripts/bench-memory-steady-state.sh                 # Compare vs baseline
-#   bash scripts/bench-memory-steady-state.sh --self-test     # Run bench + injection test
+#   bash scripts/bench-memory-steady-state.sh --self-test     # Self-test THEN compare
 #   bash scripts/bench-memory-steady-state.sh --write-baseline tests/fixtures/memory-baseline.json
 #   bash scripts/bench-memory-steady-state.sh --threshold 10  # Custom tolerance %
 #   bash scripts/bench-memory-steady-state.sh --help
@@ -273,7 +281,17 @@ else:
 
     # --- Build JSON ---
     local snapshot
+    # Provenance: a memory baseline is only comparable to a snapshot taken on
+    # the same platform. RSS, allocator behaviour and struct padding all differ
+    # across OS and arch, so a cross-platform delta measures the runner, not the
+    # code.
+    local prov_os prov_arch
+    prov_os=$(uname -s)
+    prov_arch=$(uname -m)
+
     snapshot=$(jq -n \
+        --arg prov_os "$prov_os" \
+        --arg prov_arch "$prov_arch" \
         --argjson rss "$rss_bytes" \
         --argjson dt_d "${doc_dashtable}" \
         --argjson dt_p "${prom_dashtable}" \
@@ -290,6 +308,7 @@ else:
         --argjson ao_d "${doc_alloc}" \
         --argjson ao_p "${prom_alloc}" \
         '{
+            platform: { os: $prov_os, arch: $prov_arch, profile: "debug" },
             rss: $rss,
             kinds: {
                 dashtable:          { doctor: $dt_d,   prom: $dt_p },
@@ -353,6 +372,55 @@ else:
     else
         log "  All kinds agree within +/-2%"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Baseline provenance guard
+# ---------------------------------------------------------------------------
+# A memory baseline is only meaningful against the platform it was captured on.
+# The committed fixture was taken on macOS aarch64 while this gate runs on
+# ubuntu-latest, so every delta would have been runner noise rather than a code
+# regression -- which nobody noticed, because --self-test exited before the
+# comparison ever ran. Refuse to compare rather than emit a number that looks
+# like a measurement and is not one.
+#
+# Returns 0 to proceed, 2 when the gate cannot legitimately run.
+check_baseline_provenance() {
+    local snapshot="$1"
+    local baseline_file="$2"
+
+    if [[ ! -f "$baseline_file" ]]; then
+        log "GATE CANNOT RUN: baseline not found: $baseline_file"
+        return 2
+    fi
+
+    local b_os b_arch m_os m_arch
+    b_os=$(jq -r '.platform.os   // "MISSING"' "$baseline_file")
+    b_arch=$(jq -r '.platform.arch // "MISSING"' "$baseline_file")
+    m_os=$(echo "$snapshot" | jq -r '.platform.os')
+    m_arch=$(echo "$snapshot" | jq -r '.platform.arch')
+
+    if [[ "$b_os" == "MISSING" || "$b_arch" == "MISSING" ]]; then
+        log "GATE CANNOT RUN: $baseline_file records no platform provenance."
+        log "  It predates the provenance field, so there is no way to tell"
+        log "  which OS/arch it was captured on. Regenerate it ON THE PLATFORM"
+        log "  THIS GATE RUNS ON (currently ${m_os}/${m_arch}):"
+        log "    bash scripts/bench-memory-steady-state.sh --write-baseline $baseline_file"
+        return 2
+    fi
+
+    if [[ "$b_os" != "$m_os" || "$b_arch" != "$m_arch" ]]; then
+        log "GATE CANNOT RUN: baseline/runner platform mismatch."
+        log "  baseline: ${b_os}/${b_arch}"
+        log "  measured: ${m_os}/${m_arch}"
+        log "  Cross-platform memory deltas measure the runner, not the code."
+        log "  Regenerate on ${m_os}/${m_arch}:"
+        log "    bash scripts/bench-memory-steady-state.sh --write-baseline $baseline_file"
+        return 2
+    fi
+
+    log "Baseline provenance OK: ${b_os}/${b_arch}"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -531,10 +599,27 @@ main() {
         log ""
         log "=== SELF-TEST PASSED: gate is functional ==="
         rm -f "$tmp_baseline"
-        exit 0
+        # NO exit here. The self-test only proves the comparison WORKS; it
+        # compares the snapshot against itself, which can never fail for a real
+        # regression. Falling through to the committed-baseline comparison
+        # below is the part that actually gates. This `exit 0` used to sit
+        # right here and was the bug that made the job vacuous (moon#764):
+        # every PR "passed" a check that had never read the committed baseline.
+        log ""
     fi
 
-    # --- Normal mode: compare against committed baseline ---
+    # --- Compare against the committed baseline ---
+    # Provenance first: an incomparable baseline means the gate cannot run
+    # (exit 2), which is a different failure mode from "compared cleanly"
+    # (exit 0) or "a kind regressed" (exit 1) -- silently passing a
+    # cross-platform comparison would just replace one vacuous gate with
+    # another.
+    local prov_rc=0
+    check_baseline_provenance "$snapshot" "$BASELINE_PATH" || prov_rc=$?
+    if [[ "$prov_rc" -ne 0 ]]; then
+        exit "$prov_rc"
+    fi
+
     if compare_snapshot "$snapshot" "$BASELINE_PATH" "$THRESHOLD"; then
         exit 0
     else

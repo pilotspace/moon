@@ -471,7 +471,18 @@ jobs:
           exit 1
       - name: Build moon
         run: cargo build --no-default-features --features runtime-tokio,jemalloc,graph,text-index
-      - name: Run memory steady-state gate (with self-test)
+      - name: Run memory steady-state gate (self-test, then baseline comparison)
+        # self-test is a PHASE, not a mode: it proves the comparison can
+        # detect an injected +6% regression, then falls through to the real
+        # comparison against tests/fixtures/memory-baseline.json. It used to
+        # exit 0 right after the injection check, so this job passed for
+        # months without ever reading the committed baseline (moon#764).
+        #
+        # Exit codes: 0 = within tolerance, 1 = a kind regressed,
+        # 2 = the gate CANNOT run (no/mismatched baseline provenance).
+        # The committed baseline was captured on macOS aarch64 and this runner
+        # is ubuntu-latest, so the gate reports 2 until the baseline is
+        # regenerated here -- see tests/fixtures/memory-baseline.README.md.
         run: bash scripts/bench-memory-steady-state.sh --self-test --skip-build
       - name: Upload report on failure
         if: failure()

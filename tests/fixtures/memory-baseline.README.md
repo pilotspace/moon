@@ -43,8 +43,43 @@ bash scripts/bench-memory-steady-state.sh --write-baseline tests/fixtures/memory
 chore(190-04): [memory-baseline-update] reason: added per-entry metadata field
 ```
 
+## Platform provenance (required)
+
+A memory baseline is only comparable to a snapshot captured on the **same OS and
+architecture**. RSS reporting, allocator behaviour and struct padding all differ
+across platforms, so a cross-platform delta measures the runner, not the code.
+
+Every snapshot therefore records:
+
+```json
+"platform": { "os": "Linux", "arch": "x86_64", "profile": "debug" }
+```
+
+`check_baseline_provenance` in the script **refuses to compare** (exit 2) when the
+baseline carries no provenance, or when its platform differs from the machine
+measuring now. Exit 2 means "the gate cannot run", which is distinct from exit 1,
+"a kind regressed".
+
+> **This fixture predates the provenance field and was captured on macOS aarch64
+> (see Capture Details above), while the CI job runs on `ubuntu-latest`.** It must
+> be regenerated on the platform the gate runs on before the comparison can do
+> anything. Until then the job exits 2 and says so -- which is the honest state,
+> not a new breakage: the comparison had never run at all (see below).
+
 ## CI Gate
 
 The `memory-steady-state` job in `.github/workflows/ci.yml` compares every PR's
 memory profile against this baseline with a +/-5% per-kind tolerance. If any kind
 exceeds the threshold, the job fails with the offending kind and delta percentage.
+
+### History: the gate was vacuous (moon#764)
+
+CI invoked the script as `--self-test --skip-build`, and `--self-test` used to
+`exit 0` immediately after its injection check -- **before** the
+committed-baseline comparison. The self-test compares the freshly captured
+snapshot against *itself*, so it can only ever prove the comparison machinery
+works; it can never detect a real regression. The result: the job passed for
+months without once reading this file.
+
+`--self-test` is now a *phase*. It runs the injection check, then falls through to
+the real comparison.
