@@ -205,6 +205,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   earlier) and is covered by the new gate too.
   `tests/read_preserves_compact_encoding.rs` asserts the encoding survives on
   all three dispatch paths; 19 of its 52 cases fail on the pre-fix binary.
+- **`server`: a reader inside its own `TXN` no longer sees another
+  connection's uncommitted write through the inline `GET` fast path (#807).**
+  Inside an open cross-store transaction the generic read leg runs the
+  write-intent visibility filter (`KvWriteIntents::is_key_visible`) and
+  answers `(nil)` for a key carrying a foreign transaction's uncommitted
+  intent; `try_inline_dispatch` never consults the intent table, and
+  `can_inline_reads` carried no `in_cross_txn` term, so the same reader got
+  `"modified"` from the fast path and `(nil)` from generic dispatch for the
+  same key. Measured on `b04e8990` at `--shards 1` with one reader speaking
+  both framings back to back. The read gate now stands down inside a `TXN`,
+  the term the write gate has carried since #660 — one `Option::is_some()`
+  per batch, already loaded for the write gate. Scope: this closes the
+  divergence between the dispatch paths. A reader that is NOT in a
+  transaction sees the uncommitted value on both paths — the generic filter
+  is gated on the reader's own transaction and non-transactional operations
+  bypass the intent table by design — and that contract is unchanged here.
+  `tests/inline_read_txn_visibility_807.rs` (monoio; red on `b04e8990`).
 
 - **`persistence`: a restart no longer flattens every compact encoding.** RDB
   decode rebuilt each container in its *full* form, so a listpack hash, a

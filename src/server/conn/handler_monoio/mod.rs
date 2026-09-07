@@ -1433,8 +1433,43 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // already accepted diagnostic overhead; when unattached this is one
             // Relaxed load that the branch below would take anyway.
             let monitored = crate::monitor::any_attached();
-            let can_inline_reads =
-                acl_unrestricted && !conn.in_multi && !conn.tracking_state.enabled && !monitored;
+            // moon#807: `!conn.in_cross_txn()` — the same term the write gate
+            // carries. Inside an open `TXN` the generic read leg runs the
+            // write-intent visibility filter (the `if conn.in_cross_txn()`
+            // block ahead of `dispatch_read` further down this file:
+            // `kv_write_intents.is_key_visible`) and answers `Null` for a
+            // key carrying ANOTHER transaction's uncommitted intent.
+            // `try_inline_dispatch` never consults `kv_write_intents`, so
+            // without this term a reader inside its own TXN answered a plain
+            // `GET` from the fast path and saw the foreign transaction's
+            // uncommitted value — the two dispatch paths disagreed on the
+            // same key for the same reader. Measured on `b04e8990`,
+            // `--shards 1`, one reader connection, both framings:
+            //
+            //     A: SET k original; TXN BEGIN; SET k modified   (uncommitted)
+            //     B: TXN BEGIN
+            //     B: GET k   (RESP array)   "modified"  local_inline +1: INLINED
+            //     B: GET k   (text form)    (nil)       generic: the filter ran
+            //
+            // The filter needs the reader's snapshot LSN and txn id plus the
+            // committed-set snapshot from the vector store's txn manager;
+            // none of that belongs in the hottest function in the codebase,
+            // and the generic leg already does it. Standing down is one
+            // `Option::is_some()` on a connection field per batch, the load
+            // the write gate below takes anyway.
+            //
+            // Scope: this closes the DIVERGENCE between the paths. A reader
+            // that is NOT in a transaction sees the uncommitted value on
+            // both paths — `KvWriteIntents` is documented as bypassed by
+            // non-transactional operations and the generic filter is gated
+            // on the READER's `in_cross_txn()`. That is the engine's
+            // isolation contract for plain clients, unchanged here.
+            // See `tests/inline_read_txn_visibility_807.rs`.
+            let can_inline_reads = acl_unrestricted
+                && !conn.in_multi
+                && !conn.in_cross_txn()
+                && !conn.tracking_state.enabled
+                && !monitored;
             // moon#660: this term used to be `ctx.spill_sender.is_none()`, a
             // CONFIG predicate standing in for a STATE one. `--disk-offload`
             // defaults to `enable`, which spawns a per-shard `SpillThread` and
@@ -1512,8 +1547,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // is measured end-to-end and is what the `!conn.in_cross_txn()`
             // term is justified by. The snapshot-visibility half is stated
             // from the code, not from a measurement — and note that the inline
-            // READ path bypasses that same filter independently of this term
-            // (a dirty read, present identically on merge-base: moon#807). So
+            // READ path bypassed that same filter independently of this term
+            // (a dirty read, present identically on merge-base: moon#807,
+            // closed by the matching term on `can_inline_reads` above). So
             // do not read this term as closing the visibility hole; it closes
             // the undo hole.
             //
