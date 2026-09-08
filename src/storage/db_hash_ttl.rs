@@ -108,6 +108,16 @@ impl Database {
             NoOp,
         }
 
+        // moon#861: the reap frees real, billed bytes — the field entries, the
+        // sidecar entries, and on a downgrade the sidecar box. None of it was
+        // credited, so a hash whose fields expired one by one left `used_memory`
+        // permanently above the truth (`recalculate_memory` is a load-time
+        // healer only). Accumulated here, settled once the `rv` borrow ends.
+        //
+        // `KeyDeleted` credits nothing: the caller's `db.remove(key)` runs
+        // `remove_hot`, which credits `entry_overhead` recomputed from the
+        // value as it stands — crediting here too would double-credit.
+        let mut credit: usize = 0;
         let action = match rv {
             RedisValue::HashWithTtl {
                 fields,
@@ -115,12 +125,18 @@ impl Database {
                 min_expiry_ms,
             } => {
                 for f in &to_remove {
-                    fields.remove(f.as_ref());
-                    ttls.remove(f.as_ref());
+                    if let Some(v) = fields.remove(f.as_ref()) {
+                        credit += crate::storage::db::hash_field_cost(f.as_ref(), &v);
+                    }
+                    if ttls.remove(f.as_ref()).is_some() {
+                        credit += crate::storage::db::hash_ttl_field_cost(f.as_ref());
+                    }
                 }
                 if fields.is_empty() {
+                    credit = 0;
                     PostReap::KeyDeleted
                 } else if ttls.is_empty() {
+                    credit += crate::storage::db::hash_ttl_sidecar_box_cost();
                     PostReap::NeedDowngrade(std::mem::take(fields))
                 } else {
                     // All reaped TTLs were <= now_ms, so the old min is gone.
@@ -133,7 +149,7 @@ impl Database {
             _ => PostReap::NoOp,
         };
 
-        match action {
+        let outcome = match action {
             PostReap::KeyDeleted => ReapOutcome::KeyDeleted,
             PostReap::NeedDowngrade(m) => {
                 // `rv` borrow from the previous match is gone; reassign safely.
@@ -142,6 +158,10 @@ impl Database {
             }
             PostReap::FieldsRemoved => ReapOutcome::FieldsRemoved,
             PostReap::NoOp => ReapOutcome::NoOp,
+        };
+        if credit > 0 {
+            self.credit_memory(credit);
         }
+        outcome
     }
 }

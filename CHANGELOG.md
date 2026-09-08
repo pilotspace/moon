@@ -64,6 +64,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `every_boxed_payload_block_is_billed` covers all six variants and fails on
   each of them without the fix.
 
+- **`storage`: the `HashWithTtl` promotion/downgrade ledger balances.** The
+  `ttls` sidecar was allocated by `promote_to_hash_with_ttl` on the first
+  `HEXPIRE` with no `charge_memory`, while `remove_hot` credits
+  `entry_overhead` recomputed from the value as it stands at `DEL` time —
+  which does include it. `HSET h f v; HEXPIRE h 100 FIELDS 1 f; DEL h` in a
+  loop therefore walked `used_memory` **down by 120 B every iteration**
+  (248 B from a `HashListpack` key), unbounded and reachable from any
+  unprivileged connection. `credit_memory` saturates at 0, and once there
+  `--maxmemory` can never bind again; `recalculate_memory` is a load-time
+  healer only, so nothing repairs it at runtime. Same class as moon#788,
+  moon#810 and moon#814.
+
+  Boxing `ttls` (above) contributes 48 B of that; the other 72 B is the
+  sidecar *entry* itself, which `estimate_memory` has always billed and no
+  writer has ever charged. Both are fixed together, in both directions:
+  `promote_to_hash_with_ttl` now returns the signed delta it caused — O(1) and
+  exact from a plain `Hash` (only the empty sidecar box is new), a before/after
+  snapshot from a `HashListpack`, whose conversion changes the cost model
+  outright and used to lose 320 B. Every site that drops a sidecar entry
+  (`hash_persist_field`, `hash_clear_field_ttls`, `hash_delete_field`,
+  `hash_get_and_delete_field`, the past-expiry short-circuit, and the active
+  `reap_expired_fields_one_hash` sweep, which credited nothing at all) now
+  credits the entry, plus the sidecar box on the downgrade back to plain
+  `Hash`.
+
+  `tests/hash_ttl_memory_accounting.rs` holds the guard. Its oracle is
+  `recalculate_memory()` — a full rescan by the same `entry_overhead` the
+  running ledger claims to track incrementally — which is strictly stronger
+  than checking deltas one at a time. All 7 tests fail on the parent commit;
+  the two end-to-end cycle tests carry ballast keys deliberately, because on
+  an empty database the ledger starts at 0, over-crediting saturates back to
+  0, and the repro passes against the very bug it exists to catch.
+
 - **`ci`: clippy now lints tests, benches and examples.** Every clippy
   invocation in `ci.yml` was lib-only, so `--all-targets` code was never
   linted anywhere: moon#835's two errors (`tests/busy_poll_idle.rs`,

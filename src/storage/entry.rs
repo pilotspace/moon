@@ -1290,6 +1290,20 @@ mod accounting_788 {
     /// the block structure itself, and the contents term is either zero or
     /// computed here from the same public helper `estimate_memory` uses — never
     /// from `estimate_memory`, which is what is on trial.
+    /// moon#861: `hash_ttl_sidecar_box_cost` prices the `HashWithTtl.ttls` box
+    /// from the declared type so promotion and downgrade can charge/credit it
+    /// in O(1) with no live map to measure. If it ever stops mirroring what
+    /// `boxed_payload_bytes` actually bills, the ledger drifts by exactly that
+    /// difference on every HEXPIRE — silently. Pin the two together.
+    #[test]
+    fn hash_ttl_sidecar_box_cost_mirrors_the_billed_block() {
+        assert_eq!(
+            crate::storage::db::hash_ttl_sidecar_box_cost(),
+            boxed_payload_block(&HashMap::<Bytes, u64>::new()),
+            "the O(1) sidecar constant must equal the block estimate_memory bills"
+        );
+    }
+
     #[test]
     fn every_boxed_payload_block_is_billed() {
         fn cls<T: ?Sized>(v: &T) -> usize {

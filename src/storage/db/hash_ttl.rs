@@ -7,7 +7,8 @@ use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::RedisValue;
 
 use crate::storage::db::{
-    Database, FieldState, HashTtlCond, WrongType, hash_field_cost, promote_to_hash_with_ttl,
+    Database, FieldState, HashTtlCond, WrongType, hash_field_cost, hash_ttl_field_cost,
+    hash_ttl_sidecar_box_cost, promote_to_hash_with_ttl,
 };
 
 impl Database {
@@ -84,12 +85,19 @@ impl Database {
                     min_expiry_ms,
                 } => {
                     let old_ttl = ttls.remove(field);
+                    // moon#861: the sidecar entry is billed by
+                    // `estimate_memory` too — credit it with the field.
+                    if old_ttl.is_some() {
+                        credit += hash_ttl_field_cost(field);
+                    }
                     if let Some(v) = fields.remove(field) {
-                        credit = hash_field_cost(field, &v);
+                        credit += hash_field_cost(field, &v);
                     }
                     if ttls.is_empty() {
                         let m = std::mem::take(fields);
                         *rv = RedisValue::Hash(m);
+                        // The sidecar BOX goes away with the variant swap.
+                        credit += hash_ttl_sidecar_box_cost();
                     } else if old_ttl == Some(*min_expiry_ms) {
                         // The removed field held the min; recompute.
                         *min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
@@ -104,7 +112,14 @@ impl Database {
         }
 
         // 4. Promote to HashWithTtl if needed.
-        promote_to_hash_with_ttl(rv);
+        //
+        // moon#861: promotion allocates — the `ttls` sidecar box always, and a
+        // whole `HashMap` when coming from a listpack. `remove_hot` credits
+        // `entry_overhead` recomputed from the value at DEL time, so those
+        // bytes get credited whether or not they were ever charged. The delta
+        // is accumulated here and settled once at the end of the call, after
+        // the `&mut` borrow into `self.data` has ended.
+        let mut mem_delta = promote_to_hash_with_ttl(rv);
         let RedisValue::HashWithTtl {
             ttls,
             min_expiry_ms,
@@ -125,10 +140,18 @@ impl Database {
             HashTtlCond::Lt => current.is_some_and(|c| ts_ms < c) || current.is_none(),
         };
         if !pass {
+            // The promotion above already happened and is already billed by
+            // `estimate_memory`; the rejected TTL does not un-promote it.
+            self.apply_memory_delta(mem_delta);
             return Ok(-2);
         }
 
         // 6. Set the TTL and maintain the cached minimum.
+        // A brand-new sidecar entry costs `hash_ttl_field_cost`; overwriting an
+        // existing one replaces a `u64` in place and costs nothing.
+        if current.is_none() {
+            mem_delta += hash_ttl_field_cost(field) as isize;
+        }
         ttls.insert(Bytes::copy_from_slice(field), ts_ms);
         if ts_ms < *min_expiry_ms {
             *min_expiry_ms = ts_ms;
@@ -144,6 +167,7 @@ impl Database {
         // `self.hash_expiry_index` (same shape as the line above).
         self.hash_expiry_index
             .insert((ts_ms, crate::storage::compact_key::CompactKey::from(key)));
+        self.apply_memory_delta(mem_delta);
         Ok(1)
     }
 
@@ -211,14 +235,23 @@ impl Database {
         };
         let removed = ttls.remove(field);
         let had_ttl = removed.is_some();
+        // moon#861: both the sidecar ENTRY and, on the last removal, the
+        // sidecar BOX are billed by `estimate_memory`. Credit them here or the
+        // eventual DEL credits bytes this path never released.
+        let mut credit: usize = 0;
         if had_ttl {
+            credit += hash_ttl_field_cost(field);
             if ttls.is_empty() {
                 let m = std::mem::take(fields);
                 *rv = RedisValue::Hash(m);
+                credit += hash_ttl_sidecar_box_cost();
             } else if removed == Some(*min_expiry_ms) {
                 // Removed field held the minimum; recompute from remaining entries.
                 *min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
             }
+        }
+        if credit > 0 {
+            self.credit_memory(credit);
         }
         had_ttl
     }
@@ -252,8 +285,12 @@ impl Database {
         // Track whether any removed TTL equaled the cached minimum.
         // If so, recompute after all removals rather than re-scanning per step.
         let mut min_invalidated = false;
+        // moon#861: every sidecar entry dropped here was billed by
+        // `estimate_memory`, and so is the sidecar box once the last one goes.
+        let mut credit: usize = 0;
         for f in fields {
             if let Some(t) = ttls.remove(f.as_ref()) {
+                credit += hash_ttl_field_cost(f.as_ref());
                 if t == *min_expiry_ms {
                     min_invalidated = true;
                 }
@@ -267,9 +304,13 @@ impl Database {
             if let RedisValue::HashWithTtl { fields: fmap, .. } = rv2 {
                 let m = std::mem::take(fmap);
                 *rv2 = RedisValue::Hash(m);
+                credit += hash_ttl_sidecar_box_cost();
             }
         } else if min_invalidated {
             *min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
+        }
+        if credit > 0 {
+            self.credit_memory(credit);
         }
     }
 
@@ -327,10 +368,15 @@ impl Database {
                 if let Some(v) = fields.remove(field) {
                     credit = hash_field_cost(field, &v);
                     let old_ttl = ttls.remove(field);
+                    // moon#861: sidecar entry + (on the last one) sidecar box.
+                    if old_ttl.is_some() {
+                        credit += hash_ttl_field_cost(field);
+                    }
                     if ttls.is_empty() && !fields.is_empty() {
                         // All TTLs gone but fields remain — downgrade to plain Hash.
                         let m = std::mem::take(fields);
                         *rv = RedisValue::Hash(m);
+                        credit += hash_ttl_sidecar_box_cost();
                         Ok((true, false))
                     } else if ttls.is_empty() && fields.is_empty() {
                         // Both maps empty — signal caller to delete the key.
@@ -338,6 +384,7 @@ impl Database {
                         // caller will call db.remove() to drop the key.
                         let m = std::mem::take(fields);
                         *rv = RedisValue::Hash(m);
+                        credit += hash_ttl_sidecar_box_cost();
                         Ok((true, true))
                     } else {
                         // TTLs remain; recompute min if the removed field held it.
@@ -428,14 +475,20 @@ impl Database {
                 if let Some(ref val) = v {
                     credit = hash_field_cost(field, val);
                     let old_ttl = ttls.remove(field);
+                    // moon#861: sidecar entry + (on the last one) sidecar box.
+                    if old_ttl.is_some() {
+                        credit += hash_ttl_field_cost(field);
+                    }
                     if ttls.is_empty() && !fields.is_empty() {
                         // All TTLs gone, live fields remain — downgrade to Hash.
                         let m = std::mem::take(fields);
                         *rv = RedisValue::Hash(m);
+                        credit += hash_ttl_sidecar_box_cost();
                     } else if ttls.is_empty() && fields.is_empty() {
                         // Both maps empty — leave an empty Hash shell; caller
                         // must call cleanup_empty_hash to remove the key.
                         *rv = RedisValue::Hash(Box::default());
+                        credit += hash_ttl_sidecar_box_cost();
                     } else if old_ttl == Some(*min_expiry_ms) {
                         // Removed field held the minimum; recompute.
                         *min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);

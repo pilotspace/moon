@@ -135,6 +135,20 @@ pub fn hash_ttl_field_cost(field: &[u8]) -> usize {
     size_class(field.len()) + HASH_TTL_SLOT
 }
 
+/// Bytes the `HashWithTtl.ttls` **box** occupies — the second heap block a
+/// promoted hash carries on top of the `fields` box (moon#790 boxed both fat
+/// variant payloads). MUST mirror the `ttls` term of the `HashWithTtl` arm of
+/// `RedisValue::boxed_payload_bytes`.
+///
+/// It is priced from the declared field type rather than from a live value so
+/// promotion and downgrade can charge/credit it in O(1), with no map to
+/// measure — swapping `HashMap` for another container re-prices both sides
+/// here at once (moon#861).
+#[inline]
+pub fn hash_ttl_sidecar_box_cost() -> usize {
+    size_class(std::mem::size_of::<HashMap<Bytes, u64>>())
+}
+
 /// Per-element byte cost for `RedisValue::List`. MUST mirror the `List` arm
 /// of `RedisValue::estimate_memory`.
 #[inline]
@@ -244,9 +258,23 @@ pub struct WrongType;
 /// `RedisValue::HashWithTtl` carrying an empty `ttls` sidecar. No-op when the
 /// value is already `HashWithTtl`. Panics for non-hash variants — callers must
 /// type-check first.
-fn promote_to_hash_with_ttl(rv: &mut RedisValue) {
+///
+/// Returns the signed `estimate_memory` delta the promotion caused, which the
+/// caller MUST hand to [`Database::apply_memory_delta`].
+///
+/// # Why it is not memory-neutral (moon#861)
+///
+/// Promotion allocates a second boxed payload (`ttls`), and from a listpack it
+/// also materialises a whole `HashMap`. `remove_hot` credits `entry_overhead`
+/// recomputed from the value as it stands at DEL time, so it credits those
+/// bytes whether or not anyone charged them. Leaving the promotion silent made
+/// `HSET h f v; HEXPIRE h ...; DEL h` walk `used_memory` DOWN every cycle,
+/// unbounded — and `credit_memory` saturates at 0, past which `--maxmemory`
+/// can never bind again. Same class as moon#788 / moon#810 / moon#814.
+#[must_use = "the promotion's memory delta must be applied to the ledger"]
+fn promote_to_hash_with_ttl(rv: &mut RedisValue) -> isize {
     match rv {
-        RedisValue::HashWithTtl { .. } => {}
+        RedisValue::HashWithTtl { .. } => 0,
         RedisValue::Hash(_) => {
             let placeholder = RedisValue::Hash(Box::default());
             let owned = std::mem::replace(rv, placeholder);
@@ -260,14 +288,24 @@ fn promote_to_hash_with_ttl(rv: &mut RedisValue) {
                 ttls: Box::default(),
                 min_expiry_ms: u64::MAX,
             };
+            // O(1) and exact: `fields` moves across untouched and an empty
+            // `ttls` contributes no contents bytes, so the sidecar box IS the
+            // whole delta. No O(n) rescan on this hot-ish path.
+            hash_ttl_sidecar_box_cost() as isize
         }
         RedisValue::HashListpack(lp) => {
+            // The cost MODEL changes here (capacity-based listpack -> per-field
+            // HashMap sum + two boxes), so price it by before/after snapshot.
+            // O(n), but the `to_hash_map` conversion it pays for is already
+            // O(n) and fires at most once per key.
+            let before = lp.estimate_memory();
             let fields = lp.to_hash_map();
             *rv = RedisValue::HashWithTtl {
                 fields: Box::new(fields),
                 ttls: Box::default(),
                 min_expiry_ms: u64::MAX,
             };
+            rv.estimate_memory() as isize - before as isize
         }
         _ => panic!("promote_to_hash_with_ttl called on non-hash variant"),
     }
@@ -1051,6 +1089,20 @@ impl Database {
             self.charge_memory(new_cost - old_cost);
         } else {
             self.credit_memory(old_cost - new_cost);
+        }
+    }
+
+    /// Apply an already-signed byte delta. For call sites that accumulate a
+    /// running `isize` across several mutations in one command (an encoding
+    /// promotion that can move the ledger either way, plus the field/sidecar
+    /// costs around it) and settle the ledger once, after the `&mut` borrow
+    /// into the entry has ended. O(1), saturating, no allocation.
+    #[inline]
+    pub fn apply_memory_delta(&mut self, delta: isize) {
+        if delta >= 0 {
+            self.charge_memory(delta as usize);
+        } else {
+            self.credit_memory(delta.unsigned_abs());
         }
     }
 }
