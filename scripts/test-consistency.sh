@@ -512,6 +512,58 @@ log "=== 8. Set operations ==="
 
 both SADD s:test a b c d e
 assert_both "SCARD" SCARD s:test
+
+# OBJECT ENCODING parity for containers (moon#787). moon reported `hashtable`
+# for a small string set from its first member while Redis reports `listpack`:
+# `SetListpack` was wired end to end but no accessor ever produced one that
+# survived. No row here probed encoding, so the divergence went unseen.
+both SADD s:enc:lp a b c
+both SADD s:enc:int 1 2 3
+both HSET h:enc:lp f1 v1 f2 v2
+both RPUSH l:enc:lp a b c
+assert_both "OBJECT ENCODING small string set"  OBJECT ENCODING s:enc:lp
+assert_both "OBJECT ENCODING small int set"     OBJECT ENCODING s:enc:int
+assert_both "OBJECT ENCODING small hash"        OBJECT ENCODING h:enc:lp
+assert_both "OBJECT ENCODING small list"        OBJECT ENCODING l:enc:lp
+# A duplicate SADD is a no-op on both and must not change the encoding.
+assert_both "duplicate SADD on listpack set"    SADD s:enc:lp a
+assert_both "OBJECT ENCODING after duplicate"   OBJECT ENCODING s:enc:lp
+# SMEMBERS order is unspecified on both -- sort before comparing.
+redis_lp_sm=$(redis-cli -p "$PORT_REDIS" SMEMBERS s:enc:lp 2>&1 | sort)
+rust_lp_sm=$(redis-cli -p "$PORT_RUST" SMEMBERS s:enc:lp 2>&1 | sort)
+assert_eq "SMEMBERS listpack set (sorted)" "$redis_lp_sm" "$rust_lp_sm"
+# Exactly set-max-listpack-entries (128) members is STILL a listpack; one
+# more promotes to a hashtable on both. One SADD per step, not 129 — each
+# `both` spawns two redis-cli processes.
+both SADD s:enc:big $(seq -f 'm%.0f' 1 128)
+assert_both "OBJECT ENCODING set at threshold"   OBJECT ENCODING s:enc:big
+both SADD s:enc:big m129
+assert_both "OBJECT ENCODING set past threshold" OBJECT ENCODING s:enc:big
+assert_both "SCARD set past threshold"           SCARD s:enc:big
+# A member of exactly set-max-listpack-value (64) bytes fits; 65 promotes.
+both SADD s:enc:val64 short "$(printf 'x%.0s' $(seq 1 64))"
+assert_both "OBJECT ENCODING set 64-byte member"    OBJECT ENCODING s:enc:val64
+both SADD s:enc:bigval short "$(printf 'x%.0s' $(seq 1 65))"
+assert_both "OBJECT ENCODING set oversized member"  OBJECT ENCODING s:enc:bigval
+# Member IDENTITY inside a listpack (moon#795 / moon#802). A listpack stores
+# an integer-shaped member in its INTEGER encoding, so `000000012345` would
+# come back as `12345` if the encode step accepted a non-canonical spelling.
+# `storage::numeric::canonical_i64` round-trips through itoa and refuses, but
+# the listpack SET path is a NEW caller of that guard -- so compare the exact
+# bytes against the oracle, not just the encoding name.
+both SADD s:enc:ident 000000012345 abcdefgh +5 -0 12345
+assert_both "OBJECT ENCODING mixed-string set"  OBJECT ENCODING s:enc:ident
+assert_both "SCARD mixed-string set"            SCARD s:enc:ident
+redis_ident_sm=$(redis-cli -p "$PORT_REDIS" SMEMBERS s:enc:ident 2>&1 | sort)
+rust_ident_sm=$(redis-cli -p "$PORT_RUST" SMEMBERS s:enc:ident 2>&1 | sort)
+assert_eq "SMEMBERS mixed-string set (sorted, byte-exact)" "$redis_ident_sm" "$rust_ident_sm"
+# The padded spelling and the canonical one are DIFFERENT members, and a
+# re-rendered integer must not answer for a member nobody added.
+assert_both "SISMEMBER padded integer spelling"  SISMEMBER s:enc:ident 000000012345
+assert_both "SISMEMBER canonical integer"        SISMEMBER s:enc:ident 12345
+assert_both "SISMEMBER plus-prefixed integer"    SISMEMBER s:enc:ident +5
+assert_both "SISMEMBER re-rendered plus form"    SISMEMBER s:enc:ident 5
+assert_both "SISMEMBER re-rendered minus-zero"   SISMEMBER s:enc:ident 0
 assert_both "SISMEMBER a" SISMEMBER s:test a
 assert_both "SISMEMBER missing" SISMEMBER s:test z
 

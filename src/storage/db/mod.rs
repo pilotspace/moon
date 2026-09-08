@@ -2918,6 +2918,41 @@ mod ledger_consistency_788 {
         }
     }
 
+    /// moon#787 (`SADD` listpack path): every step of a small string set's
+    /// life — creation as a listpack, a duplicate that changes nothing, the
+    /// growth past `LISTPACK_MAX_ENTRIES` that promotes it to an `IndexSet`,
+    /// and its deletion — must leave the running ledger equal to a recompute.
+    /// The promotion is the step that matters: the `IndexSet` cost is
+    /// `set_table_bytes` (real capacity) plus per-member bytes (moon#788/
+    /// #810), and a promotion that charged only the per-member half would
+    /// under-count the whole table — the class this module exists to catch.
+    #[test]
+    fn sadd_listpack_path_keeps_the_ledger_exact_through_promotion() {
+        use crate::command::set::sadd;
+        use crate::storage::db::LISTPACK_MAX_ENTRIES;
+        let mut db = Database::new();
+        let floor = db.estimated_memory();
+        sadd(&mut db, &[f(b"s"), f(b"a"), f(b"b"), f(b"c")]);
+        assert_ledger_exact(&mut db, "after SADD creating a listpack set");
+        sadd(&mut db, &[f(b"s"), f(b"a")]);
+        assert_ledger_exact(&mut db, "after a duplicate SADD on the listpack");
+        for i in 0..=LISTPACK_MAX_ENTRIES {
+            let m = format!("m{i:04}");
+            sadd(&mut db, &[f(b"s"), f(m.as_bytes())]);
+        }
+        assert_ledger_exact(
+            &mut db,
+            "after growing past LISTPACK_MAX_ENTRIES (promotion)",
+        );
+        crate::command::key::del(&mut db, &[f(b"s")]);
+        assert_ledger_exact(&mut db, "after DEL of the promoted set");
+        assert_eq!(
+            db.estimated_memory(),
+            floor,
+            "a create/promote/delete cycle must return the ledger to its floor"
+        );
+    }
+
     #[test]
     fn set_mutations_keep_the_ledger_exact() {
         let mut db = Database::new();
