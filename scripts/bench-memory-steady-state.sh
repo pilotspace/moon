@@ -10,11 +10,19 @@ set -euo pipefail
 #
 # Exits 0 when every kind and RSS are within +/-5% of baseline.
 # Exits 1 when ANY kind grows >5% (prints the offending kind + delta).
-# Exits 2 when --self-test detects that the gate itself is broken.
+# Exits 2 when the gate CANNOT run: --self-test found the comparison broken,
+#   or the committed baseline was captured on a different platform than the one
+#   measuring now (comparing a Linux snapshot to a macOS baseline is noise, not
+#   a regression signal).
+#
+# --self-test is a PHASE, not a mode: it proves the comparison can detect an
+# injected regression, then falls through to the real baseline comparison. It
+# used to `exit 0` right after the injection check, so CI ran the gate for
+# months without ever comparing against the committed baseline (moon#764).
 #
 # Usage:
 #   bash scripts/bench-memory-steady-state.sh                 # Compare vs baseline
-#   bash scripts/bench-memory-steady-state.sh --self-test     # Run bench + injection test
+#   bash scripts/bench-memory-steady-state.sh --self-test     # Self-test THEN compare
 #   bash scripts/bench-memory-steady-state.sh --write-baseline tests/fixtures/memory-baseline.json
 #   bash scripts/bench-memory-steady-state.sh --threshold 10  # Custom tolerance %
 #   bash scripts/bench-memory-steady-state.sh --help
@@ -28,6 +36,11 @@ THRESHOLD=5
 SELF_TEST=false
 WRITE_BASELINE=""
 SKIP_BUILD=false
+# Written unconditionally, every run, pass or fail, self-test or
+# --write-baseline (moon#764 follow-up). Before this the only way to see
+# what a run actually measured was to read the failure text out of a CI log
+# -- CI now uploads this path as an artifact on every invocation.
+SNAPSHOT_OUT_PATH="/tmp/moon-memory-snapshot.json"
 
 PORT=6391
 ADMIN_PORT=9091
@@ -73,8 +86,6 @@ cleanup() {
     # Safety: kill any lingering instance on our ports
     pkill -f "moon.*--port ${PORT}" 2>/dev/null || true
 }
-trap cleanup EXIT
-
 wait_for_server() {
     local max_wait=30
     for ((i=0; i<max_wait; i++)); do
@@ -107,13 +118,33 @@ start_server() {
     pkill -f "moon.*--port ${PORT}" 2>/dev/null || true
     sleep 0.3
 
+    # --memory-arenas-cap 2 (moon#764 follow-up): this gate runs --shards 1,
+    # i.e. one hot allocator thread, but the binary's baked-in default is
+    # narenas:8 -- sized for the multi-shard thread-per-core layout (see
+    # src/malloc_respawn.rs's STANDALONE_PROFILE_ARENAS comment: "2 arenas
+    # cut the allocator's per-arena metadata and dirty-page cache RSS
+    # baseline with no contention cost at this concurrency"). Real hosted-
+    # runner samples showed a same-machine, same-code RSS spread of ~5.5%
+    # (146,817,024 / 144,723,968 / 152,678,400 across 3 runs) -- a
+    # PREFER-CONTROLLING-OVER-WIDENING candidate cause, not yet confirmed:
+    # 8 arenas contending over 4 real vCPUs (this runner's cpu_count) gives
+    # jemalloc's thread-to-arena assignment more room for run-to-run
+    # variance in which arena(s) accumulate dirty-page cache. This flag
+    # already exists and is already tested (src/malloc_respawn.rs); it is
+    # not new/unsafe code. If the next sample batch shows tighter spread
+    # under this flag, keep it and lower the rss floor accordingly; if not,
+    # remove it and fall back to widening with the measured margin instead
+    # -- either way, re-baseline is required, since this flag also changes
+    # the absolute RSS/allocator_overhead values, not just their variance.
     MOON_NO_URING=1 "$MOON_BINARY" \
         --port "$PORT" \
         --admin-port "$ADMIN_PORT" \
         --shards "$SHARDS" \
         --disk-offload disable \
         --appendonly no \
-        --protected-mode no &>/dev/null &
+        --protected-mode no \
+        --memory-arenas-cap 2 \
+        &>/dev/null &
     SERVER_PID=$!
 
     wait_for_server
@@ -273,7 +304,50 @@ else:
 
     # --- Build JSON ---
     local snapshot
+    # Provenance: a memory baseline is only comparable to a snapshot taken on
+    # the same platform. RSS, allocator behaviour and struct padding all differ
+    # across OS and arch, so a cross-platform delta measures the runner, not the
+    # code.
+    #
+    # os/arch alone is NOT enough (moon#764 follow-up): a GCE c3-standard-8
+    # and a GitHub-hosted `ubuntu-latest` runner are both Linux/x86_64 and
+    # still produced a 243% "allocator_overhead regression" that was purely
+    # the machine, not the code (RSS +30.51%, allocator_overhead +243.22%,
+    # while dashtable -- unaffected by machine class -- held at -0.14%).
+    # cpu_count is the field that would have caught it: GCE c3-standard-8 is
+    # 8 vCPU, GitHub's hosted `ubuntu-latest` is a fixed, documented, smaller
+    # vCPU count. runner_environment/runner_name are recorded for a human
+    # reading a failure to see AT A GLANCE which runner produced which
+    # number; they are not gated on (RUNNER_NAME is a fresh random string
+    # every single hosted run by design, so gating on it would make the gate
+    # permanently exit 2).
+    local prov_os prov_arch prov_cpu_model prov_cpu_count prov_mem_kb
+    local prov_runner_env prov_runner_name
+    prov_os=$(uname -s)
+    prov_arch=$(uname -m)
+    if [[ "$prov_os" == "Linux" ]]; then
+        prov_cpu_model=$(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//')
+        prov_cpu_count=$(nproc 2>/dev/null || echo 0)
+        prov_mem_kb=$(grep -m1 '^MemTotal' /proc/meminfo 2>/dev/null | awk '{print $2}')
+    elif [[ "$prov_os" == "Darwin" ]]; then
+        prov_cpu_model=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
+        prov_cpu_count=$(sysctl -n hw.ncpu 2>/dev/null || echo 0)
+        prov_mem_kb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 ))
+    fi
+    prov_cpu_model="${prov_cpu_model:-unknown}"
+    prov_cpu_count="${prov_cpu_count:-0}"
+    prov_mem_kb="${prov_mem_kb:-0}"
+    prov_runner_env="${RUNNER_ENVIRONMENT:-unknown}"
+    prov_runner_name="${RUNNER_NAME:-unknown}"
+
     snapshot=$(jq -n \
+        --arg prov_os "$prov_os" \
+        --arg prov_arch "$prov_arch" \
+        --arg prov_cpu_model "$prov_cpu_model" \
+        --argjson prov_cpu_count "$prov_cpu_count" \
+        --argjson prov_mem_kb "$prov_mem_kb" \
+        --arg prov_runner_env "$prov_runner_env" \
+        --arg prov_runner_name "$prov_runner_name" \
         --argjson rss "$rss_bytes" \
         --argjson dt_d "${doc_dashtable}" \
         --argjson dt_p "${prom_dashtable}" \
@@ -290,6 +364,12 @@ else:
         --argjson ao_d "${doc_alloc}" \
         --argjson ao_p "${prom_alloc}" \
         '{
+            platform: {
+                os: $prov_os, arch: $prov_arch, profile: "debug",
+                cpu_model: $prov_cpu_model, cpu_count: $prov_cpu_count,
+                mem_total_kb: $prov_mem_kb,
+                runner_environment: $prov_runner_env, runner_name: $prov_runner_name
+            },
             rss: $rss,
             kinds: {
                 dashtable:          { doctor: $dt_d,   prom: $dt_p },
@@ -356,14 +436,265 @@ else:
 }
 
 # ---------------------------------------------------------------------------
-# Compare snapshot against baseline
-# Returns 0 if all within threshold, 1 if any regression detected
+# Did the workload actually run? (absolute, baseline-independent)
 # ---------------------------------------------------------------------------
+# Every other check in this script is RELATIVE to the committed baseline, so
+# all of them share one blind spot: if the populate step silently no-ops on
+# both the baseline capture AND the measuring run, the deltas are 0% and the
+# gate is green forever while measuring an empty server. That is the same
+# class of bug as the `exit 0` this PR removed -- a check that cannot fail.
+#
+# These floors are absolute byte counts, sized at roughly half of what the
+# fixed workload (1M string keys, 10K x 16-dim vectors, 100 graph nodes)
+# actually produces, so they leave room for a genuine 2x memory improvement
+# and still cannot be satisfied by a server that populated nothing.
+# Observed on hosted ubuntu-latest: dashtable ~96.6 MB, hnsw ~1.20 MB,
+# csr ~50.3 KB.
+WORKLOAD_FLOOR_DASHTABLE=50000000
+WORKLOAD_FLOOR_HNSW=500000
+WORKLOAD_FLOOR_CSR=10000
+
+# Returns 0 when the snapshot is of a populated server, 2 when it is not.
+check_workload_ran() {
+    local snapshot="$1"
+    local bad=0
+    local dt hn cs
+    dt=$(echo "$snapshot" | jq -r '.kinds.dashtable.prom')
+    hn=$(echo "$snapshot" | jq -r '.kinds.hnsw.prom')
+    cs=$(echo "$snapshot" | jq -r '.kinds.csr.prom')
+
+    if [[ "$dt" -lt "$WORKLOAD_FLOOR_DASHTABLE" ]]; then
+        log "  MEASUREMENT VOID: dashtable=${dt} < floor ${WORKLOAD_FLOOR_DASHTABLE} (${NUM_STRINGS} keys did not land)"
+        bad=$((bad + 1))
+    fi
+    if [[ "$hn" -lt "$WORKLOAD_FLOOR_HNSW" ]]; then
+        log "  MEASUREMENT VOID: hnsw=${hn} < floor ${WORKLOAD_FLOOR_HNSW} (${NUM_VECTORS} vectors did not land)"
+        bad=$((bad + 1))
+    fi
+    if [[ "$cs" -lt "$WORKLOAD_FLOOR_CSR" ]]; then
+        log "  MEASUREMENT VOID: csr=${cs} < floor ${WORKLOAD_FLOOR_CSR} (${NUM_GRAPH_NODES} graph nodes did not land)"
+        bad=$((bad + 1))
+    fi
+
+    if [[ "$bad" -gt 0 ]]; then
+        log "GATE CANNOT RUN: the workload did not populate, so this snapshot"
+        log "  measures an empty server. Comparing it -- or worse, committing it"
+        log "  as a baseline -- would produce numbers that look like a"
+        log "  measurement and are not one. Check the populate log above"
+        log "  (redis-benchmark / FT.CREATE / the python3 populate script)."
+        return 2
+    fi
+    log "  Workload floors OK (dashtable=${dt}, hnsw=${hn}, csr=${cs})"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Baseline provenance guard
+# ---------------------------------------------------------------------------
+# A memory baseline is only meaningful against the platform it was captured on.
+# The committed fixture was taken on macOS aarch64 while this gate runs on
+# ubuntu-latest, so every delta would have been runner noise rather than a code
+# regression -- which nobody noticed, because --self-test exited before the
+# comparison ever ran. Refuse to compare rather than emit a number that looks
+# like a measurement and is not one.
+#
+# Returns 0 to proceed, 2 when the gate cannot legitimately run.
+check_baseline_provenance() {
+    local snapshot="$1"
+    local baseline_file="$2"
+
+    if [[ ! -f "$baseline_file" ]]; then
+        log "GATE CANNOT RUN: baseline not found: $baseline_file"
+        return 2
+    fi
+
+    local b_os b_arch m_os m_arch
+    b_os=$(jq -r '.platform.os   // "MISSING"' "$baseline_file")
+    b_arch=$(jq -r '.platform.arch // "MISSING"' "$baseline_file")
+    m_os=$(echo "$snapshot" | jq -r '.platform.os')
+    m_arch=$(echo "$snapshot" | jq -r '.platform.arch')
+
+    if [[ "$b_os" == "MISSING" || "$b_arch" == "MISSING" ]]; then
+        log "GATE CANNOT RUN: $baseline_file records no platform provenance."
+        log "  It predates the provenance field, so there is no way to tell"
+        log "  which OS/arch it was captured on. Regenerate it ON THE PLATFORM"
+        log "  THIS GATE RUNS ON (currently ${m_os}/${m_arch}):"
+        log "    bash scripts/bench-memory-steady-state.sh --write-baseline $baseline_file"
+        return 2
+    fi
+
+    if [[ "$b_os" != "$m_os" || "$b_arch" != "$m_arch" ]]; then
+        log "GATE CANNOT RUN: baseline/runner platform mismatch."
+        log "  baseline: ${b_os}/${b_arch}"
+        log "  measured: ${m_os}/${m_arch}"
+        log "  Cross-platform memory deltas measure the runner, not the code."
+        log "  Regenerate on ${m_os}/${m_arch}:"
+        log "    bash scripts/bench-memory-steady-state.sh --write-baseline $baseline_file"
+        return 2
+    fi
+
+    # os/arch alone is NOT enough (moon#764 follow-up): a GCE c3-standard-8
+    # and GitHub's hosted `ubuntu-latest` are both Linux/x86_64 and still
+    # produced a 243% "allocator_overhead regression" that was purely the
+    # machine (RSS +30.51%, allocator_overhead +243.22%), not the code
+    # (dashtable, unaffected by machine class, held at -0.14% on that same
+    # run). cpu_count is the strongest, most stable signal available: GitHub
+    # documents a fixed vCPU count per hosted runner label, so gating on it
+    # will not flap red across legitimate ubuntu-latest reruns the way
+    # gating on the ephemeral, always-different RUNNER_NAME would.
+    local b_cpu_count m_cpu_count b_cpu_model m_cpu_model
+    local b_runner_env b_runner_name m_runner_env m_runner_name
+    b_cpu_count=$(jq -r '.platform.cpu_count // "MISSING"' "$baseline_file")
+    m_cpu_count=$(echo "$snapshot" | jq -r '.platform.cpu_count // "MISSING"')
+    b_cpu_model=$(jq -r '.platform.cpu_model // "MISSING"' "$baseline_file")
+    m_cpu_model=$(echo "$snapshot" | jq -r '.platform.cpu_model // "MISSING"')
+    b_runner_env=$(jq -r '.platform.runner_environment // "unknown"' "$baseline_file")
+    b_runner_name=$(jq -r '.platform.runner_name // "unknown"' "$baseline_file")
+    m_runner_env=$(echo "$snapshot" | jq -r '.platform.runner_environment // "unknown"')
+    m_runner_name=$(echo "$snapshot" | jq -r '.platform.runner_name // "unknown"')
+
+    if [[ "$b_cpu_count" == "MISSING" ]]; then
+        log "GATE CANNOT RUN: $baseline_file has os/arch but no cpu_count."
+        log "  It predates the machine-class provenance check (moon#764"
+        log "  follow-up), so an os/arch match alone cannot prove it came"
+        log "  from a comparable machine -- that gap is exactly what let a"
+        log "  GCE box silently pass as a stand-in for ubuntu-latest once."
+        log "  Regenerate on the runner this gate actually runs on:"
+        log "    bash scripts/bench-memory-steady-state.sh --write-baseline $baseline_file"
+        return 2
+    fi
+
+    if [[ "$b_cpu_count" != "$m_cpu_count" ]]; then
+        log "GATE CANNOT RUN: baseline/runner machine-class mismatch (cpu_count)."
+        log "  baseline: cpu_count=${b_cpu_count} cpu_model=${b_cpu_model} runner=${b_runner_env}/${b_runner_name}"
+        log "  measured: cpu_count=${m_cpu_count} cpu_model=${m_cpu_model} runner=${m_runner_env}/${m_runner_name}"
+        log "  Same os/arch, different machine class -- RSS and allocator"
+        log "  overhead do not transfer (this is the exact failure mode that"
+        log "  motivated this check: a GCE c3-standard-8 baseline compared"
+        log "  against ubuntu-latest read +243% allocator_overhead)."
+        log "  Regenerate on this machine class:"
+        log "    bash scripts/bench-memory-steady-state.sh --write-baseline $baseline_file"
+        return 2
+    fi
+
+    # cpu_model is logged and compared, but only WARNED on, not gated: GitHub
+    # does not document (or guarantee stability of) the exact CPU SKU behind
+    # a hosted runner label the way it documents vCPU count, so hard-failing
+    # here risked the opposite failure mode -- a gate that goes permanently
+    # red because the hosted fleet legitimately rotated silicon under an
+    # unchanged runner label, which is not a code regression either.
+    if [[ "$b_cpu_model" != "MISSING" && "$m_cpu_model" != "MISSING" && "$b_cpu_model" != "$m_cpu_model" ]]; then
+        log "WARN: cpu_model differs (same cpu_count, comparing anyway):"
+        log "  baseline: ${b_cpu_model}"
+        log "  measured: ${m_cpu_model}"
+    fi
+
+    log "Baseline provenance OK: ${b_os}/${b_arch}, cpu_count=${m_cpu_count} (baseline runner=${b_runner_env}/${b_runner_name}, this runner=${m_runner_env}/${m_runner_name})"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Per-kind noise floor (moon#764 follow-up)
+# ---------------------------------------------------------------------------
+# `hnsw` and `allocator_overhead` are not measured directly -- `hnsw`'s prom
+# value tracks a growable mutable buffer whose realized jemalloc size class
+# depends on concurrent insertion ordering (the doctor-computed estimate for
+# the same kind is bit-identical run over run; only the real allocation
+# isn't), and `allocator_overhead` is `max(0, RSS - sum(other 6))`, a residual
+# that inherits every other kind's noise plus RSS's own page-level jitter.
+#
+# Measured on moon-bench-x86 (GCE c3-standard-8, Ubuntu 24.04.4,
+# Linux 6.17.0-1022-gcp, x86_64, debug build, idle host, 10 back-to-back
+# real runs of this exact workload, 2026-09-08): dashtable/rss/csr held
+# under 2% every time; hnsw swung -13.55%..+15.68% and allocator_overhead
+# swung -18.98%..+9.15%, purely from run-to-run noise with ZERO code change
+# between runs. A flat +/-5% would make this gate report a regression on
+# these two kinds roughly every other real run -- a false-positive rate
+# that trains reviewers to click "re-run" without reading the failure,
+# which is a different route to the same outcome #764 was filed over: a
+# gate nobody trusts. See tmp/perf-campaign/FIX-764.md for the raw
+# transcripts this floor is derived from.
+#
+# The floor sits comfortably above the measured noise ceiling (~16% / ~19%)
+# so a real regression several times the noise floor is still caught; it
+# does NOT touch the other 5 kinds or RSS, which stayed noise-free.
+# RSS shrink floor: the growth threshold is NOT relaxed
+# ---------------------------------------------------------------------------
+# `rss` is the one figure here that is not an accounting number. It is the
+# whole process: tracked kinds (~78%) plus a residual of jemalloc arena
+# metadata, dirty pages, thread stacks and binary text that no counter owns.
+# Nine samples of an IDENTICAL source tree on hosted ubuntu-latest spanned
+# 7.96% min-to-max (119,946,xxx .. 129,495,040), while `dashtable` over the
+# same nine spanned 0.11%. A +/-5% band is 10 points wide; an 8% spread does
+# not fit inside it with margin, and the gate would go red on ordinary runs.
+#
+# The fix is direction-aware, not a wider band:
+#
+#   GROWTH stays at $THRESHOLD (5%). A memory regression is a growth, so the
+#   gate's entire detection power is preserved, unrelaxed, at the tightest
+#   threshold the evidence supports. Nothing this gate exists to catch gets
+#   easier to sneak past.
+#
+#   SHRINK gets the measured floor below. A shrink is never a regression. Its
+#   only job is to notice a STEP -- a stale baseline, a harness change, a
+#   workload that did not run -- and a step is large: moon#764's arena-cap
+#   step was -11.82% .. -14.02%, still caught here with margin, while the
+#   worst noise sample sits at -4.28%.
+#
+# So this is not "widen the band until it is green". The band that catches
+# regressions is untouched; only the direction that cannot be a regression
+# absorbs the measured noise. If a shrink ever fires, check_workload_ran()
+# has already proven the workload populated, so the remaining causes are the
+# two the failure text names.
+RSS_SHRINK_FLOOR=10
+
+kind_threshold() {
+    local kind="$1"
+    local base="$2"
+    local floor=0
+    case "$kind" in
+        hnsw)                floor=20 ;;
+        allocator_overhead)  floor=25 ;;
+        *)                   floor=0  ;;
+    esac
+    python3 -c "print($base if $base > $floor else $floor)"
+}
+
+# ---------------------------------------------------------------------------
+# Compare snapshot against baseline -- DIRECTION MATTERS
+# ---------------------------------------------------------------------------
+# Returns 0 when every kind and RSS are inside the band, 1 otherwise.
+#
+# A delta outside the band is classified GREW or SHRANK, and BOTH are
+# failures. That asymmetry in the *message* (not in the verdict) exists
+# because the two directions have completely different fixes:
+#
+#   GREW   -> a memory regression. Fix the code.
+#   SHRANK -> the committed baseline no longer describes what this harness
+#             measures. Fix the BASELINE, after working out why.
+#
+# Why a shrink can never be waved through: moon#764's first real comparison
+# read `rss delta=-14.02%` with `dashtable` flat at -0.06% and ZERO files
+# changed under src/. Nothing got leaner -- the harness had started passing
+# `--memory-arenas-cap 2` to start_server() (8 jemalloc arenas -> 2) one
+# commit AFTER the baseline was captured, so the gate was comparing two
+# different measurement configurations. The same shape also appears when the
+# workload silently fails to populate: less data, less memory, a big happy
+# green tick on a run that measured nothing. That is the vacuous gate #764
+# was filed over, wearing a different hat. Treating a shrink as "well, it
+# improved" is how a gate stops gating.
+#
+# Note that `allocator_overhead` is NOT an independent signal to cross-check
+# RSS against: src/command/server_admin.rs computes it as
+# `rss.saturating_sub(tracked_sum)`. When RSS moves and the tracked kinds do
+# not, allocator_overhead moves with it by construction -- one measurement
+# reported twice, not two failures agreeing.
 compare_snapshot() {
     local snapshot="$1"
     local baseline_file="$2"
     local threshold="$3"
-    local failures=0
+    local growth_failures=0
+    local shrink_failures=0
     local failure_msgs=""
 
     if [[ ! -f "$baseline_file" ]]; then
@@ -374,7 +705,7 @@ compare_snapshot() {
     local baseline
     baseline=$(cat "$baseline_file")
 
-    log "Comparing against baseline (threshold: +/-${threshold}%)..."
+    log "Comparing against baseline (threshold: +/-${threshold}%, wider floor for hnsw/allocator_overhead -- see kind_threshold())..."
 
     # Compare RSS
     local measured_rss baseline_rss
@@ -382,70 +713,114 @@ compare_snapshot() {
     baseline_rss=$(echo "$baseline" | jq -r '.rss')
 
     if [[ "$baseline_rss" -gt 0 ]]; then
-        local rss_delta_pct
+        local rss_delta_pct rss_verdict
         rss_delta_pct=$(python3 -c "
 m = $measured_rss
 b = $baseline_rss
 print(round((m - b) / b * 100, 2))
 ")
-        local rss_abs
-        rss_abs=$(python3 -c "print(abs($rss_delta_pct))")
-        local rss_exceeds
-        rss_exceeds=$(python3 -c "print('yes' if $rss_abs > $threshold else 'no')")
-
-        if [[ "$rss_exceeds" == "yes" ]]; then
-            failure_msgs="${failure_msgs}  FAIL: rss delta=${rss_delta_pct}% (measured=$measured_rss, baseline=$baseline_rss)\n"
-            failures=$((failures + 1))
-        else
-            log "  OK: rss delta=${rss_delta_pct}% (within +/-${threshold}%)"
-        fi
+        # Asymmetric ON PURPOSE -- see RSS_SHRINK_FLOOR above. Growth is
+        # judged at the full (tight) threshold; only the shrink side, which
+        # can never be a regression, carries the measured noise floor.
+        rss_verdict=$(python3 -c "
+d = $rss_delta_pct
+print('grow' if d > $threshold else ('shrink' if d < -$RSS_SHRINK_FLOOR else 'ok'))
+")
+        case "$rss_verdict" in
+            grow)
+                failure_msgs="${failure_msgs}  FAIL (GREW):   rss delta=${rss_delta_pct}% (measured=$measured_rss, baseline=$baseline_rss, growth threshold=+${threshold}%)\n"
+                growth_failures=$((growth_failures + 1))
+                ;;
+            shrink)
+                failure_msgs="${failure_msgs}  FAIL (SHRANK): rss delta=${rss_delta_pct}% (measured=$measured_rss, baseline=$baseline_rss, shrink floor=-${RSS_SHRINK_FLOOR}%)\n"
+                shrink_failures=$((shrink_failures + 1))
+                ;;
+            *)
+                log "  OK: rss delta=${rss_delta_pct}% (grow limit +${threshold}%, shrink limit -${RSS_SHRINK_FLOOR}%)"
+                ;;
+        esac
     fi
 
     # Compare each kind (use prom value for comparison)
     for kind in dashtable hnsw csr wal sealed replication_backlog allocator_overhead; do
-        local measured_val baseline_val
+        local measured_val baseline_val kind_thr
         measured_val=$(echo "$snapshot" | jq -r ".kinds.${kind}.prom")
         baseline_val=$(echo "$baseline" | jq -r ".kinds.${kind}.prom")
+        kind_thr=$(kind_threshold "$kind" "$threshold")
 
         # Handle baseline=0: if measured > 1024 bytes, flag as regression
         if [[ "$baseline_val" == "0" ]]; then
             if [[ "$measured_val" -gt 1024 ]]; then
-                failure_msgs="${failure_msgs}  FAIL: ${kind} was 0 in baseline, now ${measured_val} bytes\n"
-                failures=$((failures + 1))
+                failure_msgs="${failure_msgs}  FAIL (GREW):   ${kind} was 0 in baseline, now ${measured_val} bytes\n"
+                growth_failures=$((growth_failures + 1))
             else
                 log "  OK: ${kind} baseline=0, measured=$measured_val (below 1KB epsilon)"
             fi
             continue
         fi
 
-        local delta_pct
+        local delta_pct verdict
         delta_pct=$(python3 -c "
 m = $measured_val
 b = $baseline_val
 print(round((m - b) / b * 100, 2))
 ")
-        local abs_delta
-        abs_delta=$(python3 -c "print(abs($delta_pct))")
-        local exceeds
-        exceeds=$(python3 -c "print('yes' if $abs_delta > $threshold else 'no')")
+        verdict=$(python3 -c "
+d = $delta_pct
+t = $kind_thr
+print('grow' if d > t else ('shrink' if d < -t else 'ok'))
+")
 
-        if [[ "$exceeds" == "yes" ]]; then
-            failure_msgs="${failure_msgs}  FAIL: ${kind} delta=${delta_pct}% (measured=$measured_val, baseline=$baseline_val)\n"
-            failures=$((failures + 1))
-        else
-            log "  OK: ${kind} delta=${delta_pct}% (within +/-${threshold}%)"
-        fi
+        case "$verdict" in
+            grow)
+                failure_msgs="${failure_msgs}  FAIL (GREW):   ${kind} delta=${delta_pct}% (measured=$measured_val, baseline=$baseline_val, threshold=+/-${kind_thr}%)\n"
+                growth_failures=$((growth_failures + 1))
+                ;;
+            shrink)
+                failure_msgs="${failure_msgs}  FAIL (SHRANK): ${kind} delta=${delta_pct}% (measured=$measured_val, baseline=$baseline_val, threshold=+/-${kind_thr}%)\n"
+                shrink_failures=$((shrink_failures + 1))
+                ;;
+            *)
+                log "  OK: ${kind} delta=${delta_pct}% (within +/-${kind_thr}%)"
+                ;;
+        esac
     done
 
+    local failures=$((growth_failures + shrink_failures))
     if [[ "$failures" -gt 0 ]]; then
         log ""
-        log "=== MEMORY REGRESSION DETECTED ==="
+        if [[ "$growth_failures" -gt 0 ]]; then
+            log "=== MEMORY REGRESSION DETECTED ==="
+        else
+            log "=== BASELINE NO LONGER DESCRIBES THIS BUILD ==="
+        fi
         echo -e "$failure_msgs" >&2
-        log "=== $failures kind(s) exceeded +/-${threshold}% threshold ==="
+        if [[ "$shrink_failures" -gt 0 ]]; then
+            log "A SHRANK line is a FAILURE, not a free pass. Memory falling"
+            log "outside the band means one of exactly two things and both need"
+            log "a human before this gate can be green again:"
+            log "  (a) The baseline is stale. Something really did get leaner --"
+            log "      or, just as likely, THE HARNESS CHANGED WHAT IT MEASURES."
+            log "      Adding --memory-arenas-cap 2 to start_server() moved RSS"
+            log "      -14% with zero src/ changes (moon#764). Server flags,"
+            log "      shard count, workload size and feature set are all part"
+            log "      of the measurement contract; changing any of them"
+            log "      invalidates the committed baseline."
+            log "      Refresh: run ci.yml via workflow_dispatch with"
+            log "      capture_memory_baseline=true, download the"
+            log "      memory-steady-state-snapshot artifact, commit it as"
+            log "      ${BASELINE_PATH}, and say in the commit message WHY the"
+            log "      numbers moved."
+            log "  (b) The workload never actually ran, so there was less to"
+            log "      measure. check_workload_ran() catches the total-failure"
+            log "      shape; a PARTIAL populate still lands right here. Read"
+            log "      the populate log before touching the baseline."
+        fi
+        log "=== $failures kind(s) outside tolerance -- $growth_failures grew, $shrink_failures shrank ==="
         return 1
     else
         log ""
-        log "=== ALL KINDS WITHIN +/-${threshold}% === PASS ==="
+        log "=== ALL KINDS WITHIN TOLERANCE === PASS ==="
         return 0
     fi
 }
@@ -454,6 +829,11 @@ print(round((m - b) / b * 100, 2))
 # Main
 # ---------------------------------------------------------------------------
 main() {
+    # Registered here, not at file scope: the file is sourced by
+    # tests/memory_gate_compare_selftest.sh to exercise the comparison
+    # logic offline, and a source must not arm a pkill-on-exit trap.
+    trap cleanup EXIT
+
     log "============================================"
     log "  Memory Steady-State Gate"
     log "============================================"
@@ -480,8 +860,24 @@ main() {
     log "Captured snapshot:"
     echo "$snapshot" | jq . >&2
 
+    # Always written, regardless of mode or outcome, so CI can upload it as
+    # an artifact unconditionally -- pass, fail, self-test, or
+    # --write-baseline all produce the same measured-this-run record.
+    echo "$snapshot" | jq . > "$SNAPSHOT_OUT_PATH"
+    log "Snapshot written to $SNAPSHOT_OUT_PATH"
+
     # Cross-reporter check (warnings only, non-fatal)
     check_cross_reporter "$snapshot"
+
+    # Did the workload actually run? This is checked BEFORE --write-baseline
+    # so an empty-server snapshot can never be committed as the baseline that
+    # every later run is measured against.
+    log "Workload sanity (absolute floors, baseline-independent)..."
+    local workload_rc=0
+    check_workload_ran "$snapshot" || workload_rc=$?
+    if [[ "$workload_rc" -ne 0 ]]; then
+        exit "$workload_rc"
+    fi
 
     # --- Write baseline mode ---
     if [[ -n "$WRITE_BASELINE" ]]; then
@@ -531,10 +927,27 @@ main() {
         log ""
         log "=== SELF-TEST PASSED: gate is functional ==="
         rm -f "$tmp_baseline"
-        exit 0
+        # NO exit here. The self-test only proves the comparison WORKS; it
+        # compares the snapshot against itself, which can never fail for a real
+        # regression. Falling through to the committed-baseline comparison
+        # below is the part that actually gates. This `exit 0` used to sit
+        # right here and was the bug that made the job vacuous (moon#764):
+        # every PR "passed" a check that had never read the committed baseline.
+        log ""
     fi
 
-    # --- Normal mode: compare against committed baseline ---
+    # --- Compare against the committed baseline ---
+    # Provenance first: an incomparable baseline means the gate cannot run
+    # (exit 2), which is a different failure mode from "compared cleanly"
+    # (exit 0) or "a kind regressed" (exit 1) -- silently passing a
+    # cross-platform comparison would just replace one vacuous gate with
+    # another.
+    local prov_rc=0
+    check_baseline_provenance "$snapshot" "$BASELINE_PATH" || prov_rc=$?
+    if [[ "$prov_rc" -ne 0 ]]; then
+        exit "$prov_rc"
+    fi
+
     if compare_snapshot "$snapshot" "$BASELINE_PATH" "$THRESHOLD"; then
         exit 0
     else
@@ -542,4 +955,12 @@ main() {
     fi
 }
 
-main
+
+# Lib-only guard: `bash scripts/bench-memory-steady-state.sh` runs the gate;
+# `source`ing the file (tests/memory_gate_compare_selftest.sh does exactly
+# that) defines the functions and runs nothing. Without this, sourcing the
+# script to unit-test compare_snapshot() would boot a server and run the
+# full 1M-key workload as a side effect.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main
+fi

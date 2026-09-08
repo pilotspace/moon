@@ -40,6 +40,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lint pass cannot substitute for it. Verified it can fail: reverting the
   collapsed `if` gives `RC=101`, `2 errors`.
 
+- **`ci`: the memory steady-state gate never compared against its baseline,
+  and its baseline was never comparable in the first place (moon#764).**
+  Three compounding defects, found by chasing the gate's own green:
+  1. `--self-test` `exit 0`'d immediately after proving its own injection
+     check worked, one branch above the `compare_snapshot` call against
+     `tests/fixtures/memory-baseline.json` -- the only place the committed
+     baseline was ever read. `ci.yml` invokes exactly `--self-test
+     --skip-build`, so that comparison had never executed in CI. Fixed:
+     `--self-test` is now a phase, not a mode -- it falls through to the
+     real comparison instead of returning early.
+  2. The committed baseline was captured on macOS aarch64/debug while the
+     gate runs on `ubuntu-latest` (Linux), so even with (1) fixed the
+     comparison would have measured the runner, not the code, on every PR.
+     A new `check_baseline_provenance` refuses to compare (exit 2) when a
+     baseline's platform doesn't match the runner's.
+  3. Regenerating a baseline on a real machine surfaced that os/arch-level
+     provenance was not enough either: a GCE `c3-standard-8` and GitHub's
+     hosted `ubuntu-latest` are both Linux/x86_64 and still produced a
+     false 243% `allocator_overhead` "regression" from machine differences
+     alone (RSS +30.51%, `allocator_overhead` +243.22%, while `dashtable` --
+     unaffected by machine class -- held at -0.14% on the same run).
+     `check_baseline_provenance` now also records and gates on `cpu_count`
+     (hard, exit 2 on mismatch -- GitHub documents a fixed vCPU count per
+     runner label) and records `cpu_model`/`mem_total_kb`/runner identity
+     for warning and audit, without hard-failing on them (GitHub does not
+     guarantee CPU-model stability within a runner label, so gating there
+     risked trading a silent-wrong-machine-pass for a permanent false-red
+     instead). Separately, real runs on that same GCE host showed `hnsw`
+     and `allocator_overhead` are genuinely noisy run-to-run with **zero**
+     code changes (~±16% / ~±19% measured over 10+ runs) -- the old flat
+     ±5% tolerance would have failed the gate on those two kinds roughly
+     every other real run for reasons having nothing to do with the PR
+     under test. `compare_snapshot` now applies a wider, evidence-based
+     floor to just those two kinds (±20% / ±25%); the other five kinds and
+     RSS are unchanged. Every run now also uploads its captured snapshot as
+     an artifact unconditionally (pass, fail, or baseline capture), and a
+     `workflow_dispatch` input regenerates the baseline on the actual
+     runner instead of an out-of-band machine.
+
+- **`ci`: a memory *drop* is now a failure with its own name, `rss` judges
+  the two directions at different thresholds, and the gate can no longer
+  measure an empty server (moon#764).** The first comparison that gate ever
+  performed came back `rss -14.02%` / `allocator_overhead -43.34%` with
+  `dashtable` flat at `-0.06%` and **zero files changed under `src/`** -- so
+  nothing had got leaner, and the `cpu_model differs` warning in the log was
+  a red herring (a later capture on the baseline's *own* EPYC 9V74 measured
+  `-11.82%` against it). The cause was the harness measuring itself:
+  `--memory-arenas-cap 2` (jemalloc 8 arenas -> 2) was added to
+  `start_server()` one commit *after* the baseline was captured, so the gate
+  was comparing two different measurement configurations.
+  `allocator_overhead` was never a second opinion corroborating it -- it is
+  `rss - tracked_sum` (`src/command/server_admin.rs`), a residual that moves
+  with RSS by construction. Two FAIL lines, one measurement. Fixes:
+  1. `compare_snapshot` classifies every out-of-band delta as `GREW` or
+     `SHRANK`. Both still fail -- a shrink is never silently accepted -- but
+     a shrink-only failure prints
+     `=== BASELINE NO LONGER DESCRIBES THIS BUILD ===` and names the two
+     causes worth checking (a stale baseline, including one invalidated by a
+     harness/server-flag change; or a workload that never ran, which is
+     moon#764's vacuous gate wearing a different hat).
+  2. **`rss` grows at +5% and shrinks at -10%; the growth threshold is not
+     relaxed.** Nine hosted-runner samples of an identical source tree, over
+     four CPU SKUs the `ubuntu-latest` pool hands out, span **7.96%**
+     (119,943,168 .. 129,495,040) while `dashtable` over the same nine spans
+     **0.11%**. A symmetric ±5% band is 10 points wide and cannot hold an 8%
+     spread: the first re-baseline left 0.63% of margin under the observed
+     minimum and the next run measured -4.39%. Rather than widen the band --
+     every point added to it is a real regression the gate stops catching --
+     the noise slack goes **only to the direction that can never be a
+     regression**. A shrink still has to clear -10%, which moon#764's own
+     -11.82%..-14.02% step does not. The baseline is re-captured on a hosted
+     runner with the current harness and chosen, from those nine samples, as
+     the one that balances headroom (+3.70% above the observed maximum,
+     +4.04% below the observed minimum); the full per-candidate table is in
+     the fixture README.
+  3. `check_workload_ran` asserts absolute, baseline-independent floors on
+     `dashtable`/`hnsw`/`csr` before anything is compared **or written as a
+     baseline**. Every other check is relative, so all of them shared one
+     blind spot: an empty capture *and* an empty measurement compare at 0%
+     and stay green forever.
+  4. `tests/memory_gate_compare_selftest.sh` sources the gate (which now has
+     a lib-only `BASH_SOURCE` guard) and drives the comparison against
+     synthetic snapshots -- 16 checks, no server, no build, ~1s, run in CI
+     before the build. Verified it can fail, by mutating the gate: accepting
+     shrinks silently -> 2 failures; `compare_snapshot` hard-wired to return
+     0 (the original #764 bug) -> 5 failures; workload floors zeroed
+     -> 1 failure; growth relaxed to the shrink floor -> 1 failure; shrink
+     floor widened past the -14% step -> 2 failures.
+  End-to-end on the real runner, against the real committed-baseline path: a
+  baseline with `dashtable` cut 15% made the job exit 1 with
+  `FAIL (GREW):   dashtable delta=17.64%` (run 34191154173); the same commit
+  with the injection removed passed with every kind in band (run
+  34191132296). The stale baseline this entry is about produced
+  `=== BASELINE NO LONGER DESCRIBES THIS BUILD ===` /
+  `FAIL (SHRANK): rss delta=-13.42%` on run 34190674369 -- the new
+  classification, from a real run, not a mock.
+
 ### Documentation
 
 - **The "27-35% less memory" claim is corrected to a measured 15-17%, on Linux,

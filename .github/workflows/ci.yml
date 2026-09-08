@@ -31,7 +31,21 @@ on:
   # those legs stay on main-push as a post-merge net rather than re-running
   # here. Measured before the cut: 7 of 9 dispatch legs duplicated ci-local,
   # and two of them queued on the very moon-dev VM ci-local had just used.
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      capture_memory_baseline:
+        description: >-
+          moon#764 follow-up: instead of comparing against the committed
+          baseline, run --write-baseline on THIS runner and upload the
+          result as an artifact (memory-steady-state-snapshot). Nothing is
+          committed automatically -- download the artifact and commit it as
+          tests/fixtures/memory-baseline.json yourself. Use this to
+          regenerate the baseline on a genuine ubuntu-latest runner; a
+          baseline captured anywhere else (e.g. an ad-hoc cloud VM) has
+          already caused a false 243% "regression" from machine
+          differences alone -- see tests/fixtures/memory-baseline.README.md.
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -469,10 +483,55 @@ jobs:
             sleep 15
           done
           exit 1
+      - name: Memory-gate comparison self-test (offline, no server, no build)
+        # The gate's own --self-test needs a server + a 1M-key populate + a
+        # 60s settle, so it can only inject ONE mutation. This runs the
+        # comparison logic against synthetic snapshots in ~1s and asserts it
+        # goes RED for growth, RED for an unexplained shrink, and RED for an
+        # empty-server measurement. It fails BEFORE the build because a gate
+        # whose comparison is broken has nothing to say about the binary.
+        run: bash tests/memory_gate_compare_selftest.sh
       - name: Build moon
         run: cargo build --no-default-features --features runtime-tokio,jemalloc,graph,text-index
-      - name: Run memory steady-state gate (with self-test)
+      - name: Run memory steady-state gate (self-test, then baseline comparison)
+        # self-test is a PHASE, not a mode: it proves the comparison can
+        # detect an injected +6% regression, then falls through to the real
+        # comparison against tests/fixtures/memory-baseline.json. It used to
+        # exit 0 right after the injection check, so this job passed for
+        # months without ever reading the committed baseline (moon#764).
+        #
+        # Exit codes: 0 = within tolerance, 1 = a kind regressed,
+        # 2 = the gate CANNOT run (no/mismatched baseline provenance --
+        # os/arch OR machine class, see check_baseline_provenance).
+        #
+        # Skipped on a capture_memory_baseline dispatch: that run's whole
+        # point is to WRITE a baseline on this runner, not compare against
+        # the (possibly wrong-machine) committed one below.
+        if: github.event.inputs.capture_memory_baseline != 'true'
         run: bash scripts/bench-memory-steady-state.sh --self-test --skip-build
+      - name: Capture a fresh baseline on THIS runner (workflow_dispatch only)
+        # moon#764 follow-up: a baseline captured on an ad-hoc GCE box (same
+        # os/arch as ubuntu-latest, different CPU/RAM/allocator behaviour)
+        # produced a false 243% allocator_overhead "regression" on this exact
+        # job. The only baseline that means anything for this gate is one
+        # captured BY this workflow, ON this runner label -- hence a dispatch
+        # input rather than any out-of-band capture method.
+        if: github.event.inputs.capture_memory_baseline == 'true'
+        run: bash scripts/bench-memory-steady-state.sh --write-baseline tests/fixtures/memory-baseline.json --skip-build
+      - name: Upload captured snapshot (always -- pass, fail, or capture)
+        # Before this, the only way to see what a run actually measured was
+        # to read failure text out of a log. bench-memory-steady-state.sh
+        # writes SNAPSHOT_OUT_PATH (/tmp/moon-memory-snapshot.json)
+        # unconditionally, every mode, every outcome -- upload it every time,
+        # not just on failure, so the next person gets the JSON directly.
+        # In capture_memory_baseline mode this is identical in content to
+        # what --write-baseline wrote to tests/fixtures/memory-baseline.json.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-steady-state-snapshot
+          path: /tmp/moon-memory-snapshot.json
+          if-no-files-found: warn
       - name: Upload report on failure
         if: failure()
         uses: actions/upload-artifact@v4
