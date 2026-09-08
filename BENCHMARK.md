@@ -34,7 +34,9 @@ number that later had to be retracted:
    macOS figures are labelled as dev references in the archive and are not
    quoted here.
 
-n=5 interleaved reps per throughput point, n=3 fresh servers per memory point.
+n=5 interleaved reps per throughput point. Memory points are n=3 fresh servers,
+except the four sizes added later to test a specific archived claim (16/32/48/
+128 B), which are n=2 and marked `†` in §3.
 
 ---
 
@@ -49,7 +51,7 @@ n=5 interleaved reps per throughput point, n=3 fresh servers per memory point.
 | p=1, all families | 0.89-1.08x | 0.77-1.05x |
 | **Memory per key, 8 B - 1 KB** | **0.78-0.92x** (moon uses less) | **0.84-0.92x** |
 | Idle RSS, `--shards 1` | 0.99x (tie) | 0.96x |
-| **vs v0.8.7:** non-inlined families, p>=8 | **+5 to +25%** | **-1 to +21%** (11/12 rows up) |
+| **vs v0.8.7:** non-inlined families, p>=8 | **+5 to +23%** | **+5 to +18%** (raw ops/s, 12/12 rows up) |
 
 **The one-sentence version: moon is faster than Redis on GET and SET at pipeline
 depth, slower than Redis on everything else at pipeline depth, and uses 8-22%
@@ -96,7 +98,14 @@ noise floor.
 | ZADD  | 0.77x | 0.68x | 0.53x |
 
 Noise floors: 0.5-13.6% (x86), 0.8-8.5% (ARM). Every unmarked ratio above sits
-several floor-widths from 1.0.
+at least 2.4 floor-widths from 1.0, except ARM GET p=1, which sits at 1.19 —
+close enough that it should be read as "at or just above parity", not a win.
+
+These floors are 3-4x wider than the archive's §2.12 run (0.2-3.6%) because the
+request counts here are smaller (100k/400k/1.5M at p=1/8/64 against its
+200k/600k/4M). This run trades precision for covering two more command families
+and a second binary; where a tighter number matters, §2.12's method is the one
+to repeat.
 
 ### Peak absolute, p=64
 
@@ -129,35 +138,46 @@ The archive's §2.13 documented a 9-21% write-path loss that landed between
 v0.6.0 and v0.8.7, on every non-inlined family, and closed without attribution.
 v0.8.7 (`d63ffcd8`) was rebuilt on these same two hosts, same toolchain, same
 `RUSTFLAGS`, and run through the same harness — each version normalised by its
-own freshly-measured Redis. Change in the moon/Redis ratio, main vs v0.8.7:
+own freshly-measured Redis.
 
-| command | x86 p=8 | x86 p=64 | ARM p=8 | ARM p=64 |
+Change in the moon/Redis **ratio**, and — because a ratio moves when either
+side does — the change in moon's **raw ops/s**, which cannot be moved by Redis:
+
+| command | x86 p=8 ratio / raw | x86 p=64 ratio / raw | ARM p=8 ratio / raw | ARM p=64 ratio / raw |
 |---------|:---:|:---:|:---:|:---:|
-| INCR  | **+16.2%** | **+23.5%** | **+14.0%** | **+17.7%** |
-| HSET  | **+14.0%** | **+18.3%** | **+11.1%** | **+16.1%** |
-| SPOP  | **+25.0%** | **+15.0%** | -1.4%* | **+14.2%** |
-| SADD  | +5.3%* | **+12.0%** | **+4.7%** | **+12.4%** |
-| LPUSH | **+9.7%** | **+11.3%** | **+4.9%** | **+8.5%** |
-| ZADD  | +6.8%* | **+6.5%** | **+20.8%** | **+7.7%** |
-| GET   | +0.6%* | +1.9%* | +2.9%* | +0.1%* |
-| SET   | -1.0%* | -1.0%* | +1.3%* | -3.0% |
+| INCR  | +16.2% / **+16.7%** | +23.5% / **+23.1%** | +14.0% / **+12.2%** | +17.7% / **+17.5%** |
+| HSET  | +14.0% / **+14.8%** | +18.3% / **+18.9%** | +11.1% / **+8.9%** | +16.1% / **+13.9%** |
+| SPOP  | +25.0% / **+13.2%** | +15.0% / **+17.0%** | -1.4% / **+7.1%** | +14.2% / **+14.9%** |
+| SADD  | +5.3% / **+4.6%** | +12.0% / **+10.3%** | +4.7% / **+4.9%** | +12.4% / **+13.3%** |
+| LPUSH | +9.7% / **+9.5%** | +11.3% / **+11.3%** | +4.9% / **+7.2%** | +8.5% / **+9.1%** |
+| ZADD  | +6.8% / **+5.4%** | +6.5% / **+5.5%** | +20.8% / **+5.3%** | +7.7% / **+5.8%** |
+| GET   | +0.6% / +2.6% | +1.9% / +0.0% | +2.9% / +3.0% | +0.1% / +0.8% |
+| SET   | -1.0% / -1.4% | -1.0% / -3.5% | +1.3% / +0.7% | -3.0% / -0.3% |
 
-**The six non-inlined families all improved, on both architectures**, by roughly
-the margin §2.13 recorded as lost — INCR gained back 23.5% against a recorded
-17.5% loss, HSET 18.3% against 14.7%, LPUSH 11.3% against 13.1%. The families
-that never regressed (GET, SET) did not move.
+**Read the raw column.** On it, all twelve non-inlined rows improved on both
+architectures — **+4.6% to +23.1%** on x86 and **+4.9% to +17.5%** on ARM, no
+exceptions — while GET and SET moved by at most 3.5%. That is roughly the margin
+the archive's §2.13 recorded as lost (INCR -17.5%, SPOP -21.4%, HSET -14.7%,
+LPUSH -13.1%), so the write-path regression is reversed.
 
 **The one loss §2.13 recorded that has *not* come back is SET at p=64** (-14.9%
-there; -1.0% x86 / -3.0% ARM here, i.e. flat). Whatever cost SET at depth is
-still in the tree.
+there; -3.5% raw x86 / -0.3% raw ARM here, i.e. flat). Whatever cost SET at depth
+is still in the tree.
 
-Two checks that this is moon moving and not the host: the raw moon ops/s delta
-tracks the ratio change on every row (INCR p=8 x86: ratio +16.2%, raw +16.7%),
-and Redis — unchanged code, measured in both runs — drifted by a median of
-**-0.4%** (x86) and **+0.3%** (ARM) between them. The two runs are sequential
-rather than interleaved with each other, which is the weaker design; it is
-adequate here only because the control held still, and that was verified rather
-than assumed.
+**Where the two columns disagree, trust the raw one, and do not quote the
+ratio.** Redis was re-measured in both runs and drifted by a median of -0.4%
+(x86) / +0.3% (ARM) — but the *per-cell* drift ranges -9.4%…+1.9% and
+-12.8%…+8.6%, and the two widest-drifting cells are exactly the ones that
+produce the biggest ratio numbers: x86 SPOP p=8 reads +25.0% by ratio and
++13.2% raw because Redis fell 9.4%, and ARM ZADD p=8 reads +20.8% by ratio and
++5.3% raw because Redis fell 12.8%. ARM SPOP p=8 flips sign for the same reason
+(-1.4% by ratio, +7.1% raw, Redis up 8.6%). An earlier draft of this section
+claimed the raw delta tracked the ratio on every row; it does not, and the two
+places it fails were the two headline maxima.
+
+These two runs are sequential rather than interleaved with each other, which is
+the weaker design — that is precisely why the raw column is published here
+rather than the ratio alone.
 
 ---
 
@@ -175,18 +195,21 @@ was measuring `redis-benchmark`'s default **3-byte** value.
 | value size | moon x86 | Redis x86 | ratio | moon ARM | Redis ARM | ratio |
 |---|---:|---:|:---:|---:|---:|:---:|
 | 8 B    | 97.9 B | 125.1 B | **0.78x** | 97.5 B | 113.0 B | **0.86x** |
-| 16 B   | 113.7 B | 136.4 B | **0.83x** | 113.9 B | 128.7 B | **0.89x** |
-| 32 B   | 130.6 B | 158.3 B | **0.83x** | 129.8 B | 145.6 B | **0.89x** |
-| 48 B   | 146.5 B | 175.0 B | **0.84x** | 145.7 B | 161.9 B | **0.90x** |
+| 16 B † | 113.3 B | 136.1 B | **0.83x** | 113.3 B | 128.7 B | **0.88x** |
+| 32 B † | 130.1 B | 158.3 B | **0.82x** | 129.7 B | 145.6 B | **0.89x** |
+| 48 B † | 146.1 B | 174.9 B | **0.84x** | 145.7 B | 161.8 B | **0.90x** |
 | 64 B   | 163.9 B | 178.8 B | **0.92x** | 162.8 B | 177.0 B | **0.92x** |
-| 128 B  | 229.2 B | 259.8 B | **0.88x** | 228.9 B | 257.3 B | **0.89x** |
+| 128 B †| 230.0 B | 259.8 B | **0.89x** | 228.9 B | 257.3 B | **0.89x** |
 | 256 B  | 362.2 B | 421.7 B | **0.86x** | 361.1 B | 419.0 B | **0.86x** |
 | 1024 B | 1164.6 B | 1393.3 B | **0.84x** | 1161.9 B | 1386.1 B | **0.84x** |
 | **idle RSS** | 13.01 MB | 13.19 MB | 0.99x | 11.43 MB | 11.93 MB | 0.96x |
 
+`†` = n=2 repetitions; every other row is n=3.
+
 **moon uses less memory per key at every size measured, on both architectures** —
-8-22%, weakest at 64 B and strongest at 8 B, where `CompactValue` inlines the
-value into the entry (values <=12 B).
+8-22% on x86 and 8-16% on ARM. The weakest point on both is 64 B. The strongest
+differs: on x86 it is 8 B (0.78x), where `CompactValue` inlines the value into
+the entry (values <=12 B); on ARM it is 1 KB (0.84x).
 
 The result does not depend on the idle-RSS subtraction: moon's **absolute**
 loaded RSS is lower at every size too (1 KB values, x86: 210 MB vs 249 MB).
@@ -197,8 +220,8 @@ Both are recorded rather than quietly dropped:
 
 - The archive's §3.2 reports moon **11-51% worse at 32 B** on x86 `--shards 1`.
   16/32/48/128 B were measured here specifically to test that point, on both
-  architectures: moon is **0.83x** at 32 B on x86 and **0.89x** on ARM — a
-  17% and 11% win. Not reproduced on either. That run compared against Redis
+  architectures: moon is **0.82x** at 32 B on x86 and **0.89x** on ARM — an
+  18% and 11% win. Not reproduced on either. That run compared against Redis
   **7.4.2**; this one against 7.0.15.
 - The archive's §3.1 reports idle RSS moon 12.6-12.9 MB vs Redis 7.5-7.7 MB
   (moon 1.7x worse). Here Redis 7.0.15 idles at **13.19 MB** on the same host
@@ -223,8 +246,8 @@ most recent measurement of each subsystem, **not** measurements of `ae6cd003`.
 | area | last measured | result | where |
 |---|---|---|---|
 | Durability write path (AOF) | 2026-07-08, GCE x86 | `everysec` SET P16 **1.32x**, P1 0.99x; `always` P16 0.91x; pub/sub 5.09 M msg/s | archive §7.3 |
-| Vector vs Qdrant | 2026-07-08, GCE both arches | ingest **10x**, search **2.7-3.4x**, time-to-green **1.6-2.3x** | archive §10.9 |
-| Vector ANN-benchmarks | 2026-07-08, GCE ARM | iso-recall **1.7-3.2x** vs RediSearch, **2.9-5x** vs Qdrant | archive §10.10 |
+| Vector vs Qdrant | 2026-07-08, GCE both arches | ingest **5.8-10.4x**, search **2.8x** (ARM) / **3.6x** (x86), time-to-green **1.6x** (x86) / **2.3x** (ARM) | archive §10.9 |
+| Vector ANN-benchmarks | 2026-07-08, GCE ARM | glove-200 at iso-recall: **1.7-3.2x** vs RediSearch, **2.9-3.1x** vs Qdrant (gist-960 differs — see archive) | archive §10.10 |
 | Graph Cypher vs FalkorDB | 2026-07-07, GCE dedicated | 1-hop **2.34x** (x86) / **2.67x** (ARM) | archive §11.9 |
 | Full-text vs RediSearch | 2026-06-17, GCE | counts exact; index 15,052 docs/s; low-DF wins, multi-term trails | archive §12.3 |
 | Multi-shard scaling | 2026-09-01, GCE ARM | s8/s1 = 1.42x (p=1), 2.14x (p=8), 3.79x (p=64) | archive §2.14 |
@@ -257,7 +280,10 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release   # fat LTO, cgu=1
 # Throughput: 8 families x 3 depths, n=5 interleaved, Redis re-measured every
 # rep. Provenance (binary sha256, versions, CPU) goes into the CSV header.
 ./scripts/bench-ab-matrix.sh --moon-bin ./target/release/moon --reps 5 > matrix.csv
-python3 scripts/bench-ab-report.py matrix.csv     # ratios + noise floors
+python3 scripts/bench-ab-report.py matrix.csv 5   # ratios + noise floors
+#                                            ^ expected reps: pins the
+#   completeness check, so a run truncated by an aborted leg reports
+#   INCOMPLETE instead of quietly redefining "all reps" as whatever survived.
 
 # Memory: fresh server per point, arithmetic-floor guard.
 ./scripts/bench-ab-memory.sh --moon-bin ./target/release/moon --reps 3 > mem.csv

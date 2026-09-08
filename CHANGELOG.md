@@ -166,10 +166,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caveat (GET/SET **1.6x** at p=64; every other family **0.45-0.87x** at p>=8,
   both arches). The write-path regression the old §2.13 recorded between v0.6.0
   and v0.8.7 is **reversed** — a v0.8.7 rebuild on the same hosts puts main
-  ahead by +5 to +25% on every non-inlined family (INCR +23.5%, HSET +18.3%,
-  SPOP +15.0% at x86 p=64), with Redis drifting a median -0.4% between runs.
+  ahead on every non-inlined family, twelve rows of twelve on both arches, by
+  +5 to +23% (x86) and +5 to +18% (ARM) measured in moon's raw ops/s -- the
+  ratio column is also published, but where the two disagree the raw one is the
+  honest number, because per-cell Redis drift reaches 12.8% and lands on the
+  largest ratio gains.
   The one loss that did **not** come back is SET at p=64. Memory: moon uses
-  **8-22% less per key at every size from 8 B to 1 KB** on both arches, which
+  **less per key at every size from 8 B to 1 KB** on both arches (8-22% on x86,
+  8-16% on ARM), which
   does not reproduce the archived "11-51% worse at 32 B" (measured 0.83x here)
   or "empty-server RSS 1.7x Redis" (a tie here); both older runs used Redis
   7.4.2 rather than 7.0.15, and both readings stay on the record.

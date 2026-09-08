@@ -42,6 +42,20 @@ done
 
 log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 
+# Fail closed on a missing tool. The port and readiness checks below are built
+# on `timeout`, which is absent on stock macOS -- and a missing `timeout` makes
+# `$(timeout 2 redis-cli ... )` expand to empty, which is not "PONG", so the
+# occupied-port guard would silently pass instead of refusing. A guard that
+# cannot fire is worse than no guard, so require the tools up front.
+for _tool in timeout redis-cli redis-benchmark; do
+  command -v "$_tool" >/dev/null 2>&1 || {
+    echo "FATAL: '$_tool' not found. These harnesses are Linux-only;" >&2
+    echo "       on macOS, 'timeout' comes from coreutils (brew install coreutils)." >&2
+    exit 1
+  }
+done
+
+
 SERVER_PID=""; SERVER_DIR=""
 stop_server() {
   if [[ -n "$SERVER_PID" ]]; then

@@ -7,6 +7,7 @@ worst within-leg coefficient of variation across the two series being compared
 no difference to report (BENCHMARK.md §2.11).
 """
 import csv
+import re
 import statistics
 import sys
 from collections import defaultdict
@@ -44,7 +45,30 @@ def main(path, expected_reps=None):
             seen_reps[(r["family"], int(r["depth"]), r["engine"])].add(r["rep"])
 
     print("\n".join(header))
-    n_expected = expected_reps if expected_reps is not None else len(all_reps)
+    # Truncation is the NORMAL failure mode here: both shell harnesses `exit 1`
+    # mid-run on an aborted leg, so the CSV simply stops. Inferring the expected
+    # repetition count from the rows present would then redefine "complete" as
+    # whatever survived and publish a ratio anyway. The harness writes its
+    # intended count into the provenance header (`# ... reps: N`) precisely so
+    # this can be checked against intent rather than against the wreckage.
+    declared = None
+    for h in header:
+        m = re.search(r"\breps:\s*(\d+)", h)
+        if m:
+            declared = int(m.group(1))
+    n_expected = expected_reps if expected_reps is not None else declared
+    if n_expected is None:
+        n_expected = len(all_reps)
+        print(
+            f"\n> WARNING: no rep count given and none in the header; assuming "
+            f"{n_expected} from the rows present. A truncated file cannot be "
+            f"detected this way — pass the expected count as argument 2.\n"
+        )
+    elif len(all_reps) < n_expected:
+        print(
+            f"\n> **TRUNCATED: {len(all_reps)} of {n_expected} repetitions present.** "
+            f"Cells below are suppressed accordingly.\n"
+        )
     families, depths = [], []
     for (fam, depth, _eng) in rows:
         if fam not in families:

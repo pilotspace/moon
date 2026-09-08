@@ -69,7 +69,7 @@ and how they compose.
 - **Forkless persistence.** RDB snapshots iterate DashTable segments incrementally — no `fork()`, no COW memory spike. AOF is a per-shard WAL v3 with batched fsync; the advantage over Redis grows with pipeline depth.
 - **Tiered disk offload — for data AND engines.** Keys evicted under `maxmemory` spill to NVMe instead of being deleted, with async write and read-through; idle vector-index segments demote HOT→WARM (mmap)→COLD (unloaded stub, reload-on-search) and give the memory back — measured **−26% process RSS** on a 40K×768d corpus with identical search results after reload. 100% crash recovery across all tiers.
 - **Multi-tenant isolation that's actually enforced.** Logical dbs get their own `FT.*`/graph/full-text indexes (db 1's indexes are invisible to db 0 — across shards, restarts, and recovery), per-db memory quotas (`--db-maxmemory`) with Redis-style deny-OOM semantics (shrink commands always pass — a tenant can never wedge itself), and workspace key-prefix namespaces on top.
-- **Memory-optimized types — a win at every value size measured.** `CompactKey` (23-byte SSO), `CompactValue` (16-byte SSO with inline TTL), `HeapString`, B+ tree sorted sets, and per-request bumpalo arenas — no heap allocation for keys ≤23 B or values ≤12 B. Re-measured 2026-09-08 on Linux at `--shards 1` against **Redis 7.0.15/jemalloc**: **8–22% less memory per key at every size from 8 B to 1 KB**, on both x86_64 and aarch64 (0.78× at 8 B, 0.83× at 32 B, 0.86× at 256 B, 0.84× at 1 KB on x86), and idle RSS a tie (13.01 MB vs Redis 13.19 MB). This run **did not reproduce** two figures published from the 2026-09-04 run — "11–51% *more* at 32 B" and "empty-server RSS 1.7× Redis". The conditions differed: that run's oracle was **Redis 7.4.2**, this one's is 7.0.15, and on idle RSS it is the *Redis* side that disagrees (7.5–7.7 MB then, 13.19 MB now, same host class) — [#821](https://github.com/pilotspace/moon/issues/821) tracks it. Both measurements stand on the record. Full table, host and method: [BENCHMARK.md §3](BENCHMARK.md); the 2026-09-04 run is preserved in the [benchmark archive](docs/internal/benchmark-history.md) §3.
+- **Memory-optimized types — a win at every value size measured.** `CompactKey` (23-byte SSO), `CompactValue` (16-byte SSO with inline TTL), `HeapString`, B+ tree sorted sets, and per-request bumpalo arenas — no heap allocation for keys ≤23 B or values ≤12 B. Re-measured 2026-09-08 on Linux at `--shards 1` against **Redis 7.0.15/jemalloc**: **8–22% less memory per key at every size from 8 B to 1 KB**, on both x86_64 and aarch64 (0.78× at 8 B, 0.82× at 32 B, 0.86× at 256 B, 0.84× at 1 KB on x86), and idle RSS a tie (13.01 MB vs Redis 13.19 MB). This run **did not reproduce** two figures published from the 2026-09-04 run — "11–51% *more* at 32 B" and "empty-server RSS 1.7× Redis". The conditions differed: that run's oracle was **Redis 7.4.2**, this one's is 7.0.15, and on idle RSS it is the *Redis* side that disagrees (7.5–7.7 MB then, 13.19 MB now, same host class) — [#821](https://github.com/pilotspace/moon/issues/821) tracks it. Both measurements stand on the record. Full table, host and method: [BENCHMARK.md §3](BENCHMARK.md); the 2026-09-04 run is preserved in the [benchmark archive](docs/internal/benchmark-history.md) §3.
 - **AI-native, in-core.** Vector search (HNSW + TurboQuant), BM25 full-text with three-way RRF hybrid fusion, a Cypher property-graph engine, cross-store ACID, workspaces, durable queues, and bi-temporal MVCC — one binary, no module loader.
 
 <p align="center">
@@ -232,8 +232,9 @@ rep as a live drift control.
 > cache line, and key distribution alone moves these numbers by ~2×. The two are
 > not comparable, so neither is quoted as a delta. On the question of whether the
 > tree got slower, the direct answer is the v0.8.7 → main A/B on these same hosts
-> on the same day: the six non-inlined families came back **+5 to +25%** (x86) and
-> **up to +21%** on eleven of twelve rows (ARM), and GET and SET did not move. See "Change since v0.8.7"
+> on the same day: the six non-inlined families came back **+5 to +23%** (x86)
+> and **+5 to +18%** (ARM) in raw ops/s, twelve rows of twelve on both, and GET
+> and SET did not move. See "Change since v0.8.7"
 > in [BENCHMARK.md §2](BENCHMARK.md).
 
 > **Scope of the pipelined win — read before quoting these.** GET and plain
@@ -365,7 +366,7 @@ reference but ships under SSPL since 2024. Full traced review:
 | Multi-node cluster (GA)    | **Alpha** (single-node GA today) | **Production**              | **Production**            |
 | Peak single-server GET     | **2.97M/s** (c3-8 x86_64, p=64, `-r 100000`, 2026-09-08) | 2.1M RPS (vendor, 9 I/O threads, p=10, 512 B) | 1.83M/s, Redis 7.0.15 (same harness and same run as Moon) |
 
-- **Choose Moon** for single-node peak pipelined **GET/SET** throughput, per-key memory efficiency (8–22% less than Redis 7.0.15 across 8 B – 1 KB, both arches, 2026-09-08), forkless snapshots, or AI-native workloads (vector / GraphRAG / hybrid retrieval) with cross-store ACID. **Not** for pipelined workloads dominated by anything other than GET/SET — every other family measured runs 0.45–0.87× Redis at p≥8.
+- **Choose Moon** for single-node peak pipelined **GET/SET** throughput, per-key memory efficiency (8–22% less on x86 and 8–16% on ARM vs Redis 7.0.15, across 8 B – 1 KB, 2026-09-08), forkless snapshots, or AI-native workloads (vector / GraphRAG / hybrid retrieval) with cross-store ACID. **Not** for pipelined workloads dominated by anything other than GET/SET — every other family measured runs 0.45–0.87× Redis at p≥8.
 - **Choose Valkey** for proven multi-node clusters, managed-cloud-only deployments, or strict Redis 7.2 module-ecosystem compatibility under LF governance.
 - **Stay on Redis OSS** for existing RediSearch/RedisJSON/RedisBloom investments or Redis Enterprise features (CRDT active-active, Redis Flash).
 

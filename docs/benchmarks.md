@@ -41,8 +41,8 @@ recorded in the source report, this table says so rather than filling it in.
 | All families, p=1 | 0.89–1.08× x86 / 0.77–1.05× ARM | roughly a tie; ARM container families are the weak end — same run — §2 |
 | Peak GET, absolute | **2.97M ops/s** x86 vs Redis 1.83M · **1.53M** ARM vs 0.95M | same run — §2 |
 | Peak SET, absolute | **2.01M ops/s** x86 vs Redis 1.52M · **1.32M** ARM vs 0.85M | same run — §2 |
-| vs v0.8.7, non-inlined families | **+6 to +25% x86 / +5 to +21% ARM** | v0.8.7 `d63ffcd8` rebuilt on the same hosts, same day, same harness; Redis control drifted a median −0.4% (x86) / +0.3% (ARM) — §2 |
-| Memory per key, 8 B – 1 KB | **0.78–0.92× x86 / 0.86–0.92× ARM** (Moon uses 8–22% **less**) | 2026-09-08, `--shards 1`, Redis 7.0.15/jemalloc, `-r 200000`, fresh server per point, n=3, arithmetic-floor guard — §3 |
+| vs v0.8.7, non-inlined families | **+5 to +23% x86 / +5 to +18% ARM** (raw ops/s) | v0.8.7 `d63ffcd8` rebuilt on the same hosts, same day, same harness; Redis control drifted a median −0.4% (x86) / +0.3% (ARM) — §2 |
+| Memory per key, 8 B – 1 KB | **0.78–0.92× x86 / 0.84–0.92× ARM** (Moon uses 8–22% **less** on x86, 8–16% on ARM) | 2026-09-08, `--shards 1`, Redis 7.0.15/jemalloc, `-r 200000`, fresh server per point, n=3 (n=2 at 16/32/48/128 B), arithmetic-floor guard — §3 |
 | Idle RSS, `--shards 1` | **tie** — 0.99× x86, 0.96× ARM | 13.01 vs 13.19 MB (x86), 11.43 vs 11.93 MB (ARM) — same run — §3 |
 | Peak GET (v0.1.6, absolute) | 5.11M ops/sec (1.72×) | GCloud c3-standard-8 x86_64, p=64. Redis `io-threads` and payload size **not recorded**, and the run drove a *single hot key* rather than `-r N` — archive §2.1, superseded |
 | Memory, 64 B values (aarch64, `--shards 8`) | 1.16× worse than Redis | 2026-09-01, GCE t2a-standard-8, Redis 7.0.15 `--io-threads 8 --io-threads-do-reads yes`, `-r 200000` — archive §2.14; a different configuration from the `--shards 1` rows above |
@@ -85,17 +85,20 @@ Full table and method: [BENCHMARK.md §3](https://github.com/pilotspace/moon/blo
 | Value size | Moon x86 | Redis x86 | Moon / Redis | Moon ARM | Redis ARM | Moon / Redis |
 |:---:|---:|---:|:---:|---:|---:|:---:|
 | 8 B | 97.9 B | 125.1 B | **0.78×** | 97.5 B | 113.0 B | **0.86×** |
-| 16 B | 113.7 B | 136.4 B | **0.83×** | 113.9 B | 128.7 B | **0.89×** |
-| 32 B | 130.6 B | 158.3 B | **0.83×** | 129.8 B | 145.6 B | **0.89×** |
-| 48 B | 146.5 B | 175.0 B | **0.84×** | 145.7 B | 161.9 B | **0.90×** |
+| 16 B † | 113.3 B | 136.1 B | **0.83×** | 113.3 B | 128.7 B | **0.88×** |
+| 32 B † | 130.1 B | 158.3 B | **0.82×** | 129.7 B | 145.6 B | **0.89×** |
+| 48 B † | 146.1 B | 174.9 B | **0.84×** | 145.7 B | 161.8 B | **0.90×** |
 | 64 B | 163.9 B | 178.8 B | **0.92×** | 162.8 B | 177.0 B | **0.92×** |
-| 128 B | 229.2 B | 259.8 B | **0.88×** | 228.9 B | 257.3 B | **0.89×** |
+| 128 B † | 230.0 B | 259.8 B | **0.89×** | 228.9 B | 257.3 B | **0.89×** |
 | 256 B | 362.2 B | 421.7 B | **0.86×** | 361.1 B | 419.0 B | **0.86×** |
 | 1,024 B | 1,164.6 B | 1,393.3 B | **0.84×** | 1,161.9 B | 1,386.1 B | **0.84×** |
 | **idle RSS** | 13.01 MB | 13.19 MB | 0.99× (tie) | 11.43 MB | 11.93 MB | 0.96× |
 
+`†` = n=2 repetitions; every other row is n=3.
+
 **Read it as:** Moon uses **less memory per key at every size measured, on both
-architectures** — 8–22%, weakest at 64 B and strongest at 8 B, where
+architectures** — 8–22% on x86 and 8–16% on ARM, weakest at 64 B on both;
+strongest at 8 B on x86 and at 1 KB on ARM, where
 `CompactValue` inlines the value into the entry (values ≤12 B). The result does
 not depend on the idle-RSS subtraction: Moon's **absolute** loaded RSS is lower at
 every size too (1 KB values, x86: 210 MB vs 249 MB). Scope: `--shards 1`, string
@@ -105,8 +108,8 @@ values, one key shape; 4 KB was not part of this run.
     The 2026-09-04 Linux run reported Moon **11–51% worse at 32 B** on x86
     `--shards 1` (archive §3.2), and an empty-server RSS of **12.6–12.9 MB against
     Redis 7.5–7.7 MB — Moon 1.7× worse** (archive §3.1). 16/32/48/128 B were
-    measured on 2026-09-08 specifically to test the first point: Moon is **0.83×
-    at 32 B on x86 and 0.89× on ARM — a 17% and 11% win**. On idle RSS the two servers tie. Neither older figure is
+    measured on 2026-09-08 specifically to test the first point: Moon is **0.82×
+    at 32 B on x86 and 0.89× on ARM — an 18% and 11% win**. On idle RSS the two servers tie. Neither older figure is
     being called wrong here — the newer measurement did not reproduce it, and the
     conditions differ: the 2026-09-04 oracle was **Redis 7.4.2**, this one is
     **Redis 7.0.15**. On idle RSS the disagreement is on the *Redis* side
