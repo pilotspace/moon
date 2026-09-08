@@ -904,3 +904,138 @@ mod tests {
         assert_eq!(encoding_of_832(&mut db, b"l"), "listpack");
     }
 }
+
+#[cfg(test)]
+mod listpack_batch_overflow_tests {
+    use crate::protocol::Frame;
+    use crate::storage::Database;
+    use bytes::Bytes;
+
+    fn bs(s: &[u8]) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s))
+    }
+
+    /// moon#865. The listpack header counts elements in a `u16`. Before the
+    /// fix, one command's entries were all pushed before the entry count was
+    /// compared with LISTPACK_MAX_ENTRIES, so a batch past 65_536 wrapped the
+    /// count and the container silently forgot everything before the wrap --
+    /// while the server acknowledged the write.
+    ///
+    /// Measured pre-fix: `LLEN` returned 4464 (= 70_000 - 65_536).
+    #[test]
+    fn rpush_one_call_past_u16_keeps_every_element() {
+        let mut db = Database::new();
+        const N: usize = 70_000;
+        let owned: Vec<Vec<u8>> = (0..N).map(|i| format!("e{i:07}").into_bytes()).collect();
+        let mut args: Vec<Frame> = Vec::with_capacity(N + 1);
+        args.push(bs(b"biglist"));
+        args.extend(owned.iter().map(|m| bs(m)));
+
+        assert_eq!(
+            crate::command::list::rpush(&mut db, &args),
+            Frame::Integer(N as i64),
+            "RPUSH under-reported the elements it accepted"
+        );
+        assert_eq!(
+            crate::command::list::llen(&mut db, &[bs(b"biglist")]),
+            Frame::Integer(N as i64),
+            "LLEN lost elements to the u16 wrap"
+        );
+    }
+
+    /// Measured pre-fix: `LPUSH` reported 4464 for the same reason.
+    #[test]
+    fn lpush_one_call_past_u16_keeps_every_element() {
+        let mut db = Database::new();
+        const N: usize = 70_000;
+        let owned: Vec<Vec<u8>> = (0..N).map(|i| format!("e{i:07}").into_bytes()).collect();
+        let mut args: Vec<Frame> = Vec::with_capacity(N + 1);
+        args.push(bs(b"biglist"));
+        args.extend(owned.iter().map(|m| bs(m)));
+
+        assert_eq!(
+            crate::command::list::lpush(&mut db, &args),
+            Frame::Integer(N as i64),
+            "LPUSH under-reported"
+        );
+        assert_eq!(
+            crate::command::list::llen(&mut db, &[bs(b"biglist")]),
+            Frame::Integer(N as i64),
+            "LLEN lost elements to the u16 wrap"
+        );
+    }
+
+    /// A hash stores two listpack entries per field, so it wraps at 32_768
+    /// fields. Measured pre-fix: `HLEN` returned 7232 for 40_000 fields.
+    #[test]
+    fn hset_one_call_past_u16_keeps_every_field() {
+        let mut db = Database::new();
+        const N: usize = 40_000;
+        let mut owned: Vec<Vec<u8>> = Vec::with_capacity(N * 2);
+        for i in 0..N {
+            owned.push(format!("f{i:07}").into_bytes());
+            owned.push(format!("v{i:07}").into_bytes());
+        }
+        let mut args: Vec<Frame> = Vec::with_capacity(N * 2 + 1);
+        args.push(bs(b"bighash"));
+        args.extend(owned.iter().map(|m| bs(m)));
+
+        assert_eq!(
+            crate::command::hash::hset(&mut db, &args),
+            Frame::Integer(N as i64),
+            "HSET under-reported"
+        );
+        assert_eq!(
+            crate::command::hash::hlen(&mut db, &[bs(b"bighash")]),
+            Frame::Integer(N as i64),
+            "HLEN lost fields to the u16 wrap"
+        );
+    }
+
+    /// The batch guard must not change behaviour for a batch that legitimately
+    /// belongs in a listpack, nor for one that straddles the upgrade point --
+    /// otherwise the fix is just "never use the encoding".
+    #[test]
+    fn small_and_straddling_batches_are_unchanged() {
+        for n in [1usize, 8, 128, 129, 200] {
+            let mut db = Database::new();
+            let owned: Vec<Vec<u8>> = (0..n).map(|i| format!("e{i:05}").into_bytes()).collect();
+            let mut args: Vec<Frame> = Vec::with_capacity(n + 1);
+            args.push(bs(b"l"));
+            args.extend(owned.iter().map(|m| bs(m)));
+            assert_eq!(
+                crate::command::list::rpush(&mut db, &args),
+                Frame::Integer(n as i64),
+                "RPUSH n={n}"
+            );
+            assert_eq!(
+                crate::command::list::llen(&mut db, &[bs(b"l")]),
+                Frame::Integer(n as i64),
+                "LLEN n={n}"
+            );
+        }
+    }
+
+    /// Many small calls must still reach the same total: the guard is on the
+    /// per-command batch, so repeated RPUSHes have to upgrade the container
+    /// rather than pile into the listpack.
+    #[test]
+    fn many_small_calls_accumulate_past_the_listpack_ceiling() {
+        let mut db = Database::new();
+        const CALLS: usize = 700;
+        const PER: usize = 100;
+        for c in 0..CALLS {
+            let owned: Vec<Vec<u8>> = (0..PER)
+                .map(|i| format!("e{:07}", c * PER + i).into_bytes())
+                .collect();
+            let mut args: Vec<Frame> = Vec::with_capacity(PER + 1);
+            args.push(bs(b"l"));
+            args.extend(owned.iter().map(|m| bs(m)));
+            crate::command::list::rpush(&mut db, &args);
+        }
+        assert_eq!(
+            crate::command::list::llen(&mut db, &[bs(b"l")]),
+            Frame::Integer((CALLS * PER) as i64)
+        );
+    }
+}

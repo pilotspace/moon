@@ -1308,6 +1308,40 @@ else
 fi
 redis-cli -p "$PORT_RUST" -n 9 FLUSHDB &>/dev/null || true
 
+# moon#865 -- one command carrying more elements than a listpack's u16 element
+# count can hold. Pre-fix, RPUSH of 70k elements left LLEN reporting 4464
+# (70000 - 65536) and the server had already replied +OK-equivalent. Redis is
+# the oracle: it must agree element-for-element.
+#
+# The payload is built as one argv, so it is a single command on the wire --
+# 70k separate RPUSHes would upgrade the container long before the wrap and
+# prove nothing.
+lp_big_args=$(seq 0 69999 | awk '{printf "e%07d\n", $1}')
+for lp_port in "$PORT_REDIS" "$PORT_RUST"; do
+    redis-cli -p "$lp_port" -n 10 FLUSHDB &>/dev/null || true
+    # shellcheck disable=SC2086
+    printf 'RPUSH lpbig %s\n' "$(echo $lp_big_args | tr '\n' ' ')" \
+        | redis-cli -p "$lp_port" -n 10 &>/dev/null || true
+done
+lp_redis_len=$(redis-cli -p "$PORT_REDIS" -n 10 LLEN lpbig 2>&1)
+lp_rust_len=$(redis-cli -p "$PORT_RUST" -n 10 LLEN lpbig 2>&1)
+assert_eq "moon#865 LLEN after a 70k-element RPUSH (shards=$SHARDS)" \
+    "$lp_redis_len" "$lp_rust_len"
+
+for lp_port in "$PORT_REDIS" "$PORT_RUST"; do
+    redis-cli -p "$lp_port" -n 10 DEL hbig &>/dev/null || true
+    printf 'HSET hbig %s\n' "$(seq 0 39999 | awk '{printf "f%07d v%07d ", $1, $1}')" \
+        | redis-cli -p "$lp_port" -n 10 &>/dev/null || true
+done
+lp_redis_hlen=$(redis-cli -p "$PORT_REDIS" -n 10 HLEN hbig 2>&1)
+lp_rust_hlen=$(redis-cli -p "$PORT_RUST" -n 10 HLEN hbig 2>&1)
+assert_eq "moon#865 HLEN after a 40k-field HSET (shards=$SHARDS)" \
+    "$lp_redis_hlen" "$lp_rust_hlen"
+
+for lp_port in "$PORT_REDIS" "$PORT_RUST"; do
+    redis-cli -p "$lp_port" -n 10 FLUSHDB &>/dev/null || true
+done
+
 route_probe lmpop      "RPUSH %K v1"                 "LMPOP 1 %K LEFT"
 route_probe zmpop      "ZADD %K 1 m"                 "ZMPOP 1 %K MIN"
 route_probe sintercard "SADD %K a b"                 "SINTERCARD 1 %K"

@@ -3,7 +3,9 @@ use bytes::Bytes;
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, list_elem_cost};
+use crate::storage::db::{
+    LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, list_elem_cost, listpack_batch_fits,
+};
 
 use super::{parse_i64, resolve_index};
 use crate::command::helpers::{all_args_are_bytes, err_wrong_args, extract_bytes};
@@ -38,7 +40,10 @@ pub fn lpush(db: &mut Database, args: &[Frame]) -> Frame {
             .unwrap_or(false)
     });
 
-    if !has_large_element {
+    // moon#865: refuse the listpack path for a batch large enough to wrap the
+    // header's u16 element count. The upgrade check below runs after the push
+    // loop, which cannot stop a wrap that happens inside it.
+    if !has_large_element && listpack_batch_fits(args.len() - 1) {
         match db.get_or_create_list_listpack(key) {
             Ok(Some(lp)) => {
                 // Listpack `estimate_memory()` is O(1) (capacity-based).
@@ -122,7 +127,10 @@ pub fn rpush(db: &mut Database, args: &[Frame]) -> Frame {
             .unwrap_or(false)
     });
 
-    if !has_large_element {
+    // moon#865: refuse the listpack path for a batch large enough to wrap the
+    // header's u16 element count. The upgrade check below runs after the push
+    // loop, which cannot stop a wrap that happens inside it.
+    if !has_large_element && listpack_batch_fits(args.len() - 1) {
         match db.get_or_create_list_listpack(key) {
             Ok(Some(lp)) => {
                 let before = lp.estimate_memory();

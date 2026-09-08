@@ -8,6 +8,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`storage`: one large `RPUSH`/`LPUSH`/`HSET` silently dropped 65,536
+  elements, and the server acknowledged the write (#865).** The listpack
+  header counts its elements in a `u16` and `update_header` advanced that
+  count with `wrapping_add`, while the command layer only compared the count
+  against `LISTPACK_MAX_ENTRIES` *after* the whole argument list had been
+  pushed. Nothing between the client and the wrap enforced a bound. Measured
+  over the wire against a v0.8.9 binary, with `redis-server` as the oracle:
+
+      RPUSH lpbig e0000000 .. e0069999   moon replied 4464    Redis 70000
+      LLEN  lpbig                        moon replied 4464    Redis 70000
+      HSET  hbig  (40,000 fields)        moon replied 40000   Redis 40000
+      HLEN  hbig                         moon replied 7232    Redis 40000
+
+  `70000 - 65536 = 4464`; `80000 - 65536 = 14464`, halved for the field count
+  = `7232`. The bytes were still in the buffer -- only the header count
+  wrapped -- so this was not a crash or a corrupt file but something worse: an
+  acknowledged write whose length reply is neither the truth nor an error, and
+  every later read iterates the wrapped count. `HSET` returned the *correct*
+  count and then reported a different one from `HLEN`.
+
+  The batch is now bounded before the listpack path is entered
+  (`listpack_batch_fits`, `src/storage/db/mod.rs`): a call carrying more than
+  `LISTPACK_MAX_ENTRIES` new entries skips the listpack encoding entirely,
+  exactly as an oversized *element* already did. Such a container was going to
+  be upgraded on the very next line anyway, so this costs nothing and caps the
+  count at 128 existing + 128 new -- three orders of magnitude below the wrap.
+  It also closes a quadratic window that came with it: the membership scan
+  inside the push loop is linear, so an unbounded batch was O(n^2) inside a
+  single command on a single shard thread (7.1s for 70k members; 0.01s now).
+  As a backstop, `update_header` saturates instead of wrapping and carries a
+  `debug_assert!`, so a future caller that forgets the bound corrupts nothing
+  worse than its own count and says so in a debug build.
+
+  Five lib tests plus two `scripts/test-consistency.sh` rows, all verified to
+  fail against the pre-fix binary.
+
 - **`replication`: coordinator local legs now replicate, and stop inflating
   `master_repl_offset` (#815).** On a multi-shard master the in-process leg
   of a multi-key write (`MSET`/`MSETNX` co-located or scattered slices,

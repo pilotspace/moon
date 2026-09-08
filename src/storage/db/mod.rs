@@ -14,6 +14,30 @@ use super::entry::{CachedClock, Entry, RedisValue, current_secs, current_time_ms
 
 /// Maximum number of entries in a listpack before upgrading to full encoding.
 pub const LISTPACK_MAX_ENTRIES: usize = 128;
+
+/// Whether one command's worth of new entries may go through the listpack path.
+///
+/// The listpack header counts its elements in a `u16` and `push_back` advances
+/// that count with `wrapping_add`, so a batch large enough to cross 65_536
+/// wraps the count to a small number and the container silently forgets
+/// everything before the wrap (moon#865). The upgrade check in every command
+/// that writes a listpack runs AFTER the push loop, which is far too late to
+/// stop it.
+///
+/// A batch this large is going to be upgraded out of the listpack encoding on
+/// the very next line anyway, so refusing the listpack path up front costs
+/// nothing and caps the count at `LISTPACK_MAX_ENTRIES` already present plus
+/// `LISTPACK_MAX_ENTRIES` new -- three orders of magnitude below the wrap. It
+/// also closes the quadratic window: `SADD`'s membership check is a linear
+/// in-place scan, so an unbounded batch is O(n^2) inside a single command on a
+/// single shard thread.
+///
+/// `new_entries` is counted in LISTPACK entries, not logical items: a hash
+/// stores two entries per field, so `HSET` passes `pairs * 2`.
+#[inline]
+pub fn listpack_batch_fits(new_entries: usize) -> bool {
+    new_entries <= LISTPACK_MAX_ENTRIES
+}
 /// Maximum element size in bytes before upgrading a listpack to full encoding.
 pub const LISTPACK_MAX_ELEMENT_SIZE: usize = 64;
 /// Maximum number of entries in an intset before upgrading to full encoding.

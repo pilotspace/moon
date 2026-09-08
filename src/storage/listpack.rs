@@ -344,9 +344,25 @@ impl Listpack {
     fn update_header(&mut self) {
         let total = self.data.len() as u32;
         self.data[0..4].copy_from_slice(&total.to_le_bytes());
-        // Increment element count
+        // Increment element count.
+        //
+        // The count is a `u16`, and this used to wrap: a single command that
+        // pushed 65_536 entries left a header claiming a handful, the entries
+        // before the wrap became unreachable, and the server had already
+        // acknowledged the write (moon#865). No caller has any business coming
+        // near the ceiling -- a listpack upgrades to a full container at
+        // LISTPACK_MAX_ENTRIES (128) -- so saturating here is a backstop, not
+        // a policy. The command layer bounds the batch BEFORE the loop
+        // (`listpack_batch_fits`); this exists so a future caller that forgets
+        // corrupts nothing worse than its own count, and so the debug build
+        // says which caller it was.
         let count = u16::from_le_bytes([self.data[4], self.data[5]]);
-        let new_count = count.wrapping_add(1);
+        debug_assert!(
+            count < u16::MAX,
+            "listpack element count at u16::MAX -- caller pushed past the \
+             encoding's ceiling without bounding the batch (moon#865)"
+        );
+        let new_count = count.saturating_add(1);
         self.data[4..6].copy_from_slice(&new_count.to_le_bytes());
     }
 
@@ -354,7 +370,8 @@ impl Listpack {
         let total = self.data.len() as u32;
         self.data[0..4].copy_from_slice(&total.to_le_bytes());
         let count = u16::from_le_bytes([self.data[4], self.data[5]]);
-        let new_count = count.wrapping_sub(1);
+        debug_assert!(count > 0, "listpack element count decremented below zero");
+        let new_count = count.saturating_sub(1);
         self.data[4..6].copy_from_slice(&new_count.to_le_bytes());
     }
 }
