@@ -47,6 +47,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`text`: the `TMX3` TAG/NUMERIC sidecar block is now proven compatible
+  in both directions, and the format no longer depends on the build's
+  feature set (#880).** The block itself landed with #879; this finishes
+  it. `TagFieldDef` and `NumericFieldDef` lose their `text-index` gate (they
+  are plain data with no dependencies), so `text-indexes.meta` is written
+  and read identically on every build and the serializer carries no `#[cfg]`
+  — the dead-code hazard on the tokio leg that failed #879's first CI run
+  cannot recur. The reader is split into `deserialize_body` (behaviourally
+  the pre-block reader: reads `count` indexes and returns) and
+  `deserialize_ext_block`, so compatibility is unit-tested against the real
+  code path rather than argued: an old reader given a new file restores
+  every TEXT field and parks exactly on the block; a new reader given a v2
+  or v1 file without the block loads with empty TAG/NUMERIC; a torn block
+  fails closed at every cut point; foreign trailing bytes are ignored.
+  Measured over the wire as well, with the pre-#879 binary as the old side:
+  `FT.SEARCH ix hello` finds `doc:1` after a cross-version restart in both
+  directions, and only the direction where the file never carried the
+  fields answers `unknown_field` for `@cat:{a}`. New fuzz target
+  `text_index_meta` covers the decoder (both `fuzz.yml` matrices), and
+  `tests/ft_text_meta_tag_numeric_restart.rs` is the SIGKILL restart
+  round-trip that fails on a pre-#879 binary.
+
 - **`storage`: one large `RPUSH`/`LPUSH`/`HSET` silently dropped 65,536
   elements, and the server acknowledged the write (#865).** The listpack
   header counts its elements in a `u16` and `update_header` advanced that

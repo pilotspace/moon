@@ -2372,8 +2372,12 @@ impl TextStore {
                 db_index: idx.db_index,
                 #[cfg(feature = "text-index")]
                 tag_fields: idx.tag_fields.clone(),
+                #[cfg(not(feature = "text-index"))]
+                tag_fields: Vec::new(),
                 #[cfg(feature = "text-index")]
                 numeric_fields: idx.numeric_fields.clone(),
+                #[cfg(not(feature = "text-index"))]
+                numeric_fields: Vec::new(),
             })
             .collect()
     }
