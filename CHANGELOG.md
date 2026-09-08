@@ -95,14 +95,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      the one that balances headroom (+3.70% above the observed maximum,
      +4.04% below the observed minimum); the full per-candidate table is in
      the fixture README.
-  3. `check_workload_ran` asserts absolute, baseline-independent floors on
+  3. **`allocator_overhead`'s shrink floor is derived from RSS's, not
+     hand-picked.** It is `rss - tracked_sum`, so it carries all of RSS's
+     absolute jitter at ~23% of RSS's magnitude -- a percentage band on it
+     is ~4.3x tighter than the same percentage on RSS. A real run measuring
+     `rss -7.26%` (green as a whole process) failed on
+     `allocator_overhead -30.83%` (run 34193633946).
+     `ao_shrink_threshold()` now expresses RSS's shrink allowance in this
+     kind's units, so the residual is never gated tighter, in bytes, than
+     the number it is derived from, and never looser than its own floor.
+     Growth stays at +25% and RSS's +5% is the tighter absolute check on
+     untracked memory anyway, so no leak detection is given up.
+  4. `compare_snapshot` fails closed: a delta or verdict that does not
+     compute (malformed snapshot, `jq` null, python traceback) is reported
+     `FAIL (UNEVALUATED)` instead of falling through to the OK branch, and
+     the script no longer parses the caller's positional arguments when it
+     is sourced.
+  5. `check_workload_ran` asserts absolute, baseline-independent floors on
      `dashtable`/`hnsw`/`csr` before anything is compared **or written as a
      baseline**. Every other check is relative, so all of them shared one
      blind spot: an empty capture *and* an empty measurement compare at 0%
      and stay green forever.
-  4. `tests/memory_gate_compare_selftest.sh` sources the gate (which now has
+  6. `tests/memory_gate_compare_selftest.sh` sources the gate (which now has
      a lib-only `BASH_SOURCE` guard) and drives the comparison against
-     synthetic snapshots -- 16 checks, no server, no build, ~1s, run in CI
+     synthetic snapshots -- 21 checks, no server, no build, ~1s, run in CI
      before the build. Verified it can fail, by mutating the gate: accepting
      shrinks silently -> 2 failures; `compare_snapshot` hard-wired to return
      0 (the original #764 bug) -> 5 failures; workload floors zeroed

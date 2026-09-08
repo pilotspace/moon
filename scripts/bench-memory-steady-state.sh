@@ -59,6 +59,10 @@ NUM_GRAPH_NODES=100
 # Steady-state wait (seconds)
 STEADY_STATE_WAIT=60
 
+# Only when executed. A `source` inherits the caller's positional parameters,
+# and without this guard sourcing the file from a shell that has any args
+# makes it die on "Unknown option" before defining a single function.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --baseline)        BASELINE_PATH="$2"; shift 2 ;;
@@ -75,6 +79,7 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+fi
 
 log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 
@@ -648,6 +653,41 @@ check_baseline_provenance() {
 # two the failure text names.
 RSS_SHRINK_FLOOR=10
 
+# allocator_overhead's shrink floor is DERIVED, not a second magic number
+# ---------------------------------------------------------------------------
+# `allocator_overhead` is `rss - tracked_sum` (src/command/server_admin.rs).
+# The tracked kinds are stable to 0.11% run-to-run, so this residual absorbs
+# essentially ALL of RSS's absolute jitter -- while being only ~23% of RSS's
+# magnitude. A percentage band on it is therefore ~4.3x tighter than the same
+# percentage on RSS, in the only unit that matters (bytes). Measured: an
+# `rss delta=-7.26%` run -- comfortably inside the shrink floor -- carried
+# `allocator_overhead delta=-30.83%` and turned a green whole-process
+# measurement red, on a residual that no code owns.
+#
+# So the shrink side of this kind is pinned to RSS's own allowance: whatever
+# absolute byte movement RSS is permitted to shrink by, allocator_overhead is
+# permitted the same, expressed as a percentage of its (much smaller)
+# baseline. It is never gated TIGHTER than the number it is derived from,
+# and never looser than its own measured floor (kind_threshold).
+#
+# This costs no detection power. Untracked memory can only leak by growing,
+# growth is unaffected here, and RSS at +5% (~6.4 MB) is a tighter absolute
+# growth check than allocator_overhead at +25% (~7.4 MB) anyway -- RSS sees
+# such a leak first.
+ao_shrink_threshold() {
+    local baseline_rss="$1" baseline_ao="$2" floor="$3"
+    python3 -c "
+b_rss = $baseline_rss
+b_ao  = $baseline_ao
+floor = $floor
+if b_ao <= 0:
+    print(floor)
+else:
+    derived = (b_rss * $RSS_SHRINK_FLOOR / 100.0) / b_ao * 100.0
+    print(round(max(floor, derived), 2))
+"
+}
+
 kind_threshold() {
     local kind="$1"
     local base="$2"
@@ -726,6 +766,16 @@ print(round((m - b) / b * 100, 2))
 d = $rss_delta_pct
 print('grow' if d > $threshold else ('shrink' if d < -$RSS_SHRINK_FLOOR else 'ok'))
 ")
+        # Fail closed. If the delta or the verdict came back empty (a
+        # malformed snapshot, a jq null, a python traceback), the honest
+        # answer is "this gate did not evaluate", not "ok" -- silently
+        # falling through to the OK branch is how a check stops checking.
+        if [[ -z "$rss_delta_pct" || -z "$rss_verdict" ]]; then
+            failure_msgs="${failure_msgs}  FAIL (UNEVALUATED): rss (measured=$measured_rss, baseline=$baseline_rss) -- delta/verdict did not compute\n"
+            growth_failures=$((growth_failures + 1))
+            rss_verdict="unevaluated"
+        fi
+
         case "$rss_verdict" in
             grow)
                 failure_msgs="${failure_msgs}  FAIL (GREW):   rss delta=${rss_delta_pct}% (measured=$measured_rss, baseline=$baseline_rss, growth threshold=+${threshold}%)\n"
@@ -743,10 +793,14 @@ print('grow' if d > $threshold else ('shrink' if d < -$RSS_SHRINK_FLOOR else 'ok
 
     # Compare each kind (use prom value for comparison)
     for kind in dashtable hnsw csr wal sealed replication_backlog allocator_overhead; do
-        local measured_val baseline_val kind_thr
+        local measured_val baseline_val kind_thr shrink_thr
         measured_val=$(echo "$snapshot" | jq -r ".kinds.${kind}.prom")
         baseline_val=$(echo "$baseline" | jq -r ".kinds.${kind}.prom")
         kind_thr=$(kind_threshold "$kind" "$threshold")
+        shrink_thr="$kind_thr"
+        if [[ "$kind" == "allocator_overhead" ]]; then
+            shrink_thr=$(ao_shrink_threshold "$baseline_rss" "$baseline_val" "$kind_thr")
+        fi
 
         # Handle baseline=0: if measured > 1024 bytes, flag as regression
         if [[ "$baseline_val" == "0" ]]; then
@@ -767,21 +821,30 @@ print(round((m - b) / b * 100, 2))
 ")
         verdict=$(python3 -c "
 d = $delta_pct
-t = $kind_thr
-print('grow' if d > t else ('shrink' if d < -t else 'ok'))
+print('grow' if d > $kind_thr else ('shrink' if d < -$shrink_thr else 'ok'))
 ")
+
+        if [[ -z "$delta_pct" || -z "$verdict" ]]; then
+            failure_msgs="${failure_msgs}  FAIL (UNEVALUATED): ${kind} (measured=$measured_val, baseline=$baseline_val) -- delta/verdict did not compute\n"
+            growth_failures=$((growth_failures + 1))
+            verdict="unevaluated"
+        fi
 
         case "$verdict" in
             grow)
-                failure_msgs="${failure_msgs}  FAIL (GREW):   ${kind} delta=${delta_pct}% (measured=$measured_val, baseline=$baseline_val, threshold=+/-${kind_thr}%)\n"
+                failure_msgs="${failure_msgs}  FAIL (GREW):   ${kind} delta=${delta_pct}% (measured=$measured_val, baseline=$baseline_val, growth threshold=+${kind_thr}%)\n"
                 growth_failures=$((growth_failures + 1))
                 ;;
             shrink)
-                failure_msgs="${failure_msgs}  FAIL (SHRANK): ${kind} delta=${delta_pct}% (measured=$measured_val, baseline=$baseline_val, threshold=+/-${kind_thr}%)\n"
+                failure_msgs="${failure_msgs}  FAIL (SHRANK): ${kind} delta=${delta_pct}% (measured=$measured_val, baseline=$baseline_val, shrink floor=-${shrink_thr}%)\n"
                 shrink_failures=$((shrink_failures + 1))
                 ;;
             *)
-                log "  OK: ${kind} delta=${delta_pct}% (within +/-${kind_thr}%)"
+                if [[ "$shrink_thr" == "$kind_thr" ]]; then
+                    log "  OK: ${kind} delta=${delta_pct}% (within +/-${kind_thr}%)"
+                else
+                    log "  OK: ${kind} delta=${delta_pct}% (grow limit +${kind_thr}%, shrink limit -${shrink_thr}% derived from rss)"
+                fi
                 ;;
         esac
     done
