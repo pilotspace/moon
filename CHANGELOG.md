@@ -148,8 +148,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
-- **BENCHMARK.md re-measured end to end and cut from 2137 lines to 285.** Every
-  number in the report now comes from one run on 2026-09-08: moon `ae6cd003`
+- **BENCHMARK.md re-measured end to end and cut from 2137 lines to 285.** The
+  throughput and memory numbers now all come from one run on 2026-09-08 (the
+  AOF, vector, graph and full-text results are carried forward with their own
+  dates and are labelled as not re-measured): moon `ae6cd003`
   (v0.8.9) against Redis 7.0.15 on GCE `c3-standard-8` (x86_64) and
   `t2a-standard-8` (aarch64), `--shards 1`, n=5 interleaved reps with Redis
   restarted and re-measured every rep as a live drift control, and a per-row

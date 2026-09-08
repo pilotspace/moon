@@ -60,7 +60,7 @@ recorded in the source report, this table says so rather than filling it in.
     byte path that bypasses frame construction and the dispatch table. Those two
     win at depth — **1.62× / 1.32×** on x86 and **1.60× / 1.55×** on ARM at p=64.
     **Every other family measured (INCR, LPUSH, SADD, SPOP, HSET, ZADD) loses at
-    p≥8**, by 20–55%, on both architectures. The boundary is the fast path, not
+    p≥8**, by 13–55%, on both architectures. The boundary is the fast path, not
     the engine: measured on v0.8.7, `SET k v` ran 2.08× Redis while
     `SET k v EX 100` — same work, one disqualifying option — ran 0.87×
     (archive §2.12). **Any summary quoting the GET number alone describes a
@@ -85,11 +85,11 @@ Full table and method: [BENCHMARK.md §3](https://github.com/pilotspace/moon/blo
 | Value size | Moon x86 | Redis x86 | Moon / Redis | Moon ARM | Redis ARM | Moon / Redis |
 |:---:|---:|---:|:---:|---:|---:|:---:|
 | 8 B | 97.9 B | 125.1 B | **0.78×** | 97.5 B | 113.0 B | **0.86×** |
-| 16 B | 113.7 B | 136.4 B | **0.83×** | — | — | — |
-| 32 B | 130.6 B | 158.3 B | **0.83×** | — | — | — |
-| 48 B | 146.5 B | 175.0 B | **0.84×** | — | — | — |
+| 16 B | 113.7 B | 136.4 B | **0.83×** | 113.9 B | 128.7 B | **0.89×** |
+| 32 B | 130.6 B | 158.3 B | **0.83×** | 129.8 B | 145.6 B | **0.89×** |
+| 48 B | 146.5 B | 175.0 B | **0.84×** | 145.7 B | 161.9 B | **0.90×** |
 | 64 B | 163.9 B | 178.8 B | **0.92×** | 162.8 B | 177.0 B | **0.92×** |
-| 128 B | 229.2 B | 259.8 B | **0.88×** | — | — | — |
+| 128 B | 229.2 B | 259.8 B | **0.88×** | 228.9 B | 257.3 B | **0.89×** |
 | 256 B | 362.2 B | 421.7 B | **0.86×** | 361.1 B | 419.0 B | **0.86×** |
 | 1,024 B | 1,164.6 B | 1,393.3 B | **0.84×** | 1,161.9 B | 1,386.1 B | **0.84×** |
 | **idle RSS** | 13.01 MB | 13.19 MB | 0.99× (tie) | 11.43 MB | 11.93 MB | 0.96× |
@@ -106,7 +106,7 @@ values, one key shape; 4 KB was not part of this run.
     `--shards 1` (archive §3.2), and an empty-server RSS of **12.6–12.9 MB against
     Redis 7.5–7.7 MB — Moon 1.7× worse** (archive §3.1). 16/32/48/128 B were
     measured on 2026-09-08 specifically to test the first point: Moon is **0.83×
-    at 32 B, a 17% win**. On idle RSS the two servers tie. Neither older figure is
+    at 32 B on x86 and 0.89× on ARM — a 17% and 11% win**. On idle RSS the two servers tie. Neither older figure is
     being called wrong here — the newer measurement did not reproduce it, and the
     conditions differ: the 2026-09-04 oracle was **Redis 7.4.2**, this one is
     **Redis 7.0.15**. On idle RSS the disagreement is on the *Redis* side

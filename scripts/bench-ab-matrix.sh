@@ -90,7 +90,23 @@ stop_server() {
 }
 trap stop_server EXIT
 
+
+# A foreign process already holding $PORT answers PING while our server fails
+# to bind, and the harness then attributes a stranger's numbers to both
+# engines. This has happened in this repo: a stray redis-server PONGed on a
+# probe port after moon had aborted. So: refuse to start on an occupied port,
+# and treat a dead SERVER_PID during the wait as fatal rather than waiting for
+# someone else to answer.
+preflight_port() {
+  if [[ "$(timeout 2 redis-cli -p "$PORT" ping 2>/dev/null)" == "PONG" ]]; then
+    echo "FATAL: something already answers PING on port $PORT -- refusing to start." >&2
+    echo "       A foreign listener would be measured as if it were ours." >&2
+    exit 1
+  fi
+}
+
 start_server() { # start_server <moon|redis>
+  preflight_port
   SERVER_DIR="$(mktemp -d)"
   if [[ "$1" == "moon" ]]; then
     MOON_DISK_FREE_MIN_PCT=0 "$MOON_BIN" --port "$PORT" --shards "$SHARDS" \
@@ -102,6 +118,12 @@ start_server() { # start_server <moon|redis>
   fi
   SERVER_PID=$!
   for _ in $(seq 1 100); do
+    # Liveness first: if our process is gone, a PONG can only be a stranger.
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "FATAL: $1 exited during startup (port $PORT)" >&2
+      cat "$SERVER_DIR/log" >&2 || true
+      exit 1
+    fi
     if [[ "$(timeout 2 redis-cli -p "$PORT" ping 2>/dev/null)" == "PONG" ]]; then return 0; fi
     sleep 0.1
   done

@@ -4,8 +4,10 @@
 **Hosts:** GCE `c3-standard-8` (Xeon 8481C, x86_64) and `t2a-standard-8` (Neoverse-N1, aarch64), 8 vCPU, Ubuntu, kernel 6.17
 **Config:** `--shards 1 --appendonly no --disk-offload disable`, Redis `--save "" --appendonly no`, `-c 50`, keys spread over `-r 100000`
 
-Everything in this report was re-measured on the date above. The full historical
-record — eight months of prior runs, including the vector, graph and full-text
+The throughput (§2) and memory (§3) numbers were all measured on the date above.
+§4 lists what was **not** re-measured — AOF durability, vector, graph, full-text
+and multi-shard scaling are carried forward with their own dates. The full
+historical record — eight months of prior runs, including the vector, graph and full-text
 competitor benchmarks not repeated here — is archived in
 [`docs/internal/benchmark-history.md`](docs/internal/benchmark-history.md).
 

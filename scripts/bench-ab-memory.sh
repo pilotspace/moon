@@ -55,7 +55,23 @@ stop_server() {
 }
 trap stop_server EXIT
 
+
+# A foreign process already holding $PORT answers PING while our server fails
+# to bind, and the harness then attributes a stranger's numbers to both
+# engines. This has happened in this repo: a stray redis-server PONGed on a
+# probe port after moon had aborted. So: refuse to start on an occupied port,
+# and treat a dead SERVER_PID during the wait as fatal rather than waiting for
+# someone else to answer.
+preflight_port() {
+  if [[ "$(timeout 2 redis-cli -p "$PORT" ping 2>/dev/null)" == "PONG" ]]; then
+    echo "FATAL: something already answers PING on port $PORT -- refusing to start." >&2
+    echo "       A foreign listener would be measured as if it were ours." >&2
+    exit 1
+  fi
+}
+
 start_server() {
+  preflight_port
   SERVER_DIR="$(mktemp -d)"
   if [[ "$1" == "moon" ]]; then
     MOON_DISK_FREE_MIN_PCT=0 "$MOON_BIN" --port "$PORT" --shards "$SHARDS" \
@@ -67,6 +83,10 @@ start_server() {
   fi
   SERVER_PID=$!
   for _ in $(seq 1 100); do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "FATAL: $1 exited during startup (port $PORT)" >&2
+      cat "$SERVER_DIR/log" >&2 || true; exit 1
+    fi
     [[ "$(timeout 2 redis-cli -p "$PORT" ping 2>/dev/null)" == "PONG" ]] && return 0
     sleep 0.1
   done
@@ -78,11 +98,18 @@ start_server() {
 # self-report -- moon's own INFO memory has been wrong before.
 rss_kb() { awk '/VmRSS/ {print $2}' "/proc/$SERVER_PID/status"; }
 
-echo "engine,rep,value_size,idle_rss_kb,loaded_rss_kb,dbsize,per_key_bytes,floor_bytes"
+echo "engine,rep,order,value_size,idle_rss_kb,loaded_rss_kb,dbsize,per_key_bytes,floor_bytes"
 
+# Alternate the engine order per (rep, size), not per rep. Running every moon
+# leg and then every redis leg lets a host-state drift over the run land
+# entirely on one engine. Fresh-server-per-point makes RSS far less drift-prone
+# than throughput, but the ordering costs nothing and the alternative is
+# unfalsifiable, so it is recorded in the CSV as `order`.
 for rep in $(seq 1 "$REPS"); do
-  for engine in moon redis; do
-    for size in "${SIZES[@]}"; do
+  for size in "${SIZES[@]}"; do
+    if (( rep % 2 == 1 )); then order="moon-first"; engines=(moon redis)
+    else                        order="redis-first"; engines=(redis moon); fi
+    for engine in "${engines[@]}"; do
       start_server "$engine"
       sleep 1
       idle="$(rss_kb)"
@@ -102,7 +129,7 @@ for rep in $(seq 1 "$REPS"); do
         echo "FATAL: $engine d=$size per_key=$per_key < floor=$floor -- impossible, harness is wrong" >&2
         exit 1
       fi
-      echo "$engine,$rep,$size,$idle,$loaded,$dbsize,$per_key,$floor"
+      echo "$engine,$rep,$order,$size,$idle,$loaded,$dbsize,$per_key,$floor"
       stop_server
     done
   done

@@ -351,7 +351,7 @@ every major cloud, drop-in compatibility. Redis OSS is the upstream
 reference but ships under SSPL since 2024. Full traced review:
 [`docs/comparison-valkey.md`](docs/comparison-valkey.md).
 
-| Dimension                  | **Moon v0.6.0**                  | **Valkey 9.1.0**            | **Redis 8.6.1 (OSS)**     |
+| Dimension                  | **Moon v0.8.9**                  | **Valkey 9.1.0**            | **Redis 8.6.1 (OSS)**     |
 |----------------------------|----------------------------------|-----------------------------|----------------------------|
 | Language / license         | Rust 2024 / Apache-2.0           | C99 / BSD-3 (LF TSC)        | C99 / **SSPL** since 2024 |
 | Threading                  | Thread-per-core, shared-nothing  | Main thread + ≤9 I/O threads | Single-threaded core      |
