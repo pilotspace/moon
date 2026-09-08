@@ -13,8 +13,11 @@
 //! - trigger when `current >= min_size` AND
 //!   `(current - base) * 100 / max(base, 1) >= percentage`
 //! - `percentage == 0` disables automatic rewrites entirely.
-//! - `base` is the total AOF size right after boot recovery and after each
-//!   completed rewrite.
+//! - `base` is the size of the AOF's *compacted form*: at boot, the base
+//!   RDB(s) the committed manifest names (never the uncompacted incr — #868:
+//!   seeding from the directory total raised the bar by the incr on every
+//!   restart, permanently, so a restart-prone host never rewrote); after a
+//!   completed rewrite, the freshly compacted directory, whose incr is empty.
 //!
 //! Design-for-failure:
 //! - A failed dispatch (backpressure, unsupported layout, …) arms a 60 s
@@ -28,16 +31,19 @@
 //! the hardcoded zeros).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
+
+use crate::persistence::aof_manifest::{AofLayout, AofManifest};
 
 /// Whether AOF persistence is enabled at all (set once at boot when the
 /// writer pool is created). Backs `INFO persistence` `aof_enabled` (#432).
 pub static AOF_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Total on-disk AOF size (bytes) at boot / after the last completed
-/// rewrite. Backs `INFO persistence` `aof_base_size`.
+/// Compacted AOF size (bytes): the base RDB(s) at boot, the total on-disk
+/// size after the last completed rewrite. Backs `INFO persistence`
+/// `aof_base_size`.
 pub static AOF_BASE_SIZE: AtomicU64 = AtomicU64::new(0);
 
 /// Most recently sampled total on-disk AOF size (bytes). Backs
@@ -45,8 +51,10 @@ pub static AOF_BASE_SIZE: AtomicU64 = AtomicU64::new(0);
 /// by `refresh_current_size` (INFO reads between ticks / monitor disabled).
 pub static AOF_CURRENT_SIZE: AtomicU64 = AtomicU64::new(0);
 
-/// The `appendonlydir` root the sizes are measured from.
-static AOF_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// The `appendonlydir` root the sizes are measured from. Written once by
+/// [`init`] at boot; a lock rather than a `OnceLock` so unit tests can
+/// re-seed it per scratch directory (the monitor reads it once a second).
+static AOF_DIR: parking_lot::RwLock<Option<PathBuf>> = parking_lot::RwLock::new(None);
 
 /// Cooldown after a failed auto-rewrite dispatch. One minute mirrors the
 /// "don't hot-retry a deterministic failure" backoff floor used elsewhere.
@@ -59,17 +67,81 @@ const TICK: std::time::Duration = std::time::Duration::from_secs(1);
 /// TopLevel writer, which appends to one flat file instead of the
 /// `appendonlydir` manifest layout the monoio writers use. Both are measured;
 /// whichever exists contributes (they never coexist for one server).
-static AOF_LEGACY_FILE: OnceLock<PathBuf> = OnceLock::new();
+static AOF_LEGACY_FILE: parking_lot::RwLock<Option<PathBuf>> = parking_lot::RwLock::new(None);
 
 /// Record the AOF locations (`<dir>/appendonlydir` + the legacy
 /// `<dir>/<appendfilename>` flat file) and initialize the base / current
 /// sizes from what recovery just replayed. Call once at boot, after AOF
 /// recovery, when appendonly is enabled.
+///
+/// Base is seeded from the compacted form only ([`measure_base_size_at`]);
+/// current from the whole directory. The two differ by exactly the incr
+/// recovery just replayed, which is growth the monitor must still see.
 pub fn init(persistence_dir: &Path, appendfilename: &str) {
-    let _ = AOF_DIR.set(persistence_dir.join("appendonlydir"));
-    let _ = AOF_LEGACY_FILE.set(persistence_dir.join(appendfilename));
+    let legacy_file = persistence_dir.join(appendfilename);
+    *AOF_DIR.write() = Some(persistence_dir.join("appendonlydir"));
+    *AOF_LEGACY_FILE.write() = Some(legacy_file.clone());
     AOF_ENABLED.store(true, Ordering::Relaxed);
-    record_base_size();
+    let base = measure_base_size_at(persistence_dir, &legacy_file);
+    AOF_BASE_SIZE.store(base, Ordering::Relaxed);
+    AOF_CURRENT_SIZE.store(measure_total_size(), Ordering::Relaxed);
+}
+
+/// Size of the AOF's compacted form: the base RDB(s) the committed
+/// `moon.aof.manifest` names — one file in the TopLevel layout, one per
+/// shard in PerShard, always at the manifest's current `seq` — plus the
+/// legacy flat file `legacy_file` when present (the tokio TopLevel writer's
+/// single `appendonly.aof` has no separable base, so the whole file is its
+/// base, exactly as Redis treats a pre-multipart AOF). Incr logs, the
+/// manifest itself and any orphaned generation on disk are not base.
+///
+/// Every degraded case resolves toward a *smaller* base, never a larger one,
+/// so the scheduler can only become more willing to compact:
+/// - no manifest: nothing has been compacted, base is 0 (Redis `max(base,1)`
+///   then fires at the first crossing of `min_size`);
+/// - the manifest names a base file that is not on disk: that file
+///   contributes 0 and a warning is logged;
+/// - the manifest is unreadable: 0 and a warning. Recovery already treats a
+///   corrupt manifest as fatal before this runs, so this arm is defensive.
+///
+/// `AofManifest::load` also re-runs its best-effort orphan sweep; recovery
+/// ran the same sweep moments earlier, so at boot it is a no-op.
+pub fn measure_base_size_at(persistence_dir: &Path, legacy_file: &Path) -> u64 {
+    fn file_len(path: &Path) -> u64 {
+        match std::fs::metadata(path) {
+            Ok(md) => md.len(),
+            Err(e) => {
+                warn!(
+                    "aof-auto-rewrite: base file {} named by the manifest is unreadable ({e}); \
+                     counting it as 0 bytes of base",
+                    path.display()
+                );
+                0
+            }
+        }
+    }
+
+    let mut base = 0u64;
+    match AofManifest::load(persistence_dir) {
+        Ok(Some(m)) => match m.layout {
+            AofLayout::TopLevel => base += file_len(&m.base_path()),
+            AofLayout::PerShard => {
+                for shard in &m.shards {
+                    base += file_len(&m.shard_base_path(shard.shard_id));
+                }
+            }
+        },
+        Ok(None) => {}
+        Err(e) => warn!(
+            "aof-auto-rewrite: cannot read the AOF manifest under {} ({e}); \
+             seeding base size as 0",
+            persistence_dir.display()
+        ),
+    }
+    if let Ok(md) = std::fs::metadata(legacy_file) {
+        base += md.len();
+    }
+    base
 }
 
 /// Total on-disk AOF size: every file under the manifest root (base RDBs +
@@ -90,10 +162,10 @@ pub fn measure_total_size() -> u64 {
         }
     }
     let mut total = 0;
-    if let Some(dir) = AOF_DIR.get() {
+    if let Some(dir) = AOF_DIR.read().as_deref() {
         walk(dir, &mut total);
     }
-    if let Some(file) = AOF_LEGACY_FILE.get()
+    if let Some(file) = AOF_LEGACY_FILE.read().as_deref()
         && let Ok(md) = std::fs::metadata(file)
     {
         total += md.len();
@@ -271,5 +343,171 @@ mod tests {
     fn no_overflow_at_extremes() {
         assert!(should_trigger(u64::MAX, 1, 100, 0));
         assert!(!should_trigger(0, u64::MAX, 100, 0));
+    }
+
+    // ── #868: init() must seed the base from the compacted base file(s), not
+    // the whole directory, or every restart ratchets the trigger up by the
+    // uncompacted incr. These tests share the module statics, so they run
+    // serialized under INIT_LOCK.
+
+    use super::{AOF_BASE_SIZE, AOF_CURRENT_SIZE, init};
+    use crate::persistence::aof_manifest::AofManifest;
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
+
+    static INIT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    const APPENDFILENAME: &str = "appendonly.aof";
+
+    fn write_bytes(path: &Path, n: usize) {
+        std::fs::write(path, vec![b'x'; n]).expect("write fixture file");
+    }
+
+    fn base_size() -> u64 {
+        AOF_BASE_SIZE.load(Ordering::Relaxed)
+    }
+
+    fn current_size() -> u64 {
+        AOF_CURRENT_SIZE.load(Ordering::Relaxed)
+    }
+
+    /// The reported base must be the base file's size — not base + incr.
+    #[test]
+    fn init_seeds_base_from_manifest_base_file_not_directory_total() {
+        let _g = INIT_LOCK.lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let m = AofManifest::initialize(tmp.path()).expect("initialize manifest");
+        write_bytes(&m.base_path(), 100_000);
+        write_bytes(&m.incr_path(), 60_000);
+
+        init(tmp.path(), APPENDFILENAME);
+
+        assert_eq!(base_size(), 100_000, "base must be the base RDB alone");
+        assert!(
+            current_size() >= 160_000,
+            "current must still count base + incr (+ manifest), got {}",
+            current_size()
+        );
+    }
+
+    /// The user-visible bug: a restart with an unchanged dataset must not
+    /// move the trigger point (issue: 16,280,244 -> 23,600,244 across one
+    /// restart on the same directory).
+    #[test]
+    fn restart_does_not_ratchet_the_trigger_point() {
+        let _g = INIT_LOCK.lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let m = AofManifest::initialize(tmp.path()).expect("initialize manifest");
+        write_bytes(&m.base_path(), 100_000);
+        init(tmp.path(), APPENDFILENAME);
+        // Whatever the first boot seeds is the reference; the contamination
+        // itself is asserted by `init_seeds_base_from_manifest_base_file…`.
+        // This test is only about the bar moving between boots.
+        let base_after_rewrite = base_size();
+
+        // Incr grows to 45% of base: under the 100% trigger.
+        write_bytes(&m.incr_path(), 45_000);
+        let current = super::refresh_current_size();
+        assert!(!should_trigger(current, base_size(), 100, 0));
+
+        // "Restart": same directory, nothing compacted, nothing written.
+        init(tmp.path(), APPENDFILENAME);
+
+        assert_eq!(
+            base_size(),
+            base_after_rewrite,
+            "restart moved the base (and therefore the trigger point)"
+        );
+        assert!(
+            !should_trigger(current_size(), base_size(), 100, 0),
+            "still under the threshold after restart"
+        );
+        // And the very next growth past 2x base fires — the bar did not move.
+        write_bytes(&m.incr_path(), 100_000);
+        assert!(should_trigger(
+            super::refresh_current_size(),
+            base_size(),
+            100,
+            0
+        ));
+    }
+
+    /// Guard against "fixing" this by never firing: growth past the
+    /// threshold, measured against the seeded base, still triggers.
+    #[test]
+    fn rewrite_still_fires_when_growth_crosses_threshold() {
+        let _g = INIT_LOCK.lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let m = AofManifest::initialize(tmp.path()).expect("initialize manifest");
+        write_bytes(&m.base_path(), 100_000);
+        write_bytes(&m.incr_path(), 100_000);
+
+        init(tmp.path(), APPENDFILENAME);
+
+        assert!(should_trigger(current_size(), base_size(), 100, 0));
+        // The min-size floor is still honoured.
+        assert!(!should_trigger(current_size(), base_size(), 100, 1 << 30));
+    }
+
+    /// First boot: no manifest, no legacy file — nothing has been compacted,
+    /// so base is 0 (Redis `max(base, 1)` fires at min_size).
+    #[test]
+    fn no_manifest_yet_seeds_zero() {
+        let _g = INIT_LOCK.lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        init(tmp.path(), APPENDFILENAME);
+
+        assert_eq!(base_size(), 0);
+        assert_eq!(current_size(), 0);
+    }
+
+    /// Manifest names a base file that is not on disk: contributes 0 rather
+    /// than falling back to the directory total.
+    #[test]
+    fn manifest_naming_missing_base_file_seeds_zero_base() {
+        let _g = INIT_LOCK.lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let m = AofManifest::initialize(tmp.path()).expect("initialize manifest");
+        write_bytes(&m.incr_path(), 70_000);
+        std::fs::remove_file(m.base_path()).expect("remove base");
+
+        init(tmp.path(), APPENDFILENAME);
+
+        assert_eq!(base_size(), 0);
+        assert!(current_size() >= 70_000);
+    }
+
+    /// Legacy flat-file layout (tokio TopLevel writer): no manifest, one
+    /// `appendonly.aof`. There is no separable base, so the whole file is
+    /// the base — the same number recovery replayed.
+    #[test]
+    fn legacy_flat_file_is_its_own_base() {
+        let _g = INIT_LOCK.lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_bytes(&tmp.path().join(APPENDFILENAME), 5_000);
+
+        init(tmp.path(), APPENDFILENAME);
+
+        assert_eq!(base_size(), 5_000);
+        assert_eq!(current_size(), 5_000);
+    }
+
+    /// PerShard layout: "the base" is the sum of every shard's base RDB at
+    /// the manifest's committed seq. Incr files and the manifest are not
+    /// base; an older generation left on disk is an orphan, not base.
+    #[test]
+    fn per_shard_layout_sums_every_shards_base() {
+        let _g = INIT_LOCK.lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let m = AofManifest::initialize_multi(tmp.path(), 3).expect("initialize_multi");
+        for (shard, n) in [(0u16, 100_000usize), (1, 200_000), (2, 300_000)] {
+            write_bytes(&m.shard_base_path(shard), n);
+            write_bytes(&m.shard_incr_path(shard), 50_000);
+        }
+
+        init(tmp.path(), APPENDFILENAME);
+
+        assert_eq!(base_size(), 600_000);
+        assert!(current_size() >= 750_000);
     }
 }
