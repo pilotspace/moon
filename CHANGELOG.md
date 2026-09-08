@@ -146,6 +146,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FAIL (SHRANK): rss delta=-13.42%` on run 34190674369 -- the new
   classification, from a real run, not a mock.
 
+- **`ci`: `allocator_overhead`'s shrink floor is derived from RSS's, and the
+  memory gate fails closed on a delta that does not compute (moon#764
+  follow-up to #854).** Found by a real pre-merge dispatch, not by
+  reasoning: run 34193633946 measured `rss delta=-7.26%` -- comfortably
+  inside the shrink floor, a green whole-process measurement -- and went red
+  on `FAIL (SHRANK): allocator_overhead delta=-30.83%`. `allocator_overhead`
+  is `rss - tracked_sum` (`src/command/server_admin.rs`), and since the
+  tracked kinds are stable to 0.11% run-to-run it absorbs essentially all of
+  RSS's absolute jitter while being only ~23% of RSS's magnitude -- so a
+  percentage band on it is ~4.3x tighter than the same percentage on RSS, in
+  the only unit that matters. `ao_shrink_threshold()` now expresses RSS's own
+  shrink allowance in this kind's units
+  (`max(kind_threshold, (baseline_rss * RSS_SHRINK_FLOOR / 100) / baseline_ao * 100)`,
+  = -43.05% for the committed baseline): never gated tighter, in bytes, than
+  the number it is derived from, never looser than its own measured floor.
+  No detection power is given up -- untracked memory can only leak by
+  *growing*, growth is untouched at +25%, and RSS at +5% (~6.4 MB) is a
+  tighter absolute growth check than +25% of `allocator_overhead` (~7.4 MB),
+  so RSS sees such a leak first. Replayed against all eleven real
+  post-#854 snapshots: every one passes (worst margins 2.74 points on
+  `rss`, 12.2 on `allocator_overhead`), while the pre-`--memory-arenas-cap`
+  baseline replayed as a measurement is still caught at `rss +13.16%`.
+  Two fail-closed fixes alongside: a delta or verdict that does not compute
+  (malformed snapshot, `jq` null, python traceback) reported `delta=%` and
+  fell through to the OK branch -- it is now `FAIL (UNEVALUATED)`, because
+  "did not evaluate" must never render as "in tolerance" in a gate whose
+  original bug was exactly that; and `source`ing the script inherited the
+  caller's positional parameters and died on `Unknown option` before
+  defining a function, so the argument loop moves behind the same
+  `BASH_SOURCE` guard as `main()`. The offline self-test grows to 21 checks,
+  pinning the derivation itself and the unevaluable-snapshot case.
+
 ### Documentation
 
 - **BENCHMARK.md re-measured end to end and cut from 2137 lines to 285.** The

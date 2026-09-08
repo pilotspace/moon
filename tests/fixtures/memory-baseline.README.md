@@ -64,34 +64,40 @@ log carried a `cpu_model differs` warning (baseline EPYC 9V74, measured EPYC
 3. **The CPU model was a red herring, and a same-silicon control proves
    it.** A capture on an EPYC **9V74** -- the very model the old baseline
    came from -- measured **127,610,880** against that baseline's
-   **144,723,968**: `-11.82%` on identical silicon. Nine post-change hosted
-   samples of the identical source tree, across **four** CPU SKUs the
-   `ubuntu-latest` pool hands out (three AMD and, as of this writing, an
-   Intel):
+   **144,723,968**: `-11.82%` on identical silicon. Eleven post-change
+   hosted samples of the identical source tree, across **four** CPU SKUs the
+   `ubuntu-latest` pool hands out (three AMD and an Intel):
 
-   | run | CPU | RSS | dashtable | vs this baseline |
-   |---|---|---|---|---|
-   | 34192309710 | Xeon Platinum 8370C | 119,943,168 | 96,614,352 | -6.21% |
-   | 34191449626 | EPYC 7763    | 122,003,456 | 96,589,950 | -4.60% |
-   | 34191154173 | EPYC 7763    | 123,351,040 | 96,691,380 | -3.55% |
-   | 34157392545 | EPYC 7763    | 124,432,384 | 96,598,476 | -2.70% |
-   | 34191132296 | EPYC 6973P-C | 124,641,280 | 96,600,975 | -2.54% |
-   | 34190674369 | EPYC 9V74    | 125,308,928 | 96,612,735 | -2.02% |
-   | 34190858545 | EPYC 9V74    | 127,610,880 | 96,698,436 | -0.22% |
-   | 34169276001 | EPYC 7763    | 127,889,408 | 96,661,392 |  0.00% (this file) |
-   | 34190676729 | EPYC 7763    | 129,495,040 | 96,616,116 | +1.26% |
+   | RSS | vs this baseline | allocator_overhead (`rss - tracked`) |
+   |---|---|---|
+   | 118,607,872 | -7.26% | -30.83% |
+   | 119,943,168 | -6.21% | -26.04% |
+   | 122,003,456 | -4.60% | -18.75% |
+   | 123,351,040 | -3.55% | -15.06% |
+   | 124,432,384 | -2.70% | -11.10% |
+   | 124,641,280 | -2.54% | -10.30% |
+   | 125,308,928 | -2.02% | -8.16% |
+   | 127,610,880 | -0.22% | -0.44% |
+   | 127,733,xxx | -0.12% | -0.18% |
+   | **127,889,408** | **0.00%** (this file) | 0.00% |
+   | 129,495,040 | +1.26% | +5.90% |
 
-   The two extreme AMD samples are the **same SKU** (EPYC 7763: 122,003,456
-   and 129,495,040, 6.1% apart), so silicon does not explain the spread --
-   though the single Intel sample being the lowest is a reason the gate
-   *warns* on `cpu_model` rather than ignoring it. `dashtable` across all
-   nine spans **0.11%**, which is why its flatness is the diagnostic: the
-   workload and moon's tracked allocation are identical every run, so
-   anything moving in RSS is outside them.
+   The two most extreme AMD samples are the **same SKU** (EPYC 7763), so
+   silicon does not explain the spread -- though the Intel sample being near
+   the bottom is why the gate *warns* on `cpu_model` rather than ignoring
+   it. `dashtable` across all of them spans **0.11%**, which is why its
+   flatness is the diagnostic: the workload and moon's tracked allocation
+   are identical every run, so anything moving in RSS is outside them.
+
+   The third column is the same fact told twice. `allocator_overhead` is
+   `rss - tracked_sum`, so it absorbs all of RSS's absolute jitter at ~23%
+   of RSS's magnitude -- which multiplies the percentage by ~4.3x. That is
+   why its shrink floor is **derived from RSS's allowance** rather than
+   being a second hand-picked number: see `ao_shrink_threshold()`.
 
 ### Choosing which sample to commit
 
-Nine samples of one source tree span **7.96%** min-to-max. Which sample
+Eleven samples of one source tree span **9.18%** min-to-max. Which sample
 becomes the baseline therefore decides how much of the tolerance window is
 left over, and getting it wrong is not theoretical: the first re-capture
 (127,610,880) was measured against a **symmetric** +/-5% band, which left
@@ -99,8 +105,11 @@ left over, and getting it wrong is not theoretical: the first re-capture
 `-4.39%`. Green, one ordinary sample from a false SHRANK.
 
 Against the asymmetric window the gate now uses (grow `+5%`, shrink `-10%`
--- see `RSS_SHRINK_FLOOR` in the script for why), headroom by candidate over
-the same nine samples:
+-- see `RSS_SHRINK_FLOOR` in the script for why), this file leaves **+3.74%**
+above the observed maximum and **+2.74%** below the observed minimum.
+Headroom by candidate, measured over the first nine samples (before the
+fleet drifted lower, which is why the committed choice has since moved
+toward the top of the observed range rather than its middle):
 
 | candidate baseline | headroom above observed max (grow +5%) | headroom below observed min (shrink -10%) |
 |---|---|---|
@@ -346,7 +355,7 @@ Both fail. They need different fixes, so they print different headlines:
   memory measured, and printing PASS for that is moon#764's vacuous gate in a
   different costume.
 
-`rss` -- and only `rss` -- judges the two directions at different thresholds:
+`rss` judges the two directions at different thresholds:
 **grow at +5%, shrink at -10%** (`RSS_SHRINK_FLOOR`). It is the one figure
 here that is not an accounting number: ~78% tracked kinds plus a residual of
 arena metadata, dirty pages, stacks and text that no counter owns, and that
@@ -355,6 +364,17 @@ residual moves 7.96% run-to-run on hosted runners (see the table above) while
 side that can never be a regression**. The threshold that catches memory
 regressions is 5% and is not relaxed; a shrink still has to clear -10% to
 pass, and moon#764's own -11.82%..-14.02% step does not.
+
+`allocator_overhead` inherits the same treatment, but its shrink floor is
+**computed, not chosen**: `ao_shrink_threshold()` expresses RSS's own shrink
+allowance in allocator_overhead's (much smaller) units, so the residual is
+never gated tighter, in bytes, than the number it is derived from -- and
+never looser than its own `kind_threshold` floor. This is not a free pass:
+untracked memory can only leak by *growing*, growth here is untouched at
++25%, and RSS at +5% is a tighter absolute growth check anyway, so RSS sees
+such a leak first. Without it, a run measuring `rss -7.26%` -- comfortably
+green as a whole process -- failed on `allocator_overhead -30.83%`
+(run 34193633946).
 
 ### Two checks that do not depend on this file
 
