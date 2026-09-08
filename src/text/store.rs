@@ -49,6 +49,11 @@ const ROARING_BIT_APPROX_COST: usize = 3;
 #[cfg(feature = "text-index")]
 const NUMERIC_CARDINALITY_LIMIT: usize = 10_000_000;
 
+// Only reachable from the NUMERIC bitmap accounting, which is itself behind
+// `text-index`. The tokio CI leg builds without that feature, where this is
+// genuinely dead — scope the allow to exactly that configuration rather than
+// silencing it everywhere.
+#[cfg_attr(not(feature = "text-index"), allow(dead_code))]
 const EMPTY_BITMAP_BASE_COST: usize = 8;
 
 /// Modifier for a query term — controls expansion strategy (D-16).
@@ -212,7 +217,14 @@ pub struct TextIndex {
     mutation_seq: u64,
     persisted_seq: u64,
     /// Duty-cycle state for `TextStore::persist_dirty_postings`.
+    ///
+    /// Read only by the 1 s `text_postings_tick`, which is `text-index`-gated,
+    /// so on a build without that feature nothing ever consults these. They are
+    /// still written by the constructor, so the fields must exist; the allow is
+    /// scoped to the configuration where they are genuinely unread.
+    #[cfg_attr(not(feature = "text-index"), allow(dead_code))]
     last_encode_at: Option<std::time::Instant>,
+    #[cfg_attr(not(feature = "text-index"), allow(dead_code))]
     last_encode_cost: std::time::Duration,
 }
 
