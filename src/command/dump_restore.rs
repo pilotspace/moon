@@ -469,8 +469,8 @@ mod dispatch_wiring_tests {
         let mut entry = crate::storage::Entry::new_string(Bytes::new());
         entry.value =
             crate::storage::compact_value::CompactValue::from_redis_value(RedisValue::SortedSet {
-                members: members.clone(),
-                scores,
+                members: Box::new(members.clone()),
+                scores: Box::new(scores),
             });
 
         // Serialize exactly as the eviction path does, so the payload under

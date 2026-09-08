@@ -7,6 +7,7 @@ use crate::storage::db::{
     HashTtlCond, LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, hash_field_cost,
     hash_field_cost_len, listpack_batch_fits,
 };
+use crate::storage::entry::boxed_payload_block;
 
 use crate::command::helpers::{all_args_are_bytes, err_wrong_args, extract_bytes, ok};
 
@@ -93,7 +94,15 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
                     // via a single O(n) recompute. This fires once per key at
                     // the 128-entry boundary, not per mutation.
                     let map = db.upgrade_hash_listpack_to_hash(key);
-                    let new_cost: usize = map.iter().map(|(k, v)| hash_field_cost(k, v)).sum();
+                    // The `HashMap` the fields move into is itself a boxed
+                    // payload — a second allocation the listpack did not have.
+                    // Omit it and the running ledger drifts 48 B below a full
+                    // recompute on every key that crosses the threshold.
+                    let new_cost: usize = boxed_payload_block(map)
+                        + map
+                            .iter()
+                            .map(|(k, v)| hash_field_cost(k, v))
+                            .sum::<usize>();
                     db.credit_memory(after);
                     db.charge_memory(new_cost);
                 }
@@ -264,7 +273,15 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
                 if should_upgrade {
                     // One-time cost-model swing — see the matching comment in `hset`.
                     let map = db.upgrade_hash_listpack_to_hash(key);
-                    let new_cost: usize = map.iter().map(|(k, v)| hash_field_cost(k, v)).sum();
+                    // The `HashMap` the fields move into is itself a boxed
+                    // payload — a second allocation the listpack did not have.
+                    // Omit it and the running ledger drifts 48 B below a full
+                    // recompute on every key that crosses the threshold.
+                    let new_cost: usize = boxed_payload_block(map)
+                        + map
+                            .iter()
+                            .map(|(k, v)| hash_field_cost(k, v))
+                            .sum::<usize>();
                     db.credit_memory(after);
                     db.charge_memory(new_cost);
                 }

@@ -142,6 +142,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **1 rps**. Both reproduced against live `redis-benchmark` 8.x output before
   and after the fix; the parser now anchors on the position of the words
   `requests per second` and takes the last match.
+- **`storage`: `used_memory` bills the boxed payload block of every fat
+  `RedisValue` variant.** `CompactValue::estimate_memory` charged
+  `size_class(size_of::<RedisValue>())` for the outer `Box<RedisValue>` and
+  nothing for the payload blocks *inside* it. Two consequences, both measured:
+
+  - `RedisValue::Stream` has carried a `Box<StreamData>` since it was written,
+    and its **112-byte block was never billed** — a pre-existing under-count on
+    every stream key, independent of the boxing above.
+  - After boxing the fat variants the gap widens to all six: a `Set` key's
+    ledger would fall 80 B while its RSS did not move at all, and a
+    `SortedSetBPTree` key's would fall 128 B while its RSS rose 48 B. That is
+    `used_memory` moving *away* from RSS — the exact failure mode moon#788
+    exists to prevent, because a ledger that drifts makes `--maxmemory` unable
+    to bind.
+
+  `estimate_memory` now adds `boxed_payload_bytes()`, one `size_class` term per
+  boxed field, derived with `size_of_val` of the pointee so it follows the
+  declared field type rather than a copied constant.
+
+  Three encoding-upgrade sites in the command layer (`HSET`/`HSETNX` listpack
+  -> `Hash`, `SADD` intset -> `Set`) re-derived the post-upgrade cost by hand
+  and so missed the new block; `hash_and_list_mutations_keep_the_ledger_exact`
+  caught the 48 B drift between the running ledger and a full recompute. All
+  three now call the same `boxed_payload_block` the value itself uses.
+
+  `every_boxed_payload_block_is_billed` covers all six variants and fails on
+  each of them without the fix.
+
+- **`storage`: the `HashWithTtl` promotion/downgrade ledger balances.** The
+  `ttls` sidecar was allocated by `promote_to_hash_with_ttl` on the first
+  `HEXPIRE` with no `charge_memory`, while `remove_hot` credits
+  `entry_overhead` recomputed from the value as it stands at `DEL` time —
+  which does include it. `HSET h f v; HEXPIRE h 100 FIELDS 1 f; DEL h` in a
+  loop therefore walked `used_memory` **down by 120 B every iteration**
+  (248 B from a `HashListpack` key), unbounded and reachable from any
+  unprivileged connection. `credit_memory` saturates at 0, and once there
+  `--maxmemory` can never bind again; `recalculate_memory` is a load-time
+  healer only, so nothing repairs it at runtime. Same class as moon#788,
+  moon#810 and moon#814.
+
+  Boxing `ttls` (above) contributes 48 B of that; the other 72 B is the
+  sidecar *entry* itself, which `estimate_memory` has always billed and no
+  writer has ever charged. Both are fixed together, in both directions:
+  `promote_to_hash_with_ttl` now returns the signed delta it caused — O(1) and
+  exact from a plain `Hash` (only the empty sidecar box is new), a before/after
+  snapshot from a `HashListpack`, whose conversion changes the cost model
+  outright and used to lose 320 B. Every site that drops a sidecar entry
+  (`hash_persist_field`, `hash_clear_field_ttls`, `hash_delete_field`,
+  `hash_get_and_delete_field`, the past-expiry short-circuit, and the active
+  `reap_expired_fields_one_hash` sweep, which credited nothing at all) now
+  credits the entry, plus the sidecar box on the downgrade back to plain
+  `Hash`.
+
+  The active sweep needed the credit in *both* its outcomes. `remove_hot`
+  credits `entry_overhead` recomputed from the value as it stands, and by the
+  time the caller's `db.remove()` runs the maps are empty — so it credits the
+  shell and never the fields the sweep dropped. A first cut skipped the credit
+  on that path and stranded 384 B per two-field key;
+  `reap_key_deleted_does_not_double_credit` is what caught it.
+
+  `tests/hash_ttl_memory_accounting.rs` holds the guard. Its oracle is
+  `recalculate_memory()` — a full rescan by the same `entry_overhead` the
+  running ledger claims to track incrementally — which is strictly stronger
+  than checking deltas one at a time. All 9 tests fail on the parent commit;
+  the two end-to-end cycle tests carry ballast keys deliberately, because on
+  an empty database the ledger starts at 0, over-crediting saturates back to
+  0, and the repro passes against the very bug it exists to catch.
 
 - **`ci`: clippy now lints tests, benches and examples.** Every clippy
   invocation in `ci.yml` was lib-only, so `--all-targets` code was never
@@ -1567,6 +1634,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Removal moves to `swap_remove` (O(1), reorders) rather than `shift_remove`
   (O(n), order-preserving). Redis set iteration order is unspecified, and all
   5,136 lib tests pass, so nothing depended on it.
+- **`storage`: the block a container key allocates is priced by the variant it
+  holds, not by the widest variant in the enum.**
+  `CompactValue::from_redis_value` stores a collection as a `Box<RedisValue>`,
+  so the block charged to a container key was `size_of::<RedisValue>()` — the
+  width of the enum's *widest* variant — no matter which variant the key
+  actually holds. One variant set that width:
+
+  | variant | payload |
+  |---|---:|
+  | `HashListpack` / `ListListpack` / `SetListpack` | 24 |
+  | `String(Bytes)` / `List` / `SetIntset` | 32 |
+  | `Hash` | 48 |
+  | `Set` (`IndexSet`) | 72 |
+  | `SortedSet { members, scores }` | 72 |
+  | `HashWithTtl { fields, ttls, min }` | 104 |
+  | `SortedSetBPTree { tree, members }` | **128 <- sets the enum** |
+
+  A hash small enough to live in a listpack — the common case — was billed the
+  128 bytes that a large B+tree zset needs. The five fat payloads are now
+  boxed, taking the enum from **128 B to 40 B** and its jemalloc class from 128
+  to 48.
+
+  **What that is worth, per container key, is not one number.** Boxing a
+  payload does not delete it: it moves it into a *second* block. Summing the
+  blocks a key really holds:
+
+  | key holds | before | after | delta |
+  |---|---:|---:|---:|
+  | `HashListpack` / `ListListpack` / `SetListpack` / `SortedSetListpack` | 128 | 48 | **-80** |
+  | `SetIntset` | 128 | 48 | **-80** |
+  | `List` (`VecDeque`, stays inline) | 128 | 48 | **-80** |
+  | `Stream` (already boxed; its 112 B block was never billed) | 240 | 160 | **-80** |
+  | `Hash` | 128 | 48 + 48 = 96 | -32 |
+  | `Set` (`IndexSet`, 72 -> class 80) | 128 | 48 + 80 = 128 | 0 |
+  | `SortedSet` (legacy) | 128 | 48 + 48 + 32 = 128 | 0 |
+  | `HashWithTtl` | 128 | 48 + 48 + 48 = 144 | **+16** |
+  | `SortedSetBPTree` | 128 | 48 + 80 + 48 = 176 | **+48** |
+
+  So the win is real and 80 B on the compact encodings, plain lists and
+  streams — where the overwhelming majority of small keys live — and the two
+  regressions land on the two heaviest variants, where 16 B and 48 B sit
+  against a table that is already kilobytes. `String(Bytes)` is unaffected: a
+  string value is never stored behind a `Box<RedisValue>` at all.
+
+  `String(Bytes)`, the three listpack variants and `SetIntset` deliberately
+  stay **inline**: strings are the hot path and the one dimension moon already
+  wins on, and the compact encodings are where small collections live.
+  `HashWithTtl::min_expiry_ms` stays inline too, so the "has any field
+  expired?" fast path still reads a plain `u64` with no pointer chase.
+  `test_hot_variants_stay_inline` pins that at compile time by binding each
+  payload to its exact unboxed type, and a `const` assertion plus
+  `test_redis_value_fits_48_byte_size_class` pin the 48-byte ceiling.
+
+  The boxes are on the *fields*, not on newtype wrappers around each struct
+  variant, so every existing `match` arm binds the same names and `Box<T>`
+  derefs to `T` at each use; only construction sites changed. The cost is one
+  extra `malloc` when a collection is promoted out of its listpack encoding — a
+  cold, once-per-key event.
+
+  No on-disk or wire format changes: `RedisValue` is in-memory only.
 
 - **`storage`: an empty `DashTable` no longer reserves 16 segments to hold one.**
   `SegmentSlab::new` seeded its first slab at 16 segments, so `DashTable::new`

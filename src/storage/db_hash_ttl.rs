@@ -108,6 +108,19 @@ impl Database {
             NoOp,
         }
 
+        // moon#861: the reap frees real, billed bytes — the field entries, the
+        // sidecar entries, and on a downgrade the sidecar box. None of it was
+        // credited, so a hash whose fields expired one by one left `used_memory`
+        // permanently above the truth (`recalculate_memory` is a load-time
+        // healer only). Accumulated here, settled once the `rv` borrow ends.
+        //
+        // This holds on the `KeyDeleted` path too. `remove_hot` credits
+        // `entry_overhead` recomputed from the value AS IT STANDS, and by then
+        // the maps are empty — it credits the shell (key + both boxes + 128),
+        // never the fields this sweep just dropped. Skipping the credit here
+        // stranded 384 B per 2-field key, caught by
+        // `reap_key_deleted_does_not_double_credit`.
+        let mut credit: usize = 0;
         let action = match rv {
             RedisValue::HashWithTtl {
                 fields,
@@ -115,12 +128,17 @@ impl Database {
                 min_expiry_ms,
             } => {
                 for f in &to_remove {
-                    fields.remove(f.as_ref());
-                    ttls.remove(f.as_ref());
+                    if let Some(v) = fields.remove(f.as_ref()) {
+                        credit += crate::storage::db::hash_field_cost(f.as_ref(), &v);
+                    }
+                    if ttls.remove(f.as_ref()).is_some() {
+                        credit += crate::storage::db::hash_ttl_field_cost(f.as_ref());
+                    }
                 }
                 if fields.is_empty() {
                     PostReap::KeyDeleted
                 } else if ttls.is_empty() {
+                    credit += crate::storage::db::hash_ttl_sidecar_box_cost();
                     PostReap::NeedDowngrade(std::mem::take(fields))
                 } else {
                     // All reaped TTLs were <= now_ms, so the old min is gone.
@@ -133,15 +151,19 @@ impl Database {
             _ => PostReap::NoOp,
         };
 
-        match action {
+        let outcome = match action {
             PostReap::KeyDeleted => ReapOutcome::KeyDeleted,
             PostReap::NeedDowngrade(m) => {
                 // `rv` borrow from the previous match is gone; reassign safely.
-                *rv = RedisValue::Hash(m);
+                *rv = RedisValue::Hash(Box::new(m));
                 ReapOutcome::Downgraded
             }
             PostReap::FieldsRemoved => ReapOutcome::FieldsRemoved,
             PostReap::NoOp => ReapOutcome::NoOp,
+        };
+        if credit > 0 {
+            self.credit_memory(credit);
         }
+        outcome
     }
 }

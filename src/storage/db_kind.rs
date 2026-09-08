@@ -114,14 +114,14 @@ impl ValueKind for HashKind {
 
     fn classify_cold<'a>(val: RedisValue, now_ms: u64) -> Result<Self::Ref<'a>, WrongType> {
         match val {
-            RedisValue::Hash(map) => Ok(HashRef::Owned(map)),
+            RedisValue::Hash(map) => Ok(HashRef::Owned(*map)),
             RedisValue::HashWithTtl {
                 fields,
                 ttls,
                 min_expiry_ms,
             } => Ok(HashRef::OwnedWithTtl {
-                fields,
-                ttls,
+                fields: *fields,
+                ttls: *ttls,
                 now_ms,
                 min_expiry_ms,
             }),
@@ -144,7 +144,7 @@ impl OwnedKind for HashKind {
                 let before = v.estimate_memory();
                 if let RedisValue::HashListpack(lp) = v {
                     let map = lp.to_hash_map();
-                    *v = RedisValue::Hash(map);
+                    *v = RedisValue::Hash(Box::new(map));
                 }
                 return v.estimate_memory() as isize - before as isize;
             }
@@ -246,7 +246,7 @@ impl ValueKind for SetKind {
 
     fn classify_cold<'a>(val: RedisValue, _now_ms: u64) -> Result<Self::Ref<'a>, WrongType> {
         match val {
-            RedisValue::Set(set) => Ok(SetRef::Owned(set)),
+            RedisValue::Set(set) => Ok(SetRef::Owned(*set)),
             _ => Err(WrongType),
         }
     }
@@ -267,11 +267,11 @@ impl OwnedKind for SetKind {
                 match v {
                     RedisValue::SetListpack(lp) => {
                         let set = lp.to_set_value();
-                        *v = RedisValue::Set(set);
+                        *v = RedisValue::Set(Box::new(set));
                     }
                     RedisValue::SetIntset(is) => {
                         let set = is.to_set_value();
-                        *v = RedisValue::Set(set);
+                        *v = RedisValue::Set(Box::new(set));
                     }
                     _ => {}
                 }
@@ -316,9 +316,10 @@ impl ValueKind for SortedSetKind {
 
     fn classify_cold<'a>(val: RedisValue, _now_ms: u64) -> Result<Self::Ref<'a>, WrongType> {
         match val {
-            RedisValue::SortedSetBPTree { tree, members } => {
-                Ok(SortedSetRef::Owned { tree, members })
-            }
+            RedisValue::SortedSetBPTree { tree, members } => Ok(SortedSetRef::Owned {
+                tree: *tree,
+                members: *members,
+            }),
             _ => Err(WrongType),
         }
     }
@@ -350,11 +351,11 @@ impl OwnedKind for SortedSetKind {
             let mut tree = BPTree::new();
             let new_members = std::mem::take(members);
             let old_scores = std::mem::take(scores);
-            for ((score, member), ()) in old_scores {
+            for ((score, member), ()) in *old_scores {
                 tree.insert(score, member);
             }
             entry.value = CompactValue::from_redis_value(RedisValue::SortedSetBPTree {
-                tree,
+                tree: Box::new(tree),
                 members: new_members,
             });
         }

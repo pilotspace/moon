@@ -159,6 +159,20 @@ pub fn hash_ttl_field_cost(field: &[u8]) -> usize {
     size_class(field.len()) + HASH_TTL_SLOT
 }
 
+/// Bytes the `HashWithTtl.ttls` **box** occupies — the second heap block a
+/// promoted hash carries on top of the `fields` box (moon#790 boxed both fat
+/// variant payloads). MUST mirror the `ttls` term of the `HashWithTtl` arm of
+/// `RedisValue::boxed_payload_bytes`.
+///
+/// It is priced from the declared field type rather than from a live value so
+/// promotion and downgrade can charge/credit it in O(1), with no map to
+/// measure — swapping `HashMap` for another container re-prices both sides
+/// here at once (moon#861).
+#[inline]
+pub fn hash_ttl_sidecar_box_cost() -> usize {
+    size_class(std::mem::size_of::<HashMap<Bytes, u64>>())
+}
+
 /// Per-element byte cost for `RedisValue::List`. MUST mirror the `List` arm
 /// of `RedisValue::estimate_memory`.
 #[inline]
@@ -268,11 +282,25 @@ pub struct WrongType;
 /// `RedisValue::HashWithTtl` carrying an empty `ttls` sidecar. No-op when the
 /// value is already `HashWithTtl`. Panics for non-hash variants — callers must
 /// type-check first.
-fn promote_to_hash_with_ttl(rv: &mut RedisValue) {
+///
+/// Returns the signed `estimate_memory` delta the promotion caused, which the
+/// caller MUST hand to [`Database::apply_memory_delta`].
+///
+/// # Why it is not memory-neutral (moon#861)
+///
+/// Promotion allocates a second boxed payload (`ttls`), and from a listpack it
+/// also materialises a whole `HashMap`. `remove_hot` credits `entry_overhead`
+/// recomputed from the value as it stands at DEL time, so it credits those
+/// bytes whether or not anyone charged them. Leaving the promotion silent made
+/// `HSET h f v; HEXPIRE h ...; DEL h` walk `used_memory` DOWN every cycle,
+/// unbounded — and `credit_memory` saturates at 0, past which `--maxmemory`
+/// can never bind again. Same class as moon#788 / moon#810 / moon#814.
+#[must_use = "the promotion's memory delta must be applied to the ledger"]
+fn promote_to_hash_with_ttl(rv: &mut RedisValue) -> isize {
     match rv {
-        RedisValue::HashWithTtl { .. } => {}
+        RedisValue::HashWithTtl { .. } => 0,
         RedisValue::Hash(_) => {
-            let placeholder = RedisValue::Hash(HashMap::new());
+            let placeholder = RedisValue::Hash(Box::default());
             let owned = std::mem::replace(rv, placeholder);
             let RedisValue::Hash(fields) = owned else {
                 unreachable!("matched Hash above");
@@ -281,17 +309,27 @@ fn promote_to_hash_with_ttl(rv: &mut RedisValue) {
             // yet").  hash_set_field_ttl will update min on the first insert.
             *rv = RedisValue::HashWithTtl {
                 fields,
-                ttls: HashMap::new(),
+                ttls: Box::default(),
                 min_expiry_ms: u64::MAX,
             };
+            // O(1) and exact: `fields` moves across untouched and an empty
+            // `ttls` contributes no contents bytes, so the sidecar box IS the
+            // whole delta. No O(n) rescan on this hot-ish path.
+            hash_ttl_sidecar_box_cost() as isize
         }
         RedisValue::HashListpack(lp) => {
+            // The cost MODEL changes here (capacity-based listpack -> per-field
+            // HashMap sum + two boxes), so price it by before/after snapshot.
+            // O(n), but the `to_hash_map` conversion it pays for is already
+            // O(n) and fires at most once per key.
+            let before = lp.estimate_memory();
             let fields = lp.to_hash_map();
             *rv = RedisValue::HashWithTtl {
-                fields,
-                ttls: HashMap::new(),
+                fields: Box::new(fields),
+                ttls: Box::default(),
                 min_expiry_ms: u64::MAX,
             };
+            rv.estimate_memory() as isize - before as isize
         }
         _ => panic!("promote_to_hash_with_ttl called on non-hash variant"),
     }
@@ -1077,6 +1115,20 @@ impl Database {
             self.credit_memory(old_cost - new_cost);
         }
     }
+
+    /// Apply an already-signed byte delta. For call sites that accumulate a
+    /// running `isize` across several mutations in one command (an encoding
+    /// promotion that can move the ledger either way, plus the field/sidecar
+    /// costs around it) and settle the ledger once, after the `&mut` borrow
+    /// into the entry has ended. O(1), saturating, no allocation.
+    #[inline]
+    pub fn apply_memory_delta(&mut self, delta: isize) {
+        if delta >= 0 {
+            self.charge_memory(delta as usize);
+        } else {
+            self.credit_memory(delta.unsigned_abs());
+        }
+    }
 }
 
 impl Default for Database {
@@ -1723,8 +1775,8 @@ mod tests {
         let mut entry = Entry::new_string(Bytes::new());
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
             RedisValue::HashWithTtl {
-                fields,
-                ttls,
+                fields: Box::new(fields),
+                ttls: Box::new(ttls),
                 // Deliberately WRONG cached minimum: the index must not trust it.
                 min_expiry_ms: u64::MAX,
             },
@@ -1759,8 +1811,8 @@ mod tests {
         let mut entry = Entry::new_string(Bytes::new());
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
             RedisValue::HashWithTtl {
-                fields,
-                ttls,
+                fields: Box::new(fields),
+                ttls: Box::new(ttls),
                 min_expiry_ms: past,
             },
         );
@@ -2135,7 +2187,11 @@ mod tests {
         let mut fields = HashMap::new();
         fields.insert(Bytes::from_static(b"color"), Bytes::from_static(b"red"));
         fields.insert(Bytes::from_static(b"size"), Bytes::from_static(b"large"));
-        let mut db = db_with_spilled_value(tmp.path(), b"myhash", TestRedisValue::Hash(fields));
+        let mut db = db_with_spilled_value(
+            tmp.path(),
+            b"myhash",
+            TestRedisValue::Hash(Box::new(fields)),
+        );
 
         // Precondition: nothing hot yet, key only exists cold.
         assert!(!db.is_hot(b"myhash"), "precondition: key must be cold-only");
@@ -2164,7 +2220,8 @@ mod tests {
             Bytes::from_static(b"old_field"),
             Bytes::from_static(b"old_value"),
         );
-        let mut db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+        let mut db =
+            db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(Box::new(fields)));
 
         // HSET h new_field new_value
         {
@@ -2196,7 +2253,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut fields = HashMap::new();
         fields.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
-        let db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+        let db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(Box::new(fields)));
 
         let href = db
             .get_hash_ref_if_alive(b"h", 0)
@@ -2242,8 +2299,8 @@ mod tests {
         let mut entry = Entry::new_hash();
         entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
             RedisValue::HashWithTtl {
-                fields,
-                ttls,
+                fields: Box::new(fields),
+                ttls: Box::new(ttls),
                 min_expiry_ms: 1_000,
             },
         );
@@ -2298,7 +2355,8 @@ mod tests {
         let mut set = crate::storage::entry::SetValue::new();
         set.insert(Bytes::from_static(b"m1"));
         set.insert(Bytes::from_static(b"m2"));
-        let mut db = db_with_spilled_value(tmp.path(), b"myset", TestRedisValue::Set(set));
+        let mut db =
+            db_with_spilled_value(tmp.path(), b"myset", TestRedisValue::Set(Box::new(set)));
 
         let s = db.get_or_create_set(b"myset").unwrap();
         assert_eq!(
@@ -2314,7 +2372,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut set = crate::storage::entry::SetValue::new();
         set.insert(Bytes::from_static(b"m"));
-        let db = db_with_spilled_value(tmp.path(), b"s", TestRedisValue::Set(set));
+        let db = db_with_spilled_value(tmp.path(), b"s", TestRedisValue::Set(Box::new(set)));
 
         let sref = db
             .get_set_ref_if_alive(b"s", 0)
@@ -2334,7 +2392,10 @@ mod tests {
         let mut db = db_with_spilled_value(
             tmp.path(),
             b"myzset",
-            TestRedisValue::SortedSetBPTree { tree, members },
+            TestRedisValue::SortedSetBPTree {
+                tree: Box::new(tree),
+                members: Box::new(members),
+            },
         );
 
         let (members, _tree) = db.get_or_create_sorted_set(b"myzset").unwrap();
@@ -2356,7 +2417,10 @@ mod tests {
         let db = db_with_spilled_value(
             tmp.path(),
             b"z",
-            TestRedisValue::SortedSetBPTree { tree, members },
+            TestRedisValue::SortedSetBPTree {
+                tree: Box::new(tree),
+                members: Box::new(members),
+            },
         );
 
         let zref = db
@@ -2418,7 +2482,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut fields = HashMap::new();
         fields.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
-        let mut db = db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(fields));
+        let mut db =
+            db_with_spilled_value(tmp.path(), b"h", TestRedisValue::Hash(Box::new(fields)));
 
         assert!(db.exists(b"h"), "cold-only key must count as existing");
         // Cheap presence check must not have promoted the key into hot RAM.
