@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`replication`: coordinator local legs now replicate, and stop inflating
+  `master_repl_offset` (#815).** On a multi-shard master the in-process leg
+  of a multi-key write (`MSET`/`MSETNX` co-located or scattered slices,
+  `DEL`/`UNLINK`, `COPY`, `BITOP` at the connection's own shard) reached the
+  AOF via `persist_local_leg` but never the replication backlog or a live
+  replica, while `issue_append_lsn` still advanced the offset for it. With
+  `--appendonly yes` the offset counted bytes no replica could ACK, so
+  `WAIT` answered `:0` forever after the first local leg; with
+  `--appendonly no` the leg neither counted nor shipped and the replica
+  silently diverged. `persist_local_leg` now takes the same two-plane
+  contract as the handler's single-key write: record to the backlog +
+  advance the offset synchronously when a replica is attached (AOF LSN 0),
+  else advance through the AOF LSN. The multi-shard `SWAPDB` leg, which
+  issued an AOF LSN *and* emitted a replication record, no longer counts
+  its record twice. `record_local_write`/`record_local_write_db` and their
+  ctx-free twins now share one implementation
+  (`replication::state::record_local_write_db_on`).
+  Red/green: `tests/replication_local_leg_815.rs` (`#[ignore]`d, real
+  primary + replica, `--shards 1` and `--shards 4`, both AOF modes).
+
 - **`ci`: clippy now lints tests, benches and examples.** Every clippy
   invocation in `ci.yml` was lib-only, so `--all-targets` code was never
   linted anywhere: moon#835's two errors (`tests/busy_poll_idle.rs`,

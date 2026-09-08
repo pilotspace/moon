@@ -513,11 +513,12 @@ async fn run_local_persist(
         return resp;
     }
     // Skip the `Vec` + `serialize_command` allocation entirely when there is
-    // nothing to append to — `persist_local_leg` short-circuits on a `None`
-    // pool anyway, so building the command first would be pure waste on the
-    // `appendonly=no` path this early return exists to keep cheap. Same idiom
-    // as `wal_fanout_has_work`.
-    if aof_pool.is_none() {
+    // nothing to append to AND nobody to replicate to — `persist_local_leg`
+    // short-circuits on exactly that pair, so building the command first
+    // would be pure waste on the `appendonly=no` path this early return
+    // exists to keep cheap. Same idiom as `wal_fanout_has_work`. A live
+    // replica (moon#815) needs the record even without an AOF pool.
+    if aof_pool.is_none() && !crate::replication::state::fanout_active_for(repl_state) {
         return resp;
     }
     let mut parts: Vec<Frame> = Vec::with_capacity(args.len() + 1);
@@ -559,24 +560,60 @@ type ReplStateRef<'a> =
 ///
 /// Returns `Err(())` when the append never reached the writer so the caller
 /// surfaces `AOF_FSYNC_ERR` instead of a false `+OK` (design-for-failure).
+///
+/// # Replication (moon#815)
+///
+/// A local leg is a write like any other, so it takes the SAME two-plane
+/// contract the handler's `is_write` block uses for a single-key local write:
+/// when the replication plane is live (`fanout_active_for`), the record is
+/// appended to my_shard's backlog and advances the per-shard + master offset
+/// synchronously — BEFORE the first `.await`, so the inline PSYNC snapshot
+/// cut can never miss it — and its live delivery is queued on the shard's
+/// self-queue; the AOF leg then carries `lsn = 0` so the offset is not
+/// advanced twice. When no replica has ever attached, the AOF LSN advances
+/// the offset exactly as before.
+///
+/// Before this, the leg only ever took the AOF branch: `issue_append_lsn`
+/// advanced `master_repl_offset` for bytes that were never put on any wire,
+/// so the offset ran permanently ahead of what a replica could ACK and
+/// `WAIT` answered `:0` forever (`--appendonly yes`), while with no AOF pool
+/// the leg neither counted nor shipped and the replica silently diverged.
 async fn persist_local_leg(
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     repl_state: ReplStateRef<'_>,
     my_shard: usize,
     // task #35: the db this local leg executed in (`db_index` at every call
     // site) — threaded into the AOF pool so the writer can inject a
-    // `SELECT <db>` record on a db-context change.
+    // `SELECT <db>` record on a db-context change, and into the replication
+    // record so the replica applies it in the same db.
     db: usize,
     serialized: Bytes,
 ) -> Result<bool, ()> {
+    let repl_active = crate::replication::state::fanout_active_for(repl_state);
+    if !repl_active && aof_pool.is_none() {
+        return Ok(false);
+    }
+    let lsn = if repl_active {
+        if let Some(rs) = repl_state {
+            let g = rs.read();
+            crate::replication::state::record_local_write_db_on(
+                &g,
+                my_shard,
+                db,
+                serialized.clone(),
+            );
+        }
+        0
+    } else {
+        crate::persistence::aof::AofWriterPool::issue_append_lsn(
+            repl_state,
+            my_shard,
+            serialized.len(),
+        )
+    };
     let Some(pool) = aof_pool else {
         return Ok(false);
     };
-    let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(
-        repl_state,
-        my_shard,
-        serialized.len(),
-    );
     match pool.send_append_group(my_shard, lsn, db, serialized).await {
         Ok(needs_barrier) => Ok(needs_barrier),
         Err(_) => Err(()),
@@ -3612,7 +3649,7 @@ pub async fn coordinate_swapdb(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
-    repl_state: ReplStateRef<'_>,
+    _repl_state: ReplStateRef<'_>,
 ) -> Frame {
     // Serves num_shards >= 1: the tokio single-shard SWAPDB lives in
     // handler_single.rs, but the monoio handler routes ALL shard counts here
@@ -3650,14 +3687,19 @@ pub async fn coordinate_swapdb(
         // Same v3-5 group-commit contract `persist_local_leg` uses for
         // MSET/BITOP/COPY/DEL: enqueue fire-and-forget, then ONE barrier
         // under `Always` instead of a per-write awaited fsync.
+        //
+        // `lsn = 0` (moon#815): the replication record emitted below via
+        // `record_local_write_global` advances the per-shard + master offset
+        // for this SWAPDB whenever a `ReplicationState` exists at all, and
+        // that is the offset a replica can ACK. Issuing an AOF LSN here as
+        // well counted the record twice, so every SWAPDB under
+        // `--appendonly yes` pushed `master_repl_offset` permanently ahead of
+        // the wire. When no `ReplicationState` exists, `issue_append_lsn`
+        // returned 0 anyway; per-shard AOF order is preserved by write order,
+        // not by LSN value (see `wal_append_and_fanout`).
         if let Some(pool) = aof_pool {
-            let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(
-                repl_state,
-                my_shard,
-                serialized.len(),
-            );
             match pool
-                .send_append_group(my_shard, lsn, 0, serialized.clone())
+                .send_append_group(my_shard, 0, 0, serialized.clone())
                 .await
             {
                 Ok(needs_barrier) => {

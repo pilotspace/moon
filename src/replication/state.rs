@@ -493,49 +493,118 @@ pub fn record_local_write_global(shard_id: usize, bytes: Bytes) {
         return;
     };
     let g = repl_state_arc.read();
+    record_local_write_on(&g, shard_id, bytes);
+}
+
+/// Ctx-free twin of `handler_monoio::ft::replication_fanout_active`: true
+/// once the replication plane has anything to feed — a registered replica or
+/// an allocated backlog — so a write path that is NOT a connection handler
+/// (the coordinator's local legs, moon#815) can make the identical "record
+/// to the backlog, or advance the offset through the AOF LSN" decision the
+/// handler's `is_write` block makes.
+///
+/// Same lock discipline as the handler's gate: one short-lived `.read()`,
+/// released before the caller reaches any `.await`.
+pub fn fanout_active_for(repl_state: &Option<Arc<parking_lot::RwLock<ReplicationState>>>) -> bool {
+    if !fanout_hint_active() {
+        return false;
+    }
+    repl_state.as_ref().is_some_and(|rs| {
+        let g = rs.read();
+        !g.replicas.is_empty()
+            || g.per_shard_backlogs
+                .first()
+                .is_some_and(|slot| slot.lock().is_some())
+    })
+}
+
+/// Record one replication record for `shard_id` against an already-held
+/// `ReplicationState` guard: backlog append + per-shard/master offset
+/// advance happen HERE, synchronously, and only the live replica delivery is
+/// deferred through the shard's self-queue (`ReplicaLiveFanout`).
+///
+/// This is the ONE implementation behind `handler_monoio::ft::record_local_write`
+/// and [`record_local_write_global`]; see the former's doc comment for why the
+/// offset advance must be synchronous with the mutation (the inline PSYNC
+/// snapshot cut) and why `end_offset` is the PER-SHARD offset.
+///
+/// A backlog slot that is `None` skips the byte append but still advances the
+/// offset — the offset counter is the source of truth, and a later lazy
+/// allocation seeds the backlog at the current counter.
+///
+/// Caller MUST be on shard `shard_id`'s own OS thread (`shard::self_msg` is
+/// a `thread_local!` queue drained by that shard's event loop).
+#[inline]
+pub fn record_local_write_on(g: &ReplicationState, shard_id: usize, bytes: Bytes) {
     if let Some(slot) = g.per_shard_backlogs.get(shard_id) {
         if let Some(backlog) = slot.lock().as_mut() {
             backlog.append(&bytes);
         }
     }
     let end_offset = g.increment_shard_offset(shard_id, bytes.len() as u64);
-    drop(g);
     crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout {
         bytes,
         end_offset,
     });
 }
 
-/// Db-aware ctx-free twin of `record_local_write_db`, for the same
-/// ctx-free callers as [`record_local_write_global`]. Implements only the
-/// single-shard "prepend `SELECT` on db change" branch — ctx-free MQ
-/// replication is gated `num_shards == 1` by its caller (graph precedent:
-/// live streaming is single-shard-only), so the N-shard fused-SELECT branch
-/// (which needs `ctx.num_shards`) is never reached and intentionally not
-/// implemented here.
-pub fn record_local_write_db_global(shard_id: usize, db: usize, bytes: Bytes) {
-    let Some(repl_state_arc) = crate::admin::metrics_setup::get_global_repl_state_arc() else {
+/// Db-aware form of [`record_local_write_on`]: binds the record to the db it
+/// executed in, on either master topology.
+///
+/// * `num_shards > 1` (R2, task #20): N shard threads feed ONE merged replica
+///   wire, so a shared "current db" context cannot exist — every db-scoped
+///   record carries its own `SELECT <db>` prefix, fused into ONE record so no
+///   cross-shard interleave can split them. Gated on the fanout hint so a
+///   multi-shard master that never had a replica attach pays nothing.
+/// * `num_shards == 1`: emit-on-change tracking via `stream_db` — a `SELECT`
+///   record precedes the payload only when the stream's db context differs.
+///
+/// Both records go through [`record_local_write_on`], so the SELECT is
+/// counted in the offset and delivered in order ahead of its payload on the
+/// same self-queue.
+#[inline]
+pub fn record_local_write_db_on(g: &ReplicationState, shard_id: usize, db: usize, bytes: Bytes) {
+    if g.num_shards() > 1 {
+        if fanout_hint_active() {
+            let select = crate::persistence::aof::serialize_select_record(db);
+            let mut combined = Vec::with_capacity(select.len() + bytes.len());
+            combined.extend_from_slice(&select);
+            combined.extend_from_slice(&bytes);
+            record_local_write_on(g, shard_id, Bytes::from(combined));
+        } else {
+            record_local_write_on(g, shard_id, bytes);
+        }
         return;
-    };
-    let needs_select = repl_state_arc
-        .read()
-        .stream_db
-        .get(shard_id)
-        .is_some_and(|slot| {
-            if slot.load(Ordering::Relaxed) != db as i64 {
-                slot.store(db as i64, Ordering::Relaxed);
-                true
-            } else {
-                false
-            }
-        });
+    }
+    let needs_select = g.stream_db.get(shard_id).is_some_and(|slot| {
+        if slot.load(Ordering::Relaxed) != db as i64 {
+            slot.store(db as i64, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    });
     if needs_select {
-        record_local_write_global(
+        record_local_write_on(
+            g,
             shard_id,
             crate::persistence::aof::serialize_select_record(db),
         );
     }
-    record_local_write_global(shard_id, bytes);
+    record_local_write_on(g, shard_id, bytes);
+}
+
+/// Db-aware ctx-free twin of `record_local_write_db`, for the same
+/// ctx-free callers as [`record_local_write_global`]. Delegates to
+/// [`record_local_write_db_on`], so both master topologies are handled
+/// (the single-shard emit-on-change branch is the one MQ replication
+/// reaches — its caller gates on `num_shards == 1`).
+pub fn record_local_write_db_global(shard_id: usize, db: usize, bytes: Bytes) {
+    let Some(repl_state_arc) = crate::admin::metrics_setup::get_global_repl_state_arc() else {
+        return;
+    };
+    let g = repl_state_arc.read();
+    record_local_write_db_on(&g, shard_id, db, bytes);
 }
 
 /// Load replication IDs from {dir}/replication.state.
@@ -757,6 +826,13 @@ mod tests {
         assert_eq!(backlog.end_offset(), (MIN_REPL_BACKLOG_SIZE + 100) as u64);
     }
 
+    /// Serializes every test that reads-then-asserts or writes the
+    /// process-global `FANOUT_HINT`. `cargo test` runs tests on parallel
+    /// threads; without this, a `mark_fanout_active()` in one test can land
+    /// between another test's `before`/`after` loads (observed once: the
+    /// moon#815 tests made the delta assertion below fail spuriously).
+    static HINT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     /// Task #70 RED/GREEN: `ensure_backlogs_allocated` — the side effect of a
     /// bare REPLCONF (`try_handle_replconf`, dispatch.rs) — must NOT flip the
     /// sticky, process-global `FANOUT_HINT`. Only an actual PSYNC arrival
@@ -774,12 +850,15 @@ mod tests {
     ///
     /// `FANOUT_HINT` is a process-global `static` shared by every test in
     /// this binary; the delta form (`before == after`) is deliberately
-    /// robust to whatever the ambient value already is — no test in this
-    /// codebase's unit-test-reachable surface calls `mark_fanout_active`
-    /// outside a real `ConnectionContext`/`RegisterReplica` path, so `before`
-    /// is `false` in practice, but the assertion does not depend on that.
+    /// robust to whatever the ambient value already is. The tests that DO
+    /// call `mark_fanout_active` (the activation test and the moon#815
+    /// `record_local_write_db_on` / `fanout_active_for` tests) serialize
+    /// with this one through [`HINT_LOCK`], so a concurrent flip cannot
+    /// land between `before` and `after` and be blamed on
+    /// `ensure_backlogs_allocated`.
     #[test]
     fn test_ensure_backlogs_allocated_does_not_activate_fanout_hint() {
+        let _serial = HINT_LOCK.lock();
         let before = fanout_hint_active();
         let state = ReplicationState::new(2, generate_repl_id(), ZEROED_ID.to_string());
         state.ensure_backlogs_allocated();
@@ -804,11 +883,79 @@ mod tests {
     /// the hint — monotonic, so this holds regardless of the ambient value.
     #[test]
     fn test_mark_fanout_active_sets_hint() {
+        let _serial = HINT_LOCK.lock();
         mark_fanout_active();
         assert!(
             fanout_hint_active(),
             "mark_fanout_active (actual PSYNC/replica registration) must set the hint"
         );
+    }
+
+    /// moon#815: the ctx-free gate the coordinator's local legs use must
+    /// agree with the handler's `replication_fanout_active` — false with no
+    /// state or nothing to feed, true once a backlog exists.
+    #[test]
+    fn test_fanout_active_for_tracks_backlog_allocation() {
+        let _serial = HINT_LOCK.lock();
+        mark_fanout_active();
+        assert!(!fanout_active_for(&None), "no ReplicationState => inactive");
+        let state = Arc::new(parking_lot::RwLock::new(ReplicationState::new(
+            4,
+            generate_repl_id(),
+            ZEROED_ID.to_string(),
+        )));
+        let handle = Some(state.clone());
+        assert!(
+            !fanout_active_for(&handle),
+            "no replica and no backlog => nothing to feed"
+        );
+        state.read().ensure_backlogs_allocated();
+        assert!(
+            fanout_active_for(&handle),
+            "an allocated backlog (REPLCONF/PSYNC in flight) => active"
+        );
+    }
+
+    /// moon#815: a multi-shard record is fused with its `SELECT <db>` prefix
+    /// and the offset advances by the FUSED length — offset accounting must
+    /// equal the bytes the replica receives or WAIT/ACK math diverges.
+    #[test]
+    fn test_record_local_write_db_on_multishard_counts_fused_select() {
+        let _serial = HINT_LOCK.lock();
+        mark_fanout_active();
+        let state = ReplicationState::new(4, generate_repl_id(), ZEROED_ID.to_string());
+        state.ensure_backlogs_allocated();
+        let payload = Bytes::from_static(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        let select = crate::persistence::aof::serialize_select_record(3);
+        record_local_write_db_on(&state, 2, 3, payload.clone());
+        let expect = (select.len() + payload.len()) as u64;
+        assert_eq!(state.offset_handle().shard_offset(2), expect);
+        assert_eq!(state.total_offset(), expect);
+        let guard = state.per_shard_backlogs[2].lock();
+        let backlog = guard.as_ref().expect("allocated");
+        assert_eq!(backlog.end_offset(), expect);
+        let tail = backlog.bytes_from(0).expect("record present");
+        let mut want = Vec::new();
+        want.extend_from_slice(&select);
+        want.extend_from_slice(&payload);
+        assert_eq!(&tail[..], &want[..], "fused SELECT + payload as one record");
+    }
+
+    /// moon#815: on a single-shard master the `SELECT` is emitted only when
+    /// the stream's db context changes, and both records count.
+    #[test]
+    fn test_record_local_write_db_on_single_shard_emits_select_on_change() {
+        let state = ReplicationState::new(1, generate_repl_id(), ZEROED_ID.to_string());
+        state.ensure_backlogs_allocated();
+        let payload = Bytes::from_static(b"*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n");
+        let select = crate::persistence::aof::serialize_select_record(0);
+        // stream_db starts unknown (-1): first db-0 record is preceded by SELECT 0.
+        record_local_write_db_on(&state, 0, 0, payload.clone());
+        let after_first = (select.len() + payload.len()) as u64;
+        assert_eq!(state.total_offset(), after_first);
+        // Same db again: payload only.
+        record_local_write_db_on(&state, 0, 0, payload.clone());
+        assert_eq!(state.total_offset(), after_first + payload.len() as u64);
     }
 
     /// Task #70 correctness follow-up (orchestrator-caught regression):
