@@ -59,40 +59,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      `workflow_dispatch` input regenerates the baseline on the actual
      runner instead of an out-of-band machine.
 
-- **`ci`: a memory *drop* is now a failure with its own name, and the gate
-  can no longer measure an empty server (moon#764).** The first comparison
-  that gate ever performed came back `rss -14.02%` /
-  `allocator_overhead -43.34%` with `dashtable` flat at `-0.06%` and **zero
-  files changed under `src/`** -- so nothing had got leaner and the CPU-model
-  warning in the log was a red herring (the passing baseline-capture run and
-  the failing comparison ran on the same EPYC 7763). The cause was the
-  harness measuring itself: `--memory-arenas-cap 2` (jemalloc 8 arenas -> 2)
-  was added to `start_server()` one commit *after* the baseline was
-  captured, so the gate was comparing two different measurement
-  configurations. The baseline is regenerated on a hosted `ubuntu-latest`
-  runner with the current harness. Three changes so the next one explains
-  itself instead of needing an investigation:
+- **`ci`: a memory *drop* is now a failure with its own name, `rss` judges
+  the two directions at different thresholds, and the gate can no longer
+  measure an empty server (moon#764).** The first comparison that gate ever
+  performed came back `rss -14.02%` / `allocator_overhead -43.34%` with
+  `dashtable` flat at `-0.06%` and **zero files changed under `src/`** -- so
+  nothing had got leaner, and the `cpu_model differs` warning in the log was
+  a red herring (a later capture on the baseline's *own* EPYC 9V74 measured
+  `-11.82%` against it). The cause was the harness measuring itself:
+  `--memory-arenas-cap 2` (jemalloc 8 arenas -> 2) was added to
+  `start_server()` one commit *after* the baseline was captured, so the gate
+  was comparing two different measurement configurations.
+  `allocator_overhead` was never a second opinion corroborating it -- it is
+  `rss - tracked_sum` (`src/command/server_admin.rs`), a residual that moves
+  with RSS by construction. Two FAIL lines, one measurement. Fixes:
   1. `compare_snapshot` classifies every out-of-band delta as `GREW` or
-     `SHRANK`. Both still fail -- the band is **not** widened, and a shrink
-     is never silently accepted -- but a shrink-only failure now prints
+     `SHRANK`. Both still fail -- a shrink is never silently accepted -- but
+     a shrink-only failure prints
      `=== BASELINE NO LONGER DESCRIBES THIS BUILD ===` and names the two
      causes worth checking (a stale baseline, including one invalidated by a
      harness/server-flag change; or a workload that never ran, which is
      moon#764's vacuous gate wearing a different hat).
-  2. `check_workload_ran` asserts absolute, baseline-independent floors on
+  2. **`rss` grows at +5% and shrinks at -10%; the growth threshold is not
+     relaxed.** Nine hosted-runner samples of an identical source tree, over
+     four CPU SKUs the `ubuntu-latest` pool hands out, span **7.96%**
+     (119,943,168 .. 129,495,040) while `dashtable` over the same nine spans
+     **0.11%**. A symmetric ±5% band is 10 points wide and cannot hold an 8%
+     spread: the first re-baseline left 0.63% of margin under the observed
+     minimum and the next run measured -4.39%. Rather than widen the band --
+     every point added to it is a real regression the gate stops catching --
+     the noise slack goes **only to the direction that can never be a
+     regression**. A shrink still has to clear -10%, which moon#764's own
+     -11.82%..-14.02% step does not. The baseline is re-captured on a hosted
+     runner with the current harness and chosen, from those nine samples, as
+     the one that balances headroom (+3.70% above the observed maximum,
+     +4.04% below the observed minimum); the full per-candidate table is in
+     the fixture README.
+  3. `check_workload_ran` asserts absolute, baseline-independent floors on
      `dashtable`/`hnsw`/`csr` before anything is compared **or written as a
      baseline**. Every other check is relative, so all of them shared one
      blind spot: an empty capture *and* an empty measurement compare at 0%
      and stay green forever.
-  3. `tests/memory_gate_compare_selftest.sh` sources the gate (which now has
+  4. `tests/memory_gate_compare_selftest.sh` sources the gate (which now has
      a lib-only `BASH_SOURCE` guard) and drives the comparison against
-     synthetic snapshots -- 13 checks, no server, no build, ~1s, run in CI
-     before the build. Verified it can fail: accepting shrinks silently
-     -> 2 failures; `compare_snapshot` hard-wired to return 0 (the original
-     #764 bug) -> 5 failures; workload floors zeroed -> 1 failure.
-  `allocator_overhead` is documented as what it is -- `rss - tracked_sum`
-  (`src/command/server_admin.rs`) -- so it is never again mistaken for an
-  independent second signal corroborating an RSS move.
+     synthetic snapshots -- 16 checks, no server, no build, ~1s, run in CI
+     before the build. Verified it can fail, by mutating the gate: accepting
+     shrinks silently -> 2 failures; `compare_snapshot` hard-wired to return
+     0 (the original #764 bug) -> 5 failures; workload floors zeroed
+     -> 1 failure; growth relaxed to the shrink floor -> 1 failure; shrink
+     floor widened past the -14% step -> 2 failures.
+  End-to-end on the real runner, against the real committed-baseline path: a
+  baseline with `dashtable` cut 15% made the job exit 1 with
+  `FAIL (GREW):   dashtable delta=17.64%` (run 34191154173); the same commit
+  with the injection removed passed with every kind in band (run
+  34191132296). The stale baseline this entry is about produced
+  `=== BASELINE NO LONGER DESCRIBES THIS BUILD ===` /
+  `FAIL (SHRANK): rss delta=-13.42%` on run 34190674369 -- the new
+  classification, from a real run, not a mock.
 
 ### Documentation
 

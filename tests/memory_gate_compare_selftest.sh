@@ -17,6 +17,9 @@
 #   1  identical snapshot vs baseline                 -> PASS
 #   2  dashtable +6%                                  -> RED, GREW
 #   3  rss -14.02% (the real #764 numbers)            -> RED, SHRANK
+#   3a rss +6%   -- growth threshold NOT relaxed      -> RED, GREW
+#   3b rss -8%   -- inside measured hosted noise      -> PASS
+#   3c rss -11%  -- past the shrink floor             -> RED, SHRANK
 #   4  #764's exact measured-vs-committed pair        -> RED (never a pass)
 #   5  hnsw +15% (inside the measured noise floor)    -> PASS
 #   6  hnsw +73% (>3x the floor)                      -> RED, GREW
@@ -116,8 +119,20 @@ expect_case "1 identical -> PASS" pass \
 expect_case "2 dashtable +6% -> RED (GREW)" red \
     "FAIL (GREW):   dashtable" "$(mutate '.kinds.dashtable.prom = (.kinds.dashtable.prom * 1.06 | floor)')" "$BASE_SNAPSHOT"
 
-expect_case "3 rss -14% -> RED (SHRANK)" red \
+expect_case "3 rss -14% (a STEP) -> RED (SHRANK)" red \
     "FAIL (SHRANK): rss" "$(mutate '.rss = (.rss * 0.8598 | floor)')" "$BASE_SNAPSHOT"
+
+# The asymmetry, both halves. Growth detection must NOT have been relaxed to
+# buy the shrink slack: a +6% RSS regression stays red at the 5% growth
+# threshold while -8% (inside the measured hosted-runner noise) stays green.
+expect_case "3a rss +6% -> RED (GREW), growth threshold NOT relaxed" red \
+    "FAIL (GREW):   rss" "$(mutate '.rss = (.rss * 1.06 | floor)')" "$BASE_SNAPSHOT"
+
+expect_case "3b rss -8% (inside measured noise) -> PASS" pass \
+    "ALL KINDS WITHIN TOLERANCE" "$(mutate '.rss = (.rss * 0.92 | floor)')" "$BASE_SNAPSHOT"
+
+expect_case "3c rss -11% (past the shrink floor) -> RED (SHRANK)" red \
+    "FAIL (SHRANK): rss" "$(mutate '.rss = (.rss * 0.89 | floor)')" "$BASE_SNAPSHOT"
 
 expect_case "4 #764 measured vs stale baseline -> RED, never a pass" red \
     "BASELINE NO LONGER DESCRIBES THIS BUILD" "$BASE_SNAPSHOT" "$STALE_BASELINE"

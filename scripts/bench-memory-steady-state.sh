@@ -618,6 +618,36 @@ check_baseline_provenance() {
 # The floor sits comfortably above the measured noise ceiling (~16% / ~19%)
 # so a real regression several times the noise floor is still caught; it
 # does NOT touch the other 5 kinds or RSS, which stayed noise-free.
+# RSS shrink floor: the growth threshold is NOT relaxed
+# ---------------------------------------------------------------------------
+# `rss` is the one figure here that is not an accounting number. It is the
+# whole process: tracked kinds (~78%) plus a residual of jemalloc arena
+# metadata, dirty pages, thread stacks and binary text that no counter owns.
+# Nine samples of an IDENTICAL source tree on hosted ubuntu-latest spanned
+# 7.96% min-to-max (119,946,xxx .. 129,495,040), while `dashtable` over the
+# same nine spanned 0.11%. A +/-5% band is 10 points wide; an 8% spread does
+# not fit inside it with margin, and the gate would go red on ordinary runs.
+#
+# The fix is direction-aware, not a wider band:
+#
+#   GROWTH stays at $THRESHOLD (5%). A memory regression is a growth, so the
+#   gate's entire detection power is preserved, unrelaxed, at the tightest
+#   threshold the evidence supports. Nothing this gate exists to catch gets
+#   easier to sneak past.
+#
+#   SHRINK gets the measured floor below. A shrink is never a regression. Its
+#   only job is to notice a STEP -- a stale baseline, a harness change, a
+#   workload that did not run -- and a step is large: moon#764's arena-cap
+#   step was -11.82% .. -14.02%, still caught here with margin, while the
+#   worst noise sample sits at -4.28%.
+#
+# So this is not "widen the band until it is green". The band that catches
+# regressions is untouched; only the direction that cannot be a regression
+# absorbs the measured noise. If a shrink ever fires, check_workload_ran()
+# has already proven the workload populated, so the remaining causes are the
+# two the failure text names.
+RSS_SHRINK_FLOOR=10
+
 kind_threshold() {
     local kind="$1"
     local base="$2"
@@ -689,22 +719,24 @@ m = $measured_rss
 b = $baseline_rss
 print(round((m - b) / b * 100, 2))
 ")
+        # Asymmetric ON PURPOSE -- see RSS_SHRINK_FLOOR above. Growth is
+        # judged at the full (tight) threshold; only the shrink side, which
+        # can never be a regression, carries the measured noise floor.
         rss_verdict=$(python3 -c "
 d = $rss_delta_pct
-t = $threshold
-print('grow' if d > t else ('shrink' if d < -t else 'ok'))
+print('grow' if d > $threshold else ('shrink' if d < -$RSS_SHRINK_FLOOR else 'ok'))
 ")
         case "$rss_verdict" in
             grow)
-                failure_msgs="${failure_msgs}  FAIL (GREW):   rss delta=${rss_delta_pct}% (measured=$measured_rss, baseline=$baseline_rss, threshold=+/-${threshold}%)\n"
+                failure_msgs="${failure_msgs}  FAIL (GREW):   rss delta=${rss_delta_pct}% (measured=$measured_rss, baseline=$baseline_rss, growth threshold=+${threshold}%)\n"
                 growth_failures=$((growth_failures + 1))
                 ;;
             shrink)
-                failure_msgs="${failure_msgs}  FAIL (SHRANK): rss delta=${rss_delta_pct}% (measured=$measured_rss, baseline=$baseline_rss, threshold=+/-${threshold}%)\n"
+                failure_msgs="${failure_msgs}  FAIL (SHRANK): rss delta=${rss_delta_pct}% (measured=$measured_rss, baseline=$baseline_rss, shrink floor=-${RSS_SHRINK_FLOOR}%)\n"
                 shrink_failures=$((shrink_failures + 1))
                 ;;
             *)
-                log "  OK: rss delta=${rss_delta_pct}% (within +/-${threshold}%)"
+                log "  OK: rss delta=${rss_delta_pct}% (grow limit +${threshold}%, shrink limit -${RSS_SHRINK_FLOOR}%)"
                 ;;
         esac
     fi
