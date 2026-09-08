@@ -115,6 +115,11 @@ path = "fuzz_targets/term_fst_sidecar.rs"
 doc = false
 
 [[bin]]
+name = "text_index_meta"
+path = "fuzz_targets/text_index_meta.rs"
+doc = false
+
+[[bin]]
 name = "text_postings_file"
 path = "fuzz_targets/text_postings_file.rs"
 doc = false

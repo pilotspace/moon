@@ -63,7 +63,6 @@ impl Default for BM25Config {
 /// Plan 07 mirrors this shape for NUMERIC fields. The `FieldFilter` enum
 /// (declared in `command::vector_search::ft_text_search`) carries TAG / NUMERIC
 /// clauses through the query path without invoking the text analyzer.
-#[cfg(feature = "text-index")]
 #[derive(Debug, Clone)]
 pub struct TagFieldDef {
     /// Canonical field name. Stored once; comparisons use `eq_ignore_ascii_case`
@@ -80,7 +79,6 @@ pub struct TagFieldDef {
     pub noindex: bool,
 }
 
-#[cfg(feature = "text-index")]
 impl TagFieldDef {
     /// Create a new TAG field definition with RediSearch-compatible defaults.
     pub fn new(field_name: bytes::Bytes) -> Self {
@@ -108,7 +106,6 @@ impl TagFieldDef {
 /// carries NUMERIC range clauses through the query path without invoking the
 /// text analyzer. Storage is `HashMap<field, BTreeMap<OrderedFloat<f64>, RoaringBitmap<doc_id>>>`
 /// so `BTreeMap::range` yields O(log N) range resolution.
-#[cfg(feature = "text-index")]
 #[derive(Debug, Clone)]
 pub struct NumericFieldDef {
     /// Canonical field name. Stored once; comparisons use `eq_ignore_ascii_case`
@@ -120,7 +117,6 @@ pub struct NumericFieldDef {
     pub noindex: bool,
 }
 
-#[cfg(feature = "text-index")]
 impl NumericFieldDef {
     /// Create a new NUMERIC field definition with RediSearch-compatible defaults.
     pub fn new(field_name: bytes::Bytes) -> Self {
