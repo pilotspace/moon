@@ -89,10 +89,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   credits the entry, plus the sidecar box on the downgrade back to plain
   `Hash`.
 
+  The active sweep needed the credit in *both* its outcomes. `remove_hot`
+  credits `entry_overhead` recomputed from the value as it stands, and by the
+  time the caller's `db.remove()` runs the maps are empty — so it credits the
+  shell and never the fields the sweep dropped. A first cut skipped the credit
+  on that path and stranded 384 B per two-field key;
+  `reap_key_deleted_does_not_double_credit` is what caught it.
+
   `tests/hash_ttl_memory_accounting.rs` holds the guard. Its oracle is
   `recalculate_memory()` — a full rescan by the same `entry_overhead` the
   running ledger claims to track incrementally — which is strictly stronger
-  than checking deltas one at a time. All 7 tests fail on the parent commit;
+  than checking deltas one at a time. All 9 tests fail on the parent commit;
   the two end-to-end cycle tests carry ballast keys deliberately, because on
   an empty database the ledger starts at 0, over-crediting saturates back to
   0, and the repro passes against the very bug it exists to catch.

@@ -23,6 +23,7 @@
 use bytes::Bytes;
 
 use moon::storage::db::{Database, HashTtlCond};
+use moon::storage::db_hash_ttl::ReapOutcome;
 use moon::storage::entry::{Entry, RedisValue};
 
 /// Insert a plain `RedisValue::Hash` key through `Database::set`, which is the
@@ -224,4 +225,66 @@ fn hdel_downgrade_keeps_the_ledger_honest() {
 
     db.hash_delete_field(b"h", b"f1").unwrap();
     assert_ledger_matches_rescan(&mut db, "after HDEL f1 (downgrade to Hash)");
+}
+
+/// The active-expiry sweep reaps expired fields off a `HashWithTtl` in place.
+/// It credited **nothing** — not the field entries, not the sidecar entries,
+/// not the sidecar box on the downgrade — so a hash whose fields expired one
+/// by one left `used_memory` permanently ABOVE the truth. Opposite direction
+/// to the promotion bug (fail-closed rather than dangerous), same asymmetry.
+#[test]
+fn reaping_expired_fields_keeps_the_ledger_honest() {
+    let mut db = Database::new();
+    make_hash_key(
+        &mut db,
+        b"h",
+        &[(b"f1", b"v1"), (b"f2", b"v2"), (b"keep", b"v3")],
+    );
+    let base = db.now_ms();
+    for f in [&b"f1"[..], &b"f2"[..]] {
+        db.hash_set_field_ttl(b"h", f, base + 10_000, HashTtlCond::Always)
+            .unwrap();
+    }
+    assert_ledger_matches_rescan(&mut db, "after HEXPIRE on two fields");
+
+    // Sweep against a clock past both TTLs. `keep` has no TTL, so the key
+    // survives and the value downgrades back to a plain `Hash`.
+    assert_eq!(
+        db.reap_expired_fields_one_hash_at(b"h", base + 20_000, usize::MAX),
+        ReapOutcome::Downgraded
+    );
+    assert_ledger_matches_rescan(&mut db, "after the active-expiry sweep downgraded the hash");
+}
+
+/// The sweep's `KeyDeleted` outcome still has to credit the fields it dropped.
+/// `remove_hot` credits `entry_overhead` recomputed from the value AS IT
+/// STANDS, and by then the maps are empty — so it credits only the shell. A
+/// first cut of this fix skipped the credit here on the theory that the
+/// caller's `db.remove()` covered it; this test is what proved it did not,
+/// stranding 384 B on a two-field key.
+#[test]
+fn reap_key_deleted_does_not_double_credit() {
+    let mut db = Database::new();
+    add_ballast(&mut db);
+    let baseline = db.resident_bytes();
+
+    make_hash_key(&mut db, b"h", &[(b"f1", b"v1"), (b"f2", b"v2")]);
+    let base = db.now_ms();
+    for f in [&b"f1"[..], &b"f2"[..]] {
+        db.hash_set_field_ttl(b"h", f, base + 10_000, HashTtlCond::Always)
+            .unwrap();
+    }
+    // Every field is TTL'd, so the sweep empties the hash entirely.
+    assert_eq!(
+        db.reap_expired_fields_one_hash_at(b"h", base + 20_000, usize::MAX),
+        ReapOutcome::KeyDeleted
+    );
+    db.remove(b"h");
+
+    assert_eq!(
+        db.resident_bytes(),
+        baseline,
+        "the swept-then-removed key must leave the ledger exactly where it started"
+    );
+    assert_ledger_matches_rescan(&mut db, "after sweep + remove");
 }

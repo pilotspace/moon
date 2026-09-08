@@ -114,9 +114,12 @@ impl Database {
         // permanently above the truth (`recalculate_memory` is a load-time
         // healer only). Accumulated here, settled once the `rv` borrow ends.
         //
-        // `KeyDeleted` credits nothing: the caller's `db.remove(key)` runs
-        // `remove_hot`, which credits `entry_overhead` recomputed from the
-        // value as it stands — crediting here too would double-credit.
+        // This holds on the `KeyDeleted` path too. `remove_hot` credits
+        // `entry_overhead` recomputed from the value AS IT STANDS, and by then
+        // the maps are empty — it credits the shell (key + both boxes + 128),
+        // never the fields this sweep just dropped. Skipping the credit here
+        // stranded 384 B per 2-field key, caught by
+        // `reap_key_deleted_does_not_double_credit`.
         let mut credit: usize = 0;
         let action = match rv {
             RedisValue::HashWithTtl {
@@ -133,7 +136,6 @@ impl Database {
                     }
                 }
                 if fields.is_empty() {
-                    credit = 0;
                     PostReap::KeyDeleted
                 } else if ttls.is_empty() {
                     credit += crate::storage::db::hash_ttl_sidecar_box_cost();
