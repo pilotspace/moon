@@ -69,7 +69,7 @@ and how they compose.
 - **Forkless persistence.** RDB snapshots iterate DashTable segments incrementally — no `fork()`, no COW memory spike. AOF is a per-shard WAL v3 with batched fsync; the advantage over Redis grows with pipeline depth.
 - **Tiered disk offload — for data AND engines.** Keys evicted under `maxmemory` spill to NVMe instead of being deleted, with async write and read-through; idle vector-index segments demote HOT→WARM (mmap)→COLD (unloaded stub, reload-on-search) and give the memory back — measured **−26% process RSS** on a 40K×768d corpus with identical search results after reload. 100% crash recovery across all tiers.
 - **Multi-tenant isolation that's actually enforced.** Logical dbs get their own `FT.*`/graph/full-text indexes (db 1's indexes are invisible to db 0 — across shards, restarts, and recovery), per-db memory quotas (`--db-maxmemory`) with Redis-style deny-OOM semantics (shrink commands always pass — a tenant can never wedge itself), and workspace key-prefix namespaces on top.
-- **Memory-optimized types — a win at large values, a loss at small ones.** `CompactKey` (23-byte SSO), `CompactValue` (16-byte SSO with inline TTL), `HeapString`, B+ tree sorted sets, and per-request bumpalo arenas — no heap allocation for keys ≤23 B or values ≤12 B. Measured on Linux x86_64 at `--shards 1` against Redis 7.4.2/jemalloc: **15–17% less memory per key at values ≥ 1 KB**, a tie at 256 B, and **11–51% *more* at 32 B**. Empty-server RSS is **1.7× Redis** ([#821](https://github.com/pilotspace/moon/issues/821)). Full table, host and method: [BENCHMARK.md §3](BENCHMARK.md).
+- **Memory-optimized types — a win at every value size measured.** `CompactKey` (23-byte SSO), `CompactValue` (16-byte SSO with inline TTL), `HeapString`, B+ tree sorted sets, and per-request bumpalo arenas — no heap allocation for keys ≤23 B or values ≤12 B. Re-measured 2026-09-08 on Linux at `--shards 1` against **Redis 7.0.15/jemalloc**: **8–22% less memory per key at every size from 8 B to 1 KB**, on both x86_64 and aarch64 (0.78× at 8 B, 0.83× at 32 B, 0.86× at 256 B, 0.84× at 1 KB on x86), and idle RSS a tie (13.01 MB vs Redis 13.19 MB). This run **did not reproduce** two figures published from the 2026-09-04 run — "11–51% *more* at 32 B" and "empty-server RSS 1.7× Redis". The conditions differed: that run's oracle was **Redis 7.4.2**, this one's is 7.0.15, and on idle RSS it is the *Redis* side that disagrees (7.5–7.7 MB then, 13.19 MB now, same host class) — [#821](https://github.com/pilotspace/moon/issues/821) tracks it. Both measurements stand on the record. Full table, host and method: [BENCHMARK.md §3](BENCHMARK.md); the 2026-09-04 run is preserved in the [benchmark archive](docs/internal/benchmark-history.md) §3.
 - **AI-native, in-core.** Vector search (HNSW + TurboQuant), BM25 full-text with three-way RRF hybrid fusion, a Cypher property-graph engine, cross-store ACID, workspaces, durable queues, and bi-temporal MVCC — one binary, no module loader.
 
 <p align="center">
@@ -202,35 +202,56 @@ Full tutorials in [examples/](examples/): [RAG](examples/rag-quickstart/), [Sema
 
 ## Benchmarks
 
-Headline numbers vs Redis 8.6.1, peak throughput, co-located client/server.
-**Full methodology, ARM64, vector, graph, persistence, and latency tables
-are in [BENCHMARK.md](BENCHMARK.md)** and [docs/benchmarks.md](docs/benchmarks.md).
+Headline numbers vs Redis 7.0.15, measured 2026-09-08 on moon `ae6cd003`
+(v0.8.9), co-located client/server. **Full methodology, both architectures, the
+noise floors, and the v0.8.7 A/B are in [BENCHMARK.md](BENCHMARK.md)** and
+[docs/benchmarks.md](docs/benchmarks.md). Eight months of prior runs — vector,
+graph, full-text, and every superseded table — are preserved verbatim in the
+[benchmark archive](docs/internal/benchmark-history.md).
 
-### Peak throughput (Linux — GCloud c3-standard-8, x86_64, monoio io_uring, v0.1.6)
+### Peak throughput (Linux — GCE c3-standard-8 x86_64 and t2a-standard-8 aarch64, monoio io_uring, v0.8.9)
 
-> Absolute figures from BENCHMARK.md §2.1. That run does not record the Redis
-> build's `io-threads` setting or the `redis-benchmark` payload size. The
-> current tree was re-measured as ratios on v0.8.7 (§2.12, Redis 7.0.15,
-> `--shards 1`, c=50): GET **2.40×** x86 / **2.29×** ARM, SET **1.78×** /
-> **2.02×** at p=64.
+`--shards 1 --appendonly no --disk-offload disable`, `-c 50`, keys spread over
+`-r 100000`, n=5 interleaved reps with Redis restarted and re-measured in every
+rep as a live drift control.
 
-| Workload                            |   Moon | Redis 8.6.1 |
-|-------------------------------------|-------:|------------:|
-| Peak GET (c=50, p=64)               | 5.11M  | 2.98M (1.72×) |
-| Peak SET (c=50, p=64)               | 3.50M  | 1.82M (1.92×) |
-| GET, production defaults (AOF + offload) | 4.76M | 2.46M (1.93×) |
-| Crash recovery (SIGKILL, 5K keys)   | 100%   | 100% (parity) |
+| Workload                              |   Moon | Redis 7.0.15 |
+|---------------------------------------|-------:|-------------:|
+| Peak GET (c=50, p=64), x86_64         | 2.97M  | 1.83M (**1.62×**) |
+| Peak SET (c=50, p=64), x86_64         | 2.01M  | 1.52M (**1.32×**) |
+| Peak GET (c=50, p=64), aarch64        | 1.53M  | 0.95M (**1.60×**) |
+| Peak SET (c=50, p=64), aarch64        | 1.32M  | 0.85M (**1.55×**) |
+| Crash recovery (SIGKILL, 5K keys)     | 100%   | 100% (parity) |
 
-On **ARM64** (Neoverse-N1) Moon runs ~2.1–2.2× Redis on the same harness.
+> **These absolutes are lower than the 5.11M / 3.50M this table used to quote,
+> and that is a change of workload, not a regression.** The older row was a
+> v0.1.6 run ([archive](docs/internal/benchmark-history.md) §2.1) that drove
+> `redis-benchmark`'s default *single hot key*, on a different Redis build whose
+> `io-threads` setting it did not record; every row above spreads keys over
+> `-r 100000`, the only distribution that measures a keyspace rather than one
+> cache line, and key distribution alone moves these numbers by ~2×. The two are
+> not comparable, so neither is quoted as a delta. On the question of whether the
+> tree got slower, the direct answer is the v0.8.7 → main A/B on these same hosts
+> on the same day: the six non-inlined families came back **+5 to +25%** (x86) and
+> **up to +21%** on eleven of twelve rows (ARM), and GET and SET did not move. See "Change since v0.8.7"
+> in [BENCHMARK.md §2](BENCHMARK.md).
 
-> **Scope of the pipelined win — read before quoting these.** GET and SET are the
-> two commands moon serves from an inline byte path that bypasses frame
-> construction and the dispatch table. Re-measured on v0.8.7
-> ([BENCHMARK.md §2.12](BENCHMARK.md)), they beat Redis by 1.78–2.40× at p=64 —
-> but **every other command family (INCR, LPUSH, SPOP, HSET) runs 0.40–0.67×
-> Redis at p≥8.** The boundary is the fast path, not the engine: `SET k v` runs
-> 2.08× Redis while `SET k v EX 100` — same work, one disqualifying option —
-> runs 0.87×. At p=1 moon is at parity or slightly ahead across the board.
+> **Scope of the pipelined win — read before quoting these.** GET and plain
+> `SET key value` are the two commands moon serves from an inline byte path that
+> bypasses frame construction and the dispatch table. Those two win: **1.62× /
+> 1.32×** on x86 and **1.60× / 1.55×** on ARM at p=64, **1.18–1.20×** at p=8.
+> **Every other family measured — INCR, LPUSH, SADD, SPOP, HSET, ZADD — loses at
+> p≥8, by 13–55%**: 0.62–0.81× at p=8 and 0.45–0.87× at p=64, on both
+> architectures. The boundary is the fast path, not the engine: measured on
+> v0.8.7, `SET k v` ran 2.08× Redis while `SET k v EX 100` — same work, one
+> disqualifying option — ran 0.87×
+> ([archive](docs/internal/benchmark-history.md) §2.12). At p=1 the two engines
+> are roughly tied — 0.89–1.08× on x86, 0.77–1.05× on ARM. **Any summary quoting
+> the GET number alone describes a two-command fast path, not the server.**
+
+Those rows run `--appendonly no --disk-offload disable`. The default
+configuration a user actually gets is **not** measured there; that gap and four
+others are listed in [BENCHMARK.md §5](BENCHMARK.md).
 
 Deep pipelines were always Moon's home turf; v0.5–v0.6 closed the two
 classic gaps too:
@@ -241,8 +262,9 @@ classic gaps too:
   annotated [`conf/moon-standalone.conf`](conf/moon-standalone.conf), sets it
   for you): **1.19–1.21×** Redis on ARM (c4a Axion), **1.65–1.66×** on x86
   (c3), same-instance A/Bs, n=3 — **on dedicated cores**. Re-measured on
-  ordinary shared-tenant GCE instances (v0.8.7, BENCHMARK.md §2.12) the same
-  flag yields 1.06–1.08× on x86 and nothing outside the noise floor on ARM,
+  ordinary shared-tenant GCE instances (v0.8.7,
+  [archive](docs/internal/benchmark-history.md) §2.12) the same flag yields
+  1.06–1.08× on x86 and nothing outside the noise floor on ARM,
   because the contention governor below correctly self-gates there. As of v0.8.1 the busy-poll **auto-gates on
   shared cores** (per-shard contention governor), so the preset is safe on any
   host — not just pinned ones. **This is a single-connection result and does
@@ -255,38 +277,60 @@ classic gaps too:
 - **Fully durable writes** (`appendfsync always`, p=16) went from 0.12× to
   **0.91× Redis** via per-batch group commit + coalesced writes, while
   `everysec` p=16 is a **1.32× win** — with kill-9-lossless recovery.
+  Measured 2026-07-08 (GCE c3-standard-8, `--shards 2`); **not** re-measured on
+  the current tree — [archive](docs/internal/benchmark-history.md) §7.3.
 - **Vector time-to-index-green** (bulk load → searchable at target recall)
-  beats Qdrant **1.6–2.3×** on GCE with the parallel HNSW build.
+  beats Qdrant **1.6–2.3×** on GCE with the parallel HNSW build. Measured
+  2026-07-08; not re-measured on the current tree —
+  [archive](docs/internal/benchmark-history.md) §10.9.
 
-### Per-key memory (Linux — GCE c3-standard-8, x86_64, `--shards 1`, 2026-09-04)
+### Per-key memory (Linux — `--shards 1`, measured 2026-09-08)
 
-Against **Redis 7.4.2 built with jemalloc 5.3.0**. Fresh server per point,
-`redis-benchmark -r N` for unique keys, per-key = (loaded RSS − baseline RSS) /
-`DBSIZE`. Full table, all twelve points and the method:
-[BENCHMARK.md §3](BENCHMARK.md).
+Against **Redis 7.0.15 built with jemalloc**. Fresh server per point, `-r 200000`
+distinct keys, per-key = (loaded RSS − idle RSS) / `DBSIZE`, n=3, every row
+checked against its arithmetic floor. Full table including 16/48/128 B, both
+architectures, and the method: [BENCHMARK.md §3](BENCHMARK.md).
 
 | Value size | Redis/key | Moon/key | Result |
 |------------|----------:|---------:|--------|
-| 32 B       | 123–129 B | 143–186 B | **Moon 11–51% worse** |
-| 256 B      | 408–410 B | 377–418 B | tie (±8%) |
-| 1 KB       | 1,380–1,388 B | 1,155–1,256 B | **Moon 9.5–16.4% less** |
-| 4 KB       | 5,259–5,266 B | 4,352–4,404 B | **Moon 16.4–17.2% less** |
-| Empty-server RSS | 7.5–7.7 MB | 12.6–12.9 MB | **Moon 1.7× worse** ([#821](https://github.com/pilotspace/moon/issues/821)) |
+| 8 B        | 125.1 B   |  97.9 B  | **Moon 22% less** |
+| 32 B       | 158.3 B   | 130.6 B  | **Moon 17% less** |
+| 64 B       | 178.8 B   | 163.9 B  | **Moon 8% less** |
+| 256 B      | 421.7 B   | 362.2 B  | **Moon 14% less** |
+| 1 KB       | 1,393.3 B | 1,164.6 B | **Moon 16% less** |
+| Empty-server RSS | 13.19 MB | 13.01 MB | tie (0.99×) |
 
-> **This supersedes the retired "27–35% less memory" claim, and Moon is not what
-> changed.** The old published 1M × 1 KB row was Redis 1,571 B / Moon 1,153 B;
-> re-measured here it is Redis **1,380 B** / Moon **1,172 B**. Moon's own figure
-> moved 1.6%; the *oracle* moved 12%. The old number was inflated by a Redis
-> baseline measured on macOS and/or without jemalloc — both Redis builds already
-> on the benchmark host were libc-malloc, which inflates Redis RSS and would
-> have biased this comparison in Moon's favour, so Redis was rebuilt against
-> jemalloc for the run. **x86_64 only; nothing here is an ARM result.** On
-> aarch64 at `--shards 8`, [§2.14](BENCHMARK.md) separately measures a 16% loss
-> at 64 B and a 26% idle-RSS loss.
+x86_64 figures; **aarch64 agrees** — 0.86× at 8 B, 0.92× at 64 B, 0.86× at
+256 B, 0.84× at 1 KB, idle RSS 0.96× (11.43 vs 11.93 MB). The result does not
+depend on the idle-RSS subtraction: Moon's *absolute* loaded RSS is lower at
+every size too (1 KB values, x86: 210 MB vs 249 MB).
 
-For **vector** (12.7K search QPS @ 384d), **graph** (23× FalkorDB bulk
-insert, 2.4× Cypher QPS; 2.78× on point-filter after the mutable property
-index), and **hash-field TTL** benchmarks, see [BENCHMARK.md](BENCHMARK.md).
+> **Two claims published from the 2026-09-04 run did not reproduce here, and
+> both stay on the record.** That run reported Moon **11–51% worse at 32 B** and
+> an empty-server RSS of **1.7× Redis**; measured directly at 16/32/48/128 B on
+> 2026-09-08, Moon is **0.83× at 32 B — a 17% win**, and the two servers tie on
+> idle RSS. The conditions differ: the earlier run's oracle was **Redis 7.4.2**,
+> this one's is **7.0.15**, and on idle RSS it is the *Redis* side that moved
+> (7.5–7.7 MB then, 13.19 MB now, same host class) —
+> [#821](https://github.com/pilotspace/moon/issues/821) tracks that. Neither
+> number is being called wrong; the newer one simply did not reproduce the older
+> one. The 2026-09-04 tables, including the 4 KB row (16.4–17.2% Moon win) that
+> was not repeated on 2026-09-08, are preserved in the
+> [archive](docs/internal/benchmark-history.md) §3.
+>
+> **Scope:** `--shards 1`, string values, one key shape. Separately, at
+> `--shards 8` on aarch64 the archive's §2.14 (2026-09-01) measures a **16% loss
+> at 64 B and a 26% idle-RSS loss**, because the default config spawns four
+> threads per shard. Nothing above contradicts that; it is a different
+> configuration.
+
+For **vector**, **graph**, **full-text**, and **hash-field TTL** benchmarks —
+none of them re-measured on 2026-09-08 — see the dated carry-forward table in
+[BENCHMARK.md §4](BENCHMARK.md) and the full
+[archive](docs/internal/benchmark-history.md): vector vs Qdrant ingest **10×**
+and search **2.7–3.4×** (2026-07-08, §10.9), graph 1-hop Cypher **2.34×** x86 /
+**2.67×** ARM vs FalkorDB (2026-07-07, §11.9), full-text vs RediSearch
+(2026-06-17, §12.3).
 Hash-field TTL is a **feature** parity with Valkey, not a performance parity:
 the three-way bench
 ([docs/perf/2026-05-27-hash-ttl-3way-bench.md](docs/perf/2026-05-27-hash-ttl-3way-bench.md))
@@ -319,9 +363,9 @@ reference but ships under SSPL since 2024. Full traced review:
 | Tiered NVMe offload        | **Yes** (KV under `maxmemory` + idle engine segments) | No (OSS)   | No (OSS)                  |
 | Multi-tenant isolation     | **Per-db quotas + db-scoped indexes + workspaces** | ACL only  | ACL only                  |
 | Multi-node cluster (GA)    | **Alpha** (single-node GA today) | **Production**              | **Production**            |
-| Peak single-server GET     | **5.11M/s** (c3-8 x86_64, p=64)  | 2.1M RPS (vendor, 9 I/O threads, p=10, 512 B) | 2.98M/s (same harness as Moon, p=64) |
+| Peak single-server GET     | **2.97M/s** (c3-8 x86_64, p=64, `-r 100000`, 2026-09-08) | 2.1M RPS (vendor, 9 I/O threads, p=10, 512 B) | 1.83M/s, Redis 7.0.15 (same harness and same run as Moon) |
 
-- **Choose Moon** for single-node peak pipelined GET/SET throughput, ≥1 KB per-key memory efficiency (15–17%, x86_64), forkless snapshots, or AI-native workloads (vector / GraphRAG / hybrid retrieval) with cross-store ACID. Not for small-value or idle footprint — Moon is worse than Redis at 32 B values and 1.7× worse when empty.
+- **Choose Moon** for single-node peak pipelined **GET/SET** throughput, per-key memory efficiency (8–22% less than Redis 7.0.15 across 8 B – 1 KB, both arches, 2026-09-08), forkless snapshots, or AI-native workloads (vector / GraphRAG / hybrid retrieval) with cross-store ACID. **Not** for pipelined workloads dominated by anything other than GET/SET — every other family measured runs 0.45–0.87× Redis at p≥8.
 - **Choose Valkey** for proven multi-node clusters, managed-cloud-only deployments, or strict Redis 7.2 module-ecosystem compatibility under LF governance.
 - **Stay on Redis OSS** for existing RediSearch/RedisJSON/RedisBloom investments or Redis Enterprise features (CRDT active-active, Redis Flash).
 

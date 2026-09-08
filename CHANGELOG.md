@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`replication::state::record_local_write_db_on`).
   Red/green: `tests/replication_local_leg_815.rs` (`#[ignore]`d, real
   primary + replica, `--shards 1` and `--shards 4`, both AOF modes).
+- **`bench-compare.sh` reported the LPUSH seeding rate under the LRANGE label.**
+  `redis-benchmark -t lrange_100` emits *two* `requests per second` lines — the
+  LPUSH used to populate the list, then the LRANGE — and `parse_rps` took the
+  first match, so all four LRANGE rows the script has ever printed were LPUSH
+  numbers. The same parser scanned for the first numeric *field*, which reads
+  the literal score out of `zadd z:__rand_int__ 1 m:__rand_int__` and reports
+  **1 rps**. Both reproduced against live `redis-benchmark` 8.x output before
+  and after the fix; the parser now anchors on the position of the words
+  `requests per second` and takes the last match.
 
 - **`ci`: clippy now lints tests, benches and examples.** Every clippy
   invocation in `ci.yml` was lib-only, so `--all-targets` code was never
@@ -138,6 +147,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   classification, from a real run, not a mock.
 
 ### Documentation
+
+- **BENCHMARK.md re-measured end to end and cut from 2137 lines to 285.** Every
+  number in the report now comes from one run on 2026-09-08: moon `ae6cd003`
+  (v0.8.9) against Redis 7.0.15 on GCE `c3-standard-8` (x86_64) and
+  `t2a-standard-8` (aarch64), `--shards 1`, n=5 interleaved reps with Redis
+  restarted and re-measured every rep as a live drift control, and a per-row
+  noise floor below which a ratio is reported as a tie rather than a result.
+  The previous report is archived verbatim at
+  `docs/internal/benchmark-history.md` — it is kept because several of its
+  sections exist to document how an earlier published number turned out to be
+  wrong, and deleting them would delete the correction with the error. Raw CSVs
+  in `docs/internal/bench-data/2026-09-08/`.
+
+  Findings: the GET/SET inline-path split is confirmed and remains the headline
+  caveat (GET/SET **1.6x** at p=64; every other family **0.45-0.87x** at p>=8,
+  both arches). The write-path regression the old §2.13 recorded between v0.6.0
+  and v0.8.7 is **reversed** — a v0.8.7 rebuild on the same hosts puts main
+  ahead by +5 to +25% on every non-inlined family (INCR +23.5%, HSET +18.3%,
+  SPOP +15.0% at x86 p=64), with Redis drifting a median -0.4% between runs.
+  The one loss that did **not** come back is SET at p=64. Memory: moon uses
+  **8-22% less per key at every size from 8 B to 1 KB** on both arches, which
+  does not reproduce the archived "11-51% worse at 32 B" (measured 0.83x here)
+  or "empty-server RSS 1.7x Redis" (a tie here); both older runs used Redis
+  7.4.2 rather than 7.0.15, and both readings stay on the record.
+
 
 - **The "27-35% less memory" claim is corrected to a measured 15-17%, on Linux,
   against a jemalloc Redis (#817, #821).** The figure was re-measured on GCE
