@@ -24,6 +24,8 @@
 #   5  hnsw +15% (inside the measured noise floor)    -> PASS
 #   6  hnsw +73% (>3x the floor)                      -> RED, GREW
 #   7  allocator_overhead +30% (past its 25% floor)   -> RED, GREW
+#   7a allocator_overhead -31% (rss-derived floor)    -> PASS
+#   7b allocator_overhead -60%                        -> RED, SHRANK
 #   8  empty-server snapshot                          -> check_workload_ran RC 2
 #   9  populated snapshot                             -> check_workload_ran RC 0
 set -uo pipefail
@@ -145,6 +147,41 @@ expect_case "6 hnsw +73% -> RED (GREW)" red \
 
 expect_case "7 allocator_overhead +30% -> RED (GREW)" red \
     "FAIL (GREW):   allocator_overhead" "$(mutate '.kinds.allocator_overhead.prom = (.kinds.allocator_overhead.prom * 1.30 | floor)')" "$BASE_SNAPSHOT"
+
+# allocator_overhead is rss - tracked_sum, so it carries all of rss's
+# absolute jitter at ~23% of its magnitude. Its shrink floor is derived from
+# rss's own allowance (~47% for this snapshot), NOT from the 25% growth
+# floor: a real run with rss at -7.26% -- inside the shrink limit -- carried
+# allocator_overhead at -30.83% and would otherwise turn that green
+# whole-process measurement red.
+expect_case "7a allocator_overhead -31% (rss-derived floor) -> PASS" pass \
+    "shrink limit" "$(mutate '.kinds.allocator_overhead.prom = (.kinds.allocator_overhead.prom * 0.69 | floor)')" "$BASE_SNAPSHOT"
+
+expect_case "7b allocator_overhead -60% (past the derived floor) -> RED (SHRANK)" red \
+    "FAIL (SHRANK): allocator_overhead" "$(mutate '.kinds.allocator_overhead.prom = (.kinds.allocator_overhead.prom * 0.40 | floor)')" "$BASE_SNAPSHOT"
+
+# The derivation itself: never tighter than rss's absolute allowance, never
+# looser than the kind's own measured floor.
+d=$(ao_shrink_threshold 124432384 26408931 25)
+if python3 -c "import sys; sys.exit(0 if abs($d - 47.12) < 0.1 else 1)"; then
+    echo "  ok   ao_shrink_threshold(rss=124432384, ao=26408931) = $d (rss allowance in ao's units)"
+    PASSES=$((PASSES + 1))
+else
+    echo "  FAIL ao_shrink_threshold = $d, want ~47.12"
+    FAILS=$((FAILS + 1))
+fi
+d=$(ao_shrink_threshold 124432384 900000000 25)
+if [[ "$d" == "25" ]]; then
+    echo "  ok   ao_shrink_threshold floors at the kind's own 25% when rss's allowance is smaller"
+    PASSES=$((PASSES + 1))
+else
+    echo "  FAIL ao_shrink_threshold did not floor at 25: $d"
+    FAILS=$((FAILS + 1))
+fi
+
+# Fail closed: a snapshot that cannot be evaluated is not a pass.
+expect_case "10 unparseable snapshot -> RED (UNEVALUATED), never OK" red \
+    "FAIL (UNEVALUATED)" "$(mutate '.rss = null | .kinds.dashtable.prom = null')" "$BASE_SNAPSHOT"
 
 echo "== kind_threshold() =="
 for spec in "dashtable 5" "rss_unknown_kind 5" "hnsw 20" "allocator_overhead 25"; do
