@@ -21,6 +21,7 @@ pub mod stream;
 pub mod tier;
 pub mod tiered;
 pub mod value_codec;
+pub mod zset_score;
 
 pub use db::Database;
 pub use entry::{Entry, RedisValue};

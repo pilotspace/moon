@@ -568,10 +568,89 @@ impl Database {
         }
     }
 
+    /// Get or create a sorted set entry as a listpack. Creates new keys as
+    /// `SortedSetListpack`.
+    ///
+    /// Returns `Ok(Some(&mut Listpack))` when the key is a `SortedSetListpack`,
+    /// `Ok(None)` when it already holds the full `SortedSetBPTree` (or the
+    /// legacy `SortedSet`) form — the caller falls through to
+    /// `get_or_create_sorted_set` — and `Err(WRONGTYPE)` for a non-zset type.
+    ///
+    /// This is the accessor `ZADD` was missing (moon#787). `SortedSetListpack`
+    /// was wired end to end — `Entry::new_sorted_set_listpack`, the value
+    /// codec, the RDB/AOF writers, `DEBUG DIGEST`, and
+    /// `SortedSetKind::classify_hot`'s `SortedSetRef::Listpack` arm all handle
+    /// it — but nothing ever produced one, so every zset was a `skiplist` from
+    /// its first member where Redis keeps one in a listpack up to
+    /// `zset-max-listpack-entries` (128) / `zset-max-listpack-value` (64).
+    ///
+    /// Mirrors `get_or_create_hash_listpack` exactly, including the cold-tier
+    /// rule: cold storage never persists a compact encoding, so a promoted
+    /// value always decodes as `RedisValue::SortedSetBPTree` and lands in the
+    /// `Ok(None)` arm rather than being fabricated over.
+    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
+    pub fn get_or_create_zset_listpack(
+        &mut self,
+        key: &[u8],
+    ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
+        let now_ms = self.cached_now_ms;
+        self.drop_if_expired(key, now_ms);
+        if !self.data.contains_key(key) {
+            self.promote_cold_if_present(key, now_ms);
+            if !self.data.contains_key(key) {
+                let mut entry = Entry::new_sorted_set_listpack();
+                // Fresh incarnation: stamp the per-db creation ticket so a
+                // WATCHing client can tell this container from the one that
+                // occupied the key before (see `Database::birth_counter`).
+                entry.set_version(self.next_birth_version());
+                let k = CompactKey::from(key);
+                self.used_memory += entry_overhead(key, &entry);
+                self.data.insert(k, entry);
+            }
+        }
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::SortedSetListpack(lp)) => Ok(Some(lp)),
+            Some(RedisValue::SortedSetBPTree { .. }) | Some(RedisValue::SortedSet { .. }) => {
+                Ok(None)
+            }
+            _ => Err(Self::wrongtype_error()),
+        }
+    }
+
+    /// Upgrade a `SortedSetListpack` to the full `SortedSetBPTree` form in
+    /// place, returning mutable refs to both inner structures.
+    ///
+    /// SELF-ACCOUNTING, unlike the older `upgrade_*` siblings: it delegates to
+    /// `SortedSetKind::upgrade` — the one conversion `get_or_create` and
+    /// `get_promoted` also run — and applies the delta it returns to
+    /// `used_memory` here. The listpack -> B+tree swing therefore has exactly
+    /// one implementation, billing the arena and the `members` table from
+    /// their real capacity (`zset_table_bytes`, moon#788/#810); a caller
+    /// cannot reach for the retired per-member model by mistake.
+    ///
+    /// Infallible for a key that exists and holds a zset; a key that already
+    /// holds the full form is returned unchanged with a zero delta.
+    #[allow(clippy::unwrap_used)] // caller guarantees key exists and is a zset; upgrade is infallible
+    pub fn upgrade_zset_listpack_to_bptree(
+        &mut self,
+        key: &[u8],
+    ) -> (&mut HashMap<Bytes, f64>, &mut BPTree) {
+        let entry = self.data.get_mut(key).unwrap();
+        let encoding_delta = db_kind::SortedSetKind::upgrade(entry);
+        self.used_memory = self.used_memory.saturating_add_signed(encoding_delta);
+        let entry = self.data.get_mut(key).unwrap();
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::SortedSetBPTree { members, tree }) => (members, tree),
+            _ => unreachable!("upgrade_zset_listpack_to_bptree: expected BPTree after upgrade"),
+        }
+    }
+
     /// Get or create a sorted set entry. Returns mutable refs to both inner structures.
     ///
     /// New keys start with SortedSetBPTree encoding. Legacy SortedSet (BTreeMap)
-    /// entries are upgraded to SortedSetBPTree on access for backward compatibility.
+    /// and — since moon#787 — `SortedSetListpack` entries are upgraded to
+    /// SortedSetBPTree on access.
     pub fn get_or_create_sorted_set(
         &mut self,
         key: &[u8],

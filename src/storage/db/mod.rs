@@ -2953,6 +2953,101 @@ mod ledger_consistency_788 {
         );
     }
 
+    /// moon#787 (`ZADD` listpack path) meets moon#814: a listpack zset that
+    /// receives a command with a bad score in the middle must be left exactly
+    /// as it was — nothing written, nothing charged — and a FRESH key must
+    /// not be created. The listpack branch was first inserted ABOVE #820's
+    /// validation pre-pass and re-created the regression on the new path;
+    /// this test fails against that shape (`a`/`b` written, uncharged, then
+    /// an error) and passes with the branch below the pre-pass.
+    #[test]
+    fn zadd_that_errors_mid_command_on_the_listpack_path_keeps_the_ledger_exact() {
+        let mut db = Database::new();
+        let floor = db.estimated_memory();
+        // Fresh key: must not be created.
+        let r = crate::command::sorted_set::zadd(
+            &mut db,
+            &[
+                f(b"z"),
+                f(b"1"),
+                f(b"a"),
+                f(b"2"),
+                f(b"b"),
+                f(b"notanum"),
+                f(b"c"),
+            ],
+        );
+        assert!(matches!(r, Frame::Error(_)), "got {r:?}");
+        assert_eq!(
+            db.logical_len(),
+            0,
+            "an erroring ZADD must not create the key"
+        );
+        assert_eq!(db.estimated_memory(), floor, "…nor charge anything for it");
+        assert_ledger_exact(&mut db, "after ZADD that errored on a fresh key");
+
+        // Existing listpack zset: the valid prefix must not be written.
+        crate::command::sorted_set::zadd(&mut db, &[f(b"z"), f(b"1"), f(b"a")]);
+        assert_ledger_exact(&mut db, "after ZADD creating a listpack zset");
+        let held = db.estimated_memory();
+        let r = crate::command::sorted_set::zadd(
+            &mut db,
+            &[f(b"z"), f(b"2"), f(b"b"), f(b"notanum"), f(b"c")],
+        );
+        assert!(matches!(r, Frame::Error(_)), "got {r:?}");
+        assert_eq!(
+            db.estimated_memory(),
+            held,
+            "an erroring ZADD on a listpack must charge nothing"
+        );
+        assert_ledger_exact(&mut db, "after ZADD that errored on a listpack zset");
+        let card = crate::command::sorted_set::zcard_readonly(&db, &[f(b"z")], 0);
+        assert_eq!(
+            card,
+            Frame::Integer(1),
+            "the valid prefix must not be written"
+        );
+    }
+
+    /// moon#787 (`ZADD` listpack path): create as a listpack, update a score
+    /// in place, grow past `LISTPACK_MAX_ENTRIES` into the B+tree form, and
+    /// delete — every step must leave the running ledger equal to a
+    /// recompute. The promotion is the step that matters: the B+tree cost is
+    /// `zset_table_bytes` (arena + members table from real capacity) plus
+    /// per-member bytes (moon#788/#810), and a promotion charged on the
+    /// retired per-member model would under-count the whole arena.
+    #[test]
+    fn zadd_listpack_path_keeps_the_ledger_exact_through_promotion() {
+        use crate::command::sorted_set::zadd;
+        use crate::storage::db::LISTPACK_MAX_ENTRIES;
+        let mut db = Database::new();
+        let floor = db.estimated_memory();
+        zadd(&mut db, &[f(b"z"), f(b"1"), f(b"a"), f(b"2.5"), f(b"b")]);
+        assert_ledger_exact(&mut db, "after ZADD creating a listpack zset");
+        zadd(&mut db, &[f(b"z"), f(b"1000000.25"), f(b"a")]);
+        assert_ledger_exact(&mut db, "after an in-place score update (longer rendering)");
+        zadd(&mut db, &[f(b"z"), f(b"1"), f(b"a")]);
+        assert_ledger_exact(
+            &mut db,
+            "after an in-place score update (shorter rendering)",
+        );
+        for i in 0..=LISTPACK_MAX_ENTRIES {
+            let m = format!("m{i:04}");
+            zadd(&mut db, &[f(b"z"), f(b"1"), f(m.as_bytes())]);
+        }
+        assert_ledger_exact(
+            &mut db,
+            "after growing past LISTPACK_MAX_ENTRIES (promotion)",
+        );
+        crate::command::key::del(&mut db, &[f(b"z")]);
+        assert_ledger_exact(&mut db, "after DEL of the promoted zset");
+        assert_eq!(
+            db.estimated_memory(),
+            floor,
+            "a create/promote/delete cycle must return the ledger to its floor"
+        );
+    }
+
     #[test]
     fn set_mutations_keep_the_ledger_exact() {
         let mut db = Database::new();

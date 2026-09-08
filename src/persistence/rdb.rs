@@ -1350,14 +1350,20 @@ mod tests {
         let count = load(&mut loaded, &path).unwrap();
         assert_eq!(count, 1);
         let entry = loaded[0].get(b"myzset").unwrap();
+        // A 2-member zset reloads as a LISTPACK (moon#787 lifted the zset
+        // exclusion from the restart fix). Scores are stored as text and must
+        // come back bit-exact.
         match entry.value.as_redis_value() {
-            RedisValueRef::SortedSetBPTree { members, tree } => {
-                assert_eq!(members.len(), 2);
-                assert_eq!(*members.get(&Bytes::from_static(b"alice")).unwrap(), 1.5);
-                assert_eq!(*members.get(&Bytes::from_static(b"bob")).unwrap(), 2.7);
-                assert_eq!(tree.len(), 2);
+            RedisValueRef::SortedSetListpack(lp) => {
+                let got: std::collections::HashMap<Vec<u8>, f64> = lp
+                    .iter_pairs()
+                    .map(|(m, s)| (m.as_bytes(), s.as_score().expect("score parses")))
+                    .collect();
+                assert_eq!(got.len(), 2);
+                assert_eq!(got[&b"alice"[..]], 1.5);
+                assert_eq!(got[&b"bob"[..]], 2.7);
             }
-            _ => panic!("Expected sorted set"),
+            other => panic!("Expected zset listpack, got {:?}", other.encoding_name()),
         }
     }
 

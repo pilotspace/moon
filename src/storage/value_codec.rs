@@ -431,16 +431,31 @@ pub(crate) fn compact_after_decode(v: RedisValue) -> RedisValue {
             RedisValue::Set(set)
         }
 
-        // Everything else passes through untouched. Zsets are excluded ON
-        // PURPOSE, not for lack of a threshold: `SortedSetKind::project_mut` /
-        // `project_ref` (`db_kind.rs`) accept only `SortedSetBPTree`, and
-        // `SortedSetKind::upgrade` deliberately does not convert
-        // `SortedSetListpack`. A zset compacted here would answer WRONGTYPE to
-        // every zset command on the mutable dispatch path -- ZADD included --
-        // after the very restart that compacted it. The zset arm belongs with
-        // the write-side upgrade (moon#787, the ZADD-listpack change), and
-        // `small_zset_is_left_in_full_form_until_the_write_path_accepts_a_listpack`
-        // below is the tripwire that makes lifting the exclusion a decision.
+        // ── sorted set ────────────────────────────────────────────────────
+        // Lands together with the write-side upgrade arm
+        // (`SortedSetKind::upgrade` now converts `SortedSetListpack`, moon#787):
+        // before that arm existed, a zset compacted here would have answered
+        // WRONGTYPE to every zset command on the mutable dispatch path after
+        // the very restart that compacted it. Only the MEMBER is measured
+        // against the element threshold, matching Redis
+        // (`zset-max-listpack-value` applies to members) and the live ZADD
+        // path. Score order, from the tree: the layout Redis's own listpack
+        // keeps, and one a reader can rely on nothing about (reads sort).
+        RedisValue::SortedSetBPTree { members, tree }
+            if members.len() <= LISTPACK_MAX_ENTRIES && members.keys().all(|m| fits(m)) =>
+        {
+            let mut lp = crate::storage::listpack::Listpack::new();
+            let mut rendered = crate::storage::zset_score::ScoreBuf::new();
+            for (score, member) in tree.iter() {
+                lp.push_back(member);
+                crate::storage::zset_score::render_score(score.0, &mut rendered);
+                lp.push_back(&rendered);
+            }
+            RedisValue::SortedSetListpack(lp)
+        }
+
+        // Everything else passes through untouched: the full forms past their
+        // thresholds, `HashWithTtl`, streams, strings.
         other => other,
     }
 }
@@ -1157,30 +1172,22 @@ mod tests {
         );
     }
 
-    /// Zsets are deliberately NOT compacted on reload -- and this pins it so
-    /// lifting the exclusion is a visible decision rather than an accident.
-    ///
-    /// On main, `SortedSetKind::project_mut` / `project_ref`
-    /// (`src/storage/db_kind.rs`) accept only `SortedSetBPTree`, and
-    /// `SortedSetKind::upgrade` explicitly leaves `SortedSetListpack` alone.
-    /// A zset compacted here would therefore answer WRONGTYPE to every zset
-    /// command on the mutable dispatch path -- ZADD included -- after the very
-    /// restart that compacted it. `SortedSetListpack` is unreachable from every
-    /// load path today (`value_codec`, `redis_rdb`, DUMP/RESTORE all rebuild
-    /// the full form), so this arm would CREATE that hazard, not inherit it.
-    ///
-    /// The zset arm must land together with the write-side upgrade arm
-    /// (moon#787 -- the ZADD-listpack change); that is the commit at which this
-    /// assertion flips to `"listpack"`. Until then the 20.5x zset memory win is
-    /// restart-transient, and this test says so out loud.
+    /// The tripwire pinned in the restart fix
+    /// (`small_zset_is_left_in_full_form_until_the_write_path_accepts_a_listpack`)
+    /// flips here, in the same change that teaches `SortedSetKind::upgrade`
+    /// to convert `SortedSetListpack`: a reloaded small zset is a listpack,
+    /// with every member AND every score intact. Scores round-trip as text
+    /// (`zset_score::render_score` / `parse_score`), so a non-integral and a
+    /// negative one are included on purpose.
     #[test]
-    fn small_zset_is_left_in_full_form_until_the_write_path_accepts_a_listpack() {
+    fn small_zset_round_trips_back_to_listpack_with_scores_intact() {
         let mut members = HashMap::new();
         let mut tree = BPTree::new();
-        for i in 0..5 {
+        let scores = [-1.5, 0.0, 2.0, 1e3, 0.1 + 0.2];
+        for (i, sc) in scores.iter().enumerate() {
             let m = Bytes::from(format!("m{i}"));
-            members.insert(m.clone(), i as f64);
-            tree.insert(OrderedFloat(i as f64), m);
+            members.insert(m.clone(), *sc);
+            tree.insert(OrderedFloat(*sc), m);
         }
         let out = round_trip(&RedisValueRef::SortedSetBPTree {
             members: &members,
@@ -1188,10 +1195,65 @@ mod tests {
         });
         assert_eq!(
             out.encoding_name(),
-            "skiplist",
-            "a reloaded zset must stay in the full form while the mutable zset \
-             path rejects SortedSetListpack -- see SortedSetKind::project_mut"
+            "listpack",
+            "a 5-member zset must come back as a listpack, matching what redis \
+             preserves across DEBUG RELOAD"
         );
+        match &out {
+            RedisValue::SortedSetListpack(lp) => {
+                let got: std::collections::HashMap<Vec<u8>, f64> = lp
+                    .iter_pairs()
+                    .map(|(m, s)| {
+                        (
+                            m.as_bytes(),
+                            s.as_score().expect("a re-derived score must parse"),
+                        )
+                    })
+                    .collect();
+                assert_eq!(got.len(), 5, "all five members must survive");
+                for (m, sc) in &members {
+                    assert_eq!(
+                        got.get(m.as_ref()).map(|v| v.to_bits()),
+                        Some(sc.to_bits()),
+                        "member {m:?} must round-trip with its exact score"
+                    );
+                }
+            }
+            other => panic!("expected SortedSetListpack, got {}", other.encoding_name()),
+        }
+    }
+
+    #[test]
+    fn zset_past_the_entry_threshold_stays_a_skiplist() {
+        let mut members = HashMap::new();
+        let mut tree = BPTree::new();
+        for i in 0..=crate::storage::db::LISTPACK_MAX_ENTRIES {
+            let m = Bytes::from(format!("m{i:04}"));
+            members.insert(m.clone(), i as f64);
+            tree.insert(OrderedFloat(i as f64), m);
+        }
+        let out = round_trip(&RedisValueRef::SortedSetBPTree {
+            members: &members,
+            tree: &tree,
+        });
+        assert_eq!(out.encoding_name(), "skiplist");
+    }
+
+    #[test]
+    fn zset_with_an_oversized_member_stays_a_skiplist() {
+        let mut members = HashMap::new();
+        let mut tree = BPTree::new();
+        let big = Bytes::from(vec![
+            b'x';
+            crate::storage::db::LISTPACK_MAX_ELEMENT_SIZE + 1
+        ]);
+        members.insert(big.clone(), 1.0);
+        tree.insert(OrderedFloat(1.0), big);
+        let out = round_trip(&RedisValueRef::SortedSetBPTree {
+            members: &members,
+            tree: &tree,
+        });
+        assert_eq!(out.encoding_name(), "skiplist");
     }
 
     #[test]

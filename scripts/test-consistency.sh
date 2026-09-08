@@ -609,6 +609,47 @@ assert_both "ZRANGEBYSCORE 1 3" ZRANGEBYSCORE z:test 1 3
 both ZINCRBY z:test 10 "delta"
 assert_both "ZINCRBY then ZSCORE" ZSCORE z:test delta
 
+# OBJECT ENCODING parity for sorted sets (moon#787). moon reported `skiplist`
+# for a small zset from its first member while Redis reports `listpack`:
+# `SortedSetListpack` was wired end to end but no accessor ever produced one
+# that survived. No row here probed zset encoding, and the unit test
+# `test_object_encoding_sorted_set` ASSERTED the divergence, so it went unseen.
+both ZADD z:enc:lp 1 a 2 b 3 c
+assert_both "OBJECT ENCODING small zset"        OBJECT ENCODING z:enc:lp
+# Scores must round-trip through the listpack as their canonical rendering:
+# `3.0` reads back as `3`, `1e3` as `1000`, `3.5000` as `3.5`.
+both ZADD z:enc:scores 3.0 m 1e3 n 3.5000 o inf p -inf q
+assert_both "listpack zset ZSCORE 3.0"          ZSCORE z:enc:scores m
+assert_both "listpack zset ZSCORE 1e3"          ZSCORE z:enc:scores n
+assert_both "listpack zset ZSCORE 3.5000"       ZSCORE z:enc:scores o
+assert_both "listpack zset ZSCORE inf"          ZSCORE z:enc:scores p
+assert_both "listpack zset ZRANGE WITHSCORES"   ZRANGE z:enc:scores 0 -1 WITHSCORES
+# A repeated member is an in-place UPDATE and must not promote or grow the set.
+both ZADD z:enc:lp 10 a
+assert_both "duplicate ZADD returns 0"          ZADD z:enc:lp 10 a
+assert_both "OBJECT ENCODING after duplicate"   OBJECT ENCODING z:enc:lp
+assert_both "ZRANGE after duplicate"            ZRANGE z:enc:lp 0 -1 WITHSCORES
+# A bad score anywhere is all-or-nothing on both (moon#814/#820): the key is
+# not created and the valid prefix is not written.
+assert_both "ZADD bad score is an error"        ZADD z:enc:bad 1 a 2 b notafloat c
+assert_both "ZADD bad score creates no key"     EXISTS z:enc:bad
+assert_both "ZADD bad score on listpack errors" ZADD z:enc:lp 4 d notafloat e
+assert_both "ZADD bad score writes no prefix"   ZCARD z:enc:lp
+# Exactly zset-max-listpack-entries (128) members is STILL a listpack; one
+# more promotes to a skiplist on both. One ZADD per step, not 129 — each
+# `both` spawns two redis-cli processes.
+both ZADD z:enc:big $(seq 1 128 | awk '{print $1, "m"$1}')
+assert_both "OBJECT ENCODING zset at threshold"   OBJECT ENCODING z:enc:big
+both ZADD z:enc:big 129 m129
+assert_both "OBJECT ENCODING zset past threshold" OBJECT ENCODING z:enc:big
+assert_both "ZCARD zset past threshold"           ZCARD z:enc:big
+# A member longer than zset-max-listpack-value (64) forces promotion too;
+# a member of exactly 64 does not.
+both ZADD z:enc:bigval 1 short 2 "$(printf 'x%.0s' $(seq 1 65))"
+assert_both "OBJECT ENCODING zset oversized member" OBJECT ENCODING z:enc:bigval
+both ZADD z:enc:val64 1 "$(printf 'x%.0s' $(seq 1 64))"
+assert_both "OBJECT ENCODING zset 64-byte member"   OBJECT ENCODING z:enc:val64
+
 # ===========================================================================
 # 9b. Command parity: BITFIELD_RO / SORT_RO / GEORADIUS_RO / GEORADIUSBYMEMBER_RO
 # ===========================================================================

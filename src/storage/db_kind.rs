@@ -17,6 +17,8 @@ use crate::storage::entry::SetValue;
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 
+use ordered_float::OrderedFloat;
+
 use super::bptree::BPTree;
 use super::compact_value::{CompactValue, RedisValueRef};
 use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef, StreamRef};
@@ -298,6 +300,40 @@ impl OwnedKind for SetKind {
 
 // ── Sorted set ──────────────────────────────────────────────────────────
 
+/// Materialise a `SortedSetListpack`'s `[member, score, …]` pairs into the
+/// `(members, tree)` pair of the `SortedSetBPTree` encoding.
+///
+/// Shared by [`SortedSetKind::upgrade`] and
+/// `Database::upgrade_zset_listpack_to_bptree` so the promotion has exactly
+/// one implementation. An unparseable score means in-memory corruption (the
+/// only writers are the `ZADD` listpack path and the RDB re-derivation, both
+/// through `zset_score::render_score`); this is a conversion with no way to
+/// report an error, so it keeps the member at 0.0 and logs rather than
+/// dropping data on the floor.
+pub(crate) fn zset_listpack_to_bptree(
+    lp: &super::listpack::Listpack,
+) -> (HashMap<Bytes, f64>, BPTree) {
+    let mut tree = BPTree::new();
+    let mut members: HashMap<Bytes, f64> = HashMap::with_capacity(lp.len() / 2);
+    for (member_ref, score_ref) in lp.iter_pair_refs() {
+        let member = Bytes::from(member_ref.to_vec());
+        let score = match score_ref.as_score() {
+            Some(s) => s,
+            None => {
+                tracing::error!("zset listpack holds an unparseable score; keeping member at 0.0");
+                0.0
+            }
+        };
+        // Defensive: the writer rejects duplicates, but a corrupt listpack
+        // must not leave `members` and `tree` disagreeing on cardinality.
+        if let Some(old) = members.insert(member.clone(), score) {
+            tree.remove(OrderedFloat(old), &member);
+        }
+        tree.insert(OrderedFloat(score), member);
+    }
+    (members, tree)
+}
+
 impl ValueKind for SortedSetKind {
     type Ref<'a> = SortedSetRef<'a>;
 
@@ -333,31 +369,49 @@ impl OwnedKind for SortedSetKind {
         Entry::new_sorted_set_bptree()
     }
 
-    /// Upgrade the legacy `SortedSet` (BTreeMap) form to `SortedSetBPTree`.
-    /// `SortedSetListpack` is deliberately NOT upgraded here — its upgrade
-    /// path lives in the zset command layer (same as the hand-written
-    /// accessor this replaces).
+    /// Upgrade a compact or legacy sorted-set encoding to `SortedSetBPTree`.
+    ///
+    /// Two sources: the legacy `SortedSet` (BTreeMap) form, and — since
+    /// moon#787 made `ZADD` produce them — `SortedSetListpack`. The listpack
+    /// arm is the safety net for the whole zset command surface: only `ZADD`
+    /// mutates a listpack in place, so every OTHER command reaches the value
+    /// through `get_or_create` / `get_promoted`, both of which call this.
+    /// Without the arm those commands would see `project_mut` fail and answer
+    /// WRONGTYPE on a perfectly good zset. Promotion is one-way, matching
+    /// Redis: a zset that leaves the listpack encoding never returns to it —
+    /// which is also the moon#832 ceiling: any zset command on the mutable
+    /// dispatch path, reads included, flattens the listpack on first touch.
     fn upgrade(entry: &mut Entry) -> isize {
         if !matches!(
             entry.value.as_redis_value_mut(),
-            Some(RedisValue::SortedSet { .. })
+            Some(RedisValue::SortedSet { .. }) | Some(RedisValue::SortedSetListpack(_))
         ) {
             return 0;
         }
         // Measured on the whole `CompactValue` because the conversion below
         // replaces it wholesale rather than the inner `RedisValue`.
         let before = entry.value.estimate_memory();
-        if let Some(RedisValue::SortedSet { members, scores }) = entry.value.as_redis_value_mut() {
-            let mut tree = BPTree::new();
-            let new_members = std::mem::take(members);
-            let old_scores = std::mem::take(scores);
-            for ((score, member), ()) in *old_scores {
-                tree.insert(score, member);
+        match entry.value.as_redis_value_mut() {
+            Some(RedisValue::SortedSet { members, scores }) => {
+                let mut tree = BPTree::new();
+                let new_members = std::mem::take(members);
+                let old_scores = std::mem::take(scores);
+                for ((score, member), ()) in *old_scores {
+                    tree.insert(score, member);
+                }
+                entry.value = CompactValue::from_redis_value(RedisValue::SortedSetBPTree {
+                    tree: Box::new(tree),
+                    members: new_members,
+                });
             }
-            entry.value = CompactValue::from_redis_value(RedisValue::SortedSetBPTree {
-                tree: Box::new(tree),
-                members: new_members,
-            });
+            Some(RedisValue::SortedSetListpack(lp)) => {
+                let (members, tree) = zset_listpack_to_bptree(lp);
+                entry.value = CompactValue::from_redis_value(RedisValue::SortedSetBPTree {
+                    tree: Box::new(tree),
+                    members: Box::new(members),
+                });
+            }
+            _ => {}
         }
         entry.value.estimate_memory() as isize - before as isize
     }

@@ -47,6 +47,14 @@ impl ListpackEntry {
     pub fn to_bytes(&self) -> Bytes {
         Bytes::from(self.as_bytes())
     }
+
+    /// Interpret this entry as a sorted-set score. See [`ListpackRef::as_score`].
+    pub fn as_score(&self) -> Option<f64> {
+        match self {
+            ListpackEntry::Integer(v) => Some(*v as f64),
+            ListpackEntry::String(s) => crate::storage::zset_score::parse_score(s),
+        }
+    }
 }
 
 /// A borrowed view of one listpack entry.
@@ -82,6 +90,23 @@ impl ListpackRef<'_> {
                 let mut buf = itoa::Buffer::new();
                 buf.format(*v).as_bytes() == other
             }
+        }
+    }
+
+    /// Interpret this entry as a sorted-set score, without allocating.
+    ///
+    /// A zset listpack stores `[member, score, member, score, …]` with the
+    /// score as its canonical decimal rendering
+    /// (`storage::zset_score::render_score`), which the listpack re-encodes
+    /// as an integer entry when it is integral — so an `Integer` here IS a
+    /// score, exactly (every integer that came out of rendering an `f64` is
+    /// representable as one). `None` means the bytes are not a float at all:
+    /// in-memory corruption, since every writer goes through `render_score`.
+    #[inline]
+    pub fn as_score(&self) -> Option<f64> {
+        match self {
+            ListpackRef::Integer(v) => Some(*v as f64),
+            ListpackRef::Str(s) => crate::storage::zset_score::parse_score(s),
         }
     }
 
