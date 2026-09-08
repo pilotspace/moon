@@ -5,7 +5,7 @@ use crate::protocol::{Frame, FrameVec};
 use crate::storage::Database;
 use crate::storage::db::{
     HashTtlCond, LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, hash_field_cost,
-    hash_field_cost_len,
+    hash_field_cost_len, listpack_batch_fits,
 };
 
 use crate::command::helpers::{all_args_are_bytes, err_wrong_args, extract_bytes, ok};
@@ -40,7 +40,10 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
             .unwrap_or(false)
     });
 
-    if !has_large_element {
+    // moon#865: refuse the listpack path for a batch large enough to wrap the
+    // header's u16 element count. The upgrade check below runs after the push
+    // loop, which cannot stop a wrap that happens inside it.
+    if !has_large_element && listpack_batch_fits(args.len() - 1) {
         // Try listpack path for small hashes. HashWithTtl returns Ok(None) here
         // (get_or_create_hash_listpack is now HashWithTtl-aware), so it falls
         // through to the full HashMap path — correct, because TTL'd hashes never
@@ -223,7 +226,10 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
             .unwrap_or(false)
     });
 
-    if !has_large_element {
+    // moon#865: refuse the listpack path for a batch large enough to wrap the
+    // header's u16 element count. The upgrade check below runs after the push
+    // loop, which cannot stop a wrap that happens inside it.
+    if !has_large_element && listpack_batch_fits(args.len() - 1) {
         // HashWithTtl returns Ok(None), falling through — same as HSET.
         match db.get_or_create_hash_listpack(key) {
             Ok(Some(lp)) => {
