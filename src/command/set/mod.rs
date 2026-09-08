@@ -1128,3 +1128,76 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod sadd_listpack_batch_tests {
+    use super::*;
+    use crate::storage::Database;
+
+    fn bs(s: &[u8]) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s))
+    }
+
+    /// moon#865, the set arm. Before the batch guard this branch pushed every
+    /// member into the listpack and only then compared the entry count with
+    /// LISTPACK_MAX_ENTRIES, so a single large SADD wrapped the header's u16
+    /// counter: `SADD` replied 70000 and `SCARD` replied 4464 (= 70000 -
+    /// 65536), with the write already acknowledged.
+    #[test]
+    fn sadd_one_call_past_u16_keeps_every_member() {
+        let mut db = Database::new();
+        const N: usize = 70_000;
+        let owned: Vec<Vec<u8>> = (0..N).map(|i| format!("m{i:07}").into_bytes()).collect();
+        let mut args: Vec<Frame> = Vec::with_capacity(N + 1);
+        args.push(bs(b"big"));
+        args.extend(owned.iter().map(|m| bs(m)));
+
+        assert_eq!(
+            sadd(&mut db, &args),
+            Frame::Integer(N as i64),
+            "SADD under-reported the members it accepted"
+        );
+        assert_eq!(
+            scard(&mut db, &[bs(b"big")]),
+            Frame::Integer(N as i64),
+            "SCARD lost members to the u16 wrap"
+        );
+        assert_eq!(
+            sismember(&mut db, &[bs(b"big"), bs(&owned[N - 1])]),
+            Frame::Integer(1),
+            "last member unreachable"
+        );
+    }
+
+    /// The guard must not disable the encoding it protects: a batch that
+    /// belongs in a listpack must still land in one, and repeated small calls
+    /// must still accumulate correctly past the ceiling.
+    #[test]
+    fn small_batches_still_reach_the_listpack_and_accumulate() {
+        for n in [1usize, 8, 128, 129] {
+            let mut db = Database::new();
+            let owned: Vec<Vec<u8>> = (0..n).map(|i| format!("m{i:05}").into_bytes()).collect();
+            let mut args: Vec<Frame> = Vec::with_capacity(n + 1);
+            args.push(bs(b"s"));
+            args.extend(owned.iter().map(|m| bs(m)));
+            assert_eq!(sadd(&mut db, &args), Frame::Integer(n as i64), "SADD n={n}");
+            assert_eq!(
+                scard(&mut db, &[bs(b"s")]),
+                Frame::Integer(n as i64),
+                "SCARD n={n}"
+            );
+        }
+
+        let mut db = Database::new();
+        for c in 0..700 {
+            let owned: Vec<Vec<u8>> = (0..100)
+                .map(|i| format!("m{:07}", c * 100 + i).into_bytes())
+                .collect();
+            let mut args: Vec<Frame> = Vec::with_capacity(101);
+            args.push(bs(b"acc"));
+            args.extend(owned.iter().map(|m| bs(m)));
+            sadd(&mut db, &args);
+        }
+        assert_eq!(scard(&mut db, &[bs(b"acc")]), Frame::Integer(70_000));
+    }
+}

@@ -119,7 +119,12 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
     let has_large_member = args[1..]
         .iter()
         .any(|a| extract_bytes(a).is_some_and(|b| b.len() > LISTPACK_MAX_ELEMENT_SIZE));
-    if !has_large_member {
+    // moon#865: a batch large enough to wrap the listpack header's u16
+    // element count must not enter the listpack path. The upgrade check runs
+    // AFTER the push loop below, which cannot stop a wrap that happens inside
+    // it -- measured on this branch before the guard, `SADD` of 70,000 members
+    // replied 70000 and `SCARD` then replied 4464.
+    if !has_large_member && listpack_batch_fits(args.len() - 1) {
         match db.get_or_create_set_listpack(key) {
             Ok(Some(lp)) => {
                 let mut added = 0i64;
