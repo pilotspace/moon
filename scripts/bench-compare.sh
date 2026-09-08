@@ -77,11 +77,21 @@ cleanup() {
 trap cleanup EXIT
 
 parse_rps() {
+    # Anchor on the POSITION of "requests per second" and take the LAST match.
+    #
+    # Two ways the obvious parser lies, both measured (2026-09-08):
+    #   * `-t lrange_100` prints TWO "requests per second" lines -- the LPUSH
+    #     used to seed the list, then the LRANGE. Taking the first match
+    #     reported the seeding rate under the LRANGE label, which every LRANGE
+    #     row this script has ever printed did. Hence `last`, not first.
+    #   * scanning for the first numeric FIELD picks up literals out of the
+    #     echoed command: `zadd z:__rand_int__ 1 m:__rand_int__` parsed as
+    #     1 rps. Hence position-anchored, not value-sniffed.
     tr '\r' '\n' \
-        | awk '/[Rr]equests per second/ { for (i=1; i<=NF; i++) { gsub(/,/, "", $i); if ($i+0 == $i && $i > 0) { print $i; exit } } }' \
-        | head -1 \
-        || sed -n 's/.*[[:space:]]\([0-9][0-9.]*\)[[:space:]]*requests per second.*/\1/p' \
-        | sed 's/,//g' | tail -1
+        | awk '{
+            for (i = 1; i <= NF; i++)
+                if ($i == "requests" && $(i+1) == "per") { v = $(i-1); gsub(/,/, "", v); last = v }
+          } END { if (last != "") print last }'
 }
 
 bench() {
