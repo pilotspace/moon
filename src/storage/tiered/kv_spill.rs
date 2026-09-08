@@ -1195,25 +1195,33 @@ mod tests {
         assert_eq!(index.referenced_file_count(), 2);
         assert_eq!(index.pending_unlink_len(), 0);
 
-        // Now the same shape with 301 holding ONLY the superseded key: it
-        // must come back with zero refs and queued for unlink.
+        // Second shape — a file that loses ALL its keys. 303 holds only
+        // `gone`, which 304 re-spills, so 303 must rebuild with zero live
+        // refs and land in `pending_unlink`. That is the zero-ref transition
+        // the old per-key loop produced via `ref_dec`, and the one the bulk
+        // build has to reconstruct from the finished map rather than observe.
         let manifest_path2 = shard_dir.join("shard2.manifest");
         let mut m2 = ShardManifest::create(&manifest_path2).unwrap();
-        for file_id in [301u64, 302u64] {
-            let byte_size = std::fs::metadata(
-                shard_dir
-                    .join("data")
-                    .join(format!("heap-{file_id:06}.mpf")),
-            )
-            .unwrap()
-            .len();
+        for (file_id, keys) in [(303u64, vec!["gone"]), (304u64, vec!["gone", "kept"])] {
+            let entries: Vec<SpillEntry> = keys
+                .iter()
+                .map(|k| SpillEntry {
+                    key: Bytes::from(k.to_string()),
+                    value_bytes: Bytes::from(format!("v-from-{file_id}")),
+                    value_type: ValueType::String,
+                    flags: 0,
+                    ttl_ms: None,
+                })
+                .collect();
+            let batch = build_kv_spill_batch(&entries, file_id).unwrap();
+            let byte_size = write_kv_spill_batch(shard_dir, file_id, &batch).unwrap();
             m2.add_file(FileEntry {
                 file_id,
                 file_type: PageType::KvLeaf as u8,
                 status: FileStatus::Active,
                 tier: StorageTier::Hot,
                 page_size_log2: 12,
-                page_count: (byte_size / 4096) as u32,
+                page_count: batch.pages.len() as u32,
                 byte_size,
                 created_lsn: 0,
                 db_index: 0,
@@ -1222,10 +1230,30 @@ mod tests {
             });
         }
         m2.commit().unwrap();
-        // (Same two files; `only-in-301` still lives in 301, so assert the
-        // invariant that actually distinguishes the two builds: identical
-        // resident accounting to a per-key insert loop.)
-        let bulk = ColdIndex::rebuild_from_manifest(shard_dir, &m2);
+
+        // Assert on the PER-DB result, which is what recovery attaches to a
+        // `Database`. The merged `rebuild_from_manifest` wrapper re-inserts
+        // into a fresh index whose map already holds one entry per key, so no
+        // overwrite fires and `pending_unlink` is empty there by construction
+        // — true before this change and after it.
+        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &m2);
+        assert_eq!(per_db.len(), 1, "one db");
+        let bulk = per_db.remove(0).1;
+        assert_eq!(bulk.len(), 2, "`gone` + `kept`");
+        assert_eq!(bulk.lookup(b"gone").map(|l| l.file_id), Some(304));
+        assert_eq!(
+            bulk.referenced_file_count(),
+            1,
+            "303 lost its only key and must hold no live refs"
+        );
+        assert_eq!(
+            bulk.pending_unlink_len(),
+            1,
+            "303 must be queued for unlink, exactly as ref_dec would have queued it"
+        );
+
+        // And the derived accounting must match a per-key insert loop over the
+        // same final contents, byte for byte.
         let mut by_hand = ColdIndex::new();
         for (k, l) in bulk.iter() {
             by_hand.insert(k.clone(), *l);

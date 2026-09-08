@@ -708,8 +708,16 @@ impl ColdIndex {
         // vector, in manifest order. Nothing is inserted into a `BTreeMap`
         // here: an ordered map fed one random-ordered key at a time pays an
         // O(log n) descent plus node splits per key, and that insert loop
-        // measured 50% of this whole function's wall time on a 463k-entry
-        // corpus. Pass 2 replaces it with one sort + one bulk load.
+        // measured 75% of this whole function's wall time on a real 466,912-
+        // entry / 114 MiB spill corpus (file I/O was 13%, the page copy 2%,
+        // the CRC32C verify 3%, entry decode 8%). Pass 2 replaces it with one
+        // sort + one bulk load.
+        //
+        // The cost of that is a transient: this vector holds every recovered
+        // pair (~80 B each) until its db's map is built, on top of the map
+        // itself. Recovery is single-threaded and pre-accept, so the peak is
+        // this shard's alone — but it IS proportional to the cold index, so
+        // see the measured RSS note in `from_pairs_last_wins`.
         let mut per_db: Vec<(usize, Vec<((u64, Bytes), ColdLocation)>)> = Vec::new();
         let data_dir = shard_dir.join("data");
 

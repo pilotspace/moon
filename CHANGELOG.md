@@ -19,12 +19,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `((scan_h48(key), key), ColdLocation)` pairs into a flat per-db vector and
   hands them to `BTreeMap`'s `FromIterator`, which stable-sorts once and
   bulk-loads bottom-up; `file_refs`, `resident_bytes` and `pending_unlink`
-  are derived from the finished map. In-process over that corpus, median of
-  7 interleaved runs: **0.200s -> 0.113s (1.77x)**; end to end (server
-  restart, phase bracketed between the `manifest recovered` and
-  `rebuilt cold index` log lines, fresh corpus copy per leg, min of 3):
-  0.213s -> 0.128s. On a byte-heavy 2.1 GiB / 183,741-entry corpus, where
-  the file scan (I/O + decode) is 84% of the phase, 0.411s -> 0.369s.
+  are derived from the finished map. Measured, interleaved legs, fresh
+  corpus copy per leg:
+  - CPU only (in-process, warm page cache, median of 7):
+    **0.200s -> 0.113s, 1.77x**.
+  - Whole restart phase at scale — a 1,629,070-entry / 6,490-file / 430 MiB
+    corpus, cold cache, bracketed between the `manifest recovered` and
+    `rebuilt cold index` log lines, median of 3 pairs: **3.10s -> 2.44s,
+    1.27x**. Smaller than the CPU figure because at that size file I/O, not
+    the map, is the larger term; every one of the three pairs favoured the
+    new path.
+  - Peak RSS over the same restart, `/usr/bin/time -l`, median of 3:
+    **552 MiB -> 494 MiB (-10.5%)**. The transient pair vector is more than
+    paid for by `bulk_build`'s densely packed B-tree nodes; random insertion
+    leaves them part-full.
+  - Byte-heavy shape (2.1 GiB / 183,741 entries, file scan is 84% of the
+    phase): 0.411s -> 0.369s.
+
   The rebuilt index is byte-identical — same keys, same
   `file_id`/`page_idx`/`slot_idx`/`ttl_ms`/`value_type`, same
   `resident_bytes`, same referenced-file count — because `FromIterator`'s
