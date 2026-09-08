@@ -1341,6 +1341,42 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    // Is the multi-part AOF (appendonlydir/ manifest) the KV authority for this
+    // boot? Exactly when the replay block further down will `db.clear()` every
+    // database and replay it: a manifest exists, and this runtime/shard-count
+    // combination engages that block (single-shard multi-part replay is
+    // monoio-only; multi-shard needs the PerShard layout — any other layout
+    // refuses to start there). When it is, every key the per-shard recovery
+    // below would load into hot RAM (snapshot, WAL KV records, the legacy
+    // `appendonly.aof` / legacy-mode WAL fallback and its hot-shadow demote)
+    // is thrown away by that wipe, so `restore_from_persistence` skips the
+    // load and recovers only what the AOF does not carry (cold index, warm
+    // vector segments, FPI repair, WAL last_lsn). Measured on a 2.2M-key
+    // instance: 13.8 s of snapshot load, a second walk of the same WAL as a
+    // "legacy-mode" fallback, and a 650k-key materialise-then-demote round
+    // trip, all discarded on every boot.
+    let aof_manifest_is_kv_authority = {
+        let manifest_opt = match (config.appendonly.as_str(), persistence_dir.as_deref()) {
+            ("yes", Some(dir)) => {
+                use anyhow::Context;
+                moon::persistence::aof_manifest::AofManifest::load(std::path::Path::new(dir))
+                    .with_context(|| {
+                        format!(
+                            "AOF manifest at {dir}/appendonlydir/ is corrupt; refusing to start \
+                             to avoid data loss. Inspect manually before deleting."
+                        )
+                    })?
+            }
+            _ => None,
+        };
+        manifest_opt.is_some_and(|m| {
+            if num_shards == 1 {
+                cfg!(feature = "runtime-monoio")
+            } else {
+                m.layout == moon::persistence::aof_manifest::AofLayout::PerShard
+            }
+        })
+    };
     let mut shards: Vec<Shard> = (0..num_shards)
         .map(|id| {
             let mut shard = Shard::with_initial_keyspace_hint(
@@ -1361,7 +1397,11 @@ fn main() -> anyhow::Result<()> {
             // fallback (a no-op when no appendonly.aof/snapshot exists).
             if persistence_dir.is_some() || disk_offload_base.is_some() {
                 let recover_dir = persistence_dir.as_deref().unwrap_or(config.dir.as_str());
-                shard.restore_from_persistence(recover_dir, disk_offload_base.as_deref());
+                shard.restore_from_persistence(
+                    recover_dir,
+                    disk_offload_base.as_deref(),
+                    aof_manifest_is_kv_authority,
+                );
             }
             // Initialize cold_index + cold_shard_dir for disk offload
             if let Some(ref offload_base) = disk_offload_base {

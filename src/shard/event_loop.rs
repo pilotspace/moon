@@ -45,6 +45,15 @@ use super::{conn_accept, persistence_tick, spsc_handler, timers};
 /// exactly the pre-F1 behaviour for every task.
 const SHUTDOWN_DRAIN_MAX: Duration = Duration::from_secs(5);
 
+/// Index-definition restore (`recover_indexes_task`): yield to the event loop
+/// after this many definitions so accepted connections get `-LOADING` (or a
+/// PING reply) instead of silence. A definition restore is microseconds once
+/// the per-index sidecar rewrite is gone, so 64 keeps the yield overhead in
+/// the noise while bounding the silent window to well under a millisecond;
+/// a Stack-B manifest load per index (real disk reads) is what makes it
+/// worth yielding at all.
+const RESTORE_YIELD_EVERY: usize = 64;
+
 /// c10k hardening B4: may the experimental io_uring bridge be armed?
 ///
 /// The bridge binds a SECOND `SO_REUSEPORT` listener on the server's own port
@@ -2746,21 +2755,38 @@ async fn recover_indexes_task(
     let mut recovery_state = crate::vector::persistence::recover_v2::RecoveryState::new();
 
     if let (Some(metas), Some(vdir)) = (&metas, &vector_persist_dir) {
-        crate::shard::slice::with_shard(|s| {
-            info!(
-                "Shard {}: restoring {} vector index(es) from sidecar",
-                shard_id,
-                metas.len()
-            );
-            for (meta, weight) in metas {
+        let started = std::time::Instant::now();
+        info!(
+            "Shard {}: restoring {} vector index(es) from sidecar",
+            shard_id,
+            metas.len()
+        );
+        for (i, (meta, weight)) in metas.iter().enumerate() {
+            crate::shard::slice::with_shard(|s| {
                 recovery_state.create_index(&mut s.vector_store, vdir, meta);
                 if *weight != 1.0 {
                     if let Some(idx) = s.vector_store.get_index_mut(&meta.name) {
                         idx.set_compaction_weight(*weight);
                     }
                 }
+            });
+            // Hand the thread back every few definitions so the listener can
+            // answer PING / `-LOADING` while thousands of them load, instead
+            // of leaving accepted connections silent for the whole phase.
+            if i % RESTORE_YIELD_EVERY == RESTORE_YIELD_EVERY - 1 {
+                crate::runtime::cooperative_yield().await;
             }
-        });
+        }
+        // ONE sidecar write for the whole restore. `create_index` used to
+        // rewrite it (two fsyncs) once per index — a 2,793-index store spent
+        // this entire phase in fsync (see `VectorStore::create_index_unsaved`).
+        crate::shard::slice::with_shard(|s| s.vector_store.save_index_meta_sidecar());
+        info!(
+            "Shard {}: restored {} vector index definition(s) in {:.2?}",
+            shard_id,
+            metas.len(),
+            started.elapsed()
+        );
     }
 
     // Reattach WARM-tier segments Stack A's v3 recovery discovered
@@ -2816,13 +2842,14 @@ async fn recover_indexes_task(
     // Restore text indexes from sidecar metadata.
     #[cfg(feature = "text-index")]
     if let Some(ref text_metas) = text_metas {
-        crate::shard::slice::with_shard(|s| {
-            info!(
-                "Shard {}: restoring {} text index(es) from sidecar",
-                shard_id,
-                text_metas.len()
-            );
-            for meta in text_metas {
+        let started = std::time::Instant::now();
+        info!(
+            "Shard {}: restoring {} text index(es) from sidecar",
+            shard_id,
+            text_metas.len()
+        );
+        for (i, meta) in text_metas.iter().enumerate() {
+            crate::shard::slice::with_shard(|s| {
                 let mut text_index = crate::text::store::TextIndex::new(
                     meta.name.clone(),
                     meta.key_prefixes.clone(),
@@ -2833,7 +2860,10 @@ async fn recover_indexes_task(
                 // restart doesn't silently re-home a restored text
                 // index to db 0.
                 text_index.db_index = meta.db_index;
-                if let Err(e) = s.text_store.create_index(meta.name.clone(), text_index) {
+                // `restore_index`, not `create_index`: the latter rewrote the
+                // sidecar (two fsyncs) per index — 4,191 indexes spent this
+                // whole phase in fsync. One write follows the loop.
+                if let Err(e) = s.text_store.restore_index(meta.name.clone(), text_index) {
                     tracing::warn!(
                         "Shard {}: failed to restore text index '{}': {}",
                         shard_id,
@@ -2841,8 +2871,11 @@ async fn recover_indexes_task(
                         e
                     );
                 }
+            });
+            if i % RESTORE_YIELD_EVERY == RESTORE_YIELD_EVERY - 1 {
+                crate::runtime::cooperative_yield().await;
             }
-        });
+        }
 
         // Kernel M4 (task #50): seed each restored text index's term
         // dictionaries (and, where the sidecar validates cleanly,
@@ -2853,8 +2886,15 @@ async fn recover_indexes_task(
         // seeding after the rescan (or not at all) is exactly the
         // stale-id-space corruption this closes.
         crate::shard::slice::with_shard(|s| {
+            s.text_store.save_index_meta_sidecar();
             s.text_store.load_term_fst_sidecars();
         });
+        info!(
+            "Shard {}: restored {} text index definition(s) in {:.2?}",
+            shard_id,
+            text_metas.len(),
+            started.elapsed()
+        );
     }
 
     // Auto-reindex existing HASH keys that match vector or text index prefixes.
@@ -2869,22 +2909,30 @@ async fn recover_indexes_task(
             std::time::Duration::from_secs(10),
             std::time::Instant::now(),
         );
+        // "Does ANY restored index cover this key?" answered in O(key length)
+        // per key. The walk this replaces tested every prefix of every index
+        // for every key of the keyspace: O(keys x indexes), ~15 billion
+        // `starts_with` for a 2.2M-key store with 7k indexes — minutes of
+        // startup before one document was re-indexed. Same semantics as that
+        // walk: an index with no prefixes is not matched here.
+        let mut rescan_prefixes = crate::util::prefix_map::PrefixMap::new();
+        if let Some(ms) = metas.as_ref() {
+            for (m, _w) in ms {
+                rescan_prefixes.insert(&m.name, &m.key_prefixes);
+            }
+        }
+        if let Some(ms) = text_metas.as_ref() {
+            for m in ms {
+                rescan_prefixes.insert(&m.name, &m.key_prefixes);
+            }
+        }
         for db_idx in 0..db_count {
             let collect_matching =
                 |db: &crate::storage::Database| -> Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> {
                     let mut matching: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = Vec::new();
                     for (key, entry) in db.data().iter() {
                         let key_bytes = key.as_bytes();
-                        let matches_vector = metas.as_ref().is_some_and(|ms| {
-                            ms.iter().any(|(m, _w)| {
-                                m.key_prefixes.iter().any(|p| key_bytes.starts_with(p))
-                            })
-                        });
-                        let matches_text = text_metas.as_ref().is_some_and(|ms| {
-                            ms.iter()
-                                .any(|m| m.key_prefixes.iter().any(|p| key_bytes.starts_with(p)))
-                        });
-                        if !matches_vector && !matches_text {
+                        if !rescan_prefixes.any_matching(key_bytes) {
                             continue;
                         }
                         let mut args = Vec::new();
@@ -2923,33 +2971,51 @@ async fn recover_indexes_task(
                     }
                     matching
                 };
+            let scan_started = std::time::Instant::now();
             let matching =
                 { crate::shard::slice::with_shard_db(db_idx, |db| collect_matching(db)) };
 
             if !matching.is_empty() {
                 let total_in_db = matching.len();
+                // The scan is its own phase: it used to be silently folded
+                // into the first progress line's "elapsed", which is how a
+                // live instance's cumulative keys/s read 10x below its
+                // real reconcile rate.
+                info!(
+                    "Shard {}: recovery scanned db {}: {} key(s) match an index prefix ({:.2?})",
+                    shard_id,
+                    db_idx,
+                    total_in_db,
+                    scan_started.elapsed()
+                );
                 // moon#476: `with_shard` takes a SYNCHRONOUS closure, so
-                // an `.await` cannot live inside it. Chunking lets the
-                // task yield BETWEEN chunks while each chunk still runs
+                // an `.await` cannot live inside it. Slicing lets the
+                // task yield BETWEEN slices while each slice still runs
                 // inside exactly one `with_shard` — which is also what
                 // `recover_v2`'s re-entrancy rule requires.
                 //
-                // 1024 keys is ~12 ms of reconcile at the measured
-                // ~12 us/key: short enough that a client's command is
-                // not visibly delayed, long enough that the yield's cost
-                // stays in the noise.
-                const YIELD_CHUNK: usize = 1024;
+                // The slice is TIME-bounded, not count-bounded. A fixed
+                // 1024-key chunk was ~12 ms at the ~12 us/key this was
+                // tuned on, but a key that matches many indexes (or
+                // carries a long document) costs milliseconds each — a
+                // live instance measured ~10 ms/key, turning each chunk
+                // into a 10 s silence during which every PING timed out.
+                // `RESCAN_SLICE_BUDGET` caps the silence at roughly one
+                // budget plus one key, whatever the per-key cost.
+                const RESCAN_SLICE_BUDGET: std::time::Duration =
+                    std::time::Duration::from_millis(10);
+                // How often to read the clock inside a slice: 16 keys is
+                // one clock read per ~200 us at the fast end, and the
+                // clock is what bounds the slice at the slow end. Never
+                // coarser than the db itself: a db of a few pathologically
+                // slow keys must still reach the progress line (#546).
+                let clock_stride = total_in_db.clamp(1, 16);
                 let mut done_in_db = 0usize;
-                // How often to read the clock. Capped at 128 so a
-                // million-key db pays ~8k clock reads instead of a
-                // million, but never coarser than the db itself: a db
-                // of 50 pathologically slow keys would otherwise never
-                // reach any fixed stride and stay silent — which is the
-                // exact failure #546 is about.
-                let clock_stride = total_in_db.clamp(1, 128);
-                for chunk in matching.chunks(YIELD_CHUNK) {
+                while done_in_db < total_in_db {
                     crate::shard::slice::with_shard(|s| {
-                        for (key, args) in chunk.iter() {
+                        let slice_started = std::time::Instant::now();
+                        while done_in_db < total_in_db {
+                            let (key, args) = &matching[done_in_db];
                             // B3 dedup rescan: verifies each matching
                             // key against any recovered durable state
                             // (manifest/segment/keymap) before deciding
@@ -2972,9 +3038,20 @@ async fn recover_indexes_task(
                             if done_in_db % clock_stride == 0 {
                                 let now = std::time::Instant::now();
                                 if progress.tick_at(reindexed as u64, now) {
+                                    // Both rates, labelled, plus an ETA from
+                                    // the RECENT one: the cumulative average
+                                    // alone read 10x low on a live instance
+                                    // and turned a 25-minute remainder into
+                                    // a "4 hours, must be wedged" decision.
+                                    // `-1` = unknown (nothing moved yet); a
+                                    // number the reader can act on otherwise.
+                                    let eta_secs = progress
+                                        .eta_secs(done_in_db as u64, total_in_db as u64, now)
+                                        .unwrap_or(-1.0);
                                     info!(
                                         "Shard {}: recovery reconciling db {} \
-                                             key {}/{} ({} total, {:.0} keys/s, \
+                                             key {}/{} ({} total, {:.0} keys/s avg, \
+                                             {:.0} keys/s recent, ETA for this db {:.0}s, \
                                              {:.0}s elapsed)",
                                         shard_id,
                                         db_idx,
@@ -2982,8 +3059,13 @@ async fn recover_indexes_task(
                                         total_in_db,
                                         reindexed,
                                         progress.keys_per_sec(reindexed as u64, now),
+                                        progress.recent_keys_per_sec(reindexed as u64, now),
+                                        eta_secs,
                                         progress.elapsed_secs(now),
                                     );
+                                }
+                                if now.duration_since(slice_started) >= RESCAN_SLICE_BUDGET {
+                                    break;
                                 }
                             }
                         }

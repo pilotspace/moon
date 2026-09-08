@@ -170,10 +170,18 @@ impl Shard {
     /// format freeze — see `restore_from_persistence_v2`).
     ///
     /// Returns total keys loaded (snapshot + AOF/WAL v3 replay).
+    ///
+    /// `kv_authority_elsewhere`: the caller will wipe every database and
+    /// replay the multi-part AOF right after this returns (main.rs), so no
+    /// hot-keyspace load here can survive — snapshot, WAL KV records, and
+    /// the legacy `appendonly.aof` / legacy-mode WAL fallbacks are skipped.
+    /// The cold index, warm vector segments, FPI repair and the WAL's
+    /// `last_lsn` still recover (see `recover_shard_v3_pitr`).
     pub fn restore_from_persistence(
         &mut self,
         persistence_dir: &str,
         disk_offload_dir: Option<&std::path::Path>,
+        kv_authority_elsewhere: bool,
     ) -> usize {
         // If disk-offload was enabled, use v3 recovery protocol.
         //
@@ -192,6 +200,7 @@ impl Shard {
                     &shard_dir,
                     &DispatchReplayEngine::new(),
                     Some(std::path::Path::new(persistence_dir)),
+                    kv_authority_elsewhere,
                 ) {
                     Ok(result) => {
                         info!(
@@ -258,7 +267,7 @@ impl Shard {
         }
 
         // Existing v2 path (unchanged)
-        self.restore_from_persistence_v2(persistence_dir)
+        self.restore_from_persistence_v2(persistence_dir, kv_authority_elsewhere)
     }
 
     /// Legacy recovery path: snapshot load + appendonly.aof (authority) /
@@ -280,15 +289,20 @@ impl Shard {
     /// replayed ONLY when no `appendonly.aof` exists at all (disaster
     /// fallback: partial recovery beats none), with a loud warning about
     /// its partial KV coverage.
-    fn restore_from_persistence_v2(&mut self, persistence_dir: &str) -> usize {
+    fn restore_from_persistence_v2(
+        &mut self,
+        persistence_dir: &str,
+        kv_authority_elsewhere: bool,
+    ) -> usize {
         use crate::persistence::snapshot::shard_snapshot_load;
 
         let dir = std::path::Path::new(persistence_dir);
         let mut total_keys = 0;
 
-        // Load per-shard snapshot
+        // Load per-shard snapshot -- unless the multi-part AOF replay that
+        // follows this pass wipes it anyway (see `restore_from_persistence`).
         let snap_path = dir.join(format!("shard-{}.rrdshard", self.id));
-        if snap_path.exists() {
+        if snap_path.exists() && !kv_authority_elsewhere {
             match shard_snapshot_load(&mut self.databases, &snap_path) {
                 Ok(n) => {
                     info!("Shard {}: loaded {} keys from snapshot", self.id, n);
@@ -321,7 +335,13 @@ impl Shard {
         // AOF is the recovery authority (see doc comment: WAL v3 KV coverage
         // is intentionally partial post-#211, so it must never shadow the AOF).
         let aof_path = dir.join("appendonly.aof");
-        if aof_path.exists() {
+        if kv_authority_elsewhere {
+            info!(
+                "Shard {}: legacy snapshot/appendonly.aof/WAL replay skipped — the \
+                 multi-part AOF is the KV authority and is replayed after this pass",
+                self.id
+            );
+        } else if aof_path.exists() {
             match crate::persistence::aof::replay_aof(
                 &mut self.databases,
                 &aof_path,
@@ -697,7 +717,7 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let mut shard = Shard::new(0, 1, 1, config);
-        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap());
+        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap(), false);
 
         assert_eq!(
             total, 1,
@@ -735,7 +755,7 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let mut shard = Shard::new(0, 1, 1, config);
-        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap());
+        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap(), false);
 
         assert_eq!(
             total, 3,
@@ -758,7 +778,7 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let mut shard = Shard::new(0, 1, 1, config);
-        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap());
+        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap(), false);
 
         assert_eq!(
             total, 2,
@@ -783,7 +803,7 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let mut shard = Shard::new(0, 1, 1, config);
-        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap());
+        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap(), false);
 
         assert_eq!(
             total, 1,

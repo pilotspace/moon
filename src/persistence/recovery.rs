@@ -98,7 +98,7 @@ pub fn recover_shard_v3(
     shard_dir: &Path,
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
 ) -> Result<RecoveryResult, crate::error::MoonError> {
-    recover_shard_v3_with_fallback(databases, shard_id, shard_dir, engine, None)
+    recover_shard_v3_with_fallback(databases, shard_id, shard_dir, engine, None, false)
 }
 
 /// v3 recovery with optional v2 WAL fallback directory.
@@ -113,6 +113,7 @@ pub fn recover_shard_v3_with_fallback(
     shard_dir: &Path,
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
     v2_persistence_dir: Option<&Path>,
+    kv_authority_elsewhere: bool,
 ) -> Result<RecoveryResult, crate::error::MoonError> {
     recover_shard_v3_pitr(
         databases,
@@ -121,6 +122,7 @@ pub fn recover_shard_v3_with_fallback(
         engine,
         v2_persistence_dir,
         None,
+        kv_authority_elsewhere,
     )
 }
 
@@ -138,6 +140,19 @@ pub fn recover_shard_v3_with_fallback(
 ///
 /// `recovery_target_lsn = None` reproduces the classic crash-recovery
 /// behavior (load snapshot, replay all WAL past redo_lsn).
+///
+/// `kv_authority_elsewhere = true` says the caller will WIPE every database
+/// and replay the multi-part AOF after this pass (main.rs's `db.clear()` +
+/// `replay_multi_part`/`replay_per_shard` block). Everything this pass
+/// would load into the hot keyspace — the snapshot, the WAL's KV `Command`
+/// records, the Phase 4b legacy `appendonly.aof` / legacy-mode WAL fallback
+/// and its hot-shadow demote — is then discarded, so it is skipped. What is
+/// NOT in the AOF still recovers unchanged: the cold index, warm vector
+/// segments, orphan classification, FPI torn-page repair, the WAL's
+/// `last_lsn`, and CLOG rollback. Measured on a 2.2M-key instance the
+/// skipped work was 13.8 s of snapshot load, a second full walk of the same
+/// WAL directory as a "legacy-mode" fallback, and a 650k-key hot
+/// materialise-then-demote round trip — all thrown away.
 pub fn recover_shard_v3_pitr(
     databases: &mut [crate::storage::Database],
     shard_id: usize,
@@ -145,6 +160,7 @@ pub fn recover_shard_v3_pitr(
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
     v2_persistence_dir: Option<&Path>,
     recovery_target_lsn: Option<u64>,
+    kv_authority_elsewhere: bool,
 ) -> Result<RecoveryResult, crate::error::MoonError> {
     let mut result = RecoveryResult::default();
 
@@ -207,7 +223,14 @@ pub fn recover_shard_v3_pitr(
     // for legacy v1 or unstamped v2 files). Skipping forces full WAL
     // replay up to the target -- slower but correct.
     let snap_path = shard_dir.join(format!("shard-{}.rrdshard", shard_id));
-    if snap_path.exists() {
+    if snap_path.exists() && kv_authority_elsewhere {
+        info!(
+            "Shard {}: snapshot load skipped — the multi-part AOF is the KV authority \
+             and is replayed after this pass (loading it here was discarded)",
+            shard_id
+        );
+    }
+    if snap_path.exists() && !kv_authority_elsewhere {
         let snapshot_ok = if let Some(target) = recovery_target_lsn {
             match crate::persistence::snapshot::read_snapshot_metadata(&snap_path) {
                 Ok(meta) => {
@@ -283,9 +306,14 @@ pub fn recover_shard_v3_pitr(
                     let seg_dir = vectors_dir.join(format!("segment-{}", entry.file_id));
                     if seg_dir.exists() && seg_dir.join("codes.mpf").exists() {
                         result.warm_segments.push((entry.file_id, seg_dir));
-                        info!(
+                        // Per-segment detail at DEBUG: a store with hundreds
+                        // of segments emitted one formatted INFO line each
+                        // on the boot path; the summary below is the INFO.
+                        tracing::debug!(
                             "Shard {}: warm segment {} found ({}B codes)",
-                            shard_id, entry.file_id, entry.byte_size
+                            shard_id,
+                            entry.file_id,
+                            entry.byte_size
                         );
                     } else {
                         // #546a: RETIRE the entry, do not merely warn about it.
@@ -444,12 +472,19 @@ pub fn recover_shard_v3_pitr(
     // whenever disk-offload spills had written FileCreate records into the
     // WAL: every KV write since the last snapshot was lost on restart.
     let mut kv_commands_replayed = 0usize;
+    let mut kv_commands_skipped = 0usize;
     let wal_dir = shard_dir.join("wal-v3");
     if wal_dir.exists() {
         let mut selected_db = 0usize;
         let on_command = &mut |record: &WalRecord| {
             match record.record_type {
                 WalRecordType::Command => {
+                    if kv_authority_elsewhere {
+                        // The AOF replays this write after this pass; applying
+                        // it here would only be wiped (see the fn docs).
+                        kv_commands_skipped += 1;
+                        return;
+                    }
                     // Parse RESP frames from the serialized command payload.
                     // The payload is RESP-encoded (same format as AOF/WAL v2 blocks).
                     let mut buf = bytes::BytesMut::from(&record.payload[..]);
@@ -671,6 +706,13 @@ pub fn recover_shard_v3_pitr(
                     replay_result.fpi_applied,
                     replay_result.last_lsn
                 );
+                if kv_commands_skipped > 0 {
+                    info!(
+                        "Shard {}: skipped {} WAL v3 KV command record(s) — the multi-part \
+                         AOF is the KV authority and is replayed after this pass",
+                        shard_id, kv_commands_skipped
+                    );
+                }
             }
             Err(e) => {
                 // #452.2: a mid-chain tear must ABORT boot, not degrade to a
@@ -727,7 +769,16 @@ pub fn recover_shard_v3_pitr(
     // keeps the WAL's partial KV view and still skips the AOF (replaying
     // both would double-apply non-idempotent commands). Resolving that needs
     // an AOF-first redesign of Phase 4, tracked in the roadmap.
-    if kv_commands_replayed == 0 {
+    //
+    // `kv_authority_elsewhere`: the multi-part AOF is replayed by the caller
+    // after this pass, over a wiped keyspace. Neither rung below may run
+    // then — the legacy-mode rung in particular re-walks the SAME `wal-v3/`
+    // directory Phase 4 just replayed (when `v2_dir == shard_dir`'s parent)
+    // and materialises every key it finds into hot RAM, only for it to be
+    // demoted right below and then wiped. A 2.2M-key instance logged
+    // "no appendonly.aof found — replayed 2397677 records from legacy-mode
+    // WAL v3" on every boot while holding a perfectly good manifest AOF.
+    if kv_commands_replayed == 0 && !kv_authority_elsewhere {
         if let Some(v2_dir) = v2_persistence_dir {
             let aof_path = v2_dir.join("appendonly.aof");
             if aof_path.exists() {
@@ -801,7 +852,7 @@ pub fn recover_shard_v3_pitr(
     // inert for this one runtime/shard combination. Reconciling here, right
     // after Phase 4b and before Phase 5, covers it the same way regardless
     // of which fallback source (AOF or legacy WAL v3) supplied the replay.
-    if let Some(db0) = databases.first_mut() {
+    if !kv_authority_elsewhere && let Some(db0) = databases.first_mut() {
         let demoted = db0.demote_replayed_cold_shadows();
         if demoted > 0 {
             info!(
@@ -1007,7 +1058,8 @@ mod tests {
         let mut databases = vec![Database::new()];
         let engine = crate::persistence::replay::DispatchReplayEngine::new();
         let result =
-            recover_shard_v3_pitr(&mut databases, 0, &shard_dir, &engine, None, Some(5)).unwrap();
+            recover_shard_v3_pitr(&mut databases, 0, &shard_dir, &engine, None, Some(5), false)
+                .unwrap();
 
         assert_eq!(
             result.commands_replayed, 5,
@@ -1048,8 +1100,8 @@ mod tests {
         let mut dbs_classic = vec![Database::new()];
         let engine = crate::persistence::replay::DispatchReplayEngine::new();
 
-        let pitr =
-            recover_shard_v3_pitr(&mut dbs_pitr, 0, &shard_dir, &engine, None, None).unwrap();
+        let pitr = recover_shard_v3_pitr(&mut dbs_pitr, 0, &shard_dir, &engine, None, None, false)
+            .unwrap();
         // Use a fresh shard dir for the classic side so its control file
         // doesn't reflect the PITR side's state.
         let shard_dir2 = tmp.path().join("shard-0-classic");
@@ -1457,9 +1509,15 @@ mod tests {
 
         let mut databases = vec![Database::new()];
         let engine = crate::persistence::replay::DispatchReplayEngine::new();
-        let result =
-            recover_shard_v3_with_fallback(&mut databases, 0, &shard_dir, &engine, Some(&v2_dir))
-                .unwrap();
+        let result = recover_shard_v3_with_fallback(
+            &mut databases,
+            0,
+            &shard_dir,
+            &engine,
+            Some(&v2_dir),
+            false,
+        )
+        .unwrap();
 
         assert_eq!(
             result.commands_replayed, 2,
@@ -1468,6 +1526,92 @@ mod tests {
              (the WAL shadowed the AOF if this is 5)",
             result.commands_replayed
         );
+    }
+
+    /// `kv_authority_elsewhere`: when main.rs is about to wipe the keyspace
+    /// and replay the multi-part AOF, the snapshot, the WAL's KV records and
+    /// the Phase 4b legacy fallback must all be skipped — every key they
+    /// would load is discarded, and a 2.2M-key store paid ~20 s per boot for
+    /// it. The WAL is still walked (its `last_lsn` is needed), so the
+    /// counters distinguish "walked" from "applied".
+    #[test]
+    fn kv_authority_elsewhere_skips_every_hot_keyspace_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        // A snapshot with one key, a WAL v3 with one KV Command record, and a
+        // legacy dir carrying an appendonly.aof — three hot-keyspace sources.
+        let mut src = vec![Database::new()];
+        src[0].set(
+            b"snap:key",
+            crate::storage::Entry::new_string(bytes::Bytes::from_static(b"v")),
+        );
+        let snap_path = shard_dir.join("shard-0.rrdshard");
+        crate::persistence::snapshot::shard_snapshot_save(0, 1, &src, &snap_path).unwrap();
+
+        let wal_dir = shard_dir.join("wal-v3");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let mut wal_data = make_v3_header(0);
+        write_wal_v3_record(
+            &mut wal_data,
+            7,
+            WalRecordType::Command,
+            b"*3\r\n$3\r\nSET\r\n$7\r\nwal:key\r\n$1\r\nv\r\n",
+        );
+        std::fs::write(wal_dir.join("000000000001.wal"), &wal_data).unwrap();
+
+        let v2_dir = tmp.path().join("legacy");
+        std::fs::create_dir_all(&v2_dir).unwrap();
+        std::fs::write(
+            v2_dir.join("appendonly.aof"),
+            b"*3\r\n$3\r\nSET\r\n$7\r\naof:key\r\n$1\r\nv\r\n",
+        )
+        .unwrap();
+
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+
+        // Control: without the flag all three sources land in the keyspace
+        // (the WAL carried a KV record, so Phase 4b does not engage — the
+        // snapshot and the WAL key are what arrive).
+        let mut control = vec![Database::new()];
+        let r = recover_shard_v3_with_fallback(
+            &mut control,
+            0,
+            &shard_dir,
+            &engine,
+            Some(&v2_dir),
+            false,
+        )
+        .unwrap();
+        assert!(
+            control[0].get(b"snap:key").is_some(),
+            "control: snapshot loaded"
+        );
+        assert!(
+            control[0].get(b"wal:key").is_some(),
+            "control: WAL KV record applied"
+        );
+        assert_eq!(r.commands_replayed, 1);
+        assert_eq!(r.last_lsn, 7);
+
+        // Under test: nothing reaches the keyspace, but the WAL was still
+        // walked (last_lsn) and no fallback rung ran.
+        let mut dbs = vec![Database::new()];
+        let r =
+            recover_shard_v3_with_fallback(&mut dbs, 0, &shard_dir, &engine, Some(&v2_dir), true)
+                .unwrap();
+        assert_eq!(
+            dbs[0].len(),
+            0,
+            "no hot key may be loaded: {:?}",
+            dbs[0].len()
+        );
+        assert_eq!(
+            r.commands_replayed, 0,
+            "skipped KV records are not counted as replayed"
+        );
+        assert_eq!(r.last_lsn, 7, "the WAL is still walked for its last_lsn");
     }
 
     #[test]
@@ -1495,9 +1639,15 @@ mod tests {
 
         let mut databases = vec![Database::new()];
         let engine = crate::persistence::replay::DispatchReplayEngine::new();
-        let result =
-            recover_shard_v3_with_fallback(&mut databases, 0, &shard_dir, &engine, Some(&v2_dir))
-                .unwrap();
+        let result = recover_shard_v3_with_fallback(
+            &mut databases,
+            0,
+            &shard_dir,
+            &engine,
+            Some(&v2_dir),
+            false,
+        )
+        .unwrap();
 
         assert_eq!(
             result.commands_replayed, 3,
@@ -1532,9 +1682,15 @@ mod tests {
 
         let mut databases = vec![Database::new()];
         let engine = crate::persistence::replay::DispatchReplayEngine::new();
-        let result =
-            recover_shard_v3_with_fallback(&mut databases, 0, &shard_dir, &engine, Some(&v2_dir))
-                .unwrap();
+        let result = recover_shard_v3_with_fallback(
+            &mut databases,
+            0,
+            &shard_dir,
+            &engine,
+            Some(&v2_dir),
+            false,
+        )
+        .unwrap();
 
         assert_eq!(
             result.commands_replayed, 5,
@@ -1559,9 +1715,15 @@ mod tests {
 
         let mut databases = vec![Database::new()];
         let engine = crate::persistence::replay::DispatchReplayEngine::new();
-        let result =
-            recover_shard_v3_with_fallback(&mut databases, 0, &shard_dir, &engine, Some(&v2_dir))
-                .unwrap();
+        let result = recover_shard_v3_with_fallback(
+            &mut databases,
+            0,
+            &shard_dir,
+            &engine,
+            Some(&v2_dir),
+            false,
+        )
+        .unwrap();
 
         assert_eq!(
             result.commands_replayed, 3,
@@ -1594,9 +1756,15 @@ mod tests {
 
         let mut databases = vec![Database::new()];
         let engine = crate::persistence::replay::DispatchReplayEngine::new();
-        let result =
-            recover_shard_v3_with_fallback(&mut databases, 0, &shard_dir, &engine, Some(&v2_dir))
-                .unwrap();
+        let result = recover_shard_v3_with_fallback(
+            &mut databases,
+            0,
+            &shard_dir,
+            &engine,
+            Some(&v2_dir),
+            false,
+        )
+        .unwrap();
 
         assert_eq!(
             result.commands_replayed, 1,

@@ -78,6 +78,11 @@ pub(crate) struct RecoveryProgress {
     started: std::time::Instant,
     last: std::time::Instant,
     interval: std::time::Duration,
+    /// `done` as of the last emitted line, and when that line was emitted:
+    /// the window `recent_keys_per_sec` measures over.
+    window_start: std::time::Instant,
+    window_done: u64,
+    last_done: u64,
 }
 
 impl RecoveryProgress {
@@ -86,29 +91,62 @@ impl RecoveryProgress {
             started: now,
             last: now,
             interval,
+            window_start: now,
+            window_done: 0,
+            last_done: 0,
         }
     }
 
     /// Should a progress line be emitted now? Records the emission if so.
     ///
-    /// `_done` is carried for the caller's message only; the decision is time-
-    /// based by design (see the type docs).
-    pub(crate) fn tick_at(&mut self, _done: u64, now: std::time::Instant) -> bool {
+    /// The decision is time-based by design (see the type docs); `done` is
+    /// recorded so the NEXT line can report the rate since this one.
+    pub(crate) fn tick_at(&mut self, done: u64, now: std::time::Instant) -> bool {
         if now.duration_since(self.last) < self.interval {
             return false;
         }
+        self.window_start = self.last;
+        self.window_done = self.last_done;
         self.last = now;
+        self.last_done = done;
         true
     }
 
-    /// Keys per second over the WHOLE run — the number an operator multiplies
-    /// by the keys remaining to decide whether to keep waiting.
+    /// Keys per second over the WHOLE run (cumulative average).
+    ///
+    /// Misleading on its own: a live instance's line read "21 keys/s" while
+    /// consecutive lines showed ~230-345 keys/s, because the run's first
+    /// half hour was the pre-reconcile keyspace scan and the average never
+    /// recovers from it — an operator computing an ETA from it got 4 hours
+    /// for a 25-minute remainder. Always print it next to
+    /// [`Self::recent_keys_per_sec`], labelled.
     pub(crate) fn keys_per_sec(&self, done: u64, now: std::time::Instant) -> f64 {
         let secs = now.duration_since(self.started).as_secs_f64();
         if secs <= 0.0 {
             return 0.0;
         }
         done as f64 / secs
+    }
+
+    /// Keys per second since the previous progress line — the rate the run
+    /// is achieving NOW, which is what an ETA must be built from. Falls back
+    /// to the cumulative rate before the first line has been emitted.
+    pub(crate) fn recent_keys_per_sec(&self, done: u64, now: std::time::Instant) -> f64 {
+        let secs = now.duration_since(self.window_start).as_secs_f64();
+        if secs <= 0.0 || done < self.window_done {
+            return self.keys_per_sec(done, now);
+        }
+        (done - self.window_done) as f64 / secs
+    }
+
+    /// Seconds until `total` at the recent rate; `None` when the rate is 0
+    /// (nothing has moved) so the caller prints "unknown" rather than `inf`.
+    pub(crate) fn eta_secs(&self, done: u64, total: u64, now: std::time::Instant) -> Option<f64> {
+        let rate = self.recent_keys_per_sec(done, now);
+        if rate <= 0.0 {
+            return None;
+        }
+        Some(total.saturating_sub(done) as f64 / rate)
     }
 
     /// Seconds since recovery started, for the progress line.
@@ -188,7 +226,9 @@ impl RecoveryState {
                 load_segments_and_keymap(vector_store, name.as_ref(), &idx_dir, m)
             }
             None => {
-                if let Err(e) = vector_store.create_index(meta.clone()) {
+                // Unsaved on purpose: the caller writes the sidecar once after
+                // every definition is back (see `VectorStore::create_index_unsaved`).
+                if let Err(e) = vector_store.create_index_unsaved(meta.clone()) {
                     warn!(
                         "vector index {}: failed to restore from sidecar: {e}",
                         String::from_utf8_lossy(&name)

@@ -1900,6 +1900,11 @@ pub struct TextStore {
     /// - Counter never wraps in practice (u64::MAX ≈ 1.8 × 10¹⁹ writes).
     /// - Failed writes do NOT bump the counter.
     version_token: AtomicU64,
+    /// `key prefix -> index names`, kept in lock-step with `indexes` by
+    /// `create_index`/`restore_index`/`drop_index`. Answers "which indexes
+    /// cover this key?" in O(key length) instead of O(indexes) — see
+    /// `crate::util::prefix_map`.
+    prefix_map: crate::util::prefix_map::PrefixMap,
 }
 
 impl TextStore {
@@ -1909,6 +1914,7 @@ impl TextStore {
             indexes: HashMap::new(),
             persist_dir: None,
             version_token: AtomicU64::new(0),
+            prefix_map: crate::util::prefix_map::PrefixMap::new(),
         }
     }
 
@@ -1938,7 +1944,10 @@ impl TextStore {
 
     /// Persist current text index metadata to the sidecar file.
     /// No-op if persist_dir is not set (persistence disabled).
-    fn save_index_meta_sidecar(&self) {
+    ///
+    /// `pub` so boot-time recovery can write the sidecar ONCE after
+    /// `restore_index`-ing every definition, instead of once per index.
+    pub fn save_index_meta_sidecar(&self) {
         if let Some(ref dir) = self.persist_dir {
             let metas = self.collect_index_metas();
             if let Err(e) = crate::text::index_persist::save_text_index_metadata(dir, &metas) {
@@ -1973,11 +1982,31 @@ impl TextStore {
 
     /// Create a new text index. Returns Err if the name already exists.
     pub fn create_index(&mut self, name: Bytes, index: TextIndex) -> Result<(), &'static str> {
+        self.restore_index(name, index)?;
+        self.save_index_meta_sidecar();
+        Ok(())
+    }
+
+    /// Register an index definition WITHOUT rewriting the metadata sidecar.
+    ///
+    /// Boot-time recovery re-creates every persisted index from that very
+    /// sidecar; going through `create_index` rewrote it (two `fsync`s via
+    /// `atomic_write_durable`, and a full re-serialisation of every index
+    /// registered so far — O(n²) bytes) once PER index. A store with 4,191
+    /// text indexes spent its entire "restoring text index(es)" phase in
+    /// those fsyncs. Recovery calls this for each definition and then
+    /// [`Self::save_index_meta_sidecar`] once.
+    pub fn restore_index(&mut self, name: Bytes, index: TextIndex) -> Result<(), &'static str> {
         if self.indexes.contains_key(&name) {
             return Err("Index already exists");
         }
+        if index.key_prefixes.is_empty() {
+            // Empty prefix list means match all keys.
+            self.prefix_map.insert_match_all(&name);
+        } else {
+            self.prefix_map.insert(&name, &index.key_prefixes);
+        }
         self.indexes.insert(name, index);
-        self.save_index_meta_sidecar();
         // Bump version AFTER successful create (monotonicity-on-success contract).
         self.bump_version();
         Ok(())
@@ -1987,7 +2016,13 @@ impl TextStore {
     ///
     /// NOTE (WS5a): NOT db-scoped — see [`Self::drop_index_for_db`].
     pub fn drop_index(&mut self, name: &[u8]) -> bool {
-        let removed = self.indexes.remove(name).is_some();
+        let removed = match self.indexes.remove(name) {
+            Some(index) => {
+                self.prefix_map.remove(name, &index.key_prefixes);
+                true
+            }
+            None => false,
+        };
         if removed {
             self.save_index_meta_sidecar();
             // Bump version AFTER successful drop (monotonicity-on-success contract).
@@ -2092,42 +2127,21 @@ impl TextStore {
     /// NOTE (WS5a): NOT db-scoped — the HSET auto-index hook still calls
     /// this unscoped variant (see [`Self::find_matching_index_names_for_db`]
     /// and the WS5a gap report).
+    ///
+    /// O(key length) via the prefix map (an empty prefix list means "match
+    /// all keys", an empty-string prefix likewise), never O(indexes).
     pub fn find_matching_index_names(&self, key: &[u8]) -> Vec<Bytes> {
-        let mut matches = Vec::new();
-        for (name, index) in &self.indexes {
-            // Empty prefix list means match all keys
-            if index.key_prefixes.is_empty() {
-                matches.push(name.clone());
-                continue;
-            }
-            for prefix in &index.key_prefixes {
-                if key.starts_with(prefix.as_ref()) {
-                    matches.push(name.clone());
-                    break;
-                }
-            }
-        }
-        matches
+        self.prefix_map.matching(key)
     }
 
     /// Db-scoped variant of [`Self::find_matching_index_names`] (WS5a).
     pub fn find_matching_index_names_for_db(&self, key: &[u8], db_index: u8) -> Vec<Bytes> {
-        let mut matches = Vec::new();
-        for (name, index) in &self.indexes {
-            if index.db_index != db_index {
-                continue;
-            }
-            if index.key_prefixes.is_empty() {
-                matches.push(name.clone());
-                continue;
-            }
-            for prefix in &index.key_prefixes {
-                if key.starts_with(prefix.as_ref()) {
-                    matches.push(name.clone());
-                    break;
-                }
-            }
-        }
+        let mut matches = self.prefix_map.matching(key);
+        matches.retain(|name| {
+            self.indexes
+                .get(name)
+                .is_some_and(|index| index.db_index == db_index)
+        });
         matches
     }
 
@@ -2427,6 +2441,83 @@ mod tests {
             idx.index_document(key_hash, key.as_bytes(), &args);
         }
         idx
+    }
+
+    /// The prefix map behind `find_matching_index_names` must track every
+    /// create/restore/drop exactly — a stale entry means an HSET silently
+    /// skips (or double-feeds) an index. Checked against the brute-force
+    /// `starts_with` walk it replaced, including the "no prefixes = match
+    /// all" text-store rule.
+    #[test]
+    fn prefix_map_tracks_create_restore_and_drop() {
+        fn idx(name: &str, prefixes: &[&str], db: u8) -> TextIndex {
+            let mut i = TextIndex::new(
+                Bytes::from(name.to_owned()),
+                prefixes
+                    .iter()
+                    .map(|p| Bytes::from((*p).to_owned()))
+                    .collect(),
+                vec![TextFieldDef::new(Bytes::from_static(b"body"))],
+                crate::text::types::BM25Config::default(),
+            );
+            i.db_index = db;
+            i
+        }
+        fn brute(store: &TextStore, key: &[u8], db: Option<u8>) -> Vec<Bytes> {
+            let mut v: Vec<Bytes> = store
+                .indexes
+                .iter()
+                .filter(|(_, i)| db.is_none_or(|d| i.db_index == d))
+                .filter(|(_, i)| {
+                    i.key_prefixes.is_empty() || i.key_prefixes.iter().any(|p| key.starts_with(p))
+                })
+                .map(|(n, _)| n.clone())
+                .collect();
+            v.sort();
+            v
+        }
+        let keys: [&[u8]; 6] = [b"doc:1", b"doc:x:9", b"user:1", b"", b"zzz", b"d"];
+        let check = |store: &TextStore| {
+            for key in keys {
+                let mut got = store.find_matching_index_names(key);
+                got.sort();
+                assert_eq!(got, brute(store, key, None), "key {:?}", key);
+                for db in [0u8, 1] {
+                    let mut got = store.find_matching_index_names_for_db(key, db);
+                    got.sort();
+                    assert_eq!(got, brute(store, key, Some(db)), "key {:?} db {db}", key);
+                }
+            }
+        };
+
+        let mut store = TextStore::new();
+        store
+            .create_index(Bytes::from_static(b"a"), idx("a", &["doc:"], 0))
+            .unwrap();
+        store
+            .restore_index(Bytes::from_static(b"b"), idx("b", &["doc:", "user:"], 1))
+            .unwrap();
+        store
+            .create_index(Bytes::from_static(b"all"), idx("all", &[], 0))
+            .unwrap();
+        store
+            .create_index(Bytes::from_static(b"deep"), idx("deep", &["doc:x:"], 0))
+            .unwrap();
+        check(&store);
+
+        assert!(store.drop_index(b"b"));
+        assert!(!store.drop_index(b"b"), "second drop is a no-op");
+        check(&store);
+        assert!(store.drop_index(b"all"));
+        check(&store);
+        assert!(
+            store
+                .restore_index(Bytes::from_static(b"a"), idx("a", &["other:"], 0))
+                .is_err(),
+            "duplicate name is refused and must not register its prefixes"
+        );
+        check(&store);
+        assert!(store.find_matching_index_names(b"other:1").is_empty());
     }
 
     /// WS5a (db-scoped indexes): TextStore db-tagged variants mirror the
