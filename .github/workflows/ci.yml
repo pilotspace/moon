@@ -483,6 +483,14 @@ jobs:
             sleep 15
           done
           exit 1
+      - name: Memory-gate comparison self-test (offline, no server, no build)
+        # The gate's own --self-test needs a server + a 1M-key populate + a
+        # 60s settle, so it can only inject ONE mutation. This runs the
+        # comparison logic against synthetic snapshots in ~1s and asserts it
+        # goes RED for growth, RED for an unexplained shrink, and RED for an
+        # empty-server measurement. It fails BEFORE the build because a gate
+        # whose comparison is broken has nothing to say about the binary.
+        run: bash tests/memory_gate_compare_selftest.sh
       - name: Build moon
         run: cargo build --no-default-features --features runtime-tokio,jemalloc,graph,text-index
       - name: Run memory steady-state gate (self-test, then baseline comparison)

@@ -59,6 +59,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      `workflow_dispatch` input regenerates the baseline on the actual
      runner instead of an out-of-band machine.
 
+- **`ci`: a memory *drop* is now a failure with its own name, and the gate
+  can no longer measure an empty server (moon#764).** The first comparison
+  that gate ever performed came back `rss -14.02%` /
+  `allocator_overhead -43.34%` with `dashtable` flat at `-0.06%` and **zero
+  files changed under `src/`** -- so nothing had got leaner and the CPU-model
+  warning in the log was a red herring (the passing baseline-capture run and
+  the failing comparison ran on the same EPYC 7763). The cause was the
+  harness measuring itself: `--memory-arenas-cap 2` (jemalloc 8 arenas -> 2)
+  was added to `start_server()` one commit *after* the baseline was
+  captured, so the gate was comparing two different measurement
+  configurations. The baseline is regenerated on a hosted `ubuntu-latest`
+  runner with the current harness. Three changes so the next one explains
+  itself instead of needing an investigation:
+  1. `compare_snapshot` classifies every out-of-band delta as `GREW` or
+     `SHRANK`. Both still fail -- the band is **not** widened, and a shrink
+     is never silently accepted -- but a shrink-only failure now prints
+     `=== BASELINE NO LONGER DESCRIBES THIS BUILD ===` and names the two
+     causes worth checking (a stale baseline, including one invalidated by a
+     harness/server-flag change; or a workload that never ran, which is
+     moon#764's vacuous gate wearing a different hat).
+  2. `check_workload_ran` asserts absolute, baseline-independent floors on
+     `dashtable`/`hnsw`/`csr` before anything is compared **or written as a
+     baseline**. Every other check is relative, so all of them shared one
+     blind spot: an empty capture *and* an empty measurement compare at 0%
+     and stay green forever.
+  3. `tests/memory_gate_compare_selftest.sh` sources the gate (which now has
+     a lib-only `BASH_SOURCE` guard) and drives the comparison against
+     synthetic snapshots -- 13 checks, no server, no build, ~1s, run in CI
+     before the build. Verified it can fail: accepting shrinks silently
+     -> 2 failures; `compare_snapshot` hard-wired to return 0 (the original
+     #764 bug) -> 5 failures; workload floors zeroed -> 1 failure.
+  `allocator_overhead` is documented as what it is -- `rss - tracked_sum`
+  (`src/command/server_admin.rs`) -- so it is never again mistaken for an
+  independent second signal corroborating an RSS move.
+
 ### Documentation
 
 - **The "27-35% less memory" claim is corrected to a measured 15-17%, on Linux,

@@ -86,8 +86,6 @@ cleanup() {
     # Safety: kill any lingering instance on our ports
     pkill -f "moon.*--port ${PORT}" 2>/dev/null || true
 }
-trap cleanup EXIT
-
 wait_for_server() {
     local max_wait=30
     for ((i=0; i<max_wait; i++)); do
@@ -438,6 +436,59 @@ else:
 }
 
 # ---------------------------------------------------------------------------
+# Did the workload actually run? (absolute, baseline-independent)
+# ---------------------------------------------------------------------------
+# Every other check in this script is RELATIVE to the committed baseline, so
+# all of them share one blind spot: if the populate step silently no-ops on
+# both the baseline capture AND the measuring run, the deltas are 0% and the
+# gate is green forever while measuring an empty server. That is the same
+# class of bug as the `exit 0` this PR removed -- a check that cannot fail.
+#
+# These floors are absolute byte counts, sized at roughly half of what the
+# fixed workload (1M string keys, 10K x 16-dim vectors, 100 graph nodes)
+# actually produces, so they leave room for a genuine 2x memory improvement
+# and still cannot be satisfied by a server that populated nothing.
+# Observed on hosted ubuntu-latest: dashtable ~96.6 MB, hnsw ~1.20 MB,
+# csr ~50.3 KB.
+WORKLOAD_FLOOR_DASHTABLE=50000000
+WORKLOAD_FLOOR_HNSW=500000
+WORKLOAD_FLOOR_CSR=10000
+
+# Returns 0 when the snapshot is of a populated server, 2 when it is not.
+check_workload_ran() {
+    local snapshot="$1"
+    local bad=0
+    local dt hn cs
+    dt=$(echo "$snapshot" | jq -r '.kinds.dashtable.prom')
+    hn=$(echo "$snapshot" | jq -r '.kinds.hnsw.prom')
+    cs=$(echo "$snapshot" | jq -r '.kinds.csr.prom')
+
+    if [[ "$dt" -lt "$WORKLOAD_FLOOR_DASHTABLE" ]]; then
+        log "  MEASUREMENT VOID: dashtable=${dt} < floor ${WORKLOAD_FLOOR_DASHTABLE} (${NUM_STRINGS} keys did not land)"
+        bad=$((bad + 1))
+    fi
+    if [[ "$hn" -lt "$WORKLOAD_FLOOR_HNSW" ]]; then
+        log "  MEASUREMENT VOID: hnsw=${hn} < floor ${WORKLOAD_FLOOR_HNSW} (${NUM_VECTORS} vectors did not land)"
+        bad=$((bad + 1))
+    fi
+    if [[ "$cs" -lt "$WORKLOAD_FLOOR_CSR" ]]; then
+        log "  MEASUREMENT VOID: csr=${cs} < floor ${WORKLOAD_FLOOR_CSR} (${NUM_GRAPH_NODES} graph nodes did not land)"
+        bad=$((bad + 1))
+    fi
+
+    if [[ "$bad" -gt 0 ]]; then
+        log "GATE CANNOT RUN: the workload did not populate, so this snapshot"
+        log "  measures an empty server. Comparing it -- or worse, committing it"
+        log "  as a baseline -- would produce numbers that look like a"
+        log "  measurement and are not one. Check the populate log above"
+        log "  (redis-benchmark / FT.CREATE / the python3 populate script)."
+        return 2
+    fi
+    log "  Workload floors OK (dashtable=${dt}, hnsw=${hn}, csr=${cs})"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Baseline provenance guard
 # ---------------------------------------------------------------------------
 # A memory baseline is only meaningful against the platform it was captured on.
@@ -580,14 +631,40 @@ kind_threshold() {
 }
 
 # ---------------------------------------------------------------------------
-# Compare snapshot against baseline
-# Returns 0 if all within threshold, 1 if any regression detected
+# Compare snapshot against baseline -- DIRECTION MATTERS
 # ---------------------------------------------------------------------------
+# Returns 0 when every kind and RSS are inside the band, 1 otherwise.
+#
+# A delta outside the band is classified GREW or SHRANK, and BOTH are
+# failures. That asymmetry in the *message* (not in the verdict) exists
+# because the two directions have completely different fixes:
+#
+#   GREW   -> a memory regression. Fix the code.
+#   SHRANK -> the committed baseline no longer describes what this harness
+#             measures. Fix the BASELINE, after working out why.
+#
+# Why a shrink can never be waved through: moon#764's first real comparison
+# read `rss delta=-14.02%` with `dashtable` flat at -0.06% and ZERO files
+# changed under src/. Nothing got leaner -- the harness had started passing
+# `--memory-arenas-cap 2` to start_server() (8 jemalloc arenas -> 2) one
+# commit AFTER the baseline was captured, so the gate was comparing two
+# different measurement configurations. The same shape also appears when the
+# workload silently fails to populate: less data, less memory, a big happy
+# green tick on a run that measured nothing. That is the vacuous gate #764
+# was filed over, wearing a different hat. Treating a shrink as "well, it
+# improved" is how a gate stops gating.
+#
+# Note that `allocator_overhead` is NOT an independent signal to cross-check
+# RSS against: src/command/server_admin.rs computes it as
+# `rss.saturating_sub(tracked_sum)`. When RSS moves and the tracked kinds do
+# not, allocator_overhead moves with it by construction -- one measurement
+# reported twice, not two failures agreeing.
 compare_snapshot() {
     local snapshot="$1"
     local baseline_file="$2"
     local threshold="$3"
-    local failures=0
+    local growth_failures=0
+    local shrink_failures=0
     local failure_msgs=""
 
     if [[ ! -f "$baseline_file" ]]; then
@@ -606,23 +683,30 @@ compare_snapshot() {
     baseline_rss=$(echo "$baseline" | jq -r '.rss')
 
     if [[ "$baseline_rss" -gt 0 ]]; then
-        local rss_delta_pct
+        local rss_delta_pct rss_verdict
         rss_delta_pct=$(python3 -c "
 m = $measured_rss
 b = $baseline_rss
 print(round((m - b) / b * 100, 2))
 ")
-        local rss_abs
-        rss_abs=$(python3 -c "print(abs($rss_delta_pct))")
-        local rss_exceeds
-        rss_exceeds=$(python3 -c "print('yes' if $rss_abs > $threshold else 'no')")
-
-        if [[ "$rss_exceeds" == "yes" ]]; then
-            failure_msgs="${failure_msgs}  FAIL: rss delta=${rss_delta_pct}% (measured=$measured_rss, baseline=$baseline_rss)\n"
-            failures=$((failures + 1))
-        else
-            log "  OK: rss delta=${rss_delta_pct}% (within +/-${threshold}%)"
-        fi
+        rss_verdict=$(python3 -c "
+d = $rss_delta_pct
+t = $threshold
+print('grow' if d > t else ('shrink' if d < -t else 'ok'))
+")
+        case "$rss_verdict" in
+            grow)
+                failure_msgs="${failure_msgs}  FAIL (GREW):   rss delta=${rss_delta_pct}% (measured=$measured_rss, baseline=$baseline_rss, threshold=+/-${threshold}%)\n"
+                growth_failures=$((growth_failures + 1))
+                ;;
+            shrink)
+                failure_msgs="${failure_msgs}  FAIL (SHRANK): rss delta=${rss_delta_pct}% (measured=$measured_rss, baseline=$baseline_rss, threshold=+/-${threshold}%)\n"
+                shrink_failures=$((shrink_failures + 1))
+                ;;
+            *)
+                log "  OK: rss delta=${rss_delta_pct}% (within +/-${threshold}%)"
+                ;;
+        esac
     fi
 
     # Compare each kind (use prom value for comparison)
@@ -635,42 +719,76 @@ print(round((m - b) / b * 100, 2))
         # Handle baseline=0: if measured > 1024 bytes, flag as regression
         if [[ "$baseline_val" == "0" ]]; then
             if [[ "$measured_val" -gt 1024 ]]; then
-                failure_msgs="${failure_msgs}  FAIL: ${kind} was 0 in baseline, now ${measured_val} bytes\n"
-                failures=$((failures + 1))
+                failure_msgs="${failure_msgs}  FAIL (GREW):   ${kind} was 0 in baseline, now ${measured_val} bytes\n"
+                growth_failures=$((growth_failures + 1))
             else
                 log "  OK: ${kind} baseline=0, measured=$measured_val (below 1KB epsilon)"
             fi
             continue
         fi
 
-        local delta_pct
+        local delta_pct verdict
         delta_pct=$(python3 -c "
 m = $measured_val
 b = $baseline_val
 print(round((m - b) / b * 100, 2))
 ")
-        local abs_delta
-        abs_delta=$(python3 -c "print(abs($delta_pct))")
-        local exceeds
-        exceeds=$(python3 -c "print('yes' if $abs_delta > $kind_thr else 'no')")
+        verdict=$(python3 -c "
+d = $delta_pct
+t = $kind_thr
+print('grow' if d > t else ('shrink' if d < -t else 'ok'))
+")
 
-        if [[ "$exceeds" == "yes" ]]; then
-            failure_msgs="${failure_msgs}  FAIL: ${kind} delta=${delta_pct}% (measured=$measured_val, baseline=$baseline_val, threshold=+/-${kind_thr}%)\n"
-            failures=$((failures + 1))
-        else
-            log "  OK: ${kind} delta=${delta_pct}% (within +/-${kind_thr}%)"
-        fi
+        case "$verdict" in
+            grow)
+                failure_msgs="${failure_msgs}  FAIL (GREW):   ${kind} delta=${delta_pct}% (measured=$measured_val, baseline=$baseline_val, threshold=+/-${kind_thr}%)\n"
+                growth_failures=$((growth_failures + 1))
+                ;;
+            shrink)
+                failure_msgs="${failure_msgs}  FAIL (SHRANK): ${kind} delta=${delta_pct}% (measured=$measured_val, baseline=$baseline_val, threshold=+/-${kind_thr}%)\n"
+                shrink_failures=$((shrink_failures + 1))
+                ;;
+            *)
+                log "  OK: ${kind} delta=${delta_pct}% (within +/-${kind_thr}%)"
+                ;;
+        esac
     done
 
+    local failures=$((growth_failures + shrink_failures))
     if [[ "$failures" -gt 0 ]]; then
         log ""
-        log "=== MEMORY REGRESSION DETECTED ==="
+        if [[ "$growth_failures" -gt 0 ]]; then
+            log "=== MEMORY REGRESSION DETECTED ==="
+        else
+            log "=== BASELINE NO LONGER DESCRIBES THIS BUILD ==="
+        fi
         echo -e "$failure_msgs" >&2
-        log "=== $failures kind(s) exceeded +/-${threshold}% threshold ==="
+        if [[ "$shrink_failures" -gt 0 ]]; then
+            log "A SHRANK line is a FAILURE, not a free pass. Memory falling"
+            log "outside the band means one of exactly two things and both need"
+            log "a human before this gate can be green again:"
+            log "  (a) The baseline is stale. Something really did get leaner --"
+            log "      or, just as likely, THE HARNESS CHANGED WHAT IT MEASURES."
+            log "      Adding --memory-arenas-cap 2 to start_server() moved RSS"
+            log "      -14% with zero src/ changes (moon#764). Server flags,"
+            log "      shard count, workload size and feature set are all part"
+            log "      of the measurement contract; changing any of them"
+            log "      invalidates the committed baseline."
+            log "      Refresh: run ci.yml via workflow_dispatch with"
+            log "      capture_memory_baseline=true, download the"
+            log "      memory-steady-state-snapshot artifact, commit it as"
+            log "      ${BASELINE_PATH}, and say in the commit message WHY the"
+            log "      numbers moved."
+            log "  (b) The workload never actually ran, so there was less to"
+            log "      measure. check_workload_ran() catches the total-failure"
+            log "      shape; a PARTIAL populate still lands right here. Read"
+            log "      the populate log before touching the baseline."
+        fi
+        log "=== $failures kind(s) outside tolerance -- $growth_failures grew, $shrink_failures shrank ==="
         return 1
     else
         log ""
-        log "=== ALL KINDS WITHIN +/-${threshold}% === PASS ==="
+        log "=== ALL KINDS WITHIN TOLERANCE === PASS ==="
         return 0
     fi
 }
@@ -679,6 +797,11 @@ print(round((m - b) / b * 100, 2))
 # Main
 # ---------------------------------------------------------------------------
 main() {
+    # Registered here, not at file scope: the file is sourced by
+    # tests/memory_gate_compare_selftest.sh to exercise the comparison
+    # logic offline, and a source must not arm a pkill-on-exit trap.
+    trap cleanup EXIT
+
     log "============================================"
     log "  Memory Steady-State Gate"
     log "============================================"
@@ -713,6 +836,16 @@ main() {
 
     # Cross-reporter check (warnings only, non-fatal)
     check_cross_reporter "$snapshot"
+
+    # Did the workload actually run? This is checked BEFORE --write-baseline
+    # so an empty-server snapshot can never be committed as the baseline that
+    # every later run is measured against.
+    log "Workload sanity (absolute floors, baseline-independent)..."
+    local workload_rc=0
+    check_workload_ran "$snapshot" || workload_rc=$?
+    if [[ "$workload_rc" -ne 0 ]]; then
+        exit "$workload_rc"
+    fi
 
     # --- Write baseline mode ---
     if [[ -n "$WRITE_BASELINE" ]]; then
@@ -790,4 +923,12 @@ main() {
     fi
 }
 
-main
+
+# Lib-only guard: `bash scripts/bench-memory-steady-state.sh` runs the gate;
+# `source`ing the file (tests/memory_gate_compare_selftest.sh does exactly
+# that) defines the functions and runs nothing. Without this, sourcing the
+# script to unit-test compare_snapshot() would boot a server and run the
+# full 1M-key workload as a side effect.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main
+fi
