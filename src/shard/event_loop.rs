@@ -2954,7 +2954,26 @@ async fn recover_indexes_task(
 
     // Auto-reindex existing HASH keys that match vector or text index prefixes.
     let has_indexes = metas.is_some() || text_metas.is_some();
-    if has_indexes {
+    // moon#882 escape hatch. The walk below is the whole of a long startup on a
+    // large corpus, and it runs before the shard serves anyone. An operator who
+    // needs the KV plane back NOW can trade the indexes for it. Logged at WARN,
+    // once per affected shard, because the resulting `FT.SEARCH` answers zero
+    // results rather than an error -- a silent wrong answer is exactly the kind
+    // of state an operator must be told they are in.
+    let skip_reindex = has_indexes && crate::shard::loading::skip_index_recovery();
+    if skip_reindex {
+        tracing::warn!(
+            "Shard {}: MOON_SKIP_INDEX_RECOVERY is set -- restored {} vector and {} text index \
+             DEFINITION(s) but SKIPPED the keyspace reindex. Every document NOT covered by a \
+             persisted snapshot (.tpost postings / vector keymap) is missing from its index, and \
+             FT.SEARCH answers ZERO RESULTS for it rather than an error. The durable index state \
+             on disk is untouched: unset the variable and restart to rebuild.",
+            shard_id,
+            metas.as_ref().map_or(0, Vec::len),
+            text_metas.as_ref().map_or(0, Vec::len),
+        );
+    }
+    if has_indexes && !skip_reindex {
         let db_count = shard_databases.db_count();
         let mut reindexed = 0usize;
         // moon#546 hypothesis 3: the reported 94-minute recovery logged
@@ -3145,7 +3164,13 @@ async fn recover_indexes_task(
     // unknown `idx-*` dirs with no matching sidecar index) +
     // per-index acceptance-signal log line. No-op (does nothing,
     // logs nothing) when no index had durable state to recover.
-    if let Some(ref vdir) = vector_persist_dir {
+    //
+    // Skipped with the reindex (moon#882): the probe tombstones every key_hash
+    // the manifest loaded that the walk did not OBSERVE, and a skipped walk
+    // observes nothing. Running it here would erase the durable index state on
+    // disk -- turning an escape hatch that costs one boot's indexes into one
+    // that costs them permanently.
+    if let (Some(vdir), false) = (&vector_persist_dir, skip_reindex) {
         #[cfg(feature = "text-index")]
         let text_recovery = std::mem::take(&mut recovery_state.text);
         crate::shard::slice::with_shard(|s| {

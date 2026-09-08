@@ -6,6 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`shard`: `MOON_SKIP_INDEX_RECOVERY=1` — an operator escape hatch for a
+  long boot-time index rebuild.** `recover_indexes_task` restores index
+  definitions from the sidecars and then walks every key matching an index
+  prefix, re-deriving its postings and vectors. Until that walk finishes the
+  shard answers `-LOADING` to every data command, so from a client's point of
+  view the server is down. Measured on a production instance: 293,439 matching
+  keys at a cumulative 56 keys/s, i.e. hours, with no way to ask for the KV
+  plane back sooner. With the variable set the shard serves in seconds; the
+  documents not covered by a persisted snapshot (`.tpost` postings, vector
+  keymap) are simply missing from their index, and `FT.SEARCH` answers zero
+  results for them rather than an error. Off by default, fails closed on any
+  spelling that is not affirmative, and logs at WARN once per affected shard —
+  a silent wrong answer is a state an operator must be told they are in.
+
+  The deletion probe is skipped with the walk. It tombstones every `key_hash`
+  the manifest loaded that the walk did not *observe*, and a skipped walk
+  observes nothing — running it anyway would erase the durable index state on
+  disk, turning a hatch that costs one boot's indexes into one that costs them
+  permanently. `tests/skip_index_recovery_escape_hatch.rs` asserts exactly that
+  property: it does not check the hatch boot's hit count (which depends on
+  snapshot coverage, not on this change), it checks that a *plain* restart
+  afterwards rebuilds the full index.
+
 ### Performance
 
 - **`storage`: the cold-index rebuild builds its ordered map in one bulk load

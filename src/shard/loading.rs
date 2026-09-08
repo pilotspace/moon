@@ -135,6 +135,53 @@ pub fn loading_error() -> crate::protocol::Frame {
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Operator escape hatch: skip the boot-time keyspace reindex (moon#882)
+// ---------------------------------------------------------------------------
+
+/// Should this boot SKIP the keyspace walk that repopulates vector/text
+/// indexes from the restored hashes?
+///
+/// Index definitions are restored from the sidecars either way — this only
+/// governs phase 2, the walk over every key matching an index prefix that
+/// re-derives its postings/vectors. On a large corpus that walk is the whole
+/// of a long startup: a production instance measured ~200 ms of CPU per key
+/// over 293,439 keys, a 12-hour boot during which every command answers
+/// `-LOADING` and the server is, from a client's point of view, down.
+///
+/// With the hatch on, the shard accepts traffic in seconds and the KV plane is
+/// complete and correct. The indexes are **empty**: `FT.SEARCH` answers zero
+/// results rather than an error, which is a silent wrong answer to anything
+/// that searches. That is the trade, and it is why this is opt-in, off by
+/// default, and logged at WARN on every affected shard for the life of the
+/// process — never inferred, never automatic.
+///
+/// The deletion probe is skipped with it. The probe tombstones every key_hash
+/// the manifest loaded that the walk did not observe; with no walk it observes
+/// nothing, so running it would erase the durable index state this hatch
+/// exists to preserve for a later rebuild.
+pub fn skip_index_recovery() -> bool {
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| skip_index_recovery_from(std::env::var("MOON_SKIP_INDEX_RECOVERY").ok()))
+}
+
+/// The parse behind [`skip_index_recovery`], split out so it is testable
+/// without mutating process environment (which is racy across a test binary's
+/// threads and, since Rust 2024, `unsafe`).
+///
+/// Fails CLOSED: anything that is not an affirmative spelling leaves recovery
+/// running. A typo in a deploy must not silently ship a server with empty
+/// indexes.
+pub(crate) fn skip_index_recovery_from(var: Option<String>) -> bool {
+    match var {
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +306,40 @@ mod tests {
             "error name must be LOADING, got {:?}",
             String::from_utf8_lossy(&e)
         );
+    }
+
+    /// The hatch must be OFF unless someone spelled it affirmatively. An unset
+    /// var, an empty one, `0`, and a typo all leave index recovery running:
+    /// shipping empty indexes is the dangerous direction, so it fails closed.
+    #[test]
+    fn the_skip_hatch_is_off_unless_affirmatively_set() {
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("of"),
+            Some("ON1"),
+        ] {
+            assert!(
+                !skip_index_recovery_from(off.map(str::to_string)),
+                "{off:?} must NOT skip index recovery"
+            );
+        }
+    }
+
+    /// The spellings an operator actually types, including whitespace an
+    /// environment file or a plist string tends to carry.
+    #[test]
+    fn the_skip_hatch_accepts_the_usual_affirmative_spellings() {
+        for on in [
+            "1", "true", "TRUE", "True", "yes", "YES", "on", "ON", " 1 ", "\ttrue\n",
+        ] {
+            assert!(
+                skip_index_recovery_from(Some(on.to_string())),
+                "{on:?} must skip index recovery"
+            );
+        }
     }
 }
