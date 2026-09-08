@@ -174,24 +174,13 @@ vm() { # vm <shell-command> — run inside the moon-dev VM at the repo
 # row included — still fails this gate; that asymmetry is what the
 # deliberate-break proof in moon#762's report exercises.
 run_ft_consistency() { # run_ft_consistency <moon-bin> <port-rust> <port-redis>
+  # Thin wrapper. The gate logic (truncation check, row-count floor, moon#536
+  # waiver) lives in scripts/consistency-gate.sh so the VM leg below runs the
+  # SAME implementation instead of a second transcription of it.
   local moon_bin=$1 port_rust=$2 port_redis=$3
-  local out rc fails
-  out=$(MOON_BIN="$moon_bin" MOON_DISK_FREE_MIN_PCT=0 \
-        ./scripts/test-consistency.sh --skip-build \
-          --port-rust "$port_rust" --port-redis "$port_redis" 2>&1)
-  rc=$?
-  echo "$out"
-  if [ "$rc" -ne 0 ]; then
-    fails=$(grep -c '^  FAIL:' <<< "$out")
-    if [ "$fails" -eq 1 ] && grep -qx '  FAIL: ROLE on a master' <<< "$out"; then
-      echo ""
-      echo "  WARNING: tolerating the one known pre-existing failure (moon#536:"
-      echo "    ROLE's replication offset on a masterless server — unrelated to"
-      echo "    FT.*). Any OTHER or ADDITIONAL failure still fails this gate."
-      return 0
-    fi
-  fi
-  return $rc
+  MOON_BIN="$moon_bin" MOON_DISK_FREE_MIN_PCT=0 \
+    ./scripts/consistency-gate.sh --skip-build \
+      --port-rust "$port_rust" --port-redis "$port_redis"
 }
 
 # ── Disk pre-flight (moon#658) ────────────────────────────────────────
@@ -699,7 +688,7 @@ if [ "$MODE" = "full" ]; then
   # there is no overlap. See run_ft_consistency's doc comment (above,
   # next to its definition) for the moon#536 carve-out and what this
   # leg does and does not cover.
-  VM_CONSISTENCY_CMD='out=$(MOON_BIN=$HOME/ci-target/local-compat/release/moon MOON_NO_URING=1 MOON_DISK_FREE_MIN_PCT=0 ./scripts/test-consistency.sh --skip-build 2>&1); rc=$?; echo "$out"; if [ $rc -ne 0 ]; then fails=$(grep -c "^  FAIL:" <<< "$out"); if [ "$fails" -eq 1 ] && grep -qx "  FAIL: ROLE on a master" <<< "$out"; then echo; echo "  WARNING: tolerating the one known pre-existing failure (moon#536: ROLE'\''s replication offset on a masterless server — unrelated to FT.*). Any OTHER or ADDITIONAL failure still fails this gate."; exit 0; fi; fi; exit $rc'
+  VM_CONSISTENCY_CMD='MOON_BIN=$HOME/ci-target/local-compat/release/moon MOON_NO_URING=1 MOON_DISK_FREE_MIN_PCT=0 ./scripts/consistency-gate.sh --skip-build'
   run_step "VM FT.* consistency suite (moon#762, io_uring monoio)" \
     vm "$VM_CONSISTENCY_CMD"
   # ── Phase 3: macOS host suite (tokio — kqueue) ──────────────────────

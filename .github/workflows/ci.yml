@@ -87,6 +87,11 @@ jobs:
       # VM. It runs here so the thresholds cannot silently rot — the check
       # itself only ever runs on a developer's machine.
       - run: bash scripts/test-ci-local-preflight.sh
+      # The consistency gate waives one known failure (moon#536) and
+      # rejects a truncated run. Both behaviours are the kind that decay
+      # silently, so its self-test runs here: pure bash, no server, <1s.
+      - name: Consistency-gate self-test (moon#762)
+        run: bash scripts/consistency-gate.sh --self-test
       # Nothing else in CI compiles `fuzz/`, and it showed: `mq_registry_blob`
       # failed to BUILD on every nightly from at least 2026-07-17 — running zero
       # executions the whole time — because `ShardStoreMemory` gained two fields

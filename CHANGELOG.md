@@ -257,6 +257,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   partial makes the gate report `AGG-03 cross-shard divergence` with
   `GATE_RC=1`.
 
+  The gate lives in `scripts/consistency-gate.sh` — **one** implementation that
+  both the host leg and the VM leg call, rather than the two hand-transcriptions
+  of the same rc/count/waiver logic they started as, where fixing one and not
+  the other failed silently. It checks two things an exit code cannot: that the
+  suite **reached its summary block**, and that it ran **>= 458 assertions**.
+  `test-consistency.sh` runs under `set -euo pipefail`, so an abort partway
+  through leaves exit 0 and no `FAIL:` lines and is indistinguishable from a
+  clean run — moon#634 is that exact defect, which had this script silently
+  running about half its rows for months. Both checks run BEFORE the moon#536
+  waiver, so a truncated run can never be waived. `--self-test` covers six
+  cases (clean / waived / different-single-failure / waived-plus-another /
+  truncated / short) and runs in the hosted Lint job.
+
 - **`ci`: clippy now lints tests, benches and examples.** Every clippy
   invocation in `ci.yml` was lib-only, so `--all-targets` code was never
   linted anywhere: moon#835's two errors (`tests/busy_poll_idle.rs`,
