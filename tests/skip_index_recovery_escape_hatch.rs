@@ -26,6 +26,13 @@
 //! results" would pass just as happily against a build that had erased the
 //! durable state on disk.
 
+// The tokio CI leg builds with `--no-default-features --features
+// runtime-tokio,jemalloc`, which drops `text-index`: `FT.CREATE ... SCHEMA
+// body TEXT` is rejected there, and this whole suite is about a text index's
+// durable state. Gate the file rather than the test, so nothing in it compiles
+// into a build that cannot run it.
+#![cfg(feature = "text-index")]
+
 mod common;
 
 use std::io::{Read, Write};
@@ -224,21 +231,24 @@ fn the_skip_hatch_is_reversible_and_never_erases_durable_index_state() {
     {
         let guard = common::ServerGuard::new(spawn(port, &dir, false));
         let mut c = Conn::open(port);
+        let created = c.cmd(&[
+            "FT.CREATE",
+            "tidx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "d:",
+            "SCHEMA",
+            "body",
+            "TEXT",
+        ]);
+        // Print the reply. The first version asserted `starts_with("+OK")` with
+        // the message "FT.CREATE failed" and nothing else, so a CI leg that
+        // rejects the command outright reported only that something failed.
         assert!(
-            c.cmd(&[
-                "FT.CREATE",
-                "tidx",
-                "ON",
-                "HASH",
-                "PREFIX",
-                "1",
-                "d:",
-                "SCHEMA",
-                "body",
-                "TEXT",
-            ])
-            .starts_with("+OK"),
-            "FT.CREATE failed"
+            created.starts_with("+OK"),
+            "FT.CREATE did not succeed: {created:?}"
         );
         for i in 0..DOCS {
             c.cmd(&["HSET", &format!("d:{i}"), "body", "alpha beta gamma"]);
