@@ -103,6 +103,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   visible on a running server. Red/green in
   `src/persistence/wal_v3/segment.rs` and `src/shard/persistence_tick.rs`
   (`test_870_*`), asserting on scan counts, never wall time.
+- **`persistence`: AOF auto-rewrite seeds its base size from the manifest's
+  base RDB, not the whole `appendonlydir` (#868).** `auto_rewrite::init()`
+  recorded base + uncompacted incr as the growth baseline, so every restart
+  raised the rewrite trigger by however much incr had accumulated — for
+  good. On a host that restarts more often than the AOF doubles the monitor
+  never fired: a live instance reported `aof_base_size` 3.41 GB against a
+  1.08 GB base file and sat at 4.8 GB on disk for 17 days. Boot now seeds
+  base from the base file(s) the committed `moon.aof.manifest` names (one
+  per shard in the PerShard layout) plus the legacy flat `appendonly.aof`,
+  and current from the directory as before; the post-rewrite baseline is
+  unchanged. Trigger percentage, min-size and cadence are untouched.
 - **`replication`: coordinator local legs now replicate, and stop inflating
   `master_repl_offset` (#815).** On a multi-shard master the in-process leg
   of a multi-key write (`MSET`/`MSETNX` co-located or scattered slices,
