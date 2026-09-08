@@ -246,6 +246,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the two end-to-end cycle tests carry ballast keys deliberately, because on
   an empty database the ledger starts at 0, over-crediting saturates back to
   0, and the repro passes against the very bug it exists to catch.
+- **`ci`: the multi-shard consistency suite now runs before merge (#762).**
+  `scripts/test-consistency.sh` is the only harness that starts moon at
+  `--shards 1/4/12` and diffs behaviour across them, and no gate ever ran it:
+  `grep -rln "test-consistency" .github/ scripts/ci-local.sh` returned exactly
+  one hit, a manual checklist line in the PR template. Its 458 assertions —
+  including `FT.CREATE/SEARCH/AGGREGATE/DROPINDEX/INFO` across shard counts —
+  had never executed in CI. Wired into `scripts/ci-local.sh`, the local merge
+  bar, and verified it can fail: mutating `shard::scatter_aggregate` to drop a
+  partial makes the gate report `AGG-03 cross-shard divergence` with
+  `GATE_RC=1`.
 
 - **`ci`: clippy now lints tests, benches and examples.** Every clippy
   invocation in `ci.yml` was lib-only, so `--all-targets` code was never
