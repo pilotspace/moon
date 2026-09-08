@@ -32,6 +32,15 @@
 //!   ... (same as v1 fields) ...
 //!   [db_index: u8]   ← NEW in v2
 //! ```
+//!
+//! ## `TMX3` extension block (appended after the v2 body)
+//!
+//! TAG and NUMERIC field definitions. The v2 body only ever carried TEXT
+//! fields, so every restart silently dropped the others (`@cat:{a}` →
+//! `unknown_field`). The block lives AFTER the v2 body and the file keeps
+//! `version = 2`: a v2 reader stops after `count` indexes and an older binary
+//! keeps restoring the TEXT definitions it understands. Layout in
+//! `serialize_text_index_metas`.
 
 use std::io::{self, Read};
 use std::path::Path;
@@ -90,7 +99,20 @@ pub struct TextIndexMeta {
     /// Logical db this index belongs to (WS5a). Defaults to `0` for v1
     /// sidecars and for callers not yet threading a real db_index.
     pub db_index: u8,
+    /// TAG field definitions, carried by the `TMX3` extension block (see
+    /// module docs). Empty when the sidecar predates the block — which is
+    /// exactly the restart-loses-TAG-fields bug the block closes.
+    #[cfg(feature = "text-index")]
+    pub tag_fields: Vec<crate::text::types::TagFieldDef>,
+    /// NUMERIC field definitions, same block as `tag_fields`.
+    #[cfg(feature = "text-index")]
+    pub numeric_fields: Vec<crate::text::types::NumericFieldDef>,
 }
+
+/// Magic of the extension block appended AFTER the v2 body. A v2 reader
+/// stops after `count` indexes and never looks at it, so the file keeps
+/// `version = 2` and an older binary still restores every TEXT definition.
+const EXT_MAGIC: &[u8; 4] = b"TMX3";
 
 /// Serialize text index metadata to bytes (current v2 format — WS5a db_index).
 pub fn serialize_text_index_metas(indexes: &[TextIndexMeta]) -> Vec<u8> {
@@ -131,7 +153,102 @@ pub fn serialize_text_index_metas(indexes: &[TextIndexMeta]) -> Vec<u8> {
         buf.push(idx.db_index);
     }
 
+    // `TMX3` extension block: per index (same order as the v2 body)
+    //   [tag_count: u16] per tag: [name_len: u16] [name] [separator: u8] [flags: u8]
+    //     flags — bit 0 = case_sensitive, bit 1 = sortable, bit 2 = noindex
+    //   [numeric_count: u16] per numeric: [name_len: u16] [name] [flags: u8]
+    //     flags — bit 1 = sortable, bit 2 = noindex
+    // Always written (zero counts included) so a reader can tell "this
+    // writer knew about the block" from "block missing".
+    buf.extend_from_slice(EXT_MAGIC);
+    for idx in indexes {
+        #[cfg(feature = "text-index")]
+        {
+            buf.extend_from_slice(&(idx.tag_fields.len() as u16).to_le_bytes());
+            for t in &idx.tag_fields {
+                buf.extend_from_slice(&(t.field_name.len() as u16).to_le_bytes());
+                buf.extend_from_slice(&t.field_name);
+                buf.push(t.separator);
+                let flags: u8 =
+                    (t.case_sensitive as u8) | ((t.sortable as u8) << 1) | ((t.noindex as u8) << 2);
+                buf.push(flags);
+            }
+            buf.extend_from_slice(&(idx.numeric_fields.len() as u16).to_le_bytes());
+            for n in &idx.numeric_fields {
+                buf.extend_from_slice(&(n.field_name.len() as u16).to_le_bytes());
+                buf.extend_from_slice(&n.field_name);
+                let flags: u8 = ((n.sortable as u8) << 1) | ((n.noindex as u8) << 2);
+                buf.push(flags);
+            }
+        }
+        #[cfg(not(feature = "text-index"))]
+        {
+            let _ = idx;
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+        }
+    }
+
     buf
+}
+
+/// Parse the `TMX3` block that follows the v2 body, filling `metas` in place.
+/// A block is optional (older writers); once present it must parse in full —
+/// the file is written atomically, so a torn block is corruption, not skew.
+fn deserialize_ext_block(
+    data: &[u8],
+    cursor: &mut usize,
+    metas: &mut [TextIndexMeta],
+) -> io::Result<()> {
+    if *cursor + 4 > data.len() || &data[*cursor..*cursor + 4] != EXT_MAGIC {
+        return Ok(());
+    }
+    *cursor += 4;
+    for meta in metas.iter_mut() {
+        let tag_count = read_u16(data, cursor)? as usize;
+        #[cfg(feature = "text-index")]
+        let mut tag_fields = Vec::with_capacity(tag_count.min(64));
+        for _ in 0..tag_count {
+            let len = read_u16(data, cursor)? as usize;
+            let name = read_bytes(data, cursor, len)?;
+            let separator = read_u8(data, cursor)?;
+            let flags = read_u8(data, cursor)?;
+            #[cfg(feature = "text-index")]
+            tag_fields.push(crate::text::types::TagFieldDef {
+                field_name: Bytes::copy_from_slice(name),
+                separator,
+                case_sensitive: flags & 0x01 != 0,
+                sortable: flags & 0x02 != 0,
+                noindex: flags & 0x04 != 0,
+            });
+            #[cfg(not(feature = "text-index"))]
+            let _ = (name, separator, flags);
+        }
+        let numeric_count = read_u16(data, cursor)? as usize;
+        #[cfg(feature = "text-index")]
+        let mut numeric_fields = Vec::with_capacity(numeric_count.min(64));
+        for _ in 0..numeric_count {
+            let len = read_u16(data, cursor)? as usize;
+            let name = read_bytes(data, cursor, len)?;
+            let flags = read_u8(data, cursor)?;
+            #[cfg(feature = "text-index")]
+            numeric_fields.push(crate::text::types::NumericFieldDef {
+                field_name: Bytes::copy_from_slice(name),
+                sortable: flags & 0x02 != 0,
+                noindex: flags & 0x04 != 0,
+            });
+            #[cfg(not(feature = "text-index"))]
+            let _ = (name, flags);
+        }
+        #[cfg(feature = "text-index")]
+        {
+            meta.tag_fields = tag_fields;
+            meta.numeric_fields = numeric_fields;
+        }
+        #[cfg(not(feature = "text-index"))]
+        let _ = meta;
+    }
+    Ok(())
 }
 
 /// Deserialize text index metadata from bytes. Handles v1 and v2 formats.
@@ -202,8 +319,14 @@ pub fn deserialize_text_index_metas(data: &[u8]) -> io::Result<Vec<TextIndexMeta
             key_prefixes,
             text_fields,
             db_index,
+            #[cfg(feature = "text-index")]
+            tag_fields: Vec::new(),
+            #[cfg(feature = "text-index")]
+            numeric_fields: Vec::new(),
         });
     }
+
+    deserialize_ext_block(data, &mut cursor, &mut metas)?;
 
     Ok(metas)
 }
@@ -571,7 +694,78 @@ mod tests {
                 })
                 .collect(),
             db_index: 0,
+            #[cfg(feature = "text-index")]
+            tag_fields: Vec::new(),
+            #[cfg(feature = "text-index")]
+            numeric_fields: Vec::new(),
         }
+    }
+
+    /// The restart-loses-TAG/NUMERIC bug: `FT.SEARCH ix '@cat:{a}'` answered
+    /// `unknown_field` after every reboot because the v2 body only carries
+    /// TEXT fields. The extension block must round-trip both.
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn tag_and_numeric_fields_roundtrip_through_the_extension_block() {
+        use crate::text::types::{NumericFieldDef, TagFieldDef};
+        let mut meta = make_meta("idx", "doc:", &[("title", 2.0, 0)]);
+        meta.tag_fields = vec![TagFieldDef {
+            field_name: Bytes::from_static(b"cat"),
+            separator: b'|',
+            case_sensitive: true,
+            sortable: false,
+            noindex: true,
+        }];
+        meta.numeric_fields = vec![NumericFieldDef {
+            field_name: Bytes::from_static(b"n"),
+            sortable: true,
+            noindex: false,
+        }];
+        let plain = make_meta("plain", "p:", &[("body", 1.0, 0)]);
+        let data = serialize_text_index_metas(&[meta, plain]);
+        let back = deserialize_text_index_metas(&data).expect("deserialize");
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].tag_fields.len(), 1);
+        assert_eq!(back[0].tag_fields[0].field_name, "cat");
+        assert_eq!(back[0].tag_fields[0].separator, b'|');
+        assert!(back[0].tag_fields[0].case_sensitive);
+        assert!(back[0].tag_fields[0].noindex);
+        assert_eq!(back[0].numeric_fields.len(), 1);
+        assert_eq!(back[0].numeric_fields[0].field_name, "n");
+        assert!(back[0].numeric_fields[0].sortable);
+        assert!(back[1].tag_fields.is_empty());
+        assert!(back[1].numeric_fields.is_empty());
+    }
+
+    /// A v2 body with no block (older writer) still loads, with empty
+    /// TAG/NUMERIC — and a v2 READER given a file with the block must be
+    /// able to stop at `count` (it never inspects the tail), which is what
+    /// keeps `version = 2`. Modelled here by truncating the block away.
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn a_body_without_the_extension_block_still_loads() {
+        let meta = make_meta("idx", "doc:", &[("title", 2.0, 0)]);
+        let data = serialize_text_index_metas(std::slice::from_ref(&meta));
+        let ext_at = data
+            .windows(4)
+            .rposition(|w| w == EXT_MAGIC)
+            .expect("block present");
+        let back = deserialize_text_index_metas(&data[..ext_at]).expect("v2 body loads alone");
+        assert_eq!(back.len(), 1);
+        assert!(back[0].tag_fields.is_empty());
+    }
+
+    /// A block that starts but does not finish is corruption, not skew: the
+    /// file is written atomically. Fail closed like every other framing error.
+    #[test]
+    fn a_torn_extension_block_is_rejected() {
+        let meta = make_meta("idx", "doc:", &[("title", 2.0, 0)]);
+        let data = serialize_text_index_metas(std::slice::from_ref(&meta));
+        let ext_at = data
+            .windows(4)
+            .rposition(|w| w == EXT_MAGIC)
+            .expect("block present");
+        assert!(deserialize_text_index_metas(&data[..ext_at + 5]).is_err());
     }
 
     #[test]
@@ -728,6 +922,10 @@ mod tests {
                 },
             ],
             db_index: 0,
+            #[cfg(feature = "text-index")]
+            tag_fields: Vec::new(),
+            #[cfg(feature = "text-index")]
+            numeric_fields: Vec::new(),
         };
 
         let data = serialize_text_index_metas(&[meta]);
@@ -792,6 +990,10 @@ mod tests {
             ],
             text_fields: vec![TextFieldDef::new(Bytes::from_static(b"content"))],
             db_index: 0,
+            #[cfg(feature = "text-index")]
+            tag_fields: Vec::new(),
+            #[cfg(feature = "text-index")]
+            numeric_fields: Vec::new(),
         };
 
         let data = serialize_text_index_metas(&[meta]);

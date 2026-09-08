@@ -1627,6 +1627,11 @@ impl super::Shard {
                             server_config.mvcc_old_snapshot_threshold_secs,
                         );
                     });
+                    // `.tpost`: encode dirty text indexes (2 ms budget) for
+                    // the off-loop writer.
+                    crate::shard::slice::with_shard(|s| {
+                        persistence_tick::text_postings_tick(&mut s.text_store, shard_id);
+                    });
                     // P6: ceiling-trigger — runs at 1s cadence to avoid the
                     // read_dir syscall overhead of wal.stats() on every 1ms tick.
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
@@ -1862,6 +1867,15 @@ impl super::Shard {
                             }
                         });
                     }
+                    // `.tpost`: flush every dirty text index and wait for the
+                    // writer, after the KV checkpoint so a crash mid-flush
+                    // still leaves a consistent (reconcilable) pair.
+                    crate::shard::slice::with_shard(|s| {
+                        persistence_tick::persist_text_postings_on_shutdown(
+                            &mut s.text_store,
+                            shard_id,
+                        );
+                    });
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.flush_sync();
                     }
@@ -2045,6 +2059,15 @@ impl super::Shard {
                             ),
                         );
                     }
+                    // `.tpost`: flush every dirty text index and wait for the
+                    // writer, after the KV checkpoint so a crash mid-flush
+                    // still leaves a consistent (reconcilable) pair.
+                    crate::shard::slice::with_shard(|s| {
+                        persistence_tick::persist_text_postings_on_shutdown(
+                            &mut s.text_store,
+                            shard_id,
+                        );
+                    });
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.flush_sync();
                     }
@@ -2436,6 +2459,11 @@ impl super::Shard {
                 // P6 is gated here (not per-1ms tick) to avoid the read_dir
                 // syscall overhead of wal.stats() on the hot path.
                 if monoio_tick_counter % 1000 == 0 {
+                    // `.tpost`: encode dirty text indexes (2 ms budget) for
+                    // the off-loop writer.
+                    crate::shard::slice::with_shard(|s| {
+                        persistence_tick::text_postings_tick(&mut s.text_store, shard_id);
+                    });
                     // O3: sample this shard thread's involuntary-preemption
                     // rate and gate the driver spin while the core is shared.
                     // The gate is thread-local in the vendored driver, so the
@@ -2850,16 +2878,10 @@ async fn recover_indexes_task(
         );
         for (i, meta) in text_metas.iter().enumerate() {
             crate::shard::slice::with_shard(|s| {
-                let mut text_index = crate::text::store::TextIndex::new(
-                    meta.name.clone(),
-                    meta.key_prefixes.clone(),
-                    meta.text_fields.clone(),
-                    meta.bm25_config,
-                );
-                // WS5a: carry the persisted db_index forward so a
-                // restart doesn't silently re-home a restored text
-                // index to db 0.
-                text_index.db_index = meta.db_index;
+                // `from_meta` carries db_index AND the TAG/NUMERIC schema
+                // (`TMX3` block) — `TextIndex::new` here used to drop both
+                // field kinds on every restart.
+                let text_index = crate::text::store::TextIndex::from_meta(meta);
                 // `restore_index`, not `create_index`: the latter rewrote the
                 // sidecar (two fsyncs) per index — 4,191 indexes spent this
                 // whole phase in fsync. One write follows the loop.
@@ -2885,10 +2907,43 @@ async fn recover_indexes_task(
         // `TextStore::load_term_fst_sidecars`'s doc comment for why
         // seeding after the rescan (or not at all) is exactly the
         // stale-id-space corruption this closes.
-        crate::shard::slice::with_shard(|s| {
-            s.text_store.save_index_meta_sidecar();
-            s.text_store.load_term_fst_sidecars();
-        });
+        crate::shard::slice::with_shard(|s| s.text_store.save_index_meta_sidecar());
+        // `.tpost`: load persisted postings into the (still empty) restored
+        // indexes, batched with yields like the definition loop above. An
+        // index whose file is missing, stale, corrupt or of another version
+        // stays empty and takes the keyspace-rescan path below, exactly as
+        // before. Loaded indexes are then reconciled per document during
+        // that rescan (`TextRecoveryState`) — see
+        // `docs/internal/text-postings-persistence.md`.
+        {
+            let names: Vec<bytes::Bytes> = text_metas.iter().map(|m| m.name.clone()).collect();
+            let mut loaded: Vec<(bytes::Bytes, usize)> = Vec::new();
+            let mut cursor = Some(0usize);
+            while let Some(at) = cursor {
+                cursor = crate::shard::slice::with_shard(|s| {
+                    s.text_store
+                        .load_postings_files(&names, at, RESTORE_YIELD_EVERY, &mut loaded)
+                });
+                crate::runtime::cooperative_yield().await;
+            }
+            let loaded_docs: usize = loaded.iter().map(|(_, n)| n).sum();
+            let loaded_count = loaded.len();
+            for (name, docs) in loaded {
+                recovery_state.text.mark_loaded(name, docs);
+            }
+            if loaded_count > 0 {
+                info!(
+                    "Shard {}: loaded {} of {} text index(es) from .tpost ({} doc(s))",
+                    shard_id,
+                    loaded_count,
+                    text_metas.len(),
+                    loaded_docs
+                );
+            }
+        }
+        // `.tfst` seeding for the indexes that did NOT load from `.tpost`
+        // (`load_term_fst_sidecars` skips the ones that did).
+        crate::shard::slice::with_shard(|s| s.text_store.load_term_fst_sidecars());
         info!(
             "Shard {}: restored {} text index definition(s) in {:.2?}",
             shard_id,
@@ -3091,8 +3146,14 @@ async fn recover_indexes_task(
     // per-index acceptance-signal log line. No-op (does nothing,
     // logs nothing) when no index had durable state to recover.
     if let Some(ref vdir) = vector_persist_dir {
+        #[cfg(feature = "text-index")]
+        let text_recovery = std::mem::take(&mut recovery_state.text);
         crate::shard::slice::with_shard(|s| {
             recovery_state.finish(&mut s.vector_store, vdir);
+            // Text plane: deletion probe + stats recompute + orphan sweep for
+            // the indexes loaded from `.tpost`.
+            #[cfg(feature = "text-index")]
+            text_recovery.finish(&mut s.text_store);
         });
     }
 }

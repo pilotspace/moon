@@ -13,6 +13,7 @@ use smallvec::SmallVec;
 use std::collections::HashMap;
 
 /// A single term's posting data across all documents.
+#[derive(Debug)]
 pub struct PostingList {
     /// Bitmap of document IDs containing this term.
     pub doc_ids: RoaringBitmap,
@@ -69,6 +70,38 @@ impl PostingList {
             .get(self.rank_index(doc_id))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Rebuild a posting list from its persisted parts (`.tpost` load).
+    ///
+    /// `doc_ids` must be strictly increasing, `term_freqs` (and `positions`,
+    /// when present) must have exactly one entry per doc, and every `tf`
+    /// must be `>= 1`. Returns `None` on any violation — the caller falls
+    /// back to a rebuild; nothing partial is ever constructed.
+    #[must_use]
+    pub fn from_parts(
+        doc_ids: &[u32],
+        term_freqs: Vec<u32>,
+        positions: Option<Vec<Vec<u32>>>,
+    ) -> Option<Self> {
+        if doc_ids.is_empty() || term_freqs.len() != doc_ids.len() {
+            return None;
+        }
+        if positions.as_ref().is_some_and(|p| p.len() != doc_ids.len()) {
+            return None;
+        }
+        if doc_ids.windows(2).any(|w| w[0] >= w[1]) || term_freqs.contains(&0) {
+            return None;
+        }
+        // `from_sorted_iter` is O(n) and rejects non-increasing input — the
+        // check above already guarantees it, so `ok()?` is a belt-and-braces
+        // failure path, never a panic.
+        let doc_ids = RoaringBitmap::from_sorted_iter(doc_ids.iter().copied()).ok()?;
+        Some(Self {
+            doc_ids,
+            term_freqs,
+            positions,
+        })
     }
 
     /// Position list for `doc_id` (rank-aligned), or `None` when positions are not
@@ -209,6 +242,44 @@ impl PostingStore {
     /// Get a reference to a posting list for the given term.
     pub fn get_posting(&self, term_id: u32) -> Option<&PostingList> {
         self.postings.get(&term_id)
+    }
+
+    /// Every `(term_id, posting)` pair, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &PostingList)> {
+        self.postings.iter().map(|(&t, p)| (t, p))
+    }
+
+    /// Rebuild a store from persisted lists (`.tpost` load): recomputes the
+    /// `doc -> terms` map and the resident-bytes accounting with the same
+    /// constants `add_term_occurrence` charges, so a loaded store reports
+    /// exactly what an incrementally built one would. `None` on a duplicate
+    /// `term_id` — the caller falls back to a rebuild.
+    #[must_use]
+    pub fn from_lists(lists: Vec<(u32, PostingList)>) -> Option<Self> {
+        let mut postings: HashMap<u32, PostingList> = HashMap::with_capacity(lists.len());
+        let mut doc_terms: HashMap<u32, SmallVec<[u32; 8]>> = HashMap::new();
+        let mut resident_bytes = 0usize;
+        for (term_id, list) in lists {
+            resident_bytes += POSTING_ENTRY_OVERHEAD;
+            resident_bytes += list.doc_ids.len() as usize * POSTING_OCCURRENCE_COST;
+            if let Some(pos_list) = &list.positions {
+                resident_bytes += pos_list
+                    .iter()
+                    .map(|p| p.len() * POSITION_COST)
+                    .sum::<usize>();
+            }
+            for doc_id in &list.doc_ids {
+                doc_terms.entry(doc_id).or_default().push(term_id);
+            }
+            if postings.insert(term_id, list).is_some() {
+                return None;
+            }
+        }
+        Some(Self {
+            postings,
+            doc_terms,
+            resident_bytes,
+        })
     }
 
     /// Number of documents containing the given term.

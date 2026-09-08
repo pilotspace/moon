@@ -68,6 +68,7 @@ jobs:
           - mq_registry_blob
           - redis_rdb_load
           - term_fst_sidecar
+          - text_postings_file
           - dump_payload
           - acl_keyspec
           - ft_create_args
@@ -151,6 +152,7 @@ jobs:
           - mq_registry_blob
           - redis_rdb_load
           - term_fst_sidecar
+          - text_postings_file
           - dump_payload
           - acl_keyspec
           - ft_create_args

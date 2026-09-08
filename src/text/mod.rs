@@ -17,9 +17,15 @@ pub mod analyzer;
 pub mod bm25;
 pub mod fst_dict;
 pub mod index_persist;
+#[cfg(feature = "text-index")]
+pub mod persist_writer;
 pub mod posting;
 #[cfg(feature = "text-index")]
+pub mod postings_persist;
+#[cfg(feature = "text-index")]
 pub mod query;
+#[cfg(feature = "text-index")]
+pub mod recovery;
 pub mod store;
 pub mod term_dict;
 pub mod types;

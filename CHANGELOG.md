@@ -114,6 +114,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per shard in the PerShard layout) plus the legacy flat `appendonly.aof`,
   and current from the directory as before; the post-rewrite baseline is
   unchanged. Trigger percentage, min-size and cadence are untouched.
+### Added
+
+- **`text`: text indexes load their postings on restart instead of
+  re-tokenising every hash under a text prefix.** A text index had no
+  durable form — `text-indexes.meta` carried definitions and `.tfst`
+  (written only by `FT.COMPACT`) the term dictionaries — so every boot
+  rebuilt every posting from the keyspace: ~0.22 µs per token, half
+  tokenising and half building postings, growing with the corpus forever.
+  Each index now persists its complete state to `{persist_dir}/{xxh64(name)}.tpost`
+  (postings, dictionaries, FSTs, doc maps, TAG/NUMERIC entries) plus one
+  content checksum per document, and a boot loads the file, then walks the
+  keyspace comparing the stored stamp with one computed over the live hash:
+  equal docs are skipped, changed docs re-indexed, docs whose key is gone
+  removed — so a stale or crash-torn file still yields exactly a rebuild's
+  result. Any missing/corrupt/version-mismatched/schema-mismatched file
+  means "rebuild this index"; nothing partial is ever installed. Encoding
+  runs on the shard thread under a 2 ms-per-second budget and a 1 % duty
+  cycle per index; every syscall (tmp → fsync → rename → dir fsync) runs on
+  one `moon-text-persist` thread; graceful shutdown flushes and waits.
+  Design and contract: `docs/internal/text-postings-persistence.md`.
+  Fuzz target `text_postings_file`. Measured on a generated corpus (macOS,
+  1,000 indexes, same binary both sides): 49.5k 40-120-word docs, the
+  index phase 3.22 s rebuilt → 0.95 s loaded (0.73 s decode of 93 MB +
+  0.17 s checksum walk); 19.8k 300-800-word docs, 6.40 s → 1.29 s. 1,100
+  queries (term, AND, phrase, prefix, stopword-only, TAG, NUMERIC,
+  match-all) return identical keys and scores loaded vs rebuilt; flipping
+  one byte in every file makes every index fall back and answer the same.
+  Also fixed a pre-existing restart data loss: TAG and NUMERIC field
+  definitions were dropped by the meta sidecar (see Fixed below).
+
+### Fixed
+
+- **`text`: TAG and NUMERIC fields no longer vanish on restart (or on a
+  replica).** The `text-indexes.meta` sidecar only ever carried TEXT field
+  definitions, so after every reboot `FT.SEARCH ix '@cat:{a}'` answered
+  `unknown_field` and numeric ranges likewise; the replication snapshot
+  streams the same bytes and lost them the same way. The definitions now
+  ride a `TMX3` block appended after the v2 body (the file keeps
+  `version = 2`; an older binary stops at `count` and keeps restoring the
+  TEXT fields it understands), and every restore path builds the index
+  through one constructor, `TextIndex::from_meta`.
+
 - **`recovery`: startup no longer spends minutes rebuilding index definitions
   it already has, re-loading a keyspace it then wipes, or sitting silent on an
   accepted socket.** A live 2.2M-key instance with 4,191 text + 2,793 vector
