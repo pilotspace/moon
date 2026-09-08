@@ -324,6 +324,55 @@ pub(crate) fn check_warm_transitions(
 // Warm-segment mmap budget enforcement
 // ---------------------------------------------------------------------------
 
+/// 1 s tick: encode dirty text indexes (budgeted, duty-cycled) and hand the
+/// bytes to the `.tpost` writer thread. No-op without the `text-index`
+/// feature. See `docs/internal/text-postings-persistence.md`.
+pub(crate) fn text_postings_tick(text_store: &mut crate::text::store::TextStore, shard_id: usize) {
+    #[cfg(feature = "text-index")]
+    {
+        const TICK_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
+        let n = text_store.persist_dirty_postings(TICK_BUDGET);
+        if n > 0 {
+            tracing::debug!(
+                "Shard {}: queued {} text index(es) for .tpost write",
+                shard_id,
+                n
+            );
+        }
+    }
+    #[cfg(not(feature = "text-index"))]
+    let _ = (text_store, shard_id);
+}
+
+/// Graceful shutdown: encode everything dirty and wait for the writer to
+/// land it. A failure only costs the next boot a rebuild of the affected
+/// indexes, so it is logged, never fatal.
+pub(crate) fn persist_text_postings_on_shutdown(
+    text_store: &mut crate::text::store::TextStore,
+    shard_id: usize,
+) {
+    #[cfg(feature = "text-index")]
+    {
+        const SHUTDOWN_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        let started = std::time::Instant::now();
+        match text_store.persist_all_postings_and_wait(SHUTDOWN_FLUSH_TIMEOUT) {
+            Ok(0) => {}
+            Ok(n) => info!(
+                "Shard {}: persisted {} text index(es) to .tpost in {:.2?}",
+                shard_id,
+                n,
+                started.elapsed()
+            ),
+            Err(e) => tracing::warn!(
+                "Shard {}: text postings flush on shutdown failed ({e}); affected indexes rebuild on next boot",
+                shard_id
+            ),
+        }
+    }
+    #[cfg(not(feature = "text-index"))]
+    let _ = (text_store, shard_id);
+}
+
 /// Enforce the warm-segment resident-bytes budget across all vector indexes.
 ///
 /// Called from the event loop on the warm-check timer (same 10s cadence as

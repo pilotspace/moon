@@ -3808,6 +3808,29 @@ pub fn auto_index_hset_public_txn(
 /// silently cross-contaminating index contents (worse than the read-path
 /// leak fixed in round 3, since it corrupts data rather than just exposing
 /// it). Triggers at `--shards 1` (no multi-shard fan-out required).
+/// Boot-reconcile variant: `text_unchanged` names the text indexes whose
+/// persisted postings for `key` were verified against the live hash
+/// (`TextRecoveryState::reconcile`) — they are skipped instead of
+/// re-tokenised. Everything else behaves like `auto_index_hset_public`.
+pub fn auto_index_hset_recover(
+    vector_store: &mut VectorStore,
+    text_store: &mut crate::text::store::TextStore,
+    key: &[u8],
+    args: &[crate::protocol::Frame],
+    db_index: u8,
+    text_unchanged: &[bytes::Bytes],
+) -> smallvec::SmallVec<[(bytes::Bytes, u64); 4]> {
+    auto_index_hset_inner(
+        vector_store,
+        text_store,
+        key,
+        args,
+        0,
+        db_index,
+        text_unchanged,
+    )
+}
+
 fn auto_index_hset(
     vector_store: &mut VectorStore,
     text_store: &mut crate::text::store::TextStore,
@@ -3816,9 +3839,24 @@ fn auto_index_hset(
     txn_id: u64,
     db_index: u8,
 ) -> smallvec::SmallVec<[(bytes::Bytes, u64); 4]> {
+    auto_index_hset_inner(vector_store, text_store, key, args, txn_id, db_index, &[])
+}
+
+fn auto_index_hset_inner(
+    vector_store: &mut VectorStore,
+    text_store: &mut crate::text::store::TextStore,
+    key: &[u8],
+    args: &[crate::protocol::Frame],
+    txn_id: u64,
+    db_index: u8,
+    text_unchanged: &[bytes::Bytes],
+) -> smallvec::SmallVec<[(bytes::Bytes, u64); 4]> {
     let mut inserted: smallvec::SmallVec<[(bytes::Bytes, u64); 4]> = smallvec::SmallVec::new();
     let matching_names = vector_store.find_matching_index_names_for_db(key, db_index);
-    let text_matching = text_store.find_matching_index_names_for_db(key, db_index);
+    let mut text_matching = text_store.find_matching_index_names_for_db(key, db_index);
+    if !text_unchanged.is_empty() {
+        text_matching.retain(|n| !text_unchanged.contains(n));
+    }
     if matching_names.is_empty() && text_matching.is_empty() {
         return inserted;
     }
@@ -3941,6 +3979,10 @@ fn auto_index_hset(
             // numeric_fields).
             #[cfg(feature = "text-index")]
             idx.numeric_index_document(key_hash, key, text_args);
+            // The `.tpost` validity stamp: what this doc's postings were
+            // built from. Must follow every indexing call above and see
+            // exactly the frames they saw.
+            idx.record_content_checksum(key_hash, text_args);
             any_text_indexed = true;
         }
     }

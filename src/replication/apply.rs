@@ -1160,15 +1160,10 @@ fn install_snapshot_index_defs(
                     for p in &meta.key_prefixes {
                         prefixes.push((meta.db_index, p.clone()));
                     }
-                    let mut text_index = crate::text::store::TextIndex::new(
-                        meta.name.clone(),
-                        meta.key_prefixes.clone(),
-                        meta.text_fields.clone(),
-                        meta.bm25_config,
-                    );
-                    // Carry the master's db binding forward (WS5a) — same as
-                    // the restart-recovery restore path.
-                    text_index.db_index = meta.db_index;
+                    // `from_meta` carries the master's db binding (WS5a) AND
+                    // its TAG/NUMERIC schema (`TMX3` block) — same constructor
+                    // as the restart-recovery restore path.
+                    let text_index = crate::text::store::TextIndex::from_meta(&meta);
                     if let Err(e) = s.text_store.create_index(meta.name.clone(), text_index) {
                         tracing::warn!(
                             "replica snapshot: failed to create text index '{}': {}",

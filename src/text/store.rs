@@ -45,6 +45,10 @@ const MAP_ENTRY_OVERHEAD: usize = 48;
 const ROARING_BIT_APPROX_COST: usize = 3;
 /// Fixed approximate cost of a brand-new (empty) `RoaringBitmap` container.
 #[cfg(feature = "text-index")]
+/// Hard cap on distinct values per NUMERIC field (see `numeric_bitmap_insert`).
+#[cfg(feature = "text-index")]
+const NUMERIC_CARDINALITY_LIMIT: usize = 10_000_000;
+
 const EMPTY_BITMAP_BASE_COST: usize = 8;
 
 /// Modifier for a query term — controls expansion strategy (D-16).
@@ -197,6 +201,19 @@ pub struct TextIndex {
     /// see when the fast-boot path was actually taken vs silently falling
     /// back to a full rescan (missing/stale/corrupt sidecar).
     pub recovered_from_sidecar: bool,
+
+    /// Per-document content checksum (`content_checksum` over the schema
+    /// fields as they were indexed) — the `.tpost` validity stamp, mirroring
+    /// the vector plane's `key_hash_to_vec_checksum`. Absent for docs indexed
+    /// by a path that did not record one (treated as "changed" on reconcile).
+    pub doc_id_to_content_checksum: HashMap<u32, u64>,
+    /// Bumped by every mutator; `persisted_seq` trails it. Dirty when they
+    /// differ. Both start at 0 so a fresh empty index is clean.
+    mutation_seq: u64,
+    persisted_seq: u64,
+    /// Duty-cycle state for `TextStore::persist_dirty_postings`.
+    last_encode_at: Option<std::time::Instant>,
+    last_encode_cost: std::time::Duration,
 }
 
 impl TextIndex {
@@ -260,7 +277,31 @@ impl TextIndex {
             db_index: 0,
             resident_bytes_extra: 0,
             recovered_from_sidecar: false,
+            doc_id_to_content_checksum: HashMap::new(),
+            mutation_seq: 0,
+            persisted_seq: 0,
+            last_encode_at: None,
+            last_encode_cost: std::time::Duration::ZERO,
         }
+    }
+
+    /// Rebuild an EMPTY index from its persisted (or replicated) definition —
+    /// the one constructor every restore path shares, so TAG/NUMERIC fields
+    /// cannot be forgotten by one of them again.
+    #[cfg(feature = "text-index")]
+    pub fn from_meta(meta: &TextIndexMeta) -> Self {
+        let mut idx = Self::new_with_schema(
+            meta.name.clone(),
+            meta.key_prefixes.clone(),
+            meta.text_fields.clone(),
+            meta.tag_fields.clone(),
+            meta.numeric_fields.clone(),
+            meta.bm25_config,
+        );
+        // WS5a: carry the persisted db_index forward so a restart doesn't
+        // silently re-home a restored text index to db 0.
+        idx.db_index = meta.db_index;
+        idx
     }
 
     /// Create a TextIndex with an explicit TAG + NUMERIC schema (Plan 152-06 / 07).
@@ -390,6 +431,325 @@ impl TextIndex {
         }
         let delete_lsn = self.doc_id_to_delete_lsn.get(&doc_id).copied().unwrap_or(0);
         delete_lsn == 0 || delete_lsn > as_of_lsn
+    }
+
+    // ── `.tpost` persistence support ─────────────────────────────────────
+    //
+    // Design and contract: `docs/internal/text-postings-persistence.md`.
+
+    const CONTENT_CHECKSUM_ENTRY_COST: usize =
+        std::mem::size_of::<u32>() + std::mem::size_of::<u64>() + MAP_ENTRY_OVERHEAD;
+
+    #[inline]
+    fn mark_dirty(&mut self) {
+        self.mutation_seq = self.mutation_seq.wrapping_add(1);
+    }
+
+    /// Something changed since the last encode (or the index was never encoded).
+    #[inline]
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        self.mutation_seq != self.persisted_seq
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn next_doc_id(&self) -> u32 {
+        self.next_doc_id
+    }
+
+    /// Everything a query's answer depends on that is fixed at `FT.CREATE`
+    /// time. Stored in the `.tpost` header; a mismatch means the definition
+    /// changed under the file and the whole index is rebuilt.
+    #[must_use]
+    pub fn schema_hash(&self) -> u64 {
+        use xxhash_rust::xxh64::Xxh64;
+        let mut h = Xxh64::new(0);
+        h.update(b"moon-tpost-schema-v1");
+        h.update(&(self.name.len() as u32).to_le_bytes());
+        h.update(&self.name);
+        h.update(&[self.db_index]);
+        h.update(&(self.key_prefixes.len() as u32).to_le_bytes());
+        for p in &self.key_prefixes {
+            h.update(&(p.len() as u32).to_le_bytes());
+            h.update(p);
+        }
+        h.update(&self.bm25_config.k1.to_bits().to_le_bytes());
+        h.update(&self.bm25_config.b.to_bits().to_le_bytes());
+        h.update(&(self.text_fields.len() as u32).to_le_bytes());
+        for f in &self.text_fields {
+            h.update(&(f.field_name.len() as u32).to_le_bytes());
+            h.update(&f.field_name);
+            h.update(&f.weight.to_bits().to_le_bytes());
+            h.update(&[f.nostem as u8, f.sortable as u8, f.noindex as u8]);
+        }
+        #[cfg(feature = "text-index")]
+        {
+            h.update(&(self.tag_fields.len() as u32).to_le_bytes());
+            for t in &self.tag_fields {
+                h.update(&(t.field_name.len() as u32).to_le_bytes());
+                h.update(&t.field_name);
+                h.update(&[
+                    t.separator,
+                    t.case_sensitive as u8,
+                    t.sortable as u8,
+                    t.noindex as u8,
+                ]);
+            }
+            h.update(&(self.numeric_fields.len() as u32).to_le_bytes());
+            for n in &self.numeric_fields {
+                h.update(&(n.field_name.len() as u32).to_le_bytes());
+                h.update(&n.field_name);
+                h.update(&[n.sortable as u8, n.noindex as u8]);
+            }
+        }
+        h.digest()
+    }
+
+    /// The per-document validity stamp: xxh64 over the values of every
+    /// schema field (TEXT, then TAG, then NUMERIC, in schema order) present
+    /// in `args`, with an explicit absent marker per missing field.
+    ///
+    /// Called with the SAME field/value frames at index time
+    /// (`record_content_checksum`) and, at boot, over the live hash
+    /// (`TextRecoveryState::reconcile`). Equal ⇒ the postings were built from
+    /// exactly these values. A partial `HSET`, an `HDEL`, or an extra schema
+    /// field written later all change it, so the doc is re-indexed from the
+    /// full hash — what a rebuild would have done. Never 0 (0 = "unknown").
+    #[must_use]
+    pub fn content_checksum(&self, args: &[crate::protocol::Frame]) -> u64 {
+        use xxhash_rust::xxh64::Xxh64;
+        let mut h = Xxh64::new(0);
+        h.update(b"moon-tpost-doc-v1");
+        let mut feed = |section: u8, ordinal: usize, name: &[u8]| match find_field_value(args, name)
+        {
+            Some(v) => {
+                h.update(&[section, 1]);
+                h.update(&(ordinal as u32).to_le_bytes());
+                h.update(&(v.len() as u32).to_le_bytes());
+                h.update(v);
+            }
+            None => {
+                h.update(&[section, 0]);
+                h.update(&(ordinal as u32).to_le_bytes());
+            }
+        };
+        for (i, f) in self.text_fields.iter().enumerate() {
+            feed(1, i, &f.field_name);
+        }
+        #[cfg(feature = "text-index")]
+        {
+            for (i, t) in self.tag_fields.iter().enumerate() {
+                feed(2, i, &t.field_name);
+            }
+            for (i, n) in self.numeric_fields.iter().enumerate() {
+                feed(3, i, &n.field_name);
+            }
+        }
+        h.digest().max(1)
+    }
+
+    /// Stamp the doc for `key_hash` with `content_checksum(args)`. Call after
+    /// the text/tag/numeric indexing of the same `args`; a no-op for a key the
+    /// index does not track.
+    pub fn record_content_checksum(&mut self, key_hash: u64, args: &[crate::protocol::Frame]) {
+        let Some(&doc_id) = self.key_hash_to_doc_id.get(&key_hash) else {
+            return;
+        };
+        let sum = self.content_checksum(args);
+        if self
+            .doc_id_to_content_checksum
+            .insert(doc_id, sum)
+            .is_none()
+        {
+            self.resident_bytes_extra += Self::CONTENT_CHECKSUM_ENTRY_COST;
+        }
+        self.mark_dirty();
+    }
+
+    /// Stored stamp for a tracked key, if any.
+    #[must_use]
+    pub fn stored_content_checksum(&self, key_hash: u64) -> Option<u64> {
+        let doc_id = self.key_hash_to_doc_id.get(&key_hash)?;
+        self.doc_id_to_content_checksum.get(doc_id).copied()
+    }
+
+    /// `field_stats` from first principles: `num_docs` = every tracked doc
+    /// (what `index_document` counts for a new doc, for every field) and
+    /// `total_field_length` = Σ per-doc lengths. This is what a rebuild
+    /// produces; the live incremental accounting can drift from it
+    /// (`remove_doc_by_doc_id` only decrements `num_docs` for non-empty
+    /// fields), so a loaded index recomputes instead of trusting the file.
+    pub fn recompute_field_stats(&mut self) {
+        let docs = self.doc_id_to_key.len() as u32;
+        for (f, stats) in self.field_stats.iter_mut().enumerate() {
+            stats.num_docs = docs;
+            stats.total_field_length = self
+                .doc_field_lengths
+                .values()
+                .map(|l| l.get(f).copied().unwrap_or(0) as u64)
+                .sum();
+        }
+    }
+
+    /// Install a decoded `.tpost` into this EMPTY index. All-or-nothing:
+    /// every piece is built into locals and validated against the live
+    /// schema before anything is assigned; `Err` leaves `self` untouched so
+    /// the caller can take the rebuild path.
+    #[cfg(feature = "text-index")]
+    pub fn install_recovered(
+        &mut self,
+        p: crate::text::postings_persist::PersistedTextIndex,
+    ) -> Result<(), &'static str> {
+        if !self.doc_id_to_key.is_empty() || self.next_doc_id != 0 {
+            return Err("index is not empty");
+        }
+        if p.schema_hash != self.schema_hash() {
+            return Err("schema hash mismatch");
+        }
+        if p.name != self.name || p.db_index != self.db_index {
+            return Err("name or db mismatch");
+        }
+        if p.fields.len() != self.text_fields.len() {
+            return Err("text field count mismatch");
+        }
+        if p.docs
+            .iter()
+            .any(|d| d.field_lengths.len() != self.text_fields.len())
+        {
+            return Err("doc field_lengths length mismatch");
+        }
+
+        let mut dicts = Vec::with_capacity(p.fields.len());
+        let mut stores = Vec::with_capacity(p.fields.len());
+        let mut fsts: Vec<Option<fst::Map<Vec<u8>>>> = Vec::with_capacity(p.fields.len());
+        for (f, field) in p.fields.into_iter().enumerate() {
+            let dict =
+                TermDictionary::from_pairs(field.terms, field.next_id, field.fst_high_water_mark)
+                    .ok_or("term dictionary invariants")?;
+            let store =
+                PostingStore::from_lists(field.postings).ok_or("posting store invariants")?;
+            let fst = match field.fst_bytes {
+                Some(bytes) => match fst::Map::new(bytes) {
+                    Ok(map) => Some(map),
+                    Err(e) => {
+                        // Same policy as the `.tfst` loader: the FST is an
+                        // accelerator, the dictionary is the truth.
+                        tracing::warn!(
+                            "text index {}[{}]: persisted FST failed to parse, continuing without it: {}",
+                            String::from_utf8_lossy(&self.name),
+                            f,
+                            e
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            dicts.push(dict);
+            stores.push(store);
+            fsts.push(fst);
+        }
+        for (doc_id, entries) in &p.tag_docs {
+            let _ = doc_id;
+            if entries
+                .iter()
+                .any(|(field, _)| !self.tag_fields.iter().any(|t| t.field_name == *field))
+            {
+                return Err("tag entry for a field not in the schema");
+            }
+        }
+        for (doc_id, entries) in &p.numeric_docs {
+            let _ = doc_id;
+            if entries
+                .iter()
+                .any(|(field, _)| !self.numeric_fields.iter().any(|n| n.field_name == *field))
+            {
+                return Err("numeric entry for a field not in the schema");
+            }
+        }
+
+        // Validated — assign.
+        self.next_doc_id = p.next_doc_id;
+        let field_count = self.text_fields.len();
+        for d in p.docs {
+            let key_hash = xxhash_rust::xxh64::xxh64(&d.key, 0);
+            self.key_hash_to_doc_id.insert(key_hash, d.doc_id);
+            self.charge_new_doc_key(d.key.len());
+            self.doc_id_to_key.insert(d.doc_id, d.key);
+            self.doc_field_lengths.insert(d.doc_id, d.field_lengths);
+            self.resident_bytes_extra += std::mem::size_of::<u32>()
+                + field_count * std::mem::size_of::<u32>()
+                + MAP_ENTRY_OVERHEAD;
+            self.set_doc_insert_lsn(d.doc_id, d.insert_lsn);
+            if d.content_checksum != 0 {
+                self.doc_id_to_content_checksum
+                    .insert(d.doc_id, d.content_checksum);
+                self.resident_bytes_extra += Self::CONTENT_CHECKSUM_ENTRY_COST;
+            }
+        }
+        self.field_term_dicts = dicts;
+        self.field_postings = stores;
+        for (f, fst) in fsts.into_iter().enumerate() {
+            self.set_fst_map(f, fst);
+        }
+        for (doc_id, entries) in p.tag_docs {
+            let mut next: smallvec::SmallVec<[(Bytes, Bytes); 8]> = smallvec::SmallVec::new();
+            for (field, value) in entries {
+                self.tag_bitmap_insert(&field, &value, doc_id);
+                next.push((field, value));
+            }
+            self.resident_bytes_extra += Self::tag_entries_cost(&next);
+            self.doc_tag_entries.insert(doc_id, next);
+        }
+        for (doc_id, entries) in p.numeric_docs {
+            let mut next: smallvec::SmallVec<[(Bytes, ordered_float::OrderedFloat<f64>); 4]> =
+                smallvec::SmallVec::new();
+            for (field, value) in entries {
+                let of = ordered_float::OrderedFloat(value);
+                if self.numeric_bitmap_insert(&field, of, doc_id) {
+                    next.push((field, of));
+                }
+            }
+            if !next.is_empty() {
+                self.resident_bytes_extra += Self::numeric_entries_cost(&next);
+                self.doc_numeric_entries.insert(doc_id, next);
+            }
+        }
+        self.recompute_field_stats();
+        self.recovered_from_sidecar = true;
+        // Freshly loaded == freshly persisted.
+        self.persisted_seq = self.mutation_seq;
+        Ok(())
+    }
+
+    /// Encode this index for `.tpost` and mark it clean. Returns the bytes
+    /// and how long the encode took (feeds the duty cycle).
+    #[cfg(feature = "text-index")]
+    pub fn encode_for_persist(&mut self, now: std::time::Instant) -> Vec<u8> {
+        let bytes = crate::text::postings_persist::encode_index(self);
+        self.persisted_seq = self.mutation_seq;
+        self.last_encode_cost = now.elapsed();
+        self.last_encode_at = Some(now);
+        bytes
+    }
+
+    /// Duty-cycle gate for the periodic flush: an index that took `c` to
+    /// encode is not encoded again within `max(1 s, 100 × c)` — 1 % of the
+    /// shard thread at most, however big the index. Shutdown bypasses this.
+    #[cfg(feature = "text-index")]
+    #[must_use]
+    pub fn persist_due(&self, now: std::time::Instant) -> bool {
+        if !self.is_dirty() {
+            return false;
+        }
+        match self.last_encode_at {
+            None => true,
+            Some(at) => {
+                let min_gap = (self.last_encode_cost * 100).max(std::time::Duration::from_secs(1));
+                now.saturating_duration_since(at) >= min_gap
+            }
+        }
     }
 
     /// Record the insertion LSN for a doc_id after `index_document` allocates it.
@@ -535,6 +895,7 @@ impl TextIndex {
                 + MAP_ENTRY_OVERHEAD;
         }
         self.doc_field_lengths.insert(doc_id, field_lengths);
+        self.mark_dirty();
     }
 
     /// Search a specific field for query terms with BM25 scoring.
@@ -709,6 +1070,7 @@ impl TextIndex {
     /// acceleration structure; its absence only affects fuzzy/prefix queries.
     #[cfg(feature = "text-index")]
     pub fn build_fst(&mut self) {
+        self.mark_dirty();
         for field_idx in 0..self.field_term_dicts.len() {
             match crate::text::fst_dict::build_fst_from_term_dict(&self.field_term_dicts[field_idx])
             {
@@ -977,6 +1339,7 @@ impl TextIndex {
         if self.tag_fields.is_empty() {
             return;
         }
+        self.mark_dirty();
 
         const TAG_VALUE_MAX_LEN: usize = 4096;
         const TAG_VALUES_PER_FIELD_PER_DOC: usize = 1_024;
@@ -1307,7 +1670,7 @@ impl TextIndex {
             return;
         }
 
-        const NUMERIC_CARDINALITY_LIMIT: usize = 10_000_000;
+        self.mark_dirty();
 
         let doc_id = self.ensure_doc_id(key_hash, key);
 
@@ -1346,7 +1709,8 @@ impl TextIndex {
         }
 
         // Insert fresh entries for each touched field.
-        for num_def in &self.numeric_fields {
+        for i in 0..self.numeric_fields.len() {
+            let num_def = self.numeric_fields[i].clone();
             if num_def.noindex {
                 continue;
             }
@@ -1385,43 +1749,53 @@ impl TextIndex {
             }
             let of = ordered_float::OrderedFloat(parsed);
             let canonical_field = num_def.field_name.clone();
-            let field_is_new = !self.numeric_indexes.contains_key(&canonical_field);
-            let btree = self
-                .numeric_indexes
-                .entry(canonical_field.clone())
-                .or_default();
-            // T-152-07-01: cardinality cap.
-            if !btree.contains_key(&of) && btree.len() >= NUMERIC_CARDINALITY_LIMIT {
-                tracing::warn!(
-                    field = ?canonical_field,
-                    "numeric cardinality cap reached; dropping new value"
-                );
-                continue;
+            if self.numeric_bitmap_insert(&canonical_field, of, doc_id) {
+                next.push((canonical_field, of));
             }
-            // K4 (P0 fix): charge the O(1) fixed-cost delta for any
-            // newly-created field/value/doc-bit -- checked AFTER the
-            // cardinality cap so a dropped value is never charged.
-            let value_is_new = !btree.contains_key(&of);
-            let bm = btree.entry(of).or_default();
-            let doc_is_new = !bm.contains(doc_id);
-            bm.insert(doc_id);
-            if doc_is_new {
-                self.resident_bytes_extra += ROARING_BIT_APPROX_COST;
-            }
-            if value_is_new {
-                self.resident_bytes_extra +=
-                    std::mem::size_of::<f64>() + MAP_ENTRY_OVERHEAD + EMPTY_BITMAP_BASE_COST;
-            }
-            if field_is_new {
-                self.resident_bytes_extra += canonical_field.len() + MAP_ENTRY_OVERHEAD;
-            }
-            next.push((canonical_field, of));
         }
 
         if !next.is_empty() {
             self.resident_bytes_extra += Self::numeric_entries_cost(&next);
             self.doc_numeric_entries.insert(doc_id, next);
         }
+    }
+
+    /// Insert `doc_id` under `field -> value`, charging the O(1) fixed-cost
+    /// delta for any newly created field/value/doc bit — checked AFTER the
+    /// cardinality cap so a dropped value is never charged. Returns `false`
+    /// when the cap dropped it. Shared by `numeric_index_document` and
+    /// `install_recovered` so the two cannot drift.
+    #[cfg(feature = "text-index")]
+    fn numeric_bitmap_insert(
+        &mut self,
+        field: &Bytes,
+        value: ordered_float::OrderedFloat<f64>,
+        doc_id: u32,
+    ) -> bool {
+        let field_is_new = !self.numeric_indexes.contains_key(field);
+        let btree = self.numeric_indexes.entry(field.clone()).or_default();
+        if !btree.contains_key(&value) && btree.len() >= NUMERIC_CARDINALITY_LIMIT {
+            tracing::warn!(
+                field = ?field,
+                "numeric cardinality cap reached; dropping new value"
+            );
+            return false;
+        }
+        let value_is_new = !btree.contains_key(&value);
+        let bm = btree.entry(value).or_default();
+        let doc_is_new = !bm.contains(doc_id);
+        bm.insert(doc_id);
+        if doc_is_new {
+            self.resident_bytes_extra += ROARING_BIT_APPROX_COST;
+        }
+        if value_is_new {
+            self.resident_bytes_extra +=
+                std::mem::size_of::<f64>() + MAP_ENTRY_OVERHEAD + EMPTY_BITMAP_BASE_COST;
+        }
+        if field_is_new {
+            self.resident_bytes_extra += field.len() + MAP_ENTRY_OVERHEAD;
+        }
+        true
     }
 
     /// K4 (P0 fix): revoke `doc_id` from `numeric_indexes[field][value]`,
@@ -1651,7 +2025,9 @@ impl TextIndex {
             .values()
             .map(|k| std::mem::size_of::<u32>() + k.len() + MAP_ENTRY_OVERHEAD)
             .sum();
-        let lsn_maps = (self.doc_id_to_insert_lsn.len() + self.doc_id_to_delete_lsn.len())
+        let lsn_maps = (self.doc_id_to_insert_lsn.len()
+            + self.doc_id_to_delete_lsn.len()
+            + self.doc_id_to_content_checksum.len())
             * (std::mem::size_of::<u32>() + std::mem::size_of::<u64>() + MAP_ENTRY_OVERHEAD);
 
         #[cfg(feature = "text-index")]
@@ -1806,6 +2182,12 @@ impl TextIndex {
                 std::mem::size_of::<u32>() + std::mem::size_of::<u64>() + MAP_ENTRY_OVERHEAD,
             );
         }
+        if self.doc_id_to_content_checksum.remove(&doc_id).is_some() {
+            self.resident_bytes_extra = self
+                .resident_bytes_extra
+                .saturating_sub(Self::CONTENT_CHECKSUM_ENTRY_COST);
+        }
+        self.mark_dirty();
         // `doc_id_to_delete_lsn` currently has no insertion call site anywhere
         // in the codebase (reserved for future v0.2 logical-delete wiring --
         // see the field's doc comment on `TextIndex`), so this `.remove()` is
@@ -1976,6 +2358,10 @@ impl TextStore {
                 key_prefixes: idx.key_prefixes.clone(),
                 text_fields: idx.text_fields.clone(),
                 db_index: idx.db_index,
+                #[cfg(feature = "text-index")]
+                tag_fields: idx.tag_fields.clone(),
+                #[cfg(feature = "text-index")]
+                numeric_fields: idx.numeric_fields.clone(),
             })
             .collect()
     }
@@ -2025,6 +2411,13 @@ impl TextStore {
         };
         if removed {
             self.save_index_meta_sidecar();
+            // The `.tpost` goes with the definition — off-thread, and a
+            // boot-time sweep catches a crash between the two writes.
+            #[cfg(feature = "text-index")]
+            if let Some(ref dir) = self.persist_dir {
+                crate::text::persist_writer::writer()
+                    .submit_delete(crate::text::postings_persist::postings_file_path(dir, name));
+            }
             // Bump version AFTER successful drop (monotonicity-on-success contract).
             self.bump_version();
         }
@@ -2083,6 +2476,11 @@ impl TextStore {
                     idx.bm25_config,
                 );
                 idx.db_index = db_index;
+                // The on-disk `.tpost` still holds the flushed docs: dirty
+                // the empty index so the next flush overwrites it, rather
+                // than leaving the next boot to load and then probe-delete
+                // every one of them.
+                idx.mark_dirty();
                 any = true;
             }
             if any {
@@ -2331,6 +2729,161 @@ impl TextStore {
     /// apply a sidecar (e.g. seed the dict but skip a corrupt FST, or vice
     /// versa) -- that would silently reintroduce the id-space mismatch this
     /// function exists to prevent.
+    // ── `.tpost` postings persistence ────────────────────────────────────
+    //
+    // `docs/internal/text-postings-persistence.md`. Encoding runs here, on
+    // the shard thread (CPU only); every syscall runs on
+    // `text::persist_writer`'s thread.
+
+    /// Encode dirty indexes that are due (see `TextIndex::persist_due`) and
+    /// hand the bytes to the writer, stopping once `budget` is spent (at
+    /// least one index per call) or the writer is `MAX_PENDING_BYTES`
+    /// behind. Returns how many indexes were encoded. The 1 s tick of both
+    /// event-loop legs calls this.
+    #[cfg(feature = "text-index")]
+    pub fn persist_dirty_postings(&mut self, budget: std::time::Duration) -> usize {
+        let Some(dir) = self.persist_dir.clone() else {
+            return 0;
+        };
+        let writer = crate::text::persist_writer::writer();
+        let started = std::time::Instant::now();
+        let mut encoded = 0usize;
+        for idx in self.indexes.values_mut() {
+            if encoded > 0 && started.elapsed() >= budget {
+                break;
+            }
+            let now = std::time::Instant::now();
+            if !idx.persist_due(now) {
+                continue;
+            }
+            if writer.pending_bytes() >= crate::text::persist_writer::MAX_PENDING_BYTES {
+                break;
+            }
+            let bytes = idx.encode_for_persist(now);
+            writer.submit_write(
+                crate::text::postings_persist::postings_file_path(&dir, &idx.name),
+                bytes,
+            );
+            encoded += 1;
+        }
+        encoded
+    }
+
+    /// Shutdown: encode EVERYTHING dirty (no duty cycle, no budget) and wait
+    /// for the writer to land it. The error is the first write failure, if
+    /// any — the caller logs it; the next boot rebuilds those indexes.
+    #[cfg(feature = "text-index")]
+    pub fn persist_all_postings_and_wait(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<usize> {
+        let Some(dir) = self.persist_dir.clone() else {
+            return Ok(0);
+        };
+        let writer = crate::text::persist_writer::writer();
+        let mut encoded = 0usize;
+        for idx in self.indexes.values_mut() {
+            if !idx.is_dirty() {
+                continue;
+            }
+            let bytes = idx.encode_for_persist(std::time::Instant::now());
+            writer.submit_write(
+                crate::text::postings_persist::postings_file_path(&dir, &idx.name),
+                bytes,
+            );
+            encoded += 1;
+        }
+        writer.flush_blocking(timeout)?;
+        Ok(encoded)
+    }
+
+    /// Boot: for every (empty, just-restored) index try its `.tpost`. Every
+    /// failure is logged and leaves that index on the rebuild path; the
+    /// caller records the returned `(name, doc_count)` pairs with
+    /// `TextRecoveryState::mark_loaded`. `yield_every` lets the caller
+    /// interleave `cooperative_yield` between batches: this loads at most
+    /// that many indexes per call starting at `cursor` and returns the next
+    /// cursor (`None` when done).
+    #[cfg(feature = "text-index")]
+    pub fn load_postings_files(
+        &mut self,
+        names: &[Bytes],
+        cursor: usize,
+        batch: usize,
+        loaded: &mut Vec<(Bytes, usize)>,
+    ) -> Option<usize> {
+        let dir = self.persist_dir.clone()?;
+        let end = cursor.saturating_add(batch).min(names.len());
+        for name in &names[cursor..end] {
+            let Some(idx) = self.indexes.get_mut(name) else {
+                continue;
+            };
+            let bytes = match crate::text::postings_persist::read_postings_file(&dir, name) {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        "text index {}: .tpost unreadable, rebuilding from the keyspace: {e}",
+                        String::from_utf8_lossy(name)
+                    );
+                    continue;
+                }
+            };
+            let persisted = match crate::text::postings_persist::decode(&bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        "text index {}: .tpost rejected ({e}), rebuilding from the keyspace",
+                        String::from_utf8_lossy(name)
+                    );
+                    continue;
+                }
+            };
+            let doc_count = persisted.docs.len();
+            match idx.install_recovered(persisted) {
+                Ok(()) => loaded.push((name.clone(), doc_count)),
+                Err(reason) => tracing::warn!(
+                    "text index {}: .tpost does not match the live definition ({reason}), rebuilding from the keyspace",
+                    String::from_utf8_lossy(name)
+                ),
+            }
+        }
+        (end < names.len()).then_some(end)
+    }
+
+    /// Delete `.tpost` files that belong to no index in this store (dropped
+    /// between the definition write and the file delete, or written by an
+    /// index that no longer exists). Boot-time, after the reconcile.
+    #[cfg(feature = "text-index")]
+    pub fn sweep_orphan_postings_files(&self) {
+        let Some(ref dir) = self.persist_dir else {
+            return;
+        };
+        let known: std::collections::HashSet<std::ffi::OsString> = self
+            .indexes
+            .keys()
+            .filter_map(|n| {
+                crate::text::postings_persist::postings_file_path(dir, n)
+                    .file_name()
+                    .map(|f| f.to_os_string())
+            })
+            .collect();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            if !file_name.to_string_lossy().ends_with(".tpost") || known.contains(&file_name) {
+                continue;
+            }
+            tracing::info!(
+                "sweeping orphan text postings file {}",
+                entry.path().display()
+            );
+            crate::text::persist_writer::writer().submit_delete(entry.path());
+        }
+    }
+
     #[cfg(feature = "text-index")]
     pub fn load_term_fst_sidecars(&mut self) {
         let Some(ref dir) = self.persist_dir else {
@@ -2358,6 +2911,12 @@ impl TextStore {
             let Some(idx) = self.indexes.get_mut(name.as_ref()) else {
                 continue;
             };
+            if idx.recovered_from_sidecar {
+                // Already populated from `.tpost`, which carries the same
+                // dictionaries and FSTs: seeding again would replace live
+                // ids with an older generation's.
+                continue;
+            }
             if loaded.len() != idx.field_term_dicts.len() {
                 // Schema changed (field count differs) since the sidecar
                 // was written -- stale, fail closed.

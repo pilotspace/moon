@@ -182,6 +182,10 @@ pub struct RecoveryState {
     /// index whose manifest just hasn't been read yet".
     known_index_hexes: HashSet<String>,
     counters: HashMap<Bytes, IndexRecoveryCounters>,
+    /// The text plane's half of the same walk: per-doc checksum reconcile
+    /// for indexes loaded from `.tpost` (see `text::recovery`).
+    #[cfg(feature = "text-index")]
+    pub text: crate::text::recovery::TextRecoveryState,
 }
 
 impl RecoveryState {
@@ -192,6 +196,8 @@ impl RecoveryState {
             observed_key_hashes: HashMap::new(),
             known_index_hexes: HashSet::new(),
             counters: HashMap::new(),
+            #[cfg(feature = "text-index")]
+            text: crate::text::recovery::TextRecoveryState::new(),
         }
     }
 
@@ -311,6 +317,12 @@ impl RecoveryState {
     ) {
         let matching_vector = vector_store.find_matching_index_names_for_db(key, db_index);
         let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
+        // Text plane: which LOADED text indexes already hold this doc's
+        // postings, verified by content checksum. Those are skipped below.
+        #[cfg(feature = "text-index")]
+        let text_unchanged = self.text.reconcile(text_store, key, args, db_index);
+        #[cfg(not(feature = "text-index"))]
+        let text_unchanged: [Bytes; 0] = [];
 
         let mut any_recovered_checked = false;
         let mut all_unchanged = true;
@@ -364,12 +376,13 @@ impl RecoveryState {
 
         if any_recovered_checked && all_unchanged {
             let stripped = strip_default_vector_fields(&matching_vector, vector_store, args);
-            let inserted = crate::shard::spsc_handler::auto_index_hset_public(
+            let inserted = crate::shard::spsc_handler::auto_index_hset_recover(
                 vector_store,
                 text_store,
                 key,
                 &stripped,
                 db_index,
+                &text_unchanged,
             );
             debug_assert!(
                 inserted.is_empty(),
@@ -381,12 +394,13 @@ impl RecoveryState {
                 }
             }
         } else {
-            let _ = crate::shard::spsc_handler::auto_index_hset_public(
+            let _ = crate::shard::spsc_handler::auto_index_hset_recover(
                 vector_store,
                 text_store,
                 key,
                 args,
                 db_index,
+                &text_unchanged,
             );
             for idx_name in &matching_vector {
                 if self.recovered_names.contains(idx_name) {
