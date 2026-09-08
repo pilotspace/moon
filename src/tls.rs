@@ -298,8 +298,7 @@ mod tests {
     #[test]
     fn test_build_tls_config_missing_key() {
         // Create a temp cert file but no key
-        let dir = std::env::temp_dir().join("moon-tls-test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = crate::util::test_temp::unique_test_dir("moon-tls-test");
         let cert_path = dir.join("test.crt");
         std::fs::write(&cert_path, "not a real cert").unwrap();
 
@@ -331,8 +330,7 @@ mod tests {
     /// panic or a silently-empty cert chain.
     #[test]
     fn test_build_tls_config_garbage_cert_parse_error() {
-        let dir = std::env::temp_dir().join("moon-tls-garbage-cert-test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = crate::util::test_temp::unique_test_dir("moon-tls-garbage-cert-test");
         let cert_path = dir.join("garbage.crt");
         let key_path = dir.join("unused.key");
         std::fs::write(
@@ -361,8 +359,7 @@ mod tests {
     /// returning a bogus key.
     #[test]
     fn test_build_tls_config_garbage_key_parse_error() {
-        let dir = std::env::temp_dir().join("moon-tls-garbage-key-test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = crate::util::test_temp::unique_test_dir("moon-tls-garbage-key-test");
         let cert_path = dir.join("valid.crt");
         let key_path = dir.join("garbage.key");
 
@@ -416,8 +413,7 @@ mod tests {
 
     #[test]
     fn test_reload_tls_config_swaps_config() {
-        let dir = std::env::temp_dir().join("moon-tls-reload-test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = crate::util::test_temp::unique_test_dir("moon-tls-reload-test");
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
 
@@ -510,8 +506,7 @@ mod tests {
 
     #[test]
     fn test_reload_tls_config_failure_keeps_old() {
-        let dir = std::env::temp_dir().join("moon-tls-reload-fail-test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = crate::util::test_temp::unique_test_dir("moon-tls-reload-fail-test");
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
 
