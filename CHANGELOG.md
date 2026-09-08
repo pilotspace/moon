@@ -44,6 +44,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Five lib tests plus two `scripts/test-consistency.sh` rows, all verified to
   fail against the pre-fix binary.
 
+- **`persistence`: the WAL ceiling-trigger no longer re-reads every sealed
+  segment every ~10 s to free nothing (#870).** With the WAL past
+  `--max-wal-size`, at least one completed checkpoint, and a
+  workspace/MQ/temporal record in each sealed segment, the overflow pass
+  content-scanned every immutable sealed file on every pass and the plane
+  guard (correctly) refused them all — 7.96 TB read in 6.8 days on a live
+  instance writing 30 KB/s, growing with the WAL. `WalWriterV3` now
+  memoizes the plane-guard verdict per sealed segment (in memory; a restart
+  costs one scan per segment, once), and the `--wal-max-checkpoint-lag-ms`
+  guard backs off ×2 per pass that frees nothing, capped at 64× (10 min 40 s
+  at defaults), resetting the moment any recycler frees a segment. The
+  fail-closed plane guard is unchanged and now pinned by a test on the
+  memoized path. The issue's "`break` at the first blocker" was assessed and
+  rejected: a pure-KV segment sealed after a plane-blocked one is freeable
+  today, and `break` would pin the whole WAL behind the first MQ record.
+  New `# Reclamation` fields `reclamation_wal_plane_scan_total` /
+  `reclamation_wal_plane_scan_bytes_total` make the loop, and its absence,
+  visible on a running server. Red/green in
+  `src/persistence/wal_v3/segment.rs` and `src/shard/persistence_tick.rs`
+  (`test_870_*`), asserting on scan counts, never wall time.
 - **`replication`: coordinator local legs now replicate, and stop inflating
   `master_repl_offset` (#815).** On a multi-shard master the in-process leg
   of a multi-key write (`MSET`/`MSETNX` co-located or scattered slices,

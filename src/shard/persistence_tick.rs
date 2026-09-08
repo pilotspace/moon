@@ -1320,14 +1320,26 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
 
     // Condition 2: enough time has elapsed since the last checkpoint to
     // avoid thrashing when the checkpoint just ran.
+    //
+    // #870 (D3): the lag alone is a thrash guard, not a schedule. When the
+    // previous pass freed nothing — the whole eligible prefix holds
+    // sole-copy plane history, or the floor did not move — running again
+    // at base cadence is a fixed-rate no-op whose cost grows with the WAL.
+    // Each such pass doubles the effective lag, capped at
+    // `2^OVERFLOW_BACKOFF_MAX_SHIFT` (64× — 10 min 40 s at defaults); any
+    // recycler that frees a segment resets it, and the regular checkpoint
+    // path recycles on its own cadence regardless of this guard.
     let elapsed_ms = last_checkpoint_at.elapsed().as_millis() as u64;
-    if elapsed_ms < max_checkpoint_lag_ms {
+    let effective_lag_ms =
+        max_checkpoint_lag_ms.saturating_mul(wal.overflow_recycle_backoff_multiplier());
+    if elapsed_ms < effective_lag_ms {
         tracing::debug!(
-            "Shard {}: P6 WAL overflow ({} bytes) but lag guard active ({}/{}ms), deferring",
+            "Shard {}: P6 WAL overflow ({} bytes) but lag guard active ({}/{}ms, {}x backoff), deferring",
             shard_id,
             total_wal,
             elapsed_ms,
-            max_checkpoint_lag_ms
+            effective_lag_ms,
+            wal.overflow_recycle_backoff_multiplier()
         );
         return false;
     }
@@ -1378,13 +1390,17 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
             );
         }
         Ok(_) => {
+            wal.note_overflow_recycle_freed_nothing();
             tracing::debug!(
-                "Shard {}: P6 aggressive recycle: no segments eligible at redo_lsn={}",
+                "Shard {}: P6 aggressive recycle: no segments eligible at redo_lsn={} \
+                 (next pass after {}x lag)",
                 shard_id,
-                redo_lsn
+                redo_lsn,
+                wal.overflow_recycle_backoff_multiplier()
             );
         }
         Err(e) => {
+            wal.note_overflow_recycle_freed_nothing();
             tracing::warn!(
                 "Shard {}: P6 aggressive recycle failed: {} — disk may be full",
                 shard_id,
