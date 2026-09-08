@@ -704,16 +704,30 @@ impl ColdIndex {
         use crate::persistence::manifest::FileStatus;
         use crate::persistence::page::{PAGE_4K, PageType};
 
-        let mut per_db: Vec<(usize, Self)> = Vec::new();
+        // Pass 1 — decode every Active KvLeaf file into a flat per-db pair
+        // vector, in manifest order. Nothing is inserted into a `BTreeMap`
+        // here: an ordered map fed one random-ordered key at a time pays an
+        // O(log n) descent plus node splits per key, and that insert loop
+        // measured 75% of this whole function's wall time on a real 466,912-
+        // entry / 114 MiB spill corpus (file I/O was 13%, the page copy 2%,
+        // the CRC32C verify 3%, entry decode 8%). Pass 2 replaces it with one
+        // sort + one bulk load.
+        //
+        // The cost of that is a transient: this vector holds every recovered
+        // pair (~80 B each) until its db's map is built, on top of the map
+        // itself. Recovery is single-threaded and pre-accept, so the peak is
+        // this shard's alone — but it IS proportional to the cold index, so
+        // see the measured RSS note in `from_pairs_last_wins`.
+        let mut per_db: Vec<(usize, Vec<((u64, Bytes), ColdLocation)>)> = Vec::new();
         let data_dir = shard_dir.join("data");
 
         for entry in manifest.files() {
             if entry.status == FileStatus::Active && entry.file_type == PageType::KvLeaf as u8 {
                 let db = entry.db_index as usize;
-                let index = match per_db.iter_mut().find(|(d, _)| *d == db) {
-                    Some((_, idx)) => idx,
+                let pairs = match per_db.iter_mut().find(|(d, _)| *d == db) {
+                    Some((_, p)) => p,
                     None => {
-                        per_db.push((db, Self::new()));
+                        per_db.push((db, Vec::new()));
                         #[allow(clippy::unwrap_used)] // pushed on the previous line
                         let last = per_db.last_mut().unwrap();
                         &mut last.1
@@ -734,8 +748,9 @@ impl ColdIndex {
                     if let Some(page) = crate::persistence::kv_page::KvLeafPage::from_bytes(buf) {
                         for slot_idx in 0..page.slot_count() {
                             if let Some(kv) = page.get(slot_idx) {
-                                index.insert(
-                                    Bytes::from(kv.key),
+                                let key = Bytes::from(kv.key);
+                                pairs.push((
+                                    (scan_h48(&key), key),
                                     ColdLocation {
                                         file_id: entry.file_id,
                                         page_idx: page_idx as u32,
@@ -743,14 +758,76 @@ impl ColdIndex {
                                         ttl_ms: kv.ttl_ms,
                                         value_type: kv.value_type,
                                     },
-                                );
+                                ));
                             }
                         }
                     }
                 }
             }
         }
+
+        // Pass 2 — bulk-load each db's pairs into its ordered map.
         per_db
+            .into_iter()
+            .map(|(db, pairs)| (db, Self::from_pairs_last_wins(pairs)))
+            .collect()
+    }
+
+    /// Build an index from `((scan_h48(key), key), location)` pairs supplied in
+    /// **insertion order**, applying the same last-writer-wins rule repeated
+    /// [`Self::insert`] calls would.
+    ///
+    /// Equivalence rests on `BTreeMap`'s `FromIterator`, which *stable*-sorts
+    /// its input and then bulk-loads it, keeping the **last** of every run of
+    /// equal keys — byte-for-byte what a sequence of `insert` calls in the same
+    /// order produces. Building the tree in one bottom-up pass over sorted
+    /// input is what makes this cheaper than n independent descents.
+    ///
+    /// The derived state is recomputed from the finished map rather than
+    /// maintained incrementally:
+    /// - `file_refs` — one live-entry count per `file_id`, by definition equal
+    ///   to a walk of the final map.
+    /// - `resident_bytes` — [`Self::insert`] charges [`cold_entry_cost`] once
+    ///   per *distinct* key (an overwrite is free), i.e. the same sum.
+    /// - `pending_unlink` — a file lands here exactly when its last live entry
+    ///   is overwritten by a later one, i.e. exactly when it is mentioned by
+    ///   the input but referenced by no surviving map entry. The *set* is
+    ///   identical; the order within it is not specified by either path (it
+    ///   only sequences a later orphan sweep's unlinks).
+    fn from_pairs_last_wins(pairs: Vec<((u64, Bytes), ColdLocation)>) -> Self {
+        if pairs.is_empty() {
+            return Self::new();
+        }
+
+        // Every file_id the input mentions, in first-appearance order.
+        let mut seen_files: Vec<u64> = Vec::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (_, loc) in &pairs {
+            if seen.insert(loc.file_id) {
+                seen_files.push(loc.file_id);
+            }
+        }
+
+        let map: BTreeMap<(u64, Bytes), ColdLocation> = pairs.into_iter().collect();
+
+        let mut file_refs: HashMap<u64, u32> = HashMap::with_capacity(seen_files.len());
+        let mut resident_bytes = 0usize;
+        for ((_, key), loc) in &map {
+            *file_refs.entry(loc.file_id).or_insert(0) += 1;
+            resident_bytes += cold_entry_cost(key.len());
+        }
+
+        let pending_unlink: Vec<u64> = seen_files
+            .into_iter()
+            .filter(|f| !file_refs.contains_key(f))
+            .collect();
+
+        Self {
+            map,
+            file_refs,
+            pending_unlink,
+            resident_bytes,
+        }
     }
 }
 

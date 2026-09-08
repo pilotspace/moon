@@ -1126,6 +1126,150 @@ mod tests {
         }
     }
 
+    /// A key present in TWO still-Active heap files (a re-spill whose orphan
+    /// sweep had not yet tombstoned the older file when the process died)
+    /// must rebuild to the LATER file's location, exactly as the per-key
+    /// `ColdIndex::insert` loop resolved it — and the superseded file must
+    /// come back with zero live refs, queued for unlink.
+    ///
+    /// This is the case a bulk index build can silently get backwards: any
+    /// dedup that keeps the FIRST of an equal-key run resurrects the stale
+    /// location, and cold read-through then serves a superseded value from a
+    /// file the sweep is entitled to delete.
+    #[test]
+    fn test_rebuild_duplicate_key_across_active_files_keeps_the_later_file() {
+        use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
+        use crate::persistence::page::PageType;
+        use crate::storage::tiered::cold_index::ColdIndex;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+
+        // OLD file 301 holds `dup` plus a private key; NEW file 302 re-spills
+        // `dup` alone. Both are Active — the sweep never ran.
+        for (file_id, keys) in [(301u64, vec!["dup", "only-in-301"]), (302u64, vec!["dup"])] {
+            let entries: Vec<SpillEntry> = keys
+                .iter()
+                .map(|k| SpillEntry {
+                    key: Bytes::from(k.to_string()),
+                    value_bytes: Bytes::from(format!("v-from-{file_id}")),
+                    value_type: ValueType::String,
+                    flags: 0,
+                    ttl_ms: None,
+                })
+                .collect();
+            let batch = build_kv_spill_batch(&entries, file_id).unwrap();
+            let byte_size = write_kv_spill_batch(shard_dir, file_id, &batch).unwrap();
+            manifest.add_file(FileEntry {
+                file_id,
+                file_type: PageType::KvLeaf as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Hot,
+                page_size_log2: 12,
+                page_count: batch.pages.len() as u32,
+                byte_size,
+                created_lsn: 0,
+                db_index: 0,
+                max_key_hash: 0,
+                last_modified_lsn: 0,
+            });
+        }
+        manifest.commit().unwrap();
+
+        let index = ColdIndex::rebuild_from_manifest(shard_dir, &manifest);
+
+        assert_eq!(index.len(), 2, "`dup` is one key, not two");
+        assert_eq!(
+            index.lookup(b"dup").map(|l| l.file_id),
+            Some(302),
+            "the LATER manifest file must win the duplicate key"
+        );
+        assert_eq!(
+            index.lookup(b"only-in-301").map(|l| l.file_id),
+            Some(301),
+            "file 301's un-superseded key survives"
+        );
+        // 301 still backs `only-in-301`, so it is NOT orphaned here.
+        assert_eq!(index.referenced_file_count(), 2);
+        assert_eq!(index.pending_unlink_len(), 0);
+
+        // Second shape — a file that loses ALL its keys. 303 holds only
+        // `gone`, which 304 re-spills, so 303 must rebuild with zero live
+        // refs and land in `pending_unlink`. That is the zero-ref transition
+        // the old per-key loop produced via `ref_dec`, and the one the bulk
+        // build has to reconstruct from the finished map rather than observe.
+        let manifest_path2 = shard_dir.join("shard2.manifest");
+        let mut m2 = ShardManifest::create(&manifest_path2).unwrap();
+        for (file_id, keys) in [(303u64, vec!["gone"]), (304u64, vec!["gone", "kept"])] {
+            let entries: Vec<SpillEntry> = keys
+                .iter()
+                .map(|k| SpillEntry {
+                    key: Bytes::from(k.to_string()),
+                    value_bytes: Bytes::from(format!("v-from-{file_id}")),
+                    value_type: ValueType::String,
+                    flags: 0,
+                    ttl_ms: None,
+                })
+                .collect();
+            let batch = build_kv_spill_batch(&entries, file_id).unwrap();
+            let byte_size = write_kv_spill_batch(shard_dir, file_id, &batch).unwrap();
+            m2.add_file(FileEntry {
+                file_id,
+                file_type: PageType::KvLeaf as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Hot,
+                page_size_log2: 12,
+                page_count: batch.pages.len() as u32,
+                byte_size,
+                created_lsn: 0,
+                db_index: 0,
+                max_key_hash: 0,
+                last_modified_lsn: 0,
+            });
+        }
+        m2.commit().unwrap();
+
+        // Assert on the PER-DB result, which is what recovery attaches to a
+        // `Database`. The merged `rebuild_from_manifest` wrapper re-inserts
+        // into a fresh index whose map already holds one entry per key, so no
+        // overwrite fires and `pending_unlink` is empty there by construction
+        // — true before this change and after it.
+        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &m2);
+        assert_eq!(per_db.len(), 1, "one db");
+        let bulk = per_db.remove(0).1;
+        assert_eq!(bulk.len(), 2, "`gone` + `kept`");
+        assert_eq!(bulk.lookup(b"gone").map(|l| l.file_id), Some(304));
+        assert_eq!(
+            bulk.referenced_file_count(),
+            1,
+            "303 lost its only key and must hold no live refs"
+        );
+        assert_eq!(
+            bulk.pending_unlink_len(),
+            1,
+            "303 must be queued for unlink, exactly as ref_dec would have queued it"
+        );
+
+        // And the derived accounting must match a per-key insert loop over the
+        // same final contents, byte for byte.
+        let mut by_hand = ColdIndex::new();
+        for (k, l) in bulk.iter() {
+            by_hand.insert(k.clone(), *l);
+        }
+        assert_eq!(bulk.len(), by_hand.len());
+        assert_eq!(
+            bulk.resident_bytes(),
+            by_hand.resident_bytes(),
+            "bulk build must charge resident_bytes exactly once per distinct key"
+        );
+        assert_eq!(
+            bulk.referenced_file_count(),
+            by_hand.referenced_file_count()
+        );
+    }
+
     /// #139 recovery attribution: two spill files tagged with different
     /// `FileEntry::db_index` values must rebuild into SEPARATE per-db cold
     /// indexes, each holding exactly its own file's keys — the db0-only
