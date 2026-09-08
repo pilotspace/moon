@@ -259,9 +259,20 @@ fn peek_nested_plane_record_type(payload: &[u8]) -> Option<Option<WalRecordType>
 /// `replay_mq_wal` / `replay_temporal_wal` perform via
 /// `read_wal_v3_record(&record.payload)`, or scan and replay could
 /// disagree about which segments are safe to delete.
+#[cfg(test)]
 fn segment_plane_scan(path: &Path) -> SegmentPlaneScan {
-    use super::record::WalRecordType;
+    segment_plane_scan_measured(path).0
+}
 
+/// [`segment_plane_scan`] plus the number of bytes it had to read.
+///
+/// `None` bytes means the file could not be read at all — the verdict is
+/// still the fail-closed `BLOCKED`, but it describes a transient I/O
+/// condition rather than the segment's immutable content, so callers must
+/// not memoize it (#870). Every other outcome — clean, plane-blocked, bad
+/// header, torn tail — is a pure function of bytes that never change once
+/// the segment is sealed, and is safe to remember for the life of the file.
+fn segment_plane_scan_measured(path: &Path) -> (SegmentPlaneScan, Option<u64>) {
     const BLOCKED: SegmentPlaneScan = SegmentPlaneScan {
         blocks_recycle: true,
         has_graph_temporal: false,
@@ -269,8 +280,23 @@ fn segment_plane_scan(path: &Path) -> SegmentPlaneScan {
 
     let data = match fs::read(path) {
         Ok(d) => d,
-        Err(_) => return BLOCKED,
+        Err(_) => return (BLOCKED, None),
     };
+    let bytes_read = Some(data.len() as u64);
+    let scan = segment_plane_scan_bytes(&data);
+    (scan, bytes_read)
+}
+
+/// Content classification of one sealed segment's raw bytes. See
+/// [`segment_plane_scan`] for the fail-closed contract.
+fn segment_plane_scan_bytes(data: &[u8]) -> SegmentPlaneScan {
+    use super::record::WalRecordType;
+
+    const BLOCKED: SegmentPlaneScan = SegmentPlaneScan {
+        blocks_recycle: true,
+        has_graph_temporal: false,
+    };
+
     if data.len() < WAL_V3_HEADER_SIZE || &data[..6] != WAL_V3_MAGIC || data[6] != WAL_V3_VERSION {
         return BLOCKED;
     }
@@ -357,7 +383,41 @@ pub struct WalWriterV3 {
     /// never retry a failing flush at tick cadence (syscall+log error loop).
     /// `None` while healthy.
     flush_backoff_until: Option<std::time::Instant>,
+    /// Cold (file-reading) plane scans performed by this writer's recyclers,
+    /// and the bytes those scans read. The #870 instrument: "the same
+    /// immutable segment is scanned repeatedly" is a claim about this
+    /// number, not about wall time.
+    plane_scans: u64,
+    plane_scan_bytes: u64,
+    /// Memoized plane-guard verdict per SEALED segment sequence (#870).
+    ///
+    /// A sealed segment is immutable — `rotate_segment` flushes, fsyncs and
+    /// closes it before `current_sequence` moves on, and nothing writes to
+    /// a lower sequence again — so `segment_plane_scan` over it is a pure
+    /// function of bytes that never change. Kept in memory rather than
+    /// stamped into the header's `reserved_1`: an advisory cache must
+    /// never re-open a file the rest of this module treats as read-only,
+    /// and a torn or mis-versioned on-disk stamp would be a durability
+    /// hazard for something that costs one extra read to recompute. The
+    /// price of an in-memory memo is a cold cache after restart — one scan
+    /// per sealed segment, once — which is exactly the pre-#870 cost of a
+    /// single pass. Entries leave when their segment is deleted; sequence
+    /// numbers are never reused within a process.
+    plane_scan_memo: std::collections::HashMap<u64, SegmentPlaneScan>,
+    /// Consecutive ceiling-trigger passes that freed nothing (#870, D3).
+    /// Read by `overflow_recycle_backoff_multiplier`; reset by any
+    /// recycler that deletes at least one segment.
+    overflow_noop_streak: u32,
 }
+
+/// Cap on the #870 overflow backoff: the lag guard doubles per no-op pass
+/// up to `2^6 = 64×` the configured `--wal-max-checkpoint-lag-ms` (10 s →
+/// 10 min 40 s at defaults). Bounded so a prefix that becomes freeable
+/// while the guard is backed off is still picked up within minutes, and
+/// because the regular checkpoint path (`recycle_segments_before` from
+/// Finalize) recycles on its own cadence regardless — and resets the
+/// streak the moment it frees anything.
+pub const OVERFLOW_BACKOFF_MAX_SHIFT: u32 = 6;
 
 /// Bound on every blocking durability wait (checkpoint ordering gates,
 /// shutdown drain). Design-for-failure: no unbounded waits.
@@ -398,6 +458,10 @@ impl WalWriterV3 {
             sync_agent: None,
             sync_agent_unavailable: false,
             flush_backoff_until: None,
+            plane_scans: 0,
+            plane_scan_bytes: 0,
+            plane_scan_memo: std::collections::HashMap::new(),
+            overflow_noop_streak: 0,
         };
 
         writer.open_new_segment()?;
@@ -682,6 +746,80 @@ impl WalWriterV3 {
         })
     }
 
+    /// Number of sealed-segment content scans that actually read a file
+    /// (#870 instrument). O(1).
+    #[inline]
+    pub fn plane_scans(&self) -> u64 {
+        self.plane_scans
+    }
+
+    /// Bytes read by [`Self::plane_scans`] scans. O(1).
+    #[inline]
+    pub fn plane_scan_bytes(&self) -> u64 {
+        self.plane_scan_bytes
+    }
+
+    /// Classify a sealed segment's content for the plane guard, reading
+    /// the file at most once per segment per process (#870, D1).
+    ///
+    /// `seq` must be a SEALED sequence (`< current_sequence`) — only a
+    /// sealed segment is immutable, which is what makes the memo sound.
+    /// A verdict from an unreadable file is fail-closed but transient, so
+    /// it is returned without being remembered.
+    fn plane_scan(&mut self, seq: u64, path: &Path) -> SegmentPlaneScan {
+        debug_assert!(
+            seq < self.current_sequence,
+            "plane_scan memo is for sealed segments only"
+        );
+        if let Some(scan) = self.plane_scan_memo.get(&seq) {
+            return *scan;
+        }
+        let (scan, bytes_read) = segment_plane_scan_measured(path);
+        self.plane_scans += 1;
+        let bytes = bytes_read.unwrap_or(0);
+        self.plane_scan_bytes += bytes;
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::command::info_reclamation::RECL_WAL_PLANE_SCAN_TOTAL.fetch_add(1, Relaxed);
+        crate::command::info_reclamation::RECL_WAL_PLANE_SCAN_BYTES_TOTAL.fetch_add(bytes, Relaxed);
+        if bytes_read.is_some() {
+            self.plane_scan_memo.insert(seq, scan);
+        }
+        scan
+    }
+
+    /// Multiplier the ceiling-trigger applies to `--wal-max-checkpoint-lag-ms`
+    /// (#870, D3): `1` while overflow passes are freeing segments, doubling
+    /// per consecutive pass that freed nothing, capped at
+    /// `2^OVERFLOW_BACKOFF_MAX_SHIFT`. The guard was a thrash guard; used
+    /// as the only scheduler of a pass that cannot free anything it became
+    /// a fixed-cadence no-op. Recovery is prompt on every path that can
+    /// change the answer: any recycler deleting a segment resets the
+    /// streak, and the regular checkpoint's own recycle is not gated by
+    /// this at all.
+    #[inline]
+    pub fn overflow_recycle_backoff_multiplier(&self) -> u64 {
+        1u64 << self.overflow_noop_streak.min(OVERFLOW_BACKOFF_MAX_SHIFT)
+    }
+
+    /// Record that a ceiling-trigger pass freed nothing (or failed), so the
+    /// next one waits longer. Saturating — the multiplier is capped anyway.
+    #[inline]
+    pub fn note_overflow_recycle_freed_nothing(&mut self) {
+        self.overflow_noop_streak = self.overflow_noop_streak.saturating_add(1);
+    }
+
+    /// Number of sealed segments with a memoized plane verdict.
+    #[cfg(test)]
+    pub(crate) fn plane_scan_memo_len(&self) -> usize {
+        self.plane_scan_memo.len()
+    }
+
+    /// Drop every memoized verdict — simulates a restart's cold cache.
+    #[cfg(test)]
+    pub(crate) fn forget_plane_scan_memo(&mut self) {
+        self.plane_scan_memo.clear();
+    }
+
     /// Aggressively recycle fully-checkpointed WAL segments, **ignoring** the
     /// `min_wal_bytes` floor.
     ///
@@ -705,7 +843,7 @@ impl WalWriterV3 {
     ///   completed checkpoint to recycle everything before the new redo point.
     ///
     /// Returns [`RecycleStats`] with the count and byte total of segments deleted.
-    pub fn recycle_aggressive(&self, redo_lsn: u64) -> std::io::Result<RecycleStats> {
+    pub fn recycle_aggressive(&mut self, redo_lsn: u64) -> std::io::Result<RecycleStats> {
         use std::io::Read as _;
 
         struct SegInfo {
@@ -780,14 +918,25 @@ impl WalWriterV3 {
             // `scan.has_graph_temporal` observes when THIS caller's floor
             // (already `min(kv, graph)`-derived by K2 callers) is what let
             // such a segment through.
-            let scan = segment_plane_scan(&seg.path);
+            let scan = self.plane_scan(seg.seq, &seg.path);
             if scan.blocks_recycle {
                 segments_blocked_plane += 1;
+                // `continue`, deliberately not `break` (#870 D2 assessed
+                // and rejected): the LSN floor above IS prefix-ordered
+                // (`base_lsn` is monotonic in `seq`), but the plane guard
+                // is per-segment content — a pure-KV segment sealed AFTER
+                // a plane-blocked one is still freeable, and replay
+                // (`replay.rs`, sorted `read_dir`) and `WalTailReader`
+                // (`find_segment_after`) both tolerate the gap.
+                // `test_recycle_aggressive_keeps_plane_history_segments`
+                // pins that segment 2 recycles behind a blocked segment 1.
+                // With the memo, walking past a blocker costs a map probe.
                 continue;
             }
             // Aggressive: skip the min_wal_bytes floor check.
             match fs::remove_file(&seg.path) {
                 Ok(()) => {
+                    self.plane_scan_memo.remove(&seg.seq);
                     segments_recycled += 1;
                     bytes_reclaimed += seg.file_size;
                     // Emit reclamation metrics for P10 INFO emitter.
@@ -809,6 +958,9 @@ impl WalWriterV3 {
             }
         }
 
+        if segments_recycled > 0 {
+            self.overflow_noop_streak = 0;
+        }
         Ok(RecycleStats {
             segments_recycled,
             bytes_reclaimed,
@@ -914,7 +1066,7 @@ impl WalWriterV3 {
     ///
     /// Called after checkpoint finalization when redo_lsn advances.
     /// Returns the number of segments recycled.
-    pub fn recycle_segments_before(&self, redo_lsn: u64) -> std::io::Result<usize> {
+    pub fn recycle_segments_before(&mut self, redo_lsn: u64) -> std::io::Result<usize> {
         use std::io::Read as _;
 
         // First pass: collect all .wal segments with their metadata.
@@ -990,7 +1142,7 @@ impl WalWriterV3 {
             // as of K2, so `GraphTemporal` segments (no longer in that
             // guard's match arm) recycle here once the graph floor covers
             // them.
-            let scan = segment_plane_scan(&seg.path);
+            let scan = self.plane_scan(seg.seq, &seg.path);
             if scan.blocks_recycle {
                 tracing::debug!(
                     "WAL recycle: keeping segment {:?} — holds sole-copy plane history",
@@ -1006,6 +1158,7 @@ impl WalWriterV3 {
             if let Err(e) = fs::remove_file(&seg.path) {
                 tracing::warn!("WAL segment recycle failed for {:?}: {}", seg.path, e);
             } else {
+                self.plane_scan_memo.remove(&seg.seq);
                 total_wal_size -= seg.file_size;
                 recycled += 1;
                 if scan.has_graph_temporal {
@@ -1013,6 +1166,9 @@ impl WalWriterV3 {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+        }
+        if recycled > 0 {
+            self.overflow_noop_streak = 0;
         }
         Ok(recycled)
     }
@@ -2023,5 +2179,212 @@ mod tests {
             !scan.has_graph_temporal,
             "an ordinary non-nested Command payload must never set has_graph_temporal"
         );
+    }
+
+    /// Seals `n_plane_segments`+ segments that each hold at least one
+    /// sole-copy MQ plane record, so every sealed segment is plane-blocked
+    /// (the #870 live-instance shape: 34 sealed, 34 blocked, 0 freed).
+    fn seal_plane_blocked_segments(wal_dir: &Path) -> (WalWriterV3, u64) {
+        let mut writer = WalWriterV3::new(0, wal_dir, 512).unwrap();
+        writer.set_wal_bounds(0, u64::MAX);
+        for i in 0..60 {
+            writer.append(WalRecordType::MqCreate, b"mq-plane-payload-#870");
+            if (i + 1) % 3 == 0 {
+                writer.flush_sync().unwrap();
+            }
+        }
+        writer.flush_sync().unwrap();
+        let sealed = writer.current_segment_sequence() - 1;
+        assert!(sealed >= 4, "need several sealed segments, got {sealed}");
+        (writer, sealed)
+    }
+
+    /// #870 reproduction — all three conditions the issue names: the WAL is
+    /// past the ceiling (`max_wal_bytes` is irrelevant to the recycler
+    /// itself, the caller already decided to run it), a checkpoint has
+    /// completed (`redo_lsn > 0` covers every sealed segment), and every
+    /// sealed segment holds a plane record so the guard vetoes all of them.
+    /// A sealed segment is immutable, so its verdict can never change: three
+    /// passes over the same directory must read each sealed file ONCE, not
+    /// once per pass. Asserts on scan count, never on wall time.
+    #[test]
+    fn test_870_sealed_segment_plane_scan_runs_once_across_recycle_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let (mut writer, sealed) = seal_plane_blocked_segments(&wal_dir);
+        let redo_lsn = writer.current_lsn();
+
+        for pass in 1..=3u64 {
+            let stats = writer.recycle_aggressive(redo_lsn).unwrap();
+            assert_eq!(
+                stats.segments_recycled, 0,
+                "pass {pass}: nothing is freeable"
+            );
+            assert_eq!(
+                stats.segments_blocked_plane as u64, sealed,
+                "pass {pass}: every sealed segment is plane-blocked"
+            );
+        }
+        // The checkpoint-path recycler shares the memo — it must not pay
+        // for a fourth cold walk either.
+        assert_eq!(writer.recycle_segments_before(redo_lsn).unwrap(), 0);
+
+        assert_eq!(
+            writer.plane_scans(),
+            sealed,
+            "#870: {sealed} immutable sealed segments were content-scanned {} times \
+             across 4 recycle passes — the verdict of a sealed segment never changes, \
+             so each must be read exactly once",
+            writer.plane_scans()
+        );
+    }
+
+    /// The fail-closed plane guard must hold on a MEMOIZED verdict exactly
+    /// as it holds on a cold one: a segment holding an MQ record is refused
+    /// on the first pass (cold scan) and on every later pass (cache hit),
+    /// by both recyclers, at the most permissive floor there is. Nobody
+    /// gets to "fix" the #870 loop by weakening this.
+    #[test]
+    fn test_870_plane_guard_refuses_on_cached_verdict_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let (mut writer, sealed) = seal_plane_blocked_segments(&wal_dir);
+
+        let cold = writer.recycle_aggressive(u64::MAX).unwrap();
+        assert_eq!(cold.segments_recycled, 0);
+        assert_eq!(cold.segments_blocked_plane as u64, sealed);
+        let scans_after_cold = writer.plane_scans();
+        assert_eq!(
+            scans_after_cold, sealed,
+            "first pass is the one cold scan per segment"
+        );
+
+        let warm = writer.recycle_aggressive(u64::MAX).unwrap();
+        assert_eq!(
+            warm, cold,
+            "a cached verdict must be byte-for-byte the cold verdict"
+        );
+        assert_eq!(writer.recycle_segments_before(u64::MAX).unwrap(), 0);
+        for seq in 1..=sealed {
+            assert!(
+                WalSegment::segment_path(&wal_dir, seq).exists(),
+                "sealed segment {seq} holds sole-copy MQ history and must survive every pass"
+            );
+        }
+    }
+    /// Deleting a segment must drop its memo entry, and a segment that could
+    /// not be read must NOT be memoized as blocked — a transient I/O error
+    /// is not a property of the segment's bytes. Sequence numbers are never
+    /// reused within a process (`current_sequence` only grows), so a
+    /// stale entry could only ever be a leak, never a wrong verdict; this
+    /// pins that it is not even a leak.
+    #[test]
+    fn test_870_plane_scan_memo_forgets_recycled_and_unreadable_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        writer.set_wal_bounds(0, u64::MAX);
+        // Segment 1 = plane-blocked; the rest pure KV (freeable).
+        writer.append(WalRecordType::MqPush, b"\\x01mq-plane-payload");
+        for i in 0..60 {
+            writer.append(WalRecordType::Command, b"SET key val");
+            if (i + 1) % 3 == 0 {
+                writer.flush_sync().unwrap();
+            }
+        }
+        writer.flush_sync().unwrap();
+        let sealed = writer.current_segment_sequence() - 1;
+
+        let stats = writer.recycle_aggressive(writer.current_lsn()).unwrap();
+        assert_eq!(stats.segments_blocked_plane, 1);
+        assert_eq!(stats.segments_recycled as u64, sealed - 1);
+        assert_eq!(writer.plane_scans(), sealed);
+        assert_eq!(
+            writer.plane_scan_memo_len(),
+            1,
+            "only the surviving (blocked) segment keeps a memo entry"
+        );
+
+        // A restart-shaped cold cache costs exactly one more scan per
+        // surviving segment, then goes quiet again.
+        writer.forget_plane_scan_memo();
+        let before = writer.plane_scans();
+        writer.recycle_aggressive(writer.current_lsn()).unwrap();
+        writer.recycle_aggressive(writer.current_lsn()).unwrap();
+        assert_eq!(
+            writer.plane_scans() - before,
+            1,
+            "cold cache: one scan, once"
+        );
+
+        // An unreadable sealed path: the verdict is fail-closed BLOCKED,
+        // but it describes an I/O condition, not the segment's bytes, so
+        // it is re-tried on every pass and never memoized. Exercised on
+        // the memoizing wrapper directly — the recyclers' header pre-read
+        // drops a vanished file before the guard ever sees it.
+        writer.forget_plane_scan_memo();
+        let missing = WalSegment::segment_path(&wal_dir, 1).with_extension("gone");
+        let before = writer.plane_scans();
+        let v1 = writer.plane_scan(1, &missing);
+        let v2 = writer.plane_scan(1, &missing);
+        assert!(
+            v1.blocks_recycle && v2.blocks_recycle,
+            "unreadable → fail closed"
+        );
+        assert_eq!(
+            writer.plane_scans() - before,
+            2,
+            "an unreadable segment is re-tried on every pass, never memoized"
+        );
+        assert_eq!(writer.plane_scan_memo_len(), 0);
+    }
+
+    /// #870 D3 — the ceiling-trigger backoff doubles per no-op pass, caps
+    /// at `2^OVERFLOW_BACKOFF_MAX_SHIFT`, and resets the moment ANY
+    /// recycler frees a segment (the recovery path once a checkpoint
+    /// unblocks the prefix).
+    #[test]
+    fn test_870_overflow_backoff_doubles_caps_and_resets_on_a_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        writer.set_wal_bounds(0, u64::MAX);
+        assert_eq!(writer.overflow_recycle_backoff_multiplier(), 1);
+
+        for expect in [2u64, 4, 8, 16, 32, 64, 64, 64] {
+            writer.note_overflow_recycle_freed_nothing();
+            assert_eq!(writer.overflow_recycle_backoff_multiplier(), expect);
+        }
+
+        // Seal a few pure-KV segments; a pass that frees them resets the
+        // streak even though it is the checkpoint-path recycler.
+        for i in 0..60 {
+            writer.append(WalRecordType::Command, b"SET key val");
+            if (i + 1) % 3 == 0 {
+                writer.flush_sync().unwrap();
+            }
+        }
+        writer.flush_sync().unwrap();
+        assert!(
+            writer
+                .recycle_segments_before(writer.current_lsn())
+                .unwrap()
+                >= 1
+        );
+        assert_eq!(
+            writer.overflow_recycle_backoff_multiplier(),
+            1,
+            "a recycler that freed a segment must re-arm the ceiling trigger at base lag"
+        );
+        // A no-op pass (nothing left to free) does NOT reset it.
+        writer.note_overflow_recycle_freed_nothing();
+        assert_eq!(
+            writer
+                .recycle_aggressive(writer.current_lsn())
+                .unwrap()
+                .segments_recycled,
+            0
+        );
+        assert_eq!(writer.overflow_recycle_backoff_multiplier(), 2);
     }
 }
