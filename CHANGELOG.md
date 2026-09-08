@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restart, phase bracketed between the `manifest recovered` and
   `rebuilt cold index` log lines, fresh corpus copy per leg, min of 3):
   0.213s -> 0.128s. On a byte-heavy 2.1 GiB / 183,741-entry corpus, where
-  file I/O is 85% of the phase, 0.411s -> 0.369s.
+  the file scan (I/O + decode) is 84% of the phase, 0.411s -> 0.369s.
   The rebuilt index is byte-identical — same keys, same
   `file_id`/`page_idx`/`slot_idx`/`ttl_ms`/`value_type`, same
   `resident_bytes`, same referenced-file count — because `FromIterator`'s
