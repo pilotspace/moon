@@ -114,6 +114,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per shard in the PerShard layout) plus the legacy flat `appendonly.aof`,
   and current from the directory as before; the post-rewrite baseline is
   unchanged. Trigger percentage, min-size and cadence are untouched.
+- **`recovery`: startup no longer spends minutes rebuilding index definitions
+  it already has, re-loading a keyspace it then wipes, or sitting silent on an
+  accepted socket.** A live 2.2M-key instance with 4,191 text + 2,793 vector
+  indexes took 6+ minutes to answer, and its log named four structural
+  wastes, all fixed here: (1) every restored index definition rewrote the
+  whole metadata sidecar (two `fsync`s, O(n²) bytes) — `TextStore::restore_index`
+  and `VectorStore::create_index_unsaved` register without the write and the
+  sidecar is written once per store after the loop; (2) the boot rescan tested
+  every prefix of every index against every key (O(keys × indexes)) and the
+  HSET path did the same three times per key — both stores now keep a
+  `prefix -> index` map (`util::prefix_map`) so the lookup is O(key length),
+  on the boot path and on every steady-state HSET/DEL; (3) when the
+  multi-part AOF is the KV authority, per-shard recovery still loaded the
+  snapshot, applied WAL KV records, ran the "no appendonly.aof found —
+  replayed N records from legacy-mode WAL v3" fallback over the SAME WAL
+  directory and demoted 650k hot shadows, all of which `db.clear()` then
+  discarded — `restore_from_persistence` now takes `kv_authority_elsewhere`
+  and skips every hot-keyspace load while still recovering the cold index,
+  warm segments, FPI repair and `last_lsn`; (4) warm-segment registration
+  re-read every index's persisted keymap from disk for every segment — read
+  once per index and indexed by `key_hash`. The per-segment INFO lines moved
+  to DEBUG behind the existing summaries. Readiness: the definition-restore
+  loops now yield to the event loop and the keyspace rescan slices are
+  time-bounded (10 ms) instead of 1024-keys-bounded, so a client during
+  recovery gets `+PONG` / `-LOADING` instead of a hung socket, and the
+  reconcile progress line prints the cumulative and the recent keys/s,
+  labelled, plus an ETA from the recent one (the cumulative alone read 21
+  keys/s on a live instance whose real rate was ~230/s). Measured on a
+  generated 380k-key corpus (1,500 text + 400 vector indexes, 80k indexed
+  hashes, 3 interleaved rounds, macOS): `loading:0` at 22.0-25.1 s → 2.1-3.4 s;
+  first `+PONG` at 17.7-21.9 s → 0.3 s with zero probe timeouts; state after
+  restart identical (`DEBUG DIGEST`, per-index doc counts, text hits) before
+  and after every round. Red/green: `util::prefix_map` tests,
+  `prefix_map_tracks_*` in both stores against the brute-force walk,
+  `kv_authority_elsewhere_skips_every_hot_keyspace_load`, and
+  `the_recent_rate_ignores_a_slow_start_and_drives_the_eta`.
+
 - **`replication`: coordinator local legs now replicate, and stop inflating
   `master_repl_offset` (#815).** On a multi-shard master the in-process leg
   of a multi-key write (`MSET`/`MSETNX` co-located or scattered slices,

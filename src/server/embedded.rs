@@ -281,7 +281,10 @@ pub async fn run_embedded(
             // keys are unrecoverable (mirrors main.rs).
             if should_run_recovery(persistence_dir.as_deref(), disk_offload_base.is_some()) {
                 let recover_dir = persistence_dir.as_deref().unwrap_or(config.dir.as_str());
-                shard.restore_from_persistence(recover_dir, disk_offload_base.as_deref());
+                // `kv_authority_elsewhere = false`: the embedded server runs no
+                // multi-part AOF replay after this pass (see the module docs),
+                // so this recovery IS the keyspace authority here.
+                shard.restore_from_persistence(recover_dir, disk_offload_base.as_deref(), false);
             }
             if let Some(ref offload_base) = disk_offload_base {
                 let shard_dir = offload_base.join(format!("shard-{}", id));

@@ -1651,6 +1651,11 @@ pub struct VectorStore {
     /// - Counter never wraps in practice (u64::MAX ≈ 1.8 × 10¹⁹ writes).
     /// - Failed writes (index-not-found, parse errors) do NOT bump the counter.
     version_token: AtomicU64,
+    /// `key prefix -> index names`, kept in lock-step with `indexes` by the
+    /// two create paths and the two drop paths. Answers "which indexes cover
+    /// this key?" in O(key length) instead of O(indexes) — see
+    /// `crate::util::prefix_map`.
+    prefix_map: crate::util::prefix_map::PrefixMap,
 }
 
 /// Read `manifest.json` and the keymap file for whatever epoch it points to,
@@ -1702,6 +1707,7 @@ impl VectorStore {
             txn_manager: TransactionManager::new(),
             persist_dir: None,
             version_token: AtomicU64::new(0),
+            prefix_map: crate::util::prefix_map::PrefixMap::new(),
         }
     }
 
@@ -1795,7 +1801,22 @@ impl VectorStore {
     }
 
     /// Create a new index. Returns Err(&str) if index already exists.
-    pub fn create_index(&mut self, mut meta: IndexMeta) -> Result<(), &'static str> {
+    pub fn create_index(&mut self, meta: IndexMeta) -> Result<(), &'static str> {
+        self.create_index_unsaved(meta)?;
+        // Persist index metadata sidecar
+        self.save_index_meta_sidecar();
+        Ok(())
+    }
+
+    /// [`Self::create_index`] WITHOUT rewriting the metadata sidecar.
+    ///
+    /// Boot-time recovery re-creates every persisted index from that very
+    /// sidecar; rewriting it (two `fsync`s via `atomic_write_durable`, plus a
+    /// re-serialisation of every index registered so far — O(n²) bytes) once
+    /// per index made a 2,793-index restore spend its whole "restoring vector
+    /// index(es)" phase in fsyncs. Recovery calls this per definition, then
+    /// [`Self::save_index_meta_sidecar`] once.
+    pub(crate) fn create_index_unsaved(&mut self, mut meta: IndexMeta) -> Result<(), &'static str> {
         if self.indexes.contains_key(&meta.name) {
             return Err("Index already exists");
         }
@@ -1900,8 +1921,11 @@ impl VectorStore {
             },
         );
 
-        // Persist index metadata sidecar
-        self.save_index_meta_sidecar();
+        // Register the prefixes AFTER the insert: `meta` moved into the
+        // index, and `indexes`/`prefix_map` are disjoint fields.
+        if let Some(idx) = self.indexes.get(&name) {
+            self.prefix_map.insert(&name, &idx.meta.key_prefixes);
+        }
 
         // Bump version AFTER successful write (monotonicity-on-success contract).
         self.bump_version();
@@ -2029,8 +2053,11 @@ impl VectorStore {
             },
         );
 
-        // Persist index metadata sidecar
-        self.save_index_meta_sidecar();
+        // Register the prefixes AFTER the insert: `meta` moved into the
+        // index, and `indexes`/`prefix_map` are disjoint fields.
+        if let Some(idx) = self.indexes.get(&name) {
+            self.prefix_map.insert(&name, &idx.meta.key_prefixes);
+        }
 
         // Bump version AFTER successful write (monotonicity-on-success contract).
         self.bump_version();
@@ -2095,6 +2122,7 @@ impl VectorStore {
     /// NOTE (WS5a): NOT db-scoped — see [`Self::drop_index_for_db`].
     pub fn drop_index(&mut self, name: &[u8]) -> bool {
         if let Some(index) = self.indexes.remove(name) {
+            self.prefix_map.remove(name, &index.meta.key_prefixes);
             // Tombstone warm segments: mark for deletion on last Arc drop.
             let snapshot = index.segments.load();
             for warm_seg in &snapshot.warm {
@@ -2157,6 +2185,7 @@ impl VectorStore {
             let Some(index) = self.indexes.remove(&name) else {
                 continue;
             };
+            self.prefix_map.remove(&name, &index.meta.key_prefixes);
             // Tombstone warm segments so their on-disk directories are
             // reclaimed once in-flight search snapshots drop (as drop_index).
             let snapshot = index.segments.load();
@@ -2245,9 +2274,10 @@ impl VectorStore {
     ///
     /// NOTE (WS5a): NOT db-scoped.
     pub fn find_matching_indexes(&self, key: &[u8]) -> Vec<&VectorIndex> {
-        self.indexes
-            .values()
-            .filter(|idx| idx.meta.key_prefixes.iter().any(|p| key.starts_with(p)))
+        self.prefix_map
+            .matching(key)
+            .iter()
+            .filter_map(|name| self.indexes.get(name))
             .collect()
     }
 
@@ -2259,34 +2289,24 @@ impl VectorStore {
     /// unscoped variant, so a HSET issued in db 3 can still feed an index
     /// created in db 0 if the key matches its PREFIX. Migrating the caller
     /// to [`Self::find_matching_index_names_for_db`] is open follow-up work.
+    ///
+    /// O(key length) via the prefix map, never O(indexes): an index with an
+    /// empty prefix list never matches, an empty-string prefix matches every
+    /// key — exactly what the `starts_with` walk this replaces computed.
     pub fn find_matching_index_names(&self, key: &[u8]) -> Vec<Bytes> {
-        self.indexes
-            .iter()
-            .filter_map(|(name, idx)| {
-                if idx.meta.key_prefixes.iter().any(|p| key.starts_with(p)) {
-                    Some(name.clone())
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.prefix_map.matching(key)
     }
 
     /// Db-scoped variant of [`Self::find_matching_index_names`]: only
     /// considers indexes owned by `db_index`.
     pub fn find_matching_index_names_for_db(&self, key: &[u8], db_index: u8) -> Vec<Bytes> {
-        self.indexes
-            .iter()
-            .filter_map(|(name, idx)| {
-                if idx.meta.db_index == db_index
-                    && idx.meta.key_prefixes.iter().any(|p| key.starts_with(p))
-                {
-                    Some(name.clone())
-                } else {
-                    None
-                }
-            })
-            .collect()
+        let mut matches = self.prefix_map.matching(key);
+        matches.retain(|name| {
+            self.indexes
+                .get(name)
+                .is_some_and(|idx| idx.meta.db_index == db_index)
+        });
+        matches
     }
 
     /// Mark vectors as deleted for a key that was removed (DEL/HDEL/UNLINK).
@@ -2656,6 +2676,19 @@ impl VectorStore {
         let mut retired_orphans = 0usize;
         let mut unregistered = 0usize;
 
+        // Each index's persisted keymap, read ONCE for the whole batch and
+        // indexed by key_hash. The loop below used to re-read every index's
+        // manifest + keymap from disk for EVERY segment and count overlap by
+        // scanning the whole keymap — O(segments x indexes x keymap) I/O and
+        // compares; 377 segments took ~0.25 s each on a live store, most of
+        // it in those re-reads. `None` caches "no consistent keymap" too, so
+        // a missing index is not re-probed per segment. Nothing rewrites a
+        // keymap during recovery (no snapshot job runs before the rescan),
+        // so one read is exactly as fresh as the per-segment ones were.
+        type KeymapByHash = (Vec<KeymapEntry>, std::collections::HashMap<u64, usize>);
+        let mut keymap_cache: std::collections::HashMap<Bytes, Option<KeymapByHash>> =
+            std::collections::HashMap::new();
+
         for (segment_id, segment_dir) in &warm_segments {
             let seg_key_hashes = match peek_key_hashes(segment_dir) {
                 Ok(hs) => hs,
@@ -2711,20 +2744,31 @@ impl VectorStore {
             // second TOCTOU window) for the same file.
             let mut owner: Option<Bytes> = None;
             let mut owner_matches = 0usize;
-            let mut owner_entries: Vec<KeymapEntry> = Vec::new();
             let mut ambiguous = false;
             if !seg_key_hash_set.is_empty() {
                 if let Some(store_dir) = self.persist_dir.clone() {
                     for name in self.indexes.keys() {
-                        let idx_dir = crate::vector::persistence::manifest::index_persist_dir(
-                            &store_dir, name,
-                        );
-                        let Some(entries) = read_manifest_and_keymap_consistent(&idx_dir) else {
+                        let cached = keymap_cache.entry(name.clone()).or_insert_with(|| {
+                            let idx_dir = crate::vector::persistence::manifest::index_persist_dir(
+                                &store_dir, name,
+                            );
+                            read_manifest_and_keymap_consistent(&idx_dir).map(|entries| {
+                                let by_hash: std::collections::HashMap<u64, usize> = entries
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, e)| (e.key_hash, i))
+                                    .collect();
+                                (entries, by_hash)
+                            })
+                        });
+                        let Some((_, by_hash)) = cached else {
                             continue;
                         };
-                        let matches = entries
+                        // Overlap counted over the SEGMENT's keys (small), not
+                        // the index's whole keymap.
+                        let matches = seg_key_hash_set
                             .iter()
-                            .filter(|e| seg_key_hash_set.contains(&e.key_hash))
+                            .filter(|kh| by_hash.contains_key(kh))
                             .count();
                         if matches == 0 {
                             continue;
@@ -2733,7 +2777,6 @@ impl VectorStore {
                             std::cmp::Ordering::Greater => {
                                 owner = Some(name.clone());
                                 owner_matches = matches;
-                                owner_entries = entries;
                                 ambiguous = false;
                             }
                             std::cmp::Ordering::Equal if owner.as_ref() != Some(name) => {
@@ -2812,11 +2855,13 @@ impl VectorStore {
                     // persisted keymap is left out (rescan self-heals it
                     // into mutable) and tombstoned in this warm copy so the
                     // two never coexist as live duplicates.
-                    let entries_by_hash: std::collections::HashMap<u64, &KeymapEntry> =
-                        owner_entries.iter().map(|e| (e.key_hash, e)).collect();
+                    let owner_keymap = keymap_cache.get(&owner_name).and_then(|c| c.as_ref());
                     let mut missing_from_keymap: Vec<u64> = Vec::new();
                     for kh in &seg_key_hash_set {
-                        if let Some(entry) = entries_by_hash.get(kh) {
+                        let entry = owner_keymap.and_then(|(entries, by_hash)| {
+                            by_hash.get(kh).and_then(|&i| entries.get(i))
+                        });
+                        if let Some(entry) = entry {
                             idx.key_hash_to_key
                                 .insert(entry.key_hash, entry.key.clone());
                             idx.key_hash_to_global_id
@@ -2852,7 +2897,9 @@ impl VectorStore {
                     };
                     idx.segments.swap(new_list);
                     loaded += 1;
-                    tracing::info!(
+                    // Per-segment detail at DEBUG; the batch summary below
+                    // is the INFO line (hundreds of these sat on the boot path).
+                    tracing::debug!(
                         "Registered warm segment {} from {:?} into index {:?}",
                         segment_id,
                         segment_dir,
@@ -3726,6 +3773,71 @@ mod tests {
         .expect("keymap for the committed epoch must be readable");
         assert_eq!(keymap.len(), 1);
         assert_eq!(keymap[0].key_hash, xxhash_rust::xxh64::xxh64(b"doc:1", 0));
+    }
+
+    /// The prefix map behind the three `find_matching_*` lookups must track
+    /// every create (both paths) and drop exactly — a stale entry means an
+    /// HSET silently skips (or double-feeds) an index. Checked against the
+    /// brute-force `starts_with` walk it replaced, including the vector-store
+    /// rule that an index with NO prefixes never matches.
+    #[test]
+    fn prefix_map_tracks_create_and_drop() {
+        fn brute(store: &VectorStore, key: &[u8], db: Option<u8>) -> Vec<Bytes> {
+            let mut v: Vec<Bytes> = store
+                .indexes
+                .iter()
+                .filter(|(_, i)| db.is_none_or(|d| i.meta.db_index == d))
+                .filter(|(_, i)| i.meta.key_prefixes.iter().any(|p| key.starts_with(p)))
+                .map(|(n, _)| n.clone())
+                .collect();
+            v.sort();
+            v
+        }
+        let keys: [&[u8]; 6] = [b"user:1", b"user:x:9", b"item:1", b"", b"zzz", b"u"];
+        let check = |store: &VectorStore| {
+            for key in keys {
+                let mut got = store.find_matching_index_names(key);
+                got.sort();
+                assert_eq!(got, brute(store, key, None), "key {:?}", key);
+                let mut got: Vec<Bytes> = store
+                    .find_matching_indexes(key)
+                    .iter()
+                    .map(|i| i.meta.name.clone())
+                    .collect();
+                got.sort();
+                assert_eq!(got, brute(store, key, None), "refs for key {:?}", key);
+                for db in [0u8, 1] {
+                    let mut got = store.find_matching_index_names_for_db(key, db);
+                    got.sort();
+                    assert_eq!(got, brute(store, key, Some(db)), "key {:?} db {db}", key);
+                }
+            }
+        };
+
+        let mut store = VectorStore::new();
+        store.create_index(make_meta("a", 8, &["user:"])).unwrap();
+        store
+            .create_index_unsaved(make_meta("b", 8, &["user:", "item:"]))
+            .unwrap();
+        let mut none = make_meta("none", 8, &[]);
+        none.db_index = 1;
+        store.create_index(none).unwrap();
+        let mut deep = make_meta("deep", 8, &["user:x:"]);
+        deep.db_index = 1;
+        store.create_index(deep).unwrap();
+        check(&store);
+
+        assert!(store.drop_index(b"b"));
+        assert!(!store.drop_index(b"b"), "second drop is a no-op");
+        check(&store);
+        assert!(store.drop_index(b"deep"));
+        check(&store);
+        assert!(
+            store.create_index(make_meta("a", 8, &["other:"])).is_err(),
+            "duplicate name is refused and must not register its prefixes"
+        );
+        check(&store);
+        assert!(store.find_matching_index_names(b"other:1").is_empty());
     }
 
     #[test]

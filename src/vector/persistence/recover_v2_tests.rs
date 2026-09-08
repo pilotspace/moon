@@ -649,5 +649,37 @@ mod recovery_progress {
         let t0 = Instant::now();
         let p = RecoveryProgress::new(IVL, t0);
         assert_eq!(p.keys_per_sec(0, t0), 0.0);
+        assert_eq!(p.recent_keys_per_sec(0, t0), 0.0);
+        assert_eq!(
+            p.eta_secs(0, 1_000, t0),
+            None,
+            "no rate yet: ETA is unknown, not inf"
+        );
+    }
+
+    /// The live case: a 30-minute pre-reconcile scan sits inside "elapsed",
+    /// so the cumulative average reads ~10x below the rate the run is
+    /// actually achieving. The recent rate must ignore that history and the
+    /// ETA must be built from it.
+    #[test]
+    fn the_recent_rate_ignores_a_slow_start_and_drives_the_eta() {
+        let t0 = Instant::now();
+        let mut p = RecoveryProgress::new(IVL, t0);
+        // 1,800 s of scan, then keys start moving at 250/s.
+        let t1 = t0 + Duration::from_secs(1_800 + 10);
+        assert!(p.tick_at(2_500, t1));
+        // Before any line existed the recent rate IS the cumulative one.
+        let t2 = t1 + Duration::from_secs(10);
+        assert!(p.tick_at(5_000, t2));
+        assert!(
+            p.keys_per_sec(5_000, t2) < 3.0,
+            "cumulative average is dragged down by the scan: {}",
+            p.keys_per_sec(5_000, t2)
+        );
+        assert_eq!(p.recent_keys_per_sec(5_000, t2).round(), 250.0);
+        // 300k keys total at 250/s = 1,180 s remaining, not the 27 hours the
+        // cumulative figure would give.
+        let eta = p.eta_secs(5_000, 300_000, t2).expect("rate > 0");
+        assert_eq!(eta.round(), 1_180.0);
     }
 }
