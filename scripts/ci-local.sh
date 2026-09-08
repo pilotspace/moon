@@ -138,6 +138,51 @@ vm() { # vm <shell-command> — run inside the moon-dev VM at the repo
   orb run -m "$VM" bash -c "source ~/.cargo/env && cd $REPO && $*"
 }
 
+# ── FT.* / multi-shard consistency suite (moon#762) ────────────────────
+# scripts/test-consistency.sh is the ONLY harness in the repo that starts
+# moon at --shards 1/4/12 and diffs behaviour across them, and NO gate ran
+# it: `grep -rln "test-consistency" .github/ scripts/ci-local.sh` returns
+# only .github/pull_request_template.md (a manual PR checklist line) and
+# the script's own self-references — confirmed again on this branch before
+# writing this comment. It was simply never wired, not blocked by a
+# feature gate or a missing fixture: `default` in Cargo.toml already
+# includes `graph` and `text-index`, so a default `cargo build --release`
+# (or the script's own `--skip-build` + MOON_BIN) carries every FT.*
+# command on both the VM (io_uring monoio, below) and native (kqueue
+# monoio) legs.
+#
+# Five FT.* commands already fan out correctly across shards, and this
+# script is what proves it — test-consistency.sh:1932
+# (`for NSHARDS in 1 4 12`, Phase 152: FT.AGGREGATE GROUPBY+COUNT and
+# FT.SEARCH HYBRID) plus the Vector Search / TXN.ABORT-hides-FT.SEARCH /
+# FT.SEARCH AS_OF phases beside it. The other six FT.* commands (moon#762
+# §1: FT.CACHESEARCH, FT.RECOMMEND, FT.NAVIGATE, FT.EXPAND, FT.COMPACT,
+# FT.INVALIDATE_RANGE) still have zero rows in this suite — that is a
+# separate, larger fix (new assertions against #755/#498/#761) and is
+# NOT what this leg does; this leg only makes the EXISTING 458 assertions,
+# FT.* included, execute on every push instead of never.
+#
+# moon#536 (open, unrelated to FT.*): ROLE's replication offset advances
+# on a master with no replica ever attached, where Redis holds it at 0.
+# `assert_both "ROLE on a master" ROLE` (test-consistency.sh:1719) diffs
+# byte-for-byte against the live redis-server oracle, and on pristine main
+# it is the ONLY other row that fails (measured 2026-09-08: 457/458).
+# Carved out by exact name, the same shape as the
+# `gate_is_skipped_with_spill_sender...` precedent in this campaign
+# (tmp/perf-campaign/CONTEXT.md §8): tolerated ONLY when it is the single
+# failing row. A second failure, or a failure on any OTHER row — an FT.*
+# row included — still fails this gate; that asymmetry is what the
+# deliberate-break proof in moon#762's report exercises.
+run_ft_consistency() { # run_ft_consistency <moon-bin> <port-rust> <port-redis>
+  # Thin wrapper. The gate logic (truncation check, row-count floor, moon#536
+  # waiver) lives in scripts/consistency-gate.sh so the VM leg below runs the
+  # SAME implementation instead of a second transcription of it.
+  local moon_bin=$1 port_rust=$2 port_redis=$3
+  MOON_BIN="$moon_bin" MOON_DISK_FREE_MIN_PCT=0 \
+    ./scripts/consistency-gate.sh --skip-build \
+      --port-rust "$port_rust" --port-redis "$port_redis"
+}
+
 # ── Disk pre-flight (moon#658) ────────────────────────────────────────
 # A full VM root does not announce itself. On 2026-08-22 the tokio leg
 # exited rc=1 printing nothing, and the next `orb run` answered "sconrpc
@@ -618,6 +663,15 @@ if [ "$MODE" = "native" ]; then
     env MOON_DISK_FREE_MIN_PCT=0 ./scripts/test-client-compat.sh \
       --filter __none__ --info-manifest \
       --moon-bin "$REPO/target/release/moon"
+
+  # ── Native phase 3: FT.* / multi-shard consistency (moon#762) ──────
+  # Reuses the release binary the compat leg just built — default
+  # features, so graph + text-index (and every FT.* command) are in it.
+  # kqueue monoio, same dispatch code the VM's io_uring leg exercises;
+  # see run_ft_consistency's doc comment for what this does and does not
+  # cover.
+  run_step "native FT.* consistency suite (moon#762, kqueue monoio)" \
+    run_ft_consistency "$REPO/target/release/moon" 16400 16399
 fi
 
 if [ "$MODE" = "full" ]; then
@@ -627,6 +681,16 @@ if [ "$MODE" = "full" ]; then
   run_step "VM client-compat (strict + contexts)" \
     vm "MOON_BIN=\$HOME/ci-target/local-compat/release/moon MOON_NO_URING=1 MOON_DISK_FREE_MIN_PCT=0 \
         ./scripts/test-client-compat.sh --strict --contexts standalone,multi,pipeline"
+  # ── Phase 2b: FT.* / multi-shard consistency (moon#762) ─────────────
+  # Same binary the compat leg above just built — io_uring monoio, the
+  # SHIPPED runtime. Ports are the script's own defaults (6400/6399);
+  # this step runs after the compat leg has torn its servers down, so
+  # there is no overlap. See run_ft_consistency's doc comment (above,
+  # next to its definition) for the moon#536 carve-out and what this
+  # leg does and does not cover.
+  VM_CONSISTENCY_CMD='MOON_BIN=$HOME/ci-target/local-compat/release/moon MOON_NO_URING=1 MOON_DISK_FREE_MIN_PCT=0 ./scripts/consistency-gate.sh --skip-build'
+  run_step "VM FT.* consistency suite (moon#762, io_uring monoio)" \
+    vm "$VM_CONSISTENCY_CMD"
   # ── Phase 3: macOS host suite (tokio — kqueue) ──────────────────────
   # Runs through HOST_TEST_TOKIO — the same nextest-or-fallback shape the VM
   # legs and `--native` already use. This leg was the one place still on a

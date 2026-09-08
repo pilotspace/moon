@@ -246,6 +246,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the two end-to-end cycle tests carry ballast keys deliberately, because on
   an empty database the ledger starts at 0, over-crediting saturates back to
   0, and the repro passes against the very bug it exists to catch.
+- **`ci`: the multi-shard consistency suite now runs before merge (#762).**
+  `scripts/test-consistency.sh` is the only harness that starts moon at
+  `--shards 1/4/12` and diffs behaviour across them, and no gate ever ran it:
+  `grep -rln "test-consistency" .github/ scripts/ci-local.sh` returned exactly
+  one hit, a manual checklist line in the PR template. Its 458 assertions —
+  including `FT.CREATE/SEARCH/AGGREGATE/DROPINDEX/INFO` across shard counts —
+  had never executed in CI. Wired into `scripts/ci-local.sh`, the local merge
+  bar, and verified it can fail: mutating `shard::scatter_aggregate` to drop a
+  partial makes the gate report `AGG-03 cross-shard divergence` with
+  `GATE_RC=1`.
+
+  The gate lives in `scripts/consistency-gate.sh` — **one** implementation that
+  both the host leg and the VM leg call, rather than the two hand-transcriptions
+  of the same rc/count/waiver logic they started as, where fixing one and not
+  the other failed silently. It checks two things an exit code cannot: that the
+  suite **reached its summary block**, and that it ran **>= 458 assertions**.
+  `test-consistency.sh` runs under `set -euo pipefail`, so an abort partway
+  through leaves exit 0 and no `FAIL:` lines and is indistinguishable from a
+  clean run — moon#634 is that exact defect, which had this script silently
+  running about half its rows for months. Both checks run BEFORE the moon#536
+  waiver, so a truncated run can never be waived. `--self-test` covers six
+  cases (clean / waived / different-single-failure / waived-plus-another /
+  truncated / short) and runs in the hosted Lint job.
 
 - **`ci`: clippy now lints tests, benches and examples.** Every clippy
   invocation in `ci.yml` was lib-only, so `--all-targets` code was never
