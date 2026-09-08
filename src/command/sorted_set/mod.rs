@@ -2020,3 +2020,89 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod zadd_listpack_batch_tests {
+    use crate::protocol::Frame;
+    use crate::storage::Database;
+    use bytes::Bytes;
+
+    fn bs(s: &[u8]) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s))
+    }
+
+    /// moon#865, the sorted-set arm. A zset listpack stores TWO entries per
+    /// member (member then score), so it wraps the header's u16 element count
+    /// at 32,768 members -- half the list/set threshold. Before the batch
+    /// guard, every pair was pushed and only then was the entry count compared
+    /// with LISTPACK_MAX_ENTRIES.
+    #[test]
+    fn zadd_one_call_past_u16_keeps_every_member() {
+        let mut db = Database::new();
+        const N: usize = 40_000; // 40k members = 80k listpack entries
+        let owned: Vec<Vec<u8>> = (0..N).map(|i| format!("m{i:07}").into_bytes()).collect();
+        let scores: Vec<Vec<u8>> = (0..N).map(|i| format!("{i}").into_bytes()).collect();
+        let mut args: Vec<Frame> = Vec::with_capacity(N * 2 + 1);
+        args.push(bs(b"bigz"));
+        for i in 0..N {
+            args.push(bs(&scores[i]));
+            args.push(bs(&owned[i]));
+        }
+
+        assert_eq!(
+            crate::command::sorted_set::zadd(&mut db, &args),
+            Frame::Integer(N as i64),
+            "ZADD under-reported the members it accepted"
+        );
+        assert_eq!(
+            crate::command::sorted_set::zcard(&mut db, &[bs(b"bigz")]),
+            Frame::Integer(N as i64),
+            "ZCARD lost members to the u16 wrap"
+        );
+        assert_ne!(
+            crate::command::sorted_set::zscore(&mut db, &[bs(b"bigz"), bs(&owned[N - 1])]),
+            Frame::Null,
+            "last member unreachable"
+        );
+    }
+
+    /// The guard must not disable the encoding it protects.
+    #[test]
+    fn small_batches_still_reach_the_listpack_and_accumulate() {
+        for n in [1usize, 8, 64, 65] {
+            let mut db = Database::new();
+            let mut args: Vec<Frame> = Vec::with_capacity(n * 2 + 1);
+            args.push(bs(b"z"));
+            for i in 0..n {
+                args.push(bs(format!("{i}").as_bytes()));
+                args.push(bs(format!("m{i:05}").as_bytes()));
+            }
+            assert_eq!(
+                crate::command::sorted_set::zadd(&mut db, &args),
+                Frame::Integer(n as i64),
+                "ZADD n={n}"
+            );
+            assert_eq!(
+                crate::command::sorted_set::zcard(&mut db, &[bs(b"z")]),
+                Frame::Integer(n as i64),
+                "ZCARD n={n}"
+            );
+        }
+
+        let mut db = Database::new();
+        for c in 0..400 {
+            let mut args: Vec<Frame> = Vec::with_capacity(201);
+            args.push(bs(b"acc"));
+            for i in 0..100 {
+                let idx = c * 100 + i;
+                args.push(bs(format!("{idx}").as_bytes()));
+                args.push(bs(format!("m{idx:07}").as_bytes()));
+            }
+            crate::command::sorted_set::zadd(&mut db, &args);
+        }
+        assert_eq!(
+            crate::command::sorted_set::zcard(&mut db, &[bs(b"acc")]),
+            Frame::Integer(40_000)
+        );
+    }
+}

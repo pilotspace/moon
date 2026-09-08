@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::db::{
-    LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, zset_member_cost, zset_table_bytes,
+    LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, listpack_batch_fits, zset_member_cost,
+    zset_table_bytes,
 };
 use crate::storage::listpack::Listpack;
 use crate::storage::zset_score::{ScoreBuf, render_score};
@@ -180,7 +181,13 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     let has_large_member = remaining
         .chunks_exact(2)
         .any(|pair| extract_bytes(&pair[1]).is_some_and(|m| m.len() > LISTPACK_MAX_ELEMENT_SIZE));
-    if !has_large_member {
+    // moon#865: a batch large enough to wrap the listpack header's u16 element
+    // count must not enter the listpack path. The upgrade check runs AFTER the
+    // loop below, which cannot stop a wrap that happens inside it. A zset
+    // listpack stores TWO entries per member (member then score), so
+    // `remaining.len()` -- not the pair count -- is the entry count, and the
+    // wrap arrives at 32,768 members rather than 65,536.
+    if !has_large_member && listpack_batch_fits(remaining.len()) {
         match db.get_or_create_zset_listpack(key) {
             Ok(Some(lp)) => {
                 let mut added = 0i64;
