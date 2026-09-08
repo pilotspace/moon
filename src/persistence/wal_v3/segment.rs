@@ -260,8 +260,18 @@ fn peek_nested_plane_record_type(payload: &[u8]) -> Option<Option<WalRecordType>
 /// `read_wal_v3_record(&record.payload)`, or scan and replay could
 /// disagree about which segments are safe to delete.
 fn segment_plane_scan(path: &Path) -> SegmentPlaneScan {
-    use super::record::WalRecordType;
+    segment_plane_scan_measured(path).0
+}
 
+/// [`segment_plane_scan`] plus the number of bytes it had to read.
+///
+/// `None` bytes means the file could not be read at all — the verdict is
+/// still the fail-closed `BLOCKED`, but it describes a transient I/O
+/// condition rather than the segment's immutable content, so callers must
+/// not memoize it (#870). Every other outcome — clean, plane-blocked, bad
+/// header, torn tail — is a pure function of bytes that never change once
+/// the segment is sealed, and is safe to remember for the life of the file.
+fn segment_plane_scan_measured(path: &Path) -> (SegmentPlaneScan, Option<u64>) {
     const BLOCKED: SegmentPlaneScan = SegmentPlaneScan {
         blocks_recycle: true,
         has_graph_temporal: false,
@@ -269,8 +279,23 @@ fn segment_plane_scan(path: &Path) -> SegmentPlaneScan {
 
     let data = match fs::read(path) {
         Ok(d) => d,
-        Err(_) => return BLOCKED,
+        Err(_) => return (BLOCKED, None),
     };
+    let bytes_read = Some(data.len() as u64);
+    let scan = segment_plane_scan_bytes(&data);
+    (scan, bytes_read)
+}
+
+/// Content classification of one sealed segment's raw bytes. See
+/// [`segment_plane_scan`] for the fail-closed contract.
+fn segment_plane_scan_bytes(data: &[u8]) -> SegmentPlaneScan {
+    use super::record::WalRecordType;
+
+    const BLOCKED: SegmentPlaneScan = SegmentPlaneScan {
+        blocks_recycle: true,
+        has_graph_temporal: false,
+    };
+
     if data.len() < WAL_V3_HEADER_SIZE || &data[..6] != WAL_V3_MAGIC || data[6] != WAL_V3_VERSION {
         return BLOCKED;
     }
@@ -357,6 +382,12 @@ pub struct WalWriterV3 {
     /// never retry a failing flush at tick cadence (syscall+log error loop).
     /// `None` while healthy.
     flush_backoff_until: Option<std::time::Instant>,
+    /// Cold (file-reading) plane scans performed by this writer's recyclers,
+    /// and the bytes those scans read. The #870 instrument: "the same
+    /// immutable segment is scanned repeatedly" is a claim about this
+    /// number, not about wall time.
+    plane_scans: u64,
+    plane_scan_bytes: u64,
 }
 
 /// Bound on every blocking durability wait (checkpoint ordering gates,
@@ -398,6 +429,8 @@ impl WalWriterV3 {
             sync_agent: None,
             sync_agent_unavailable: false,
             flush_backoff_until: None,
+            plane_scans: 0,
+            plane_scan_bytes: 0,
         };
 
         writer.open_new_segment()?;
@@ -682,6 +715,33 @@ impl WalWriterV3 {
         })
     }
 
+    /// Number of sealed-segment content scans that actually read a file
+    /// (#870 instrument). O(1).
+    #[inline]
+    pub fn plane_scans(&self) -> u64 {
+        self.plane_scans
+    }
+
+    /// Bytes read by [`Self::plane_scans`] scans. O(1).
+    #[inline]
+    pub fn plane_scan_bytes(&self) -> u64 {
+        self.plane_scan_bytes
+    }
+
+    /// Classify a sealed segment's content for the plane guard, counting
+    /// the file read against this writer and the `# Reclamation` INFO
+    /// counters.
+    fn plane_scan(&mut self, path: &Path) -> SegmentPlaneScan {
+        let (scan, bytes_read) = segment_plane_scan_measured(path);
+        self.plane_scans += 1;
+        let bytes = bytes_read.unwrap_or(0);
+        self.plane_scan_bytes += bytes;
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::command::info_reclamation::RECL_WAL_PLANE_SCAN_TOTAL.fetch_add(1, Relaxed);
+        crate::command::info_reclamation::RECL_WAL_PLANE_SCAN_BYTES_TOTAL.fetch_add(bytes, Relaxed);
+        scan
+    }
+
     /// Aggressively recycle fully-checkpointed WAL segments, **ignoring** the
     /// `min_wal_bytes` floor.
     ///
@@ -705,7 +765,7 @@ impl WalWriterV3 {
     ///   completed checkpoint to recycle everything before the new redo point.
     ///
     /// Returns [`RecycleStats`] with the count and byte total of segments deleted.
-    pub fn recycle_aggressive(&self, redo_lsn: u64) -> std::io::Result<RecycleStats> {
+    pub fn recycle_aggressive(&mut self, redo_lsn: u64) -> std::io::Result<RecycleStats> {
         use std::io::Read as _;
 
         struct SegInfo {
@@ -780,7 +840,7 @@ impl WalWriterV3 {
             // `scan.has_graph_temporal` observes when THIS caller's floor
             // (already `min(kv, graph)`-derived by K2 callers) is what let
             // such a segment through.
-            let scan = segment_plane_scan(&seg.path);
+            let scan = self.plane_scan(&seg.path);
             if scan.blocks_recycle {
                 segments_blocked_plane += 1;
                 continue;
@@ -914,7 +974,7 @@ impl WalWriterV3 {
     ///
     /// Called after checkpoint finalization when redo_lsn advances.
     /// Returns the number of segments recycled.
-    pub fn recycle_segments_before(&self, redo_lsn: u64) -> std::io::Result<usize> {
+    pub fn recycle_segments_before(&mut self, redo_lsn: u64) -> std::io::Result<usize> {
         use std::io::Read as _;
 
         // First pass: collect all .wal segments with their metadata.
@@ -990,7 +1050,7 @@ impl WalWriterV3 {
             // as of K2, so `GraphTemporal` segments (no longer in that
             // guard's match arm) recycle here once the graph floor covers
             // them.
-            let scan = segment_plane_scan(&seg.path);
+            let scan = self.plane_scan(&seg.path);
             if scan.blocks_recycle {
                 tracing::debug!(
                     "WAL recycle: keeping segment {:?} — holds sole-copy plane history",
@@ -2023,5 +2083,97 @@ mod tests {
             !scan.has_graph_temporal,
             "an ordinary non-nested Command payload must never set has_graph_temporal"
         );
+    }
+
+    /// Seals `n_plane_segments`+ segments that each hold at least one
+    /// sole-copy MQ plane record, so every sealed segment is plane-blocked
+    /// (the #870 live-instance shape: 34 sealed, 34 blocked, 0 freed).
+    fn seal_plane_blocked_segments(wal_dir: &Path) -> (WalWriterV3, u64) {
+        let mut writer = WalWriterV3::new(0, wal_dir, 512).unwrap();
+        writer.set_wal_bounds(0, u64::MAX);
+        for i in 0..60 {
+            writer.append(WalRecordType::MqCreate, b"mq-plane-payload-#870");
+            if (i + 1) % 3 == 0 {
+                writer.flush_sync().unwrap();
+            }
+        }
+        writer.flush_sync().unwrap();
+        let sealed = writer.current_segment_sequence() - 1;
+        assert!(sealed >= 4, "need several sealed segments, got {sealed}");
+        (writer, sealed)
+    }
+
+    /// #870 reproduction — all three conditions the issue names: the WAL is
+    /// past the ceiling (`max_wal_bytes` is irrelevant to the recycler
+    /// itself, the caller already decided to run it), a checkpoint has
+    /// completed (`redo_lsn > 0` covers every sealed segment), and every
+    /// sealed segment holds a plane record so the guard vetoes all of them.
+    /// A sealed segment is immutable, so its verdict can never change: three
+    /// passes over the same directory must read each sealed file ONCE, not
+    /// once per pass. Asserts on scan count, never on wall time.
+    #[test]
+    fn test_870_sealed_segment_plane_scan_runs_once_across_recycle_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let (mut writer, sealed) = seal_plane_blocked_segments(&wal_dir);
+        let redo_lsn = writer.current_lsn();
+
+        for pass in 1..=3u64 {
+            let stats = writer.recycle_aggressive(redo_lsn).unwrap();
+            assert_eq!(
+                stats.segments_recycled, 0,
+                "pass {pass}: nothing is freeable"
+            );
+            assert_eq!(
+                stats.segments_blocked_plane as u64, sealed,
+                "pass {pass}: every sealed segment is plane-blocked"
+            );
+        }
+        // The checkpoint-path recycler shares the memo — it must not pay
+        // for a fourth cold walk either.
+        assert_eq!(writer.recycle_segments_before(redo_lsn).unwrap(), 0);
+
+        assert_eq!(
+            writer.plane_scans(),
+            sealed,
+            "#870: {sealed} immutable sealed segments were content-scanned {} times \
+             across 4 recycle passes — the verdict of a sealed segment never changes, \
+             so each must be read exactly once",
+            writer.plane_scans()
+        );
+    }
+
+    /// The fail-closed plane guard must hold on a MEMOIZED verdict exactly
+    /// as it holds on a cold one: a segment holding an MQ record is refused
+    /// on the first pass (cold scan) and on every later pass (cache hit),
+    /// by both recyclers, at the most permissive floor there is. Nobody
+    /// gets to "fix" the #870 loop by weakening this.
+    #[test]
+    fn test_870_plane_guard_refuses_on_cached_verdict_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let (mut writer, sealed) = seal_plane_blocked_segments(&wal_dir);
+
+        let cold = writer.recycle_aggressive(u64::MAX).unwrap();
+        assert_eq!(cold.segments_recycled, 0);
+        assert_eq!(cold.segments_blocked_plane as u64, sealed);
+        let scans_after_cold = writer.plane_scans();
+        assert_eq!(
+            scans_after_cold, sealed,
+            "first pass is the one cold scan per segment"
+        );
+
+        let warm = writer.recycle_aggressive(u64::MAX).unwrap();
+        assert_eq!(
+            warm, cold,
+            "a cached verdict must be byte-for-byte the cold verdict"
+        );
+        assert_eq!(writer.recycle_segments_before(u64::MAX).unwrap(), 0);
+        for seq in 1..=sealed {
+            assert!(
+                WalSegment::segment_path(&wal_dir, seq).exists(),
+                "sealed segment {seq} holds sole-copy MQ history and must survive every pass"
+            );
+        }
     }
 }

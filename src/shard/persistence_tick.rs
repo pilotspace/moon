@@ -2237,4 +2237,109 @@ mod tests {
             "resident_buffer_bytes must equal grown-4KB*4096 + grown-64KB*65536"
         );
     }
+
+    /// #870 — the lag guard must not re-arm at base cadence after an
+    /// overflow pass that freed nothing. Establishes all three conditions
+    /// the issue names (WAL over the ceiling, a completed checkpoint, plane
+    /// records in every sealed segment), drives the real overflow path, and
+    /// asserts on the scheduler's decisions and the scan counter — never on
+    /// wall time (`last_checkpoint_at` is synthesized).
+    #[test]
+    fn test_870_wal_overflow_pass_backs_off_when_it_frees_nothing() {
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let wal_dir = shard_dir.join("wal-v3");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Condition 3: every sealed segment holds a sole-copy MQ record.
+        let mut wal = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        // Condition 1: ceiling far below the WAL we are about to write.
+        wal.set_wal_bounds(0, 1024);
+        for i in 0..60 {
+            wal.append(WalRecordType::MqCreate, b"mq-plane-payload-#870");
+            if (i + 1) % 3 == 0 {
+                wal.flush_sync().unwrap();
+            }
+        }
+        wal.flush_sync().unwrap();
+        let sealed = wal.current_segment_sequence() - 1;
+        assert!(sealed >= 4, "need several sealed segments, got {sealed}");
+        assert!(wal.stats().unwrap().total_bytes > wal.max_wal_bytes());
+
+        let page_cache = PageCache::new(4, 0);
+        let trigger = CheckpointTrigger::new(300, 256 * 1024 * 1024, 0.9);
+        let mut checkpoint_mgr = CheckpointManager::new(trigger);
+        let manifest_path = shard_dir.join("manifest.dat");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut control = ShardControlFile::new([0u8; 16]);
+        let control_path = ShardControlFile::control_path(&shard_dir, 0);
+        control.write(&control_path).unwrap();
+
+        const LAG_MS: u64 = 10_000;
+        let mut run =
+            |wal: &mut WalWriterV3, control: &mut ShardControlFile, elapsed_ms: u64| -> bool {
+                let last_checkpoint_at = Instant::now()
+                    .checked_sub(Duration::from_millis(elapsed_ms))
+                    .expect("Instant arithmetic");
+                maybe_force_checkpoint_on_wal_overflow(
+                    &mut checkpoint_mgr,
+                    wal,
+                    &page_cache,
+                    &mut manifest,
+                    control,
+                    &control_path,
+                    0,
+                    last_checkpoint_at,
+                    LAG_MS,
+                    &mut |_| true,
+                )
+            };
+
+        // Pass 1 — lag elapsed, pass runs, forces the checkpoint (condition
+        // 2: `redo_lsn` now covers every sealed segment) and frees nothing.
+        assert!(run(&mut wal, &mut control, LAG_MS + 1), "pass 1 must run");
+        assert!(
+            control.last_checkpoint_lsn > 0,
+            "condition 2: a completed checkpoint"
+        );
+        assert_eq!(
+            wal.plane_scans(),
+            sealed,
+            "pass 1 pays one cold scan per sealed segment"
+        );
+        for seq in 1..=sealed {
+            assert!(
+                crate::persistence::wal_v3::segment::WalSegment::segment_path(&wal_dir, seq)
+                    .exists(),
+                "plane-blocked segment {seq} must survive"
+            );
+        }
+
+        // Pass 2 — the same base lag has elapsed again. The previous pass
+        // freed nothing, so re-arming at base cadence is the #870 loop:
+        // the guard must back off and DEFER this one.
+        assert!(
+            !run(&mut wal, &mut control, LAG_MS + 1),
+            "#870: a pass that freed nothing re-armed the lag guard at base cadence"
+        );
+        // Pass 3 — the doubled lag has elapsed: the pass runs again (the
+        // backoff is bounded, not a freeze) and still reads no sealed file.
+        assert!(
+            run(&mut wal, &mut control, 2 * LAG_MS + 1),
+            "pass must run once the backed-off lag elapses"
+        );
+        assert_eq!(
+            wal.plane_scans(),
+            sealed,
+            "#870: a later pass re-read immutable sealed segments"
+        );
+        // Pass 4 — quadrupled lag now required.
+        assert!(
+            !run(&mut wal, &mut control, 2 * LAG_MS + 1),
+            "second no-op pass doubles the lag again"
+        );
+        assert!(run(&mut wal, &mut control, 4 * LAG_MS + 1));
+    }
 }

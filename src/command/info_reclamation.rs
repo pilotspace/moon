@@ -156,6 +156,18 @@ pub static RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL: AtomicU64 = AtomicU64::
 /// them.
 pub static RECL_WAL_RECYCLE_GRAPH_TEMPORAL_FREED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Cumulative count of sealed WAL segment files read end-to-end by the
+/// recyclers' plane-guard content scan (`segment_plane_scan`), and the bytes
+/// those reads moved. A sealed segment is immutable, so its verdict is
+/// memoized per writer (#870): in steady state this should advance by at
+/// most one scan per sealed segment per process lifetime. A counter that
+/// keeps climbing while `reclamation_wal_segments` stays flat is the #870
+/// loop — every sealed segment re-read on every overflow pass.
+pub static RECL_WAL_PLANE_SCAN_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes read by [`RECL_WAL_PLANE_SCAN_TOTAL`] scans.
+pub static RECL_WAL_PLANE_SCAN_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Cumulative count of plane WAL records (MQ/WS/temporal) DROPPED because the
 /// shard's `wal_append` channel was full at enqueue time (capacity 4096,
 /// drained every 1ms by the same shard thread — blocking there would deadlock
@@ -222,11 +234,15 @@ pub fn write_reclamation_section(buf: &mut String) {
          reclamation_wal_segments:{}\r\n\
          reclamation_wal_recycle_blocked_no_checkpoint_total:{}\r\n\
          reclamation_wal_recycle_graph_temporal_freed_total:{}\r\n\
+         reclamation_wal_plane_scan_total:{}\r\n\
+         reclamation_wal_plane_scan_bytes_total:{}\r\n\
          reclamation_wal_append_channel_dropped_total:{}\r\n",
         RECL_WAL_BYTES.load(Ordering::Relaxed),
         RECL_WAL_SEGMENTS.load(Ordering::Relaxed),
         RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL.load(Ordering::Relaxed),
         RECL_WAL_RECYCLE_GRAPH_TEMPORAL_FREED_TOTAL.load(Ordering::Relaxed),
+        RECL_WAL_PLANE_SCAN_TOTAL.load(Ordering::Relaxed),
+        RECL_WAL_PLANE_SCAN_BYTES_TOTAL.load(Ordering::Relaxed),
         RECL_WAL_APPEND_CHANNEL_DROPPED_TOTAL.load(Ordering::Relaxed)
     );
 
