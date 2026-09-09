@@ -514,11 +514,31 @@ mod dispatch_wiring_tests {
 
         // Answering with SOME payload is not enough: it has to be the value.
         let back = dump_payload::decode(&payload).expect("payload decodes");
+        // A 2-member zset decodes to the LISTPACK encoding since moon#863 —
+        // `read_rdb_entry` re-derives the compact form, so a DUMP payload
+        // restores into the same encoding a live `ZADD` would have produced.
+        // What this test is about is the VALUE, so compare the members.
         match back.as_redis_value() {
-            crate::storage::compact_value::RedisValueRef::SortedSet { members: m, .. } => {
-                assert_eq!(*m, members, "the tiered sorted set round-tripped wrong")
+            crate::storage::compact_value::RedisValueRef::SortedSetListpack(lp) => {
+                let decoded: HashMap<Bytes, f64> = lp
+                    .iter_pairs()
+                    .map(|(m, sc)| {
+                        (
+                            Bytes::from(m.as_bytes().to_vec()),
+                            crate::storage::zset_score::parse_score(&sc.as_bytes())
+                                .expect("stored score must parse"),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    decoded, members,
+                    "the tiered sorted set round-tripped wrong"
+                );
             }
-            _ => panic!("decoded entry is not a sorted set"),
+            other => panic!(
+                "decoded entry is not a zset listpack: {}",
+                other.encoding_name()
+            ),
         }
     }
 

@@ -151,6 +151,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `parse::<i64>()`, so a set holding `+5` reloaded as an intset and read
   back `5` — the moon#795 loss moon#802 had closed on the live path. It
   now uses `canonical_i64`; such a set reloads as a listpack, byte-exact.
+- **`replication`/`persistence`: a full resync no longer flattens every
+  compact encoding (moon#863).** The Redis-wire RDB codec has no type tag for
+  a compact encoding — `SetIntset`, `SetListpack` and the full `Set` all go
+  out as `RDB_TYPE_SET` — so `redis_rdb::read_rdb_entry` rebuilt every
+  container in its FULL form, and that codec is the one a FULLRESYNC payload
+  travels through (`replication::apply::load_snapshot` -> `load_rdb`). A
+  replica therefore held the master's data in the expensive form until each
+  key was rewritten, and `OBJECT ENCODING` on the replica disagreed with the
+  master's for all five affected types (set intset, set listpack, hash
+  listpack, list listpack, zset listpack). moon#840 fixed the equivalent gap
+  on the RESTART path only; this closes the replication one, reusing the same
+  helper and the same thresholds (`value_codec::compact_after_decode`), so a
+  value that arrives over the wire lands in exactly the encoding it would have
+  had if the same commands had been replayed live. `RESTORE` (which shares the
+  codec) benefits identically. Nothing about the bytes on the wire changes, so
+  moon stays readable by — and able to read — real Redis in both directions;
+  containers past the thresholds still load in their full form, complete.
+  The `RDB_TYPE_ZSET_2` arm now builds the canonical `SortedSetBPTree`
+  instead of the legacy `SortedSet`, which this arm was the last producer of:
+  the legacy form cost a `SortedSetKind::upgrade` on every zset command's
+  first touch and billed `used_memory` with the retired per-member model. A
+  NaN zset score (8 raw bytes on the wire; no writer produces one, `ZADD`
+  rejects it) is now rejected rather than rendered into a listpack as the text
+  `NaN`, which `parse_score` refuses and every later read would answer 0.0 for.
+  Measured on macOS 15.7.9 / M4 Pro, `release-fast` (not a publishable
+  benchmark profile), 3 interleaved A/B rounds over 100,000 keys across the
+  five types: replica `used_memory` 46,628,615 B -> 24,228,615 B (**-48.0%**),
+  which is now *exactly* the master's own 24,228,615 B; replica RSS
+  127.4 MB -> 92.0 MB (**-27.7%**). The master is unchanged.
 
 - **`text`: the `TMX3` TAG/NUMERIC sidecar block is now proven compatible
   in both directions, and the format no longer depends on the build's
