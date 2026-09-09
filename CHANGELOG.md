@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`text`/`vector`: one tokenization per HASH field, shared by the BM25 text
+  plane and the vector payload index (moon#885).** An `HSET` into a key that
+  matches both a text index and a vector index ran the whole analysis
+  pipeline twice over the same bytes — NFKD, combining-mark strip, lowercase,
+  UAX#29 segmentation and English Snowball — once in
+  `AnalyzerPipeline::tokenize_with_positions` and again in
+  `filter::TextIndex::tokenize` from `index_payload_field`. Measured on
+  Linux/aarch64 as 48.7% of a no-`.tpost` boot reconcile. The two consumers
+  are not interchangeable and were not made so: the text plane drops the 33
+  default stop words, honours NOSTEM per field and keeps word positions; the
+  payload index keeps stop words (an `@f:the` filter still hits), always
+  stems and has no positions. `AnalyzedText` now holds the normalized text
+  and word spans once per value, with a per-word English stem filled by
+  whichever consumer needs it first; an `AnalysisCache` scoped to one
+  `auto_index_hset` call hands the second consumer the first one's work. A
+  text-only NOSTEM field still never stems; a text-only stemmed field still
+  never stems its stop words. **Scope:** this removes duplication only where
+  both planes run — steady-state ingest, and recovery with no `.tpost`
+  (first boot, corrupt or version-skewed file). With `.tpost` present the
+  text plane is skipped on the reconcile path, so there is nothing to share
+  and that boot time is unchanged; the payload index's own pass there is
+  the only thing rebuilding it, because `PayloadIndex` has no durable form.
+  Pinned by `src/text/shared_analysis_tests.rs`, including a thread-local
+  `segment_passes()` probe asserting one pass per field value.
+
 - **`storage`: the cold-index rebuild builds its ordered map in one bulk load
   instead of one tree descent per key.** `ColdIndex::rebuild_from_manifest_per_db`
   fed every recovered key into a `BTreeMap` one at a time, in random hash

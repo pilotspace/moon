@@ -10,13 +10,11 @@ pub use text_index_impl::TextIndex;
 
 #[cfg(feature = "text-index")]
 mod text_index_impl {
+    use crate::text::analyzer::AnalyzedText;
     use bytes::Bytes;
     use roaring::RoaringBitmap;
-    use rust_stemmers::{Algorithm, Stemmer};
     use std::collections::HashMap;
     use std::sync::Arc;
-    use unicode_normalization::UnicodeNormalization;
-    use unicode_segmentation::UnicodeSegmentation;
 
     /// One field's index: the inverted map plus the forward map that makes
     /// removal proportional to the DOCUMENT rather than to the vocabulary.
@@ -51,21 +49,40 @@ mod text_index_impl {
         }
 
         /// Tokenize and index a text value for the given field and doc_id.
+        ///
+        /// Runs its own analysis pass. The auto-index path uses
+        /// [`insert_terms`](Self::insert_terms) with an analysis shared with
+        /// the text plane instead (moon#885).
         pub fn insert(&mut self, field: &Bytes, text: &[u8], doc_id: u32) {
             let text_str = match std::str::from_utf8(text) {
                 Ok(s) => s,
                 Err(_) => return, // Skip non-UTF8 text
             };
-            let terms = Self::tokenize(text_str);
+            let mut analysis = AnalyzedText::segment(text_str);
+            self.insert_terms(field, analysis.english_terms(), doc_id);
+        }
+
+        /// Index already-analyzed terms for `field` / `doc_id`.
+        ///
+        /// `terms` must be what [`tokenize`](Self::tokenize) would have
+        /// produced for the value — every word, English-stemmed, no
+        /// stop-word list — or a `TextMatch` filter on that value will miss.
+        /// [`AnalyzedText::english_terms`] is that stream.
+        pub fn insert_terms<'a>(
+            &mut self,
+            field: &Bytes,
+            terms: impl IntoIterator<Item = &'a str>,
+            doc_id: u32,
+        ) {
             let field_idx = self.indexes.entry(field.clone()).or_default();
             let carried = field_idx.docs.entry(doc_id).or_default();
             for term in terms {
                 // Reuse the term's existing allocation when the field has
                 // already seen it, so the forward map adds a pointer and not a
                 // second copy of the string.
-                let key: Arc<str> = match field_idx.terms.get_key_value(term.as_str()) {
+                let key: Arc<str> = match field_idx.terms.get_key_value(term) {
                     Some((existing, _)) => Arc::clone(existing),
-                    None => Arc::from(term.as_str()),
+                    None => Arc::from(term),
                 };
                 field_idx
                     .terms
@@ -105,26 +122,16 @@ mod text_index_impl {
 
         /// Tokenize raw text into stemmed terms.
         ///
-        /// Pipeline:
+        /// Pipeline (the shared [`AnalyzedText`] pass, then English stems):
         /// 1. NFKD normalize (decompose accented characters)
         /// 2. Strip combining marks (diacritics)
         /// 3. Lowercase
         /// 4. Unicode word segmentation
-        /// 5. Filter tokens < 2 chars
-        /// 6. Snowball stem (English)
+        /// 5. Filter tokens < 2 bytes
+        /// 6. Snowball stem (English) — every word, stop words included
         pub fn tokenize(text: &str) -> Vec<String> {
-            let stemmer = Stemmer::create(Algorithm::English);
-            // NFKD normalize and strip combining marks
-            let normalized: String = text
-                .nfkd()
-                .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
-                .collect();
-            let lowered = normalized.to_lowercase();
-            lowered
-                .unicode_words()
-                .filter(|w| w.len() >= 2)
-                .map(|w| stemmer.stem(w).into_owned())
-                .collect()
+            let mut analysis = AnalyzedText::segment(text);
+            analysis.english_terms().map(str::to_owned).collect()
         }
 
         /// Number of distinct terms currently indexed for `field`.

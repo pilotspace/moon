@@ -9,7 +9,7 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::text::analyzer::AnalyzerPipeline;
+use crate::text::analyzer::{AnalysisCache, AnalyzerPipeline};
 use crate::text::bm25::{FieldStats, bm25_score};
 use crate::text::index_persist::TextIndexMeta;
 use crate::text::posting::PostingStore;
@@ -793,7 +793,23 @@ impl TextIndex {
         args: &[crate::protocol::Frame],
         insert_lsn: u64,
     ) -> u32 {
-        self.index_document(key_hash, key, args);
+        let mut cache = AnalysisCache::new();
+        self.index_document_with_lsn_shared(key_hash, key, args, insert_lsn, &mut cache)
+    }
+
+    /// [`index_document_with_lsn`](Self::index_document_with_lsn) reading
+    /// field analyses from — and leaving them in — `cache`, so the vector
+    /// payload index for the same HSET does not analyze the same values
+    /// again (moon#885).
+    pub fn index_document_with_lsn_shared(
+        &mut self,
+        key_hash: u64,
+        key: &[u8],
+        args: &[crate::protocol::Frame],
+        insert_lsn: u64,
+        cache: &mut AnalysisCache,
+    ) -> u32 {
+        self.index_document_shared(key_hash, key, args, cache);
         let doc_id = *self
             .key_hash_to_doc_id
             .get(&key_hash)
@@ -813,6 +829,24 @@ impl TextIndex {
     /// * `key` - Raw Redis key bytes
     /// * `args` - HSET arguments: [field1, value1, field2, value2, ...]
     pub fn index_document(&mut self, key_hash: u64, key: &[u8], args: &[crate::protocol::Frame]) {
+        let mut cache = AnalysisCache::new();
+        self.index_document_shared(key_hash, key, args, &mut cache);
+    }
+
+    /// [`index_document`](Self::index_document) with a shared
+    /// [`AnalysisCache`]: each TEXT field's value is normalized and
+    /// segmented once per HSET across the text plane and the vector payload
+    /// index, and an English-stemmed field leaves its stems behind for the
+    /// payload index to reuse.
+    pub fn index_document_shared(
+        &mut self,
+        key_hash: u64,
+        key: &[u8],
+        args: &[crate::protocol::Frame],
+        cache: &mut AnalysisCache,
+    ) {
+        #[cfg(not(feature = "text-index"))]
+        let _ = &cache;
         let is_upsert = self.key_hash_to_doc_id.contains_key(&key_hash);
         let doc_id = if let Some(&existing_id) = self.key_hash_to_doc_id.get(&key_hash) {
             // Upsert: reuse existing doc_id
@@ -864,19 +898,29 @@ impl TextIndex {
 
             // Find field value in HSET args (pairwise: field_name, value, field_name, value, ...)
             let field_name = &self.text_fields[field_idx].field_name;
-            let field_value = find_field_value(args, field_name);
-
-            let Some(value_bytes) = field_value else {
+            let Some(value_bytes) = find_field_bytes(args, field_name) else {
                 continue;
             };
 
-            // Decode as UTF-8
-            let Ok(text) = std::str::from_utf8(value_bytes) else {
-                continue;
+            // Tokenize through the shared analysis (non-UTF8 values skip, as before).
+            #[cfg(feature = "text-index")]
+            let tokens = {
+                let Some(analysis) = cache.get_or_segment(value_bytes) else {
+                    continue;
+                };
+                self.field_analyzers[field_idx].terms_from(analysis)
             };
-
-            // Tokenize
-            let tokens = self.field_analyzers[field_idx].tokenize_with_positions(text);
+            #[cfg(not(feature = "text-index"))]
+            let tokens = {
+                let Ok(text) = std::str::from_utf8(value_bytes) else {
+                    continue;
+                };
+                self.field_analyzers[field_idx]
+                    .tokenize_with_positions(text)
+                    .into_iter()
+                    .map(|(term, pos)| (std::borrow::Cow::<str>::Owned(term), pos))
+                    .collect::<Vec<_>>()
+            };
             let token_count = tokens.len() as u32;
             field_lengths[field_idx] = token_count;
 
@@ -2258,12 +2302,21 @@ fn normalize_tag_value(
 /// Args layout: [field1, value1, field2, value2, ...]
 /// Returns the raw bytes of the value for the matching field name.
 fn find_field_value<'a>(args: &'a [crate::protocol::Frame], field_name: &[u8]) -> Option<&'a [u8]> {
+    find_field_bytes(args, field_name).map(Bytes::as_ref)
+}
+
+/// `find_field_value` keeping the frame's `Bytes`, so the value can key an
+/// [`AnalysisCache`] by identity as well as by content.
+fn find_field_bytes<'a>(
+    args: &'a [crate::protocol::Frame],
+    field_name: &[u8],
+) -> Option<&'a Bytes> {
     let mut i = 0;
     while i + 1 < args.len() {
         if let crate::protocol::Frame::BulkString(name) = &args[i] {
             if name.as_ref() == field_name {
                 if let crate::protocol::Frame::BulkString(value) = &args[i + 1] {
-                    return Some(value.as_ref());
+                    return Some(value);
                 }
             }
         }
