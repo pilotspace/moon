@@ -1,0 +1,9 @@
+w300	    6.63s	 0.4733 ms/key	(14000 keys)	nidx=200 per=70 words=300 sab=notpost flags=
+w1200	   22.44s	 1.6026 ms/key	(14000 keys)	nidx=200 per=70 words=1200 sab=notpost flags=
+w4800	   20.99s	 5.9959 ms/key	(3500 keys)	nidx=50 per=70 words=4800 sab=notpost flags=
+w300	    6.65s	 0.4753 ms/key	(14000 keys)	nidx=200 per=70 words=300 sab=notpost flags=
+w1200	   22.44s	 1.6026 ms/key	(14000 keys)	nidx=200 per=70 words=1200 sab=notpost flags=
+w4800	   20.99s	 5.9973 ms/key	(3500 keys)	nidx=50 per=70 words=4800 sab=notpost flags=
+w300	    6.62s	 0.4726 ms/key	(14000 keys)	nidx=200 per=70 words=300 sab=notpost flags=
+w1200	   22.53s	 1.6092 ms/key	(14000 keys)	nidx=200 per=70 words=1200 sab=notpost flags=
+w4800	   21.08s	 6.0239 ms/key	(3500 keys)	nidx=50 per=70 words=4800 sab=notpost flags=

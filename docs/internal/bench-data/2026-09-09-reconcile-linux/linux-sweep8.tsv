@@ -1,0 +1,4 @@
+s035k	   32.47s	 0.9276 ms/key	(35000 keys)	rep1	nidx=10	keys=35000	load=2.01	wall=34s
+s294k	  317.33s	 1.0793 ms/key	(294000 keys)	rep1	nidx=84	keys=294000	load=2.50	wall=326s
+s035k	   32.20s	 0.9200 ms/key	(35000 keys)	rep2	nidx=10	keys=35000	load=2.18	wall=34s
+s294k	  317.08s	 1.0785 ms/key	(294000 keys)	rep2	nidx=84	keys=294000	load=2.46	wall=326s

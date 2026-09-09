@@ -1,0 +1,5 @@
+base2	   16.74s	 0.4782 ms/key	(35000 keys)	rep1	nidx=500	per=70	dim=384	words=300	heaps=0	load=0.04	wall=47s
+hb70	   27.43s	 0.7836 ms/key	(35000 keys)	rep1	nidx=500	per=70	dim=384	words=300	heaps=1	load=0.76	wall=74s
+hb350	rep1	HARNESS-FAIL	see /tmp/g2-hb350-1-11675.out
+hb1750	   30.65s	 0.8757 ms/key	(35000 keys)	rep1	nidx=20	per=1750	dim=384	words=300	heaps=1	load=0.91	wall=75s
+hb7000	rep1	HARNESS-FAIL	see /tmp/g2-hb7000-1-1562.out

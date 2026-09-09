@@ -1,0 +1,10 @@
+base6	   16.74s	 0.4783 ms/key	(35000 keys)	rep1	nidx=500	per=70	prodvocab=0	pv_types=0	sab=notpost	vunch=0	reidx=0	load=1.36	wall=48s
+pv70	   19.65s	 0.5614 ms/key	(35000 keys)	rep1	nidx=500	per=70	prodvocab=1	pv_types=937	sab=notpost	vunch=0	reidx=0	load=1.19	wall=54s
+pv7000	   25.62s	 0.7319 ms/key	(35000 keys)	rep1	nidx=5	per=7000	prodvocab=1	pv_types=15765	sab=notpost	vunch=34000	reidx=1000	load=1.13	wall=65s
+pv7000nk	   26.76s	 0.7647 ms/key	(35000 keys)	rep1	nidx=5	per=7000	prodvocab=1	pv_types=15765	sab=both	vunch=0	reidx=35000	load=1.30	wall=66s
+base6nk	   16.79s	 0.4798 ms/key	(35000 keys)	rep1	nidx=500	per=70	prodvocab=0	pv_types=0	sab=both	vunch=0	reidx=0	load=1.37	wall=48s
+base6	   17.06s	 0.4876 ms/key	(35000 keys)	rep2	nidx=500	per=70	prodvocab=0	pv_types=0	sab=notpost	vunch=0	reidx=0	load=1.31	wall=48s
+pv70	   19.83s	 0.5666 ms/key	(35000 keys)	rep2	nidx=500	per=70	prodvocab=1	pv_types=937	sab=notpost	vunch=0	reidx=0	load=1.08	wall=55s
+pv7000	   27.20s	 0.7770 ms/key	(35000 keys)	rep2	nidx=5	per=7000	prodvocab=1	pv_types=15765	sab=notpost	vunch=33000	reidx=2000	load=1.24	wall=67s
+pv7000nk	   25.75s	 0.7356 ms/key	(35000 keys)	rep2	nidx=5	per=7000	prodvocab=1	pv_types=15765	sab=both	vunch=0	reidx=35000	load=1.29	wall=65s
+base6nk	   16.95s	 0.4844 ms/key	(35000 keys)	rep2	nidx=500	per=70	prodvocab=0	pv_types=0	sab=both	vunch=0	reidx=0	load=1.38	wall=48s

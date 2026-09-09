@@ -103,6 +103,7 @@ Measured detail — spin governor, THP soak, io_uring dead ends — in [`docs/in
 - Vector engine (FT.*) internals — segment lifecycle, exact-rerank sidecar, adaptive ef, quantization trade-offs: [`docs/internal/vector-engine-internals.md`](docs/internal/vector-engine-internals.md). User guide: [`docs/vector-search-guide.md`](docs/vector-search-guide.md).
 - GPU / CUDA (`--features gpu-cuda`, never default): [`docs/internal/gpu-cuda.md`](docs/internal/gpu-cuda.md).
 - Cross-shard performance — the per-park cost model, seven measured dead ends, five retracted claims: [`docs/internal/cross-shard-cost-model.md`](docs/internal/cross-shard-cost-model.md). **Read before proposing any cross-shard optimisation.**
+- Startup index reconcile — why a restart is slow, the per-word cost model, and five disproved explanations: [`docs/internal/startup-reconcile-cost-model.md`](docs/internal/startup-reconcile-cost-model.md). **Read before optimising startup.** The bench model does NOT describe production: 44.4x apart, ten terms measured, eight ties, 24.1x unexplained. Index count and docs-per-index cost nothing; the fixture vocabulary was 290x too low.
 
 ## CI — the merge bar
 

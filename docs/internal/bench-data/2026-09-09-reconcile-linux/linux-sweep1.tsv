@@ -1,0 +1,17 @@
+base	   16.67s	 0.4764 ms/key	(35000 keys)	rep1	nidx=500	per=70	dim=384	words=300	uniq=0	load=0.91	wall=47s
+idx7000	   16.38s	 0.4680 ms/key	(35000 keys)	rep1	nidx=7000	per=5	dim=384	words=300	uniq=0	load=1.05	wall=142s
+dpi7000	   16.30s	 0.4656 ms/key	(35000 keys)	rep1	nidx=5	per=7000	dim=384	words=300	uniq=0	load=1.48	wall=43s
+uniq	   36.97s	 1.0562 ms/key	(35000 keys)	rep1	nidx=500	per=70	dim=384	words=300	uniq=1	load=1.38	wall=100s
+dim768	   16.71s	 0.4775 ms/key	(35000 keys)	rep1	nidx=500	per=70	dim=768	words=300	uniq=0	load=1.25	wall=52s
+w500	   25.41s	 0.7261 ms/key	(35000 keys)	rep1	nidx=500	per=70	dim=384	words=500	uniq=0	load=1.28	wall=68s
+dpi350	   16.28s	 0.4652 ms/key	(35000 keys)	rep1	nidx=100	per=350	dim=384	words=300	uniq=0	load=1.21	wall=44s
+dpi1750	   16.95s	 0.4842 ms/key	(35000 keys)	rep1	nidx=20	per=1750	dim=384	words=300	uniq=0	load=1.03	wall=44s
+prodlike	rep1	HARNESS-FAIL	see /tmp/g0-prodlike-1-26024.out	nidx=5 per=7000 dim=768 words=500 uniq=1
+base	   16.54s	 0.4726 ms/key	(35000 keys)	rep2	nidx=500	per=70	dim=384	words=300	uniq=0	load=1.37	wall=47s
+idx7000	   16.32s	 0.4662 ms/key	(35000 keys)	rep2	nidx=7000	per=5	dim=384	words=300	uniq=0	load=1.20	wall=142s
+dpi7000	   16.59s	 0.4741 ms/key	(35000 keys)	rep2	nidx=5	per=7000	dim=384	words=300	uniq=0	load=1.50	wall=44s
+uniq	   36.91s	 1.0547 ms/key	(35000 keys)	rep2	nidx=500	per=70	dim=384	words=300	uniq=1	load=1.43	wall=99s
+dim768	   16.79s	 0.4797 ms/key	(35000 keys)	rep2	nidx=500	per=70	dim=768	words=300	uniq=0	load=1.09	wall=53s
+w500	   25.32s	 0.7235 ms/key	(35000 keys)	rep2	nidx=500	per=70	dim=384	words=500	uniq=0	load=1.10	wall=68s
+dpi350	   16.26s	 0.4645 ms/key	(35000 keys)	rep2	nidx=100	per=350	dim=384	words=300	uniq=0	load=1.09	wall=43s
+dpi1750	   16.94s	 0.4840 ms/key	(35000 keys)	rep2	nidx=20	per=1750	dim=384	words=300	uniq=0	load=0.98	wall=45s

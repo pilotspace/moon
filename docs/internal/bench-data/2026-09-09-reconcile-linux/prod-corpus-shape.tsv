@@ -1,0 +1,9 @@
+field	n	mean_bytes	median_bytes	p90_bytes	max_bytes	mean_words	median_words	max_words
+content	13674	1977.1	1844	3015	4309	245.6	220	384
+meta	13674	2137.0	2009	3197	4492	245.6	220	384
+source	13674	21.7	22	22	22	1.0	1	1
+valid_time	6959	13.0	13	13	13	1.0	1	1
+vec	6715	3072.0	3072	3072	3072	59.7	59	85
+# n_hsets_sampled=13674 source=appendonlydir/moon.aof.7.incr.aof (119.6 MB, 31,487 HSETs, 13,674 of them indexed-family)
+# text-plane words/key (schema field 'content' only) = 245.6
+# payload-plane words/key (index_payload_field runs over EVERY field) = 493.3

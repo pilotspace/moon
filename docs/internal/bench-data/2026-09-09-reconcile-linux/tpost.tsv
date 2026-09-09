@@ -1,0 +1,6 @@
+tpost_off	    6.55s	 0.4679 ms/key	(14000 keys)	nidx=200 per=70 words=300 sab=notpost flags=
+tpost_on	    3.32s	 0.2374 ms/key	(14000 keys)	nidx=200 per=70 words=300 sab=none flags=
+tpost_off	    6.59s	 0.4709 ms/key	(14000 keys)	nidx=200 per=70 words=300 sab=notpost flags=
+tpost_on	    3.34s	 0.2386 ms/key	(14000 keys)	nidx=200 per=70 words=300 sab=none flags=
+tpost_off	    6.62s	 0.4727 ms/key	(14000 keys)	nidx=200 per=70 words=300 sab=notpost flags=
+tpost_on	    3.33s	 0.2376 ms/key	(14000 keys)	nidx=200 per=70 words=300 sab=none flags=

@@ -1,0 +1,13 @@
+uncapped	  153.56s	 1.0446 ms/key	(147000 keys)	rep0	cap=none	peak=7559462912	swap_peak=0	events=low0,high0,max0,oom0,oom_kill0,oom_group_kill0,sock_throttled0,	wall=167s
+cap_none	  152.74s	 1.0391 ms/key	(147000 keys)	rep1	cap=none	peak=7558782976	swap_peak=0	events=low0,high0,max0,oom0,oom_kill0,oom_group_kill0,sock_throttled0,	wall=165s
+cap_85	  156.29s	 1.0632 ms/key	(147000 keys)	rep1	cap=6425543475	peak=6425542656	swap_peak=776900608	events=low0,high0,max686,oom0,oom_kill0,oom_group_kill0,sock_throttled0,	wall=170s
+cap_60	  163.81s	 1.1143 ms/key	(147000 keys)	rep1	cap=4535677747	peak=4535676928	swap_peak=2660306944	events=low0,high0,max3675,oom0,oom_kill0,oom_group_kill0,sock_throttled0,	wall=178s
+cap_45	  172.72s	 1.1749 ms/key	(147000 keys)	rep1	cap=3401758310	peak=3401756672	swap_peak=3780177920	events=low0,high0,max7432,oom0,oom_kill0,oom_group_kill0,sock_throttled0,	wall=188s
+cap_35	  180.98s	 1.2312 ms/key	(147000 keys)	rep1	cap=2645812019	peak=2645811200	swap_peak=4538433536	events=low0,high0,max13444,oom0,oom_kill0,oom_group_kill0,sock_throttled0,	wall=199s
+cap_25	  189.36s	 1.2882 ms/key	(147000 keys)	rep1	cap=1889865728	peak=1889865728	swap_peak=5280391168	events=low0,high0,max25920,oom0,oom_kill0,oom_group_kill0,sock_throttled0,	wall=214s
+cap_none	  151.99s	 1.0340 ms/key	(147000 keys)	rep2	cap=none	peak=7568388096	swap_peak=0	events=low0,high0,max0,oom0,oom_kill0,oom_group_kill0,sock_throttled0,	wall=165s
+cap_85	  153.44s	 1.0438 ms/key	(147000 keys)	rep2	cap=6425543475	peak=6425542656	swap_peak=764141568	events=low0,high0,max685,oom0,oom_kill0,oom_group_kill0,sock_throttled0,	wall=167s
+cap_60	  161.80s	 1.1007 ms/key	(147000 keys)	rep2	cap=4535677747	peak=4535676928	swap_peak=2655109120	events=low0,high0,max3654,oom0,oom_kill0,oom_group_kill0,sock_throttled0,	wall=176s
+cap_45	  171.37s	 1.1658 ms/key	(147000 keys)	rep2	cap=3401758310	peak=3401756672	swap_peak=3786043392	events=low0,high0,max7378,oom0,oom_kill0,oom_group_kill0,sock_throttled0,	wall=186s
+cap_35	  179.21s	 1.2191 ms/key	(147000 keys)	rep2	cap=2645812019	peak=2645811200	swap_peak=4536311808	events=low0,high0,max13572,oom0,oom_kill0,oom_group_kill0,sock_throttled0,	wall=196s
+cap_25	  189.75s	 1.2908 ms/key	(147000 keys)	rep2	cap=1889865728	peak=1889865728	swap_peak=5283700736	events=low0,high0,max26326,oom0,oom_kill0,oom_group_kill0,sock_throttled0,	wall=214s
