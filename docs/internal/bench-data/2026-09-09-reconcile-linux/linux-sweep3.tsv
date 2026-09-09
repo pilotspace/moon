@@ -1,0 +1,14 @@
+base3	   16.85s	 0.4813 ms/key	(35000 keys)	rep1	nidx=500	per=70	dim=384	words=300	heaps=0	lv=0	sab=notpost	vunch=0	reidx=0	load=0.20	wall=47s
+lword	   25.96s	 0.7416 ms/key	(35000 keys)	rep1	nidx=500	per=70	dim=384	words=300	heaps=0	lv=1	sab=notpost	vunch=0	reidx=0	load=0.68	wall=67s
+hb7000	   32.30s	 0.9227 ms/key	(35000 keys)	rep1	nidx=5	per=7000	dim=384	words=300	heaps=1	lv=0	sab=notpost	vunch=33000	reidx=2000	load=0.98	wall=81s
+nokm384	   16.83s	 0.4808 ms/key	(35000 keys)	rep1	nidx=500	per=70	dim=384	words=300	heaps=0	lv=0	sab=both	vunch=0	reidx=0	load=1.23	wall=48s
+nokm768	   16.84s	 0.4812 ms/key	(35000 keys)	rep1	nidx=500	per=70	dim=768	words=300	heaps=0	lv=0	sab=both	vunch=0	reidx=0	load=1.30	wall=51s
+h70nokm	   27.74s	 0.7926 ms/key	(35000 keys)	rep1	nidx=500	per=70	dim=768	words=300	heaps=1	lv=0	sab=both	vunch=0	reidx=0	load=1.29	wall=78s
+h7000nokm	   32.70s	 0.9342 ms/key	(35000 keys)	rep1	nidx=5	per=7000	dim=768	words=300	heaps=1	lv=0	sab=both	vunch=0	reidx=35000	load=1.16	wall=85s
+base3	   16.72s	 0.4776 ms/key	(35000 keys)	rep2	nidx=500	per=70	dim=384	words=300	heaps=0	lv=0	sab=notpost	vunch=0	reidx=0	load=1.50	wall=47s
+lword	   25.72s	 0.7349 ms/key	(35000 keys)	rep2	nidx=500	per=70	dim=384	words=300	heaps=0	lv=1	sab=notpost	vunch=0	reidx=0	load=1.25	wall=67s
+hb7000	   32.72s	 0.9349 ms/key	(35000 keys)	rep2	nidx=5	per=7000	dim=384	words=300	heaps=1	lv=0	sab=notpost	vunch=33001	reidx=1999	load=1.22	wall=81s
+nokm384	   16.75s	 0.4787 ms/key	(35000 keys)	rep2	nidx=500	per=70	dim=384	words=300	heaps=0	lv=0	sab=both	vunch=0	reidx=0	load=1.28	wall=48s
+nokm768	   17.06s	 0.4873 ms/key	(35000 keys)	rep2	nidx=500	per=70	dim=768	words=300	heaps=0	lv=0	sab=both	vunch=0	reidx=0	load=1.23	wall=52s
+h70nokm	   28.00s	 0.8001 ms/key	(35000 keys)	rep2	nidx=500	per=70	dim=768	words=300	heaps=1	lv=0	sab=both	vunch=0	reidx=0	load=1.24	wall=78s
+h7000nokm	   33.60s	 0.9600 ms/key	(35000 keys)	rep2	nidx=5	per=7000	dim=768	words=300	heaps=1	lv=0	sab=both	vunch=0	reidx=35000	load=1.18	wall=87s

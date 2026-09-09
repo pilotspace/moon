@@ -57,3 +57,23 @@ build finished and nothing in `target/release/moon.d` — the build's own declar
 inputs — is newer than the binary. Its first version compared the binary against
 the build log and rejected every correct build, because cargo appends `Finished`
 about 64 ms after linking.
+
+---
+
+## Gate-zero files (added 2026-09-09, second sweep)
+
+`gate-zero-findings.md` is the full 756-line attribution study; the summary is
+in the parent document's §4. `linux-sweep{1,2,3,5,6,7,8}.tsv` are its Linux
+legs, `prod-*.tsv` the production-side measurements taken read-only from the
+live instance's log, AOF, RDB and index sidecars.
+
+**Two corrections this sweep forced on the files above it.** The
+`~45x document size` note in the provenance section below is wrong — it was
+derived by inverting the cost model against the answer, and the measured ratio
+is 1.03x. And `doc-size.tsv`'s companion claim that the reconcile is flat in
+corpus size at fixed density is wrong: it is log-linear at 0.068 per ln key.
+
+Both errors share one cause, recorded here because it outlives them: the corpus
+these files were generated from draws on a **54-word vocabulary**, against
+production's 15,765 types per index. Vocabulary is the only content axis that
+moves the reconcile, and it was held 290x too low.

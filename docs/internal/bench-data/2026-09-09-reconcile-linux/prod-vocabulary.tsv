@@ -1,0 +1,20 @@
+# Production per-index vocabulary growth, measured from 13,674 real documents
+# in appendonlydir/moon.aof.7.incr.aof. Analyzer approximation: unicode word
+# segmentation, tokens >= 2 bytes (moon's pipeline also NFKD-normalises,
+# lowercases and Snowball-stems, which can only REDUCE the count).
+# Fit: V(tokens) = 2.619 * tokens^0.613 at 209.3 terms/doc.
+index	docs_in_sample	stems_at_70	stems_at_200	stems_at_500	stems_at_1000	total_stems	terms_per_doc
+lunaris_git_c7a6943241865507_chunks_idx	4956	1198	1980	3182	4864	12994	219.3
+lunaris_cwd_858ccb1119128e74_chunks_idx	1934	893	1716	2997	3761	5501	205.5
+lunaris_git_07f25578a1faa839_chunks_idx	1297	937	1819	2854	3866	4394	188.3
+lunaris_git_2bcc15e0f977d444_chunks_idx	1204	665	1210	2410	3575	3952	197.8
+lunaris_git_ab579ed01d885f35_chunks_idx	1116	800	1592	2689	3281	3425	204.6
+lunaris_git_23d602de8bfadbe0_chunks_idx	1046	1007	1419	2902	5341	5543	197.3
+lunaris_git_4a7892b2d28f4c6f_chunks_idx	879	1149	2089	3712		4930	221.2
+lunaris_git_d64d1418e0d58f42_chunks_idx	378	1003	1820			2733	224.7
+lunaris_git_d5cc31612d69832c_chunks_idx	260	785	1407			1679	230.6
+lunaris_git_035506340ca9f1a8_chunks_idx	134	1436				2025	232.7
+lunaris_git_50cb00e5e9f9d6c9_chunks_idx	112	535				813	173.9
+lunaris_git_185428270d2c6227_chunks_idx	106	320				691	182.7
+lunaris_git_ae8d1a9fa093f0df_chunks_idx	87	772				977	236.3
+lunaris_git_ba155e1577bbb3d7_chunks_idx	72	627				627	199.4

@@ -1,0 +1,3 @@
+boot_start	keys	ms_per_key	tail_pct_keys	tail_pct_time	tail_ms_per_key	body_ms_per_key	tail_factor
+2026-09-08T08:53:54.785634+00:00	315868	15.638	0.57	5.61	89.09	8.576	1.823
+2026-09-08T16:07:30.822766+00:00	293439	22.252	6.20	67.33	228.90	7.346	3.029

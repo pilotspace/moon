@@ -1,20 +1,26 @@
-# The startup reconcile cost model — what was measured, and what was disproved
+# The startup reconcile — a bench model, and why it does not describe production
 
-Written after a day spent diagnosing why a production instance took **1 hour
+Written after two days spent on why a production instance took **1 hour
 50 minutes** to become available after a restart. Its purpose is largely
-**negative knowledge**: six explanations were proposed and five were wrong, and
-one of the wrong ones was published to the user as "unambiguous". All of them
-are recorded here so nobody spends another day re-deriving them.
+**negative knowledge**: thirteen explanations were proposed and eleven were
+measured to be wrong, including every one this document's first version ranked
+worth fixing. All of them are recorded here so nobody spends a third day
+re-deriving them.
+
+**The headline is a hole, not a finding.** Production reconciles a key **44.4x**
+slower than the synthetic bench. Ten candidate terms were measured on Linux;
+eight are ties, and the two that are real multiply to **1.84x**. The remaining
+**24.1x is named and unexplained.**
 
 Every number below comes from a Linux host — GCE `t2a-standard-8` (aarch64,
-8 vCPU, 31 GB RAM), dedicated, nothing else running, moon `0bfc730d` built with
-the shipping `release` profile and `RUSTFLAGS="-C target-cpu=native"`. Raw data:
+8 vCPU, 31 GB RAM), dedicated, moon `0bfc730d` built with the shipping `release`
+profile and `RUSTFLAGS="-C target-cpu=native"`. Raw data:
 [`bench-data/2026-09-09-reconcile-linux/`](bench-data/2026-09-09-reconcile-linux/).
 
 **No macOS number appears in this document, and none should be added.** Every
 figure this investigation produced on a developer laptop was either wrong or
-misleading, including one that was off by 2.5x in the direction that would have
-deprioritised the real fix. See §5.
+misleading, one of them by 2.5x in the direction that would have deprioritised
+the fix it was pointing at.
 
 ---
 
@@ -26,179 +32,196 @@ then walks every key matching an index prefix, re-deriving its postings and
 vectors. Until it finishes the shard answers `-LOADING` to every data command,
 so from a client's point of view the server is down for the whole walk.
 
-## 2. The finding: text analysis dominates, and one pass is not what it looks like
+## 2. The two anchors, and the definitional gap between them
 
-Plane isolation, 500 indexes x 70 docs = 35,000 keys, 300 words/doc, `.tpost`
-deleted between boots, 3 interleaved repetitions (CV 0.03%):
+| interval | production ms/key |
+|---|---|
+| process start -> done (client-visible outage) | 22.432 |
+| vector-restore -> done | 22.351 |
+| **scanned-db -> done (the harness's definition)** | **21.055** |
 
-```text
-both planes           0.4767  0.4766  0.4769   ms/key
---no-vector (text)    0.2342  0.2278  0.2280
---no-text  (vector)   0.0190  0.0165  0.0167
-```
+The bench harness times `recovery scanned db` -> `auto-reindexed`. Comparing
+production's *whole boot* against that is comparing different intervals, and
+**1.06x of the originally reported 46.9x was definitional.** Like for like the
+gap is **21.055 / 0.4745 = 44.4x**.
 
-The legs do not sum, and the residual is the whole point:
+## 3. Production is a distribution, not a number
 
-| component | ms/key | share |
-|---|---|---|
-| text plane (`index_document` -> analyzer -> stemmer) | 0.2280 | 47.8% |
-| vector plane, **including a full HNSW re-encode** | 0.0167 | **3.5%** |
-| payload/filter rebuild (`index_payload_field`) | 0.2320 | **48.7%** |
+Key-weighted quantiles over the anchor boot's 432 progress intervals:
 
-The residual appears only when a vector index and text fields coexist:
-`--no-vector` removes the payload index entirely, `--no-text` leaves it nothing
-long to stem. It is `PayloadIndex::insert_text`
-(`src/vector/filter/text_index.rs`) running the analyzer over the same bytes,
-constructing a `Stemmer` per call.
+| p10 | p25 | p50 | p75 | p90 | p95 | p99 |
+|---|---|---|---|---|---|---|
+| 2.32 | 3.82 | **5.77** | 8.89 | 21.32 | 80.79 | 363.78 |
 
-### That third row is NOT simply "redundant", and the label above cost a day
-
-Whether it is duplicated work depends on which path recovery takes, and the two
-paths are opposite:
-
-- **No `.tpost`** (first boot after deploy, corrupt/version-skewed file): both
-  planes run, the bytes really are analysed twice, and sharing one tokenisation
-  removes a pass. This is **moon#885**, and this is the configuration the table
-  above was measured in.
-- **`.tpost` present** (the normal steady state after #879): the text plane is
-  *skipped* — `RecoveryState::reconcile_key`
-  (`src/vector/persistence/recover_v2.rs:377`) takes the verified-unchanged
-  branch into `update_metadata_only`
-  (`src/shard/spsc_handler.rs:3949`) — so there is no text-plane tokenisation to
-  share, and `index_payload_field` is the **only** thing rebuilding
-  tag/numeric/geo/`TextMatch` filtering. Not redundant. Load-bearing.
-  The arithmetic closes: 0.4709 − 0.2280 = 0.2429 against 0.2376 measured with
-  `.tpost` on.
-
-**So moon#885 delivers ~0 on the `.tpost` boot path.** Its value is steady-state
-ingest (every `HSET` into a key matching both a text and a vector index runs
-both pipelines) and no-`.tpost` recovery.
-
-### The actual blocker: `PayloadIndex` has no durable form
-
-`src/vector/store.rs:1905` and `:2037` both construct `PayloadIndex::new()`, and
-nothing under `src/vector/persistence/` writes or reads it — the vector keymap
-persists only `key_hash / global_id / vec_checksum / key`
-(`src/vector/persistence/manifest.rs:205-217`). Filter state must therefore be
-rebuilt from the live keyspace on **every** boot, for every key, forever.
-
-**No text-index format can eliminate the keyspace walk while that holds.**
-
-By profile (`/usr/bin/sample`, shard-0, 13,919 samples), ~55% of on-CPU self
-time is normalize + segment + stem: `rust_stemmers` 34.1%,
-`unicode_normalization` 10.2%, `unicode_segmentation` 4.7%.
-
-## 3. The cost model
-
-Cost is linear in **field bytes**, over a 16x size range, fitting within 1.5%:
+**6.2% of keys consume 67.3% of the wall time.** So the gap is two terms:
 
 ```text
-ms/key = 0.1051 + 1.227 us/word          (~0.614 us/word per analysis pass)
-
-   300 w   measured 0.4733   predicted 0.4733
-  1200 w   measured 1.6026   predicted 1.5780   (-1.5%)
-  4800 w   measured 5.9966   predicted 5.9966
+44.4x total  =  12.2x structural (p50 5.77 vs bench 0.4745)  x  3.65x stall tail
 ```
 
-It is **flat in corpus size** at fixed density: 35k / 70k / 140k keys cost
-0.220 / 0.219 / 0.225 ms/key. It **is** superlinear on docs-per-index with a
-high-cardinality vocabulary: 3.5k / 7k / 14k docs per index cost
-0.321 / 0.618 / 1.484 ms/key, roughly n^2 (measured on macOS; the axis is real,
-the constants are not authoritative).
+Four boots over a byte-identical corpus read 2.90 / 5.58 / 5.67 / 5.58 ms/key —
+a **1.93x spread with every input fixed.** No cost model explains that.
 
-## 4. What `.tpost` buys (moon#879)
+## 4. The factor table
 
-Persisted postings, on vs off, 3 interleaved repetitions:
+Noise floor 0.42% within a sweep, 1.4% across sweeps. Anything under ~1.5% is a
+tie.
+
+| term | production vs bench | measured | verdict |
+|---|---|---|---|
+| effective index count | 596 vs 500 *(7,056 definitions)* | **0.984x** | FALSIFIED |
+| docs per index | 7,678 vs 70 *(110x)* | **0.990x** | FALSIFIED |
+| indexes matched per key | 1 vs 1 | **1.000x** | FALSIFIED |
+| document size | 641.9 vs 615 term passes | **1.033x** | FALSIFIED |
+| vector dim / HNSW params | 768 vs 384; m=16 ef=200 both | **1.009x** | FALSIFIED |
+| full re-encode path | 85.5% vs 6% of keys | **0.994x** | FALSIFIED |
+| `.tpost` fast path | absent vs absent | 1.000x | not a term |
+| allocator | jemalloc both | 1.000x | not a term |
+| **vocabulary** | **15,765 vs 54 types/index** | **1.562x** | **CONFIRMED** |
+| **corpus scale** | **293,439 vs 35,000 keys** | **1.168x** | **CONFIRMED** |
+| **product of measured terms** | | **1.84x** | |
+| **STRUCTURAL RESIDUAL** | | **6.6x** | **unattributed** |
+| **stall tail** | mean 21.055 / p50 5.77 | **3.65x** | **unattributed** |
+| **TOTAL** | 21.055 / 0.4745 | **44.4x** | |
+
+**The eight ties are the load-bearing result.** Index count moved 14x and cost
+nothing — `PrefixMap` (`src/util/prefix_map.rs`) makes prefix matching O(key
+length), and the O(keys x indexes) walk was removed in #873. Docs-per-index
+moved 100x and cost nothing. Those are the two axes this document's first
+version ranked first.
+
+**The residual is larger than everything measured put together.** It is not a
+rounding error to argue away.
+
+## 5. What the bench model actually describes
+
+Within the bench's own corpus the model is sound and reproducible:
 
 ```text
-off  median 0.4709 ms/key (CV 0.52%)
-on   median 0.2376 ms/key (CV 0.27%)
-ratio 0.5046  ->  49.5% faster        noise floor 0.52%  ->  SIGNAL
+ms/key = 0.1051 + 1.227 us/word     (verified on Linux to 0.9% at 500 words)
 ```
 
-`.tpost` and #885 are independent halvings and they compose.
+Two corrections to its first published form:
 
-## 5. Disproved — do not re-derive these
+- **It is NOT "flat in corpus size at fixed density."** It is log-linear in key
+  count: 14,000 / 35,000 / 147,000 keys read 0.8590 / 0.9210 / 1.0190 ms/key,
+  slopes 0.0677 and 0.0683 per ln key (0.9% apart), and the fit predicted the
+  294,000-key leg to 1.2% before it ran.
+- **Its "superlinear in docs-per-index" axis does not exist.** That was
+  vocabulary in disguise — the original measurement's own sentence says it was
+  taken *"with a high-cardinality vocabulary."* At fixed vocabulary, 70 ->
+  7,000 docs per index is 0.99x.
 
-Six explanations were proposed for the slow boot. Five were wrong.
+## 6. The fixture was a monoculture, and that is why the model misleads
+
+The synthetic corpus draws from **54 words** (~100 distinct stems). Production
+carries **15,765 types per index**. Vocabulary is the only content axis that
+moves the reconcile at all, and the bench held it at a value 290x too low.
+
+A monoculture fixture does not merely hide a bug. It produces a confident,
+internally consistent, **published** performance model of a system that does not
+exist — one that aimed this investigation at tokenization, which turns out to
+differ between bench and production by **1.03x**.
+
+Even the corrected vocabulary term needed a second correction: an all-unique
+generator first measured 2.22x, which fell to **1.56x** once the generator was
+rebuilt from 30,616 real production `(term, count)` pairs, because synthetic
+terms averaged 14.30 characters against production's 6.35.
+
+**Before trusting any performance model, measure the real corpus's cardinality
+and put it in the fixture. State the fixture's vocabulary size next to every
+number derived from it.**
+
+## 7. Disproved — do not re-derive these
 
 **1. "The `cooperative_yield` between rescan slices is expensive."** Refuted by
 `/usr/bin/sample`: 8,459 of 8,459 shard-thread samples were on-CPU inside
-moon's own reconcile stack. The thread never parks. A yield it does not wait on
-cannot be the cost.
+moon's own reconcile stack. The thread never parks.
 
 **2. "moon#873's 10 ms slice budget regressed it."** Refuted by A/B. The
 measurements behind the claim were taken while a 533%-CPU `rustc` — spawned by
-the investigation itself — saturated the box. The pre-#873 binary showed the
-same rate.
+the investigation itself — saturated the box.
 
-**3. "The remaining time is 12 hours."** The server's own
-`ETA for this db` field is computed from the RECENT rate and read 121,067 s
-while the cumulative rate on the same log line implied ~48 minutes. On a noisy
-series the recent-rate ETA is the misleading one. Tracked as **moon#882**.
+**3. "The remaining time is 12 hours."** The server's own `ETA for this db` is
+computed from the RECENT rate and read 121,067 s while the cumulative rate on
+the same log line implied ~48 minutes. Tracked as **moon#882**.
 
-**4. "It is macOS memory-compressor pressure."** Refuted by the full 199-interval
-series, which runs the OPPOSITE way:
+**4. "It is macOS memory-compressor pressure."** Refuted by the full
+199-interval series, which runs the OPPOSITE way: `corr(keys, decompressions) =
++0.440`. Decompression rate is an **output** of allocating hard, not an input.
+Published as "unambiguous" on four hand-picked rows before the series existed.
 
-```text
-corr(keys reconciled, free MB)         = -0.190
-corr(keys reconciled, decompressions)  = +0.440
-10 FASTEST intervals: median  60 MB free,  67,055 decompressions/s
-10 SLOWEST intervals: median 728 MB free,   7,099 decompressions/s
-```
+**5. "The rate is bimodal — two regimes 150x apart."** One noisy ramp with ~10x
+neighbour scatter. Choosing two window boundaries manufactures "two regimes"
+where none exist.
 
-Decompression rate is an **output** of the process allocating hard, not an input
-that slows it. This was published as "unambiguous" on the strength of four
-hand-picked rows before the full series was computed.
+**6. "`add_term_occurrence` hashes every term twice — 41.8% of self-time."**
+The 41.8% is the whole function; the duplicate probe runs warm. +0.6% against a
+2.0% floor. **moon#884**, retitled to the allocations question.
 
-**5. "The rate is bimodal — two regimes 150x apart."** There is no regime
-switch. A single run's per-tick series reads
-`2899 1923 1235 438 901 598 467 736 393 1020 661 458 360 96 184 180 308 375 273 206`
-keys/s — one noisy ramp with ~10x neighbour-to-neighbour scatter. Choosing two
-window boundaries in such a series manufactures "two regimes" with none present;
-the split that produced the claim compared a 611-second window against a
-172-second one holding 144 keys.
+**7. "The 48.7% residual is a redundant second stemming pass."** It is the
+vector plane's payload/filter rebuild. Redundant only when both planes run; on
+the `.tpost` path the text plane is skipped and it is the ONLY thing rebuilding
+filter state.
 
-**6. "`add_term_occurrence` hashes every term twice, and that is 41.8% of
-self-time."** The 41.8% is the whole function; the duplicate `contains_key`
-probes the bucket the following `entry` probes anyway, so it runs warm.
-Measured as a tie: +0.6% against a 2.0% noise floor over 6 interleaved
-repetitions. Tracked in **moon#884**, retitled to the three-allocations-per-term
-question, which remains untested.
+**8. "Index count is the gap."** 14x more indexes costs **-1.6%**. Production
+has 7,056 index *definitions* but only ~158 hold a key; definitions are free.
 
-**The one that survived** came from a controlled reproduction with
-plane-isolating flags and one axis varied at a time. Every wrong explanation had
-data *consistent* with it; none had data that *discriminated* against the
-alternatives.
+**9. "Production documents are ~45x the synthetic size."** Derived by inverting
+the cost model against the answer. Measured: **641.9 vs 615 term passes per
+key — 1.03x.** Wrong by a factor of ~43.
 
-## 5b. Gate zero: the bench is 47x faster than production, unexplained
+**10. "Docs per index is superlinear."** 0.99x over a 100x range at fixed
+vocabulary. It was a proxy for vocabulary.
 
-The whole model above is calibrated at **0.4733 ms/key**. The production
-instance that started this investigation reconciles at roughly **22.5 ms/key**.
-That is a **47x** gap, and nothing in this document explains it.
+**11. "Vector dimension / HNSW parameters."** dim 768 vs 384 costs 0.9%,
+inside the floor. `m` and `ef_construction` are identical in both.
 
-Everything here is therefore a model of the *bench* reconcile. Before acting on
-any ranking below, measure the production instance directly and find out which
-term carries the 47x -- document size, index fan-out (a key matching N index
-prefixes is reconciled N times), cold-tier fetches per key, or something not on
-this list. **Optimising a term that is 2% of production is how a day gets
-spent.** This is the first thing to measure, ahead of every item in §6.
+**12. "The full HNSW re-encode path explains it."** 85.5% of production keys
+take it, against 6% in the bench: **0.994x**.
 
-## 6. What this means for anyone optimising startup
+**13. "It is memory pressure from the 1.7 GB `matching` materialisation."**
+Tested on Linux under cgroup v2 + zram, with the guard proven to bind
+(`memory.peak` pinned on each cap, 5.28 GB swapped, 26,326 throttle events).
+Result: a **uniform 1.24x shift with no tail** — production's tail
+concentration is 3.66x, the capped bench's 0.99x. The falsification criterion
+was stated before the run and it failed cleanly.
 
-- **Measure the text plane first**, but read the next line before concluding
-  anything from the 3.5%.
-- **"The vector engine is only 3.5%" is a trap, and this document made it.** The
-  3.5% row is the vector plane *excluding* the payload/filter stemming, which is
-  booked on the third row and is work the vector plane performs. The plane that
-  looks cheapest on the ledger owns the state that makes the walk mandatory.
-  Attribute by *mechanism*, not by the flag that happened to switch it off.
-- **Isolate planes with a load-generator flag** before profiling. A single
-  end-to-end number cannot attribute anything.
-- **Live-instance timings on a shared box discriminate nothing.** Interleave
-  legs, report a noise floor, and treat a ratio inside it as a tie.
+**The pattern across all thirteen:** every wrong explanation had data
+*consistent* with it. None had data that *discriminated* against the
+alternatives. Consistency is free; only discrimination is worth anything.
 
-## 7. How to reproduce
+## 8. What to do about it
+
+**1. Deploy a post-#879 binary and re-measure. Zero engineering.** The
+production binary's mtime is `2026-09-08 22:39`; #879 was committed
+`2026-09-08 23:12:35` — it predates `.tpost` by 33 minutes and contains none of
+that code. It gets neither #879 (49.5% on the bench) nor #885 (29.0% on the
+no-`.tpost` path, which is the path the first boot after a deploy takes).
+**Per this document's own thesis, do not assume those bench percentages
+transfer — measure the boot afterwards.**
+
+**2. Stop. Do not optimise anything in the falsified list.** Eight of the ten
+terms are ties, including every axis this document's first version recommended.
+
+**3. `PayloadIndex` has no durable form.** `src/vector/store.rs:1905` and
+`:2037` construct it fresh; nothing under `src/vector/persistence/` writes it,
+and the keymap (`manifest.rs:205-217`) persists only
+`key_hash / global_id / vec_checksum / key`. Filter state is rebuilt from the
+live keyspace on **every** boot, forever. No text-index format eliminates the
+keyspace walk while that holds.
+
+**4. The residual is the work.** 6.6x structural and 3.65x stall are both
+unattributed, and together they are 24.1x of 44.4x. The only untested candidate
+is the platform difference itself (production is macOS, every number here is
+Linux), which has **no number and no known sign**. It is recorded as
+unreachable under this study's constraints, not offered as the answer.
+
+**5. Fix the harness before the next measurement.** Its corpus must carry
+production's vocabulary cardinality and term length, or the next model will be
+as confidently wrong as this one's first version.
+
+## 9. How to reproduce
 
 The harness is `run2.sh` + `load.py` + `reconcile_time.py`, described in the raw
 data's [README](bench-data/2026-09-09-reconcile-linux/README.md). Time the
@@ -211,3 +234,6 @@ own declared inputs. A stale binary from an earlier session produces
 real-looking numbers for the wrong commit, and a guard comparing the binary to
 the build log instead rejects every correct build — cargo appends `Finished`
 about 64 ms after linking.
+
+Check host load before every leg. Two separate findings in this investigation
+were contaminated by builds the investigation itself had started.
