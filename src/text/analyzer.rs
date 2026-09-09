@@ -28,6 +28,11 @@ pub const DEFAULT_STOP_WORDS: [&str; 33] = [
     "this", "to", "was", "will", "with",
 ];
 
+/// Shortest word either consumer keeps. Both pipelines used `2` before they
+/// were unified; it is the one length rule they share, and
+/// `AnalyzerPipeline::min_token_len` must not go below it (see `terms_from`).
+pub const MIN_TOKEN_LEN: usize = 2;
+
 // Deterministic probe: how many normalize + segment passes this thread has run
 // over field text (moon#885). One per `AnalyzedText` — the unit of work the
 // text plane and the vector payload index used to each pay separately.
@@ -102,7 +107,11 @@ impl AnalyzerPipeline {
             english_stem: stemmer.is_some() && language == rust_stemmers::Algorithm::English,
             stemmer,
             stop_words,
-            min_token_len: 2,
+            // Coupled to `AnalyzedText::segment`, which drops words shorter
+            // than `MIN_TOKEN_LEN` before any pipeline sees them: a value
+            // below it here would be silently ineffective (`terms_from`
+            // debug-asserts the bound).
+            min_token_len: MIN_TOKEN_LEN,
         }
     }
 
@@ -111,7 +120,9 @@ impl AnalyzerPipeline {
     pub fn new_fallback() -> Self {
         Self {
             stop_words: HashSet::new(),
-            min_token_len: 2,
+            // Same coupling as `new`: the shared segment pass keeps nothing
+            // shorter than `MIN_TOKEN_LEN`.
+            min_token_len: MIN_TOKEN_LEN,
         }
     }
 
@@ -168,6 +179,13 @@ impl AnalyzerPipeline {
         &self,
         analysis: &'a mut AnalyzedText,
     ) -> Vec<(std::borrow::Cow<'a, str>, u32)> {
+        // `segment` already dropped everything shorter than `MIN_TOKEN_LEN`;
+        // a pipeline minimum below that could never take effect.
+        debug_assert!(
+            self.min_token_len >= MIN_TOKEN_LEN,
+            "min_token_len {} is below the shared segment floor {MIN_TOKEN_LEN}",
+            self.min_token_len
+        );
         // Phase 1 (mutable): decide which words survive and, for an English
         // stemmed field, fill their shared stem slots. Indices are kept so
         // phase 2 can hand out borrows without re-checking the stop list.
@@ -216,10 +234,6 @@ impl AnalyzerPipeline {
             .collect()
     }
 }
-
-/// Shortest word either consumer keeps. Both pipelines used `2` before they
-/// were unified; it is the one length rule they share.
-pub const MIN_TOKEN_LEN: usize = 2;
 
 /// One normalize + segment pass over a field value, shared by the two things
 /// that need it: the BM25 text plane and the vector payload index (moon#885).
