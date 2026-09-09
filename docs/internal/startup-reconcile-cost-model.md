@@ -7,10 +7,12 @@ measured to be wrong, including every one this document's first version ranked
 worth fixing. All of them are recorded here so nobody spends a third day
 re-deriving them.
 
-**The headline is a hole, not a finding.** Production reconciles a key **44.4x**
-slower than the synthetic bench. Ten candidate terms were measured on Linux;
-eight are ties, and the two that are real multiply to **1.84x**. The remaining
-**24.1x is named and unexplained.**
+**The gap is now fully decomposed, and the largest term is the machine.**
+Production reconciles a key **44.4x** slower than the synthetic bench. Ten
+candidate *code and corpus* terms were measured on Linux; eight are ties. The
+residual those left — 24.1x, unexplained for a day — was closed by booting
+production's own data dir on Linux with the same commit: **macOS costs 5.80x on
+this workload.** See §4b.
 
 Every number below comes from a Linux host — GCE `t2a-standard-8` (aarch64,
 8 vCPU, 31 GB RAM), dedicated, moon `0bfc730d` built with the shipping `release`
@@ -80,8 +82,8 @@ tie.
 | **vocabulary** | **15,765 vs 54 types/index** | **1.562x** | **CONFIRMED** |
 | **corpus scale** | **293,439 vs 35,000 keys** | **1.168x** | **CONFIRMED** |
 | **product of measured terms** | | **1.84x** | |
-| **STRUCTURAL RESIDUAL** | | **6.6x** | **unattributed** |
-| **stall tail** | mean 21.055 / p50 5.77 | **3.65x** | **unattributed** |
+| **STRUCTURAL RESIDUAL** | | **6.6x** | resolved in §4b |
+| **stall tail** | mean 21.055 / p50 5.77 | **3.65x** | resolved in §4b |
 | **TOTAL** | 21.055 / 0.4745 | **44.4x** | |
 
 **The eight ties are the load-bearing result.** Index count moved 14x and cost
@@ -92,6 +94,64 @@ version ranked first.
 
 **The residual is larger than everything measured put together.** It is not a
 rounding error to argue away.
+
+## 4b. The residual was the platform — measured, not inferred
+
+The 24.1x left over after the ten sweeps was closed by the one experiment the
+first pass called untestable: boot **production's own 15 GB data directory** on
+a Linux host, with the **same commit** and the **same starting state**.
+
+```text
+macOS,  adf3a808, production data, no .tpost    4.585 ms/key   (303,778 keys)
+Linux,  adf3a808, production data, no .tpost    0.790 ms/key   (303,778 keys)
+                                                -----------
+                                                     5.80x
+```
+
+Same binary, same corpus, same zero-`.tpost` start. **macOS is 5.80x slower**,
+and that figure is *conservative*: the macOS run had a warm page cache (the
+directory had just been cloned), the Linux run started cold.
+
+The whole gap then multiplies out:
+
+| term | factor |
+|---|---|
+| binary + page cache + boot-to-boot variance (old macOS binary -> `adf3a808`) | 4.59x |
+| **platform / environment (macOS -> Linux, same commit and data)** | **5.80x** |
+| production corpus vs the 54-word synthetic bench (both Linux) | 1.66x |
+| **product** | **44.37x** |
+| target (21.055 / 0.4745) | **44.40x** |
+
+**This validates §4's factor table from an independent direction.** That table
+predicted the corpus term as vocabulary 1.562x times scale 1.168x = **1.82x**,
+derived entirely from synthetic sweeps. Measured against the real production
+corpus on the same host: **1.66x**. Within 10%. The eight ties are real.
+
+Two confounds stay attached and must not be dropped when this is quoted: the
+Linux host has 31 GB for a 15 GB dataset where the production Mac has 24 GB for
+the same data plus everything else it runs, and only the macOS side had a warm
+cache. Both bias *toward* Linux, so 5.80x is an **upper bound** on a pure-OS
+term and a fair estimate of the environment term as actually experienced.
+
+### What `.tpost` is worth on a real corpus
+
+The same run measured the fast path on production data, which the 54-word
+fixture could not:
+
+```text
+Linux, no .tpost      0.790 ms/key
+Linux, .tpost present 0.603 ms/key      ->  24% faster
+```
+
+**The bench claimed 49.5%.** It overstated the benefit by roughly 2x. This
+document's own thesis — that bench percentages do not transfer — applies to the
+one number in it that looked safest.
+
+One operational detail found the same way: the clean-shutdown flush
+(`persist_all_postings_and_wait`) wrote **618** `.tpost` files, while a
+production instance sampled shortly after boot had **103** — the periodic
+duty-cycled writer had not caught up. A hard kill therefore forfeits most of the
+fast path on the next boot. Shut down cleanly.
 
 ## 5. What the bench model actually describes
 
@@ -211,11 +271,11 @@ and the keymap (`manifest.rs:205-217`) persists only
 live keyspace on **every** boot, forever. No text-index format eliminates the
 keyspace walk while that holds.
 
-**4. The residual is the work.** 6.6x structural and 3.65x stall are both
-unattributed, and together they are 24.1x of 44.4x. The only untested candidate
-is the platform difference itself (production is macOS, every number here is
-Linux), which has **no number and no known sign**. It is recorded as
-unreachable under this study's constraints, not offered as the answer.
+**4. The residual was the platform, and it is now measured: 5.80x (§4b).**
+It is the largest single term in the decomposition — bigger than every code
+change in this document combined — and no optimisation in this repository
+touches it. If restart time matters, the host matters more than the code.
+On Linux the same 303,778-key corpus reconciles in **240 seconds**.
 
 **5. Fix the harness before the next measurement.** Its corpus must carry
 production's vocabulary cardinality and term length, or the next model will be

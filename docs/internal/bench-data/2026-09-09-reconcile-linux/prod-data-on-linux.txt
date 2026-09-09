@@ -1,0 +1,13 @@
+binary sha: 4698609e30e539da
+commit:     adf3a8085
+host mem:   31 GB   cores: 8
+=== LEG 1: cold, no .tpost (matches macOS 4.585 ms/key run) ===
+tpost files at start: 0
+cold: 240.0s for 303778 keys = 0.790 ms/key
+tpost files after:    618
+=== LEG 2: warm, .tpost present (predicts the NEXT production restart) ===
+warm: 183.0s for 303778 keys = 0.603 ms/key
+   Shard 0: loaded 618 of 4311 text index(es) from .tpost (303778 doc(s))
+=== DONE ===
+
+
