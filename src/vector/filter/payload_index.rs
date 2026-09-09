@@ -7,6 +7,18 @@ use roaring::RoaringBitmap;
 
 use super::expression::FilterExpr;
 
+/// Suffixes geo fields are recorded under in the forward index -- see
+/// [`PayloadIndex::insert_geo`] and [`PayloadIndex::remove_field`].
+const GEO_LAT_SUFFIX: &[u8] = b"__lat";
+const GEO_LON_SUFFIX: &[u8] = b"__lon";
+
+/// Stack capacity for the `{field}__lat` / `{field}__lon` scratch key
+/// `remove_field` builds to check for a geo entry, sized for real-world field
+/// names (`location`, `warehouse_coords`, ...) plus the 5-byte suffix. A
+/// longer field name still works correctly -- the `SmallVec` spills to the
+/// heap -- it just loses the zero-allocation fast path.
+const GEO_SUBFIELD_INLINE_CAP: usize = 48;
+
 /// The values one document wrote to one field.
 ///
 /// `SmallVec<[_; 1]>` because the overwhelmingly common case is a document
@@ -177,26 +189,61 @@ impl PayloadIndex {
     /// how the pre-fix text index grew without bound (moon#613): a field that
     /// had once seen a million values kept paying for all million on every
     /// later retire and every search miss, long after the documents were gone.
+    ///
+    /// This runs once per HSET field on `update_metadata_only`'s fast path
+    /// (`src/shard/spsc_handler.rs`), which every-boot recovery drives hard —
+    /// so the geo sub-field lookup below is a stack-only `SmallVec` key rather
+    /// than the two `format!` heap allocations this used to pay on EVERY call,
+    /// for EVERY field, whether or not that field (or even that document) is
+    /// geo. `Bytes: Borrow<[u8]>` means the forward-index lookup only needs a
+    /// `&[u8]`, so the candidate key never needs to become an owned `Bytes`
+    /// unless the field name is long enough to spill the `SmallVec` to the
+    /// heap.
     pub fn remove_field(&mut self, field: &Bytes, internal_id: u32) {
-        // Geo writes two numeric sub-fields, so retiring the parent field must
-        // retire those too. They are recorded in the forward index under their
-        // own names, which is why this is a lookup rather than a sweep.
-        let field_str = std::str::from_utf8(field).unwrap_or("");
-        let lat_field = Bytes::from(format!("{field_str}__lat"));
-        let lon_field = Bytes::from(format!("{field_str}__lon"));
-
         if let Some(fields) = self.doc_values.get_mut(&internal_id) {
-            for f in [field, &lat_field, &lon_field] {
-                if let Some(values) = fields.remove(f) {
+            let field_bytes: &[u8] = field.as_ref();
+            if let Some(values) = fields.remove(field_bytes) {
+                Self::retire_values(
+                    &mut self.tag_indexes,
+                    &mut self.numeric_indexes,
+                    field_bytes,
+                    &values,
+                    internal_id,
+                );
+            }
+
+            // Geo sub-fields are recorded in the forward index under
+            // `{field}__lat` / `{field}__lon`. Built once on the stack and
+            // reused for both suffixes -- no allocation unless `field` is
+            // long enough to spill `GEO_SUBFIELD_INLINE_CAP`.
+            //
+            // `insert_geo` derives that prefix from
+            // `str::from_utf8(field).unwrap_or("")`: a non-UTF8 field name
+            // silently collapses to an empty prefix there, so this lookup
+            // must use the exact same prefix, or a non-UTF8 geo field's
+            // entries never get retired.
+            let geo_prefix: &[u8] = if std::str::from_utf8(field_bytes).is_ok() {
+                field_bytes
+            } else {
+                b""
+            };
+            let mut key: smallvec::SmallVec<[u8; GEO_SUBFIELD_INLINE_CAP]> =
+                smallvec::SmallVec::with_capacity(geo_prefix.len() + GEO_LAT_SUFFIX.len());
+            key.extend_from_slice(geo_prefix);
+            for suffix in [GEO_LAT_SUFFIX, GEO_LON_SUFFIX] {
+                key.truncate(geo_prefix.len());
+                key.extend_from_slice(suffix);
+                if let Some(values) = fields.remove(key.as_slice()) {
                     Self::retire_values(
                         &mut self.tag_indexes,
                         &mut self.numeric_indexes,
-                        f,
+                        key.as_slice(),
                         &values,
                         internal_id,
                     );
                 }
             }
+
             if fields.is_empty() {
                 self.doc_values.remove(&internal_id);
             }
@@ -233,7 +280,7 @@ impl PayloadIndex {
     fn retire_values(
         tag_indexes: &mut HashMap<Bytes, HashMap<Bytes, RoaringBitmap>>,
         numeric_indexes: &mut HashMap<Bytes, BTreeMap<OrderedFloat<f64>, RoaringBitmap>>,
-        field: &Bytes,
+        field: &[u8],
         values: &DocFieldValues,
         internal_id: u32,
     ) {
@@ -1076,5 +1123,87 @@ mod tests {
         };
         let bm = idx.evaluate_bitmap(&type_expr, 1);
         assert!(bm.contains(0));
+    }
+
+    /// `insert_geo` derives the `{field}__lat` / `{field}__lon` sub-field
+    /// names from `str::from_utf8(field).unwrap_or("")` -- a non-UTF8 field
+    /// name silently collapses to an empty prefix there, landing its geo
+    /// entries under the literal keys `"__lat"` / `"__lon"`.
+    ///
+    /// `remove_field`'s stack-buffer rewrite (moon perf: two `format!`
+    /// allocations removed from every call) has to reproduce that exact
+    /// fallback or a non-UTF8 geo field's bitmap entries never get retired --
+    /// this is the one case a byte-for-byte copy of `field` into the scratch
+    /// key would silently diverge from `insert_geo`, so it is pinned here.
+    #[test]
+    fn remove_field_retires_geo_subfields_for_non_utf8_field_name() {
+        let mut idx = PayloadIndex::new();
+        // 0x80 alone is not valid UTF-8 (a lone continuation byte).
+        let weird_field = Bytes::from_static(&[0x80, 0x81]);
+        idx.insert_geo(&weird_field, 37.78, -122.42, 0);
+
+        // Sanity: insert_geo really did fall back to the empty prefix, so
+        // this test is exercising the case it claims to.
+        assert!(
+            idx.doc_values[&0].contains_key(&field("__lat"))
+                && idx.doc_values[&0].contains_key(&field("__lon")),
+            "test setup assumption broken: insert_geo's UTF-8 fallback changed"
+        );
+
+        idx.remove_field(&weird_field, 0);
+
+        assert!(
+            !idx.doc_values.contains_key(&0),
+            "remove_field left a stale forward-index entry for a non-UTF8 geo field"
+        );
+        assert!(
+            idx.numeric_indexes.is_empty(),
+            "remove_field failed to retire a non-UTF8 geo field's __lat/__lon bitmaps"
+        );
+
+        let geo_expr = FilterExpr::GeoRadius {
+            field: weird_field,
+            lon: -122.42,
+            lat: 37.78,
+            radius_km: 10.0,
+        };
+        let bm = idx.evaluate_bitmap(&geo_expr, 1);
+        assert!(
+            bm.is_empty(),
+            "a non-UTF8 geo field was still findable after remove_field"
+        );
+    }
+
+    /// Per-call overhead of `remove_field` on a plain (non-geo) field held at
+    /// FIXED cardinality, so `O(values written)` (already O(1) since
+    /// moon#614) doesn't dominate. This isolates the constant-factor cost the
+    /// two `format!` heap allocations used to add to EVERY call, geo or not.
+    ///
+    /// Run: `cargo test --release --lib bench_remove_field_call_overhead -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement harness; run explicitly with --nocapture"]
+    fn bench_remove_field_call_overhead() {
+        use std::time::Instant;
+        let f = field("status");
+        let ok = Bytes::from_static(b"ok");
+        let iters = 2_000_000_u32;
+        let mut idx = PayloadIndex::new();
+        // Warm the allocator identically before timing either side of an A/B.
+        for _ in 0..1000 {
+            idx.insert_tag(&f, &ok, 0);
+            idx.remove_field(&f, 0);
+        }
+        let t0 = Instant::now();
+        for i in 0..iters {
+            let id = i % 4;
+            idx.insert_tag(&f, &ok, id);
+            idx.remove_field(&f, id);
+        }
+        let el = t0.elapsed();
+        println!(
+            "{iters} insert_tag+remove_field cycles: {:?} total, {:.1} ns/cycle",
+            el,
+            el.as_nanos() as f64 / f64::from(iters)
+        );
     }
 }
