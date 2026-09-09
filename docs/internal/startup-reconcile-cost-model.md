@@ -26,7 +26,7 @@ then walks every key matching an index prefix, re-deriving its postings and
 vectors. Until it finishes the shard answers `-LOADING` to every data command,
 so from a client's point of view the server is down for the whole walk.
 
-## 2. The finding: it is text analysis, run twice
+## 2. The finding: text analysis dominates, and one pass is not what it looks like
 
 Plane isolation, 500 indexes x 70 docs = 35,000 keys, 300 words/doc, `.tpost`
 deleted between boots, 3 interleaved repetitions (CV 0.03%):
@@ -43,14 +43,46 @@ The legs do not sum, and the residual is the whole point:
 |---|---|---|
 | text plane (`index_document` -> analyzer -> stemmer) | 0.2280 | 47.8% |
 | vector plane, **including a full HNSW re-encode** | 0.0167 | **3.5%** |
-| second stemming pass in `index_payload_field` | 0.2320 | **48.7%** |
+| payload/filter rebuild (`index_payload_field`) | 0.2320 | **48.7%** |
 
 The residual appears only when a vector index and text fields coexist:
 `--no-vector` removes the payload index entirely, `--no-text` leaves it nothing
-long to stem. That is `PayloadIndex::insert_text`
-(`src/vector/filter/text_index.rs`) re-tokenising and re-stemming content the
-text plane has already stemmed — and constructing a `Stemmer` per call. Tracked
-as **moon#885**.
+long to stem. It is `PayloadIndex::insert_text`
+(`src/vector/filter/text_index.rs`) running the analyzer over the same bytes,
+constructing a `Stemmer` per call.
+
+### That third row is NOT simply "redundant", and the label above cost a day
+
+Whether it is duplicated work depends on which path recovery takes, and the two
+paths are opposite:
+
+- **No `.tpost`** (first boot after deploy, corrupt/version-skewed file): both
+  planes run, the bytes really are analysed twice, and sharing one tokenisation
+  removes a pass. This is **moon#885**, and this is the configuration the table
+  above was measured in.
+- **`.tpost` present** (the normal steady state after #879): the text plane is
+  *skipped* — `RecoveryState::reconcile_key`
+  (`src/vector/persistence/recover_v2.rs:377`) takes the verified-unchanged
+  branch into `update_metadata_only`
+  (`src/shard/spsc_handler.rs:3949`) — so there is no text-plane tokenisation to
+  share, and `index_payload_field` is the **only** thing rebuilding
+  tag/numeric/geo/`TextMatch` filtering. Not redundant. Load-bearing.
+  The arithmetic closes: 0.4709 − 0.2280 = 0.2429 against 0.2376 measured with
+  `.tpost` on.
+
+**So moon#885 delivers ~0 on the `.tpost` boot path.** Its value is steady-state
+ingest (every `HSET` into a key matching both a text and a vector index runs
+both pipelines) and no-`.tpost` recovery.
+
+### The actual blocker: `PayloadIndex` has no durable form
+
+`src/vector/store.rs:1905` and `:2037` both construct `PayloadIndex::new()`, and
+nothing under `src/vector/persistence/` writes or reads it — the vector keymap
+persists only `key_hash / global_id / vec_checksum / key`
+(`src/vector/persistence/manifest.rs:205-217`). Filter state must therefore be
+rebuilt from the live keyspace on **every** boot, for every key, forever.
+
+**No text-index format can eliminate the keyspace walk while that holds.**
 
 By profile (`/usr/bin/sample`, shard-0, 13,919 samples), ~55% of on-CPU self
 time is normalize + segment + stem: `rust_stemmers` 34.1%,
@@ -139,11 +171,28 @@ plane-isolating flags and one axis varied at a time. Every wrong explanation had
 data *consistent* with it; none had data that *discriminated* against the
 alternatives.
 
+## 5b. Gate zero: the bench is 47x faster than production, unexplained
+
+The whole model above is calibrated at **0.4733 ms/key**. The production
+instance that started this investigation reconciles at roughly **22.5 ms/key**.
+That is a **47x** gap, and nothing in this document explains it.
+
+Everything here is therefore a model of the *bench* reconcile. Before acting on
+any ranking below, measure the production instance directly and find out which
+term carries the 47x -- document size, index fan-out (a key matching N index
+prefixes is reconciled N times), cold-tier fetches per key, or something not on
+this list. **Optimising a term that is 2% of production is how a day gets
+spent.** This is the first thing to measure, ahead of every item in §6.
+
 ## 6. What this means for anyone optimising startup
 
-- **Measure the text plane first.** It and its duplicate are 96.5% of the cost.
-- **Do not go near the vector engine for this.** 3.5%, with no persisted keymap,
-  so every key took the full HNSW re-encode path.
+- **Measure the text plane first**, but read the next line before concluding
+  anything from the 3.5%.
+- **"The vector engine is only 3.5%" is a trap, and this document made it.** The
+  3.5% row is the vector plane *excluding* the payload/filter stemming, which is
+  booked on the third row and is work the vector plane performs. The plane that
+  looks cheapest on the ledger owns the state that makes the walk mandatory.
+  Attribute by *mechanism*, not by the flag that happened to switch it off.
 - **Isolate planes with a load-generator flag** before profiling. A single
   end-to-end number cannot attribute anything.
 - **Live-instance timings on a shared box discriminate nothing.** Interleave
