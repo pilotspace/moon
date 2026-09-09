@@ -124,6 +124,39 @@ impl PayloadIndex {
         self.text_indexes.insert(field, text, internal_id);
     }
 
+    /// Insert a text value into the full-text index through an analysis
+    /// shared with the BM25 text plane for the same HSET (moon#885).
+    ///
+    /// Same result as [`insert_text`](Self::insert_text); the normalize +
+    /// segment pass and any stems the text plane already computed for
+    /// `value` are reused instead of repeated. Non-UTF8 values are skipped,
+    /// as before.
+    #[cfg(feature = "text-index")]
+    pub fn insert_text_shared(
+        &mut self,
+        field: &Bytes,
+        value: &Bytes,
+        internal_id: u32,
+        cache: &mut crate::text::analyzer::AnalysisCache,
+    ) {
+        if let Some(analysis) = cache.get_or_segment(value) {
+            self.text_indexes
+                .insert_terms(field, analysis.english_terms(), internal_id);
+        }
+    }
+
+    /// Shared-analysis insert (stub when feature disabled).
+    #[cfg(not(feature = "text-index"))]
+    pub fn insert_text_shared(
+        &mut self,
+        _field: &Bytes,
+        _value: &Bytes,
+        _internal_id: u32,
+        _cache: &mut crate::text::analyzer::AnalysisCache,
+    ) {
+        // No-op: text-index feature not enabled
+    }
+
     /// Insert a text value into the full-text index (stub when feature disabled).
     #[cfg(not(feature = "text-index"))]
     pub fn insert_text(&mut self, _field: &Bytes, _text: &[u8], _internal_id: u32) {

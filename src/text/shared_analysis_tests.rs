@@ -86,7 +86,12 @@ fn two_plane_stores() -> (VectorStore, TextStore) {
     let body = TextFieldDef::new(b("body"));
     let mut title = TextFieldDef::new(b("title"));
     title.nostem = true;
-    let idx = TextIndex::new(b("ix"), vec![b("doc:")], vec![body, title], BM25Config::default());
+    let idx = TextIndex::new(
+        b("ix"),
+        vec![b("doc:")],
+        vec![body, title],
+        BM25Config::default(),
+    );
     ts.create_index(b("ix"), idx).expect("text index");
     (vs, ts)
 }
@@ -139,12 +144,14 @@ fn pin_payload_tokenizer_keeps_stop_words_stems_and_drops_one_byte_tokens() {
     idx.insert(&b("body"), SAMPLE.as_bytes(), 7);
     for q in ["the", "are", "running", "RUNNERS", "cafe", "caf\u{e9}"] {
         assert!(
-            idx.search(&b("body"), &PayloadTextIndex::tokenize(q)).contains(7),
+            idx.search(&b("body"), &PayloadTextIndex::tokenize(q))
+                .contains(7),
             "payload filter on {q:?} must hit"
         );
     }
     assert!(
-        idx.search(&b("body"), &PayloadTextIndex::tokenize("I")).is_empty(),
+        idx.search(&b("body"), &PayloadTextIndex::tokenize("I"))
+            .is_empty(),
         "a 1-byte query tokenizes to nothing and matches nothing"
     );
 }
@@ -155,14 +162,28 @@ fn pin_text_plane_drops_stop_words_keeps_positions_and_honours_nostem() {
     let got = owned(stem.tokenize_with_positions(SAMPLE));
     assert_eq!(
         as_pairs(&got),
-        [("runner", 1), ("run", 3), ("fast", 4), ("am", 6), ("cafe", 8), ("cat", 9)],
+        [
+            ("runner", 1),
+            ("run", 3),
+            ("fast", 4),
+            ("am", 6),
+            ("cafe", 8),
+            ("cat", 9)
+        ],
         "stemmed field: stop words gone, positions are ORIGINAL word ordinals"
     );
     let nostem = AnalyzerPipeline::new(rust_stemmers::Algorithm::English, true);
     let got = owned(nostem.tokenize_with_positions(SAMPLE));
     assert_eq!(
         as_pairs(&got),
-        [("runners", 1), ("running", 3), ("fast", 4), ("am", 6), ("cafe", 8), ("cat", 9)],
+        [
+            ("runners", 1),
+            ("running", 3),
+            ("fast", 4),
+            ("am", 6),
+            ("cafe", 8),
+            ("cat", 9)
+        ],
         "NOSTEM field: surface forms survive, stop words still gone"
     );
 }
@@ -190,12 +211,23 @@ fn pin_both_planes_through_auto_index_hset() {
     let kh = xxhash_rust::xxh64::xxh64(b"doc:1", 0);
     let doc = *tidx.key_hash_to_doc_id.get(&kh).expect("doc indexed");
     let (body_dict, title_dict) = (&tidx.field_term_dicts[0], &tidx.field_term_dicts[1]);
-    assert!(body_dict.get("the").is_none(), "stop word must not enter the BM25 dictionary");
-    assert!(body_dict.get("running").is_none(), "stemmed field stores the stem only");
-    assert!(title_dict.get("run").is_none(), "NOSTEM field stores the surface form only");
+    assert!(
+        body_dict.get("the").is_none(),
+        "stop word must not enter the BM25 dictionary"
+    );
+    assert!(
+        body_dict.get("running").is_none(),
+        "stemmed field stores the stem only"
+    );
+    assert!(
+        title_dict.get("run").is_none(),
+        "NOSTEM field stores the surface form only"
+    );
     assert!(title_dict.get("the").is_none());
     let run = body_dict.get("run").expect("body has `run`");
-    let runner = body_dict.get("runner").expect("Snowball: runners -> runner, not run");
+    let runner = body_dict
+        .get("runner")
+        .expect("Snowball: runners -> runner, not run");
     let running = title_dict.get("running").expect("title has `running`");
     let cafe = title_dict.get("cafe").expect("title has `cafe`");
     let pos = |f: usize, t: u32| {
@@ -222,7 +254,10 @@ fn pin_duplicate_field_names_in_one_hset() {
     assert!(payload_hit(&vs, b"doc:2", "body", "beta"));
     let dict = &ts.get_index(b"ix").expect("text index").field_term_dicts[0];
     assert!(dict.get("alpha").is_some());
-    assert!(dict.get("beta").is_none(), "text plane takes the first occurrence only");
+    assert!(
+        dict.get("beta").is_none(),
+        "text plane takes the first occurrence only"
+    );
 }
 
 // ── The claim: one expensive pass per field value, not one per consumer ─────

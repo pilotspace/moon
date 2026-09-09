@@ -3877,6 +3877,11 @@ fn auto_index_hset_inner(
         vector_store.txn_manager_mut().allocate_lsn()
     };
 
+    // moon#885: one normalize + segment + stem pass per field value for this
+    // HSET, shared between the vector payload index and the BM25 text plane.
+    // Whichever consumer reaches a value first analyzes it; the other reads.
+    let mut analysis = crate::text::analyzer::AnalysisCache::new();
+
     for idx_name in matching_names {
         let idx = match vector_store.get_index_mut(&idx_name) {
             Some(i) => i,
@@ -3909,6 +3914,7 @@ fn auto_index_hset_inner(
                     key_hash,
                     insert_lsn,
                     txn_id,
+                    &mut analysis,
                 );
             } else {
                 // Additional field: use field_segments
@@ -3950,7 +3956,7 @@ fn auto_index_hset_inner(
         if !any_vector_inserted {
             if let Some(&global_id) = idx.key_hash_to_global_id.get(&key_hash) {
                 let source_field = idx.meta.source_field.clone();
-                update_metadata_only(idx, args, &source_field, global_id);
+                update_metadata_only(idx, args, &source_field, global_id, &mut analysis);
             }
         }
     }
@@ -3968,7 +3974,13 @@ fn auto_index_hset_inner(
     for idx_name in text_matching {
         if let Some(idx) = text_store.get_index_mut(&idx_name) {
             let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
-            let doc_id = idx.index_document_with_lsn(key_hash, key, text_args, insert_lsn);
+            let doc_id = idx.index_document_with_lsn_shared(
+                key_hash,
+                key,
+                text_args,
+                insert_lsn,
+                &mut analysis,
+            );
             let _ = doc_id;
             // TAG auto-indexing (Plan 152-06): safe no-op on indexes with no
             // TAG fields (tag_index_document returns early on empty tag_fields).
@@ -4041,6 +4053,7 @@ fn handle_vector_insert(
     key_hash: u64,
     insert_lsn: u64,
     txn_id: u64,
+    analysis: &mut crate::text::analyzer::AnalysisCache,
 ) {
     let blob = match find_vector_blob(args, source_field, dim) {
         Some(b) => b.clone(),
@@ -4120,7 +4133,7 @@ fn handle_vector_insert(
         ) = (&args[j], &args[j + 1])
         {
             if !f_name.eq_ignore_ascii_case(source_field) {
-                index_payload_field(&mut idx.payload_index, f_name, f_val, global_id);
+                index_payload_field(&mut idx.payload_index, f_name, f_val, global_id, analysis);
             }
         }
         j += 2;
@@ -4196,6 +4209,7 @@ fn update_metadata_only(
     args: &[crate::protocol::Frame],
     source_field: &bytes::Bytes,
     global_id: u32,
+    analysis: &mut crate::text::analyzer::AnalysisCache,
 ) {
     let mut j = 1;
     while j + 1 < args.len() {
@@ -4207,7 +4221,7 @@ fn update_metadata_only(
             if !f_name.eq_ignore_ascii_case(source_field) {
                 // Remove old entries for this field only, then re-insert
                 idx.payload_index.remove_field(f_name, global_id);
-                index_payload_field(&mut idx.payload_index, f_name, f_val, global_id);
+                index_payload_field(&mut idx.payload_index, f_name, f_val, global_id, analysis);
             }
         }
         j += 2;
@@ -4223,6 +4237,7 @@ fn index_payload_field(
     field: &bytes::Bytes,
     value: &bytes::Bytes,
     global_id: u32,
+    analysis: &mut crate::text::analyzer::AnalysisCache,
 ) {
     if let Ok(val_str) = std::str::from_utf8(value) {
         // Geo detection: "lon,lat" pattern (two floats separated by comma)
@@ -4243,8 +4258,9 @@ fn index_payload_field(
     }
     // Also index into full-text TextIndex (if text-index feature enabled).
     // All payload string fields are indexed; only fields queried via TextMatch
-    // will actually be searched at query time.
-    payload_index.insert_text(field, value, global_id);
+    // will actually be searched at query time. The analysis is shared with
+    // the BM25 text plane for this HSET (moon#885).
+    payload_index.insert_text_shared(field, value, global_id, analysis);
 }
 
 /// Parse a "lon,lat" geo value string. Returns `Some((lon, lat))` if the value
