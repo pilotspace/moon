@@ -346,12 +346,10 @@ impl Database {
                 // Listpack cost is O(1) (capacity-based) — snapshot before/after
                 // instead of tracking a per-element formula.
                 let before = lp.estimate_memory();
-                // Locate field among pairs, remove both field + value entries.
-                if let Some(i) = lp.find_pair_index(field) {
-                    // Each pair occupies two listpack slots: field at 2*i, value at 2*i+1.
-                    // Remove value first (higher index) then field to keep indices stable.
-                    lp.remove_at(i * 2 + 1);
-                    lp.remove_at(i * 2);
+                // ONE borrowed scan locates the pair and drains both entries.
+                // Locating it and then calling `remove_at` twice walked the
+                // listpack three times over (moon#799).
+                if lp.remove_pair(field) {
                     let after = lp.estimate_memory();
                     credit = before.saturating_sub(after);
                     let empty = lp.is_empty();
@@ -450,15 +448,10 @@ impl Database {
             RedisValue::HashListpack(lp) => {
                 // Listpack cost is O(1) (capacity-based) — snapshot before/after.
                 let before = lp.estimate_memory();
-                // Locate the field-value pair by borrowed scan, then remove
-                // both listpack slots (value first so the field index stays
-                // valid). Only the matched value is materialized.
-                let found = lp
-                    .find_pair_index(field)
-                    .and_then(|i| lp.get_at(i * 2 + 1).map(|v| (i, v.to_bytes())));
-                if let Some((i, v)) = found {
-                    lp.remove_at(i * 2 + 1); // value first (higher index)
-                    lp.remove_at(i * 2); // then field
+                // ONE borrowed scan locates the pair, materializes only the
+                // matched value, and drains both entries. This used to be
+                // four walks: find, get, remove, remove (moon#799).
+                if let Some(v) = lp.take_pair_value(field) {
                     let after = lp.estimate_memory();
                     credit = before.saturating_sub(after);
                     Ok(Some(v))

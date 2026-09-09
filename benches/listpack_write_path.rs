@@ -85,6 +85,59 @@ fn hdel_existing(c: &mut Criterion) {
     g.finish();
 }
 
+/// The same three shapes through the ONE-SCAN pair API (moon#799 commit 2).
+///
+/// Deliberately in the SAME binary as the two-scan groups above, so the pair
+/// can be read off one run: cross-run drift on a loaded box has been large
+/// enough here to swamp the effect being measured.
+fn one_scan_pair_ops(c: &mut Criterion) {
+    let mut g = c.benchmark_group("listpack_hset_existing_1scan");
+    for &n in SIZES {
+        let field = format!("field:{:08}", n - 1);
+        g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            let mut lp = build(n);
+            b.iter(|| {
+                black_box(lp.replace_pair_value(
+                    black_box(field.as_bytes()),
+                    black_box(b"value-payload-replaced"),
+                ))
+            });
+        });
+    }
+    g.finish();
+
+    let mut g = c.benchmark_group("listpack_hget_existing_1scan");
+    for &n in SIZES {
+        let field = format!("field:{:08}", n - 1);
+        g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            let lp = build(n);
+            b.iter(|| {
+                black_box(
+                    lp.pair_value(black_box(field.as_bytes()))
+                        .map(|v| v.to_vec()),
+                )
+            });
+        });
+    }
+    g.finish();
+
+    let mut g = c.benchmark_group("listpack_hdel_existing_1scan");
+    for &n in SIZES {
+        let field = format!("field:{:08}", n - 1);
+        let value = format!("value-payload-{:08}", n - 1);
+        g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            let mut lp = build(n);
+            b.iter(|| {
+                black_box(lp.remove_pair(black_box(field.as_bytes())));
+                lp.push_back(field.as_bytes());
+                lp.push_back(value.as_bytes());
+                black_box(lp.len())
+            });
+        });
+    }
+    g.finish();
+}
+
 /// SISMEMBER against a set-encoded listpack.
 fn set_contains(c: &mut Criterion) {
     let mut g = c.benchmark_group("listpack_set_contains");
@@ -103,6 +156,7 @@ criterion_group!(
     hset_existing,
     hget_existing,
     hdel_existing,
+    one_scan_pair_ops,
     set_contains
 );
 criterion_main!(benches);
