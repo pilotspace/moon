@@ -113,6 +113,7 @@ mod text_index_impl {
         /// 5. Filter tokens < 2 chars
         /// 6. Snowball stem (English)
         pub fn tokenize(text: &str) -> Vec<String> {
+            crate::text::analyzer::note_segment_pass();
             let stemmer = Stemmer::create(Algorithm::English);
             // NFKD normalize and strip combining marks
             let normalized: String = text

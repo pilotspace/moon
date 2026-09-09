@@ -28,6 +28,29 @@ pub const DEFAULT_STOP_WORDS: [&str; 33] = [
     "this", "to", "was", "will", "with",
 ];
 
+/// Deterministic probe: how many normalize + segment passes this thread has run
+/// over field text (moon#885). One per `AnalyzedText` — the unit of work the
+/// text plane and the vector payload index used to each pay separately.
+///
+/// Thread-local by design: a shard is one thread, so the count a test reads
+/// around one `auto_index_hset` call is exactly that call's work and no other
+/// test's. Read it with [`segment_passes`].
+#[cfg(feature = "text-index")]
+thread_local! {
+    static SEGMENT_PASSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of normalize + segment passes run on the calling thread so far.
+#[cfg(feature = "text-index")]
+pub fn segment_passes() -> u64 {
+    SEGMENT_PASSES.with(std::cell::Cell::get)
+}
+
+#[cfg(feature = "text-index")]
+pub(crate) fn note_segment_pass() {
+    SEGMENT_PASSES.with(|c| c.set(c.get() + 1));
+}
+
 /// Configurable text analysis pipeline.
 ///
 /// Created once per TEXT field (not per document) to amortize stemmer
@@ -115,6 +138,7 @@ impl AnalyzerPipeline {
         use unicode_normalization::UnicodeNormalization;
         use unicode_segmentation::UnicodeSegmentation;
 
+        note_segment_pass();
         // Step 1: NFKD normalize and strip combining marks
         let normalized: String = text
             .nfkd()

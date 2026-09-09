@@ -26,6 +26,8 @@ pub mod postings_persist;
 pub mod query;
 #[cfg(feature = "text-index")]
 pub mod recovery;
+#[cfg(all(test, feature = "text-index"))]
+mod shared_analysis_tests;
 pub mod store;
 pub mod term_dict;
 pub mod types;
