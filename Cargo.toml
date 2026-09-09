@@ -349,3 +349,7 @@ required-features = ["graph"]
 [[bench]]
 name = "simd_probe"
 harness = false
+
+[[bench]]
+name = "listpack_write_path"
+harness = false
