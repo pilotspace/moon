@@ -1,0 +1,9 @@
+bothplanes	   16.68s	 0.4767 ms/key	(35000 keys)	nidx=500 per=70 words=300 sab=notpost flags=
+textonly	    8.20s	 0.2342 ms/key	(35000 keys)	nidx=500 per=70 words=300 sab=notpost flags=--no-vector
+notext	    0.66s	 0.0190 ms/key	(35000 keys)	nidx=500 per=70 words=300 sab=notpost flags=--no-text
+bothplanes	   16.68s	 0.4766 ms/key	(35000 keys)	nidx=500 per=70 words=300 sab=notpost flags=
+textonly	    7.97s	 0.2278 ms/key	(35000 keys)	nidx=500 per=70 words=300 sab=notpost flags=--no-vector
+notext	    0.58s	 0.0165 ms/key	(35000 keys)	nidx=500 per=70 words=300 sab=notpost flags=--no-text
+bothplanes	   16.69s	 0.4769 ms/key	(35000 keys)	nidx=500 per=70 words=300 sab=notpost flags=
+textonly	    7.98s	 0.2280 ms/key	(35000 keys)	nidx=500 per=70 words=300 sab=notpost flags=--no-vector
+notext	    0.58s	 0.0167 ms/key	(35000 keys)	nidx=500 per=70 words=300 sab=notpost flags=--no-text
