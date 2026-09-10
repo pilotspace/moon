@@ -13,7 +13,7 @@ use crate::storage::entry::{Entry, RedisValue, current_time_ms};
 use crate::storage::intset::Intset;
 use crate::storage::stream::Stream as StreamData;
 
-use crate::storage::db::{Database, entry_overhead, list_elem_cost};
+use crate::storage::db::{Database, entry_overhead, list_elem_cost, stamp_mutation};
 
 /// Rendered width, in bytes, of the widest member of an intset — what the
 /// listpack value threshold would measure once the intset's `i64`s become
@@ -156,6 +156,10 @@ impl Database {
                 b"ERR internal: lookup failed after insert",
             )));
         };
+        // moon#926: handing out `K::Mut` IS the mutation as far as WATCH is
+        // concerned. See `stamp_mutation` for why this cannot live in the
+        // ~60 write handlers instead.
+        stamp_mutation(entry);
         // moon#788: a compact→full encoding upgrade changes the entry's real
         // size; charge the difference or the ledger silently desynchronises
         // from the keyspace. Disjoint field borrows: `entry` borrows
@@ -196,6 +200,10 @@ impl Database {
         let Some(entry) = self.data.get_mut(key) else {
             return Ok(None);
         };
+        // moon#926: a present key is about to be handed out mutably. A MISS
+        // returns above without stamping — a pop that finds nothing is a read
+        // as far as the keyspace is concerned, and redis does not dirty it.
+        stamp_mutation(entry);
         // moon#788: a compact→full encoding upgrade changes the entry's real
         // size; charge the difference or the ledger silently desynchronises
         // from the keyspace. Disjoint field borrows: `entry` borrows
@@ -356,6 +364,8 @@ impl Database {
             }
         }
         let entry = self.data.get_mut(key).unwrap();
+        // moon#926 — see `stamp_mutation`.
+        stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::SetIntset(is)) => Ok(Some(is)),
             Some(RedisValue::Set(_)) | Some(RedisValue::SetListpack(_)) => Ok(None),
@@ -376,6 +386,8 @@ impl Database {
             _ => {}
         }
         let entry = self.data.get_mut(key).unwrap();
+        // moon#926 — see `stamp_mutation`.
+        stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::Set(set)) => set,
             _ => unreachable!("upgrade_intset_to_set: expected Set after upgrade"),
@@ -413,6 +425,8 @@ impl Database {
             }
         }
         let entry = self.data.get_mut(key).unwrap();
+        // moon#926 — see `stamp_mutation`.
+        stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::HashListpack(lp)) => Ok(Some(lp)),
             // Plain HashMap or TTL-extended hash: caller falls through to the
@@ -435,6 +449,8 @@ impl Database {
             _ => {}
         }
         let entry = self.data.get_mut(key).unwrap();
+        // moon#926 — see `stamp_mutation`.
+        stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::Hash(map)) => map,
             _ => unreachable!("upgrade_hash_listpack_to_hash: expected Hash after upgrade"),
@@ -472,6 +488,8 @@ impl Database {
             }
         }
         let entry = self.data.get_mut(key).unwrap();
+        // moon#926 — see `stamp_mutation`.
+        stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::ListListpack(lp)) => Ok(Some(lp)),
             Some(RedisValue::List(_)) => Ok(None),
@@ -492,6 +510,8 @@ impl Database {
             _ => {}
         }
         let entry = self.data.get_mut(key).unwrap();
+        // moon#926 — see `stamp_mutation`.
+        stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::List(list)) => list,
             _ => unreachable!("upgrade_list_listpack_to_list: expected List after upgrade"),
@@ -564,6 +584,8 @@ impl Database {
         }
         self.absorb_intset_into_listpack(key, absorb_intset);
         let entry = self.data.get_mut(key).unwrap();
+        // moon#926 — see `stamp_mutation`.
+        stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::SetListpack(lp)) => Ok(Some(lp)),
             Some(RedisValue::Set(_)) | Some(RedisValue::SetIntset(_)) => Ok(None),
@@ -633,6 +655,8 @@ impl Database {
         let encoding_delta = db_kind::SetKind::upgrade(entry);
         self.used_memory = self.used_memory.saturating_add_signed(encoding_delta);
         let entry = self.data.get_mut(key).unwrap();
+        // moon#926 — see `stamp_mutation`.
+        stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::Set(set)) => set,
             _ => unreachable!("upgrade_set_listpack_to_set: expected Set after upgrade"),
@@ -680,6 +704,8 @@ impl Database {
             }
         }
         let entry = self.data.get_mut(key).unwrap();
+        // moon#926 — see `stamp_mutation`.
+        stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::SortedSetListpack(lp)) => Ok(Some(lp)),
             Some(RedisValue::SortedSetBPTree { .. }) | Some(RedisValue::SortedSet { .. }) => {
@@ -711,6 +737,8 @@ impl Database {
         let encoding_delta = db_kind::SortedSetKind::upgrade(entry);
         self.used_memory = self.used_memory.saturating_add_signed(encoding_delta);
         let entry = self.data.get_mut(key).unwrap();
+        // moon#926 — see `stamp_mutation`.
+        stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::SortedSetBPTree { members, tree }) => (members, tree),
             _ => unreachable!("upgrade_zset_listpack_to_bptree: expected BPTree after upgrade"),
@@ -1140,11 +1168,15 @@ impl Database {
         }
         match self.data.get_mut(key) {
             None => Ok(None),
-            Some(entry) => match entry.value.as_redis_value_mut() {
-                Some(RedisValue::Stream(s)) => Ok(Some(s.as_mut())),
-                Some(_) => Err(Self::wrongtype_error()),
-                None => Err(Self::wrongtype_error()),
-            },
+            Some(entry) => {
+                // moon#926 — see `stamp_mutation`. A miss stamps nothing.
+                stamp_mutation(entry);
+                match entry.value.as_redis_value_mut() {
+                    Some(RedisValue::Stream(s)) => Ok(Some(s.as_mut())),
+                    Some(_) => Err(Self::wrongtype_error()),
+                    None => Err(Self::wrongtype_error()),
+                }
+            }
         }
     }
 }

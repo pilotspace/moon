@@ -331,6 +331,10 @@ impl Database {
         // Single get_mut: touch LRU + return
         let entry = self.data.get_mut(key)?;
         entry.set_last_access(now);
+        // moon#926: this hands out a raw `&mut Entry`, the broadest mutable
+        // handle there is — stamp the WATCH version with it. A miss returns
+        // above (the `?`) without stamping.
+        crate::storage::db::stamp_mutation(entry);
         Some(entry)
     }
 
@@ -1008,6 +1012,16 @@ impl Database {
         let old_ttl = match self.data.get_mut(key) {
             Some(entry) => {
                 let old = entry.expires_at_ms();
+                // moon#926: a TTL change is a modification of the watched key.
+                // Verified against redis 8.6.1, which dirties on every
+                // SUCCESSFUL expire-family write — `EXPIREAT k <same-ts>` twice
+                // aborts a watcher the second time too — but leaves the key
+                // alone when `PERSIST` finds no TTL to remove. `expires_at_ms
+                // != 0` is the expire family; `old != 0` is the PERSIST that
+                // actually removed something.
+                if expires_at_ms != 0 || old != 0 {
+                    crate::storage::db::stamp_mutation(entry);
+                }
                 entry.set_expires_at_ms(expires_at_ms);
                 old
             }
@@ -1089,10 +1103,19 @@ impl Database {
         self.data.get(key).map(|e| e.version()).unwrap_or(0)
     }
 
-    /// Increment version of a key if it exists.
+    /// Increment version of a key if it exists — the BY-KEY form, which
+    /// costs its own hash probe.
+    ///
+    /// The production write path does NOT come through here: every accessor
+    /// that hands out a mutable handle already holds the `&mut Entry` it
+    /// probed for and stamps that directly via
+    /// [`crate::storage::db::stamp_mutation`], which is where the moon#926
+    /// invariant lives. This entry point remains for a caller that has only a
+    /// key — and is deliberately implemented in terms of the same helper so
+    /// the two can never disagree about what a bump is.
     pub fn increment_version(&mut self, key: &[u8]) {
         if let Some(entry) = self.data.get_mut(key) {
-            entry.increment_version();
+            crate::storage::db::stamp_mutation(entry);
         }
     }
 
