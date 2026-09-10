@@ -560,9 +560,27 @@ run_step "clippy (tokio)"     env CARGO_TARGET_DIR=target-tokio \
 # Execute-reply consumer, found only after the dispatch matrix ran). Seconds
 # here, against a whole dispatch cycle there. No pnpm build is needed: without
 # console/dist the rust_embed macro embeds nothing, which still type-checks.
+#
+# --all-targets since moon#905. `cargo clippy` alone does NOT compile tests, so
+# this leg linted only the lib — and every OTHER clippy leg here passes
+# --all-targets but not `console`. The intersection was empty for as long as the
+# module has existed, which is how two deny-by-default `clippy::approx_constant`
+# errors sat green in `console_gateway.rs`'s own `#[cfg(test)]` block: reachable
+# by no gate on any machine, and fatal to anyone who did run the combination.
+# Catching console breakage in seconds is the whole argument for this leg, and
+# test code is console code.
+#
+# It is not free. Measured on this host, warm target-console, interleaved ABAB
+# with a `touch src/admin/console_gateway.rs` before every rep (an unchanged
+# tree is a ~1s no-op either way, which measures nothing): 21s/19s without the
+# flag, 88s/88s with it — +68s, because the console feature set must now also
+# check every test, bench and example target that links the lib. That is the
+# price of the only gate on any machine that lints console `#[cfg(test)]` code,
+# paid once per push on a phase that already takes minutes. Cheaper than the
+# alternative, which is what moon#905 measured: never.
 run_step "clippy (console)"   env CARGO_TARGET_DIR=target-console \
   cargo clippy --no-default-features \
-  --features runtime-monoio,jemalloc,graph,text-index,console -- -D warnings || exit 1
+  --features runtime-monoio,jemalloc,graph,text-index,console --all-targets -- -D warnings || exit 1
 # `handler_sharded` is `cfg(feature = "runtime-tokio")`, so the default leg
 # never compiles it; the tokio leg above drops `text-index`, so it never
 # compiles the parts of it behind that cfg. The intersection — tokio code

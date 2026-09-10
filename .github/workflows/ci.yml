@@ -427,8 +427,15 @@ jobs:
       - name: Build console assets
         working-directory: console
         run: pnpm build
-      - name: Clippy (monoio + console)
-        run: cargo clippy --no-default-features --features runtime-monoio,jemalloc,graph,text-index,console -- -D warnings
+      # --all-targets since moon#905. Without it this step lints only the lib,
+      # and every OTHER clippy invocation in this workflow passes --all-targets
+      # but not `console` — so `#[cfg(test)]` code behind the console feature
+      # was reachable by no gate on any machine. Two deny-by-default
+      # `clippy::approx_constant` errors sat green in console_gateway.rs's own
+      # test module for as long as it has existed, and `-D warnings` made them
+      # fatal to anyone who did run the combination.
+      - name: Clippy (monoio + console, all targets)
+        run: cargo clippy --no-default-features --features runtime-monoio,jemalloc,graph,text-index,console --all-targets -- -D warnings
 
   # ── MSRV — minimal build, different cache key ───────────────────────
   msrv:

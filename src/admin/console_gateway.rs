@@ -381,9 +381,15 @@ mod tests {
 
     #[test]
     fn test_frame_to_json_double() {
-        let frame = Frame::Double(3.14);
+        // 3.5, not 3.14: the assertion is that a Double round-trips to a JSON
+        // number, and cares not at all WHICH number. 3.14 is close enough to
+        // `std::f64::consts::PI` to trip `clippy::approx_constant`, which is
+        // deny-by-default and so broke `clippy --features console
+        // --all-targets` (moon#905). A value near no constant keeps the test
+        // saying what it means without an `#[allow]` to explain away.
+        let frame = Frame::Double(3.5);
         let json = ConsoleGateway::frame_to_json(&frame);
-        assert_eq!(json, serde_json::json!(3.14));
+        assert_eq!(json, serde_json::json!(3.5));
     }
 
     #[test]
