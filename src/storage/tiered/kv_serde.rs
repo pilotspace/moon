@@ -84,7 +84,8 @@ use crate::storage::value_codec::{self, HashTtlTrailer};
 #[inline]
 pub fn compact_for_promotion(value: RedisValue) -> RedisValue {
     if let RedisValue::SortedSetBPTree { members, .. } = &value
-        && members.len() <= crate::storage::db::LISTPACK_MAX_ENTRIES
+        && members.len()
+            <= crate::storage::encoding_limits::EncodingLimits::moon_defaults().zset_entries
         && members.values().any(|score| !score.is_finite())
     {
         return value;
