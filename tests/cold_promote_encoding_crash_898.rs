@@ -8,10 +8,12 @@
 //!   1. **Mid-spill SIGKILL.** Kill the server while the filler wave is still
 //!      driving `allkeys-lru` spills. Restart on the same `--dir`. Every probe
 //!      that survives must hold its COMPLETE original content — the fix must
-//!      not turn a crash into data loss (the moon#866 class). The one
-//!      exception is moon#902, a PRE-EXISTING cold-tier + AOF double-apply
-//!      that this suite found and does not test; see
-//!      `is_moon902_multiplication`.
+//!      not turn a crash into data loss (the moon#866 class), and EXACTLY its
+//!      original content — this suite is where moon#902 (cold copy restored
+//!      from the manifest AND the AOF's record of the same `RPUSH` replayed
+//!      on top) was found; it tolerated that shape for lists until the fix
+//!      landed, and tolerates nothing now. `tests/
+//!      cold_tier_aof_double_apply_902.rs` owns that defect's own gate.
 //!   2. **Mid-promote SIGKILL.** Drive a second spill wave post-restart, then
 //!      kill while a promote-back wave is in flight — the exact window where
 //!      `promote_cold_outcome` is rebuilding compact encodings. Restart again
@@ -207,44 +209,6 @@ fn write_all_probes(c: &mut common::Conn) {
     }
 }
 
-/// The shape moon#902 produces: a cold-tier list restored from the shard
-/// manifest AND re-`RPUSH`ed by the AOF replay, so every element appears `k`
-/// times for the same `k`. It **compounds** — measured here, one crash gives
-/// `k == 2` and a second gives `k == 3`, so it is unbounded in the number of
-/// recovery cycles, not a one-off doubling.
-///
-/// moon#902 is a PRE-EXISTING bug: reproduced on `f7c83769` itself, and
-/// identically on binaries with and without the moon#898 fix; with
-/// `--disk-offload disable` it does not occur at all. Tolerating it here is
-/// what keeps this suite from shipping permanently red for a defect it does
-/// not test — and it is tolerated as narrowly as the shape allows: a uniform
-/// whole-multiple of the expected multiset, on lists only. A partial list, a
-/// reordered one, a wrong element, or the same shape on any other type all
-/// still fail.
-fn is_moon902_multiplication(kind: &str, got: &str) -> bool {
-    if kind != "l" {
-        return false;
-    }
-    let once = expected(kind);
-    let want: Vec<&str> = once.split(',').collect();
-    let have: Vec<&str> = got.split(',').collect();
-    if want.is_empty() || !have.len().is_multiple_of(want.len()) {
-        return false;
-    }
-    let k = have.len() / want.len();
-    if k < 2 {
-        return false;
-    }
-    let mut multiplied: Vec<&str> = Vec::new();
-    for item in &want {
-        for _ in 0..k {
-            multiplied.push(item);
-        }
-    }
-    multiplied.sort();
-    have == multiplied
-}
-
 /// Content check over every probe: none may come back PARTIAL. Returns how
 /// many were still present, so the caller can refuse a vacuous run.
 fn assert_content_intact(c: &mut common::Conn, phase: &str) -> usize {
@@ -255,7 +219,7 @@ fn assert_content_intact(c: &mut common::Conn, phase: &str) -> usize {
             None => {}
             Some(got) => {
                 present += 1;
-                if got != expected(kind) && !is_moon902_multiplication(kind, &got) {
+                if got != expected(kind) {
                     broken.push(format!("{key}: {got:?} != {:?}", expected(kind)));
                 }
             }
@@ -263,8 +227,9 @@ fn assert_content_intact(c: &mut common::Conn, phase: &str) -> usize {
     }
     assert!(
         broken.is_empty(),
-        "[{phase}] probes came back PARTIAL after a SIGKILL — a surviving key must \
-         hold its complete content (moon#866 class): {}",
+        "[{phase}] probes came back WRONG after a SIGKILL — a surviving key must \
+         hold exactly its original content (partial = moon#866 class, a whole \
+         multiple = moon#902 class): {}",
         broken.join("; ")
     );
     present

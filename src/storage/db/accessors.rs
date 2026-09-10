@@ -856,6 +856,12 @@ impl Database {
         }
         let shard_dir = self.cold_shard_dir.as_ref()?;
         let ci = self.cold_index.as_ref()?;
+        // moon#902: an AOF-authority replay may not read a value from a cold
+        // file the log has not cut yet (see `cold_replay_gate`). Outside
+        // replay this is the same lookup `cold_read_through` repeats.
+        if self.replay_cold_gate_active() {
+            self.cold_location_visible(key)?;
+        }
         let (value, _ttl) =
             crate::storage::tiered::cold_read::cold_read_through(ci, shard_dir, key, now_ms)?;
         Some(value)
@@ -872,8 +878,9 @@ impl Database {
         std::path::PathBuf,
     )> {
         let shard_dir = self.cold_shard_dir.as_ref()?;
-        let ci = self.cold_index.as_ref()?;
-        let location = ci.lookup(key)?;
+        // moon#902: replay-gated (see `cold_replay_gate`); a plain lookup
+        // outside replay.
+        let location = self.cold_location_visible(key)?;
         Some((location, shard_dir.clone()))
     }
 

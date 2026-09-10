@@ -241,6 +241,34 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
     buf
 }
 
+/// moon#902: every AOF generation opens with `MOON.COLDCUT <watermark>` —
+/// cold files with `file_id < watermark` were sealed before this
+/// generation's base was cut, so a replay may read them as the base for
+/// every record that follows. Written and fsynced BEFORE any post-cut append
+/// so it is always the first record of the new incr; `framed` selects the
+/// per-shard `[lsn=0][len][RESP]` encoding.
+pub(crate) fn write_cold_cut_head(
+    file: &mut std::fs::File,
+    framed: bool,
+    watermark: u64,
+    path: &Path,
+) -> Result<(), MoonError> {
+    use std::io::Write;
+    let resp = crate::persistence::cold_records::serialize_cold_cut(watermark);
+    let io = |e: std::io::Error| AofError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    };
+    if framed {
+        file.write_all(&crate::persistence::cold_records::frame_unoffset(&resp))
+            .map_err(io)?;
+    } else {
+        file.write_all(&resp).map_err(io)?;
+    }
+    file.sync_data().map_err(io)?;
+    Ok(())
+}
+
 /// Snapshot databases and generate compacted AOF commands.
 ///
 /// Shared by both the async (tokio) and sync (monoio) rewrite paths.
@@ -769,9 +797,10 @@ pub(crate) fn do_rewrite_per_shard(
         .append(true)
         .open(&new_incr)
         .map_err(|e| AofError::Io {
-            path: new_incr,
+            path: new_incr.clone(),
             source: e,
         })?;
+    write_cold_cut_head(file, true, fold_snapshot.cold_file_watermark, &new_incr)?;
     // task #35: save the OLD incr's final db context (in case phase 8 rolls
     // back to it on abort) then reset for the fresh NEW incr — replay always
     // starts a segment at db 0, so the writer's running context must match.
@@ -892,6 +921,13 @@ pub(crate) fn do_rewrite_single(
     overflow.mark_cut();
 
     // Phase 4: snapshot under the write locks. No mutation is possible.
+    // moon#902: the cold-file watermark for the new generation's
+    // `MOON.COLDCUT`, taken at the same instant as the snapshot.
+    let cold_watermark = guards
+        .iter()
+        .map(|g| g.cold_file_watermark_hint())
+        .max()
+        .unwrap_or(1);
     let now_ms = current_time_ms();
     let snapshot: Vec<
         Vec<(
@@ -924,9 +960,10 @@ pub(crate) fn do_rewrite_single(
         .append(true)
         .open(&new_incr)
         .map_err(|e| AofError::Io {
-            path: new_incr,
+            path: new_incr.clone(),
             source: e,
         })?;
+    write_cold_cut_head(file, false, cold_watermark, &new_incr)?;
     // task #35: fresh incr — replay always starts a segment at db 0.
     *last_db = 0;
 
@@ -1098,9 +1135,10 @@ pub(crate) fn do_rewrite_sharded(
         .append(true)
         .open(&new_incr)
         .map_err(|e| AofError::Io {
-            path: new_incr,
+            path: new_incr.clone(),
             source: e,
         })?;
+    write_cold_cut_head(file, false, fold_snapshot.cold_file_watermark, &new_incr)?;
     // task #35: fresh incr — replay always starts a segment at db 0.
     *last_db = 0;
 

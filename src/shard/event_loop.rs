@@ -1841,6 +1841,12 @@ impl super::Shard {
                         &mut shard_manifest,
                         &shard_databases,
                         shard_id,
+                        &mut persistence_tick::ColdMarkerSink {
+                            aof_pool: aof_pool.as_ref(),
+                            wal_writer: None,
+                            shard_id,
+                            wal_kv_log: false,
+                        },
                     );
                     // Trigger final checkpoint before shutdown (design S9)
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
@@ -2027,6 +2033,12 @@ impl super::Shard {
                         &mut shard_manifest,
                         &shard_databases,
                         shard_id,
+                        &mut persistence_tick::ColdMarkerSink {
+                            aof_pool: aof_pool.as_ref(),
+                            wal_writer: None,
+                            shard_id,
+                            wal_kv_log: false,
+                        },
                     );
                     if let (
                         Some(ckpt_mgr),

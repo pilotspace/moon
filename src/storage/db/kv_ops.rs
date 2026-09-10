@@ -269,10 +269,11 @@ impl Database {
         if self.spill_inflight_alive(key, now_ms) {
             return true;
         }
-        let Some(ci) = self.cold_index.as_ref() else {
-            return false;
-        };
-        match ci.lookup(key) {
+        // moon#902: `cold_location_visible` is the replay-gated choke point —
+        // during an AOF-authority replay a cold entry whose file has not been
+        // cut yet must read as absent, or `SETNX`/`LPUSHX`-style existence
+        // checks answer from a copy the log is about to rebuild.
+        match self.cold_location_visible(key) {
             Some(loc) => loc.ttl_ms.is_none_or(|ttl| now_ms <= ttl),
             None => false,
         }
