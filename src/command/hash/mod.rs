@@ -2046,4 +2046,432 @@ mod tests {
             assert_eq!(got, expected, "argv {argv:?}");
         }
     }
+
+    // ── moon#897: a secondary write must not flatten a small hash ──────────
+    //
+    // `HINCRBY` and `HSETNX` reached for `get_or_create_hash`, whose contract
+    // is an EAGER upgrade to the full `HashMap`. Either one on a three-field
+    // hash left it `hashtable` — and because nothing demotes (moon#832), for
+    // the key's lifetime. `HDEL` was the only hash secondary write that
+    // survived, because it routes through the listpack-aware
+    // `Database::hash_delete_field`; these guards pin all three together.
+    //
+    // Measured on ab91a23e vs redis 8.6.1 (policy aligned to moon's 128/64),
+    // one shard, macOS: 24 divergences, every one an `OBJECT ENCODING` row
+    // after HINCRBY/HSETNX or a field-ORDER row that only differs because the
+    // container had been flattened into an unordered map.
+
+    /// `OBJECT ENCODING`'s own source, so a guard cannot pass against some
+    /// other notion of "compact" than the one a client sees.
+    fn encoding_897(db: &mut Database, key: &[u8]) -> &'static str {
+        db.get(key)
+            .map(|e| e.value.as_redis_value().encoding_name())
+            .unwrap_or("<missing>")
+    }
+
+    fn small_hash_897(db: &mut Database, fields: usize) {
+        let mut argv: Vec<Vec<u8>> = vec![b"h".to_vec()];
+        for i in 0..fields {
+            argv.push(format!("f{i}").into_bytes());
+            argv.push(format!("v{i}").into_bytes());
+        }
+        let refs: Vec<&[u8]> = argv.iter().map(|v| v.as_slice()).collect();
+        assert_eq!(
+            hset(db, &make_args(&refs)),
+            Frame::Integer(fields as i64),
+            "fixture HSET must create {fields} fields"
+        );
+        assert_eq!(
+            encoding_897(db, b"h"),
+            "listpack",
+            "fixture must start compact"
+        );
+    }
+
+    /// The headline: every hash secondary write leaves a SMALL hash compact.
+    /// `HDEL` is in the table because it was already correct — it is the pin
+    /// against regressing the one survivor.
+    #[test]
+    fn secondary_writes_keep_a_small_hash_listpack() {
+        #[allow(clippy::type_complexity)]
+        let writes: &[(&str, fn(&mut Database))] = &[
+            ("HINCRBY existing field", |db| {
+                hset(db, &make_args(&[b"h", b"n", b"10"]));
+                assert_eq!(
+                    hincrby(db, &make_args(&[b"h", b"n", b"5"])),
+                    Frame::Integer(15)
+                );
+            }),
+            ("HINCRBY new field", |db| {
+                assert_eq!(
+                    hincrby(db, &make_args(&[b"h", b"brand", b"7"])),
+                    Frame::Integer(7)
+                );
+            }),
+            ("HINCRBY on a non-integer value (error path)", |db| {
+                hset(db, &make_args(&[b"h", b"s", b"notanum"]));
+                assert!(matches!(
+                    hincrby(db, &make_args(&[b"h", b"s", b"1"])),
+                    Frame::Error(_)
+                ));
+            }),
+            ("HSETNX new field", |db| {
+                assert_eq!(
+                    hsetnx(db, &make_args(&[b"h", b"brand", b"1"])),
+                    Frame::Integer(1)
+                );
+            }),
+            ("HSETNX existing field (no-op)", |db| {
+                assert_eq!(
+                    hsetnx(db, &make_args(&[b"h", b"f0", b"clobber"])),
+                    Frame::Integer(0)
+                );
+            }),
+            ("HDEL (already correct — pin)", |db| {
+                assert_eq!(hdel(db, &make_args(&[b"h", b"f1"])), Frame::Integer(1));
+            }),
+        ];
+        for (name, write) in writes {
+            let mut db = Database::new();
+            small_hash_897(&mut db, 3);
+            write(&mut db);
+            assert_eq!(
+                encoding_897(&mut db, b"h"),
+                "listpack",
+                "{name}: a 3-field hash must still be compact after this write"
+            );
+        }
+    }
+
+    /// A key CREATED by one of these commands starts compact too — the old
+    /// path fabricated a full `HashMap` on the very first touch.
+    #[test]
+    fn secondary_writes_create_a_compact_hash() {
+        let mut db = Database::new();
+        assert_eq!(
+            hincrby(&mut db, &make_args(&[b"a", b"n", b"7"])),
+            Frame::Integer(7)
+        );
+        assert_eq!(encoding_897(&mut db, b"a"), "listpack");
+        assert_eq!(
+            hsetnx(&mut db, &make_args(&[b"b", b"n", b"x"])),
+            Frame::Integer(1)
+        );
+        assert_eq!(encoding_897(&mut db, b"b"), "listpack");
+    }
+
+    /// The fix is "do not flatten a SMALL hash", not "never promote". Both
+    /// sides of `hash-max-listpack-entries` and of `hash-max-listpack-value`,
+    /// read from the ONE authority — never a literal threshold in this file.
+    #[test]
+    fn secondary_writes_still_promote_past_the_threshold() {
+        use crate::storage::db::Shape;
+        let limits = Database::new().encoding_limits();
+        let max_items = limits.max_items(Shape::Hash);
+        let max_value = limits.max_value(Shape::Hash);
+
+        // ENTRIES axis. One field short of the limit, the write that fills it
+        // stays compact; exactly at the limit, the write that pushes one past
+        // it promotes. HSETNX and HINCRBY each ADD a field here.
+        #[allow(clippy::type_complexity)]
+        let adders: &[(&str, fn(&mut Database))] = &[
+            ("HSETNX", |db| {
+                assert_eq!(
+                    hsetnx(db, &make_args(&[b"h", b"zz", b"1"])),
+                    Frame::Integer(1)
+                );
+            }),
+            ("HINCRBY", |db| {
+                assert_eq!(
+                    hincrby(db, &make_args(&[b"h", b"zz", b"1"])),
+                    Frame::Integer(1)
+                );
+            }),
+        ];
+        for (name, add) in adders {
+            for (start, want) in [(max_items - 1, "listpack"), (max_items, "hashtable")] {
+                let mut db = Database::new();
+                small_hash_897(&mut db, start);
+                add(&mut db);
+                assert_eq!(
+                    encoding_897(&mut db, b"h"),
+                    want,
+                    "{name}: {start} fields + 1 must be {want}"
+                );
+                assert_eq!(
+                    hlen(&mut db, &make_args(&[b"h"])),
+                    Frame::Integer(start as i64 + 1),
+                    "{name}: no field lost across the boundary"
+                );
+            }
+        }
+
+        // A field ALREADY in the container adds no entry, so a full listpack
+        // stays compact under HINCRBY — which is what redis does.
+        let mut db = Database::new();
+        small_hash_897(&mut db, max_items);
+        hset(&mut db, &make_args(&[b"h", b"f0", b"1"]));
+        assert_eq!(
+            hincrby(&mut db, &make_args(&[b"h", b"f0", b"1"])),
+            Frame::Integer(2)
+        );
+        assert_eq!(encoding_897(&mut db, b"h"), "listpack");
+
+        // VALUE axis, both sides. The element measured is the longer of the
+        // field and the value.
+        let at = vec![b'v'; max_value];
+        let past = vec![b'v'; max_value + 1];
+        for (elem, want) in [(&at, "listpack"), (&past, "hashtable")] {
+            let mut db = Database::new();
+            small_hash_897(&mut db, 3);
+            assert_eq!(
+                hsetnx(&mut db, &make_args(&[b"h", b"big", elem])),
+                Frame::Integer(1)
+            );
+            assert_eq!(
+                encoding_897(&mut db, b"h"),
+                want,
+                "HSETNX value len {}",
+                elem.len()
+            );
+
+            let mut db = Database::new();
+            small_hash_897(&mut db, 3);
+            assert_eq!(
+                hsetnx(&mut db, &make_args(&[b"h", elem, b"v"])),
+                Frame::Integer(1)
+            );
+            assert_eq!(
+                encoding_897(&mut db, b"h"),
+                want,
+                "HSETNX field len {}",
+                elem.len()
+            );
+
+            let mut db = Database::new();
+            small_hash_897(&mut db, 3);
+            assert_eq!(
+                hincrby(&mut db, &make_args(&[b"h", elem, b"3"])),
+                Frame::Integer(3)
+            );
+            assert_eq!(
+                encoding_897(&mut db, b"h"),
+                want,
+                "HINCRBY field len {}",
+                elem.len()
+            );
+        }
+    }
+
+    /// moon#795: the compact encodings are byte-transparent only because the
+    /// listpack integer encoding is reserved for CANONICAL spellings. Routing
+    /// HSETNX into a listpack must not start normalising a caller's bytes,
+    /// and HINCRBY must write back a spelling that round-trips.
+    #[test]
+    fn secondary_writes_preserve_numeric_looking_bytes() {
+        let mut db = Database::new();
+        small_hash_897(&mut db, 3);
+        for (field, value) in [
+            (&b"a"[..], &b"+5"[..]),
+            (b"b", b"007"),
+            (b"c", b"-0"),
+            (b"d", b" 7"),
+            (b"e", b"000000012345"),
+            (b"f", b"12345"),
+        ] {
+            assert_eq!(
+                hsetnx(&mut db, &make_args(&[b"h", field, value])),
+                Frame::Integer(1)
+            );
+            assert_eq!(
+                hget(&mut db, &make_args(&[b"h", field])),
+                Frame::BulkString(Bytes::copy_from_slice(value)),
+                "HSETNX must store {value:?} verbatim"
+            );
+        }
+        assert_eq!(encoding_897(&mut db, b"h"), "listpack", "still compact");
+
+        // HINCRBY's own write-back: `itoa` is canonical, so what goes in
+        // comes back out unchanged, negatives and zero included.
+        let mut db = Database::new();
+        small_hash_897(&mut db, 3);
+        for (inc, want) in [("-5", "-5"), ("0", "-5"), ("10", "5"), ("-5", "0")] {
+            hincrby(&mut db, &make_args(&[b"h", b"n", inc.as_bytes()]));
+            assert_eq!(
+                hget(&mut db, &make_args(&[b"h", b"n"])),
+                Frame::BulkString(Bytes::copy_from_slice(want.as_bytes())),
+                "after HINCRBY by {inc}"
+            );
+        }
+        assert_eq!(encoding_897(&mut db, b"h"), "listpack");
+    }
+
+    /// The semantics the routing must not disturb: replies, error strings,
+    /// WRONGTYPE, and HSETNX's no-op-on-existing contract. Each is asserted
+    /// against the byte string the pre-moon#897 code returned.
+    #[test]
+    fn secondary_write_semantics_are_unchanged() {
+        let mut db = Database::new();
+        small_hash_897(&mut db, 3);
+
+        // HINCRBY on a non-integer value: the exact error, with the value and
+        // the field count both untouched.
+        hset(&mut db, &make_args(&[b"h", b"s", b"notanum"]));
+        assert_eq!(
+            hincrby(&mut db, &make_args(&[b"h", b"s", b"1"])),
+            Frame::Error(Bytes::from_static(b"ERR hash value is not an integer"))
+        );
+        assert_eq!(
+            hget(&mut db, &make_args(&[b"h", b"s"])),
+            Frame::BulkString(Bytes::from_static(b"notanum"))
+        );
+
+        // A bad INCREMENT is rejected before the container is consulted.
+        assert_eq!(
+            hincrby(&mut db, &make_args(&[b"h", b"n", b"abc"])),
+            Frame::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range"
+            ))
+        );
+
+        // WRONGTYPE, both commands, from BOTH arms — the short argv takes the
+        // new listpack arm, the 200-byte one is refused by the entry gate and
+        // takes the full-form arm.
+        db.set_string(b"str", Bytes::from_static(b"v"));
+        let long = vec![b'x'; 200];
+        for got in [
+            hincrby(&mut db, &make_args(&[b"str", b"f", b"1"])),
+            hsetnx(&mut db, &make_args(&[b"str", b"f", b"1"])),
+            hincrby(&mut db, &make_args(&[b"str", &long, b"1"])),
+            hsetnx(&mut db, &make_args(&[b"str", b"f", &long])),
+        ] {
+            assert!(matches!(got, Frame::Error(ref e) if e.starts_with(b"WRONGTYPE")));
+        }
+
+        // HSETNX's no-op contract: 0, the old value survives, HLEN unmoved.
+        let before_len = hlen(&mut db, &make_args(&[b"h"]));
+        assert_eq!(
+            hsetnx(&mut db, &make_args(&[b"h", b"f0", b"clobber"])),
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            hget(&mut db, &make_args(&[b"h", b"f0"])),
+            Frame::BulkString(Bytes::from_static(b"v0"))
+        );
+        assert_eq!(hlen(&mut db, &make_args(&[b"h"])), before_len);
+
+        // Arity, both commands, both directions.
+        for argv in [
+            vec![b"h".as_slice(), b"f"],
+            vec![b"h".as_slice(), b"f", b"1", b"2"],
+        ] {
+            assert!(matches!(
+                hincrby(&mut db, &make_args(&argv)),
+                Frame::Error(_)
+            ));
+            assert!(matches!(
+                hsetnx(&mut db, &make_args(&argv)),
+                Frame::Error(_)
+            ));
+        }
+    }
+
+    /// A per-field TTL promotes the container to `HashWithTtl`, which never
+    /// compacts back. Both commands must fall THROUGH the listpack arm there
+    /// and leave the sidecar intact — the TTL survives an HINCRBY, and
+    /// HSETNX's no-op does not clear one.
+    #[test]
+    fn secondary_writes_leave_the_ttl_sidecar_alone() {
+        let mut db = Database::new();
+        small_hash_897(&mut db, 3);
+        hset(&mut db, &make_args(&[b"h", b"n", b"1"]));
+        assert_eq!(
+            hexpire(&mut db, &make_args(&[b"h", b"100", b"FIELDS", b"1", b"n"])),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
+        // The TTL took the container off the compact path for good.
+        assert_eq!(encoding_897(&mut db, b"h"), "hashtable");
+
+        assert_eq!(
+            hincrby(&mut db, &make_args(&[b"h", b"n", b"1"])),
+            Frame::Integer(2)
+        );
+        assert!(
+            db.hash_get_field_ttl_ms(b"h", b"n").is_some(),
+            "HINCRBY must preserve the field's TTL"
+        );
+
+        assert_eq!(
+            hsetnx(&mut db, &make_args(&[b"h", b"n", b"zz"])),
+            Frame::Integer(0)
+        );
+        assert!(
+            db.hash_get_field_ttl_ms(b"h", b"n").is_some(),
+            "HSETNX's no-op must not clear the field's TTL"
+        );
+        assert_eq!(
+            hget(&mut db, &make_args(&[b"h", b"n"])),
+            Frame::BulkString(Bytes::from_static(b"2")),
+            "HSETNX's no-op must not overwrite the value either"
+        );
+
+        // And a NEW field on the same TTL'd hash must still be INSERTED,
+        // returning 1. This case is what makes the guard able to fail: the
+        // no-op above answers `0`, which is also what a listpack arm that
+        // mistook `Ok(None)` for "nothing to do" would answer — measured, a
+        // mutation doing exactly that left all seven guards green until this
+        // assertion existed. A brand-new field discriminates: the correct
+        // answer is 1 and the field must be readable afterwards.
+        assert_eq!(
+            hsetnx(&mut db, &make_args(&[b"h", b"brand", b"9"])),
+            Frame::Integer(1),
+            "HSETNX must still insert a new field into a TTL'd hash"
+        );
+        assert_eq!(
+            hget(&mut db, &make_args(&[b"h", b"brand"])),
+            Frame::BulkString(Bytes::from_static(b"9"))
+        );
+        assert_eq!(
+            hlen(&mut db, &make_args(&[b"h"])),
+            Frame::Integer(5),
+            "f0 f1 f2 n brand"
+        );
+        assert!(
+            db.hash_get_field_ttl_ms(b"h", b"brand").is_none(),
+            "a newly inserted field carries no TTL"
+        );
+        assert!(
+            db.hash_get_field_ttl_ms(b"h", b"n").is_some(),
+            "and inserting one must not disturb another field's TTL"
+        );
+    }
+
+    /// The memory ledger must survive the new routing (moon#788). Running
+    /// `used_memory` after a listpack-path HINCRBY/HSETNX has to equal a
+    /// from-scratch recompute, and it has to keep doing so across the
+    /// promotion boundary — that is where the cost MODEL changes, and where a
+    /// hand-copied settle tail would drift from HSET's.
+    #[test]
+    fn secondary_writes_keep_the_memory_ledger_honest() {
+        use crate::storage::db::Shape;
+        let max_items = Database::new().encoding_limits().max_items(Shape::Hash);
+        for fields in [3usize, max_items - 1, max_items] {
+            let mut db = Database::new();
+            small_hash_897(&mut db, fields);
+            hsetnx(&mut db, &make_args(&[b"h", b"zz", b"1"]));
+            hincrby(&mut db, &make_args(&[b"h", b"zz", b"41"]));
+            assert_eq!(
+                hget(&mut db, &make_args(&[b"h", b"zz"])),
+                Frame::BulkString(Bytes::from_static(b"42"))
+            );
+            let running = db.estimated_memory();
+            db.recalculate_memory();
+            let recomputed = db.estimated_memory();
+            assert_eq!(
+                running, recomputed,
+                "{fields} fields: ledger drifted after the listpack-path writes \
+                 ({running} B running vs {recomputed} B recomputed)"
+            );
+        }
+    }
 }
