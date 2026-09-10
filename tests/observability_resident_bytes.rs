@@ -57,13 +57,13 @@ fn vector_store_resident_bytes_zero_when_empty() {
 // ---- WAL Writer ----
 
 use moon::persistence::wal_v3::record::WalRecordType;
-use moon::persistence::wal_v3::segment::WalWriterV3;
+use moon::persistence::wal_v3::segment::{WalBounds, WalWriterV3};
 
 #[test]
 fn wal_writer_resident_bytes_after_append() {
     let dir = tempfile::tempdir().expect("failed to create tempdir");
-    let mut writer =
-        WalWriterV3::new(0, dir.path(), 1024 * 1024).expect("failed to create WAL writer");
+    let mut writer = WalWriterV3::new(0, dir.path(), 1024 * 1024, WalBounds::DEFAULT)
+        .expect("failed to create WAL writer");
 
     // The buffer is pre-allocated to 8192 bytes.
     let before = writer.resident_bytes();

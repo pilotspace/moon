@@ -1362,8 +1362,66 @@ impl ServerConfig {
     }
 
     /// Returns --max-wal-size parsed to bytes (default 256 MiB).
-    pub fn max_wal_size_bytes(&self) -> u64 {
+    ///
+    /// Private on purpose: every consumer of the ceiling — `CheckpointTrigger`,
+    /// autovacuum Pass C and `WalWriterV3` — reads [`Self::wal_bounds`], so
+    /// there is one derivation and the three cannot drift apart (moon#916).
+    fn max_wal_size_bytes(&self) -> u64 {
         Self::parse_size(&self.max_wal_size).unwrap_or(256 * 1024 * 1024)
+    }
+
+    /// The WAL recycling bounds every consumer reads.
+    ///
+    /// `max_bytes` is `--max-wal-size` as parsed. `min_bytes` — the floor the
+    /// regular recycler keeps — has no flag of its own: it is
+    /// `DEFAULT_MIN_WAL_BYTES` (48 MiB), lowered to `max / 2` whenever the
+    /// ceiling is small enough that the default floor would sit above it.
+    /// Deriving the floor from the ceiling is what makes `min > max`
+    /// unrepresentable: before moon#916 was wired, `--max-wal-size 32mb`
+    /// was inert; wired naively it would have kept a 48 MiB floor under a
+    /// 32 MiB ceiling, the regular recycler could never bring the WAL under
+    /// the ceiling, and P6 would have forced a retention-zeroed checkpoint
+    /// every `--wal-max-checkpoint-lag-ms`.
+    ///
+    /// This is one named accessor because moon#916 was exactly the absence
+    /// of it: `--max-wal-size` reached `CheckpointTrigger` but never
+    /// `WalWriterV3`, whose bounds setter had no production caller, so the
+    /// P6 overflow ceiling was the 256 MiB default on every instance ever run.
+    ///
+    /// Pure: the ceiling-vs-segment check lives in
+    /// [`Self::validate_wal_bounds`], which `main` runs before any shard starts.
+    pub fn wal_bounds(&self) -> crate::persistence::wal_v3::segment::WalBounds {
+        use crate::persistence::wal_v3::segment::{DEFAULT_MIN_WAL_BYTES, WalBounds};
+        let max_bytes = self.max_wal_size_bytes();
+        WalBounds::new(DEFAULT_MIN_WAL_BYTES.min(max_bytes / 2), max_bytes)
+    }
+
+    /// Reject a `--max-wal-size` the WAL could never get back under.
+    ///
+    /// The active segment is never recycled, so a ceiling below two segments
+    /// means the P6 trigger fires and frees nothing, forever (bounded only by
+    /// the moon#870 backoff). Refusing at startup — rather than clamping —
+    /// follows `validate_tuning_defaults`: a fleet-wide typo must be loud, and
+    /// `--check-config` reports it without starting anything.
+    ///
+    /// Returns the effective bounds on success so the caller can log a floor
+    /// that was lowered below its default.
+    pub fn validate_wal_bounds(
+        &self,
+    ) -> Result<crate::persistence::wal_v3::segment::WalBounds, String> {
+        let bounds = self.wal_bounds();
+        let segment = self.wal_segment_size_bytes();
+        let floor = segment.saturating_mul(2);
+        if bounds.max_bytes < floor {
+            return Err(format!(
+                "--max-wal-size {} ({} bytes) is below two WAL segments ({} bytes at \
+                 --wal-segment-size {}): the active segment is never recycled, so the \
+                 ceiling could never be enforced. Raise --max-wal-size to at least {} \
+                 bytes or lower --wal-segment-size.",
+                self.max_wal_size, bounds.max_bytes, floor, self.wal_segment_size, floor
+            ));
+        }
+        Ok(bounds)
     }
 
     /// Returns --wal-segment-size parsed to bytes (default 16 MiB).
@@ -2228,6 +2286,86 @@ mod tests {
         assert!(config.validate_databases_bound().is_err());
     }
 
+    /// moon#916: the one accessor every ceiling consumer reads must carry
+    /// the parsed flag, not the compiled-in default.
+    ///
+    /// This pins the VALUE only. Whether the value reaches the writer and
+    /// the P6 path is a wiring property, and a unit test that constructs its
+    /// own writer cannot see it — `tests/wal_bounds_wired_916.rs` spawns a
+    /// real server and reads the ceiling back out of the writer's startup
+    /// log and out of the P6 trigger itself.
+    #[test]
+    fn wal_bounds_carry_max_wal_size_and_keep_the_default_floor() {
+        use crate::persistence::wal_v3::segment::{DEFAULT_MAX_WAL_BYTES, DEFAULT_MIN_WAL_BYTES};
+
+        let config = ServerConfig::parse_from(["moon", "--max-wal-size", "1gb"]);
+        let bounds = config.wal_bounds();
+        assert_eq!(
+            bounds.max_bytes,
+            1024 * 1024 * 1024,
+            "1gb must parse to 1 GiB"
+        );
+        assert_eq!(
+            bounds.min_bytes, DEFAULT_MIN_WAL_BYTES,
+            "a ceiling above 2x the default floor keeps the default floor"
+        );
+        assert_ne!(
+            bounds.max_bytes, DEFAULT_MAX_WAL_BYTES,
+            "fixture must differ from the default, or this test cannot fail"
+        );
+        assert_eq!(
+            config.validate_wal_bounds().map(|b| b.max_bytes),
+            Ok(1024 * 1024 * 1024)
+        );
+    }
+
+    /// A small ceiling lowers the floor with it, so `min <= max` always holds
+    /// and the regular recycler can bring the WAL back under the ceiling.
+    #[test]
+    fn wal_bounds_lower_the_floor_under_a_small_ceiling() {
+        let config = ServerConfig::parse_from(["moon", "--max-wal-size", "32mb"]);
+        let bounds = config.wal_bounds();
+        assert_eq!(bounds.max_bytes, 32 * 1024 * 1024);
+        assert_eq!(bounds.min_bytes, 16 * 1024 * 1024, "floor = max / 2");
+        assert!(bounds.min_bytes <= bounds.max_bytes);
+        // 32 MiB >= 2 x 16 MiB segments: accepted.
+        assert!(config.validate_wal_bounds().is_ok());
+
+        // The configuration `tests/crash_recovery_wal_recycle_legacy.rs` starts
+        // a real server with — it must keep starting.
+        let legacy = ServerConfig::parse_from([
+            "moon",
+            "--wal-segment-size",
+            "32kb",
+            "--max-wal-size",
+            "96kb",
+        ]);
+        let b = legacy.validate_wal_bounds().expect("96kb >= 2 x 32kb");
+        assert_eq!((b.min_bytes, b.max_bytes), (48 * 1024, 96 * 1024));
+    }
+
+    /// A ceiling under two segments can never be enforced (the active
+    /// segment is never recycled) — refuse at startup, naming both flags.
+    #[test]
+    fn validate_wal_bounds_rejects_a_ceiling_under_two_segments() {
+        let config = ServerConfig::parse_from(["moon", "--max-wal-size", "8mb"]);
+        let err = config
+            .validate_wal_bounds()
+            .expect_err("8mb < 2 x 16mb segments must be refused");
+        assert!(err.contains("--max-wal-size 8mb"), "{err}");
+        assert!(err.contains("--wal-segment-size"), "{err}");
+        assert!(err.contains("33554432"), "must name the minimum: {err}");
+
+        // Exactly two segments is the boundary and is accepted.
+        let edge = ServerConfig::parse_from(["moon", "--max-wal-size", "32mb"]);
+        assert!(edge.validate_wal_bounds().is_ok());
+
+        // The same defect from the other flag: a segment so large the
+        // default ceiling is under two of them.
+        let big_seg = ServerConfig::parse_from(["moon", "--wal-segment-size", "256mb"]);
+        assert!(big_seg.validate_wal_bounds().is_err());
+    }
+
     /// `MOON_DISK_FREE_MIN_PCT` env override for `--disk-free-min-pct`.
     ///
     /// Test harnesses (and CI runners whose root disk legitimately sits
@@ -2986,7 +3124,7 @@ mod tests {
         assert_eq!(config.pagecache_size, Some("512mb".to_string()));
         assert_eq!(config.checkpoint_timeout, 600);
         assert!((config.checkpoint_completion - 0.8).abs() < f64::EPSILON);
-        assert_eq!(config.max_wal_size_bytes(), 512 * 1024 * 1024);
+        assert_eq!(config.wal_bounds().max_bytes, 512 * 1024 * 1024);
         assert!(!config.wal_fpi_enabled());
         assert_eq!(config.wal_compression, "none");
         assert_eq!(config.wal_segment_size_bytes(), 32 * 1024 * 1024);

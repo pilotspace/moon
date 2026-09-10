@@ -921,8 +921,13 @@ mod tests {
         wal_dir: &std::path::Path,
     ) -> crate::persistence::wal_v3::segment::WalWriterV3 {
         use crate::persistence::wal_v3::record::WalRecordType;
-        let mut writer =
-            crate::persistence::wal_v3::segment::WalWriterV3::new(0, wal_dir, 512).unwrap();
+        let mut writer = crate::persistence::wal_v3::segment::WalWriterV3::new(
+            0,
+            wal_dir,
+            512,
+            crate::persistence::wal_v3::segment::WalBounds::DEFAULT,
+        )
+        .unwrap();
         for i in 0..80 {
             writer.append(WalRecordType::Command, b"legacy-ws-t43 EARLY-MARKER-T43");
             if (i + 1) % 3 == 0 {
@@ -996,8 +1001,13 @@ mod tests {
         use crate::persistence::wal_v3::record::WalRecordType;
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer =
-            crate::persistence::wal_v3::segment::WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        let mut writer = crate::persistence::wal_v3::segment::WalWriterV3::new(
+            0,
+            &wal_dir,
+            512,
+            crate::persistence::wal_v3::segment::WalBounds::DEFAULT,
+        )
+        .unwrap();
         // Plane record first (lands in segment 1), then KV filler.
         writer.append(WalRecordType::MqPush, b"\x01mq-plane-payload");
         for i in 0..80 {

@@ -199,10 +199,10 @@ impl CdcSubscriberRegistry {
 mod tests {
     use super::*;
     use crate::persistence::wal_v3::record::WalRecordType;
-    use crate::persistence::wal_v3::segment::{DEFAULT_SEGMENT_SIZE, WalWriterV3};
+    use crate::persistence::wal_v3::segment::{DEFAULT_SEGMENT_SIZE, WalBounds, WalWriterV3};
 
     fn write_kv_records(wal_dir: &std::path::Path, n: u64) {
-        let mut w = WalWriterV3::new(0, wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut w = WalWriterV3::new(0, wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
         for _ in 0..n {
             w.append(
                 WalRecordType::Command,

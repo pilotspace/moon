@@ -4595,6 +4595,7 @@ pub(crate) fn extract_command_static(
 #[cfg(test)]
 mod wal_append_tests {
     use super::*;
+    use crate::persistence::wal_v3::segment::WalBounds;
     use crate::replication::backlog::{ReplicationBacklog, SharedBacklog};
 
     /// S3.5b: when there is no WAL writer and no connected replica, the
@@ -4808,7 +4809,8 @@ mod wal_append_tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut w3 = Some(WalWriterV3::new(0, &wal_dir, 16 * 1024 * 1024).unwrap());
+        let mut w3 =
+            Some(WalWriterV3::new(0, &wal_dir, 16 * 1024 * 1024, WalBounds::DEFAULT).unwrap());
         w3.as_mut().unwrap().flush_sync().unwrap();
         let seg = wal_dir.join("000000000001.wal");
         let base_len = std::fs::metadata(&seg).unwrap().len();

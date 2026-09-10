@@ -1825,7 +1825,9 @@ mod tests {
     use super::*;
     use crate::persistence::checkpoint::CheckpointTrigger;
     use crate::persistence::wal_v3::record::{WalRecordType, read_wal_v3_record};
-    use crate::persistence::wal_v3::segment::{DEFAULT_SEGMENT_SIZE, WAL_V3_HEADER_SIZE};
+    use crate::persistence::wal_v3::segment::{
+        DEFAULT_SEGMENT_SIZE, WAL_V3_HEADER_SIZE, WalBounds,
+    };
 
     /// Count FullPageImage records in a raw WAL segment file.
     fn count_fpi_records(raw_data: &[u8]) -> usize {
@@ -1886,7 +1888,8 @@ mod tests {
         std::fs::write(&heap_path, vec![0u8; 8192]).unwrap();
 
         // Create WAL writer
-        let mut wal = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut wal =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
 
         // Create checkpoint manager and begin checkpoint with dirty_count=2
         let trigger = CheckpointTrigger::new(300, 256 * 1024 * 1024, 0.9);
@@ -1975,7 +1978,8 @@ mod tests {
         std::fs::write(&heap_path, vec![0u8; 8192]).unwrap();
 
         // Create WAL writer
-        let mut wal = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut wal =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
 
         // Create checkpoint manager and begin
         let trigger = CheckpointTrigger::new(300, 256 * 1024 * 1024, 0.9);
@@ -2406,9 +2410,8 @@ mod tests {
         std::fs::create_dir_all(&wal_dir).unwrap();
 
         // Condition 3: every sealed segment holds a sole-copy MQ record.
-        let mut wal = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        let mut wal = WalWriterV3::new(0, &wal_dir, 512, WalBounds::new(0, 1024)).unwrap();
         // Condition 1: ceiling far below the WAL we are about to write.
-        wal.set_wal_bounds(0, 1024);
         for i in 0..60 {
             wal.append(WalRecordType::MqCreate, b"mq-plane-payload-#870");
             if (i + 1) % 3 == 0 {

@@ -572,14 +572,16 @@ mod tests {
     #[test]
     fn test_transition_writes_file_create_wal_record() {
         use crate::persistence::wal_v3::record::{WalRecordType, read_wal_v3_record};
-        use crate::persistence::wal_v3::segment::{WAL_V3_HEADER_SIZE, WalSegment, WalWriterV3};
+        use crate::persistence::wal_v3::segment::{
+            WAL_V3_HEADER_SIZE, WalBounds, WalSegment, WalWriterV3,
+        };
 
         let tmp = tempfile::tempdir().unwrap();
         let shard_dir = tmp.path().join("shard-0");
         std::fs::create_dir_all(&shard_dir).unwrap();
 
         let wal_dir = shard_dir.join("wal_v3");
-        let mut wal = WalWriterV3::new(0, &wal_dir, 16 * 1024 * 1024).unwrap();
+        let mut wal = WalWriterV3::new(0, &wal_dir, 16 * 1024 * 1024, WalBounds::DEFAULT).unwrap();
 
         let manifest_path = shard_dir.join("shard-0.manifest");
         let mut manifest = ShardManifest::create(&manifest_path).unwrap();

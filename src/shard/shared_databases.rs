@@ -1893,11 +1893,11 @@ mod tests {
         inner_records: &[(crate::persistence::wal_v3::record::WalRecordType, Vec<u8>)],
     ) {
         use crate::persistence::wal_v3::record::{WalRecordType, write_wal_v3_record};
-        use crate::persistence::wal_v3::segment::WalWriterV3;
+        use crate::persistence::wal_v3::segment::{WalBounds, WalWriterV3};
 
         let wal_dir = dir.join(format!("shard-{}", shard_id)).join("wal-v3");
-        let mut writer =
-            WalWriterV3::new(shard_id, &wal_dir, 16 * 1024 * 1024).expect("create WalWriterV3");
+        let mut writer = WalWriterV3::new(shard_id, &wal_dir, 16 * 1024 * 1024, WalBounds::DEFAULT)
+            .expect("create WalWriterV3");
         for (rtype, payload) in inner_records {
             let mut inner_buf = Vec::new();
             write_wal_v3_record(&mut inner_buf, 0, *rtype, payload);
@@ -2449,11 +2449,11 @@ mod tests {
     #[cfg(feature = "graph")]
     fn write_temporal_wal_command(dir: &std::path::Path, shard_id: usize, command_payload: &[u8]) {
         use crate::persistence::wal_v3::record::WalRecordType;
-        use crate::persistence::wal_v3::segment::WalWriterV3;
+        use crate::persistence::wal_v3::segment::{WalBounds, WalWriterV3};
 
         let wal_dir = dir.join(format!("shard-{}", shard_id)).join("wal-v3");
-        let mut writer =
-            WalWriterV3::new(shard_id, &wal_dir, 16 * 1024 * 1024).expect("create WalWriterV3");
+        let mut writer = WalWriterV3::new(shard_id, &wal_dir, 16 * 1024 * 1024, WalBounds::DEFAULT)
+            .expect("create WalWriterV3");
         writer.append(WalRecordType::Command, command_payload);
         writer.flush_sync().expect("flush wal segment");
     }

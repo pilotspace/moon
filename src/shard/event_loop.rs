@@ -499,14 +499,30 @@ impl super::Shard {
                 .as_ref()
                 .map(|dir| std::path::Path::new(dir).join(format!("shard-{}", shard_id)))
         };
+        // moon#916: the ONE value every WAL-ceiling consumer reads — the
+        // writer (P6 overflow check), `CheckpointTrigger`, and autovacuum
+        // Pass C. The writer takes it as a constructor argument, so a future
+        // construction site cannot forget it the way the old setter was
+        // forgotten for the whole life of the codebase.
+        let wal_bounds = server_config.wal_bounds();
         let mut wal_writer: Option<WalWriterV3> = wal_shard_dir.and_then(|shard_dir| {
             let wal_dir = shard_dir.join("wal-v3");
-            match WalWriterV3::new(shard_id, &wal_dir, server_config.wal_segment_size_bytes()) {
+            match WalWriterV3::new(
+                shard_id,
+                &wal_dir,
+                server_config.wal_segment_size_bytes(),
+                wal_bounds,
+            ) {
                 Ok(w) => {
+                    // Logged from the writer, not the config: this line is
+                    // what `tests/wal_bounds_wired_916.rs` reads back, and it
+                    // must observe the object the P6 path consults.
                     info!(
-                        "Shard {}: WAL writer initialized (segment_size={})",
+                        "Shard {}: WAL writer initialized (segment_size={}, min_wal={}, max_wal={})",
                         shard_id,
-                        server_config.wal_segment_size_bytes()
+                        server_config.wal_segment_size_bytes(),
+                        w.min_wal_bytes(),
+                        w.max_wal_bytes()
                     );
                     Some(w)
                 }
@@ -645,14 +661,12 @@ impl super::Shard {
             if server_config.disk_offload_enabled() {
                 let trigger = crate::persistence::checkpoint::CheckpointTrigger::new(
                     server_config.checkpoint_timeout,
-                    server_config.max_wal_size_bytes(),
+                    wal_bounds.max_bytes,
                     server_config.checkpoint_completion,
                 );
                 info!(
                     "Shard {}: checkpoint manager initialized (timeout={}s, max_wal={})",
-                    shard_id,
-                    server_config.checkpoint_timeout,
-                    server_config.max_wal_size_bytes()
+                    shard_id, server_config.checkpoint_timeout, wal_bounds.max_bytes
                 );
                 Some(crate::persistence::checkpoint::CheckpointManager::new(
                     trigger,
@@ -1796,7 +1810,7 @@ impl super::Shard {
                             shard_manifest.as_mut(),
                             wal_writer.as_mut(),
                             control_file.as_ref(),
-                            server_config.max_wal_size_bytes(),
+                            wal_bounds.max_bytes,
                             server_config.disk_offload_enabled(),
                             server_config.manifest_tombstone_retain_epochs,
                             server_config.manifest_tombstone_retain_secs,
@@ -2605,7 +2619,7 @@ impl super::Shard {
                             shard_manifest.as_mut(),
                             wal_writer.as_mut(),
                             control_file.as_ref(),
-                            server_config.max_wal_size_bytes(),
+                            wal_bounds.max_bytes,
                             server_config.disk_offload_enabled(),
                             server_config.manifest_tombstone_retain_epochs,
                             server_config.manifest_tombstone_retain_secs,

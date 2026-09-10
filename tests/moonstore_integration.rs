@@ -15,7 +15,7 @@ use moon::persistence::page::{MOONPAGE_HEADER_SIZE, MoonPageHeader, PageType};
 use moon::persistence::wal_v3::record::{WalRecordType, write_wal_v3_record};
 use moon::persistence::wal_v3::replay::{replay_wal_v3_dir, replay_wal_v3_file};
 use moon::persistence::wal_v3::segment::{
-    DEFAULT_SEGMENT_SIZE, WAL_V3_HEADER_SIZE, WalSegment, WalWriterV3,
+    DEFAULT_SEGMENT_SIZE, WAL_V3_HEADER_SIZE, WalBounds, WalSegment, WalWriterV3,
 };
 use moon::storage::tiered::warm_tier::transition_to_warm;
 
@@ -44,7 +44,8 @@ fn test_wal_v3_write_and_recovery() {
 
     // Phase 1: Write 100 command records via WalWriterV3
     {
-        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
         for i in 1..=100u64 {
             let payload = format!("*3\r\n$3\r\nSET\r\n$6\r\nkey:{i:03}\r\n$9\r\nvalue:{i:03}\r\n");
             writer.append(WalRecordType::Command, payload.as_bytes());
@@ -344,7 +345,8 @@ fn test_fpi_torn_page_defense() {
     let tmp = tempfile::tempdir().unwrap();
     let wal_dir = tmp.path().join("wal");
 
-    let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+    let mut writer =
+        WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
 
     // Write 50 command records
     for i in 1..=50u64 {

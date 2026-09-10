@@ -265,6 +265,26 @@ fn main() -> anyhow::Result<()> {
     if let Err(msg) = config.validate_tuning_defaults() {
         return Err(anyhow::anyhow!(msg));
     }
+
+    // moon#916: now that `--max-wal-size` actually reaches the WAL writer, a
+    // ceiling the WAL can never get back under (below two segments) would be
+    // a frees-nothing P6 loop. Refuse it here — both normal boot and
+    // `--check-config` — and say so when a small ceiling lowered the floor.
+    match config.validate_wal_bounds() {
+        Err(msg) => return Err(anyhow::anyhow!(msg)),
+        Ok(bounds)
+            if bounds.min_bytes < moon::persistence::wal_v3::segment::DEFAULT_MIN_WAL_BYTES =>
+        {
+            tracing::warn!(
+                "--max-wal-size {} lowers the WAL recycle floor from the {} byte default \
+                 to {} bytes (max / 2)",
+                config.max_wal_size,
+                moon::persistence::wal_v3::segment::DEFAULT_MIN_WAL_BYTES,
+                bounds.min_bytes
+            );
+        }
+        Ok(_) => {}
+    }
     moon::vector::store::set_vector_create_defaults(moon::vector::store::VectorCreateDefaults {
         ef_runtime: config.vector_ef_runtime,
         rerank_mult: config.vector_rerank_mult,

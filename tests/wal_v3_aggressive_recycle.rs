@@ -7,7 +7,7 @@
 //! Test design: deterministic — no real sleeps. We drive the writer and
 //! recycler directly without a running server.
 
-use moon::persistence::wal_v3::{WalStats, WalWriterV3, record::WalRecordType};
+use moon::persistence::wal_v3::{WalBounds, WalStats, WalWriterV3, record::WalRecordType};
 use std::fs;
 
 // ---------------------------------------------------------------------------
@@ -36,11 +36,16 @@ fn test_aggressive_recycle_bypasses_min_floor() {
     let wal_dir = tmp.path().join("wal");
 
     // Tiny segments to force many rotations.
-    let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+    let mut writer = WalWriterV3::new(
+        0,
+        &wal_dir,
+        512,
+        WalBounds::new(10 * 1024 * 1024, 256 * 1024 * 1024),
+    )
+    .unwrap();
 
     // Set min_wal_bytes large enough to block normal recycling.
     // max_wal_bytes can be anything — aggressive recycle is called directly.
-    writer.set_wal_bounds(10 * 1024 * 1024, 256 * 1024 * 1024);
 
     // Write enough to create 5+ segments.
     for i in 0..60 {
@@ -84,8 +89,7 @@ fn test_wal_stats_accuracy() {
     let tmp = tempfile::tempdir().unwrap();
     let wal_dir = tmp.path().join("wal");
 
-    let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
-    writer.set_wal_bounds(0, u64::MAX);
+    let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::UNBOUNDED).unwrap();
 
     for i in 0..30 {
         writer.append(WalRecordType::Command, b"SET k v");
@@ -123,8 +127,7 @@ fn test_aggressive_recycle_stats_accounting() {
     let tmp = tempfile::tempdir().unwrap();
     let wal_dir = tmp.path().join("wal");
 
-    let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
-    writer.set_wal_bounds(0, u64::MAX);
+    let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::UNBOUNDED).unwrap();
 
     for i in 0..60 {
         writer.append(WalRecordType::Command, b"SET k v");
@@ -188,8 +191,7 @@ fn test_ceiling_trigger_reduces_wal_below_two_x_max() {
     // Use 512-byte segments and write 300 records (~40 bytes each = ~12KB
     // on disk after rotation). Set max_wal to 4KB so we clearly exceed it.
     let max_wal: u64 = 4 * 1024;
-    let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
-    writer.set_wal_bounds(0, max_wal);
+    let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::new(0, max_wal)).unwrap();
 
     // Write 300 records, flushing every 5 to force segment rotation.
     for i in 0..300 {
