@@ -3,10 +3,7 @@ use std::collections::HashMap;
 
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::storage::db::{
-    LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, listpack_batch_fits, zset_member_cost,
-    zset_table_bytes,
-};
+use crate::storage::db::{Shape, zset_member_cost, zset_table_bytes};
 use crate::storage::listpack::Listpack;
 use crate::storage::zset_score::{ScoreBuf, render_score};
 
@@ -59,7 +56,7 @@ fn parse_zadd_pair<'a>(
 /// materialised for the entries walked past. The owning `iter_pairs()` +
 /// `as_bytes()` shape allocated twice per pair walked — the exact lookup
 /// moon#801 removed from HSET — and must not come back here. Bounded by
-/// `LISTPACK_MAX_ENTRIES`, so this stays O(128) worst case.
+/// `zset-max-listpack-entries`, so this stays O(128) worst case.
 ///
 /// An unparseable stored score is in-memory corruption (every writer goes
 /// through `render_score`); it is read as 0.0 so the member is still FOUND
@@ -178,16 +175,21 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     // The first version of this branch was inserted ABOVE the pre-pass and
     // re-introduced moon#814 on the listpack path; `ledger_consistency_788`
     // now pins both the ledger and the all-or-nothing reply for it.
-    let has_large_member = remaining
+    // The entry gate, from the ONE authority (moon#896): the longest MEMBER
+    // in the batch against `zset-max-listpack-value`, the batch size against
+    // `zset-max-listpack-entries`. The same predicate bounds a batch far
+    // below the listpack header's u16 range (moon#865) — the upgrade check
+    // runs AFTER the loop below, too late to stop a batch already too big.
+    let limits = db.encoding_limits();
+    let max_member = remaining
         .chunks_exact(2)
-        .any(|pair| extract_bytes(&pair[1]).is_some_and(|m| m.len() > LISTPACK_MAX_ELEMENT_SIZE));
-    // moon#865: a batch large enough to wrap the listpack header's u16 element
-    // count must not enter the listpack path. The upgrade check runs AFTER the
-    // loop below, which cannot stop a wrap that happens inside it. A zset
-    // listpack stores TWO entries per member (member then score), so
-    // `remaining.len()` -- not the pair count -- is the entry count, and the
-    // wrap arrives at 32,768 members rather than 65,536.
-    if !has_large_member && listpack_batch_fits(remaining.len()) {
+        .map(|pair| extract_bytes(&pair[1]).map_or(0, |m| m.len()))
+        .max()
+        .unwrap_or(0);
+    // moon#896: `remaining.len()` is listpack ENTRIES (two per member), not
+    // members. Kept as-is in this commit so the refactor is behaviour-neutral;
+    // the unit fix is the next commit.
+    if limits.fits(Shape::SortedSet, remaining.len(), max_member) {
         match db.get_or_create_zset_listpack(key) {
             Ok(Some(lp)) => {
                 let mut added = 0i64;
@@ -251,9 +253,10 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                     }
                 }
                 let after = lp.estimate_memory();
-                // `lp.len()` counts member AND score entries, so the member
-                // count is half of it.
-                let should_upgrade = lp.len() / 2 > LISTPACK_MAX_ENTRIES;
+                // The upgrade check, from the same authority as the gate:
+                // it converts `lp.len()` (member AND score entries) to
+                // members itself.
+                let should_upgrade = !limits.listpack_fits(Shape::SortedSet, lp);
                 // `lp`'s borrow of `db` ends here — safe to call back into
                 // `db` for accounting from this point on.
                 db.adjust_memory(before, after);

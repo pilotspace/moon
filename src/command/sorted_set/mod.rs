@@ -1673,7 +1673,7 @@ mod tests {
     #[test]
     fn zadd_promotes_past_the_entry_threshold() {
         let mut db = Database::new();
-        for i in 0..crate::storage::db::LISTPACK_MAX_ENTRIES {
+        for i in 0..crate::storage::db::EncodingLimits::moon_defaults().zset_entries {
             let m = format!("m{i:04}");
             run_zadd(&mut db, &[b"z", b"1", m.as_bytes()]);
         }
@@ -1683,17 +1683,19 @@ mod tests {
         assert_eq!(
             encoding_of(&mut db, b"z"),
             "listpack",
-            "exactly LISTPACK_MAX_ENTRIES members must still be a listpack"
+            "exactly zset-max-listpack-entries members must still be a listpack"
         );
         run_zadd(&mut db, &[b"z", b"1", b"one-more"]);
         assert_eq!(
             encoding_of(&mut db, b"z"),
             "skiplist",
-            "past LISTPACK_MAX_ENTRIES the zset must promote to a skiplist"
+            "past zset-max-listpack-entries the zset must promote to a skiplist"
         );
         assert_eq!(
             run_zcard(&mut db, &[b"z"]),
-            Frame::Integer(crate::storage::db::LISTPACK_MAX_ENTRIES as i64 + 1),
+            Frame::Integer(
+                crate::storage::db::EncodingLimits::moon_defaults().zset_entries as i64 + 1
+            ),
             "the promotion must not lose a member"
         );
         assert_eq!(
@@ -1705,14 +1707,14 @@ mod tests {
     #[test]
     fn zadd_promotes_on_an_oversized_member() {
         let mut db = Database::new();
-        let at_limit = vec![b'y'; crate::storage::db::LISTPACK_MAX_ELEMENT_SIZE];
+        let at_limit = vec![b'y'; crate::storage::db::EncodingLimits::moon_defaults().zset_value];
         run_zadd(&mut db, &[b"z", b"1", b"small", b"2", &at_limit]);
         assert_eq!(
             encoding_of(&mut db, b"z"),
             "listpack",
-            "a member of exactly LISTPACK_MAX_ELEMENT_SIZE bytes fits a listpack"
+            "a member of exactly zset-max-listpack-value bytes fits a listpack"
         );
-        let big = vec![b'x'; crate::storage::db::LISTPACK_MAX_ELEMENT_SIZE + 1];
+        let big = vec![b'x'; crate::storage::db::EncodingLimits::moon_defaults().zset_value + 1];
         run_zadd(&mut db, &[b"z", b"3", &big]);
         assert_eq!(
             encoding_of(&mut db, b"z"),
@@ -1992,7 +1994,7 @@ mod tests {
         // A listpack that then grows past the threshold via ZADD promotes
         // with its non-integral score intact.
         run_zadd(&mut db, &[b"z2", b"2.5", b"b"]);
-        for i in 0..=crate::storage::db::LISTPACK_MAX_ENTRIES {
+        for i in 0..=crate::storage::db::EncodingLimits::moon_defaults().zset_entries {
             let m = format!("m{i:04}");
             run_zadd(&mut db, &[b"z2", b"1", m.as_bytes()]);
         }
@@ -2035,7 +2037,7 @@ mod zadd_listpack_batch_tests {
     /// member (member then score), so it wraps the header's u16 element count
     /// at 32,768 members -- half the list/set threshold. Before the batch
     /// guard, every pair was pushed and only then was the entry count compared
-    /// with LISTPACK_MAX_ENTRIES.
+    /// with zset-max-listpack-entries.
     #[test]
     fn zadd_one_call_past_u16_keeps_every_member() {
         let mut db = Database::new();

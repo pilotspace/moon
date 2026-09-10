@@ -930,7 +930,7 @@ mod tests {
     #[test]
     fn sadd_promotes_past_the_entry_threshold() {
         let mut db = Database::new();
-        for i in 0..crate::storage::db::LISTPACK_MAX_ENTRIES {
+        for i in 0..crate::storage::db::EncodingLimits::moon_defaults().set_entries {
             let m = format!("m{i:04}");
             sadd(&mut db, &[bs(b"s"), bs(m.as_bytes())]);
         }
@@ -940,18 +940,20 @@ mod tests {
         assert_eq!(
             encoding_of(&mut db, b"s"),
             "listpack",
-            "exactly LISTPACK_MAX_ENTRIES members must still be a listpack"
+            "exactly set-max-listpack-entries members must still be a listpack"
         );
         sadd(&mut db, &[bs(b"s"), bs(b"one-more")]);
         assert_eq!(
             encoding_of(&mut db, b"s"),
             "hashtable",
-            "past LISTPACK_MAX_ENTRIES the set must promote to a hashtable"
+            "past set-max-listpack-entries the set must promote to a hashtable"
         );
         // The promotion must not lose or duplicate a member.
         assert_eq!(
             scard_readonly(&db, &[bs(b"s")], 0),
-            Frame::Integer(crate::storage::db::LISTPACK_MAX_ENTRIES as i64 + 1)
+            Frame::Integer(
+                crate::storage::db::EncodingLimits::moon_defaults().set_entries as i64 + 1
+            )
         );
         assert_eq!(
             sismember_readonly(&db, &[bs(b"s"), bs(b"m0000")], 0),
@@ -966,7 +968,7 @@ mod tests {
     #[test]
     fn sadd_promotes_on_an_oversized_member() {
         let mut db = Database::new();
-        let at_limit = vec![b'y'; crate::storage::db::LISTPACK_MAX_ELEMENT_SIZE];
+        let at_limit = vec![b'y'; crate::storage::db::EncodingLimits::moon_defaults().set_value];
         sadd(&mut db, &[bs(b"s"), bs(b"small"), bs(&at_limit)]);
         // Exactly set-max-listpack-value bytes is still a listpack — the
         // pre-fix binary answers `hashtable` here, so this half cannot pass
@@ -974,9 +976,9 @@ mod tests {
         assert_eq!(
             encoding_of(&mut db, b"s"),
             "listpack",
-            "a member of exactly LISTPACK_MAX_ELEMENT_SIZE bytes fits a listpack"
+            "a member of exactly set-max-listpack-value bytes fits a listpack"
         );
-        let big = vec![b'x'; crate::storage::db::LISTPACK_MAX_ELEMENT_SIZE + 1];
+        let big = vec![b'x'; crate::storage::db::EncodingLimits::moon_defaults().set_value + 1];
         sadd(&mut db, &[bs(b"s"), bs(&big)]);
         assert_eq!(
             encoding_of(&mut db, b"s"),
@@ -1140,7 +1142,7 @@ mod sadd_listpack_batch_tests {
 
     /// moon#865, the set arm. Before the batch guard this branch pushed every
     /// member into the listpack and only then compared the entry count with
-    /// LISTPACK_MAX_ENTRIES, so a single large SADD wrapped the header's u16
+    /// set-max-listpack-entries, so a single large SADD wrapped the header's u16
     /// counter: `SADD` replied 70000 and `SCARD` replied 4464 (= 70000 -
     /// 65536), with the write already acknowledged.
     #[test]

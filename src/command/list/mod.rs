@@ -917,7 +917,7 @@ mod listpack_batch_overflow_tests {
 
     /// moon#865. The listpack header counts elements in a `u16`. Before the
     /// fix, one command's entries were all pushed before the entry count was
-    /// compared with LISTPACK_MAX_ENTRIES, so a batch past 65_536 wrapped the
+    /// compared with the entry threshold, so a batch past 65_536 wrapped the
     /// count and the container silently forgot everything before the wrap --
     /// while the server acknowledged the write.
     ///

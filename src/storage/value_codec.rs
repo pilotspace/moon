@@ -41,6 +41,7 @@ use ordered_float::OrderedFloat;
 use crate::persistence::kv_page::ValueType;
 use crate::storage::bptree::BPTree;
 use crate::storage::compact_value::RedisValueRef;
+use crate::storage::encoding_limits::{EncodingLimits, Shape};
 use crate::storage::entry::RedisValue;
 use crate::storage::stream::{
     Consumer, ConsumerGroup, PendingEntry, Stream as StreamData, StreamId,
@@ -364,21 +365,34 @@ fn validate_count(
 /// the bytes on disk changes, so old files stay readable by new builds and new
 /// files stay readable by old ones.
 ///
-/// Thresholds are the ones the command layer already enforces, so a value
-/// reloaded from disk lands in exactly the encoding it would have had if the
-/// same commands had been replayed live.
+/// Thresholds come from the ONE authority the command layer consults
+/// (`EncodingLimits`, moon#896), so a value reloaded from disk lands in
+/// exactly the encoding it would have had if the same commands had been
+/// replayed live. This entry point applies moon's defaults; a caller holding
+/// a shard's configured snapshot passes it to [`compact_after_decode_with`].
 pub(crate) fn compact_after_decode(v: RedisValue) -> RedisValue {
-    use crate::storage::db::{INTSET_MAX_ENTRIES, LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
+    compact_after_decode_with(v, EncodingLimits::moon_defaults())
+}
 
-    let fits = |b: &[u8]| b.len() <= LISTPACK_MAX_ELEMENT_SIZE;
+/// [`compact_after_decode`] against an explicit threshold snapshot.
+pub(crate) fn compact_after_decode_with(v: RedisValue, limits: EncodingLimits) -> RedisValue {
+    /// The longest element among `lens`, 0 for an empty container.
+    fn longest(lens: impl Iterator<Item = usize>) -> usize {
+        lens.max().unwrap_or(0)
+    }
 
     match v {
         // ── hash ──────────────────────────────────────────────────────────
         // `HashWithTtl` is deliberately NOT compacted: a listpack carries no
         // TTL sidecar, so a TTL'd hash has no compact form to return to.
+        // Both the field and the value are measured, as the live HSET gate
+        // does.
         RedisValue::Hash(map)
-            if map.len() <= LISTPACK_MAX_ENTRIES
-                && map.iter().all(|(f, val)| fits(f) && fits(val)) =>
+            if limits.fits(
+                Shape::Hash,
+                map.len(),
+                longest(map.iter().flat_map(|(f, val)| [f.len(), val.len()])),
+            ) =>
         {
             let mut lp = crate::storage::listpack::Listpack::new();
             for (f, val) in map.iter() {
@@ -394,7 +408,11 @@ pub(crate) fn compact_after_decode(v: RedisValue) -> RedisValue {
         // the resulting listpack order is likewise unspecified (as it already
         // is for those types today).
         RedisValue::List(list)
-            if list.len() <= LISTPACK_MAX_ENTRIES && list.iter().all(|e| fits(e)) =>
+            if limits.fits(
+                Shape::List,
+                list.len(),
+                longest(list.iter().map(|e| e.len())),
+            ) =>
         {
             let mut lp = crate::storage::listpack::Listpack::new();
             for e in &list {
@@ -407,7 +425,7 @@ pub(crate) fn compact_after_decode(v: RedisValue) -> RedisValue {
         // Integers first, matching the command layer's precedence: an
         // all-integer set is an intset regardless of how few members it has.
         RedisValue::Set(set) => {
-            let all_ints: Option<Vec<i64>> = if set.len() <= INTSET_MAX_ENTRIES {
+            let all_ints: Option<Vec<i64>> = if limits.intset_fits(set.len()) {
                 set.iter()
                     .map(|m| std::str::from_utf8(m).ok()?.parse::<i64>().ok())
                     .collect()
@@ -421,7 +439,7 @@ pub(crate) fn compact_after_decode(v: RedisValue) -> RedisValue {
                 }
                 return RedisValue::SetIntset(is);
             }
-            if set.len() <= LISTPACK_MAX_ENTRIES && set.iter().all(|m| fits(m)) {
+            if limits.fits(Shape::Set, set.len(), longest(set.iter().map(|m| m.len()))) {
                 let mut lp = crate::storage::listpack::Listpack::new();
                 for m in set.iter() {
                     lp.push_back(m);
@@ -442,7 +460,11 @@ pub(crate) fn compact_after_decode(v: RedisValue) -> RedisValue {
         // path. Score order, from the tree: the layout Redis's own listpack
         // keeps, and one a reader can rely on nothing about (reads sort).
         RedisValue::SortedSetBPTree { members, tree }
-            if members.len() <= LISTPACK_MAX_ENTRIES && members.keys().all(|m| fits(m)) =>
+            if limits.fits(
+                Shape::SortedSet,
+                members.len(),
+                longest(members.keys().map(|m| m.len())),
+            ) =>
         {
             let mut lp = crate::storage::listpack::Listpack::new();
             let mut rendered = crate::storage::zset_score::ScoreBuf::new();
@@ -1137,7 +1159,7 @@ mod tests {
     #[test]
     fn hash_past_the_entry_threshold_stays_a_hashtable() {
         let mut map = std::collections::HashMap::new();
-        for i in 0..=crate::storage::db::LISTPACK_MAX_ENTRIES {
+        for i in 0..=crate::storage::db::EncodingLimits::moon_defaults().hash_entries {
             map.insert(Bytes::from(format!("f{i:04}")), Bytes::from_static(b"v"));
         }
         assert_eq!(
@@ -1150,7 +1172,9 @@ mod tests {
     fn hash_with_an_oversized_element_stays_a_hashtable() {
         let big = Bytes::from(vec![
             b'x';
-            crate::storage::db::LISTPACK_MAX_ELEMENT_SIZE + 1
+            crate::storage::db::EncodingLimits::moon_defaults()
+                .hash_value
+                + 1
         ]);
         let mut map = std::collections::HashMap::new();
         map.insert(Bytes::from_static(b"f"), big);
@@ -1163,7 +1187,7 @@ mod tests {
     #[test]
     fn list_past_the_entry_threshold_stays_a_linkedlist() {
         let list: std::collections::VecDeque<Bytes> = (0
-            ..=crate::storage::db::LISTPACK_MAX_ENTRIES)
+            ..=crate::storage::db::EncodingLimits::moon_defaults().list_entries)
             .map(|i| Bytes::from(format!("e{i:04}")))
             .collect();
         assert_eq!(
@@ -1227,7 +1251,7 @@ mod tests {
     fn zset_past_the_entry_threshold_stays_a_skiplist() {
         let mut members = HashMap::new();
         let mut tree = BPTree::new();
-        for i in 0..=crate::storage::db::LISTPACK_MAX_ENTRIES {
+        for i in 0..=crate::storage::db::EncodingLimits::moon_defaults().zset_entries {
             let m = Bytes::from(format!("m{i:04}"));
             members.insert(m.clone(), i as f64);
             tree.insert(OrderedFloat(i as f64), m);
@@ -1245,7 +1269,9 @@ mod tests {
         let mut tree = BPTree::new();
         let big = Bytes::from(vec![
             b'x';
-            crate::storage::db::LISTPACK_MAX_ELEMENT_SIZE + 1
+            crate::storage::db::EncodingLimits::moon_defaults()
+                .zset_value
+                + 1
         ]);
         members.insert(big.clone(), 1.0);
         tree.insert(OrderedFloat(1.0), big);
@@ -1262,7 +1288,7 @@ mod tests {
         set.insert(Bytes::from_static(b"small"));
         set.insert(Bytes::from(vec![
             b'x';
-            crate::storage::db::LISTPACK_MAX_ELEMENT_SIZE
+            crate::storage::db::EncodingLimits::moon_defaults().set_value
                 + 1
         ]));
         assert_eq!(

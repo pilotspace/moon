@@ -295,7 +295,7 @@ impl<'a> SetRef<'a> {
     ///   - `Hash`/`Owned`: O(1). This is why the set is an `IndexSet`.
     ///   - `Intset`: O(1) -- a sorted `Vec<i64>` indexes directly.
     ///   - `Listpack`: O(idx), but a listpack set is capped at
-    ///     `LISTPACK_MAX_ENTRIES` (128) members, so the walk is bounded.
+    ///     `set-max-listpack-entries` (128) members, so the walk is bounded.
     ///
     /// Returns `None` when `idx >= len()`.
     pub fn nth(&self, idx: usize) -> Option<Bytes> {

@@ -96,6 +96,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`storage`: the compact-encoding thresholds have ONE authority
+  (moon#896).** Three sites decided whether a container stays in its
+  listpack/intset form — a write command's entry gate, its post-push
+  upgrade check, and the restart-side re-derivation in
+  `compact_after_decode` — each with its own copy of the arithmetic, and two
+  of them disagreed about the UNIT: the entry gate compared `args.len() - 1`
+  (listpack ENTRIES, two per hash field or zset member) against the same
+  `128` the upgrade check applied to `lp.len() / 2` (ITEMS). All three now
+  consult `storage::encoding_limits::EncodingLimits`, a `Copy` snapshot on
+  `Database`, through a predicate that takes a `Shape` rather than a raw
+  count, so the entries-per-item factor lives in one place and a caller
+  cannot pass the wrong unit. The POLICY thresholds (`*-max-listpack-*`,
+  `set-max-intset-entries`) and the SAFETY ceiling
+  (`LISTPACK_SAFE_BATCH_ENTRIES`, which keeps a batch far below the listpack
+  header's `u16` range and closes `SADD`'s O(n^2) scan window, moon#865) are
+  now distinct named things; the raw constants are private to the module and
+  `scripts/audit-encoding-limits.sh` keeps a hand-rolled threshold or unit
+  conversion out of every consultation site. The authority carries moon's
+  CURRENT values, and the refactor is proven behaviour-neutral: the
+  encoding matrix (`src/command/encoding_matrix.golden` — every type at
+  every size around the thresholds, built bulk, incrementally and via the
+  restart path) is byte-identical to the one captured on the pre-authority
+  tree, wrong cells included.
+
 - **`text`: the `TMX3` TAG/NUMERIC sidecar block is now proven compatible
   in both directions, and the format no longer depends on the build's
   feature set (#880).** The block itself landed with #879; this finishes

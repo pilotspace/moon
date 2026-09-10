@@ -3,9 +3,7 @@ use bytes::Bytes;
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::storage::db::{
-    LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, list_elem_cost, listpack_batch_fits,
-};
+use crate::storage::db::{Shape, list_elem_cost};
 
 use super::{parse_i64, resolve_index};
 use crate::command::helpers::{all_args_are_bytes, err_wrong_args, extract_bytes};
@@ -34,16 +32,18 @@ pub fn lpush(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("LPUSH");
     }
 
-    let has_large_element = args[1..].iter().any(|a| {
-        extract_bytes(a)
-            .map(|b| b.len() > LISTPACK_MAX_ELEMENT_SIZE)
-            .unwrap_or(false)
-    });
-
-    // moon#865: refuse the listpack path for a batch large enough to wrap the
-    // header's u16 element count. The upgrade check below runs after the push
-    // loop, which cannot stop a wrap that happens inside it.
-    if !has_large_element && listpack_batch_fits(args.len() - 1) {
+    // The entry gate, from the ONE authority (moon#896): the longest element
+    // in the batch against the element threshold, the batch size against the
+    // list entry threshold. The same predicate bounds a batch far below the
+    // listpack header's u16 range (moon#865) — the upgrade check below runs
+    // after the push loop, too late to stop a batch already too big.
+    let limits = db.encoding_limits();
+    let max_elem = args[1..]
+        .iter()
+        .map(|a| extract_bytes(a).map_or(0, |b| b.len()))
+        .max()
+        .unwrap_or(0);
+    if limits.fits(Shape::List, args.len() - 1, max_elem) {
         match db.get_or_create_list_listpack(key) {
             Ok(Some(lp)) => {
                 // Listpack `estimate_memory()` is O(1) (capacity-based).
@@ -57,7 +57,8 @@ pub fn lpush(db: &mut Database, args: &[Frame]) -> Frame {
                 }
                 let len = lp.len();
                 let after = lp.estimate_memory();
-                let should_upgrade = len > LISTPACK_MAX_ENTRIES;
+                // The upgrade check, from the same authority as the gate.
+                let should_upgrade = !limits.listpack_fits(Shape::List, lp);
                 // `lp`'s borrow of `db` ends here.
                 if after >= before {
                     db.charge_memory(after - before);
@@ -121,16 +122,18 @@ pub fn rpush(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("RPUSH");
     }
 
-    let has_large_element = args[1..].iter().any(|a| {
-        extract_bytes(a)
-            .map(|b| b.len() > LISTPACK_MAX_ELEMENT_SIZE)
-            .unwrap_or(false)
-    });
-
-    // moon#865: refuse the listpack path for a batch large enough to wrap the
-    // header's u16 element count. The upgrade check below runs after the push
-    // loop, which cannot stop a wrap that happens inside it.
-    if !has_large_element && listpack_batch_fits(args.len() - 1) {
+    // The entry gate, from the ONE authority (moon#896): the longest element
+    // in the batch against the element threshold, the batch size against the
+    // list entry threshold. The same predicate bounds a batch far below the
+    // listpack header's u16 range (moon#865) — the upgrade check below runs
+    // after the push loop, too late to stop a batch already too big.
+    let limits = db.encoding_limits();
+    let max_elem = args[1..]
+        .iter()
+        .map(|a| extract_bytes(a).map_or(0, |b| b.len()))
+        .max()
+        .unwrap_or(0);
+    if limits.fits(Shape::List, args.len() - 1, max_elem) {
         match db.get_or_create_list_listpack(key) {
             Ok(Some(lp)) => {
                 let before = lp.estimate_memory();
@@ -143,7 +146,8 @@ pub fn rpush(db: &mut Database, args: &[Frame]) -> Frame {
                 }
                 let len = lp.len();
                 let after = lp.estimate_memory();
-                let should_upgrade = len > LISTPACK_MAX_ENTRIES;
+                // The upgrade check, from the same authority as the gate.
+                let should_upgrade = !limits.listpack_fits(Shape::List, lp);
                 // `lp`'s borrow of `db` ends here.
                 if after >= before {
                     db.charge_memory(after - before);

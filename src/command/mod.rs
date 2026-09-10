@@ -5,6 +5,8 @@ pub mod config;
 pub mod connection;
 pub mod debug_digest;
 pub mod dump_restore;
+#[cfg(test)]
+mod encoding_matrix;
 pub mod functions;
 pub mod geo;
 #[cfg(feature = "graph")]
@@ -2163,7 +2165,7 @@ mod tests {
         // Past set-max-listpack-entries the set promotes to a hashtable —
         // this is what keeps the `hashtable` encoding covered now that small
         // sets are listpacks.
-        for i in 0..=crate::storage::db::LISTPACK_MAX_ENTRIES {
+        for i in 0..=crate::storage::db::EncodingLimits::moon_defaults().set_entries {
             let m = format!("m{i:04}");
             let args = make_args(&[b"myset", m.as_bytes()]);
             dispatch(&mut db, b"SADD", &args, &mut selected, 16);
@@ -2278,7 +2280,7 @@ mod tests {
         // Past zset-max-listpack-entries the zset promotes to a skiplist —
         // this is what keeps the `skiplist` encoding covered now that small
         // sorted sets are listpacks.
-        for i in 0..=crate::storage::db::LISTPACK_MAX_ENTRIES {
+        for i in 0..=crate::storage::db::EncodingLimits::moon_defaults().zset_entries {
             let m = format!("m{i:04}");
             let args = make_args(&[b"myzset", b"1", m.as_bytes()]);
             dispatch(&mut db, b"ZADD", &args, &mut selected, 16);

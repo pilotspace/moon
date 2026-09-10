@@ -470,9 +470,10 @@ impl Listpack {
         // before the wrap became unreachable, and the server had already
         // acknowledged the write (moon#865). No caller has any business coming
         // near the ceiling -- a listpack upgrades to a full container at
-        // LISTPACK_MAX_ENTRIES (128) -- so saturating here is a backstop, not
-        // a policy. The command layer bounds the batch BEFORE the loop
-        // (`listpack_batch_fits`); this exists so a future caller that forgets
+        // the policy threshold (`EncodingLimits`, 128 today) -- so saturating
+        // here is a backstop, not a policy. The command layer bounds the batch
+        // BEFORE the loop (`EncodingLimits::fits`, clamped by
+        // `LISTPACK_SAFE_BATCH_ENTRIES`); this exists so a caller that forgets
         // corrupts nothing worse than its own count, and so the debug build
         // says which caller it was.
         let count = u16::from_le_bytes([self.data[4], self.data[5]]);

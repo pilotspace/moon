@@ -1943,7 +1943,7 @@ mod tests {
     #[test]
     fn test_estimated_memory_listpack_growth_and_upgrade() {
         let mut db = Database::new();
-        // Small values stay on the listpack fast path (< LISTPACK_MAX_ELEMENT_SIZE).
+        // Small values stay on the listpack fast path (< hash-max-listpack-value).
         let value = vec![b'v'; 8];
         hset(&mut db, &make_args(&[b"h", b"f0", &value]));
         let one = db.estimated_memory();

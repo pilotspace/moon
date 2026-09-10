@@ -12,40 +12,7 @@ use super::compact_key::CompactKey;
 use super::dashtable::DashTable;
 use super::entry::{CachedClock, Entry, RedisValue, current_secs, current_time_ms};
 
-/// Maximum number of entries in a listpack before upgrading to full encoding.
-pub const LISTPACK_MAX_ENTRIES: usize = 128;
-
-/// Whether one command's worth of new entries may go through the listpack path.
-///
-/// The listpack header counts its elements in a `u16` and `push_back` advances
-/// that count with `wrapping_add`, so a batch large enough to cross 65_536
-/// wraps the count to a small number and the container silently forgets
-/// everything before the wrap (moon#865). The upgrade check in every command
-/// that writes a listpack runs AFTER the push loop, which is far too late to
-/// stop it.
-///
-/// A batch this large is going to be upgraded out of the listpack encoding on
-/// the very next line anyway, so refusing the listpack path up front costs
-/// nothing and caps the count at `LISTPACK_MAX_ENTRIES` already present plus
-/// `LISTPACK_MAX_ENTRIES` new -- three orders of magnitude below the wrap. It
-/// also closes the quadratic window: `SADD`'s membership check is a linear
-/// in-place scan, so an unbounded batch is O(n^2) inside a single command on a
-/// single shard thread.
-///
-/// `new_entries` is counted in LISTPACK entries, not logical items: a hash
-/// stores two entries per field, so `HSET` passes `pairs * 2`.
-#[inline]
-pub fn listpack_batch_fits(new_entries: usize) -> bool {
-    new_entries <= LISTPACK_MAX_ENTRIES
-}
-/// Maximum element size in bytes before upgrading a listpack to full encoding.
-pub const LISTPACK_MAX_ELEMENT_SIZE: usize = 64;
-/// Maximum number of entries in an intset before upgrading to full encoding.
-///
-/// The single definition: the `SADD` path and the RDB decode-side
-/// re-derivation (`value_codec::compact_after_decode`) both read it, so a
-/// value reloaded from disk lands in the encoding a live `SADD` would give it.
-pub const INTSET_MAX_ENTRIES: usize = 512;
+pub use crate::storage::encoding_limits::{EncodingLimits, Shape};
 
 /// Estimate per-entry overhead: key length + value memory + struct overhead.
 fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
@@ -342,6 +309,11 @@ fn promote_to_hash_with_ttl(rv: &mut RedisValue) -> isize {
 pub struct Database {
     data: DashTable<CompactKey, Entry>,
     used_memory: usize,
+    /// The compact-encoding thresholds this shard applies — the ONE authority
+    /// every entry gate, upgrade check and decode-side re-derivation consults
+    /// (moon#896). A per-shard snapshot: `Copy`, read by value, never borrowed
+    /// across a mutation.
+    encoding_limits: EncodingLimits,
     /// Cached current time in epoch seconds; set once per batch to avoid
     /// repeated `SystemTime::now()` syscalls on every command.
     cached_now: u32,
@@ -542,6 +514,7 @@ impl Database {
         Database {
             data: DashTable::new(),
             used_memory: 0,
+            encoding_limits: EncodingLimits::moon_defaults(),
             cached_now: current_secs(),
             cached_now_ms: current_time_ms(),
             base_timestamp: current_secs(),
@@ -573,6 +546,7 @@ impl Database {
         Database {
             data,
             used_memory: 0,
+            encoding_limits: EncodingLimits::moon_defaults(),
             cached_now: current_secs(),
             cached_now_ms: current_time_ms(),
             base_timestamp: current_secs(),
@@ -1081,6 +1055,24 @@ impl Database {
     #[inline]
     pub fn resident_bytes(&self) -> usize {
         self.used_memory.saturating_add(self.spill_inflight_bytes)
+    }
+
+    /// The compact-encoding thresholds this shard applies.
+    ///
+    /// The ONE authority (moon#896): a write command's entry gate, its
+    /// post-push upgrade check and the restart-side re-derivation all take
+    /// their verdict from this snapshot's predicates — never from a constant.
+    #[inline]
+    #[must_use]
+    pub fn encoding_limits(&self) -> EncodingLimits {
+        self.encoding_limits
+    }
+
+    /// Replace the shard's thresholds. Applies to writes from this point on;
+    /// an existing container is not re-encoded.
+    #[inline]
+    pub fn set_encoding_limits(&mut self, limits: EncodingLimits) {
+        self.encoding_limits = limits;
     }
 
     /// Charge `delta` bytes of container growth to this database's memory
@@ -2920,7 +2912,7 @@ mod ledger_consistency_788 {
 
     /// moon#787 (`SADD` listpack path): every step of a small string set's
     /// life — creation as a listpack, a duplicate that changes nothing, the
-    /// growth past `LISTPACK_MAX_ENTRIES` that promotes it to an `IndexSet`,
+    /// growth past `set-max-listpack-entries` that promotes it to an `IndexSet`,
     /// and its deletion — must leave the running ledger equal to a recompute.
     /// The promotion is the step that matters: the `IndexSet` cost is
     /// `set_table_bytes` (real capacity) plus per-member bytes (moon#788/
@@ -2929,20 +2921,20 @@ mod ledger_consistency_788 {
     #[test]
     fn sadd_listpack_path_keeps_the_ledger_exact_through_promotion() {
         use crate::command::set::sadd;
-        use crate::storage::db::LISTPACK_MAX_ENTRIES;
+        let max_items = crate::storage::db::EncodingLimits::moon_defaults().set_entries;
         let mut db = Database::new();
         let floor = db.estimated_memory();
         sadd(&mut db, &[f(b"s"), f(b"a"), f(b"b"), f(b"c")]);
         assert_ledger_exact(&mut db, "after SADD creating a listpack set");
         sadd(&mut db, &[f(b"s"), f(b"a")]);
         assert_ledger_exact(&mut db, "after a duplicate SADD on the listpack");
-        for i in 0..=LISTPACK_MAX_ENTRIES {
+        for i in 0..=max_items {
             let m = format!("m{i:04}");
             sadd(&mut db, &[f(b"s"), f(m.as_bytes())]);
         }
         assert_ledger_exact(
             &mut db,
-            "after growing past LISTPACK_MAX_ENTRIES (promotion)",
+            "after growing past set-max-listpack-entries (promotion)",
         );
         crate::command::key::del(&mut db, &[f(b"s")]);
         assert_ledger_exact(&mut db, "after DEL of the promoted set");
@@ -3010,7 +3002,7 @@ mod ledger_consistency_788 {
     }
 
     /// moon#787 (`ZADD` listpack path): create as a listpack, update a score
-    /// in place, grow past `LISTPACK_MAX_ENTRIES` into the B+tree form, and
+    /// in place, grow past `zset-max-listpack-entries` into the B+tree form, and
     /// delete — every step must leave the running ledger equal to a
     /// recompute. The promotion is the step that matters: the B+tree cost is
     /// `zset_table_bytes` (arena + members table from real capacity) plus
@@ -3019,7 +3011,7 @@ mod ledger_consistency_788 {
     #[test]
     fn zadd_listpack_path_keeps_the_ledger_exact_through_promotion() {
         use crate::command::sorted_set::zadd;
-        use crate::storage::db::LISTPACK_MAX_ENTRIES;
+        let max_items = crate::storage::db::EncodingLimits::moon_defaults().zset_entries;
         let mut db = Database::new();
         let floor = db.estimated_memory();
         zadd(&mut db, &[f(b"z"), f(b"1"), f(b"a"), f(b"2.5"), f(b"b")]);
@@ -3031,13 +3023,13 @@ mod ledger_consistency_788 {
             &mut db,
             "after an in-place score update (shorter rendering)",
         );
-        for i in 0..=LISTPACK_MAX_ENTRIES {
+        for i in 0..=max_items {
             let m = format!("m{i:04}");
             zadd(&mut db, &[f(b"z"), f(b"1"), f(m.as_bytes())]);
         }
         assert_ledger_exact(
             &mut db,
-            "after growing past LISTPACK_MAX_ENTRIES (promotion)",
+            "after growing past zset-max-listpack-entries (promotion)",
         );
         crate::command::key::del(&mut db, &[f(b"z")]);
         assert_ledger_exact(&mut db, "after DEL of the promoted zset");
@@ -3202,7 +3194,7 @@ mod ledger_consistency_788 {
     #[test]
     fn hash_and_list_mutations_keep_the_ledger_exact() {
         let mut db = Database::new();
-        // Past LISTPACK_MAX_ENTRIES so both the compact and the full encoding
+        // Past the listpack entry threshold so both the compact and the full encoding
         // are exercised, including the one-time upgrade swing.
         for i in 0..300u32 {
             let fd = format!("f:{i:08}");
