@@ -16,48 +16,74 @@ use super::{
 };
 
 // ---------------------------------------------------------------------------
-// Mutable-path read commands (take &mut Database for historical reasons)
+// Mutable-path read commands (take &mut Database because `command::dispatch`
+// hands every handler a `&mut Database` — NOT because they mutate)
+//
+// moon#928 — the mutable dispatch path reads through the SHARED one
+//
+// Every handler in this section is a pure read, and every one used to reach
+// the zset through `Database::get_sorted_set`, whose `get_promoted` core
+// calls `SortedSetKind::upgrade` unconditionally. The return type is the
+// forcing function: `(&HashMap<Bytes, f64>, &BPTree)` is the FULL B+tree
+// form, which a `SortedSetListpack` cannot satisfy, so satisfying it means
+// converting — and the conversion is one-way, because nothing in the tree
+// ever downgrades (moon#832). A single `ZCARD` taken on the mutable path
+// (inside MULTI/EXEC, inside a Lua script, or from `try_inline_dispatch`)
+// therefore flattened a `listpack` zset to a `skiplist` for the rest of its
+// life, and whether that happened depended on which of moon's three dispatch
+// paths the command took rather than on what the command did.
+//
+// moon#853 fixed exactly this for the set and list families and predicted
+// this one in writing: "the moment #793 makes `SortedSetListpack` reachable,
+// every `get_sorted_set` read caller becomes the same defect". moon#878 made
+// it reachable.
+//
+// Measured on the pre-fix binary at ab91a23e (`--shards 1`, macOS host,
+// `used_memory` ledger — accounting, not throughput): 1000 eight-member
+// zsets went 293,055 -> 4,749,055 bytes (16.21x) after ONE `ZCARD` each
+// through MULTI/EXEC, `OBJECT ENCODING` going `listpack -> skiplist`. All
+// seventeen reads below flattened; the same reads on a bare connection (the
+// `dispatch_read` path) kept `listpack`, which is the negative control
+// proving the probe measures the dispatch path and not `OBJECT ENCODING`.
+// That put a ceiling on moon#878's +38.0% ZADD win: a write-only benchmark
+// measured an encoding the first read destroyed.
+//
+// The fix is to take the read through `&Database`, via the `SortedSetRef`
+// view that already backs `dispatch_read`. That view is the right shape for
+// a reason the type system enforces rather than documents: it classifies all
+// four forms (`BPTree`, `Listpack`, `Legacy`, and the `Owned` decode of a
+// cold-tier hit) instead of demanding one, and a SHARED borrow cannot reach
+// `K::upgrade` at all. It also collapses the two implementations of every
+// one of these commands into one, which removes the divergence class #610
+// came from — the answer no longer depends on the dispatch path.
+//
+// What is deliberately NOT preserved: the mutable path used to reclaim an
+// expired key and to promote a cold-tier hit back into hot RAM as a side
+// effect of the read. Neither is a correctness property —
+// `get_sorted_set_ref_if_alive` still treats an expired key as absent and
+// still reads the cold tier through, answering from `SortedSetRef::Owned`
+// (pinned by `tests/zset_read_cold_tier_928.rs`, which compares every read
+// against a hot zset holding the same members) — and the hash, list and set
+// families have shipped this exact trade since moon#853. Active expiry and
+// every write path still reclaim and still promote.
 // ---------------------------------------------------------------------------
 
-/// ZSCORE key member
+/// ZSCORE key member — the score of one member.
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block above).
 pub fn zscore(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() != 2 {
-        return err_wrong_args("ZSCORE");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZSCORE"),
-    };
-    let member = match extract_bytes(&args[1]) {
-        Some(b) => b,
-        None => return err_wrong_args("ZSCORE"),
-    };
-
-    match db.get_sorted_set(key) {
-        Ok(Some((members, _scores))) => match members.get(member) {
-            Some(score) => Frame::BulkString(Bytes::from(format_score(*score))),
-            None => Frame::Null,
-        },
-        Ok(None) => Frame::Null,
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    zscore_readonly(db, args, now_ms)
 }
 
-/// ZCARD key
+/// ZCARD key — cardinality of a sorted set.
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block above).
 pub fn zcard(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() != 1 {
-        return err_wrong_args("ZCARD");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZCARD"),
-    };
-
-    match db.get_sorted_set(key) {
-        Ok(Some((members, _scores))) => Frame::Integer(members.len() as i64),
-        Ok(None) => Frame::Integer(0),
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    zcard_readonly(db, args, now_ms)
 }
 
 /// Parse the optional `WITHSCORE` of `ZRANK`/`ZREVRANK` (Redis 7.2).
@@ -113,527 +139,96 @@ fn rank_hit(rank: usize, score: f64, withscore: bool) -> Frame {
     }
 }
 
-/// ZRANK key member [WITHSCORE]
+/// ZRANK key member [WITHSCORE] — score-ascending position of a member.
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block above).
 pub fn zrank(db: &mut Database, args: &[Frame]) -> Frame {
-    let withscore = match parse_withscore("ZRANK", args) {
-        Ok(w) => w,
-        Err(e) => return e,
-    };
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZRANK"),
-    };
-    let member = match extract_bytes(&args[1]) {
-        Some(b) => b,
-        None => return err_wrong_args("ZRANK"),
-    };
-
-    match db.get_sorted_set(key) {
-        Ok(Some((members, scores))) => match members.get(member) {
-            Some(score) => match scores.rank(OrderedFloat(*score), member) {
-                Some(rank) => rank_hit(rank, *score, withscore),
-                None => rank_miss(withscore),
-            },
-            None => rank_miss(withscore),
-        },
-        Ok(None) => rank_miss(withscore),
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    zrank_readonly(db, args, now_ms)
 }
 
-/// ZREVRANK key member [WITHSCORE]
+/// ZREVRANK key member [WITHSCORE] — score-descending position of a member.
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block above).
 pub fn zrevrank(db: &mut Database, args: &[Frame]) -> Frame {
-    let withscore = match parse_withscore("ZREVRANK", args) {
-        Ok(w) => w,
-        Err(e) => return e,
-    };
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZREVRANK"),
-    };
-    let member = match extract_bytes(&args[1]) {
-        Some(b) => b,
-        None => return err_wrong_args("ZREVRANK"),
-    };
-
-    match db.get_sorted_set(key) {
-        Ok(Some((members, scores))) => match members.get(member) {
-            Some(score) => match scores.rev_rank(OrderedFloat(*score), member) {
-                Some(rev_rank) => rank_hit(rev_rank, *score, withscore),
-                None => rank_miss(withscore),
-            },
-            None => rank_miss(withscore),
-        },
-        Ok(None) => rank_miss(withscore),
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    zrevrank_readonly(db, args, now_ms)
 }
 
-/// ZSCAN key cursor [MATCH pattern] [COUNT count]
+/// ZSCAN key cursor [MATCH pattern] [COUNT count] — incremental scan.
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block at the top of the
+/// mutable-path section).
 pub fn zscan(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() < 2 {
-        return err_wrong_args("ZSCAN");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZSCAN"),
-    };
-    let cursor_bytes = match extract_bytes(&args[1]) {
-        Some(b) => b,
-        None => return err_wrong_args("ZSCAN"),
-    };
-    let cursor: usize = match std::str::from_utf8(cursor_bytes)
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(c) => c,
-        None => return err("ERR invalid cursor"),
-    };
-
-    // Parse optional MATCH and COUNT
-    // One parser for the whole family — see `command::scan_options`. ZSCAN's
-    // own copy was the strictest of the eight (it alone refused a non-numeric
-    // COUNT) and still answered `wrong number of arguments` where Redis
-    // answers `syntax error` for a dangling MATCH.
-    let opts = match crate::command::scan_options::parse_scan_options(
-        crate::command::scan_options::ScanKind::SortedSet,
-        &args[2..],
-    ) {
-        Ok(o) => o,
-        Err(e) => return e,
-    };
-    let pattern = opts.pattern;
-    let scan_count = opts.count;
-
-    match db.get_sorted_set(key) {
-        Ok(Some((members, _scores))) => {
-            // Collect all members sorted for deterministic cursor
-            let mut all_members: Vec<(&Bytes, &f64)> = members.iter().collect();
-            all_members.sort_by(|a, b| a.0.cmp(b.0));
-
-            let mut result_items = Vec::new();
-            let mut pos = cursor;
-            let mut returned = 0;
-
-            while pos < all_members.len() && returned < scan_count {
-                let (member, score) = all_members[pos];
-                let matches = match pattern {
-                    Some(p) => glob_match(p, member),
-                    None => true,
-                };
-                if matches {
-                    result_items.push(Frame::BulkString(member.clone()));
-                    result_items.push(Frame::BulkString(Bytes::from(format_score(*score))));
-                    returned += 1;
-                }
-                pos += 1;
-            }
-
-            let next_cursor = if pos >= all_members.len() {
-                Bytes::from_static(b"0")
-            } else {
-                Bytes::from(pos.to_string())
-            };
-
-            Frame::Array(framevec![
-                Frame::BulkString(next_cursor),
-                Frame::Array(result_items.into()),
-            ])
-        }
-        Ok(None) => Frame::Array(framevec![
-            Frame::BulkString(Bytes::from_static(b"0")),
-            Frame::Array(framevec![]),
-        ]),
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    zscan_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
 // Range commands
 // ---------------------------------------------------------------------------
 
-/// ZRANGE key min max [BYSCORE|BYLEX] [REV] [LIMIT offset count] [WITHSCORES]
+/// ZRANGE key min max [BYSCORE|BYLEX] [REV] [LIMIT offset count] [WITHSCORES].
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block at the top of the
+/// mutable-path section).
 pub fn zrange(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() < 3 {
-        return err_wrong_args("ZRANGE");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZRANGE"),
-    };
-    let min_arg = match extract_bytes(&args[1]) {
-        Some(b) => b.clone(),
-        None => return err_wrong_args("ZRANGE"),
-    };
-    let max_arg = match extract_bytes(&args[2]) {
-        Some(b) => b.clone(),
-        None => return err_wrong_args("ZRANGE"),
-    };
-
-    // Parse optional flags
-    let mut by_score = false;
-    let mut by_lex = false;
-    let mut rev = false;
-    let mut withscores = false;
-    let mut limit_offset: Option<i64> = None;
-    let mut limit_count: Option<i64> = None;
-
-    let mut i = 3;
-    while i < args.len() {
-        let opt = match extract_bytes(&args[i]) {
-            Some(b) => b.as_ref(),
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-        if opt.eq_ignore_ascii_case(b"BYSCORE") {
-            by_score = true;
-            i += 1;
-        } else if opt.eq_ignore_ascii_case(b"BYLEX") {
-            by_lex = true;
-            i += 1;
-        } else if opt.eq_ignore_ascii_case(b"REV") {
-            rev = true;
-            i += 1;
-        } else if opt.eq_ignore_ascii_case(b"WITHSCORES") {
-            withscores = true;
-            i += 1;
-        } else if opt.eq_ignore_ascii_case(b"LIMIT") {
-            if i + 2 < args.len() {
-                let off_b = match extract_bytes(&args[i + 1]) {
-                    Some(b) => b,
-                    None => return err_wrong_args("ZRANGE"),
-                };
-                let cnt_b = match extract_bytes(&args[i + 2]) {
-                    Some(b) => b,
-                    None => return err_wrong_args("ZRANGE"),
-                };
-                limit_offset = std::str::from_utf8(off_b).ok().and_then(|s| s.parse().ok());
-                limit_count = std::str::from_utf8(cnt_b).ok().and_then(|s| s.parse().ok());
-                if limit_offset.is_none() || limit_count.is_none() {
-                    return err("ERR value is not an integer or out of range");
-                }
-                i += 3;
-            } else {
-                return err_wrong_args("ZRANGE");
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    if by_score && by_lex {
-        return err("ERR BYSCORE and BYLEX options are not compatible");
-    }
-
-    // LIMIT is only valid with BYSCORE or BYLEX
-    if limit_offset.is_some() && !by_score && !by_lex {
-        return err(
-            "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
-        );
-    }
-
-    match db.get_sorted_set(key) {
-        Ok(Some((members, scores))) => {
-            if by_score {
-                zrange_by_score(
-                    members,
-                    scores,
-                    &min_arg,
-                    &max_arg,
-                    rev,
-                    withscores,
-                    limit_offset,
-                    limit_count,
-                )
-            } else if by_lex {
-                zrange_by_lex(
-                    scores,
-                    &min_arg,
-                    &max_arg,
-                    rev,
-                    withscores,
-                    members,
-                    limit_offset,
-                    limit_count,
-                )
-            } else {
-                zrange_by_rank(scores, &min_arg, &max_arg, rev, withscores)
-            }
-        }
-        Ok(None) => Frame::Array(framevec![]),
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    zrange_readonly(db, args, now_ms)
 }
 
-/// ZREVRANGE key start stop [WITHSCORES]
+/// ZREVRANGE key start stop [WITHSCORES] — reverse rank range.
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block at the top of the
+/// mutable-path section).
 pub fn zrevrange(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() < 3 {
-        return err_wrong_args("ZREVRANGE");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZREVRANGE"),
-    };
-    let start_arg = match extract_bytes(&args[1]) {
-        Some(b) => b.clone(),
-        None => return err_wrong_args("ZREVRANGE"),
-    };
-    let stop_arg = match extract_bytes(&args[2]) {
-        Some(b) => b.clone(),
-        None => return err_wrong_args("ZREVRANGE"),
-    };
-
-    let withscores = args.len() > 3
-        && extract_bytes(&args[3])
-            .map(|b| b.eq_ignore_ascii_case(b"WITHSCORES"))
-            .unwrap_or(false);
-
-    match db.get_sorted_set(key) {
-        Ok(Some((_members, scores))) => {
-            zrange_by_rank(scores, &start_arg, &stop_arg, true, withscores)
-        }
-        Ok(None) => Frame::Array(framevec![]),
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    zrevrange_readonly(db, args, now_ms)
 }
 
-/// ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]
+/// ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count].
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block at the top of the
+/// mutable-path section).
 pub fn zrangebyscore(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() < 3 {
-        return err_wrong_args("ZRANGEBYSCORE");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZRANGEBYSCORE"),
-    };
-    let min_arg = match extract_bytes(&args[1]) {
-        Some(b) => b.clone(),
-        None => return err_wrong_args("ZRANGEBYSCORE"),
-    };
-    let max_arg = match extract_bytes(&args[2]) {
-        Some(b) => b.clone(),
-        None => return err_wrong_args("ZRANGEBYSCORE"),
-    };
-
-    let mut withscores = false;
-    let mut limit_offset: Option<i64> = None;
-    let mut limit_count: Option<i64> = None;
-
-    let mut i = 3;
-    while i < args.len() {
-        let opt = match extract_bytes(&args[i]) {
-            Some(b) => b.as_ref(),
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-        if opt.eq_ignore_ascii_case(b"WITHSCORES") {
-            withscores = true;
-            i += 1;
-        } else if opt.eq_ignore_ascii_case(b"LIMIT") {
-            if i + 2 < args.len() {
-                let off_b = match extract_bytes(&args[i + 1]) {
-                    Some(b) => b,
-                    None => return err_wrong_args("ZRANGEBYSCORE"),
-                };
-                let cnt_b = match extract_bytes(&args[i + 2]) {
-                    Some(b) => b,
-                    None => return err_wrong_args("ZRANGEBYSCORE"),
-                };
-                limit_offset = std::str::from_utf8(off_b).ok().and_then(|s| s.parse().ok());
-                limit_count = std::str::from_utf8(cnt_b).ok().and_then(|s| s.parse().ok());
-                if limit_offset.is_none() || limit_count.is_none() {
-                    return err("ERR value is not an integer or out of range");
-                }
-                i += 3;
-            } else {
-                return err_wrong_args("ZRANGEBYSCORE");
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    match db.get_sorted_set(key) {
-        Ok(Some((members, scores))) => zrange_by_score(
-            members,
-            scores,
-            &min_arg,
-            &max_arg,
-            false,
-            withscores,
-            limit_offset,
-            limit_count,
-        ),
-        Ok(None) => Frame::Array(framevec![]),
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    zrangebyscore_readonly(db, args, now_ms)
 }
 
-/// ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]
+/// ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count].
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block at the top of the
+/// mutable-path section).
 pub fn zrevrangebyscore(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() < 3 {
-        return err_wrong_args("ZREVRANGEBYSCORE");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZREVRANGEBYSCORE"),
-    };
-    // NOTE: arg order is max then min (reversed from ZRANGEBYSCORE)
-    let max_arg = match extract_bytes(&args[1]) {
-        Some(b) => b.clone(),
-        None => return err_wrong_args("ZREVRANGEBYSCORE"),
-    };
-    let min_arg = match extract_bytes(&args[2]) {
-        Some(b) => b.clone(),
-        None => return err_wrong_args("ZREVRANGEBYSCORE"),
-    };
-
-    let mut withscores = false;
-    let mut limit_offset: Option<i64> = None;
-    let mut limit_count: Option<i64> = None;
-
-    let mut i = 3;
-    while i < args.len() {
-        let opt = match extract_bytes(&args[i]) {
-            Some(b) => b.as_ref(),
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-        if opt.eq_ignore_ascii_case(b"WITHSCORES") {
-            withscores = true;
-            i += 1;
-        } else if opt.eq_ignore_ascii_case(b"LIMIT") {
-            if i + 2 < args.len() {
-                let off_b = match extract_bytes(&args[i + 1]) {
-                    Some(b) => b,
-                    None => return err_wrong_args("ZREVRANGEBYSCORE"),
-                };
-                let cnt_b = match extract_bytes(&args[i + 2]) {
-                    Some(b) => b,
-                    None => return err_wrong_args("ZREVRANGEBYSCORE"),
-                };
-                limit_offset = std::str::from_utf8(off_b).ok().and_then(|s| s.parse().ok());
-                limit_count = std::str::from_utf8(cnt_b).ok().and_then(|s| s.parse().ok());
-                if limit_offset.is_none() || limit_count.is_none() {
-                    return err("ERR value is not an integer or out of range");
-                }
-                i += 3;
-            } else {
-                return err_wrong_args("ZREVRANGEBYSCORE");
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    match db.get_sorted_set(key) {
-        Ok(Some((members, scores))) => {
-            // Use min_arg and max_arg but in correct order for the score filter,
-            // then reverse the result
-            zrange_by_score(
-                members,
-                scores,
-                &min_arg,
-                &max_arg,
-                true,
-                withscores,
-                limit_offset,
-                limit_count,
-            )
-        }
-        Ok(None) => Frame::Array(framevec![]),
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    zrevrangebyscore_readonly(db, args, now_ms)
 }
 
-/// ZCOUNT key min max
+/// ZCOUNT key min max — members inside a score range.
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block at the top of the
+/// mutable-path section).
 pub fn zcount(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() != 3 {
-        return err_wrong_args("ZCOUNT");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZCOUNT"),
-    };
-    let min_bytes = match extract_bytes(&args[1]) {
-        Some(b) => b,
-        None => return err_wrong_args("ZCOUNT"),
-    };
-    let max_bytes = match extract_bytes(&args[2]) {
-        Some(b) => b,
-        None => return err_wrong_args("ZCOUNT"),
-    };
-
-    let min_bound = match parse_score_bound(min_bytes) {
-        Ok(b) => b,
-        Err(e) => return e,
-    };
-    let max_bound = match parse_score_bound(max_bytes) {
-        Ok(b) => b,
-        Err(e) => return e,
-    };
-
-    match db.get_sorted_set(key) {
-        Ok(Some((_members, scores))) => {
-            let range_min = OrderedFloat(min_bound.value());
-            let range_max = OrderedFloat(max_bound.value());
-            let count = scores
-                .range(range_min, range_max)
-                .filter(|(score, _)| {
-                    min_bound.includes(score.0) && max_bound.includes_upper(score.0)
-                })
-                .count();
-            Frame::Integer(count as i64)
-        }
-        Ok(None) => Frame::Integer(0),
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    zcount_readonly(db, args, now_ms)
 }
 
-/// ZLEXCOUNT key min max
+/// ZLEXCOUNT key min max — members inside a lexicographic range.
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block at the top of the
+/// mutable-path section).
 pub fn zlexcount(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() != 3 {
-        return err_wrong_args("ZLEXCOUNT");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZLEXCOUNT"),
-    };
-    let min_bytes = match extract_bytes(&args[1]) {
-        Some(b) => b,
-        None => return err_wrong_args("ZLEXCOUNT"),
-    };
-    let max_bytes = match extract_bytes(&args[2]) {
-        Some(b) => b,
-        None => return err_wrong_args("ZLEXCOUNT"),
-    };
-
-    let min_bound = match parse_lex_bound(min_bytes) {
-        Ok(b) => b,
-        Err(e) => return e,
-    };
-    let max_bound = match parse_lex_bound(max_bytes) {
-        Ok(b) => b,
-        Err(e) => return e,
-    };
-
-    match db.get_sorted_set(key) {
-        Ok(Some((_members, scores))) => {
-            let count = scores
-                .iter()
-                .filter(|(_, member)| lex_in_range(member, &min_bound, &max_bound))
-                .count();
-            Frame::Integer(count as i64)
-        }
-        Ok(None) => Frame::Integer(0),
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    zlexcount_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -1384,31 +979,20 @@ fn parse_setop_args(
     Ok((keys, weights, aggregate, withscores))
 }
 
-/// Read all source sorted sets into temporary HashMaps.
-fn collect_source_sets(
-    db: &mut Database,
-    keys: &[Bytes],
-) -> Result<Vec<HashMap<Bytes, f64>>, Frame> {
-    let mut source_data: Vec<HashMap<Bytes, f64>> = Vec::with_capacity(keys.len());
-    for key in keys {
-        match db.get_sorted_set(key) {
-            Ok(Some((members, _))) => {
-                source_data.push(members.clone());
-            }
-            Ok(None) => {
-                source_data.push(HashMap::new());
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(source_data)
-}
+// `collect_source_sets` — the `&mut Database` twin that reached every source
+// through `get_sorted_set` — is gone with moon#928. It was the twelfth of the
+// fourteen flattening call sites, and the one that hit FOUR commands at once
+// (ZDIFF / ZUNION / ZINTER / ZINTERCARD), flattening every key named in a
+// multi-key read, not just the one the caller asked about.
 
-/// Read-only twin: collect source sets using `get_sorted_set_ref_if_alive`.
+/// Collect the source sorted sets of ZDIFF / ZUNION / ZINTER / ZINTERCARD.
 ///
-/// Compact (listpack) encodings return an empty map — callers see an absent
-/// set, which is correct because compact sets are upgraded to BPTree on first
-/// write access.
+/// Handles ALL encodings via `get_sorted_set_ref_if_alive` — the BPTree-only
+/// accessor would treat a listpack zset as missing. `BPTree`/`Legacy` borrow
+/// their map (no clone); a listpack is small by definition (bounded by
+/// `EncodingLimits::zset_entries`), so materializing an owned map for one is
+/// bounded too. The `&Database` receiver is what makes the compact encoding
+/// survive the read: a shared borrow cannot reach `SortedSetKind::upgrade`.
 fn collect_source_sets_readonly<'a>(
     db: &'a Database,
     keys: &[Bytes],
@@ -1463,331 +1047,84 @@ fn result_map_to_frame(result: &HashMap<Bytes, f64>, withscores: bool) -> Frame 
 // ZDIFF numkeys key [key ...] [WITHSCORES]
 // ---------------------------------------------------------------------------
 
+/// ZDIFF numkeys key [key ...] [WITHSCORES] — set difference.
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block at the top of the
+/// mutable-path section).
 pub fn zdiff(db: &mut Database, args: &[Frame]) -> Frame {
-    let (keys, _, _, withscores) = match parse_setop_args(args, "ZDIFF", false) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let source_data = match collect_source_sets(db, &keys) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let mut result_map: HashMap<Bytes, f64> = HashMap::new();
-    if let Some(first) = source_data.first() {
-        'outer: for (member, score) in first {
-            for src in source_data.iter().skip(1) {
-                if src.contains_key(member) {
-                    continue 'outer;
-                }
-            }
-            result_map.insert(member.clone(), *score);
-        }
-    }
-    result_map_to_frame(&result_map, withscores)
+    let now_ms = db.now_ms();
+    zdiff_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
 // ZUNION numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...] [WITHSCORES]
 // ---------------------------------------------------------------------------
 
+/// ZUNION numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...] [WITHSCORES].
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block at the top of the
+/// mutable-path section).
 pub fn zunion(db: &mut Database, args: &[Frame]) -> Frame {
-    let (keys, weights, aggregate, withscores) = match parse_setop_args(args, "ZUNION", true) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let source_data = match collect_source_sets(db, &keys) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let mut result_map: HashMap<Bytes, f64> = HashMap::new();
-    for (idx, src) in source_data.iter().enumerate() {
-        for (member, score) in src {
-            let weighted = *score * weights[idx];
-            result_map
-                .entry(member.clone())
-                .and_modify(|existing| {
-                    *existing = match aggregate {
-                        AggregateOp::Sum => *existing + weighted,
-                        AggregateOp::Min => existing.min(weighted),
-                        AggregateOp::Max => existing.max(weighted),
-                    };
-                })
-                .or_insert(weighted);
-        }
-    }
-    result_map_to_frame(&result_map, withscores)
+    let now_ms = db.now_ms();
+    zunion_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
 // ZINTER numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...] [WITHSCORES]
 // ---------------------------------------------------------------------------
 
+/// ZINTER numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...] [WITHSCORES].
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block at the top of the
+/// mutable-path section).
 pub fn zinter(db: &mut Database, args: &[Frame]) -> Frame {
-    let (keys, weights, aggregate, withscores) = match parse_setop_args(args, "ZINTER", true) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let source_data = match collect_source_sets(db, &keys) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let mut result_map: HashMap<Bytes, f64> = HashMap::new();
-    if let Some(first) = source_data.first() {
-        for (member, score) in first {
-            let weighted = *score * weights[0];
-            let mut final_score = weighted;
-            let mut in_all = true;
-            for (idx, src) in source_data.iter().enumerate().skip(1) {
-                match src.get(member) {
-                    Some(s) => {
-                        let ws = *s * weights[idx];
-                        final_score = match aggregate {
-                            AggregateOp::Sum => final_score + ws,
-                            AggregateOp::Min => final_score.min(ws),
-                            AggregateOp::Max => final_score.max(ws),
-                        };
-                    }
-                    None => {
-                        in_all = false;
-                        break;
-                    }
-                }
-            }
-            if in_all {
-                result_map.insert(member.clone(), final_score);
-            }
-        }
-    }
-    result_map_to_frame(&result_map, withscores)
+    let now_ms = db.now_ms();
+    zinter_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
 // ZINTERCARD numkeys key [key ...] [LIMIT n]
 // ---------------------------------------------------------------------------
 
+/// ZINTERCARD numkeys key [key ...] [LIMIT n] — intersection size.
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block at the top of the
+/// mutable-path section).
 pub fn zintercard(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.is_empty() {
-        return err_wrong_args("ZINTERCARD");
-    }
-    let numkeys_bytes = match extract_bytes(&args[0]) {
-        Some(b) => b,
-        None => return err_wrong_args("ZINTERCARD"),
-    };
-    let numkeys: usize = match std::str::from_utf8(numkeys_bytes)
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(n) if n > 0 => n,
-        _ => return err("ERR numkeys can't be non-positive value"),
-    };
-    if args.len() < 1 + numkeys {
-        return err_wrong_args("ZINTERCARD");
-    }
-    let keys: Vec<Bytes> = (0..numkeys)
-        .map(|j| {
-            extract_bytes(&args[1 + j])
-                .cloned()
-                .unwrap_or_else(Bytes::new)
-        })
-        .collect();
-    let mut limit: usize = 0;
-    let mut i = 1 + numkeys;
-    while i < args.len() {
-        let opt = match extract_bytes(&args[i]) {
-            Some(b) => b.as_ref(),
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-        if opt.eq_ignore_ascii_case(b"LIMIT") {
-            if i + 1 >= args.len() {
-                return err_wrong_args("ZINTERCARD");
-            }
-            let lb = match extract_bytes(&args[i + 1]) {
-                Some(b) => b,
-                None => return err_wrong_args("ZINTERCARD"),
-            };
-            limit = match std::str::from_utf8(lb).ok().and_then(|s| s.parse().ok()) {
-                Some(v) => v,
-                None => return err("ERR value is not an integer or out of range"),
-            };
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    let source_data = match collect_source_sets(db, &keys) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    if source_data.iter().any(|s| s.is_empty()) {
-        return Frame::Integer(0);
-    }
-    let mut indices: Vec<usize> = (0..source_data.len()).collect();
-    indices.sort_by_key(|&i| source_data[i].len());
-    let smallest_idx = indices[0];
-    let mut count: i64 = 0;
-    for member in source_data[smallest_idx].keys() {
-        let mut in_all = true;
-        for &idx in indices.iter().skip(1) {
-            if !source_data[idx].contains_key(member) {
-                in_all = false;
-                break;
-            }
-        }
-        if in_all {
-            count += 1;
-            if limit > 0 && count >= limit as i64 {
-                break;
-            }
-        }
-    }
-    Frame::Integer(count)
+    let now_ms = db.now_ms();
+    zintercard_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
 // ZMSCORE key member [member ...]
 // ---------------------------------------------------------------------------
 
+/// ZMSCORE key member [member ...] — scores of several members.
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block at the top of the
+/// mutable-path section).
 pub fn zmscore(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() < 2 {
-        return err_wrong_args("ZMSCORE");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZMSCORE"),
-    };
-    match db.get_sorted_set(key) {
-        Ok(Some((members, _))) => {
-            let mut result = Vec::with_capacity(args.len() - 1);
-            for arg in &args[1..] {
-                let member = match extract_bytes(arg) {
-                    Some(m) => m,
-                    None => {
-                        result.push(Frame::Null);
-                        continue;
-                    }
-                };
-                match members.get(member) {
-                    Some(score) => {
-                        result.push(Frame::BulkString(format_score_bytes(*score)));
-                    }
-                    None => result.push(Frame::Null),
-                }
-            }
-            Frame::Array(result.into())
-        }
-        Ok(None) => {
-            let mut result = Vec::with_capacity(args.len() - 1);
-            for _ in &args[1..] {
-                result.push(Frame::Null);
-            }
-            Frame::Array(result.into())
-        }
-        Err(e) => e,
-    }
+    let now_ms = db.now_ms();
+    zmscore_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------
 // ZRANDMEMBER key [count [WITHSCORES]]
 // ---------------------------------------------------------------------------
 
+/// ZRANDMEMBER key [count [WITHSCORES]] — random member(s).
+///
+/// Reads through the shared-borrow implementation so the zset's compact
+/// encoding survives the read (moon#928 — see the block at the top of the
+/// mutable-path section).
 pub fn zrandmember(db: &mut Database, args: &[Frame]) -> Frame {
-    use rand::seq::IndexedRandom;
-    if args.is_empty() || args.len() > 3 {
-        return err_wrong_args("ZRANDMEMBER");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZRANDMEMBER"),
-    };
-    let (members_map, _) = match db.get_sorted_set(key) {
-        Ok(Some(pair)) => pair,
-        Ok(None) => {
-            return if args.len() == 1 {
-                Frame::Null
-            } else {
-                Frame::Array(framevec![])
-            };
-        }
-        Err(e) => return e,
-    };
-    if members_map.is_empty() {
-        return if args.len() == 1 {
-            Frame::Null
-        } else {
-            Frame::Array(framevec![])
-        };
-    }
-    let entries: Vec<(&Bytes, f64)> = members_map.iter().map(|(m, s)| (m, *s)).collect();
-    let mut rng = rand::rng();
-    if args.len() == 1 {
-        return if let Some(chosen) = entries.choose(&mut rng) {
-            Frame::BulkString(chosen.0.clone())
-        } else {
-            Frame::Null
-        };
-    }
-    let count_bytes = match extract_bytes(&args[1]) {
-        Some(b) => b,
-        None => return err_wrong_args("ZRANDMEMBER"),
-    };
-    let count: i64 = match std::str::from_utf8(count_bytes)
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(c) => c,
-        None => return err("ERR value is not an integer or out of range"),
-    };
-    let withscores = if args.len() == 3 {
-        let opt = match extract_bytes(&args[2]) {
-            Some(b) => b,
-            None => return err("ERR syntax error"),
-        };
-        if opt.eq_ignore_ascii_case(b"WITHSCORES") {
-            true
-        } else {
-            return err("ERR syntax error");
-        }
-    } else {
-        false
-    };
-    if count == 0 {
-        return Frame::Array(framevec![]);
-    }
-    if count > 0 {
-        let n = std::cmp::min(count as usize, entries.len());
-        let chosen: Vec<&(&Bytes, f64)> = entries.sample(&mut rng, n).collect();
-        let cap = if withscores { n * 2 } else { n };
-        let mut result = Vec::with_capacity(cap);
-        for (member, score) in chosen {
-            result.push(Frame::BulkString((*member).clone()));
-            if withscores {
-                result.push(Frame::BulkString(format_score_bytes(*score)));
-            }
-        }
-        Frame::Array(result.into())
-    } else {
-        // Negative count: allow duplicates — exactly |COUNT| of them (Redis
-        // contract). The DoS guard refuses extreme counts loudly instead of
-        // silently truncating.
-        let n = count.unsigned_abs() as usize;
-        if n > crate::command::RAND_DUP_COUNT_MAX {
-            return Frame::Error(Bytes::from_static(crate::command::ERR_RAND_COUNT_RANGE));
-        }
-        let cap = if withscores { n * 2 } else { n };
-        let mut result = Vec::with_capacity(cap);
-        for _ in 0..n {
-            if let Some(chosen) = entries.choose(&mut rng) {
-                result.push(Frame::BulkString(chosen.0.clone()));
-                if withscores {
-                    result.push(Frame::BulkString(format_score_bytes(chosen.1)));
-                }
-            }
-        }
-        Frame::Array(result.into())
-    }
+    let now_ms = db.now_ms();
+    zrandmember_readonly(db, args, now_ms)
 }
 
 // ---------------------------------------------------------------------------

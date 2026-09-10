@@ -195,6 +195,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field with no TTL, `PERSIST` on a key with no TTL, a pop from a missing key)
   moon matches redis exactly. The seventh, `SETBIT` writing a bit that already
   holds that value, predates this change.
+- **A sorted-set READ no longer flattens a listpack zset (moon#928).** All
+  fourteen `get_sorted_set` call sites in `command/sorted_set/sorted_set_read.rs`
+  reached the zset through an accessor documented as read-only that takes
+  `&mut self` and returns the FULL `(&HashMap<Bytes, f64>, &BPTree)` pair — a
+  shape a `SortedSetListpack` cannot satisfy, so obtaining one ran
+  `SortedSetKind::upgrade`. That conversion is one-way (nothing downgrades,
+  moon#832), so ONE `ZCARD` taken on the mutable dispatch path — inside
+  MULTI/EXEC, inside a Lua script, or through `try_inline_dispatch` —
+  converted a small zset to a `skiplist` for the rest of its life. moon#853
+  fixed exactly this for the set and list families and predicted this one in
+  writing; moon#878, which made `ZADD` produce listpacks, made the prediction
+  live. Measured on the pre-fix binary (`--shards 1`, macOS host,
+  `used_memory` ledger — accounting, not throughput): 1000 eight-member zsets
+  went 293,055 -> 4,749,055 bytes (**16.21x**) after one `ZCARD` each through
+  MULTI/EXEC; the same reads on a bare connection kept `listpack`, the
+  negative control that proves the probe measures the dispatch path. That put
+  a ceiling on moon#878's +38.0% ZADD win — a write-only benchmark measuring
+  an encoding the first read destroyed. All seventeen affected handlers —
+  ZSCORE, ZCARD, ZRANK, ZREVRANK, ZSCAN, ZRANGE, ZREVRANGE, ZRANGEBYSCORE,
+  ZREVRANGEBYSCORE, ZCOUNT, ZLEXCOUNT, ZMSCORE, ZRANDMEMBER, ZDIFF, ZUNION,
+  ZINTER, ZINTERCARD — now take their read through the `&Database`
+  implementation that already backed `dispatch_read`. A shared borrow cannot
+  reach `K::upgrade`, so the compiler enforces "reading does not rewrite", and
+  the two implementations of each command collapse into one.
+
+  *Deliberately not preserved:* the mutable path used to reclaim an expired key
+  and promote a cold-tier hit into hot RAM as side effects of a read. Neither
+  is a correctness property — `get_sorted_set_ref_if_alive` still treats an
+  expired key as absent and still reads the cold tier through — and the hash,
+  list and set families have shipped this trade since moon#853.
+  `tests/zset_read_cold_tier_928.rs` pins it: every read of a cold-spilled
+  zset answers identically to a hot one holding the same members, and a WRITE
+  still promotes (re-deriving the compact encoding, moon#898).
+
+- **`ZREVRANGE`/`ZRANGE … REV` answered the wrong window on a listpack zset.**
+  `zrange_from_entries`' by-rank arm sliced the score-ASCENDING entries by
+  `[start..=stop]` and then reversed, instead of counting ranks from the
+  high-score end. Only the whole-range form came out right, which is why
+  `ZREVRANGE z 0 -1` looked fine: on `{a:1, b:2, c:3}`, `ZREVRANGE z 0 1`
+  answered `[b, a]` where redis 8.6.1 answers `[c, b]`. Reachable only through
+  the compact-encoding branch, so it was live on the `dispatch_read` path
+  before this change and would have spread to the mutable path with it. The
+  index mapping now matches `zrange_by_rank`'s against the B+tree exactly. A
+  648-row sweep against a live `redis-server` 8.6.1, rebuilding the fixture
+  before every read so the pre-fix binary cannot self-flatten, goes from 73
+  divergences to 48 with **zero new ones**, and moon's own two dispatch paths
+  go from 17 disagreements to 0.
 
 - **`--max-wal-size` now reaches the WAL overflow ceiling (moon#916).** The flag
   configured `CheckpointTrigger` but never `WalWriterV3`, whose bounds setter

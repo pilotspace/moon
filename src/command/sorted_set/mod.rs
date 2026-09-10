@@ -532,23 +532,40 @@ pub(super) fn zrange_from_entries(
             Some(v) => v,
             None => return err("ERR value is not an integer or out of range"),
         };
+        // Normalize negative indices exactly as `zrange_by_rank` does against
+        // the B+tree, so the listpack answer and the B+tree answer cannot
+        // drift apart.
         let start = if start_raw < 0 {
-            (total + start_raw).max(0) as usize
+            (total + start_raw).max(0)
         } else {
-            start_raw as usize
+            start_raw.min(total)
         };
         let stop = if stop_raw < 0 {
-            (total + stop_raw).max(0) as usize
+            (total + stop_raw).max(0)
         } else {
-            (stop_raw as usize).min(entries.len().saturating_sub(1))
+            stop_raw.min(total - 1)
         };
-        if start > stop || start >= entries.len() {
+        if start > stop {
             return Frame::Array(framevec![]);
         }
+        // REV counts ranks from the HIGH-score end. `entries` is
+        // score-ascending, so the window [start, stop] in the reversed order
+        // is [total-1-stop, total-1-start] here, walked backwards — the same
+        // mapping `zrange_by_rank` performs.
+        //
+        // Reversing the ASCENDING slice instead (what this did before
+        // moon#928) is only correct when the window covers the whole zset,
+        // which is why `ZREVRANGE z 0 -1` looked fine: on {a:1, b:2, c:3},
+        // `ZREVRANGE z 0 1` answered [b, a] where redis 8.6.1 answers [c, b].
+        // Reachable only through the compact-encoding branch, which is why
+        // moon#928 — the change that stops a read flattening a listpack — is
+        // what surfaced it.
         let slice: Vec<&(Bytes, f64)> = if rev {
-            entries[start..=stop].iter().rev().collect()
+            let lo = (total - 1 - stop) as usize;
+            let hi = (total - 1 - start) as usize;
+            entries[lo..=hi].iter().rev().collect()
         } else {
-            entries[start..=stop].iter().collect()
+            entries[start as usize..=stop as usize].iter().collect()
         };
         let result: Vec<Frame> = slice
             .into_iter()
@@ -1653,6 +1670,432 @@ mod tests {
             Frame::Error(e) => assert_eq!(e, Bytes::from_static(b"ERR syntax error")),
             other => panic!("expected syntax error, got {other:?}"),
         }
+    }
+
+    // ── #928: a READ on the mutable dispatch path must not flatten a
+    //         listpack zset ────────────────────────────────────────────────
+    //
+    // Every handler below is a pure read, and every one used to reach the
+    // zset through `Database::get_sorted_set`, whose `get_promoted` core
+    // calls `SortedSetKind::upgrade` unconditionally. That conversion is
+    // one-way -- nothing in the tree ever downgrades (moon#832) -- so a
+    // single ZCARD taken on the mutable path (inside MULTI/EXEC, inside a
+    // Lua script, or from `try_inline_dispatch`) permanently flattened a
+    // `listpack` zset to a `skiplist` for the rest of its life.
+    //
+    // Measured on the pre-fix binary at ab91a23e (`--shards 1`, macOS host,
+    // `used_memory` ledger -- accounting, not throughput): 1000 eight-member
+    // zsets went 293,055 -> 4,749,055 bytes (16.21x) after ONE `ZCARD` each
+    // taken through MULTI/EXEC, and `OBJECT ENCODING` went
+    // `listpack -> skiplist`. All 17 reads flattened; the same reads on a
+    // bare connection (the `dispatch_read` path) kept `listpack`, which is
+    // the negative control proving the probe measures the dispatch path.
+    //
+    // Probe choice: `OBJECT ENCODING` reads `entry.value` through
+    // `Database::get`, which does not route through `get_promoted`, so asking
+    // about the encoding cannot itself flatten it. Every case asserts the
+    // fixture is `listpack` BEFORE the read -- a fixture that was never
+    // compact would make the post-read assertion vacuous.
+
+    fn run_zmscore(db: &mut Database, args: &[&[u8]]) -> Frame {
+        let frames: Vec<Frame> = args.iter().map(|a| bulk(a)).collect();
+        zmscore(db, &frames)
+    }
+
+    fn run_zrandmember(db: &mut Database, args: &[&[u8]]) -> Frame {
+        let frames: Vec<Frame> = args.iter().map(|a| bulk(a)).collect();
+        zrandmember(db, &frames)
+    }
+
+    fn run_zdiff(db: &mut Database, args: &[&[u8]]) -> Frame {
+        let frames: Vec<Frame> = args.iter().map(|a| bulk(a)).collect();
+        zdiff(db, &frames)
+    }
+
+    fn run_zunion(db: &mut Database, args: &[&[u8]]) -> Frame {
+        let frames: Vec<Frame> = args.iter().map(|a| bulk(a)).collect();
+        zunion(db, &frames)
+    }
+
+    fn run_zinter(db: &mut Database, args: &[&[u8]]) -> Frame {
+        let frames: Vec<Frame> = args.iter().map(|a| bulk(a)).collect();
+        zinter(db, &frames)
+    }
+
+    fn run_zintercard(db: &mut Database, args: &[&[u8]]) -> Frame {
+        let frames: Vec<Frame> = args.iter().map(|a| bulk(a)).collect();
+        zintercard(db, &frames)
+    }
+
+    /// A `Frame::Array` of bulk strings — the reply shape most of the range
+    /// commands answer without `WITHSCORES`.
+    fn bulk_array(members: &[&[u8]]) -> Frame {
+        Frame::Array(members.iter().map(|m| bulk(m)).collect::<Vec<_>>().into())
+    }
+
+    /// The shared fixture: three members, far below `zset_entries` (128) and
+    /// `zset_value` (64), so redis 8.6.1 reports `listpack` for it too.
+    fn listpack_zset(db: &mut Database) {
+        run_zadd(db, &[b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(
+            encoding_of(db, b"z"),
+            "listpack",
+            "fixture must start as a listpack or the case proves nothing"
+        );
+    }
+
+    /// The post-read assertion every case below shares.
+    fn assert_still_listpack(db: &mut Database, what: &str) {
+        assert_eq!(
+            encoding_of(db, b"z"),
+            "listpack",
+            "{what} on the mutable dispatch path flattened the zset to a \
+             skiplist (moon#928) -- reads must not rewrite the encoding"
+        );
+    }
+
+    #[test]
+    fn zscore_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(
+            run_zscore(&mut db, &[b"z", b"b"]),
+            Frame::BulkString(Bytes::from_static(b"2"))
+        );
+        assert_eq!(run_zscore(&mut db, &[b"z", b"nope"]), Frame::Null);
+        assert_still_listpack(&mut db, "ZSCORE");
+    }
+
+    #[test]
+    fn zcard_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(run_zcard(&mut db, &[b"z"]), Frame::Integer(3));
+        assert_still_listpack(&mut db, "ZCARD");
+    }
+
+    #[test]
+    fn zrank_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(run_zrank(&mut db, &[b"z", b"a"]), Frame::Integer(0));
+        assert_eq!(run_zrank(&mut db, &[b"z", b"c"]), Frame::Integer(2));
+        assert_eq!(run_zrank(&mut db, &[b"z", b"nope"]), Frame::Null);
+        assert_still_listpack(&mut db, "ZRANK");
+    }
+
+    #[test]
+    fn zrevrank_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(run_zrevrank(&mut db, &[b"z", b"a"]), Frame::Integer(2));
+        assert_eq!(run_zrevrank(&mut db, &[b"z", b"c"]), Frame::Integer(0));
+        assert_eq!(run_zrevrank(&mut db, &[b"z", b"nope"]), Frame::Null);
+        assert_still_listpack(&mut db, "ZREVRANK");
+    }
+
+    #[test]
+    fn zscan_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(
+            run_zscan(&mut db, &[b"z", b"0"]),
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"0")),
+                Frame::Array(framevec![
+                    Frame::BulkString(Bytes::from_static(b"a")),
+                    Frame::BulkString(Bytes::from_static(b"1")),
+                    Frame::BulkString(Bytes::from_static(b"b")),
+                    Frame::BulkString(Bytes::from_static(b"2")),
+                    Frame::BulkString(Bytes::from_static(b"c")),
+                    Frame::BulkString(Bytes::from_static(b"3")),
+                ]),
+            ])
+        );
+        assert_still_listpack(&mut db, "ZSCAN");
+    }
+
+    #[test]
+    fn zrange_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(
+            run_zrange(&mut db, &[b"z", b"0", b"-1"]),
+            bulk_array(&[b"a", b"b", b"c"])
+        );
+        assert_still_listpack(&mut db, "ZRANGE");
+    }
+
+    #[test]
+    fn zrevrange_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(
+            run_zrevrange(&mut db, &[b"z", b"0", b"-1"]),
+            bulk_array(&[b"c", b"b", b"a"])
+        );
+        // A PARTIAL rev window is the case the whole-range one hides: ranks
+        // count from the HIGH-score end, so `0 1` is [c, b], not [b, a].
+        // Verified against redis 8.6.1: `zrevrange z 0 1` => c, b.
+        assert_eq!(
+            run_zrevrange(&mut db, &[b"z", b"0", b"1"]),
+            bulk_array(&[b"c", b"b"])
+        );
+        assert_eq!(
+            run_zrevrange(&mut db, &[b"z", b"1", b"1"]),
+            bulk_array(&[b"b"])
+        );
+        assert_eq!(
+            run_zrevrange(&mut db, &[b"z", b"-2", b"-1"]),
+            bulk_array(&[b"b", b"a"])
+        );
+        assert_eq!(
+            run_zrevrange(&mut db, &[b"z", b"5", b"10"]),
+            Frame::Array(framevec![])
+        );
+        assert_still_listpack(&mut db, "ZREVRANGE");
+    }
+
+    #[test]
+    fn zrangebyscore_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(
+            run_zrangebyscore(&mut db, &[b"z", b"-inf", b"+inf"]),
+            bulk_array(&[b"a", b"b", b"c"])
+        );
+        assert_still_listpack(&mut db, "ZRANGEBYSCORE");
+    }
+
+    #[test]
+    fn zrevrangebyscore_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(
+            run_zrevrangebyscore(&mut db, &[b"z", b"+inf", b"-inf"]),
+            bulk_array(&[b"c", b"b", b"a"])
+        );
+        assert_still_listpack(&mut db, "ZREVRANGEBYSCORE");
+    }
+
+    #[test]
+    fn zcount_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(
+            run_zcount(&mut db, &[b"z", b"-inf", b"+inf"]),
+            Frame::Integer(3)
+        );
+        assert_eq!(run_zcount(&mut db, &[b"z", b"2", b"3"]), Frame::Integer(2));
+        assert_eq!(run_zcount(&mut db, &[b"z", b"(2", b"3"]), Frame::Integer(1));
+        assert_still_listpack(&mut db, "ZCOUNT");
+    }
+
+    #[test]
+    fn zlexcount_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(
+            run_zlexcount(&mut db, &[b"z", b"-", b"+"]),
+            Frame::Integer(3)
+        );
+        assert_eq!(
+            run_zlexcount(&mut db, &[b"z", b"[b", b"+"]),
+            Frame::Integer(2)
+        );
+        assert_still_listpack(&mut db, "ZLEXCOUNT");
+    }
+
+    #[test]
+    fn zmscore_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(
+            run_zmscore(&mut db, &[b"z", b"a", b"nope", b"c"]),
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"1")),
+                Frame::Null,
+                Frame::BulkString(Bytes::from_static(b"3")),
+            ])
+        );
+        assert_still_listpack(&mut db, "ZMSCORE");
+    }
+
+    #[test]
+    fn zrandmember_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        // Random member, deterministic membership: whatever comes back must
+        // be one of the three, and the count form must return all three.
+        match run_zrandmember(&mut db, &[b"z"]) {
+            Frame::BulkString(b) => assert!(
+                [&b"a"[..], b"b", b"c"].contains(&b.as_ref()),
+                "ZRANDMEMBER returned {b:?}, not a member of the fixture"
+            ),
+            other => panic!("expected a bulk string, got {other:?}"),
+        }
+        match run_zrandmember(&mut db, &[b"z", b"3"]) {
+            Frame::Array(items) => assert_eq!(items.len(), 3),
+            other => panic!("expected an array, got {other:?}"),
+        }
+        assert_still_listpack(&mut db, "ZRANDMEMBER");
+    }
+
+    #[test]
+    fn zdiff_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(
+            run_zdiff(&mut db, &[b"1", b"z"]),
+            bulk_array(&[b"a", b"b", b"c"])
+        );
+        assert_still_listpack(&mut db, "ZDIFF");
+    }
+
+    #[test]
+    fn zunion_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(
+            run_zunion(&mut db, &[b"1", b"z"]),
+            bulk_array(&[b"a", b"b", b"c"])
+        );
+        assert_still_listpack(&mut db, "ZUNION");
+    }
+
+    #[test]
+    fn zinter_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(
+            run_zinter(&mut db, &[b"1", b"z"]),
+            bulk_array(&[b"a", b"b", b"c"])
+        );
+        assert_still_listpack(&mut db, "ZINTER");
+    }
+
+    #[test]
+    fn zintercard_read_keeps_a_small_zset_listpack() {
+        let mut db = Database::new();
+        listpack_zset(&mut db);
+        assert_eq!(run_zintercard(&mut db, &[b"1", b"z"]), Frame::Integer(3));
+        assert_still_listpack(&mut db, "ZINTERCARD");
+    }
+
+    /// Route a command name to its mutable-path handler — the same handlers
+    /// `command::dispatch` calls.
+    fn dispatch_named(db: &mut Database, name: &str, args: &[&[u8]]) -> Frame {
+        let frames: Vec<Frame> = args.iter().map(|a| bulk(a)).collect();
+        match name {
+            "ZSCORE" => zscore(db, &frames),
+            "ZCARD" => zcard(db, &frames),
+            "ZRANK" => zrank(db, &frames),
+            "ZREVRANK" => zrevrank(db, &frames),
+            "ZSCAN" => zscan(db, &frames),
+            "ZRANGE" => zrange(db, &frames),
+            "ZREVRANGE" => zrevrange(db, &frames),
+            "ZRANGEBYSCORE" => zrangebyscore(db, &frames),
+            "ZREVRANGEBYSCORE" => zrevrangebyscore(db, &frames),
+            "ZCOUNT" => zcount(db, &frames),
+            "ZLEXCOUNT" => zlexcount(db, &frames),
+            "ZMSCORE" => zmscore(db, &frames),
+            "ZDIFF" => zdiff(db, &frames),
+            "ZUNION" => zunion(db, &frames),
+            "ZINTER" => zinter(db, &frames),
+            "ZINTERCARD" => zintercard(db, &frames),
+            other => panic!("dispatch_named has no arm for {other}"),
+        }
+    }
+
+    /// Same members, both encodings, byte-identical replies.
+    ///
+    /// This is the semantic half of moon#928: routing the mutable handlers
+    /// through the shared-borrow implementation only preserves the encoding
+    /// if the two implementations answer the same. A zset that genuinely
+    /// exceeds `zset_entries`/`zset_value` is a B+tree and must still read
+    /// correctly from that form, so the same fixture is built twice — once
+    /// small enough to stay a listpack, once promoted past the value
+    /// threshold and then trimmed back to the identical three members.
+    #[test]
+    fn listpack_and_skiplist_zsets_answer_every_read_identically() {
+        let deterministic: &[&[&[u8]]] = &[
+            &[b"ZSCORE", b"z", b"b"],
+            &[b"ZSCORE", b"z", b"nope"],
+            &[b"ZCARD", b"z"],
+            &[b"ZRANK", b"z", b"b"],
+            &[b"ZRANK", b"z", b"b", b"WITHSCORE"],
+            &[b"ZREVRANK", b"z", b"b"],
+            &[b"ZSCAN", b"z", b"0"],
+            &[b"ZRANGE", b"z", b"0", b"-1"],
+            &[b"ZRANGE", b"z", b"0", b"-1", b"WITHSCORES"],
+            &[b"ZRANGE", b"z", b"(1", b"+inf", b"BYSCORE"],
+            &[b"ZRANGE", b"z", b"[a", b"[b", b"BYLEX"],
+            &[b"ZRANGE", b"z", b"0", b"-1", b"REV"],
+            // Partial REV windows — the arm a whole-range `0 -1` cannot
+            // distinguish, and the one that was wrong for listpacks until
+            // moon#928 surfaced it.
+            &[b"ZRANGE", b"z", b"0", b"1", b"REV"],
+            &[b"ZREVRANGE", b"z", b"0", b"-1", b"WITHSCORES"],
+            &[b"ZREVRANGE", b"z", b"0", b"1"],
+            &[b"ZREVRANGE", b"z", b"1", b"1"],
+            &[b"ZREVRANGE", b"z", b"-2", b"-1"],
+            &[b"ZREVRANGE", b"z", b"5", b"10"],
+            &[b"ZREVRANGE", b"z", b"-100", b"100"],
+            &[b"ZRANGEBYSCORE", b"z", b"-inf", b"+inf", b"WITHSCORES"],
+            &[b"ZRANGEBYSCORE", b"z", b"2", b"3", b"LIMIT", b"1", b"1"],
+            &[b"ZREVRANGEBYSCORE", b"z", b"+inf", b"-inf"],
+            &[b"ZCOUNT", b"z", b"(1", b"3"],
+            &[b"ZLEXCOUNT", b"z", b"[b", b"+"],
+            &[b"ZMSCORE", b"z", b"a", b"nope", b"c"],
+            &[b"ZDIFF", b"1", b"z", b"WITHSCORES"],
+            &[b"ZUNION", b"1", b"z", b"WITHSCORES"],
+            &[b"ZINTER", b"1", b"z", b"WITHSCORES"],
+            &[b"ZINTERCARD", b"1", b"z"],
+        ];
+
+        let mut lp = Database::new();
+        run_zadd(&mut lp, &[b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(encoding_of(&mut lp, b"z"), "listpack");
+
+        // The same three members in the B+tree form: one oversized member
+        // forces the promotion, then ZREM takes it away again. Promotion is
+        // one-way, so what is left is the identical content as a skiplist.
+        let mut bt = Database::new();
+        run_zadd(&mut bt, &[b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        let oversized =
+            vec![b'x'; crate::storage::db::EncodingLimits::moon_defaults().zset_value + 1];
+        run_zadd(&mut bt, &[b"z", b"9", &oversized]);
+        run_zrem(&mut bt, &[b"z", &oversized]);
+        assert_eq!(
+            encoding_of(&mut bt, b"z"),
+            "skiplist",
+            "the control fixture must be a B+tree or this test compares two listpacks"
+        );
+
+        let mut divergences: Vec<String> = Vec::new();
+        for argv in deterministic {
+            let name = String::from_utf8_lossy(argv[0]).into_owned();
+            let got_lp = dispatch_named(&mut lp, &name, &argv[1..]);
+            let got_bt = dispatch_named(&mut bt, &name, &argv[1..]);
+            if got_lp != got_bt {
+                divergences.push(format!(
+                    "{}: listpack {got_lp:?} != skiplist {got_bt:?}",
+                    argv.iter()
+                        .map(|a| String::from_utf8_lossy(a).into_owned())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ));
+            }
+        }
+        assert!(
+            divergences.is_empty(),
+            "{} read(s) answer differently depending on the encoding:\n  {}",
+            divergences.len(),
+            divergences.join("\n  ")
+        );
+        // The whole point: none of the reads above moved either encoding.
+        assert_eq!(encoding_of(&mut lp, b"z"), "listpack");
+        assert_eq!(encoding_of(&mut bt, b"z"), "skiplist");
     }
 
     // ── #787: ZADD must reach the listpack encoding ───────────────────────

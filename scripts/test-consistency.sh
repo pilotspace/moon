@@ -745,6 +745,22 @@ assert_both "listpack zset ZSCORE 1e3"          ZSCORE z:enc:scores n
 assert_both "listpack zset ZSCORE 3.5000"       ZSCORE z:enc:scores o
 assert_both "listpack zset ZSCORE inf"          ZSCORE z:enc:scores p
 assert_both "listpack zset ZRANGE WITHSCORES"   ZRANGE z:enc:scores 0 -1 WITHSCORES
+# moon#928: a PARTIAL reverse window on a listpack zset. Ranks count from the
+# HIGH-score end, so `ZREVRANGE z:enc:lp 0 1` is the top TWO (c, b) — the
+# compact-encoding branch sliced the score-ASCENDING entries and then reversed,
+# which only agrees with redis when the window covers the whole zset. That is
+# why the `0 -1` row above never caught it. These rows run on a bare connection,
+# i.e. the `dispatch_read` path where the bug was already live; the mutable
+# path is covered by `tests/read_preserves_compact_encoding.rs`, which drives
+# MULTI/EXEC and EVAL.
+assert_both "listpack zset ZREVRANGE 0 -1"      ZREVRANGE z:enc:lp 0 -1
+assert_both "listpack zset ZREVRANGE 0 1"       ZREVRANGE z:enc:lp 0 1
+assert_both "listpack zset ZREVRANGE 1 1"       ZREVRANGE z:enc:lp 1 1
+assert_both "listpack zset ZREVRANGE -2 -1"     ZREVRANGE z:enc:lp -2 -1
+assert_both "listpack zset ZREVRANGE past end"  ZREVRANGE z:enc:lp 5 10
+assert_both "listpack zset ZRANGE 0 1 REV"      ZRANGE z:enc:lp 0 1 REV
+# ...and every read above must leave the encoding alone (moon#928).
+assert_both "OBJECT ENCODING after zset reads"  OBJECT ENCODING z:enc:lp
 # A repeated member is an in-place UPDATE and must not promote or grow the set.
 both ZADD z:enc:lp 10 a
 assert_both "duplicate ZADD returns 0"          ZADD z:enc:lp 10 a
