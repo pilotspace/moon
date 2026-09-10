@@ -55,12 +55,11 @@ impl<'a> HashRef<'a> {
         match self {
             HashRef::Map(map) => map.get(field).cloned(),
             HashRef::Listpack(lp) => {
-                // Borrowed scan: only the value that actually matches is
-                // materialized, instead of every field walked past.
-                match lp.find_pair_index(field) {
-                    Some(idx) => lp.get_at(idx * 2 + 1).map(|v| v.to_bytes()),
-                    None => None,
-                }
+                // ONE borrowed scan: only the value that actually matches is
+                // materialized, instead of every field walked past -- and the
+                // listpack is not re-walked from the head to reach a position
+                // the lookup had already found (moon#799).
+                lp.pair_value(field).map(|v| Bytes::from(v.to_vec()))
             }
             HashRef::WithTtl {
                 fields,
@@ -370,15 +369,12 @@ impl<'a> SortedSetRef<'a> {
         match self {
             SortedSetRef::BPTree { members, .. } => members.get(member).copied(),
             SortedSetRef::Listpack(lp) => {
-                // Borrowed scan: walk members without materializing each one,
-                // then decode only the score that belongs to the match.
-                let idx = lp.find_pair_index(member)?;
-                match lp.get_at(idx * 2 + 1)? {
-                    super::listpack::ListpackEntry::Integer(i) => Some(i as f64),
-                    super::listpack::ListpackEntry::String(ref b) => {
-                        std::str::from_utf8(b).ok().and_then(|s| s.parse().ok())
-                    }
-                }
+                // ONE borrowed scan, and the score is read straight out of the
+                // borrowed view -- no second walk to an index the lookup had
+                // already reached, and nothing materialized at all (moon#799).
+                // `as_score` is the same rule `listpack_zset_find` applies on
+                // the write side, so ZSCORE and ZADD cannot disagree.
+                lp.pair_value(member)?.as_score()
             }
             SortedSetRef::Legacy { members, .. } => members.get(member).copied(),
             SortedSetRef::Owned { members, .. } => members.get(member).copied(),

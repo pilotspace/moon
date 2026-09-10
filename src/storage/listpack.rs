@@ -154,6 +154,22 @@ pub struct ListpackPairIter<'a> {
     inner: ListpackIter<'a>,
 }
 
+/// Where one field/value pair sits in the buffer.
+///
+/// Byte offsets, not an ordinal: an ordinal has to be walked back to from the
+/// head, which is exactly the second scan moon#799 is about. Every span is
+/// produced and consumed inside one `&mut self` method, so it can never
+/// outlive the bytes it names.
+#[derive(Debug, Clone, Copy)]
+struct PairSpan {
+    /// First byte of the FIELD entry.
+    field_start: usize,
+    /// First byte of the VALUE entry (one past the field's backlen).
+    value_start: usize,
+    /// One past the VALUE entry's backlen.
+    value_end: usize,
+}
+
 impl Listpack {
     /// Create a new empty listpack.
     pub fn new() -> Self {
@@ -201,68 +217,54 @@ impl Listpack {
     }
 
     /// Get entry at a given index (O(N) scan).
+    ///
+    /// The walk is borrowed ([`seek_to`]); only the entry actually returned
+    /// is materialized.
     pub fn get_at(&self, index: usize) -> Option<ListpackEntry> {
-        let mut pos = 6; // start after header
-        for i in 0..=index {
-            if pos >= self.data.len() - 1 || self.data[pos] == LP_TERMINATOR {
-                return None;
-            }
-            let (entry, next_pos) = decode_entry_at(&self.data, pos);
-            if i == index {
-                return Some(entry);
-            }
-            pos = next_pos;
-        }
-        None
+        let (pos, _next) = seek_to(&self.data, index)?;
+        let (entry, _) = decode_entry_at(&self.data, pos);
+        Some(entry)
     }
 
     /// Remove entry at a given index. Returns true if removed.
+    ///
+    /// Allocation-free: the removed entry is discarded, so nothing on the
+    /// path to it -- including it -- is ever decoded into a `Vec`.
     pub fn remove_at(&mut self, index: usize) -> bool {
-        let mut pos = 6;
-        for i in 0..=index {
-            if pos >= self.data.len() - 1 || self.data[pos] == LP_TERMINATOR {
-                return false;
-            }
-            let (_entry, next_pos) = decode_entry_at(&self.data, pos);
-            if i == index {
+        match seek_to(&self.data, index) {
+            Some((pos, next_pos)) => {
                 self.data.drain(pos..next_pos);
                 self.update_header_dec();
-                return true;
+                true
             }
-            pos = next_pos;
+            None => false,
         }
-        false
     }
 
     /// Replace entry at a given index with a new value.
+    ///
+    /// The replaced entry is discarded, so it is never decoded either: the
+    /// only allocation is the encoding of the replacement.
     pub fn replace_at(&mut self, index: usize, value: &[u8]) {
-        let mut pos = 6;
-        for i in 0..=index {
-            if pos >= self.data.len() - 1 || self.data[pos] == LP_TERMINATOR {
-                return;
-            }
-            let (_entry, next_pos) = decode_entry_at(&self.data, pos);
-            if i == index {
-                let encoded = encode_entry(value);
-                self.data.splice(pos..next_pos, encoded.iter().cloned());
-                // Update total_bytes in header (len unchanged)
-                let total = self.data.len() as u32;
-                self.data[0..4].copy_from_slice(&total.to_le_bytes());
-                return;
-            }
-            pos = next_pos;
-        }
+        let Some((pos, next_pos)) = seek_to(&self.data, index) else {
+            return;
+        };
+        let encoded = encode_entry(value);
+        self.data.splice(pos..next_pos, encoded.iter().cloned());
+        // Update total_bytes in header (len unchanged)
+        let total = self.data.len() as u32;
+        self.data[0..4].copy_from_slice(&total.to_le_bytes());
     }
 
     /// Find the index of the first entry matching value.
+    ///
+    /// Borrowed: `ListpackRef::eq_bytes` applies the same canonical-integer
+    /// rule `make_entry_for_compare` did -- a stored `Integer(7)` answers to
+    /// `b"7"` and to nothing else -- so this decides identically to the old
+    /// `iter()`-and-compare while allocating neither the probe nor the
+    /// entries it walks past. SISMEMBER against a set listpack is this call.
     pub fn find(&self, value: &[u8]) -> Option<usize> {
-        let target = make_entry_for_compare(value);
-        for (i, entry) in self.iter().enumerate() {
-            if entry == target {
-                return Some(i);
-            }
-        }
-        None
+        self.iter_refs().position(|entry| entry.eq_bytes(value))
     }
 
     /// Forward iterator.
@@ -317,6 +319,98 @@ impl Listpack {
     /// Whether any entry equals `value`, without allocating.
     pub fn contains_element(&self, value: &[u8]) -> bool {
         self.iter_refs().any(|e| e.eq_bytes(value))
+    }
+
+    /// Byte spans of the pair whose FIELD equals `field`.
+    ///
+    /// This is [`Listpack::find_pair_index`] keeping the byte offsets it
+    /// already walked past instead of throwing them away and returning an
+    /// ordinal the caller has to walk BACK to. It is the whole content of the
+    /// one-scan pair operations below.
+    fn locate_pair(&self, field: &[u8]) -> Option<PairSpan> {
+        let data = &self.data;
+        let mut pos = 6; // after header
+        let mut remaining = self.len();
+        while remaining >= 2 {
+            if pos >= data.len() - 1 || data[pos] == LP_TERMINATOR {
+                return None;
+            }
+            let (f, value_start) = decode_entry_ref_at(data, pos);
+            // A trailing field with no value is not a pair. `iter_pair_refs`
+            // draws the same line by requiring two `next()`s.
+            if value_start >= data.len() - 1 || data[value_start] == LP_TERMINATOR {
+                return None;
+            }
+            let (_v, value_end) = decode_entry_ref_at(data, value_start);
+            if f.eq_bytes(field) {
+                return Some(PairSpan {
+                    field_start: pos,
+                    value_start,
+                    value_end,
+                });
+            }
+            pos = value_end;
+            remaining -= 2;
+        }
+        None
+    }
+
+    /// Value of the pair whose FIELD equals `field`, borrowed. ONE scan.
+    ///
+    /// HGET and ZSCORE used to call `find_pair_index` and then `get_at`,
+    /// which walks the listpack a SECOND time from the head to reach an
+    /// index the first walk had already arrived at.
+    pub fn pair_value(&self, field: &[u8]) -> Option<ListpackRef<'_>> {
+        let span = self.locate_pair(field)?;
+        let (value, _) = decode_entry_ref_at(&self.data, span.value_start);
+        Some(value)
+    }
+
+    /// Replace the VALUE of the pair whose FIELD equals `field`. ONE scan.
+    /// Returns whether the field was present.
+    ///
+    /// This is the HSET-onto-an-existing-field write. It used to be
+    /// `find_pair_index` (a borrowed scan) followed by `replace_at` (a
+    /// second scan from the head), so a 128-field hash was walked 256 entries
+    /// to change one value (moon#799).
+    pub fn replace_pair_value(&mut self, field: &[u8], value: &[u8]) -> bool {
+        let Some(span) = self.locate_pair(field) else {
+            return false;
+        };
+        let encoded = encode_entry(value);
+        self.data
+            .splice(span.value_start..span.value_end, encoded.iter().cloned());
+        // Element count unchanged; only total_bytes moves.
+        let total = self.data.len() as u32;
+        self.data[0..4].copy_from_slice(&total.to_le_bytes());
+        true
+    }
+
+    /// Remove the pair whose FIELD equals `field`, both entries. ONE scan.
+    /// Returns whether the field was present.
+    ///
+    /// This is HDEL, which used to run THREE scans: `find_pair_index`, then
+    /// `remove_at` for the value, then `remove_at` again for the field.
+    pub fn remove_pair(&mut self, field: &[u8]) -> bool {
+        let Some(span) = self.locate_pair(field) else {
+            return false;
+        };
+        self.data.drain(span.field_start..span.value_end);
+        self.update_header_sub(2);
+        true
+    }
+
+    /// Remove the pair whose FIELD equals `field` and return its VALUE.
+    /// ONE scan; the matched value is the only entry materialized.
+    pub fn take_pair_value(&mut self, field: &[u8]) -> Option<Bytes> {
+        let span = self.locate_pair(field)?;
+        let value = {
+            let (entry, _) = decode_entry_at(&self.data, span.value_start);
+            entry.to_bytes()
+        };
+        self.data.drain(span.field_start..span.value_end);
+        self.update_header_sub(2);
+        Some(value)
     }
 
     /// Iterate as (field, value) pairs for hash usage.
@@ -392,11 +486,24 @@ impl Listpack {
     }
 
     fn update_header_dec(&mut self) {
+        self.update_header_sub(1);
+    }
+
+    /// Drop `n` from the element count and re-stamp `total_bytes`.
+    ///
+    /// `remove_pair` takes both entries out in one `drain`, so it must also
+    /// account for both in one header write -- calling the single-entry
+    /// version twice would re-derive `total_bytes` from the same buffer twice
+    /// for no reason.
+    fn update_header_sub(&mut self, n: u16) {
         let total = self.data.len() as u32;
         self.data[0..4].copy_from_slice(&total.to_le_bytes());
         let count = u16::from_le_bytes([self.data[4], self.data[5]]);
-        debug_assert!(count > 0, "listpack element count decremented below zero");
-        let new_count = count.saturating_sub(1);
+        debug_assert!(
+            count >= n,
+            "listpack element count decremented below zero (by {n}, from {count})"
+        );
+        let new_count = count.saturating_sub(n);
         self.data[4..6].copy_from_slice(&new_count.to_le_bytes());
     }
 }
@@ -410,6 +517,13 @@ fn try_encode_as_integer(value: &[u8]) -> Option<i64> {
 }
 
 /// Create an entry for comparison from raw bytes.
+///
+/// This WAS the probe `Listpack::find` built before every lookup -- an owned
+/// `ListpackEntry`, so a `Vec` per call on top of the one per entry walked.
+/// `find` now compares with [`ListpackRef::eq_bytes`] instead; this is kept
+/// as the oracle that pins the two rules together
+/// (`find_agrees_with_owned_compare`).
+#[cfg(test)]
 fn make_entry_for_compare(value: &[u8]) -> ListpackEntry {
     if let Some(i) = try_encode_as_integer(value) {
         ListpackEntry::Integer(i)
@@ -748,6 +862,36 @@ fn decode_entry_ref_at(data: &[u8], pos: usize) -> (ListpackRef<'_>, usize) {
             _ => panic!("Unknown listpack encoding byte: 0x{:02X}", b0),
         }
     }
+}
+
+/// Byte range `(start, next)` of the entry at `index`, found by a BORROWED
+/// walk. `None` when the listpack has fewer than `index + 1` entries.
+///
+/// The walk only ever needs each entry's WIDTH in order to step over it, and
+/// `decode_entry_ref_at` already returns exactly that alongside a view that
+/// costs nothing to build. `decode_entry_at` -- what this replaced -- copies
+/// every string entry it passes into a fresh `Vec`, so `remove_at` and
+/// `replace_at`, which discard the entry entirely, paid one malloc/free per
+/// entry they merely stepped over. On the HSET-onto-an-existing-field path
+/// that is ~n allocations per command, inside `src/command/`, which
+/// CLAUDE.md forbids from allocating at all (moon#799).
+///
+/// Sharing `decode_entry_ref_at` is deliberate: entry widths are decided in
+/// ONE place for all nine encodings, so a seek can never disagree with a
+/// decode about where the next entry starts.
+fn seek_to(data: &[u8], index: usize) -> Option<(usize, usize)> {
+    let mut pos = 6; // start after header
+    for i in 0..=index {
+        if pos >= data.len() - 1 || data[pos] == LP_TERMINATOR {
+            return None;
+        }
+        let (_entry, next_pos) = decode_entry_ref_at(data, pos);
+        if i == index {
+            return Some((pos, next_pos));
+        }
+        pos = next_pos;
+    }
+    None
 }
 
 impl<'a> Iterator for ListpackRefIter<'a> {
@@ -1147,68 +1291,6 @@ mod tests {
 mod zero_alloc_scan_tests {
     use super::*;
 
-    /// The borrowed view must agree with the owning decoder on every entry,
-    /// for both the integer and the string encodings. If these ever diverge,
-    /// the zero-alloc scan would silently answer a different question than the
-    /// allocating one it replaces.
-    #[test]
-    fn refs_agree_with_owned_entries() {
-        let mut lp = Listpack::new();
-        // Cover every encoding width the decoder distinguishes.
-        let inputs: Vec<Vec<u8>> = vec![
-            b"0".to_vec(),
-            b"127".to_vec(),
-            b"-1".to_vec(),
-            b"4095".to_vec(),
-            b"-4096".to_vec(),
-            b"32767".to_vec(),
-            b"-32768".to_vec(),
-            b"8388607".to_vec(),
-            b"2147483647".to_vec(),
-            b"9223372036854775807".to_vec(),
-            b"-9223372036854775808".to_vec(),
-            b"".to_vec(),
-            b"short".to_vec(),
-            // NOTE: non-canonical integer spellings (`0123`, `+5`) are
-            // deliberately absent. On this branch the ENCODER still folds them
-            // to `123` / `5`, losing the original bytes -- that is bug #795,
-            // fixed separately in `try_encode_as_integer`. Asserting the
-            // correct round trip here would fail for a defect this change does
-            // not own. `find_pair_index_handles_integer_encoded_fields` still
-            // covers the LOOKUP side, which is what this change is responsible
-            // for: a non-canonical query must not match a canonical entry.
-            vec![b'x'; 63],   // 6-bit string boundary
-            vec![b'y'; 64],   // just past it
-            vec![b'z'; 4095], // 12-bit string boundary
-        ];
-        for v in &inputs {
-            lp.push_back(v);
-        }
-
-        let owned: Vec<ListpackEntry> = lp.iter().collect();
-        let borrowed: Vec<ListpackRef<'_>> = lp.iter_refs().collect();
-        assert_eq!(owned.len(), inputs.len(), "iter() lost entries");
-        assert_eq!(borrowed.len(), inputs.len(), "iter_refs() lost entries");
-
-        for (i, (o, b)) in owned.iter().zip(borrowed.iter()).enumerate() {
-            assert_eq!(
-                o.as_bytes(),
-                b.to_vec(),
-                "entry {i} decoded differently by iter_refs()"
-            );
-            // The comparison helper is the thing the hot paths actually call.
-            assert!(
-                b.eq_bytes(&inputs[i]),
-                "entry {i} ({:?}) failed eq_bytes against its own input",
-                inputs[i]
-            );
-            assert!(
-                !b.eq_bytes(b"\xffdefinitely-not-this"),
-                "entry {i} matched a value it does not hold"
-            );
-        }
-    }
-
     /// `find_pair_index` replaces the allocating `iter_pairs()` scan in HSET.
     /// It must return the FIELD index (not the raw entry index) and must only
     /// ever match on field positions -- a value that happens to equal the
@@ -1302,6 +1384,104 @@ mod zero_alloc_scan_tests {
                 backlen_size(n),
                 encode_backlen(n).len(),
                 "backlen_size disagreed at entry_len={n}"
+            );
+        }
+    }
+
+    /// Every encoding width the format has, laid out so `seek_to` has to get
+    /// all nine arms right to reach the ones after them.
+    fn all_encoding_widths() -> Vec<Vec<u8>> {
+        vec![
+            b"0".to_vec(),                    // 7-bit uint
+            b"127".to_vec(),                  // 7-bit uint, top
+            b"-1".to_vec(),                   // 13-bit int
+            b"4095".to_vec(),                 // 13-bit int, top
+            b"32767".to_vec(),                // 16-bit int
+            b"8388607".to_vec(),              // 24-bit int
+            b"2147483647".to_vec(),           // 32-bit int
+            b"9223372036854775807".to_vec(),  // 64-bit int
+            b"-9223372036854775808".to_vec(), // 64-bit int, bottom
+            b"".to_vec(),                     // 6-bit string, empty
+            vec![b'x'; 63],                   // 6-bit string, top
+            vec![b'y'; 64],                   // 12-bit string
+            vec![b'z'; 4095],                 // 12-bit string, top
+            vec![b'w'; 4096],                 // 32-bit string
+        ]
+    }
+
+    /// `seek_to` walks with the BORROWED decoder while `get_at` still decodes
+    /// the owned entry it lands on. The two must agree on every entry
+    /// boundary the format has -- a width wrong by one byte in any arm would
+    /// leave the seek reading the middle of the next entry, and there are
+    /// nine arms, not two.
+    #[test]
+    fn seek_to_agrees_with_the_owned_walk_on_every_encoding() {
+        let inputs = all_encoding_widths();
+        let mut lp = Listpack::new();
+        for v in &inputs {
+            lp.push_back(v);
+        }
+
+        // Independent oracle: walk with the OWNED decoder, recording the same
+        // (start, next) pairs `seek_to` claims.
+        let mut pos = 6;
+        for (i, input) in inputs.iter().enumerate() {
+            let (entry, next) = decode_entry_at(&lp.data, pos);
+            assert_eq!(
+                seek_to(&lp.data, i),
+                Some((pos, next)),
+                "seek_to disagreed with the owned walk at index {i}"
+            );
+            assert_eq!(entry.as_bytes(), *input, "owned walk itself lost entry {i}");
+            assert_eq!(
+                lp.get_at(i).map(|e| e.as_bytes()).as_deref(),
+                Some(input.as_slice()),
+                "get_at returned the wrong bytes at index {i}"
+            );
+            pos = next;
+        }
+        assert_eq!(seek_to(&lp.data, inputs.len()), None, "seek past the end");
+    }
+
+    /// `find` compares borrowed now. It must decide identically to the owned
+    /// probe it replaced, canonical-integer rule included.
+    #[test]
+    fn find_agrees_with_owned_compare() {
+        let mut lp = Listpack::new();
+        let stored: Vec<Vec<u8>> = vec![
+            b"12345".to_vec(),
+            b"hello".to_vec(),
+            b"0".to_vec(),
+            b"-9223372036854775808".to_vec(),
+            b"".to_vec(),
+            vec![b'q'; 300],
+        ];
+        for v in &stored {
+            lp.push_back(v);
+        }
+
+        let probes: Vec<Vec<u8>> = vec![
+            b"12345".to_vec(),
+            b"000000012345".to_vec(),
+            b"+12345".to_vec(),
+            b"hello".to_vec(),
+            b"HELLO".to_vec(),
+            b"0".to_vec(),
+            b"-0".to_vec(),
+            b"".to_vec(),
+            b"-9223372036854775808".to_vec(),
+            vec![b'q'; 300],
+            vec![b'q'; 299],
+            b"absent".to_vec(),
+        ];
+        for probe in &probes {
+            let target = make_entry_for_compare(probe);
+            let oracle = lp.iter().position(|e| e == target);
+            assert_eq!(
+                lp.find(probe),
+                oracle,
+                "find disagreed with the owned probe for {:?}",
+                String::from_utf8_lossy(probe)
             );
         }
     }

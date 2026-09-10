@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`storage`: the listpack write path stops walking twice and stops
+  allocating per entry it walks past (moon#799).** `get_at`, `remove_at` and
+  `replace_at` reached their index with the OWNED decoder, which copies every
+  string entry into a fresh `Vec` — and `remove_at`/`replace_at` then threw
+  that entry away. `HSET` onto an existing field also scanned the listpack
+  TWICE: once allocation-free to find the field, then again from the head to
+  reach the position the first scan had already arrived at. On a 128-field
+  hash that was ~256 entries walked and ~260 malloc/free pairs to change one
+  value, inside `src/command/`, which forbids allocating at all. The walk now
+  uses the borrowed decoder (`seek_to`), and `HSET`/`HMSET`/`HDEL`/`HGETDEL`/
+  `HGET`/`ZSCORE` route through one-scan pair operations
+  (`replace_pair_value`, `remove_pair`, `take_pair_value`, `pair_value`).
+  `Listpack::find` — SISMEMBER against a set listpack — moved to the borrowed
+  comparison too. Allocations per call, counted by a `GlobalAlloc` wrapper on
+  an 8- vs 128-pair listpack: `replace_at` 20/260 -> 4/4, `remove_at` 16/256
+  -> 0/0, `get_at` 16/256 -> 1/1. **Ratios only, macOS aarch64,
+  `--profile release-fast`, interleaved legs — NOT Linux numbers.**
+  `benches/listpack_write_path` at 128 fields: HSET-existing 5.3x, HGET 5.5x,
+  HDEL 8.8x, SISMEMBER 5.6x. End to end (`redis-benchmark -t hset -P 16 -r N`,
+  `--shards 1`): 128 fields 3.39x, 64 fields 2.53x, 32 fields 2.10x. The
+  internal control is the point — moon's listpack was **5.80x slower than
+  moon's own hashtable** on this host and is now **1.67x**; the promoted
+  hashtable rows are the negative control and did not move (0.97x, 1.01x).
+
 - **`text`/`vector`: one tokenization per HASH field, shared by the BM25 text
   plane and the vector payload index (moon#885).** An `HSET` into a key that
   matches both a text index and a vector index ran the whole analysis

@@ -65,13 +65,12 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
                         Some(v) => v,
                         None => return err_wrong_args("HSET"),
                     };
-                    // Locate the field WITHOUT materializing every entry we
-                    // walk past: the old scan decoded each field into a fresh
-                    // `Vec` just to compare and drop it, so one HSET against a
-                    // 128-field listpack ran hundreds of malloc/free pairs.
-                    if let Some(idx) = lp.find_pair_index(field.as_ref()) {
-                        lp.replace_at(idx * 2 + 1, value);
-                    } else {
+                    // ONE borrowed scan locates the field and overwrites its
+                    // value in place. Locating it and then calling
+                    // `replace_at` walked the listpack a second time from the
+                    // head to reach a position the first walk had already
+                    // arrived at (moon#799).
+                    if !lp.replace_pair_value(field.as_ref(), value) {
                         lp.push_back(field);
                         lp.push_back(value);
                         count += 1;
@@ -254,9 +253,8 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
                         Some(v) => v,
                         None => return err_wrong_args("HMSET"),
                     };
-                    if let Some(idx) = lp.find_pair_index(field.as_ref()) {
-                        lp.replace_at(idx * 2 + 1, value);
-                    } else {
+                    // One borrowed scan -- see the matching comment in `hset`.
+                    if !lp.replace_pair_value(field.as_ref(), value) {
                         lp.push_back(field);
                         lp.push_back(value);
                     }
