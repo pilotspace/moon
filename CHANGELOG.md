@@ -68,6 +68,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for numeric-looking members (`+5`, `000000012345`, `-0` — moon#795/#903) are
   unchanged, verified row by row against a live redis oracle at, below and one
   past every set threshold.
+- **`ZINCRBY` and `ZREM` no longer flatten a small sorted set (moon#897).**
+  Both reached for the eager `get_or_create_sorted_set`, which upgrades a
+  `SortedSetListpack` on ACCESS — so one `ZINCRBY` or `ZREM` turned a
+  three-member zset into a `skiplist`, and because nothing demotes (moon#832)
+  it stayed that way for the key's lifetime. Measured against redis 8.6.1 on
+  one shard: `zadd z 1 a 2 b 3 c` was `listpack` on both, and one `ZINCRBY z 5
+  b` left moon on `skiplist` where redis stays `listpack`. Since moon#787
+  measured the full zset form at 20.5× Redis's, that made the compact encoding
+  reachable only for a key nobody ever updates — which is the opposite of the
+  leaderboard and counter workloads the encoding exists for. Both commands now
+  mutate the listpack in place and consult the one `EncodingLimits` authority
+  (moon#896) for the entry gate and the upgrade check, so a zset that
+  genuinely crosses `zset-max-listpack-entries` (128) or
+  `zset-max-listpack-value` (64) still promotes, and one already promoted is
+  never demoted. Replies, score rendering, `inf`/`-inf` handling and the
+  delete-on-empty rule are byte-identical to before: an A/B of the two
+  binaries over 56 scripted cases diverges on `OBJECT ENCODING` and nothing
+  else. A `ZINCRBY` whose result would be `NaN` (`inf + -inf`) is deliberately
+  routed to the B+tree arm — `render_score(NaN)` is not round-trippable
+  through a listpack (the moon#863 shape), and moon's pre-existing reply for
+  that case is unchanged.
 
 - **`--max-wal-size` now reaches the WAL overflow ceiling (moon#916).** The flag
   configured `CheckpointTrigger` but never `WalWriterV3`, whose bounds setter
