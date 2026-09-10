@@ -103,6 +103,12 @@ jobs:
       # silently, so its self-test runs here: pure bash, no server, <1s.
       - name: Consistency-gate self-test (moon#762)
         run: bash scripts/consistency-gate.sh --self-test
+      # Same reasoning for the single-process lib gate (moon#904): it waives
+      # one known failure (moon#856) and rejects a truncated run, and a waiver
+      # that quietly stops refusing anything is indistinguishable from a green
+      # build. Pure bash against synthetic transcripts, <1s, no cargo.
+      - name: Libtest-singleproc-gate self-test (moon#904)
+        run: bash scripts/libtest-singleproc-gate.sh --self-test
       # Nothing else in CI compiles `fuzz/`, and it showed: `mq_registry_blob`
       # failed to BUILD on every nightly from at least 2026-07-17 — running zero
       # executions the whole time — because `ShardStoreMemory` gained two fields
@@ -221,6 +227,25 @@ jobs:
         # and a cold CARGO_TARGET_DIR on the self-hosted VM exceeds 15m.
         # Warm runs finish in a few minutes.
         timeout-minutes: 30
+      # moon#904: the SAME lib tests again, in ONE process. nextest above forks
+      # a process per test, so a bug whose mechanism is process-global state
+      # leaking from one test into another never gets a second test to reach —
+      # statics, OnceLock/OnceCell, env vars, allocator state, installed hooks.
+      # moon#856 is exactly that: it PASSES under nextest and FAILS under
+      # `cargo test --lib` on the same commit, host and binary. Every gate in
+      # this repo ran nextest, so the whole class was invisible and #856 read
+      # as an environment-specific flake for months.
+      #
+      # The test binary is already built by the Test step above, so this is
+      # execution time. Measured on the macOS host at 65fa069e for this feature
+      # set: 4470 passed / 1 failed in 27s. MIN_LIBTEST_TESTS is lowered
+      # because this leg drops `graph` and `text-index` (4470 tests, not 5337);
+      # it is a floor against a truncated run, not a drift tracker.
+      - name: Test (lib, SINGLE process — moon#904)
+        env:
+          MIN_LIBTEST_TESTS: "4000"
+        run: ./scripts/libtest-singleproc-gate.sh --no-default-features --features runtime-tokio,jemalloc
+        timeout-minutes: 15
       - name: Doctests
         run: cargo test --doc --no-default-features --features runtime-tokio,jemalloc
         timeout-minutes: 5
@@ -294,6 +319,15 @@ jobs:
         # 30m mirrors `check`: the budget is dominated by compiling test
         # binaries on a cold CARGO_TARGET_DIR, not by the 80s of test time.
         timeout-minutes: 30
+      # moon#904: the same lib tests once more, in ONE process. nextest above
+      # forks a process per test, so a leak of process-global state from one
+      # test into another has no second test to reach — the class that made
+      # moon#856 invisible to every gate. Default features here, so the full
+      # count applies (5336-5338 depending on host); the binary is already
+      # built by the step above, so this is execution time (~70s on Linux).
+      - name: Test (lib, SINGLE process — moon#904)
+        run: ./scripts/libtest-singleproc-gate.sh
+        timeout-minutes: 15
 
   # ── macOS — clippy + test (tokio), clippy (monoio/kqueue) ───────────
   # Main-push only (2026-07-13 queue-killer round): macOS runners are the

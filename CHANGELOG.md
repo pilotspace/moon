@@ -214,6 +214,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `000000012345` and `-0` — which an intset both rewrites (moon#795) and
   collapses into fewer members. A byte-transparency guard over exactly those
   spellings ships here, and the cold path is correct only with moon#903 fixed.
+- **`ci`: the merge bar can now see process-global state leaks between tests,
+  and lints console test code (moon#904, moon#905).** Two proven holes in
+  moon's own gates. (1) Every configured test gate — both VM suites and both
+  `--native` suites in `scripts/ci-local.sh`, plus the hosted `Check` and
+  `check-monoio` jobs — runs `cargo nextest`, which forks a process per test.
+  A bug whose mechanism is process-global state leaking from one test into
+  another therefore never gets a second test to reach, and moon#856 has been
+  read as an environment-specific flake for months because of it. Measured on
+  the macOS host at `65fa069e`, same target dir and same test binary:
+  `cargo nextest run --lib` 5338/5338 green, `cargo test --lib` 5337 passed /
+  1 failed. nextest is KEPT for the other ~6000 tests; a single-process
+  `scripts/libtest-singleproc-gate.sh` stage now runs beside it (36s on macOS,
+  ~70s on Linux). It ASSERTS four things — the suite reached its summary, it
+  ran at least `MIN_LIBTEST_TESTS`, there is at most one failure, and that
+  failure is moon#856 by name — and REPORTS the passed count against a
+  **platform-keyed** baseline without gating on it, because Linux-only `cfg`
+  code compiles ~21 Linux-only tests that macOS never runs and a single
+  hardcoded figure would read as a phantom regression on the other platform.
+  The gate ships a `--self-test` (13 synthetic transcripts) that ci-local and
+  the hosted Lint job run first, so its waiver is proven able to refuse before
+  any run is trusted. (2)
+  `cargo clippy --features console --all-targets` failed on `main`: two
+  deny-by-default `clippy::approx_constant` errors in `console_gateway.rs`'s
+  own `#[cfg(test)]` block. The lint needs `--all-targets` AND `console`, and
+  no gate had both — ci-local's console leg omitted `--all-targets`, every
+  `--all-targets` leg omitted `console`. The intersection was empty for as
+  long as the module has existed. The test's `3.14` becomes `3.5` (the
+  assertion never cared which float), and both the ci-local and `check-console`
+  legs gain `--all-targets`.
 
 - **`text`: the `TMX3` TAG/NUMERIC sidecar block is now proven compatible
   in both directions, and the format no longer depends on the build's

@@ -52,6 +52,10 @@
 #     VANISHED VM through -- and then every VM leg fails at 0s while the
 #     run spends ~20 more minutes on the macOS suite before blaming the
 #     tests. "Cannot measure" and "cannot reach" are now separate.
+#   * Both suites run under `cargo nextest`, which forks a process per
+#     test — so no suite here can see a bug that leaks PROCESS-GLOBAL
+#     state from one test into another (moon#904). nextest is kept; a
+#     single-process `cargo test --lib` stage runs beside it.
 #   * The tree is fingerprinted at start and re-checked at the end: a
 #     branch switch or edit mid-run silently invalidates every result
 #     (suites compile from a mutating tree), so the run refuses to
@@ -547,6 +551,12 @@ run_step "audit-tempdirs"     bash scripts/audit-test-tempdirs.sh       || exit 
 # `EncodingLimits` authority; the guard's self-test proves it can still fail.
 run_step "audit-encoding self" bash scripts/audit-encoding-limits.sh --self-test || exit 1
 run_step "audit-encoding"     bash scripts/audit-encoding-limits.sh     || exit 1
+# moon#904: the single-process lib stage below waives one known failure
+# (moon#856). A waiver that cannot be shown to REFUSE anything is not a gate,
+# so its verdict logic is exercised against synthetic transcripts here, in
+# under a second, before any run is trusted — same shape as the tempdir
+# self-test above and consistency-gate.sh's.
+run_step "libtest-gate self"  bash scripts/libtest-singleproc-gate.sh --self-test || exit 1
 run_step "clippy (default)"   env CARGO_TARGET_DIR=target-clippy \
   cargo clippy -- -D warnings                                          || exit 1
 run_step "clippy (tokio)"     env CARGO_TARGET_DIR=target-tokio \
@@ -648,6 +658,25 @@ if [ "$MODE" != "quick" ] && [ "$MODE" != "native" ]; then
   else
     run_step "VM suites, concurrent (monoio + tokio)" vm_suites_concurrent
   fi
+
+  # ── Phase 1b: the lib tests AGAIN, in ONE process (moon#904) ────────
+  # Both suites above run under nextest, which forks a process per test. So
+  # does the hosted Check leg, and so do both --native suites. That means NO
+  # configured gate can see a bug whose mechanism is process-global state
+  # leaking from one test into another — the leak never gets a second test to
+  # reach. moon#856 is exactly that, and it PASSES under nextest and FAILS
+  # under `cargo test --lib` on the same commit, the same host and the same
+  # binary (measured on Linux aarch64 at f7c83769, and again on this macOS
+  # host at 65fa069e: nextest 5338/5338 green, single-process 5337 passed /
+  # 1 failed).
+  #
+  # nextest is KEPT for the other ~6000 tests; this only adds the old runner
+  # back beside it, on the monoio target dir the suite above just warmed, so
+  # it is execution time and not a second build. See the gate script for the
+  # count baseline, the waiver's maintenance story, and the developer trap
+  # that re-running the red test alone is not a valid control.
+  VM_LIBTEST_CMD="export CARGO_TARGET_DIR=\$HOME/ci-target/local-monoio MOON_DISK_FREE_MIN_PCT=0 $CI_BUILD_ENV; ./scripts/libtest-singleproc-gate.sh"
+  run_step "VM lib tests, SINGLE process (moon#904)" vm "$VM_LIBTEST_CMD"
 fi
 
 if [ "$MODE" = "native" ]; then
@@ -668,6 +697,19 @@ if [ "$MODE" = "native" ]; then
     env MOON_NO_URING=1 CARGO_TARGET_DIR=target-tokio MOON_DISK_FREE_MIN_PCT=0 \
     CARGO_INCREMENTAL=0 \
     bash -c "$HOST_TEST_TOKIO"
+
+  # ── Native phase 1b: the lib tests AGAIN, in ONE process (moon#904) ─
+  # Both suites above run under nextest, which forks a process per test —
+  # so a bug that leaks process-global state from one test into another has
+  # no second test to reach, and no configured gate can see it. Measured on
+  # THIS host at 65fa069e, same target dir, same test binary: nextest --lib
+  # 5338/5338 green, `cargo test --lib` 5337 passed / 1 failed (moon#856).
+  # Reuses the default `target/` the monoio suite above just warmed, so this
+  # is execution time only — 31s here, ~70s on the GCE Linux host. See the
+  # gate script for the baseline and the "isolating the red test proves
+  # nothing" trap.
+  run_step "native lib tests, SINGLE process (moon#904)" \
+    env MOON_DISK_FREE_MIN_PCT=0 ./scripts/libtest-singleproc-gate.sh
 
   # ── Native phase 2: client-compat against brew's redis-server ──────
   # Refuses rather than skips when the oracle is missing: a compat gate
