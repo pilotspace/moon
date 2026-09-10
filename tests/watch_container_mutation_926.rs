@@ -679,6 +679,124 @@ fn wcm10_a_self_issued_container_write_aborts_the_watch() {
     }
 }
 
+/// THE READ DIRECTION, ON THE PATHS THAT REACH THE PROMOTING ACCESSOR.
+///
+/// `wcm8` alone is not enough, and that was established by mutation rather
+/// than assumed: injecting a version bump into `Database::get_promoted` — the
+/// exact mistake this fix has to avoid — left all thirteen other tests GREEN.
+/// Every read `wcm8` issues is on `command::dispatch_read`'s 95-command fast
+/// path, which takes `&Database` and goes to `get_ref_if_alive`; it never
+/// reaches `get_promoted` at all.
+///
+/// The `&mut Database` read handlers that DO call `get_promoted`
+/// (`sorted_set_read::zcard`/`zscore`/`zrange`, `stream_read::xlen`, …) are
+/// reached when the read is not eligible for that fast path — inside a
+/// `MULTI` body, and through `EVAL`'s `redis.call`. Those are the routes here.
+/// A read must not abort a watcher no matter which dispatch path it takes.
+#[test]
+fn wcm14_reads_on_the_mutable_dispatch_paths_do_not_abort_a_live_watch() {
+    let (_g, port, _d) = server(1);
+    /// (label, seed commands, read commands, transaction body).
+    type ReadRouteCase = (
+        &'static str,
+        Vec<Vec<&'static str>>,
+        Vec<Vec<&'static str>>,
+        Vec<&'static str>,
+    );
+    let cases: [ReadRouteCase; 5] = [
+        (
+            "zset",
+            vec![vec!["ZADD", "k", "1", "a"]],
+            vec![
+                vec!["ZCARD", "k"],
+                vec!["ZSCORE", "k", "a"],
+                vec!["ZRANGE", "k", "0", "-1"],
+            ],
+            vec!["ZADD", "k", "9", "z"],
+        ),
+        (
+            "hash",
+            vec![vec!["HSET", "k", "f", "1"]],
+            vec![vec!["HGET", "k", "f"], vec!["HLEN", "k"]],
+            vec!["HSET", "k", "f", "9"],
+        ),
+        (
+            "set",
+            vec![vec!["SADD", "k", "a"]],
+            vec![vec!["SCARD", "k"], vec!["SMEMBERS", "k"]],
+            vec!["SADD", "k", "z"],
+        ),
+        (
+            "list",
+            vec![vec!["RPUSH", "k", "a"]],
+            vec![vec!["LLEN", "k"], vec!["LRANGE", "k", "0", "-1"]],
+            vec!["RPUSH", "k", "z"],
+        ),
+        (
+            "stream",
+            vec![vec!["XADD", "k", "1-1", "f", "v"]],
+            vec![vec!["XLEN", "k"]],
+            vec!["XADD", "k", "9-1", "f", "v"],
+        ),
+    ];
+
+    for route in ["MULTI", "EVAL"] {
+        for (label, seed, reads, body) in &cases {
+            let (mut a, mut b) = (connect_ready(port), connect_ready(port));
+            cmd(&mut a, &["DEL", "k"]);
+            for s in seed {
+                cmd(&mut a, s);
+            }
+            cmd(&mut a, &["WATCH", "k"]);
+
+            match route {
+                "MULTI" => {
+                    cmd(&mut b, &["MULTI"]);
+                    for r in reads {
+                        cmd(&mut b, r);
+                    }
+                    let e = cmd(&mut b, &["EXEC"]);
+                    assert!(
+                        !is_null(&e),
+                        "{label}/MULTI: the reader's own transaction must not abort — \
+                         this test cannot say anything about the watcher otherwise. Got {:?}",
+                        text(&e)
+                    );
+                }
+                _ => {
+                    for r in reads {
+                        let script = format!(
+                            "return redis.call({})",
+                            r.iter()
+                                .map(|x| format!("'{x}'"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        let e = cmd(&mut b, &["EVAL", &script, "0"]);
+                        assert!(
+                            !text(&e).starts_with('-'),
+                            "{label}/EVAL: the read script itself failed — the route is not \
+                             being exercised. Got {:?}",
+                            text(&e)
+                        );
+                    }
+                }
+            }
+
+            cmd(&mut a, &["MULTI"]);
+            cmd(&mut a, body);
+            let exec = cmd(&mut a, &["EXEC"]);
+            assert!(
+                !is_null(&exec),
+                "{label}/{route}: a pure READ taking the &mut Database dispatch path must \
+                 NOT abort a watching transaction. A version bump reached a read accessor \
+                 (`get_promoted` and its get_hash/get_list/get_set/get_sorted_set/get_stream \
+                 delegators hand back a SHARED reference — they are reads)."
+            );
+        }
+    }
+}
+
 /// PRECISION, where the storage layer can afford it. A write command that
 /// changed nothing must leave the watch intact — redis does not dirty a key
 /// for `HDEL` of an absent field, `HPERSIST` on a field with no TTL, `PERSIST`
