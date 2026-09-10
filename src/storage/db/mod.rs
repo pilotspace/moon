@@ -2945,6 +2945,46 @@ mod ledger_consistency_788 {
         );
     }
 
+    /// moon#899 (the `intset -> listpack` edge): the conversion is
+    /// self-accounting inside `get_or_create_set_listpack`, and the caller's
+    /// listpack before/after snapshot starts from the converted form. Every
+    /// step — intset creation, the edge, growth past the listpack threshold
+    /// into the `IndexSet`, deletion — must leave the running ledger equal to
+    /// a recompute, and the cycle must return to the floor.
+    #[test]
+    fn sadd_intset_to_listpack_edge_keeps_the_ledger_exact() {
+        use crate::command::set::sadd;
+        let max_items = crate::storage::db::EncodingLimits::moon_defaults().set_entries;
+        let mut db = Database::new();
+        let floor = db.estimated_memory();
+        sadd(&mut db, &[f(b"s"), f(b"1"), f(b"2"), f(b"3")]);
+        assert_ledger_exact(&mut db, "after SADD creating an intset");
+        sadd(&mut db, &[f(b"s"), f(b"abc")]);
+        assert_eq!(
+            crate::command::key::object(&mut db, &[f(b"ENCODING"), f(b"s")]),
+            Frame::BulkString(Bytes::from_static(b"listpack")),
+            "fixture: the edge must have been taken"
+        );
+        assert_ledger_exact(&mut db, "after the intset -> listpack edge");
+        sadd(&mut db, &[f(b"s"), f(b"4"), f(b"def")]);
+        assert_ledger_exact(&mut db, "after mixed growth in the converted listpack");
+        for i in 0..=max_items {
+            let m = format!("m{i:04}");
+            sadd(&mut db, &[f(b"s"), f(m.as_bytes())]);
+        }
+        assert_ledger_exact(
+            &mut db,
+            "after growing the converted listpack past the threshold",
+        );
+        crate::command::key::del(&mut db, &[f(b"s")]);
+        assert_ledger_exact(&mut db, "after DEL");
+        assert_eq!(
+            db.estimated_memory(),
+            floor,
+            "the cycle must return to the floor"
+        );
+    }
+
     /// moon#787 (`ZADD` listpack path) meets moon#814: a listpack zset that
     /// receives a command with a bad score in the middle must be left exactly
     /// as it was — nothing written, nothing charged — and a FRESH key must

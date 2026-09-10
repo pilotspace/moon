@@ -84,6 +84,7 @@ fn field(i: usize) -> Vec<u8> {
 }
 
 /// The restart path: encode the full form, decode with re-derivation.
+#[allow(clippy::expect_used)] // test-only module: a failed codec round trip IS the test failing
 fn decoded_encoding(v: &RedisValueRef) -> String {
     let mut buf = Vec::new();
     encode_value_body(v, &mut buf).expect("encode");
@@ -194,6 +195,73 @@ fn list_row(n: usize, len: usize) -> [String; 3] {
     [bulk, incr, decode]
 }
 
+/// Sizes for the intset family: both intset boundaries, plus the listpack
+/// boundary an intset crosses when a string joins it (moon#899).
+const INTSET_SIZES: &[usize] = &[1, 3, 63, 64, 100, 126, 127, 128, 129, 200, 512, 513];
+
+/// `n` canonical integers, built three ways.
+fn intset_row(n: usize) -> [String; 3] {
+    let members: Vec<Vec<u8>> = (0..n).map(|i| i.to_string().into_bytes()).collect();
+
+    let mut db = Database::new();
+    let mut args = vec![bs(b"i")];
+    args.extend(members.iter().map(|m| bs(m)));
+    crate::command::set::sadd(&mut db, &args);
+    let bulk = encoding_of(&mut db, b"i");
+
+    let mut db = Database::new();
+    for m in &members {
+        crate::command::set::sadd(&mut db, &[bs(b"i"), bs(m)]);
+    }
+    let incr = encoding_of(&mut db, b"i");
+
+    let set: SetValue = members.iter().map(|m| Bytes::from(m.clone())).collect();
+    let decode = decoded_encoding(&RedisValueRef::Set(&set));
+    [bulk, incr, decode]
+}
+
+/// `n` canonical integers and ONE string of `len` bytes (moon#899). `bulk`
+/// carries all of them in one SADD to a fresh key — the entry gate's verdict
+/// on a mixed batch. `incr` builds the intset one integer at a time and then
+/// adds the string — THE edge, `intset -> listpack` or `-> hashtable`.
+/// `decode` is the restart path over the same members.
+fn mixed_row(n: usize, len: usize) -> [String; 3] {
+    let ints: Vec<Vec<u8>> = (0..n).map(|i| i.to_string().into_bytes()).collect();
+    let s = elem(0, len);
+
+    let mut db = Database::new();
+    let mut args = vec![bs(b"x")];
+    args.extend(ints.iter().map(|m| bs(m)));
+    args.push(bs(&s));
+    crate::command::set::sadd(&mut db, &args);
+    let bulk = encoding_of(&mut db, b"x");
+
+    let mut db = Database::new();
+    for m in &ints {
+        crate::command::set::sadd(&mut db, &[bs(b"x"), bs(m)]);
+    }
+    crate::command::set::sadd(&mut db, &[bs(b"x"), bs(&s)]);
+    let incr = encoding_of(&mut db, b"x");
+
+    let mut set: SetValue = ints.iter().map(|m| Bytes::from(m.clone())).collect();
+    set.insert(Bytes::from(s));
+    let decode = decoded_encoding(&RedisValueRef::Set(&set));
+    [bulk, incr, decode]
+}
+
+/// The authority's verdict for the set family, where three encodings compete.
+fn set_family_verdict(limits: EncodingLimits, ints: usize, string: Option<usize>) -> &'static str {
+    // The widest decimal rendering among `0..ints`.
+    let digits = ints.saturating_sub(1).to_string().len();
+    match string {
+        None if limits.intset_fits(ints) => "intset",
+        None if limits.fits(Shape::Set, ints, digits) => "listpack",
+        None => "hashtable",
+        Some(len) if limits.fits(Shape::Set, ints + 1, digits.max(len)) => "listpack",
+        Some(_) => "hashtable",
+    }
+}
+
 /// The three consultation sites of the encoding policy, plus the authority's
 /// own verdict, for one `(shape, n, elem)`: `[bulk, incr, decode, predicate]`.
 fn four_verdicts(shape: Shape, n: usize, len: usize) -> [String; 4] {
@@ -240,6 +308,31 @@ fn entry_gate_upgrade_check_and_decode_agree_with_the_authority() {
             }
         }
     }
+    // The set family, where three encodings compete: all-integer sets, and
+    // an intset joined by one string (moon#899 — red on f7c83769 for every
+    // `mixed` row whose incremental build fit a listpack: the edge did not
+    // exist, so `incr` said hashtable while `bulk` and `decode` said
+    // listpack).
+    let limits = EncodingLimits::moon_defaults();
+    for &n in INTSET_SIZES {
+        let [bulk, incr, decode] = intset_row(n);
+        let want = set_family_verdict(limits, n, None);
+        if !(bulk == want && incr == want && decode == want) {
+            disagreements.push(format!(
+                "intset n={n}: bulk={bulk} incr={incr} decode={decode} authority={want}"
+            ));
+        }
+        for &len in ELEM_LENS {
+            let [bulk, incr, decode] = mixed_row(n, len);
+            let want = set_family_verdict(limits, n, Some(len));
+            if !(bulk == want && incr == want && decode == want) {
+                disagreements.push(format!(
+                    "mixed n={n} elem={len}: bulk={bulk} incr={incr} decode={decode} \
+                     authority={want}"
+                ));
+            }
+        }
+    }
     assert!(
         disagreements.is_empty(),
         "the consultation sites disagree (moon#896 class):\n  {}",
@@ -264,13 +357,26 @@ pub(crate) fn render_matrix() -> String {
             }
         }
     }
+    // The set family (moon#899). `elem` is 0 for the all-integer rows.
+    for &n in INTSET_SIZES {
+        let [bulk, incr, decode] = intset_row(n);
+        out.push_str(&format!("intset {n} 0 {bulk} {incr} {decode}\n"));
+        for &len in ELEM_LENS {
+            let [bulk, incr, decode] = mixed_row(n, len);
+            out.push_str(&format!("mixed {n} {len} {bulk} {incr} {decode}\n"));
+        }
+    }
     out
 }
 
+#[allow(clippy::expect_used)] // test-only module: a golden without markers IS the test failing
 fn golden_table() -> String {
-    let begin = GOLDEN.find("# BEGIN\n").expect("golden has a BEGIN marker") + "# BEGIN\n".len();
-    let end = GOLDEN.find("# END\n").expect("golden has an END marker");
-    GOLDEN[begin..end].to_string()
+    // A Windows checkout under `core.autocrlf` hands `include_str!` a CRLF
+    // file while the matrix is rendered with bare `\n`: normalise first.
+    let golden = GOLDEN.replace("\r\n", "\n");
+    let begin = golden.find("# BEGIN\n").expect("golden has a BEGIN marker") + "# BEGIN\n".len();
+    let end = golden.find("# END\n").expect("golden has an END marker");
+    golden[begin..end].to_string()
 }
 
 #[test]

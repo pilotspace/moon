@@ -424,10 +424,15 @@ pub(crate) fn compact_after_decode_with(v: RedisValue, limits: EncodingLimits) -
         // ── set ───────────────────────────────────────────────────────────
         // Integers first, matching the command layer's precedence: an
         // all-integer set is an intset regardless of how few members it has.
+        // CANONICAL integers only (moon#795): an intset stores the `i64`, and
+        // reads render it back with `itoa`, so `+5` or `000000012345` admitted
+        // here would come back as `5` / `12345` after the restart that
+        // compacted them — the exact byte loss moon#802 closed on the live
+        // `SADD` path, which this arm bypassed with a bare `parse::<i64>()`.
         RedisValue::Set(set) => {
             let all_ints: Option<Vec<i64>> = if limits.intset_fits(set.len()) {
                 set.iter()
-                    .map(|m| std::str::from_utf8(m).ok()?.parse::<i64>().ok())
+                    .map(|m| crate::storage::numeric::canonical_i64(m))
                     .collect()
             } else {
                 None
@@ -1152,6 +1157,36 @@ mod tests {
             "intset",
             "an all-integer set must come back as an intset, matching redis"
         );
+    }
+
+    /// moon#795 on the RESTART path. The set arm decided "all integers" with
+    /// a bare `parse::<i64>()`, which accepts `+5` and `000000012345`; the
+    /// intset then stored the parsed value and every read rendered it back
+    /// as `5` / `12345`. The live `SADD` path was fixed in moon#802 through
+    /// `canonical_i64`; this arm bypassed it, so a set whose members
+    /// survived one session byte-exact lost them at the first restart.
+    /// Red on f7c83769: the value came back as an `intset` holding 5.
+    #[test]
+    fn set_with_non_canonical_integer_spellings_reloads_as_listpack_not_intset() {
+        let mut set = crate::storage::entry::SetValue::new();
+        for m in [&b"+5"[..], b"000000012345", b"-0", b"12345"] {
+            set.insert(Bytes::copy_from_slice(m));
+        }
+        let out = round_trip(&RedisValueRef::Set(&set));
+        assert_eq!(
+            out.encoding_name(),
+            "listpack",
+            "a non-canonical spelling has no intset representation that \
+             renders back to the same bytes"
+        );
+        let RedisValue::SetListpack(lp) = &out else {
+            panic!("expected SetListpack, got {}", out.encoding_name());
+        };
+        let mut got: Vec<Vec<u8>> = lp.iter().map(|e| e.as_bytes()).collect();
+        got.sort();
+        let mut want: Vec<Vec<u8>> = set.iter().map(|m| m.to_vec()).collect();
+        want.sort();
+        assert_eq!(got, want, "every member must reload byte-exact");
     }
 
     // ── the guards: these must NOT over-compact ──────────────────────────

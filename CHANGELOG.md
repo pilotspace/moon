@@ -130,6 +130,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the bulk 64/65 (hash, zset) and 128/129 (all four types) boundary rows
   against a live redis oracle.
 
+- **`set`: `SADD` of a string to a small intset reaches a listpack
+  (moon#899).** Redis's set state machine has three forward edges —
+  `intset -> listpack`, `listpack -> hashtable`, `intset -> hashtable` — and
+  moon had no `intset -> listpack`: `SADD s 1 2 3` then `SADD s abc` was
+  `hashtable` here and `listpack` on redis 8.6.1, and because nothing demotes
+  (moon#832) the hashtable was permanent. `get_or_create_set_listpack` now
+  takes the edge when the authority says the result fits — Redis's rule,
+  `intsetLen < set-max-listpack-entries` and every member within
+  `set-max-listpack-value`, with the intset's widest rendered integer
+  measured too — and is self-accounting for the cost swing (ledger test).
+  Measured at the boundary against the oracle: 127 ints + a string is a
+  listpack on both, 128 + a string a hashtable on both; a fixture at 200
+  ints cannot see this defect. Byte transparency across the edge is guarded
+  explicitly (moon#795): every intset value arrived through `canonical_i64`,
+  so its `itoa` rendering is the client's exact bytes, and `+5`,
+  `000000012345`, `-0` added in the same command stay distinct members.
+  Found on the way: the restart-side re-derivation
+  (`compact_after_decode`) decided "all integers" with a bare
+  `parse::<i64>()`, so a set holding `+5` reloaded as an intset and read
+  back `5` — the moon#795 loss moon#802 had closed on the live path. It
+  now uses `canonical_i64`; such a set reloads as a listpack, byte-exact.
+
 - **`text`: the `TMX3` TAG/NUMERIC sidecar block is now proven compatible
   in both directions, and the format no longer depends on the build's
   feature set (#880).** The block itself landed with #879; this finishes

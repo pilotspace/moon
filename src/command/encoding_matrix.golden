@@ -4,7 +4,11 @@
 # this test file, then the 20 cells of moon#896 -- hash/zset, BULK column,
 # n in {65,66,100,127,128} at 8- and 64-byte elements, hashtable/skiplist ->
 # listpack -- flipped by the commit that fixed the entry gate's unit. Every
-# other cell is the pristine value.
+# other hash/set/zset/list cell is the pristine value.
+# The `intset` (n canonical integers; elem is 0) and `mixed` (n integers then
+# one string of elem bytes) sections were added with the intset -> listpack
+# edge (moon#899) and captured on that tree; on f7c83769 every `mixed` row
+# with n <= 127 and elem <= 64 read `listpack hashtable listpack`.
 # BEGIN
 # type n elem bulk incr decode
 hash 1 8 listpack listpack listpack
@@ -187,4 +191,52 @@ list 257 65 linkedlist linkedlist linkedlist
 list 300 8 linkedlist linkedlist linkedlist
 list 300 64 linkedlist linkedlist linkedlist
 list 300 65 linkedlist linkedlist linkedlist
+intset 1 0 intset intset intset
+mixed 1 8 listpack listpack listpack
+mixed 1 64 listpack listpack listpack
+mixed 1 65 hashtable hashtable hashtable
+intset 3 0 intset intset intset
+mixed 3 8 listpack listpack listpack
+mixed 3 64 listpack listpack listpack
+mixed 3 65 hashtable hashtable hashtable
+intset 63 0 intset intset intset
+mixed 63 8 listpack listpack listpack
+mixed 63 64 listpack listpack listpack
+mixed 63 65 hashtable hashtable hashtable
+intset 64 0 intset intset intset
+mixed 64 8 listpack listpack listpack
+mixed 64 64 listpack listpack listpack
+mixed 64 65 hashtable hashtable hashtable
+intset 100 0 intset intset intset
+mixed 100 8 listpack listpack listpack
+mixed 100 64 listpack listpack listpack
+mixed 100 65 hashtable hashtable hashtable
+intset 126 0 intset intset intset
+mixed 126 8 listpack listpack listpack
+mixed 126 64 listpack listpack listpack
+mixed 126 65 hashtable hashtable hashtable
+intset 127 0 intset intset intset
+mixed 127 8 listpack listpack listpack
+mixed 127 64 listpack listpack listpack
+mixed 127 65 hashtable hashtable hashtable
+intset 128 0 intset intset intset
+mixed 128 8 hashtable hashtable hashtable
+mixed 128 64 hashtable hashtable hashtable
+mixed 128 65 hashtable hashtable hashtable
+intset 129 0 intset intset intset
+mixed 129 8 hashtable hashtable hashtable
+mixed 129 64 hashtable hashtable hashtable
+mixed 129 65 hashtable hashtable hashtable
+intset 200 0 intset intset intset
+mixed 200 8 hashtable hashtable hashtable
+mixed 200 64 hashtable hashtable hashtable
+mixed 200 65 hashtable hashtable hashtable
+intset 512 0 intset intset intset
+mixed 512 8 hashtable hashtable hashtable
+mixed 512 64 hashtable hashtable hashtable
+mixed 512 65 hashtable hashtable hashtable
+intset 513 0 hashtable hashtable hashtable
+mixed 513 8 hashtable hashtable hashtable
+mixed 513 64 hashtable hashtable hashtable
+mixed 513 65 hashtable hashtable hashtable
 # END

@@ -847,7 +847,14 @@ mod tests {
         assert_eq!(encoding_of(&mut db, b"s"), "intset");
     }
 
-    /// A WRITE still upgrades — the fix must not have disabled `K::upgrade`.
+    /// A WRITE still changes the encoding — the moon#832 fix must not have
+    /// disabled the write-side transitions. A non-integer member has no
+    /// intset form, so the intset must leave that encoding: to a listpack
+    /// when the result still fits (the `intset -> listpack` edge, moon#899 —
+    /// this assertion used to demand `hashtable`, codifying the divergence
+    /// from redis exactly as `test_object_encoding_sorted_set` once codified
+    /// moon#787), and to a hashtable when it cannot, which is the half that
+    /// proves `K::upgrade` is still live.
     #[test]
     fn write_on_mutable_path_still_upgrades() {
         let mut db = Database::new();
@@ -856,9 +863,17 @@ mod tests {
         sadd(&mut db, &[bs(b"s"), bs(b"not-an-int")]);
         assert_eq!(
             encoding_of(&mut db, b"s"),
-            "hashtable",
-            "a non-integer member has no intset form; the write must upgrade"
+            "listpack",
+            "a non-integer member has no intset form; a small set moves to a listpack"
         );
+        let big = vec![b'x'; crate::storage::db::EncodingLimits::moon_defaults().set_value + 1];
+        sadd(&mut db, &[bs(b"s"), bs(&big)]);
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "hashtable",
+            "an oversized member has no compact form at all; the write must upgrade"
+        );
+        assert_eq!(scard(&mut db, &[bs(b"s")]), Frame::Integer(5));
     }
 
     // ── #787: SADD must reach the listpack encoding ──────────────────────
@@ -1045,6 +1060,152 @@ mod tests {
             "listpack",
             "reads through the shared-read twins must not change the encoding"
         );
+    }
+
+    // ── moon#899: the intset -> listpack edge ────────────────────────────
+    //
+    // Redis's set state machine has three forward edges — intset -> listpack,
+    // listpack -> hashtable, intset -> hashtable — and moon had no
+    // intset -> listpack. Measured against redis 8.6.1: `SADD s 1 2 3` then
+    // `SADD s abc` is `listpack` there and was `hashtable` here. A fixture at
+    // 200 ints misses it entirely (200 exceeds the listpack threshold, so
+    // hashtable is right on both), which is why every test below sits BELOW
+    // the threshold or straddles it.
+
+    /// The edge itself, far below the threshold. Red on f7c83769.
+    #[test]
+    fn sadd_string_into_small_intset_lands_in_listpack() {
+        let mut db = Database::new();
+        sadd(&mut db, &[bs(b"s"), bs(b"1"), bs(b"2"), bs(b"3")]);
+        assert_eq!(encoding_of(&mut db, b"s"), "intset");
+        assert_eq!(sadd(&mut db, &[bs(b"s"), bs(b"abc")]), Frame::Integer(1));
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "listpack",
+            "a string joining a 3-member intset must land in a listpack (redis 7.2+)"
+        );
+        assert_eq!(scard_readonly(&db, &[bs(b"s")], 0), Frame::Integer(4));
+        assert_eq!(
+            ro_members_sorted(&db, b"s"),
+            vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec(), b"abc".to_vec()]
+        );
+        assert_eq!(
+            sismember_readonly(&db, &[bs(b"s"), bs(b"2")], 0),
+            Frame::Integer(1),
+            "an integer member must still answer after the conversion"
+        );
+        // Integers added afterwards stay in the listpack; the intset path
+        // answers `Ok(None)` for a `SetListpack` and falls through.
+        assert_eq!(sadd(&mut db, &[bs(b"s"), bs(b"99")]), Frame::Integer(1));
+        assert_eq!(encoding_of(&mut db, b"s"), "listpack");
+        assert_eq!(
+            sismember_readonly(&db, &[bs(b"s"), bs(b"99")], 0),
+            Frame::Integer(1)
+        );
+        // And a duplicate of a converted integer is still a duplicate.
+        assert_eq!(sadd(&mut db, &[bs(b"s"), bs(b"3")]), Frame::Integer(0));
+        assert_eq!(scard_readonly(&db, &[bs(b"s")], 0), Frame::Integer(5));
+    }
+
+    /// Redis's rule is `intsetLen < set-max-listpack-entries`: 127 ints plus
+    /// a string (128 members) is a listpack, 128 ints plus a string (129) is
+    /// a hashtable. Both halves, so the boundary cannot be off by one in
+    /// either direction and pass.
+    #[test]
+    fn intset_to_listpack_edge_straddles_the_entry_threshold() {
+        let limit = crate::storage::db::EncodingLimits::moon_defaults().set_entries;
+        for (ints, want) in [(limit - 1, "listpack"), (limit, "hashtable")] {
+            let mut db = Database::new();
+            for i in 0..ints {
+                let m = i.to_string();
+                sadd(&mut db, &[bs(b"s"), bs(m.as_bytes())]);
+            }
+            assert_eq!(encoding_of(&mut db, b"s"), "intset", "fixture: {ints} ints");
+            assert_eq!(sadd(&mut db, &[bs(b"s"), bs(b"abc")]), Frame::Integer(1));
+            assert_eq!(
+                encoding_of(&mut db, b"s"),
+                want,
+                "{ints} ints + one string: {} members",
+                ints + 1
+            );
+            assert_eq!(
+                scard_readonly(&db, &[bs(b"s")], 0),
+                Frame::Integer(ints as i64 + 1),
+                "no member may be lost across the edge ({ints} ints)"
+            );
+            assert_eq!(
+                sismember_readonly(&db, &[bs(b"s"), bs(b"abc")], 0),
+                Frame::Integer(1)
+            );
+            assert_eq!(
+                sismember_readonly(&db, &[bs(b"s"), bs(b"0")], 0),
+                Frame::Integer(1)
+            );
+        }
+    }
+
+    /// The value threshold applies to the incoming string too: a 65-byte
+    /// member cannot live in a listpack, so the intset goes to a hashtable.
+    #[test]
+    fn oversized_string_into_small_intset_goes_to_hashtable() {
+        let mut db = Database::new();
+        sadd(&mut db, &[bs(b"s"), bs(b"1"), bs(b"2"), bs(b"3")]);
+        let big = vec![b'x'; crate::storage::db::EncodingLimits::moon_defaults().set_value + 1];
+        assert_eq!(sadd(&mut db, &[bs(b"s"), bs(&big)]), Frame::Integer(1));
+        assert_eq!(encoding_of(&mut db, b"s"), "hashtable");
+        assert_eq!(scard_readonly(&db, &[bs(b"s")], 0), Frame::Integer(4));
+    }
+
+    /// moon#795 across the edge. The conversion renders every `i64` in the
+    /// intset into the listpack; the bytes that come back must be the bytes
+    /// that went in, for the extreme integers as well as the small ones, and
+    /// the non-canonical spellings added in the same command must be stored
+    /// as the distinct strings they are — `+5` is not `5`.
+    #[test]
+    fn intset_to_listpack_preserves_every_member_byte_for_byte() {
+        let mut db = Database::new();
+        let ints: [&[u8]; 5] = [
+            b"5",
+            b"12345",
+            b"-7",
+            b"-9223372036854775808",
+            b"9223372036854775807",
+        ];
+        let mut args = vec![bs(b"s")];
+        args.extend(ints.iter().map(|m| bs(m)));
+        assert_eq!(sadd(&mut db, &args), Frame::Integer(5));
+        assert_eq!(encoding_of(&mut db, b"s"), "intset");
+        let strings: [&[u8]; 4] = [b"+5", b"000000012345", b"-0", b"abc"];
+        let mut args = vec![bs(b"s")];
+        args.extend(strings.iter().map(|m| bs(m)));
+        assert_eq!(sadd(&mut db, &args), Frame::Integer(4));
+        assert_eq!(encoding_of(&mut db, b"s"), "listpack");
+
+        let mut want: Vec<Vec<u8>> = ints
+            .iter()
+            .chain(strings.iter())
+            .map(|m| m.to_vec())
+            .collect();
+        want.sort();
+        assert_eq!(ro_members_sorted(&db, b"s"), want, "byte-exact membership");
+        assert_eq!(scard_readonly(&db, &[bs(b"s")], 0), Frame::Integer(9));
+        for (probe, want) in [
+            (&b"+5"[..], 1),
+            (b"5", 1),
+            (b"000000012345", 1),
+            (b"12345", 1),
+            (b"-0", 1),
+            (b"0", 0),
+            (b"-9223372036854775808", 1),
+            (b"7", 0),
+        ] {
+            assert_eq!(
+                sismember_readonly(&db, &[bs(b"s"), bs(probe)], 0),
+                Frame::Integer(want),
+                "SISMEMBER {:?}",
+                String::from_utf8_lossy(probe)
+            );
+        }
     }
 
     /// A listpack stores an integer-shaped member in its INTEGER encoding, so

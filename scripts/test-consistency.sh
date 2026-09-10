@@ -688,6 +688,47 @@ both RPUSH l:enc:bulk128 $(seq -f 'e%.0f' 1 128)
 assert_both "OBJECT ENCODING bulk RPUSH 128 elems"  OBJECT ENCODING l:enc:bulk128
 assert_both "LLEN bulk RPUSH 128 elems"             LLEN l:enc:bulk128
 
+# moon#899: the `intset -> listpack` edge. Redis's set state machine has
+# three forward edges (intset -> listpack, listpack -> hashtable, intset ->
+# hashtable); moon had no intset -> listpack, so a string joining a SMALL
+# intset went straight to a hashtable. A fixture at 200 ints misses it (200
+# is past the listpack threshold, so hashtable is right on both), hence the
+# rows below sit under the threshold and straddle it: redis converts while
+# `intsetLen < set-max-listpack-entries`, so 127 ints + a string is a
+# listpack and 128 + a string is a hashtable.
+both SADD s:enc:is3 1 2 3
+both SADD s:enc:is3 abc
+assert_both "OBJECT ENCODING 3 ints + string"        OBJECT ENCODING s:enc:is3
+assert_both "SCARD 3 ints + string"                  SCARD s:enc:is3
+assert_both "SISMEMBER int after the edge"           SISMEMBER s:enc:is3 2
+both SADD s:enc:is127 $(seq 1 127)
+both SADD s:enc:is127 abc
+assert_both "OBJECT ENCODING 127 ints + string"      OBJECT ENCODING s:enc:is127
+both SADD s:enc:is128 $(seq 1 128)
+both SADD s:enc:is128 abc
+assert_both "OBJECT ENCODING 128 ints + string"      OBJECT ENCODING s:enc:is128
+both SADD s:enc:is200 $(seq 1 200)
+both SADD s:enc:is200 abc
+assert_both "OBJECT ENCODING 200 ints + string"      OBJECT ENCODING s:enc:is200
+both SADD s:enc:isval 1 2 3
+both SADD s:enc:isval "$(printf 'x%.0s' $(seq 1 65))"
+assert_both "OBJECT ENCODING intset + 65-byte member" OBJECT ENCODING s:enc:isval
+# Byte identity ACROSS the edge (moon#795): the conversion renders every
+# intset integer into the listpack, and the non-canonical spellings that
+# arrive with the string must stay distinct members. Compare the exact
+# bytes, not just the encoding name.
+both SADD s:enc:isid 5 12345 -7
+both SADD s:enc:isid +5 000000012345 -0 abc
+assert_both "OBJECT ENCODING intset->listpack identity" OBJECT ENCODING s:enc:isid
+assert_both "SCARD intset->listpack identity"        SCARD s:enc:isid
+redis_isid_sm=$(redis-cli -p "$PORT_REDIS" SMEMBERS s:enc:isid 2>&1 | sort)
+rust_isid_sm=$(redis-cli -p "$PORT_RUST" SMEMBERS s:enc:isid 2>&1 | sort)
+assert_eq "SMEMBERS across the edge (sorted, byte-exact)" "$redis_isid_sm" "$rust_isid_sm"
+assert_both "SISMEMBER +5 across the edge"           SISMEMBER s:enc:isid +5
+assert_both "SISMEMBER 5 across the edge"            SISMEMBER s:enc:isid 5
+assert_both "SISMEMBER 0 across the edge (absent)"   SISMEMBER s:enc:isid 0
+assert_both "SISMEMBER padded across the edge"       SISMEMBER s:enc:isid 000000012345
+
 # ===========================================================================
 # 9b. Command parity: BITFIELD_RO / SORT_RO / GEORADIUS_RO / GEORADIUSBYMEMBER_RO
 # ===========================================================================

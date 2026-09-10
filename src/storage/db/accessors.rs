@@ -15,6 +15,20 @@ use crate::storage::stream::Stream as StreamData;
 
 use crate::storage::db::{Database, entry_overhead, list_elem_cost};
 
+/// Rendered width, in bytes, of the widest member of an intset — what the
+/// listpack value threshold would measure once the intset's `i64`s become
+/// decimal spellings (moon#899). The intset is sorted, so only its two ends
+/// can be the widest; 0 for an empty one. Allocation-free.
+#[inline]
+fn widest_rendering(is: &Intset) -> usize {
+    let mut buf = itoa::Buffer::new();
+    let first = is.get(0).map_or(0, |v| buf.format(v).len());
+    let last = is
+        .get(is.len().wrapping_sub(1))
+        .map_or(0, |v| buf.format(v).len());
+    first.max(last)
+}
+
 /// A live entry sourced from either storage plane (moon#610).
 ///
 /// The hot plane hands back a borrow; the cold plane has to materialise the
@@ -505,14 +519,33 @@ impl Database {
     /// value always decodes as `RedisValue::Set` and lands in the `Ok(None)`
     /// arm rather than being fabricated over.
     ///
-    /// An existing `SetIntset` is NOT converted to a listpack here (Redis 7.2+
-    /// does that when a string joins a small intset); it answers `Ok(None)`
-    /// and the caller promotes it to the full form. That residual of moon#787
-    /// is deliberate scope, not an oversight.
+    /// An existing `SetIntset` takes the `intset -> listpack` edge (moon#899)
+    /// when `absorb_intset(members, widest_rendering)` says the result still
+    /// fits the listpack policy — the edge Redis 7.2+ has and moon lacked, so
+    /// `SADD s 1 2 3` then `SADD s abc` went straight to a hashtable where
+    /// redis answers `listpack`. The caller decides with the authority's
+    /// predicate (`EncodingLimits::fits(Shape::Set, members + 1, ..)`); the
+    /// accessor supplies the two facts only it can see cheaply: the member
+    /// count, and the rendered width of the widest integer (an intset stores
+    /// `i64`s, a listpack stores their decimal spelling, and the value
+    /// threshold applies to the spelling). Refused, the intset answers
+    /// `Ok(None)` and the caller promotes it to the full form as before.
+    ///
+    /// Byte transparency across the edge (moon#795): every value in an intset
+    /// arrived through `numeric::canonical_i64`, so its `itoa` rendering is
+    /// the exact bytes the client sent; a listpack, for its part, integer-
+    /// encodes only canonical spellings. `SMEMBERS` after the conversion
+    /// returns what was written, and `SISMEMBER +5` still answers 0 against a
+    /// stored `5`.
+    ///
+    /// SELF-ACCOUNTING for the conversion: the intset -> listpack cost swing
+    /// is applied to `used_memory` here, so the caller's own before/after
+    /// snapshot of the listpack starts from the converted form.
     #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
     pub fn get_or_create_set_listpack(
         &mut self,
         key: &[u8],
+        absorb_intset: impl FnOnce(usize, usize) -> bool,
     ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
         self.drop_if_expired(key, now_ms);
@@ -529,12 +562,50 @@ impl Database {
                 self.data.insert(k, entry);
             }
         }
+        self.absorb_intset_into_listpack(key, absorb_intset);
         let entry = self.data.get_mut(key).unwrap();
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::SetListpack(lp)) => Ok(Some(lp)),
             Some(RedisValue::Set(_)) | Some(RedisValue::SetIntset(_)) => Ok(None),
             _ => Err(Self::wrongtype_error()),
         }
+    }
+
+    /// The `intset -> listpack` edge (moon#899), in place, for a key that
+    /// holds a `SetIntset` and whose `absorb(members, widest_rendering)`
+    /// answers true; a no-op for anything else. Renders every `i64` with
+    /// `itoa` (canonical, so byte-exact — see `get_or_create_set_listpack`)
+    /// and applies the cost swing to `used_memory`.
+    fn absorb_intset_into_listpack(
+        &mut self,
+        key: &[u8],
+        absorb: impl FnOnce(usize, usize) -> bool,
+    ) {
+        let Some(entry) = self.data.get_mut(key) else {
+            return;
+        };
+        let Some(RedisValue::SetIntset(is)) = entry.value.as_redis_value_mut() else {
+            return;
+        };
+        if !absorb(is.len(), widest_rendering(is)) {
+            return;
+        }
+        let before = is.estimate_memory();
+        let mut lp = crate::storage::listpack::Listpack::new();
+        let mut buf = itoa::Buffer::new();
+        for v in is.iter() {
+            lp.push_back(buf.format(v).as_bytes());
+        }
+        let after = lp.estimate_memory();
+        if let Some(slot) = entry.value.as_redis_value_mut() {
+            *slot = RedisValue::SetListpack(lp);
+        }
+        // Disjoint field borrows: `entry` borrows `self.data`, the ledger is
+        // a separate field (same shape as `get_or_create`).
+        self.used_memory = self
+            .used_memory
+            .saturating_add(after)
+            .saturating_sub(before);
     }
 
     /// Upgrade a `SetListpack` to the full `IndexSet` form in place, returning

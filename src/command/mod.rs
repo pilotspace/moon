@@ -2207,14 +2207,15 @@ mod tests {
             }
             _ => panic!("Expected Response"),
         }
-        // Add non-integer member -- should upgrade to hashtable
+        // Add a non-integer member: a small intset takes Redis's
+        // `intset -> listpack` edge (the string fits `set-max-listpack-value`)
+        // rather than jumping straight to the hashtable.
         let args = make_args(&[b"myset", b"hello"]);
         dispatch(&mut db, b"SADD", &args, &mut selected, 16);
-        // Verify it's now hashtable
         let args = make_args(&[b"ENCODING", b"myset"]);
         match dispatch(&mut db, b"OBJECT", &args, &mut selected, 16) {
             DispatchResult::Response(f) => {
-                assert_eq!(f, Frame::BulkString(Bytes::from("hashtable")));
+                assert_eq!(f, Frame::BulkString(Bytes::from("listpack")));
             }
             _ => panic!("Expected Response"),
         }

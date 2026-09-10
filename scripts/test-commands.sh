@@ -865,6 +865,14 @@ if should_run "sorted_set"; then
     mcli HSET h:enc:bulk65 $(seq 1 65 | awk '{print "f"$1, "v"$1}') >/dev/null 2>&1
     assert_match "bulk HSET 65 fields encoding" OBJECT ENCODING h:enc:bulk65
     assert_match "bulk HSET 65 fields HLEN"     HLEN h:enc:bulk65
+    # moon#899: a string joining a small intset lands in a listpack (redis
+    # 7.2+); moon went straight to a hashtable. Below the threshold on
+    # purpose -- at 200 ints both answer hashtable and the defect is invisible.
+    rcli SADD s:enc:is3 1 2 3 >/dev/null 2>&1; rcli SADD s:enc:is3 abc >/dev/null 2>&1
+    mcli SADD s:enc:is3 1 2 3 >/dev/null 2>&1; mcli SADD s:enc:is3 abc >/dev/null 2>&1
+    assert_match "intset + string encoding"     OBJECT ENCODING s:enc:is3
+    assert_match "intset + string SCARD"        SCARD s:enc:is3
+    assert_match "intset + string SISMEMBER 2"  SISMEMBER s:enc:is3 2
     # Scores round-trip through the listpack as their canonical rendering.
     rcli ZADD z:enc:sc 3.0 m 1e3 n 3.5000 o >/dev/null 2>&1
     mcli ZADD z:enc:sc 3.0 m 1e3 n 3.5000 o >/dev/null 2>&1

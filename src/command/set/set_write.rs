@@ -130,7 +130,19 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
         .max()
         .unwrap_or(0);
     if limits.fits(Shape::Set, member_count, max_member) {
-        match db.get_or_create_set_listpack(key) {
+        // moon#899: a string joining a SMALL intset lands in a listpack, as
+        // in redis 7.2+; before this edge existed it went straight to a
+        // hashtable (3 ints + "abc": moon `hashtable`, redis `listpack`).
+        // Redis's rule, stated on the authority: the intset's members plus
+        // one still fit the entry threshold, and neither the incoming batch's
+        // longest member nor the widest rendered integer exceeds the value
+        // threshold. The push loop's upgrade check below then handles a
+        // batch that overflows the converted listpack, exactly as it does
+        // for any other listpack.
+        let absorb = |members: usize, widest: usize| {
+            limits.fits(Shape::Set, members + 1, max_member.max(widest))
+        };
+        match db.get_or_create_set_listpack(key, absorb) {
             Ok(Some(lp)) => {
                 let mut added = 0i64;
                 // Listpack `estimate_memory()` is O(1) (capacity-based), so a
