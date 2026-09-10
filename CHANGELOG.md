@@ -25,6 +25,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contract and the per-field TTL sidecar are unchanged; the listpack integer
   encoding still refuses non-canonical spellings, so `+5` and `007` survive
   byte-for-byte (moon#795).
+- **`SREM` no longer flattens a small set's compact encoding (moon#897).** A
+  three-member set built by `SADD` reported `listpack` (or `intset`) and then
+  `hashtable` after ONE `SREM` of one member, where redis 8.6.1 reports
+  `listpack`/`intset`. Nothing demotes (moon#832), so the promotion was
+  permanent for the key's lifetime — a session set lost the compact form on its
+  first update and never got it back. `SREM` now removes in place from BOTH
+  compact forms (they are different code paths and both were wrong), routing on
+  a `&self` probe that cannot itself rewrite the value, and consulting the ONE
+  `EncodingLimits` authority (moon#896) afterwards so a container that
+  genuinely exceeds the policy still promotes. The empty-set cleanup moved off
+  `get_set` (= `get_promoted`), which meant the emptiness PROBE was a flattener
+  in its own right. Replies, delete-when-empty, WRONGTYPE and byte transparency
+  for numeric-looking members (`+5`, `000000012345`, `-0` — moon#795/#903) are
+  unchanged, verified row by row against a live redis oracle at, below and one
+  past every set threshold.
 
 - **`--max-wal-size` now reaches the WAL overflow ceiling (moon#916).** The flag
   configured `CheckpointTrigger` but never `WalWriterV3`, whose bounds setter

@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::storage::db::{Shape, set_member_cost, set_table_bytes};
+use crate::storage::db::{SetRef, Shape, set_member_cost, set_table_bytes};
 use crate::storage::entry::{Entry, boxed_payload_block};
 
 use super::{collect_sets, parse_int};
@@ -220,8 +220,56 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
 // SREM key member [member ...]
 // ---------------------------------------------------------------------------
 
+/// Which encoding the key holds RIGHT NOW, as answered by a `&self` probe that
+/// cannot rewrite it.
+///
+/// `Copy` and field-free on purpose: it is the whole of what a `SetRef` borrow
+/// tells the router, so the borrow of `db` ends at the `match` that produces
+/// one and the mutation below is free to take `&mut db`.
+#[derive(Clone, Copy)]
+enum SetRoute {
+    /// A live `SetListpack` — mutate it in place.
+    Listpack,
+    /// A live `SetIntset` — mutate it in place.
+    Intset,
+    /// The full `IndexSet`, a cold-spilled value, an expired entry, or no key
+    /// at all: the pre-existing eager path, byte for byte.
+    Full,
+}
+
+/// Ask what `key` holds without rewriting it.
+///
+/// `get_set_ref_if_alive` takes `&self`, so — unlike every `get_or_create_*`
+/// and `get_promoted` accessor — asking this question cannot itself flatten
+/// the compact encoding (moon#832). A missing, expired or cold-spilled key
+/// answers `Full`, which routes to exactly the code that ran before this
+/// function existed; only the two compact forms take a new path.
+fn set_route(db: &Database, key: &[u8]) -> Result<SetRoute, Frame> {
+    match db.get_set_ref_if_alive(key, db.now_ms()) {
+        Ok(Some(SetRef::Listpack(_))) => Ok(SetRoute::Listpack),
+        Ok(Some(SetRef::Intset(_))) => Ok(SetRoute::Intset),
+        Ok(Some(SetRef::Hash(_) | SetRef::Owned(_))) | Ok(None) => Ok(SetRoute::Full),
+        Err(e) => Err(e),
+    }
+}
+
 /// SREM command handler: remove members from a set.
 /// Returns Integer(count removed). Removes key if set becomes empty.
+///
+/// # Encoding (moon#897)
+///
+/// A `SREM` of one member used to flatten a three-member `listpack` set to a
+/// `hashtable` — permanently, because nothing demotes (moon#832) — by reaching
+/// for `get_or_create_set`, whose `SetKind::upgrade` materialises the full form
+/// unconditionally. Redis mutates the listpack in place and promotes only when
+/// a threshold is genuinely crossed; so does this now, for BOTH compact source
+/// encodings (an `intset` stays an `intset`, a `listpack` stays a `listpack` —
+/// they are different code paths and moon got both wrong).
+///
+/// A removal only ever shrinks a container, so it cannot make one newly
+/// oversized; the authority is still consulted after the mutation, because a
+/// listpack that was ALREADY past the policy — the one case where a container
+/// legitimately belongs in the full form — must still promote.
 pub fn srem(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 2 {
         return err_wrong_args("SREM");
@@ -230,6 +278,24 @@ pub fn srem(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("SREM"),
     };
+
+    match set_route(db, key) {
+        Err(e) => e,
+        Ok(SetRoute::Listpack) => srem_listpack(db, key, args),
+        Ok(SetRoute::Intset) => srem_intset(db, key, args),
+        Ok(SetRoute::Full) => srem_eager(db, key, args),
+    }
+}
+
+/// The pre-moon#897 path, unchanged: materialise the full `IndexSet` and
+/// `swap_remove` from it.
+///
+/// Reached for a set that is ALREADY a hashtable, for a cold-spilled value
+/// (which `get_or_create_set` promotes back), for an expired entry (which it
+/// drops), and for a missing key (which it fabricates and the cleanup below
+/// then removes) — i.e. for every case where there is no compact encoding to
+/// preserve, so the routing costs one `&self` probe and changes nothing.
+fn srem_eager(db: &mut Database, key: &Bytes, args: &[Frame]) -> Frame {
     let set = match db.get_or_create_set(key) {
         Ok(s) => s,
         Err(e) => return e,
@@ -252,12 +318,109 @@ pub fn srem(db: &mut Database, args: &[Frame]) -> Frame {
     // `set`'s borrow of `db` ends above.
     db.credit_memory(credit);
     db.adjust_memory(table_before, table_after);
-    // Clean up empty set
-    let key_clone = key.clone();
-    if let Ok(Some(s)) = db.get_set(&key_clone) {
-        if s.is_empty() {
-            db.remove(&key_clone);
+    // Clean up empty set. `get_set_ref_if_alive` rather than `get_set`: the
+    // latter is `get_promoted`, so the emptiness PROBE itself re-flattened the
+    // container this function had just kept compact (moon#832).
+    let now_ms = db.now_ms();
+    let empty = matches!(db.get_set_ref_if_alive(key, now_ms), Ok(Some(s)) if s.len() == 0);
+    if empty {
+        db.remove(key);
+    }
+    Frame::Integer(removed)
+}
+
+/// `SREM` against a `SetListpack`: remove in place, keep the listpack.
+///
+/// The `absorb` closure answers `false` unconditionally. It is the moon#899
+/// `intset -> listpack` edge, and it belongs to `SADD` alone: this arm is only
+/// reached for a key the `&self` probe already saw AS a listpack, and a removal
+/// can never be the thing that makes a set newly fit one.
+fn srem_listpack(db: &mut Database, key: &Bytes, args: &[Frame]) -> Frame {
+    let limits = db.encoding_limits();
+    let lp = match db.get_or_create_set_listpack(key, |_, _| false) {
+        Ok(Some(lp)) => lp,
+        // The probe said listpack; anything else means the value changed
+        // between the probe and here, which one shard thread cannot do. Fall
+        // back to the eager path rather than assume.
+        Ok(None) => return srem_eager(db, key, args),
+        Err(e) => return e,
+    };
+    // Listpack `estimate_memory()` is O(1) (capacity-based), so a before/after
+    // snapshot is cheap — no per-member formula.
+    let before = lp.estimate_memory();
+    let mut removed = 0i64;
+    for arg in &args[1..] {
+        // A non-bulk frame is skipped, not an error, exactly as the eager path
+        // below skips it — the reply and the count must not depend on which
+        // encoding the set happened to be in.
+        let Some(member) = extract_bytes(arg) else {
+            continue;
+        };
+        // `find` is a BORROWED scan (`ListpackRef::eq_bytes`): it allocates
+        // neither the probe nor the entries it walks past, and it applies the
+        // canonical-integer rule, so a stored `Integer(7)` answers to `b"7"`
+        // and to nothing else. `remove_at` discards the entry without decoding
+        // it. Bytes of every SURVIVING member are untouched (moon#795/#903).
+        if let Some(idx) = lp.find(member) {
+            lp.remove_at(idx);
+            removed += 1;
         }
+    }
+    let after = lp.estimate_memory();
+    let empty = lp.is_empty();
+    // The upgrade check, from the ONE authority (moon#896) and the same
+    // predicate `SADD`'s push loop uses. A shrink cannot cross the threshold
+    // upward, so this is false for every listpack `SADD` could have produced;
+    // it fires only for one that was already past the policy, which is exactly
+    // the container that belongs in the full form.
+    let should_upgrade = !limits.listpack_fits(Shape::Set, lp);
+    // `lp`'s borrow of `db` ends here — safe to call back into `db` now.
+    db.adjust_memory(before, after);
+    if empty {
+        db.remove(key);
+    } else if should_upgrade {
+        // The accessor bills the swing itself through `SetKind::upgrade`
+        // (moon#788/#810).
+        db.upgrade_set_listpack_to_set(key);
+    }
+    Frame::Integer(removed)
+}
+
+/// `SREM` against a `SetIntset`: remove in place, keep the intset.
+fn srem_intset(db: &mut Database, key: &Bytes, args: &[Frame]) -> Frame {
+    let is = match db.get_or_create_intset(key) {
+        Ok(Some(is)) => is,
+        Ok(None) => return srem_eager(db, key, args),
+        Err(e) => return e,
+    };
+    // `Intset::estimate_memory()` is O(1) (capacity-based).
+    let before = is.estimate_memory();
+    let mut removed = 0i64;
+    for arg in &args[1..] {
+        let Some(member) = extract_bytes(arg) else {
+            continue;
+        };
+        // Canonical spellings only. An intset stores `i64`s and answers to
+        // their exact `itoa` rendering, so `+5`, `007` and `-0` are simply not
+        // members of a set holding `5`, `7` and `0` — the same verdict redis
+        // reaches through its own `string2ll` gate, and the rule that keeps the
+        // encoding byte-transparent (moon#795).
+        let Some(val) = try_parse_i64(member) else {
+            continue;
+        };
+        if is.remove(val) {
+            removed += 1;
+        }
+    }
+    let after = is.estimate_memory();
+    let empty = is.is_empty();
+    // `is`'s borrow of `db` ends here.
+    db.adjust_memory(before, after);
+    // No upgrade check: `set-max-intset-entries` bounds a COUNT, and a removal
+    // only lowers it. An intset can never become too large by shrinking, and
+    // (unlike a listpack) it has no element-size dimension to cross.
+    if empty {
+        db.remove(key);
     }
     Frame::Integer(removed)
 }
