@@ -543,6 +543,10 @@ run_step "audit-unwrap"       bash scripts/audit-unwrap.sh             || exit 1
 # The --self-test leg proves the scanner can still fail before trusting a PASS.
 run_step "audit-tempdirs self" bash scripts/audit-test-tempdirs.sh --self-test || exit 1
 run_step "audit-tempdirs"     bash scripts/audit-test-tempdirs.sh       || exit 1
+# moon#896 — every compact-encoding threshold decision goes through the one
+# `EncodingLimits` authority; the guard's self-test proves it can still fail.
+run_step "audit-encoding self" bash scripts/audit-encoding-limits.sh --self-test || exit 1
+run_step "audit-encoding"     bash scripts/audit-encoding-limits.sh     || exit 1
 run_step "clippy (default)"   env CARGO_TARGET_DIR=target-clippy \
   cargo clippy -- -D warnings                                          || exit 1
 run_step "clippy (tokio)"     env CARGO_TARGET_DIR=target-tokio \

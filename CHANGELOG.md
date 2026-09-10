@@ -96,6 +96,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`storage`: the compact-encoding thresholds have ONE authority
+  (moon#896).** Three sites decided whether a container stays in its
+  listpack/intset form — a write command's entry gate, its post-push
+  upgrade check, and the restart-side re-derivation in
+  `compact_after_decode` — each with its own copy of the arithmetic, and two
+  of them disagreed about the UNIT: the entry gate compared `args.len() - 1`
+  (listpack ENTRIES, two per hash field or zset member) against the same
+  `128` the upgrade check applied to `lp.len() / 2` (ITEMS). All three now
+  consult `storage::encoding_limits::EncodingLimits`, a `Copy` snapshot on
+  `Database`, through a predicate that takes a `Shape` rather than a raw
+  count, so the entries-per-item factor lives in one place and a caller
+  cannot pass the wrong unit. The POLICY thresholds (`*-max-listpack-*`,
+  `set-max-intset-entries`) and the SAFETY ceiling
+  (`LISTPACK_SAFE_BATCH_ENTRIES`, which keeps a batch far below the listpack
+  header's `u16` range and closes `SADD`'s O(n^2) scan window, moon#865) are
+  now distinct named things; the raw constants are private to the module and
+  `scripts/audit-encoding-limits.sh` keeps a hand-rolled threshold or unit
+  conversion out of every consultation site. The authority carries moon's
+  CURRENT values, and the refactor is proven behaviour-neutral: the
+  encoding matrix (`src/command/encoding_matrix.golden` — every type at
+  every size around the thresholds, built bulk, incrementally and via the
+  restart path) is byte-identical to the one captured on the pre-authority
+  tree, wrong cells included. **The unit fix then lands on top of it:** the
+  `HSET`/`HMSET` and `ZADD` entry gates now convert their argv length
+  through `Shape::items_in`, so a bulk `HSET` of 65..128 fields or `ZADD`
+  of 65..128 pairs stays a listpack, as the same container built one item
+  at a time always did and as redis 8.6.1 does; the 20 flipped golden cells
+  are exactly that range at 8- and 64-byte elements, and a new agreement
+  test asserts, for every shape and size, that the entry gate, the upgrade
+  check, the restart path and the authority's own predicate reach one
+  verdict. `scripts/test-consistency.sh` and `scripts/test-commands.sh` gain
+  the bulk 64/65 (hash, zset) and 128/129 (all four types) boundary rows
+  against a live redis oracle.
+
+- **`set`: `SADD` of a string to a small intset reaches a listpack
+  (moon#899).** Redis's set state machine has three forward edges —
+  `intset -> listpack`, `listpack -> hashtable`, `intset -> hashtable` — and
+  moon had no `intset -> listpack`: `SADD s 1 2 3` then `SADD s abc` was
+  `hashtable` here and `listpack` on redis 8.6.1, and because nothing demotes
+  (moon#832) the hashtable was permanent. `get_or_create_set_listpack` now
+  takes the edge when the authority says the result fits — Redis's rule,
+  `intsetLen < set-max-listpack-entries` and every member within
+  `set-max-listpack-value`, with the intset's widest rendered integer
+  measured too — and is self-accounting for the cost swing (ledger test).
+  Measured at the boundary against the oracle: 127 ints + a string is a
+  listpack on both, 128 + a string a hashtable on both; a fixture at 200
+  ints cannot see this defect. Byte transparency across the edge is guarded
+  explicitly (moon#795): every intset value arrived through `canonical_i64`,
+  so its `itoa` rendering is the client's exact bytes, and `+5`,
+  `000000012345`, `-0` added in the same command stay distinct members.
+  Found on the way: the restart-side re-derivation
+  (`compact_after_decode`) decided "all integers" with a bare
+  `parse::<i64>()`, so a set holding `+5` reloaded as an intset and read
+  back `5` — the moon#795 loss moon#802 had closed on the live path. It
+  now uses `canonical_i64`; such a set reloads as a listpack, byte-exact.
+
 - **`text`: the `TMX3` TAG/NUMERIC sidecar block is now proven compatible
   in both directions, and the format no longer depends on the build's
   feature set (#880).** The block itself landed with #879; this finishes

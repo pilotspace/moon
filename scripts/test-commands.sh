@@ -849,6 +849,30 @@ if should_run "sorted_set"; then
     rcli ZADD z:enc:bigval 1 "$(printf 'x%.0s' $(seq 1 65))" >/dev/null 2>&1
     mcli ZADD z:enc:bigval 1 "$(printf 'x%.0s' $(seq 1 65))" >/dev/null 2>&1
     assert_match "ZADD encoding big member" OBJECT ENCODING z:enc:bigval
+    # moon#896: ONE command carrying 64 vs 65 pairs (argv 128 -> 130). The
+    # batch entry gate counted listpack ENTRIES against an ITEM threshold, so
+    # 65 pairs in one ZADD promoted at half the intended cardinality; the
+    # 129-pair row above never saw it because 129 is past the threshold in
+    # either unit. Same boundary for HSET (two entries per field).
+    rcli ZADD z:enc:bulk64 $(seq 1 64 | awk '{print $1, "m"$1}') >/dev/null 2>&1
+    mcli ZADD z:enc:bulk64 $(seq 1 64 | awk '{print $1, "m"$1}') >/dev/null 2>&1
+    assert_match "bulk ZADD 64 pairs encoding" OBJECT ENCODING z:enc:bulk64
+    rcli ZADD z:enc:bulk65 $(seq 1 65 | awk '{print $1, "m"$1}') >/dev/null 2>&1
+    mcli ZADD z:enc:bulk65 $(seq 1 65 | awk '{print $1, "m"$1}') >/dev/null 2>&1
+    assert_match "bulk ZADD 65 pairs encoding" OBJECT ENCODING z:enc:bulk65
+    assert_match "bulk ZADD 65 pairs ZCARD"    ZCARD z:enc:bulk65
+    rcli HSET h:enc:bulk65 $(seq 1 65 | awk '{print "f"$1, "v"$1}') >/dev/null 2>&1
+    mcli HSET h:enc:bulk65 $(seq 1 65 | awk '{print "f"$1, "v"$1}') >/dev/null 2>&1
+    assert_match "bulk HSET 65 fields encoding" OBJECT ENCODING h:enc:bulk65
+    assert_match "bulk HSET 65 fields HLEN"     HLEN h:enc:bulk65
+    # moon#899: a string joining a small intset lands in a listpack (redis
+    # 7.2+); moon went straight to a hashtable. Below the threshold on
+    # purpose -- at 200 ints both answer hashtable and the defect is invisible.
+    rcli SADD s:enc:is3 1 2 3 >/dev/null 2>&1; rcli SADD s:enc:is3 abc >/dev/null 2>&1
+    mcli SADD s:enc:is3 1 2 3 >/dev/null 2>&1; mcli SADD s:enc:is3 abc >/dev/null 2>&1
+    assert_match "intset + string encoding"     OBJECT ENCODING s:enc:is3
+    assert_match "intset + string SCARD"        SCARD s:enc:is3
+    assert_match "intset + string SISMEMBER 2"  SISMEMBER s:enc:is3 2
     # Scores round-trip through the listpack as their canonical rendering.
     rcli ZADD z:enc:sc 3.0 m 1e3 n 3.5000 o >/dev/null 2>&1
     mcli ZADD z:enc:sc 3.0 m 1e3 n 3.5000 o >/dev/null 2>&1

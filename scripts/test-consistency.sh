@@ -650,6 +650,85 @@ assert_both "OBJECT ENCODING zset oversized member" OBJECT ENCODING z:enc:bigval
 both ZADD z:enc:val64 1 "$(printf 'x%.0s' $(seq 1 64))"
 assert_both "OBJECT ENCODING zset 64-byte member"   OBJECT ENCODING z:enc:val64
 
+# moon#896: ONE command carrying the whole container, at the entry-count
+# boundary. The rows above build one item per command and never exercised
+# the batch entry gate, which counted listpack ENTRIES (two per hash field or
+# zset member) against a threshold meant for ITEMS: a bulk HSET of 65 fields
+# (argv 130) or ZADD of 65 pairs promoted at half the intended cardinality,
+# while SADD/RPUSH (one entry per item) were right by coincidence. 64 and 65
+# items straddle the argv 128 -> 130 flip the defect was measured at; 128 and
+# 129 straddle the real threshold. A 129-element LIST is deliberately absent:
+# redis's `list-max-listpack-size -2` is an 8 KB byte budget, not a count, so
+# it keeps 129 small elements in a listpack where moon's count threshold
+# promotes -- a known divergence, not this defect.
+both HSET h:enc:bulk64 $(seq 1 64 | awk '{print "f"$1, "v"$1}')
+assert_both "OBJECT ENCODING bulk HSET 64 fields"   OBJECT ENCODING h:enc:bulk64
+both HSET h:enc:bulk65 $(seq 1 65 | awk '{print "f"$1, "v"$1}')
+assert_both "OBJECT ENCODING bulk HSET 65 fields"   OBJECT ENCODING h:enc:bulk65
+assert_both "HLEN bulk HSET 65 fields"              HLEN h:enc:bulk65
+both HSET h:enc:bulk128 $(seq 1 128 | awk '{print "f"$1, "v"$1}')
+assert_both "OBJECT ENCODING bulk HSET 128 fields"  OBJECT ENCODING h:enc:bulk128
+# No 129-field HASH row: redis's hash-max-listpack-entries default is 512
+# where moon's is 128, so 129 is `listpack` there and `hashtable` here -- a
+# known threshold divergence, not this defect.
+both ZADD z:enc:bulk64 $(seq 1 64 | awk '{print $1, "m"$1}')
+assert_both "OBJECT ENCODING bulk ZADD 64 pairs"    OBJECT ENCODING z:enc:bulk64
+both ZADD z:enc:bulk65 $(seq 1 65 | awk '{print $1, "m"$1}')
+assert_both "OBJECT ENCODING bulk ZADD 65 pairs"    OBJECT ENCODING z:enc:bulk65
+assert_both "ZCARD bulk ZADD 65 pairs"              ZCARD z:enc:bulk65
+both ZADD z:enc:bulk128 $(seq 1 128 | awk '{print $1, "m"$1}')
+assert_both "OBJECT ENCODING bulk ZADD 128 pairs"   OBJECT ENCODING z:enc:bulk128
+both ZADD z:enc:bulk129 $(seq 1 129 | awk '{print $1, "m"$1}')
+assert_both "OBJECT ENCODING bulk ZADD 129 pairs"   OBJECT ENCODING z:enc:bulk129
+both SADD s:enc:bulk128 $(seq -f 'm%.0f' 1 128)
+assert_both "OBJECT ENCODING bulk SADD 128 members" OBJECT ENCODING s:enc:bulk128
+both SADD s:enc:bulk129 $(seq -f 'm%.0f' 1 129)
+assert_both "OBJECT ENCODING bulk SADD 129 members" OBJECT ENCODING s:enc:bulk129
+both RPUSH l:enc:bulk128 $(seq -f 'e%.0f' 1 128)
+assert_both "OBJECT ENCODING bulk RPUSH 128 elems"  OBJECT ENCODING l:enc:bulk128
+assert_both "LLEN bulk RPUSH 128 elems"             LLEN l:enc:bulk128
+
+# moon#899: the `intset -> listpack` edge. Redis's set state machine has
+# three forward edges (intset -> listpack, listpack -> hashtable, intset ->
+# hashtable); moon had no intset -> listpack, so a string joining a SMALL
+# intset went straight to a hashtable. A fixture at 200 ints misses it (200
+# is past the listpack threshold, so hashtable is right on both), hence the
+# rows below sit under the threshold and straddle it: redis converts while
+# `intsetLen < set-max-listpack-entries`, so 127 ints + a string is a
+# listpack and 128 + a string is a hashtable.
+both SADD s:enc:is3 1 2 3
+both SADD s:enc:is3 abc
+assert_both "OBJECT ENCODING 3 ints + string"        OBJECT ENCODING s:enc:is3
+assert_both "SCARD 3 ints + string"                  SCARD s:enc:is3
+assert_both "SISMEMBER int after the edge"           SISMEMBER s:enc:is3 2
+both SADD s:enc:is127 $(seq 1 127)
+both SADD s:enc:is127 abc
+assert_both "OBJECT ENCODING 127 ints + string"      OBJECT ENCODING s:enc:is127
+both SADD s:enc:is128 $(seq 1 128)
+both SADD s:enc:is128 abc
+assert_both "OBJECT ENCODING 128 ints + string"      OBJECT ENCODING s:enc:is128
+both SADD s:enc:is200 $(seq 1 200)
+both SADD s:enc:is200 abc
+assert_both "OBJECT ENCODING 200 ints + string"      OBJECT ENCODING s:enc:is200
+both SADD s:enc:isval 1 2 3
+both SADD s:enc:isval "$(printf 'x%.0s' $(seq 1 65))"
+assert_both "OBJECT ENCODING intset + 65-byte member" OBJECT ENCODING s:enc:isval
+# Byte identity ACROSS the edge (moon#795): the conversion renders every
+# intset integer into the listpack, and the non-canonical spellings that
+# arrive with the string must stay distinct members. Compare the exact
+# bytes, not just the encoding name.
+both SADD s:enc:isid 5 12345 -7
+both SADD s:enc:isid +5 000000012345 -0 abc
+assert_both "OBJECT ENCODING intset->listpack identity" OBJECT ENCODING s:enc:isid
+assert_both "SCARD intset->listpack identity"        SCARD s:enc:isid
+redis_isid_sm=$(redis-cli -p "$PORT_REDIS" SMEMBERS s:enc:isid 2>&1 | sort)
+rust_isid_sm=$(redis-cli -p "$PORT_RUST" SMEMBERS s:enc:isid 2>&1 | sort)
+assert_eq "SMEMBERS across the edge (sorted, byte-exact)" "$redis_isid_sm" "$rust_isid_sm"
+assert_both "SISMEMBER +5 across the edge"           SISMEMBER s:enc:isid +5
+assert_both "SISMEMBER 5 across the edge"            SISMEMBER s:enc:isid 5
+assert_both "SISMEMBER 0 across the edge (absent)"   SISMEMBER s:enc:isid 0
+assert_both "SISMEMBER padded across the edge"       SISMEMBER s:enc:isid 000000012345
+
 # ===========================================================================
 # 9b. Command parity: BITFIELD_RO / SORT_RO / GEORADIUS_RO / GEORADIUSBYMEMBER_RO
 # ===========================================================================

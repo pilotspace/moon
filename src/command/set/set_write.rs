@@ -5,10 +5,7 @@ use std::collections::HashSet;
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::storage::db::{
-    INTSET_MAX_ENTRIES, LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, listpack_batch_fits,
-    set_member_cost, set_table_bytes,
-};
+use crate::storage::db::{Shape, set_member_cost, set_table_bytes};
 use crate::storage::entry::{Entry, boxed_payload_block};
 
 use super::{collect_sets, parse_int};
@@ -47,9 +44,11 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
             .unwrap_or(false)
     });
     let member_count = args.len() - 1;
+    // Every threshold below comes from the ONE authority (moon#896).
+    let limits = db.encoding_limits();
 
     // Try intset path: new key with all-integer members, or existing intset
-    if all_integers && member_count <= INTSET_MAX_ENTRIES {
+    if all_integers && limits.intset_fits(member_count) {
         match db.get_or_create_intset(key) {
             Ok(Some(intset)) => {
                 // `Intset::estimate_memory()` is O(1) (capacity-based).
@@ -64,7 +63,7 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                         if intset.insert(val) {
                             added += 1;
                         }
-                        if intset.len() > INTSET_MAX_ENTRIES {
+                        if !limits.intset_fits(intset.len()) {
                             needs_upgrade = true;
                             break;
                         }
@@ -114,18 +113,36 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
     // Redis keeps a set in a listpack until it exceeds set-max-listpack-entries
     // (128) or set-max-listpack-value (64), and moon reported `hashtable` from
     // the first member because no accessor ever produced a surviving
-    // `SetListpack`. Skipped when any member is oversized, exactly as `hset`
-    // pre-checks LISTPACK_MAX_ELEMENT_SIZE.
-    let has_large_member = args[1..]
+    // `SetListpack`.
+    //
+    // The entry gate, from the ONE authority (moon#896): the longest member
+    // in the batch against `set-max-listpack-value`, the batch size against
+    // `set-max-listpack-entries`. The same predicate bounds a batch far below
+    // the listpack header's u16 range (moon#865) -- the upgrade check runs
+    // AFTER the push loop, which cannot stop a batch already too big; measured
+    // before the bound existed, `SADD` of 70,000 members replied 70000 and
+    // `SCARD` then replied 4464. It also closes the O(n^2) window: membership
+    // here is a linear scan, so an unbounded batch is quadratic inside one
+    // command on one shard thread.
+    let max_member = args[1..]
         .iter()
-        .any(|a| extract_bytes(a).is_some_and(|b| b.len() > LISTPACK_MAX_ELEMENT_SIZE));
-    // moon#865: a batch large enough to wrap the listpack header's u16
-    // element count must not enter the listpack path. The upgrade check runs
-    // AFTER the push loop below, which cannot stop a wrap that happens inside
-    // it -- measured on this branch before the guard, `SADD` of 70,000 members
-    // replied 70000 and `SCARD` then replied 4464.
-    if !has_large_member && listpack_batch_fits(args.len() - 1) {
-        match db.get_or_create_set_listpack(key) {
+        .map(|a| extract_bytes(a).map_or(0, |b| b.len()))
+        .max()
+        .unwrap_or(0);
+    if limits.fits(Shape::Set, member_count, max_member) {
+        // moon#899: a string joining a SMALL intset lands in a listpack, as
+        // in redis 7.2+; before this edge existed it went straight to a
+        // hashtable (3 ints + "abc": moon `hashtable`, redis `listpack`).
+        // Redis's rule, stated on the authority: the intset's members plus
+        // one still fit the entry threshold, and neither the incoming batch's
+        // longest member nor the widest rendered integer exceeds the value
+        // threshold. The push loop's upgrade check below then handles a
+        // batch that overflows the converted listpack, exactly as it does
+        // for any other listpack.
+        let absorb = |members: usize, widest: usize| {
+            limits.fits(Shape::Set, members + 1, max_member.max(widest))
+        };
+        match db.get_or_create_set_listpack(key, absorb) {
             Ok(Some(lp)) => {
                 let mut added = 0i64;
                 // Listpack `estimate_memory()` is O(1) (capacity-based), so a
@@ -151,7 +168,8 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                     }
                 }
                 let after = lp.estimate_memory();
-                let should_upgrade = lp.len() > LISTPACK_MAX_ENTRIES;
+                // The upgrade check, from the same authority as the gate.
+                let should_upgrade = !limits.listpack_fits(Shape::Set, lp);
                 // `lp`'s borrow of `db` ends here — safe to call back into
                 // `db` for accounting from this point on.
                 db.adjust_memory(before, after);

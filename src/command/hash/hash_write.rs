@@ -3,10 +3,7 @@ use smallvec::SmallVec;
 
 use crate::protocol::{Frame, FrameVec};
 use crate::storage::Database;
-use crate::storage::db::{
-    HashTtlCond, LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES, hash_field_cost,
-    hash_field_cost_len, listpack_batch_fits,
-};
+use crate::storage::db::{HashTtlCond, Shape, hash_field_cost, hash_field_cost_len};
 use crate::storage::entry::boxed_payload_block;
 
 use crate::command::helpers::{all_args_are_bytes, err_wrong_args, extract_bytes, ok};
@@ -34,17 +31,23 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("HSET");
     }
 
-    // Check if any field or value exceeds LISTPACK_MAX_ELEMENT_SIZE
-    let has_large_element = args[1..].iter().any(|a| {
-        extract_bytes(a)
-            .map(|b| b.len() > LISTPACK_MAX_ELEMENT_SIZE)
-            .unwrap_or(false)
-    });
-
-    // moon#865: refuse the listpack path for a batch large enough to wrap the
-    // header's u16 element count. The upgrade check below runs after the push
-    // loop, which cannot stop a wrap that happens inside it.
-    if !has_large_element && listpack_batch_fits(args.len() - 1) {
+    // The entry gate, from the ONE authority (moon#896): the longest field or
+    // value in the batch against `hash-max-listpack-value`, the batch size
+    // against `hash-max-listpack-entries`. The same predicate bounds a batch
+    // far below the listpack header's u16 range (moon#865) — the upgrade
+    // check below runs after the push loop, which is too late to stop a
+    // batch that is already too big.
+    let limits = db.encoding_limits();
+    let max_elem = args[1..]
+        .iter()
+        .map(|a| extract_bytes(a).map_or(0, |b| b.len()))
+        .max()
+        .unwrap_or(0);
+    // `args.len() - 1` is listpack ENTRIES (two per field); the policy is in
+    // FIELDS, and the shape converts. Passing the entry count here was
+    // moon#896: a bulk HSET of 65 fields (argv 130) refused the listpack path
+    // that the same hash built one field at a time stayed on until 128.
+    if limits.fits(Shape::Hash, Shape::Hash.items_in(args.len() - 1), max_elem) {
         // Try listpack path for small hashes. HashWithTtl returns Ok(None) here
         // (get_or_create_hash_listpack is now HashWithTtl-aware), so it falls
         // through to the full HashMap path — correct, because TTL'd hashes never
@@ -78,8 +81,8 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
                     i += 2;
                 }
                 let after = lp.estimate_memory();
-                // Check threshold: lp.len()/2 fields > LISTPACK_MAX_ENTRIES
-                let should_upgrade = lp.len() / 2 > LISTPACK_MAX_ENTRIES;
+                // The upgrade check, from the same authority as the gate.
+                let should_upgrade = !limits.listpack_fits(Shape::Hash, lp);
                 // `lp`'s borrow of `db` ends here (last use above) — safe to
                 // call back into `db` for accounting from this point on.
                 if after >= before {
@@ -227,17 +230,15 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("HMSET");
     }
 
-    // Check if any field or value exceeds LISTPACK_MAX_ELEMENT_SIZE
-    let has_large_element = args[1..].iter().any(|a| {
-        extract_bytes(a)
-            .map(|b| b.len() > LISTPACK_MAX_ELEMENT_SIZE)
-            .unwrap_or(false)
-    });
-
-    // moon#865: refuse the listpack path for a batch large enough to wrap the
-    // header's u16 element count. The upgrade check below runs after the push
-    // loop, which cannot stop a wrap that happens inside it.
-    if !has_large_element && listpack_batch_fits(args.len() - 1) {
+    // Entry gate from the ONE authority — see `hset`.
+    let limits = db.encoding_limits();
+    let max_elem = args[1..]
+        .iter()
+        .map(|a| extract_bytes(a).map_or(0, |b| b.len()))
+        .max()
+        .unwrap_or(0);
+    // Fields, not entries — the moon#896 unit, see `hset`.
+    if limits.fits(Shape::Hash, Shape::Hash.items_in(args.len() - 1), max_elem) {
         // HashWithTtl returns Ok(None), falling through — same as HSET.
         match db.get_or_create_hash_listpack(key) {
             Ok(Some(lp)) => {
@@ -261,7 +262,7 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
                     i += 2;
                 }
                 let after = lp.estimate_memory();
-                let should_upgrade = lp.len() / 2 > LISTPACK_MAX_ENTRIES;
+                let should_upgrade = !limits.listpack_fits(Shape::Hash, lp);
                 // `lp`'s borrow of `db` ends here.
                 if after >= before {
                     db.charge_memory(after - before);

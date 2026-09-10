@@ -88,6 +88,12 @@ jobs:
       # that silently stopped matching fails here instead of passing.
       - run: bash scripts/audit-test-tempdirs.sh --self-test
       - run: bash scripts/audit-test-tempdirs.sh
+      # moon#896: the compact-encoding thresholds have ONE authority
+      # (`EncodingLimits`); a hand-rolled threshold or unit conversion at a
+      # consultation site is how the entry gate and the upgrade check came
+      # to disagree. Self-test first, same reason as above.
+      - run: bash scripts/audit-encoding-limits.sh --self-test
+      - run: bash scripts/audit-encoding-limits.sh
       # ci-local.sh's disk pre-flight is pure bash and testable without a
       # VM. It runs here so the thresholds cannot silently rot — the check
       # itself only ever runs on a developer's machine.

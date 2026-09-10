@@ -3,7 +3,7 @@
 //! compares against a `HashMap` oracle.
 //!
 //! **The encoding is asserted at every checkpoint, and that is the point.**
-//! A hash promotes to a `HashMap` above `LISTPACK_MAX_ENTRIES` (128) fields,
+//! A hash promotes to a `HashMap` above the hash entry limit (128) fields,
 //! and nothing ever downgrades. A "large hash" parity test therefore proves
 //! nothing about the listpack path unless it also proves the key was STILL
 //! listpack-encoded when the assertion ran -- otherwise the oracle is being
@@ -25,7 +25,8 @@ use bytes::Bytes;
 use moon::command::hash::{hdel, hget, hgetdel, hset};
 use moon::protocol::Frame;
 use moon::storage::compact_value::RedisValueRef;
-use moon::storage::db::{Database, LISTPACK_MAX_ENTRIES};
+use moon::storage::db::Database;
+use moon::storage::encoding_limits::EncodingLimits;
 
 fn f(b: &[u8]) -> Frame {
     Frame::BulkString(Bytes::copy_from_slice(b))
@@ -57,8 +58,8 @@ fn value(i: usize) -> Vec<u8> {
 #[test]
 fn listpack_hash_commands_match_a_hashmap_oracle_at_the_widest_listpack() {
     // Exactly the promotion threshold: `hset` upgrades when
-    // `lp.len() / 2 > LISTPACK_MAX_ENTRIES`, so 128 fields stay listpack.
-    let n = LISTPACK_MAX_ENTRIES;
+    // the authority's hash entry limit, so 128 fields stay listpack.
+    let n = EncodingLimits::moon_defaults().hash_entries;
     let mut db = Database::new();
     let mut oracle: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let key = b"h";
