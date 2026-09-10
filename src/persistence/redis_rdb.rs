@@ -860,21 +860,44 @@ pub(crate) fn read_rdb_entry(
             let (count, _) = read_length(cursor)?;
             check_alloc_bound(cursor, count, 1, "zset")?;
             let mut members = HashMap::with_capacity(count as usize);
-            let mut scores = BTreeMap::new();
+            let mut tree = crate::storage::bptree::BPTree::new();
             for _ in 0..count {
                 let member_bytes = read_redis_string(cursor)?;
                 let mut score_buf = [0u8; 8];
                 cursor.read_exact(&mut score_buf)?;
                 let score = f64::from_le_bytes(score_buf);
+                // A score is 8 raw bytes on the wire, so a corrupt or hostile
+                // payload can spell NaN — which no writer can produce (`ZADD`
+                // rejects it) and which `zset_score::render_score` documents
+                // as unreachable. It stopped being merely ugly once this arm
+                // started feeding `compact_after_decode`: a NaN would be
+                // rendered into a listpack as the text `NaN`, which
+                // `parse_score` then refuses, so every later read of that
+                // member would silently answer 0.0. Reject the payload here
+                // instead, where the caller still gets an error (RESTORE
+                // reports the encoding it cannot decode; replication fails the
+                // resync) rather than quietly wrong data.
+                if score.is_nan() {
+                    bail!("zset score is NaN; payload is corrupt");
+                }
                 let member = Bytes::from(member_bytes);
-                scores.insert((OrderedFloat(score), member.clone()), ());
+                tree.insert(OrderedFloat(score), member.clone());
                 members.insert(member, score);
             }
-            let mut entry = Entry::new_sorted_set();
+            // `SortedSetBPTree`, not the legacy `SortedSet` this arm used to
+            // build: BPTree is the canonical full form everywhere else
+            // (`OwnedKind::new_entry`, `persistence::rdb`, `classify_cold`),
+            // and it is the only one `compact_after_decode` below has an arm
+            // for. The legacy form had exactly one producer left — this arm —
+            // and every mutable zset command paid `SortedSetKind::upgrade` to
+            // convert it on first touch, while `used_memory` billed it with
+            // the retired per-member model (`legacy_zset_member_cost`)
+            // instead of moon#788's arena-accurate one.
+            let mut entry = Entry::new_sorted_set_bptree();
             if let Some(rv) = entry.redis_value_mut() {
-                *rv = RedisValue::SortedSet {
+                *rv = RedisValue::SortedSetBPTree {
                     members: Box::new(members),
-                    scores: Box::new(scores),
+                    tree: Box::new(tree),
                 };
             }
             entry
@@ -1007,6 +1030,34 @@ pub(crate) fn read_rdb_entry(
         }
         other => bail!("Unsupported RDB type tag: {}", other),
     };
+
+    // Re-derive the compact encoding (moon#863). The Redis wire format has no
+    // type tag for one — `SetIntset`, `SetListpack` and the full `Set` all go
+    // out as `RDB_TYPE_SET` — so the arms above can only rebuild the FULL
+    // form, and this codec is the one a FULLRESYNC payload travels through
+    // (`replication::apply::load_snapshot` -> `load_rdb`). Without this step a
+    // replica lost every compact encoding across a resync and held the
+    // master's data in the expensive form until each key was rewritten;
+    // `OBJECT ENCODING` on the replica disagreed with the master's too.
+    //
+    // Same helper, same thresholds as the native RDB loader
+    // (`persistence::rdb` -> `compact_after_decode`, moon#840): a value that
+    // arrives over the wire lands in exactly the encoding it would have had if
+    // the same commands had been replayed live. Nothing about the bytes on the
+    // wire changes, so moon stays readable by — and able to read — real Redis
+    // in both directions. Values PAST the thresholds fall through the helper's
+    // catch-all arm untouched, in their full form and complete.
+    //
+    // `redis_value_mut` is `None` for an inline/heap string, which is exactly
+    // right: strings have no compact container form. The placeholder swapped
+    // in is an empty `Bytes`, which allocates nothing; every compaction stays
+    // inside its own `CompactValue` heap-tag family (`Set` -> `SetListpack`,
+    // `Hash` -> `HashListpack`, and so on), so replacing the boxed value in
+    // place cannot desynchronise the tag from the payload.
+    if let Some(rv) = entry.redis_value_mut() {
+        let full = std::mem::replace(rv, RedisValue::String(Bytes::new()));
+        *rv = crate::storage::value_codec::compact_after_decode(full);
+    }
 
     // Apply expiry if present
     if let Some(ms) = expiry_ms {
@@ -1426,8 +1477,12 @@ mod tests {
 
         let data = load_dbs[0].data();
         let entry = data.get(b"h1".as_ref()).expect("key h1 not found");
+        // A 2-field hash reloads as a hash LISTPACK, not a hashtable
+        // (moon#863): `read_rdb_entry` re-derives the compact encoding, so a
+        // replica lands on the same encoding as its master.
         match entry.as_redis_value() {
-            RedisValueRef::Hash(map) => {
+            RedisValueRef::HashListpack(lp) => {
+                let map = lp.to_hash_map();
                 assert_eq!(map.len(), 2);
                 assert_eq!(
                     map.get(&Bytes::from_static(b"field1")).unwrap(),
@@ -1438,7 +1493,7 @@ mod tests {
                     &Bytes::from_static(b"val2")
                 );
             }
-            _ => panic!("Expected hash value"),
+            other => panic!("Expected hash listpack, got {}", other.encoding_name()),
         }
     }
 
@@ -1462,14 +1517,18 @@ mod tests {
 
         let data = load_dbs[0].data();
         let entry = data.get(b"l1".as_ref()).expect("key l1 not found");
+        // A 3-element list reloads as a list LISTPACK (moon#863), with its
+        // ORDER intact — a list is the one container where the re-derivation
+        // has to preserve iteration order.
         match entry.as_redis_value() {
-            RedisValueRef::List(list) => {
+            RedisValueRef::ListListpack(lp) => {
+                let list = lp.to_vec_deque();
                 assert_eq!(list.len(), 3);
                 assert_eq!(list[0], Bytes::from_static(b"a"));
                 assert_eq!(list[1], Bytes::from_static(b"b"));
                 assert_eq!(list[2], Bytes::from_static(b"c"));
             }
-            _ => panic!("Expected list value"),
+            other => panic!("Expected list listpack, got {}", other.encoding_name()),
         }
     }
 
@@ -1492,13 +1551,18 @@ mod tests {
 
         let data = load_dbs[0].data();
         let entry = data.get(b"s1".as_ref()).expect("key s1 not found");
+        // A 2-member non-integer set reloads as a set LISTPACK (moon#863);
+        // an all-integer one would reload as an intset. Mirrors
+        // `persistence::rdb::tests::test_round_trip_set`, which has asserted
+        // the same for moon's own RDB since moon#840.
         match entry.as_redis_value() {
-            RedisValueRef::Set(set) => {
+            RedisValueRef::SetListpack(lp) => {
+                let set = lp.to_set_value();
                 assert_eq!(set.len(), 2);
                 assert!(set.contains(&Bytes::from_static(b"x")));
                 assert!(set.contains(&Bytes::from_static(b"y")));
             }
-            _ => panic!("Expected set value"),
+            other => panic!("Expected set listpack, got {}", other.encoding_name()),
         }
     }
 
@@ -1523,14 +1587,29 @@ mod tests {
 
         let data = load_dbs[0].data();
         let entry = data.get(b"z1".as_ref()).expect("key z1 not found");
+        // A 2-member zset reloads as a zset LISTPACK (moon#863), in score
+        // order, with the scores exact through their text rendering.
         match entry.as_redis_value() {
-            RedisValueRef::SortedSet { members, scores } => {
-                assert_eq!(members.len(), 2);
-                assert_eq!(*members.get(&Bytes::from_static(b"alice")).unwrap(), 1.5);
-                assert_eq!(*members.get(&Bytes::from_static(b"bob")).unwrap(), 2.5);
-                assert_eq!(scores.len(), 2);
+            RedisValueRef::SortedSetListpack(lp) => {
+                let pairs: Vec<(Bytes, f64)> = lp
+                    .iter_pairs()
+                    .map(|(m, s)| {
+                        (
+                            Bytes::from(m.as_bytes().to_vec()),
+                            crate::storage::zset_score::parse_score(&s.as_bytes())
+                                .expect("stored score must parse"),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    pairs,
+                    vec![
+                        (Bytes::from_static(b"alice"), 1.5),
+                        (Bytes::from_static(b"bob"), 2.5),
+                    ]
+                );
             }
-            _ => panic!("Expected sorted set value"),
+            other => panic!("Expected zset listpack, got {}", other.encoding_name()),
         }
     }
 
@@ -1668,6 +1747,44 @@ mod tests {
                 "{name}: a count exceeding the remaining input must be rejected, not allocated"
             );
         }
+    }
+
+    /// A zset score is 8 RAW bytes on the wire, so a corrupt or hostile
+    /// payload can spell NaN — which no writer produces (`ZADD` rejects it).
+    /// Since moon#863 this arm feeds `compact_after_decode`, and a NaN would
+    /// be rendered into the listpack as the text `NaN`, which
+    /// `zset_score::parse_score` refuses: every later read of that member
+    /// would silently answer 0.0. Reject the payload instead.
+    ///
+    /// A control with a GOOD score proves the fixture reaches the score at
+    /// all — without it this test passes for any reason the decode fails.
+    #[test]
+    fn test_read_rdb_entry_rejects_a_nan_zset_score() {
+        let zset_body = |score: f64| {
+            let mut buf = Vec::new();
+            write_length(&mut buf, 1); // one member
+            write_redis_string(&mut buf, b"m");
+            buf.extend_from_slice(&score.to_le_bytes());
+            buf
+        };
+
+        let good = zset_body(1.5);
+        let mut cursor = Cursor::new(good.as_slice());
+        let entry = read_rdb_entry(&mut cursor, RDB_TYPE_ZSET_2, None)
+            .expect("control: a well-formed zset body must decode");
+        assert_eq!(
+            entry.as_redis_value().encoding_name(),
+            "listpack",
+            "control: a 1-member zset must come back compacted"
+        );
+
+        let bad = zset_body(f64::NAN);
+        let mut cursor = Cursor::new(bad.as_slice());
+        assert!(
+            read_rdb_entry(&mut cursor, RDB_TYPE_ZSET_2, None).is_err(),
+            "a NaN zset score must be rejected, not stored as the unparseable \
+             text `NaN`"
+        );
     }
 
     /// Wave B stage 2b: `RDB_TYPE_STREAM_MOON` round-trips entries, PEL,
