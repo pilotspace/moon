@@ -25,9 +25,13 @@
 use bytes::Bytes;
 use moon::persistence::redis_rdb::{load_rdb, write_rdb};
 use moon::storage::compact_value::RedisValueRef;
-use moon::storage::db::{
-    Database, INTSET_MAX_ENTRIES, LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES,
-};
+use moon::storage::db::Database;
+use moon::storage::encoding_limits::EncodingLimits;
+
+/// moon#907 retired the free-standing threshold constants into the single
+/// `EncodingLimits` authority. This test asserts boundaries, so it reads them
+/// from the authority rather than restating numbers that can drift apart.
+const LIMITS: EncodingLimits = EncodingLimits::moon_defaults();
 use moon::storage::entry::{Entry, RedisValue, SetValue};
 use moon::storage::listpack::Listpack;
 use std::collections::{HashMap, VecDeque};
@@ -269,20 +273,29 @@ fn zset_scores_survive_the_compacting_round_trip_exactly() {
 
 #[test]
 fn above_threshold_containers_stay_full_and_keep_every_element() {
-    const N: usize = LISTPACK_MAX_ENTRIES + 1; // 129
+    // One element past the listpack entry limit. The hash, set and list
+    // limits are the same number today; the assertion below makes that
+    // explicit, so a later per-type configuration wave fails here loudly
+    // instead of silently testing the wrong boundary for two of the three.
+    assert_eq!(
+        (LIMITS.set_entries, LIMITS.hash_entries, LIMITS.list_entries),
+        (LIMITS.set_entries, LIMITS.set_entries, LIMITS.set_entries),
+        "this test uses one N for set, hash and list; their entry limits have diverged",
+    );
+    const N: usize = LIMITS.set_entries + 1; // 129
     let mut db = Database::new();
 
-    // Non-integer set past LISTPACK_MAX_ENTRIES.
+    // Non-integer set past the listpack entry limit.
     db.set(
         b"bigset",
         full_set((0..N).map(|i| Bytes::from(format!("m{i}")))),
     );
 
-    // All-integer set past INTSET_MAX_ENTRIES: too big for an intset AND too
+    // All-integer set past the intset entry limit: too big for an intset AND too
     // big for a listpack, so it must stay a hashtable.
     db.set(
         b"bigints",
-        full_set((0..=INTSET_MAX_ENTRIES).map(|i| Bytes::from(i.to_string()))),
+        full_set((0..=LIMITS.set_intset).map(|i| Bytes::from(i.to_string()))),
     );
 
     // A single OVER-SIZED element is the other way past the threshold.
@@ -290,7 +303,7 @@ fn above_threshold_containers_stay_full_and_keep_every_element() {
         b"fatmember",
         full_set([
             Bytes::from_static(b"small"),
-            Bytes::from(vec![b'x'; LISTPACK_MAX_ELEMENT_SIZE + 1]),
+            Bytes::from(vec![b'x'; LIMITS.set_value + 1]),
             Bytes::from_static(b"other"),
         ]),
     );
@@ -365,7 +378,7 @@ fn above_threshold_containers_stay_full_and_keep_every_element() {
     // moon#866 guard: element counts, not just encodings.
     let counts: [(&[u8], usize); 7] = [
         (b"bigset", N),
-        (b"bigints", INTSET_MAX_ENTRIES + 1),
+        (b"bigints", LIMITS.set_intset + 1),
         (b"bighash", N),
         (b"biglist", N),
         (b"fatmember", 3),
