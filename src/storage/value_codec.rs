@@ -502,11 +502,16 @@ pub(crate) fn compact_after_decode_with(v: RedisValue, limits: EncodingLimits) -
 /// listpack -> hashtable, list listpack -> linkedlist, set intset ->
 /// hashtable) while redis preserves all three across `DEBUG RELOAD`.
 ///
-/// **Deliberately NOT used by the cold/spill path.** `ValueKind::classify_cold`
-/// accepts only the canonical full forms — a cold-decoded `SetListpack` would
-/// fall through its `_ => Err(WrongType)` arm and answer WRONGTYPE for a
-/// perfectly valid set. Compacting the cold tier is a worthwhile follow-up but
-/// needs `classify_cold` widened first, so it is not bundled here.
+/// **Deliberately NOT used by the cold/spill DECODER.**
+/// `kv_serde::deserialize_collection` is shared with the NON-promoting cold
+/// read-through, which feeds `ValueKind::classify_cold` — that accepts only
+/// the canonical full forms, so a cold-decoded `SetListpack` would fall
+/// through its `_ => Err(WrongType)` arm and answer WRONGTYPE for a perfectly
+/// valid set. The cold tier is covered as of moon#898, but one layer up:
+/// `kv_serde::compact_for_promotion` applies the same re-derivation at the two
+/// boundaries where a cold value actually re-enters the HOT keyspace
+/// (`Database::promote_cold_outcome` and `eviction::rehydrate_spill_payload`),
+/// leaving the shared decoder's full-form contract intact.
 pub fn decode_value_body_compacting(
     cursor: &mut Cursor<&[u8]>,
     value_type: ValueType,

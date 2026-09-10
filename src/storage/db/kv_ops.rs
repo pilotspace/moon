@@ -206,9 +206,23 @@ impl Database {
         match outcome {
             ColdReadOutcome::Hit(redis_value, ttl_ms) => {
                 // Build an entry from the RedisValue (works for strings and collections).
+                //
+                // moon#898: this is the boundary where a cold value re-enters
+                // the HOT keyspace, and therefore where its compact encoding
+                // has to be re-derived. The spill body format is canonical per
+                // logical type (`Set | SetListpack | SetIntset` all encode as
+                // `ValueType::Set`), so `cold_read` can only hand back the FULL
+                // form; without this step the default-enabled offload path
+                // flattened every container it promoted, permanently — nothing
+                // demotes (moon#832). The re-derivation cannot live one layer
+                // down in `kv_serde::deserialize_collection`, which the
+                // NON-promoting read-through shares: `ValueKind::classify_cold`
+                // accepts only the full forms and would answer WRONGTYPE for a
+                // compacted one. See `kv_serde::compact_for_promotion`.
                 let mut entry = Entry::new_string(Bytes::new()); // placeholder
-                entry.value =
-                    crate::storage::compact_value::CompactValue::from_redis_value(redis_value);
+                entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
+                    crate::storage::tiered::kv_serde::compact_for_promotion(redis_value),
+                );
                 if let Some(ttl) = ttl_ms {
                     entry.set_expires_at_ms(ttl);
                 }
