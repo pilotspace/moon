@@ -33,6 +33,37 @@
 //!   A future command that ships without a key spec therefore fails safe
 //!   instead of falling open.
 //!
+//! # `first_key: 0` is not an answer (moon#927)
+//!
+//! The fail-closed contract above had one hole: it was only ever reached for
+//! an UNKNOWN command. A REGISTERED command declaring `first_key: 0` took the
+//! `None` branch, and `first_key: 0` meant two different things — "names no
+//! key" and "nobody filled the key positions in". `MQ` meant the second while
+//! declaring the first, so a `~cache:*` user was correctly refused
+//! `HGET secret:doc1` and then created, filled and drained `secretq` through
+//! `MQ CREATE`/`PUSH`/`POP`, leaving a real keyspace key of type `stream`.
+//!
+//! The registry now carries the distinction as
+//! [`metadata::KeySpecClass`](crate::command::metadata::KeySpecClass), and
+//! [`keyless_verdict`] turns it into a `KeyPositions`. Only an explicitly
+//! reviewed `Keyless` yields `None`; an unclassified entry denies, and a
+//! registration test in `command::metadata` refuses to let one ship.
+//!
+//! # What `~pattern` does NOT scope, and why
+//!
+//! * **`GRAPH.*` and `WS`** — separate namespaces with no keyspace reach.
+//!   Measured: `GRAPH.CREATE g` + `GRAPH.ADDNODE` leave `DBSIZE` unchanged and
+//!   `TYPE g` = `none`; every `WS` argument is a workspace name or UUID. Both
+//!   stay allowed and are gated by command/category permissions, exactly as
+//!   pub/sub channels are gated by `&pattern` rather than `~pattern`.
+//! * **`FT.*` and `CDC.READ`** — an index name and a WAL directory are not
+//!   keys either, but their REPLIES are keyspace data: `FT.SEARCH` names
+//!   matching document keys and re-reads the indexed hashes' values, and
+//!   `CDC.READ` returns the raw change stream for the whole keyspace. These
+//!   are DENIED for key-restricted users. Scoping `FT.*` properly means
+//!   deciding whether the caller's patterns cover the index's `PREFIX`, which
+//!   is the filed follow-up.
+//!
 //! # Hot path
 //!
 //! `check_key_permission` short-circuits for unrestricted users and for `~*`
@@ -150,6 +181,39 @@ pub enum KeyPositions {
     Unknown,
 }
 
+/// What a `first_key: 0` entry's [`KeySpecClass`] means to this walker
+/// (moon#927).
+///
+/// Split out of [`command_key_positions`] so every variant's verdict can be
+/// asserted directly, including the ones no shipped registry entry can
+/// currently produce. `Unclassified` is the whole point of the exercise: a
+/// registered command whose key positions nobody filled in must fail closed
+/// exactly like an unregistered one, instead of being waved through the way
+/// `MQ` was.
+///
+/// [`KeySpecClass`]: metadata::KeySpecClass
+#[must_use]
+pub(crate) fn keyless_verdict(class: metadata::KeySpecClass) -> KeyPositions {
+    use metadata::KeySpecClass as C;
+    match class {
+        // Reviewed as naming no keyspace key: nothing for `~pattern` to gate.
+        C::Keyless => KeyPositions::None,
+        // Reaches keyspace data through a namespace `~pattern` cannot scope
+        // (FT.*, CDC.READ). ACL denies; an unrestricted or `~*` user never
+        // gets here.
+        C::Unscopable => KeyPositions::Unknown,
+        // `movable_shape` runs BEFORE this function, so a `Movable` arriving
+        // here means the shape table and `MOVABLE_KEYS` have drifted. Deny —
+        // and the cross-check test below fails the run so it cannot ship.
+        C::Movable => KeyPositions::Unknown,
+        // Nobody said what this command's `first_key: 0` means.
+        C::Unclassified => KeyPositions::Unknown,
+        // Unreachable: the caller only asks about `first_key <= 0`. Denying is
+        // still the right answer if that ever stops being true.
+        C::Fixed => KeyPositions::Unknown,
+    }
+}
+
 /// Locate the key arguments of `cmd`/`args`. `args` EXCLUDES the command name,
 /// so registry key-spec index `N` maps to `args[N - 1]`.
 pub fn command_key_positions(cmd: &[u8], args: &[Frame]) -> KeyPositions {
@@ -161,11 +225,16 @@ pub fn command_key_positions(cmd: &[u8], args: &[Frame]) -> KeyPositions {
     }
 
     let Some(meta) = metadata::lookup(cmd) else {
-        // FT.* / GRAPH.* address indexes and graphs, not keyspace keys; ACL
-        // key patterns do not cover that namespace at all (tracked
-        // separately). Everything else unknown fails closed.
-        if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.")
-            || cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.")
+        // moon#927: the `FT.` half of this arm is gone. It read "FT.* / GRAPH.*
+        // address indexes and graphs, not keyspace keys ... (tracked
+        // separately)" — nothing tracked it, and the premise was only half
+        // right. A graph really is its own store (measured: `GRAPH.CREATE` +
+        // `GRAPH.ADDNODE` leave `DBSIZE` unchanged), so `GRAPH.` keeps its
+        // pass. An FT.* search REPLY is keyspace data, so an unregistered
+        // `FT.*` now falls through to `Unknown` — the same verdict its
+        // registered siblings get from `KEY_PATTERN_UNSCOPABLE`, instead of the
+        // opposite one on the strength of a prefix nobody reviewed.
+        if cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.")
             || UNREGISTERED_KEYLESS
                 .iter()
                 .any(|k| cmd.eq_ignore_ascii_case(k))
@@ -176,7 +245,12 @@ pub fn command_key_positions(cmd: &[u8], args: &[Frame]) -> KeyPositions {
     };
 
     if meta.first_key <= 0 {
-        return KeyPositions::None;
+        // moon#927: `first_key: 0` alone answers nothing. It meant BOTH "names
+        // no key" and "nobody filled the key positions in", and this line used
+        // to read only the first — which is how a `~cache:*` user created,
+        // filled and drained `secretq` through `MQ`. The registry now says
+        // which it is, and anything it does not say is denied.
+        return keyless_verdict(metadata::class_of(meta));
     }
 
     let argc = args.len();
@@ -297,6 +371,10 @@ pub fn command_has_keys(cmd: &[u8], args: &[Frame]) -> bool {
         Some(Movable::Container { role }) => {
             matches!(subcommand_key(args, role), KeyPositions::At(_))
         }
+        // moon#927: same reasoning as `Container` — `MQ`'s key-ness belongs to
+        // its SUBCOMMAND, so `COMMAND GETKEYS MQ PUSH q f v` reports `q` while
+        // a bare `MQ` reports no keys rather than an invented one.
+        Some(Movable::MqQueue) => matches!(mq_queue_key(args), KeyPositions::At(_)),
         Some(_) => true,
         None => metadata::lookup(cmd).is_some_and(|m| m.first_key > 0),
     }
@@ -394,7 +472,39 @@ enum Movable {
     Streams { role: KeyRole },
     /// `<CMD> <SUBCOMMAND> <key>` — only SOME subcommands take a key.
     Container { role: KeyRole },
+    /// `MQ <SUB> <queue-key> ...` (moon#927).
+    ///
+    /// Deliberately NOT [`Container`](Movable::Container): that shape reports a
+    /// key whenever `args[1]` exists, whatever the subcommand is, which is
+    /// right for `OBJECT`/`XINFO` (a subcommand it does not know still puts its
+    /// key there) and wrong here. `MQ` is a moon extension whose subcommand set
+    /// is still growing, and a subcommand added without revisiting
+    /// [`MQ_SUBCOMMANDS`] must fail CLOSED rather than have `args[1]` guessed
+    /// at on its behalf.
+    MqQueue,
 }
+
+/// Every `MQ` subcommand moon serves, with what it does to its queue key.
+///
+/// Enumerated against `src/command/mq.rs` — `validate_mq_create`,
+/// `validate_mq_push`, `validate_mq_pop`, `validate_mq_ack`,
+/// `validate_mq_dlqlen`, `validate_mq_trigger`, `validate_mq_publish` — all of
+/// which read the queue name at `args[1]`. `LEN` has no handler arm today but
+/// is already in `command::mq::is_mq_readonly_subcommand`; it is listed here
+/// for the same reason, so wiring it up later does not need a second change.
+///
+/// A subcommand missing from this list is refused for key-restricted users,
+/// not waved through: that is the direction that cannot become a bypass.
+const MQ_SUBCOMMANDS: &[(&[u8], KeyRole)] = &[
+    (b"CREATE", KeyRole::Write),
+    (b"PUSH", KeyRole::Write),
+    (b"POP", KeyRole::Write),
+    (b"ACK", KeyRole::Write),
+    (b"TRIGGER", KeyRole::Write),
+    (b"PUBLISH", KeyRole::Write),
+    (b"DLQLEN", KeyRole::Read),
+    (b"LEN", KeyRole::Read),
+];
 
 /// Classify `cmd`'s key layout, or `None` when the meta-derived walk applies.
 ///
@@ -497,6 +607,12 @@ fn movable_shape(cmd: &[u8]) -> Option<Movable> {
         (6, b'm') if cmd.eq_ignore_ascii_case(b"MEMORY") => Movable::Container { role: Read },
         (6, b'x') if cmd.eq_ignore_ascii_case(b"XGROUP") => Movable::Container { role: Write },
 
+        // ---- moon#927: MQ's queue key sits behind its subcommand ----
+        // `WS` is deliberately absent: its arguments are workspace names and
+        // UUIDs, never keyspace keys, so it is classified `Keyless` in the
+        // registry instead. See `metadata::KEYLESS_BY_DESIGN`.
+        (2, b'm') if cmd.eq_ignore_ascii_case(b"MQ") => Movable::MqQueue,
+
         _ => return None,
     };
     Some(shape)
@@ -515,6 +631,7 @@ impl Movable {
             Movable::TwoKeys => two_keys(args),
             Movable::Streams { role } => stream_keys(args, role),
             Movable::Container { role } => subcommand_key(args, role),
+            Movable::MqQueue => mq_queue_key(args),
         }
     }
 }
@@ -660,6 +777,40 @@ fn subcommand_key(args: &[Frame], role: KeyRole) -> KeyPositions {
             KeyPositions::At(idx)
         }
     }
+}
+
+/// `MQ <SUB> <queue-key> ...` (moon#927).
+///
+/// Every subcommand in [`MQ_SUBCOMMANDS`] names its durable queue at
+/// `args[1]`, and that name IS a keyspace key: `MQ CREATE q` leaves `TYPE q`
+/// answering `stream`, and `MQ PUSH`/`POP` read and write that stream's
+/// entries. `MQ POP` may additionally spill over-delivered entries into a
+/// sibling `<key>::mq:dlq` stream — a SUFFIX of the named key, so a prefix
+/// pattern like `~cache:*` covers it, and an exact pattern like `~cache:q`
+/// does not. That residual is the one thing this walker cannot report, because
+/// it borrows key bytes out of the argv and a derived name exists nowhere in
+/// it; it is written down in the PR rather than papered over.
+///
+/// Unrecognised subcommand, or a missing one: `Unknown`, so a key-restricted
+/// user is denied. `MQ` alone and `MQ PUSH` (no queue) are arity errors that
+/// the handler would reject anyway — the difference is only which error an
+/// already-restricted user sees.
+fn mq_queue_key(args: &[Frame]) -> KeyPositions {
+    let Some(sub) = args.first().and_then(key_bytes) else {
+        return KeyPositions::Unknown;
+    };
+    let Some((_, role)) = MQ_SUBCOMMANDS
+        .iter()
+        .find(|(name, _)| sub.eq_ignore_ascii_case(name))
+    else {
+        return KeyPositions::Unknown;
+    };
+    if args.get(1).is_none() {
+        return KeyPositions::Unknown;
+    }
+    let mut idx = KeyIdx::new();
+    idx.push(KeyAt::new(1, *role));
+    KeyPositions::At(idx)
 }
 
 #[cfg(test)]
@@ -1025,9 +1176,12 @@ mod tests {
             b"FLUSHALL".as_ref(),
             b"PUBSUB".as_ref(),
             b"HEALTHZ".as_ref(),
-            b"FT.SEARCH".as_ref(),
-            b"FT.INVALIDATE_RANGE".as_ref(),
+            // moon#927: graphs are their own store with no keyspace reach, so
+            // `GRAPH.*` keeps reporting no keys — registered and unregistered
+            // alike. `FT.SEARCH` and `FT.INVALIDATE_RANGE` used to be on this
+            // list and are now denied instead; see `ft_and_cdc_are_denied_...`.
             b"GRAPH.QUERY".as_ref(),
+            b"GRAPH.REMOVENODE".as_ref(),
         ] {
             assert!(
                 is_none(cmd, &["x"]),
@@ -1043,113 +1197,52 @@ mod tests {
         assert!(is_indeterminate(b"SMOVE", &["only-one"]));
     }
 
-    /// The guard that keeps the fail-closed default honest: every command in
-    /// the registry that declares NO key must be one we have actually looked
-    /// at. A new command whose `first_key` is left at 0 by accident lands
-    /// here and fails the suite instead of shipping unenforced.
+    /// moon#927 retired this module's hand-maintained `REVIEWED_KEYLESS` list.
+    ///
+    /// It answered "is every `first_key: 0` entry one we have looked at?" from
+    /// a SECOND copy of the registry's own knowledge, waived whole prefixes
+    /// (`FT.`, `GRAPH.`), and still had `WS` and `MQ` sitting in it under the
+    /// heading "moon extensions addressing indexes/graphs/queues, not keys" —
+    /// while `MQ` was addressing a real keyspace key at `args[1]`. A duplicated
+    /// list that can disagree with the thing it describes is the defect, not
+    /// the guard. `command::metadata::key_spec_registration` now enumerates the
+    /// registry with NO waiver of any kind.
+    ///
+    /// What remains here is the half only THIS module can answer: a command
+    /// classified `Movable` must actually have a shape arm, and a command with
+    /// a shape arm must be classified `Movable`. Either direction failing means
+    /// a key-restricted user gets the wrong verdict — a `Movable` with no arm
+    /// is denied everything, and an arm with no classification would have been
+    /// waved through if the shape table were ever reordered.
     #[test]
-    fn keyless_registry_entries_are_reviewed() {
-        // Commands whose registry entry says `first_key == 0` AND that this
-        // module does not special-case. Every name here has been checked to
-        // name no keyspace key.
-        const REVIEWED_KEYLESS: &[&str] = &[
-            // connection / server / admin
-            "PING",
-            "ECHO",
-            "QUIT",
-            "SELECT",
-            "INFO",
-            "COMMAND",
-            "AUTH",
-            "HELLO",
-            "RESET",
-            "CLIENT",
-            "ROLE",
-            "WAIT",
-            "BGSAVE",
-            "BGREWRITEAOF",
-            "SAVE",
-            "LASTSAVE",
-            "CONFIG",
-            "ACL",
-            "SLOWLOG",
-            "MODULE",
-            "MONITOR",
-            "HOTKEYS",
-            "DEBUG",
-            "KILL",
-            "VACUUM",
-            "FLUSHDB",
-            "FLUSHALL",
-            "SWAPDB",
-            "SHUTDOWN",
-            "TIME",
-            "LOLWUT",
-            "DBSIZE",
-            "RANDOMKEY",
-            "KEYS",
-            "SCAN",
-            // pub/sub (channel patterns, not key patterns)
-            "SUBSCRIBE",
-            "UNSUBSCRIBE",
-            "PSUBSCRIBE",
-            "PUNSUBSCRIBE",
-            "PUBLISH",
-            "SPUBLISH",
-            "SSUBSCRIBE",
-            "SUNSUBSCRIBE",
-            // moon#635: PUBSUB introspects CHANNELS, which ACL governs with
-            // `&patterns`, never `~patterns` — same reasoning as the verbs
-            // above it.
-            "PUBSUB",
-            // scripting containers (EVAL/EVALSHA/FCALL are movable-key handled)
-            "SCRIPT",
-            "FUNCTION",
-            // transactions
-            "MULTI",
-            "EXEC",
-            "DISCARD",
-            "TXN",
-            "UNWATCH",
-            // replication / cluster
-            "REPLICAOF",
-            "SLAVEOF",
-            "REPLCONF",
-            "PSYNC",
-            "CLUSTER",
-            // moon#635: connection-MODE verbs. Each takes no argument at all
-            // (arity 1), so there is nothing for a key pattern to match.
-            "ASKING",
-            "READONLY",
-            "READWRITE",
-            "CDC.READ",
-            // moon extensions addressing indexes/graphs/queues, not keys
-            "WS",
-            "MQ",
-            "TEMPORAL.SNAPSHOT_AT",
-            "TEMPORAL.INVALIDATE",
-        ];
-
-        let mut unreviewed: Vec<&str> = metadata::COMMAND_META
-            .entries()
-            .filter(|(_, meta)| meta.first_key == 0)
-            .map(|(name, _)| *name)
-            .filter(|name| {
-                !REVIEWED_KEYLESS.contains(name)
-                    && !name.starts_with("FT.")
-                    && !name.starts_with("GRAPH.")
-                    // movable-key commands: their registry spec says 0 but
-                    // this module extracts their keys explicitly.
-                    && movable_shape(name.as_bytes()).is_none()
-            })
-            .collect();
-        unreviewed.sort_unstable();
+    fn movable_classification_and_shape_table_agree() {
+        let mut missing_arm: Vec<&str> = Vec::new();
+        for name in metadata::MOVABLE_KEYS.iter() {
+            if movable_shape(name.as_bytes()).is_none() {
+                missing_arm.push(name);
+            }
+        }
+        missing_arm.sort_unstable();
         assert!(
-            unreviewed.is_empty(),
-            "these registry commands declare NO keys and are not reviewed as keyless — \
-             if they touch keys, give them a key spec (or a movable-key arm) or the ACL \
-             key check will not enforce ~patterns for them: {:?}",
-            unreviewed
+            missing_arm.is_empty(),
+            "classified MOVABLE_KEYS but with no `movable_shape` arm to find their keys, so ACL \
+             denies them outright for every key-restricted user: {missing_arm:?}"
+        );
+
+        let mut unclassified_arm: Vec<&str> = Vec::new();
+        for (name, meta) in metadata::COMMAND_META.entries() {
+            if meta.first_key != 0 || movable_shape(name.as_bytes()).is_none() {
+                continue;
+            }
+            if !metadata::MOVABLE_KEYS.contains(name) {
+                unclassified_arm.push(name);
+            }
+        }
+        unclassified_arm.sort_unstable();
+        assert!(
+            unclassified_arm.is_empty(),
+            "have a `movable_shape` arm and `first_key: 0`, but are not in MOVABLE_KEYS — the two \
+             tables disagree about where their keys are: {unclassified_arm:?}"
         );
     }
 
@@ -1604,13 +1697,15 @@ mod tests {
             (b"FUNCTION", &one),
             (b"WAIT", &one),
             (b"TIME", &[]),
-            (b"FT.SEARCH", &one),
-            (b"FT.INVALIDATE_RANGE", &one),
+            // moon#927 removed `FT.SEARCH`, `FT.INVALIDATE_RANGE`, `CDC.READ`
+            // and `MQ` from this list. They were asserted here as "names no
+            // key and must not be denied" — which is precisely the bypass:
+            // `MQ` names one, and the other three hand back keyspace data a
+            // `~pattern` cannot scope. Their new verdicts are pinned by
+            // `mq_is_enforced_...` / `ft_and_cdc_are_denied_...` below.
             (b"GRAPH.QUERY", &one),
             (b"TEMPORAL.INVALIDATE", &one),
-            (b"CDC.READ", &one),
             (b"WS", &one),
-            (b"MQ", &one),
             (b"TXN", &one),
             (b"XINFO", &[]),
             (b"OBJECT", &[]),
@@ -1622,6 +1717,173 @@ mod tests {
                     .check_key_permission("alice", cmd, args, true)
                     .is_none(),
                 "{} names no key and must not be denied by the key check",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+    }
+
+    // ── moon#927 ─────────────────────────────────────────────────────────
+
+    /// `MQ`'s queue key, for every subcommand moon serves.
+    ///
+    /// Extraction and the ANSWER are asserted separately on purpose: getting
+    /// the position right but leaving `MQ` classified `Keyless` would keep the
+    /// second half of this test green while the bypass stayed open.
+    #[test]
+    fn mq_names_its_queue_key_for_every_subcommand() {
+        for (sub, extra) in [
+            ("CREATE", &[][..]),
+            ("PUSH", &["f", "v"][..]),
+            ("POP", &[][..]),
+            ("ACK", &["1-1"][..]),
+            ("DLQLEN", &[][..]),
+            ("TRIGGER", &["PING"][..]),
+            ("PUBLISH", &["f", "v"][..]),
+            ("LEN", &[][..]),
+        ] {
+            let mut parts = vec![sub, "q"];
+            parts.extend_from_slice(extra);
+            assert_eq!(
+                keys_of(b"MQ", &parts),
+                vec!["q".to_string()],
+                "MQ {sub} reads its queue at args[1] (src/command/mq.rs)"
+            );
+            // Lowercase is what clients actually send.
+            let lower = sub.to_ascii_lowercase();
+            let mut parts = vec![lower.as_str(), "q"];
+            parts.extend_from_slice(extra);
+            assert_eq!(keys_of(b"mq", &parts), vec!["q".to_string()]);
+        }
+    }
+
+    /// A subcommand this walker does not know may put a key anywhere, so it is
+    /// refused rather than guessed at. Same for a truncated argv.
+    #[test]
+    fn mq_unknown_or_truncated_subcommand_is_indeterminate() {
+        assert!(is_indeterminate(b"MQ", &["NOSUCHSUB", "secretq"]));
+        assert!(is_indeterminate(b"MQ", &["PUSH"]));
+        assert!(is_indeterminate(b"MQ", &[]));
+        // A non-string in the subcommand slot is a malformed argv, not a
+        // keyless invocation.
+        assert!(matches!(
+            command_keys(b"MQ", &[Frame::Integer(1), Frame::Integer(2)]),
+            CommandKeys::Indeterminate
+        ));
+    }
+
+    /// The end-to-end answer a key-restricted user gets. Both halves: the
+    /// queue outside the pattern is refused, and the one inside it is not.
+    #[test]
+    fn mq_is_enforced_against_the_users_key_pattern() {
+        let mut table = crate::acl::AclTable::new();
+        table.apply_setuser("alice", &["on", "nopass", "~cache:*", "+@all"]);
+        for (sub, extra) in [
+            ("CREATE", &[][..]),
+            ("PUSH", &["f", "v"][..]),
+            ("POP", &[][..]),
+            ("ACK", &["1-1"][..]),
+            ("DLQLEN", &[][..]),
+            ("TRIGGER", &["PING"][..]),
+            ("PUBLISH", &["f", "v"][..]),
+        ] {
+            let mut outside = vec![sub, "secretq"];
+            outside.extend_from_slice(extra);
+            assert!(
+                table
+                    .check_key_permission("alice", b"MQ", &argv(&outside), true)
+                    .is_some(),
+                "MQ {sub} on a queue outside ~cache:* must be denied"
+            );
+            let mut inside = vec![sub, "cache:q"];
+            inside.extend_from_slice(extra);
+            assert!(
+                table
+                    .check_key_permission("alice", b"MQ", &argv(&inside), true)
+                    .is_none(),
+                "MQ {sub} on a queue INSIDE ~cache:* must still be allowed — a blanket denial \
+                 would pass the assertion above while breaking every legitimate user"
+            );
+        }
+    }
+
+    /// `FT.*` and `CDC.READ` hand back keyspace data through a namespace
+    /// `~pattern` cannot scope, so a key-restricted user is refused — and an
+    /// unregistered `FT.*` gets the same verdict as its registered siblings
+    /// rather than the opposite one from a prefix match.
+    #[test]
+    fn ft_and_cdc_are_denied_for_a_key_restricted_user() {
+        let mut table = crate::acl::AclTable::new();
+        table.apply_setuser("alice", &["on", "nopass", "~cache:*", "+@all"]);
+        let cases: &[(&[u8], &[&str])] = &[
+            (b"FT.SEARCH", &["tidx", "alpha"]),
+            (b"FT.AGGREGATE", &["tidx", "alpha"]),
+            (b"FT.CREATE", &["tidx"]),
+            (b"FT.DROPINDEX", &["tidx"]),
+            (b"FT._LIST", &[]),
+            (b"FT.INVALIDATE_RANGE", &["tidx"]),
+            (b"CDC.READ", &["/var/lib/moon/shard-0/wal-v3", "0"]),
+        ];
+        for (cmd, parts) in cases {
+            assert!(
+                table
+                    .check_key_permission("alice", cmd, &argv(parts), false)
+                    .is_some(),
+                "{} must be refused for a `~cache:*` user",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+        // The other half, and the constraint most likely to be violated: a
+        // `~*` user is UNAFFECTED. It short-circuits before key extraction, so
+        // this also proves the deny arm cannot reach an unrestricted user.
+        table.apply_setuser("wide", &["on", "nopass", "~*", "+@all"]);
+        for (cmd, parts) in cases {
+            assert!(
+                table
+                    .check_key_permission("wide", cmd, &argv(parts), false)
+                    .is_none(),
+                "{} must stay available to a `~*` user",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+    }
+
+    /// The mechanism itself, variant by variant — including the ones no
+    /// shipped registry entry can currently produce. `Unclassified` is the
+    /// whole point: a registered command whose key positions nobody filled in
+    /// must fail closed exactly like an unregistered one.
+    #[test]
+    fn keyless_verdict_denies_everything_it_has_not_reviewed() {
+        use crate::command::metadata::KeySpecClass as C;
+        assert!(matches!(keyless_verdict(C::Keyless), KeyPositions::None));
+        for class in [C::Unclassified, C::Unscopable, C::Movable, C::Fixed] {
+            assert!(
+                matches!(keyless_verdict(class), KeyPositions::Unknown),
+                "{class:?} must deny: it is not a reviewed `names no key`"
+            );
+        }
+    }
+
+    /// `~*` users are unaffected by the whole moon#927 surface, asserted once
+    /// over every family the change touches.
+    #[test]
+    fn allkeys_user_is_unaffected_by_the_927_surface() {
+        let mut table = crate::acl::AclTable::new();
+        table.apply_setuser("wide", &["on", "nopass", "~*", "+@all"]);
+        let cases: &[(&[u8], &[&str])] = &[
+            (b"MQ", &["PUSH", "anyq", "f", "v"]),
+            (b"MQ", &["NOSUCHSUB", "anyq"]),
+            (b"FT.SEARCH", &["tidx", "alpha"]),
+            (b"CDC.READ", &["/tmp/wal", "0"]),
+            (b"WS", &["LIST"]),
+            (b"GRAPH.QUERY", &["g", "MATCH (n) RETURN n"]),
+            (b"GET", &["secret:doc1"]),
+        ];
+        for (cmd, parts) in cases {
+            assert!(
+                table
+                    .check_key_permission("wide", cmd, &argv(parts), true)
+                    .is_none(),
+                "a `~*` user must be unaffected: {} {parts:?}",
                 String::from_utf8_lossy(cmd)
             );
         }

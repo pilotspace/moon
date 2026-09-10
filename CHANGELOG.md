@@ -6,6 +6,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **ACL `~pattern` now applies to `MQ`, and is no longer silently skipped for
+  `FT.*` and `CDC.READ` (moon#927).** ACL key enforcement derives key positions
+  from `COMMAND_META`, where `first_key: 0` meant two different things: *"this
+  command names no keyspace key"* and *"nobody filled the key positions in"*.
+  `MQ` declared the second while meaning the first, so a user limited to
+  `~cache:*` was correctly refused `HGET secret:doc1` and then created, filled
+  and drained `secretq` through `MQ CREATE`/`PUSH`/`POP` — a real keyspace key
+  of type `stream`, outside its pattern. The same user read `secret:doc1` and
+  its BM25 score out of `FT.SEARCH`, and the values of every key in the
+  instance out of `CDC.READ <wal_dir> 0`.
+
+  Fixed in three parts. `MQ`'s queue key is now enumerated per subcommand
+  (CREATE, PUSH, POP, ACK, DLQLEN, TRIGGER, PUBLISH; an unrecognised subcommand
+  fails closed). The registry now carries `KeySpecClass`, so every
+  `first_key: 0` entry must be classified as keyless-by-design, movable-key, or
+  pattern-unscopable — an unclassified one is DENIED at runtime and refused by a
+  registration test, which is what makes the ambiguity unrepresentable rather
+  than merely commented. And the `FT.`/`GRAPH.` skip in `acl::keyspec`, whose
+  comment deferred to an issue that never existed, is now a decision that is
+  written down: `GRAPH.*`, `WS` and `TEMPORAL.*` address namespaces with no
+  keyspace reach and stay outside `~pattern` (gated by command/category
+  permissions, as pub/sub channels are gated by `&pattern`), while `FT.*` and
+  `CDC.READ` hand back keyspace data and are refused.
+
+  **Upgrade note.** Only users with a key pattern OTHER than `~*` are affected;
+  unrestricted and `~*` users short-circuit before key extraction and are
+  unchanged. Such a user now needs `~<queue-pattern>` to use `MQ`, and can no
+  longer run `FT.*` or `CDC.READ` at all. Per-index scoping for `FT.*` — deciding
+  whether the caller's patterns cover the index's `PREFIX` — is filed as the
+  follow-up; grant `~*` in the meantime if a restricted user must search.
+
 ### Fixed
 
 - **`HINCRBY` and `HSETNX` no longer flatten a small hash (moon#897).** Both

@@ -574,6 +574,209 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
 };
 
 // ---------------------------------------------------------------------------
+// What `first_key: 0` MEANS — moon#927
+// ---------------------------------------------------------------------------
+
+/// How a registry entry's key spec is to be READ by a consumer that gates on
+/// keys (ACL `~pattern`, cache invalidation, workspace prefixing, cross-shard
+/// routing).
+///
+/// # Why this exists
+///
+/// `first_key: 0` used to be the answer to two different questions:
+///
+/// * *"this command provably names no keyspace key"* — `PING`, `SUBSCRIBE`,
+///   `FLUSHALL`; and
+/// * *"nobody filled the key positions in"* — `MQ`, whose handler reads its
+///   queue name at `args[1]` (`src/command/mq.rs`) and creates a real keyspace
+///   key of type `stream` from it.
+///
+/// `acl::keyspec` read the first meaning and answered `KeyPositions::None`,
+/// which does not mean "check less precisely" — it means the permission loop
+/// never runs. Measured on moon 0.8.9: a user limited to `~cache:*` was
+/// correctly refused `HGET secret:doc1` and then created, filled and drained
+/// `secretq` through `MQ CREATE`/`PUSH`/`POP` (moon#927). The module's
+/// fail-closed default for an UNKNOWN command was never reached, because `MQ`
+/// is perfectly well known.
+///
+/// The two meanings are now separate values that a command must be classified
+/// into by NAME. An entry that is not classified is
+/// [`Unclassified`](KeySpecClass::Unclassified), which every keys-gating
+/// consumer must treat exactly as it treats an unknown command — deny. The
+/// registration test in this module additionally refuses to let an
+/// unclassified entry ship at all, so the runtime arm is a second line of
+/// defence rather than the only one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeySpecClass {
+    /// `first_key >= 1`: the fixed `first_key`/`last_key`/`step` spec names
+    /// the keys, and the ordinary walk applies.
+    Fixed,
+    /// Reviewed: this command provably names no keyspace key. Key patterns
+    /// have nothing to gate, so a key-restricted user keeps it.
+    Keyless,
+    /// This command DOES name keys, but not at a position `first_key` can
+    /// express — a `numkeys`-counted vector, the `STREAMS` token, or a
+    /// subcommand-shaped position. The caller must use the shape walker in
+    /// [`crate::acl::keyspec`]; reaching this variant there means the shape
+    /// table and this list have drifted, which is a bug, so it denies.
+    Movable,
+    /// This command addresses a namespace a `~pattern` cannot scope, AND it
+    /// reaches keyspace data. A key-restricted user is DENIED; an
+    /// unrestricted or `~*` user is unaffected (both short-circuit in
+    /// `AclTable::check_key_permission` before key extraction runs at all).
+    ///
+    /// See [`KEY_PATTERN_UNSCOPABLE`] for the per-family rationale.
+    Unscopable,
+    /// `first_key: 0` and nobody said which of the above it is. Fail closed.
+    Unclassified,
+}
+
+/// Commands whose `first_key: 0` means **there is no keyspace key here**.
+///
+/// Membership is a claim that the command's handler indexes no argument as a
+/// keyspace key. Getting one wrong here is a silent ACL bypass, so the entries
+/// are grouped by the reason they qualify:
+///
+/// * **Connection / server / admin** — `PING`, `SELECT`, `INFO`, `CONFIG`,
+///   `ACL`, `SHUTDOWN`, … take no key argument at all.
+/// * **Whole-keyspace verbs** — `FLUSHDB`, `FLUSHALL`, `SWAPDB`, `KEYS`,
+///   `SCAN`, `DBSIZE`, `RANDOMKEY`. These reach every key by construction, so
+///   there is no key ARGUMENT for a pattern to match; redis gates them the
+///   same way (`firstkey 0`) and leaves them to `@dangerous`/`@keyspace`.
+/// * **Pub/sub** — a channel is not a key. Channels have their own ACL
+///   dimension (`&pattern`, `AclTable::check_channel_permission`); scoping
+///   them with `~pattern` would be a category error.
+/// * **`WS`** — every `WS` argument is a workspace NAME or UUID, never a key
+///   (`src/command/workspace.rs`: CREATE takes a name, DROP/AUTH/INFO take a
+///   `WorkspaceId`, LIST takes nothing). `WS DROP` does destroy a whole
+///   workspace's keys, which is `FLUSHDB`-shaped and gated the same way — by
+///   command permission, not by key pattern.
+/// * **`TEMPORAL.*`** — both operate on GRAPH entities (`valid_to` on a node
+///   or edge, and the shard-local snapshot registry), never on keys.
+/// * **`GRAPH.*`** — graphs live in their own store. Measured on moon 0.8.9:
+///   `GRAPH.CREATE g` followed by `GRAPH.ADDNODE` leaves `DBSIZE` unchanged
+///   and `TYPE g` answering `none`, and `src/graph/store.rs` holds no handle
+///   to a `ShardSlice`. A graph name is therefore no more a keyspace key than
+///   a channel is. This is the half of the moon#927 comment that was TRUE.
+///   (`FT.*` is the half that was not — see [`KEY_PATTERN_UNSCOPABLE`].)
+///
+/// One known leak is deliberately left here rather than silently changed:
+/// `DEBUG OBJECT <key>` reports a key's encoding and serialised length, and
+/// `DEBUG` is `firstkey 0` in redis too, so moon matches redis exactly. It is
+/// `ADMIN` + `@dangerous`; tightening it would diverge `COMMAND GETKEYS DEBUG`
+/// from redis and belongs in its own change.
+pub static KEYLESS_BY_DESIGN: phf::Set<&'static str> = phf::phf_set! {
+    // connection
+    "PING", "ECHO", "QUIT", "SELECT", "AUTH", "HELLO", "RESET", "CLIENT", "ROLE",
+    // server / admin
+    "INFO", "COMMAND", "WAIT", "BGSAVE", "BGREWRITEAOF", "SAVE", "LASTSAVE",
+    "CONFIG", "ACL", "SLOWLOG", "MONITOR", "HOTKEYS", "DEBUG", "KILL", "VACUUM",
+    "MODULE", "SHUTDOWN", "TIME", "LOLWUT",
+    // whole-keyspace verbs: no key ARGUMENT to match
+    "KEYS", "SCAN", "DBSIZE", "RANDOMKEY", "FLUSHDB", "FLUSHALL", "SWAPDB",
+    // pub/sub: channels are gated by `&pattern`, not `~pattern`
+    "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE", "PUBLISH",
+    "SPUBLISH", "SSUBSCRIBE", "SUNSUBSCRIBE", "PUBSUB",
+    // scripting administration (the key-bearing forms are EVAL*/FCALL*)
+    "SCRIPT", "FUNCTION",
+    // transactions (WATCH is first_key 1 and takes the ordinary walk)
+    "MULTI", "EXEC", "DISCARD", "UNWATCH", "TXN",
+    // replication / cluster
+    "REPLICAOF", "SLAVEOF", "REPLCONF", "PSYNC", "CLUSTER", "ASKING",
+    "READONLY", "READWRITE",
+    // workspaces: names and UUIDs, never keys
+    "WS",
+    // temporal + graph: their own namespaces, no keyspace reach
+    "TEMPORAL.SNAPSHOT_AT", "TEMPORAL.INVALIDATE",
+    "GRAPH.CREATE", "GRAPH.ADDNODE", "GRAPH.ADDEDGE", "GRAPH.DELETE",
+    "GRAPH.DROP", "GRAPH.NEIGHBORS", "GRAPH.INFO", "GRAPH.LIST",
+    "GRAPH.QUERY", "GRAPH.RO_QUERY", "GRAPH.EXPLAIN", "GRAPH.VSEARCH",
+    "GRAPH.HYBRID", "GRAPH.PROFILE",
+};
+
+/// Commands whose `first_key: 0` means **the keys are not at a fixed
+/// position** — the shape walker in [`crate::acl::keyspec`] finds them.
+///
+/// Every name here MUST have a `movable_shape` arm; the cross-check test in
+/// that module fails otherwise, and a name that slipped through would be
+/// DENIED at runtime rather than waved past.
+pub static MOVABLE_KEYS: phf::Set<&'static str> = phf::phf_set! {
+    // `<cmd> numkeys key [key ...]`
+    "LMPOP", "ZMPOP", "ZDIFF", "ZINTER", "ZUNION", "ZINTERCARD", "SINTERCARD",
+    "BLMPOP", "BZMPOP",
+    // `<cmd> script|sha numkeys key [key ...]`
+    "EVAL", "EVALSHA", "EVAL_RO", "EVALSHA_RO",
+    // N keys after the `STREAMS` token
+    "XREAD", "XREADGROUP",
+    // `<CMD> <SUBCOMMAND> <key>`
+    "XINFO", "MEMORY",
+    // moon#927: `MQ <SUB> <queue-key> ...`. Every subcommand moon serves —
+    // CREATE, PUSH, POP, ACK, DLQLEN, TRIGGER, PUBLISH — reads its queue name
+    // at `args[1]` and turns it into a real keyspace key of type `stream`.
+    "MQ",
+};
+
+/// Commands a `~pattern` **cannot scope, and that reach keyspace data anyway**
+/// — so a key-restricted user is denied outright (moon#927).
+///
+/// * **`FT.*`** — an index NAME is not a keyspace key, which is why these were
+///   skipped. But a search REPLY is keyspace data: `FT.SEARCH` names the
+///   matching document keys, and `ft_text_search`/`ft_aggregate`/`recommend`
+///   re-read the indexed hashes' field VALUES out of the database
+///   (`get_hash_ref_if_alive`). Measured on moon 0.8.9: a `~cache:*` user
+///   refused `HGET secret:doc1` received `secret:doc1` and its BM25 score from
+///   `FT.SEARCH tidx alpha`. An index is DEFINED by a key prefix, so scoping
+///   it properly means deciding whether the user's patterns cover that prefix
+///   — a per-index containment check, filed as the follow-up. Until then the
+///   whole family is refused for key-restricted users rather than
+///   half-refused: `FT.CREATE` can build an index over keys the caller cannot
+///   name, and `FT.DROPINDEX` can destroy another tenant's.
+/// * **`CDC.READ`** — its first argument is a WAL DIRECTORY, not a key, and
+///   the reply is the raw change stream for the WHOLE keyspace. Measured: a
+///   `~cache:*` user read `secret:*` values straight out of
+///   `CDC.READ <dir> 0`. No key spec can scope a directory.
+///
+/// Unrestricted users and `~*` users never reach this: both short-circuit in
+/// `AclTable::check_key_permission` before key extraction is called.
+pub static KEY_PATTERN_UNSCOPABLE: phf::Set<&'static str> = phf::phf_set! {
+    "FT.CREATE", "FT.SEARCH", "FT.DROPINDEX", "FT.INFO", "FT._LIST",
+    "FT.COMPACT", "FT.CONFIG", "FT.CACHESEARCH", "FT.EXPAND", "FT.NAVIGATE",
+    "FT.RECOMMEND", "FT.AGGREGATE",
+    "CDC.READ",
+};
+
+/// Classify `cmd`'s key spec. Unknown commands are
+/// [`Unclassified`](KeySpecClass::Unclassified) — the caller decides what an
+/// unregistered name means, since only it knows whether "about to answer
+/// `unknown command`" is a safe outcome.
+#[must_use]
+pub fn key_spec_class(cmd: &[u8]) -> KeySpecClass {
+    match lookup(cmd) {
+        Some(meta) => class_of(meta),
+        None => KeySpecClass::Unclassified,
+    }
+}
+
+/// [`key_spec_class`] for a `CommandMeta` already in hand.
+#[must_use]
+pub fn class_of(meta: &CommandMeta) -> KeySpecClass {
+    if meta.first_key > 0 {
+        return KeySpecClass::Fixed;
+    }
+    // `meta.name` is the canonical uppercase spelling, so no case folding or
+    // allocation is needed for the set probes.
+    if KEYLESS_BY_DESIGN.contains(meta.name) {
+        KeySpecClass::Keyless
+    } else if MOVABLE_KEYS.contains(meta.name) {
+        KeySpecClass::Movable
+    } else if KEY_PATTERN_UNSCOPABLE.contains(meta.name) {
+        KeySpecClass::Unscopable
+    } else {
+        KeySpecClass::Unclassified
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -1507,5 +1710,120 @@ mod tests {
 
         let m = lookup(b"PING").unwrap();
         assert_eq!((m.first_key, m.last_key, m.step), (0, 0, 0));
+    }
+}
+
+/// moon#927: the registration gate that makes `first_key: 0` unspellable as an
+/// UNCLASSIFIED value.
+///
+/// The runtime already fails closed on [`KeySpecClass::Unclassified`]. These
+/// tests are the other half: they stop such an entry from reaching main at all,
+/// so the fail-closed arm is a backstop rather than the user-visible behaviour
+/// of a forgotten key spec.
+#[cfg(test)]
+mod key_spec_registration {
+    use super::*;
+
+    /// Every `first_key: 0` entry is classified into EXACTLY ONE of the three
+    /// lists.
+    ///
+    /// Adding a keyed command with `first_key: 0` and forgetting to say where
+    /// its keys are now fails here, naming the command. Before moon#927 the
+    /// same mistake shipped as a silent ACL bypass: `MQ` declared
+    /// `first_key: 0` while reading a real keyspace key at `args[1]`.
+    #[test]
+    fn every_keyless_entry_is_classified_exactly_once() {
+        let mut unclassified: Vec<&str> = Vec::new();
+        let mut duplicated: Vec<&str> = Vec::new();
+        for (name, meta) in COMMAND_META.entries() {
+            if meta.first_key > 0 {
+                continue;
+            }
+            let hits = usize::from(KEYLESS_BY_DESIGN.contains(name))
+                + usize::from(MOVABLE_KEYS.contains(name))
+                + usize::from(KEY_PATTERN_UNSCOPABLE.contains(name));
+            match hits {
+                0 => unclassified.push(name),
+                1 => {}
+                _ => duplicated.push(name),
+            }
+        }
+        unclassified.sort_unstable();
+        duplicated.sort_unstable();
+        assert!(
+            unclassified.is_empty(),
+            "these COMMAND_META entries declare `first_key: 0` without saying what that MEANS: \
+             {unclassified:?}. Put each in exactly one of KEYLESS_BY_DESIGN (it names no keyspace \
+             key), MOVABLE_KEYS (its keys sit where first_key cannot express — also add a \
+             `movable_shape` arm in acl::keyspec), or KEY_PATTERN_UNSCOPABLE (it reaches keyspace \
+             data through a namespace `~pattern` cannot scope). Until then ACL denies it for every \
+             key-restricted user."
+        );
+        assert!(
+            duplicated.is_empty(),
+            "classified in more than one list, so `class_of` picks by list ORDER rather than by \
+             intent: {duplicated:?}"
+        );
+    }
+
+    /// A name in one of the lists must be a real registry entry with
+    /// `first_key: 0`. Without this a rename leaves a stale entry behind that
+    /// classifies nothing, and the list reads as coverage it does not have.
+    #[test]
+    fn no_list_entry_is_stale_or_contradicts_a_fixed_spec() {
+        for (list, names) in [
+            ("KEYLESS_BY_DESIGN", &KEYLESS_BY_DESIGN),
+            ("MOVABLE_KEYS", &MOVABLE_KEYS),
+            ("KEY_PATTERN_UNSCOPABLE", &KEY_PATTERN_UNSCOPABLE),
+        ] {
+            for name in names.iter() {
+                let meta = COMMAND_META.get(name).unwrap_or_else(|| {
+                    panic!("{list} names `{name}`, which is not in COMMAND_META")
+                });
+                assert_eq!(
+                    meta.first_key, 0,
+                    "{list} names `{name}`, but it declares first_key {} — a fixed spec already \
+                     says where its keys are, so listing it here can only confuse the two",
+                    meta.first_key
+                );
+            }
+        }
+    }
+
+    /// The moon#927 families, pinned by name.
+    ///
+    /// `every_keyless_entry_is_classified_exactly_once` would stay GREEN if
+    /// `MQ` were moved into `KEYLESS_BY_DESIGN` — which is precisely the bug.
+    /// This is the test that goes red for that mutation.
+    #[test]
+    fn the_927_families_keep_their_verdicts() {
+        assert_eq!(
+            key_spec_class(b"MQ"),
+            KeySpecClass::Movable,
+            "MQ names a real keyspace key at args[1] (src/command/mq.rs)"
+        );
+        assert_eq!(
+            key_spec_class(b"mq"),
+            KeySpecClass::Movable,
+            "classification must be case-insensitive: clients send lowercase"
+        );
+        assert_eq!(
+            key_spec_class(b"WS"),
+            KeySpecClass::Keyless,
+            "WS arguments are workspace names and UUIDs, never keys"
+        );
+        assert_eq!(key_spec_class(b"FT.SEARCH"), KeySpecClass::Unscopable);
+        assert_eq!(key_spec_class(b"FT.AGGREGATE"), KeySpecClass::Unscopable);
+        assert_eq!(key_spec_class(b"CDC.READ"), KeySpecClass::Unscopable);
+        assert_eq!(
+            key_spec_class(b"GRAPH.QUERY"),
+            KeySpecClass::Keyless,
+            "graphs live in their own store and never touch the keyspace"
+        );
+        // A fixed spec is unaffected by any of the above.
+        assert_eq!(key_spec_class(b"GET"), KeySpecClass::Fixed);
+        // And an unregistered name stays unclassified, so its consumer keeps
+        // deciding what "unknown" means for it.
+        assert_eq!(key_spec_class(b"NOTACOMMAND"), KeySpecClass::Unclassified);
     }
 }
