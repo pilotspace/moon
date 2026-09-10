@@ -1,8 +1,10 @@
 # The encoding matrix golden -- see src/command/encoding_matrix.rs.
 # Columns: type n elem bulk incr decode.
 # Captured on f7c83769 (pristine, before the EncodingLimits authority) with
-# the same test file; the wrong cells (hash/zset bulk != incr at 65..128
-# items, moon#896) are pinned on purpose until the commit that fixes them.
+# this test file, then the 20 cells of moon#896 -- hash/zset, BULK column,
+# n in {65,66,100,127,128} at 8- and 64-byte elements, hashtable/skiplist ->
+# listpack -- flipped by the commit that fixed the entry gate's unit. Every
+# other cell is the pristine value.
 # BEGIN
 # type n elem bulk incr decode
 hash 1 8 listpack listpack listpack
@@ -17,20 +19,20 @@ hash 63 65 hashtable hashtable hashtable
 hash 64 8 listpack listpack listpack
 hash 64 64 listpack listpack listpack
 hash 64 65 hashtable hashtable hashtable
-hash 65 8 hashtable listpack listpack
-hash 65 64 hashtable listpack listpack
+hash 65 8 listpack listpack listpack
+hash 65 64 listpack listpack listpack
 hash 65 65 hashtable hashtable hashtable
-hash 66 8 hashtable listpack listpack
-hash 66 64 hashtable listpack listpack
+hash 66 8 listpack listpack listpack
+hash 66 64 listpack listpack listpack
 hash 66 65 hashtable hashtable hashtable
-hash 100 8 hashtable listpack listpack
-hash 100 64 hashtable listpack listpack
+hash 100 8 listpack listpack listpack
+hash 100 64 listpack listpack listpack
 hash 100 65 hashtable hashtable hashtable
-hash 127 8 hashtable listpack listpack
-hash 127 64 hashtable listpack listpack
+hash 127 8 listpack listpack listpack
+hash 127 64 listpack listpack listpack
 hash 127 65 hashtable hashtable hashtable
-hash 128 8 hashtable listpack listpack
-hash 128 64 hashtable listpack listpack
+hash 128 8 listpack listpack listpack
+hash 128 64 listpack listpack listpack
 hash 128 65 hashtable hashtable hashtable
 hash 129 8 hashtable hashtable hashtable
 hash 129 64 hashtable hashtable hashtable
@@ -107,20 +109,20 @@ zset 63 65 skiplist skiplist skiplist
 zset 64 8 listpack listpack listpack
 zset 64 64 listpack listpack listpack
 zset 64 65 skiplist skiplist skiplist
-zset 65 8 skiplist listpack listpack
-zset 65 64 skiplist listpack listpack
+zset 65 8 listpack listpack listpack
+zset 65 64 listpack listpack listpack
 zset 65 65 skiplist skiplist skiplist
-zset 66 8 skiplist listpack listpack
-zset 66 64 skiplist listpack listpack
+zset 66 8 listpack listpack listpack
+zset 66 64 listpack listpack listpack
 zset 66 65 skiplist skiplist skiplist
-zset 100 8 skiplist listpack listpack
-zset 100 64 skiplist listpack listpack
+zset 100 8 listpack listpack listpack
+zset 100 64 listpack listpack listpack
 zset 100 65 skiplist skiplist skiplist
-zset 127 8 skiplist listpack listpack
-zset 127 64 skiplist listpack listpack
+zset 127 8 listpack listpack listpack
+zset 127 64 listpack listpack listpack
 zset 127 65 skiplist skiplist skiplist
-zset 128 8 skiplist listpack listpack
-zset 128 64 skiplist listpack listpack
+zset 128 8 listpack listpack listpack
+zset 128 64 listpack listpack listpack
 zset 128 65 skiplist skiplist skiplist
 zset 129 8 skiplist skiplist skiplist
 zset 129 64 skiplist skiplist skiplist

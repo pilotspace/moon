@@ -46,6 +46,7 @@ use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::bptree::BPTree;
 use crate::storage::compact_value::RedisValueRef;
+use crate::storage::encoding_limits::{EncodingLimits, Shape};
 use crate::storage::entry::SetValue;
 use crate::storage::value_codec::{
     HashTtlTrailer, decode_value_body_compacting, encode_value_body,
@@ -191,6 +192,59 @@ fn list_row(n: usize, len: usize) -> [String; 3] {
     let list: VecDeque<Bytes> = elems.iter().map(|e| Bytes::from(e.clone())).collect();
     let decode = decoded_encoding(&RedisValueRef::List(&list));
     [bulk, incr, decode]
+}
+
+/// The three consultation sites of the encoding policy, plus the authority's
+/// own verdict, for one `(shape, n, elem)`: `[bulk, incr, decode, predicate]`.
+fn four_verdicts(shape: Shape, n: usize, len: usize) -> [String; 4] {
+    let limits = EncodingLimits::moon_defaults();
+    let [bulk, incr, decode] = match shape {
+        Shape::Hash => hash_row(n, len),
+        Shape::Set => set_row(n, len),
+        Shape::SortedSet => zset_row(n, len),
+        Shape::List => list_row(n, len),
+    };
+    let compact = if limits.fits(shape, n, len) {
+        "listpack"
+    } else {
+        "full"
+    };
+    [bulk, incr, decode, compact.to_string()]
+}
+
+/// The moon#896 CLASS, not its instance: for every shape at every size, the
+/// entry gate (bulk), the upgrade check (incremental) and the restart path
+/// (decode) must reach the same verdict, and it must be the authority's.
+///
+/// Red on `f7c83769` for hash and zset at 65..128 items (bulk said
+/// hashtable/skiplist, the other two said listpack); green once every site
+/// takes its unit from `Shape`. A future site that re-derives a threshold or
+/// a unit by hand fails here at the first size it gets wrong.
+#[test]
+fn entry_gate_upgrade_check_and_decode_agree_with_the_authority() {
+    let mut disagreements = Vec::new();
+    for shape in [Shape::Hash, Shape::Set, Shape::SortedSet, Shape::List] {
+        for &n in SIZES {
+            for &len in ELEM_LENS {
+                let [bulk, incr, decode, predicate] = four_verdicts(shape, n, len);
+                let is_compact = |e: &str| e == "listpack";
+                let expect_compact = predicate == "listpack";
+                let all_agree =
+                    bulk == incr && incr == decode && is_compact(&bulk) == expect_compact;
+                if !all_agree {
+                    disagreements.push(format!(
+                        "{shape:?} n={n} elem={len}: bulk={bulk} incr={incr} \
+                         decode={decode} authority={predicate}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        disagreements.is_empty(),
+        "the consultation sites disagree (moon#896 class):\n  {}",
+        disagreements.join("\n  ")
+    );
 }
 
 /// Every row of the matrix, in golden order: `type n elem bulk incr decode`.

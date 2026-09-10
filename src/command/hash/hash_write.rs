@@ -43,10 +43,11 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
         .map(|a| extract_bytes(a).map_or(0, |b| b.len()))
         .max()
         .unwrap_or(0);
-    // moon#896: `args.len() - 1` is listpack ENTRIES (two per field), not
-    // fields. Kept as-is in this commit so the refactor is behaviour-neutral;
-    // the unit fix is the next commit.
-    if limits.fits(Shape::Hash, args.len() - 1, max_elem) {
+    // `args.len() - 1` is listpack ENTRIES (two per field); the policy is in
+    // FIELDS, and the shape converts. Passing the entry count here was
+    // moon#896: a bulk HSET of 65 fields (argv 130) refused the listpack path
+    // that the same hash built one field at a time stayed on until 128.
+    if limits.fits(Shape::Hash, Shape::Hash.items_in(args.len() - 1), max_elem) {
         // Try listpack path for small hashes. HashWithTtl returns Ok(None) here
         // (get_or_create_hash_listpack is now HashWithTtl-aware), so it falls
         // through to the full HashMap path — correct, because TTL'd hashes never
@@ -236,8 +237,8 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
         .map(|a| extract_bytes(a).map_or(0, |b| b.len()))
         .max()
         .unwrap_or(0);
-    // moon#896: entries, not fields — behaviour-neutral here, fixed next.
-    if limits.fits(Shape::Hash, args.len() - 1, max_elem) {
+    // Fields, not entries — the moon#896 unit, see `hset`.
+    if limits.fits(Shape::Hash, Shape::Hash.items_in(args.len() - 1), max_elem) {
         // HashWithTtl returns Ok(None), falling through — same as HSET.
         match db.get_or_create_hash_listpack(key) {
             Ok(Some(lp)) => {

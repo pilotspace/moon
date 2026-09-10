@@ -186,10 +186,16 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
         .map(|pair| extract_bytes(&pair[1]).map_or(0, |m| m.len()))
         .max()
         .unwrap_or(0);
-    // moon#896: `remaining.len()` is listpack ENTRIES (two per member), not
-    // members. Kept as-is in this commit so the refactor is behaviour-neutral;
-    // the unit fix is the next commit.
-    if limits.fits(Shape::SortedSet, remaining.len(), max_member) {
+    // `remaining.len()` is listpack ENTRIES (score and member per pair); the
+    // policy is in MEMBERS, and the shape converts. Passing the entry count
+    // here was moon#896: a bulk ZADD of 65 pairs (argv 130) refused the
+    // listpack path that the same zset built one pair at a time stayed on
+    // until 128.
+    if limits.fits(
+        Shape::SortedSet,
+        Shape::SortedSet.items_in(remaining.len()),
+        max_member,
+    ) {
         match db.get_or_create_zset_listpack(key) {
             Ok(Some(lp)) => {
                 let mut added = 0i64;

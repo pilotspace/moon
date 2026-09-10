@@ -118,7 +118,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   encoding matrix (`src/command/encoding_matrix.golden` — every type at
   every size around the thresholds, built bulk, incrementally and via the
   restart path) is byte-identical to the one captured on the pre-authority
-  tree, wrong cells included.
+  tree, wrong cells included. **The unit fix then lands on top of it:** the
+  `HSET`/`HMSET` and `ZADD` entry gates now convert their argv length
+  through `Shape::items_in`, so a bulk `HSET` of 65..128 fields or `ZADD`
+  of 65..128 pairs stays a listpack, as the same container built one item
+  at a time always did and as redis 8.6.1 does; the 20 flipped golden cells
+  are exactly that range at 8- and 64-byte elements, and a new agreement
+  test asserts, for every shape and size, that the entry gate, the upgrade
+  check, the restart path and the authority's own predicate reach one
+  verdict. `scripts/test-consistency.sh` and `scripts/test-commands.sh` gain
+  the bulk 64/65 (hash, zset) and 128/129 (all four types) boundary rows
+  against a live redis oracle.
 
 - **`text`: the `TMX3` TAG/NUMERIC sidecar block is now proven compatible
   in both directions, and the format no longer depends on the build's
