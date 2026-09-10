@@ -1385,39 +1385,81 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
     }
     let b0 = cmd[0] | 0x20;
 
+    // The keyless set. Every entry is `first_key == 0` in `COMMAND_META`, and
+    // membership here must NOT depend on whether the command happens to be
+    // called with arguments — that is moon#925.
+    //
+    // The `args.is_empty()` short-circuit below returns `None` before this
+    // table is ever consulted, which is why a keyless command that takes no
+    // arguments looks correct even when its arm is missing (or, in
+    // BGREWRITEAOF's case, spelled at a length it can never have). Give the
+    // same command an optional modifier — `FLUSHALL ASYNC`, `SHUTDOWN NOSAVE`,
+    // `SLOWLOG GET 10` — and the tail of this function returns that modifier
+    // as the ROUTING key. It is hashed, the command is shipped to whatever
+    // shard the literal `ASYNC` lands on, and everything the local branch was
+    // supposed to do (for FLUSHALL: `coordinate_flush_broadcast`) is skipped.
+    //
+    // `extract_primary_key_keyless_registry_commands_never_route_by_a_modifier`
+    // walks `COMMAND_META` and fails if a `first_key == 0` command is missing
+    // from this table, so a future keyless command cannot repeat moon#925 by
+    // omission.
     let is_keyless = match (len, b0) {
         (4, b'a') => cmd.eq_ignore_ascii_case(b"AUTH"),
         (4, b'e') => cmd.eq_ignore_ascii_case(b"ECHO") || cmd.eq_ignore_ascii_case(b"EXEC"),
         (4, b'i') => cmd.eq_ignore_ascii_case(b"INFO"),
-        (4, b'k') => cmd.eq_ignore_ascii_case(b"KEYS"),
+        (4, b'k') => cmd.eq_ignore_ascii_case(b"KEYS") || cmd.eq_ignore_ascii_case(b"KILL"),
         (4, b'p') => cmd.eq_ignore_ascii_case(b"PING"),
         (4, b'q') => cmd.eq_ignore_ascii_case(b"QUIT"),
+        (4, b'r') => cmd.eq_ignore_ascii_case(b"ROLE"),
         (4, b's') => cmd.eq_ignore_ascii_case(b"SCAN") || cmd.eq_ignore_ascii_case(b"SAVE"),
+        (4, b't') => cmd.eq_ignore_ascii_case(b"TIME"),
         (4, b'w') => cmd.eq_ignore_ascii_case(b"WAIT"),
         (5, b'd') => cmd.eq_ignore_ascii_case(b"DEBUG"),
         (5, b'h') => cmd.eq_ignore_ascii_case(b"HELLO"),
         (5, b'm') => cmd.eq_ignore_ascii_case(b"MULTI"),
         (5, b'p') => cmd.eq_ignore_ascii_case(b"PSYNC"),
+        (5, b'r') => cmd.eq_ignore_ascii_case(b"RESET"),
         (6, b'a') => cmd.eq_ignore_ascii_case(b"ASKING"),
         (6, b'b') => cmd.eq_ignore_ascii_case(b"BGSAVE"),
         (6, b'c') => cmd.eq_ignore_ascii_case(b"CLIENT") || cmd.eq_ignore_ascii_case(b"CONFIG"),
         (6, b'd') => cmd.eq_ignore_ascii_case(b"DBSIZE"),
+        (6, b'l') => cmd.eq_ignore_ascii_case(b"LOLWUT"),
+        // MEMORY is NOT keyless: `MEMORY USAGE <key>` has its own arm below.
+        (6, b'm') => cmd.eq_ignore_ascii_case(b"MODULE"),
+        (6, b'p') => cmd.eq_ignore_ascii_case(b"PUBSUB"),
         (6, b's') => cmd.eq_ignore_ascii_case(b"SELECT"),
+        (6, b'v') => cmd.eq_ignore_ascii_case(b"VACUUM"),
         (7, b'c') => cmd.eq_ignore_ascii_case(b"COMMAND") || cmd.eq_ignore_ascii_case(b"CLUSTER"),
         (7, b'd') => cmd.eq_ignore_ascii_case(b"DISCARD"),
+        // moon#925: `FLUSHDB ASYNC` routed by the literal "ASYNC".
+        (7, b'f') => cmd.eq_ignore_ascii_case(b"FLUSHDB"),
         (7, b'h') => cmd.eq_ignore_ascii_case(b"HOTKEYS"),
+        (7, b'm') => cmd.eq_ignore_ascii_case(b"MONITOR"),
         (7, b'p') => cmd.eq_ignore_ascii_case(b"PUBLISH"),
-        (7, b's') => cmd.eq_ignore_ascii_case(b"SLAVEOF"),
+        (7, b's') => cmd.eq_ignore_ascii_case(b"SLAVEOF") || cmd.eq_ignore_ascii_case(b"SLOWLOG"),
+        (7, b'u') => cmd.eq_ignore_ascii_case(b"UNWATCH"),
+        // moon#925: `FLUSHALL ASYNC` routed by the literal "ASYNC".
+        (8, b'f') => cmd.eq_ignore_ascii_case(b"FLUSHALL"),
         (8, b'l') => cmd.eq_ignore_ascii_case(b"LASTSAVE"),
         (8, b'r') => cmd.eq_ignore_ascii_case(b"REPLCONF") || cmd.eq_ignore_ascii_case(b"READONLY"),
+        // SPUBLISH is also (8, 's') and is deliberately NOT here: its shard
+        // CHANNEL is what the cluster slot router hashes, exactly as redis
+        // does, and it is consumed by `try_handle_publish` before shard
+        // routing ever runs. Same for SSUBSCRIBE / SUNSUBSCRIBE below.
+        (8, b's') => cmd.eq_ignore_ascii_case(b"SHUTDOWN"),
         (9, b'r') => {
-            cmd.eq_ignore_ascii_case(b"REPLICAOF") || cmd.eq_ignore_ascii_case(b"READWRITE")
+            cmd.eq_ignore_ascii_case(b"REPLICAOF")
+                || cmd.eq_ignore_ascii_case(b"READWRITE")
+                || cmd.eq_ignore_ascii_case(b"RANDOMKEY")
         }
         (9, b's') => cmd.eq_ignore_ascii_case(b"SUBSCRIBE"),
         (10, b'p') => cmd.eq_ignore_ascii_case(b"PSUBSCRIBE"),
         (11, b'u') => cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE"),
+        // BGREWRITEAOF is TWELVE bytes. The arm that named it was keyed on 13
+        // and could never fire; the command was keyless only because its
+        // arity is 1 and `args.is_empty()` caught it first.
+        (12, b'b') => cmd.eq_ignore_ascii_case(b"BGREWRITEAOF"),
         (12, b'p') => cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE"),
-        (13, b'b') => cmd.eq_ignore_ascii_case(b"BGREWRITEAOF"),
         _ => false,
     };
 
@@ -3304,6 +3346,195 @@ mod as_of_tests {
         // HOTKEYS COUNT 5 must not route by "COUNT".
         let args = vec![frame_bulk(b"COUNT"), frame_bulk(b"5")];
         assert!(extract_primary_key(b"HOTKEYS", &args).is_none());
+    }
+
+    /// moon#925: FLUSHALL and FLUSHDB are keyless REGARDLESS of arity.
+    ///
+    /// The bare forms were correct only by accident of arity: `args.is_empty()`
+    /// short-circuits before the `(len, b0)` table is consulted, and the table
+    /// had no `f` arm at all. Add a modifier and `args[0]` is the literal
+    /// `ASYNC`/`SYNC`, which the tail returned as the ROUTING key — hashed to
+    /// one shard, `is_local` went false, and `coordinate_flush_broadcast`
+    /// (which sits INSIDE the `is_local` block) never ran.
+    ///
+    /// Measured on the unfixed tree, 60 keys, pinned connection:
+    /// `FLUSHALL ASYNC` left 30/60 alive at `--shards 2`, 34/60 at 3, 44/60 at
+    /// 5; `FLUSHALL SYNC` left 43/60 at 4 and 53/60 at 8. The client got `+OK`
+    /// every time, and `GET a:0` still answered `v`.
+    ///
+    /// The bare form is asserted in the SAME test as the in-band control: a
+    /// change that made every arm return `Some` would fail here rather than
+    /// read as a pass.
+    #[test]
+    fn extract_primary_key_flush_is_keyless_with_any_modifier_moon925() {
+        for cmd in [
+            &b"FLUSHALL"[..],
+            &b"FLUSHDB"[..],
+            // Casing is not the client's problem.
+            &b"flushall"[..],
+            &b"FlushDb"[..],
+        ] {
+            let name = String::from_utf8_lossy(cmd).into_owned();
+            // Control: the bare form, correct today only by arity.
+            assert!(
+                extract_primary_key(cmd, &[]).is_none(),
+                "bare {name} must be keyless"
+            );
+            for modifier in [&b"ASYNC"[..], &b"SYNC"[..], &b"async"[..], &b"sync"[..]] {
+                let args = vec![frame_bulk(modifier)];
+                assert!(
+                    extract_primary_key(cmd, &args).is_none(),
+                    "{name} {} must be keyless — routing it by the modifier \
+                     sends the flush to one shard and answers +OK",
+                    String::from_utf8_lossy(modifier)
+                );
+            }
+            // An unrecognised modifier must earn the command's OWN error on
+            // the local shard, not a trip to whatever shard it hashes to.
+            let junk = vec![frame_bulk(b"NOTAMODIFIER")];
+            assert!(
+                extract_primary_key(cmd, &junk).is_none(),
+                "{name} NOTAMODIFIER must be keyless"
+            );
+        }
+    }
+
+    /// moon#925, the class: **any** keyless command that accepts a modifier is
+    /// exposed to the same defect, and the keyless table is a hand-maintained
+    /// duplicate of a fact `COMMAND_META` already records as `first_key == 0`.
+    ///
+    /// This walks the registry and asserts the routing decision agrees. Two
+    /// exclusions, both named rather than inferred:
+    ///
+    /// * [`is_inline_intercepted`] — EVAL/FCALL/FUNCTION/SCRIPT/SWAPDB/ACL/
+    ///   MQ/WS and the `FT.`/`GRAPH.`/`CDC.`/`TS.` families. These carry real
+    ///   keys (or a real index/graph name) and are routed by their own
+    ///   interceptors; declaring them keyless here would be wrong.
+    /// * [`COMPUTED_KEY_POSITION`] — commands whose metadata says `first_key
+    ///   0` because the key is not at a FIXED index, not because there is no
+    ///   key. Each has its own arm in `extract_primary_key` and its own test.
+    ///
+    /// A new keyless command added to `COMMAND_META` and forgotten here fails
+    /// this test instead of shipping a one-shard flush.
+    #[test]
+    fn extract_primary_key_keyless_registry_commands_never_route_by_a_modifier() {
+        /// `first_key == 0` in the registry, but the key IS present at a
+        /// position the registry cannot express (after `numkeys`, after a
+        /// subcommand, or after a `STREAMS` token).
+        const COMPUTED_KEY_POSITION: &[&str] = &[
+            "MEMORY",
+            "XINFO",
+            "XREAD",
+            "XREADGROUP",
+            "LMPOP",
+            "ZMPOP",
+            "BLMPOP",
+            "BZMPOP",
+            "SINTERCARD",
+            "ZDIFF",
+            "ZINTER",
+            "ZUNION",
+            "ZINTERCARD",
+        ];
+        /// Routed by a graph name, exactly like the `GRAPH.` family, and
+        /// consumed by `try_handle_temporal_*` before routing. Named here so
+        /// the exclusion is a decision on the record rather than a silent gap.
+        const GRAPH_SCOPED: &[&str] = &["TEMPORAL.INVALIDATE", "TEMPORAL.SNAPSHOT_AT"];
+        /// Transaction control, consumed by `try_handle_txn_*`.
+        const TXN_CONTROL: &[&str] = &["TXN"];
+        /// Shard-pubsub. `first_key == 0` because the shard CHANNEL is not a
+        /// keyspace key — but redis hashes that channel for cluster slot
+        /// routing, and in moon the cluster slot router is the ONLY consumer
+        /// of this function that these three ever reach (`try_handle_publish`
+        /// / `try_handle_subscribe_entry` / `try_handle_unsubscribe` all run
+        /// after it and before shard routing). Declaring them keyless would
+        /// silently drop `MOVED` for shard channels, so they stay out:
+        /// keyless-for-ACL is not keyless-for-slots.
+        const SHARD_CHANNEL: &[&str] = &["SPUBLISH", "SSUBSCRIBE", "SUNSUBSCRIBE"];
+
+        // A plausible modifier for a keyless command: never a key, always
+        // key-SHAPED, which is the whole trap.
+        let args = vec![frame_bulk(b"ASYNC"), frame_bulk(b"1")];
+
+        let mut unrouted = Vec::new();
+        for (name, meta) in crate::command::metadata::COMMAND_META.entries() {
+            if meta.first_key != 0 {
+                continue;
+            }
+            if COMPUTED_KEY_POSITION.contains(name)
+                || GRAPH_SCOPED.contains(name)
+                || TXN_CONTROL.contains(name)
+                || SHARD_CHANNEL.contains(name)
+                || is_inline_intercepted(name.as_bytes())
+            {
+                continue;
+            }
+            if extract_primary_key(name.as_bytes(), &args).is_some() {
+                unrouted.push(*name);
+            }
+        }
+        unrouted.sort_unstable();
+        assert!(
+            unrouted.is_empty(),
+            "keyless by COMMAND_META (first_key == 0) but routed by args[0] \
+             — each of these hashes a modifier as if it were a key and lands \
+             on one arbitrary shard: {unrouted:?}"
+        );
+    }
+
+    /// The shard-pubsub trio is excluded from the class guard on purpose, so
+    /// pin what it must keep doing: answer the CHANNEL. The cluster slot
+    /// router is the only consumer they reach, and it must go on hashing the
+    /// channel and answering `MOVED`, exactly as redis does — declaring them
+    /// keyless for moon#925's sake would have silently dropped that.
+    #[test]
+    fn extract_primary_key_shard_pubsub_still_routes_by_its_channel() {
+        let args = vec![frame_bulk(b"shardchan"), frame_bulk(b"payload")];
+        for cmd in [&b"SPUBLISH"[..], &b"SSUBSCRIBE"[..], &b"SUNSUBSCRIBE"[..]] {
+            assert_eq!(
+                extract_primary_key(cmd, &args).map(|b| b.as_ref()),
+                Some(&b"shardchan"[..]),
+                "{} must keep routing by its shard channel",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+        // A bare SUNSUBSCRIBE names no channel and has nothing to hash.
+        assert!(extract_primary_key(b"SUNSUBSCRIBE", &[]).is_none());
+    }
+
+    /// The class guard above is only worth its runtime if it can FAIL. This
+    /// pins that the exclusion lists are exclusions, not a blanket pass:
+    /// a command with a real key at args[0] must still route by it.
+    #[test]
+    fn extract_primary_key_keyed_commands_are_untouched_by_the_keyless_table() {
+        let args = vec![frame_bulk(b"mykey"), frame_bulk(b"v")];
+        // Every entry is the KEYED occupant of a `(len, first_byte)` slot this
+        // change adds a keyless arm to — derived by walking `COMMAND_META` for
+        // `first_key > 0` at each new arm's slot, not guessed. An arm that
+        // matched on `(len, b0)` alone instead of on the full name would take
+        // one of these with it.
+        for cmd in [
+            &b"SET"[..],
+            &b"GET"[..],
+            &b"FCALL_RO"[..],  // (8, 'f') — FLUSHALL's slot
+            &b"LPUSHX"[..],    // (6, 'l') — LOLWUT's slot
+            &b"MSETNX"[..],    // (6, 'm') — MODULE's slot, beside MEMORY
+            &b"PSETEX"[..],    // (6, 'p') — PUBSUB's slot
+            &b"SORT_RO"[..],   // (7, 's') — SLOWLOG's slot, beside SLAVEOF
+            &b"SETRANGE"[..],  // (8, 's') — SHUTDOWN's slot
+            &b"SMEMBERS"[..],  // (8, 's') — same slot, second occupant
+            &b"RPOPLPUSH"[..], // (9, 'r') — RANDOMKEY's slot
+            &b"RPOP"[..],      // (4, 'r') — ROLE's slot
+            &b"TYPE"[..],      // (4, 't') — TIME's slot
+            &b"RPUSH"[..],     // (5, 'r') — RESET's slot
+        ] {
+            assert_eq!(
+                extract_primary_key(cmd, &args).map(|b| b.as_ref()),
+                Some(&b"mykey"[..]),
+                "{} must still route by its own key",
+                String::from_utf8_lossy(cmd)
+            );
+        }
     }
 
     #[test]
