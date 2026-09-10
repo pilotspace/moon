@@ -3436,12 +3436,26 @@ mod as_of_tests {
             "ZUNION",
             "ZINTERCARD",
         ];
-        /// Routed by a graph name, exactly like the `GRAPH.` family, and
-        /// consumed by `try_handle_temporal_*` before routing. Named here so
-        /// the exclusion is a decision on the record rather than a silent gap.
-        const GRAPH_SCOPED: &[&str] = &["TEMPORAL.INVALIDATE", "TEMPORAL.SNAPSHOT_AT"];
-        /// Transaction control, consumed by `try_handle_txn_*`.
-        const TXN_CONTROL: &[&str] = &["TXN"];
+        /// Consumed by `try_handle_temporal_*` / `try_handle_txn_*`, which run
+        /// before shard routing, so neither reaches the decision this test
+        /// guards. Excluded on that basis alone — **not** because their
+        /// `args[0]` would be a sane routing key:
+        ///
+        /// * `TEMPORAL.INVALIDATE <entity_id> <NODE|EDGE> <graph>` — `args[0]`
+        ///   is a decimal ENTITY ID and the graph name is at `args[2]`
+        ///   (`command::temporal::validate_invalidate`). Hashing `"42"` is the
+        ///   fixed-route signature of moon#511 / moon#534.
+        /// * `TXN <BEGIN|COMMIT|ABORT>` — `args[0]` is the subcommand literal.
+        /// * `TEMPORAL.SNAPSHOT_AT` takes no arguments, so `args.is_empty()`
+        ///   catches it — the same accident of arity that hid moon#925.
+        ///
+        /// None of the three is keyless-with-a-key, so none belongs in the
+        /// table above; all three are absent from `is_inline_intercepted`
+        /// despite being inline-intercepted, which is a moon#507 wait-set gap
+        /// with its own issue. Named here so the exclusion is a decision on
+        /// the record rather than a silent gap.
+        const INTERCEPTED_NOT_DECLARED: &[&str] =
+            &["TEMPORAL.INVALIDATE", "TEMPORAL.SNAPSHOT_AT", "TXN"];
         /// Shard-pubsub. `first_key == 0` because the shard CHANNEL is not a
         /// keyspace key — but redis hashes that channel for cluster slot
         /// routing, and in moon the cluster slot router is the ONLY consumer
@@ -3462,8 +3476,7 @@ mod as_of_tests {
                 continue;
             }
             if COMPUTED_KEY_POSITION.contains(name)
-                || GRAPH_SCOPED.contains(name)
-                || TXN_CONTROL.contains(name)
+                || INTERCEPTED_NOT_DECLARED.contains(name)
                 || SHARD_CHANNEL.contains(name)
                 || is_inline_intercepted(name.as_bytes())
             {
