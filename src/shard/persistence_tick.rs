@@ -452,7 +452,22 @@ pub(crate) fn run_eviction_tick(
     wal_kv_log: bool,
 ) {
     if let Some(spill_t) = spill_thread {
-        apply_spill_completions(spill_t, shard_manifest, shard_databases, shard_id);
+        // moon#902: every published spill batch also logs a `MOON.SPILLED`
+        // cut record to the AOF (AOF only — file ids are shard-local, so it
+        // is never replicated).
+        let mut marker_sink = ColdMarkerSink {
+            aof_pool,
+            wal_writer: wal_v3_writer.as_mut(),
+            shard_id,
+            wal_kv_log,
+        };
+        apply_spill_completions(
+            spill_t,
+            shard_manifest,
+            shard_databases,
+            shard_id,
+            &mut marker_sink,
+        );
     }
 
     // GAP-1: publish this shard's usage and refresh its elastic budget once
@@ -677,16 +692,23 @@ pub(crate) fn drain_and_shutdown_spill(
     shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
     shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
+    marker_sink: &mut ColdMarkerSink<'_>,
 ) {
     if let Some(spill_t) = spill_thread.as_ref() {
-        apply_spill_completions(spill_t, shard_manifest, shard_databases, shard_id);
+        apply_spill_completions(
+            spill_t,
+            shard_manifest,
+            shard_databases,
+            shard_id,
+            marker_sink,
+        );
     }
     if let Some(st) = spill_thread.take() {
         // shutdown() returns any completions from the thread's final buffer
         // flush that the drain above did not see; apply them so those cold keys
         // are not lost (file on disk but never recorded in the manifest).
         let leftover = st.shutdown();
-        apply_completion_vec(leftover, shard_manifest);
+        apply_completion_vec(leftover, shard_manifest, marker_sink);
         tracing::info!("Shard {}: spill background thread shut down", shard_id);
     }
 }
@@ -702,11 +724,60 @@ pub(crate) fn apply_spill_completions(
     shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
     shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
+    marker_sink: &mut ColdMarkerSink<'_>,
 ) {
     let _ = shard_databases; // E2 removes
     let _ = shard_id; // E2 removes
     let completions = spill_thread.drain_completions();
-    apply_completion_vec(completions, shard_manifest);
+    apply_completion_vec(completions, shard_manifest, marker_sink);
+}
+
+/// moon#902: where a published spill batch's `MOON.SPILLED <file_id> key…`
+/// cut record goes. The AOF leg is the one recovery depends on; the WAL leg
+/// mirrors `wal_append_and_fanout`'s `--wal-kv-log` copy so a WAL-authority
+/// replay sees the same cut. There is deliberately NO replication leg: cold
+/// file ids are shard-local, and a replica applying a master's marker
+/// against its own cold index could drop a hot key that a same-numbered but
+/// unrelated file happens to back.
+pub(crate) struct ColdMarkerSink<'a> {
+    pub aof_pool: Option<&'a std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    pub wal_writer: Option<&'a mut crate::persistence::wal_v3::segment::WalWriterV3>,
+    pub shard_id: usize,
+    pub wal_kv_log: bool,
+}
+
+impl ColdMarkerSink<'_> {
+    fn emit(&mut self, db: usize, file_id: u64, keys: &[bytes::Bytes]) {
+        if keys.is_empty() {
+            return;
+        }
+        let wal_leg = self.wal_kv_log && self.wal_writer.is_some();
+        if self.aof_pool.is_none() && !wal_leg {
+            return;
+        }
+        let data = crate::persistence::cold_records::serialize_spilled(file_id, keys);
+        if wal_leg && let Some(w) = self.wal_writer.as_deref_mut() {
+            w.append(
+                crate::persistence::wal_v3::record::WalRecordType::Command,
+                &data,
+            );
+        }
+        if let Some(pool) = self.aof_pool {
+            // Same bound as a reason-DEL (#452.4): losing this record does
+            // not lose data (the end-of-replay reconcile keeps the hot copy),
+            // it loses restart-as-cold for these keys — worth a short stall.
+            let mut budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
+            if !pool.send_append_bounded_blocking(self.shard_id, 0, db, data, &mut budget) {
+                tracing::error!(
+                    shard_id = self.shard_id,
+                    file_id,
+                    keys = keys.len(),
+                    "MOON.SPILLED cut record LOST under AOF backpressure; these keys \
+                     recover hot (not cold) on the next restart"
+                );
+            }
+        }
+    }
 }
 
 /// Apply a batch of spill completions: ONE manifest `add_file`+commit per file,
@@ -715,6 +786,7 @@ pub(crate) fn apply_spill_completions(
 fn apply_completion_vec(
     completions: Vec<crate::storage::tiered::spill_thread::SpillCompletion>,
     shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
+    marker_sink: &mut ColdMarkerSink<'_>,
 ) {
     if completions.is_empty() {
         return;
@@ -812,6 +884,14 @@ fn apply_completion_vec(
         // Insert one ColdIndex entry per KV within this file. `ttl_ms` rides
         // along from the `SpillCompletionEntry` so the proactive TTL sweep
         // (R1, H-2) can judge expiry from the in-RAM index alone.
+        //
+        // moon#902: the keys ACTUALLY published (not superseded) are what the
+        // `MOON.SPILLED` cut record lists — a key whose publish was withdrawn
+        // must not be cut, or a replay would drop the newer hot copy the log
+        // rebuilt for it. Grouped per db because the record is logged in a db
+        // context (the writer injects `SELECT`); a file is single-db by
+        // construction, so this is one group in practice.
+        let mut published: Vec<(usize, Vec<bytes::Bytes>)> = Vec::new();
         for entry in c.entries {
             let location = crate::storage::tiered::cold_index::ColdLocation {
                 file_id,
@@ -835,11 +915,18 @@ fn apply_completion_vec(
                 }
                 if let Some(ref mut ci) = db.cold_index {
                     ci.insert(entry.key.clone(), location);
+                    match published.iter_mut().find(|(d, _)| *d == entry.db_index) {
+                        Some((_, keys)) => keys.push(entry.key.clone()),
+                        None => published.push((entry.db_index, vec![entry.key.clone()])),
+                    }
                 }
                 // Retire this request's record; a newer request's is left
                 // for its own completion.
                 db.spill_inflight_clear(&entry.key, entry.req_file_id);
             });
+        }
+        for (db_index, keys) in &published {
+            marker_sink.emit(*db_index, file_id, keys);
         }
     }
 

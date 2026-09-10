@@ -2,8 +2,11 @@ use bytes::Bytes;
 use std::collections::HashMap;
 
 mod accessors;
+mod cold_replay_gate;
 mod hash_ttl;
 mod kv_ops;
+
+pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile};
 
 pub use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef, StreamRef};
 pub use accessors::EntryView;
@@ -346,6 +349,10 @@ pub struct Database {
     pub cold_index: Option<crate::storage::tiered::cold_index::ColdIndex>,
     /// Shard directory for cold reads (None when disk-offload disabled).
     pub cold_shard_dir: Option<std::path::PathBuf>,
+    /// moon#902: installed by a replayed `MOON.COLDCUT` for the length of an
+    /// AOF-authority replay; decides which cold files the value-giving read
+    /// paths may see. `None` outside replay and for legacy generations.
+    replay_cold_gate: Option<ReplayColdGate>,
     /// Hot-key detection sketch, fed by sampled dispatch observations.
     hot_keys: crate::storage::hotkey::HotKeySketch,
     /// Keys whose async spill is IN FLIGHT: enqueued to the spill thread,
@@ -523,6 +530,7 @@ impl Database {
             db_index: 0,
             cold_index: None,
             cold_shard_dir: None,
+            replay_cold_gate: None,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
             spill_inflight_bytes: 0,
@@ -555,6 +563,7 @@ impl Database {
             db_index: 0,
             cold_index: None,
             cold_shard_dir: None,
+            replay_cold_gate: None,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
             spill_inflight_bytes: 0,

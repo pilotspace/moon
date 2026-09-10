@@ -852,13 +852,18 @@ pub fn recover_shard_v3_pitr(
     // inert for this one runtime/shard combination. Reconciling here, right
     // after Phase 4b and before Phase 5, covers it the same way regardless
     // of which fallback source (AOF or legacy WAL v3) supplied the replay.
+    //
+    // moon#902: routed through `finish_replay_cold_reconcile`, which is the
+    // task #56 demote for a legacy log and the gated hot-wins reconcile when
+    // the replayed log opened with `MOON.COLDCUT`.
     if !kv_authority_elsewhere && let Some(db0) = databases.first_mut() {
-        let demoted = db0.demote_replayed_cold_shadows();
-        if demoted > 0 {
+        let r = db0.finish_replay_cold_reconcile();
+        if r.hot_demoted > 0 || r.cold_dropped > 0 {
             info!(
-                "Shard {}: demoted {} AOF-replay hot shadow(s) back to cold-only \
-                 stubs (Phase 4b fallback path, used_memory truthful after restart, task #56)",
-                shard_id, demoted
+                "Shard {}: Phase 4b cold-plane reconcile (gated={}): {} hot shadow(s) demoted \
+                 to cold stubs (task #56), {} cold entr(ies) dropped for the replayed hot copy \
+                 (moon#902)",
+                shard_id, r.gated, r.hot_demoted, r.cold_dropped
             );
         }
     }

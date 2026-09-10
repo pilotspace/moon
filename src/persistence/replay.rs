@@ -198,6 +198,18 @@ impl CommandReplayEngine for DispatchReplayEngine {
         args: &[Frame],
         selected_db: &mut usize,
     ) {
+        // moon#902: replay-only cold-plane cut records (`MOON.COLDCUT`,
+        // `MOON.SPILLED`) act on the databases directly and never reach
+        // dispatch — a client sending one gets "unknown command".
+        if crate::persistence::cold_records::replay_cold_plane_record(
+            databases,
+            cmd,
+            args,
+            *selected_db,
+        ) {
+            return;
+        }
+
         // Intercept graph commands and route to the collector instead of KV dispatch.
         // Graph WAL records are collected during the first pass, then replayed in
         // correct order (creates -> nodes -> edges -> removes -> drops) via

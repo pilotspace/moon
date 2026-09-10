@@ -254,6 +254,35 @@ impl AofManifest {
         Ok(manifest)
     }
 
+    /// moon#902: write `MOON.COLDCUT <watermark>` as the head of every incr
+    /// file of a freshly initialized generation (`initialize`,
+    /// `initialize_with_base`, `initialize_multi`). `watermark_for_shard`
+    /// answers the shard's next cold file id — every cold file that already
+    /// exists is below it and therefore a valid base for this generation.
+    /// Call immediately after initialization, before any writer opens the
+    /// incr; the record is fsynced so it is never a torn head.
+    pub fn seed_cold_cut(&self, watermark_for_shard: impl Fn(u16) -> u64) -> std::io::Result<()> {
+        use crate::persistence::cold_records::{frame_unoffset, serialize_cold_cut};
+        let write = |path: PathBuf, bytes: &[u8]| -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path)?;
+            f.write_all(bytes)?;
+            f.sync_data()
+        };
+        match self.layout {
+            AofLayout::TopLevel => {
+                let resp = serialize_cold_cut(watermark_for_shard(0));
+                write(self.incr_path(), &resp)
+            }
+            AofLayout::PerShard => {
+                for shard in &self.shards {
+                    let resp = serialize_cold_cut(watermark_for_shard(shard.shard_id));
+                    write(self.shard_incr_path(shard.shard_id), &frame_unoffset(&resp))?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Create the `appendonlydir/` and write an initial manifest with a base RDB
     /// capturing the current in-memory state.
     ///

@@ -96,6 +96,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`persistence`: a cold-tier key no longer comes back from a `kill -9` with
+  its non-idempotent writes applied twice (moon#902).** Under `--appendonly
+  yes --disk-offload enable` (the default) a spilled key was durable in BOTH
+  planes — the shard manifest held the value, the AOF held the command that
+  produced it — with no cut between them: recovery rebuilt the cold index
+  first, then replayed the AOF, and every `get_or_create_*` a replayed write
+  goes through promoted the cold copy before mutating it. `RPUSH l a b c d e`
+  landed on the `[a,b,c,d,e]` it had already produced; `INCRBY` doubled,
+  `APPEND` doubled, `HINCRBY`/`ZINCRBY`/`BITFIELD INCRBY` doubled — and it
+  compounded by one per unclean restart, because the replay-driven eviction
+  re-spilled the doubled value (measured k=3 after two crashes). Idempotent
+  writes (`SET`, `HSET`, `PFADD`, `SETRANGE`, `XADD` with a resolved id) were
+  unaffected, which is why it hid. The cut is now **in-band in the AOF**:
+  every generation opens with `MOON.COLDCUT <w>` (cold files below `w` were
+  sealed before the base was cut and are a valid base for every record that
+  follows — the base RDB is hot-only, so they are the only copy), and every
+  published spill batch appends `MOON.SPILLED <file_id> key…` (AOF only —
+  file ids are shard-local and must never reach a replica). During an
+  AOF-authority replay a cold entry is invisible to the value-giving read
+  paths until its file is cut; the marker also drops the replay-built hot
+  copy, which is exactly the restart-as-cold task #56 wanted. Tombstones
+  (`DEL`/`FLUSH*`, moon#257) bypass the gate. A generation written before
+  this fix has no `MOON.COLDCUT` and replays exactly as before. The same
+  cut also fixes the OTHER direction, found by this fix's rewrite control: a
+  `SET` issued to a cold key after a `BGREWRITEAOF` was silently dropped at
+  the next crash (12/24 probes on the reference run) because the old
+  end-of-replay demote treated the stale cold copy as authoritative.
+  Reference run (macOS, `--shards 1`, `release-fast`): 96 corrupted probes in
+  cycle 1 → 0; 112 in cycle 3 → 0. New crash suite
+  `tests/cold_tier_aof_double_apply_902.rs`; the moon#898 suite's list
+  tolerance is removed.
 - **`storage`: the compact-encoding thresholds have ONE authority
   (moon#896).** Three sites decided whether a container stays in its
   listpack/intset form — a write command's entry gate, its post-push

@@ -3072,6 +3072,8 @@ pub(crate) fn handle_shard_message_shared(
                     crate::shard::dispatch::AofFoldSnapshot {
                         dbs,
                         pending_aof_count,
+                        // moon#902: same atomic instant as the two cuts above.
+                        cold_file_watermark: spill_file_id.get(),
                     }
                 })
             });

@@ -4,6 +4,7 @@ pub mod atomic;
 pub mod auto_save;
 pub mod checkpoint;
 pub mod clog;
+pub mod cold_records;
 pub mod compression;
 pub mod control;
 pub mod dir_lock;

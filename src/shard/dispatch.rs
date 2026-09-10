@@ -1133,6 +1133,11 @@ pub struct AofFoldSnapshot {
     /// bound for its phase-3 mid-drain, preventing an infinite drain loop under
     /// sustained high write load (where the channel never empties on its own).
     pub pending_aof_count: usize,
+    /// moon#902: the shard's `spill_file_id` counter at the same instant —
+    /// every cold file allocated before this cut has `file_id <` this. The
+    /// rewrite writes it as the `MOON.COLDCUT` head of the new incr so a
+    /// replay knows those files are a valid base for every record after it.
+    pub cold_file_watermark: u64,
 }
 
 // ShardMessage is Send because all fields are Send. ResponseSlotPtr wraps an

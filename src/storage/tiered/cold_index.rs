@@ -286,6 +286,12 @@ impl ColdIndex {
         self.map.len()
     }
 
+    /// Highest `file_id` any live entry still references (`None` when the
+    /// index is empty). O(files), not O(keys) — walks the liveness map.
+    pub fn max_file_id(&self) -> Option<u64> {
+        self.file_refs.keys().copied().max()
+    }
+
     /// Whether any zero-ref files are queued for unlink by the next sweep.
     ///
     /// Files orphaned by `insert` overwrite (re-eviction) or `remove`
