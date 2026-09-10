@@ -491,6 +491,41 @@ assert_both "RPOP + LRANGE" LRANGE l:test 0 -1
 both LPOP l:test
 assert_both "LPOP + LRANGE" LRANGE l:test 0 -1
 
+# The SECONDARY write must not flatten what RPUSH kept compact (moon#897).
+# `LPOP` is the queue primitive, so a small work queue used to lose its
+# listpack on the first pop and — nothing demotes (moon#832) — never get it
+# back. Encoding is asserted AFTER the write, which is the row that was
+# missing: every existing row above modifies a list and then checks its
+# CONTENTS.
+both RPUSH l:sec:pop a b c
+assert_both "LPOP from listpack list"                 LPOP l:sec:pop
+assert_both "OBJECT ENCODING list after LPOP"         OBJECT ENCODING l:sec:pop
+assert_both "RPOP from listpack list"                 RPOP l:sec:pop
+assert_both "OBJECT ENCODING list after RPOP"         OBJECT ENCODING l:sec:pop
+both RPUSH l:sec:cnt a b c d
+assert_both "LPOP with count"                         LPOP l:sec:cnt 2
+assert_both "OBJECT ENCODING list after LPOP count"   OBJECT ENCODING l:sec:cnt
+both RPUSH l:sec:set a b c
+assert_both "LSET on listpack list"                   LSET l:sec:set 1 B
+assert_both "OBJECT ENCODING list after LSET"         OBJECT ENCODING l:sec:set
+assert_both "LRANGE after LSET"                       LRANGE l:sec:set 0 -1
+assert_both "LSET negative index"                     LSET l:sec:set -1 C
+assert_both "LRANGE after negative LSET"              LRANGE l:sec:set 0 -1
+assert_both "LSET index out of range"                 LSET l:sec:set 9 x
+# moon#830: LSET on an absent key answers "no such key" and must NOT create it.
+assert_both "LSET on a missing key"                   LSET l:sec:ghost 0 v
+assert_both "EXISTS after LSET on a missing key"      EXISTS l:sec:ghost
+assert_both "TYPE after LSET on a missing key"        TYPE l:sec:ghost
+# Byte transparency across a list secondary write (moon#795/#903).
+both RPUSH l:sec:ident victim 000000012345 +5 -0
+assert_both "LPOP unrelated element"                  LPOP l:sec:ident
+assert_both "OBJECT ENCODING after LPOP (ident)"      OBJECT ENCODING l:sec:ident
+assert_both "LRANGE after LPOP (byte-exact)"          LRANGE l:sec:ident 0 -1
+# Emptying a list deletes its key, from either end.
+both RPUSH l:sec:empty only
+assert_both "LPOP the last element"                   LPOP l:sec:empty
+assert_both "EXISTS after LPOP emptied the list"      EXISTS l:sec:empty
+
 # Large list values
 LVAL=$(python3 -c "print('Y' * 512)")
 both RPUSH l:test "$LVAL"
@@ -623,6 +658,33 @@ assert_both "SISMEMBER canonical integer"        SISMEMBER s:enc:ident 12345
 assert_both "SISMEMBER plus-prefixed integer"    SISMEMBER s:enc:ident +5
 assert_both "SISMEMBER re-rendered plus form"    SISMEMBER s:enc:ident 5
 assert_both "SISMEMBER re-rendered minus-zero"   SISMEMBER s:enc:ident 0
+# The SECONDARY write must not flatten what SADD kept compact (moon#897).
+# Every row above builds a container and asks its encoding; none of them
+# MODIFIED one first, which is why one SREM turning a 3-member listpack into a
+# hashtable went unseen. Both compact sources, because they are different code
+# paths in moon and both were wrong.
+both SADD s:sec:lp alpha beta gamma
+assert_both "SREM from listpack set"              SREM s:sec:lp beta
+assert_both "OBJECT ENCODING listpack set after SREM"  OBJECT ENCODING s:sec:lp
+both SADD s:sec:int 1 2 3
+assert_both "SREM from intset"                    SREM s:sec:int 2
+assert_both "OBJECT ENCODING intset after SREM"   OBJECT ENCODING s:sec:int
+# A non-canonical spelling is not a member of an intset on either server, and
+# failing to find it is no excuse to leave the compact form.
+assert_both "SREM non-canonical from intset"      SREM s:sec:int +1
+assert_both "OBJECT ENCODING intset after miss"   OBJECT ENCODING s:sec:int
+# Byte transparency across a SREM of an unrelated member (moon#795/#903).
+both SADD s:sec:ident 000000012345 +5 -0 victim
+assert_both "SREM unrelated member"               SREM s:sec:ident victim
+assert_both "OBJECT ENCODING after SREM (ident)"  OBJECT ENCODING s:sec:ident
+redis_sec_sm=$(redis-cli -p "$PORT_REDIS" SMEMBERS s:sec:ident 2>&1 | sort)
+rust_sec_sm=$(redis-cli -p "$PORT_RUST" SMEMBERS s:sec:ident 2>&1 | sort)
+assert_eq "SMEMBERS after SREM (sorted, byte-exact)" "$redis_sec_sm" "$rust_sec_sm"
+# A container past the threshold must STILL promote — the fix must not disable
+# the policy it preserves.
+both SADD s:sec:big $(seq -f 'm%.0f' 1 129)
+assert_both "SREM from oversized set"                 SREM s:sec:big m1
+assert_both "OBJECT ENCODING oversized set after SREM" OBJECT ENCODING s:sec:big
 assert_both "SISMEMBER a" SISMEMBER s:test a
 assert_both "SISMEMBER missing" SISMEMBER s:test z
 
