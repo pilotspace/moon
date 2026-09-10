@@ -246,6 +246,7 @@ mod tests {
     use super::super::record::{WalRecordType, write_wal_v3_record};
     use super::super::segment::{DEFAULT_SEGMENT_SIZE, WalWriterV3};
     use super::*;
+    use crate::persistence::wal_v3::segment::WalBounds;
 
     /// C1 — happy path: write 10 records, tail must yield all 10 in LSN order.
     #[test]
@@ -254,7 +255,8 @@ mod tests {
         let wal_dir = tmp.path().join("wal");
 
         {
-            let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+            let mut writer =
+                WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
             for _ in 0..10 {
                 writer.append(WalRecordType::Command, b"SET k v");
             }
@@ -281,7 +283,7 @@ mod tests {
         let mut last_lsn = 0u64;
         {
             // Small segment forces rotation after a handful of records.
-            let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+            let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::DEFAULT).unwrap();
             for i in 0..30 {
                 last_lsn = writer.append(WalRecordType::Command, b"SET k v");
                 if (i + 1) % 3 == 0 {
@@ -317,7 +319,8 @@ mod tests {
         let wal_dir = tmp.path().join("wal");
 
         {
-            let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+            let mut writer =
+                WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
             for _ in 0..20 {
                 writer.append(WalRecordType::Command, b"SET k v");
             }

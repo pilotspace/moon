@@ -6,6 +6,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--max-wal-size` now reaches the WAL overflow ceiling (moon#916).** The flag
+  configured `CheckpointTrigger` but never `WalWriterV3`, whose bounds setter
+  had no production caller at all — so the P6 check in
+  `maybe_force_checkpoint_on_wal_overflow`, which compares against
+  `wal.max_wal_bytes()`, enforced the 256 MiB `DEFAULT_MAX_WAL_BYTES` on every
+  instance ever run. A live instance launched with `--max-wal-size 1gb` logged
+  `P6 WAL ceiling trigger — … > max 268435456 bytes`. The bounds are now a
+  required constructor argument (`WalBounds`) so a future construction site
+  cannot omit them, and `CheckpointTrigger`, autovacuum Pass C and the writer
+  all read the one `ServerConfig::wal_bounds()`. The recycler floor
+  (`min_wal_bytes`) is unchanged at 48 MiB for any ceiling of 96 MiB or more.
+
+  **Upgrade note — behaviour change for anyone who set `--max-wal-size` above
+  256 MiB.** You now get what you asked for: each shard's WAL grows to the
+  configured ceiling (so `--shards N` × `--max-wal-size` on disk) before the P6
+  trigger forces a checkpoint, restart replay is proportionally longer (WAL
+  replay is a measured startup cost, moon#476), and `--disk-free-min-pct` is
+  approached sooner. An instance on `--max-wal-size 1gb` goes from a 256 MiB
+  WAL to a 1 GiB one per shard. Lower the flag if the old effective ceiling
+  was what you were sized for.
+
+  **Two configurations that were inert are now enforced, and one of them is
+  refused.** A ceiling below 96 MiB lowers the recycler floor to `max / 2` so
+  the regular recycler can still bring the WAL back under it (announced at
+  startup). A ceiling below two WAL segments (`--max-wal-size` <
+  2 × `--wal-segment-size`, e.g. `8mb` at the default 16 MiB segment) can never
+  be enforced — the active segment is never recycled — and the server now
+  refuses to start, naming both flags; `--check-config` reports it.
+
 ### Performance
 
 - **`storage`: the listpack write path stops walking twice and stops

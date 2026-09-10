@@ -82,6 +82,56 @@ pub const DEFAULT_MIN_WAL_BYTES: u64 = 48 * 1024 * 1024;
 /// Default maximum WAL size before aggressive recycling (256MB).
 pub const DEFAULT_MAX_WAL_BYTES: u64 = 256 * 1024 * 1024;
 
+/// The two WAL recycling bounds, carried together so a writer cannot be
+/// built without them.
+///
+/// - `min_bytes`: the regular recycler (`recycle_segments_before`) stops
+///   before it would take the on-disk WAL under this floor.
+/// - `max_bytes`: the P6 ceiling — `maybe_force_checkpoint_on_wal_overflow`
+///   forces a checkpoint + aggressive recycle once the on-disk WAL exceeds it.
+///
+/// This is a required argument to [`WalWriterV3::new`] rather than a setter
+/// because moon#916 was exactly a setter with no production caller: every
+/// instance ever run kept the 256 MiB default whatever `--max-wal-size`
+/// said, and nothing but a source-text grep could have noticed. A
+/// constructor argument makes the compiler name every construction site
+/// (the same lesson as moon#606). Production reads
+/// `ServerConfig::wal_bounds()`; tests use [`WalBounds::DEFAULT`],
+/// [`WalBounds::UNBOUNDED`] or [`WalBounds::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalBounds {
+    /// Floor the regular recycler keeps.
+    pub min_bytes: u64,
+    /// Ceiling that arms the P6 overflow trigger.
+    pub max_bytes: u64,
+}
+
+impl WalBounds {
+    /// The compiled-in defaults: 48 MiB floor, 256 MiB ceiling.
+    pub const DEFAULT: Self = Self {
+        min_bytes: DEFAULT_MIN_WAL_BYTES,
+        max_bytes: DEFAULT_MAX_WAL_BYTES,
+    };
+
+    /// No floor, no ceiling — for tests that drive the recyclers directly
+    /// and must not have a size threshold interfere.
+    pub const UNBOUNDED: Self = Self {
+        min_bytes: 0,
+        max_bytes: u64::MAX,
+    };
+
+    /// Explicit bounds. Callers are expected to keep `min_bytes <= max_bytes`;
+    /// `ServerConfig::wal_bounds()` derives the floor from the ceiling so a
+    /// configured pair can never violate that.
+    #[must_use]
+    pub const fn new(min_bytes: u64, max_bytes: u64) -> Self {
+        Self {
+            min_bytes,
+            max_bytes,
+        }
+    }
+}
+
 /// Snapshot of on-disk WAL size — read by P10 INFO emitter.
 ///
 /// Obtained via [`WalWriterV3::stats()`]. The scan is O(segment-count) and
@@ -428,7 +478,15 @@ impl WalWriterV3 {
     ///
     /// Creates `wal_dir` if it does not exist. Scans for existing segment files
     /// to resume from the highest sequence number.
-    pub fn new(shard_id: usize, wal_dir: &Path, segment_size: u64) -> std::io::Result<Self> {
+    ///
+    /// `bounds` is required (moon#916): see [`WalBounds`] for why there is no
+    /// setter and no default.
+    pub fn new(
+        shard_id: usize,
+        wal_dir: &Path,
+        segment_size: u64,
+        bounds: WalBounds,
+    ) -> std::io::Result<Self> {
         fs::create_dir_all(wal_dir)?;
 
         // Scan for existing segments to find max sequence
@@ -453,8 +511,8 @@ impl WalWriterV3 {
             next_lsn,
             base_lsn: 0,
             epoch: 0,
-            min_wal_bytes: DEFAULT_MIN_WAL_BYTES,
-            max_wal_bytes: DEFAULT_MAX_WAL_BYTES,
+            min_wal_bytes: bounds.min_bytes,
+            max_wal_bytes: bounds.max_bytes,
             sync_agent: None,
             sync_agent_unavailable: false,
             flush_backoff_until: None,
@@ -691,13 +749,10 @@ impl WalWriterV3 {
         self.buf.len()
     }
 
-    /// Configure minimum and maximum WAL size bounds for recycling.
-    ///
-    /// - `min_bytes`: recycling stops when remaining WAL would drop below this.
-    /// - `max_bytes`: used by checkpoint trigger to force recycling when exceeded.
-    pub fn set_wal_bounds(&mut self, min_bytes: u64, max_bytes: u64) {
-        self.min_wal_bytes = min_bytes;
-        self.max_wal_bytes = max_bytes;
+    /// The bounds this writer was constructed with.
+    #[inline]
+    pub fn bounds(&self) -> WalBounds {
+        WalBounds::new(self.min_wal_bytes, self.max_wal_bytes)
     }
 
     /// Return the configured minimum WAL size in bytes.
@@ -1294,7 +1349,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
         // Tiny segment so a handful of appends forces rotation.
-        let mut writer = WalWriterV3::new(0, &wal_dir, 256).unwrap();
+        let mut writer = WalWriterV3::new(0, &wal_dir, 256, WalBounds::DEFAULT).unwrap();
 
         // The shallow-heal state: the whole wal dir vanishes while the
         // writer's current-segment fd stays open (unlinked inode).
@@ -1328,7 +1383,8 @@ mod tests {
     fn test_flush_backoff_arms_and_clears() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
 
         assert!(
             !writer.flush_backing_off(),
@@ -1348,7 +1404,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
 
-        let writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
         assert_eq!(writer.current_segment_sequence(), 1);
 
         let seg_path = WalSegment::segment_path(&wal_dir, 1);
@@ -1363,7 +1420,8 @@ mod tests {
     fn test_request_sync_then_wait_durable_covers_all_appends() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
 
         let mut last = 0;
         for i in 0..10u32 {
@@ -1411,7 +1469,8 @@ mod tests {
     fn test_typed_channel_preserves_workspace_create_outer_type() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
 
         // Producer side: exactly what handler_monoio/write.rs's WS.CREATE arm
         // does post-K1a — build the UNFRAMED payload and send it with its
@@ -1450,7 +1509,8 @@ mod tests {
     fn test_wait_durable_zero_and_already_durable_are_noops() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
         // lsn 0 = "nothing to wait for" — must not spawn or block.
         writer
             .wait_durable(0, std::time::Duration::from_millis(10))
@@ -1472,7 +1532,8 @@ mod tests {
     fn test_writer_append_and_flush() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
 
         let lsn1 = writer.append(WalRecordType::Command, b"SET a 1");
         let lsn2 = writer.append(WalRecordType::Command, b"SET b 2");
@@ -1510,7 +1571,8 @@ mod tests {
     fn test_buffer_shrinks_after_flush_following_large_record() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
 
         assert_eq!(writer.resident_bytes(), DEFAULT_WAL_BUF_CAPACITY);
 
@@ -1536,7 +1598,8 @@ mod tests {
     fn test_buffer_does_not_shrink_below_threshold() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
 
         // Small records that never exceed the shrink threshold should
         // never trigger a reallocation cycle (a flush is a no-op sizing
@@ -1553,7 +1616,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
         // Small segment size to force rotation
-        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::DEFAULT).unwrap();
 
         // Write enough to trigger rotation (each record ~27 bytes for 7-byte payload)
         for _ in 0..30 {
@@ -1573,7 +1636,8 @@ mod tests {
     fn test_writer_lsn_monotonic() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
 
         let mut prev_lsn = 0;
         for _ in 0..100 {
@@ -1587,7 +1651,8 @@ mod tests {
     fn test_segment_header_format() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let _writer = WalWriterV3::new(7, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let _writer =
+            WalWriterV3::new(7, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
 
         let seg_path = WalSegment::segment_path(&wal_dir, 1);
         let data = fs::read(&seg_path).unwrap();
@@ -1618,9 +1683,8 @@ mod tests {
         let wal_dir = tmp.path().join("wal");
 
         // Small segment size (512 bytes) to force multiple segments.
-        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::UNBOUNDED).unwrap();
         // Disable min floor for backward-compatible test behavior.
-        writer.set_wal_bounds(0, u64::MAX);
 
         // Write records and flush frequently to trigger segment rotation.
         // Each record is ~31 bytes; 512 - 64 (header) = 448 usable per segment.
@@ -1680,8 +1744,7 @@ mod tests {
     fn test_recycle_aggressive_keeps_plane_history_segments() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
-        writer.set_wal_bounds(0, u64::MAX);
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::UNBOUNDED).unwrap();
 
         // First record = an MqPush plane record → lands in segment 1.
         writer.append(WalRecordType::MqPush, b"\x01mq-plane-payload");
@@ -1729,8 +1792,7 @@ mod tests {
     fn test_recycle_segments_before_keeps_plane_history_segments() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
-        writer.set_wal_bounds(0, u64::MAX);
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::UNBOUNDED).unwrap();
 
         writer.append(WalRecordType::WorkspaceCreate, b"ws-plane-payload");
         for i in 0..60 {
@@ -1760,8 +1822,7 @@ mod tests {
     fn test_recycle_frees_graphtemporal_segment_once_graph_floor_covers_it() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
-        writer.set_wal_bounds(0, u64::MAX);
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::UNBOUNDED).unwrap();
 
         // First record = a GraphTemporal (TEMPORAL.INVALIDATE) plane record
         // → lands in segment 1.
@@ -1825,8 +1886,7 @@ mod tests {
     fn test_recycle_min_across_planes_pure_kv_after_ws_still_recycles() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
-        writer.set_wal_bounds(0, u64::MAX);
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::UNBOUNDED).unwrap();
 
         // The shard's ONLY WS record, early — segment 1.
         writer.append(WalRecordType::WorkspaceCreate, b"ws-plane-payload");
@@ -1896,9 +1956,9 @@ mod tests {
         let wal_dir = tmp.path().join("wal");
 
         // Small segment size (512 bytes) to force multiple segments.
-        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        let mut writer =
+            WalWriterV3::new(0, &wal_dir, 512, WalBounds::new(1024, 1_000_000)).unwrap();
         // Set min_wal_bytes to 1024 — recycling should keep at least 1024 bytes.
-        writer.set_wal_bounds(1024, 1_000_000);
 
         // Write enough records to create 4+ segments.
         for i in 0..60 {
@@ -1945,19 +2005,21 @@ mod tests {
     fn test_wal_bounds_defaults() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
         assert_eq!(writer.min_wal_bytes(), DEFAULT_MIN_WAL_BYTES);
         assert_eq!(writer.max_wal_bytes(), DEFAULT_MAX_WAL_BYTES);
     }
 
     #[test]
-    fn test_set_wal_bounds() {
+    fn test_wal_bounds_reach_the_writer() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
-        writer.set_wal_bounds(100, 200);
+        let writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::new(100, 200)).unwrap();
         assert_eq!(writer.min_wal_bytes(), 100);
         assert_eq!(writer.max_wal_bytes(), 200);
+        assert_eq!(writer.bounds(), WalBounds::new(100, 200));
     }
 
     /// P0 — LSN durability: writer must resume `next_lsn` after restart by
@@ -1969,7 +2031,8 @@ mod tests {
 
         // First writer: append 50 records, flush, drop.
         {
-            let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+            let mut writer =
+                WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
             for _ in 0..50 {
                 writer.append(WalRecordType::Command, b"SET k v");
             }
@@ -1982,7 +2045,8 @@ mod tests {
         }
 
         // Second writer: open the same dir, the very next append must be LSN 51.
-        let mut writer2 = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer2 =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
         let next_lsn = writer2.append(WalRecordType::Command, b"SET k v");
         assert_eq!(
             next_lsn, 51,
@@ -2001,7 +2065,7 @@ mod tests {
         // Small segment size to force rotation.
         let last_lsn_first_run: u64;
         {
-            let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+            let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::DEFAULT).unwrap();
             let mut last_lsn = 0;
             // Each Command record with 7-byte payload is ~31 bytes, so 30 records
             // and periodic flushes will force at least 2 rotations.
@@ -2021,7 +2085,7 @@ mod tests {
         }
 
         // Reopen: next append must be last_lsn + 1.
-        let mut writer2 = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        let mut writer2 = WalWriterV3::new(0, &wal_dir, 512, WalBounds::DEFAULT).unwrap();
         let resumed_lsn = writer2.append(WalRecordType::Command, b"x");
         assert_eq!(
             resumed_lsn,
@@ -2038,7 +2102,8 @@ mod tests {
     fn test_writer_empty_dir_starts_at_lsn_1() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
         assert_eq!(writer.append(WalRecordType::Command, b"x"), 1);
     }
 
@@ -2067,8 +2132,8 @@ mod tests {
     fn test_segment_plane_scan_blocks_v060_nested_workspace_create() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
-        writer.set_wal_bounds(0, u64::MAX);
+        let mut writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::UNBOUNDED).unwrap();
 
         let nested =
             v060_nested_command_payload(WalRecordType::WorkspaceCreate, b"ws-plane-payload");
@@ -2088,8 +2153,8 @@ mod tests {
     fn test_segment_plane_scan_flags_v060_nested_graph_temporal() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
-        writer.set_wal_bounds(0, u64::MAX);
+        let mut writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::UNBOUNDED).unwrap();
 
         let nested =
             v060_nested_command_payload(WalRecordType::GraphTemporal, b"graph-temporal-payload");
@@ -2118,8 +2183,8 @@ mod tests {
     fn test_segment_plane_scan_blocks_nested_frame_with_unknown_inner_type() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
-        writer.set_wal_bounds(0, u64::MAX);
+        let mut writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::UNBOUNDED).unwrap();
 
         // Hand-build a validly-framed (length + CRC32C both correct) inner
         // record with a type byte no `WalRecordType` variant claims.
@@ -2160,8 +2225,8 @@ mod tests {
     fn test_segment_plane_scan_plain_command_payload_not_blocked() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
-        writer.set_wal_bounds(0, u64::MAX);
+        let mut writer =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::UNBOUNDED).unwrap();
 
         writer.append(
             WalRecordType::Command,
@@ -2185,8 +2250,7 @@ mod tests {
     /// sole-copy MQ plane record, so every sealed segment is plane-blocked
     /// (the #870 live-instance shape: 34 sealed, 34 blocked, 0 freed).
     fn seal_plane_blocked_segments(wal_dir: &Path) -> (WalWriterV3, u64) {
-        let mut writer = WalWriterV3::new(0, wal_dir, 512).unwrap();
-        writer.set_wal_bounds(0, u64::MAX);
+        let mut writer = WalWriterV3::new(0, wal_dir, 512, WalBounds::UNBOUNDED).unwrap();
         for i in 0..60 {
             writer.append(WalRecordType::MqCreate, b"mq-plane-payload-#870");
             if (i + 1) % 3 == 0 {
@@ -2282,8 +2346,7 @@ mod tests {
     fn test_870_plane_scan_memo_forgets_recycled_and_unreadable_segments() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
-        writer.set_wal_bounds(0, u64::MAX);
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::UNBOUNDED).unwrap();
         // Segment 1 = plane-blocked; the rest pure KV (freeable).
         writer.append(WalRecordType::MqPush, b"\\x01mq-plane-payload");
         for i in 0..60 {
@@ -2347,8 +2410,7 @@ mod tests {
     fn test_870_overflow_backoff_doubles_caps_and_resets_on_a_free() {
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
-        let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
-        writer.set_wal_bounds(0, u64::MAX);
+        let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::UNBOUNDED).unwrap();
         assert_eq!(writer.overflow_recycle_backoff_multiplier(), 1);
 
         for expect in [2u64, 4, 8, 16, 32, 64, 64, 64] {

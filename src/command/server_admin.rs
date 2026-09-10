@@ -2425,9 +2425,13 @@ mod tests {
         wal_dir: &std::path::Path,
     ) -> crate::persistence::wal_v3::segment::WalWriterV3 {
         use crate::persistence::wal_v3::record::WalRecordType;
-        let mut writer =
-            crate::persistence::wal_v3::segment::WalWriterV3::new(0, wal_dir, 512).unwrap();
-        writer.set_wal_bounds(0, 256);
+        let mut writer = crate::persistence::wal_v3::segment::WalWriterV3::new(
+            0,
+            wal_dir,
+            512,
+            crate::persistence::wal_v3::segment::WalBounds::new(0, 256),
+        )
+        .unwrap();
         for i in 0..80 {
             writer.append(WalRecordType::Command, b"vacuum-p0-2 EARLY-MARKER");
             if (i + 1) % 3 == 0 {

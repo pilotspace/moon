@@ -129,14 +129,15 @@ fn current_time_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::persistence::wal_v3::record::WalRecordType;
-    use crate::persistence::wal_v3::segment::{DEFAULT_SEGMENT_SIZE, WalWriterV3};
+    use crate::persistence::wal_v3::segment::{DEFAULT_SEGMENT_SIZE, WalBounds, WalWriterV3};
 
     fn bulk(s: &str) -> Frame {
         Frame::BulkString(Bytes::copy_from_slice(s.as_bytes()))
     }
 
     fn write_test_wal(wal_dir: &std::path::Path, n: u64) {
-        let mut writer = WalWriterV3::new(0, wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let mut writer =
+            WalWriterV3::new(0, wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
         for _ in 0..n {
             writer.append(
                 WalRecordType::Command,
