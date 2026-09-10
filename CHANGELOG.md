@@ -25,6 +25,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contract and the per-field TTL sidecar are unchanged; the listpack integer
   encoding still refuses non-canonical spellings, so `+5` and `007` survive
   byte-for-byte (moon#795).
+- **`LSET`, `LPOP` and `RPOP` no longer flatten a small list's compact encoding
+  (moon#897).** A three-element list built by `RPUSH` reported `listpack` and
+  then `linkedlist` after ONE `LSET`, `LPOP` or `RPOP`, where redis 8.6.1
+  reports `listpack`. Nothing demotes (moon#832), so a small work queue lost the
+  compact form on its first pop — `LPOP` is the queue primitive — and never got
+  it back. Two mechanisms were at fault and both are gone from the compact path:
+  `get_or_create_list`, whose `ListKind::upgrade` materialises the `VecDeque`
+  unconditionally, and a `get_list` (= `get_promoted`) EXISTENCE probe that the
+  pops ran purely to decide "does the key exist?" — so the miss check flattened
+  the list before the pop had even started. All three now mutate the listpack in
+  place, routed on a `&self` probe, and promote only when the ONE
+  `EncodingLimits` authority (moon#896) says the container no longer fits: for
+  `LSET`, that is a replacement element past the value threshold, the one list
+  secondary write that can legitimately cross one. Replies (including `LPOP`'s
+  optional count, its `*-1`-vs-`*0` miss, and `RPOP`'s back-to-front order), the
+  `ERR index out of range` / `ERR no such key` / count-range error strings and
+  delete-when-empty are unchanged, verified row by row against a live redis
+  oracle at, below and one past the threshold.
+
+- **`LSET` on a missing key no longer creates it (moon#830).** `LSET ghost 0 v`
+  replied `ERR no such key` *and* left an empty list behind — charged to the
+  memory ledger, visible to `DBSIZE`, and never propagated to the AOF or a
+  replica, since propagation is gated on the reply not being an error. The cause
+  was the same eager `get_or_create_list` call moon#897 removes: the create half
+  fired before the error could be returned. The non-creating `&self` router
+  answers "no such key" without it. Fixed as a consequence of moon#897, not as a
+  separate change; `EXISTS`, `TYPE` and `DBSIZE` now match redis 8.6.1.
+
 - **`SREM` no longer flattens a small set's compact encoding (moon#897).** A
   three-member set built by `SADD` reported `listpack` (or `intset`) and then
   `hashtable` after ONE `SREM` of one member, where redis 8.6.1 reports
