@@ -180,6 +180,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   five types: replica `used_memory` 46,628,615 B -> 24,228,615 B (**-48.0%**),
   which is now *exactly* the master's own 24,228,615 B; replica RSS
   127.4 MB -> 92.0 MB (**-27.7%**). The master is unchanged.
+- **`storage`: promoting a value back out of the cold tier no longer flattens
+  its compact encoding (moon#898).** The spill body format is canonical per
+  LOGICAL type — `Set`, `SetListpack` and `SetIntset` all encode as
+  `ValueType::Set`, and the body carries elements, never an encoding tag — so
+  the cold decoder could only rebuild the FULL form, and every container that
+  came back from disk landed as `hashtable`/`linkedlist`/`skiplist`. Nothing
+  demotes (moon#832), so that was permanent for the key's lifetime, and
+  `--disk-offload` is enabled by DEFAULT: the keys most likely to travel this
+  path are exactly the long-lived, rarely-touched small collections the
+  compact encodings exist for. moon#840 closed the same gap on the restart
+  path and moon#863 on the replication one; this is the third and last
+  instance of that shape. The re-derivation runs at the two boundaries where a
+  cold value re-enters the HOT keyspace — `Database::promote_cold_outcome`
+  (the on-disk plane) and `eviction::rehydrate_spill_payload` (the in-flight
+  spill plane) — and deliberately NOT one layer down in
+  `kv_serde::deserialize_collection`, which the NON-promoting cold
+  read-through shares: `ValueKind::classify_cold` accepts only the full forms,
+  and a compacted value there answers WRONGTYPE for a valid set (measured, not
+  feared — there is a guard). Same helper and same thresholds as the other two
+  paths, so a promoted value lands in exactly the encoding a live write would
+  have produced; containers past the thresholds still come back full and
+  complete, and nothing about the bytes on disk changes. Measured on macOS
+  15.7.9 / Apple M4 Pro, `release-fast` (not a publishable benchmark profile;
+  a macOS number is not a Linux number), 3 interleaved A/B rounds over 10,000
+  5-field hashes with ~3,700-6,400 of them cold per round: `used_memory` per
+  cold-promoted key **744.0 B -> 184.0 B (-75.3%)**, identical to the byte in
+  all three rounds. Wire-level, 120 probes across all five affected encodings:
+  120/120 came back compact, against 0-6 per type before. Because it shares
+  `compact_after_decode` with the restart and replication paths, this path also
+  inherits **moon#903**: that helper's intset arm decided "all integers" with a
+  bare `parse::<i64>()` rather than `numeric::canonical_i64`, admitting `+5`,
+  `000000012345` and `-0` — which an intset both rewrites (moon#795) and
+  collapses into fewer members. A byte-transparency guard over exactly those
+  spellings ships here, and the cold path is correct only with moon#903 fixed.
 
 - **`text`: the `TMX3` TAG/NUMERIC sidecar block is now proven compatible
   in both directions, and the format no longer depends on the build's

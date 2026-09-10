@@ -13,6 +13,85 @@ use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::RedisValue;
 use crate::storage::value_codec::{self, HashTtlTrailer};
 
+/// Re-derive the compact encoding a value promoted OUT of the cold tier is
+/// eligible for (moon#898).
+///
+/// # Why this exists at all
+///
+/// The spill body format is canonical per LOGICAL type — `Set`, `SetListpack`
+/// and `SetIntset` all encode as [`ValueType::Set`] and the body carries
+/// elements, never an encoding tag (see [`value_codec`]'s module docs). That
+/// is deliberate and shared with RDB, so decode has nothing to rebuild the
+/// compact form from and [`deserialize_collection`] can only produce the FULL
+/// one. Because nothing demotes (moon#832), a container that comes back full
+/// stays full for the key's lifetime — and `--disk-offload` is enabled by
+/// DEFAULT, so the keys that travel this path are exactly the long-lived,
+/// rarely-touched small collections the compact encodings exist for.
+///
+/// moon#840 closed the same gap on the restart path and moon#863 on the
+/// replication one, both by calling the same helper this delegates to. This is
+/// the third and last instance of that shape.
+///
+/// # Why it is NOT inside [`deserialize_collection`]
+///
+/// That decoder is shared by two callers with opposite requirements:
+///
+/// * the **promoting** paths, which put the value into the hot keyspace, where
+///   the compact form is what every other producer would have built; and
+/// * the **non-promoting** read-through (`Database::cold_read_only` ->
+///   `ValueKind::classify_cold`), which accepts ONLY the canonical full forms —
+///   a cold-decoded `SetListpack` falls through its `_ => Err(WrongType)` arm
+///   and would answer WRONGTYPE for a perfectly valid set.
+///
+/// So the re-derivation belongs at the boundary where a cold value re-enters
+/// the hot keyspace, not one layer down in the codec both share. Pushing it
+/// down would turn a memory issue into a correctness one; the guard against
+/// that is `tests/cold_promote_compact_encoding_898.rs`'s
+/// `the_non_promoting_cold_read_through_still_answers_the_full_form`.
+///
+/// There are exactly two such boundaries, and both call this:
+///
+/// * [`crate::storage::db::Database::promote_cold_outcome`] — the on-disk cold
+///   plane, reached from `promote_cold_if_present` (every mutable accessor and
+///   `Database::get`) and from the monoio handler's off-thread `GET` prewarm.
+/// * [`crate::storage::eviction::rehydrate_spill_payload`] — the in-flight
+///   spill plane (`promote_inflight_if_present`, plus the spill-pwrite-failure
+///   re-insert in `shard::persistence_tick`).
+///
+/// # Contract
+///
+/// Thresholds are the ones the command layer already enforces, so a promoted
+/// value lands in exactly the encoding it would have had if the same commands
+/// had been replayed live. Values PAST those thresholds fall through the
+/// helper's catch-all arm untouched — full form, every element. Strings and
+/// streams pass through unchanged. Nothing about the bytes on disk changes:
+/// this is a decode-side normalisation, so old spill files stay readable by
+/// new builds and new files by old ones.
+///
+/// # The one value this refuses to compact
+///
+/// A sorted-set score is 8 RAW bytes in the spill body, so a corrupted blob
+/// can spell NaN — which no writer produces (`ZADD` rejects it) and which
+/// `zset_score::render_score` documents as unreachable. Compacting such a
+/// zset would render the score into the listpack as the text `NaN`, which
+/// `zset_score::parse_score` then refuses, so every later read of that member
+/// would silently answer `0.0`. moon#863 hit exactly this on the redis-wire
+/// path and guarded it there. Here the value is moon's own file rather than a
+/// hostile peer's payload, so the guard is the conservative one rather than a
+/// hard error: a zset carrying any non-finite score is handed back in its
+/// FULL form — today's behaviour to the byte — instead of being turned into a
+/// listpack that reads as zeros.
+#[inline]
+pub fn compact_for_promotion(value: RedisValue) -> RedisValue {
+    if let RedisValue::SortedSetBPTree { members, .. } = &value
+        && members.len() <= crate::storage::db::LISTPACK_MAX_ENTRIES
+        && members.values().any(|score| !score.is_finite())
+    {
+        return value;
+    }
+    value_codec::compact_after_decode(value)
+}
+
 /// Serialize a collection `RedisValueRef` into bytes for KvLeafPage storage.
 ///
 /// Returns `None` for String type (strings go directly as value bytes) and

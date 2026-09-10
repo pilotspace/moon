@@ -1130,6 +1130,17 @@ pub(crate) fn rehydrate_spill_payload(
         ValueType::String => RedisValue::String(value_bytes.clone()),
         _ => kv_serde::deserialize_collection(value_bytes, value_type)?,
     };
+    // moon#898: every caller of this helper puts the result back into the HOT
+    // keyspace (`promote_inflight_if_present`, the spill-pwrite-failure
+    // re-insert in `shard::persistence_tick`, and the `EntryView::Cold`
+    // materialisation in `get_if_alive_any_plane`), so the compact encoding is
+    // re-derived here for the same reason the on-disk cold plane re-derives it
+    // in `Database::promote_cold_outcome`. The payload bytes are the same
+    // canonical per-logical-type body, which carries no encoding tag.
+    // Deliberately NOT pushed into `deserialize_collection`: the non-promoting
+    // read-through shares that decoder and feeds `ValueKind::classify_cold`,
+    // which accepts only the full forms. See `kv_serde::compact_for_promotion`.
+    let redis_value = kv_serde::compact_for_promotion(redis_value);
     let mut entry = crate::storage::Entry::new_string(Bytes::new());
     entry.value = crate::storage::compact_value::CompactValue::from_redis_value(redis_value);
     if let Some(ttl) = ttl_ms {
@@ -1703,9 +1714,19 @@ mod tests {
 
         let (vt, bytes, _flags, ttl) = build_spill_payload(&entry).expect("serializable");
         let restored = rehydrate_spill_payload(vt, &bytes, ttl).expect("round-trip");
+        // moon#898 changed the ENCODING this returns, not the content. The
+        // payload body is canonical per logical type and carries no encoding
+        // tag, so before the fix a two-field hash came back as a full
+        // `Hash` — the form no live write would ever have produced for it, and
+        // permanent, because nothing demotes (moon#832). It now lands in the
+        // encoding a live `HSET` would have produced. The F1 invariant this
+        // test exists for is the CONTENT, asserted here against the same map.
         match restored.as_redis_value() {
-            RedisValueRef::Hash(h) => assert_eq!(*h, map),
-            _ => panic!("expected hash after rehydrate"),
+            RedisValueRef::HashListpack(lp) => assert_eq!(lp.to_hash_map(), map),
+            other => panic!(
+                "expected a listpack-encoded hash after rehydrate, got {}",
+                other.encoding_name()
+            ),
         }
         assert_eq!(restored.expires_at_ms(), entry.expires_at_ms());
 
