@@ -290,7 +290,8 @@ jobs:
   check-monoio:
     name: Check (monoio — the shipped runtime)
     runs-on: [self-hosted, moon-dev]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || github.event_name == 'workflow_dispatch'
     env:
       # moon#735: no incremental cache (a one-shot job never reads it back;
       # 2.18 GiB and 85s per leg) and DWARF left beside the objects instead of
@@ -338,7 +339,8 @@ jobs:
   check-macos:
     name: Check (macOS)
     runs-on: macos-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || github.event_name == 'workflow_dispatch'
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -440,7 +442,8 @@ jobs:
       # wrong for Windows (MSVC/PDB) and redundant on macOS (already default).
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.94.1
@@ -614,7 +617,8 @@ jobs:
   client-compat:
     name: Client compat (RESP2/RESP3 diff vs Redis)
     runs-on: [self-hosted, moon-dev]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || github.event_name == 'workflow_dispatch'
     env:
       # moon#735: no incremental cache (a one-shot job never reads it back;
       # 2.18 GiB and 85s per leg) and DWARF left beside the objects instead of
