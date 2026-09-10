@@ -349,3 +349,59 @@ fn the_default_merge_bar_actually_reaches_the_monoio_suite() {
         "--quick now selects the VM suites, but still prints \"LINT ONLY\""
     );
 }
+
+/// moon#904: the single-process lib stage must actually be SELECTED, in every
+/// mode that runs tests.
+///
+/// Every test gate in this repo runs `cargo nextest`, which forks a process
+/// per test — so a bug that leaks process-global state from one test into
+/// another has no second test to reach. moon#856 is exactly that class, and it
+/// passes under nextest and fails under `cargo test --lib` on the same commit,
+/// host and binary. A stage that stopped being selected would look identical
+/// to a green build, which is the same silent-coverage-loss failure mode the
+/// rest of this file guards against — so it is asserted the same way, by
+/// running the script's REAL control flow rather than grepping its text.
+#[cfg(unix)]
+#[test]
+fn the_merge_bar_selects_the_single_process_lib_stage() {
+    use std::process::Command;
+
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let run = |args: &[&str]| -> String {
+        let out = Command::new("bash")
+            .arg(ci_local_path())
+            .args(args)
+            .env("CI_LOCAL_DRY_RUN", "1")
+            .env("CI_LOCAL_REPO", &repo)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run ci-local.sh: {e}"));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let default_mode = run(&[]);
+    assert!(
+        default_mode.contains("would run: VM lib tests, SINGLE process (moon#904)"),
+        "the DEFAULT merge bar no longer runs the lib tests in one process. \
+         Both VM suites run under nextest, which forks per test, so nothing \
+         would gate process-global state leaks between tests.\n\
+         Steps selected:\n{default_mode}"
+    );
+    let native = run(&["--native"]);
+    assert!(
+        native.contains("would run: native lib tests, SINGLE process (moon#904)"),
+        "--native no longer runs the lib tests in one process.\nSteps selected:\n{native}"
+    );
+    // The waiver in that stage tolerates one known failure (moon#856). A waiver
+    // whose refusal is never exercised is not a gate, so the gate's own
+    // self-test must run before anything trusts its verdict — in EVERY mode,
+    // --quick included, since it costs under a second.
+    for mode in [vec![], vec!["--native"], vec!["--quick"], vec!["--fast"]] {
+        let out = run(&mode);
+        assert!(
+            out.contains("would run: libtest-gate self"),
+            "`{mode:?}` no longer self-tests scripts/libtest-singleproc-gate.sh, \
+             so its moon#856 waiver could silently stop refusing anything.\n\
+             Steps selected:\n{out}"
+        );
+    }
+}
