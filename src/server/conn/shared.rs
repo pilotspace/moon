@@ -3482,6 +3482,274 @@ mod as_of_tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // moon#925, the OTHER class: an arm whose `(len, b0)` pattern does not
+    // match the name it compares.
+    // -----------------------------------------------------------------
+
+    /// Every `(len, first_byte)` dispatch arm in this file and in
+    /// `command/mod.rs`, scoped exactly, with the names it compares `cmd`
+    /// against.
+    ///
+    /// These tables hand-write the length and first byte BESIDE the name
+    /// literal. Nothing checks that the two agree, so a mismatch compiles
+    /// clean, passes every test, and produces an arm that can never fire.
+    /// `BGREWRITEAOF` sat at `(13, b'b')` for a TWELVE-byte name; it was
+    /// keyless only because its arity is 1 and `args.is_empty()` caught it
+    /// first. A future command in that position with an optional argument
+    /// reproduces moon#925 exactly.
+    ///
+    /// The parsing is the risky part, so it is isolated here and self-tested
+    /// by [`dead_arm_extractor_scopes_a_single_arm`] before any verdict is
+    /// trusted. Two rules earned by getting it wrong:
+    ///
+    /// * **Scope the arm exactly.** A braced arm runs to its matching `}`; a
+    ///   bare-expression arm ends at the first `,` at depth 0. Reading "to
+    ///   the next arm head" instead bleeds one arm into the next and reports
+    ///   every sibling's name as a dead arm.
+    /// * **Only compares against `cmd`.** `shared.rs`'s `COPY` arm contains
+    ///   `o.eq_ignore_ascii_case(b"DB")`, where `DB` is an argument token
+    ///   inside `COPY … DB n`, not a command name. Keyed on the binding, that
+    ///   arm reads `COPY` (4, 'c') and is correct.
+    fn dispatch_arms(src: &str) -> Vec<(usize, u8, Vec<String>, usize)> {
+        let bytes = src.as_bytes();
+        let mut out = Vec::new();
+        let mut line_start = 0usize;
+        let mut line_no = 1usize;
+        while line_start < bytes.len() {
+            let line_end = src[line_start..]
+                .find('\n')
+                .map_or(bytes.len(), |i| line_start + i);
+            let line = &src[line_start..line_end];
+            if let Some((len, b0, arrow_at)) = parse_arm_head(line) {
+                let body = arm_body(src, line_start + arrow_at);
+                out.push((len, b0, cmd_compares(&body), line_no));
+            }
+            line_start = line_end + 1;
+            line_no += 1;
+        }
+        out
+    }
+
+    /// `    (12, b'b') => ` -> `(12, b'b', <offset just past the `=>`>)`.
+    fn parse_arm_head(line: &str) -> Option<(usize, u8, usize)> {
+        let t = line.trim_start();
+        let indent = line.len() - t.len();
+        let rest = t.strip_prefix('(')?;
+        let (num, rest) = rest.split_once(", b'")?;
+        let len: usize = num.trim().parse().ok()?;
+        let b0 = *rest.as_bytes().first()?;
+        let rest = rest.get(1..)?.strip_prefix("') =>")?;
+        let arrow_at = indent + (t.len() - rest.len());
+        Some((len, b0, arrow_at))
+    }
+
+    /// The arm body starting just past `=>`: to the matching `}` for a braced
+    /// arm, otherwise to the first `,` at bracket depth 0. Skips string, byte
+    /// string, char and comment content so a `,` or brace inside one cannot
+    /// end the arm early.
+    fn arm_body(src: &str, from: usize) -> String {
+        let b = src.as_bytes();
+        let mut i = from;
+        while i < b.len() && (b[i] as char).is_whitespace() {
+            i += 1;
+        }
+        let braced = i < b.len() && b[i] == b'{';
+        let start = i;
+        let mut depth = 0i32;
+        while i < b.len() {
+            match b[i] {
+                b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                    i += 2;
+                    while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(b.len());
+                    continue;
+                }
+                b'"' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                // `b'x'` / `'x'`. A lifetime (`'a`) has no closing quote two
+                // bytes on, so leave it to the normal scan rather than
+                // swallowing the rest of the arm.
+                b'\'' if i + 2 < b.len() && b[i + 2] == b'\'' => i += 2,
+                b'\'' if i + 3 < b.len() && b[i + 1] == b'\\' && b[i + 3] == b'\'' => i += 3,
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => {
+                    depth -= 1;
+                    if braced && depth == 0 {
+                        return src[start..=i].to_string();
+                    }
+                    if depth < 0 {
+                        // The `}` that closes the whole match block.
+                        return src[start..i].to_string();
+                    }
+                }
+                b',' if depth == 0 && !braced => return src[start..i].to_string(),
+                _ => {}
+            }
+            i += 1;
+        }
+        src[start..].to_string()
+    }
+
+    /// Names this body compares `cmd` against, in order. Line comments are
+    /// stripped first: a comment naming another command must not be read as a
+    /// compare.
+    fn cmd_compares(body: &str) -> Vec<String> {
+        const PAT: &str = "cmd.eq_ignore_ascii_case(b\"";
+        let mut names = Vec::new();
+        for line in body.lines() {
+            let code = line.split_once("//").map_or(line, |(c, _)| c);
+            let mut rest = code;
+            while let Some(at) = rest.find(PAT) {
+                rest = &rest[at + PAT.len()..];
+                match rest.find('"') {
+                    Some(end) => {
+                        names.push(rest[..end].to_string());
+                        rest = &rest[end..];
+                    }
+                    None => break,
+                }
+            }
+        }
+        names
+    }
+
+    /// The extractor is the risky half of the guard below, so prove it on
+    /// arms whose exact shape is known before trusting any verdict it gives.
+    /// The failure this pins is the one that actually happened: an extractor
+    /// that runs an arm to the NEXT arm head reports 30-plus phantom dead
+    /// arms, every one of them a sibling's name.
+    #[test]
+    fn dead_arm_extractor_scopes_a_single_arm() {
+        let this = include_str!("shared.rs");
+        let arms = dispatch_arms(this);
+
+        // 1. A bare-expression arm stops at its own comma. BGREWRITEAOF's
+        //    neighbours in the keyless table are PUNSUBSCRIBE (12, 'p') and
+        //    UNSUBSCRIBE (11, 'u'); neither may appear in its body.
+        let bg = arms
+            .iter()
+            .find(|(_, _, names, _)| names.iter().any(|n| n == "BGREWRITEAOF"))
+            .expect("the BGREWRITEAOF arm must be found at all");
+        assert_eq!(
+            bg.2,
+            vec!["BGREWRITEAOF".to_string()],
+            "the BGREWRITEAOF arm bled into a sibling: {:?}",
+            bg.2
+        );
+
+        // 2. A braced arm stops at its matching brace, and an argument-token
+        //    compare is not mistaken for a command name. `COPY … DB n`:
+        //    `DB` is compared against `o`, not `cmd`.
+        let copy = arms
+            .iter()
+            .find(|(_, _, names, _)| names.iter().any(|n| n == "COPY"))
+            .expect("the COPY arm must be found at all");
+        assert!(
+            !copy.2.iter().any(|n| n == "DB"),
+            "`DB` is an argument token in `COPY … DB n`, not a command: {:?}",
+            copy.2
+        );
+
+        // 3. A multi-name arm keeps every name it really has.
+        let scan = arms
+            .iter()
+            .find(|(_, _, names, _)| names.iter().any(|n| n == "SCAN"))
+            .expect("the SCAN arm must be found at all");
+        assert!(
+            scan.2.iter().any(|n| n == "SAVE"),
+            "the (4, 's') arm compares SCAN and SAVE; got {:?}",
+            scan.2
+        );
+
+        // 4. Floors, so a gutted extractor that finds nothing cannot pass the
+        //    guard below by vacuity. Deliberately well under the current
+        //    counts (71 arms / 87 compares in this file) so that adding a
+        //    command does not have to touch this test.
+        let compares: usize = arms.iter().map(|a| a.2.len()).sum();
+        assert!(
+            arms.len() >= 60 && compares >= 75,
+            "extractor found only {} arms / {compares} compares in shared.rs \
+             — it is broken, and any verdict it gives is meaningless",
+            arms.len()
+        );
+    }
+
+    /// moon#925's second class: **no dispatch arm may name a command its own
+    /// `(len, first_byte)` pattern can never match.**
+    ///
+    /// Swept at the time this landed: **223 arms, 373 compares, 2 apparent
+    /// mismatches** — `BGREWRITEAOF` (real, fixed here) and `COPY … DB` (an
+    /// argument token, excluded by keying on the `cmd` binding). The class is
+    /// otherwise clean; the point of this test is that it stays clean.
+    ///
+    /// The sweep keys on the ARM shape, not on the `match` head, which is why
+    /// it covers 223 arms rather than the 211 a `match (len, b0)` search
+    /// finds: `touches_a_key_it_did_not_route_on` in this file writes
+    /// `match (len, cmd[0] | 0x20)` inline, with no `b0` binding, and its 13
+    /// arms are dispatch arms like any other.
+    ///
+    /// Chosen over the alternative — a macro deriving `(len, b0)` from the
+    /// name literal, which would make the mismatch unrepresentable —
+    /// deliberately. That macro would have to rewrite all 223 arms of two
+    /// hot dispatch tables to close a defect this test closes by reading
+    /// them, and `extract_primary_key` / `command::dispatch` are exactly the
+    /// functions where a mass rewrite for tidiness is not worth its risk. If
+    /// these tables are ever restructured for another reason, the macro is
+    /// the better end state and this test should go with them.
+    #[test]
+    fn no_dispatch_arm_names_a_command_its_pattern_cannot_match() {
+        let sources = [
+            ("src/server/conn/shared.rs", include_str!("shared.rs")),
+            ("src/command/mod.rs", include_str!("../../command/mod.rs")),
+        ];
+        let mut dead = Vec::new();
+        let mut arms = 0usize;
+        let mut compares = 0usize;
+        for (file, src) in sources {
+            for (len, b0, names, line) in dispatch_arms(src) {
+                arms += 1;
+                for name in names {
+                    compares += 1;
+                    let want_len = name.len();
+                    let want_b0 = name.as_bytes()[0].to_ascii_lowercase();
+                    if want_len != len || want_b0 != b0 {
+                        dead.push(format!(
+                            "{file}:{line}: `({len}, b'{}')` can never match {name:?} \
+                             ({want_len} bytes, b'{}')",
+                            b0 as char, want_b0 as char
+                        ));
+                    }
+                }
+            }
+        }
+        // Floors again: a change that made `dispatch_arms` return nothing
+        // would otherwise turn this guard into a no-op that reports success.
+        assert!(
+            arms >= 200 && compares >= 320,
+            "swept only {arms} arms / {compares} compares across both tables \
+             — the extractor is broken, not the tables"
+        );
+        assert!(
+            dead.is_empty(),
+            "dispatch arms that can never fire — the pattern and the name \
+             disagree, and nothing else in the build will tell you:\n  {}",
+            dead.join("\n  ")
+        );
+    }
+
     /// The shard-pubsub trio is excluded from the class guard on purpose, so
     /// pin what it must keep doing: answer the CHANNEL. The cluster slot
     /// router is the only consumer they reach, and it must go on hashing the

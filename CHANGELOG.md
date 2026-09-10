@@ -118,7 +118,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arguments, both of which are accidents rather than guarantees.
   `SPUBLISH`/`SSUBSCRIBE`/`SUNSUBSCRIBE` are deliberately NOT keyless despite
   `first_key == 0`: redis hashes their shard channel for cluster slot routing,
-  and in moon the cluster slot router is the only caller they reach.
+  and in moon the cluster slot router is the only caller they reach —
+  keyless-for-ACL is not keyless-for-slots.
+
+  **A second class, from the same defect.** `BGREWRITEAOF`'s arm was not merely
+  missing, it was *dead*: `(13, b'b')` for a twelve-byte name. These dispatch
+  tables hand-write the length and first byte beside the name literal, and
+  nothing checks that the two agree — a mismatch compiles clean, passes every
+  test, and yields an arm that can never fire. A new test sweeps every
+  `(len, first_byte)` arm in `server/conn/shared.rs` and `command/mod.rs`
+  (223 arms, 373 compares) and fails on any arm whose pattern cannot match the
+  name it compares. The class was otherwise clean; the test is there so it
+  stays clean.
 
 - **`--max-wal-size` now reaches the WAL overflow ceiling (moon#916).** The flag
   configured `CheckpointTrigger` but never `WalWriterV3`, whose bounds setter
