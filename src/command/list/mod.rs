@@ -903,6 +903,442 @@ mod tests {
         assert_eq!(items.len(), 3);
         assert_eq!(encoding_of_832(&mut db, b"l"), "listpack");
     }
+
+    /// The list's elements, read through the SHARED-read twin.
+    ///
+    /// `lrange` on the mutable path is `get_promoted` and would flatten the
+    /// very encoding under test on the first call, leaving every later
+    /// assertion measuring a `linkedlist` (moon#832). `now_ms = 0` is safe:
+    /// no key here carries a TTL.
+    fn ro_elements(db: &Database, key: &[u8]) -> Vec<Vec<u8>> {
+        match lrange_readonly(db, &[bs(key), bs(b"0"), bs(b"-1")], 0) {
+            Frame::Array(items) => items
+                .iter()
+                .map(|f| match f {
+                    Frame::BulkString(b) => b.to_vec(),
+                    other => panic!("expected bulk, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("LRANGE did not reply an array: {other:?}"),
+        }
+    }
+
+    // ── moon#897: LSET / LPOP / RPOP must not flatten the list they touch ──
+    //
+    // Measured on f7c83769 against a redis 8.6.1 oracle, same host, one
+    // shard: a three-element list built one `RPUSH` at a time reported
+    // `listpack`, then ONE `LSET`, `LPOP` or `RPOP` reported `linkedlist`
+    // where redis still reported `listpack`. Nothing demotes (moon#832), so
+    // the promotion is permanent — and `LPOP` is the QUEUE primitive, so a
+    // small work queue flattened on its first pop and never came back.
+    //
+    // Two mechanisms, both gone from the compact path: `get_or_create_list`
+    // (whose `ListKind::upgrade` materialises the `VecDeque` unconditionally)
+    // and, in the pops, a `db.get_list(key)` EXISTENCE probe — `get_promoted`
+    // — that flattened the list before the pop had even started.
+    //
+    // These guards are proven able to FAIL by MUTATION, not by removal:
+    // making `list_route` answer `ListRoute::Full` for a listpack (the
+    // pre-moon#897 verdict) turns every `assert_eq!(…, "listpack")` below red
+    // while the value assertions stay green — which is the point, since the
+    // values were never wrong.
+
+    #[test]
+    fn lset_keeps_a_small_listpack_list_a_listpack() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"l", &[b"a", b"b", b"c"]);
+        assert_eq!(
+            encoding_of_832(&mut db, b"l"),
+            "listpack",
+            "fixture precondition"
+        );
+
+        assert_eq!(
+            lset(&mut db, &[bs(b"l"), bs(b"1"), bs(b"B")]),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
+        assert_eq!(
+            encoding_of_832(&mut db, b"l"),
+            "listpack",
+            "moon#897: LSET flattened a 3-element listpack list; redis 8.6.1 keeps it a listpack"
+        );
+        assert_eq!(
+            lrange_readonly(&db, &[bs(b"l"), bs(b"0"), bs(b"-1")], 0),
+            Frame::Array(framevec![bs(b"a"), bs(b"B"), bs(b"c")])
+        );
+
+        // A negative index resolves the same way and is equally in-place.
+        assert_eq!(
+            lset(&mut db, &[bs(b"l"), bs(b"-1"), bs(b"C")]),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
+        assert_eq!(encoding_of_832(&mut db, b"l"), "listpack");
+        assert_eq!(
+            lrange_readonly(&db, &[bs(b"l"), bs(b"0"), bs(b"-1")], 0),
+            Frame::Array(framevec![bs(b"a"), bs(b"B"), bs(b"C")])
+        );
+    }
+
+    #[test]
+    fn lpop_and_rpop_keep_a_small_listpack_list_a_listpack() {
+        // `LPOP` is the one moon#897 names; `RPOP` is the same state writer
+        // from the other end and took the same two flattening accessors.
+        for (name, popped, rest) in [
+            ("LPOP", &b"a"[..], vec![b"b".to_vec(), b"c".to_vec()]),
+            ("RPOP", &b"c"[..], vec![b"a".to_vec(), b"b".to_vec()]),
+        ] {
+            let mut db = Database::new();
+            setup_list(&mut db, b"l", &[b"a", b"b", b"c"]);
+            assert_eq!(encoding_of_832(&mut db, b"l"), "listpack", "{name} fixture");
+
+            let got = if name == "LPOP" {
+                lpop(&mut db, &[bs(b"l")])
+            } else {
+                rpop(&mut db, &[bs(b"l")])
+            };
+            assert_eq!(
+                got,
+                Frame::BulkString(Bytes::copy_from_slice(popped)),
+                "{name} returned the wrong element"
+            );
+            assert_eq!(
+                encoding_of_832(&mut db, b"l"),
+                "listpack",
+                "moon#897: {name} flattened a 3-element listpack list; \
+                 redis 8.6.1 keeps it a listpack"
+            );
+            assert_eq!(ro_elements(&db, b"l"), rest, "{name} left the wrong list");
+        }
+    }
+
+    #[test]
+    fn lpop_with_a_count_keeps_the_listpack_and_its_reply_shape() {
+        let mut db = Database::new();
+        setup_list(&mut db, b"l", &[b"a", b"b", b"c"]);
+        assert_eq!(
+            lpop(&mut db, &[bs(b"l"), bs(b"2")]),
+            Frame::Array(framevec![bs(b"a"), bs(b"b")])
+        );
+        assert_eq!(encoding_of_832(&mut db, b"l"), "listpack");
+        assert_eq!(ro_elements(&db, b"l"), vec![b"c".to_vec()]);
+
+        // COUNT 0 is an EMPTY array on a live list and must touch nothing.
+        let mut db = Database::new();
+        setup_list(&mut db, b"l", &[b"a", b"b", b"c"]);
+        assert_eq!(
+            lpop(&mut db, &[bs(b"l"), bs(b"0")]),
+            Frame::Array(framevec![])
+        );
+        assert_eq!(encoding_of_832(&mut db, b"l"), "listpack");
+        assert_eq!(
+            ro_elements(&db, b"l"),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
+
+        // COUNT past the length drains it and deletes the key.
+        let mut db = Database::new();
+        setup_list(&mut db, b"l", &[b"a", b"b", b"c"]);
+        assert_eq!(
+            lpop(&mut db, &[bs(b"l"), bs(b"99")]),
+            Frame::Array(framevec![bs(b"a"), bs(b"b"), bs(b"c")])
+        );
+        assert_eq!(encoding_of_832(&mut db, b"l"), "<missing>");
+
+        // RPOP with a count pops from the back, in back-to-front order.
+        let mut db = Database::new();
+        setup_list(&mut db, b"l", &[b"a", b"b", b"c"]);
+        assert_eq!(
+            rpop(&mut db, &[bs(b"l"), bs(b"2")]),
+            Frame::Array(framevec![bs(b"c"), bs(b"b")])
+        );
+        assert_eq!(encoding_of_832(&mut db, b"l"), "listpack");
+    }
+
+    #[test]
+    fn list_secondary_writes_still_promote_past_the_threshold() {
+        // The fix must not disable the encoding policy it preserves. Both
+        // sides of the entry boundary, because a guard that only checks the
+        // compact side cannot tell "preserved" from "never promotes".
+        let limits = crate::storage::db::EncodingLimits::moon_defaults();
+        let n = limits.list_entries;
+        for (count, want) in [(n, "listpack"), (n + 1, "linkedlist")] {
+            for op in ["LSET", "LPOP", "RPOP"] {
+                let mut db = Database::new();
+                let owned: Vec<Vec<u8>> = (0..count)
+                    .map(|i| format!("e{i:05}").into_bytes())
+                    .collect();
+                for e in &owned {
+                    rpush(&mut db, &[bs(b"l"), bs(e)]);
+                }
+                assert_eq!(
+                    encoding_of_832(&mut db, b"l"),
+                    want,
+                    "{op} fixture at {count} elements"
+                );
+                match op {
+                    "LSET" => {
+                        lset(&mut db, &[bs(b"l"), bs(b"0"), bs(b"REPLACED")]);
+                    }
+                    "LPOP" => {
+                        lpop(&mut db, &[bs(b"l")]);
+                    }
+                    _ => {
+                        rpop(&mut db, &[bs(b"l")]);
+                    }
+                }
+                assert_eq!(
+                    encoding_of_832(&mut db, b"l"),
+                    want,
+                    "{op} changed the encoding at {count} elements"
+                );
+            }
+        }
+
+        // The element-size dimension is LSET's alone: the count is unchanged
+        // by a replacement, but the replacement element can be too long. moon's
+        // list value threshold is 64 B — the same one its own `RPUSH` gate
+        // applies — so a 64 B element stays compact and a 65 B one promotes.
+        // (redis's list has no element limit at all; moon's list policy has
+        // diverged from redis's `list-max-listpack-size -2` byte budget since
+        // long before this change, and flipping it is a separate decision.)
+        for (len, want) in [
+            (limits.set_value, "listpack"),
+            (limits.set_value + 1, "linkedlist"),
+        ] {
+            let mut db = Database::new();
+            setup_list(&mut db, b"l", &[b"a", b"b", b"c"]);
+            assert_eq!(encoding_of_832(&mut db, b"l"), "listpack", "fixture");
+            let big = vec![b'v'; len];
+            assert_eq!(
+                lset(&mut db, &[bs(b"l"), bs(b"1"), bs(&big)]),
+                Frame::SimpleString(Bytes::from_static(b"OK"))
+            );
+            assert_eq!(
+                encoding_of_832(&mut db, b"l"),
+                want,
+                "LSET of a {len} B element must leave the list a {want}"
+            );
+            // Promoted or not, the value must be there and be exact.
+            assert_eq!(
+                lindex_readonly(&db, &[bs(b"l"), bs(b"1")], 0),
+                Frame::BulkString(Bytes::copy_from_slice(&big)),
+                "LSET lost the element it wrote at {len} B"
+            );
+            assert_eq!(
+                ro_elements(&db, b"l"),
+                vec![b"a".to_vec(), big.clone(), b"c".to_vec()]
+            );
+        }
+    }
+
+    #[test]
+    fn list_secondary_writes_hold_byte_transparency() {
+        // moon#795/#903: the compact encodings are NOT byte-transparent for
+        // numeric-looking strings unless every value entering one goes through
+        // the canonical-integer rule. `+5`, `000000012345` and `-0` must
+        // survive an LPOP of an unrelated element — and must go IN through
+        // LSET and come back out unchanged.
+        let mut db = Database::new();
+        setup_list(&mut db, b"l", &[b"victim", b"+5", b"000000012345", b"-0"]);
+        assert_eq!(encoding_of_832(&mut db, b"l"), "listpack", "fixture");
+        assert_eq!(
+            lpop(&mut db, &[bs(b"l")]),
+            Frame::BulkString(Bytes::from_static(b"victim"))
+        );
+        assert_eq!(encoding_of_832(&mut db, b"l"), "listpack");
+        assert_eq!(
+            ro_elements(&db, b"l"),
+            vec![b"+5".to_vec(), b"000000012345".to_vec(), b"-0".to_vec()],
+            "an element's bytes changed across LPOP"
+        );
+
+        // LSET writes one in.
+        let mut db = Database::new();
+        setup_list(&mut db, b"l", &[b"a", b"b", b"c"]);
+        for (i, spelling) in [&b"+5"[..], &b"000000012345"[..], &b"-0"[..]]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                lset(
+                    &mut db,
+                    &[bs(b"l"), bs(i.to_string().as_bytes()), bs(spelling)]
+                ),
+                Frame::SimpleString(Bytes::from_static(b"OK"))
+            );
+        }
+        assert_eq!(encoding_of_832(&mut db, b"l"), "listpack");
+        assert_eq!(
+            ro_elements(&db, b"l"),
+            vec![b"+5".to_vec(), b"000000012345".to_vec(), b"-0".to_vec()],
+            "LSET did not write a numeric-looking element back verbatim"
+        );
+    }
+
+    #[test]
+    fn list_secondary_write_semantics_are_unchanged_by_the_routing() {
+        // Every non-encoding answer must be exactly what it was — and what
+        // redis 8.6.1 answers.
+
+        // LPOP / RPOP on a missing key: `Null` bare, `NullArray` with a count.
+        let mut db = Database::new();
+        assert_eq!(lpop(&mut db, &[bs(b"nokey")]), Frame::Null);
+        assert_eq!(lpop(&mut db, &[bs(b"nokey"), bs(b"2")]), Frame::NullArray);
+        assert_eq!(rpop(&mut db, &[bs(b"nokey")]), Frame::Null);
+        assert_eq!(rpop(&mut db, &[bs(b"nokey"), bs(b"2")]), Frame::NullArray);
+        assert_eq!(encoding_of_832(&mut db, b"nokey"), "<missing>");
+
+        // A bad count is refused BEFORE the key is looked at, so the same
+        // malformed command answers the same way whether the key exists or
+        // not (moon#527).
+        let mut db = Database::new();
+        setup_list(&mut db, b"l", &[b"a"]);
+        for key in [&b"l"[..], &b"nokey"[..]] {
+            for bad in [&b"-1"[..], &b"xyz"[..]] {
+                match lpop(&mut db, &[bs(key), bs(bad)]) {
+                    Frame::Error(e) => assert_eq!(
+                        &e[..],
+                        b"ERR value is out of range, must be positive",
+                        "LPOP {} {}",
+                        String::from_utf8_lossy(key),
+                        String::from_utf8_lossy(bad)
+                    ),
+                    other => panic!("expected the count error, got {other:?}"),
+                }
+            }
+        }
+        assert_eq!(encoding_of_832(&mut db, b"l"), "listpack");
+
+        // Emptying a list deletes its key, from either end.
+        for op in ["LPOP", "RPOP"] {
+            let mut db = Database::new();
+            setup_list(&mut db, b"l", &[b"only"]);
+            let got = if op == "LPOP" {
+                lpop(&mut db, &[bs(b"l")])
+            } else {
+                rpop(&mut db, &[bs(b"l")])
+            };
+            assert_eq!(got, Frame::BulkString(Bytes::from_static(b"only")));
+            assert_eq!(
+                encoding_of_832(&mut db, b"l"),
+                "<missing>",
+                "{op} left the key behind after emptying it"
+            );
+        }
+
+        // LSET error strings and their ORDER.
+        let mut db = Database::new();
+        setup_list(&mut db, b"l", &[b"a", b"b", b"c"]);
+        for ix in [&b"9"[..], &b"-9"[..]] {
+            match lset(&mut db, &[bs(b"l"), bs(ix), bs(b"x")]) {
+                Frame::Error(e) => assert_eq!(&e[..], b"ERR index out of range"),
+                other => panic!("expected index error, got {other:?}"),
+            }
+        }
+        match lset(&mut db, &[bs(b"l"), bs(b"abc"), bs(b"x")]) {
+            Frame::Error(e) => assert_eq!(&e[..], b"ERR value is not an integer or out of range"),
+            other => panic!("expected index-parse error, got {other:?}"),
+        }
+        assert_eq!(encoding_of_832(&mut db, b"l"), "listpack");
+
+        // WRONGTYPE, decided by the `&self` router before any mutation.
+        let mut db = Database::new();
+        crate::command::string::set(&mut db, &[bs(b"str"), bs(b"v")]);
+        for got in [
+            lpop(&mut db, &[bs(b"str")]),
+            rpop(&mut db, &[bs(b"str")]),
+            lset(&mut db, &[bs(b"str"), bs(b"0"), bs(b"x")]),
+        ] {
+            match got {
+                Frame::Error(e) => assert!(
+                    e.starts_with(b"WRONGTYPE"),
+                    "expected WRONGTYPE, got {:?}",
+                    String::from_utf8_lossy(&e)
+                ),
+                other => panic!("expected WRONGTYPE, got {other:?}"),
+            }
+        }
+    }
+
+    /// moon#830, fixed for free by the moon#897 routing.
+    ///
+    /// `LSET` used to reach for `get_or_create_list` BEFORE it could answer
+    /// "no such key", so the error came back AND an empty list was left in the
+    /// keyspace — charged, `DBSIZE`-visible, and never propagated to the AOF
+    /// or a replica (propagation is gated on the reply not being an error).
+    /// The non-creating `&self` router the encoding fix needs answers the
+    /// question without the create half.
+    ///
+    /// This assertion is red on the pre-fix tree, and is what makes the #830
+    /// claim in the PR body checkable rather than asserted.
+    #[test]
+    fn lset_on_a_missing_key_does_not_create_it() {
+        let mut db = Database::new();
+        match lset(&mut db, &[bs(b"ghost"), bs(b"0"), bs(b"v")]) {
+            Frame::Error(e) => assert_eq!(&e[..], b"ERR no such key"),
+            other => panic!("expected 'ERR no such key', got {other:?}"),
+        }
+        assert_eq!(
+            encoding_of_832(&mut db, b"ghost"),
+            "<missing>",
+            "moon#830: LSET fabricated the key it had just said did not exist"
+        );
+        assert_eq!(
+            db.logical_len(),
+            0,
+            "moon#830: the fabricated key is DBSIZE-visible"
+        );
+        assert_eq!(
+            db.estimated_memory(),
+            0,
+            "moon#830: the fabricated key was charged to the ledger"
+        );
+    }
+
+    /// The post-pop upgrade check is NOT decoration — the `SREM` twin of this
+    /// argument, for the list arm. See
+    /// `srem_promotes_a_listpack_that_a_tightened_policy_no_longer_fits`.
+    ///
+    /// Mutating `pop_listpack`'s check to `let should_upgrade = false;` turns
+    /// this red and leaves every other list test green.
+    #[test]
+    fn lpop_promotes_a_listpack_that_a_tightened_policy_no_longer_fits() {
+        let loose = crate::storage::db::EncodingLimits::moon_defaults();
+        let tight = crate::storage::db::EncodingLimits {
+            list_entries: 4,
+            ..loose
+        };
+
+        let mut db = Database::new();
+        for i in 0..20u32 {
+            rpush(&mut db, &[bs(b"l"), bs(format!("e{i:03}").as_bytes())]);
+        }
+        assert_eq!(encoding_of_832(&mut db, b"l"), "listpack", "fixture");
+        db.set_encoding_limits(tight);
+        assert_eq!(
+            encoding_of_832(&mut db, b"l"),
+            "listpack",
+            "the setter must not re-encode an existing container"
+        );
+        assert_eq!(
+            lpop(&mut db, &[bs(b"l")]),
+            Frame::BulkString(Bytes::from_static(b"e000"))
+        );
+        assert_eq!(
+            encoding_of_832(&mut db, b"l"),
+            "linkedlist",
+            "LPOP left a 19-element listpack under a 4-element policy"
+        );
+        assert_eq!(ro_elements(&db, b"l").len(), 19);
+
+        // A container that DOES fit the tightened policy is left alone.
+        let mut db = Database::new();
+        db.set_encoding_limits(tight);
+        setup_list(&mut db, b"t", &[b"a", b"b", b"c"]);
+        assert_eq!(encoding_of_832(&mut db, b"t"), "listpack");
+        lpop(&mut db, &[bs(b"t")]);
+        assert_eq!(encoding_of_832(&mut db, b"t"), "listpack");
+    }
 }
 
 #[cfg(test)]

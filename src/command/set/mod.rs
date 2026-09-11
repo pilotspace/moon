@@ -710,18 +710,68 @@ mod tests {
 
     #[test]
     fn test_estimated_memory_falls_with_srem() {
+        // The claim: `SREM` credits the ledger, and a fully drained set
+        // returns it to zero.
+        //
+        // It has to be asserted PER ENCODING, because the two answer the
+        // "did memory fall?" question differently and both answers are
+        // correct. Until moon#897 this test could not see that: the first
+        // `SREM` flattened the listpack to a `hashtable` (the assertion below
+        // read `"hashtable"`), so every row measured the same path.
+        //
+        //   * `hashtable` — a member is an owned `Bytes` in the `IndexSet`;
+        //     removing it frees that allocation, so `estimated_memory` FALLS
+        //     by `set_member_cost` per member. (The index TABLE does not
+        //     shrink — `swap_remove` keeps its capacity — which is why the
+        //     table is snapshotted rather than credited per member.)
+        //   * `listpack` — every member lives inside ONE `Vec<u8>`, billed by
+        //     the jemalloc size class of its CAPACITY (moon#788/#810).
+        //     `Vec::drain` lowers the length and keeps the capacity, so the
+        //     allocator still holds those bytes and the honest ledger does
+        //     NOT fall. It must not RISE either, and it must go to zero when
+        //     the key itself is removed.
+
+        // -- hashtable: past `set-max-listpack-entries`, so removals credit --
+        let n = crate::storage::db::EncodingLimits::moon_defaults().set_entries + 1;
+        let mut db = Database::new();
+        for i in 0..n {
+            let m = format!("member-{i:03}");
+            sadd(&mut db, &[bs(b"s"), bs(m.as_bytes())]);
+        }
+        assert_eq!(encoding_of(&mut db, b"s"), "hashtable");
+        let grown = db.estimated_memory();
+        for i in 0..n - 1 {
+            let m = format!("member-{i:03}");
+            srem(&mut db, &[bs(b"s"), bs(m.as_bytes())]);
+        }
+        let drained = db.estimated_memory();
+        assert!(
+            drained < grown,
+            "estimated_memory must fall as members are removed from a hashtable: \
+             grown={grown} drained={drained}"
+        );
+        srem(
+            &mut db,
+            &[bs(b"s"), bs(format!("member-{:03}", n - 1).as_bytes())],
+        );
+        assert_eq!(
+            db.estimated_memory(),
+            0,
+            "estimated_memory must return to zero once the hashtable set is fully drained"
+        );
+
+        // -- listpack: capacity is retained, so the ledger holds flat -------
         let mut db = Database::new();
         for i in 0..50 {
             let m = format!("member-{i:03}");
             sadd(&mut db, &[bs(b"s"), bs(m.as_bytes())]);
         }
-        // moon#787: 50 string members is a listpack, and the first SREM
-        // promotes it to the IndexSet form (moon#832: every non-SADD write
-        // takes the owned accessor), whose tables cost more than the whole
-        // listpack did. Snapshot AFTER that swing; the claim under test is
-        // that removals credit the ledger, not that promotion is free.
         srem(&mut db, &[bs(b"s"), bs(b"member-000")]);
-        assert_eq!(encoding_of(&mut db, b"s"), "hashtable");
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "listpack",
+            "moon#897: SREM must not flatten a 50-member listpack set"
+        );
         let grown = db.estimated_memory();
         for i in 1..49 {
             let m = format!("member-{i:03}");
@@ -729,15 +779,17 @@ mod tests {
         }
         let drained = db.estimated_memory();
         assert!(
-            drained < grown,
-            "estimated_memory must fall as members are removed: grown={grown} drained={drained}"
+            drained <= grown,
+            "estimated_memory must never RISE as members are removed: \
+             grown={grown} drained={drained}"
         );
+        assert_eq!(encoding_of(&mut db, b"s"), "listpack");
 
         srem(&mut db, &[bs(b"s"), bs(b"member-049")]);
         assert_eq!(
             db.estimated_memory(),
             0,
-            "estimated_memory must return to zero once the set is fully drained"
+            "estimated_memory must return to zero once the listpack set is fully drained"
         );
     }
 
@@ -1289,6 +1341,325 @@ mod tests {
             ),
             other => panic!("expected WRONGTYPE error, got {other:?}"),
         }
+    }
+
+    // ── moon#897: SREM must not flatten the container it removes from ────
+    //
+    // Measured on f7c83769 against a redis 8.6.1 oracle, same host, one
+    // shard: a three-member set built one `SADD` at a time reported
+    // `listpack` (or `intset`), then ONE `SREM` of one member reported
+    // `hashtable` where redis still reported `listpack`/`intset`. Nothing
+    // demotes (moon#832), so that promotion is permanent for the key's
+    // lifetime — the memory difference the compact encodings exist for is
+    // lost on the first update of a session set.
+    //
+    // The mechanism was `get_or_create_set`, whose `SetKind::upgrade`
+    // materialises the full `IndexSet` unconditionally, exactly as
+    // `get_promoted` did on the READ path before moon#853.
+    //
+    // These guards are proven able to FAIL by MUTATION, not by removal:
+    // pointing `srem`'s router at the eager arm (making `set_route` answer
+    // `SetRoute::Full`) turns every `assert_eq!(…, "listpack"/"intset")`
+    // below red while the reply assertions stay green — which is the whole
+    // point, since the replies were never wrong.
+
+    #[test]
+    fn srem_keeps_a_small_listpack_set_a_listpack() {
+        let mut db = Database::new();
+        setup_set(&mut db, b"s", &[&b"alpha"[..], b"beta", b"gamma"]);
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "listpack",
+            "fixture precondition"
+        );
+
+        assert_eq!(srem(&mut db, &[bs(b"s"), bs(b"beta")]), Frame::Integer(1));
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "listpack",
+            "moon#897: SREM flattened a 3-member listpack set; redis 8.6.1 keeps it a listpack"
+        );
+        assert_eq!(
+            ro_members_sorted(&db, b"s"),
+            vec![b"alpha".to_vec(), b"gamma".to_vec()]
+        );
+        // A member that was not there costs nothing and changes nothing.
+        assert_eq!(srem(&mut db, &[bs(b"s"), bs(b"absent")]), Frame::Integer(0));
+        assert_eq!(encoding_of(&mut db, b"s"), "listpack");
+    }
+
+    #[test]
+    fn srem_keeps_a_small_intset_an_intset() {
+        // The intset source is a DIFFERENT code path from the listpack one
+        // (`get_or_create_intset` vs `get_or_create_set_listpack`), and moon
+        // got BOTH wrong. Redis answers `intset` here.
+        let mut db = Database::new();
+        setup_set(&mut db, b"s", &[b"1", b"2", b"3"]);
+        assert_eq!(encoding_of(&mut db, b"s"), "intset", "fixture precondition");
+
+        assert_eq!(srem(&mut db, &[bs(b"s"), bs(b"2")]), Frame::Integer(1));
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "intset",
+            "moon#897: SREM flattened a 3-member intset; redis 8.6.1 keeps it an intset"
+        );
+        assert_eq!(
+            ro_members_sorted(&db, b"s"),
+            vec![b"1".to_vec(), b"3".to_vec()]
+        );
+
+        // A non-canonical spelling is not a member of an intset — the same
+        // verdict redis's `string2ll` gate reaches — and it must not be an
+        // excuse to leave the compact form either.
+        assert_eq!(srem(&mut db, &[bs(b"s"), bs(b"+1")]), Frame::Integer(0));
+        assert_eq!(srem(&mut db, &[bs(b"s"), bs(b"abc")]), Frame::Integer(0));
+        assert_eq!(encoding_of(&mut db, b"s"), "intset");
+        assert_eq!(scard(&mut db, &[bs(b"s")]), Frame::Integer(2));
+    }
+
+    #[test]
+    fn srem_still_promotes_a_container_that_legitimately_exceeds_the_threshold() {
+        // The fix must not disable the encoding policy it preserves. A set
+        // built past `set-max-listpack-entries` is a hashtable BEFORE the
+        // SREM and must still be one after it — and one past
+        // `set-max-listpack-value` likewise. Both sides of both boundaries,
+        // because a guard that only checks the compact side cannot tell
+        // "preserved" from "never promotes".
+        let limits = crate::storage::db::EncodingLimits::moon_defaults();
+        let n = limits.set_entries;
+        for (count, want) in [(n, "listpack"), (n + 1, "hashtable")] {
+            let mut db = Database::new();
+            let owned: Vec<Vec<u8>> = (0..count)
+                .map(|i| format!("m{i:05}").into_bytes())
+                .collect();
+            for m in &owned {
+                sadd(&mut db, &[bs(b"s"), bs(m)]);
+            }
+            assert_eq!(
+                encoding_of(&mut db, b"s"),
+                want,
+                "fixture at {count} members"
+            );
+            assert_eq!(srem(&mut db, &[bs(b"s"), bs(&owned[0])]), Frame::Integer(1));
+            assert_eq!(
+                encoding_of(&mut db, b"s"),
+                want,
+                "SREM changed the encoding at {count} members"
+            );
+            assert_eq!(
+                scard(&mut db, &[bs(b"s")]),
+                Frame::Integer(count as i64 - 1)
+            );
+        }
+
+        // The intset ceiling, both sides.
+        for (count, want) in [
+            (limits.set_intset, "intset"),
+            (limits.set_intset + 1, "hashtable"),
+        ] {
+            let mut db = Database::new();
+            for i in 0..count {
+                sadd(&mut db, &[bs(b"s"), bs(i.to_string().as_bytes())]);
+            }
+            assert_eq!(
+                encoding_of(&mut db, b"s"),
+                want,
+                "intset fixture at {count}"
+            );
+            assert_eq!(srem(&mut db, &[bs(b"s"), bs(b"0")]), Frame::Integer(1));
+            assert_eq!(
+                encoding_of(&mut db, b"s"),
+                want,
+                "SREM changed the encoding at {count} integer members"
+            );
+        }
+
+        // An oversized member has no listpack form at all: the set is a
+        // hashtable from the SADD that carried it, and SREM of an unrelated
+        // member leaves it one.
+        let mut db = Database::new();
+        let big = vec![b'x'; limits.set_value + 1];
+        setup_set(&mut db, b"s", &[b"small"]);
+        sadd(&mut db, &[bs(b"s"), bs(&big)]);
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "hashtable",
+            "fixture precondition"
+        );
+        assert_eq!(srem(&mut db, &[bs(b"s"), bs(b"small")]), Frame::Integer(1));
+        assert_eq!(encoding_of(&mut db, b"s"), "hashtable");
+    }
+
+    #[test]
+    fn srem_holds_byte_transparency_for_numeric_looking_members() {
+        // moon#795/#903: the compact encodings are NOT byte-transparent for
+        // numeric-looking strings unless every value entering one went
+        // through `numeric::canonical_i64`. `+5`, `000000012345` and `-0`
+        // must come back out of a listpack with their bytes intact after a
+        // SREM of an unrelated member — this regression class was found and
+        // fixed twice in one day, so it gets its own guard.
+        let mut db = Database::new();
+        setup_set(
+            &mut db,
+            b"s",
+            &[&b"+5"[..], b"000000012345", b"-0", b"victim"],
+        );
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "listpack",
+            "fixture precondition"
+        );
+
+        assert_eq!(srem(&mut db, &[bs(b"s"), bs(b"victim")]), Frame::Integer(1));
+        assert_eq!(encoding_of(&mut db, b"s"), "listpack");
+        assert_eq!(
+            ro_members_sorted(&db, b"s"),
+            vec![b"+5".to_vec(), b"-0".to_vec(), b"000000012345".to_vec()],
+            "a member's bytes changed across SREM"
+        );
+        // And the canonical spellings are still NOT members, so nothing was
+        // silently re-parsed on the way through.
+        for canonical in [&b"5"[..], &b"12345"[..], &b"0"[..]] {
+            assert_eq!(
+                sismember_readonly(&db, &[bs(b"s"), bs(canonical)], 0),
+                Frame::Integer(0),
+                "{} answered as a member",
+                String::from_utf8_lossy(canonical)
+            );
+        }
+    }
+
+    #[test]
+    fn srem_deletes_the_key_when_the_last_member_goes_from_either_compact_form() {
+        // Delete-when-empty is the semantics half of the fix: the in-place
+        // arms own the cleanup that `get_or_create_set` + `get_set` used to
+        // do, and `get_set` is `get_promoted` — so the emptiness PROBE was
+        // itself a flattener (moon#832).
+        for members in [&[&b"only"[..]][..], &[&b"7"[..]][..]] {
+            let mut db = Database::new();
+            setup_set(&mut db, b"s", members);
+            assert_eq!(
+                srem(&mut db, &[bs(b"s"), bs(members[0])]),
+                Frame::Integer(1)
+            );
+            assert_eq!(
+                encoding_of(&mut db, b"s"),
+                "<missing>",
+                "the key survived an SREM that emptied it"
+            );
+        }
+    }
+
+    #[test]
+    fn srem_semantics_are_unchanged_by_the_routing() {
+        // The routing must be invisible to every non-encoding answer: the
+        // integer reply, the missing-key answer, WRONGTYPE, and arity.
+        let mut db = Database::new();
+        assert_eq!(srem(&mut db, &[bs(b"nokey"), bs(b"m")]), Frame::Integer(0));
+        assert_eq!(
+            encoding_of(&mut db, b"nokey"),
+            "<missing>",
+            "SREM left a key behind for a set that never existed"
+        );
+
+        setup_set(&mut db, b"s", &[b"a", b"b", b"c", b"d", b"e"]);
+        assert_eq!(
+            srem(
+                &mut db,
+                &[bs(b"s"), bs(b"a"), bs(b"c"), bs(b"zzz"), bs(b"e")]
+            ),
+            Frame::Integer(3),
+            "multi-member SREM must count only the members that were present"
+        );
+        assert_eq!(encoding_of(&mut db, b"s"), "listpack");
+
+        // Duplicate members in one call count once, as in redis.
+        let mut db = Database::new();
+        setup_set(&mut db, b"s", &[b"a", b"b"]);
+        assert_eq!(
+            srem(&mut db, &[bs(b"s"), bs(b"a"), bs(b"a")]),
+            Frame::Integer(1)
+        );
+
+        // WRONGTYPE, decided by the `&self` router before any mutation.
+        let mut db = Database::new();
+        crate::command::string::set(&mut db, &[bs(b"str"), bs(b"v")]);
+        match srem(&mut db, &[bs(b"str"), bs(b"m")]) {
+            Frame::Error(e) => assert!(
+                e.starts_with(b"WRONGTYPE"),
+                "expected WRONGTYPE, got {:?}",
+                String::from_utf8_lossy(&e)
+            ),
+            other => panic!("expected WRONGTYPE error, got {other:?}"),
+        }
+
+        // Arity.
+        let mut db = Database::new();
+        match srem(&mut db, &[bs(b"s")]) {
+            Frame::Error(e) => assert!(e.starts_with(b"ERR wrong number of arguments")),
+            other => panic!("expected arity error, got {other:?}"),
+        }
+    }
+
+    /// The post-removal upgrade check is NOT decoration.
+    ///
+    /// A removal only shrinks, so a listpack `SADD` produced can never be over
+    /// the policy when `SREM` runs — which would make
+    /// `!limits.listpack_fits(..)` unreachable, and an unreachable guard is a
+    /// guard nobody can prove. `Database::set_encoding_limits` makes it
+    /// reachable, and its own doc comment says why the case is real: "Applies
+    /// to writes from this point on; an existing container is not re-encoded."
+    /// So a container built under a loose policy and then written under a
+    /// tightened one is exactly the state this check exists to converge.
+    ///
+    /// Mutating the check to `let should_upgrade = false;` turns this red and
+    /// leaves every other SREM test green.
+    #[test]
+    fn srem_promotes_a_listpack_that_a_tightened_policy_no_longer_fits() {
+        let mut db = Database::new();
+        let loose = crate::storage::db::EncodingLimits::moon_defaults();
+        for i in 0..20u32 {
+            sadd(&mut db, &[bs(b"s"), bs(format!("m{i:03}").as_bytes())]);
+        }
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "listpack",
+            "fixture precondition"
+        );
+
+        // Tighten the policy under the live container. It is NOT re-encoded
+        // by the setter — that is the documented contract.
+        db.set_encoding_limits(crate::storage::db::EncodingLimits {
+            set_entries: 4,
+            ..loose
+        });
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "listpack",
+            "the setter must not re-encode an existing container"
+        );
+
+        // The next write converges it, because the check consults the
+        // authority rather than assuming a shrink is always safe.
+        assert_eq!(srem(&mut db, &[bs(b"s"), bs(b"m000")]), Frame::Integer(1));
+        assert_eq!(
+            encoding_of(&mut db, b"s"),
+            "hashtable",
+            "SREM left a 19-member listpack under a 4-member policy"
+        );
+        assert_eq!(scard(&mut db, &[bs(b"s")]), Frame::Integer(19));
+
+        // And once the container genuinely fits again, nothing re-promotes:
+        // the check is a threshold test, not an unconditional upgrade.
+        let mut db = Database::new();
+        db.set_encoding_limits(crate::storage::db::EncodingLimits {
+            set_entries: 4,
+            ..loose
+        });
+        setup_set(&mut db, b"t", &[b"a", b"b", b"c"]);
+        assert_eq!(encoding_of(&mut db, b"t"), "listpack");
+        assert_eq!(srem(&mut db, &[bs(b"t"), bs(b"a")]), Frame::Integer(1));
+        assert_eq!(encoding_of(&mut db, b"t"), "listpack");
     }
 }
 

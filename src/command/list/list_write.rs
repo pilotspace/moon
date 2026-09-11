@@ -3,7 +3,7 @@ use bytes::Bytes;
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::storage::db::{Shape, list_elem_cost};
+use crate::storage::db::{ListRef, Shape, list_elem_cost};
 
 use super::{parse_i64, resolve_index};
 use crate::command::helpers::{all_args_are_bytes, err_wrong_args, extract_bytes};
@@ -210,14 +210,85 @@ fn parse_count_arg(args: &[Frame]) -> Result<Option<usize>, Frame> {
     }
 }
 
-/// LPOP key [count]
-pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
+// ---------------------------------------------------------------------------
+// Encoding-preserving routing for the list secondary writes (moon#897)
+// ---------------------------------------------------------------------------
+
+/// Which encoding the key holds RIGHT NOW, as answered by a `&self` probe that
+/// cannot rewrite it.
+///
+/// `Copy` and field-free on purpose: it is the whole of what a `ListRef`
+/// borrow tells the router, so the borrow of `db` ends at the `match` that
+/// produces one and the mutation below is free to take `&mut db`.
+#[derive(Clone, Copy)]
+enum ListRoute {
+    /// A live `ListListpack` — mutate it in place.
+    Listpack,
+    /// The full `VecDeque`, or a cold-spilled value: the pre-existing eager
+    /// path, byte for byte.
+    Full,
+}
+
+/// Ask what `key` holds without rewriting it. `Ok(None)` = no such (live) key.
+///
+/// `get_list_ref_if_alive` takes `&self`, so — unlike `get_or_create_list` and
+/// `get_list` (= `get_promoted`) — asking this question cannot itself flatten
+/// the compact encoding (moon#832). This matters twice over here: the old
+/// shape asked `db.get_list(key)` purely to decide "does the key exist?", so
+/// the MISS CHECK was a flattener before the pop had even started.
+fn list_route(db: &Database, key: &[u8]) -> Result<Option<ListRoute>, Frame> {
+    match db.get_list_ref_if_alive(key, db.now_ms()) {
+        Ok(None) => Ok(None),
+        Ok(Some(ListRef::Listpack(_))) => Ok(Some(ListRoute::Listpack)),
+        Ok(Some(ListRef::Deque(_) | ListRef::Owned(_))) => Ok(Some(ListRoute::Full)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Promote a `ListListpack` to the full `VecDeque` and settle the one-time
+/// cost-model swing, `after` being the listpack's last billed size.
+///
+/// Exactly the block `LPUSH`/`RPUSH` run when their push loop overflows the
+/// policy; factored out so the four sites that can now cross a threshold
+/// cannot drift apart the way the three consultation sites did in moon#896.
+fn promote_list_listpack(db: &mut Database, key: &[u8], after: usize) {
+    let list = db.upgrade_list_listpack_to_list(key);
+    let new_cost: usize = list.iter().map(|e| list_elem_cost(e)).sum();
+    db.credit_memory(after);
+    db.charge_memory(new_cost);
+}
+
+/// Remove and return one end of a listpack, without decoding anything else.
+///
+/// `get_at` walks borrowed and materialises only the entry it returns;
+/// `remove_at` discards its own without decoding it. A stored `Integer` renders
+/// through the canonical spelling it was admitted under, so the bytes handed
+/// back are the bytes the client wrote (moon#795/#903).
+#[inline]
+fn listpack_pop_end(lp: &mut crate::storage::listpack::Listpack, front: bool) -> Option<Bytes> {
+    let idx = if front { 0 } else { lp.len().checked_sub(1)? };
+    let value = lp.get_at(idx)?.to_bytes();
+    lp.remove_at(idx);
+    Some(value)
+}
+
+/// The shared body of `LPOP` and `RPOP`.
+///
+/// # Encoding (moon#897)
+///
+/// One `LPOP` of a three-element list used to report `linkedlist` where redis
+/// reports `listpack`, permanently — nothing demotes (moon#832). `LPOP` is the
+/// queue primitive, so a small work queue flattened on its first pop and never
+/// came back. Two separate sites did it: the `db.get_list(key)` existence
+/// probe, and `get_or_create_list` for the pop itself. Both are gone from the
+/// compact path.
+fn pop_generic(db: &mut Database, args: &[Frame], name: &'static str, front: bool) -> Frame {
     if args.is_empty() || args.len() > 2 {
-        return err_wrong_args("LPOP");
+        return err_wrong_args(name);
     }
     let key = match extract_bytes(&args[0]) {
         Some(k) => k,
-        None => return err_wrong_args("LPOP"),
+        None => return err_wrong_args(name),
     };
 
     // The optional count is validated BEFORE the key lookup, exactly as Redis
@@ -231,24 +302,79 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
 
-    // Check if the key exists first (for the no-list case)
-    match db.get_list(key) {
+    match list_route(db, key) {
+        Err(e) => e,
         Ok(None) => {
             // The count form's miss is a null ARRAY, not an EMPTY array: Redis
             // distinguishes "no such list" (`*-1`) from "a list that yielded
             // nothing" (`*0`). Measured, because this site was never a
             // `Frame::Null` at all and so is invisible to a null-site audit
             // (moon#482).
-            return if args.len() == 2 {
+            if args.len() == 2 {
                 Frame::NullArray
             } else {
                 Frame::Null
-            };
+            }
         }
-        Err(e) => return e,
-        Ok(Some(_)) => {}
+        Ok(Some(ListRoute::Listpack)) => pop_listpack(db, key, count, front),
+        Ok(Some(ListRoute::Full)) => pop_eager(db, key, count, front),
     }
+}
 
+/// Pop from a `ListListpack` in place, keeping the listpack.
+fn pop_listpack(db: &mut Database, key: &Bytes, count: Option<usize>, front: bool) -> Frame {
+    let limits = db.encoding_limits();
+    let lp = match db.get_or_create_list_listpack(key) {
+        Ok(Some(lp)) => lp,
+        // The probe said listpack; anything else means the value changed
+        // between the probe and here, which one shard thread cannot do. Fall
+        // back to the eager path rather than assume.
+        Ok(None) => return pop_eager(db, key, count, front),
+        Err(e) => return e,
+    };
+    // Listpack `estimate_memory()` is O(1) (capacity-based).
+    let before = lp.estimate_memory();
+    let result = match count {
+        None => match listpack_pop_end(lp, front) {
+            Some(v) => Frame::BulkString(v),
+            None => Frame::Null,
+        },
+        Some(c) => {
+            let actual = c.min(lp.len());
+            let mut items = Vec::with_capacity(actual);
+            for _ in 0..actual {
+                if let Some(v) = listpack_pop_end(lp, front) {
+                    items.push(Frame::BulkString(v));
+                }
+            }
+            Frame::Array(items.into())
+        }
+    };
+    let after = lp.estimate_memory();
+    let empty = lp.is_empty();
+    // The upgrade check, from the ONE authority (moon#896) and the same
+    // predicate the push loops use. A pop only shrinks, so this is false for
+    // every listpack a push could have produced; it fires only for one already
+    // past the policy, which is the container that belongs in the full form.
+    let should_upgrade = !limits.listpack_fits(Shape::List, lp);
+    // `lp`'s borrow of `db` ends here.
+    db.adjust_memory(before, after);
+    if empty {
+        // Whole-key removal recomputes the entry cost, so the popped elements
+        // need no separate credit.
+        db.remove(key);
+    } else if should_upgrade {
+        promote_list_listpack(db, key, after);
+    }
+    result
+}
+
+/// The pre-moon#897 path: materialise the full `VecDeque` and pop from it.
+///
+/// Reached for a list that is ALREADY a `linkedlist` and for a cold-spilled
+/// value (which `get_or_create_list` promotes back) — i.e. where there is no
+/// compact encoding to preserve, so the routing changes nothing.
+fn pop_eager(db: &mut Database, key: &Bytes, count: Option<usize>, front: bool) -> Frame {
     let list = match db.get_or_create_list(key) {
         Ok(l) => l,
         Err(e) => return e,
@@ -257,8 +383,12 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
     let mut credit: usize = 0;
     let result = match count {
         None => {
-            // Single pop
-            match list.pop_front() {
+            let popped = if front {
+                list.pop_front()
+            } else {
+                list.pop_back()
+            };
+            match popped {
                 Some(v) => {
                     credit = list_elem_cost(&v);
                     Frame::BulkString(v)
@@ -270,7 +400,12 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
             let actual = c.min(list.len());
             let mut items = Vec::with_capacity(actual);
             for _ in 0..actual {
-                if let Some(v) = list.pop_front() {
+                let popped = if front {
+                    list.pop_front()
+                } else {
+                    list.pop_back()
+                };
+                if let Some(v) = popped {
                     credit += list_elem_cost(&v);
                     items.push(Frame::BulkString(v));
                 }
@@ -281,19 +416,27 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
     // `list`'s borrow of `db` ends above.
     db.credit_memory(credit);
 
-    // If list is now empty, remove the key (this credits the container's
+    // If the list is now empty, remove the key (this credits the container's
     // fixed key/struct overhead — the popped elements were already credited
-    // above, so there is no double count).
-    if db
-        .get_list(key)
-        .ok()
-        .flatten()
-        .map_or(false, |l| l.is_empty())
-    {
+    // above, so there is no double count). The emptiness probe goes through
+    // the `&self` accessor: `get_list` is `get_promoted`, and using it here
+    // would re-flatten whatever the pop had just preserved (moon#832).
+    let now_ms = db.now_ms();
+    let empty = matches!(db.get_list_ref_if_alive(key, now_ms), Ok(Some(l)) if l.is_empty());
+    if empty {
         db.remove(key);
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// LPOP key [count]
+// ---------------------------------------------------------------------------
+
+/// LPOP key [count]
+pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
+    pop_generic(db, args, "LPOP", true)
 }
 
 // ---------------------------------------------------------------------------
@@ -301,84 +444,49 @@ pub fn lpop(db: &mut Database, args: &[Frame]) -> Frame {
 // ---------------------------------------------------------------------------
 
 /// RPOP key [count]
+///
+/// The same state writer as `LPOP` from the other end — it took the same two
+/// flattening accessors and gets the same routing. Fixing only the end named
+/// in moon#897 would have left `RPOP mylist` turning a listpack into a
+/// linkedlist.
 pub fn rpop(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.is_empty() || args.len() > 2 {
-        return err_wrong_args("RPOP");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("RPOP"),
-    };
-
-    // Count validated before the lookup — see `lpop` (moon#527).
-    let count = match parse_count_arg(args) {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
-
-    match db.get_list(key) {
-        Ok(None) => {
-            // The count form's miss is a null ARRAY, not an EMPTY array: Redis
-            // distinguishes "no such list" (`*-1`) from "a list that yielded
-            // nothing" (`*0`). Measured, because this site was never a
-            // `Frame::Null` at all and so is invisible to a null-site audit
-            // (moon#482).
-            return if args.len() == 2 {
-                Frame::NullArray
-            } else {
-                Frame::Null
-            };
-        }
-        Err(e) => return e,
-        Ok(Some(_)) => {}
-    }
-
-    let list = match db.get_or_create_list(key) {
-        Ok(l) => l,
-        Err(e) => return e,
-    };
-
-    let mut credit: usize = 0;
-    let result = match count {
-        None => match list.pop_back() {
-            Some(v) => {
-                credit = list_elem_cost(&v);
-                Frame::BulkString(v)
-            }
-            None => Frame::Null,
-        },
-        Some(c) => {
-            let actual = c.min(list.len());
-            let mut items = Vec::with_capacity(actual);
-            for _ in 0..actual {
-                if let Some(v) = list.pop_back() {
-                    credit += list_elem_cost(&v);
-                    items.push(Frame::BulkString(v));
-                }
-            }
-            Frame::Array(items.into())
-        }
-    };
-    // `list`'s borrow of `db` ends above.
-    db.credit_memory(credit);
-
-    if db
-        .get_list(key)
-        .ok()
-        .flatten()
-        .map_or(false, |l| l.is_empty())
-    {
-        db.remove(key);
-    }
-
-    result
+    pop_generic(db, args, "RPOP", false)
 }
-
 // ---------------------------------------------------------------------------
 // LSET key index element
 // ---------------------------------------------------------------------------
 
+const ERR_NO_SUCH_KEY: &[u8] = b"ERR no such key";
+const ERR_INDEX_OUT_OF_RANGE: &[u8] = b"ERR index out of range";
+
 /// LSET key index element
+///
+/// # Encoding (moon#897)
+///
+/// One `LSET` of a three-element list used to report `linkedlist` where redis
+/// reports `listpack`, permanently — nothing demotes (moon#832). The mechanism
+/// was `get_or_create_list`, whose `ListKind::upgrade` materialises the full
+/// `VecDeque` unconditionally.
+///
+/// `LSET` is the one list secondary write that can legitimately cross a
+/// threshold: the count is unchanged, but the REPLACEMENT element may be
+/// longer than the value limit. That decision goes to the ONE authority
+/// (moon#896) rather than to a constant here. A 65-byte element therefore
+/// still promotes — matching what moon's own `RPUSH` gate would have done with
+/// it, and diverging from redis only because moon's list policy is a 64-byte
+/// element limit where `list-max-listpack-size -2` is an 8 KB node budget.
+/// That policy gap is pre-existing and out of scope for this change; keeping
+/// `LSET` consistent with `RPUSH` is what stops a listpack from holding an
+/// element the restart-side re-derivation would refuse.
+///
+/// # moon#830
+///
+/// This function used to call `get_or_create_list` BEFORE it could answer
+/// "no such key", so `LSET missing 0 v` replied `ERR no such key` and left a
+/// charged, `DBSIZE`-visible, never-propagated empty list behind. The
+/// non-creating `&self` router the encoding fix needs answers that question
+/// without the create half, so the key is no longer fabricated. Verified
+/// against redis 8.6.1: `EXISTS`, `TYPE` and `DBSIZE` now all match.
 pub fn lset(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 3 {
         return err_wrong_args("LSET");
@@ -400,13 +508,65 @@ pub fn lset(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("LSET"),
     };
 
+    match list_route(db, key) {
+        Err(e) => e,
+        Ok(None) => Frame::Error(Bytes::from_static(ERR_NO_SUCH_KEY)),
+        Ok(Some(ListRoute::Listpack)) => lset_listpack(db, key, index, element),
+        Ok(Some(ListRoute::Full)) => lset_eager(db, key, index, element),
+    }
+}
+
+/// `LSET` against a `ListListpack`: replace in place when the result still
+/// fits the policy, promote and fall through when it does not.
+fn lset_listpack(db: &mut Database, key: &Bytes, index: i64, element: Bytes) -> Frame {
+    let limits = db.encoding_limits();
+    let lp = match db.get_or_create_list_listpack(key) {
+        Ok(Some(lp)) => lp,
+        Ok(None) => return lset_eager(db, key, index, element),
+        Err(e) => return e,
+    };
+    if lp.is_empty() {
+        // An empty container is not reachable through the router (an emptied
+        // list is deleted with its key), but the answer redis gives for one is
+        // "no such key", not "index out of range".
+        return Frame::Error(Bytes::from_static(ERR_NO_SUCH_KEY));
+    }
+    let Some(i) = resolve_index(index, lp.len()) else {
+        return Frame::Error(Bytes::from_static(ERR_INDEX_OUT_OF_RANGE));
+    };
+    // THE consultation: does the container still fit with this element in it?
+    // The item count is unchanged by a replacement, so only `element.len()`
+    // can move the verdict — but passing the real count keeps the call honest
+    // for a container that was already over.
+    let fits = limits.fits(Shape::List, lp.len(), element.len());
+    if !fits {
+        // `lp`'s borrow of `db` ends here; promote, then take the eager path,
+        // which does the replacement and its own accounting.
+        let after = lp.estimate_memory();
+        promote_list_listpack(db, key, after);
+        return lset_eager(db, key, index, element);
+    }
+    // Listpack `estimate_memory()` is O(1) (capacity-based). `replace_at`
+    // discards the old entry without decoding it, and encodes the new one
+    // under the canonical-integer rule, so a numeric-looking element goes in
+    // and comes back out with its exact bytes (moon#795/#903).
+    let before = lp.estimate_memory();
+    lp.replace_at(i, &element);
+    let after = lp.estimate_memory();
+    // `lp`'s borrow of `db` ends here.
+    db.adjust_memory(before, after);
+    Frame::SimpleString(Bytes::from_static(b"OK"))
+}
+
+/// The pre-moon#897 path: materialise the full `VecDeque` and index into it.
+fn lset_eager(db: &mut Database, key: &Bytes, index: i64, element: Bytes) -> Frame {
     let list = match db.get_or_create_list(key) {
         Ok(l) => l,
         Err(e) => return e,
     };
 
     if list.is_empty() {
-        return Frame::Error(Bytes::from_static(b"ERR no such key"));
+        return Frame::Error(Bytes::from_static(ERR_NO_SUCH_KEY));
     }
 
     match resolve_index(index, list.len()) {
@@ -423,7 +583,7 @@ pub fn lset(db: &mut Database, args: &[Frame]) -> Frame {
             }
             Frame::SimpleString(Bytes::from_static(b"OK"))
         }
-        None => Frame::Error(Bytes::from_static(b"ERR index out of range")),
+        None => Frame::Error(Bytes::from_static(ERR_INDEX_OUT_OF_RANGE)),
     }
 }
 
