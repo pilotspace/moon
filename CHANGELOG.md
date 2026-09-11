@@ -49,6 +49,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `scripts/bench-path-tax.sh` + `scripts/bench-path-tax-report.py` — measure what
+  moon's **generic** command path costs over its **inline** path for identical
+  handler work. `can_inline_reads` is gated on `acl_skip_allowed()`, so a
+  non-`unrestricted` ACL user runs the same `GET` handler through the full
+  generic preamble: same command, same data, same session, only the path differs.
+  Measured on ARM: inline `C` 0.613 µs/op vs generic `C` 1.516 — a **0.904 µs/op
+  path tax**, 2.48x, clearing the worst within-leg CV by 30x. That exceeds the
+  cut every one of INCR/SADD/LPUSH/HSET needs to reach parity with Redis at p=64,
+  which makes the dispatch path — not the datatypes — the thing to fix
+  (moon#799). Upper bound: the generic leg also pays the ACL check. The harness
+  fails closed unless `moon_dispatch_path_total{path="local_inline"}` advances on
+  every inline leg and stays exactly frozen on every generic one, because the
+  first run of this experiment produced empty generic legs (`redis-benchmark`
+  takes `-a`, not `--pass`) while a frozen counter appeared to confirm the path.
 - `scripts/bench-ab-delta.py` — compares moon against **moon** across two
   matrix runs, which `bench-ab-report.py` cannot do. Redis is the control: the
   tool picks the raw or the ratio column per row from the control's own
