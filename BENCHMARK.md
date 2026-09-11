@@ -131,6 +131,40 @@ to repeat.
 - **SPOP is the least-bad container family** (0.75x / 0.87x at p=64) — small
   reply, no member-position bookkeeping.
 
+### Update 2026-09-10 — two of these rows have since moved
+
+The table above is the `ae6cd003` record and is left as measured. A re-run on
+2026-09-10 (moon `c095f86d`, same two host classes, same Redis 7.0.15, same
+harness, n=5) found two families materially changed. That run is on kernel
+`7.0.0-1011-gcp`, not the 6.17 above, and moon's absolute GET p=64 came in at
+1.31 M/s against the 1.53 M here — so `ae6cd003` was **rebuilt and re-run on the
+same machines** rather than compared across dates. It reproduces the ARM ratios
+above within 0.02-0.04 on six of eight families.
+
+ARM is the leg to read: Redis drifted <1% between the two ARM runs, so raw and
+ratio agree. On x86 Redis fell 3.7-9.5% across the session, so only x86 ratios
+are quoted.
+
+| command | ARM p=64 ratio | moon raw ARM p=64 | x86 p=64 ratio |
+|---|:---:|:---:|:---:|
+| **ZADD** | 0.49x -> **0.68x** | **+38.0%** | 0.47x -> **0.72x** |
+| **SADD** | 0.72x -> 0.63x | **-13.9%** | 0.76x -> 0.69x |
+| SPOP | 0.86x -> 0.78x | -8.3% | 0.75x -> 0.67x |
+| INCR / LPUSH / HSET | within 0.03x | -3.0 to -4.8% | within 0.03x |
+
+**Two claims above no longer hold.** ZADD is no longer the worst family, and it
+is no longer the only family losing at p=1 on both arches — **HSET is now the
+worst** (0.587x ARM / 0.599x x86 at p=64). ZADD's gain bisects cleanly to the
+window opening with #878 (*ZADD reaches its listpack encoding*): flat across the
+two earlier windows, +44.7% in the last.
+
+The SADD/SPOP loss does **not** bisect to one commit — it is spread across three
+windows. The obvious suspect, #877 (*SADD reaches its listpack encoding*), was
+isolated against its own parent and costs SADD 2.7% (at its noise floor) and
+SPOP 3.8%; it is a minor contributor, not the cause. Tracked as
+[#923](https://github.com/pilotspace/moon/issues/923). Raw CSVs for all six runs
+are in [`docs/internal/bench-data/2026-09-10/`](docs/internal/bench-data/2026-09-10/).
+
 
 ### Change since v0.8.7 — the write-path regression is reversed
 
