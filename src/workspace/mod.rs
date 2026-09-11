@@ -280,8 +280,14 @@ fn scan_scoped(args: &[Frame], ws_id: &WorkspaceId) -> Vec<Frame> {
 ///     were not, so the single-key default scoped THEIR channel — sharded
 ///     pub/sub was workspace-isolated and ordinary pub/sub was not. A channel is
 ///     not a key, the shared walker names none, and all six are now global.
-///   * **`MQ` queue names** — `MQ` was in the old no-key list, so these were
-///     never scoped and still are not.
+///   * **`MQ` queue names** — not scoped *here*. `MQ` was in the old no-key
+///     list and the shared walker also answered "no key" until moon#927, so
+///     this layer never touched them; the MQ handler and `shard::mq_exec` call
+///     `workspace_key` on the queue name themselves, which is what actually
+///     scopes an MQ queue to its workspace. Now that the walker DOES report
+///     the queue position (it is a real keyspace key, and ACL was blind to it),
+///     the arm below has to say so explicitly — otherwise the name would be
+///     prefixed twice.
 ///   * **`FUNCTION` libraries** — the old default prefixed `args[0]`, the
 ///     SUBCOMMAND, so `FUNCTION` did not work inside a workspace at all. It
 ///     works now, and its libraries are server-wide.
@@ -313,6 +319,29 @@ pub fn workspace_rewrite_args(
             return Ok(args.to_vec());
         }
         return Ok(prefix_at(args, &[0], ws_id));
+    }
+
+    // --- MQ: scoped by the HANDLER, not here (moon#927) ---
+    //
+    // `MQ`'s queue name became a reported key position in moon#927 — it is a
+    // real keyspace key, and `first_key: 0` was hiding it from ACL. This layer
+    // must not act on that, because MQ scopes itself: `try_handle_mq_command`
+    // calls `workspace_key(conn.workspace_id, &queue_key)`, and `shard::mq_exec`
+    // prepends the same prefix to the name it reads out of the ORIGINAL wire
+    // frame, which the handler forwards unrewritten.
+    //
+    // Stated precisely, because it was measured rather than assumed: deleting
+    // this arm does NOT currently break MQ inside a workspace. The doubly
+    // prefixed name would only ever reach `key_to_shard`, and `{<ws hex>}` is a
+    // hash TAG, so `{ws}:{ws}:q` and `{ws}:q` route to the same shard anyway
+    // (verified at `--shards 1` and `--shards 4`: six queues created, pushed
+    // and popped, all stored under one prefix). What the arm buys is that the
+    // argv the handler VALIDATES and the frame it EXECUTES stay the same
+    // string, instead of silently differing by 35 bytes on every
+    // workspace-bound `MQ` call — a divergence nothing downstream is written to
+    // expect.
+    if cmd.eq_ignore_ascii_case(b"MQ") {
+        return Ok(args.to_vec());
     }
 
     // --- keyspace globs (policy, not keyspace keys) ---
@@ -594,6 +623,35 @@ mod tests {
         match f {
             Frame::BulkString(b) => b,
             _ => panic!("expected BulkString"),
+        }
+    }
+
+    /// moon#927: `MQ` scopes its own queue name, so this layer must leave the
+    /// argv alone even though the shared walker now reports `args[1]` as a key.
+    ///
+    /// Without the passthrough arm the queue name is prefixed here AND again in
+    /// `try_handle_mq_command`, so the argv the handler validates stops being
+    /// the frame it executes. See the arm's comment for what that does and does
+    /// not currently break.
+    #[test]
+    fn test_rewrite_args_mq_passes_through() {
+        let ws = WorkspaceId::from_bytes([0u8; 16]);
+        for parts in [
+            &[b"CREATE".as_ref(), b"q1"][..],
+            &[b"PUSH".as_ref(), b"q1", b"f", b"v"][..],
+            &[b"POP".as_ref(), b"q1"][..],
+            &[b"DLQLEN".as_ref(), b"q1"][..],
+        ] {
+            let args: Vec<Frame> = parts.iter().map(|p| bs(p)).collect();
+            let result = expect_rewrite(b"MQ", &args, &ws);
+            assert_eq!(result.len(), args.len());
+            for (i, part) in parts.iter().enumerate() {
+                assert_eq!(
+                    extract_bs(&result[i]),
+                    *part,
+                    "MQ {parts:?} must reach the handler byte-identical; the handler prefixes"
+                );
+            }
         }
     }
 
