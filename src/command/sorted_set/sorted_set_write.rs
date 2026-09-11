@@ -383,6 +383,54 @@ pub fn zrem(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("ZREM");
     }
 
+    // Listpack path (moon#897). ZREM used to reach straight for the eager
+    // `get_or_create_sorted_set`, which upgrades on ACCESS — so one ZREM
+    // flattened a three-member zset to `skiplist`, and because nothing
+    // demotes (moon#832) it stayed that way for the key's lifetime. Redis
+    // deletes from the listpack in place and never converts on a removal;
+    // measured against redis 8.6.1, a 3-member zset is `listpack` on both
+    // sides after this branch and was `skiplist` on moon's before it.
+    //
+    // No entry gate: a removal cannot grow the container, so it cannot cross
+    // a threshold. Nor is there an upgrade check afterwards — moon, like
+    // Redis, has no demotion, and a listpack that fitted before a ZREM fits
+    // after it. The only post-condition is the empty-key delete, which is
+    // the same rule the B+tree arm below applies.
+    match db.get_or_create_zset_listpack(key) {
+        Ok(Some(lp)) => {
+            // Listpack `estimate_memory()` is O(1) (capacity-based), so a
+            // before/after snapshot is cheap — no per-member formula.
+            let before = lp.estimate_memory();
+            let mut removed = 0i64;
+            for arg in &args[1..] {
+                let Some(member) = extract_bytes(arg) else {
+                    // Unreachable: `all_args_are_bytes` above proved every
+                    // one. Kept as a real match, as the B+tree loop does.
+                    return err_wrong_args("ZREM");
+                };
+                // `remove_pair` matches on the FIELD half only — for a zset
+                // listpack that is the member, never the score — and drains
+                // both entries in one scan. `ZREM z 7` must not delete the
+                // member whose SCORE is 7.
+                if lp.remove_pair(member) {
+                    removed += 1;
+                }
+            }
+            let after = lp.estimate_memory();
+            let is_empty = lp.is_empty();
+            // `lp`'s borrow of `db` ends here.
+            db.adjust_memory(before, after);
+            if is_empty {
+                db.remove(key);
+            }
+            return Frame::Integer(removed);
+        }
+        // Already the full B+tree form (or a cold-promoted value, which never
+        // decodes compact): fall through.
+        Ok(None) => {}
+        Err(e) => return e, // WRONGTYPE
+    }
+
     let (members, scores) = match db.get_or_create_sorted_set(key) {
         Ok(pair) => pair,
         Err(e) => return e,
@@ -448,6 +496,92 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
     };
     if increment.is_nan() {
         return err("ERR value is not a valid float");
+    }
+
+    // Listpack path (moon#897). ZINCRBY is the leaderboard primitive, and
+    // before this it took the eager `get_or_create_sorted_set`: one ZINCRBY
+    // flattened a three-member zset to `skiplist` permanently (nothing
+    // demotes — moon#832). Redis increments inside the listpack and converts
+    // only when a threshold is genuinely crossed.
+    //
+    // The entry gate comes from the ONE authority (moon#896): ONE logical
+    // item, its MEMBER measured against `zset-max-listpack-value`. Only the
+    // member is measured, as in Redis and as `zadd` documents — the score is
+    // stored as its rendering, and an extreme one renders long, but that is
+    // not what the threshold governs. The CARDINALITY bound is enforced by
+    // the upgrade check after the mutation, exactly as `zadd` does it, so
+    // adding the 129th member promotes.
+    let limits = db.encoding_limits();
+    if limits.fits(Shape::SortedSet, 1, member.len()) {
+        match db.get_or_create_zset_listpack(key) {
+            Ok(Some(lp)) => {
+                let found = listpack_zset_find(lp, &member);
+                let current = found.map_or(0.0, |(_, score)| score);
+                let new_score = current + increment;
+                // moon#863's hazard, stated: a listpack stores the score as
+                // its RENDERED text, and `render_score(NaN)` writes `NaN`,
+                // which `parse_score` refuses — the score would read back as
+                // 0.0 and the member would silently change value. `increment`
+                // is already proven non-NaN above, so this is reachable only
+                // as `±inf + ∓inf`, which in turn means the member already
+                // exists (a fresh member starts at 0.0) — so falling through
+                // here never leaves a key created-and-abandoned.
+                //
+                // The fall-through hands the case to the B+tree arm below,
+                // which is byte-for-byte what EVERY ZINCRBY did before this
+                // branch existed. moon's reply there (`NaN`) diverges from
+                // redis 8.6.1, which answers
+                // `ERR resulting score is not a number (NaN)` and leaves the
+                // score untouched — a real, PRE-EXISTING divergence that this
+                // change deliberately does not alter, and that a NaN must
+                // never reach a listpack in the meantime.
+                if !new_score.is_nan() {
+                    // Listpack `estimate_memory()` is O(1) (capacity-based).
+                    let before = lp.estimate_memory();
+                    // One stack buffer; `render_score` is byte-identical to
+                    // `format_score_bytes`, so the stored text and the reply
+                    // below agree, and `render_score -> parse_score` is exact
+                    // (`storage::zset_score`), so ZSCORE recovers this f64.
+                    let mut rendered = ScoreBuf::new();
+                    render_score(new_score, &mut rendered);
+                    match found {
+                        // Pair index `i` puts the score at raw entry `2i + 1`.
+                        Some((idx, _)) => lp.replace_at(idx * 2 + 1, &rendered),
+                        None => {
+                            lp.push_back(&member);
+                            lp.push_back(&rendered);
+                        }
+                    }
+                    let after = lp.estimate_memory();
+                    // The upgrade check, from the same authority as the gate:
+                    // it converts `lp.len()` (member AND score entries) to
+                    // members itself — the moon#896 unit.
+                    let should_upgrade = !limits.listpack_fits(Shape::SortedSet, lp);
+                    // `lp`'s borrow of `db` ends here.
+                    db.adjust_memory(before, after);
+                    if should_upgrade {
+                        // Self-accounting: the accessor bills the one-time
+                        // listpack -> B+tree swing itself (moon#788/#810).
+                        db.upgrade_zset_listpack_to_bptree(key);
+                    }
+                    // Reply with the bytes we STORED, not a second rendering:
+                    // one copy out of the stack buffer instead of the
+                    // `format_score` -> `String` allocation the B+tree arm
+                    // below still pays (`src/command/` is a no-`String`
+                    // path). `render_score` is pinned byte-identical to
+                    // `format_score_bytes` by
+                    // `listpack_score_rendering_matches_zscore_rendering`, so
+                    // this is the same text either way — and it is now the
+                    // same text a later ZSCORE reads out of the listpack, by
+                    // construction rather than by two formatters agreeing.
+                    return Frame::BulkString(Bytes::copy_from_slice(&rendered));
+                }
+            }
+            // Already the full B+tree form (or a cold-promoted value, which
+            // never decodes compact): fall through.
+            Ok(None) => {}
+            Err(e) => return e, // WRONGTYPE
+        }
     }
 
     let (members, scores) = match db.get_or_create_sorted_set(key) {

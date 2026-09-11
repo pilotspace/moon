@@ -771,6 +771,76 @@ assert_both "OBJECT ENCODING zset oversized member" OBJECT ENCODING z:enc:bigval
 both ZADD z:enc:val64 1 "$(printf 'x%.0s' $(seq 1 64))"
 assert_both "OBJECT ENCODING zset 64-byte member"   OBJECT ENCODING z:enc:val64
 
+# moon#897, the SORTED-SET arm: a SECONDARY write must not flatten a small
+# zset. `ZINCRBY` and `ZREM` took the eager `get_or_create_sorted_set`, which
+# upgrades on ACCESS, so ONE of either turned a three-member `listpack` into a
+# `skiplist` — permanently, since nothing demotes (moon#832). Every row above
+# builds with `ZADD` only, which is why this was invisible: the encoding was
+# never probed AFTER a non-ZADD write.
+both ZADD z:sec:incr 1 a 2 b 3 c
+assert_both "OBJECT ENCODING zset before ZINCRBY"    OBJECT ENCODING z:sec:incr
+assert_both "ZINCRBY on a listpack zset"             ZINCRBY z:sec:incr 5 b
+assert_both "OBJECT ENCODING zset after ZINCRBY"     OBJECT ENCODING z:sec:incr
+assert_both "ZRANGE after ZINCRBY"                   ZRANGE z:sec:incr 0 -1 WITHSCORES
+# A NEW member added by ZINCRBY is an append into the same listpack.
+assert_both "ZINCRBY adds a new member"              ZINCRBY z:sec:incr 2.5 fresh
+assert_both "OBJECT ENCODING zset after new member"  OBJECT ENCODING z:sec:incr
+assert_both "ZCARD after ZINCRBY new member"         ZCARD z:sec:incr
+# ZINCRBY on a MISSING key creates it compact.
+assert_both "ZINCRBY creates a key"                  ZINCRBY z:sec:new 9 m
+assert_both "OBJECT ENCODING ZINCRBY-created zset"   OBJECT ENCODING z:sec:new
+# Scores that stress the listpack's stored RENDERING (moon#863: a listpack
+# holds the score as text, so a non-round-trippable rendering reads back wrong).
+assert_both "ZINCRBY to inf"                         ZINCRBY z:sec:new inf m
+assert_both "OBJECT ENCODING zset with inf score"    OBJECT ENCODING z:sec:new
+assert_both "ZSCORE reads inf back"                  ZSCORE z:sec:new m
+both ZADD z:sec:neg 1 a
+assert_both "ZINCRBY to -inf"                        ZINCRBY z:sec:neg -inf a
+assert_both "ZSCORE reads -inf back"                 ZSCORE z:sec:neg a
+assert_both "OBJECT ENCODING zset with -inf score"   OBJECT ENCODING z:sec:neg
+# ZREM, same shape.
+both ZADD z:sec:rem 1 a 2.5 b 3 c
+assert_both "ZREM on a listpack zset"                ZREM z:sec:rem b
+assert_both "OBJECT ENCODING zset after ZREM"        OBJECT ENCODING z:sec:rem
+assert_both "ZRANGE after ZREM"                      ZRANGE z:sec:rem 0 -1 WITHSCORES
+assert_both "ZREM an absent member"                  ZREM z:sec:rem ghost
+assert_both "OBJECT ENCODING after absent ZREM"      OBJECT ENCODING z:sec:rem
+# `remove_pair` matches the MEMBER half of each pair, never the score half:
+# `ZREM z 7` must not delete the member whose score renders as `7`.
+both ZADD z:sec:score7 7 a 8 b
+assert_both "ZREM by a score value removes nothing"  ZREM z:sec:score7 7
+assert_both "ZRANGE after score-shaped ZREM"         ZRANGE z:sec:score7 0 -1 WITHSCORES
+assert_both "OBJECT ENCODING after score-shaped ZREM" OBJECT ENCODING z:sec:score7
+# Emptying the zset deletes the key on both.
+both ZADD z:sec:drain 1 only
+assert_both "ZREM the last member"                   ZREM z:sec:drain only
+assert_both "EXISTS after draining a zset"           EXISTS z:sec:drain
+# Both sides of the entry-count boundary, reached BY the secondary write.
+both ZADD z:sec:at128 $(seq 1 128 | awk '{print $1, "m"$1}')
+assert_both "ZINCRBY an existing member at 128"      ZINCRBY z:sec:at128 1 m7
+assert_both "OBJECT ENCODING zset at 128 after incr" OBJECT ENCODING z:sec:at128
+assert_both "ZINCRBY a NEW member crossing 128"      ZINCRBY z:sec:at128 1 over
+assert_both "OBJECT ENCODING zset past 128 by incr"  OBJECT ENCODING z:sec:at128
+assert_both "ZCARD after the crossing ZINCRBY"       ZCARD z:sec:at128
+# A member longer than zset-max-listpack-value promotes through ZINCRBY too.
+both ZADD z:sec:val 1 a
+assert_both "ZINCRBY a 64-byte member"               ZINCRBY z:sec:val 1 "$(printf 'y%.0s' $(seq 1 64))"
+assert_both "OBJECT ENCODING zset 64B member incr"   OBJECT ENCODING z:sec:val
+assert_both "ZINCRBY a 65-byte member"               ZINCRBY z:sec:val 1 "$(printf 'x%.0s' $(seq 1 65))"
+assert_both "OBJECT ENCODING zset 65B member incr"   OBJECT ENCODING z:sec:val
+# A zset already past the threshold is never demoted by either command.
+both ZADD z:sec:big $(seq 1 129 | awk '{print $1, "m"$1}')
+assert_both "ZREM from a skiplist zset"              ZREM z:sec:big m1
+assert_both "OBJECT ENCODING skiplist zset after ZREM" OBJECT ENCODING z:sec:big
+# Numeric-looking MEMBERS keep their exact bytes across a secondary write
+# (moon#795): `000000012345` must not read back as `12345`, nor `+5` as `5`.
+both ZADD z:sec:ident 1 000000012345 2 +5 3 5
+assert_both "ZINCRBY a zero-padded member"           ZINCRBY z:sec:ident 10 000000012345
+assert_both "OBJECT ENCODING numeric-member zset"    OBJECT ENCODING z:sec:ident
+assert_both "ZRANGE numeric-member zset"             ZRANGE z:sec:ident 0 -1 WITHSCORES
+assert_both "ZREM +5 leaves 5"                       ZREM z:sec:ident +5
+assert_both "ZRANGE after removing +5"               ZRANGE z:sec:ident 0 -1 WITHSCORES
+
 # moon#896: ONE command carrying the whole container, at the entry-count
 # boundary. The rows above build one item per command and never exercised
 # the batch entry gate, which counted listpack ENTRIES (two per hash field or
