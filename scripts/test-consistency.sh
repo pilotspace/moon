@@ -3564,6 +3564,117 @@ else
     start_moon_with_shards "$SHARDS" || true
 fi
 
+# ===========================================================================
+# moon#925: FLUSHALL / FLUSHDB with a modifier must clear EVERY shard
+# ===========================================================================
+# `extract_primary_key`'s keyless table had no `f` arm, so both commands fell
+# through to "the routing key is args[0]". The BARE forms were right only by
+# accident of arity — an `args.is_empty()` guard returned `None` first. With a
+# modifier, `args[0]` is the literal ASYNC/SYNC, it was hashed as a key, and
+# `coordinate_flush_broadcast` (inside the `is_local` block) never ran: `+OK`
+# for a keyspace that was still mostly full, survivors readable, not tombstoned.
+#
+# Two properties this section must keep or it stops discriminating:
+#
+#  * The SHARD SWEEP. A fixed count is not enough: ASYNC passed at some counts
+#    and SYNC at others, purely because `key_to_shard(<modifier>)` happened to
+#    land on the connection's own shard. The issue reports a first probe reading
+#    12/12 green at `--shards 4`.
+#  * The BARE form as an in-run control, on the same server and the same seed.
+#    Without it, a section that seeded nothing reports six green rows.
+#
+# Runs LAST: every form here empties the keyspace on both servers.
+echo "=== moon#925: FLUSHALL/FLUSHDB reach every shard with ASYNC|SYNC ==="
+
+F925_KEYS=60
+
+# One MSET, not 60 round trips — this section already restarts the server six
+# times. moon spreads the pairs across shards by key hash exactly as 60
+# separate SETs would.
+f925_seed() {
+    local -a mset=(MSET)
+    local p i
+    for p in a m z; do
+        for i in $(seq 0 19); do
+            mset+=("f925:$p:$i" v)
+        done
+    done
+    redis-cli -t 5 -p "$PORT_REDIS" "${mset[@]}" >/dev/null 2>&1 || true
+    redis-cli -t 5 -p "$PORT_RUST"  "${mset[@]}" >/dev/null 2>&1 || true
+}
+
+f925_dbsize() {
+    redis-cli -t 5 -p "$1" DBSIZE 2>&1 | tr -d '\r' || true
+}
+
+run_flush_modifier_leg() {
+    local nshards="$1"
+    if ! start_moon_with_shards "$nshards"; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: [shards=$nshards] moon did not start -- moon#925 rows did not run"
+        return
+    fi
+
+    # Explicit argv arrays. A single string here would be word-split by bash
+    # and NOT by zsh, which sends `FLUSHALL ASYNC` as one 14-byte command name
+    # and turns every row into an "unknown command" that this section would
+    # then have to interpret.
+    local -a forms=(
+        "FLUSHALL"
+        "FLUSHALL ASYNC"
+        "FLUSHALL SYNC"
+        "FLUSHDB"
+        "FLUSHDB ASYNC"
+        "FLUSHDB SYNC"
+    )
+    local form seeded ack after_rust after_redis
+    for form in "${forms[@]}"; do
+        local -a argv=()
+        read -r -a argv <<< "$form"
+
+        f925_seed
+        seeded="$(f925_dbsize "$PORT_RUST")"
+        assert_eq "[shards=$nshards] moon#925 seeded $F925_KEYS keys before '$form'" \
+            "$F925_KEYS" "$seeded"
+
+        ack="$(redis-cli -t 5 -p "$PORT_RUST" "${argv[@]}" 2>&1 | tr -d '\r' || true)"
+        assert_eq "[shards=$nshards] moon#925 '$form' answered OK" "OK" "$ack"
+        redis-cli -t 5 -p "$PORT_REDIS" "${argv[@]}" >/dev/null 2>&1 || true
+
+        # The assertion that matters: nothing survives. Against redis as the
+        # oracle AND against the literal 0, because a redis that also answered
+        # something odd would otherwise make a divergence look like agreement.
+        after_rust="$(f925_dbsize "$PORT_RUST")"
+        after_redis="$(f925_dbsize "$PORT_REDIS")"
+        assert_eq "[shards=$nshards] moon#925 '$form' left an empty keyspace" \
+            "0" "$after_rust"
+        assert_eq "[shards=$nshards] moon#925 '$form' matches redis" \
+            "$after_redis" "$after_rust"
+
+        # Never carry survivors into the next form's seed, or its "seeded 60"
+        # row fails and masks which form was actually broken.
+        if [[ "$after_rust" != "0" ]]; then
+            local p i
+            for p in a m z; do
+                for i in $(seq 0 19); do
+                    redis-cli -t 5 -p "$PORT_RUST" DEL "f925:$p:$i" >/dev/null 2>&1 || true
+                done
+            done
+        fi
+    done
+}
+
+# 1 proves the defect is not merely a routing artefact; 2/4 and 3/5/8 split the
+# two modifiers' accidental passes between them, so no single count can be
+# green for the wrong reason.
+for f925_shards in 1 2 3 4 5 8; do
+    run_flush_modifier_leg "$f925_shards"
+done
+
+# Restore the originally-requested shard count so nothing downstream inherits
+# an 8-shard server from this section.
+start_moon_with_shards "$SHARDS" || true
+
 echo "============================================"
 echo "  Data Consistency Test Results"
 echo "============================================"

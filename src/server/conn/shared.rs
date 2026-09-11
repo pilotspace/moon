@@ -1385,39 +1385,81 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
     }
     let b0 = cmd[0] | 0x20;
 
+    // The keyless set. Every entry is `first_key == 0` in `COMMAND_META`, and
+    // membership here must NOT depend on whether the command happens to be
+    // called with arguments — that is moon#925.
+    //
+    // The `args.is_empty()` short-circuit below returns `None` before this
+    // table is ever consulted, which is why a keyless command that takes no
+    // arguments looks correct even when its arm is missing (or, in
+    // BGREWRITEAOF's case, spelled at a length it can never have). Give the
+    // same command an optional modifier — `FLUSHALL ASYNC`, `SHUTDOWN NOSAVE`,
+    // `SLOWLOG GET 10` — and the tail of this function returns that modifier
+    // as the ROUTING key. It is hashed, the command is shipped to whatever
+    // shard the literal `ASYNC` lands on, and everything the local branch was
+    // supposed to do (for FLUSHALL: `coordinate_flush_broadcast`) is skipped.
+    //
+    // `extract_primary_key_keyless_registry_commands_never_route_by_a_modifier`
+    // walks `COMMAND_META` and fails if a `first_key == 0` command is missing
+    // from this table, so a future keyless command cannot repeat moon#925 by
+    // omission.
     let is_keyless = match (len, b0) {
         (4, b'a') => cmd.eq_ignore_ascii_case(b"AUTH"),
         (4, b'e') => cmd.eq_ignore_ascii_case(b"ECHO") || cmd.eq_ignore_ascii_case(b"EXEC"),
         (4, b'i') => cmd.eq_ignore_ascii_case(b"INFO"),
-        (4, b'k') => cmd.eq_ignore_ascii_case(b"KEYS"),
+        (4, b'k') => cmd.eq_ignore_ascii_case(b"KEYS") || cmd.eq_ignore_ascii_case(b"KILL"),
         (4, b'p') => cmd.eq_ignore_ascii_case(b"PING"),
         (4, b'q') => cmd.eq_ignore_ascii_case(b"QUIT"),
+        (4, b'r') => cmd.eq_ignore_ascii_case(b"ROLE"),
         (4, b's') => cmd.eq_ignore_ascii_case(b"SCAN") || cmd.eq_ignore_ascii_case(b"SAVE"),
+        (4, b't') => cmd.eq_ignore_ascii_case(b"TIME"),
         (4, b'w') => cmd.eq_ignore_ascii_case(b"WAIT"),
         (5, b'd') => cmd.eq_ignore_ascii_case(b"DEBUG"),
         (5, b'h') => cmd.eq_ignore_ascii_case(b"HELLO"),
         (5, b'm') => cmd.eq_ignore_ascii_case(b"MULTI"),
         (5, b'p') => cmd.eq_ignore_ascii_case(b"PSYNC"),
+        (5, b'r') => cmd.eq_ignore_ascii_case(b"RESET"),
         (6, b'a') => cmd.eq_ignore_ascii_case(b"ASKING"),
         (6, b'b') => cmd.eq_ignore_ascii_case(b"BGSAVE"),
         (6, b'c') => cmd.eq_ignore_ascii_case(b"CLIENT") || cmd.eq_ignore_ascii_case(b"CONFIG"),
         (6, b'd') => cmd.eq_ignore_ascii_case(b"DBSIZE"),
+        (6, b'l') => cmd.eq_ignore_ascii_case(b"LOLWUT"),
+        // MEMORY is NOT keyless: `MEMORY USAGE <key>` has its own arm below.
+        (6, b'm') => cmd.eq_ignore_ascii_case(b"MODULE"),
+        (6, b'p') => cmd.eq_ignore_ascii_case(b"PUBSUB"),
         (6, b's') => cmd.eq_ignore_ascii_case(b"SELECT"),
+        (6, b'v') => cmd.eq_ignore_ascii_case(b"VACUUM"),
         (7, b'c') => cmd.eq_ignore_ascii_case(b"COMMAND") || cmd.eq_ignore_ascii_case(b"CLUSTER"),
         (7, b'd') => cmd.eq_ignore_ascii_case(b"DISCARD"),
+        // moon#925: `FLUSHDB ASYNC` routed by the literal "ASYNC".
+        (7, b'f') => cmd.eq_ignore_ascii_case(b"FLUSHDB"),
         (7, b'h') => cmd.eq_ignore_ascii_case(b"HOTKEYS"),
+        (7, b'm') => cmd.eq_ignore_ascii_case(b"MONITOR"),
         (7, b'p') => cmd.eq_ignore_ascii_case(b"PUBLISH"),
-        (7, b's') => cmd.eq_ignore_ascii_case(b"SLAVEOF"),
+        (7, b's') => cmd.eq_ignore_ascii_case(b"SLAVEOF") || cmd.eq_ignore_ascii_case(b"SLOWLOG"),
+        (7, b'u') => cmd.eq_ignore_ascii_case(b"UNWATCH"),
+        // moon#925: `FLUSHALL ASYNC` routed by the literal "ASYNC".
+        (8, b'f') => cmd.eq_ignore_ascii_case(b"FLUSHALL"),
         (8, b'l') => cmd.eq_ignore_ascii_case(b"LASTSAVE"),
         (8, b'r') => cmd.eq_ignore_ascii_case(b"REPLCONF") || cmd.eq_ignore_ascii_case(b"READONLY"),
+        // SPUBLISH is also (8, 's') and is deliberately NOT here: its shard
+        // CHANNEL is what the cluster slot router hashes, exactly as redis
+        // does, and it is consumed by `try_handle_publish` before shard
+        // routing ever runs. Same for SSUBSCRIBE / SUNSUBSCRIBE below.
+        (8, b's') => cmd.eq_ignore_ascii_case(b"SHUTDOWN"),
         (9, b'r') => {
-            cmd.eq_ignore_ascii_case(b"REPLICAOF") || cmd.eq_ignore_ascii_case(b"READWRITE")
+            cmd.eq_ignore_ascii_case(b"REPLICAOF")
+                || cmd.eq_ignore_ascii_case(b"READWRITE")
+                || cmd.eq_ignore_ascii_case(b"RANDOMKEY")
         }
         (9, b's') => cmd.eq_ignore_ascii_case(b"SUBSCRIBE"),
         (10, b'p') => cmd.eq_ignore_ascii_case(b"PSUBSCRIBE"),
         (11, b'u') => cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE"),
+        // BGREWRITEAOF is TWELVE bytes. The arm that named it was keyed on 13
+        // and could never fire; the command was keyless only because its
+        // arity is 1 and `args.is_empty()` caught it first.
+        (12, b'b') => cmd.eq_ignore_ascii_case(b"BGREWRITEAOF"),
         (12, b'p') => cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE"),
-        (13, b'b') => cmd.eq_ignore_ascii_case(b"BGREWRITEAOF"),
         _ => false,
     };
 
@@ -3304,6 +3346,476 @@ mod as_of_tests {
         // HOTKEYS COUNT 5 must not route by "COUNT".
         let args = vec![frame_bulk(b"COUNT"), frame_bulk(b"5")];
         assert!(extract_primary_key(b"HOTKEYS", &args).is_none());
+    }
+
+    /// moon#925: FLUSHALL and FLUSHDB are keyless REGARDLESS of arity.
+    ///
+    /// The bare forms were correct only by accident of arity: `args.is_empty()`
+    /// short-circuits before the `(len, b0)` table is consulted, and the table
+    /// had no `f` arm at all. Add a modifier and `args[0]` is the literal
+    /// `ASYNC`/`SYNC`, which the tail returned as the ROUTING key — hashed to
+    /// one shard, `is_local` went false, and `coordinate_flush_broadcast`
+    /// (which sits INSIDE the `is_local` block) never ran.
+    ///
+    /// Measured on the unfixed tree, 60 keys, pinned connection:
+    /// `FLUSHALL ASYNC` left 30/60 alive at `--shards 2`, 34/60 at 3, 44/60 at
+    /// 5; `FLUSHALL SYNC` left 43/60 at 4 and 53/60 at 8. The client got `+OK`
+    /// every time, and `GET a:0` still answered `v`.
+    ///
+    /// The bare form is asserted in the SAME test as the in-band control: a
+    /// change that made every arm return `Some` would fail here rather than
+    /// read as a pass.
+    #[test]
+    fn extract_primary_key_flush_is_keyless_with_any_modifier_moon925() {
+        for cmd in [
+            &b"FLUSHALL"[..],
+            &b"FLUSHDB"[..],
+            // Casing is not the client's problem.
+            &b"flushall"[..],
+            &b"FlushDb"[..],
+        ] {
+            let name = String::from_utf8_lossy(cmd).into_owned();
+            // Control: the bare form, correct today only by arity.
+            assert!(
+                extract_primary_key(cmd, &[]).is_none(),
+                "bare {name} must be keyless"
+            );
+            for modifier in [&b"ASYNC"[..], &b"SYNC"[..], &b"async"[..], &b"sync"[..]] {
+                let args = vec![frame_bulk(modifier)];
+                assert!(
+                    extract_primary_key(cmd, &args).is_none(),
+                    "{name} {} must be keyless — routing it by the modifier \
+                     sends the flush to one shard and answers +OK",
+                    String::from_utf8_lossy(modifier)
+                );
+            }
+            // An unrecognised modifier must earn the command's OWN error on
+            // the local shard, not a trip to whatever shard it hashes to.
+            let junk = vec![frame_bulk(b"NOTAMODIFIER")];
+            assert!(
+                extract_primary_key(cmd, &junk).is_none(),
+                "{name} NOTAMODIFIER must be keyless"
+            );
+        }
+    }
+
+    /// moon#925, the class: **any** keyless command that accepts a modifier is
+    /// exposed to the same defect, and the keyless table is a hand-maintained
+    /// duplicate of a fact `COMMAND_META` already records as `first_key == 0`.
+    ///
+    /// This walks the registry and asserts the routing decision agrees. Two
+    /// exclusions, both named rather than inferred:
+    ///
+    /// * [`is_inline_intercepted`] — EVAL/FCALL/FUNCTION/SCRIPT/SWAPDB/ACL/
+    ///   MQ/WS and the `FT.`/`GRAPH.`/`CDC.`/`TS.` families. These carry real
+    ///   keys (or a real index/graph name) and are routed by their own
+    ///   interceptors; declaring them keyless here would be wrong.
+    /// * [`COMPUTED_KEY_POSITION`] — commands whose metadata says `first_key
+    ///   0` because the key is not at a FIXED index, not because there is no
+    ///   key. Each has its own arm in `extract_primary_key` and its own test.
+    ///
+    /// A new keyless command added to `COMMAND_META` and forgotten here fails
+    /// this test instead of shipping a one-shard flush.
+    #[test]
+    fn extract_primary_key_keyless_registry_commands_never_route_by_a_modifier() {
+        /// `first_key == 0` in the registry, but the key IS present at a
+        /// position the registry cannot express (after `numkeys`, after a
+        /// subcommand, or after a `STREAMS` token).
+        const COMPUTED_KEY_POSITION: &[&str] = &[
+            "MEMORY",
+            "XINFO",
+            "XREAD",
+            "XREADGROUP",
+            "LMPOP",
+            "ZMPOP",
+            "BLMPOP",
+            "BZMPOP",
+            "SINTERCARD",
+            "ZDIFF",
+            "ZINTER",
+            "ZUNION",
+            "ZINTERCARD",
+        ];
+        /// Consumed by `try_handle_temporal_*` / `try_handle_txn_*`, which run
+        /// before shard routing, so neither reaches the decision this test
+        /// guards. Excluded on that basis alone — **not** because their
+        /// `args[0]` would be a sane routing key:
+        ///
+        /// * `TEMPORAL.INVALIDATE <entity_id> <NODE|EDGE> <graph>` — `args[0]`
+        ///   is a decimal ENTITY ID and the graph name is at `args[2]`
+        ///   (`command::temporal::validate_invalidate`). Hashing `"42"` is the
+        ///   fixed-route signature of moon#511 / moon#534.
+        /// * `TXN <BEGIN|COMMIT|ABORT>` — `args[0]` is the subcommand literal.
+        /// * `TEMPORAL.SNAPSHOT_AT` takes no arguments, so `args.is_empty()`
+        ///   catches it — the same accident of arity that hid moon#925.
+        ///
+        /// None of the three is keyless-with-a-key, so none belongs in the
+        /// table above; all three are absent from `is_inline_intercepted`
+        /// despite being inline-intercepted, which is a moon#507 wait-set gap
+        /// with its own issue. Named here so the exclusion is a decision on
+        /// the record rather than a silent gap.
+        const INTERCEPTED_NOT_DECLARED: &[&str] =
+            &["TEMPORAL.INVALIDATE", "TEMPORAL.SNAPSHOT_AT", "TXN"];
+        /// Shard-pubsub. `first_key == 0` because the shard CHANNEL is not a
+        /// keyspace key — but redis hashes that channel for cluster slot
+        /// routing, and in moon the cluster slot router is the ONLY consumer
+        /// of this function that these three ever reach (`try_handle_publish`
+        /// / `try_handle_subscribe_entry` / `try_handle_unsubscribe` all run
+        /// after it and before shard routing). Declaring them keyless would
+        /// silently drop `MOVED` for shard channels, so they stay out:
+        /// keyless-for-ACL is not keyless-for-slots.
+        const SHARD_CHANNEL: &[&str] = &["SPUBLISH", "SSUBSCRIBE", "SUNSUBSCRIBE"];
+
+        // A plausible modifier for a keyless command: never a key, always
+        // key-SHAPED, which is the whole trap.
+        let args = vec![frame_bulk(b"ASYNC"), frame_bulk(b"1")];
+
+        let mut unrouted = Vec::new();
+        for (name, meta) in crate::command::metadata::COMMAND_META.entries() {
+            if meta.first_key != 0 {
+                continue;
+            }
+            if COMPUTED_KEY_POSITION.contains(name)
+                || INTERCEPTED_NOT_DECLARED.contains(name)
+                || SHARD_CHANNEL.contains(name)
+                || is_inline_intercepted(name.as_bytes())
+            {
+                continue;
+            }
+            if extract_primary_key(name.as_bytes(), &args).is_some() {
+                unrouted.push(*name);
+            }
+        }
+        unrouted.sort_unstable();
+        assert!(
+            unrouted.is_empty(),
+            "keyless by COMMAND_META (first_key == 0) but routed by args[0] \
+             — each of these hashes a modifier as if it were a key and lands \
+             on one arbitrary shard: {unrouted:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // moon#925, the OTHER class: an arm whose `(len, b0)` pattern does not
+    // match the name it compares.
+    // -----------------------------------------------------------------
+
+    /// Every `(len, first_byte)` dispatch arm in this file and in
+    /// `command/mod.rs`, scoped exactly, with the names it compares `cmd`
+    /// against.
+    ///
+    /// These tables hand-write the length and first byte BESIDE the name
+    /// literal. Nothing checks that the two agree, so a mismatch compiles
+    /// clean, passes every test, and produces an arm that can never fire.
+    /// `BGREWRITEAOF` sat at `(13, b'b')` for a TWELVE-byte name; it was
+    /// keyless only because its arity is 1 and `args.is_empty()` caught it
+    /// first. A future command in that position with an optional argument
+    /// reproduces moon#925 exactly.
+    ///
+    /// The parsing is the risky part, so it is isolated here and self-tested
+    /// by [`dead_arm_extractor_scopes_a_single_arm`] before any verdict is
+    /// trusted. Two rules earned by getting it wrong:
+    ///
+    /// * **Scope the arm exactly.** A braced arm runs to its matching `}`; a
+    ///   bare-expression arm ends at the first `,` at depth 0. Reading "to
+    ///   the next arm head" instead bleeds one arm into the next and reports
+    ///   every sibling's name as a dead arm.
+    /// * **Only compares against `cmd`.** `shared.rs`'s `COPY` arm contains
+    ///   `o.eq_ignore_ascii_case(b"DB")`, where `DB` is an argument token
+    ///   inside `COPY … DB n`, not a command name. Keyed on the binding, that
+    ///   arm reads `COPY` (4, 'c') and is correct.
+    fn dispatch_arms(src: &str) -> Vec<(usize, u8, Vec<String>, usize)> {
+        let bytes = src.as_bytes();
+        let mut out = Vec::new();
+        let mut line_start = 0usize;
+        let mut line_no = 1usize;
+        while line_start < bytes.len() {
+            let line_end = src[line_start..]
+                .find('\n')
+                .map_or(bytes.len(), |i| line_start + i);
+            let line = &src[line_start..line_end];
+            if let Some((len, b0, arrow_at)) = parse_arm_head(line) {
+                let body = arm_body(src, line_start + arrow_at);
+                out.push((len, b0, cmd_compares(&body), line_no));
+            }
+            line_start = line_end + 1;
+            line_no += 1;
+        }
+        out
+    }
+
+    /// `    (12, b'b') => ` -> `(12, b'b', <offset just past the `=>`>)`.
+    fn parse_arm_head(line: &str) -> Option<(usize, u8, usize)> {
+        let t = line.trim_start();
+        let indent = line.len() - t.len();
+        let rest = t.strip_prefix('(')?;
+        let (num, rest) = rest.split_once(", b'")?;
+        let len: usize = num.trim().parse().ok()?;
+        let b0 = *rest.as_bytes().first()?;
+        let rest = rest.get(1..)?.strip_prefix("') =>")?;
+        let arrow_at = indent + (t.len() - rest.len());
+        Some((len, b0, arrow_at))
+    }
+
+    /// The arm body starting just past `=>`: to the matching `}` for a braced
+    /// arm, otherwise to the first `,` at bracket depth 0. Skips string, byte
+    /// string, char and comment content so a `,` or brace inside one cannot
+    /// end the arm early.
+    fn arm_body(src: &str, from: usize) -> String {
+        let b = src.as_bytes();
+        let mut i = from;
+        while i < b.len() && (b[i] as char).is_whitespace() {
+            i += 1;
+        }
+        let braced = i < b.len() && b[i] == b'{';
+        let start = i;
+        let mut depth = 0i32;
+        while i < b.len() {
+            match b[i] {
+                b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                    i += 2;
+                    while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(b.len());
+                    continue;
+                }
+                b'"' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                // `b'x'` / `'x'`. A lifetime (`'a`) has no closing quote two
+                // bytes on, so leave it to the normal scan rather than
+                // swallowing the rest of the arm.
+                b'\'' if i + 2 < b.len() && b[i + 2] == b'\'' => i += 2,
+                b'\'' if i + 3 < b.len() && b[i + 1] == b'\\' && b[i + 3] == b'\'' => i += 3,
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => {
+                    depth -= 1;
+                    if braced && depth == 0 {
+                        return src[start..=i].to_string();
+                    }
+                    if depth < 0 {
+                        // The `}` that closes the whole match block.
+                        return src[start..i].to_string();
+                    }
+                }
+                b',' if depth == 0 && !braced => return src[start..i].to_string(),
+                _ => {}
+            }
+            i += 1;
+        }
+        src[start..].to_string()
+    }
+
+    /// Names this body compares `cmd` against, in order. Line comments are
+    /// stripped first: a comment naming another command must not be read as a
+    /// compare.
+    fn cmd_compares(body: &str) -> Vec<String> {
+        const PAT: &str = "cmd.eq_ignore_ascii_case(b\"";
+        let mut names = Vec::new();
+        for line in body.lines() {
+            let code = line.split_once("//").map_or(line, |(c, _)| c);
+            let mut rest = code;
+            while let Some(at) = rest.find(PAT) {
+                rest = &rest[at + PAT.len()..];
+                match rest.find('"') {
+                    Some(end) => {
+                        names.push(rest[..end].to_string());
+                        rest = &rest[end..];
+                    }
+                    None => break,
+                }
+            }
+        }
+        names
+    }
+
+    /// The extractor is the risky half of the guard below, so prove it on
+    /// arms whose exact shape is known before trusting any verdict it gives.
+    /// The failure this pins is the one that actually happened: an extractor
+    /// that runs an arm to the NEXT arm head reports 30-plus phantom dead
+    /// arms, every one of them a sibling's name.
+    #[test]
+    fn dead_arm_extractor_scopes_a_single_arm() {
+        let this = include_str!("shared.rs");
+        let arms = dispatch_arms(this);
+
+        // 1. A bare-expression arm stops at its own comma. BGREWRITEAOF's
+        //    neighbours in the keyless table are PUNSUBSCRIBE (12, 'p') and
+        //    UNSUBSCRIBE (11, 'u'); neither may appear in its body.
+        let bg = arms
+            .iter()
+            .find(|(_, _, names, _)| names.iter().any(|n| n == "BGREWRITEAOF"))
+            .expect("the BGREWRITEAOF arm must be found at all");
+        assert_eq!(
+            bg.2,
+            vec!["BGREWRITEAOF".to_string()],
+            "the BGREWRITEAOF arm bled into a sibling: {:?}",
+            bg.2
+        );
+
+        // 2. A braced arm stops at its matching brace, and an argument-token
+        //    compare is not mistaken for a command name. `COPY … DB n`:
+        //    `DB` is compared against `o`, not `cmd`.
+        let copy = arms
+            .iter()
+            .find(|(_, _, names, _)| names.iter().any(|n| n == "COPY"))
+            .expect("the COPY arm must be found at all");
+        assert!(
+            !copy.2.iter().any(|n| n == "DB"),
+            "`DB` is an argument token in `COPY … DB n`, not a command: {:?}",
+            copy.2
+        );
+
+        // 3. A multi-name arm keeps every name it really has.
+        let scan = arms
+            .iter()
+            .find(|(_, _, names, _)| names.iter().any(|n| n == "SCAN"))
+            .expect("the SCAN arm must be found at all");
+        assert!(
+            scan.2.iter().any(|n| n == "SAVE"),
+            "the (4, 's') arm compares SCAN and SAVE; got {:?}",
+            scan.2
+        );
+
+        // 4. Floors, so a gutted extractor that finds nothing cannot pass the
+        //    guard below by vacuity. Deliberately well under the current
+        //    counts (71 arms / 87 compares in this file) so that adding a
+        //    command does not have to touch this test.
+        let compares: usize = arms.iter().map(|a| a.2.len()).sum();
+        assert!(
+            arms.len() >= 60 && compares >= 75,
+            "extractor found only {} arms / {compares} compares in shared.rs \
+             — it is broken, and any verdict it gives is meaningless",
+            arms.len()
+        );
+    }
+
+    /// moon#925's second class: **no dispatch arm may name a command its own
+    /// `(len, first_byte)` pattern can never match.**
+    ///
+    /// Swept at the time this landed: **223 arms, 373 compares, 2 apparent
+    /// mismatches** — `BGREWRITEAOF` (real, fixed here) and `COPY … DB` (an
+    /// argument token, excluded by keying on the `cmd` binding). The class is
+    /// otherwise clean; the point of this test is that it stays clean.
+    ///
+    /// The sweep keys on the ARM shape, not on the `match` head, which is why
+    /// it covers 223 arms rather than the 211 a `match (len, b0)` search
+    /// finds: `touches_a_key_it_did_not_route_on` in this file writes
+    /// `match (len, cmd[0] | 0x20)` inline, with no `b0` binding, and its 13
+    /// arms are dispatch arms like any other.
+    ///
+    /// Chosen over the alternative — a macro deriving `(len, b0)` from the
+    /// name literal, which would make the mismatch unrepresentable —
+    /// deliberately. That macro would have to rewrite all 223 arms of two
+    /// hot dispatch tables to close a defect this test closes by reading
+    /// them, and `extract_primary_key` / `command::dispatch` are exactly the
+    /// functions where a mass rewrite for tidiness is not worth its risk. If
+    /// these tables are ever restructured for another reason, the macro is
+    /// the better end state and this test should go with them.
+    #[test]
+    fn no_dispatch_arm_names_a_command_its_pattern_cannot_match() {
+        let sources = [
+            ("src/server/conn/shared.rs", include_str!("shared.rs")),
+            ("src/command/mod.rs", include_str!("../../command/mod.rs")),
+        ];
+        let mut dead = Vec::new();
+        let mut arms = 0usize;
+        let mut compares = 0usize;
+        for (file, src) in sources {
+            for (len, b0, names, line) in dispatch_arms(src) {
+                arms += 1;
+                for name in names {
+                    compares += 1;
+                    let want_len = name.len();
+                    let want_b0 = name.as_bytes()[0].to_ascii_lowercase();
+                    if want_len != len || want_b0 != b0 {
+                        dead.push(format!(
+                            "{file}:{line}: `({len}, b'{}')` can never match {name:?} \
+                             ({want_len} bytes, b'{}')",
+                            b0 as char, want_b0 as char
+                        ));
+                    }
+                }
+            }
+        }
+        // Floors again: a change that made `dispatch_arms` return nothing
+        // would otherwise turn this guard into a no-op that reports success.
+        assert!(
+            arms >= 200 && compares >= 320,
+            "swept only {arms} arms / {compares} compares across both tables \
+             — the extractor is broken, not the tables"
+        );
+        assert!(
+            dead.is_empty(),
+            "dispatch arms that can never fire — the pattern and the name \
+             disagree, and nothing else in the build will tell you:\n  {}",
+            dead.join("\n  ")
+        );
+    }
+
+    /// The shard-pubsub trio is excluded from the class guard on purpose, so
+    /// pin what it must keep doing: answer the CHANNEL. The cluster slot
+    /// router is the only consumer they reach, and it must go on hashing the
+    /// channel and answering `MOVED`, exactly as redis does — declaring them
+    /// keyless for moon#925's sake would have silently dropped that.
+    #[test]
+    fn extract_primary_key_shard_pubsub_still_routes_by_its_channel() {
+        let args = vec![frame_bulk(b"shardchan"), frame_bulk(b"payload")];
+        for cmd in [&b"SPUBLISH"[..], &b"SSUBSCRIBE"[..], &b"SUNSUBSCRIBE"[..]] {
+            assert_eq!(
+                extract_primary_key(cmd, &args).map(|b| b.as_ref()),
+                Some(&b"shardchan"[..]),
+                "{} must keep routing by its shard channel",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+        // A bare SUNSUBSCRIBE names no channel and has nothing to hash.
+        assert!(extract_primary_key(b"SUNSUBSCRIBE", &[]).is_none());
+    }
+
+    /// The class guard above is only worth its runtime if it can FAIL. This
+    /// pins that the exclusion lists are exclusions, not a blanket pass:
+    /// a command with a real key at args[0] must still route by it.
+    #[test]
+    fn extract_primary_key_keyed_commands_are_untouched_by_the_keyless_table() {
+        let args = vec![frame_bulk(b"mykey"), frame_bulk(b"v")];
+        // Every entry is the KEYED occupant of a `(len, first_byte)` slot this
+        // change adds a keyless arm to — derived by walking `COMMAND_META` for
+        // `first_key > 0` at each new arm's slot, not guessed. An arm that
+        // matched on `(len, b0)` alone instead of on the full name would take
+        // one of these with it.
+        for cmd in [
+            &b"SET"[..],
+            &b"GET"[..],
+            &b"FCALL_RO"[..],  // (8, 'f') — FLUSHALL's slot
+            &b"LPUSHX"[..],    // (6, 'l') — LOLWUT's slot
+            &b"MSETNX"[..],    // (6, 'm') — MODULE's slot, beside MEMORY
+            &b"PSETEX"[..],    // (6, 'p') — PUBSUB's slot
+            &b"SORT_RO"[..],   // (7, 's') — SLOWLOG's slot, beside SLAVEOF
+            &b"SETRANGE"[..],  // (8, 's') — SHUTDOWN's slot
+            &b"SMEMBERS"[..],  // (8, 's') — same slot, second occupant
+            &b"RPOPLPUSH"[..], // (9, 'r') — RANDOMKEY's slot
+            &b"RPOP"[..],      // (4, 'r') — ROLE's slot
+            &b"TYPE"[..],      // (4, 't') — TIME's slot
+            &b"RPUSH"[..],     // (5, 'r') — RESET's slot
+        ] {
+            assert_eq!(
+                extract_primary_key(cmd, &args).map(|b| b.as_ref()),
+                Some(&b"mykey"[..]),
+                "{} must still route by its own key",
+                String::from_utf8_lossy(cmd)
+            );
+        }
     }
 
     #[test]

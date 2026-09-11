@@ -89,6 +89,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routed to the B+tree arm — `render_score(NaN)` is not round-trippable
   through a listpack (the moon#863 shape), and moon's pre-existing reply for
   that case is unchanged.
+- **`FLUSHALL ASYNC` / `FLUSHDB ASYNC` cleared one shard and answered `+OK`
+  (moon#925).** `extract_primary_key`, the function that decides shard routing,
+  keeps a keyless fast-path table — and it had no `f` arm at all. Both flush
+  commands fell through to "the routing key is `args[0]`". The BARE forms were
+  correct only by accident of arity: an earlier `args.is_empty()` guard returned
+  `None` before the tail ran. Give either command its optional modifier and
+  `args[0]` is the literal `ASYNC`/`SYNC`, which was hashed as though it were a
+  key — `is_local` went false and `coordinate_flush_broadcast`, which sits
+  *inside* the `is_local` block, never ran. Measured against the unfixed build
+  with 60 keys: 30/60 survived at `--shards 2`, 43/60 at 4, 53/60 at 8, and the
+  survivors were readable values, not tombstones. Silent in both directions —
+  an operator who believed the keyspace was empty could reuse key names on top
+  of live data. `SYNC` failed at a different set of shard counts than `ASYNC`,
+  each passing wherever `key_to_shard(<modifier>)` happened to land on the
+  connection's own shard, which is why the regression tests sweep
+  `--shards 1,2,3,4,5,8` with the bare form as an in-run control.
+
+  **The class, not just the symptom.** Sixteen commands that `COMMAND_META`
+  records as `first_key == 0` were missing from the routing table and would each
+  have hashed a modifier as a key: `FLUSHALL`, `FLUSHDB`, `KILL`, `LOLWUT`,
+  `MODULE`, `MONITOR`, `PUBSUB`, `RANDOMKEY`, `RESET`, `ROLE`, `SHUTDOWN`,
+  `SLOWLOG`, `TIME`, `UNWATCH`, `VACUUM`, and `BGREWRITEAOF` — whose arm was
+  spelled at length 13 for a 12-byte name and so could never fire. All are now
+  keyless regardless of arity, and a new test walks `COMMAND_META` so a future
+  keyless command cannot repeat the omission. Only the two flush commands were
+  observably broken; the rest were saved by an interceptor or by taking no
+  arguments, both of which are accidents rather than guarantees.
+  `SPUBLISH`/`SSUBSCRIBE`/`SUNSUBSCRIBE` are deliberately NOT keyless despite
+  `first_key == 0`: redis hashes their shard channel for cluster slot routing,
+  and in moon the cluster slot router is the only caller they reach —
+  keyless-for-ACL is not keyless-for-slots.
+
+  **A second class, from the same defect.** `BGREWRITEAOF`'s arm was not merely
+  missing, it was *dead*: `(13, b'b')` for a twelve-byte name. These dispatch
+  tables hand-write the length and first byte beside the name literal, and
+  nothing checks that the two agree — a mismatch compiles clean, passes every
+  test, and yields an arm that can never fire. A new test sweeps every
+  `(len, first_byte)` arm in `server/conn/shared.rs` and `command/mod.rs`
+  (223 arms, 373 compares) and fails on any arm whose pattern cannot match the
+  name it compares. The class was otherwise clean; the test is there so it
+  stays clean.
 
 - **`--max-wal-size` now reaches the WAL overflow ceiling (moon#916).** The flag
   configured `CheckpointTrigger` but never `WalWriterV3`, whose bounds setter
