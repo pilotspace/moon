@@ -108,6 +108,11 @@ impl Database {
             if credit > 0 {
                 self.credit_memory(credit);
             }
+            // moon#926: the field was deleted — a real modification of the
+            // watched key. Stamped here rather than at the top of the method
+            // so the `!field_exists` and NX/XX/GT/LT-rejected paths, which
+            // redis 8.6.1 leaves clean, stay clean.
+            self.stamp_hash_field_mutation(key);
             return Ok(2);
         }
 
@@ -168,6 +173,8 @@ impl Database {
         self.hash_expiry_index
             .insert((ts_ms, crate::storage::compact_key::CompactKey::from(key)));
         self.apply_memory_delta(mem_delta);
+        // moon#926: a per-field TTL was set — see the `Ok(2)` arm above.
+        self.stamp_hash_field_mutation(key);
         Ok(1)
     }
 
@@ -253,6 +260,12 @@ impl Database {
         if credit > 0 {
             self.credit_memory(credit);
         }
+        // moon#926: only a TTL that was actually removed is a modification.
+        // `HPERSIST` on a field with no TTL answers -1 and, in redis 8.6.1,
+        // leaves a watcher alone.
+        if had_ttl {
+            self.stamp_hash_field_mutation(key);
+        }
         had_ttl
     }
 
@@ -311,6 +324,12 @@ impl Database {
         }
         if credit > 0 {
             self.credit_memory(credit);
+        }
+        // moon#926: `credit > 0` is exactly "at least one sidecar TTL was
+        // removed", i.e. this call changed the hash. Every other path out of
+        // this method returned early without touching anything.
+        if credit > 0 {
+            self.stamp_hash_field_mutation(key);
         }
     }
 
@@ -400,6 +419,13 @@ impl Database {
         };
         if credit > 0 {
             self.credit_memory(credit);
+        }
+        // moon#926: stamp only when the field really went. `HDEL k <absent>`
+        // answers 0 and, in redis 8.6.1, leaves a watcher alone — this method
+        // already knows which happened, so it is stamped precisely rather than
+        // at the `&mut` handout above.
+        if matches!(result, Ok((true, _))) {
+            self.stamp_hash_field_mutation(key);
         }
         result
     }
@@ -494,7 +520,29 @@ impl Database {
         if credit > 0 {
             self.credit_memory(credit);
         }
+        // moon#926: stamp only when a value actually came out — `HGETDEL` on
+        // an absent field is a read.
+        if matches!(result, Ok(Some(_))) {
+            self.stamp_hash_field_mutation(key);
+        }
         result
+    }
+
+    /// Advance `key`'s WATCH version after a per-field hash write that
+    /// changed something (moon#926).
+    ///
+    /// Costs one extra hash probe, unlike every other stamp in the tree,
+    /// because the field-TTL writers borrow `entry.value` for the whole body
+    /// and only know at the END whether they changed anything. That is the
+    /// right trade here: the alternative is stamping at the `&mut` handout,
+    /// which would abort a watcher for `HDEL k <absent-field>` and
+    /// `HPERSIST` on a field with no TTL — both of which redis 8.6.1 leaves
+    /// clean. The HEXPIRE/HDEL family is not a hot path; the accuracy is.
+    #[inline]
+    fn stamp_hash_field_mutation(&mut self, key: &[u8]) {
+        if let Some(entry) = self.data.get_mut(key) {
+            crate::storage::db::stamp_mutation(entry);
+        }
     }
 
     /// Remove the key when its hash value has become empty.

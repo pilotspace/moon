@@ -22,6 +22,56 @@ fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
     key.len() + entry.value.estimate_memory() + 128
 }
 
+/// Advance an entry's WATCH version because its value is being mutated
+/// (moon#926).
+///
+/// # Where this belongs
+///
+/// **At the accessor that hands out the `&mut`, never at the command that
+/// uses it.** Before moon#926 the version moved only inside
+/// [`Database::set`], i.e. on whole-`Entry` replacement, so `SET` and `DEL`
+/// aborted a watching transaction and every *in-place* container write —
+/// `HSET`, `LPUSH`, `LPOP`, `SADD`, `ZADD`, `XADD`, `EXPIRE` — did not.
+/// `Database::increment_version`, the by-key form, had **zero** production
+/// callers: the mechanism was written and unit-tested, and nothing was ever
+/// wired to it. Measured against redis 8.6.1 that was 37 divergences, every
+/// one of them "moon COMMITs where redis ABORTs" — a lost update reported to
+/// the client as a compare-and-swap that held.
+///
+/// Enumerating the ~60 write handlers is what let it live that long and is
+/// what a 61st handler would silently miss, so the rule is structural:
+/// **acquiring a mutable handle on a stored value IS the bump.** The call
+/// sites are the accessors in `db/accessors.rs` that return `K::Mut` or a
+/// `&mut` into the value, plus the three writers in `db/kv_ops.rs` and
+/// `db/hash_ttl.rs` that reach `self.data.get_mut` directly.
+///
+/// # Where it does NOT belong
+///
+/// [`Database::get_promoted`] and the `get_hash`/`get_list`/`get_set`/
+/// `get_sorted_set`/`get_stream` delegators on top of it take `&mut self` and
+/// rewrite the value's *encoding* in place, but they hand back a **shared**
+/// reference: they are reads. Bumping there would abort a transaction that
+/// nothing wrote — the same bug pointing the other way, and just as silent.
+/// The seam is the returned reference's mutability, not the receiver's.
+///
+/// Where a writer already knows whether it changed anything for free — the
+/// hash field-TTL family in `db/hash_ttl.rs` returns exactly that — it is
+/// called only on the branch that did, which is how `HDEL` of an absent
+/// field keeps redis's "no dirty" answer.
+///
+/// # Cost
+///
+/// One read-modify-write of the `metadata: u32` already in the entry the
+/// caller just probed for: a load, an add, a mask, a compare against the
+/// wrap sentinel, a store. No extra hash probe, no atomic (a shard owns its
+/// keyspace on its own thread), no allocation, no branch on the value kind.
+/// The entry's cache line is being written by the mutation that follows in
+/// every case.
+#[inline]
+pub(crate) fn stamp_mutation(entry: &mut Entry) {
+    entry.increment_version();
+}
+
 // ---------------------------------------------------------------------------
 // O(1) container-growth memory accounting (WS6).
 //

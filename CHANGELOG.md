@@ -163,6 +163,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (223 arms, 373 compares) and fails on any arm whose pattern cannot match the
   name it compares. The class was otherwise clean; the test is there so it
   stays clean.
+- **`WATCH` now sees an in-place container mutation (moon#926).** The
+  per-entry version a watching transaction re-checks at `EXEC` moved only when
+  a whole `Entry` was replaced, so `SET` and `DEL` aborted a watcher and every
+  container write — `HSET`, `HDEL`, `HINCRBY`, `LPUSH`, `LPOP`, `LSET`,
+  `LINSERT`, `LREM`, `LTRIM`, `SADD`, `SREM`, `SPOP`, `ZADD`, `ZINCRBY`,
+  `ZREM`, `ZPOPMIN`, `XADD`, `XDEL`, `EXPIRE`, `PEXPIRE`, `PERSIST`,
+  `HEXPIRE`, `HPERSIST`, `HGETDEL` — did not. `Database::increment_version`
+  had **zero** production callers: the mechanism was written and unit-tested
+  and nothing was ever wired to it. A canonical CAS loop
+  (`WATCH inventory` / `HGET` / `MULTI` / `HSET` / `EXEC`) therefore lost the
+  update under concurrency while `EXEC` returned the result array, telling the
+  client the compare-and-swap had held.
+
+  The bump now lives in the storage accessors that hand out a mutable handle
+  on a stored value, not in the ~60 write handlers — **acquiring the `&mut`
+  IS the bump** — so a 61st write command inherits it. Read accessors are
+  deliberately excluded: `Database::get_promoted` and friends take `&mut self`
+  to rewrite the value's encoding but return a *shared* reference, and a bump
+  there would abort a transaction that nothing wrote.
+
+  Measured against redis 8.6.1 over 113 two-connection `WATCH`/`MULTI`/`EXEC`
+  rows: 42 divergences before, 7 after. All 41 "moon commits where redis
+  aborts" are gone (the 42nd, `SETBIT`, was already the other way round). Six of the seven remaining are no-op writes by a competing
+  client (`SADD` of a member already present, `SREM`/`ZREM`/`LREM` of an
+  absent element, `ZADD` with the score the member already has, `HSETNX` on an
+  existing field) where moon now aborts and redis does not — a CAS retry
+  rather than a lost update, recorded and pinned in
+  `tests/watch_container_mutation_926.rs`. Where the writer already knows for
+  free whether it changed anything (`HDEL` of an absent field, `HPERSIST` on a
+  field with no TTL, `PERSIST` on a key with no TTL, a pop from a missing key)
+  moon matches redis exactly. The seventh, `SETBIT` writing a bit that already
+  holds that value, predates this change.
 
 - **`--max-wal-size` now reaches the WAL overflow ceiling (moon#916).** The flag
   configured `CheckpointTrigger` but never `WalWriterV3`, whose bounds setter
