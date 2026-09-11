@@ -1,0 +1,16 @@
+--- redis (redis-server) ---
+  h     listpack
+  l     quicklist
+  s     hashtable
+  sint  intset
+  z     listpack
+  set-max-listpack-entries:  
+  set-max-intset-entries:   set-max-intset-entries 512 
+--- moon (moon-5bf716a9) ---
+  h     listpack
+  l     listpack
+  s     listpack
+  sint  intset
+  z     listpack
+  set-max-listpack-entries:  
+  set-max-intset-entries:    

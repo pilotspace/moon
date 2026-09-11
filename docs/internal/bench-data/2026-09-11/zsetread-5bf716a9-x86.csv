@@ -1,0 +1,13 @@
+# moon: sha256:08ebc35c2c274772 (/home/tindang/moon-5bf716a9)
+# redis: Redis server v=7.0.15 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64 build=e53ff17674aa6190
+# cpu: Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz (8 cores)
+# kernel: Linux 7.0.0-1011-gcp
+# shards: 1 keys: 200000 members: 4 read_modes: plain multi eval
+# date: 2026-09-11T07:42:29Z
+engine,read_mode,phase,encoding,rss_kb,dbsize,per_key_bytes
+moon,plain,before_read,listpack,57588,200000,218.1
+moon,plain,after_read,listpack,57776,200000,219.1
+moon,multi,before_read,listpack,57688,200000,218.0
+moon,multi,after_read,listpack,57960,200000,219.4
+moon,eval,before_read,listpack,57576,200000,218.6
+moon,eval,after_read,listpack,57844,200000,219.9

@@ -1,0 +1,55 @@
+# moon: sha256:6403691af6c23cd9 (/home/tindang/moon-c095f86d)
+# redis: Redis server v=7.0.15 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64 build=e53ff17674aa6190
+# cpu: Neoverse-N1 (8 cores)
+# kernel: Linux 7.0.0-1011-gcp
+# shards: 1 keys: 200000 elems: 4 elemsz: 8 reps: 3 types: hash list set zset
+# date: 2026-09-11T07:41:27Z
+engine,rep,order,type,phase,elems,idle_rss_kb,loaded_rss_kb,dbsize,per_key_bytes,floor_bytes
+moon,1,moon-first,hash,untouched,4,11968,51628,200000,203.1,73
+moon,1,moon-first,hash,touched,4,11968,187300,200000,897.7,73
+redis,1,moon-first,hash,untouched,4,12344,43112,200000,157.5,73
+redis,1,moon-first,hash,touched,4,12344,43164,200000,157.8,73
+moon,1,moon-first,list,untouched,4,11948,54256,200000,216.6,73
+moon,1,moon-first,list,touched,4,11948,90716,200000,403.3,73
+redis,1,moon-first,list,untouched,4,12348,58684,200000,237.2,73
+redis,1,moon-first,list,touched,4,12348,58800,200000,237.8,73
+moon,1,moon-first,set,untouched,4,11980,54428,200000,217.3,72
+moon,1,moon-first,set,touched,3,11980,138016,200000,645.3,64
+redis,1,moon-first,set,untouched,4,12352,87700,200000,385.8,72
+redis,1,moon-first,set,touched,3,12352,87752,200000,386.0,64
+moon,1,moon-first,zset,untouched,4,11968,54392,200000,217.2,73
+moon,1,moon-first,zset,touched,4,11968,885124,200000,4470.6,73
+redis,1,moon-first,zset,untouched,4,12348,43180,200000,157.9,73
+redis,1,moon-first,zset,touched,4,12348,43228,200000,158.1,73
+redis,2,redis-first,hash,untouched,4,12340,43100,200000,157.5,73
+redis,2,redis-first,hash,touched,4,12340,43152,200000,157.8,73
+moon,2,redis-first,hash,untouched,4,11956,51604,200000,203.0,73
+moon,2,redis-first,hash,touched,4,11956,187284,200000,897.7,73
+redis,2,redis-first,list,untouched,4,12348,58680,200000,237.2,73
+redis,2,redis-first,list,touched,4,12348,58796,200000,237.8,73
+moon,2,redis-first,list,untouched,4,11964,54288,200000,216.7,73
+moon,2,redis-first,list,touched,4,11964,90720,200000,403.2,73
+redis,2,redis-first,set,untouched,4,12352,87700,200000,385.8,72
+redis,2,redis-first,set,touched,3,12352,87752,200000,386.0,64
+moon,2,redis-first,set,untouched,4,11972,54432,200000,217.4,72
+moon,2,redis-first,set,touched,3,11972,138024,200000,645.4,64
+redis,2,redis-first,zset,untouched,4,12348,43176,200000,157.8,73
+redis,2,redis-first,zset,touched,4,12348,43224,200000,158.1,73
+moon,2,redis-first,zset,untouched,4,11964,54372,200000,217.1,73
+moon,2,redis-first,zset,touched,4,11964,885124,200000,4470.6,73
+moon,3,moon-first,hash,untouched,4,11968,51632,200000,203.1,73
+moon,3,moon-first,hash,touched,4,11968,187300,200000,897.7,73
+redis,3,moon-first,hash,untouched,4,12288,43052,200000,157.5,73
+redis,3,moon-first,hash,touched,4,12288,43104,200000,157.8,73
+moon,3,moon-first,list,untouched,4,11968,54232,200000,216.4,73
+moon,3,moon-first,list,touched,4,11968,90752,200000,403.4,73
+redis,3,moon-first,list,untouched,4,12344,58680,200000,237.2,73
+redis,3,moon-first,list,touched,4,12344,58796,200000,237.8,73
+moon,3,moon-first,set,untouched,4,11968,54412,200000,217.3,72
+moon,3,moon-first,set,touched,3,11968,138004,200000,645.3,64
+redis,3,moon-first,set,untouched,4,12344,87696,200000,385.8,72
+redis,3,moon-first,set,touched,3,12344,87748,200000,386.1,64
+moon,3,moon-first,zset,untouched,4,11968,54400,200000,217.3,73
+moon,3,moon-first,zset,touched,4,11968,885132,200000,4470.6,73
+redis,3,moon-first,zset,untouched,4,12340,43172,200000,157.9,73
+redis,3,moon-first,zset,touched,4,12340,43220,200000,158.1,73

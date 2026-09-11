@@ -1,0 +1,13 @@
+# moon: sha256:8a9ca343d48a8e62 (/home/tindang/moon-5bf716a9)
+# redis: Redis server v=7.0.15 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64 build=e53ff17674aa6190
+# cpu: Neoverse-N1 (8 cores)
+# kernel: Linux 7.0.0-1011-gcp
+# shards: 1 keys: 200000 members: 4 read_modes: plain multi eval
+# date: 2026-09-11T07:44:23Z
+engine,read_mode,phase,encoding,rss_kb,dbsize,per_key_bytes
+redis,plain,before_read,listpack,39992,200000,141.5
+redis,plain,after_read,listpack,40068,200000,141.9
+redis,multi,before_read,listpack,39992,200000,141.5
+redis,multi,after_read,listpack,40124,200000,142.2
+redis,eval,before_read,listpack,39996,200000,141.5
+redis,eval,after_read,listpack,40116,200000,142.2
