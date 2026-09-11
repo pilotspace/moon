@@ -64,6 +64,15 @@ measured all lose at p>=8, on both architectures — by 13% in the mildest case
 and 55% in the worst. Any summary quoting the GET number alone describes a
 two-command fast path, not the server.
 
+**Two later runs amend this table without replacing it** (§2 keeps each as
+measured). As of 2026-09-11: ZADD is no longer the worst family — it gained
++39.8% at p=64 and **HSET is now last**; and the memory line above is
+string-only. On *containers*, moon is 0.54-0.56x on sets and 0.89-0.91x on
+lists, but **1.21-1.29x on hashes and 1.29-1.38x on sorted sets** — i.e. worse
+than Redis on the two shapes where both engines use the same encoding. "moon
+uses less memory per key" is a claim about string values, and does not
+generalise to containers.
+
 ---
 
 ## 2. Throughput
@@ -165,6 +174,174 @@ SPOP 3.8%; it is a minor contributor, not the cause. Tracked as
 [#923](https://github.com/pilotspace/moon/issues/923). Raw CSVs for all six runs
 are in [`docs/internal/bench-data/2026-09-10/`](docs/internal/bench-data/2026-09-10/).
 
+> **Superseded 2026-09-11 — "spread across three windows" was wrong.** It came
+> from a three-point split whose middle window sat at its own noise floor. A
+> four-point split at n=10 puts the whole loss in **one** commit, #861; the two
+> flanking windows are ties on all 48 of their cells. See the next subsection.
+> The #877 figure above stands — it remains a tie at its own floor.
+
+
+### Update 2026-09-11 — #938 costs nothing measurable, and SADD/SPOP is attributed
+
+Ten PRs landed after the 2026-09-10 run, two of them on the measured hot path:
+**#938** put a `stamp_mutation` on all 23 `&mut` accessor acquisitions —
+disassembly put that at **+8 instructions per container write**, never
+throughput-tested — and **#929** added arms to the keyless table that *every*
+command traverses. This run is the regression check.
+
+`5bf716a9` against `ab91a23e`, same two hosts, same Redis 7.0.15, same harness,
+**n=10** per point (two passes of five, run `A,B,B,A` so a monotone session
+drift cannot land on one binary). The baseline binaries are byte-identical to
+the ones measured on 2026-09-10 — their sha256s match that run's CSV headers —
+so the two reports are continuous. Raw CSVs, with per-file provenance, in
+[`docs/internal/bench-data/2026-09-11/`](docs/internal/bench-data/2026-09-11/).
+
+**#938's +8 instructions do not resolve.** The four families it touches, at the
+two depths where per-op cost is the whole budget:
+
+| family | ARM raw Δ | ARM floor | x86 raw Δ | x86 floor |
+|---|---:|:---:|---:|:---:|
+| SADD p=8 | +0.6% | 1.4% | -1.1% | 0.8% |
+| SADD p=64 | +1.9% | 1.7% | -0.3% | 0.7% |
+| HSET p=8 | -0.2% | 2.2% | -0.4% | 1.5% |
+| HSET p=64 | +0.6% | 1.8% | -1.3% | 1.3% |
+| LPUSH p=8 | +0.1% | 1.9% | +0.0% | 1.2% |
+| LPUSH p=64 | -1.5% | 1.6% | +0.7% | 1.1% |
+| ZADD p=8 | -0.7% | 2.2% | +0.2% | 1.3% |
+| ZADD p=64 | -0.2% | 1.5% | +0.5% | 3.0% |
+
+Fifteen of sixteen cells are ties. The one exception — ARM SADD p=64, +1.9%
+against a 1.7% floor — is a *gain*, which added instructions cannot cause, and
+the two architectures disagree in sign on six of eight rows. **This is the
+absence of a resolvable effect, not a measured zero:** 8 instructions against a
+~3.2 µs/op budget (ARM SADD p=64) is ~0.1% of the work, an order of magnitude
+under the floor this harness supports. It would need a different instrument —
+`perf stat` on instruction counts, not ops/s — to see at all. #929 likewise
+moved nothing: SET, GET and INCR are ties at every depth on both hosts.
+
+**HSET is still the worst family**, and the p=64 shape is unchanged:
+
+| command | ARM p=1 | ARM p=8 | ARM p=64 | x86 p=1 | x86 p=8 | x86 p=64 |
+|---------|:---:|:---:|:---:|:---:|:---:|:---:|
+| GET   | **1.05x** | **1.17x** | **1.53x** | **1.06x** | **1.30x** | **1.61x** |
+| SET   | **1.03x** | **1.15x** | **1.46x** | **1.04x** | **1.21x** | **1.31x** |
+| INCR  | 0.93x | 0.68x | 0.63x | **1.12x** | 0.72x | 0.55x |
+| LPUSH | 0.87x | 0.75x | 0.71x | **1.09x** | 0.73x | 0.64x |
+| SADD  | 0.87x | 0.67x | 0.66x | **1.08x** | 0.68x | 0.67x |
+| SPOP  | 0.79x | 0.71x | 0.80x | 0.99x* | 0.67x | 0.67x |
+| HSET  | 0.86x | 0.66x | **0.62x** | **1.06x** | 0.65x | **0.55x** |
+| ZADD  | 0.82x | 0.80x | 0.70x | **1.03x** | 0.83x | 0.70x |
+
+Bold in the HSET row marks the worst cell per architecture, not a win. INCR is
+now statistically tied with it at the bottom (ARM 0.632x against HSET's 0.620x,
+floors 1.4% and 1.6%; x86 0.553x against 0.546x, floors 1.5% and 3.1%) — read
+them as a shared last place, not a ranking.
+
+**ZADD's +38% held, and it now survives a read.** Against `ae6cd003` on the
+same host, ZADD p=64 is **+39.8%** raw (0.502x → 0.704x, floor 1.9%, Redis
+control -0.4%), and it gained at the shallower depths too (+15.9% at p=1,
++16.6% at p=8). But the 2026-09-10 figure was **write-only**, and that mattered
+more than it looked: before **#932**, one `ZSCORE` taken on the *mutable*
+dispatch path — inside MULTI/EXEC, inside Lua, or through `try_inline_dispatch`
+— converted a listpack zset to a skiplist permanently.
+
+| binary | read path | encoding after | RSS/key, before → after |
+|---|---|---|---|
+| `ab91a23e` | plain connection | listpack | 218.0 → 218.5 B (+0.2%) |
+| `ab91a23e` | inside MULTI/EXEC | **skiplist** | **217.8 → 4,433.1 B (+1935%)** |
+| `ab91a23e` | inside Lua (EVAL) | **skiplist** | **217.9 → 4,433.0 B (+1934%)** |
+| `5bf716a9` | all three | listpack | 217.8 → 219.1–220.6 B (+0.6–1.2%) |
+| Redis 7.0.15 | all three | listpack | 141.5 → 141.9–142.2 B (+0.3–0.5%) |
+
+(ARM; x86 reaches 4,441 B by the same two paths and is otherwise within 0.2%.) Both instruments were read — `OBJECT ENCODING`
+and `/proc` RSS — and they agree. Note the plain-connection row: the defect was
+never reachable from the read-only dispatch path, so a probe issuing a bare
+`ZSCORE` runs **clean against the buggy binary** and proves nothing. That
+negative control is why the sweep covers all three paths.
+
+**moon#923 is settled: SADD/SPOP bisects to #861.** The largest unexplained
+window, `ae6cd003..1a7bd83f` (12 commits), was split at three points on ARM,
+two passes each, n=10 per point:
+
+| window | commits | SADD p=64 | SPOP p=64 | ZADD p=64 |
+|---|---|---:|---:|---:|
+| W1 | the first 8 | +0.2% *tie* | +0.7% *tie* | -0.6% *tie* |
+| **W2** | **#861 alone** | **-6.4%** | **-4.5%** | **-4.7%** |
+| W3 | the last 3 | +2.0% *tie* | -0.1% *tie* | +0.7% *tie* |
+| endpoint | all 12 | -4.4% | -4.0% | -4.6% |
+
+W1 and W3 are ties on every one of their 24 cells — 48 cells, no survivors. The
+entire window is one commit: **#861, `perf(storage): box RedisValue's fat
+variants`** (`75ad520c`). Within W2, SET, GET, INCR, LPUSH and HSET are ties, so
+the cost falls on SADD, SPOP and ZADD specifically.
+
+**The mechanism is boxed-variant indirection, and it correlates perfectly.** The
+families that regressed are exactly the families whose containers hold a variant
+#861 boxed — no exceptions in either direction. Encoding *population* at each
+family's own p=64 measurement point, sampled over 200 keys after replaying the
+harness leg in full:
+
+| family | encoding at its p=64 point | variant | #861 boxed it? | W2 |
+|---|---|---|:---:|---:|
+| LPUSH | listpack 199/200 | `ListListpack` (24 B) | no | *tie* |
+| HSET | listpack 199/200 | `HashListpack` (24 B) | no | *tie* |
+| SADD | **hashtable** 123/200 (77 absent) | `Set(Box<SetValue>)` | **yes** | **-6.4%** |
+| SPOP | **hashtable** 200/200 | `Set(Box<SetValue>)` | **yes** | **-4.5%** |
+| ZADD | **skiplist** 200/200 | `SortedSetBPTree` | **yes** | **-4.7%** |
+
+Getting this right required replaying the leg **in order** and tallying the
+**population**, and two earlier readings of it were wrong. The families mutate
+each other's keyspace — `SPOP` runs straight after `SADD` at every depth and
+flattens the set it touches — so a probe that benchmarks `SADD` alone sees
+listpack and concludes the opposite. And the regime oscillates *per key* (SADD
+recreates a listpack, SPOP flattens it to a hashtable, then empties and deletes
+it), so a single sampled key reports whichever phase it is in. Both mistakes
+were made here before the table above was produced.
+
+A symbol-resolved `perf` A/B of the two W2 binaries, rebuilt with the repo's
+`release-with-debug` profile and profiled in the correctly-replayed regime,
+localises the cost to the handler bodies and **rules out the allocator**:
+
+| symbol | `435ff2d8` | `75ad520c` |
+|---|---:|---:|
+| `command::set::set_write::sadd` | 0.80% | **6.45%** |
+| `command::set::set_write::spop` | 6.10% | **10.15%** |
+| all allocator symbols, SADD run | 1.94% | 2.02% |
+| `indexmap::IndexMap::insert_full` | 7.50% | 7.17% |
+
+So it is not a jemalloc size-class effect — the allocator share is flat — and
+not the `IndexSet` insert itself. The extra time is inside the handler, which is
+where the `Box<SetValue>` deref now sits. (Sampling is on the `cpu-clock`
+*software* event: this VM exposes no PMU, so these are time shares, not IPC or
+cache-miss counts, and share-based profiles cannot fully separate new work from
+work relocated by LTO inlining.)
+
+**What this means at HEAD.** The exposure has already shrunk on its own. Re-run
+on `5bf716a9`, the zset population at ZADD's measurement point is **listpack
+195/200**, not skiplist — the encoding campaign (#920/#921/#922/#932) keeps it
+compact, so ZADD no longer reaches `SortedSetBPTree` and no longer pays #861 at
+all. That is part of ZADD's +39.8%. Sets are the remaining exposure: `SPOP`
+still flattens, so SADD/SPOP still run against `Set(Box<SetValue>)` today
+(hashtable 122/200 at HEAD).
+
+This also settles the standing #861 refutation. That comment traced `HSET`,
+found it takes `get_or_create_hash_listpack`'s early-true branch and constructs
+no `RedisValue`, and concluded no box is allocated — **all of which is correct,
+and the bisect confirms it**: the hash is listpack 199/200 and HSET is a tie.
+The only error was generalising from HSET to SADD/SPOP, which that comment
+itself flagged as unmeasured.
+
+The trade was deliberate and is documented in #861 — 80 B/key saved on every
+container key. What was missing is the throughput side of it, which is this
+table. It is a real, measured cost that nobody priced at the time, not a
+defect, and not on its own a reason to revert.
+
+**Two rows where the control failed.** Redis's own series went bimodal on ZADD
+p=8 (clustering at ~275k and ~320k within one session) and SPOP p=8. Dividing by
+a control that noisy manufactures a result: the naive ratio reads **+13.0%** for
+ZADD p=8 on ARM, while moon's own raw series moved -0.7% against a 2.2% floor.
+No number is published for those rows. `scripts/bench-ab-delta.py` now refuses
+any row whose control CV exceeds 5% and says so, rather than quoting the ratio.
 
 ### Change since v0.8.7 — the write-path regression is reversed
 
@@ -248,6 +425,72 @@ the entry (values <=12 B); on ARM it is 1 KB (0.84x).
 The result does not depend on the idle-RSS subtraction: moon's **absolute**
 loaded RSS is lower at every size too (1 KB values, x86: 210 MB vs 249 MB).
 
+### Containers — added 2026-09-11
+
+Everything above measures **string values**. The compact-encoding campaign
+(moon#897, moon#830 → #920/#921/#922/#932) exists to make *containers* cheap,
+and until this run that was measured nowhere. `scripts/bench-ab-memory-containers.sh`
+loads 200,000 keys of exactly four 8-byte elements and reports **two** figures
+per type, because either alone misleads:
+
+- **untouched** — the container as first written. A best case.
+- **touched** — after **one** secondary write per key, using the very mutator
+  each PR taught to mutate in place (HINCRBY, LSET, SREM, ZINCRBY). Any workload
+  that writes a key twice sees this number, not the one above.
+
+| type | phase | moon x86 | moon ARM | Redis x86 | Redis ARM | ratio x86 | ratio ARM |
+|---|---|---:|---:|---:|---:|:---:|:---:|
+| hash | untouched | 203.2 B | 202.7 B | 168.6 B | 157.5 B | 1.21x | 1.29x |
+| hash | touched   | 203.9 B | 203.7 B | 168.4 B | 157.8 B | 1.21x | 1.29x |
+| list | untouched | 217.1 B | 216.6 B | 244.6 B | 237.2 B | **0.89x** | **0.91x** |
+| list | touched   | 217.3 B | 216.9 B | 244.4 B | 237.8 B | **0.89x** | **0.91x** |
+| set  | untouched | 217.6 B | 217.4 B | 400.3 B | 385.8 B | **0.54x** | **0.56x** |
+| set  | touched   | 218.3 B | 218.4 B | 400.2 B | 386.0 B | **0.55x** | **0.57x** |
+| zset | untouched | 217.4 B | 217.3 B | 168.9 B | 157.8 B | 1.29x | 1.38x |
+| zset | touched   | 217.9 B | 217.7 B | 168.7 B | 158.1 B | 1.29x | 1.38x |
+
+n=3, fresh server per point, engine order alternating, each row checked against
+its arithmetic floor. A re-run of the whole matrix reproduced every cell to
+within 0.5 B.
+
+**Two of these four rows are not like-for-like**, which `encodings-arm.txt`
+records rather than leaves to assumption. Against Redis **7.0.15**:
+
+| shape | moon | Redis 7.0.15 |
+|---|---|---|
+| hash, 4 small fields | listpack | listpack |
+| zset, 4 small members | listpack | listpack |
+| list, 4 small elements | listpack | **quicklist** |
+| set, 4 non-integer members | listpack | **hashtable** |
+
+`set-max-listpack-entries` does not exist in 7.0.15 — listpack-encoded sets
+arrived in Redis 7.2 — so a four-member set of non-integer strings is forced to
+a hashtable, and moon's 0.54x there is listpack-against-hashtable, not a like
+encoding beaten. The list row compares against a quicklist. **Only hash and zset
+are a fair encoding comparison, and moon loses both**, by 21–29% (hash) and
+29–38% (zset). moon's per-container-key cost is near-constant at ~203–218 B
+across all four types, while Redis's varies with its encoding; that flatness is
+what wins the set row and loses the hash and zset rows.
+
+**What the campaign bought.** The `touched` column is flat at HEAD — one
+secondary write costs +0.1% to +0.5%. Before #920/#921/#922 the same write
+flattened the container:
+
+| type | one secondary write, `ab91a23e` | at `5bf716a9` |
+|---|---:|---:|
+| hash (HINCRBY) | 202 B → 898 B (**+344%**) | +0.3% |
+| list (LSET)    | 217 B → 404 B (**+86%**)  | +0.1% |
+| set (SREM)     | 218 B → 663 B (**+205%**) | +0.3% |
+| zset (ZINCRBY) | 217 B → 4,478 B (**+1959%**) | +0.2% |
+
+(x86. ARM agrees on hash, list and zset within 0.2 points and reaches 645 B on
+the set row, +197%.)
+
+That is the answer to why both figures are published. On `ab91a23e` the
+`untouched` number was a best case no real workload saw — a single ZINCRBY cost
+20x the key's memory — and a report quoting only it would have been accurate and
+completely misleading. Redis is flat in both columns on every type.
+
 ### This contradicts two archived claims
 
 Both are recorded rather than quietly dropped:
@@ -265,7 +508,7 @@ Both are recorded rather than quietly dropped:
 The ARM idle figures do reproduce the archive's §2.14 sidebar (11.43 vs 11.93 MB
 here, 11.68 vs 11.96 MB there) — independent agreement on a different date.
 
-**Scope:** `--shards 1`, string values, one key shape. The archived §2.14 measured
+**Scope:** `--shards 1`, one key shape; string values above, containers in the subsection below. The archived §2.14 measured
 `--shards 8` on ARM and found moon **26% worse on idle RSS**, because default
 config spawns four threads per shard. Nothing here contradicts that; it is a
 different configuration.
@@ -319,14 +562,31 @@ python3 scripts/bench-ab-report.py matrix.csv 5   # ratios + noise floors
 #   completeness check, so a run truncated by an aborted leg reports
 #   INCOMPLETE instead of quietly redefining "all reps" as whatever survived.
 
+# Same binary vs a different binary (did THIS commit regress moon?). Redis is
+# the control: the tool picks raw or ratio per row from the control's own
+# movement, and publishes NEITHER when the control's CV exceeds 5%.
+python3 scripts/bench-ab-delta.py --head new.csv --base old.csv
+
 # Memory: fresh server per point, arithmetic-floor guard.
 ./scripts/bench-ab-memory.sh --moon-bin ./target/release/moon --reps 3 > mem.csv
 ./scripts/bench-ab-memory.sh --sizes 16,32,48,128 --reps 2 > mem-fine.csv
+
+# Containers: per-key RSS for hash/list/set/zset, reported BOTH untouched and
+# after one secondary write -- the untouched figure alone is a best case.
+./scripts/bench-ab-memory-containers.sh --moon-bin ./target/release/moon --keys 200000 --reps 3
+
+# Does a READ destroy a small zset's encoding? Sweeps the plain, MULTI/EXEC and
+# Lua dispatch paths, because the defect this checks for was unreachable from
+# the read-only path -- a bare ZSCORE runs clean on a BUGGY binary.
+./scripts/bench-zset-read-encoding.sh --moon-bin ./target/release/moon --keys 200000
 ```
 
-Both scripts refuse to report rather than report something false: the matrix
+These scripts refuse to report rather than report something false: the matrix
 aborts a leg whose `DBSIZE` is under 50,000 (the keyspace never materialised),
-and the memory harness aborts a row landing below its arithmetic floor.
+the memory harnesses abort a row landing below their arithmetic floor, all of
+them refuse to start on an occupied port (a stranger's numbers would otherwise
+be attributed to both engines), and `bench-ab-delta.py` suppresses any row whose
+Redis control is too unstable to divide by.
 
 Requires `redis-server` and `redis-benchmark` on PATH. Run on Linux; a macOS run
 exercises neither io_uring nor the Linux-only paths.
@@ -334,7 +594,10 @@ exercises neither io_uring nor the Linux-only paths.
 The raw CSVs behind every table above — including the v0.8.7 legs, with binary
 sha256 and CPU model in each header — are kept in
 [`docs/internal/bench-data/2026-09-08/`](docs/internal/bench-data/2026-09-08/),
-so any row here can be recomputed without re-running anything.
+with the two re-measurements in
+[`2026-09-10/`](docs/internal/bench-data/2026-09-10/) and
+[`2026-09-11/`](docs/internal/bench-data/2026-09-11/), so any row here can be
+recomputed without re-running anything.
 
 ### A note on `redis-benchmark` output parsing
 

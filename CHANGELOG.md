@@ -6,6 +6,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **`BENCHMARK.md`: re-measured the eight command families on GCE against
+  `5bf716a9`, and settled moon#923.** Ten PRs had landed since the last run, two
+  on the measured hot path. **#938**'s `stamp_mutation` (+8 instructions per
+  container write, measured by disassembly and never throughput-tested) and
+  **#929**'s keyless-table arms are both **below the noise floor**: fifteen of
+  sixteen container-write cells are ties across two architectures at n=10, the
+  architectures disagree in sign on six of eight rows, and the one non-tie is a
+  *gain*. Recorded as an unresolvable effect rather than a measured zero — 8
+  instructions is ~0.1% of a ~3.2 µs/op budget and needs `perf stat`, not ops/s.
+
+  **moon#923 is attributed: the whole `ae6cd003..1a7bd83f` window is #861**
+  (*box `RedisValue`'s fat variants*). A four-point, two-pass bisect at n=10 puts
+  SADD p=64 at -6.4%, SPOP at -4.5% and ZADD at -4.7% in that single commit,
+  with the two flanking windows tied on all 48 of their cells — overturning the
+  issue's "spread across three windows" framing. The mechanism is **boxed-variant
+  indirection**, and it correlates without exception: the three families that
+  regressed hold a variant #861 boxed at their own measurement point (set
+  `hashtable`, zset `skiplist`), and the two that tie hold 24-byte listpack
+  variants it did not box. A symbol-resolved `perf` A/B localises the cost to the
+  handler bodies (`set_write::sadd` 0.80% → 6.45%, `spop` 6.10% → 10.15%) and
+  rules out the allocator (1.94% → 2.02%). Establishing this needed the harness
+  leg replayed **in order** and the encoding **population** tallied — the
+  families mutate each other's keyspace, and the regime oscillates per key. The
+  standing refutation of #861 was right about HSET, which the bisect confirms is
+  a tie, and wrong only to generalise from it.
+
+  Also measured for the first time: **container memory**. §3 had covered string
+  values only, so the encoding campaign's payoff was measured nowhere. Two
+  figures per type, and the pair is the point — before #920/#921/#922 **one**
+  secondary write per key cost a hash +344% and a zset **+1959%** (217 B →
+  4,478 B); at HEAD it costs +0.1-0.5%. Against Redis 7.0.15 moon is 0.54-0.56x
+  on sets and 0.89-0.91x on lists, but **1.21-1.29x on hashes and 1.29-1.38x on
+  sorted sets** — and only hash and zset are like-for-like encoding comparisons,
+  so §1's "moon uses less memory per key" is now marked as string-only.
+
+  Confirmed **ZADD's +38% held** (+39.8% at p=64) and now survives a *read*:
+  before #932 one `ZSCORE` on the mutable dispatch path flipped a listpack zset
+  to a skiplist for good, at +1935% RSS (218 B → 4,433 B per key).
+
+### Added
+
+- `scripts/bench-ab-delta.py` — compares moon against **moon** across two
+  matrix runs, which `bench-ab-report.py` cannot do. Redis is the control: the
+  tool picks the raw or the ratio column per row from the control's own
+  measured movement, and publishes **neither** when the control's CV exceeds 5%.
+  That guard exists because it fired: Redis's own ZADD p=8 series went bimodal
+  within one session, which turns a flat moon row into a false +13%.
+- `scripts/bench-ab-memory-containers.sh` — per-key RSS for hash/list/set/zset,
+  reported both untouched and after one secondary write, with a per-row
+  arithmetic floor.
+- `scripts/bench-zset-read-encoding.sh` — checks whether a *read* destroys a
+  small zset's encoding, sweeping the plain, MULTI/EXEC and Lua dispatch paths
+  and reading both `OBJECT ENCODING` and `/proc` RSS. The plain leg is a
+  deliberate negative control: the defect it checks for is unreachable from the
+  read-only path, so a bare `ZSCORE` runs clean against a *buggy* binary.
+
 ### Security
 
 - **ACL `~pattern` now applies to `MQ`, and is no longer silently skipped for

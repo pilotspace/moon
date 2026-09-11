@@ -1,0 +1,7 @@
+--- moon-5bf716a9: encodings under the matrix harness's own load ---
+  set:000000000001       encoding=listpack     elements=8
+  set:000000050000       encoding=listpack     elements=19
+  z:000000000001         encoding=listpack     elements=14
+  hash:000000000001      encoding=listpack     elements=1
+  list:000000000001      encoding=listpack     elements=15
+  dbsize=400000
