@@ -139,8 +139,9 @@ struct Case {
     reads: &'static [&'static [&'static str]],
 }
 
-/// Every read that used to route through `Database::get_set` / `get_list`,
-/// plus the hash family as a regression guard on the shape this fix copies.
+/// Every read that used to route through `Database::get_set` / `get_list`
+/// (moon#853) or `get_sorted_set` (moon#928), plus the hash family as a
+/// regression guard on the shape both fixes copy.
 fn cases() -> &'static [Case] {
     &[
         // all-integer set -> intset
@@ -168,6 +169,37 @@ fn cases() -> &'static [Case] {
                 &["LRANGE", "k", "0", "-1"],
                 &["LINDEX", "k", "0"],
                 &["LPOS", "k", "b"],
+            ],
+        },
+        // short zset -> listpack (moon#928). moon#878 made `ZADD` produce a
+        // `SortedSetListpack`, which is what turned moon#853's written
+        // prediction ("the moment #793 makes SortedSetListpack reachable,
+        // every get_sorted_set read caller becomes the same defect") into a
+        // live defect: all 17 reads below flattened to `skiplist` on the
+        // mutable path at ab91a23e, and 1000 eight-member zsets went
+        // 293,055 -> 4,749,055 bytes of `used_memory` (16.21x) after ONE
+        // `ZCARD` each.
+        Case {
+            want: "listpack",
+            fixture: &["ZADD", "k", "1", "a", "2", "b", "3", "c"],
+            reads: &[
+                &["ZSCORE", "k", "a"],
+                &["ZCARD", "k"],
+                &["ZRANK", "k", "a"],
+                &["ZREVRANK", "k", "a"],
+                &["ZSCAN", "k", "0"],
+                &["ZRANGE", "k", "0", "-1"],
+                &["ZREVRANGE", "k", "0", "-1"],
+                &["ZRANGEBYSCORE", "k", "-inf", "+inf"],
+                &["ZREVRANGEBYSCORE", "k", "+inf", "-inf"],
+                &["ZCOUNT", "k", "-inf", "+inf"],
+                &["ZLEXCOUNT", "k", "-", "+"],
+                &["ZMSCORE", "k", "a"],
+                &["ZRANDMEMBER", "k"],
+                &["ZDIFF", "1", "k"],
+                &["ZUNION", "1", "k"],
+                &["ZINTER", "1", "k"],
+                &["ZINTERCARD", "1", "k"],
             ],
         },
         // short hash -> listpack. Already correct before moon#832 (the hash
@@ -207,6 +239,12 @@ fn read_never_flattens_a_compact_encoding_on_any_dispatch_path() {
                 // that the EVAL wrapper's `tostring` cannot render; the point
                 // of the EVAL leg is the dispatch path, not the reply, so the
                 // ones that only differ in reply shape run on Plain + Multi.
+                //
+                // ZDIFF/ZUNION/ZINTER/ZINTERCARD are excluded for a SECOND,
+                // independent reason: `read_via` substitutes `KEYS[1]` at
+                // argv index 1, which for those four is `numkeys`, not the
+                // key. Left in, the EVAL leg would silently run
+                // `ZDIFF k k` — a green row measuring nothing.
                 if matches!(path, Path::Eval)
                     && matches!(
                         read[0],
@@ -221,6 +259,16 @@ fn read_never_flattens_a_compact_encoding_on_any_dispatch_path() {
                             | "HKEYS"
                             | "HVALS"
                             | "SMISMEMBER"
+                            | "ZSCAN"
+                            | "ZRANGE"
+                            | "ZREVRANGE"
+                            | "ZRANGEBYSCORE"
+                            | "ZREVRANGEBYSCORE"
+                            | "ZMSCORE"
+                            | "ZDIFF"
+                            | "ZUNION"
+                            | "ZINTER"
+                            | "ZINTERCARD"
                     )
                 {
                     continue;
@@ -254,7 +302,7 @@ fn read_never_flattens_a_compact_encoding_on_any_dispatch_path() {
     let _ = child.wait();
 
     assert!(
-        checked >= 50,
+        checked >= 90,
         "only {checked} cases ran — the matrix collapsed, so a green result means nothing"
     );
     assert!(
