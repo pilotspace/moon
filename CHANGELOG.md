@@ -22,11 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (*box `RedisValue`'s fat variants*). A four-point, two-pass bisect at n=10 puts
   SADD p=64 at -6.4%, SPOP at -4.5% and ZADD at -4.7% in that single commit,
   with the two flanking windows tied on all 48 of their cells — overturning the
-  issue's "spread across three windows" framing. The *mechanism* is explicitly
-  left open: the natural explanation (boxed-payload indirection) is refuted by
-  `OBJECT ENCODING`, since every container the harness benchmarks is listpack
-  and never reaches a boxed variant. The standing refutation of #861 was right
-  about HSET — which the bisect confirms is a tie — and wrong only to generalise.
+  issue's "spread across three windows" framing. The mechanism is **boxed-variant
+  indirection**, and it correlates without exception: the three families that
+  regressed hold a variant #861 boxed at their own measurement point (set
+  `hashtable`, zset `skiplist`), and the two that tie hold 24-byte listpack
+  variants it did not box. A symbol-resolved `perf` A/B localises the cost to the
+  handler bodies (`set_write::sadd` 0.80% → 6.45%, `spop` 6.10% → 10.15%) and
+  rules out the allocator (1.94% → 2.02%). Establishing this needed the harness
+  leg replayed **in order** and the encoding **population** tallied — the
+  families mutate each other's keyspace, and the regime oscillates per key. The
+  standing refutation of #861 was right about HSET, which the bisect confirms is
+  a tie, and wrong only to generalise from it.
 
   Also measured for the first time: **container memory**. §3 had covered string
   values only, so the encoding campaign's payoff was measured nowhere. Two

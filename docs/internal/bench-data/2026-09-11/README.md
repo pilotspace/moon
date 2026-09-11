@@ -87,13 +87,31 @@ The `plain` leg is clean on every binary; that is the point. The defect was
 only ever reachable from the **mutable** dispatch path, so a probe that issued
 a bare `ZSCORE` would have run clean against a buggy binary and proved nothing.
 
-### `bench-load-encodings-arm.txt`
+### `bench-load-encodings-arm.txt` — superseded, kept as the record of a wrong probe
 
-`OBJECT ENCODING` of the keys that `bench-ab-matrix.sh`'s **own** load
-produces. Recorded because the first mechanism proposed for the #861 finding —
-boxed-payload indirection — is refuted by it: every container the matrix
-benchmarks is listpack-encoded (set 8-19 elements, zset 14, list 15, hash 1) and
-never reaches `RedisValue::Set` or `SortedSetBPTree`, the variants #861 boxed.
+`OBJECT ENCODING` under a load of *seed + `SADD p=64` only*. **Do not read this
+as the harness's regime.** It omits `SPOP`, which runs immediately after `SADD`
+at every depth and flattens the set it touches, so it reports listpack where the
+real leg has hashtable. It is kept because it is what produced a published and
+then retracted claim; `perf-861/` has the correct measurement.
+
+### `perf-861/` — mechanism of the #861 regression
+
+- `pop-tally-75ad520c-arm.txt` / `pop-tally-5bf716a9-arm.txt` — encoding
+  **population** (200 keys) at each family's own p=64 measurement point, after
+  replaying the harness leg in full. This is the authoritative regime record.
+  The regime oscillates per key, so one key cannot characterise it.
+- `regime-leg-replay-arm.txt` — the per-step walk that first showed `SPOP`
+  flattening a set mid-leg.
+- `sadd-*.txt` / `spop-*.txt` — `perf report` symbol shares for `435ff2d8` vs
+  `75ad520c`, two reps each, from binaries rebuilt with the repo's
+  `release-with-debug` profile. Sampling is the `cpu-clock` **software** event —
+  this VM exposes no PMU, so `cycles`/`instructions` are unsupported and no IPC
+  or cache-miss claim can be made from these.
+- `perf-861-rps-arm.txt` — the throughput each profiled run measured, so the
+  profile can be tied to a regression that actually reproduced (SADD -4.3%).
+
+### `encodings-arm.txt`
 
 ### `encodings-arm.txt`
 

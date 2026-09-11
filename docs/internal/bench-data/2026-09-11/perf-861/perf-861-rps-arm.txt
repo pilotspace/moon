@@ -1,0 +1,21 @@
+=== 435ff2d8 rep1 ===
+  ENCODINGS at the SADD p=64 point (n=200): hashtable=141 (absent)=59 
+  SADD p=64 rps=334604.53
+  ENCODINGS after SADD p=64 (n=200): hashtable=200 
+  SPOP p=64 rps=264276.25
+=== 75ad520c rep1 ===
+  ENCODINGS at the SADD p=64 point (n=200): hashtable=131 (absent)=69 
+  SADD p=64 rps=321481.38
+  ENCODINGS after SADD p=64 (n=200): hashtable=200 
+  SPOP p=64 rps=260739.11
+=== 75ad520c rep2 ===
+  ENCODINGS at the SADD p=64 point (n=200): hashtable=114 (absent)=86 
+  SADD p=64 rps=315796.22
+  ENCODINGS after SADD p=64 (n=200): hashtable=200 
+  SPOP p=64 rps=252999.16
+=== 435ff2d8 rep2 ===
+  ENCODINGS at the SADD p=64 point (n=200): hashtable=116 (absent)=84 
+  SADD p=64 rps=331206.03
+  ENCODINGS after SADD p=64 (n=200): hashtable=200 
+  SPOP p=64 rps=259880.81
+PERF_FINAL_DONE

@@ -1,0 +1,7 @@
+=== 5bf716a9: population at each family's p=64 measurement point (n=200 keys) ===
+  before LPUSH p=64          (absent)=1 listpack=199 
+  before SADD p=64           hashtable=122 (absent)=75 listpack=3 
+  before SPOP p=64           hashtable=122 listpack=78 
+  before HSET p=64           (absent)=1 listpack=199 
+  before ZADD p=64           (absent)=5 listpack=195 
+  after  ZADD p=64           listpack=200 

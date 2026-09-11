@@ -1,0 +1,8 @@
+--- 5bf716a9: exact bench-ab-matrix.sh leg ---
+  after seed             set=listpack  (1)  zset=          (0)  hash=          (0)  list=          (0)
+  p=1 after SADD         set=listpack  (2)  zset=          (0)  hash=          (0)  list=          (0)
+  p=1 after ZADD         set=hashtable (1)  zset=          (0)  hash=listpack  (1)  list=          (0)
+  p=8 after SADD         set=hashtable (3)  zset=          (0)  hash=listpack  (1)  list=listpack  (5)
+  p=8 after ZADD         set=          (0)  zset=listpack  (5)  hash=listpack  (1)  list=listpack  (5)
+  p=64 after SADD        set=listpack  (13)  zset=listpack  (5)  hash=listpack  (1)  list=listpack  (18)
+  p=64 after ZADD        set=          (0)  zset=listpack  (19)  hash=listpack  (1)  list=listpack  (18)

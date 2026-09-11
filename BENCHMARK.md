@@ -275,39 +275,65 @@ entire window is one commit: **#861, `perf(storage): box RedisValue's fat
 variants`** (`75ad520c`). Within W2, SET, GET, INCR, LPUSH and HSET are ties, so
 the cost falls on SADD, SPOP and ZADD specifically.
 
-**The mechanism is not established, and the obvious explanation is wrong.** The
-natural reading — #861 boxed `Set` and `SortedSet`, so SADD/SPOP/ZADD pay a
-dependent load per access — was tested and does not hold. Under the matrix
-harness's *own* load, every container stays compact:
+**The mechanism is boxed-variant indirection, and it correlates perfectly.** The
+families that regressed are exactly the families whose containers hold a variant
+#861 boxed — no exceptions in either direction. Encoding *population* at each
+family's own p=64 measurement point, sampled over 200 keys after replaying the
+harness leg in full:
 
-| key | encoding | elements |
-|---|---|---:|
-| `set:…` | **listpack** | 8–19 |
-| `z:…` | **listpack** | 14 |
-| `list:…` | **listpack** | 15 |
-| `hash:…` | **listpack** | 1 |
+| family | encoding at its p=64 point | variant | #861 boxed it? | W2 |
+|---|---|---|:---:|---:|
+| LPUSH | listpack 199/200 | `ListListpack` (24 B) | no | *tie* |
+| HSET | listpack 199/200 | `HashListpack` (24 B) | no | *tie* |
+| SADD | **hashtable** 123/200 (77 absent) | `Set(Box<SetValue>)` | **yes** | **-6.4%** |
+| SPOP | **hashtable** 200/200 | `Set(Box<SetValue>)` | **yes** | **-4.5%** |
+| ZADD | **skiplist** 200/200 | `SortedSetBPTree` | **yes** | **-4.7%** |
 
-`SetListpack` and `SortedSetListpack` are the 24-byte variants; #861 never
-boxed them, and none of the benchmarked keys ever reaches `RedisValue::Set` or
-`SortedSetBPTree`. So the regression is **not** boxed-payload indirection. What
-#861 did change for every container key is the enum itself — 128 B → 40 B,
-moving `CompactValue`'s block from jemalloc's 128-byte size class to the
-48-byte one. Why that costs SADD/SPOP/ZADD ~5% while leaving LPUSH and HSET
-(also listpack, comparable payloads) untouched is **unexplained**, and this run
-does not explain it. `perf` on the two W2 binaries is the next step.
+Getting this right required replaying the leg **in order** and tallying the
+**population**, and two earlier readings of it were wrong. The families mutate
+each other's keyspace — `SPOP` runs straight after `SADD` at every depth and
+flattens the set it touches — so a probe that benchmarks `SADD` alone sees
+listpack and concludes the opposite. And the regime oscillates *per key* (SADD
+recreates a listpack, SPOP flattens it to a hashtable, then empties and deletes
+it), so a single sampled key reports whichever phase it is in. Both mistakes
+were made here before the table above was produced.
 
-This also settles the standing #861 refutation, in both directions. That comment
-traced `HSET`, found it takes `get_or_create_hash_listpack`'s early-true branch
-and constructs no `RedisValue`, and concluded no box is allocated — **all of
-which the bisect confirms**: HSET is a tie in W2. The error was generalising
-from HSET to SADD/SPOP, which the comment itself flagged as unmeasured
-("whether traversing an already-boxed variant costs on *read* paths is a
-separate question"). #861 is now attributed by bisect, not by mechanism. Neither
-the original hypothesis nor its refutation had the reason right.
+A symbol-resolved `perf` A/B of the two W2 binaries, rebuilt with the repo's
+`release-with-debug` profile and profiled in the correctly-replayed regime,
+localises the cost to the handler bodies and **rules out the allocator**:
 
-The trade was deliberate and is documented in #861 itself — 80 B/key saved on
-every container key. What was missing is the throughput side of it, which is
-this table. It is a real, measured cost that nobody priced at the time, not a
+| symbol | `435ff2d8` | `75ad520c` |
+|---|---:|---:|
+| `command::set::set_write::sadd` | 0.80% | **6.45%** |
+| `command::set::set_write::spop` | 6.10% | **10.15%** |
+| all allocator symbols, SADD run | 1.94% | 2.02% |
+| `indexmap::IndexMap::insert_full` | 7.50% | 7.17% |
+
+So it is not a jemalloc size-class effect — the allocator share is flat — and
+not the `IndexSet` insert itself. The extra time is inside the handler, which is
+where the `Box<SetValue>` deref now sits. (Sampling is on the `cpu-clock`
+*software* event: this VM exposes no PMU, so these are time shares, not IPC or
+cache-miss counts, and share-based profiles cannot fully separate new work from
+work relocated by LTO inlining.)
+
+**What this means at HEAD.** The exposure has already shrunk on its own. Re-run
+on `5bf716a9`, the zset population at ZADD's measurement point is **listpack
+195/200**, not skiplist — the encoding campaign (#920/#921/#922/#932) keeps it
+compact, so ZADD no longer reaches `SortedSetBPTree` and no longer pays #861 at
+all. That is part of ZADD's +39.8%. Sets are the remaining exposure: `SPOP`
+still flattens, so SADD/SPOP still run against `Set(Box<SetValue>)` today
+(hashtable 122/200 at HEAD).
+
+This also settles the standing #861 refutation. That comment traced `HSET`,
+found it takes `get_or_create_hash_listpack`'s early-true branch and constructs
+no `RedisValue`, and concluded no box is allocated — **all of which is correct,
+and the bisect confirms it**: the hash is listpack 199/200 and HSET is a tie.
+The only error was generalising from HSET to SADD/SPOP, which that comment
+itself flagged as unmeasured.
+
+The trade was deliberate and is documented in #861 — 80 B/key saved on every
+container key. What was missing is the throughput side of it, which is this
+table. It is a real, measured cost that nobody priced at the time, not a
 defect, and not on its own a reason to revert.
 
 **Two rows where the control failed.** Redis's own series went bimodal on ZADD
