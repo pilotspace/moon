@@ -7,6 +7,66 @@ use crate::storage::db::{HashTtlCond, Shape, hash_field_cost, hash_field_cost_le
 use crate::storage::entry::boxed_payload_block;
 
 use crate::command::helpers::{all_args_are_bytes, err_wrong_args, extract_bytes, ok};
+use crate::storage::listpack::ListpackRef;
+
+/// Widest decimal rendering of an `i64` — `-9223372036854775808`, 20 bytes.
+///
+/// HINCRBY's entry gate needs an upper bound on the value it is about to
+/// write, and the actual value is not known until the CURRENT one has been
+/// read — which needs the listpack borrow the gate must precede. Every `i64`
+/// `itoa` can render fits in this, so gating on it is conservative in the one
+/// safe direction: it can only send an oversized write to the full form,
+/// never squeeze an oversized value into a listpack.
+const I64_MAX_RENDERED_LEN: usize = 20;
+
+/// Settle the memory ledger after a listpack-path hash write and perform the
+/// one-time `HashListpack -> Hash` upgrade when the listpack no longer fits.
+///
+/// Every listpack write in this file ends the same way: charge or credit the
+/// listpack's O(1) capacity delta, then, if the authority says the container
+/// has outgrown the compact form, swap the encoding and re-bill it under the
+/// full form's per-field cost model. Four hand-copied tails is exactly how
+/// three sites came to disagree about a threshold (moon#896), so the paths
+/// moon#897 adds share HSET's rather than reproducing it.
+///
+/// `before`/`after` are `Listpack::estimate_memory()` around the mutation.
+/// `should_upgrade` is `!limits.listpack_fits(Shape::Hash, lp)`, evaluated
+/// while the listpack was still borrowed — the authority's predicate, never a
+/// hand-rolled count.
+fn settle_hash_listpack_write(
+    db: &mut Database,
+    key: &[u8],
+    before: usize,
+    after: usize,
+    should_upgrade: bool,
+) {
+    if after >= before {
+        db.charge_memory(after - before);
+    } else {
+        db.credit_memory(before - after);
+    }
+    if !should_upgrade {
+        return;
+    }
+    // One-time listpack -> Hash upgrade: the cost MODEL changes
+    // (capacity-based -> per-field sum), so the swing is charged via a single
+    // O(n) recompute. This fires once per key at the threshold, not per
+    // mutation.
+    let new_cost: usize = {
+        let map = db.upgrade_hash_listpack_to_hash(key);
+        // The `HashMap` the fields move into is itself a boxed payload — a
+        // second allocation the listpack did not have. Omit it and the running
+        // ledger drifts 48 B below a full recompute on every key that crosses
+        // the threshold.
+        boxed_payload_block(map)
+            + map
+                .iter()
+                .map(|(k, v)| hash_field_cost(k, v))
+                .sum::<usize>()
+    };
+    db.credit_memory(after);
+    db.charge_memory(new_cost);
+}
 
 /// HSET key field value [field value ...]
 ///
@@ -85,29 +145,7 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
                 let should_upgrade = !limits.listpack_fits(Shape::Hash, lp);
                 // `lp`'s borrow of `db` ends here (last use above) — safe to
                 // call back into `db` for accounting from this point on.
-                if after >= before {
-                    db.charge_memory(after - before);
-                } else {
-                    db.credit_memory(before - after);
-                }
-                if should_upgrade {
-                    // One-time listpack -> Hash upgrade: the cost MODEL changes
-                    // (capacity-based -> per-field sum), so the swing is charged
-                    // via a single O(n) recompute. This fires once per key at
-                    // the 128-entry boundary, not per mutation.
-                    let map = db.upgrade_hash_listpack_to_hash(key);
-                    // The `HashMap` the fields move into is itself a boxed
-                    // payload — a second allocation the listpack did not have.
-                    // Omit it and the running ledger drifts 48 B below a full
-                    // recompute on every key that crosses the threshold.
-                    let new_cost: usize = boxed_payload_block(map)
-                        + map
-                            .iter()
-                            .map(|(k, v)| hash_field_cost(k, v))
-                            .sum::<usize>();
-                    db.credit_memory(after);
-                    db.charge_memory(new_cost);
-                }
+                settle_hash_listpack_write(db, key, before, after, should_upgrade);
                 return Frame::Integer(count);
             }
             Ok(None) => {
@@ -264,26 +302,7 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
                 let after = lp.estimate_memory();
                 let should_upgrade = !limits.listpack_fits(Shape::Hash, lp);
                 // `lp`'s borrow of `db` ends here.
-                if after >= before {
-                    db.charge_memory(after - before);
-                } else {
-                    db.credit_memory(before - after);
-                }
-                if should_upgrade {
-                    // One-time cost-model swing — see the matching comment in `hset`.
-                    let map = db.upgrade_hash_listpack_to_hash(key);
-                    // The `HashMap` the fields move into is itself a boxed
-                    // payload — a second allocation the listpack did not have.
-                    // Omit it and the running ledger drifts 48 B below a full
-                    // recompute on every key that crosses the threshold.
-                    let new_cost: usize = boxed_payload_block(map)
-                        + map
-                            .iter()
-                            .map(|(k, v)| hash_field_cost(k, v))
-                            .sum::<usize>();
-                    db.credit_memory(after);
-                    db.charge_memory(new_cost);
-                }
+                settle_hash_listpack_write(db, key, before, after, should_upgrade);
                 return ok();
             }
             Ok(None) => {}
@@ -370,6 +389,79 @@ pub fn hincrby(db: &mut Database, args: &[Frame]) -> Frame {
         },
         None => return err_wrong_args("HINCRBY"),
     };
+
+    // moon#897: a secondary write must not FLATTEN a small hash.
+    //
+    // HINCRBY used to reach straight for `get_or_create_hash`, whose contract
+    // is an EAGER upgrade to the full `HashMap` — so one HINCRBY on a
+    // three-field hash promoted it to `hashtable`, and because nothing
+    // demotes (moon#832) it stayed there for the key's lifetime. Redis
+    // mutates the listpack in place and promotes only when a threshold is
+    // genuinely crossed; `HDEL` was already the only moon hash write that
+    // did the same. This is that path.
+    //
+    // The gate is the ONE authority HSET's gate is (moon#896): one field is
+    // at most one new item, and the element this command writes is an
+    // `itoa`-rendered `i64`, bounded by `I64_MAX_RENDERED_LEN`. The upgrade
+    // check after the mutation is the same authority's `listpack_fits`, so a
+    // hash that legitimately outgrows the compact form still promotes.
+    let limits = db.encoding_limits();
+    if limits.fits(Shape::Hash, 1, field.len().max(I64_MAX_RENDERED_LEN)) {
+        // `HashWithTtl` returns `Ok(None)` here and falls through to the
+        // HashMap path — a TTL'd hash never compacts back to a listpack, so
+        // the per-field TTL sidecar is untouched by this arm.
+        match db.get_or_create_hash_listpack(key) {
+            Ok(Some(lp)) => {
+                // The SAME parse the HashMap path below applies, on the same
+                // bytes. A listpack `Integer` entry only ever holds a value
+                // whose canonical decimal spelling is what the caller wrote
+                // (moon#795), so its rendering round-trips; a `Str` entry
+                // holds the caller's bytes verbatim and gets the identical
+                // `str::parse::<i64>` treatment, error string included.
+                let current = match lp.pair_value(field.as_ref()) {
+                    Some(ListpackRef::Integer(n)) => n,
+                    Some(ListpackRef::Str(s)) => {
+                        match std::str::from_utf8(s)
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok())
+                        {
+                            Some(n) => n,
+                            None => {
+                                return Frame::Error(Bytes::from_static(
+                                    b"ERR hash value is not an integer",
+                                ));
+                            }
+                        }
+                    }
+                    None => 0,
+                };
+                let new_value = current + increment;
+                let mut ibuf = itoa::Buffer::new();
+                // Canonical by construction, so re-encoding it into the
+                // listpack is byte-transparent (moon#795): `itoa` never emits
+                // a leading zero, a `+` sign, or `-0`.
+                let rendered = ibuf.format(new_value).as_bytes();
+                // Listpack `estimate_memory()` is O(1) (capacity-based).
+                let before = lp.estimate_memory();
+                // ONE borrowed scan overwrites the value in place and leaves
+                // the entry count alone; only an absent field adds a pair.
+                if !lp.replace_pair_value(field.as_ref(), rendered) {
+                    lp.push_back(field.as_ref());
+                    lp.push_back(rendered);
+                }
+                let after = lp.estimate_memory();
+                let should_upgrade = !limits.listpack_fits(Shape::Hash, lp);
+                // `lp`'s borrow of `db` ends here.
+                settle_hash_listpack_write(db, key, before, after, should_upgrade);
+                return Frame::Integer(new_value);
+            }
+            Ok(None) => {
+                // Already a full HashMap or HashWithTtl — fall through.
+            }
+            Err(e) => return e,
+        }
+    }
+
     let map = match db.get_or_create_hash(key) {
         Ok(m) => m,
         Err(e) => return e,
@@ -497,6 +589,46 @@ pub fn hsetnx(db: &mut Database, args: &[Frame]) -> Frame {
         Some(v) => v.clone(),
         None => return err_wrong_args("HSETNX"),
     };
+
+    // moon#897: same defect, same fix as HINCRBY above — `get_or_create_hash`
+    // flattened a three-field hash to `hashtable` on the first HSETNX, for
+    // good. The gate is HSET's, for the same single pair: the longer of the
+    // field and the value against `hash-max-listpack-value`, one item against
+    // `hash-max-listpack-entries`, both from the ONE authority.
+    let limits = db.encoding_limits();
+    if limits.fits(Shape::Hash, 1, field.len().max(value.len())) {
+        // `HashWithTtl` returns `Ok(None)` and falls through — a TTL'd hash
+        // never compacts back to a listpack.
+        match db.get_or_create_hash_listpack(key) {
+            Ok(Some(lp)) => {
+                // The no-op contract, unchanged: an existing field is NOT
+                // overwritten, its TTL is NOT cleared, and nothing about the
+                // container changes — its encoding included. Returning here
+                // before touching the listpack is what makes that true.
+                if lp.find_pair_index(field.as_ref()).is_some() {
+                    return Frame::Integer(0);
+                }
+                // Listpack `estimate_memory()` is O(1) (capacity-based).
+                let before = lp.estimate_memory();
+                // The caller's bytes go in verbatim: the listpack integer
+                // encoding is reserved for canonical spellings (moon#795), so
+                // `+5`, `007` and ` 7` are stored as strings and read back
+                // unchanged.
+                lp.push_back(field.as_ref());
+                lp.push_back(value.as_ref());
+                let after = lp.estimate_memory();
+                let should_upgrade = !limits.listpack_fits(Shape::Hash, lp);
+                // `lp`'s borrow of `db` ends here.
+                settle_hash_listpack_write(db, key, before, after, should_upgrade);
+                return Frame::Integer(1);
+            }
+            Ok(None) => {
+                // Already a full HashMap or HashWithTtl — fall through.
+            }
+            Err(e) => return e,
+        }
+    }
+
     // get_or_create_hash is now HashWithTtl-aware: returns fields sub-map.
     let map = match db.get_or_create_hash(key) {
         Ok(m) => m,

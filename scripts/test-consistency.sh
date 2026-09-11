@@ -412,6 +412,65 @@ assert_both "HINCRBY" HGET h:test counter
 both HINCRBY h:test counter 5
 assert_both "HINCRBY again" HGET h:test counter
 
+# ---------------------------------------------------------------------------
+# moon#897: a SECONDARY write must not flatten a small hash.
+#
+# HINCRBY and HSETNX reached for the eager `get_or_create_hash` accessor, so
+# one of them on a three-field hash promoted it to `hashtable` — permanently,
+# because nothing demotes (moon#832). HDEL was the only hash write that
+# survived; it is pinned here alongside them so the survivor cannot regress.
+#
+# The rows below stay inside the range where moon's policy and Redis's AGREE.
+# Redis defaults `hash-max-listpack-entries` to 512 and moon hard-codes 128,
+# so a "one past the threshold" hash row would measure that policy gap, not
+# this fix — the entries boundary is covered by the unit guards in
+# `src/command/hash/mod.rs` instead. `hash-max-listpack-value` is 64 on both,
+# so the ELEMENT-size boundary is checkable here and is.
+both HSET h:enc:incr f1 v1 f2 v2 n 10
+assert_both "OBJECT ENCODING hash before HINCRBY" OBJECT ENCODING h:enc:incr
+assert_both "HINCRBY on a compact hash"           HINCRBY h:enc:incr n 5
+assert_both "OBJECT ENCODING hash after HINCRBY"  OBJECT ENCODING h:enc:incr
+assert_both "HGET after HINCRBY"                  HGET h:enc:incr n
+assert_both "HLEN after HINCRBY"                  HLEN h:enc:incr
+# A brand-new field added by HINCRBY keeps the container compact too.
+assert_both "HINCRBY creates a field"             HINCRBY h:enc:incr fresh 7
+assert_both "OBJECT ENCODING after new field"     OBJECT ENCODING h:enc:incr
+
+both HSET h:enc:nx f1 v1 f2 v2 f3 v3
+assert_both "HSETNX new field"                    HSETNX h:enc:nx added 1
+assert_both "OBJECT ENCODING after HSETNX"        OBJECT ENCODING h:enc:nx
+assert_both "HSETNX on an existing field is 0"    HSETNX h:enc:nx f1 clobber
+assert_both "HSETNX no-op left the value alone"   HGET h:enc:nx f1
+assert_both "OBJECT ENCODING after HSETNX no-op"  OBJECT ENCODING h:enc:nx
+# HDEL was already correct — pin the survivor.
+assert_both "HDEL on a compact hash"              HDEL h:enc:nx f3
+assert_both "OBJECT ENCODING after HDEL"          OBJECT ENCODING h:enc:nx
+
+# The fix is "do not flatten a SMALL hash", not "never promote". The VALUE
+# threshold is 64 bytes on both servers, so both sides of it are checkable
+# against the live oracle.
+both HSET h:enc:v64 f1 v1
+both HSETNX h:enc:v64 big "$(printf 'v%.0s' $(seq 1 64))"
+assert_both "OBJECT ENCODING HSETNX 64-byte value"   OBJECT ENCODING h:enc:v64
+both HSET h:enc:v65 f1 v1
+both HSETNX h:enc:v65 big "$(printf 'v%.0s' $(seq 1 65))"
+assert_both "OBJECT ENCODING HSETNX 65-byte value"   OBJECT ENCODING h:enc:v65
+assert_both "HSTRLEN oversized value survived"       HSTRLEN h:enc:v65 big
+
+# moon#795: routing HSETNX into a listpack must not start NORMALISING the
+# caller's bytes. A listpack integer-encodes only canonical spellings, so
+# `+5` / `007` / `000000012345` must come back exactly as they went in.
+both HSET h:enc:ident f1 v1
+both HSETNX h:enc:ident a +5
+both HSETNX h:enc:ident b 007
+both HSETNX h:enc:ident c 000000012345
+both HSETNX h:enc:ident d -0
+assert_both "OBJECT ENCODING non-canonical hash"  OBJECT ENCODING h:enc:ident
+assert_both "HSETNX kept +5 verbatim"             HGET h:enc:ident a
+assert_both "HSETNX kept 007 verbatim"            HGET h:enc:ident b
+assert_both "HSETNX kept 000000012345 verbatim"   HGET h:enc:ident c
+assert_both "HSETNX kept -0 verbatim"             HGET h:enc:ident d
+
 # ===========================================================================
 # 7. List operations
 # ===========================================================================

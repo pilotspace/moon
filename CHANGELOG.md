@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`HINCRBY` and `HSETNX` no longer flatten a small hash (moon#897).** Both
+  reached for `Database::get_or_create_hash`, whose contract is an EAGER
+  upgrade to the full `HashMap` — so a single `HINCRBY` on a three-field hash
+  promoted it from `listpack` to `hashtable`, and because nothing demotes
+  (moon#832) it stayed there for the key's lifetime. Counter hashes, which are
+  touched by `HINCRBY` in a loop, never got the compact encoding at all.
+  `HDEL` was the one hash secondary write that already did the right thing;
+  both commands now take the same in-place listpack route it does, gated by
+  the single `EncodingLimits` authority (moon#896) so a hash that genuinely
+  exceeds `hash-max-listpack-entries` or `hash-max-listpack-value` still
+  promotes. Measured against redis 8.6.1 with the policies aligned, one shard:
+  24 divergences before, 0 after — including field ORDER on `HGETALL`/`HKEYS`,
+  which only differed because the container had been flattened into an
+  unordered map. Reply values, error strings, `HSETNX`'s no-op-on-existing
+  contract and the per-field TTL sidecar are unchanged; the listpack integer
+  encoding still refuses non-canonical spellings, so `+5` and `007` survive
+  byte-for-byte (moon#795).
+
 - **`--max-wal-size` now reaches the WAL overflow ceiling (moon#916).** The flag
   configured `CheckpointTrigger` but never `WalWriterV3`, whose bounds setter
   had no production caller at all — so the P6 check in
