@@ -233,8 +233,15 @@ impl Database {
                 true
             }
             ColdReadOutcome::Expired => {
-                // Expired on disk: reclaim the index entry now, or it leaks
-                // (the orphan sweep only checks hot-shadowing, never TTL).
+                // Expired on disk: reclaim the index entry now rather than
+                // waiting for the periodic sweep. TTL expiry IS swept --
+                // `ColdIndex::sweep_expired` runs alongside `orphan_sweep`
+                // in `shard::timers::run_cold_orphan_sweep`, every
+                // `cold_orphan_sweep_interval_secs` -- so this is a latency
+                // optimisation, not the only reclaim path. Doing it here
+                // costs nothing (we have already paid for the read that
+                // proved the entry expired) and keeps `# Keyspace` from
+                // counting a key that the very next `EXISTS` will deny.
                 // Safe to remove unconditionally here -- the revalidation
                 // above already confirmed the index still points at
                 // `expected_location`, so this can't be clobbering a newer
