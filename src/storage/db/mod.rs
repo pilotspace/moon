@@ -4,9 +4,11 @@ use std::collections::HashMap;
 mod accessors;
 mod cold_replay_gate;
 mod hash_ttl;
+mod incr;
 mod kv_ops;
 
 pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile};
+pub(crate) use incr::IncrOutcome;
 
 pub use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef, StreamRef};
 pub use accessors::EntryView;

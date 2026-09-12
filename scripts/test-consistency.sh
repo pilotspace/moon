@@ -258,6 +258,33 @@ assert_both "DECR twice" GET mut:counter
 both INCRBY mut:counter 50
 assert_both "INCRBY 50" GET mut:counter
 
+# INCR in place (moon#942). The SSO seam is where an in-place integer write is
+# most likely to be wrong: <=12 bytes live inline in the CompactValue, 13+ in a
+# Box<[u8]>, and the fast path has to cross that boundary in both directions.
+both SET mut:sso "999999999999"       # 12 bytes — inline
+both INCR mut:sso                      # 13 bytes — heap
+assert_both "INCR SSO inline->heap" GET mut:sso
+both DECR mut:sso                      # back to 12 — inline
+assert_both "INCR SSO heap->inline" GET mut:sso
+assert_both "OBJECT ENCODING after in-place INCR" OBJECT ENCODING mut:sso
+
+# An INCR that ERRORS must leave the stored value exactly where it was, and
+# must not be reported as a change. (The in-place path returns before it
+# writes; the rule is Redis's, not moon's.)
+both SET mut:ovf "9223372036854775807"
+assert_both "INCR overflow errors"        INCR mut:ovf
+assert_both "INCR overflow keeps value"   GET  mut:ovf
+both SET mut:uf "-9223372036854775808"
+assert_both "DECR underflow errors"       DECR mut:uf
+assert_both "DECR underflow keeps value"  GET  mut:uf
+both SET mut:word "abc"
+assert_both "INCR non-integer errors"     INCR mut:word
+assert_both "INCR non-integer keeps value" GET mut:word
+both DEL mut:incrwt
+both RPUSH mut:incrwt a b
+assert_both "INCR WRONGTYPE"              INCR   mut:incrwt
+assert_both "INCR WRONGTYPE keeps list"   LRANGE mut:incrwt 0 -1
+
 # INCRBYFLOAT (skip exact comparison — float formatting may differ)
 both SET mut:flt "10.5"
 both INCRBYFLOAT mut:flt "0.1"
