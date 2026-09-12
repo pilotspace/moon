@@ -93,6 +93,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fuzz target `canonical_i64_differential`** — pins
+  `is_canonical_i64(d) == canonical_i64(d).is_some()` for every byte string,
+  plus the moon#795 property itself (an accepted value must render back to the
+  caller's exact bytes) and a suffix-extension check that a length-confused
+  recognizer would fail. Two hand-written recognizers of one grammar stay
+  honest only by agreeing, and a divergence here is a data-corruption bug on a
+  hot path, not a cosmetic one. Registered in `fuzz/Cargo.toml` and in **both**
+  matrices in `.github/workflows/fuzz.yml` — an unlisted target never runs.
+
+  **The target was proved to find its own bug before being trusted.** Against
+  the correct implementation it ran 16,290,362 executions in 46s with no
+  finding; against an implementation with the `-0` rule removed it crashed on
+  `[45, 48]` — `"-0"`, one of the original moon#795 vectors — reached by the
+  suffix-extension check from the one-byte input `"-"`.
+
+- **`storage::numeric::is_canonical_i64`** — `canonical_i64`'s verdict without
+  its value, for the callers that only need to ROUTE. `canonical_i64` costs a
+  UTF-8 validation, an `i64` parse, an `itoa` render and a `memcmp`; that is the
+  right price when the value is wanted, and pure waste when the answer is a
+  yes/no. `SADD`'s `all_integers` pre-pass is the first caller: it walks the
+  batch to decide whether it belongs in an intset and then discards every
+  number it parsed, because the push loop re-derives the ones it needs.
+  `is_canonical_i64` decides the same question from the bytes — sign, digits,
+  no leading zero, no `-0`, and one slice compare against the `i64` boundary at
+  19 magnitude digits.
+
+  Verdict-identity is the whole contract, and moon#795 is why: a non-canonical
+  spelling that slips into an integer encoding destroys the caller's bytes
+  (`SADD s 000000012345` came back as `12345`). So the equivalence is pinned
+  DIFFERENTIALLY against `canonical_i64` itself, never against hand-written
+  expectations — exhaustively over every 1-byte input and over a discriminating
+  alphabet at widths 2 and 3, across both `i64` boundaries digit by digit, and
+  over 200,000 randomised digit-heavy inputs. All four differential tests were
+  confirmed to FAIL against a deliberately mutated implementation before being
+  trusted (dropping the `-0` rule; dropping the range check), and a
+  command-level test pins the observable consequence: each of the moon#795
+  vectors — `007`, `+7`, `-0`, `" 7"`, `"7 "`, the empty string, a 20-digit
+  number, and `i64::MIN`/`i64::MAX` on both sides of their exact boundaries —
+  must still route to the same encoding and come back byte for byte.
+
+  **No throughput number is claimed here.** The candidate came from a
+  `75ad520c` SADD-only profile showing `from_utf8` 1.37% + `itoa` 0.90% +
+  `canonical_i64` 0.55%, but those symbols have other callers on the same leg
+  (the listpack encode path among them), so their attribution to *this*
+  pre-pass is **unverified** — benchmarks are Linux-only and this landed from
+  macOS. The change is justified by doing strictly less work for a provably
+  identical verdict, not by a measurement.
+
 - `scripts/bench-ab-delta.py` — compares moon against **moon** across two
   matrix runs, which `bench-ab-report.py` cannot do. Redis is the control: the
   tool picks the raw or the ratio column per row from the control's own
@@ -142,6 +190,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   follow-up; grant `~*` in the meantime if a restricted user must search.
 
 ### Fixed
+
+- **`SADD` under-reported its reply when one batch crossed
+  `set-max-intset-entries` (moon#944).** The intset push loop `break`s the
+  instant the ceiling is crossed, and the upgrade path then re-inserted the
+  whole argv into the new `IndexSet` while DISCARDING `insert`'s "was this
+  member new" bool — so `added` stopped at the crossing and every member
+  positioned *after* it was stored but never counted. Measured against redis
+  7.4.0 with `set-max-intset-entries 512`: `SADD` on a 510-member intset with a
+  24-member batch adding 22 new members replied **3** where redis replied
+  **22**. The data was never wrong — `SCARD` and `SMEMBERS` agreed all along —
+  which is why no harness row caught it: the reply is the only thing that
+  diverged, and clients build dedup accounting and "did I win the insert"
+  logic on exactly that number.
+
+  The upgrade path now counts `IndexSet::insert`'s bool, and walks **only the
+  unabsorbed tail** rather than the whole argv. The prefix is provably already
+  in the set: `Intset::to_set_value` renders each value with its decimal
+  spelling, and every value entered the intset through `canonical_i64`, so
+  that rendering is the caller's exact bytes (moon#795) — re-walking it was an
+  O(batch) no-op that also spent one `Bytes` clone per member on a
+  `src/command/` path, which CLAUDE.md bans. No unit test covered this because
+  every existing encoding row crosses a threshold with a batch of **one**, and
+  a one-member batch has no tail past the crossing. New rows in
+  `scripts/test-consistency.sh` compare the reply against the real redis oracle
+  for a straddle by twenty, a straddle by one, and a control wholly below the
+  ceiling; the unit tests assert the reply against the `SCARD` delta rather
+  than a hardcoded count, so neither the buggy answer nor an over-counting fix
+  can pass them.
 
 - **`HINCRBY` and `HSETNX` no longer flatten a small hash (moon#897).** Both
   reached for `Database::get_or_create_hash`, whose contract is an EAGER
