@@ -197,13 +197,15 @@ fn get_or_create_set_listpack_probe_budget() {
     // The intset -> listpack edge (moon#899). `absorb_intset_into_listpack`
     // is the reason this accessor costs more than its four siblings.
     let mut db2 = db_at(NOW);
-    {
-        let is = db2
-            .get_or_create_intset(b"t")
-            .expect("set type")
-            .expect("intset");
-        is.insert(1);
-        is.insert(2);
+    match db2.get_or_create_intset(b"t") {
+        Ok(Some(is)) => {
+            is.insert(1);
+            is.insert(2);
+        }
+        other => panic!(
+            "expected a fresh intset, got {:?}",
+            other.map(|o| o.is_some())
+        ),
     }
     let (r, absorb) = probes(|| {
         db2.get_or_create_set_listpack(b"t", |_, _| true)
@@ -368,11 +370,19 @@ fn wrongtype_still_errors_on_a_live_key() {
 
 #[test]
 fn watch_version_bumps_once_per_mutable_handle() {
+    /// The entry's WATCH version, or a failed assertion naming the key.
+    fn version_of(db: &Database, key: &[u8]) -> u32 {
+        match db.data().get(key) {
+            Some(e) => e.version(),
+            None => panic!("key {:?} should be present", String::from_utf8_lossy(key)),
+        }
+    }
+
     let mut db = db_at(NOW);
     let _ = db.get_or_create::<HashKind>(b"h");
-    let v0 = db.data().get(b"h").expect("present").version();
+    let v0 = version_of(&db, b"h");
     let _ = db.get_or_create::<HashKind>(b"h");
-    let v1 = db.data().get(b"h").expect("present").version();
+    let v1 = version_of(&db, b"h");
     assert_eq!(
         v1,
         v0 + 1,
@@ -381,9 +391,9 @@ fn watch_version_bumps_once_per_mutable_handle() {
 
     // The compact accessors carry the same contract.
     let _ = db.get_or_create_hash_listpack(b"lp");
-    let v0 = db.data().get(b"lp").expect("present").version();
+    let v0 = version_of(&db, b"lp");
     let _ = db.get_or_create_hash_listpack(b"lp");
-    let v1 = db.data().get(b"lp").expect("present").version();
+    let v1 = version_of(&db, b"lp");
     assert_eq!(v1, v0 + 1);
 }
 
