@@ -372,8 +372,10 @@ impl<'a> SortedSetRef<'a> {
                 // ONE borrowed scan, and the score is read straight out of the
                 // borrowed view -- no second walk to an index the lookup had
                 // already reached, and nothing materialized at all (moon#799).
-                // `as_score` is the same rule `listpack_zset_find` applies on
-                // the write side, so ZSCORE and ZADD cannot disagree.
+                // `as_score` is the same rule `Listpack::update_pair_value`
+                // applies on the write side (moon#942 replaced the local
+                // `listpack_zset_find` + `replace_at` pair with it), so ZSCORE
+                // and ZADD cannot disagree.
                 lp.pair_value(member)?.as_score()
             }
             SortedSetRef::Legacy { members, .. } => members.get(member).copied(),
