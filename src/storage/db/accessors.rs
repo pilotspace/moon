@@ -154,6 +154,23 @@ impl Database {
     /// present in hot RAM after this call", and `promote_cold_outcome` honours
     /// it on every arm — `Hit` inserts and answers `true`, `Expired` and
     /// `Miss` insert nothing and answer `false`.
+    ///
+    /// moon#942: and it calls `promote_cold_known_absent`, not
+    /// `promote_cold_if_present`, because BOTH arms below leave `key`
+    /// provably absent from the hot plane — `HotState::Absent` means
+    /// `hot_state`'s `get` just answered `None`, and the `Expired` arm has
+    /// just put the entry through `remove_hot`, which removes
+    /// unconditionally. The `contains_key` that opens
+    /// `promote_cold_if_present` therefore cannot do anything but re-answer
+    /// a question one probe old, and skipping it is the fourth probe off
+    /// every `get_or_create*` miss.
+    ///
+    /// That precondition is load-bearing: the skipped `contains_key` is what
+    /// keeps `promote_inflight_if_present` — which overwrites hot RAM with
+    /// no residency check of its own — away from a live value. This function
+    /// is the ONLY caller allowed to skip it, which is why the callee is
+    /// `pub(super)`. Anything added here that could make `key` hot again
+    /// before the call must go back to `promote_cold_if_present`.
     #[inline]
     fn settle_not_live(&mut self, key: &[u8], now_ms: u64, state: HotState) -> bool {
         debug_assert!(
@@ -167,7 +184,8 @@ impl Database {
             // lock-step (moon#541).
             self.remove_hot(key);
         }
-        self.promote_cold_if_present(key, now_ms)
+        // Precondition established above; see this function's doc comment.
+        self.promote_cold_known_absent(key, now_ms)
     }
 
     /// Insert a freshly fabricated, empty container at `key` and charge it.

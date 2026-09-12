@@ -61,11 +61,15 @@ fn get_or_create_probe_budget() {
 
     assert_eq!(
         (hit, miss),
-        (2, 4),
+        (2, 3),
         "get_or_create probe budget moved (hit={hit}, miss={miss}) — moon#942. \
          The hit path is `get` (liveness) then `get_mut` (hand out); the miss \
-         path adds `promote_cold_if_present`'s own `contains_key` and the \
-         `insert`. A RISE is the regression this test exists to catch."
+         path adds ONLY the `insert`. The fourth probe was \
+         `promote_cold_if_present`'s own `contains_key`, re-answering a \
+         question `hot_state` had just answered one probe earlier; \
+         `settle_not_live` now calls `promote_cold_known_absent`, which is \
+         that method without the re-ask. A RISE is the regression this test \
+         exists to catch."
     );
 }
 
@@ -85,7 +89,7 @@ fn get_mut_if_present_probe_budget() {
 
     assert_eq!(
         (hit, miss),
-        (2, 3),
+        (2, 2),
         "get_mut_if_present probe budget moved (hit={hit}, miss={miss}) — moon#942."
     );
 }
@@ -103,7 +107,7 @@ fn get_promoted_probe_budget() {
 
     assert_eq!(
         (hit, miss),
-        (2, 3),
+        (2, 2),
         "get_promoted probe budget moved (hit={hit}, miss={miss}) — moon#942."
     );
 }
@@ -122,7 +126,7 @@ fn get_or_create_intset_probe_budget() {
 
     assert_eq!(
         (hit, miss),
-        (2, 4),
+        (2, 3),
         "get_or_create_intset probe budget moved (hit={hit}, miss={miss}) — moon#942."
     );
 }
@@ -139,7 +143,7 @@ fn get_or_create_hash_listpack_probe_budget() {
 
     assert_eq!(
         (hit, miss),
-        (2, 4),
+        (2, 3),
         "get_or_create_hash_listpack probe budget moved (hit={hit}, miss={miss}) — moon#942."
     );
 }
@@ -156,7 +160,7 @@ fn get_or_create_list_listpack_probe_budget() {
 
     assert_eq!(
         (hit, miss),
-        (2, 4),
+        (2, 3),
         "get_or_create_list_listpack probe budget moved (hit={hit}, miss={miss}) — moon#942."
     );
 }
@@ -173,7 +177,7 @@ fn get_or_create_zset_listpack_probe_budget() {
 
     assert_eq!(
         (hit, miss),
-        (2, 4),
+        (2, 3),
         "get_or_create_zset_listpack probe budget moved (hit={hit}, miss={miss}) — moon#942."
     );
 }
@@ -219,7 +223,7 @@ fn get_or_create_set_listpack_probe_budget() {
 
     assert_eq!(
         (hit, miss, absorb),
-        (2, 4, 2),
+        (2, 3, 2),
         "get_or_create_set_listpack probe budget moved \
          (hit={hit}, miss={miss}, absorb={absorb}) — moon#942. The absorb arm \
          is the one `absorb_intset_into_listpack` used to charge its own extra \
@@ -263,12 +267,15 @@ fn sadd_end_to_end_probe_budget() {
 
     assert_eq!(
         (create, listpack_hit, hashtable_hit),
-        (4, 2, 4),
+        (3, 2, 4),
         "SADD end-to-end probe budget moved \
          (create={create}, listpack_hit={listpack_hit}, hashtable_hit={hashtable_hit}) \
-         — moon#942. The hashtable arm pays TWO accessors: \
+         — moon#942. The hashtable arm STILL pays TWO accessors: \
          `get_or_create_set_listpack` answers `Ok(None)` and `get_or_create_set` \
-         then repeats the whole skeleton. Redis pays one `dictFind` for all three."
+         then repeats the whole skeleton. Collapsing that pair needs the \
+         accessor skeleton itself to hand back the encoding it already has in \
+         its hand, which is the one piece of moon#942's SADD residue still \
+         open. Redis pays one `dictFind` for all three."
     );
 }
 
@@ -594,5 +601,100 @@ fn an_expired_hot_key_with_a_spilled_value_is_also_promoted() {
         db.expires_count(),
         0,
         "the expired incarnation must have left the expiry index (moon#541)"
+    );
+}
+
+// ── the precondition `promote_cold_known_absent` is sold on (moon#942) ──────
+
+#[test]
+fn a_hot_key_with_an_inflight_record_is_not_clobbered_by_promotion() {
+    // moon#942 removed `promote_cold_if_present`'s opening `contains_key`
+    // from the ACCESSOR path only, by routing `settle_not_live` to
+    // `promote_cold_known_absent`. This test pins WHY the split exists
+    // rather than just deleting the probe outright.
+    //
+    // `promote_inflight_if_present` does not re-check hot residency: it
+    // forgets the in-flight record and calls `Database::set` unconditionally.
+    // So on a key that is hot AND still carries an in-flight spill record,
+    // the `contains_key` is the only thing between a live value and the
+    // older spilled body overwriting it. `promote_cold_outcome` (the on-disk
+    // arm) carries its own guard; the in-flight arm does not.
+    //
+    // Mutation check: point `promote_cold_if_present` straight at
+    // `promote_cold_known_absent` and this test reports 3 members — the
+    // spilled body — instead of 2.
+    let mut db = db_at(NOW);
+    match db.get_or_create::<SetKind>(b"s") {
+        Ok(set) => {
+            set.insert(Bytes::from_static(b"live-one"));
+            set.insert(Bytes::from_static(b"live-two"));
+        }
+        Err(e) => panic!("fixture: could not build the hot set: {e:?}"),
+    }
+    // Parked AFTER the write: `Database::set` retires the in-flight record
+    // for a key it overwrites, so parking first would leave nothing to
+    // clobber with and the test would pass vacuously.
+    park_in_flight(
+        &mut db,
+        b"s",
+        spilled_set_body(&[b"alpha", b"beta", b"gamma"]),
+    );
+    assert!(
+        db.spill_inflight_entry(b"s", NOW).is_some(),
+        "fixture: there must be a record that COULD clobber, or this is vacuous"
+    );
+
+    assert!(
+        db.promote_cold_if_present(b"s", NOW),
+        "a hot key is present in hot RAM after the call, by the contract"
+    );
+
+    let set = match db.get_ref_if_alive::<SetKind>(b"s", NOW) {
+        Ok(Some(r)) => r,
+        other => panic!("the hot set vanished: {:?}", other.map(|o| o.is_some())),
+    };
+    assert_eq!(
+        set.len(),
+        2,
+        "`promote_cold_if_present` overwrote a LIVE value with an older          in-flight spill body — the hot guard it opens with is load-bearing,          and only a caller that has just looked (accessors::settle_not_live)          may skip it via `promote_cold_known_absent`"
+    );
+}
+
+#[test]
+fn a_key_deleted_mid_spill_does_not_resurrect_through_the_accessor() {
+    // moon#459, through the accessor preamble the probe collapse rewrote.
+    // `Database::remove` retires the in-flight record (`remove_cold_only`),
+    // which withdraws the spill completion's authorization to publish. A
+    // `get_or_create` afterwards must fabricate an EMPTY container, not
+    // rehydrate the body the DEL was supposed to have destroyed.
+    let mut db = db_at(NOW);
+    match db.get_or_create::<SetKind>(b"s") {
+        Ok(set) => {
+            set.insert(Bytes::from_static(b"doomed"));
+        }
+        Err(e) => panic!("fixture: could not build the set: {e:?}"),
+    }
+    park_in_flight(
+        &mut db,
+        b"s",
+        spilled_set_body(&[b"alpha", b"beta", b"gamma"]),
+    );
+    assert!(
+        db.spill_inflight_entry(b"s", NOW).is_some(),
+        "fixture: the key must be mid-spill for this to test anything"
+    );
+
+    // `remove_counting_cold` is the DEL/UNLINK path — the one that has to
+    // count a mid-spill key as removed, and the one moon#459 was about.
+    let (existed, _) = db.remove_counting_cold(b"s");
+    assert!(existed, "fixture: the DEL must have found the key");
+
+    let len = match db.get_or_create::<SetKind>(b"s") {
+        Ok(set) => set.len(),
+        Err(e) => panic!("expected a fresh empty set, got {e:?}"),
+    };
+    assert_eq!(
+        len, 0,
+        "a key DEL'd mid-spill came back to life through the accessor — the          DEL-acked-then-UNDONE bug (moon#459)"
     );
 }

@@ -8,6 +8,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **The accessor miss path drops its fourth probe: cold promotion stops
+  re-asking whether the key is hot** (moon#942). `promote_cold_if_present`
+  opens with a `contains_key`, and `accessors::settle_not_live` — the only
+  caller on the `get_or_create*` preamble — reaches it exclusively from
+  `HotState::Absent` (`hot_state`'s `get` has just answered `None`) or from
+  `HotState::Expired` after `remove_hot`, which removes unconditionally. Both
+  arms leave the key provably absent, so that `contains_key` could not do
+  anything but re-answer a question one probe old. It is now
+  `promote_cold_known_absent`, the same method without the re-ask, and
+  `settle_not_live` calls that instead.
+
+  **Measured with the `cfg(test)` DashTable key-lookup counter added by the
+  preceding entry**, which is also where the pre-change numbers below come
+  from — this change moves only the miss column, and no hit path moves at all:
+
+  | accessor | miss before | miss after |
+  |---|---:|---:|
+  | `get_or_create` | 4 | **3** |
+  | `get_mut_if_present` | 3 | **2** |
+  | `get_promoted` | 3 | **2** |
+  | `get_or_create_intset` / `_hash_listpack` / `_list_listpack` / `_zset_listpack` / `_set_listpack` | 4 | **3** |
+
+  End to end, `SADD` on an absent key goes 4 → **3**. Its hashtable regime
+  stays at **4** and is untouched: that one is two accessors' worth
+  (`get_or_create_set_listpack` answers `Ok(None)`, `get_or_create_set` then
+  repeats the skeleton) and collapsing it needs the accessor skeleton itself
+  to hand back the encoding it already holds, which this change does not do.
+
+  **The skipped `contains_key` is load-bearing for data integrity, not just
+  for speed, which is why this is a second entry point and not a deletion.**
+  `promote_inflight_if_present` does not re-check residency — it calls
+  `Database::set` unconditionally — so on a key that is hot AND still carries
+  an in-flight spill record, that probe is the only thing between a live value
+  and the older spilled body overwriting it. (`promote_cold_outcome`, the
+  on-disk arm, carries its own guard and is safe either way.)
+  `promote_cold_known_absent` is therefore `pub(super)`, documents the
+  precondition, and has exactly one caller. A new test builds that exact
+  state and pins it: removing the guard from `promote_cold_if_present` makes
+  it report the 3-member spilled body where the 2-member live value should
+  be. A second new test pins that a key DEL'd mid-spill does not resurrect
+  through the accessor (moon#459); dropping `spill_inflight_forget` from
+  `remove_cold_only` makes that one report 3 members instead of 0.
+
+  **No throughput number is claimed, and none was measured.** The same
+  discipline as the entry below applies and applies harder here, because the
+  quantity is smaller: moon#789 measured the previous probe-count reduction in
+  this repo at **+11% on aarch64 and −17% on x86_64**, disagreeing in sign, and
+  `b3083c5a` found the wall-clock net guarding it was timing a page-fault
+  artifact. This removes one probe from a *miss*, so at the SADD benchmark
+  point (75 of 200 keys absent) it is a fraction of a single probe per
+  operation and is **expected to sit below the ~1.5% noise floor on its own** —
+  it is committed separately so it can be A/B'd and dropped on its own
+  evidence. Fewer probes is a structural fact; whether it is faster is a
+  question only a Linux benchmark host may answer, on **both** arches.
+
+  Behaviour is unchanged. Beyond the two new tests, every guard the preceding
+  entry installed still passes unmodified — expired-reads-as-absent through
+  every accessor with no expiry-index leak (moon#541), cold promotion before
+  fabrication on both the absent and the expired arm (moon#459), `WRONGTYPE`
+  on a live key of the wrong type, one WATCH version bump per mutable handle
+  (moon#926; moon#940 is neither fixed nor worsened, and `stamp_mutation` did
+  not move), and `used_memory` agreeing with an independent whole-keyspace
+  recount. Separately verified against a live redis 8.6.1 oracle: 33 of 33
+  rows agree, covering every set/zset encoding transition through the create
+  path this change rewrote — intset → listpack (moon#899), listpack →
+  hashtable at the entry and the 64/65-byte value boundary, the zero-padded
+  benchmark shape staying a listpack with its bytes intact (moon#795), zset
+  listpack → skiplist, and SADD/ZADD creating a *fresh* container after the
+  key expired rather than resurrecting the old members — with a byte-identical
+  `DEBUG DIGEST` over the whole dataset at the end.
+
 - **Writing a listpack entry no longer touches the allocator, and ZADD no
   longer walks the listpack twice** (moon#942). Two changes in
   `src/storage/listpack.rs`, both on the write path HSET, LPUSH, SADD and ZADD

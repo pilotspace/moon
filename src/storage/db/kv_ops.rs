@@ -80,6 +80,10 @@ impl Database {
     /// right there in the cold tier. The fabricated container then got
     /// written back over the cold copy on the next `set`/mutation,
     /// permanently destroying it. Calling this method first closes that gap.
+    /// Those accessors now reach the same work through
+    /// [`Self::promote_cold_known_absent`] -- this method minus the hot
+    /// guard below, which their own preamble has already answered -- so the
+    /// gap stays closed by the same code, one probe cheaper (moon#942).
     ///
     /// Correctness (task #59 review): this is a plain, ORIGINAL synchronous
     /// blocking disk read — no timeout, no possibility of returning "not
@@ -96,9 +100,44 @@ impl Database {
     /// bodies and Lua `redis.call` keep calling this original synchronous
     /// method unchanged.
     pub fn promote_cold_if_present(&mut self, key: &[u8], now_ms: u64) -> bool {
+        // THE HOT GUARD. Not an optimisation -- see
+        // [`Self::promote_cold_known_absent`], which is this method without
+        // it and is only callable by a caller that has already established
+        // the key is not hot.
         if self.data.contains_key(key) {
             return true;
         }
+        self.promote_cold_known_absent(key, now_ms)
+    }
+
+    /// [`Self::promote_cold_if_present`] for a caller that has ALREADY
+    /// established, with its own hot-plane lookup, that `key` is **not**
+    /// resident in `self.data`.
+    ///
+    /// # Precondition (load-bearing for data integrity, not just for speed)
+    ///
+    /// `key` MUST be absent from the hot plane on entry. The `contains_key`
+    /// this skips is not merely a fast path: it is the only thing standing
+    /// between [`Self::promote_inflight_if_present`] and a hot value.
+    /// That method does **not** re-check residency -- it calls
+    /// `Database::set` unconditionally -- so calling this on a key that is
+    /// hot AND still carries an in-flight spill record would overwrite the
+    /// live value with the older spilled body. (`promote_cold_outcome`, the
+    /// on-disk arm, carries its own `contains_key` guard and is safe either
+    /// way; the in-flight arm is not.)
+    ///
+    /// `pub(super)` on purpose: the only caller is `accessors::
+    /// Database::settle_not_live`, which reaches here exclusively from
+    /// `HotState::Absent` (`self.data.get(key)` just answered `None`) or from
+    /// `HotState::Expired` after `remove_hot` has unconditionally removed the
+    /// entry. Both arms leave `key` provably absent. Do not widen this
+    /// visibility, and do not call it from a path that has not just looked.
+    ///
+    /// moon#942: this removes the fourth probe from every `get_or_create*`
+    /// miss. It is a PROBE-COUNT reduction and makes no throughput claim --
+    /// see `storage::db::probe_budget`'s module docs for why this repo does
+    /// not treat those as the same thing.
+    pub(super) fn promote_cold_known_absent(&mut self, key: &[u8], now_ms: u64) -> bool {
         if self.promote_inflight_if_present(key, now_ms) {
             return true;
         }
