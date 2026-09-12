@@ -833,3 +833,276 @@ fn sadd_on_a_wrongtype_key_still_bumps_the_version_moon940() {
          change fixed #940 as a side effect, which it must not do silently."
     );
 }
+
+// ── end to end: the LIST family (moon#942) ──────────────────────────────────
+//
+// The benchmark's own shape (`scripts/bench-ab-matrix.sh:81`) is
+// `LPUSH list:<12-digit> xxxxxxxx` over `-r 100000`. That keyspace matters
+// more than it looks: one leg pushes ~2.0M elements across 100,000 keys, so a
+// `list:` key holds roughly 5 elements when the p=64 point starts and roughly
+// 20 when it ends. `list-max-listpack-size` is 128
+// (`encoding_limits.rs:69`), so **every timed LPUSH in the matrix lands on
+// the LISTPACK arm**, never on the full `VecDeque`. Any claim about the
+// benchmark row has to be a claim about `listpack_hit`.
+const LKEY: &str = "list:000000000042";
+const LELEM: &str = "xxxxxxxx";
+
+/// A list of `len` elements under [`LKEY`], on whatever encoding `len`
+/// implies, with a pinned clock.
+fn list_of(len: usize) -> Database {
+    let mut db = db_at(NOW);
+    let args = [bulk(LKEY), bulk(LELEM)];
+    for _ in 0..len {
+        crate::command::list::lpush(&mut db, &args);
+    }
+    db
+}
+
+/// `OBJECT ENCODING key`, as a `String`, through the read-only path.
+fn encoding_of(db: &mut Database, key: &str) -> String {
+    match crate::command::key::object(db, &[bulk("ENCODING"), bulk(key)]) {
+        Frame::BulkString(b) => String::from_utf8_lossy(&b).into_owned(),
+        other => panic!("OBJECT ENCODING answered {other:?}"),
+    }
+}
+
+#[test]
+fn lpush_end_to_end_probe_budget() {
+    let args = [bulk(LKEY), bulk(LELEM)];
+
+    // (a) Absent key -> a ListListpack is fabricated.
+    let mut db = db_at(NOW);
+    let (r, create) = probes(|| crate::command::list::lpush(&mut db, &args));
+    assert_eq!(r, Frame::Integer(1));
+
+    // (b) Steady state on the LISTPACK encoding — the benchmark's own arm.
+    let mut db = list_of(20);
+    let (r, listpack_hit) = probes(|| crate::command::list::lpush(&mut db, &args));
+    assert_eq!(r, Frame::Integer(21));
+    assert_eq!(
+        encoding_of(&mut db, LKEY),
+        "listpack",
+        "fixture: 21 elements must still be a listpack, or this row is \
+         measuring the wrong arm"
+    );
+
+    // (c) Steady state on the FULL encoding, past `list-max-listpack-size`.
+    let mut db = list_of(200);
+    let (r, full_hit) = probes(|| crate::command::list::lpush(&mut db, &args));
+    assert_eq!(r, Frame::Integer(201));
+    assert_eq!(encoding_of(&mut db, LKEY), "linkedlist", "fixture");
+
+    assert_eq!(
+        (create, listpack_hit, full_hit),
+        (3, 2, 4),
+        "LPUSH end-to-end probe budget moved \
+         (create={create}, listpack_hit={listpack_hit}, full_hit={full_hit}) \
+         — moon#942. `create` and `listpack_hit` are at the floor the shared \
+         accessor skeleton allows (`hot_state`, then `get_mut`, plus the \
+         `insert_fresh` a miss adds) and a RISE in either is the regression \
+         this row exists to catch.\n\
+         \n\
+         `full_hit` is 4 because the residue is STILL OPEN, and this is the \
+         row that will fall when it closes. `get_or_create_list_listpack` \
+         answers `Ok(None)` for a key that already holds the full \
+         `VecDeque` (`accessors.rs:657`), and `lpush` answers that by \
+         calling `get_or_create_list` (`list_write.rs:81`) — which re-runs \
+         the whole skeleton (`hot_state`, `settle_not_live`, `get_mut`, \
+         `stamp_mutation`, `ListKind::upgrade`) against the key the first \
+         call had already classified and was still holding. It is the exact \
+         shape moon#942 closed for `SADD` in a4ae9775 by returning a \
+         `SetHandle` instead of `Ok(None)`, and closing it here needs the \
+         same change to `accessors.rs`. Redis pays one `dictFind` for all \
+         three arms.\n\
+         \n\
+         NOTE the benchmark does NOT exercise `full_hit`: at `-r 100000` a \
+         `list:` key holds ~5-20 elements against a 128-element threshold, \
+         so the matrix row is `listpack_hit` and closing the residue cannot \
+         move it. It is worth closing for real lists, which are longer than \
+         a benchmark's."
+    );
+}
+
+#[test]
+fn lpop_rpop_probe_budget() {
+    let pop = [bulk(LKEY)];
+
+    // (a) LISTPACK: the `&self` router (moon#897, one probe, cannot flatten)
+    //     plus the listpack accessor's own pair.
+    let mut db = list_of(20);
+    let (r, listpack) = probes(|| crate::command::list::lpop(&mut db, &pop));
+    assert_eq!(r, Frame::BulkString(Bytes::from_static(LELEM.as_bytes())));
+    assert_eq!(encoding_of(&mut db, LKEY), "listpack", "fixture");
+
+    let mut db = list_of(20);
+    let (_, listpack_rpop) = probes(|| crate::command::list::rpop(&mut db, &pop));
+
+    // (b) FULL: the router plus `get_or_create_list`.
+    let mut db = list_of(200);
+    let (r, full) = probes(|| crate::command::list::lpop(&mut db, &pop));
+    assert_eq!(r, Frame::BulkString(Bytes::from_static(LELEM.as_bytes())));
+    assert_eq!(encoding_of(&mut db, LKEY), "linkedlist", "fixture");
+
+    let mut db = list_of(200);
+    let (_, full_rpop) = probes(|| crate::command::list::rpop(&mut db, &pop));
+
+    assert_eq!(
+        (listpack, listpack_rpop, full, full_rpop),
+        (3, 3, 3, 3),
+        "LPOP/RPOP probe budget moved (listpack LPOP={listpack}, \
+         listpack RPOP={listpack_rpop}, full LPOP={full}, \
+         full RPOP={full_rpop}) — moon#942.\n\
+         \n\
+         The full arm used to be 4: `pop_eager` popped through \
+         `get_or_create_list`, let that borrow end, and then asked \
+         `get_list_ref_if_alive` a FOURTH time whether the list was now \
+         empty — a question the `&mut VecDeque` it had just been holding \
+         answers for free. `list.is_empty()` is read inside the existing \
+         borrow instead.\n\
+         \n\
+         Three is the floor without a change to `accessors.rs`: the `&self` \
+         router is what stops the pop flattening the compact encoding \
+         (moon#897/#832), and it cannot be folded into the mutable accessor \
+         from `src/command/`."
+    );
+}
+
+#[test]
+fn lpushx_rpushx_probe_budget() {
+    let args = [bulk(LKEY), bulk(LELEM)];
+
+    // (a) HIT on the listpack encoding.
+    let mut db = list_of(20);
+    let (r, listpack_hit) = probes(|| crate::command::list::lpushx(&mut db, &args));
+    assert_eq!(r, Frame::Integer(21));
+
+    // (b) HIT on the full encoding.
+    let mut db = list_of(200);
+    let (r, full_hit) = probes(|| crate::command::list::rpushx(&mut db, &args));
+    assert_eq!(r, Frame::Integer(201));
+
+    // (c) MISS: no such key. LPUSHX must NOT fabricate one.
+    let mut db = db_at(NOW);
+    let (r, miss) = probes(|| crate::command::list::lpushx(&mut db, &args));
+    assert_eq!(r, Frame::Integer(0));
+    assert!(
+        db.data().get(LKEY.as_bytes()).is_none(),
+        "LPUSHX on a missing key must not fabricate it (moon#830)"
+    );
+
+    // (d) WRONGTYPE.
+    let mut db = db_at(NOW);
+    db.set(b"str", Entry::new_string(Bytes::from_static(b"v")));
+    let wrong = [bulk("str"), bulk(LELEM)];
+    let (r, wrongtype) = probes(|| crate::command::list::rpushx(&mut db, &wrong));
+    assert!(
+        matches!(&r, Frame::Error(e) if e.starts_with(b"WRONGTYPE")),
+        "expected WRONGTYPE, got {r:?}"
+    );
+
+    assert_eq!(
+        (listpack_hit, full_hit, miss, wrongtype),
+        (3, 3, 1, 1),
+        "LPUSHX/RPUSHX probe budget moved (listpack_hit={listpack_hit}, \
+         full_hit={full_hit}, miss={miss}, wrongtype={wrongtype}) — \
+         moon#942. The existence-and-type gate used to be `db.get_list(key)` \
+         = `get_promoted`, which costs two probes AND flattens the compact \
+         encoding on the way past (moon#832) — the same pair moon#897 \
+         removed from `LPOP`'s gate. It is now the `&self` router, which \
+         costs one and cannot rewrite anything. The mutable accessor behind \
+         it is unchanged, so the encoding OUTCOME is unchanged too; only the \
+         redundant probe is gone."
+    );
+}
+
+#[test]
+fn list_writes_bump_the_watch_version_exactly_once() {
+    // moon#926's rule is "acquiring a mutable handle on a stored value IS the
+    // bump". This is the observable shadow of the accessor budget above, and
+    // the guard that stops the `LPUSHX` gate swap from changing WATCH
+    // semantics as a side effect.
+    let args = [bulk(LKEY), bulk(LELEM)];
+    let k = LKEY.as_bytes();
+
+    // (a) LPUSH, listpack steady state — ONE handle.
+    let mut db = list_of(20);
+    let v0 = version_of(&db, k);
+    assert_eq!(
+        crate::command::list::lpush(&mut db, &args),
+        Frame::Integer(21)
+    );
+    assert_eq!(
+        version_of(&db, k),
+        v0 + 1,
+        "a listpack LPUSH is exactly one mutation (moon#926)"
+    );
+
+    // (b) LPUSH, full steady state — TWO, and that is the OPEN residue.
+    let mut db = list_of(200);
+    let v0 = version_of(&db, k);
+    assert_eq!(
+        crate::command::list::lpush(&mut db, &args),
+        Frame::Integer(201)
+    );
+    assert_eq!(
+        version_of(&db, k),
+        v0 + 2,
+        "moon#942 (open): one LPUSH onto a `linkedlist` moves a watched \
+         key's version by TWO, because it acquires two mutable handles — \
+         `get_or_create_list_listpack` (discarded, `Ok(None)`) and then \
+         `get_or_create_set`'s list twin. Not a lost update (a watcher \
+         aborts either way) but the observable tell that the duplicate \
+         accessor is still there. This assertion is written to the CURRENT \
+         value on purpose: when `accessors.rs` grows the `ListHandle` that \
+         a4ae9775 gave sets, this line becomes `v0 + 1` in the same commit, \
+         and until then a move in EITHER direction is a change nobody \
+         intended"
+    );
+
+    // (c) LPOP on both encodings — one handle each.
+    for (len, what) in [(20usize, "listpack"), (200, "linkedlist")] {
+        let mut db = list_of(len);
+        let v0 = version_of(&db, k);
+        assert!(matches!(
+            crate::command::list::lpop(&mut db, &[bulk(LKEY)]),
+            Frame::BulkString(_)
+        ));
+        assert_eq!(
+            version_of(&db, k),
+            v0 + 1,
+            "a {what} LPOP is exactly one mutation (moon#926)"
+        );
+    }
+
+    // (d) LPUSHX: one bump on a hit, and — the half that matters for the
+    //     gate swap — ZERO on a miss and ZERO on WRONGTYPE.
+    let mut db = list_of(20);
+    let v0 = version_of(&db, k);
+    assert_eq!(
+        crate::command::list::lpushx(&mut db, &args),
+        Frame::Integer(21)
+    );
+    assert_eq!(
+        version_of(&db, k),
+        v0 + 1,
+        "an LPUSHX that pushes is exactly one mutation (moon#926)"
+    );
+
+    let mut db = db_at(NOW);
+    db.set(b"str", Entry::new_string(Bytes::from_static(b"v")));
+    let v0 = version_of(&db, b"str");
+    let r = crate::command::list::lpushx(&mut db, &[bulk("str"), bulk(LELEM)]);
+    assert!(matches!(&r, Frame::Error(e) if e.starts_with(b"WRONGTYPE")));
+    assert_eq!(
+        version_of(&db, b"str"),
+        v0,
+        "an LPUSHX REFUSED for WRONGTYPE must not dirty the key. moon#940 \
+         (open) is that `LPUSH` does — `stamp_mutation` fires inside \
+         `get_or_create_list_listpack` before the `Err(WRONGTYPE)` arm — but \
+         `LPUSHX` reaches its answer through a gate that never takes a \
+         mutable handle, and must keep doing so. A gate swapped to \
+         `get_mut_if_present` would cost one probe less and silently WIDEN \
+         moon#940 to a second command; that is the trade this assertion \
+         exists to refuse"
+    );
+}

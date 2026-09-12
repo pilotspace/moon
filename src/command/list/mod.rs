@@ -1475,3 +1475,354 @@ mod listpack_batch_overflow_tests {
         );
     }
 }
+
+/// moon#942/#788: the `used_memory` ledger across the list encoding ladder.
+///
+/// These guards live here, next to the commands, because moon#942's list work
+/// moves WHERE two charges are applied — the pop's element credit (out of a
+/// re-probe, into the borrow that popped it) and the push-if-exists gate (off
+/// the flattening `get_promoted`, onto the `&self` router). A memory delta
+/// that MOVES is a memory delta that can be dropped, and moon#814 is the
+/// recorded consequence: a charge stranded on one branch drives `used_memory`
+/// monotonically DOWN, without bound, on a path any unprivileged client can
+/// drive, until `--maxmemory` can never fire.
+///
+/// The oracle is `recalculate_memory` — the running ledger is asserted against
+/// a from-scratch recompute of the whole keyspace at every rung.
+#[cfg(test)]
+mod ledger_and_encoding_942 {
+    use crate::protocol::Frame;
+    use crate::storage::Database;
+    use bytes::Bytes;
+
+    fn bs(s: &[u8]) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s))
+    }
+
+    /// The running ledger must equal a full recompute. `step` names the rung.
+    fn assert_ledger_exact(db: &mut Database, step: &str) {
+        let running = db.estimated_memory();
+        db.recalculate_memory();
+        let recomputed = db.estimated_memory();
+        assert_eq!(
+            running, recomputed,
+            "{step}: running ledger {running} B != full recompute {recomputed} B — \
+             a list mutation site charged the wrong delta (or none at all)"
+        );
+    }
+
+    /// `OBJECT ENCODING key`, read through the path that does not flatten.
+    fn encoding_of(db: &mut Database, key: &[u8]) -> String {
+        match crate::command::key::object(db, &[bs(b"ENCODING"), bs(key)]) {
+            Frame::BulkString(b) => String::from_utf8_lossy(&b).into_owned(),
+            other => panic!("OBJECT ENCODING answered {other:?}"),
+        }
+    }
+
+    /// One key walked up the whole ladder and back down to the floor:
+    /// absent -> listpack -> the 128-element threshold -> linkedlist ->
+    /// drained to empty -> gone.
+    ///
+    /// Mutation check: delete the `db.credit_memory(credit)` line from
+    /// `pop_eager` and the "drained the linkedlist" rung goes red.
+    #[test]
+    fn the_list_ladder_keeps_the_ledger_exact() {
+        let limits = crate::storage::db::EncodingLimits::moon_defaults();
+        let mut db = Database::new();
+        let floor = db.estimated_memory();
+        let push = [bs(b"l"), bs(b"xxxxxxxx")];
+        let pop = [bs(b"l")];
+
+        // absent -> listpack
+        assert_eq!(
+            crate::command::list::lpush(&mut db, &push),
+            Frame::Integer(1)
+        );
+        assert_eq!(encoding_of(&mut db, b"l"), "listpack", "fixture");
+        assert_ledger_exact(&mut db, "absent -> listpack");
+
+        // listpack steady state, both ends
+        for _ in 0..10 {
+            crate::command::list::lpush(&mut db, &push);
+            crate::command::list::rpush(&mut db, &push);
+        }
+        assert_eq!(encoding_of(&mut db, b"l"), "listpack", "fixture");
+        assert_ledger_exact(&mut db, "listpack steady state");
+
+        // a pop off each end, still a listpack (moon#897)
+        assert!(matches!(
+            crate::command::list::lpop(&mut db, &pop),
+            Frame::BulkString(_)
+        ));
+        assert!(matches!(
+            crate::command::list::rpop(&mut db, &pop),
+            Frame::BulkString(_)
+        ));
+        assert_eq!(
+            encoding_of(&mut db, b"l"),
+            "listpack",
+            "moon#897: a pop must not flatten the list"
+        );
+        assert_ledger_exact(&mut db, "listpack after a pop from each end");
+
+        // AT the entry threshold: inclusive, so exactly `list_entries`
+        // elements is still a listpack.
+        // `llen` on the MUTABLE path is `get_promoted` and would flatten the
+        // very encoding this rung is about (moon#832) — the length has to
+        // come from the read-only twin. `now_ms = 0` is safe: no key here
+        // carries a TTL.
+        let have = match crate::command::list::llen_readonly(&db, &pop, 0) {
+            Frame::Integer(n) => n as usize,
+            other => panic!("LLEN answered {other:?}"),
+        };
+        for _ in have..limits.list_entries {
+            crate::command::list::rpush(&mut db, &push);
+        }
+        assert_eq!(
+            encoding_of(&mut db, b"l"),
+            "listpack",
+            "fixture: list-max-listpack-size is inclusive"
+        );
+        assert_ledger_exact(&mut db, "listpack at the entry threshold");
+
+        // ONE past it: the promotion, and the one-time cost-model swing.
+        crate::command::list::rpush(&mut db, &push);
+        assert_eq!(
+            encoding_of(&mut db, b"l"),
+            "linkedlist",
+            "fixture: one element past the threshold must promote"
+        );
+        assert_ledger_exact(&mut db, "listpack -> linkedlist");
+
+        // linkedlist steady state, pushes and pops and the X forms
+        crate::command::list::lpush(&mut db, &push);
+        assert_ledger_exact(&mut db, "linkedlist LPUSH");
+        crate::command::list::rpushx(&mut db, &push);
+        assert_ledger_exact(&mut db, "linkedlist RPUSHX");
+        crate::command::list::lpushx(&mut db, &push);
+        assert_ledger_exact(&mut db, "linkedlist LPUSHX");
+        assert!(matches!(
+            crate::command::list::rpop(&mut db, &pop),
+            Frame::BulkString(_)
+        ));
+        assert_ledger_exact(&mut db, "linkedlist RPOP");
+
+        // Drain it dry one element at a time. The LAST pop must delete the
+        // key, not leave an empty container behind.
+        loop {
+            match crate::command::list::lpop(&mut db, &pop) {
+                Frame::BulkString(_) => {}
+                Frame::Null => break,
+                other => panic!("LPOP answered {other:?}"),
+            }
+        }
+        assert_ledger_exact(&mut db, "drained the linkedlist");
+        assert!(
+            db.data().get(b"l").is_none(),
+            "the pop that empties a list must remove the key"
+        );
+        assert_eq!(
+            db.estimated_memory(),
+            floor,
+            "the full ladder must return the ledger to its floor"
+        );
+    }
+
+    /// The same drain-to-empty on the COMPACT encoding, which takes the other
+    /// pop branch entirely, plus a multi-element `LPOP key count`.
+    ///
+    /// Mutation check: delete the `db.adjust_memory(before, after)` line from
+    /// `pop_listpack` and the "counted listpack pop" rung goes red.
+    #[test]
+    fn draining_a_listpack_keeps_the_ledger_exact_and_removes_the_key() {
+        let mut db = Database::new();
+        let floor = db.estimated_memory();
+        let push = [bs(b"l"), bs(b"xxxxxxxx")];
+
+        for _ in 0..12 {
+            crate::command::list::rpush(&mut db, &push);
+        }
+        assert_eq!(encoding_of(&mut db, b"l"), "listpack", "fixture");
+
+        // The counted form, off both ends.
+        assert!(matches!(
+            crate::command::list::lpop(&mut db, &[bs(b"l"), bs(b"3")]),
+            Frame::Array(_)
+        ));
+        assert!(matches!(
+            crate::command::list::rpop(&mut db, &[bs(b"l"), bs(b"3")]),
+            Frame::Array(_)
+        ));
+        assert_eq!(
+            encoding_of(&mut db, b"l"),
+            "listpack",
+            "moon#897: a counted pop must not flatten the list either"
+        );
+        assert_ledger_exact(&mut db, "counted listpack pop");
+
+        // A count LARGER than the list drains it and removes the key.
+        assert!(matches!(
+            crate::command::list::lpop(&mut db, &[bs(b"l"), bs(b"1000")]),
+            Frame::Array(_)
+        ));
+        assert!(
+            db.data().get(b"l").is_none(),
+            "a counted pop that empties a listpack must remove the key"
+        );
+        assert_ledger_exact(&mut db, "drained the listpack");
+        assert_eq!(db.estimated_memory(), floor, "back to the floor");
+
+        // And the miss forms, which must not fabricate anything.
+        assert_eq!(
+            crate::command::list::lpop(&mut db, &[bs(b"l")]),
+            Frame::Null
+        );
+        assert_eq!(
+            crate::command::list::lpop(&mut db, &[bs(b"l"), bs(b"2")]),
+            Frame::NullArray
+        );
+        assert_eq!(
+            crate::command::list::lpushx(&mut db, &push),
+            Frame::Integer(0)
+        );
+        assert!(
+            db.data().get(b"l").is_none(),
+            "a miss must fabricate nothing"
+        );
+        assert_eq!(db.estimated_memory(), floor, "a miss must charge nothing");
+    }
+
+    /// moon#795/#903 byte transparency across a pop: an element that LOOKS
+    /// numeric goes into a listpack under the canonical-integer rule and must
+    /// come back out as the exact bytes the client wrote.
+    ///
+    /// This is the guard on rewriting `listpack_pop_end` to decode through the
+    /// BORROWED `ListpackRef` instead of the owning `ListpackEntry`: the two
+    /// render an integer entry by different routes (`itoa` vs `to_string`) and
+    /// must not be able to disagree.
+    #[test]
+    fn a_listpack_pop_returns_the_exact_bytes_that_were_pushed() {
+        // `007` and `+7` are NOT canonical, so they are stored as strings;
+        // `7`, `-0`… wait, `-0` is not canonical either. Both i64 limits ARE.
+        let cases: [&[u8]; 8] = [
+            b"7",
+            b"007",
+            b"+7",
+            b"-0",
+            b"0",
+            b"-9223372036854775808",
+            b"9223372036854775807",
+            b"xxxxxxxx",
+        ];
+        for probe in cases {
+            // Front and back, so both ends of `listpack_pop_end` are asked.
+            for front in [true, false] {
+                let mut db = Database::new();
+                crate::command::list::rpush(&mut db, &[bs(b"l"), bs(probe)]);
+                assert_eq!(
+                    encoding_of(&mut db, b"l"),
+                    "listpack",
+                    "fixture: a one-element list must be a listpack"
+                );
+                let got = if front {
+                    crate::command::list::lpop(&mut db, &[bs(b"l")])
+                } else {
+                    crate::command::list::rpop(&mut db, &[bs(b"l")])
+                };
+                assert_eq!(
+                    got,
+                    Frame::BulkString(Bytes::copy_from_slice(probe)),
+                    "pop (front={front}) of {:?} did not round-trip its bytes \
+                     (moon#795/#903)",
+                    String::from_utf8_lossy(probe)
+                );
+            }
+        }
+    }
+
+    /// moon#832, and the guard the LPUSHX/RPUSHX gate swap is pinned against:
+    /// these two STILL flatten a listpack-encoded list, and must keep doing
+    /// exactly that until someone changes it deliberately.
+    ///
+    /// moon#897 made `LPOP`, `RPOP` and `LSET` encoding-preserving and left
+    /// `LPUSHX`, `RPUSHX`, `LINSERT`, `LREM`, `LTRIM` and `LMOVE` behind. All
+    /// six still reach `get_or_create_list`, whose `ListKind::upgrade`
+    /// materialises the `VecDeque` unconditionally and never comes back —
+    /// redis 8.x keeps a small list a `listpack` through every one of them.
+    /// That is a real divergence and it is NOT this change's to fix: moon#942
+    /// is a probe budget, and swapping a two-probe flattening gate for a
+    /// one-probe `&self` one must leave the OUTCOME byte for byte alone.
+    ///
+    /// So this test asserts the divergence, deliberately. If someone makes
+    /// `LPUSHX` encoding-preserving, this test is the thing that says so out
+    /// loud instead of letting an encoding change ride along inside a
+    /// performance commit.
+    #[test]
+    fn lpushx_and_rpushx_still_flatten_a_listpack_moon832() {
+        for (name, f) in [
+            (
+                "LPUSHX",
+                crate::command::list::lpushx as fn(&mut Database, &[Frame]) -> Frame,
+            ),
+            ("RPUSHX", crate::command::list::rpushx),
+        ] {
+            let mut db = Database::new();
+            let push = [bs(b"l"), bs(b"xxxxxxxx")];
+            for _ in 0..3 {
+                crate::command::list::rpush(&mut db, &push);
+            }
+            assert_eq!(encoding_of(&mut db, b"l"), "listpack", "fixture ({name})");
+
+            assert_eq!(f(&mut db, &push), Frame::Integer(4), "{name} must push");
+            assert_eq!(
+                encoding_of(&mut db, b"l"),
+                "linkedlist",
+                "{name} is expected to flatten (moon#832, still open). A \
+                 `listpack` here means the encoding changed — which may well \
+                 be the right thing to do, but not silently and not inside a \
+                 probe-budget commit"
+            );
+            assert_ledger_exact(&mut db, "after the X-form flattened the list");
+        }
+    }
+
+    /// The X forms must also leave a missing key missing and a wrong-typed key
+    /// untouched — the two arms the gate swap moves off `get_promoted`.
+    #[test]
+    fn the_x_forms_fabricate_nothing_and_reject_a_wrong_type() {
+        for (name, f) in [
+            (
+                "LPUSHX",
+                crate::command::list::lpushx as fn(&mut Database, &[Frame]) -> Frame,
+            ),
+            ("RPUSHX", crate::command::list::rpushx),
+        ] {
+            let mut db = Database::new();
+            let floor = db.estimated_memory();
+            assert_eq!(
+                f(&mut db, &[bs(b"nope"), bs(b"v")]),
+                Frame::Integer(0),
+                "{name} on a missing key answers 0"
+            );
+            assert!(
+                db.data().get(b"nope").is_none(),
+                "{name} on a missing key must not fabricate it (moon#830)"
+            );
+            assert_eq!(db.estimated_memory(), floor, "{name} miss charged memory");
+
+            crate::command::string::set(&mut db, &[bs(b"str"), bs(b"v")]);
+            let before = db.estimated_memory();
+            let r = f(&mut db, &[bs(b"str"), bs(b"v")]);
+            assert!(
+                matches!(&r, Frame::Error(e) if e.starts_with(b"WRONGTYPE")),
+                "{name} on a string must answer WRONGTYPE, got {r:?}"
+            );
+            assert_eq!(
+                db.estimated_memory(),
+                before,
+                "{name} WRONGTYPE must charge nothing"
+            );
+            assert_ledger_exact(&mut db, "after a refused X form");
+        }
+    }
+}
