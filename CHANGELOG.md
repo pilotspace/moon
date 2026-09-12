@@ -49,6 +49,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A test that enumerates `COMMAND_META` and drives the real wait decision**,
+  `intercepted_commands_wait_for_pending_remote_writes_moon937`
+  (`src/server/conn/shared.rs`). `tests/intercept_flag_drift.rs` guards one
+  direction — *marked `NO_INTERCEPT` implies no gate claims it* — whose flag
+  fails **safe**. The other direction, *a gate claims it implies
+  `must_wait_for_pending_remote` says wait*, was unguarded, and
+  `is_inline_intercepted` fails **open**: a missing entry reads as permission,
+  which is moon#507's shape and how moon#937 happened. The new test drives the
+  real decision function over the registry rather than a hand list, probes each
+  command twice (a key-shaped modifier and a `numkeys` form — the one-probe
+  version stayed green under a deliberate deletion), and probes the gates whose
+  name predicate lives outside the five scanned files explicitly, since no text
+  scan can see those. Six commands answer "safe" today; each is waived by name
+  with a reason, and the waiver is pinned to exactly the set that still offends,
+  so a new undeclared interceptor fails one assertion and *fixing* one of the
+  waived commands fails the other. Verified by mutation: five separate breakages
+  — dropping `EVALSHA`, dropping `EVAL`, declaring `TXN`, breaking the gate scan,
+  breaking a delegated probe — each turned it red.
 - `scripts/bench-ab-delta.py` — compares moon against **moon** across two
   matrix runs, which `bench-ab-report.py` cannot do. Redis is the control: the
   tool picks the raw or the ratio column per row from the control's own
