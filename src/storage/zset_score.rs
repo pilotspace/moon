@@ -96,11 +96,59 @@ pub fn render_score(score: f64, out: &mut ScoreBuf) {
         out.extend_from_slice(b"inf");
     } else if score == f64::NEG_INFINITY {
         out.extend_from_slice(b"-inf");
+    } else if let Some(v) = integral_score(score) {
+        let mut buf = itoa::Buffer::new();
+        out.extend_from_slice(buf.format(v).as_bytes());
     } else {
         note_float_format();
         // `write!` into a `SmallVec` cannot fail.
         let _ = write!(Sink(out), "{score}");
     }
+}
+
+/// The largest magnitude the integer fast path accepts: 2^53, the last point
+/// where every integral `f64` is exactly representable.
+///
+/// Above it the `f64` grid is coarser than the integers, so `score as i64` is
+/// still exact for the values that land on the grid but the DECIMAL SPELLING
+/// stops being the shortest round-trip one — `1e17` is exactly representable
+/// and `{}` prints its 18 digits, but so would `itoa`, and at wider exponents
+/// the shortest-round-trip digits and the exact integer diverge. The cutoff is
+/// where the proof is easy, not where the arithmetic first breaks; Redis's
+/// `double2ll` draws it one binade lower still, at 2^52.
+const INTEGRAL_RENDER_LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
+
+/// `Some(n)` when `score` is an integer whose `itoa` rendering is
+/// byte-identical to `{score}` — the fork Redis's `d2string` takes with
+/// `double2ll` before it reaches `fpconv_dtoa`.
+///
+/// Three exclusions, each one a place where the two renderings differ:
+///
+/// * **`-0.0`.** `{}` prints `-0`; `0i64` prints `0`. `ZADD z -0 m` must keep
+///   answering `-0`, and the value codec must keep round-tripping the sign
+///   bit, so the negative zero goes down the slow path.
+/// * **Non-integers**, where there is nothing to render as an integer.
+/// * **Anything past [`INTEGRAL_RENDER_LIMIT`]**, including both infinities
+///   (`inf.fract()` is NaN) and NaN itself (which `ZADD` rejects long before
+///   this, and which `{}` would print as `NaN`).
+#[inline]
+#[must_use]
+pub fn integral_score(score: f64) -> Option<i64> {
+    if score == 0.0 {
+        // `-0.0 == 0.0`, so this arm catches both zeros and the sign bit
+        // separates them.
+        return if score.is_sign_negative() {
+            None
+        } else {
+            Some(0)
+        };
+    }
+    // NaN and the infinities fail both of these: `NaN.fract()` is NaN and
+    // `inf.fract()` is NaN, neither of which equals 0.0.
+    if score.fract() != 0.0 || score.abs() > INTEGRAL_RENDER_LIMIT {
+        return None;
+    }
+    Some(score as i64)
 }
 
 /// Parse a score as stored by [`render_score`]. The grammar is the one
@@ -201,5 +249,177 @@ mod tests {
         assert_eq!(parse_score(b"notafloat"), None);
         assert_eq!(parse_score(b""), None);
         assert_eq!(parse_score(b"\xff"), None);
+    }
+
+    /// moon#942: the integer fast path must be INVISIBLE.
+    ///
+    /// `render_score` now forks the way Redis's `d2string` does — `double2ll`
+    /// then `ll2string`, falling back to the float formatter — and the whole
+    /// change is safe only if the two arms are byte-identical wherever the
+    /// fast one is taken. This asserts that against `{}` DIRECTLY, not against
+    /// another moon function: the ground truth is `core::fmt`, because every
+    /// score moon ever wrote, persisted or replied with came out of it, and a
+    /// listpack written before this commit must still read back the same.
+    ///
+    /// Mutation check: widen `INTEGRAL_RENDER_LIMIT` to `f64::MAX` and the
+    /// `1e21` case reports `1000000000000000000000` against
+    /// `-9223372036854775808` (the saturating `as i64`). Drop the `-0.0` arm
+    /// from `integral_score` and the `-0.0` case reports `0` against `-0`.
+    #[test]
+    fn the_integer_fast_path_is_byte_identical_to_core_fmt() {
+        fn reference(v: f64) -> String {
+            if v == f64::INFINITY {
+                "inf".to_owned()
+            } else if v == f64::NEG_INFINITY {
+                "-inf".to_owned()
+            } else {
+                format!("{v}")
+            }
+        }
+
+        let mut cases: Vec<f64> = CASES.to_vec();
+        // The boundary of the fast path, from both sides, and the powers of
+        // two either side of it.
+        cases.extend([
+            9_007_199_254_740_992.0,  // 2^53, the limit itself
+            -9_007_199_254_740_992.0, // and its negation
+            9_007_199_254_740_991.0,  // 2^53 - 1
+            9_007_199_254_740_994.0,  // the next f64 above 2^53
+            4_503_599_627_370_496.0,  // 2^52, Redis's own double2ll bound
+            -4_503_599_627_370_496.0,
+            1e15,
+            1e16,
+            1e17,
+            1e18,
+            1e19,
+            1e21,
+            -1e21,
+            f64::MIN,
+            -0.0,
+            0.0,
+            127.0,
+            128.0,
+            -128.0,
+            -129.0,
+            4095.0,
+            4096.0,
+            32767.0,
+            32768.0,
+            2_147_483_647.0,
+            2_147_483_648.0,
+            i64::MAX as f64,
+            i64::MIN as f64,
+            0.5,
+            -0.5,
+            1.0000000000000002,
+            -3.25,
+        ]);
+        // Every integer with a short decimal spelling, plus their negations.
+        for i in -1100i64..=1100 {
+            cases.push(i as f64);
+        }
+        // A deterministic sweep of bit patterns: an xorshift over the f64
+        // domain, NaNs skipped (ZADD rejects them before any renderer runs).
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let v = f64::from_bits(state);
+            if v.is_nan() {
+                continue;
+            }
+            cases.push(v);
+            // And its integral neighbour, so the fast path is actually hit
+            // by the sweep rather than only by the hand-written cases.
+            if v.is_finite() && v.abs() < 1e18 {
+                cases.push(v.trunc());
+            }
+        }
+
+        let mut buf = ScoreBuf::new();
+        let mut fast_path_hits = 0usize;
+        for v in cases {
+            render_score(v, &mut buf);
+            let got = std::str::from_utf8(&buf).expect("render_score writes ASCII");
+            assert_eq!(
+                got,
+                reference(v),
+                "render_score({:?}) [bits {:#018x}] diverged from core::fmt",
+                v,
+                v.to_bits()
+            );
+            if integral_score(v).is_some() {
+                fast_path_hits += 1;
+            }
+        }
+        assert!(
+            fast_path_hits > 2000,
+            "only {fast_path_hits} cases took the integer fast path — the \
+             sweep stopped exercising what it exists to check"
+        );
+    }
+
+    /// The fast path must also stay round-trip exact, which is what every
+    /// listpack reader depends on (`SortedSetRef::score`, the value codec,
+    /// both RDB writers, the AOF rewriter, `DEBUG DIGEST`).
+    #[test]
+    fn the_integer_fast_path_round_trips_bit_exactly() {
+        let mut buf = ScoreBuf::new();
+        for i in [
+            0i64,
+            1,
+            -1,
+            7,
+            -7,
+            127,
+            128,
+            -129,
+            4096,
+            65_535,
+            1 << 31,
+            -(1i64 << 31),
+            (1i64 << 53) - 1,
+            1i64 << 53,
+            -(1i64 << 53),
+        ] {
+            let v = i as f64;
+            render_score(v, &mut buf);
+            let back = parse_score(&buf).unwrap_or_else(|| {
+                panic!(
+                    "{v:?} rendered as {:?} and did not parse",
+                    String::from_utf8_lossy(&buf)
+                )
+            });
+            assert_eq!(back.to_bits(), v.to_bits(), "{v:?} did not round-trip");
+        }
+    }
+
+    /// `-0.0` is the one zero the fast path must refuse: `{}` prints `-0`,
+    /// `itoa` of `0i64` prints `0`, and `ZADD z -0 m` must keep answering
+    /// `-0` the way it always has.
+    #[test]
+    fn negative_zero_keeps_its_sign() {
+        assert_eq!(
+            integral_score(-0.0),
+            None,
+            "-0.0 must not take the fast path"
+        );
+        assert_eq!(integral_score(0.0), Some(0), "+0.0 must take it");
+        let mut buf = ScoreBuf::new();
+        render_score(-0.0, &mut buf);
+        assert_eq!(std::str::from_utf8(&buf).unwrap(), "-0");
+        render_score(0.0, &mut buf);
+        assert_eq!(std::str::from_utf8(&buf).unwrap(), "0");
+    }
+
+    /// Neither infinity nor NaN may reach the integer conversion: `as i64`
+    /// saturates rather than failing, so an unguarded fast path would print
+    /// `9223372036854775807` for `inf`.
+    #[test]
+    fn non_finite_scores_never_take_the_integer_path() {
+        assert_eq!(integral_score(f64::INFINITY), None);
+        assert_eq!(integral_score(f64::NEG_INFINITY), None);
+        assert_eq!(integral_score(f64::NAN), None);
     }
 }

@@ -20,31 +20,36 @@ use super::helpers::err;
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Format a float score for Redis output (strip trailing zeros, but keep at least one decimal).
+/// Format a float score for Redis output, exactly as `ZSCORE` replies it.
+///
+/// Delegates to [`crate::storage::zset_score::render_score`] (moon#942). The
+/// two used to be independent transcriptions of the same three rules, and
+/// `listpack_score_rendering_matches_zscore_rendering` existed to catch them
+/// drifting apart — a test that can only ever notice the drift AFTER a client
+/// has read a score back differently from a listpack than from a B+tree.
+/// There is now ONE renderer, so they agree by construction, and that test
+/// keeps standing as the guard on this delegation.
 pub(super) fn format_score(score: f64) -> String {
-    if score == f64::INFINITY {
-        "inf".to_string()
-    } else if score == f64::NEG_INFINITY {
-        "-inf".to_string()
-    } else {
-        // Use ryu or manual formatting to match Redis behavior
-        let s = format!("{}", score);
-        s
-    }
+    let mut buf = crate::storage::zset_score::ScoreBuf::new();
+    crate::storage::zset_score::render_score(score, &mut buf);
+    // `render_score` writes ASCII only — `inf`, `-inf`, an `itoa` rendering,
+    // or `core::fmt`'s `f64` Display — so the fallback is unreachable. One
+    // allocation, the same count `format!` made.
+    std::str::from_utf8(&buf).unwrap_or("0").to_owned()
 }
 
-/// Zero-alloc version of `format_score` — returns `Bytes` directly.
+/// `Bytes` version of [`format_score`], for the reply paths that want no
+/// intermediate `String`.
 pub(crate) fn format_score_bytes(score: f64) -> Bytes {
     if score == f64::INFINITY {
-        Bytes::from_static(b"inf")
-    } else if score == f64::NEG_INFINITY {
-        Bytes::from_static(b"-inf")
-    } else {
-        use std::fmt::Write;
-        let mut buf = String::with_capacity(24);
-        let _ = write!(buf, "{}", score);
-        Bytes::from(buf)
+        return Bytes::from_static(b"inf");
     }
+    if score == f64::NEG_INFINITY {
+        return Bytes::from_static(b"-inf");
+    }
+    let mut buf = crate::storage::zset_score::ScoreBuf::new();
+    crate::storage::zset_score::render_score(score, &mut buf);
+    Bytes::copy_from_slice(&buf)
 }
 
 /// Aggregate operation for ZUNION/ZINTER/ZUNIONSTORE/ZINTERSTORE.

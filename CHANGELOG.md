@@ -8,6 +8,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **An integral sorted-set score is no longer rendered by `core::fmt`'s `f64`
+  Display** (moon#942). Every score moon stored in a listpack, replied to a
+  client, or wrote to an RDB went through `write!("{score}")` — the
+  shortest-round-trip (Grisu/Dragon) formatter plus the whole `Formatter`
+  machinery — including the literal `1` the ZADD benchmark writes on every
+  call and every integral leaderboard score ever posted. Redis's `d2string`
+  has always forked here: `double2ll` first, `ll2string` when it succeeds, and
+  `fpconv_dtoa` only when it does not. `zset_score::render_score` now takes
+  the same fork through a new `integral_score`, and `format_score` /
+  `format_score_bytes` — which were an independent second transcription of the
+  same three rules — delegate to it, so `ZSCORE`, `ZRANGE … WITHSCORES`,
+  `ZINCRBY`, `ZPOPMIN`/`ZPOPMAX`, `ZMSCORE`, the blocking `BZPOPMIN` wakeups
+  and `DEBUG DIGEST` all take it too.
+
+  **Measured with a `cfg(test)` counter on the slow arm**, on the benchmark's
+  own `zadd z:<n> 1 m:<n>` shape: a `ZADD` with an integral score reached
+  `core::fmt`'s float formatter **1 time before, 0 after**; a `ZADD` with
+  `1.5` still reaches it exactly once, which is the control that proves the
+  counter is live.
+
+  A call count is a count. It is **not** a throughput claim and this entry
+  makes none — PERF-08 (moon#789) measured +11% on aarch64 and −17% on x86_64
+  for one work reduction in this repo, so the wall-clock question belongs to a
+  Linux bench host.
+
+  **The bytes are identical wherever the fast path is taken**, and that is
+  asserted against `core::fmt` DIRECTLY rather than against another moon
+  function: `the_integer_fast_path_is_byte_identical_to_core_fmt` sweeps the
+  hand-written cases, both sides of the 2^53 cutoff, every integer in
+  ±1100, and 20,000 deterministic `f64` bit patterns plus their truncations.
+  Three exclusions carry the proof — `-0.0` (which prints `-0`, not `0`),
+  non-integers, and anything past 2^53 (which catches both infinities and NaN,
+  whose `fract()` is NaN). Both were proven able to fail: widening the cutoff
+  to `f64::MAX` makes `1e21` report `1000000000000000000000` against
+  `-9223372036854775808`, and dropping the `-0.0` arm makes `-0.0` report `0`
+  against `-0`. A listpack or RDB written before this change still reads back
+  byte-for-byte the same, which is what `parse_score`'s round-trip exactness
+  and every reader of a stored score depend on.
+
+### Performance
+
 - **`SADD` on a hashtable set stops paying for a second accessor: 4 key
   lookups → 2** (moon#942). `get_or_create_set_listpack` answered `Ok(None)`
   for a set that was already an `IndexSet` — or a `SetIntset` the moon#899
