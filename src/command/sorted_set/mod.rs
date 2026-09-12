@@ -815,6 +815,85 @@ mod tests {
         assert_eq!(score, Frame::BulkString(Bytes::from("1")));
     }
 
+    /// A refused `ZADD` must not leave an empty zset behind.
+    ///
+    /// moon's `ZADD` reaches the keyspace through `get_or_create_*`, which
+    /// FABRICATES the container before the loop can discover that `XX` refuses
+    /// every member of the batch. Redis short-circuits first —
+    /// `if (zobj == NULL) { if (xx) goto reply_to_client; }` — so
+    /// `ZADD ghost XX 1 m` answers 0 and creates nothing.
+    ///
+    /// Verified against a live redis 8.6.1: after that one command moon
+    /// answered `EXISTS ghost` 1, `TYPE ghost` `zset`, `DBSIZE` 1, `KEYS *`
+    /// `ghost` and a non-empty `DEBUG DIGEST`, against 0 / `none` / 0 / empty
+    /// / the zero digest. `ZCARD` agreed at 0 on both, which is why nothing
+    /// caught it.
+    ///
+    /// This is unbounded keyspace growth on a path any unprivileged client can
+    /// drive — one entry plus a fabricated container per call, none of which
+    /// ever appears to hold anything — and it diverges the digest, so a
+    /// replica or a reloaded RDB disagrees with its master. It is the sorted
+    /// set's copy of the empty-container class, and `ZREM` already carries the
+    /// fix: drop the key when the container ends up empty.
+    ///
+    /// Both encodings, because the 65-byte member skips the listpack gate
+    /// entirely and lands on `get_or_create_sorted_set`, which fabricates too.
+    #[test]
+    fn a_refused_zadd_leaves_no_empty_zset_behind() {
+        for member in [b"m".to_vec(), vec![b'y'; 70]] {
+            let mut db = Database::new();
+            let floor = db.estimated_memory();
+            assert_eq!(
+                zadd(
+                    &mut db,
+                    &[bulk(b"ghost"), bulk(b"XX"), bulk(b"1"), bulk(&member)]
+                ),
+                Frame::Integer(0),
+                "XX on a missing key adds nothing"
+            );
+            assert_eq!(
+                crate::command::key::exists(&mut db, &[bulk(b"ghost")]),
+                Frame::Integer(0),
+                "XX on a missing key must not create it (member {} bytes)",
+                member.len()
+            );
+            assert_eq!(
+                crate::command::key::type_cmd(&mut db, &[bulk(b"ghost")]),
+                Frame::SimpleString(bytes::Bytes::from_static(b"none")),
+                "and TYPE must still say none"
+            );
+            assert_eq!(
+                db.estimated_memory(),
+                floor,
+                "a refused ZADD must charge nothing at all"
+            );
+        }
+
+        // The same refusal on a key that DOES exist must leave it untouched.
+        let mut db = Database::new();
+        assert_eq!(
+            zadd(&mut db, &[bulk(b"live"), bulk(b"1"), bulk(b"a")]),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            zadd(
+                &mut db,
+                &[bulk(b"live"), bulk(b"XX"), bulk(b"2"), bulk(b"never")]
+            ),
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            crate::command::key::exists(&mut db, &[bulk(b"live")]),
+            Frame::Integer(1),
+            "an existing zset must survive a refused ZADD"
+        );
+        assert_eq!(
+            zcard(&mut db, &[bulk(b"live")]),
+            Frame::Integer(1),
+            "and keep the member it had"
+        );
+    }
+
     #[test]
     fn test_zadd_xx() {
         let mut db = Database::new();
