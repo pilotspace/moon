@@ -517,6 +517,158 @@ mod budget {
         );
     }
 
+    #[test]
+    fn the_bptree_identical_score_skip_is_decided_on_bits() {
+        // The full form's skip is `new.to_bits() != old.to_bits()`, for the
+        // same reason and with the same consequence as the listpack's byte
+        // comparison: `-0.0 == 0.0`, so plain `!=` would silently start
+        // answering `0` to a client that wrote `-0`.
+        let mut db = bptree_zset();
+        assert_eq!(
+            zadd(&mut db, &[bulk("z"), bulk("0"), bulk("m7")]),
+            Frame::Integer(0)
+        );
+        let (_, b) = measure(|| zadd(&mut db, &[bulk("z"), bulk("-0"), bulk("m7")]));
+        assert_eq!(
+            b.bptree_score_writes, 1,
+            "-0 over a stored 0 must still move the B+tree entry"
+        );
+        assert_eq!(
+            crate::command::sorted_set::zscore(&mut db, &[bulk("z"), bulk("m7")]),
+            Frame::BulkString(Bytes::from_static(b"-0")),
+            "the sign must have survived into the B+tree"
+        );
+        let (_, b) = measure(|| zadd(&mut db, &[bulk("z"), bulk("-0"), bulk("m7")]));
+        assert_eq!(
+            b.bptree_score_writes, 0,
+            "the identical bit pattern is not re-inserted"
+        );
+    }
+
+    // ── the ledger across every arm this change moved (moon#788/#814) ───────
+
+    /// The running `used_memory` against a from-scratch `recalculate_memory`
+    /// at every rung of the paths moon#942 restructured.
+    ///
+    /// This is the real risk in the change, and it is verified rather than
+    /// argued. `zset_member_cost` used to be charged from `is_new` at the end
+    /// of `zadd_member`; it is now charged in the ABSENT arm of a `match`, and
+    /// a charge that moves is a charge that can be dropped or doubled.
+    /// moon#814 is the recorded consequence of getting this wrong — a charge
+    /// stranded on a branch drives `used_memory` monotonically in one
+    /// direction, without bound, on a path any unprivileged client can drive,
+    /// until `--maxmemory` can never fire.
+    ///
+    /// Mutation check: delete the `mem_charge += zset_member_cost(member)`
+    /// line from `zadd`'s absent arm and the "a fresh member on the full form"
+    /// step goes red.
+    #[test]
+    fn every_restructured_arm_keeps_the_ledger_exact() {
+        fn exact(db: &mut Database, step: &str) {
+            let running = db.estimated_memory();
+            db.recalculate_memory();
+            let recomputed = db.estimated_memory();
+            assert_eq!(
+                running, recomputed,
+                "{step}: running ledger {running} B != full recompute \
+                 {recomputed} B — a mutation site charged the wrong delta"
+            );
+        }
+
+        // ── the listpack arms ──
+        let mut db = Database::new();
+        let floor = db.estimated_memory();
+        assert_eq!(
+            zadd(&mut db, &[bulk("z"), bulk("1"), bulk("m")]),
+            Frame::Integer(1)
+        );
+        exact(&mut db, "listpack create");
+        // The skipped write: nothing changes, so nothing may be charged.
+        assert_eq!(
+            zadd(&mut db, &[bulk("z"), bulk("1"), bulk("m")]),
+            Frame::Integer(0)
+        );
+        exact(&mut db, "listpack, identical score skipped");
+        // A write that genuinely moves, both narrower and wider.
+        assert_eq!(
+            zadd(&mut db, &[bulk("z"), bulk("123456789"), bulk("m")]),
+            Frame::Integer(0)
+        );
+        exact(&mut db, "listpack, score widened");
+        assert_eq!(
+            zadd(&mut db, &[bulk("z"), bulk("2"), bulk("m")]),
+            Frame::Integer(0)
+        );
+        exact(&mut db, "listpack, score narrowed");
+        // Refusals must charge nothing at all.
+        assert_eq!(
+            zadd(&mut db, &[bulk("z"), bulk("NX"), bulk("9"), bulk("m")]),
+            Frame::Integer(0)
+        );
+        exact(&mut db, "listpack, NX refused");
+        assert_eq!(
+            zadd(&mut db, &[bulk("z"), bulk("XX"), bulk("9"), bulk("absent")]),
+            Frame::Integer(0)
+        );
+        exact(&mut db, "listpack, XX refused a fresh member");
+        assert_eq!(
+            zincrby(&mut db, &[bulk("z"), bulk("3"), bulk("m")]),
+            Frame::BulkString(Bytes::from_static(b"5"))
+        );
+        exact(&mut db, "listpack ZINCRBY");
+        assert_eq!(zrem(&mut db, &[bulk("z"), bulk("m")]), Frame::Integer(1));
+        exact(&mut db, "listpack drained");
+        assert_eq!(
+            db.estimated_memory(),
+            floor,
+            "the listpack ladder must return the ledger to its floor"
+        );
+
+        // ── the full B+tree arms ──
+        let mut db = bptree_zset();
+        exact(&mut db, "full form built");
+        assert_eq!(
+            zadd(&mut db, &[bulk("z"), bulk("7"), bulk("m7")]),
+            Frame::Integer(0)
+        );
+        exact(&mut db, "full form, identical score skipped");
+        assert_eq!(
+            zadd(&mut db, &[bulk("z"), bulk("999"), bulk("m7")]),
+            Frame::Integer(0)
+        );
+        exact(&mut db, "full form, score moved");
+        assert_eq!(
+            zadd(&mut db, &[bulk("z"), bulk("5"), bulk("fresh")]),
+            Frame::Integer(1)
+        );
+        exact(&mut db, "a fresh member on the full form");
+        assert_eq!(
+            zadd(&mut db, &[bulk("z"), bulk("XX"), bulk("5"), bulk("never")]),
+            Frame::Integer(0)
+        );
+        exact(&mut db, "full form, XX refused a fresh member");
+        assert_eq!(
+            zadd(&mut db, &[bulk("z"), bulk("NX"), bulk("5"), bulk("m7")]),
+            Frame::Integer(0)
+        );
+        exact(&mut db, "full form, NX refused an existing member");
+        assert_eq!(
+            zincrby(&mut db, &[bulk("z"), bulk("1"), bulk("m7")]),
+            Frame::BulkString(Bytes::from_static(b"1000"))
+        );
+        exact(&mut db, "full form ZINCRBY onto an existing member");
+        assert_eq!(
+            zincrby(&mut db, &[bulk("z"), bulk("4"), bulk("nowhere")]),
+            Frame::BulkString(Bytes::from_static(b"4"))
+        );
+        exact(&mut db, "full form ZINCRBY creating a member");
+        assert_eq!(
+            zrem(&mut db, &[bulk("z"), bulk("fresh"), bulk("nowhere")]),
+            Frame::Integer(2)
+        );
+        exact(&mut db, "full form after ZREM");
+    }
+
     // ── integral scores do not reach `core::fmt`'s float formatter ──────────
 
     #[test]

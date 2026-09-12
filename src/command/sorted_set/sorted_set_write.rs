@@ -12,7 +12,7 @@ use crate::command::sorted_set::work_budget;
 
 use super::{
     AggregateOp, format_score, format_score_bytes, zadd_member, zrange_by_lex, zrange_by_rank,
-    zrange_by_score, zrem_member,
+    zrange_by_score, zrem_member, zset_insert_absent, zset_update_existing,
 };
 
 // ---------------------------------------------------------------------------
@@ -410,37 +410,47 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
             Ok(parsed) => parsed,
             Err(e) => return e,
         };
-        let member = member.clone();
 
-        work_budget::note_member_lookup();
-        let existing_score = members.get(&member).copied();
+        // ONE hash lookup answers everything this loop asks of an EXISTING
+        // member (moon#942): whether it is there, what its score was, and
+        // where the new one goes. The flag decision rides inside the closure,
+        // so the score never has to be looked up a second time to write it.
+        let mut accepted = false;
+        let existing_score: Option<f64> = zset_update_existing(members, scores, member, |old| {
+            let should_update = if nx {
+                false // NX: never update existing
+            } else if gt && lt {
+                false // GT+LT together: never update (mutually exclusive)
+            } else if gt {
+                score > old
+            } else if lt {
+                score < old
+            } else {
+                true // No flags: always update
+            };
+            accepted = should_update;
+            if should_update { Some(score) } else { None }
+        });
 
-        let should_update = match existing_score {
-            None => !xx, // New member: add unless XX
+        match existing_score {
             Some(old) => {
-                if nx {
-                    false // NX: never update existing
-                } else if gt && lt {
-                    false // GT+LT together: never update (mutually exclusive)
-                } else if gt {
-                    score > old
-                } else if lt {
-                    score < old
-                } else {
-                    true // No flags: always update
+                // `accepted` is the closure's own decision, read back rather
+                // than re-derived: the flag logic has ONE spelling, so the
+                // write and the `CH` tally can never disagree about it.
+                // `changed` then reports whether the score MOVED, on the same
+                // epsilon rule this command has always used.
+                if accepted && (old - score).abs() > f64::EPSILON {
+                    changed += 1;
                 }
             }
-        };
-
-        if should_update {
-            let member_cost = zset_member_cost(&member);
-            let is_new = zadd_member(members, scores, member, score);
-            if is_new {
-                added += 1;
-                changed += 1;
-                mem_charge += member_cost;
-            } else if existing_score.is_some_and(|es| (es - score).abs() > f64::EPSILON) {
-                changed += 1;
+            None => {
+                // New member: add unless XX.
+                if !xx {
+                    mem_charge += zset_member_cost(member);
+                    zset_insert_absent(members, scores, member.clone(), score);
+                    added += 1;
+                    changed += 1;
+                }
             }
         }
     }
@@ -702,13 +712,23 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
 
-    work_budget::note_member_lookup();
-    let current = members.get(&member).copied().unwrap_or(0.0);
-    let new_score = current + increment;
-
     let member_cost = zset_member_cost(&member);
     let table_before = zset_table_bytes(members, scores);
-    let is_new = zadd_member(members, scores, member, new_score);
+    // ONE hash lookup (moon#942): the same lookup that reads the current score
+    // writes `current + increment` back through the slot it found. It used to
+    // be `members.get` followed by `zadd_member`'s own `remove` and `insert` —
+    // three hashes of one member for one command.
+    let mut new_score = increment;
+    let is_new = zset_update_existing(members, scores, &member, |current| {
+        new_score = current + increment;
+        Some(new_score)
+    })
+    .is_none();
+    if is_new {
+        // A member that was not there starts at 0.0, so its new score is the
+        // increment itself — already in `new_score`.
+        zset_insert_absent(members, scores, member, new_score);
+    }
     let table_after = zset_table_bytes(members, scores);
     // `members`/`scores`' borrow of `db` ends above.
     if is_new {

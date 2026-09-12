@@ -8,6 +8,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`ZADD` and `ZINCRBY` on a `skiplist` zset hash the member once, not three
+  times** (moon#942). Redis's `zsetAdd` does ONE `dictFind` and writes the new
+  score through the entry it found. moon did three — `members.get` for the flag
+  decision, then `members.remove` and `members.insert` inside `zadd_member` —
+  and cloned the `Bytes` twice on a path `src/command/` forbids cloning on at
+  all. A new `zset_update_existing` looks the member up once with `get_mut` and
+  writes through the slot; the flag decision rides inside its closure, so it has
+  one spelling and the write and the `CH` tally can never disagree about it.
+
+  The B+tree is now touched only when the score actually MOVES, which is
+  Redis's own `if (score != curscore)` and matters more here than it does
+  there: `BPTree::remove` builds a `Bytes::copy_from_slice(member)` to form its
+  lookup key, so an idempotent re-post used to cost an allocation as well as a
+  tree delete and a tree insert.
+
+  **Measured with `cfg(test)` counters**:
+
+  | on a 200-member (`skiplist`) zset | before | after |
+  |---|---:|---:|
+  | `members` hashes, `ZADD` onto an existing member | 3 | **1** |
+  | `members` hashes, `ZADD` of a new member | 3 | **2** |
+  | `members` hashes, `ZINCRBY` onto an existing member | 3 | **1** |
+  | `members` hashes, `ZREM` | 1 | 1 (control) |
+  | B+tree re-insertions, same score re-posted | 1 | **0** |
+  | B+tree re-insertions, score genuinely moved | 1 | 1 (control) |
+
+  Counts, not a throughput claim (PERF-08, moon#789).
+
+  The comparison is `to_bits()`, not `==`, for the same reason the listpack arm
+  compares bytes: `-0.0 == 0.0` is true while `-0` and `0` render differently,
+  and moon has always stored whichever spelling the client sent.
+  `the_bptree_identical_score_skip_is_decided_on_bits` pins it.
+
+  **The ledger is guarded, not argued.** `zset_member_cost` moved from
+  `is_new` at the end of `zadd_member` into the ABSENT arm of a `match`, and a
+  charge that moves is a charge that can be dropped or doubled (moon#814/#788).
+  `every_restructured_arm_keeps_the_ledger_exact` walks both encodings through
+  create, the skipped write, a widened score, a narrowed score, `NX` and `XX`
+  refusals, `ZINCRBY` both ways and `ZREM`, asserting the running ledger against
+  a from-scratch `recalculate_memory` at every rung — and returning the listpack
+  ladder to its exact floor. Proven able to fail: deleting the charge line makes
+  it report a 41,265 B ledger against a 42,865 B recompute.
+
 - **A `ZADD` that consults nothing stops decoding the stored score, and a
   score already in place is no longer written back over itself** (moon#942).
   A zset listpack keeps a score as canonical decimal text, so reading one is a

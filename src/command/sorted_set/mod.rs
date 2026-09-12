@@ -64,26 +64,83 @@ pub(super) enum AggregateOp {
 // Internal helpers -- CRITICAL for dual structure consistency
 // ---------------------------------------------------------------------------
 
+/// Look up a member and, if `decide` returns a new score, move it — in ONE
+/// hash lookup (moon#942).
+///
+/// Returns `None` when the member is absent, in which case NOTHING was written
+/// and `decide` was never called; the caller adds it with [`zset_insert_absent`]
+/// if it wants to. Otherwise `Some(old_score)`, whether or not the score moved.
+///
+/// This is the shape Redis's `zsetAdd` has: ONE `dictFind`, then the new score
+/// written through the entry it found. moon hashed the member three times for
+/// one `ZADD` — `members.get` for the flag decision, then `members.remove` and
+/// `members.insert` inside `zadd_member` — and cloned the `Bytes` twice, on a
+/// path `src/command/` forbids cloning on at all.
+///
+/// The B+tree is touched only when the score actually moves, which is Redis's
+/// own `if (score != curscore)` and matters more here than it does there:
+/// `BPTree::remove` builds a `Bytes::copy_from_slice(member)` to form its
+/// lookup key, so a no-op re-score used to cost an allocation as well as a
+/// tree delete and a tree insert.
+///
+/// The comparison is BITWISE, deliberately. `-0.0 == 0.0` is true while the two
+/// render differently (`-0` and `0`), and moon has always stored whichever one
+/// the client sent; `to_bits` keeps that, where `==` would silently start
+/// answering `0` to a client that wrote `-0`. NaN cannot reach here — `ZADD`
+/// and `ZINCRBY` both reject it — so `to_bits` has no NaN-payload hazard.
+pub(super) fn zset_update_existing(
+    members: &mut HashMap<Bytes, f64>,
+    scores: &mut BPTree,
+    member: &Bytes,
+    decide: impl FnOnce(f64) -> Option<f64>,
+) -> Option<f64> {
+    work_budget::note_member_lookup();
+    let slot = members.get_mut(member.as_ref() as &[u8])?;
+    let old = *slot;
+    let Some(new) = decide(old) else {
+        return Some(old);
+    };
+    if new.to_bits() != old.to_bits() {
+        *slot = new;
+        work_budget::note_bptree_score_write();
+        // MUST move in both structures.
+        scores.remove(OrderedFloat(old), member);
+        scores.insert(OrderedFloat(new), member.clone());
+    }
+    Some(old)
+}
+
+/// Insert a member the caller has already PROVEN absent, into both structures.
+/// One hash lookup.
+pub(super) fn zset_insert_absent(
+    members: &mut HashMap<Bytes, f64>,
+    scores: &mut BPTree,
+    member: Bytes,
+    score: f64,
+) {
+    work_budget::note_member_lookup();
+    work_budget::note_bptree_score_write();
+    members.insert(member.clone(), score);
+    scores.insert(OrderedFloat(score), member);
+}
+
 /// Add or update a member in the sorted set. Returns true if the member is new.
+///
+/// Unconditional overwrite — the shape `ZUNIONSTORE`, `ZINTERSTORE` and
+/// `ZRANGESTORE` want, where the destination is being built and no flag has a
+/// say. `ZADD` and `ZINCRBY` call [`zset_update_existing`] directly, because
+/// their decision depends on the score they are about to displace.
 pub(super) fn zadd_member(
     members: &mut HashMap<Bytes, f64>,
     scores: &mut BPTree,
     member: Bytes,
     score: f64,
 ) -> bool {
-    // Remove old entry if exists (MUST remove from both)
-    work_budget::note_member_lookup();
-    let is_new = if let Some(old_score) = members.remove(&member) {
-        scores.remove(OrderedFloat(old_score), &member);
-        false
-    } else {
-        true
-    };
-    work_budget::note_member_lookup();
-    work_budget::note_bptree_score_write();
-    members.insert(member.clone(), score);
-    scores.insert(OrderedFloat(score), member);
-    is_new
+    if zset_update_existing(members, scores, &member, |_| Some(score)).is_some() {
+        return false;
+    }
+    zset_insert_absent(members, scores, member, score);
+    true
 }
 
 /// Remove a member from the sorted set. Returns true if the member existed.
