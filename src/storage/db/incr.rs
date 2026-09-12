@@ -677,3 +677,96 @@ mod incr_in_place_942 {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// moon#942 — INCR's DashTable probe budget.
+// ---------------------------------------------------------------------------
+
+/// Every assertion here counts **DashTable key lookups** for one whole `INCR`
+/// command — the handler, not the storage method — with
+/// [`crate::storage::dashtable::take_key_lookups`]. Nothing here touches a
+/// clock and nothing here is a throughput claim; see
+/// [`crate::storage::db::probe_budget`]'s module docs for why this repo keeps
+/// those two apart (PERF-08 measured a probe reduction at **+11% on aarch64
+/// and -17% on x86_64** — the two arches disagreed in *sign*).
+///
+/// Why the command and not the storage method: the in-place fast path
+/// *declines* on some inputs, and a decline whose fallback then costs four
+/// more probes is a regression the method-level number cannot see. That is
+/// exactly what happened to the absent key when the fast path first landed.
+#[cfg(test)]
+mod incr_probe_budget_942 {
+    use crate::protocol::Frame;
+    use crate::storage::Database;
+    use crate::storage::dashtable::take_key_lookups;
+    use crate::storage::entry::Entry;
+    use bytes::Bytes;
+
+    /// Reset the counter, run one `INCR key`, return `(reply, lookups)`.
+    fn incr_probes(db: &mut Database, key: &'static [u8]) -> (Frame, u32) {
+        let args = [Frame::BulkString(Bytes::from_static(key))];
+        let _ = take_key_lookups();
+        let reply = crate::command::string::incr(db, &args);
+        (reply, take_key_lookups())
+    }
+
+    /// The dominant case at every pipeline depth: a counter that is already
+    /// hot, already a string and already an `i64`. Redis does one
+    /// `lookupKeyWrite`; so does this.
+    #[test]
+    fn a_hot_counter_costs_one_probe() {
+        let mut db = Database::new();
+        db.set(b"ctr", Entry::new_string(Bytes::from_static(b"41")));
+        let (reply, probes) = incr_probes(&mut db, b"ctr");
+        assert_eq!(reply, Frame::Integer(42));
+        assert_eq!(
+            probes, 1,
+            "the in-place path is ONE probe; anything more means the fallback \
+             ran or a second accessor crept in"
+        );
+    }
+
+    /// The case that dominates `bench-ab-matrix.sh` at p=1 and is roughly a
+    /// quarter of p=8: `ctr:__rand_int__` over a 100k keyspace is never
+    /// seeded, so the first touch of every counter has to create it.
+    ///
+    /// One probe proves the key is not hot. `promote_cold_known_absent` then
+    /// answers the in-flight and cold planes without touching the hot table at
+    /// all, and `Database::set` inserts. Two.
+    #[test]
+    fn an_absent_counter_costs_two_probes() {
+        let mut db = Database::new();
+        let (reply, probes) = incr_probes(&mut db, b"fresh");
+        assert_eq!(reply, Frame::Integer(1));
+        assert_eq!(
+            probes, 2,
+            "creating a counter must cost the residency probe plus the insert \
+             and nothing else"
+        );
+    }
+
+    /// A TTL-expired counter is physically present, so the fast path spends
+    /// its probe and then declines — deliberately, because taking the entry in
+    /// place would resurrect a dead value and keep its stale deadline. This
+    /// pins the price of that decline so it cannot drift upward unnoticed.
+    #[test]
+    fn an_expired_counter_pays_for_the_decline() {
+        let mut db = Database::new();
+        db.set_cached_now_ms_for_test(1_000_000);
+        db.set(
+            b"ctr",
+            Entry::new_string_with_expiry(Bytes::from_static(b"41"), 999_999),
+        );
+        let (reply, probes) = incr_probes(&mut db, b"ctr");
+        assert_eq!(
+            reply,
+            Frame::Integer(1),
+            "an expired counter starts again from zero"
+        );
+        assert_eq!(
+            probes, 3,
+            "the expired decline costs the fast path's probe, the general \
+             path's classify probe and the insert"
+        );
+    }
+}
