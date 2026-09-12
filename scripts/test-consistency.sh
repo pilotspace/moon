@@ -680,6 +680,30 @@ assert_both "OBJECT ENCODING after SREM (ident)"  OBJECT ENCODING s:sec:ident
 redis_sec_sm=$(redis-cli -p "$PORT_REDIS" SMEMBERS s:sec:ident 2>&1 | sort)
 rust_sec_sm=$(redis-cli -p "$PORT_RUST" SMEMBERS s:sec:ident 2>&1 | sort)
 assert_eq "SMEMBERS after SREM (sorted, byte-exact)" "$redis_sec_sm" "$rust_sec_sm"
+# moon#944: SADD's REPLY across `set-max-intset-entries` (512). moon's intset
+# push loop `break`s the instant the ceiling is crossed and the upgrade path
+# then discarded `insert`'s "was it new" bool, so every member positioned AFTER
+# the crossing was STORED but never COUNTED. Measured against redis 7.4.0: moon
+# replied 3 where redis replied 22. Nothing above probes this — every existing
+# encoding row crosses a threshold with a batch of ONE, and a one-member batch
+# has no tail past the crossing, which is exactly why the divergence went
+# unseen. The reply is what has to be compared: SCARD and SMEMBERS agreed all
+# along.
+both SADD s:intset:cross $(seq 0 509)
+assert_both "OBJECT ENCODING intset below the ceiling"   OBJECT ENCODING s:intset:cross
+assert_both "SADD straddling set-max-intset-entries"     SADD s:intset:cross $(seq 508 531)
+assert_both "SCARD after straddling SADD"                SCARD s:intset:cross
+assert_both "OBJECT ENCODING after straddling SADD"      OBJECT ENCODING s:intset:cross
+assert_both "SISMEMBER tail of the straddling batch"     SISMEMBER s:intset:cross 531
+# Straddle by ONE member past the crossing — the minimum tail that exposes it.
+both SADD s:intset:edge $(seq 0 510)
+assert_both "SADD straddling the ceiling by one member"  SADD s:intset:edge 511 512 513
+assert_both "SCARD after by-one straddle"                SCARD s:intset:edge
+# Control: the same shape entirely BELOW the ceiling must not move.
+both SADD s:intset:under $(seq 0 99)
+assert_both "SADD wholly below the intset ceiling"       SADD s:intset:under $(seq 98 109)
+assert_both "SCARD below the intset ceiling"             SCARD s:intset:under
+assert_both "OBJECT ENCODING below the intset ceiling"   OBJECT ENCODING s:intset:under
 # A container past the threshold must STILL promote — the fix must not disable
 # the policy it preserves.
 both SADD s:sec:big $(seq -f 'm%.0f' 1 129)

@@ -99,6 +99,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`SADD` under-reported its reply when one batch crossed
+  `set-max-intset-entries` (moon#944).** The intset push loop `break`s the
+  instant the ceiling is crossed, and the upgrade path then re-inserted the
+  whole argv into the new `IndexSet` while DISCARDING `insert`'s "was this
+  member new" bool — so `added` stopped at the crossing and every member
+  positioned *after* it was stored but never counted. Measured against redis
+  7.4.0 with `set-max-intset-entries 512`: `SADD` on a 510-member intset with a
+  24-member batch adding 22 new members replied **3** where redis replied
+  **22**. The data was never wrong — `SCARD` and `SMEMBERS` agreed all along —
+  which is why no harness row caught it: the reply is the only thing that
+  diverged, and clients build dedup accounting and "did I win the insert"
+  logic on exactly that number.
+
+  The upgrade path now counts `IndexSet::insert`'s bool, and walks **only the
+  unabsorbed tail** rather than the whole argv. The prefix is provably already
+  in the set: `Intset::to_set_value` renders each value with its decimal
+  spelling, and every value entered the intset through `canonical_i64`, so
+  that rendering is the caller's exact bytes (moon#795) — re-walking it was an
+  O(batch) no-op that also spent one `Bytes` clone per member on a
+  `src/command/` path, which CLAUDE.md bans. No unit test covered this because
+  every existing encoding row crosses a threshold with a batch of **one**, and
+  a one-member batch has no tail past the crossing. New rows in
+  `scripts/test-consistency.sh` compare the reply against the real redis oracle
+  for a straddle by twenty, a straddle by one, and a control wholly below the
+  ceiling; the unit tests assert the reply against the `SCARD` delta rather
+  than a hardcoded count, so neither the buggy answer nor an over-counting fix
+  can pass them.
+
 - **`HINCRBY` and `HSETNX` no longer flatten a small hash (moon#897).** Both
   reached for `Database::get_or_create_hash`, whose contract is an EAGER
   upgrade to the full `HashMap` — so a single `HINCRBY` on a three-field hash

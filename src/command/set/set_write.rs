@@ -54,8 +54,17 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                 // `Intset::estimate_memory()` is O(1) (capacity-based).
                 let before = intset.estimate_memory();
                 let mut added = 0i64;
-                let mut needs_upgrade = false;
-                for arg in &args[1..] {
+                // Index into `args` of the first member the intset did NOT
+                // absorb — where the upgraded `IndexSet` has to resume.
+                // `None` means the whole batch fit and there is no upgrade.
+                let mut resume_at: Option<usize> = None;
+                for (i, arg) in args[1..].iter().enumerate() {
+                    // Neither skip below is reachable: the `all_integers` gate
+                    // above already proved that EVERY member of this batch is
+                    // a bulk frame holding a canonical integer. That is what
+                    // makes the tail boundary exact — no member is ever passed
+                    // over before `resume_at`, so everything before it is in
+                    // the intset and everything from it on is not.
                     if let Some(member) = extract_bytes(arg) {
                         let Some(val) = try_parse_i64(member) else {
                             continue;
@@ -64,7 +73,10 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                             added += 1;
                         }
                         if !limits.intset_fits(intset.len()) {
-                            needs_upgrade = true;
+                            // `args[1 + i]` is the member that tripped the
+                            // ceiling. It IS in the intset and IS counted, so
+                            // the unabsorbed tail starts one past it.
+                            resume_at = Some(i + 2);
                             break;
                         }
                     }
@@ -76,14 +88,34 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                 } else {
                     db.credit_memory(before - after);
                 }
-                if needs_upgrade {
+                if let Some(resume_at) = resume_at {
                     // One-time cost-model swing (intset -> HashSet) — see the
                     // matching comment in hash_write.rs's hset.
                     let set = db.upgrade_intset_to_set(key);
-                    // Re-add remaining members (some may already be in the set from intset)
-                    for arg in &args[1..] {
-                        if let Some(member) = extract_bytes(arg) {
-                            set.insert(member.clone());
+                    // moon#944: the REPLY is part of the contract. `added`
+                    // stopped at the `break`, so the tail has to keep counting
+                    // into it, and `IndexSet::insert`'s `bool` is the only
+                    // thing that says whether a member was new. Discarding it
+                    // under-reported every member past the crossing: measured
+                    // against redis 7.4.0 with `set-max-intset-entries 512`,
+                    // moon replied 3 for a batch that added 22, so the sum of
+                    // a client's SADD replies disagreed with `SCARD`.
+                    //
+                    // Only `args[resume_at..]` is walked. `args[1..resume_at]`
+                    // is already IN `set`: `Intset::to_set_value` renders each
+                    // value with `to_string`, and every value reached the
+                    // intset through `canonical_i64`, so that rendering is the
+                    // caller's exact bytes (moon#795). Re-walking the absorbed
+                    // prefix would be an O(batch) no-op that also spends one
+                    // `Bytes` clone per member for nothing — the clone that
+                    // survives below is the unavoidable ownership transfer of
+                    // a member that genuinely has to be stored, exactly as on
+                    // the standard path.
+                    for arg in &args[resume_at..] {
+                        if let Some(member) = extract_bytes(arg)
+                            && set.insert(member.clone())
+                        {
+                            added += 1;
                         }
                     }
                     // `boxed_payload_block`: the `IndexSet` the members move
@@ -94,9 +126,6 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                         + set.iter().map(|m| set_member_cost(m)).sum::<usize>();
                     db.credit_memory(after);
                     db.charge_memory(new_cost);
-                    // Recount: we need accurate count of new members
-                    // Since we already inserted into intset and then upgraded,
-                    // just count total unique members vs original
                     return Frame::Integer(added);
                 }
                 return Frame::Integer(added);
