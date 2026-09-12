@@ -13,10 +13,18 @@ use crate::protocol::Frame;
 use super::helpers::extract_bytes;
 
 /// Parse a Frame argument as i64.
+///
+/// moon#942: `from_utf8` then `str::parse` walked the argument twice, and the
+/// first walk could never cast the deciding vote — the `i64` grammar is
+/// `[+-]?[0-9]+`, which is pure ASCII, so anything UTF-8 validation rejects
+/// the digit scan rejects too. [`crate::storage::numeric::parse_i64_bytes`] is
+/// that composition in one pass, pinned to it by differential tests and a fuzz
+/// target; the accepted set here is byte-for-byte what it was.
+///
+/// This is the argument parser for `INCRBY`/`DECRBY`'s delta and for every
+/// offset, index and count the string, bitmap and list commands take.
 pub(crate) fn parse_i64(frame: &Frame) -> Option<i64> {
-    let b = extract_bytes(frame)?;
-    let s = std::str::from_utf8(b).ok()?;
-    s.parse::<i64>().ok()
+    crate::storage::numeric::parse_i64_bytes(extract_bytes(frame)?)
 }
 
 /// Parse a Frame argument as positive i64 (> 0).

@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Every integer argument the string, bitmap and list commands take is read
+  in one pass** (moon#942). `command::string::parse_i64` — the parser behind
+  `INCRBY`/`DECRBY`'s delta and behind every offset, index and count in
+  `SETRANGE`, `GETRANGE`, `SETBIT`, `GETBIT`, `BITCOUNT`, `BITPOS`, `LRANGE`,
+  `LINDEX` and `LPOS` — walked its argument twice, once for `from_utf8` and
+  once for `str::parse`. It now calls `storage::numeric::parse_i64_bytes`, and
+  the accepted set is byte-for-byte unchanged (see the entry below for how that
+  equivalence is pinned).
+
 - **`INCRBYFLOAT` allocates twice per call, not three times** (moon#942).
   `format_float` built a `String` with `format!`, trimmed it, and then built a
   **second** `String` with `to_string()` to hold a prefix of the one already in

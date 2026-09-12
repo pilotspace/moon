@@ -557,7 +557,7 @@ mod tests {
             let rendered = base.to_string();
             agree(rendered.as_bytes());
             for n in 1..=rendered.len() {
-                agree(rendered[..n].as_bytes());
+                agree(&rendered.as_bytes()[..n]);
                 // Zero-padded to the same magnitude, which `str::parse`
                 // accepts and `canonical_i64` does not.
                 for pad in [1usize, 2, 8, 40] {
