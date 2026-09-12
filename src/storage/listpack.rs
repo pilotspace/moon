@@ -202,8 +202,7 @@ impl Listpack {
     pub fn push_back(&mut self, value: &[u8]) {
         let encoded = encode_entry(value);
         let insert_pos = self.data.len() - 1; // before terminator
-        self.data
-            .splice(insert_pos..insert_pos, encoded.iter().cloned());
+        self.write_entry(insert_pos..insert_pos, &encoded);
         self.update_header();
     }
 
@@ -211,8 +210,7 @@ impl Listpack {
     pub fn push_front(&mut self, value: &[u8]) {
         let encoded = encode_entry(value);
         let insert_pos = 6; // after header (4 + 2)
-        self.data
-            .splice(insert_pos..insert_pos, encoded.iter().cloned());
+        self.write_entry(insert_pos..insert_pos, &encoded);
         self.update_header();
     }
 
@@ -250,7 +248,7 @@ impl Listpack {
             return;
         };
         let encoded = encode_entry(value);
-        self.data.splice(pos..next_pos, encoded.iter().cloned());
+        self.write_entry(pos..next_pos, &encoded);
         // Update total_bytes in header (len unchanged)
         let total = self.data.len() as u32;
         self.data[0..4].copy_from_slice(&total.to_le_bytes());
@@ -378,8 +376,7 @@ impl Listpack {
             return false;
         };
         let encoded = encode_entry(value);
-        self.data
-            .splice(span.value_start..span.value_end, encoded.iter().cloned());
+        self.write_entry(span.value_start..span.value_end, &encoded);
         // Element count unchanged; only total_bytes moves.
         let total = self.data.len() as u32;
         self.data[0..4].copy_from_slice(&total.to_le_bytes());
@@ -460,6 +457,53 @@ impl Listpack {
 
     // --- Internal helpers ---
 
+    /// Replace `self.data[range]` with `entry`'s bytes, moving the tail once.
+    ///
+    /// This is what `Vec::splice` was doing, minus the temporary `Vec` the
+    /// encoding had to be materialized into first and minus `Splice`'s
+    /// byte-at-a-time `fill` loop. It is also the shape of Redis's
+    /// `lpInsert`: one `memmove` of the tail, then the head, the payload and
+    /// the backlen copied into place. A same-width replacement -- the common
+    /// HSET and ZADD update, where a fixed-width value is overwritten by
+    /// another of the same width -- moves no tail at all.
+    ///
+    /// `resize` is the only call that can touch the allocator, and only when
+    /// the listpack's own buffer has to GROW; it zero-fills the new bytes,
+    /// which the copies below immediately overwrite. That growth is the same
+    /// `lp_realloc` Redis pays, not the per-entry temporary moon#942 is
+    /// about.
+    ///
+    /// Header fields are deliberately not touched here: whether the element
+    /// count moves depends on the caller, so every caller stamps its own.
+    fn write_entry(&mut self, range: std::ops::Range<usize>, entry: &EncodedEntry<'_>) {
+        debug_assert!(range.start <= range.end && range.end <= self.data.len());
+        let old_width = range.end - range.start;
+        let new_width = entry.len();
+        let orig_len = self.data.len();
+        match new_width.cmp(&old_width) {
+            std::cmp::Ordering::Greater => {
+                let grow = new_width - old_width;
+                self.data.resize(orig_len + grow, 0);
+                self.data.copy_within(range.end..orig_len, range.end + grow);
+            }
+            std::cmp::Ordering::Less => {
+                // `shrink <= old_width <= range.end`, so the destination
+                // never underflows.
+                let shrink = old_width - new_width;
+                self.data
+                    .copy_within(range.end..orig_len, range.end - shrink);
+                self.data.truncate(orig_len - shrink);
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        let head_end = range.start + entry.head_len;
+        let payload_end = head_end + entry.payload.len();
+        self.data[range.start..head_end].copy_from_slice(&entry.head[..entry.head_len]);
+        self.data[head_end..payload_end].copy_from_slice(entry.payload);
+        self.data[payload_end..payload_end + entry.backlen_len]
+            .copy_from_slice(&entry.backlen[..entry.backlen_len]);
+    }
+
     fn update_header(&mut self) {
         let total = self.data.len() as u32;
         self.data[0..4].copy_from_slice(&total.to_le_bytes());
@@ -533,76 +577,177 @@ fn make_entry_for_compare(value: &[u8]) -> ListpackEntry {
     }
 }
 
-/// Encode a value into listpack entry bytes (encoding + data + backlen).
-fn encode_entry(value: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::new();
+/// Maximum bytes an entry's ENCODING HEAD can occupy.
+///
+/// The head is the encoding byte(s) plus whatever the encoding carries
+/// INLINE. Derived from the arms of [`encode_integer_head`] and
+/// [`encode_string_head`], not guessed at:
+///
+/// | encoding      | head bytes            |
+/// |---------------|-----------------------|
+/// | 64-bit int    | 1 + 8 = **9**         |
+/// | 32-bit int    | 1 + 4 = 5             |
+/// | 32-bit string | 1 + 4 = 5 (+ payload) |
+/// | 24-bit int    | 1 + 3 = 4             |
+/// | 16-bit int    | 1 + 2 = 3             |
+/// | 13-bit int    | 2                     |
+/// | 12-bit string | 2 (+ payload)         |
+/// | 7-bit uint    | 1                     |
+/// | 6-bit string  | 1 (+ payload)         |
+///
+/// A string PAYLOAD is deliberately NOT part of this bound, and no constant
+/// could make it one: `hash-max-listpack-value` and its siblings are runtime
+/// config, and the RDB/AOF loaders rebuild listpacks with no element-size
+/// limit at all. The payload is therefore never copied into a stack buffer --
+/// [`Listpack::write_entry`] copies it straight from the caller's slice into
+/// the listpack, which is what Redis's `lpInsert` does too.
+const LP_MAX_ENTRY_HEAD: usize = 9;
 
-    if let Some(v) = try_encode_as_integer(value) {
-        encode_integer_entry(v, &mut buf);
-    } else {
-        encode_string_entry(value, &mut buf);
-    }
+/// Maximum bytes of a backlen field.
+///
+/// [`encode_backlen_into`] emits 7 bits of `entry_len` per byte and
+/// `entry_len` is a `usize`, so the widest field the encoder can produce is
+/// `ceil(usize::BITS / 7)` -- 10 bytes on a 64-bit target, 5 on a 32-bit one.
+/// `backlen_bound_covers_usize_max` pins that against [`backlen_size`].
+const LP_MAX_BACKLEN: usize = (usize::BITS as usize).div_ceil(7);
 
-    // Compute and append backlen (total entry size before backlen)
-    let entry_len = buf.len();
-    let backlen = encode_backlen(entry_len);
-    buf.extend_from_slice(&backlen);
-    buf
+/// One listpack entry, encoded but not yet placed.
+///
+/// The encoding head and the backlen live in stack arrays; the payload is
+/// BORROWED from the caller and never copied into a temporary. This replaced
+/// an `encode_entry -> Vec<u8>` that heap-allocated on every entry written by
+/// HSET, LPUSH, SADD and ZADD -- twice, in fact, because `Vec::new()` starts
+/// at capacity 0 and the backlen was appended afterwards -- and then dropped
+/// the allocation immediately (moon#942). Redis encodes into a stack
+/// `intenc[LP_MAX_INT_ENCODING_LEN]` and never allocates.
+struct EncodedEntry<'a> {
+    head: [u8; LP_MAX_ENTRY_HEAD],
+    head_len: usize,
+    /// The caller's bytes, for the string encodings. Empty for an integer
+    /// entry, whose value lives entirely inside `head`.
+    payload: &'a [u8],
+    backlen: [u8; LP_MAX_BACKLEN],
+    backlen_len: usize,
 }
 
-fn encode_integer_entry(v: i64, buf: &mut Vec<u8>) {
+impl EncodedEntry<'_> {
+    /// Total bytes this entry occupies once written.
+    #[inline]
+    fn len(&self) -> usize {
+        self.head_len + self.payload.len() + self.backlen_len
+    }
+}
+
+/// Encode a value into listpack entry form (encoding + data + backlen).
+///
+/// Byte-for-byte identical to the `Vec`-building encoder it replaced;
+/// `byte_exactness_tests` pins every arm against goldens captured from that
+/// encoder before the rewrite.
+#[inline]
+fn encode_entry(value: &[u8]) -> EncodedEntry<'_> {
+    let mut head = [0u8; LP_MAX_ENTRY_HEAD];
+    let (head_len, payload): (usize, &[u8]) = match try_encode_as_integer(value) {
+        Some(v) => (encode_integer_head(v, &mut head), &[]),
+        None => (encode_string_head(value.len(), &mut head), value),
+    };
+    // The backlen covers the entry size BEFORE the backlen itself.
+    let entry_len = head_len + payload.len();
+    let mut backlen = [0u8; LP_MAX_BACKLEN];
+    let backlen_len = encode_backlen_into(entry_len, &mut backlen);
+    EncodedEntry {
+        head,
+        head_len,
+        payload,
+        backlen,
+        backlen_len,
+    }
+}
+
+/// Write the integer encoding for `v` into `head`; returns its width.
+fn encode_integer_head(v: i64, head: &mut [u8; LP_MAX_ENTRY_HEAD]) -> usize {
     if v >= 0 && v <= 127 {
         // 7-bit unsigned: 0xxxxxxx
-        buf.push(v as u8);
+        head[0] = v as u8;
+        1
     } else if v >= -4096 && v <= 4095 {
         // 13-bit signed: 110xxxxx + 1 byte
         let uv = (v as i16 as u16) & 0x1FFF;
-        let b0 = 0xC0 | ((uv >> 8) as u8 & 0x1F);
-        let b1 = (uv & 0xFF) as u8;
-        buf.push(b0);
-        buf.push(b1);
+        head[0] = 0xC0 | ((uv >> 8) as u8 & 0x1F);
+        head[1] = (uv & 0xFF) as u8;
+        2
     } else if v >= i16::MIN as i64 && v <= i16::MAX as i64 {
         // 16-bit signed
-        buf.push(LP_ENCODING_16BIT_INT);
-        buf.extend_from_slice(&(v as i16).to_le_bytes());
+        head[0] = LP_ENCODING_16BIT_INT;
+        head[1..3].copy_from_slice(&(v as i16).to_le_bytes());
+        3
     } else if v >= -8388608 && v <= 8388607 {
         // 24-bit signed
-        buf.push(LP_ENCODING_24BIT_INT);
-        let bytes = (v as i32).to_le_bytes();
-        buf.extend_from_slice(&bytes[..3]);
+        head[0] = LP_ENCODING_24BIT_INT;
+        head[1..4].copy_from_slice(&(v as i32).to_le_bytes()[..3]);
+        4
     } else if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
         // 32-bit signed
-        buf.push(LP_ENCODING_32BIT_INT);
-        buf.extend_from_slice(&(v as i32).to_le_bytes());
+        head[0] = LP_ENCODING_32BIT_INT;
+        head[1..5].copy_from_slice(&(v as i32).to_le_bytes());
+        5
     } else {
         // 64-bit signed
-        buf.push(LP_ENCODING_64BIT_INT);
-        buf.extend_from_slice(&v.to_le_bytes());
+        head[0] = LP_ENCODING_64BIT_INT;
+        head[1..9].copy_from_slice(&v.to_le_bytes());
+        9
     }
 }
 
-fn encode_string_entry(value: &[u8], buf: &mut Vec<u8>) {
-    let len = value.len();
+/// Write the string encoding for a payload of `len` bytes into `head`;
+/// returns its width. The payload itself is not touched here.
+fn encode_string_head(len: usize, head: &mut [u8; LP_MAX_ENTRY_HEAD]) -> usize {
     if len <= 63 {
         // 6-bit string: 10xxxxxx
-        buf.push(0x80 | (len as u8));
-        buf.extend_from_slice(value);
+        head[0] = 0x80 | (len as u8);
+        1
     } else if len <= 4095 {
         // 12-bit string: 1110xxxx + 1 byte
-        let b0 = 0xE0 | ((len >> 8) as u8 & 0x0F);
-        let b1 = (len & 0xFF) as u8;
-        buf.push(b0);
-        buf.push(b1);
-        buf.extend_from_slice(value);
+        head[0] = 0xE0 | ((len >> 8) as u8 & 0x0F);
+        head[1] = (len & 0xFF) as u8;
+        2
     } else {
         // 32-bit string: 11110000 + 4 bytes
-        buf.push(LP_ENCODING_32BIT_STR);
-        buf.extend_from_slice(&(len as u32).to_le_bytes());
-        buf.extend_from_slice(value);
+        head[0] = LP_ENCODING_32BIT_STR;
+        head[1..5].copy_from_slice(&(len as u32).to_le_bytes());
+        5
     }
+}
+
+/// Write the backlen for an entry of `entry_len` bytes into `out`; returns
+/// how many bytes it used.
+///
+/// The non-allocating twin of [`encode_backlen`], which survives as the test
+/// oracle both this and [`backlen_size`] are pinned against.
+#[inline]
+fn encode_backlen_into(entry_len: usize, out: &mut [u8; LP_MAX_BACKLEN]) -> usize {
+    let mut len = entry_len;
+    if len <= 127 {
+        out[0] = len as u8;
+        return 1;
+    }
+    let mut n = 0;
+    while len > 0 {
+        let mut byte = (len & 0x7F) as u8;
+        len >>= 7;
+        if len > 0 {
+            byte |= 0x80;
+        }
+        out[n] = byte;
+        n += 1;
+    }
+    n
 }
 
 /// Encode backlen as variable-length bytes (7 bits + continuation bit).
+///
+/// The allocating original, kept as the oracle [`encode_backlen_into`] and
+/// [`backlen_size`] are checked against. No production path calls it.
+#[cfg(test)]
 fn encode_backlen(entry_len: usize) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut len = entry_len;
@@ -1600,13 +1745,13 @@ mod byte_exactness_tests {
     fn encoding_width_seams_are_unchanged() {
         // 63 bytes is the top of the 6-bit string head, 64 the first 12-bit
         // one, 65 the one after.
-        assert_eq!(&encoded_hex(&vec![b'x'; 63])[12..14], "bf");
-        assert_eq!(&encoded_hex(&vec![b'y'; 64])[12..16], "e040");
-        assert_eq!(&encoded_hex(&vec![b'z'; 65])[12..16], "e041");
+        assert_eq!(&encoded_hex(&[b'x'; 63])[12..14], "bf");
+        assert_eq!(&encoded_hex(&[b'y'; 64])[12..16], "e040");
+        assert_eq!(&encoded_hex(&[b'z'; 65])[12..16], "e041");
 
         // 127 bytes of payload makes entry_len 129: the first two-byte
         // backlen.
-        let seam = encoded_hex(&vec![b'p'; 127]);
+        let seam = encoded_hex(&[b'p'; 127]);
         assert_eq!(&seam[..16], "8a0000000100e07f");
         assert_eq!(&seam[seam.len() - 6..], "8101ff");
     }
@@ -1678,7 +1823,105 @@ mod byte_exactness_tests {
         }
         assert!(lp.replace_pair_value(b"f39", b"same-width-replacement"));
         assert!(lp.replace_pair_value(b"f0", b"0"));
-        assert_eq!(hex(&lp.data), GOLDEN_PAIRS_40, "replace_pair_value byte layout changed");
+        assert_eq!(
+            hex(&lp.data),
+            GOLDEN_PAIRS_40,
+            "replace_pair_value byte layout changed"
+        );
+    }
+
+    /// `LP_MAX_BACKLEN` is DERIVED from `usize::BITS`, not guessed at. Prove
+    /// the derivation covers the widest `entry_len` the type can express --
+    /// and that it is not needlessly generous either, so a future reader can
+    /// see the bound is tight rather than a round number someone liked.
+    #[test]
+    fn backlen_bound_covers_usize_max() {
+        assert_eq!(
+            backlen_size(usize::MAX),
+            LP_MAX_BACKLEN,
+            "LP_MAX_BACKLEN must be exactly the width of the widest backlen"
+        );
+        let mut buf = [0u8; LP_MAX_BACKLEN];
+        assert_eq!(encode_backlen_into(usize::MAX, &mut buf), LP_MAX_BACKLEN);
+    }
+
+    /// `LP_MAX_ENTRY_HEAD` must cover the widest head any arm of the encoder
+    /// can write, checked against the bytes the encoder actually emits rather
+    /// than against the table in the constant's own doc comment.
+    #[test]
+    fn head_bound_covers_every_encoding() {
+        // The 64-bit integer arm is what pins the bound.
+        let widest = encode_entry(b"9223372036854775807");
+        assert_eq!(widest.head_len, LP_MAX_ENTRY_HEAD);
+        assert!(
+            widest.payload.is_empty(),
+            "integer entries carry no payload"
+        );
+
+        // The widest STRING head, whose payload is deliberately outside the
+        // bound and stays borrowed.
+        let big_string = vec![b'a'; 4096];
+        let wide_str = encode_entry(&big_string);
+        assert_eq!(wide_str.head_len, 5);
+        assert_eq!(wide_str.payload.len(), 4096);
+        assert_eq!(
+            wide_str.payload.as_ptr(),
+            big_string.as_ptr(),
+            "the payload must be borrowed, not copied into a buffer"
+        );
+
+        for probe in [
+            &b"0"[..],
+            b"127",
+            b"128",
+            b"4095",
+            b"32767",
+            b"8388607",
+            b"2147483647",
+            b"9223372036854775807",
+            b"-9223372036854775808",
+            b"",
+            b"abc",
+            b"007",
+            b"+5",
+        ] {
+            let e = encode_entry(probe);
+            assert!(
+                e.head_len <= LP_MAX_ENTRY_HEAD,
+                "head overflowed the bound for {:?}",
+                String::from_utf8_lossy(probe)
+            );
+            assert!(e.backlen_len <= LP_MAX_BACKLEN);
+        }
+    }
+
+    /// The stack-buffer backlen writer must agree with `encode_backlen`, the
+    /// allocating original kept as the oracle, and with `backlen_size`.
+    #[test]
+    fn backlen_writer_agrees_with_the_oracle() {
+        for n in [
+            0usize,
+            1,
+            126,
+            127,
+            128,
+            129,
+            16383,
+            16384,
+            16385,
+            2097151,
+            2097152,
+            usize::MAX,
+        ] {
+            let mut buf = [0u8; LP_MAX_BACKLEN];
+            let written = encode_backlen_into(n, &mut buf);
+            assert_eq!(
+                &buf[..written],
+                encode_backlen(n).as_slice(),
+                "encode_backlen_into disagreed with the oracle at entry_len={n}"
+            );
+            assert_eq!(written, backlen_size(n), "width disagreed at {n}");
+        }
     }
 
     /// Golden for `mutation_sequence_bytes_are_unchanged`'s 40-pair listpack.
