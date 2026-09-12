@@ -160,18 +160,6 @@ impl Database {
     // methods are thin delegators, so command-layer call sites are
     // unchanged and dispatch is fully static.
 
-    /// Remove `key` if it is expired at `now_ms`, crediting its memory.
-    ///
-    /// Write-path expired drop (get_or_create*): the incoming streamed write
-    /// supersedes the key everywhere, so no #542 hide/queue here — but the
-    /// removal must still go through `remove_hot` so the expiry index stays
-    /// in lock-step (moon#541).
-    fn drop_if_expired(&mut self, key: &[u8], now_ms: u64) {
-        if Self::check_expired(&self.data, key, now_ms) {
-            self.remove_hot(key);
-        }
-    }
-
     /// Read-only typed access via the kind's `*Ref` view.
     ///
     /// Takes `&self` because this backs BOTH the exclusive-dispatch path
@@ -422,25 +410,21 @@ impl Database {
     #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
     pub fn get_or_create_intset(&mut self, key: &[u8]) -> Result<Option<&mut Intset>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            // P0 fix: promote a cold-spilled set before fabricating an empty
-            // intset — a promoted value always decodes as `RedisValue::Set`
-            // (cold storage never persists the intset compact encoding), so
-            // it naturally falls into the `Ok(None)` "not an intset, caller
-            // should use get_or_create_set" arm below, which already routes
-            // callers (e.g. SADD) to `get_or_create_set` — no fabrication.
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let mut entry = Entry::new_set_intset();
-                // Fresh incarnation: stamp the per-db creation ticket so a
-                // WATCHing client can tell this container from the one that
-                // occupied the key before (see `Database::birth_counter`).
-                entry.set_version(self.next_birth_version());
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
+        // P0 fix: `settle_not_live` promotes a cold-spilled set before this
+        // fabricates an empty intset — a promoted value always decodes as
+        // `RedisValue::Set` (cold storage never persists the intset compact
+        // encoding), so it naturally falls into the `Ok(None)` "not an
+        // intset, caller should use get_or_create_set" arm below, which
+        // already routes callers (e.g. SADD) to `get_or_create_set` — no
+        // fabrication.
+        //
+        // moon#942: ONE lookup decides the preamble — `hot_state` replaces
+        // the `drop_if_expired` + `contains_key` pair, and the create arm
+        // reads `promote_cold_if_present`'s own return value instead of
+        // re-issuing `contains_key`.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            self.insert_fresh(key, Entry::new_set_intset());
         }
         let entry = self.data.get_mut(key).unwrap();
         // moon#926 — see `stamp_mutation`.
@@ -483,25 +467,20 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            // P0 fix: promote a cold-spilled hash before fabricating an
-            // empty listpack — a promoted value always decodes as
-            // `RedisValue::Hash` (cold storage never persists the listpack
-            // compact encoding), so it naturally falls into the `Ok(None)`
-            // "not a listpack, fall through" arm below, which already routes
-            // callers (e.g. HSET) to `get_or_create_hash` — no fabrication.
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let mut entry = Entry::new_hash_listpack();
-                // Fresh incarnation: stamp the per-db creation ticket so a
-                // WATCHing client can tell this container from the one that
-                // occupied the key before (see `Database::birth_counter`).
-                entry.set_version(self.next_birth_version());
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
+        // P0 fix: `settle_not_live` promotes a cold-spilled hash before this
+        // fabricates an empty listpack — a promoted value always decodes as
+        // `RedisValue::Hash` (cold storage never persists the listpack
+        // compact encoding), so it naturally falls into the `Ok(None)` "not a
+        // listpack, fall through" arm below, which already routes callers
+        // (e.g. HSET) to `get_or_create_hash` — no fabrication.
+        //
+        // moon#942: ONE lookup decides the preamble — `hot_state` replaces
+        // the `drop_if_expired` + `contains_key` pair, and the create arm
+        // reads `promote_cold_if_present`'s own return value instead of
+        // re-issuing `contains_key`.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            self.insert_fresh(key, Entry::new_hash_listpack());
         }
         let entry = self.data.get_mut(key).unwrap();
         // moon#926 — see `stamp_mutation`.
@@ -546,25 +525,20 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            // P0 fix: promote a cold-spilled list before fabricating an
-            // empty listpack — a promoted value always decodes as
-            // `RedisValue::List` (cold storage never persists the listpack
-            // compact encoding), so it naturally falls into the `Ok(None)`
-            // "not a listpack, fall through" arm below, which already routes
-            // callers (e.g. LPUSH) to `get_or_create_list` — no fabrication.
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let mut entry = Entry::new_list_listpack();
-                // Fresh incarnation: stamp the per-db creation ticket so a
-                // WATCHing client can tell this container from the one that
-                // occupied the key before (see `Database::birth_counter`).
-                entry.set_version(self.next_birth_version());
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
+        // P0 fix: `settle_not_live` promotes a cold-spilled list before this
+        // fabricates an empty listpack — a promoted value always decodes as
+        // `RedisValue::List` (cold storage never persists the listpack
+        // compact encoding), so it naturally falls into the `Ok(None)` "not a
+        // listpack, fall through" arm below, which already routes callers
+        // (e.g. LPUSH) to `get_or_create_list` — no fabrication.
+        //
+        // moon#942: ONE lookup decides the preamble — `hot_state` replaces
+        // the `drop_if_expired` + `contains_key` pair, and the create arm
+        // reads `promote_cold_if_present`'s own return value instead of
+        // re-issuing `contains_key`.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            self.insert_fresh(key, Entry::new_list_listpack());
         }
         let entry = self.data.get_mut(key).unwrap();
         // moon#926 — see `stamp_mutation`.
@@ -647,19 +621,13 @@ impl Database {
         absorb_intset: impl FnOnce(usize, usize) -> bool,
     ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let mut entry = Entry::new_set_listpack();
-                // Fresh incarnation: stamp the per-db creation ticket so a
-                // WATCHing client can tell this container from the one that
-                // occupied the key before (see `Database::birth_counter`).
-                entry.set_version(self.next_birth_version());
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
+        // moon#942: ONE lookup decides the preamble. `settle_not_live` still
+        // promotes a cold-spilled set before this fabricates an empty
+        // listpack, so a promoted value lands in the `Ok(None)` arm below
+        // rather than being fabricated over.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            self.insert_fresh(key, Entry::new_set_listpack());
         }
         self.absorb_intset_into_listpack(key, absorb_intset);
         let entry = self.data.get_mut(key).unwrap();
@@ -768,19 +736,13 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let mut entry = Entry::new_sorted_set_listpack();
-                // Fresh incarnation: stamp the per-db creation ticket so a
-                // WATCHing client can tell this container from the one that
-                // occupied the key before (see `Database::birth_counter`).
-                entry.set_version(self.next_birth_version());
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
+        // moon#942: ONE lookup decides the preamble. `settle_not_live` still
+        // promotes a cold-spilled zset before this fabricates an empty
+        // listpack, so a promoted value lands in the `Ok(None)` arm below
+        // rather than being fabricated over.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            self.insert_fresh(key, Entry::new_sorted_set_listpack());
         }
         let entry = self.data.get_mut(key).unwrap();
         // moon#926 — see `stamp_mutation`.
@@ -1241,9 +1203,10 @@ impl Database {
     /// cold-collection-visibility fix) — this accessor takes `&mut self`.
     pub fn get_stream_mut(&mut self, key: &[u8]) -> Result<Option<&mut StreamData>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
+        // moon#942: one lookup for the preamble, one to hand the stream out.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live {
+            self.settle_not_live(key, now_ms, state);
         }
         match self.data.get_mut(key) {
             None => Ok(None),
