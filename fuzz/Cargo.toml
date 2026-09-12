@@ -148,3 +148,8 @@ doc = false
 name = "listpack_roundtrip"
 path = "fuzz_targets/listpack_roundtrip.rs"
 doc = false
+
+[[bin]]
+name = "canonical_i64_differential"
+path = "fuzz_targets/canonical_i64_differential.rs"
+doc = false

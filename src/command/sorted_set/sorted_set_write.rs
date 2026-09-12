@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::db::{Shape, zset_member_cost, zset_table_bytes};
-use crate::storage::listpack::Listpack;
+use crate::storage::listpack::PairUpdate;
 use crate::storage::zset_score::{ScoreBuf, render_score};
 
 use crate::command::helpers::{all_args_are_bytes, err, err_wrong_args, extract_bytes};
@@ -47,27 +47,20 @@ fn parse_zadd_pair<'a>(
     Ok((score, member))
 }
 
-/// Locate `member` in a zset listpack: the PAIR index and the member's
-/// current score.
-///
-/// A zset listpack is `[member, score, member, score, …]`, so pair index `i`
-/// puts the member at raw entry `2*i` and its score at `2*i + 1` — which is
-/// what `replace_at` needs. Borrowed scan over `iter_pair_refs`: nothing is
-/// materialised for the entries walked past. The owning `iter_pairs()` +
-/// `as_bytes()` shape allocated twice per pair walked — the exact lookup
-/// moon#801 removed from HSET — and must not come back here. Bounded by
-/// `zset-max-listpack-entries`, so this stays O(128) worst case.
-///
-/// An unparseable stored score is in-memory corruption (every writer goes
-/// through `render_score`); it is read as 0.0 so the member is still FOUND
-/// and updated in place rather than duplicated.
-#[inline]
-fn listpack_zset_find(lp: &Listpack, member: &[u8]) -> Option<(usize, f64)> {
-    lp.iter_pair_refs().enumerate().find_map(|(idx, (m, s))| {
-        m.eq_bytes(member)
-            .then(|| (idx, s.as_score().unwrap_or(0.0)))
-    })
-}
+// A zset listpack is `[member, score, member, score, …]` — the same
+// field/value layout a hash listpack has — so the member/score update is
+// `Listpack::update_pair_value`: ONE borrowed scan that keeps the byte
+// offsets it walked past and writes the new score where it stopped.
+//
+// It used to be a local `listpack_zset_find` returning a pair ORDINAL,
+// followed by `replace_at`, which walked back to that ordinal from the head.
+// Two scans to change one score, which is the defect moon#799 fixed for HSET
+// and left standing for the sorted set (moon#942). Nothing materialises for
+// the entries walked past on either the lookup or the write.
+//
+// An unparseable stored score is in-memory corruption (every writer goes
+// through `render_score`); the closures below read it as 0.0 so the member is
+// still FOUND and updated in place rather than duplicated.
 
 /// ZADD key [NX|XX] [GT|LT] [CH] score member [score member ...]
 pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
@@ -203,8 +196,6 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                 // Listpack `estimate_memory()` is O(1) (capacity-based), so a
                 // before/after snapshot is cheap — no per-member formula.
                 let before = lp.estimate_memory();
-                // One stack buffer for every rendered score in this call.
-                let mut rendered = ScoreBuf::new();
                 for pair in remaining.chunks_exact(2) {
                     let [score_arg, member_arg] = pair else {
                         return err_wrong_args("ZADD");
@@ -218,38 +209,50 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                         Err(e) => return e,
                     };
 
-                    let found = listpack_zset_find(lp, member);
-                    let should_update = match found {
-                        None => !xx, // New member: add unless XX
-                        Some((_, old)) => {
-                            if nx {
-                                false // NX: never update existing
-                            } else if gt && lt {
-                                false // GT+LT together: never update
-                            } else if gt {
-                                score > old
-                            } else if lt {
-                                score < old
-                            } else {
-                                true // No flags: always update
+                    // ONE scan (moon#942), decided from the score that is
+                    // already there. `old_score` comes back out through the
+                    // closure because the `CH` tally needs it after the
+                    // write.
+                    let mut old_score = 0.0f64;
+                    let outcome = lp.update_pair_value(member, |current| {
+                        let old = current.as_score().unwrap_or(0.0);
+                        old_score = old;
+                        let should_update = if nx {
+                            false // NX: never update existing
+                        } else if gt && lt {
+                            false // GT+LT together: never update
+                        } else if gt {
+                            score > old
+                        } else if lt {
+                            score < old
+                        } else {
+                            true // No flags: always update
+                        };
+                        if !should_update {
+                            return None;
+                        }
+                        // Store the canonical rendering, not the raw
+                        // argument: `ZADD z 3.0 m` must answer `ZSCORE` with
+                        // `3`, and `render_score` is round-trip exact, so
+                        // `as_score` recovers the identical f64.
+                        let mut rendered = ScoreBuf::new();
+                        render_score(score, &mut rendered);
+                        Some(rendered)
+                    });
+
+                    match outcome {
+                        PairUpdate::Replaced(_) => {
+                            if (old_score - score).abs() > f64::EPSILON {
+                                changed += 1;
                             }
                         }
-                    };
-
-                    if should_update {
-                        // Store the canonical rendering, not the raw argument:
-                        // `ZADD z 3.0 m` must answer `ZSCORE` with `3`, and
-                        // `render_score` is round-trip exact, so `as_score`
-                        // recovers the identical f64.
-                        render_score(score, &mut rendered);
-                        match found {
-                            Some((idx, old)) => {
-                                lp.replace_at(idx * 2 + 1, &rendered);
-                                if (old - score).abs() > f64::EPSILON {
-                                    changed += 1;
-                                }
-                            }
-                            None => {
+                        // The member is there and a flag refused the write.
+                        PairUpdate::Unchanged => {}
+                        PairUpdate::Absent => {
+                            // New member: add unless XX.
+                            if !xx {
+                                let mut rendered = ScoreBuf::new();
+                                render_score(score, &mut rendered);
                                 lp.push_back(member);
                                 lp.push_back(&rendered);
                                 added += 1;
@@ -515,43 +518,62 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
     if limits.fits(Shape::SortedSet, 1, member.len()) {
         match db.get_or_create_zset_listpack(key) {
             Ok(Some(lp)) => {
-                let found = listpack_zset_find(lp, &member);
-                let current = found.map_or(0.0, |(_, score)| score);
-                let new_score = current + increment;
+                // Listpack `estimate_memory()` is O(1) (capacity-based).
+                let before = lp.estimate_memory();
+                // ONE scan (moon#942): the walk that finds the member carries
+                // the byte offsets its score is rewritten at, so there is no
+                // second walk back to an ordinal.
+                //
                 // moon#863's hazard, stated: a listpack stores the score as
                 // its RENDERED text, and `render_score(NaN)` writes `NaN`,
                 // which `parse_score` refuses — the score would read back as
                 // 0.0 and the member would silently change value. `increment`
                 // is already proven non-NaN above, so this is reachable only
                 // as `±inf + ∓inf`, which in turn means the member already
-                // exists (a fresh member starts at 0.0) — so falling through
-                // here never leaves a key created-and-abandoned.
+                // exists (a fresh member starts at 0.0) — so declining here
+                // never leaves a key created-and-abandoned.
                 //
-                // The fall-through hands the case to the B+tree arm below,
-                // which is byte-for-byte what EVERY ZINCRBY did before this
-                // branch existed. moon's reply there (`NaN`) diverges from
-                // redis 8.6.1, which answers
+                // Declining hands the case to the B+tree arm below, which is
+                // byte-for-byte what EVERY ZINCRBY did before this branch
+                // existed. moon's reply there (`NaN`) diverges from redis
+                // 8.6.1, which answers
                 // `ERR resulting score is not a number (NaN)` and leaves the
                 // score untouched — a real, PRE-EXISTING divergence that this
                 // change deliberately does not alter, and that a NaN must
                 // never reach a listpack in the meantime.
-                if !new_score.is_nan() {
-                    // Listpack `estimate_memory()` is O(1) (capacity-based).
-                    let before = lp.estimate_memory();
+                let outcome = lp.update_pair_value(&member, |current| {
+                    let new_score = current.as_score().unwrap_or(0.0) + increment;
+                    if new_score.is_nan() {
+                        return None;
+                    }
                     // One stack buffer; `render_score` is byte-identical to
                     // `format_score_bytes`, so the stored text and the reply
                     // below agree, and `render_score -> parse_score` is exact
                     // (`storage::zset_score`), so ZSCORE recovers this f64.
                     let mut rendered = ScoreBuf::new();
                     render_score(new_score, &mut rendered);
-                    match found {
-                        // Pair index `i` puts the score at raw entry `2i + 1`.
-                        Some((idx, _)) => lp.replace_at(idx * 2 + 1, &rendered),
-                        None => {
-                            lp.push_back(&member);
-                            lp.push_back(&rendered);
-                        }
+                    Some(rendered)
+                });
+
+                let stored = match outcome {
+                    // The bytes handed back are the ones written, so the
+                    // reply below does not render the score a second time.
+                    PairUpdate::Replaced(rendered) => Some(rendered),
+                    PairUpdate::Absent => {
+                        // A fresh member starts at 0.0 and `increment` is
+                        // already proven non-NaN, so this rendering can never
+                        // be the NaN the arm above guards against.
+                        let mut rendered = ScoreBuf::new();
+                        render_score(increment, &mut rendered);
+                        lp.push_back(&member);
+                        lp.push_back(&rendered);
+                        Some(rendered)
                     }
+                    // NaN: the listpack was not touched. Fall through.
+                    PairUpdate::Unchanged => None,
+                };
+
+                if let Some(rendered) = stored {
                     let after = lp.estimate_memory();
                     // The upgrade check, from the same authority as the gate:
                     // it converts `lp.len()` (member AND score entries) to

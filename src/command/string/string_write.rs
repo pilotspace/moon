@@ -2,6 +2,7 @@ use bytes::Bytes;
 
 use crate::protocol::Frame;
 use crate::storage::Database;
+use crate::storage::db::IncrOutcome;
 use crate::storage::entry::{Entry, current_time_ms};
 
 use super::{format_float, parse_f64, parse_i64, parse_positive_i64};
@@ -376,8 +377,52 @@ pub fn decrby(db: &mut Database, args: &[Frame]) -> Frame {
     incrby_internal(db, key, neg)
 }
 
+const ERR_NOT_INTEGER: &[u8] = b"ERR value is not an integer or out of range";
+const ERR_INCR_OVERFLOW: &[u8] = b"ERR increment or decrement would overflow";
+const ERR_WRONGTYPE: &[u8] = b"WRONGTYPE Operation against a key holding the wrong kind of value";
+
 /// Internal helper for INCR/DECR/INCRBY/DECRBY.
+///
+/// moon#942: the common case — a counter that is already hot, already a
+/// string, and already an `i64` — is mutated **in place**
+/// ([`Database::incr_hot_string_in_place`]), the way Redis's
+/// `incrDecrCommand` rewrites `o->ptr`. That is one `DashTable` probe against
+/// the three the `get` + `set` pair below costs, and it rebuilds no `Entry`.
+/// The storage method owns every side effect `Database::set` would have had;
+/// see `src/storage/db/incr.rs` for the enumeration and the per-item decision.
+///
+/// Everything the fast path refuses — an absent key (which may be in the cold
+/// tier or the in-flight spill plane), and a TTL-expired one — falls through
+/// to [`incrby_general`] unchanged.
 fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
+    match db.incr_hot_string_in_place(key, delta) {
+        IncrOutcome::Applied(new_val) => {
+            // "incrby", not "incr": Redis names the internal operation, not
+            // the command the client typed, so INCR/DECR/INCRBY/DECRBY all
+            // report this.
+            crate::notify::notify_keyspace_event(
+                crate::notify::NotifyFlags::STRING,
+                "incrby",
+                key,
+                db.db_index,
+            );
+            Frame::Integer(new_val)
+        }
+        IncrOutcome::NotInteger => Frame::Error(Bytes::from_static(ERR_NOT_INTEGER)),
+        IncrOutcome::WrongType => Frame::Error(Bytes::from_static(ERR_WRONGTYPE)),
+        IncrOutcome::Overflow => Frame::Error(Bytes::from_static(ERR_INCR_OVERFLOW)),
+        IncrOutcome::NotHot => incrby_general(db, key, delta),
+    }
+}
+
+/// The general INCR path: key creation, cold-tier promotion, in-flight-spill
+/// rehydration and lazy-expiry bookkeeping all live behind `Database::get`,
+/// and the write is a whole-`Entry` replacement through `Database::set`.
+///
+/// Reached only when [`Database::incr_hot_string_in_place`] declined
+/// ([`IncrOutcome::NotHot`]): the key is absent from hot RAM, or present but
+/// TTL-expired.
+fn incrby_general(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
     // Get current value and existing expiry
     let (current, existing_expiry_ms) = match db.get(key) {
         Some(entry) => {
@@ -387,24 +432,18 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
                     let s = match std::str::from_utf8(v) {
                         Ok(s) => s,
                         Err(_) => {
-                            return Frame::Error(Bytes::from_static(
-                                b"ERR value is not an integer or out of range",
-                            ));
+                            return Frame::Error(Bytes::from_static(ERR_NOT_INTEGER));
                         }
                     };
                     match s.parse::<i64>() {
                         Ok(n) => (n, expiry),
                         Err(_) => {
-                            return Frame::Error(Bytes::from_static(
-                                b"ERR value is not an integer or out of range",
-                            ));
+                            return Frame::Error(Bytes::from_static(ERR_NOT_INTEGER));
                         }
                     }
                 }
                 None => {
-                    return Frame::Error(Bytes::from_static(
-                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ));
+                    return Frame::Error(Bytes::from_static(ERR_WRONGTYPE));
                 }
             }
         }
@@ -414,9 +453,7 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
     let new_val = match current.checked_add(delta) {
         Some(v) => v,
         None => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR increment or decrement would overflow",
-            ));
+            return Frame::Error(Bytes::from_static(ERR_INCR_OVERFLOW));
         }
     };
 

@@ -2609,6 +2609,20 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     // moon#595: shared gate — see the twin in
                                     // handler_monoio. Omitting XADD here made a
                                     // locally-owned stream key unwakeable.
+                                    //
+                                    // moon#942 does NOT apply here, and that is
+                                    // deliberate rather than an omission. This
+                                    // arm reuses `db_guard`, which already spans
+                                    // eviction → undo capture → dispatch → this
+                                    // call, so a non-producer write pays nothing
+                                    // extra for the no-op. `handler_monoio`
+                                    // drops its write guard right after
+                                    // `dispatch` (the index hooks re-enter the
+                                    // slice) and so had to take a SECOND one
+                                    // here — that acquisition is the one now
+                                    // gated on `producer_family`. Adding a gate
+                                    // here would buy nothing and would put a
+                                    // second copy of the predicate in the tree.
                                     crate::blocking::wakeup::wake_producer(
                                         &ctx.blocking_registry,
                                         db,

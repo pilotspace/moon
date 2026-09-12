@@ -29,6 +29,41 @@ fn widest_rendering(is: &Intset) -> usize {
     first.max(last)
 }
 
+/// The `intset -> listpack` edge (moon#899), in place, on an entry the caller
+/// ALREADY HOLDS: a no-op for anything but a `SetIntset` whose
+/// `absorb(members, widest_rendering)` answers true. Renders every `i64` with
+/// `itoa` (canonical, so byte-exact — see `get_or_create_set_listpack`).
+///
+/// Returns the `(before, after)` memory estimates so the caller can apply the
+/// cost swing, or `None` when nothing was converted.
+///
+/// It takes the entry rather than the key because as a `&mut self` method
+/// keyed by `&[u8]` it cost `get_or_create_set_listpack` an ENTIRE EXTRA
+/// DashTable lookup — on every SADD, including the overwhelming majority where
+/// the key is not an intset at all and this function does nothing (moon#942).
+fn absorb_intset_into_listpack(
+    entry: &mut Entry,
+    absorb: impl FnOnce(usize, usize) -> bool,
+) -> Option<(usize, usize)> {
+    let Some(RedisValue::SetIntset(is)) = entry.value.as_redis_value_mut() else {
+        return None;
+    };
+    if !absorb(is.len(), widest_rendering(is)) {
+        return None;
+    }
+    let before = is.estimate_memory();
+    let mut lp = crate::storage::listpack::Listpack::new();
+    let mut buf = itoa::Buffer::new();
+    for v in is.iter() {
+        lp.push_back(buf.format(v).as_bytes());
+    }
+    let after = lp.estimate_memory();
+    if let Some(slot) = entry.value.as_redis_value_mut() {
+        *slot = RedisValue::SetListpack(lp);
+    }
+    Some((before, after))
+}
+
 /// A live entry sourced from either storage plane (moon#610).
 ///
 /// The hot plane hands back a borrow; the cold plane has to materialise the
@@ -67,7 +102,89 @@ impl std::ops::Deref for EntryView<'_> {
     }
 }
 
+/// What ONE hot-plane lookup says about a key (moon#942).
+///
+/// The accessor skeleton used to spend three DashTable lookups before it
+/// handed anything out: a `get` inside `drop_if_expired`, a `contains_key`,
+/// then the `get_mut`. The first two answer the same question — "is there a
+/// live entry here?" — and this enum is that question asked once.
+///
+/// `Database::get` (`kv_ops.rs:22`) has used the same shape since it was
+/// written; the typed accessors now share it rather than each re-deriving it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HotState {
+    /// Present and not expired at the caller's `now_ms`.
+    Live,
+    /// Present but past its deadline. Must read as ABSENT, and the entry has
+    /// to be removed through `remove_hot` so the expiry index stays in
+    /// lock-step (moon#541).
+    Expired,
+    /// Not in the hot plane. May still be in the cold tier or mid-spill.
+    Absent,
+}
+
 impl Database {
+    /// Classify `key` in the hot plane with EXACTLY ONE DashTable lookup.
+    ///
+    /// This is the single probe that replaced the `drop_if_expired` +
+    /// `contains_key` pair (moon#942). Expiry is *observed* here and acted on
+    /// by [`Self::settle_not_live`] — the split exists only because dropping
+    /// an expired entry needs `&mut self` and classifying it does not.
+    #[inline]
+    fn hot_state(&self, key: &[u8], now_ms: u64) -> HotState {
+        match self.data.get(key) {
+            Some(e) if e.is_expired_at(now_ms) => HotState::Expired,
+            Some(_) => HotState::Live,
+            None => HotState::Absent,
+        }
+    }
+
+    /// Resolve a key [`Self::hot_state`] just reported as NOT `Live`. Returns
+    /// `true` if the key is resident in the hot plane afterwards.
+    ///
+    /// Both the expired and the absent arm attempt cold promotion, exactly as
+    /// the `drop_if_expired` + `contains_key` + `promote_cold_if_present`
+    /// sequence did: dropping an expired HOT copy is not a statement about the
+    /// cold plane, and skipping the promotion would let a write on an evicted
+    /// key silently shadow the cold copy (moon#459 / the P0 this accessor
+    /// family carries).
+    ///
+    /// The return value replaces the second `contains_key`:
+    /// `promote_cold_if_present`'s documented contract is "`true` iff `key` is
+    /// present in hot RAM after this call", and `promote_cold_outcome` honours
+    /// it on every arm — `Hit` inserts and answers `true`, `Expired` and
+    /// `Miss` insert nothing and answer `false`.
+    #[inline]
+    fn settle_not_live(&mut self, key: &[u8], now_ms: u64, state: HotState) -> bool {
+        debug_assert!(
+            state != HotState::Live,
+            "settle_not_live called on a live key"
+        );
+        if state == HotState::Expired {
+            // Write-path expired drop: the incoming write supersedes the key
+            // everywhere, so no #542 hide/queue here — but the removal must
+            // still go through `remove_hot` so the expiry index stays in
+            // lock-step (moon#541).
+            self.remove_hot(key);
+        }
+        self.promote_cold_if_present(key, now_ms)
+    }
+
+    /// Insert a freshly fabricated, empty container at `key` and charge it.
+    ///
+    /// Stamps the per-db creation ticket so a WATCHing client can tell this
+    /// container from the one that occupied the key before (see
+    /// `Database::birth_counter`), then bills `entry_overhead` — the two
+    /// steps every `get_or_create*` fabrication path used to spell out for
+    /// itself. One implementation means one place for the ledger to be right.
+    #[inline]
+    fn insert_fresh(&mut self, key: &[u8], mut entry: Entry) {
+        let version = self.next_birth_version();
+        entry.set_version(version);
+        self.used_memory += entry_overhead(key, &entry);
+        self.data.insert(CompactKey::from(key), entry);
+    }
+
     // ── W5: generic typed accessors ─────────────────────────────────────
     //
     // The per-type accessor skeleton (expiry check → cold promote/
@@ -77,18 +194,6 @@ impl Database {
     // public `get_hash`/`get_or_create_set`/`get_list_ref_if_alive`/…
     // methods are thin delegators, so command-layer call sites are
     // unchanged and dispatch is fully static.
-
-    /// Remove `key` if it is expired at `now_ms`, crediting its memory.
-    ///
-    /// Write-path expired drop (get_or_create*): the incoming streamed write
-    /// supersedes the key everywhere, so no #542 hide/queue here — but the
-    /// removal must still go through `remove_hot` so the expiry index stays
-    /// in lock-step (moon#541).
-    fn drop_if_expired(&mut self, key: &[u8], now_ms: u64) {
-        if Self::check_expired(&self.data, key, now_ms) {
-            self.remove_hot(key);
-        }
-    }
 
     /// Read-only typed access via the kind's `*Ref` view.
     ///
@@ -131,19 +236,13 @@ impl Database {
     /// upgrades the kind's compact encoding(s) in place.
     pub fn get_or_create<K: OwnedKind>(&mut self, key: &[u8]) -> Result<K::Mut<'_>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let mut entry = K::new_entry();
-                // Fresh incarnation: stamp the per-db creation ticket so a
-                // WATCHing client can tell this container from the one that
-                // occupied the key before (see `Database::birth_counter`).
-                entry.set_version(self.next_birth_version());
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
+        // moon#942: ONE lookup decides the whole preamble. What used to be a
+        // `get` (expiry) + `contains_key` + `get_mut` is now `hot_state` +
+        // `get_mut`; the create arm drops a second `contains_key` by reading
+        // `promote_cold_if_present`'s own return value instead.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            self.insert_fresh(key, K::new_entry());
         }
         let Some(entry) = self.data.get_mut(key) else {
             // Should not happen — insert was just called above. Log and
@@ -193,9 +292,10 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<K::Mut<'_>>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
+        // moon#942: one lookup for the preamble, one to hand the entry out.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live {
+            self.settle_not_live(key, now_ms, state);
         }
         let Some(entry) = self.data.get_mut(key) else {
             return Ok(None);
@@ -247,24 +347,26 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<K::Shared<'_>>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
+        // moon#942: two lookups, not four. The old shape paid a `get` for
+        // expiry, a `contains_key`, a `get_mut` to run the upgrade, and then
+        // a FOURTH `get` purely to re-borrow the same entry immutably — the
+        // upgrade's `&mut` reborrows to `&` for free.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live {
+            self.settle_not_live(key, now_ms, state);
         }
-        if let Some(entry) = self.data.get_mut(key) {
-            // moon#788: a compact→full encoding upgrade changes the entry's real
-            // size; charge the difference or the ledger silently desynchronises
-            // from the keyspace. Disjoint field borrows: `entry` borrows
-            // `self.data`, the counter is a separate field.
-            let encoding_delta = K::upgrade(entry);
-            self.used_memory = self.used_memory.saturating_add_signed(encoding_delta);
-        }
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) => match K::project_ref(entry.value.as_redis_value()) {
-                Ok(r) => Ok(Some(r)),
-                Err(db_kind::WrongType) => Err(Self::wrongtype_error()),
-            },
+        let Some(entry) = self.data.get_mut(key) else {
+            return Ok(None);
+        };
+        // moon#788: a compact→full encoding upgrade changes the entry's real
+        // size; charge the difference or the ledger silently desynchronises
+        // from the keyspace. Disjoint field borrows: `entry` borrows
+        // `self.data`, the counter is a separate field.
+        let encoding_delta = K::upgrade(entry);
+        self.used_memory = self.used_memory.saturating_add_signed(encoding_delta);
+        match K::project_ref(entry.value.as_redis_value()) {
+            Ok(r) => Ok(Some(r)),
+            Err(db_kind::WrongType) => Err(Self::wrongtype_error()),
         }
     }
 
@@ -340,28 +442,34 @@ impl Database {
     /// Returns Err if the key exists but holds a non-set type.
     /// Returns Ok(None) if the key exists but is not an intset (caller should use get_or_create_set).
     /// Returns Ok(Some(&mut Intset)) if the key holds or was created as an intset.
-    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
+    // `get_mut` cannot answer None here: the preamble above leaves the key
+    // hot on every path — `HotState::Live` observed it, `settle_not_live`
+    // returned true (its contract: "true iff `key` is present in hot RAM
+    // after this call", honoured on every `promote_cold_outcome` arm), or
+    // `insert_fresh` just inserted it. moon#942 moved the FIRST of those
+    // three from a `contains_key` one line up to a contract three call
+    // levels away, so if `Database::set` ever becomes conditional — a
+    // maxmemory fail-close, a spill gate — this panics on the write path.
+    // Prefer `get_or_create`'s shape (tracing::error! + `ERR internal`) if
+    // that day comes.
+    #[allow(clippy::unwrap_used)]
     pub fn get_or_create_intset(&mut self, key: &[u8]) -> Result<Option<&mut Intset>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            // P0 fix: promote a cold-spilled set before fabricating an empty
-            // intset — a promoted value always decodes as `RedisValue::Set`
-            // (cold storage never persists the intset compact encoding), so
-            // it naturally falls into the `Ok(None)` "not an intset, caller
-            // should use get_or_create_set" arm below, which already routes
-            // callers (e.g. SADD) to `get_or_create_set` — no fabrication.
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let mut entry = Entry::new_set_intset();
-                // Fresh incarnation: stamp the per-db creation ticket so a
-                // WATCHing client can tell this container from the one that
-                // occupied the key before (see `Database::birth_counter`).
-                entry.set_version(self.next_birth_version());
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
+        // P0 fix: `settle_not_live` promotes a cold-spilled set before this
+        // fabricates an empty intset — a promoted value always decodes as
+        // `RedisValue::Set` (cold storage never persists the intset compact
+        // encoding), so it naturally falls into the `Ok(None)` "not an
+        // intset, caller should use get_or_create_set" arm below, which
+        // already routes callers (e.g. SADD) to `get_or_create_set` — no
+        // fabrication.
+        //
+        // moon#942: ONE lookup decides the preamble — `hot_state` replaces
+        // the `drop_if_expired` + `contains_key` pair, and the create arm
+        // reads `promote_cold_if_present`'s own return value instead of
+        // re-issuing `contains_key`.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            self.insert_fresh(key, Entry::new_set_intset());
         }
         let entry = self.data.get_mut(key).unwrap();
         // moon#926 — see `stamp_mutation`.
@@ -398,31 +506,36 @@ impl Database {
     /// Returns Ok(Some(&mut Listpack)) if the key is a HashListpack.
     /// Returns Ok(None) if the key already holds a full Hash (caller should fall through).
     /// Returns Err(WRONGTYPE) if the key holds a non-hash type.
-    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
+    // `get_mut` cannot answer None here: the preamble above leaves the key
+    // hot on every path — `HotState::Live` observed it, `settle_not_live`
+    // returned true (its contract: "true iff `key` is present in hot RAM
+    // after this call", honoured on every `promote_cold_outcome` arm), or
+    // `insert_fresh` just inserted it. moon#942 moved the FIRST of those
+    // three from a `contains_key` one line up to a contract three call
+    // levels away, so if `Database::set` ever becomes conditional — a
+    // maxmemory fail-close, a spill gate — this panics on the write path.
+    // Prefer `get_or_create`'s shape (tracing::error! + `ERR internal`) if
+    // that day comes.
+    #[allow(clippy::unwrap_used)]
     pub fn get_or_create_hash_listpack(
         &mut self,
         key: &[u8],
     ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            // P0 fix: promote a cold-spilled hash before fabricating an
-            // empty listpack — a promoted value always decodes as
-            // `RedisValue::Hash` (cold storage never persists the listpack
-            // compact encoding), so it naturally falls into the `Ok(None)`
-            // "not a listpack, fall through" arm below, which already routes
-            // callers (e.g. HSET) to `get_or_create_hash` — no fabrication.
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let mut entry = Entry::new_hash_listpack();
-                // Fresh incarnation: stamp the per-db creation ticket so a
-                // WATCHing client can tell this container from the one that
-                // occupied the key before (see `Database::birth_counter`).
-                entry.set_version(self.next_birth_version());
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
+        // P0 fix: `settle_not_live` promotes a cold-spilled hash before this
+        // fabricates an empty listpack — a promoted value always decodes as
+        // `RedisValue::Hash` (cold storage never persists the listpack
+        // compact encoding), so it naturally falls into the `Ok(None)` "not a
+        // listpack, fall through" arm below, which already routes callers
+        // (e.g. HSET) to `get_or_create_hash` — no fabrication.
+        //
+        // moon#942: ONE lookup decides the preamble — `hot_state` replaces
+        // the `drop_if_expired` + `contains_key` pair, and the create arm
+        // reads `promote_cold_if_present`'s own return value instead of
+        // re-issuing `contains_key`.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            self.insert_fresh(key, Entry::new_hash_listpack());
         }
         let entry = self.data.get_mut(key).unwrap();
         // moon#926 — see `stamp_mutation`.
@@ -461,31 +574,36 @@ impl Database {
     /// Returns Ok(Some(&mut Listpack)) if the key is a ListListpack.
     /// Returns Ok(None) if the key already holds a full List (caller should fall through).
     /// Returns Err(WRONGTYPE) if the key holds a non-list type.
-    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
+    // `get_mut` cannot answer None here: the preamble above leaves the key
+    // hot on every path — `HotState::Live` observed it, `settle_not_live`
+    // returned true (its contract: "true iff `key` is present in hot RAM
+    // after this call", honoured on every `promote_cold_outcome` arm), or
+    // `insert_fresh` just inserted it. moon#942 moved the FIRST of those
+    // three from a `contains_key` one line up to a contract three call
+    // levels away, so if `Database::set` ever becomes conditional — a
+    // maxmemory fail-close, a spill gate — this panics on the write path.
+    // Prefer `get_or_create`'s shape (tracing::error! + `ERR internal`) if
+    // that day comes.
+    #[allow(clippy::unwrap_used)]
     pub fn get_or_create_list_listpack(
         &mut self,
         key: &[u8],
     ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            // P0 fix: promote a cold-spilled list before fabricating an
-            // empty listpack — a promoted value always decodes as
-            // `RedisValue::List` (cold storage never persists the listpack
-            // compact encoding), so it naturally falls into the `Ok(None)`
-            // "not a listpack, fall through" arm below, which already routes
-            // callers (e.g. LPUSH) to `get_or_create_list` — no fabrication.
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let mut entry = Entry::new_list_listpack();
-                // Fresh incarnation: stamp the per-db creation ticket so a
-                // WATCHing client can tell this container from the one that
-                // occupied the key before (see `Database::birth_counter`).
-                entry.set_version(self.next_birth_version());
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
+        // P0 fix: `settle_not_live` promotes a cold-spilled list before this
+        // fabricates an empty listpack — a promoted value always decodes as
+        // `RedisValue::List` (cold storage never persists the listpack
+        // compact encoding), so it naturally falls into the `Ok(None)` "not a
+        // listpack, fall through" arm below, which already routes callers
+        // (e.g. LPUSH) to `get_or_create_list` — no fabrication.
+        //
+        // moon#942: ONE lookup decides the preamble — `hot_state` replaces
+        // the `drop_if_expired` + `contains_key` pair, and the create arm
+        // reads `promote_cold_if_present`'s own return value instead of
+        // re-issuing `contains_key`.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            self.insert_fresh(key, Entry::new_list_listpack());
         }
         let entry = self.data.get_mut(key).unwrap();
         // moon#926 — see `stamp_mutation`.
@@ -561,73 +679,52 @@ impl Database {
     /// SELF-ACCOUNTING for the conversion: the intset -> listpack cost swing
     /// is applied to `used_memory` here, so the caller's own before/after
     /// snapshot of the listpack starts from the converted form.
-    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
+    // `get_mut` cannot answer None here: the preamble above leaves the key
+    // hot on every path — `HotState::Live` observed it, `settle_not_live`
+    // returned true (its contract: "true iff `key` is present in hot RAM
+    // after this call", honoured on every `promote_cold_outcome` arm), or
+    // `insert_fresh` just inserted it. moon#942 moved the FIRST of those
+    // three from a `contains_key` one line up to a contract three call
+    // levels away, so if `Database::set` ever becomes conditional — a
+    // maxmemory fail-close, a spill gate — this panics on the write path.
+    // Prefer `get_or_create`'s shape (tracing::error! + `ERR internal`) if
+    // that day comes.
+    #[allow(clippy::unwrap_used)]
     pub fn get_or_create_set_listpack(
         &mut self,
         key: &[u8],
         absorb_intset: impl FnOnce(usize, usize) -> bool,
     ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let mut entry = Entry::new_set_listpack();
-                // Fresh incarnation: stamp the per-db creation ticket so a
-                // WATCHing client can tell this container from the one that
-                // occupied the key before (see `Database::birth_counter`).
-                entry.set_version(self.next_birth_version());
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
+        // moon#942: ONE lookup decides the preamble. `settle_not_live` still
+        // promotes a cold-spilled set before this fabricates an empty
+        // listpack, so a promoted value lands in the `Ok(None)` arm below
+        // rather than being fabricated over.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            self.insert_fresh(key, Entry::new_set_listpack());
         }
-        self.absorb_intset_into_listpack(key, absorb_intset);
+        // moon#942: the intset -> listpack edge runs on the handle this
+        // accessor is ABOUT TO TAKE ANYWAY. It used to take its own
+        // `data.get_mut(key)`, which is why this accessor cost one more probe
+        // than its four siblings for a key that is not even an intset.
         let entry = self.data.get_mut(key).unwrap();
+        let swing = absorb_intset_into_listpack(entry, absorb_intset);
         // moon#926 — see `stamp_mutation`.
         stamp_mutation(entry);
+        // Disjoint field borrows: `entry` borrows `self.data`, the ledger is
+        // a separate field (same shape as `get_or_create`).
+        if let Some((before, after)) = swing {
+            self.used_memory = self
+                .used_memory
+                .saturating_add(after)
+                .saturating_sub(before);
+        }
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::SetListpack(lp)) => Ok(Some(lp)),
             Some(RedisValue::Set(_)) | Some(RedisValue::SetIntset(_)) => Ok(None),
             _ => Err(Self::wrongtype_error()),
         }
-    }
-
-    /// The `intset -> listpack` edge (moon#899), in place, for a key that
-    /// holds a `SetIntset` and whose `absorb(members, widest_rendering)`
-    /// answers true; a no-op for anything else. Renders every `i64` with
-    /// `itoa` (canonical, so byte-exact — see `get_or_create_set_listpack`)
-    /// and applies the cost swing to `used_memory`.
-    fn absorb_intset_into_listpack(
-        &mut self,
-        key: &[u8],
-        absorb: impl FnOnce(usize, usize) -> bool,
-    ) {
-        let Some(entry) = self.data.get_mut(key) else {
-            return;
-        };
-        let Some(RedisValue::SetIntset(is)) = entry.value.as_redis_value_mut() else {
-            return;
-        };
-        if !absorb(is.len(), widest_rendering(is)) {
-            return;
-        }
-        let before = is.estimate_memory();
-        let mut lp = crate::storage::listpack::Listpack::new();
-        let mut buf = itoa::Buffer::new();
-        for v in is.iter() {
-            lp.push_back(buf.format(v).as_bytes());
-        }
-        let after = lp.estimate_memory();
-        if let Some(slot) = entry.value.as_redis_value_mut() {
-            *slot = RedisValue::SetListpack(lp);
-        }
-        // Disjoint field borrows: `entry` borrows `self.data`, the ledger is
-        // a separate field (same shape as `get_or_create`).
-        self.used_memory = self
-            .used_memory
-            .saturating_add(after)
-            .saturating_sub(before);
     }
 
     /// Upgrade a `SetListpack` to the full `IndexSet` form in place, returning
@@ -683,25 +780,29 @@ impl Database {
     /// rule: cold storage never persists a compact encoding, so a promoted
     /// value always decodes as `RedisValue::SortedSetBPTree` and lands in the
     /// `Ok(None)` arm rather than being fabricated over.
-    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
+    // `get_mut` cannot answer None here: the preamble above leaves the key
+    // hot on every path — `HotState::Live` observed it, `settle_not_live`
+    // returned true (its contract: "true iff `key` is present in hot RAM
+    // after this call", honoured on every `promote_cold_outcome` arm), or
+    // `insert_fresh` just inserted it. moon#942 moved the FIRST of those
+    // three from a `contains_key` one line up to a contract three call
+    // levels away, so if `Database::set` ever becomes conditional — a
+    // maxmemory fail-close, a spill gate — this panics on the write path.
+    // Prefer `get_or_create`'s shape (tracing::error! + `ERR internal`) if
+    // that day comes.
+    #[allow(clippy::unwrap_used)]
     pub fn get_or_create_zset_listpack(
         &mut self,
         key: &[u8],
     ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let mut entry = Entry::new_sorted_set_listpack();
-                // Fresh incarnation: stamp the per-db creation ticket so a
-                // WATCHing client can tell this container from the one that
-                // occupied the key before (see `Database::birth_counter`).
-                entry.set_version(self.next_birth_version());
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
+        // moon#942: ONE lookup decides the preamble. `settle_not_live` still
+        // promotes a cold-spilled zset before this fabricates an empty
+        // listpack, so a promoted value lands in the `Ok(None)` arm below
+        // rather than being fabricated over.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            self.insert_fresh(key, Entry::new_sorted_set_listpack());
         }
         let entry = self.data.get_mut(key).unwrap();
         // moon#926 — see `stamp_mutation`.
@@ -1162,9 +1263,10 @@ impl Database {
     /// cold-collection-visibility fix) — this accessor takes `&mut self`.
     pub fn get_stream_mut(&mut self, key: &[u8]) -> Result<Option<&mut StreamData>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
+        // moon#942: one lookup for the preamble, one to hand the stream out.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live {
+            self.settle_not_live(key, now_ms, state);
         }
         match self.data.get_mut(key) {
             None => Ok(None),

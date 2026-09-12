@@ -73,6 +73,7 @@ jobs:
           - dump_payload
           - acl_keyspec
           - ft_create_args
+          - canonical_i64_differential
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -158,6 +159,7 @@ jobs:
           - dump_payload
           - acl_keyspec
           - ft_create_args
+          - canonical_i64_differential
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly

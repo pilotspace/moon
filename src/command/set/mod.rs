@@ -1661,6 +1661,241 @@ mod tests {
         assert_eq!(srem(&mut db, &[bs(b"t"), bs(b"a")]), Frame::Integer(1));
         assert_eq!(encoding_of(&mut db, b"t"), "listpack");
     }
+
+    // ── moon#944: SADD's REPLY across the intset ceiling ─────────────────
+    //
+    // The intset push loop `break`s the instant `set-max-intset-entries` is
+    // crossed, and the upgrade path then re-inserted the whole argv while
+    // DISCARDING `IndexSet::insert`'s bool — so every member positioned AFTER
+    // the tripping one was stored but never counted. Measured against redis
+    // 7.4.0 with `set-max-intset-entries 512`: moon replied `3` where redis
+    // replied `22`, for a batch that really did add 22 members.
+    //
+    // The reply is part of the contract: clients build dedup accounting and
+    // "did I win the insert" logic on it, and `SCARD` afterwards disagreed
+    // with the sum of the SADD replies.
+
+    /// `SCARD` as an `i64`, so a reply can be compared against the cardinality
+    /// delta it claims to describe.
+    fn scard_of(db: &mut Database, key: &[u8]) -> i64 {
+        match scard(db, &[bs(key)]) {
+            Frame::Integer(n) => n,
+            other => panic!("SCARD did not reply an integer: {other:?}"),
+        }
+    }
+
+    /// Pre-fill `key` with the integers `0..n`, one SADD at a time, so the
+    /// fixture itself never straddles a threshold inside one batch.
+    fn fill_ints(db: &mut Database, key: &[u8], n: usize) {
+        for i in 0..n {
+            sadd(db, &[bs(key), bs(i.to_string().as_bytes())]);
+        }
+    }
+
+    /// The reply MUST equal the `SCARD` delta. Asserting against a hardcoded
+    /// count would have to encode the buggy answer to pass today, and
+    /// asserting on `SCARD` alone passes today — the data was always stored
+    /// correctly. Only the delta discriminates.
+    #[test]
+    fn sadd_reply_equals_the_scard_delta_across_the_intset_ceiling() {
+        let ceiling = crate::storage::db::EncodingLimits::moon_defaults().set_intset;
+
+        // (name, pre-filled integer count, the batch to add)
+        let cases: Vec<(&str, usize, Vec<Vec<u8>>)> = vec![
+            (
+                "control: 10 new members, nowhere near the ceiling",
+                100,
+                (100..110)
+                    .map(|i: usize| i.to_string().into_bytes())
+                    .collect(),
+            ),
+            (
+                // One member sits PAST the member that trips the ceiling.
+                // The tripping member is itself counted before the `break`,
+                // so a batch that merely reaches the ceiling cannot expose
+                // this — the bug needs a tail.
+                "batch straddles the intset ceiling by one",
+                ceiling - 1,
+                (ceiling - 1..ceiling + 2)
+                    .map(|i: usize| i.to_string().into_bytes())
+                    .collect(),
+            ),
+            (
+                "batch straddles the intset ceiling by twenty",
+                ceiling - 2,
+                (ceiling - 2..ceiling + 20)
+                    .map(|i: usize| i.to_string().into_bytes())
+                    .collect(),
+            ),
+            (
+                // Duplicates inside one straddling batch: the members before
+                // the break are already in the upgraded set, so a fix that
+                // re-counts them would over-report here exactly as the bug
+                // under-reports above.
+                "duplicates inside a straddling batch",
+                ceiling - 2,
+                [
+                    ceiling - 2,
+                    ceiling - 1,
+                    ceiling,
+                    ceiling,
+                    ceiling + 1,
+                    ceiling + 1,
+                    ceiling + 2,
+                ]
+                .iter()
+                .map(|i| i.to_string().into_bytes())
+                .collect(),
+            ),
+            (
+                // `all_integers` is false, so this never enters the intset
+                // block at all — a control proving the fix did not move the
+                // routing gate.
+                "mixed integer/non-integer batch over a near-ceiling intset",
+                ceiling - 2,
+                vec![
+                    (ceiling - 2).to_string().into_bytes(),
+                    (ceiling - 1).to_string().into_bytes(),
+                    ceiling.to_string().into_bytes(),
+                    (ceiling + 1).to_string().into_bytes(),
+                    b"abc".to_vec(),
+                ],
+            ),
+            (
+                "control: already a hashtable set",
+                ceiling + 10,
+                (ceiling + 10..ceiling + 15)
+                    .map(|i: usize| i.to_string().into_bytes())
+                    .collect(),
+            ),
+        ];
+
+        for (name, prefill, batch) in cases {
+            let mut db = Database::new();
+            fill_ints(&mut db, b"s", prefill);
+            let before = scard_of(&mut db, b"s");
+
+            let mut args: Vec<Frame> = Vec::with_capacity(batch.len() + 1);
+            args.push(bs(b"s"));
+            args.extend(batch.iter().map(|m| bs(m)));
+            let reply = sadd(&mut db, &args);
+
+            let after = scard_of(&mut db, b"s");
+            assert_eq!(
+                reply,
+                Frame::Integer(after - before),
+                "{name}: SADD replied {reply:?} but SCARD moved {before} -> {after}"
+            );
+        }
+    }
+
+    /// Every member of a straddling batch must be RETRIEVABLE afterwards, in
+    /// its exact bytes. The count fix must not be bought by dropping the tail.
+    #[test]
+    fn sadd_across_the_intset_ceiling_stores_every_member() {
+        let ceiling = crate::storage::db::EncodingLimits::moon_defaults().set_intset;
+        let mut db = Database::new();
+        fill_ints(&mut db, b"s", ceiling - 2);
+
+        let batch: Vec<Vec<u8>> = (ceiling - 2..ceiling + 20)
+            .map(|i: usize| i.to_string().into_bytes())
+            .collect();
+        let mut args: Vec<Frame> = Vec::with_capacity(batch.len() + 1);
+        args.push(bs(b"s"));
+        args.extend(batch.iter().map(|m| bs(m)));
+        sadd(&mut db, &args);
+
+        for m in &batch {
+            assert_eq!(
+                sismember(&mut db, &[bs(b"s"), bs(m)]),
+                Frame::Integer(1),
+                "member {:?} lost across the intset upgrade",
+                String::from_utf8_lossy(m)
+            );
+        }
+        assert_eq!(scard_of(&mut db, b"s"), (ceiling + 20) as i64);
+        assert_eq!(encoding_of(&mut db, b"s"), "hashtable");
+    }
+
+    /// SADD's `all_integers` pre-pass answers a pure ROUTING question and
+    /// throws every parsed value away, so it runs on `is_canonical_i64`
+    /// rather than the full `canonical_i64` round trip. `storage::numeric`
+    /// pins the two to the same verdict differentially; this pins the
+    /// OBSERVABLE consequence of that verdict at the command level, because
+    /// moon#795 was a real data-corruption bug and the routing gate is the
+    /// thing that keeps a non-canonical spelling out of an intset.
+    ///
+    /// Every case here is one of the named moon#795 vectors. A member that
+    /// routes to an intset must be spelled canonically; one that does not must
+    /// land in a string encoding with its bytes intact.
+    #[test]
+    fn sadd_routes_every_byte_transparency_case_the_way_canonical_i64_does() {
+        // (member, the encoding the ROUTING gate must produce)
+        let cases: [(&[u8], &str); 14] = [
+            (b"007", "listpack"),
+            (b"+7", "listpack"),
+            (b"-0", "listpack"),
+            (b" 7", "listpack"),
+            (b"7 ", "listpack"),
+            (b"", "listpack"),
+            (b"000000012345", "listpack"), // redis-benchmark's shape
+            (b"12345678901234567890", "listpack"), // 20 digits, overflows i64
+            (b"9223372036854775808", "listpack"), // i64::MAX + 1
+            (b"-9223372036854775809", "listpack"), // i64::MIN - 1
+            (b"0", "intset"),
+            (b"-1", "intset"),
+            (b"9223372036854775807", "intset"),  // i64::MAX
+            (b"-9223372036854775808", "intset"), // i64::MIN
+        ];
+
+        for (member, want_encoding) in cases {
+            let mut db = Database::new();
+            assert_eq!(
+                sadd(&mut db, &[bs(b"s"), bs(member)]),
+                Frame::Integer(1),
+                "SADD of {:?} did not report one new member",
+                String::from_utf8_lossy(member)
+            );
+            assert_eq!(
+                encoding_of(&mut db, b"s"),
+                want_encoding,
+                "routing verdict moved for {:?}",
+                String::from_utf8_lossy(member)
+            );
+            // The bytes that come back must be the bytes that went in — the
+            // whole reason the canonical gate exists (moon#795).
+            assert_eq!(
+                ro_members_sorted(&db, b"s"),
+                vec![member.to_vec()],
+                "member bytes changed for {:?}",
+                String::from_utf8_lossy(member)
+            );
+            assert_eq!(
+                sismember(&mut db, &[bs(b"s"), bs(member)]),
+                Frame::Integer(1),
+                "member {:?} not found by its own spelling",
+                String::from_utf8_lossy(member)
+            );
+        }
+
+        // A batch is routed by the WEAKEST member: one non-canonical spelling
+        // keeps the whole batch out of the intset, and `.all()` must reach it
+        // wherever it sits.
+        for position in 0..3usize {
+            let mut members: Vec<Vec<u8>> = vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()];
+            members[position] = b"+7".to_vec();
+            let mut db = Database::new();
+            let mut args: Vec<Frame> = Vec::with_capacity(4);
+            args.push(bs(b"s"));
+            args.extend(members.iter().map(|m| bs(m)));
+            assert_eq!(sadd(&mut db, &args), Frame::Integer(3));
+            assert_eq!(
+                encoding_of(&mut db, b"s"),
+                "listpack",
+                "a non-canonical member at position {position} did not block the intset"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

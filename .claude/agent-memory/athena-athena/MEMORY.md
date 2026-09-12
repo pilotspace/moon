@@ -1,0 +1,5 @@
+- [Cold-index persistence design](project_cold_index_persistence_design.md) — 2026-09-08: per-file KvIndex footer recommended; heap files write-once; read path never checks key
+- [#888 warm-segment orphans root cause](project_888_warm_segment_orphans_root_cause.md) — 2026-09-10: file_id reuse + dup manifest entries + boot self-retire; orphans 100% live; issue counts ~3x inflated
+- [Encoding policy consult](project_encoding_policy_consult_2026_09_10.md) — 2026-09-10: #896 fix = shape+items contract; no demotion; cold tier + 22 write cmds flatten (unfiled); byte budget lists only
+- [Cold capacity governance consult](project_cold_capacity_governance_consult_2026_09_10.md) — 2026-09-10: --maxdisk auto-80%; FIFO file drop = cold LRU; sweep_expired EXISTS; noeviction never spills; #869 blocks any counter
+- [Five-family pipeline consult](project_five_family_pipeline_consult_2026_09_12.md) — 2026-09-12: plain lane (finish skip_name_gates) not new inline paths; first test = GET via non-unrestricted ACL user

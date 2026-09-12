@@ -459,6 +459,20 @@ pub fn try_wake_zset_waiter(
 /// wrong. `EXEC` was such a path — it ran producers through its own executor
 /// and reached none of the existing hooks, so a `MULTI ; LPUSH k v ; EXEC`
 /// left a client blocked on `k` asleep until its own timeout (moon#606).
+///
+/// It is also the **gate** a call site must use when the only reason it would
+/// acquire a database guard is to call [`wake_producer`]: this needs the
+/// command NAME alone, so the question can and should be asked *before* paying
+/// for the `&mut Database`. `handler_monoio`'s write tail does exactly that
+/// (moon#942) — it used to take an exclusive guard on every successful write
+/// just so `wake_producer` could return `None` inside it for `INCR`, `SADD`
+/// and `HSET`.
+///
+/// A gate that hoists this decision must call THIS function, never a
+/// hand-written list of command names. The two must not be able to disagree:
+/// a gate narrower than the mapping is a lost wakeup whose visibility depends
+/// on which shard owns the key, so it reads as a flake rather than as a bug
+/// (moon#595, moon#623).
 pub fn producer_family(cmd: &[u8]) -> Option<crate::blocking::WaitFamily> {
     if !is_producer(cmd) {
         return None;

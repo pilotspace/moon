@@ -429,7 +429,7 @@ impl RedisValue {
 }
 
 /// LFU initial counter value (per Redis convention).
-const LFU_INIT_VAL: u8 = 5;
+pub(crate) const LFU_INIT_VAL: u8 = 5;
 
 /// Probabilistic logarithmic increment for LFU counter (Morris counter).
 pub fn lfu_log_incr(counter: u8, lfu_log_factor: u8) -> u8 {
