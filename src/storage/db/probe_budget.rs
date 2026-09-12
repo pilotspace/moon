@@ -217,7 +217,7 @@ fn get_or_create_set_listpack_probe_budget() {
 
     assert_eq!(
         (hit, miss, absorb),
-        (3, 5, 3),
+        (2, 4, 2),
         "get_or_create_set_listpack probe budget moved \
          (hit={hit}, miss={miss}, absorb={absorb}) — moon#942. The absorb arm \
          is the one `absorb_intset_into_listpack` used to charge its own extra \
@@ -261,7 +261,7 @@ fn sadd_end_to_end_probe_budget() {
 
     assert_eq!(
         (create, listpack_hit, hashtable_hit),
-        (5, 3, 5),
+        (4, 2, 4),
         "SADD end-to-end probe budget moved \
          (create={create}, listpack_hit={listpack_hit}, hashtable_hit={hashtable_hit}) \
          — moon#942. The hashtable arm pays TWO accessors: \

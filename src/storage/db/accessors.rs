@@ -29,6 +29,41 @@ fn widest_rendering(is: &Intset) -> usize {
     first.max(last)
 }
 
+/// The `intset -> listpack` edge (moon#899), in place, on an entry the caller
+/// ALREADY HOLDS: a no-op for anything but a `SetIntset` whose
+/// `absorb(members, widest_rendering)` answers true. Renders every `i64` with
+/// `itoa` (canonical, so byte-exact — see `get_or_create_set_listpack`).
+///
+/// Returns the `(before, after)` memory estimates so the caller can apply the
+/// cost swing, or `None` when nothing was converted.
+///
+/// It takes the entry rather than the key because as a `&mut self` method
+/// keyed by `&[u8]` it cost `get_or_create_set_listpack` an ENTIRE EXTRA
+/// DashTable lookup — on every SADD, including the overwhelming majority where
+/// the key is not an intset at all and this function does nothing (moon#942).
+fn absorb_intset_into_listpack(
+    entry: &mut Entry,
+    absorb: impl FnOnce(usize, usize) -> bool,
+) -> Option<(usize, usize)> {
+    let Some(RedisValue::SetIntset(is)) = entry.value.as_redis_value_mut() else {
+        return None;
+    };
+    if !absorb(is.len(), widest_rendering(is)) {
+        return None;
+    }
+    let before = is.estimate_memory();
+    let mut lp = crate::storage::listpack::Listpack::new();
+    let mut buf = itoa::Buffer::new();
+    for v in is.iter() {
+        lp.push_back(buf.format(v).as_bytes());
+    }
+    let after = lp.estimate_memory();
+    if let Some(slot) = entry.value.as_redis_value_mut() {
+        *slot = RedisValue::SetListpack(lp);
+    }
+    Some((before, after))
+}
+
 /// A live entry sourced from either storage plane (moon#610).
 ///
 /// The hot plane hands back a borrow; the cold plane has to materialise the
@@ -629,52 +664,27 @@ impl Database {
         if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
             self.insert_fresh(key, Entry::new_set_listpack());
         }
-        self.absorb_intset_into_listpack(key, absorb_intset);
+        // moon#942: the intset -> listpack edge runs on the handle this
+        // accessor is ABOUT TO TAKE ANYWAY. It used to take its own
+        // `data.get_mut(key)`, which is why this accessor cost one more probe
+        // than its four siblings for a key that is not even an intset.
         let entry = self.data.get_mut(key).unwrap();
+        let swing = absorb_intset_into_listpack(entry, absorb_intset);
         // moon#926 — see `stamp_mutation`.
         stamp_mutation(entry);
+        // Disjoint field borrows: `entry` borrows `self.data`, the ledger is
+        // a separate field (same shape as `get_or_create`).
+        if let Some((before, after)) = swing {
+            self.used_memory = self
+                .used_memory
+                .saturating_add(after)
+                .saturating_sub(before);
+        }
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::SetListpack(lp)) => Ok(Some(lp)),
             Some(RedisValue::Set(_)) | Some(RedisValue::SetIntset(_)) => Ok(None),
             _ => Err(Self::wrongtype_error()),
         }
-    }
-
-    /// The `intset -> listpack` edge (moon#899), in place, for a key that
-    /// holds a `SetIntset` and whose `absorb(members, widest_rendering)`
-    /// answers true; a no-op for anything else. Renders every `i64` with
-    /// `itoa` (canonical, so byte-exact — see `get_or_create_set_listpack`)
-    /// and applies the cost swing to `used_memory`.
-    fn absorb_intset_into_listpack(
-        &mut self,
-        key: &[u8],
-        absorb: impl FnOnce(usize, usize) -> bool,
-    ) {
-        let Some(entry) = self.data.get_mut(key) else {
-            return;
-        };
-        let Some(RedisValue::SetIntset(is)) = entry.value.as_redis_value_mut() else {
-            return;
-        };
-        if !absorb(is.len(), widest_rendering(is)) {
-            return;
-        }
-        let before = is.estimate_memory();
-        let mut lp = crate::storage::listpack::Listpack::new();
-        let mut buf = itoa::Buffer::new();
-        for v in is.iter() {
-            lp.push_back(buf.format(v).as_bytes());
-        }
-        let after = lp.estimate_memory();
-        if let Some(slot) = entry.value.as_redis_value_mut() {
-            *slot = RedisValue::SetListpack(lp);
-        }
-        // Disjoint field borrows: `entry` borrows `self.data`, the ledger is
-        // a separate field (same shape as `get_or_create`).
-        self.used_memory = self
-            .used_memory
-            .saturating_add(after)
-            .saturating_sub(before);
     }
 
     /// Upgrade a `SetListpack` to the full `IndexSet` form in place, returning
