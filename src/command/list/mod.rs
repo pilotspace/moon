@@ -1524,7 +1524,8 @@ mod ledger_and_encoding_942 {
     /// drained to empty -> gone.
     ///
     /// Mutation check: delete the `db.credit_memory(credit)` line from
-    /// `pop_eager` and the "drained the linkedlist" rung goes red.
+    /// `pop_eager` and the "drained the linkedlist" rung goes red — measured
+    /// at a 7,569 B running ledger against a 7,513 B recompute.
     #[test]
     fn the_list_ladder_keeps_the_ledger_exact() {
         let limits = crate::storage::db::EncodingLimits::moon_defaults();
@@ -1631,8 +1632,17 @@ mod ledger_and_encoding_942 {
     /// The same drain-to-empty on the COMPACT encoding, which takes the other
     /// pop branch entirely, plus a multi-element `LPOP key count`.
     ///
-    /// Mutation check: delete the `db.adjust_memory(before, after)` line from
-    /// `pop_listpack` and the "counted listpack pop" rung goes red.
+    /// Mutation check: replace `pop_listpack`'s `if empty` with `if false` and
+    /// the "a counted pop that empties a listpack must remove the key" rung
+    /// goes red.
+    ///
+    /// NOT `db.adjust_memory(before, after)`: that line was tried first and
+    /// the test stayed green, because `Listpack::estimate_memory` bills the
+    /// jemalloc size class of the buffer's CAPACITY and nothing shrinks a
+    /// listpack's buffer on removal — so `before == after` on every pop and
+    /// the call is a genuine no-op there. The running ledger and
+    /// `recalculate_memory` agree for the same reason, which is why this
+    /// rung needs the emptiness guard to carry it.
     #[test]
     fn draining_a_listpack_keeps_the_ledger_exact_and_removes_the_key() {
         let mut db = Database::new();
@@ -1823,6 +1833,198 @@ mod ledger_and_encoding_942 {
                 "{name} WRONGTYPE must charge nothing"
             );
             assert_ledger_exact(&mut db, "after a refused X form");
+        }
+    }
+
+    /// `used_memory` that `Database::list_pop_front`/`list_pop_back` STRAND
+    /// every time they remove the last element of a list — one
+    /// `list_elem_cost` for the element they just handed back.
+    ///
+    /// **This is an open bug, pinned at its measured value, not a tolerance.**
+    /// `accessors.rs:1192-1222` credits `list_elem_cost(&val)` on the `else`
+    /// branch and NOT on the `if empty` branch, on the stated theory that
+    /// "whole-key removal recomputes the (now-empty) entry cost via
+    /// `entry_overhead`". It does not: `entry_overhead` is computed from the
+    /// CURRENT value, which no longer holds the element, so the push-time
+    /// charge is never given back. Measured on an otherwise EMPTY database:
+    /// one `RPUSH k e` + one `list_pop_front` leaves `used_memory` at 56 B
+    /// against a from-scratch recompute of 0 B, on BOTH encodings, and ten
+    /// create/drain cycles leave 560 B. It accumulates without bound on a
+    /// keyspace that is empty.
+    ///
+    /// Everything that drains a list through the BLOCKING family reaches it —
+    /// `LMOVE`, `RPOPLPUSH`, and the `BLPOP`/`BRPOP`/`BLMOVE`/`BRPOPLPUSH`
+    /// immediate and wakeup paths — i.e. the reliable-queue pattern, which is
+    /// precisely the workload that drains a list to empty over and over. The
+    /// drift is UPWARD, so the consequence is `--maxmemory` and eviction
+    /// firing on a server that is actually empty, rather than moon#814's
+    /// never-firing direction.
+    ///
+    /// The fix is one line in each of the two accessors — credit the element
+    /// unconditionally, exactly as `pop_eager` in this module already does —
+    /// but `src/storage/db/accessors.rs` is not this change's to edit. When it
+    /// lands, this constant goes to 0 and that is the signal, not a
+    /// regression.
+    const STRANDED_BY_LIST_POP: usize = 56;
+
+    /// EVERY list writer that can remove the last element must remove the KEY
+    /// with it, on BOTH encodings.
+    ///
+    /// A container left alive holding nothing is not a cosmetic defect. It is
+    /// `EXISTS`/`TYPE`/`DBSIZE`-visible, it survives into the AOF and onto a
+    /// replica, redis has no such state to compare against, and — because
+    /// `db.remove` credits an `entry_overhead` recomputed from the CURRENT
+    /// value — a later delete credits back memory that was charged against a
+    /// value that no longer exists. moon#830 is the recorded shape on the
+    /// creation side (`LSET missing` fabricating a charged empty list) and
+    /// moon#814 is what the ledger does afterwards.
+    ///
+    /// This enumerates the STATE WRITERS, not the command names: the entry
+    /// gate is "does this call path remove elements", so `LPOP` appears twice
+    /// (bare and counted) and `LMOVE`/`RPOPLPUSH` appear because they drain a
+    /// source through a different accessor entirely (`Database::list_pop_*`)
+    /// than the pops do. A writer added later that empties a list and is not
+    /// listed here is exactly the gap this test cannot see, so it is listed by
+    /// the operation it performs and not by the module it lives in.
+    #[test]
+    fn every_list_writer_that_empties_a_list_removes_the_key() {
+        type Drain = fn(&mut Database);
+
+        // (name, how to empty a 2-element list at key `l`, the ledger drift
+        // that writer leaves behind). Every drift here is a BUG pinned at its
+        // measured value, not a tolerance: see the two LMOVE rows.
+        let cases: [(&str, Drain, usize); 9] = [
+            (
+                "LPOP x2",
+                |db| {
+                    crate::command::list::lpop(db, &[bs(b"l")]);
+                    crate::command::list::lpop(db, &[bs(b"l")]);
+                },
+                0,
+            ),
+            (
+                "RPOP x2",
+                |db| {
+                    crate::command::list::rpop(db, &[bs(b"l")]);
+                    crate::command::list::rpop(db, &[bs(b"l")]);
+                },
+                0,
+            ),
+            (
+                "LPOP count",
+                |db| {
+                    crate::command::list::lpop(db, &[bs(b"l"), bs(b"9")]);
+                },
+                0,
+            ),
+            (
+                "RPOP count",
+                |db| {
+                    crate::command::list::rpop(db, &[bs(b"l"), bs(b"9")]);
+                },
+                0,
+            ),
+            (
+                "LREM all",
+                |db| {
+                    crate::command::list::lrem(db, &[bs(b"l"), bs(b"0"), bs(b"e")]);
+                },
+                0,
+            ),
+            (
+                "LTRIM to an empty range",
+                |db| {
+                    crate::command::list::ltrim(db, &[bs(b"l"), bs(b"5"), bs(b"1")]);
+                },
+                0,
+            ),
+            (
+                "LMPOP",
+                |db| {
+                    crate::command::list::lmpop(
+                        db,
+                        &[bs(b"1"), bs(b"l"), bs(b"LEFT"), bs(b"COUNT"), bs(b"9")],
+                    );
+                },
+                0,
+            ),
+            (
+                "LMOVE draining the source",
+                |db| {
+                    for _ in 0..2 {
+                        crate::command::list::lmove(
+                            db,
+                            &[bs(b"l"), bs(b"dst"), bs(b"LEFT"), bs(b"RIGHT")],
+                        );
+                    }
+                },
+                STRANDED_BY_LIST_POP,
+            ),
+            (
+                "RPOPLPUSH draining the source",
+                |db| {
+                    for _ in 0..2 {
+                        crate::command::list::rpoplpush(db, &[bs(b"l"), bs(b"dst")]);
+                    }
+                },
+                STRANDED_BY_LIST_POP,
+            ),
+        ];
+
+        for (name, drain, drift) in cases {
+            // Both encodings: a 2-element listpack, and a list that has been
+            // pushed past `list-max-listpack-size` and trimmed back to 2, so
+            // it is a `linkedlist` holding the same two elements. Nothing
+            // demotes (moon#832), which is what makes the second reachable.
+            for compact in [true, false] {
+                let mut db = Database::new();
+                if compact {
+                    crate::command::list::rpush(&mut db, &[bs(b"l"), bs(b"e"), bs(b"e")]);
+                } else {
+                    let owned: Vec<Vec<u8>> = (0..200).map(|_| b"e".to_vec()).collect();
+                    let mut args: Vec<Frame> = Vec::with_capacity(201);
+                    args.push(bs(b"l"));
+                    args.extend(owned.iter().map(|m| bs(m)));
+                    crate::command::list::rpush(&mut db, &args);
+                    crate::command::list::ltrim(&mut db, &[bs(b"l"), bs(b"0"), bs(b"1")]);
+                }
+                let want = if compact { "listpack" } else { "linkedlist" };
+                assert_eq!(
+                    encoding_of(&mut db, b"l"),
+                    want,
+                    "fixture ({name}, compact={compact})"
+                );
+                assert_eq!(
+                    crate::command::list::llen_readonly(&db, &[bs(b"l")], 0),
+                    Frame::Integer(2),
+                    "fixture ({name}, compact={compact}): two elements"
+                );
+
+                drain(&mut db);
+
+                assert!(
+                    db.data().get(b"l").is_none(),
+                    "{name} (compact={compact}) emptied the list and left the \
+                     KEY alive — an empty container that EXISTS, TYPE and \
+                     DBSIZE report, that reaches the AOF and a replica, and \
+                     that redis has no counterpart for"
+                );
+                assert_eq!(
+                    crate::command::list::llen_readonly(&db, &[bs(b"l")], 0),
+                    Frame::Integer(0),
+                    "{name} (compact={compact}): LLEN after the key is gone"
+                );
+                let running = db.estimated_memory();
+                db.recalculate_memory();
+                let recomputed = db.estimated_memory();
+                assert_eq!(
+                    running - recomputed,
+                    drift,
+                    "{name} (compact={compact}): running ledger {running} B vs \
+                     full recompute {recomputed} B, expected a drift of \
+                     {drift} B"
+                );
+            }
         }
     }
 }

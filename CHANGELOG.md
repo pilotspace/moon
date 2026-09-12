@@ -8,6 +8,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **The list pops stop paying for work they already had in hand** (moon#942).
+  Three reductions on the `LPUSH`/`RPUSH`/`LPOP`/`RPOP` family, all inside
+  `src/command/list/`:
+
+  | path | before | after | unit |
+  |---|---:|---:|---|
+  | `LPOP`/`RPOP` off a **listpack** | 2 | **1** | heap allocations per element |
+  | `LPOP`/`RPOP` off a **linkedlist** | 4 | **3** | DashTable key lookups |
+  | `LPUSHX`/`RPUSHX`, hit | 4 | **3** | DashTable key lookups |
+  | `LPUSHX`/`RPUSHX`, miss or WRONGTYPE | 2 | **1** | DashTable key lookups |
+
+  1. `listpack_pop_end` decoded the popped element through the OWNING
+     `ListpackEntry`: `Listpack::get_at` allocates a `Vec` and
+     `ListpackEntry::to_bytes` then goes through `as_bytes`, whose string arm
+     CLONES it — two heap allocations, the first dropped having been copied
+     and never read. It now decodes through the borrowed `ListpackRef` that
+     `Listpack::iter_refs` already hands out. **One is the floor, not zero:**
+     the reply owns its bytes and `remove_at` mutates the buffer on the next
+     line. `src/command/` is forbidden from allocating on the hot path at all,
+     and moon#897 made the listpack encoding *survive* a pop — so every small
+     work queue in the tree now takes this path on every drain, where before
+     #897 it flattened once and paid zero thereafter.
+  2. `pop_eager` popped through `get_or_create_list`, dropped the borrow, and
+     then asked `get_list_ref_if_alive` a FOURTH time whether the list was now
+     empty — a question the `&mut VecDeque` it had just been holding answers
+     for free.
+  3. `LPUSHX`/`RPUSHX`'s exists-and-is-a-list gate was `db.get_list(key)` =
+     `get_promoted`: two lookups, and a `&mut self` accessor whose
+     `ListKind::upgrade` flattens the compact encoding just to answer a
+     yes/no. It is now the `&self` router `LPOP` already uses (moon#897),
+     whose receiver makes the rewrite unrepresentable. The mutable accessor
+     behind it is unchanged, so the encoding OUTCOME is unchanged too.
+
+     The one trade: for a COLD-SPILLED list the `&self` router decodes a
+     throwaway copy that `get_promoted` would have promoted outright, so a
+     spilled key now costs one extra decode on these two commands — the same
+     trade `pop_generic` already makes, and hot keys pay nothing. What it must
+     NOT do is answer 0, which for `LPUSHX` is a silently dropped write
+     wearing a success-shaped reply; `pushx_sees_a_cold_spilled_list_and_appends_to_it`
+     asserts the cold read-through rather than trusting the accessor's
+     comment, because moon#610 is exactly the class of a read-only path that
+     forgets the cold tier.
+
+  **Which arm does the benchmark exercise? The listpack one, and only that.**
+  `scripts/bench-ab-matrix.sh`'s row is `LPUSH list:__rand_int__ xxxxxxxx` at
+  `-r 100000`, so ~2.0M pushes spread over 100,000 keys leave a `list:` key
+  holding roughly 5 elements when the p=64 point starts and 20 when it ends,
+  against a `list-max-listpack-size` of 128. **No timed `LPUSH` in the matrix
+  ever reaches the quicklist arm**, and `LPUSH` on the listpack arm was
+  already at the accessor skeleton's 2-lookup floor before this change. None
+  of the three reductions above can move the benchmarked `LPUSH` number, and
+  this entry does not claim they do. They are worth having for real lists,
+  which are longer than a benchmark's, and for the queue drain, which a
+  benchmark of pushes does not measure at all. No throughput number was
+  measured and none is claimed; PERF-08 (moon#789) is why — a probe reduction
+  in this repo measured +11% on aarch64 and −17% on x86_64.
+
+  **Still open, and now pinned rather than described:** `LPUSH` onto a
+  `linkedlist` costs FOUR lookups and moves a watched key's version by TWO,
+  because `get_or_create_list_listpack` answers `Ok(None)` for a key already
+  holding the full `VecDeque` and `lpush` answers that by re-running the whole
+  skeleton through `get_or_create_list`. That is exactly the shape moon#942
+  closed for `SADD`, and closing it needs the same `SetHandle`-shaped change
+  to `src/storage/db/accessors.rs`. `lpush_end_to_end_probe_budget` and
+  `list_writes_bump_the_watch_version_exactly_once` assert both at their
+  CURRENT values, in both directions, so the fix has to update them
+  deliberately.
+
+  Every new guard was proven able to fail by mutation, and the mutants are
+  named in the tests. One claim did **not** survive that check and was
+  corrected rather than kept: deleting `pop_listpack`'s
+  `db.adjust_memory(before, after)` leaves the ledger tests green, because
+  `Listpack::estimate_memory` bills the size class of the buffer's CAPACITY
+  and nothing shrinks a listpack's buffer on removal — so `before == after` on
+  every pop and the call is a genuine no-op there.
+
+  **A bug this work FOUND and did not fix.** `LMOVE`, `RPOPLPUSH` and the
+  whole `BLPOP`/`BRPOP`/`BLMOVE`/`BRPOPLPUSH` family strand `used_memory`
+  every time they drain a list to empty, without bound, on a keyspace that
+  ends up empty. `Database::list_pop_front` and
+  `list_pop_back` (`src/storage/db/accessors.rs:1192-1222`) credit
+  `list_elem_cost(&val)` on the `else` branch and not on the `if empty`
+  branch, on the stated theory that "whole-key removal recomputes the
+  (now-empty) entry cost via `entry_overhead`" — but `entry_overhead` is
+  computed from the CURRENT value, which no longer holds the element, so the
+  push-time charge is never given back.
+
+  Measured on an otherwise empty `Database`: one `RPUSH k e` followed by one
+  `list_pop_front` leaves `used_memory` at **56 B against a from-scratch
+  `recalculate_memory` of 0 B**, on both encodings; ten create/drain cycles
+  leave 560 B. The drift is UPWARD, so the consequence is `--maxmemory` and
+  eviction firing on a server that is actually empty — the opposite direction
+  from moon#814, and reached by precisely the reliable-queue pattern that
+  drains a list over and over. The `LPOP`/`RPOP` command paths are exact and
+  are unaffected.
+
+  The fix is one line in each accessor — credit the element unconditionally,
+  as `pop_eager` already does — but `accessors.rs` was out of scope here.
+  `every_list_writer_that_empties_a_list_removes_the_key` enumerates all nine
+  list state writers that can remove the last element, asserts all nine do
+  remove the KEY (they do), and pins this drift at its measured 56 B so the
+  fix shows up as a test that needs updating rather than as silence.
+
 - **`SADD` on a hashtable set stops paying for a second accessor: 4 key
   lookups → 2** (moon#942). `get_or_create_set_listpack` answered `Ok(None)`
   for a set that was already an `IndexSet` — or a `SetIntset` the moon#899

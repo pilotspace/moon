@@ -2818,6 +2818,55 @@ mod tests {
         );
     }
 
+    /// moon#942, and the one risk in moving `LPUSHX`/`RPUSHX`'s
+    /// exists-and-is-a-list gate off `get_promoted`: the new gate is a
+    /// READ-ONLY path, and a read-only path that does not consult the cold
+    /// tier is moon#610's whole bug class — `STRLEN`, `TYPE`, `TTL`, `MGET`
+    /// and `BITCOUNT` each answered for a spilled key as though it did not
+    /// exist.
+    ///
+    /// Here that would be worse than a wrong answer. `LPUSHX`'s miss arm is
+    /// `Frame::Integer(0)` — "no such list, nothing pushed" — so a gate blind
+    /// to the cold tier would SILENTLY DROP a write against a key that is
+    /// merely spilled, and report success-shaped `0` while doing it.
+    ///
+    /// `get_list_ref_if_alive` documents a non-promoting cold read-through on
+    /// a hot miss. This asserts it rather than trusting the comment, on both
+    /// X forms and from both ends.
+    #[test]
+    fn pushx_sees_a_cold_spilled_list_and_appends_to_it() {
+        use crate::protocol::Frame;
+        for (name, push) in [
+            (
+                "LPUSHX",
+                crate::command::list::lpushx as fn(&mut Database, &[Frame]) -> Frame,
+            ),
+            ("RPUSHX", crate::command::list::rpushx),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut list = VecDeque::new();
+            list.push_back(Bytes::from_static(b"first"));
+            list.push_back(Bytes::from_static(b"second"));
+            let mut db = db_with_spilled_value(tmp.path(), b"coldlist", TestRedisValue::List(list));
+
+            let args = [
+                Frame::BulkString(Bytes::from_static(b"coldlist")),
+                Frame::BulkString(Bytes::from_static(b"third")),
+            ];
+            assert_eq!(
+                push(&mut db, &args),
+                Frame::Integer(3),
+                "{name} on a COLD-spilled list must promote it and push, not \
+                 answer 0 — a 0 here is a silently dropped write (moon#610)"
+            );
+            assert_eq!(
+                db.get_list(b"coldlist").unwrap().map(|l| l.len()),
+                Some(3),
+                "{name}: the promoted list stays in hot RAM"
+            );
+        }
+    }
+
     /// Same guard on the sorted-set side.
     #[test]
     fn test_zset_pop_removes_key_only_when_it_empties() {

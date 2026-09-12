@@ -258,16 +258,41 @@ fn promote_list_listpack(db: &mut Database, key: &[u8], after: usize) {
     db.charge_memory(new_cost);
 }
 
-/// Remove and return one end of a listpack, without decoding anything else.
+/// Remove and return one end of a listpack, materialising the popped element
+/// exactly ONCE and decoding nothing else.
 ///
-/// `get_at` walks borrowed and materialises only the entry it returns;
-/// `remove_at` discards its own without decoding it. A stored `Integer` renders
-/// through the canonical spelling it was admitted under, so the bytes handed
-/// back are the bytes the client wrote (moon#795/#903).
+/// The walk to the element is borrowed either way — `iter_refs` and `seek_to`
+/// share `decode_entry_ref_at`, so nothing stepped over is ever materialised —
+/// and `remove_at` discards its own entry without decoding it. What changed
+/// (moon#942) is the element the pop actually keeps: `Listpack::get_at`
+/// returns the OWNING `ListpackEntry`, whose string arm is a fresh `Vec`, and
+/// `ListpackEntry::to_bytes` then goes through `as_bytes`, which CLONES that
+/// `Vec` — two heap allocations, the first dropped having been copied and
+/// never read. `ListpackRef` borrows instead, so the only copy is the one the
+/// reply genuinely needs: it owns its bytes and `remove_at` mutates the buffer
+/// out from under them on the next line.
+///
+/// One allocation is the floor, not zero, and
+/// `tests/list_pop_alloc_942.rs` pins it there against a counting
+/// `GlobalAlloc` — with a full-encoding pop (a `Bytes` move, zero) as the
+/// control that says the surplus belonged to the decode and not to the reply.
+///
+/// A stored `Integer` renders through the canonical decimal spelling it was
+/// admitted under, so the bytes handed back are the bytes the client wrote
+/// (moon#795/#903). `itoa` here and `i64::to_string` in `ListpackEntry`
+/// produce the same bytes for every `i64`; `a_listpack_pop_returns_the_exact_bytes_that_were_pushed`
+/// asks both ends for `007`, `+7`, `-0` and both limits.
 #[inline]
 fn listpack_pop_end(lp: &mut crate::storage::listpack::Listpack, front: bool) -> Option<Bytes> {
+    use crate::storage::listpack::ListpackRef;
     let idx = if front { 0 } else { lp.len().checked_sub(1)? };
-    let value = lp.get_at(idx)?.to_bytes();
+    let value = match lp.iter_refs().nth(idx)? {
+        ListpackRef::Str(s) => Bytes::copy_from_slice(s),
+        ListpackRef::Integer(v) => {
+            let mut buf = itoa::Buffer::new();
+            Bytes::copy_from_slice(buf.format(v).as_bytes())
+        }
+    };
     lp.remove_at(idx);
     Some(value)
 }
@@ -413,16 +438,22 @@ fn pop_eager(db: &mut Database, key: &Bytes, count: Option<usize>, front: bool) 
             Frame::Array(items.into())
         }
     };
+    // Whether the pop emptied the list, read from the handle that did the
+    // popping. moon#942: this used to be a FOURTH DashTable probe — the
+    // borrow was dropped and `get_list_ref_if_alive` was asked to look the
+    // key up again to answer a question the `&mut VecDeque` had in hand. The
+    // `&self` accessor was the right choice for the question (`get_list` is
+    // `get_promoted` and would re-flatten whatever the pop preserved,
+    // moon#832); not asking it at all is better still, and identical — one
+    // shard thread owns this keyspace and nothing between here and there can
+    // change the list's length.
+    let empty = list.is_empty();
     // `list`'s borrow of `db` ends above.
     db.credit_memory(credit);
 
     // If the list is now empty, remove the key (this credits the container's
     // fixed key/struct overhead — the popped elements were already credited
-    // above, so there is no double count). The emptiness probe goes through
-    // the `&self` accessor: `get_list` is `get_promoted`, and using it here
-    // would re-flatten whatever the pop had just preserved (moon#832).
-    let now_ms = db.now_ms();
-    let empty = matches!(db.get_list_ref_if_alive(key, now_ms), Ok(Some(l)) if l.is_empty());
+    // above, so there is no double count).
     if empty {
         db.remove(key);
     }
@@ -966,7 +997,21 @@ pub fn lpushx(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("LPUSHX");
     }
 
-    match db.get_list(key) {
+    // The exists-and-is-a-list gate. moon#942: this used to be
+    // `db.get_list(key)` = `get_promoted`, which costs TWO probes and, being
+    // a `&mut self` accessor whose `ListKind::upgrade` is unconditional,
+    // flattens the compact encoding just to answer a yes/no — the same pair
+    // moon#897 took out of `LPOP`'s gate. `list_route` is the `&self` router:
+    // one probe, and its receiver makes the rewrite unrepresentable.
+    //
+    // The mutable accessor below is deliberately unchanged, so the ENCODING
+    // outcome is unchanged too (LPUSHX still flattens a listpack — moon#832,
+    // still open, pinned by `lpushx_and_rpushx_still_flatten_a_listpack_moon832`).
+    // Nor is this `get_mut_if_present`, which would fold both accessors into
+    // one and save a second probe: that one stamps the mutation BEFORE it can
+    // answer WRONGTYPE, so it would widen moon#940 to a command that today
+    // refuses without dirtying a watched key.
+    match list_route(db, key) {
         Ok(None) => return Frame::Integer(0),
         Err(e) => return e,
         Ok(Some(_)) => {}
@@ -1015,7 +1060,9 @@ pub fn rpushx(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("RPUSHX");
     }
 
-    match db.get_list(key) {
+    // The same one-probe, non-flattening gate `LPUSHX` takes; see the comment
+    // there for why it is not `get_promoted` and not `get_mut_if_present`.
+    match list_route(db, key) {
         Ok(None) => return Frame::Integer(0),
         Err(e) => return e,
         Ok(Some(_)) => {}
