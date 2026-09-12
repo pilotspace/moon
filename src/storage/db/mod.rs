@@ -6,6 +6,10 @@ mod cold_replay_gate;
 mod hash_ttl;
 mod incr;
 mod kv_ops;
+/// moon#942: the accessors' DashTable probe budget, asserted with a counter
+/// rather than a clock. Test-only; see the module docs for why.
+#[cfg(test)]
+mod probe_budget;
 
 pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile};
 pub(crate) use incr::IncrOutcome;

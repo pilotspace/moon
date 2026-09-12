@@ -140,6 +140,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pre-pass is **unverified** — benchmarks are Linux-only and this landed from
   macOS. The change is justified by doing strictly less work for a provably
   identical verdict, not by a measurement.
+- **`test`: a DashTable key-lookup counter and a probe budget for the storage
+  accessors (moon#942).** `DashTable`'s six lookup entry points (`get`,
+  `get_mut`, `insert`, `insert_or_update`, `remove`, `remove_entry`) now record
+  a per-thread count under `cfg(test)`, behind the same `#[cfg(not(test))]`
+  `#[inline(always)]` no-op that moon#789 established for `note_simd_probe` —
+  zero production cost, in the hottest lookups in the codebase. It is
+  deliberately COARSER than `segment::take_simd_probes`: that one counts
+  control-byte group scans and varies with a segment's fill, this one counts how
+  many times a caller hashes a key and walks a segment at all, which is a
+  property of the *accessor* rather than of the table.
+
+  `storage::db::probe_budget` pins the measured budget of every `get_or_create*`
+  / `get_promoted` / `get_mut_if_present` accessor and of `SADD` end to end, on
+  a hit and on a miss. The baseline it records is **measured, not read off the
+  moon#942 audit — which undercounted `get_or_create`'s miss path by one**
+  (`promote_cold_if_present` opens with its own `contains_key`). These are the
+  **PRE-reduction** counts, which is the point of recording them; the reduced
+  ones are under Performance below and are what the module asserts at HEAD:
+
+  | accessor | hit | miss |
+  |---|---:|---:|
+  | `get_or_create` | 3 | 6 |
+  | `get_mut_if_present` | 3 | 4 |
+  | `get_promoted` | 4 | 5 |
+  | `get_or_create_intset` / `_hash_listpack` / `_list_listpack` / `_zset_listpack` | 3 | 6 |
+  | `get_or_create_set_listpack` | 4 | 7 |
+  | `SADD` end to end — absent key / listpack regime / hashtable regime | \[7, 4, 7\] | |
+
+  Redis reaches all of these with one `dictFind`. **No throughput claim is made
+  or implied**: the counter exists precisely *because* moon#789 measured the
+  last probe-count change at +11% on aarch64 and −17% on x86_64 — the two
+  architectures disagreed in sign — and because `b3083c5a` found the wall-clock
+  net for it was timing a page-fault artifact. A probe count is a structural
+  fact; only a Linux benchmark host may speak about time.
 
 - `scripts/bench-ab-delta.py` — compares moon against **moon** across two
   matrix runs, which `bench-ab-report.py` cannot do. Redis is the control: the
@@ -535,6 +569,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   four, which is that routing-dependence reproduced. `handler_sharded` (tokio)
   was checked and deliberately left alone: its single `db_guard` already spans
   dispatch and the wake, so it never paid for the no-op.
+- **`storage`: the typed accessors probe the DashTable half as many times
+  (moon#942).** Every `get_or_create*` opened with a `get` (inside
+  `drop_if_expired`) and a `contains_key` that answer the same question — "is
+  there a live entry at this key?" — before the `get_mut` that hands the entry
+  out. `get_promoted` paid a fourth lookup, a trailing `get`, purely to
+  re-borrow immutably what the upgrade's `&mut` already had.
+  `get_or_create_set_listpack` paid a fifth, because
+  `absorb_intset_into_listpack` was a `&mut self` method keyed by `&[u8]` and
+  took its own `get_mut` — on every `SADD`, including the overwhelming majority
+  where the key is not an intset and the function does nothing. Each of those
+  is a full xxh64 over the key plus a segment scan; nothing cached a probe
+  anywhere.
+
+  One `HotState` classification now decides the whole preamble, the create arm
+  reads `promote_cold_if_present`'s own return value instead of re-issuing
+  `contains_key`, and the intset edge runs on the handle the accessor was
+  about to take anyway. **Measured with a new `cfg(test)` DashTable key-lookup
+  counter, per accessor, on a hit and on a miss:**
+
+  | accessor | before (hit / miss) | after (hit / miss) |
+  |---|---:|---:|
+  | `get_or_create` | 3 / 6 | **2 / 4** |
+  | `get_mut_if_present` | 3 / 4 | **2 / 3** |
+  | `get_promoted` | 4 / 5 | **2 / 3** |
+  | `get_or_create_intset` / `_hash_listpack` / `_list_listpack` / `_zset_listpack` | 3 / 6 | **2 / 4** |
+  | `get_or_create_set_listpack` | 4 / 7 | **2 / 4** |
+
+  SADD end to end does not fit that table's hit/miss axis — its three regimes
+  are an absent key, a listpack-encoded key and a hashtable-encoded one (122 of
+  200 keys at the benchmark's own p=64 point):
+
+  | `SADD` regime | before | after |
+  |---|---:|---:|
+  | absent key (creates the container) | 7 | **4** |
+  | listpack-encoded key | 4 | **2** |
+  | hashtable-encoded key | 7 | **4** |
+
+  Redis reaches the same key with one `dictFind`. The residual 4 on SADD's
+  hashtable regime is two accessors' worth: `get_or_create_set_listpack`
+  answers `Ok(None)` and `get_or_create_set` then repeats the skeleton.
+  Collapsing that needs a change in `src/command/set/`.
+
+  **No throughput number is claimed, and none was measured.** That is
+  deliberate, not an omission: moon#789 measured the previous probe-count
+  reduction in this repo at **+11% on aarch64 and −17% on x86_64** — the two
+  architectures disagreed in *sign* — and `b3083c5a` found the wall-clock net
+  guarding it was timing a page-fault artifact rather than the optimisation.
+  Fewer probes is a structural fact; whether it is faster is a question only a
+  Linux benchmark host may answer, and this change must be A/B'd on **both**
+  arches before any performance claim is attached to it. What *is* verified
+  beyond the counter is that the codegen moved: on aarch64 the emitted bodies
+  of `get_or_create_hash_listpack`, `_list_listpack`, `_zset_listpack`,
+  `_intset` and `_set_listpack` shrink by 45–48% (884→460, 880→456, 884→460,
+  984→556, 964→528 bytes). Code size is not speed either; it is evidence the
+  compiler saw the change.
+
+  Behaviour is unchanged and pinned by tests written against the pre-change
+  baseline: an expired key still reads as ABSENT (not `WRONGTYPE`) through
+  every accessor and still leaves no expiry-index entry behind (moon#541); a
+  cold-spilled value is still promoted before an empty container is fabricated
+  over it, on the expired arm as well as the absent one (moon#459); a live key
+  of the wrong type still errors; the WATCH version still bumps exactly once
+  per mutable handle (moon#926 — moon#940, the `WRONGTYPE` path stamping too,
+  is neither fixed nor worsened, and `stamp_mutation` did not move); and
+  `used_memory` still agrees with an independent whole-keyspace recount.
+
+  That last one was first written as `assert_eq!(run(), run())` over a pure
+  deterministic closure, which is a tautology — a build that moved a charge
+  across a branch would still agree with itself — and an adversarial review
+  caught it. It now compares the incrementally maintained ledger against a
+  fresh walk summing `entry_overhead` per entry, and a second test pins the one
+  ledger write this change actually moved (the moon#899 intset→listpack swing,
+  which used to be applied inside `absorb_intset_into_listpack` before
+  `stamp_mutation` and is now applied by the accessor after it). Both were
+  verified to FAIL against deliberately mutated builds — charge dropped, swing
+  dropped — rather than assumed to be capable of failing.
 
 - **`storage`: the listpack write path stops walking twice and stops
   allocating per entry it walks past (moon#799).** `get_at`, `remove_at` and
