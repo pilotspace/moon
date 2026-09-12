@@ -710,6 +710,88 @@ mod budget {
         );
     }
 
+    // ── the benchmark's own shape, end to end ───────────────────────────────
+
+    /// Everything ONE benchmarked `ZADD` spends, in one assertion.
+    ///
+    /// The row is `scripts/bench-ab-matrix.sh`'s
+    /// `ZADD|zadd z:__rand_int__ 1 m:__rand_int__` with `KEYSPACE=100000` and
+    /// 1,500,000 requests at p=64 — about fifteen members per key, always with
+    /// the literal score `1`. So the benchmarked zset is a ~15-entry LISTPACK
+    /// for the whole run, the `skiplist` arm is never reached, and the member
+    /// is usually NEW, which means the update closure is not called at all and
+    /// the `PairUpdate::Absent` arm is what runs.
+    ///
+    /// That narrows what can possibly move this number to two things, and this
+    /// is the assertion that pins both:
+    ///
+    /// * the score ARGUMENT is parsed once, not twice, and
+    /// * the score is rendered by `itoa`, not by `core::fmt`'s `f64` Display.
+    ///
+    /// Everything else here is a control that must NOT move: the accessor
+    /// still costs two key lookups, the listpack is still written once, and
+    /// the stored score is still never decoded (there is nothing to decode —
+    /// the member is absent).
+    ///
+    /// Proven able to fail: removing `integral_score`'s fast arm from
+    /// `render_score` takes `float_formats` to 1; restoring the mutation
+    /// loop's own `parse_zadd_pair` takes `arg_score_parses` to 2.
+    #[test]
+    fn one_benchmark_shaped_zadd_end_to_end() {
+        let mut db = Database::new();
+        // Fifteen members already there, exactly as the run's own key
+        // population settles: `z:<6 digits>` with `m:<6 digits>` members.
+        for i in 0..15u32 {
+            assert_eq!(
+                zadd(
+                    &mut db,
+                    &[bulk("z:042042"), bulk("1"), bulk(&format!("m:{i:06}"))]
+                ),
+                Frame::Integer(1)
+            );
+        }
+        assert_eq!(
+            crate::command::key::object(&mut db, &[bulk("ENCODING"), bulk("z:042042")]),
+            Frame::BulkString(Bytes::from_static(b"listpack")),
+            "fixture: the benchmarked zset must be a listpack"
+        );
+
+        let args = [bulk("z:042042"), bulk("1"), bulk("m:999999")];
+        let _ = take_key_lookups();
+        let (r, b) = measure(|| zadd(&mut db, &args));
+        let key_lookups = take_key_lookups();
+        assert_eq!(r, Frame::Integer(1), "a new member is one add");
+
+        assert_eq!(
+            (
+                b.arg_score_parses,
+                b.stored_score_parses,
+                b.listpack_score_writes,
+                b.float_formats,
+                b.member_lookups,
+                b.bptree_score_writes,
+                key_lookups,
+            ),
+            (1, 0, 1, 0, 0, 0, 2),
+            "the benchmarked ZADD's work budget moved — moon#942. \
+             (arg_score_parses={}, stored_score_parses={}, \
+             listpack_score_writes={}, float_formats={}, member_lookups={}, \
+             bptree_score_writes={}, key_lookups={}). It was (2, 0, 1, 1, 0, \
+             0, 2) before this work: the score argument was parsed twice and \
+             the score `1` went through `core::fmt`'s shortest-round-trip f64 \
+             Display. A RISE in any field is the regression this test exists \
+             to catch; this is a work count and says NOTHING about wall clock, \
+             which only a Linux bench host may answer (PERF-08, moon#789).",
+            b.arg_score_parses,
+            b.stored_score_parses,
+            b.listpack_score_writes,
+            b.float_formats,
+            b.member_lookups,
+            b.bptree_score_writes,
+            key_lookups
+        );
+    }
+
     // ── the accessor budget: how many times ZADD hashes its KEY ─────────────
 
     #[test]
