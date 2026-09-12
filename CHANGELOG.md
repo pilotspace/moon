@@ -97,6 +97,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whether the caller's patterns cover the index's `PREFIX` — is filed as the
   follow-up; grant `~*` in the meantime if a restricted user must search.
 
+### Performance
+
+- **`INCR`/`INCRBY`/`DECR`/`DECRBY` mutate the stored integer in place
+  (moon#942).** Adding one to a hot counter cost **three** independent
+  `DashTable` probes — two in `Database::get` (the second is a documented NLL
+  re-probe, `kv_ops.rs:29`/`:36`) and a third in `Database::set` — plus a
+  `CompactKey::from(key)` re-copy of the key bytes, a whole new `Entry`, and
+  two `entry_overhead` recomputations. Redis's `incrDecrCommand` does one
+  `lookupKeyWrite` and rewrites `o->ptr`. `Database::incr_hot_string_in_place`
+  (`src/storage/db/incr.rs`) is the equivalent: **one** `get_mut` probe, one
+  `CompactValue` assignment, and nothing re-hashed or rebuilt.
+
+  **Counted in the disassembly of the release binary** (aarch64-apple-darwin,
+  fat LTO, `strip=false`), by `DashTable` entry points reached on the live
+  path — each entry point computes exactly one `hash_key`:
+
+  | | `DashTable` entry points | key hashes |
+  |---|---:|---:|
+  | `Database::get` (live path) | 2 x `DashTable::get` | 2 |
+  | `Database::set` | 1 x `insert_or_update` | 1 |
+  | **pre-#942 `INCR` hot path** | **3** | **3** |
+  | `incr_hot_string_in_place` | 1 x `DashTable::get_mut` | 1 |
+
+  That also **settles the open question about `Database::get`'s NLL re-probe**
+  (`kv_ops.rs:29`/`:36`): LLVM does *not* eliminate it. It tail-merges the
+  live-path re-probe with the post-cold-promotion probe into one branch
+  target, but the live path still executes `bl DashTable::get` and then tail-
+  calls `DashTable::get` a second time. `DashTable::get` is not inlined into
+  `Database::get` even with `hash_key` fully inlinable, so no CSE is possible
+  across the two. Fixing that re-probe remains open (it needs polonius, a
+  `RawEntry`-style `DashTable` API, or `unsafe`); `INCR` no longer pays it
+  because its hot path does not call `Database::get` at all.
+
+  **No throughput number is claimed.** Benchmarks are Linux-only and this
+  change has not been run on the instrument; the probe counts above are
+  static instruction-level facts, not a wall-clock measurement.
+
+  The risk in a fast path around `Database::set` is the side effects it
+  quietly stops doing, so all eleven are enumerated in the module docs with a
+  per-item decision, and each preserved one has a named test. The two cases
+  the fast path **refuses** — absent key, TTL-expired key — fall back to the
+  original `get` + `set` pair unchanged, because those are exactly where
+  cold-tier promotion, in-flight-spill rehydration and lazy-expiry
+  bookkeeping live; fabricating a `0` for a spilled counter would have been a
+  silent data loss. Error replies (`WRONGTYPE`, non-integer, overflow) leave
+  the keyspace bit-for-bit unchanged — no WATCH-version bump (moon#926/#940),
+  no dirty-counter charge, no ledger movement, no keyspace notification.
+
+  The trade is stated in the module docs rather than left to be discovered:
+  a refused call has already spent its probe, so `INCR` on an **absent** key
+  now costs 5 probes where it cost 4. A counter is created once and
+  incremented many times.
+
+  21 mutation-injected defects — one per preserved side effect, in both
+  directions — were each confirmed to turn a *named* test red before the
+  suite was trusted (11 against the unit suite, 10 against the live-server
+  one). Two guards did not catch their mutation on the first pass and were
+  rewritten until they did.
+
 ### Fixed
 
 - **`HINCRBY` and `HSETNX` no longer flatten a small hash (moon#897).** Both
