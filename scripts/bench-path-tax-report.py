@@ -37,7 +37,11 @@ def main(path):
     print("\n".join(header))
     print()
 
-    need = [("inline", 8), ("inline", 64), ("generic", 8), ("generic", 64)]
+    # Leg names differ by mode: tax mode is inline-vs-generic, aclcost mode is
+    # unrestricted-vs-restricted (both generic, so the delta IS the ACL check).
+    legs = ("inline", "generic") if any(k[0] == "inline" for k in rows) \
+           else ("unrestricted", "restricted")
+    need = [(legs[0], 8), (legs[0], 64), (legs[1], 8), (legs[1], 64)]
     missing = [k for k in need if len(rows.get(k, [])) < 2]
     if missing:
         print(f"> **INCOMPLETE**: fewer than 2 samples for {missing}. No tax published.")
@@ -46,7 +50,7 @@ def main(path):
     out = {}
     print("| leg | p=8 rps | p=64 rps | µs@8 | µs@64 | C (µs/op) | B (µs/batch) | CV8 | CV64 |")
     print("|---|---:|---:|---:|---:|---:|---:|:---:|:---:|")
-    for leg in ("inline", "generic"):
+    for leg in legs:
         r8, r64 = rows[(leg, 8)], rows[(leg, 64)]
         u8, u64 = 1e6 / st.median(r8), 1e6 / st.median(r64)
         C = u64 - (u8 - u64) / 7.0
@@ -57,12 +61,13 @@ def main(path):
         print(f"| {leg} | {st.median(r8):,.0f} | {st.median(r64):,.0f} | {u8:.3f} | "
               f"{u64:.3f} | **{C:.3f}** | {B:.2f} | {cv8:.1f}% | {cv64:.1f}% |")
 
-    Ci, _, cvi = out["inline"]
-    Cg, _, cvg = out["generic"]
+    Ci, _, cvi = out[legs[0]]
+    Cg, _, cvg = out[legs[1]]
     tax = Cg - Ci
+    label = "Path tax" if legs[0] == "inline" else "ACL check cost"
     floor = max(cvi, cvg) / 100.0
     print()
-    print(f"**Path tax = {tax:.3f} µs/op** ({Cg / Ci:.2f}x the inline per-command cost), "
+    print(f"**{label} = {tax:.3f} µs/op** ({Cg / Ci:.2f}x the baseline leg's per-command cost), "
           f"same handler, same session.")
     print()
     # The tax must clear the noise the two legs themselves support, or it is not
@@ -74,7 +79,16 @@ def main(path):
         print(f"Worst within-leg CV {floor*100:.1f}% ({floor*Cg:.3f} µs on the generic "
               f"leg) — the tax clears it by {tax/(floor*Cg):.1f}x.")
     print()
-    print("Upper bound: the generic leg also pays the ACL check the inline leg skips.")
+    if legs[0] == "inline":
+        print("Upper bound: the generic leg also pays the ACL check the inline leg")
+        print("skips, AND -- if the command is GET -- the GET-only cold-tier peek at")
+        print("handler_monoio/mod.rs:3674, which takes the db's exclusive guard and a")
+        print("second full DashTable probe. Neither transfers to the write families.")
+        print("Run `--mode aclcost` to measure the ACL component and subtract it;")
+        print("run `--command 'set key:__rand_int__ xxxxxxxx'` to drop the GET peek.")
+    else:
+        print("BOTH legs take the generic path (the command is inline-ineligible), so")
+        print("this difference is the ACL check alone -- subtract it from a `tax` run.")
     return 0
 
 
