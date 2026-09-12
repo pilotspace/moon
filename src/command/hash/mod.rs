@@ -2535,7 +2535,10 @@ mod tests {
                 seed.push(f);
                 seed.push(v);
             }
-            assert_eq!(hset(&mut db, &make_args(&seed)), Frame::Integer(fields as i64));
+            assert_eq!(
+                hset(&mut db, &make_args(&seed)),
+                Frame::Integer(fields as i64)
+            );
 
             assert_eq!(
                 hdel(
@@ -2584,7 +2587,10 @@ mod tests {
     fn hdel_on_a_missing_key_answers_zero_and_creates_nothing() {
         let mut db = Database::new();
         let before = db.estimated_memory();
-        assert_eq!(hdel(&mut db, &make_args(&[b"ghost", b"f"])), Frame::Integer(0));
+        assert_eq!(
+            hdel(&mut db, &make_args(&[b"ghost", b"f"])),
+            Frame::Integer(0)
+        );
         assert!(
             db.data().get(b"ghost").is_none(),
             "HDEL must never fabricate a container"
@@ -2643,7 +2649,9 @@ mod tests {
         assert!(
             matches!(
                 db.data().get(b"h").map(|e| e.value.as_redis_value()),
-                Some(crate::storage::compact_value::RedisValueRef::HashListpack(_))
+                Some(crate::storage::compact_value::RedisValueRef::HashListpack(
+                    _
+                ))
             ),
             "HINCRBY must not flatten a small hash (moon#897)"
         );
@@ -2702,22 +2710,31 @@ mod tests {
         let limits = Database::new().encoding_limits();
         let long = vec![b'x'; limits.max_value(Shape::Hash) + 1];
 
+        // Both commands fuse the walk, so both are exercised — and the
+        // over-long element sits FIRST in one case and LAST in the other, so
+        // a walk that keeps only the element it saw most recently fails here.
         for pos in ["field", "value"] {
-            let mut db = Database::new();
-            let args = if pos == "field" {
-                make_args(&[b"h", &long, b"v", b"f2", b"v2"])
-            } else {
-                make_args(&[b"h", b"f1", b"v1", b"f2", &long])
-            };
-            assert_eq!(hset(&mut db, &args), Frame::Integer(2));
-            assert!(
-                matches!(
-                    db.data().get(b"h").map(|e| e.value.as_redis_value()),
-                    Some(crate::storage::compact_value::RedisValueRef::Hash(_))
-                ),
-                "an over-long {pos} anywhere in the batch must refuse the \
-                 compact form (moon#896)"
-            );
+            for cmd in ["HSET", "HMSET"] {
+                let mut db = Database::new();
+                let args = if pos == "field" {
+                    make_args(&[b"h", &long, b"v", b"f2", b"v2"])
+                } else {
+                    make_args(&[b"h", b"f1", b"v1", b"f2", &long])
+                };
+                if cmd == "HSET" {
+                    assert_eq!(hset(&mut db, &args), Frame::Integer(2));
+                } else {
+                    assert!(matches!(hmset(&mut db, &args), Frame::SimpleString(_)));
+                }
+                assert!(
+                    matches!(
+                        db.data().get(b"h").map(|e| e.value.as_redis_value()),
+                        Some(crate::storage::compact_value::RedisValueRef::Hash(_))
+                    ),
+                    "{cmd}: an over-long {pos} anywhere in the batch must \
+                     refuse the compact form (moon#896)"
+                );
+            }
         }
 
         // And the control: every element at the threshold stays compact.
@@ -2730,7 +2747,9 @@ mod tests {
         assert!(
             matches!(
                 db.data().get(b"h").map(|e| e.value.as_redis_value()),
-                Some(crate::storage::compact_value::RedisValueRef::HashListpack(_))
+                Some(crate::storage::compact_value::RedisValueRef::HashListpack(
+                    _
+                ))
             ),
             "the bound is inclusive (moon#896)"
         );

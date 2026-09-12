@@ -340,94 +340,151 @@ impl Database {
     ///
     /// Returns `Err(wrongtype_error())` if the key is not a hash.
     /// Returns `Ok((false, false))` for a missing key.
+    ///
+    /// The one-field spelling of [`Self::hash_delete_fields`], and a
+    /// delegator to it so the two cannot drift: HDEL's batch and a
+    /// single-field caller settle the ledger, the TTL sidecar and the WATCH
+    /// version through the same code.
     pub fn hash_delete_field(&mut self, key: &[u8], field: &[u8]) -> Result<(bool, bool), Frame> {
+        let (removed, empty) = self.hash_delete_fields(key, &[field])?;
+        Ok((removed > 0, empty))
+    }
+
+    /// Remove every field in `fields` from the hash at `key` in ONE accessor,
+    /// cleaning up the TTL sidecar as it goes.
+    ///
+    /// Returns `(removed, hash_now_empty)`:
+    /// - `removed` — how many of `fields` existed and were deleted. A field
+    ///   named twice counts once, because the second removal finds nothing.
+    /// - `hash_now_empty` — whether the hash has no fields left **after the
+    ///   whole batch**. The caller drops the key when this is true.
+    ///
+    /// Returns `Err(wrongtype_error())` if the key is not a hash, without
+    /// removing anything. `Ok((0, false))` for a missing key — this never
+    /// fabricates a container.
+    ///
+    /// # Why the batch is the unit (moon#942)
+    ///
+    /// The per-field spelling cost TWO DashTable probes for every field: its
+    /// own `self.data.get_mut(key)` and, when the field really went,
+    /// `stamp_hash_field_mutation`'s. `HDEL h f1 f2 f3` therefore hashed the
+    /// key SIX times, where Redis pays one `dictFind` for the command and
+    /// then looks each field up inside the hash. This walks the fields inside
+    /// the handle the single lookup already holds, and stamps that same
+    /// handle — so the whole command is ONE probe.
+    ///
+    /// It also fixes what the per-field loop could not express. Emptiness is
+    /// a property of the hash AFTER the batch, not of the last field the
+    /// caller happened to name: `hdel` tracked it in a variable reassigned on
+    /// every iteration, so `HDEL h only absent` overwrote the emptiness the
+    /// real removal reported and left the key behind as a hash with zero
+    /// fields.
+    ///
+    /// moon#926: one command is one WATCH version bump, and only when
+    /// something was actually removed. `HDEL k <absent>` answers 0 and, in
+    /// redis 8.6.1, leaves a watcher alone.
+    pub fn hash_delete_fields<F>(&mut self, key: &[u8], fields: &[F]) -> Result<(i64, bool), Frame>
+    where
+        F: AsRef<[u8]>,
+    {
         let Some(entry) = self.data.get_mut(key) else {
-            return Ok((false, false));
+            return Ok((0, false));
         };
         let Some(rv) = entry.value.as_redis_value_mut() else {
             return Err(Self::wrongtype_error());
         };
-        // Accumulated O(1) credit for this call; applied to `used_memory`
-        // once at the end (single field mutated per call, so this is exactly
-        // the byte delta — see the WS6 accounting note above `entry_overhead`).
+        // Accumulated O(1) credit for the whole batch; applied to
+        // `used_memory` once the entry's borrow ends — see the WS6 accounting
+        // note above `entry_overhead`.
         let mut credit: usize = 0;
-        let result = match rv {
+        let mut removed: i64 = 0;
+        let result: Result<bool, Frame> = match rv {
             RedisValue::Hash(map) => {
-                if let Some(v) = map.remove(field) {
-                    credit = hash_field_cost(field, &v);
-                    let empty = map.is_empty();
-                    Ok((true, empty))
-                } else {
-                    Ok((false, false))
+                for f in fields {
+                    if let Some(v) = map.remove(f.as_ref()) {
+                        credit += hash_field_cost(f.as_ref(), &v);
+                        removed += 1;
+                    }
                 }
+                Ok(map.is_empty())
             }
             RedisValue::HashListpack(lp) => {
-                // Listpack cost is O(1) (capacity-based) — snapshot before/after
-                // instead of tracking a per-element formula.
+                // Listpack cost is O(1) (capacity-based) — one snapshot pair
+                // around the whole batch, not one per field. `Vec::drain`
+                // leaves capacity alone, so this is the same figure the
+                // per-field spelling produced, summed the same way.
                 let before = lp.estimate_memory();
-                // ONE borrowed scan locates the pair and drains both entries.
-                // Locating it and then calling `remove_at` twice walked the
-                // listpack three times over (moon#799).
-                if lp.remove_pair(field) {
-                    let after = lp.estimate_memory();
-                    credit = before.saturating_sub(after);
-                    let empty = lp.is_empty();
-                    Ok((true, empty))
-                } else {
-                    Ok((false, false))
+                for f in fields {
+                    // ONE borrowed scan per field locates the pair and drains
+                    // both entries — the per-field work Redis does too
+                    // (moon#799).
+                    if lp.remove_pair(f.as_ref()) {
+                        removed += 1;
+                    }
                 }
+                let after = lp.estimate_memory();
+                credit += before.saturating_sub(after);
+                Ok(lp.is_empty())
             }
             RedisValue::HashWithTtl {
-                fields,
+                fields: fmap,
                 ttls,
                 min_expiry_ms,
             } => {
-                if let Some(v) = fields.remove(field) {
-                    credit = hash_field_cost(field, &v);
-                    let old_ttl = ttls.remove(field);
-                    // moon#861: sidecar entry + (on the last one) sidecar box.
-                    if old_ttl.is_some() {
-                        credit += hash_ttl_field_cost(field);
-                    }
-                    if ttls.is_empty() && !fields.is_empty() {
-                        // All TTLs gone but fields remain — downgrade to plain Hash.
-                        let m = std::mem::take(fields);
-                        *rv = RedisValue::Hash(m);
-                        credit += hash_ttl_sidecar_box_cost();
-                        Ok((true, false))
-                    } else if ttls.is_empty() && fields.is_empty() {
-                        // Both maps empty — signal caller to delete the key.
-                        // We leave the (now-empty) HashWithTtl in place; the
-                        // caller will call db.remove() to drop the key.
-                        let m = std::mem::take(fields);
-                        *rv = RedisValue::Hash(m);
-                        credit += hash_ttl_sidecar_box_cost();
-                        Ok((true, true))
-                    } else {
-                        // TTLs remain; recompute min if the removed field held it.
-                        if old_ttl == Some(*min_expiry_ms) {
-                            *min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
+                // Whether any removed field held the cached minimum. Recomputed
+                // once after the batch rather than per removal.
+                let mut min_invalidated = false;
+                for f in fields {
+                    let Some(v) = fmap.remove(f.as_ref()) else {
+                        continue;
+                    };
+                    removed += 1;
+                    credit += hash_field_cost(f.as_ref(), &v);
+                    // moon#861: the sidecar entry is billed by
+                    // `estimate_memory` and so is credited here.
+                    if let Some(old) = ttls.remove(f.as_ref()) {
+                        credit += hash_ttl_field_cost(f.as_ref());
+                        if old == *min_expiry_ms {
+                            min_invalidated = true;
                         }
-                        let empty = fields.is_empty();
-                        Ok((true, empty))
                     }
+                }
+                if removed == 0 {
+                    Ok(fmap.is_empty())
+                } else if ttls.is_empty() {
+                    // Every TTL is gone: downgrade to a plain `Hash` and
+                    // credit the sidecar box (moon#861). The fields map may
+                    // or may not be empty — when it is, the caller drops the
+                    // key, exactly as it did before.
+                    let empty = fmap.is_empty();
+                    let m = std::mem::take(fmap);
+                    *rv = RedisValue::Hash(m);
+                    credit += hash_ttl_sidecar_box_cost();
+                    Ok(empty)
                 } else {
-                    Ok((false, false))
+                    if min_invalidated {
+                        *min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
+                    }
+                    Ok(fmap.is_empty())
                 }
             }
             _ => Err(Self::wrongtype_error()),
         };
+        let container_empty = result?;
+        // A batch that removed nothing reports `false`, whatever the
+        // container's state — the single-field spelling's contract, kept
+        // exactly, so a caller never drops a key on the strength of a HDEL
+        // that did nothing.
+        let empty = removed > 0 && container_empty;
+        // moon#926: stamp the handle this call already holds, once, and only
+        // when the command really changed the hash.
+        if removed > 0 {
+            crate::storage::db::stamp_mutation(entry);
+        }
         if credit > 0 {
             self.credit_memory(credit);
         }
-        // moon#926: stamp only when the field really went. `HDEL k <absent>`
-        // answers 0 and, in redis 8.6.1, leaves a watcher alone — this method
-        // already knows which happened, so it is stamped precisely rather than
-        // at the `&mut` handout above.
-        if matches!(result, Ok((true, _))) {
-            self.stamp_hash_field_mutation(key);
-        }
-        result
+        Ok((removed, empty))
     }
 
     // -- HGETDEL / HGETEX family (phase 199 / issue #110) ----------------------

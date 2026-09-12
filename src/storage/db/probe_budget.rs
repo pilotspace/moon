@@ -834,7 +834,6 @@ fn sadd_on_a_wrongtype_key_still_bumps_the_version_moon940() {
     );
 }
 
-
 // ── HSET / HDEL: the hash family's probe budget (moon#942) ──────────────────
 
 #[test]
@@ -913,7 +912,10 @@ fn hdel_costs_one_key_probe_per_command_not_two_per_field() {
         seed.push(bulk(&format!("f{i}")));
         seed.push(bulk(&format!("v{i}")));
     }
-    assert_eq!(crate::command::hash::hset(&mut db, &seed), Frame::Integer(8));
+    assert_eq!(
+        crate::command::hash::hset(&mut db, &seed),
+        Frame::Integer(8)
+    );
 
     let one = [bulk("h"), bulk("f0")];
     let (r, single) = probes(|| crate::command::hash::hdel(&mut db, &one));
@@ -931,14 +933,21 @@ fn hdel_costs_one_key_probe_per_command_not_two_per_field() {
 
     assert_eq!(
         (single, triple, missed),
-        (2, 2, 1),
+        (1, 1, 1),
         "HDEL probe budget moved (single={single}, triple={triple}, \
-         missed={missed}) — moon#942. HDEL must cost ONE accessor for the \
-         whole command: one lookup to reach the hash, one to stamp it, and \
-         the per-field work inside the container where Redis does it. It \
-         used to be 2 per field (`hash_delete_field`'s own `get_mut` plus \
-         `stamp_hash_field_mutation`'s), so a three-field HDEL hashed the \
-         key SIX times. An all-miss batch stamps nothing and so pays one."
+         missed={missed}) — moon#942. HDEL costs ONE DashTable probe for the \
+         whole command, whatever the batch size: the fields are walked inside \
+         the handle that one lookup already holds, which is where Redis does \
+         them too, and `stamp_mutation` runs on that same handle instead of \
+         re-finding the entry.\n\
+         \n\
+         It used to be TWO probes per FIELD — `hash_delete_field`'s own \
+         `data.get_mut` plus `stamp_hash_field_mutation`'s — so a three-field \
+         HDEL hashed the key six times and an all-miss three-field batch \
+         still hashed it three. The RED commit asserted 2 here, expecting the \
+         stamp to stay a second lookup; folding it into the same handle made \
+         it 1, so this is TIGHTER than the target it was written against, not \
+         looser. A RISE is the regression this test exists to catch."
     );
 }
 
@@ -957,7 +966,10 @@ fn hdel_bumps_the_watch_version_exactly_once_per_command() {
         seed.push(bulk(&format!("f{i}")));
         seed.push(bulk(&format!("v{i}")));
     }
-    assert_eq!(crate::command::hash::hset(&mut db, &seed), Frame::Integer(8));
+    assert_eq!(
+        crate::command::hash::hset(&mut db, &seed),
+        Frame::Integer(8)
+    );
 
     let v0 = version_of(&db, b"h");
     assert_eq!(
