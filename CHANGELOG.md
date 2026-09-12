@@ -8,6 +8,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Creating a counter with `INCR` costs 2 key lookups, not 5** (moon#942).
+  The in-place fast path added for `INCR`/`INCRBY`/`DECR`/`DECRBY` made the
+  *hot* counter cost one `DashTable` probe — Redis's single `lookupKeyWrite` —
+  but made the *absent* one cost five, up from four: its declined `get_mut`
+  was spent before `incrby_general` started over with `Database::get`
+  (classify + cold guard + re-probe) and `Database::set`. The module docs
+  called that a deliberate trade on the theory that a counter is created once
+  and incremented many times. True in production; false in the instrument this
+  work is measured on — `scripts/bench-ab-matrix.sh` seeds only `key:*` and
+  `set:*`, so all 100k of its `ctr:*` keys are created by the benchmark
+  itself, which is essentially every `INCR` at p=1 and about a quarter of them
+  at p=8.
+
+  `Database::incr_string` (was `incr_hot_string_in_place`) now owns the create
+  as well. It fabricates nothing until `promote_cold_known_absent` has ruled
+  out **both** the in-flight spill plane and the cold tier — the same method
+  the container accessors use, whose precondition is discharged by the
+  `get_mut` immediately above it — and hands a key that really was promoted
+  straight back to the general path, which re-reads it.
+
+  **Measured with the `cfg(test)` DashTable key-lookup counter**, over the
+  whole `INCR` command rather than the storage method (a decline whose
+  fallback costs four more probes is invisible at method level — that is how
+  this one got in):
+
+  | `INCR` arm | before | after |
+  |---|---:|---:|
+  | hot, live, integer | 1 | 1 |
+  | **absent from every plane** | **5** | **2** |
+  | present but TTL-expired | 3 | 3 |
+
+  A probe count is a count, not a throughput claim, and this entry makes none:
+  PERF-08 (moon#789) measured a probe reduction at +11% on aarch64 and −17% on
+  x86_64 — the two architectures disagreed in *sign*. The wall-clock question
+  belongs to a Linux bench host.
+
 - **`SADD` on a hashtable set stops paying for a second accessor: 4 key
   lookups → 2** (moon#942). `get_or_create_set_listpack` answered `Ok(None)`
   for a set that was already an `IndexSet` — or a `SetIntset` the moon#899

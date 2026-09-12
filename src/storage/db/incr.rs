@@ -17,7 +17,7 @@
 //! ```
 //!
 //! Redis's `incrDecrCommand` does **one** `lookupKeyWrite` and then updates
-//! `o->ptr` in place. [`Database::incr_hot_string_in_place`] is moon's
+//! `o->ptr` in place. [`Database::incr_string`] is moon's
 //! equivalent: one `get_mut` probe, one `CompactValue` assignment, and the
 //! bookkeeping `Database::set` would have done — no re-hash of the key, no
 //! `CompactKey` copy, no `Entry` rebuild.
@@ -55,29 +55,53 @@
 //! path changes neither, which is why every error outcome must keep returning
 //! `Frame::Error`.
 //!
-//! The two cases the fast path refuses ([`IncrOutcome::NotHot`]) are the ones
-//! where those "N/A"s stop holding: an absent key (the value may be in the
-//! cold tier or the in-flight spill plane — fabricating a `0` here would
-//! destroy it), and a TTL-expired key (still physically in the `DashTable`;
+//! The one case this module refuses ([`IncrOutcome::NotHot`]) is a key that is
+//! physically present but TTL-expired: it is still in the `DashTable`, and
 //! taking it in place would resurrect a dead value and keep its stale
-//! deadline). Both fall back to the original `get` + `set` pair, which is
-//! already correct for them.
+//! deadline. That falls back to the original `get` + `set` pair, which owns
+//! `note_lazy_expired` and is already correct for it.
 //!
-//! # What the fallback costs
+//! # The absent key
 //!
-//! Stated so it is not discovered later: a refused call has already spent its
-//! `get_mut` probe, so `INCR` on an **absent** key now costs 5 `DashTable`
-//! probes where it used to cost 4 (and 3 instead of 2 on a TTL-expired one).
-//! That is the deliberate trade — a counter is created once and incremented
-//! many times, and the alternative (fabricating the key here) would have to
-//! re-implement cold-tier promotion and in-flight-spill rehydration, which is
-//! exactly how a spilled counter gets silently reset to zero.
+//! An absent counter is **created here**, and the reason that is safe is worth
+//! stating precisely, because getting it wrong resets a spilled counter to
+//! zero (#459's failure mode with an `INCR` on the front).
+//!
+//! "Absent from `self.data`" is not "absent". The value may be parked on the
+//! in-flight spill plane or sitting in the cold tier, and fabricating a `0`
+//! for either destroys it. So the create branch does not fabricate anything
+//! until [`Database::promote_cold_known_absent`] has answered **both** of those
+//! planes — the same method `accessors::settle_not_live` uses, whose
+//! precondition ("the caller has just established the key is not in the hot
+//! plane") is discharged by the `get_mut` immediately above it. When it
+//! promotes, this module hands the key straight back to the general path,
+//! which re-reads the now-hot value. Only when it answers `false` — no
+//! in-flight record, no cold-index entry — is the key absent from every plane
+//! moon has, and only then is `0 + delta` the right answer.
+//!
+//! The probe budget for the three shapes, pinned in
+//! `mod incr_probe_budget_942` below and counted over the whole command:
+//!
+//! | key | probes |
+//! |---|---:|
+//! | hot, live, integer | 1 |
+//! | absent from every plane | 2 |
+//! | present but TTL-expired | 3 |
+//!
+//! The first revision of this module returned `NotHot` for an absent key and
+//! let `incrby_general` start over, which cost **5**: the declined `get_mut`,
+//! then `Database::get`'s classify + cold guard + re-probe, then
+//! `Database::set`. That was stated in these docs as a deliberate trade on the
+//! theory that a counter is created once and incremented many times — true in
+//! production, false in the instrument this campaign is measured on.
+//! `scripts/bench-ab-matrix.sh` seeds only `key:*` and `set:*`, so every one of
+//! its 100k `ctr:*` keys is created by the benchmark itself.
 
 use crate::storage::compact_value::CompactValue;
 use crate::storage::db::{Database, stamp_mutation};
-use crate::storage::entry::LFU_INIT_VAL;
+use crate::storage::entry::{Entry, LFU_INIT_VAL};
 
-/// What [`Database::incr_hot_string_in_place`] did.
+/// What [`Database::incr_string`] did.
 ///
 /// Deliberately NOT a `Frame`: the storage layer does not build replies, and
 /// the two error strings differ between "not an integer" and "would
@@ -94,26 +118,32 @@ pub(crate) enum IncrOutcome {
     /// `current + delta` does not fit `i64`. **Nothing was written** — Redis
     /// leaves the counter at its old value on overflow, and so does this.
     Overflow,
-    /// The key is not hot-and-live (absent, or present but TTL-expired). The
-    /// caller must fall back to the general `get` + `set` path, which owns
-    /// cold-tier promotion, in-flight-spill rehydration, lazy-expiry
-    /// bookkeeping and key creation.
+    /// The key needs the general `get` + `set` path. Two shapes reach here:
+    /// a key that is physically present but TTL-expired (whose lazy-expiry
+    /// bookkeeping lives in `Database::get`), and a key that was absent from
+    /// hot RAM but has just been promoted back into it from the cold tier or
+    /// the in-flight spill plane. **Nothing was written** in the first case;
+    /// in the second, only the promotion itself.
     NotHot,
 }
 
 impl Database {
-    /// Add `delta` to the integer string stored at `key`, mutating the stored
-    /// value **in place** — one `DashTable` probe, no `Entry` rebuild, no
-    /// re-hash of the key.
+    /// Add `delta` to the integer counter at `key`.
     ///
-    /// Returns [`IncrOutcome::NotHot`] without touching anything when the key
-    /// is absent or expired; see the module docs for why those two cases are
-    /// deliberately refused rather than handled here.
+    /// A counter that is already hot, already a string and already an `i64` is
+    /// mutated **in place** — one `DashTable` probe, no `Entry` rebuild, no
+    /// re-hash of the key. An absent one is created after (and only after)
+    /// [`Database::promote_cold_known_absent`] has ruled out the cold tier and
+    /// the in-flight spill plane — two probes. See the module docs for the
+    /// budget and for why the absent branch cannot simply fabricate a `0`.
+    ///
+    /// Returns [`IncrOutcome::NotHot`] for the two shapes the general path
+    /// owns; see that variant's docs.
     ///
     /// Every error outcome leaves the keyspace **bit-for-bit unchanged** —
     /// no version bump (moon#926/#940: a failed CAS must not abort a watching
     /// transaction), no `record_keyspace_change`, no ledger movement.
-    pub(crate) fn incr_hot_string_in_place(&mut self, key: &[u8], delta: i64) -> IncrOutcome {
+    pub(crate) fn incr_string(&mut self, key: &[u8], delta: i64) -> IncrOutcome {
         let now_ms = self.cached_now_ms;
         let now_secs = self.cached_now;
 
@@ -121,7 +151,7 @@ impl Database {
         // `Database::get` (whose NLL re-probe at `kv_ops.rs:36` this path
         // avoids entirely) nothing here re-hashes the key.
         let Some(entry) = self.data.get_mut(key) else {
-            return IncrOutcome::NotHot;
+            return self.incr_absent(key, delta, now_ms, now_secs);
         };
         if entry.is_expired_at(now_ms) {
             // Physically present, logically gone. `Database::get` hides it and
@@ -207,6 +237,49 @@ impl Database {
         self.adjust_memory(old_cost, new_cost);
 
         IncrOutcome::Applied(new_val)
+    }
+
+    /// `key` was just proven absent from the hot plane by the caller's
+    /// `get_mut`. Decide what that means and act on it.
+    ///
+    /// # Precondition
+    ///
+    /// `key` MUST be absent from `self.data` on entry — this is
+    /// [`Database::promote_cold_known_absent`]'s own load-bearing precondition,
+    /// not a performance nicety: that method's in-flight arm calls
+    /// `Database::set` without re-checking residency, so calling it on a key
+    /// that is hot *and* mid-spill would overwrite the live value with the
+    /// older spilled body. The only caller is the `else` arm of the `get_mut`
+    /// in [`Database::incr_string`], which has just looked.
+    fn incr_absent(&mut self, key: &[u8], delta: i64, now_ms: u64, now_secs: u32) -> IncrOutcome {
+        if self.promote_cold_known_absent(key, now_ms) {
+            // The key was in the cold tier or on the in-flight spill plane and
+            // is hot again. Its real value is whatever was promoted, which is
+            // emphatically not zero — hand it to the general path, which
+            // re-reads it. Rare by construction (a counter has to have been
+            // evicted first) and correctness, not speed, decides it.
+            return IncrOutcome::NotHot;
+        }
+
+        // Absent from every plane moon has. `0 + delta` cannot overflow, so
+        // there is no error outcome on this branch.
+        //
+        // Byte-for-byte the `None => (0, 0)` arm of `incrby_general`: no
+        // expiry (there is no key to carry one from), the shard-cached clock,
+        // and the LFU counter `Entry::new_string_from_slice` already seeds —
+        // set explicitly so a change to that default cannot silently move
+        // which keys the evictor picks.
+        let mut itoa_buf = itoa::Buffer::new();
+        let mut entry = Entry::new_string_from_slice(itoa_buf.format(delta).as_bytes());
+        entry.set_last_access(now_secs);
+        entry.set_access_counter(LFU_INIT_VAL);
+        // `set` owns every side effect of a CREATE — `next_birth_version`, the
+        // ledger charge, the expiry index, `record_keyspace_change`, the
+        // in-flight retirement. None of it is re-implemented here; the
+        // in-place branch above only hand-rolls the UPDATE arm, where the
+        // entry already exists.
+        self.set(key, entry);
+        IncrOutcome::Applied(delta)
     }
 }
 
@@ -310,7 +383,7 @@ mod incr_in_place_942 {
 
         let mut got_db = Database::new();
         seed(&mut got_db);
-        let got_res = match got_db.incr_hot_string_in_place(key, delta) {
+        let got_res = match got_db.incr_string(key, delta) {
             IncrOutcome::Applied(n) => Ok(n),
             IncrOutcome::NotInteger => Err("not-integer"),
             IncrOutcome::WrongType => Err("wrongtype"),
@@ -364,10 +437,7 @@ mod incr_in_place_942 {
         db.set(b"ctr", Entry::new_string(Bytes::from_static(b"0")));
         let mut prev = db.get_version(b"ctr");
         for i in 1..=64 {
-            assert!(matches!(
-                db.incr_hot_string_in_place(b"ctr", 1),
-                IncrOutcome::Applied(_)
-            ));
+            assert!(matches!(db.incr_string(b"ctr", 1), IncrOutcome::Applied(_)));
             let now = db.get_version(b"ctr");
             assert_eq!(
                 now,
@@ -390,7 +460,7 @@ mod incr_in_place_942 {
             let mut db = Database::new();
             db.set(b"ctr", Entry::new_string(Bytes::copy_from_slice(seed)));
             let before = observe(&db, b"ctr");
-            let r = db.incr_hot_string_in_place(b"ctr", delta);
+            let r = db.incr_string(b"ctr", delta);
             assert!(
                 matches!(r, IncrOutcome::NotInteger | IncrOutcome::Overflow),
                 "{label}: expected an error outcome, got {r:?}"
@@ -409,10 +479,7 @@ mod incr_in_place_942 {
         let mut db = Database::new();
         db.set(b"ctr", Entry::new_list());
         let before = observe(&db, b"ctr");
-        assert!(matches!(
-            db.incr_hot_string_in_place(b"ctr", 1),
-            IncrOutcome::WrongType
-        ));
+        assert!(matches!(db.incr_string(b"ctr", 1), IncrOutcome::WrongType));
         assert_eq!(before, observe(&db, b"ctr"));
     }
 
@@ -426,10 +493,7 @@ mod incr_in_place_942 {
             Entry::new_string(Bytes::from_static(b"999999999990")),
         );
         for step in 0..40 {
-            assert!(matches!(
-                db.incr_hot_string_in_place(b"ctr", 1),
-                IncrOutcome::Applied(_)
-            ));
+            assert!(matches!(db.incr_string(b"ctr", 1), IncrOutcome::Applied(_)));
             let running = db.used_memory;
             db.recalculate_memory();
             assert_eq!(
@@ -439,7 +503,7 @@ mod incr_in_place_942 {
         }
         for step in 0..40 {
             assert!(matches!(
-                db.incr_hot_string_in_place(b"ctr", -1),
+                db.incr_string(b"ctr", -1),
                 IncrOutcome::Applied(_)
             ));
             let running = db.used_memory;
@@ -478,7 +542,7 @@ mod incr_in_place_942 {
         );
         db.maybe_has_expiring_keys = false;
         assert!(matches!(
-            db.incr_hot_string_in_place(b"ctr", 1),
+            db.incr_string(b"ctr", 1),
             IncrOutcome::Applied(42)
         ));
         assert!(
@@ -498,7 +562,7 @@ mod incr_in_place_942 {
         );
         db.set_cached_now_ms_for_test(deadline + 1);
         assert!(
-            matches!(db.incr_hot_string_in_place(b"ctr", 1), IncrOutcome::NotHot),
+            matches!(db.incr_string(b"ctr", 1), IncrOutcome::NotHot),
             "an expired entry is still IN the DashTable — taking it in place \
              would resurrect a dead value and keep its stale TTL"
         );
@@ -527,10 +591,7 @@ mod incr_in_place_942 {
         // Second touch, in place. Same proof as `set`'s `Updated` arm: a
         // second write to a cold-shadowed key proves the shadow stale, and
         // leaving it behind resurrects the old value across a restart.
-        assert!(matches!(
-            db.incr_hot_string_in_place(b"ctr", 1),
-            IncrOutcome::Applied(2)
-        ));
+        assert!(matches!(db.incr_string(b"ctr", 1), IncrOutcome::Applied(2)));
         assert!(
             db.cold_index.as_ref().unwrap().lookup(b"ctr").is_none(),
             "the in-place path must invalidate the now-stale cold shadow"
@@ -558,10 +619,7 @@ mod incr_in_place_942 {
             },
         );
         assert!(!db.spill_inflight_is_empty());
-        assert!(matches!(
-            db.incr_hot_string_in_place(b"ctr", 1),
-            IncrOutcome::Applied(2)
-        ));
+        assert!(matches!(db.incr_string(b"ctr", 1), IncrOutcome::Applied(2)));
         assert!(
             db.spill_inflight_is_empty(),
             "the in-place path must retire the in-flight spill record, or its \
@@ -585,10 +643,7 @@ mod incr_in_place_942 {
         let mut db = Database::new();
         db.set(b"ctr", Entry::new_string(Bytes::from_static(b"1")));
         db.data.get_mut(b"ctr").unwrap().set_last_access(0);
-        assert!(matches!(
-            db.incr_hot_string_in_place(b"ctr", 1),
-            IncrOutcome::Applied(2)
-        ));
+        assert!(matches!(db.incr_string(b"ctr", 1), IncrOutcome::Applied(2)));
         assert_eq!(
             db.data.get(b"ctr").unwrap().last_access(),
             db.now(),
@@ -604,10 +659,7 @@ mod incr_in_place_942 {
         let mut db = Database::new();
         db.set(b"ctr", Entry::new_string(Bytes::from_static(b"1")));
         db.data.get_mut(b"ctr").unwrap().set_access_counter(200);
-        assert!(matches!(
-            db.incr_hot_string_in_place(b"ctr", 1),
-            IncrOutcome::Applied(2)
-        ));
+        assert!(matches!(db.incr_string(b"ctr", 1), IncrOutcome::Applied(2)));
         assert_eq!(
             db.data.get(b"ctr").unwrap().access_counter(),
             5,
@@ -660,20 +712,82 @@ mod incr_in_place_942 {
         );
     }
 
-    // ── The absent key: fabricating it here would skip the cold tier ───────
+    // ── The absent key: created here, but only after both other planes ─────
 
+    /// The counter that is genuinely nowhere. Creating it here must be
+    /// observationally identical to what `incrby_general`'s `None => (0, 0)`
+    /// arm produced — value, version, LFU counter, ledger and all.
     #[test]
-    fn an_absent_key_is_left_to_the_slow_path() {
+    fn an_absent_key_is_created_exactly_as_the_set_path_created_it() {
+        differential("absent +1", |_db| {}, 1);
+        differential("absent -1", |_db| {}, -1);
+        differential("absent +0", |_db| {}, 0);
+        differential("absent large", |_db| {}, i64::MAX);
+        differential("absent min", |_db| {}, i64::MIN);
+    }
+
+    /// Creating a counter that carries a cold-index entry must land in exactly
+    /// the state `incrby_general` left it in — including the cold shadow,
+    /// which `Database::set`'s **Inserted** arm deliberately leaves in place
+    /// (a first touch is ambiguous; see
+    /// `an_in_place_incr_drops_the_stale_cold_shadow` for the Updated arm,
+    /// which does clear it).
+    ///
+    /// This asserts PARITY, not a rule of its own. An earlier revision of this
+    /// test asserted that a created key must leave no shadow behind; it went
+    /// red against the pre-existing behaviour of both paths, which is the
+    /// test being wrong, not the code.
+    ///
+    /// There is no cold *file* behind the index entry here, so the read fails
+    /// and both paths fall through to a create. The arm that proves the
+    /// promotion planes are genuinely consulted is
+    /// `an_in_flight_key_is_handed_back_not_created` below, whose payload is
+    /// in RAM and therefore really does come back.
+    #[test]
+    fn a_cold_shadowed_key_is_created_exactly_as_the_set_path_created_it() {
+        differential(
+            "cold-shadowed absent",
+            |db: &mut Database| {
+                let mut ci = ColdIndex::new();
+                ci.insert(
+                    Bytes::from_static(b"ctr"),
+                    ColdLocation {
+                        file_id: 1,
+                        page_idx: 0,
+                        slot_idx: 0,
+                        ttl_ms: None,
+                        value_type: crate::persistence::kv_page::ValueType::String,
+                    },
+                );
+                db.cold_index = Some(ci);
+            },
+            1,
+        );
+    }
+
+    /// A key parked on the in-flight spill plane is in no plane `data` can
+    /// see. The create branch must hand it back, not invent a `1` for it.
+    #[test]
+    fn an_in_flight_key_is_handed_back_not_created() {
+        use crate::storage::db::PendingSpill;
         let mut db = Database::new();
-        assert!(
-            matches!(db.incr_hot_string_in_place(b"nope", 1), IncrOutcome::NotHot),
-            "a miss must fall back: the key may be sitting in the cold tier \
-             or the in-flight spill plane, and fabricating a 0 here would \
-             destroy it"
+        db.spill_inflight_mark(
+            Bytes::from_static(b"ctr"),
+            PendingSpill {
+                req_id: 1,
+                value_type: crate::persistence::kv_page::ValueType::String,
+                value_bytes: Bytes::from_static(b"41"),
+                ttl_ms: None,
+            },
         );
         assert!(
-            db.data.get(b"nope").is_none(),
-            "the fast path must not create"
+            matches!(db.incr_string(b"ctr", 1), IncrOutcome::NotHot),
+            "a promoted key belongs to the general path, which re-reads it"
+        );
+        assert_eq!(
+            db.data.get(b"ctr").and_then(|e| e.value.as_bytes()),
+            Some(&b"41"[..]),
+            "the promotion must have restored 41, not fabricated anything"
         );
     }
 }

@@ -385,17 +385,20 @@ const ERR_WRONGTYPE: &[u8] = b"WRONGTYPE Operation against a key holding the wro
 ///
 /// moon#942: the common case — a counter that is already hot, already a
 /// string, and already an `i64` — is mutated **in place**
-/// ([`Database::incr_hot_string_in_place`]), the way Redis's
-/// `incrDecrCommand` rewrites `o->ptr`. That is one `DashTable` probe against
-/// the three the `get` + `set` pair below costs, and it rebuilds no `Entry`.
-/// The storage method owns every side effect `Database::set` would have had;
-/// see `src/storage/db/incr.rs` for the enumeration and the per-item decision.
+/// ([`Database::incr_string`]), the way Redis's `incrDecrCommand` rewrites
+/// `o->ptr`. That is one `DashTable` probe against the three the `get` + `set`
+/// pair below costs, and it rebuilds no `Entry`. An absent counter is created
+/// there too, for two probes, once the cold tier and the in-flight spill plane
+/// have both been ruled out. The storage method owns every side effect
+/// `Database::set` would have had; see `src/storage/db/incr.rs` for the
+/// enumeration and the per-item decision.
 ///
-/// Everything the fast path refuses — an absent key (which may be in the cold
-/// tier or the in-flight spill plane), and a TTL-expired one — falls through
-/// to [`incrby_general`] unchanged.
+/// What still falls through to [`incrby_general`] ([`IncrOutcome::NotHot`]):
+/// a TTL-expired key, whose `note_lazy_expired` bookkeeping lives in
+/// `Database::get`, and a key that was just promoted back out of the cold tier
+/// or the spill plane, whose real value has to be re-read.
 fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
-    match db.incr_hot_string_in_place(key, delta) {
+    match db.incr_string(key, delta) {
         IncrOutcome::Applied(new_val) => {
             // "incrby", not "incr": Redis names the internal operation, not
             // the command the client typed, so INCR/DECR/INCRBY/DECRBY all
@@ -419,9 +422,10 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
 /// rehydration and lazy-expiry bookkeeping all live behind `Database::get`,
 /// and the write is a whole-`Entry` replacement through `Database::set`.
 ///
-/// Reached only when [`Database::incr_hot_string_in_place`] declined
-/// ([`IncrOutcome::NotHot`]): the key is absent from hot RAM, or present but
-/// TTL-expired.
+/// Reached only when [`Database::incr_string`] declined
+/// ([`IncrOutcome::NotHot`]): the key is present but TTL-expired, or it has
+/// just been promoted back into hot RAM from the cold tier or the in-flight
+/// spill plane and its real value has to be re-read.
 fn incrby_general(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
     // Get current value and existing expiry
     let (current, existing_expiry_ms) = match db.get(key) {
