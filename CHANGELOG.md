@@ -49,6 +49,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`test`: a DashTable key-lookup counter and a probe budget for the storage
+  accessors (moon#942).** `DashTable`'s six lookup entry points (`get`,
+  `get_mut`, `insert`, `insert_or_update`, `remove`, `remove_entry`) now record
+  a per-thread count under `cfg(test)`, behind the same `#[cfg(not(test))]`
+  `#[inline(always)]` no-op that moon#789 established for `note_simd_probe` —
+  zero production cost, in the hottest lookups in the codebase. It is
+  deliberately COARSER than `segment::take_simd_probes`: that one counts
+  control-byte group scans and varies with a segment's fill, this one counts how
+  many times a caller hashes a key and walks a segment at all, which is a
+  property of the *accessor* rather than of the table.
+
+  `storage::db::probe_budget` pins the measured budget of every `get_or_create*`
+  / `get_promoted` / `get_mut_if_present` accessor and of `SADD` end to end, on
+  a hit and on a miss. The baseline it records is **measured, not read off the
+  moon#942 audit — which undercounted `get_or_create`'s miss path by one**
+  (`promote_cold_if_present` opens with its own `contains_key`):
+
+  | accessor | hit | miss |
+  |---|---:|---:|
+  | `get_or_create` | 3 | 6 |
+  | `get_mut_if_present` | 3 | 4 |
+  | `get_promoted` | 4 | 5 |
+  | `get_or_create_intset` / `_hash_listpack` / `_list_listpack` / `_zset_listpack` | 3 | 6 |
+  | `get_or_create_set_listpack` | 4 | 7 |
+  | `SADD` end to end (listpack / hashtable regime) | 4 | 7 |
+
+  Redis reaches all of these with one `dictFind`. **No throughput claim is made
+  or implied**: the counter exists precisely *because* moon#789 measured the
+  last probe-count change at +11% on aarch64 and −17% on x86_64 — the two
+  architectures disagreed in sign — and because `b3083c5a` found the wall-clock
+  net for it was timing a page-fault artifact. A probe count is a structural
+  fact; only a Linux benchmark host may speak about time.
+
 - `scripts/bench-ab-delta.py` — compares moon against **moon** across two
   matrix runs, which `bench-ab-report.py` cannot do. Redis is the control: the
   tool picks the raw or the ratio column per row from the control's own

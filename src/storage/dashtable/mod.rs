@@ -42,6 +42,53 @@ pub fn hash_key(key: &[u8]) -> u64 {
     xxhash_rust::xxh64::xxh64(key, 0)
 }
 
+// Per-thread count of DashTable KEY LOOKUPS (test builds only).
+//
+// One "lookup" is one entry point that computes `hash_key`, routes through the
+// directory and walks a segment: `get`, `get_mut`, `insert`, `insert_or_update`,
+// `remove` and `remove_entry`. `contains_key` delegates to `get` and is
+// therefore counted once, not twice. A split-and-retry inside `insert` /
+// `insert_or_update` genuinely re-probes and is counted again.
+//
+// This is COARSER than `segment::take_simd_probes`, deliberately. The SIMD
+// counter measures control-byte GROUP SCANS, which vary with a segment's
+// occupancy and pin PERF-08's fusion claim. This one measures how many times a
+// caller hashes a key and walks a segment at all — the quantity the moon#942
+// accessor audit is about, and the only one that is a property of the ACCESSOR
+// rather than of the table's current fill.
+//
+// Plain `//` comments, not `///`: a doc comment on a macro invocation trips
+// `unused_doc_comments`, which is denied in CI.
+//
+// Compiles to nothing outside `cfg(test)` — it sits in the hottest lookups in
+// the codebase (moon#789 set this precedent for `note_simd_probe`).
+#[cfg(test)]
+thread_local! {
+    static KEY_LOOKUPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Record one DashTable key lookup. No-op outside test builds.
+#[cfg(test)]
+#[inline]
+fn note_key_lookup() {
+    KEY_LOOKUPS.with(|c| c.set(c.get() + 1));
+}
+
+/// No-op in non-test builds — zero production cost.
+#[cfg(not(test))]
+#[inline(always)]
+fn note_key_lookup() {}
+
+/// Read and reset the per-thread key-lookup counter.
+///
+/// `pub(crate)` so the storage accessors' probe-budget tests
+/// (`storage::db::probe_budget`) can measure a whole accessor call, which is
+/// where moon#942's probe budget actually lives.
+#[cfg(test)]
+pub(crate) fn take_key_lookups() -> u32 {
+    KEY_LOOKUPS.with(|c| c.replace(0))
+}
+
 /// Issue a software prefetch hint for a segment's memory.
 ///
 /// Called after computing the segment index but before computing h2/home_buckets.
@@ -376,6 +423,7 @@ impl<V> DashTable<CompactKey, V> {
 
     /// Look up a key and return an immutable reference to its value.
     pub fn get(&self, key: &[u8]) -> Option<&V> {
+        note_key_lookup();
         let hash = hash_key(key);
         let dir_idx = segment_index(hash, self.depth);
         let seg_idx = self.directory[dir_idx];
@@ -390,6 +438,7 @@ impl<V> DashTable<CompactKey, V> {
 
     /// Look up a key and return a mutable reference to its value.
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut V> {
+        note_key_lookup();
         let hash = hash_key(key);
         let dir_idx = segment_index(hash, self.depth);
         let seg_idx = self.directory[dir_idx];
@@ -409,6 +458,7 @@ impl<V> DashTable<CompactKey, V> {
 
     /// Insert a key-value pair. Returns `Some(old_value)` if the key existed.
     pub fn insert(&mut self, key: CompactKey, value: V) -> Option<V> {
+        note_key_lookup();
         let hash = hash_key(key.as_ref());
         let dir_idx = segment_index(hash, self.depth);
         let seg_idx = self.directory[dir_idx];
@@ -455,6 +505,7 @@ impl<V> DashTable<CompactKey, V> {
         F: FnOnce(&mut V),
         G: FnOnce() -> V,
     {
+        note_key_lookup();
         let hash = hash_key(key.as_ref());
         let dir_idx = segment_index(hash, self.depth);
         let seg_idx = self.directory[dir_idx];
@@ -549,6 +600,7 @@ impl<V> DashTable<CompactKey, V> {
     ///
     /// Matches HashMap's `remove` semantics: returns only the value, dropping the key.
     pub fn remove(&mut self, key: &[u8]) -> Option<V> {
+        note_key_lookup();
         let hash = hash_key(key);
         let dir_idx = segment_index(hash, self.depth);
         let seg_idx = self.directory[dir_idx];
@@ -571,6 +623,7 @@ impl<V> DashTable<CompactKey, V> {
     /// Remove a key and return both key and value.
     #[allow(dead_code)]
     pub fn remove_entry(&mut self, key: &[u8]) -> Option<(CompactKey, V)> {
+        note_key_lookup();
         let hash = hash_key(key);
         let dir_idx = segment_index(hash, self.depth);
         let seg_idx = self.directory[dir_idx];
