@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`ZADD` parses each score argument once instead of twice** (moon#942).
+  moon#814's validation pre-pass — which must keep proving every pair before
+  the keyspace is touched, because the mutation loop returns from inside the
+  `table_before … charge_memory()` window — threw every decoded `f64` away, and
+  the loop then re-ran `str::parse::<f64>` over the same bytes. Redis's
+  `zaddGenericCommand` parses once into its own `scores` array. The pre-pass
+  now keeps what it decodes, in a fixed 32-entry stack array: `src/command/`
+  forbids the heap allocation a `SmallVec` spill would make, so a batch larger
+  than that re-parses in the loop exactly as before.
+
+  **Measured with a `cfg(test)` counter on the parse itself**: a one-pair
+  `ZADD` went from **2 parses to 1**, a four-pair batch from **8 to 4**. A call
+  count is not a throughput claim and this entry makes none (PERF-08, moon#789).
+
+  The all-or-nothing contract is unchanged and guarded:
+  `a_rejected_batch_still_validates_every_pair_before_the_keyspace` asserts that
+  a bad pair anywhere still errors and still leaves the key uncreated — the one
+  thing caching the pre-pass's output could have broken.
+
 - **An integral sorted-set score is no longer rendered by `core::fmt`'s `f64`
   Display** (moon#942). Every score moon stored in a listpack, replied to a
   client, or wrote to an RDB went through `write!("{score}")` — the

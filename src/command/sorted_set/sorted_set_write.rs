@@ -19,14 +19,25 @@ use super::{
 // Write commands (mutate the database)
 // ---------------------------------------------------------------------------
 
+/// How many `score member` pairs of one `ZADD` are carried from the moon#814
+/// validation pre-pass to the mutation loop in a stack array.
+///
+/// A fixed array rather than a `SmallVec` because `src/command/` forbids the
+/// heap allocation a spill would make: past this many pairs the loop re-parses
+/// exactly as it always did, which is correct, just not free. 32 pairs covers
+/// the benchmark's one and every batch an application realistically sends, and
+/// costs 256 bytes of a shard thread's stack.
+const ZADD_INLINE_PAIRS: usize = 32;
+
 /// Parse one `score member` pair of a `ZADD`.
 ///
-/// The single source of truth for what `ZADD` accepts. Both the validation
-/// pre-pass and the mutation loop call it, and that is load-bearing rather
-/// than tidy: the moment the two disagree — the pre-pass accepting something
-/// the loop then rejects — moon#814 returns, because the loop's error arms
-/// return from inside the `table_before … charge_memory()` window and strand
-/// the charge for every member already inserted.
+/// The single source of truth for what `ZADD` accepts. The validation pre-pass
+/// calls it for every pair, and the mutation loop calls it again for any batch
+/// too large to cache — and that shared definition is load-bearing rather than
+/// tidy: the moment the two disagree — the pre-pass accepting something the
+/// loop then rejects — moon#814 returns, because the loop's error arms return
+/// from inside the `table_before … charge_memory()` window and strand the
+/// charge for every member already inserted.
 #[inline]
 fn parse_zadd_pair<'a>(
     score_arg: &Frame,
@@ -47,6 +58,33 @@ fn parse_zadd_pair<'a>(
         return Err(err("ERR value is not a valid float"));
     }
     Ok((score, member))
+}
+
+/// The pair at `idx`, taking the score from the pre-pass's cache when it fits
+/// and re-parsing when it does not (moon#942).
+///
+/// Neither arm can fail for a batch the pre-pass accepted; both are kept as
+/// real `Result`s anyway, because a bare `unwrap` here would be the one place
+/// the validation and the mutation could silently diverge — which is exactly
+/// the moon#814 shape.
+#[inline]
+fn resolved_pair<'a>(
+    pair: &'a [Frame],
+    idx: usize,
+    cache: Option<&[f64]>,
+) -> Result<(f64, &'a Bytes), Frame> {
+    let [score_arg, member_arg] = pair else {
+        return Err(err_wrong_args("ZADD"));
+    };
+    match cache {
+        Some(scores) => {
+            let (Some(member), Some(score)) = (extract_bytes(member_arg), scores.get(idx)) else {
+                return Err(err_wrong_args("ZADD"));
+            };
+            Ok((*score, member))
+        }
+        None => parse_zadd_pair(score_arg, member_arg),
+    }
 }
 
 // A zset listpack is `[member, score, member, score, …]` — the same
@@ -138,19 +176,39 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     // all-or-nothing, and it does not create the key when the command errors —
     // which is why this sits above `get_or_create_sorted_set`.
     //
-    // Two passes rather than a parsed `Vec`: `src/command/` is a no-allocation
-    // path, and parsing an f64 twice is far cheaper than the B+tree insert it
-    // guards.
-    for pair in remaining.chunks_exact(2) {
+    // The pre-pass KEEPS what it decodes (moon#942). It used to throw every
+    // `f64` away and let the mutation loop re-run `parse_zadd_pair` over the
+    // same bytes — `str::parse::<f64>` twice per pair, where Redis's
+    // `zaddGenericCommand` parses once into its own `scores` array.
+    //
+    // A fixed stack array, not a `SmallVec`: `src/command/` forbids the
+    // allocation a spill would make, so a batch that does not fit simply
+    // re-parses in the loop exactly as before.
+    let pair_count = remaining.len() / 2;
+    let mut scores_cache = [0f64; ZADD_INLINE_PAIRS];
+    let cached = pair_count <= ZADD_INLINE_PAIRS;
+    for (idx, pair) in remaining.chunks_exact(2).enumerate() {
         let [score_arg, member_arg] = pair else {
             // `chunks_exact(2)` yields nothing else; the guard above already
             // rejected an odd tail.
             return err_wrong_args("ZADD");
         };
-        if let Err(e) = parse_zadd_pair(score_arg, member_arg) {
-            return e;
+        match parse_zadd_pair(score_arg, member_arg) {
+            Ok((score, _)) => {
+                if cached {
+                    scores_cache[idx] = score;
+                }
+            }
+            Err(e) => return e,
         }
     }
+    // What the two mutation loops below read instead of re-parsing. `None` for
+    // an oversized batch, which re-parses exactly as it always did.
+    let cache: Option<&[f64]> = if cached {
+        Some(&scores_cache[..pair_count])
+    } else {
+        None
+    };
 
     // Listpack path for small sorted sets (moon#787). Redis keeps a zset in a
     // listpack until it exceeds zset-max-listpack-entries (128) or
@@ -198,15 +256,8 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                 // Listpack `estimate_memory()` is O(1) (capacity-based), so a
                 // before/after snapshot is cheap — no per-member formula.
                 let before = lp.estimate_memory();
-                for pair in remaining.chunks_exact(2) {
-                    let [score_arg, member_arg] = pair else {
-                        return err_wrong_args("ZADD");
-                    };
-                    // Cannot fail: the pre-pass above validated every pair
-                    // with this exact function before the keyspace was
-                    // touched. Kept as a real match anyway, as the B+tree
-                    // loop below does.
-                    let (score, member) = match parse_zadd_pair(score_arg, member_arg) {
+                for (idx, pair) in remaining.chunks_exact(2).enumerate() {
+                    let (score, member) = match resolved_pair(pair, idx, cache) {
                         Ok(parsed) => parsed,
                         Err(e) => return e,
                     };
@@ -314,15 +365,8 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     // allocation is four of them.
     let table_before = zset_table_bytes(members, scores);
 
-    for pair in remaining.chunks_exact(2) {
-        let [score_arg, member_arg] = pair else {
-            return err_wrong_args("ZADD");
-        };
-        // Cannot fail: the pre-pass above validated every pair with this exact
-        // function before the keyspace was touched. Kept as a real match
-        // anyway — a bare `unwrap` here would be the one place the two passes
-        // could silently diverge.
-        let (score, member) = match parse_zadd_pair(score_arg, member_arg) {
+    for (idx, pair) in remaining.chunks_exact(2).enumerate() {
+        let (score, member) = match resolved_pair(pair, idx, cache) {
             Ok(parsed) => parsed,
             Err(e) => return e,
         };
