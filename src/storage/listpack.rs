@@ -1487,3 +1487,200 @@ mod zero_alloc_scan_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod byte_exactness_tests {
+    use super::*;
+
+    /// A listpack is a byte-exact format, not merely a container.
+    ///
+    /// It is what `DUMP`/`RESTORE` hand across the wire and what the RDB
+    /// writes to disk (`persistence::redis_rdb` emits the `*_LISTPACK` object
+    /// types verbatim), so an encoder change that still "reads back
+    /// correctly" inside this process can still be a wire-format break. The
+    /// bar is identical BYTES, and these goldens are that bar: they were
+    /// captured from the `Vec`-building encoder and committed BEFORE the
+    /// moon#942 stack-buffer rewrite, so they are an oracle for that rewrite
+    /// rather than a restatement of it.
+    ///
+    /// `007`, `000000012345`, `00`, `0000`, `+5`, `+0` and `-0` are in here
+    /// deliberately: storing `000000012345` as the integer `12345` and
+    /// reading it back as `12345` was a real data-corruption bug in this repo
+    /// (moon#795). They must stay STRING-encoded, byte for byte.
+    ///
+    /// Each value is the hex of the WHOLE listpack -- header, entry,
+    /// terminator -- after one `push_back`.
+    const GOLDEN_SINGLE_ENTRY: &[(&str, &str)] = &[
+        // --- integer encodings: every width, both signs, at each boundary
+        ("0", "0900000001000001ff"),
+        ("7", "0900000001000701ff"),
+        ("127", "0900000001007f01ff"),
+        ("128", "0a0000000100c08002ff"),
+        ("-1", "0a0000000100dfff02ff"),
+        ("4095", "0a0000000100cfff02ff"),
+        ("-4096", "0a0000000100d00002ff"),
+        ("4096", "0b0000000100f1001003ff"),
+        ("32767", "0b0000000100f1ff7f03ff"),
+        ("-32768", "0b0000000100f1008003ff"),
+        ("8388607", "0c0000000100f2ffff7f04ff"),
+        ("-8388608", "0c0000000100f200008004ff"),
+        ("2147483647", "0d0000000100f3ffffff7f05ff"),
+        ("-2147483648", "0d0000000100f30000008005ff"),
+        ("9223372036854775807", "110000000100f4ffffffffffffff7f09ff"),
+        ("-9223372036854775808", "110000000100f4000000000000008009ff"),
+        // One past i64::MAX: not an integer, so it stays a 19-byte string.
+        (
+            "9223372036854775808",
+            "1c0000000100933932323333373230333638353437373538303814ff",
+        ),
+        // --- string encodings
+        ("", "0900000001008001ff"),
+        ("abc", "0c00000001008361626304ff"),
+        ("3.5", "0c000000010083332e3504ff"),
+        (" 7", "0b000000010082203703ff"),
+        // --- moon#795: leading zeros and a leading `+` are STRINGS
+        ("007", "0c00000001008330303704ff"),
+        ("000000012345", "1500000001008c3030303030303031323334350dff"),
+        ("00", "0b000000010082303003ff"),
+        ("0000", "0d0000000100843030303005ff"),
+        ("+5", "0b0000000100822b3503ff"),
+        ("+0", "0b0000000100822b3003ff"),
+        ("-0", "0b0000000100822d3003ff"),
+    ];
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+
+    fn encoded_hex(value: &[u8]) -> String {
+        let mut lp = Listpack::new();
+        lp.push_back(value);
+        hex(&lp.data)
+    }
+
+    #[test]
+    fn single_entry_bytes_are_unchanged() {
+        for (input, want) in GOLDEN_SINGLE_ENTRY {
+            assert_eq!(
+                &encoded_hex(input.as_bytes()),
+                want,
+                "encoding of {input:?} changed"
+            );
+        }
+    }
+
+    /// Bytes, not text: the encoder must never look at a value as a string.
+    /// The 256-byte case also crosses into the 12-bit string head and the
+    /// two-byte backlen at once.
+    #[test]
+    fn non_utf8_payload_bytes_are_unchanged() {
+        assert_eq!(
+            encoded_hex(&[0x00, 0xff, 0x80, 0xfe, 0x01]),
+            "0e00000001008500ff80fe0106ff",
+            "short non-UTF8 payload changed"
+        );
+
+        let all: Vec<u8> = (0u8..=255).collect();
+        let got = encoded_hex(&all);
+        // total = 7 + (2 + 256) + 2 = 267; head = 0xE1 0x00;
+        // backlen(258) = [0x82, 0x02].
+        assert_eq!(&got[..12], "0b0100000100", "header changed");
+        assert_eq!(&got[12..16], "e100", "12-bit string head changed");
+        assert_eq!(&got[16..16 + 512], &hex(&all), "payload changed");
+        assert_eq!(&got[16 + 512..], "8202ff", "backlen/terminator changed");
+    }
+
+    /// The seams where the head width or the backlen width moves.
+    #[test]
+    fn encoding_width_seams_are_unchanged() {
+        // 63 bytes is the top of the 6-bit string head, 64 the first 12-bit
+        // one, 65 the one after.
+        assert_eq!(&encoded_hex(&vec![b'x'; 63])[12..14], "bf");
+        assert_eq!(&encoded_hex(&vec![b'y'; 64])[12..16], "e040");
+        assert_eq!(&encoded_hex(&vec![b'z'; 65])[12..16], "e041");
+
+        // 127 bytes of payload makes entry_len 129: the first two-byte
+        // backlen.
+        let seam = encoded_hex(&vec![b'p'; 127]);
+        assert_eq!(&seam[..16], "8a0000000100e07f");
+        assert_eq!(&seam[seam.len() - 6..], "8101ff");
+    }
+
+    /// The two widest encodings, checked against a head/backlen derivation
+    /// taken from the format definition rather than from the encoder -- a
+    /// literal for a 4 KB payload is 8 KB of hex that nobody can read, and
+    /// therefore nobody can check.
+    #[test]
+    fn wide_string_entries_are_unchanged() {
+        // 4095 bytes: the top of the 12-bit string encoding.
+        //   head    = 0xE0 | (4095 >> 8) = 0xEF, then 4095 & 0xFF = 0xFF
+        //   entry   = 2 + 4095 = 4097
+        //   backlen = [(4097 & 0x7F) | 0x80, 4097 >> 7] = [0x81, 0x20]
+        //   total   = 7 + 4097 + 2 = 4106
+        let mut lp = Listpack::new();
+        lp.push_back(&vec![b'q'; 4095]);
+        let mut want = Vec::new();
+        want.extend_from_slice(&4106u32.to_le_bytes());
+        want.extend_from_slice(&1u16.to_le_bytes());
+        want.extend_from_slice(&[0xEF, 0xFF]);
+        want.extend(std::iter::repeat_n(b'q', 4095));
+        want.extend_from_slice(&[0x81, 0x20, LP_TERMINATOR]);
+        assert_eq!(lp.data, want, "12-bit string encoding changed at its top");
+
+        // 4096 bytes: the first 32-bit string encoding.
+        //   head    = 0xF0, then 4096u32 LE
+        //   entry   = 5 + 4096 = 4101 -> backlen [0x85, 0x20]
+        //   total   = 7 + 4101 + 2 = 4110
+        let mut lp = Listpack::new();
+        lp.push_back(&vec![b'r'; 4096]);
+        let mut want = Vec::new();
+        want.extend_from_slice(&4110u32.to_le_bytes());
+        want.extend_from_slice(&1u16.to_le_bytes());
+        want.push(LP_ENCODING_32BIT_STR);
+        want.extend_from_slice(&4096u32.to_le_bytes());
+        want.extend(std::iter::repeat_n(b'r', 4096));
+        want.extend_from_slice(&[0x85, 0x20, LP_TERMINATOR]);
+        assert_eq!(lp.data, want, "32-bit string encoding changed");
+    }
+
+    /// The mutating operations, not just `push_back`: `push_front` writes at
+    /// the head, `replace_at` and `replace_pair_value` write in the middle,
+    /// and all of them restamp `total_bytes`. Widening, narrowing and
+    /// equal-width replacements are all here, because they are three
+    /// different tail moves.
+    #[test]
+    fn mutation_sequence_bytes_are_unchanged() {
+        let mut lp = Listpack::new();
+        lp.push_back(b"field:00");
+        lp.push_back(b"value-00");
+        lp.push_front(b"head");
+        lp.replace_at(1, b"REPLACED-LONGER"); // widen
+        lp.push_back(b"007");
+        lp.replace_at(0, b"+5"); // narrow
+        lp.replace_at(2, b"s"); // narrow
+        assert_eq!(
+            hex(&lp.data),
+            "240000000400822b35038f5245504c414345442d4c4f4e474552108173028330303704ff",
+            "push_front / replace_at byte layout changed"
+        );
+
+        // 40 field/value pairs whose values span three integer widths, then
+        // an equal-width and a narrowing `replace_pair_value`.
+        let mut lp = Listpack::new();
+        for i in 0..40 {
+            lp.push_back(format!("f{i}").as_bytes());
+            lp.push_back(format!("{}", i * 1000).as_bytes());
+        }
+        assert!(lp.replace_pair_value(b"f39", b"same-width-replacement"));
+        assert!(lp.replace_pair_value(b"f0", b"0"));
+        assert_eq!(hex(&lp.data), GOLDEN_PAIRS_40, "replace_pair_value byte layout changed");
+    }
+
+    /// Golden for `mutation_sequence_bytes_are_unchanged`'s 40-pair listpack.
+    const GOLDEN_PAIRS_40: &str = "79010000500082663003000182663103c3e80282663203c7d00282663303cbb80282663403cfa00282663503f188130382663603f170170382663703f1581b0382663803f1401f0382663903f12823038366313004f11027038366313104f1f82a038366313204f1e02e038366313304f1c832038366313404f1b036038366313504f1983a038366313604f1803e038366313704f16842038366313804f15046038366313904f1384a038366323004f1204e038366323104f10852038366323204f1f055038366323304f1d859038366323404f1c05d038366323504f1a861038366323604f19065038366323704f17869038366323804f1606d038366323904f14871038366333004f13075038366333104f11879038366333204f1007d038366333304f2e88000048366333404f2d08400048366333504f2b88800048366333604f2a08c00048366333704f2889000048366333804f27094000483663339049673616d652d77696474682d7265706c6163656d656e7417ff";
+}
