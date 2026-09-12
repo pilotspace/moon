@@ -332,6 +332,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`server`: the monoio write path stops taking a second exclusive database
+  guard just to discover it has nothing to wake (moon#942).** After `dispatch`,
+  `handler_monoio` acquired `s.databases.write(new_sel_db)` — a `guard_depth`
+  thread-local RMW plus a `parking_lot` write acquisition — on **every**
+  successful write, solely to hand a `&mut Database` to `wake_producer`. That
+  function's own first line is `producer_family(cmd)?`, which returns `None`
+  for everything outside `LPUSH`/`RPUSH`/`LMOVE`/`RPOPLPUSH`/`ZADD`/`XADD`, so
+  for `INCR`, `SADD` and `HSET` — three of the five families moon#942 targets —
+  the guard was taken, nothing happened, and it was dropped. `producer_family`
+  needs only the command NAME, so the question is now asked before the guard
+  instead of inside it. The set of `wake_producer` calls is unchanged; only
+  no-op acquisitions are gone, and the guard, when taken, is still taken on the
+  POST-dispatch database index. **No throughput number is claimed:** the
+  acquisition is uncontended at `--shards 1` and this was not measured on a
+  Linux host. The gate is `producer_family` itself and must never become a
+  hand-written list of command names — a gate narrower than the mapping is a
+  lost wakeup whose visibility depends on which shard owns the key, which is
+  moon#595 exactly. New `tests/wakeup_local_write_gate.rs` pins `BLPOP`/`LPUSH`,
+  `XREAD`/`XADD` and `BZPOPMIN`/`ZADD` at **both** 1 and 4 shards, plus an
+  `INCR`/`SADD`/`HSET` control that must wake nothing and must not error;
+  restoring the pre-#595 gate turns it red at 8/8 trials at one shard and 3/8 at
+  four, which is that routing-dependence reproduced. `handler_sharded` (tokio)
+  was checked and deliberately left alone: its single `db_guard` already spans
+  dispatch and the wake, so it never paid for the no-op.
+
 - **`storage`: the listpack write path stops walking twice and stops
   allocating per entry it walks past (moon#799).** `get_at`, `remove_at` and
   `replace_at` reached their index with the OWNED decoder, which copies every
