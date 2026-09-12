@@ -417,6 +417,44 @@ mod budget {
         );
     }
 
+    #[test]
+    fn the_listpack_identical_score_skip_is_decided_on_bytes() {
+        // The skip asks `current.eq_bytes(&rendered)`, not `old == score`, and
+        // that choice is load-bearing at exactly one point: `-0.0 == 0.0` is
+        // true while `-0` and `0` are different bytes. Redis's `zsetAdd`
+        // compares the doubles and therefore LEAVES a `0` in place when a
+        // client writes `-0`; moon has always stored whichever spelling the
+        // client sent, and this change must not quietly switch sides — a
+        // silent reply change is worse than the divergence it would fix.
+        let mut db = Database::new();
+        assert_eq!(
+            zadd(&mut db, &[bulk("z"), bulk("0"), bulk("m")]),
+            Frame::Integer(1)
+        );
+
+        // `-0` over a stored `0`: different bytes, so it is written.
+        let flip = [bulk("z"), bulk("-0"), bulk("m")];
+        let (r, b) = measure(|| zadd(&mut db, &flip));
+        assert_eq!(r, Frame::Integer(0));
+        assert_eq!(
+            b.listpack_score_writes, 1,
+            "-0 over a stored 0 must still be written"
+        );
+        assert_eq!(
+            crate::command::sorted_set::zscore(&mut db, &[bulk("z"), bulk("m")]),
+            Frame::BulkString(Bytes::from_static(b"-0")),
+            "the sign must have survived into the listpack"
+        );
+
+        // And `-0` again over the stored `-0`: identical bytes, skipped.
+        let again = [bulk("z"), bulk("-0"), bulk("m")];
+        let (_, b) = measure(|| zadd(&mut db, &again));
+        assert_eq!(
+            b.listpack_score_writes, 0,
+            "identical bytes are not rewritten"
+        );
+    }
+
     // ── one hash lookup per member, as Redis's one `dictFind` ───────────────
 
     #[test]

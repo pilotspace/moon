@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **A `ZADD` that consults nothing stops decoding the stored score, and a
+  score already in place is no longer written back over itself** (moon#942).
+  A zset listpack keeps a score as canonical decimal text, so reading one is a
+  real `str::parse::<f64>` — and the plain `ZADD z <score> <member>`, which is
+  the benchmark's shape and most applications', consulted it for nothing:
+  `should_update` was unconditionally true and the `changed` tally it fed is
+  not what the command replies. It is now decoded only for `CH`, `GT` and `LT`
+  (`NX` refuses on presence, which locating the pair already established).
+  On top of that, Redis's `zsetAdd` re-inserts only `if (score != curscore)`
+  while moon spliced the rendering back over itself every time — so the
+  idempotent re-post a leaderboard client makes paid an `encode_entry` and a
+  `write_entry` to change nothing.
+
+  **Measured with `cfg(test)` counters**, on the benchmark's own
+  `zadd z:<n> 1 m:<n>` shape:
+
+  | `ZADD` onto an existing listpack member | before | after |
+  |---|---:|---:|
+  | stored-score decodes, no flag and no `CH` | 1 | **0** |
+  | stored-score decodes with `GT` / `CH` | 1 | 1 (control) |
+  | score entries written, same score re-posted | 1 | **0** |
+  | score entries written, score genuinely moved | 1 | 1 (control) |
+
+  A call count is not a throughput claim and this entry makes none (PERF-08,
+  moon#789).
+
+  The skip is decided on the RENDERED BYTES, not on `old == score`, and that is
+  deliberate: `-0.0 == 0.0` is true while `-0` and `0` are different bytes, so
+  comparing doubles the way Redis does would have silently started answering
+  `0` to a client that wrote `-0`. moon has always stored whichever spelling
+  the client sent, and `the_listpack_identical_score_skip_is_decided_on_bytes`
+  pins that. Writing bytes that are already there changes nothing, so declining
+  is observationally identical everywhere else.
+
 - **`ZADD` parses each score argument once instead of twice** (moon#942).
   moon#814's validation pre-pass — which must keep proving every pair before
   the keyspace is touched, because the mutation loop returns from inside the

@@ -256,18 +256,60 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                 // Listpack `estimate_memory()` is O(1) (capacity-based), so a
                 // before/after snapshot is cheap — no per-member formula.
                 let before = lp.estimate_memory();
+                // Does ANYTHING in this command consult the score already
+                // stored (moon#942)? A listpack keeps a score as canonical
+                // decimal text, so decoding one is a real `str::parse::<f64>`,
+                // and the plain `ZADD z <score> <member>` — the benchmark's
+                // shape, and most applications' — consults it for nothing:
+                // `should_update` is unconditionally true and the `changed`
+                // tally it feeds is not what the command replies. `NX` is on
+                // this side of the line too, because it refuses on PRESENCE,
+                // which `update_pair_value` established by finding the pair.
+                let consults_old = ch || gt || lt;
                 for (idx, pair) in remaining.chunks_exact(2).enumerate() {
                     let (score, member) = match resolved_pair(pair, idx, cache) {
                         Ok(parsed) => parsed,
                         Err(e) => return e,
                     };
 
-                    // ONE scan (moon#942), decided from the score that is
-                    // already there. `old_score` comes back out through the
-                    // closure because the `CH` tally needs it after the
-                    // write.
+                    // Store the canonical rendering, not the raw argument:
+                    // `ZADD z 3.0 m` must answer `ZSCORE` with `3`, and
+                    // `render_score` is round-trip exact, so `as_score`
+                    // recovers the identical f64. Rendered ONCE per member and
+                    // reused by every arm below.
+                    let mut rendered = ScoreBuf::new();
+                    render_score(score, &mut rendered);
+
+                    // ONE scan (moon#942), decided from what is already there.
+                    // `old_score` comes back out through the closure because
+                    // the `CH` tally needs it after the write.
                     let mut old_score = 0.0f64;
                     let outcome = lp.update_pair_value(member, |current| {
+                        if !consults_old {
+                            if nx {
+                                // The member is present, which is all NX needs.
+                                return None;
+                            }
+                            // Redis's `zsetAdd` re-inserts only
+                            // `if (score != curscore)`. Comparing the RENDERED
+                            // bytes decides the same question without decoding
+                            // the stored score — and decides it the way moon
+                            // already behaved, byte for byte: writing bytes
+                            // that are already there changes nothing, so
+                            // declining here is observationally identical and
+                            // skips an `encode_entry` plus a `write_entry`.
+                            //
+                            // (Byte equality is not score equality at exactly
+                            // one point — `-0` and `0` are different bytes for
+                            // scores that compare equal — and taking the BYTE
+                            // answer there is what preserves moon's existing
+                            // behaviour rather than quietly adopting Redis's.)
+                            if current.eq_bytes(&rendered) {
+                                return None;
+                            }
+                            work_budget::note_listpack_score_write();
+                            return Some(&rendered[..]);
+                        }
                         work_budget::note_stored_score_parse();
                         let old = current.as_score().unwrap_or(0.0);
                         old_score = old;
@@ -285,29 +327,27 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                         if !should_update {
                             return None;
                         }
-                        // Store the canonical rendering, not the raw
-                        // argument: `ZADD z 3.0 m` must answer `ZSCORE` with
-                        // `3`, and `render_score` is round-trip exact, so
-                        // `as_score` recovers the identical f64.
-                        let mut rendered = ScoreBuf::new();
-                        render_score(score, &mut rendered);
                         work_budget::note_listpack_score_write();
-                        Some(rendered)
+                        Some(&rendered[..])
                     });
 
                     match outcome {
                         PairUpdate::Replaced(_) => {
+                            // `changed` is only ever REPLIED under `CH`, and
+                            // `CH` is on the `consults_old` side, so
+                            // `old_score` is the real stored score whenever
+                            // this tally can be read.
                             if (old_score - score).abs() > f64::EPSILON {
                                 changed += 1;
                             }
                         }
-                        // The member is there and a flag refused the write.
+                        // The member is there and either a flag refused the
+                        // write or the bytes were already the ones this call
+                        // would have written.
                         PairUpdate::Unchanged => {}
                         PairUpdate::Absent => {
                             // New member: add unless XX.
                             if !xx {
-                                let mut rendered = ScoreBuf::new();
-                                render_score(score, &mut rendered);
                                 work_budget::note_listpack_score_write();
                                 lp.push_back(member);
                                 lp.push_back(&rendered);
