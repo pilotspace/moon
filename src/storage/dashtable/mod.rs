@@ -44,11 +44,19 @@ pub fn hash_key(key: &[u8]) -> u64 {
 
 // Per-thread count of DashTable KEY LOOKUPS (test builds only).
 //
-// One "lookup" is one entry point that computes `hash_key`, routes through the
-// directory and walks a segment: `get`, `get_mut`, `insert`, `insert_or_update`,
-// `remove` and `remove_entry`. `contains_key` delegates to `get` and is
-// therefore counted once, not twice. A split-and-retry inside `insert` /
-// `insert_or_update` genuinely re-probes and is counted again.
+// One "lookup" is one walk of a segment for a key: `get`, `get_mut`, `insert`,
+// `insert_or_update`, `remove` and `remove_entry`. `contains_key` delegates to
+// `get` and is therefore counted once, not twice.
+//
+// A SPLIT-AND-RETRY is counted again, in both shapes. `insert` retries by
+// recursing, so its entry-point call site covers it; `insert_or_update` retries
+// in a loop that re-enters `Segment::insert_or_update_at` WITHOUT re-entering
+// `insert_or_update`, so that loop carries its own call. Counting only the
+// first would make the fused path look cheaper than the legacy one under a
+// split purely because of how each spells its retry — the exact false
+// comparison PERF-08 exists to prevent. Note the retry reuses the already
+// computed `hash`, so it is a segment walk without a rehash; the counter does
+// not distinguish the two, and neither does any claim made from it.
 //
 // This is COARSER than `segment::take_simd_probes`, deliberately. The SIMD
 // counter measures control-byte GROUP SCANS, which vary with a segment's
@@ -559,6 +567,14 @@ impl<V> DashTable<CompactKey, V> {
                 let mut split_dir_idx = dir_idx;
                 let (final_seg_idx, slot, inserted) = loop {
                     self.split_segment(split_dir_idx);
+
+                    // This retry re-walks a segment. It reuses `hash`, so it
+                    // is cheaper than a fresh lookup — but it is a segment
+                    // walk, which is what the counter counts, and leaving it
+                    // out would make `Database::set` (fused) and
+                    // `DashTable::insert` (recursive, and therefore counted
+                    // again) disagree under a split for no reason.
+                    note_key_lookup();
 
                     // After split, the directory may have doubled and the key
                     // now routes to a different segment. Recompute.

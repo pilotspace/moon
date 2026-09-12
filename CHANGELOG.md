@@ -64,7 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   / `get_promoted` / `get_mut_if_present` accessor and of `SADD` end to end, on
   a hit and on a miss. The baseline it records is **measured, not read off the
   moon#942 audit — which undercounted `get_or_create`'s miss path by one**
-  (`promote_cold_if_present` opens with its own `contains_key`):
+  (`promote_cold_if_present` opens with its own `contains_key`). These are the
+  **PRE-reduction** counts, which is the point of recording them; the reduced
+  ones are under Performance below and are what the module asserts at HEAD:
 
   | accessor | hit | miss |
   |---|---:|---:|
@@ -73,7 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `get_promoted` | 4 | 5 |
   | `get_or_create_intset` / `_hash_listpack` / `_list_listpack` / `_zset_listpack` | 3 | 6 |
   | `get_or_create_set_listpack` | 4 | 7 |
-  | `SADD` end to end (listpack / hashtable regime) | 4 | 7 |
+  | `SADD` end to end — absent key / listpack regime / hashtable regime | \[7, 4, 7\] | |
 
   Redis reaches all of these with one `dictFind`. **No throughput claim is made
   or implied**: the counter exists precisely *because* moon#789 measured the
@@ -391,7 +393,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `get_promoted` | 4 / 5 | **2 / 3** |
   | `get_or_create_intset` / `_hash_listpack` / `_list_listpack` / `_zset_listpack` | 3 / 6 | **2 / 4** |
   | `get_or_create_set_listpack` | 4 / 7 | **2 / 4** |
-  | **`SADD` end to end** (listpack / hashtable regime) | **4 / 7** | **2 / 4** |
+
+  SADD end to end does not fit that table's hit/miss axis — its three regimes
+  are an absent key, a listpack-encoded key and a hashtable-encoded one (122 of
+  200 keys at the benchmark's own p=64 point):
+
+  | `SADD` regime | before | after |
+  |---|---:|---:|
+  | absent key (creates the container) | 7 | **4** |
+  | listpack-encoded key | 4 | **2** |
+  | hashtable-encoded key | 7 | **4** |
 
   Redis reaches the same key with one `dictFind`. The residual 4 on SADD's
   hashtable regime is two accessors' worth: `get_or_create_set_listpack`
@@ -420,7 +431,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the wrong type still errors; the WATCH version still bumps exactly once
   per mutable handle (moon#926 — moon#940, the `WRONGTYPE` path stamping too,
   is neither fixed nor worsened, and `stamp_mutation` did not move); and
-  `used_memory` is byte-identical for an identical sequence of operations.
+  `used_memory` still agrees with an independent whole-keyspace recount.
+
+  That last one was first written as `assert_eq!(run(), run())` over a pure
+  deterministic closure, which is a tautology — a build that moved a charge
+  across a branch would still agree with itself — and an adversarial review
+  caught it. It now compares the incrementally maintained ledger against a
+  fresh walk summing `entry_overhead` per entry, and a second test pins the one
+  ledger write this change actually moved (the moon#899 intset→listpack swing,
+  which used to be applied inside `absorb_intset_into_listpack` before
+  `stamp_mutation` and is now applied by the accessor after it). Both were
+  verified to FAIL against deliberately mutated builds — charge dropped, swing
+  dropped — rather than assumed to be capable of failing.
 
 - **`storage`: the listpack write path stops walking twice and stops
   allocating per entry it walks past (moon#799).** `get_at`, `remove_at` and

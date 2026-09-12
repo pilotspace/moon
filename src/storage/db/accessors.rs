@@ -442,7 +442,17 @@ impl Database {
     /// Returns Err if the key exists but holds a non-set type.
     /// Returns Ok(None) if the key exists but is not an intset (caller should use get_or_create_set).
     /// Returns Ok(Some(&mut Intset)) if the key holds or was created as an intset.
-    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
+    // `get_mut` cannot answer None here: the preamble above leaves the key
+    // hot on every path — `HotState::Live` observed it, `settle_not_live`
+    // returned true (its contract: "true iff `key` is present in hot RAM
+    // after this call", honoured on every `promote_cold_outcome` arm), or
+    // `insert_fresh` just inserted it. moon#942 moved the FIRST of those
+    // three from a `contains_key` one line up to a contract three call
+    // levels away, so if `Database::set` ever becomes conditional — a
+    // maxmemory fail-close, a spill gate — this panics on the write path.
+    // Prefer `get_or_create`'s shape (tracing::error! + `ERR internal`) if
+    // that day comes.
+    #[allow(clippy::unwrap_used)]
     pub fn get_or_create_intset(&mut self, key: &[u8]) -> Result<Option<&mut Intset>, Frame> {
         let now_ms = self.cached_now_ms;
         // P0 fix: `settle_not_live` promotes a cold-spilled set before this
@@ -496,7 +506,17 @@ impl Database {
     /// Returns Ok(Some(&mut Listpack)) if the key is a HashListpack.
     /// Returns Ok(None) if the key already holds a full Hash (caller should fall through).
     /// Returns Err(WRONGTYPE) if the key holds a non-hash type.
-    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
+    // `get_mut` cannot answer None here: the preamble above leaves the key
+    // hot on every path — `HotState::Live` observed it, `settle_not_live`
+    // returned true (its contract: "true iff `key` is present in hot RAM
+    // after this call", honoured on every `promote_cold_outcome` arm), or
+    // `insert_fresh` just inserted it. moon#942 moved the FIRST of those
+    // three from a `contains_key` one line up to a contract three call
+    // levels away, so if `Database::set` ever becomes conditional — a
+    // maxmemory fail-close, a spill gate — this panics on the write path.
+    // Prefer `get_or_create`'s shape (tracing::error! + `ERR internal`) if
+    // that day comes.
+    #[allow(clippy::unwrap_used)]
     pub fn get_or_create_hash_listpack(
         &mut self,
         key: &[u8],
@@ -554,7 +574,17 @@ impl Database {
     /// Returns Ok(Some(&mut Listpack)) if the key is a ListListpack.
     /// Returns Ok(None) if the key already holds a full List (caller should fall through).
     /// Returns Err(WRONGTYPE) if the key holds a non-list type.
-    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
+    // `get_mut` cannot answer None here: the preamble above leaves the key
+    // hot on every path — `HotState::Live` observed it, `settle_not_live`
+    // returned true (its contract: "true iff `key` is present in hot RAM
+    // after this call", honoured on every `promote_cold_outcome` arm), or
+    // `insert_fresh` just inserted it. moon#942 moved the FIRST of those
+    // three from a `contains_key` one line up to a contract three call
+    // levels away, so if `Database::set` ever becomes conditional — a
+    // maxmemory fail-close, a spill gate — this panics on the write path.
+    // Prefer `get_or_create`'s shape (tracing::error! + `ERR internal`) if
+    // that day comes.
+    #[allow(clippy::unwrap_used)]
     pub fn get_or_create_list_listpack(
         &mut self,
         key: &[u8],
@@ -649,7 +679,17 @@ impl Database {
     /// SELF-ACCOUNTING for the conversion: the intset -> listpack cost swing
     /// is applied to `used_memory` here, so the caller's own before/after
     /// snapshot of the listpack starts from the converted form.
-    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
+    // `get_mut` cannot answer None here: the preamble above leaves the key
+    // hot on every path — `HotState::Live` observed it, `settle_not_live`
+    // returned true (its contract: "true iff `key` is present in hot RAM
+    // after this call", honoured on every `promote_cold_outcome` arm), or
+    // `insert_fresh` just inserted it. moon#942 moved the FIRST of those
+    // three from a `contains_key` one line up to a contract three call
+    // levels away, so if `Database::set` ever becomes conditional — a
+    // maxmemory fail-close, a spill gate — this panics on the write path.
+    // Prefer `get_or_create`'s shape (tracing::error! + `ERR internal`) if
+    // that day comes.
+    #[allow(clippy::unwrap_used)]
     pub fn get_or_create_set_listpack(
         &mut self,
         key: &[u8],
@@ -740,7 +780,17 @@ impl Database {
     /// rule: cold storage never persists a compact encoding, so a promoted
     /// value always decodes as `RedisValue::SortedSetBPTree` and lands in the
     /// `Ok(None)` arm rather than being fabricated over.
-    #[allow(clippy::unwrap_used)] // get_mut() after insert guarantees key present
+    // `get_mut` cannot answer None here: the preamble above leaves the key
+    // hot on every path — `HotState::Live` observed it, `settle_not_live`
+    // returned true (its contract: "true iff `key` is present in hot RAM
+    // after this call", honoured on every `promote_cold_outcome` arm), or
+    // `insert_fresh` just inserted it. moon#942 moved the FIRST of those
+    // three from a `contains_key` one line up to a contract three call
+    // levels away, so if `Database::set` ever becomes conditional — a
+    // maxmemory fail-close, a spill gate — this panics on the write path.
+    // Prefer `get_or_create`'s shape (tracing::error! + `ERR internal`) if
+    // that day comes.
+    #[allow(clippy::unwrap_used)]
     pub fn get_or_create_zset_listpack(
         &mut self,
         key: &[u8],
