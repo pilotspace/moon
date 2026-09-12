@@ -365,6 +365,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`storage`: the typed accessors probe the DashTable half as many times
+  (moon#942).** Every `get_or_create*` opened with a `get` (inside
+  `drop_if_expired`) and a `contains_key` that answer the same question — "is
+  there a live entry at this key?" — before the `get_mut` that hands the entry
+  out. `get_promoted` paid a fourth lookup, a trailing `get`, purely to
+  re-borrow immutably what the upgrade's `&mut` already had.
+  `get_or_create_set_listpack` paid a fifth, because
+  `absorb_intset_into_listpack` was a `&mut self` method keyed by `&[u8]` and
+  took its own `get_mut` — on every `SADD`, including the overwhelming majority
+  where the key is not an intset and the function does nothing. Each of those
+  is a full xxh64 over the key plus a segment scan; nothing cached a probe
+  anywhere.
+
+  One `HotState` classification now decides the whole preamble, the create arm
+  reads `promote_cold_if_present`'s own return value instead of re-issuing
+  `contains_key`, and the intset edge runs on the handle the accessor was
+  about to take anyway. **Measured with a new `cfg(test)` DashTable key-lookup
+  counter, per accessor, on a hit and on a miss:**
+
+  | accessor | before (hit / miss) | after (hit / miss) |
+  |---|---:|---:|
+  | `get_or_create` | 3 / 6 | **2 / 4** |
+  | `get_mut_if_present` | 3 / 4 | **2 / 3** |
+  | `get_promoted` | 4 / 5 | **2 / 3** |
+  | `get_or_create_intset` / `_hash_listpack` / `_list_listpack` / `_zset_listpack` | 3 / 6 | **2 / 4** |
+  | `get_or_create_set_listpack` | 4 / 7 | **2 / 4** |
+  | **`SADD` end to end** (listpack / hashtable regime) | **4 / 7** | **2 / 4** |
+
+  Redis reaches the same key with one `dictFind`. The residual 4 on SADD's
+  hashtable regime is two accessors' worth: `get_or_create_set_listpack`
+  answers `Ok(None)` and `get_or_create_set` then repeats the skeleton.
+  Collapsing that needs a change in `src/command/set/`.
+
+  **No throughput number is claimed, and none was measured.** That is
+  deliberate, not an omission: moon#789 measured the previous probe-count
+  reduction in this repo at **+11% on aarch64 and −17% on x86_64** — the two
+  architectures disagreed in *sign* — and `b3083c5a` found the wall-clock net
+  guarding it was timing a page-fault artifact rather than the optimisation.
+  Fewer probes is a structural fact; whether it is faster is a question only a
+  Linux benchmark host may answer, and this change must be A/B'd on **both**
+  arches before any performance claim is attached to it. What *is* verified
+  beyond the counter is that the codegen moved: on aarch64 the emitted bodies
+  of `get_or_create_hash_listpack`, `_list_listpack`, `_zset_listpack`,
+  `_intset` and `_set_listpack` shrink by 45–48% (884→460, 880→456, 884→460,
+  984→556, 964→528 bytes). Code size is not speed either; it is evidence the
+  compiler saw the change.
+
+  Behaviour is unchanged and pinned by tests written against the pre-change
+  baseline: an expired key still reads as ABSENT (not `WRONGTYPE`) through
+  every accessor and still leaves no expiry-index entry behind (moon#541); a
+  cold-spilled value is still promoted before an empty container is fabricated
+  over it, on the expired arm as well as the absent one (moon#459); a live key
+  of the wrong type still errors; the WATCH version still bumps exactly once
+  per mutable handle (moon#926 — moon#940, the `WRONGTYPE` path stamping too,
+  is neither fixed nor worsened, and `stamp_mutation` did not move); and
+  `used_memory` is byte-identical for an identical sequence of operations.
+
 - **`storage`: the listpack write path stops walking twice and stops
   allocating per entry it walks past (moon#799).** `get_at`, `remove_at` and
   `replace_at` reached their index with the OWNED decoder, which copies every
