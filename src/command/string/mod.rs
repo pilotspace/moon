@@ -33,15 +33,30 @@ pub(crate) fn parse_f64(frame: &Frame) -> Option<f64> {
 }
 
 /// Format a float result, stripping trailing zeros after decimal point.
+///
+/// moon#942: the trim used to end in `to_string()`, building a **second**
+/// `String` to hold a prefix of the one already in hand. `truncate` is the
+/// same edit in place — a length store, no allocation, no copy — and the
+/// rendered bytes are identical, which
+/// `format_float_truncate_matches_the_old_reallocating_trim` pins.
 pub(crate) fn format_float(val: f64) -> String {
-    let s = format!("{}", val);
+    let mut s = format!("{}", val);
     if s.contains('.') {
-        let trimmed = s.trim_end_matches('0');
-        let trimmed = trimmed.trim_end_matches('.');
-        trimmed.to_string()
-    } else {
-        s
+        // `trim_end_matches` returns a prefix of `s`, so its length is a valid
+        // `truncate` point and always lands on a char boundary (the trimmed
+        // characters are ASCII `'0'` and `'.'`).
+        //
+        // The second trim is defensive and, against this renderer, dead:
+        // `{}` on an `f64` emits the shortest decimal that round-trips, which
+        // is `"1"` and never `"1.0"`, so a rendering containing a `'.'` always
+        // has a non-zero digit after it. Kept because it costs one compare on
+        // a path that has already allocated, and because it is what makes the
+        // trim correct independently of which renderer feeds it — but noted so
+        // nobody spends a mutation budget trying to make it fail.
+        let keep = s.trim_end_matches('0').trim_end_matches('.').len();
+        s.truncate(keep);
     }
+    s
 }
 
 #[cfg(test)]
@@ -561,6 +576,67 @@ mod tests {
         assert_eq!(format_float(3.1), "3.1");
         assert_eq!(format_float(10.0), "10");
         assert_eq!(format_float(0.5), "0.5");
+    }
+
+    /// moon#942: the trim stopped reallocating. The rendered bytes must not
+    /// have moved by one character — an `INCRBYFLOAT` reply is compared
+    /// literally by clients, and `"3"` vs `"3.0"` vs `"3."` are three
+    /// different answers.
+    ///
+    /// The oracle is the exact pre-#942 body, kept here rather than described,
+    /// so this is a live differential and not a restatement of the new code.
+    #[test]
+    fn format_float_truncate_matches_the_old_reallocating_trim() {
+        fn reference(val: f64) -> String {
+            let s = format!("{}", val);
+            if s.contains('.') {
+                let trimmed = s.trim_end_matches('0');
+                let trimmed = trimmed.trim_end_matches('.');
+                trimmed.to_string()
+            } else {
+                s
+            }
+        }
+
+        let mut cases: Vec<f64> = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            3.15,
+            3.1,
+            10.0,
+            100.0,
+            // Values whose Display ends in zeros before the trim, and values
+            // that trim away the whole fraction.
+            1.10,
+            1.100,
+            2.500,
+            -2.500,
+            1e15,
+            1e-5,
+            0.1 + 0.2,
+            // Both ends of the exactly-representable integer range, where the
+            // integral arm (no '.') is taken and nothing is trimmed at all.
+            9007199254740992.0,
+            -9007199254740992.0,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::MIN,
+            f64::EPSILON,
+        ];
+        // Plus a deterministic sweep over ratios, which is where trailing
+        // zeros actually show up in practice.
+        for n in -400i32..=400 {
+            cases.push(f64::from(n) / 8.0);
+            cases.push(f64::from(n) / 1000.0);
+            cases.push(f64::from(n) * 1.0e6);
+        }
+        for v in cases {
+            assert_eq!(format_float(v), reference(v), "diverged on {v:?}");
+        }
     }
 
     // --- APPEND tests ---

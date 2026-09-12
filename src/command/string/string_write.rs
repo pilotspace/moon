@@ -552,10 +552,18 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
 
     let formatted = format_float(result);
 
+    // moon#942: the entry is built from the rendered BYTES, not from a second
+    // copy of them. `formatted.clone()` allocated a whole second `String` per
+    // call so that one could go into the `Entry` and one into the reply — and
+    // the `Entry` then copied out of it and dropped it again immediately: a
+    // result of <= 12 bytes inlines into `CompactValue`'s SSO payload, so for
+    // every ordinary counter the allocation was never even the storage.
+    // Handing the slice over keeps the one `String` for the reply, which moves
+    // into `Bytes` below without copying.
     let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(Bytes::from(formatted.clone()), existing_expiry_ms)
+        Entry::new_string_from_slice_with_expiry(formatted.as_bytes(), existing_expiry_ms)
     } else {
-        Entry::new_string(Bytes::from(formatted.clone()))
+        Entry::new_string_from_slice(formatted.as_bytes())
     };
     entry.set_last_access(db.now());
     entry.set_access_counter(5);

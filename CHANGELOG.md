@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`INCRBYFLOAT` allocates twice per call, not three times** (moon#942).
+  `format_float` built a `String` with `format!`, trimmed it, and then built a
+  **second** `String` with `to_string()` to hold a prefix of the one already in
+  hand; the handler then `clone()`d the result so the stored `Entry` and the
+  reply could have one each. `format!`, `to_string()` and `clone()` are all
+  three banned in `src/command/` by CLAUDE.md, and this one command paid all
+  three per call.
+
+  The trim is now a `truncate` — a length store, no copy — and the `Entry` is
+  built from the rendered bytes rather than from a second copy of them, which
+  for any result inside `CompactValue`'s 12-byte SSO window means it needs no
+  buffer at all. Rendered output is unchanged, pinned by a differential
+  against the exact pre-#942 body over ~2,400 values.
+
+  Measured with a counting `GlobalAlloc`, per call, after warm-up:
+
+  | `INCRBYFLOAT` arm | before | after |
+  |---|---:|---:|
+  | integral result | 3 | 2 |
+  | fractional result | 3 | 2 |
+  | negative fractional | 3 | 2 |
+  | wider than the SSO window | 2 | 2 |
+
+  The remaining two are `format!`'s `String` growth and `Bytes::from(String)`
+  reallocating in `into_boxed_slice`. Reaching the true floor (1, or 2 outside
+  the SSO window) needs an `f64` `Display` renderer that writes into a stack
+  buffer, which is not done here.
+
 - **`INCR` stops walking its counter twice to read one integer** (moon#942).
   The path parsed the stored value as `std::str::from_utf8(bytes)` followed by
   `str::parse::<i64>()`. The first walk proves the slice is UTF-8; the second

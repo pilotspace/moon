@@ -1,7 +1,7 @@
-//! moon#942: `INCRBYFLOAT` must touch the allocator once, not four times.
+//! moon#942: `INCRBYFLOAT` must stay inside its allocation budget.
 //!
 //! The handler rendered its result through `format_float`, which builds a
-//! `String` with `format!` and then rebuilds it with `to_string()` after
+//! `String` with `format!` and then rebuilt it with `to_string()` after
 //! trimming; the handler then `clone()`d that `String` to have one copy for
 //! the stored `Entry` and one for the reply. `format!`, `to_string()` and
 //! `clone()` are all three banned outright in `src/command/` by CLAUDE.md, and
@@ -75,7 +75,11 @@ fn allocs() -> usize {
 }
 
 /// One `INCRBYFLOAT key delta` against a warm database, measured.
-fn incrbyfloat_allocs(db: &mut Database, key: &'static [u8], delta: &'static [u8]) -> (Frame, usize) {
+fn incrbyfloat_allocs(
+    db: &mut Database,
+    key: &'static [u8],
+    delta: &'static [u8],
+) -> (Frame, usize) {
     let args = [
         Frame::BulkString(Bytes::from_static(key)),
         Frame::BulkString(Bytes::from_static(delta)),
@@ -86,7 +90,7 @@ fn incrbyfloat_allocs(db: &mut Database, key: &'static [u8], delta: &'static [u8
 }
 
 #[test]
-fn incrbyfloat_allocates_once_per_call() {
+fn incrbyfloat_stays_within_its_allocation_budget() {
     let mut db = Database::new();
 
     // Warm every lazily-initialised structure the FIRST write to a database
