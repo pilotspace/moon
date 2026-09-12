@@ -3050,6 +3050,130 @@ mod ledger_consistency_788 {
         );
     }
 
+    /// moon#942 (`SetHandle::Full`): the ledger across the FULL encoding
+    /// ladder of one key — empty -> intset -> listpack (the moon#899 absorb)
+    /// -> hashtable — plus the steady-state SADDs that land on each rung.
+    ///
+    /// The hashtable rung is what this test was written for. `SADD` on a set
+    /// that is already an `IndexSet` used to reach it through TWO accessors:
+    /// `get_or_create_set_listpack` answered `Ok(None)` and `get_or_create_set`
+    /// then ran `SetKind::upgrade` and applied its delta. Collapsing the pair
+    /// moves that delta into the first accessor, and a memory delta that moves
+    /// is a memory delta that can be dropped. moon#814 is the recorded shape:
+    /// a charge stranded on one branch drives `used_memory` monotonically
+    /// DOWN, without bound, on a path any unprivileged client can drive, until
+    /// `--maxmemory` can never fire.
+    ///
+    /// Mutation check: delete the `self.used_memory` line from
+    /// `get_or_create_set_listpack`'s `Full` arm and the "after the refused
+    /// intset promoted" step goes red.
+    #[test]
+    fn sadd_keeps_the_ledger_exact_across_every_encoding_transition() {
+        use crate::command::set::sadd;
+        let limits = crate::storage::db::EncodingLimits::moon_defaults();
+        let mut db = Database::new();
+        let floor = db.estimated_memory();
+
+        // empty -> intset
+        sadd(&mut db, &[f(b"s"), f(b"1"), f(b"2"), f(b"3")]);
+        assert_ledger_exact(&mut db, "empty -> intset");
+        // intset steady state
+        sadd(&mut db, &[f(b"s"), f(b"4")]);
+        assert_ledger_exact(&mut db, "intset steady state");
+        // intset -> listpack (moon#899 absorb)
+        sadd(&mut db, &[f(b"s"), f(b"str")]);
+        assert_eq!(
+            crate::command::key::object(&mut db, &[f(b"ENCODING"), f(b"s")]),
+            Frame::BulkString(Bytes::from_static(b"listpack")),
+            "fixture: the absorb must have been taken"
+        );
+        assert_ledger_exact(&mut db, "intset -> listpack (absorb)");
+        // listpack steady state
+        sadd(&mut db, &[f(b"s"), f(b"str2")]);
+        assert_ledger_exact(&mut db, "listpack steady state");
+
+        // The VALUE boundary: `set-max-listpack-value` is inclusive, so a
+        // member of exactly that many bytes stays a listpack and one byte
+        // more promotes. Both sides must leave the ledger exact, and they
+        // take DIFFERENT routes through SADD — the 64-byte member goes
+        // through the listpack accessor, the 65-byte member skips the gate
+        // entirely and lands on `get_or_create_set`.
+        let at_limit = vec![b'x'; limits.set_value];
+        sadd(&mut db, &[f(b"s"), f(&at_limit)]);
+        assert_eq!(
+            crate::command::key::object(&mut db, &[f(b"ENCODING"), f(b"s")]),
+            Frame::BulkString(Bytes::from_static(b"listpack")),
+            "fixture: set-max-listpack-value is inclusive"
+        );
+        assert_ledger_exact(&mut db, "listpack at the value boundary");
+        let over_limit = vec![b'y'; limits.set_value + 1];
+        sadd(&mut db, &[f(b"s"), f(&over_limit)]);
+        assert_eq!(
+            crate::command::key::object(&mut db, &[f(b"ENCODING"), f(b"s")]),
+            Frame::BulkString(Bytes::from_static(b"hashtable")),
+            "fixture: one byte past the value threshold must promote"
+        );
+        assert_ledger_exact(&mut db, "listpack -> hashtable (value boundary)");
+
+        // hashtable steady state: the `SetHandle::Full` arm.
+        sadd(&mut db, &[f(b"s"), f(b"after")]);
+        assert_ledger_exact(&mut db, "hashtable steady state");
+        // ... including a duplicate, which changes nothing at all.
+        sadd(&mut db, &[f(b"s"), f(b"after")]);
+        assert_ledger_exact(&mut db, "hashtable duplicate");
+
+        crate::command::key::del(&mut db, &[f(b"s")]);
+        assert_ledger_exact(&mut db, "after DEL");
+        assert_eq!(
+            db.estimated_memory(),
+            floor,
+            "the full ladder must return the ledger to its floor"
+        );
+    }
+
+    /// moon#942, the OTHER `SetHandle::Full` arm: an intset the moon#899 edge
+    /// REFUSES, because it already holds more members than the listpack policy
+    /// allows. The accessor now runs `SetKind::upgrade` on the handle it holds
+    /// instead of answering `Ok(None)` and letting `get_or_create_set` do it —
+    /// the intset -> `IndexSet` cost swing moves with it, and this is the test
+    /// that sees it land.
+    #[test]
+    fn sadd_promoting_a_refused_intset_keeps_the_ledger_exact() {
+        use crate::command::set::sadd;
+        let limits = crate::storage::db::EncodingLimits::moon_defaults();
+        let mut db = Database::new();
+        let floor = db.estimated_memory();
+
+        // More members than `set-max-listpack-entries`, fewer than
+        // `set-max-intset-entries`: a legitimate large intset that the
+        // listpack edge must refuse.
+        let mut ints = vec![f(b"s")];
+        let spellings: Vec<String> = (0..limits.set_entries + 72).map(|v| v.to_string()).collect();
+        ints.extend(spellings.iter().map(|v| f(v.as_bytes())));
+        sadd(&mut db, &ints);
+        assert_eq!(
+            crate::command::key::object(&mut db, &[f(b"ENCODING"), f(b"s")]),
+            Frame::BulkString(Bytes::from_static(b"intset")),
+            "fixture: the batch must still be an intset"
+        );
+        assert_ledger_exact(&mut db, "a large intset");
+
+        sadd(&mut db, &[f(b"s"), f(b"str")]);
+        assert_eq!(
+            crate::command::key::object(&mut db, &[f(b"ENCODING"), f(b"s")]),
+            Frame::BulkString(Bytes::from_static(b"hashtable")),
+            "fixture: a refused absorb must promote to the full form"
+        );
+        assert_ledger_exact(&mut db, "after the refused intset promoted");
+
+        sadd(&mut db, &[f(b"s"), f(b"str2")]);
+        assert_ledger_exact(&mut db, "hashtable steady state after the promotion");
+
+        crate::command::key::del(&mut db, &[f(b"s")]);
+        assert_ledger_exact(&mut db, "after DEL");
+        assert_eq!(db.estimated_memory(), floor, "back to the floor");
+    }
+
     /// moon#787 (`ZADD` listpack path) meets moon#814: a listpack zset that
     /// receives a command with a bad score in the middle must be left exactly
     /// as it was — nothing written, nothing charged — and a FRESH key must

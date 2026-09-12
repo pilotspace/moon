@@ -267,15 +267,49 @@ fn sadd_end_to_end_probe_budget() {
 
     assert_eq!(
         (create, listpack_hit, hashtable_hit),
-        (3, 2, 4),
+        (3, 2, 2),
         "SADD end-to-end probe budget moved \
          (create={create}, listpack_hit={listpack_hit}, hashtable_hit={hashtable_hit}) \
-         — moon#942. The hashtable arm STILL pays TWO accessors: \
-         `get_or_create_set_listpack` answers `Ok(None)` and `get_or_create_set` \
-         then repeats the whole skeleton. Collapsing that pair needs the \
-         accessor skeleton itself to hand back the encoding it already has in \
-         its hand, which is the one piece of moon#942's SADD residue still \
-         open. Redis pays one `dictFind` for all three."
+         — moon#942. All three arms now pay ONE accessor. The hashtable arm \
+         used to pay two: `get_or_create_set_listpack` answered `Ok(None)` and \
+         `get_or_create_set` then repeated the whole skeleton — a second \
+         classification and probe pair for a key the first call already had in \
+         hand. `SetHandle::Full` hands that entry back instead, running \
+         `SetKind::upgrade` and its ledger delta on the handle the accessor \
+         already holds. A RISE is the regression this test exists to catch."
+    );
+}
+
+#[test]
+fn sadd_onto_a_refused_intset_probe_budget() {
+    // The other `SetHandle::Full` arm: a live `SetIntset` the moon#899 edge
+    // REFUSES (the intset already holds more members than the listpack policy
+    // allows), so the batch has to promote it to the full `IndexSet`. That
+    // used to be `get_or_create_set_listpack` answering `Ok(None)` followed by
+    // `get_or_create_set` re-classifying the very same entry.
+    let mut db = db_at(NOW);
+    let mut ints = vec![bulk("i")];
+    ints.extend((0..200).map(|v| bulk(&v.to_string())));
+    assert_eq!(
+        crate::command::set::sadd(&mut db, &ints),
+        Frame::Integer(200)
+    );
+    assert!(
+        matches!(
+            db.data().get(b"i").map(|e| e.value.as_redis_value()),
+            Some(crate::storage::compact_value::RedisValueRef::SetIntset(_))
+        ),
+        "fixture: 200 canonical integers must still be an intset"
+    );
+
+    let args = [bulk("i"), bulk("not-an-integer")];
+    let (r, refused) = probes(|| crate::command::set::sadd(&mut db, &args));
+    assert_eq!(r, Frame::Integer(1));
+    assert_eq!(
+        refused, 2,
+        "SADD onto a refused intset costs {refused} probes — moon#942. The \
+         accessor already holds the entry; promoting it must not cost a \
+         second full classification."
     );
 }
 
@@ -696,5 +730,105 @@ fn a_key_deleted_mid_spill_does_not_resurrect_through_the_accessor() {
     assert_eq!(
         len, 0,
         "a key DEL'd mid-spill came back to life through the accessor — the          DEL-acked-then-UNDONE bug (moon#459)"
+    );
+}
+
+// ── the WATCH contract across the collapsed accessor pair (moon#926/#940) ───
+
+/// The entry's WATCH version, or a failed assertion naming the key.
+fn version_of(db: &Database, key: &[u8]) -> u32 {
+    match db.data().get(key) {
+        Some(e) => e.version(),
+        None => panic!("key {:?} should be present", String::from_utf8_lossy(key)),
+    }
+}
+
+#[test]
+fn sadd_bumps_the_watch_version_exactly_once_on_every_encoding() {
+    // moon#926's rule is "acquiring a mutable handle on a stored value IS the
+    // bump". SADD on a HASHTABLE set used to acquire TWO — one from
+    // `get_or_create_set_listpack` (discarded, `Ok(None)`) and one from
+    // `get_or_create_set` — so one command moved the version by two. That is
+    // not a lost-update bug (a watcher aborts either way), but it is the
+    // observable shadow of the duplicate accessor this change removes, and it
+    // is the assertion that fails if the collapse ever regresses.
+
+    // (a) listpack steady state — one accessor before and after.
+    let mut db = db_at(NOW);
+    assert_eq!(
+        crate::command::set::sadd(&mut db, &[bulk("lp"), bulk("alpha")]),
+        Frame::Integer(1)
+    );
+    let v0 = version_of(&db, b"lp");
+    assert_eq!(
+        crate::command::set::sadd(&mut db, &[bulk("lp"), bulk("beta")]),
+        Frame::Integer(1)
+    );
+    assert_eq!(
+        version_of(&db, b"lp"),
+        v0 + 1,
+        "a listpack SADD is exactly one mutation (moon#926)"
+    );
+
+    // (b) intset steady state — one accessor, unchanged by this work.
+    let mut db = db_at(NOW);
+    assert_eq!(
+        crate::command::set::sadd(&mut db, &[bulk("is"), bulk("1"), bulk("2")]),
+        Frame::Integer(2)
+    );
+    let v0 = version_of(&db, b"is");
+    assert_eq!(
+        crate::command::set::sadd(&mut db, &[bulk("is"), bulk("3")]),
+        Frame::Integer(1)
+    );
+    assert_eq!(
+        version_of(&db, b"is"),
+        v0 + 1,
+        "an intset SADD is exactly one mutation (moon#926)"
+    );
+
+    // (c) hashtable steady state — the arm that used to bump TWICE.
+    let mut db = db_at(NOW);
+    let mut big = vec![bulk("ht")];
+    big.extend((0..400).map(|i| bulk(&format!("member-{i}"))));
+    assert_eq!(
+        crate::command::set::sadd(&mut db, &big),
+        Frame::Integer(400)
+    );
+    let v0 = version_of(&db, b"ht");
+    assert_eq!(
+        crate::command::set::sadd(&mut db, &[bulk("ht"), bulk("extra")]),
+        Frame::Integer(1)
+    );
+    assert_eq!(
+        version_of(&db, b"ht"),
+        v0 + 1,
+        "a hashtable SADD acquired TWO mutable handles for one command — the \
+         duplicate accessor moon#942 removes (moon#926)"
+    );
+}
+
+#[test]
+fn sadd_on_a_wrongtype_key_still_bumps_the_version_moon940() {
+    // moon#940 is OPEN and is NOT fixed here: `stamp_mutation` fires before
+    // the arm that answers `Err(WRONGTYPE)`, so a rejected write still dirties
+    // a watching transaction. This test pins the CURRENT behaviour so the
+    // `SetHandle` change is provably neutral on it — neither fixing #940 (a
+    // separate change, separately benchmarked) nor making it worse by adding a
+    // second bump.
+    let mut db = db_at(NOW);
+    db.set(b"str", Entry::new_string(Bytes::from_static(b"v")));
+    let v0 = version_of(&db, b"str");
+    let r = crate::command::set::sadd(&mut db, &[bulk("str"), bulk("member")]);
+    assert!(
+        matches!(&r, Frame::Error(e) if e.starts_with(b"WRONGTYPE")),
+        "expected WRONGTYPE, got {r:?}"
+    );
+    assert_eq!(
+        version_of(&db, b"str"),
+        v0 + 1,
+        "moon#940 (open): a rejected SADD bumps the version exactly once. \
+         Two would mean the collapse added a handle; zero would mean this \
+         change fixed #940 as a side effect, which it must not do silently."
     );
 }
