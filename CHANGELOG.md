@@ -6,6 +6,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ZADD <missing-key> XX <score> <member>` no longer creates an empty zset**
+  (moon#942). moon reaches the keyspace through `get_or_create_*`, which
+  fabricates the container before the mutation loop can discover that `XX`
+  refuses every member of the batch; Redis short-circuits first
+  (`if (zobj == NULL) { if (xx) goto reply_to_client; }`) and creates nothing.
+  Both encodings leaked, because a member past `zset-max-listpack-value` skips
+  the listpack entry gate and lands on `get_or_create_sorted_set`, which
+  fabricates too. `ZADD` now drops an empty container the way `ZREM` always
+  has.
+
+  Verified against a live redis 8.6.1 — after one `ZADD ghost XX 1 m`:
+
+  | | redis | moon (before) |
+  |---|---|---|
+  | `EXISTS ghost` | 0 | **1** |
+  | `TYPE ghost` | `none` | **`zset`** |
+  | `DBSIZE` | 0 | **1** |
+  | `KEYS *` | (empty) | **`ghost`** |
+  | `DEBUG DIGEST` | `000…000` | **`01158ee1…`** |
+  | `ZCARD ghost` | 0 | 0 (agrees — which is why nothing caught it) |
+
+  This was unbounded keyspace growth on a path any unprivileged client can
+  drive — an entry plus a fabricated container per call, none of which ever
+  appears to hold anything — and it moved `DEBUG DIGEST`, so a replica or a
+  reloaded RDB disagreed with its master about the keyspace. The fix is pinned
+  on both encodings, together with the ledger (a refused `ZADD` charges
+  nothing) and the case it must not break (a refused `XX` on a zset that DOES
+  exist leaves it and its members alone).
+
 ### Performance
 
 - **`ZADD` and `ZINCRBY` on a `skiplist` zset hash the member once, not three

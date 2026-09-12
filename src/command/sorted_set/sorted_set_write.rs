@@ -362,9 +362,24 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                 // it converts `lp.len()` (member AND score entries) to
                 // members itself.
                 let should_upgrade = !limits.listpack_fits(Shape::SortedSet, lp);
+                // Empty means the accessor FABRICATED this container and `XX`
+                // then refused every member of the batch — moon reaches the
+                // keyspace through `get_or_create_*`, where Redis checks
+                // `if (zobj == NULL) { if (xx) goto reply_to_client; }` and
+                // creates nothing. `ZREM` already carries this rule, which is
+                // why a drained zset never survives; without it here,
+                // `ZADD <random> XX 1 m` grows the keyspace without bound and
+                // moves `DEBUG DIGEST` away from the master's.
+                let is_empty = lp.is_empty();
                 // `lp`'s borrow of `db` ends here — safe to call back into
                 // `db` for accounting from this point on.
                 db.adjust_memory(before, after);
+                if is_empty {
+                    db.remove(key);
+                    // Nothing was added and nothing changed, so both tallies
+                    // are zero and the reply is the same either way.
+                    return Frame::Integer(0);
+                }
                 if should_upgrade {
                     // One-time cost-model swing (listpack -> B+tree + members
                     // map). The accessor bills it itself through
@@ -456,9 +471,18 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     }
 
     let table_after = zset_table_bytes(members, scores);
+    // Same rule as the listpack arm and as `ZREM`: an empty container here
+    // means the accessor fabricated it and `XX` refused the whole batch, and
+    // Redis creates nothing in that case. A 65-byte member skips the listpack
+    // gate entirely, so this arm leaks a ghost key without it.
+    let is_empty = members.is_empty();
     // `members`/`scores`' borrow of `db` ends above.
     db.charge_memory(mem_charge);
     db.adjust_memory(table_before, table_after);
+    if is_empty {
+        db.remove(key);
+        return Frame::Integer(0);
+    }
 
     if ch {
         Frame::Integer(changed)
