@@ -121,6 +121,117 @@ pub fn is_canonical_i64(value: &[u8]) -> bool {
     true
 }
 
+/// The `i64` grammar `str::parse` accepts, read straight off the bytes.
+///
+/// Exactly equivalent to
+/// `std::str::from_utf8(value).ok().and_then(|s| s.parse::<i64>().ok())`,
+/// and the equivalence is the whole contract — this is **not** a stricter or
+/// looser recognizer, and it is emphatically not [`canonical_i64`], which
+/// rejects leading zeros, a leading `+` and `-0`. `INCR` has always parsed its
+/// stored counter with `str::parse`, and changing *which* spellings a counter
+/// accepts is a client-visible behaviour change that does not belong in a
+/// performance patch.
+///
+/// # Why it exists
+///
+/// `from_utf8` walks every byte to prove the slice is UTF-8, and then
+/// `from_str_radix` walks the same bytes again rejecting everything that is
+/// not an ASCII digit. The first walk is redundant *by construction*: every
+/// byte string the grammar admits is `[+-]?[0-9]+`, which is pure ASCII and
+/// therefore always valid UTF-8. So `from_utf8` can only ever reject inputs
+/// the digit scan was going to reject anyway, and its verdict is never the
+/// deciding one. Redis reaches the same answer in one pass, in `string2ll`.
+///
+/// Per digit this also drops `char::to_digit`'s radix handling and the two
+/// `checked_*` operations, by hoisting the range question out of the loop:
+/// after leading zeros are skipped, more than 19 significant digits cannot
+/// fit an `i64` at all, and 19 digits of 9 (`9_999_999_999_999_999_999`) is
+/// comfortably inside `u64`, so the accumulator provably cannot wrap.
+///
+/// # Guards
+///
+/// [`mod tests`]'s `parse_i64_bytes_matches_std_*` differentials — every
+/// 1-byte input exhaustively, every 2- and 3-byte word over a discriminating
+/// alphabet, both `i64` boundaries digit by digit, zero-padded and
+/// over-long forms, and 200,000 randomised digit-heavy inputs — plus the
+/// `parse_i64_bytes_differential` fuzz target. Any change here must keep the
+/// std equivalence.
+///
+/// ```
+/// use moon::storage::numeric::parse_i64_bytes;
+/// assert_eq!(parse_i64_bytes(b"12345"), Some(12345));
+/// // Unlike `canonical_i64`, the `str::parse` grammar is permissive:
+/// assert_eq!(parse_i64_bytes(b"000000012345"), Some(12345));
+/// assert_eq!(parse_i64_bytes(b"+5"), Some(5));
+/// assert_eq!(parse_i64_bytes(b"-0"), Some(0));
+/// // ... but no more permissive than `str::parse` is:
+/// assert_eq!(parse_i64_bytes(b" 7"), None);
+/// assert_eq!(parse_i64_bytes(b"7 "), None);
+/// assert_eq!(parse_i64_bytes(b""), None);
+/// assert_eq!(parse_i64_bytes(b"-"), None);
+/// assert_eq!(parse_i64_bytes(b"9223372036854775808"), None);
+/// assert_eq!(parse_i64_bytes(b"-9223372036854775808"), Some(i64::MIN));
+/// ```
+#[inline]
+#[must_use]
+pub fn parse_i64_bytes(value: &[u8]) -> Option<i64> {
+    // `from_str_radix` splits the sign first and errors on a bare sign, on an
+    // empty string, and on anything else it cannot read as a digit.
+    let (negative, digits) = match value.first() {
+        Some(b'-') => (true, &value[1..]),
+        Some(b'+') => (false, &value[1..]),
+        _ => (false, value),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+
+    // Leading zeros are accepted by this grammar and carry no magnitude, so
+    // skipping them is what lets the range question leave the loop. `"000"`
+    // and `"-000"` legitimately reduce to no significant digits at all, which
+    // is zero.
+    let mut i = 0usize;
+    while i < digits.len() && digits[i] == b'0' {
+        i += 1;
+    }
+    let significant = &digits[i..];
+
+    // 20 or more significant digits cannot fit an `i64`, so `str::parse`
+    // would return `Err(PosOverflow/NegOverflow)` — and if one of those bytes
+    // is not a digit it would return `Err(InvalidDigit)`. Both are `None`
+    // here, so the scan can stop without deciding which.
+    if significant.len() > 19 {
+        return None;
+    }
+
+    let mut acc: u64 = 0;
+    for &c in significant {
+        let d = c.wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        // Cannot wrap: at most 19 iterations, so `acc` peaks at
+        // 9_999_999_999_999_999_999 < u64::MAX (18_446_744_073_709_551_615).
+        acc = acc * 10 + d as u64;
+    }
+
+    if negative {
+        // `|i64::MIN|` is one past `i64::MAX`, and is the only magnitude that
+        // needs the `u64` accumulator's extra bit. `2^63 as i64` is already
+        // `i64::MIN`, so the cast lands on the right value without a negation
+        // that would overflow.
+        match acc.cmp(&(i64::MAX as u64 + 1)) {
+            std::cmp::Ordering::Greater => None,
+            std::cmp::Ordering::Equal => Some(i64::MIN),
+            std::cmp::Ordering::Less => Some(-(acc as i64)),
+        }
+    } else if acc > i64::MAX as u64 {
+        None
+    } else {
+        Some(acc as i64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::canonical_i64;
@@ -339,6 +450,149 @@ mod tests {
                 "routing verdict diverged on {:?}",
                 String::from_utf8_lossy(&input)
             );
+        }
+    }
+
+    // ── parse_i64_bytes vs the std composition it replaces (moon#942) ──────
+
+    /// The oracle: exactly the expression `INCR` used before
+    /// [`super::parse_i64_bytes`] existed.
+    fn std_parse(value: &[u8]) -> Option<i64> {
+        std::str::from_utf8(value).ok().and_then(|s| s.parse().ok())
+    }
+
+    fn agree(input: &[u8]) {
+        assert_eq!(
+            super::parse_i64_bytes(input),
+            std_parse(input),
+            "parse verdict diverged on {input:?}"
+        );
+    }
+
+    #[test]
+    fn parse_i64_bytes_matches_std_on_hand_picked_shapes() {
+        for input in [
+            &b""[..],
+            b"0",
+            b"-0",
+            b"+0",
+            b"7",
+            b"-7",
+            b"+7",
+            b"-",
+            b"+",
+            b"--1",
+            b"++1",
+            b"+-1",
+            b"-+1",
+            b" 7",
+            b"7 ",
+            b"\t7",
+            b"7\n",
+            b"1_000",
+            b"0x10",
+            b"007",
+            b"-007",
+            b"+007",
+            b"000000000000000000000000000",
+            b"-000000000000000000000000000",
+            b"0000000000000000000000000007",
+            b"-0000000000000000000000000007",
+            // Both boundaries, and one past each.
+            b"9223372036854775807",
+            b"9223372036854775808",
+            b"-9223372036854775808",
+            b"-9223372036854775809",
+            b"00009223372036854775807",
+            b"-00009223372036854775808",
+            // 19, 20 and 21 significant digits.
+            b"9999999999999999999",
+            b"99999999999999999999",
+            b"999999999999999999999",
+            b"-9999999999999999999",
+            b"-99999999999999999999",
+            // Non-UTF-8, and UTF-8 that is not an ASCII digit.
+            b"\xff",
+            b"1\xff",
+            b"\xff1",
+            b"\xc3\xa9",
+            b"1\xc3\xa92",
+            "٣".as_bytes(),
+            "１２３".as_bytes(),
+        ] {
+            agree(input);
+        }
+    }
+
+    /// Exhaustive over every single byte, including every non-UTF-8 one.
+    #[test]
+    fn parse_i64_bytes_matches_std_on_every_one_byte_input() {
+        for b in 0u8..=255 {
+            agree(&[b]);
+        }
+    }
+
+    /// Exhaustive at widths 2 and 3 over an alphabet chosen so every
+    /// interesting transition (sign, zero, digit, separator, non-ASCII) is
+    /// reachable in any position.
+    #[test]
+    fn parse_i64_bytes_matches_std_on_short_words() {
+        const ALPHABET: [u8; 10] = [b'0', b'1', b'9', b'-', b'+', b' ', b'a', b'.', 0x00, 0xff];
+        for &a in &ALPHABET {
+            for &b in &ALPHABET {
+                agree(&[a, b]);
+                for &c in &ALPHABET {
+                    agree(&[a, b, c]);
+                }
+            }
+        }
+    }
+
+    /// Walk both boundaries digit by digit: for every prefix length, nudge the
+    /// last digit up and down. This is where an off-by-one in the range check
+    /// or in the 19-digit cutoff shows up.
+    #[test]
+    fn parse_i64_bytes_matches_std_across_both_boundaries() {
+        for base in [i64::MIN, i64::MAX, 0, -1, 1] {
+            let rendered = base.to_string();
+            agree(rendered.as_bytes());
+            for n in 1..=rendered.len() {
+                agree(rendered[..n].as_bytes());
+                // Zero-padded to the same magnitude, which `str::parse`
+                // accepts and `canonical_i64` does not.
+                for pad in [1usize, 2, 8, 40] {
+                    let (sign, mag) = rendered.split_at(usize::from(base < 0));
+                    let padded = format!("{sign}{}{mag}", "0".repeat(pad));
+                    agree(padded.as_bytes());
+                    let _ = n;
+                }
+            }
+        }
+    }
+
+    /// 200,000 randomised inputs over a digit-heavy alphabet, deterministic
+    /// (xorshift, fixed seed) so a failure is reproducible.
+    #[test]
+    fn parse_i64_bytes_matches_std_on_randomised_inputs() {
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        const ALPHABET: [u8; 16] = [
+            b'0', b'0', b'1', b'2', b'5', b'8', b'9', b'9', b'-', b'+', b' ', b'a', b'.', 0x00,
+            0x80, 0xff,
+        ];
+        let mut input: Vec<u8> = Vec::with_capacity(32);
+        for _ in 0..200_000 {
+            let len = (next() % 25) as usize;
+            input.clear();
+            for _ in 0..len {
+                input.push(ALPHABET[(next() % ALPHABET.len() as u64) as usize]);
+            }
+            agree(&input);
         }
     }
 }

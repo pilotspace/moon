@@ -162,15 +162,18 @@ impl Database {
         let Some(bytes) = entry.value.as_bytes() else {
             return IncrOutcome::WrongType;
         };
-        // Parsed exactly as the pre-#942 handler did — `from_utf8` then
-        // `i64::from_str`, NOT `canonical_i64`. They disagree on leading
-        // zeros and a leading `+`, and changing which one INCR uses is a
-        // client-visible behaviour change that does not belong in a
-        // performance patch.
-        let Ok(text) = std::str::from_utf8(bytes) else {
-            return IncrOutcome::NotInteger;
-        };
-        let Ok(current) = text.parse::<i64>() else {
+        // The `str::parse` grammar, NOT `canonical_i64`. They disagree on
+        // leading zeros and a leading `+`, and changing which one INCR uses is
+        // a client-visible behaviour change that does not belong in a
+        // performance patch — which is why `parse_i64_bytes` is pinned to
+        // `from_utf8(..).ok().and_then(|s| s.parse().ok())` by differential
+        // tests and a fuzz target rather than to a hand-written expectation.
+        //
+        // What it removes is the `from_utf8` walk: every byte string the
+        // grammar admits is `[+-]?[0-9]+`, which is pure ASCII, so UTF-8
+        // validation can only ever reject inputs the digit scan was going to
+        // reject anyway. Redis's `string2ll` makes one pass; so does this.
+        let Some(current) = crate::storage::numeric::parse_i64_bytes(bytes) else {
             return IncrOutcome::NotInteger;
         };
         let Some(new_val) = current.checked_add(delta) else {
@@ -426,6 +429,56 @@ mod incr_in_place_942 {
             ("i64 min + 1", &b"-9223372036854775807"[..], -1),
         ] {
             differential(label, seed_string(v), delta);
+        }
+    }
+
+    /// The accept/reject surface, end to end, against the pre-#942 reference —
+    /// which still parses with `from_utf8` + `str::parse` on purpose, so this
+    /// is a live differential and not a restatement of the new parser.
+    ///
+    /// Every shape here is one a hand-rolled `i64` grammar has historically
+    /// got wrong: the permissive spellings `str::parse` accepts and
+    /// `canonical_i64` does not (`"007"`, `"+5"`, `"-0"`), the ones it rejects
+    /// that look close (`" 7"`, `"7 "`, `"1_0"`), both range boundaries and one
+    /// past each, and bytes that are not UTF-8 at all.
+    ///
+    /// A divergence is client-visible in both directions: accepting what Redis
+    /// rejects makes `INCR` overwrite the caller's bytes with a re-rendered
+    /// number, and rejecting what Redis accepts turns a working counter into a
+    /// permanent `-ERR value is not an integer` for that spelling.
+    #[test]
+    fn the_accept_reject_surface_matches_the_str_parse_reference() {
+        for (label, v) in [
+            ("zero padded", &b"007"[..]),
+            ("zero padded negative", &b"-007"[..]),
+            ("leading plus", &b"+5"[..]),
+            ("negative zero", &b"-0"[..]),
+            ("plus zero", &b"+0"[..]),
+            ("all zeros", &b"000"[..]),
+            ("empty", &b""[..]),
+            ("bare minus", &b"-"[..]),
+            ("bare plus", &b"+"[..]),
+            ("double minus", &b"--1"[..]),
+            ("leading space", &b" 7"[..]),
+            ("trailing space", &b"7 "[..]),
+            ("underscore", &b"1_0"[..]),
+            ("hex", &b"0x10"[..]),
+            ("letters", &b"abc"[..]),
+            ("float", &b"1.5"[..]),
+            ("i64 max", &b"9223372036854775807"[..]),
+            ("i64 max + 1", &b"9223372036854775808"[..]),
+            ("i64 min", &b"-9223372036854775808"[..]),
+            ("i64 min - 1", &b"-9223372036854775809"[..]),
+            ("20 nines", &b"99999999999999999999"[..]),
+            ("padded to 27 bytes", &b"000000000000000000000000007"[..]),
+            ("not utf-8", &b"\xff"[..]),
+            ("digit then not utf-8", &b"1\xff"[..]),
+            ("non-ascii digit", "٣".as_bytes()),
+        ] {
+            // Both directions of delta: a rejected parse must reject
+            // identically whether the command was INCR or DECR.
+            differential(label, seed_string(v), 1);
+            differential(label, seed_string(v), -1);
         }
     }
 

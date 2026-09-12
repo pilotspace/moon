@@ -153,3 +153,8 @@ doc = false
 name = "canonical_i64_differential"
 path = "fuzz_targets/canonical_i64_differential.rs"
 doc = false
+
+[[bin]]
+name = "parse_i64_bytes_differential"
+path = "fuzz_targets/parse_i64_bytes_differential.rs"
+doc = false

@@ -8,6 +8,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`INCR` stops walking its counter twice to read one integer** (moon#942).
+  The path parsed the stored value as `std::str::from_utf8(bytes)` followed by
+  `str::parse::<i64>()`. The first walk proves the slice is UTF-8; the second
+  walks the same bytes again rejecting everything that is not an ASCII digit.
+  The first is redundant *by construction* — every byte string the `i64`
+  grammar admits is `[+-]?[0-9]+`, which is pure ASCII and therefore always
+  valid UTF-8 — so `from_utf8` can only ever reject inputs the digit scan was
+  going to reject anyway, and its verdict is never the deciding one. Redis
+  reaches the same answer in one pass, in `string2ll`.
+
+  `storage::numeric::parse_i64_bytes` reads that grammar straight off the
+  bytes. It also hoists the range question out of the per-digit loop: once
+  leading zeros are skipped, more than 19 significant digits cannot fit an
+  `i64` at all, and 19 digits of 9 is comfortably inside `u64`, so the
+  accumulator provably cannot wrap and the two `checked_*` operations and
+  `char::to_digit`'s radix handling go with it.
+
+  It is **exactly** `from_utf8(b).ok().and_then(|s| s.parse::<i64>().ok())`,
+  including every permissive spelling `str::parse` accepts and `canonical_i64`
+  does not (`"007"`, `"+5"`, `"-0"`). Changing which spellings a counter
+  accepts would be a client-visible behaviour change, so the equivalence is
+  pinned rather than described: differentials over every 1-byte input, every 2-
+  and 3-byte word from a discriminating alphabet, both `i64` boundaries digit
+  by digit, zero-padded and over-long forms and 200,000 randomised inputs; an
+  end-to-end `INCR`/`DECR` differential against the pre-#942 `from_utf8` +
+  `str::parse` reference over 25 accept/reject shapes; and a new
+  `parse_i64_bytes_differential` fuzz target registered in both matrices of
+  `.github/workflows/fuzz.yml`.
+
+  No throughput claim. Removing work is a hypothesis about wall clock, not a
+  measurement of it.
+
 - **Creating a counter with `INCR` costs 2 key lookups, not 5** (moon#942).
   The in-place fast path added for `INCR`/`INCRBY`/`DECR`/`DECRBY` made the
   *hot* counter cost one `DashTable` probe — Redis's single `lookupKeyWrite` —
