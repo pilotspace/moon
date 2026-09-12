@@ -6,6 +6,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Writing a listpack entry no longer touches the allocator, and ZADD no
+  longer walks the listpack twice** (moon#942). Two changes in
+  `src/storage/listpack.rs`, both on the write path HSET, LPUSH, SADD and ZADD
+  share.
+
+  `encode_entry` built a `Vec<u8>` per entry written, copied it into the
+  listpack and dropped it. Measured with a counting allocator over 100
+  same-width replacements — a width that neither grows nor shrinks the buffer,
+  so the only correct answer is zero — it was **four allocations per string
+  entry and two per integer entry**: `Vec::new()` starts at capacity 0, so the
+  encoding head and the backlen each grew it, and `encode_backlen` allocated a
+  second `Vec` of its own. The encoding head now goes into
+  `[u8; LP_MAX_ENTRY_HEAD]` and the backlen into `[u8; LP_MAX_BACKLEN]`, both
+  bounds derived from the encoder's own arms rather than picked; the payload
+  is borrowed and copied straight into the listpack, because no constant can
+  bound it (`hash-max-listpack-value` and friends are runtime config, and the
+  RDB/AOF loaders rebuild listpacks with no element-size limit at all). The
+  four `Vec::splice` call sites became one `write_entry` that moves the tail
+  once with `copy_within` — and not at all when the replacement is the same
+  width, which the common HSET/ZADD update is. Same shape as Redis's
+  `lpInsert`. The counter now reads 0.
+
+  ZADD and ZINCRBY scanned a zset listpack twice to change one score: a
+  borrowed walk down to a pair ORDINAL, then `replace_at` walking back to that
+  ordinal from the head. That is the defect moon#799 fixed for HSET and left
+  standing for the sorted set. `Listpack::update_pair_value` is HSET's
+  `locate_pair`/`replace_pair_value` generalised to a caller whose replacement
+  depends on the old value, so the scan that finds the member writes the new
+  score where it stopped; `replace_pair_value` is now that method with a
+  constant decision. A test-only seek counter pins it — the shape this
+  replaces seeks from the head once, the new one never does.
+
+  **No throughput number is claimed here.** Benchmarks are Linux-only and
+  these were written on macOS; the allocation and walk counts are counts, and
+  the ops/s effect is unmeasured. The encoding itself is unchanged, byte for
+  byte, which is the part that matters for a format `DUMP`/`RESTORE` and the
+  RDB both write out: goldens captured from the old encoder — every integer
+  width at both signs of every boundary, every string width at its seam,
+  non-UTF8 payloads, the moon#795 leading-zero and leading-`+` families, and
+  widening/narrowing/equal-width mutation sequences — were committed before
+  the rewrite and still pass unedited.
+
 ### Documentation
 
 - **`BENCHMARK.md`: re-measured the eight command families on GCE against
