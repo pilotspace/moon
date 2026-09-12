@@ -80,21 +80,107 @@ correction to the audit: `all_integers` uses `.all()`, which short-circuits, so
 at the benchmark's single-member shape the pre-pass is ONE call rather than a
 full argv walk — the expected win is smaller than the audit implied.
 
+## 4. INCR in place (`c0e17c48`) — real
+
+Three DashTable probes and a full entry rebuild collapse to one in-place mutation.
+All eleven side effects of the old `get`+`set` pair were enumerated and decided
+per item; 21 injected defects, 21 caught.
+
+`INCR p=64 +16.5% raw / +14.1% ratio` (floor 1.5%, control CV 1.4%). Required cut
+**0.602 -> 0.358**. INCR p=8 +3.5%; p=1 tie. SET/GET ties.
+
+## 5. Accessor probe collapse (`9ea2d7ec`) — real, and it does NOT invert across arches
+
+SADD's end-to-end probe count 7 -> 4 (hashtable) and 4 -> 2 (listpack); every
+`get_or_create*` hit 3 -> 2; `get_promoted` 4 -> 2.
+
+**This is the change class PERF-08 measured at +11% aarch64 / -17% x86 — opposite
+signs — so it was priced on BOTH architectures before any claim.** It gains on
+both:
+
+| family, p=64 | ARM | x86 |
+|---|---:|---:|
+| SPOP | +9.6% | +8.2% |
+| SADD | +6.6% | +7.2% |
+| LPUSH | +7.8% | +4.7% |
+| HSET | +5.1% | +4.5% |
+| ZADD | +2.9% | +3.0% |
+| **INCR** | **tie** | **tie** |
+
+INCR is a tie on both, independently — the mechanism check. On this branch INCR
+still routes through `Database::get`/`set`, not the collapsed accessors, so it
+*should not* move, and does not. Every family that uses them gained on both
+arches; the one that does not, did not, on both.
+
+## 6. ALL FIVE COMBINED (`ad6b97cc`) — the number that is actually true
+
+The five changes above were each measured in isolation, and isolated effects need
+not add. This is the merged tree measured against the same base.
+
+| family, p=64 | ARM | x86 | moon:redis ratio, ARM |
+|---|---:|---:|---|
+| INCR | **+20.3%** | +15.4% | 0.628x -> **0.733x** |
+| LPUSH | **+15.7%** | +10.7% | 0.700x -> **0.800x** |
+| SADD | **+14.7%** | +10.9% | 0.658x -> **0.747x** |
+| SPOP | **+14.4%** | +9.6% | 0.797x -> **0.893x** |
+| HSET | **+12.6%** | +10.6% | 0.614x -> **0.692x** |
+| ZADD | **+10.5%** | +14.8% | 0.693x -> **0.764x** |
+
+Double digits on every family on ARM, and on every family but SPOP on x86.
+
+### Required cut, start to finish (ARM)
+
+Against the measured **0.626 µs/op** transferable dispatch-path tax:
+
+| family | at campaign start | final | path tax covers it now? |
+|---|---:|---:|:---|
+| **SPOP** | 0.759 | **0.286** | **yes** |
+| **INCR** | 0.602 | **0.340** | **yes** |
+| **LPUSH** | 0.722 | **0.405** | **yes** |
+| **HSET** | 0.861 | **0.592** | **yes** |
+| SADD | 1.063 | **0.685** | short by 0.06 |
+| ZADD | 0.961 | **0.705** | short by 0.08 |
+
+Four families now sit inside the path budget. SADD — which began at nearly double
+it and which nothing but the probe collapse could move — and ZADD are each within
+about a tenth of a microsecond.
+
+**ZADD's figure remains the least precise in the table:** its p=8 control CV is
+9.2%, above the limit at which the delta tool declines to normalise. Its clean
+evidence is p=64 (+10.5% ARM, +14.8% x86, control CV 1.2-2.3%).
+
 ## Standing conclusion
 
-Handler work is doing what the path work could not. After change 2:
+Handler work did what path work alone could not, and the campaign's opening
+premise — that the dispatch-path tax covered every family's gap — was wrong twice
+over (a cut table twelve commits stale, and a tax inflated by GET-only work plus
+the instrument's own ACL check). Both errors were corrected by measurement, not
+argument; see the correction history in `README.md`.
 
-- **LPUSH** is reachable by the dispatch path alone.
-- **HSET** and **ZADD** are within 0.11-0.14 µs/op of it.
-- **SADD** is untouched at 1.088 and remains the outlier. Its 7 accessor probes
-  per op (vs Redis's 1) are the only candidate large enough to close it — and
-  that is precisely the change class PERF-08 measured at **+11% aarch64 /
-  −17% x86**, so it must be priced on both architectures. `moon-bench-x86` is
-  TERMINATED; nothing about it ships on ARM-only evidence.
-- **INCR** is unchanged and still marginal.
+What is now true, measured on both architectures:
+
+- **Every one of the five target families is double-digit faster at p=64 on ARM**,
+  and on x86 too except SPOP at +9.6%.
+- **SPOP, INCR, LPUSH and HSET** have required cuts inside the 0.626 µs/op the
+  dispatch path can supply. Finishing them is now path work, tracked in #942.
+- **SADD and ZADD** are 0.06 and 0.08 µs/op outside it.
+- The **wake-guard hoist measured as a tie** and is recorded as one. Its three
+  non-tie cells were disqualified by mechanism, not by taste.
+
+### What would falsify any of this
+
+Every A/B here is `--shards 1`, `--reps 5`, one host per architecture, against
+redis 7.0.15. A re-run on a different host, a different Redis build, or at a
+different shard count could move these. Rows whose Redis control exceeded 5% CV
+are marked and were never normalised. `C`/`B` is a two-point solve — exactly
+determined, no residual — so read every cut as a band, not a figure.
 
 ## Files
 
-- `ab-wakeguard-base-d3b8a206-arm.csv` — the shared base matrix.
-- `ab-wakeguard-hoist-908609c1-arm.csv` — wake-guard hoist.
+- `ab-wakeguard-base-d3b8a206-arm.csv` — the shared ARM base matrix.
+- `ab-wakeguard-hoist-908609c1-arm.csv` — wake-guard hoist (tie).
 - `ab-listpack-0e725a5b-arm.csv` — listpack + one-walk.
+- `ab-incr-c0e17c48-arm.csv` — INCR in place.
+- `ab-probes-9ea2d7ec-{arm,x86}.csv` — accessor probe collapse, both arches.
+- `ab-base-d3b8a206-x86.csv` — the x86 base matrix.
+- `ab-combined-ad6b97cc-{arm,x86}.csv` — all five changes merged, both arches.
