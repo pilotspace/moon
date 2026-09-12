@@ -49,6 +49,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fuzz target `canonical_i64_differential`** — pins
+  `is_canonical_i64(d) == canonical_i64(d).is_some()` for every byte string,
+  plus the moon#795 property itself (an accepted value must render back to the
+  caller's exact bytes) and a suffix-extension check that a length-confused
+  recognizer would fail. Two hand-written recognizers of one grammar stay
+  honest only by agreeing, and a divergence here is a data-corruption bug on a
+  hot path, not a cosmetic one. Registered in `fuzz/Cargo.toml` and in **both**
+  matrices in `.github/workflows/fuzz.yml` — an unlisted target never runs.
+
+  **The target was proved to find its own bug before being trusted.** Against
+  the correct implementation it ran 16,290,362 executions in 46s with no
+  finding; against an implementation with the `-0` rule removed it crashed on
+  `[45, 48]` — `"-0"`, one of the original moon#795 vectors — reached by the
+  suffix-extension check from the one-byte input `"-"`.
+
 - **`storage::numeric::is_canonical_i64`** — `canonical_i64`'s verdict without
   its value, for the callers that only need to ROUTE. `canonical_i64` costs a
   UTF-8 validation, an `i64` parse, an `itoa` render and a `memcmp`; that is the
