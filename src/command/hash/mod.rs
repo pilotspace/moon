@@ -2754,4 +2754,79 @@ mod tests {
             "the bound is inclusive (moon#896)"
         );
     }
+
+    #[test]
+    fn hdel_recomputes_the_ttl_minimum_across_a_multi_field_batch() {
+        // The subtlest thing the HDEL collapse moved (moon#942). The
+        // per-field spelling recomputed `min_expiry_ms` inside every call
+        // that removed the field currently holding the minimum, so a batch
+        // recomputed it once per such field. The batch now sets a flag and
+        // recomputes ONCE, over the sidecar as it stands at the end.
+        //
+        // (a) the field holding the min goes, others survive.
+        let mut db = Database::new();
+        seed_hash(
+            &mut db,
+            b"h",
+            &[(b"f1", b"v1"), (b"f2", b"v2"), (b"f3", b"v3")],
+        );
+        db.set_cached_now_ms_for_test(0);
+        for (ts, f) in [
+            (&b"1000"[..], &b"f1"[..]),
+            (b"5000", b"f2"),
+            (b"9000", b"f3"),
+        ] {
+            hpexpireat(&mut db, &make_args(&[b"h", ts, b"FIELDS", b"1", f]));
+        }
+        assert_eq!(db.hash_min_expiry_ms_for_test(b"h"), Some(1000));
+
+        // One batch removes the min holder AND a field that is not the min.
+        assert_eq!(
+            hdel(&mut db, &make_args(&[b"h", b"f1", b"f3"])),
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            db.hash_min_expiry_ms_for_test(b"h"),
+            Some(5000),
+            "the minimum must be recomputed from what SURVIVED the batch, not \
+             from the state after the first removal"
+        );
+
+        // (b) removing every TTL'd field downgrades the encoding back to a
+        //     plain `Hash`, exactly once, and leaves the untouched field.
+        let mut db = Database::new();
+        seed_hash(
+            &mut db,
+            b"h",
+            &[(b"f1", b"v1"), (b"f2", b"v2"), (b"keep", b"v")],
+        );
+        db.set_cached_now_ms_for_test(0);
+        for (ts, f) in [(&b"1000"[..], &b"f1"[..]), (b"5000", b"f2")] {
+            hpexpireat(&mut db, &make_args(&[b"h", ts, b"FIELDS", b"1", f]));
+        }
+        assert!(db.hash_min_expiry_ms_for_test(b"h").is_some());
+        assert_eq!(
+            hdel(&mut db, &make_args(&[b"h", b"f1", b"f2"])),
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            db.hash_min_expiry_ms_for_test(b"h"),
+            None,
+            "the last per-field TTL going must downgrade `HashWithTtl` back to \
+             a plain `Hash` (moon#861)"
+        );
+        assert_eq!(
+            hget(&mut db, &make_args(&[b"h", b"keep"])),
+            Frame::BulkString(Bytes::from_static(b"v")),
+            "the untouched field must survive the downgrade"
+        );
+        let running = db.estimated_memory();
+        db.recalculate_memory();
+        assert_eq!(
+            running,
+            db.estimated_memory(),
+            "the sidecar box credit went missing across the batch downgrade \
+             (moon#788/moon#861)"
+        );
+    }
 }
