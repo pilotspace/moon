@@ -21,6 +21,7 @@
 use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::dashtable::take_key_lookups;
+use crate::storage::db::SetHandle;
 use crate::storage::db_kind::{HashKind, ListKind, SetKind, SortedSetKind};
 use crate::storage::entry::Entry;
 use bytes::Bytes;
@@ -188,13 +189,13 @@ fn get_or_create_set_listpack_probe_budget() {
 
     let (r, miss) = probes(|| {
         db.get_or_create_set_listpack(b"s", |_, _| false)
-            .map(|o| o.is_some())
+            .map(|h| matches!(h, SetHandle::Listpack(_)))
     });
     assert_eq!(r, Ok(true));
 
     let (r, hit) = probes(|| {
         db.get_or_create_set_listpack(b"s", |_, _| false)
-            .map(|o| o.is_some())
+            .map(|h| matches!(h, SetHandle::Listpack(_)))
     });
     assert_eq!(r, Ok(true));
 
@@ -213,7 +214,7 @@ fn get_or_create_set_listpack_probe_budget() {
     }
     let (r, absorb) = probes(|| {
         db2.get_or_create_set_listpack(b"t", |_, _| true)
-            .map(|o| o.is_some())
+            .map(|h| matches!(h, SetHandle::Listpack(_)))
     });
     assert_eq!(
         r,
@@ -368,7 +369,7 @@ fn expired_key_reads_as_absent_through_every_compact_accessor() {
         .map(|o| o.is_some()));
     case!("set_listpack", |db| db
         .get_or_create_set_listpack(b"k", |_, _| false)
-        .map(|o| o.is_some()));
+        .map(|h| matches!(h, SetHandle::Listpack(_))));
 }
 
 #[test]
@@ -508,10 +509,10 @@ fn the_intset_to_listpack_swing_lands_in_the_ledger() {
     let ledger_before = db.used_memory;
 
     match db.get_or_create_set_listpack(b"t", |_, _| true) {
-        Ok(Some(_)) => {}
+        Ok(SetHandle::Listpack(_)) => {}
         other => panic!(
             "the intset should have been absorbed, got {:?}",
-            other.map(|o| o.is_some())
+            other.map(|h| matches!(h, SetHandle::Listpack(_)))
         ),
     }
 

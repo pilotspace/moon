@@ -6,6 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use crate::protocol::Frame;
 use crate::storage::bptree::BPTree;
 use crate::storage::compact_key::CompactKey;
+use crate::storage::compact_value::RedisValueRef;
 use crate::storage::dashtable::DashTable;
 use crate::storage::db_kind::{self, OwnedKind, ValueKind};
 use crate::storage::db_read::{HashRef, ListRef, SetRef, SortedSetRef, StreamRef};
@@ -100,6 +101,28 @@ impl std::ops::Deref for EntryView<'_> {
     fn deref(&self) -> &Entry {
         self.entry()
     }
+}
+
+/// What [`Database::get_or_create_set_listpack`] found, handed back as the
+/// mutable handle the accessor ALREADY HOLDS (moon#942).
+///
+/// The accessor used to answer `Ok(None)` for a set that was not a listpack,
+/// and its callers then re-entered `get_or_create_set` — a second full
+/// classification and probe pair for a key the first call had in its hand.
+/// That second accessor was the largest remaining duplicate in `SADD`, and it
+/// landed on the HASHTABLE regime (~61% of keys at the benchmark's own p=64
+/// point), not the miss regime.
+///
+/// Two borrows of the same entry, so no variant widens `RedisValue` and
+/// `storage/entry.rs`'s `size_of::<RedisValue>() <= 48` (moon#861) is
+/// untouched.
+pub enum SetHandle<'a> {
+    /// A live `SetListpack` — mutate the compact form in place.
+    Listpack(&'a mut crate::storage::listpack::Listpack),
+    /// The full `IndexSet`. Either the key already held one, or it held a
+    /// `SetIntset` the moon#899 absorb refused and the accessor promoted with
+    /// `SetKind::upgrade`, billing the swing to `used_memory` itself.
+    Full(&'a mut crate::storage::entry::SetValue),
 }
 
 /// What ONE hot-plane lookup says about a key (moon#942).
@@ -656,10 +679,19 @@ impl Database {
 
     /// Get or create a set entry as a listpack. Creates new keys as `SetListpack`.
     ///
-    /// Returns `Ok(Some(&mut Listpack))` when the key is a `SetListpack`,
-    /// `Ok(None)` when it already holds the full `IndexSet` form or a
-    /// `SetIntset` (the caller falls through to the intset path or to
-    /// `get_or_create_set`), and `Err(WRONGTYPE)` for a non-set type.
+    /// Returns [`SetHandle::Listpack`] when the key is a `SetListpack`,
+    /// [`SetHandle::Full`] when it already holds the full `IndexSet` form or a
+    /// `SetIntset` the absorb refused (promoted here, see below), and
+    /// `Err(WRONGTYPE)` for a non-set type.
+    ///
+    /// moon#942: the `Full` arm used to be `Ok(None)`, and every caller
+    /// answered it by calling `get_or_create_set` — which re-ran the entire
+    /// accessor skeleton (`hot_state`, `settle_not_live`, `get_mut`,
+    /// `stamp_mutation`, `SetKind::upgrade`) on the key this call had already
+    /// classified and was still holding. Handing the entry back instead makes
+    /// `SADD` cost ONE accessor on every encoding. The `SetKind::upgrade` and
+    /// its `used_memory` delta moved with it, so the ledger arithmetic is the
+    /// same call with the same delta, applied one accessor earlier.
     ///
     /// This is the accessor `SADD` was missing (moon#787). `SetListpack` was
     /// wired end to end — `Entry::new_set_listpack`, the value codec, the RDB
@@ -684,8 +716,10 @@ impl Database {
     /// accessor supplies the two facts only it can see cheaply: the member
     /// count, and the rendered width of the widest integer (an intset stores
     /// `i64`s, a listpack stores their decimal spelling, and the value
-    /// threshold applies to the spelling). Refused, the intset answers
-    /// `Ok(None)` and the caller promotes it to the full form as before.
+    /// threshold applies to the spelling). Refused, the intset is
+    /// promoted to the full form HERE and answered as [`SetHandle::Full`];
+    /// the caller used to do that promotion itself through
+    /// `get_or_create_set`.
     ///
     /// Byte transparency across the edge (moon#795): every value in an intset
     /// arrived through `numeric::canonical_i64`, so its `itoa` rendering is
@@ -712,12 +746,13 @@ impl Database {
         &mut self,
         key: &[u8],
         absorb_intset: impl FnOnce(usize, usize) -> bool,
-    ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
+    ) -> Result<SetHandle<'_>, Frame> {
         let now_ms = self.cached_now_ms;
         // moon#942: ONE lookup decides the preamble. `settle_not_live` still
         // promotes a cold-spilled set before this fabricates an empty
-        // listpack, so a promoted value lands in the `Ok(None)` arm below
-        // rather than being fabricated over.
+        // listpack, so a promoted value — which cold storage always stores as
+        // `RedisValue::Set`, never as a compact encoding — lands in the
+        // `SetHandle::Full` arm below rather than being fabricated over.
         let state = self.hot_state(key, now_ms);
         if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
             self.insert_fresh(key, Entry::new_set_listpack());
@@ -738,9 +773,30 @@ impl Database {
                 .saturating_add(after)
                 .saturating_sub(before);
         }
+        // Classify ONCE, on the handle already held, before deciding whether
+        // the `SetKind::upgrade` below may run: `upgrade` flattens a
+        // `SetListpack` too, and keeping that one compact is the whole reason
+        // this accessor exists (moon#787).
+        let full = match entry.value.as_redis_value() {
+            RedisValueRef::SetListpack(_) => false,
+            RedisValueRef::Set(_) | RedisValueRef::SetIntset(_) => true,
+            _ => return Err(Self::wrongtype_error()),
+        };
+        if !full {
+            return match entry.value.as_redis_value_mut() {
+                Some(RedisValue::SetListpack(lp)) => Ok(SetHandle::Listpack(lp)),
+                _ => Err(Self::wrongtype_error()),
+            };
+        }
+        // moon#788/#942: the compact -> full swing, the SAME `SetKind::upgrade`
+        // call `get_or_create` would have made one accessor later, with the
+        // same delta applied to the same counter. A `SetIntset` the absorb
+        // refused converts here; an entry already in the full form returns a
+        // zero delta. Disjoint field borrows, as above.
+        let encoding_delta = db_kind::SetKind::upgrade(entry);
+        self.used_memory = self.used_memory.saturating_add_signed(encoding_delta);
         match entry.value.as_redis_value_mut() {
-            Some(RedisValue::SetListpack(lp)) => Ok(Some(lp)),
-            Some(RedisValue::Set(_)) | Some(RedisValue::SetIntset(_)) => Ok(None),
+            Some(RedisValue::Set(set)) => Ok(SetHandle::Full(set)),
             _ => Err(Self::wrongtype_error()),
         }
     }

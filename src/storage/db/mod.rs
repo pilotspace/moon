@@ -15,7 +15,7 @@ pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile};
 pub(crate) use incr::IncrOutcome;
 
 pub use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef, StreamRef};
-pub use accessors::EntryView;
+pub use accessors::{EntryView, SetHandle};
 
 use super::compact_key::CompactKey;
 use super::dashtable::DashTable;
@@ -3148,7 +3148,9 @@ mod ledger_consistency_788 {
         // `set-max-intset-entries`: a legitimate large intset that the
         // listpack edge must refuse.
         let mut ints = vec![f(b"s")];
-        let spellings: Vec<String> = (0..limits.set_entries + 72).map(|v| v.to_string()).collect();
+        let spellings: Vec<String> = (0..limits.set_entries + 72)
+            .map(|v| v.to_string())
+            .collect();
         ints.extend(spellings.iter().map(|v| f(v.as_bytes())));
         sadd(&mut db, &ints);
         assert_eq!(

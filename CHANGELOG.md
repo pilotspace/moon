@@ -8,6 +8,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`SADD` on a hashtable set stops paying for a second accessor: 4 key
+  lookups → 2** (moon#942). `get_or_create_set_listpack` answered `Ok(None)`
+  for a set that was already an `IndexSet` — or a `SetIntset` the moon#899
+  absorb refused — and every caller then called `get_or_create_set`, which
+  re-ran the entire accessor skeleton (`hot_state`, `settle_not_live`,
+  `get_mut`, `stamp_mutation`, `SetKind::upgrade`) against the key the first
+  call had already classified and was still holding. The accessor now returns
+  a `SetHandle { Listpack(&mut Listpack), Full(&mut SetValue) }` and runs the
+  upgrade on that handle, so the second accessor is gone.
+
+  This lands on the **hashtable** regime, not the miss regime — 122 of 200
+  keys at the benchmark's own p=64 point — which is why it is the largest
+  remaining item in the SADD residue the previous entry left open.
+
+  **Measured with the `cfg(test)` DashTable key-lookup counter**, on the
+  benchmark's own `SADD set:<12-digit> <12-digit>` shape:
+
+  | `SADD` arm | before | after |
+  |---|---:|---:|
+  | absent key (create) | 3 | 3 |
+  | listpack steady state | 2 | 2 |
+  | **hashtable steady state** | **4** | **2** |
+  | **refused-intset promotion** | **4** | **2** |
+
+  A probe count is a count. It is **not** a throughput claim, and this entry
+  makes none: the PERF-08 precedent (moon#789) measured +11% on aarch64 and
+  −17% on x86_64 for a probe reduction — the two architectures disagreed in
+  sign — so the wall-clock question belongs to a Linux bench host and to
+  nothing else.
+
+  **The ledger is byte-identical across the move.** The `used_memory` delta
+  that moved is the same `SetKind::upgrade` call returning the same `isize`,
+  applied to the same counter one accessor earlier; nothing is charged twice
+  and nothing is dropped. Two new guards in `ledger_consistency_788` assert
+  the running ledger against a from-scratch `recalculate_memory` at every rung
+  of one key's ladder — empty → intset → the moon#899 absorb → listpack → the
+  64/65-byte `set-max-listpack-value` boundary in both directions → hashtable
+  → duplicate → `DEL` back to the floor — and again across the intset →
+  `IndexSet` promotion. Both were proven able to fail: deleting the delta line
+  from the new `Full` arm makes the refused-intset guard report a 729 B ledger
+  against a 14,665 B recompute. moon#814 is why this matters — a charge
+  stranded on a branch drives `used_memory` monotonically DOWN, without bound,
+  on a path any unprivileged client can drive, until `--maxmemory` can never
+  fire.
+
+  **Side effect on WATCH, in the correct direction.** moon#926's rule is that
+  acquiring a mutable handle IS the version bump, and the hashtable arm was
+  acquiring two, so one `SADD` moved a watched key's version by two. It now
+  moves it by one. A watcher aborted either way, so this is not a behaviour
+  fix; it is the observable tell that the duplicate accessor is gone, and a
+  new test pins it on all three encodings. **moon#940 is untouched and still
+  open**: `stamp_mutation` still fires before the arm that answers
+  `Err(WRONGTYPE)`, so a rejected `SADD` still dirties the key. A test pins
+  that at exactly one bump, so this change is provably neutral on it — two
+  would mean a handle was added, zero would mean #940 was fixed as an
+  unbenchmarked side effect.
+
+  Encoding behaviour is unchanged and was checked against a live redis 8.6.1
+  on every rung of the ladder above, plus the entry-count boundary, `SREM` on
+  both compact forms, and the moon#795 byte-transparency cases (`007`, `+7`,
+  `-0`, both `i64` limits) re-asked after each promotion: every `OBJECT
+  ENCODING`, reply and `SISMEMBER` matched, and the whole-dataset `DEBUG
+  DIGEST` was identical (verified discriminating — one extra member on moon
+  alone changes it).
+
 - **The accessor miss path drops its fourth probe: cold promotion stops
   re-asking whether the key is hot** (moon#942). `promote_cold_if_present`
   opens with a `contains_key`, and `accessors::settle_not_live` — the only
