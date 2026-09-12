@@ -350,6 +350,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`server/conn` (monoio): a single-shard server stops building and polling
+  the cross-shard coordinator's future once per command.**
+  `try_handle_cross_shard_commands` is an `async fn` taking six arguments whose
+  very first statement is `if ctx.num_shards <= 1 { return false }` — but its
+  call site was guarded only by `!txn_multikey_write`, so at `--shards 1` every
+  `GET`, `INCR`, `SADD`, `LPUSH`, `HSET` and `ZADD` constructed that future,
+  awaited it, and was told there was nothing to coordinate. The same predicate
+  now sits at the call site; the inner early-out stays, so the site is an
+  optimisation rather than a correctness dependency.
+
+  It is deliberately **not** gated on `skip_name_gates`.
+  `MGET`/`MSET`/`UNLINK`/`EXISTS` carry `NO_INTERCEPT` *and* are claimed by the
+  gate's own multi-key arm, so the flag would silently route them by their
+  FIRST key and execute the whole command against that one shard's slice. That
+  failure was reproduced deliberately, by mutating the gate to
+  `ctx.num_shards > 8`: `MSET` across four shards then loses three of its four
+  values and `DBSIZE` answers `1` instead of `4`.
+
+  Above one shard nothing changes — the predicate is the one the callee already
+  applied. **No throughput number is claimed:** benchmarks are Linux-only and
+  this was written and verified on macOS. `tests/cross_shard_gate_shard_count.rs`
+  runs every command the gate claims at `--shards 1` and `--shards 4` with
+  identical assertions, because this seam's defects (moon#507, moon#513,
+  moon#592, moon#937) were all invisible at one shard.
+
 - **`storage`: the listpack write path stops walking twice and stops
   allocating per entry it walks past (moon#799).** `get_at`, `remove_at` and
   `replace_at` reached their index with the OWNED decoder, which copies every

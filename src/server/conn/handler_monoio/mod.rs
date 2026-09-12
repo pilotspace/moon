@@ -2834,7 +2834,25 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // routing, which captures it when the owner is local and refuses it
             // via the cross-shard guard when it is not. Spread key sets were
             // already refused above.
-            if !txn_multikey_write
+            //
+            // `ctx.num_shards > 1` is the SAME predicate the callee opens with
+            // (`dispatch.rs`, first statement: `if ctx.num_shards <= 1 { return
+            // false }`) — hoisted here so a single-shard server does not build
+            // and poll an `async fn` future, with six arguments, once per
+            // command only to be told there is nothing to coordinate. The inner
+            // early-out stays: it is the function's own contract, and keeping
+            // both makes this site an optimisation rather than a correctness
+            // dependency.
+            //
+            // It must be THIS predicate and not `skip_name_gates`.
+            // `MGET`/`MSET`/`UNLINK`/`EXISTS` carry `NO_INTERCEPT` *and* are
+            // claimed by the multi-key arm below, so gating on the flag would
+            // silently drop them into ordinary routing — which hashes their
+            // FIRST key and runs the whole command against that one shard's
+            // slice (moon#592's shape). `num_shards > 1` cannot do that: at one
+            // shard the arm it skips could only have returned `false`.
+            if ctx.num_shards > 1
+                && !txn_multikey_write
                 && dispatch::try_handle_cross_shard_commands(
                     cmd,
                     cmd_args,
