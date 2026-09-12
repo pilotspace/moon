@@ -61,7 +61,7 @@ fn get_or_create_probe_budget() {
 
     assert_eq!(
         (hit, miss),
-        (3, 6),
+        (2, 4),
         "get_or_create probe budget moved (hit={hit}, miss={miss}) — moon#942. \
          The hit path is `get` (liveness) then `get_mut` (hand out); the miss \
          path adds `promote_cold_if_present`'s own `contains_key` and the \
@@ -85,7 +85,7 @@ fn get_mut_if_present_probe_budget() {
 
     assert_eq!(
         (hit, miss),
-        (3, 4),
+        (2, 3),
         "get_mut_if_present probe budget moved (hit={hit}, miss={miss}) — moon#942."
     );
 }
@@ -103,7 +103,7 @@ fn get_promoted_probe_budget() {
 
     assert_eq!(
         (hit, miss),
-        (4, 5),
+        (2, 3),
         "get_promoted probe budget moved (hit={hit}, miss={miss}) — moon#942."
     );
 }
@@ -261,7 +261,7 @@ fn sadd_end_to_end_probe_budget() {
 
     assert_eq!(
         (create, listpack_hit, hashtable_hit),
-        (7, 4, 7),
+        (7, 4, 6),
         "SADD end-to-end probe budget moved \
          (create={create}, listpack_hit={listpack_hit}, hashtable_hit={hashtable_hit}) \
          — moon#942. The hashtable arm pays TWO accessors: \

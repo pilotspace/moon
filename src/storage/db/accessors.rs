@@ -67,7 +67,89 @@ impl std::ops::Deref for EntryView<'_> {
     }
 }
 
+/// What ONE hot-plane lookup says about a key (moon#942).
+///
+/// The accessor skeleton used to spend three DashTable lookups before it
+/// handed anything out: a `get` inside `drop_if_expired`, a `contains_key`,
+/// then the `get_mut`. The first two answer the same question — "is there a
+/// live entry here?" — and this enum is that question asked once.
+///
+/// `Database::get` (`kv_ops.rs:22`) has used the same shape since it was
+/// written; the typed accessors now share it rather than each re-deriving it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HotState {
+    /// Present and not expired at the caller's `now_ms`.
+    Live,
+    /// Present but past its deadline. Must read as ABSENT, and the entry has
+    /// to be removed through `remove_hot` so the expiry index stays in
+    /// lock-step (moon#541).
+    Expired,
+    /// Not in the hot plane. May still be in the cold tier or mid-spill.
+    Absent,
+}
+
 impl Database {
+    /// Classify `key` in the hot plane with EXACTLY ONE DashTable lookup.
+    ///
+    /// This is the single probe that replaced the `drop_if_expired` +
+    /// `contains_key` pair (moon#942). Expiry is *observed* here and acted on
+    /// by [`Self::settle_not_live`] — the split exists only because dropping
+    /// an expired entry needs `&mut self` and classifying it does not.
+    #[inline]
+    fn hot_state(&self, key: &[u8], now_ms: u64) -> HotState {
+        match self.data.get(key) {
+            Some(e) if e.is_expired_at(now_ms) => HotState::Expired,
+            Some(_) => HotState::Live,
+            None => HotState::Absent,
+        }
+    }
+
+    /// Resolve a key [`Self::hot_state`] just reported as NOT `Live`. Returns
+    /// `true` if the key is resident in the hot plane afterwards.
+    ///
+    /// Both the expired and the absent arm attempt cold promotion, exactly as
+    /// the `drop_if_expired` + `contains_key` + `promote_cold_if_present`
+    /// sequence did: dropping an expired HOT copy is not a statement about the
+    /// cold plane, and skipping the promotion would let a write on an evicted
+    /// key silently shadow the cold copy (moon#459 / the P0 this accessor
+    /// family carries).
+    ///
+    /// The return value replaces the second `contains_key`:
+    /// `promote_cold_if_present`'s documented contract is "`true` iff `key` is
+    /// present in hot RAM after this call", and `promote_cold_outcome` honours
+    /// it on every arm — `Hit` inserts and answers `true`, `Expired` and
+    /// `Miss` insert nothing and answer `false`.
+    #[inline]
+    fn settle_not_live(&mut self, key: &[u8], now_ms: u64, state: HotState) -> bool {
+        debug_assert!(
+            state != HotState::Live,
+            "settle_not_live called on a live key"
+        );
+        if state == HotState::Expired {
+            // Write-path expired drop: the incoming write supersedes the key
+            // everywhere, so no #542 hide/queue here — but the removal must
+            // still go through `remove_hot` so the expiry index stays in
+            // lock-step (moon#541).
+            self.remove_hot(key);
+        }
+        self.promote_cold_if_present(key, now_ms)
+    }
+
+    /// Insert a freshly fabricated, empty container at `key` and charge it.
+    ///
+    /// Stamps the per-db creation ticket so a WATCHing client can tell this
+    /// container from the one that occupied the key before (see
+    /// `Database::birth_counter`), then bills `entry_overhead` — the two
+    /// steps every `get_or_create*` fabrication path used to spell out for
+    /// itself. One implementation means one place for the ledger to be right.
+    #[inline]
+    fn insert_fresh(&mut self, key: &[u8], mut entry: Entry) {
+        let version = self.next_birth_version();
+        entry.set_version(version);
+        self.used_memory += entry_overhead(key, &entry);
+        self.data.insert(CompactKey::from(key), entry);
+    }
+
     // ── W5: generic typed accessors ─────────────────────────────────────
     //
     // The per-type accessor skeleton (expiry check → cold promote/
@@ -131,19 +213,13 @@ impl Database {
     /// upgrades the kind's compact encoding(s) in place.
     pub fn get_or_create<K: OwnedKind>(&mut self, key: &[u8]) -> Result<K::Mut<'_>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
-            if !self.data.contains_key(key) {
-                let mut entry = K::new_entry();
-                // Fresh incarnation: stamp the per-db creation ticket so a
-                // WATCHing client can tell this container from the one that
-                // occupied the key before (see `Database::birth_counter`).
-                entry.set_version(self.next_birth_version());
-                let k = CompactKey::from(key);
-                self.used_memory += entry_overhead(key, &entry);
-                self.data.insert(k, entry);
-            }
+        // moon#942: ONE lookup decides the whole preamble. What used to be a
+        // `get` (expiry) + `contains_key` + `get_mut` is now `hot_state` +
+        // `get_mut`; the create arm drops a second `contains_key` by reading
+        // `promote_cold_if_present`'s own return value instead.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            self.insert_fresh(key, K::new_entry());
         }
         let Some(entry) = self.data.get_mut(key) else {
             // Should not happen — insert was just called above. Log and
@@ -193,9 +269,10 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<K::Mut<'_>>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
+        // moon#942: one lookup for the preamble, one to hand the entry out.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live {
+            self.settle_not_live(key, now_ms, state);
         }
         let Some(entry) = self.data.get_mut(key) else {
             return Ok(None);
@@ -247,24 +324,26 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<K::Shared<'_>>, Frame> {
         let now_ms = self.cached_now_ms;
-        self.drop_if_expired(key, now_ms);
-        if !self.data.contains_key(key) {
-            self.promote_cold_if_present(key, now_ms);
+        // moon#942: two lookups, not four. The old shape paid a `get` for
+        // expiry, a `contains_key`, a `get_mut` to run the upgrade, and then
+        // a FOURTH `get` purely to re-borrow the same entry immutably — the
+        // upgrade's `&mut` reborrows to `&` for free.
+        let state = self.hot_state(key, now_ms);
+        if state != HotState::Live {
+            self.settle_not_live(key, now_ms, state);
         }
-        if let Some(entry) = self.data.get_mut(key) {
-            // moon#788: a compact→full encoding upgrade changes the entry's real
-            // size; charge the difference or the ledger silently desynchronises
-            // from the keyspace. Disjoint field borrows: `entry` borrows
-            // `self.data`, the counter is a separate field.
-            let encoding_delta = K::upgrade(entry);
-            self.used_memory = self.used_memory.saturating_add_signed(encoding_delta);
-        }
-        match self.data.get(key) {
-            None => Ok(None),
-            Some(entry) => match K::project_ref(entry.value.as_redis_value()) {
-                Ok(r) => Ok(Some(r)),
-                Err(db_kind::WrongType) => Err(Self::wrongtype_error()),
-            },
+        let Some(entry) = self.data.get_mut(key) else {
+            return Ok(None);
+        };
+        // moon#788: a compact→full encoding upgrade changes the entry's real
+        // size; charge the difference or the ledger silently desynchronises
+        // from the keyspace. Disjoint field borrows: `entry` borrows
+        // `self.data`, the counter is a separate field.
+        let encoding_delta = K::upgrade(entry);
+        self.used_memory = self.used_memory.saturating_add_signed(encoding_delta);
+        match K::project_ref(entry.value.as_redis_value()) {
+            Ok(r) => Ok(Some(r)),
+            Err(db_kind::WrongType) => Err(Self::wrongtype_error()),
         }
     }
 
