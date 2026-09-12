@@ -1,0 +1,21 @@
+# moon: sha256:8a9ca343d48a8e62 (/home/tindang/moon-5bf716a9 == main d3b8a206 for these paths; d3b8a206 is docs-only)
+# redis-benchmark: redis-benchmark 7.0.15
+# cpu: Neoverse-N1 (8 cores)
+# kernel: Linux 7.0.0-1011-gcp
+# shards: 1 keyspace: 100000 dbsize: 86544 reps: 3
+# date: 2026-09-11T23:49:00Z
+# NOTE: produced by the pre-cleanup form of scripts/bench-path-tax.sh;
+#       the committed script emits this header itself.
+leg,depth,rps,inline_before,inline_after,inline_delta
+inline,8,510855.69,200000,600000,400000
+inline,64,1314664.25,600000,2100032,1500032
+generic,8,325732.88,2100032,2100032,0
+generic,64,584352.19,2100032,2100032,0
+generic,8,325203.25,2100032,2100032,0
+generic,64,593132.44,2100032,2100032,0
+inline,8,501253.16,2100032,2500032,400000
+inline,64,1269062.50,2500032,4000064,1500032
+inline,8,499375.78,4000064,4400064,400000
+inline,64,1273371.88,4400064,5900096,1500032
+generic,8,319233.84,5900096,5900096,0
+generic,64,579834.56,5900096,5900096,0

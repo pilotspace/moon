@@ -1,0 +1,28 @@
+# moon: sha256:8a9ca343d48a8e62 (/home/tindang/moon-head-d3b8a2061)
+# redis-benchmark: redis-benchmark 7.0.15
+# cpu:  (8 cores)
+# kernel: Linux 7.0.0-1011-gcp
+# shards: 1 keyspace: 100000 dbsize: 86609 reps: 5
+# mode: aclcost command: lpush l:__rand_int__ xxxxxxxx
+# date: 2026-09-12T03:36:19Z
+leg,depth,rps,inline_before,inline_after,inline_delta
+unrestricted,8,244498.77,200000,200000,0
+unrestricted,64,421949.91,200000,200000,0
+restricted,8,246002.45,200000,200000,0
+restricted,64,373793.16,200000,200000,0
+restricted,8,251414.22,200000,200000,0
+restricted,64,369739.19,200000,200000,0
+unrestricted,8,251730.66,200000,200000,0
+unrestricted,64,403885.84,200000,200000,0
+unrestricted,8,258899.69,200000,200000,0
+unrestricted,64,397570.09,200000,200000,0
+restricted,8,231481.47,200000,200000,0
+restricted,64,332453.91,200000,200000,0
+restricted,8,219538.97,200000,200000,0
+restricted,64,308585.06,200000,200000,0
+unrestricted,8,228180.27,200000,200000,0
+unrestricted,64,367564.81,200000,200000,0
+unrestricted,8,249843.86,200000,200000,0
+unrestricted,64,393090.16,200000,200000,0
+restricted,8,243013.36,200000,200000,0
+restricted,64,371478.94,200000,200000,0

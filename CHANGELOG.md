@@ -49,6 +49,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `scripts/bench-path-tax.sh` + `scripts/bench-path-tax-report.py` +
+  `scripts/bench-solve-cb.py` — decompose what moon's **generic** command path
+  costs over its **inline** path for identical handler work, and how much of that
+  transfers to the write families. `can_inline_reads` is gated on
+  `acl_skip_allowed()`, so a non-`unrestricted` ACL user runs the same handler
+  through the full generic preamble; `--mode aclcost` then removes the ACL
+  confound by comparing unrestricted vs restricted on an **inline-ineligible**
+  command (HSET), where both legs take the generic path and the difference is the
+  ACL check alone. Measured on ARM: GET tax 0.904 µs/op, SET tax 0.823 (the
+  difference being a GET-only cold-tier peek at `handler_monoio/mod.rs:3674`),
+  ACL check ≈0.197 — leaving a **transferable write-path tax of 0.626 µs/op**.
+  That covers INCR's required cut and no other family's: LPUSH is short by
+  0.05–0.08, HSET by 0.22, ZADD by 0.32 and SADD by 0.43, with cuts re-solved at
+  HEAD by `bench-solve-cb.py`. So the dispatch path alone does not reach parity
+  for four of the five families (moon#942, moon#799). The harness fails closed
+  unless `moon_dispatch_path_total{path="local_inline"}` moves exactly as the leg
+  requires — it advanced on every inline leg, and stayed frozen on every generic
+  one — because the first run of this experiment produced empty generic legs
+  (`redis-benchmark` takes `-a`, not `--pass`) while a frozen counter appeared to
+  confirm the path.
 - `scripts/bench-ab-delta.py` — compares moon against **moon** across two
   matrix runs, which `bench-ab-report.py` cannot do. Redis is the control: the
   tool picks the raw or the ratio column per row from the control's own
