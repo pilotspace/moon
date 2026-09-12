@@ -47,6 +47,41 @@ impl std::fmt::Write for Sink<'_> {
     }
 }
 
+// ── work budget (moon#942) ─────────────────────────────────────────────────
+//
+// Plain `//` comments on the macro invocation: a doc comment there trips
+// `unused_doc_comments`, which CI denies.
+//
+// How many scores were rendered through `core::fmt`'s `f64` Display — the
+// shortest-round-trip (Grisu/Dragon) formatter — rather than through the
+// integer fast path. Redis's `d2string` takes the same fork: `double2ll`
+// first, `ll2string` when it succeeds, `fpconv_dtoa` only when it does not.
+// Test-only; compiles to nothing in a release build.
+#[cfg(test)]
+thread_local! {
+    static FLOAT_FORMATS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Record one `core::fmt` `f64` rendering. No-op outside test builds.
+#[cfg(test)]
+#[inline]
+fn note_float_format() {
+    FLOAT_FORMATS.with(|c| c.set(c.get() + 1));
+}
+
+/// No-op in non-test builds — zero production cost.
+#[cfg(not(test))]
+#[inline(always)]
+fn note_float_format() {}
+
+/// Read and reset the per-thread `core::fmt` float-rendering counter.
+///
+/// `pub(crate)` so the sorted-set command tests can measure a whole `ZADD`.
+#[cfg(test)]
+pub(crate) fn take_float_formats() -> u32 {
+    FLOAT_FORMATS.with(|c| c.replace(0))
+}
+
 /// Render `score` into `out` (cleared first), exactly as `ZSCORE` replies it:
 /// `inf` / `-inf` for the infinities, otherwise Rust's shortest round-trip
 /// `{}` rendering (`3` for `3.0`, `1000` for `1e3`, `3.5` for `3.5000`).
@@ -62,6 +97,7 @@ pub fn render_score(score: f64, out: &mut ScoreBuf) {
     } else if score == f64::NEG_INFINITY {
         out.extend_from_slice(b"-inf");
     } else {
+        note_float_format();
         // `write!` into a `SmallVec` cannot fail.
         let _ = write!(Sink(out), "{score}");
     }

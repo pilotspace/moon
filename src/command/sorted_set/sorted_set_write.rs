@@ -8,6 +8,7 @@ use crate::storage::listpack::PairUpdate;
 use crate::storage::zset_score::{ScoreBuf, render_score};
 
 use crate::command::helpers::{all_args_are_bytes, err, err_wrong_args, extract_bytes};
+use crate::command::sorted_set::work_budget;
 
 use super::{
     AggregateOp, format_score, format_score_bytes, zadd_member, zrange_by_lex, zrange_by_rank,
@@ -38,6 +39,7 @@ fn parse_zadd_pair<'a>(
     let Ok(score_str) = std::str::from_utf8(score_bytes) else {
         return Err(err("ERR value is not a valid float"));
     };
+    work_budget::note_arg_score_parse();
     let Ok(score) = score_str.parse::<f64>() else {
         return Err(err("ERR value is not a valid float"));
     };
@@ -215,6 +217,7 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                     // write.
                     let mut old_score = 0.0f64;
                     let outcome = lp.update_pair_value(member, |current| {
+                        work_budget::note_stored_score_parse();
                         let old = current.as_score().unwrap_or(0.0);
                         old_score = old;
                         let should_update = if nx {
@@ -237,6 +240,7 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                         // `as_score` recovers the identical f64.
                         let mut rendered = ScoreBuf::new();
                         render_score(score, &mut rendered);
+                        work_budget::note_listpack_score_write();
                         Some(rendered)
                     });
 
@@ -253,6 +257,7 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                             if !xx {
                                 let mut rendered = ScoreBuf::new();
                                 render_score(score, &mut rendered);
+                                work_budget::note_listpack_score_write();
                                 lp.push_back(member);
                                 lp.push_back(&rendered);
                                 added += 1;
@@ -323,6 +328,7 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
         };
         let member = member.clone();
 
+        work_budget::note_member_lookup();
         let existing_score = members.get(&member).copied();
 
         let should_update = match existing_score {
@@ -542,6 +548,7 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
                 // change deliberately does not alter, and that a NaN must
                 // never reach a listpack in the meantime.
                 let outcome = lp.update_pair_value(&member, |current| {
+                    work_budget::note_stored_score_parse();
                     let new_score = current.as_score().unwrap_or(0.0) + increment;
                     if new_score.is_nan() {
                         return None;
@@ -611,6 +618,7 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
 
+    work_budget::note_member_lookup();
     let current = members.get(&member).copied().unwrap_or(0.0);
     let new_score = current + increment;
 

@@ -1,5 +1,6 @@
 mod sorted_set_read;
 mod sorted_set_write;
+mod work_budget;
 
 pub use sorted_set_read::*;
 pub use sorted_set_write::*;
@@ -66,12 +67,15 @@ pub(super) fn zadd_member(
     score: f64,
 ) -> bool {
     // Remove old entry if exists (MUST remove from both)
+    work_budget::note_member_lookup();
     let is_new = if let Some(old_score) = members.remove(&member) {
         scores.remove(OrderedFloat(old_score), &member);
         false
     } else {
         true
     };
+    work_budget::note_member_lookup();
+    work_budget::note_bptree_score_write();
     members.insert(member.clone(), score);
     scores.insert(OrderedFloat(score), member);
     is_new
@@ -83,6 +87,7 @@ pub(super) fn zrem_member(
     scores: &mut BPTree,
     member: &[u8],
 ) -> bool {
+    work_budget::note_member_lookup();
     if let Some(score) = members.remove(member) {
         scores.remove(OrderedFloat(score), member);
         true
