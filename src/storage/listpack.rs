@@ -160,6 +160,21 @@ pub struct ListpackPairIter<'a> {
 /// head, which is exactly the second scan moon#799 is about. Every span is
 /// produced and consumed inside one `&mut self` method, so it can never
 /// outlive the bytes it names.
+/// Outcome of [`Listpack::update_pair_value`].
+///
+/// Three states, because the caller has three different jobs: append the pair
+/// (`Absent`), count a no-op (`Unchanged`), or account for a write and -- in
+/// ZINCRBY's case -- reply with the bytes that were stored (`Replaced`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairUpdate<R> {
+    /// No pair carries that field; nothing was written.
+    Absent,
+    /// The pair is there and the caller declined to change its value.
+    Unchanged,
+    /// The pair's value was replaced with these bytes.
+    Replaced(R),
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PairSpan {
     /// First byte of the FIELD entry.
@@ -372,15 +387,57 @@ impl Listpack {
     /// second scan from the head), so a 128-field hash was walked 256 entries
     /// to change one value (moon#799).
     pub fn replace_pair_value(&mut self, field: &[u8], value: &[u8]) -> bool {
+        matches!(
+            self.update_pair_value(field, |_current| Some(value)),
+            PairUpdate::Replaced(_)
+        )
+    }
+
+    /// Update the VALUE of the pair whose FIELD equals `field`, deciding from
+    /// the value currently stored there -- in ONE scan.
+    ///
+    /// `update` is handed the stored value and returns the replacement bytes,
+    /// or `None` to leave the pair alone. The replacement comes back out in
+    /// [`PairUpdate::Replaced`], so a caller that needs the bytes it stored --
+    /// ZINCRBY replies with them -- does not render them a second time.
+    ///
+    /// This is [`Listpack::replace_pair_value`] for the callers whose
+    /// replacement DEPENDS on the old value: ZADD's `NX`/`GT`/`LT`
+    /// comparison, and ZINCRBY's `old + increment`. Both used to walk the
+    /// listpack TWICE -- a borrowed scan down to an ORDINAL, then
+    /// `replace_at` walking back to that ordinal from the head -- which is
+    /// the same defect moon#799 fixed for HSET, still standing for the sorted
+    /// set (moon#942).
+    ///
+    /// Nothing in the return borrows `self`, and that is load-bearing rather
+    /// than incidental: it lets the caller's miss arm append to this same
+    /// listpack. An `Option<&mut _>` handle could not, because the borrow
+    /// would span the whole `match`.
+    pub fn update_pair_value<R, F>(&mut self, field: &[u8], update: F) -> PairUpdate<R>
+    where
+        R: AsRef<[u8]>,
+        F: FnOnce(ListpackRef<'_>) -> Option<R>,
+    {
         let Some(span) = self.locate_pair(field) else {
-            return false;
+            return PairUpdate::Absent;
         };
-        let encoded = encode_entry(value);
+        // The shared borrow of `self.data` ends with this block, before the
+        // write below takes a mutable one. `R` cannot smuggle one out: it is
+        // chosen by the caller, who holds `&mut self` and so has no shared
+        // borrow of the buffer to hand back.
+        let replacement = {
+            let (current, _) = decode_entry_ref_at(&self.data, span.value_start);
+            update(current)
+        };
+        let Some(replacement) = replacement else {
+            return PairUpdate::Unchanged;
+        };
+        let encoded = encode_entry(replacement.as_ref());
         self.write_entry(span.value_start..span.value_end, &encoded);
         // Element count unchanged; only total_bytes moves.
         let total = self.data.len() as u32;
         self.data[0..4].copy_from_slice(&total.to_le_bytes());
-        true
+        PairUpdate::Replaced(replacement)
     }
 
     /// Remove the pair whose FIELD equals `field`, both entries. ONE scan.
@@ -1010,6 +1067,29 @@ fn decode_entry_ref_at(data: &[u8], pos: usize) -> (ListpackRef<'_>, usize) {
     }
 }
 
+// Test-only count of walks that started at the HEAD of a listpack.
+//
+// `seek_to` is the only one; every other scan either starts at the head ONCE
+// per operation (`locate_pair`, the iterators) or resumes from where the
+// previous one stopped. Reaching an entry by ORDINAL means walking back to it
+// from the head, and that second walk is exactly what moon#799 removed from
+// HSET and moon#942 removes from ZADD -- so "did this path seek?" is the
+// falsifiable form of "did it scan twice?".
+//
+// Thread-local, because unit tests share one process and run in parallel; a
+// global counter would make every assertion on it a race. Compiled out of
+// every non-test build.
+#[cfg(test)]
+thread_local! {
+    static HEAD_SEEKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reads [`HEAD_SEEKS`] for the current thread.
+#[cfg(test)]
+fn head_seeks() -> usize {
+    HEAD_SEEKS.with(std::cell::Cell::get)
+}
+
 /// Byte range `(start, next)` of the entry at `index`, found by a BORROWED
 /// walk. `None` when the listpack has fewer than `index + 1` entries.
 ///
@@ -1026,6 +1106,8 @@ fn decode_entry_ref_at(data: &[u8], pos: usize) -> (ListpackRef<'_>, usize) {
 /// ONE place for all nine encodings, so a seek can never disagree with a
 /// decode about where the next entry starts.
 fn seek_to(data: &[u8], index: usize) -> Option<(usize, usize)> {
+    #[cfg(test)]
+    HEAD_SEEKS.with(|c| c.set(c.get() + 1));
     let mut pos = 6; // start after header
     for i in 0..=index {
         if pos >= data.len() - 1 || data[pos] == LP_TERMINATOR {
@@ -1926,4 +2008,174 @@ mod byte_exactness_tests {
 
     /// Golden for `mutation_sequence_bytes_are_unchanged`'s 40-pair listpack.
     const GOLDEN_PAIRS_40: &str = "79010000500082663003000182663103c3e80282663203c7d00282663303cbb80282663403cfa00282663503f188130382663603f170170382663703f1581b0382663803f1401f0382663903f12823038366313004f11027038366313104f1f82a038366313204f1e02e038366313304f1c832038366313404f1b036038366313504f1983a038366313604f1803e038366313704f16842038366313804f15046038366313904f1384a038366323004f1204e038366323104f10852038366323204f1f055038366323304f1d859038366323404f1c05d038366323504f1a861038366323604f19065038366323704f17869038366323804f1606d038366323904f14871038366333004f13075038366333104f11879038366333204f1007d038366333304f2e88000048366333404f2d08400048366333504f2b88800048366333604f2a08c00048366333704f2889000048366333804f27094000483663339049673616d652d77696474682d7265706c6163656d656e7417ff";
+}
+
+#[cfg(test)]
+mod one_walk_update_tests {
+    use super::*;
+
+    /// 64 member/score pairs, the shape a ZADD listpack actually holds:
+    /// `[member, score, member, score, ...]` with the scores rendered as
+    /// text and re-encoded as integers by the listpack.
+    fn zset_fixture() -> Listpack {
+        let mut lp = Listpack::new();
+        for i in 0..64 {
+            lp.push_back(format!("m{i:04}").as_bytes());
+            lp.push_back(format!("{}", i * 10).as_bytes());
+        }
+        lp
+    }
+
+    /// moon#942: the ZADD update shape must walk the listpack ONCE.
+    ///
+    /// `seek_to` is the only walk that starts at the head, so counting it is
+    /// the falsifiable form of "did this scan twice?". The shape this
+    /// replaces is measured first, in the same test, so the number has
+    /// something to be compared against -- a bare `assert_eq!(seeks, 0)`
+    /// would pass just as happily if the counter were never wired up.
+    #[test]
+    fn update_pair_value_does_not_walk_from_the_head_twice() {
+        let mut lp = zset_fixture();
+        let last: &[u8] = b"m0063";
+
+        // The shape moon#942 replaces: an ordinal from a borrowed walk, then
+        // `replace_at` walking back to that ordinal from the head.
+        let mark = head_seeks();
+        let idx = lp.find_pair_index(last).expect("member present");
+        lp.replace_at(idx * 2 + 1, b"111");
+        assert_eq!(
+            head_seeks() - mark,
+            1,
+            "the replaced shape is supposed to seek from the head exactly once"
+        );
+
+        let mark = head_seeks();
+        let out = lp.update_pair_value(last, |current| {
+            assert_eq!(
+                current.as_score(),
+                Some(111.0),
+                "the old value is handed in"
+            );
+            Some(&b"222"[..])
+        });
+        assert!(matches!(out, PairUpdate::Replaced(_)));
+        assert_eq!(
+            head_seeks() - mark,
+            0,
+            "update_pair_value must not walk from the head at all"
+        );
+        assert_eq!(lp.pair_value(last).and_then(|v| v.as_score()), Some(222.0));
+    }
+
+    /// One walk must produce the SAME BYTES as the two-walk shape it
+    /// replaces. Widening, narrowing and equal-width replacements are all
+    /// here, at the first pair, a middle one and the last one, because those
+    /// are three different tail moves at three different offsets.
+    #[test]
+    fn update_pair_value_agrees_with_the_two_walk_shape() {
+        for (field, new_value) in [
+            (&b"m0000"[..], &b"widen-to-a-much-longer-value"[..]),
+            (b"m0000", b"7"),
+            (b"m0031", b"310"),
+            (b"m0031", b"999999999999"),
+            (b"m0063", b"630"),
+            (b"m0063", b"0"),
+        ] {
+            let mut want = zset_fixture();
+            let mut got = zset_fixture();
+
+            let idx = want.find_pair_index(field).expect("member present");
+            want.replace_at(idx * 2 + 1, new_value);
+            assert!(matches!(
+                got.update_pair_value(field, |_| Some(new_value)),
+                PairUpdate::Replaced(_)
+            ));
+
+            assert_eq!(
+                got.data,
+                want.data,
+                "byte layout diverged replacing {}'s value with {}",
+                String::from_utf8_lossy(field),
+                String::from_utf8_lossy(new_value)
+            );
+        }
+    }
+
+    /// The three outcomes, and the edges where the pair arithmetic is
+    /// tightest: a single-pair listpack, the first pair, the last pair, an
+    /// absent field, and a VALUE that happens to spell a field name.
+    #[test]
+    fn update_pair_value_outcomes_and_edges() {
+        let mut solo = Listpack::new();
+        solo.push_back(b"solo");
+        solo.push_back(b"1");
+
+        assert!(matches!(
+            solo.update_pair_value(b"nope", |_| Some(&b"x"[..])),
+            PairUpdate::Absent
+        ));
+        // Declining must leave the bytes exactly as they were.
+        let before = solo.data.clone();
+        assert!(matches!(
+            solo.update_pair_value::<&[u8], _>(b"solo", |_| None),
+            PairUpdate::Unchanged
+        ));
+        assert_eq!(solo.data, before, "a declined update wrote to the buffer");
+        assert!(matches!(
+            solo.update_pair_value(b"solo", |_| Some(&b"2"[..])),
+            PairUpdate::Replaced(_)
+        ));
+        assert_eq!(
+            solo.pair_value(b"solo").map(|v| v.to_vec()),
+            Some(b"2".to_vec())
+        );
+        assert_eq!(solo.len(), 2, "the element count must not move");
+
+        // A lone field with no value is not a pair.
+        let mut lone = Listpack::new();
+        lone.push_back(b"lone");
+        assert!(matches!(
+            lone.update_pair_value(b"lone", |_| Some(&b"x"[..])),
+            PairUpdate::Absent
+        ));
+
+        // A VALUE equal to a field name must never be matched as a field.
+        let mut lp = Listpack::new();
+        lp.push_back(b"alpha");
+        lp.push_back(b"beta");
+        lp.push_back(b"gamma");
+        lp.push_back(b"delta");
+        assert!(matches!(
+            lp.update_pair_value(b"beta", |_| Some(&b"x"[..])),
+            PairUpdate::Absent
+        ));
+        assert!(matches!(
+            lp.update_pair_value(b"gamma", |_| Some(&b"epsilon"[..])),
+            PairUpdate::Replaced(_)
+        ));
+        assert_eq!(
+            lp.pair_value(b"gamma").map(|v| v.to_vec()),
+            Some(b"epsilon".to_vec())
+        );
+
+        // The replacement bytes come back out, which is how ZINCRBY replies
+        // without rendering the score a second time.
+        let mut lp = zset_fixture();
+        match lp.update_pair_value(b"m0007", |_| Some(&b"71"[..])) {
+            PairUpdate::Replaced(stored) => assert_eq!(stored, b"71"),
+            other => panic!("expected Replaced, got {other:?}"),
+        }
+    }
+
+    /// `replace_pair_value` is now `update_pair_value` with a constant
+    /// decision. It must still answer exactly as it did, on a hit and a miss.
+    #[test]
+    fn replace_pair_value_still_reports_presence() {
+        let mut lp = zset_fixture();
+        assert!(lp.replace_pair_value(b"m0000", b"1"));
+        assert!(lp.replace_pair_value(b"m0063", b"1"));
+        assert!(!lp.replace_pair_value(b"absent", b"1"));
+        // A value, not a field.
+        assert!(!lp.replace_pair_value(b"630", b"1"));
+    }
 }
