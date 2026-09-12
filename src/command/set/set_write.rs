@@ -37,10 +37,21 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("SADD"),
     };
 
-    // Check if all members are valid integers (for intset optimization)
+    // Check if all members are valid integers (for intset optimization).
+    //
+    // This pass answers a pure ROUTING question — does this batch belong in an
+    // intset? — and throws every parsed value away; the push loop below
+    // re-derives the ones it needs. `canonical_i64` was doing a UTF-8
+    // validation, an `i64` parse, an `itoa` render and a `memcmp` per member to
+    // produce a number nobody reads. `is_canonical_i64` returns the SAME
+    // verdict for every input from the bytes alone, pinned by differential
+    // tests against `canonical_i64` itself (`storage::numeric`) — including
+    // every moon#795 byte-transparency case, both `i64` boundaries digit by
+    // digit, and 200,000 randomised inputs. The routing decision does not
+    // move; only its cost does.
     let all_integers = args[1..].iter().all(|a| {
         extract_bytes(a)
-            .map(|b| try_parse_i64(b).is_some())
+            .map(|b| crate::storage::numeric::is_canonical_i64(b))
             .unwrap_or(false)
     });
     let member_count = args.len() - 1;

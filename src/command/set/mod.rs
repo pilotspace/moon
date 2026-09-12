@@ -1816,6 +1816,86 @@ mod tests {
         assert_eq!(scard_of(&mut db, b"s"), (ceiling + 20) as i64);
         assert_eq!(encoding_of(&mut db, b"s"), "hashtable");
     }
+
+    /// SADD's `all_integers` pre-pass answers a pure ROUTING question and
+    /// throws every parsed value away, so it runs on `is_canonical_i64`
+    /// rather than the full `canonical_i64` round trip. `storage::numeric`
+    /// pins the two to the same verdict differentially; this pins the
+    /// OBSERVABLE consequence of that verdict at the command level, because
+    /// moon#795 was a real data-corruption bug and the routing gate is the
+    /// thing that keeps a non-canonical spelling out of an intset.
+    ///
+    /// Every case here is one of the named moon#795 vectors. A member that
+    /// routes to an intset must be spelled canonically; one that does not must
+    /// land in a string encoding with its bytes intact.
+    #[test]
+    fn sadd_routes_every_byte_transparency_case_the_way_canonical_i64_does() {
+        // (member, the encoding the ROUTING gate must produce)
+        let cases: [(&[u8], &str); 14] = [
+            (b"007", "listpack"),
+            (b"+7", "listpack"),
+            (b"-0", "listpack"),
+            (b" 7", "listpack"),
+            (b"7 ", "listpack"),
+            (b"", "listpack"),
+            (b"000000012345", "listpack"), // redis-benchmark's shape
+            (b"12345678901234567890", "listpack"), // 20 digits, overflows i64
+            (b"9223372036854775808", "listpack"), // i64::MAX + 1
+            (b"-9223372036854775809", "listpack"), // i64::MIN - 1
+            (b"0", "intset"),
+            (b"-1", "intset"),
+            (b"9223372036854775807", "intset"),  // i64::MAX
+            (b"-9223372036854775808", "intset"), // i64::MIN
+        ];
+
+        for (member, want_encoding) in cases {
+            let mut db = Database::new();
+            assert_eq!(
+                sadd(&mut db, &[bs(b"s"), bs(member)]),
+                Frame::Integer(1),
+                "SADD of {:?} did not report one new member",
+                String::from_utf8_lossy(member)
+            );
+            assert_eq!(
+                encoding_of(&mut db, b"s"),
+                want_encoding,
+                "routing verdict moved for {:?}",
+                String::from_utf8_lossy(member)
+            );
+            // The bytes that come back must be the bytes that went in — the
+            // whole reason the canonical gate exists (moon#795).
+            assert_eq!(
+                ro_members_sorted(&db, b"s"),
+                vec![member.to_vec()],
+                "member bytes changed for {:?}",
+                String::from_utf8_lossy(member)
+            );
+            assert_eq!(
+                sismember(&mut db, &[bs(b"s"), bs(member)]),
+                Frame::Integer(1),
+                "member {:?} not found by its own spelling",
+                String::from_utf8_lossy(member)
+            );
+        }
+
+        // A batch is routed by the WEAKEST member: one non-canonical spelling
+        // keeps the whole batch out of the intset, and `.all()` must reach it
+        // wherever it sits.
+        for position in 0..3usize {
+            let mut members: Vec<Vec<u8>> = vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()];
+            members[position] = b"+7".to_vec();
+            let mut db = Database::new();
+            let mut args: Vec<Frame> = Vec::with_capacity(4);
+            args.push(bs(b"s"));
+            args.extend(members.iter().map(|m| bs(m)));
+            assert_eq!(sadd(&mut db, &args), Frame::Integer(3));
+            assert_eq!(
+                encoding_of(&mut db, b"s"),
+                "listpack",
+                "a non-canonical member at position {position} did not block the intset"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -49,6 +49,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`storage::numeric::is_canonical_i64`** — `canonical_i64`'s verdict without
+  its value, for the callers that only need to ROUTE. `canonical_i64` costs a
+  UTF-8 validation, an `i64` parse, an `itoa` render and a `memcmp`; that is the
+  right price when the value is wanted, and pure waste when the answer is a
+  yes/no. `SADD`'s `all_integers` pre-pass is the first caller: it walks the
+  batch to decide whether it belongs in an intset and then discards every
+  number it parsed, because the push loop re-derives the ones it needs.
+  `is_canonical_i64` decides the same question from the bytes — sign, digits,
+  no leading zero, no `-0`, and one slice compare against the `i64` boundary at
+  19 magnitude digits.
+
+  Verdict-identity is the whole contract, and moon#795 is why: a non-canonical
+  spelling that slips into an integer encoding destroys the caller's bytes
+  (`SADD s 000000012345` came back as `12345`). So the equivalence is pinned
+  DIFFERENTIALLY against `canonical_i64` itself, never against hand-written
+  expectations — exhaustively over every 1-byte input and over a discriminating
+  alphabet at widths 2 and 3, across both `i64` boundaries digit by digit, and
+  over 200,000 randomised digit-heavy inputs. All four differential tests were
+  confirmed to FAIL against a deliberately mutated implementation before being
+  trusted (dropping the `-0` rule; dropping the range check), and a
+  command-level test pins the observable consequence: each of the moon#795
+  vectors — `007`, `+7`, `-0`, `" 7"`, `"7 "`, the empty string, a 20-digit
+  number, and `i64::MIN`/`i64::MAX` on both sides of their exact boundaries —
+  must still route to the same encoding and come back byte for byte.
+
+  **No throughput number is claimed here.** The candidate came from a
+  `75ad520c` SADD-only profile showing `from_utf8` 1.37% + `itoa` 0.90% +
+  `canonical_i64` 0.55%, but those symbols have other callers on the same leg
+  (the listpack encode path among them), so their attribution to *this*
+  pre-pass is **unverified** — benchmarks are Linux-only and this landed from
+  macOS. The change is justified by doing strictly less work for a provably
+  identical verdict, not by a measurement.
+
 - `scripts/bench-ab-delta.py` — compares moon against **moon** across two
   matrix runs, which `bench-ab-report.py` cannot do. Redis is the control: the
   tool picks the raw or the ratio column per row from the control's own
