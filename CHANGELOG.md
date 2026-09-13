@@ -6,6 +6,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`HDEL` no longer leaves an empty hash behind when the emptying field is
+  not the last argument** (moon#942). `hdel` tracked emptiness in a
+  `last_was_empty` variable reassigned on EVERY iteration, including the ones
+  that removed nothing, so the emptiness the real removal reported was
+  overwritten by the `false` a later absent field produced. `HDEL h only
+  absent` therefore answered `1`, emptied the hash and kept the key: `EXISTS
+  h` answered `1` and `HLEN h` answered `0` on a hash redis had already
+  deleted, and the empty container was written to the AOF and shipped to every
+  replica. `HDEL h absent only` — the same two fields, reversed — deleted
+  correctly, which is why this survived. Emptiness is now a property of the
+  hash after the whole batch.
+
+### Performance
+
+- **`HDEL` costs ONE key lookup for the whole command, not two per field: a
+  three-field `HDEL` went 6 → 1** (moon#942). `hdel` called
+  `Database::hash_delete_field` once per argument, and that method costs two
+  DashTable probes — its own `data.get_mut(key)` and, on a real removal,
+  `stamp_hash_field_mutation`'s, which re-finds the same entry to stamp it.
+  Redis pays one `dictFind` for the command and then looks each field up
+  inside the hash; `Database::hash_delete_fields` now does the same, walking
+  the batch inside the handle the single lookup already holds and stamping
+  that same handle. `hash_delete_field` is kept as a delegator to it, so the
+  one-field and many-field spellings cannot drift.
+
+  **Measured with the `cfg(test)` DashTable key-lookup counter**:
+
+  | `HDEL` arm | before | after |
+  |---|---:|---:|
+  | one field, present | 2 | 1 |
+  | three fields, all present | 6 | 1 |
+  | three fields, none present | 3 | 1 |
+
+  It also makes one command ONE WATCH version bump (moon#926). `HDEL h f1 f2`
+  moved the version by two, because the per-field loop stamped once per
+  removed field — the same observable shadow of a duplicated accessor that
+  `sadd_bumps_the_watch_version_exactly_once_on_every_encoding` pins for SADD.
+  A batch that removes nothing still leaves a watcher alone, as before.
+
+- **`HINCRBY` walks a hash listpack ONCE, not twice** (moon#942). Its listpack
+  arm called `Listpack::pair_value` — a borrowed scan that located the field —
+  and then `Listpack::replace_pair_value`, which located the SAME field all
+  over again from the head, so a 128-field hash was walked up to 256 entries
+  to change one value. That is the defect moon#799 removed for HSET and
+  moon#942 removed for ZADD/ZINCRBY; `Listpack::update_pair_value` is the
+  one-scan primitive built for callers whose replacement depends on the value
+  currently stored, and HINCRBY was the last hash caller still walking twice.
+  Structural, not counted: this repo has no listpack entry-decode counter, and
+  one is proposed rather than asserted here.
+
+- **`HSET` and `HMSET` walk their argv once, not twice** (moon#942). The
+  moon#823 `all_args_are_bytes` validation pass matched every frame and the
+  moon#896 entry gate's `max` chain then matched every frame again to read its
+  length. One loop now does both, and still refuses a non-argument-shaped
+  frame strictly before `get_or_create_hash_listpack` opens the mutation
+  window.
+
+- **`HSET`'s probe budget is now ratcheted** (moon#942). Measured on the
+  harness's own shape — `scripts/bench-ab-matrix.sh:84` is
+  `hset hash:__rand_int__ f __rand_int__` over a 100 000-key keyspace, so the
+  benchmarked HSET touches hashes holding exactly ONE field named `f`:
+
+  | `HSET` arm | probes | notes |
+  |---|---:|---|
+  | absent key (create) | 3 | `hot_state` + `insert` + `get_mut` |
+  | **listpack steady state** | **2** | the benchmarked arm; at this accessor family's floor |
+  | full-`HashMap` steady state | 5 | **open** — 2 thrown away + 2 + 1, see below |
+
+  The full-`HashMap` arm's five is the hash equivalent of the SADD defect
+  fixed above and is NOT fixed here: `get_or_create_hash_listpack` answers
+  `Ok(None)` for a `Hash` or `HashWithTtl` (2 probes, and a WATCH bump,
+  discarded), `get_or_create_hash` then re-runs the whole classification (2
+  more, and a second bump), and `hash_clear_field_ttls` re-finds the entry a
+  third time (1) only to discover a plain `Hash` carries no sidecar. The fix
+  is a `HashHandle` mirroring `SetHandle` in `storage/db/accessors.rs`, which
+  this change does not own.
+
+  None of these numbers is a throughput claim and this entry makes none. The
+  PERF-08 precedent (moon#789) measured +11% on aarch64 and −17% on x86_64 for
+  a probe reduction — the two architectures disagreed in *sign* — so the
+  wall-clock question belongs to a Linux bench host and to nothing else.
+
+  **The ledger is byte-identical across the HDEL move.** The per-field credits
+  a batch books are the same `hash_field_cost` / `hash_ttl_field_cost` figures
+  summed into one `credit_memory`, and the listpack arm's one before/after
+  `estimate_memory` pair reports the same capacity-based delta the per-field
+  snapshots did (`Vec::drain` does not shrink capacity). A new guard asserts
+  the running ledger against a from-scratch `recalculate_memory` after a mixed
+  hit/miss batch on a 4-field listpack and a 400-field `HashMap`.
+
+  Every new guard was proven able to fail, by mutation: restoring the
+  per-field stamp makes the probe budget report `(2, 4, 1)` and the WATCH
+  guard report two bumps; forcing `empty = false` resurrects the empty-hash
+  leak; dropping the refusal from the fused argv walk fails the moon#823 pin;
+  taking the LAST element's length instead of the longest fails the moon#896
+  gate pin; and making HINCRBY's one-scan closure refuse a `Str` entry fails
+  the round-trip pin on a non-canonical stored spelling.
+
 ### Performance
 
 - **Every integer argument the string, bitmap and list commands take is read

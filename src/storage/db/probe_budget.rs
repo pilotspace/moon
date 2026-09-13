@@ -833,3 +833,210 @@ fn sadd_on_a_wrongtype_key_still_bumps_the_version_moon940() {
          change fixed #940 as a side effect, which it must not do silently."
     );
 }
+
+// ── HSET / HDEL: the hash family's probe budget (moon#942) ──────────────────
+
+#[test]
+fn hset_end_to_end_probe_budget() {
+    // The benchmark's own shape (`scripts/bench-ab-matrix.sh:84`):
+    // `HSET hash:<12-digit> f <12-digit>` over a keyspace of 100 000 keys.
+    // ONE field per key, so the steady state of the HSET row is a ONE-FIELD
+    // `HashListpack`, not the hashtable regime SADD's row lands in. That is
+    // measured from the harness, not assumed: the field name is the literal
+    // `f` and only the KEY carries `__rand_int__`.
+    let key = || bulk("hash:000000000042");
+
+    // (a) Absent key -> a HashListpack is fabricated.
+    let mut db = db_at(NOW);
+    let args = [key(), bulk("f"), bulk("000000000007")];
+    let (r, create) = probes(|| crate::command::hash::hset(&mut db, &args));
+    assert_eq!(r, Frame::Integer(1));
+
+    // (b) Listpack steady state — THE benchmarked arm.
+    let args2 = [key(), bulk("f"), bulk("000000000008")];
+    let (r, listpack_hit) = probes(|| crate::command::hash::hset(&mut db, &args2));
+    assert_eq!(r, Frame::Integer(0), "an overwrite adds no new field");
+
+    // (c) Steady state on the full `HashMap` encoding, reached by overflowing
+    //     `hash-max-listpack-entries` first. NOT the benchmarked arm, but it
+    //     is the regime a real application's hash lives in, and it is where
+    //     the duplicate accessor still stands.
+    let mut db2 = db_at(NOW);
+    let mut big = vec![bulk("h")];
+    for i in 0..400 {
+        big.push(bulk(&format!("f{i}")));
+        big.push(bulk(&format!("v{i}")));
+    }
+    assert_eq!(
+        crate::command::hash::hset(&mut db2, &big),
+        Frame::Integer(400)
+    );
+    let args3 = [bulk("h"), bulk("f1"), bulk("zzz")];
+    let (r, hashtable_hit) = probes(|| crate::command::hash::hset(&mut db2, &args3));
+    assert_eq!(r, Frame::Integer(0));
+
+    assert_eq!(
+        (create, listpack_hit, hashtable_hit),
+        (3, 2, 5),
+        "HSET end-to-end probe budget moved \
+         (create={create}, listpack_hit={listpack_hit}, \
+          hashtable_hit={hashtable_hit}) — moon#942.\n\
+         \n\
+         The listpack arm — the one the benchmark measures — is already at \
+         the floor this accessor family can reach: `hot_state` then \
+         `get_mut`. A RISE there is a regression.\n\
+         \n\
+         The hashtable arm's FIVE is not a floor, it is the open item. It \
+         decomposes as 2 (`get_or_create_hash_listpack`, which answers \
+         `Ok(None)` and is thrown away) + 2 (`get_or_create_hash`, which \
+         re-runs the whole classification on a key the first call had in \
+         hand) + 1 (`hash_clear_field_ttls`, whose `data.get_mut` re-finds \
+         the same entry to discover it is a plain `Hash` with no sidecar). \
+         SADD's `SetHandle` (moon#942, a4ae9775) is the same defect and the \
+         same fix; the hash equivalent needs `storage/db/accessors.rs`, \
+         which this branch does not own. Lowering this number is the \
+         proposal, not a regression."
+    );
+}
+
+#[test]
+fn hdel_costs_one_key_probe_per_command_not_two_per_field() {
+    // Redis's HDEL pays ONE `dictFind` for the key and then one lookup per
+    // field INSIDE the hash. moon paid a DashTable probe pair per FIELD:
+    // `hash_delete_field` opens with `self.data.get_mut(key)` and, when the
+    // field really went, closes with `stamp_hash_field_mutation`, which is a
+    // second `self.data.get_mut(key)`.
+    let mut db = db_at(NOW);
+    let mut seed = vec![bulk("h")];
+    for i in 0..8 {
+        seed.push(bulk(&format!("f{i}")));
+        seed.push(bulk(&format!("v{i}")));
+    }
+    assert_eq!(
+        crate::command::hash::hset(&mut db, &seed),
+        Frame::Integer(8)
+    );
+
+    let one = [bulk("h"), bulk("f0")];
+    let (r, single) = probes(|| crate::command::hash::hdel(&mut db, &one));
+    assert_eq!(r, Frame::Integer(1));
+
+    let three = [bulk("h"), bulk("f1"), bulk("f2"), bulk("f3")];
+    let (r, triple) = probes(|| crate::command::hash::hdel(&mut db, &three));
+    assert_eq!(r, Frame::Integer(3));
+
+    // A batch that removes NOTHING must not cost more than the lookup that
+    // proved it: no stamp, so no second probe (moon#926).
+    let miss = [bulk("h"), bulk("nope-a"), bulk("nope-b"), bulk("nope-c")];
+    let (r, missed) = probes(|| crate::command::hash::hdel(&mut db, &miss));
+    assert_eq!(r, Frame::Integer(0));
+
+    assert_eq!(
+        (single, triple, missed),
+        (1, 1, 1),
+        "HDEL probe budget moved (single={single}, triple={triple}, \
+         missed={missed}) — moon#942. HDEL costs ONE DashTable probe for the \
+         whole command, whatever the batch size: the fields are walked inside \
+         the handle that one lookup already holds, which is where Redis does \
+         them too, and `stamp_mutation` runs on that same handle instead of \
+         re-finding the entry.\n\
+         \n\
+         It used to be TWO probes per FIELD — `hash_delete_field`'s own \
+         `data.get_mut` plus `stamp_hash_field_mutation`'s — so a three-field \
+         HDEL hashed the key six times and an all-miss three-field batch \
+         still hashed it three. The RED commit asserted 2 here, expecting the \
+         stamp to stay a second lookup; folding it into the same handle made \
+         it 1, so this is TIGHTER than the target it was written against, not \
+         looser. A RISE is the regression this test exists to catch."
+    );
+}
+
+#[test]
+fn hdel_bumps_the_watch_version_exactly_once_per_command() {
+    // moon#926's rule is "acquiring a mutable handle on a stored value IS the
+    // bump", and the unit is the COMMAND. `HDEL h f1 f2` used to stamp once
+    // per removed field, so one command moved the version by two — the same
+    // observable shadow of a duplicated accessor that
+    // `sadd_bumps_the_watch_version_exactly_once_on_every_encoding` pins for
+    // SADD. Not a lost update (a watcher aborts either way), but it is the
+    // regression tell if this collapse is ever undone.
+    let mut db = db_at(NOW);
+    let mut seed = vec![bulk("h")];
+    for i in 0..8 {
+        seed.push(bulk(&format!("f{i}")));
+        seed.push(bulk(&format!("v{i}")));
+    }
+    assert_eq!(
+        crate::command::hash::hset(&mut db, &seed),
+        Frame::Integer(8)
+    );
+
+    let v0 = version_of(&db, b"h");
+    assert_eq!(
+        crate::command::hash::hdel(&mut db, &[bulk("h"), bulk("f1"), bulk("f2")]),
+        Frame::Integer(2)
+    );
+    assert_eq!(
+        version_of(&db, b"h"),
+        v0 + 1,
+        "a two-field HDEL is ONE mutation, not two (moon#926)"
+    );
+
+    // And a batch that removes nothing leaves a watcher alone, exactly as
+    // `hash_delete_field` already promised for the single-field case.
+    let v1 = version_of(&db, b"h");
+    assert_eq!(
+        crate::command::hash::hdel(&mut db, &[bulk("h"), bulk("gone-a"), bulk("gone-b")]),
+        Frame::Integer(0)
+    );
+    assert_eq!(
+        version_of(&db, b"h"),
+        v1,
+        "HDEL of fields that do not exist is not a mutation (moon#926)"
+    );
+}
+
+#[test]
+fn hdel_keeps_the_ledger_exact_across_both_encodings() {
+    // The real risk in collapsing HDEL's per-field accessor into one: the
+    // credit each removed field books moves from N calls to one. The oracle
+    // is computed a DIFFERENT WAY from the ledger — a fresh walk of the
+    // finished keyspace — so a charge that went missing inside a branch
+    // cannot hide behind a tautology.
+    for fields in [4usize, 400usize] {
+        let mut db = db_at(NOW);
+        let mut seed = vec![bulk("h")];
+        for i in 0..fields {
+            seed.push(bulk(&format!("field-{i}")));
+            seed.push(bulk(&format!("value-{i}")));
+        }
+        assert_eq!(
+            crate::command::hash::hset(&mut db, &seed),
+            Frame::Integer(fields as i64)
+        );
+
+        // Mixed batch: two that exist, one that does not.
+        assert_eq!(
+            crate::command::hash::hdel(
+                &mut db,
+                &[
+                    bulk("h"),
+                    bulk("field-0"),
+                    bulk("not-a-field"),
+                    bulk("field-1"),
+                ]
+            ),
+            Frame::Integer(2),
+            "{fields} fields: the mixed batch removed the wrong count"
+        );
+
+        let running = db.used_memory;
+        db.recalculate_memory();
+        assert_eq!(
+            running, db.used_memory,
+            "{fields} fields: the ledger drifted across a multi-field HDEL \
+             ({running} B running vs {} B recomputed) — moon#788",
+            db.used_memory
+        );
+    }
+}

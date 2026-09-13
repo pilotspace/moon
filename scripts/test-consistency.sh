@@ -434,6 +434,22 @@ both HDEL h:test f2
 assert_both "HDEL then HGET" HGET h:test f2
 assert_both "HLEN after HDEL" HLEN h:test
 
+# moon#942: an emptied hash must not outlive its last field, whatever ORDER
+# the fields were named in. moon tracked emptiness in a variable reassigned on
+# every iteration, so the emptiness the real removal reported was overwritten
+# by the `false` a later ABSENT field produced, and the key survived with zero
+# fields — `EXISTS` answered 1 on a hash redis had already deleted. The
+# removal-last spelling below is the control: it was always correct.
+both DEL h:empty:first
+both HSET h:empty:first only v
+assert_both "HDEL removal-first empties"   HDEL h:empty:first only absent
+assert_both "EXISTS after removal-first"   EXISTS h:empty:first
+assert_both "HLEN after removal-first"     HLEN h:empty:first
+both DEL h:empty:last
+both HSET h:empty:last only v
+assert_both "HDEL removal-last empties"    HDEL h:empty:last absent only
+assert_both "EXISTS after removal-last"    EXISTS h:empty:last
+
 both HINCRBY h:test counter 10
 assert_both "HINCRBY" HGET h:test counter
 both HINCRBY h:test counter 5
