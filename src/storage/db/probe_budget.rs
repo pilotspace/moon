@@ -896,92 +896,6 @@ fn hset_end_to_end_probe_budget() {
          same fix; the hash equivalent needs `storage/db/accessors.rs`, \
          which this branch does not own. Lowering this number is the \
          proposal, not a regression."
-// ── end to end: the LIST family (moon#942) ──────────────────────────────────
-//
-// The benchmark's own shape (`scripts/bench-ab-matrix.sh:81`) is
-// `LPUSH list:<12-digit> xxxxxxxx` over `-r 100000`. That keyspace matters
-// more than it looks: one leg pushes ~2.0M elements across 100,000 keys, so a
-// `list:` key holds roughly 5 elements when the p=64 point starts and roughly
-// 20 when it ends. `list-max-listpack-size` is 128
-// (`encoding_limits.rs:69`), so **every timed LPUSH in the matrix lands on
-// the LISTPACK arm**, never on the full `VecDeque`. Any claim about the
-// benchmark row has to be a claim about `listpack_hit`.
-const LKEY: &str = "list:000000000042";
-const LELEM: &str = "xxxxxxxx";
-
-/// A list of `len` elements under [`LKEY`], on whatever encoding `len`
-/// implies, with a pinned clock.
-fn list_of(len: usize) -> Database {
-    let mut db = db_at(NOW);
-    let args = [bulk(LKEY), bulk(LELEM)];
-    for _ in 0..len {
-        crate::command::list::lpush(&mut db, &args);
-    }
-    db
-}
-
-/// `OBJECT ENCODING key`, as a `String`, through the read-only path.
-fn encoding_of(db: &mut Database, key: &str) -> String {
-    match crate::command::key::object(db, &[bulk("ENCODING"), bulk(key)]) {
-        Frame::BulkString(b) => String::from_utf8_lossy(&b).into_owned(),
-        other => panic!("OBJECT ENCODING answered {other:?}"),
-    }
-}
-
-#[test]
-fn lpush_end_to_end_probe_budget() {
-    let args = [bulk(LKEY), bulk(LELEM)];
-
-    // (a) Absent key -> a ListListpack is fabricated.
-    let mut db = db_at(NOW);
-    let (r, create) = probes(|| crate::command::list::lpush(&mut db, &args));
-    assert_eq!(r, Frame::Integer(1));
-
-    // (b) Steady state on the LISTPACK encoding — the benchmark's own arm.
-    let mut db = list_of(20);
-    let (r, listpack_hit) = probes(|| crate::command::list::lpush(&mut db, &args));
-    assert_eq!(r, Frame::Integer(21));
-    assert_eq!(
-        encoding_of(&mut db, LKEY),
-        "listpack",
-        "fixture: 21 elements must still be a listpack, or this row is \
-         measuring the wrong arm"
-    );
-
-    // (c) Steady state on the FULL encoding, past `list-max-listpack-size`.
-    let mut db = list_of(200);
-    let (r, full_hit) = probes(|| crate::command::list::lpush(&mut db, &args));
-    assert_eq!(r, Frame::Integer(201));
-    assert_eq!(encoding_of(&mut db, LKEY), "linkedlist", "fixture");
-
-    assert_eq!(
-        (create, listpack_hit, full_hit),
-        (3, 2, 4),
-        "LPUSH end-to-end probe budget moved \
-         (create={create}, listpack_hit={listpack_hit}, full_hit={full_hit}) \
-         — moon#942. `create` and `listpack_hit` are at the floor the shared \
-         accessor skeleton allows (`hot_state`, then `get_mut`, plus the \
-         `insert_fresh` a miss adds) and a RISE in either is the regression \
-         this row exists to catch.\n\
-         \n\
-         `full_hit` is 4 because the residue is STILL OPEN, and this is the \
-         row that will fall when it closes. `get_or_create_list_listpack` \
-         answers `Ok(None)` for a key that already holds the full \
-         `VecDeque` (`accessors.rs:657`), and `lpush` answers that by \
-         calling `get_or_create_list` (`list_write.rs:81`) — which re-runs \
-         the whole skeleton (`hot_state`, `settle_not_live`, `get_mut`, \
-         `stamp_mutation`, `ListKind::upgrade`) against the key the first \
-         call had already classified and was still holding. It is the exact \
-         shape moon#942 closed for `SADD` in a4ae9775 by returning a \
-         `SetHandle` instead of `Ok(None)`, and closing it here needs the \
-         same change to `accessors.rs`. Redis pays one `dictFind` for all \
-         three arms.\n\
-         \n\
-         NOTE the benchmark does NOT exercise `full_hit`: at `-r 100000` a \
-         `list:` key holds ~5-20 elements against a 128-element threshold, \
-         so the matrix row is `listpack_hit` and closing the residue cannot \
-         move it. It is worth closing for real lists, which are longer than \
-         a benchmark's."
     );
 }
 
@@ -1034,46 +948,6 @@ fn hdel_costs_one_key_probe_per_command_not_two_per_field() {
          stamp to stay a second lookup; folding it into the same handle made \
          it 1, so this is TIGHTER than the target it was written against, not \
          looser. A RISE is the regression this test exists to catch."
-fn lpop_rpop_probe_budget() {
-    let pop = [bulk(LKEY)];
-
-    // (a) LISTPACK: the `&self` router (moon#897, one probe, cannot flatten)
-    //     plus the listpack accessor's own pair.
-    let mut db = list_of(20);
-    let (r, listpack) = probes(|| crate::command::list::lpop(&mut db, &pop));
-    assert_eq!(r, Frame::BulkString(Bytes::from_static(LELEM.as_bytes())));
-    assert_eq!(encoding_of(&mut db, LKEY), "listpack", "fixture");
-
-    let mut db = list_of(20);
-    let (_, listpack_rpop) = probes(|| crate::command::list::rpop(&mut db, &pop));
-
-    // (b) FULL: the router plus `get_or_create_list`.
-    let mut db = list_of(200);
-    let (r, full) = probes(|| crate::command::list::lpop(&mut db, &pop));
-    assert_eq!(r, Frame::BulkString(Bytes::from_static(LELEM.as_bytes())));
-    assert_eq!(encoding_of(&mut db, LKEY), "linkedlist", "fixture");
-
-    let mut db = list_of(200);
-    let (_, full_rpop) = probes(|| crate::command::list::rpop(&mut db, &pop));
-
-    assert_eq!(
-        (listpack, listpack_rpop, full, full_rpop),
-        (3, 3, 3, 3),
-        "LPOP/RPOP probe budget moved (listpack LPOP={listpack}, \
-         listpack RPOP={listpack_rpop}, full LPOP={full}, \
-         full RPOP={full_rpop}) — moon#942.\n\
-         \n\
-         The full arm used to be 4: `pop_eager` popped through \
-         `get_or_create_list`, let that borrow end, and then asked \
-         `get_list_ref_if_alive` a FOURTH time whether the list was now \
-         empty — a question the `&mut VecDeque` it had just been holding \
-         answers for free. `list.is_empty()` is read inside the existing \
-         borrow instead.\n\
-         \n\
-         Three is the floor without a change to `accessors.rs`: the `&self` \
-         router is what stops the pop flattening the compact encoding \
-         (moon#897/#832), and it cannot be folded into the mutable accessor \
-         from `src/command/`."
     );
 }
 
@@ -1165,6 +1039,142 @@ fn hdel_keeps_the_ledger_exact_across_both_encodings() {
             db.used_memory
         );
     }
+}
+
+// ── end to end: the LIST family (moon#942) ──────────────────────────────────
+//
+// The benchmark's own shape (`scripts/bench-ab-matrix.sh:81`) is
+// `LPUSH list:<12-digit> xxxxxxxx` over `-r 100000`. That keyspace matters
+// more than it looks: one leg pushes ~2.0M elements across 100,000 keys, so a
+// `list:` key holds roughly 5 elements when the p=64 point starts and roughly
+// 20 when it ends. `list-max-listpack-size` is 128
+// (`encoding_limits.rs:69`), so **every timed LPUSH in the matrix lands on
+// the LISTPACK arm**, never on the full `VecDeque`. Any claim about the
+// benchmark row has to be a claim about `listpack_hit`.
+const LKEY: &str = "list:000000000042";
+const LELEM: &str = "xxxxxxxx";
+
+/// A list of `len` elements under [`LKEY`], on whatever encoding `len`
+/// implies, with a pinned clock.
+fn list_of(len: usize) -> Database {
+    let mut db = db_at(NOW);
+    let args = [bulk(LKEY), bulk(LELEM)];
+    for _ in 0..len {
+        crate::command::list::lpush(&mut db, &args);
+    }
+    db
+}
+
+/// `OBJECT ENCODING key`, as a `String`, through the read-only path.
+fn encoding_of(db: &mut Database, key: &str) -> String {
+    match crate::command::key::object(db, &[bulk("ENCODING"), bulk(key)]) {
+        Frame::BulkString(b) => String::from_utf8_lossy(&b).into_owned(),
+        other => panic!("OBJECT ENCODING answered {other:?}"),
+    }
+}
+
+#[test]
+fn lpush_end_to_end_probe_budget() {
+    let args = [bulk(LKEY), bulk(LELEM)];
+
+    // (a) Absent key -> a ListListpack is fabricated.
+    let mut db = db_at(NOW);
+    let (r, create) = probes(|| crate::command::list::lpush(&mut db, &args));
+    assert_eq!(r, Frame::Integer(1));
+
+    // (b) Steady state on the LISTPACK encoding — the benchmark's own arm.
+    let mut db = list_of(20);
+    let (r, listpack_hit) = probes(|| crate::command::list::lpush(&mut db, &args));
+    assert_eq!(r, Frame::Integer(21));
+    assert_eq!(
+        encoding_of(&mut db, LKEY),
+        "listpack",
+        "fixture: 21 elements must still be a listpack, or this row is \
+         measuring the wrong arm"
+    );
+
+    // (c) Steady state on the FULL encoding, past `list-max-listpack-size`.
+    let mut db = list_of(200);
+    let (r, full_hit) = probes(|| crate::command::list::lpush(&mut db, &args));
+    assert_eq!(r, Frame::Integer(201));
+    assert_eq!(encoding_of(&mut db, LKEY), "linkedlist", "fixture");
+
+    assert_eq!(
+        (create, listpack_hit, full_hit),
+        (3, 2, 4),
+        "LPUSH end-to-end probe budget moved \
+         (create={create}, listpack_hit={listpack_hit}, full_hit={full_hit}) \
+         — moon#942. `create` and `listpack_hit` are at the floor the shared \
+         accessor skeleton allows (`hot_state`, then `get_mut`, plus the \
+         `insert_fresh` a miss adds) and a RISE in either is the regression \
+         this row exists to catch.\n\
+         \n\
+         `full_hit` is 4 because the residue is STILL OPEN, and this is the \
+         row that will fall when it closes. `get_or_create_list_listpack` \
+         answers `Ok(None)` for a key that already holds the full \
+         `VecDeque` (`accessors.rs:657`), and `lpush` answers that by \
+         calling `get_or_create_list` (`list_write.rs:81`) — which re-runs \
+         the whole skeleton (`hot_state`, `settle_not_live`, `get_mut`, \
+         `stamp_mutation`, `ListKind::upgrade`) against the key the first \
+         call had already classified and was still holding. It is the exact \
+         shape moon#942 closed for `SADD` in a4ae9775 by returning a \
+         `SetHandle` instead of `Ok(None)`, and closing it here needs the \
+         same change to `accessors.rs`. Redis pays one `dictFind` for all \
+         three arms.\n\
+         \n\
+         NOTE the benchmark does NOT exercise `full_hit`: at `-r 100000` a \
+         `list:` key holds ~5-20 elements against a 128-element threshold, \
+         so the matrix row is `listpack_hit` and closing the residue cannot \
+         move it. It is worth closing for real lists, which are longer than \
+         a benchmark's."
+    );
+}
+
+#[test]
+fn lpop_rpop_probe_budget() {
+    let pop = [bulk(LKEY)];
+
+    // (a) LISTPACK: the `&self` router (moon#897, one probe, cannot flatten)
+    //     plus the listpack accessor's own pair.
+    let mut db = list_of(20);
+    let (r, listpack) = probes(|| crate::command::list::lpop(&mut db, &pop));
+    assert_eq!(r, Frame::BulkString(Bytes::from_static(LELEM.as_bytes())));
+    assert_eq!(encoding_of(&mut db, LKEY), "listpack", "fixture");
+
+    let mut db = list_of(20);
+    let (_, listpack_rpop) = probes(|| crate::command::list::rpop(&mut db, &pop));
+
+    // (b) FULL: the router plus `get_or_create_list`.
+    let mut db = list_of(200);
+    let (r, full) = probes(|| crate::command::list::lpop(&mut db, &pop));
+    assert_eq!(r, Frame::BulkString(Bytes::from_static(LELEM.as_bytes())));
+    assert_eq!(encoding_of(&mut db, LKEY), "linkedlist", "fixture");
+
+    let mut db = list_of(200);
+    let (_, full_rpop) = probes(|| crate::command::list::rpop(&mut db, &pop));
+
+    assert_eq!(
+        (listpack, listpack_rpop, full, full_rpop),
+        (3, 3, 3, 3),
+        "LPOP/RPOP probe budget moved (listpack LPOP={listpack}, \
+         listpack RPOP={listpack_rpop}, full LPOP={full}, \
+         full RPOP={full_rpop}) — moon#942.\n\
+         \n\
+         The full arm used to be 4: `pop_eager` popped through \
+         `get_or_create_list`, let that borrow end, and then asked \
+         `get_list_ref_if_alive` a FOURTH time whether the list was now \
+         empty — a question the `&mut VecDeque` it had just been holding \
+         answers for free. `list.is_empty()` is read inside the existing \
+         borrow instead.\n\
+         \n\
+         Three is the floor without a change to `accessors.rs`: the `&self` \
+         router is what stops the pop flattening the compact encoding \
+         (moon#897/#832), and it cannot be folded into the mutable accessor \
+         from `src/command/`."
+    );
+}
+
+#[test]
 fn lpushx_rpushx_probe_budget() {
     let args = [bulk(LKEY), bulk(LELEM)];
 
