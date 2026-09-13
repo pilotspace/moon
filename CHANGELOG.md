@@ -19,6 +19,171 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replica. `HDEL h absent only` — the same two fields, reversed — deleted
   correctly, which is why this survived. Emptiness is now a property of the
   hash after the whole batch.
+- **`ZADD <missing-key> XX <score> <member>` no longer creates an empty zset**
+  (moon#942). moon reaches the keyspace through `get_or_create_*`, which
+  fabricates the container before the mutation loop can discover that `XX`
+  refuses every member of the batch; Redis short-circuits first
+  (`if (zobj == NULL) { if (xx) goto reply_to_client; }`) and creates nothing.
+  Both encodings leaked, because a member past `zset-max-listpack-value` skips
+  the listpack entry gate and lands on `get_or_create_sorted_set`, which
+  fabricates too. `ZADD` now drops an empty container the way `ZREM` always
+  has.
+
+  Verified against a live redis 8.6.1 — after one `ZADD ghost XX 1 m`:
+
+  | | redis | moon (before) |
+  |---|---|---|
+  | `EXISTS ghost` | 0 | **1** |
+  | `TYPE ghost` | `none` | **`zset`** |
+  | `DBSIZE` | 0 | **1** |
+  | `KEYS *` | (empty) | **`ghost`** |
+  | `DEBUG DIGEST` | `000…000` | **`01158ee1…`** |
+  | `ZCARD ghost` | 0 | 0 (agrees — which is why nothing caught it) |
+
+  This was unbounded keyspace growth on a path any unprivileged client can
+  drive — an entry plus a fabricated container per call, none of which ever
+  appears to hold anything — and it moved `DEBUG DIGEST`, so a replica or a
+  reloaded RDB disagreed with its master about the keyspace. The fix is pinned
+  on both encodings, together with the ledger (a refused `ZADD` charges
+  nothing) and the case it must not break (a refused `XX` on a zset that DOES
+  exist leaves it and its members alone).
+
+### Performance
+
+- **`ZADD` and `ZINCRBY` on a `skiplist` zset hash the member once, not three
+  times** (moon#942). Redis's `zsetAdd` does ONE `dictFind` and writes the new
+  score through the entry it found. moon did three — `members.get` for the flag
+  decision, then `members.remove` and `members.insert` inside `zadd_member` —
+  and cloned the `Bytes` twice on a path `src/command/` forbids cloning on at
+  all. A new `zset_update_existing` looks the member up once with `get_mut` and
+  writes through the slot; the flag decision rides inside its closure, so it has
+  one spelling and the write and the `CH` tally can never disagree about it.
+
+  The B+tree is now touched only when the score actually MOVES, which is
+  Redis's own `if (score != curscore)` and matters more here than it does
+  there: `BPTree::remove` builds a `Bytes::copy_from_slice(member)` to form its
+  lookup key, so an idempotent re-post used to cost an allocation as well as a
+  tree delete and a tree insert.
+
+  **Measured with `cfg(test)` counters**:
+
+  | on a 200-member (`skiplist`) zset | before | after |
+  |---|---:|---:|
+  | `members` hashes, `ZADD` onto an existing member | 3 | **1** |
+  | `members` hashes, `ZADD` of a new member | 3 | **2** |
+  | `members` hashes, `ZINCRBY` onto an existing member | 3 | **1** |
+  | `members` hashes, `ZREM` | 1 | 1 (control) |
+  | B+tree re-insertions, same score re-posted | 1 | **0** |
+  | B+tree re-insertions, score genuinely moved | 1 | 1 (control) |
+
+  Counts, not a throughput claim (PERF-08, moon#789).
+
+  The comparison is `to_bits()`, not `==`, for the same reason the listpack arm
+  compares bytes: `-0.0 == 0.0` is true while `-0` and `0` render differently,
+  and moon has always stored whichever spelling the client sent.
+  `the_bptree_identical_score_skip_is_decided_on_bits` pins it.
+
+  **The ledger is guarded, not argued.** `zset_member_cost` moved from
+  `is_new` at the end of `zadd_member` into the ABSENT arm of a `match`, and a
+  charge that moves is a charge that can be dropped or doubled (moon#814/#788).
+  `every_restructured_arm_keeps_the_ledger_exact` walks both encodings through
+  create, the skipped write, a widened score, a narrowed score, `NX` and `XX`
+  refusals, `ZINCRBY` both ways and `ZREM`, asserting the running ledger against
+  a from-scratch `recalculate_memory` at every rung — and returning the listpack
+  ladder to its exact floor. Proven able to fail: deleting the charge line makes
+  it report a 41,265 B ledger against a 42,865 B recompute.
+
+- **A `ZADD` that consults nothing stops decoding the stored score, and a
+  score already in place is no longer written back over itself** (moon#942).
+  A zset listpack keeps a score as canonical decimal text, so reading one is a
+  real `str::parse::<f64>` — and the plain `ZADD z <score> <member>`, which is
+  the benchmark's shape and most applications', consulted it for nothing:
+  `should_update` was unconditionally true and the `changed` tally it fed is
+  not what the command replies. It is now decoded only for `CH`, `GT` and `LT`
+  (`NX` refuses on presence, which locating the pair already established).
+  On top of that, Redis's `zsetAdd` re-inserts only `if (score != curscore)`
+  while moon spliced the rendering back over itself every time — so the
+  idempotent re-post a leaderboard client makes paid an `encode_entry` and a
+  `write_entry` to change nothing.
+
+  **Measured with `cfg(test)` counters**, on the benchmark's own
+  `zadd z:<n> 1 m:<n>` shape:
+
+  | `ZADD` onto an existing listpack member | before | after |
+  |---|---:|---:|
+  | stored-score decodes, no flag and no `CH` | 1 | **0** |
+  | stored-score decodes with `GT` / `CH` | 1 | 1 (control) |
+  | score entries written, same score re-posted | 1 | **0** |
+  | score entries written, score genuinely moved | 1 | 1 (control) |
+
+  A call count is not a throughput claim and this entry makes none (PERF-08,
+  moon#789).
+
+  The skip is decided on the RENDERED BYTES, not on `old == score`, and that is
+  deliberate: `-0.0 == 0.0` is true while `-0` and `0` are different bytes, so
+  comparing doubles the way Redis does would have silently started answering
+  `0` to a client that wrote `-0`. moon has always stored whichever spelling
+  the client sent, and `the_listpack_identical_score_skip_is_decided_on_bytes`
+  pins that. Writing bytes that are already there changes nothing, so declining
+  is observationally identical everywhere else.
+
+- **`ZADD` parses each score argument once instead of twice** (moon#942).
+  moon#814's validation pre-pass — which must keep proving every pair before
+  the keyspace is touched, because the mutation loop returns from inside the
+  `table_before … charge_memory()` window — threw every decoded `f64` away, and
+  the loop then re-ran `str::parse::<f64>` over the same bytes. Redis's
+  `zaddGenericCommand` parses once into its own `scores` array. The pre-pass
+  now keeps what it decodes, in a fixed 32-entry stack array: `src/command/`
+  forbids the heap allocation a `SmallVec` spill would make, so a batch larger
+  than that re-parses in the loop exactly as before.
+
+  **Measured with a `cfg(test)` counter on the parse itself**: a one-pair
+  `ZADD` went from **2 parses to 1**, a four-pair batch from **8 to 4**. A call
+  count is not a throughput claim and this entry makes none (PERF-08, moon#789).
+
+  The all-or-nothing contract is unchanged and guarded:
+  `a_rejected_batch_still_validates_every_pair_before_the_keyspace` asserts that
+  a bad pair anywhere still errors and still leaves the key uncreated — the one
+  thing caching the pre-pass's output could have broken.
+
+- **An integral sorted-set score is no longer rendered by `core::fmt`'s `f64`
+  Display** (moon#942). Every score moon stored in a listpack, replied to a
+  client, or wrote to an RDB went through `write!("{score}")` — the
+  shortest-round-trip (Grisu/Dragon) formatter plus the whole `Formatter`
+  machinery — including the literal `1` the ZADD benchmark writes on every
+  call and every integral leaderboard score ever posted. Redis's `d2string`
+  has always forked here: `double2ll` first, `ll2string` when it succeeds, and
+  `fpconv_dtoa` only when it does not. `zset_score::render_score` now takes
+  the same fork through a new `integral_score`, and `format_score` /
+  `format_score_bytes` — which were an independent second transcription of the
+  same three rules — delegate to it, so `ZSCORE`, `ZRANGE … WITHSCORES`,
+  `ZINCRBY`, `ZPOPMIN`/`ZPOPMAX`, `ZMSCORE`, the blocking `BZPOPMIN` wakeups
+  and `DEBUG DIGEST` all take it too.
+
+  **Measured with a `cfg(test)` counter on the slow arm**, on the benchmark's
+  own `zadd z:<n> 1 m:<n>` shape: a `ZADD` with an integral score reached
+  `core::fmt`'s float formatter **1 time before, 0 after**; a `ZADD` with
+  `1.5` still reaches it exactly once, which is the control that proves the
+  counter is live.
+
+  A call count is a count. It is **not** a throughput claim and this entry
+  makes none — PERF-08 (moon#789) measured +11% on aarch64 and −17% on x86_64
+  for one work reduction in this repo, so the wall-clock question belongs to a
+  Linux bench host.
+
+  **The bytes are identical wherever the fast path is taken**, and that is
+  asserted against `core::fmt` DIRECTLY rather than against another moon
+  function: `the_integer_fast_path_is_byte_identical_to_core_fmt` sweeps the
+  hand-written cases, both sides of the 2^53 cutoff, every integer in
+  ±1100, and 20,000 deterministic `f64` bit patterns plus their truncations.
+  Three exclusions carry the proof — `-0.0` (which prints `-0`, not `0`),
+  non-integers, and anything past 2^53 (which catches both infinities and NaN,
+  whose `fract()` is NaN). Both were proven able to fail: widening the cutoff
+  to `f64::MAX` makes `1e21` report `1000000000000000000000` against
+  `-9223372036854775808`, and dropping the `-0.0` arm makes `-0.0` report `0`
+  against `-0`. A listpack or RDB written before this change still reads back
+  byte-for-byte the same, which is what `parse_score`'s round-trip exactness
+  and every reader of a stored score depend on.
 
 ### Performance
 

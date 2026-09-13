@@ -8,24 +8,36 @@ use crate::storage::listpack::PairUpdate;
 use crate::storage::zset_score::{ScoreBuf, render_score};
 
 use crate::command::helpers::{all_args_are_bytes, err, err_wrong_args, extract_bytes};
+use crate::command::sorted_set::work_budget;
 
 use super::{
     AggregateOp, format_score, format_score_bytes, zadd_member, zrange_by_lex, zrange_by_rank,
-    zrange_by_score, zrem_member,
+    zrange_by_score, zrem_member, zset_insert_absent, zset_update_existing,
 };
 
 // ---------------------------------------------------------------------------
 // Write commands (mutate the database)
 // ---------------------------------------------------------------------------
 
+/// How many `score member` pairs of one `ZADD` are carried from the moon#814
+/// validation pre-pass to the mutation loop in a stack array.
+///
+/// A fixed array rather than a `SmallVec` because `src/command/` forbids the
+/// heap allocation a spill would make: past this many pairs the loop re-parses
+/// exactly as it always did, which is correct, just not free. 32 pairs covers
+/// the benchmark's one and every batch an application realistically sends, and
+/// costs 256 bytes of a shard thread's stack.
+const ZADD_INLINE_PAIRS: usize = 32;
+
 /// Parse one `score member` pair of a `ZADD`.
 ///
-/// The single source of truth for what `ZADD` accepts. Both the validation
-/// pre-pass and the mutation loop call it, and that is load-bearing rather
-/// than tidy: the moment the two disagree — the pre-pass accepting something
-/// the loop then rejects — moon#814 returns, because the loop's error arms
-/// return from inside the `table_before … charge_memory()` window and strand
-/// the charge for every member already inserted.
+/// The single source of truth for what `ZADD` accepts. The validation pre-pass
+/// calls it for every pair, and the mutation loop calls it again for any batch
+/// too large to cache — and that shared definition is load-bearing rather than
+/// tidy: the moment the two disagree — the pre-pass accepting something the
+/// loop then rejects — moon#814 returns, because the loop's error arms return
+/// from inside the `table_before … charge_memory()` window and strand the
+/// charge for every member already inserted.
 #[inline]
 fn parse_zadd_pair<'a>(
     score_arg: &Frame,
@@ -38,6 +50,7 @@ fn parse_zadd_pair<'a>(
     let Ok(score_str) = std::str::from_utf8(score_bytes) else {
         return Err(err("ERR value is not a valid float"));
     };
+    work_budget::note_arg_score_parse();
     let Ok(score) = score_str.parse::<f64>() else {
         return Err(err("ERR value is not a valid float"));
     };
@@ -45,6 +58,33 @@ fn parse_zadd_pair<'a>(
         return Err(err("ERR value is not a valid float"));
     }
     Ok((score, member))
+}
+
+/// The pair at `idx`, taking the score from the pre-pass's cache when it fits
+/// and re-parsing when it does not (moon#942).
+///
+/// Neither arm can fail for a batch the pre-pass accepted; both are kept as
+/// real `Result`s anyway, because a bare `unwrap` here would be the one place
+/// the validation and the mutation could silently diverge — which is exactly
+/// the moon#814 shape.
+#[inline]
+fn resolved_pair<'a>(
+    pair: &'a [Frame],
+    idx: usize,
+    cache: Option<&[f64]>,
+) -> Result<(f64, &'a Bytes), Frame> {
+    let [score_arg, member_arg] = pair else {
+        return Err(err_wrong_args("ZADD"));
+    };
+    match cache {
+        Some(scores) => {
+            let (Some(member), Some(score)) = (extract_bytes(member_arg), scores.get(idx)) else {
+                return Err(err_wrong_args("ZADD"));
+            };
+            Ok((*score, member))
+        }
+        None => parse_zadd_pair(score_arg, member_arg),
+    }
 }
 
 // A zset listpack is `[member, score, member, score, …]` — the same
@@ -136,19 +176,39 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     // all-or-nothing, and it does not create the key when the command errors —
     // which is why this sits above `get_or_create_sorted_set`.
     //
-    // Two passes rather than a parsed `Vec`: `src/command/` is a no-allocation
-    // path, and parsing an f64 twice is far cheaper than the B+tree insert it
-    // guards.
-    for pair in remaining.chunks_exact(2) {
+    // The pre-pass KEEPS what it decodes (moon#942). It used to throw every
+    // `f64` away and let the mutation loop re-run `parse_zadd_pair` over the
+    // same bytes — `str::parse::<f64>` twice per pair, where Redis's
+    // `zaddGenericCommand` parses once into its own `scores` array.
+    //
+    // A fixed stack array, not a `SmallVec`: `src/command/` forbids the
+    // allocation a spill would make, so a batch that does not fit simply
+    // re-parses in the loop exactly as before.
+    let pair_count = remaining.len() / 2;
+    let mut scores_cache = [0f64; ZADD_INLINE_PAIRS];
+    let cached = pair_count <= ZADD_INLINE_PAIRS;
+    for (idx, pair) in remaining.chunks_exact(2).enumerate() {
         let [score_arg, member_arg] = pair else {
             // `chunks_exact(2)` yields nothing else; the guard above already
             // rejected an odd tail.
             return err_wrong_args("ZADD");
         };
-        if let Err(e) = parse_zadd_pair(score_arg, member_arg) {
-            return e;
+        match parse_zadd_pair(score_arg, member_arg) {
+            Ok((score, _)) => {
+                if cached {
+                    scores_cache[idx] = score;
+                }
+            }
+            Err(e) => return e,
         }
     }
+    // What the two mutation loops below read instead of re-parsing. `None` for
+    // an oversized batch, which re-parses exactly as it always did.
+    let cache: Option<&[f64]> = if cached {
+        Some(&scores_cache[..pair_count])
+    } else {
+        None
+    };
 
     // Listpack path for small sorted sets (moon#787). Redis keeps a zset in a
     // listpack until it exceeds zset-max-listpack-entries (128) or
@@ -196,25 +256,61 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                 // Listpack `estimate_memory()` is O(1) (capacity-based), so a
                 // before/after snapshot is cheap — no per-member formula.
                 let before = lp.estimate_memory();
-                for pair in remaining.chunks_exact(2) {
-                    let [score_arg, member_arg] = pair else {
-                        return err_wrong_args("ZADD");
-                    };
-                    // Cannot fail: the pre-pass above validated every pair
-                    // with this exact function before the keyspace was
-                    // touched. Kept as a real match anyway, as the B+tree
-                    // loop below does.
-                    let (score, member) = match parse_zadd_pair(score_arg, member_arg) {
+                // Does ANYTHING in this command consult the score already
+                // stored (moon#942)? A listpack keeps a score as canonical
+                // decimal text, so decoding one is a real `str::parse::<f64>`,
+                // and the plain `ZADD z <score> <member>` — the benchmark's
+                // shape, and most applications' — consults it for nothing:
+                // `should_update` is unconditionally true and the `changed`
+                // tally it feeds is not what the command replies. `NX` is on
+                // this side of the line too, because it refuses on PRESENCE,
+                // which `update_pair_value` established by finding the pair.
+                let consults_old = ch || gt || lt;
+                for (idx, pair) in remaining.chunks_exact(2).enumerate() {
+                    let (score, member) = match resolved_pair(pair, idx, cache) {
                         Ok(parsed) => parsed,
                         Err(e) => return e,
                     };
 
-                    // ONE scan (moon#942), decided from the score that is
-                    // already there. `old_score` comes back out through the
-                    // closure because the `CH` tally needs it after the
-                    // write.
+                    // Store the canonical rendering, not the raw argument:
+                    // `ZADD z 3.0 m` must answer `ZSCORE` with `3`, and
+                    // `render_score` is round-trip exact, so `as_score`
+                    // recovers the identical f64. Rendered ONCE per member and
+                    // reused by every arm below.
+                    let mut rendered = ScoreBuf::new();
+                    render_score(score, &mut rendered);
+
+                    // ONE scan (moon#942), decided from what is already there.
+                    // `old_score` comes back out through the closure because
+                    // the `CH` tally needs it after the write.
                     let mut old_score = 0.0f64;
                     let outcome = lp.update_pair_value(member, |current| {
+                        if !consults_old {
+                            if nx {
+                                // The member is present, which is all NX needs.
+                                return None;
+                            }
+                            // Redis's `zsetAdd` re-inserts only
+                            // `if (score != curscore)`. Comparing the RENDERED
+                            // bytes decides the same question without decoding
+                            // the stored score — and decides it the way moon
+                            // already behaved, byte for byte: writing bytes
+                            // that are already there changes nothing, so
+                            // declining here is observationally identical and
+                            // skips an `encode_entry` plus a `write_entry`.
+                            //
+                            // (Byte equality is not score equality at exactly
+                            // one point — `-0` and `0` are different bytes for
+                            // scores that compare equal — and taking the BYTE
+                            // answer there is what preserves moon's existing
+                            // behaviour rather than quietly adopting Redis's.)
+                            if current.eq_bytes(&rendered) {
+                                return None;
+                            }
+                            work_budget::note_listpack_score_write();
+                            return Some(&rendered[..]);
+                        }
+                        work_budget::note_stored_score_parse();
                         let old = current.as_score().unwrap_or(0.0);
                         old_score = old;
                         let should_update = if nx {
@@ -231,28 +327,28 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                         if !should_update {
                             return None;
                         }
-                        // Store the canonical rendering, not the raw
-                        // argument: `ZADD z 3.0 m` must answer `ZSCORE` with
-                        // `3`, and `render_score` is round-trip exact, so
-                        // `as_score` recovers the identical f64.
-                        let mut rendered = ScoreBuf::new();
-                        render_score(score, &mut rendered);
-                        Some(rendered)
+                        work_budget::note_listpack_score_write();
+                        Some(&rendered[..])
                     });
 
                     match outcome {
                         PairUpdate::Replaced(_) => {
+                            // `changed` is only ever REPLIED under `CH`, and
+                            // `CH` is on the `consults_old` side, so
+                            // `old_score` is the real stored score whenever
+                            // this tally can be read.
                             if (old_score - score).abs() > f64::EPSILON {
                                 changed += 1;
                             }
                         }
-                        // The member is there and a flag refused the write.
+                        // The member is there and either a flag refused the
+                        // write or the bytes were already the ones this call
+                        // would have written.
                         PairUpdate::Unchanged => {}
                         PairUpdate::Absent => {
                             // New member: add unless XX.
                             if !xx {
-                                let mut rendered = ScoreBuf::new();
-                                render_score(score, &mut rendered);
+                                work_budget::note_listpack_score_write();
                                 lp.push_back(member);
                                 lp.push_back(&rendered);
                                 added += 1;
@@ -266,9 +362,24 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                 // it converts `lp.len()` (member AND score entries) to
                 // members itself.
                 let should_upgrade = !limits.listpack_fits(Shape::SortedSet, lp);
+                // Empty means the accessor FABRICATED this container and `XX`
+                // then refused every member of the batch — moon reaches the
+                // keyspace through `get_or_create_*`, where Redis checks
+                // `if (zobj == NULL) { if (xx) goto reply_to_client; }` and
+                // creates nothing. `ZREM` already carries this rule, which is
+                // why a drained zset never survives; without it here,
+                // `ZADD <random> XX 1 m` grows the keyspace without bound and
+                // moves `DEBUG DIGEST` away from the master's.
+                let is_empty = lp.is_empty();
                 // `lp`'s borrow of `db` ends here — safe to call back into
                 // `db` for accounting from this point on.
                 db.adjust_memory(before, after);
+                if is_empty {
+                    db.remove(key);
+                    // Nothing was added and nothing changed, so both tallies
+                    // are zero and the reply is the same either way.
+                    return Frame::Integer(0);
+                }
                 if should_upgrade {
                     // One-time cost-model swing (listpack -> B+tree + members
                     // map). The accessor bills it itself through
@@ -309,56 +420,69 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     // allocation is four of them.
     let table_before = zset_table_bytes(members, scores);
 
-    for pair in remaining.chunks_exact(2) {
-        let [score_arg, member_arg] = pair else {
-            return err_wrong_args("ZADD");
-        };
-        // Cannot fail: the pre-pass above validated every pair with this exact
-        // function before the keyspace was touched. Kept as a real match
-        // anyway — a bare `unwrap` here would be the one place the two passes
-        // could silently diverge.
-        let (score, member) = match parse_zadd_pair(score_arg, member_arg) {
+    for (idx, pair) in remaining.chunks_exact(2).enumerate() {
+        let (score, member) = match resolved_pair(pair, idx, cache) {
             Ok(parsed) => parsed,
             Err(e) => return e,
         };
-        let member = member.clone();
 
-        let existing_score = members.get(&member).copied();
+        // ONE hash lookup answers everything this loop asks of an EXISTING
+        // member (moon#942): whether it is there, what its score was, and
+        // where the new one goes. The flag decision rides inside the closure,
+        // so the score never has to be looked up a second time to write it.
+        let mut accepted = false;
+        let existing_score: Option<f64> = zset_update_existing(members, scores, member, |old| {
+            let should_update = if nx {
+                false // NX: never update existing
+            } else if gt && lt {
+                false // GT+LT together: never update (mutually exclusive)
+            } else if gt {
+                score > old
+            } else if lt {
+                score < old
+            } else {
+                true // No flags: always update
+            };
+            accepted = should_update;
+            if should_update { Some(score) } else { None }
+        });
 
-        let should_update = match existing_score {
-            None => !xx, // New member: add unless XX
+        match existing_score {
             Some(old) => {
-                if nx {
-                    false // NX: never update existing
-                } else if gt && lt {
-                    false // GT+LT together: never update (mutually exclusive)
-                } else if gt {
-                    score > old
-                } else if lt {
-                    score < old
-                } else {
-                    true // No flags: always update
+                // `accepted` is the closure's own decision, read back rather
+                // than re-derived: the flag logic has ONE spelling, so the
+                // write and the `CH` tally can never disagree about it.
+                // `changed` then reports whether the score MOVED, on the same
+                // epsilon rule this command has always used.
+                if accepted && (old - score).abs() > f64::EPSILON {
+                    changed += 1;
                 }
             }
-        };
-
-        if should_update {
-            let member_cost = zset_member_cost(&member);
-            let is_new = zadd_member(members, scores, member, score);
-            if is_new {
-                added += 1;
-                changed += 1;
-                mem_charge += member_cost;
-            } else if existing_score.is_some_and(|es| (es - score).abs() > f64::EPSILON) {
-                changed += 1;
+            None => {
+                // New member: add unless XX.
+                if !xx {
+                    mem_charge += zset_member_cost(member);
+                    zset_insert_absent(members, scores, member.clone(), score);
+                    added += 1;
+                    changed += 1;
+                }
             }
         }
     }
 
     let table_after = zset_table_bytes(members, scores);
+    // Same rule as the listpack arm and as `ZREM`: an empty container here
+    // means the accessor fabricated it and `XX` refused the whole batch, and
+    // Redis creates nothing in that case. A 65-byte member skips the listpack
+    // gate entirely, so this arm leaks a ghost key without it.
+    let is_empty = members.is_empty();
     // `members`/`scores`' borrow of `db` ends above.
     db.charge_memory(mem_charge);
     db.adjust_memory(table_before, table_after);
+    if is_empty {
+        db.remove(key);
+        return Frame::Integer(0);
+    }
 
     if ch {
         Frame::Integer(changed)
@@ -542,6 +666,7 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
                 // change deliberately does not alter, and that a NaN must
                 // never reach a listpack in the meantime.
                 let outcome = lp.update_pair_value(&member, |current| {
+                    work_budget::note_stored_score_parse();
                     let new_score = current.as_score().unwrap_or(0.0) + increment;
                     if new_score.is_nan() {
                         return None;
@@ -611,12 +736,23 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
 
-    let current = members.get(&member).copied().unwrap_or(0.0);
-    let new_score = current + increment;
-
     let member_cost = zset_member_cost(&member);
     let table_before = zset_table_bytes(members, scores);
-    let is_new = zadd_member(members, scores, member, new_score);
+    // ONE hash lookup (moon#942): the same lookup that reads the current score
+    // writes `current + increment` back through the slot it found. It used to
+    // be `members.get` followed by `zadd_member`'s own `remove` and `insert` —
+    // three hashes of one member for one command.
+    let mut new_score = increment;
+    let is_new = zset_update_existing(members, scores, &member, |current| {
+        new_score = current + increment;
+        Some(new_score)
+    })
+    .is_none();
+    if is_new {
+        // A member that was not there starts at 0.0, so its new score is the
+        // increment itself — already in `new_score`.
+        zset_insert_absent(members, scores, member, new_score);
+    }
     let table_after = zset_table_bytes(members, scores);
     // `members`/`scores`' borrow of `db` ends above.
     if is_new {
