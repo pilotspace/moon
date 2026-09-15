@@ -701,6 +701,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A test that enumerates `COMMAND_META` and drives the real wait decision**,
+  `intercepted_commands_wait_for_pending_remote_writes_moon937`
+  (`src/server/conn/shared.rs`). `tests/intercept_flag_drift.rs` guards one
+  direction — *marked `NO_INTERCEPT` implies no gate claims it* — whose flag
+  fails **safe**. The other direction, *a gate claims it implies
+  `must_wait_for_pending_remote` says wait*, was unguarded, and
+  `is_inline_intercepted` fails **open**: a missing entry reads as permission,
+  which is moon#507's shape and how moon#937 happened. The new test drives the
+  real decision function over the registry rather than a hand list, probes each
+  command twice (a key-shaped modifier and a `numkeys` form — the one-probe
+  version stayed green under a deliberate deletion), and probes the gates whose
+  name predicate lives outside the five scanned files explicitly, since no text
+  scan can see those. Six commands answer "safe" today; each is waived by name
+  with a reason, and the waiver is pinned to exactly the set that still offends,
+  so a new undeclared interceptor fails one assertion and *fixing* one of the
+  waived commands fails the other. Verified by mutation: five separate breakages
+  — dropping `EVALSHA`, dropping `EVAL`, declaring `TXN`, breaking the gate scan,
+  breaking a delegated probe — each turned it red.
 - **Fuzz target `canonical_i64_differential`** — pins
   `is_canonical_i64(d) == canonical_i64(d).is_some()` for every byte string,
   plus the moon#795 property itself (an accepted value must render back to the
@@ -1170,6 +1188,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **`server/conn` (monoio): a single-shard server stops building and polling
+  the cross-shard coordinator's future once per command.**
+  `try_handle_cross_shard_commands` is an `async fn` taking six arguments whose
+  very first statement is `if ctx.num_shards <= 1 { return false }` — but its
+  call site was guarded only by `!txn_multikey_write`, so at `--shards 1` every
+  `GET`, `INCR`, `SADD`, `LPUSH`, `HSET` and `ZADD` constructed that future,
+  awaited it, and was told there was nothing to coordinate. The same predicate
+  now sits at the call site; the inner early-out stays, so the site is an
+  optimisation rather than a correctness dependency.
+
+  It is deliberately **not** gated on `skip_name_gates`.
+  `MGET`/`MSET`/`UNLINK`/`EXISTS` carry `NO_INTERCEPT` *and* are claimed by the
+  gate's own multi-key arm, so the flag would silently route them by their
+  FIRST key and execute the whole command against that one shard's slice. That
+  failure was reproduced deliberately, by mutating the gate to
+  `ctx.num_shards > 8`: `MSET` across four shards then loses three of its four
+  values and `DBSIZE` answers `1` instead of `4`.
+
+  Above one shard nothing changes — the predicate is the one the callee already
+  applied. **No throughput number is claimed:** benchmarks are Linux-only and
+  this was written and verified on macOS. `tests/cross_shard_gate_shard_count.rs`
+  runs every command the gate claims at `--shards 1` and `--shards 4` with
+  identical assertions, because this seam's defects (moon#507, moon#513,
+  moon#592, moon#937) were all invisible at one shard.
 - **`server`: the monoio write path stops taking a second exclusive database
   guard just to discover it has nothing to wake (moon#942).** After `dispatch`,
   `handler_monoio` acquired `s.databases.write(new_sel_db)` — a `guard_depth`

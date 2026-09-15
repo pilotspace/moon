@@ -3496,6 +3496,308 @@ mod as_of_tests {
     }
 
     // -----------------------------------------------------------------
+    // moon#937 — the implication `tests/intercept_flag_drift.rs` does NOT
+    // guard: a command a gate CLAIMS must still make
+    // `must_wait_for_pending_remote` say WAIT.
+    // -----------------------------------------------------------------
+
+    /// Files holding the connection handler's intercept gates. Kept in step
+    /// with `GATE_FILES` in `tests/intercept_flag_drift.rs`.
+    const GATE_FILES: [&str; 5] = [
+        "src/server/conn/handler_monoio/dispatch.rs",
+        "src/server/conn/handler_monoio/write.rs",
+        "src/server/conn/handler_monoio/txn.rs",
+        "src/server/conn/handler_monoio/pubsub.rs",
+        "src/server/conn/handler_monoio/ft.rs",
+    ];
+
+    /// Every command name matched by an intercept gate's top-level guard —
+    /// the prefix of a `try_*` body before it starts parsing subcommands,
+    /// which is where a gate decides "not mine, return false". Names appearing
+    /// later are subcommands (`CLIENT KILL`, `FT.CONFIG SET`) and must not
+    /// count.
+    ///
+    /// A deliberate second copy of the scan in
+    /// `tests/intercept_flag_drift.rs`. That file is an INTEGRATION test: it
+    /// reaches `COMMAND_META` (public) but not [`must_wait_for_pending_remote`]
+    /// or [`is_inline_intercepted`], both crate-private, and the assertion
+    /// below must CALL the real decision function rather than approximate it
+    /// with a second text scan. Widening routing primitives into the public
+    /// API to save forty lines of test-only scanning is the worse trade.
+    /// **Edit one scanner, edit the other** — each carries its own
+    /// anti-vacuity floor, so a broken extraction fails loudly on both sides
+    /// rather than passing silently.
+    ///
+    /// # What this scan cannot see
+    ///
+    /// A gate that delegates its name test to a predicate defined OUTSIDE
+    /// these five files — `try_handle_txn_*`/`try_handle_temporal_*`
+    /// (`is_txn_begin`, `is_temporal_invalidate`, … in `command::`) and
+    /// `try_handle_blocking` (`is_blocking_command_args` in
+    /// `server::conn::blocking`) — contributes no literal here. Those gates
+    /// are probed explicitly by `DELEGATED_GATE_PROBES` below instead of being
+    /// silently absent, which is exactly how moon#937 stayed invisible.
+    fn names_claimed_by_gates() -> std::collections::BTreeSet<String> {
+        let mut claimed = std::collections::BTreeSet::new();
+        // CARGO_MANIFEST_DIR, never a hardcoded path: a literal that happens
+        // to exist on one machine makes this test pass locally and vanish on
+        // CI.
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for rel in GATE_FILES {
+            let path = root.join(rel);
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read gate file {}: {e}", path.display()));
+
+            for (idx, _) in src.match_indices("fn try_") {
+                let body = &src[idx..];
+                let end = [
+                    "_inner(",
+                    "parse_mq_subcommand",
+                    "parse_ws_subcommand",
+                    "let sub",
+                ]
+                .iter()
+                .filter_map(|m| body.find(m))
+                .min()
+                .unwrap_or(body.len().min(1200))
+                .min(1200);
+                let guard = &body[..end];
+
+                for pat in ["eq_ignore_ascii_case(b\"", "starts_with(b\""] {
+                    let mut rest = guard;
+                    while let Some(p) = rest.find(pat) {
+                        let after = &rest[p + pat.len()..];
+                        if let Some(q) = after.find('"') {
+                            claimed.insert(after[..q].to_ascii_uppercase());
+                        }
+                        rest = &after[1..];
+                    }
+                }
+            }
+        }
+        claimed
+    }
+
+    /// True when `name` is claimed by a gate's top-level guard, directly or
+    /// through a dotted-family prefix guard (`FT.`, `GRAPH.`, `CDC.`, `TS.`).
+    fn gate_claims(claimed: &std::collections::BTreeSet<String>, name: &str) -> bool {
+        claimed.contains(name)
+            || claimed
+                .iter()
+                .any(|c| c.ends_with('.') && name.len() > c.len() && name.starts_with(c.as_str()))
+    }
+
+    /// Gates whose name test is a predicate defined outside [`GATE_FILES`], so
+    /// the text scan is blind to them. Each row is `(name, args)` chosen so the
+    /// delegated predicate actually fires; the test asserts that it does, so a
+    /// renamed subcommand turns the row red instead of silently disabling it.
+    ///
+    /// `TXN` carries its subcommand in `args[0]`, which is also what
+    /// `extract_primary_key` would hash — the whole reason it is on this list.
+    fn delegated_gate_probes() -> Vec<(&'static str, Vec<Frame>, bool)> {
+        use crate::command::temporal::{is_temporal_invalidate, is_temporal_snapshot_at};
+        use crate::command::transaction::{is_txn_abort, is_txn_begin, is_txn_commit};
+        let blocking =
+            |c: &[u8], a: &[Frame]| crate::server::conn::blocking::is_blocking_command_args(c, a);
+        vec![
+            (
+                "TXN",
+                vec![frame_bulk(b"BEGIN")],
+                is_txn_begin(b"TXN", &[frame_bulk(b"BEGIN")]),
+            ),
+            (
+                "TXN",
+                vec![frame_bulk(b"COMMIT")],
+                is_txn_commit(b"TXN", &[frame_bulk(b"COMMIT")]),
+            ),
+            (
+                "TXN",
+                vec![frame_bulk(b"ABORT")],
+                is_txn_abort(b"TXN", &[frame_bulk(b"ABORT")]),
+            ),
+            (
+                "TEMPORAL.SNAPSHOT_AT",
+                vec![],
+                is_temporal_snapshot_at(b"TEMPORAL.SNAPSHOT_AT"),
+            ),
+            (
+                "TEMPORAL.INVALIDATE",
+                vec![frame_bulk(b"42"), frame_bulk(b"NODE"), frame_bulk(b"g")],
+                is_temporal_invalidate(b"TEMPORAL.INVALIDATE"),
+            ),
+            (
+                "BLPOP",
+                vec![frame_bulk(b"k"), frame_bulk(b"0")],
+                blocking(b"BLPOP", &[frame_bulk(b"k"), frame_bulk(b"0")]),
+            ),
+        ]
+    }
+
+    /// Every command an intercept gate CONSUMES must make
+    /// [`must_wait_for_pending_remote`] answer `true`.
+    ///
+    /// An intercepted command executes against the LOCAL slice, before
+    /// routing, whatever keys it names — so it must not run while that shard
+    /// still holds undispatched writes. The guard's own opening line is
+    ///
+    /// ```text
+    /// if is_inline_intercepted(cmd) || extract_primary_key(cmd, args).is_none() {
+    ///     return true; // wait
+    /// }
+    /// ```
+    ///
+    /// and [`is_inline_intercepted`] fails **OPEN**: a missing entry reads as
+    /// permission, which is moon#507 (acked writes vanishing) and moon#937.
+    /// `tests/intercept_flag_drift.rs` guards the other implication —
+    /// `NO_INTERCEPT(c) => no gate claims c` — whose flag fails SAFE. This is
+    /// the missing half, and it drives the REAL decision function over an
+    /// enumeration of `COMMAND_META` rather than over a hand-maintained list.
+    ///
+    /// # The waiver is a recorded decision, not a widening
+    ///
+    /// Two groups answer `false` today and both are named, with a reason each,
+    /// in `WAIVED`. The waiver cannot silently grow or silently rot: the final
+    /// assertion pins the waived-and-still-offending set to exactly those
+    /// names, so a NEW undeclared interceptor fails the first assertion and
+    /// FIXING either group fails the second, forcing the entry out.
+    #[test]
+    fn intercepted_commands_wait_for_pending_remote_writes_moon937() {
+        /// `(name, why)`. Every entry is a command a gate consumes inline for
+        /// which the guard currently says "safe to run now".
+        const WAIVED: &[(&str, &str)] = &[
+            // Shard-channel pub/sub. Consumed by try_handle_publish /
+            // try_handle_subscribe_entry / try_handle_unsubscribe before
+            // routing, and `extract_primary_key` answers for them because the
+            // shard CHANNEL is key-shaped — deliberately so: the sibling
+            // `SHARD_CHANNEL` constant above records that declaring them
+            // keyless would drop `MOVED` for shard channels. They mutate the
+            // pub/sub registries and never read or write the keyspace slice,
+            // so the wait they skip protects nothing. INFERRED from reading
+            // those three gates, not measured.
+            ("SPUBLISH", "shard channel; touches no keyspace state"),
+            ("SSUBSCRIBE", "shard channel; touches no keyspace state"),
+            ("SUNSUBSCRIBE", "shard channel; touches no keyspace state"),
+            // moon#937, the live gap. `INTERCEPTED_NOT_DECLARED` above already
+            // names these as absent from `is_inline_intercepted` despite being
+            // inline-intercepted. Fixing them means DECLARING them there,
+            // which widens the cross-shard wait set — a correctness change
+            // belonging to moon#937, deliberately not made from a performance
+            // branch.
+            ("TXN", "moon#937 wait-set gap"),
+            ("TEMPORAL.INVALIDATE", "moon#937 wait-set gap"),
+            // `try_handle_blocking` consumes it, `is_blocking_command_args`
+            // lives outside GATE_FILES so no scanner ever saw it, and the
+            // guard routes it by its own key and says "do not wait". Whether
+            // that is safe depends on the blocking path's own ordering, which
+            // this test does not model. Recorded so it is a named unknown
+            // rather than an absence. Not part of moon#937.
+            ("BLPOP", "blocking gate; ordering not modelled here"),
+        ];
+
+        let claimed = names_claimed_by_gates();
+        assert!(
+            claimed.len() > 20,
+            "the gate scan found only {} names — the extraction broke, and a \
+             broken extraction would make this test pass vacuously. Found: \
+             {claimed:?}",
+            claimed.len()
+        );
+        // Positive controls: the two entries `pco10` already drives must come
+        // out claimed AND waiting. If either side of the pipeline returns
+        // nothing, this fails before any verdict is read.
+        for probe in ["EVAL", "SWAPDB"] {
+            assert!(
+                gate_claims(&claimed, probe),
+                "{probe} is intercepted but the gate scan did not find it — the \
+                 scan is broken, not the registry"
+            );
+            assert!(
+                is_inline_intercepted(probe.as_bytes()),
+                "{probe} is declared in is_inline_intercepted by inspection; if \
+                 this fails the predicate under test is broken"
+            );
+        }
+
+        // TWO probes, and a command offends if EITHER of them skips the wait.
+        //
+        // * `MODIFIER` is a plausible modifier: never a key, always key-SHAPED,
+        //   which is the whole trap (moon#925).
+        // * `NUMKEYS` satisfies the `<name> <numkeys> <key> …` shape, so
+        //   `extract_primary_key` answers for EVAL/FCALL-style commands too.
+        //   With `MODIFIER` alone those come back keyless and the guard waits
+        //   for the wrong reason — verified by mutation: deleting `FCALL` from
+        //   `is_inline_intercepted` left the one-probe version GREEN.
+        //
+        // `pending` is every shard and `num_shards` is 4, so any `false` below
+        // is a genuine "run it now", not an artefact of an empty pending mask.
+        const NUM_SHARDS: usize = 4;
+        const PENDING_ALL: u64 = u64::MAX;
+        let modifier = vec![frame_bulk(b"ASYNC"), frame_bulk(b"1")];
+        let numkeys = vec![
+            frame_bulk(b"body"),
+            frame_bulk(b"1"),
+            frame_bulk(b"k1"),
+            frame_bulk(b"v"),
+        ];
+
+        let mut offenders: Vec<&str> = Vec::new();
+        for (name, _meta) in crate::command::metadata::COMMAND_META.entries() {
+            if !gate_claims(&claimed, name) {
+                continue;
+            }
+            let waits = [&modifier, &numkeys].into_iter().all(|args| {
+                must_wait_for_pending_remote(name.as_bytes(), args, NUM_SHARDS, PENDING_ALL, false)
+            });
+            if !waits {
+                offenders.push(*name);
+            }
+        }
+        for (name, args, predicate_fired) in delegated_gate_probes() {
+            assert!(
+                predicate_fired,
+                "the delegated-gate probe for {name} no longer fires — its \
+                 predicate was renamed or its subcommand changed, and the row \
+                 would otherwise test nothing"
+            );
+            if !must_wait_for_pending_remote(name.as_bytes(), &args, NUM_SHARDS, PENDING_ALL, false)
+            {
+                offenders.push(name);
+            }
+        }
+        offenders.sort_unstable();
+        offenders.dedup();
+
+        let waived: std::collections::BTreeSet<&str> = WAIVED.iter().map(|(n, _)| *n).collect();
+        let unwaived: Vec<&str> = offenders
+            .iter()
+            .copied()
+            .filter(|n| !waived.contains(n))
+            .collect();
+        assert!(
+            unwaived.is_empty(),
+            "an intercept gate consumes each of these, but \
+             must_wait_for_pending_remote calls them SAFE and runs them against \
+             a shard with undispatched writes pending (moon#507): {unwaived:?}\n\
+             Either declare them in is_inline_intercepted, or, if the gate no \
+             longer claims them, update the gate."
+        );
+
+        let still_offending: Vec<&str> = offenders
+            .iter()
+            .copied()
+            .filter(|n| waived.contains(n))
+            .collect();
+        let expected: Vec<&str> = waived.iter().copied().collect();
+        assert_eq!(
+            still_offending, expected,
+            "the waiver no longer matches reality. If an entry disappeared it \
+             was FIXED — delete it from WAIVED instead of leaving a stale \
+             waiver behind. If one appeared, a new interceptor was added \
+             without declaring it. WAIVED reasons: {WAIVED:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // moon#925, the OTHER class: an arm whose `(len, b0)` pattern does not
     // match the name it compares.
     // -----------------------------------------------------------------
