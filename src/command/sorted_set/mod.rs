@@ -1,5 +1,6 @@
 mod sorted_set_read;
 mod sorted_set_write;
+mod work_budget;
 
 pub use sorted_set_read::*;
 pub use sorted_set_write::*;
@@ -19,31 +20,36 @@ use super::helpers::err;
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Format a float score for Redis output (strip trailing zeros, but keep at least one decimal).
+/// Format a float score for Redis output, exactly as `ZSCORE` replies it.
+///
+/// Delegates to [`crate::storage::zset_score::render_score`] (moon#942). The
+/// two used to be independent transcriptions of the same three rules, and
+/// `listpack_score_rendering_matches_zscore_rendering` existed to catch them
+/// drifting apart — a test that can only ever notice the drift AFTER a client
+/// has read a score back differently from a listpack than from a B+tree.
+/// There is now ONE renderer, so they agree by construction, and that test
+/// keeps standing as the guard on this delegation.
 pub(super) fn format_score(score: f64) -> String {
-    if score == f64::INFINITY {
-        "inf".to_string()
-    } else if score == f64::NEG_INFINITY {
-        "-inf".to_string()
-    } else {
-        // Use ryu or manual formatting to match Redis behavior
-        let s = format!("{}", score);
-        s
-    }
+    let mut buf = crate::storage::zset_score::ScoreBuf::new();
+    crate::storage::zset_score::render_score(score, &mut buf);
+    // `render_score` writes ASCII only — `inf`, `-inf`, an `itoa` rendering,
+    // or `core::fmt`'s `f64` Display — so the fallback is unreachable. One
+    // allocation, the same count `format!` made.
+    std::str::from_utf8(&buf).unwrap_or("0").to_owned()
 }
 
-/// Zero-alloc version of `format_score` — returns `Bytes` directly.
+/// `Bytes` version of [`format_score`], for the reply paths that want no
+/// intermediate `String`.
 pub(crate) fn format_score_bytes(score: f64) -> Bytes {
     if score == f64::INFINITY {
-        Bytes::from_static(b"inf")
-    } else if score == f64::NEG_INFINITY {
-        Bytes::from_static(b"-inf")
-    } else {
-        use std::fmt::Write;
-        let mut buf = String::with_capacity(24);
-        let _ = write!(buf, "{}", score);
-        Bytes::from(buf)
+        return Bytes::from_static(b"inf");
     }
+    if score == f64::NEG_INFINITY {
+        return Bytes::from_static(b"-inf");
+    }
+    let mut buf = crate::storage::zset_score::ScoreBuf::new();
+    crate::storage::zset_score::render_score(score, &mut buf);
+    Bytes::copy_from_slice(&buf)
 }
 
 /// Aggregate operation for ZUNION/ZINTER/ZUNIONSTORE/ZINTERSTORE.
@@ -58,23 +64,83 @@ pub(super) enum AggregateOp {
 // Internal helpers -- CRITICAL for dual structure consistency
 // ---------------------------------------------------------------------------
 
+/// Look up a member and, if `decide` returns a new score, move it — in ONE
+/// hash lookup (moon#942).
+///
+/// Returns `None` when the member is absent, in which case NOTHING was written
+/// and `decide` was never called; the caller adds it with [`zset_insert_absent`]
+/// if it wants to. Otherwise `Some(old_score)`, whether or not the score moved.
+///
+/// This is the shape Redis's `zsetAdd` has: ONE `dictFind`, then the new score
+/// written through the entry it found. moon hashed the member three times for
+/// one `ZADD` — `members.get` for the flag decision, then `members.remove` and
+/// `members.insert` inside `zadd_member` — and cloned the `Bytes` twice, on a
+/// path `src/command/` forbids cloning on at all.
+///
+/// The B+tree is touched only when the score actually moves, which is Redis's
+/// own `if (score != curscore)` and matters more here than it does there:
+/// `BPTree::remove` builds a `Bytes::copy_from_slice(member)` to form its
+/// lookup key, so a no-op re-score used to cost an allocation as well as a
+/// tree delete and a tree insert.
+///
+/// The comparison is BITWISE, deliberately. `-0.0 == 0.0` is true while the two
+/// render differently (`-0` and `0`), and moon has always stored whichever one
+/// the client sent; `to_bits` keeps that, where `==` would silently start
+/// answering `0` to a client that wrote `-0`. NaN cannot reach here — `ZADD`
+/// and `ZINCRBY` both reject it — so `to_bits` has no NaN-payload hazard.
+pub(super) fn zset_update_existing(
+    members: &mut HashMap<Bytes, f64>,
+    scores: &mut BPTree,
+    member: &Bytes,
+    decide: impl FnOnce(f64) -> Option<f64>,
+) -> Option<f64> {
+    work_budget::note_member_lookup();
+    let slot = members.get_mut(member.as_ref() as &[u8])?;
+    let old = *slot;
+    let Some(new) = decide(old) else {
+        return Some(old);
+    };
+    if new.to_bits() != old.to_bits() {
+        *slot = new;
+        work_budget::note_bptree_score_write();
+        // MUST move in both structures.
+        scores.remove(OrderedFloat(old), member);
+        scores.insert(OrderedFloat(new), member.clone());
+    }
+    Some(old)
+}
+
+/// Insert a member the caller has already PROVEN absent, into both structures.
+/// One hash lookup.
+pub(super) fn zset_insert_absent(
+    members: &mut HashMap<Bytes, f64>,
+    scores: &mut BPTree,
+    member: Bytes,
+    score: f64,
+) {
+    work_budget::note_member_lookup();
+    work_budget::note_bptree_score_write();
+    members.insert(member.clone(), score);
+    scores.insert(OrderedFloat(score), member);
+}
+
 /// Add or update a member in the sorted set. Returns true if the member is new.
+///
+/// Unconditional overwrite — the shape `ZUNIONSTORE`, `ZINTERSTORE` and
+/// `ZRANGESTORE` want, where the destination is being built and no flag has a
+/// say. `ZADD` and `ZINCRBY` call [`zset_update_existing`] directly, because
+/// their decision depends on the score they are about to displace.
 pub(super) fn zadd_member(
     members: &mut HashMap<Bytes, f64>,
     scores: &mut BPTree,
     member: Bytes,
     score: f64,
 ) -> bool {
-    // Remove old entry if exists (MUST remove from both)
-    let is_new = if let Some(old_score) = members.remove(&member) {
-        scores.remove(OrderedFloat(old_score), &member);
-        false
-    } else {
-        true
-    };
-    members.insert(member.clone(), score);
-    scores.insert(OrderedFloat(score), member);
-    is_new
+    if zset_update_existing(members, scores, &member, |_| Some(score)).is_some() {
+        return false;
+    }
+    zset_insert_absent(members, scores, member, score);
+    true
 }
 
 /// Remove a member from the sorted set. Returns true if the member existed.
@@ -83,6 +149,7 @@ pub(super) fn zrem_member(
     scores: &mut BPTree,
     member: &[u8],
 ) -> bool {
+    work_budget::note_member_lookup();
     if let Some(score) = members.remove(member) {
         scores.remove(OrderedFloat(score), member);
         true
@@ -746,6 +813,85 @@ mod tests {
         // a should still have score 1.0
         let score = run_zscore(&mut db, &[b"zs", b"a"]);
         assert_eq!(score, Frame::BulkString(Bytes::from("1")));
+    }
+
+    /// A refused `ZADD` must not leave an empty zset behind.
+    ///
+    /// moon's `ZADD` reaches the keyspace through `get_or_create_*`, which
+    /// FABRICATES the container before the loop can discover that `XX` refuses
+    /// every member of the batch. Redis short-circuits first —
+    /// `if (zobj == NULL) { if (xx) goto reply_to_client; }` — so
+    /// `ZADD ghost XX 1 m` answers 0 and creates nothing.
+    ///
+    /// Verified against a live redis 8.6.1: after that one command moon
+    /// answered `EXISTS ghost` 1, `TYPE ghost` `zset`, `DBSIZE` 1, `KEYS *`
+    /// `ghost` and a non-empty `DEBUG DIGEST`, against 0 / `none` / 0 / empty
+    /// / the zero digest. `ZCARD` agreed at 0 on both, which is why nothing
+    /// caught it.
+    ///
+    /// This is unbounded keyspace growth on a path any unprivileged client can
+    /// drive — one entry plus a fabricated container per call, none of which
+    /// ever appears to hold anything — and it diverges the digest, so a
+    /// replica or a reloaded RDB disagrees with its master. It is the sorted
+    /// set's copy of the empty-container class, and `ZREM` already carries the
+    /// fix: drop the key when the container ends up empty.
+    ///
+    /// Both encodings, because the 65-byte member skips the listpack gate
+    /// entirely and lands on `get_or_create_sorted_set`, which fabricates too.
+    #[test]
+    fn a_refused_zadd_leaves_no_empty_zset_behind() {
+        for member in [b"m".to_vec(), vec![b'y'; 70]] {
+            let mut db = Database::new();
+            let floor = db.estimated_memory();
+            assert_eq!(
+                zadd(
+                    &mut db,
+                    &[bulk(b"ghost"), bulk(b"XX"), bulk(b"1"), bulk(&member)]
+                ),
+                Frame::Integer(0),
+                "XX on a missing key adds nothing"
+            );
+            assert_eq!(
+                crate::command::key::exists(&mut db, &[bulk(b"ghost")]),
+                Frame::Integer(0),
+                "XX on a missing key must not create it (member {} bytes)",
+                member.len()
+            );
+            assert_eq!(
+                crate::command::key::type_cmd(&mut db, &[bulk(b"ghost")]),
+                Frame::SimpleString(bytes::Bytes::from_static(b"none")),
+                "and TYPE must still say none"
+            );
+            assert_eq!(
+                db.estimated_memory(),
+                floor,
+                "a refused ZADD must charge nothing at all"
+            );
+        }
+
+        // The same refusal on a key that DOES exist must leave it untouched.
+        let mut db = Database::new();
+        assert_eq!(
+            zadd(&mut db, &[bulk(b"live"), bulk(b"1"), bulk(b"a")]),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            zadd(
+                &mut db,
+                &[bulk(b"live"), bulk(b"XX"), bulk(b"2"), bulk(b"never")]
+            ),
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            crate::command::key::exists(&mut db, &[bulk(b"live")]),
+            Frame::Integer(1),
+            "an existing zset must survive a refused ZADD"
+        );
+        assert_eq!(
+            zcard(&mut db, &[bulk(b"live")]),
+            Frame::Integer(1),
+            "and keep the member it had"
+        );
     }
 
     #[test]

@@ -6,6 +6,658 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`HDEL` no longer leaves an empty hash behind when the emptying field is
+  not the last argument** (moon#942). `hdel` tracked emptiness in a
+  `last_was_empty` variable reassigned on EVERY iteration, including the ones
+  that removed nothing, so the emptiness the real removal reported was
+  overwritten by the `false` a later absent field produced. `HDEL h only
+  absent` therefore answered `1`, emptied the hash and kept the key: `EXISTS
+  h` answered `1` and `HLEN h` answered `0` on a hash redis had already
+  deleted, and the empty container was written to the AOF and shipped to every
+  replica. `HDEL h absent only` — the same two fields, reversed — deleted
+  correctly, which is why this survived. Emptiness is now a property of the
+  hash after the whole batch.
+- **`ZADD <missing-key> XX <score> <member>` no longer creates an empty zset**
+  (moon#942). moon reaches the keyspace through `get_or_create_*`, which
+  fabricates the container before the mutation loop can discover that `XX`
+  refuses every member of the batch; Redis short-circuits first
+  (`if (zobj == NULL) { if (xx) goto reply_to_client; }`) and creates nothing.
+  Both encodings leaked, because a member past `zset-max-listpack-value` skips
+  the listpack entry gate and lands on `get_or_create_sorted_set`, which
+  fabricates too. `ZADD` now drops an empty container the way `ZREM` always
+  has.
+
+  Verified against a live redis 8.6.1 — after one `ZADD ghost XX 1 m`:
+
+  | | redis | moon (before) |
+  |---|---|---|
+  | `EXISTS ghost` | 0 | **1** |
+  | `TYPE ghost` | `none` | **`zset`** |
+  | `DBSIZE` | 0 | **1** |
+  | `KEYS *` | (empty) | **`ghost`** |
+  | `DEBUG DIGEST` | `000…000` | **`01158ee1…`** |
+  | `ZCARD ghost` | 0 | 0 (agrees — which is why nothing caught it) |
+
+  This was unbounded keyspace growth on a path any unprivileged client can
+  drive — an entry plus a fabricated container per call, none of which ever
+  appears to hold anything — and it moved `DEBUG DIGEST`, so a replica or a
+  reloaded RDB disagreed with its master about the keyspace. The fix is pinned
+  on both encodings, together with the ledger (a refused `ZADD` charges
+  nothing) and the case it must not break (a refused `XX` on a zset that DOES
+  exist leaves it and its members alone).
+
+### Performance
+
+- **`ZADD` and `ZINCRBY` on a `skiplist` zset hash the member once, not three
+  times** (moon#942). Redis's `zsetAdd` does ONE `dictFind` and writes the new
+  score through the entry it found. moon did three — `members.get` for the flag
+  decision, then `members.remove` and `members.insert` inside `zadd_member` —
+  and cloned the `Bytes` twice on a path `src/command/` forbids cloning on at
+  all. A new `zset_update_existing` looks the member up once with `get_mut` and
+  writes through the slot; the flag decision rides inside its closure, so it has
+  one spelling and the write and the `CH` tally can never disagree about it.
+
+  The B+tree is now touched only when the score actually MOVES, which is
+  Redis's own `if (score != curscore)` and matters more here than it does
+  there: `BPTree::remove` builds a `Bytes::copy_from_slice(member)` to form its
+  lookup key, so an idempotent re-post used to cost an allocation as well as a
+  tree delete and a tree insert.
+
+  **Measured with `cfg(test)` counters**:
+
+  | on a 200-member (`skiplist`) zset | before | after |
+  |---|---:|---:|
+  | `members` hashes, `ZADD` onto an existing member | 3 | **1** |
+  | `members` hashes, `ZADD` of a new member | 3 | **2** |
+  | `members` hashes, `ZINCRBY` onto an existing member | 3 | **1** |
+  | `members` hashes, `ZREM` | 1 | 1 (control) |
+  | B+tree re-insertions, same score re-posted | 1 | **0** |
+  | B+tree re-insertions, score genuinely moved | 1 | 1 (control) |
+
+  Counts, not a throughput claim (PERF-08, moon#789).
+
+  The comparison is `to_bits()`, not `==`, for the same reason the listpack arm
+  compares bytes: `-0.0 == 0.0` is true while `-0` and `0` render differently,
+  and moon has always stored whichever spelling the client sent.
+  `the_bptree_identical_score_skip_is_decided_on_bits` pins it.
+
+  **The ledger is guarded, not argued.** `zset_member_cost` moved from
+  `is_new` at the end of `zadd_member` into the ABSENT arm of a `match`, and a
+  charge that moves is a charge that can be dropped or doubled (moon#814/#788).
+  `every_restructured_arm_keeps_the_ledger_exact` walks both encodings through
+  create, the skipped write, a widened score, a narrowed score, `NX` and `XX`
+  refusals, `ZINCRBY` both ways and `ZREM`, asserting the running ledger against
+  a from-scratch `recalculate_memory` at every rung — and returning the listpack
+  ladder to its exact floor. Proven able to fail: deleting the charge line makes
+  it report a 41,265 B ledger against a 42,865 B recompute.
+
+- **A `ZADD` that consults nothing stops decoding the stored score, and a
+  score already in place is no longer written back over itself** (moon#942).
+  A zset listpack keeps a score as canonical decimal text, so reading one is a
+  real `str::parse::<f64>` — and the plain `ZADD z <score> <member>`, which is
+  the benchmark's shape and most applications', consulted it for nothing:
+  `should_update` was unconditionally true and the `changed` tally it fed is
+  not what the command replies. It is now decoded only for `CH`, `GT` and `LT`
+  (`NX` refuses on presence, which locating the pair already established).
+  On top of that, Redis's `zsetAdd` re-inserts only `if (score != curscore)`
+  while moon spliced the rendering back over itself every time — so the
+  idempotent re-post a leaderboard client makes paid an `encode_entry` and a
+  `write_entry` to change nothing.
+
+  **Measured with `cfg(test)` counters**, on the benchmark's own
+  `zadd z:<n> 1 m:<n>` shape:
+
+  | `ZADD` onto an existing listpack member | before | after |
+  |---|---:|---:|
+  | stored-score decodes, no flag and no `CH` | 1 | **0** |
+  | stored-score decodes with `GT` / `CH` | 1 | 1 (control) |
+  | score entries written, same score re-posted | 1 | **0** |
+  | score entries written, score genuinely moved | 1 | 1 (control) |
+
+  A call count is not a throughput claim and this entry makes none (PERF-08,
+  moon#789).
+
+  The skip is decided on the RENDERED BYTES, not on `old == score`, and that is
+  deliberate: `-0.0 == 0.0` is true while `-0` and `0` are different bytes, so
+  comparing doubles the way Redis does would have silently started answering
+  `0` to a client that wrote `-0`. moon has always stored whichever spelling
+  the client sent, and `the_listpack_identical_score_skip_is_decided_on_bytes`
+  pins that. Writing bytes that are already there changes nothing, so declining
+  is observationally identical everywhere else.
+
+- **`ZADD` parses each score argument once instead of twice** (moon#942).
+  moon#814's validation pre-pass — which must keep proving every pair before
+  the keyspace is touched, because the mutation loop returns from inside the
+  `table_before … charge_memory()` window — threw every decoded `f64` away, and
+  the loop then re-ran `str::parse::<f64>` over the same bytes. Redis's
+  `zaddGenericCommand` parses once into its own `scores` array. The pre-pass
+  now keeps what it decodes, in a fixed 32-entry stack array: `src/command/`
+  forbids the heap allocation a `SmallVec` spill would make, so a batch larger
+  than that re-parses in the loop exactly as before.
+
+  **Measured with a `cfg(test)` counter on the parse itself**: a one-pair
+  `ZADD` went from **2 parses to 1**, a four-pair batch from **8 to 4**. A call
+  count is not a throughput claim and this entry makes none (PERF-08, moon#789).
+
+  The all-or-nothing contract is unchanged and guarded:
+  `a_rejected_batch_still_validates_every_pair_before_the_keyspace` asserts that
+  a bad pair anywhere still errors and still leaves the key uncreated — the one
+  thing caching the pre-pass's output could have broken.
+
+- **An integral sorted-set score is no longer rendered by `core::fmt`'s `f64`
+  Display** (moon#942). Every score moon stored in a listpack, replied to a
+  client, or wrote to an RDB went through `write!("{score}")` — the
+  shortest-round-trip (Grisu/Dragon) formatter plus the whole `Formatter`
+  machinery — including the literal `1` the ZADD benchmark writes on every
+  call and every integral leaderboard score ever posted. Redis's `d2string`
+  has always forked here: `double2ll` first, `ll2string` when it succeeds, and
+  `fpconv_dtoa` only when it does not. `zset_score::render_score` now takes
+  the same fork through a new `integral_score`, and `format_score` /
+  `format_score_bytes` — which were an independent second transcription of the
+  same three rules — delegate to it, so `ZSCORE`, `ZRANGE … WITHSCORES`,
+  `ZINCRBY`, `ZPOPMIN`/`ZPOPMAX`, `ZMSCORE`, the blocking `BZPOPMIN` wakeups
+  and `DEBUG DIGEST` all take it too.
+
+  **Measured with a `cfg(test)` counter on the slow arm**, on the benchmark's
+  own `zadd z:<n> 1 m:<n>` shape: a `ZADD` with an integral score reached
+  `core::fmt`'s float formatter **1 time before, 0 after**; a `ZADD` with
+  `1.5` still reaches it exactly once, which is the control that proves the
+  counter is live.
+
+  A call count is a count. It is **not** a throughput claim and this entry
+  makes none — PERF-08 (moon#789) measured +11% on aarch64 and −17% on x86_64
+  for one work reduction in this repo, so the wall-clock question belongs to a
+  Linux bench host.
+
+  **The bytes are identical wherever the fast path is taken**, and that is
+  asserted against `core::fmt` DIRECTLY rather than against another moon
+  function: `the_integer_fast_path_is_byte_identical_to_core_fmt` sweeps the
+  hand-written cases, both sides of the 2^53 cutoff, every integer in
+  ±1100, and 20,000 deterministic `f64` bit patterns plus their truncations.
+  Three exclusions carry the proof — `-0.0` (which prints `-0`, not `0`),
+  non-integers, and anything past 2^53 (which catches both infinities and NaN,
+  whose `fract()` is NaN). Both were proven able to fail: widening the cutoff
+  to `f64::MAX` makes `1e21` report `1000000000000000000000` against
+  `-9223372036854775808`, and dropping the `-0.0` arm makes `-0.0` report `0`
+  against `-0`. A listpack or RDB written before this change still reads back
+  byte-for-byte the same, which is what `parse_score`'s round-trip exactness
+  and every reader of a stored score depend on.
+
+### Performance
+
+- **`HDEL` costs ONE key lookup for the whole command, not two per field: a
+  three-field `HDEL` went 6 → 1** (moon#942). `hdel` called
+  `Database::hash_delete_field` once per argument, and that method costs two
+  DashTable probes — its own `data.get_mut(key)` and, on a real removal,
+  `stamp_hash_field_mutation`'s, which re-finds the same entry to stamp it.
+  Redis pays one `dictFind` for the command and then looks each field up
+  inside the hash; `Database::hash_delete_fields` now does the same, walking
+  the batch inside the handle the single lookup already holds and stamping
+  that same handle. `hash_delete_field` is kept as a delegator to it, so the
+  one-field and many-field spellings cannot drift.
+
+  **Measured with the `cfg(test)` DashTable key-lookup counter**:
+
+  | `HDEL` arm | before | after |
+  |---|---:|---:|
+  | one field, present | 2 | 1 |
+  | three fields, all present | 6 | 1 |
+  | three fields, none present | 3 | 1 |
+
+  It also makes one command ONE WATCH version bump (moon#926). `HDEL h f1 f2`
+  moved the version by two, because the per-field loop stamped once per
+  removed field — the same observable shadow of a duplicated accessor that
+  `sadd_bumps_the_watch_version_exactly_once_on_every_encoding` pins for SADD.
+  A batch that removes nothing still leaves a watcher alone, as before.
+
+- **`HINCRBY` walks a hash listpack ONCE, not twice** (moon#942). Its listpack
+  arm called `Listpack::pair_value` — a borrowed scan that located the field —
+  and then `Listpack::replace_pair_value`, which located the SAME field all
+  over again from the head, so a 128-field hash was walked up to 256 entries
+  to change one value. That is the defect moon#799 removed for HSET and
+  moon#942 removed for ZADD/ZINCRBY; `Listpack::update_pair_value` is the
+  one-scan primitive built for callers whose replacement depends on the value
+  currently stored, and HINCRBY was the last hash caller still walking twice.
+  Structural, not counted: this repo has no listpack entry-decode counter, and
+  one is proposed rather than asserted here.
+
+- **`HSET` and `HMSET` walk their argv once, not twice** (moon#942). The
+  moon#823 `all_args_are_bytes` validation pass matched every frame and the
+  moon#896 entry gate's `max` chain then matched every frame again to read its
+  length. One loop now does both, and still refuses a non-argument-shaped
+  frame strictly before `get_or_create_hash_listpack` opens the mutation
+  window.
+
+- **`HSET`'s probe budget is now ratcheted** (moon#942). Measured on the
+  harness's own shape — `scripts/bench-ab-matrix.sh:84` is
+  `hset hash:__rand_int__ f __rand_int__` over a 100 000-key keyspace, so the
+  benchmarked HSET touches hashes holding exactly ONE field named `f`:
+
+  | `HSET` arm | probes | notes |
+  |---|---:|---|
+  | absent key (create) | 3 | `hot_state` + `insert` + `get_mut` |
+  | **listpack steady state** | **2** | the benchmarked arm; at this accessor family's floor |
+  | full-`HashMap` steady state | 5 | **open** — 2 thrown away + 2 + 1, see below |
+
+  The full-`HashMap` arm's five is the hash equivalent of the SADD defect
+  fixed above and is NOT fixed here: `get_or_create_hash_listpack` answers
+  `Ok(None)` for a `Hash` or `HashWithTtl` (2 probes, and a WATCH bump,
+  discarded), `get_or_create_hash` then re-runs the whole classification (2
+  more, and a second bump), and `hash_clear_field_ttls` re-finds the entry a
+  third time (1) only to discover a plain `Hash` carries no sidecar. The fix
+  is a `HashHandle` mirroring `SetHandle` in `storage/db/accessors.rs`, which
+  this change does not own.
+
+  None of these numbers is a throughput claim and this entry makes none. The
+  PERF-08 precedent (moon#789) measured +11% on aarch64 and −17% on x86_64 for
+  a probe reduction — the two architectures disagreed in *sign* — so the
+  wall-clock question belongs to a Linux bench host and to nothing else.
+
+  **The ledger is byte-identical across the HDEL move.** The per-field credits
+  a batch books are the same `hash_field_cost` / `hash_ttl_field_cost` figures
+  summed into one `credit_memory`, and the listpack arm's one before/after
+  `estimate_memory` pair reports the same capacity-based delta the per-field
+  snapshots did (`Vec::drain` does not shrink capacity). A new guard asserts
+  the running ledger against a from-scratch `recalculate_memory` after a mixed
+  hit/miss batch on a 4-field listpack and a 400-field `HashMap`.
+
+  Every new guard was proven able to fail, by mutation: restoring the
+  per-field stamp makes the probe budget report `(2, 4, 1)` and the WATCH
+  guard report two bumps; forcing `empty = false` resurrects the empty-hash
+  leak; dropping the refusal from the fused argv walk fails the moon#823 pin;
+  taking the LAST element's length instead of the longest fails the moon#896
+  gate pin; and making HINCRBY's one-scan closure refuse a `Str` entry fails
+  the round-trip pin on a non-canonical stored spelling.
+
+### Performance
+
+- **Every integer argument the string, bitmap and list commands take is read
+  in one pass** (moon#942). `command::string::parse_i64` — the parser behind
+  `INCRBY`/`DECRBY`'s delta and behind every offset, index and count in
+  `SETRANGE`, `GETRANGE`, `SETBIT`, `GETBIT`, `BITCOUNT`, `BITPOS`, `LRANGE`,
+  `LINDEX` and `LPOS` — walked its argument twice, once for `from_utf8` and
+  once for `str::parse`. It now calls `storage::numeric::parse_i64_bytes`, and
+  the accepted set is byte-for-byte unchanged (see the entry below for how that
+  equivalence is pinned).
+
+- **`INCRBYFLOAT` allocates twice per call, not three times** (moon#942).
+  `format_float` built a `String` with `format!`, trimmed it, and then built a
+  **second** `String` with `to_string()` to hold a prefix of the one already in
+  hand; the handler then `clone()`d the result so the stored `Entry` and the
+  reply could have one each. `format!`, `to_string()` and `clone()` are all
+  three banned in `src/command/` by CLAUDE.md, and this one command paid all
+  three per call.
+
+  The trim is now a `truncate` — a length store, no copy — and the `Entry` is
+  built from the rendered bytes rather than from a second copy of them, which
+  for any result inside `CompactValue`'s 12-byte SSO window means it needs no
+  buffer at all. Rendered output is unchanged, pinned by a differential
+  against the exact pre-#942 body over ~2,400 values.
+
+  Measured with a counting `GlobalAlloc`, per call, after warm-up:
+
+  | `INCRBYFLOAT` arm | before | after |
+  |---|---:|---:|
+  | integral result | 3 | 2 |
+  | fractional result | 3 | 2 |
+  | negative fractional | 3 | 2 |
+  | wider than the SSO window | 2 | 2 |
+
+  The remaining two are `format!`'s `String` growth and `Bytes::from(String)`
+  reallocating in `into_boxed_slice`. Reaching the true floor (1, or 2 outside
+  the SSO window) needs an `f64` `Display` renderer that writes into a stack
+  buffer, which is not done here.
+
+- **`INCR` stops walking its counter twice to read one integer** (moon#942).
+  The path parsed the stored value as `std::str::from_utf8(bytes)` followed by
+  `str::parse::<i64>()`. The first walk proves the slice is UTF-8; the second
+  walks the same bytes again rejecting everything that is not an ASCII digit.
+  The first is redundant *by construction* — every byte string the `i64`
+  grammar admits is `[+-]?[0-9]+`, which is pure ASCII and therefore always
+  valid UTF-8 — so `from_utf8` can only ever reject inputs the digit scan was
+  going to reject anyway, and its verdict is never the deciding one. Redis
+  reaches the same answer in one pass, in `string2ll`.
+
+  `storage::numeric::parse_i64_bytes` reads that grammar straight off the
+  bytes. It also hoists the range question out of the per-digit loop: once
+  leading zeros are skipped, more than 19 significant digits cannot fit an
+  `i64` at all, and 19 digits of 9 is comfortably inside `u64`, so the
+  accumulator provably cannot wrap and the two `checked_*` operations and
+  `char::to_digit`'s radix handling go with it.
+
+  It is **exactly** `from_utf8(b).ok().and_then(|s| s.parse::<i64>().ok())`,
+  including every permissive spelling `str::parse` accepts and `canonical_i64`
+  does not (`"007"`, `"+5"`, `"-0"`). Changing which spellings a counter
+  accepts would be a client-visible behaviour change, so the equivalence is
+  pinned rather than described: differentials over every 1-byte input, every 2-
+  and 3-byte word from a discriminating alphabet, both `i64` boundaries digit
+  by digit, zero-padded and over-long forms and 200,000 randomised inputs; an
+  end-to-end `INCR`/`DECR` differential against the pre-#942 `from_utf8` +
+  `str::parse` reference over 25 accept/reject shapes; and a new
+  `parse_i64_bytes_differential` fuzz target registered in both matrices of
+  `.github/workflows/fuzz.yml`.
+
+  No throughput claim. Removing work is a hypothesis about wall clock, not a
+  measurement of it.
+
+- **Creating a counter with `INCR` costs 2 key lookups, not 5** (moon#942).
+  The in-place fast path added for `INCR`/`INCRBY`/`DECR`/`DECRBY` made the
+  *hot* counter cost one `DashTable` probe — Redis's single `lookupKeyWrite` —
+  but made the *absent* one cost five, up from four: its declined `get_mut`
+  was spent before `incrby_general` started over with `Database::get`
+  (classify + cold guard + re-probe) and `Database::set`. The module docs
+  called that a deliberate trade on the theory that a counter is created once
+  and incremented many times. True in production; false in the instrument this
+  work is measured on — `scripts/bench-ab-matrix.sh` seeds only `key:*` and
+  `set:*`, so all 100k of its `ctr:*` keys are created by the benchmark
+  itself, which is essentially every `INCR` at p=1 and about a quarter of them
+  at p=8.
+
+  `Database::incr_string` (was `incr_hot_string_in_place`) now owns the create
+  as well. It fabricates nothing until `promote_cold_known_absent` has ruled
+  out **both** the in-flight spill plane and the cold tier — the same method
+  the container accessors use, whose precondition is discharged by the
+  `get_mut` immediately above it — and hands a key that really was promoted
+  straight back to the general path, which re-reads it.
+
+  **Measured with the `cfg(test)` DashTable key-lookup counter**, over the
+  whole `INCR` command rather than the storage method (a decline whose
+  fallback costs four more probes is invisible at method level — that is how
+  this one got in):
+
+  | `INCR` arm | before | after |
+  |---|---:|---:|
+  | hot, live, integer | 1 | 1 |
+  | **absent from every plane** | **5** | **2** |
+  | present but TTL-expired | 3 | 3 |
+
+  A probe count is a count, not a throughput claim, and this entry makes none:
+  PERF-08 (moon#789) measured a probe reduction at +11% on aarch64 and −17% on
+  x86_64 — the two architectures disagreed in *sign*. The wall-clock question
+  belongs to a Linux bench host.
+- **The list pops stop paying for work they already had in hand** (moon#942).
+  Three reductions on the `LPUSH`/`RPUSH`/`LPOP`/`RPOP` family, all inside
+  `src/command/list/`:
+
+  | path | before | after | unit |
+  |---|---:|---:|---|
+  | `LPOP`/`RPOP` off a **listpack** | 2 | **1** | heap allocations per element |
+  | `LPOP`/`RPOP` off a **linkedlist** | 4 | **3** | DashTable key lookups |
+  | `LPUSHX`/`RPUSHX`, hit | 4 | **3** | DashTable key lookups |
+  | `LPUSHX`/`RPUSHX`, miss or WRONGTYPE | 2 | **1** | DashTable key lookups |
+
+  1. `listpack_pop_end` decoded the popped element through the OWNING
+     `ListpackEntry`: `Listpack::get_at` allocates a `Vec` and
+     `ListpackEntry::to_bytes` then goes through `as_bytes`, whose string arm
+     CLONES it — two heap allocations, the first dropped having been copied
+     and never read. It now decodes through the borrowed `ListpackRef` that
+     `Listpack::iter_refs` already hands out. **One is the floor, not zero:**
+     the reply owns its bytes and `remove_at` mutates the buffer on the next
+     line. `src/command/` is forbidden from allocating on the hot path at all,
+     and moon#897 made the listpack encoding *survive* a pop — so every small
+     work queue in the tree now takes this path on every drain, where before
+     #897 it flattened once and paid zero thereafter.
+  2. `pop_eager` popped through `get_or_create_list`, dropped the borrow, and
+     then asked `get_list_ref_if_alive` a FOURTH time whether the list was now
+     empty — a question the `&mut VecDeque` it had just been holding answers
+     for free.
+  3. `LPUSHX`/`RPUSHX`'s exists-and-is-a-list gate was `db.get_list(key)` =
+     `get_promoted`: two lookups, and a `&mut self` accessor whose
+     `ListKind::upgrade` flattens the compact encoding just to answer a
+     yes/no. It is now the `&self` router `LPOP` already uses (moon#897),
+     whose receiver makes the rewrite unrepresentable. The mutable accessor
+     behind it is unchanged, so the encoding OUTCOME is unchanged too.
+
+     The one trade: for a COLD-SPILLED list the `&self` router decodes a
+     throwaway copy that `get_promoted` would have promoted outright, so a
+     spilled key now costs one extra decode on these two commands — the same
+     trade `pop_generic` already makes, and hot keys pay nothing. What it must
+     NOT do is answer 0, which for `LPUSHX` is a silently dropped write
+     wearing a success-shaped reply; `pushx_sees_a_cold_spilled_list_and_appends_to_it`
+     asserts the cold read-through rather than trusting the accessor's
+     comment, because moon#610 is exactly the class of a read-only path that
+     forgets the cold tier.
+
+  **Which arm does the benchmark exercise? The listpack one, and only that.**
+  `scripts/bench-ab-matrix.sh`'s row is `LPUSH list:__rand_int__ xxxxxxxx` at
+  `-r 100000`, so ~2.0M pushes spread over 100,000 keys leave a `list:` key
+  holding roughly 5 elements when the p=64 point starts and 20 when it ends,
+  against a `list-max-listpack-size` of 128. **No timed `LPUSH` in the matrix
+  ever reaches the quicklist arm**, and `LPUSH` on the listpack arm was
+  already at the accessor skeleton's 2-lookup floor before this change. None
+  of the three reductions above can move the benchmarked `LPUSH` number, and
+  this entry does not claim they do. They are worth having for real lists,
+  which are longer than a benchmark's, and for the queue drain, which a
+  benchmark of pushes does not measure at all. No throughput number was
+  measured and none is claimed; PERF-08 (moon#789) is why — a probe reduction
+  in this repo measured +11% on aarch64 and −17% on x86_64.
+
+  **Still open, and now pinned rather than described:** `LPUSH` onto a
+  `linkedlist` costs FOUR lookups and moves a watched key's version by TWO,
+  because `get_or_create_list_listpack` answers `Ok(None)` for a key already
+  holding the full `VecDeque` and `lpush` answers that by re-running the whole
+  skeleton through `get_or_create_list`. That is exactly the shape moon#942
+  closed for `SADD`, and closing it needs the same `SetHandle`-shaped change
+  to `src/storage/db/accessors.rs`. `lpush_end_to_end_probe_budget` and
+  `list_writes_bump_the_watch_version_exactly_once` assert both at their
+  CURRENT values, in both directions, so the fix has to update them
+  deliberately.
+
+  Every new guard was proven able to fail by mutation, and the mutants are
+  named in the tests. One claim did **not** survive that check and was
+  corrected rather than kept: deleting `pop_listpack`'s
+  `db.adjust_memory(before, after)` leaves the ledger tests green, because
+  `Listpack::estimate_memory` bills the size class of the buffer's CAPACITY
+  and nothing shrinks a listpack's buffer on removal — so `before == after` on
+  every pop and the call is a genuine no-op there.
+
+  **A bug this work FOUND and did not fix.** `LMOVE`, `RPOPLPUSH` and the
+  whole `BLPOP`/`BRPOP`/`BLMOVE`/`BRPOPLPUSH` family strand `used_memory`
+  every time they drain a list to empty, without bound, on a keyspace that
+  ends up empty. `Database::list_pop_front` and
+  `list_pop_back` (`src/storage/db/accessors.rs:1192-1222`) credit
+  `list_elem_cost(&val)` on the `else` branch and not on the `if empty`
+  branch, on the stated theory that "whole-key removal recomputes the
+  (now-empty) entry cost via `entry_overhead`" — but `entry_overhead` is
+  computed from the CURRENT value, which no longer holds the element, so the
+  push-time charge is never given back.
+
+  Measured on an otherwise empty `Database`: one `RPUSH k e` followed by one
+  `list_pop_front` leaves `used_memory` at **56 B against a from-scratch
+  `recalculate_memory` of 0 B**, on both encodings; ten create/drain cycles
+  leave 560 B. The drift is UPWARD, so the consequence is `--maxmemory` and
+  eviction firing on a server that is actually empty — the opposite direction
+  from moon#814, and reached by precisely the reliable-queue pattern that
+  drains a list over and over. The `LPOP`/`RPOP` command paths are exact and
+  are unaffected.
+
+  The fix is one line in each accessor — credit the element unconditionally,
+  as `pop_eager` already does — but `accessors.rs` was out of scope here.
+  `every_list_writer_that_empties_a_list_removes_the_key` enumerates all nine
+  list state writers that can remove the last element, asserts all nine do
+  remove the KEY (they do), and pins this drift at its measured 56 B so the
+  fix shows up as a test that needs updating rather than as silence.
+
+- **`SADD` on a hashtable set stops paying for a second accessor: 4 key
+  lookups → 2** (moon#942). `get_or_create_set_listpack` answered `Ok(None)`
+  for a set that was already an `IndexSet` — or a `SetIntset` the moon#899
+  absorb refused — and every caller then called `get_or_create_set`, which
+  re-ran the entire accessor skeleton (`hot_state`, `settle_not_live`,
+  `get_mut`, `stamp_mutation`, `SetKind::upgrade`) against the key the first
+  call had already classified and was still holding. The accessor now returns
+  a `SetHandle { Listpack(&mut Listpack), Full(&mut SetValue) }` and runs the
+  upgrade on that handle, so the second accessor is gone.
+
+  This lands on the **hashtable** regime, not the miss regime — 122 of 200
+  keys at the benchmark's own p=64 point — which is why it is the largest
+  remaining item in the SADD residue the previous entry left open.
+
+  **Measured with the `cfg(test)` DashTable key-lookup counter**, on the
+  benchmark's own `SADD set:<12-digit> <12-digit>` shape:
+
+  | `SADD` arm | before | after |
+  |---|---:|---:|
+  | absent key (create) | 3 | 3 |
+  | listpack steady state | 2 | 2 |
+  | **hashtable steady state** | **4** | **2** |
+  | **refused-intset promotion** | **4** | **2** |
+
+  A probe count is a count. It is **not** a throughput claim, and this entry
+  makes none: the PERF-08 precedent (moon#789) measured +11% on aarch64 and
+  −17% on x86_64 for a probe reduction — the two architectures disagreed in
+  sign — so the wall-clock question belongs to a Linux bench host and to
+  nothing else.
+
+  **The ledger is byte-identical across the move.** The `used_memory` delta
+  that moved is the same `SetKind::upgrade` call returning the same `isize`,
+  applied to the same counter one accessor earlier; nothing is charged twice
+  and nothing is dropped. Two new guards in `ledger_consistency_788` assert
+  the running ledger against a from-scratch `recalculate_memory` at every rung
+  of one key's ladder — empty → intset → the moon#899 absorb → listpack → the
+  64/65-byte `set-max-listpack-value` boundary in both directions → hashtable
+  → duplicate → `DEL` back to the floor — and again across the intset →
+  `IndexSet` promotion. Both were proven able to fail: deleting the delta line
+  from the new `Full` arm makes the refused-intset guard report a 729 B ledger
+  against a 14,665 B recompute. moon#814 is why this matters — a charge
+  stranded on a branch drives `used_memory` monotonically DOWN, without bound,
+  on a path any unprivileged client can drive, until `--maxmemory` can never
+  fire.
+
+  **Side effect on WATCH, in the correct direction.** moon#926's rule is that
+  acquiring a mutable handle IS the version bump, and the hashtable arm was
+  acquiring two, so one `SADD` moved a watched key's version by two. It now
+  moves it by one. A watcher aborted either way, so this is not a behaviour
+  fix; it is the observable tell that the duplicate accessor is gone, and a
+  new test pins it on all three encodings. **moon#940 is untouched and still
+  open**: `stamp_mutation` still fires before the arm that answers
+  `Err(WRONGTYPE)`, so a rejected `SADD` still dirties the key. A test pins
+  that at exactly one bump, so this change is provably neutral on it — two
+  would mean a handle was added, zero would mean #940 was fixed as an
+  unbenchmarked side effect.
+
+  Encoding behaviour is unchanged and was checked against a live redis 8.6.1
+  on every rung of the ladder above, plus the entry-count boundary, `SREM` on
+  both compact forms, and the moon#795 byte-transparency cases (`007`, `+7`,
+  `-0`, both `i64` limits) re-asked after each promotion: every `OBJECT
+  ENCODING`, reply and `SISMEMBER` matched, and the whole-dataset `DEBUG
+  DIGEST` was identical (verified discriminating — one extra member on moon
+  alone changes it).
+
+- **The accessor miss path drops its fourth probe: cold promotion stops
+  re-asking whether the key is hot** (moon#942). `promote_cold_if_present`
+  opens with a `contains_key`, and `accessors::settle_not_live` — the only
+  caller on the `get_or_create*` preamble — reaches it exclusively from
+  `HotState::Absent` (`hot_state`'s `get` has just answered `None`) or from
+  `HotState::Expired` after `remove_hot`, which removes unconditionally. Both
+  arms leave the key provably absent, so that `contains_key` could not do
+  anything but re-answer a question one probe old. It is now
+  `promote_cold_known_absent`, the same method without the re-ask, and
+  `settle_not_live` calls that instead.
+
+  **Measured with the `cfg(test)` DashTable key-lookup counter added by the
+  preceding entry**, which is also where the pre-change numbers below come
+  from — this change moves only the miss column, and no hit path moves at all:
+
+  | accessor | miss before | miss after |
+  |---|---:|---:|
+  | `get_or_create` | 4 | **3** |
+  | `get_mut_if_present` | 3 | **2** |
+  | `get_promoted` | 3 | **2** |
+  | `get_or_create_intset` / `_hash_listpack` / `_list_listpack` / `_zset_listpack` / `_set_listpack` | 4 | **3** |
+
+  End to end, `SADD` on an absent key goes 4 → **3**. Its hashtable regime
+  stays at **4** and is untouched: that one is two accessors' worth
+  (`get_or_create_set_listpack` answers `Ok(None)`, `get_or_create_set` then
+  repeats the skeleton) and collapsing it needs the accessor skeleton itself
+  to hand back the encoding it already holds, which this change does not do.
+
+  **The skipped `contains_key` is load-bearing for data integrity, not just
+  for speed, which is why this is a second entry point and not a deletion.**
+  `promote_inflight_if_present` does not re-check residency — it calls
+  `Database::set` unconditionally — so on a key that is hot AND still carries
+  an in-flight spill record, that probe is the only thing between a live value
+  and the older spilled body overwriting it. (`promote_cold_outcome`, the
+  on-disk arm, carries its own guard and is safe either way.)
+  `promote_cold_known_absent` is therefore `pub(super)`, documents the
+  precondition, and has exactly one caller. A new test builds that exact
+  state and pins it: removing the guard from `promote_cold_if_present` makes
+  it report the 3-member spilled body where the 2-member live value should
+  be. A second new test pins that a key DEL'd mid-spill does not resurrect
+  through the accessor (moon#459); dropping `spill_inflight_forget` from
+  `remove_cold_only` makes that one report 3 members instead of 0.
+
+  **No throughput number is claimed, and none was measured.** The same
+  discipline as the entry below applies and applies harder here, because the
+  quantity is smaller: moon#789 measured the previous probe-count reduction in
+  this repo at **+11% on aarch64 and −17% on x86_64**, disagreeing in sign, and
+  `b3083c5a` found the wall-clock net guarding it was timing a page-fault
+  artifact. This removes one probe from a *miss*, so at the SADD benchmark
+  point (75 of 200 keys absent) it is a fraction of a single probe per
+  operation and is **expected to sit below the ~1.5% noise floor on its own** —
+  it is committed separately so it can be A/B'd and dropped on its own
+  evidence. Fewer probes is a structural fact; whether it is faster is a
+  question only a Linux benchmark host may answer, on **both** arches.
+
+  Behaviour is unchanged. Beyond the two new tests, every guard the preceding
+  entry installed still passes unmodified — expired-reads-as-absent through
+  every accessor with no expiry-index leak (moon#541), cold promotion before
+  fabrication on both the absent and the expired arm (moon#459), `WRONGTYPE`
+  on a live key of the wrong type, one WATCH version bump per mutable handle
+  (moon#926; moon#940 is neither fixed nor worsened, and `stamp_mutation` did
+  not move), and `used_memory` agreeing with an independent whole-keyspace
+  recount. Separately verified against a live redis 8.6.1 oracle: 33 of 33
+  rows agree, covering every set/zset encoding transition through the create
+  path this change rewrote — intset → listpack (moon#899), listpack →
+  hashtable at the entry and the 64/65-byte value boundary, the zero-padded
+  benchmark shape staying a listpack with its bytes intact (moon#795), zset
+  listpack → skiplist, and SADD/ZADD creating a *fresh* container after the
+  key expired rather than resurrecting the old members — with a byte-identical
+  `DEBUG DIGEST` over the whole dataset at the end.
+
+- **Writing a listpack entry no longer touches the allocator, and ZADD no
+  longer walks the listpack twice** (moon#942). Two changes in
+  `src/storage/listpack.rs`, both on the write path HSET, LPUSH, SADD and ZADD
+  share.
+
+  `encode_entry` built a `Vec<u8>` per entry written, copied it into the
+  listpack and dropped it. Measured with a counting allocator over 100
+  same-width replacements — a width that neither grows nor shrinks the buffer,
+  so the only correct answer is zero — it was **four allocations per string
+  entry and two per integer entry**: `Vec::new()` starts at capacity 0, so the
+  encoding head and the backlen each grew it, and `encode_backlen` allocated a
+  second `Vec` of its own. The encoding head now goes into
+  `[u8; LP_MAX_ENTRY_HEAD]` and the backlen into `[u8; LP_MAX_BACKLEN]`, both
+  bounds derived from the encoder's own arms rather than picked; the payload
+  is borrowed and copied straight into the listpack, because no constant can
+  bound it (`hash-max-listpack-value` and friends are runtime config, and the
+  RDB/AOF loaders rebuild listpacks with no element-size limit at all). The
+  four `Vec::splice` call sites became one `write_entry` that moves the tail
+  once with `copy_within` — and not at all when the replacement is the same
+  width, which the common HSET/ZADD update is. Same shape as Redis's
+  `lpInsert`. The counter now reads 0.
+
+  ZADD and ZINCRBY scanned a zset listpack twice to change one score: a
+  borrowed walk down to a pair ORDINAL, then `replace_at` walking back to that
+  ordinal from the head. That is the defect moon#799 fixed for HSET and left
+  standing for the sorted set. `Listpack::update_pair_value` is HSET's
+  `locate_pair`/`replace_pair_value` generalised to a caller whose replacement
+  depends on the old value, so the scan that finds the member writes the new
+  score where it stopped; `replace_pair_value` is now that method with a
+  constant decision. A test-only seek counter pins it — the shape this
+  replaces seeks from the head once, the new one never does.
+
+  **No throughput number is claimed here.** Benchmarks are Linux-only and
+  these were written on macOS; the allocation and walk counts are counts, and
+  the ops/s effect is unmeasured. The encoding itself is unchanged, byte for
+  byte, which is the part that matters for a format `DUMP`/`RESTORE` and the
+  RDB both write out: goldens captured from the old encoder — every integer
+  width at both signs of every boundary, every string width at its seam,
+  non-UTF8 payloads, the moon#795 leading-zero and leading-`+` families, and
+  widening/narrowing/equal-width mutation sequences — were committed before
+  the rewrite and still pass unedited.
+
 ### Documentation
 
 - **`BENCHMARK.md`: re-measured the eight command families on GCE against
@@ -48,6 +700,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to a skiplist for good, at +1935% RSS (218 B → 4,433 B per key).
 
 ### Added
+
+- **Fuzz target `canonical_i64_differential`** — pins
+  `is_canonical_i64(d) == canonical_i64(d).is_some()` for every byte string,
+  plus the moon#795 property itself (an accepted value must render back to the
+  caller's exact bytes) and a suffix-extension check that a length-confused
+  recognizer would fail. Two hand-written recognizers of one grammar stay
+  honest only by agreeing, and a divergence here is a data-corruption bug on a
+  hot path, not a cosmetic one. Registered in `fuzz/Cargo.toml` and in **both**
+  matrices in `.github/workflows/fuzz.yml` — an unlisted target never runs.
+
+  **The target was proved to find its own bug before being trusted.** Against
+  the correct implementation it ran 16,290,362 executions in 46s with no
+  finding; against an implementation with the `-0` rule removed it crashed on
+  `[45, 48]` — `"-0"`, one of the original moon#795 vectors — reached by the
+  suffix-extension check from the one-byte input `"-"`.
+
+- **`storage::numeric::is_canonical_i64`** — `canonical_i64`'s verdict without
+  its value, for the callers that only need to ROUTE. `canonical_i64` costs a
+  UTF-8 validation, an `i64` parse, an `itoa` render and a `memcmp`; that is the
+  right price when the value is wanted, and pure waste when the answer is a
+  yes/no. `SADD`'s `all_integers` pre-pass is the first caller: it walks the
+  batch to decide whether it belongs in an intset and then discards every
+  number it parsed, because the push loop re-derives the ones it needs.
+  `is_canonical_i64` decides the same question from the bytes — sign, digits,
+  no leading zero, no `-0`, and one slice compare against the `i64` boundary at
+  19 magnitude digits.
+
+  Verdict-identity is the whole contract, and moon#795 is why: a non-canonical
+  spelling that slips into an integer encoding destroys the caller's bytes
+  (`SADD s 000000012345` came back as `12345`). So the equivalence is pinned
+  DIFFERENTIALLY against `canonical_i64` itself, never against hand-written
+  expectations — exhaustively over every 1-byte input and over a discriminating
+  alphabet at widths 2 and 3, across both `i64` boundaries digit by digit, and
+  over 200,000 randomised digit-heavy inputs. All four differential tests were
+  confirmed to FAIL against a deliberately mutated implementation before being
+  trusted (dropping the `-0` rule; dropping the range check), and a
+  command-level test pins the observable consequence: each of the moon#795
+  vectors — `007`, `+7`, `-0`, `" 7"`, `"7 "`, the empty string, a 20-digit
+  number, and `i64::MIN`/`i64::MAX` on both sides of their exact boundaries —
+  must still route to the same encoding and come back byte for byte.
+
+  **No throughput number is claimed here.** The candidate came from a
+  `75ad520c` SADD-only profile showing `from_utf8` 1.37% + `itoa` 0.90% +
+  `canonical_i64` 0.55%, but those symbols have other callers on the same leg
+  (the listpack encode path among them), so their attribution to *this*
+  pre-pass is **unverified** — benchmarks are Linux-only and this landed from
+  macOS. The change is justified by doing strictly less work for a provably
+  identical verdict, not by a measurement.
+- **`test`: a DashTable key-lookup counter and a probe budget for the storage
+  accessors (moon#942).** `DashTable`'s six lookup entry points (`get`,
+  `get_mut`, `insert`, `insert_or_update`, `remove`, `remove_entry`) now record
+  a per-thread count under `cfg(test)`, behind the same `#[cfg(not(test))]`
+  `#[inline(always)]` no-op that moon#789 established for `note_simd_probe` —
+  zero production cost, in the hottest lookups in the codebase. It is
+  deliberately COARSER than `segment::take_simd_probes`: that one counts
+  control-byte group scans and varies with a segment's fill, this one counts how
+  many times a caller hashes a key and walks a segment at all, which is a
+  property of the *accessor* rather than of the table.
+
+  `storage::db::probe_budget` pins the measured budget of every `get_or_create*`
+  / `get_promoted` / `get_mut_if_present` accessor and of `SADD` end to end, on
+  a hit and on a miss. The baseline it records is **measured, not read off the
+  moon#942 audit — which undercounted `get_or_create`'s miss path by one**
+  (`promote_cold_if_present` opens with its own `contains_key`). These are the
+  **PRE-reduction** counts, which is the point of recording them; the reduced
+  ones are under Performance below and are what the module asserts at HEAD:
+
+  | accessor | hit | miss |
+  |---|---:|---:|
+  | `get_or_create` | 3 | 6 |
+  | `get_mut_if_present` | 3 | 4 |
+  | `get_promoted` | 4 | 5 |
+  | `get_or_create_intset` / `_hash_listpack` / `_list_listpack` / `_zset_listpack` | 3 | 6 |
+  | `get_or_create_set_listpack` | 4 | 7 |
+  | `SADD` end to end — absent key / listpack regime / hashtable regime | \[7, 4, 7\] | |
+
+  Redis reaches all of these with one `dictFind`. **No throughput claim is made
+  or implied**: the counter exists precisely *because* moon#789 measured the
+  last probe-count change at +11% on aarch64 and −17% on x86_64 — the two
+  architectures disagreed in sign — and because `b3083c5a` found the wall-clock
+  net for it was timing a page-fault artifact. A probe count is a structural
+  fact; only a Linux benchmark host may speak about time.
 
 - `scripts/bench-ab-delta.py` — compares moon against **moon** across two
   matrix runs, which `bench-ab-report.py` cannot do. Redis is the control: the
@@ -97,6 +831,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whether the caller's patterns cover the index's `PREFIX` — is filed as the
   follow-up; grant `~*` in the meantime if a restricted user must search.
 
+### Performance
+
+- **`INCR`/`INCRBY`/`DECR`/`DECRBY` mutate the stored integer in place
+  (moon#942).** Adding one to a hot counter cost **three** independent
+  `DashTable` probes — two in `Database::get` (the second is a documented NLL
+  re-probe, `kv_ops.rs:29`/`:36`) and a third in `Database::set` — plus a
+  `CompactKey::from(key)` re-copy of the key bytes, a whole new `Entry`, and
+  two `entry_overhead` recomputations. Redis's `incrDecrCommand` does one
+  `lookupKeyWrite` and rewrites `o->ptr`. `Database::incr_hot_string_in_place`
+  (`src/storage/db/incr.rs`) is the equivalent: **one** `get_mut` probe, one
+  `CompactValue` assignment, and nothing re-hashed or rebuilt.
+
+  **Counted in the disassembly of the release binary** (aarch64-apple-darwin,
+  fat LTO, `strip=false`), by `DashTable` entry points reached on the live
+  path — each entry point computes exactly one `hash_key`:
+
+  | | `DashTable` entry points | key hashes |
+  |---|---:|---:|
+  | `Database::get` (live path) | 2 x `DashTable::get` | 2 |
+  | `Database::set` | 1 x `insert_or_update` | 1 |
+  | **pre-#942 `INCR` hot path** | **3** | **3** |
+  | `incr_hot_string_in_place` | 1 x `DashTable::get_mut` | 1 |
+
+  That also **settles the open question about `Database::get`'s NLL re-probe**
+  (`kv_ops.rs:29`/`:36`): LLVM does *not* eliminate it. It tail-merges the
+  live-path re-probe with the post-cold-promotion probe into one branch
+  target, but the live path still executes `bl DashTable::get` and then tail-
+  calls `DashTable::get` a second time. `DashTable::get` is not inlined into
+  `Database::get` even with `hash_key` fully inlinable, so no CSE is possible
+  across the two. Fixing that re-probe remains open (it needs polonius, a
+  `RawEntry`-style `DashTable` API, or `unsafe`); `INCR` no longer pays it
+  because its hot path does not call `Database::get` at all.
+
+  **No throughput number is claimed.** Benchmarks are Linux-only and this
+  change has not been run on the instrument; the probe counts above are
+  static instruction-level facts, not a wall-clock measurement.
+
+  The risk in a fast path around `Database::set` is the side effects it
+  quietly stops doing, so all eleven are enumerated in the module docs with a
+  per-item decision, and each preserved one has a named test. The two cases
+  the fast path **refuses** — absent key, TTL-expired key — fall back to the
+  original `get` + `set` pair unchanged, because those are exactly where
+  cold-tier promotion, in-flight-spill rehydration and lazy-expiry
+  bookkeeping live; fabricating a `0` for a spilled counter would have been a
+  silent data loss. Error replies (`WRONGTYPE`, non-integer, overflow) leave
+  the keyspace bit-for-bit unchanged — no WATCH-version bump (moon#926/#940),
+  no dirty-counter charge, no ledger movement, no keyspace notification.
+
+  The trade is stated in the module docs rather than left to be discovered:
+  a refused call has already spent its probe, so `INCR` on an **absent** key
+  now costs 5 probes where it cost 4. A counter is created once and
+  incremented many times.
+
+  21 mutation-injected defects — one per preserved side effect, in both
+  directions — were each confirmed to turn a *named* test red before the
+  suite was trusted (11 against the unit suite, 10 against the live-server
+  one). Two guards did not catch their mutation on the first pass and were
+  rewritten until they did.
+
 ### Fixed
 
 - **`scripts/test-consistency.sh`: the WATCH/CAS rows no longer race moon's shard
@@ -116,6 +909,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   varies with `conflict` itself, 10/10 unanimous per cell on both engines.
   Failure sentinels now interpolate the port, so a double failure can no longer
   pass `assert_eq` vacuously.
+- **`SADD` under-reported its reply when one batch crossed
+  `set-max-intset-entries` (moon#944).** The intset push loop `break`s the
+  instant the ceiling is crossed, and the upgrade path then re-inserted the
+  whole argv into the new `IndexSet` while DISCARDING `insert`'s "was this
+  member new" bool — so `added` stopped at the crossing and every member
+  positioned *after* it was stored but never counted. Measured against redis
+  7.4.0 with `set-max-intset-entries 512`: `SADD` on a 510-member intset with a
+  24-member batch adding 22 new members replied **3** where redis replied
+  **22**. The data was never wrong — `SCARD` and `SMEMBERS` agreed all along —
+  which is why no harness row caught it: the reply is the only thing that
+  diverged, and clients build dedup accounting and "did I win the insert"
+  logic on exactly that number.
+
+  The upgrade path now counts `IndexSet::insert`'s bool, and walks **only the
+  unabsorbed tail** rather than the whole argv. The prefix is provably already
+  in the set: `Intset::to_set_value` renders each value with its decimal
+  spelling, and every value entered the intset through `canonical_i64`, so
+  that rendering is the caller's exact bytes (moon#795) — re-walking it was an
+  O(batch) no-op that also spent one `Bytes` clone per member on a
+  `src/command/` path, which CLAUDE.md bans. No unit test covered this because
+  every existing encoding row crosses a threshold with a batch of **one**, and
+  a one-member batch has no tail past the crossing. New rows in
+  `scripts/test-consistency.sh` compare the reply against the real redis oracle
+  for a straddle by twenty, a straddle by one, and a control wholly below the
+  ceiling; the unit tests assert the reply against the `SCARD` delta rather
+  than a hardcoded count, so neither the buggy answer nor an over-counting fix
+  can pass them.
 
 - **`HINCRBY` and `HSETNX` no longer flatten a small hash (moon#897).** Both
   reached for `Database::get_or_create_hash`, whose contract is an EAGER
@@ -349,6 +1169,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses to start, naming both flags; `--check-config` reports it.
 
 ### Performance
+
+- **`server`: the monoio write path stops taking a second exclusive database
+  guard just to discover it has nothing to wake (moon#942).** After `dispatch`,
+  `handler_monoio` acquired `s.databases.write(new_sel_db)` — a `guard_depth`
+  thread-local RMW plus a `parking_lot` write acquisition — on **every**
+  successful write, solely to hand a `&mut Database` to `wake_producer`. That
+  function's own first line is `producer_family(cmd)?`, which returns `None`
+  for everything outside `LPUSH`/`RPUSH`/`LMOVE`/`RPOPLPUSH`/`ZADD`/`XADD`, so
+  for `INCR`, `SADD` and `HSET` — three of the five families moon#942 targets —
+  the guard was taken, nothing happened, and it was dropped. `producer_family`
+  needs only the command NAME, so the question is now asked before the guard
+  instead of inside it. The set of `wake_producer` calls is unchanged; only
+  no-op acquisitions are gone, and the guard, when taken, is still taken on the
+  POST-dispatch database index. **No throughput number is claimed:** the
+  acquisition is uncontended at `--shards 1` and this was not measured on a
+  Linux host. The gate is `producer_family` itself and must never become a
+  hand-written list of command names — a gate narrower than the mapping is a
+  lost wakeup whose visibility depends on which shard owns the key, which is
+  moon#595 exactly. New `tests/wakeup_local_write_gate.rs` pins `BLPOP`/`LPUSH`,
+  `XREAD`/`XADD` and `BZPOPMIN`/`ZADD` at **both** 1 and 4 shards, plus an
+  `INCR`/`SADD`/`HSET` control that must wake nothing and must not error;
+  restoring the pre-#595 gate turns it red at 8/8 trials at one shard and 3/8 at
+  four, which is that routing-dependence reproduced. `handler_sharded` (tokio)
+  was checked and deliberately left alone: its single `db_guard` already spans
+  dispatch and the wake, so it never paid for the no-op.
+- **`storage`: the typed accessors probe the DashTable half as many times
+  (moon#942).** Every `get_or_create*` opened with a `get` (inside
+  `drop_if_expired`) and a `contains_key` that answer the same question — "is
+  there a live entry at this key?" — before the `get_mut` that hands the entry
+  out. `get_promoted` paid a fourth lookup, a trailing `get`, purely to
+  re-borrow immutably what the upgrade's `&mut` already had.
+  `get_or_create_set_listpack` paid a fifth, because
+  `absorb_intset_into_listpack` was a `&mut self` method keyed by `&[u8]` and
+  took its own `get_mut` — on every `SADD`, including the overwhelming majority
+  where the key is not an intset and the function does nothing. Each of those
+  is a full xxh64 over the key plus a segment scan; nothing cached a probe
+  anywhere.
+
+  One `HotState` classification now decides the whole preamble, the create arm
+  reads `promote_cold_if_present`'s own return value instead of re-issuing
+  `contains_key`, and the intset edge runs on the handle the accessor was
+  about to take anyway. **Measured with a new `cfg(test)` DashTable key-lookup
+  counter, per accessor, on a hit and on a miss:**
+
+  | accessor | before (hit / miss) | after (hit / miss) |
+  |---|---:|---:|
+  | `get_or_create` | 3 / 6 | **2 / 4** |
+  | `get_mut_if_present` | 3 / 4 | **2 / 3** |
+  | `get_promoted` | 4 / 5 | **2 / 3** |
+  | `get_or_create_intset` / `_hash_listpack` / `_list_listpack` / `_zset_listpack` | 3 / 6 | **2 / 4** |
+  | `get_or_create_set_listpack` | 4 / 7 | **2 / 4** |
+
+  SADD end to end does not fit that table's hit/miss axis — its three regimes
+  are an absent key, a listpack-encoded key and a hashtable-encoded one (122 of
+  200 keys at the benchmark's own p=64 point):
+
+  | `SADD` regime | before | after |
+  |---|---:|---:|
+  | absent key (creates the container) | 7 | **4** |
+  | listpack-encoded key | 4 | **2** |
+  | hashtable-encoded key | 7 | **4** |
+
+  Redis reaches the same key with one `dictFind`. The residual 4 on SADD's
+  hashtable regime is two accessors' worth: `get_or_create_set_listpack`
+  answers `Ok(None)` and `get_or_create_set` then repeats the skeleton.
+  Collapsing that needs a change in `src/command/set/`.
+
+  **No throughput number is claimed, and none was measured.** That is
+  deliberate, not an omission: moon#789 measured the previous probe-count
+  reduction in this repo at **+11% on aarch64 and −17% on x86_64** — the two
+  architectures disagreed in *sign* — and `b3083c5a` found the wall-clock net
+  guarding it was timing a page-fault artifact rather than the optimisation.
+  Fewer probes is a structural fact; whether it is faster is a question only a
+  Linux benchmark host may answer, and this change must be A/B'd on **both**
+  arches before any performance claim is attached to it. What *is* verified
+  beyond the counter is that the codegen moved: on aarch64 the emitted bodies
+  of `get_or_create_hash_listpack`, `_list_listpack`, `_zset_listpack`,
+  `_intset` and `_set_listpack` shrink by 45–48% (884→460, 880→456, 884→460,
+  984→556, 964→528 bytes). Code size is not speed either; it is evidence the
+  compiler saw the change.
+
+  Behaviour is unchanged and pinned by tests written against the pre-change
+  baseline: an expired key still reads as ABSENT (not `WRONGTYPE`) through
+  every accessor and still leaves no expiry-index entry behind (moon#541); a
+  cold-spilled value is still promoted before an empty container is fabricated
+  over it, on the expired arm as well as the absent one (moon#459); a live key
+  of the wrong type still errors; the WATCH version still bumps exactly once
+  per mutable handle (moon#926 — moon#940, the `WRONGTYPE` path stamping too,
+  is neither fixed nor worsened, and `stamp_mutation` did not move); and
+  `used_memory` still agrees with an independent whole-keyspace recount.
+
+  That last one was first written as `assert_eq!(run(), run())` over a pure
+  deterministic closure, which is a tautology — a build that moved a charge
+  across a branch would still agree with itself — and an adversarial review
+  caught it. It now compares the incrementally maintained ledger against a
+  fresh walk summing `entry_overhead` per entry, and a second test pins the one
+  ledger write this change actually moved (the moon#899 intset→listpack swing,
+  which used to be applied inside `absorb_intset_into_listpack` before
+  `stamp_mutation` and is now applied by the accessor after it). Both were
+  verified to FAIL against deliberately mutated builds — charge dropped, swing
+  dropped — rather than assumed to be capable of failing.
 
 - **`storage`: the listpack write path stops walking twice and stops
   allocating per entry it walks past (moon#799).** `get_at`, `remove_at` and

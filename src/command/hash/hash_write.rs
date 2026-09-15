@@ -6,8 +6,8 @@ use crate::storage::Database;
 use crate::storage::db::{HashTtlCond, Shape, hash_field_cost, hash_field_cost_len};
 use crate::storage::entry::boxed_payload_block;
 
-use crate::command::helpers::{all_args_are_bytes, err_wrong_args, extract_bytes, ok};
-use crate::storage::listpack::ListpackRef;
+use crate::command::helpers::{err_wrong_args, extract_bytes, ok};
+use crate::storage::listpack::{ListpackRef, PairUpdate};
 
 /// Widest decimal rendering of an `i64` — `-9223372036854775808`, 20 bytes.
 ///
@@ -18,6 +18,24 @@ use crate::storage::listpack::ListpackRef;
 /// safe direction: it can only send an oversized write to the full form,
 /// never squeeze an oversized value into a listpack.
 const I64_MAX_RENDERED_LEN: usize = 20;
+
+/// An `i64` rendered on the stack. `SmallVec` with a 20-byte inline array
+/// never reaches the allocator for a value `itoa` can produce, so this is the
+/// hot-path-legal way to hand bytes OUT of a closure — the shape
+/// `zset_score::ScoreBuf` already uses for ZINCRBY.
+type IntBuf = SmallVec<[u8; I64_MAX_RENDERED_LEN]>;
+
+/// Render `v` into an owned stack buffer.
+///
+/// `Listpack::update_pair_value`'s closure cannot return `itoa::Buffer::format`'s
+/// `&str`: that borrow is derived from a variable the closure captures, and a
+/// closure may not hand out a borrow of its own capture. The replacement has
+/// to own its bytes, which is what this is.
+#[inline]
+fn render_i64(v: i64) -> IntBuf {
+    let mut ibuf = itoa::Buffer::new();
+    IntBuf::from_slice(ibuf.format(v).as_bytes())
+}
 
 /// Settle the memory ledger after a listpack-path hash write and perform the
 /// one-time `HashListpack -> Hash` upgrade when the listpack no longer fits.
@@ -82,27 +100,36 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("HSET"),
     };
 
-    // moon#823: refuse a non-argument-shaped frame BEFORE the mutation window
-    // opens. The loop below bails on the first one `extract_bytes` rejects,
-    // and by then it has already written part of the command — a partial write
-    // that is applied on the master and, because propagation is gated on the
-    // reply not being an error, never reaches the AOF or a replica.
-    if !all_args_are_bytes(&args[1..]) {
-        return err_wrong_args("HSET");
+    // ONE walk of the argv does both jobs (moon#942). It used to be two:
+    // `all_args_are_bytes` matched every frame, then the `max` chain matched
+    // every frame again to read its length.
+    //
+    // moon#823 (the validation half): refuse a non-argument-shaped frame
+    // BEFORE the mutation window opens. The write loop below bails on the
+    // first one `extract_bytes` rejects, and by then it has already written
+    // part of the command — a partial write that is applied on the master
+    // and, because propagation is gated on the reply not being an error,
+    // never reaches the AOF or a replica. Returning from this walk keeps the
+    // refusal strictly before `get_or_create_hash_listpack`.
+    //
+    // moon#896 (the measurement half): the entry gate takes the longest field
+    // OR value anywhere in the batch — position does not matter — against
+    // `hash-max-listpack-value`.
+    let mut max_elem = 0usize;
+    for a in &args[1..] {
+        match extract_bytes(a) {
+            Some(b) => max_elem = max_elem.max(b.len()),
+            None => return err_wrong_args("HSET"),
+        }
     }
 
-    // The entry gate, from the ONE authority (moon#896): the longest field or
-    // value in the batch against `hash-max-listpack-value`, the batch size
-    // against `hash-max-listpack-entries`. The same predicate bounds a batch
-    // far below the listpack header's u16 range (moon#865) — the upgrade
-    // check below runs after the push loop, which is too late to stop a
-    // batch that is already too big.
+    // The entry gate, from the ONE authority (moon#896): that longest element
+    // against `hash-max-listpack-value`, the batch size against
+    // `hash-max-listpack-entries`. The same predicate bounds a batch far
+    // below the listpack header's u16 range (moon#865) — the upgrade check
+    // below runs after the push loop, which is too late to stop a batch that
+    // is already too big.
     let limits = db.encoding_limits();
-    let max_elem = args[1..]
-        .iter()
-        .map(|a| extract_bytes(a).map_or(0, |b| b.len()))
-        .max()
-        .unwrap_or(0);
     // `args.len() - 1` is listpack ENTRIES (two per field); the policy is in
     // FIELDS, and the shape converts. Passing the entry count here was
     // moon#896: a bulk HSET of 65 fields (argv 130) refused the listpack path
@@ -225,23 +252,32 @@ pub fn hdel(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("HDEL"),
     };
-    let mut count: i64 = 0;
-    let mut last_was_empty = false;
+    // ONE accessor for the whole command (moon#942). The per-field loop this
+    // replaces called `hash_delete_field` once per argument, and that method
+    // costs TWO DashTable probes — its own `data.get_mut` and, on a real
+    // removal, `stamp_hash_field_mutation`'s — so `HDEL h f1 f2 f3` hashed
+    // the key six times. Redis pays one `dictFind` for the command and then
+    // looks each field up inside the hash, which is what this does.
+    //
+    // It also fixes what the loop could not express: emptiness was tracked in
+    // a variable reassigned on EVERY iteration, so `HDEL h only absent`
+    // overwrote the emptiness the real removal reported and the key survived
+    // as a hash with zero fields.
+    //
+    // `SmallVec` keeps the common batch off the heap; the same shape `hset`
+    // already uses for its `touched` list.
+    let mut fields: SmallVec<[&[u8]; 8]> = SmallVec::new();
     for arg in &args[1..] {
         if let Some(field) = extract_bytes(arg) {
-            match db.hash_delete_field(key, field) {
-                Ok((removed, empty)) => {
-                    if removed {
-                        count += 1;
-                    }
-                    last_was_empty = empty;
-                }
-                Err(e) => return e,
-            }
+            fields.push(field.as_ref());
         }
     }
-    // If the last deletion left the hash empty, remove the key.
-    if last_was_empty {
+    let (count, now_empty) = match db.hash_delete_fields(key, &fields) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    // An emptied hash does not outlive its last field.
+    if now_empty {
         db.remove(key);
     }
     Frame::Integer(count)
@@ -259,22 +295,17 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("HMSET"),
     };
 
-    // moon#823: refuse a non-argument-shaped frame BEFORE the mutation window
-    // opens. The loop below bails on the first one `extract_bytes` rejects,
-    // and by then it has already written part of the command — a partial write
-    // that is applied on the master and, because propagation is gated on the
-    // reply not being an error, never reaches the AOF or a replica.
-    if !all_args_are_bytes(&args[1..]) {
-        return err_wrong_args("HMSET");
+    // ONE walk validates (moon#823) and measures (moon#896) — see `hset`.
+    let mut max_elem = 0usize;
+    for a in &args[1..] {
+        match extract_bytes(a) {
+            Some(b) => max_elem = max_elem.max(b.len()),
+            None => return err_wrong_args("HMSET"),
+        }
     }
 
     // Entry gate from the ONE authority — see `hset`.
     let limits = db.encoding_limits();
-    let max_elem = args[1..]
-        .iter()
-        .map(|a| extract_bytes(a).map_or(0, |b| b.len()))
-        .max()
-        .unwrap_or(0);
     // Fields, not entries — the moon#896 unit, see `hset`.
     if limits.fits(Shape::Hash, Shape::Hash.items_in(args.len() - 1), max_elem) {
         // HashWithTtl returns Ok(None), falling through — same as HSET.
@@ -412,42 +443,71 @@ pub fn hincrby(db: &mut Database, args: &[Frame]) -> Frame {
         // the per-field TTL sidecar is untouched by this arm.
         match db.get_or_create_hash_listpack(key) {
             Ok(Some(lp)) => {
-                // The SAME parse the HashMap path below applies, on the same
-                // bytes. A listpack `Integer` entry only ever holds a value
-                // whose canonical decimal spelling is what the caller wrote
-                // (moon#795), so its rendering round-trips; a `Str` entry
-                // holds the caller's bytes verbatim and gets the identical
-                // `str::parse::<i64>` treatment, error string included.
-                let current = match lp.pair_value(field.as_ref()) {
-                    Some(ListpackRef::Integer(n)) => n,
-                    Some(ListpackRef::Str(s)) => {
-                        match std::str::from_utf8(s)
+                // ONE scan reads the current value AND writes the new one
+                // (moon#942). This used to be `pair_value` — a borrowed scan
+                // that located the field — followed by `replace_pair_value`,
+                // which located the SAME field all over again from the head.
+                // That is the defect moon#799 removed for HSET and moon#942
+                // removed for ZADD/ZINCRBY; `update_pair_value` is the
+                // primitive built for exactly this shape, and HINCRBY is the
+                // last hash caller still walking twice.
+                //
+                // The parse inside the closure is the SAME one the HashMap
+                // path below applies, on the same bytes. A listpack `Integer`
+                // entry only ever holds a value whose canonical decimal
+                // spelling is what the caller wrote (moon#795), so its
+                // rendering round-trips; a `Str` entry holds the caller's
+                // bytes verbatim and gets the identical `str::parse::<i64>`
+                // treatment, error string included.
+                //
+                // Listpack `estimate_memory()` is O(1) (capacity-based), and
+                // the snapshot has to be taken before the scan that writes.
+                let before = lp.estimate_memory();
+                // `None` out of the closure would mean "leave the pair
+                // alone", which HINCRBY never wants; a parse failure is
+                // carried out in `parse_failed` instead, and answered after
+                // the borrow ends so the error path writes nothing.
+                let mut parse_failed = false;
+                // Seeded with the value an ABSENT field produces: Redis
+                // treats a missing hash field as 0, so the new value is the
+                // increment itself. The closure overwrites it when the field
+                // is there.
+                let mut new_value = increment;
+                let outcome = lp.update_pair_value(field.as_ref(), |current| {
+                    let parsed = match current {
+                        ListpackRef::Integer(n) => Some(n),
+                        ListpackRef::Str(s) => std::str::from_utf8(s)
                             .ok()
-                            .and_then(|s| s.parse::<i64>().ok())
-                        {
-                            Some(n) => n,
-                            None => {
-                                return Frame::Error(Bytes::from_static(
-                                    b"ERR hash value is not an integer",
-                                ));
-                            }
+                            .and_then(|s| s.parse::<i64>().ok()),
+                    };
+                    match parsed {
+                        Some(n) => {
+                            new_value = n + increment;
+                            // Canonical by construction, so re-encoding it
+                            // into the listpack is byte-transparent
+                            // (moon#795): `itoa` never emits a leading zero,
+                            // a `+` sign, or `-0`. One stack buffer, the
+                            // shape `ZINCRBY`'s `ScoreBuf` already uses — the
+                            // closure cannot hand back a borrow of its own
+                            // capture.
+                            Some(render_i64(new_value))
+                        }
+                        None => {
+                            parse_failed = true;
+                            None
                         }
                     }
-                    None => 0,
-                };
-                let new_value = current + increment;
-                let mut ibuf = itoa::Buffer::new();
-                // Canonical by construction, so re-encoding it into the
-                // listpack is byte-transparent (moon#795): `itoa` never emits
-                // a leading zero, a `+` sign, or `-0`.
-                let rendered = ibuf.format(new_value).as_bytes();
-                // Listpack `estimate_memory()` is O(1) (capacity-based).
-                let before = lp.estimate_memory();
-                // ONE borrowed scan overwrites the value in place and leaves
-                // the entry count alone; only an absent field adds a pair.
-                if !lp.replace_pair_value(field.as_ref(), rendered) {
+                });
+                if parse_failed {
+                    // Answered here, after the scan declined to write: the
+                    // listpack is byte-identical to what it was, so a
+                    // rejected HINCRBY leaves the value alone.
+                    return Frame::Error(Bytes::from_static(b"ERR hash value is not an integer"));
+                }
+                if matches!(outcome, PairUpdate::Absent) {
+                    let rendered = render_i64(new_value);
                     lp.push_back(field.as_ref());
-                    lp.push_back(rendered);
+                    lp.push_back(rendered.as_ref());
                 }
                 let after = lp.estimate_memory();
                 let should_upgrade = !limits.listpack_fits(Shape::Hash, lp);

@@ -160,6 +160,21 @@ pub struct ListpackPairIter<'a> {
 /// head, which is exactly the second scan moon#799 is about. Every span is
 /// produced and consumed inside one `&mut self` method, so it can never
 /// outlive the bytes it names.
+/// Outcome of [`Listpack::update_pair_value`].
+///
+/// Three states, because the caller has three different jobs: append the pair
+/// (`Absent`), count a no-op (`Unchanged`), or account for a write and -- in
+/// ZINCRBY's case -- reply with the bytes that were stored (`Replaced`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairUpdate<R> {
+    /// No pair carries that field; nothing was written.
+    Absent,
+    /// The pair is there and the caller declined to change its value.
+    Unchanged,
+    /// The pair's value was replaced with these bytes.
+    Replaced(R),
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PairSpan {
     /// First byte of the FIELD entry.
@@ -202,8 +217,7 @@ impl Listpack {
     pub fn push_back(&mut self, value: &[u8]) {
         let encoded = encode_entry(value);
         let insert_pos = self.data.len() - 1; // before terminator
-        self.data
-            .splice(insert_pos..insert_pos, encoded.iter().cloned());
+        self.write_entry(insert_pos..insert_pos, &encoded);
         self.update_header();
     }
 
@@ -211,8 +225,7 @@ impl Listpack {
     pub fn push_front(&mut self, value: &[u8]) {
         let encoded = encode_entry(value);
         let insert_pos = 6; // after header (4 + 2)
-        self.data
-            .splice(insert_pos..insert_pos, encoded.iter().cloned());
+        self.write_entry(insert_pos..insert_pos, &encoded);
         self.update_header();
     }
 
@@ -250,7 +263,7 @@ impl Listpack {
             return;
         };
         let encoded = encode_entry(value);
-        self.data.splice(pos..next_pos, encoded.iter().cloned());
+        self.write_entry(pos..next_pos, &encoded);
         // Update total_bytes in header (len unchanged)
         let total = self.data.len() as u32;
         self.data[0..4].copy_from_slice(&total.to_le_bytes());
@@ -374,16 +387,57 @@ impl Listpack {
     /// second scan from the head), so a 128-field hash was walked 256 entries
     /// to change one value (moon#799).
     pub fn replace_pair_value(&mut self, field: &[u8], value: &[u8]) -> bool {
+        matches!(
+            self.update_pair_value(field, |_current| Some(value)),
+            PairUpdate::Replaced(_)
+        )
+    }
+
+    /// Update the VALUE of the pair whose FIELD equals `field`, deciding from
+    /// the value currently stored there -- in ONE scan.
+    ///
+    /// `update` is handed the stored value and returns the replacement bytes,
+    /// or `None` to leave the pair alone. The replacement comes back out in
+    /// [`PairUpdate::Replaced`], so a caller that needs the bytes it stored --
+    /// ZINCRBY replies with them -- does not render them a second time.
+    ///
+    /// This is [`Listpack::replace_pair_value`] for the callers whose
+    /// replacement DEPENDS on the old value: ZADD's `NX`/`GT`/`LT`
+    /// comparison, and ZINCRBY's `old + increment`. Both used to walk the
+    /// listpack TWICE -- a borrowed scan down to an ORDINAL, then
+    /// `replace_at` walking back to that ordinal from the head -- which is
+    /// the same defect moon#799 fixed for HSET, still standing for the sorted
+    /// set (moon#942).
+    ///
+    /// Nothing in the return borrows `self`, and that is load-bearing rather
+    /// than incidental: it lets the caller's miss arm append to this same
+    /// listpack. An `Option<&mut _>` handle could not, because the borrow
+    /// would span the whole `match`.
+    pub fn update_pair_value<R, F>(&mut self, field: &[u8], update: F) -> PairUpdate<R>
+    where
+        R: AsRef<[u8]>,
+        F: FnOnce(ListpackRef<'_>) -> Option<R>,
+    {
         let Some(span) = self.locate_pair(field) else {
-            return false;
+            return PairUpdate::Absent;
         };
-        let encoded = encode_entry(value);
-        self.data
-            .splice(span.value_start..span.value_end, encoded.iter().cloned());
+        // The shared borrow of `self.data` ends with this block, before the
+        // write below takes a mutable one. `R` cannot smuggle one out: it is
+        // chosen by the caller, who holds `&mut self` and so has no shared
+        // borrow of the buffer to hand back.
+        let replacement = {
+            let (current, _) = decode_entry_ref_at(&self.data, span.value_start);
+            update(current)
+        };
+        let Some(replacement) = replacement else {
+            return PairUpdate::Unchanged;
+        };
+        let encoded = encode_entry(replacement.as_ref());
+        self.write_entry(span.value_start..span.value_end, &encoded);
         // Element count unchanged; only total_bytes moves.
         let total = self.data.len() as u32;
         self.data[0..4].copy_from_slice(&total.to_le_bytes());
-        true
+        PairUpdate::Replaced(replacement)
     }
 
     /// Remove the pair whose FIELD equals `field`, both entries. ONE scan.
@@ -460,6 +514,53 @@ impl Listpack {
 
     // --- Internal helpers ---
 
+    /// Replace `self.data[range]` with `entry`'s bytes, moving the tail once.
+    ///
+    /// This is what `Vec::splice` was doing, minus the temporary `Vec` the
+    /// encoding had to be materialized into first and minus `Splice`'s
+    /// byte-at-a-time `fill` loop. It is also the shape of Redis's
+    /// `lpInsert`: one `memmove` of the tail, then the head, the payload and
+    /// the backlen copied into place. A same-width replacement -- the common
+    /// HSET and ZADD update, where a fixed-width value is overwritten by
+    /// another of the same width -- moves no tail at all.
+    ///
+    /// `resize` is the only call that can touch the allocator, and only when
+    /// the listpack's own buffer has to GROW; it zero-fills the new bytes,
+    /// which the copies below immediately overwrite. That growth is the same
+    /// `lp_realloc` Redis pays, not the per-entry temporary moon#942 is
+    /// about.
+    ///
+    /// Header fields are deliberately not touched here: whether the element
+    /// count moves depends on the caller, so every caller stamps its own.
+    fn write_entry(&mut self, range: std::ops::Range<usize>, entry: &EncodedEntry<'_>) {
+        debug_assert!(range.start <= range.end && range.end <= self.data.len());
+        let old_width = range.end - range.start;
+        let new_width = entry.len();
+        let orig_len = self.data.len();
+        match new_width.cmp(&old_width) {
+            std::cmp::Ordering::Greater => {
+                let grow = new_width - old_width;
+                self.data.resize(orig_len + grow, 0);
+                self.data.copy_within(range.end..orig_len, range.end + grow);
+            }
+            std::cmp::Ordering::Less => {
+                // `shrink <= old_width <= range.end`, so the destination
+                // never underflows.
+                let shrink = old_width - new_width;
+                self.data
+                    .copy_within(range.end..orig_len, range.end - shrink);
+                self.data.truncate(orig_len - shrink);
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        let head_end = range.start + entry.head_len;
+        let payload_end = head_end + entry.payload.len();
+        self.data[range.start..head_end].copy_from_slice(&entry.head[..entry.head_len]);
+        self.data[head_end..payload_end].copy_from_slice(entry.payload);
+        self.data[payload_end..payload_end + entry.backlen_len]
+            .copy_from_slice(&entry.backlen[..entry.backlen_len]);
+    }
+
     fn update_header(&mut self) {
         let total = self.data.len() as u32;
         self.data[0..4].copy_from_slice(&total.to_le_bytes());
@@ -533,76 +634,177 @@ fn make_entry_for_compare(value: &[u8]) -> ListpackEntry {
     }
 }
 
-/// Encode a value into listpack entry bytes (encoding + data + backlen).
-fn encode_entry(value: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::new();
+/// Maximum bytes an entry's ENCODING HEAD can occupy.
+///
+/// The head is the encoding byte(s) plus whatever the encoding carries
+/// INLINE. Derived from the arms of [`encode_integer_head`] and
+/// [`encode_string_head`], not guessed at:
+///
+/// | encoding      | head bytes            |
+/// |---------------|-----------------------|
+/// | 64-bit int    | 1 + 8 = **9**         |
+/// | 32-bit int    | 1 + 4 = 5             |
+/// | 32-bit string | 1 + 4 = 5 (+ payload) |
+/// | 24-bit int    | 1 + 3 = 4             |
+/// | 16-bit int    | 1 + 2 = 3             |
+/// | 13-bit int    | 2                     |
+/// | 12-bit string | 2 (+ payload)         |
+/// | 7-bit uint    | 1                     |
+/// | 6-bit string  | 1 (+ payload)         |
+///
+/// A string PAYLOAD is deliberately NOT part of this bound, and no constant
+/// could make it one: `hash-max-listpack-value` and its siblings are runtime
+/// config, and the RDB/AOF loaders rebuild listpacks with no element-size
+/// limit at all. The payload is therefore never copied into a stack buffer --
+/// [`Listpack::write_entry`] copies it straight from the caller's slice into
+/// the listpack, which is what Redis's `lpInsert` does too.
+const LP_MAX_ENTRY_HEAD: usize = 9;
 
-    if let Some(v) = try_encode_as_integer(value) {
-        encode_integer_entry(v, &mut buf);
-    } else {
-        encode_string_entry(value, &mut buf);
-    }
+/// Maximum bytes of a backlen field.
+///
+/// [`encode_backlen_into`] emits 7 bits of `entry_len` per byte and
+/// `entry_len` is a `usize`, so the widest field the encoder can produce is
+/// `ceil(usize::BITS / 7)` -- 10 bytes on a 64-bit target, 5 on a 32-bit one.
+/// `backlen_bound_covers_usize_max` pins that against [`backlen_size`].
+const LP_MAX_BACKLEN: usize = (usize::BITS as usize).div_ceil(7);
 
-    // Compute and append backlen (total entry size before backlen)
-    let entry_len = buf.len();
-    let backlen = encode_backlen(entry_len);
-    buf.extend_from_slice(&backlen);
-    buf
+/// One listpack entry, encoded but not yet placed.
+///
+/// The encoding head and the backlen live in stack arrays; the payload is
+/// BORROWED from the caller and never copied into a temporary. This replaced
+/// an `encode_entry -> Vec<u8>` that heap-allocated on every entry written by
+/// HSET, LPUSH, SADD and ZADD -- twice, in fact, because `Vec::new()` starts
+/// at capacity 0 and the backlen was appended afterwards -- and then dropped
+/// the allocation immediately (moon#942). Redis encodes into a stack
+/// `intenc[LP_MAX_INT_ENCODING_LEN]` and never allocates.
+struct EncodedEntry<'a> {
+    head: [u8; LP_MAX_ENTRY_HEAD],
+    head_len: usize,
+    /// The caller's bytes, for the string encodings. Empty for an integer
+    /// entry, whose value lives entirely inside `head`.
+    payload: &'a [u8],
+    backlen: [u8; LP_MAX_BACKLEN],
+    backlen_len: usize,
 }
 
-fn encode_integer_entry(v: i64, buf: &mut Vec<u8>) {
+impl EncodedEntry<'_> {
+    /// Total bytes this entry occupies once written.
+    #[inline]
+    fn len(&self) -> usize {
+        self.head_len + self.payload.len() + self.backlen_len
+    }
+}
+
+/// Encode a value into listpack entry form (encoding + data + backlen).
+///
+/// Byte-for-byte identical to the `Vec`-building encoder it replaced;
+/// `byte_exactness_tests` pins every arm against goldens captured from that
+/// encoder before the rewrite.
+#[inline]
+fn encode_entry(value: &[u8]) -> EncodedEntry<'_> {
+    let mut head = [0u8; LP_MAX_ENTRY_HEAD];
+    let (head_len, payload): (usize, &[u8]) = match try_encode_as_integer(value) {
+        Some(v) => (encode_integer_head(v, &mut head), &[]),
+        None => (encode_string_head(value.len(), &mut head), value),
+    };
+    // The backlen covers the entry size BEFORE the backlen itself.
+    let entry_len = head_len + payload.len();
+    let mut backlen = [0u8; LP_MAX_BACKLEN];
+    let backlen_len = encode_backlen_into(entry_len, &mut backlen);
+    EncodedEntry {
+        head,
+        head_len,
+        payload,
+        backlen,
+        backlen_len,
+    }
+}
+
+/// Write the integer encoding for `v` into `head`; returns its width.
+fn encode_integer_head(v: i64, head: &mut [u8; LP_MAX_ENTRY_HEAD]) -> usize {
     if v >= 0 && v <= 127 {
         // 7-bit unsigned: 0xxxxxxx
-        buf.push(v as u8);
+        head[0] = v as u8;
+        1
     } else if v >= -4096 && v <= 4095 {
         // 13-bit signed: 110xxxxx + 1 byte
         let uv = (v as i16 as u16) & 0x1FFF;
-        let b0 = 0xC0 | ((uv >> 8) as u8 & 0x1F);
-        let b1 = (uv & 0xFF) as u8;
-        buf.push(b0);
-        buf.push(b1);
+        head[0] = 0xC0 | ((uv >> 8) as u8 & 0x1F);
+        head[1] = (uv & 0xFF) as u8;
+        2
     } else if v >= i16::MIN as i64 && v <= i16::MAX as i64 {
         // 16-bit signed
-        buf.push(LP_ENCODING_16BIT_INT);
-        buf.extend_from_slice(&(v as i16).to_le_bytes());
+        head[0] = LP_ENCODING_16BIT_INT;
+        head[1..3].copy_from_slice(&(v as i16).to_le_bytes());
+        3
     } else if v >= -8388608 && v <= 8388607 {
         // 24-bit signed
-        buf.push(LP_ENCODING_24BIT_INT);
-        let bytes = (v as i32).to_le_bytes();
-        buf.extend_from_slice(&bytes[..3]);
+        head[0] = LP_ENCODING_24BIT_INT;
+        head[1..4].copy_from_slice(&(v as i32).to_le_bytes()[..3]);
+        4
     } else if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
         // 32-bit signed
-        buf.push(LP_ENCODING_32BIT_INT);
-        buf.extend_from_slice(&(v as i32).to_le_bytes());
+        head[0] = LP_ENCODING_32BIT_INT;
+        head[1..5].copy_from_slice(&(v as i32).to_le_bytes());
+        5
     } else {
         // 64-bit signed
-        buf.push(LP_ENCODING_64BIT_INT);
-        buf.extend_from_slice(&v.to_le_bytes());
+        head[0] = LP_ENCODING_64BIT_INT;
+        head[1..9].copy_from_slice(&v.to_le_bytes());
+        9
     }
 }
 
-fn encode_string_entry(value: &[u8], buf: &mut Vec<u8>) {
-    let len = value.len();
+/// Write the string encoding for a payload of `len` bytes into `head`;
+/// returns its width. The payload itself is not touched here.
+fn encode_string_head(len: usize, head: &mut [u8; LP_MAX_ENTRY_HEAD]) -> usize {
     if len <= 63 {
         // 6-bit string: 10xxxxxx
-        buf.push(0x80 | (len as u8));
-        buf.extend_from_slice(value);
+        head[0] = 0x80 | (len as u8);
+        1
     } else if len <= 4095 {
         // 12-bit string: 1110xxxx + 1 byte
-        let b0 = 0xE0 | ((len >> 8) as u8 & 0x0F);
-        let b1 = (len & 0xFF) as u8;
-        buf.push(b0);
-        buf.push(b1);
-        buf.extend_from_slice(value);
+        head[0] = 0xE0 | ((len >> 8) as u8 & 0x0F);
+        head[1] = (len & 0xFF) as u8;
+        2
     } else {
         // 32-bit string: 11110000 + 4 bytes
-        buf.push(LP_ENCODING_32BIT_STR);
-        buf.extend_from_slice(&(len as u32).to_le_bytes());
-        buf.extend_from_slice(value);
+        head[0] = LP_ENCODING_32BIT_STR;
+        head[1..5].copy_from_slice(&(len as u32).to_le_bytes());
+        5
     }
+}
+
+/// Write the backlen for an entry of `entry_len` bytes into `out`; returns
+/// how many bytes it used.
+///
+/// The non-allocating twin of [`encode_backlen`], which survives as the test
+/// oracle both this and [`backlen_size`] are pinned against.
+#[inline]
+fn encode_backlen_into(entry_len: usize, out: &mut [u8; LP_MAX_BACKLEN]) -> usize {
+    let mut len = entry_len;
+    if len <= 127 {
+        out[0] = len as u8;
+        return 1;
+    }
+    let mut n = 0;
+    while len > 0 {
+        let mut byte = (len & 0x7F) as u8;
+        len >>= 7;
+        if len > 0 {
+            byte |= 0x80;
+        }
+        out[n] = byte;
+        n += 1;
+    }
+    n
 }
 
 /// Encode backlen as variable-length bytes (7 bits + continuation bit).
+///
+/// The allocating original, kept as the oracle [`encode_backlen_into`] and
+/// [`backlen_size`] are checked against. No production path calls it.
+#[cfg(test)]
 fn encode_backlen(entry_len: usize) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut len = entry_len;
@@ -865,6 +1067,29 @@ fn decode_entry_ref_at(data: &[u8], pos: usize) -> (ListpackRef<'_>, usize) {
     }
 }
 
+// Test-only count of walks that started at the HEAD of a listpack.
+//
+// `seek_to` is the only one; every other scan either starts at the head ONCE
+// per operation (`locate_pair`, the iterators) or resumes from where the
+// previous one stopped. Reaching an entry by ORDINAL means walking back to it
+// from the head, and that second walk is exactly what moon#799 removed from
+// HSET and moon#942 removes from ZADD -- so "did this path seek?" is the
+// falsifiable form of "did it scan twice?".
+//
+// Thread-local, because unit tests share one process and run in parallel; a
+// global counter would make every assertion on it a race. Compiled out of
+// every non-test build.
+#[cfg(test)]
+thread_local! {
+    static HEAD_SEEKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reads [`HEAD_SEEKS`] for the current thread.
+#[cfg(test)]
+fn head_seeks() -> usize {
+    HEAD_SEEKS.with(std::cell::Cell::get)
+}
+
 /// Byte range `(start, next)` of the entry at `index`, found by a BORROWED
 /// walk. `None` when the listpack has fewer than `index + 1` entries.
 ///
@@ -881,6 +1106,8 @@ fn decode_entry_ref_at(data: &[u8], pos: usize) -> (ListpackRef<'_>, usize) {
 /// ONE place for all nine encodings, so a seek can never disagree with a
 /// decode about where the next entry starts.
 fn seek_to(data: &[u8], index: usize) -> Option<(usize, usize)> {
+    #[cfg(test)]
+    HEAD_SEEKS.with(|c| c.set(c.get() + 1));
     let mut pos = 6; // start after header
     for i in 0..=index {
         if pos >= data.len() - 1 || data[pos] == LP_TERMINATOR {
@@ -1485,5 +1712,470 @@ mod zero_alloc_scan_tests {
                 String::from_utf8_lossy(probe)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod byte_exactness_tests {
+    use super::*;
+
+    /// A listpack is a byte-exact format, not merely a container.
+    ///
+    /// It is what `DUMP`/`RESTORE` hand across the wire and what the RDB
+    /// writes to disk (`persistence::redis_rdb` emits the `*_LISTPACK` object
+    /// types verbatim), so an encoder change that still "reads back
+    /// correctly" inside this process can still be a wire-format break. The
+    /// bar is identical BYTES, and these goldens are that bar: they were
+    /// captured from the `Vec`-building encoder and committed BEFORE the
+    /// moon#942 stack-buffer rewrite, so they are an oracle for that rewrite
+    /// rather than a restatement of it.
+    ///
+    /// `007`, `000000012345`, `00`, `0000`, `+5`, `+0` and `-0` are in here
+    /// deliberately: storing `000000012345` as the integer `12345` and
+    /// reading it back as `12345` was a real data-corruption bug in this repo
+    /// (moon#795). They must stay STRING-encoded, byte for byte.
+    ///
+    /// Each value is the hex of the WHOLE listpack -- header, entry,
+    /// terminator -- after one `push_back`.
+    const GOLDEN_SINGLE_ENTRY: &[(&str, &str)] = &[
+        // --- integer encodings: every width, both signs, at each boundary
+        ("0", "0900000001000001ff"),
+        ("7", "0900000001000701ff"),
+        ("127", "0900000001007f01ff"),
+        ("128", "0a0000000100c08002ff"),
+        ("-1", "0a0000000100dfff02ff"),
+        ("4095", "0a0000000100cfff02ff"),
+        ("-4096", "0a0000000100d00002ff"),
+        ("4096", "0b0000000100f1001003ff"),
+        ("32767", "0b0000000100f1ff7f03ff"),
+        ("-32768", "0b0000000100f1008003ff"),
+        ("8388607", "0c0000000100f2ffff7f04ff"),
+        ("-8388608", "0c0000000100f200008004ff"),
+        ("2147483647", "0d0000000100f3ffffff7f05ff"),
+        ("-2147483648", "0d0000000100f30000008005ff"),
+        ("9223372036854775807", "110000000100f4ffffffffffffff7f09ff"),
+        ("-9223372036854775808", "110000000100f4000000000000008009ff"),
+        // One past i64::MAX: not an integer, so it stays a 19-byte string.
+        (
+            "9223372036854775808",
+            "1c0000000100933932323333373230333638353437373538303814ff",
+        ),
+        // --- string encodings
+        ("", "0900000001008001ff"),
+        ("abc", "0c00000001008361626304ff"),
+        ("3.5", "0c000000010083332e3504ff"),
+        (" 7", "0b000000010082203703ff"),
+        // --- moon#795: leading zeros and a leading `+` are STRINGS
+        ("007", "0c00000001008330303704ff"),
+        ("000000012345", "1500000001008c3030303030303031323334350dff"),
+        ("00", "0b000000010082303003ff"),
+        ("0000", "0d0000000100843030303005ff"),
+        ("+5", "0b0000000100822b3503ff"),
+        ("+0", "0b0000000100822b3003ff"),
+        ("-0", "0b0000000100822d3003ff"),
+    ];
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+
+    fn encoded_hex(value: &[u8]) -> String {
+        let mut lp = Listpack::new();
+        lp.push_back(value);
+        hex(&lp.data)
+    }
+
+    #[test]
+    fn single_entry_bytes_are_unchanged() {
+        for (input, want) in GOLDEN_SINGLE_ENTRY {
+            assert_eq!(
+                &encoded_hex(input.as_bytes()),
+                want,
+                "encoding of {input:?} changed"
+            );
+        }
+    }
+
+    /// Bytes, not text: the encoder must never look at a value as a string.
+    /// The 256-byte case also crosses into the 12-bit string head and the
+    /// two-byte backlen at once.
+    #[test]
+    fn non_utf8_payload_bytes_are_unchanged() {
+        assert_eq!(
+            encoded_hex(&[0x00, 0xff, 0x80, 0xfe, 0x01]),
+            "0e00000001008500ff80fe0106ff",
+            "short non-UTF8 payload changed"
+        );
+
+        let all: Vec<u8> = (0u8..=255).collect();
+        let got = encoded_hex(&all);
+        // total = 7 + (2 + 256) + 2 = 267; head = 0xE1 0x00;
+        // backlen(258) = [0x82, 0x02].
+        assert_eq!(&got[..12], "0b0100000100", "header changed");
+        assert_eq!(&got[12..16], "e100", "12-bit string head changed");
+        assert_eq!(&got[16..16 + 512], &hex(&all), "payload changed");
+        assert_eq!(&got[16 + 512..], "8202ff", "backlen/terminator changed");
+    }
+
+    /// The seams where the head width or the backlen width moves.
+    #[test]
+    fn encoding_width_seams_are_unchanged() {
+        // 63 bytes is the top of the 6-bit string head, 64 the first 12-bit
+        // one, 65 the one after.
+        assert_eq!(&encoded_hex(&[b'x'; 63])[12..14], "bf");
+        assert_eq!(&encoded_hex(&[b'y'; 64])[12..16], "e040");
+        assert_eq!(&encoded_hex(&[b'z'; 65])[12..16], "e041");
+
+        // 127 bytes of payload makes entry_len 129: the first two-byte
+        // backlen.
+        let seam = encoded_hex(&[b'p'; 127]);
+        assert_eq!(&seam[..16], "8a0000000100e07f");
+        assert_eq!(&seam[seam.len() - 6..], "8101ff");
+    }
+
+    /// The two widest encodings, checked against a head/backlen derivation
+    /// taken from the format definition rather than from the encoder -- a
+    /// literal for a 4 KB payload is 8 KB of hex that nobody can read, and
+    /// therefore nobody can check.
+    #[test]
+    fn wide_string_entries_are_unchanged() {
+        // 4095 bytes: the top of the 12-bit string encoding.
+        //   head    = 0xE0 | (4095 >> 8) = 0xEF, then 4095 & 0xFF = 0xFF
+        //   entry   = 2 + 4095 = 4097
+        //   backlen = [(4097 & 0x7F) | 0x80, 4097 >> 7] = [0x81, 0x20]
+        //   total   = 7 + 4097 + 2 = 4106
+        let mut lp = Listpack::new();
+        lp.push_back(&vec![b'q'; 4095]);
+        let mut want = Vec::new();
+        want.extend_from_slice(&4106u32.to_le_bytes());
+        want.extend_from_slice(&1u16.to_le_bytes());
+        want.extend_from_slice(&[0xEF, 0xFF]);
+        want.extend(std::iter::repeat_n(b'q', 4095));
+        want.extend_from_slice(&[0x81, 0x20, LP_TERMINATOR]);
+        assert_eq!(lp.data, want, "12-bit string encoding changed at its top");
+
+        // 4096 bytes: the first 32-bit string encoding.
+        //   head    = 0xF0, then 4096u32 LE
+        //   entry   = 5 + 4096 = 4101 -> backlen [0x85, 0x20]
+        //   total   = 7 + 4101 + 2 = 4110
+        let mut lp = Listpack::new();
+        lp.push_back(&vec![b'r'; 4096]);
+        let mut want = Vec::new();
+        want.extend_from_slice(&4110u32.to_le_bytes());
+        want.extend_from_slice(&1u16.to_le_bytes());
+        want.push(LP_ENCODING_32BIT_STR);
+        want.extend_from_slice(&4096u32.to_le_bytes());
+        want.extend(std::iter::repeat_n(b'r', 4096));
+        want.extend_from_slice(&[0x85, 0x20, LP_TERMINATOR]);
+        assert_eq!(lp.data, want, "32-bit string encoding changed");
+    }
+
+    /// The mutating operations, not just `push_back`: `push_front` writes at
+    /// the head, `replace_at` and `replace_pair_value` write in the middle,
+    /// and all of them restamp `total_bytes`. Widening, narrowing and
+    /// equal-width replacements are all here, because they are three
+    /// different tail moves.
+    #[test]
+    fn mutation_sequence_bytes_are_unchanged() {
+        let mut lp = Listpack::new();
+        lp.push_back(b"field:00");
+        lp.push_back(b"value-00");
+        lp.push_front(b"head");
+        lp.replace_at(1, b"REPLACED-LONGER"); // widen
+        lp.push_back(b"007");
+        lp.replace_at(0, b"+5"); // narrow
+        lp.replace_at(2, b"s"); // narrow
+        assert_eq!(
+            hex(&lp.data),
+            "240000000400822b35038f5245504c414345442d4c4f4e474552108173028330303704ff",
+            "push_front / replace_at byte layout changed"
+        );
+
+        // 40 field/value pairs whose values span three integer widths, then
+        // an equal-width and a narrowing `replace_pair_value`.
+        let mut lp = Listpack::new();
+        for i in 0..40 {
+            lp.push_back(format!("f{i}").as_bytes());
+            lp.push_back(format!("{}", i * 1000).as_bytes());
+        }
+        assert!(lp.replace_pair_value(b"f39", b"same-width-replacement"));
+        assert!(lp.replace_pair_value(b"f0", b"0"));
+        assert_eq!(
+            hex(&lp.data),
+            GOLDEN_PAIRS_40,
+            "replace_pair_value byte layout changed"
+        );
+    }
+
+    /// `LP_MAX_BACKLEN` is DERIVED from `usize::BITS`, not guessed at. Prove
+    /// the derivation covers the widest `entry_len` the type can express --
+    /// and that it is not needlessly generous either, so a future reader can
+    /// see the bound is tight rather than a round number someone liked.
+    #[test]
+    fn backlen_bound_covers_usize_max() {
+        assert_eq!(
+            backlen_size(usize::MAX),
+            LP_MAX_BACKLEN,
+            "LP_MAX_BACKLEN must be exactly the width of the widest backlen"
+        );
+        let mut buf = [0u8; LP_MAX_BACKLEN];
+        assert_eq!(encode_backlen_into(usize::MAX, &mut buf), LP_MAX_BACKLEN);
+    }
+
+    /// `LP_MAX_ENTRY_HEAD` must cover the widest head any arm of the encoder
+    /// can write, checked against the bytes the encoder actually emits rather
+    /// than against the table in the constant's own doc comment.
+    #[test]
+    fn head_bound_covers_every_encoding() {
+        // The 64-bit integer arm is what pins the bound.
+        let widest = encode_entry(b"9223372036854775807");
+        assert_eq!(widest.head_len, LP_MAX_ENTRY_HEAD);
+        assert!(
+            widest.payload.is_empty(),
+            "integer entries carry no payload"
+        );
+
+        // The widest STRING head, whose payload is deliberately outside the
+        // bound and stays borrowed.
+        let big_string = vec![b'a'; 4096];
+        let wide_str = encode_entry(&big_string);
+        assert_eq!(wide_str.head_len, 5);
+        assert_eq!(wide_str.payload.len(), 4096);
+        assert_eq!(
+            wide_str.payload.as_ptr(),
+            big_string.as_ptr(),
+            "the payload must be borrowed, not copied into a buffer"
+        );
+
+        for probe in [
+            &b"0"[..],
+            b"127",
+            b"128",
+            b"4095",
+            b"32767",
+            b"8388607",
+            b"2147483647",
+            b"9223372036854775807",
+            b"-9223372036854775808",
+            b"",
+            b"abc",
+            b"007",
+            b"+5",
+        ] {
+            let e = encode_entry(probe);
+            assert!(
+                e.head_len <= LP_MAX_ENTRY_HEAD,
+                "head overflowed the bound for {:?}",
+                String::from_utf8_lossy(probe)
+            );
+            assert!(e.backlen_len <= LP_MAX_BACKLEN);
+        }
+    }
+
+    /// The stack-buffer backlen writer must agree with `encode_backlen`, the
+    /// allocating original kept as the oracle, and with `backlen_size`.
+    #[test]
+    fn backlen_writer_agrees_with_the_oracle() {
+        for n in [
+            0usize,
+            1,
+            126,
+            127,
+            128,
+            129,
+            16383,
+            16384,
+            16385,
+            2097151,
+            2097152,
+            usize::MAX,
+        ] {
+            let mut buf = [0u8; LP_MAX_BACKLEN];
+            let written = encode_backlen_into(n, &mut buf);
+            assert_eq!(
+                &buf[..written],
+                encode_backlen(n).as_slice(),
+                "encode_backlen_into disagreed with the oracle at entry_len={n}"
+            );
+            assert_eq!(written, backlen_size(n), "width disagreed at {n}");
+        }
+    }
+
+    /// Golden for `mutation_sequence_bytes_are_unchanged`'s 40-pair listpack.
+    const GOLDEN_PAIRS_40: &str = "79010000500082663003000182663103c3e80282663203c7d00282663303cbb80282663403cfa00282663503f188130382663603f170170382663703f1581b0382663803f1401f0382663903f12823038366313004f11027038366313104f1f82a038366313204f1e02e038366313304f1c832038366313404f1b036038366313504f1983a038366313604f1803e038366313704f16842038366313804f15046038366313904f1384a038366323004f1204e038366323104f10852038366323204f1f055038366323304f1d859038366323404f1c05d038366323504f1a861038366323604f19065038366323704f17869038366323804f1606d038366323904f14871038366333004f13075038366333104f11879038366333204f1007d038366333304f2e88000048366333404f2d08400048366333504f2b88800048366333604f2a08c00048366333704f2889000048366333804f27094000483663339049673616d652d77696474682d7265706c6163656d656e7417ff";
+}
+
+#[cfg(test)]
+mod one_walk_update_tests {
+    use super::*;
+
+    /// 64 member/score pairs, the shape a ZADD listpack actually holds:
+    /// `[member, score, member, score, ...]` with the scores rendered as
+    /// text and re-encoded as integers by the listpack.
+    fn zset_fixture() -> Listpack {
+        let mut lp = Listpack::new();
+        for i in 0..64 {
+            lp.push_back(format!("m{i:04}").as_bytes());
+            lp.push_back(format!("{}", i * 10).as_bytes());
+        }
+        lp
+    }
+
+    /// moon#942: the ZADD update shape must walk the listpack ONCE.
+    ///
+    /// `seek_to` is the only walk that starts at the head, so counting it is
+    /// the falsifiable form of "did this scan twice?". The shape this
+    /// replaces is measured first, in the same test, so the number has
+    /// something to be compared against -- a bare `assert_eq!(seeks, 0)`
+    /// would pass just as happily if the counter were never wired up.
+    #[test]
+    fn update_pair_value_does_not_walk_from_the_head_twice() {
+        let mut lp = zset_fixture();
+        let last: &[u8] = b"m0063";
+
+        // The shape moon#942 replaces: an ordinal from a borrowed walk, then
+        // `replace_at` walking back to that ordinal from the head.
+        let mark = head_seeks();
+        let idx = lp.find_pair_index(last).expect("member present");
+        lp.replace_at(idx * 2 + 1, b"111");
+        assert_eq!(
+            head_seeks() - mark,
+            1,
+            "the replaced shape is supposed to seek from the head exactly once"
+        );
+
+        let mark = head_seeks();
+        let out = lp.update_pair_value(last, |current| {
+            assert_eq!(
+                current.as_score(),
+                Some(111.0),
+                "the old value is handed in"
+            );
+            Some(&b"222"[..])
+        });
+        assert!(matches!(out, PairUpdate::Replaced(_)));
+        assert_eq!(
+            head_seeks() - mark,
+            0,
+            "update_pair_value must not walk from the head at all"
+        );
+        assert_eq!(lp.pair_value(last).and_then(|v| v.as_score()), Some(222.0));
+    }
+
+    /// One walk must produce the SAME BYTES as the two-walk shape it
+    /// replaces. Widening, narrowing and equal-width replacements are all
+    /// here, at the first pair, a middle one and the last one, because those
+    /// are three different tail moves at three different offsets.
+    #[test]
+    fn update_pair_value_agrees_with_the_two_walk_shape() {
+        for (field, new_value) in [
+            (&b"m0000"[..], &b"widen-to-a-much-longer-value"[..]),
+            (b"m0000", b"7"),
+            (b"m0031", b"310"),
+            (b"m0031", b"999999999999"),
+            (b"m0063", b"630"),
+            (b"m0063", b"0"),
+        ] {
+            let mut want = zset_fixture();
+            let mut got = zset_fixture();
+
+            let idx = want.find_pair_index(field).expect("member present");
+            want.replace_at(idx * 2 + 1, new_value);
+            assert!(matches!(
+                got.update_pair_value(field, |_| Some(new_value)),
+                PairUpdate::Replaced(_)
+            ));
+
+            assert_eq!(
+                got.data,
+                want.data,
+                "byte layout diverged replacing {}'s value with {}",
+                String::from_utf8_lossy(field),
+                String::from_utf8_lossy(new_value)
+            );
+        }
+    }
+
+    /// The three outcomes, and the edges where the pair arithmetic is
+    /// tightest: a single-pair listpack, the first pair, the last pair, an
+    /// absent field, and a VALUE that happens to spell a field name.
+    #[test]
+    fn update_pair_value_outcomes_and_edges() {
+        let mut solo = Listpack::new();
+        solo.push_back(b"solo");
+        solo.push_back(b"1");
+
+        assert!(matches!(
+            solo.update_pair_value(b"nope", |_| Some(&b"x"[..])),
+            PairUpdate::Absent
+        ));
+        // Declining must leave the bytes exactly as they were.
+        let before = solo.data.clone();
+        assert!(matches!(
+            solo.update_pair_value::<&[u8], _>(b"solo", |_| None),
+            PairUpdate::Unchanged
+        ));
+        assert_eq!(solo.data, before, "a declined update wrote to the buffer");
+        assert!(matches!(
+            solo.update_pair_value(b"solo", |_| Some(&b"2"[..])),
+            PairUpdate::Replaced(_)
+        ));
+        assert_eq!(
+            solo.pair_value(b"solo").map(|v| v.to_vec()),
+            Some(b"2".to_vec())
+        );
+        assert_eq!(solo.len(), 2, "the element count must not move");
+
+        // A lone field with no value is not a pair.
+        let mut lone = Listpack::new();
+        lone.push_back(b"lone");
+        assert!(matches!(
+            lone.update_pair_value(b"lone", |_| Some(&b"x"[..])),
+            PairUpdate::Absent
+        ));
+
+        // A VALUE equal to a field name must never be matched as a field.
+        let mut lp = Listpack::new();
+        lp.push_back(b"alpha");
+        lp.push_back(b"beta");
+        lp.push_back(b"gamma");
+        lp.push_back(b"delta");
+        assert!(matches!(
+            lp.update_pair_value(b"beta", |_| Some(&b"x"[..])),
+            PairUpdate::Absent
+        ));
+        assert!(matches!(
+            lp.update_pair_value(b"gamma", |_| Some(&b"epsilon"[..])),
+            PairUpdate::Replaced(_)
+        ));
+        assert_eq!(
+            lp.pair_value(b"gamma").map(|v| v.to_vec()),
+            Some(b"epsilon".to_vec())
+        );
+
+        // The replacement bytes come back out, which is how ZINCRBY replies
+        // without rendering the score a second time.
+        let mut lp = zset_fixture();
+        match lp.update_pair_value(b"m0007", |_| Some(&b"71"[..])) {
+            PairUpdate::Replaced(stored) => assert_eq!(stored, b"71"),
+            other => panic!("expected Replaced, got {other:?}"),
+        }
+    }
+
+    /// `replace_pair_value` is now `update_pair_value` with a constant
+    /// decision. It must still answer exactly as it did, on a hit and a miss.
+    #[test]
+    fn replace_pair_value_still_reports_presence() {
+        let mut lp = zset_fixture();
+        assert!(lp.replace_pair_value(b"m0000", b"1"));
+        assert!(lp.replace_pair_value(b"m0063", b"1"));
+        assert!(!lp.replace_pair_value(b"absent", b"1"));
+        // A value, not a field.
+        assert!(!lp.replace_pair_value(b"630", b"1"));
     }
 }
