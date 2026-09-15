@@ -171,8 +171,10 @@ vm() { # vm <shell-command> — run inside the moon-dev VM at the repo
 # `assert_both "ROLE on a master" ROLE` (grep it in test-consistency.sh -- a
 # line number here rots: this comment said :1719 while the row sat at :2155)
 # diffs byte-for-byte against the live redis-server oracle, and on pristine
-# main it is the ONLY other row that fails (re-measured 2026-09-15 after
-# moon#953: 769/770; the stale 457/458 predated ~300 added rows).
+# main it is the ONLY other row that fails. Do not pin a total here either:
+# the earlier 457/458 rotted once ~300 rows were added, and moon#942 added
+# more in the same week. What this waiver depends on is the COUNT OF FAILURES
+# being exactly one, which the gate checks directly -- not on any ratio.
 # Carved out by exact name, the same shape as the
 # `gate_is_skipped_with_spill_sender...` precedent in this campaign
 # (tmp/perf-campaign/CONTEXT.md §8): tolerated ONLY when it is the single
