@@ -258,6 +258,33 @@ assert_both "DECR twice" GET mut:counter
 both INCRBY mut:counter 50
 assert_both "INCRBY 50" GET mut:counter
 
+# INCR in place (moon#942). The SSO seam is where an in-place integer write is
+# most likely to be wrong: <=12 bytes live inline in the CompactValue, 13+ in a
+# Box<[u8]>, and the fast path has to cross that boundary in both directions.
+both SET mut:sso "999999999999"       # 12 bytes — inline
+both INCR mut:sso                      # 13 bytes — heap
+assert_both "INCR SSO inline->heap" GET mut:sso
+both DECR mut:sso                      # back to 12 — inline
+assert_both "INCR SSO heap->inline" GET mut:sso
+assert_both "OBJECT ENCODING after in-place INCR" OBJECT ENCODING mut:sso
+
+# An INCR that ERRORS must leave the stored value exactly where it was, and
+# must not be reported as a change. (The in-place path returns before it
+# writes; the rule is Redis's, not moon's.)
+both SET mut:ovf "9223372036854775807"
+assert_both "INCR overflow errors"        INCR mut:ovf
+assert_both "INCR overflow keeps value"   GET  mut:ovf
+both SET mut:uf "-9223372036854775808"
+assert_both "DECR underflow errors"       DECR mut:uf
+assert_both "DECR underflow keeps value"  GET  mut:uf
+both SET mut:word "abc"
+assert_both "INCR non-integer errors"     INCR mut:word
+assert_both "INCR non-integer keeps value" GET mut:word
+both DEL mut:incrwt
+both RPUSH mut:incrwt a b
+assert_both "INCR WRONGTYPE"              INCR   mut:incrwt
+assert_both "INCR WRONGTYPE keeps list"   LRANGE mut:incrwt 0 -1
+
 # INCRBYFLOAT (skip exact comparison — float formatting may differ)
 both SET mut:flt "10.5"
 both INCRBYFLOAT mut:flt "0.1"
@@ -406,6 +433,22 @@ assert_both "HGET large value" HGET h:test f_large
 both HDEL h:test f2
 assert_both "HDEL then HGET" HGET h:test f2
 assert_both "HLEN after HDEL" HLEN h:test
+
+# moon#942: an emptied hash must not outlive its last field, whatever ORDER
+# the fields were named in. moon tracked emptiness in a variable reassigned on
+# every iteration, so the emptiness the real removal reported was overwritten
+# by the `false` a later ABSENT field produced, and the key survived with zero
+# fields — `EXISTS` answered 1 on a hash redis had already deleted. The
+# removal-last spelling below is the control: it was always correct.
+both DEL h:empty:first
+both HSET h:empty:first only v
+assert_both "HDEL removal-first empties"   HDEL h:empty:first only absent
+assert_both "EXISTS after removal-first"   EXISTS h:empty:first
+assert_both "HLEN after removal-first"     HLEN h:empty:first
+both DEL h:empty:last
+both HSET h:empty:last only v
+assert_both "HDEL removal-last empties"    HDEL h:empty:last absent only
+assert_both "EXISTS after removal-last"    EXISTS h:empty:last
 
 both HINCRBY h:test counter 10
 assert_both "HINCRBY" HGET h:test counter
@@ -680,6 +723,30 @@ assert_both "OBJECT ENCODING after SREM (ident)"  OBJECT ENCODING s:sec:ident
 redis_sec_sm=$(redis-cli -p "$PORT_REDIS" SMEMBERS s:sec:ident 2>&1 | sort)
 rust_sec_sm=$(redis-cli -p "$PORT_RUST" SMEMBERS s:sec:ident 2>&1 | sort)
 assert_eq "SMEMBERS after SREM (sorted, byte-exact)" "$redis_sec_sm" "$rust_sec_sm"
+# moon#944: SADD's REPLY across `set-max-intset-entries` (512). moon's intset
+# push loop `break`s the instant the ceiling is crossed and the upgrade path
+# then discarded `insert`'s "was it new" bool, so every member positioned AFTER
+# the crossing was STORED but never COUNTED. Measured against redis 7.4.0: moon
+# replied 3 where redis replied 22. Nothing above probes this — every existing
+# encoding row crosses a threshold with a batch of ONE, and a one-member batch
+# has no tail past the crossing, which is exactly why the divergence went
+# unseen. The reply is what has to be compared: SCARD and SMEMBERS agreed all
+# along.
+both SADD s:intset:cross $(seq 0 509)
+assert_both "OBJECT ENCODING intset below the ceiling"   OBJECT ENCODING s:intset:cross
+assert_both "SADD straddling set-max-intset-entries"     SADD s:intset:cross $(seq 508 531)
+assert_both "SCARD after straddling SADD"                SCARD s:intset:cross
+assert_both "OBJECT ENCODING after straddling SADD"      OBJECT ENCODING s:intset:cross
+assert_both "SISMEMBER tail of the straddling batch"     SISMEMBER s:intset:cross 531
+# Straddle by ONE member past the crossing — the minimum tail that exposes it.
+both SADD s:intset:edge $(seq 0 510)
+assert_both "SADD straddling the ceiling by one member"  SADD s:intset:edge 511 512 513
+assert_both "SCARD after by-one straddle"                SCARD s:intset:edge
+# Control: the same shape entirely BELOW the ceiling must not move.
+both SADD s:intset:under $(seq 0 99)
+assert_both "SADD wholly below the intset ceiling"       SADD s:intset:under $(seq 98 109)
+assert_both "SCARD below the intset ceiling"             SCARD s:intset:under
+assert_both "OBJECT ENCODING below the intset ceiling"   OBJECT ENCODING s:intset:under
 # A container past the threshold must STILL promote — the fix must not disable
 # the policy it preserves.
 both SADD s:sec:big $(seq -f 'm%.0f' 1 129)
@@ -1176,10 +1243,26 @@ log "=== WATCH/CAS ==="
 # Both servers run the identical sequence and the outcomes are compared, so this
 # asserts Redis parity rather than a hardcoded expectation.
 watch_cas_outcome() {
-    local port="$1" conflict="$2" line=""
+    local port="$1" conflict="$2" line="" armed=""
     redis-cli -p "$port" SET cas:k base >/dev/null 2>&1 || true
-    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__"; return 0; }
-    printf 'WATCH cas:k\r\nMULTI\r\nSET cas:k from-txn\r\n' >&3
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED_p${port}__"; return 0; }
+    # WATCH must be ARMED before the interloper writes, and its reply is the only
+    # proof of that. Pipelining WATCH with MULTI/SET and writing immediately races
+    # a thread-per-core server: the interloper's write can reach the key's shard
+    # before the watch is registered there, so EXEC commits and this row fails
+    # intermittently (moon#953 -- measured 2/10 at shards=4, 0/10 once the client
+    # waits). Redis passes the pipelined form only by being single-threaded, so
+    # the old sequence asserted something stronger than the actual contract.
+    #
+    # An ECHO barrier cannot be used here the way it is after EXEC below: inside
+    # MULTI every command replies +QUEUED, so ECHO would never echo. WATCH's own
+    # +OK, read before MULTI is sent, is the barrier.
+    printf 'WATCH cas:k\r\n' >&3
+    IFS= read -r -t 5 armed <&3 || { exec 3>&-; echo "__WATCH_NO_REPLY_p${port}__"; return 0; }
+    if [[ "${armed%$'\r'}" != "+OK" ]]; then
+        exec 3>&-; echo "__WATCH_REFUSED_p${port}:${armed%$'\r'}__"; return 0
+    fi
+    printf 'MULTI\r\nSET cas:k from-txn\r\n' >&3
     if [[ "$conflict" == "yes" ]]; then
         redis-cli -p "$port" SET cas:k from-other >/dev/null 2>&1 || true
     fi
@@ -1203,10 +1286,17 @@ assert_eq "WATCH: unconflicted EXEC commits" \
 # WATCH had recorded and EXEC committed on a key that had been destroyed and
 # rebuilt underneath it.
 watch_cas_aba_outcome() {
-    local port="$1" line=""
+    local port="$1" line="" armed=""
     redis-cli -p "$port" SET aba:k base >/dev/null 2>&1 || true
-    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__"; return 0; }
-    printf 'WATCH aba:k\r\nMULTI\r\nSET aba:k from-txn\r\n' >&3
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED_p${port}__"; return 0; }
+    # Same barrier as watch_cas_outcome (moon#953): the DEL below only exercises
+    # the ABA hole if the watch is already armed when it lands.
+    printf 'WATCH aba:k\r\n' >&3
+    IFS= read -r -t 5 armed <&3 || { exec 3>&-; echo "__WATCH_NO_REPLY_p${port}__"; return 0; }
+    if [[ "${armed%$'\r'}" != "+OK" ]]; then
+        exec 3>&-; echo "__WATCH_REFUSED_p${port}:${armed%$'\r'}__"; return 0
+    fi
+    printf 'MULTI\r\nSET aba:k from-txn\r\n' >&3
     redis-cli -p "$port" DEL aba:k >/dev/null 2>&1 || true
     redis-cli -p "$port" SET aba:k rebuilt >/dev/null 2>&1 || true
     printf 'EXEC\r\nECHO cas-done\r\n' >&3

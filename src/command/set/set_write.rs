@@ -5,8 +5,9 @@ use std::collections::HashSet;
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::storage::db::{SetRef, Shape, set_member_cost, set_table_bytes};
-use crate::storage::entry::{Entry, boxed_payload_block};
+use crate::storage::db::{SetHandle, SetRef, Shape, set_member_cost, set_table_bytes};
+use crate::storage::entry::{Entry, SetValue, boxed_payload_block};
+use crate::storage::listpack::Listpack;
 
 use super::{collect_sets, parse_int};
 use crate::command::helpers::{err_wrong_args, extract_bytes};
@@ -37,10 +38,21 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("SADD"),
     };
 
-    // Check if all members are valid integers (for intset optimization)
+    // Check if all members are valid integers (for intset optimization).
+    //
+    // This pass answers a pure ROUTING question — does this batch belong in an
+    // intset? — and throws every parsed value away; the push loop below
+    // re-derives the ones it needs. `canonical_i64` was doing a UTF-8
+    // validation, an `i64` parse, an `itoa` render and a `memcmp` per member to
+    // produce a number nobody reads. `is_canonical_i64` returns the SAME
+    // verdict for every input from the bytes alone, pinned by differential
+    // tests against `canonical_i64` itself (`storage::numeric`) — including
+    // every moon#795 byte-transparency case, both `i64` boundaries digit by
+    // digit, and 200,000 randomised inputs. The routing decision does not
+    // move; only its cost does.
     let all_integers = args[1..].iter().all(|a| {
         extract_bytes(a)
-            .map(|b| try_parse_i64(b).is_some())
+            .map(|b| crate::storage::numeric::is_canonical_i64(b))
             .unwrap_or(false)
     });
     let member_count = args.len() - 1;
@@ -54,8 +66,17 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                 // `Intset::estimate_memory()` is O(1) (capacity-based).
                 let before = intset.estimate_memory();
                 let mut added = 0i64;
-                let mut needs_upgrade = false;
-                for arg in &args[1..] {
+                // Index into `args` of the first member the intset did NOT
+                // absorb — where the upgraded `IndexSet` has to resume.
+                // `None` means the whole batch fit and there is no upgrade.
+                let mut resume_at: Option<usize> = None;
+                for (i, arg) in args[1..].iter().enumerate() {
+                    // Neither skip below is reachable: the `all_integers` gate
+                    // above already proved that EVERY member of this batch is
+                    // a bulk frame holding a canonical integer. That is what
+                    // makes the tail boundary exact — no member is ever passed
+                    // over before `resume_at`, so everything before it is in
+                    // the intset and everything from it on is not.
                     if let Some(member) = extract_bytes(arg) {
                         let Some(val) = try_parse_i64(member) else {
                             continue;
@@ -64,7 +85,10 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                             added += 1;
                         }
                         if !limits.intset_fits(intset.len()) {
-                            needs_upgrade = true;
+                            // `args[1 + i]` is the member that tripped the
+                            // ceiling. It IS in the intset and IS counted, so
+                            // the unabsorbed tail starts one past it.
+                            resume_at = Some(i + 2);
                             break;
                         }
                     }
@@ -76,14 +100,34 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                 } else {
                     db.credit_memory(before - after);
                 }
-                if needs_upgrade {
+                if let Some(resume_at) = resume_at {
                     // One-time cost-model swing (intset -> HashSet) — see the
                     // matching comment in hash_write.rs's hset.
                     let set = db.upgrade_intset_to_set(key);
-                    // Re-add remaining members (some may already be in the set from intset)
-                    for arg in &args[1..] {
-                        if let Some(member) = extract_bytes(arg) {
-                            set.insert(member.clone());
+                    // moon#944: the REPLY is part of the contract. `added`
+                    // stopped at the `break`, so the tail has to keep counting
+                    // into it, and `IndexSet::insert`'s `bool` is the only
+                    // thing that says whether a member was new. Discarding it
+                    // under-reported every member past the crossing: measured
+                    // against redis 7.4.0 with `set-max-intset-entries 512`,
+                    // moon replied 3 for a batch that added 22, so the sum of
+                    // a client's SADD replies disagreed with `SCARD`.
+                    //
+                    // Only `args[resume_at..]` is walked. `args[1..resume_at]`
+                    // is already IN `set`: `Intset::to_set_value` renders each
+                    // value with `to_string`, and every value reached the
+                    // intset through `canonical_i64`, so that rendering is the
+                    // caller's exact bytes (moon#795). Re-walking the absorbed
+                    // prefix would be an O(batch) no-op that also spends one
+                    // `Bytes` clone per member for nothing — the clone that
+                    // survives below is the unavoidable ownership transfer of
+                    // a member that genuinely has to be stored, exactly as on
+                    // the standard path.
+                    for arg in &args[resume_at..] {
+                        if let Some(member) = extract_bytes(arg)
+                            && set.insert(member.clone())
+                        {
+                            added += 1;
                         }
                     }
                     // `boxed_payload_block`: the `IndexSet` the members move
@@ -94,9 +138,6 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                         + set.iter().map(|m| set_member_cost(m)).sum::<usize>();
                     db.credit_memory(after);
                     db.charge_memory(new_cost);
-                    // Recount: we need accurate count of new members
-                    // Since we already inserted into intset and then upgraded,
-                    // just count total unique members vs original
                     return Frame::Integer(added);
                 }
                 return Frame::Integer(added);
@@ -143,36 +184,13 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
             limits.fits(Shape::Set, members + 1, max_member.max(widest))
         };
         match db.get_or_create_set_listpack(key, absorb) {
-            Ok(Some(lp)) => {
-                let mut added = 0i64;
-                // Listpack `estimate_memory()` is O(1) (capacity-based), so a
-                // before/after snapshot is cheap — no per-element formula.
-                let before = lp.estimate_memory();
-                for arg in &args[1..] {
-                    // Same skip the standard path below applies. A non-bulk
-                    // frame is never an error from INSIDE this loop: that
-                    // would return from the `before … adjust_memory` window
-                    // with members already pushed and never charged — the
-                    // moon#814 shape — and moon#823 closed the only source
-                    // of such a frame at the Lua boundary anyway.
-                    let Some(member) = extract_bytes(arg) else {
-                        continue;
-                    };
-                    // Borrowed scan: `contains_element` compares against each
-                    // entry in place. The owning `iter().any(as_bytes ==)`
-                    // shape allocated one `Vec` per entry walked — the exact
-                    // lookup moon#801 removed — so it must not come back here.
-                    if !lp.contains_element(member) {
-                        lp.push_back(member);
-                        added += 1;
-                    }
-                }
-                let after = lp.estimate_memory();
+            Ok(SetHandle::Listpack(lp)) => {
+                let pushed = sadd_push_listpack(lp, args);
                 // The upgrade check, from the same authority as the gate.
                 let should_upgrade = !limits.listpack_fits(Shape::Set, lp);
                 // `lp`'s borrow of `db` ends here — safe to call back into
                 // `db` for accounting from this point on.
-                db.adjust_memory(before, after);
+                db.adjust_memory(pushed.before, pushed.after);
                 if should_upgrade {
                     // One-time cost-model swing (listpack -> IndexSet). The
                     // accessor bills it itself through `SetKind::upgrade`, so
@@ -181,39 +199,130 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                     // guess that under-counts the whole table.
                     db.upgrade_set_listpack_to_set(key);
                 }
-                return Frame::Integer(added);
+                return Frame::Integer(pushed.added);
             }
-            // Already an IndexSet or a SetIntset: fall through.
-            Ok(None) => {}
+            // Already an `IndexSet`, or a `SetIntset` the absorb refused and
+            // the accessor promoted. moon#942: this used to be `Ok(None)`
+            // falling through to `get_or_create_set`, which re-ran the whole
+            // accessor skeleton on the key this call already had in hand —
+            // two DashTable probes for a classification one probe old, paid
+            // on the ~61% of benchmark keys that are hashtables.
+            Ok(SetHandle::Full(set)) => {
+                let pushed = sadd_push_full(set, args);
+                return sadd_bill_full(db, pushed);
+            }
             Err(e) => return e, // WRONGTYPE
         }
     }
 
-    // Standard path: get_or_create_set (creates HashSet, upgrades compact encodings)
+    // Standard path: the batch itself is too big (or its longest member too
+    // long) for the listpack policy, so the gate above was never entered.
     let set = match db.get_or_create_set(key) {
         Ok(s) => s,
         Err(e) => return e,
     };
+    let pushed = sadd_push_full(set, args);
+    sadd_bill_full(db, pushed)
+}
+
+/// What one `SADD` push loop against a listpack did, in the units the ledger
+/// needs.
+///
+/// A named struct rather than a tuple because `before` and `after` are the
+/// same type and the caller feeds them to `adjust_memory` in order: a
+/// transposition compiles, reverses the sign of every listpack charge, and is
+/// caught only by the ledger recount. `#[must_use]` for the moon#814 reason —
+/// a `Pushed*` that is never billed is a charge stranded on a branch.
+#[must_use]
+struct PushedListpack {
+    added: i64,
+    before: usize,
+    after: usize,
+}
+
+/// The `SADD` push loop against a listpack, on a handle the caller already
+/// holds.
+///
+/// `estimate_memory()` is O(1) (capacity-based), so the before/after snapshot
+/// is cheap — no per-element formula.
+fn sadd_push_listpack(lp: &mut Listpack, args: &[Frame]) -> PushedListpack {
+    let before = lp.estimate_memory();
     let mut added = 0i64;
-    let mut mem_delta: usize = 0;
-    // moon#788: the `IndexSet`'s own entries `Vec` and index table are charged
-    // from their REAL capacity, snapshotted around the mutation (O(1), two
-    // `capacity()` reads) — the same pattern the listpack/intset paths use.
-    // A per-member constant cannot model a doubling table.
+    for arg in &args[1..] {
+        // Same skip the full path applies. A non-bulk frame is never an error
+        // from INSIDE this loop: that would return from the
+        // `before … adjust_memory` window with members already pushed and
+        // never charged — the moon#814 shape — and moon#823 closed the only
+        // source of such a frame at the Lua boundary anyway.
+        let Some(member) = extract_bytes(arg) else {
+            continue;
+        };
+        // Borrowed scan: `contains_element` compares against each entry in
+        // place. The owning `iter().any(as_bytes ==)` shape allocated one
+        // `Vec` per entry walked — the exact lookup moon#801 removed — so it
+        // must not come back here.
+        if !lp.contains_element(member) {
+            lp.push_back(member);
+            added += 1;
+        }
+    }
+    PushedListpack {
+        added,
+        before,
+        after: lp.estimate_memory(),
+    }
+}
+
+/// What one `SADD` push loop against the full `IndexSet` did, in the units the
+/// ledger needs. Carried out of the borrow so the billing can call back into
+/// `db` (moon#942: the push now happens under EITHER accessor, and the two
+/// must bill identically or the ledger depends on which one ran).
+///
+/// `#[must_use]` for the moon#814 reason: a `Pushed*` that is never handed to
+/// [`sadd_bill_full`] is members inserted into the keyspace whose charge never
+/// reached `used_memory`.
+#[must_use]
+struct PushedFull {
+    added: i64,
+    /// Bytes for the members that were genuinely new.
+    member_bytes: usize,
+    table_before: usize,
+    table_after: usize,
+}
+
+/// The `SADD` push loop against the full `IndexSet`, on a handle the caller
+/// already holds.
+///
+/// moon#788: the `IndexSet`'s own entries `Vec` and index table are charged
+/// from their REAL capacity, snapshotted around the mutation (O(1), two
+/// `capacity()` reads) — the same pattern the listpack/intset paths use. A
+/// per-member constant cannot model a doubling table.
+fn sadd_push_full(set: &mut SetValue, args: &[Frame]) -> PushedFull {
     let table_before = set_table_bytes(set);
+    let mut added = 0i64;
+    let mut member_bytes: usize = 0;
     for arg in &args[1..] {
         if let Some(member) = extract_bytes(arg) {
             if set.insert(member.clone()) {
                 added += 1;
-                mem_delta += set_member_cost(member);
+                member_bytes += set_member_cost(member);
             }
         }
     }
-    let table_after = set_table_bytes(set);
-    // `set`'s borrow of `db` ends above.
-    db.charge_memory(mem_delta);
-    db.adjust_memory(table_before, table_after);
-    Frame::Integer(added)
+    PushedFull {
+        added,
+        member_bytes,
+        table_before,
+        table_after: set_table_bytes(set),
+    }
+}
+
+/// Apply a [`PushedFull`] to the ledger and build the reply. Called once the
+/// handle's borrow of `db` has ended.
+fn sadd_bill_full(db: &mut Database, pushed: PushedFull) -> Frame {
+    db.charge_memory(pushed.member_bytes);
+    db.adjust_memory(pushed.table_before, pushed.table_after);
+    Frame::Integer(pushed.added)
 }
 
 // ---------------------------------------------------------------------------
@@ -338,11 +447,14 @@ fn srem_eager(db: &mut Database, key: &Bytes, args: &[Frame]) -> Frame {
 fn srem_listpack(db: &mut Database, key: &Bytes, args: &[Frame]) -> Frame {
     let limits = db.encoding_limits();
     let lp = match db.get_or_create_set_listpack(key, |_, _| false) {
-        Ok(Some(lp)) => lp,
+        Ok(SetHandle::Listpack(lp)) => lp,
         // The probe said listpack; anything else means the value changed
         // between the probe and here, which one shard thread cannot do. Fall
-        // back to the eager path rather than assume.
-        Ok(None) => return srem_eager(db, key, args),
+        // back to the eager path rather than assume. (`srem_eager` re-enters
+        // `get_or_create_set`, which is a no-op upgrade on the handle this
+        // accessor already promoted — an extra probe pair on a branch that
+        // cannot be reached, not on the hot path.)
+        Ok(SetHandle::Full(_)) => return srem_eager(db, key, args),
         Err(e) => return e,
     };
     // Listpack `estimate_memory()` is O(1) (capacity-based), so a before/after
