@@ -11,6 +11,7 @@ mod tests {
     use crate::framevec;
     use crate::protocol::Frame;
     use crate::storage::Database;
+    use crate::storage::db::Shape;
 
     use super::*;
 
@@ -2473,5 +2474,359 @@ mod tests {
                  ({running} B running vs {recomputed} B recomputed)"
             );
         }
+    }
+
+    // ── moon#942: the hash write path's duplicated work ─────────────────
+
+    #[test]
+    fn hdel_deletes_the_key_when_the_last_field_goes_in_any_argument_order() {
+        // `hdel` tracked emptiness in `last_was_empty`, assigned on EVERY
+        // iteration — including the ones that removed nothing. So the
+        // emptiness observed when the last real field went was overwritten
+        // by the `false` a later, absent field reported, and the key
+        // survived as a hash with zero fields. `EXISTS h` then answers 1 on
+        // a hash Redis has already deleted, and the empty container is
+        // written to the AOF and shipped to replicas.
+        //
+        // The removal-last ordering is the control: it passed before this
+        // fix and must keep passing after it.
+        for (name, argv) in [
+            ("removal first", [b"h".as_ref(), b"only", b"absent"]),
+            ("removal last", [b"h".as_ref(), b"absent", b"only"]),
+        ] {
+            let mut db = Database::new();
+            hset(&mut db, &make_args(&[b"h", b"only", b"v"]));
+            assert_eq!(
+                hdel(&mut db, &make_args(&argv)),
+                Frame::Integer(1),
+                "{name}: exactly one field existed to remove"
+            );
+            assert_eq!(
+                hlen(&mut db, &make_args(&[b"h"])),
+                Frame::Integer(0),
+                "{name}: the hash must report zero fields"
+            );
+            assert_eq!(
+                crate::command::key::exists(&mut db, &make_args(&[b"h"])),
+                Frame::Integer(0),
+                "{name}: an emptied hash must not leave its key behind"
+            );
+        }
+    }
+
+    #[test]
+    fn hdel_across_the_listpack_and_hashtable_encodings_is_identical() {
+        // The collapse rewrites the loop that drives both encodings. Run the
+        // same batch against a compact hash and a full `HashMap` one and
+        // require the same reply, the same survivors and the same key
+        // lifetime.
+        for fields in [4usize, 400usize] {
+            let mut db = Database::new();
+            let mut seed: Vec<&[u8]> = vec![b"h"];
+            let owned: Vec<(Vec<u8>, Vec<u8>)> = (0..fields)
+                .map(|i| {
+                    (
+                        format!("field-{i}").into_bytes(),
+                        format!("value-{i}").into_bytes(),
+                    )
+                })
+                .collect();
+            for (f, v) in &owned {
+                seed.push(f);
+                seed.push(v);
+            }
+            assert_eq!(
+                hset(&mut db, &make_args(&seed)),
+                Frame::Integer(fields as i64)
+            );
+
+            assert_eq!(
+                hdel(
+                    &mut db,
+                    &make_args(&[b"h", b"field-0", b"nope", b"field-1", b"field-0"])
+                ),
+                Frame::Integer(2),
+                "{fields} fields: a repeated field counts once and an absent \
+                 one counts zero"
+            );
+            assert_eq!(
+                hlen(&mut db, &make_args(&[b"h"])),
+                Frame::Integer(fields as i64 - 2),
+                "{fields} fields: wrong survivor count"
+            );
+            assert_eq!(
+                hget(&mut db, &make_args(&[b"h", b"field-2"])),
+                Frame::BulkString(Bytes::from_static(b"value-2")),
+                "{fields} fields: an untouched field changed"
+            );
+        }
+    }
+
+    #[test]
+    fn hdel_on_a_wrongtype_key_errors_before_it_removes_anything() {
+        let mut db = Database::new();
+        db.set(
+            b"str",
+            crate::storage::entry::Entry::new_string(Bytes::from_static(b"v")),
+        );
+        match hdel(&mut db, &make_args(&[b"str", b"f"])) {
+            Frame::Error(e) => assert!(
+                e.starts_with(b"WRONGTYPE"),
+                "expected WRONGTYPE, got {:?}",
+                String::from_utf8_lossy(&e)
+            ),
+            other => panic!("expected WRONGTYPE, got {other:?}"),
+        }
+        assert!(
+            db.data().get(b"str").is_some(),
+            "a rejected HDEL must not remove the key"
+        );
+    }
+
+    #[test]
+    fn hdel_on_a_missing_key_answers_zero_and_creates_nothing() {
+        let mut db = Database::new();
+        let before = db.estimated_memory();
+        assert_eq!(
+            hdel(&mut db, &make_args(&[b"ghost", b"f"])),
+            Frame::Integer(0)
+        );
+        assert!(
+            db.data().get(b"ghost").is_none(),
+            "HDEL must never fabricate a container"
+        );
+        assert_eq!(before, db.estimated_memory(), "HDEL on a miss cost bytes");
+    }
+
+    #[test]
+    fn hincrby_on_a_listpack_round_trips_every_value_shape() {
+        // The safety net for routing HINCRBY's listpack arm through
+        // `Listpack::update_pair_value` — the ONE-scan primitive — instead of
+        // `pair_value` followed by `replace_pair_value`, which located the
+        // same field twice. The behaviours that must not move are every arm
+        // of the value classification the first scan used to make.
+        //
+        // (a) absent field -> treated as 0 and appended.
+        let mut db = Database::new();
+        assert_eq!(
+            hincrby(&mut db, &make_args(&[b"h", b"n", b"5"])),
+            Frame::Integer(5)
+        );
+        // (b) integer-encoded entry (moon#795: canonical spellings only).
+        assert_eq!(
+            hincrby(&mut db, &make_args(&[b"h", b"n", b"-7"])),
+            Frame::Integer(-2)
+        );
+        assert_eq!(
+            hget(&mut db, &make_args(&[b"h", b"n"])),
+            Frame::BulkString(Bytes::from_static(b"-2"))
+        );
+        // (c) a STRING entry holding a non-canonical integer spelling. HSET
+        //     stores the caller's bytes verbatim, so `007` is a `Str` entry
+        //     that must still parse.
+        hset(&mut db, &make_args(&[b"h", b"pad", b"007"]));
+        assert_eq!(
+            hincrby(&mut db, &make_args(&[b"h", b"pad", b"1"])),
+            Frame::Integer(8)
+        );
+        assert_eq!(
+            hget(&mut db, &make_args(&[b"h", b"pad"])),
+            Frame::BulkString(Bytes::from_static(b"8")),
+            "the stored value is re-rendered canonically"
+        );
+        // (d) a STRING entry that is not an integer at all.
+        hset(&mut db, &make_args(&[b"h", b"txt", b"abc"]));
+        match hincrby(&mut db, &make_args(&[b"h", b"txt", b"1"])) {
+            Frame::Error(e) => assert_eq!(&e[..], b"ERR hash value is not an integer"),
+            other => panic!("expected the not-an-integer error, got {other:?}"),
+        }
+        assert_eq!(
+            hget(&mut db, &make_args(&[b"h", b"txt"])),
+            Frame::BulkString(Bytes::from_static(b"abc")),
+            "a rejected HINCRBY must leave the value alone"
+        );
+        // (e) the hash is still compact — moon#897's whole point.
+        assert!(
+            matches!(
+                db.data().get(b"h").map(|e| e.value.as_redis_value()),
+                Some(crate::storage::compact_value::RedisValueRef::HashListpack(
+                    _
+                ))
+            ),
+            "HINCRBY must not flatten a small hash (moon#897)"
+        );
+        // (f) the ledger still agrees with a fresh walk.
+        let running = db.estimated_memory();
+        db.recalculate_memory();
+        assert_eq!(running, db.estimated_memory(), "ledger drifted — moon#788");
+    }
+
+    #[test]
+    fn hset_and_hmset_refuse_a_non_argument_shaped_frame_before_writing() {
+        // moon#823, re-pinned because the fused argument walk this branch
+        // introduces folds the `all_args_are_bytes` pre-pass into the same
+        // loop that measures the longest element. Both walks ran over
+        // `args[1..]` and both must still refuse BEFORE the mutation window
+        // opens — a partial write is applied on the master and, because
+        // propagation is gated on the reply not being an error, never
+        // reaches the AOF or a replica.
+        for bad_at in [1usize, 2, 3] {
+            let mut db = Database::new();
+            let mut args = make_args(&[b"h", b"f1", b"v1", b"f2", b"v2"]);
+            args[bad_at] = Frame::Integer(7);
+            match hset(&mut db, &args) {
+                Frame::Error(e) => assert!(
+                    e.starts_with(b"ERR wrong number of arguments"),
+                    "bad_at={bad_at}: got {:?}",
+                    String::from_utf8_lossy(&e)
+                ),
+                other => panic!("bad_at={bad_at}: expected an error, got {other:?}"),
+            }
+            assert!(
+                db.data().get(b"h").is_none(),
+                "bad_at={bad_at}: HSET wrote part of a refused command"
+            );
+
+            let mut db = Database::new();
+            let mut args = make_args(&[b"h", b"f1", b"v1", b"f2", b"v2"]);
+            args[bad_at] = Frame::Integer(7);
+            match hmset(&mut db, &args) {
+                Frame::Error(_) => {}
+                other => panic!("bad_at={bad_at}: expected an error, got {other:?}"),
+            }
+            assert!(
+                db.data().get(b"h").is_none(),
+                "bad_at={bad_at}: HMSET wrote part of a refused command"
+            );
+        }
+    }
+
+    #[test]
+    fn hset_still_gates_on_the_longest_element_in_the_batch() {
+        // The fused walk computes `max_elem` in the same pass that validates.
+        // The element that decides the gate is the LONGEST one anywhere in
+        // `args[1..]` — a long VALUE counts, not only a long field, and its
+        // position in the batch must not matter.
+        let limits = Database::new().encoding_limits();
+        let long = vec![b'x'; limits.max_value(Shape::Hash) + 1];
+
+        // Both commands fuse the walk, so both are exercised — and the
+        // over-long element sits FIRST in one case and LAST in the other, so
+        // a walk that keeps only the element it saw most recently fails here.
+        for pos in ["field", "value"] {
+            for cmd in ["HSET", "HMSET"] {
+                let mut db = Database::new();
+                let args = if pos == "field" {
+                    make_args(&[b"h", &long, b"v", b"f2", b"v2"])
+                } else {
+                    make_args(&[b"h", b"f1", b"v1", b"f2", &long])
+                };
+                if cmd == "HSET" {
+                    assert_eq!(hset(&mut db, &args), Frame::Integer(2));
+                } else {
+                    assert!(matches!(hmset(&mut db, &args), Frame::SimpleString(_)));
+                }
+                assert!(
+                    matches!(
+                        db.data().get(b"h").map(|e| e.value.as_redis_value()),
+                        Some(crate::storage::compact_value::RedisValueRef::Hash(_))
+                    ),
+                    "{cmd}: an over-long {pos} anywhere in the batch must \
+                     refuse the compact form (moon#896)"
+                );
+            }
+        }
+
+        // And the control: every element at the threshold stays compact.
+        let at_limit = vec![b'x'; limits.max_value(Shape::Hash)];
+        let mut db = Database::new();
+        assert_eq!(
+            hset(&mut db, &make_args(&[b"h", b"f1", &at_limit])),
+            Frame::Integer(1)
+        );
+        assert!(
+            matches!(
+                db.data().get(b"h").map(|e| e.value.as_redis_value()),
+                Some(crate::storage::compact_value::RedisValueRef::HashListpack(
+                    _
+                ))
+            ),
+            "the bound is inclusive (moon#896)"
+        );
+    }
+
+    #[test]
+    fn hdel_recomputes_the_ttl_minimum_across_a_multi_field_batch() {
+        // The subtlest thing the HDEL collapse moved (moon#942). The
+        // per-field spelling recomputed `min_expiry_ms` inside every call
+        // that removed the field currently holding the minimum, so a batch
+        // recomputed it once per such field. The batch now sets a flag and
+        // recomputes ONCE, over the sidecar as it stands at the end.
+        //
+        // (a) the field holding the min goes, others survive.
+        let mut db = Database::new();
+        seed_hash(
+            &mut db,
+            b"h",
+            &[(b"f1", b"v1"), (b"f2", b"v2"), (b"f3", b"v3")],
+        );
+        db.set_cached_now_ms_for_test(0);
+        for (ts, f) in [
+            (&b"1000"[..], &b"f1"[..]),
+            (b"5000", b"f2"),
+            (b"9000", b"f3"),
+        ] {
+            hpexpireat(&mut db, &make_args(&[b"h", ts, b"FIELDS", b"1", f]));
+        }
+        assert_eq!(db.hash_min_expiry_ms_for_test(b"h"), Some(1000));
+
+        // One batch removes the min holder AND a field that is not the min.
+        assert_eq!(
+            hdel(&mut db, &make_args(&[b"h", b"f1", b"f3"])),
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            db.hash_min_expiry_ms_for_test(b"h"),
+            Some(5000),
+            "the minimum must be recomputed from what SURVIVED the batch, not \
+             from the state after the first removal"
+        );
+
+        // (b) removing every TTL'd field downgrades the encoding back to a
+        //     plain `Hash`, exactly once, and leaves the untouched field.
+        let mut db = Database::new();
+        seed_hash(
+            &mut db,
+            b"h",
+            &[(b"f1", b"v1"), (b"f2", b"v2"), (b"keep", b"v")],
+        );
+        db.set_cached_now_ms_for_test(0);
+        for (ts, f) in [(&b"1000"[..], &b"f1"[..]), (b"5000", b"f2")] {
+            hpexpireat(&mut db, &make_args(&[b"h", ts, b"FIELDS", b"1", f]));
+        }
+        assert!(db.hash_min_expiry_ms_for_test(b"h").is_some());
+        assert_eq!(
+            hdel(&mut db, &make_args(&[b"h", b"f1", b"f2"])),
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            db.hash_min_expiry_ms_for_test(b"h"),
+            None,
+            "the last per-field TTL going must downgrade `HashWithTtl` back to \
+             a plain `Hash` (moon#861)"
+        );
+        assert_eq!(
+            hget(&mut db, &make_args(&[b"h", b"keep"])),
+            Frame::BulkString(Bytes::from_static(b"v")),
+            "the untouched field must survive the downgrade"
+        );
+        let running = db.estimated_memory();
+        db.recalculate_memory();
+        assert_eq!(
+            running,
+            db.estimated_memory(),
+            "the sidecar box credit went missing across the batch downgrade \
+             (moon#788/moon#861)"
+        );
     }
 }

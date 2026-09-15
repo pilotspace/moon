@@ -2,6 +2,7 @@ use bytes::Bytes;
 
 use crate::protocol::Frame;
 use crate::storage::Database;
+use crate::storage::db::IncrOutcome;
 use crate::storage::entry::{Entry, current_time_ms};
 
 use super::{format_float, parse_f64, parse_i64, parse_positive_i64};
@@ -376,8 +377,56 @@ pub fn decrby(db: &mut Database, args: &[Frame]) -> Frame {
     incrby_internal(db, key, neg)
 }
 
+const ERR_NOT_INTEGER: &[u8] = b"ERR value is not an integer or out of range";
+const ERR_INCR_OVERFLOW: &[u8] = b"ERR increment or decrement would overflow";
+const ERR_WRONGTYPE: &[u8] = b"WRONGTYPE Operation against a key holding the wrong kind of value";
+
 /// Internal helper for INCR/DECR/INCRBY/DECRBY.
+///
+/// moon#942: the common case — a counter that is already hot, already a
+/// string, and already an `i64` — is mutated **in place**
+/// ([`Database::incr_string`]), the way Redis's `incrDecrCommand` rewrites
+/// `o->ptr`. That is one `DashTable` probe against the three the `get` + `set`
+/// pair below costs, and it rebuilds no `Entry`. An absent counter is created
+/// there too, for two probes, once the cold tier and the in-flight spill plane
+/// have both been ruled out. The storage method owns every side effect
+/// `Database::set` would have had; see `src/storage/db/incr.rs` for the
+/// enumeration and the per-item decision.
+///
+/// What still falls through to [`incrby_general`] ([`IncrOutcome::NotHot`]):
+/// a TTL-expired key, whose `note_lazy_expired` bookkeeping lives in
+/// `Database::get`, and a key that was just promoted back out of the cold tier
+/// or the spill plane, whose real value has to be re-read.
 fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
+    match db.incr_string(key, delta) {
+        IncrOutcome::Applied(new_val) => {
+            // "incrby", not "incr": Redis names the internal operation, not
+            // the command the client typed, so INCR/DECR/INCRBY/DECRBY all
+            // report this.
+            crate::notify::notify_keyspace_event(
+                crate::notify::NotifyFlags::STRING,
+                "incrby",
+                key,
+                db.db_index,
+            );
+            Frame::Integer(new_val)
+        }
+        IncrOutcome::NotInteger => Frame::Error(Bytes::from_static(ERR_NOT_INTEGER)),
+        IncrOutcome::WrongType => Frame::Error(Bytes::from_static(ERR_WRONGTYPE)),
+        IncrOutcome::Overflow => Frame::Error(Bytes::from_static(ERR_INCR_OVERFLOW)),
+        IncrOutcome::NotHot => incrby_general(db, key, delta),
+    }
+}
+
+/// The general INCR path: key creation, cold-tier promotion, in-flight-spill
+/// rehydration and lazy-expiry bookkeeping all live behind `Database::get`,
+/// and the write is a whole-`Entry` replacement through `Database::set`.
+///
+/// Reached only when [`Database::incr_string`] declined
+/// ([`IncrOutcome::NotHot`]): the key is present but TTL-expired, or it has
+/// just been promoted back into hot RAM from the cold tier or the in-flight
+/// spill plane and its real value has to be re-read.
+fn incrby_general(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
     // Get current value and existing expiry
     let (current, existing_expiry_ms) = match db.get(key) {
         Some(entry) => {
@@ -387,24 +436,18 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
                     let s = match std::str::from_utf8(v) {
                         Ok(s) => s,
                         Err(_) => {
-                            return Frame::Error(Bytes::from_static(
-                                b"ERR value is not an integer or out of range",
-                            ));
+                            return Frame::Error(Bytes::from_static(ERR_NOT_INTEGER));
                         }
                     };
                     match s.parse::<i64>() {
                         Ok(n) => (n, expiry),
                         Err(_) => {
-                            return Frame::Error(Bytes::from_static(
-                                b"ERR value is not an integer or out of range",
-                            ));
+                            return Frame::Error(Bytes::from_static(ERR_NOT_INTEGER));
                         }
                     }
                 }
                 None => {
-                    return Frame::Error(Bytes::from_static(
-                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ));
+                    return Frame::Error(Bytes::from_static(ERR_WRONGTYPE));
                 }
             }
         }
@@ -414,9 +457,7 @@ fn incrby_internal(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
     let new_val = match current.checked_add(delta) {
         Some(v) => v,
         None => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR increment or decrement would overflow",
-            ));
+            return Frame::Error(Bytes::from_static(ERR_INCR_OVERFLOW));
         }
     };
 
@@ -511,10 +552,18 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
 
     let formatted = format_float(result);
 
+    // moon#942: the entry is built from the rendered BYTES, not from a second
+    // copy of them. `formatted.clone()` allocated a whole second `String` per
+    // call so that one could go into the `Entry` and one into the reply — and
+    // the `Entry` then copied out of it and dropped it again immediately: a
+    // result of <= 12 bytes inlines into `CompactValue`'s SSO payload, so for
+    // every ordinary counter the allocation was never even the storage.
+    // Handing the slice over keeps the one `String` for the reply, which moves
+    // into `Bytes` below without copying.
     let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(Bytes::from(formatted.clone()), existing_expiry_ms)
+        Entry::new_string_from_slice_with_expiry(formatted.as_bytes(), existing_expiry_ms)
     } else {
-        Entry::new_string(Bytes::from(formatted.clone()))
+        Entry::new_string_from_slice(formatted.as_bytes())
     };
     entry.set_last_access(db.now());
     entry.set_access_counter(5);

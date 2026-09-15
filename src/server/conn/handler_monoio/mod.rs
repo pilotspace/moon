@@ -3405,12 +3405,30 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
 
                         // Blocking wakeup: re-borrow db by index (NLL)
-                        if !is_error {
-                            // moon#595: shared with the SPSC sites. This gate
-                            // used to omit XADD, so a stream reader blocked on
-                            // a key THIS shard owns was never woken by a local
-                            // write — while the same XADD arriving over SPSC
-                            // woke it. Routing-dependent, so it read as a flake.
+                        //
+                        // moon#942: the gate is `producer_family` — the SAME
+                        // predicate `wake_producer` opens with — asked BEFORE
+                        // the guard rather than inside it. `producer_family`
+                        // needs only the command NAME, so the exclusive guard
+                        // below was previously acquired on every successful
+                        // write merely to discover there was nothing to wake:
+                        // it returns `None` for `INCR`, `SADD` and `HSET`,
+                        // three of the five families moon#942 targets. The set
+                        // of `wake_producer` calls is unchanged; only the
+                        // no-op guard acquisitions are gone.
+                        //
+                        // It MUST stay `producer_family` and must never become
+                        // a hand-written list of command names. A gate that
+                        // disagrees with `wake_producer`'s own is a lost
+                        // wakeup that depends on which shard owns the key, so
+                        // it reads as a flake rather than as a bug — that is
+                        // moon#595 (this gate omitted XADD, so a stream reader
+                        // blocked on a key THIS shard owns was never woken by
+                        // a local write, while the same XADD arriving over
+                        // SPSC woke it) and moon#623 (ten open-coded copies of
+                        // the same test, two of which disagreed). Pinned by
+                        // `tests/wakeup_local_write_gate.rs` at 1 and 4 shards.
+                        if !is_error && crate::blocking::wakeup::producer_family(cmd).is_some() {
                             // L4: fresh guard on the POST-dispatch db (a
                             // queued SELECT may have moved it). The write-path
                             // guard above was dropped after `dispatch`, so
