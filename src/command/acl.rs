@@ -145,7 +145,9 @@ pub fn handle_acl(
                         .collect();
                     let commands = match &user.allowed_commands {
                         CommandPermissions::AllAllowed => "+@all".to_string(),
-                        CommandPermissions::Specific { allowed, denied } => {
+                        CommandPermissions::Specific {
+                            allowed, denied, ..
+                        } => {
                             let mut parts = vec!["-@all".to_string()];
                             let mut allowed_sorted: Vec<&String> = allowed.iter().collect();
                             allowed_sorted.sort();
