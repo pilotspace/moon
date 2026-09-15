@@ -892,6 +892,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`scripts/test-consistency.sh`: the WATCH/CAS rows no longer race moon's shard
+  dispatch (moon#953).** `watch_cas_outcome` and `watch_cas_aba_outcome` pipelined
+  `WATCH` with `MULTI`/`SET` and then wrote from a second connection *without ever
+  reading `WATCH`'s `+OK`*, so on a thread-per-core server the interloper's write
+  could reach the key's shard before the watch was registered there — and `EXEC`
+  committed. Measured at `--shards 4` against a redis 8.6.1 oracle: **2/10 wrong
+  at delay 0, 0/10 once the client waits**. Redis passes the pipelined form only
+  by being single-threaded, so the row asserted something stronger than the
+  contract its own comment documents. The fix reads `WATCH`'s reply before `MULTI`
+  is sent; an `ECHO` barrier cannot be used there, because after `MULTI` every
+  command replies `+QUEUED` and the ECHO never echoes (`exec_abort_reply_type`
+  already drained its acks and is the in-file precedent). Proved non-vacuous by
+  mutation: swapping the setup command for `PING` — same round trips, nothing
+  armed — flips the conflicting case from abort to commit, and the outcome still
+  varies with `conflict` itself, 10/10 unanimous per cell on both engines.
+  Failure sentinels now interpolate the port, so a double failure can no longer
+  pass `assert_eq` vacuously.
 - **`SADD` under-reported its reply when one batch crossed
   `set-max-intset-entries` (moon#944).** The intset push loop `break`s the
   instant the ceiling is crossed, and the upgrade path then re-inserted the

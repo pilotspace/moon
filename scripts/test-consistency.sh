@@ -1243,10 +1243,26 @@ log "=== WATCH/CAS ==="
 # Both servers run the identical sequence and the outcomes are compared, so this
 # asserts Redis parity rather than a hardcoded expectation.
 watch_cas_outcome() {
-    local port="$1" conflict="$2" line=""
+    local port="$1" conflict="$2" line="" armed=""
     redis-cli -p "$port" SET cas:k base >/dev/null 2>&1 || true
-    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__"; return 0; }
-    printf 'WATCH cas:k\r\nMULTI\r\nSET cas:k from-txn\r\n' >&3
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED_p${port}__"; return 0; }
+    # WATCH must be ARMED before the interloper writes, and its reply is the only
+    # proof of that. Pipelining WATCH with MULTI/SET and writing immediately races
+    # a thread-per-core server: the interloper's write can reach the key's shard
+    # before the watch is registered there, so EXEC commits and this row fails
+    # intermittently (moon#953 -- measured 2/10 at shards=4, 0/10 once the client
+    # waits). Redis passes the pipelined form only by being single-threaded, so
+    # the old sequence asserted something stronger than the actual contract.
+    #
+    # An ECHO barrier cannot be used here the way it is after EXEC below: inside
+    # MULTI every command replies +QUEUED, so ECHO would never echo. WATCH's own
+    # +OK, read before MULTI is sent, is the barrier.
+    printf 'WATCH cas:k\r\n' >&3
+    IFS= read -r -t 5 armed <&3 || { exec 3>&-; echo "__WATCH_NO_REPLY_p${port}__"; return 0; }
+    if [[ "${armed%$'\r'}" != "+OK" ]]; then
+        exec 3>&-; echo "__WATCH_REFUSED_p${port}:${armed%$'\r'}__"; return 0
+    fi
+    printf 'MULTI\r\nSET cas:k from-txn\r\n' >&3
     if [[ "$conflict" == "yes" ]]; then
         redis-cli -p "$port" SET cas:k from-other >/dev/null 2>&1 || true
     fi
@@ -1270,10 +1286,17 @@ assert_eq "WATCH: unconflicted EXEC commits" \
 # WATCH had recorded and EXEC committed on a key that had been destroyed and
 # rebuilt underneath it.
 watch_cas_aba_outcome() {
-    local port="$1" line=""
+    local port="$1" line="" armed=""
     redis-cli -p "$port" SET aba:k base >/dev/null 2>&1 || true
-    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__"; return 0; }
-    printf 'WATCH aba:k\r\nMULTI\r\nSET aba:k from-txn\r\n' >&3
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED_p${port}__"; return 0; }
+    # Same barrier as watch_cas_outcome (moon#953): the DEL below only exercises
+    # the ABA hole if the watch is already armed when it lands.
+    printf 'WATCH aba:k\r\n' >&3
+    IFS= read -r -t 5 armed <&3 || { exec 3>&-; echo "__WATCH_NO_REPLY_p${port}__"; return 0; }
+    if [[ "${armed%$'\r'}" != "+OK" ]]; then
+        exec 3>&-; echo "__WATCH_REFUSED_p${port}:${armed%$'\r'}__"; return 0
+    fi
+    printf 'MULTI\r\nSET aba:k from-txn\r\n' >&3
     redis-cli -p "$port" DEL aba:k >/dev/null 2>&1 || true
     redis-cli -p "$port" SET aba:k rebuilt >/dev/null 2>&1 || true
     printf 'EXEC\r\nECHO cas-done\r\n' >&3
