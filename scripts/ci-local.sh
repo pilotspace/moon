@@ -168,9 +168,11 @@ vm() { # vm <shell-command> — run inside the moon-dev VM at the repo
 #
 # moon#536 (open, unrelated to FT.*): ROLE's replication offset advances
 # on a master with no replica ever attached, where Redis holds it at 0.
-# `assert_both "ROLE on a master" ROLE` (test-consistency.sh:1719) diffs
-# byte-for-byte against the live redis-server oracle, and on pristine main
-# it is the ONLY other row that fails (measured 2026-09-08: 457/458).
+# `assert_both "ROLE on a master" ROLE` (grep it in test-consistency.sh -- a
+# line number here rots: this comment said :1719 while the row sat at :2155)
+# diffs byte-for-byte against the live redis-server oracle, and on pristine
+# main it is the ONLY other row that fails (re-measured 2026-09-15 after
+# moon#953: 769/770; the stale 457/458 predated ~300 added rows).
 # Carved out by exact name, the same shape as the
 # `gate_is_skipped_with_spill_sender...` precedent in this campaign
 # (tmp/perf-campaign/CONTEXT.md §8): tolerated ONLY when it is the single
