@@ -1337,7 +1337,11 @@ mod tests {
         }
         manifest.commit().unwrap();
         let ids: Vec<u64> = manifest.files().iter().map(|e| e.file_id).collect();
-        assert_eq!(ids, vec![402, 401], "precondition: manifest order is newest-first");
+        assert_eq!(
+            ids,
+            vec![402, 401],
+            "precondition: manifest order is newest-first"
+        );
 
         let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &manifest);
         assert_eq!(per_db.len(), 1, "one db");

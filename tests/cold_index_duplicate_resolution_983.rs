@@ -460,7 +460,11 @@ fn build_newest_first_corpus(off: &Path, shards: usize) {
         }
         manifest.commit().unwrap();
         let ids: Vec<u64> = manifest.files().iter().map(|e| e.file_id).collect();
-        assert_eq!(ids, vec![2, 1], "precondition: manifest registers the newer file first");
+        assert_eq!(
+            ids,
+            vec![2, 1],
+            "precondition: manifest registers the newer file first"
+        );
     }
 }
 

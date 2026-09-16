@@ -113,6 +113,15 @@ impl ColdLocation {
     /// of a lower one, and the same ordering holds across a restart because
     /// `gc_tombstones`, manifest compaction and reopen all preserve push
     /// order. Anything that must pick the newest copy orders by this key.
+    ///
+    /// The monotonicity above is conditional on the restart seed scan
+    /// succeeding: `next_spill_file_id_seed` falls back to `1` when
+    /// `data/` cannot be read (any error but `NotFound`), and logs
+    /// `spill file_id seed: could not scan cold dir; defaulting to 1` when
+    /// it does. A reset counter re-mints `heap-000001.mpf` and the batch
+    /// writer renames over the existing file, so the older copy is
+    /// destroyed in place before any ordering question arises — that warn
+    /// line is the signal, and the cold plane is already lost by then.
     #[inline]
     #[must_use]
     pub fn recency_key(&self) -> (u64, u32, u16) {
