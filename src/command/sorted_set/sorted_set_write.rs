@@ -11,8 +11,9 @@ use crate::command::helpers::{all_args_are_bytes, err, err_wrong_args, extract_b
 use crate::command::sorted_set::work_budget;
 
 use super::{
-    AggregateOp, clamp_nan_to_zero, format_score, format_score_bytes, zadd_member, zrange_by_lex,
-    zrange_by_rank, zrange_by_score, zrem_member, zset_insert_absent, zset_update_existing,
+    AggregateOp, clamp_nan_to_zero, format_score, format_score_bytes, parse_bounded_count,
+    parse_numkeys, zadd_member, zrange_by_lex, zrange_by_rank, zrange_by_score, zrem_member,
+    zset_insert_absent, zset_update_existing,
 };
 
 // ---------------------------------------------------------------------------
@@ -149,15 +150,24 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     if nx && xx {
         return err("ERR XX and NX options at the same time are not compatible");
     }
-    // NX and GT/LT are not compatible
-    if nx && (gt || lt) {
-        return err("ERR GT, LT, and NX options at the same time are not compatible");
+    // GT, LT and NX are pairwise incompatible (moon#969). The old guard only
+    // caught `nx && (gt || lt)`, so `GT LT` was ACCEPTED and then silently did
+    // nothing — Redis's `zaddGenericCommand` rejects all three pairings, and
+    // its message says "and/or".
+    if (gt && nx) || (lt && nx) || (gt && lt) {
+        return err("ERR GT, LT, and/or NX options at the same time are not compatible");
     }
 
     // Remaining args must be score member pairs
     let remaining = &args[i..];
-    if remaining.is_empty() || !remaining.len().is_multiple_of(2) {
+    if remaining.is_empty() {
         return err_wrong_args("ZADD");
+    }
+    // An ODD tail is a different class from NO tail (moon#969): Redis fails
+    // `ZADD k 1 a 2` in `zaddGenericCommand` with `syntax error`, and only a
+    // command with no pairs at all (`ZADD k NX`) trips `commandCheckArity`.
+    if !remaining.len().is_multiple_of(2) {
+        return err("ERR syntax error");
     }
 
     // moon#814: validate EVERY pair BEFORE touching the keyspace.
@@ -313,10 +323,14 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                         work_budget::note_stored_score_parse();
                         let old = current.as_score().unwrap_or(0.0);
                         old_score = old;
+                        // `gt && lt` no longer reaches here: the guard above
+                        // rejects that pairing outright (moon#969). The arm
+                        // that used to sit between `nx` and `gt` answered
+                        // `false` — a SILENT no-op for a command Redis
+                        // refuses — and is gone rather than left unreachable,
+                        // so relaxing the guard cannot quietly resurrect it.
                         let should_update = if nx {
                             false // NX: never update existing
-                        } else if gt && lt {
-                            false // GT+LT together: never update
                         } else if gt {
                             score > old
                         } else if lt {
@@ -432,10 +446,12 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
         // so the score never has to be looked up a second time to write it.
         let mut accepted = false;
         let existing_score: Option<f64> = zset_update_existing(members, scores, member, |old| {
+            // The second of the two `gt && lt` fallthroughs moon#969 left
+            // standing (the listpack arm has the other). The guard at the top
+            // of `zadd` now rejects the pairing, so this arm was both dead and
+            // wrong; it is removed rather than left unreachable.
             let should_update = if nx {
                 false // NX: never update existing
-            } else if gt && lt {
-                false // GT+LT together: never update (mutually exclusive)
             } else if gt {
                 score > old
             } else if lt {
@@ -801,12 +817,17 @@ pub fn zpopmin(db: &mut Database, args: &[Frame]) -> Frame {
             Some(b) => b,
             None => return err_wrong_args("ZPOPMIN"),
         };
-        match std::str::from_utf8(count_bytes)
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-        {
-            Some(c) if c >= 0 => c as usize,
-            _ => return err("ERR value is not an integer or out of range"),
+        // moon#969: Redis reads this with `getPositiveLongFromObject`, which
+        // carries its OWN message for every failure — non-numeric and
+        // negative alike. moon answered the generic integer error, a
+        // different exception type in every client that maps them.
+        match parse_bounded_count(
+            count_bytes,
+            0,
+            "ERR value is out of range, must be positive",
+        ) {
+            Ok(c) => c,
+            Err(e) => return e,
         }
     } else {
         1
@@ -867,12 +888,17 @@ pub fn zpopmax(db: &mut Database, args: &[Frame]) -> Frame {
             Some(b) => b,
             None => return err_wrong_args("ZPOPMAX"),
         };
-        match std::str::from_utf8(count_bytes)
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-        {
-            Some(c) if c >= 0 => c as usize,
-            _ => return err("ERR value is not an integer or out of range"),
+        // moon#969: Redis reads this with `getPositiveLongFromObject`, which
+        // carries its OWN message for every failure — non-numeric and
+        // negative alike. moon answered the generic integer error, a
+        // different exception type in every client that maps them.
+        match parse_bounded_count(
+            count_bytes,
+            0,
+            "ERR value is out of range, must be positive",
+        ) {
+            Ok(c) => c,
+            Err(e) => return e,
         }
     } else {
         1
@@ -945,16 +971,16 @@ fn zstore_impl(db: &mut Database, args: &[Frame], intersect: bool) -> Frame {
         Some(b) => b,
         None => return err_wrong_args(cmd_name),
     };
-    let numkeys: usize = match std::str::from_utf8(numkeys_bytes)
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(n) => n,
-        None => return err("ERR value is not an integer or out of range"),
+    let numkeys = match parse_numkeys(numkeys_bytes, cmd_name) {
+        Ok(n) => n,
+        Err(e) => return e,
     };
 
-    if numkeys == 0 || args.len() < 2 + numkeys {
-        return err_wrong_args(cmd_name);
+    // A `numkeys` that overruns the key list is `syntax error`, not an arity
+    // error (moon#969) — Redis's arity check already passed above, and
+    // `zunionInterDiffGenericCommand` answers `shared.syntaxerr` here.
+    if args.len() < 2 + numkeys {
+        return err("ERR syntax error");
     }
 
     // Collect source keys
@@ -981,14 +1007,24 @@ fn zstore_impl(db: &mut Database, args: &[Frame], intersect: bool) -> Frame {
         };
         if opt.eq_ignore_ascii_case(b"WEIGHTS") {
             for w in 0..numkeys {
+                // Too few weights to cover the key list is `syntax error` on
+                // Redis, not an arity error (moon#969).
                 if i + 1 + w >= args.len() {
-                    return err_wrong_args(cmd_name);
+                    return err("ERR syntax error");
                 }
                 let wb = match extract_bytes(&args[i + 1 + w]) {
                     Some(b) => b,
-                    None => return err_wrong_args(cmd_name),
+                    None => return err("ERR syntax error"),
                 };
-                let wval: f64 = match std::str::from_utf8(wb).ok().and_then(|s| s.parse().ok()) {
+                // `"nan"` PARSES in Rust where C's `strtod` + `isnan` check in
+                // `getDoubleFromObjectOrReply` rejects it (moon#969), so a NaN
+                // weight sailed through and poisoned every aggregated score.
+                // Infinities stay legal, as they are on Redis.
+                let wval: f64 = match std::str::from_utf8(wb)
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|v| !v.is_nan())
+                {
                     Some(v) => v,
                     None => return err("ERR weight value is not a float"),
                 };
@@ -997,11 +1033,11 @@ fn zstore_impl(db: &mut Database, args: &[Frame], intersect: bool) -> Frame {
             i += 1 + numkeys;
         } else if opt.eq_ignore_ascii_case(b"AGGREGATE") {
             if i + 1 >= args.len() {
-                return err_wrong_args(cmd_name);
+                return err("ERR syntax error");
             }
             let agg_b = match extract_bytes(&args[i + 1]) {
                 Some(b) => b.as_ref(),
-                None => return err_wrong_args(cmd_name),
+                None => return err("ERR syntax error"),
             };
             aggregate = if agg_b.eq_ignore_ascii_case(b"SUM") {
                 AggregateOp::Sum
@@ -1014,7 +1050,11 @@ fn zstore_impl(db: &mut Database, args: &[Frame], intersect: bool) -> Frame {
             };
             i += 2;
         } else {
-            i += 1;
+            // moon#967 rewrote every OTHER zset option loop to reject an
+            // unrecognised token and missed this one, so `ZUNIONSTORE d 1 k
+            // BOGUS` stepped over `BOGUS` and answered a DIFFERENT, successful
+            // command. Redis: `ERR syntax error`.
+            return err("ERR syntax error");
         }
     }
 
@@ -1295,16 +1335,18 @@ pub fn zmpop(db: &mut Database, args: &[Frame]) -> Frame {
         Some(b) => b,
         None => return err_wrong_args("ZMPOP"),
     };
-    let numkeys: usize = match std::str::from_utf8(numkeys_bytes)
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(n) if n > 0 => n,
-        _ => return err("ERR numkeys can't be non-positive value"),
-    };
+    // ZMPOP does NOT take the two-class split the ZUNIONSTORE family takes:
+    // Redis reads it with `getRangeLongFromObject(…, 1, LONG_MAX, …,
+    // "numkeys should be greater than 0")`, one message for every failure
+    // (moon#969). Verified against redis-server 8.6.1, including `notanint`.
+    let numkeys =
+        match parse_bounded_count(numkeys_bytes, 1, "ERR numkeys should be greater than 0") {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
 
     if args.len() < 1 + numkeys + 1 {
-        return err_wrong_args("ZMPOP");
+        return err("ERR syntax error");
     }
 
     let keys: Vec<Bytes> = (0..numkeys)
@@ -1340,16 +1382,18 @@ pub fn zmpop(db: &mut Database, args: &[Frame]) -> Frame {
             }
         };
         if opt.eq_ignore_ascii_case(b"COUNT") {
+            // A dangling `COUNT` is `syntax error` (moon#969), the same class
+            // the bare-token arm below already answers.
             if i + 1 >= args.len() {
-                return err_wrong_args("ZMPOP");
+                return err("ERR syntax error");
             }
             let cb = match extract_bytes(&args[i + 1]) {
                 Some(b) => b,
-                None => return err_wrong_args("ZMPOP"),
+                None => return err("ERR syntax error"),
             };
-            pop_count = match std::str::from_utf8(cb).ok().and_then(|s| s.parse().ok()) {
-                Some(c) if c > 0 => c,
-                _ => return err("ERR value is not an integer or out of range"),
+            pop_count = match parse_bounded_count(cb, 1, "ERR count should be greater than 0") {
+                Ok(c) => c,
+                Err(e) => return e,
             };
             i += 2;
         } else {
