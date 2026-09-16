@@ -3630,8 +3630,8 @@ mod as_of_tests {
     /// `UNWATCH` to `watch::try_handle_watch_unwatch` — a gate whose name
     /// literals live outside the handler directory. Before it was scanned,
     /// `WATCH` (routable: `first_key 1`) was claimed by a gate no scanner saw
-    /// and skipped the moon#507 wait: a pipelined `SET k` (remote) + `WATCH k`
-    /// + `MULTI … EXEC` aborted EXEC 18 of 24 times on the pre-fix binary,
+    /// and skipped the moon#507 wait: a pipelined `SET k` (remote), `WATCH k`,
+    /// `MULTI … EXEC` aborted EXEC 18 of 24 times on the pre-fix binary,
     /// because WATCH captured the key's version before its own batch's write
     /// landed.
     const GATE_FILES: [&str; 6] = [
