@@ -90,6 +90,36 @@ pub struct ColdLocation {
     pub value_type: crate::persistence::kv_page::ValueType,
 }
 
+impl ColdLocation {
+    /// The order in which two on-disk copies of the SAME key were written —
+    /// the later copy is the newer value (moon#983).
+    ///
+    /// `file_id` is the shard's spill allocation sequence: it is handed out
+    /// at eviction time from a per-shard counter that only ever increases and
+    /// is re-seeded on restart strictly above every file already on disk
+    /// (`eviction::next_spill_file_id_seed`). A key can only be spilled
+    /// again after it came back hot (a write, or a read-through promotion),
+    /// so its second copy always carries a strictly higher `file_id` and a
+    /// value at least as new. Within one file, `(page_idx, slot_idx)` is the
+    /// order the batch builder packed the requests in, which is their
+    /// request order.
+    ///
+    /// What this is NOT: manifest order. `ShardManifest::files()` is
+    /// `add_file` push order, and the two spill paths push at different
+    /// moments — the async path (`--appendonly yes`) pushes when the
+    /// background completion is applied, the durable-batch path
+    /// (`--appendonly no`) pushes at eviction time. A `CONFIG SET appendonly`
+    /// flip with a completion still in flight pushes a higher `file_id` ahead
+    /// of a lower one, and the same ordering holds across a restart because
+    /// `gc_tombstones`, manifest compaction and reopen all preserve push
+    /// order. Anything that must pick the newest copy orders by this key.
+    #[inline]
+    #[must_use]
+    pub fn recency_key(&self) -> (u64, u32, u16) {
+        (self.file_id, self.page_idx, self.slot_idx)
+    }
+}
+
 /// In-memory index from key to cold disk location.
 ///
 /// NOT on the hot path -- only consulted when DashTable lookup misses
@@ -711,7 +741,9 @@ impl ColdIndex {
         use crate::persistence::page::{PAGE_4K, PageType};
 
         // Pass 1 — decode every Active KvLeaf file into a flat per-db pair
-        // vector, in manifest order. Nothing is inserted into a `BTreeMap`
+        // vector. Manifest order is merely the order the files are READ in;
+        // it decides nothing (moon#983 — see `ColdLocation::recency_key` for
+        // why it cannot be trusted to). Nothing is inserted into a `BTreeMap`
         // here: an ordered map fed one random-ordered key at a time pays an
         // O(log n) descent plus node splits per key, and that insert loop
         // measured 75% of this whole function's wall time on a real 466,912-
@@ -723,7 +755,7 @@ impl ColdIndex {
         // pair (~80 B each) until its db's map is built, on top of the map
         // itself. Recovery is single-threaded and pre-accept, so the peak is
         // this shard's alone — but it IS proportional to the cold index, so
-        // see the measured RSS note in `from_pairs_last_wins`.
+        // see the measured RSS note in `from_pairs_newest_wins`.
         let mut per_db: Vec<(usize, Vec<((u64, Bytes), ColdLocation)>)> = Vec::new();
         let data_dir = shard_dir.join("data");
 
@@ -772,22 +804,32 @@ impl ColdIndex {
             }
         }
 
-        // Pass 2 — bulk-load each db's pairs into its ordered map.
+        // Pass 2 — bulk-load each db's pairs into its ordered map, resolving
+        // every duplicated key to its newest on-disk copy.
         per_db
             .into_iter()
-            .map(|(db, pairs)| (db, Self::from_pairs_last_wins(pairs)))
+            .map(|(db, pairs)| (db, Self::from_pairs_newest_wins(pairs)))
             .collect()
     }
 
-    /// Build an index from `((scan_h48(key), key), location)` pairs supplied in
-    /// **insertion order**, applying the same last-writer-wins rule repeated
-    /// [`Self::insert`] calls would.
+    /// Build an index from `((scan_h48(key), key), location)` pairs in ANY
+    /// order, resolving a key present more than once to the copy with the
+    /// highest [`ColdLocation::recency_key`] — the copy written last.
     ///
-    /// Equivalence rests on `BTreeMap`'s `FromIterator`, which *stable*-sorts
-    /// its input and then bulk-loads it, keeping the **last** of every run of
-    /// equal keys — byte-for-byte what a sequence of `insert` calls in the same
-    /// order produces. Building the tree in one bottom-up pass over sorted
-    /// input is what makes this cheaper than n independent descents.
+    /// This is the same answer the live path arrives at: a re-spill runs
+    /// through [`Self::insert`] after its predecessor, so the later
+    /// `file_id` overwrites the earlier one. The live path gets that order
+    /// for free from time; recovery reads files in manifest order, which is
+    /// push order and is NOT guaranteed to be recency order (moon#983). So
+    /// the winner is chosen here, explicitly, from the location itself —
+    /// never from where its file happened to sit in the input.
+    ///
+    /// Mechanically: sort by key ascending and recency DESCENDING, then keep
+    /// the first of each equal-key run. The survivor is the newest copy by
+    /// construction, the sorted, duplicate-free vector bulk-loads into the
+    /// `BTreeMap` in one bottom-up pass (`FromIterator` re-sorts, but a
+    /// sorted input is its fast path), and nothing depends on which of two
+    /// equal keys a collection type happens to keep.
     ///
     /// The derived state is recomputed from the finished map rather than
     /// maintained incrementally:
@@ -795,12 +837,13 @@ impl ColdIndex {
     ///   to a walk of the final map.
     /// - `resident_bytes` — [`Self::insert`] charges [`cold_entry_cost`] once
     ///   per *distinct* key (an overwrite is free), i.e. the same sum.
-    /// - `pending_unlink` — a file lands here exactly when its last live entry
-    ///   is overwritten by a later one, i.e. exactly when it is mentioned by
-    ///   the input but referenced by no surviving map entry. The *set* is
-    ///   identical; the order within it is not specified by either path (it
-    ///   only sequences a later orphan sweep's unlinks).
-    fn from_pairs_last_wins(pairs: Vec<((u64, Bytes), ColdLocation)>) -> Self {
+    /// - `pending_unlink` — a file lands here exactly when every copy it holds
+    ///   lost to a newer one, i.e. exactly when it is mentioned by the input
+    ///   but referenced by no surviving map entry. The *set* is identical to
+    ///   what a per-key insert loop would queue; the order within it is not
+    ///   specified by either path (it only sequences a later orphan sweep's
+    ///   unlinks).
+    fn from_pairs_newest_wins(mut pairs: Vec<((u64, Bytes), ColdLocation)>) -> Self {
         if pairs.is_empty() {
             return Self::new();
         }
@@ -813,6 +856,14 @@ impl ColdIndex {
                 seen_files.push(loc.file_id);
             }
         }
+
+        // Key ascending, then newest copy FIRST — so the dedup below, which
+        // keeps the first of each run, keeps the newest.
+        pairs.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| b.1.recency_key().cmp(&a.1.recency_key()))
+        });
+        pairs.dedup_by(|later, first| later.0 == first.0);
 
         let map: BTreeMap<(u64, Bytes), ColdLocation> = pairs.into_iter().collect();
 

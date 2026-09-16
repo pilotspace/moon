@@ -1270,6 +1270,139 @@ mod tests {
         );
     }
 
+    /// moon#983: the duplicate-key winner is decided by `file_id`, never by
+    /// where the file sits in the manifest.
+    ///
+    /// The sibling test above pushes the older file first, so "last in
+    /// manifest order" and "highest file_id" agree and it cannot tell the two
+    /// rules apart. Here the NEWER file (higher id, the re-spill) is pushed
+    /// FIRST — the shape a `CONFIG SET appendonly` flip produces when an
+    /// async completion lands after a durable batch was already committed —
+    /// and the rebuilt index must still point at the higher `file_id`.
+    /// Pre-fix this resolved `dup` to file 401 and cold read-through served
+    /// the superseded value after every restart.
+    ///
+    /// Second shape, same rule one level down: one FILE holding the same key
+    /// twice (two requests for a key that was overwritten while its first
+    /// spill request sat in the flush buffer) must resolve to the later
+    /// `(page_idx, slot_idx)`.
+    #[test]
+    fn test_983_rebuild_duplicate_key_resolves_by_file_id_not_manifest_order() {
+        use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
+        use crate::persistence::page::PageType;
+        use crate::storage::tiered::cold_index::ColdIndex;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+
+        // Written to disk in id order (401 is genuinely the older spill),
+        // but REGISTERED newest-first. Both Active — no sweep ran.
+        for (file_id, keys) in [(401u64, vec!["dup", "only-in-401"]), (402u64, vec!["dup"])] {
+            let entries: Vec<SpillEntry> = keys
+                .iter()
+                .map(|k| SpillEntry {
+                    key: Bytes::from(k.to_string()),
+                    value_bytes: Bytes::from(format!("v-from-{file_id}")),
+                    value_type: ValueType::String,
+                    flags: 0,
+                    ttl_ms: None,
+                })
+                .collect();
+            let batch = build_kv_spill_batch(&entries, file_id).unwrap();
+            write_kv_spill_batch(shard_dir, file_id, &batch).unwrap();
+        }
+        for file_id in [402u64, 401] {
+            let byte_size = std::fs::metadata(
+                shard_dir
+                    .join("data")
+                    .join(format!("heap-{file_id:06}.mpf")),
+            )
+            .unwrap()
+            .len();
+            manifest.add_file(FileEntry {
+                file_id,
+                file_type: PageType::KvLeaf as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Hot,
+                page_size_log2: 12,
+                page_count: (byte_size / crate::persistence::page::PAGE_4K as u64) as u32,
+                byte_size,
+                created_lsn: 0,
+                db_index: 0,
+                max_key_hash: 0,
+                last_modified_lsn: 0,
+            });
+        }
+        manifest.commit().unwrap();
+        let ids: Vec<u64> = manifest.files().iter().map(|e| e.file_id).collect();
+        assert_eq!(ids, vec![402, 401], "precondition: manifest order is newest-first");
+
+        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &manifest);
+        assert_eq!(per_db.len(), 1, "one db");
+        let index = per_db.remove(0).1;
+        assert_eq!(index.len(), 2, "`dup` is one key, not two");
+        assert_eq!(
+            index.lookup(b"dup").map(|l| l.file_id),
+            Some(402),
+            "the HIGHER file_id must win the duplicate key regardless of manifest order"
+        );
+        assert_eq!(
+            index.lookup(b"only-in-401").map(|l| l.file_id),
+            Some(401),
+            "file 401's un-superseded key survives"
+        );
+        assert_eq!(index.referenced_file_count(), 2);
+        assert_eq!(index.pending_unlink_len(), 0);
+
+        // Same key twice in ONE file: later slot wins.
+        let manifest_path2 = shard_dir.join("shard2.manifest");
+        let mut m2 = ShardManifest::create(&manifest_path2).unwrap();
+        let entries: Vec<SpillEntry> = ["twice", "twice"]
+            .iter()
+            .enumerate()
+            .map(|(i, k)| SpillEntry {
+                key: Bytes::from(k.to_string()),
+                value_bytes: Bytes::from(format!("copy-{i}")),
+                value_type: ValueType::String,
+                flags: 0,
+                ttl_ms: None,
+            })
+            .collect();
+        let batch = build_kv_spill_batch(&entries, 403).unwrap();
+        assert_eq!(batch.locations.len(), 2, "both copies packed");
+        let later = *batch.locations.last().unwrap();
+        assert!(
+            later > batch.locations[0],
+            "precondition: the second copy lands at a later (page, slot)"
+        );
+        let byte_size = write_kv_spill_batch(shard_dir, 403, &batch).unwrap();
+        m2.add_file(FileEntry {
+            file_id: 403,
+            file_type: PageType::KvLeaf as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Hot,
+            page_size_log2: 12,
+            page_count: batch.pages.len() as u32,
+            byte_size,
+            created_lsn: 0,
+            db_index: 0,
+            max_key_hash: 0,
+            last_modified_lsn: 0,
+        });
+        m2.commit().unwrap();
+        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &m2);
+        let index = per_db.remove(0).1;
+        assert_eq!(index.len(), 1);
+        let loc = index.lookup(b"twice").unwrap();
+        assert_eq!(
+            (loc.page_idx, loc.slot_idx),
+            later,
+            "within one file the later (page_idx, slot_idx) copy must win"
+        );
+    }
+
     /// #139 recovery attribution: two spill files tagged with different
     /// `FileEntry::db_index` values must rebuild into SEPARATE per-db cold
     /// indexes, each holding exactly its own file's keys — the db0-only
