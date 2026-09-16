@@ -231,18 +231,27 @@ fn key(i: usize) -> Vec<u8> {
 fn populate_and_read(port: u16, n: usize) {
     let mut c = Conn::open(port);
     let sadds: Vec<Vec<Vec<u8>>> = (0..KEYS)
-        .map(|i| vec![b"SADD".to_vec(), key(i), b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
+        .map(|i| {
+            vec![
+                b"SADD".to_vec(),
+                key(i),
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+            ]
+        })
         .collect();
     for r in c.pipeline(&sadds) {
         assert!(matches!(r, Resp::Int(_)), "SADD reply: {r:?}");
     }
-    let reads: Vec<Vec<Vec<u8>>> = (0..n)
-        .map(|i| vec![b"SMEMBERS".to_vec(), key(i)])
-        .collect();
+    let reads: Vec<Vec<Vec<u8>>> = (0..n).map(|i| vec![b"SMEMBERS".to_vec(), key(i)]).collect();
     let replies = c.pipeline(&reads);
     assert_eq!(replies.len(), n);
     for r in &replies {
-        assert!(matches!(r, Resp::Array(v) if v.len() == 3), "SMEMBERS reply: {r:?}");
+        assert!(
+            matches!(r, Resp::Array(v) if v.len() == 3),
+            "SMEMBERS reply: {r:?}"
+        );
     }
 }
 
@@ -253,7 +262,15 @@ fn assert_counted(shards: &str, fast_path: &str) {
     {
         let mut c = Conn::open(moon.port);
         let sadds: Vec<Vec<Vec<u8>>> = (0..KEYS)
-            .map(|i| vec![b"SADD".to_vec(), key(i), b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
+            .map(|i| {
+                vec![
+                    b"SADD".to_vec(),
+                    key(i),
+                    b"a".to_vec(),
+                    b"b".to_vec(),
+                    b"c".to_vec(),
+                ]
+            })
             .collect();
         c.pipeline(&sadds);
     }
@@ -265,7 +282,11 @@ fn assert_counted(shards: &str, fast_path: &str) {
             .collect();
         let replies = c.pipeline(&reads);
         assert_eq!(replies.len(), COMMANDS);
-        assert!(replies.iter().all(|r| matches!(r, Resp::Array(v) if v.len() == 3)));
+        assert!(
+            replies
+                .iter()
+                .all(|r| matches!(r, Resp::Array(v) if v.len() == 3))
+        );
     }
     let after = total_commands_processed(moon.port);
     let counted = after - before;

@@ -3872,6 +3872,67 @@ run_slowlog_latency_leg() {
 
 run_slowlog_latency_leg
 
+# ===========================================================================
+# moon#982 -- commands routed to ANOTHER shard are counted
+# ===========================================================================
+# At --shards > 1 only connection-shard-local commands went through the
+# telemetry probe: total_commands_processed counted 400 / 150 / 100 / 50 of
+# 400 SMEMBERS at 1 / 2 / 4 / 8 shards. A dedicated 4-shard moon; 16 untagged
+# keys read 25 times each over 16 connections (each connection lands on a
+# random shard, so ~3/4 of the reads are routed). redis is the oracle for
+# "N commands sent -> N counted"; the window is read over separate
+# connections, so INFO's own accounting is allowed to add at most 2.
+PORT_XSHARD=$((PORT_RUST + 531))
+
+# `commands_processed PORT` -> total_commands_processed from INFO stats.
+commands_processed() {
+    redis-cli -p "$1" INFO stats 2>/dev/null | tr -d '\r' | awk -F: '/^total_commands_processed/{print $2}'
+}
+
+# `count_window PORT` -> "counted=400..402" when every one of 400 SMEMBERS over
+# 16 keys was counted, else the raw delta.
+count_window() {
+    local port="$1" before after i
+    for i in $(seq 1 16); do
+        redis-cli -p "$port" SADD "xshard:s$i" a b c >/dev/null 2>&1
+    done
+    before=$(commands_processed "$port")
+    for i in $(seq 1 16); do
+        redis-cli -p "$port" -r 25 SMEMBERS "xshard:s$i" >/dev/null 2>&1
+    done
+    after=$(commands_processed "$port")
+    local delta=$((after - before))
+    if (( delta >= 400 && delta <= 402 )); then
+        echo "counted=400..402"
+    else
+        echo "counted=$delta"
+    fi
+}
+
+run_cross_shard_count_leg() {
+    local dir
+    dir=$(mktemp -d /tmp/moon-xshard-dir.XXXXXX)
+    "$RUST_BINARY" --port "$PORT_XSHARD" --shards 4 --dir "$dir" \
+        --disk-free-min-pct 0 --appendonly no >/dev/null 2>&1 &
+    local pid=$!
+    for _ in $(seq 1 50); do
+        redis-cli -p "$PORT_XSHARD" PING >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+
+    assert_eq "moon#982: 400 SMEMBERS over 16 keys are all counted at --shards 4 (oracle: redis)" \
+        "$(count_window "$PORT_REDIS")" \
+        "$(count_window "$PORT_XSHARD")"
+
+    # shellcheck disable=SC2046
+    redis-cli -p "$PORT_REDIS" DEL $(seq -f 'xshard:s%g' 1 16) >/dev/null 2>&1 || true
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$dir"
+}
+
+run_cross_shard_count_leg
+
 # Restore the originally-requested shard count so nothing downstream inherits
 # an 8-shard server from this section.
 start_moon_with_shards "$SHARDS" || true
