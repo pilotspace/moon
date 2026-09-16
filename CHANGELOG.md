@@ -16,6 +16,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   increment or decrement would overflow`; the hash family now applies the same
   rule, on both the listpack and the owned-HashMap arm, leaving the field
   untouched when it declines.
+- **Sorted-set range bounds are compared exactly, and an infinite bound now has
+  a direction** (moon#966, moon#961). `ScoreBound::includes`/`includes_upper`
+  tested an inclusive bound with `score >= v || (score - v).abs() <
+  f64::EPSILON`. `f64::EPSILON` is the gap between 1.0 and the next double — a
+  RELATIVE quantity used here as an ABSOLUTE tolerance, which below magnitude 1
+  spans many ulps: at a bound of `0.5` one ulp is 1.11e-16, so `ZCOUNT k -inf
+  0.5` answered `3` where redis answered `2`, returning a member strictly
+  outside the range. The same two methods answered `true` for `NegInf` and
+  `PosInf` in BOTH directions, so `ZRANGEBYSCORE k +inf -inf` returned the whole
+  set instead of nothing. `ZRANGE` also handed argv straight to the range
+  helpers, whose contract is `(min, max)` in semantic order, so the redis
+  spelling `ZRANGE k 3 1 BYSCORE REV` arrived inverted and matched nothing.
+- **`ZINCRBY` refuses a NaN result and aggregates clamp one to zero**
+  (moon#960). The guard checked `is_nan()` on the increment but never on
+  `current + increment`, so `inf + -inf` stored the string `NaN`; redis answers
+  `ERR resulting score is not a number (NaN)` and leaves the score untouched.
+  The listpack arm already declined the case but fell through to the eager
+  `get_or_create_sorted_set`, permanently flattening the encoding from a command
+  that wrote nothing. `ZUNIONSTORE`/`ZINTERSTORE`/`ZUNION`/`ZINTER` take the
+  opposite rule — redis clamps a NaN aggregate to `0.0` — applied at both the
+  SUM and the weight multiply, since `inf * 0` is NaN before any aggregation.
+- **Unknown sorted-set option tokens are rejected instead of skipped**
+  (moon#967). Every option loop ended in a bare `} else { i += 1; }`, so a
+  mis-spelled option became a DIFFERENT, successful command: `ZINTERCARD 1 k
+  BOGUS 1` dropped the intended `LIMIT` and returned the unbounded cardinality,
+  and `ZMPOP 1 k MIN MAX` popped on input redis rejects outright. Six sites.
+  `ZRANGE` now also rejects `BYLEX` with `WITHSCORES`, and a negative `LIMIT`
+  offset returns nothing rather than being clamped to zero.
 - **`HDEL` no longer leaves an empty hash behind when the emptying field is
   not the last argument** (moon#942). `hdel` tracked emptiness in a
   `last_was_empty` variable reassigned on EVERY iteration, including the ones
