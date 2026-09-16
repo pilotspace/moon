@@ -11,8 +11,9 @@ use crate::command::helpers::{err, err_wrong_args, extract_bytes};
 use std::collections::HashMap;
 
 use super::{
-    AggregateOp, format_score, format_score_bytes, glob_match, lex_in_range, parse_lex_bound,
-    parse_score_bound, zrange_by_lex, zrange_by_rank, zrange_by_score, zrange_from_entries,
+    AggregateOp, clamp_nan_to_zero, format_score, format_score_bytes, glob_match, lex_in_range,
+    parse_lex_bound, parse_score_bound, zrange_by_lex, zrange_by_rank, zrange_by_score,
+    zrange_from_entries,
 };
 
 // ---------------------------------------------------------------------------
@@ -1181,12 +1182,12 @@ pub fn zunion_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     let mut result_map: HashMap<Bytes, f64> = HashMap::new();
     for (idx, src) in source_data.iter().enumerate() {
         for (member, score) in src.iter() {
-            let weighted = *score * weights[idx];
+            let weighted = clamp_nan_to_zero(*score * weights[idx]);
             result_map
                 .entry(member.clone())
                 .and_modify(|existing| {
                     *existing = match aggregate {
-                        AggregateOp::Sum => *existing + weighted,
+                        AggregateOp::Sum => clamp_nan_to_zero(*existing + weighted),
                         AggregateOp::Min => existing.min(weighted),
                         AggregateOp::Max => existing.max(weighted),
                     };
@@ -1210,15 +1211,15 @@ pub fn zinter_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     let mut result_map: HashMap<Bytes, f64> = HashMap::new();
     if let Some(first) = source_data.first() {
         for (member, score) in first.iter() {
-            let weighted = *score * weights[0];
+            let weighted = clamp_nan_to_zero(*score * weights[0]);
             let mut final_score = weighted;
             let mut in_all = true;
             for (idx, src) in source_data.iter().enumerate().skip(1) {
                 match src.get(member) {
                     Some(s) => {
-                        let ws = *s * weights[idx];
+                        let ws = clamp_nan_to_zero(*s * weights[idx]);
                         final_score = match aggregate {
-                            AggregateOp::Sum => final_score + ws,
+                            AggregateOp::Sum => clamp_nan_to_zero(final_score + ws),
                             AggregateOp::Min => final_score.min(ws),
                             AggregateOp::Max => final_score.max(ws),
                         };

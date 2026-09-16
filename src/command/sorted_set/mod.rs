@@ -211,6 +211,22 @@ impl ScoreBound {
     }
 }
 
+/// Redis's convention for a score that arithmetic turned into NaN: `0.0`.
+///
+/// `zunionInterAggregate` clamps after every aggregation step — *"The result of
+/// adding two doubles is NaN when one variable is +inf and the other is -inf.
+/// When these numbers are added, we maintain the convention of the result being
+/// 0.0"* — and the weight multiply clamps separately, because `inf * 0` is NaN
+/// before any aggregation happens. Both points need it (moon#960).
+///
+/// This is the AGGREGATE rule only. `ZINCRBY` takes the opposite one: an
+/// explicit single-key increment that reaches NaN is a user error, answered
+/// with `ERR resulting score is not a number (NaN)` and no mutation.
+#[inline]
+pub(super) fn clamp_nan_to_zero(score: f64) -> f64 {
+    if score.is_nan() { 0.0 } else { score }
+}
+
 pub(super) fn parse_score_bound(s: &[u8]) -> Result<ScoreBound, Frame> {
     let s_str = std::str::from_utf8(s).map_err(|_| err("ERR min or max is not a float"))?;
     if s_str == "-inf" {
@@ -2931,15 +2947,15 @@ mod tests {
 
     /// `inf + -inf` is NaN, and `render_score(NaN)` writes `NaN`, which
     /// `parse_score` refuses — a NaN in a listpack would read back as `0.0`
-    /// (the moon#863 shape). The listpack arm must therefore refuse the case
-    /// and hand it to the B+tree arm, which is byte-for-byte what ZINCRBY
-    /// did before moon#897.
+    /// (the moon#863 shape). The listpack arm must therefore refuse the case.
     ///
-    /// NOTE: moon's reply here (`NaN`) diverges from redis 8.6.1, which
-    /// answers `ERR resulting score is not a number (NaN)` and leaves the
-    /// score untouched. That divergence is PRE-EXISTING and deliberately
-    /// unchanged by moon#897; this test pins moon's current behaviour so the
-    /// listpack path cannot silently make it worse.
+    /// moon#960 changed what "refuse" means. It used to mean "fall through to
+    /// the B+tree arm", which replied `NaN`, stored a NaN, and — because that
+    /// arm opens with the EAGER `get_or_create_sorted_set` — flattened the
+    /// encoding for the key's lifetime (moon#832: nothing demotes), all from a
+    /// command that should not have written anything. It now means what redis
+    /// 8.6.1 does: `ERR resulting score is not a number (NaN)`, score
+    /// untouched, encoding untouched.
     #[test]
     fn zincrby_nan_never_reaches_the_listpack() {
         for (first, second) in [(&b"inf"[..], &b"-inf"[..]), (b"-inf", b"inf")] {
@@ -2950,25 +2966,26 @@ mod tests {
                 Frame::BulkString(Bytes::copy_from_slice(first))
             );
             assert_eq!(encoding_of(&mut db, b"z"), "listpack");
-            // The NaN step stands down to the owned accessor, which promotes.
+
             let reply = run_zincrby(&mut db, &[b"z", second, b"m"]);
-            assert_eq!(
-                reply,
-                Frame::BulkString(Bytes::from_static(b"NaN")),
-                "moon's pre-#897 reply for a NaN result, unchanged"
-            );
+            match reply {
+                Frame::Error(ref e) => assert_eq!(
+                    e.as_ref(),
+                    b"ERR resulting score is not a number (NaN)".as_ref()
+                ),
+                other => panic!("expected the NaN error, got {other:?}"),
+            }
             assert_eq!(
                 encoding_of(&mut db, b"z"),
-                "skiplist",
-                "the NaN case falls through to the B+tree arm"
+                "listpack",
+                "a command that stores nothing must not promote the encoding"
             );
-            // The critical half: `m` must NOT read back as 0.0 out of a
-            // listpack. Whatever moon stores, it is not a silently-zeroed
-            // score.
-            assert_ne!(
+            // The original invariant, now satisfied outright: the member keeps
+            // the score it had, so there is no NaN to round-trip as 0.
+            assert_eq!(
                 ro_zscore(&db, &[b"z", b"m"]),
-                Frame::BulkString(Bytes::from_static(b"0")),
-                "a NaN must never round-trip through a listpack as 0"
+                Frame::BulkString(Bytes::copy_from_slice(first)),
+                "the NaN step must leave the previous score in place"
             );
         }
     }
@@ -3125,6 +3142,78 @@ mod tests {
         }
     }
 
+    // ---- moon#960: arithmetic that produces NaN ---------------------------
+    //
+    // Redis has TWO different rules here and moon had neither. Both were read
+    // off a live redis-server 8.6.1 oracle:
+    //
+    //   ZINCRBY  -> `ERR resulting score is not a number (NaN)`, score UNTOUCHED
+    //   aggregate-> clamp the NaN to 0.0 and store it, no error
+    //
+    // The asymmetry is deliberate in Redis: an explicit single-key increment
+    // is a user error, whereas an aggregate combining two sets is not, so
+    // `zunionInterAggregate` keeps "the convention of the result being 0.0".
+
+    #[test]
+    fn zincrby_to_nan_errors_and_leaves_the_score_untouched() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"k", b"inf", b"m"]);
+
+        let got = zincrby(&mut db, &[bulk(b"k"), bulk(b"-inf"), bulk(b"m")]);
+        match got {
+            Frame::Error(ref e) => assert_eq!(
+                e.as_ref(),
+                b"ERR resulting score is not a number (NaN)".as_ref(),
+                "error text must match redis 8.6.1 exactly"
+            ),
+            other => panic!("expected the NaN error, got {other:?}"),
+        }
+
+        // "Untouched" is the half that makes this a data-integrity fix rather
+        // than a cosmetic one: the member must still hold its old score, and
+        // must not have been dropped or rewritten as 0.
+        assert_eq!(
+            run_zscore(&mut db, &[b"k", b"m"]),
+            Frame::BulkString(Bytes::from_static(b"inf"))
+        );
+        assert_eq!(run_zcard(&mut db, &[b"k"]), Frame::Integer(1));
+    }
+
+    #[test]
+    fn an_aggregate_that_reaches_nan_clamps_to_zero() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"s1", b"inf", b"m"]);
+        run_zadd(&mut db, &[b"s2", b"-inf", b"m"]);
+
+        // inf + -inf across two sets: Redis stores 0, not NaN, and does not error.
+        let n = zunionstore(&mut db, &[bulk(b"d"), bulk(b"2"), bulk(b"s1"), bulk(b"s2")]);
+        assert_eq!(n, Frame::Integer(1), "ZUNIONSTORE must succeed, not error");
+        assert_eq!(
+            run_zscore(&mut db, &[b"d", b"m"]),
+            Frame::BulkString(Bytes::from_static(b"0")),
+            "a NaN aggregate result is stored as 0"
+        );
+
+        // The weight multiply is the other way in: inf * 0 is also NaN, and
+        // Redis clamps that too, before any aggregation happens.
+        let n2 = zunionstore(
+            &mut db,
+            &[
+                bulk(b"d2"),
+                bulk(b"1"),
+                bulk(b"s1"),
+                bulk(b"WEIGHTS"),
+                bulk(b"0"),
+            ],
+        );
+        assert_eq!(n2, Frame::Integer(1));
+        assert_eq!(
+            run_zscore(&mut db, &[b"d2", b"m"]),
+            Frame::BulkString(Bytes::from_static(b"0")),
+            "inf * 0 is NaN and must be clamped at the weight multiply"
+        );
+    }
+
     // ---- moon#966 / moon#961: score-range bound comparison ----------------
     //
     // Both were reproduced against a live redis-server 8.6.1 oracle before
@@ -3223,7 +3312,10 @@ mod tests {
         );
 
         // REV on a plain index range does NOT swap: start/stop stay start/stop.
-        let by_rank = zrange(&mut db, &[bulk(b"k"), bulk(b"0"), bulk(b"-1"), bulk(b"REV")]);
+        let by_rank = zrange(
+            &mut db,
+            &[bulk(b"k"), bulk(b"0"), bulk(b"-1"), bulk(b"REV")],
+        );
         assert_eq!(
             by_rank,
             Frame::Array(framevec![bulk(b"c"), bulk(b"b"), bulk(b"a")]),

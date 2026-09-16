@@ -11,8 +11,8 @@ use crate::command::helpers::{all_args_are_bytes, err, err_wrong_args, extract_b
 use crate::command::sorted_set::work_budget;
 
 use super::{
-    AggregateOp, format_score, format_score_bytes, zadd_member, zrange_by_lex, zrange_by_rank,
-    zrange_by_score, zrem_member, zset_insert_absent, zset_update_existing,
+    AggregateOp, clamp_nan_to_zero, format_score, format_score_bytes, zadd_member, zrange_by_lex,
+    zrange_by_rank, zrange_by_score, zrem_member, zset_insert_absent, zset_update_existing,
 };
 
 // ---------------------------------------------------------------------------
@@ -694,8 +694,18 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
                         lp.push_back(&rendered);
                         Some(rendered)
                     }
-                    // NaN: the listpack was not touched. Fall through.
-                    PairUpdate::Unchanged => None,
+                    // NaN. The listpack was not touched, and this is the
+                    // answer (moon#960): redis 8.6.1 replies
+                    // `ERR resulting score is not a number (NaN)` and leaves
+                    // the score alone. Returning here rather than falling
+                    // through also keeps the encoding intact — the B+tree arm
+                    // below opens with the EAGER `get_or_create_sorted_set`,
+                    // so falling through would flatten the listpack
+                    // permanently (moon#832: nothing demotes) as a side
+                    // effect of a command that errors and stores nothing.
+                    PairUpdate::Unchanged => {
+                        return err("ERR resulting score is not a number (NaN)");
+                    }
                 };
 
                 if let Some(rendered) = stored {
@@ -743,11 +753,24 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
     // be `members.get` followed by `zadd_member`'s own `remove` and `insert` —
     // three hashes of one member for one command.
     let mut new_score = increment;
+    // moon#960. `increment` is already proven non-NaN above, so the only way
+    // here is `±inf + ∓inf` — which means the member exists. Returning `None`
+    // from the closure is `zset_update_existing`'s "leave it alone", so the
+    // old score survives and neither map is touched.
+    let mut reached_nan = false;
     let is_new = zset_update_existing(members, scores, &member, |current| {
-        new_score = current + increment;
-        Some(new_score)
+        let candidate = current + increment;
+        if candidate.is_nan() {
+            reached_nan = true;
+            return None;
+        }
+        new_score = candidate;
+        Some(candidate)
     })
     .is_none();
+    if reached_nan {
+        return err("ERR resulting score is not a number (NaN)");
+    }
     if is_new {
         // A member that was not there starts at 0.0, so its new score is the
         // increment itself — already in `new_score`.
@@ -1016,16 +1039,16 @@ fn zstore_impl(db: &mut Database, args: &[Frame], intersect: bool) -> Frame {
         // Start with first set's members
         if let Some(first) = source_data.first() {
             for (member, score) in first {
-                let weighted = *score * weights[0];
+                let weighted = clamp_nan_to_zero(*score * weights[0]);
                 let mut final_score = weighted;
                 let mut in_all = true;
 
                 for (idx, src) in source_data.iter().enumerate().skip(1) {
                     match src.get(member) {
                         Some(s) => {
-                            let ws = *s * weights[idx];
+                            let ws = clamp_nan_to_zero(*s * weights[idx]);
                             final_score = match aggregate {
-                                AggregateOp::Sum => final_score + ws,
+                                AggregateOp::Sum => clamp_nan_to_zero(final_score + ws),
                                 AggregateOp::Min => final_score.min(ws),
                                 AggregateOp::Max => final_score.max(ws),
                             };
@@ -1046,12 +1069,12 @@ fn zstore_impl(db: &mut Database, args: &[Frame], intersect: bool) -> Frame {
         // Union: all members from all sets
         for (idx, src) in source_data.iter().enumerate() {
             for (member, score) in src {
-                let weighted = *score * weights[idx];
+                let weighted = clamp_nan_to_zero(*score * weights[idx]);
                 result_map
                     .entry(member.clone())
                     .and_modify(|existing| {
                         *existing = match aggregate {
-                            AggregateOp::Sum => *existing + weighted,
+                            AggregateOp::Sum => clamp_nan_to_zero(*existing + weighted),
                             AggregateOp::Min => existing.min(weighted),
                             AggregateOp::Max => existing.max(weighted),
                         };
