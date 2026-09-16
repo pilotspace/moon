@@ -179,23 +179,52 @@ impl ScoreBound {
         }
     }
 
+    /// Does `score` satisfy this bound used as the LOWER end of a range?
+    ///
+    /// Compares exactly. Both sides are doubles parsed from the same wire
+    /// text, so there is no rounding here for a tolerance to absorb — and an
+    /// absolute `f64::EPSILON` tolerance is not a tolerance at all below
+    /// magnitude 1, where it spans many ulps (moon#966).
+    ///
+    /// An infinite bound is directional: `-inf` as a minimum admits every
+    /// score, but `+inf` as a minimum admits only `+inf` itself, which is what
+    /// makes `ZRANGEBYSCORE k +inf -inf` empty rather than everything
+    /// (moon#961).
     pub(super) fn includes(&self, score: f64) -> bool {
         match self {
             ScoreBound::NegInf => true,
-            ScoreBound::PosInf => true,
-            ScoreBound::Inclusive(v) => score >= *v || (score - *v).abs() < f64::EPSILON,
+            ScoreBound::PosInf => score == f64::INFINITY,
+            ScoreBound::Inclusive(v) => score >= *v,
             ScoreBound::Exclusive(v) => score > *v,
         }
     }
 
+    /// Does `score` satisfy this bound used as the UPPER end of a range?
+    /// The mirror of [`ScoreBound::includes`]; see its note.
     pub(super) fn includes_upper(&self, score: f64) -> bool {
         match self {
-            ScoreBound::NegInf => true,
+            ScoreBound::NegInf => score == f64::NEG_INFINITY,
             ScoreBound::PosInf => true,
-            ScoreBound::Inclusive(v) => score <= *v || (score - *v).abs() < f64::EPSILON,
+            ScoreBound::Inclusive(v) => score <= *v,
             ScoreBound::Exclusive(v) => score < *v,
         }
     }
+}
+
+/// Redis's convention for a score that arithmetic turned into NaN: `0.0`.
+///
+/// `zunionInterAggregate` clamps after every aggregation step — *"The result of
+/// adding two doubles is NaN when one variable is +inf and the other is -inf.
+/// When these numbers are added, we maintain the convention of the result being
+/// 0.0"* — and the weight multiply clamps separately, because `inf * 0` is NaN
+/// before any aggregation happens. Both points need it (moon#960).
+///
+/// This is the AGGREGATE rule only. `ZINCRBY` takes the opposite one: an
+/// explicit single-key increment that reaches NaN is a user error, answered
+/// with `ERR resulting score is not a number (NaN)` and no mutation.
+#[inline]
+pub(super) fn clamp_nan_to_zero(score: f64) -> f64 {
+    if score.is_nan() { 0.0 } else { score }
 }
 
 pub(super) fn parse_score_bound(s: &[u8]) -> Result<ScoreBound, Frame> {
@@ -388,7 +417,13 @@ pub(super) fn zrange_by_score(
     }
 
     // Apply LIMIT
-    let offset = limit_offset.unwrap_or(0).max(0) as usize;
+    // moon#967: Redis defines a negative LIMIT offset as "return nothing".
+    // `.max(0)` clamped it to 0 and returned the range instead.
+    let raw_offset = limit_offset.unwrap_or(0);
+    if raw_offset < 0 {
+        return Frame::Array(framevec![]);
+    }
+    let offset = raw_offset as usize;
     let count = limit_count.unwrap_or(-1);
     let limited: Vec<_> = if count < 0 {
         entries.into_iter().skip(offset).collect()
@@ -442,7 +477,13 @@ pub(super) fn zrange_by_lex(
     }
 
     // Apply LIMIT
-    let offset = limit_offset.unwrap_or(0).max(0) as usize;
+    // moon#967: Redis defines a negative LIMIT offset as "return nothing".
+    // `.max(0)` clamped it to 0 and returned the range instead.
+    let raw_offset = limit_offset.unwrap_or(0);
+    if raw_offset < 0 {
+        return Frame::Array(framevec![]);
+    }
+    let offset = raw_offset as usize;
     let count = limit_count.unwrap_or(-1);
     let limited: Vec<_> = if count < 0 {
         entries.into_iter().skip(offset).collect()
@@ -533,7 +574,12 @@ pub(super) fn zrange_from_entries(
         if rev {
             filtered.reverse();
         }
-        let offset = limit_offset.unwrap_or(0).max(0) as usize;
+        // moon#967: a negative LIMIT offset returns nothing (see above).
+        let raw_offset = limit_offset.unwrap_or(0);
+        if raw_offset < 0 {
+            return Frame::Array(framevec![]);
+        }
+        let offset = raw_offset as usize;
         let count = limit_count
             .map(|c| if c < 0 { filtered.len() } else { c as usize })
             .unwrap_or(filtered.len());
@@ -566,7 +612,12 @@ pub(super) fn zrange_from_entries(
         if rev {
             filtered.reverse();
         }
-        let offset = limit_offset.unwrap_or(0).max(0) as usize;
+        // moon#967: a negative LIMIT offset returns nothing (see above).
+        let raw_offset = limit_offset.unwrap_or(0);
+        if raw_offset < 0 {
+            return Frame::Array(framevec![]);
+        }
+        let offset = raw_offset as usize;
         let count = limit_count
             .map(|c| if c < 0 { filtered.len() } else { c as usize })
             .unwrap_or(filtered.len());
@@ -2918,15 +2969,15 @@ mod tests {
 
     /// `inf + -inf` is NaN, and `render_score(NaN)` writes `NaN`, which
     /// `parse_score` refuses — a NaN in a listpack would read back as `0.0`
-    /// (the moon#863 shape). The listpack arm must therefore refuse the case
-    /// and hand it to the B+tree arm, which is byte-for-byte what ZINCRBY
-    /// did before moon#897.
+    /// (the moon#863 shape). The listpack arm must therefore refuse the case.
     ///
-    /// NOTE: moon's reply here (`NaN`) diverges from redis 8.6.1, which
-    /// answers `ERR resulting score is not a number (NaN)` and leaves the
-    /// score untouched. That divergence is PRE-EXISTING and deliberately
-    /// unchanged by moon#897; this test pins moon's current behaviour so the
-    /// listpack path cannot silently make it worse.
+    /// moon#960 changed what "refuse" means. It used to mean "fall through to
+    /// the B+tree arm", which replied `NaN`, stored a NaN, and — because that
+    /// arm opens with the EAGER `get_or_create_sorted_set` — flattened the
+    /// encoding for the key's lifetime (moon#832: nothing demotes), all from a
+    /// command that should not have written anything. It now means what redis
+    /// 8.6.1 does: `ERR resulting score is not a number (NaN)`, score
+    /// untouched, encoding untouched.
     #[test]
     fn zincrby_nan_never_reaches_the_listpack() {
         for (first, second) in [(&b"inf"[..], &b"-inf"[..]), (b"-inf", b"inf")] {
@@ -2937,25 +2988,26 @@ mod tests {
                 Frame::BulkString(Bytes::copy_from_slice(first))
             );
             assert_eq!(encoding_of(&mut db, b"z"), "listpack");
-            // The NaN step stands down to the owned accessor, which promotes.
+
             let reply = run_zincrby(&mut db, &[b"z", second, b"m"]);
-            assert_eq!(
-                reply,
-                Frame::BulkString(Bytes::from_static(b"NaN")),
-                "moon's pre-#897 reply for a NaN result, unchanged"
-            );
+            match reply {
+                Frame::Error(ref e) => assert_eq!(
+                    e.as_ref(),
+                    b"ERR resulting score is not a number (NaN)".as_ref()
+                ),
+                other => panic!("expected the NaN error, got {other:?}"),
+            }
             assert_eq!(
                 encoding_of(&mut db, b"z"),
-                "skiplist",
-                "the NaN case falls through to the B+tree arm"
+                "listpack",
+                "a command that stores nothing must not promote the encoding"
             );
-            // The critical half: `m` must NOT read back as 0.0 out of a
-            // listpack. Whatever moon stores, it is not a silently-zeroed
-            // score.
-            assert_ne!(
+            // The original invariant, now satisfied outright: the member keeps
+            // the score it had, so there is no NaN to round-trip as 0.
+            assert_eq!(
                 ro_zscore(&db, &[b"z", b"m"]),
-                Frame::BulkString(Bytes::from_static(b"0")),
-                "a NaN must never round-trip through a listpack as 0"
+                Frame::BulkString(Bytes::copy_from_slice(first)),
+                "the NaN step must leave the previous score in place"
             );
         }
     }
@@ -3109,6 +3161,326 @@ mod tests {
                 String::from_utf8_lossy(&e)
             ),
             other => panic!("expected WRONGTYPE error, got {other:?}"),
+        }
+    }
+
+    // ---- moon#967: unknown option tokens ----------------------------------
+    //
+    // Every zset option loop ended in a bare `} else { i += 1; }`, so a token
+    // the parser did not recognise was SKIPPED rather than rejected. Redis
+    // answers `ERR syntax error`. Verified against redis 8.6.1.
+
+    #[test]
+    fn an_unrecognised_option_token_is_a_syntax_error() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"k", b"1", b"a", b"2", b"b"]);
+
+        let syntax = Frame::Error(Bytes::from_static(b"ERR syntax error"));
+
+        assert_eq!(
+            zrange(
+                &mut db,
+                &[bulk(b"k"), bulk(b"0"), bulk(b"-1"), bulk(b"BOGUS")]
+            ),
+            syntax
+        );
+        assert_eq!(
+            zrangebyscore(
+                &mut db,
+                &[bulk(b"k"), bulk(b"-inf"), bulk(b"+inf"), bulk(b"BOGUS")]
+            ),
+            syntax
+        );
+        assert_eq!(
+            zrevrangebyscore(
+                &mut db,
+                &[bulk(b"k"), bulk(b"+inf"), bulk(b"-inf"), bulk(b"BOGUS")]
+            ),
+            syntax
+        );
+
+        // ZINTERCARD is the sharp one: the trailing `1` was meant as LIMIT 1.
+        // Skipping both tokens answered the UNBOUNDED cardinality, so a client
+        // asking for a bounded intersection silently got an unbounded one.
+        assert_eq!(
+            zintercard(
+                &mut db,
+                &[bulk(b"1"), bulk(b"k"), bulk(b"BOGUS"), bulk(b"1")]
+            ),
+            syntax
+        );
+
+        // ZMPOP MUTATES, so accepting a bogus token is not even side-effect
+        // free: `MIN MAX` used to take the first direction and pop.
+        assert_eq!(
+            zmpop(
+                &mut db,
+                &[bulk(b"1"), bulk(b"k"), bulk(b"MIN"), bulk(b"MAX")]
+            ),
+            syntax
+        );
+        assert_eq!(
+            run_zcard(&mut db, &[b"k"]),
+            Frame::Integer(2),
+            "a rejected ZMPOP must not have popped anything"
+        );
+
+        // The pairing ZRANGE never checked: only BYSCORE+BYLEX was rejected.
+        match zrange(
+            &mut db,
+            &[
+                bulk(b"k"),
+                bulk(b"-"),
+                bulk(b"+"),
+                bulk(b"BYLEX"),
+                bulk(b"WITHSCORES"),
+            ],
+        ) {
+            Frame::Error(ref e) => assert_eq!(
+                e.as_ref(),
+                b"ERR syntax error, WITHSCORES not supported in combination with BYLEX".as_ref()
+            ),
+            other => panic!("expected the BYLEX+WITHSCORES error, got {other:?}"),
+        }
+
+        // Every option the parsers DO know still works.
+        assert_eq!(
+            zrange(&mut db, &[bulk(b"k"), bulk(b"0"), bulk(b"-1")]),
+            Frame::Array(framevec![bulk(b"a"), bulk(b"b")])
+        );
+    }
+
+    /// moon#967. Redis defines a negative LIMIT offset as "return nothing".
+    /// moon parsed it as a plain i64 and clamped it to 0 with `.max(0)`,
+    /// returning a non-empty result.
+    #[test]
+    fn a_negative_limit_offset_returns_nothing() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"k", b"1", b"a", b"2", b"b"]);
+
+        let empty = Frame::Array(framevec![]);
+        assert_eq!(
+            zrangebyscore(
+                &mut db,
+                &[
+                    bulk(b"k"),
+                    bulk(b"-inf"),
+                    bulk(b"+inf"),
+                    bulk(b"LIMIT"),
+                    bulk(b"-1"),
+                    bulk(b"2"),
+                ]
+            ),
+            empty
+        );
+        // A zero offset is not negative and still returns the range.
+        assert_eq!(
+            zrangebyscore(
+                &mut db,
+                &[
+                    bulk(b"k"),
+                    bulk(b"-inf"),
+                    bulk(b"+inf"),
+                    bulk(b"LIMIT"),
+                    bulk(b"0"),
+                    bulk(b"2"),
+                ]
+            ),
+            Frame::Array(framevec![bulk(b"a"), bulk(b"b")])
+        );
+    }
+
+    // ---- moon#960: arithmetic that produces NaN ---------------------------
+    //
+    // Redis has TWO different rules here and moon had neither. Both were read
+    // off a live redis-server 8.6.1 oracle:
+    //
+    //   ZINCRBY  -> `ERR resulting score is not a number (NaN)`, score UNTOUCHED
+    //   aggregate-> clamp the NaN to 0.0 and store it, no error
+    //
+    // The asymmetry is deliberate in Redis: an explicit single-key increment
+    // is a user error, whereas an aggregate combining two sets is not, so
+    // `zunionInterAggregate` keeps "the convention of the result being 0.0".
+
+    #[test]
+    fn zincrby_to_nan_errors_and_leaves_the_score_untouched() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"k", b"inf", b"m"]);
+
+        let got = zincrby(&mut db, &[bulk(b"k"), bulk(b"-inf"), bulk(b"m")]);
+        match got {
+            Frame::Error(ref e) => assert_eq!(
+                e.as_ref(),
+                b"ERR resulting score is not a number (NaN)".as_ref(),
+                "error text must match redis 8.6.1 exactly"
+            ),
+            other => panic!("expected the NaN error, got {other:?}"),
+        }
+
+        // "Untouched" is the half that makes this a data-integrity fix rather
+        // than a cosmetic one: the member must still hold its old score, and
+        // must not have been dropped or rewritten as 0.
+        assert_eq!(
+            run_zscore(&mut db, &[b"k", b"m"]),
+            Frame::BulkString(Bytes::from_static(b"inf"))
+        );
+        assert_eq!(run_zcard(&mut db, &[b"k"]), Frame::Integer(1));
+    }
+
+    #[test]
+    fn an_aggregate_that_reaches_nan_clamps_to_zero() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"s1", b"inf", b"m"]);
+        run_zadd(&mut db, &[b"s2", b"-inf", b"m"]);
+
+        // inf + -inf across two sets: Redis stores 0, not NaN, and does not error.
+        let n = zunionstore(&mut db, &[bulk(b"d"), bulk(b"2"), bulk(b"s1"), bulk(b"s2")]);
+        assert_eq!(n, Frame::Integer(1), "ZUNIONSTORE must succeed, not error");
+        assert_eq!(
+            run_zscore(&mut db, &[b"d", b"m"]),
+            Frame::BulkString(Bytes::from_static(b"0")),
+            "a NaN aggregate result is stored as 0"
+        );
+
+        // The weight multiply is the other way in: inf * 0 is also NaN, and
+        // Redis clamps that too, before any aggregation happens.
+        let n2 = zunionstore(
+            &mut db,
+            &[
+                bulk(b"d2"),
+                bulk(b"1"),
+                bulk(b"s1"),
+                bulk(b"WEIGHTS"),
+                bulk(b"0"),
+            ],
+        );
+        assert_eq!(n2, Frame::Integer(1));
+        assert_eq!(
+            run_zscore(&mut db, &[b"d2", b"m"]),
+            Frame::BulkString(Bytes::from_static(b"0")),
+            "inf * 0 is NaN and must be clamped at the weight multiply"
+        );
+    }
+
+    // ---- moon#966 / moon#961: score-range bound comparison ----------------
+    //
+    // Both were reproduced against a live redis-server 8.6.1 oracle before
+    // this test was written. `ScoreBound` is the single decision point for
+    // every BYSCORE range, so both live here.
+
+    /// moon#966. `f64::EPSILON` is the gap between 1.0 and the next double —
+    /// a RELATIVE quantity. Used as an ABSOLUTE tolerance it swallows real
+    /// differences at every magnitude below 1: one ulp at 0.5 is 1.11e-16,
+    /// which is under EPSILON, so two distinct doubles compare "equal" and a
+    /// member strictly outside the range is reported inside it.
+    ///
+    /// Probe at magnitude 1 and this cannot fail — one ulp there IS EPSILON,
+    /// so `< EPSILON` is false. The magnitudes below are load-bearing.
+    #[test]
+    fn a_bound_excludes_a_score_one_ulp_outside_it() {
+        // 0.5000000000000001 is the next double after 0.5.
+        let just_above_half = 0.5_f64 + f64::EPSILON / 2.0;
+        assert!(just_above_half > 0.5, "test premise: distinct doubles");
+
+        assert!(
+            !ScoreBound::Inclusive(0.5).includes_upper(just_above_half),
+            "a score strictly greater than the inclusive upper bound must be excluded"
+        );
+        assert!(
+            !ScoreBound::Inclusive(0.5).includes(0.5 - f64::EPSILON / 4.0),
+            "a score strictly less than the inclusive lower bound must be excluded"
+        );
+
+        // The same at a magnitude where the absolute tolerance is millions of ulps.
+        let tiny = 1.0e-10_f64;
+        assert!(
+            !ScoreBound::Inclusive(tiny).includes_upper(tiny + f64::EPSILON / 2.0),
+            "the tolerance must not scale with how small the bound is"
+        );
+
+        // Exact equality still belongs to an inclusive bound.
+        assert!(ScoreBound::Inclusive(0.5).includes(0.5));
+        assert!(ScoreBound::Inclusive(0.5).includes_upper(0.5));
+    }
+
+    /// moon#961. `NegInf`/`PosInf` answered `true` in BOTH directions, so an
+    /// infinite bound admitted everything regardless of which end it sat on.
+    /// `ZRANGEBYSCORE k +inf -inf` returned the whole set; Redis returns empty.
+    #[test]
+    fn an_infinite_bound_respects_the_end_it_sits_on() {
+        // -inf as a LOWER bound admits everything; as an UPPER bound it admits
+        // only -inf itself.
+        assert!(ScoreBound::NegInf.includes(-1.0e300));
+        assert!(ScoreBound::NegInf.includes(f64::NEG_INFINITY));
+        assert!(!ScoreBound::NegInf.includes_upper(0.0));
+        assert!(ScoreBound::NegInf.includes_upper(f64::NEG_INFINITY));
+
+        // +inf as an UPPER bound admits everything; as a LOWER bound only +inf.
+        assert!(ScoreBound::PosInf.includes_upper(1.0e300));
+        assert!(ScoreBound::PosInf.includes_upper(f64::INFINITY));
+        assert!(!ScoreBound::PosInf.includes(0.0));
+        assert!(ScoreBound::PosInf.includes(f64::INFINITY));
+    }
+
+    /// moon#961, the other half. `zrange_by_score`'s contract is stated on the
+    /// function itself: *"All callers pass (min, max) in semantic order
+    /// regardless of rev"*. `ZRANGE` was the caller that did not — it handed
+    /// argv straight through, so the Redis invocation (max first when `REV` is
+    /// set) arrived as an inverted range and matched nothing.
+    #[test]
+    fn zrange_byscore_rev_reads_its_bounds_max_first() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"k", b"1", b"a", b"2", b"b", b"3", b"c"]);
+
+        // The Redis spelling: max, then min.
+        let got = zrange(
+            &mut db,
+            &[
+                bulk(b"k"),
+                bulk(b"3"),
+                bulk(b"1"),
+                bulk(b"BYSCORE"),
+                bulk(b"REV"),
+            ],
+        );
+        assert_eq!(
+            got,
+            Frame::Array(framevec![bulk(b"c"), bulk(b"b"), bulk(b"a")]),
+            "ZRANGE k 3 1 BYSCORE REV must walk the range in reverse"
+        );
+
+        // Without REV the order is the plain one, and the bounds are min-first.
+        let fwd = zrange(
+            &mut db,
+            &[bulk(b"k"), bulk(b"1"), bulk(b"3"), bulk(b"BYSCORE")],
+        );
+        assert_eq!(
+            fwd,
+            Frame::Array(framevec![bulk(b"a"), bulk(b"b"), bulk(b"c")])
+        );
+
+        // REV on a plain index range does NOT swap: start/stop stay start/stop.
+        let by_rank = zrange(
+            &mut db,
+            &[bulk(b"k"), bulk(b"0"), bulk(b"-1"), bulk(b"REV")],
+        );
+        assert_eq!(
+            by_rank,
+            Frame::Array(framevec![bulk(b"c"), bulk(b"b"), bulk(b"a")]),
+            "an index range with REV reverses output but keeps start/stop order"
+        );
+    }
+
+    /// The `+inf -inf` inversion end to end: an empty answer, not the whole set.
+    #[test]
+    fn an_inverted_infinite_range_matches_nothing() {
+        let lo = ScoreBound::PosInf;
+        let hi = ScoreBound::NegInf;
+        for score in [-1.0e300, -1.0, 0.0, 1.0, 1.0e300] {
+            assert!(
+                !(lo.includes(score) && hi.includes_upper(score)),
+                "score {score} must not fall inside [+inf, -inf]"
+            );
         }
     }
 }

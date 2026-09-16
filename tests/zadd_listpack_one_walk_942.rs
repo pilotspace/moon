@@ -276,11 +276,14 @@ fn zincrby_increments_in_place() {
 
 /// `inf + -inf` is NaN, which must never be written into a listpack: a
 /// listpack stores the score as TEXT and `NaN` does not parse back, so the
-/// member would silently read as 0. The listpack arm declines and the B+tree
-/// arm answers, which is a PRE-EXISTING divergence from redis (it errors).
-/// Pinned here because the rewrite moved that decision into a closure, and a
-/// closure that declined for the wrong reason would corrupt the score
-/// instead.
+/// member would silently read as 0. Pinned here because the rewrite moved that
+/// decision into a closure, and a closure that declined for the wrong reason
+/// would corrupt the score instead.
+///
+/// moon#960 changed what declining means. It used to fall through to the
+/// B+tree arm, which replied `NaN` and stored it — a divergence this test
+/// previously pinned as pre-existing. It now matches redis 8.6.1: an error,
+/// the score untouched, and the encoding left alone.
 #[test]
 fn zincrby_to_nan_leaves_the_stored_score_alone() {
     let mut db = Database::new();
@@ -289,14 +292,17 @@ fn zincrby_to_nan_leaves_the_stored_score_alone() {
     assert_eq!(zadd(&mut db, &[key, b"1", b"other"]), Frame::Integer(1));
     assert_eq!(zscore(&mut db, key, b"m").as_deref(), Some("inf"));
 
-    // Whatever moon answers here, it must not be a listpack holding `NaN`.
-    let reply = bulk(&zincrby(&mut db, &[key, b"-inf", b"m"]));
-    assert!(
-        reply.eq_ignore_ascii_case("nan"),
-        "expected moon's pre-existing NaN reply, got {reply:?}"
-    );
+    match sorted_set::zincrby(&mut db, &argv(&[key, b"-inf", b"m"])) {
+        Frame::Error(ref e) => assert_eq!(
+            e.as_ref(),
+            b"ERR resulting score is not a number (NaN)".as_ref()
+        ),
+        other => panic!("expected the NaN error, got {other:?}"),
+    }
     assert_eq!(zcard(&mut db, key), 2, "the member was duplicated");
-    // The neighbour must have survived the fall-through to the B+tree arm.
+    // The score must be exactly what it was — never `NaN`, never 0.
+    assert_eq!(zscore(&mut db, key, b"m").as_deref(), Some("inf"));
+    // The neighbour is untouched too.
     assert_eq!(zscore(&mut db, key, b"other").as_deref(), Some("1"));
 
     // A finite increment onto an infinite score is NOT NaN and stays in the

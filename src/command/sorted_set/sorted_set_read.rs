@@ -11,8 +11,9 @@ use crate::command::helpers::{err, err_wrong_args, extract_bytes};
 use std::collections::HashMap;
 
 use super::{
-    AggregateOp, format_score, format_score_bytes, glob_match, lex_in_range, parse_lex_bound,
-    parse_score_bound, zrange_by_lex, zrange_by_rank, zrange_by_score, zrange_from_entries,
+    AggregateOp, clamp_nan_to_zero, format_score, format_score_bytes, glob_match, lex_in_range,
+    parse_lex_bound, parse_score_bound, zrange_by_lex, zrange_by_rank, zrange_by_score,
+    zrange_from_entries,
 };
 
 // ---------------------------------------------------------------------------
@@ -437,17 +438,37 @@ pub fn zrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 return err_wrong_args("ZRANGE");
             }
         } else {
-            i += 1;
+            // moon#967: an unrecognised token is `ERR syntax error`, not
+            // something to step over. Skipping it silently turned a
+            // mis-spelled option into a DIFFERENT, successful command.
+            return err("ERR syntax error");
         }
     }
     if by_score && by_lex {
         return err("ERR BYSCORE and BYLEX options are not compatible");
+    }
+    // moon#967: the only pairing checked used to be BYSCORE+BYLEX.
+    if by_lex && withscores {
+        return err("ERR syntax error, WITHSCORES not supported in combination with BYLEX");
     }
     if limit_offset.is_some() && !by_score && !by_lex {
         return err(
             "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
         );
     }
+    // moon#961. With REV on a BYSCORE/BYLEX range, Redis takes the arguments
+    // MAX first: `ZRANGE k 3 1 BYSCORE REV`. Every range helper below documents
+    // the opposite contract — "all callers pass (min, max) in semantic order
+    // regardless of rev" — and `rev` there only reverses iteration. So the swap
+    // belongs here, at the one call site that receives the user's order.
+    //
+    // An index range is NOT swapped: `ZRANGE k 0 -1 REV` keeps start/stop and
+    // simply walks backwards.
+    let (min_arg, max_arg) = if rev && (by_score || by_lex) {
+        (max_arg, min_arg)
+    } else {
+        (min_arg, max_arg)
+    };
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(Some(zref)) => {
             match (&zref, zref.members_map(), zref.bptree()) {
@@ -588,7 +609,10 @@ pub fn zrangebyscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Fra
                 return err_wrong_args("ZRANGEBYSCORE");
             }
         } else {
-            i += 1;
+            // moon#967: an unrecognised token is `ERR syntax error`, not
+            // something to step over. Skipping it silently turned a
+            // mis-spelled option into a DIFFERENT, successful command.
+            return err("ERR syntax error");
         }
     }
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
@@ -675,7 +699,10 @@ pub fn zrevrangebyscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> 
                 return err_wrong_args("ZREVRANGEBYSCORE");
             }
         } else {
-            i += 1;
+            // moon#967: an unrecognised token is `ERR syntax error`, not
+            // something to step over. Skipping it silently turned a
+            // mis-spelled option into a DIFFERENT, successful command.
+            return err("ERR syntax error");
         }
     }
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
@@ -972,7 +999,10 @@ fn parse_setop_args(
             withscores = true;
             i += 1;
         } else {
-            i += 1;
+            // moon#967: an unrecognised token is `ERR syntax error`, not
+            // something to step over. Skipping it silently turned a
+            // mis-spelled option into a DIFFERENT, successful command.
+            return Err(err("ERR syntax error"));
         }
     }
 
@@ -1168,12 +1198,12 @@ pub fn zunion_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     let mut result_map: HashMap<Bytes, f64> = HashMap::new();
     for (idx, src) in source_data.iter().enumerate() {
         for (member, score) in src.iter() {
-            let weighted = *score * weights[idx];
+            let weighted = clamp_nan_to_zero(*score * weights[idx]);
             result_map
                 .entry(member.clone())
                 .and_modify(|existing| {
                     *existing = match aggregate {
-                        AggregateOp::Sum => *existing + weighted,
+                        AggregateOp::Sum => clamp_nan_to_zero(*existing + weighted),
                         AggregateOp::Min => existing.min(weighted),
                         AggregateOp::Max => existing.max(weighted),
                     };
@@ -1197,15 +1227,15 @@ pub fn zinter_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     let mut result_map: HashMap<Bytes, f64> = HashMap::new();
     if let Some(first) = source_data.first() {
         for (member, score) in first.iter() {
-            let weighted = *score * weights[0];
+            let weighted = clamp_nan_to_zero(*score * weights[0]);
             let mut final_score = weighted;
             let mut in_all = true;
             for (idx, src) in source_data.iter().enumerate().skip(1) {
                 match src.get(member) {
                     Some(s) => {
-                        let ws = *s * weights[idx];
+                        let ws = clamp_nan_to_zero(*s * weights[idx]);
                         final_score = match aggregate {
-                            AggregateOp::Sum => final_score + ws,
+                            AggregateOp::Sum => clamp_nan_to_zero(final_score + ws),
                             AggregateOp::Min => final_score.min(ws),
                             AggregateOp::Max => final_score.max(ws),
                         };
@@ -1274,7 +1304,10 @@ pub fn zintercard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
             };
             i += 2;
         } else {
-            i += 1;
+            // moon#967: an unrecognised token is `ERR syntax error`, not
+            // something to step over. Skipping it silently turned a
+            // mis-spelled option into a DIFFERENT, successful command.
+            return err("ERR syntax error");
         }
     }
     let source_data = match collect_source_sets_readonly(db, &keys, now_ms) {
