@@ -810,28 +810,45 @@ fn sadd_bumps_the_watch_version_exactly_once_on_every_encoding() {
 }
 
 #[test]
-fn sadd_on_a_wrongtype_key_still_bumps_the_version_moon940() {
-    // moon#940 is OPEN and is NOT fixed here: `stamp_mutation` fires before
-    // the arm that answers `Err(WRONGTYPE)`, so a rejected write still dirties
-    // a watching transaction. This test pins the CURRENT behaviour so the
-    // `SetHandle` change is provably neutral on it — neither fixing #940 (a
-    // separate change, separately benchmarked) nor making it worse by adding a
-    // second bump.
-    let mut db = db_at(NOW);
-    db.set(b"str", Entry::new_string(Bytes::from_static(b"v")));
-    let v0 = version_of(&db, b"str");
-    let r = crate::command::set::sadd(&mut db, &[bulk("str"), bulk("member")]);
-    assert!(
-        matches!(&r, Frame::Error(e) if e.starts_with(b"WRONGTYPE")),
-        "expected WRONGTYPE, got {r:?}"
-    );
-    assert_eq!(
-        version_of(&db, b"str"),
-        v0 + 1,
-        "moon#940 (open): a rejected SADD bumps the version exactly once. \
-         Two would mean the collapse added a handle; zero would mean this \
-         change fixed #940 as a side effect, which it must not do silently."
-    );
+fn a_wrongtype_write_never_bumps_the_version_moon940() {
+    // moon#940. Acquiring a mutable handle IS the WATCH bump (moon#926), and
+    // it used to fire before the arm that answers `Err(WRONGTYPE)`. A write
+    // REJECTED for type therefore dirtied the key, aborting an EXEC that redis
+    // 8.6.1 lets through — the command mutated nothing, so there is nothing
+    // for a watcher to have missed.
+    //
+    // Swept across the families rather than just SADD, because each one
+    // reaches the keyspace through a different accessor.
+    #[allow(clippy::type_complexity)]
+    let writes: &[(&str, fn(&mut Database) -> Frame)] = &[
+        ("SADD", |db| {
+            crate::command::set::sadd(db, &[bulk("str"), bulk("member")])
+        }),
+        ("HSET", |db| {
+            crate::command::hash::hset(db, &[bulk("str"), bulk("f"), bulk("v")])
+        }),
+        ("LPUSH", |db| {
+            crate::command::list::lpush(db, &[bulk("str"), bulk("v")])
+        }),
+        ("ZADD", |db| {
+            crate::command::sorted_set::zadd(db, &[bulk("str"), bulk("1"), bulk("m")])
+        }),
+    ];
+    for (name, write) in writes {
+        let mut db = db_at(NOW);
+        db.set(b"str", Entry::new_string(Bytes::from_static(b"v")));
+        let v0 = version_of(&db, b"str");
+        let r = write(&mut db);
+        assert!(
+            matches!(&r, Frame::Error(e) if e.starts_with(b"WRONGTYPE")),
+            "{name}: expected WRONGTYPE, got {r:?}"
+        );
+        assert_eq!(
+            version_of(&db, b"str"),
+            v0,
+            "{name}: a rejected write must leave the WATCH version alone"
+        );
+    }
 }
 
 // ── HSET / HDEL: the hash family's probe budget (moon#942) ──────────────────

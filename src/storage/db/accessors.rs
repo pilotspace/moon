@@ -296,16 +296,32 @@ impl Database {
                 b"ERR internal: lookup failed after insert",
             )));
         };
-        // moon#926: handing out `K::Mut` IS the mutation as far as WATCH is
-        // concerned. See `stamp_mutation` for why this cannot live in the
-        // ~60 write handlers instead.
-        stamp_mutation(entry);
         // moon#788: a compact→full encoding upgrade changes the entry's real
         // size; charge the difference or the ledger silently desynchronises
         // from the keyspace. Disjoint field borrows: `entry` borrows
         // `self.data`, the counter is a separate field.
+        //
+        // This runs BEFORE the type decision below because `K::upgrade` is a
+        // no-op on a value of another kind — every impl matches the encoding
+        // first and returns 0 without touching the entry — so a key that is
+        // about to be refused is not changed by it.
         let encoding_delta = K::upgrade(entry);
+        // moon#940: decide the type BEFORE stamping. Handing out `K::Mut` IS
+        // the mutation as far as WATCH is concerned (moon#926), and the stamp
+        // used to fire unconditionally — so a write REJECTED with WRONGTYPE
+        // still dirtied the key and aborted a watching EXEC that redis lets
+        // through. The command mutated nothing; there is nothing to have
+        // missed. See `stamp_mutation` for why the stamp cannot live in the
+        // ~60 write handlers instead.
+        let type_ok = match entry.value.as_redis_value_mut() {
+            Some(v) => K::project_mut(v).is_ok(),
+            None => false,
+        };
+        if !type_ok {
+            return Err(Self::wrongtype_error());
+        }
         self.used_memory = self.used_memory.saturating_add_signed(encoding_delta);
+        stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(v) => match K::project_mut(v) {
                 Ok(m) => Ok(m),
@@ -341,16 +357,23 @@ impl Database {
         let Some(entry) = self.data.get_mut(key) else {
             return Ok(None);
         };
+        // moon#788: see `get_or_create` — the upgrade is a no-op on another
+        // kind, so it is safe ahead of the type decision.
+        let encoding_delta = K::upgrade(entry);
         // moon#926: a present key is about to be handed out mutably. A MISS
         // returns above without stamping — a pop that finds nothing is a read
         // as far as the keyspace is concerned, and redis does not dirty it.
-        stamp_mutation(entry);
-        // moon#788: a compact→full encoding upgrade changes the entry's real
-        // size; charge the difference or the ledger silently desynchronises
-        // from the keyspace. Disjoint field borrows: `entry` borrows
-        // `self.data`, the counter is a separate field.
-        let encoding_delta = K::upgrade(entry);
+        // moon#940 extends that to a WRONGTYPE: a refused write is not a
+        // mutation either.
+        let type_ok = match entry.value.as_redis_value_mut() {
+            Some(v) => K::project_mut(v).is_ok(),
+            None => false,
+        };
+        if !type_ok {
+            return Err(Self::wrongtype_error());
+        }
         self.used_memory = self.used_memory.saturating_add_signed(encoding_delta);
+        stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(v) => match K::project_mut(v) {
                 Ok(m) => Ok(Some(m)),
@@ -514,6 +537,16 @@ impl Database {
         }
         let entry = self.data.get_mut(key).unwrap();
         // moon#926 — see `stamp_mutation`.
+        // moon#940: a WRONGTYPE is a refused write, not a mutation. Classify
+        // first — the reborrow ends with this `match`, so the stamp below is
+        // still the ONE lookup this accessor makes. The accepted arms stamp
+        // exactly as before; only the refusal changes.
+        if !matches!(
+            entry.value.as_redis_value_mut(),
+            Some(RedisValue::SetIntset(_) | RedisValue::Set(_) | RedisValue::SetListpack(_))
+        ) {
+            return Err(Self::wrongtype_error());
+        }
         stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::SetIntset(is)) => Ok(Some(is)),
@@ -580,6 +613,18 @@ impl Database {
         }
         let entry = self.data.get_mut(key).unwrap();
         // moon#926 — see `stamp_mutation`.
+        // moon#940: a WRONGTYPE is a refused write, not a mutation. Classify
+        // first — the reborrow ends with this `match`, so the stamp below is
+        // still the ONE lookup this accessor makes. The accepted arms stamp
+        // exactly as before; only the refusal changes.
+        if !matches!(
+            entry.value.as_redis_value_mut(),
+            Some(
+                RedisValue::HashListpack(_) | RedisValue::Hash(_) | RedisValue::HashWithTtl { .. },
+            )
+        ) {
+            return Err(Self::wrongtype_error());
+        }
         stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::HashListpack(lp)) => Ok(Some(lp)),
@@ -648,6 +693,16 @@ impl Database {
         }
         let entry = self.data.get_mut(key).unwrap();
         // moon#926 — see `stamp_mutation`.
+        // moon#940: a WRONGTYPE is a refused write, not a mutation. Classify
+        // first — the reborrow ends with this `match`, so the stamp below is
+        // still the ONE lookup this accessor makes. The accepted arms stamp
+        // exactly as before; only the refusal changes.
+        if !matches!(
+            entry.value.as_redis_value_mut(),
+            Some(RedisValue::ListListpack(_) | RedisValue::List(_))
+        ) {
+            return Err(Self::wrongtype_error());
+        }
         stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::ListListpack(lp)) => Ok(Some(lp)),
@@ -763,25 +818,33 @@ impl Database {
         // than its four siblings for a key that is not even an intset.
         let entry = self.data.get_mut(key).unwrap();
         let swing = absorb_intset_into_listpack(entry, absorb_intset);
-        // moon#926 — see `stamp_mutation`.
-        stamp_mutation(entry);
+        // Classify ONCE, on the handle already held, before deciding whether
+        // the `SetKind::upgrade` below may run: `upgrade` flattens a
+        // `SetListpack` too, and keeping that one compact is the whole reason
+        // this accessor exists (moon#787).
+        //
+        // moon#940 moved this ABOVE the stamp: a WRONGTYPE is a refused write
+        // and must not dirty a watching transaction. `None` is that refusal.
+        let classified = match entry.value.as_redis_value() {
+            RedisValueRef::SetListpack(_) => Some(false),
+            RedisValueRef::Set(_) | RedisValueRef::SetIntset(_) => Some(true),
+            _ => None,
+        };
         // Disjoint field borrows: `entry` borrows `self.data`, the ledger is
-        // a separate field (same shape as `get_or_create`).
+        // a separate field (same shape as `get_or_create`). Applied on EVERY
+        // path, refusal included — `absorb_intset_into_listpack` already ran,
+        // so an early return that skipped this would desync the ledger.
         if let Some((before, after)) = swing {
             self.used_memory = self
                 .used_memory
                 .saturating_add(after)
                 .saturating_sub(before);
         }
-        // Classify ONCE, on the handle already held, before deciding whether
-        // the `SetKind::upgrade` below may run: `upgrade` flattens a
-        // `SetListpack` too, and keeping that one compact is the whole reason
-        // this accessor exists (moon#787).
-        let full = match entry.value.as_redis_value() {
-            RedisValueRef::SetListpack(_) => false,
-            RedisValueRef::Set(_) | RedisValueRef::SetIntset(_) => true,
-            _ => return Err(Self::wrongtype_error()),
+        let Some(full) = classified else {
+            return Err(Self::wrongtype_error());
         };
+        // moon#926 — see `stamp_mutation`.
+        stamp_mutation(entry);
         if !full {
             return match entry.value.as_redis_value_mut() {
                 Some(RedisValue::SetListpack(lp)) => Ok(SetHandle::Listpack(lp)),
@@ -880,6 +943,20 @@ impl Database {
         }
         let entry = self.data.get_mut(key).unwrap();
         // moon#926 — see `stamp_mutation`.
+        // moon#940: a WRONGTYPE is a refused write, not a mutation. Classify
+        // first — the reborrow ends with this `match`, so the stamp below is
+        // still the ONE lookup this accessor makes. The accepted arms stamp
+        // exactly as before; only the refusal changes.
+        if !matches!(
+            entry.value.as_redis_value_mut(),
+            Some(
+                RedisValue::SortedSetListpack(_)
+                    | RedisValue::SortedSetBPTree { .. }
+                    | RedisValue::SortedSet { .. },
+            )
+        ) {
+            return Err(Self::wrongtype_error());
+        }
         stamp_mutation(entry);
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::SortedSetListpack(lp)) => Ok(Some(lp)),
