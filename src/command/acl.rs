@@ -860,4 +860,41 @@ mod tests {
         let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         assert!(matches!(result, Frame::Error(_)));
     }
+
+    /// moon#981: the `commands` field must report the base polarity the
+    /// table holds. A `+@all -flushall` user was reported as
+    /// `-@all -flushall` -- the same inversion `ACL SAVE` wrote to disk, from
+    /// a second copy of the same serializer. Redis 8.6.1 answers
+    /// `+@all -flushall` on the wire.
+    #[test]
+    fn getuser_reports_the_allow_all_base_of_a_user_with_one_revocation() {
+        let table = make_acl_table();
+        let mut log = AclLog::new(128);
+        let rc = make_runtime_config();
+
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"SETUSER")),
+            Frame::BulkString(Bytes::from_static(b"rt")),
+            Frame::BulkString(Bytes::from_static(b"on")),
+            Frame::BulkString(Bytes::from_static(b"+@all")),
+            Frame::BulkString(Bytes::from_static(b"-flushall")),
+        ];
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
+
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"GETUSER")),
+            Frame::BulkString(Bytes::from_static(b"rt")),
+        ];
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
+        let Frame::Map(pairs) = result else {
+            panic!("Expected Map from GETUSER, got {result:?}");
+        };
+        assert_eq!(pairs[2].0, Frame::BulkString(Bytes::from_static(b"commands")));
+        assert_eq!(
+            pairs[2].1,
+            Frame::BulkString(Bytes::from_static(b"+@all -flushall")),
+            "GETUSER must report the allow-all base, not invert it"
+        );
+    }
 }

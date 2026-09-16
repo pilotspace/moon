@@ -266,4 +266,104 @@ mod tests {
             .collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("test.acl")]);
     }
+
+    /// Build a user the way `ACL SETUSER` / the file loader do: through the
+    /// rule parser, so the test exercises the same `CommandPermissions`
+    /// transitions a live server performs.
+    fn user_from_rules(rules: &[&str]) -> AclUser {
+        let mut user = AclUser::default_deny("rt".to_string());
+        for rule in rules {
+            apply_rule(&mut user, rule);
+        }
+        user
+    }
+
+    /// moon#981. `CommandPermissions::Specific` carries `base_allow`
+    /// (moon#971), but the serializer dropped it and wrote `-@all` for EVERY
+    /// Specific user. A `+@all -flushall` user therefore came back from
+    /// `ACL LOAD` (or a restart with `--aclfile`) able to run nothing at all.
+    /// Redis 8.6.1 writes the line as `... +@all -flushall`, verified on the
+    /// wire against a real `aclfile`.
+    #[test]
+    fn allow_all_base_with_one_revocation_survives_the_line_roundtrip() {
+        let user = user_from_rules(&["+@all", "-flushall"]);
+        assert!(user.is_command_allowed("get"), "precondition: base is allow");
+        assert!(!user.is_command_allowed("flushall"), "precondition: -flushall took");
+
+        let line = user_to_acl_line(&user);
+        assert!(
+            line.ends_with(" +@all -flushall"),
+            "the written rules must carry the allow-all base, got: {line}"
+        );
+
+        let reloaded = parse_acl_line(&line).expect("a user line parses");
+        assert!(
+            reloaded.is_command_allowed("get"),
+            "OUTAGE: the reloaded user lost every grant except the one revocation"
+        );
+        assert!(reloaded.is_command_allowed("hset"));
+        assert!(
+            !reloaded.is_command_allowed("flushall"),
+            "the one revocation must survive too"
+        );
+    }
+
+    /// Same defect, with a category revocation and a re-grant inside it:
+    /// `+@all -@string +get`. Everything outside `@string` stays allowed,
+    /// `set` stays denied, `get` is back. The re-grant is the case where the
+    /// `allowed` set is non-empty under an allow-all base, so a serializer
+    /// that emits `allowed` alone would still read as a deny-all user.
+    #[test]
+    fn allow_all_base_with_category_revocation_and_regrant_survives_the_roundtrip() {
+        let user = user_from_rules(&["+@all", "-@string", "+get"]);
+        let line = user_to_acl_line(&user);
+        assert!(line.contains(" +@all "), "allow-all base missing from: {line}");
+        assert!(!line.contains("-@all"), "deny-all base written for an allow-all user: {line}");
+
+        let reloaded = parse_acl_line(&line).expect("a user line parses");
+        assert!(reloaded.is_command_allowed("hset"), "outside the revoked category");
+        assert!(reloaded.is_command_allowed("get"), "re-granted inside it");
+        assert!(!reloaded.is_command_allowed("set"), "still revoked");
+        assert!(!reloaded.is_command_allowed("append"), "still revoked");
+    }
+
+    /// Control: a deny-all base was already written correctly, and must keep
+    /// being written as `-@all` followed by the grants. Pins the polarity so
+    /// the moon#981 fix cannot overshoot into the other direction, which would
+    /// be an ESCALATION rather than an outage.
+    #[test]
+    fn deny_all_base_with_grants_still_writes_minus_all() {
+        let user = user_from_rules(&["-@all", "+get", "+set"]);
+        let line = user_to_acl_line(&user);
+        assert!(line.ends_with(" -@all +get +set"), "got: {line}");
+
+        let reloaded = parse_acl_line(&line).expect("a user line parses");
+        assert!(reloaded.is_command_allowed("get"));
+        assert!(reloaded.is_command_allowed("set"));
+        assert!(!reloaded.is_command_allowed("hset"), "ESCALATION: base must stay deny");
+        assert!(!reloaded.is_command_allowed("flushall"), "ESCALATION: base must stay deny");
+    }
+
+    /// moon#981 end to end through the file: `acl_save` then `acl_load`, the
+    /// exact path `ACL SAVE` + restart-with-`--aclfile` takes.
+    #[test]
+    fn acl_save_load_preserves_the_allow_all_base_of_a_restricted_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.acl");
+        let path_str = path.to_str().unwrap();
+
+        let mut table = AclTable::new();
+        let mut rt = user_from_rules(&["on", "+@all", "-flushall"]);
+        rt.nopass = true;
+        table.set_user("rt".to_string(), rt);
+        table.set_user("default".to_string(), AclUser::new_default_nopass());
+
+        acl_save(path_str, &table).unwrap();
+        let loaded = acl_load(path_str).unwrap();
+        let rt = loaded.get_user("rt").unwrap();
+
+        assert!(rt.is_command_allowed("get"), "OUTAGE: grants lost across SAVE/LOAD");
+        assert!(rt.is_command_allowed("set"));
+        assert!(!rt.is_command_allowed("flushall"), "the revocation must survive");
+    }
 }
