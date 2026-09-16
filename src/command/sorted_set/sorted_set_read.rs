@@ -448,6 +448,19 @@ pub fn zrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
         );
     }
+    // moon#961. With REV on a BYSCORE/BYLEX range, Redis takes the arguments
+    // MAX first: `ZRANGE k 3 1 BYSCORE REV`. Every range helper below documents
+    // the opposite contract — "all callers pass (min, max) in semantic order
+    // regardless of rev" — and `rev` there only reverses iteration. So the swap
+    // belongs here, at the one call site that receives the user's order.
+    //
+    // An index range is NOT swapped: `ZRANGE k 0 -1 REV` keeps start/stop and
+    // simply walks backwards.
+    let (min_arg, max_arg) = if rev && (by_score || by_lex) {
+        (max_arg, min_arg)
+    } else {
+        (min_arg, max_arg)
+    };
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(Some(zref)) => {
             match (&zref, zref.members_map(), zref.bptree()) {

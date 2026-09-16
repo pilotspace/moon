@@ -179,20 +179,33 @@ impl ScoreBound {
         }
     }
 
+    /// Does `score` satisfy this bound used as the LOWER end of a range?
+    ///
+    /// Compares exactly. Both sides are doubles parsed from the same wire
+    /// text, so there is no rounding here for a tolerance to absorb — and an
+    /// absolute `f64::EPSILON` tolerance is not a tolerance at all below
+    /// magnitude 1, where it spans many ulps (moon#966).
+    ///
+    /// An infinite bound is directional: `-inf` as a minimum admits every
+    /// score, but `+inf` as a minimum admits only `+inf` itself, which is what
+    /// makes `ZRANGEBYSCORE k +inf -inf` empty rather than everything
+    /// (moon#961).
     pub(super) fn includes(&self, score: f64) -> bool {
         match self {
             ScoreBound::NegInf => true,
-            ScoreBound::PosInf => true,
-            ScoreBound::Inclusive(v) => score >= *v || (score - *v).abs() < f64::EPSILON,
+            ScoreBound::PosInf => score == f64::INFINITY,
+            ScoreBound::Inclusive(v) => score >= *v,
             ScoreBound::Exclusive(v) => score > *v,
         }
     }
 
+    /// Does `score` satisfy this bound used as the UPPER end of a range?
+    /// The mirror of [`ScoreBound::includes`]; see its note.
     pub(super) fn includes_upper(&self, score: f64) -> bool {
         match self {
-            ScoreBound::NegInf => true,
+            ScoreBound::NegInf => score == f64::NEG_INFINITY,
             ScoreBound::PosInf => true,
-            ScoreBound::Inclusive(v) => score <= *v || (score - *v).abs() < f64::EPSILON,
+            ScoreBound::Inclusive(v) => score <= *v,
             ScoreBound::Exclusive(v) => score < *v,
         }
     }
@@ -3109,6 +3122,125 @@ mod tests {
                 String::from_utf8_lossy(&e)
             ),
             other => panic!("expected WRONGTYPE error, got {other:?}"),
+        }
+    }
+
+    // ---- moon#966 / moon#961: score-range bound comparison ----------------
+    //
+    // Both were reproduced against a live redis-server 8.6.1 oracle before
+    // this test was written. `ScoreBound` is the single decision point for
+    // every BYSCORE range, so both live here.
+
+    /// moon#966. `f64::EPSILON` is the gap between 1.0 and the next double —
+    /// a RELATIVE quantity. Used as an ABSOLUTE tolerance it swallows real
+    /// differences at every magnitude below 1: one ulp at 0.5 is 1.11e-16,
+    /// which is under EPSILON, so two distinct doubles compare "equal" and a
+    /// member strictly outside the range is reported inside it.
+    ///
+    /// Probe at magnitude 1 and this cannot fail — one ulp there IS EPSILON,
+    /// so `< EPSILON` is false. The magnitudes below are load-bearing.
+    #[test]
+    fn a_bound_excludes_a_score_one_ulp_outside_it() {
+        // 0.5000000000000001 is the next double after 0.5.
+        let just_above_half = 0.5_f64 + f64::EPSILON / 2.0;
+        assert!(just_above_half > 0.5, "test premise: distinct doubles");
+
+        assert!(
+            !ScoreBound::Inclusive(0.5).includes_upper(just_above_half),
+            "a score strictly greater than the inclusive upper bound must be excluded"
+        );
+        assert!(
+            !ScoreBound::Inclusive(0.5).includes(0.5 - f64::EPSILON / 4.0),
+            "a score strictly less than the inclusive lower bound must be excluded"
+        );
+
+        // The same at a magnitude where the absolute tolerance is millions of ulps.
+        let tiny = 1.0e-10_f64;
+        assert!(
+            !ScoreBound::Inclusive(tiny).includes_upper(tiny + f64::EPSILON / 2.0),
+            "the tolerance must not scale with how small the bound is"
+        );
+
+        // Exact equality still belongs to an inclusive bound.
+        assert!(ScoreBound::Inclusive(0.5).includes(0.5));
+        assert!(ScoreBound::Inclusive(0.5).includes_upper(0.5));
+    }
+
+    /// moon#961. `NegInf`/`PosInf` answered `true` in BOTH directions, so an
+    /// infinite bound admitted everything regardless of which end it sat on.
+    /// `ZRANGEBYSCORE k +inf -inf` returned the whole set; Redis returns empty.
+    #[test]
+    fn an_infinite_bound_respects_the_end_it_sits_on() {
+        // -inf as a LOWER bound admits everything; as an UPPER bound it admits
+        // only -inf itself.
+        assert!(ScoreBound::NegInf.includes(-1.0e300));
+        assert!(ScoreBound::NegInf.includes(f64::NEG_INFINITY));
+        assert!(!ScoreBound::NegInf.includes_upper(0.0));
+        assert!(ScoreBound::NegInf.includes_upper(f64::NEG_INFINITY));
+
+        // +inf as an UPPER bound admits everything; as a LOWER bound only +inf.
+        assert!(ScoreBound::PosInf.includes_upper(1.0e300));
+        assert!(ScoreBound::PosInf.includes_upper(f64::INFINITY));
+        assert!(!ScoreBound::PosInf.includes(0.0));
+        assert!(ScoreBound::PosInf.includes(f64::INFINITY));
+    }
+
+    /// moon#961, the other half. `zrange_by_score`'s contract is stated on the
+    /// function itself: *"All callers pass (min, max) in semantic order
+    /// regardless of rev"*. `ZRANGE` was the caller that did not — it handed
+    /// argv straight through, so the Redis invocation (max first when `REV` is
+    /// set) arrived as an inverted range and matched nothing.
+    #[test]
+    fn zrange_byscore_rev_reads_its_bounds_max_first() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"k", b"1", b"a", b"2", b"b", b"3", b"c"]);
+
+        // The Redis spelling: max, then min.
+        let got = zrange(
+            &mut db,
+            &[
+                bulk(b"k"),
+                bulk(b"3"),
+                bulk(b"1"),
+                bulk(b"BYSCORE"),
+                bulk(b"REV"),
+            ],
+        );
+        assert_eq!(
+            got,
+            Frame::Array(framevec![bulk(b"c"), bulk(b"b"), bulk(b"a")]),
+            "ZRANGE k 3 1 BYSCORE REV must walk the range in reverse"
+        );
+
+        // Without REV the order is the plain one, and the bounds are min-first.
+        let fwd = zrange(
+            &mut db,
+            &[bulk(b"k"), bulk(b"1"), bulk(b"3"), bulk(b"BYSCORE")],
+        );
+        assert_eq!(
+            fwd,
+            Frame::Array(framevec![bulk(b"a"), bulk(b"b"), bulk(b"c")])
+        );
+
+        // REV on a plain index range does NOT swap: start/stop stay start/stop.
+        let by_rank = zrange(&mut db, &[bulk(b"k"), bulk(b"0"), bulk(b"-1"), bulk(b"REV")]);
+        assert_eq!(
+            by_rank,
+            Frame::Array(framevec![bulk(b"c"), bulk(b"b"), bulk(b"a")]),
+            "an index range with REV reverses output but keeps start/stop order"
+        );
+    }
+
+    /// The `+inf -inf` inversion end to end: an empty answer, not the whole set.
+    #[test]
+    fn an_inverted_infinite_range_matches_nothing() {
+        let lo = ScoreBound::PosInf;
+        let hi = ScoreBound::NegInf;
+        for score in [-1.0e300, -1.0, 0.0, 1.0, 1.0e300] {
+            assert!(
+                !(lo.includes(score) && hi.includes_upper(score)),
+                "score {score} must not fall inside [+inf, -inf]"
+            );
         }
     }
 }
