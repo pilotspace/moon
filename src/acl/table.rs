@@ -554,9 +554,15 @@ impl AclTable {
         if user.unrestricted {
             return None;
         }
-        if user.key_patterns.is_empty() {
-            return Some(format!("User {} has no key permissions", username));
-        }
+        // NOTE (#979): there used to be an early `key_patterns.is_empty()`
+        // deny here, ahead of the keyless-command check below. It made a user
+        // with no key patterns unable to run PING, DBSIZE or any other command
+        // that names no key -- redis gates only KEYED commands on key
+        // patterns (`RESETKEYS` then `FLUSHALL` is permitted there). The loop
+        // at the bottom already denies every keyed command when the pattern
+        // list is empty (`any` over nothing is false), so removing the early
+        // return loses no protection.
+        //
         // ~* (read+write) shortcut -- fast path for users that have
         // unrestricted keys but restricted commands (so `unrestricted`
         // above was false for other reasons).
