@@ -26,13 +26,48 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-/// Files holding the connection handler's intercept gates.
-const GATE_FILES: [&str; 5] = [
+/// Files holding the connection handler's intercept gates. Kept in step with
+/// `GATE_FILES` in `src/server/conn/shared.rs`'s tests.
+///
+/// `watch.rs`: `try_handle_multi_exec` delegates `WATCH`/`UNWATCH` to
+/// `watch::try_handle_watch_unwatch`, whose name literals live outside the
+/// handler directory — the moon#946 blind spot, for a routable command.
+const GATE_FILES: [&str; 6] = [
     "src/server/conn/handler_monoio/dispatch.rs",
     "src/server/conn/handler_monoio/write.rs",
     "src/server/conn/handler_monoio/txn.rs",
     "src/server/conn/handler_monoio/pubsub.rs",
     "src/server/conn/handler_monoio/ft.rs",
+    "src/server/conn/watch.rs",
+];
+
+/// Commands a gate claims through a PREDICATE rather than a literal in its own
+/// body — `command::transaction::is_txn_*`, `command::temporal::is_temporal_*`,
+/// `server::conn::blocking::is_blocking_command_args` — so the text scan
+/// below cannot see them. The unit test
+/// `no_marked_command_fires_a_delegated_gate_predicate` in `shared.rs` drives
+/// the real predicates (they are crate-private); this is the integration-side
+/// copy, by name, so a mark on any of them fails here too.
+///
+/// `XREAD`/`XREADGROUP` block only with `BLOCK`, but the gate claims them by
+/// argv, and `NO_INTERCEPT` is per NAME — so neither may ever carry it.
+/// `MQ`/`WS` are claimed through `mq::is_mq_command` / `workspace::is_ws_command`.
+const DELEGATED_GATE_COMMANDS: [&str; 15] = [
+    "TXN",
+    "TEMPORAL.SNAPSHOT_AT",
+    "TEMPORAL.INVALIDATE",
+    "MQ",
+    "WS",
+    "BLPOP",
+    "BRPOP",
+    "BLMOVE",
+    "BRPOPLPUSH",
+    "BZPOPMIN",
+    "BZPOPMAX",
+    "BLMPOP",
+    "BZMPOP",
+    "XREAD",
+    "XREADGROUP",
 ];
 
 fn repo_root() -> PathBuf {
@@ -133,6 +168,33 @@ fn no_dotted_family_command_is_marked_no_intercept() {
         bad.is_empty(),
         "dotted commands are claimed by prefix-guarded gates (FT./GRAPH./CDC./TS.) \
          and must never be marked NO_INTERCEPT: {bad:?}"
+    );
+}
+
+/// No command claimed through a delegated predicate is marked — the scan
+/// cannot see those gates, so this is asserted by name (moon#946).
+#[test]
+fn no_delegated_gate_command_is_marked_no_intercept() {
+    let marked = names_marked_no_intercept();
+    let registry: BTreeSet<&str> = moon::command::metadata::COMMAND_META
+        .entries()
+        .map(|(k, _)| *k)
+        .collect();
+    for cmd in DELEGATED_GATE_COMMANDS {
+        assert!(
+            registry.contains(cmd),
+            "{cmd} is listed as a delegated-gate command but is not in \
+             COMMAND_META — the list rotted and the row would test nothing"
+        );
+    }
+    let bad: Vec<_> = DELEGATED_GATE_COMMANDS
+        .iter()
+        .filter(|c| marked.contains(**c))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "claimed by a gate through a predicate the scan cannot see, yet marked \
+         NO_INTERCEPT — the handler would skip that gate: {bad:?}"
     );
 }
 

@@ -1279,3 +1279,175 @@ fn pco16_spanning_multikey_joins_the_slotted_batch() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// moon#937 / moon#946 — the wait set is derived from the registry
+// ---------------------------------------------------------------------------
+
+/// `total_pipeline_remote_defer` from `INFO stats`.
+fn remote_defers(port: u16) -> u64 {
+    let mut c = Conn::open(port);
+    let info = c.send(&["INFO", "stats"]);
+    info.split("\r\n")
+        .find_map(|l| l.strip_prefix("total_pipeline_remote_defer:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| panic!("INFO stats has no total_pipeline_remote_defer field: {info:?}"))
+}
+
+/// Twelve `SET`s on distinct keys followed by `tail`, in ONE write, on a
+/// FRESH connection (its own shard decides which keys are remote). At
+/// `--shards 4` the chance that all twelve land locally — and the batch has
+/// nothing pending for `tail` to wait on — is 4^-12. Returns the deferral
+/// count the batch produced and `tail`'s reply.
+fn batch_with_pending_remote(port: u16, tag: &str, tail: &[&str]) -> (u64, String) {
+    let keys: Vec<String> = (0..12).map(|j| format!("pco13:{tag}:{j}")).collect();
+    let mut batch: Vec<Vec<&str>> = keys.iter().map(|k| vec!["SET", k.as_str(), "1"]).collect();
+    batch.push(tail.to_vec());
+    let refs: Vec<&[&str]> = batch.iter().map(Vec::as_slice).collect();
+    let before = remote_defers(port);
+    let mut c = Conn::open(port);
+    let replies = c.pipeline(&refs);
+    drop(c);
+    let delta = remote_defers(port) - before;
+    // The tail's reply is the last framed reply of the batch.
+    let tail_at = framed_len(replies.as_bytes(), refs.len() - 1).expect("framed batch");
+    (delta, replies[tail_at..].to_string())
+}
+
+/// moon#937: `TXN`, `TEMPORAL.*`, `SPUBLISH` and `WATCH` are consumed by an
+/// inline interceptor, and each ran against the local slice while its own
+/// batch's earlier writes were still undispatched — the guard's list of
+/// intercepted commands was hand-written and had drifted (measured on the
+/// pre-fix binary: deferral delta 0 for all four, 1 for `EVAL` and the
+/// keyless `TEMPORAL.SNAPSHOT_AT`). The wait set is now derived from
+/// `COMMAND_META`'s `NO_INTERCEPT` bit: a command waits unless the registry
+/// proves no gate can claim it.
+///
+/// The second half is the price check. Deriving fail-safe would have made 96
+/// plain keyspace commands wait for nothing; they are marked instead, and the
+/// rows with `want == 0` pin that a pipelined `HMSET`/`LRANGE`/`ZRANGE`/`XADD`
+/// still joins the slotted batch without cutting it.
+///
+/// `BLPOP` is moon#946: it is deferred by the #438 early-flush guard, which
+/// runs one statement before this predicate and does not count — so its
+/// delta is 0 on both binaries, and the row pins that the ordering IS held,
+/// by that guard, rather than not at all.
+#[test]
+fn pco13_intercepted_commands_are_deferred_behind_pending_remote_writes() {
+    let m = spawn_moon(SHARDS);
+    // (tail, expected deferral delta, why)
+    let rows: &[(&[&str], u64, &str)] = &[
+        (
+            &["TXN", "BEGIN"],
+            1,
+            "moon#937: intercepted, args[0] is a subcommand literal",
+        ),
+        (
+            &["TEMPORAL.INVALIDATE", "42", "NODE", "g"],
+            1,
+            "moon#937: intercepted, args[0] is an entity id",
+        ),
+        (
+            &["TEMPORAL.SNAPSHOT_AT"],
+            1,
+            "keyless by arity (control: waited before too)",
+        ),
+        (
+            &["EVAL", "return 1", "0"],
+            1,
+            "control: intercepted and declared before too",
+        ),
+        (
+            &["SPUBLISH", "pco13ch", "m"],
+            1,
+            "shard channel: intercepted, was not waiting",
+        ),
+        (
+            &["WATCH", "pco13wk"],
+            1,
+            "delegated gate (watch.rs): intercepted, was not waiting",
+        ),
+        (
+            &["BLPOP", "pco13bl", "0.05"],
+            0,
+            "moon#946: #438 guard defers it, uncounted",
+        ),
+        (
+            &["GET", "pco13gk"],
+            0,
+            "NO_INTERCEPT: routes by its own key",
+        ),
+        (
+            &["HMSET", "pco13hk", "f", "v"],
+            0,
+            "newly marked: must not start waiting",
+        ),
+        (
+            &["LRANGE", "pco13lk", "0", "-1"],
+            0,
+            "newly marked: must not start waiting",
+        ),
+        (
+            &["ZRANGE", "pco13zk", "0", "-1"],
+            0,
+            "newly marked: must not start waiting",
+        ),
+        (
+            &["XADD", "pco13xk", "*", "f", "v"],
+            0,
+            "newly marked: must not start waiting",
+        ),
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    for (i, (tail, want, why)) in rows.iter().enumerate() {
+        let (delta, reply) = batch_with_pending_remote(m.port, &i.to_string(), tail);
+        if delta != *want {
+            wrong.push(format!(
+                "  {tail:?}: deferred {delta} time(s), expected {want} — {why} (reply {reply:?})"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{}/{} rows took the wrong path through must_wait_for_pending_remote:\n{}",
+        wrong.len(),
+        rows.len(),
+        wrong.join("\n")
+    );
+}
+
+/// The user-visible symptom of `WATCH` skipping the wait: a transaction that
+/// WATCHes a key its own pipeline just wrote is aborted for no reason.
+///
+/// `SET k` (remote) + `WATCH k` + `MULTI` + `GET k` + `EXEC` in one write.
+/// WATCH is consumed inline by `watch::try_handle_watch_unwatch`, and on the
+/// pre-fix binary it captured the key's version BEFORE its own batch's `SET`
+/// landed, so the landing write looked like a concurrent modification and
+/// the transaction answered nil — 18 of 24 trials at `--shards 4` (the
+/// 1 − 1/shards signature). Redis, which executes a pipeline strictly in
+/// order, never aborts here. Twelve trials on fresh connections so a lucky
+/// local placement cannot pass this on its own.
+#[test]
+fn pco14_watch_inside_its_own_batch_never_aborts_the_transaction() {
+    let m = spawn_moon(SHARDS);
+    each_trial(m.port, "pco14", |c, t| {
+        let k = format!("{t}k");
+        let r = c.pipeline(&[
+            &["SET", &k, "1"],
+            &["WATCH", &k],
+            &["MULTI"],
+            &["GET", &k],
+            &["EXEC"],
+        ]);
+        let txn_reply_at = framed_len(r.as_bytes(), 4).expect("framed batch");
+        let txn_reply = &r[txn_reply_at..];
+        if txn_reply != "*1\r\n$1\r\n1\r\n" {
+            return Some(format!(
+                "the transaction answered {txn_reply:?} — the batch's own SET \
+                 landed AFTER WATCH captured the key's version, so it was \
+                 aborted by its own write (expected *1 $1 1)"
+            ));
+        }
+        None
+    });
+}
