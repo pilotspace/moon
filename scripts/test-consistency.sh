@@ -839,6 +839,119 @@ assert_both "ZADD bad score is an error"        ZADD z:enc:bad 1 a 2 b notafloat
 assert_both "ZADD bad score creates no key"     EXISTS z:enc:bad
 assert_both "ZADD bad score on listpack errors" ZADD z:enc:lp 4 d notafloat e
 assert_both "ZADD bad score writes no prefix"   ZCARD z:enc:lp
+
+# ---------------------------------------------------------------------------
+# moon#969 / moon#792 -- zset option semantics and error CLASSES.
+#
+# The class matters beyond the wording: redis-py raises a distinct exception
+# type per class, so a client branching on it takes the wrong branch. None of
+# these forms had a row in either harness, which is why every one of them was
+# free to drift. `{z969}` co-locates destination and sources so the rows keep
+# comparing the COMMAND, not the shard routing, at --shards > 1.
+# ---------------------------------------------------------------------------
+# GT, LT and NX are pairwise incompatible. `GT LT` used to be ACCEPTED and then
+# silently no-op'd at BOTH mutation sites -- the listpack arm and the B+tree
+# arm each carried a `gt && lt => never update` fallthrough.
+assert_both "ZADD GT+LT is rejected"            ZADD z:969:gtlt GT LT 1 m
+assert_both "ZADD GT+LT creates no key"         EXISTS z:969:gtlt
+assert_both "ZADD GT+NX is rejected"            ZADD z:969:gtlt GT NX 1 m
+assert_both "ZADD LT+NX is rejected"            ZADD z:969:gtlt LT NX 1 m
+assert_both "ZADD GT+LT+NX is rejected"         ZADD z:969:gtlt GT LT NX 1 m
+# ...and on an EXISTING member, on both encodings, the score must not move.
+both ZADD z:969:lp 5 m
+assert_both "ZADD GT+LT on a listpack member"   ZADD z:969:lp GT LT 9 m
+assert_both "ZADD GT+LT left the score alone"   ZSCORE z:969:lp m
+both ZADD z:969:bt 5 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+assert_both "ZADD GT+LT on a bptree member"     ZADD z:969:bt GT LT 9 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+assert_both "ZADD GT+LT left the bptree score"  ZSCORE z:969:bt aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+# An ODD score/member tail is `syntax error`; NO pairs at all is an ARITY
+# error. moon answered the arity error for both.
+assert_both "ZADD odd tail is a syntax error"   ZADD z:969:odd 1 a 2
+assert_both "ZADD CH with a lone score"         ZADD z:969:odd CH 1
+assert_both "ZADD with no pairs is arity"       ZADD z:969:odd NX
+# A NaN weight: Rust's parse accepts "nan", C's strtod+isnan does not.
+# Infinities stay legal on both.
+both ZADD {z969}:src 1 a
+assert_both "ZUNIONSTORE WEIGHTS nan"           ZUNIONSTORE {z969}:d 1 {z969}:src WEIGHTS nan
+assert_both "ZINTERSTORE WEIGHTS nan"           ZINTERSTORE {z969}:d 1 {z969}:src WEIGHTS nan
+assert_both "ZUNION WEIGHTS nan"                ZUNION 1 {z969}:src WEIGHTS nan
+assert_both "ZINTER WEIGHTS nan"                ZINTER 1 {z969}:src WEIGHTS nan
+assert_both "ZUNIONSTORE WEIGHTS nan no key"    EXISTS {z969}:d
+assert_both "ZUNIONSTORE WEIGHTS inf is legal"  ZUNIONSTORE {z969}:d 1 {z969}:src WEIGHTS inf
+# ZPOPMIN/ZPOPMAX count: `getPositiveLongFromObject`, one message for every
+# failure, and 0 is a legal count.
+assert_both "ZPOPMIN count not an integer"      ZPOPMIN z:969:lp notanint
+assert_both "ZPOPMIN negative count"            ZPOPMIN z:969:lp -1
+assert_both "ZPOPMAX count not an integer"      ZPOPMAX z:969:lp notanint
+assert_both "ZPOPMAX negative count"            ZPOPMAX z:969:lp -1
+assert_both "ZPOPMIN count 0 is legal"          ZPOPMIN z:969:lp 0
+# numkeys SPLITS into two classes for the set-operation family: not-a-number
+# is the generic integer error, a number below 1 names the command.
+assert_both "ZUNIONSTORE numkeys 0"             ZUNIONSTORE {z969}:d 0 {z969}:src
+assert_both "ZUNIONSTORE numkeys -1"            ZUNIONSTORE {z969}:d -1 {z969}:src
+assert_both "ZUNIONSTORE numkeys notanint"      ZUNIONSTORE {z969}:d notanint {z969}:src
+assert_both "ZINTERSTORE numkeys 0"             ZINTERSTORE {z969}:d 0 {z969}:src
+assert_both "ZUNION numkeys 0"                  ZUNION 0 {z969}:src
+assert_both "ZINTER numkeys 0"                  ZINTER 0 {z969}:src
+assert_both "ZDIFF numkeys 0"                   ZDIFF 0 {z969}:src
+assert_both "ZINTERCARD numkeys 0"              ZINTERCARD 0 {z969}:src
+assert_both "ZINTERCARD numkeys notanint"       ZINTERCARD notanint {z969}:src
+# Arity is checked FIRST, so a form naming no key never reaches those rules.
+assert_both "ZUNION numkeys 0 with no key"      ZUNION 0
+assert_both "ZINTERCARD numkeys 0 with no key"  ZINTERCARD 0
+# ZMPOP does NOT split -- one message for every numkeys failure.
+assert_both "ZMPOP numkeys 0"                   ZMPOP 0 z:969:lp MIN
+assert_both "ZMPOP numkeys -1"                  ZMPOP -1 z:969:lp MIN
+assert_both "ZMPOP numkeys notanint"            ZMPOP notanint z:969:lp MIN
+assert_both "ZMPOP COUNT 0"                     ZMPOP 1 z:969:lp MIN COUNT 0
+assert_both "ZMPOP COUNT -1"                    ZMPOP 1 z:969:lp MIN COUNT -1
+assert_both "ZMPOP COUNT notanint"              ZMPOP 1 z:969:lp MIN COUNT notanint
+assert_both "ZMPOP rejected pops nothing"       ZCARD z:969:lp
+# ZINTERCARD LIMIT has its own message too.
+assert_both "ZINTERCARD LIMIT -1"               ZINTERCARD 1 z:969:lp LIMIT -1
+assert_both "ZINTERCARD LIMIT notanint"         ZINTERCARD 1 z:969:lp LIMIT notanint
+assert_both "ZINTERCARD LIMIT 0 is unbounded"   ZINTERCARD 1 z:969:lp LIMIT 0
+# syntax error, NOT an arity error: a short WEIGHTS list, a dangling
+# AGGREGATE/LIMIT/COUNT, a numkeys overrunning the key list, and an unknown
+# trailing token (the one option loop the moon#967 sweep missed).
+assert_both "ZUNIONSTORE dangling WEIGHTS"      ZUNIONSTORE {z969}:d 1 {z969}:src WEIGHTS
+assert_both "ZUNION dangling WEIGHTS"           ZUNION 1 {z969}:src WEIGHTS
+assert_both "ZUNIONSTORE dangling AGGREGATE"    ZUNIONSTORE {z969}:d 1 {z969}:src AGGREGATE
+assert_both "ZUNIONSTORE numkeys overruns"      ZUNIONSTORE {z969}:d 2 {z969}:src
+assert_both "ZUNION numkeys overruns"           ZUNION 2 {z969}:src
+assert_both "ZINTERCARD numkeys overruns"       ZINTERCARD 2 {z969}:src
+assert_both "ZMPOP numkeys overruns"            ZMPOP 2 z:969:lp MIN
+assert_both "ZUNIONSTORE unknown token"         ZUNIONSTORE {z969}:d 1 {z969}:src BOGUS
+assert_both "ZINTERCARD dangling LIMIT"         ZINTERCARD 1 z:969:lp LIMIT
+assert_both "ZMPOP dangling COUNT"              ZMPOP 1 z:969:lp MIN COUNT
+# ANTI-REGRESSION (moon#969 cites these as wrong; the oracle says they are
+# NOT). A ZRANGE rank index and a `LIMIT offset count` are read by Redis with
+# `getLongFromObjectOrReply(..., NULL)`, whose message is exactly the generic
+# integer error moon already answers. These rows exist so a later reading of
+# moon#969 cannot "fix" them into a divergence.
+both ZADD z:969:ok 1 a 2 b
+assert_both "ZRANGE rank start stays generic"   ZRANGE z:969:ok notanint 5
+assert_both "ZRANGE rank stop stays generic"    ZRANGE z:969:ok 0 notanint
+assert_both "ZRANGE fractional rank is generic" ZRANGE z:969:ok 1.5 2
+assert_both "ZREVRANGE rank stays generic"      ZREVRANGE z:969:ok notanint 5
+assert_both "ZRANGE REV LIMIT stays generic"    ZRANGE z:969:ok 0 -1 REV LIMIT notanint 5
+assert_both "ZRANGEBYSCORE LIMIT offset"        ZRANGEBYSCORE z:969:ok 0 5 LIMIT notanint 5
+assert_both "ZRANGEBYSCORE LIMIT count"         ZRANGEBYSCORE z:969:ok 0 5 LIMIT 0 notanint
+assert_both "ZREVRANGEBYSCORE LIMIT offset"     ZREVRANGEBYSCORE z:969:ok 5 0 LIMIT notanint 5
+assert_both "ZRANDMEMBER count stays generic"   ZRANDMEMBER z:969:ok notanint
+assert_both "ZRANGESTORE rank stays generic"    ZRANGESTORE {z969}:d z:969:ok notanint 5
+# moon#792: CH counts a rescore EXACTLY, as Redis does. `1.0000000000000002`
+# is nextafter(1.0), whose distance from 1.0 is exactly f64::EPSILON -- so the
+# old `.abs() > f64::EPSILON` window called this real move "unchanged" while
+# the stored score really did change, which the ZSCORE row proves.
+both ZADD z:792:lp 1 m
+assert_both "ZADD CH sub-epsilon (listpack)"    ZADD z:792:lp CH 1.0000000000000002 m
+assert_both "ZADD CH sub-epsilon moved score"   ZSCORE z:792:lp m
+assert_both "ZADD CH rewriting the same score"  ZADD z:792:lp CH 1.0000000000000002 m
+both ZADD z:792:bt 1 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+assert_both "ZADD CH sub-epsilon (bptree)"      ZADD z:792:bt CH 1.0000000000000002 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+assert_both "ZADD CH bptree moved score"        ZSCORE z:792:bt bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
 # Exactly zset-max-listpack-entries (128) members is STILL a listpack; one
 # more promotes to a skiplist on both. One ZADD per step, not 129 — each
 # `both` spawns two redis-cli processes.

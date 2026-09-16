@@ -913,6 +913,44 @@ if should_run "sorted_set"; then
     assert_match "ZRANGESTORE"         ZRANGESTORE {z}:rstore {z}:A 0 -1
     assert_match "ZCARD after ZRANGESTORE" ZCARD {z}:rstore
     assert_moon_ok "ZSCAN"             ZSCAN {z}:A 0
+
+    # moon#969 / moon#792 -- option semantics and error CLASSES. redis-cli
+    # prints an error reply on STDOUT with rc=0, so assert_match compares the
+    # text directly. Every form below was previously unrepresented in either
+    # harness, which is how they drifted.
+    assert_match "ZADD GT+LT rejected"     ZADD z:e1 GT LT 1 m
+    assert_match "ZADD GT+LT made no key"  EXISTS z:e1
+    assert_match "ZADD GT+NX rejected"     ZADD z:e1 GT NX 1 m
+    assert_match "ZADD odd tail is syntax" ZADD z:e1 1 a 2
+    assert_match "ZADD no pairs is arity"  ZADD z:e1 NX
+    rcli ZADD {z}:w 1 a >/dev/null 2>&1; mcli ZADD {z}:w 1 a >/dev/null 2>&1
+    assert_match "ZUNIONSTORE WEIGHTS nan" ZUNIONSTORE {z}:wd 1 {z}:w WEIGHTS nan
+    assert_match "ZUNION WEIGHTS nan"      ZUNION 1 {z}:w WEIGHTS nan
+    assert_match "ZUNIONSTORE WEIGHTS inf" ZUNIONSTORE {z}:wd 1 {z}:w WEIGHTS inf
+    assert_match "ZPOPMIN bad count"       ZPOPMIN {z}:w notanint
+    assert_match "ZPOPMIN negative count"  ZPOPMIN {z}:w -1
+    assert_match "ZUNIONSTORE numkeys 0"   ZUNIONSTORE {z}:wd 0 {z}:w
+    assert_match "ZUNIONSTORE numkeys -1"  ZUNIONSTORE {z}:wd -1 {z}:w
+    assert_match "ZUNIONSTORE numkeys bad" ZUNIONSTORE {z}:wd notanint {z}:w
+    assert_match "ZINTERCARD numkeys 0"    ZINTERCARD 0 {z}:w
+    assert_match "ZMPOP numkeys 0"         ZMPOP 0 {z}:w MIN
+    assert_match "ZMPOP COUNT 0"           ZMPOP 1 {z}:w MIN COUNT 0
+    assert_match "ZINTERCARD LIMIT -1"     ZINTERCARD 1 {z}:w LIMIT -1
+    assert_match "ZUNIONSTORE bare WEIGHTS" ZUNIONSTORE {z}:wd 1 {z}:w WEIGHTS
+    assert_match "ZUNIONSTORE bare AGGREG"  ZUNIONSTORE {z}:wd 1 {z}:w AGGREGATE
+    assert_match "ZUNIONSTORE numkeys over" ZUNIONSTORE {z}:wd 2 {z}:w
+    assert_match "ZUNIONSTORE junk token"   ZUNIONSTORE {z}:wd 1 {z}:w BOGUS
+    # Anti-regression: rank-index and LIMIT parses KEEP the generic integer
+    # error -- Redis reads them with a NULL message. moon#969 calls these
+    # wrong; the oracle says they are not.
+    assert_match "ZRANGE rank stays generic" ZRANGE {z}:w notanint 5
+    assert_match "ZRANGE LIMIT stays generic" ZRANGEBYSCORE {z}:w 0 5 LIMIT notanint 5
+    assert_match "ZRANDMEMBER stays generic"  ZRANDMEMBER {z}:w notanint
+    # moon#792: CH counts an exact rescore; nextafter(1.0) is exactly one
+    # f64::EPSILON away and used to be reported as no change.
+    rcli ZADD z:ch 1 m >/dev/null 2>&1; mcli ZADD z:ch 1 m >/dev/null 2>&1
+    assert_match "ZADD CH sub-epsilon"     ZADD z:ch CH 1.0000000000000002 m
+    assert_match "ZADD CH moved the score" ZSCORE z:ch m
 fi
 
 # ===========================================================================
