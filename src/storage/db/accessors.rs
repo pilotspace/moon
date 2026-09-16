@@ -1271,13 +1271,20 @@ impl Database {
         let val = list.pop_front()?;
         let empty = list.is_empty();
         // `list`'s borrow of `self` ends above.
+        //
+        // moon#949: credit the element UNCONDITIONALLY. The empty branch used
+        // to skip this on the theory that whole-key removal recovers the cost
+        // via `entry_overhead` — it does not. `entry_overhead` is computed
+        // from the CURRENT value, which by then no longer holds the element,
+        // so the push-time charge was never given back and `used_memory`
+        // drifted UP by one element every time a list was drained to empty.
+        // Unbounded on an empty keyspace, which is `--maxmemory` and eviction
+        // firing on a server holding nothing. `pop_eager` in
+        // `src/command/list/` always credited unconditionally; this is the
+        // same rule.
+        self.credit_memory(list_elem_cost(&val));
         if empty {
-            // Whole-key removal recomputes the (now-empty) entry cost via
-            // `entry_overhead` -- no separate credit needed for the popped
-            // element itself.
             self.remove(key);
-        } else {
-            self.credit_memory(list_elem_cost(&val));
         }
         Some(val)
     }
@@ -1290,10 +1297,10 @@ impl Database {
         let list = self.get_mut_if_present::<db_kind::ListKind>(key).ok()??;
         let val = list.pop_back()?;
         let empty = list.is_empty();
+        // moon#949 — see `list_pop_front`.
+        self.credit_memory(list_elem_cost(&val));
         if empty {
             self.remove(key);
-        } else {
-            self.credit_memory(list_elem_cost(&val));
         }
         Some(val)
     }

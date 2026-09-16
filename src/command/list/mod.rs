@@ -1860,12 +1860,11 @@ mod ledger_and_encoding_942 {
     /// firing on a server that is actually empty, rather than moon#814's
     /// never-firing direction.
     ///
-    /// The fix is one line in each of the two accessors — credit the element
-    /// unconditionally, exactly as `pop_eager` in this module already does —
-    /// but `src/storage/db/accessors.rs` is not this change's to edit. When it
-    /// lands, this constant goes to 0 and that is the signal, not a
-    /// regression.
-    const STRANDED_BY_LIST_POP: usize = 56;
+    /// FIXED in moon#949: both accessors now credit the element
+    /// unconditionally, exactly as `pop_eager` in this module already did. The
+    /// constant is kept at 0 rather than deleted, so the cases below still
+    /// enumerate every draining writer and would catch the strand coming back.
+    const STRANDED_BY_LIST_POP: usize = 0;
 
     /// EVERY list writer that can remove the last element must remove the KEY
     /// with it, on BOTH encodings.
