@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ACL SAVE` no longer inverts a `+@all -<cmd>` user into `-@all -<cmd>`**
+  (moon#981). `CommandPermissions::Specific` carries the `base_allow` polarity
+  added by moon#971, but the serializer behind `ACL SAVE`, `ACL LIST` and
+  `ACL GETUSER` discarded it and wrote `-@all` plus the sets for EVERY
+  Specific user. A service account defined as "everything except FLUSHALL"
+  was written to disk as "nothing, and also not FLUSHALL", and came back from
+  `ACL LOAD` or a restart with `--aclfile` unable to run a single command —
+  `GET k` answered `NOPERM` while `SAVE` and `LOAD` had both answered `+OK`.
+  It failed closed, so it was an outage rather than an escalation, but a
+  silent one. The writer now emits `+@all` followed by the revocations (then
+  any re-grants) when the base is allow, and `-@all` followed by the grants
+  when it is deny — the same line redis 8.6.1 writes, verified against a real
+  `aclfile` on both engines. The reader was already correct; only the writer
+  changed. `ACL GETUSER`'s `commands` field, a second copy of the same
+  serializer, now shares the one implementation and reports
+  `+@all -flushall` as redis does.
 - **`LMOVE`/`RPOPLPUSH`/`BLPOP` no longer strand 56 B every time they drain a
   list to empty** (moon#949). `Database::list_pop_front`/`list_pop_back`
   credited the popped element back to `used_memory` on the non-empty branch but
