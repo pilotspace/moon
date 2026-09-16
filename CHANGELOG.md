@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A type-refused write no longer aborts a watching transaction**
+  (moon#940). Acquiring a mutable handle IS the WATCH version bump (moon#926),
+  and it fired before the arm that answers `WRONGTYPE` — so `SADD`/`HSET`/
+  `LPUSH`/`ZADD` against a key of the wrong type dirtied that key and aborted a
+  concurrent `EXEC` that redis lets through. The command mutated nothing, so a
+  watcher had nothing to miss: measured against redis 8.6.1 over a raw socket,
+  `EXEC` answered nil on moon and the queued replies on redis, for all four
+  families. Every accessor now decides the type before it stamps, and the
+  positive control (a real `SET`) still aborts on both engines. The accepted
+  paths stamp exactly as before, so the moon#942 probe budgets and the "exactly
+  once per command" version counts are unchanged; only the refusal differs.
 - **`HINCRBY` refuses to wrap at the i64 boundary** (moon#952). The increment
   used a plain `+`, which wraps in release builds, so `HINCRBY h f 1` on a field
   holding `i64::MAX` replied `(integer) -9223372036854775808` and STORED it —
@@ -575,12 +586,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   acquiring two, so one `SADD` moved a watched key's version by two. It now
   moves it by one. A watcher aborted either way, so this is not a behaviour
   fix; it is the observable tell that the duplicate accessor is gone, and a
-  new test pins it on all three encodings. **moon#940 is untouched and still
-  open**: `stamp_mutation` still fires before the arm that answers
-  `Err(WRONGTYPE)`, so a rejected `SADD` still dirties the key. A test pins
-  that at exactly one bump, so this change is provably neutral on it — two
-  would mean a handle was added, zero would mean #940 was fixed as an
-  unbenchmarked side effect.
+  new test pins it on all three encodings. moon#940 was untouched by *this*
+  change and was still open when it landed: `stamp_mutation` fired before the
+  arm that answers `Err(WRONGTYPE)`, so a rejected `SADD` still dirtied the
+  key, and a test pinned that at exactly one bump so this change was provably
+  neutral on it. **moon#940 is fixed separately in this same release** — see
+  the entry above; that pin has been replaced by one asserting no bump at all.
 
   Encoding behaviour is unchanged and was checked against a live redis 8.6.1
   on every rung of the ladder above, plus the entry-count boundary, `SREM` on
