@@ -8,6 +8,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The cold-index rebuild no longer drops entries silently, and an
+  indexed-but-unreadable cold entry is no longer a "miss" in code**
+  (moon#875). `ColdIndex::rebuild_from_manifest_per_db` skipped a heap file
+  that failed to read (any `io::Error`), a page that failed its magic/type/CRC
+  check, and a trailing partial page (`chunks_exact` discards the remainder)
+  with no log line, no counter and no error — and every entry lost that way
+  then read as an ABSENT key, indistinguishable to a client from one that was
+  never written. Two more silent paths were found on the way: a slot inside a
+  CRC-valid page that does not decode (an unknown `ValueType`, i.e. a
+  downgrade), and a file truncated on a page boundary, which no per-page check
+  can see. Every one is now counted by cause (`INFO` →
+  `reclamation_cold_recovery_{files_missing,files_unreadable,files_short,pages_rejected,partial_page_bytes,entries_rejected}_total`),
+  logged with the `file_id` and page, and rolled into one per-shard summary
+  that says `cold index rebuild clean` or `cold index rebuild DEGRADED`. A
+  valid `KvOverflow` page — which `KvLeafPage::from_bytes` also rejects — is
+  classified from its header first and is NOT counted as loss. The decision
+  per class: a `NotFound` file (the orphan sweep's unlink-before-commit crash
+  window, or external removal) is warned about and queued so the sweep
+  retires its manifest entry instead of re-warning on every boot; any other
+  read error is logged at `error` and the file is skipped, never tombstoned,
+  so a restart after the operator fixes it recovers the keys (a recovery
+  `Err` today falls back to v2 recovery, which would discard the whole v3
+  replay — refusing to boot needs a path shard init does not have yet, left
+  as a follow-up); corrupt pages, partial pages and undecodable slots are
+  bytes that are gone, so they are counted and logged. On the read side,
+  `ColdReadOutcome` gained `Unreadable(ColdReadFault)`: `Miss` now means only
+  "no index entry", and a read whose index entry points at bytes that cannot
+  be produced is counted (`reclamation_cold_read_unreadable_total`), logged
+  with its location, and leaves the index entry in place so a later read
+  retries. Value-reading commands still answer nil for such a key at the
+  wire — the accessor family has no error channel out of `Database::get`,
+  and a dispatch-boundary flag would report an `IOERR` on a write that had
+  already executed — so the `-IOERR` reply with fail-closed writes is filed
+  as a follow-up rather than half-wired. Proved with a real spill →
+  `BGREWRITEAOF` → `SIGKILL` → damage → restart lifecycle at `--shards 1`
+  and `4` against the pre-fix binary: the four damaged keys answered nil
+  with nothing in `INFO` or the log; after the fix the same nil comes with
+  the counters and the file ids.
 - **A re-spilled key recovers to its NEWEST on-disk copy, not whichever file
   the manifest happened to list last** (moon#983). The cold-index rebuild
   resolved a key present in two Active heap files by "last one seen wins",

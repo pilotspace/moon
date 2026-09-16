@@ -291,6 +291,15 @@ impl Database {
                 false
             }
             ColdReadOutcome::Miss => false,
+            // moon#875: indexed, but the bytes could not be produced. NOT a
+            // miss: the index entry is kept (a transient I/O error must not
+            // permanently drop the key; the next read retries) and nothing
+            // is fabricated in hot RAM. `read_cold_entry` has already
+            // counted and logged the fault with its location. The caller
+            // sees "not hot" and the command answers as it would for an
+            // absent key — see `ColdReadOutcome::Unreadable` for why the
+            // wire reply is not yet an error.
+            ColdReadOutcome::Unreadable(_) => false,
         }
     }
 

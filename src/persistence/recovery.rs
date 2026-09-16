@@ -391,75 +391,123 @@ pub fn recover_shard_v3_pitr(
     // path normal (non-restart) cold read-through already uses. This is the
     // ONLY place a KvLeaf DataFile is read during recovery now.
     if manifest_path.exists() {
-        if let Ok(manifest) = ShardManifest::open(&manifest_path) {
-            let per_db =
-                crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest_per_db(
-                    shard_dir, &manifest,
-                );
-            // Observability parity with the removed hot-reload loop's
-            // counter: report how many keys the cold tier recovered, NOT
-            // how many were loaded into RAM (zero, by design).
-            result.kv_heap_entries_loaded = per_db.iter().map(|(_, ci)| ci.len()).sum();
-            // Attach each database's index to ITS database (#139 — spilled
-            // SELECT >0 keys used to recover into db0's index, unreachable
-            // from their own db) BEFORE Phase 4 replay. Replayed
-            // DEL/UNLINK/FLUSH*/EXPIRE-past must tombstone the cold plane:
-            // with `cold_index == None`, `remove_counting_cold()`/`clear()`
-            // are silent no-ops (`as_mut()` on None), so a key deleted in
-            // the WAL tail resurrects via cold read-through after restart
-            // whenever the crash lands inside the pre-orphan-sweep window
-            // (the manifest entry is still Active until the sweep).
-            for (db_index, cold_idx) in per_db {
-                info!(
-                    "Shard {}: rebuilt cold index for db {} with {} entries",
+        match ShardManifest::open(&manifest_path) {
+            Err(e) => {
+                // Phase 2 already warned that the manifest failed to open;
+                // this is the CONSEQUENCE, which that line does not state:
+                // no cold index at all, so every spilled key reads as an
+                // absent key until the manifest is repaired (moon#875).
+                tracing::error!(
                     shard_id,
-                    db_index,
-                    cold_idx.len()
+                    path = %manifest_path.display(),
+                    err = %e,
+                    "cold recovery: manifest unreadable, cold index NOT rebuilt — every \
+                     spilled key of this shard reads as ABSENT until the manifest is repaired \
+                     and the server restarts"
                 );
-                match databases.get_mut(db_index) {
-                    Some(db) => {
-                        db.cold_shard_dir = Some(shard_dir.to_path_buf());
-                        match db.cold_index.as_mut() {
-                            Some(existing) => existing.merge(cold_idx),
-                            None => db.cold_index = Some(cold_idx),
+            }
+            Ok(manifest) => {
+                let crate::storage::tiered::cold_index::ColdRebuild { per_db, report } =
+                    crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest_per_db(
+                        shard_dir, &manifest,
+                    );
+                // moon#875: the one line that distinguishes a clean rebuild
+                // from one that skipped forty files. Loss classes are counted
+                // into `INFO` too, so a monitor can alarm on them.
+                crate::command::info_reclamation::record_cold_recovery_report(&report);
+                if report.is_degraded() {
+                    tracing::error!(
+                        shard_id,
+                        files_attempted = report.files_attempted,
+                        files_read = report.files_read,
+                        files_missing = report.files_missing,
+                        files_unreadable = report.files_unreadable,
+                        files_short = report.files_short,
+                        short_file_bytes = report.short_file_bytes,
+                        pages_scanned = report.pages_scanned,
+                        pages_rejected = report.pages_rejected,
+                        partial_page_bytes = report.partial_page_bytes,
+                        entries_recovered = report.entries_recovered,
+                        entries_rejected = report.entries_rejected,
+                        "cold index rebuild DEGRADED: some spilled keys were NOT recovered and \
+                     now read as absent — see the `cold recovery:` lines above for the files"
+                    );
+                } else {
+                    info!(
+                        shard_id,
+                        files_read = report.files_read,
+                        pages_scanned = report.pages_scanned,
+                        pages_overflow = report.pages_overflow,
+                        entries_recovered = report.entries_recovered,
+                        "cold index rebuild clean"
+                    );
+                }
+                // Observability parity with the removed hot-reload loop's
+                // counter: report how many keys the cold tier recovered, NOT
+                // how many were loaded into RAM (zero, by design).
+                result.kv_heap_entries_loaded = per_db.iter().map(|(_, ci)| ci.len()).sum();
+                // Attach each database's index to ITS database (#139 — spilled
+                // SELECT >0 keys used to recover into db0's index, unreachable
+                // from their own db) BEFORE Phase 4 replay. Replayed
+                // DEL/UNLINK/FLUSH*/EXPIRE-past must tombstone the cold plane:
+                // with `cold_index == None`, `remove_counting_cold()`/`clear()`
+                // are silent no-ops (`as_mut()` on None), so a key deleted in
+                // the WAL tail resurrects via cold read-through after restart
+                // whenever the crash lands inside the pre-orphan-sweep window
+                // (the manifest entry is still Active until the sweep).
+                for (db_index, cold_idx) in per_db {
+                    info!(
+                        "Shard {}: rebuilt cold index for db {} with {} entries",
+                        shard_id,
+                        db_index,
+                        cold_idx.len()
+                    );
+                    match databases.get_mut(db_index) {
+                        Some(db) => {
+                            db.cold_shard_dir = Some(shard_dir.to_path_buf());
+                            match db.cold_index.as_mut() {
+                                Some(existing) => existing.merge(cold_idx),
+                                None => db.cold_index = Some(cold_idx),
+                            }
                         }
-                    }
-                    None => {
-                        // --databases was reduced below what this manifest
-                        // was written under. The keys are unreachable either
-                        // way (their db no longer exists); refuse to attach
-                        // them to a WRONG db and say so loudly instead of
-                        // silently resurrecting them elsewhere.
-                        tracing::warn!(
-                            shard_id,
-                            db_index,
-                            entries = cold_idx.len(),
-                            "cold recovery: manifest references a logical db beyond the \
+                        None => {
+                            // --databases was reduced below what this manifest
+                            // was written under. The keys are unreachable either
+                            // way (their db no longer exists); refuse to attach
+                            // them to a WRONG db and say so loudly instead of
+                            // silently resurrecting them elsewhere.
+                            tracing::warn!(
+                                shard_id,
+                                db_index,
+                                entries = cold_idx.len(),
+                                "cold recovery: manifest references a logical db beyond the \
                              configured --databases count; its spilled keys are NOT attached \
                              (unreachable until the server is restarted with enough databases)"
-                        );
+                            );
+                        }
                     }
                 }
-            }
-            // Crash-orphan sweep (task #55): heap files written but never
-            // registered in the manifest (crash between spill write and
-            // manifest commit) leak disk forever otherwise. Manifest opened
-            // OK — safe to classify. Only CLASSIFY here (cheap: read_dir +
-            // HashSet membership, no `remove_file` syscalls) so recovery
-            // stays fast at any cold-plane size; the actual deletes are
-            // deferred to a background sweep the caller starts once the
-            // shard is serving traffic (see `Shard::restore_from_persistence`
-            // / `event_loop.rs`'s `pending_heap_orphans` handoff).
-            let pending =
-                crate::storage::tiered::kv_spill::classify_orphan_heap_files(shard_dir, &manifest);
-            if !pending.is_empty() {
-                info!(
-                    "Shard {}: classified {} crash-orphaned heap file(s), deferred for background reclaim",
-                    shard_id,
-                    pending.len()
+                // Crash-orphan sweep (task #55): heap files written but never
+                // registered in the manifest (crash between spill write and
+                // manifest commit) leak disk forever otherwise. Manifest opened
+                // OK — safe to classify. Only CLASSIFY here (cheap: read_dir +
+                // HashSet membership, no `remove_file` syscalls) so recovery
+                // stays fast at any cold-plane size; the actual deletes are
+                // deferred to a background sweep the caller starts once the
+                // shard is serving traffic (see `Shard::restore_from_persistence`
+                // / `event_loop.rs`'s `pending_heap_orphans` handoff).
+                let pending = crate::storage::tiered::kv_spill::classify_orphan_heap_files(
+                    shard_dir, &manifest,
                 );
+                if !pending.is_empty() {
+                    info!(
+                        "Shard {}: classified {} crash-orphaned heap file(s), deferred for background reclaim",
+                        shard_id,
+                        pending.len()
+                    );
+                }
+                result.pending_heap_orphans = pending;
             }
-            result.pending_heap_orphans = pending;
         }
     }
 
