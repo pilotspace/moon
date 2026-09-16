@@ -52,7 +52,7 @@ Per-field return code on the TTL commands: `-2` = no such field, `-1` = no TTL, 
 `ZADD`, `ZREM`, `ZSCORE`, `ZCARD`, `ZINCRBY`, `ZRANK`, `ZREVRANK`, `ZPOPMIN`, `ZPOPMAX`, `ZSCAN`, `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZCOUNT`, `ZLEXCOUNT`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYLEX`, `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE`, `ZRANGESTORE`, `ZDIFF`, `ZUNION`, `ZINTER`, `ZINTERCARD`, `ZMSCORE`, `ZRANDMEMBER`, `ZMPOP`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`
 
 !!! tip
-    `ZADD` supports `NX`, `XX`, `GT`, `LT`, `CH` and `INCR`, matching Redis 6.2+ behavior. Every command in this list is accepted by dispatch on a live server — the table is checked against `scripts/test-consistency.sh`, not against `COMMAND INFO`.
+    `ZADD` supports `NX`, `XX`, `GT`, `LT`, `CH` and `INCR`, matching Redis 6.2+ behavior. Every command in this list was sent to a live moon server and answered (moon#959 re-verified the table command by command, not from `COMMAND INFO`, after it had advertised an unimplemented one).
 
 ## Geospatial (8)
 

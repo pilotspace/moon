@@ -48,11 +48,13 @@ pub fn zrevrangebylex_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Fr
 /// Error precedence follows Redis's `zrangeGenericCommand`, verified against
 /// redis-server 8.6.1: the option loop first (a dangling `LIMIT` or an unknown
 /// token is `syntax error`, a non-integer `LIMIT` value is the generic integer
-/// error), then the range grammar (`min or max not valid string range item`),
-/// then `WITHSCORES` — which the legacy spelling parses but refuses with its
-/// own message — and only then the key. The bounds are therefore validated
-/// BEFORE the lookup, so `ZRANGEBYLEX nokey a b` is an error and not an empty
-/// array.
+/// error), then `WITHSCORES` — which the legacy spelling parses but refuses
+/// with its own message, BEFORE it looks at the bounds — then the range
+/// grammar (`min or max not valid string range item`), and only then the key.
+/// The bounds are therefore validated BEFORE the lookup, so `ZRANGEBYLEX
+/// nokey a b` is an error and not an empty array. The first draft checked the
+/// bounds before WITHSCORES; the oracle sweep of the built binary caught it —
+/// `ZRANGEBYLEX k a b WITHSCORES` is the WITHSCORES error on redis.
 fn zrangebylex_impl(db: &Database, args: &[Frame], now_ms: u64, rev: bool) -> Frame {
     let cmd = if rev { "ZREVRANGEBYLEX" } else { "ZRANGEBYLEX" };
     if args.len() < 3 {
@@ -102,7 +104,8 @@ fn zrangebylex_impl(db: &Database, args: &[Frame], now_ms: u64, rev: bool) -> Fr
             }
             i += 3;
         } else if opt.eq_ignore_ascii_case(b"WITHSCORES") {
-            // Parsed here, refused below: the range grammar is checked first.
+            // Parsed here, refused below, after the whole option loop: a
+            // later dangling `LIMIT` still wins.
             withscores = true;
             i += 1;
         } else {
@@ -110,6 +113,9 @@ fn zrangebylex_impl(db: &Database, args: &[Frame], now_ms: u64, rev: bool) -> Fr
         }
     }
 
+    if withscores {
+        return err("ERR syntax error, WITHSCORES not supported in combination with BYLEX");
+    }
     // Validate the grammar before the key is consulted. The helpers below
     // parse the bounds again; that second pass is two small copies on a path
     // that is about to materialise the reply, and it keeps the ONE grammar
@@ -119,9 +125,6 @@ fn zrangebylex_impl(db: &Database, args: &[Frame], now_ms: u64, rev: bool) -> Fr
     }
     if let Err(e) = parse_lex_bound(max_arg) {
         return e;
-    }
-    if withscores {
-        return err("ERR syntax error, WITHSCORES not supported in combination with BYLEX");
     }
 
     match db.get_sorted_set_ref_if_alive(key, now_ms) {

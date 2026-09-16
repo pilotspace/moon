@@ -968,6 +968,8 @@ assert_both "ZRANGEBYLEX reversed bounds"       ZRANGEBYLEX z:959:lex + -
 assert_both "ZRANGEBYLEX bad bound"             ZRANGEBYLEX z:959:lex a b
 assert_both "ZRANGEBYLEX bad bound missing key" ZRANGEBYLEX z:959:nokey a b
 assert_both "ZRANGEBYLEX WITHSCORES"            ZRANGEBYLEX z:959:lex - + WITHSCORES
+assert_both "ZRANGEBYLEX WITHSCORES beats bound" ZRANGEBYLEX z:959:lex a b WITHSCORES
+assert_both "ZRANGEBYLEX LIMIT beats WITHSCORES" ZRANGEBYLEX z:959:lex - + WITHSCORES LIMIT 1
 assert_both "ZRANGEBYLEX dangling LIMIT"        ZRANGEBYLEX z:959:lex - + LIMIT 1
 assert_both "ZRANGEBYLEX LIMIT notanint"        ZRANGEBYLEX z:959:lex - + LIMIT notanint 1
 assert_both "ZRANGEBYLEX unknown token"         ZRANGEBYLEX z:959:lex - + BOGUS

@@ -4311,10 +4311,12 @@ mod missing_commands_959_tests {
                 e(&mut db, cmd, &["lex", "-", "+", "WITHSCORES"]),
                 "ERR syntax error, WITHSCORES not supported in combination with BYLEX"
             );
-            // ... but a bad bound outranks the WITHSCORES refusal.
+            // ... and the WITHSCORES refusal outranks a bad bound. (The
+            // first draft had these the other way round; the oracle sweep of
+            // the built binary caught it, which is why every row is sent.)
             assert_eq!(
                 e(&mut db, cmd, &["lex", "a", "b", "WITHSCORES"]),
-                "ERR min or max not valid string range item"
+                "ERR syntax error, WITHSCORES not supported in combination with BYLEX"
             );
             assert_eq!(
                 e(&mut db, cmd, &["lex", "-", "+", "LIMIT", "1"]),

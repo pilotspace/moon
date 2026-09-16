@@ -964,6 +964,7 @@ if should_run "sorted_set"; then
     assert_match "ZRANGEBYLEX LIMIT"        ZRANGEBYLEX z:959:lex - + LIMIT 1 2
     assert_match "ZRANGEBYLEX bad bound"    ZRANGEBYLEX z:959:lex a b
     assert_match "ZRANGEBYLEX WITHSCORES"   ZRANGEBYLEX z:959:lex - + WITHSCORES
+    assert_match "ZRANGEBYLEX WITHSCORES 1st" ZRANGEBYLEX z:959:lex a b WITHSCORES
     assert_match "ZREVRANGEBYLEX"           ZREVRANGEBYLEX z:959:lex + -
     assert_match "ZREVRANGEBYLEX bounds"    ZREVRANGEBYLEX z:959:lex '(d' '[b' LIMIT 0 1
     rcli ZADD z:959:r 1 a 2 b 3 c 4 d 5 e >/dev/null 2>&1; mcli ZADD z:959:r 1 a 2 b 3 c 4 d 5 e >/dev/null 2>&1
