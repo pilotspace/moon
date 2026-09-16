@@ -86,7 +86,8 @@ pub fn parse_acl_line(line: &str) -> Option<AclUser> {
     let username = tokens.next()?.to_string();
     let mut user = AclUser::default_deny(username.clone());
     for token in tokens {
-        // #978: a rule naming a category Moon cannot resolve rejects the whole
+        // #978/#979: a rule the grammar rejects (unknown category, unknown
+        // token, bad hash, ...) rejects the whole
         // LINE. Applying the rest would hand back a user whose permissions are
         // not the ones the file asked for, and the failure mode this fixes was
         // exactly a silently-wrong permission set. Dropping the user is
@@ -98,7 +99,7 @@ pub fn parse_acl_line(line: &str) -> Option<AclUser> {
                 user = %username,
                 rule = %token,
                 error = %err,
-                "rejecting ACL file line: unresolvable rule; user not loaded"
+                "rejecting ACL file line: invalid rule; user not loaded"
             );
             return None;
         }
