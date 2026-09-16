@@ -1353,7 +1353,11 @@ pub fn zmpop(db: &mut Database, args: &[Frame]) -> Frame {
             };
             i += 2;
         } else {
-            i += 1;
+            // moon#967. ZMPOP MUTATES, so argument validation has to complete
+            // before anything is popped: `ZMPOP 1 k MIN MAX` used to take the
+            // first direction and pop, leaving the caller with a keyspace
+            // change from a command Redis rejects outright.
+            return err("ERR syntax error");
         }
     }
 

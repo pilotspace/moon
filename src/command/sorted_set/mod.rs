@@ -417,7 +417,13 @@ pub(super) fn zrange_by_score(
     }
 
     // Apply LIMIT
-    let offset = limit_offset.unwrap_or(0).max(0) as usize;
+    // moon#967: Redis defines a negative LIMIT offset as "return nothing".
+    // `.max(0)` clamped it to 0 and returned the range instead.
+    let raw_offset = limit_offset.unwrap_or(0);
+    if raw_offset < 0 {
+        return Frame::Array(framevec![]);
+    }
+    let offset = raw_offset as usize;
     let count = limit_count.unwrap_or(-1);
     let limited: Vec<_> = if count < 0 {
         entries.into_iter().skip(offset).collect()
@@ -471,7 +477,13 @@ pub(super) fn zrange_by_lex(
     }
 
     // Apply LIMIT
-    let offset = limit_offset.unwrap_or(0).max(0) as usize;
+    // moon#967: Redis defines a negative LIMIT offset as "return nothing".
+    // `.max(0)` clamped it to 0 and returned the range instead.
+    let raw_offset = limit_offset.unwrap_or(0);
+    if raw_offset < 0 {
+        return Frame::Array(framevec![]);
+    }
+    let offset = raw_offset as usize;
     let count = limit_count.unwrap_or(-1);
     let limited: Vec<_> = if count < 0 {
         entries.into_iter().skip(offset).collect()
@@ -562,7 +574,12 @@ pub(super) fn zrange_from_entries(
         if rev {
             filtered.reverse();
         }
-        let offset = limit_offset.unwrap_or(0).max(0) as usize;
+        // moon#967: a negative LIMIT offset returns nothing (see above).
+        let raw_offset = limit_offset.unwrap_or(0);
+        if raw_offset < 0 {
+            return Frame::Array(framevec![]);
+        }
+        let offset = raw_offset as usize;
         let count = limit_count
             .map(|c| if c < 0 { filtered.len() } else { c as usize })
             .unwrap_or(filtered.len());
@@ -595,7 +612,12 @@ pub(super) fn zrange_from_entries(
         if rev {
             filtered.reverse();
         }
-        let offset = limit_offset.unwrap_or(0).max(0) as usize;
+        // moon#967: a negative LIMIT offset returns nothing (see above).
+        let raw_offset = limit_offset.unwrap_or(0);
+        if raw_offset < 0 {
+            return Frame::Array(framevec![]);
+        }
+        let offset = raw_offset as usize;
         let count = limit_count
             .map(|c| if c < 0 { filtered.len() } else { c as usize })
             .unwrap_or(filtered.len());
@@ -3140,6 +3162,132 @@ mod tests {
             ),
             other => panic!("expected WRONGTYPE error, got {other:?}"),
         }
+    }
+
+    // ---- moon#967: unknown option tokens ----------------------------------
+    //
+    // Every zset option loop ended in a bare `} else { i += 1; }`, so a token
+    // the parser did not recognise was SKIPPED rather than rejected. Redis
+    // answers `ERR syntax error`. Verified against redis 8.6.1.
+
+    #[test]
+    fn an_unrecognised_option_token_is_a_syntax_error() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"k", b"1", b"a", b"2", b"b"]);
+
+        let syntax = Frame::Error(Bytes::from_static(b"ERR syntax error"));
+
+        assert_eq!(
+            zrange(
+                &mut db,
+                &[bulk(b"k"), bulk(b"0"), bulk(b"-1"), bulk(b"BOGUS")]
+            ),
+            syntax
+        );
+        assert_eq!(
+            zrangebyscore(
+                &mut db,
+                &[bulk(b"k"), bulk(b"-inf"), bulk(b"+inf"), bulk(b"BOGUS")]
+            ),
+            syntax
+        );
+        assert_eq!(
+            zrevrangebyscore(
+                &mut db,
+                &[bulk(b"k"), bulk(b"+inf"), bulk(b"-inf"), bulk(b"BOGUS")]
+            ),
+            syntax
+        );
+
+        // ZINTERCARD is the sharp one: the trailing `1` was meant as LIMIT 1.
+        // Skipping both tokens answered the UNBOUNDED cardinality, so a client
+        // asking for a bounded intersection silently got an unbounded one.
+        assert_eq!(
+            zintercard(
+                &mut db,
+                &[bulk(b"1"), bulk(b"k"), bulk(b"BOGUS"), bulk(b"1")]
+            ),
+            syntax
+        );
+
+        // ZMPOP MUTATES, so accepting a bogus token is not even side-effect
+        // free: `MIN MAX` used to take the first direction and pop.
+        assert_eq!(
+            zmpop(
+                &mut db,
+                &[bulk(b"1"), bulk(b"k"), bulk(b"MIN"), bulk(b"MAX")]
+            ),
+            syntax
+        );
+        assert_eq!(
+            run_zcard(&mut db, &[b"k"]),
+            Frame::Integer(2),
+            "a rejected ZMPOP must not have popped anything"
+        );
+
+        // The pairing ZRANGE never checked: only BYSCORE+BYLEX was rejected.
+        match zrange(
+            &mut db,
+            &[
+                bulk(b"k"),
+                bulk(b"-"),
+                bulk(b"+"),
+                bulk(b"BYLEX"),
+                bulk(b"WITHSCORES"),
+            ],
+        ) {
+            Frame::Error(ref e) => assert_eq!(
+                e.as_ref(),
+                b"ERR syntax error, WITHSCORES not supported in combination with BYLEX".as_ref()
+            ),
+            other => panic!("expected the BYLEX+WITHSCORES error, got {other:?}"),
+        }
+
+        // Every option the parsers DO know still works.
+        assert_eq!(
+            zrange(&mut db, &[bulk(b"k"), bulk(b"0"), bulk(b"-1")]),
+            Frame::Array(framevec![bulk(b"a"), bulk(b"b")])
+        );
+    }
+
+    /// moon#967. Redis defines a negative LIMIT offset as "return nothing".
+    /// moon parsed it as a plain i64 and clamped it to 0 with `.max(0)`,
+    /// returning a non-empty result.
+    #[test]
+    fn a_negative_limit_offset_returns_nothing() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"k", b"1", b"a", b"2", b"b"]);
+
+        let empty = Frame::Array(framevec![]);
+        assert_eq!(
+            zrangebyscore(
+                &mut db,
+                &[
+                    bulk(b"k"),
+                    bulk(b"-inf"),
+                    bulk(b"+inf"),
+                    bulk(b"LIMIT"),
+                    bulk(b"-1"),
+                    bulk(b"2"),
+                ]
+            ),
+            empty
+        );
+        // A zero offset is not negative and still returns the range.
+        assert_eq!(
+            zrangebyscore(
+                &mut db,
+                &[
+                    bulk(b"k"),
+                    bulk(b"-inf"),
+                    bulk(b"+inf"),
+                    bulk(b"LIMIT"),
+                    bulk(b"0"),
+                    bulk(b"2"),
+                ]
+            ),
+            Frame::Array(framevec![bulk(b"a"), bulk(b"b")])
+        );
     }
 
     // ---- moon#960: arithmetic that produces NaN ---------------------------

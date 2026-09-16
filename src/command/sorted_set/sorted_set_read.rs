@@ -438,11 +438,18 @@ pub fn zrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                 return err_wrong_args("ZRANGE");
             }
         } else {
-            i += 1;
+            // moon#967: an unrecognised token is `ERR syntax error`, not
+            // something to step over. Skipping it silently turned a
+            // mis-spelled option into a DIFFERENT, successful command.
+            return err("ERR syntax error");
         }
     }
     if by_score && by_lex {
         return err("ERR BYSCORE and BYLEX options are not compatible");
+    }
+    // moon#967: the only pairing checked used to be BYSCORE+BYLEX.
+    if by_lex && withscores {
+        return err("ERR syntax error, WITHSCORES not supported in combination with BYLEX");
     }
     if limit_offset.is_some() && !by_score && !by_lex {
         return err(
@@ -602,7 +609,10 @@ pub fn zrangebyscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Fra
                 return err_wrong_args("ZRANGEBYSCORE");
             }
         } else {
-            i += 1;
+            // moon#967: an unrecognised token is `ERR syntax error`, not
+            // something to step over. Skipping it silently turned a
+            // mis-spelled option into a DIFFERENT, successful command.
+            return err("ERR syntax error");
         }
     }
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
@@ -689,7 +699,10 @@ pub fn zrevrangebyscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> 
                 return err_wrong_args("ZREVRANGEBYSCORE");
             }
         } else {
-            i += 1;
+            // moon#967: an unrecognised token is `ERR syntax error`, not
+            // something to step over. Skipping it silently turned a
+            // mis-spelled option into a DIFFERENT, successful command.
+            return err("ERR syntax error");
         }
     }
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
@@ -986,7 +999,10 @@ fn parse_setop_args(
             withscores = true;
             i += 1;
         } else {
-            i += 1;
+            // moon#967: an unrecognised token is `ERR syntax error`, not
+            // something to step over. Skipping it silently turned a
+            // mis-spelled option into a DIFFERENT, successful command.
+            return Err(err("ERR syntax error"));
         }
     }
 
@@ -1288,7 +1304,10 @@ pub fn zintercard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
             };
             i += 2;
         } else {
-            i += 1;
+            // moon#967: an unrecognised token is `ERR syntax error`, not
+            // something to step over. Skipping it silently turned a
+            // mis-spelled option into a DIFFERENT, successful command.
+            return err("ERR syntax error");
         }
     }
     let source_data = match collect_source_sets_readonly(db, &keys, now_ms) {
