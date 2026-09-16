@@ -954,7 +954,9 @@ fn main() -> anyhow::Result<()> {
             let base_dir = PathBuf::from(&config.dir);
             let mut senders = Vec::with_capacity(num_shards);
             for sid in 0..num_shards {
-                let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
+                let (tx, rx) = channel::mpsc_bounded::<AofMessage>(
+                    moon::persistence::aof::append_channel_capacity(),
+                );
                 let aof_token = cancel_token.child_token();
                 let base_dir = base_dir.clone();
                 let thread_name = format!("aof-writer-{sid}");
@@ -989,7 +991,9 @@ fn main() -> anyhow::Result<()> {
                 base_dir.clone(),
             ))
         } else {
-            let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
+            let (tx, rx) = channel::mpsc_bounded::<AofMessage>(
+                moon::persistence::aof::append_channel_capacity(),
+            );
             let aof_token = cancel_token.child_token();
             let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
 

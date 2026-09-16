@@ -165,7 +165,8 @@ pub async fn run_embedded(
         Option<Arc<AofWriterPool>>,
         Option<std::thread::JoinHandle<()>>,
     ) = if config.appendonly == "yes" {
-        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
+        let (tx, rx) =
+            channel::mpsc_bounded::<AofMessage>(crate::persistence::aof::append_channel_capacity());
         let aof_token = cancel.child_token();
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);

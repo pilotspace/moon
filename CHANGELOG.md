@@ -6,6 +6,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The cold-reconciliation property test now reports EVERY divergence with its
+  step index, and CI stops destroying the evidence** (moon#965, instrumentation
+  only — no fix). `check()` panicked on the first key that disagreed, which is
+  one sample of a population and could not distinguish the two live mechanisms.
+  It now collects every divergent key, prints a table with the step each value
+  was minted at, and names the verdict: a single cut (every write the server
+  kept was issued before every write it lost) is **TAIL LOSS**; a stale key
+  alongside correctly-held LATER writes is **COLD PLANE / SHADOWING**. The table
+  separates `dSTEPS` (a difference of sequence indices, which means nothing on
+  its own) from `dWRITES` (the distance in the key's own history) — moon#965 was
+  filed on `dSTEPS=29` for `prop:key:004`, whose `dWRITES` is **1**. The run
+  also asserts `aof_backpressure_dropped == 0` at the LIVE checkpoint, *before*
+  the crash, because a fire-and-forget append dropped at enqueue is acked to the
+  client and makes every post-crash assertion meaningless; and it captures the
+  AOF byte length on both sides of the crash plus any `AOF truncated: …` line
+  the server logged. Two new knobs make the failure reproducible off CI:
+  `MOON_TEST_AOF_CHANNEL_CAP` caps the AOF writer channel (default 10,000,
+  production untouched when unset) and `MOON_660_SETTLE_MS` sets the pre-SIGKILL
+  drain window (default 3000). `.config/nextest.toml` scopes `retries = 0` to
+  this test — the global `retries = 2` is untouched — and `ci.yml` runs it in a
+  `continue-on-error` step that uploads the server `--dir` as an artifact.
+  **That soft-fail and the nextest override are a bounded evidence window owned
+  by moon#965 and must be deleted by the PR that fixes it.**
+- **Cold-tier recovery says what it drops** (moon#875, instrumentation only).
+  `ColdIndex::rebuild_from_manifest_per_db` discarded spill data in three places
+  without a word: an unreadable heap file, a page failing the header/CRC check,
+  and a torn partial page at end-of-file. Each now emits a `warn!` naming the
+  file, its `file_id`, its db and the number of pages affected. Behaviour is
+  unchanged — turning these into hard refusals is moon#875's own work.
+
 ### Fixed
 
 - **`LMOVE`/`RPOPLPUSH`/`BLPOP` no longer strand 56 B every time they drain a

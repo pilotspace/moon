@@ -159,7 +159,8 @@ pub async fn run_with_shutdown(
     // (step 2f-α). Single-shard tokio path: `handler_single` receives the pool
     // directly; per-shard layout is unreachable from this listener.
     let aof_pool: Option<Arc<AofWriterPool>> = if config.appendonly == "yes" {
-        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
+        let (tx, rx) =
+            channel::mpsc_bounded::<AofMessage>(crate::persistence::aof::append_channel_capacity());
         let aof_token = token.child_token();
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);

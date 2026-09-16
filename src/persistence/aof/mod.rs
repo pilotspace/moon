@@ -82,6 +82,75 @@ pub enum AofAck {
     ChannelFull,
 }
 
+/// Production capacity of the bounded `AofMessage` channel between the shard
+/// threads and an AOF writer task.
+///
+/// Every production construction site — `main.rs` (both layouts),
+/// `server::listener` and `server::embedded` — sizes its channel from
+/// [`append_channel_capacity`], never from this constant directly, so the
+/// test-only override below reaches all of them or none of them.
+pub const AOF_APPEND_CHANNEL_CAP: usize = 10_000;
+
+/// Capacity to give a new AOF writer channel.
+///
+/// Returns [`AOF_APPEND_CHANNEL_CAP`] unless `MOON_TEST_AOF_CHANNEL_CAP` is
+/// set to a parseable non-zero integer, which is a **test-only** knob and has
+/// no other effect on the build: with the variable unset this function is a
+/// constant, in every profile, on every platform.
+///
+/// ## Why the knob exists (moon#965)
+///
+/// `AofWriterPool::try_send_append` is fire-and-forget under
+/// `appendfsync=everysec`: on `TrySendError::Full` it counts the drop
+/// (`aof_backpressure_dropped`) and warns — *after the client has already been
+/// told `+OK`*. Whether that path is ever taken depends on how far the writer
+/// task falls behind, which depends on disk latency, which is CI weather. The
+/// durability property test (`tests/cold_reconciliation_property_660.rs`)
+/// therefore reddens on the hosted ubuntu/Windows runners (network-backed
+/// storage) and stays green on macOS and the self-hosted NVMe VM, and the
+/// evidence is destroyed by the retry before anyone can read it.
+///
+/// Capping this channel makes that path reachable ON DEMAND, so the mechanism
+/// can be confirmed or refuted off CI instead of waiting for a red run.
+///
+/// The value is resolved **once**, at the first writer-channel construction
+/// (start-up), and cached — this is never on a request path.
+#[must_use]
+pub fn append_channel_capacity() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let Ok(raw) = std::env::var("MOON_TEST_AOF_CHANNEL_CAP") else {
+            return AOF_APPEND_CHANNEL_CAP;
+        };
+        match raw.trim().parse::<usize>() {
+            Ok(n) if n > 0 => {
+                // Loud on purpose. A capped AOF channel drops acked writes by
+                // design; an operator who finds this in a production log has a
+                // durability incident, not a tuning opportunity.
+                tracing::warn!(
+                    "MOON_TEST_AOF_CHANNEL_CAP={} honoured: AOF writer channel \
+                     capped at {} instead of {}. THIS IS A TEST-ONLY KNOB \
+                     (moon#965) and makes `everysec` drop acked appends under \
+                     load. Never set it in production.",
+                    n,
+                    n,
+                    AOF_APPEND_CHANNEL_CAP
+                );
+                n
+            }
+            _ => {
+                tracing::warn!(
+                    "MOON_TEST_AOF_CHANNEL_CAP={:?} is not a positive integer; \
+                     ignoring and using the production capacity {}.",
+                    raw,
+                    AOF_APPEND_CHANNEL_CAP
+                );
+                AOF_APPEND_CHANNEL_CAP
+            }
+        }
+    })
+}
+
 /// Global counter incremented each time an AOF `AppendSync` (or fire-and-
 /// forget `Append`) is dropped because the writer channel was at capacity.
 ///

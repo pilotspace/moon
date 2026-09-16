@@ -38,3 +38,30 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 [[profile.ci.overrides]]
 filter = 'test(/freed_memory_is_returned_to_the_os_when_idle/)'
 success-output = "final"
+
+# ── moon#965: BOUNDED EVIDENCE WINDOW — delete this block with the fix ──────
+#
+# `cold_reconciliation_holds_across_crash_for_every_seed` reddens on the hosted
+# ubuntu and Windows runners and stays green on macOS-latest and the
+# self-hosted NVMe VM — the discriminator is disk latency, not the runtime
+# (both a failing and a passing leg run tokio). Under `retries = 2` a failing
+# run is retried twice on a FRESH temp dir, so the AOF, the manifest and the
+# `server.err` that diagnose it are destroyed before anyone can read them, and
+# the run is reported FLAKY. That has been happening for weeks.
+#
+# `retries = 0` is SCOPED to this one test on purpose: the global `retries = 2`
+# above still absorbs the fixed-port and kill-9 flake classes for every other
+# suite. It buys a readable artifact, nothing else.
+#
+# The matching `continue-on-error` + artifact-upload step lives in
+# `.github/workflows/ci.yml` (job `check`). Both must be deleted by the PR that
+# fixes moon#965 — a soft-fail left behind is a waiver, and this repo already
+# has one that rotted (moon#904).
+[[profile.ci.overrides]]
+filter = 'test(/cold_reconciliation/)'
+retries = 0
+# Two SIGKILL/restart cycles per seed over six seeds, each preceded by ~10 MiB
+# of filler: the default 60s x 8 terminate-after is not enough headroom on a
+# slow hosted disk, and a terminate is indistinguishable from the failure under
+# investigation.
+slow-timeout = { period = "120s", terminate-after = 10 }

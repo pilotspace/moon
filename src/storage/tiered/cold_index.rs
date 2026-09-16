@@ -746,12 +746,36 @@ impl ColdIndex {
                 // We must use the raw chunk index to produce a correct `page_idx`.
                 let raw = match std::fs::read(&heap_path) {
                     Ok(b) => b,
-                    Err(_) => continue,
+                    // moon#875 instrumentation: an unreadable spill file drops
+                    // EVERY key it holds, silently, and recovery then answers
+                    // `nil` for them. Whether that is a permissions problem, a
+                    // missing file or a truncated volume is not decidable from
+                    // the outside once the process has started serving, so say
+                    // so HERE. (Turning this into a hard refusal is moon#875's
+                    // own job, not this log line's.)
+                    Err(e) => {
+                        tracing::warn!(
+                            "cold recovery: spill file {} (file_id {}, db {}) could not \
+                             be read ({}); EVERY key it holds is dropped from the cold \
+                             index and will answer as absent (moon#875)",
+                            heap_path.display(),
+                            entry.file_id,
+                            db,
+                            e
+                        );
+                        continue;
+                    }
                 };
+                // Counted, not logged per page: a corrupt file can hold
+                // thousands of bad pages and one line each would be the
+                // outage.
+                let mut bad_pages = 0usize;
+                let mut recovered_pages = 0usize;
                 for (page_idx, chunk) in raw.chunks_exact(PAGE_4K).enumerate() {
                     let mut buf = [0u8; PAGE_4K];
                     buf.copy_from_slice(chunk);
                     if let Some(page) = crate::persistence::kv_page::KvLeafPage::from_bytes(buf) {
+                        recovered_pages += 1;
                         for slot_idx in 0..page.slot_count() {
                             if let Some(kv) = page.get(slot_idx) {
                                 let key = Bytes::from(kv.key);
@@ -767,7 +791,40 @@ impl ColdIndex {
                                 ));
                             }
                         }
+                    } else {
+                        bad_pages += 1;
                     }
+                }
+                if bad_pages > 0 {
+                    tracing::warn!(
+                        "cold recovery: spill file {} (file_id {}, db {}) has {} page(s) \
+                         failing the header/CRC check out of {}; every key on them is \
+                         dropped from the cold index and will answer as absent \
+                         (moon#875)",
+                        heap_path.display(),
+                        entry.file_id,
+                        db,
+                        bad_pages,
+                        bad_pages + recovered_pages
+                    );
+                }
+                // `chunks_exact` yields only whole pages; a short tail is a
+                // torn final write (crash mid-flush) and is discarded in
+                // silence today.
+                let tail = raw.len() % PAGE_4K;
+                if tail != 0 {
+                    tracing::warn!(
+                        "cold recovery: spill file {} (file_id {}, db {}) ends with a \
+                         partial {}-byte page ({} bytes total, page size {}); the torn \
+                         tail is discarded and any key on it will answer as absent \
+                         (moon#875)",
+                        heap_path.display(),
+                        entry.file_id,
+                        db,
+                        tail,
+                        raw.len(),
+                        PAGE_4K
+                    );
                 }
             }
         }
