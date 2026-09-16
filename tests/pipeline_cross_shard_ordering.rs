@@ -1300,7 +1300,7 @@ fn remote_defers(port: u16) -> u64 {
 /// nothing pending for `tail` to wait on — is 4^-12. Returns the deferral
 /// count the batch produced and `tail`'s reply.
 fn batch_with_pending_remote(port: u16, tag: &str, tail: &[&str]) -> (u64, String) {
-    let keys: Vec<String> = (0..12).map(|j| format!("pco13:{tag}:{j}")).collect();
+    let keys: Vec<String> = (0..12).map(|j| format!("pco17:{tag}:{j}")).collect();
     let mut batch: Vec<Vec<&str>> = keys.iter().map(|k| vec!["SET", k.as_str(), "1"]).collect();
     batch.push(tail.to_vec());
     let refs: Vec<&[&str]> = batch.iter().map(Vec::as_slice).collect();
@@ -1333,7 +1333,7 @@ fn batch_with_pending_remote(port: u16, tag: &str, tail: &[&str]) -> (u64, Strin
 /// delta is 0 on both binaries, and the row pins that the ordering IS held,
 /// by that guard, rather than not at all.
 #[test]
-fn pco13_intercepted_commands_are_deferred_behind_pending_remote_writes() {
+fn pco17_intercepted_commands_are_deferred_behind_pending_remote_writes() {
     let m = spawn_moon(SHARDS);
     // (tail, expected deferral delta, why)
     let rows: &[(&[&str], u64, &str)] = &[
@@ -1358,42 +1358,42 @@ fn pco13_intercepted_commands_are_deferred_behind_pending_remote_writes() {
             "control: intercepted and declared before too",
         ),
         (
-            &["SPUBLISH", "pco13ch", "m"],
+            &["SPUBLISH", "pco17ch", "m"],
             1,
             "shard channel: intercepted, was not waiting",
         ),
         (
-            &["WATCH", "pco13wk"],
+            &["WATCH", "pco17wk"],
             1,
             "delegated gate (watch.rs): intercepted, was not waiting",
         ),
         (
-            &["BLPOP", "pco13bl", "0.05"],
+            &["BLPOP", "pco17bl", "0.05"],
             0,
             "moon#946: #438 guard defers it, uncounted",
         ),
         (
-            &["GET", "pco13gk"],
+            &["GET", "pco17gk"],
             0,
             "NO_INTERCEPT: routes by its own key",
         ),
         (
-            &["HMSET", "pco13hk", "f", "v"],
+            &["HMSET", "pco17hk", "f", "v"],
             0,
             "newly marked: must not start waiting",
         ),
         (
-            &["LRANGE", "pco13lk", "0", "-1"],
+            &["LRANGE", "pco17lk", "0", "-1"],
             0,
             "newly marked: must not start waiting",
         ),
         (
-            &["ZRANGE", "pco13zk", "0", "-1"],
+            &["ZRANGE", "pco17zk", "0", "-1"],
             0,
             "newly marked: must not start waiting",
         ),
         (
-            &["XADD", "pco13xk", "*", "f", "v"],
+            &["XADD", "pco17xk", "*", "f", "v"],
             0,
             "newly marked: must not start waiting",
         ),
@@ -1428,9 +1428,9 @@ fn pco13_intercepted_commands_are_deferred_behind_pending_remote_writes() {
 /// order, never aborts here. Twelve trials on fresh connections so a lucky
 /// local placement cannot pass this on its own.
 #[test]
-fn pco14_watch_inside_its_own_batch_never_aborts_the_transaction() {
+fn pco18_watch_inside_its_own_batch_never_aborts_the_transaction() {
     let m = spawn_moon(SHARDS);
-    each_trial(m.port, "pco14", |c, t| {
+    each_trial(m.port, "pco18", |c, t| {
         let k = format!("{t}k");
         let r = c.pipeline(&[
             &["SET", &k, "1"],

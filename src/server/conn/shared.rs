@@ -1404,6 +1404,12 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
     // from this table, so a future keyless command cannot repeat moon#925 by
     // omission.
     let is_keyless = match (len, b0) {
+        // moon#937: `TXN <BEGIN|COMMIT|ABORT>` — `args[0]` is the subcommand
+        // literal. It is consumed by `try_handle_txn_*`, but the cluster slot
+        // router runs FIRST and used to hash "BEGIN" into one fixed slot for
+        // every client. `COMMAND GETKEYS` already reported it keyless.
+        // Shares `(3, 't')` with `TTL`, which pays one extra compare.
+        (3, b't') => cmd.eq_ignore_ascii_case(b"TXN"),
         (4, b'a') => cmd.eq_ignore_ascii_case(b"AUTH"),
         (4, b'e') => cmd.eq_ignore_ascii_case(b"ECHO") || cmd.eq_ignore_ascii_case(b"EXEC"),
         (4, b'i') => cmd.eq_ignore_ascii_case(b"INFO"),
@@ -1460,6 +1466,15 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
         // arity is 1 and `args.is_empty()` caught it first.
         (12, b'b') => cmd.eq_ignore_ascii_case(b"BGREWRITEAOF"),
         (12, b'p') => cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE"),
+        // moon#937: `TEMPORAL.INVALIDATE <entity_id> <NODE|EDGE> <graph>` —
+        // `args[0]` is a decimal ENTITY ID and the graph name is at `args[2]`
+        // (`command::temporal::validate_invalidate`); hashing "42" is the
+        // fixed-route signature of moon#511 / moon#534. `TEMPORAL.SNAPSHOT_AT`
+        // takes no arguments and was keyless only by the accident of arity
+        // that hid moon#925 — named here so a future optional argument
+        // cannot turn it into a routing key.
+        (19, b't') => cmd.eq_ignore_ascii_case(b"TEMPORAL.INVALIDATE"),
+        (20, b't') => cmd.eq_ignore_ascii_case(b"TEMPORAL.SNAPSHOT_AT"),
         _ => false,
     };
 
@@ -1635,13 +1650,14 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
 ///    predicate is keyed on ROUTABILITY rather than on a list of command names;
 /// 3. it is intercepted inline by a `try_handle_*` handler BEFORE routing runs,
 ///    even though it does have an args[0] that `extract_primary_key` would
-///    happily hash. That is the one case routability cannot see, so those
-///    families are named in [`is_inline_intercepted`].
+///    happily hash. That is the one case routability cannot see, so it is
+///    read off the registry by [`may_be_inline_intercepted`]: a command waits
+///    unless `COMMAND_META` marks it `NO_INTERCEPT`.
 ///
 /// Deferring is conservative: a command wrongly sent down this path is merely
 /// executed at the start of the next batch, which is always correct and costs
 /// one batch boundary. Wrongly calling something SAFE is the direction that
-/// corrupts data, so when in doubt, add it to the wait set.
+/// corrupts data, so when in doubt, leave the command unmarked and it waits.
 /// The shards a command's keys live on, as a bitmask — or `None` when the mask
 /// cannot be trusted and the caller must fall back to waiting.
 ///
@@ -1725,7 +1741,7 @@ pub(crate) fn must_wait_for_pending_remote(
     // silently escape it — the compiler names every call site.
     keys_may_be_rewritten: bool,
 ) -> bool {
-    if is_inline_intercepted(cmd) || extract_primary_key(cmd, args).is_none() {
+    if may_be_inline_intercepted(cmd) || extract_primary_key(cmd, args).is_none() {
         return true;
     }
     if !is_multi_key_command(cmd, args) {
@@ -1921,58 +1937,48 @@ pub(crate) fn single_owner_shard(cmd: &[u8], args: &[Frame], num_shards: usize) 
     }
 }
 
-/// Commands handled INLINE by a `try_handle_*` interceptor before the routing
-/// step, and which `extract_primary_key` would nonetheless answer for.
+/// May a `try_handle_*` interceptor consume `cmd` INLINE, before the routing
+/// step? `true` unless `COMMAND_META` proves otherwise.
 ///
-/// Derived by reading the interceptor chain in `handler_monoio::dispatch` /
-/// `handler_sharded`, not guessed: every other interceptor there guards a
-/// command that `extract_primary_key` already reports keyless (AUTH, HELLO,
-/// CLUSTER, CONFIG, CLIENT, INFO, WAIT, SELECT, KEYS, SCAN, DBSIZE, HOTKEYS,
-/// the persistence verbs …), so those are caught by the keyless arm.
+/// Derived from the registry's [`CommandFlags::NO_INTERCEPT`] bit — the SAME
+/// bit the monoio handler reads to skip its gate chain — rather than from a
+/// list of command names kept here (moon#937). That list was hand-written,
+/// keyed on `(len, first byte)`, and failed OPEN: a missing entry read as
+/// "safe to run now". It had drifted twice before anyone noticed — `TXN` /
+/// `TEMPORAL.*` (moon#937), the blocking family (moon#946) — and `WATCH`,
+/// `SPUBLISH`, `MQ`, `WS` besides, each intercepted through a predicate no
+/// scanner could see.
 ///
-/// **Adding a new inline interceptor means adding its command here.** A new
-/// interceptor for a command with a key-shaped first argument would silently
-/// re-open moon#507 for that command.
-/// `pco10_inline_intercepted_commands_see_their_own_batch` in
-/// `tests/pipeline_cross_shard_ordering.rs` drives EVAL and SWAPDB — the two
-/// entries that touch real keys — and fails if either is dropped from this
-/// list. It cannot prove the list is COMPLETE against a future interceptor;
-/// that is why the doc above says to err toward waiting.
-fn is_inline_intercepted(cmd: &[u8]) -> bool {
-    // Dotted families first, and deliberately so: a length-keyed match below
-    // would swallow `FT.ALIAS` (8 bytes, 'f') into the FCALL_RO/FUNCTION arm
-    // and answer false for it.
-    const DOTTED: [&[u8]; 4] = [b"FT.", b"GRAPH.", b"CDC.", b"TS."];
-    if DOTTED
-        .iter()
-        .any(|p| cmd.len() > p.len() && cmd[..p.len()].eq_ignore_ascii_case(p))
-    {
-        return true;
-    }
-    let len = cmd.len();
-    if len == 0 {
-        return false;
-    }
-    let b0 = cmd[0] | 0x20;
-    match (len, b0) {
-        // Lua and functions read and write real keys through the interceptor,
-        // never through routing.
-        (4, b'e') => cmd.eq_ignore_ascii_case(b"EVAL"),
-        // `EVAL_RO` is also 7 bytes, so this arm answers for both.
-        (7, b'e') => cmd.eq_ignore_ascii_case(b"EVALSHA") || cmd.eq_ignore_ascii_case(b"EVAL_RO"),
-        (10, b'e') => cmd.eq_ignore_ascii_case(b"EVALSHA_RO"),
-        (5, b'f') => cmd.eq_ignore_ascii_case(b"FCALL"),
-        (8, b'f') => cmd.eq_ignore_ascii_case(b"FCALL_RO") || cmd.eq_ignore_ascii_case(b"FUNCTION"),
-        // SWAPDB exchanges whole databases across every shard.
-        // SCRIPT/ACL touch no keyspace data, but they are inline and cost
-        // nothing to serialise behind pending writes.
-        (6, b's') => cmd.eq_ignore_ascii_case(b"SCRIPT") || cmd.eq_ignore_ascii_case(b"SWAPDB"),
-        (3, b'a') => cmd.eq_ignore_ascii_case(b"ACL"),
-        // Container commands for the message-queue and workspace stores.
-        (2, b'm') => cmd.eq_ignore_ascii_case(b"MQ"),
-        (2, b'w') => cmd.eq_ignore_ascii_case(b"WS"),
-        _ => false,
-    }
+/// The derivation fails SAFE in both consumers:
+///
+/// * an unmarked command walks every gate in the handler AND waits here —
+///   adding an interceptor for it needs no edit anywhere;
+/// * the only way to skip the wait is the mark, and a mark on a command a
+///   gate claims is caught by `tests/intercept_flag_drift.rs` (scan) and
+///   `no_marked_command_fires_a_delegated_gate_predicate` (predicates) —
+///   and would, in any case, stop that command's interceptor from running at
+///   all, which no integration test of the command survives.
+///
+/// Fail-safe is not free: an unmarked plain keyspace command waits for
+/// nothing (one batch cut per occurrence, moon#513). So the registry is
+/// marked completely — 165 commands — and
+/// `routable_commands_no_gate_claims_are_marked_no_intercept_moon937` fails
+/// when a new routable command is added without the mark.
+///
+/// An unknown command has no metadata and takes the full gate chain, so it
+/// waits too; the "unknown command" error it earns one batch later is the
+/// same error either way.
+///
+/// Cost: one `metadata::lookup` — a packed-`u64` match for names up to 8
+/// bytes, a `phf` probe beyond — in place of four prefix compares and a
+/// `(len, b0)` match. Reached only when the batch already holds remote work
+/// (`pending_mask != 0`), never on the local-only fast path.
+#[inline]
+fn may_be_inline_intercepted(cmd: &[u8]) -> bool {
+    !crate::command::metadata::lookup(cmd).is_some_and(|m| {
+        m.flags
+            .contains(crate::command::metadata::CommandFlags::NO_INTERCEPT)
+    })
 }
 
 /// If this script's keys all live on ANOTHER shard, run it there and return
