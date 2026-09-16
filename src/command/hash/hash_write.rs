@@ -468,6 +468,9 @@ pub fn hincrby(db: &mut Database, args: &[Frame]) -> Frame {
                 // carried out in `parse_failed` instead, and answered after
                 // the borrow ends so the error path writes nothing.
                 let mut parse_failed = false;
+                // moon#952, answered after the closure for the same reason
+                // `parse_failed` is: the closure cannot return a Frame.
+                let mut overflowed = false;
                 // Seeded with the value an ABSENT field produces: Redis
                 // treats a missing hash field as 0, so the new value is the
                 // increment itself. The closure overwrites it when the field
@@ -482,7 +485,16 @@ pub fn hincrby(db: &mut Database, args: &[Frame]) -> Frame {
                     };
                     match parsed {
                         Some(n) => {
-                            new_value = n + increment;
+                            // moon#952: a plain `+` wraps in release, so
+                            // i64::MAX + 1 was stored as i64::MIN and reported
+                            // as success. `INCR` on a string already refuses
+                            // this. Declining leaves the field untouched; the
+                            // error is answered after the borrow ends.
+                            let Some(sum) = n.checked_add(increment) else {
+                                overflowed = true;
+                                return None;
+                            };
+                            new_value = sum;
                             // Canonical by construction, so re-encoding it
                             // into the listpack is byte-transparent
                             // (moon#795): `itoa` never emits a leading zero,
@@ -498,6 +510,11 @@ pub fn hincrby(db: &mut Database, args: &[Frame]) -> Frame {
                         }
                     }
                 });
+                if overflowed {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR increment or decrement would overflow",
+                    ));
+                }
                 if parse_failed {
                     // Answered here, after the scan declined to write: the
                     // listpack is byte-identical to what it was, so a
@@ -536,7 +553,12 @@ pub fn hincrby(db: &mut Database, args: &[Frame]) -> Frame {
         },
         None => 0,
     };
-    let new_value = current + increment;
+    // moon#952: the owned arm carried the same plain `+`.
+    let Some(new_value) = current.checked_add(increment) else {
+        return Frame::Error(Bytes::from_static(
+            b"ERR increment or decrement would overflow",
+        ));
+    };
     let mut ibuf = itoa::Buffer::new();
     let field_len = field.len();
     let new_bytes = Bytes::copy_from_slice(ibuf.format(new_value).as_bytes());

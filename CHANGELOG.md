@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`HINCRBY` refuses to wrap at the i64 boundary** (moon#952). The increment
+  used a plain `+`, which wraps in release builds, so `HINCRBY h f 1` on a field
+  holding `i64::MAX` replied `(integer) -9223372036854775808` and STORED it —
+  silent corruption reported as success, written to the AOF and shipped to every
+  replica. `INCR` on a string already refused the identical case with `ERR
+  increment or decrement would overflow`; the hash family now applies the same
+  rule, on both the listpack and the owned-HashMap arm, leaving the field
+  untouched when it declines.
 - **`HDEL` no longer leaves an empty hash behind when the emptying field is
   not the last argument** (moon#942). `hdel` tracked emptiness in a
   `last_was_empty` variable reassigned on EVERY iteration, including the ones
