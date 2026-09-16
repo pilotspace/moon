@@ -881,6 +881,10 @@ mod tests {
             ("LPUSH", vec!["k875", "x"]),
             ("SADD", vec!["k875", "x"]),
             ("ZADD", vec!["k875", "1", "x"]),
+            // Streams have no compact sibling: XADD is the one command that
+            // reaches the generic `get_or_create::<K>` site directly (the
+            // four above take the listpack/intset siblings first).
+            ("XADD", vec!["k875", "*", "f", "v"]),
             ("SET", vec!["k875", "x", "GET"]),
             ("SET", vec!["k875", "x", "KEEPTTL"]),
         ] {

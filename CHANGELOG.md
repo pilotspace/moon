@@ -37,15 +37,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "no index entry", and a read whose index entry points at bytes that cannot
   be produced is counted (`reclamation_cold_read_unreadable_total`), logged
   with its location, and leaves the index entry in place so a later read
-  retries. Value-reading commands still answer nil for such a key at the
-  wire — the accessor family has no error channel out of `Database::get`,
-  and a dispatch-boundary flag would report an `IOERR` on a write that had
-  already executed — so the `-IOERR` reply with fail-closed writes is filed
-  as a follow-up rather than half-wired. Proved with a real spill →
-  `BGREWRITEAOF` → `SIGKILL` → damage → restart lifecycle at `--shards 1`
-  and `4` against the pre-fix binary: the four damaged keys answered nil
-  with nothing in `INFO` or the log; after the fix the same nil comes with
-  the counters and the file ids.
+  heals. **At the wire such a key now answers `-IOERR cold tier: key is
+  indexed but its data could not be read (see server log)` instead of nil**,
+  on both dispatch paths: the fabricating accessors (`get_or_create*` and
+  their compact siblings), `INCR*`/`INCRBYFLOAT`, `APPEND`, `SETRANGE`,
+  `GETSET` and `SET … GET|KEEPTTL` refuse BEFORE mutating — previously
+  `INCR` minted a counter from zero and `HSET`/`LPUSH`/… fabricated a fresh
+  value that shadowed the cold copy until the orphan sweep reclaimed it for
+  good — and a dispatch-boundary gate turns every remaining `Database::get`-
+  shaped reply into the error (one relaxed load per command). `EXISTS`,
+  `DBSIZE` and `TYPE` keep reporting the key present, plain `SET` still
+  overwrites (it never reads the old value) and `DEL` discards: the two
+  escape hatches. Proved two ways against the pre-fix binary at `--shards 1`
+  and `4`: (a) a real spill → `BGREWRITEAOF` → `SIGKILL` → on-disk damage →
+  restart lifecycle, where the four damaged keys answered nil with nothing in
+  `INFO` or the log and now come with the counters and the file ids; (b) a
+  file removed and another `chmod 000` under the RUNNING server, where
+  `GET` answered `$-1` for an indexed key and now answers `-IOERR`, `APPEND`
+  and `INCR` are refused, and after `chmod 644` the ORIGINAL value is served.
 - **A re-spilled key recovers to its NEWEST on-disk copy, not whichever file
   the manifest happened to list last** (moon#983). The cold-index rebuild
   resolved a key present in two Active heap files by "last one seen wins",
