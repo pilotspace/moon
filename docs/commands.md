@@ -47,9 +47,12 @@ Per-field return code on the TTL commands: `-2` = no such field, `-1` = no TTL, 
 
 `SADD`, `SREM`, `SMEMBERS`, `SCARD`, `SISMEMBER`, `SMISMEMBER`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SRANDMEMBER`, `SPOP`, `SSCAN`
 
-## Sorted sets (21)
+## Sorted sets (35)
 
-`ZADD`, `ZREM`, `ZSCORE`, `ZCARD`, `ZINCRBY`, `ZRANK`, `ZREVRANK`, `ZPOPMIN`, `ZPOPMAX`, `ZSCAN`, `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZRANGEBYLEX`, `ZCOUNT`, `ZLEXCOUNT`, `ZUNIONSTORE`, `ZINTERSTORE`, `BZPOPMIN`, `BZPOPMAX`
+`ZADD`, `ZREM`, `ZSCORE`, `ZCARD`, `ZINCRBY`, `ZRANK`, `ZREVRANK`, `ZPOPMIN`, `ZPOPMAX`, `ZSCAN`, `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZCOUNT`, `ZLEXCOUNT`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYLEX`, `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE`, `ZRANGESTORE`, `ZDIFF`, `ZUNION`, `ZINTER`, `ZINTERCARD`, `ZMSCORE`, `ZRANDMEMBER`, `ZMPOP`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`
+
+!!! tip
+    `ZADD` supports `NX`, `XX`, `GT`, `LT`, `CH` and `INCR`, matching Redis 6.2+ behavior. Every command in this list is accepted by dispatch on a live server — the table is checked against `scripts/test-consistency.sh`, not against `COMMAND INFO`.
 
 ## Geospatial (8)
 
