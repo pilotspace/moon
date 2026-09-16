@@ -30,30 +30,54 @@ pub fn user_to_acl_line(user: &AclUser) -> String {
     for cp in &user.channel_patterns {
         parts.push(format!("&{}", cp));
     }
-    // Serialize command permissions
-    match &user.allowed_commands {
-        CommandPermissions::AllAllowed => parts.push("+@all".to_string()),
+    parts.push(command_rules_to_string(&user.allowed_commands));
+    parts.join(" ")
+}
+
+/// Render command permissions as the ACL rule tokens that rebuild them:
+/// the base polarity (`+@all` / `-@all`) first, then the named sets.
+///
+/// moon#981: this is the ONE serializer behind `ACL SAVE`, `ACL LIST` and
+/// `ACL GETUSER`. It used to emit `-@all` for every `Specific` value,
+/// discarding `base_allow` (moon#971), so a `+@all -flushall` user was
+/// written to disk as `-@all -flushall` and reloaded able to run nothing.
+///
+/// The rule parser is the reader. `+@all` yields `AllAllowed`, and the first
+/// `-<cmd>` after it is what transitions to `Specific { base_allow: true }`,
+/// so under an allow base the revocations must precede the re-grants: a
+/// `+get` emitted while the user is still `AllAllowed` is a no-op, and the
+/// later `-@string` expansion would then deny `get` again. Under a deny base
+/// the grants precede the revocations, exactly as before, so every existing
+/// file line is byte-identical. Both sets are written even where one is
+/// redundant with the base, so nothing the operator granted is dropped.
+pub fn command_rules_to_string(perms: &CommandPermissions) -> String {
+    match perms {
+        CommandPermissions::AllAllowed => "+@all".to_string(),
         CommandPermissions::Specific {
-            allowed, denied, ..
+            base_allow,
+            allowed,
+            denied,
         } => {
-            if allowed.is_empty() && denied.is_empty() {
-                parts.push("-@all".to_string());
+            let mut allowed_sorted: Vec<&String> = allowed.iter().collect();
+            allowed_sorted.sort();
+            let mut denied_sorted: Vec<&String> = denied.iter().collect();
+            denied_sorted.sort();
+            let grants = allowed_sorted.iter().map(|a| format!("+{a}"));
+            let revocations = denied_sorted.iter().map(|d| format!("-{d}"));
+
+            let mut parts: Vec<String> = Vec::with_capacity(1 + allowed.len() + denied.len());
+            if *base_allow {
+                parts.push("+@all".to_string());
+                parts.extend(revocations);
+                parts.extend(grants);
             } else {
                 parts.push("-@all".to_string());
-                let mut allowed_sorted: Vec<&String> = allowed.iter().collect();
-                allowed_sorted.sort();
-                for a in allowed_sorted {
-                    parts.push(format!("+{}", a));
-                }
-                let mut denied_sorted: Vec<&String> = denied.iter().collect();
-                denied_sorted.sort();
-                for d in denied_sorted {
-                    parts.push(format!("-{}", d));
-                }
+                parts.extend(grants);
+                parts.extend(revocations);
             }
+            parts.join(" ")
         }
     }
-    parts.join(" ")
 }
 
 /// Parse a single ACL file line. Returns None for blank/comment lines.
@@ -287,8 +311,14 @@ mod tests {
     #[test]
     fn allow_all_base_with_one_revocation_survives_the_line_roundtrip() {
         let user = user_from_rules(&["+@all", "-flushall"]);
-        assert!(user.is_command_allowed("get"), "precondition: base is allow");
-        assert!(!user.is_command_allowed("flushall"), "precondition: -flushall took");
+        assert!(
+            user.is_command_allowed("get"),
+            "precondition: base is allow"
+        );
+        assert!(
+            !user.is_command_allowed("flushall"),
+            "precondition: -flushall took"
+        );
 
         let line = user_to_acl_line(&user);
         assert!(
@@ -317,11 +347,20 @@ mod tests {
     fn allow_all_base_with_category_revocation_and_regrant_survives_the_roundtrip() {
         let user = user_from_rules(&["+@all", "-@string", "+get"]);
         let line = user_to_acl_line(&user);
-        assert!(line.contains(" +@all "), "allow-all base missing from: {line}");
-        assert!(!line.contains("-@all"), "deny-all base written for an allow-all user: {line}");
+        assert!(
+            line.contains(" +@all "),
+            "allow-all base missing from: {line}"
+        );
+        assert!(
+            !line.contains("-@all"),
+            "deny-all base written for an allow-all user: {line}"
+        );
 
         let reloaded = parse_acl_line(&line).expect("a user line parses");
-        assert!(reloaded.is_command_allowed("hset"), "outside the revoked category");
+        assert!(
+            reloaded.is_command_allowed("hset"),
+            "outside the revoked category"
+        );
         assert!(reloaded.is_command_allowed("get"), "re-granted inside it");
         assert!(!reloaded.is_command_allowed("set"), "still revoked");
         assert!(!reloaded.is_command_allowed("append"), "still revoked");
@@ -340,8 +379,14 @@ mod tests {
         let reloaded = parse_acl_line(&line).expect("a user line parses");
         assert!(reloaded.is_command_allowed("get"));
         assert!(reloaded.is_command_allowed("set"));
-        assert!(!reloaded.is_command_allowed("hset"), "ESCALATION: base must stay deny");
-        assert!(!reloaded.is_command_allowed("flushall"), "ESCALATION: base must stay deny");
+        assert!(
+            !reloaded.is_command_allowed("hset"),
+            "ESCALATION: base must stay deny"
+        );
+        assert!(
+            !reloaded.is_command_allowed("flushall"),
+            "ESCALATION: base must stay deny"
+        );
     }
 
     /// moon#981 end to end through the file: `acl_save` then `acl_load`, the
@@ -362,8 +407,14 @@ mod tests {
         let loaded = acl_load(path_str).unwrap();
         let rt = loaded.get_user("rt").unwrap();
 
-        assert!(rt.is_command_allowed("get"), "OUTAGE: grants lost across SAVE/LOAD");
+        assert!(
+            rt.is_command_allowed("get"),
+            "OUTAGE: grants lost across SAVE/LOAD"
+        );
         assert!(rt.is_command_allowed("set"));
-        assert!(!rt.is_command_allowed("flushall"), "the revocation must survive");
+        assert!(
+            !rt.is_command_allowed("flushall"),
+            "the revocation must survive"
+        );
     }
 }

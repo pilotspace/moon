@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use bytes::Bytes;
 
 use crate::acl::rules::get_category_commands;
-use crate::acl::{AclLog, AclLogEntry, AclTable, CommandPermissions};
+use crate::acl::{AclLog, AclLogEntry, AclTable};
 use crate::config::RuntimeConfig;
 use crate::framevec;
 use crate::protocol::Frame;
@@ -143,25 +143,9 @@ pub fn handle_acl(
                         .iter()
                         .map(|cp| format!("&{}", cp))
                         .collect();
-                    let commands = match &user.allowed_commands {
-                        CommandPermissions::AllAllowed => "+@all".to_string(),
-                        CommandPermissions::Specific {
-                            allowed, denied, ..
-                        } => {
-                            let mut parts = vec!["-@all".to_string()];
-                            let mut allowed_sorted: Vec<&String> = allowed.iter().collect();
-                            allowed_sorted.sort();
-                            for a in allowed_sorted {
-                                parts.push(format!("+{}", a));
-                            }
-                            let mut denied_sorted: Vec<&String> = denied.iter().collect();
-                            denied_sorted.sort();
-                            for d in denied_sorted {
-                                parts.push(format!("-{}", d));
-                            }
-                            parts.join(" ")
-                        }
-                    };
+                    // One serializer for SAVE, LIST and GETUSER (moon#981): a
+                    // second copy here inverted `+@all -x` into `-@all -x`.
+                    let commands = crate::acl::io::command_rules_to_string(&user.allowed_commands);
                     // The reply is a Map, and the serializer downgrades a Map
                     // to the flat `[k, v, …]` array on RESP2 — so this one
                     // construction is correct under both protocols and needs no
@@ -890,7 +874,10 @@ mod tests {
         let Frame::Map(pairs) = result else {
             panic!("Expected Map from GETUSER, got {result:?}");
         };
-        assert_eq!(pairs[2].0, Frame::BulkString(Bytes::from_static(b"commands")));
+        assert_eq!(
+            pairs[2].0,
+            Frame::BulkString(Bytes::from_static(b"commands"))
+        );
         assert_eq!(
             pairs[2].1,
             Frame::BulkString(Bytes::from_static(b"+@all -flushall")),
