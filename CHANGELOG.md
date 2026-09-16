@@ -44,6 +44,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `ZMPOP 1 k MIN MAX` popped on input redis rejects outright. Six sites.
   `ZRANGE` now also rejects `BYLEX` with `WITHSCORES`, and a negative `LIMIT`
   offset returns nothing rather than being clamped to zero.
+- **`HINCRBYFLOAT` no longer flattens a small hash** (moon#958). It was the
+  eighth secondary writer, and the one moon#897 missed: it reached straight for
+  the eager `get_or_create_hash`, which upgrades on ACCESS, so one
+  `HINCRBYFLOAT` converted a small hash to `hashtable` permanently (nothing
+  demotes). It now increments inside the listpack like redis and converts only
+  when a threshold is genuinely crossed — including when the RENDERED value
+  outgrows `hash-max-listpack-value`, which the count-based `listpack_fits`
+  check cannot see and a rendered `f64` has no useful constant bound for
+  (`format_float` never uses exponent form, so `1e300 + 1` renders 301 chars).
 - **`HDEL` no longer leaves an empty hash behind when the emptying field is
   not the last argument** (moon#942). `hdel` tracked emptiness in a
   `last_was_empty` variable reassigned on EVERY iteration, including the ones

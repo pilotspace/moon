@@ -600,6 +600,79 @@ pub fn hincrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
         },
         None => return err_wrong_args("HINCRBYFLOAT"),
     };
+    // moon#958. HINCRBYFLOAT was the eighth secondary writer, and the one
+    // moon#897 missed: it reached straight for the EAGER `get_or_create_hash`,
+    // which upgrades on ACCESS, so a single HINCRBYFLOAT flattened a small hash
+    // to `hashtable` permanently (nothing demotes). Redis increments inside the
+    // listpack and converts only when a threshold is genuinely crossed.
+    //
+    // The gate is the same ONE authority the siblings use (moon#896): one field
+    // is at most one new item. Only the FIELD length is known before the value
+    // is computed — a rendered f64 has no useful constant bound, since
+    // `format_float` never uses exponent form — so the post-mutation
+    // `listpack_fits` below is the real authority, exactly as it is for
+    // HINCRBY. A value that renders too long to stay compact promotes there.
+    let limits = db.encoding_limits();
+    if limits.fits(Shape::Hash, 1, field.len()) {
+        match db.get_or_create_hash_listpack(key) {
+            Ok(Some(lp)) => {
+                let before = lp.estimate_memory();
+                // `None` out of the closure means "leave the pair alone",
+                // which is how the parse failure below writes nothing.
+                let mut parse_failed = false;
+                let mut new_value = increment;
+                let outcome = lp.update_pair_value(field.as_ref(), |current| {
+                    let parsed = match current {
+                        ListpackRef::Integer(n) => Some(n as f64),
+                        ListpackRef::Str(b) => std::str::from_utf8(b)
+                            .ok()
+                            .and_then(|t| t.parse::<f64>().ok()),
+                    };
+                    match parsed {
+                        Some(n) => {
+                            new_value = n + increment;
+                            Some(format_float(new_value).into_bytes())
+                        }
+                        None => {
+                            parse_failed = true;
+                            None
+                        }
+                    }
+                });
+                if parse_failed {
+                    // The listpack is byte-identical to what it was, so a
+                    // rejected HINCRBYFLOAT leaves the value alone.
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR hash value is not a valid float",
+                    ));
+                }
+                let formatted = format_float(new_value);
+                if matches!(outcome, PairUpdate::Absent) {
+                    // An absent field starts at 0.0, so the new value is the
+                    // increment itself — already in `new_value`.
+                    lp.push_back(field.as_ref());
+                    lp.push_back(formatted.as_bytes());
+                }
+                let after = lp.estimate_memory();
+                // `listpack_fits` bounds the COUNT, not the width of what was
+                // just written, and a rendered f64 has no useful constant
+                // bound — `format_float` never uses exponent form, so
+                // `1e300 + 1` renders 301 characters. Without this check the
+                // gate above (which could only measure the FIELD) would let an
+                // over-long value stay compact: measured against redis 8.6.1,
+                // which promotes it at `hash-max-listpack-value`.
+                let should_upgrade = !limits.listpack_fits(Shape::Hash, lp)
+                    || formatted.len() > limits.max_value(Shape::Hash);
+                // `lp`'s borrow of `db` ends here.
+                settle_hash_listpack_write(db, key, before, after, should_upgrade);
+                return Frame::BulkString(Bytes::from(formatted));
+            }
+            // Already a full HashMap or HashWithTtl — fall through.
+            Ok(None) => {}
+            Err(e) => return e,
+        }
+    }
+
     let map = match db.get_or_create_hash(key) {
         Ok(m) => m,
         Err(e) => return e,
