@@ -1871,11 +1871,25 @@ MK_TOUCH_REFUSED=0
 mk_state() {
     local port="$1" tmpl="$2"; shift 2
     local k out=""
+    local -a av
     for k in "$@"; do
-        # shellcheck disable=SC2086  # deliberate word-split: templates are ours
-        out="${out}$(redis-cli -p "$port" ${tmpl//%K/$k} 2>&1 | tr '\n' ' ')|"
+        # An ARRAY, never `redis-cli $tmpl`. Word-splitting a command out of a
+        # variable is one shell away from sending the whole string as ONE
+        # argument (it is exactly what zsh does), and the probe then measures
+        # an arity error instead of the routing it was written for.
+        read -r -a av <<<"${tmpl//%K/$k}"
+        out="${out}$(mk_norm "$(redis-cli -p "$port" "${av[@]}" 2>&1)")|"
     done
     printf '%s' "$out"
+}
+
+# Collapse a reply to one comparable line: sort the lines (the set combinators
+# answer an unordered collection), then squeeze runs of whitespace and strip the
+# ends. redis-cli emits a LEADING BLANK LINE for an error reply, which `sort`
+# puts first -- an un-normalised comparison then reports every correct refusal
+# as a mismatch, and an anchored `CROSSSLOT*` pattern never matches at all.
+mk_norm() {
+    printf '%s' "$1" | sort | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//'
 }
 
 # mode(span|colo) label nkeys seed-templates(|-separated, one per key, %K)
@@ -1888,7 +1902,7 @@ route_probe_multi() {
     local mode="$1" label="$2" n="$3" seeds="$4" probe="$5" check="${6:-}"
     local i j port s p r m before="" after=""
     local wrong=0 refused=0
-    local -a keys seedv
+    local -a keys seedv sv pv
     for i in $(seq 1 "$MK_TRIALS"); do
         keys=()
         for j in $(seq 1 "$n"); do
@@ -1906,9 +1920,8 @@ route_probe_multi() {
                 # `if`, never `[[ ... ]] && continue`: under `set -e` a bare
                 # `&&` statement that evaluates FALSE aborts the script (#642).
                 if [[ -n "$s" ]]; then
-                    s="${s//%K/${keys[$((j-1))]}}"
-                    # shellcheck disable=SC2086
-                    redis-cli -p "$port" $s >/dev/null 2>&1 || true
+                    read -r -a sv <<<"${s//%K/${keys[$((j-1))]}}"
+                    redis-cli -p "$port" "${sv[@]}" >/dev/null 2>&1 || true
                 fi
             done
         done
@@ -1916,40 +1929,36 @@ route_probe_multi() {
             before="$(mk_state "$PORT_RUST" "$check" "${keys[@]}")"
         fi
         p="$probe"
+        # Highest index first: %K10 must not be eaten by the %K1 rule if a row
+        # ever needs ten keys.
         for j in $(seq "$n" -1 1); do p="${p//%K$j/${keys[$((j-1))]}}"; done
-        # Sorted: the set combinators return an unordered collection, and
-        # ordering parity is test-commands.sh's job, not this block's.
-        # shellcheck disable=SC2086
-        r="$(redis-cli -p "$PORT_REDIS" $p 2>&1 | sort | tr '\n' ' ')"
-        # shellcheck disable=SC2086
-        m="$(redis-cli -p "$PORT_RUST"  $p 2>&1 | sort | tr '\n' ' ')"
+        read -r -a pv <<<"$p"
+        r="$(mk_norm "$(redis-cli -p "$PORT_REDIS" "${pv[@]}" 2>&1)")"
+        m="$(mk_norm "$(redis-cli -p "$PORT_RUST"  "${pv[@]}" 2>&1)")"
         if [[ -n "$check" ]]; then
             after="$(mk_state "$PORT_RUST" "$check" "${keys[@]}")"
         fi
-        # `*CROSSSLOT*`, not `CROSSSLOT*`: redis-cli emits a leading blank
-        # line for an error reply, and `sort` puts it first. An anchored
-        # pattern silently fell through to the "answered" arm and reported
-        # every correct refusal as a mismatch.
-        case "$m" in
-            *CROSSSLOT*)
-                refused=$((refused + 1))
-                if [[ "$mode" == "colo" ]]; then
-                    echo "  FAIL detail: ${label}[$i] refused a CO-LOCATED key set: $m"
-                    wrong=$((wrong + 1))
-                elif [[ "$label" == "touch" ]]; then
-                    MK_TOUCH_REFUSED=$((MK_TOUCH_REFUSED + 1))
-                    echo "  FAIL detail: touch[$i] was refused; it is per-key decomposable and must fan out"
-                    wrong=$((wrong + 1))
-                elif [[ -n "$check" && "$before" != "$after" ]]; then
-                    echo "  FAIL detail: ${label}[$i] refused but the keyspace MOVED: '$before' -> '$after'"
-                    wrong=$((wrong + 1))
-                fi ;;
-            *)
-                if [[ "$r" != "$m" ]]; then
-                    echo "  FAIL detail: ${label}[$i] ($mode) answered '$m'; redis says '$r'"
-                    wrong=$((wrong + 1))
-                fi ;;
-        esac
+        # A SUBSTRING test, not an anchored `case` pattern. The reply may carry
+        # a leading blank line (see `mk_norm`), and an anchored pattern that
+        # silently stops matching turns a correct refusal into a reported
+        # mismatch -- a guard that cannot recognise its own success.
+        if [[ "$m" == *CROSSSLOT* ]]; then
+            refused=$((refused + 1))
+            if [[ "$mode" == "colo" ]]; then
+                echo "  FAIL detail: ${label}[$i] refused a CO-LOCATED key set: $m"
+                wrong=$((wrong + 1))
+            elif [[ "$label" == "touch" ]]; then
+                MK_TOUCH_REFUSED=$((MK_TOUCH_REFUSED + 1))
+                echo "  FAIL detail: touch[$i] was refused; it is per-key decomposable and must fan out"
+                wrong=$((wrong + 1))
+            elif [[ -n "$check" && "$before" != "$after" ]]; then
+                echo "  FAIL detail: ${label}[$i] refused but the keyspace MOVED: '$before' -> '$after'"
+                wrong=$((wrong + 1))
+            fi
+        elif [[ "$r" != "$m" ]]; then
+            echo "  FAIL detail: ${label}[$i] ($mode) answered '$m'; redis says '$r'"
+            wrong=$((wrong + 1))
+        fi
     done
     assert_eq "moon#962 ${label} ${mode} (shards=${SHARDS}, ${MK_TRIALS} placements)" \
         "0 wrong" "${wrong} wrong"
