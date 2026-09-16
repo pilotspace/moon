@@ -4654,6 +4654,167 @@ else
 fi
 rm -rf "$F981_DIR"
 
+# ===========================================================================
+# BEGIN acl-rule-token-section -- moon#979. Self-contained: reuses the
+# `acl_*` helpers from the #978 section above, touches only users named
+# `n979:*` and keys/channels prefixed `n979:`, and deletes them again.
+# Append new rows INSIDE the markers.
+#
+#   #979  The rule parser matched lowercase literals and ended in `_ => {}`,
+#         so `nocommands`, `OFF`, `RESET`, `RESETKEYS` and every uppercase
+#         token answered +OK and changed NOTHING -- an operator revoking a
+#         compromised credential was told it worked while the account kept
+#         +@all. Redis compares keywords case-insensitively and rejects an
+#         unknown token with `Syntax error`.
+#
+# Every row is a moon-vs-redis comparison. The revocation rows observe
+# ENFORCEMENT (a denied command, a refused AUTH), never a flag read-back.
+# ===========================================================================
+log "=== ACL rule-token grammar (#979) ==="
+
+ACL_U="n979:probe"
+
+# Both servers: a fresh user holding everything -- the state an emergency
+# lockdown starts from, and the state every dropped revocation left behind.
+acl979_full() {
+    acl_reset_user
+    # Clear the probe keys too, so a dropped revocation in an earlier block
+    # (moon SET went through, redis denied) cannot leak into a later GET.
+    both DEL n979:k n979:x n979:y n979:r
+    both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all
+}
+
+# --- revocations that were dropped with +OK ---------------------------------
+# RED on a8eb2efc and on #987 alone: moon answered OK and the probe still ran.
+for acl979_tok in nocommands NOCOMMANDS NoCommands; do
+    acl979_full
+    assert_acl_setuser "#979 $acl979_tok reply" "$acl979_tok"
+    assert_acl_probe   "#979 $acl979_tok denies PING" PING
+    assert_acl_probe   "#979 $acl979_tok denies SET"  SET n979:k 1
+done
+for acl979_tok in OFF Off RESET Reset RESETPASS; do
+    acl979_full
+    assert_acl_setuser "#979 $acl979_tok reply" "$acl979_tok"
+    assert_acl_probe   "#979 $acl979_tok: the password no longer authenticates" PING
+done
+acl979_full
+assert_acl_setuser "#979 RESETKEYS reply" RESETKEYS
+# Key/channel denials use `assert_acl_both_denied`: moon words its NOPERM for a
+# key differently from redis (pre-existing, not this issue) -- both must DENY.
+assert_acl_both_denied "#979 RESETKEYS denies a key command" SET n979:k 1
+assert_acl_probe   "#979 RESETKEYS keeps keyless PING"   PING
+acl979_full
+assert_acl_setuser "#979 RESETCHANNELS reply" RESETCHANNELS
+assert_acl_both_denied "#979 RESETCHANNELS denies PUBLISH" PUBLISH n979:ch 1
+acl979_full
+assert_acl_setuser "#979 -SET (uppercase command) reply" -SET
+assert_acl_probe   "#979 -SET denies SET" SET n979:k 1
+assert_acl_probe   "#979 -SET keeps GET"  GET n979:k
+
+# `nopass` then `>pw2`: redis clears nopass on `>` and clears the password
+# list on `nopass`, so afterwards ONLY pw2 authenticates. moon kept nopass
+# set (any password worked) and kept `pw` stored (the old credential
+# survived the rotation). Both are fail-open.
+acl979_full
+assert_acl_setuser "#979 nopass then >pw2 reply" nopass '>pw2'
+acl979_r=$(acl_as "$PORT_REDIS" "$ACL_U" wrong PING)
+acl979_m=$(acl_as "$PORT_RUST"  "$ACL_U" wrong PING)
+assert_eq "#979 >pw clears nopass: a wrong password is refused" "$acl979_r" "$acl979_m"
+assert_acl_probe "#979 nopass removed the old password: pw is refused" PING
+acl979_r=$(acl_as "$PORT_REDIS" "$ACL_U" pw2 PING)
+acl979_m=$(acl_as "$PORT_RUST"  "$ACL_U" pw2 PING)
+assert_eq "#979 the new password authenticates" "$acl979_r" "$acl979_m"
+
+# --- grants that were dropped with +OK --------------------------------------
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw'
+assert_acl_probe   "#979 baseline: a bare user cannot SET" SET n979:k 1
+assert_acl_setuser "#979 ALLKEYS ALLCOMMANDS ALLCHANNELS reply" ALLKEYS ALLCOMMANDS ALLCHANNELS
+assert_acl_probe   "#979 all* keywords grant SET"     SET n979:k 1
+assert_acl_probe   "#979 all* keywords grant PUBLISH" PUBLISH n979:ch 1
+
+# Key patterns gate KEYED commands only. moon had a blanket "no key patterns
+# -> deny everything" ahead of the keyless check, so `RESETKEYS` (now that it
+# is honoured) also took away PING. RED on a8eb2efc and on #987 alone.
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' +@all
+assert_acl_probe       "#979 no key patterns: keyless PING is allowed" PING
+assert_acl_both_denied "#979 no key patterns: SET is denied"          SET n979:k 1
+
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '&*' +@all
+assert_acl_setuser "#979 %rw~ (lowercase flags) reply" '%rw~n979:x'
+assert_acl_probe   "#979 %rw~n979:x grants SET n979:x" SET n979:x 1
+assert_acl_both_denied "#979 %rw~n979:x denies SET n979:y" SET n979:y 1
+assert_acl_setuser "#979 %r~ reply" '%r~n979:r'
+assert_acl_probe   "#979 %r~n979:r allows GET" GET n979:r
+assert_acl_both_denied "#979 %r~n979:r denies SET" SET n979:r 1
+
+# --- rejected tokens: byte-for-byte error text, and NOTHING applied --------
+acl979_full
+for acl979_tok in bogus BOGUS @read nocommand ')' '+get|' ' on'; do
+    assert_acl_setuser "#979 '$acl979_tok' is a syntax error" "$acl979_tok"
+done
+for acl979_tok in +bogus -bogus -flushal + - '+|get' '+config|bogus'; do
+    assert_acl_setuser "#979 '$acl979_tok' is an unknown command" "$acl979_tok"
+done
+acl979_zero=$(printf '0%.0s' $(seq 1 64))
+for acl979_tok in '#zz' '#abc' '#30C952FAB122C3F9759F02A6D95C3758B246B4FEE239957B2D4FEE46E26170C4' '!nonexistent'; do
+    assert_acl_setuser "#979 '$acl979_tok' is a bad password hash" "$acl979_tok"
+done
+assert_acl_setuser "#979 <nope: password does not exist"      '<nope'
+assert_acl_setuser "#979 !<absent hash>: password does not exist" "!$acl979_zero"
+# After every rejection above the user must still hold everything on both.
+assert_acl_probe "#979 rejected tokens left the user intact" SET n979:k 1
+
+# Malformed `%` shapes are checked on a user WITHOUT `~*`: when allkeys is
+# set redis reports "Adding a pattern after the * pattern" ahead of the
+# syntax error, so the byte-for-byte row needs an empty key-pattern list.
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '&*' +@all
+for acl979_tok in '%X~k' '%RR~k' '%~k' '%' '%RX~k'; do
+    assert_acl_setuser "#979 '$acl979_tok' is a syntax error" "$acl979_tok"
+done
+assert_acl_probe "#979 rejected % tokens left the user intact" PING
+
+# --- valid no-op tokens must be ACCEPTED (every redis ACL LIST line carries
+# sanitize-payload, so refusing it would make a redis-exported file unloadable)
+acl979_full
+assert_acl_setuser "#979 sanitize-payload / clearselectors / '' accepted" \
+    sanitize-payload SKIP-SANITIZE-PAYLOAD clearselectors ''
+assert_acl_probe "#979 no-op tokens keep access" SET n979:k 1
+
+# --- whole-call atomicity ---------------------------------------------------
+# A bad token mid-list: redis rejects the whole modifier list, so the account
+# never comes into existence. moon created it holding +@all.
+acl_reset_user
+assert_acl_setuser "#979 bad token mid-list rejects the whole call" \
+    on '>pw' '~*' '&*' +@all bogus
+assert_both      "#979 rejected call creates no user"      ACL GETUSER "$ACL_U"
+assert_acl_probe "#979 rejected call grants no credential" PING
+# ...and for an EXISTING user the parsed prefix (`off`, `nocommands`) must not
+# stick when a later, state-dependent token (`<nope`) fails.
+acl979_full
+assert_acl_setuser "#979 off nocommands <nope rejects the whole call" off nocommands '<nope'
+assert_acl_probe   "#979 rejected prefix not applied: still on, still allowed" SET n979:k 1
+
+# --- selectors: valid redis grammar moon does not implement. No oracle parity
+# is possible, so assert the moon-only property: REFUSED, never dropped.
+acl979_full
+acl979_m=$(redis-cli -p "$PORT_RUST" ACL SETUSER "$ACL_U" '(+get ~n979:k)' 2>&1) || true
+if [[ "$acl979_m" == ERR* ]]; then
+    PASS=$((PASS + 1))
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: #979 a selector must be refused, not silently dropped"
+    echo "    actual:   $(echo "$acl979_m" | head -c 200)"
+fi
+
+acl_reset_user
+both DEL n979:k n979:x n979:y n979:r
+ACL_U="n978:probe"
+# END acl-rule-token-section -- moon#979
+
 echo "============================================"
 echo "  Data Consistency Test Results"
 echo "============================================"
