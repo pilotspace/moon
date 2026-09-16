@@ -18,6 +18,17 @@ pub struct KeyPattern {
 pub enum CommandPermissions {
     AllAllowed,
     Specific {
+        /// What a command NOT named in either set resolves to.
+        ///
+        /// GHSA-9x86-7597-5wwj: this used to be inferred from
+        /// `allowed.is_empty()`. Both mutators prune the opposite set
+        /// (`allow_command` does `denied.remove`, `deny_command` does
+        /// `allowed.remove`), so the last rule applied could empty a set and
+        /// silently REVERSE the base -- escalating `-@all +get` then `-get`
+        /// into full access, and demoting `+@all -get` then `+get` into
+        /// get-only. The polarity is set once, at the transition that
+        /// establishes it, and never derived from set contents again.
+        base_allow: bool,
         allowed: HashSet<String>,
         denied: HashSet<String>,
     },
@@ -88,6 +99,7 @@ impl AclUser {
             passwords: vec![],
             nopass: false,
             allowed_commands: CommandPermissions::Specific {
+                base_allow: false,
                 allowed: HashSet::new(),
                 denied: HashSet::new(),
             },
@@ -153,7 +165,9 @@ impl AclUser {
         }
         match &mut self.allowed_commands {
             CommandPermissions::AllAllowed => {} // already all allowed
-            CommandPermissions::Specific { allowed, denied } => {
+            CommandPermissions::Specific {
+                allowed, denied, ..
+            } => {
                 if rule.starts_with('@') {
                     for cmd in get_category_commands(rule) {
                         allowed.insert(cmd.to_string());
@@ -173,6 +187,7 @@ impl AclUser {
     pub fn deny_command(&mut self, rule: &str) {
         if rule == "@all" {
             self.allowed_commands = CommandPermissions::Specific {
+                base_allow: false,
                 allowed: HashSet::new(),
                 denied: HashSet::new(),
             };
@@ -190,11 +205,14 @@ impl AclUser {
                     denied.insert(rule.to_ascii_lowercase());
                 }
                 self.allowed_commands = CommandPermissions::Specific {
-                    allowed: HashSet::new(), // empty means "everything not denied"
+                    base_allow: true, // came from AllAllowed: default is still allow
+                    allowed: HashSet::new(),
                     denied,
                 };
             }
-            CommandPermissions::Specific { allowed, denied } => {
+            CommandPermissions::Specific {
+                allowed, denied, ..
+            } => {
                 if rule.starts_with('@') {
                     for cmd in get_category_commands(rule) {
                         denied.insert(cmd.to_string());
@@ -212,7 +230,11 @@ impl AclUser {
         let cmd_lower = cmd.to_ascii_lowercase();
         match &self.allowed_commands {
             CommandPermissions::AllAllowed => true,
-            CommandPermissions::Specific { allowed, denied } => {
+            CommandPermissions::Specific {
+                base_allow,
+                allowed,
+                denied,
+            } => {
                 // Deny takes precedence
                 if denied.contains(&cmd_lower) {
                     return false;
@@ -221,15 +243,10 @@ impl AclUser {
                 if allowed.contains(&cmd_lower) {
                     return true;
                 }
-                // If allowed is empty and denied is non-empty:
-                //   This came from AllAllowed -> deny specific commands.
-                //   Everything not in denied is allowed.
-                if allowed.is_empty() && !denied.is_empty() {
-                    return true;
-                }
-                // If both empty: deny-all state (-@all with no +cmd)
-                // If allowed non-empty: only explicitly allowed commands pass
-                false
+                // Neither set names this command, so the answer is the base
+                // polarity recorded when this `Specific` was created. Never
+                // inferred from set emptiness -- see the field comment.
+                *base_allow
             }
         }
     }
@@ -558,6 +575,106 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use clap::Parser;
+
+    /// GHSA-9x86-7597-5wwj. `CommandPermissions::Specific` used to carry no
+    /// base polarity: `is_command_allowed` inferred it from whether `allowed`
+    /// happened to be empty. Because `deny_command` also does
+    /// `allowed.remove(...)`, revoking a restricted user's LAST grant emptied
+    /// `allowed` and flipped the base from deny-all to allow-all -- turning a
+    /// tightening into a privilege ESCALATION.
+    ///
+    /// Redis 8.0.5 denies every command after this sequence; moon allowed
+    /// `SET`, `CONFIG GET`, `ACL WHOAMI` and `INFO`.
+    #[test]
+    fn revoking_the_last_grant_of_a_restricted_user_does_not_escalate() {
+        let mut user = AclUser::default_deny("u".to_string());
+        user.deny_command("@all");
+        user.allow_command("get");
+        assert!(
+            user.is_command_allowed("get"),
+            "precondition: +get took effect"
+        );
+        assert!(
+            !user.is_command_allowed("set"),
+            "precondition: -@all still denies set"
+        );
+
+        user.deny_command("get");
+
+        assert!(
+            !user.is_command_allowed("get"),
+            "the revoked command must stay denied"
+        );
+        assert!(
+            !user.is_command_allowed("set"),
+            "ESCALATION: revoking the only grant must not grant everything else"
+        );
+        assert!(!user.is_command_allowed("config"), "ESCALATION via config");
+        assert!(
+            !user.is_command_allowed("flushall"),
+            "ESCALATION via flushall"
+        );
+    }
+
+    /// The mirror image, and the originally reported bug: `allow_command` does
+    /// `denied.remove(...)`, so re-granting the one command a `+@all` user had
+    /// lost emptied `denied` and flipped the base the other way, leaving the
+    /// user holding ONLY that command. Redis restores full access.
+    #[test]
+    fn regranting_a_denied_command_restores_the_allow_all_base() {
+        let mut user = AclUser::default_deny("u".to_string());
+        user.allow_command("@all");
+        user.deny_command("get");
+        assert!(
+            !user.is_command_allowed("get"),
+            "precondition: -get took effect"
+        );
+        assert!(
+            user.is_command_allowed("set"),
+            "precondition: +@all still allows set"
+        );
+
+        user.allow_command("get");
+
+        assert!(
+            user.is_command_allowed("get"),
+            "the re-granted command must be allowed"
+        );
+        assert!(
+            user.is_command_allowed("set"),
+            "STICKY DEMOTION: re-granting must not strip every other command"
+        );
+        assert!(user.is_command_allowed("del"), "STICKY DEMOTION via del");
+    }
+
+    /// Both polarities must survive a round trip through their own base, so a
+    /// long rule list cannot drift. This is the control for the two tests
+    /// above: it pins the behaviour they depend on rather than assuming it.
+    #[test]
+    fn base_polarity_survives_repeated_flips() {
+        let mut deny_based = AclUser::default_deny("d".to_string());
+        deny_based.deny_command("@all");
+        for _ in 0..3 {
+            deny_based.allow_command("get");
+            deny_based.deny_command("get");
+        }
+        assert!(
+            !deny_based.is_command_allowed("set"),
+            "deny-all base must persist"
+        );
+
+        let mut allow_based = AclUser::default_deny("a".to_string());
+        allow_based.allow_command("@all");
+        for _ in 0..3 {
+            allow_based.deny_command("get");
+            allow_based.allow_command("get");
+        }
+        assert!(
+            allow_based.is_command_allowed("set"),
+            "allow-all base must persist"
+        );
+    }
+
     fn make_config(requirepass: Option<&str>) -> ServerConfig {
         let mut args = vec!["moon"];
         if let Some(p) = requirepass {

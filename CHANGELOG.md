@@ -818,6 +818,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`ACL SETUSER`: a `-rule` after a `+rule` no longer flips the base policy
+  (GHSA-9x86-7597-5wwj).** `CommandPermissions::Specific` carried no base
+  polarity — `is_command_allowed` inferred it from whether `allowed` happened to
+  be empty. Both mutators prune the opposite set (`allow_command` does
+  `denied.remove`, `deny_command` does `allowed.remove`), so **the last rule
+  applied could reverse the meaning of every rule before it**:
+
+  - `-@all +get` then `-get` emptied `allowed` and flipped the base to allow-all,
+    escalating a restricted user to the **entire server** — `SET`, `CONFIG GET`,
+    `ACL WHOAMI` and `INFO` all succeeded where Redis denies them. Reachable
+    through `--aclfile`, so importing a Redis `users.acl` could silently grant
+    full access to a locked-down user.
+  - `+@all -get` then `+get` emptied `denied` and flipped the base the other way,
+    leaving the user holding *only* `get` where Redis restores full access.
+
+  `Specific` now stores `base_allow` explicitly, set once at the transition that
+  establishes it and never re-derived from set contents. Verified against a live
+  redis 8.0.5 oracle: every row of the escalation/demotion probe now matches,
+  with `-@all` (deny) and `+@all` (allow) as controls firing in both directions.
+
+  Not covered by this change and tracked separately: `ACL SETUSER` still accepts
+  unknown rules and replies `+OK`, so `nocommands`, `allkeys`, `allcommands`,
+  `allchannels`, `clearselectors` and `sanitize-payload` are silent no-ops.
+
 - **ACL `~pattern` now applies to `MQ`, and is no longer silently skipped for
   `FT.*` and `CDC.READ` (moon#927).** ACL key enforcement derives key positions
   from `COMMAND_META`, where `first_key: 0` meant two different things: *"this

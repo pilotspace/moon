@@ -33,7 +33,9 @@ pub fn user_to_acl_line(user: &AclUser) -> String {
     // Serialize command permissions
     match &user.allowed_commands {
         CommandPermissions::AllAllowed => parts.push("+@all".to_string()),
-        CommandPermissions::Specific { allowed, denied } => {
+        CommandPermissions::Specific {
+            allowed, denied, ..
+        } => {
             if allowed.is_empty() && denied.is_empty() {
                 parts.push("-@all".to_string());
             } else {

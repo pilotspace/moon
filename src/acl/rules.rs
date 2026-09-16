@@ -40,6 +40,7 @@ fn apply_rule_inner(user: &mut AclUser, rule: &str) {
             user.key_patterns.clear();
             user.channel_patterns.clear();
             user.allowed_commands = CommandPermissions::Specific {
+                base_allow: false,
                 allowed: HashSet::new(),
                 denied: HashSet::new(),
             };
