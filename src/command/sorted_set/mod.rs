@@ -3627,6 +3627,43 @@ mod tests {
         );
     }
 
+    /// moon#792. `CH` counted a rescore only when the score moved by MORE than
+    /// an absolute `f64::EPSILON`, so a real change smaller than ~2.2e-16 was
+    /// reported as no change — while the stored score really did move, which
+    /// the `ZSCORE` assertions below prove. Redis's `zsetAdd` compares
+    /// EXACTLY (`score != curscore`).
+    #[test]
+    fn ch_counts_a_sub_epsilon_rescore() {
+        // `nextafter(1.0)` — the smallest representable move from 1.0, whose
+        // distance is EXACTLY `f64::EPSILON` and so failed the old `>` test.
+        const NUDGED: &[u8] = b"1.0000000000000002";
+
+        for member in [LP_MEMBER, BT_MEMBER] {
+            let mut db = Database::new();
+            assert_eq!(run_zadd(&mut db, &[b"z", b"1", member]), Frame::Integer(1));
+            assert_eq!(
+                run_zadd(&mut db, &[b"z", b"CH", NUDGED, member]),
+                Frame::Integer(1),
+                "CH must count a sub-epsilon rescore ({})",
+                if member == LP_MEMBER {
+                    "listpack"
+                } else {
+                    "bptree"
+                }
+            );
+            assert_eq!(
+                run_zscore(&mut db, &[b"z", member]),
+                Frame::BulkString(Bytes::from_static(NUDGED)),
+                "and the score really did move"
+            );
+            // Re-writing the SAME score is still no change.
+            assert_eq!(
+                run_zadd(&mut db, &[b"z", b"CH", NUDGED, member]),
+                Frame::Integer(0)
+            );
+        }
+    }
+
     /// moon#967. Redis defines a negative LIMIT offset as "return nothing".
     /// moon parsed it as a plain i64 and clamped it to 0 with `.max(0)`,
     /// returning a non-empty result.

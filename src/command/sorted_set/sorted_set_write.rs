@@ -351,7 +351,18 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                             // `CH` is on the `consults_old` side, so
                             // `old_score` is the real stored score whenever
                             // this tally can be read.
-                            if (old_score - score).abs() > f64::EPSILON {
+                            //
+                            // moon#792: EXACTLY, as Redis's `zsetAdd` does
+                            // (`if (score != curscore)`). An absolute
+                            // `f64::EPSILON` window called any move smaller
+                            // than ~2.2e-16 "unchanged" REGARDLESS of
+                            // magnitude, so rescoring 1e-10 to 1.0000001e-10 —
+                            // a change of six significant figures — replied 0
+                            // while the stored score really did move, and the
+                            // next read disagreed with the reply. Neither side
+                            // can be NaN: `parse_zadd_pair` rejects a NaN
+                            // score, so `!=` is total here.
+                            if old_score != score {
                                 changed += 1;
                             }
                         }
@@ -468,9 +479,15 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                 // `accepted` is the closure's own decision, read back rather
                 // than re-derived: the flag logic has ONE spelling, so the
                 // write and the `CH` tally can never disagree about it.
-                // `changed` then reports whether the score MOVED, on the same
-                // epsilon rule this command has always used.
-                if accepted && (old - score).abs() > f64::EPSILON {
+                //
+                // moon#792, the B+tree half: `changed` reports whether the
+                // score MOVED, compared EXACTLY as Redis's `zsetAdd` does. The
+                // old absolute `f64::EPSILON` window disagreed with
+                // `zset_update_existing`, which decides on `to_bits()` — so a
+                // sub-epsilon rescore really was written to both structures
+                // and then reported as no change. Neither side can be NaN
+                // (`parse_zadd_pair` rejects a NaN score).
+                if accepted && old != score {
                     changed += 1;
                 }
             }
