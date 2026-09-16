@@ -2181,6 +2181,29 @@ mod tests {
                     Frame::Integer(0)
                 );
             }),
+            // moon#958: the eighth secondary writer, missed by moon#897.
+            // HINCRBYFLOAT reached straight for the eager `get_or_create_hash`
+            // while every sibling above had already been gated.
+            ("HINCRBYFLOAT existing field", |db| {
+                hset(db, &make_args(&[b"h", b"n", b"10"]));
+                assert_eq!(
+                    hincrbyfloat(db, &make_args(&[b"h", b"n", b"1.5"])),
+                    Frame::BulkString(Bytes::from_static(b"11.5"))
+                );
+            }),
+            ("HINCRBYFLOAT new field", |db| {
+                assert_eq!(
+                    hincrbyfloat(db, &make_args(&[b"h", b"brand", b"2.5"])),
+                    Frame::BulkString(Bytes::from_static(b"2.5"))
+                );
+            }),
+            ("HINCRBYFLOAT on a non-float value (error path)", |db| {
+                hset(db, &make_args(&[b"h", b"s", b"notanum"]));
+                assert!(matches!(
+                    hincrbyfloat(db, &make_args(&[b"h", b"s", b"1"])),
+                    Frame::Error(_)
+                ));
+            }),
             ("HDEL (already correct — pin)", |db| {
                 assert_eq!(hdel(db, &make_args(&[b"h", b"f1"])), Frame::Integer(1));
             }),
@@ -2212,6 +2235,12 @@ mod tests {
             Frame::Integer(1)
         );
         assert_eq!(encoding_897(&mut db, b"b"), "listpack");
+        // moon#958
+        assert_eq!(
+            hincrbyfloat(&mut db, &make_args(&[b"c", b"n", b"1.5"])),
+            Frame::BulkString(Bytes::from_static(b"1.5"))
+        );
+        assert_eq!(encoding_897(&mut db, b"c"), "listpack");
     }
 
     /// The fix is "do not flatten a SMALL hash", not "never promote". Both
