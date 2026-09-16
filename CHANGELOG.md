@@ -170,6 +170,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unthresholded, since the current 6.21% figure is an artefact of the
   vitest config's include scope pulling in untested Three.js/graph UI, not
   a signal a threshold could usefully gate.
+- **`ACL SETUSER` no longer drops rule tokens with `+OK`** (moon#979). The
+  rule parser matched lowercase literals and ended in `_ => {}`, so every
+  token it did not recognise was silently ignored while the call answered
+  `OK`. Measured against redis-server 8.6.1 from a `+@all` user:
+  `ACL SETUSER svc nocommands` (arm missing), `ACL SETUSER svc OFF`, `RESET`,
+  `RESETKEYS`, `RESETCHANNELS`, `RESETPASS`, `NOPASS` (every non-lowercase
+  spelling — redis compares keywords case-insensitively) all answered `OK` on
+  both servers, after which the moon user still ran `FLUSHALL`, still
+  authenticated, or still wrote keys where redis answered `NOPERM` or
+  `WRONGPASS`. A revocation that reports success and does nothing is the worst
+  failure an ACL can have; the operator walks away believing the access is
+  gone. The full divergence set, established by sweeping the redis grammar
+  against both servers, was wider than the four tokens in the title:
+  `allkeys`/`allchannels`/`allcommands`/`sanitize-payload`/
+  `skip-sanitize-payload`/`clearselectors` were unhandled; `%r~`, `%w~`,
+  `%RW~` and bare `%R` were dropped while `%X~k`, `%RR~k`, `%~k` and `%` were
+  accepted; an unknown token (`bogus`, `@read`, `nocommand`, `' on'`) was
+  accepted; an unknown command (`-flushal`, `+bogus`, `+`, `-`, `+|get`,
+  `+config|bogus`) was accepted — `-` even stored a `-` deny entry; `#HASH`
+  accepted anything (an uppercase or short hash could then never authenticate);
+  `<pw`/`!hash` for a credential the user does not hold answered `OK`; `>pw`
+  and `#hash` did not clear `nopass`, so requiring a password left the account
+  passwordless; `nopass` did not remove the old passwords, so `nopass >new`
+  kept the old credential live; a `(...)` selector was silently dropped; and a
+  bad token mid-list still created or mutated the user. Rules are now parsed
+  by one tokenizer: keyword spelling is compared in exactly one table lookup,
+  every redis keyword has an arm, `%` flags follow redis's grammar, command
+  names are validated against the dispatch registry, hashes must be 64
+  lowercase hex, and every rejection carries redis's own text
+  (`Syntax error`, `Unknown command or category name in ACL`, `The password
+  hash must be exactly 64 characters and contain only lowercase hexadecimal
+  characters`, `The password you are trying to remove from the user does not
+  exist`). `ACL SETUSER` applies the rule list to a copy and commits only when
+  every rule applied, so a rejected call — including a state-dependent one
+  like `<nope` — leaves the table byte-identical. Selectors are refused with
+  `ACL selectors are not supported` rather than dropped. An ACL file line
+  carrying any rejected token is not loaded (logged at WARN), as #978 already
+  did for categories. Stacked on moon#978's category fix.
 
 ### Fixed
 
