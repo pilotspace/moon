@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Console `vitest` unit suite (10 files / 56 tests) now runs in CI**
+  (Closes moon#964). Nothing in `.github/workflows/` ran it — a dependency
+  bump could break `console/src` with every check green, which is exactly
+  what happened in moon#909's first commit (`vitest` bumped to `^5` while
+  `@vitest/coverage-v8` stayed on `^2.1.8`, fixed in the same PR's second
+  commit before merge). Added a `unit` job to `console-integration.yml`,
+  which already carried the correct `console/**` path filter and installed
+  Node/pnpm without ever using them. Runs `pnpm test` only — coverage stays
+  unthresholded, since the current 6.21% figure is an artefact of the
+  vitest config's include scope pulling in untested Three.js/graph UI, not
+  a signal a threshold could usefully gate.
+
 ### Fixed
 
 - **`LMOVE`/`RPOPLPUSH`/`BLPOP` no longer strand 56 B every time they drain a
