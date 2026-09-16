@@ -2081,14 +2081,12 @@ pub(crate) const CROSS_SHARD_WRITE_ERROR: &[u8] =
 ///   entry points (`blocking::immediate_scan`, `blocking::wakeup`) that this
 ///   pre-routing guard cannot see. Two overlapping guards for one family would
 ///   be worse than one complete one.
-/// * `ZDIFFSTORE` — not implemented in moon (unknown command), so there is
-///   no write to misplace, and claiming `CROSSSLOT` would send a client
-///   chasing hash tags for a command that will never work.
-///   `tests/two_key_write_cross_shard.rs::t2k4` fails the moment it starts
-///   working, which is when it must be added here. `GEORADIUS`/
-///   `GEORADIUSBYMEMBER` used to sit in this same bucket; moon#645
-///   implemented their `STORE`/`STOREDIST` clause, so they moved INTO the
-///   family below in the same change that made them able to write.
+/// * `ZDIFFSTORE` sat in this list as "not implemented, so nothing to
+///   misplace" until moon#959 implemented it; it moved INTO the family
+///   below in the same change, exactly as `GEORADIUS`/`GEORADIUSBYMEMBER`
+///   did when moon#645 gave them a `STORE`/`STOREDIST` clause. The
+///   `tests/two_key_write_cross_shard.rs::t2k4` tripwire is what forces
+///   that migration.
 /// * The read-only multi-key commands (`SINTER`, `SUNION`, `SDIFF`, `ZDIFF`,
 ///   `ZINTER`, `ZUNION`, `ZINTERCARD`, `SINTERCARD`, `LCS`, `PFCOUNT`,
 ///   `TOUCH`, `LMPOP`, `ZMPOP`) — same routing rule, but the consequence is a
@@ -2118,6 +2116,9 @@ fn touches_a_key_it_did_not_route_on(cmd: &[u8]) -> bool {
                 || cmd.eq_ignore_ascii_case(b"ZUNIONSTORE")
                 || cmd.eq_ignore_ascii_case(b"ZINTERSTORE")
         }
+        // `ZDIFFSTORE dst numkeys src ...` (moon#959): routed on `dst`, reads
+        // every source — the same shape as its two siblings above.
+        (10, b'z') => cmd.eq_ignore_ascii_case(b"ZDIFFSTORE"),
         (7, b'p') => cmd.eq_ignore_ascii_case(b"PFMERGE"),
         (14, b'g') => cmd.eq_ignore_ascii_case(b"GEOSEARCHSTORE"),
         // `GEORADIUS src ... STORE|STOREDIST dst` (moon#645). Without the
