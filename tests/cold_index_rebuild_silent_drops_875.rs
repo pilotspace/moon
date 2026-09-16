@@ -710,3 +710,124 @@ fn rebuild_reports_every_drop_1_shard() {
 fn rebuild_reports_every_drop_4_shards() {
     rebuild_reports_every_drop(4);
 }
+
+// ===========================================================================
+// The read side: damage while SERVING. The key stays indexed, so the reply
+// must be an error, never nil.
+// ===========================================================================
+
+const KEY_LIVE_CONTROL: &str = "k875:live:control";
+const KEY_LIVE_MISSING: &str = "k875:live:file-removed";
+const KEY_LIVE_LOCKED: &str = "k875:live:file-chmod-000";
+
+fn raw(c: &mut Conn, parts: &[&str]) -> String {
+    c.send(parts)
+}
+
+fn live_damage_answers_ioerr_not_nil(shards: usize) {
+    let dir = common::unique_test_dir(&format!("cold-live-875-s{shards}"));
+    let off = offload_dir(&dir);
+    let server = spawn(&dir, shards);
+    let mut c = Conn::open(server.port);
+
+    let keys = [KEY_LIVE_CONTROL, KEY_LIVE_MISSING, KEY_LIVE_LOCKED];
+    let mut files: Vec<PathBuf> = Vec::new();
+    for (phase, key) in keys.iter().enumerate() {
+        set_retrying(&mut c, key, &value_for(key));
+        files.push(fill_until_spilled(&mut c, &off, phase + 1, key));
+    }
+    settle();
+    {
+        let mut d = files.clone();
+        d.sort();
+        d.dedup();
+        assert_eq!(d.len(), 3, "three distinct files: {files:?}");
+    }
+    let [f_control, f_missing, f_locked] = <[PathBuf; 3]>::try_from(files).unwrap();
+    let _ = f_control;
+
+    // Damage the disk under a RUNNING server: the index still has the keys.
+    std::fs::remove_file(&f_missing).unwrap();
+    chmod(&f_locked, 0o000);
+    for key in [KEY_LIVE_MISSING, KEY_LIVE_LOCKED] {
+        assert!(
+            exists(&mut c, key),
+            "{key} is still indexed — EXISTS must say 1"
+        );
+    }
+
+    // The client must NOT be told the keys are absent.
+    for key in [KEY_LIVE_MISSING, KEY_LIVE_LOCKED] {
+        let r = raw(&mut c, &["GET", key]);
+        eprintln!("[875 live s{shards}] GET {key} -> {:?}", r.trim_end());
+        assert!(
+            r.starts_with("-IOERR"),
+            "GET {key}: indexed but unreadable must answer -IOERR, got {r:?} (moon#875)"
+        );
+    }
+    // A write that depends on the old value is refused BEFORE mutating.
+    let r = raw(&mut c, &["APPEND", KEY_LIVE_LOCKED, "-tail"]);
+    eprintln!(
+        "[875 live s{shards}] APPEND {KEY_LIVE_LOCKED} -> {:?}",
+        r.trim_end()
+    );
+    assert!(
+        r.starts_with("-IOERR"),
+        "APPEND on an unreadable cold key: {r:?}"
+    );
+    let r = raw(&mut c, &["INCR", KEY_LIVE_MISSING]);
+    eprintln!(
+        "[875 live s{shards}] INCR {KEY_LIVE_MISSING} -> {:?}",
+        r.trim_end()
+    );
+    assert!(
+        r.starts_with("-IOERR"),
+        "INCR on an unreadable cold key: {r:?}"
+    );
+    assert!(
+        exists(&mut c, KEY_LIVE_LOCKED),
+        "the refused APPEND left the key indexed"
+    );
+
+    // The fault is counted, the untouched key still serves, and the next
+    // command is unaffected (the flag does not leak).
+    let body = info(&mut c);
+    let unreadable = info_u64(&body, "reclamation_cold_read_unreadable_total").unwrap_or(0);
+    eprintln!("[875 live s{shards}] reclamation_cold_read_unreadable_total={unreadable}");
+    assert!(
+        unreadable >= 4,
+        "every unreadable read must be counted, got {unreadable}"
+    );
+    assert_eq!(
+        get(&mut c, KEY_LIVE_CONTROL).as_deref(),
+        Some(value_for(KEY_LIVE_CONTROL).as_str())
+    );
+    assert!(raw(&mut c, &["PING"]).starts_with("+PONG"));
+
+    // The retained index entry heals the read once the bytes are back, and
+    // the refused APPEND fabricated nothing: the ORIGINAL value comes back.
+    chmod(&f_locked, 0o644);
+    assert_eq!(
+        get(&mut c, KEY_LIVE_LOCKED).as_deref(),
+        Some(value_for(KEY_LIVE_LOCKED).as_str()),
+        "once readable again the original value must be served"
+    );
+    // And the operator's escape hatch for bytes that are really gone.
+    assert!(raw(&mut c, &["DEL", KEY_LIVE_MISSING]).starts_with(":1"));
+    assert_eq!(
+        get(&mut c, KEY_LIVE_MISSING),
+        None,
+        "deleted: now genuinely absent"
+    );
+    drop(server);
+}
+
+#[test]
+fn live_damage_answers_ioerr_not_nil_1_shard() {
+    live_damage_answers_ioerr_not_nil(1);
+}
+
+#[test]
+fn live_damage_answers_ioerr_not_nil_4_shards() {
+    live_damage_answers_ioerr_not_nil(4);
+}

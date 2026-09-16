@@ -34,9 +34,12 @@ pub enum ColdReadOutcome {
     /// The index entry is deliberately left alone: a transient I/O error
     /// must not permanently drop the key, and a later read retries.
     ///
-    /// At the wire the value-reading commands still answer nil for now (the
-    /// accessor family has no error channel out of `Database::get`); the
-    /// fault is counted in `INFO` (`reclamation_cold_read_unreadable_total`)
+    /// At the wire the command answers `-IOERR` (see
+    /// `Database::cold_fault_error`): the fault is noted on the `Database`
+    /// by the two read-through funnels (`promote_cold_outcome`,
+    /// `get_cold_value`), the fabricating accessors refuse BEFORE mutating,
+    /// and the dispatch boundary turns any remaining reply into the error.
+    /// It is also counted in `INFO` (`reclamation_cold_read_unreadable_total`)
     /// and logged with its location by [`read_cold_entry`].
     Unreadable(ColdReadFault),
 }
@@ -50,6 +53,7 @@ pub struct ColdReadFault {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum ColdReadFaultReason {
     /// The heap file is not on disk.
     FileMissing,
@@ -63,6 +67,22 @@ pub enum ColdReadFaultReason {
     OverflowBroken,
     /// The collection body did not deserialize.
     ValueUndecodable,
+}
+
+impl ColdReadFaultReason {
+    /// Inverse of `as u8`, for the `Database::cold_fault` flag.
+    #[must_use]
+    pub fn from_code(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => Self::FileMissing,
+            1 => Self::FileUnreadable,
+            2 => Self::PageRejected,
+            3 => Self::SlotUndecodable,
+            4 => Self::OverflowBroken,
+            5 => Self::ValueUndecodable,
+            _ => return None,
+        })
+    }
 }
 
 /// Every unreadable-but-indexed cold read funnels through here: count it in
@@ -780,5 +800,133 @@ mod tests {
             db.exists_if_alive(b"stuck", 0),
             "EXISTS still sees the indexed key — it is not absent"
         );
+    }
+
+    // =======================================================================
+    // moon#875: at the wire, indexed-but-unreadable answers -IOERR, not nil.
+    // =======================================================================
+
+    fn args(parts: &[&str]) -> Vec<crate::protocol::Frame> {
+        parts
+            .iter()
+            .map(|p| crate::protocol::Frame::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+            .collect()
+    }
+
+    fn run(
+        db: &mut crate::storage::db::Database,
+        cmd: &str,
+        parts: &[&str],
+    ) -> crate::protocol::Frame {
+        let mut selected = 0usize;
+        match crate::command::dispatch(db, cmd.as_bytes(), &args(parts), &mut selected, 16) {
+            crate::command::DispatchResult::Response(f)
+            | crate::command::DispatchResult::Quit(f) => f,
+        }
+    }
+
+    fn run_read(
+        db: &crate::storage::db::Database,
+        cmd: &str,
+        parts: &[&str],
+    ) -> crate::protocol::Frame {
+        let mut selected = 0usize;
+        match crate::command::dispatch_read(db, cmd.as_bytes(), &args(parts), 0, &mut selected, 16)
+        {
+            crate::command::DispatchResult::Response(f)
+            | crate::command::DispatchResult::Quit(f) => f,
+        }
+    }
+
+    fn is_ioerr(f: &crate::protocol::Frame) -> bool {
+        matches!(f, crate::protocol::Frame::Error(e) if e.starts_with(b"IOERR cold tier"))
+    }
+
+    #[test]
+    fn indexed_but_unreadable_key_answers_ioerr_and_writes_refuse_before_mutating() {
+        use crate::protocol::Frame;
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let mut db = db_with_spilled_key(shard_dir, b"k875", b"the-cold-value", None);
+        let heap = heap_path_of(shard_dir, 40);
+        let parked = shard_dir.join("parked.mpf");
+        std::fs::rename(&heap, &parked).unwrap();
+
+        // Reads: an ERROR, never nil — on both dispatch paths.
+        assert!(is_ioerr(&run(&mut db, "GET", &["k875"])), "exclusive GET");
+        assert!(
+            is_ioerr(&run_read(&db, "GET", &["k875"])),
+            "shared-read GET"
+        );
+        assert!(is_ioerr(&run(&mut db, "STRLEN", &["k875"])), "STRLEN");
+        // Still indexed: the key is not absent.
+        assert_eq!(run(&mut db, "EXISTS", &["k875"]), Frame::Integer(1));
+        // The flag never outlives the command that raised it.
+        assert_eq!(
+            run(&mut db, "PING", &[]),
+            Frame::SimpleString(Bytes::from_static(b"PONG"))
+        );
+        // A genuinely absent key is still a plain miss.
+        assert_eq!(run(&mut db, "GET", &["never-written"]), Frame::Null);
+
+        // Writes that depend on or would shadow the old value: refused, and
+        // nothing is fabricated in hot RAM.
+        for (cmd, parts) in [
+            ("INCR", vec!["k875"]),
+            ("INCRBYFLOAT", vec!["k875", "1.5"]),
+            ("APPEND", vec!["k875", "x"]),
+            ("SETRANGE", vec!["k875", "0", "x"]),
+            ("GETSET", vec!["k875", "x"]),
+            ("HSET", vec!["k875", "f", "v"]),
+            ("LPUSH", vec!["k875", "x"]),
+            ("SADD", vec!["k875", "x"]),
+            ("ZADD", vec!["k875", "1", "x"]),
+            ("SET", vec!["k875", "x", "GET"]),
+            ("SET", vec!["k875", "x", "KEEPTTL"]),
+        ] {
+            let f = run(&mut db, cmd, &parts);
+            assert!(is_ioerr(&f), "{cmd} must answer IOERR, got {f:?}");
+            assert!(!db.is_hot(b"k875"), "{cmd} must not fabricate a hot value");
+            assert!(
+                db.cold_index.as_ref().unwrap().lookup(b"k875").is_some(),
+                "{cmd} must leave the index entry in place"
+            );
+        }
+
+        // The bytes come back: the retained index entry heals the read.
+        std::fs::rename(&parked, &heap).unwrap();
+        assert_eq!(
+            run(&mut db, "GET", &["k875"]),
+            Frame::BulkString(Bytes::from_static(b"the-cold-value")),
+            "once readable again the value is served — nothing was tombstoned or shadowed"
+        );
+    }
+
+    #[test]
+    fn plain_set_and_del_remain_the_escape_hatches() {
+        use crate::protocol::Frame;
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let mut db = db_with_spilled_key(shard_dir, b"k875", b"the-cold-value", None);
+        std::fs::remove_file(heap_path_of(shard_dir, 40)).unwrap();
+        assert!(is_ioerr(&run(&mut db, "GET", &["k875"])));
+
+        // A plain SET does not read the old value: it overwrites, as in Redis.
+        assert_eq!(
+            run(&mut db, "SET", &["k875", "fresh"]),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
+        assert_eq!(
+            run(&mut db, "GET", &["k875"]),
+            Frame::BulkString(Bytes::from_static(b"fresh"))
+        );
+
+        // DEL discards the unreadable entry; afterwards the key is absent.
+        let mut db2 = db_with_spilled_key(tmp.path(), b"k876", b"v", None);
+        std::fs::remove_file(heap_path_of(tmp.path(), 40)).unwrap();
+        assert!(is_ioerr(&run(&mut db2, "GET", &["k876"])));
+        assert_eq!(run(&mut db2, "DEL", &["k876"]), Frame::Integer(1));
+        assert_eq!(run(&mut db2, "GET", &["k876"]), Frame::Null);
+        assert_eq!(run(&mut db2, "EXISTS", &["k876"]), Frame::Integer(0));
     }
 }
