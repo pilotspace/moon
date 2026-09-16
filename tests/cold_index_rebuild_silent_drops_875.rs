@@ -436,6 +436,25 @@ fn rewrite_aof(c: &mut Conn, dir: &Path) {
     panic!("BGREWRITEAOF did not publish new bases within 60s: before {before:?}, last {last:?}");
 }
 
+/// Remove `ESC [ … <letter>` control sequences so log fields match as text.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// `heap-000042.mpf` -> 42.
 fn file_id_of(p: &Path) -> u64 {
     let name = p.file_name().unwrap().to_str().unwrap();
@@ -630,7 +649,9 @@ fn rebuild_reports_every_drop(shards: usize) {
 
     // And a human can find it: every damaged file is named in the log, and
     // the rebuild summary says it was degraded.
-    let log = std::fs::read_to_string(dir.join("server.err")).unwrap_or_default();
+    // `tracing_subscriber::fmt` writes ANSI colour codes even into a file,
+    // so `file_id=15212` arrives as `\x1b[3mfile_id\x1b[0m\x1b[2m=\x1b[0m15212`.
+    let log = strip_ansi(&std::fs::read_to_string(dir.join("server.err")).unwrap_or_default());
     for (what, id, file) in [
         ("missing", id_missing, &f_missing),
         ("unreadable", id_unreadable, &f_unreadable),
