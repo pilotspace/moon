@@ -816,10 +816,7 @@ fn mkr4_lmpop_and_zmpop_never_pop_a_key_they_did_not_route_on() {
             let (label, seed, argv, pop_probe, untouched, drained) = if family == "l" {
                 (
                     "LMPOP",
-                    vec![
-                        vec!["RPUSH", k2, "B1", "B2"],
-                        vec!["RPUSH", k3, "C1", "C2"],
-                    ],
+                    vec![vec!["RPUSH", k2, "B1", "B2"], vec!["RPUSH", k3, "C1", "C2"]],
                     vec!["LMPOP", "3", k1, k2, k3, "LEFT"],
                     vec!["LRANGE", k3, "0", "-1"],
                     "[C1,C2]",
@@ -897,10 +894,8 @@ fn mkr4_lmpop_and_zmpop_never_pop_a_key_they_did_not_route_on() {
 #[test]
 fn mkr5_transactions_and_scripts_cannot_answer_from_one_shard_either() {
     let m = spawn_moon(SHARDS);
-    const LMPOP_DECLARED: &str =
-        "return redis.call('LMPOP', 3, KEYS[1], KEYS[2], KEYS[3], 'LEFT')";
-    const LMPOP_VIA_ARGV: &str =
-        "return redis.call('LMPOP', 3, KEYS[1], ARGV[1], ARGV[2], 'LEFT')";
+    const LMPOP_DECLARED: &str = "return redis.call('LMPOP', 3, KEYS[1], KEYS[2], KEYS[3], 'LEFT')";
+    const LMPOP_VIA_ARGV: &str = "return redis.call('LMPOP', 3, KEYS[1], ARGV[1], ARGV[2], 'LEFT')";
 
     let mut wrong: Vec<String> = Vec::new();
     for shape in ["multi", "eval-keys", "eval-argv"] {
