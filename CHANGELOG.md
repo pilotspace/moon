@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`LMOVE`/`RPOPLPUSH`/`BLPOP` no longer strand 56 B every time they drain a
+  list to empty** (moon#949). `Database::list_pop_front`/`list_pop_back`
+  credited the popped element back to `used_memory` on the non-empty branch but
+  not on the empty one, on the theory that whole-key removal recovers it via
+  `entry_overhead`. It does not: `entry_overhead` is computed from the CURRENT
+  value, which by then no longer holds the element, so the push-time charge was
+  never given back. The drift is UPWARD and unbounded on an EMPTY keyspace —
+  `--maxmemory` and eviction firing on a server holding nothing — and it reaches
+  exactly the reliable-queue pattern that drains a list over and over. Measured
+  at 56.00 B/cycle before and 0.00 after on all three paths, with `LPOP`/`RPOP`
+  (which route through `pop_eager` and always credited) and a `SET`/`DEL` pair
+  as controls at 0 both times. `STRANDED_BY_LIST_POP` in the list tests goes
+  from 56 to 0.
 - **A type-refused write no longer aborts a watching transaction**
   (moon#940). Acquiring a mutable handle IS the WATCH version bump (moon#926),
   and it fired before the arm that answers `WRONGTYPE` — so `SADD`/`HSET`/
