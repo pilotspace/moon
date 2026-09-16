@@ -770,15 +770,31 @@ mod tests {
     /// write. GREEN: keyed on the STATE predicate
     /// `eviction::write_gate_active()`.
     ///
-    /// `MAXMEMORY_GLOBAL` / `DB_MAXMEMORY_ANY_SET` are process-global and
-    /// other tests in this binary publish them, so each attempt samples both
-    /// before and after the gate call and only counts when they were unset
-    /// throughout. The probe counter is thread-local, so it cannot be moved
-    /// by another test's `evict_to_budget` call.
+    /// `MAXMEMORY_GLOBAL` / `DB_MAXMEMORY_ANY_SET` are process-global, so this
+    /// test ESTABLISHES the unset state it needs under a `PublishedLimits`
+    /// guard rather than observing whatever ambient state the suite left
+    /// behind, and the guard puts back what was there on drop.
+    ///
+    /// It used to loop 100 attempts, sampling both atomics around each gate
+    /// call and `continue`-ing when a sibling had a limit published — then
+    /// panicking with "could not observe an unset maxmemory in 100 attempts".
+    /// That retry made a PERMANENT leak (moon#856: five `command::config`
+    /// tests published a limit and never restored it) read as a flake for
+    /// months, and the CI waiver built on top of it kept the suite green. Both
+    /// are gone: the assertion below fires immediately and names the state it
+    /// actually saw. The probe counter is thread-local, so no other test's
+    /// `evict_to_budget` call can move it.
     #[test]
     fn gate_is_skipped_with_spill_sender_when_no_limit_is_configured() {
         use crate::storage::db_quota::db_maxmemory_any_set;
-        use crate::storage::eviction::{evict_to_budget_entries_on_this_thread, maxmemory_is_set};
+        use crate::storage::eviction::{
+            PublishedLimits, evict_to_budget_entries_on_this_thread, maxmemory_bytes,
+            maxmemory_is_set,
+        };
+
+        let _limits = PublishedLimits::capture();
+        crate::storage::eviction::publish_maxmemory(0);
+        crate::storage::db_quota::publish_db_maxmemory_any_set(&RuntimeConfig::default());
 
         let (shard_databases, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
         let runtime_config = Arc::new(parking_lot::RwLock::new(make_config(0, "allkeys-lru")));
@@ -802,36 +818,40 @@ mod tests {
         }
         let len_before = db.len();
 
-        for _attempt in 0..100 {
-            let limit_before = maxmemory_is_set() || db_maxmemory_any_set();
-            let entries_before = evict_to_budget_entries_on_this_thread();
-            let result = ctx.gate(&mut db, 0);
-            let entries_after = evict_to_budget_entries_on_this_thread();
-            let limit_after = maxmemory_is_set() || db_maxmemory_any_set();
-            assert!(
-                result.is_ok(),
-                "no limit configured: the gate must never reject"
-            );
-            if limit_before || limit_after {
-                // Another test had a limit published during this attempt;
-                // the skip is not expected then. Try again.
-                std::thread::yield_now();
-                continue;
-            }
-            assert_eq!(
-                db.len(),
-                len_before,
-                "nothing may be evicted without a limit"
-            );
-            assert_eq!(
-                entries_after, entries_before,
-                "no maxmemory and no db quota: the Lua write gate must not enter \
-                 evict_to_budget just because a spill sender is wired"
-            );
-            return;
-        }
-        panic!(
-            "could not observe an unset maxmemory in 100 attempts; check for a test leaking a published limit"
+        // PRECONDITION, asserted rather than hoped for: the guard above put
+        // both atomics in the unset state this test is about. If this fires,
+        // something published a limit between the guard and here.
+        assert!(
+            !maxmemory_is_set() && !db_maxmemory_any_set(),
+            "precondition: no limit may be published here, but maxmemory={} \
+             db_maxmemory_any_set={} — a sibling test is leaking one (moon#856)",
+            maxmemory_bytes(),
+            db_maxmemory_any_set()
+        );
+
+        let entries_before = evict_to_budget_entries_on_this_thread();
+        let result = ctx.gate(&mut db, 0);
+        let entries_after = evict_to_budget_entries_on_this_thread();
+
+        assert!(
+            result.is_ok(),
+            "no limit configured: the gate must never reject"
+        );
+        assert_eq!(
+            db.len(),
+            len_before,
+            "nothing may be evicted without a limit (maxmemory={}, db_maxmemory_any_set={})",
+            maxmemory_bytes(),
+            db_maxmemory_any_set()
+        );
+        assert_eq!(
+            entries_after,
+            entries_before,
+            "no maxmemory and no db quota: the Lua write gate must not enter \
+             evict_to_budget just because a spill sender is wired \
+             (observed maxmemory={}, db_maxmemory_any_set={})",
+            maxmemory_bytes(),
+            db_maxmemory_any_set()
         );
     }
 

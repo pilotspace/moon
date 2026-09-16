@@ -181,6 +181,74 @@ pub(crate) fn force_write_gate(active: bool) -> ForceWriteGate {
     ForceWriteGate(prev)
 }
 
+/// Test-only RAII guard: snapshots EVERY process-global *published* memory
+/// limit on construction and restores all five on `Drop`.
+///
+/// ── Why this exists (moon#856) ───────────────────────────────────────────
+/// These atomics are written by PRODUCTION code. `command::config::config_set`
+/// calls `publish_maxmemory`, `publish_maxmemory_hints`,
+/// `publish_maxmemory_policy` and `db_quota::publish_db_maxmemory_any_set` on
+/// the `CONFIG SET` path, so a unit test that drives `config_set` mutates
+/// process-global state that OUTLIVES it. Under `cargo test --lib` — one
+/// process for the whole suite, unlike nextest's process-per-test — whichever
+/// test later READ that state failed. That is why moon#856 looked
+/// order-dependent (the victim varies) while the cause was not (the leak is
+/// permanent). Five `command::config::tests` cases leaked one, each
+/// individually sufficient to redden
+/// `scripting::bridge::tests::gate_is_skipped_with_spill_sender_when_no_limit_is_configured`.
+///
+/// ── Why `Drop`, and not a manual restore at the end of the body ──────────
+/// A manual restore is SKIPPED on the unwind path, so a test that panics
+/// mid-body leaks worse than one that never restored at all: the poison
+/// outlives a run that has already failed and reddens an innocent sibling on
+/// top of it. `Drop` runs on both the normal and the unwind path, which is the
+/// entire point. Three tests restored manually before this guard existed
+/// (`write_gate_active_tracks_maxmemory_and_db_quota_atomics`,
+/// `maxmemory_publish_and_is_set_roundtrip`, and `db_quota`'s
+/// `publish_and_read_any_set_flag`, whose own comment conceded the gap).
+///
+/// Nesting is LIFO-correct: an inner guard restores the state as of ITS
+/// construction, the outer one the true original.
+///
+/// NOT a substitute for [`force_write_gate`]: that overrides the PREDICATE on
+/// one thread, this one scopes the PUBLISHED VALUES process-wide.
+#[cfg(test)]
+pub(crate) struct PublishedLimits {
+    maxmemory_global: u64,
+    maxmemory_hint: usize,
+    maxmemory_per_shard_hint: usize,
+    maxmemory_policy: u8,
+    db_maxmemory_any_set: bool,
+}
+
+#[cfg(test)]
+impl PublishedLimits {
+    /// Snapshot all five published atomics; restored when the guard drops.
+    #[must_use]
+    pub(crate) fn capture() -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        Self {
+            maxmemory_global: MAXMEMORY_GLOBAL.load(Relaxed),
+            maxmemory_hint: MAXMEMORY_HINT.load(Relaxed),
+            maxmemory_per_shard_hint: MAXMEMORY_PER_SHARD_HINT.load(Relaxed),
+            maxmemory_policy: MAXMEMORY_POLICY_GLOBAL.load(Relaxed),
+            db_maxmemory_any_set: crate::storage::db_quota::db_maxmemory_any_set(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublishedLimits {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        MAXMEMORY_GLOBAL.store(self.maxmemory_global, Relaxed);
+        MAXMEMORY_HINT.store(self.maxmemory_hint, Relaxed);
+        MAXMEMORY_PER_SHARD_HINT.store(self.maxmemory_per_shard_hint, Relaxed);
+        MAXMEMORY_POLICY_GLOBAL.store(self.maxmemory_policy, Relaxed);
+        crate::storage::db_quota::restore_db_maxmemory_any_set(self.db_maxmemory_any_set);
+    }
+}
+
 /// Publish the maxmemory hints. MUST be called wherever `maxmemory` (or the
 /// shard count it is divided by) changes: server startup after the resolved
 /// `num_shards` is written, and `CONFIG SET maxmemory`. A missed publish is
@@ -1770,6 +1838,11 @@ mod tests {
     #[test]
     fn write_gate_active_tracks_maxmemory_and_db_quota_atomics() {
         use crate::storage::db_quota::publish_db_maxmemory_any_set;
+        // moon#856: every store below hits a PROCESS-GLOBAL atomic. The final
+        // lines happen to leave both unset, but only on the success path — a
+        // panic anywhere in between used to leave a published limit behind for
+        // the rest of the suite. The guard restores on the unwind path too.
+        let _limits = PublishedLimits::capture();
         publish_maxmemory(0);
         publish_db_maxmemory_any_set(&RuntimeConfig::default());
         assert!(!write_gate_active(), "no limit published: gate inactive");
@@ -1794,6 +1867,9 @@ mod tests {
 
     #[test]
     fn maxmemory_publish_and_is_set_roundtrip() {
+        // moon#856: same reasoning as the test above — the trailing
+        // `publish_maxmemory(0)` only runs when every assertion held.
+        let _limits = PublishedLimits::capture();
         // Unset (0) => maxmemory_is_set() is false.
         publish_maxmemory(0);
         assert!(!maxmemory_is_set());
