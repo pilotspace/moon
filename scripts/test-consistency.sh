@@ -1829,6 +1829,203 @@ route_probe f_xread    "XADD %K 1-1 f v"             "XREAD COUNT 1 STREAMS %K 0
 # tests/shard_routing_parity.rs, which asserts the reply is an integer for
 # every key rather than that the two servers agree on the number.
 
+# ===========================================================================
+# BEGIN moon#962 -- a multi-key command must not answer from ONE shard
+# ===========================================================================
+#
+# Self-contained block: it defines its own helpers and its own key namespace
+# (`mk:`), and modifies nothing above or below it.
+#
+# `route_probe` above substitutes a SINGLE `%K`, so every row it drives in this
+# family is numkeys=1 -- `LMPOP 1 %K LEFT`, `ZDIFF 1 %K`, `SINTERCARD 1 %K`.
+# **One key cannot span shards**, which is exactly why this family read clean
+# for a release while `LMPOP` was popping a key it had never routed on. This is
+# the adjacent vacuity trap the comment at the top of the routing block already
+# warns about, in its other form: not "the key was absent" but "there was only
+# one key".
+#
+# `route_probe_multi` maps `%K1..%Kn` to DISTINCT key names and runs each row
+# in two placements, both of which are load-bearing:
+#
+#   span -- unrelated names, which at --shards>1 land on different shards.
+#           moon must either AGREE with redis or refuse with CROSSSLOT, and a
+#           refusal must have left the keyspace untouched. Answering something
+#           else is the defect.
+#   colo -- one `{hash}` tag, the documented remedy. moon must AGREE with
+#           redis and must NEVER refuse. This is what a blanket refusal fails.
+#
+# At --shards 1 the span placement co-locates trivially and both halves demand
+# the correct answer, so the block is a pure parity check there rather than
+# being skipped.
+#
+# The per-key `check` template is what makes the two MUTATING members
+# (`LMPOP`/`ZMPOP`) visible: the reply alone cannot show that an element left a
+# key the command must never reach.
+
+MK_TRIALS=8
+MK_REFUSED=0
+MK_TOUCH_REFUSED=0
+
+# Read `tmpl` (with %K) for every key, joined -- one comparable string for the
+# whole key set.
+mk_state() {
+    local port="$1" tmpl="$2"; shift 2
+    local k out=""
+    for k in "$@"; do
+        # shellcheck disable=SC2086  # deliberate word-split: templates are ours
+        out="${out}$(redis-cli -p "$port" ${tmpl//%K/$k} 2>&1 | tr '\n' ' ')|"
+    done
+    printf '%s' "$out"
+}
+
+# mode(span|colo) label nkeys seed-templates(|-separated, one per key, %K)
+#   probe(%K1..%Kn) [check(%K)]
+#
+# An EMPTY seed template leaves that key absent -- `LMPOP`'s first key must be
+# empty AND the routing key, or the priority scan never walks past it and the
+# wrong-key pop cannot happen.
+route_probe_multi() {
+    local mode="$1" label="$2" n="$3" seeds="$4" probe="$5" check="${6:-}"
+    local i j port s p r m before="" after=""
+    local wrong=0 refused=0
+    local -a keys seedv
+    for i in $(seq 1 "$MK_TRIALS"); do
+        keys=()
+        for j in $(seq 1 "$n"); do
+            if [[ "$mode" == "colo" ]]; then
+                keys+=("{mk:${label}:${i}}:${j}")
+            else
+                keys+=("mk:${label}:${i}:${j}")
+            fi
+        done
+        IFS='|' read -r -a seedv <<<"$seeds"
+        for port in "$PORT_REDIS" "$PORT_RUST"; do
+            redis-cli -p "$port" DEL "${keys[@]}" >/dev/null 2>&1 || true
+            for j in $(seq 1 "$n"); do
+                s="${seedv[$((j-1))]:-}"
+                # `if`, never `[[ ... ]] && continue`: under `set -e` a bare
+                # `&&` statement that evaluates FALSE aborts the script (#642).
+                if [[ -n "$s" ]]; then
+                    s="${s//%K/${keys[$((j-1))]}}"
+                    # shellcheck disable=SC2086
+                    redis-cli -p "$port" $s >/dev/null 2>&1 || true
+                fi
+            done
+        done
+        if [[ -n "$check" ]]; then
+            before="$(mk_state "$PORT_RUST" "$check" "${keys[@]}")"
+        fi
+        p="$probe"
+        for j in $(seq "$n" -1 1); do p="${p//%K$j/${keys[$((j-1))]}}"; done
+        # Sorted: the set combinators return an unordered collection, and
+        # ordering parity is test-commands.sh's job, not this block's.
+        # shellcheck disable=SC2086
+        r="$(redis-cli -p "$PORT_REDIS" $p 2>&1 | sort | tr '\n' ' ')"
+        # shellcheck disable=SC2086
+        m="$(redis-cli -p "$PORT_RUST"  $p 2>&1 | sort | tr '\n' ' ')"
+        if [[ -n "$check" ]]; then
+            after="$(mk_state "$PORT_RUST" "$check" "${keys[@]}")"
+        fi
+        # `*CROSSSLOT*`, not `CROSSSLOT*`: redis-cli emits a leading blank
+        # line for an error reply, and `sort` puts it first. An anchored
+        # pattern silently fell through to the "answered" arm and reported
+        # every correct refusal as a mismatch.
+        case "$m" in
+            *CROSSSLOT*)
+                refused=$((refused + 1))
+                if [[ "$mode" == "colo" ]]; then
+                    echo "  FAIL detail: ${label}[$i] refused a CO-LOCATED key set: $m"
+                    wrong=$((wrong + 1))
+                elif [[ "$label" == "touch" ]]; then
+                    MK_TOUCH_REFUSED=$((MK_TOUCH_REFUSED + 1))
+                    echo "  FAIL detail: touch[$i] was refused; it is per-key decomposable and must fan out"
+                    wrong=$((wrong + 1))
+                elif [[ -n "$check" && "$before" != "$after" ]]; then
+                    echo "  FAIL detail: ${label}[$i] refused but the keyspace MOVED: '$before' -> '$after'"
+                    wrong=$((wrong + 1))
+                fi ;;
+            *)
+                if [[ "$r" != "$m" ]]; then
+                    echo "  FAIL detail: ${label}[$i] ($mode) answered '$m'; redis says '$r'"
+                    wrong=$((wrong + 1))
+                fi ;;
+        esac
+    done
+    assert_eq "moon#962 ${label} ${mode} (shards=${SHARDS}, ${MK_TRIALS} placements)" \
+        "0 wrong" "${wrong} wrong"
+    MK_REFUSED=$((MK_REFUSED + refused))
+}
+
+# label | n | per-key seeds | probe | per-key check
+#
+# `sdiff`/`zdiff` get an ASYMMETRIC seed on purpose: under a uniform one, key 3
+# subtracts the shared member whether or not key 2 was visible, and the DIFF
+# rows come back RIGHT for the WRONG reason (measured: 12 of 12 green on the
+# defective binary before this seed existed). Only key 2 can subtract `common`
+# here, so losing it is visible.
+MK_ROWS=(
+  "sinter|3|SADD %K common m1|SADD %K common m2|SADD %K common m3|SINTER %K1 %K2 %K3|SCARD %K"
+  "sunion|3|SADD %K common m1|SADD %K common m2|SADD %K common m3|SUNION %K1 %K2 %K3|SCARD %K"
+  "sdiff|3|SADD %K common m1|SADD %K common|SADD %K m3|SDIFF %K1 %K2 %K3|SCARD %K"
+  "sintercard|3|SADD %K common m1|SADD %K common m2|SADD %K common m3|SINTERCARD 3 %K1 %K2 %K3|SCARD %K"
+  "zdiff|3|ZADD %K 1 common 2 m1|ZADD %K 1 common|ZADD %K 2 m3|ZDIFF 3 %K1 %K2 %K3|ZCARD %K"
+  "zinter|3|ZADD %K 1 common 2 m1|ZADD %K 1 common 2 m2|ZADD %K 1 common 2 m3|ZINTER 3 %K1 %K2 %K3|ZCARD %K"
+  "zunion|3|ZADD %K 1 common 2 m1|ZADD %K 1 common 2 m2|ZADD %K 1 common 2 m3|ZUNION 3 %K1 %K2 %K3 WITHSCORES|ZCARD %K"
+  "zintercard|3|ZADD %K 1 common 2 m1|ZADD %K 1 common 2 m2|ZADD %K 1 common 2 m3|ZINTERCARD 3 %K1 %K2 %K3|ZCARD %K"
+  "lcs|2|SET %K ohmytext|SET %K mynewtext|LCS %K1 %K2|GET %K"
+  "pfcount|3|PFADD %K a b c|PFADD %K d e f|PFADD %K g h i|PFCOUNT %K1 %K2 %K3|PFCOUNT %K"
+  "touch|3|SET %K v|SET %K v|SET %K v|TOUCH %K1 %K2 %K3|GET %K"
+  "lmpop|3||RPUSH %K B1 B2|RPUSH %K C1 C2|LMPOP 3 %K1 %K2 %K3 LEFT|LRANGE %K 0 -1"
+  "zmpop|3||ZADD %K 1 B1 2 B2|ZADD %K 1 C1 2 C2|ZMPOP 3 %K1 %K2 %K3 MIN|ZRANGE %K 0 -1"
+)
+
+for mk_row in "${MK_ROWS[@]}"; do
+    IFS='|' read -r -a mk_f <<<"$mk_row"
+    mk_label="${mk_f[0]}"; mk_n="${mk_f[1]}"
+    # fields 2..(2+n-1) are the per-key seeds, then the probe, then the check
+    mk_seeds=""
+    for mk_j in $(seq 0 $((mk_n - 1))); do
+        mk_seeds="${mk_seeds}${mk_f[$((2 + mk_j))]:-}|"
+    done
+    mk_seeds="${mk_seeds%|}"
+    mk_probe="${mk_f[$((2 + mk_n))]}"
+    mk_check="${mk_f[$((3 + mk_n))]:-}"
+    route_probe_multi span "$mk_label" "$mk_n" "$mk_seeds" "$mk_probe" "$mk_check"
+    route_probe_multi colo "$mk_label" "$mk_n" "$mk_seeds" "$mk_probe" "$mk_check"
+done
+
+# Non-vacuity. At --shards>1 the span sweep MUST have reached the cross-shard
+# case at least once, or every row above passed by co-locating and the block
+# proved nothing. At --shards 1 there is nothing to refuse, so zero is right.
+if [[ "$SHARDS" -gt 1 ]]; then
+    if [[ "$MK_REFUSED" -gt 0 ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: moon#962 span sweep reached the cross-shard case ($MK_REFUSED refusals, shards=$SHARDS)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: moon#962 span sweep refused nothing at shards=$SHARDS -- every placement co-located and the block is vacuous"
+    fi
+else
+    assert_eq "moon#962 nothing is refused at one shard" "0" "$MK_REFUSED"
+fi
+# TOUCH is the one member that fans out; a refusal for it is a regression.
+assert_eq "moon#962 TOUCH is never refused (shards=$SHARDS)" "0" "$MK_TOUCH_REFUSED"
+
+# Tidy up by exact name -- `--scan | xargs -r` is GNU-only and this script runs
+# on macOS too.
+for mk_row in "${MK_ROWS[@]}"; do
+    IFS='|' read -r -a mk_f <<<"$mk_row"
+    for mk_i in $(seq 1 "$MK_TRIALS"); do
+        for mk_j in $(seq 1 "${mk_f[1]}"); do
+            for mk_port in "$PORT_REDIS" "$PORT_RUST"; do
+                redis-cli -p "$mk_port" DEL "mk:${mk_f[0]}:${mk_i}:${mk_j}" \
+                    "{mk:${mk_f[0]}:${mk_i}}:${mk_j}" >/dev/null 2>&1 || true
+            done
+        done
+    done
+done
+# ===========================================================================
+# END moon#962
+# ===========================================================================
+
 # EXEC aborted by a broken WATCH: the reply TYPE, not the committed value.
 # Needs two connections interleaved, like watch_cas_outcome above, but reads
 # EXEC's own reply line rather than the key's final value.
