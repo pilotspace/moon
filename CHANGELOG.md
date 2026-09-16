@@ -105,7 +105,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   like `<nope` — leaves the table byte-identical. Selectors are refused with
   `ACL selectors are not supported` rather than dropped. An ACL file line
   carrying any rejected token is not loaded (logged at WARN), as #978 already
-  did for categories. Stacked on moon#978's category fix.
+  did for categories. One deliberate loosening, surfaced by `RESETKEYS` now
+  taking effect: `check_key_permission` had a blanket "no key patterns →
+  deny" ahead of its keyless-command check, so such a user could not even
+  `PING`; redis gates only keyed commands on key patterns, and so does moon
+  now (keyed commands are still denied by the per-key loop). Stacked on
+  moon#978's category fix.
 
 ### Fixed
 
