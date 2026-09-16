@@ -23,6 +23,59 @@ mod tests {
         parts.iter().map(|p| b(p)).collect()
     }
 
+    /// moon#952. HINCRBY added with a plain `+`, which wraps in release, so
+    /// i64::MAX + 1 was STORED as i64::MIN and reported as success. `INCR` on a
+    /// string already refuses the same case with
+    /// `ERR increment or decrement would overflow` — this is that rule, applied
+    /// to the hash family.
+    ///
+    /// Both encodings are covered: a one-field hash is a listpack and takes
+    /// `update_pair_value`; past the threshold it is a HashMap and takes the
+    /// owned arm. They were two separate `+`.
+    #[test]
+    fn hincrby_refuses_to_wrap_at_the_i64_boundary() {
+        const OVERFLOW: &[u8] = b"ERR increment or decrement would overflow";
+
+        for encoding_filler in [0usize, 200usize] {
+            let mut db = Database::new();
+            // Push the hash past the listpack threshold on the second pass so
+            // the owned HashMap arm is exercised too.
+            for i in 0..encoding_filler {
+                let f = format!("filler{i}");
+                hset(&mut db, &make_args(&[b"h", f.as_bytes(), b"0"]));
+            }
+            hset(&mut db, &make_args(&[b"h", b"f", b"9223372036854775807"]));
+
+            let got = hincrby(&mut db, &make_args(&[b"h", b"f", b"1"]));
+            match got {
+                Frame::Error(ref e) => assert_eq!(e.as_ref(), OVERFLOW),
+                other => panic!("filler={encoding_filler}: expected overflow error, got {other:?}"),
+            }
+            // The value must be untouched — a refused increment that still
+            // wrote would be the same data loss with an error attached.
+            assert_eq!(
+                hget(&mut db, &make_args(&[b"h", b"f"])),
+                Frame::BulkString(Bytes::from_static(b"9223372036854775807")),
+                "filler={encoding_filler}: a refused HINCRBY must not write"
+            );
+
+            // The negative end, same rule.
+            hset(&mut db, &make_args(&[b"h", b"g", b"-9223372036854775808"]));
+            match hincrby(&mut db, &make_args(&[b"h", b"g", b"-1"])) {
+                Frame::Error(ref e) => assert_eq!(e.as_ref(), OVERFLOW),
+                other => {
+                    panic!("filler={encoding_filler}: expected underflow error, got {other:?}")
+                }
+            }
+
+            // An increment that fits still works.
+            assert_eq!(
+                hincrby(&mut db, &make_args(&[b"h", b"f", b"-1"])),
+                Frame::Integer(9223372036854775806)
+            );
+        }
+    }
+
     #[test]
     fn test_hset_new_fields() {
         let mut db = Database::new();
