@@ -6,6 +6,7 @@
 mod command_metrics;
 mod globals;
 mod init;
+mod latency;
 mod memory;
 mod publishers;
 mod recorders;
@@ -13,6 +14,7 @@ mod recorders;
 pub use command_metrics::*;
 pub use globals::*;
 pub use init::*;
+pub use latency::*;
 pub use memory::*;
 pub use publishers::*;
 pub use recorders::*;
@@ -174,6 +176,20 @@ fn bump_total_commands() {
     });
 }
 
+/// Count `n` commands in this thread's total-commands slot as ONE relaxed
+/// add. [`LatencyProbe`] flushes through here on drop, which is what lets the
+/// inline loop (moon#660) keep its per-batch accounting while sharing the
+/// generic paths' spelling. `n == 0` costs nothing.
+#[inline]
+pub(crate) fn bump_total_commands_by(n: u64) {
+    if n == 0 {
+        return;
+    }
+    COMMAND_COUNTER_SLOT.with(|&slot| {
+        COMMAND_COUNTERS[slot].0.fetch_add(n, Ordering::Relaxed);
+    });
+}
+
 /// This thread's slot of the sharded total-commands counter. Used by the
 /// shard loop's adaptive idle park (#373) as its "commands dispatched on
 /// this shard since the last tick" signal — one relaxed load per tick.
@@ -182,33 +198,6 @@ fn bump_total_commands() {
 #[inline]
 pub fn this_thread_commands() -> u64 {
     COMMAND_COUNTER_SLOT.with(|&slot| COMMAND_COUNTERS[slot].0.load(Ordering::Relaxed))
-}
-
-/// Count `n` inline-dispatched commands in this thread's total-commands slot.
-///
-/// moon#660: `try_inline_dispatch` answers a plain `SET`/`GET` straight from
-/// the read buffer and never reaches the generic leg's `record_command*`
-/// calls, so every inlined command was invisible to
-/// `total_commands_processed`. Measured before this existed: 200 plain `SET`s
-/// moved `local_inline` by 200 and `total_commands_processed` by **0**.
-///
-/// That is not only an `INFO` inaccuracy. [`this_thread_commands`] is the
-/// adaptive idle park's (#373) activity signal, so a shard serving nothing but
-/// inlined commands read zero commands-per-tick and could be classified IDLE
-/// while fully loaded — the same hazard `record_replica_apply` below exists to
-/// prevent for the apply path.
-///
-/// Batched (`fetch_add(n)`, not `n` × `fetch_add(1)`) because the inline loop
-/// already knows how many it served: one relaxed add per BATCH on this
-/// thread's own padded line.
-#[inline]
-pub fn record_inline_commands(n: u64) {
-    if n == 0 {
-        return;
-    }
-    COMMAND_COUNTER_SLOT.with(|&slot| {
-        COMMAND_COUNTERS[slot].0.fetch_add(n, Ordering::Relaxed);
-    });
 }
 
 /// Count a replica-applied command in this thread's total-commands slot.

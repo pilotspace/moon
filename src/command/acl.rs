@@ -2,7 +2,7 @@ use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 
-use crate::acl::rules::get_category_commands;
+use crate::acl::rules::{acl_category_names, get_category_commands};
 use crate::acl::{AclLog, AclLogEntry, AclTable, CommandPermissions};
 use crate::config::RuntimeConfig;
 use crate::framevec;
@@ -145,10 +145,17 @@ pub fn handle_acl(
                         .collect();
                     let commands = match &user.allowed_commands {
                         CommandPermissions::AllAllowed => "+@all".to_string(),
+                        // #978: same concealment as `user_to_acl_line` --
+                        // `base_allow` was dropped and `-@all` hardcoded, so
+                        // `ACL GETUSER` reported a base-allow user as having no
+                        // commands. Both renderers now show the polarity.
                         CommandPermissions::Specific {
-                            allowed, denied, ..
+                            base_allow,
+                            allowed,
+                            denied,
                         } => {
-                            let mut parts = vec!["-@all".to_string()];
+                            let mut parts =
+                                vec![if *base_allow { "+@all" } else { "-@all" }.to_string()];
                             let mut allowed_sorted: Vec<&String> = allowed.iter().collect();
                             allowed_sorted.sort();
                             for a in allowed_sorted {
@@ -228,7 +235,14 @@ pub fn handle_acl(
             let Ok(mut table) = acl_table.write() else {
                 return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
             };
-            table.apply_setuser(&username, &rules);
+            // #978: a category Moon cannot resolve is an ERROR, never a
+            // silent no-op. It used to resolve to an empty command list, and
+            // `-@bitmap` on a `+@all` user then rebuilt the permission set as
+            // base-allow with an empty deny set -- every command granted,
+            // reported by `ACL LIST` as `-@all`.
+            if let Err((rule, err)) = table.try_apply_setuser(&username, &rules) {
+                return Frame::Error(Bytes::from(err.to_setuser_error(rule)));
+            }
             Frame::SimpleString(Bytes::from_static(b"OK"))
         }
 
@@ -282,69 +296,35 @@ pub fn handle_acl(
         }
 
         "CAT" => {
+            // Both arms read `rules::CATEGORY_TABLE` through
+            // `acl_category_names` / `get_category_commands`. This branch used
+            // to keep TWO more hand-maintained name arrays -- one published by
+            // the no-arg form, one gating the single-category form -- neither
+            // of which matched what `+@`/`-@` actually resolved. A name could
+            // be published without resolving, and (#978) resolve to nothing
+            // while still being accepted by `ACL SETUSER`. One table, three
+            // consumers, no drift.
             if args.is_empty() {
-                // Return all category names
-                let cats = vec![
-                    "read",
-                    "write",
-                    "string",
-                    "hash",
-                    "list",
-                    "set",
-                    "sortedset",
-                    "stream",
-                    "pubsub",
-                    "admin",
-                    "dangerous",
-                    "keyspace",
-                    "connection",
-                    "transaction",
-                    "scripting",
-                    "cluster",
-                    "all",
-                ];
                 Frame::Array(
-                    cats.iter()
+                    acl_category_names()
                         .map(|c| Frame::BulkString(Bytes::copy_from_slice(c.as_bytes())))
                         .collect(),
                 )
             } else {
-                let cat = match extract_str(&args[0]) {
-                    Some(c) => c.to_string(),
-                    None => return Frame::Error(Bytes::from_static(b"ERR invalid category")),
+                let Some(cat) = extract_str(&args[0]) else {
+                    return Frame::Error(Bytes::from_static(b"ERR invalid category"));
                 };
-                let cat_stripped = cat.trim_start_matches('@');
-                let known_cats = [
-                    "all",
-                    "read",
-                    "write",
-                    "string",
-                    "hash",
-                    "list",
-                    "set",
-                    "sortedset",
-                    "stream",
-                    "pubsub",
-                    "admin",
-                    "dangerous",
-                    "keyspace",
-                    "connection",
-                    "transaction",
-                    "scripting",
-                    "cluster",
-                ];
-                if !known_cats.contains(&cat_stripped) {
-                    return Frame::Error(Bytes::from(format!(
+                match get_category_commands(cat) {
+                    Some(cmds) => Frame::Array(
+                        cmds.iter()
+                            .map(|c| Frame::BulkString(Bytes::copy_from_slice(c.as_bytes())))
+                            .collect(),
+                    ),
+                    None => Frame::Error(Bytes::from(format!(
                         "ERR Unknown category '{}'. Try ACL CAT with no arguments to get a list of all available categories",
                         cat
-                    )));
+                    ))),
                 }
-                let cmds = get_category_commands(&cat);
-                Frame::Array(
-                    cmds.iter()
-                        .map(|c| Frame::BulkString(Bytes::copy_from_slice(c.as_bytes())))
-                        .collect(),
-                )
             }
         }
 
