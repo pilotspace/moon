@@ -81,8 +81,16 @@ fn names_claimed_by_gates() -> BTreeSet<String> {
     let mut claimed = BTreeSet::new();
     for rel in GATE_FILES {
         let path = repo_root().join(rel);
+        // Normalise line endings before scanning. The guard window below is a
+        // BYTE budget, and a CRLF checkout (git's default on Windows) spends
+        // one extra byte per line — enough to push the last claim of a long
+        // guard past the cap. That dropped FUNCTION and GRAPH.QUERY on
+        // `Check (Windows)` while every LF platform kept them, i.e. the
+        // verdict depended on the checkout's line endings, not on the code
+        // this audits.
         let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("cannot read gate file {}: {e}", path.display()));
+            .unwrap_or_else(|e| panic!("cannot read gate file {}: {e}", path.display()))
+            .replace("\r\n", "\n");
 
         for (idx, _) in src.match_indices("fn try_") {
             let body = &src[idx..];
