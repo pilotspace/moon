@@ -6,6 +6,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **An ACL category Moon does not implement is an error, not a grant of every
+  command** (moon#978). `get_category_commands` ended in `_ => &[]`, so an
+  unknown category resolved to an EMPTY command list rather than failing.
+  `deny_command` walked that empty list, inserted nothing, and then
+  unconditionally rebuilt the permission set as
+  `Specific { base_allow: true, allowed: {}, denied: {} }` — base-allow with an
+  empty deny set, i.e. **every command permitted**. `is_command_allowed` fell
+  through to `base_allow`, while `user_to_acl_line` (which discards
+  `base_allow`) printed the user as `-@all`, so introspection actively
+  concealed the state: measured against redis-server 8.6.1,
+  `ACL SETUSER v on >pw ~* &* +@all` then `ACL SETUSER v -@bitmap` answered
+  `OK` on both, after which moon's `ACL LIST` reported
+  `user v on #… ~* &* -@all` while that user ran `SETBIT`, `BITCOUNT` and
+  `FLUSHALL` — redis reported `+@all -@bitmap` and answered `NOPERM`. Six real
+  redis categories reached that arm (`bitmap`, `hyperloglog`, `geo`, `fast`,
+  `slow`, `blocking`), as did **every** non-lowercase spelling of a category
+  Moon did have — the old `match` compared lowercase literals while redis
+  category names are case-insensitive, so `-@DANGEROUS` was a full grant.
+  Category lookup is now case-insensitive, an unresolvable name returns
+  redis's `ERR Error in ACL SETUSER modifier '<rule>': Unknown command or
+  category name in ACL`, and the rejected `ACL SETUSER` mutates nothing —
+  neither creating the user nor applying the prefix of the rule list that
+  parsed. This is a second, distinct path into the state disclosed as
+  GHSA-9x86-7597-5wwj, and worse in one respect: there, stored and reported
+  state agreed.
+- **`+@read` no longer grants commands that mutate, and `-@dangerous` now
+  revokes what redis revokes** (moon#980). `@read` contained `getdel`, `getex`
+  and `sort`, so a `-@all +@read` user could run `GETDEL vic` — measured
+  returning `"hello"` and leaving `EXISTS vic` at 0, where redis answers
+  `NOPERM` — and `SORT … STORE` wrote a new key. `@dangerous` was missing
+  `SWAPDB`, `INFO`, `CLIENT`, `ROLE`, `SHUTDOWN` and `RESTORE`, so
+  `+@all -@dangerous` left all of them runnable. Every category's membership
+  is now derived from a live `redis-server 8.6.1` `ACL CAT`, restricted to the
+  commands Moon implements, with redis's per-subcommand classification
+  collapsed onto the bare container name Moon's permission check actually
+  sees — in the direction that makes `-@dangerous` deny the whole container.
+  The six missing categories are implemented, and Moon-only families
+  (`FT.*`, `GRAPH.*`, `TXN`, `TEMPORAL.*`, `MQ`, `WS`, `CDC.READ`, `VACUUM`)
+  are classified explicitly instead of falling into the hole this fixes.
+  `@transaction` listed a bare `temporal`, which Moon does not dispatch at
+  all — the real names are `TEMPORAL.SNAPSHOT_AT` and `TEMPORAL.INVALIDATE`,
+  so that carve-out had never covered either, and the unit test asserting it
+  did was probing an un-dispatchable name and could not fail.
+- **`ACL CAT` publishes exactly the categories `+@`/`-@` resolves.** The name
+  list existed in three hand-maintained copies — two in `src/command/acl.rs`
+  (one published by the no-argument form, one gating the single-category form)
+  and the `match` arms in `src/acl/rules.rs`. A name could be published without
+  resolving, or resolve to nothing while `ACL SETUSER` still accepted it. There
+  is now one table with three consumers.
+- **`+CONFIG|GET` is stored lowercased.** The subcommand branch of
+  `allow_command` stored the rule verbatim while `is_command_allowed`
+  lowercases the incoming name before probing, so a mixed-case subcommand grant
+  could never match anything.
+- **The consistency suite has ACL rows.** `scripts/test-consistency.sh` had
+  none — the only `ACL` mention in either harness was a container-subcommand
+  list — so both bugs above shipped unnoticed. It now carries the three
+  measured escalations, the case-insensitivity case, moon#971's `base_allow`
+  polarity pair, and an `ACL CAT` diff of all 21 redis categories against the
+  live oracle that fails on an escalation in a permissive category or a missing
+  member of `@admin`/`@dangerous`.
 ### Added
 
 - **Console `vitest` unit suite (10 files / 56 tests) now runs in CI**
