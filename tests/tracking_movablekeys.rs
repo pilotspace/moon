@@ -17,12 +17,31 @@
 //! on the wire and not only as a unit test of the extractor.
 //!
 //! Every case below was measured against `redis-server 8.0.5`, which fires an
-//! invalidation for all of them.
+//! invalidation for all of them; the `{hash}`-tagged read rows were re-measured
+//! against `redis-server 8.6.1` (`SINTERCARD 2 {s}1 {s}2` -> `:1`, then
+//! `SADD {s}1 y` pushes `invalidate {s}1`).
 //!
 //! Each case runs beside a **control** that differs only in using a
 //! fixed-position command. The controls are not decoration: without them, a
 //! harness that never delivers pushes at all would make every assertion pass
 //! after an inverted fix, or fail for reasons unrelated to key extraction.
+//!
+//! ## Why the multi-key read rows are `{hash}`-tagged (moon#962)
+//!
+//! Until moon#962 a multi-key read whose keys lived on several shards was
+//! executed on the FIRST key's shard alone, and every other key read as
+//! absent. `SINTERCARD 2 s1 s2` with `x` in both answered `0` at `--shards 4`
+//! (true answer `1`) — and this file was **green on that wrong answer**: the
+//! read "succeeded", the client registered, the assertion passed. moon#962
+//! turns that into a `CROSSSLOT` refusal, which registers nothing, so the
+//! untagged rows failed for the right reason.
+//!
+//! The read rows are therefore co-located with a `{hash}` tag — the read
+//! genuinely executes at every shard count and the assertion means what it
+//! says — and `spanning_movablekeys_read_is_refused_not_answered_from_one_shard`
+//! pins the refusal itself, so a regression that quietly restored the one-shard
+//! answer cannot make this file green again. [`invalidation_reaches_tracker`]
+//! additionally refuses to count an errored read as "registered".
 
 mod common;
 
@@ -30,6 +49,12 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use moon::shard::dispatch::key_to_shard;
+
+/// Shard count the spanning case is pinned at: what moon#962 measured at, and
+/// enough that a two-key set can be placed on different shards.
+const SPAN_SHARDS: usize = 4;
 
 struct Moon {
     child: Child,
@@ -46,7 +71,10 @@ impl Drop for Moon {
 }
 
 fn spawn_moon(shards: &str) -> Moon {
-    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"));
+    // `find_moon_binary`, not a bare `CARGO_BIN_EXE_moon`: `MOON_BIN` must be
+    // able to point this suite at a control binary, or a red/green A/B of the
+    // rows below is impossible.
+    let bin = common::find_moon_binary();
     let (child, port) = common::spawn_listening(|port| {
         let tmp_dir = std::env::temp_dir().join(format!("moon-track-{port}"));
         let _ = std::fs::create_dir_all(&tmp_dir);
@@ -169,6 +197,12 @@ fn tracking_client(port: u16) -> Conn {
 }
 
 /// One tracked-read / foreign-write pair: does the tracking client get told?
+///
+/// Panics if the tracked read itself errors. A read that was refused never
+/// executed, so whether the client "registered" afterwards proves nothing
+/// about key extraction — and naming the reply here is what turns a bare
+/// "did not register" into a diagnosis (moon#962 was first seen as exactly
+/// that bare message).
 fn invalidation_reaches_tracker(
     port: u16,
     setup: &[&[&str]],
@@ -182,12 +216,28 @@ fn invalidation_reaches_tracker(
     }
 
     let mut tracker = tracking_client(port);
-    tracker.call(tracked_read);
+    let read_reply = tracker.call(tracked_read);
+    assert!(
+        !read_reply.starts_with(b"-"),
+        "tracked read {tracked_read:?} errored, so registration cannot be judged: {:?}",
+        String::from_utf8_lossy(&read_reply)
+    );
 
     let mut other = Conn::open(port);
     other.call(foreign_write);
 
     tracker.awaits_invalidate(key, Duration::from_secs(3))
+}
+
+/// A key on a DIFFERENT shard from `anchor` at [`SPAN_SHARDS`], found with the
+/// routing hash the server itself uses — never a literal that happens to land
+/// right at one shard count.
+fn key_on_another_shard(anchor: &str, prefix: &str) -> String {
+    let owner = key_to_shard(anchor.as_bytes(), SPAN_SHARDS);
+    (0..1000)
+        .map(|i| format!("{prefix}{i}"))
+        .find(|k| key_to_shard(k.as_bytes(), SPAN_SHARDS) != owner)
+        .expect("a key on another shard must exist within 1000 candidates")
 }
 
 /// A movablekeys READ must register the client, and a movablekeys WRITE must
@@ -222,17 +272,22 @@ fn movablekeys_reads_and_writes_reach_tracking_clients() {
         );
 
         // ── READ side: a movablekeys read must register the client ────────
+        //
+        // Two keys, co-located by `{hash}` tag so the read EXECUTES at every
+        // shard count (moon#962: an untagged pair that spans shards is refused
+        // with CROSSSLOT, and a refused read registers nothing). The spanning
+        // form is pinned separately below.
         assert!(
             invalidation_reaches_tracker(
                 p,
                 &[
-                    &["DEL", "s1", "s2"],
-                    &["SADD", "s1", "x"],
-                    &["SADD", "s2", "x"]
+                    &["DEL", "{s}1", "{s}2"],
+                    &["SADD", "{s}1", "x"],
+                    &["SADD", "{s}2", "x"]
                 ],
-                &["SINTERCARD", "2", "s1", "s2"],
-                &["SADD", "s1", "y"],
-                "s1",
+                &["SINTERCARD", "2", "{s}1", "{s}2"],
+                &["SADD", "{s}1", "y"],
+                "{s}1",
             ),
             "SINTERCARD read did not register the tracking client (shards={shards})"
         );
@@ -240,18 +295,22 @@ fn movablekeys_reads_and_writes_reach_tracking_clients() {
             invalidation_reaches_tracker(
                 p,
                 &[
-                    &["DEL", "z1", "z2"],
-                    &["ZADD", "z1", "1", "a"],
-                    &["ZADD", "z2", "1", "b"]
+                    &["DEL", "{z}1", "{z}2"],
+                    &["ZADD", "{z}1", "1", "a"],
+                    &["ZADD", "{z}2", "1", "b"]
                 ],
-                &["ZDIFF", "2", "z1", "z2"],
-                &["ZADD", "z1", "2", "c"],
-                "z1",
+                &["ZDIFF", "2", "{z}1", "{z}2"],
+                &["ZADD", "{z}1", "2", "c"],
+                "{z}1",
             ),
             "ZDIFF read did not register the tracking client (shards={shards})"
         );
 
         // ── WRITE side: a movablekeys write must push an invalidation ─────
+        //
+        // Single-key (`numkeys 1`) on purpose: one key names one shard, so
+        // these rows are outside moon#962's refusal at every shard count and
+        // isolate the #582 extractor defect from routing.
         assert!(
             invalidation_reaches_tracker(
                 p,
@@ -272,6 +331,101 @@ fn movablekeys_reads_and_writes_reach_tracking_clients() {
             ),
             "ZMPOP write did not invalidate the key it popped (shards={shards})"
         );
+        // Two keys, co-located by tag, with the FIRST one empty so the pop
+        // lands on the SECOND: the invalidation must name the key that was
+        // actually popped, not the routing key. Measured against redis 8.6.1
+        // (`LMPOP 2 {m}a {m}b LEFT` -> `{m}b B1`, push `invalidate {m}b`).
+        assert!(
+            invalidation_reaches_tracker(
+                p,
+                &[&["DEL", "{m}a", "{m}b"], &["RPUSH", "{m}b", "B1", "B2"]],
+                &["LRANGE", "{m}b", "0", "-1"],
+                &["LMPOP", "2", "{m}a", "{m}b", "LEFT"],
+                "{m}b",
+            ),
+            "LMPOP over two keys did not invalidate the SECOND key it popped \
+             (shards={shards})"
+        );
+        assert!(
+            invalidation_reaches_tracker(
+                p,
+                &[
+                    &["DEL", "{q}a", "{q}b"],
+                    &["ZADD", "{q}b", "1", "x", "2", "y"]
+                ],
+                &["ZRANGE", "{q}b", "0", "-1"],
+                &["ZMPOP", "2", "{q}a", "{q}b", "MIN"],
+                "{q}b",
+            ),
+            "ZMPOP over two keys did not invalidate the SECOND key it popped \
+             (shards={shards})"
+        );
+    }
+}
+
+/// moon#962: a movablekeys read whose keys SPAN shards is refused with
+/// `CROSSSLOT` — never answered from one shard's slice. Before the fix the same
+/// `SINTERCARD` answered `:0` at `--shards 4` (true answer `1`), the client
+/// registered, and this file was green on the wrong answer.
+///
+/// The second key is SEARCHED for on a different shard with the server's own
+/// routing hash, so the pair spans by construction, not by luck. The same argv
+/// at `--shards 1` — where no boundary exists — must still answer `:1` and
+/// still register the client, which keeps the pre-#962 untagged shape of the
+/// #582 assertion alive on the one leg where it was ever true.
+#[test]
+fn spanning_movablekeys_read_is_refused_not_answered_from_one_shard() {
+    let a = "span:a";
+    let b = key_on_another_shard(a, "span:b");
+    assert_ne!(
+        key_to_shard(a.as_bytes(), SPAN_SHARDS),
+        key_to_shard(b.as_bytes(), SPAN_SHARDS),
+        "the pair must span shards for this test to mean anything"
+    );
+
+    // ── shards=4: refused, and refused BEFORE reading (the reply is an error,
+    //    not a number) ────────────────────────────────────────────────────────
+    {
+        let moon = spawn_moon(&SPAN_SHARDS.to_string());
+        let mut c = Conn::open(moon.port);
+        c.call(&["DEL", a, &b]);
+        c.call(&["SADD", a, "x"]);
+        c.call(&["SADD", &b, "x"]);
+        let reply = c.call(&["SINTERCARD", "2", a, &b]);
+        let text = String::from_utf8_lossy(&reply);
+        assert!(
+            text.starts_with("-CROSSSLOT"),
+            "SINTERCARD over a spanning key set at shards={SPAN_SHARDS} must be refused \
+             with CROSSSLOT, got {text:?} (`:0` is the pre-#962 one-shard wrong answer; \
+             `:1` would mean a merge now exists and this pin should move to \
+             tests/multikey_read_cross_shard.rs)"
+        );
+    }
+
+    // ── shards=1: the same argv answers correctly and registers ───────────
+    {
+        let moon = spawn_moon("1");
+        let mut c = Conn::open(moon.port);
+        c.call(&["DEL", a, &b]);
+        c.call(&["SADD", a, "x"]);
+        c.call(&["SADD", &b, "x"]);
+        let reply = c.call(&["SINTERCARD", "2", a, &b]);
+        assert_eq!(
+            reply,
+            b":1\r\n",
+            "at shards=1 there is no boundary to cross: got {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert!(
+            invalidation_reaches_tracker(
+                moon.port,
+                &[&["DEL", a, &b], &["SADD", a, "x"], &["SADD", &b, "x"]],
+                &["SINTERCARD", "2", a, &b],
+                &["SADD", a, "y"],
+                a,
+            ),
+            "untagged SINTERCARD read did not register the tracking client at shards=1"
+        );
     }
 }
 
@@ -287,13 +441,13 @@ fn sort_store_invalidates_the_destination_it_writes() {
             invalidation_reaches_tracker(
                 moon.port,
                 &[
-                    &["DEL", "sortsrc", "sortdst"],
-                    &["RPUSH", "sortsrc", "b", "a"],
-                    &["RPUSH", "sortdst", "stale"],
+                    &["DEL", "{sort}src", "{sort}dst"],
+                    &["RPUSH", "{sort}src", "b", "a"],
+                    &["RPUSH", "{sort}dst", "stale"],
                 ],
-                &["LRANGE", "sortdst", "0", "-1"],
-                &["SORT", "sortsrc", "ALPHA", "STORE", "sortdst"],
-                "sortdst",
+                &["LRANGE", "{sort}dst", "0", "-1"],
+                &["SORT", "{sort}src", "ALPHA", "STORE", "{sort}dst"],
+                "{sort}dst",
             ),
             "SORT ... STORE did not invalidate its DESTINATION (shards={shards})"
         );

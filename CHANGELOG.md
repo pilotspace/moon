@@ -6,6 +6,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BEHAVIOUR CHANGE — `ZADD ... GT LT` and a NaN `WEIGHTS` value now error**
+  where they previously succeeded (moon#969). `ZADD k GT LT 1 m` used to reply
+  `(integer) 1` and, on an existing member, `(integer) 0` with the score left
+  alone; it is now `ERR GT, LT, and/or NX options at the same time are not
+  compatible`, as on Redis. `ZUNIONSTORE`/`ZINTERSTORE`/`ZUNION`/`ZINTER` with
+  `WEIGHTS nan` used to be accepted and poison every aggregated score; it is now
+  `ERR weight value is not a float`. Infinite weights remain legal. A client
+  relying on either form silently doing nothing will now see an error.
+
+### Fixed
+
+- **Sorted-set argument validation reports the error CLASS Redis reports**
+  (moon#969). Nine forms answered the wrong class, which matters beyond wording:
+  redis-py raises a distinct exception type per class, so a client branching on
+  the exception took the wrong branch and retried a request that could never
+  succeed. `ZPOPMIN k notanint`/`k -1` now say `value is out of range, must be
+  positive`; `ZINTERCARD 0 k` and `ZUNIONSTORE d 0 k` now say `at least 1 input
+  key is needed for '<cmd>' command`; `ZMPOP 0 k MIN` says `numkeys should be
+  greater than 0`; and a short `WEIGHTS` list, a dangling `AGGREGATE`/`LIMIT`/
+  `COUNT`, a `numkeys` overrunning the key list, and `ZADD k 1 a 2` are all
+  `syntax error` rather than arity errors. The set-operation family SPLITS into
+  two classes exactly as Redis does — not-a-number is the generic integer error,
+  a number below 1 names the command — while `ZMPOP` does not split, and arity
+  is checked first so `ZUNION 0` stays an arity error. Also fixed while
+  reproducing: `ZINTERCARD k LIMIT -1` (`LIMIT can't be negative`), `ZMPOP ...
+  COUNT 0` (`count should be greater than 0`), and one moon#967 leftover where
+  `ZUNIONSTORE d 1 k BOGUS` stepped over the unknown token and answered a
+  different, successful command. Four ZRANGE-family sites the issue also cites
+  were verified against a redis 8.6.1 oracle to be ALREADY correct and are
+  deliberately unchanged, with harness rows pinning them.
+- **`ZADD ... CH` counts a rescore exactly instead of against an epsilon
+  window** (moon#792). Both mutation loops decided `changed` with an ABSOLUTE
+  `f64::EPSILON`, where Redis's `zsetAdd` compares exactly. `f64::EPSILON` is
+  the gap between 1.0 and the next double — a RELATIVE quantity — so as a fixed
+  tolerance it swallowed real moves at every magnitude below 1: rescoring
+  `0.0000000001` to `0.00000000010000001`, six significant figures, replied `0`
+  while `ZSCORE` showed the new value. The window also disagreed with
+  `zset_update_existing`, which moves the member on `to_bits()` inequality, so
+  the write happened and only the tally pretended otherwise. Any client using
+  `CH` as a did-anything-change signal silently skipped those updates. Fixed on
+  both the listpack and B+tree arms, which carried separate copies.
 ### Security
 
 - **An ACL category Moon does not implement is an error, not a grant of every
@@ -100,6 +143,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changed. `ACL GETUSER`'s `commands` field, a second copy of the same
   serializer, now shares the one implementation and reports
   `+@all -flushall` as redis does.
+- **Twelve multi-key commands now return `CROSSSLOT` at `--shards >= 2` instead
+  of answering — and, for `LMPOP`/`ZMPOP`, MUTATING — from one shard's slice**
+  (moon#962). **This is a behaviour change.** Routing picks a command's FIRST
+  key and ships the whole command to that key's owner, which then executes it
+  against its own keyspace slice; every other key reads as ABSENT rather than
+  erroring. `SINTER`, `SUNION`, `SDIFF`, `SINTERCARD`, `ZDIFF`, `ZINTER`,
+  `ZUNION`, `ZINTERCARD`, `LCS`, `PFCOUNT`, `LMPOP` and `ZMPOP` therefore
+  answered confidently wrong: measured against redis 8.6.1 at `--shards 4`,
+  `SDIFF`/`ZDIFF` returned EXTRA members the remote operand should have
+  subtracted, `SINTER`/`ZINTER`/`*CARD` empty or `0`, `SUNION`/`ZUNION` a short
+  set (and `ZUNION` wrong SCORES), `LCS` empty, `PFCOUNT` an undercount — 156 of
+  156 constructed cross-shard placements. `LMPOP` and `ZMPOP` are `flags: W` and
+  were worse than a wrong answer: they POPPED a key the command is defined never
+  to reach and acked it (`LMPOP 3 {t1}a {t2}b {t7}c LEFT` answered `{t7}c C1`
+  where redis answered `{t2}b B1`, 24 of 24). All twelve now fail closed before
+  anything is read or written. **Co-located and `--shards 1` usage is
+  unaffected, and `{hash}` tags are the remedy** — the same trade moon already
+  made for the `*STORE` family in moon#592. `TOUCH` is the one member that does
+  NOT error: it is per-key decomposable, so it fans out and sums exactly like
+  `EXISTS`, and now answers the correct total where it previously undercounted.
+
 - **Writes report their real latency on the shipped runtime, and `GET`/`SET`
   are in the histogram at all** (moon#941, moon#963). The monoio write path
   constructed its 1-in-16 latency timer AFTER the `with_shard` closure that
