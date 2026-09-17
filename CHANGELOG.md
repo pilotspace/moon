@@ -6,6 +6,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BEHAVIOUR CHANGE — `ZADD ... GT LT` and a NaN `WEIGHTS` value now error**
+  where they previously succeeded (moon#969). `ZADD k GT LT 1 m` used to reply
+  `(integer) 1` and, on an existing member, `(integer) 0` with the score left
+  alone; it is now `ERR GT, LT, and/or NX options at the same time are not
+  compatible`, as on Redis. `ZUNIONSTORE`/`ZINTERSTORE`/`ZUNION`/`ZINTER` with
+  `WEIGHTS nan` used to be accepted and poison every aggregated score; it is now
+  `ERR weight value is not a float`. Infinite weights remain legal. A client
+  relying on either form silently doing nothing will now see an error.
+
+### Fixed
+
+- **Sorted-set argument validation reports the error CLASS Redis reports**
+  (moon#969). Nine forms answered the wrong class, which matters beyond wording:
+  redis-py raises a distinct exception type per class, so a client branching on
+  the exception took the wrong branch and retried a request that could never
+  succeed. `ZPOPMIN k notanint`/`k -1` now say `value is out of range, must be
+  positive`; `ZINTERCARD 0 k` and `ZUNIONSTORE d 0 k` now say `at least 1 input
+  key is needed for '<cmd>' command`; `ZMPOP 0 k MIN` says `numkeys should be
+  greater than 0`; and a short `WEIGHTS` list, a dangling `AGGREGATE`/`LIMIT`/
+  `COUNT`, a `numkeys` overrunning the key list, and `ZADD k 1 a 2` are all
+  `syntax error` rather than arity errors. The set-operation family SPLITS into
+  two classes exactly as Redis does — not-a-number is the generic integer error,
+  a number below 1 names the command — while `ZMPOP` does not split, and arity
+  is checked first so `ZUNION 0` stays an arity error. Also fixed while
+  reproducing: `ZINTERCARD k LIMIT -1` (`LIMIT can't be negative`), `ZMPOP ...
+  COUNT 0` (`count should be greater than 0`), and one moon#967 leftover where
+  `ZUNIONSTORE d 1 k BOGUS` stepped over the unknown token and answered a
+  different, successful command. Four ZRANGE-family sites the issue also cites
+  were verified against a redis 8.6.1 oracle to be ALREADY correct and are
+  deliberately unchanged, with harness rows pinning them.
+- **`ZADD ... CH` counts a rescore exactly instead of against an epsilon
+  window** (moon#792). Both mutation loops decided `changed` with an ABSOLUTE
+  `f64::EPSILON`, where Redis's `zsetAdd` compares exactly. `f64::EPSILON` is
+  the gap between 1.0 and the next double — a RELATIVE quantity — so as a fixed
+  tolerance it swallowed real moves at every magnitude below 1: rescoring
+  `0.0000000001` to `0.00000000010000001`, six significant figures, replied `0`
+  while `ZSCORE` showed the new value. The window also disagreed with
+  `zset_update_existing`, which moves the member on `to_bits()` inequality, so
+  the write happened and only the tally pretended otherwise. Any client using
+  `CH` as a did-anything-change signal silently skipped those updates. Fixed on
+  both the listpack and B+tree arms, which carried separate copies.
 ### Security
 
 - **An ACL category Moon does not implement is an error, not a grant of every

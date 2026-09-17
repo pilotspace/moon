@@ -12,8 +12,8 @@ use std::collections::HashMap;
 
 use super::{
     AggregateOp, clamp_nan_to_zero, format_score, format_score_bytes, glob_match, lex_in_range,
-    parse_lex_bound, parse_score_bound, zrange_by_lex, zrange_by_rank, zrange_by_score,
-    zrange_from_entries,
+    parse_bounded_count, parse_lex_bound, parse_numkeys, parse_score_bound, zrange_by_lex,
+    zrange_by_rank, zrange_by_score, zrange_from_entries,
 };
 
 // ---------------------------------------------------------------------------
@@ -921,23 +921,22 @@ fn parse_setop_args(
     cmd_name: &str,
     supports_weights: bool,
 ) -> Result<(Vec<Bytes>, Vec<f64>, AggregateOp, bool), Frame> {
-    if args.is_empty() {
+    // Redis checks ARITY first, so `ZUNION 0` — which never names a key — is
+    // an arity error and never reaches the `numkeys` rules below (moon#969).
+    // These commands are declared `-3`: numkeys plus at least one key.
+    if args.len() < 2 {
         return Err(err_wrong_args(cmd_name));
     }
     let numkeys_bytes = match extract_bytes(&args[0]) {
         Some(b) => b,
         None => return Err(err_wrong_args(cmd_name)),
     };
-    let numkeys: usize = match std::str::from_utf8(numkeys_bytes)
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(n) if n > 0 => n,
-        _ => return Err(err("ERR value is not an integer or out of range")),
-    };
+    let numkeys = parse_numkeys(numkeys_bytes, cmd_name)?;
 
+    // Past the arity floor, a `numkeys` that overruns the key list is
+    // `syntax error` (moon#969).
     if args.len() < 1 + numkeys {
-        return Err(err_wrong_args(cmd_name));
+        return Err(err("ERR syntax error"));
     }
 
     let keys: Vec<Bytes> = (0..numkeys)
@@ -963,14 +962,22 @@ fn parse_setop_args(
         };
         if supports_weights && opt.eq_ignore_ascii_case(b"WEIGHTS") {
             for w in 0..numkeys {
+                // Too few weights to cover the key list is `syntax error`
+                // (moon#969), not an arity error.
                 if i + 1 + w >= args.len() {
-                    return Err(err_wrong_args(cmd_name));
+                    return Err(err("ERR syntax error"));
                 }
                 let wb = match extract_bytes(&args[i + 1 + w]) {
                     Some(b) => b,
-                    None => return Err(err_wrong_args(cmd_name)),
+                    None => return Err(err("ERR syntax error")),
                 };
-                let wval: f64 = match std::str::from_utf8(wb).ok().and_then(|s| s.parse().ok()) {
+                // `"nan"` parses in Rust; Redis's `getDoubleFromObjectOrReply`
+                // rejects it after `strtod` (moon#969). Infinities stay legal.
+                let wval: f64 = match std::str::from_utf8(wb)
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|v| !v.is_nan())
+                {
                     Some(v) => v,
                     None => return Err(err("ERR weight value is not a float")),
                 };
@@ -979,11 +986,11 @@ fn parse_setop_args(
             i += 1 + numkeys;
         } else if supports_weights && opt.eq_ignore_ascii_case(b"AGGREGATE") {
             if i + 1 >= args.len() {
-                return Err(err_wrong_args(cmd_name));
+                return Err(err("ERR syntax error"));
             }
             let agg_b = match extract_bytes(&args[i + 1]) {
                 Some(b) => b.as_ref(),
-                None => return Err(err_wrong_args(cmd_name)),
+                None => return Err(err("ERR syntax error")),
             };
             aggregate = if agg_b.eq_ignore_ascii_case(b"SUM") {
                 AggregateOp::Sum
@@ -1256,22 +1263,21 @@ pub fn zinter_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 
 /// ZINTERCARD numkeys key [key …] [LIMIT limit] — read-only twin.
 pub fn zintercard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    if args.is_empty() {
+    // Arity before everything else — `ZINTERCARD 0` names no key and is an
+    // arity error on Redis, not a numkeys error (moon#969).
+    if args.len() < 2 {
         return err_wrong_args("ZINTERCARD");
     }
     let numkeys_bytes = match extract_bytes(&args[0]) {
         Some(b) => b,
         None => return err_wrong_args("ZINTERCARD"),
     };
-    let numkeys: usize = match std::str::from_utf8(numkeys_bytes)
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(n) if n > 0 => n,
-        _ => return err("ERR numkeys can't be non-positive value"),
+    let numkeys = match parse_numkeys(numkeys_bytes, "ZINTERCARD") {
+        Ok(n) => n,
+        Err(e) => return e,
     };
     if args.len() < 1 + numkeys {
-        return err_wrong_args("ZINTERCARD");
+        return err("ERR syntax error");
     }
     let keys: Vec<Bytes> = (0..numkeys)
         .map(|j| {
@@ -1292,15 +1298,19 @@ pub fn zintercard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
         };
         if opt.eq_ignore_ascii_case(b"LIMIT") {
             if i + 1 >= args.len() {
-                return err_wrong_args("ZINTERCARD");
+                return err("ERR syntax error");
             }
             let lb = match extract_bytes(&args[i + 1]) {
                 Some(b) => b,
-                None => return err_wrong_args("ZINTERCARD"),
+                None => return err("ERR syntax error"),
             };
-            limit = match std::str::from_utf8(lb).ok().and_then(|s| s.parse().ok()) {
-                Some(v) => v,
-                None => return err("ERR value is not an integer or out of range"),
+            // `getPositiveLongFromObject(…, "LIMIT can't be negative")`: one
+            // message for a negative AND for bytes that are not a number
+            // (moon#969). `limit: usize` used to fail a negative into the
+            // generic integer error.
+            limit = match parse_bounded_count(lb, 0, "ERR LIMIT can't be negative") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
             i += 2;
         } else {
