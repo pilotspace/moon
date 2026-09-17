@@ -1058,6 +1058,13 @@ impl super::Shard {
         let mut pending_cdc_subscribes: Vec<crate::shard::dispatch::CdcSubscribePayload> =
             Vec::new();
 
+        // moon#982: this shard's sampler + metric-handle cache for the commands
+        // it executes on behalf of OTHER shards' connections (the SPSC execute
+        // arms). Lives for the whole event loop so the 1-in-16 cadence counts
+        // across drain cycles, like a connection's sampler counts across batches.
+        let mut spsc_sampler = crate::admin::metrics_setup::CommandSampler::new();
+        let mut spsc_metrics = crate::admin::metrics_setup::CachedMetricsHandles::new();
+
         // Per-shard VectorStore: use the SHARED instance from ShardDatabases.
         // This ensures handler_sharded FT.* commands and SPSC auto-indexing
         // (triggered by HSET) operate on the SAME VectorStore.
@@ -1307,6 +1314,8 @@ impl super::Shard {
                         spill_sender.as_ref(),
                         &spill_file_id,
                         disk_offload_dir.as_deref(),
+                        &mut spsc_sampler,
+                        &mut spsc_metrics,
                     );
                     if hit_cap {
                         // M3: capped drain may have left a tail — re-arm immediately
@@ -1426,6 +1435,8 @@ impl super::Shard {
                         spill_sender.as_ref(),
                         &spill_file_id,
                         disk_offload_dir.as_deref(),
+                        &mut spsc_sampler,
+                        &mut spsc_metrics,
                     );
                     if hit_cap {
                         // M3: capped drain may have left a tail — re-arm immediately
@@ -2206,6 +2217,8 @@ impl super::Shard {
                     spill_sender.as_ref(),
                     &spill_file_id,
                     disk_offload_dir.as_deref(),
+                    &mut spsc_sampler,
+                    &mut spsc_metrics,
                 );
                 if hit_cap {
                     // M3: the drain stopped at its per-cycle cap (or a snapshot

@@ -502,6 +502,8 @@ mod tests {
             None,
             &Rc::new(std::cell::Cell::new(1u64)),
             None,
+            &mut crate::admin::metrics_setup::CommandSampler::new(),
+            &mut crate::admin::metrics_setup::CachedMetricsHandles::new(),
         );
 
         // Subscriber now receives pre-serialized RESP bytes
@@ -568,6 +570,8 @@ mod tests {
             None,
             &Rc::new(std::cell::Cell::new(1u64)),
             None,
+            &mut crate::admin::metrics_setup::CommandSampler::new(),
+            &mut crate::admin::metrics_setup::CachedMetricsHandles::new(),
         );
     }
 
