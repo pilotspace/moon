@@ -3777,6 +3777,101 @@ for f925_shards in 1 2 3 4 5 8; do
     run_flush_modifier_leg "$f925_shards"
 done
 
+# ===========================================================================
+# moon#941 / moon#963 -- the latency telemetry sees writes and the inline
+# GET/SET path
+# ===========================================================================
+# moon#941: the monoio write path started its timer AFTER the command had run,
+# so every write logged 0 us and SLOWLOG could never fire for a write.
+# moon#963: plain GET/SET are answered by `try_inline_dispatch`, which recorded
+# nothing, so they never appeared in SLOWLOG (or the histogram) at all.
+#
+# A dedicated moon at `--slowlog-log-slower-than 0` (moon has no runtime
+# CONFIG SET for it) and redis at the same threshold via CONFIG SET. Every
+# command family runs on ONE connection (`redis-cli -r N`): moon samples
+# 1-in-16 per connection, so a fresh connection per command never samples and
+# would make every row here pass or fail for the wrong reason. 64 repeats = 4
+# samples per family.
+PORT_SLOWLOG=$((PORT_RUST + 530))
+
+# `slowlog_cmd_stats PORT CMD` -> "seen=yes|no nonzero=yes|no" for CMD's
+# entries. redis-cli's non-tty SLOWLOG GET is flat: id, ts, duration, argv...,
+# client addr, client name, per entry -- the addr line is the only reliable
+# end-of-argv marker.
+slowlog_cmd_stats() {
+    local port="$1" cmd="$2"
+    redis-cli -p "$port" SLOWLOG GET 1024 2>/dev/null | awk -v cmd="$cmd" '
+        st == 0 { st = 1; next }                              # id
+        st == 1 { st = 2; next }                              # timestamp
+        st == 2 { dur = $0 + 0; st = 3; next }                # duration (us)
+        st == 3 { name = toupper($0); st = 4; next }          # argv[0]
+        st == 4 && /^[0-9.]+:[0-9]+$/ { st = 5; next }        # client addr
+        st == 4 { next }                                      # further argv
+        st == 5 {                                             # client name
+            if (name == cmd) { seen = 1; if (dur > 0) nz = 1 }
+            st = 0; next
+        }
+        END { printf "seen=%s nonzero=%s\n", (seen ? "yes" : "no"), (nz ? "yes" : "no") }'
+}
+
+run_slowlog_latency_leg() {
+    local dir
+    dir=$(mktemp -d /tmp/moon-slowlog-dir.XXXXXX)
+    "$RUST_BINARY" --port "$PORT_SLOWLOG" --shards 1 --dir "$dir" \
+        --disk-free-min-pct 0 --appendonly no \
+        --slowlog-log-slower-than 0 --slowlog-max-len 1024 >/dev/null 2>&1 &
+    local pid=$!
+    for _ in $(seq 1 50); do
+        redis-cli -p "$PORT_SLOWLOG" PING >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+
+    # The oracle at the same threshold, with a ring big enough to hold every
+    # command below (redis logs ALL of them, not 1-in-16).
+    redis-cli -p "$PORT_REDIS" CONFIG SET slowlog-log-slower-than 0 >/dev/null 2>&1 || true
+    redis-cli -p "$PORT_REDIS" CONFIG SET slowlog-max-len 1024 >/dev/null 2>&1 || true
+    redis-cli -p "$PORT_REDIS" SLOWLOG RESET >/dev/null 2>&1 || true
+
+    local members p
+    members=$(seq -s ' ' 1 3000)
+    for p in "$PORT_REDIS" "$PORT_SLOWLOG"; do
+        # shellcheck disable=SC2086
+        redis-cli -p "$p" -r 64 SADD slowlog:w $members >/dev/null 2>&1
+        redis-cli -p "$p" -r 64 SET slowlog:k v >/dev/null 2>&1
+        redis-cli -p "$p" -r 64 GET slowlog:k >/dev/null 2>&1
+    done
+
+    # moon#941: the slow WRITE is logged, and with a real duration. A 3000
+    # member SADD is tens of microseconds everywhere; only a timer started
+    # after the work can make it 0.
+    assert_eq "moon#941: SLOWLOG logs a slow write (SADD) with a nonzero duration" \
+        "$(slowlog_cmd_stats "$PORT_REDIS" SADD)" \
+        "$(slowlog_cmd_stats "$PORT_SLOWLOG" SADD)"
+
+    # moon#963: the inline path is visible. Only presence is compared -- a
+    # 1-byte SET/GET can legitimately round to 0 us on either engine.
+    local redis_set moon_set redis_get moon_get
+    redis_set=$(slowlog_cmd_stats "$PORT_REDIS" SET | cut -d' ' -f1)
+    moon_set=$(slowlog_cmd_stats "$PORT_SLOWLOG" SET | cut -d' ' -f1)
+    redis_get=$(slowlog_cmd_stats "$PORT_REDIS" GET | cut -d' ' -f1)
+    moon_get=$(slowlog_cmd_stats "$PORT_SLOWLOG" GET | cut -d' ' -f1)
+    assert_eq "moon#963: SLOWLOG sees the inline SET path" "$redis_set" "$moon_set"
+    assert_eq "moon#963: SLOWLOG sees the inline GET path" "$redis_get" "$moon_get"
+
+    # Restore the oracle's defaults so nothing downstream inherits a
+    # log-everything slowlog.
+    redis-cli -p "$PORT_REDIS" CONFIG SET slowlog-log-slower-than 10000 >/dev/null 2>&1 || true
+    redis-cli -p "$PORT_REDIS" CONFIG SET slowlog-max-len 128 >/dev/null 2>&1 || true
+    redis-cli -p "$PORT_REDIS" SLOWLOG RESET >/dev/null 2>&1 || true
+    redis-cli -p "$PORT_REDIS" DEL slowlog:w slowlog:k >/dev/null 2>&1 || true
+
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$dir"
+}
+
+run_slowlog_latency_leg
+
 # Restore the originally-requested shard count so nothing downstream inherits
 # an 8-shard server from this section.
 start_moon_with_shards "$SHARDS" || true

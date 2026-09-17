@@ -22,6 +22,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Writes report their real latency on the shipped runtime, and `GET`/`SET`
+  are in the histogram at all** (moon#941, moon#963). The monoio write path
+  constructed its 1-in-16 latency timer AFTER the `with_shard` closure that
+  ran the command had returned, so every write on the runtime that ships
+  reported 0 µs and `SLOWLOG` was structurally unable to fire for a write —
+  measured on one connection: 20 sampled `SADD`s of 3000 members summed to
+  `0` µs while the `SMEMBERS` control over the same members summed to 2407.
+  Separately, `try_inline_dispatch` (plain `GET`/`SET`, the hottest path)
+  recorded nothing, so `moon_command_duration_microseconds{cmd="get"|"set"}`
+  did not exist as a series. Both were instances of the three-dispatch-paths
+  trap. All five timing sites (monoio write/read, tokio sharded write/read,
+  tokio single) and the inline path now go through ONE `LatencyProbe::observe`
+  that takes the command as a closure and brackets exactly it, so the timer
+  cannot be placed on the wrong side of the work again; the inline path takes
+  the probe as a mandatory parameter so an uninstrumented arm cannot be
+  spelled. `SlowlogArgv` lets the inline path offer its raw argv to the
+  slowlog without building a `Frame`. The tokio single-shard handler, which
+  timed every command unconditionally, now samples 1-in-16 like the others.
+  Cost is unchanged on the generic paths (same counter, same branch, same
+  `Instant` cadence); the inline path gains the same per-command counter
+  increment and branch, with `total_commands_processed` still flushed once
+  per batch.
 - **A re-spilled key recovers to its NEWEST on-disk copy, not whichever file
   the manifest happened to list last** (moon#983). The cold-index rebuild
   resolved a key present in two Active heap files by "last one seen wins",
