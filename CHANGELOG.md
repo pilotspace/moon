@@ -48,6 +48,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   family is deferred by the #438 early-flush guard one statement above this
   predicate in both handlers whenever remote work is pending, and the derived
   predicate now says wait for them regardless.
+- **Commands routed to another shard are counted and timed** (moon#982).
+  At `--shards > 1` a command whose key lives on a shard other than the
+  connection's went through no telemetry probe at all — neither the
+  cross-shard read fast path (executed on the origin thread) nor any of the
+  six SPSC execute arms on the owner (`Execute`, `ExecuteSlotted`,
+  `PipelineBatch`, `PipelineBatchSlotted`, `MultiExecute`,
+  `MultiExecuteSlotted`) observed what they ran. `INFO
+  total_commands_processed` and `moon_command_duration_microseconds`
+  therefore counted only connection-shard-local commands: measured on one
+  connection, 400 `SMEMBERS` over 16 untagged keys counted 400 / 150 / 100 /
+  50 at 1 / 2 / 4 / 8 shards, and **0** at 8 shards with the fast path off
+  when the connection's shard owned none of the keys. Every ops/sec
+  dashboard derived from that counter was under by `1/shards`, silently, in
+  the reassuring direction. Each SPSC drain cycle now builds one
+  `LatencyProbe` from a per-shard sampler and metric-handle cache and every
+  execute arm observes its `cmd_dispatch` through it — the same `observe`
+  the connection handlers use, so there is still one spelling of "time this
+  command" on both sides of the SPSC boundary; the fast-path read and the
+  local part of a spanning read (moon#768 fan-out) are observed on the
+  origin thread by the connection's own probe. Duration for a routed command
+  is its execution on the owning shard — the same quantity as for a local
+  command and what Redis reports — not the queue and reply wait, which the
+  `cross_spsc` / `remote_awaits_parked` counters already expose. A spanning
+  multi-key read now counts once per shard it touches; commands that take
+  the multi-key coordinator (`MSET`, spanning `DEL`/`EXISTS`, `KEYS`/`SCAN`/
+  `DBSIZE` aggregation) count their remote legs but not yet their local
+  leg. A slowlog entry for a routed command carries an empty client address
+  and name (the message does not carry the client). Cost: one probe
+  construction and drop per drain cycle, and per routed command the same
+  counter increment and 1-in-16 `Instant` the local paths already pay; no
+  allocation.
 - **Sorted-set argument validation reports the error CLASS Redis reports**
   (moon#969). Nine forms answered the wrong class, which matters beyond wording:
   redis-py raises a distinct exception type per class, so a client branching on
