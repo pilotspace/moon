@@ -2789,6 +2789,20 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     }
                     let db_count = ctx.shard_databases.db_count();
                     let now_ms = ctx.cached_clock.ms();
+                    let cur_db = conn.selected_db;
+                    // moon#982: the local PART of a spanning read executes
+                    // here and is observed here; each remote part is observed
+                    // by the shard that executes it. A spanning read therefore
+                    // counts once per shard it touches — what a cluster client
+                    // splitting it per node would produce.
+                    let mut probe = crate::admin::metrics_setup::LatencyProbe::new(
+                        &mut conn.sampler,
+                        &mut conn.cached_metrics,
+                        peer_addr.as_bytes(),
+                        conn.client_name
+                            .as_ref()
+                            .map_or(b"" as &[u8], |n| n.as_ref()),
+                    );
                     for (target, sub_frame, part_idx) in fanout_scratch.drain(..) {
                         if target == ctx.shard_id {
                             // The local part executes inline at the command's
@@ -2799,20 +2813,26 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             let Frame::Array(ref sub_args) = sub_frame else {
                                 continue;
                             };
-                            let mut sel_db = conn.selected_db;
-                            let reply =
-                                crate::shard::slice::with_shard_db_read(conn.selected_db, |db| {
-                                    match dispatch_read(
-                                        db,
-                                        cmd,
-                                        &sub_args[1..],
-                                        now_ms,
-                                        &mut sel_db,
-                                        db_count,
-                                    ) {
-                                        DispatchResult::Response(f) | DispatchResult::Quit(f) => f,
-                                    }
-                                });
+                            let mut sel_db = cur_db;
+                            let reply = probe.observe(
+                                cmd,
+                                crate::admin::slowlog::SlowlogArgv::from(&sub_frame),
+                                || {
+                                    crate::shard::slice::with_shard_db_read(cur_db, |db| {
+                                        match dispatch_read(
+                                            db,
+                                            cmd,
+                                            &sub_args[1..],
+                                            now_ms,
+                                            &mut sel_db,
+                                            db_count,
+                                        ) {
+                                            DispatchResult::Response(f)
+                                            | DispatchResult::Quit(f) => f,
+                                        }
+                                    })
+                                },
+                            );
                             fanout_state.set_part(part_idx, reply);
                             local_dispatches = local_dispatches.saturating_add(1);
                         } else {
@@ -2830,6 +2850,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
                         }
                     }
+                    drop(probe);
                     crate::admin::metrics_setup::record_pipeline_multikey_fanout();
                     continue;
                 }
@@ -3868,6 +3889,20 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let fast_now_ms = ctx.cached_clock.ms();
                     let fast_db_count = ctx.shard_databases.db_count();
                     let mut fast_sel = conn.selected_db;
+                    // moon#982: a foreign read served HERE is executed here, so
+                    // it is observed here, through the same probe as a local
+                    // read. Only the executed branch is observed: a decline
+                    // (cold key, or the owner holding its guard) falls through
+                    // to the SPSC path, where the OWNER observes it instead —
+                    // never both.
+                    let mut probe = crate::admin::metrics_setup::LatencyProbe::new(
+                        &mut conn.sampler,
+                        &mut conn.cached_metrics,
+                        peer_addr.as_bytes(),
+                        conn.client_name
+                            .as_ref()
+                            .map_or(b"" as &[u8], |n| n.as_ref()),
+                    );
                     let served =
                         crate::shard::slice::try_foreign_db_read(target, conn.selected_db, |db| {
                             let hot = extract_primary_key(cmd, cmd_args)
@@ -3875,14 +3910,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             if !hot {
                                 return None;
                             }
-                            match dispatch_read(
-                                db,
+                            let result = probe.observe(
                                 cmd,
-                                cmd_args,
-                                fast_now_ms,
-                                &mut fast_sel,
-                                fast_db_count,
-                            ) {
+                                crate::admin::slowlog::SlowlogArgv::from(&frame),
+                                || {
+                                    dispatch_read(
+                                        db,
+                                        cmd,
+                                        cmd_args,
+                                        fast_now_ms,
+                                        &mut fast_sel,
+                                        fast_db_count,
+                                    )
+                                },
+                            );
+                            match result {
                                 DispatchResult::Response(f) => Some(f),
                                 // A foreign read cannot be QUIT (keyless, so it
                                 // never routes here). Fall through rather than
@@ -3891,6 +3933,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             }
                         })
                         .flatten();
+                    drop(probe);
                     if let Some(response) = served {
                         conn.selected_db = fast_sel;
                         // Post-processing mirrors the LOCAL read path exactly —

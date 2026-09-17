@@ -2102,24 +2102,39 @@ pub(crate) async fn handle_connection_sharded_inner<
                             }
                             let db_count = ctx.shard_databases.db_count();
                             let now_ms = ctx.cached_clock.ms();
+                            let cur_db = conn.selected_db;
+                            // moon#982: the local PART of a spanning read is
+                            // observed here; each remote part by the shard that
+                            // executes it (see handler_monoio for the rationale).
+                            let mut probe = crate::admin::metrics_setup::LatencyProbe::new(
+                                &mut conn.sampler,
+                                &mut conn.cached_metrics,
+                                peer_addr.as_bytes(),
+                                conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                            );
                             for (target, sub_frame, part_idx) in fanout_scratch.drain(..) {
                                 if target == ctx.shard_id {
                                     let Frame::Array(ref sub_args) = sub_frame else {
                                         continue;
                                     };
-                                    let mut sel_db = conn.selected_db;
-                                    let reply = crate::shard::slice::with_shard_db_read(
-                                        conn.selected_db,
-                                        |db| match dispatch_read(
-                                            db,
-                                            cmd,
-                                            &sub_args[1..],
-                                            now_ms,
-                                            &mut sel_db,
-                                            db_count,
-                                        ) {
-                                            DispatchResult::Response(f)
-                                            | DispatchResult::Quit(f) => f,
+                                    let mut sel_db = cur_db;
+                                    let reply = probe.observe(
+                                        cmd,
+                                        crate::admin::slowlog::SlowlogArgv::from(&sub_frame),
+                                        || {
+                                            crate::shard::slice::with_shard_db_read(cur_db, |db| {
+                                                match dispatch_read(
+                                                    db,
+                                                    cmd,
+                                                    &sub_args[1..],
+                                                    now_ms,
+                                                    &mut sel_db,
+                                                    db_count,
+                                                ) {
+                                                    DispatchResult::Response(f)
+                                                    | DispatchResult::Quit(f) => f,
+                                                }
+                                            })
                                         },
                                     );
                                     fanout_state.set_part(part_idx, reply);
@@ -2140,6 +2155,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
                                 }
                             }
+                            drop(probe);
                             crate::admin::metrics_setup::record_pipeline_multikey_fanout();
                             continue;
                         }
