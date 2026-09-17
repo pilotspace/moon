@@ -1590,6 +1590,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // `allkeys-lru` that degrades victim selection exactly when
             // eviction matters. Two Relaxed atomic loads per batch.
             crate::shard::slice::refresh_db_clock(conn.selected_db, &ctx.cached_clock);
+            // moon#963: one probe per batch. Every command the loop inlines
+            // is timed through it (the parameter is mandatory — see
+            // `try_inline_dispatch`), and dropping it lands the whole batch
+            // in `total_commands_processed` as ONE add, which is the
+            // moon#660 accounting this site used to do by hand.
+            let mut probe = crate::admin::metrics_setup::LatencyProbe::new(
+                &mut conn.sampler,
+                &mut conn.cached_metrics,
+                peer_addr.as_bytes(),
+                conn.client_name
+                    .as_ref()
+                    .map_or(b"" as &[u8], |n| n.as_ref()),
+            );
             let inlined = try_inline_dispatch_loop(
                 &mut read_buf,
                 &mut write_buf,
@@ -1614,13 +1627,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // spill thread, so the inline path must NOT resolve eviction
                 // itself — it stands down to generic dispatch under pressure.
                 spill_sender_active,
+                &mut probe,
             );
+            drop(probe);
             crate::admin::metrics_setup::record_dispatch_local_inline(inlined as u64);
-            // moon#660: inlined commands never reach the generic leg's
-            // `record_command*` calls, so without this they are absent from
-            // `total_commands_processed` AND from the adaptive idle park's
-            // activity signal. See `record_inline_commands`.
-            crate::admin::metrics_setup::record_inline_commands(inlined as u64);
             if inlined > 0 && read_buf.is_empty() {
                 // All commands were inlined -- flush write_buf and continue
                 if !write_buf.is_empty() {
@@ -3233,6 +3243,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     //
                     // Returns Ok((result, new_selected_db, hset_inserts)) on success
                     // or Err(oom_frame) when OOM eviction fails (caller pushes + continues).
+                    // moon#941: the probe is built out here (it borrows
+                    // `conn.sampler` / `conn.cached_metrics`, disjoint from
+                    // the fields the closure touches) and `observe` runs
+                    // INSIDE the closure, around `dispatch` and nothing else.
+                    // The timer used to be constructed after this closure had
+                    // returned, so every write measured a `match` and a move.
+                    let argv = crate::admin::slowlog::SlowlogArgv::from(&frame);
+                    let mut probe = crate::admin::metrics_setup::LatencyProbe::new(
+                        &mut conn.sampler,
+                        &mut conn.cached_metrics,
+                        peer_addr.as_bytes(),
+                        conn.client_name
+                            .as_ref()
+                            .map_or(b"" as &[u8], |n| n.as_ref()),
+                    );
                     let write_result: Result<
                         (
                             DispatchResult,
@@ -3330,9 +3355,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             }
                         }
 
-                        // Dispatch
+                        // Dispatch — the timed interval is exactly this call.
                         let mut new_sel_db = sel_db;
-                        let result = dispatch(db, cmd, cmd_args, &mut new_sel_db, db_count);
+                        let result = probe.observe(cmd, argv, || {
+                            dispatch(db, cmd, cmd_args, &mut new_sel_db, db_count)
+                        });
                         // L4: end of the keyspace mutation. Everything below
                         // touches the index stores or re-enters `s`, so the
                         // guard must not outlive this point.
@@ -3473,12 +3500,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             continue;
                         }
                     };
+                    drop(probe);
                     conn.selected_db = new_selected_db;
-
-                    // 1-in-16 latency sampling (outside closure — needs conn.cached_metrics)
-                    conn.cmd_counter = conn.cmd_counter.wrapping_add(1);
-                    let sample_latency = (conn.cmd_counter & 0xF) == 0;
-                    let dispatch_start = sample_latency.then(std::time::Instant::now);
 
                     let mut response = match result {
                         DispatchResult::Response(f) => f,
@@ -3487,32 +3510,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             f
                         }
                     };
-
-                    if let Ok(cmd_str) = std::str::from_utf8(cmd) {
-                        if let Some(start) = dispatch_start {
-                            let elapsed_us = start.elapsed().as_micros() as u64;
-                            crate::admin::metrics_setup::record_command_cached(
-                                cmd_str,
-                                elapsed_us,
-                                &mut conn.cached_metrics,
-                            );
-                            if let Frame::Array(ref args) = frame {
-                                crate::admin::metrics_setup::global_slowlog().maybe_record(
-                                    elapsed_us,
-                                    args.as_slice(),
-                                    peer_addr.as_bytes(),
-                                    conn.client_name
-                                        .as_ref()
-                                        .map_or(b"" as &[u8], |n| n.as_ref()),
-                                );
-                            }
-                        } else {
-                            crate::admin::metrics_setup::record_command_no_latency_cached(
-                                cmd_str,
-                                &mut conn.cached_metrics,
-                            );
-                        }
-                    }
 
                     // D-2: keyless FLUSHDB/FLUSHALL routed local-only cleared just
                     // this shard — broadcast to every other shard (outside the
@@ -3761,40 +3758,27 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
                     // READ PATH: shared lock — no contention with other shards' reads
                     let now_ms = ctx.cached_clock.ms();
-                    conn.cmd_counter = conn.cmd_counter.wrapping_add(1);
-                    let sample_latency = (conn.cmd_counter & 0xF) == 0;
-                    let dispatch_start = sample_latency.then(std::time::Instant::now);
-                    let mut sel_db = conn.selected_db;
-                    let result = crate::shard::slice::with_shard_db_read(conn.selected_db, |db| {
-                        dispatch_read(db, cmd, cmd_args, now_ms, &mut sel_db, db_count)
-                    });
-                    let new_read_selected_db = sel_db;
-                    conn.selected_db = new_read_selected_db;
-                    if let Ok(cmd_str) = std::str::from_utf8(cmd) {
-                        if let Some(start) = dispatch_start {
-                            let elapsed_us = start.elapsed().as_micros() as u64;
-                            crate::admin::metrics_setup::record_command_cached(
-                                cmd_str,
-                                elapsed_us,
-                                &mut conn.cached_metrics,
-                            );
-                            if let Frame::Array(ref args) = frame {
-                                crate::admin::metrics_setup::global_slowlog().maybe_record(
-                                    elapsed_us,
-                                    args.as_slice(),
-                                    peer_addr.as_bytes(),
-                                    conn.client_name
-                                        .as_ref()
-                                        .map_or(b"" as &[u8], |n| n.as_ref()),
-                                );
-                            }
-                        } else {
-                            crate::admin::metrics_setup::record_command_no_latency_cached(
-                                cmd_str,
-                                &mut conn.cached_metrics,
-                            );
-                        }
-                    }
+                    let cur_db = conn.selected_db;
+                    let mut sel_db = cur_db;
+                    let mut probe = crate::admin::metrics_setup::LatencyProbe::new(
+                        &mut conn.sampler,
+                        &mut conn.cached_metrics,
+                        peer_addr.as_bytes(),
+                        conn.client_name
+                            .as_ref()
+                            .map_or(b"" as &[u8], |n| n.as_ref()),
+                    );
+                    let result = probe.observe(
+                        cmd,
+                        crate::admin::slowlog::SlowlogArgv::from(&frame),
+                        || {
+                            crate::shard::slice::with_shard_db_read(cur_db, |db| {
+                                dispatch_read(db, cmd, cmd_args, now_ms, &mut sel_db, db_count)
+                            })
+                        },
+                    );
+                    drop(probe);
+                    conn.selected_db = sel_db;
 
                     let response = match result {
                         DispatchResult::Response(f) => f,

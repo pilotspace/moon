@@ -91,9 +91,24 @@ pub fn parse_acl_line(line: &str) -> Option<AclUser> {
         return None;
     }
     let username = tokens.next()?.to_string();
-    let mut user = AclUser::default_deny(username);
+    let mut user = AclUser::default_deny(username.clone());
     for token in tokens {
-        apply_rule(&mut user, token);
+        // #978: a rule naming a category Moon cannot resolve rejects the whole
+        // LINE. Applying the rest would hand back a user whose permissions are
+        // not the ones the file asked for, and the failure mode this fixes was
+        // exactly a silently-wrong permission set. Dropping the user is
+        // fail-closed -- an absent user is denied by
+        // `check_command_permission` -- but it is silent on its own, so it is
+        // logged at WARN.
+        if let Err(err) = apply_rule(&mut user, token) {
+            tracing::warn!(
+                user = %username,
+                rule = %token,
+                error = %err,
+                "rejecting ACL file line: unresolvable rule; user not loaded"
+            );
+            return None;
+        }
     }
     Some(user)
 }
@@ -297,7 +312,13 @@ mod tests {
     fn user_from_rules(rules: &[&str]) -> AclUser {
         let mut user = AclUser::default_deny("rt".to_string());
         for rule in rules {
-            apply_rule(&mut user, rule);
+            // moon#978 made `apply_rule` fallible. Discarding the result here
+            // would let a fixture rule fail silently and build a DIFFERENT
+            // user than the test names, so the helper asserts instead.
+            assert!(
+                apply_rule(&mut user, rule).is_ok(),
+                "fixture rule {rule:?} must apply"
+            );
         }
         user
     }

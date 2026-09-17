@@ -331,13 +331,15 @@ pub(crate) struct ConnectionState {
     pub affinity_tracker: Option<AffinityTracker>,
     pub migration_target: Option<usize>,
 
-    /// Per-connection command counter used for 1-in-N latency sampling on the
-    /// hot dispatch path. Wraps on overflow. Sampling avoids the ~30–40 ns
-    /// `Instant::now()` tax per command while still producing statistically
-    /// accurate latency histograms. Slowlog coverage degrades to 1/16 but
-    /// only matters when threshold <~ expected per-op latency; default 10 ms
-    /// threshold effectively never fires on pipelined workloads regardless.
-    pub cmd_counter: u32,
+    /// Per-connection 1-in-16 latency sampler for the hot dispatch path.
+    /// Sampling avoids the ~30–40 ns `Instant::now()` tax per command while
+    /// still producing statistically accurate latency histograms. Slowlog
+    /// coverage degrades to 1/16 but only matters when threshold <~ expected
+    /// per-op latency; default 10 ms threshold effectively never fires on
+    /// pipelined workloads regardless. The counter is private to the sampler:
+    /// every handler times a command through `LatencyProbe::observe`
+    /// (moon#941, moon#963), never by re-deriving the cadence here.
+    pub sampler: crate::admin::metrics_setup::CommandSampler,
 
     /// Cached Prometheus metric handles for the most recently executed
     /// command on this connection. A cache hit skips the recorder backend's
@@ -418,7 +420,7 @@ impl ConnectionState {
                 None
             },
             migration_target: None,
-            cmd_counter: 0,
+            sampler: crate::admin::metrics_setup::CommandSampler::new(),
             cached_metrics: crate::admin::metrics_setup::CachedMetricsHandles::new(),
             cached_acl_unrestricted: false,
             cached_acl_version: 0,
