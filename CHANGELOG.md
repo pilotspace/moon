@@ -84,6 +84,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Twelve multi-key commands now return `CROSSSLOT` at `--shards >= 2` instead
+  of answering — and, for `LMPOP`/`ZMPOP`, MUTATING — from one shard's slice**
+  (moon#962). **This is a behaviour change.** Routing picks a command's FIRST
+  key and ships the whole command to that key's owner, which then executes it
+  against its own keyspace slice; every other key reads as ABSENT rather than
+  erroring. `SINTER`, `SUNION`, `SDIFF`, `SINTERCARD`, `ZDIFF`, `ZINTER`,
+  `ZUNION`, `ZINTERCARD`, `LCS`, `PFCOUNT`, `LMPOP` and `ZMPOP` therefore
+  answered confidently wrong: measured against redis 8.6.1 at `--shards 4`,
+  `SDIFF`/`ZDIFF` returned EXTRA members the remote operand should have
+  subtracted, `SINTER`/`ZINTER`/`*CARD` empty or `0`, `SUNION`/`ZUNION` a short
+  set (and `ZUNION` wrong SCORES), `LCS` empty, `PFCOUNT` an undercount — 156 of
+  156 constructed cross-shard placements. `LMPOP` and `ZMPOP` are `flags: W` and
+  were worse than a wrong answer: they POPPED a key the command is defined never
+  to reach and acked it (`LMPOP 3 {t1}a {t2}b {t7}c LEFT` answered `{t7}c C1`
+  where redis answered `{t2}b B1`, 24 of 24). All twelve now fail closed before
+  anything is read or written. **Co-located and `--shards 1` usage is
+  unaffected, and `{hash}` tags are the remedy** — the same trade moon already
+  made for the `*STORE` family in moon#592. `TOUCH` is the one member that does
+  NOT error: it is per-key decomposable, so it fans out and sums exactly like
+  `EXISTS`, and now answers the correct total where it previously undercounted.
+
 - **Writes report their real latency on the shipped runtime, and `GET`/`SET`
   are in the histogram at all** (moon#941, moon#963). The monoio write path
   constructed its 1-in-16 latency timer AFTER the `with_shard` closure that
