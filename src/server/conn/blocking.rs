@@ -2398,6 +2398,11 @@ pub(crate) fn try_inline_dispatch(
     // pressure, leaving `read_buf` untouched. See the block comment on
     // `can_inline_writes` in `handler_monoio/mod.rs` for the full invariant.
     spill_sender_active: bool,
+    // moon#963: the connection's latency probe. This path answers `GET`/`SET`
+    // without entering generic dispatch, so it has to time them itself — and
+    // the parameter is mandatory rather than an `Option` precisely so that
+    // "silently uninstrumented arm" cannot be spelled at a call site.
+    probe: &mut crate::admin::metrics_setup::LatencyProbe<'_>,
 ) -> usize {
     let buf = &read_buf[..];
     let len = buf.len();
@@ -2569,26 +2574,36 @@ pub(crate) fn try_inline_dispatch(
                 }
             }
         };
-        let served = crate::shard::slice::with_shard_db_read(selected_db, |db| {
-            // #459: a key mid-spill is in neither hot nor cold, so the miss
-            // arm would frame `$-1` inline for a key that exists and that
-            // EXISTS reports as present. Pulling it back (RAM only, no disk
-            // read) mutates, so it is the one case that still needs the
-            // exclusive guard — retaken below. Costs one `is_empty()` load
-            // per inline GET on a server that is not spilling, which is
-            // every server without --disk-offload.
-            if !db.spill_inflight_is_empty() {
-                return None;
-            }
-            Some(serve(db))
-        });
-        let (outcome, cold_loc) = match served {
-            Some(served) => served,
-            None => crate::shard::slice::with_shard_db(selected_db, |db| {
-                db.promote_inflight_if_present(key_bytes, now_ms);
-                serve(&*db)
-            }),
-        };
+        // moon#963: the timed interval is the lookup — the analogue of the
+        // generic path's `dispatch_read`. Argv is borrowed from the read
+        // buffer; nothing is copied unless a sample crosses the threshold.
+        let argv: [&[u8]; 2] = [&buf[8..11], key_bytes];
+        let (outcome, cold_loc) = probe.observe(
+            &buf[8..11],
+            crate::admin::slowlog::SlowlogArgv::Raw(&argv),
+            || {
+                let served = crate::shard::slice::with_shard_db_read(selected_db, |db| {
+                    // #459: a key mid-spill is in neither hot nor cold, so the miss
+                    // arm would frame `$-1` inline for a key that exists and that
+                    // EXISTS reports as present. Pulling it back (RAM only, no disk
+                    // read) mutates, so it is the one case that still needs the
+                    // exclusive guard — retaken below. Costs one `is_empty()` load
+                    // per inline GET on a server that is not spilling, which is
+                    // every server without --disk-offload.
+                    if !db.spill_inflight_is_empty() {
+                        return None;
+                    }
+                    Some(serve(db))
+                });
+                match served {
+                    Some(served) => served,
+                    None => crate::shard::slice::with_shard_db(selected_db, |db| {
+                        db.promote_inflight_if_present(key_bytes, now_ms);
+                        serve(&*db)
+                    }),
+                }
+            },
+        );
         match outcome {
             GetOutcome::Handled => {
                 let _ = read_buf.split_to(consumed);
@@ -2944,36 +2959,49 @@ pub(crate) fn try_inline_dispatch(
 
         let key = frozen.slice(key_start..key_end);
         let value = frozen.slice(val_start..val_end);
+        // moon#963: the timed interval is the write — the analogue of the
+        // generic path's `dispatch`. Argv borrows `frozen` (no copy).
+        let argv: [&[u8]; 3] = [
+            &frozen[8..11],
+            &frozen[key_start..key_end],
+            &frozen[val_start..val_end],
+        ];
         // `move` closure: `key` and `value` are consumed here (last use), so the
         // entry/set take ownership — no Bytes refcount bump+drop pair per SET.
-        crate::shard::slice::with_shard_db(selected_db, move |db| {
-            if db.hot_keys().tick() {
-                db.hot_keys().observe(&key);
-            }
-            // moon#558: this path frames a plain SET straight from the read
-            // buffer — it never builds a `Frame`, never enters
-            // `command::dispatch`, and never reaches
-            // `spsc_handler::cow_intercept`. It must still stash the key's
-            // epoch-start value while a BGSAVE is in flight, or the snapshot
-            // serializes the overwritten value for a segment it has not
-            // written yet. One thread-local `bool` load when no snapshot is
-            // armed, which is every SET on a server that is not saving.
-            crate::persistence::snapshot_cow::capture_key_pre_image(db, selected_db, &key);
-            let mut entry = crate::storage::entry::Entry::new_string(value);
-            entry.set_last_access(db.now());
-            entry.set_access_counter(5);
-            // Same reason as the inline GET above: a plain `SET k v` is served
-            // HERE and never reaches `string::set`, so the notification has to
-            // be queued on this path too or it exists only for SETs complex
-            // enough to fall out of the fast path.
-            crate::notify::notify_keyspace_event(
-                crate::notify::NotifyFlags::STRING,
-                "set",
-                &key,
-                selected_db,
-            );
-            db.set(&key, entry);
-        });
+        probe.observe(
+            &frozen[8..11],
+            crate::admin::slowlog::SlowlogArgv::Raw(&argv),
+            || {
+                crate::shard::slice::with_shard_db(selected_db, move |db| {
+                    if db.hot_keys().tick() {
+                        db.hot_keys().observe(&key);
+                    }
+                    // moon#558: this path frames a plain SET straight from the read
+                    // buffer — it never builds a `Frame`, never enters
+                    // `command::dispatch`, and never reaches
+                    // `spsc_handler::cow_intercept`. It must still stash the key's
+                    // epoch-start value while a BGSAVE is in flight, or the snapshot
+                    // serializes the overwritten value for a segment it has not
+                    // written yet. One thread-local `bool` load when no snapshot is
+                    // armed, which is every SET on a server that is not saving.
+                    crate::persistence::snapshot_cow::capture_key_pre_image(db, selected_db, &key);
+                    let mut entry = crate::storage::entry::Entry::new_string(value);
+                    entry.set_last_access(db.now());
+                    entry.set_access_counter(5);
+                    // Same reason as the inline GET above: a plain `SET k v` is served
+                    // HERE and never reaches `string::set`, so the notification has to
+                    // be queued on this path too or it exists only for SETs complex
+                    // enough to fall out of the fast path.
+                    crate::notify::notify_keyspace_event(
+                        crate::notify::NotifyFlags::STRING,
+                        "set",
+                        &key,
+                        selected_db,
+                    );
+                    db.set(&key, entry);
+                })
+            },
+        );
     }
 
     // AOF: reuse the frozen RESP bytes directly (Arc clone, zero-copy).
@@ -3042,6 +3070,8 @@ pub(crate) fn try_inline_dispatch_loop(
     runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
     // moon#660: forwarded verbatim to `try_inline_dispatch`.
     spill_sender_active: bool,
+    // moon#963: forwarded verbatim to `try_inline_dispatch`.
+    probe: &mut crate::admin::metrics_setup::LatencyProbe<'_>,
 ) -> usize {
     if cluster_enabled {
         return 0;
@@ -3063,6 +3093,7 @@ pub(crate) fn try_inline_dispatch_loop(
             resp3,
             runtime_config,
             spill_sender_active,
+            probe,
         );
         if n == 0 {
             break;

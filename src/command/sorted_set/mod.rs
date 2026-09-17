@@ -61,6 +61,75 @@ pub(super) enum AggregateOp {
 }
 
 // ---------------------------------------------------------------------------
+// Argument validation shared by the read and write halves (moon#969)
+// ---------------------------------------------------------------------------
+//
+// The error CLASS matters beyond the wording. redis-py maps each class to a
+// distinct exception type, so a client that branches on the exception takes
+// the WRONG branch when moon answers an arity error where Redis answers a
+// syntax error — and retries a request that can never succeed.
+
+/// `ERR at least 1 input key is needed for '<cmd>' command`.
+///
+/// Redis interpolates the command's registered (lower-case) name here, exactly
+/// as `err_wrong_args` does for the arity message and for the same reason:
+/// clients string-match the result.
+fn err_at_least_one_key(cmd: &str) -> Frame {
+    const PREFIX: &str = "ERR at least 1 input key is needed for '";
+    const SUFFIX: &str = "' command";
+    let mut msg = String::with_capacity(PREFIX.len() + cmd.len() + SUFFIX.len());
+    msg.push_str(PREFIX);
+    msg.extend(cmd.chars().map(|c| c.to_ascii_lowercase()));
+    msg.push_str(SUFFIX);
+    Frame::Error(Bytes::from(msg))
+}
+
+/// The `numkeys` contract of the set-operation family — ZUNIONSTORE,
+/// ZINTERSTORE, ZUNION, ZINTER, ZDIFF, ZINTERCARD.
+///
+/// Redis's `zunionInterDiffGenericCommand` answers in TWO classes, and the
+/// split is the whole point: `getLongFromObjectOrReply(…, NULL)` reports
+/// `ERR value is not an integer or out of range` for bytes that are not a
+/// number, and only then does `if (setnum < 1)` report `at least 1 input key
+/// is needed …`. Parsing straight into a `usize` collapsed the two — `-1` came
+/// back as the integer error, and `0` came back as an ARITY error, a third
+/// class again. Verified against redis-server 8.6.1.
+pub(super) fn parse_numkeys(arg: &[u8], cmd: &str) -> Result<usize, Frame> {
+    let n: i64 = match std::str::from_utf8(arg).ok().and_then(|s| s.parse().ok()) {
+        Some(n) => n,
+        None => return Err(err("ERR value is not an integer or out of range")),
+    };
+    if n < 1 {
+        return Err(err_at_least_one_key(cmd));
+    }
+    Ok(n as usize)
+}
+
+/// A count argument Redis reads with `getRangeLongFromObject` /
+/// `getPositiveLongFromObject`: ONE bespoke message for EVERY failure, whether
+/// the bytes were not a number at all or the number was below `min`.
+///
+/// Deliberately the opposite shape to [`parse_numkeys`]. ZPOPMIN/ZPOPMAX's
+/// `count`, ZMPOP's `numkeys` and `COUNT`, and ZINTERCARD's `LIMIT` each carry
+/// a message Redis hands to that one call site; moon answered the generic
+/// integer error at all of them.
+///
+/// Note what this is NOT for. A ZRANGE **rank index**, or a
+/// `LIMIT offset count` pair, is read with `NULL` as the message, so the
+/// generic `ERR value is not an integer or out of range` is the CORRECT reply
+/// there — and those sites accept negatives. They are already right and do not
+/// come through here (moon#969 cites them; the oracle says otherwise).
+pub(super) fn parse_bounded_count(arg: &[u8], min: i64, msg: &str) -> Result<usize, Frame> {
+    match std::str::from_utf8(arg)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        Some(n) if n >= min => Ok(n as usize),
+        _ => Err(err(msg)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers -- CRITICAL for dual structure consistency
 // ---------------------------------------------------------------------------
 
@@ -3248,6 +3317,351 @@ mod tests {
             zrange(&mut db, &[bulk(b"k"), bulk(b"0"), bulk(b"-1")]),
             Frame::Array(framevec![bulk(b"a"), bulk(b"b")])
         );
+    }
+
+    // ---- moon#969 / moon#792: option semantics and error classes ----------
+    //
+    // Every expectation below was taken from a live redis-server 8.6.1 on a
+    // second port, command by command, BEFORE any of it was changed.
+
+    /// A member short enough to stay in the listpack encoding.
+    const LP_MEMBER: &[u8] = b"m";
+    /// A member past `zset-max-listpack-value` (64), which forces the B+tree.
+    /// The two `ZADD` mutation loops are SEPARATE code, so every claim about
+    /// flags or `CH` has to be made twice.
+    const BT_MEMBER: &[u8] =
+        b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn error_text(f: &Frame) -> String {
+        match f {
+            Frame::Error(e) => String::from_utf8_lossy(e).into_owned(),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gt_lt_and_nx_are_pairwise_incompatible() {
+        let mut db = Database::new();
+        const MSG: &str = "ERR GT, LT, and/or NX options at the same time are not compatible";
+
+        // `GT LT` is the pairing the old guard missed: it was ACCEPTED, and
+        // then the mutation loops answered it with a silent no-op.
+        for flags in [
+            [&b"GT"[..], &b"LT"[..]],
+            [&b"GT"[..], &b"NX"[..]],
+            [&b"LT"[..], &b"NX"[..]],
+        ] {
+            let reply = run_zadd(&mut db, &[b"k", flags[0], flags[1], b"1", b"m"]);
+            assert_eq!(error_text(&reply), MSG, "flags {flags:?}");
+        }
+        assert_eq!(
+            run_zadd(&mut db, &[b"k", b"GT", b"LT", b"NX", b"1", b"m"]),
+            Frame::Error(Bytes::from_static(MSG.as_bytes()))
+        );
+
+        // Rejected before the keyspace is touched, on BOTH encodings.
+        assert_eq!(run_zcard(&mut db, &[b"k"]), Frame::Integer(0));
+        for member in [LP_MEMBER, BT_MEMBER] {
+            run_zadd(&mut db, &[b"z", b"5", member]);
+            let reply = run_zadd(&mut db, &[b"z", b"GT", b"LT", b"9", member]);
+            assert_eq!(error_text(&reply), MSG);
+            assert_eq!(
+                run_zscore(&mut db, &[b"z", member]),
+                Frame::BulkString(Bytes::from_static(b"5")),
+                "a rejected GT+LT must not have rescored the member"
+            );
+        }
+
+        // The pairing that is still legal on its own keeps working.
+        assert_eq!(
+            run_zadd(&mut db, &[b"z", b"GT", b"9", LP_MEMBER]),
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            run_zscore(&mut db, &[b"z", LP_MEMBER]),
+            Frame::BulkString(Bytes::from_static(b"9"))
+        );
+    }
+
+    #[test]
+    fn an_odd_score_member_tail_is_a_syntax_error() {
+        let mut db = Database::new();
+        // Redis splits these two: NO pairs at all fails `commandCheckArity`,
+        // an ODD tail fails inside `zaddGenericCommand`.
+        assert_eq!(
+            error_text(&run_zadd(&mut db, &[b"k", b"1", b"a", b"2"])),
+            "ERR syntax error"
+        );
+        assert_eq!(
+            error_text(&run_zadd(&mut db, &[b"k", b"CH", b"1"])),
+            "ERR syntax error"
+        );
+        assert_eq!(
+            error_text(&run_zadd(&mut db, &[b"k", b"NX"])),
+            "ERR wrong number of arguments for 'zadd' command"
+        );
+        assert_eq!(run_zcard(&mut db, &[b"k"]), Frame::Integer(0));
+    }
+
+    #[test]
+    fn a_nan_weight_is_not_a_float() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"src", b"1", b"a"]);
+        let nan_args =
+            |extra: &[&[u8]]| -> Vec<Frame> { extra.iter().map(|a| bulk(a)).collect::<Vec<_>>() };
+
+        // Rust parses "nan"; C's `strtod` + `isnan` check does not.
+        for w in [&b"nan"[..], &b"-nan"[..], &b"NaN"[..]] {
+            assert_eq!(
+                error_text(&zunionstore(
+                    &mut db,
+                    &nan_args(&[b"d", b"1", b"src", b"WEIGHTS", w])
+                )),
+                "ERR weight value is not a float",
+                "ZUNIONSTORE weight {}",
+                String::from_utf8_lossy(w)
+            );
+            assert_eq!(
+                error_text(&zunion(&mut db, &nan_args(&[b"1", b"src", b"WEIGHTS", w]))),
+                "ERR weight value is not a float",
+                "ZUNION weight {}",
+                String::from_utf8_lossy(w)
+            );
+        }
+        // …and the destination was never written.
+        assert_eq!(run_zcard(&mut db, &[b"d"]), Frame::Integer(0));
+
+        // An INFINITE weight stays legal, exactly as on Redis.
+        assert_eq!(
+            zunionstore(
+                &mut db,
+                &nan_args(&[b"d", b"1", b"src", b"WEIGHTS", b"inf"])
+            ),
+            Frame::Integer(1)
+        );
+    }
+
+    #[test]
+    fn count_and_numkeys_errors_carry_the_class_redis_uses() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"z", b"1", b"a", b"2", b"b"]);
+        let f = |args: &[&[u8]]| -> Vec<Frame> { args.iter().map(|a| bulk(a)).collect() };
+
+        // `getPositiveLongFromObject` — one message for every failure.
+        for bad in [&b"notanint"[..], &b"-1"[..], &b"1.5"[..]] {
+            assert_eq!(
+                error_text(&zpopmin(&mut db, &f(&[b"z", bad]))),
+                "ERR value is out of range, must be positive"
+            );
+            assert_eq!(
+                error_text(&zpopmax(&mut db, &f(&[b"z", bad]))),
+                "ERR value is out of range, must be positive"
+            );
+        }
+        assert_eq!(run_zcard(&mut db, &[b"z"]), Frame::Integer(2));
+
+        // The set-operation family SPLITS: not-a-number is the generic integer
+        // error, a number below 1 names the command.
+        assert_eq!(
+            error_text(&zunionstore(&mut db, &f(&[b"d", b"notanint", b"z"]))),
+            "ERR value is not an integer or out of range"
+        );
+        for bad in [&b"0"[..], &b"-1"[..]] {
+            assert_eq!(
+                error_text(&zunionstore(&mut db, &f(&[b"d", bad, b"z"]))),
+                "ERR at least 1 input key is needed for 'zunionstore' command"
+            );
+            assert_eq!(
+                error_text(&zinterstore(&mut db, &f(&[b"d", bad, b"z"]))),
+                "ERR at least 1 input key is needed for 'zinterstore' command"
+            );
+            assert_eq!(
+                error_text(&zunion(&mut db, &f(&[bad, b"z"]))),
+                "ERR at least 1 input key is needed for 'zunion' command"
+            );
+            assert_eq!(
+                error_text(&zinter(&mut db, &f(&[bad, b"z"]))),
+                "ERR at least 1 input key is needed for 'zinter' command"
+            );
+            assert_eq!(
+                error_text(&zdiff(&mut db, &f(&[bad, b"z"]))),
+                "ERR at least 1 input key is needed for 'zdiff' command"
+            );
+            assert_eq!(
+                error_text(&zintercard(&mut db, &f(&[bad, b"z"]))),
+                "ERR at least 1 input key is needed for 'zintercard' command"
+            );
+        }
+        // Arity is checked FIRST, so a form that names no key at all never
+        // reaches the numkeys rules.
+        assert_eq!(
+            error_text(&zunion(&mut db, &f(&[b"0"]))),
+            "ERR wrong number of arguments for 'zunion' command"
+        );
+        assert_eq!(
+            error_text(&zintercard(&mut db, &f(&[b"0"]))),
+            "ERR wrong number of arguments for 'zintercard' command"
+        );
+
+        // ZMPOP does NOT split — `getRangeLongFromObject` with one message.
+        for bad in [&b"0"[..], &b"-1"[..], &b"notanint"[..]] {
+            assert_eq!(
+                error_text(&zmpop(&mut db, &f(&[bad, b"z", b"MIN"]))),
+                "ERR numkeys should be greater than 0"
+            );
+        }
+        for bad in [&b"0"[..], &b"-1"[..], &b"notanint"[..]] {
+            assert_eq!(
+                error_text(&zmpop(&mut db, &f(&[b"1", b"z", b"MIN", b"COUNT", bad]))),
+                "ERR count should be greater than 0"
+            );
+        }
+        assert_eq!(
+            run_zcard(&mut db, &[b"z"]),
+            Frame::Integer(2),
+            "a rejected ZMPOP must not have popped"
+        );
+
+        // ZINTERCARD's LIMIT has its own message too.
+        for bad in [&b"-1"[..], &b"notanint"[..]] {
+            assert_eq!(
+                error_text(&zintercard(&mut db, &f(&[b"1", b"z", b"LIMIT", bad]))),
+                "ERR LIMIT can't be negative"
+            );
+        }
+        assert_eq!(
+            zintercard(&mut db, &f(&[b"1", b"z", b"LIMIT", b"0"])),
+            Frame::Integer(2)
+        );
+
+        // A numkeys that overruns the key list, a short WEIGHTS list, a
+        // dangling AGGREGATE and an unknown trailing token are all
+        // `syntax error` — NOT arity errors.
+        let syntax = "ERR syntax error";
+        assert_eq!(
+            error_text(&zunionstore(&mut db, &f(&[b"d", b"2", b"z"]))),
+            syntax
+        );
+        assert_eq!(error_text(&zunion(&mut db, &f(&[b"2", b"z"]))), syntax);
+        assert_eq!(error_text(&zintercard(&mut db, &f(&[b"2", b"z"]))), syntax);
+        assert_eq!(
+            error_text(&zmpop(&mut db, &f(&[b"2", b"z", b"MIN"]))),
+            syntax
+        );
+        assert_eq!(
+            error_text(&zunionstore(&mut db, &f(&[b"d", b"1", b"z", b"WEIGHTS"]))),
+            syntax
+        );
+        assert_eq!(
+            error_text(&zunion(&mut db, &f(&[b"1", b"z", b"WEIGHTS"]))),
+            syntax
+        );
+        assert_eq!(
+            error_text(&zunionstore(&mut db, &f(&[b"d", b"1", b"z", b"AGGREGATE"]))),
+            syntax
+        );
+        // moon#967 rewrote every zset option loop but this one.
+        assert_eq!(
+            error_text(&zunionstore(&mut db, &f(&[b"d", b"1", b"z", b"BOGUS"]))),
+            syntax
+        );
+        assert_eq!(
+            error_text(&zintercard(&mut db, &f(&[b"1", b"z", b"LIMIT"]))),
+            syntax
+        );
+        assert_eq!(
+            error_text(&zmpop(&mut db, &f(&[b"1", b"z", b"MIN", b"COUNT"]))),
+            syntax
+        );
+    }
+
+    /// moon#969 cites four ZRANGE-family sites as wrong. They are NOT: Redis
+    /// reads a rank index and a `LIMIT offset count` with
+    /// `getLongFromObjectOrReply(…, NULL)`, whose message is exactly the
+    /// generic one moon already answers. This test pins them so the moon#969
+    /// sweep cannot "fix" them into a divergence.
+    #[test]
+    fn rank_and_limit_parses_keep_the_generic_integer_error() {
+        let mut db = Database::new();
+        run_zadd(&mut db, &[b"z", b"1", b"a", b"2", b"b"]);
+        let f = |args: &[&[u8]]| -> Vec<Frame> { args.iter().map(|a| bulk(a)).collect() };
+        const GENERIC: &str = "ERR value is not an integer or out of range";
+
+        assert_eq!(
+            error_text(&zrange(&mut db, &f(&[b"z", b"notanint", b"5"]))),
+            GENERIC
+        );
+        assert_eq!(
+            error_text(&zrange(&mut db, &f(&[b"z", b"0", b"notanint"]))),
+            GENERIC
+        );
+        assert_eq!(
+            error_text(&zrange(&mut db, &f(&[b"z", b"1.5", b"2"]))),
+            GENERIC
+        );
+        assert_eq!(
+            error_text(&zrevrange(&mut db, &f(&[b"z", b"notanint", b"5"]))),
+            GENERIC
+        );
+        assert_eq!(
+            error_text(&zrangebyscore(
+                &mut db,
+                &f(&[b"z", b"0", b"5", b"LIMIT", b"notanint", b"5"])
+            )),
+            GENERIC
+        );
+        assert_eq!(
+            error_text(&zrevrangebyscore(
+                &mut db,
+                &f(&[b"z", b"5", b"0", b"LIMIT", b"notanint", b"5"])
+            )),
+            GENERIC
+        );
+        assert_eq!(
+            error_text(&zrandmember(&mut db, &f(&[b"z", b"notanint"]))),
+            GENERIC
+        );
+        assert_eq!(
+            error_text(&zrangestore(&mut db, &f(&[b"d", b"z", b"notanint", b"5"]))),
+            GENERIC
+        );
+    }
+
+    /// moon#792. `CH` counted a rescore only when the score moved by MORE than
+    /// an absolute `f64::EPSILON`, so a real change smaller than ~2.2e-16 was
+    /// reported as no change — while the stored score really did move, which
+    /// the `ZSCORE` assertions below prove. Redis's `zsetAdd` compares
+    /// EXACTLY (`score != curscore`).
+    #[test]
+    fn ch_counts_a_sub_epsilon_rescore() {
+        // `nextafter(1.0)` — the smallest representable move from 1.0, whose
+        // distance is EXACTLY `f64::EPSILON` and so failed the old `>` test.
+        const NUDGED: &[u8] = b"1.0000000000000002";
+
+        for member in [LP_MEMBER, BT_MEMBER] {
+            let mut db = Database::new();
+            assert_eq!(run_zadd(&mut db, &[b"z", b"1", member]), Frame::Integer(1));
+            assert_eq!(
+                run_zadd(&mut db, &[b"z", b"CH", NUDGED, member]),
+                Frame::Integer(1),
+                "CH must count a sub-epsilon rescore ({})",
+                if member == LP_MEMBER {
+                    "listpack"
+                } else {
+                    "bptree"
+                }
+            );
+            assert_eq!(
+                run_zscore(&mut db, &[b"z", member]),
+                Frame::BulkString(Bytes::from_static(NUDGED)),
+                "and the score really did move"
+            );
+            // Re-writing the SAME score is still no change.
+            assert_eq!(
+                run_zadd(&mut db, &[b"z", b"CH", NUDGED, member]),
+                Frame::Integer(0)
+            );
+        }
     }
 
     /// moon#967. Redis defines a negative LIMIT offset as "return nothing".

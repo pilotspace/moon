@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::config::ServerConfig;
 use crate::protocol::Frame;
 
-use super::rules::{apply_rule, get_category_commands, hash_password, verify_password};
+use super::rules::{
+    AclRuleError, apply_rule, get_category_commands, hash_password, verify_password,
+};
 
 #[derive(Clone, Debug)]
 pub struct KeyPattern {
@@ -158,47 +160,91 @@ impl AclUser {
             && channels_unrestricted;
     }
 
-    pub fn allow_command(&mut self, rule: &str) {
-        if rule == "@all" {
+    /// Resolve the category named by a `+@x` / `-@x` rule.
+    ///
+    /// Split out so that **both** `allow_command` and `deny_command` resolve
+    /// before they touch `self`. That ordering is the #978 fix: the old code
+    /// resolved an unknown category to an empty slice and then mutated anyway.
+    fn resolve_category(rule: &str) -> Result<&'static [&'static str], AclRuleError> {
+        get_category_commands(rule)
+            .ok_or_else(|| AclRuleError::UnknownCategory(rule.trim_start_matches('@').to_string()))
+    }
+
+    /// Grant `rule` (a bare command, a `cmd|sub`, or `@category`).
+    ///
+    /// An unresolvable category returns `Err` and leaves `self` unchanged.
+    pub fn allow_command(&mut self, rule: &str) -> Result<(), AclRuleError> {
+        if rule.eq_ignore_ascii_case("@all") {
             self.allowed_commands = CommandPermissions::AllAllowed;
-            return;
+            return Ok(());
         }
+        // Resolve BEFORE the borrow of self.allowed_commands, so an unknown
+        // category bails out with nothing mutated.
+        let category = if rule.starts_with('@') {
+            Some(Self::resolve_category(rule)?)
+        } else {
+            None
+        };
         match &mut self.allowed_commands {
             CommandPermissions::AllAllowed => {} // already all allowed
             CommandPermissions::Specific {
                 allowed, denied, ..
             } => {
-                if rule.starts_with('@') {
-                    for cmd in get_category_commands(rule) {
+                if let Some(cmds) = category {
+                    for cmd in cmds {
                         allowed.insert(cmd.to_string());
                         denied.remove(*cmd);
                     }
-                } else if let Some(idx) = rule.find('|') {
-                    // subcommand: store as "cmd|sub"
-                    allowed.insert(rule[..idx].to_string() + "|" + &rule[idx + 1..]);
+                } else if rule.contains('|') {
+                    // subcommand: stored as "cmd|sub", lowercased like every
+                    // other command token. It used to be stored verbatim, so
+                    // `+CONFIG|GET` could never match: `is_command_allowed`
+                    // lowercases the incoming name before probing the set.
+                    allowed.insert(rule.to_ascii_lowercase());
                 } else {
                     allowed.insert(rule.to_ascii_lowercase());
                     denied.remove(&rule.to_ascii_lowercase());
                 }
             }
         }
+        Ok(())
     }
 
-    pub fn deny_command(&mut self, rule: &str) {
-        if rule == "@all" {
+    /// Revoke `rule` (a bare command, a `cmd|sub`, or `@category`).
+    ///
+    /// An unresolvable category returns `Err` and leaves `self` unchanged.
+    ///
+    /// # #978
+    ///
+    /// The `AllAllowed` arm below rebuilds the permission set as
+    /// `Specific { base_allow: true, .. }`. That is correct *given* a resolved
+    /// category -- the user really did have everything, and is now losing one
+    /// category. It was catastrophic only because an unknown category reached
+    /// it with an empty command list, producing `base_allow: true` with an
+    /// empty `denied` set: every command allowed, reported by `ACL LIST` as
+    /// `-@all`. With `resolve_category` returning `Err` above, this arm is now
+    /// unreachable from an unknown category, and `denied` is non-empty for
+    /// every category Moon resolves.
+    pub fn deny_command(&mut self, rule: &str) -> Result<(), AclRuleError> {
+        if rule.eq_ignore_ascii_case("@all") {
             self.allowed_commands = CommandPermissions::Specific {
                 base_allow: false,
                 allowed: HashSet::new(),
                 denied: HashSet::new(),
             };
-            return;
+            return Ok(());
         }
+        let category = if rule.starts_with('@') {
+            Some(Self::resolve_category(rule)?)
+        } else {
+            None
+        };
         match &mut self.allowed_commands {
             CommandPermissions::AllAllowed => {
                 // Transition to Specific with everything allowed except this
                 let mut denied = HashSet::new();
-                if rule.starts_with('@') {
-                    for cmd in get_category_commands(rule) {
+                if let Some(cmds) = category {
+                    for cmd in cmds {
                         denied.insert(cmd.to_string());
                     }
                 } else {
@@ -213,8 +259,8 @@ impl AclUser {
             CommandPermissions::Specific {
                 allowed, denied, ..
             } => {
-                if rule.starts_with('@') {
-                    for cmd in get_category_commands(rule) {
+                if let Some(cmds) = category {
+                    for cmd in cmds {
                         denied.insert(cmd.to_string());
                         allowed.remove(*cmd);
                     }
@@ -224,6 +270,7 @@ impl AclUser {
                 }
             }
         }
+        Ok(())
     }
 
     pub fn is_command_allowed(&self, cmd: &str) -> bool {
@@ -374,8 +421,57 @@ impl AclTable {
         users
     }
 
+    /// Reject a rule list that names a category Moon cannot resolve.
+    ///
+    /// Checked before any user is created or mutated so that `ACL SETUSER`
+    /// with a bad category is a no-op, the way redis's is. Scoped to
+    /// `+@x`/`-@x` on purpose: validating the *rest* of the token grammar
+    /// (unknown tokens, `nocommands`, modifier case) is #970/#979.
+    ///
+    /// Returns the offending rule alongside the error so the caller can build
+    /// redis's `Error in ACL SETUSER modifier '<rule>': ...` text.
+    pub fn validate_rules<'r>(rules: &[&'r str]) -> Result<(), (&'r str, AclRuleError)> {
+        for rule in rules {
+            let Some(token) = rule.strip_prefix(['+', '-']) else {
+                continue;
+            };
+            if !token.starts_with('@') || token.eq_ignore_ascii_case("@all") {
+                continue;
+            }
+            if get_category_commands(token).is_none() {
+                return Err((
+                    rule,
+                    AclRuleError::UnknownCategory(token.trim_start_matches('@').to_string()),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply ACL SETUSER rules to create or modify a user, rejecting the whole
+    /// call if any rule names an unresolvable category (#978).
+    ///
+    /// Validation runs to completion *before* the user is created or touched,
+    /// so a rejected `ACL SETUSER` leaves the table byte-identical -- matching
+    /// `redis-server`, which neither creates the user nor applies the prefix
+    /// of the rule list that parsed.
+    pub fn try_apply_setuser<'r>(
+        &mut self,
+        username: &str,
+        rules: &[&'r str],
+    ) -> Result<(), (&'r str, AclRuleError)> {
+        Self::validate_rules(rules)?;
+        self.apply_setuser(username, rules);
+        Ok(())
+    }
+
     /// Apply ACL SETUSER rules to create or modify a user.
     /// Creates user if not exists (default-deny for new non-default users).
+    ///
+    /// Prefer [`Self::try_apply_setuser`] on any path that can report to a
+    /// client: a rule this rejects is silently skipped here. Skipping is
+    /// fail-closed (the rule mutates nothing, so no permission is granted),
+    /// but it is still invisible.
     pub fn apply_setuser(&mut self, username: &str, rules: &[&str]) {
         let user = self.users.entry(username.to_string()).or_insert_with(|| {
             if username == "default" {
@@ -385,7 +481,10 @@ impl AclTable {
             }
         });
         for rule in rules {
-            apply_rule(user, rule);
+            // Deliberately discarded: `apply_rule` mutates nothing when it
+            // returns Err, and this signature has no error channel. The
+            // reporting path is `try_apply_setuser`.
+            let _ = apply_rule(user, rule);
         }
         self.bump_version();
     }
@@ -588,8 +687,8 @@ mod tests {
     #[test]
     fn revoking_the_last_grant_of_a_restricted_user_does_not_escalate() {
         let mut user = AclUser::default_deny("u".to_string());
-        user.deny_command("@all");
-        user.allow_command("get");
+        user.deny_command("@all").expect("rule must apply");
+        user.allow_command("get").expect("rule must apply");
         assert!(
             user.is_command_allowed("get"),
             "precondition: +get took effect"
@@ -599,7 +698,7 @@ mod tests {
             "precondition: -@all still denies set"
         );
 
-        user.deny_command("get");
+        user.deny_command("get").expect("rule must apply");
 
         assert!(
             !user.is_command_allowed("get"),
@@ -623,8 +722,8 @@ mod tests {
     #[test]
     fn regranting_a_denied_command_restores_the_allow_all_base() {
         let mut user = AclUser::default_deny("u".to_string());
-        user.allow_command("@all");
-        user.deny_command("get");
+        user.allow_command("@all").expect("rule must apply");
+        user.deny_command("get").expect("rule must apply");
         assert!(
             !user.is_command_allowed("get"),
             "precondition: -get took effect"
@@ -634,7 +733,7 @@ mod tests {
             "precondition: +@all still allows set"
         );
 
-        user.allow_command("get");
+        user.allow_command("get").expect("rule must apply");
 
         assert!(
             user.is_command_allowed("get"),
@@ -653,10 +752,10 @@ mod tests {
     #[test]
     fn base_polarity_survives_repeated_flips() {
         let mut deny_based = AclUser::default_deny("d".to_string());
-        deny_based.deny_command("@all");
+        deny_based.deny_command("@all").expect("rule must apply");
         for _ in 0..3 {
-            deny_based.allow_command("get");
-            deny_based.deny_command("get");
+            deny_based.allow_command("get").expect("rule must apply");
+            deny_based.deny_command("get").expect("rule must apply");
         }
         assert!(
             !deny_based.is_command_allowed("set"),
@@ -664,10 +763,10 @@ mod tests {
         );
 
         let mut allow_based = AclUser::default_deny("a".to_string());
-        allow_based.allow_command("@all");
+        allow_based.allow_command("@all").expect("rule must apply");
         for _ in 0..3 {
-            allow_based.deny_command("get");
-            allow_based.allow_command("get");
+            allow_based.deny_command("get").expect("rule must apply");
+            allow_based.allow_command("get").expect("rule must apply");
         }
         assert!(
             allow_based.is_command_allowed("set"),
@@ -923,8 +1022,18 @@ mod tests {
 
         // -@transaction must cover Moon's MVCC TXN/TEMPORAL extensions the
         // same way it covers MULTI/EXEC.
+        //
+        // #980: these used to probe a bare `TEMPORAL`, which Moon does not
+        // dispatch at all -- `TEMPORAL` alone answers `ERR unknown command`.
+        // The category table matched that same phantom name, so the carve-out
+        // never covered either real command and this assertion could not fail.
+        // Probe what the connection handler actually accepts.
         table.apply_setuser("notxn", &["on", "nopass", "~*", "+@all", "-@transaction"]);
-        for cmd in [b"TXN".as_ref(), b"TEMPORAL".as_ref()] {
+        for cmd in [
+            b"TXN".as_ref(),
+            b"TEMPORAL.SNAPSHOT_AT".as_ref(),
+            b"TEMPORAL.INVALIDATE".as_ref(),
+        ] {
             assert!(
                 table
                     .check_command_permission("notxn", cmd, &args)
@@ -947,7 +1056,8 @@ mod tests {
         table.apply_setuser("full", &["on", "nopass", "~*", "+@all"]);
         for cmd in [
             b"TXN".as_ref(),
-            b"TEMPORAL".as_ref(),
+            b"TEMPORAL.SNAPSHOT_AT".as_ref(),
+            b"TEMPORAL.INVALIDATE".as_ref(),
             b"WS".as_ref(),
             b"MQ".as_ref(),
             b"CDC.READ".as_ref(),
