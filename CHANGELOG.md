@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Console `vitest` unit suite (10 files / 56 tests) now runs in CI**
+  (Closes moon#964). Nothing in `.github/workflows/` ran it — a dependency
+  bump could break `console/src` with every check green, which is exactly
+  what happened in moon#909's first commit (`vitest` bumped to `^5` while
+  `@vitest/coverage-v8` stayed on `^2.1.8`, fixed in the same PR's second
+  commit before merge). Added a `unit` job to `console-integration.yml`,
+  which already carried the correct `console/**` path filter and installed
+  Node/pnpm without ever using them. Runs `pnpm test` only — coverage stays
+  unthresholded, since the current 6.21% figure is an artefact of the
+  vitest config's include scope pulling in untested Three.js/graph UI, not
+  a signal a threshold could usefully gate.
+
 ### Fixed
 
 - **Writes report their real latency on the shipped runtime, and `GET`/`SET`
@@ -30,6 +44,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Instant` cadence); the inline path gains the same per-command counter
   increment and branch, with `total_commands_processed` still flushed once
   per batch.
+- **A re-spilled key recovers to its NEWEST on-disk copy, not whichever file
+  the manifest happened to list last** (moon#983). The cold-index rebuild
+  resolved a key present in two Active heap files by "last one seen wins",
+  where "last" was `ShardManifest::files()` order — `add_file` push order,
+  which is not recency order: the async spill path pushes a file when its
+  background completion is applied, the durable-batch path pushes at eviction
+  time, so a `CONFIG SET appendonly` flip with a completion still in flight
+  registers a higher `file_id` ahead of a lower one, and every restart
+  preserves that order. The rebuild then served the superseded value after
+  recovery with no error and no log line. Duplicates are now resolved by
+  `ColdLocation::recency_key()` — `(file_id, page_idx, slot_idx)`, the spill
+  allocation sequence — regardless of manifest order. Reproduced on the
+  pre-fix binary by booting it on a newest-first manifest built with the spill
+  thread's own writers: `GET` answered the stale copy; after the fix, the
+  fresh one. The real spill → overwrite → re-spill → `SIGKILL` → restart
+  lifecycle is pinned at `--shards 1` and `4`.
 - **`LMOVE`/`RPOPLPUSH`/`BLPOP` no longer strand 56 B every time they drain a
   list to empty** (moon#949). `Database::list_pop_front`/`list_pop_back`
   credited the popped element back to `used_memory` on the non-empty branch but

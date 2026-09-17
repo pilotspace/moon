@@ -11,6 +11,29 @@ on:
   workflow_dispatch: {}
 
 jobs:
+  # Cheap vitest unit gate for console/src. Kept separate from `integration`
+  # (Playwright + a live moon server) so a broken unit test fails in seconds
+  # rather than waiting on the Rust build. Does not gate coverage - see
+  # console/vitest.config.ts's include scope for why a global threshold would
+  # only ever catch someone deleting tests, not a real regression.
+  unit:
+    name: Console unit (vitest)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      - name: Install console deps
+        working-directory: console
+        run: pnpm install --frozen-lockfile
+      - name: Unit tests
+        working-directory: console
+        run: pnpm test
+
   integration:
     runs-on: ubuntu-24.04
     env:
