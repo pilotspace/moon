@@ -130,7 +130,7 @@ retries), and that knob is the rollback if a wall-clock-sensitive test starts fa
 
 **Windows cannot run locally.** Before merging, always dispatch the hosted matrix — `gh workflow run ci.yml --ref <branch>` (add `console-integration.yml` / `crash-matrix.yml` when warranted). It runs only what no local gate can produce: Check (Windows), MSRV 1.94, memory steady-state.
 
-**Per-PR (hosted, ~5–8m):** Lint (`cargo fmt --check`, unsafe/unwrap audits, CHANGELOG gate — `skip-changelog` is the escape hatch) · Check (clippy ×3 + tokio nextest under `MOON_NO_URING=1`) · MSRV · memory steady-state. Fuzz, console, and integration legs run only behind labels. **Main-push** (post-merge net, not a gate): monoio self-hosted with io_uring live, client-compat against a real redis-server, macOS, console feature. **Scheduled:** fuzz nightly 5h, crash matrix nightly + weekly soak, CodeQL and supply-chain weekly.
+**Per-PR (hosted, ~5–8m):** Lint (`cargo fmt --check`, unsafe/unwrap audits, CHANGELOG gate — `skip-changelog` is the escape hatch) · Check (clippy ×3 + tokio nextest under `MOON_NO_URING=1`) · MSRV · memory steady-state. Fuzz and integration legs run only behind labels; console legs (`console-integration.yml`, unit + integration) run on a plain `console/**` path trigger, no label needed. **Main-push** (post-merge net, not a gate): monoio self-hosted with io_uring live, client-compat against a real redis-server, macOS, console feature. **Scheduled:** fuzz nightly 5h, crash matrix nightly + weekly soak, CodeQL and supply-chain weekly.
 
 <!-- ADD:BEGIN — managed by `add.py sync-guidelines`; do not edit inside -->
 ## ADD — how to work in this repo
