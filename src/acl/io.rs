@@ -34,12 +34,29 @@ pub fn user_to_acl_line(user: &AclUser) -> String {
     match &user.allowed_commands {
         CommandPermissions::AllAllowed => parts.push("+@all".to_string()),
         CommandPermissions::Specific {
-            allowed, denied, ..
+            base_allow,
+            allowed,
+            denied,
         } => {
+            // #978, second half: this destructured `{ allowed, denied, .. }`
+            // and hardcoded `-@all`, discarding the one field that says which
+            // way the set is read. A base-ALLOW permission set therefore
+            // printed as "-@all" -- a user reported as holding NOTHING while
+            // holding EVERYTHING, so `ACL LIST` actively concealed the
+            // escalation instead of revealing it. The base polarity is now
+            // rendered, which also makes the line round-trip through
+            // `parse_acl_line`: `+@all` followed by the denies rebuilds the
+            // same permission set, where `-@all` followed by denies rebuilt a
+            // user with no access at all.
+            //
+            // MINIMAL on purpose. moon#981 owns the rest of the round-trip:
+            // re-folding an expanded deny list back into `-@category`, and the
+            // property test that proves save/load is identity.
+            let base = if *base_allow { "+@all" } else { "-@all" };
             if allowed.is_empty() && denied.is_empty() {
-                parts.push("-@all".to_string());
+                parts.push(base.to_string());
             } else {
-                parts.push("-@all".to_string());
+                parts.push(base.to_string());
                 let mut allowed_sorted: Vec<&String> = allowed.iter().collect();
                 allowed_sorted.sort();
                 for a in allowed_sorted {
@@ -67,9 +84,24 @@ pub fn parse_acl_line(line: &str) -> Option<AclUser> {
         return None;
     }
     let username = tokens.next()?.to_string();
-    let mut user = AclUser::default_deny(username);
+    let mut user = AclUser::default_deny(username.clone());
     for token in tokens {
-        apply_rule(&mut user, token);
+        // #978: a rule naming a category Moon cannot resolve rejects the whole
+        // LINE. Applying the rest would hand back a user whose permissions are
+        // not the ones the file asked for, and the failure mode this fixes was
+        // exactly a silently-wrong permission set. Dropping the user is
+        // fail-closed -- an absent user is denied by
+        // `check_command_permission` -- but it is silent on its own, so it is
+        // logged at WARN.
+        if let Err(err) = apply_rule(&mut user, token) {
+            tracing::warn!(
+                user = %username,
+                rule = %token,
+                error = %err,
+                "rejecting ACL file line: unresolvable rule; user not loaded"
+            );
+            return None;
+        }
     }
     Some(user)
 }

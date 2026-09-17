@@ -839,6 +839,119 @@ assert_both "ZADD bad score is an error"        ZADD z:enc:bad 1 a 2 b notafloat
 assert_both "ZADD bad score creates no key"     EXISTS z:enc:bad
 assert_both "ZADD bad score on listpack errors" ZADD z:enc:lp 4 d notafloat e
 assert_both "ZADD bad score writes no prefix"   ZCARD z:enc:lp
+
+# ---------------------------------------------------------------------------
+# moon#969 / moon#792 -- zset option semantics and error CLASSES.
+#
+# The class matters beyond the wording: redis-py raises a distinct exception
+# type per class, so a client branching on it takes the wrong branch. None of
+# these forms had a row in either harness, which is why every one of them was
+# free to drift. `{z969}` co-locates destination and sources so the rows keep
+# comparing the COMMAND, not the shard routing, at --shards > 1.
+# ---------------------------------------------------------------------------
+# GT, LT and NX are pairwise incompatible. `GT LT` used to be ACCEPTED and then
+# silently no-op'd at BOTH mutation sites -- the listpack arm and the B+tree
+# arm each carried a `gt && lt => never update` fallthrough.
+assert_both "ZADD GT+LT is rejected"            ZADD z:969:gtlt GT LT 1 m
+assert_both "ZADD GT+LT creates no key"         EXISTS z:969:gtlt
+assert_both "ZADD GT+NX is rejected"            ZADD z:969:gtlt GT NX 1 m
+assert_both "ZADD LT+NX is rejected"            ZADD z:969:gtlt LT NX 1 m
+assert_both "ZADD GT+LT+NX is rejected"         ZADD z:969:gtlt GT LT NX 1 m
+# ...and on an EXISTING member, on both encodings, the score must not move.
+both ZADD z:969:lp 5 m
+assert_both "ZADD GT+LT on a listpack member"   ZADD z:969:lp GT LT 9 m
+assert_both "ZADD GT+LT left the score alone"   ZSCORE z:969:lp m
+both ZADD z:969:bt 5 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+assert_both "ZADD GT+LT on a bptree member"     ZADD z:969:bt GT LT 9 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+assert_both "ZADD GT+LT left the bptree score"  ZSCORE z:969:bt aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+# An ODD score/member tail is `syntax error`; NO pairs at all is an ARITY
+# error. moon answered the arity error for both.
+assert_both "ZADD odd tail is a syntax error"   ZADD z:969:odd 1 a 2
+assert_both "ZADD CH with a lone score"         ZADD z:969:odd CH 1
+assert_both "ZADD with no pairs is arity"       ZADD z:969:odd NX
+# A NaN weight: Rust's parse accepts "nan", C's strtod+isnan does not.
+# Infinities stay legal on both.
+both ZADD {z969}:src 1 a
+assert_both "ZUNIONSTORE WEIGHTS nan"           ZUNIONSTORE {z969}:d 1 {z969}:src WEIGHTS nan
+assert_both "ZINTERSTORE WEIGHTS nan"           ZINTERSTORE {z969}:d 1 {z969}:src WEIGHTS nan
+assert_both "ZUNION WEIGHTS nan"                ZUNION 1 {z969}:src WEIGHTS nan
+assert_both "ZINTER WEIGHTS nan"                ZINTER 1 {z969}:src WEIGHTS nan
+assert_both "ZUNIONSTORE WEIGHTS nan no key"    EXISTS {z969}:d
+assert_both "ZUNIONSTORE WEIGHTS inf is legal"  ZUNIONSTORE {z969}:d 1 {z969}:src WEIGHTS inf
+# ZPOPMIN/ZPOPMAX count: `getPositiveLongFromObject`, one message for every
+# failure, and 0 is a legal count.
+assert_both "ZPOPMIN count not an integer"      ZPOPMIN z:969:lp notanint
+assert_both "ZPOPMIN negative count"            ZPOPMIN z:969:lp -1
+assert_both "ZPOPMAX count not an integer"      ZPOPMAX z:969:lp notanint
+assert_both "ZPOPMAX negative count"            ZPOPMAX z:969:lp -1
+assert_both "ZPOPMIN count 0 is legal"          ZPOPMIN z:969:lp 0
+# numkeys SPLITS into two classes for the set-operation family: not-a-number
+# is the generic integer error, a number below 1 names the command.
+assert_both "ZUNIONSTORE numkeys 0"             ZUNIONSTORE {z969}:d 0 {z969}:src
+assert_both "ZUNIONSTORE numkeys -1"            ZUNIONSTORE {z969}:d -1 {z969}:src
+assert_both "ZUNIONSTORE numkeys notanint"      ZUNIONSTORE {z969}:d notanint {z969}:src
+assert_both "ZINTERSTORE numkeys 0"             ZINTERSTORE {z969}:d 0 {z969}:src
+assert_both "ZUNION numkeys 0"                  ZUNION 0 {z969}:src
+assert_both "ZINTER numkeys 0"                  ZINTER 0 {z969}:src
+assert_both "ZDIFF numkeys 0"                   ZDIFF 0 {z969}:src
+assert_both "ZINTERCARD numkeys 0"              ZINTERCARD 0 {z969}:src
+assert_both "ZINTERCARD numkeys notanint"       ZINTERCARD notanint {z969}:src
+# Arity is checked FIRST, so a form naming no key never reaches those rules.
+assert_both "ZUNION numkeys 0 with no key"      ZUNION 0
+assert_both "ZINTERCARD numkeys 0 with no key"  ZINTERCARD 0
+# ZMPOP does NOT split -- one message for every numkeys failure.
+assert_both "ZMPOP numkeys 0"                   ZMPOP 0 z:969:lp MIN
+assert_both "ZMPOP numkeys -1"                  ZMPOP -1 z:969:lp MIN
+assert_both "ZMPOP numkeys notanint"            ZMPOP notanint z:969:lp MIN
+assert_both "ZMPOP COUNT 0"                     ZMPOP 1 z:969:lp MIN COUNT 0
+assert_both "ZMPOP COUNT -1"                    ZMPOP 1 z:969:lp MIN COUNT -1
+assert_both "ZMPOP COUNT notanint"              ZMPOP 1 z:969:lp MIN COUNT notanint
+assert_both "ZMPOP rejected pops nothing"       ZCARD z:969:lp
+# ZINTERCARD LIMIT has its own message too.
+assert_both "ZINTERCARD LIMIT -1"               ZINTERCARD 1 z:969:lp LIMIT -1
+assert_both "ZINTERCARD LIMIT notanint"         ZINTERCARD 1 z:969:lp LIMIT notanint
+assert_both "ZINTERCARD LIMIT 0 is unbounded"   ZINTERCARD 1 z:969:lp LIMIT 0
+# syntax error, NOT an arity error: a short WEIGHTS list, a dangling
+# AGGREGATE/LIMIT/COUNT, a numkeys overrunning the key list, and an unknown
+# trailing token (the one option loop the moon#967 sweep missed).
+assert_both "ZUNIONSTORE dangling WEIGHTS"      ZUNIONSTORE {z969}:d 1 {z969}:src WEIGHTS
+assert_both "ZUNION dangling WEIGHTS"           ZUNION 1 {z969}:src WEIGHTS
+assert_both "ZUNIONSTORE dangling AGGREGATE"    ZUNIONSTORE {z969}:d 1 {z969}:src AGGREGATE
+assert_both "ZUNIONSTORE numkeys overruns"      ZUNIONSTORE {z969}:d 2 {z969}:src
+assert_both "ZUNION numkeys overruns"           ZUNION 2 {z969}:src
+assert_both "ZINTERCARD numkeys overruns"       ZINTERCARD 2 {z969}:src
+assert_both "ZMPOP numkeys overruns"            ZMPOP 2 z:969:lp MIN
+assert_both "ZUNIONSTORE unknown token"         ZUNIONSTORE {z969}:d 1 {z969}:src BOGUS
+assert_both "ZINTERCARD dangling LIMIT"         ZINTERCARD 1 z:969:lp LIMIT
+assert_both "ZMPOP dangling COUNT"              ZMPOP 1 z:969:lp MIN COUNT
+# ANTI-REGRESSION (moon#969 cites these as wrong; the oracle says they are
+# NOT). A ZRANGE rank index and a `LIMIT offset count` are read by Redis with
+# `getLongFromObjectOrReply(..., NULL)`, whose message is exactly the generic
+# integer error moon already answers. These rows exist so a later reading of
+# moon#969 cannot "fix" them into a divergence.
+both ZADD z:969:ok 1 a 2 b
+assert_both "ZRANGE rank start stays generic"   ZRANGE z:969:ok notanint 5
+assert_both "ZRANGE rank stop stays generic"    ZRANGE z:969:ok 0 notanint
+assert_both "ZRANGE fractional rank is generic" ZRANGE z:969:ok 1.5 2
+assert_both "ZREVRANGE rank stays generic"      ZREVRANGE z:969:ok notanint 5
+assert_both "ZRANGE REV LIMIT stays generic"    ZRANGE z:969:ok 0 -1 REV LIMIT notanint 5
+assert_both "ZRANGEBYSCORE LIMIT offset"        ZRANGEBYSCORE z:969:ok 0 5 LIMIT notanint 5
+assert_both "ZRANGEBYSCORE LIMIT count"         ZRANGEBYSCORE z:969:ok 0 5 LIMIT 0 notanint
+assert_both "ZREVRANGEBYSCORE LIMIT offset"     ZREVRANGEBYSCORE z:969:ok 5 0 LIMIT notanint 5
+assert_both "ZRANDMEMBER count stays generic"   ZRANDMEMBER z:969:ok notanint
+assert_both "ZRANGESTORE rank stays generic"    ZRANGESTORE {z969}:d z:969:ok notanint 5
+# moon#792: CH counts a rescore EXACTLY, as Redis does. `1.0000000000000002`
+# is nextafter(1.0), whose distance from 1.0 is exactly f64::EPSILON -- so the
+# old `.abs() > f64::EPSILON` window called this real move "unchanged" while
+# the stored score really did change, which the ZSCORE row proves.
+both ZADD z:792:lp 1 m
+assert_both "ZADD CH sub-epsilon (listpack)"    ZADD z:792:lp CH 1.0000000000000002 m
+assert_both "ZADD CH sub-epsilon moved score"   ZSCORE z:792:lp m
+assert_both "ZADD CH rewriting the same score"  ZADD z:792:lp CH 1.0000000000000002 m
+both ZADD z:792:bt 1 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+assert_both "ZADD CH sub-epsilon (bptree)"      ZADD z:792:bt CH 1.0000000000000002 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+assert_both "ZADD CH bptree moved score"        ZSCORE z:792:bt bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
 # Exactly zset-max-listpack-entries (128) members is STILL a listpack; one
 # more promotes to a skiplist on both. One ZADD per step, not 129 — each
 # `both` spawns two redis-cli processes.
@@ -1828,6 +1941,212 @@ route_probe f_xread    "XADD %K 1-1 f v"             "XREAD COUNT 1 STREAMS %K 0
 # reason that has nothing to do with routing. Its routing fence lives in
 # tests/shard_routing_parity.rs, which asserts the reply is an integer for
 # every key rather than that the two servers agree on the number.
+
+# ===========================================================================
+# BEGIN moon#962 -- a multi-key command must not answer from ONE shard
+# ===========================================================================
+#
+# Self-contained block: it defines its own helpers and its own key namespace
+# (`mk:`), and modifies nothing above or below it.
+#
+# `route_probe` above substitutes a SINGLE `%K`, so every row it drives in this
+# family is numkeys=1 -- `LMPOP 1 %K LEFT`, `ZDIFF 1 %K`, `SINTERCARD 1 %K`.
+# **One key cannot span shards**, which is exactly why this family read clean
+# for a release while `LMPOP` was popping a key it had never routed on. This is
+# the adjacent vacuity trap the comment at the top of the routing block already
+# warns about, in its other form: not "the key was absent" but "there was only
+# one key".
+#
+# `route_probe_multi` maps `%K1..%Kn` to DISTINCT key names and runs each row
+# in two placements, both of which are load-bearing:
+#
+#   span -- unrelated names, which at --shards>1 land on different shards.
+#           moon must either AGREE with redis or refuse with CROSSSLOT, and a
+#           refusal must have left the keyspace untouched. Answering something
+#           else is the defect.
+#   colo -- one `{hash}` tag, the documented remedy. moon must AGREE with
+#           redis and must NEVER refuse. This is what a blanket refusal fails.
+#
+# At --shards 1 the span placement co-locates trivially and both halves demand
+# the correct answer, so the block is a pure parity check there rather than
+# being skipped.
+#
+# The per-key `check` template is what makes the two MUTATING members
+# (`LMPOP`/`ZMPOP`) visible: the reply alone cannot show that an element left a
+# key the command must never reach.
+
+MK_TRIALS=8
+MK_REFUSED=0
+MK_TOUCH_REFUSED=0
+
+# Read `tmpl` (with %K) for every key, joined -- one comparable string for the
+# whole key set.
+mk_state() {
+    local port="$1" tmpl="$2"; shift 2
+    local k out=""
+    local -a av
+    for k in "$@"; do
+        # An ARRAY, never `redis-cli $tmpl`. Word-splitting a command out of a
+        # variable is one shell away from sending the whole string as ONE
+        # argument (it is exactly what zsh does), and the probe then measures
+        # an arity error instead of the routing it was written for.
+        read -r -a av <<<"${tmpl//%K/$k}"
+        out="${out}$(mk_norm "$(redis-cli -p "$port" "${av[@]}" 2>&1)")|"
+    done
+    printf '%s' "$out"
+}
+
+# Collapse a reply to one comparable line: sort the lines (the set combinators
+# answer an unordered collection), then squeeze runs of whitespace and strip the
+# ends. redis-cli emits a LEADING BLANK LINE for an error reply, which `sort`
+# puts first -- an un-normalised comparison then reports every correct refusal
+# as a mismatch, and an anchored `CROSSSLOT*` pattern never matches at all.
+mk_norm() {
+    printf '%s' "$1" | sort | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//'
+}
+
+# mode(span|colo) label nkeys seed-templates(|-separated, one per key, %K)
+#   probe(%K1..%Kn) [check(%K)]
+#
+# An EMPTY seed template leaves that key absent -- `LMPOP`'s first key must be
+# empty AND the routing key, or the priority scan never walks past it and the
+# wrong-key pop cannot happen.
+route_probe_multi() {
+    local mode="$1" label="$2" n="$3" seeds="$4" probe="$5" check="${6:-}"
+    local i j port s p r m before="" after=""
+    local wrong=0 refused=0
+    local -a keys seedv sv pv
+    for i in $(seq 1 "$MK_TRIALS"); do
+        keys=()
+        for j in $(seq 1 "$n"); do
+            if [[ "$mode" == "colo" ]]; then
+                keys+=("{mk:${label}:${i}}:${j}")
+            else
+                keys+=("mk:${label}:${i}:${j}")
+            fi
+        done
+        IFS='|' read -r -a seedv <<<"$seeds"
+        for port in "$PORT_REDIS" "$PORT_RUST"; do
+            redis-cli -p "$port" DEL "${keys[@]}" >/dev/null 2>&1 || true
+            for j in $(seq 1 "$n"); do
+                s="${seedv[$((j-1))]:-}"
+                # `if`, never `[[ ... ]] && continue`: under `set -e` a bare
+                # `&&` statement that evaluates FALSE aborts the script (#642).
+                if [[ -n "$s" ]]; then
+                    read -r -a sv <<<"${s//%K/${keys[$((j-1))]}}"
+                    redis-cli -p "$port" "${sv[@]}" >/dev/null 2>&1 || true
+                fi
+            done
+        done
+        if [[ -n "$check" ]]; then
+            before="$(mk_state "$PORT_RUST" "$check" "${keys[@]}")"
+        fi
+        p="$probe"
+        # Highest index first: %K10 must not be eaten by the %K1 rule if a row
+        # ever needs ten keys.
+        for j in $(seq "$n" -1 1); do p="${p//%K$j/${keys[$((j-1))]}}"; done
+        read -r -a pv <<<"$p"
+        r="$(mk_norm "$(redis-cli -p "$PORT_REDIS" "${pv[@]}" 2>&1)")"
+        m="$(mk_norm "$(redis-cli -p "$PORT_RUST"  "${pv[@]}" 2>&1)")"
+        if [[ -n "$check" ]]; then
+            after="$(mk_state "$PORT_RUST" "$check" "${keys[@]}")"
+        fi
+        # A SUBSTRING test, not an anchored `case` pattern. The reply may carry
+        # a leading blank line (see `mk_norm`), and an anchored pattern that
+        # silently stops matching turns a correct refusal into a reported
+        # mismatch -- a guard that cannot recognise its own success.
+        if [[ "$m" == *CROSSSLOT* ]]; then
+            refused=$((refused + 1))
+            if [[ "$mode" == "colo" ]]; then
+                echo "  FAIL detail: ${label}[$i] refused a CO-LOCATED key set: $m"
+                wrong=$((wrong + 1))
+            elif [[ "$label" == "touch" ]]; then
+                MK_TOUCH_REFUSED=$((MK_TOUCH_REFUSED + 1))
+                echo "  FAIL detail: touch[$i] was refused; it is per-key decomposable and must fan out"
+                wrong=$((wrong + 1))
+            elif [[ -n "$check" && "$before" != "$after" ]]; then
+                echo "  FAIL detail: ${label}[$i] refused but the keyspace MOVED: '$before' -> '$after'"
+                wrong=$((wrong + 1))
+            fi
+        elif [[ "$r" != "$m" ]]; then
+            echo "  FAIL detail: ${label}[$i] ($mode) answered '$m'; redis says '$r'"
+            wrong=$((wrong + 1))
+        fi
+    done
+    assert_eq "moon#962 ${label} ${mode} (shards=${SHARDS}, ${MK_TRIALS} placements)" \
+        "0 wrong" "${wrong} wrong"
+    MK_REFUSED=$((MK_REFUSED + refused))
+}
+
+# label | n | per-key seeds | probe | per-key check
+#
+# `sdiff`/`zdiff` get an ASYMMETRIC seed on purpose: under a uniform one, key 3
+# subtracts the shared member whether or not key 2 was visible, and the DIFF
+# rows come back RIGHT for the WRONG reason (measured: 12 of 12 green on the
+# defective binary before this seed existed). Only key 2 can subtract `common`
+# here, so losing it is visible.
+MK_ROWS=(
+  "sinter|3|SADD %K common m1|SADD %K common m2|SADD %K common m3|SINTER %K1 %K2 %K3|SCARD %K"
+  "sunion|3|SADD %K common m1|SADD %K common m2|SADD %K common m3|SUNION %K1 %K2 %K3|SCARD %K"
+  "sdiff|3|SADD %K common m1|SADD %K common|SADD %K m3|SDIFF %K1 %K2 %K3|SCARD %K"
+  "sintercard|3|SADD %K common m1|SADD %K common m2|SADD %K common m3|SINTERCARD 3 %K1 %K2 %K3|SCARD %K"
+  "zdiff|3|ZADD %K 1 common 2 m1|ZADD %K 1 common|ZADD %K 2 m3|ZDIFF 3 %K1 %K2 %K3|ZCARD %K"
+  "zinter|3|ZADD %K 1 common 2 m1|ZADD %K 1 common 2 m2|ZADD %K 1 common 2 m3|ZINTER 3 %K1 %K2 %K3|ZCARD %K"
+  "zunion|3|ZADD %K 1 common 2 m1|ZADD %K 1 common 2 m2|ZADD %K 1 common 2 m3|ZUNION 3 %K1 %K2 %K3 WITHSCORES|ZCARD %K"
+  "zintercard|3|ZADD %K 1 common 2 m1|ZADD %K 1 common 2 m2|ZADD %K 1 common 2 m3|ZINTERCARD 3 %K1 %K2 %K3|ZCARD %K"
+  "lcs|2|SET %K ohmytext|SET %K mynewtext|LCS %K1 %K2|GET %K"
+  "pfcount|3|PFADD %K a b c|PFADD %K d e f|PFADD %K g h i|PFCOUNT %K1 %K2 %K3|PFCOUNT %K"
+  "touch|3|SET %K v|SET %K v|SET %K v|TOUCH %K1 %K2 %K3|GET %K"
+  "lmpop|3||RPUSH %K B1 B2|RPUSH %K C1 C2|LMPOP 3 %K1 %K2 %K3 LEFT|LRANGE %K 0 -1"
+  "zmpop|3||ZADD %K 1 B1 2 B2|ZADD %K 1 C1 2 C2|ZMPOP 3 %K1 %K2 %K3 MIN|ZRANGE %K 0 -1"
+)
+
+for mk_row in "${MK_ROWS[@]}"; do
+    IFS='|' read -r -a mk_f <<<"$mk_row"
+    mk_label="${mk_f[0]}"; mk_n="${mk_f[1]}"
+    # fields 2..(2+n-1) are the per-key seeds, then the probe, then the check
+    mk_seeds=""
+    for mk_j in $(seq 0 $((mk_n - 1))); do
+        mk_seeds="${mk_seeds}${mk_f[$((2 + mk_j))]:-}|"
+    done
+    mk_seeds="${mk_seeds%|}"
+    mk_probe="${mk_f[$((2 + mk_n))]}"
+    mk_check="${mk_f[$((3 + mk_n))]:-}"
+    route_probe_multi span "$mk_label" "$mk_n" "$mk_seeds" "$mk_probe" "$mk_check"
+    route_probe_multi colo "$mk_label" "$mk_n" "$mk_seeds" "$mk_probe" "$mk_check"
+done
+
+# Non-vacuity. At --shards>1 the span sweep MUST have reached the cross-shard
+# case at least once, or every row above passed by co-locating and the block
+# proved nothing. At --shards 1 there is nothing to refuse, so zero is right.
+if [[ "$SHARDS" -gt 1 ]]; then
+    if [[ "$MK_REFUSED" -gt 0 ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: moon#962 span sweep reached the cross-shard case ($MK_REFUSED refusals, shards=$SHARDS)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: moon#962 span sweep refused nothing at shards=$SHARDS -- every placement co-located and the block is vacuous"
+    fi
+else
+    assert_eq "moon#962 nothing is refused at one shard" "0" "$MK_REFUSED"
+fi
+# TOUCH is the one member that fans out; a refusal for it is a regression.
+assert_eq "moon#962 TOUCH is never refused (shards=$SHARDS)" "0" "$MK_TOUCH_REFUSED"
+
+# Tidy up by exact name -- `--scan | xargs -r` is GNU-only and this script runs
+# on macOS too.
+for mk_row in "${MK_ROWS[@]}"; do
+    IFS='|' read -r -a mk_f <<<"$mk_row"
+    for mk_i in $(seq 1 "$MK_TRIALS"); do
+        for mk_j in $(seq 1 "${mk_f[1]}"); do
+            for mk_port in "$PORT_REDIS" "$PORT_RUST"; do
+                redis-cli -p "$mk_port" DEL "mk:${mk_f[0]}:${mk_i}:${mk_j}" \
+                    "{mk:${mk_f[0]}:${mk_i}}:${mk_j}" >/dev/null 2>&1 || true
+            done
+        done
+    done
+done
+# ===========================================================================
+# END moon#962
+# ===========================================================================
 
 # EXEC aborted by a broken WATCH: the reply TYPE, not the committed value.
 # Needs two connections interleaved, like watch_cas_outcome above, but reads
@@ -3936,6 +4255,321 @@ run_cross_shard_count_leg
 # Restore the originally-requested shard count so nothing downstream inherits
 # an 8-shard server from this section.
 start_moon_with_shards "$SHARDS" || true
+
+
+# ===========================================================================
+# ACL category resolution and membership (moon#978 CRITICAL, moon#980)
+#
+# BEGIN acl-category-section -- moon#978/#980. Self-contained: it adds its own
+# helpers, touches only users named `n978:*`, and deletes them again. Append
+# new rows INSIDE the markers.
+#
+# Until this landed the harness had ZERO ACL rows -- `scripts/test-commands.sh`
+# listed ACL's subcommands and nothing anywhere exercised a permission. Both of
+# the bugs below were live in a shipped release and no suite noticed.
+#
+#   #978  `get_category_commands` ended in `_ => &[]`, so an unknown category
+#         resolved to an EMPTY command list. `deny_command` walked it, inserted
+#         nothing, and rebuilt the permission set as base-allow with an empty
+#         deny set -- every command granted -- while `ACL LIST` printed `-@all`.
+#         Six real redis categories (bitmap, hyperloglog, geo, fast, slow,
+#         blocking) and every non-lowercase spelling took that path.
+#   #980  `@read` contained GETDEL/GETEX/SORT, so `+@read` could DELETE a key;
+#         `@dangerous` was missing SWAPDB/INFO/CLIENT, so `-@dangerous` left
+#         them granted.
+#
+# Every row is a moon-vs-redis comparison, so the oracle decides, not this
+# file's idea of what the answer should be.
+# ===========================================================================
+log "=== ACL category resolution + membership (#978, #980) ==="
+
+# Run one command as a given ACL user on one port. `--no-auth-warning` keeps
+# the password off stderr, which would otherwise land in the compared output.
+acl_as() {
+    local port="$1" user="$2" pass="$3"; shift 3
+    redis-cli -p "$port" --user "$user" --pass "$pass" --no-auth-warning "$@" 2>&1 || true
+}
+
+# Same rules applied to both servers, then the same probe run as that user on
+# both, and the two replies compared. `$ACL_U` is the user name.
+ACL_U="n978:probe"
+acl_reset_user() {
+    redis-cli -p "$PORT_REDIS" ACL DELUSER "$ACL_U" &>/dev/null || true
+    redis-cli -p "$PORT_RUST"  ACL DELUSER "$ACL_U" &>/dev/null || true
+}
+
+# assert_acl_setuser <desc> <rule>...  -- compare the SETUSER reply itself.
+assert_acl_setuser() {
+    local desc="$1"; shift
+    local r m
+    r=$(redis-cli -p "$PORT_REDIS" ACL SETUSER "$ACL_U" "$@" 2>&1) || true
+    m=$(redis-cli -p "$PORT_RUST"  ACL SETUSER "$ACL_U" "$@" 2>&1) || true
+    assert_eq "$desc" "$r" "$m"
+}
+
+# assert_acl_probe <desc> <cmd>...  -- compare the reply the restricted user
+# gets. A NOPERM on one side and a real answer on the other is the whole bug.
+assert_acl_probe() {
+    local desc="$1"; shift
+    local r m
+    r=$(acl_as "$PORT_REDIS" "$ACL_U" pw "$@")
+    m=$(acl_as "$PORT_RUST"  "$ACL_U" pw "$@")
+    assert_eq "$desc" "$r" "$m"
+}
+
+# assert_acl_both_denied <desc> <cmd>...  -- both servers must refuse, without
+# requiring identical text.
+#
+# For a CONTAINER command redis names the subcommand it refused
+# (`... to run the 'client|list' command`) because its ACL is per subcommand;
+# moon's permission check only ever sees the bare container, so it names
+# `'client'`. Both DENY -- only the noun differs -- so comparing the strings
+# would fail on a difference that is not a permission difference. Asserting
+# "denied on both" keeps the security property under test without pinning a
+# message moon cannot produce. Per-subcommand matching is tracked separately;
+# when it lands these rows can go back to `assert_acl_probe`.
+assert_acl_both_denied() {
+    local desc="$1"; shift
+    local r m
+    r=$(acl_as "$PORT_REDIS" "$ACL_U" pw "$@")
+    m=$(acl_as "$PORT_RUST"  "$ACL_U" pw "$@")
+    if [[ "$r" == NOPERM* && "$m" == NOPERM* ]]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $desc (both servers must refuse)"
+        echo "    redis: $(echo "$r" | head -c 160)"
+        echo "    moon:  $(echo "$m" | head -c 160)"
+    fi
+}
+
+# --- #978 row 1: an unknown category must be an ERROR on both -------------
+# RED on main: moon answered +OK and left SETBIT runnable.
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all
+assert_acl_setuser "#978 -@bogusnope is rejected" -@bogusnope
+assert_acl_probe   "#978 -@bogusnope: SETBIT unaffected" SETBIT n978:k 0 1
+
+# The row above is deliberately NOT the load-bearing one: the oracle's user
+# also holds +@all there, so both servers answer the SETBIT probe identically
+# whether or not moon honoured the deny. The discriminating case is a rule list
+# that would CREATE the user: redis rejects the whole modifier list, so the
+# account never comes into existence, while the #978 code path created it
+# holding +@all. This row fails loudly when the guard is removed.
+acl_reset_user
+assert_acl_setuser "#978 rejected SETUSER is a whole-call no-op" \
+    on '>pw' '~*' '&*' +@all -@bogusnope
+assert_both "#978 rejected SETUSER creates no user" ACL GETUSER "$ACL_U"
+acl_probe_auth_r=$(acl_as "$PORT_REDIS" "$ACL_U" pw PING)
+acl_probe_auth_m=$(acl_as "$PORT_RUST"  "$ACL_U" pw PING)
+assert_eq "#978 rejected SETUSER grants no credential" "$acl_probe_auth_r" "$acl_probe_auth_m"
+
+# Introspection must not contradict enforcement. This is #978's second half:
+# `user_to_acl_line` discards `base_allow`, so a base-ALLOW permission set with
+# an empty deny set printed as `-@all` -- a user reported as having nothing
+# while holding everything. The oracle cannot arbitrate this (moon and redis
+# render the line differently; the rendering itself is moon#981), so assert the
+# INVARIANT instead: if moon's own ACL LIST line says `-@all` and grants no
+# `+command`, that user must actually be denied.
+acl_reset_user
+redis-cli -p "$PORT_RUST" ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all &>/dev/null || true
+redis-cli -p "$PORT_RUST" ACL SETUSER "$ACL_U" -@bitmap &>/dev/null || true
+acl_line=$(redis-cli -p "$PORT_RUST" ACL LIST 2>/dev/null | tr -d '\r' | grep "^user $ACL_U " || true)
+acl_get=$(acl_as "$PORT_RUST" "$ACL_U" pw GET n978:absent)
+if [[ "$acl_line" == *"-@all"* && "$acl_line" != *" +"* ]]; then
+    # line claims "no permissions at all" -- enforcement must agree
+    if [[ "$acl_get" == NOPERM* ]]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: #978 ACL LIST says -@all with no grants, but GET is permitted"
+        echo "    line: $acl_line"
+        echo "    GET:  $acl_get"
+    fi
+else
+    # line advertises real grants -- also fine, and what a correct render does
+    PASS=$((PASS + 1))
+fi
+
+# --- #978 row 2: the six real categories moon did not implement ----------
+# RED on main for every one of them: moon accepted the deny, granted
+# everything, and reported the user as `-@all`.
+for acl_cat in bitmap hyperloglog geo fast slow blocking; do
+    acl_reset_user
+    both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all
+    assert_acl_setuser "#978 -@$acl_cat accepted like redis" "-@$acl_cat"
+done
+
+# The measured escalation, end to end.
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all
+both ACL SETUSER "$ACL_U" -@bitmap
+assert_acl_probe "#978 -@bitmap denies SETBIT"   SETBIT n978:k 0 1
+assert_acl_probe "#978 -@bitmap denies BITCOUNT" BITCOUNT n978:k
+assert_acl_probe "#978 -@bitmap still allows GET" GET n978:k
+
+# --- #978 row 3: category names are case-insensitive ---------------------
+# RED on main: moon matched lowercase literals, so `-@DANGEROUS` fell through
+# to `_ => &[]` -- a deny that granted everything.
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all
+assert_acl_setuser "#978 -@DANGEROUS accepted (case-insensitive)" -@DANGEROUS
+assert_acl_probe   "#978 -@DANGEROUS denies FLUSHALL" FLUSHALL
+
+# --- #980 row 1: +@read must not grant a mutating command ----------------
+# RED on main: GETDEL returned the value AND deleted the key.
+acl_reset_user
+both SET n978:vic hello
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' -@all +@read
+assert_acl_probe "#980 +@read denies GETDEL" GETDEL n978:vic
+assert_both      "#980 +@read: GETDEL did not delete the key" EXISTS n978:vic
+assert_acl_probe "#980 +@read denies GETEX"  GETEX n978:vic EX 100
+assert_acl_probe "#980 +@read allows GET"    GET n978:vic
+both RPUSH n978:lst b
+both RPUSH n978:lst a
+assert_acl_probe "#980 +@read denies SORT ... STORE" SORT n978:lst ALPHA STORE n978:dst
+assert_both      "#980 +@read: SORT STORE wrote nothing" EXISTS n978:dst
+assert_acl_probe "#980 +@read allows SORT_RO" SORT_RO n978:lst ALPHA
+
+# --- #980 row 2: -@dangerous must actually be dangerous ------------------
+# RED on main: SWAPDB, CLIENT and INFO stayed granted.
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all -@dangerous
+assert_acl_probe "#980 -@dangerous denies SWAPDB"      SWAPDB 0 1
+assert_acl_both_denied "#980 -@dangerous denies CLIENT LIST" CLIENT LIST
+assert_acl_probe "#980 -@dangerous denies KEYS"        KEYS 'n978:*'
+assert_acl_probe "#980 -@dangerous denies FLUSHALL"    FLUSHALL
+assert_acl_probe "#980 -@dangerous still allows GET"   GET n978:vic
+
+# --- GHSA-9x86-7597-5wwj / #971 base_allow polarity ----------------------
+# This change re-touches `CommandPermissions::Specific`, so #971's two
+# polarity cases are re-asserted here rather than trusted.
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all -get +get
+assert_acl_probe "#971 +@all -get +get: GET allowed" GET n978:vic
+assert_acl_probe "#971 +@all -get +get: SET allowed" SET n978:pol 1
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' -@all +get -get
+assert_acl_probe "#971 -@all +get -get: GET denied" GET n978:vic
+assert_acl_probe "#971 -@all +get -get: SET denied" SET n978:pol 1
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all -get
+assert_acl_probe "#971 +@all -get: GET denied"  GET n978:vic
+assert_acl_probe "#971 +@all -get: SET allowed" SET n978:pol 1
+acl_reset_user
+
+# ---------------------------------------------------------------------------
+# ACL CAT diff against the live oracle, all 21 redis categories.
+#
+# This is the row that catches membership drift rather than one hand-picked
+# command, and the one that would have caught #980 on the day it shipped.
+#
+# Two adjustments, both forced by real differences rather than convenience:
+#
+#  1. moon implements a different command SET. A redis member moon does not
+#     implement cannot be classified, so the comparison is restricted to
+#     `COMMAND LIST` on the moon side.
+#  2. redis classifies per SUBCOMMAND (`acl|setuser`); moon's permission check
+#     only ever sees the bare container name. So redis `foo|sub` collapses to
+#     bare `foo` before comparing.
+#
+# Verdict, deliberately asymmetric because the two directions are not equally
+# dangerous:
+#   * a command in a PERMISSIVE moon category (@read/@keyspace/@connection/
+#     @fast/@string/...) that redis puts only under @write/@admin/@dangerous
+#     is an ESCALATION  -> FAIL
+#   * a command missing from moon's @admin/@dangerous that redis has there is
+#     a failed revocation -> FAIL
+#   * everything else is printed as an informational delta.
+# ---------------------------------------------------------------------------
+log "--- ACL CAT: 21-category diff vs the live oracle ---"
+
+ACL_CAT_DIR=$(mktemp -d /tmp/moon-aclcat.XXXXXX)
+redis-cli -p "$PORT_RUST" COMMAND LIST 2>/dev/null | tr -d '\r' | tr 'A-Z' 'a-z' \
+    | grep -v '|' | sort -u > "$ACL_CAT_DIR/moon-cmds"
+
+acl_cat_fetch() {  # <port> <category> <outfile>
+    redis-cli -p "$1" ACL CAT "$2" 2>/dev/null | tr -d '\r' | tr 'A-Z' 'a-z' \
+        | sed 's/|.*//' | sort -u > "$3"
+}
+
+ACL_CAT_TOTAL_MISSING=0
+ACL_CAT_TOTAL_EXTRA=0
+for acl_cat in $(redis-cli -p "$PORT_REDIS" ACL CAT 2>/dev/null | tr -d '\r' | sort); do
+    acl_cat_fetch "$PORT_REDIS" "$acl_cat" "$ACL_CAT_DIR/r"
+    acl_cat_fetch "$PORT_RUST"  "$acl_cat" "$ACL_CAT_DIR/m"
+    if [[ ! -s "$ACL_CAT_DIR/m" ]]; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: ACL CAT @$acl_cat -- moon resolves it to NOTHING (the #978 shape)"
+        continue
+    fi
+    # redis members moon implements, vs what moon actually classifies
+    comm -12 "$ACL_CAT_DIR/r" "$ACL_CAT_DIR/moon-cmds" > "$ACL_CAT_DIR/expected"
+    comm -13 "$ACL_CAT_DIR/m" "$ACL_CAT_DIR/expected"  > "$ACL_CAT_DIR/missing"
+    comm -13 "$ACL_CAT_DIR/r" "$ACL_CAT_DIR/m"         > "$ACL_CAT_DIR/extra"
+    n_missing=$(wc -l < "$ACL_CAT_DIR/missing" | tr -d ' ')
+    n_extra=$(wc -l < "$ACL_CAT_DIR/extra" | tr -d ' ')
+    ACL_CAT_TOTAL_MISSING=$((ACL_CAT_TOTAL_MISSING + n_missing))
+    ACL_CAT_TOTAL_EXTRA=$((ACL_CAT_TOTAL_EXTRA + n_extra))
+    printf "    @%-13s redis=%-4s moon=%-4s missing=%-4s extra=%s\n" \
+        "$acl_cat" "$(wc -l < "$ACL_CAT_DIR/r" | tr -d ' ')" \
+        "$(wc -l < "$ACL_CAT_DIR/m" | tr -d ' ')" "$n_missing" "$n_extra"
+
+    case "$acl_cat" in
+        admin|dangerous)
+            # A revocation that does not revoke. #980's second half.
+            if [[ -s "$ACL_CAT_DIR/missing" ]]; then
+                FAIL=$((FAIL + 1))
+                echo "  FAIL: @$acl_cat is missing commands redis revokes: $(tr '\n' ' ' < "$ACL_CAT_DIR/missing")"
+            else
+                PASS=$((PASS + 1))
+            fi
+            ;;
+        read|keyspace|connection|fast|string|hash|list|set|sortedset|stream|pubsub|scripting|transaction|bitmap|hyperloglog|geo|blocking|slow|write)
+            # An escalation: moon grants under this category something redis
+            # only ever grants under @write/@admin/@dangerous. Moon-only
+            # commands (ft.*, graph.*, mq, ws, ...) are absent from the redis
+            # side entirely and are filtered out by `moon-cmds ∩ redis`.
+            acl_cat_fetch "$PORT_REDIS" write "$ACL_CAT_DIR/rw"
+            acl_cat_fetch "$PORT_REDIS" admin "$ACL_CAT_DIR/ra"
+            acl_cat_fetch "$PORT_REDIS" dangerous "$ACL_CAT_DIR/rd"
+            redis-cli -p "$PORT_REDIS" COMMAND LIST 2>/dev/null | tr -d '\r' \
+                | tr 'A-Z' 'a-z' | sed 's/|.*//' | sort -u > "$ACL_CAT_DIR/rcmds"
+            # only judge commands redis actually knows
+            comm -12 "$ACL_CAT_DIR/extra" "$ACL_CAT_DIR/rcmds" > "$ACL_CAT_DIR/extra_known"
+            if [[ "$acl_cat" == "write" || "$acl_cat" == "slow" ]]; then
+                : > "$ACL_CAT_DIR/priv"   # @write/@slow legitimately overlap
+            else
+                sort -u "$ACL_CAT_DIR/rw" "$ACL_CAT_DIR/ra" "$ACL_CAT_DIR/rd" > "$ACL_CAT_DIR/priv"
+            fi
+            comm -12 "$ACL_CAT_DIR/extra_known" "$ACL_CAT_DIR/priv" > "$ACL_CAT_DIR/esc"
+            if [[ -s "$ACL_CAT_DIR/esc" ]]; then
+                FAIL=$((FAIL + 1))
+                echo "  FAIL: +@$acl_cat grants commands redis classifies as write/admin/dangerous: $(tr '\n' ' ' < "$ACL_CAT_DIR/esc")"
+            else
+                PASS=$((PASS + 1))
+            fi
+            ;;
+    esac
+done
+echo "    ACL CAT totals: missing=$ACL_CAT_TOTAL_MISSING extra=$ACL_CAT_TOTAL_EXTRA (informational)"
+rm -rf "$ACL_CAT_DIR"
+
+# Every category moon PUBLISHES must RESOLVE. Publication and dispatch were
+# three separate hand-maintained lists before #978.
+for acl_cat in $(redis-cli -p "$PORT_RUST" ACL CAT 2>/dev/null | tr -d '\r'); do
+    acl_n=$(redis-cli -p "$PORT_RUST" ACL CAT "$acl_cat" 2>&1 | tr -d '\r' | grep -c . || true)
+    if [[ "$acl_n" -gt 0 ]]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: moon publishes @$acl_cat but resolves it to nothing"
+    fi
+done
+
+acl_reset_user
+both DEL n978:k n978:vic n978:lst n978:dst n978:pol
+# END acl-category-section -- moon#978/#980
 
 echo "============================================"
 echo "  Data Consistency Test Results"
