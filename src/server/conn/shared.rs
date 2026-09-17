@@ -1873,6 +1873,23 @@ fn splittable_read_kind(
     match (cmd.len(), cmd[0] | 0x20) {
         (4, b'm') if cmd.eq_ignore_ascii_case(b"MGET") => Some(FanoutKind::Gather),
         (6, b'e') if cmd.eq_ignore_ascii_case(b"EXISTS") => Some(FanoutKind::SumInteger),
+        // moon#962. `TOUCH` is the one member of that family whose reply is a
+        // pure per-key sum, so it fans out instead of being refused — exactly
+        // `EXISTS`'s shape, and it reaches `coordinate_multi_del_or_exists`
+        // unchanged on the non-batch path.
+        //
+        // **It is also the only one that MAY be added here.** The `args` guard
+        // above accepts any argv of bulk strings, and the split then hashes
+        // EVERY argument as a key. `TOUCH`'s argv really is all keys. The
+        // other twelve are not: `ZDIFF 2 k1 k2` carries the numkeys literal
+        // `"2"` at `args[0]` — a bulk string that passes the guard and would
+        // be hashed as a key name — and `LMPOP`/`ZMPOP` additionally carry a
+        // trailing `LEFT`/`MIN`. A "harmless-looking" arm for any of them
+        // would silently route parts of the command to a shard chosen by
+        // hashing the string "2". Anything with a numkeys count, a direction
+        // token or an option keyword needs a key-position-aware split, which
+        // this function does not have.
+        (5, b't') if cmd.eq_ignore_ascii_case(b"TOUCH") => Some(FanoutKind::SumInteger),
         _ => None,
     }
 }
@@ -2081,17 +2098,69 @@ pub(crate) const CROSS_SHARD_WRITE_ERROR: &[u8] =
 ///   entry points (`blocking::immediate_scan`, `blocking::wakeup`) that this
 ///   pre-routing guard cannot see. Two overlapping guards for one family would
 ///   be worse than one complete one.
-/// * `ZDIFFSTORE` sat in this list as "not implemented, so nothing to
-///   misplace" until moon#959 implemented it; it moved INTO the family
-///   below in the same change, exactly as `GEORADIUS`/`GEORADIUSBYMEMBER`
-///   did when moon#645 gave them a `STORE`/`STOREDIST` clause. The
-///   `tests/two_key_write_cross_shard.rs::t2k4` tripwire is what forces
-///   that migration.
-/// * The read-only multi-key commands (`SINTER`, `SUNION`, `SDIFF`, `ZDIFF`,
-///   `ZINTER`, `ZUNION`, `ZINTERCARD`, `SINTERCARD`, `LCS`, `PFCOUNT`,
-///   `TOUCH`, `LMPOP`, `ZMPOP`) — same routing rule, but the consequence is a
-///   silently wrong ANSWER, never destroyed data. A separate decision with a
-///   different blast radius; see the PR body.
+/// * `TOUCH` — the one member of the moon#962 family that is genuinely
+///   per-key decomposable. It is in `is_multi_key_command` and
+///   [`splittable_read_kind`], so it FANS OUT and sums, exactly like `EXISTS`.
+///   Erroring on it would be gratuitous.
+///
+/// # moon#962 — and the comment that used to sit here
+///
+/// This paragraph read: "the read-only multi-key commands (`SINTER` … `LMPOP`,
+/// `ZMPOP`) — same routing rule, but the consequence is a silently wrong
+/// ANSWER, never destroyed data."
+///
+/// The second half was **false**, and it is what kept the family out of the
+/// guard for a release. `LMPOP` and `ZMPOP` are `flags: W`
+/// (`src/command/metadata.rs`), `src/acl/keyspec.rs` maps both to
+/// `vec0(Write)`, and `list_write::lmpop` walks the keys in argv order,
+/// `continue`ing past any whose length reads `0`. A REMOTE key reads `0`, so
+/// the priority scan proceeds to a key the command is defined never to reach,
+/// pops from it, and acks. Measured at `--shards 4` against redis 8.6.1:
+///
+/// ```text
+/// LMPOP 3 {t1}a {t2}b {t7}c LEFT   ({t1}a absent AND the routing key,
+///                                   {t2}b REMOTE non-empty, {t7}c LOCAL non-empty)
+/// redis 8.6.1     -> {t2}b B1   {t2}b=[B2]     {t7}c=[C1 C2] untouched
+/// moon --shards 4 -> {t7}c C1   {t2}b=[B1 B2]  {t7}c=[C2]     <-- POPPED THE WRONG KEY
+/// ```
+///
+/// That is a misdirected DESTRUCTIVE operation, not a wrong answer: an element
+/// left a key nobody named, and the client was told it came from another one.
+/// It needs THREE keys — with two, the routing key is always local and the
+/// scan degrades to a benign nil — which is why every existing probe missed it
+/// (`route_probe` in `scripts/test-consistency.sh` substitutes a single `%K`,
+/// and one key cannot span shards).
+///
+/// The other eleven are wrong ANSWERS, each in its own direction: `SDIFF`/
+/// `ZDIFF` return EXTRA members the remote operand should have subtracted,
+/// `SINTER`/`ZINTER`/`*CARD` empty or `0`, `SUNION`/`ZUNION` a short set (and
+/// `ZUNION` wrong SCORES), `LCS` empty, `PFCOUNT` an undercount.
+///
+/// All twelve fail closed here rather than fanning out. Fan-out is four
+/// different merge kinds, three of them needing whole operand SETS moved to
+/// the origin, and the MPOP pair has no split at all — a key's emptiness is
+/// only knowable on its owner, and "first non-empty in argv order" is a global
+/// property of the key vector. A later PR may remove any single command from
+/// this list once it merges properly; each such change removes an error and
+/// cannot regress correctness, which is the direction that is safe to defer.
+///
+/// # moon#959 — `ZDIFFSTORE` is IN the family, and used not to be
+///
+/// This block used to carry a `ZDIFFSTORE` bullet in the EXCLUDED list above,
+/// reading "not implemented in moon (unknown command), so there is no write to
+/// misplace". moon#959 implemented it, so that sentence is now false and the
+/// bullet is gone: `ZDIFFSTORE dst numkeys src ...` routes on `dst` and reads
+/// every source, the identical shape to `ZUNIONSTORE`/`ZINTERSTORE`. It is
+/// matched in the `(10, b'z')` arm below, which it SHARES with `ZINTERCARD` —
+/// same length, same first byte, so an arm that names only one of them
+/// silently drops the other.
+///
+/// `GEORADIUS`/`GEORADIUSBYMEMBER` made the same trip when moon#645 gave them
+/// a `STORE`/`STOREDIST` clause. The tripwire that forces the migration is
+/// `tests/two_key_write_cross_shard.rs::t2k4`, and the measured cost of
+/// skipping it is in `t2k1`: with the `ZDIFFSTORE` spelling removed from the
+/// arm below and everything else in place, 12 of 180 placements at
+/// `--shards 4` ack `ZDIFFSTORE` while the destination lands nowhere.
 ///
 /// Matched on `(len, first byte)` first so a single-key command falls through
 /// after one integer compare and never reaches the key walk.
@@ -2103,11 +2172,13 @@ fn touches_a_key_it_did_not_route_on(cmd: &[u8]) -> bool {
     match (len, cmd[0] | 0x20) {
         (6, b'r') => cmd.eq_ignore_ascii_case(b"RENAME"),
         (8, b'r') => cmd.eq_ignore_ascii_case(b"RENAMENX"),
-        (5, b's') => cmd.eq_ignore_ascii_case(b"SMOVE"),
+        (5, b's') => cmd.eq_ignore_ascii_case(b"SMOVE") || cmd.eq_ignore_ascii_case(b"SDIFF"),
         // `SORT src ... STORE dst`. Without a STORE clause the walker reports
         // one key and the check is a no-op, so no read-only SORT is affected.
         (4, b's') => cmd.eq_ignore_ascii_case(b"SORT"),
-        (10, b's') => cmd.eq_ignore_ascii_case(b"SDIFFSTORE"),
+        (10, b's') => {
+            cmd.eq_ignore_ascii_case(b"SDIFFSTORE") || cmd.eq_ignore_ascii_case(b"SINTERCARD")
+        }
         (11, b's') => {
             cmd.eq_ignore_ascii_case(b"SINTERSTORE") || cmd.eq_ignore_ascii_case(b"SUNIONSTORE")
         }
@@ -2116,10 +2187,33 @@ fn touches_a_key_it_did_not_route_on(cmd: &[u8]) -> bool {
                 || cmd.eq_ignore_ascii_case(b"ZUNIONSTORE")
                 || cmd.eq_ignore_ascii_case(b"ZINTERSTORE")
         }
-        // `ZDIFFSTORE dst numkeys src ...` (moon#959): routed on `dst`, reads
-        // every source — the same shape as its two siblings above.
-        (10, b'z') => cmd.eq_ignore_ascii_case(b"ZDIFFSTORE"),
-        (7, b'p') => cmd.eq_ignore_ascii_case(b"PFMERGE"),
+        (7, b'p') => cmd.eq_ignore_ascii_case(b"PFMERGE") || cmd.eq_ignore_ascii_case(b"PFCOUNT"),
+        // ---- moon#962: the multi-key READS, plus the two that MUTATE ------
+        //
+        // Single-key invocations of every name below are unaffected: the
+        // walker reports one key and one key cannot disagree with itself, so
+        // `SINTER k`, `ZDIFF 1 k` and `PFCOUNT k` never reach a refusal. Only
+        // a genuinely spanning key set is refused, and a `{hash}` tag
+        // collapses it back onto one shard.
+        //
+        // `LMPOP`/`ZMPOP` sit here rather than in a later PR because leaving
+        // them behind would ship a partial fix over a live wrong-MUTATION
+        // path — strictly worse than either endpoint. See the family doc
+        // above for the measured pop.
+        (5, b'l') => cmd.eq_ignore_ascii_case(b"LMPOP"),
+        (3, b'l') => cmd.eq_ignore_ascii_case(b"LCS"),
+        (5, b'z') => cmd.eq_ignore_ascii_case(b"ZMPOP") || cmd.eq_ignore_ascii_case(b"ZDIFF"),
+        (6, b's') => cmd.eq_ignore_ascii_case(b"SINTER") || cmd.eq_ignore_ascii_case(b"SUNION"),
+        (6, b'z') => cmd.eq_ignore_ascii_case(b"ZINTER") || cmd.eq_ignore_ascii_case(b"ZUNION"),
+        // One arm, two unrelated additions: `ZINTERCARD` is a moon#962
+        // multi-key READ, `ZDIFFSTORE` a moon#959 two-key WRITE routed on its
+        // destination. They collide on `(10, b'z')`, so naming only one of
+        // them here silently drops the other from the guard — for
+        // `ZDIFFSTORE` that is the moon#592 misdirected write, measured in
+        // `t2k1`. Keep both spellings.
+        (10, b'z') => {
+            cmd.eq_ignore_ascii_case(b"ZINTERCARD") || cmd.eq_ignore_ascii_case(b"ZDIFFSTORE")
+        }
         (14, b'g') => cmd.eq_ignore_ascii_case(b"GEOSEARCHSTORE"),
         // `GEORADIUS src ... STORE|STOREDIST dst` (moon#645). Without the
         // clause the walker reports one key and this check is a no-op, so no
@@ -2286,6 +2380,15 @@ pub(crate) fn is_multi_key_command(cmd: &[u8], args: &[Frame]) -> bool {
         (3, b'd') => args.len() > 1 && cmd.eq_ignore_ascii_case(b"DEL"),
         (6, b'u') => args.len() > 1 && cmd.eq_ignore_ascii_case(b"UNLINK"),
         (6, b'e') => args.len() > 1 && cmd.eq_ignore_ascii_case(b"EXISTS"),
+        // moon#962: TOUCH is EXISTS's twin — a pure per-key integer sum, and
+        // the only member of that family that fans out instead of earning a
+        // CROSSSLOT. Admitting it here is what lets `multikey_placement` be
+        // consulted at all; without this line `splittable_read_kind`'s TOUCH
+        // arm is unreachable and the command would still be routed by its
+        // first key alone. `coordinate_multi_del_or_exists` already handles it
+        // on the non-batch path (it groups by owner and sums, and TOUCH
+        // updates access time only — never AOF-logged, like Redis).
+        (5, b't') => args.len() > 1 && cmd.eq_ignore_ascii_case(b"TOUCH"),
         // BITOP <op> dest src...: dest + sources can live on different shards.
         (5, b'b') => args.len() >= 3 && cmd.eq_ignore_ascii_case(b"BITOP"),
         // COPY src dst [REPLACE]: src and dst can live on different shards.
@@ -4657,6 +4760,12 @@ mod cross_shard_write_tests {
         ("ZRANGESTORE", &["{d}", "{s}", "0", "-1"]),
         ("ZUNIONSTORE", &["{d}", "1", "{s}"]),
         ("ZINTERSTORE", &["{d}", "1", "{s}"]),
+        // moon#959 implemented ZDIFFSTORE. Until it did, the test below
+        // asserted the OPPOSITE — that the guard must not claim it — because
+        // an unimplemented command has no write to misplace. It shares the
+        // `(10, b'z')` arm with `ZINTERCARD`, so this row is what fails if a
+        // future edit narrows that arm back to one spelling.
+        ("ZDIFFSTORE", &["{d}", "1", "{s}"]),
         ("PFMERGE", &["{d}", "{s}"]),
         (
             "GEOSEARCHSTORE",
@@ -4804,13 +4913,20 @@ mod cross_shard_write_tests {
                 "{cmd} belongs to moon#570, not here"
             );
         }
-        // Read-only twins: same routing rule, different (wrong-answer) defect.
-        for cmd in ["SINTER", "SUNION", "SDIFF", "PFCOUNT", "LCS", "TOUCH"] {
-            assert!(
-                cross_shard_multikey_rejection(cmd.as_bytes(), &two, N).is_none(),
-                "{cmd} is read-only and out of scope for moon#592"
-            );
-        }
+        // moon#962 moved `SINTER`/`SUNION`/`SDIFF`/`PFCOUNT`/`LCS` and the
+        // rest of that family INTO the guard; they are asserted in
+        // `multikey_read_family_tests` below. `TOUCH` is the one that stayed
+        // out, because it fans out per key — a CROSSSLOT for it would be a
+        // regression, so the exclusion is pinned here.
+        assert!(
+            cross_shard_multikey_rejection(b"TOUCH", &two, N).is_none(),
+            "TOUCH is per-key decomposable and must fan out, never be refused"
+        );
+        // ZDIFFSTORE used to be asserted here as OUT of the family, on the
+        // grounds that an unimplemented command has no write to misplace.
+        // moon#959 implemented it, so it moved INTO `FAMILY` above and is
+        // asserted positively there — the migration the `t2k4` tripwire in
+        // `tests/two_key_write_cross_shard.rs` existed to force.
 
         // A SORT with no STORE clause names one key: nothing to straddle.
         let sort_ro = [bulk(src), bulk("LIMIT"), bulk("0"), bulk("10")];
@@ -4842,6 +4958,238 @@ mod cross_shard_write_tests {
             cross_shard_multikey_rejection(b"RENAME", &[bulk("k"), bulk("k")], 64).is_none(),
             "RENAME k k names one key"
         );
+    }
+}
+
+#[cfg(test)]
+mod multikey_read_family_tests {
+    //! moon#962: the multi-key commands that used to ANSWER — and, for
+    //! `LMPOP`/`ZMPOP`, MUTATE — from one shard's slice.
+    //!
+    //! Shard membership is never assumed: every "far" and "near" key is
+    //! SEARCHED for with the routing hash the server itself uses, so no case
+    //! can pass by accident on a lucky literal.
+
+    use super::{
+        CROSS_SHARD_WRITE_ERROR, MultiKeyPlacement, cross_shard_multikey_rejection,
+        is_multi_key_command, multikey_placement,
+    };
+    use crate::protocol::Frame;
+    use crate::server::conn::fanout::FanoutKind;
+    use crate::shard::dispatch::key_to_shard;
+    use bytes::Bytes;
+
+    const N: usize = 4;
+
+    fn bulk(s: &str) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s.as_bytes()))
+    }
+
+    fn far_from(src: &str) -> String {
+        let owner = key_to_shard(src.as_bytes(), N);
+        (0..1000)
+            .map(|i| format!("mkfar{i}"))
+            .find(|k| key_to_shard(k.as_bytes(), N) != owner)
+            .expect("a key on another shard must exist")
+    }
+
+    fn near_to(src: &str) -> String {
+        let owner = key_to_shard(src.as_bytes(), N);
+        (0..1000)
+            .map(|i| format!("mknear{i}"))
+            .find(|k| key_to_shard(k.as_bytes(), N) == owner)
+            .expect("a key on the same shard must exist")
+    }
+
+    /// The twelve that fail closed, in the argv shape a client sends.
+    /// `{a}` is the routing key, `{b}` the second key, `{c}` the third.
+    ///
+    /// Every numkeys-counted row carries its literal count, because that
+    /// literal is exactly what a naive split would hash as a key name — see
+    /// the trap comment on `splittable_read_kind`.
+    const REFUSED: &[(&str, &[&str])] = &[
+        ("SINTER", &["{a}", "{b}"]),
+        ("SUNION", &["{a}", "{b}"]),
+        ("SDIFF", &["{a}", "{b}"]),
+        ("SINTERCARD", &["2", "{a}", "{b}"]),
+        ("ZDIFF", &["2", "{a}", "{b}"]),
+        ("ZINTER", &["2", "{a}", "{b}"]),
+        ("ZUNION", &["2", "{a}", "{b}"]),
+        ("ZINTERCARD", &["2", "{a}", "{b}"]),
+        ("LCS", &["{a}", "{b}"]),
+        ("PFCOUNT", &["{a}", "{b}"]),
+        ("LMPOP", &["3", "{a}", "{b}", "{c}", "LEFT"]),
+        ("ZMPOP", &["3", "{a}", "{b}", "{c}", "MIN"]),
+    ];
+
+    fn argv(shape: &[&str], a: &str, b: &str, c: &str) -> Vec<Frame> {
+        shape
+            .iter()
+            .map(|p| match *p {
+                "{a}" => bulk(a),
+                "{b}" => bulk(b),
+                "{c}" => bulk(c),
+                lit => bulk(lit),
+            })
+            .collect()
+    }
+
+    /// A key set that spans shards is refused; the same commands co-located,
+    /// or at `--shards 1`, are not.
+    #[test]
+    fn spanning_is_refused_and_co_located_is_not() {
+        let a = "mksrc";
+        let far = far_from(a);
+        let near = near_to(a);
+        for (cmd, shape) in REFUSED {
+            let split = argv(shape, a, &far, &near);
+            assert_eq!(
+                cross_shard_multikey_rejection(cmd.as_bytes(), &split, N),
+                Some(Frame::Error(Bytes::from_static(CROSS_SHARD_WRITE_ERROR))),
+                "{cmd}: a key set spanning shards must be refused, not answered \
+                 from the routed slice"
+            );
+            // Co-located without a tag, by construction.
+            let together = argv(shape, a, &near, &near);
+            assert!(
+                cross_shard_multikey_rejection(cmd.as_bytes(), &together, N).is_none(),
+                "{cmd}: keys that already share a shard must never be refused"
+            );
+            // The documented remedy.
+            let tagged = argv(shape, "{t}:1", "{t}:2", "{t}:3");
+            assert!(
+                cross_shard_multikey_rejection(cmd.as_bytes(), &tagged, N).is_none(),
+                "{cmd}: a {{hash}} tag must collapse the key set"
+            );
+            // One shard: no boundary exists to cross.
+            assert!(
+                cross_shard_multikey_rejection(cmd.as_bytes(), &split, 1).is_none(),
+                "{cmd}: a single-shard server has nothing to refuse"
+            );
+        }
+    }
+
+    /// A SINGLE-key invocation of any of them names one key, and one key
+    /// cannot disagree with itself. `SINTER k` must keep working at any shard
+    /// count — this is the half that stops the guard over-reaching.
+    #[test]
+    fn single_key_invocations_are_never_refused() {
+        let a = "mksrc";
+        let one: &[(&str, &[&str])] = &[
+            ("SINTER", &["{a}"]),
+            ("SUNION", &["{a}"]),
+            ("SDIFF", &["{a}"]),
+            ("SINTERCARD", &["1", "{a}"]),
+            ("ZDIFF", &["1", "{a}"]),
+            ("ZINTER", &["1", "{a}"]),
+            ("ZUNION", &["1", "{a}"]),
+            ("ZINTERCARD", &["1", "{a}"]),
+            ("PFCOUNT", &["{a}"]),
+            ("LMPOP", &["1", "{a}", "LEFT"]),
+            ("ZMPOP", &["1", "{a}", "MIN"]),
+        ];
+        for (cmd, shape) in one {
+            let args = argv(shape, a, a, a);
+            assert!(
+                cross_shard_multikey_rejection(cmd.as_bytes(), &args, N).is_none(),
+                "{cmd} with one key names one shard and must not be refused"
+            );
+        }
+    }
+
+    /// A malformed argv must still earn its own arity/syntax error rather than
+    /// a misleading CROSSSLOT that sends the client chasing hash tags.
+    #[test]
+    fn malformed_argvs_keep_their_own_answers() {
+        let a = "mksrc";
+        let far = far_from(a);
+        let cases: &[(&str, Vec<Frame>)] = &[
+            // numkeys larger than the argv
+            ("ZDIFF", vec![bulk("99"), bulk(a), bulk(&far)]),
+            // numkeys is not a number
+            ("ZINTERCARD", vec![bulk("banana"), bulk(a), bulk(&far)]),
+            // arity: LCS needs two keys
+            ("LCS", vec![bulk(a)]),
+            // a key position holding a non-string
+            ("SINTER", vec![bulk(a), Frame::Integer(7)]),
+            // LMPOP with a count the argv cannot satisfy
+            ("LMPOP", vec![bulk("4"), bulk(a), bulk(&far)]),
+        ];
+        for (cmd, args) in cases {
+            assert!(
+                cross_shard_multikey_rejection(cmd.as_bytes(), args, N).is_none(),
+                "{cmd} {args:?}: a malformed argv must keep its own error"
+            );
+        }
+    }
+
+    /// `TOUCH` is the exception, and both halves of its treatment are pinned.
+    ///
+    /// The correctness half is `is_multi_key_command`: without it the command
+    /// routes by its first key and undercounts (measured `1` where redis
+    /// answered `2`, and removing this arm alone turns 12 of 12 `TOUCH`
+    /// placements in `tests/multikey_read_cross_shard.rs` red). The batching
+    /// half is `splittable_read_kind`, which lets a spanning `TOUCH` join the
+    /// slotted pipeline batch instead of cutting it — the same treatment
+    /// `EXISTS` already gets.
+    #[test]
+    fn touch_fans_out_instead_of_being_refused() {
+        let a = "mksrc";
+        let far = far_from(a);
+        let near = near_to(a);
+        let spanning = [bulk(a), bulk(&far)];
+
+        assert!(
+            cross_shard_multikey_rejection(b"TOUCH", &spanning, N).is_none(),
+            "TOUCH is per-key decomposable; refusing it would be gratuitous"
+        );
+        assert!(
+            is_multi_key_command(b"TOUCH", &spanning),
+            "TOUCH must reach the multi-key path, or it is routed by its first \
+             key alone and undercounts"
+        );
+        assert_eq!(
+            multikey_placement(b"TOUCH", &spanning, N, false),
+            MultiKeyPlacement::Fanout(FanoutKind::SumInteger),
+            "a spanning TOUCH is split per owner and summed"
+        );
+        // Co-located: ordinary routing slots the whole command, no fan-out.
+        let together = [bulk(a), bulk(&near)];
+        assert!(
+            matches!(
+                multikey_placement(b"TOUCH", &together, N, false),
+                MultiKeyPlacement::Slotted(_)
+            ),
+            "a co-located TOUCH is slotted, not split"
+        );
+        // One key stays on the single-key fast path.
+        assert!(
+            !is_multi_key_command(b"TOUCH", &[bulk(a)]),
+            "TOUCH with one key is a single-key command"
+        );
+    }
+
+    /// The numkeys-literal trap, asserted rather than only commented.
+    ///
+    /// `splittable_read_kind` walks EVERY argument as a key, so an arm for any
+    /// command carrying a count, a direction token or an option keyword would
+    /// hash those literals as key names. None of the twelve may ever answer
+    /// `Some` there.
+    #[test]
+    fn no_command_with_a_non_key_argument_is_splittable() {
+        let a = "mksrc";
+        let far = far_from(a);
+        for (cmd, shape) in REFUSED {
+            let args = argv(shape, a, &far, &far);
+            assert!(
+                matches!(
+                    multikey_placement(cmd.as_bytes(), &args, N, false),
+                    MultiKeyPlacement::Coordinator { .. }
+                ),
+                "{cmd} carries a non-key argument ({shape:?}) and must never be \
+                 split — a split would hash that literal as a key name"
+            );
+        }
     }
 }
 

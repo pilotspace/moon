@@ -2433,13 +2433,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // auto-delete paths (which need vector/text stores, separate
                             // ShardSlice fields).
                             let db_count = ctx.shard_databases.db_count();
-                            // Returns Ok((response, sample_latency, dispatch_start)) on
-                            // success or Err(oom_frame) when eviction fails (caller
-                            // pushes + continues).
-                            type WriteOutcome = Result<
-                                (Frame, bool, Option<std::time::Instant>),
-                                Frame,
-                            >;
+                            // Returns Ok(response) on success or Err(oom_frame) when
+                            // eviction fails (caller pushes + continues). Latency is
+                            // recorded inside `do_write` through the connection's
+                            // `LatencyProbe` (moon#941).
+                            type WriteOutcome = Result<Frame, Frame>;
                             // Takes the whole ShardSlice (not just the Database):
                             // the KV undo-log capture below records write intents on
                             // s.kv_write_intents, and re-entering with_shard from
@@ -2597,10 +2595,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 }
 
                                 db.refresh_now_from_cache(&ctx.cached_clock);
-                                conn.cmd_counter = conn.cmd_counter.wrapping_add(1);
-                                let sample_latency = (conn.cmd_counter & 0xF) == 0;
-                                let dispatch_start = sample_latency.then(std::time::Instant::now);
-                                let result = dispatch(db, cmd, cmd_args, &mut conn.selected_db, db_count);
+                                let mut probe = crate::admin::metrics_setup::LatencyProbe::new(
+                                    &mut conn.sampler,
+                                    &mut conn.cached_metrics,
+                                    peer_addr.as_bytes(),
+                                    conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                );
+                                let result = probe.observe(cmd, crate::admin::slowlog::SlowlogArgv::from(&frame), || {
+                                    dispatch(db, cmd, cmd_args, &mut conn.selected_db, db_count)
+                                });
+                                drop(probe);
                                 let response = match result {
                                     DispatchResult::Response(f) => f,
                                     DispatchResult::Quit(f) => { should_quit = true; f }
@@ -2631,44 +2635,20 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         cmd_args,
                                     );
                                 }
-                                Ok((response, sample_latency, dispatch_start))
+                                Ok(response)
                             };
 
                             // Unconditional slice path: ShardSlice is always initialized.
                             let write_outcome: WriteOutcome =
                                 crate::shard::slice::with_shard(|s| do_write(s, &mut conn));
 
-                            let (mut response, _sample_latency, dispatch_start): (Frame, bool, Option<std::time::Instant>) =
-                                match write_outcome {
-                                    Ok(t) => t,
-                                    Err(oom_frame) => {
-                                        responses.push(oom_frame);
-                                        continue;
-                                    }
-                                };
-                            if let Ok(cmd_str) = std::str::from_utf8(cmd) {
-                                if let Some(start) = dispatch_start {
-                                    let elapsed_us = start.elapsed().as_micros() as u64;
-                                    crate::admin::metrics_setup::record_command_cached(
-                                        cmd_str,
-                                        elapsed_us,
-                                        &mut conn.cached_metrics,
-                                    );
-                                    if let Frame::Array(ref args) = frame {
-                                        crate::admin::metrics_setup::global_slowlog().maybe_record(
-                                            elapsed_us,
-                                            args.as_slice(),
-                                            peer_addr.as_bytes(),
-                                            conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
-                                        );
-                                    }
-                                } else {
-                                    crate::admin::metrics_setup::record_command_no_latency_cached(
-                                        cmd_str,
-                                        &mut conn.cached_metrics,
-                                    );
+                            let mut response: Frame = match write_outcome {
+                                Ok(t) => t,
+                                Err(oom_frame) => {
+                                    responses.push(oom_frame);
+                                    continue;
                                 }
-                            }
+                            };
                             if matches!(response, Frame::Error(_)) {
                                 if let Ok(cmd_str) = std::str::from_utf8(cmd) {
                                     crate::admin::metrics_setup::record_command_error_cached(
@@ -2923,12 +2903,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // READ PATH: unconditional slice path — ShardSlice is always initialized.
                             let now_ms = ctx.cached_clock.ms();
                             let db_count = ctx.shard_databases.db_count();
-                            conn.cmd_counter = conn.cmd_counter.wrapping_add(1);
-                            let sample_latency = (conn.cmd_counter & 0xF) == 0;
-                            let dispatch_start = sample_latency.then(std::time::Instant::now);
-                            let result = crate::shard::slice::with_shard_db_read(
-                                conn.selected_db,
-                                |db| {
+                            let cur_db = conn.selected_db;
+                            let mut probe = crate::admin::metrics_setup::LatencyProbe::new(
+                                &mut conn.sampler,
+                                &mut conn.cached_metrics,
+                                peer_addr.as_bytes(),
+                                conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                            );
+                            let result = probe.observe(cmd, crate::admin::slowlog::SlowlogArgv::from(&frame), || {
+                                crate::shard::slice::with_shard_db_read(cur_db, |db| {
                                     dispatch_read(
                                         db,
                                         cmd,
@@ -2937,31 +2920,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         &mut conn.selected_db,
                                         db_count,
                                     )
-                                },
-                            );
-                            if let Ok(cmd_str) = std::str::from_utf8(cmd) {
-                                if let Some(start) = dispatch_start {
-                                    let elapsed_us = start.elapsed().as_micros() as u64;
-                                    crate::admin::metrics_setup::record_command_cached(
-                                        cmd_str,
-                                        elapsed_us,
-                                        &mut conn.cached_metrics,
-                                    );
-                                    if let Frame::Array(ref args) = frame {
-                                        crate::admin::metrics_setup::global_slowlog().maybe_record(
-                                            elapsed_us,
-                                            args.as_slice(),
-                                            peer_addr.as_bytes(),
-                                            conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
-                                        );
-                                    }
-                                } else {
-                                    crate::admin::metrics_setup::record_command_no_latency_cached(
-                                        cmd_str,
-                                        &mut conn.cached_metrics,
-                                    );
-                                }
-                            }
+                                })
+                            });
+                            drop(probe);
                             let response = match result {
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => { should_quit = true; f }
