@@ -4570,89 +4570,6 @@ done
 acl_reset_user
 both DEL n978:k n978:vic n978:lst n978:dst n978:pol
 # END acl-category-section -- moon#978/#980
-# ===========================================================================
-# moon#981: ACL SAVE must write the base polarity the table holds in memory
-# ===========================================================================
-# `CommandPermissions::Specific` carries `base_allow` (moon#971), but the
-# serializer behind ACL SAVE / ACL LIST / ACL GETUSER dropped it and emitted
-# `-@all` for EVERY Specific user. A `+@all -flushall` service account was
-# written to disk as `-@all -flushall` and came back from ACL LOAD (or a
-# restart with --aclfile) able to run NOTHING. It fails closed, so it is an
-# outage rather than an escalation -- and a silent one: SAVE and LOAD both
-# answered +OK.
-#
-# Both servers are restarted with an --aclfile: ACL SAVE refuses without one
-# on both engines, and redis will not CONFIG SET it at runtime. Runs LAST for
-# that reason -- nothing downstream should inherit these servers.
-#
-# The `-@all +get +set` user is the in-run control: its base polarity was
-# already written correctly, so its rows are green on the pre-fix binary and
-# prove the section discriminates rather than failing on its own setup.
-echo "=== moon#981: ACL SAVE / ACL LOAD keeps a '+@all -<cmd>' user ==="
-
-F981_DIR=$(mktemp -d /tmp/moon-consistency-acl.XXXXXX)
-F981_REDIS_ACL="$F981_DIR/redis-users.acl"
-F981_MOON_ACL="$F981_DIR/moon-users.acl"
-: > "$F981_REDIS_ACL"
-: > "$F981_MOON_ACL"
-
-# The main redis has no aclfile; replace it with one that does.
-if [[ -n "${REDIS_PID:-}" ]]; then
-    kill "$REDIS_PID" 2>/dev/null || true
-    wait "$REDIS_PID" 2>/dev/null || true
-fi
-pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
-sleep 0.3
-redis-server --port "$PORT_REDIS" --save "" --appendonly no --loglevel warning \
-    --aclfile "$F981_REDIS_ACL" --daemonize no &>/dev/null &
-REDIS_PID=$!
-
-stop_moon
-new_moon_dir
-"$RUST_BINARY" --port "$PORT_RUST" --shards "$SHARDS" --dir "$MOON_DATA_DIR" \
-    --aclfile "$F981_MOON_ACL" &>/dev/null &
-RUST_PID=$!
-
-if wait_for_port "$PORT_REDIS" && wait_for_port "$PORT_RUST"; then
-    # The `commands` value of ACL GETUSER: the line after the `commands` key.
-    f981_commands() {
-        redis-cli -t 5 -p "$1" ACL GETUSER rt 2>&1 | tr -d '\r' \
-            | awk 'f { print; exit } /^commands$/ { f = 1 }' || true
-    }
-    # The command-rule tail of the user's line in the ACL file. Redis also
-    # writes `sanitize-payload`, which moon does not, so only the rules from
-    # the `@all` token onward are compared.
-    f981_file_rules() {
-        grep '^user rt ' "$1" | grep -o '[+-]@all.*' || true
-    }
-
-    for f981_spec in "+@all -flushall" "-@all +get +set"; do
-        read -r -a f981_rules <<< "$f981_spec"
-        both ACL DELUSER rt
-        both ACL SETUSER rt on '>pw' '~*' '&*' "${f981_rules[@]}"
-
-        assert_eq "moon#981 '$f981_spec' GETUSER commands before SAVE" \
-            "$(f981_commands "$PORT_REDIS")" "$(f981_commands "$PORT_RUST")"
-        assert_both "moon#981 '$f981_spec' ACL SAVE" ACL SAVE
-        assert_eq "moon#981 '$f981_spec' rules written to the ACL file" \
-            "$(f981_file_rules "$F981_REDIS_ACL")" "$(f981_file_rules "$F981_MOON_ACL")"
-        assert_both "moon#981 '$f981_spec' ACL LOAD" ACL LOAD
-        assert_eq "moon#981 '$f981_spec' GETUSER commands after LOAD" \
-            "$(f981_commands "$PORT_REDIS")" "$(f981_commands "$PORT_RUST")"
-        # What the user can actually DO after the reload -- the outage itself.
-        assert_both "moon#981 '$f981_spec' GET as rt after LOAD" \
-            --user rt --pass pw --no-auth-warning GET f981:k
-        assert_both "moon#981 '$f981_spec' HSET as rt after LOAD" \
-            --user rt --pass pw --no-auth-warning HSET f981:h f v
-        assert_both "moon#981 '$f981_spec' FLUSHALL as rt after LOAD" \
-            --user rt --pass pw --no-auth-warning FLUSHALL
-    done
-    both ACL DELUSER rt
-else
-    FAIL=$((FAIL + 1))
-    echo "  FAIL: moon#981 servers with --aclfile did not start -- rows did not run"
-fi
-rm -rf "$F981_DIR"
 
 # ===========================================================================
 # BEGIN acl-rule-token-section -- moon#979. Self-contained: reuses the
@@ -4752,7 +4669,9 @@ assert_acl_both_denied "#979 %r~n979:r denies SET" SET n979:r 1
 
 # --- rejected tokens: byte-for-byte error text, and NOTHING applied --------
 acl979_full
-for acl979_tok in bogus BOGUS @read nocommand ')' '+get|' ' on'; do
+# `éx`: a multi-byte FIRST character crashed #998's tokenizer (byte slice
+# inside `é`, shard panic, whole-server abort). Redis: Syntax error.
+for acl979_tok in bogus BOGUS @read nocommand ')' '+get|' ' on' 'éx'; do
     assert_acl_setuser "#979 '$acl979_tok' is a syntax error" "$acl979_tok"
 done
 for acl979_tok in +bogus -bogus -flushal + - '+|get' '+config|bogus'; do
@@ -4810,10 +4729,195 @@ else
     echo "    actual:   $(echo "$acl979_m" | head -c 200)"
 fi
 
+# --- moon#999: credential fail-open ------------------------------------------
+# `>pw` / `#hash` on a `nopass` user must REQUIRE that password. moon left
+# `nopass` set, so ANY password authenticated -- the standard "provisioned
+# nopass for bootstrap, now give it a real password" step left the account
+# open. Probed through AUTH (redis-cli --user/--pass) AND `HELLO 3 AUTH`, the
+# two ways a client authenticates. Only the refusal is compared for HELLO: a
+# successful HELLO reply carries server-identity fields that differ by design.
 acl_reset_user
-both DEL n979:k n979:x n979:y n979:r
+both ACL SETUSER "$ACL_U" on nopass '~*' '&*' +@all
+assert_acl_setuser "#999 nopass then >pw reply" '>pw'
+acl979_r=$(acl_as "$PORT_REDIS" "$ACL_U" totallywrong PING)
+acl979_m=$(acl_as "$PORT_RUST"  "$ACL_U" totallywrong PING)
+assert_eq "#999 nopass then >pw: a wrong password is refused (AUTH)" "$acl979_r" "$acl979_m"
+acl979_r=$(redis-cli -p "$PORT_REDIS" HELLO 3 AUTH "$ACL_U" totallywrong 2>&1 | head -1) || true
+acl979_m=$(redis-cli -p "$PORT_RUST"  HELLO 3 AUTH "$ACL_U" totallywrong 2>&1 | head -1) || true
+assert_eq "#999 nopass then >pw: a wrong password is refused (HELLO AUTH)" "$acl979_r" "$acl979_m"
+assert_acl_probe "#999 nopass then >pw: the password itself authenticates" PING
+# Same through a pre-hashed credential: sha256("pw").
+acl_reset_user
+both ACL SETUSER "$ACL_U" on nopass '~*' '&*' +@all
+assert_acl_setuser "#999 nopass then #hash reply" \
+    '#30c952fab122c3f9759f02a6d95c3758b246b4fee239957b2d4fee46e26170c4'
+acl979_r=$(acl_as "$PORT_REDIS" "$ACL_U" totallywrong PING)
+acl979_m=$(acl_as "$PORT_RUST"  "$ACL_U" totallywrong PING)
+assert_eq "#999 nopass then #hash: a wrong password is refused" "$acl979_r" "$acl979_m"
+assert_acl_probe "#999 nopass then #hash: the hashed password authenticates" PING
+# The rotation case with HELLO: >oldpw, nopass, >pw -- `oldpw` must be dead.
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>oldpw' '~*' '&*' +@all
+assert_acl_setuser "#999 rotation through nopass reply" nopass '>pw'
+acl979_r=$(redis-cli -p "$PORT_REDIS" HELLO 3 AUTH "$ACL_U" oldpw 2>&1 | head -1) || true
+acl979_m=$(redis-cli -p "$PORT_RUST"  HELLO 3 AUTH "$ACL_U" oldpw 2>&1 | head -1) || true
+assert_eq "#999 rotation through nopass: the old password is refused (HELLO AUTH)" "$acl979_r" "$acl979_m"
+
+# --- moon#970: key/channel selectors render as redis renders them -----------
+# `allkeys`/`~*` and `allchannels`/`&*` REPLACE the list in redis, so
+# `~a %R~b allkeys` reports `~*`; moon appended and reported `~a %R~b ~*`.
+# `%RW~` is read+write and reports as `~`. Compared through GETUSER's `keys`
+# and `channels` fields -- the ACL LIST line itself differs by
+# `sanitize-payload`/`resetchannels`, which moon does not emit.
+acl979_field() {
+    redis-cli -p "$1" ACL GETUSER "$ACL_U" 2>&1 | tr -d '\r' \
+        | awk -v f="$2" 'g { print; exit } $0 == f { g = 1 }' || true
+}
+acl_reset_user
+assert_acl_setuser "#970 ~a %R~b allkeys &c allchannels reply" \
+    on '>pw' '~n979:a' '%R~n979:b' allkeys '&n979:c' allchannels +@all
+assert_eq "#970 allkeys replaces the key list (GETUSER keys)" \
+    "$(acl979_field "$PORT_REDIS" keys)" "$(acl979_field "$PORT_RUST" keys)"
+assert_eq "#970 allchannels replaces the channel list (GETUSER channels)" \
+    "$(acl979_field "$PORT_REDIS" channels)" "$(acl979_field "$PORT_RUST" channels)"
+acl_reset_user
+assert_acl_setuser "#970 %RW~ %r~ %W~ reply" \
+    on '>pw' '%RW~n979:rw*' '%r~n979:r*' '%W~n979:w*' +@all
+assert_eq "#970 key selectors render as redis does (GETUSER keys)" \
+    "$(acl979_field "$PORT_REDIS" keys)" "$(acl979_field "$PORT_RUST" keys)"
+assert_acl_probe       "#970 %R~ allows GET"  GET n979:r1
+assert_acl_both_denied "#970 %R~ denies SET"  SET n979:r1 v
+assert_acl_probe       "#970 %W~ allows SET"  SET n979:w1 v
+assert_acl_both_denied "#970 %W~ denies GET"  GET n979:w1
+assert_acl_probe       "#970 %RW~ allows SET" SET n979:rw1 v
+assert_acl_probe       "#970 %RW~ allows GET" GET n979:rw1
+# `totalnonsense` is #970's own example of a non-rule that answered +OK.
+assert_acl_setuser "#970 totalnonsense is a syntax error" totalnonsense
+
+acl_reset_user
+both DEL n979:k n979:x n979:y n979:r n979:w1 n979:rw1
 ACL_U="n978:probe"
 # END acl-rule-token-section -- moon#979
+
+# ===========================================================================
+# moon#981: ACL SAVE must write the base polarity the table holds in memory
+# ===========================================================================
+# `CommandPermissions::Specific` carries `base_allow` (moon#971), but the
+# serializer behind ACL SAVE / ACL LIST / ACL GETUSER dropped it and emitted
+# `-@all` for EVERY Specific user. A `+@all -flushall` service account was
+# written to disk as `-@all -flushall` and came back from ACL LOAD (or a
+# restart with --aclfile) able to run NOTHING. It fails closed, so it is an
+# outage rather than an escalation -- and a silent one: SAVE and LOAD both
+# answered +OK.
+#
+# Both servers are restarted with an --aclfile: ACL SAVE refuses without one
+# on both engines, and redis will not CONFIG SET it at runtime. Runs LAST for
+# that reason -- nothing downstream should inherit these servers.
+#
+# The `-@all +get +set` user is the in-run control: its base polarity was
+# already written correctly, so its rows are green on the pre-fix binary and
+# prove the section discriminates rather than failing on its own setup.
+echo "=== moon#981: ACL SAVE / ACL LOAD keeps a '+@all -<cmd>' user ==="
+
+F981_DIR=$(mktemp -d /tmp/moon-consistency-acl.XXXXXX)
+F981_REDIS_ACL="$F981_DIR/redis-users.acl"
+F981_MOON_ACL="$F981_DIR/moon-users.acl"
+: > "$F981_REDIS_ACL"
+: > "$F981_MOON_ACL"
+
+# The main redis has no aclfile; replace it with one that does.
+if [[ -n "${REDIS_PID:-}" ]]; then
+    kill "$REDIS_PID" 2>/dev/null || true
+    wait "$REDIS_PID" 2>/dev/null || true
+fi
+pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
+sleep 0.3
+redis-server --port "$PORT_REDIS" --save "" --appendonly no --loglevel warning \
+    --aclfile "$F981_REDIS_ACL" --daemonize no &>/dev/null &
+REDIS_PID=$!
+
+stop_moon
+new_moon_dir
+"$RUST_BINARY" --port "$PORT_RUST" --shards "$SHARDS" --dir "$MOON_DATA_DIR" \
+    --aclfile "$F981_MOON_ACL" &>/dev/null &
+RUST_PID=$!
+
+if wait_for_port "$PORT_REDIS" && wait_for_port "$PORT_RUST"; then
+    # The `commands` value of ACL GETUSER: the line after the `commands` key.
+    f981_commands() {
+        redis-cli -t 5 -p "$1" ACL GETUSER rt 2>&1 | tr -d '\r' \
+            | awk 'f { print; exit } /^commands$/ { f = 1 }' || true
+    }
+    # The command-rule tail of the user's line in the ACL file. Redis also
+    # writes `sanitize-payload`, which moon does not, so only the rules from
+    # the `@all` token onward are compared.
+    f981_file_rules() {
+        grep '^user rt ' "$1" | grep -o '[+-]@all.*' || true
+    }
+
+    for f981_spec in "+@all -flushall" "-@all +get +set"; do
+        read -r -a f981_rules <<< "$f981_spec"
+        both ACL DELUSER rt
+        both ACL SETUSER rt on '>pw' '~*' '&*' "${f981_rules[@]}"
+
+        assert_eq "moon#981 '$f981_spec' GETUSER commands before SAVE" \
+            "$(f981_commands "$PORT_REDIS")" "$(f981_commands "$PORT_RUST")"
+        assert_both "moon#981 '$f981_spec' ACL SAVE" ACL SAVE
+        assert_eq "moon#981 '$f981_spec' rules written to the ACL file" \
+            "$(f981_file_rules "$F981_REDIS_ACL")" "$(f981_file_rules "$F981_MOON_ACL")"
+        assert_both "moon#981 '$f981_spec' ACL LOAD" ACL LOAD
+        assert_eq "moon#981 '$f981_spec' GETUSER commands after LOAD" \
+            "$(f981_commands "$PORT_REDIS")" "$(f981_commands "$PORT_RUST")"
+        # What the user can actually DO after the reload -- the outage itself.
+        assert_both "moon#981 '$f981_spec' GET as rt after LOAD" \
+            --user rt --pass pw --no-auth-warning GET f981:k
+        assert_both "moon#981 '$f981_spec' HSET as rt after LOAD" \
+            --user rt --pass pw --no-auth-warning HSET f981:h f v
+        assert_both "moon#981 '$f981_spec' FLUSHALL as rt after LOAD" \
+            --user rt --pass pw --no-auth-warning FLUSHALL
+    done
+    both ACL DELUSER rt
+
+    # moon#970/#979/#999 through the same SAVE -> LOAD cycle: every rule
+    # shape this change implements must reload to exactly what redis reloads
+    # it to -- keys, channels AND commands, token order included -- and the
+    # credential fixes must survive the file (a rotated-out password stays
+    # dead, a wrong one stays refused).
+    f970_field() {
+        redis-cli -t 5 -p "$1" ACL GETUSER rk 2>&1 | tr -d '\r' \
+            | awk -v f="$2" 'g { print; exit } $0 == f { g = 1 }' || true
+    }
+    for f970_spec in \
+        "allkeys allchannels allcommands" \
+        "~f970:a %R~f970:b allkeys &f970:c allchannels +@all" \
+        "%RW~f970:rw* %r~f970:r* %W~f970:w* +@all -flushall" \
+        "~* &* +@all nocommands" \
+        "nopass ~* +@all >pw" \
+        "nopass >pw nopass >pw ~* +@all"; do
+        read -r -a f970_rules <<< "$f970_spec"
+        both ACL DELUSER rk
+        both ACL SETUSER rk on '>oldpw' nopass '>pw' "${f970_rules[@]}"
+        for f970_f in keys channels commands; do
+            assert_eq "moon#970 '$f970_spec' GETUSER $f970_f before SAVE" \
+                "$(f970_field "$PORT_REDIS" "$f970_f")" "$(f970_field "$PORT_RUST" "$f970_f")"
+        done
+        assert_both "moon#970 '$f970_spec' ACL SAVE" ACL SAVE
+        assert_both "moon#970 '$f970_spec' ACL LOAD" ACL LOAD
+        for f970_f in keys channels commands; do
+            assert_eq "moon#970 '$f970_spec' GETUSER $f970_f after LOAD" \
+                "$(f970_field "$PORT_REDIS" "$f970_f")" "$(f970_field "$PORT_RUST" "$f970_f")"
+        done
+        for f970_pw in pw oldpw wrong; do
+            assert_both "moon#999 '$f970_spec' AUTH rk $f970_pw after LOAD" \
+                --user rk --pass "$f970_pw" --no-auth-warning PING
+        done
+    done
+    both ACL DELUSER rk
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: moon#981 servers with --aclfile did not start -- rows did not run"
+fi
+rm -rf "$F981_DIR"
 
 echo "============================================"
 echo "  Data Consistency Test Results"

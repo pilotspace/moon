@@ -53,6 +53,13 @@ pub enum AclRuleError {
     /// for.
     #[error("ACL selectors are not supported")]
     SelectorsUnsupported,
+    /// A rule argument that is not valid UTF-8. Redis accepts binary rule
+    /// bytes (a binary `>password`, say); Moon's user record stores rules as
+    /// `String` and cannot represent one. Before #970's fix `ACL SETUSER`
+    /// silently DROPPED such an argument and still answered `OK` -- the same
+    /// "unknown means ignored" hole as the `_ => {}` arm, one layer up.
+    #[error("ACL rules must be valid UTF-8")]
+    NotUtf8,
 }
 
 impl AclRuleError {
@@ -158,44 +165,52 @@ enum Rule<'a> {
 /// looking at the user is rejected here, so a caller that wants to
 /// pre-validate a rule list can do so without cloning anything.
 fn parse_rule(rule: &str) -> Result<Rule<'_>, AclRuleError> {
-    if rule.is_empty() {
+    let Some(prefix) = rule.chars().next() else {
         return Ok(Rule::Noop);
-    }
+    };
     if let Some((_, kw)) = KEYWORDS
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(rule))
     {
         return Ok(Rule::Keyword(*kw));
     }
-    // Every prefix is a single ASCII byte, so `rule[1..]` is a char boundary.
-    let payload = &rule[1..];
-    match rule.as_bytes()[0] {
-        b'>' => Ok(Rule::AddPassword(payload)),
-        b'<' => Ok(Rule::RemovePassword(payload)),
-        b'#' => {
+    // Slice after the first CHARACTER, not the first byte. The rule is
+    // attacker-shaped text (`ACL SETUSER`, an aclfile line): `&rule[1..]` on
+    // `éx` split a multi-byte char, panicked the shard thread and aborted the
+    // whole server. `len_utf8` is always a char boundary; every real prefix is
+    // one ASCII byte, and any other first char falls to `Syntax` below.
+    let payload = &rule[prefix.len_utf8()..];
+    match prefix {
+        '>' => Ok(Rule::AddPassword(payload)),
+        '<' => Ok(Rule::RemovePassword(payload)),
+        '#' => {
             validate_password_hash(payload)?;
             Ok(Rule::AddHash(payload))
         }
-        b'!' => {
+        '!' => {
             validate_password_hash(payload)?;
             Ok(Rule::RemoveHash(payload))
         }
-        b'~' => Ok(Rule::KeyPattern {
+        // Redis treats the literal `~*` / `&*` as the `allkeys` /
+        // `allchannels` flag (it REPLACES the list), not as one more pattern.
+        '~' if payload == "*" => Ok(Rule::Keyword(Keyword::Allkeys)),
+        '~' => Ok(Rule::KeyPattern {
             pattern: payload,
             read: true,
             write: true,
         }),
-        b'%' => parse_key_pattern_flags(payload),
-        b'&' => Ok(Rule::Channel(payload)),
-        b'+' => {
+        '%' => parse_key_pattern_flags(payload),
+        '&' if payload == "*" => Ok(Rule::Keyword(Keyword::Allchannels)),
+        '&' => Ok(Rule::Channel(payload)),
+        '+' => {
             validate_command_rule(payload)?;
             Ok(Rule::Allow(payload))
         }
-        b'-' => {
+        '-' => {
             validate_command_rule(payload)?;
             Ok(Rule::Deny(payload))
         }
-        b'(' => Err(AclRuleError::SelectorsUnsupported),
+        '(' => Err(AclRuleError::SelectorsUnsupported),
         _ => Err(AclRuleError::Syntax),
     }
 }
@@ -392,12 +407,25 @@ fn apply_keyword(user: &mut AclUser, kw: Keyword) -> Result<(), AclRuleError> {
                 denied: HashSet::new(),
             };
         }
-        Keyword::Allkeys => user.key_patterns.push(KeyPattern {
-            pattern: "*".to_string(),
-            read: true,
-            write: true,
-        }),
-        Keyword::Allchannels => user.channel_patterns.push("*".to_string()),
+        // `allkeys` / `~*` and `allchannels` / `&*` REPLACE the list, as in
+        // redis 8.6.1 (`ACLSetSelector` empties it and sets the ALL flag).
+        // `*` read+write is a superset of every other pattern, so dropping
+        // the rest changes no permission -- only what LIST/GETUSER/SAVE
+        // render, which now matches redis (`~a allkeys` -> `~*`, not
+        // `~a ~*`). A line saved by an older moon as `~a ~*` loads to the
+        // identical permission set.
+        Keyword::Allkeys => {
+            user.key_patterns.clear();
+            user.key_patterns.push(KeyPattern {
+                pattern: "*".to_string(),
+                read: true,
+                write: true,
+            });
+        }
+        Keyword::Allchannels => {
+            user.channel_patterns.clear();
+            user.channel_patterns.push("*".to_string());
+        }
         Keyword::Allcommands => return user.allow_command("@all"),
         Keyword::Nocommands => return user.deny_command("@all"),
         Keyword::SanitizePayload | Keyword::SkipSanitizePayload | Keyword::Clearselectors => {}
@@ -2255,6 +2283,68 @@ mod tests {
         );
     }
 
+    /// moon#970: `allkeys` and `~*` REPLACE the key-pattern list in redis
+    /// 8.6.1 (`ACLSetSelector` sets the ALLKEYS flag and empties the list),
+    /// so `~a %R~b allkeys` is rendered by `ACL LIST` as plain `~*`. Moon used
+    /// to append, rendering `~a %R~b ~*` -- the same grant, a different report
+    /// and a different saved line. Same for `allchannels` / `&*`.
+    #[test]
+    fn test_allkeys_and_tilde_star_replace_the_pattern_list() {
+        for all_keys in ["allkeys", "ALLKEYS", "~*"] {
+            let mut user = AclUser::default_deny("v".to_string());
+            for rule in ["~a", "%R~b", all_keys] {
+                apply_rule(&mut user, rule).expect("must apply");
+            }
+            let patterns: Vec<(&str, bool, bool)> = user
+                .key_patterns
+                .iter()
+                .map(|kp| (kp.pattern.as_str(), kp.read, kp.write))
+                .collect();
+            assert_eq!(patterns, vec![("*", true, true)], "after `{all_keys}`");
+        }
+        for all_channels in ["allchannels", "AllChannels", "&*"] {
+            let mut user = AclUser::default_deny("v".to_string());
+            for rule in ["&a", "&b", all_channels] {
+                apply_rule(&mut user, rule).expect("must apply");
+            }
+            assert_eq!(
+                user.channel_patterns,
+                vec!["*".to_string()],
+                "after `{all_channels}`"
+            );
+        }
+    }
+
+    /// Only the literal `~*` / `&*` spelling is the all-keys / all-channels
+    /// flag in redis. A pattern that merely CONTAINS `*` is an ordinary
+    /// pattern and appends, and a pattern AFTER `~*` still appends (redis
+    /// rejects that; moon keeps accepting it so an existing aclfile holding
+    /// `~* ~x` still loads -- see the CHANGELOG).
+    #[test]
+    fn test_only_the_literal_star_pattern_replaces() {
+        let mut user = AclUser::default_deny("v".to_string());
+        for rule in ["~a", "~b*", "%W~*"] {
+            apply_rule(&mut user, rule).expect("must apply");
+        }
+        let names: Vec<&str> = user
+            .key_patterns
+            .iter()
+            .map(|kp| kp.pattern.as_str())
+            .collect();
+        assert_eq!(names, vec!["a", "b*", "*"]);
+
+        let mut user = AclUser::default_deny("v".to_string());
+        for rule in ["~*", "~x"] {
+            apply_rule(&mut user, rule).expect("must apply");
+        }
+        let names: Vec<&str> = user
+            .key_patterns
+            .iter()
+            .map(|kp| kp.pattern.as_str())
+            .collect();
+        assert_eq!(names, vec!["*", "x"]);
+    }
+
     /// Tokens redis accepts that have no effect on moon. They must be
     /// ACCEPTED (every redis `ACL LIST` line carries `sanitize-payload`)
     /// and must change nothing.
@@ -2292,6 +2382,30 @@ mod tests {
             assert_eq!(err, AclRuleError::Syntax, "{rule}");
             assert!(user.unrestricted(), "`{rule}` must not mutate");
         }
+    }
+
+    /// A token whose FIRST character is multi-byte UTF-8. The tokenizer
+    /// sliced `&rule[1..]` before looking at the prefix, and byte 1 of `é` is
+    /// not a char boundary: `ACL SETUSER u on éx` PANICKED the shard thread and
+    /// aborted the whole server (and the same token in an aclfile would have
+    /// crashed every boot). Redis answers `Syntax error`. Multi-byte bytes
+    /// AFTER an ASCII prefix are ordinary payload and must still apply.
+    #[test]
+    fn test_multibyte_first_char_is_a_syntax_error_not_a_panic() {
+        for rule in ["éx", "é", "€", "💥+get", "ü~*", "\u{a0}on"] {
+            let mut user = full_user();
+            let err = apply_rule(&mut user, rule).expect_err(rule);
+            assert_eq!(err, AclRuleError::Syntax, "{rule}");
+            assert!(user.unrestricted(), "`{rule}` must not mutate");
+        }
+        let mut user = AclUser::default_deny("v".to_string());
+        for rule in [">pässwörd", "~kéy:*", "&chän", "%R~ü"] {
+            apply_rule(&mut user, rule).unwrap_or_else(|e| panic!("`{rule}` must apply: {e}"));
+        }
+        assert_eq!(user.passwords, vec![hash_password("pässwörd")]);
+        assert_eq!(user.key_patterns[0].pattern, "kéy:*");
+        assert_eq!(user.key_patterns[1].pattern, "ü");
+        assert_eq!(user.channel_patterns, vec!["chän".to_string()]);
     }
 
     /// `%` flags: case-insensitive, any order, each at most once, `~`

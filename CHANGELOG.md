@@ -32,8 +32,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ERR weight value is not a float`. Infinite weights remain legal. A client
   relying on either form silently doing nothing will now see an error.
 
+- **BEHAVIOUR CHANGE — `ACL SETUSER` now REJECTS rule tokens it used to
+  answer `+OK` for and silently drop** (moon#970, moon#979). The parser ended
+  in `_ => {}`, so a token it did not recognise was ignored while the call
+  succeeded. Each of these now errors with redis's own text and applies
+  NOTHING -- the rule list runs on a copy of the user, committed only if every
+  rule applied, so a rejected call neither creates the user nor keeps the
+  prefix that parsed (`on >pw ~* +@all bogus` used to create the user with
+  `+@all`): an unknown token (`totalnonsense`, `nocommand`, `@read`, `' on'`)
+  -> `Syntax error`; a malformed `%` selector (`%X~k`, `%RR~k`, `%`) ->
+  `Syntax error`; an unknown command (`+bogus`, a typo'd `-flushal`, `+`,
+  `+config|bogus`) -> `Unknown command or category name in ACL`; a `#`/`!`
+  hash that is not 64 lowercase hex -> redis's hash error (an uppercase hash
+  used to be stored and then never authenticate); `<pw` / `!hash` for a
+  password the user does not hold -> `The password you are trying to remove
+  from the user does not exist`; a `(...)` selector -> `ACL selectors are not
+  supported` (redis accepts selectors; moon does not implement them and
+  refuses rather than drop the grant); a non-UTF-8 rule argument -> `ACL rules
+  must be valid UTF-8` (it used to be dropped before the parser saw it). **An
+  aclfile line carrying any of these is no longer loaded** -- the user is
+  absent and a WARN names the rule -- where it used to load with the token
+  dropped; fix the line (usually a typo'd command or an uppercase hash) before
+  upgrading. Two further visible changes: a user with no key patterns can now
+  run keyless commands such as `PING` (redis gates only keyed commands on key
+  patterns; keyed commands are still denied), and `allkeys` / `~*` and
+  `allchannels` / `&*` now REPLACE the pattern list as on redis, so
+  `~a allkeys` is reported and saved as `~*` rather than `~a ~*` -- the same
+  permission either way. Not changed: a pattern added AFTER `~*` is still
+  accepted (redis rejects it), so an existing aclfile holding `~* ~x` keeps
+  loading.
+
 ### Fixed
 
+- **`ACL SETUSER` implements `allkeys`, `allcommands`, `allchannels` and
+  every spelling of the `%R~` / `%W~` / `%RW~` key selectors** (moon#970).
+  All were dropped with `+OK`, so a user provisioned with the standard redis
+  idioms came out inert: `ACL SETUSER w1 on >pw allkeys allcommands` reported
+  `-@all` and every command was `NOPERM`; `%RW~cache:* +@read` left the user
+  with no key access at all; `%r~` / `%wr~` (lowercase flags) vanished.
+  `ACL LIST`, `ACL GETUSER` and `ACL SAVE` now render these exactly as redis
+  8.6.1 does (`%RW~p` as `~p`, one-sided grants as `%R~p` / `%W~p`), through
+  one key-pattern renderer -- `ACL GETUSER` carried a second copy that would
+  have rendered a no-access pattern as a write grant. Every touched
+  permission set, including moon#981's `+@all -x`, is verified to round-trip
+  `SETUSER` -> `LIST`/`GETUSER` -> `SAVE` -> restart with `LOAD` unchanged,
+  token order included.
 - **Commands routed to another shard are counted and timed** (moon#982).
   At `--shards > 1` a command whose key lives on a shard other than the
   connection's went through no telemetry probe at all — neither the
@@ -97,6 +140,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both the listpack and B+tree arms, which carried separate copies.
 ### Security
 
+- **Setting a password on a `nopass` user now actually requires it, and
+  `nopass` now revokes the old passwords** (moon#999). Two credential
+  fail-opens, both answering `+OK`. (a) `>pw` / `#hash` did not clear the
+  `nopass` flag: `ACL SETUSER fa on nopass ~* +@all` then
+  `ACL SETUSER fa >realpw` left an account that accepted ANY password --
+  measured against redis-server 8.6.1, `AUTH fa totallywrong` answered `OK` on
+  moon and `WRONGPASS` on redis, over `AUTH`, `HELLO 3 AUTH` and inline `AUTH`
+  alike, while `ACL GETUSER` showed a password set. (b) `nopass` did not drop
+  the stored hashes, so rotating a credential through `nopass` (`>oldpw`,
+  `nopass`, `>newpw`) left the compromised `oldpw` valid indefinitely. `>` and
+  `#` now clear `nopass`, and `nopass` clears the password list, as redis
+  does; both hold across `ACL SAVE` / `ACL LOAD` and a restart.
+- **The ACL keywords an operator uses to contain a compromised account now
+  take effect** (moon#979). `ACL SETUSER svc nocommands` (the arm did not
+  exist) and `ACL SETUSER svc OFF` / `RESET` / `RESETKEYS` / `RESETCHANNELS` /
+  `RESETPASS` / `NOPASS` (every non-lowercase spelling -- redis compares
+  keywords case-insensitively) answered `OK` and changed nothing: the account
+  stayed live with `+@all` and the operator was told the lockdown worked.
+  Keywords are now matched case-insensitively in exactly one table, and every
+  redis keyword has an arm.
 - **An ACL category Moon does not implement is an error, not a grant of every
   command** (moon#978). `get_category_commands` ended in `_ => &[]`, so an
   unknown category resolved to an EMPTY command list rather than failing.
@@ -170,49 +233,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unthresholded, since the current 6.21% figure is an artefact of the
   vitest config's include scope pulling in untested Three.js/graph UI, not
   a signal a threshold could usefully gate.
-- **`ACL SETUSER` no longer drops rule tokens with `+OK`** (moon#979). The
-  rule parser matched lowercase literals and ended in `_ => {}`, so every
-  token it did not recognise was silently ignored while the call answered
-  `OK`. Measured against redis-server 8.6.1 from a `+@all` user:
-  `ACL SETUSER svc nocommands` (arm missing), `ACL SETUSER svc OFF`, `RESET`,
-  `RESETKEYS`, `RESETCHANNELS`, `RESETPASS`, `NOPASS` (every non-lowercase
-  spelling — redis compares keywords case-insensitively) all answered `OK` on
-  both servers, after which the moon user still ran `FLUSHALL`, still
-  authenticated, or still wrote keys where redis answered `NOPERM` or
-  `WRONGPASS`. A revocation that reports success and does nothing is the worst
-  failure an ACL can have; the operator walks away believing the access is
-  gone. The full divergence set, established by sweeping the redis grammar
-  against both servers, was wider than the four tokens in the title:
-  `allkeys`/`allchannels`/`allcommands`/`sanitize-payload`/
-  `skip-sanitize-payload`/`clearselectors` were unhandled; `%r~`, `%w~`,
-  `%RW~` and bare `%R` were dropped while `%X~k`, `%RR~k`, `%~k` and `%` were
-  accepted; an unknown token (`bogus`, `@read`, `nocommand`, `' on'`) was
-  accepted; an unknown command (`-flushal`, `+bogus`, `+`, `-`, `+|get`,
-  `+config|bogus`) was accepted — `-` even stored a `-` deny entry; `#HASH`
-  accepted anything (an uppercase or short hash could then never authenticate);
-  `<pw`/`!hash` for a credential the user does not hold answered `OK`; `>pw`
-  and `#hash` did not clear `nopass`, so requiring a password left the account
-  passwordless; `nopass` did not remove the old passwords, so `nopass >new`
-  kept the old credential live; a `(...)` selector was silently dropped; and a
-  bad token mid-list still created or mutated the user. Rules are now parsed
-  by one tokenizer: keyword spelling is compared in exactly one table lookup,
-  every redis keyword has an arm, `%` flags follow redis's grammar, command
-  names are validated against the dispatch registry, hashes must be 64
-  lowercase hex, and every rejection carries redis's own text
-  (`Syntax error`, `Unknown command or category name in ACL`, `The password
-  hash must be exactly 64 characters and contain only lowercase hexadecimal
-  characters`, `The password you are trying to remove from the user does not
-  exist`). `ACL SETUSER` applies the rule list to a copy and commits only when
-  every rule applied, so a rejected call — including a state-dependent one
-  like `<nope` — leaves the table byte-identical. Selectors are refused with
-  `ACL selectors are not supported` rather than dropped. An ACL file line
-  carrying any rejected token is not loaded (logged at WARN), as #978 already
-  did for categories. One deliberate loosening, surfaced by `RESETKEYS` now
-  taking effect: `check_key_permission` had a blanket "no key patterns →
-  deny" ahead of its keyless-command check, so such a user could not even
-  `PING`; redis gates only keyed commands on key patterns, and so does moon
-  now (keyed commands are still denied by the per-key loop). Stacked on
-  moon#978's category fix.
 
 ### Fixed
 

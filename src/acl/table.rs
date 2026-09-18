@@ -453,16 +453,19 @@ impl AclTable {
         Ok(())
     }
 
-    /// Apply ACL SETUSER rules to create or modify a user, discarding the
-    /// error.
+    /// Test fixture: apply ACL SETUSER rules and PANIC if any is rejected.
     ///
-    /// A convenience for bootstrap and test code whose rule lists are
-    /// literals. Same atomicity as [`Self::try_apply_setuser`]: an invalid
-    /// rule anywhere in the list means NOTHING is applied, not "everything
-    /// but that rule". Any path that can report to a client must call
-    /// `try_apply_setuser` and surface the error.
-    pub fn apply_setuser(&mut self, username: &str, rules: &[&str]) {
-        let _ = self.try_apply_setuser(username, rules);
+    /// Test-only on purpose. Every production path reports to a client or a
+    /// log and must call [`Self::try_apply_setuser`]. A fixture that swallowed
+    /// the error would, under validate-then-commit, build NO user at all for a
+    /// list with one bad token, and every "is denied" assertion in that test
+    /// would then pass vacuously against an absent user.
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn apply_setuser(&mut self, username: &str, rules: &[&str]) {
+        if let Err((rule, err)) = self.try_apply_setuser(username, rules) {
+            panic!("test fixture rule {rule:?} for user {username:?} was rejected: {err}");
+        }
     }
 
     /// Authenticate username+password. Returns Some(username) on success, None on failure.
@@ -1350,13 +1353,27 @@ mod tests {
         assert_eq!(table.version(), v1);
     }
 
-    /// The infallible convenience has the same atomicity, not "everything
-    /// but the bad rule".
+    /// A bad token LAST in the list still discards the whole call, not
+    /// "everything but the bad rule": the passwordless `+@all` prefix must not
+    /// be committed.
     #[test]
-    fn test_apply_setuser_discards_the_whole_call_on_a_bad_rule() {
+    fn test_try_apply_setuser_discards_the_whole_call_on_a_trailing_bad_rule() {
         let mut table = AclTable::new_empty();
-        table.apply_setuser("svc", &["on", "nopass", "~*", "+@all", "nocommand"]);
+        let err = table
+            .try_apply_setuser("svc", &["on", "nopass", "~*", "+@all", "nocommand"])
+            .expect_err("`nocommand` (no s) is not a keyword");
+        assert_eq!(err, ("nocommand", AclRuleError::Syntax));
         assert!(table.get_user("svc").is_none());
+    }
+
+    /// The test fixture must fail LOUDLY on a rejected rule. If it swallowed
+    /// the error, a typo in a fixture would build no user and every denial
+    /// assertion in that test would pass against an absent user.
+    #[test]
+    #[should_panic(expected = "test fixture rule \"nocommand\"")]
+    fn test_apply_setuser_fixture_panics_on_a_rejected_rule() {
+        let mut table = AclTable::new_empty();
+        table.apply_setuser("svc", &["on", "nopass", "nocommand"]);
     }
 
     /// The #979 headline, end to end through the table: a `+@all` user is
