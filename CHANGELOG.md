@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`Check (macOS)` and `Check (Windows)` run their tests in three shards**,
+  cutting the critical path of a `workflow_dispatch` roughly in half. Measured
+  on a real run before changing anything: the macOS job spent 146s compiling
+  and 527s RUNNING 5,909 tests — 85% of 793s — and Windows 739s of 854s, with
+  clippy only 15-40s because sccache and `rust-cache` already make the build
+  cheap. So the cost was never compilation, and caching it harder would have
+  bought nothing. `cargo nextest --partition count:N/3` splits the RUN across
+  three machines; each still pays the ~146s compile, trading 2x146s of CPU for
+  ~350s of wall clock per job. Whole-tree audits (both clippy invocations, the
+  x86_64-apple-darwin cross-build) are pinned to shard 1 rather than repeated
+  three times. Shards are separate machines, so the fixed-port server suites
+  cannot collide, and `fail-fast: false` keeps a failure in one shard from
+  hiding the others. Free on a public repo; the one real limit is the
+  5-concurrent-macOS-job ceiling, which a single dispatch stays under.
+
 - **BEHAVIOUR CHANGE — `ZADD ... GT LT` and a NaN `WEIGHTS` value now error**
   where they previously succeeded (moon#969). `ZADD k GT LT 1 m` used to reply
   `(integer) 1` and, on an existing member, `(integer) 0` with the score left
