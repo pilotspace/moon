@@ -686,7 +686,9 @@ impl super::Shard {
                 std::fs::create_dir_all(&shard_dir).ok();
                 let manifest_path = shard_dir.join(format!("shard-{}.manifest", shard_id));
                 if manifest_path.exists() {
-                    match crate::persistence::manifest::ShardManifest::open(&manifest_path) {
+                    match crate::persistence::manifest::ShardManifest::open_repairing_torn_create(
+                        &manifest_path,
+                    ) {
                         Ok(m) => Some(m),
                         Err(e) => {
                             tracing::warn!("Shard {}: shard manifest open failed: {}", shard_id, e);
@@ -819,8 +821,10 @@ impl super::Shard {
                 }
             }
         };
+        // The shard's ONE cold file_id counter: every consumer allocates from
+        // it through `file_id_seed::allocate_from` — there is no second copy
+        // to fall behind it (moon#997 review).
         spill_file_id.set(spill_seed);
-        let mut next_file_id: u64 = spill_seed;
         if spill_seed > 1 {
             info!(
                 "Shard {}: cold file_id counter seeded at {} (above every spill file, \
@@ -1426,8 +1430,6 @@ impl super::Shard {
                 // Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll
                 _ = periodic_interval.0.tick() => {
                     cached_clock.update();
-                    // Sync file ID from shared Cell (handlers may have incremented it)
-                    next_file_id = next_file_id.max(spill_file_id.get());
 
                     let mut pending_snapshot = None;
                     // No outer with_shard — each arm takes its own flat borrow.
@@ -1716,7 +1718,7 @@ impl super::Shard {
                                     manifest,
                                     server_config.segment_warm_after,
                                     server_config.engine_offload_idle_secs,
-                                    &mut next_file_id,
+                                    &spill_file_id,
                                     shard_id,
                                     &mut wal_writer,
                                 );
@@ -1798,7 +1800,6 @@ impl super::Shard {
                         &server_config,
                         &runtime_config,
                         &page_cache,
-                        &mut next_file_id,
                         &mut wal_writer,
                         &script_cache_rc,
                         &lua_rc,
@@ -2337,7 +2338,6 @@ impl super::Shard {
                 // 10 idle) so the counter keeps counting nominal milliseconds.
                 monoio_tick_counter = monoio_tick_counter.wrapping_add(idle_park.counter_step());
                 cached_clock.update();
-                next_file_id = next_file_id.max(spill_file_id.get());
 
                 persistence_tick::check_auto_save_trigger(
                     &snapshot_trigger_rx,
@@ -2485,7 +2485,6 @@ impl super::Shard {
                         &server_config,
                         &runtime_config,
                         &page_cache,
-                        &mut next_file_id,
                         &mut wal_writer,
                         &script_cache_rc,
                         &lua_rc,
@@ -2618,7 +2617,7 @@ impl super::Shard {
                                     manifest,
                                     server_config.segment_warm_after,
                                     server_config.engine_offload_idle_secs,
-                                    &mut next_file_id,
+                                    &spill_file_id,
                                     shard_id,
                                     &mut wal_writer,
                                 );

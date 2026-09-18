@@ -11,13 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BEHAVIOUR CHANGE — a disk-offload server that cannot prove where its cold
   file ids resume now refuses to start** (moon#997). If a shard's
   `data/` or `vectors/` directory exists but cannot be listed, an entry in it
-  cannot be read, or its shard manifest exists but cannot be opened, startup
-  exits with `refusing to start: cannot prove shard N's cold file_id seed …`
-  and the OS error. It used to log a warning and restart the counter at 1,
-  after which the next spill renamed its batch onto the live
+  cannot be read, or its shard manifest is full-length but cannot be opened,
+  startup exits with `refusing to start: cannot prove shard N's cold file_id
+  seed …`, the OS error, and what is safe to do: for a permission or I/O
+  error nothing needs removing; for a manifest whose two root pages are both
+  corrupt the message says NOT to delete it (the next boot would delete every
+  heap file beside it as an orphan). It used to log a warning and restart the
+  counter at 1, after which the next spill renamed its batch onto the live
   `heap-000001.mpf` (reproduced on both runtimes at `--shards 1` and `4` with
-  a `-wx` `data/` directory). Fix the named error and restart; nothing on
-  disk was changed by the refusal.
+  a `-wx` `data/` directory). A manifest shorter than its two root pages is
+  NOT refused: only an interrupted create produces one, it holds no entry, and
+  it is re-created empty with a WARN naming the file. Nothing on disk is
+  changed by a refusal.
 
 - **BEHAVIOUR CHANGE — `ZADD ... GT LT` and a NaN `WEIGHTS` value now error**
   where they previously succeeded (moon#969). `ZADD k GT LT 1 m` used to reply
@@ -53,6 +58,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   id becomes a failed spill that keeps the values hot instead of overwriting
   live cold data. The seed scan also no longer skips a directory entry it
   cannot read.
+
+- **A shard's cold file ids come from one counter that never moves
+  backwards** (moon#893, moon#997). The event loop kept a second copy of the
+  counter, re-synced once per tick. On tokio the cross-shard SPSC drain ran
+  after that sync and advanced the shared counter; the eviction tick and warm
+  vector transitions then allocated from the stale copy, re-issuing the
+  drain's ids, and wrote it back with a plain `set` that moved the shared
+  counter backwards. The copy is gone: every consumer allocates through
+  `file_id_seed::allocate_from`, and every write-back is monotonic.
+
+- **`ShardManifest::create` is atomic** (temp file, fsync, rename, directory
+  fsync). A crash part-way through it used to leave a manifest shorter than
+  its two root pages at the real path, which every later open rejected.
+  Tombstones are also aged per `(file_id, file_type)`, not per id.
 
 - **Commands routed to another shard are counted and timed** (moon#982).
   At `--shards > 1` a command whose key lives on a shard other than the

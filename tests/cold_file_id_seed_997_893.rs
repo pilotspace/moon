@@ -13,7 +13,7 @@
 //! * answered `1` when the scan failed for any reason but `NotFound`, and
 //!   skipped every directory entry it could not read (moon#997).
 //!
-//! ## Three tests, one per mechanism
+//! ## The tests
 //!
 //! * `vector_segment_id_is_never_reissued_to_a_spill_file_*` — the #893
 //!   consequence triage raised from P2 on a code read. The corpus is a data
@@ -38,6 +38,10 @@
 //!   batch onto the LIVE `heap-000001.mpf`. The fixed server refuses to
 //!   start; once the operator restores the permission it starts and serves
 //!   every key.
+//!
+//! * `torn_manifest_create_does_not_block_startup_*` — a manifest shorter
+//!   than its two root pages (a `create` that died part-way) holds no entry
+//!   and must not make the fail-closed seed refuse every boot.
 //!
 //! The per-entry half of #997 (`read_dir(..).flatten()` dropping an entry the
 //! kernel could not return) cannot be produced on demand on a real filesystem;
@@ -677,8 +681,86 @@ impl Drop for RestorePerms {
     }
 }
 
+// ===========================================================================
+// Test 3 — moon#997 review: a torn manifest create must not block startup.
+// ===========================================================================
+
+/// A manifest shorter than its two root pages can only be a `create` that
+/// died part-way (builds before create became atomic wrote it in place). It
+/// holds no entry, so it must not make the file_id seed refuse every boot:
+/// the server starts, re-creates it, spills through it, and recovers from it.
+fn torn_manifest_create(shards: usize) {
+    let dir = common::unique_test_dir(&format!("fileid-torn-manifest-s{shards}"));
+    for shard in 0..shards {
+        std::fs::create_dir_all(shard_dir(&dir, shard)).unwrap();
+        std::fs::write(manifest_path(&dir, shard), vec![0u8; 100]).unwrap();
+    }
+    let mode = Mode { shards, aof: true };
+
+    let port = common::reserve_port();
+    let mut child = Command::new(find_moon_binary())
+        .args(moon_args(&dir, port, mode))
+        .stdout(Stdio::null())
+        .stderr(common::server_stderr(&dir))
+        .spawn()
+        .expect("spawn moon");
+    if let Some(code) = exited_within(&mut child, Duration::from_secs(10)) {
+        let log = std::fs::read_to_string(dir.join("server.err")).unwrap_or_default();
+        panic!(
+            "--shards {shards}: moon refused to start (exit {code}) over a 100-byte \
+             manifest — a torn create that holds no entry. server.err:\n{log}"
+        );
+    }
+    let server = Server {
+        guard: ServerGuard::new(child),
+        port,
+        dir: dir.clone(),
+        mode,
+    };
+    assert!(server.pings(), "moon never answered PING");
+
+    // The manifest works again: spills register in it.
+    let mut c = Conn::open(server.port);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut round = 0;
+    while !(0..shards).all(|s| {
+        active_entries(&dir, s)
+            .iter()
+            .any(|&(_, t)| t == PageType::KvLeaf as u8)
+    }) {
+        write_filler(&mut c, round);
+        round += 1;
+        assert!(
+            round < MAX_FILLER_ROUNDS && Instant::now() < deadline,
+            "no shard registered a spill file in its re-created manifest"
+        );
+    }
+    settle();
+    let cold = durable_cold_keys(&dir, shards);
+    let server = server.crash_and_restart();
+    let absent = absent_keys(server.port, &cold);
+    assert!(
+        absent.is_empty(),
+        "--shards {shards}: {} of {} keys spilled through the re-created manifest read \
+         as absent after a restart: {:?}",
+        absent.len(),
+        cold.len(),
+        absent.iter().take(3).collect::<Vec<_>>()
+    );
+    drop(server);
+}
+
+#[test]
+fn torn_manifest_create_does_not_block_startup_1_shard() {
+    torn_manifest_create(1);
+}
+
+#[test]
+fn torn_manifest_create_does_not_block_startup_4_shards() {
+    torn_manifest_create(4);
+}
+
 /// Wait for the child to exit on its own; `None` if it is still running.
-#[cfg(unix)]
 fn exited_within(child: &mut std::process::Child, within: Duration) -> Option<i32> {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {

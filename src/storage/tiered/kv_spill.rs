@@ -471,9 +471,14 @@ pub fn write_kv_spill_batch(shard_dir: &Path, file_id: u64, batch: &BatchPages) 
 /// values hot (the async path counts it in `spill_failed_reinserted`). One
 /// `lstat` per spill file.
 ///
-/// Only the spill writers call this, on an id the shard's counter handed out
-/// exactly once — so the check-then-rename window has no second writer for
-/// the same name.
+/// Two writers exist per shard — the background spill thread and the
+/// event-loop's durable batch (`eviction::evict_batch_durable`) — and a file
+/// is named after its batch's first id. Both draw ids from the shard's ONE
+/// counter (`file_id_seed::allocate_from`, never moved backwards), so no two
+/// batches share a first id and the check-then-rename window has no second
+/// writer for the same name. This check is the backstop if that invariant is
+/// ever broken again: the loser fails its spill instead of replacing a file.
+/// It cannot stop two writers racing on the same `.tmp`; the one counter does.
 fn refuse_to_replace(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Err(io::Error::new(

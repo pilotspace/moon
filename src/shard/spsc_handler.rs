@@ -83,7 +83,7 @@ pub(super) fn spsc_eviction_gate(
                 .budget(budget)
                 .report(on_plain_drop),
         );
-        spill_file_id.set(fid);
+        spill_file_id.set(spill_file_id.get().max(fid));
         res
     } else {
         evict_to_budget(

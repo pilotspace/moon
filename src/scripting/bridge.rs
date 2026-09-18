@@ -219,7 +219,7 @@ impl LuaEvictionCtx {
                     .budget(budget)
                     .report(&mut on_plain_drop),
             );
-            inner.spill_file_id.set(fid);
+            inner.spill_file_id.set(inner.spill_file_id.get().max(fid));
             res
         } else {
             evict_to_budget(

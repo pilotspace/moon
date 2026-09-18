@@ -197,7 +197,11 @@ pub fn recover_shard_v3_pitr(
     // ── Phase 2: MANIFEST RECOVERY ────────────────────────────────────
     let manifest_path = shard_dir.join(format!("shard-{}.manifest", shard_id));
     if manifest_path.exists() {
-        match ShardManifest::open(&manifest_path) {
+        // A torn create (shorter than the two root pages, no committed entry)
+        // is re-created empty here, the first place a boot opens the manifest,
+        // so every later open — the cold-index rebuild below, the file_id
+        // seed, the event loop — sees a valid one instead of failing forever.
+        match ShardManifest::open_repairing_torn_create(&manifest_path) {
             Ok(manifest) => {
                 let file_count = manifest.files().len();
                 info!(
