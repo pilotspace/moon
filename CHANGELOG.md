@@ -64,6 +64,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One `GRAPH.*` write no longer makes a restart discard every acknowledged
+  KV write** (moon#1018). This hits `runtime-tokio` with `--shards 1` and the
+  `graph` feature. That configuration has no `AofManifest`, so recovery picks
+  the KV authority itself: the shard's WAL v3 if replaying it produced KV
+  history, otherwise `appendonly.aof`. Every graph write lands in that WAL as a
+  `Command` record. Replay hands it to the graph engine, never to the keyspace,
+  yet it was counted as KV history. The AOF was skipped, and the keys lived
+  only there. Measured with `--appendfsync always` and `kill -9`: DBSIZE
+  3 → 0, and the same again on every later boot. Recovery now counts a record
+  only when replay applied it to the keyspace. The replay engine reports where
+  each record went (keyspace, cold plane, graph, or unhandled), so this does
+  not depend on an exclusion list: moon#914 and this issue each found a record
+  class such a list missed. A record this build cannot handle (for example,
+  `GRAPH.*` without the `graph` feature) no longer counts either. monoio, and
+  tokio with `--shards` ≥ 2, have a manifest and never reach this decision.
+  CI's per-PR `Test (graph)` step now also runs the recovery/replay unit tests
+  and `tests/graph_wal_kv_authority_1018.rs` under `runtime-tokio` + `graph`,
+  a combination no per-PR leg built before. It adds ~19 s.
+
 - **Commands routed to another shard are counted and timed** (moon#982).
   At `--shards > 1` a command whose key lives on a shard other than the
   connection's went through no telemetry probe at all — neither the

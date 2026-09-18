@@ -771,10 +771,11 @@ mod tests {
             cmd: &[u8],
             _args: &[crate::protocol::Frame],
             _selected_db: &mut usize,
-        ) {
+        ) -> crate::persistence::replay::ReplayRoute {
             self.calls
                 .borrow_mut()
                 .push(String::from_utf8_lossy(cmd).into_owned());
+            crate::persistence::replay::ReplayRoute::Keyspace
         }
     }
 

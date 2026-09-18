@@ -249,9 +249,20 @@ jobs:
       - name: Doctests
         run: cargo test --doc --no-default-features --features runtime-tokio,jemalloc
         timeout-minutes: 5
+      # moon#1018: tokio + `graph` is the only configuration where a GRAPH.*
+      # WAL record reaches recovery's KV-authority decision (tokio --shards 1
+      # has no AOF manifest), and no other per-PR leg builds it: `Test` above
+      # drops `graph`, and the Windows leg that keeps it is main-push/dispatch
+      # only. So this step also runs the recovery/replay unit tests and the
+      # crash suite for that bug under the same features. The lib is already
+      # compiled for the graph tests; the extra cost is building the tokio+graph
+      # `moon` binary plus one test binary. Measured on a macOS host (-j4, fresh
+      # target dir): the old step took 86 s and the new one ~19 s more. The three
+      # crash legs (~1 s each) run in parallel inside the existing ~7.5 s test
+      # window.
       - name: Test (graph)
-        run: "cargo nextest run --profile ci --no-default-features --features runtime-tokio,jemalloc,graph --lib -E 'test(graph::)'"
-        timeout-minutes: 5
+        run: "cargo nextest run --profile ci --no-default-features --features runtime-tokio,jemalloc,graph --lib --test graph_wal_kv_authority_1018 -E 'test(graph::) | test(persistence::recovery::) | test(persistence::replay::) | binary(graph_wal_kv_authority_1018)'"
+        timeout-minutes: 10
 
   # ── monoio — the runtime Moon actually SHIPS ────────────────────────
   # Until this job existed, every CI job that EXECUTED tests did so under

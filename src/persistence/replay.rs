@@ -131,6 +131,43 @@ fn is_hexpire_family_write(cmd: &[u8]) -> bool {
         || cmd.eq_ignore_ascii_case(b"HPERSIST")
 }
 
+/// Where [`CommandReplayEngine::replay_command`] sent one replayed record.
+///
+/// Recovery uses this to decide whether a log is the KV authority: only
+/// [`ReplayRoute::Keyspace`] is KV history. The engine is the one party that
+/// knows what it did with a record, so the classification lives here rather
+/// than in a list of names the counter excludes. That list has already missed
+/// two record classes: cold-plane markers (moon#914) and `GRAPH.*` (moon#1018).
+/// Each time, one non-KV record made recovery skip `appendonly.aof` and lose
+/// every acknowledged write in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayRoute {
+    /// Applied to the KV keyspace: a `command::dispatch` handler ran, or a
+    /// replay shim that mutates the database slice (SWAPDB, FLUSHALL, the
+    /// HEXPIRE family) did.
+    Keyspace,
+    /// A replay-only cold-plane cut record (`MOON.COLDCUT` / `MOON.SPILLED`):
+    /// it moves the cold-tier gate. It is not a key write.
+    ColdPlane,
+    /// Diverted to the graph collector (well-formed or not). The graph engine
+    /// applies it in its own pass, and it never reaches the keyspace.
+    Graph,
+    /// No replay path handles it: KV dispatch answered "unknown command", so
+    /// nothing was applied. This covers any record class this build has no
+    /// handler for, such as `GRAPH.*` in a build without the `graph` feature.
+    Unhandled,
+}
+
+impl ReplayRoute {
+    /// Whether the record is KV history, i.e. replay applied it to the
+    /// keyspace.
+    #[inline]
+    #[must_use]
+    pub fn is_kv_history(self) -> bool {
+        matches!(self, ReplayRoute::Keyspace)
+    }
+}
+
 /// Trait that abstracts command dispatch for AOF/WAL replay.
 ///
 /// This decouples persistence replay from `command::dispatch`, allowing
@@ -139,15 +176,15 @@ pub trait CommandReplayEngine {
     /// Replay a single parsed command against the database slice.
     ///
     /// `selected_db` may be mutated by SELECT commands during replay.
-    /// The response is intentionally discarded -- replay cares only about
-    /// side effects on the databases.
+    /// The command's reply is discarded; replay cares only about its side
+    /// effects. The returned [`ReplayRoute`] says which path those went to.
     fn replay_command(
         &self,
         databases: &mut [Database],
         cmd: &[u8],
         args: &[Frame],
         selected_db: &mut usize,
-    );
+    ) -> ReplayRoute;
 }
 
 /// Concrete implementation that delegates to `command::dispatch`.
@@ -197,7 +234,7 @@ impl CommandReplayEngine for DispatchReplayEngine {
         cmd: &[u8],
         args: &[Frame],
         selected_db: &mut usize,
-    ) {
+    ) -> ReplayRoute {
         // moon#902: replay-only cold-plane cut records (`MOON.COLDCUT`,
         // `MOON.SPILLED`) act on the databases directly and never reach
         // dispatch — a client sending one gets "unknown command".
@@ -207,7 +244,7 @@ impl CommandReplayEngine for DispatchReplayEngine {
             args,
             *selected_db,
         ) {
-            return;
+            return ReplayRoute::ColdPlane;
         }
 
         // Intercept graph commands and route to the collector instead of KV dispatch.
@@ -254,7 +291,7 @@ impl CommandReplayEngine for DispatchReplayEngine {
                         args.len()
                     );
                 }
-                return;
+                return ReplayRoute::Graph;
             }
         }
 
@@ -282,7 +319,7 @@ impl CommandReplayEngine for DispatchReplayEngine {
                     // Out-of-range or same-index — silently skip (same as Redis).
                 }
             }
-            return;
+            return ReplayRoute::Keyspace;
         }
 
         let db_count = databases.len();
@@ -310,7 +347,7 @@ impl CommandReplayEngine for DispatchReplayEngine {
             if !matches!(resp, Frame::Error(_)) {
                 crate::command::server_admin::flush_every_database(databases, *selected_db);
             }
-            return;
+            return ReplayRoute::Keyspace;
         }
 
         // Phase 200 — HEXPIRE-family replay shims.
@@ -330,16 +367,21 @@ impl CommandReplayEngine for DispatchReplayEngine {
             } else {
                 let _ = replay_hexpire_family(db, cmd, args);
             }
-            return;
+            return ReplayRoute::Keyspace;
         }
 
-        let _ = crate::command::dispatch(
+        let reply = crate::command::dispatch(
             &mut databases[*selected_db],
             cmd,
             args,
             selected_db,
             db_count,
         );
+        if reply.is_unknown_command() {
+            ReplayRoute::Unhandled
+        } else {
+            ReplayRoute::Keyspace
+        }
     }
 }
 
@@ -616,5 +658,75 @@ mod tests {
             Some(abs_ms),
             "replay must accept the recorded TTL irrespective of NX/XX/GT/LT"
         );
+    }
+
+    // ── ReplayRoute (moon#1018) ───────────────────────────────────────────────
+
+    fn bulk(s: &'static [u8]) -> Frame {
+        Frame::BulkString(bytes::Bytes::from_static(s))
+    }
+
+    /// Each replay path reports where the record went, so recovery counts KV
+    /// history by what replay did rather than by a list of names. Only a
+    /// record that reached the keyspace is `Keyspace`, including one a
+    /// handler refused (arity, WRONGTYPE): a handler ran.
+    #[test]
+    fn every_replay_path_reports_its_route() {
+        let engine = DispatchReplayEngine::new();
+        let mut dbs: Vec<Database> = (0..2).map(|_| Database::new()).collect();
+        let mut sel = 0usize;
+        let mut route =
+            |cmd: &[u8], args: &[Frame]| engine.replay_command(&mut dbs, cmd, args, &mut sel);
+
+        assert_eq!(
+            route(b"SET", &[bulk(b"k"), bulk(b"v")]),
+            ReplayRoute::Keyspace
+        );
+        assert_eq!(
+            route(b"GET", &[]),
+            ReplayRoute::Keyspace,
+            "arity error: a handler ran"
+        );
+        assert_eq!(
+            route(b"SWAPDB", &[bulk(b"0"), bulk(b"1")]),
+            ReplayRoute::Keyspace
+        );
+        assert_eq!(route(b"FLUSHALL", &[]), ReplayRoute::Keyspace);
+        assert_eq!(
+            route(
+                b"HPERSIST",
+                &[bulk(b"h"), bulk(b"FIELDS"), bulk(b"1"), bulk(b"f")]
+            ),
+            ReplayRoute::Keyspace
+        );
+
+        assert_eq!(
+            route(b"MOON.COLDCUT", &[bulk(b"1")]),
+            ReplayRoute::ColdPlane
+        );
+        assert_eq!(route(b"moon.spilled", &[]), ReplayRoute::ColdPlane);
+
+        // Without the `graph` feature KV dispatch has no GRAPH.* handler, so
+        // the record is unhandled. Either way it is not KV history.
+        let graph = route(b"GRAPH.CREATE", &[bulk(b"g")]);
+        #[cfg(feature = "graph")]
+        assert_eq!(graph, ReplayRoute::Graph);
+        #[cfg(not(feature = "graph"))]
+        assert_eq!(graph, ReplayRoute::Unhandled);
+        assert!(!graph.is_kv_history());
+
+        assert_eq!(
+            route(b"MOON.FUTUREPLANE", &[bulk(b"x")]),
+            ReplayRoute::Unhandled
+        );
+
+        assert!(ReplayRoute::Keyspace.is_kv_history());
+        for r in [
+            ReplayRoute::ColdPlane,
+            ReplayRoute::Graph,
+            ReplayRoute::Unhandled,
+        ] {
+            assert!(!r.is_kv_history(), "{r:?} is not KV history");
+        }
     }
 }
