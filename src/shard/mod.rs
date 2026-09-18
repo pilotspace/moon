@@ -355,6 +355,22 @@ impl Shard {
                     tracing::error!("Shard {}: AOF replay failed: {}", self.id, e);
                 }
             }
+            // moon#914: close the replay generation on every database. The
+            // tokio `--shards 1` AOF opens with `MOON.COLDCUT`, whose gate
+            // must not outlive replay: main.rs wires the cold tier AFTER this
+            // path when disk-offload is on but its shard dir did not exist
+            // yet, and a lingering gate would then hide every cold file at or
+            // past its watermark — every key spilled after this boot would
+            // read as absent. Runs on the Err arm too: a replay that stopped
+            // at corruption may already have installed the gate.
+            let r = crate::storage::db::close_replay_generation(&mut self.databases);
+            if r.hot_demoted > 0 || r.cold_dropped > 0 {
+                info!(
+                    "Shard {}: AOF replay cold-plane reconcile (gated={}): {} hot shadow(s) \
+                     demoted, {} cold entr(ies) dropped",
+                    self.id, r.gated, r.hot_demoted, r.cold_dropped
+                );
+            }
         } else {
             // Disaster fallback ONLY: no AOF at all (lost/rebuilt/never
             // written). Partial recovery from WAL v3 beats nothing, but its
