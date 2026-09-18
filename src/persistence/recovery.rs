@@ -78,6 +78,12 @@ pub struct RecoveryResult {
     /// traffic, so restart-to-ready stays seconds-scale regardless of
     /// cold-plane size. See `storage::tiered::kv_spill::classify_orphan_heap_files`.
     pub pending_heap_orphans: Vec<std::path::PathBuf>,
+    /// moon#914 (b): Phase 4b replayed the legacy `appendonly.aof` and no
+    /// `MOON.COLDCUT` opened it, so every cold file was readable during that
+    /// replay. Such a file was written before the cut existed (a pre-#1017
+    /// tokio `--shards 1` AOF). The caller decides whether to rewrite it so
+    /// the next replay is gated; see `main.rs`.
+    pub aof_replayed_without_cold_cut: bool,
     // NOTE: the ColdIndex rebuilt in Phase 3 is attached directly to
     // `databases[0]` BEFORE Phase 4 replay (never returned here) so that
     // replayed deletes tombstone the cold plane — see the Phase 3 comment.
@@ -791,6 +797,9 @@ pub fn recover_shard_v3_pitr(
     // demoted right below and then wiped. A 2.2M-key instance logged
     // "no appendonly.aof found — replayed 2397677 records from legacy-mode
     // WAL v3" on every boot while holding a perfectly good manifest AOF.
+    // moon#914 (b): set when the AOF below replayed at least one record, so
+    // the reconcile can report whether a cut opened it.
+    let mut aof_replayed = false;
     if kv_commands_replayed == 0 && !kv_authority_elsewhere {
         if let Some(v2_dir) = v2_persistence_dir {
             let aof_path = v2_dir.join("appendonly.aof");
@@ -802,6 +811,7 @@ pub fn recover_shard_v3_pitr(
                 match crate::persistence::aof::replay_aof(databases, &aof_path, engine) {
                     Ok(n) => {
                         result.commands_replayed += n;
+                        aof_replayed = n > 0;
                         info!("Shard {}: AOF fallback replayed {} commands", shard_id, n);
                     }
                     Err(e) => {
@@ -886,6 +896,9 @@ pub fn recover_shard_v3_pitr(
         r.gated |= rest.gated;
         r.hot_demoted += rest.hot_demoted;
         r.cold_dropped += rest.cold_dropped;
+        // `gated` is true exactly when a `MOON.COLDCUT` installed its gate
+        // during this replay, so an AOF that replayed without one has no cut.
+        result.aof_replayed_without_cold_cut = aof_replayed && !r.gated;
         if r.hot_demoted > 0 || r.cold_dropped > 0 {
             info!(
                 "Shard {}: Phase 4b cold-plane reconcile (gated={}): {} hot shadow(s) demoted \
@@ -1774,6 +1787,45 @@ mod tests {
                 "db {i}: the replay gate outlived recovery"
             );
         }
+    }
+
+    /// moon#914 (b): recovery reports an AOF that replayed without a
+    /// `MOON.COLDCUT` (a pre-#1017 file) and does not report one that opened
+    /// with its cut, an empty one, or a boot with no AOF at all. `main.rs`
+    /// rewrites the AOF once on that signal.
+    #[test]
+    fn phase_4b_reports_an_aof_replayed_without_its_cold_cut() {
+        fn recover(aof: Option<&[u8]>) -> RecoveryResult {
+            let tmp = tempfile::tempdir().unwrap();
+            let shard_dir = tmp.path().join("shard-0");
+            std::fs::create_dir_all(&shard_dir).unwrap();
+            let v2_dir = tmp.path().join("legacy");
+            std::fs::create_dir_all(&v2_dir).unwrap();
+            if let Some(bytes) = aof {
+                std::fs::write(v2_dir.join("appendonly.aof"), bytes).unwrap();
+            }
+            let mut databases: Vec<Database> = (0..2).map(|_| Database::new()).collect();
+            recover_shard_v3_with_fallback(
+                &mut databases,
+                0,
+                &shard_dir,
+                &crate::persistence::replay::DispatchReplayEngine::new(),
+                Some(&v2_dir),
+                false,
+            )
+            .unwrap()
+        }
+        let set = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
+        let mut headed = crate::persistence::cold_records::serialize_cold_cut(4).to_vec();
+        headed.extend_from_slice(set);
+
+        assert!(
+            recover(Some(set)).aof_replayed_without_cold_cut,
+            "a legacy AOF with records and no head must be reported"
+        );
+        assert!(!recover(Some(&headed)).aof_replayed_without_cold_cut);
+        assert!(!recover(Some(b"")).aof_replayed_without_cold_cut);
+        assert!(!recover(None).aof_replayed_without_cold_cut);
     }
 
     #[test]

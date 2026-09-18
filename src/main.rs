@@ -1915,6 +1915,64 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // moon#914 (b): tokio --shards 1 replayed a legacy `appendonly.aof` (one
+    // written before #1017, so it has no `MOON.COLDCUT`) while cold files
+    // existed. That replay read every cold file ungated, so a write logged
+    // before its key was spilled may just have been applied twice. The log
+    // has no record of which writes preceded which spill, so this boot's
+    // damage can't be undone. It can be stopped from compounding: nothing
+    // else rewrites this file, and every later boot would replay the same
+    // headless log over the re-spilled result. One rewrite opens the file
+    // with its cut (`rewrite_aof_sharded_sync`), so every later boot is
+    // gated. The #433 monitor dispatches it through the BGREWRITEAOF entry
+    // after the shards start. Accept is not blocked, and a crash before the
+    // rename leaves the old file authoritative, so the next boot retries.
+    // monoio (manifest, cut since #911) and multi-shard (PerShard manifest)
+    // never take this path.
+    let force_legacy_aof_rewrite = cfg!(not(feature = "runtime-monoio"))
+        && num_shards == 1
+        && shards[0].replayed_aof_without_cold_cut
+        && cold_file_watermark(disk_offload_base.as_deref(), 0) > 1
+        && {
+            // The replay reads `<dir>/appendonly.aof`; the writer appends to
+            // `<dir>/<appendfilename>`. A rewrite can only repair the file
+            // that was replayed.
+            let replayed = std::path::Path::new(&config.dir).join("appendonly.aof");
+            let aof_bytes = std::fs::metadata(&replayed).map_or(0, |m| m.len());
+            let writes_replayed_file = config.appendfilename == "appendonly.aof";
+            if aof_pool.is_some() && writes_replayed_file {
+                tracing::warn!(
+                    "moon#914: replayed a legacy appendonly.aof ({}, {} bytes) with no \
+                     MOON.COLDCUT head over existing cold files. This boot's replay could \
+                     not be gated: a write logged before its key was spilled may have been \
+                     applied twice, and that cannot be undone. To stop it compounding on \
+                     every later boot, moon now runs ONE background AOF rewrite. One-time \
+                     cost: the hot dataset written and fsynced as a new RDB-preamble AOF. \
+                     Clients are served meanwhile. Later boots replay a file that opens with \
+                     its cut.",
+                    replayed.display(),
+                    aof_bytes
+                );
+                true
+            } else {
+                tracing::warn!(
+                    "moon#914: replayed a legacy appendonly.aof ({}, {} bytes) with no \
+                     MOON.COLDCUT head over existing cold files. This boot's replay could \
+                     not be gated, and moon CANNOT rewrite it: {}. Every boot will replay \
+                     it ungated again. Run with --appendonly yes and the default \
+                     --appendfilename once, then BGREWRITEAOF.",
+                    replayed.display(),
+                    aof_bytes,
+                    if aof_pool.is_none() {
+                        "appendonly is off"
+                    } else {
+                        "--appendfilename names a different file than the one replayed"
+                    }
+                );
+                false
+            }
+        };
+
     // Extract databases from all shards and wrap in ShardDatabases
     let all_dbs: Vec<Vec<moon::storage::Database>> = shards
         .iter_mut()
@@ -1983,6 +2041,7 @@ fn main() -> anyhow::Result<()> {
             shard_databases.clone(),
             config.auto_aof_rewrite_percentage,
             min_size,
+            force_legacy_aof_rewrite,
         );
     }
 
