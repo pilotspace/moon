@@ -72,7 +72,7 @@ use crate::replication::state::ReplicationState;
 /// Serialize `DEL <key>` as a RESP command record — the same wire form
 /// `aof::serialize_command` produces for any ordinary client command, so
 /// replica apply and AOF replay treat it identically to a real client DEL.
-fn serialize_del(key: &[u8]) -> Bytes {
+pub(crate) fn serialize_del(key: &[u8]) -> Bytes {
     let frame = Frame::Array(crate::framevec![
         Frame::BulkString(Bytes::from_static(b"DEL")),
         Frame::BulkString(Bytes::copy_from_slice(key)),

@@ -1470,6 +1470,50 @@ if should_run "transaction"; then
         echo "  FAIL: FN-MULTI-02 expected queue-time refusal + EXECABORT, got: $(echo "$fn_bogus" | tr '\n' ' ')"
     fi
 
+    # --- Scripts inside MULTI (moon#894) -----------------------------------
+    #
+    # EVAL/EVALSHA/EVAL_RO/FCALL were queued and then answered `unknown
+    # command` at EXEC while the rest of the body committed. As with moon#697,
+    # the verdict is read from the KEYS, not from EXEC's reply: the pre-fix
+    # EXEC array was full-length, so a length check passes on the bug. The
+    # transcript is also compared to Redis byte for byte. `{tx894}`
+    # co-locates every key so the row compares the command, not the routing,
+    # at --shards > 1. The sha is SHA1 of the script body, so both servers
+    # agree on it.
+    sc894_set="return redis.call('SET',KEYS[1],ARGV[1])"
+    sc894_sha="cf63a54c34e159e75e5a3fe4794bb2ea636ee005"
+    sc894_lib="$(printf "#!lua name=tx894\nredis.register_function('tx894set', function(keys, args) return redis.call('SET', keys[1], args[1]) end)")"
+    for srv in mcli rcli; do
+        $srv DEL "{tx894}before" "{tx894}eval" "{tx894}sha" "{tx894}ro" "{tx894}fcall" "{tx894}after" > /dev/null
+        $srv SCRIPT LOAD "$sc894_set" > /dev/null
+        $srv FUNCTION LOAD REPLACE "$sc894_lib" > /dev/null
+    done
+    sc894_body=$(printf '%s\n' 'MULTI' 'SET {tx894}before 1' \
+        "EVAL \"$sc894_set\" 1 {tx894}eval e" \
+        "EVALSHA $sc894_sha 1 {tx894}sha s" \
+        "EVAL_RO \"return redis.call('GET',KEYS[1])\" 1 {tx894}before" \
+        'FCALL tx894set 1 {tx894}fcall f' \
+        'SET {tx894}after 2' 'EXEC')
+    sc894_moon=$(printf '%s\n' "$sc894_body" | redis-cli -p "$PORT_RUST" 2>&1 || true)
+    sc894_redis=$(printf '%s\n' "$sc894_body" | redis-cli -p "$PORT_REDIS" 2>&1 || true)
+    TOTAL=$((TOTAL + 1))
+    sc894_keys=$(mcli MGET "{tx894}before" "{tx894}eval" "{tx894}sha" "{tx894}fcall" "{tx894}after" | tr '\n' ' ')
+    if [ "$sc894_keys" = "1 e s f 2 " ] && ! echo "$sc894_moon" | qgrep -q "unknown command"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: SCRIPT-MULTI-01 scripts inside MULTI must apply (moon#894): keys='$sc894_keys' exec=$(echo "$sc894_moon" | tr '\n' ' ')"
+    fi
+    TOTAL=$((TOTAL + 1))
+    if [ "$sc894_moon" = "$sc894_redis" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: SCRIPT-MULTI-02 EXEC transcript differs from Redis (moon#894)"
+        echo "    redis: $(echo "$sc894_redis" | tr '\n' ' ')"
+        echo "    moon:  $(echo "$sc894_moon" | tr '\n' ' ')"
+    fi
+
     # --- Container HELP (moon#698) ----------------------------------------
     #
     # Redis gives every container a HELP subcommand answering an array of SIMPLE

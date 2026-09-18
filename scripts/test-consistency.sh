@@ -1444,6 +1444,33 @@ assert_eq "UNWATCH releases the dependency" \
 assert_both "WATCH arity" WATCH
 assert_both "UNWATCH outside MULTI" UNWATCH
 
+# ---------------------------------------------------------------------------
+# moon#894: scripts queued inside MULTI run at EXEC, in body order
+# ---------------------------------------------------------------------------
+#
+# Pre-fix, EVAL/EVALSHA/FCALL inside MULTI answered `unknown command` at EXEC
+# while the rest of the body committed. The EXEC array was still full-length,
+# so the KEY is the verdict. `SET o 1; EVAL APPEND o x; APPEND o y` must read
+# `1xy`, which also pins that the script ran at its own position. `{tx894c}`
+# co-locates every key, so at --shards > 1 this compares the command, not the
+# routing.
+script_in_multi_outcome() {
+    local port=$1
+    redis-cli -p "$port" DEL "{tx894c}o" "{tx894c}f" "{tx894c}n" >/dev/null 2>&1 || true
+    redis-cli -p "$port" FUNCTION LOAD REPLACE \
+        "$(printf "#!lua name=tx894c\nredis.register_function('tx894c_incr', function(keys, args) return redis.call('INCR', keys[1]) end)")" \
+        >/dev/null 2>&1 || true
+    printf '%s\n' 'MULTI' 'SET {tx894c}o 1' \
+        "EVAL \"return redis.call('APPEND',KEYS[1],'x')\" 1 {tx894c}o" \
+        'APPEND {tx894c}o y' \
+        "EVAL \"return redis.call('INCR',KEYS[1])\" 1 {tx894c}n" \
+        'FCALL tx894c_incr 1 {tx894c}n' 'EXEC' \
+        | redis-cli -p "$port" 2>&1 | tr '\n' ' ' || true
+    echo "| $(redis-cli -p "$port" GET "{tx894c}o" 2>&1) $(redis-cli -p "$port" GET "{tx894c}n" 2>&1)"
+}
+assert_eq "moon#894 scripts inside MULTI run at EXEC in body order (shards=$SHARDS)" \
+    "$(script_in_multi_outcome "$PORT_REDIS")" "$(script_in_multi_outcome "$PORT_RUST")"
+
 # ===========================================================================
 # RESP2 null TYPE parity (moon#482)
 # ===========================================================================

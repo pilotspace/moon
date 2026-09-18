@@ -777,6 +777,29 @@ pub(super) async fn try_handle_multi_exec(
             // committed and the aborted outcome, and a stale watch surviving
             // an abort is how a CAS retry loop livelocks.
             let watched = std::mem::take(&mut conn.watched_keys);
+            // moon#894: a queued script runs INSIDE the body, wherever the
+            // body runs. Resolve what it needs once, here, while the
+            // connection is at hand: the caller's ACL identity (every inner
+            // `redis.call` is authorized as this user, on whichever shard),
+            // the shard's function registry, and the EVAL bodies published
+            // server-wide first (moon#515) — the executor is synchronous and
+            // cannot fan out itself. `None` for a body with no script.
+            let txn_script_acl =
+                if crate::server::conn::txn_script::queue_has_script(&conn.command_queue) {
+                    crate::server::conn::txn_script::txn_script_prepass(
+                        ctx,
+                        shutdown,
+                        &conn.command_queue,
+                    )
+                    .await;
+                    crate::server::conn::core::ensure_function_registry(func_registry, ctx);
+                    Some(crate::acl::ScriptAcl::for_user(
+                        &ctx.acl_table,
+                        &conn.current_user,
+                    ))
+                } else {
+                    None
+                };
             // The body runs on THIS shard with no per-key routing, so a
             // foreign-owned key would be silently misplaced. Classify locality:
             //  - CrossShard: genuinely spans shards — a shared-nothing engine
@@ -826,6 +849,9 @@ pub(super) async fn try_handle_multi_exec(
                             // an SPSC hop and must own its tokens; the map is
                             // empty for every transaction that did not WATCH.
                             watched.clone(),
+                            // moon#894: the owner runs any queued script as
+                            // THIS connection's user.
+                            txn_script_acl.clone(),
                             &ctx.dispatch_tx,
                             &ctx.spsc_notifiers,
                         )
@@ -946,6 +972,16 @@ pub(super) async fn try_handle_multi_exec(
             // moon#606: keys the body wrote that a blocked client may be on.
             let mut exec_wakes: Vec<(usize, bytes::Bytes, crate::blocking::WaitFamily)> =
                 Vec::new();
+            let txn_scripting =
+                txn_script_acl
+                    .as_ref()
+                    .map(|acl| crate::server::conn::txn_script::TxnScripting {
+                        lua: &ctx.lua,
+                        script_cache: &ctx.script_cache,
+                        functions: func_registry,
+                        script_acl: acl,
+                        num_shards: ctx.num_shards,
+                    });
             let (mut result, aof_entries, graph_records) = execute_transaction_sharded(
                 &ctx.shard_databases,
                 ctx.shard_id,
@@ -957,6 +993,7 @@ pub(super) async fn try_handle_multi_exec(
                 &mut exec_flushes,
                 &mut exec_wakes,
                 &watched,
+                txn_scripting.as_ref(),
             );
             // moon#639: fill the slots the executor left for connection-level
             // intercepts. Snapshotted first because filling takes `&mut conn`
