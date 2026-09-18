@@ -71,22 +71,29 @@ pub fn command_rules_to_string(perms: &CommandPermissions) -> String {
             allowed,
             denied,
         } => {
-            let mut allowed_sorted: Vec<&String> = allowed.iter().collect();
-            allowed_sorted.sort();
-            let mut denied_sorted: Vec<&String> = denied.iter().collect();
-            denied_sorted.sort();
-            let grants = allowed_sorted.iter().map(|a| format!("+{a}"));
-            let revocations = denied_sorted.iter().map(|d| format!("-{d}"));
-
+            // Bare `cmd` tokens first, `cmd|arg` tokens after: on reload a
+            // bare `+cmd` / `-cmd` clears every `cmd|*` rule applied before
+            // it (`acl::subcommand`), so a `-config|set` written ahead of a
+            // `+config` would reload as `CONFIG SET` allowed -- fail-open.
+            // `cmd|arg` rules are always the newer ones in the live set, so
+            // this order reproduces them exactly.
+            fn sorted(set: &std::collections::HashSet<String>, sub: bool) -> Vec<&String> {
+                let mut v: Vec<&String> = set.iter().filter(|r| r.contains('|') == sub).collect();
+                v.sort();
+                v
+            }
             let mut parts: Vec<String> = Vec::with_capacity(1 + allowed.len() + denied.len());
-            if *base_allow {
-                parts.push("+@all".to_string());
-                parts.extend(revocations);
-                parts.extend(grants);
-            } else {
-                parts.push("-@all".to_string());
-                parts.extend(grants);
-                parts.extend(revocations);
+            parts.push(if *base_allow { "+@all" } else { "-@all" }.to_string());
+            for sub in [false, true] {
+                let grants = sorted(allowed, sub).into_iter().map(|a| format!("+{a}"));
+                let revocations = sorted(denied, sub).into_iter().map(|d| format!("-{d}"));
+                if *base_allow {
+                    parts.extend(revocations);
+                    parts.extend(grants);
+                } else {
+                    parts.extend(grants);
+                    parts.extend(revocations);
+                }
             }
             parts.join(" ")
         }
