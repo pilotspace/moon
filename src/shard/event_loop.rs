@@ -793,18 +793,38 @@ impl super::Shard {
             .clone()
             .map(|base| base.join(format!("shard-{}", shard_id)));
 
-        // B-2: resume the spill file_id counter ABOVE every recovered
-        // `heap-*.mpf`. Without this the counter restarts at 1 each boot and
-        // post-restart re-eviction overwrites cold files the rebuilt cold_index
-        // still points at, silently corrupting post-crash cold read-through.
-        // Fresh server / disk-offload off → seed 1 (unchanged from before).
-        let spill_seed =
-            crate::storage::eviction::next_spill_file_id_seed(disk_offload_dir.as_deref());
+        // B-2 / moon#997 / moon#893: resume the file_id counter — shared by
+        // KV spill files and warm vector segments — above EVERY id in use, or
+        // a restart re-mints a live `heap-*.mpf` / `segment-*` name. The
+        // startup gate (`Shard::prove_spill_file_id_seed`, run by `main` and
+        // the embedded server) proved the seed and refused to start if it
+        // could not. A shard reaching here without that gate proves it now,
+        // under the same fail-closed rule. Disk-offload off → 1: no cold
+        // file can exist.
+        let spill_seed = match (self.spill_file_id_seed, disk_offload_dir.as_deref()) {
+            (Some(seed), _) => seed,
+            (None, None) => 1,
+            (None, Some(dir)) => {
+                match crate::storage::tiered::file_id_seed::next_file_id_seed(dir, shard_id) {
+                    Ok(seed) => seed,
+                    Err(e) => {
+                        tracing::error!(
+                            "REFUSING TO START: shard {}: {} — a guessed cold file_id could \
+                             overwrite or tombstone live cold data",
+                            shard_id,
+                            e
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+        };
         spill_file_id.set(spill_seed);
         let mut next_file_id: u64 = spill_seed;
         if spill_seed > 1 {
             info!(
-                "Shard {}: spill file_id counter seeded at {} from recovered cold files",
+                "Shard {}: cold file_id counter seeded at {} (above every spill file, \
+                 warm segment and manifest entry in use)",
                 shard_id, spill_seed
             );
         }

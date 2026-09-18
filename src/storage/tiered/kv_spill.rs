@@ -92,6 +92,7 @@ pub fn write_kv_spill_pages(
     let data_dir = shard_dir.join("data");
     std::fs::create_dir_all(&data_dir)?;
     let file_path = data_dir.join(format!("heap-{file_id:06}.mpf"));
+    refuse_to_replace(&file_path)?;
 
     if pages.overflow.is_empty() {
         write_datafile(&file_path, &[&pages.leaf])?;
@@ -440,6 +441,7 @@ pub fn write_kv_spill_batch(shard_dir: &Path, file_id: u64, batch: &BatchPages) 
 
     let final_path = data_dir.join(format!("heap-{file_id:06}.mpf"));
     let tmp_path = data_dir.join(format!("heap-{file_id:06}.tmp"));
+    refuse_to_replace(&final_path)?;
 
     {
         let mut file = std::fs::File::create(&tmp_path)?;
@@ -456,6 +458,34 @@ pub fn write_kv_spill_batch(shard_dir: &Path, file_id: u64, batch: &BatchPages) 
 
     let total_pages = batch.pages.len() as u64;
     Ok(total_pages * PAGE_4K as u64)
+}
+
+/// A spill never replaces an existing `heap-*.mpf` (moon#997).
+///
+/// Both writers finish with a rename (`atomic_write_durable` / the batch's own
+/// temp+rename), and a POSIX rename silently replaces its target. The restart
+/// seed puts every new id above every file on disk, so an existing file under
+/// the name means the counter re-issued an id that is still live — overwriting
+/// it destroys every key the cold index points into it. Refusing turns that
+/// into a failed spill, which both spill paths already handle by keeping the
+/// values hot (the async path counts it in `spill_failed_reinserted`). One
+/// `lstat` per spill file.
+///
+/// Only the spill writers call this, on an id the shard's counter handed out
+/// exactly once — so the check-then-rename window has no second writer for
+/// the same name.
+fn refuse_to_replace(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to overwrite existing spill file {} (file_id re-issued)",
+                path.display()
+            ),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Startup sweep of crash-orphaned heap files in `{shard_dir}/data`.
@@ -1006,6 +1036,42 @@ mod tests {
             );
             let _ = slot_idx; // just assert no panic
         }
+    }
+
+    /// moon#997: a re-issued file_id must fail the spill, never rename over the
+    /// live file — through both writers.
+    #[test]
+    fn test_spill_writers_refuse_to_replace_an_existing_heap_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let file_id = 12u64;
+        let live = build_kv_spill_batch(&make_inline_entries(3), file_id).unwrap();
+        write_kv_spill_batch(shard_dir, file_id, &live).unwrap();
+        let path = shard_dir
+            .join("data")
+            .join(format!("heap-{file_id:06}.mpf"));
+        let before = std::fs::read(&path).unwrap();
+
+        let other = build_kv_spill_batch(&make_inline_entries(1), file_id).unwrap();
+        let err = write_kv_spill_batch(shard_dir, file_id, &other).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            !shard_dir
+                .join("data")
+                .join(format!("heap-{file_id:06}.tmp"))
+                .exists(),
+            "the refused batch must not leave a .tmp behind"
+        );
+
+        let pages = build_kv_spill_pages(b"k", b"v", ValueType::String, 0, None, file_id).unwrap();
+        let err = write_kv_spill_pages(shard_dir, file_id, &pages).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the live heap file must be byte-identical after both refusals"
+        );
     }
 
     /// write_kv_spill_batch must produce an atomic file and

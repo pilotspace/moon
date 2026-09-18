@@ -647,15 +647,25 @@ impl ShardManifest {
         self.active_root.entries.push(entry);
     }
 
-    /// Mark a file as Tombstone by file_id (in-memory only until commit).
+    /// Mark the `file_type` file with `file_id` as Tombstone (in-memory only
+    /// until commit).
+    ///
+    /// Matches on `(file_id, file_type)`, never on the id alone (moon#893).
+    /// A KV spill file (`KvLeaf`, `data/heap-{id}.mpf`) and a warm vector
+    /// segment (`VecCodes`, `vectors/segment-{id}/`) are different artifacts,
+    /// and a manifest written before the file_id seed covered every artifact
+    /// kind can hold one of each under the same id. Retiring a vanished
+    /// segment's entry by id alone tombstoned the live spill file beside it,
+    /// and every key in it read as absent after the next restart.
     ///
     /// Records the tombstone in the in-memory registry with the current epoch
     /// and wall-clock instant so `gc_tombstones` can enforce two-axis retention.
     /// The epoch recorded is the pre-commit epoch; after `commit()` the active
     /// epoch is incremented by 1, so tombstone age in epochs = current_epoch - tombstone_epoch.
-    pub fn remove_file(&mut self, file_id: u64) {
+    pub fn remove_file(&mut self, file_id: u64, file_type: PageType) {
+        let file_type = file_type as u8;
         for entry in &mut self.active_root.entries {
-            if entry.file_id == file_id {
+            if entry.file_id == file_id && entry.file_type == file_type {
                 entry.status = FileStatus::Tombstone;
                 // Register tombstone with current epoch and monotonic clock.
                 // Use entry() to avoid overwriting an existing registry entry
@@ -1823,7 +1833,7 @@ mod tests {
         m.commit().unwrap();
 
         // id 150 lives in the overflow region (inline cap is 70).
-        m.remove_file(150);
+        m.remove_file(150, PageType::KvLeaf);
         let pruned = m.gc_tombstones(0, 0, std::time::Instant::now());
         assert_eq!(pruned, 1, "overflow-region tombstone must be prunable");
         m.commit().unwrap();
@@ -1941,7 +1951,7 @@ mod tests {
         m.commit().unwrap();
 
         // Remove file 2
-        m.remove_file(2);
+        m.remove_file(2, PageType::KvLeaf);
         m.commit().unwrap();
 
         let m2 = ShardManifest::open(&path).unwrap();
@@ -1949,6 +1959,35 @@ mod tests {
         assert_eq!(m2.files()[1].status, FileStatus::Tombstone);
         assert_eq!(m2.files()[0].status, FileStatus::Active);
         assert_eq!(m2.files()[2].status, FileStatus::Active);
+    }
+
+    /// moon#893: one id, two artifact kinds — `remove_file` retires only the
+    /// kind it is asked for.
+    #[test]
+    fn test_remove_file_matches_file_type_not_id_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        let mut m = ShardManifest::create(&path).unwrap();
+        let mut warm = make_entry(5);
+        warm.file_type = PageType::VecCodes as u8;
+        warm.tier = StorageTier::Warm;
+        m.add_file(warm);
+        m.add_file(make_entry(5)); // KvLeaf, same id
+        m.commit().unwrap();
+
+        m.remove_file(5, PageType::VecCodes);
+        m.commit().unwrap();
+
+        let m2 = ShardManifest::open(&path).unwrap();
+        let status = |t: PageType| {
+            m2.files()
+                .iter()
+                .find(|e| e.file_type == t as u8)
+                .map(|e| e.status)
+        };
+        assert_eq!(status(PageType::VecCodes), Some(FileStatus::Tombstone));
+        assert_eq!(status(PageType::KvLeaf), Some(FileStatus::Active));
     }
 
     #[test]
