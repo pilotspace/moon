@@ -49,6 +49,39 @@ fn superseded(epoch: u64) -> bool {
     REPLICA_TASK_EPOCH.load(Ordering::Acquire) != epoch
 }
 
+/// The reply for any command that would turn a multi-shard node into a
+/// replica (`REPLICAOF host port`, `SLAVEOF host port`, `CLUSTER REPLICATE`).
+///
+/// Streaming replication applies into a single shard only (see the guard at
+/// the top of [`run_replica_task`]); multi-shard replicas are moon#406.
+pub const MULTI_SHARD_REPLICA_REFUSAL: &[u8] = b"ERR replica mode requires --shards 1: \
+this node runs more than one shard and multi-shard replicas are not supported yet (moon#406)";
+
+/// Whether a node with `num_shards` shards can run the replica task.
+///
+/// The ONE predicate behind both the command-time refusal
+/// ([`replica_start_refusal`]) and the task's own guard, so the two cannot
+/// drift: a node the task would refuse is always refused at the command,
+/// before anything is acknowledged.
+#[must_use]
+#[inline]
+pub fn replica_supported(num_shards: usize) -> bool {
+    num_shards == 1
+}
+
+/// Refusal for a replica start on this node, or `None` when it may proceed.
+///
+/// Every handler that starts a replica task MUST consult this BEFORE it
+/// changes the role or bumps [`bump_replica_task_epoch`] (moon#1015). Doing
+/// either first acknowledged `+OK`, flipped the node read-only and killed any
+/// running replica task — and then the task refused to start, logging the
+/// reason where no client would ever see it.
+#[must_use]
+pub fn replica_start_refusal(num_shards: usize) -> Option<crate::protocol::Frame> {
+    (!replica_supported(num_shards))
+        .then(|| crate::protocol::Frame::Error(Bytes::from_static(MULTI_SHARD_REPLICA_REFUSAL)))
+}
+
 /// Configuration for the replica outbound connection task.
 pub struct ReplicaTaskConfig {
     pub master_host: String,
@@ -87,8 +120,12 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
     // misread the master's single diskless RDB bulk and mis-route the command
     // stream (see `apply::load_snapshot`, which is thread-local and clears all
     // dbs per call), silently diverging. Refuse loudly rather than loop forever
-    // on a broken sync. Multi-shard replica apply is tracked for R2.
-    if cfg.num_shards != 1 {
+    // on a broken sync. Multi-shard replica apply is tracked for R2 (moon#406).
+    //
+    // Defence in depth only: every command that spawns this task refuses a
+    // multi-shard node first via `replica_start_refusal` (same predicate), so
+    // this line is unreachable behind a `+OK` (moon#1015).
+    if !replica_supported(cfg.num_shards) {
         tracing::error!(
             "Replica: streaming replication currently supports single-shard only \
              (--shards 1); this node has {} shards. Not starting replication.",
@@ -438,8 +475,12 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
     // misread the master's single diskless RDB bulk and mis-route the command
     // stream (see `apply::load_snapshot`, which is thread-local and clears all
     // dbs per call), silently diverging. Refuse loudly rather than loop forever
-    // on a broken sync. Multi-shard replica apply is tracked for R2.
-    if cfg.num_shards != 1 {
+    // on a broken sync. Multi-shard replica apply is tracked for R2 (moon#406).
+    //
+    // Defence in depth only: every command that spawns this task refuses a
+    // multi-shard node first via `replica_start_refusal` (same predicate), so
+    // this line is unreachable behind a `+OK` (moon#1015).
+    if !replica_supported(cfg.num_shards) {
         tracing::error!(
             "Replica: streaming replication currently supports single-shard only \
              (--shards 1); this node has {} shards. Not starting replication.",
@@ -904,4 +945,35 @@ fn encode_replconf_ack(offset: u64) -> Vec<u8> {
     buf.extend_from_slice(off.as_bytes());
     buf.extend_from_slice(b"\r\n");
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Frame;
+
+    /// moon#1015: the command-time refusal and the task's own guard share ONE
+    /// predicate, so a shard count the task refuses is always refused first.
+    #[test]
+    fn replica_start_refusal_matches_the_task_guard() {
+        for n in 1..=16 {
+            assert_eq!(
+                replica_start_refusal(n).is_none(),
+                replica_supported(n),
+                "num_shards={n}: refusal and task guard disagree"
+            );
+        }
+        assert!(replica_start_refusal(1).is_none());
+    }
+
+    #[test]
+    fn replica_start_refusal_names_the_remedy_and_the_tracking_issue() {
+        let Some(Frame::Error(msg)) = replica_start_refusal(4) else {
+            panic!("a 4-shard node must be refused with an error frame");
+        };
+        assert!(msg.starts_with(b"ERR "), "{msg:?}");
+        let text = String::from_utf8_lossy(&msg);
+        assert!(text.contains("--shards 1"), "{text}");
+        assert!(text.contains("moon#406"), "{text}");
+    }
 }

@@ -32,6 +32,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ERR weight value is not a float`. Infinite weights remain legal. A client
   relying on either form silently doing nothing will now see an error.
 
+- **BEHAVIOUR CHANGE — `REPLICAOF`/`SLAVEOF host port` and `CLUSTER REPLICATE`
+  on a `--shards > 1` node now error instead of replying `+OK`** (moon#1015).
+  Streaming replication applies into one shard only (multi-shard replicas are
+  moon#406), so the replica task already refused such a node — but only in the
+  server log, AFTER the handler had acked `+OK`, flipped the node to a
+  read-only replica and killed any running replica task. The node then refused
+  every write while holding none of the master's data. The handlers now refuse
+  first, with `ERR replica mode requires --shards 1: this node runs more than
+  one shard and multi-shard replicas are not supported yet (moon#406)`, and
+  leave the role, the running replica task and the cluster view untouched.
+  `REPLICAOF NO ONE` is unaffected, and so is a `--shards 1` node. One shared
+  predicate gates all four call sites (monoio and tokio `REPLICAOF`, monoio and
+  tokio `CLUSTER REPLICATE`) and the replica task's own guard, so they cannot
+  drift apart. An admin script that retried until `+OK` will now see the error.
+
 ### Fixed
 
 - **The moon#507 pipeline wait set is derived from `COMMAND_META` instead of a
