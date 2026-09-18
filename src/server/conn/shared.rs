@@ -2191,6 +2191,12 @@ fn touches_a_key_it_did_not_route_on(cmd: &[u8]) -> bool {
         // path — strictly worse than either endpoint. See the family doc
         // above for the measured pop.
         (5, b'l') => cmd.eq_ignore_ascii_case(b"LMPOP"),
+        // moon#989: the blocking twins. They never reach the pre-routing
+        // guard — the connection handlers intercept every blocking command
+        // first — so `blocking::immediate_scan` consults this function itself,
+        // before it pops or registers anything. Listed HERE so there is one
+        // family list, not two that can drift.
+        (6, b'b') => cmd.eq_ignore_ascii_case(b"BLMPOP") || cmd.eq_ignore_ascii_case(b"BZMPOP"),
         (3, b'l') => cmd.eq_ignore_ascii_case(b"LCS"),
         (5, b'z') => cmd.eq_ignore_ascii_case(b"ZMPOP") || cmd.eq_ignore_ascii_case(b"ZDIFF"),
         (6, b's') => cmd.eq_ignore_ascii_case(b"SINTER") || cmd.eq_ignore_ascii_case(b"SUNION"),
