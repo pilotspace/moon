@@ -48,19 +48,41 @@ impl std::fmt::Write for F64Display {
     }
 }
 
+/// Write one line-framed reply -- `+status`, `-error`, `(bignumber` -- as
+/// `<prefix><payload>\r\n`, with every CR and LF in `payload` written as a
+/// space.
+///
+/// A line-framed reply ends at the first `\r\n`, so an unescaped CR/LF lets
+/// whoever controls the payload end the reply early and append replies the
+/// server never sent: error texts quote client input (an unknown command
+/// name, an `ACL SETUSER` rule), and a client that pipelines would then read
+/// the injected tail as the answer to its NEXT command. Redis does the same
+/// mapping for error text (`addReplyErrorFormat`: `sdsmapchars(s, "\r\n",
+/// "  ", 2)`); doing it here, where every line-framed type is written, covers
+/// every producer instead of each call site that happens to quote input.
+///
+/// Allocation-free: a payload with no CR/LF (every reply in practice) is one
+/// `memchr2` scan and one copy, as before; otherwise the runs between
+/// offending bytes are copied straight into `buf`.
+#[inline]
+pub fn put_line(buf: &mut BytesMut, prefix: u8, payload: &[u8]) {
+    buf.reserve(payload.len() + 3);
+    buf.put_u8(prefix);
+    let mut start = 0;
+    for i in memchr::memchr2_iter(b'\r', b'\n', payload) {
+        buf.put_slice(&payload[start..i]);
+        buf.put_u8(b' ');
+        start = i + 1;
+    }
+    buf.put_slice(&payload[start..]);
+    buf.put_slice(b"\r\n");
+}
+
 /// Serialize a Frame into RESP2 wire format, appending to the buffer.
 pub fn serialize(frame: &Frame, buf: &mut BytesMut) {
     match frame {
-        Frame::SimpleString(s) => {
-            buf.put_u8(b'+');
-            buf.put_slice(s);
-            buf.put_slice(b"\r\n");
-        }
-        Frame::Error(s) => {
-            buf.put_u8(b'-');
-            buf.put_slice(s);
-            buf.put_slice(b"\r\n");
-        }
+        Frame::SimpleString(s) => put_line(buf, b'+', s),
+        Frame::Error(s) => put_line(buf, b'-', s),
         Frame::Integer(n) => {
             buf.put_u8(b':');
             let mut itoa_buf = itoa::Buffer::new();
@@ -175,16 +197,8 @@ pub fn serialize(frame: &Frame, buf: &mut BytesMut) {
 /// New RESP3 types use their native wire format.
 pub fn serialize_resp3(frame: &Frame, buf: &mut BytesMut) {
     match frame {
-        Frame::SimpleString(s) => {
-            buf.put_u8(b'+');
-            buf.put_slice(s);
-            buf.put_slice(b"\r\n");
-        }
-        Frame::Error(s) => {
-            buf.put_u8(b'-');
-            buf.put_slice(s);
-            buf.put_slice(b"\r\n");
-        }
+        Frame::SimpleString(s) => put_line(buf, b'+', s),
+        Frame::Error(s) => put_line(buf, b'-', s),
         Frame::Integer(n) => {
             buf.put_u8(b':');
             let mut itoa_buf = itoa::Buffer::new();
@@ -239,11 +253,7 @@ pub fn serialize_resp3(frame: &Frame, buf: &mut BytesMut) {
             }
             buf.put_slice(b"\r\n");
         }
-        Frame::BigNumber(n) => {
-            buf.put_u8(b'(');
-            buf.put_slice(n);
-            buf.put_slice(b"\r\n");
-        }
+        Frame::BigNumber(n) => put_line(buf, b'(', n),
         Frame::VerbatimString { encoding, data } => {
             buf.put_u8(b'=');
             let total_len = encoding.len() + 1 + data.len();
@@ -768,5 +778,92 @@ mod tests {
     fn test_resp2_null_still_dollar_minus_one() {
         let buf = serialize_frame(&Frame::Null);
         assert_eq!(&buf[..], b"$-1\r\n");
+    }
+
+    /// A line-framed reply (`-err`, `+status`, `(bignum`) cannot carry CR or
+    /// LF: the first `\r\n` ends the reply and the rest parses as a second
+    /// reply the server never sent. Redis maps both bytes to spaces in error
+    /// text; the expected bytes are redis-server 8.6.1's for the same input.
+    #[test]
+    fn test_line_replies_never_carry_cr_or_lf() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (
+                b"ERR Error in ACL SETUSER modifier '-@bogus\r\n+INJECTED': Unknown command or category name in ACL",
+                b"ERR Error in ACL SETUSER modifier '-@bogus  +INJECTED': Unknown command or category name in ACL",
+            ),
+            (
+                b"ERR unknown command 'foo\r\n+INJ2'",
+                b"ERR unknown command 'foo  +INJ2'",
+            ),
+            (
+                b"ERR unknown command '\r\nfoo\r\n'",
+                b"ERR unknown command '  foo  '",
+            ),
+            (
+                b"ERR unknown subcommand 'x\ry\nz'. Try CONFIG HELP.",
+                b"ERR unknown subcommand 'x y z'. Try CONFIG HELP.",
+            ),
+            (b"\r\n", b"  "),
+            (b"\n\n\n", b"   "),
+            (b"", b""),
+            (b"ERR plain", b"ERR plain"),
+        ];
+        for (raw, clean) in cases {
+            let raw = Bytes::copy_from_slice(raw);
+            for (prefix, frame) in [
+                (b'-', Frame::Error(raw.clone())),
+                (b'+', Frame::SimpleString(raw.clone())),
+            ] {
+                let mut expected = vec![prefix];
+                expected.extend_from_slice(clean);
+                expected.extend_from_slice(b"\r\n");
+                assert_eq!(&serialize_frame(&frame)[..], &expected[..], "RESP2 {raw:?}");
+                assert_eq!(
+                    &serialize_resp3_frame(&frame)[..],
+                    &expected[..],
+                    "RESP3 {raw:?}"
+                );
+            }
+            let mut expected = b"(".to_vec();
+            expected.extend_from_slice(clean);
+            expected.extend_from_slice(b"\r\n");
+            let big = Frame::BigNumber(raw.clone());
+            assert_eq!(
+                &serialize_resp3_frame(&big)[..],
+                &expected[..],
+                "BigNumber {raw:?}"
+            );
+        }
+    }
+
+    /// Whatever bytes an error carries, its serialized reply parses back as
+    /// exactly ONE frame that consumes the whole buffer -- the property the
+    /// injection broke. Every single-byte payload, in both protocols, and
+    /// nested inside an array.
+    #[test]
+    fn test_any_error_payload_is_exactly_one_frame() {
+        let cfg = ParseConfig::default();
+        let mut payloads: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b'E', b, b'x']).collect();
+        payloads.push(b"a\r\n-b\r\n+c\r\n:1\r\n".to_vec());
+        payloads.push(b"\r\r\n\n\r".to_vec());
+        for p in payloads {
+            let frame = Frame::Error(Bytes::from(p.clone()));
+            for wire in [serialize_frame(&frame), serialize_resp3_frame(&frame)] {
+                let mut buf = wire.clone();
+                let parsed = parse::parse(&mut buf, &cfg)
+                    .unwrap_or_else(|e| panic!("{p:?}: parse error {e:?}"))
+                    .unwrap_or_else(|| panic!("{p:?}: incomplete"));
+                assert!(matches!(parsed, Frame::Error(_)), "{p:?}");
+                assert!(buf.is_empty(), "{p:?}: {} trailing bytes", buf.len());
+            }
+            let arr = Frame::Array(framevec![frame.clone(), Frame::Integer(7)]);
+            let mut buf = serialize_frame(&arr);
+            let parsed = parse::parse(&mut buf, &cfg).ok().flatten();
+            assert!(
+                matches!(parsed, Some(Frame::Array(ref v)) if v.len() == 2),
+                "{p:?}"
+            );
+            assert!(buf.is_empty(), "{p:?}");
+        }
     }
 }
