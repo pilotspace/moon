@@ -883,7 +883,7 @@ fn apply_completion_vec(
 
         // RAM-only manifest update; durability handled once per batch below.
         if let Some(ref mut manifest) = *shard_manifest {
-            manifest.add_file(c.file_entry);
+            manifest.add_file(c.file_entry).unwrap();
             manifest_dirty = true;
         }
 

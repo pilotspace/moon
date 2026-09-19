@@ -444,19 +444,21 @@ fn build_newest_first_corpus(off: &Path, shards: usize) {
         // NEWEST FIRST — the order a durable batch committed while an async
         // completion was still in flight leaves in the manifest.
         for &(file_id, page_count, byte_size) in written.iter().rev() {
-            manifest.add_file(FileEntry {
-                file_id,
-                file_type: PageType::KvLeaf as u8,
-                status: FileStatus::Active,
-                tier: StorageTier::Hot,
-                page_size_log2: 12,
-                page_count,
-                byte_size,
-                created_lsn: 0,
-                db_index: 0,
-                max_key_hash: 0,
-                last_modified_lsn: 0,
-            });
+            manifest
+                .add_file(FileEntry {
+                    file_id,
+                    file_type: PageType::KvLeaf as u8,
+                    status: FileStatus::Active,
+                    tier: StorageTier::Hot,
+                    page_size_log2: 12,
+                    page_count,
+                    byte_size,
+                    created_lsn: 0,
+                    db_index: 0,
+                    max_key_hash: 0,
+                    last_modified_lsn: 0,
+                })
+                .unwrap();
         }
         manifest.commit().unwrap();
         let ids: Vec<u64> = manifest.files().iter().map(|e| e.file_id).collect();

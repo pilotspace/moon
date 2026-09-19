@@ -77,8 +77,8 @@ fn crash_manifest_gc_before_commit_recovers_pre_staging_root() {
 
     // Create manifest, add two files, commit to stable epoch 2.
     let mut m = ShardManifest::create(&path).unwrap();
-    m.add_file(make_entry(1));
-    m.add_file(make_entry(2));
+    m.add_file(make_entry(1)).unwrap();
+    m.add_file(make_entry(2)).unwrap();
     m.commit().unwrap(); // epoch 2 on Root B (active_slot = 1)
 
     // Tombstone file #2 and commit — epoch 3 on Root A (active_slot = 0).
