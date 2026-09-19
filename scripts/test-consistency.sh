@@ -1011,6 +1011,29 @@ assert_both "ZRANGE BYLEX valid bound missing key"    ZRANGE z:1060:nokey - + BY
 both ZADD z:1060:exists 1 m
 assert_both "ZRANGEBYSCORE bad bound existing key"    ZRANGEBYSCORE z:1060:exists a b
 
+# moon#1102 -- ZRANGESTORE had the moon#1060 defect: it looked the SOURCE up
+# before parsing the range, so a bad bound against a missing source answered
+# :0 and DELETED the destination, and against a wrong-type source answered
+# WRONGTYPE. Redis parses the rank, BYSCORE or BYLEX range first. One hash tag
+# keeps source and destination on one shard at every --shards.
+assert_both "ZRANGESTORE BYSCORE bad bound missing src"      ZRANGESTORE "{z1102}d" "{z1102}nokey" a b BYSCORE
+assert_both "ZRANGESTORE BYSCORE REV LIMIT bad bound"        ZRANGESTORE "{z1102}d" "{z1102}nokey" a b BYSCORE REV LIMIT 0 1
+assert_both "ZRANGESTORE BYLEX bad bound missing src"        ZRANGESTORE "{z1102}d" "{z1102}nokey" a b BYLEX
+assert_both "ZRANGESTORE BYLEX REV LIMIT bad bound"          ZRANGESTORE "{z1102}d" "{z1102}nokey" b a BYLEX REV LIMIT 0 1
+assert_both "ZRANGESTORE rank bad bound missing src"         ZRANGESTORE "{z1102}d" "{z1102}nokey" a b
+assert_both "ZRANGESTORE rank REV bad bound missing src"     ZRANGESTORE "{z1102}d" "{z1102}nokey" 0 b REV
+both SET "{z1102}d" keep
+assert_both "ZRANGESTORE bad bound keeps dst: reply"         ZRANGESTORE "{z1102}d" "{z1102}nokey" a b BYSCORE
+assert_both "ZRANGESTORE bad bound keeps dst: dst"           EXISTS "{z1102}d"
+both SET "{z1102}s" str
+assert_both "ZRANGESTORE bad bound wrong-type src"           ZRANGESTORE "{z1102}d" "{z1102}s" a b BYSCORE
+# Controls: a valid range on a missing source is still :0 (and removes dst, as
+# redis does); a valid range on a wrong-type source is still WRONGTYPE.
+assert_both "ZRANGESTORE valid range missing src"            ZRANGESTORE "{z1102}d" "{z1102}nokey" 0 1 BYSCORE
+assert_both "ZRANGESTORE valid range removed dst"            EXISTS "{z1102}d"
+assert_both "ZRANGESTORE valid range wrong-type src"         ZRANGESTORE "{z1102}d" "{z1102}s" 0 1 BYSCORE
+both DEL "{z1102}s"
+
 # moon#1001 -- ZRANGE, ZREVRANGE and ZRANGESTORE clamped a STOP still
 # negative after `len + stop` to 0, so `ZRANGE z -10 -6` on a five-member
 # zset answered one element where redis answers an empty array. Verified
@@ -1780,6 +1803,27 @@ assert_eq "moon#1076 CONFIG SET (1 arg) aborts the transaction (shards=$SHARDS)"
 assert_eq "moon#1076 CLIENT GETNAME (correct arity) still queues (shards=$SHARDS)" \
     "$(bad_subcommand_arity_in_multi_outcome "$PORT_REDIS" "CLIENT GETNAME" "tx1076:e")" \
     "$(bad_subcommand_arity_in_multi_outcome "$PORT_RUST" "CLIENT GETNAME" "tx1076:e")"
+
+# ---------------------------------------------------------------------------
+# moon#1098: a WAIT queued inside MULTI parks EXEC for its whole timeout
+# ---------------------------------------------------------------------------
+#
+# Redis runs a transaction body with CLIENT_DENY_BLOCKING, so a queued WAIT
+# answers the current ack count at once. Moon filled it with the live WAIT,
+# which polled until its deadline: the reply was right, the time was not. The
+# verdict is the transcript plus whether EXEC came back in under 2 s of a 3 s
+# WAIT (bash SECONDS ticks in whole seconds, so a parked EXEC reads >= 2).
+wait_in_multi_outcome() {
+    local port=$1 start took reply
+    redis-cli -p "$port" DEL "tx1098:k" >/dev/null 2>&1 || true
+    start=$SECONDS
+    reply=$(printf '%s\n' 'MULTI' 'INCR tx1098:k' 'WAIT 1 3000' 'EXEC' \
+        | redis-cli -p "$port" 2>&1 | tr '\n' ' ' || true)
+    took=$((SECONDS - start))
+    if (( took < 2 )); then echo "${reply}| prompt"; else echo "${reply}| parked ${took}s"; fi
+}
+assert_eq "moon#1098 WAIT inside MULTI answers at once (shards=$SHARDS)" \
+    "$(wait_in_multi_outcome "$PORT_REDIS")" "$(wait_in_multi_outcome "$PORT_RUST")"
 
 # ---------------------------------------------------------------------------
 # moon#1077: unknown-command error never lists the arguments and appends the

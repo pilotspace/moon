@@ -92,6 +92,23 @@ pub enum AofAck {
 pub static AOF_BACKPRESSURE_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Routed write legs that had to wait, before applying anything, for their
+/// shard's AOF writer to make room (moon#769): each one parked at the head of
+/// its producer's SPSC ring at least once, while the shard kept serving
+/// everything else. Exposed in INFO as `aof_backpressure_stalls`. Non-zero
+/// means the writer's channel ran within the admission headroom of full,
+/// usually behind a slow fsync.
+pub static AOF_BACKPRESSURE_STALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Commands refused WITHOUT being applied because their shard's AOF writer
+/// could not take their records within the routed admission wait
+/// (`--aof-fsync-timeout-ms`, capped; moon#769).
+/// Exposed in INFO as `aof_backpressure_refused`. Nothing is lost when this
+/// is counted: the refused commands never ran.
+pub static AOF_BACKPRESSURE_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Total everysec deadline-fsync failures across all AOF writers (both
 /// runtimes, both layouts). Monotonic; exposed as `aof_fsync_failures`.
 pub static AOF_FSYNC_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -236,6 +253,48 @@ impl FsyncPolicy {
     }
 }
 
+/// Which fold generation a record's mutation belongs to (#455).
+///
+/// Every AOF writer has a fold epoch that the rewrite fold advances at its
+/// snapshot instant, under the same exclusion that makes the snapshot exact
+/// (the shard's `AofFold` handler, or every db write guard). A record carries
+/// the epoch read in the SAME synchronous section as the mutation it logs:
+///
+/// - `epoch < snapshot epoch`: the mutation happened before the snapshot, so
+///   its effect is in the new base.
+/// - `epoch >= snapshot epoch`: it happened after, so the record belongs in
+///   the new incr.
+///
+/// The fold used to split records by *position* only (the channel length and
+/// the overflow buffer length at the snapshot). That assumes enqueue is atomic
+/// with the mutation. It is not when a producer parks between the two (full
+/// channel), or when an await separates a mutation from its enqueue (EXEC with
+/// a connection intercept, the local half of a broadcast FLUSH). Such a record
+/// reached the writer after the cut, was written into the new incr, and
+/// replayed on top of a base that already held its effect. Non-idempotent
+/// commands (INCR, APPEND, LPUSH) then double-applied after a restart.
+///
+/// Once a fold's new generation is the committed one, the writer drops every
+/// non-empty record stamped below that snapshot epoch (its "floor"). An
+/// aborted fold leaves the floor where it was, because the old base predates
+/// everything. The stamp lives only in memory and is never written to disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FoldEpoch(pub u64);
+
+impl FoldEpoch {
+    /// The epoch every writer starts in, before its first fold. A record
+    /// stamped with it is never below any writer's floor until a fold
+    /// takes effect.
+    pub const INITIAL: FoldEpoch = FoldEpoch(0);
+
+    /// `true` when a record stamped `self` is already in the base of the
+    /// generation whose snapshot epoch is `floor`.
+    #[inline]
+    pub fn folded_below(self, floor: FoldEpoch) -> bool {
+        self < floor
+    }
+}
+
 /// Messages sent to the AOF writer task via mpsc channel.
 pub enum AofMessage {
     /// Append serialized RESP command bytes to the AOF file, tagged with the
@@ -263,7 +322,15 @@ pub enum AofMessage {
     /// `SELECT` commands are connection-state only and are never persisted
     /// (see `metadata::is_persisted_write`). A zero-length payload (the
     /// `fsync_barrier` H1-BARRIER) never triggers or observes a db switch.
-    Append { lsn: u64, db: usize, bytes: Bytes },
+    ///
+    /// `epoch` is the writer's [`FoldEpoch`] read in the same synchronous
+    /// section as the mutation this record logs (#455) — never on disk.
+    Append {
+        lsn: u64,
+        db: usize,
+        bytes: Bytes,
+        epoch: FoldEpoch,
+    },
     /// Append + fsync + ack rendezvous (RFC § 4 — Fix 2 for the H1
     /// data-loss vector exposed by `appendfsync=always`).
     ///
@@ -282,11 +349,15 @@ pub enum AofMessage {
     /// mechanism plus tests. Per-handler integration (which sites use
     /// AppendSync vs Append) is wired in step 9 before lifting the
     /// `--unsafe-multishard-aof` gate.
+    ///
+    /// `epoch`: see [`AofMessage::Append`]. A zero-length barrier is never
+    /// folded away — it logs no mutation, it only waits for the fsync.
     AppendSync {
         lsn: u64,
         db: usize,
         bytes: Bytes,
         ack: crate::runtime::channel::OneshotSender<AofAck>,
+        epoch: FoldEpoch,
     },
     /// Trigger a full AOF rewrite (compaction) using current database state.
     /// The [`rewrite::RewriteOverflow`] is this writer's rewrite-window spill
@@ -772,24 +843,83 @@ pub(crate) fn select_prefix_if_needed(
 /// (a framed `[u64 lsn=0][u32 len]` header for the PerShard loops, raw bytes
 /// for TopLevel), so no per-loop special-casing of the SELECT bytes is
 /// needed.
-pub(crate) fn inject_select_records(data: Vec<AofMessage>, last_db: &mut usize) -> Vec<AofMessage> {
+///
+/// It first drops every record already folded into the committed base
+/// (`floor`, see [`keep_unless_folded`]). That makes this the single place
+/// where all four batch loops apply the #455 filter.
+pub(crate) fn inject_select_records(
+    data: Vec<AofMessage>,
+    floor: FoldEpoch,
+    last_db: &mut usize,
+) -> Vec<AofMessage> {
     let mut out = Vec::with_capacity(data.len());
     for msg in data {
-        let (db, is_empty) = match &msg {
-            AofMessage::Append { db, bytes, .. } => (*db, bytes.is_empty()),
-            AofMessage::AppendSync { db, bytes, .. } => (*db, bytes.is_empty()),
-            _ => (0, true),
+        // #455: a record already folded into the committed base is dropped
+        // BEFORE the db-context bookkeeping, so it never injects a SELECT.
+        let Some(msg) = keep_unless_folded(msg, floor) else {
+            continue;
+        };
+        let (db, is_empty, epoch) = match &msg {
+            AofMessage::Append {
+                db, bytes, epoch, ..
+            } => (*db, bytes.is_empty(), *epoch),
+            AofMessage::AppendSync {
+                db, bytes, epoch, ..
+            } => (*db, bytes.is_empty(), *epoch),
+            _ => (0, true, FoldEpoch::INITIAL),
         };
         if let Some(select_bytes) = select_prefix_if_needed(db, is_empty, last_db) {
             out.push(AofMessage::Append {
                 lsn: 0,
                 db,
                 bytes: select_bytes,
+                epoch,
             });
         }
         out.push(msg);
     }
     out
+}
+
+/// Records whose mutation preceded a fold's snapshot but that reached their
+/// writer only after that fold's generation took effect — dropped instead of
+/// written, because the new base already holds their effect (#455). Non-zero
+/// means producers were parked (or awaiting) between a mutation and its
+/// enqueue across a rewrite. Each one would have double-applied on replay.
+pub static AOF_REWRITE_LATE_RECORDS_FOLDED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Whether `msg` logs a mutation that is already inside the base of the
+/// generation whose snapshot epoch is `floor` (#455). Zero-length barriers
+/// and control messages never are.
+#[inline]
+pub(crate) fn is_folded(msg: &AofMessage, floor: FoldEpoch) -> bool {
+    match msg {
+        AofMessage::Append { bytes, epoch, .. } | AofMessage::AppendSync { bytes, epoch, .. } => {
+            !bytes.is_empty() && epoch.folded_below(floor)
+        }
+        _ => false,
+    }
+}
+
+/// The writer-side half of the fold's exactly-once contract (#455).
+///
+/// `floor` is the snapshot epoch of the generation the writer is appending to
+/// (`FoldEpoch::INITIAL` before any fold took effect). Returns `None` — the
+/// record is consumed — when `msg` logs a mutation already inside that
+/// generation's base. A consumed `AppendSync` is acked `Synced` on the spot:
+/// the base that holds its effect was fsynced before the floor was raised.
+/// Everything else is returned untouched: control messages, zero-length
+/// barriers (they log nothing), and records at or above the floor.
+pub(crate) fn keep_unless_folded(msg: AofMessage, floor: FoldEpoch) -> Option<AofMessage> {
+    if !is_folded(&msg, floor) {
+        return Some(msg);
+    }
+    AOF_REWRITE_LATE_RECORDS_FOLDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let AofMessage::AppendSync { ack, .. } = msg {
+        let _ = ack.send(AofAck::Synced);
+    }
+    None
 }
 
 /// Whether legacy best-effort skip-and-resync on mid-stream AOF corruption is
@@ -1618,5 +1748,102 @@ mod tests {
             ci.lookup(b"spilled:key").is_some(),
             "the spilled key must still resolve after the preamble load"
         );
+    }
+}
+
+#[cfg(test)]
+mod fold_floor_tests {
+    //! The steady-state half of the fold's exactly-once contract (#455): the
+    //! batch loops drop records a committed base already holds.
+
+    use super::*;
+
+    fn append(payload: &'static [u8], db: usize, epoch: FoldEpoch) -> AofMessage {
+        AofMessage::Append {
+            lsn: 0,
+            db,
+            bytes: Bytes::from_static(payload),
+            epoch,
+        }
+    }
+
+    fn payloads(batch: &[AofMessage]) -> Vec<Vec<u8>> {
+        batch
+            .iter()
+            .map(|m| match m {
+                AofMessage::Append { bytes, .. } | AofMessage::AppendSync { bytes, .. } => {
+                    bytes.to_vec()
+                }
+                _ => b"<control>".to_vec(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn batch_filter_drops_records_below_the_floor_and_acks_them() {
+        let floor = FoldEpoch(3);
+        let (ack_tx, ack_rx) = crate::runtime::channel::oneshot::<AofAck>();
+        let batch = vec![
+            append(b"pre", 0, FoldEpoch(2)),
+            AofMessage::AppendSync {
+                lsn: 0,
+                db: 0,
+                bytes: Bytes::from_static(b"pre-sync"),
+                ack: ack_tx,
+                epoch: FoldEpoch(2),
+            },
+            append(b"post", 0, FoldEpoch(3)),
+        ];
+        let mut last_db = 0usize;
+        let out = inject_select_records(batch, floor, &mut last_db);
+        assert_eq!(payloads(&out), vec![b"post".to_vec()]);
+        assert_eq!(
+            ack_rx.try_recv(),
+            Ok(AofAck::Synced),
+            "a dropped AppendSync is durable via the committed base"
+        );
+    }
+
+    #[test]
+    fn a_dropped_record_never_switches_the_db_context() {
+        // The pre-snapshot record in db 5 is dropped: no SELECT 5 may be
+        // injected for it, or the post-snapshot db-0 record would replay
+        // into db 5.
+        let floor = FoldEpoch(1);
+        let batch = vec![
+            append(b"pre-db5", 5, FoldEpoch::INITIAL),
+            append(b"post-db0", 0, FoldEpoch(1)),
+        ];
+        let mut last_db = 0usize;
+        let out = inject_select_records(batch, floor, &mut last_db);
+        assert_eq!(payloads(&out), vec![b"post-db0".to_vec()]);
+        assert_eq!(last_db, 0);
+    }
+
+    #[test]
+    fn barriers_are_never_below_a_floor() {
+        let (ack_tx, ack_rx) = crate::runtime::channel::oneshot::<AofAck>();
+        let batch = vec![AofMessage::AppendSync {
+            lsn: 0,
+            db: 0,
+            bytes: Bytes::new(),
+            ack: ack_tx,
+            epoch: FoldEpoch::INITIAL,
+        }];
+        let mut last_db = 0usize;
+        let out = inject_select_records(batch, FoldEpoch(9), &mut last_db);
+        assert_eq!(out.len(), 1, "the barrier must reach the fsync");
+        assert!(
+            ack_rx.try_recv().is_err(),
+            "a barrier's ack waits for the batch fsync"
+        );
+    }
+
+    #[test]
+    fn no_record_is_below_the_initial_floor() {
+        let batch = vec![append(b"x", 0, FoldEpoch::INITIAL)];
+        let mut last_db = 0usize;
+        let out = inject_select_records(batch, FoldEpoch::INITIAL, &mut last_db);
+        assert_eq!(out.len(), 1);
     }
 }

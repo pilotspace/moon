@@ -203,13 +203,23 @@ impl AofManifest {
                 ),
             }
         })?;
-        fsync_parent_best_effort(&new_base);
 
         // 2. Create empty new incremental file.
         let new_incr = self.shard_incr_path_seq(shard_id, new_seq);
         std::fs::File::create(&new_incr).map_err(|e| crate::error::AofError::Io {
             path: new_incr.clone(),
             source: e,
+        })?;
+
+        // Make both new entries (the renamed base and the new incr) durable
+        // BEFORE the caller's manifest write names them. The manifest fsync
+        // covers `appendonlydir/` only, not this shard directory. A failure
+        // aborts the fold while the old generation is still the committed one.
+        crate::persistence::fsync::fsync_directory(&shard_dir).map_err(|e| {
+            crate::error::AofError::Io {
+                path: shard_dir.clone(),
+                source: e,
+            }
         })?;
 
         // 3. Update per-shard LSN in-memory (manifest write is the caller's job).
@@ -413,6 +423,39 @@ mod tests {
             "second call must not create or overwrite any shard files"
         );
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The manifest fsync only covers `appendonlydir/`. The new incr lives in
+    /// the shard directory, so its entry is durable only once that directory
+    /// is fsynced AFTER the file was created, and before `advance_shard`
+    /// returns (the caller names the file in the manifest next). Otherwise a
+    /// power loss can leave a committed manifest naming an incr that does not
+    /// exist, together with every record the writer fsynced into it.
+    #[test]
+    fn advance_shard_fsyncs_the_shard_dir_after_creating_the_new_incr() {
+        use crate::persistence::fsync::dir_fsync_probe;
+        let dir = temp_dir();
+        let mut manifest = AofManifest::initialize_multi(&dir, 2).expect("initialize_multi");
+        let empty_rdb = crate::persistence::rdb::save_to_bytes(&[] as &[crate::storage::Database])
+            .expect("empty rdb");
+
+        dir_fsync_probe::start();
+        let result = manifest.advance_shard(0, 2, &empty_rdb);
+        let fsyncs = dir_fsync_probe::stop();
+        let new_incr = result.expect("advance_shard 0 -> seq=2");
+
+        let shard_dir = new_incr.parent().expect("incr has a parent dir");
+        let incr_name = new_incr.file_name().expect("incr has a file name");
+        assert!(
+            fsyncs
+                .iter()
+                .any(|(d, names)| d == shard_dir && names.iter().any(|n| n == incr_name)),
+            "no fsync of {} ran after {} was created; fsyncs seen: {:?}",
+            shard_dir.display(),
+            new_incr.display(),
+            fsyncs
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

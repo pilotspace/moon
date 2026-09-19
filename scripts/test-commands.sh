@@ -1014,6 +1014,15 @@ if should_run "sorted_set"; then
     assert_match "ZRANGE BYSCORE bad bound missing key"   ZRANGE z:1060:nokey a b BYSCORE
     assert_match "ZRANGE BYLEX bad bound missing key"     ZRANGE z:1060:nokey a b BYLEX
     assert_match "ZRANGE BYSCORE valid bound missing key" ZRANGEBYSCORE z:1060:nokey 0 10
+
+    # moon#1102 -- ZRANGESTORE had the same defect: a bad bound against a
+    # MISSING source answered :0 (and deleted the destination) where redis
+    # parses the rank, BYSCORE or BYLEX range before the key lookup.
+    assert_match "ZRANGESTORE BYSCORE bad bound missing src" ZRANGESTORE "{z1102}d" "{z1102}nokey" a b BYSCORE
+    assert_match "ZRANGESTORE BYSCORE REV LIMIT bad bound"   ZRANGESTORE "{z1102}d" "{z1102}nokey" a b BYSCORE REV LIMIT 0 1
+    assert_match "ZRANGESTORE BYLEX bad bound missing src"   ZRANGESTORE "{z1102}d" "{z1102}nokey" a b BYLEX
+    assert_match "ZRANGESTORE rank bad bound missing src"    ZRANGESTORE "{z1102}d" "{z1102}nokey" a b
+    assert_match "ZRANGESTORE valid range missing src"       ZRANGESTORE "{z1102}d" "{z1102}nokey" 0 1 BYSCORE
 fi
 
 # ===========================================================================
@@ -1889,6 +1898,24 @@ if should_run "transaction"; then
     else
         FAIL=$((FAIL + 1))
         echo "  FAIL: TXN-ARITY-03 a correct-arity subcommand blocked the transaction"
+    fi
+
+    # --- WAIT inside MULTI answers at once (moon#1098) --------------------
+    #
+    # Redis runs a transaction body with CLIENT_DENY_BLOCKING, so a queued
+    # WAIT answers the current ack count at once. Moon filled it with the live
+    # WAIT, which polled until its deadline. The reply bytes were already
+    # right, so the verdict is the time: under 2 s for a 3 s WAIT.
+    TOTAL=$((TOTAL + 1))
+    mcli DEL tx:wait1098 > /dev/null 2>&1
+    wait_start=$SECONDS
+    wait_reply=$(printf 'MULTI\nINCR tx:wait1098\nWAIT 1 3000\nEXEC\n' | redis-cli -p "$PORT_RUST" 2>/dev/null | tr '\n' ' ' || true)
+    wait_took=$((SECONDS - wait_start))
+    if [ "$wait_reply" = "OK QUEUED QUEUED 1 0 " ] && (( wait_took < 2 )); then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TXN-WAIT-01 WAIT inside MULTI must answer at once; got '$wait_reply' after ${wait_took}s"
     fi
 
     # --- FUNCTION inside MULTI (moon#697) ---------------------------------
