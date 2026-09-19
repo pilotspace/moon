@@ -148,7 +148,11 @@ pub(crate) fn try_wake_stream_waiter_budgeted(
                             decisions.push((entry.wait_id, won.then_some(err)));
                             continue;
                         }
-                        GroupReadiness::Ready if aof_lost => continue,
+                        // moon#1111: retried once the writer has room.
+                        GroupReadiness::Ready if aof_lost => {
+                            crate::blocking::wakeup::defer_wake(db_index, key);
+                            continue;
+                        }
                         GroupReadiness::Ready => {}
                     }
                     if !claim_for_serve(entry) {

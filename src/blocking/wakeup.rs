@@ -718,9 +718,11 @@ fn serve_list_key(
             // moon#1056: the AOF writer could not take this pop's record
             // within the backpressure bound. Every further serve here would
             // wait out a bound of its own on the shard thread; leave the rest
-            // parked beside their data instead (a later write to the key, or
-            // their own timeout, reaches them).
+            // parked beside their data instead; the key is retried once the
+            // writer has room again (moon#1111), not left for a later write
+            // to the key or the waiters' own timeouts.
             if delivered == Delivered::ServedAofLost {
+                defer_wake(db_index, key);
                 break;
             }
             // moon#1019: one push can carry several elements, and
@@ -999,7 +1001,12 @@ fn serve_zset_key(
         );
         if delivered.served() {
             served = true;
-            if delivered == Delivered::ServedAofLost || !db.exists(key) {
+            if delivered == Delivered::ServedAofLost {
+                // moon#1111: see serve_list_key.
+                defer_wake(db_index, key);
+                break;
+            }
+            if !db.exists(key) {
                 break;
             }
         }
@@ -1210,6 +1217,50 @@ pub fn recheck_group_readers(registry: &std::cell::RefCell<BlockingRegistry>) {
                 &mut budget,
             );
         });
+    }
+}
+
+thread_local! {
+    /// Keys whose wake stopped at a record the AOF writer refused, with
+    /// waiters possibly still parked beside data (moon#1111). Retried by
+    /// [`retry_deferred_wakes`] once the writer has room.
+    static DEFERRED_WAKES: std::cell::RefCell<Vec<(usize, Bytes)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A wake on `key` stopped early because the AOF writer refused a served
+/// pop's record (`Delivered::ServedAofLost`): every further serve in that
+/// pass would have waited out another bound on the shard thread, so the
+/// waiters behind it were left parked. Remember the key, so they are served
+/// as soon as the writer can take records again — without needing another
+/// write to the key, which for a producer that has gone quiet never comes
+/// (moon#1111). Allocates only on that already-failing path.
+pub(crate) fn defer_wake(db_index: usize, key: &Bytes) {
+    DEFERRED_WAKES.with(|d| {
+        let mut d = d.borrow_mut();
+        if !d.iter().any(|(db, k)| *db == db_index && k == key) {
+            d.push((db_index, key.clone()));
+        }
+    });
+}
+
+/// The deferred keys, once the writer has room; `None` (and nothing taken)
+/// while there is nothing deferred or the writer is still saturated.
+pub(crate) fn take_deferred_wakes() -> Option<Vec<(usize, Bytes)>> {
+    let pending = DEFERRED_WAKES.with(|d| !d.borrow().is_empty());
+    if !pending || !crate::blocking::pop_log::writer_has_room() {
+        return None;
+    }
+    Some(DEFERRED_WAKES.with(|d| std::mem::take(&mut *d.borrow_mut())))
+}
+
+/// Retry the wakes [`defer_wake`] recorded, as one batch per database with a
+/// fresh backpressure budget, if the writer has room. A serve that meets a
+/// saturated writer again defers its key again, for the next tick. Called
+/// from the shard's 10 ms blocking tick, outside any borrow of its slice.
+pub fn retry_deferred_wakes(registry: &std::cell::RefCell<BlockingRegistry>) {
+    if let Some(keys) = take_deferred_wakes() {
+        wake_recorded(registry, keys);
     }
 }
 
