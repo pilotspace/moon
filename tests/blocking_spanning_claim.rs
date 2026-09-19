@@ -746,7 +746,7 @@ fn bsc5_a_push_after_an_observed_disconnect_stays_in_the_key() {
 }
 
 // ---------------------------------------------------------------------------
-// The review P3 on moon#989 — one push, several elements, several waiters
+// moon#989 — one push, several elements, several waiters
 // ---------------------------------------------------------------------------
 
 /// Two clients parked on one key; one `RPUSH` delivers two elements. Redis
@@ -800,7 +800,7 @@ fn bsc6_one_push_serves_every_waiter_its_elements_cover() {
 }
 
 // ---------------------------------------------------------------------------
-// Review F2 — the run acknowledgement must not outlive the client's timeout
+// The run acknowledgement must not outlive the client's timeout
 // ---------------------------------------------------------------------------
 
 /// How long `MOON_TEST_BLOCK_ACK_STALL_MS` holds an owner before it answers
@@ -848,7 +848,7 @@ fn bsc7_a_slow_owner_does_not_stretch_the_timeout() {
 }
 
 // ---------------------------------------------------------------------------
-// Review F3 — a disconnected serve is never undone over later writes
+// moon#1023 — a disconnected serve is never undone over later writes
 // ---------------------------------------------------------------------------
 
 /// A client in `BLPOP k 0` disconnects while an owner serves it; meanwhile a
@@ -864,9 +864,10 @@ fn bsc7_a_slow_owner_does_not_stretch_the_timeout() {
 /// This asserts the master, not the AOF, on purpose. The record of ANY
 /// blocking serve, delivered or not, is written by the waiter's connection
 /// (moon#827), to the connection's own shard AOF; for a key owned by another
-/// shard replay drops it. A DELIVERED cross-shard `BLPOP` diverges from its
-/// AOF the same way on origin/main, so an AOF comparison here would measure
-/// that pre-existing gap, not the restore this test is about.
+/// shard replay drops it (moon#1056). A DELIVERED cross-shard `BLPOP`
+/// diverges from its AOF the same way on origin/main, so an AOF comparison
+/// here would measure that pre-existing gap, not the restore this test is
+/// about.
 #[test]
 fn bsc8_a_disconnected_serve_is_never_undone_over_later_writes() {
     let m = spawn_moon(SHARDS, Some(SETTLE_MS));
@@ -917,7 +918,7 @@ fn bsc8_a_disconnected_serve_is_never_undone_over_later_writes() {
     }
     assert!(
         wrong.is_empty(),
-        "a disconnected serve was undone on top of later writes (review F3):\n{}",
+        "a disconnected serve was undone on top of later writes (moon#1023):\n{}",
         wrong.join("\n")
     );
 }

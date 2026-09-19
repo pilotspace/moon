@@ -82,7 +82,7 @@ pub fn producer_wake_key_index(cmd: &[u8]) -> usize {
 /// else can have touched the key in between. That is the whole reason it may
 /// exist at all: a put-back after an await would land on top of other
 /// clients' logged writes while the pop itself was never logged, and the
-/// master would diverge from its AOF and replicas (review F3 on PR #1045).
+/// master would diverge from its AOF and replicas (moon#1023).
 pub(crate) enum WakeUndo {
     /// Values popped from the FRONT of the key, in pop order.
     ListFront(smallvec::SmallVec<[bytes::Bytes; 4]>),
@@ -103,7 +103,7 @@ pub(crate) enum WakeUndo {
 /// The absolute TTL of `key` (ms), or 0 when it has none or is absent.
 ///
 /// Read BEFORE a pop that may be put back: a pop that empties the key removes
-/// it, TTL and all, and the put-back recreates it from nothing (review F4).
+/// it, TTL and all, and the put-back recreates it from nothing.
 pub(crate) fn expiry_of(db: &mut Database, key: &Bytes) -> u64 {
     db.get(key)
         .filter(|e| e.has_expiry())
@@ -114,9 +114,9 @@ impl WakeUndo {
     /// [`restore`](Self::restore), then give the key back the TTL it had
     /// before the pop — `expires_at_ms` from [`expiry_of`], 0 for none.
     ///
-    /// Review F4: a pop that emptied the key removed it, and `restore`
-    /// recreates it through the create-on-push path with NO TTL. The master
-    /// then held forever a key its replicas expire. A key that survived the
+    /// A pop that emptied the key removed it, and `restore` recreates it
+    /// through the create-on-push path with NO TTL; without this the master
+    /// would hold forever a key its replicas expire. A key that survived the
     /// pop still carries its TTL, and is left alone.
     pub(crate) fn restore_keeping_ttl(self, db: &mut Database, key: &Bytes, expires_at_ms: u64) {
         self.restore(db, key);
@@ -200,11 +200,12 @@ pub fn try_wake_list_waiter(
     // The loop condition moved from `has_waiters` to the pop itself: a queue
     // holding only foreign waiters is not empty, so the old condition would
     // now spin forever.
-    // Review F1: a wake on a key that holds nothing must answer NOBODY. The
-    // loop below pops a waiter before it pops data, and a waiter popped for
-    // nothing is answered `None` — nil to a `BLPOP k 0`, which Redis never
-    // sends. Every producer calls this after a successful push, so the key
-    // exists; this guards the callers that cannot promise that.
+    // A key that holds nothing has nothing for anyone: leave every waiter
+    // parked without touching the queue. Every producer calls this after a
+    // successful push, so the key exists; this is the cheap exit for the
+    // callers that cannot promise that. (A waiter popped below for a pop that
+    // yields nothing is put back too — never answered nil, which redis never
+    // sends a timeout-0 waiter.)
     if !db.exists(key) {
         return false;
     }
@@ -225,12 +226,12 @@ pub fn try_wake_list_waiter(
             cmd,
             reply_tx,
             claim,
-            ..
+            deadline,
         } = waiter;
 
         // Execute the pop based on command type
-        // Review F4: the TTL the key has before this pop, in case the pop
-        // empties it and has to be put back.
+        // The TTL the key has before this pop, in case the pop empties it
+        // and has to be put back.
         let expires_at_ms = expiry_of(db, key);
         let (result, undo) = match &cmd {
             BlockedCommand::BLPop => {
@@ -374,6 +375,28 @@ pub fn try_wake_list_waiter(
             _ => (None, None),
         };
 
+        // Nothing to pop: the key holds another type (a waiter of this
+        // family parked on it while it was absent, then another client
+        // created it as something else), or it emptied under a caller that
+        // runs every waker. This waker has nothing for the waiter, so it must
+        // not answer it — nil is a reply redis never sends a timeout-0 waiter.
+        // Put it back where it was and stop; every other waiter of this
+        // family would find the same nothing.
+        let Some(result) = result else {
+            registry.requeue_front(
+                db_index,
+                key,
+                crate::blocking::WaitEntry {
+                    wait_id,
+                    cmd,
+                    reply_tx,
+                    deadline,
+                    claim,
+                },
+            );
+            break;
+        };
+
         // Clean up all other key registrations for this wait_id
         registry.remove_wait(wait_id);
 
@@ -387,7 +410,7 @@ pub fn try_wake_list_waiter(
             expires_at_ms,
         ) {
             served = true;
-            // moon#1019 review P3: one push can carry several elements, and
+            // moon#1019: one push can carry several elements, and
             // Redis keeps serving the key's waiters while it has data. Stopping
             // after the first left the rest parked next to data they could
             // have had — and a waiter parked on several keys was offered each
@@ -403,7 +426,8 @@ pub fn try_wake_list_waiter(
 
 /// The tail every destructive wake shares, once the element is popped and the
 /// reply built: decide whether this waiter gets it, and put it back if not.
-/// Returns true if the waiter was answered with data.
+/// Returns true if the waiter was answered. A waker with nothing to hand a
+/// waiter never gets here — it leaves the waiter parked instead.
 ///
 /// * moon#1019: a waiter registered on several threads is served by exactly
 ///   one of them — whichever wins its [`ClaimToken`](crate::blocking::ClaimToken).
@@ -417,16 +441,10 @@ pub(crate) fn deliver(
     key: &Bytes,
     reply_tx: crate::runtime::channel::OneshotSender<Option<Frame>>,
     claim: Option<&crate::blocking::ClaimToken>,
-    result: Option<Frame>,
+    frame: Frame,
     undo: Option<WakeUndo>,
     expires_at_ms: u64,
 ) -> bool {
-    let Some(frame) = result else {
-        // Nothing was popped (the key emptied under a registration that
-        // should not have been offered it); tell the waiter this key is out.
-        let _ = reply_tx.send(None);
-        return false;
-    };
     let won = claim.is_none_or(crate::blocking::ClaimToken::try_claim);
     if won && reply_tx.send(Some(frame)).is_ok() {
         return true;
@@ -454,11 +472,12 @@ pub fn try_wake_zset_waiter(
     // The loop condition moved from `has_waiters` to the pop itself: a queue
     // holding only foreign waiters is not empty, so the old condition would
     // now spin forever.
-    // Review F1: a wake on a key that holds nothing must answer NOBODY. The
-    // loop below pops a waiter before it pops data, and a waiter popped for
-    // nothing is answered `None` — nil to a `BLPOP k 0`, which Redis never
-    // sends. Every producer calls this after a successful push, so the key
-    // exists; this guards the callers that cannot promise that.
+    // A key that holds nothing has nothing for anyone: leave every waiter
+    // parked without touching the queue. Every producer calls this after a
+    // successful push, so the key exists; this is the cheap exit for the
+    // callers that cannot promise that. (A waiter popped below for a pop that
+    // yields nothing is put back too — never answered nil, which redis never
+    // sends a timeout-0 waiter.)
     if !db.exists(key) {
         return false;
     }
@@ -477,11 +496,11 @@ pub fn try_wake_zset_waiter(
             cmd,
             reply_tx,
             claim,
-            ..
+            deadline,
         } = waiter;
 
-        // Review F4: the TTL the key has before this pop, in case the pop
-        // empties it and has to be put back.
+        // The TTL the key has before this pop, in case the pop empties it
+        // and has to be put back.
         let expires_at_ms = expiry_of(db, key);
         let (result, undo) = match &cmd {
             BlockedCommand::BZPopMin => match db.zset_pop_min(key) {
@@ -543,6 +562,21 @@ pub fn try_wake_zset_waiter(
             }
             // Unreachable since moon#535 — see try_wake_list_waiter.
             _ => (None, None),
+        };
+        // Nothing to pop: see try_wake_list_waiter — leave the waiter parked.
+        let Some(result) = result else {
+            registry.requeue_front(
+                db_index,
+                key,
+                crate::blocking::WaitEntry {
+                    wait_id,
+                    cmd,
+                    reply_tx,
+                    deadline,
+                    claim,
+                },
+            );
+            break;
         };
 
         registry.remove_wait(wait_id);

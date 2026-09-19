@@ -1701,9 +1701,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                             &mut stream, &mut read_buf,
                         ).await;
                         drop(blocked_guard);
-                        // `peer_gone_after_serve`: moon#1023 / review F3 — the
-                        // serve stands, so it is invalidated and logged below
-                        // exactly as a delivered reply; only the write is skipped.
+                        // `peer_gone_after_serve` (moon#1023): the serve stands,
+                        // so it is invalidated and logged below exactly as a
+                        // delivered reply — AOF only on this runtime, and
+                        // dropped on replay for a remote key (moon#1056); only
+                        // the write is skipped.
                         let (mut blocking_response, peer_gone_after_serve) = match blocking_outcome {
                             crate::server::conn::blocking::BlockingOutcome::Reply(frame) => (frame, false),
                             crate::server::conn::blocking::BlockingOutcome::ServedPeerGone(frame) => (frame, true),

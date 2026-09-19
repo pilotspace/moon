@@ -2,8 +2,8 @@
 //!
 //! The token is the REAL one: `src/blocking/claim.rs` is compiled into this
 //! test crate through `#[path]`, and under `cfg(loom)` that file takes loom's
-//! `Arc`/`AtomicU8` (review F6 on PR #1045 — the first cut modelled a
-//! hand-copied twin, which proves nothing about the code that ships).
+//! `Arc`/`AtomicU8`. A hand-copied twin of the token would prove nothing
+//! about the code that ships.
 //!
 //! Around it, each owner runs the waker's protocol: skip a settled waiter,
 //! else POP, then `try_claim`, then send on a win or put the element back on a

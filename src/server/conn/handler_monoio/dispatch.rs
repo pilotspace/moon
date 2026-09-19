@@ -1992,10 +1992,11 @@ pub(super) async fn try_handle_blocking<
     .await;
     drop(blocked_guard);
 
-    // `peer_gone_after_serve`: moon#1023 / review F3 — a shard served this
-    // client and then found it gone. The serve stands (as in redis), so the
-    // tracking invalidation and the AOF/replication record below run exactly
-    // as for a delivered reply; only the write to the dead socket is skipped.
+    // `peer_gone_after_serve` (moon#1023): a shard served this client and
+    // then found it gone. The serve stands (as in redis), so the tracking
+    // invalidation and the AOF/replication record below run exactly as for a
+    // delivered reply; only the write to the dead socket is skipped. For a
+    // key another shard owns, replay drops that record (moon#1056).
     let (mut blocking_response, peer_gone_after_serve) = match outcome {
         crate::server::conn::blocking::BlockingOutcome::Reply(frame) => (frame, false),
         crate::server::conn::blocking::BlockingOutcome::ServedPeerGone(frame) => (frame, true),

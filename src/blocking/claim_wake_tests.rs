@@ -1,5 +1,6 @@
-//! The claim token as the wakers use it (moon#1019, moon#1023), and the
-//! adversarial-review findings on PR #1045 that live at the waker.
+//! The claim token as the wakers use it (moon#1019, moon#1023), and what a
+//! waker owes a waiter it cannot serve: no answer, no lost element, no lost
+//! TTL.
 //!
 //! Kept out of `claim.rs` on purpose: that file is compiled verbatim into
 //! `tests/loom_blocking_claim.rs` (via `#[path]`), so it must not reach into
@@ -51,12 +52,10 @@ fn list(db: &mut Database, key: &str) -> Vec<Bytes> {
     }
 }
 
-/// Review F1: a waker run on a key that holds nothing — a key deleted in
-/// between, a caller that cannot promise a push just happened — must answer
-/// NOBODY. It used to pop the first parked waiter, find nothing to give it,
-/// and answer it nil; for `BLPOP k 0` that is a reply redis never sends. (The
-/// path the review found it through, a reply-derived restore that put nothing
-/// back, no longer exists — see `finish_unserved`.)
+/// A waker run on a key that holds nothing — a key deleted in between, a
+/// caller that cannot promise a push just happened — must answer NOBODY. It
+/// used to pop the first parked waiter, find nothing to give it, and answer
+/// it nil; for `BLPOP k 0` that is a reply redis never sends.
 #[test]
 fn a_wake_on_an_absent_key_answers_nobody() {
     for family in ["list", "zset"] {
@@ -82,7 +81,69 @@ fn a_wake_on_an_absent_key_answers_nobody() {
     }
 }
 
-/// Review F4: a shard pops for a waiter, the pop EMPTIES the key (removing
+/// A waiter parked on a key that now holds ANOTHER type is not the waker's
+/// to answer. `BZPOPMIN k 0` parks on an absent `k`; `RPUSH k x y` creates it
+/// as a list; any later zset wake on `k` (a group registration or a
+/// `BlockRegister` runs every waker whenever the key exists) must leave the
+/// waiter parked — answering it nil is a reply redis never gives a
+/// timeout-0 waiter. The same holds the other way round.
+#[test]
+fn a_waiter_of_another_family_is_left_parked_on_a_wrong_typed_key() {
+    for family in ["zset waiter on a list", "list waiter on a zset"] {
+        let mut reg = BlockingRegistry::new(0);
+        let mut db = Database::new();
+        let k = b("k");
+        let (cmd, woke) = if family == "zset waiter on a list" {
+            db.list_push_back(&k, b("x"));
+            db.list_push_back(&k, b("y"));
+            (BlockedCommand::BZPopMin, false)
+        } else {
+            db.zset_restore(&k, b("m"), 1.0);
+            (BlockedCommand::BLPop, false)
+        };
+        let rx = park(&mut reg, "k", cmd, Some(ClaimToken::new()));
+        let got = if family == "zset waiter on a list" {
+            try_wake_zset_waiter(&mut reg, &mut db, 0, &k)
+        } else {
+            try_wake_list_waiter(&mut reg, &mut db, 0, &k)
+        };
+        assert_eq!(got, woke, "{family}");
+        assert!(
+            matches!(rx.try_recv(), Err(flume::TryRecvError::Empty)),
+            "{family}: the waiter was answered from a key of another type"
+        );
+        assert!(reg.has_waiters(0, &k), "{family}: and must stay parked");
+        if family == "zset waiter on a list" {
+            assert_eq!(list(&mut db, "k"), vec![b("x"), b("y")], "{family}");
+        }
+    }
+}
+
+/// A queue can hold several waiters of the wrong family; the waker leaves
+/// every one of them parked, in order, and does not spin.
+#[test]
+fn every_waiter_of_another_family_stays_parked_in_order() {
+    let mut reg = BlockingRegistry::new(0);
+    let mut db = Database::new();
+    let k = b("k");
+    db.list_push_back(&k, b("x"));
+    let first = park(&mut reg, "k", BlockedCommand::BZPopMin, None);
+    let second = park(&mut reg, "k", BlockedCommand::BZPopMax, None);
+    assert!(!try_wake_zset_waiter(&mut reg, &mut db, 0, &k));
+    assert!(matches!(first.try_recv(), Err(flume::TryRecvError::Empty)));
+    assert!(matches!(second.try_recv(), Err(flume::TryRecvError::Empty)));
+    let queued: Vec<bool> = reg
+        .waiters_on(0, &k)
+        .map(|q| {
+            q.iter()
+                .map(|e| matches!(e.cmd, BlockedCommand::BZPopMin))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(queued, vec![true, false], "both still queued, FIFO intact");
+}
+
+/// A shard pops for a waiter, the pop EMPTIES the key (removing
 /// it), and then the shard loses the waiter's claim. The put-back must
 /// recreate the key WITH its TTL, or the master keeps forever a key every
 /// replica expires. Driven through the real lost-claim path, `deliver`.
@@ -120,7 +181,7 @@ fn a_lost_claim_put_back_keeps_the_ttl() {
         let claim = ClaimToken::new();
         assert!(claim.clone().try_claim());
         let (tx, rx) = channel::oneshot();
-        let served = deliver(&mut db, &k, tx, Some(&claim), Some(frame), Some(undo), ttl);
+        let served = deliver(&mut db, &k, tx, Some(&claim), frame, Some(undo), ttl);
 
         assert!(!served, "{family}: a lost claim serves nothing");
         assert!(rx.try_recv().is_err(), "{family}: and sends nothing");
@@ -157,7 +218,7 @@ fn a_won_claim_whose_send_fails_puts_the_element_back() {
         &k,
         tx,
         Some(&claim),
-        Some(Frame::BulkString(v.clone())),
+        Frame::BulkString(v.clone()),
         Some(WakeUndo::ListFront(smallvec::smallvec![v])),
         ttl,
     );

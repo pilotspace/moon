@@ -42,13 +42,15 @@ pub(crate) enum BlockingOutcome {
     /// torn down; the caller must close the connection without replying.
     PeerGone,
     /// The peer went away, but a shard had ALREADY served it: the element
-    /// left the keyspace and the frame is its reply (moon#1023, review F3).
+    /// left the keyspace and the frame is its reply (moon#1023).
     ///
     /// The serve stands, as in redis. The caller must do everything it does
     /// for a delivered reply EXCEPT write it: invalidate tracking and append
-    /// the pop's AOF/replication record, so the master and every replica keep
-    /// one history. Then it closes the connection as for
-    /// [`PeerGone`](BlockingOutcome::PeerGone).
+    /// the pop's effect record exactly where a delivered reply's goes. Then
+    /// it closes the connection as for [`PeerGone`](BlockingOutcome::PeerGone).
+    /// That record has the delivered path's gaps: a cross-shard serve's is
+    /// dropped on replay (moon#1056), and the tokio handler never streams it
+    /// to replicas.
     ServedPeerGone(Frame),
 }
 
@@ -675,7 +677,7 @@ where
     // A1: `PeerGone` ends the same loop as every other terminal condition,
     // so the shared cleanup below runs identically — a vanished multi-key
     // waiter unwinds ALL of its registrations, local and remote.
-    // Review F2: a registration phase that ended the wait (the client's
+    // A registration phase that ended the wait (the client's
     // deadline passed while an owner was slow to acknowledge, or shutdown)
     // is settled exactly like the same end inside the loop.
     let ended: Result<Frame, WaitEnd> = if let Err(end) = registered {
@@ -985,7 +987,7 @@ where
     // Await first successful result from any key/shard.
     // FuturesUnordered may return Err (sender dropped by remove_wait cleanup) before
     // returning the successful Ok. We must skip Err/None results and keep polling.
-    // Review F2: a registration phase that ended the wait (the client's
+    // A registration phase that ended the wait (the client's
     // deadline passed while an owner was slow to acknowledge, or shutdown)
     // is settled exactly like the same end inside the loop.
     let ended: Result<Frame, WaitEnd> = if let Err(end) = registered {

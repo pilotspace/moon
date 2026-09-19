@@ -276,7 +276,7 @@ where
 }
 
 /// Wait for a run's acknowledgement — but never past the client's own
-/// deadline, and never through a shutdown (review F2 on PR #1045).
+/// deadline, and never through a shutdown.
 ///
 /// The registration phase runs BEFORE the wait loop arms the client's timer,
 /// so this is the only thing standing between a slow owner and the client's
@@ -448,20 +448,26 @@ pub(super) async fn register_runs(
 /// on shutdown the reply is the only place the element still exists.
 ///
 /// A client that is GONE cannot receive it, and the serve STANDS: the caller
-/// logs its effect exactly as for a delivered reply and closes
+/// logs its effect through the same path as a delivered reply and closes
 /// ([`ServedPeerGone`](super::blocking::BlockingOutcome::ServedPeerGone)).
 /// That is what redis does — it pops and propagates when it serves, and a
 /// client that disconnects with the reply in its output buffer loses it.
 ///
 /// Putting the element back instead (the first cut of moon#1023) is not
-/// sound here (review F3 on PR #1045). The owner's pop is not logged when it
-/// happens; its record is written by the connection, from the reply. A
-/// restore therefore lands AFTER whatever other clients logged meanwhile, on
-/// top of a pop the log never saw. `RPUSH k a` → served, client gone →
-/// `RPUSH k b; LPOP k` (logged) → restore `a`: the master holds `[a]` while
-/// the AOF and every replica replay `[b]`. Logging the restore does not help
-/// either — the unlogged pop is still missing from the history it would be
-/// appended to. Only "the serve happened, and is logged" keeps one history.
+/// sound here. The owner's pop is not logged when it happens; its record is
+/// written by the connection, from the reply. A restore therefore lands AFTER
+/// whatever other clients logged meanwhile, on top of a pop the log never
+/// saw. `RPUSH k a` → served, client gone → `RPUSH k b; LPOP k` (logged) →
+/// restore `a`: the master holds `[a]` while its AOF replays `[b]`, and a
+/// `DEL k` in the window is undone. Logging the restore does not help either
+/// — the unlogged pop is still missing from the history it would be appended
+/// to.
+///
+/// "Through the same path as a delivered reply" is only as good as that
+/// path, and for a gone client it inherits its gaps rather than closing them:
+/// the record goes to the CONNECTION's shard AOF, so for a key another shard
+/// owns replay drops it (moon#1056); and the tokio handler appends it to the
+/// AOF only, never to the replication stream.
 pub(super) fn finish_unserved(
     end: WaitEnd,
     served: Option<Frame>,
@@ -636,7 +642,7 @@ mod tests {
         assert_eq!(block_on(settle(None, &mut rxs)), Some(frame));
     }
 
-    /// Review P3: the local drain is correct for ANY key count. It used to
+    /// The local drain is correct for ANY key count. It used to
     /// give up after 1024 items, so a reply behind 1024+ closed receivers
     /// (a `BLPOP` over that many keys) was dropped with its element.
     #[test]

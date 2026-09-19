@@ -158,7 +158,7 @@ fn register_run(
     // key is skipped instead; it cannot come before the key that serves,
     // because `first_type_error` already answered it.
     //
-    // One waker call per key is enough (the review P3 on moon#989): a waker
+    // One waker call per key is enough (moon#989): a waker
     // keeps serving the key's waiters while it still holds data, so if this
     // waiter is still parked after the call, the key ran dry serving waiters
     // queued ahead of it.
@@ -487,7 +487,7 @@ mod tests {
         }
     }
 
-    /// The review P3 on moon#989: two waiters on one key, the key holding two
+    /// moon#989: two waiters on one key, the key holding two
     /// elements. One waker call serves BOTH — data is never left sitting next
     /// to a parked waiter.
     #[test]

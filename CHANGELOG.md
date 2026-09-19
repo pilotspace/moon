@@ -222,9 +222,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   more, and there is nothing to drain. If one has, its reply is taken and
   delivered on a timeout or shutdown: the client was served before the end of
   the wait was observed. If the client is gone, the serve stands, as it does
-  in Redis: it is recorded in the AOF and replication stream exactly like a
-  delivered reply (tracking invalidation included), and the reply is dropped
-  with the socket. The element is not put back. A put-back would land after
+  in Redis: its effect is recorded through the same path as a delivered
+  reply (tracking invalidation included), and the reply is dropped with the
+  socket. That path has two known gaps, which this change inherits and does
+  not close. The record goes to the connection's shard AOF, so for a key owned
+  by another shard, replay drops it (moon#1056). On `runtime-tokio`, the
+  record is appended to the AOF only, never to the replication stream. The
+  element is not put back. A put-back would land after
   whatever other clients wrote to the key in the meantime, on top of a pop
   that was never logged. After `RPUSH k b; LPOP k` the master would then hold
   `[a]` while its AOF replays `[b]`, and a `DEL k` would be undone. Measured
@@ -250,6 +254,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key is recreated in the natural encoding for its size. A wake on a key that
   holds nothing now answers nobody, instead of answering a parked `BLPOP k 0`
   with nil.
+- **A blocking pop parked on a key that now holds another type stays
+  parked.** Example: `BZPOPMIN k 0` parks, then `RPUSH k x y` creates `k` as
+  a list, then a remote `BLPOP k 0` registers. That registration runs every
+  waker on `k`. The zset waker took the `BZPOPMIN` waiter, found nothing to
+  pop, and answered it nil, which Redis never sends a timeout-0 waiter. A
+  waker with nothing to pop now puts the waiter back at the front of its
+  queue, unanswered.
+- **A timed-out spanning wait no longer leaves a registration behind.** A
+  later local run of a spanning wait (`BLPOP a b c 1`, with `a` and `c` local
+  and `b` remote) was registered without the client's deadline. The timeout
+  sweep removed the waiter's deadlined entries and forgot its id, which
+  orphaned that entry until its key was next pushed. The sweep now removes
+  every registration of a timed-out waiter.
 - **One push that carries several elements serves every parked waiter those
   elements cover**, as Redis does. Two clients in `BLPOP k 2` and one
   `RPUSH k a b` used to answer one waiter and leave the other parked next to
