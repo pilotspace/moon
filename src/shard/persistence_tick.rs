@@ -1334,6 +1334,10 @@ pub(crate) fn handle_memory_pressure(
 // Checkpoint protocol handlers (disk-offload path)
 // ---------------------------------------------------------------------------
 
+use super::checkpoint_heap_files::{
+    HeapFilesDurability, heap_file_path, make_written_heap_files_durable,
+    stop_waiting_on_vanished_heap_file,
+};
 use crate::persistence::checkpoint::{CheckpointAction, CheckpointManager};
 use crate::persistence::control::ShardControlFile;
 use crate::persistence::manifest::ShardManifest;
@@ -1371,13 +1375,36 @@ pub(crate) fn graph_checkpoint_hook(
     }
 }
 
-/// Force a complete checkpoint synchronously (used by BGSAVE and shutdown).
+/// Who forces a checkpoint, which decides whether the shard thread may
+/// block on the off-loop heap data-file fsync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForcedCheckpoint {
+    /// Graceful shutdown: the shard serves no clients any more, so it waits
+    /// for the outstanding fsync, bounded by `WAIT_DURABLE_TIMEOUT` counted
+    /// from the helper's start.
+    Shutdown,
+    /// The P6 WAL-ceiling trigger, on the shard thread WHILE IT SERVES
+    /// CLIENTS: never waits on the fsync. When Finalize reports it pending,
+    /// the checkpoint is left to the periodic tick, which polls it.
+    WalCeiling,
+}
+
+/// Force a checkpoint now, driving the state machine synchronously.
+///
+/// Callers: graceful shutdown (both runtimes' event loops,
+/// [`ForcedCheckpoint::Shutdown`]) and the P6 WAL-ceiling trigger
+/// ([`maybe_force_checkpoint_on_wal_overflow`],
+/// [`ForcedCheckpoint::WalCeiling`]). BGSAVE does not come here: it only
+/// `force_begin`s, and the periodic tick drives that checkpoint.
 ///
 /// Calls `force_begin` to bypass trigger conditions, then drives the
-/// checkpoint state machine to completion in a tight loop. No-op if a
-/// checkpoint is already active.
+/// checkpoint state machine in a tight loop until it completes, or — for
+/// `WalCeiling` — until the heap data-file fsync is pending. No-op if a
+/// checkpoint is already active (so a later trigger never starts a second
+/// fsync helper).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn force_checkpoint(
+    mode: ForcedCheckpoint,
     checkpoint_mgr: &mut CheckpointManager,
     page_cache: &PageCache,
     wal: &mut WalWriterV3,
@@ -1433,6 +1460,40 @@ pub(crate) fn force_checkpoint(
                 ticks
             );
             return;
+        }
+        // The heap data-file fsync runs off the shard thread and the periodic
+        // tick only polls it; Finalize just reported it pending.
+        if checkpoint_mgr.data_sync_busy() {
+            match mode {
+                // Serving clients: never block on the fsync. The periodic
+                // tick polls it and finishes this checkpoint; until then the
+                // published redo point does not move.
+                ForcedCheckpoint::WalCeiling => {
+                    info!(
+                        "Shard {}: WAL-ceiling checkpoint: heap data-file fsync pending; \
+                         the periodic tick finishes the checkpoint",
+                        shard_id
+                    );
+                    return;
+                }
+                // No clients any more: wait for the one outstanding batch,
+                // bounded by WAIT_DURABLE_TIMEOUT counted from the batch's
+                // START, so a hung disk delays shutdown by that budget once.
+                ForcedCheckpoint::Shutdown => {
+                    if !checkpoint_mgr
+                        .wait_data_sync(crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT)
+                    {
+                        tracing::error!(
+                            "Shard {}: shutdown checkpoint: heap data-file fsync still \
+                             outstanding after {:?}; giving up (the redo point stays where \
+                             it is and recovery replays the WAL from there)",
+                            shard_id,
+                            crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT
+                        );
+                        return;
+                    }
+                }
+            }
         }
     }
     info!("Shard {}: forced checkpoint complete", shard_id);
@@ -1554,11 +1615,14 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
         wal.max_wal_bytes()
     );
 
-    // Force a synchronous checkpoint (drives the state machine to completion).
-    // If checkpoint is already active, force_checkpoint is a no-op — the
-    // in-progress checkpoint will advance next tick and the recycle will run
-    // in handle_checkpoint_tick's Finalize arm.
+    // Force a checkpoint (drives the state machine until it completes or its
+    // heap data-file fsync is pending — this runs while the shard serves
+    // clients, so it never waits on that fsync). If a checkpoint is already
+    // active, force_checkpoint is a no-op — the in-progress checkpoint will
+    // advance next tick and the recycle will run in handle_checkpoint_tick's
+    // Finalize arm.
     force_checkpoint(
+        ForcedCheckpoint::WalCeiling,
         checkpoint_mgr,
         page_cache,
         wal,
@@ -1574,9 +1638,13 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
     // Aggressive recycle — bypass min_wal_bytes floor.
     // Use control.last_checkpoint_lsn (the LSN of the last *completed*
     // checkpoint) rather than wal.current_lsn()-1. If force_checkpoint above
-    // was a no-op (checkpoint already active) or failed silently, using the
-    // current WAL head would be unsafe — we would recycle segments whose dirty
-    // pages have not been flushed to data files yet.
+    // was a no-op (checkpoint already active), left its checkpoint pending on
+    // the data-file fsync, or failed silently, using the current WAL head
+    // would be unsafe — we would recycle segments whose dirty pages have not
+    // been made durable in their data files yet. The in-memory `control` is
+    // the PUBLISHED redo point: Finalize only advances it together with a
+    // successful control-file write (it restores the old values if that
+    // write fails).
     //
     // Kernel M3 K2 review round 2 / P1-1: same min-across-planes floor as
     // every other recycle call site (Finalize, Pass C, VACUUM) — KV alone
@@ -1615,12 +1683,50 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
     true
 }
 
+/// WAL payload of a FullPageImage record:
+/// `file_id(8 LE) + page_offset(8 LE) + flag(1) + page_data`, where the flag is
+/// `0x00` for an uncompressed image and `0x01` for an LZ4-compressed one.
+fn full_page_image_payload(file_id: u64, page_offset: u64, data: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(17 + data.len());
+    payload.extend_from_slice(&file_id.to_le_bytes());
+    payload.extend_from_slice(&page_offset.to_le_bytes());
+    if data.len() > 256 {
+        let compressed = lz4_flex::compress_prepend_size(data);
+        if compressed.len() < data.len() {
+            payload.push(0x01);
+            payload.extend_from_slice(&compressed);
+            return payload;
+        }
+    }
+    payload.push(0x00);
+    payload.extend_from_slice(data);
+    payload
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_FPI: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test hook: the next FullPageImage append on this thread fails.
+#[cfg(test)]
+pub(crate) fn fail_next_full_page_image() {
+    FAIL_NEXT_FPI.with(|c| c.set(true));
+}
+
+#[cfg(test)]
+fn take_full_page_image_fault() -> bool {
+    FAIL_NEXT_FPI.with(|c| c.replace(false))
+}
+
 /// Handle one checkpoint tick. Called from the event loop every 1ms when
 /// disk-offload is enabled.
 ///
 /// Returns `true` if a finalize step was completed this tick.
 ///
-/// The caller provides all I/O dependencies — CheckpointManager itself is pure state.
+/// The caller provides all I/O dependencies. The only work this tick hands
+/// off is the heap data-file fsync, which runs on the manager's off-loop
+/// helper; the tick never blocks on it.
 ///
 /// After a successful manifest commit at the Finalize step, tombstone GC runs
 /// with the configured two-axis retention policy. GC is in-memory only here;
@@ -1647,20 +1753,40 @@ pub(crate) fn handle_checkpoint_tick(
     match checkpoint_mgr.advance_tick() {
         CheckpointAction::Nothing => false,
         CheckpointAction::FlushPages(count) => {
-            // Collect FPI payloads during sweep, then append to WAL after.
-            // This avoids dual-mutable-borrow of `wal` across closures.
-            let mut fpi_payloads: Vec<Vec<u8>> = Vec::new();
+            // Log-before-data for torn-page protection (#452), one WAL barrier
+            // per batch: `flush_dirty_pages_with_fpi` appends the FullPageImage
+            // of every FPI-pending page in the batch, then calls the barrier
+            // below ONCE, then pwrites the pages. The barrier makes the WAL
+            // durable through the batch's highest page LSN AND its highest FPI
+            // LSN, so every page's change and image are on disk before any
+            // page is overwritten in place — the order a wait per page gives,
+            // for one fsync instead of one per page.
+            //
+            // The FPI append and the barrier are separate callbacks that both
+            // need `wal`; they never run nested, so a `RefCell` hands the one
+            // `&mut` to whichever runs.
+            let wal_cell = std::cell::RefCell::new(&mut *wal);
+            let wal_busy = || std::io::Error::other("checkpoint: WAL writer already borrowed");
+            // Highest FPI LSN appended in this batch (0 = none).
+            let batch_fpi_lsn = std::cell::Cell::new(0u64);
+            let mut written_files: smallvec::SmallVec<[u64; 16]> = smallvec::SmallVec::new();
+            let mut vanished_files: smallvec::SmallVec<[u64; 4]> = smallvec::SmallVec::new();
+            let mut vanished_pages = 0usize;
+            let mut fpi_records = 0usize;
+            let shard_dir = control_path.parent().unwrap_or(Path::new("."));
 
-            let flushed = page_cache.flush_dirty_pages_with_fpi(
+            let outcome = page_cache.flush_dirty_pages_with_fpi(
                 count,
-                &mut |page_lsn| {
-                    // HARD ordering invariant (log-before-data): the WAL must
-                    // be durable past this page's LSN before the page pwrite.
-                    // Bounded blocking wait on the off-loop sync agent; Err
-                    // aborts this flush batch (checkpoint retries next tick).
-                    if wal.current_lsn() > page_lsn {
+                &mut |max_page_lsn| {
+                    // HARD ordering invariant (log-before-data). Bounded wait
+                    // on the off-loop WAL sync agent; Err writes no page of
+                    // the batch and fails this checkpoint's flush (the pages
+                    // stay dirty and are re-flushed before finalize).
+                    let upto = max_page_lsn.max(batch_fpi_lsn.get());
+                    let mut wal = wal_cell.try_borrow_mut().map_err(|_| wal_busy())?;
+                    if wal.current_lsn() > upto {
                         wal.wait_durable(
-                            page_lsn,
+                            upto,
                             crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT,
                         )
                     } else {
@@ -1668,26 +1794,15 @@ pub(crate) fn handle_checkpoint_tick(
                     }
                 },
                 &mut |file_id, page_offset, _is_large, data| {
-                    // Collect FPI payload for deferred WAL append.
-                    // Payload format: file_id(8 LE) + page_offset(8 LE) + flag(1) + page_data
-                    // Flag: 0x00 = uncompressed, 0x01 = LZ4-compressed
-                    let mut payload = Vec::with_capacity(17 + data.len());
-                    payload.extend_from_slice(&file_id.to_le_bytes());
-                    payload.extend_from_slice(&page_offset.to_le_bytes());
-                    if data.len() > 256 {
-                        let compressed = lz4_flex::compress_prepend_size(data);
-                        if compressed.len() < data.len() {
-                            payload.push(0x01);
-                            payload.extend_from_slice(&compressed);
-                        } else {
-                            payload.push(0x00);
-                            payload.extend_from_slice(data);
-                        }
-                    } else {
-                        payload.push(0x00);
-                        payload.extend_from_slice(data);
+                    #[cfg(test)]
+                    if take_full_page_image_fault() {
+                        return Err(std::io::Error::other("injected FPI failure"));
                     }
-                    fpi_payloads.push(payload);
+                    let payload = full_page_image_payload(file_id, page_offset, data);
+                    let mut wal = wal_cell.try_borrow_mut().map_err(|_| wal_busy())?;
+                    let lsn = wal.append(WalRecordType::FullPageImage, &payload);
+                    batch_fpi_lsn.set(batch_fpi_lsn.get().max(lsn));
+                    fpi_records += 1;
                     Ok(())
                 },
                 &mut |file_id, page_offset, is_large, data| {
@@ -1701,27 +1816,57 @@ pub(crate) fn handle_checkpoint_tick(
                         crate::persistence::page::PAGE_4K
                     };
                     let byte_offset = page_offset * page_size as u64;
-                    let shard_dir = control_path.parent().unwrap_or(Path::new("."));
-                    let file_path = shard_dir
-                        .join("data")
-                        .join(format!("heap-{:06}.mpf", file_id));
-                    let file = std::fs::OpenOptions::new().write(true).open(&file_path)?;
-                    crate::util::file_ext::write_at(&file, data, byte_offset)?;
-                    Ok(())
+                    // Never `create`: a heap file that is gone stays gone.
+                    let r = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(heap_file_path(shard_dir, file_id))
+                        .and_then(|file| crate::util::file_ext::write_at(&file, data, byte_offset));
+                    match &r {
+                        // Written, NOT yet durable: Finalize fsyncs the file
+                        // before it may publish a redo point above this page.
+                        Ok(()) => {
+                            if !written_files.contains(&file_id) {
+                                written_files.push(file_id);
+                            }
+                        }
+                        // The heap file no longer exists: this page can never
+                        // be written anywhere. Handled below — it is not a
+                        // flush failure to retry.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            vanished_pages += 1;
+                            if !vanished_files.contains(&file_id) {
+                                vanished_files.push(file_id);
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                    r
                 },
             );
 
-            // Deferred FPI WAL append -- now safe since flush_dirty_pages_with_fpi
-            // returned and the closures no longer borrow `wal`.
-            for payload in &fpi_payloads {
-                wal.append(WalRecordType::FullPageImage, payload);
+            for file_id in written_files {
+                checkpoint_mgr.note_data_file_written(file_id);
             }
-
-            if flushed > 0 {
+            for file_id in vanished_files {
+                stop_waiting_on_vanished_heap_file(
+                    checkpoint_mgr,
+                    page_cache,
+                    manifest,
+                    file_id,
+                    "page write",
+                );
+            }
+            // Any page the batch did not write for a reason other than its
+            // file being gone — its image, the WAL barrier or its write
+            // failed — is still dirty: Finalize must re-flush it.
+            if outcome.failed > vanished_pages {
+                checkpoint_mgr.note_page_flush_failed();
+            }
+            if outcome.flushed > 0 {
                 tracing::trace!(
                     "Checkpoint: flushed {} dirty pages (with FPI, {} FPI records)",
-                    flushed,
-                    fpi_payloads.len()
+                    outcome.flushed,
+                    fpi_records
                 );
             }
             false
@@ -1745,6 +1890,52 @@ pub(crate) fn handle_checkpoint_tick(
             let now = std::time::Instant::now();
             if !checkpoint_mgr.finalize_ready(now) {
                 return false;
+            }
+
+            // 0. Every page change below `redo_lsn` must be durable in its heap
+            //    file before the redo point is published (#452). Step 4 makes
+            //    `redo_lsn` the replay start and step 6 recycles the WAL below
+            //    it — including the FullPageImages — so a page that is only in
+            //    the kernel's page cache at that instant rolls back on power
+            //    loss with nothing left to redo it.
+            if checkpoint_mgr.is_data_sync_poisoned() {
+                tracing::error!(
+                    "Checkpoint refused: a heap data-file fsync failed earlier on this \
+                     shard, so pages it wrote cannot be proven durable. The redo point \
+                     stays at {} and the WAL above it is retained; recovery replays \
+                     from there. Restart the server once the disk is healthy.",
+                    control.last_checkpoint_lsn
+                );
+                checkpoint_mgr.note_finalize_failed(std::time::Instant::now());
+                return false;
+            }
+            //    A page that failed to flush is still dirty and was neither
+            //    written nor imaged: flush it again before finalizing, keeping
+            //    this checkpoint's redo point.
+            if checkpoint_mgr.page_flush_failed() {
+                tracing::warn!(
+                    "Checkpoint: a dirty page failed to flush; re-flushing before \
+                     publishing redo_lsn={}",
+                    redo_lsn
+                );
+                checkpoint_mgr.restart_flush(page_cache.dirty_page_count());
+                checkpoint_mgr.note_finalize_failed(std::time::Instant::now());
+                return false;
+            }
+            //    Every heap file the flush wrote must be durable. The fsync
+            //    runs off the shard thread; this tick only polls it.
+            match make_written_heap_files_durable(
+                checkpoint_mgr,
+                page_cache,
+                manifest,
+                control_path.parent().unwrap_or(Path::new(".")),
+            ) {
+                HeapFilesDurability::Durable => {}
+                HeapFilesDurability::Pending => return false,
+                HeapFilesDurability::Failed => {
+                    checkpoint_mgr.note_finalize_failed(std::time::Instant::now());
+                    return false;
+                }
             }
 
             // 1. Write WAL checkpoint record with redo_lsn payload
@@ -1836,10 +2027,23 @@ pub(crate) fn handle_checkpoint_tick(
             // graph engine's own replay-skip authority; `graph_floor_lsn`
             // here is a recycle-decision mirror of that SAME value, so the
             // two can never disagree.
+            //    The in-memory copy is what the WAL recyclers cut below (step 6
+            //    and the P6 ceiling's emergency recycle), so it must only ever
+            //    hold a PUBLISHED redo point: if the write fails, restore it.
+            let published = (
+                control.last_checkpoint_lsn,
+                control.last_checkpoint_epoch,
+                control.graph_floor_lsn,
+            );
             control.last_checkpoint_lsn = redo_lsn;
             control.last_checkpoint_epoch = manifest.epoch();
             control.graph_floor_lsn = graph_floor_lsn;
             if let Err(e) = control.write(control_path) {
+                (
+                    control.last_checkpoint_lsn,
+                    control.last_checkpoint_epoch,
+                    control.graph_floor_lsn,
+                ) = published;
                 tracing::error!("Checkpoint control file update failed: {}", e);
                 checkpoint_mgr.note_finalize_failed(std::time::Instant::now());
                 return false;
@@ -1888,6 +2092,9 @@ pub(crate) fn handle_checkpoint_tick(
 }
 
 #[cfg(test)]
+mod checkpoint_tick_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::persistence::checkpoint::CheckpointTrigger;
@@ -1897,7 +2104,7 @@ mod tests {
     };
 
     /// Count FullPageImage records in a raw WAL segment file.
-    fn count_fpi_records(raw_data: &[u8]) -> usize {
+    pub(super) fn count_fpi_records(raw_data: &[u8]) -> usize {
         let mut offset = WAL_V3_HEADER_SIZE;
         let mut fpi_count = 0usize;
         while offset + 4 <= raw_data.len() {
@@ -1990,11 +2197,13 @@ mod tests {
             if finalized || !checkpoint_mgr.is_active() {
                 break;
             }
-            // Safety: don't loop forever
             assert!(
-                tick_count < 100,
-                "Checkpoint should complete within 100 ticks"
+                tick_count < 5000,
+                "Checkpoint should complete within 5000 ticks"
             );
+            // The heap-file fsync completes off the shard thread; tick at
+            // roughly the event loop's 1 ms cadence while it runs.
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
         // Flush WAL to disk
@@ -2079,9 +2288,12 @@ mod tests {
                 break;
             }
             assert!(
-                tick_count < 100,
-                "Checkpoint should complete within 100 ticks"
+                tick_count < 5000,
+                "Checkpoint should complete within 5000 ticks"
             );
+            // The heap-file fsync completes off the shard thread; tick at
+            // roughly the event loop's 1 ms cadence while it runs.
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
         // Flush WAL to disk
