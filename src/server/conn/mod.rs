@@ -1,6 +1,9 @@
 pub mod affinity;
 pub mod blocking;
 pub mod blocking_effect;
+/// moon#989: the multi-key waiter's registration protocol, shared by both
+/// runtimes' blocking handlers.
+mod blocking_multikey;
 /// moon#556/#557: runtime-agnostic tests for the blocking pre-registration
 /// scan. Separate from `tests` below, which only compiles under monoio.
 #[cfg(test)]
@@ -21,6 +24,7 @@ pub mod shared;
 pub mod subscriber_mode;
 #[cfg(all(test, feature = "runtime-monoio"))]
 mod tests;
+pub(crate) mod txn_script;
 pub mod util;
 pub mod watch;
 
