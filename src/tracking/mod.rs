@@ -187,19 +187,59 @@ pub struct ScriptCaller {
     pub noloop: bool,
 }
 
+/// Entries the running script's effect log may hold before they are applied
+/// early. Applying early changes nothing (the effects are applied in order
+/// either way); it only stops one huge script from growing the log without
+/// bound. Also the capacity a thread keeps once a script has ended.
+const SCRIPT_EFFECTS_BATCH: usize = 4096;
+
+thread_local! {
+    /// The tracking effects of the script running on this thread, in the
+    /// order it made them (moon#1089). A script runs to completion without
+    /// yielding, so one log per thread is enough. Nothing is locked while the
+    /// script runs; [`ScriptCaller::finish_script`] applies the log under
+    /// ONE acquisition of the tracking mutex when the script ends.
+    static SCRIPT_EFFECTS: std::cell::RefCell<Vec<(invalidation::ScriptKeyEffect, Bytes)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl ScriptCaller {
-    /// Tracking bookkeeping for one command a script ran successfully.
+    /// Record the tracking effects of one command a script ran successfully:
+    /// the keys it may have modified, and, if the caller tracks reads, the
+    /// keys it read. Takes no lock.
     ///
     /// Callers gate on [`tracking_active`], so with nobody tracking a script
     /// pays one relaxed load per `redis.call` and never reaches here.
     #[cold]
     #[inline(never)]
     pub fn after_script_command(&self, cmd: &[u8], args: &[Frame]) {
-        let table = global_table();
-        invalidation::invalidate_after_write(&table, cmd, args, self.client_id);
-        if self.track_reads {
-            invalidation::track_script_read_keys(&table, cmd, args, self.client_id, self.noloop);
-        }
+        SCRIPT_EFFECTS.with_borrow_mut(|log| {
+            invalidation::record_script_command(log, cmd, args, self.track_reads);
+            if log.len() >= SCRIPT_EFFECTS_BATCH {
+                self.apply_script_effects(log);
+            }
+        });
+    }
+
+    /// Apply, then forget, what [`ScriptCaller::after_script_command`]
+    /// recorded for the script that just ended. The scripting bridge calls
+    /// it on every exit path of a script. A script that recorded nothing
+    /// costs one thread-local check.
+    #[inline]
+    pub fn finish_script(&self) {
+        SCRIPT_EFFECTS.with_borrow_mut(|log| {
+            if !log.is_empty() {
+                self.apply_script_effects(log);
+            }
+        });
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn apply_script_effects(&self, log: &mut Vec<(invalidation::ScriptKeyEffect, Bytes)>) {
+        invalidation::apply_script_effects(&global_table(), log, self.client_id, self.noloop);
+        log.clear();
+        log.shrink_to(SCRIPT_EFFECTS_BATCH);
     }
 }
 
@@ -377,14 +417,21 @@ impl TrackingMessage {
 /// target is not reading; one item per command keeps even a long pipeline of
 /// such writes far inside it. The receiving loop writes each item verbatim,
 /// so the wire is unchanged: the same messages, in the same order.
+///
+/// Collecting takes no copy: each message is serialised once per protocol
+/// ([`TrackingMessage`] caches it) and every inbox keeps a cheap `Bytes`
+/// handle to it. The pieces are joined only in [`DeliveryBatch::flush`],
+/// which callers run after releasing the tracking mutex. A one-message batch,
+/// which is every single-key write, is offered as the shared `Bytes` itself
+/// with no copy at all.
 #[derive(Default)]
 pub struct DeliveryBatch {
-    inboxes: smallvec::SmallVec<[(PubSubInbox, bytes::BytesMut); 2]>,
+    inboxes: smallvec::SmallVec<[(PubSubInbox, smallvec::SmallVec<[Bytes; 1]>); 2]>,
 }
 
 impl DeliveryBatch {
-    /// Deliver `msg` to `to`: at once for a tracking channel, or appended to
-    /// the inbox's pending item.
+    /// Deliver `msg` to `to`: at once for a tracking channel, or added to the
+    /// inbox's pending item.
     pub fn deliver(&mut self, msg: &mut TrackingMessage, to: &Delivery) {
         let Delivery::PubSub(inbox) = to else {
             msg.deliver(to);
@@ -396,23 +443,35 @@ impl DeliveryBatch {
             .iter_mut()
             .find(|(i, _)| i.owner == inbox.owner)
         {
-            Some((_, buf)) => buf.extend_from_slice(&bytes),
+            Some((_, pieces)) => pieces.push(bytes),
             None => self
                 .inboxes
-                .push((inbox.clone(), bytes::BytesMut::from(bytes.as_ref()))),
+                .push((inbox.clone(), smallvec::smallvec![bytes])),
         }
     }
 
-    /// Send every coalesced inbox item.
+    /// Send every inbox its item: the lone message as is, or all of them
+    /// joined in order.
     pub fn flush(self) {
-        for (inbox, buf) in self.inboxes {
-            inbox.offer(buf.freeze());
+        for (inbox, pieces) in self.inboxes {
+            let item = match pieces.as_slice() {
+                [one] => one.clone(),
+                many => {
+                    let len = many.iter().map(Bytes::len).sum();
+                    let mut buf = bytes::BytesMut::with_capacity(len);
+                    for piece in many {
+                        buf.extend_from_slice(piece);
+                    }
+                    buf.freeze()
+                }
+            };
+            inbox.offer(item);
         }
     }
 }
 
 thread_local! {
-    /// The batch a synchronous multi-command unit (a script, an EXEC body's
+    /// The batch a synchronous multi-command unit (an EXEC body's
     /// bookkeeping) collects its inbox deliveries into, and how many nested
     /// units hold it open. See [`begin_delivery_batch`].
     static OPEN_BATCH: std::cell::RefCell<(u32, Option<DeliveryBatch>)> =
@@ -423,11 +482,12 @@ thread_local! {
 /// the matching [`end_delivery_batch`] reaches each REDIRECT inbox as ONE
 /// channel item (moon#1088).
 ///
-/// For units that run to completion WITHOUT yielding — a Lua script, the
-/// bookkeeping of an EXEC body — whose target therefore cannot drain its
-/// channel in between: a script with hundreds of writing `redis.call`s would
-/// otherwise take hundreds of slots. Never hold one across an `.await`: other
-/// connections' deliveries on this thread would wait for it.
+/// For units that run to completion WITHOUT yielding, such as the
+/// bookkeeping of an EXEC body. Their target cannot drain its channel in
+/// between, so a body of hundreds of writes would otherwise take hundreds of
+/// slots. (A script needs none: its effects are applied in one call when it
+/// ends.) Never hold one across an `.await`: other connections' deliveries
+/// on this thread would wait for it.
 pub fn begin_delivery_batch() {
     OPEN_BATCH.with_borrow_mut(|(depth, batch)| {
         *depth += 1;

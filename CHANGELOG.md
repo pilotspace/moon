@@ -209,10 +209,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     slots and bounded in bytes by `--client-output-buffer-limit-normal`; past
     it the connection is closed through the `CLIENT KILL` path, which is what
     redis does at its output-buffer limit (measured: `normal 8192 0 0` closes
-    the tracker on that `MSET`). A burst is written in socket writes that
-    never exceed that limit, and a RESP2 connection, which redis writes
-    nothing for its own invalidations, queues nothing. A REDIRECT target that
-    is subscribed receives through its pub/sub channel: one command's
+    the tracker on that `MSET`). The limit bounds what is QUEUED, as redis's
+    bounds its output buffer. A tracker that stops reading is always closed.
+    A tracker whose connection drains the queue on another shard thread
+    while the burst arrives can receive every push instead. A burst is
+    written in socket writes that never exceed that limit, and a RESP2
+    connection, which redis writes nothing for its own invalidations, queues
+    nothing. The RESP2/RESP3 switch takes effect at the `HELLO` itself, so a
+    pipelined `HELLO 3` / `GET k` / `BLPOP` still gets the push for `k`. A
+    RESP3 tracker that runs `MONITOR` keeps receiving its pushes, as on
+    redis; on monoio it used to receive none. A REDIRECT target that is
+    subscribed receives through its pub/sub channel: one command's
     invalidations, or a whole script's or `EXEC` body's, now take one slot
     there instead of one per key, and a target whose channel is still full is
     disconnected rather than silently shorted.
@@ -224,7 +231,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     state. `EVAL`, `EVALSHA`, `EVAL_RO`, `FCALL`, `FCALL_RO`, scripts routed to
     another shard and scripts queued inside `MULTI` are all covered, and a
     `FCALL` of a function that only reads no longer counts as a write of its
-    keys.
+    keys. A script's tracking effects are recorded without a lock as it runs
+    and applied in order under one tracking lock when it ends, so a script's
+    `redis.call`s do not each contend for the process-wide tracking mutex.
   - moon#1090: commands a RESP2 client pipelined after its last `UNSUBSCRIBE`
     (or `RESET`) were refused with the subscriber-context error on monoio and
     left unanswered on tokio. The subscriber gate now judges each command by

@@ -109,7 +109,7 @@ pub(super) fn check_auth_gate(
                 // produced under the OLD protocol and keep it. See
                 // `shared::encode_response_batch`.
                 crate::server::conn::shared::note_protocol_switch(conn, responses.len(), new_proto);
-                conn.protocol_version = new_proto;
+                conn.set_protocol_version(new_proto);
                 // Keep the wire codec in lockstep for single-frame encodes.
                 codec.set_protocol_version(new_proto);
             }
@@ -535,7 +535,7 @@ pub(super) fn try_handle_hello(
         // makes the identical approximation.
         let at = switch_index.unwrap_or_else(|| responses.len());
         crate::server::conn::shared::note_protocol_switch(conn, at, new_proto);
-        conn.protocol_version = new_proto;
+        conn.set_protocol_version(new_proto);
         // Keep the wire codec in lockstep for single-frame encodes.
         codec.set_protocol_version(new_proto);
     }
@@ -1109,7 +1109,10 @@ pub(super) fn try_handle_client_tracking(
         &mut conn.tracking_state,
         &mut conn.tracking_rx,
         &ctx.tracking_table,
-        ctx.runtime_config.read().client_output_buffer_limit_normal,
+        crate::tracking::client_cmd::QueueSpec {
+            cap_bytes: ctx.runtime_config.read().client_output_buffer_limit_normal,
+            resp3: conn.protocol_version >= 3,
+        },
     ) {
         Some(reply) => {
             responses.push(reply);

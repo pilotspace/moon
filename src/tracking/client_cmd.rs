@@ -15,6 +15,22 @@ use crate::protocol::Frame;
 use crate::runtime::channel;
 use crate::tracking::{InvalidationRx, TrackingState, TrackingTable};
 
+/// How `CLIENT TRACKING on` creates a connection's invalidation queue
+/// (moon#1088).
+#[derive(Debug, Clone, Copy)]
+pub struct QueueSpec {
+    /// The connection's output-buffer limit in bytes (0 = unlimited).
+    /// Invalidations queued past it disconnect the connection, as redis does.
+    /// The limit is fixed for the life of the process: `CONFIG SET` refuses
+    /// `client-output-buffer-limit`, and the reply path reads it once per
+    /// connection too. If it ever becomes settable, both must read it live.
+    pub cap_bytes: usize,
+    /// Whether the connection speaks RESP3 right now. A RESP2 connection's
+    /// own queue discards until `ConnectionState::set_protocol_version`
+    /// switches it.
+    pub resp3: bool,
+}
+
 /// Whether `sub` is one of the subcommands [`handle`] owns.
 #[inline]
 pub fn is_tracking_subcommand(sub: &[u8]) -> bool {
@@ -28,23 +44,21 @@ pub fn is_tracking_subcommand(sub: &[u8]) -> bool {
 /// `TRACKING`, `CACHING`, ...). Returns `None` for any other subcommand.
 ///
 /// `rx` is the connection's invalidation receiver: created when tracking is
-/// first enabled, dropped when it is disabled. `queue_cap` is the
-/// connection's output-buffer limit in bytes (0 = unlimited): invalidations
-/// queued past it disconnect the connection, as redis does (moon#1088).
+/// first enabled, as `queue` describes, and dropped when it is disabled.
 pub fn handle(
     args: &[Frame],
     client_id: u64,
     state: &mut TrackingState,
     rx: &mut Option<InvalidationRx>,
     table: &parking_lot::Mutex<TrackingTable>,
-    queue_cap: usize,
+    queue: QueueSpec,
 ) -> Option<Frame> {
     let sub = match args.first()? {
         Frame::BulkString(s) | Frame::SimpleString(s) => s.clone(),
         _ => return None,
     };
     if sub.eq_ignore_ascii_case(b"TRACKING") {
-        Some(tracking(args, client_id, state, rx, table, queue_cap))
+        Some(tracking(args, client_id, state, rx, table, queue))
     } else if sub.eq_ignore_ascii_case(b"CACHING") {
         Some(caching(args, state))
     } else if sub.eq_ignore_ascii_case(b"TRACKINGINFO") {
@@ -72,7 +86,7 @@ fn tracking(
     state: &mut TrackingState,
     rx: &mut Option<InvalidationRx>,
     table: &parking_lot::Mutex<TrackingTable>,
-    queue_cap: usize,
+    queue: QueueSpec,
 ) -> Frame {
     let cfg = match crate::command::client::parse_tracking_args(args, |id| {
         table.lock().client_exists(id)
@@ -124,7 +138,8 @@ fn tracking(
     // alone.
     let mut t = table.lock();
     if rx.is_none() {
-        let (tx, new_rx) = crate::tracking::invalidation_queue(client_id, queue_cap);
+        let (tx, new_rx) = crate::tracking::invalidation_queue(client_id, queue.cap_bytes);
+        new_rx.set_deliverable(queue.resp3);
         state.invalidation_tx = Some(tx.clone());
         *rx = Some(new_rx);
         t.register_client(client_id, tx);
@@ -492,6 +507,12 @@ mod tests {
         table: std::sync::Arc<parking_lot::Mutex<TrackingTable>>,
     }
 
+    /// Unlimited, RESP3: every push is queued.
+    const TEST_QUEUE: QueueSpec = QueueSpec {
+        cap_bytes: 0,
+        resp3: true,
+    };
+
     impl Conn {
         fn new(id: u64) -> Self {
             Self {
@@ -507,8 +528,15 @@ mod tests {
 
         fn run(&mut self, parts: &[&str]) -> Frame {
             let a = args(parts);
-            handle(&a, self.id, &mut self.state, &mut self.rx, &self.table, 0)
-                .expect("a tracking subcommand")
+            handle(
+                &a,
+                self.id,
+                &mut self.state,
+                &mut self.rx,
+                &self.table,
+                TEST_QUEUE,
+            )
+            .expect("a tracking subcommand")
         }
     }
 
@@ -523,7 +551,7 @@ mod tests {
     fn other_subcommands_are_not_owned() {
         let mut c = Conn::new(4001);
         let a = args(&["ID"]);
-        assert!(handle(&a, c.id, &mut c.state, &mut c.rx, &c.table, 0).is_none());
+        assert!(handle(&a, c.id, &mut c.state, &mut c.rx, &c.table, TEST_QUEUE).is_none());
         assert!(!is_tracking_subcommand(b"LIST"));
         assert!(is_tracking_subcommand(b"caching"));
         assert!(is_tracking_subcommand(b"TrackingInfo"));

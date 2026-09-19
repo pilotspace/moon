@@ -146,10 +146,12 @@ pub fn invalidate_keys(
     if keys.is_empty() {
         return;
     }
-    let mut table = table.lock();
-    // One item per REDIRECT inbox for the whole key list — or for the whole
-    // script / EXEC body when one has opened a batch (moon#1088).
+    // One item per REDIRECT inbox for the whole key list, or for the whole
+    // EXEC body when one has opened a batch (moon#1088). The lock is taken
+    // INSIDE the batch scope, so a batch of this call's own is sent after the
+    // lock is released.
     crate::tracking::with_delivery_batch(|batch| {
+        let mut table = table.lock();
         for key in keys {
             let recipients = table.invalidate_key(key, writer_client_id);
             if !recipients.is_empty() {
@@ -248,31 +250,92 @@ pub fn track_read_keys(
     track_keys(&mut table.lock(), &keys, client_id, noloop);
 }
 
-/// [`track_read_keys`] for a read a SCRIPT made (moon#1089).
-///
-/// A script can run on another shard than its caller, so the caller may have
-/// disconnected, or turned tracking off, by the time the read registers.
-/// Registering a key for a client whose teardown already ran would leave an
-/// entry nothing ever removes, so the registration is checked under the same
-/// lock that adds the keys.
-pub fn track_script_read_keys(
-    table: &parking_lot::Mutex<crate::tracking::TrackingTable>,
+/// What one command a script ran did to one key (moon#1089).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptKeyEffect {
+    /// The command may have modified the key: invalidate it.
+    Written,
+    /// The command read the key: register it for the script's caller.
+    Read,
+}
+
+/// Append the tracking effects of one command a script ran to `log`: the
+/// keys it may modify ([`written_keys`]), then, when the caller's reads are
+/// tracked, the keys it read. That is the order a command run outside a
+/// script takes effect in.
+pub fn record_script_command(
+    log: &mut Vec<(ScriptKeyEffect, Bytes)>,
     cmd: &[u8],
     cmd_args: &[Frame],
+    track_reads: bool,
+) {
+    if crate::command::metadata::is_write(cmd) {
+        log.extend(
+            written_keys(cmd, cmd_args)
+                .into_iter()
+                .map(|k| (ScriptKeyEffect::Written, k)),
+        );
+    }
+    if track_reads && crate::command::metadata::is_read(cmd) {
+        log.extend(
+            command_keys(cmd, cmd_args)
+                .into_iter()
+                .map(|k| (ScriptKeyEffect::Read, k)),
+        );
+    }
+}
+
+/// Apply a script's recorded tracking effects under ONE acquisition of the
+/// tracking mutex, in the order the script made them (moon#1089).
+///
+/// A script runs to completion on the shard that owns its keys. Nothing
+/// else can change those keys while it runs, so applying its effects when
+/// it ends gives the same result as applying each one as it happened.
+/// Measured on redis-server 8.6.1, for a RESP3 caller:
+/// - `GET k` then `SET k` in one script pushes `invalidate [k]` to the
+///   caller, and no push if the caller has NOLOOP;
+/// - `SET k` then `GET k` leaves `k` tracked.
+///
+/// A write invalidates with the caller as the writer, so NOLOOP is judged
+/// against the caller. A read registers only for a caller that still tracks.
+/// A script can run on another shard than its caller, so the caller may have
+/// disconnected, or turned tracking off, before the script ends. A key
+/// registered for a client whose teardown already ran would be an entry
+/// that nothing ever removes. So the caller's registration is checked under
+/// the same lock that adds the keys.
+pub fn apply_script_effects(
+    table: &parking_lot::Mutex<crate::tracking::TrackingTable>,
+    effects: &[(ScriptKeyEffect, Bytes)],
     client_id: u64,
     noloop: bool,
 ) {
-    if !crate::command::metadata::is_read(cmd) {
+    if effects.is_empty() {
         return;
     }
-    let keys = command_keys(cmd, cmd_args);
-    if keys.is_empty() {
-        return;
-    }
-    let mut table = table.lock();
-    if table.is_tracking(client_id) {
-        track_keys(&mut table, &keys, client_id, noloop);
-    }
+    crate::tracking::with_delivery_batch(|batch| {
+        let mut table = table.lock();
+        let caller_tracks = table.is_tracking(client_id);
+        for (effect, key) in effects {
+            let (named, recipients) = match effect {
+                ScriptKeyEffect::Written => (key.clone(), table.invalidate_key(key, client_id)),
+                // Cap eviction (G1): the evicted key's trackers drop their copy.
+                ScriptKeyEffect::Read if caller_tracks => {
+                    match table.track_key(client_id, key, noloop) {
+                        Some(evicted) => evicted,
+                        None => continue,
+                    }
+                }
+                ScriptKeyEffect::Read => continue,
+            };
+            if recipients.is_empty() {
+                continue;
+            }
+            let mut msg = crate::tracking::TrackingMessage::keys(std::slice::from_ref(&named));
+            for to in &recipients {
+                batch.deliver(&mut msg, to);
+            }
+        }
+    });
 }
 
 fn track_keys(
@@ -1080,7 +1143,12 @@ mod tests {
     #[test]
     fn a_script_read_for_a_departed_caller_registers_nothing() {
         let table = parking_lot::Mutex::new(crate::tracking::TrackingTable::new());
-        track_script_read_keys(&table, b"GET", &[bulk("gone")], 77, false);
+        let read = |key: &'static str| {
+            let mut log = Vec::new();
+            record_script_command(&mut log, b"GET", &[bulk(key)], true);
+            log
+        };
+        apply_script_effects(&table, &read("gone"), 77, false);
         assert!(
             table
                 .lock()
@@ -1089,12 +1157,57 @@ mod tests {
         );
         let (tx, _rx) = crate::runtime::channel::mpsc_unbounded::<Frame>();
         table.lock().register_client(77, tx);
-        track_script_read_keys(&table, b"GET", &[bulk("here")], 77, false);
+        apply_script_effects(&table, &read("here"), 77, false);
         assert_eq!(
             table.lock().tracked_clients(&Bytes::from_static(b"here")),
             vec![77]
         );
         table.lock().untrack_all(77);
+    }
+
+    /// A script's effects apply in the order it made them. `GET k` then
+    /// `SET k` leaves the caller told and `k` no longer tracked. `SET k` then
+    /// `GET k` leaves `k` tracked and nobody told. Both match redis 8.6.1.
+    #[test]
+    fn a_script_s_effects_apply_in_order() {
+        let table = parking_lot::Mutex::new(crate::tracking::TrackingTable::new());
+        let (tx, rx) = crate::runtime::channel::mpsc_unbounded::<Frame>();
+        table.lock().register_client(78, tx);
+        let get = |log: &mut Vec<_>, k: &'static str| {
+            record_script_command(log, b"GET", &[bulk(k)], true)
+        };
+        let set = |log: &mut Vec<_>, k: &'static str| {
+            record_script_command(log, b"SET", &[bulk(k), bulk("v")], true)
+        };
+
+        let mut log = Vec::new();
+        get(&mut log, "gs");
+        set(&mut log, "gs");
+        apply_script_effects(&table, &log, 78, false);
+        assert_eq!(rx.try_recv().ok(), Some(invalidation_push(&[key("gs")])));
+        assert!(table.lock().tracked_clients(&key("gs")).is_empty());
+
+        let mut log = Vec::new();
+        set(&mut log, "sg");
+        get(&mut log, "sg");
+        apply_script_effects(&table, &log, 78, false);
+        assert!(
+            rx.try_recv().is_err(),
+            "nobody tracked sg when it was written"
+        );
+        assert_eq!(table.lock().tracked_clients(&key("sg")), vec![78]);
+
+        // NOLOOP: the caller's own write does not tell it.
+        let mut log = Vec::new();
+        get(&mut log, "nl");
+        set(&mut log, "nl");
+        apply_script_effects(&table, &log, 78, true);
+        assert!(rx.try_recv().is_err());
+        table.lock().untrack_all(78);
+    }
+
+    fn key(s: &str) -> Bytes {
+        Bytes::copy_from_slice(s.as_bytes())
     }
 
     /// A queued CLIENT command that EXEC answered with an error changes

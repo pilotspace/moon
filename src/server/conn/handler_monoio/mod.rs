@@ -1108,8 +1108,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // subscriber arm above: both a reply and a feed line are whole
             // frames written by this one task, and the loop only parks here
             // when no reply is in flight.
+            //
+            // A tracking connection keeps receiving its invalidations while it
+            // monitors, as on redis (measured on 8.6.1: a RESP3 tracker in
+            // MONITOR gets `>2 invalidate` for a key it read). Its queue must
+            // be drained here too, or it fills to the output-buffer limit and
+            // the monitor is disconnected for pushes it never saw.
             let mon_buf = std::mem::take(&mut tmp_buf);
             let mut line: Option<bytes::Bytes> = None;
+            let mut push_frame: Option<Frame> = None;
             monoio::select! {
                 _ = shutdown.cancelled() => { break; }
                 read_result = stream.read(mon_buf) => {
@@ -1124,6 +1131,32 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 msg = rx.recv_async() => {
                     line = msg.ok();
                 }
+                push = async {
+                    match conn.tracking_rx {
+                        Some(ref trx) => trx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    push_frame = push;
+                }
+            }
+            if let (Some(frame), Some(trx)) = (push_frame, conn.tracking_rx.as_ref()) {
+                let deliverable =
+                    crate::tracking::client_cmd::push_deliverable(conn.protocol_version);
+                let Some(push_bytes) = trx.coalesce(frame, deliverable) else {
+                    continue;
+                };
+                if !write_all_bounded!(
+                    stream,
+                    push_bytes,
+                    write_timeout,
+                    out_cap_normal,
+                    client_live,
+                    client_id
+                ) {
+                    break;
+                }
+                continue;
             }
             if let Some(data) = line {
                 if !write_all_bounded!(

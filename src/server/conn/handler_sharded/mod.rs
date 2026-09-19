@@ -712,7 +712,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         responses.len(),
                                         new_proto,
                                     );
-                                    conn.protocol_version = new_proto;
+                                    conn.set_protocol_version(new_proto);
                                 }
                                 if let Some(name) = new_name {
                                     conn.client_name = Some(name);

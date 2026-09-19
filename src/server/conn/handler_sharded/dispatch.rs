@@ -67,7 +67,10 @@ pub(super) fn try_handle_client_command(
                 &mut conn.tracking_state,
                 &mut conn.tracking_rx,
                 &ctx.tracking_table,
-                ctx.runtime_config.read().client_output_buffer_limit_normal,
+                crate::tracking::client_cmd::QueueSpec {
+                    cap_bytes: ctx.runtime_config.read().client_output_buffer_limit_normal,
+                    resp3: conn.protocol_version >= 3,
+                },
             ) {
                 responses.push(reply);
                 return true;

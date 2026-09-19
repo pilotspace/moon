@@ -10,6 +10,10 @@
 //! | #1088 | 400 pipelined SETs, RESP3 tracker                | 400/400 pushes                       | 256/400                          |
 //! | #1088 | 400 pipelined SETs, RESP2 REDIRECT target        | 400/400 messages                     | 256/400, target still connected  |
 //! | #1088 | same, output-buffer limit 8 KiB                  | connection closed                    | 256 pushes, open                 |
+//! | #1088 | tracker stops reading, limit 8 KiB               | connection closed                    | open, pushes dropped             |
+//! | #1088 | RESP2 tracker pipelines `HELLO 3`/`GET k`/`BLPOP` | `>2 invalidate [k]` + BLPOP reply   | delivered                        |
+//! | #1088 | RESP3 tracker in MONITOR, key it read is written | `>2 invalidate [k]` + feed line      | nothing (monoio)                 |
+//! | #1089 | `GET k` then `SET k` in the caller's own script  | `:1` then `>2 invalidate [k]`        | `:1` only                        |
 //! | #1089 | tracker GETs k; other client EVAL SET k          | `>2 invalidate [k]`                  | nothing                          |
 //! | #1089 | tracker EVAL GET k; other client SET k           | `>2 invalidate [k]`                  | nothing                          |
 //! | #1089 | same through EVALSHA, EVAL_RO, FCALL, FCALL_RO   | pushed                               | nothing                          |
@@ -97,8 +101,9 @@ fn spawn_moon(shards: &str, extra: &[&str]) -> Moon {
     panic!("moon (--shards {shards}) never answered PING\n--- stderr ---\n{log}");
 }
 
-/// Minimal RESP client over a blocking TcpStream. No connection in this file
-/// issues a blocking command, so one connection per role is reused safely.
+/// Minimal RESP client over a blocking TcpStream. The one blocking command in
+/// this file (a `BLPOP`) runs on a connection that sends nothing after it, so
+/// one connection per role is reused safely.
 struct Resp {
     stream: TcpStream,
     buf: Vec<u8>,
@@ -456,24 +461,44 @@ fn pipelined_writes_never_silently_short_a_redirect_target_4_shards() {
     pipelined_writes_never_silently_short_a_redirect_target("4");
 }
 
-/// Past the output-buffer limit redis does not drop: it disconnects the
-/// client, which a caching client treats as "flush everything". Measured with
-/// `client-output-buffer-limit normal 8192 0 0`: the tracker is closed.
-fn overflow_disconnects_the_tracker(shards: &str) {
+/// One command whose invalidations exceed the output-buffer limit, sent to a
+/// tracker that keeps reading. Redis is single-threaded: the whole `MSET`
+/// lands in the tracker's output buffer before any of it is written, so with
+/// `client-output-buffer-limit normal 8192 0 0` the tracker is always closed.
+///
+/// moon's limit bounds what is QUEUED for the connection, as redis's bounds
+/// its output buffer. At `--shards 1` the writer runs on the tracker's own
+/// thread, so the connection cannot drain in between. That is redis's case,
+/// and the tracker is closed. At `--shards 4` the tracker's connection may run
+/// on another thread and drain the queue while it fills. Then every push is
+/// delivered and the queue never holds 8 KiB, which is correct: the limit is a
+/// memory bound. Which of the two happens depends on scheduling and on which
+/// shard accepted the connection (it differs between platforms), so all this
+/// test demands there is the issue's rule: every invalidation, or a closed
+/// connection, never a silent short. The deterministic overflow test is
+/// `overflow_disconnects_a_tracker_that_stops_reading`.
+fn a_burst_past_the_limit_is_never_silently_short(shards: &str) {
     let m = spawn_moon(shards, &["--client-output-buffer-limit-normal", "8192"]);
     let mut t = resp3_tracker(m.port, &[]);
     read_burst_keys(&mut t, "ob", b"_\r\n");
     mset_burst(m.port, "ob");
-    t.pump_until(|_| false, Duration::from_secs(5));
+    t.pump_until(|b| count_in(b, PUSH_HEAD) >= BURST, Duration::from_secs(5));
+    // Let a close that follows the last push arrive too.
+    t.pump(Duration::from_millis(300));
+    let got = t.count(PUSH_HEAD);
+    if shards == "1" {
+        assert!(
+            t.closed && got < BURST,
+            "--shards 1: {BURST} invalidations (~16 KiB) queued at once past an 8 KiB \
+             output-buffer limit must close the tracker (redis 8.6.1 does); got {got} pushes, \
+             closed={}",
+            t.closed
+        );
+    }
     assert!(
-        t.closed,
-        "--shards {shards}: {BURST} invalidations (~16 KiB) past an 8 KiB output-buffer limit \
-         must close the tracker, not drop silently; got {} pushes and an open connection",
-        t.count(PUSH_HEAD)
-    );
-    assert!(
-        t.count(PUSH_HEAD) < BURST,
-        "the limit was never hit, so the test proves nothing"
+        t.closed || got == BURST,
+        "--shards {shards}: the tracker got {got} of {BURST} invalidations and is still \
+         connected: a silent short"
     );
     // The server itself is unaffected.
     let mut other = Resp::connect(m.port);
@@ -481,13 +506,269 @@ fn overflow_disconnects_the_tracker(shards: &str) {
 }
 
 #[test]
-fn overflow_disconnects_the_tracker_1_shard() {
-    overflow_disconnects_the_tracker("1");
+fn a_burst_past_the_limit_is_never_silently_short_1_shard() {
+    a_burst_past_the_limit_is_never_silently_short("1");
 }
 
 #[test]
-fn overflow_disconnects_the_tracker_4_shards() {
-    overflow_disconnects_the_tracker("4");
+fn a_burst_past_the_limit_is_never_silently_short_4_shards() {
+    a_burst_past_the_limit_is_never_silently_short("4");
+}
+
+/// Key length for the stalled-reader test. Long keys make each push large, so
+/// the kernel's buffering is used up in a few hundred commands.
+const STALL_KEY_LEN: usize = 4096;
+/// SETs per pipelined write in the stalled-reader test.
+const STALL_BATCH: usize = 64;
+/// What the writer may send before the test gives up. A loopback connection
+/// buffers at most a few MiB in the server's send buffer plus a few MiB in the
+/// client's receive buffer. Linux autotunes to 4 + 6 MiB by default (cloud
+/// images raise both to 16 MiB at most), and Windows' receive window stops
+/// at 16 MiB. Reaching 128 MiB would mean the server queued everything past
+/// its limit without bound. On unix the writer stops as soon as the server
+/// drops the tracker, far below this.
+const STALL_MAX_BYTES: usize = 128 << 20;
+
+/// A tracker that stops reading is disconnected once more than the
+/// output-buffer limit is waiting for it, whatever the kernel buffers in
+/// between. It never silently loses pushes and stays open. This is the
+/// deterministic form of redis's
+/// `client-output-buffer-limit normal <n> 0 0` rule.
+///
+/// BCAST makes every write invalidate. The tracker reads nothing while the
+/// writer sends until the server has dropped it. That fills the server's send
+/// buffer and the tracker's receive buffer, so moon's queue for the tracker
+/// must grow past 8 KiB.
+fn overflow_disconnects_a_tracker_that_stops_reading(shards: &str) {
+    let m = spawn_moon(shards, &["--client-output-buffer-limit-normal", "8192"]);
+    let mut t = resp3_tracker(m.port, &["BCAST", "PREFIX", "ovf:"]);
+    let tid = client_id(&mut t);
+    // From here the tracker reads nothing until the writer is done.
+    let pad = "x".repeat(STALL_KEY_LEN);
+    let mut pipeline = Vec::new();
+    for i in 0..STALL_BATCH {
+        pipeline.extend_from_slice(&common::encode(&["SET", &format!("ovf:{i}:{pad}"), "v"]));
+    }
+    let mut w = Resp::connect(m.port);
+    let (mut sent_bytes, mut writes, mut dropped) = (0usize, 0usize, false);
+    while sent_bytes < STALL_MAX_BYTES {
+        w.buf.clear();
+        w.send_raw(&pipeline);
+        w.pump_until(
+            |b| count_in(b, b"+OK\r\n") >= STALL_BATCH,
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            w.count(b"+OK\r\n"),
+            STALL_BATCH,
+            "--shards {shards}: the writer was held up by a tracker that does not read"
+        );
+        sent_bytes += pipeline.len();
+        writes += STALL_BATCH;
+        let list = String::from_utf8_lossy(&w.reply(&["CLIENT", "LIST"])).into_owned();
+        if !list.contains(&format!("id={tid} ")) {
+            dropped = true;
+            break;
+        }
+    }
+    // On unix the CLIENT KILL path shuts the socket down, which ends the
+    // server's blocked write at once. Elsewhere the kill is cooperative: the
+    // connection closes when its pending write completes, i.e. once the
+    // tracker reads again, and the queue stops growing in the meantime.
+    if cfg!(unix) {
+        assert!(
+            dropped,
+            "--shards {shards}: the server still holds a tracker that stopped reading after \
+             {writes} invalidations (~{} MiB), past an 8 KiB output-buffer limit",
+            sent_bytes >> 20
+        );
+    }
+    t.pump_until(|_| false, Duration::from_secs(30));
+    let got = t.count(PUSH_HEAD);
+    assert!(
+        t.closed,
+        "--shards {shards}: a tracker past its output-buffer limit must be disconnected; it \
+         got {got} of {writes} invalidations and is still connected"
+    );
+    assert!(
+        got < writes,
+        "--shards {shards}: every one of {writes} invalidations was delivered, so the limit \
+         was never reached and the test proves nothing"
+    );
+    // The server itself is unaffected.
+    let mut other = Resp::connect(m.port);
+    assert_eq!(other.reply(&["PING"]), b"+PONG\r\n".to_vec());
+}
+
+#[test]
+fn overflow_disconnects_a_tracker_that_stops_reading_1_shard() {
+    overflow_disconnects_a_tracker_that_stops_reading("1");
+}
+
+#[test]
+fn overflow_disconnects_a_tracker_that_stops_reading_4_shards() {
+    overflow_disconnects_a_tracker_that_stops_reading("4");
+}
+
+/// A RESP2 tracking connection that switches to RESP3 in the middle of a
+/// pipeline must receive the pushes for keys it reads after the switch.
+/// `BLPOP` parks the connection right after that read, so it does not get
+/// back to the top of its loop before the key is written.
+///
+/// Measured on redis-server 8.6.1: `CLIENT TRACKING on`, then one write of
+/// `HELLO 3` / `GET hk` / `BLPOP hq 0`, then another client runs `SET hk v2`
+/// and `RPUSH hq x`. The tracker receives `>2 invalidate [hk]` and the
+/// `BLPOP` reply.
+fn a_tracker_switching_to_resp3_mid_pipeline_gets_its_push(shards: &str) {
+    let m = spawn_moon(shards, &[]);
+    let mut t = Resp::connect(m.port);
+    assert_eq!(t.reply(&["CLIENT", "TRACKING", "on"]), b"+OK\r\n".to_vec());
+    let mut pipeline = common::encode(&["HELLO", "3"]);
+    pipeline.extend_from_slice(&common::encode(&["GET", "hk"]));
+    pipeline.extend_from_slice(&common::encode(&["BLPOP", "hq", "0"]));
+    t.send_raw(&pipeline);
+    // The HELLO map and GET's `_` arrive; BLPOP then blocks.
+    t.pump_until(|b| b.ends_with(b"_\r\n"), Duration::from_secs(4));
+    assert!(
+        t.buf.ends_with(b"_\r\n"),
+        "--shards {shards}: HELLO 3 + GET did not answer: {:?}",
+        t.text()
+    );
+    t.buf.clear();
+    let mut w = Resp::connect(m.port);
+    assert_eq!(w.reply(&["SET", "hk", "v2"]), b"+OK\r\n".to_vec());
+    assert_eq!(w.reply(&["RPUSH", "hq", "x"]), b":1\r\n".to_vec());
+    let push = push_for("hk");
+    let popped = b"*2\r\n$2\r\nhq\r\n$1\r\nx\r\n";
+    t.pump_until(
+        |b| count_in(b, &push) == 1 && count_in(b, popped) == 1,
+        Duration::from_secs(4),
+    );
+    assert_eq!(
+        (t.count(&push), t.count(popped)),
+        (1, 1),
+        "--shards {shards}: redis delivers `invalidate [hk]` and the BLPOP reply; moon sent {:?}",
+        t.text()
+    );
+}
+
+#[test]
+fn a_tracker_switching_to_resp3_mid_pipeline_gets_its_push_1_shard() {
+    a_tracker_switching_to_resp3_mid_pipeline_gets_its_push("1");
+}
+
+#[test]
+fn a_tracker_switching_to_resp3_mid_pipeline_gets_its_push_4_shards() {
+    a_tracker_switching_to_resp3_mid_pipeline_gets_its_push("4");
+}
+
+/// A RESP2 tracker has nowhere to receive its own invalidations (redis writes
+/// it nothing), and once it subscribes nothing reads its queue. So its own
+/// invalidations must not pile up until the output-buffer limit disconnects
+/// it. On redis-server 8.6.1 it stays connected and keeps receiving
+/// messages.
+fn a_resp2_subscribed_tracker_is_not_disconnected_by_its_own_invalidations(shards: &str) {
+    const N: usize = 500;
+    let m = spawn_moon(shards, &["--client-output-buffer-limit-normal", "8192"]);
+    let mut t = Resp::connect(m.port);
+    assert_eq!(
+        t.reply(&["CLIENT", "TRACKING", "on", "BCAST", "PREFIX", "r2:"]),
+        b"+OK\r\n".to_vec()
+    );
+    t.cmd(&["SUBSCRIBE", "r2chan"]);
+    let pad = "q".repeat(32);
+    let mut pipeline = Vec::new();
+    for i in 0..N {
+        pipeline.extend_from_slice(&common::encode(&["SET", &format!("r2:{i}:{pad}"), "v"]));
+    }
+    let mut w = Resp::connect(m.port);
+    w.send_raw(&pipeline);
+    w.pump_until(|b| count_in(b, b"+OK\r\n") >= N, Duration::from_secs(10));
+    assert_eq!(
+        w.count(b"+OK\r\n"),
+        N,
+        "the writer's SETs did not all answer"
+    );
+    t.buf.clear();
+    assert_eq!(w.reply(&["PUBLISH", "r2chan", "hi"]), b":1\r\n".to_vec());
+    let msg = b"*3\r\n$7\r\nmessage\r\n$6\r\nr2chan\r\n$2\r\nhi\r\n";
+    t.pump_until(|b| count_in(b, msg) == 1, Duration::from_secs(4));
+    assert_eq!(
+        t.text(),
+        String::from_utf8_lossy(msg),
+        "--shards {shards}: a RESP2 subscriber got something other than the message \
+         (closed={})",
+        t.closed
+    );
+}
+
+#[test]
+fn a_resp2_subscribed_tracker_is_not_disconnected_by_its_own_invalidations_1_shard() {
+    a_resp2_subscribed_tracker_is_not_disconnected_by_its_own_invalidations("1");
+}
+
+#[test]
+fn a_resp2_subscribed_tracker_is_not_disconnected_by_its_own_invalidations_4_shards() {
+    a_resp2_subscribed_tracker_is_not_disconnected_by_its_own_invalidations("4");
+}
+
+/// A RESP3 tracker that runs MONITOR keeps receiving its invalidations, as
+/// on redis-server 8.6.1 (measured: `HELLO 3`, `CLIENT TRACKING on`,
+/// `GET mk`, `MONITOR`, then another client's `SET mk v` delivers
+/// `>2 invalidate [mk]` and the feed line).
+///
+/// It is also never disconnected for pushes that only pile up because
+/// nothing drains them while it monitors. The writer below makes one write
+/// per round trip, so a tracker whose pushes are delivered never has more
+/// than a handful waiting. Together they are ~30 KiB, far past the 8 KiB
+/// limit, which a queue that is never read would cross. (A single pipelined
+/// burst of the same size would close the tracker on redis too, since its
+/// output buffer takes the whole burst at once.)
+fn a_monitoring_tracker_keeps_its_pushes(shards: &str) {
+    const N: usize = 500;
+    let m = spawn_moon(shards, &["--client-output-buffer-limit-normal", "8192"]);
+    let mut t = resp3_tracker(m.port, &["BCAST", "PREFIX", "mon:"]);
+    assert_eq!(t.reply(&["MONITOR"]), b"+OK\r\n".to_vec());
+    let pad = "p".repeat(32);
+    let mut w = Resp::connect(m.port);
+    // 20 SETs per round trip: ~1.2 KiB of pushes at a time.
+    const STEP: usize = 20;
+    for chunk in 0..N / STEP {
+        let mut pipeline = Vec::new();
+        for i in chunk * STEP..(chunk + 1) * STEP {
+            pipeline.extend_from_slice(&common::encode(&["SET", &format!("mon:{i}:{pad}"), "v"]));
+        }
+        w.buf.clear();
+        w.send_raw(&pipeline);
+        w.pump_until(|b| count_in(b, b"+OK\r\n") >= STEP, Duration::from_secs(4));
+        assert_eq!(
+            w.count(b"+OK\r\n"),
+            STEP,
+            "round trip {chunk} did not answer"
+        );
+    }
+    t.pump_until(|b| count_in(b, PUSH_HEAD) >= N, Duration::from_secs(10));
+    assert_eq!(
+        t.count(PUSH_HEAD),
+        N,
+        "--shards {shards}: a monitoring tracker must receive all {N} invalidations; closed={}",
+        t.closed
+    );
+    t.pump(Duration::from_millis(200));
+    assert!(
+        !t.closed,
+        "--shards {shards}: the monitoring tracker was disconnected"
+    );
+}
+
+#[test]
+fn a_monitoring_tracker_keeps_its_pushes_1_shard() {
+    a_monitoring_tracker_keeps_its_pushes("1");
+}
+
+#[test]
+fn a_monitoring_tracker_keeps_its_pushes_4_shards() {
+    a_monitoring_tracker_keeps_its_pushes("4");
 }
 
 // ═══════════════════ moon#1089: scripts are visible to tracking ═══════════════════
@@ -638,6 +919,66 @@ fn scripts_invalidate_and_track_1_shard() {
 #[test]
 fn scripts_invalidate_and_track_4_shards() {
     scripts_invalidate_and_track("4");
+}
+
+/// Reads and writes inside one script take effect for the caller in the
+/// order the script made them. Measured on redis-server 8.6.1 for a RESP3
+/// tracker running the script itself:
+///
+/// | script body           | tracker receives                | then an outside `SET` |
+/// |-----------------------|---------------------------------|-----------------------|
+/// | `GET k` then `SET k`  | `:1` then `>2 invalidate [k]`   | nothing               |
+/// | `SET k` then `GET k`  | `:1`                            | `>2 invalidate [k]`   |
+/// | `GET`, `SET`, NOLOOP  | `:1`                            | nothing               |
+fn a_script_s_reads_and_writes_apply_in_order(shards: &str) {
+    let m = spawn_moon(shards, &[]);
+    let p = m.port;
+    let get_set = "redis.call('GET', KEYS[1]); redis.call('SET', KEYS[1], 'v'); return 1";
+    let set_get = "redis.call('SET', KEYS[1], 'v'); redis.call('GET', KEYS[1]); return 1";
+    // (case, tracking mode, body, push right after `:1`, push on an outside SET)
+    let cases: [(&str, &[&str], &str, bool, bool); 3] = [
+        ("GET then SET", &[], get_set, true, false),
+        ("SET then GET", &[], set_get, false, true),
+        ("GET then SET, NOLOOP", &["NOLOOP"], get_set, false, false),
+    ];
+    for (i, (case, mode, body, pushed_now, pushed_after)) in cases.into_iter().enumerate() {
+        let key = format!("so:{i}");
+        let mut t = resp3_tracker(p, mode);
+        let want = push_for(&key);
+        let mut eval_reply = b":1\r\n".to_vec();
+        if pushed_now {
+            eval_reply.extend_from_slice(&want);
+        }
+        t.buf.clear();
+        t.send(&["EVAL", body, "1", &key]);
+        t.pump_until(|b| b.len() >= eval_reply.len(), Duration::from_secs(4));
+        t.pump(Duration::from_millis(150));
+        assert_eq!(
+            t.text(),
+            String::from_utf8_lossy(&eval_reply),
+            "{case} at --shards {shards}: what the script's caller receives"
+        );
+        t.buf.clear();
+        let mut w = Resp::connect(p);
+        assert_eq!(w.reply(&["SET", &key, "w"]), b"+OK\r\n".to_vec());
+        t.pump_until(|b| !b.is_empty(), Duration::from_millis(600));
+        let expected: &[u8] = if pushed_after { &want } else { b"" };
+        assert_eq!(
+            t.text(),
+            String::from_utf8_lossy(expected),
+            "{case} at --shards {shards}: what an outside SET then pushes"
+        );
+    }
+}
+
+#[test]
+fn a_script_s_reads_and_writes_apply_in_order_1_shard() {
+    a_script_s_reads_and_writes_apply_in_order("1");
+}
+
+#[test]
+fn a_script_s_reads_and_writes_apply_in_order_4_shards() {
+    a_script_s_reads_and_writes_apply_in_order("4");
 }
 
 fn scripts_in_multi_and_tracking_modes(shards: &str) {
