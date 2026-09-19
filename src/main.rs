@@ -1890,7 +1890,7 @@ fn main() -> anyhow::Result<()> {
             let aof_path = base_dir.join(&config.appendfilename);
             let seeded = moon::persistence::cold_records::seed_cold_cut_if_fresh(
                 &aof_path,
-                cold_file_watermark(disk_offload_base.as_deref(), 0),
+                cold_file_watermark(&spill_seeds, 0),
             )
             .with_context(|| {
                 format!(
