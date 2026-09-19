@@ -581,6 +581,41 @@ pub fn refresh_db_clock(db_index: usize, clock: &crate::storage::entry::CachedCl
     }
 }
 
+/// Exclusive access to a SECOND database of this shard, for a caller that is
+/// already inside a guard on another one it cannot hand back — a script's
+/// `redis.call('MOVE', ...)` / `redis.call('COPY', ..., 'DB', n)` (moon#1068).
+///
+/// A script runs inside `pending_flush::run_and_complete`'s guard on the
+/// selected database, which itself often runs inside a [`with_shard`] borrow,
+/// so neither [`with_shard_db`]'s slow path (a second `with_shard`) nor
+/// [`ShardDbSet::with_pair`] (the selected db again) can be used from there.
+///
+/// Returns `None`, running nothing, when this thread is not a registered shard
+/// thread (`cached_db_set()` absent — unit-test slices) or `db_index` is out of
+/// range. The caller must answer with an error rather than fall back to the
+/// one database it holds.
+///
+/// # Lock order
+///
+/// This may acquire a LOWER index than the one the caller holds, against
+/// [`ShardDbSet::write_pair`]'s ascending rule. That rule orders owner
+/// acquisitions against each other; the owner is the only thread that ever
+/// PARKS on these locks, and it is single-threaded. Every other party —
+/// `try_foreign_db_read` / `try_foreign_db_write` — makes one non-blocking
+/// attempt and holds a single guard while never waiting on anything, so it
+/// cannot be one side of a cycle. The worst case is a short wait for a foreign
+/// reader to finish.
+///
+/// # Panics
+/// On the re-entrancy contract: `db_index` must not be a database this thread
+/// already holds (the caller passes a destination distinct from its source).
+#[inline]
+pub fn with_second_shard_db<R>(db_index: usize, f: impl FnOnce(&mut Database) -> R) -> Option<R> {
+    let set = cached_db_set()?;
+    let mut guard = set.try_write(db_index)?;
+    Some(f(&mut guard))
+}
+
 /// The foreign fast path: serve a read of `shard`'s database on THIS thread.
 ///
 /// Returns `None` — meaning the caller must fall through to the SPSC path it
