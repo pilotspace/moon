@@ -249,6 +249,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     connections holding a channel `parked_clients:0`), or a cross-thread wake of
     a parked connection, which the idle-park machinery does not have. That
     part of moon#1078 stays open.
+- **A served blocking pop is logged by the shard that popped it, at the moment
+  it popped** (moon#1056, moon#1097). Since moon#827 a `BLPOP`/`BRPOP`/
+  `BLMOVE`/`BRPOPLPUSH`/`BLMPOP`/`BZPOPMIN`/`BZPOPMAX`/`BZMPOP` that popped
+  propagated a synthesised record, but the WAITER's connection wrote it,
+  after the reply had reached it. At `--shards > 1` that is usually not the
+  shard owning the key, so the record sat in the wrong shard's AOF and replay
+  dropped it: 33 of 48 probes in the new kill -9 test (four owners, one
+  waiter connection, `appendfsync always`) came back with the popped element
+  restored. At any shard count the record could also land behind a later
+  write to the same key (`[a,b]`, pop `a`, `LPUSH x` recovered as `[a,b]`
+  instead of `[x,b]`, on disk and on a replica), and an AOF rewrite snapshot
+  could fall between the pop and its record, applying the pop twice. The
+  owner now appends the record to its own AOF and replication stream in the
+  pop's synchronous stretch, before the reply leaves (wake-served, claim-won
+  and immediately-served pops alike); the waiter only confirms the fsync on
+  the owner's writer under `appendfsync always`. A write that wakes a waiter
+  (a plain write, `EXEC`, `MOVE`/`COPY ... DB n` on the connection and on
+  every cross-shard SPSC arm) now logs itself before it serves the waiter, so
+  the pop always follows the push that fed it. A record the AOF writer cannot
+  take within its backpressure bound answers the waiter with the same
+  `MOONERR AOF backpressure` error as every other synchronous write, instead
+  of the element; that error, like `AOF fsync failed`, means the element may
+  have been consumed. One wake pass shares one backpressure bound across all
+  the pops it logs, so a saturated writer stalls the shard thread once, not
+  once per served waiter.
+
+- **A write is logged in the order it was applied, even when it waits after
+  applying** (moon#1084). Three paths applied a write, awaited something, and
+  only then appended it to the AOF (and, on monoio, to the replication
+  stream), so a write another client made in between was logged first and
+  replay applied the two in the wrong order:
+  - `EXEC` with a queued connection intercept (`WAIT`, `CLIENT`, `CONFIG`,
+    `SCRIPT`, `FUNCTION`, ...) logged its body after filling the intercept
+    replies. `SET k 0`, then `MULTI / INCR k / WAIT 1 1500 / EXEC` with
+    another client's `SET k 5` landing while `EXEC` was parked in `WAIT`:
+    the server acknowledged `5`, and after `kill -9` it recovered `6`; a
+    replica settled on `6` too. Seen on both runtimes at `--shards 1` and
+    `--shards 4`. The body is now logged and replicated right after it
+    runs, before any intercept is filled; the intercepts do not change the
+    keyspace. If the append fails, `EXEC` reports the error without running
+    the intercepts, as the owner-routed path already did.
+  - A typed `FLUSHDB`/`FLUSHALL` at `--shards > 1` logged this shard's flush
+    after broadcasting it to the other shards, so a key written to this shard
+    during the broadcast was replayed BEFORE the flush and vanished after a
+    restart. The flush is now logged before the broadcast, which also means a
+    broadcast that fails part-way no longer leaves this shard's flush out of
+    the log.
+  - A scattered `MSET` logged its local slice after awaiting the remote legs,
+    so a newer write to one of its local keys was replayed under the `MSET`
+    value. The slice is now logged right after it is applied.
+
+- **Three wire-parity gaps found probing redis-server 8.6.1 raw sockets**
+  (moon#1060, moon#1076, moon#1077).
+  - `ZRANGEBYSCORE`, `ZRANGE ... BYSCORE`/`BYLEX` and `ZREVRANGEBYSCORE`
+    (moon#1060) looked a key up before validating the min/max grammar, so a
+    malformed bound against a MISSING key answered an empty array where Redis
+    parses the grammar unconditionally and answers a parse error.
+    `ZRANGEBYLEX`/`ZREVRANGEBYLEX` (moon#959) already had the order right.
+  - Inside `MULTI`, a container subcommand with the wrong number of arguments
+    (`CLIENT CACHING`, `CLIENT SETNAME`, `CONFIG GET`, `CONFIG SET`, ...) was
+    queued instead of aborting the transaction (moon#1076). The queue-time
+    gate checked the container's own arity and, since moon#670, whether the
+    subcommand was known, but never the subcommand's own arity even though
+    `SUBCOMMAND_META` records it. `EXEC` now answers `EXECABORT` the same way
+    it does for an unknown subcommand.
+  - The unknown-command error always appended `, with args beginning with: `
+    and never listed the arguments (moon#1077). Redis appends that clause
+    only when there is at least one argument, then lists each one quoted and
+    space-separated with no commas, truncated at a combined 128-byte budget
+    (and, C's `%.*s` being what it is, at an argument's first embedded NUL).
+    One builder (`command::helpers::err_unknown_command`) now serves
+    `command::dispatch`, `command::dispatch_read` and the `MULTI` queue-time
+    gate, so the three cannot drift the way they had — the live paths never
+    listed arguments and the queue-time gate listed them with `', '` where
+    Redis has no comma. The builder writes raw bytes rather than a lossy
+    `String`, so a non-UTF8 argument reaches the wire unchanged; CR and LF are
+    still mapped to a space so a client-chosen argument cannot split this
+    reply into a second, forged one on a pipelined connection (the same class
+    of bug as moon#1031, whose general fix — the RESP2/RESP3 line writers —
+    remains open).
+
 - **Restart no longer deletes warm vector segments it is serving, and a warm
   segment is superseded per key instead of as a whole directory** (moon#893).
   Boot recovery judged a warm segment "already covered" when ANY one of its

@@ -993,6 +993,24 @@ assert_both "ZREMRANGEBYRANK missing key"       ZREMRANGEBYRANK z:959:nokey 0 1
 assert_both "ZREMRANGEBYRANK drains"            ZREMRANGEBYRANK z:959:rank 0 -1
 assert_both "ZREMRANGEBYRANK drained key gone"  EXISTS z:959:rank
 
+# moon#1060 -- ZRANGEBYSCORE and ZRANGE ... BYSCORE/BYLEX looked the key up
+# BEFORE validating the min/max grammar, so a bad bound against a MISSING key
+# answered `[]` where redis parses the grammar unconditionally and answers a
+# parse error. ZREVRANGEBYSCORE had the identical defect (same file, same
+# sweep) and is fixed alongside it. ZRANGEBYLEX/ZREVRANGEBYLEX (moon#959,
+# rows above) already had the order right; they are the negative control.
+assert_both "ZRANGEBYSCORE bad bound missing key"     ZRANGEBYSCORE z:1060:nokey a b
+assert_both "ZREVRANGEBYSCORE bad bound missing key"  ZREVRANGEBYSCORE z:1060:nokey a b
+assert_both "ZRANGE BYSCORE bad bound missing key"    ZRANGE z:1060:nokey a b BYSCORE
+assert_both "ZRANGE BYLEX bad bound missing key"      ZRANGE z:1060:nokey a b BYLEX
+assert_both "ZRANGE BYSCORE REV bad bound missing key" ZRANGE z:1060:nokey b a BYSCORE REV
+# Controls: a VALID bound on the same missing key is still an ordinary empty
+# reply, and a bad bound on an EXISTING key already errored before the fix.
+assert_both "ZRANGEBYSCORE valid bound missing key"   ZRANGEBYSCORE z:1060:nokey 0 10
+assert_both "ZRANGE BYLEX valid bound missing key"    ZRANGE z:1060:nokey - + BYLEX
+both ZADD z:1060:exists 1 m
+assert_both "ZRANGEBYSCORE bad bound existing key"    ZRANGEBYSCORE z:1060:exists a b
+
 # moon#1001 -- ZRANGE, ZREVRANGE and ZRANGESTORE clamped a STOP still
 # negative after `len + stop` to 0, so `ZRANGE z -10 -6` on a five-member
 # zset answered one element where redis answers an empty array. Verified
@@ -1672,6 +1690,52 @@ move_copy_in_multi_outcome() {
 }
 assert_eq "moon#1062 MOVE and COPY ... DB n inside MULTI (shards=$SHARDS)" \
     "$(move_copy_in_multi_outcome "$PORT_REDIS")" "$(move_copy_in_multi_outcome "$PORT_RUST")"
+
+# ---------------------------------------------------------------------------
+# moon#1076: a container subcommand with the wrong arity is queued instead of
+# aborting the transaction
+# ---------------------------------------------------------------------------
+#
+# Pre-fix, `CLIENT CACHING` (and every other known-but-wrong-arity container
+# subcommand) answered `+QUEUED`, and `EXEC` ran the rest of the body instead
+# of `-EXECABORT`. The verdict is the whole transcript plus whether the SET
+# that followed actually landed -- a shorter EXEC array or a wrongly-applied
+# SET both show up in the trailing GET.
+bad_subcommand_arity_in_multi_outcome() {
+    local port=$1 sub_args="$2" key="$3"
+    redis-cli -p "$port" DEL "$key" >/dev/null 2>&1 || true
+    printf '%s\n' 'MULTI' "$sub_args" "SET $key from-txn" 'EXEC' "GET $key" \
+        | redis-cli -p "$port" 2>&1 | tr '\n' ' ' || true
+}
+assert_eq "moon#1076 CLIENT CACHING (no args) aborts the transaction (shards=$SHARDS)" \
+    "$(bad_subcommand_arity_in_multi_outcome "$PORT_REDIS" "CLIENT CACHING" "tx1076:a")" \
+    "$(bad_subcommand_arity_in_multi_outcome "$PORT_RUST" "CLIENT CACHING" "tx1076:a")"
+assert_eq "moon#1076 CLIENT SETNAME (no args) aborts the transaction (shards=$SHARDS)" \
+    "$(bad_subcommand_arity_in_multi_outcome "$PORT_REDIS" "CLIENT SETNAME" "tx1076:b")" \
+    "$(bad_subcommand_arity_in_multi_outcome "$PORT_RUST" "CLIENT SETNAME" "tx1076:b")"
+assert_eq "moon#1076 CONFIG GET (no args) aborts the transaction (shards=$SHARDS)" \
+    "$(bad_subcommand_arity_in_multi_outcome "$PORT_REDIS" "CONFIG GET" "tx1076:c")" \
+    "$(bad_subcommand_arity_in_multi_outcome "$PORT_RUST" "CONFIG GET" "tx1076:c")"
+assert_eq "moon#1076 CONFIG SET (1 arg) aborts the transaction (shards=$SHARDS)" \
+    "$(bad_subcommand_arity_in_multi_outcome "$PORT_REDIS" "CONFIG SET maxmemory" "tx1076:d")" \
+    "$(bad_subcommand_arity_in_multi_outcome "$PORT_RUST" "CONFIG SET maxmemory" "tx1076:d")"
+# Control: a subcommand with CORRECT arity still queues and runs normally.
+assert_eq "moon#1076 CLIENT GETNAME (correct arity) still queues (shards=$SHARDS)" \
+    "$(bad_subcommand_arity_in_multi_outcome "$PORT_REDIS" "CLIENT GETNAME" "tx1076:e")" \
+    "$(bad_subcommand_arity_in_multi_outcome "$PORT_RUST" "CLIENT GETNAME" "tx1076:e")"
+
+# ---------------------------------------------------------------------------
+# moon#1077: unknown-command error never lists the arguments and appends the
+# suffix even when there are none
+# ---------------------------------------------------------------------------
+#
+# Pre-fix, moon always appended `, with args beginning with: ` and never
+# listed the arguments; redis appends the clause only when there IS at least
+# one argument, then lists each one quoted and space-separated (no commas).
+assert_both "unknown command zero args"           NOSUCHCMD1077
+assert_both "unknown command two args"            NOSUCHCMD1077 a b
+assert_both "unknown command keeps client casing" NoSuchCmd1077 a b
+assert_both "unknown command lower-case"          nosuchcmd1077
 
 # ===========================================================================
 # RESP2 null TYPE parity (moon#482)

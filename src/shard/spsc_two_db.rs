@@ -27,6 +27,46 @@ use crate::shard::shared_databases::ShardDatabases;
 use crate::storage::entry::CachedClock;
 use crate::storage::tiered::spill_thread::SpillRequest;
 
+/// What [`try_two_db_intercept`] did: the command's final response, and the
+/// key it wrote into the OTHER database, if any.
+///
+/// moon#1069 serves the clients blocked on that key; moon#1056 makes the
+/// CALLER do it, with [`wake_two_db_target`], AFTER it has logged the
+/// command. A waiter served by that wake has its pop logged at the moment it
+/// pops, so waking inside the intercept (before the arm's
+/// `wal_append_and_fanout`) put the pop ahead of the MOVE that fed it, and
+/// replay popped an empty key and then moved the element back in.
+pub(crate) struct TwoDbOutcome {
+    pub(crate) response: Frame,
+    pub(crate) wake: Option<(usize, bytes::Bytes)>,
+}
+
+/// Serve the clients blocked on the key a MOVE / `COPY ... DB n` wrote into
+/// `dst_db` — once the command is logged (see [`TwoDbOutcome`]). `wrote` is
+/// "the command answered `:1`", read before any AOF error replaced the
+/// reply: the key moved either way. A no-op unless someone waits there.
+pub(crate) fn wake_two_db_target(
+    blocking_registry: &RefCell<BlockingRegistry>,
+    databases: &ShardDbSet,
+    wake: Option<(usize, bytes::Bytes)>,
+    wrote: bool,
+) {
+    let Some((dst_db, key)) = wake else {
+        return;
+    };
+    if !wrote || !blocking_registry.borrow().has_waiters(dst_db, &key) {
+        return;
+    }
+    let mut dst = databases.write(dst_db);
+    crate::blocking::wakeup::wake_cross_db_write(
+        blocking_registry,
+        &mut dst,
+        dst_db,
+        &key,
+        &Frame::Integer(1),
+    );
+}
+
 /// Attempt the MOVE/`COPY ... DB n` two-database intercept for one command.
 ///
 /// Returns `Some(response)` when `cmd` is `MOVE`, or `COPY` with a `DB`
@@ -64,10 +104,7 @@ pub(crate) fn try_two_db_intercept(
     spill_sender: Option<&flume::Sender<SpillRequest>>,
     spill_file_id: &Rc<Cell<u64>>,
     disk_offload_dir: Option<&std::path::Path>,
-    // moon#1069: the waiters on the key this writes into the OTHER database
-    // are served here — this intercept replaces every generic write tail.
-    blocking_registry: &RefCell<BlockingRegistry>,
-) -> Option<Frame> {
+) -> Option<TwoDbOutcome> {
     if cmd.eq_ignore_ascii_case(b"MOVE") {
         // `resolve_move` refuses `dst_db == db_idx` with redis's same-object
         // error (moon#1062), so `with_pair`'s distinct-index assert holds.
@@ -77,23 +114,23 @@ pub(crate) fn try_two_db_intercept(
                 // Refresh expiry clock on BOTH databases before the move so
                 // an expired source key behaves as "not found" and an
                 // expired destination key doesn't shadow the insert.
-                databases.with_pair(db_idx, dst_db, |src, dst| {
+                let reply = databases.with_pair(db_idx, dst_db, |src, dst| {
                     src.refresh_now_from_cache(cached_clock);
                     dst.refresh_now_from_cache(cached_clock);
-                    let reply = ksmv::move_core(src, dst, &key);
-                    // moon#1069: the key now exists in `dst_db`.
-                    crate::blocking::wakeup::wake_cross_db_write(
-                        blocking_registry,
-                        dst,
-                        dst_db,
-                        &key,
-                        &reply,
-                    );
-                    reply
-                })
+                    ksmv::move_core(src, dst, &key)
+                });
+                // moon#1069: the key now exists in `dst_db`; the caller
+                // wakes it once the MOVE is logged (moon#1056).
+                return Some(TwoDbOutcome {
+                    response: reply,
+                    wake: Some((dst_db, key)),
+                });
             }
         };
-        return Some(response);
+        return Some(TwoDbOutcome {
+            response,
+            wake: None,
+        });
     }
 
     if cmd.eq_ignore_ascii_case(b"COPY") {
@@ -101,8 +138,8 @@ pub(crate) fn try_two_db_intercept(
         // exactly the desired "no DB clause / same-db: fall through to
         // cmd_dispatch" behavior `parse_copy_db_args` documents.
         let copy_result = ksmv::parse_copy_db_args(args, db_idx, db_count)?;
-        let response = match copy_result {
-            Err(e) => e,
+        let (response, wake) = match copy_result {
+            Err(e) => (e, None),
             Ok(ca) => databases.with_pair(db_idx, ca.dst_db, |src, dst| {
                 // Refresh expiry clock on BOTH dbs to mirror the single-db
                 // write path: expired src/dst keys must resolve correctly
@@ -134,22 +171,16 @@ pub(crate) fn try_two_db_intercept(
                         disk_offload_dir,
                         &mut |_| {},
                     ) {
-                        return oom;
+                        return (oom, None);
                     }
                 }
                 let reply = ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace);
-                // moon#1069: the copy now exists in `ca.dst_db`.
-                crate::blocking::wakeup::wake_cross_db_write(
-                    blocking_registry,
-                    dst,
-                    ca.dst_db,
-                    &ca.dst_key,
-                    &reply,
-                );
-                reply
+                // moon#1069: the copy now exists in `ca.dst_db`; the caller
+                // wakes it once the COPY is logged (moon#1056).
+                (reply, Some((ca.dst_db, ca.dst_key.clone())))
             }),
         };
-        return Some(response);
+        return Some(TwoDbOutcome { response, wake });
     }
 
     None
