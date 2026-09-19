@@ -30,6 +30,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BEHAVIOUR CHANGE — once the cold tier holds keys, a write is checked
+  against `maxmemory` using hot bytes PLUS the cold index's RAM, not hot bytes
+  alone** (moon#1036).
+  - **Who is affected:** servers running `maxmemory-policy noeviction`, and
+    `volatile-*` servers whose volatile keys run out. They now answer `-OOM`
+    earlier than before, by the size of the cold index. `allkeys-*` servers
+    reply the same; they spill more hot keys to disk to stay under the cap.
+  - **When it applies:** only with `--disk-offload` enabled and only after keys
+    have spilled. A server with an empty cold tier behaves exactly as before.
+  - **Why this is correct:** the cold index (one entry per spilled key) is
+    resident RAM. The 100 ms pressure cascade has charged it against
+    `maxmemory` since K4. Until now the per-write gates did not, so the shard
+    ran over the cascade's cap between ticks. `noeviction` / `volatile-*`
+    writes are now refused at the cap the server was already enforcing,
+    instead of up to one tick later.
+  - **What to do:** if writes that used to fit now hit `-OOM`, raise
+    `maxmemory` by the cold index's size. INFO reports it as `cold_index_bytes`
+    in the `# MoonStore` section, and Prometheus as
+    `moon_memory_bytes{kind="cold_index"}`. Both are refreshed by the cold
+    orphan sweep (`--cold-orphan-sweep-interval-secs`, 60 s default), so leave
+    some headroom for growth between samples.
+
 - **BEHAVIOUR CHANGE — a command the user's ACL denies inside `MULTI` now
   aborts the whole transaction** (moon#1035). `EXEC` answers
   `-EXECABORT Transaction discarded because of previous errors.` and applies
@@ -168,6 +190,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drift apart. An admin script that retried until `+OK` will now see the error.
 
 ### Fixed
+
+- **`maxmemory` is one cap again once keys have spilled to disk** (moon#1036).
+  Since K4, the 100 ms pressure cascade has held each database to hot bytes
+  PLUS its cold index's RAM. The per-write gates did not: the inline `SET`
+  pre-gate and `evict_to_budget` without `.total()` compared hot bytes only.
+  So each tick the cascade spilled a cold index's worth of hot keys, and the
+  write path let writers refill that room without evicting. Plain `SET`s
+  inlined into it while the shard was over the cascade's cap. The shard ran
+  over budget between ticks, and every tick spilled extra keys. An
+  instrumented build classified every inlined write (1,809 across 6 runs):
+  all of them saw fresh hints and a shard under budget by hot bytes but over
+  it once the cold index was counted. None was a stale-hint slip. With a
+  CI-speed writer this reproduced 247-389 inlined writes out of 2000; CI's
+  red `g2_bail_out_fires_under_pressure_shards1` runs showed 53-297. All
+  eviction gates now read one figure, `Database::budgeted_memory()`: the
+  inline pre-gate, `evict_to_budget`'s default, the tick publish and the
+  timer sweep. After the fix the count is 0 of 2000 in every run, with or
+  without contention. The G2 test's window is now paced so the cascade runs
+  inside it on any host, and its bound is a constant (5) rather than 2% of
+  the writes.
 
 - **A tokio `--shards 1` AOF written before `MOON.COLDCUT` existed no longer
   compounds its damage on every restart** (moon#914 (b)). Such a file has no
