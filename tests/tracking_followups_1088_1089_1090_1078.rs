@@ -283,7 +283,60 @@ fn burst_reaches_a_resp3_tracker_4_shards() {
     burst_reaches_a_resp3_tracker("4");
 }
 
+/// How a burst of `BURST` writes is issued.
+#[derive(Clone, Copy, Debug)]
+enum Burst {
+    /// One `MSET` over every key.
+    Mset,
+    /// One script making `BURST` writing `redis.call`s.
+    Script,
+    /// One `MULTI` body of `BURST` `SET`s.
+    Exec,
+}
+
+fn write_burst(port: u16, tag: &str, how: Burst) {
+    if matches!(how, Burst::Mset) {
+        mset_burst(port, tag);
+        return;
+    }
+    let keys: Vec<String> = (0..BURST).map(|i| format!("{{{tag}}}:{i}")).collect();
+    let mut w = Resp::connect(port);
+    match how {
+        Burst::Mset => {}
+        Burst::Script => {
+            let n = BURST.to_string();
+            let mut args = vec![
+                "EVAL",
+                "for i = 1, #KEYS do redis.call('SET', KEYS[i], 'v') end return 1",
+                &n,
+            ];
+            args.extend(keys.iter().map(String::as_str));
+            assert_eq!(w.reply(&args), b":1\r\n".to_vec());
+        }
+        Burst::Exec => {
+            let mut pipeline = common::encode(&["MULTI"]);
+            for k in &keys {
+                pipeline.extend_from_slice(&common::encode(&["SET", k, "v"]));
+            }
+            pipeline.extend_from_slice(&common::encode(&["EXEC"]));
+            w.send_raw(&pipeline);
+            let want = b"*400\r\n";
+            w.pump_until(
+                |b| b.windows(want.len()).any(|x| x == want) && b.ends_with(b"+OK\r\n"),
+                Duration::from_secs(10),
+            );
+            assert!(w.saw(want), "EXEC did not commit: {:?}", w.text());
+        }
+    }
+}
+
 fn burst_reaches_a_resp2_redirect_target(shards: &str) {
+    for how in [Burst::Mset, Burst::Script, Burst::Exec] {
+        burst_reaches_a_resp2_redirect_target_via(shards, how);
+    }
+}
+
+fn burst_reaches_a_resp2_redirect_target_via(shards: &str, how: Burst) {
     let m = spawn_moon(shards, &[]);
     let mut target = Resp::connect(m.port);
     let tid = client_id(&mut target);
@@ -295,7 +348,7 @@ fn burst_reaches_a_resp2_redirect_target(shards: &str) {
         b"+OK\r\n".to_vec()
     );
     read_burst_keys(&mut source, "rb", b"$-1\r\n");
-    mset_burst(m.port, "rb");
+    write_burst(m.port, "rb", how);
     target.pump_until(
         |b| count_in(b, MESSAGE_HEAD) >= BURST,
         Duration::from_secs(10),
@@ -303,11 +356,11 @@ fn burst_reaches_a_resp2_redirect_target(shards: &str) {
     assert_eq!(
         target.count(MESSAGE_HEAD),
         BURST,
-        "--shards {shards}: a RESP2 REDIRECT target must receive all {BURST} messages"
+        "--shards {shards}, {how:?}: a RESP2 REDIRECT target must receive all {BURST} messages"
     );
     assert!(
         !target.closed,
-        "--shards {shards}: the target must stay connected"
+        "--shards {shards}, {how:?}: the target must stay connected"
     );
 }
 

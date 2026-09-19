@@ -147,18 +147,19 @@ pub fn invalidate_keys(
         return;
     }
     let mut table = table.lock();
-    // One item per REDIRECT inbox for the whole key list (moon#1088).
-    let mut batch = crate::tracking::DeliveryBatch::default();
-    for key in keys {
-        let recipients = table.invalidate_key(key, writer_client_id);
-        if !recipients.is_empty() {
-            let mut msg = crate::tracking::TrackingMessage::keys(std::slice::from_ref(key));
-            for to in &recipients {
-                batch.deliver(&mut msg, to);
+    // One item per REDIRECT inbox for the whole key list — or for the whole
+    // script / EXEC body when one has opened a batch (moon#1088).
+    crate::tracking::with_delivery_batch(|batch| {
+        for key in keys {
+            let recipients = table.invalidate_key(key, writer_client_id);
+            if !recipients.is_empty() {
+                let mut msg = crate::tracking::TrackingMessage::keys(std::slice::from_ref(key));
+                for to in &recipients {
+                    batch.deliver(&mut msg, to);
+                }
             }
         }
-    }
-    batch.flush();
+    });
 }
 
 /// Writer id for a removal the SERVER decided on (expiry, eviction).
@@ -294,6 +295,15 @@ fn track_keys(
     }
 }
 
+/// Closes a delivery batch however the scope ends.
+struct FlushOnDrop;
+
+impl Drop for FlushOnDrop {
+    fn drop(&mut self) {
+        crate::tracking::end_delivery_batch();
+    }
+}
+
 /// CLIENT TRACKING bookkeeping for a committed MULTI/EXEC body, in queue
 /// order — the order it executed in.
 ///
@@ -332,6 +342,9 @@ pub fn after_transaction(
     tracking_now: bool,
 ) {
     let mut modes = before;
+    // The whole body's invalidations reach each REDIRECT inbox as one item.
+    crate::tracking::begin_delivery_batch();
+    let _flush = FlushOnDrop;
     for (cmd_frame, result) in queue.iter().zip(results) {
         let Some((cmd, args)) = crate::server::conn::util::extract_command(cmd_frame) else {
             continue;

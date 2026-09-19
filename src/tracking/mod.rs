@@ -411,6 +411,66 @@ impl DeliveryBatch {
     }
 }
 
+thread_local! {
+    /// The batch a synchronous multi-command unit (a script, an EXEC body's
+    /// bookkeeping) collects its inbox deliveries into, and how many nested
+    /// units hold it open. See [`begin_delivery_batch`].
+    static OPEN_BATCH: std::cell::RefCell<(u32, Option<DeliveryBatch>)> =
+        const { std::cell::RefCell::new((0, None)) };
+}
+
+/// Open (or join) this thread's delivery batch, so every invalidation until
+/// the matching [`end_delivery_batch`] reaches each REDIRECT inbox as ONE
+/// channel item (moon#1088).
+///
+/// For units that run to completion WITHOUT yielding — a Lua script, the
+/// bookkeeping of an EXEC body — whose target therefore cannot drain its
+/// channel in between: a script with hundreds of writing `redis.call`s would
+/// otherwise take hundreds of slots. Never hold one across an `.await`: other
+/// connections' deliveries on this thread would wait for it.
+pub fn begin_delivery_batch() {
+    OPEN_BATCH.with_borrow_mut(|(depth, batch)| {
+        *depth += 1;
+        if batch.is_none() {
+            *batch = Some(DeliveryBatch::default());
+        }
+    });
+}
+
+/// Close the unit opened by [`begin_delivery_batch`]; the outermost close
+/// sends everything collected. A close with nothing open is a no-op.
+pub fn end_delivery_batch() {
+    let done = OPEN_BATCH.with_borrow_mut(|(depth, batch)| {
+        if *depth == 0 {
+            return None;
+        }
+        *depth -= 1;
+        if *depth == 0 { batch.take() } else { None }
+    });
+    if let Some(batch) = done {
+        batch.flush();
+    }
+}
+
+/// Run `f` with this thread's open delivery batch, or, when none is open,
+/// with a fresh one that is sent as soon as `f` returns.
+pub(crate) fn with_delivery_batch<R>(f: impl FnOnce(&mut DeliveryBatch) -> R) -> R {
+    let open = OPEN_BATCH.with_borrow_mut(|(_, batch)| batch.take());
+    match open {
+        Some(mut batch) => {
+            let r = f(&mut batch);
+            OPEN_BATCH.with_borrow_mut(|(_, slot)| *slot = Some(batch));
+            r
+        }
+        None => {
+            let mut batch = DeliveryBatch::default();
+            let r = f(&mut batch);
+            batch.flush();
+            r
+        }
+    }
+}
+
 /// `>2 tracking-redir-broken :<target>` — what redis pushes to a RESP3 source
 /// each time an invalidation cannot reach its vanished redirect target.
 pub fn redir_broken_push(target: u64) -> Frame {
@@ -542,9 +602,19 @@ impl TrackingTable {
     /// LIST`. Proportional to the number of tracking clients, not of
     /// connections.
     pub fn client_views(&self) -> HashMap<u64, ClientTrackingView> {
+        // One pass over the BCAST registrations, not one per client: this
+        // runs under the tracking mutex every write path waits on.
+        let bcast: HashSet<u64> = self.bcast_clients.iter().map(|(id, _, _)| *id).collect();
         self.client_channels
             .keys()
-            .filter_map(|&id| self.client_view(id).map(|v| (id, v)))
+            .map(|&id| {
+                let view = ClientTrackingView {
+                    redirect: self.redirects.get(&id).copied().unwrap_or(0),
+                    broken_redirect: self.broken.contains(&id),
+                    bcast: bcast.contains(&id),
+                };
+                (id, view)
+            })
             .collect()
     }
 
@@ -1228,6 +1298,57 @@ mod tests {
         }
         assert_eq!(item.as_ref(), want.as_slice());
         table.untrack_all(1071);
+    }
+
+    /// A script or EXEC body holds the thread's batch open across many
+    /// commands: every invalidation for one inbox leaves as ONE item when the
+    /// outermost unit closes, and nothing leaves before.
+    #[test]
+    fn an_open_batch_spans_many_commands() {
+        let table =
+            parking_lot::Mutex::new(TrackingTable::new().with_liveness(connected_above_1000));
+        let (src_tx, _src_rx) = channel::mpsc_unbounded::<Frame>();
+        let (ib, ib_rx) = inbox(true);
+        {
+            let mut t = table.lock();
+            t.register_client(1081, src_tx);
+            t.set_redirect(1081, Some(1082));
+            t.register_inbox(1082, ib);
+        }
+        let keys: Vec<Bytes> = (0..300).map(|i| Bytes::from(format!("b:{i}"))).collect();
+        for k in &keys {
+            table.lock().track_key(1081, k, false);
+        }
+        begin_delivery_batch();
+        begin_delivery_batch(); // nested unit (a script inside a transaction)
+        for k in &keys {
+            invalidation::invalidate_keys(&table, std::slice::from_ref(k), 7);
+        }
+        end_delivery_batch();
+        assert!(ib_rx.try_recv().is_err(), "an inner close sends nothing");
+        end_delivery_batch();
+        let item = ib_rx.try_recv().expect("one item at the outermost close");
+        assert!(
+            ib_rx.try_recv().is_err(),
+            "exactly one item for 300 commands"
+        );
+        assert_eq!(item.len(), pushes_len(&keys), "every key, byte for byte");
+        end_delivery_batch(); // unbalanced close is a no-op
+        table.lock().untrack_all(1081);
+    }
+
+    /// Serialised length of one RESP3 invalidation push per key.
+    fn pushes_len(keys: &[Bytes]) -> usize {
+        keys.iter()
+            .map(|k| {
+                let mut b = bytes::BytesMut::new();
+                crate::protocol::serialize_resp3(
+                    &invalidation::invalidation_push(std::slice::from_ref(k)),
+                    &mut b,
+                );
+                b.len()
+            })
+            .sum()
     }
 
     /// moon#1088: an invalidation that finds the target's channel full is

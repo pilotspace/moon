@@ -37,6 +37,10 @@ struct Gauge {
     /// the connection is being closed, and a caching client discards its
     /// whole cache on reconnect.
     overflowed: AtomicBool,
+    /// Set while the connection speaks RESP2 (see
+    /// [`InvalidationRx::set_deliverable`]): a push has nowhere to go there,
+    /// so it is not queued at all.
+    discard: AtomicBool,
     /// How the overflowing connection is disconnected. The client registry
     /// in production; injectable so the rule is unit-testable.
     disconnect: fn(u64),
@@ -62,6 +66,9 @@ impl std::fmt::Debug for InvalidationTx {
 pub struct InvalidationRx {
     rx: channel::MpscReceiver<Frame>,
     gauge: Arc<Gauge>,
+    /// A frame taken off the channel that did not fit in the last coalesced
+    /// write; the next `recv`/`try_recv` returns it first.
+    carry: parking_lot::Mutex<Option<Frame>>,
 }
 
 impl std::fmt::Debug for InvalidationRx {
@@ -93,6 +100,7 @@ fn with_disconnect(
         },
         client_id,
         overflowed: AtomicBool::new(false),
+        discard: AtomicBool::new(false),
         disconnect,
     });
     (
@@ -100,7 +108,11 @@ fn with_disconnect(
             tx,
             gauge: Arc::clone(&gauge),
         },
-        InvalidationRx { rx, gauge },
+        InvalidationRx {
+            rx,
+            gauge,
+            carry: parking_lot::Mutex::new(None),
+        },
     )
 }
 
@@ -117,7 +129,7 @@ impl InvalidationTx {
     /// silently: past the byte ceiling the connection is disconnected.
     pub fn send(&self, frame: Frame) {
         let g = &*self.gauge;
-        if g.overflowed.load(Ordering::Relaxed) {
+        if g.overflowed.load(Ordering::Relaxed) || g.discard.load(Ordering::Relaxed) {
             return;
         }
         let size = wire_len(&frame);
@@ -176,6 +188,7 @@ impl From<channel::MpscSender<Frame>> for InvalidationTx {
                 cap: usize::MAX,
                 client_id: 0,
                 overflowed: AtomicBool::new(false),
+                discard: AtomicBool::new(false),
                 disconnect: |_| {},
             }),
         }
@@ -185,13 +198,31 @@ impl From<channel::MpscSender<Frame>> for InvalidationTx {
 impl InvalidationRx {
     /// Wait for the next frame. `None` once every sender is gone.
     pub async fn recv(&self) -> Option<Frame> {
+        if let Some(frame) = self.carry.lock().take() {
+            return Some(frame);
+        }
         let frame = self.rx.recv_async().await.ok()?;
         self.credit(&frame);
         Some(frame)
     }
 
+    /// Record whether the connection can carry a push (RESP3). Redis writes a
+    /// RESP2 connection nothing for its own invalidations, and some RESP2
+    /// states (the subscriber loop, MONITOR) never read this queue, so while
+    /// the connection speaks RESP2 nothing is queued — otherwise it would
+    /// fill to the byte limit and be disconnected for invalidations it could
+    /// never have received. One relaxed store; called once per pass of the
+    /// connection loop, and only for a tracking connection.
+    #[inline]
+    pub fn set_deliverable(&self, deliverable: bool) {
+        self.gauge.discard.store(!deliverable, Ordering::Relaxed);
+    }
+
     /// Take a frame that is already queued, without waiting.
     pub fn try_recv(&self) -> Option<Frame> {
+        if let Some(frame) = self.carry.lock().take() {
+            return Some(frame);
+        }
         let frame = self.rx.try_recv().ok()?;
         self.credit(&frame);
         Some(frame)
@@ -210,13 +241,20 @@ impl InvalidationRx {
             while self.try_recv().is_some() {}
             return None;
         }
+        // Never past the byte limit either: senders on other shards keep
+        // queueing while this drains, and one write larger than the
+        // connection's output-buffer limit is refused by the write path.
+        let max = MAX_COALESCE_BYTES.min(self.gauge.cap);
         let mut buf = bytes::BytesMut::new();
         crate::protocol::serialize_resp3(&first, &mut buf);
-        while buf.len() < MAX_COALESCE_BYTES {
-            match self.try_recv() {
-                Some(next) => crate::protocol::serialize_resp3(&next, &mut buf),
-                None => break,
+        while let Some(next) = self.try_recv() {
+            // `wire_len` bounds the serialised size from above, so a frame
+            // that might not fit waits for the next write.
+            if buf.len() + wire_len(&next) > max {
+                *self.carry.lock() = Some(next);
+                break;
             }
+            crate::protocol::serialize_resp3(&next, &mut buf);
         }
         Some(buf.freeze())
     }
@@ -315,6 +353,56 @@ mod tests {
         }
         assert!(!tx.overflowed());
         assert_eq!(tx.queued_bytes(), 0);
+    }
+
+    /// A coalesced write never exceeds the byte limit: a frame that might not
+    /// fit is carried to the next write, not dropped.
+    #[test]
+    fn a_coalesced_write_stays_within_the_limit() {
+        let per = wire_len(&push(b"k"));
+        let cap = per * 2;
+        let (tx, rx) = with_disconnect(7005, cap, record);
+        tx.send(push(b"k"));
+        tx.send(push(b"k"));
+        // The connection takes one frame; a sender on another shard refills
+        // the room it freed before the connection coalesces the rest.
+        let first = rx.try_recv().expect("queued");
+        tx.send(push(b"k"));
+        let write = rx.coalesce(first, true).expect("deliverable");
+        assert!(
+            write.len() <= cap,
+            "{} bytes past a {cap}-byte limit",
+            write.len()
+        );
+        let single = {
+            let mut b = bytes::BytesMut::new();
+            crate::protocol::serialize_resp3(&push(b"k"), &mut b);
+            b.len()
+        };
+        assert_eq!(write.len(), single * 2, "two frames fit");
+        assert_eq!(
+            rx.try_recv(),
+            Some(push(b"k")),
+            "the third is carried, not lost"
+        );
+        assert_eq!(rx.try_recv(), None);
+        assert_eq!(tx.queued_bytes(), 0);
+    }
+
+    /// While the connection speaks RESP2 nothing is queued at all.
+    #[test]
+    fn a_resp2_connection_queues_nothing() {
+        let (tx, rx) = with_disconnect(7007, 64, record);
+        rx.set_deliverable(false);
+        for _ in 0..1000 {
+            tx.send(push(b"k"));
+        }
+        assert_eq!(tx.queued_bytes(), 0);
+        assert!(!tx.overflowed(), "discarding is not an overflow");
+        assert_eq!(rx.try_recv(), None);
+        rx.set_deliverable(true);
+        tx.send(push(b"k"));
+        assert!(rx.try_recv().is_some());
     }
 
     /// A dropped receiver (TRACKING off, disconnect) leaves nothing charged.

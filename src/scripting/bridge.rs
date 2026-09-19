@@ -400,6 +400,11 @@ thread_local! {
     /// reset by [`clear_script_db`]. `Copy`, so reading it costs nothing.
     static SCRIPT_CALLER: Cell<crate::tracking::ScriptCaller> =
         const { Cell::new(crate::tracking::ScriptCaller { client_id: 0, track_reads: false, noloop: false }) };
+    /// moon#1088: whether this script holds the thread's tracking delivery
+    /// batch open, so a script with many writing `redis.call`s reaches each
+    /// REDIRECT inbox as one channel item. Opened by [`set_script_db`] only
+    /// while someone is tracking, closed by [`clear_script_db`].
+    static SCRIPT_BATCH_OPEN: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Set the thread-local database pointer and caller identity before script
@@ -420,6 +425,12 @@ pub fn set_script_db(
     SCRIPT_HAD_WRITE.with(|c| c.set(false));
     SCRIPT_CALLER.with(|c| c.set(acl.caller()));
     SCRIPT_ACL.with(|c| *c.borrow_mut() = acl.clone());
+    // The VM runs to completion without yielding, so holding the batch open
+    // for the whole script delays no other connection's deliveries. Never
+    // opened twice, so a missed `clear_script_db` cannot leave it stuck.
+    if crate::tracking::tracking_active() && !SCRIPT_BATCH_OPEN.with(|c| c.replace(true)) {
+        crate::tracking::begin_delivery_batch();
+    }
 }
 
 /// Clear the thread-local database pointer after script execution.
@@ -429,6 +440,9 @@ pub fn clear_script_db() {
     // Back to fail-closed: nothing may run until the next `set_script_db`.
     SCRIPT_ACL.with(|c| *c.borrow_mut() = ScriptAcl::deny());
     SCRIPT_CALLER.with(|c| c.set(crate::tracking::ScriptCaller::default()));
+    if SCRIPT_BATCH_OPEN.with(|c| c.replace(false)) {
+        crate::tracking::end_delivery_batch();
+    }
 }
 
 /// Set the read-only flag for the current script execution (FCALL_RO).

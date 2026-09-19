@@ -585,6 +585,13 @@ impl ConnectionState {
             self.client_id,
             table,
         );
+        // moon#1088: a RESP2 connection's own invalidation queue would only
+        // fill up (see `InvalidationRx::set_deliverable`).
+        if let Some(rx) = &self.tracking_rx {
+            rx.set_deliverable(crate::tracking::client_cmd::push_deliverable(
+                self.protocol_version,
+            ));
+        }
     }
 
     /// D4 (#438): whether this connection may migrate to another shard
