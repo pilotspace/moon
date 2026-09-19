@@ -978,7 +978,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             drop(acl_guard);
                             conn.acl_log.push(crate::acl::AclLogEntry {
                                 reason: "command".to_string(),
-                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                                object: crate::acl::subcommand::command_log_object(cmd, cmd_args),
                                 username: conn.current_user.clone(),
                                 client_addr: peer_addr.clone(),
                                 timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,

@@ -4377,16 +4377,9 @@ assert_acl_probe() {
 }
 
 # assert_acl_both_denied <desc> <cmd>...  -- both servers must refuse, without
-# requiring identical text.
-#
-# For a CONTAINER command redis names the subcommand it refused
-# (`... to run the 'client|list' command`) because its ACL is per subcommand;
-# moon's permission check only ever sees the bare container, so it names
-# `'client'`. Both DENY -- only the noun differs -- so comparing the strings
-# would fail on a difference that is not a permission difference. Asserting
-# "denied on both" keeps the security property under test without pinning a
-# message moon cannot produce. Per-subcommand matching is tracked separately;
-# when it lands these rows can go back to `assert_acl_probe`.
+# requiring identical text. Used where moon words a key or channel NOPERM
+# differently from redis; a container command's NOPERM now names the same
+# `cmd|sub` redis does, so those rows use `assert_acl_probe`.
 assert_acl_both_denied() {
     local desc="$1"; shift
     local r m
@@ -4495,7 +4488,7 @@ assert_acl_probe "#980 +@read allows SORT_RO" SORT_RO n978:lst ALPHA
 acl_reset_user
 both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all -@dangerous
 assert_acl_probe "#980 -@dangerous denies SWAPDB"      SWAPDB 0 1
-assert_acl_both_denied "#980 -@dangerous denies CLIENT LIST" CLIENT LIST
+assert_acl_probe "#980 -@dangerous denies CLIENT LIST" CLIENT LIST
 assert_acl_probe "#980 -@dangerous denies KEYS"        KEYS 'n978:*'
 assert_acl_probe "#980 -@dangerous denies FLUSHALL"    FLUSHALL
 assert_acl_probe "#980 -@dangerous still allows GET"   GET n978:vic
@@ -4515,6 +4508,36 @@ acl_reset_user
 both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all -get
 assert_acl_probe "#971 +@all -get: GET denied"  GET n978:vic
 assert_acl_probe "#971 +@all -get: SET allowed" SET n978:pol 1
+acl_reset_user
+
+# --- per-subcommand and first-arg rules (`-cmd|sub`, `+cmd|sub`) ----------
+# The check used to probe only the bare command name: `+@all -config|set`
+# answered +OK and CONFIG SET still ran. Last rule wins per subcommand, as in
+# redis; the NOPERM names `config|set`, so the whole reply is compared.
+# CONFIG SET writes maxmemory-samples 5, the default on both servers.
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all '-config|set'
+assert_acl_probe "subcmd +@all -config|set: CONFIG SET denied" CONFIG SET maxmemory-samples 5
+assert_acl_probe "subcmd +@all -config|set: config set denied" config set maxmemory-samples 5
+assert_acl_probe "subcmd +@all -config|set: CONFIG GET allowed" CONFIG GET maxmemory-samples
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' -@all '+config|get' '-config|set'
+assert_acl_probe "subcmd -@all +config|get: CONFIG GET allowed" CONFIG GET maxmemory-samples
+assert_acl_probe "subcmd -@all +config|get: CONFIG SET denied" CONFIG SET maxmemory-samples 5
+assert_acl_probe "subcmd -@all +config|get: CONFIG RESETSTAT denied" CONFIG RESETSTAT
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all -config '+config|get'
+assert_acl_probe "subcmd -config +config|get: CONFIG GET allowed" CONFIG GET maxmemory-samples
+assert_acl_probe "subcmd -config +config|get: CONFIG SET denied" CONFIG SET maxmemory-samples 5
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all '-config|set' +@admin
+assert_acl_probe "subcmd -config|set +@admin: CONFIG SET allowed" CONFIG SET maxmemory-samples 5
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' -@all '+config|get' -@admin
+assert_acl_probe "subcmd +config|get -@admin: CONFIG GET denied" CONFIG GET maxmemory-samples
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' -@all '+select|0'
+assert_acl_probe "first-arg +select|0: SELECT 0 allowed" SELECT 0
+assert_acl_probe "first-arg +select|0: SELECT 1 denied" SELECT 1
 acl_reset_user
 
 # ---------------------------------------------------------------------------
