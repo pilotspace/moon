@@ -119,6 +119,14 @@ pub struct ReplicaTaskConfig {
     /// so post-snapshot bytes always re-establish context). In-memory only: a
     /// replica process restart starts at offset 0 → always FULLRESYNC.
     pub stream_db: std::sync::atomic::AtomicUsize,
+    /// This shard's blocking registry, so every applied write serves the
+    /// clients blocked on the keys it wrote — an `XREAD BLOCK` on a replica
+    /// is woken by the master's `XADD` exactly as on the master (moon#1096).
+    /// The task runs on the shard thread that owns it (`monoio::spawn` /
+    /// `spawn_local`), which is why it can hold the `Rc`. `None` applies
+    /// without waking (tests that drive `apply_local` directly).
+    pub blocking_registry:
+        Option<std::rc::Rc<std::cell::RefCell<crate::blocking::BlockingRegistry>>>,
 }
 
 /// Entry point for the outbound replica task.
@@ -478,7 +486,11 @@ async fn stream_commands_read_loop(
             crate::replication::apply::drain_replicated_commands(&mut buf, &mut selected_db);
         for rc in &outcome.commands {
             use crate::replication::apply::ApplyOutcome;
-            match crate::replication::apply::apply_local(rc, &cfg.shard_databases) {
+            match crate::replication::apply::apply_local(
+                rc,
+                &cfg.shard_databases,
+                cfg.blocking_registry.as_deref(),
+            ) {
                 ApplyOutcome::Applied => {}
                 // Unified poison-record policy (task #48): a malformed
                 // record has already been logged + counted inside
@@ -884,7 +896,11 @@ async fn stream_commands_read_loop(
             crate::replication::apply::drain_replicated_commands(&mut buf, &mut selected_db);
         for rc in &outcome.commands {
             use crate::replication::apply::ApplyOutcome;
-            match crate::replication::apply::apply_local(rc, &cfg.shard_databases) {
+            match crate::replication::apply::apply_local(
+                rc,
+                &cfg.shard_databases,
+                cfg.blocking_registry.as_deref(),
+            ) {
                 ApplyOutcome::Applied => {}
                 // Unified poison-record policy (task #48): a malformed
                 // record has already been logged + counted inside
