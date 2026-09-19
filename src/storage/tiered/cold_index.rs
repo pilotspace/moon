@@ -180,6 +180,152 @@ fn cold_entry_cost(key_len: usize) -> usize {
     key_len + COLD_ENTRY_OVERHEAD
 }
 
+/// What one cold-index rebuild ([`ColdIndex::rebuild_from_manifest_per_db`])
+/// read, and — the point of it — what it could NOT read (moon#875).
+///
+/// Every entry the rebuild fails to recover reads afterwards as an ABSENT
+/// key: cold read-through is index-driven, `GET` answers nil, `EXISTS`
+/// answers 0, and nothing downstream can tell that answer from a key that
+/// was never written. So every skip is counted here, by cause, and the
+/// caller logs the whole report once — a rebuild that lost forty files and
+/// one that lost nothing used to print the same single line.
+///
+/// The loss classes, and why each is only counted rather than fatal:
+///
+/// * `files_missing` — the manifest says Active, `read` says `NotFound`.
+///   Expected in one crash window: the orphan sweep unlinks a zero-ref file
+///   BEFORE it commits the manifest tombstone (`drain_pending_unlink`), so a
+///   `SIGKILL` between the two leaves exactly this state, and nothing was
+///   lost (every key in a zero-ref file has a newer copy elsewhere or was
+///   deleted). The other cause is external removal, which IS loss; the two
+///   are indistinguishable here. The file is queued for the sweep so its
+///   manifest entry is retired and the warning does not repeat on every
+///   boot forever (the moon#546a pattern).
+/// * `files_unreadable` — any other `io::Error` (EACCES, EIO, EISDIR…). Up to
+///   `FLUSH_ENTRY_CAP` (256) keys become unreachable. This is the class an
+///   operator can usually FIX (permissions, a mount) — and the index entry
+///   is skipped, never tombstoned, so a restart after the fix recovers the
+///   keys. Refusing to boot would be the stronger answer, but a recovery
+///   `Err` today falls back to v2 recovery (discarding the whole v3 replay:
+///   worse), and shard init has no refuse-boot path — see the follow-up
+///   noted in the PR for moon#875.
+/// * `files_short` — the file is shorter than the `byte_size` its manifest
+///   entry was stamped with. Whole pages lost to truncation are invisible
+///   to every other check here (`chunks_exact` sees only whole pages), so
+///   this is the only detector for that damage.
+/// * `pages_rejected` — bad magic, a page type that is neither `KvLeaf` nor
+///   `KvOverflow`, or a CRC32C mismatch. Skipping is the correct DECISION
+///   (a corrupt page must not be trusted); the bytes are gone and no boot
+///   refusal would bring them back, so it is counted and logged.
+/// * `partial_page_bytes` — a trailing remainder shorter than `PAGE_4K`.
+///   The writer cannot produce one (`write_kv_spill_batch` writes whole
+///   pages to a temp file, fsyncs, then renames), so its presence means the
+///   file was damaged after the rename. Same class as a rejected page.
+/// * `entries_rejected` — a slot inside a CRC-valid page that does not
+///   decode (`KvLeafPage::get` → `None`): an unknown `ValueType`, which is
+///   what a downgrade to a binary older than the one that spilled the value
+///   looks like. One key each.
+///
+/// `pages_overflow` is NOT a loss class: `KvOverflow` pages carry large
+/// values and are reached through their leaf's pointer, never scanned for
+/// keys. `KvLeafPage::from_bytes` rejects them too, which is why the rebuild
+/// classifies the header itself before deciding what a `None` means.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ColdRebuildReport {
+    /// Active `KvLeaf` manifest entries the rebuild tried to read.
+    pub files_attempted: u64,
+    /// Files read in full.
+    pub files_read: u64,
+    /// `NotFound` — see the type docs.
+    pub files_missing: u64,
+    /// Any other read error — see the type docs.
+    pub files_unreadable: u64,
+    /// Files shorter than their manifest `byte_size`.
+    pub files_short: u64,
+    /// Bytes those short files are missing, summed.
+    pub short_file_bytes: u64,
+    /// Whole `PAGE_4K` chunks examined.
+    pub pages_scanned: u64,
+    /// Valid `KvOverflow` pages (expected; not a loss).
+    pub pages_overflow: u64,
+    /// Pages that failed magic, type or CRC.
+    pub pages_rejected: u64,
+    /// Bytes in trailing partial pages, summed.
+    pub partial_page_bytes: u64,
+    /// Entries decoded and handed to the index (before duplicate resolution).
+    pub entries_recovered: u64,
+    /// Slots inside valid pages that did not decode.
+    pub entries_rejected: u64,
+}
+
+impl ColdRebuildReport {
+    /// `true` if any loss class fired. A degraded rebuild means some number
+    /// of keys now read as absent; the caller logs it at `error`.
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.files_missing > 0
+            || self.files_unreadable > 0
+            || self.files_short > 0
+            || self.pages_rejected > 0
+            || self.partial_page_bytes > 0
+            || self.entries_rejected > 0
+    }
+}
+
+/// The result of [`ColdIndex::rebuild_from_manifest_per_db`]: one index per
+/// logical db, plus the [`ColdRebuildReport`] the caller must log.
+#[derive(Debug)]
+pub struct ColdRebuild {
+    /// `(db_index, index)` for every db with at least one recovered entry
+    /// or one missing file queued for manifest retirement.
+    pub per_db: Vec<(usize, ColdIndex)>,
+    pub report: ColdRebuildReport,
+}
+
+/// How many per-file / per-page problems one rebuild logs individually
+/// before falling back to the summary counts. A corpus with hundreds of
+/// damaged files should not print hundreds of lines on the boot path; the
+/// summary carries the totals and the first few carry the `file_id`s an
+/// operator needs to start from.
+const REBUILD_DETAIL_LOG_CAP: u64 = 16;
+
+/// Why one `PAGE_4K` chunk was not a usable `KvLeaf` page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageVerdict {
+    Leaf,
+    Overflow,
+    BadHeader,
+    ForeignType,
+    BadChecksum,
+}
+
+/// Classify one page-sized chunk by its header BEFORE `KvLeafPage::from_bytes`
+/// gets a say — that constructor answers `None` for a valid overflow page and
+/// for a corrupt one alike, and only one of those is a loss.
+fn classify_page(chunk: &[u8]) -> PageVerdict {
+    use crate::persistence::page::{MoonPageHeader, PageType};
+    let Some(hdr) = MoonPageHeader::read_from(chunk) else {
+        return PageVerdict::BadHeader;
+    };
+    match hdr.page_type {
+        PageType::KvOverflow => {
+            if MoonPageHeader::verify_checksum(chunk) {
+                PageVerdict::Overflow
+            } else {
+                PageVerdict::BadChecksum
+            }
+        }
+        PageType::KvLeaf => {
+            if MoonPageHeader::verify_checksum(chunk) {
+                PageVerdict::Leaf
+            } else {
+                PageVerdict::BadChecksum
+            }
+        }
+        _ => PageVerdict::ForeignType,
+    }
+}
+
 impl ColdIndex {
     pub fn new() -> Self {
         Self {
@@ -729,7 +875,7 @@ impl ColdIndex {
         manifest: &crate::persistence::manifest::ShardManifest,
     ) -> Self {
         let mut merged = Self::new();
-        for (_db, index) in Self::rebuild_from_manifest_per_db(shard_dir, manifest) {
+        for (_db, index) in Self::rebuild_from_manifest_per_db(shard_dir, manifest).per_db {
             merged.merge(index);
         }
         merged
@@ -741,13 +887,27 @@ impl ColdIndex {
     /// (flush chunks cut at db boundaries), and manifests from before the
     /// field existed read as db 0, matching their actual (db-blind,
     /// attach-to-db0) provenance. Returns `(db_index, index)` pairs for
-    /// every db that has at least one recovered entry.
+    /// every db that has at least one recovered entry (or a missing file
+    /// queued for manifest retirement), plus the [`ColdRebuildReport`].
+    ///
+    /// Nothing is skipped silently (moon#875): every file, page or entry
+    /// this cannot recover is counted in the report by cause, and the first
+    /// [`REBUILD_DETAIL_LOG_CAP`] of each cause are logged here with the
+    /// `file_id` (and page) so an operator can find the damage. The caller
+    /// owns the one-line summary. See [`ColdRebuildReport`] for what each
+    /// class means and why none of them aborts the rebuild.
     pub fn rebuild_from_manifest_per_db(
         shard_dir: &Path,
         manifest: &crate::persistence::manifest::ShardManifest,
-    ) -> Vec<(usize, Self)> {
+    ) -> ColdRebuild {
         use crate::persistence::manifest::FileStatus;
         use crate::persistence::page::{PAGE_4K, PageType};
+
+        let mut report = ColdRebuildReport::default();
+        // Files the manifest lists as Active whose bytes are gone (NotFound),
+        // per db, queued onto the rebuilt index's `pending_unlink` so the
+        // next orphan sweep retires the manifest entry.
+        let mut missing_per_db: Vec<(usize, Vec<u64>)> = Vec::new();
 
         // Pass 1 — decode every Active KvLeaf file into a flat per-db pair
         // vector. Manifest order is merely the order the files are READ in;
@@ -781,44 +941,169 @@ impl ColdIndex {
                     }
                 };
                 let heap_path = data_dir.join(format!("heap-{:06}.mpf", entry.file_id));
+                let file_id = entry.file_id;
+                report.files_attempted += 1;
                 // Read raw bytes and iterate by absolute chunk index.
                 // `read_datafile` skips overflow pages (returns only KvLeaf pages),
                 // so its enumerate index ≠ file-absolute page index in multi-page files.
                 // We must use the raw chunk index to produce a correct `page_idx`.
                 let raw = match std::fs::read(&heap_path) {
                     Ok(b) => b,
-                    Err(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        report.files_missing += 1;
+                        if report.files_missing <= REBUILD_DETAIL_LOG_CAP {
+                            tracing::warn!(
+                                file_id,
+                                db,
+                                path = %heap_path.display(),
+                                "cold recovery: manifest lists an Active heap file that is not \
+                                 on disk; its keys (if any were live) now read as absent. Benign \
+                                 if the orphan sweep unlinked it before committing the manifest \
+                                 (nothing lost); otherwise the file was removed externally. \
+                                 Queued so the sweep retires the manifest entry"
+                            );
+                        }
+                        match missing_per_db.iter_mut().find(|(d, _)| *d == db) {
+                            Some((_, ids)) => ids.push(file_id),
+                            None => missing_per_db.push((db, vec![file_id])),
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        report.files_unreadable += 1;
+                        if report.files_unreadable <= REBUILD_DETAIL_LOG_CAP {
+                            tracing::error!(
+                                file_id,
+                                db,
+                                path = %heap_path.display(),
+                                err = %e,
+                                "cold recovery: heap file could not be read; every key in it \
+                                 (up to 256) now reads as ABSENT until the file is readable and \
+                                 the server restarts. The index entry is skipped, not tombstoned"
+                            );
+                        }
+                        continue;
+                    }
                 };
-                for (page_idx, chunk) in raw.chunks_exact(PAGE_4K).enumerate() {
-                    let mut buf = [0u8; PAGE_4K];
-                    buf.copy_from_slice(chunk);
-                    if let Some(page) = crate::persistence::kv_page::KvLeafPage::from_bytes(buf) {
-                        for slot_idx in 0..page.slot_count() {
-                            if let Some(kv) = page.get(slot_idx) {
-                                let key = Bytes::from(kv.key);
-                                pairs.push((
-                                    (scan_h48(&key), key),
-                                    ColdLocation {
-                                        file_id: entry.file_id,
-                                        page_idx: page_idx as u32,
-                                        slot_idx,
-                                        ttl_ms: kv.ttl_ms,
-                                        value_type: kv.value_type,
-                                    },
-                                ));
+                report.files_read += 1;
+                if entry.byte_size > 0 && (raw.len() as u64) < entry.byte_size {
+                    report.files_short += 1;
+                    report.short_file_bytes += entry.byte_size - raw.len() as u64;
+                    if report.files_short <= REBUILD_DETAIL_LOG_CAP {
+                        tracing::error!(
+                            file_id,
+                            db,
+                            path = %heap_path.display(),
+                            on_disk = raw.len(),
+                            manifest = entry.byte_size,
+                            "cold recovery: heap file is shorter than its manifest entry; the \
+                             keys in the missing tail now read as ABSENT"
+                        );
+                    }
+                }
+                let mut chunks = raw.chunks_exact(PAGE_4K);
+                for (page_idx, chunk) in chunks.by_ref().enumerate() {
+                    report.pages_scanned += 1;
+                    let verdict = classify_page(chunk);
+                    match verdict {
+                        PageVerdict::Leaf => {}
+                        PageVerdict::Overflow => {
+                            report.pages_overflow += 1;
+                            continue;
+                        }
+                        PageVerdict::BadHeader
+                        | PageVerdict::ForeignType
+                        | PageVerdict::BadChecksum => {
+                            report.pages_rejected += 1;
+                            if report.pages_rejected <= REBUILD_DETAIL_LOG_CAP {
+                                tracing::error!(
+                                    file_id,
+                                    db,
+                                    path = %heap_path.display(),
+                                    page_idx,
+                                    reason = ?verdict,
+                                    "cold recovery: heap page rejected (corrupt); every key in \
+                                     it now reads as ABSENT"
+                                );
                             }
+                            continue;
                         }
                     }
+                    let mut buf = [0u8; PAGE_4K];
+                    buf.copy_from_slice(chunk);
+                    // `classify_page` already proved type + CRC; `from_bytes`
+                    // re-checks them, cheaply enough for a boot path.
+                    let Some(page) = crate::persistence::kv_page::KvLeafPage::from_bytes(buf)
+                    else {
+                        continue;
+                    };
+                    for slot_idx in 0..page.slot_count() {
+                        let Some(kv) = page.get(slot_idx) else {
+                            report.entries_rejected += 1;
+                            if report.entries_rejected <= REBUILD_DETAIL_LOG_CAP {
+                                tracing::error!(
+                                    file_id,
+                                    db,
+                                    path = %heap_path.display(),
+                                    page_idx,
+                                    slot_idx,
+                                    "cold recovery: slot in a valid heap page did not decode \
+                                     (unknown value type — a downgrade?); that key now reads \
+                                     as ABSENT"
+                                );
+                            }
+                            continue;
+                        };
+                        report.entries_recovered += 1;
+                        let key = Bytes::from(kv.key);
+                        pairs.push((
+                            (scan_h48(&key), key),
+                            ColdLocation {
+                                file_id,
+                                page_idx: page_idx as u32,
+                                slot_idx,
+                                ttl_ms: kv.ttl_ms,
+                                value_type: kv.value_type,
+                            },
+                        ));
+                    }
+                }
+                let tail = chunks.remainder().len() as u64;
+                if tail > 0 {
+                    report.partial_page_bytes += tail;
+                    tracing::error!(
+                        file_id,
+                        db,
+                        path = %heap_path.display(),
+                        bytes = tail,
+                        "cold recovery: heap file ends in a partial page; the writer never \
+                         produces one, so the file was damaged after it was written. The \
+                         keys in that page now read as ABSENT"
+                    );
                 }
             }
         }
 
         // Pass 2 — bulk-load each db's pairs into its ordered map, resolving
-        // every duplicated key to its newest on-disk copy.
-        per_db
+        // every duplicated key to its newest on-disk copy. A db that recovered
+        // nothing but has missing files to retire still gets an (empty) index
+        // so the queue has somewhere to live.
+        for (db, _) in &missing_per_db {
+            if !per_db.iter().any(|(d, _)| d == db) {
+                per_db.push((*db, Vec::new()));
+            }
+        }
+        let per_db = per_db
             .into_iter()
-            .map(|(db, pairs)| (db, Self::from_pairs_newest_wins(pairs)))
-            .collect()
+            .map(|(db, pairs)| {
+                let mut index = Self::from_pairs_newest_wins(pairs);
+                if let Some((_, ids)) = missing_per_db.iter().find(|(d, _)| *d == db) {
+                    index.pending_unlink.extend_from_slice(ids);
+                }
+                (db, index)
+            })
+            .collect();
+        ColdRebuild { per_db, report }
     }
 
     /// Build an index from `((scan_h48(key), key), location)` pairs in ANY

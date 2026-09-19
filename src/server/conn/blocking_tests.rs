@@ -312,10 +312,12 @@ fn immediate_scan_ignores_keys_this_shard_does_not_own() {
     );
 }
 
-/// The ownership gate must not touch the keys this shard DOES own, and a
-/// multi-key pop must still scan PAST a remote key to a local one.
+/// The ownership gate must not touch the keys this shard DOES own when they
+/// come first — and (moon#1019) must NOT scan past a remote key to a later
+/// local one: redis serves the first non-empty key in argument order, and
+/// only the remote key's owner can say whether it is empty.
 #[test]
-fn immediate_scan_still_serves_keys_this_shard_owns() {
+fn immediate_scan_serves_a_leading_local_key_and_stops_at_a_remote_one() {
     const SHARDS: usize = 4;
     let mine = 0usize;
     let local = key_owned_here(mine, SHARDS);
@@ -326,8 +328,8 @@ fn immediate_scan_still_serves_keys_this_shard_owns() {
     assert_eq!(
         immediate_scan(
             b"BLPOP",
-            &args(&[&remote, &local, "0"]),
-            &keys(&[&remote, &local]),
+            &args(&[&local, &remote, "0"]),
+            &keys(&[&local, &remote]),
             &mut db,
             mine,
             SHARDS,
@@ -335,6 +337,26 @@ fn immediate_scan_still_serves_keys_this_shard_owns() {
         Some(Frame::Array(framevec![
             Frame::BulkString(Bytes::copy_from_slice(local.as_bytes())),
             Frame::BulkString(Bytes::from_static(b"v1")),
-        ]))
+        ])),
+        "a leading local key is decided here"
+    );
+
+    db.list_push_back(local.as_bytes(), Bytes::from_static(b"v2"));
+    assert_eq!(
+        immediate_scan(
+            b"BLPOP",
+            &args(&[&remote, &local, "0"]),
+            &keys(&[&remote, &local]),
+            &mut db,
+            mine,
+            SHARDS,
+        ),
+        None,
+        "a local key AFTER a remote one waits for the remote owner's answer"
+    );
+    assert_eq!(
+        db.list_pop_front(local.as_bytes()),
+        Some(Bytes::from_static(b"v2")),
+        "and is left untouched"
     );
 }

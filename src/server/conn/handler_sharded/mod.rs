@@ -1702,8 +1702,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                             &mut stream, &mut read_buf,
                         ).await;
                         drop(blocked_guard);
-                        let mut blocking_response = match blocking_outcome {
-                            crate::server::conn::blocking::BlockingOutcome::Reply(frame) => frame,
+                        // `peer_gone_after_serve` (moon#1023): the serve stands,
+                        // so it is invalidated and logged below exactly as a
+                        // delivered reply — AOF only on this runtime, and
+                        // dropped on replay for a remote key (moon#1056); only
+                        // the write is skipped.
+                        let (mut blocking_response, peer_gone_after_serve) = match blocking_outcome {
+                            crate::server::conn::blocking::BlockingOutcome::Reply(frame) => (frame, false),
+                            crate::server::conn::blocking::BlockingOutcome::ServedPeerGone(frame) => (frame, true),
                             // Peer vanished mid-block: registrations are torn
                             // down, nothing to reply to, close the connection.
                             crate::server::conn::blocking::BlockingOutcome::PeerGone => {
@@ -1783,6 +1789,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                             }
                         }
                     }
+                        if peer_gone_after_serve {
+                            // Logged above; nobody left to write the reply to.
+                            arena.reset();
+                            return (HandlerResult::Done, None);
+                        }
                         let blocking_response = apply_resp3_conversion(
                             cmd,
                             cmd_args,
@@ -2307,18 +2318,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                             use crate::command::keyspace::move_cmd as ksmv;
                             let src_db = conn.selected_db;
                             let db_count = ctx.shard_databases.db_count();
-                            let response = match ksmv::parse_move_args(cmd_args, db_count) {
+                            // `resolve_move` refuses `dst_db == src_db` with
+                            // redis's same-object error (moon#1062).
+                            let response = match ksmv::resolve_move(cmd_args, src_db, db_count) {
                                 Err(e) => e,
-                                Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
                                 Ok((key, dst_db)) => {
                                     // Unconditional slice path: ShardSlice is always initialized.
                                     // L4: `with_pair` is the exact contract
                                     // `with_two_slice_dbs` had — asserts the
                                     // indexes differ, panics out of range,
                                     // acquires ascending, hands the closure
-                                    // (src, dst). The `dst_db == src_db` match
-                                    // arm above short-circuits, so the
-                                    // distinct-db assert cannot fire here.
+                                    // (src, dst). `resolve_move` never yields
+                                    // `dst_db == src_db`, so the distinct-db
+                                    // assert cannot fire here.
                                     crate::shard::slice::with_shard(|s| {
                                         s.databases.with_pair(src_db, dst_db, |src, dst| {
                                             ksmv::move_core(src, dst, &key)
