@@ -332,7 +332,25 @@ fn group_reader_ready(
     count: Option<usize>,
     budget: &mut std::time::Duration,
 ) -> bool {
-    let Ok(Some(stream)) = db.get_stream_mut(key) else {
+    // Deciding is not a write: a read-only look first, because
+    // `get_stream_mut` stamps the key's `WATCH` version and a wake that serves
+    // nothing would abort every transaction watching the stream.
+    let (consumer_exists, has_new) = match db.get_stream(key) {
+        Ok(Some(stream)) => match stream.groups.get(group.as_ref()) {
+            Some(g) => (
+                g.consumers.contains_key(consumer),
+                stream.group_has_new(group) == Some(true),
+            ),
+            None => return false, // no such group
+        },
+        _ => return false,
+    };
+    if consumer_exists {
+        return count != Some(0) && has_new;
+    }
+    // Redis creates a blocked reader's consumer without signalling the key's
+    // watchers (`keyModified(..., signal=0)`), so neither does this.
+    let Ok(Some(stream)) = db.get_stream_mut_unsignalled(key) else {
         return false;
     };
     let Ok(created) = stream.create_consumer(group, consumer.clone()) else {
@@ -356,7 +374,7 @@ fn group_reader_ready(
     // `COUNT 0` reads nothing in moon's `read_group_new`, so it can never be
     // served here; deciding otherwise would claim a waiter with nothing to
     // hand it.
-    count != Some(0) && stream.group_has_new(group) == Some(true)
+    count != Some(0) && has_new
 }
 
 /// Run a claimed group reader's `>` read and log it (moon#1104) in this same
@@ -525,6 +543,38 @@ mod tests {
             matches!(next, Frame::Array(_)),
             "the entry must still be delivered to the next reader, got {next:?}"
         );
+    }
+
+    /// Looking at a parked group reader is not a write to its stream. A wake
+    /// that serves nothing — this reader's group has nothing new — must leave
+    /// the key's `WATCH` version alone, or a transaction watching the stream
+    /// aborts although nothing in it changed. Redis creates the consumer of a
+    /// blocked `XREADGROUP` with `keyModified(..., signal=0)`, which touches
+    /// no watcher either, so a consumer this wake has to create is not a
+    /// `WATCH` event.
+    #[test]
+    fn a_wake_that_serves_nothing_leaves_the_watch_version_alone() {
+        let mut db = Database::new();
+        let mut reg = BlockingRegistry::new(0);
+        cmd(&mut db, &["XGROUP", "CREATE", "s", "g", "$", "MKSTREAM"]);
+        cmd(&mut db, &["XADD", "s", "1-1", "f", "v"]);
+        // `g` already delivered 1-1 elsewhere: nothing new for the reader.
+        cmd(&mut db, &["XGROUP", "SETID", "s", "g", "1-1"]);
+        let rx = park_group_reader(&mut reg, "s", "fresh-consumer", None);
+        let before = db.get_version(b"s");
+
+        assert!(!try_wake_stream_waiter(&mut reg, &mut db, 0, &b("s")));
+
+        assert_eq!(
+            db.get_version(b"s"),
+            before,
+            "a wake that served nothing stamped the stream's WATCH version"
+        );
+        assert!(rx.try_recv().is_err(), "the reader stays parked");
+        let consumers = db.get_stream(b"s").unwrap().unwrap().groups[b"g".as_ref()]
+            .consumers
+            .len();
+        assert_eq!(consumers, 1, "the consumer is created, as in redis");
     }
 
     /// moon#1104: the shard that serves a parked group read logs it — the

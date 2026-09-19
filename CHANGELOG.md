@@ -235,6 +235,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   between answered nil while the entries sat undelivered in its PEL, and a
   `>` loop never saw them again. The waker now claims first and reads only on
   a won claim, the claim-token order moon#1045 gave the list and zset wakers.
+  The readiness check before the claim is read-only. It used to take the
+  stream mutably, and a wake that served nothing then aborted every `EXEC`
+  watching the stream. A consumer the check must create does not signal
+  watchers, as in redis.
 
 - **A restart no longer re-issues a cold-tier file id, which could apply a
   write twice** (moon#1067). A restart resumes the shard's cold file-id
