@@ -199,6 +199,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ZRANGESTORE` checks its range before it looks up the source** (moon#1102),
+  the `ZRANGESTORE` sibling of moon#1060. A malformed rank, `BYSCORE` or
+  `BYLEX` bound against a missing source answered `:0` and deleted the
+  destination; against a source of another type it answered `WRONGTYPE`.
+  Redis parses the range first, so both now answer its parse error
+  (`min or max is not a float`, `min or max not valid string range item` or
+  `value is not an integer or out of range`), with or without `REV` and
+  `LIMIT`, and the destination is left alone.
+
+- **A `WAIT` queued inside `MULTI` no longer holds `EXEC` for its timeout**
+  (moon#1098). Redis runs a transaction body with `CLIENT_DENY_BLOCKING`, so a
+  queued `WAIT` answers the current replica ack count at once. Moon filled it
+  with the live `WAIT`, which polled until its deadline:
+  `MULTI / INCR k / WAIT 1 1500 / EXEC` answered after 1.5 s instead of at
+  once, and `WAIT 1 0` inside `MULTI` never answered. The reply is still the
+  number of replicas that have acknowledged the master's current offset, now
+  sampled once, on both runtimes and on the local and owner-routed `EXEC`
+  paths. A `WAIT` outside `MULTI` still blocks as before. (`WAITAOF` is not
+  implemented, so it has no queued form to fix.)
+
+- **The disk-offload checkpoint only publishes a redo point over heap pages it
+  has made durable** (moon#452 item 3). The fuzzy checkpoint pwrote dirty heap
+  pages and never fsynced a heap file, then published `redo_lsn` in the control
+  file and recycled every WAL segment below it — FullPageImages included. A
+  power loss after that recycle could roll a page back with nothing left in the
+  WAL to redo it. Four changes close the protocol:
+  - Finalize fsyncs every heap file the flush wrote before it writes the WAL
+    checkpoint record. The fsync runs on a helper thread and the shard thread
+    never waits for it: each tick polls the helper without blocking, and a
+    shard has at most one helper outstanding, so a hung disk leaves one stuck
+    thread rather than one per retry. Only the shutdown checkpoint, which
+    serves no clients any more, waits for that one helper, for at most
+    `WAIT_DURABLE_TIMEOUT` counted from the helper's start. The WAL-ceiling
+    checkpoint runs while the shard serves clients, so it never waits: it
+    leaves a pending fsync to the periodic tick, and its emergency recycle
+    cuts only below the redo point already published. A failed control-file
+    write no longer leaves the unpublished redo point in memory, where that
+    recycle would have cut below it. If a file cannot be opened, Finalize
+    retries with backoff. If an fsync returns an error, the shard never
+    publishes a redo point again, because a retried fsync can report success
+    for pages the kernel already dropped. The WAL above the last good redo
+    point is kept, and recovery replays from there.
+  - A heap file that no longer exists does not hold the redo point back. The
+    cold-tier GC unlinks a file once its last live key is gone, and only then;
+    nothing references it and no fsync can reach the unlinked inode. So the
+    checkpoint stops waiting on it, drops its pages from the dirty set, counts
+    it and logs it at debug. If the manifest still lists the file as live,
+    something other than the GC removed it: that is counted separately and
+    logged as an error. Without this, every Finalize failed on `NotFound` and
+    the WAL grew until the disk was full.
+  - Log before data, one WAL wait per batch: the flush appends the
+    FullPageImage of every page in the batch, waits once for the WAL to be
+    durable through the batch's highest LSN, and only then overwrites the
+    pages in place. The flush used to collect every image and append them
+    only after the whole batch had been pwritten, into the WAL writer's memory
+    buffer. A crash during the pwrite left a torn page and no image of it
+    anywhere.
+  - A page that fails any flush step (its image, the WAL wait, or its write)
+    makes the checkpoint flush again, keeping its redo point. Before, the page
+    was counted as flushed and the checkpoint finalized over a change that was
+    on disk in neither the heap nor the WAL.
+
+  No production path marks a heap page dirty today (`PageCache::mark_dirty`
+  has no callers outside tests), so this closes the hazard before the first
+  in-place cold-page write can reach it. Pinned by the tests in
+  `shard::persistence_tick::checkpoint_tick_tests`,
+  `persistence::data_file_sync` and `persistence::page_cache`.
+
 - **`aof_last_append_status` and `aof_last_write_status` return to `ok` after a
   rewrite that covers the dropped append** (moon#1094). The status latched to
   `err` at the first dropped acked append and stayed there for the life of the

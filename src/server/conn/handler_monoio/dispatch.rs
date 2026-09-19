@@ -874,10 +874,17 @@ pub(super) async fn try_handle_info(
 /// master offset or the timeout expires; reply with the acked count. Runs at
 /// the connection layer because it awaits — the generic dispatch path is
 /// synchronous (it used to hard-code `:0`). Returns `true` if consumed.
+///
+/// `deny_blocking` is set when the `WAIT` was queued inside `MULTI` and is
+/// being filled at `EXEC` (moon#1098). Redis runs a transaction body with
+/// `CLIENT_DENY_BLOCKING`, and `waitCommand` then answers the current ack
+/// count at once instead of blocking — so does this: one sample, no poll, no
+/// timeout honoured. `WAIT n 0` would otherwise hold `EXEC` for a year.
 pub(super) async fn try_handle_wait(
     cmd: &[u8],
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
+    deny_blocking: bool,
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"WAIT") {
@@ -910,6 +917,7 @@ pub(super) async fn try_handle_wait(
         timeout_ms
     };
     let count = match ctx.repl_state.as_ref() {
+        Some(rs) if deny_blocking => crate::replication::master::count_acked_replicas(rs),
         Some(rs) => {
             crate::replication::master::wait_for_replicas(num_required as usize, timeout_ms, rs)
                 .await
@@ -2156,7 +2164,9 @@ pub(super) async fn run_txn_connection_intercept(
         || try_handle_script(cmd, cmd_args, ctx, shutdown, shaped!()).await
         || try_handle_acl(cmd, cmd_args, conn, ctx, peer_addr, shaped!())
         || try_handle_config(cmd, cmd_args, ctx, shaped!())
-        || try_handle_wait(cmd, cmd_args, ctx, shaped!()).await
+        // moon#1098: `true` = deny blocking. Inside EXEC a WAIT answers the
+        // current ack count at once, as redis does, instead of parking EXEC.
+        || try_handle_wait(cmd, cmd_args, ctx, true, shaped!()).await
         || try_handle_client_early(cmd, cmd_args, client_id, conn, shaped!())
         || try_handle_client_tracking(cmd, cmd_args, client_id, conn, ctx, shaped!())
         || try_handle_client_admin(cmd, cmd_args, client_id, conn, shaped!())
