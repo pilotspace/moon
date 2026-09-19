@@ -88,6 +88,42 @@ pub fn sweep_orphan_staging(vectors_dir: &Path) -> usize {
     removed
 }
 
+/// Delete a warm segment directory so that a crash part-way through can never
+/// leave something that still looks like a segment (moon#893).
+///
+/// `remove_dir_all` alone is not atomic: a kill mid-way leaves
+/// `segment-{id}/` with some files gone — `codes.mpf` present and `mvcc.mpf`
+/// gone, say — which the next boot rediscovers and has to classify again.
+/// Renaming it to `.segment-{id}.staging` first is one atomic step after which
+/// no boot will discover it as a segment; the rename is made durable, then the
+/// directory is deleted. If the delete does not finish, the next boot's
+/// [`sweep_orphan_staging`] removes the leftover, and recovery retires the
+/// manifest entry whose directory is gone (#546a).
+///
+/// # Errors
+///
+/// Any error from the rename or the parent-directory fsync, with the
+/// directory left in place under its original name; an error from the final
+/// delete, with the directory already out of discovery's reach.
+pub fn retire_segment_dir(segment_dir: &Path) -> std::io::Result<()> {
+    let (Some(parent), Some(name)) = (
+        segment_dir.parent(),
+        segment_dir.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a segment directory path: {}", segment_dir.display()),
+        ));
+    };
+    let doomed = parent.join(format!(".{name}.staging"));
+    if doomed.exists() {
+        std::fs::remove_dir_all(&doomed)?;
+    }
+    std::fs::rename(segment_dir, &doomed)?;
+    fsync_directory(parent)?;
+    std::fs::remove_dir_all(&doomed)
+}
+
 /// Transition a HOT vector segment to WARM (mmap-backed on disk).
 ///
 /// Protocol:
@@ -118,6 +154,24 @@ pub fn transition_to_warm(
 
     let staging = vectors_dir.join(format!(".segment-{segment_id}.staging"));
     let final_dir = vectors_dir.join(format!("segment-{segment_id}"));
+
+    // moon#893: never transition onto an id that already names a segment.
+    // The manifest commit below precedes the rename, so finding the target
+    // taken only at the rename (ENOTEMPTY) left an Active entry describing a
+    // directory that holds another segment's data. Both sides are checked
+    // before any work — and before the WAL `FileCreate` record below — and
+    // `add_file` re-checks the manifest side at the append.
+    if final_dir.exists() || manifest.has_entry(file_id, PageType::VecCodes as u8) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "warm transition refused: file_id {file_id} already names a segment \
+                 ({} or its manifest entry exists: the id was re-issued); the segment \
+                 stays HOT",
+                final_dir.display()
+            ),
+        ));
+    }
 
     // Step 1: Create staging directory. Remove a stale leftover for this same
     // id first — the sibling writer (`vector/persistence/segment_io.rs`) has
@@ -190,7 +244,7 @@ pub fn transition_to_warm(
         wal.flush_sync()?;
     }
 
-    manifest.add_file(entry);
+    manifest.add_file(entry)?;
     manifest.commit()?;
 
     // Step 6: Rename staging -> final. The directory now lives under its final
@@ -272,6 +326,96 @@ mod tests {
             std::fs::read(vectors.join("segment-7/occupied")).unwrap(),
             b"in the way",
             "cleanup must not touch the pre-existing segment directory"
+        );
+    }
+
+    /// A transition onto an id whose directory already exists must be refused
+    /// BEFORE the manifest append (moon#893). The old order committed the
+    /// Active entry first and only then failed the rename with ENOTEMPTY, so
+    /// the manifest gained a second entry for a directory holding a DIFFERENT
+    /// segment's data — the duplicate that later made recovery delete it.
+    #[test]
+    fn transition_onto_an_existing_segment_is_refused_before_the_manifest_append() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let vectors = shard_dir.join("vectors");
+        std::fs::create_dir_all(vectors.join("segment-7")).unwrap();
+        std::fs::write(vectors.join("segment-7/codes.mpf"), b"a live segment").unwrap();
+
+        let manifest_path = shard_dir.join("shard-0.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+
+        let result = transition_to_warm(
+            &shard_dir,
+            7,
+            7,
+            b"codes",
+            b"graph",
+            None,
+            b"mvcc",
+            &mut manifest,
+            None,
+        );
+
+        let Err(err) = result else {
+            panic!("a transition onto a live segment must fail");
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            manifest.files().is_empty(),
+            "the refused transition must not append a manifest entry"
+        );
+        assert!(
+            ShardManifest::open(&manifest_path)
+                .unwrap()
+                .files()
+                .is_empty(),
+            "nor commit one"
+        );
+        assert_eq!(
+            std::fs::read(vectors.join("segment-7/codes.mpf")).unwrap(),
+            b"a live segment",
+            "the existing segment must be untouched"
+        );
+    }
+
+    /// Retiring a segment directory leaves nothing a later boot could mistake
+    /// for a segment: the directory is renamed out of discovery's namespace
+    /// before it is deleted, so a crash mid-delete leaves only a
+    /// `.segment-*.staging` leftover — which the startup sweep removes — never
+    /// a half-deleted `segment-{id}/`. A leftover from an earlier crashed
+    /// retire of the same id does not block a new one.
+    #[test]
+    fn retire_segment_dir_never_leaves_a_half_deleted_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vectors = tmp.path().join("vectors");
+        let seg = vectors.join("segment-9");
+        std::fs::create_dir_all(&seg).unwrap();
+        std::fs::write(seg.join("codes.mpf"), b"x").unwrap();
+        std::fs::write(seg.join("mvcc.mpf"), b"y").unwrap();
+        // A crashed earlier retire of the same id.
+        std::fs::create_dir_all(vectors.join(".segment-9.staging")).unwrap();
+        std::fs::write(vectors.join(".segment-9.staging/codes.mpf"), b"old").unwrap();
+        let bystander = vectors.join("segment-10");
+        std::fs::create_dir_all(&bystander).unwrap();
+        std::fs::write(bystander.join("codes.mpf"), b"keep").unwrap();
+
+        retire_segment_dir(&seg).unwrap();
+
+        let left: Vec<String> = std::fs::read_dir(&vectors)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            vec!["segment-10".to_owned()],
+            "only the bystander remains"
+        );
+        assert_eq!(std::fs::read(bystander.join("codes.mpf")).unwrap(), b"keep");
+        assert!(
+            retire_segment_dir(&seg).is_err(),
+            "a missing directory is an error"
         );
     }
 

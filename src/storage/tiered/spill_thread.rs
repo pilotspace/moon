@@ -196,6 +196,25 @@ pub fn record_spill_completion_superseded() {
     SPILL_COMPLETION_SUPERSEDED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Spill completions whose file id the shard manifest ALREADY listed, so
+/// `ShardManifest::add_file` refused them (moon#893). The keys went back to
+/// the hot table from their in-flight payloads; nothing was published cold.
+/// Unreachable while the file_id seed holds, so any nonzero value means an id
+/// was re-issued. Exposed as `spill_completion_id_rejected` in INFO.
+static SPILL_COMPLETION_ID_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative spill completions refused for an already-listed file id.
+#[inline]
+pub fn spill_completion_id_rejected_total() -> u64 {
+    SPILL_COMPLETION_ID_REJECTED.load(Ordering::Relaxed)
+}
+
+/// Record one spill completion refused for an already-listed file id.
+#[inline]
+pub fn record_spill_completion_id_rejected() {
+    SPILL_COMPLETION_ID_REJECTED.fetch_add(1, Ordering::Relaxed);
+}
+
 use bytes::Bytes;
 use tracing::warn;
 

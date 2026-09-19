@@ -1,25 +1,26 @@
 //! The local (connection-owned) write path must wake a producer's blocked
 //! consumer — and must keep doing so after the database guard in front of
-//! `wake_producer` is gated (moon#942, the W7 hoist).
+//! the wake hook is gated (moon#942, the W7 hoist).
 //!
 //! # Why this suite exists
 //!
 //! `handler_monoio`'s write tail acquires a SECOND exclusive database guard
-//! after `dispatch`, purely so it can hand a `&mut Database` to
-//! `wake_producer`. `wake_producer`'s own first line is
-//! `producer_family(cmd)?`, which is `None` for every write that is not
-//! `LPUSH`/`RPUSH`/`LMOVE`/`RPOPLPUSH`/`ZADD`/`XADD` — so for `INCR`, `SADD`
-//! and `HSET` the guard is taken, nothing happens, and it is dropped. Moving
-//! that predicate OUTSIDE the guard is safe **only while the predicate stays
-//! exactly the one `wake_producer` itself uses**.
+//! after `dispatch`, purely so it can hand a `&mut Database` to the wakers.
+//! The gate in front of it is `blocking::wakeup::ready_keys` — the keys this
+//! write touched that have a client parked on them, decided from the registry
+//! alone — so for an `INCR`, `SADD` or `HSET` on a key nobody waits on the
+//! guard is never taken. Moving that predicate OUTSIDE the guard is safe
+//! **only while the predicate stays exactly the one the hook itself uses**
+//! (`wake_written_keys` opens with the same `ready_keys`).
 //!
 //! Getting that wrong has a name here. moon#595: the local gate omitted
 //! `XADD`, so a stream reader blocked on a key THIS shard owned was never
 //! woken by a local write — while the same `XADD` arriving over the SPSC mesh
 //! woke it. Routing-dependent, so it read as a flake rather than as a bug.
-//! moon#623 then collapsed ten open-coded copies of the test into
-//! `is_producer` / `producer_family` so a future producer is taught the
-//! mapping once, in one place.
+//! moon#623 then collapsed ten open-coded copies of the test into one
+//! predicate, and moon#1069 replaced its six command names with the keys a
+//! write touches (`tests/blocking_ready_key_wake.rs` covers the writers that
+//! are not pushes).
 //!
 //! # What is asserted, and why each half is load-bearing
 //!

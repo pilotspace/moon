@@ -656,9 +656,10 @@ fn warm_reattach_picks_correct_index_among_same_dim_indexes() {
     for file_id in 1..next_file_id {
         let dir = shard_dir.join("vectors").join(format!("segment-{file_id}"));
         let hashes: std::collections::HashSet<u64> =
-            crate::vector::persistence::warm_search::peek_key_hashes(&dir)
+            crate::vector::persistence::warm_search::peek_mvcc_rows(&dir)
                 .unwrap()
                 .into_iter()
+                .map(|(kh, _)| kh)
                 .collect();
         if hashes == key_hashes_a {
             segment_for_a = Some((file_id, dir));
@@ -1124,4 +1125,440 @@ fn a_present_but_unparseable_mvcc_keeps_its_data() {
              vectors beside it are worthless — retiring here would be data loss"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// moon#893: recovery must never delete a directory it attached, and a warm
+// segment is superseded PER KEY, never as a whole directory on one overlap.
+// ---------------------------------------------------------------------------
+
+/// What a restart test needs to know about the state `build_warm_fixture`
+/// left on disk.
+struct WarmFixture {
+    tmp: tempfile::TempDir,
+    meta: IndexMeta,
+    dim: usize,
+    n: usize,
+    /// `(file_id, dir)` of every warm segment, in transition order.
+    warm: Vec<(u64, std::path::PathBuf)>,
+    /// The key re-inserted after the first transition, if any.
+    updated: Option<usize>,
+    /// Its global_id BEFORE the re-insert (the copy the first warm segment holds).
+    updated_old_gid: Option<u32>,
+}
+
+/// Seed of the vector a re-inserted key is given (far from every `i + 1`).
+const REINSERT_SEED: u32 = 50_000;
+
+impl WarmFixture {
+    /// The CURRENT vector of `doc:{i}`.
+    fn blob(&self, i: usize) -> Bytes {
+        if Some(i) == self.updated {
+            f32_blob(self.dim, REINSERT_SEED)
+        } else {
+            f32_blob(self.dim, i as u32 + 1)
+        }
+    }
+}
+
+fn blob_to_f32(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+fn hset(store: &mut VectorStore, key: &str, blob: Bytes) {
+    use crate::protocol::Frame;
+    let args = vec![
+        Frame::BulkString(Bytes::from(key.to_owned())),
+        Frame::BulkString(Bytes::from_static(b"vec")),
+        Frame::BulkString(blob),
+    ];
+    let _ = crate::shard::spsc_handler::auto_index_hset_public(
+        store,
+        &mut TextStore::new(),
+        key.as_bytes(),
+        &args,
+        0,
+    );
+}
+
+/// Poll the index's Stack-B manifest until `pred` holds (bounded).
+fn wait_manifest_until(
+    idx_dir: &std::path::Path,
+    what: &str,
+    pred: impl Fn(&IndexManifest) -> bool,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(m) = manifest::read_manifest_tolerant(idx_dir)
+            && pred(&m)
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Stack-B manifest never reached: {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// Build `n` keys, compact, and move the segment to WARM. With `update`, then
+/// re-insert that key with a NEW vector and compact it into a fresh HOT
+/// segment (persisted by Stack B); with `second_to_warm`, move that HOT
+/// segment to WARM as well. Every async Stack-B snapshot is waited for, so the
+/// on-disk state is exactly what a clean shutdown leaves.
+fn build_warm_fixture(n: usize, update: Option<usize>, second_to_warm: bool) -> WarmFixture {
+    crate::vector::distance::init();
+    let tmp = tempfile::tempdir().unwrap();
+    let dim = 8usize;
+    let mut store = VectorStore::new();
+    store.set_persist_dir(tmp.path().to_path_buf());
+    let meta = make_meta("idx", dim as u32, "doc:");
+    store.create_index(meta.clone()).unwrap();
+    for i in 0..n {
+        hset(&mut store, &format!("doc:{i}"), f32_blob(dim, i as u32 + 1));
+    }
+    store.get_index_mut(b"idx").unwrap().force_compact();
+    let idx_dir = manifest::index_persist_dir(tmp.path(), b"idx");
+    wait_manifest_until(&idx_dir, "one HOT segment", |m| m.segment_ids.len() == 1);
+
+    let shard_dir = tmp.path().to_path_buf();
+    let mut shard_manifest =
+        crate::persistence::manifest::ShardManifest::create(&shard_dir.join("shard-0.manifest"))
+            .unwrap();
+    let mut next_file_id = 1u64;
+    let mut warm = Vec::new();
+    let moved = store.try_warm_transitions_all(
+        &shard_dir,
+        &mut shard_manifest,
+        0,
+        &mut next_file_id,
+        &mut None,
+    );
+    assert_eq!(moved, 1);
+    warm.push((
+        next_file_id - 1,
+        shard_dir
+            .join("vectors")
+            .join(format!("segment-{}", next_file_id - 1)),
+    ));
+    wait_manifest_until(&idx_dir, "no HOT segment after the transition", |m| {
+        m.segment_ids.is_empty()
+    });
+
+    let mut updated_old_gid = None;
+    if let Some(u) = update {
+        let key = format!("doc:{u}");
+        let kh = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0);
+        updated_old_gid = store
+            .get_index(b"idx")
+            .unwrap()
+            .key_hash_to_global_id
+            .get(&kh)
+            .copied();
+        hset(&mut store, &key, f32_blob(dim, REINSERT_SEED));
+        store.get_index_mut(b"idx").unwrap().force_compact();
+        let new_gid = *store
+            .get_index(b"idx")
+            .unwrap()
+            .key_hash_to_global_id
+            .get(&kh)
+            .unwrap();
+        assert_ne!(
+            Some(new_gid),
+            updated_old_gid,
+            "sanity: a re-insert gets a new global_id"
+        );
+        // The snapshot that records the HOT segment AND the key's new global_id.
+        wait_manifest_until(&idx_dir, "re-inserted key in a HOT segment", |m| {
+            m.segment_ids.len() == 1
+                && manifest::read_keymap_tolerant(&idx_dir, m.keymap_epoch).is_some_and(|km| {
+                    km.iter()
+                        .any(|e| e.key_hash == kh && e.global_id == new_gid)
+                })
+        });
+        if second_to_warm {
+            let moved = store.try_warm_transitions_all(
+                &shard_dir,
+                &mut shard_manifest,
+                0,
+                &mut next_file_id,
+                &mut None,
+            );
+            assert_eq!(moved, 1);
+            warm.push((
+                next_file_id - 1,
+                shard_dir
+                    .join("vectors")
+                    .join(format!("segment-{}", next_file_id - 1)),
+            ));
+            wait_manifest_until(&idx_dir, "no HOT segment after the 2nd transition", |m| {
+                m.segment_ids.is_empty()
+            });
+        }
+    }
+    WarmFixture {
+        tmp,
+        meta,
+        dim,
+        n,
+        warm,
+        updated: update,
+        updated_old_gid,
+    }
+}
+
+/// Reboot into a fresh store in the production order: create_index ->
+/// register_warm_segments(`segments`) -> baseline -> rescan of every key with
+/// its CURRENT value -> finish.
+fn reboot(fx: &WarmFixture, segments: Vec<(u64, std::path::PathBuf)>) -> VectorStore {
+    use crate::protocol::Frame;
+    let mut fresh = VectorStore::new();
+    fresh.set_persist_dir(fx.tmp.path().to_path_buf());
+    let mut state = RecoveryState::new();
+    state.create_index(&mut fresh, fx.tmp.path(), &fx.meta);
+    fresh.register_warm_segments(segments);
+    state.snapshot_recovered_baseline(&fresh);
+    for i in 0..fx.n {
+        let key = format!("doc:{i}");
+        let args = vec![
+            Frame::BulkString(Bytes::from(key.clone())),
+            Frame::BulkString(Bytes::from_static(b"vec")),
+            Frame::BulkString(fx.blob(i)),
+        ];
+        state.reconcile_key(&mut fresh, &mut TextStore::new(), key.as_bytes(), &args, 0);
+    }
+    state.finish(&mut fresh, fx.tmp.path());
+    fresh
+}
+
+fn gid_of(store: &VectorStore, key: &str) -> u32 {
+    let kh = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0);
+    *store
+        .get_index(b"idx")
+        .unwrap()
+        .key_hash_to_global_id
+        .get(&kh)
+        .unwrap_or_else(|| panic!("{key} is not indexed after the reboot"))
+}
+
+/// Top-1 global_id for `doc:{i}`'s current vector.
+fn top1(store: &mut VectorStore, fx: &WarmFixture, i: usize) -> Option<u32> {
+    store
+        .search_index(b"idx", &blob_to_f32(&fx.blob(i)), 1, 64)
+        .unwrap()
+        .first()
+        .copied()
+}
+
+/// Every global_id a wide search for the ORIGINAL vector of `doc:{i}` returns.
+fn hits_for_original(store: &mut VectorStore, fx: &WarmFixture, i: usize) -> Vec<u32> {
+    store
+        .search_index(
+            b"idx",
+            &blob_to_f32(&f32_blob(fx.dim, i as u32 + 1)),
+            fx.n + 1,
+            256,
+        )
+        .unwrap()
+}
+
+/// Links 3 + 4 of moon#893 on an UPGRADED data dir: a manifest written by an
+/// older build holds the same warm segment id twice, so discovery hands the
+/// same directory over twice. The first pass attached it; the second pass saw
+/// the key_hashes the first pass had just registered, called the segment
+/// "already covered", and `remove_dir_all`ed the directory it was serving from.
+#[test]
+fn a_warm_segment_listed_twice_is_attached_once_and_never_deleted() {
+    let fx = build_warm_fixture(12, None, false);
+    let (id, dir) = fx.warm[0].clone();
+
+    let mut fresh = reboot(&fx, vec![(id, dir.clone()), (id, dir.clone())]);
+
+    assert!(
+        dir.join("mvcc.mpf").exists(),
+        "recovery deleted the warm segment directory it had just attached"
+    );
+    {
+        let idx = fresh.get_index(b"idx").unwrap();
+        let snap = idx.segments.load();
+        assert_eq!(
+            snap.warm.len(),
+            1,
+            "the segment must be attached exactly once"
+        );
+        assert_eq!(
+            snap.immutable.len(),
+            0,
+            "nothing may be re-encoded into HOT"
+        );
+        assert_eq!(
+            snap.mutable.len(),
+            0,
+            "nothing may be re-encoded into mutable"
+        );
+    }
+    for i in 0..fx.n {
+        let want = gid_of(&fresh, &format!("doc:{i}"));
+        assert_eq!(
+            top1(&mut fresh, &fx, i),
+            Some(want),
+            "doc:{i} is not served"
+        );
+    }
+}
+
+/// Link 4 of moon#893: ONE key of a warm segment re-inserted and compacted
+/// into a HOT segment made `already_covered` (`.any()`) true for the whole
+/// segment, and recovery deleted the directory, the other n-1 keys with it.
+/// The covered key must be tombstoned in the warm copy only; its siblings stay
+/// served from the warm segment.
+#[test]
+fn one_key_reinserted_into_hot_does_not_retire_its_warm_siblings() {
+    let n = 20usize;
+    let fx = build_warm_fixture(n, Some(3), false);
+    let (id, dir) = fx.warm[0].clone();
+
+    let mut fresh = reboot(&fx, vec![(id, dir.clone())]);
+
+    assert!(
+        dir.join("mvcc.mpf").exists(),
+        "one covered key retired the whole warm segment directory"
+    );
+    {
+        let idx = fresh.get_index(b"idx").unwrap();
+        let snap = idx.segments.load();
+        assert_eq!(snap.warm.len(), 1, "the warm segment must stay attached");
+        assert_eq!(
+            snap.immutable.len(),
+            1,
+            "the re-inserted key's HOT segment reloads"
+        );
+        assert_eq!(snap.mutable.len(), 0, "no sibling may be re-encoded");
+        assert_eq!(
+            snap.warm[0].live_count() as usize,
+            n - 1,
+            "exactly the covered key is tombstoned in the warm copy"
+        );
+    }
+    for i in 0..n {
+        let want = gid_of(&fresh, &format!("doc:{i}"));
+        assert_eq!(
+            top1(&mut fresh, &fx, i),
+            Some(want),
+            "doc:{i} is not served"
+        );
+    }
+    let old = fx.updated_old_gid.unwrap();
+    assert_ne!(gid_of(&fresh, "doc:3"), old);
+    assert!(
+        !hits_for_original(&mut fresh, &fx, 3).contains(&old),
+        "the stale warm copy of the re-inserted key is still searchable"
+    );
+}
+
+/// The same overlap across TWO warm segments: the older one holds the stale
+/// copy of a key, the newer one its current copy. The persisted keymap names
+/// the current copy by global_id, so only the older segment's copy may die —
+/// both directories stay, and the key resolves to its current vector.
+/// (`.any()` attached the older segment, registered the key under the newer
+/// global_id, then retired the NEWER directory as "covered": the key served
+/// its OLD vector and its current one was deleted.)
+#[test]
+fn a_key_in_two_warm_segments_keeps_the_copy_the_keymap_names() {
+    let n = 20usize;
+    let fx = build_warm_fixture(n, Some(3), true);
+    assert_eq!(fx.warm.len(), 2);
+
+    let mut fresh = reboot(&fx, fx.warm.clone());
+
+    for (_, dir) in &fx.warm {
+        assert!(
+            dir.join("mvcc.mpf").exists(),
+            "{dir:?} was deleted by recovery"
+        );
+    }
+    {
+        let idx = fresh.get_index(b"idx").unwrap();
+        let snap = idx.segments.load();
+        assert_eq!(snap.warm.len(), 2, "both warm segments must stay attached");
+        assert_eq!(snap.mutable.len(), 0, "nothing may be re-encoded");
+    }
+    for i in 0..n {
+        let want = gid_of(&fresh, &format!("doc:{i}"));
+        assert_eq!(
+            top1(&mut fresh, &fx, i),
+            Some(want),
+            "doc:{i} is not served"
+        );
+    }
+    let old = fx.updated_old_gid.unwrap();
+    assert_ne!(
+        gid_of(&fresh, "doc:3"),
+        old,
+        "doc:3 resolves to its STALE copy"
+    );
+    assert!(
+        !hits_for_original(&mut fresh, &fx, 3).contains(&old),
+        "the stale copy of doc:3 is still searchable"
+    );
+}
+
+/// The global_id allocator must resume ABOVE every global_id a reattached warm
+/// segment holds. Recovery seeds the mutable segment's base from Stack B's
+/// `next_global_id` alone; when Stack B's manifest lags the warm tier (a lost
+/// async snapshot, `appendonly no`), a key re-written after the restart could
+/// be handed a global_id an attached warm row already carries — and the
+/// per-key rule, which trusts global_ids to tell copies apart, would then
+/// take the old row for the current one on the next boot.
+#[test]
+fn a_reattached_warm_segment_raises_the_global_id_allocator_above_its_rows() {
+    let n = 12usize;
+    let fx = build_warm_fixture(n, None, false);
+    let (id, dir) = fx.warm[0].clone();
+    let warm_gids: std::collections::HashSet<u32> =
+        crate::vector::persistence::warm_search::peek_mvcc_rows(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|(_, gid)| gid)
+            .collect();
+    let max_warm_gid = *warm_gids.iter().max().unwrap();
+
+    // Stack B lagging: its manifest predates every warm row's global_id.
+    let idx_dir = manifest::index_persist_dir(fx.tmp.path(), b"idx");
+    let mut m = manifest::read_manifest_tolerant(&idx_dir).unwrap();
+    m.next_global_id = 0;
+    manifest::write_manifest_atomic(&idx_dir, &m).unwrap();
+
+    let mut fresh = reboot(&fx, vec![(id, dir.clone())]);
+    let next = fresh
+        .get_index(b"idx")
+        .unwrap()
+        .segments
+        .load()
+        .mutable
+        .next_global_id();
+    assert!(
+        next > max_warm_gid,
+        "the allocator resumes at {next}, at or below warm global_id {max_warm_gid}"
+    );
+
+    // A key re-written now gets a global_id no warm row holds, and is served.
+    hset(&mut fresh, "doc:3", f32_blob(fx.dim, REINSERT_SEED));
+    let new_gid = gid_of(&fresh, "doc:3");
+    assert!(
+        !warm_gids.contains(&new_gid),
+        "re-written doc:3 was given global_id {new_gid}, which a warm row already holds"
+    );
+    let got = fresh
+        .search_index(
+            b"idx",
+            &blob_to_f32(&f32_blob(fx.dim, REINSERT_SEED)),
+            1,
+            64,
+        )
+        .unwrap();
+    assert_eq!(got.first().copied(), Some(new_gid));
 }

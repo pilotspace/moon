@@ -272,7 +272,9 @@ fn build_corpus(
             }];
             let batch = build_kv_spill_batch(&entries, file_id).unwrap();
             let bytes = write_kv_spill_batch(&sdir, file_id, &batch).unwrap();
-            manifest.add_file(kv_entry(file_id, batch.pages.len() as u32, bytes));
+            manifest
+                .add_file(kv_entry(file_id, batch.pages.len() as u32, bytes))
+                .unwrap();
             keys.insert(key, value);
         }
         manifest.commit().unwrap();
@@ -625,7 +627,8 @@ fn already_collided(mode: Mode) {
             db_index: 0,
             max_key_hash: u64::MAX,
             last_modified_lsn: 0,
-        });
+        })
+        .unwrap();
         m.commit().unwrap();
         assert!(
             !shard_dir(&dir, shard).join("vectors/segment-3").exists(),
