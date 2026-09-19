@@ -244,6 +244,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     applies the write, waits up to the bound on its connection task, and
     then reports `ERR AOF fsync failed; write not durable`.
 
+- **`ZRANGESTORE` checks its range before it looks up the source** (moon#1102),
+  the `ZRANGESTORE` sibling of moon#1060. A malformed rank, `BYSCORE` or
+  `BYLEX` bound against a missing source answered `:0` and deleted the
+  destination; against a source of another type it answered `WRONGTYPE`.
+  Redis parses the range first, so both now answer its parse error
+  (`min or max is not a float`, `min or max not valid string range item` or
+  `value is not an integer or out of range`), with or without `REV` and
+  `LIMIT`, and the destination is left alone.
+
+- **A `WAIT` queued inside `MULTI` no longer holds `EXEC` for its timeout**
+  (moon#1098). Redis runs a transaction body with `CLIENT_DENY_BLOCKING`, so a
+  queued `WAIT` answers the current replica ack count at once. Moon filled it
+  with the live `WAIT`, which polled until its deadline:
+  `MULTI / INCR k / WAIT 1 1500 / EXEC` answered after 1.5 s instead of at
+  once, and `WAIT 1 0` inside `MULTI` never answered. The reply is still the
+  number of replicas that have acknowledged the master's current offset, now
+  sampled once, on both runtimes and on the local and owner-routed `EXEC`
+  paths. A `WAIT` outside `MULTI` still blocks as before. (`WAITAOF` is not
+  implemented, so it has no queued form to fix.)
+
 - **The disk-offload checkpoint only publishes a redo point over heap pages it
   has made durable** (moon#452 item 3). The fuzzy checkpoint pwrote dirty heap
   pages and never fsynced a heap file, then published `redo_lsn` in the control

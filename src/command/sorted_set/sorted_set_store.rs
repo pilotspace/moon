@@ -17,9 +17,14 @@ use crate::storage::db::{zset_member_cost, zset_table_bytes};
 use crate::command::helpers::{err, err_wrong_args, extract_bytes};
 
 use super::{
-    AggregateOp, clamp_nan_to_zero, parse_numkeys, zadd_member, zrange_by_lex, zrange_by_rank,
-    zrange_by_score,
+    AggregateOp, clamp_nan_to_zero, parse_lex_bound, parse_numkeys, parse_score_bound, zadd_member,
+    zrange_by_lex, zrange_by_rank, zrange_by_score,
 };
+
+/// A rank bound as `zrange_by_rank` parses it: a base-10 `i64`, or `None`.
+fn parse_rank(b: &[u8]) -> Option<i64> {
+    std::str::from_utf8(b).ok()?.parse().ok()
+}
 
 /// Which set operation a `Z*STORE` command computes over its sources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +387,30 @@ pub fn zrangestore(db: &mut Database, args: &[Frame]) -> Frame {
         return err(
             "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
         );
+    }
+
+    // moon#1102: Redis parses the range grammar unconditionally, before it
+    // looks the source up — a malformed bound is a parse error whether the
+    // source is missing, a zset or another type. The helpers below validate
+    // too, but only on the `Ok(Some(_))` arm: a missing source used to fall
+    // through to "store the empty result" and DELETE `dst`, and a wrong-type
+    // source answered WRONGTYPE. Same shape as `zrange_readonly` (moon#1060).
+    if by_score {
+        if let Err(e) = parse_score_bound(&min_arg) {
+            return e;
+        }
+        if let Err(e) = parse_score_bound(&max_arg) {
+            return e;
+        }
+    } else if by_lex {
+        if let Err(e) = parse_lex_bound(&min_arg) {
+            return e;
+        }
+        if let Err(e) = parse_lex_bound(&max_arg) {
+            return e;
+        }
+    } else if parse_rank(&min_arg).is_none() || parse_rank(&max_arg).is_none() {
+        return err("ERR value is not an integer or out of range");
     }
 
     // Run ZRANGE on src, collecting (member, score) pairs
