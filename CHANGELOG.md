@@ -199,6 +199,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A cross-shard `COPY` keeps the source's absolute expiry** (moon#1095). The
+  TTL crossed as a relative duration — `PTTL` read on the source shard's
+  cached clock, `PEXPIRE` re-anchored on the destination's — so the copy's
+  deadline moved by the drift between the two (measured: `PTTL` 500004 after
+  `PEXPIRE 500000`; 5 to 32 of 64 copies moved per run). The copy now carries
+  the source's `PEXPIRETIME` and is written as one `SET dst v PXAT <deadline>
+  [NX]`, which also closes the window in which a crash between the old `SET`
+  and `PEXPIRE` left a copy that never expired. Every other cross-shard hop
+  that could carry a TTL was audited: `RENAME`/`RENAMENX`, `SMOVE`,
+  `LMOVE`/`BLMOVE`, `SORT ... STORE` and the `*STORE` family are refused across
+  shards (`CROSSSLOT`, moon#592/#570), and `MOVE` / `COPY ... DB n` stay on one
+  shard, carrying the stored entry and its absolute deadline.
+
+- **`MOVE` and `COPY ... DB n` work inside scripts, and land where the effect
+  record says** (moon#1068). A script reaches the keyspace through the one
+  database it runs in, so `redis.call('MOVE', k, n)` answered `ERR MOVE requires
+  handler-level dispatch`, and `redis.call('COPY', a, b, 'DB', n)` answered `:1`
+  while writing `b` into the SCRIPT's database — and logged `COPY a b DB n` to
+  the AOF and the replication stream, which a replica and a restart apply into
+  db `n`. Both now run from `EVAL`, `EVALSHA`, `FCALL` and a script queued in
+  `MULTI` exactly as on the connection, as redis 8.6.1 does: the reply, the
+  landing database, the key's absolute deadline, `REPLACE`, redis's errors for
+  the script's own db and an out-of-range db, and one verbatim effect record on
+  `:1` only. A client blocked on the key in the destination database is served
+  once the script returns, after the record is logged (the moon#1056 rule), so
+  a restart neither loses nor resurrects the element it popped.
+
 - **`scripts/test-consistency.sh`: six rows no longer fail with `CROSSSLOT`
   at `--shards 4`** (moon#1106). `ZRANGESTORE still-negative stop` and five
   CLIENT TRACKING destination controls named keys on different shards, so
