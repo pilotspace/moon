@@ -2739,8 +2739,9 @@ pub(crate) fn is_multi_key_command(cmd: &[u8], args: &[Frame]) -> bool {
         (5, b'b') => args.len() >= 3 && cmd.eq_ignore_ascii_case(b"BITOP"),
         // COPY src dst [REPLACE]: src and dst can live on different shards.
         // The `COPY ... DB n` form is EXCLUDED: it needs two databases and is
-        // owned by the handlers' two-db interception (cross-db + cross-shard
-        // simultaneously is unsupported, as before).
+        // owned by the handlers' two-db interception. Cross-db AND cross-shard
+        // at once is unsupported: `cross_shard_multikey_rejection` refuses it
+        // with CROSSSLOT before routing (moon#1062).
         (4, b'c') => {
             args.len() >= 2 && cmd.eq_ignore_ascii_case(b"COPY") && !copy_has_db_clause(args)
         }
