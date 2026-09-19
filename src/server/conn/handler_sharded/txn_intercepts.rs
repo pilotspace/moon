@@ -112,6 +112,14 @@ pub(super) fn try_handle_cluster(
         )));
         return true;
     };
+    // moon#1015: refuse before `handle_cluster_command` relabels this node as
+    // a replica and before the role flip / epoch bump below.
+    if crate::cluster::command::is_cluster_replicate(cmd_args)
+        && let Some(refusal) = crate::replication::replica::replica_start_refusal(ctx.num_shards)
+    {
+        responses.push(refusal);
+        return true;
+    }
     #[allow(clippy::unwrap_used)] // Fallback "127.0.0.1:6379" is a valid literal
     let self_addr: std::net::SocketAddr = format!("127.0.0.1:{}", ctx.config_port)
         .parse()

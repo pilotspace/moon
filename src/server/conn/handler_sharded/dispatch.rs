@@ -288,6 +288,15 @@ pub(super) fn try_handle_replicaof(
     }
     use crate::command::connection::{ReplicaofAction, replicaof};
     let (resp, action) = replicaof(cmd_args);
+    // moon#1015: a multi-shard node cannot run the replica task. Refuse here,
+    // BEFORE the role flip and the epoch bump below — acking `+OK` first left
+    // the node read-only, killed any running replica task, and never synced.
+    if matches!(action, Some(ReplicaofAction::StartReplication { .. }))
+        && let Some(refusal) = crate::replication::replica::replica_start_refusal(ctx.num_shards)
+    {
+        responses.push(refusal);
+        return true;
+    }
     if let Some(action) = action {
         if let Some(ref rs) = ctx.repl_state {
             match action {

@@ -1917,6 +1917,32 @@ else
 fi
 redis-cli -p "$PORT_RUST" -n 9 FLUSHDB &>/dev/null || true
 
+# ---------------------------------------------------------------------------
+# moon#1015: a multi-shard node refuses REPLICAOF instead of acking it
+# ---------------------------------------------------------------------------
+#
+# moon-only at --shards > 1: Redis has no shards, and multi-shard replicas are
+# moon#406. Pre-fix the reply was `OK`, the node went read-only (`role:slave`),
+# and it never synced. The refusal must leave the node a writable master.
+#
+# Not run at --shards 1: there REPLICAOF is SUPPOSED to succeed, and pointing
+# this node at the oracle would full-sync it from Redis mid-script.
+# `REPLICAOF NO ONE` is compared against Redis at every shard count.
+assert_both "moon#1015 REPLICAOF NO ONE (shards=$SHARDS)" REPLICAOF NO ONE
+if [[ "$SHARDS" -gt 1 ]]; then
+    ro_reply=$(redis-cli -p "$PORT_RUST" REPLICAOF 127.0.0.1 "$PORT_REDIS" 2>&1) || true
+    if [[ "$ro_reply" == *"--shards 1"*"406"* ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: moon#1015 REPLICAOF refused at shards=$SHARDS"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: moon#1015 REPLICAOF at shards=$SHARDS answered '$ro_reply', want the --shards 1 refusal"
+    fi
+    ro_role=$(redis-cli -p "$PORT_RUST" INFO replication 2>&1 | tr -d '\r' | grep '^role:') || true
+    assert_eq "moon#1015 refused REPLICAOF leaves role:master (shards=$SHARDS)" "role:master" "$ro_role"
+    assert_eq "moon#1015 refused REPLICAOF leaves the node writable (shards=$SHARDS)" "OK" \
+        "$(redis-cli -p "$PORT_RUST" SET moon1015:w v 2>&1)"
+    redis-cli -p "$PORT_RUST" DEL moon1015:w &>/dev/null || true
+fi
+
 # moon#865 -- one command carrying more elements than a listpack's u16 element
 # count can hold. Pre-fix, RPUSH of 70k elements left LLEN reporting 4464
 # (70000 - 65536) and the server had already replied +OK-equivalent. Redis is

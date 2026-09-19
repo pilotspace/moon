@@ -1338,6 +1338,19 @@ if should_run "connection"; then
     fi
     mcli SET dg:probe v1 >/dev/null 2>&1
     assert_moon "DEBUG DIGEST returns to its earlier value" "$DG_ONE" DEBUG DIGEST
+
+    # moon#1015: REPLICAOF NO ONE answers like Redis at any shard count. A
+    # replica START is only probed at --shards > 1, where it must be REFUSED
+    # (multi-shard replicas are moon#406) and leave a writable master; at
+    # --shards 1 it would succeed and full-sync this node from the oracle.
+    assert_match "REPLICAOF NO ONE"    REPLICAOF NO ONE
+    if [[ "$SHARDS" -gt 1 ]]; then
+        assert_moon_contains "moon#1015 REPLICAOF refused at shards>1" \
+            "requires --shards 1" REPLICAOF 127.0.0.1 "$PORT_REDIS"
+        assert_moon_contains "moon#1015 refused REPLICAOF keeps role:master" \
+            "role:master" INFO replication
+        assert_moon "moon#1015 refused REPLICAOF keeps the node writable" "OK" SET moon1015:w v
+    fi
 fi
 
 # ===========================================================================

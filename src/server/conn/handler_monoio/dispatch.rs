@@ -158,6 +158,15 @@ pub(super) fn try_handle_cluster(
         return false;
     }
     if let Some(ref cs) = ctx.cluster_state {
+        // moon#1015: refuse before `handle_cluster_command` relabels this node
+        // as a replica and before the role flip / epoch bump below.
+        if crate::cluster::command::is_cluster_replicate(cmd_args)
+            && let Some(refusal) =
+                crate::replication::replica::replica_start_refusal(ctx.num_shards)
+        {
+            responses.push(refusal);
+            return true;
+        }
         #[allow(clippy::unwrap_used)] // Fallback "127.0.0.1:6379" is a valid literal
         let self_addr: std::net::SocketAddr = format!("127.0.0.1:{}", ctx.config_port)
             .parse()
@@ -614,6 +623,15 @@ pub(super) fn try_handle_replicaof(
     }
     use crate::command::connection::{ReplicaofAction, replicaof};
     let (resp, action) = replicaof(cmd_args);
+    // moon#1015: a multi-shard node cannot run the replica task. Refuse here,
+    // BEFORE the role flip and the epoch bump below — acking `+OK` first left
+    // the node read-only, killed any running replica task, and never synced.
+    if matches!(action, Some(ReplicaofAction::StartReplication { .. }))
+        && let Some(refusal) = crate::replication::replica::replica_start_refusal(ctx.num_shards)
+    {
+        responses.push(refusal);
+        return true;
+    }
     if let Some(action) = action {
         if let Some(ref rs) = ctx.repl_state {
             match action {
