@@ -420,6 +420,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `appendonly.aof` could return, losing every record written after the
     rewrite. Both directories are now fsynced before the new file is used.
 
+- **The console lints, and CI runs it** (moon#1082). `pnpm run lint` exited
+  with a missing-config error because ESLint 9 reads only flat config and the
+  console had none. `console/eslint.config.js` now wires the plugins that were
+  already installed (`@eslint/js` and `typescript-eslint` recommended,
+  `react-hooks`, `react-refresh`), and the `unit` job of
+  `console-integration.yml` runs `pnpm run lint` before the tests. Its first
+  run found a real bug: `GraphCosmos` returned its Canvas2D fallback before its
+  hooks, so the re-render after a failed WebGL init called fewer hooks than the
+  first render and React threw; only the parent's error boundary hid it. The
+  fallback now returns after the hooks, with a unit test that failed before the
+  change. `badge.tsx` stops exporting the unused `badgeVariants`, and
+  `no-unused-vars` accepts a leading underscore, the convention `tsc` already
+  applies under `noUnusedParameters`.
+
 - **A COLD vector segment leaves `unloaded` with the search that reloads it,
   and a delete that lands while the reload is waiting to install is no longer
   lost** (moon#1070). Since the off-loop reload pool (prod-hardening #18) a
@@ -1362,6 +1376,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CH` as a did-anything-change signal silently skipped those updates. Fixed on
   both the listpack and B+tree arms, which carried separate copies.
 ### Security
+
+- **`fuzz/Cargo.lock` is audited and clean** (moon#1092). The fuzz workspace
+  has its own lockfile, which no gate checked, and it carried
+  RUSTSEC-2026-0204 (`crossbeam-epoch` 0.9.18) and RUSTSEC-2026-0258 (`h2`
+  0.4.13), plus the unsound `anyhow` 1.0.102 and `memmap2` 0.9.10 and the
+  yanked `spin` 0.9.8. Each is bumped to the version the root `Cargo.lock`
+  already ships (0.9.20, 0.4.18, 1.0.104, 0.9.11, 0.9.9), and nothing else in
+  the lockfile moves. `supply-chain.yml` now triggers on `fuzz/Cargo.toml` and
+  `fuzz/Cargo.lock` and runs `cargo audit --file fuzz/Cargo.lock` next to the
+  root audit, so the fuzz lockfile cannot drift behind again unnoticed.
 
 - **Error and status replies can no longer be split by client input**
   (moon#1031). Error text quotes client input (an unknown command name, an
