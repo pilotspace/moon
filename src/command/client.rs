@@ -14,24 +14,25 @@ pub struct TrackingConfig {
 
 /// Parse CLIENT TRACKING ON|OFF options.
 /// `args` starts from the subcommand after "CLIENT", i.e. args[0] = "TRACKING", args[1] = ON|OFF.
-pub fn parse_tracking_args(args: &[Frame]) -> Result<TrackingConfig, Frame> {
+///
+/// Follows redis `clientCommand` step for step, because the ORDER decides
+/// which error a malformed request gets (all measured on redis-server 8.6.1):
+/// the options are parsed first — an unknown one is a plain syntax error, and
+/// `REDIRECT <id>` is checked against `redirect_exists` right where it is
+/// parsed, so `REDIRECT 99999 PREFIX x` names the missing client, not the
+/// missing BCAST — then `ON|OFF`, then (for ON) the PREFIX-needs-BCAST rule.
+/// The rules that depend on the connection's CURRENT mode are checked by the
+/// caller, which has that state.
+pub fn parse_tracking_args(
+    args: &[Frame],
+    redirect_exists: impl Fn(u64) -> bool,
+) -> Result<TrackingConfig, Frame> {
+    const SYNTAX: &[u8] = b"ERR syntax error";
     if args.len() < 2 {
         return Err(Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'client|tracking' command",
         )));
     }
-    let on_off = match &args[1] {
-        Frame::BulkString(s) | Frame::SimpleString(s) => s,
-        _ => return Err(Frame::Error(Bytes::from_static(b"ERR syntax error"))),
-    };
-
-    let enable = if on_off.eq_ignore_ascii_case(b"ON") {
-        true
-    } else if on_off.eq_ignore_ascii_case(b"OFF") {
-        false
-    } else {
-        return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
-    };
 
     let mut bcast = false;
     let mut optin = false;
@@ -54,64 +55,64 @@ pub fn parse_tracking_args(args: &[Frame]) -> Result<TrackingConfig, Frame> {
             optout = true;
         } else if opt.eq_ignore_ascii_case(b"NOLOOP") {
             noloop = true;
-        } else if opt.eq_ignore_ascii_case(b"REDIRECT") {
+        } else if opt.eq_ignore_ascii_case(b"REDIRECT") && i + 1 < args.len() {
             i += 1;
-            if i >= args.len() {
-                return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+            if redirect.is_some() {
+                return Err(Frame::Error(Bytes::from_static(
+                    b"ERR A client can only redirect to a single other client",
+                )));
             }
-            let id_bytes = match &args[i] {
-                Frame::BulkString(s) | Frame::SimpleString(s) => s,
-                _ => return Err(Frame::Error(Bytes::from_static(b"ERR syntax error"))),
+            let not_int = || {
+                Frame::Error(Bytes::from_static(
+                    b"ERR value is not an integer or out of range",
+                ))
             };
-            let id_str = std::str::from_utf8(id_bytes).map_err(|_| {
-                Frame::Error(Bytes::from_static(
-                    b"ERR value is not an integer or out of range",
-                ))
-            })?;
-            redirect = Some(id_str.parse::<u64>().map_err(|_| {
-                Frame::Error(Bytes::from_static(
-                    b"ERR value is not an integer or out of range",
-                ))
-            })?);
-        } else if opt.eq_ignore_ascii_case(b"PREFIX") {
-            i += 1;
-            if i >= args.len() {
-                return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+            let id = match &args[i] {
+                Frame::BulkString(s) | Frame::SimpleString(s) => std::str::from_utf8(s)
+                    .ok()
+                    .and_then(|t| t.parse::<i64>().ok())
+                    .ok_or_else(not_int)?,
+                _ => return Err(not_int()),
+            };
+            // Client ids start at 1, so 0 and negatives name nobody — redis
+            // answers them exactly like an id that has disconnected.
+            match u64::try_from(id) {
+                Ok(id) if id > 0 && redirect_exists(id) => redirect = Some(id),
+                _ => {
+                    return Err(Frame::Error(Bytes::from_static(
+                        b"ERR The client ID you want redirect to does not exist",
+                    )));
+                }
             }
+        } else if opt.eq_ignore_ascii_case(b"PREFIX") && i + 1 < args.len() {
+            i += 1;
             let prefix = match &args[i] {
                 Frame::BulkString(s) | Frame::SimpleString(s) => s.clone(),
-                _ => return Err(Frame::Error(Bytes::from_static(b"ERR syntax error"))),
+                _ => return Err(Frame::Error(Bytes::from_static(SYNTAX))),
             };
             prefixes.push(prefix);
         } else {
-            return Err(Frame::Error(Bytes::from(format!(
-                "ERR Unrecognized option: {:?}",
-                String::from_utf8_lossy(&opt)
-            ))));
+            return Err(Frame::Error(Bytes::from_static(SYNTAX)));
         }
         i += 1;
     }
 
+    let enable = match &args[1] {
+        Frame::BulkString(s) | Frame::SimpleString(s) if s.eq_ignore_ascii_case(b"ON") => true,
+        Frame::BulkString(s) | Frame::SimpleString(s) if s.eq_ignore_ascii_case(b"OFF") => false,
+        _ => return Err(Frame::Error(Bytes::from_static(SYNTAX))),
+    };
+
     // PREFIX requires BCAST
-    if !prefixes.is_empty() && !bcast {
+    if enable && !prefixes.is_empty() && !bcast {
         return Err(Frame::Error(Bytes::from_static(
             b"ERR PREFIX option requires BCAST mode to be enabled",
         )));
     }
 
-    // `BCAST` with no `PREFIX` means "invalidate me for EVERY key" in Redis.
-    // The handlers register broadcast interest with
-    // `TrackingTable::register_prefix` inside `for prefix in &prefixes`, so a
-    // prefix-less BCAST client used to register nothing and then never
-    // received an invalidation — at any shard count, and regardless of what it
-    // read (BCAST does not depend on reads at all). `TrackingTable` matches
-    // with `key.starts_with(prefix)`, for which the empty prefix is exactly
-    // "all keys". Normalising here fixes all three handlers at once
-    // (monoio/dispatch.rs, handler_single.rs, handler_sharded/dispatch.rs)
-    // and keeps the semantics in one place.
-    if bcast && prefixes.is_empty() {
-        prefixes.push(Bytes::new());
-    }
+    // `BCAST` with no `PREFIX` ("invalidate me for EVERY key") is normalised
+    // to the empty prefix by `tracking::client_cmd`, AFTER the prefix
+    // collision check — redis skips that check when no PREFIX was given.
 
     Ok(TrackingConfig {
         enable,
@@ -253,7 +254,7 @@ mod tests {
     #[test]
     fn test_parse_tracking_on() {
         let args = vec![bs(b"TRACKING"), bs(b"ON")];
-        let config = parse_tracking_args(&args).unwrap();
+        let config = parse_tracking_args(&args, |_| true).unwrap();
         assert!(config.enable);
         assert!(!config.bcast);
         assert!(!config.noloop);
@@ -262,14 +263,14 @@ mod tests {
     #[test]
     fn test_parse_tracking_off() {
         let args = vec![bs(b"TRACKING"), bs(b"OFF")];
-        let config = parse_tracking_args(&args).unwrap();
+        let config = parse_tracking_args(&args, |_| true).unwrap();
         assert!(!config.enable);
     }
 
     #[test]
     fn test_parse_tracking_on_bcast() {
         let args = vec![bs(b"TRACKING"), bs(b"ON"), bs(b"BCAST")];
-        let config = parse_tracking_args(&args).unwrap();
+        let config = parse_tracking_args(&args, |_| true).unwrap();
         assert!(config.enable);
         assert!(config.bcast);
     }
@@ -283,7 +284,7 @@ mod tests {
             bs(b"PREFIX"),
             bs(b"user:"),
         ];
-        let config = parse_tracking_args(&args).unwrap();
+        let config = parse_tracking_args(&args, |_| true).unwrap();
         assert!(config.enable);
         assert!(config.bcast);
         assert_eq!(config.prefixes.len(), 1);
@@ -293,14 +294,14 @@ mod tests {
     #[test]
     fn test_parse_tracking_prefix_without_bcast_fails() {
         let args = vec![bs(b"TRACKING"), bs(b"ON"), bs(b"PREFIX"), bs(b"user:")];
-        let result = parse_tracking_args(&args);
+        let result = parse_tracking_args(&args, |_| true);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_tracking_on_noloop() {
         let args = vec![bs(b"TRACKING"), bs(b"ON"), bs(b"NOLOOP")];
-        let config = parse_tracking_args(&args).unwrap();
+        let config = parse_tracking_args(&args, |_| true).unwrap();
         assert!(config.enable);
         assert!(config.noloop);
     }
@@ -308,7 +309,7 @@ mod tests {
     #[test]
     fn test_parse_tracking_on_redirect() {
         let args = vec![bs(b"TRACKING"), bs(b"ON"), bs(b"REDIRECT"), bs(b"42")];
-        let config = parse_tracking_args(&args).unwrap();
+        let config = parse_tracking_args(&args, |_| true).unwrap();
         assert!(config.enable);
         assert_eq!(config.redirect, Some(42));
     }
@@ -316,14 +317,14 @@ mod tests {
     #[test]
     fn test_parse_tracking_redirect_invalid_int() {
         let args = vec![bs(b"TRACKING"), bs(b"ON"), bs(b"REDIRECT"), bs(b"abc")];
-        let result = parse_tracking_args(&args);
+        let result = parse_tracking_args(&args, |_| true);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_tracking_too_few_args() {
         let args = vec![bs(b"TRACKING")];
-        let result = parse_tracking_args(&args);
+        let result = parse_tracking_args(&args, |_| true);
         assert!(result.is_err());
     }
 
@@ -339,10 +340,78 @@ mod tests {
             bs(b"PREFIX"),
             bs(b"session:"),
         ];
-        let config = parse_tracking_args(&args).unwrap();
+        let config = parse_tracking_args(&args, |_| true).unwrap();
         assert!(config.enable);
         assert!(config.bcast);
         assert!(config.noloop);
         assert_eq!(config.prefixes.len(), 2);
+    }
+
+    fn parse_err(parts: &[&[u8]], exists: fn(u64) -> bool) -> String {
+        let args: Vec<Frame> = parts.iter().map(|p| bs(p)).collect();
+        match parse_tracking_args(&args, exists) {
+            Ok(_) => panic!("expected an error for {parts:?}"),
+            Err(f) => err_text(&f),
+        }
+    }
+
+    /// Error precedence measured on redis-server 8.6.1 (moon#1048): options
+    /// are parsed before ON|OFF, REDIRECT's target is checked where it is
+    /// parsed, and PREFIX-needs-BCAST comes last.
+    #[test]
+    fn tracking_parse_errors_follow_redis_order() {
+        let missing = "ERR The client ID you want redirect to does not exist";
+        let exists_42: fn(u64) -> bool = |id| id == 42;
+        assert_eq!(
+            parse_err(&[b"TRACKING", b"ON", b"REDIRECT", b"7"], exists_42),
+            missing
+        );
+        assert_eq!(
+            parse_err(&[b"TRACKING", b"ON", b"REDIRECT", b"0"], |_| true),
+            missing
+        );
+        assert_eq!(
+            parse_err(&[b"TRACKING", b"ON", b"REDIRECT", b"-1"], |_| true),
+            missing
+        );
+        assert_eq!(
+            parse_err(
+                &[b"TRACKING", b"ON", b"REDIRECT", b"7", b"PREFIX", b"x"],
+                exists_42
+            ),
+            missing,
+            "the missing client is reported before the missing BCAST"
+        );
+        assert_eq!(
+            parse_err(&[b"TRACKING", b"MAYBE", b"REDIRECT", b"7"], exists_42),
+            missing,
+            "options are parsed before ON|OFF"
+        );
+        assert_eq!(
+            parse_err(
+                &[b"TRACKING", b"ON", b"REDIRECT", b"42", b"REDIRECT", b"42"],
+                exists_42
+            ),
+            "ERR A client can only redirect to a single other client"
+        );
+        assert_eq!(
+            parse_err(&[b"TRACKING", b"ON", b"FOO"], |_| true),
+            "ERR syntax error"
+        );
+        assert_eq!(
+            parse_err(&[b"TRACKING", b"ON", b"REDIRECT"], |_| true),
+            "ERR syntax error"
+        );
+        assert_eq!(
+            parse_err(&[b"TRACKING", b"ON", b"PREFIX"], |_| true),
+            "ERR syntax error"
+        );
+        // OFF with a PREFIX but no BCAST is accepted: redis checks that rule
+        // for ON only.
+        let off: Vec<Frame> = [b"TRACKING".as_ref(), b"OFF", b"PREFIX", b"x"]
+            .iter()
+            .map(|p| bs(p))
+            .collect();
+        assert!(parse_tracking_args(&off, |_| true).is_ok());
     }
 }
