@@ -440,7 +440,6 @@ pub(crate) async fn handle_blocking_command<S>(
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    use futures::stream::FuturesUnordered;
     use tokio::io::AsyncReadExt;
 
     // Parse timeout (last argument for all blocking commands)
@@ -485,9 +484,6 @@ where
                     wait_id,
                     cmd: blocked_cmd_factory(),
                     reply_tx,
-                    // The single-key fast path: this key IS the command, so
-                    // the owner may answer a type error for it (moon#556).
-                    sole_key: true,
                 },
             ));
             if !push_block_msg(shutdown, dispatch_tx, shard_id, target, msg, None).await {
@@ -602,56 +598,28 @@ where
     }
 
     // --- Multi-key coordinator: register on ALL keys across local + remote shards ---
-    // Uses FuturesUnordered for first-wakeup-wins semantics.
-    let wait_id;
-    let mut receivers: FuturesUnordered<channel::OneshotReceiver<Option<Frame>>> =
-        FuturesUnordered::new();
-    let mut registered_remote_shards: Vec<usize> = Vec::new();
-
-    // A4/A5: build every registration under one borrow, but STAGE the remote
-    // ones and push them only after the borrow is released — the old code
-    // pushed while holding both borrows, which forced the bare `try_push`
-    // (no await possible, so no backpressure retry and no shutdown arm).
-    let mut pending_remote: Vec<(usize, ShardMessage)> = Vec::new();
-    {
-        let mut reg = blocking_registry.borrow_mut();
-        wait_id = reg.next_wait_id();
-
-        for key in &keys {
-            let target = key_to_shard(key, num_shards);
-            let (tx, rx) = channel::oneshot::<Option<Frame>>();
-            receivers.push(rx);
-
-            if target == shard_id {
-                // Local registration
-                let entry = crate::blocking::WaitEntry {
-                    wait_id,
-                    cmd: local_blocked_cmd(&blocked_cmd_factory, selected_db, key),
-                    reply_tx: tx,
-                    deadline,
-                };
-                reg.register(selected_db, key.clone(), entry);
-            } else {
-                // Remote registration via SPSC
-                let msg = ShardMessage::BlockRegister(Box::new(
-                    crate::shard::dispatch::BlockRegisterPayload {
-                        db_index: selected_db,
-                        key: key.clone(),
-                        wait_id,
-                        cmd: blocked_cmd_factory(),
-                        reply_tx: tx,
-                        // One of several keys — see `sole_key`'s docs for why
-                        // the owner must NOT decide the whole command here.
-                        sole_key: false,
-                    },
-                ));
-                pending_remote.push((target, msg));
-                if !registered_remote_shards.contains(&target) {
-                    registered_remote_shards.push(target);
-                }
-            }
-        }
-    } // borrows dropped -- CRITICAL before await
+    // Uses FuturesUnordered for first-wakeup-wins semantics. moon#989: remote
+    // keys travel as ONE group per owner shard — the owner serves this waiter
+    // at most once only because it sees all of its keys in one message. See
+    // `blocking_multikey` for the protocol and what it does not cover.
+    //
+    // A4/A5: every registration is built under one borrow and the remote ones
+    // are STAGED, pushed only after the borrow is released.
+    let super::blocking_multikey::StagedWait {
+        wait_id,
+        mut receivers,
+        pending_remote,
+        remote_shards: registered_remote_shards,
+    } = super::blocking_multikey::stage_multikey_wait(
+        &mut blocking_registry.borrow_mut(),
+        &keys,
+        &|key| local_blocked_cmd(&blocked_cmd_factory, selected_db, key),
+        &*blocked_cmd_factory,
+        selected_db,
+        shard_id,
+        num_shards,
+        deadline,
+    ); // borrow dropped -- CRITICAL before await
 
     // A5: a silently dropped registration leaves this waiter blocked on a key
     // nobody is watching — it would sleep through data that IS available.
@@ -793,8 +761,6 @@ pub(crate) async fn handle_blocking_command_monoio<S>(
 where
     S: super::handler_monoio::idle_park::IdleParkRead,
 {
-    use futures::stream::FuturesUnordered;
-
     // Parse timeout (last argument for all blocking commands)
     let timeout_secs = match parse_blocking_timeout(cmd, args) {
         Ok(t) => t,
@@ -841,9 +807,6 @@ where
                     wait_id,
                     cmd: blocked_cmd_factory(),
                     reply_tx,
-                    // The single-key fast path: this key IS the command, so
-                    // the owner may answer a type error for it (moon#556).
-                    sole_key: true,
                 },
             ));
             if !push_block_msg(
@@ -943,54 +906,28 @@ where
     }
 
     // --- Multi-key coordinator: register on ALL keys across local + remote shards ---
-    // Uses FuturesUnordered for first-wakeup-wins semantics.
-    let wait_id;
-    let mut receivers: FuturesUnordered<channel::OneshotReceiver<Option<Frame>>> =
-        FuturesUnordered::new();
-    let mut registered_remote_shards: Vec<usize> = Vec::new();
-
-    // A4/A5: stage remote registrations, push them after the borrow is
-    // released. See the tokio twin for the full rationale.
-    let mut pending_remote: Vec<(usize, ShardMessage)> = Vec::new();
-    {
-        let mut reg = blocking_registry.borrow_mut();
-        wait_id = reg.next_wait_id();
-
-        for key in &keys {
-            let target = key_to_shard(key, num_shards);
-            let (tx, rx) = channel::oneshot::<Option<Frame>>();
-            receivers.push(rx);
-
-            if target == shard_id {
-                // Local registration
-                let entry = crate::blocking::WaitEntry {
-                    wait_id,
-                    cmd: local_blocked_cmd(&blocked_cmd_factory, selected_db, key),
-                    reply_tx: tx,
-                    deadline,
-                };
-                reg.register(selected_db, key.clone(), entry);
-            } else {
-                // Remote registration via SPSC
-                let msg = ShardMessage::BlockRegister(Box::new(
-                    crate::shard::dispatch::BlockRegisterPayload {
-                        db_index: selected_db,
-                        key: key.clone(),
-                        wait_id,
-                        cmd: blocked_cmd_factory(),
-                        reply_tx: tx,
-                        // One of several keys — see `sole_key`'s docs for why
-                        // the owner must NOT decide the whole command here.
-                        sole_key: false,
-                    },
-                ));
-                pending_remote.push((target, msg));
-                if !registered_remote_shards.contains(&target) {
-                    registered_remote_shards.push(target);
-                }
-            }
-        }
-    } // borrows dropped -- CRITICAL before await
+    // Uses FuturesUnordered for first-wakeup-wins semantics. moon#989: remote
+    // keys travel as ONE group per owner shard — the owner serves this waiter
+    // at most once only because it sees all of its keys in one message. See
+    // `blocking_multikey` for the protocol and what it does not cover.
+    //
+    // A4/A5: every registration is built under one borrow and the remote ones
+    // are STAGED, pushed only after the borrow is released.
+    let super::blocking_multikey::StagedWait {
+        wait_id,
+        mut receivers,
+        pending_remote,
+        remote_shards: registered_remote_shards,
+    } = super::blocking_multikey::stage_multikey_wait(
+        &mut blocking_registry.borrow_mut(),
+        &keys,
+        &|key| local_blocked_cmd(&blocked_cmd_factory, selected_db, key),
+        &*blocked_cmd_factory,
+        selected_db,
+        shard_id,
+        num_shards,
+        deadline,
+    ); // borrow dropped -- CRITICAL before await
 
     let mut registration_failed = false;
     for (target, msg) in pending_remote {
@@ -2053,6 +1990,23 @@ pub(crate) fn immediate_scan(
     if let Some(err) = move_endpoints(cmd, args).and_then(|(src, dst)| {
         crate::command::list::cross_shard_move_refusal(&src, &dst, num_shards)
     }) {
+        return Some(err);
+    }
+    // moon#989: a `BLMPOP`/`BZMPOP` whose keys span shards is refused here,
+    // before anything is popped or registered — the rule moon#962 applies to
+    // their non-blocking twins. "Pop from the FIRST non-empty key in argument
+    // order, exactly once" is a property of the whole key vector, and no shard
+    // can see the whole vector: this scan skips the keys it does not own (and
+    // so served a LATER local key over an earlier remote one), and two owners
+    // could each serve the same waiter. Refusing is decided from the key names
+    // alone, so it cannot lose an element. Co-located keys (`{hash}` tags) are
+    // unaffected and answer exactly as at `--shards 1`.
+    //
+    // The family list lives in `cross_shard_multikey_rejection`, the same
+    // guard the non-blocking dispatch path and scripts consult; of the
+    // blocking commands only these two are in it (a blocking stream read
+    // names one stream, and one key cannot span shards).
+    if let Some(err) = super::shared::cross_shard_multikey_rejection(cmd, args, num_shards) {
         return Some(err);
     }
     // moon#595: a stream read is answered by running the reader itself, not by

@@ -31,6 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WEIGHTS nan` used to be accepted and poison every aggregated score; it is now
   `ERR weight value is not a float`. Infinite weights remain legal. A client
   relying on either form silently doing nothing will now see an error.
+- **BEHAVIOUR CHANGE — `BLMPOP`/`BZMPOP` whose keys span shards are refused with
+  `CROSSSLOT`** at `--shards > 1` (moon#989), the rule moon#962 already applies
+  to `LMPOP`/`ZMPOP`. They used to answer, and measured at `--shards 4` over 16
+  three-shard placements, 20 of 32 probes popped a key the reply did not name:
+  either the WRONG key (a later local key served over an earlier remote one) or
+  a second key whose element no client ever received. "Pop from the first
+  non-empty key in argument order, exactly once" is a property of the whole key
+  vector that no single shard can see. The refusal is decided from the key
+  names before anything is touched, so the keyspace is unchanged. Keys under
+  one `{hash}` tag, and every placement at `--shards 1`, are unaffected.
 
 ### Fixed
 
@@ -90,6 +100,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   family is deferred by the #438 early-flush guard one statement above this
   predicate in both handlers whenever remote work is pending, and the derived
   predicate now says wait for them regardless.
+
+- **Multi-key blocking pops no longer destroy an element from a key they did
+  not answer with** (moon#989). `BLMPOP`, `BZMPOP`, `BLPOP`, `BRPOP`,
+  `BZPOPMIN` and `BZPOPMAX` over keys co-located under one `{hash}` tag replied
+  correctly while a SECOND non-empty key silently lost its head element:
+  `BLMPOP 0.3 3 {t}a {t}b {t}c LEFT` answered `{t}b B1` and left `{t}c` at
+  `[C2]`, with `C1` delivered to nobody. It happened whenever the client's
+  connection lived on a different shard than the keys: the client's shard
+  could not see them, so it sent one registration per key to their owner, and
+  the owner served the same waiter once per non-empty key — the client kept
+  the first reply and dropped the rest. The same fan-out popped a key named
+  twice (`BLMPOP 0 2 k k LEFT`) twice, and skipped Redis's `-WRONGTYPE` for an
+  earlier key of the wrong type. Measured at `--shards 4` (`BLMPOP`, `BZMPOP`,
+  `BLPOP`, `BZPOPMIN` × 16 tags × 3 server instances, against redis 8.6.1): 139
+  of 192 probes destroyed an element before, 0 after; `--shards 1` was and is 0. The client now sends ONE registration per owner shard carrying
+  every key it owns, and the owner registers, type-checks and serves them in
+  one synchronous stretch, so a waiter is served at most once there. A
+  spanning `BLPOP`/`BRPOP`/`BZPOPMIN`/`BZPOPMAX` can still be served by two
+  owner shards at once; that placement is unchanged by this fix and is
+  tracked as moon#1019.
+
 - **Commands routed to another shard are counted and timed** (moon#982).
   At `--shards > 1` a command whose key lives on a shard other than the
   connection's went through no telemetry probe at all — neither the
