@@ -3565,7 +3565,7 @@ pub(crate) fn try_handle_reset(
     if proto != conn.protocol_version {
         note_protocol_switch(conn, responses.len(), proto);
     }
-    conn.protocol_version = proto;
+    conn.set_protocol_version(proto);
     conn.selected_db = db;
     conn.authenticated = authed;
     conn.current_user = user;
