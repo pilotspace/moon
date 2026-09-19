@@ -412,6 +412,36 @@ impl RecoveryState {
         }
     }
 
+    /// Count `key` as present, without reconciling it, in every recovered
+    /// vector index and loaded text index that covers it.
+    ///
+    /// For a key the rescan knows exists but whose payload it could not read
+    /// (an unreadable cold-tier entry: `EXISTS` answers 1, a read answers
+    /// `-IOERR`, and a later read may succeed). Its recovered documents stay
+    /// as they were; the deletion probe in [`Self::finish`] must not take a
+    /// read fault for a delete.
+    pub fn observe_unreadable(
+        &mut self,
+        vector_store: &VectorStore,
+        text_store: &TextStore,
+        key: &[u8],
+        db_index: u8,
+    ) {
+        let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
+        for idx_name in vector_store.find_matching_index_names_for_db(key, db_index) {
+            if self.recovered_names.contains(&idx_name) {
+                self.observed_key_hashes
+                    .entry(idx_name)
+                    .or_default()
+                    .insert(key_hash);
+            }
+        }
+        #[cfg(feature = "text-index")]
+        self.text.observe(text_store, key, db_index);
+        #[cfg(not(feature = "text-index"))]
+        let _ = text_store;
+    }
+
     /// Phase 3: deletion probe + orphan sweep + acceptance-signal log
     /// lines. Call exactly once, after the full keyspace scan.
     pub fn finish(self, vector_store: &mut VectorStore, idx_persist_root: &Path) {
