@@ -1003,6 +1003,17 @@ if should_run "sorted_set"; then
     assert_match "ZADD GT INCR refused"     ZADD z:959:i GT INCR -1 a
     assert_match "ZADD LT INCR"             ZADD z:959:i LT INCR -1 a
     assert_match "ZADD INCR two pairs"      ZADD z:959:i INCR 1 a 2 b
+
+    # moon#1060 -- ZRANGEBYSCORE and ZRANGE ... BYSCORE/BYLEX looked the key
+    # up BEFORE validating the min/max grammar, so a bad bound against a
+    # MISSING key answered `[]` where redis parses the grammar
+    # unconditionally and answers a parse error. ZREVRANGEBYSCORE had the
+    # identical defect (same file, same sweep) and is fixed alongside it.
+    assert_match "ZRANGEBYSCORE bad bound missing key"    ZRANGEBYSCORE z:1060:nokey a b
+    assert_match "ZREVRANGEBYSCORE bad bound missing key" ZREVRANGEBYSCORE z:1060:nokey a b
+    assert_match "ZRANGE BYSCORE bad bound missing key"   ZRANGE z:1060:nokey a b BYSCORE
+    assert_match "ZRANGE BYLEX bad bound missing key"     ZRANGE z:1060:nokey a b BYLEX
+    assert_match "ZRANGE BYSCORE valid bound missing key" ZRANGEBYSCORE z:1060:nokey 0 10
 fi
 
 # ===========================================================================
@@ -1289,6 +1300,14 @@ if should_run "connection"; then
     assert_match "PING"                PING
     assert_match "PING message"        PING hello
     assert_match "ECHO"                ECHO "hello world"
+    # moon#1077 -- the unknown-command error always appended
+    # `, with args beginning with: ` and never listed the arguments. Redis
+    # appends the clause only when there is at least one argument, then
+    # lists each one quoted and space-separated (no commas between them).
+    assert_match "unknown command, zero args"    NOSUCHCMD1077
+    assert_match "unknown command, two args"     NOSUCHCMD1077 a b
+    assert_match "unknown command, client casing" NoSuchCmd1077 a b
+    assert_match "unknown command, lower-case"   nosuchcmd1077
     assert_moon_ok "SELECT 0"          SELECT 0
     assert_moon_ok "SELECT 1"          SELECT 1
     assert_moon_contains "INFO server" "redis_version" INFO server
@@ -1753,6 +1772,51 @@ if should_run "transaction"; then
     else
         FAIL=$((FAIL + 1))
         echo "  FAIL: TXN-SUB-03 a valid container subcommand blocked the transaction"
+    fi
+
+    # --- A KNOWN container subcommand with the wrong arity aborts (moon#1076) --
+    #
+    # `queue_time_rejection` checked the container's OWN (variadic) arity and,
+    # since moon#670, whether the subcommand was known — but never the
+    # subcommand's own arity. `CLIENT CACHING` (arity 3) with no argument used
+    # to reply `+QUEUED` and let the rest of the block run. Same discriminating
+    # shape as TXN-SUB-01: the verdict is the KEY, not EXEC's reply text.
+    TOTAL=$((TOTAL + 1))
+    mcli DEL tx:arity1076 > /dev/null 2>&1
+    tx_arity=$(printf 'MULTI\nCLIENT CACHING\nSET tx:arity1076 ran\nEXEC\n' | redis-cli -p "$PORT_RUST" 2>/dev/null || true)
+    tx_arity_key=$(mcli GET tx:arity1076 2>/dev/null || true)
+    if [ -n "$tx_arity_key" ]; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TXN-ARITY-01 the transaction RAN despite a wrong-arity subcommand (tx:arity1076=$tx_arity_key)"
+    elif echo "$tx_arity" | qgrep -q "EXECABORT"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TXN-ARITY-01 expected EXECABORT, got: $(echo "$tx_arity" | tr '\n' ' ')"
+    fi
+
+    # The queue-time refusal carries the ordinary arity shape, normalised to
+    # `container|sub` lower-case — the SAME builder the live dispatch path
+    # uses (moon#491), not moon#670's "unknown subcommand" shape.
+    TOTAL=$((TOTAL + 1))
+    tx_arity_msg=$(mcli CLIENT CACHING 2>&1 || true)
+    if echo "$tx_arity_msg" | qgrep -q "wrong number of arguments for 'client|caching' command"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TXN-ARITY-02 wrong arity-error shape: $tx_arity_msg"
+    fi
+
+    # Discriminator for the widening direction: the SAME subcommand with
+    # CORRECT arity still queues and the transaction still runs.
+    TOTAL=$((TOTAL + 1))
+    mcli DEL tx:arity1076ok > /dev/null 2>&1
+    printf 'MULTI\nCLIENT CACHING YES\nSET tx:arity1076ok ran\nEXEC\n' | redis-cli -p "$PORT_RUST" > /dev/null 2>&1 || true
+    if [ "$(mcli GET tx:arity1076ok 2>/dev/null || true)" = "ran" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TXN-ARITY-03 a correct-arity subcommand blocked the transaction"
     fi
 
     # --- FUNCTION inside MULTI (moon#697) ---------------------------------

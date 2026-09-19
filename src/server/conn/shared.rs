@@ -3096,21 +3096,10 @@ pub(crate) fn queue_time_rejection(cmd: &[u8], args: &[Frame]) -> Option<Frame> 
         if cmd.contains(&b'.') {
             return None;
         }
-        // Redis's format: the name quoted, then the args it did get. A driver
-        // author reading this sees their typo; a generic "unknown command"
-        // sends them looking at Moon.
-        let mut detail = String::new();
-        for a in args.iter().take(20) {
-            if let Frame::BulkString(b) | Frame::SimpleString(b) = a {
-                detail.push('\'');
-                detail.push_str(&String::from_utf8_lossy(b));
-                detail.push_str("', ");
-            }
-        }
-        return Some(Frame::Error(Bytes::from(format!(
-            "ERR unknown command '{}', with args beginning with: {detail}",
-            String::from_utf8_lossy(cmd)
-        ))));
+        // moon#1077: shared with `command::dispatch` and `command::dispatch_read`
+        // so this and the two live paths can never answer with a different
+        // shape — see `err_unknown_command` for the exact grammar.
+        return Some(crate::command::helpers::err_unknown_command(cmd, args));
     };
 
     // `arity` counts the command name itself, so compare against args + 1.
@@ -3153,11 +3142,50 @@ pub(crate) fn queue_time_rejection(cmd: &[u8], args: &[Frame]) -> Option<Frame> 
             Frame::BulkString(b) | Frame::SimpleString(b) => Some(b.as_ref()),
             _ => None,
         })
-        && !crate::command::metadata::is_known_subcommand(container.as_bytes(), sub)
     {
-        return Some(crate::command::helpers::err_unknown_subcommand(
-            container, sub,
-        ));
+        if !crate::command::metadata::is_known_subcommand(container.as_bytes(), sub) {
+            return Some(crate::command::helpers::err_unknown_subcommand(
+                container, sub,
+            ));
+        }
+
+        // moon#1076: a KNOWN subcommand with the wrong number of arguments was
+        // still queued — only the container's own (variadic, `-2`-shaped)
+        // arity had been checked above, never the subcommand's. Redis rejects
+        // `CLIENT CACHING` (arity 3, needs `YES`/`NO`) at queue time and
+        // poisons the block the same way it does an unknown subcommand:
+        //
+        // ```text
+        // MULTI / CLIENT CACHING / SET k v / EXEC
+        //   redis -> -ERR wrong number of arguments for 'client|caching' command ... EXECABORT
+        //   moon  -> +QUEUED ... *2 (the SET ran)
+        // ```
+        //
+        // `lookup_subcommand` (not `is_known_subcommand`, which also accepts
+        // `RECOGNISED_UNPUBLISHED` names) is the source of the arity: a
+        // recognised-but-unpublished subcommand such as `FUNCTION DUMP` has no
+        // `SubcommandMeta` and therefore nothing to check here, matching
+        // dispatch, which never checks its arity either.
+        //
+        // The word count is the SAME `given` computed above for the container
+        // itself: `SubcommandMeta::arity` "counts the CONTAINER name too", and
+        // `args` here is everything after the container (sub + its own args),
+        // so `args.len() + 1` already equals container + sub + rest.
+        if let Some(sub_meta) =
+            crate::command::metadata::lookup_subcommand(container.as_bytes(), sub)
+        {
+            let sub_bad_arity = if sub_meta.arity >= 0 {
+                given != sub_meta.arity
+            } else {
+                given < -sub_meta.arity
+            };
+            if sub_bad_arity {
+                return Some(crate::command::helpers::err_wrong_args(&format!(
+                    "{container} {}",
+                    sub_meta.name
+                )));
+            }
+        }
     }
     None
 }
@@ -3194,6 +3222,104 @@ fn gated_container(cmd: &[u8]) -> Option<&'static str> {
         .iter()
         .find(|c| c.as_bytes().eq_ignore_ascii_case(cmd))
         .copied()
+}
+
+/// moon#1076 — a KNOWN container subcommand with the wrong number of
+/// arguments used to be queued instead of aborting the transaction at queue
+/// time. Measured against redis-server 8.6.1, raw socket: every row here
+/// answers `-ERR wrong number of arguments for '<container>|<sub>' command`
+/// at `MULTI` queue time, poisoning the block the same way an unknown
+/// subcommand (moon#670) does.
+#[cfg(test)]
+mod subcommand_arity_1076_tests {
+    use super::queue_time_rejection;
+    use crate::protocol::Frame;
+    use bytes::Bytes;
+
+    fn argv(parts: &[&'static str]) -> Vec<Frame> {
+        parts
+            .iter()
+            .map(|p| Frame::BulkString(Bytes::from_static(p.as_bytes())))
+            .collect()
+    }
+
+    fn err_text(frame: &Frame) -> String {
+        match frame {
+            Frame::Error(e) => String::from_utf8_lossy(e).into_owned(),
+            other => panic!("expected an error reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_known_subcommand_with_too_few_arguments_aborts_at_queue_time() {
+        for (container, args, want) in [
+            (
+                "CLIENT",
+                &["CACHING"][..],
+                "ERR wrong number of arguments for 'client|caching' command",
+            ),
+            (
+                "CLIENT",
+                &["SETNAME"][..],
+                "ERR wrong number of arguments for 'client|setname' command",
+            ),
+            (
+                "CONFIG",
+                &["GET"][..],
+                "ERR wrong number of arguments for 'config|get' command",
+            ),
+            (
+                "CONFIG",
+                &["SET", "maxmemory"][..],
+                "ERR wrong number of arguments for 'config|set' command",
+            ),
+        ] {
+            let rejected = queue_time_rejection(container.as_bytes(), &argv(args))
+                .unwrap_or_else(|| panic!("{container} {args:?} was queued, not rejected"));
+            assert_eq!(err_text(&rejected), want, "{container} {args:?}");
+        }
+    }
+
+    /// Negative control: the SAME subcommands with enough arguments are
+    /// accepted (queue_time_rejection returns `None`, meaning "queue it").
+    #[test]
+    fn a_known_subcommand_with_correct_arity_is_not_rejected() {
+        for (container, args) in [
+            ("CLIENT", &["CACHING", "YES"][..]),
+            ("CLIENT", &["SETNAME", "conn1"][..]),
+            ("CLIENT", &["GETNAME"][..]),
+            ("CONFIG", &["GET", "maxmemory"][..]),
+            ("CONFIG", &["SET", "maxmemory", "100mb"][..]),
+        ] {
+            assert!(
+                queue_time_rejection(container.as_bytes(), &argv(args)).is_none(),
+                "{container} {args:?} was rejected, but arity is correct"
+            );
+        }
+    }
+
+    /// `FUNCTION DUMP` is dispatchable (moon#697) but deliberately absent from
+    /// `SUBCOMMAND_META` (moon#670's `RECOGNISED_UNPUBLISHED`) — it has no
+    /// arity to check here, matching dispatch, which never checks it either.
+    /// This is the negative control for "known but unpublished must not
+    /// panic or false-positive an arity error".
+    #[test]
+    fn a_recognised_unpublished_subcommand_has_no_arity_check() {
+        assert!(queue_time_rejection(b"FUNCTION", &argv(&["DUMP"])).is_none());
+    }
+
+    /// Still unchanged: an outright unknown subcommand is refused with
+    /// moon#670's shape, not the arity shape.
+    #[test]
+    fn an_unknown_subcommand_is_still_unknown_not_an_arity_error() {
+        let rejected = queue_time_rejection(b"CLIENT", &argv(&["BOGUS"]))
+            .expect("CLIENT BOGUS must be rejected at queue time");
+        let text = err_text(&rejected);
+        assert!(
+            text.starts_with("ERR unknown subcommand 'BOGUS'"),
+            "got {text:?}"
+        );
+    }
 }
 
 /// Finish a flush a script issued — moon#685.
