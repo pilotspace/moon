@@ -1015,6 +1015,9 @@ fn dispatch_inner(
             if cmd.eq_ignore_ascii_case(b"ZINTERCARD") {
                 return resp(sorted_set::zintercard(db, args));
             }
+            if cmd.eq_ignore_ascii_case(b"ZDIFFSTORE") {
+                return resp(sorted_set::zdiffstore(db, args));
+            }
         }
         // 11-letter commands
         (11, b'p') => {
@@ -1061,6 +1064,9 @@ fn dispatch_inner(
             if cmd.eq_ignore_ascii_case(b"ZRANDMEMBER") {
                 return resp(sorted_set::zrandmember(db, args));
             }
+            if cmd.eq_ignore_ascii_case(b"ZRANGEBYLEX") {
+                return resp(sorted_set::zrangebylex(db, args));
+            }
         }
         // 11-letter commands (hash)
         (11, b'h') => {
@@ -1093,6 +1099,15 @@ fn dispatch_inner(
             }
         }
         // 14-letter commands
+        (14, b'z') => {
+            // ZREVRANGEBYLEX ZREMRANGEBYLEX
+            if cmd.eq_ignore_ascii_case(b"ZREVRANGEBYLEX") {
+                return resp(sorted_set::zrevrangebylex(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"ZREMRANGEBYLEX") {
+                return resp(sorted_set::zremrangebylex(db, args));
+            }
+        }
         (14, b'g') => {
             // GEOSEARCHSTORE
             if cmd.eq_ignore_ascii_case(b"GEOSEARCHSTORE") {
@@ -1104,6 +1119,16 @@ fn dispatch_inner(
             // ZREVRANGEBYSCORE
             if cmd.eq_ignore_ascii_case(b"ZREVRANGEBYSCORE") {
                 return resp(sorted_set::zrevrangebyscore(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"ZREMRANGEBYSCORE") {
+                return resp(sorted_set::zremrangebyscore(db, args));
+            }
+        }
+        // 15-letter commands
+        (15, b'z') => {
+            // ZREMRANGEBYRANK
+            if cmd.eq_ignore_ascii_case(b"ZREMRANGEBYRANK") {
+                return resp(sorted_set::zremrangebyrank(db, args));
             }
         }
         // 17-letter commands
@@ -1227,6 +1252,7 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         | (12, b'h') // HPEXPIRETIME
         | (12, b'g') // GEORADIUS_RO
         | (13, b'z') // ZRANGEBYSCORE
+        | (14, b'z') // ZREVRANGEBYLEX
         | (16, b'z') // ZREVRANGEBYSCORE
         | (20, b'g') // GEORADIUSBYMEMBER_RO
     )
@@ -1634,6 +1660,12 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
                 return resp(sorted_set::zrevrangebyscore_readonly(db, args, now_ms));
             }
         }
+        (14, b'z') => {
+            // ZREVRANGEBYLEX
+            if cmd.eq_ignore_ascii_case(b"ZREVRANGEBYLEX") {
+                return resp(sorted_set::zrevrangebylex_readonly(db, args, now_ms));
+            }
+        }
         // ---- new arms (contract v2): buckets that don't conflict with pre-existing ones ----
         (3, b'l') => {
             // LCS
@@ -1746,6 +1778,9 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             // ZRANDMEMBER (11 bytes)
             if cmd.eq_ignore_ascii_case(b"ZRANDMEMBER") {
                 return resp(sorted_set::zrandmember_readonly(db, args, now_ms));
+            }
+            if cmd.eq_ignore_ascii_case(b"ZRANGEBYLEX") {
+                return resp(sorted_set::zrangebylex_readonly(db, args, now_ms));
             }
         }
         (11, b'b') => {
@@ -2401,6 +2436,8 @@ mod tests {
             b"ZLEXCOUNT",
             b"ZRANGEBYSCORE",
             b"ZREVRANGEBYSCORE",
+            b"ZRANGEBYLEX",
+            b"ZREVRANGEBYLEX",
             b"LLEN",
             b"LRANGE",
             b"LINDEX",

@@ -83,7 +83,7 @@ pub(super) fn spsc_eviction_gate(
                 .budget(budget)
                 .report(on_plain_drop),
         );
-        spill_file_id.set(fid);
+        spill_file_id.set(spill_file_id.get().max(fid));
         res
     } else {
         evict_to_budget(
@@ -2319,7 +2319,6 @@ pub(crate) fn handle_shard_message_shared(
                 wait_id,
                 cmd,
                 reply_tx,
-                sole_key,
             } = *payload;
             // moon#556: THIS shard owns the key, so it is the only one that
             // can answer the type question for it. A blocking pop on an
@@ -2329,38 +2328,33 @@ pub(crate) fn handle_shard_message_shared(
             // remote case keeps the old behaviour (the waker finds nothing to
             // pop and answers a null the client reads as "empty").
             //
-            // Gated on `sole_key`: for a multi-key waiter the sibling keys are
-            // registered on other shards and may be serving right now, and an
-            // error raised here would race a real wake-up whose element has
-            // already left the keyspace. Those keep the pre-#556 behaviour.
+            // Unconditional since moon#989: this message now carries only a
+            // single-key waiter (the key IS the command). Multi-key waiters
+            // register through `BlockRegisterGroup`, which makes the same
+            // decision only when it holds every key of the command.
             let mut cmd = cmd;
-            let type_error = if sole_key {
-                crate::shard::slice::with_shard_db(db_index, |guard| {
-                    match cmd.family() {
-                        // moon#832: a type probe before parking a waiter must
-                        // not rewrite the value it is probing — `get_list`
-                        // (via `get_promoted`) flattened the list's compact
-                        // encoding on every remote blocking registration.
-                        crate::blocking::WaitFamily::List => {
-                            let now_ms = guard.now_ms();
-                            guard.get_list_ref_if_alive(&key, now_ms).err()
-                        }
-                        crate::blocking::WaitFamily::ZSet => guard.get_sorted_set(&key).err(),
-                        // moon#595: `-WRONGTYPE` for a stream read on the
-                        // wrong type, plus XREADGROUP's missing-key and
-                        // missing-group errors. The client's own scan cannot
-                        // see a key it does not own, so — exactly as moon#556
-                        // argued for the pops — the check has to happen here
-                        // too or the remote case parks on a key that can never
-                        // serve it.
-                        crate::blocking::WaitFamily::Stream => {
-                            crate::blocking::wakeup::stream_register_error(guard, &key, &cmd)
-                        }
+            let type_error = crate::shard::slice::with_shard_db(db_index, |guard| {
+                match cmd.family() {
+                    // moon#832: a type probe before parking a waiter must not
+                    // rewrite the value it is probing — `get_list` (via
+                    // `get_promoted`) flattened the list's compact encoding
+                    // on every remote blocking registration.
+                    crate::blocking::WaitFamily::List => {
+                        let now_ms = guard.now_ms();
+                        guard.get_list_ref_if_alive(&key, now_ms).err()
                     }
-                })
-            } else {
-                None
-            };
+                    crate::blocking::WaitFamily::ZSet => guard.get_sorted_set(&key).err(),
+                    // moon#595: `-WRONGTYPE` for a stream read on the wrong
+                    // type, plus XREADGROUP's missing-key and missing-group
+                    // errors. The client's own scan cannot see a key it does
+                    // not own, so — exactly as moon#556 argued for the pops —
+                    // the check has to happen here too or the remote case
+                    // parks on a key that can never serve it.
+                    crate::blocking::WaitFamily::Stream => {
+                        crate::blocking::wakeup::stream_register_error(guard, &key, &cmd)
+                    }
+                }
+            });
             if let Some(err) = type_error {
                 // Never registered, so there is nothing to unwind: the
                 // client's `BlockCancel` on the way out is a no-op.
@@ -2394,6 +2388,16 @@ pub(crate) fn handle_shard_message_shared(
                         &mut reg, guard, db_index, &key,
                     );
                 }
+            });
+        }
+        ShardMessage::BlockRegisterGroup(payload) => {
+            // moon#989: every key this shard owns of one multi-key waiter, in
+            // ONE message — so registering, type-checking and serving them is
+            // one synchronous stretch and the waiter is served at most once.
+            let db_index = payload.db_index;
+            let mut reg = blocking_registry.borrow_mut();
+            crate::shard::slice::with_shard_db(db_index, |guard| {
+                crate::blocking::group::register_group(&mut reg, guard, *payload);
             });
         }
         ShardMessage::BlockCancel { wait_id } => {
@@ -3155,6 +3159,7 @@ pub(crate) fn handle_shard_message_shared(
                 reply_tx,
                 proto,
                 watched,
+                script_acl,
             } = *payload;
             let mut exec_publishes: Vec<(usize, bytes::Bytes, bytes::Bytes)> = Vec::new();
             // c10k E2: a queued FLUSHDB/FLUSHALL clears only THIS shard's
@@ -3170,6 +3175,41 @@ pub(crate) fn handle_shard_message_shared(
             // originator.
             let mut exec_wakes: Vec<(usize, bytes::Bytes, crate::blocking::WaitFamily)> =
                 Vec::new();
+            // moon#894: a queued script runs in the body on THIS shard's VM,
+            // cache and function registry, as the ORIGINATING user. Built only
+            // when the body holds a script (`script_acl` is `Some` exactly
+            // then). A shard with no Lua runtime leaves it `None`, and the
+            // executor answers each script with an error instead of skipping
+            // it.
+            let txn_script_rt = match (script_acl.as_ref(), lua_rt) {
+                (Some(_), Some(rt)) => rt.vm().map(|vm| {
+                    let slot = crate::scripting::shard_function_registry();
+                    // Build the registry on first use, exactly as the routed
+                    // FCALL arm above does; `try_borrow_mut` for the same
+                    // no-panic-on-the-shard-thread reason.
+                    if let Ok(mut guard) = slot.try_borrow_mut()
+                        && guard.is_none()
+                    {
+                        *guard = Some(crate::scripting::FunctionRegistry::new(
+                            rt.eviction_ctx().clone(),
+                        ));
+                    }
+                    (vm, slot, rt.num_shards())
+                }),
+                _ => None,
+            };
+            let txn_scripting = match (script_acl.as_ref(), txn_script_rt.as_ref()) {
+                (Some(acl), Some((vm, slot, num_shards))) => {
+                    Some(crate::server::conn::txn_script::TxnScripting {
+                        lua: vm,
+                        script_cache,
+                        functions: slot,
+                        script_acl: acl,
+                        num_shards: *num_shards,
+                    })
+                }
+                _ => None,
+            };
             let (result, aof_entries, graph_records) =
                 crate::server::conn::shared::execute_transaction_sharded(
                     shard_databases,
@@ -3182,6 +3222,7 @@ pub(crate) fn handle_shard_message_shared(
                     &mut exec_flushes,
                     &mut exec_wakes,
                     &watched,
+                    txn_scripting.as_ref(),
                 );
             // The waiters are registered HERE, on the owning shard's registry
             // — the same one the live cross-shard write path wakes.

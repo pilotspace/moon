@@ -267,7 +267,7 @@ fn run_write_eviction_gate(
                     );
                 }),
         );
-        ctx.spill_file_id.set(fid);
+        ctx.spill_file_id.set(ctx.spill_file_id.get().max(fid));
         res
     } else {
         // task #34 (Wave A): plain-drop eviction on the generic per-command
@@ -2124,6 +2124,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 if let Some(err) = crate::server::conn::shared::queue_time_rejection(cmd, cmd_args)
                 {
                     conn.multi_dirty = true;
+                    responses.push(err);
+                    continue;
+                }
+                // moon#1035: the ACL gate above checks command and keys, never
+                // a PUBLISH channel — refuse a denied one HERE so the block
+                // aborts, instead of at EXEC after the rest of it ran.
+                if let Some(err) = crate::server::conn::shared::queued_publish_channel_deny(
+                    &ctx.acl_table,
+                    &conn.current_user,
+                    cmd,
+                    cmd_args,
+                ) {
+                    conn.flag_transaction();
                     responses.push(err);
                     continue;
                 }

@@ -1323,6 +1323,32 @@ fn migration_eligibility_gate() {
     );
 }
 
+/// moon#1035: `flag_transaction` is redis's `flagTransaction` — it poisons an
+/// OPEN transaction and is a no-op outside one. The no-op half matters as much
+/// as the other: a flag set outside MULTI would leak into the NEXT transaction
+/// and abort it for a refusal that happened before it began.
+#[test]
+fn flag_transaction_poisons_only_an_open_transaction() {
+    let mut c = crate::server::conn::core::ConnectionState::new(
+        1,
+        "127.0.0.1:1".to_string(),
+        &None,
+        0,
+        4,
+        true,
+        128,
+        None,
+    );
+    c.flag_transaction();
+    assert!(
+        !c.multi_dirty,
+        "a refusal outside MULTI must not poison a later transaction"
+    );
+    c.in_multi = true;
+    c.flag_transaction();
+    assert!(c.multi_dirty, "a refusal inside MULTI must poison it");
+}
+
 /// moon#660: a plain `SET` must NOT inline while `CLIENT PAUSE` is in force.
 ///
 /// `client_pause::check_pause` is consulted once per frame in the GENERIC loop,
