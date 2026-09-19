@@ -320,6 +320,10 @@ pub(crate) struct ConnectionState {
     // Tracking
     pub tracking_state: TrackingState,
     pub tracking_rx: Option<channel::MpscReceiver<Frame>>,
+    /// This connection's pub/sub channel, registered as a CLIENT TRACKING
+    /// REDIRECT inbox the first time it is created (moon#1048). Dropping it —
+    /// on any exit from the handler — unregisters.
+    pub tracking_inbox: Option<crate::tracking::client_cmd::InboxGuard>,
 
     // WATCH/EXEC optimistic locking. Read by all three dispatch paths — the
     // `handler_single only` note and its dead_code allow were accurate right up
@@ -413,6 +417,7 @@ impl ConnectionState {
             saw_replconf: false,
             tracking_state: TrackingState::default(),
             tracking_rx: None,
+            tracking_inbox: None,
             watched_keys: HashMap::new(),
             affinity_tracker: if num_shards > 1 && can_migrate {
                 Some(AffinityTracker::new(shard_id, num_shards))

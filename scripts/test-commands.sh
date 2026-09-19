@@ -1440,6 +1440,43 @@ if should_run "connection"; then
         FAIL=$((FAIL + 1))
         echo "  FAIL: TRACKING-EXPIRY-02 expired hash field must push invalidate (moon#1013): redis=$trk1013_h_redis moon=$trk1013_h_moon"
     fi
+
+    # moon#1049: CLIENT CACHING answered "unknown subcommand", and the other
+    # client-side-caching introspection subcommands did not exist. Every row is
+    # a fresh connection (tracking off) unless it pipes a session.
+    assert_match "moon#1049 CLIENT CACHING yes, tracking off"  CLIENT CACHING yes
+    assert_match "moon#1049 CLIENT CACHING arity"              CLIENT CACHING
+    assert_match "moon#1049 CLIENT TRACKINGINFO, tracking off" CLIENT TRACKINGINFO
+    assert_match "moon#1049 CLIENT GETREDIR, tracking off"     CLIENT GETREDIR
+    assert_match "moon#1049 TRACKING OPTIN+OPTOUT refused"     CLIENT TRACKING on OPTIN OPTOUT
+    assert_match "moon#1049 TRACKING BCAST+OPTIN refused"      CLIENT TRACKING on BCAST OPTIN
+    assert_match "moon#1049 TRACKING unknown option"           CLIENT TRACKING on FOO
+    assert_match "moon#1048 REDIRECT to a missing client"      CLIENT TRACKING on REDIRECT 987654
+    # Connection-scoped state needs ONE connection per server: redis-cli holds
+    # a single connection for commands piped on stdin.
+    trk1049_session() {
+        local port="$1"; shift
+        printf '%s\n' "$@" | redis-cli -p "$port" 2>/dev/null || true
+    }
+    for trk1049_case in \
+        "CLIENT TRACKING on OPTIN|CLIENT CACHING yes|CLIENT TRACKINGINFO" \
+        "CLIENT TRACKING on OPTIN|CLIENT CACHING no|CLIENT CACHING maybe" \
+        "CLIENT TRACKING on OPTOUT|CLIENT CACHING no|CLIENT TRACKINGINFO" \
+        "CLIENT TRACKING on OPTIN|CLIENT TRACKING on OPTOUT" \
+        "CLIENT TRACKING on BCAST PREFIX zz PREFIX aa|CLIENT TRACKING on BCAST PREFIX aab|CLIENT TRACKINGINFO"; do
+        IFS='|' read -r -a trk1049_cmds <<< "$trk1049_case"
+        trk1049_r=$(trk1049_session "$PORT_REDIS" "${trk1049_cmds[@]}")
+        trk1049_m=$(trk1049_session "$PORT_RUST" "${trk1049_cmds[@]}")
+        TOTAL=$((TOTAL + 1))
+        if [[ "$trk1049_r" == "$trk1049_m" ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: moon#1049 session [$trk1049_case]"
+            echo "    REDIS: $(echo "$trk1049_r" | tr '\n' ' ')"
+            echo "    MOON:  $(echo "$trk1049_m" | tr '\n' ' ')"
+        fi
+    done
 fi
 
 # ===========================================================================

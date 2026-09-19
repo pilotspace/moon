@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`CLIENT TRACKINGINFO` and `CLIENT GETREDIR`** (refs moon#632), matching
+  redis 8.6.1 byte for byte: flags (`on`/`off`, `bcast`, `optin`,
+  `caching-yes`, `optout`, `caching-no`, `noloop`, `broken_redirect`), the
+  redirect id (`0` for none, `-1` with tracking off) and the sorted BCAST
+  prefixes; a map with a set of flags under RESP3. Both, and `CLIENT CACHING`
+  (moon#1049), are published in `COMMAND` and `CLIENT HELP` and queue inside
+  `MULTI`.
+
 - **Six sorted-set commands that were `unknown command`, and `ZADD ... INCR`**
   (moon#959). `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZREMRANGEBYRANK`,
   `ZREMRANGEBYSCORE`, `ZREMRANGEBYLEX` and `ZDIFFSTORE` are implemented, wired
@@ -168,6 +176,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drift apart. An admin script that retried until `+OK` will now see the error.
 
 ### Fixed
+
+- **`CLIENT TRACKING ... REDIRECT <id>` now reaches its target, and
+  `CLIENT CACHING` works** (moon#1048, moon#1049). Every wire reply below was
+  read off redis-server 8.6.1 over a raw socket first.
+  - REDIRECT (the RESP2 client-side-caching pattern): a target subscribed to
+    `__redis__:invalidate` received nothing, for a write, an expiry, a BCAST
+    match or a `FLUSHALL`. It now gets `*3 message __redis__:invalidate
+    *1 <key>` (a flush sends a null payload); a RESP3 target gets the
+    `invalidate` push. `REDIRECT` to an id that does not exist (or `0`, or a
+    negative id) is refused with `-ERR The client ID you want redirect to does
+    not exist`, and when the target disconnects a RESP3 source is told
+    `tracking-redir-broken <id>` and `CLIENT TRACKINGINFO` reports
+    `broken_redirect`. Invalidations reach a target on any shard.
+  - `CLIENT CACHING yes|no` answered "unknown subcommand", so OPTIN tracked
+    every read and OPTOUT could opt out of none. It is implemented with redis's
+    errors and its one-command lifetime: the flag covers the NEXT command (or
+    the whole next transaction), survives other `CLIENT` subcommands and an
+    open `MULTI`, and is consumed by anything else — an unknown command
+    included.
+  - Reads inside `MULTI`/`EXEC` are now tracked, as redis tracks them; before
+    this only a transaction's writes invalidated.
+  - `CLIENT TRACKING` option errors now follow redis: an unknown option is
+    `syntax error`, `OPTIN` with `OPTOUT` and either with `BCAST` are refused,
+    switching OPTIN/OPTOUT or BCAST without turning tracking off first is
+    refused, a second `REDIRECT` is refused, overlapping BCAST prefixes are
+    refused, and re-enabling tracking replaces the redirect and flags instead
+    of being silently ignored.
+  - A RESP2 connection with tracking on (and no redirect) no longer has a
+    RESP3 `>` push frame written into its reply stream; redis sends it nothing.
+  - A RESP3 connection that tracks and is also subscribed now receives its
+    invalidations while idle; on the monoio runtime they waited until it
+    unsubscribed.
+  - Known gap: a RESP3 redirect target that neither subscribed nor enabled
+    tracking itself cannot be reached (redis pushes to it); giving every
+    connection a delivery channel would cost every idle connection its park.
 
 - **`SPUBLISH` queued inside `MULTI` is now delivered at `EXEC`** (moon#1043).
   The command was answered `+QUEUED`, then `EXEC` answered

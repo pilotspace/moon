@@ -881,29 +881,18 @@ pub(super) async fn try_handle_multi_exec(
                                     }
                                 }
                                 // CLIENT TRACKING: invalidate every key written by
-                                // the routed body, same as the local EXEC path
-                                // (which the early return would otherwise skip).
+                                // the routed body and register every key it read,
+                                // same as the local EXEC path (which the early
+                                // return would otherwise skip).
                                 if let Some(cmds) = tracking_cmds.as_ref() {
                                     if let Frame::Array(ref txn_results) = r.result {
-                                        for (i, cmd_frame) in cmds.iter().enumerate() {
-                                            if i >= txn_results.len()
-                                                || matches!(txn_results[i], Frame::Error(_))
-                                            {
-                                                continue;
-                                            }
-                                            if let Some((c, a)) =
-                                                crate::server::conn::util::extract_command(
-                                                    cmd_frame,
-                                                )
-                                            {
-                                                crate::tracking::invalidation::invalidate_after_write(
-                                                    &ctx.tracking_table,
-                                                    c,
-                                                    a,
-                                                    conn.client_id,
-                                                );
-                                            }
-                                        }
+                                        crate::tracking::invalidation::after_transaction(
+                                            &ctx.tracking_table,
+                                            cmds,
+                                            txn_results,
+                                            conn.client_id,
+                                            &conn.tracking_state,
+                                        );
                                     }
                                 }
                                 // Adopt the owner's deferred PUBLISH fan-out; the
@@ -1110,25 +1099,19 @@ pub(super) async fn try_handle_multi_exec(
                 )));
                 return true;
             }
-            // CLIENT TRACKING: invalidate keys written inside the txn, same as
-            // the normal write path (EXEC previously bypassed this). Self-gated
-            // on tracking_active(); must run before command_queue is cleared.
+            // CLIENT TRACKING: invalidate keys written inside the txn and
+            // register keys it read, same as the normal paths (EXEC previously
+            // bypassed both). Gated on tracking_active(); must run before
+            // command_queue is cleared.
             if crate::tracking::tracking_active() {
                 if let Frame::Array(ref txn_results) = result {
-                    for (i, cmd_frame) in conn.command_queue.iter().enumerate() {
-                        if i >= txn_results.len() || matches!(txn_results[i], Frame::Error(_)) {
-                            continue;
-                        }
-                        if let Some((c, a)) = crate::server::conn::util::extract_command(cmd_frame)
-                        {
-                            crate::tracking::invalidation::invalidate_after_write(
-                                &ctx.tracking_table,
-                                c,
-                                a,
-                                conn.client_id,
-                            );
-                        }
-                    }
+                    crate::tracking::invalidation::after_transaction(
+                        &ctx.tracking_table,
+                        &conn.command_queue,
+                        txn_results,
+                        conn.client_id,
+                        &conn.tracking_state,
+                    );
                 }
             }
             conn.command_queue.clear();

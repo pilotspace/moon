@@ -148,11 +148,11 @@ pub fn invalidate_keys(
     }
     let mut table = table.lock();
     for key in keys {
-        let senders = table.invalidate_key(key, writer_client_id);
-        if !senders.is_empty() {
-            let push = invalidation_push(std::slice::from_ref(key));
-            for tx in senders {
-                let _ = tx.try_send(push.clone());
+        let recipients = table.invalidate_key(key, writer_client_id);
+        if !recipients.is_empty() {
+            let mut msg = crate::tracking::TrackingMessage::keys(std::slice::from_ref(key));
+            for to in &recipients {
+                msg.deliver(to);
             }
         }
     }
@@ -214,13 +214,13 @@ pub fn invalidate_flush(table: &parking_lot::Mutex<crate::tracking::TrackingTabl
     if !crate::tracking::tracking_active() {
         return;
     }
-    let senders = table.lock().invalidate_all();
-    if senders.is_empty() {
+    let recipients = table.lock().invalidate_all();
+    if recipients.is_empty() {
         return;
     }
-    let push = flush_invalidation_push();
-    for tx in senders {
-        let _ = tx.try_send(push.clone());
+    let mut msg = crate::tracking::TrackingMessage::flush();
+    for to in &recipients {
+        msg.deliver(to);
     }
 }
 
@@ -243,14 +243,58 @@ pub fn track_read_keys(
     }
     let mut table = table.lock();
     for key in &keys {
-        if let Some((evicted_key, senders)) = table.track_key(client_id, key, noloop) {
+        if let Some((evicted_key, recipients)) = table.track_key(client_id, key, noloop) {
             // Cap eviction (G1): tell the evicted key's trackers to drop
             // their cached copy — silently forgetting the tracking entry
             // would leave client-side caches permanently stale.
-            let push = invalidation_push(std::slice::from_ref(&evicted_key));
-            for tx in senders {
-                let _ = tx.try_send(push.clone());
+            let mut msg =
+                crate::tracking::TrackingMessage::keys(std::slice::from_ref(&evicted_key));
+            for to in &recipients {
+                msg.deliver(to);
             }
+        }
+    }
+}
+
+/// CLIENT TRACKING bookkeeping for a committed MULTI/EXEC body, in queue
+/// order — the order it executed in.
+///
+/// Every successful write invalidates, as the EXEC paths always did. Every
+/// successful READ now also registers its keys for the executing client,
+/// under the same OPTIN/OPTOUT rule a standalone read obeys: redis tracks the
+/// reads of a transaction (measured on 8.6.1: `MULTI / GET k / EXEC` then an
+/// outside `SET k` pushes `invalidate [k]`), and moon tracked none of them.
+///
+/// The CACHING flag is not cleared between a transaction's commands, and a
+/// `CLIENT CACHING` queued INSIDE it arms the flag for the commands after it.
+/// Both are replayed here from `state` — the connection's state as of EXEC —
+/// because the queued `CLIENT` command itself only runs after the body (its
+/// slot is filled in by the connection, which owns that state).
+///
+/// `results` is the EXEC reply array, one entry per queued command. The
+/// caller gates this on `tracking_active()`.
+pub fn after_transaction(
+    table: &parking_lot::Mutex<crate::tracking::TrackingTable>,
+    queue: &[Frame],
+    results: &[Frame],
+    client_id: u64,
+    state: &crate::tracking::TrackingState,
+) {
+    let mut caching = state.caching;
+    for (cmd_frame, result) in queue.iter().zip(results) {
+        let Some((cmd, args)) = crate::server::conn::util::extract_command(cmd_frame) else {
+            continue;
+        };
+        if crate::tracking::client_cmd::caching_would_arm(state, cmd, args) {
+            caching = true;
+            continue;
+        }
+        if matches!(result, Frame::Error(_)) {
+            continue;
+        }
+        invalidate_after_write(table, cmd, args, client_id);
+        if state.enabled && !state.bcast && state.caching_permits(caching) {
+            track_read_keys(table, cmd, args, client_id, state.noloop);
         }
     }
 }
@@ -451,7 +495,7 @@ mod tests {
             t.register_prefix(10, Bytes::from_static(b"bc:"), false);
             // Client 11 tracks the key but redirects to client 12.
             t.register_client(12, target_tx);
-            t.set_redirect(11, 12);
+            t.set_redirect(11, Some(12));
             let _ = t.track_key(11, &key, false);
         }
         invalidate_server_removed_in(&table, &key);

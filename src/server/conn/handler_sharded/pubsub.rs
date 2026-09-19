@@ -421,6 +421,14 @@ pub(super) async fn try_handle_subscribe<
     // Allocate pubsub channel if not yet created
     if conn.pubsub_tx.is_none() {
         let (tx, rx) = channel::mpsc_bounded::<Bytes>(256);
+        // A subscribed connection can be a CLIENT TRACKING REDIRECT target
+        // (moon#1048): make its channel reachable by client id.
+        conn.tracking_inbox = Some(crate::tracking::client_cmd::register_inbox(
+            conn.client_id,
+            &tx,
+            conn.protocol_version >= 3,
+            &ctx.tracking_table,
+        ));
         conn.pubsub_tx = Some(tx);
         conn.pubsub_rx = Some(rx);
     }

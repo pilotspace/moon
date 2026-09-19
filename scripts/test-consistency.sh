@@ -2752,6 +2752,84 @@ assert_tracking_expiry "tracking: expired hash FIELD invalidates the hash (moon#
     "tx:h" "" "HGET tx:h g" tx_seed_hash
 
 # ---------------------------------------------------------------------------
+# moon#1049 -- OPTIN/OPTOUT decide per read, through `CLIENT CACHING yes|no`,
+# whether the read is tracked. Moon answered CACHING with "unknown subcommand"
+# and tracked every read in both modes. Each "not tracked" row has a CONTROL
+# row that must push, so a probe that simply sees nothing cannot pass both.
+#
+# moon#1048 -- a RESP2 client caching through `CLIENT TRACKING on REDIRECT
+# <id>` gets its invalidations on the target connection, subscribed to
+# `__redis__:invalidate`, as a pub/sub `message`. Moon delivered nothing. The
+# whole target transcript is compared, frame bytes included.
+# ---------------------------------------------------------------------------
+tracking_mode_push_for() {
+    local port="$1" watched="$2" mode="$3" pre="$4" read_cmd="$5"; shift 5
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'HELLO 3\r\nCLIENT TRACKING ON %s\r\n%s%s\r\n' "$mode" "$pre" "$read_cmd" >&3
+    local line=""
+    while IFS= read -r -t 1 line <&3; do :; done
+    redis-cli -p "$port" "$@" >/dev/null 2>&1 || true
+    local seen="" got="NONE"
+    while IFS= read -r -t 1 line <&3; do
+        seen="${seen}${line%$'\r'}|"
+    done
+    exec 3>&-
+    case "$seen" in
+        *invalidate*"${watched}"*) got="PUSH:${watched}" ;;
+        *invalidate*)              got="PUSH:other" ;;
+    esac
+    echo "$got"
+}
+
+assert_tracking_mode() {
+    local desc="$1" watched="$2" mode="$3" pre="$4" read_cmd="$5"; shift 5
+    assert_eq "$desc" \
+        "$(tracking_mode_push_for "$PORT_REDIS" "$watched" "$mode" "$pre" "$read_cmd" "$@")" \
+        "$(tracking_mode_push_for "$PORT_RUST"  "$watched" "$mode" "$pre" "$read_cmd" "$@")"
+}
+
+both SET tcc:k v
+CACHING_YES=$'CLIENT CACHING yes\r\n'
+CACHING_NO=$'CLIENT CACHING no\r\n'
+assert_tracking_mode "tracking: OPTIN read without CACHING yes is not tracked (moon#1049)" \
+    "tcc:k" OPTIN "" "GET tcc:k" SET tcc:k v2
+assert_tracking_mode "tracking: OPTIN read after CACHING yes is tracked [control]" \
+    "tcc:k" OPTIN "$CACHING_YES" "GET tcc:k" SET tcc:k v3
+assert_tracking_mode "tracking: OPTOUT read after CACHING no is not tracked (moon#1049)" \
+    "tcc:k" OPTOUT "$CACHING_NO" "GET tcc:k" SET tcc:k v4
+assert_tracking_mode "tracking: OPTOUT read without CACHING is tracked [control]" \
+    "tcc:k" OPTOUT "" "GET tcc:k" SET tcc:k v5
+assert_tracking_mode "tracking: CACHING yes covers the NEXT command only (moon#1049)" \
+    "tcc:k" OPTIN "${CACHING_YES}"$'PING\r\n' "GET tcc:k" SET tcc:k v6
+
+tracking_redirect_transcript() {
+    local port="$1" key="$2"
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    local line="" id=""
+    printf 'CLIENT ID\r\n' >&3
+    IFS= read -r -t 2 line <&3 || true
+    id="${line#:}"
+    id="${id%$'\r'}"
+    printf 'SUBSCRIBE __redis__:invalidate\r\n' >&3
+    while IFS= read -r -t 1 line <&3; do :; done
+    exec 4<>"/dev/tcp/127.0.0.1/${port}" || { exec 3>&-; echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'CLIENT TRACKING ON REDIRECT %s\r\nGET %s\r\n' "$id" "$key" >&4
+    while IFS= read -r -t 1 line <&4; do :; done
+    redis-cli -p "$port" SET "$key" changed >/dev/null 2>&1 || true
+    local seen=""
+    while IFS= read -r -t 1 line <&3; do
+        seen="${seen}${line%$'\r'}|"
+    done
+    exec 3>&- 4>&-
+    echo "${seen:-NONE}"
+}
+
+both SET tcr:k v
+assert_eq "tracking: RESP2 REDIRECT target gets message on __redis__:invalidate (moon#1048)" \
+    "$(tracking_redirect_transcript "$PORT_REDIS" tcr:k)" \
+    "$(tracking_redirect_transcript "$PORT_RUST" tcr:k)"
+
+# ---------------------------------------------------------------------------
 # moon#644 -- every BLOCKING pop modifies the keyspace and must invalidate.
 #
 # `try_handle_blocking` is a THIRTEENTH write path, and nobody gave it the
