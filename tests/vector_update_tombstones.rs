@@ -737,7 +737,13 @@ fn two_hot_segments_then_vacuum(tag: &str, rewrite: bool) {
         assert_eq!(c.send(&["DEL", &format!("doc:{TARGET}")]), ":1\r\n");
         2 * N - 1
     };
-    let merged = c.send(&["VACUUM", "VECTOR", "idx"]);
+    // The merge runs synchronously and replies only when it is done: about
+    // 0.3s in a release build and about 6s unoptimized on a fast host, which
+    // is too close to the 20s default budget on a slower CI runner.
+    let merged = c.send_within(
+        &["VACUUM", "VECTOR", "idx"],
+        std::time::Duration::from_secs(120),
+    );
     assert!(
         merged.starts_with("+Merged 2 segments into 1"),
         "instrument: VACUUM VECTOR did not merge: {merged:?}"
