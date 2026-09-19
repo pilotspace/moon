@@ -689,7 +689,10 @@ pub fn evict_to_budget(
         None => &mut noop,
     };
 
-    let mut current_total = run.total_memory.unwrap_or_else(|| db.estimated_memory());
+    // moon#1036: `budgeted_memory`, not `estimated_memory` — the same figure
+    // the pressure cascade publishes and evicts against, so a per-write run
+    // and a tick run enforce one cap, not two a cold index apart.
+    let mut current_total = run.total_memory.unwrap_or_else(|| db.budgeted_memory());
     // moon#600: consecutive iterations that claimed progress but changed
     // NOTHING observable. See `EVICTION_STALL_LIMIT`.
     let mut stalled = 0usize;
@@ -3308,6 +3311,95 @@ mod tests {
         assert!(
             spill_files <= 4,
             "40 victims must batch into shared files, got {spill_files}"
+        );
+    }
+
+    /// Fill `db` with a cold index of `n` entries, as spill completions leave
+    /// it. Returns the index's `resident_bytes()`.
+    fn seed_cold_index(db: &mut Database, n: usize) -> usize {
+        let mut ci = crate::storage::tiered::cold_index::ColdIndex::new();
+        for i in 0..n {
+            ci.insert(
+                Bytes::from(format!("cold:{i:06}")),
+                crate::storage::tiered::cold_index::ColdLocation {
+                    file_id: 1,
+                    page_idx: 0,
+                    slot_idx: i as u16,
+                    ttl_ms: None,
+                    value_type: ValueType::String,
+                },
+            );
+        }
+        let bytes = ci.resident_bytes();
+        db.cold_index = Some(ci);
+        bytes
+    }
+
+    /// moon#1036: a per-write eviction run (no `.total()`) must hold the
+    /// database to the SAME figure the 100 ms pressure cascade does — hot
+    /// bytes PLUS the cold index's RAM (`run_eviction_tick` publishes that
+    /// sum and the cascade evicts against it).
+    ///
+    /// The budget below sits between the two figures: the hot set alone fits,
+    /// the hot set plus the cold index does not. Before the fix the per-write
+    /// run compared `estimated_memory()` and evicted nothing, while the next
+    /// tick's cascade evicted — one shard, two caps.
+    #[test]
+    fn evict_to_budget_charges_the_cold_index_like_the_cascade() {
+        let mut db = Database::new();
+        for i in 0..64 {
+            db.set_string(
+                format!("hot:{i:04}").as_bytes(),
+                Bytes::from(vec![b'v'; 200]),
+            );
+        }
+        let ci = seed_cold_index(&mut db, 256);
+        let hot = db.estimated_memory();
+        assert!(ci > 0, "fixture: the cold index must occupy RAM");
+        // What the tick publishes for this db and the cascade evicts against.
+        let cascade_figure = hot + ci;
+        let budget = hot + ci / 2;
+        assert!(
+            hot <= budget && cascade_figure > budget,
+            "fixture: budget between"
+        );
+
+        // CONTROL: the cascade's own call shape evicts at this budget.
+        let mut control = Database::new();
+        for i in 0..64 {
+            control.set_string(
+                format!("hot:{i:04}").as_bytes(),
+                Bytes::from(vec![b'v'; 200]),
+            );
+        }
+        seed_cold_index(&mut control, 256);
+        let config = make_config(budget, "allkeys-lru");
+        evict_to_budget(
+            &mut control,
+            &config,
+            EvictionRun::plain().total(cascade_figure),
+        )
+        .expect("cascade-shaped run");
+        assert!(
+            control.len() < 64,
+            "CONTROL: the cascade evicts at this budget"
+        );
+
+        // The per-write shape must agree with it.
+        evict_to_budget(&mut db, &config, EvictionRun::plain()).expect("per-write run");
+        assert!(
+            db.len() < 64,
+            "a per-write eviction run left all 64 hot keys in place at a budget \
+             the pressure cascade enforces by evicting: it compared the budget \
+             against hot bytes only ({hot}) and ignored the cold index ({ci} \
+             bytes) the cascade charges — two effective caps on one shard"
+        );
+        let hot_after = db.estimated_memory();
+        assert!(
+            hot_after + ci <= budget,
+            "the per-write run must leave hot + cold index ({} ) within budget \
+             ({budget})",
+            hot_after + ci
         );
     }
 

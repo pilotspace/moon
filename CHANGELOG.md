@@ -169,6 +169,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`maxmemory` is one cap again once keys have spilled to disk** (moon#1036).
+  Since K4, the 100 ms pressure cascade has held each database to hot bytes
+  PLUS its cold index's RAM. The per-write gates did not: the inline `SET`
+  pre-gate and `evict_to_budget` without `.total()` compared hot bytes only.
+  So each tick the cascade spilled a cold index's worth of hot keys, and the
+  write path let writers refill that room without evicting. Plain `SET`s
+  inlined into it while the shard was over the cascade's cap. The shard ran
+  over budget between ticks, and every tick spilled extra keys. An
+  instrumented build classified every inlined write (1,809 across 6 runs):
+  all of them saw fresh hints and a shard under budget by hot bytes but over
+  it once the cold index was counted. None was a stale-hint slip. With a
+  CI-speed writer this reproduced 247-389 inlined writes out of 2000; CI's
+  red `g2_bail_out_fires_under_pressure_shards1` runs showed 53-297. All
+  eviction gates now read one figure, `Database::budgeted_memory()`: the
+  inline pre-gate, `evict_to_budget`'s default, the tick publish and the
+  timer sweep. After the fix the count is 0 of 2000 in every run, with or
+  without contention. The G2 test's window is now paced so the cascade runs
+  inside it on any host, and its bound is a constant (5) rather than 2% of
+  the writes.
+
 - **`runtime-tokio` with `--shards 1` now opens every AOF generation with a
   `MOON.COLDCUT`, so a `kill -9` no longer double-applies writes to spilled
   keys or drops acknowledged post-rewrite writes** (moon#914). This is the one
