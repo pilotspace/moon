@@ -23,6 +23,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hiding the others. Free on a public repo; the one real limit is the
   5-concurrent-macOS-job ceiling, which a single dispatch stays under.
 
+- **The AOF RDB-preamble load no longer wipes the cold plane on restart**
+  (moon#1007). Recovery Phase 3 rebuilds the cold index from the shard
+  manifest; Phase 4b's `replay_aof` then loaded the `MOON` preamble that
+  `BGREWRITEAOF` writes, and `rdb::load_from_bytes` swaps fresh `Database`
+  temporaries over the live ones (`*live = temp`) — dropping `cold_index` and
+  `cold_shard_dir`, live-tier topology the hot snapshot does not carry. The
+  server then came up with a wired-but-EMPTY cold plane and every spilled key
+  read as an ABSENT key, with `DBSIZE` agreeing. Measured at `--shards 1`
+  after any `BGREWRITEAOF`: 28,868 cold keys gone, and gone again on every
+  later boot. The damaged-file scenario that surfaced it is a red herring —
+  an undamaged run loses just as much. Only tokio `--shards 1` takes this
+  path (`--shards >= 2` uses the PerShard manifest, whose `shard_replay`
+  already brackets the same swap via `take_cold_wiring`); monoio is exposed
+  for exactly one boot when upgrading from a legacy AOF, during which an
+  `INCR`/`APPEND` against a vanished key mints from zero and corrupts it
+  permanently. The preamble load is now bracketed the same way, restored
+  BEFORE the RESP tail so replayed `DEL`/`FLUSH*` still tombstone cold. Fixed
+  in `replay_aof` rather than `rdb::load_from_bytes` on purpose: the generic
+  loader also serves replica full-sync and `DEBUG RELOAD` with a FOREIGN
+  dataset, where preserving this node's index would surface stale reads.
+
+- **BEHAVIOUR CHANGE — a disk-offload server that cannot prove where its cold
+  file ids resume now refuses to start** (moon#997). If a shard's
+  `data/` or `vectors/` directory exists but cannot be listed, an entry in it
+  cannot be read, or its shard manifest is full-length but cannot be opened,
+  startup exits with `refusing to start: cannot prove shard N's cold file_id
+  seed …`, the OS error, and what is safe to do: for a permission or I/O
+  error nothing needs removing; for a manifest whose two root pages are both
+  corrupt the message says NOT to delete it (the next boot would delete every
+  heap file beside it as an orphan). It used to log a warning and restart the
+  counter at 1, after which the next spill renamed its batch onto the live
+  `heap-000001.mpf` (reproduced on both runtimes at `--shards 1` and `4` with
+  a `-wx` `data/` directory). A manifest shorter than its two root pages is
+  NOT refused: only an interrupted create produces one, it holds no entry, and
+  it is re-created empty with a WARN naming the file. Nothing on disk is
+  changed by a refusal.
+
 - **BEHAVIOUR CHANGE — `ZADD ... GT LT` and a NaN `WEIGHTS` value now error**
   where they previously succeeded (moon#969). `ZADD k GT LT 1 m` used to reply
   `(integer) 1` and, on an existing member, `(integer) 0` with the score left
@@ -31,6 +68,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WEIGHTS nan` used to be accepted and poison every aggregated score; it is now
   `ERR weight value is not a float`. Infinite weights remain legal. A client
   relying on either form silently doing nothing will now see an error.
+- **BEHAVIOUR CHANGE — `BLMPOP`/`BZMPOP` whose keys span shards are refused with
+  `CROSSSLOT`** at `--shards > 1` (moon#989), the rule moon#962 already applies
+  to `LMPOP`/`ZMPOP`. They used to answer, and measured at `--shards 4` over 16
+  three-shard placements, 20 of 32 probes popped a key the reply did not name:
+  either the WRONG key (a later local key served over an earlier remote one) or
+  a second key whose element no client ever received. "Pop from the first
+  non-empty key in argument order, exactly once" is a property of the whole key
+  vector that no single shard can see. The refusal is decided from the key
+  names before anything is touched, so the keyspace is unchanged. Keys under
+  one `{hash}` tag, and every placement at `--shards 1`, are unaffected.
+
+- **BEHAVIOUR CHANGE — `ACL SETUSER` now REJECTS rule tokens it used to
+  answer `+OK` for and silently drop** (moon#970, moon#979). The parser ended
+  in `_ => {}`, so a token it did not recognise was ignored while the call
+  succeeded. Each of these now errors with redis's own text and applies
+  NOTHING -- the rule list runs on a copy of the user, committed only if every
+  rule applied, so a rejected call neither creates the user nor keeps the
+  prefix that parsed (`on >pw ~* +@all bogus` used to create the user with
+  `+@all`): an unknown token (`totalnonsense`, `nocommand`, `@read`, `' on'`)
+  -> `Syntax error`; a malformed `%` selector (`%X~k`, `%RR~k`, `%`) ->
+  `Syntax error`; an unknown command (`+bogus`, a typo'd `-flushal`, `+`,
+  `+config|bogus`) -> `Unknown command or category name in ACL`; a `#`/`!`
+  hash that is not 64 lowercase hex -> redis's hash error (an uppercase hash
+  used to be stored and then never authenticate); `<pw` / `!hash` for a
+  password the user does not hold -> `The password you are trying to remove
+  from the user does not exist`; a `(...)` selector -> `ACL selectors are not
+  supported` (redis accepts selectors; moon does not implement them and
+  refuses rather than drop the grant); a non-UTF-8 rule argument -> `ACL rules
+  must be valid UTF-8` (it used to be dropped before the parser saw it). **An
+  aclfile line carrying any of these is no longer loaded** -- the user is
+  absent and a WARN names the rule -- where it used to load with the token
+  dropped; fix the line (usually a typo'd command or an uppercase hash) before
+  upgrading. Two further visible changes: a user with no key patterns can now
+  run keyless commands such as `PING` (redis gates only keyed commands on key
+  patterns; keyed commands are still denied), and `allkeys` / `~*` and
+  `allchannels` / `&*` now REPLACE the pattern list as on redis, so
+  `~a allkeys` is reported and saved as `~*` rather than `~a ~*` -- the same
+  permission either way. Not changed: a pattern added AFTER `~*` is still
+  accepted (redis rejects it), so an existing aclfile holding `~* ~x` keeps
+  loading.
 
 - **BEHAVIOUR CHANGE — `REPLICAOF`/`SLAVEOF host port` and `CLUSTER REPLICATE`
   on a `--shards > 1` node now error instead of replying `+OK`** (moon#1015).
@@ -48,6 +125,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drift apart. An admin script that retried until `+OK` will now see the error.
 
 ### Fixed
+
+- **Scripts queued inside `MULTI` now run at `EXEC`** (moon#894). `EVAL`,
+  `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `FCALL` and `FCALL_RO` were answered
+  `+QUEUED` and then `-ERR unknown command` at `EXEC`, while the rest of the
+  transaction committed. That one step was silently dropped from an otherwise
+  successful transaction, and the reply array was still full length. The
+  transaction executor now runs a queued script in place, in body order, on
+  whichever shard the body runs. The moon#247 locality rules apply unchanged:
+  a script whose declared keys live on another shard routes the whole body to
+  that owner, and a body spanning shards is refused with `CROSSSLOT` before
+  anything runs. Every inner `redis.call` is authorized as the calling user,
+  on the owner too.
+
+  The script's effect records are captured and spliced into the body's own
+  record list, so they reach the AOF, the WAL and the replication stream in
+  body order and exactly once. Letting the script emit them directly, as it
+  does outside `MULTI`, would log `SET k 1; EVAL "APPEND k x"` as
+  `APPEND k x; SET k 1`, and a restart would read `1` where the master
+  answered `1x`. A mutation run that disabled the capture reproduced exactly
+  that divergence after `SIGKILL`.
+
+  Semantics match redis-server 8.6.1:
+  - an unknown sha is `NOSCRIPT` in its slot;
+  - `EVAL_RO` refuses a write;
+  - a script that errors is one error element, its earlier writes stay, and
+    the rest of the body runs;
+  - a `WATCH` conflict aborts before any script runs.
+
+- **A write replayed after its key's spill marker is no longer discarded on
+  restart** (moon#965). On `runtime-tokio` with `--shards 1` no `AofManifest`
+  exists, so the AOF never carries a `MOON.COLDCUT` head — but `MOON.SPILLED`
+  markers are emitted unconditionally, so that configuration ran moon#902
+  half-armed. A replayed marker drops the key's hot copy; its next write then
+  replays through `Database::set`'s `Inserted` arm, which by design leaves the
+  cold shadow standing; and with no cut the end-of-replay reconcile took the
+  legacy cold-wins branch and threw the newer write away — logging it as
+  `1 hot shadow(s) demoted to cold stubs`. The issue's "AOF tail loss" title
+  named the wrong mechanism: both writes were on disk and both replayed.
+  A replayed marker now proves the generation is #902-era, and reconcile
+  resolves hot-wins for it whether or not the head carries the cut. That is
+  value-correct in every way a key can end hot and cold there: written after
+  its marker, a stale entry in a still-listed file, or a marker lost under
+  backpressure (both planes then hold the same value). Logs with neither record
+  keep the task #56 path unchanged. `tests/cold_shadow_single_shard_tokio.rs`,
+  written for exactly this configuration, was RED on main for weeks and never
+  ran: it was `#[ignore]`d because it shelled out to `redis-cli`. It now speaks
+  RESP through `common::Conn` and runs in every `runtime-tokio` leg; with the
+  fix inert it fails 3/3 on 36-47 stale probes.
 
 - **`REPLICAOF <hostname> <port>` no longer aborts the server** (moon#1034).
   On the default monoio runtime, the replica task parsed `host:port` as a
@@ -98,6 +223,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   family is deferred by the #438 early-flush guard one statement above this
   predicate in both handlers whenever remote work is pending, and the derived
   predicate now says wait for them regardless.
+
+- **Multi-key blocking pops no longer destroy an element from a key they did
+  not answer with** (moon#989). `BLMPOP`, `BZMPOP`, `BLPOP`, `BRPOP`,
+  `BZPOPMIN` and `BZPOPMAX` over keys co-located under one `{hash}` tag replied
+  correctly while a SECOND non-empty key silently lost its head element:
+  `BLMPOP 0.3 3 {t}a {t}b {t}c LEFT` answered `{t}b B1` and left `{t}c` at
+  `[C2]`, with `C1` delivered to nobody. It happened whenever the client's
+  connection lived on a different shard than the keys: the client's shard
+  could not see them, so it sent one registration per key to their owner, and
+  the owner served the same waiter once per non-empty key — the client kept
+  the first reply and dropped the rest. The same fan-out popped a key named
+  twice (`BLMPOP 0 2 k k LEFT`) twice, and skipped Redis's `-WRONGTYPE` for an
+  earlier key of the wrong type. Measured at `--shards 4` (`BLMPOP`, `BZMPOP`,
+  `BLPOP`, `BZPOPMIN` × 16 tags × 3 server instances, against redis 8.6.1): 139
+  of 192 probes destroyed an element before, 0 after; `--shards 1` was and is 0. The client now sends ONE registration per owner shard carrying
+  every key it owns, and the owner registers, type-checks and serves them in
+  one synchronous stretch, so a waiter is served at most once there. A
+  spanning `BLPOP`/`BRPOP`/`BZPOPMIN`/`BZPOPMAX` can still be served by two
+  owner shards at once; that placement is unchanged by this fix and is
+  tracked as moon#1019.
+
+- **`ACL SETUSER` implements `allkeys`, `allcommands`, `allchannels` and
+  every spelling of the `%R~` / `%W~` / `%RW~` key selectors** (moon#970).
+  All were dropped with `+OK`, so a user provisioned with the standard redis
+  idioms came out inert: `ACL SETUSER w1 on >pw allkeys allcommands` reported
+  `-@all` and every command was `NOPERM`; `%RW~cache:* +@read` left the user
+  with no key access at all; `%r~` / `%wr~` (lowercase flags) vanished.
+  `ACL LIST`, `ACL GETUSER` and `ACL SAVE` now render these exactly as redis
+  8.6.1 does (`%RW~p` as `~p`, one-sided grants as `%R~p` / `%W~p`), through
+  one key-pattern renderer -- `ACL GETUSER` carried a second copy that would
+  have rendered a no-access pattern as a write grant. Every touched
+  permission set, including moon#981's `+@all -x`, is verified to round-trip
+  `SETUSER` -> `LIST`/`GETUSER` -> `SAVE` -> restart with `LOAD` unchanged,
+  token order included.
+
+- **A restart no longer re-issues a warm vector segment's id to a KV spill
+  file, and retiring a segment entry no longer tombstones a spill file**
+  (moon#893, moon#997). One per-shard counter names both KV spill files and
+  warm vector segments, but its restart seed scanned `data/heap-*.mpf` only.
+  When the highest id in use belonged to a vector segment, the next spill
+  file took the same id; when that segment's directory later vanished,
+  recovery retired its manifest entry with `remove_file(id)`, which
+  tombstoned every entry with that id — the live spill file's included — so
+  its keys read as **absent** after the restart. Measured before the fix
+  (durable cold keys absent after one restart): monoio 256/894 at
+  `--shards 1` and 540/901 at `--shards 4` after a `BGREWRITEAOF`, 2/4 and
+  4/226 under `--appendonly no`; tokio 514/902 at `--shards 4`, 2/4 and
+  209/219 under `--appendonly no`. The seed is now one authority
+  (`storage::tiered::file_id_seed`): the maximum over every manifest entry
+  of every type and status, every `heap-*.{mpf,tmp}` and every
+  `segment-*` / `.segment-*.staging` directory, computed once after recovery
+  and shared by the spill counter and the `MOON.COLDCUT` watermark.
+  `ShardManifest::remove_file` now matches `(file_id, file_type)`, so a data
+  dir a pre-fix build already wrote the collision into keeps its spill file.
+  Both spill writers refuse to replace an existing `heap-*.mpf`; a re-issued
+  id becomes a failed spill that keeps the values hot instead of overwriting
+  live cold data. The seed scan also no longer skips a directory entry it
+  cannot read.
+
+- **A shard's cold file ids come from one counter that never moves
+  backwards** (moon#893, moon#997). The event loop kept a second copy of the
+  counter, re-synced once per tick. On tokio the cross-shard SPSC drain ran
+  after that sync and advanced the shared counter; the eviction tick and warm
+  vector transitions then allocated from the stale copy, re-issuing the
+  drain's ids, and wrote it back with a plain `set` that moved the shared
+  counter backwards. The copy is gone: every consumer allocates through
+  `file_id_seed::allocate_from`, and every write-back is monotonic.
+
+- **`ShardManifest::create` is atomic** (temp file, fsync, rename, directory
+  fsync). A crash part-way through it used to leave a manifest shorter than
+  its two root pages at the real path, which every later open rejected.
+  Tombstones are also aged per `(file_id, file_type)`, not per id.
+
 - **Commands routed to another shard are counted and timed** (moon#982).
   At `--shards > 1` a command whose key lives on a shard other than the
   connection's went through no telemetry probe at all — neither the
@@ -161,6 +359,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both the listpack and B+tree arms, which carried separate copies.
 ### Security
 
+- **Subcommand ACL rules are now enforced** (moon#1030). `+@all -config|set`
+  was accepted, listed and saved, but the permission check only ever looked up
+  the bare command name, so the user could still run `CONFIG SET`. The same
+  gap meant `+config|get` or `+select|0` grants never took effect. The check
+  now consults `cmd|<first arg>` first, with redis's last-rule-wins ordering: a
+  bare rule or category clears that command's subcommand rules. `NOPERM` text
+  and `ACL LOG` name the subcommand (`config|set`). `ACL LIST`, `GETUSER` and
+  `SAVE` emit bare rules before subcommand rules, so a saved file reloads to the
+  same permissions; a line with no subcommand rules is byte-identical.
+
+- **Setting a password on a `nopass` user now actually requires it, and
+  `nopass` now revokes the old passwords** (moon#999). Two credential
+  fail-opens, both answering `+OK`. (a) `>pw` / `#hash` did not clear the
+  `nopass` flag: `ACL SETUSER fa on nopass ~* +@all` then
+  `ACL SETUSER fa >realpw` left an account that accepted ANY password --
+  measured against redis-server 8.6.1, `AUTH fa totallywrong` answered `OK` on
+  moon and `WRONGPASS` on redis, over `AUTH`, `HELLO 3 AUTH` and inline `AUTH`
+  alike, while `ACL GETUSER` showed a password set. (b) `nopass` did not drop
+  the stored hashes, so rotating a credential through `nopass` (`>oldpw`,
+  `nopass`, `>newpw`) left the compromised `oldpw` valid indefinitely. `>` and
+  `#` now clear `nopass`, and `nopass` clears the password list, as redis
+  does; both hold across `ACL SAVE` / `ACL LOAD` and a restart.
+- **The ACL keywords an operator uses to contain a compromised account now
+  take effect** (moon#979). `ACL SETUSER svc nocommands` (the arm did not
+  exist) and `ACL SETUSER svc OFF` / `RESET` / `RESETKEYS` / `RESETCHANNELS` /
+  `RESETPASS` / `NOPASS` (every non-lowercase spelling -- redis compares
+  keywords case-insensitively) answered `OK` and changed nothing: the account
+  stayed live with `+@all` and the operator was told the lockdown worked.
+  Keywords are now matched case-insensitively in exactly one table, and every
+  redis keyword has an arm.
 - **An ACL category Moon does not implement is an error, not a grant of every
   command** (moon#978). `get_category_commands` ended in `_ => &[]`, so an
   unknown category resolved to an EMPTY command list rather than failing.

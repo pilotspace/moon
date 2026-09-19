@@ -1544,7 +1544,7 @@ pub(super) fn try_enforce_acl(
         drop(acl_guard);
         conn.acl_log.push(crate::acl::AclLogEntry {
             reason: "command".to_string(),
-            object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+            object: crate::acl::subcommand::command_log_object(cmd, cmd_args),
             username: conn.current_user.clone(),
             client_addr: peer_addr.to_string(),
             timestamp_ms: std::time::SystemTime::now()

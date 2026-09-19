@@ -96,8 +96,8 @@ impl ColdLocation {
     ///
     /// `file_id` is the shard's spill allocation sequence: it is handed out
     /// at eviction time from a per-shard counter that only ever increases and
-    /// is re-seeded on restart strictly above every file already on disk
-    /// (`eviction::next_spill_file_id_seed`). A key can only be spilled
+    /// is re-seeded on restart strictly above every id already in use
+    /// (`file_id_seed::next_file_id_seed`). A key can only be spilled
     /// again after it came back hot (a write, or a read-through promotion),
     /// so its second copy always carries a strictly higher `file_id` and a
     /// value at least as new. Within one file, `(page_idx, slot_idx)` is the
@@ -114,14 +114,11 @@ impl ColdLocation {
     /// `gc_tombstones`, manifest compaction and reopen all preserve push
     /// order. Anything that must pick the newest copy orders by this key.
     ///
-    /// The monotonicity above is conditional on the restart seed scan
-    /// succeeding: `next_spill_file_id_seed` falls back to `1` when
-    /// `data/` cannot be read (any error but `NotFound`), and logs
-    /// `spill file_id seed: could not scan cold dir; defaulting to 1` when
-    /// it does. A reset counter re-mints `heap-000001.mpf` and the batch
-    /// writer renames over the existing file, so the older copy is
-    /// destroyed in place before any ordering question arises — that warn
-    /// line is the signal, and the cold plane is already lost by then.
+    /// The restart seed is proven or the server refuses to start (moon#997):
+    /// a scan that cannot list a directory, read an entry or open the
+    /// manifest is an error, never a fallback to `1` — a reset counter would
+    /// re-mint `heap-000001.mpf` and rename over the older copy before any
+    /// ordering question arose.
     #[inline]
     #[must_use]
     pub fn recency_key(&self) -> (u64, u32, u16) {
@@ -693,7 +690,7 @@ impl ColdIndex {
 
             // Tombstone manifest entry so GC / recovery doesn't re-index it.
             if let Some(ref mut m) = manifest.as_deref_mut() {
-                m.remove_file(file_id);
+                m.remove_file(file_id, crate::persistence::page::PageType::KvLeaf);
                 manifest_dirty = true;
             }
 

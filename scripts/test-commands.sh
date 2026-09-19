@@ -74,6 +74,7 @@ while [[ $# -gt 0 ]]; do
             echo "  key          - Key commands (DEL, EXISTS, EXPIRE, TTL, RENAME, etc.)"
             echo "  stream       - Stream commands (XADD, XREAD, XRANGE, XGROUP, etc.)"
             echo "  connection   - Connection commands (PING, ECHO, SELECT, INFO, etc.)"
+            echo "  acl          - ACL SETUSER grammar, credentials, key selectors (moon#970/#979/#999)"
             echo "  pubsub       - Pub/Sub commands (SUBSCRIBE, PUBLISH, etc.)"
             echo "  transaction  - Transaction commands (MULTI, EXEC, DISCARD)"
             echo "  scripting    - Lua scripting (EVAL, EVALSHA)"
@@ -1353,6 +1354,128 @@ if should_run "connection"; then
 fi
 
 # ===========================================================================
+# ACL (moon#970 / moon#979 / moon#999)
+# ===========================================================================
+#
+# Users are named `tc:acl:*` and keys `tc:acl:*`; the block removes them again.
+#
+# AUTH rows go through ONE connection per server (`acl_session`, stdin mode)
+# and keep stderr, so the AUTH reply itself is compared. `rcli`/`mcli` would be
+# vacuous here: `redis-cli --user u --pass wrong PING` reports the failed AUTH
+# on STDERR (which they discard) and then runs PING as `default`, so a server
+# that wrongly ACCEPTED the password and one that refused it would both print
+# PONG.
+
+if should_run "acl"; then
+    echo ""
+    echo "=== ACL COMMANDS ==="
+
+    acl_session() {
+        local port="$1"; shift
+        printf '%s\n' "$@" | redis-cli -p "$port" 2>&1 || true
+    }
+    assert_acl_session() {
+        local desc="$1"; shift
+        TOTAL=$((TOTAL + 1))
+        local r m
+        r=$(acl_session "$PORT_REDIS" "$@")
+        m=$(acl_session "$PORT_RUST" "$@")
+        if [[ "$r" == "$m" ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: $desc"
+            echo "    REDIS: $(echo "$r" | head -3 | tr '\n' '|')"
+            echo "    MOON:  $(echo "$m" | head -3 | tr '\n' '|')"
+        fi
+    }
+    # One field of ACL GETUSER (`keys`, `channels`, `commands`) on both servers.
+    # The ACL LIST line itself is not comparable: redis adds `sanitize-payload`
+    # and `resetchannels`, which moon does not emit.
+    acl_field() {
+        redis-cli -p "$1" ACL GETUSER "$2" 2>&1 | tr -d '\r' \
+            | awk -v f="$3" 'g { print; exit } $0 == f { g = 1 }' || true
+    }
+    assert_acl_field() {
+        local desc="$1" user="$2" field="$3"
+        TOTAL=$((TOTAL + 1))
+        local r m
+        r=$(acl_field "$PORT_REDIS" "$user" "$field")
+        m=$(acl_field "$PORT_RUST" "$user" "$field")
+        if [[ "$r" == "$m" ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: $desc"
+            echo "    REDIS: $r"
+            echo "    MOON:  $m"
+        fi
+    }
+    acl_both() { rcli "$@" >/dev/null; mcli "$@" >/dev/null; }
+
+    # --- #970: allkeys / allcommands / allchannels were dropped with +OK ----
+    acl_both ACL DELUSER tc:acl:a
+    assert_match "ACL SETUSER allkeys allcommands allchannels" \
+        ACL SETUSER tc:acl:a on '>pw' allkeys allcommands allchannels
+    assert_acl_field "allkeys renders as ~*"      tc:acl:a keys
+    assert_acl_field "allchannels renders as &*"  tc:acl:a channels
+    assert_acl_field "allcommands renders +@all"  tc:acl:a commands
+    assert_acl_session "allkeys+allcommands: the user can SET" \
+        "AUTH tc:acl:a pw" "SET tc:acl:k v"
+    # `~a allkeys` REPLACES the list on redis (renders `~*`, not `~a ~*`).
+    acl_both ACL DELUSER tc:acl:a
+    assert_match "ACL SETUSER ~a %R~b allkeys" \
+        ACL SETUSER tc:acl:a on '>pw' '~tc:acl:x' '%R~tc:acl:y' allkeys +@all
+    assert_acl_field "allkeys replaces earlier patterns" tc:acl:a keys
+
+    # --- #970: %RW~ / lowercase %r~ / %W~ key selectors ------------------------
+    acl_both ACL DELUSER tc:acl:s
+    assert_match "ACL SETUSER %RW~ %r~ %W~" \
+        ACL SETUSER tc:acl:s on '>pw' '%RW~tc:acl:rw*' '%r~tc:acl:r*' '%W~tc:acl:w*' +@all
+    assert_acl_field "key selectors render as redis does" tc:acl:s keys
+    assert_acl_session "%RW~ grants GET" "AUTH tc:acl:s pw" "GET tc:acl:rw1"
+    assert_acl_session "%r~ grants GET"  "AUTH tc:acl:s pw" "GET tc:acl:r1"
+
+    # --- #970/#979: unknown tokens are errors, and create nothing -------------
+    acl_both ACL DELUSER tc:acl:bad
+    # `éx`: a multi-byte first character must be a syntax error, not a crash.
+    for acl_tok in totalnonsense nocommand '%X~k' '+bogus' '#ABC' 'éx'; do
+        assert_match "ACL SETUSER rejects '$acl_tok'" \
+            ACL SETUSER tc:acl:bad on '>pw' "$acl_tok"
+    done
+    assert_match "a rejected ACL SETUSER creates no user" ACL GETUSER tc:acl:bad
+
+    # --- #979: restricting keywords were dropped with +OK ---------------------
+    acl_both ACL DELUSER tc:acl:n
+    acl_both ACL SETUSER tc:acl:n on '>pw' '~*' '&*' +@all
+    assert_match "ACL SETUSER nocommands" ACL SETUSER tc:acl:n nocommands
+    assert_acl_session "nocommands denies PING" "AUTH tc:acl:n pw" "PING"
+    acl_both ACL SETUSER tc:acl:n '>pw' '~*' '&*' +@all
+    assert_match "ACL SETUSER OFF (upper case)" ACL SETUSER tc:acl:n OFF
+    assert_acl_session "OFF refuses AUTH" "AUTH tc:acl:n pw"
+
+    # --- #999: credential fail-open --------------------------------------------
+    acl_both ACL DELUSER tc:acl:p
+    acl_both ACL SETUSER tc:acl:p on nopass '~*' +@all
+    assert_match "ACL SETUSER >pw on a nopass user" ACL SETUSER tc:acl:p '>pw'
+    assert_acl_session ">pw clears nopass: a wrong password is refused" \
+        "AUTH tc:acl:p wrong"
+    assert_acl_session ">pw clears nopass: HELLO AUTH with a wrong password" \
+        "HELLO 3 AUTH tc:acl:p wrong"
+    assert_acl_session ">pw clears nopass: the password works" "AUTH tc:acl:p pw"
+    acl_both ACL DELUSER tc:acl:p
+    acl_both ACL SETUSER tc:acl:p on '>oldpw' '~*' +@all
+    assert_match "ACL SETUSER nopass >newpw (rotation)" \
+        ACL SETUSER tc:acl:p nopass '>newpw'
+    assert_acl_session "nopass drops old hashes: the rotated-out password is refused" \
+        "AUTH tc:acl:p oldpw"
+    assert_acl_session "rotation: the new password works" "AUTH tc:acl:p newpw"
+
+    acl_both ACL DELUSER tc:acl:a tc:acl:s tc:acl:bad tc:acl:n tc:acl:p
+    acl_both DEL tc:acl:k
+fi
+
+# ===========================================================================
 # PUB/SUB COMMANDS
 # ===========================================================================
 
@@ -1481,6 +1604,50 @@ if should_run "transaction"; then
     else
         FAIL=$((FAIL + 1))
         echo "  FAIL: FN-MULTI-02 expected queue-time refusal + EXECABORT, got: $(echo "$fn_bogus" | tr '\n' ' ')"
+    fi
+
+    # --- Scripts inside MULTI (moon#894) -----------------------------------
+    #
+    # EVAL/EVALSHA/EVAL_RO/FCALL were queued and then answered `unknown
+    # command` at EXEC while the rest of the body committed. As with moon#697,
+    # the verdict is read from the KEYS, not from EXEC's reply: the pre-fix
+    # EXEC array was full-length, so a length check passes on the bug. The
+    # transcript is also compared to Redis byte for byte. `{tx894}`
+    # co-locates every key so the row compares the command, not the routing,
+    # at --shards > 1. The sha is SHA1 of the script body, so both servers
+    # agree on it.
+    sc894_set="return redis.call('SET',KEYS[1],ARGV[1])"
+    sc894_sha="cf63a54c34e159e75e5a3fe4794bb2ea636ee005"
+    sc894_lib="$(printf "#!lua name=tx894\nredis.register_function('tx894set', function(keys, args) return redis.call('SET', keys[1], args[1]) end)")"
+    for srv in mcli rcli; do
+        $srv DEL "{tx894}before" "{tx894}eval" "{tx894}sha" "{tx894}ro" "{tx894}fcall" "{tx894}after" > /dev/null
+        $srv SCRIPT LOAD "$sc894_set" > /dev/null
+        $srv FUNCTION LOAD REPLACE "$sc894_lib" > /dev/null
+    done
+    sc894_body=$(printf '%s\n' 'MULTI' 'SET {tx894}before 1' \
+        "EVAL \"$sc894_set\" 1 {tx894}eval e" \
+        "EVALSHA $sc894_sha 1 {tx894}sha s" \
+        "EVAL_RO \"return redis.call('GET',KEYS[1])\" 1 {tx894}before" \
+        'FCALL tx894set 1 {tx894}fcall f' \
+        'SET {tx894}after 2' 'EXEC')
+    sc894_moon=$(printf '%s\n' "$sc894_body" | redis-cli -p "$PORT_RUST" 2>&1 || true)
+    sc894_redis=$(printf '%s\n' "$sc894_body" | redis-cli -p "$PORT_REDIS" 2>&1 || true)
+    TOTAL=$((TOTAL + 1))
+    sc894_keys=$(mcli MGET "{tx894}before" "{tx894}eval" "{tx894}sha" "{tx894}fcall" "{tx894}after" | tr '\n' ' ')
+    if [ "$sc894_keys" = "1 e s f 2 " ] && ! echo "$sc894_moon" | qgrep -q "unknown command"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: SCRIPT-MULTI-01 scripts inside MULTI must apply (moon#894): keys='$sc894_keys' exec=$(echo "$sc894_moon" | tr '\n' ' ')"
+    fi
+    TOTAL=$((TOTAL + 1))
+    if [ "$sc894_moon" = "$sc894_redis" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: SCRIPT-MULTI-02 EXEC transcript differs from Redis (moon#894)"
+        echo "    redis: $(echo "$sc894_redis" | tr '\n' ' ')"
+        echo "    moon:  $(echo "$sc894_moon" | tr '\n' ' ')"
     fi
 
     # --- Container HELP (moon#698) ----------------------------------------
@@ -1821,6 +1988,19 @@ if should_run "blocking"; then
     # moon#570: `{blk}` co-locates the pair -- see the LMOVE row above.
     rcli RPUSH {blk}:src x y z >/dev/null 2>&1; mcli RPUSH {blk}:src x y z >/dev/null 2>&1
     assert_match "BLMOVE (ready)"      BLMOVE {blk}:src {blk}:dst LEFT RIGHT 1
+
+    # moon#989: a multi-key blocking pop serves from the FIRST non-empty key,
+    # exactly once. The reply alone cannot show a SECOND key losing an element
+    # (moon answered correctly while destroying it), so each row is followed by
+    # a read of the key it must not touch. `{blk}` co-locates the three keys.
+    rcli RPUSH {blk}:mp2 B1 B2 >/dev/null 2>&1; mcli RPUSH {blk}:mp2 B1 B2 >/dev/null 2>&1
+    rcli RPUSH {blk}:mp3 C1 C2 >/dev/null 2>&1; mcli RPUSH {blk}:mp3 C1 C2 >/dev/null 2>&1
+    assert_match "BLMPOP (ready, 3 co-located keys)" BLMPOP 1 3 {blk}:mp1 {blk}:mp2 {blk}:mp3 LEFT
+    assert_match "BLMPOP left the later key untouched" LRANGE {blk}:mp3 0 -1
+    rcli ZADD {blk}:zp2 1 B1 2 B2 >/dev/null 2>&1; mcli ZADD {blk}:zp2 1 B1 2 B2 >/dev/null 2>&1
+    rcli ZADD {blk}:zp3 1 C1 2 C2 >/dev/null 2>&1; mcli ZADD {blk}:zp3 1 C1 2 C2 >/dev/null 2>&1
+    assert_match "BZMPOP (ready, 3 co-located keys)" BZMPOP 1 3 {blk}:zp1 {blk}:zp2 {blk}:zp3 MIN
+    assert_match "BZMPOP left the later key untouched" ZRANGE {blk}:zp3 0 -1 WITHSCORES
 fi
 
 # ===========================================================================
@@ -2762,15 +2942,19 @@ if should_run "vector"; then
     # `set -euo pipefail` that killed the run outright -- on a clean machine
     # the FIRST of these (nothing to kill yet) aborted the script before
     # NUMERIC-07, so MQ, txn_kv, eviction and the RESULT SUMMARY never ran.
-    pkill -f 'moon --port 6411' 2>/dev/null || true
-    pkill -f 'moon --port 6414' 2>/dev/null || true
+    # A previous aborted run's servers are found by THIS row's temp-dir names,
+    # not by the binary name: `MOON_BIN` can point at any file, and a pattern
+    # like 'moon --port 6411' never matches e.g. `moon-v0.8.9 --port 6411`.
+    pkill -f 'moon-n7-[14][.]' 2>/dev/null || true
     sleep 1
     # Fresh dirs here too -- these two would otherwise reload `nidx` from the
     # repo root and report a cross-shard "match" that came from disk.
     N7_DIR1=$(mktemp -d "${TMPDIR:-/tmp}/moon-n7-1.XXXXXX")
     N7_DIR2=$(mktemp -d "${TMPDIR:-/tmp}/moon-n7-4.XXXXXX")
-    ./target/release/moon --port 6411 --shards 1 --protected-mode no --dir "$N7_DIR1" --disk-free-min-pct 0 > /tmp/moon-6411.log 2>&1 &
-    ./target/release/moon --port 6414 --shards 4 --protected-mode no --dir "$N7_DIR2" --disk-free-min-pct 0 > /tmp/moon-6414.log 2>&1 &
+    "$RUST_BINARY" --port 6411 --shards 1 --protected-mode no --dir "$N7_DIR1" --disk-free-min-pct 0 > /tmp/moon-6411.log 2>&1 &
+    N7_PID1=$!
+    "$RUST_BINARY" --port 6414 --shards 4 --protected-mode no --dir "$N7_DIR2" --disk-free-min-pct 0 > /tmp/moon-6414.log 2>&1 &
+    N7_PID2=$!
     sleep 2
     for PORT in 6411 6414; do
         redis-cli -p $PORT FT.CREATE nidx ON HASH PREFIX 1 n: SCHEMA status TAG score NUMERIC > /dev/null 2>&1 || true
@@ -2793,8 +2977,10 @@ if should_run "vector"; then
     # `set -euo pipefail` that killed the run outright -- on a clean machine
     # the FIRST of these (nothing to kill yet) aborted the script before
     # NUMERIC-07, so MQ, txn_kv, eviction and the RESULT SUMMARY never ran.
-    pkill -f 'moon --port 6411' 2>/dev/null || true
-    pkill -f 'moon --port 6414' 2>/dev/null || true
+    # Kill exactly the two servers this row started. The old name-based pkill
+    # silently missed any `MOON_BIN` not literally named `moon` and leaked both.
+    kill "$N7_PID1" "$N7_PID2" 2>/dev/null || true
+    wait "$N7_PID1" "$N7_PID2" 2>/dev/null || true
 
     echo "  ft_aggregate: done"
 fi
