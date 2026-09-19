@@ -186,6 +186,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WAL without error. A record for a db beyond the configured `--databases`
   count is dropped with a warning instead of being folded into db 0.
 
+- **`SPUBLISH` queued inside `MULTI` is now delivered at `EXEC`** (moon#1043).
+  The command was answered `+QUEUED`, then `EXEC` answered
+  `-ERR unknown command` for that slot while the rest of the transaction
+  committed, so the shard-channel message was silently dropped. The
+  transaction executors intercepted `PUBLISH` for their deferred post-body
+  fan-out but not `SPUBLISH`, which fell through to the keyspace dispatch
+  table. Now both are recorded with their namespace, an enum and not a bool,
+  since the two namespaces can share a channel name without sharing
+  subscribers. After the body, each fans out through the same registry,
+  remote-subscriber map, and SPSC message as its immediate form. This holds
+  on every handler, including an owner-routed EXEC at `--shards > 1`. The
+  channel ACL is checked at fan-out exactly as for `PUBLISH`, so a denied
+  channel answers `NOPERM` in its slot and is never delivered. Measured
+  against redis 8.6.1 at `--shards 1` and `--shards 4`: the EXEC reply
+  (`*2 +OK :3`) and delivery to every subscriber now match.
+
 - **`runtime-tokio` with `--shards 1` now opens every AOF generation with a
   `MOON.COLDCUT`, so a `kill -9` no longer double-applies writes to spilled
   keys or drops acknowledged post-rewrite writes** (moon#914). This is the one
@@ -209,6 +225,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covered:** an AOF written before this change has no head, and replays
   ungated until its first rewrite. Run `BGREWRITEAOF` once after upgrading a
   tokio `--shards 1` deployment that uses disk offload.
+
+- **`CLIENT TRACKING` now invalidates a key that expires or is evicted**
+  (moon#1013). Only command writes used to push `invalidate`, so a
+  client-side cache served an expired or evicted value forever, with no
+  signal. redis 8.6.1 pushes in both cases, and moon now does too. The fix
+  covers the active expiry sweep, the lazy-expiry drain, hash-field expiry
+  (the hash is invalidated even when it survives, as in redis), cold-tier
+  expiry (on read and in the periodic sweep), and plain-drop eviction. A
+  victim spilled to the cold tier is not invalidated, because it stays
+  readable with the same value. All of these go through one hook on the
+  existing process-global tracking table, so BCAST prefixes and NOLOOP
+  behave as they do for writes. An expiry is nobody's own write, so NOLOOP
+  does not suppress it, matching redis. The owner shard pushes straight into
+  a reader on any other shard. With no tracking client the hook costs one
+  relaxed atomic load per removed key. Measured red/green against redis at
+  `--shards 1` and `--shards 4`: before the fix every case got zero pushes,
+  and after it every case got a push.
+
+  Also fixed here: a hash-field TTL on an **idle** database was never
+  reaped. The field reaper runs against the database's cached clock, and
+  only commands advance that clock, so a due field sat in memory (and its
+  invalidation stayed unsent) until unrelated traffic touched the database.
+  The expiry tick now moves that clock forward, never backwards, and only
+  when a hash-field TTL exists.
+
+  Found alongside, filed separately, and not changed here: `REDIRECT` (the
+  RESP2 mode) delivers no invalidation at all (moon#1048), and
+  `CLIENT CACHING` is unimplemented, so `OPTIN`/`OPTOUT` track every read
+  (moon#1049). Both affect writes and expiry alike.
 
 - **Scripts queued inside `MULTI` now run at `EXEC`** (moon#894). `EVAL`,
   `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `FCALL` and `FCALL_RO` were answered

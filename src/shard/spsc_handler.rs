@@ -3161,7 +3161,7 @@ pub(crate) fn handle_shard_message_shared(
                 watched,
                 script_acl,
             } = *payload;
-            let mut exec_publishes: Vec<(usize, bytes::Bytes, bytes::Bytes)> = Vec::new();
+            let mut exec_publishes: Vec<crate::shard::exec_publish::ExecPublish> = Vec::new();
             // c10k E2: a queued FLUSHDB/FLUSHALL clears only THIS shard's
             // slice. Collect them and hand them back to the originator, which
             // broadcasts to the other shards (see `TxnExecReply::exec_flushes`
