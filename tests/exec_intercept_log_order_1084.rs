@@ -2,33 +2,44 @@
 //! logged in the order it was APPLIED, not the order its reply was finished.
 //!
 //! The executor applies the body synchronously and leaves a placeholder for
-//! each queued intercept (`WAIT`, `CLIENT`, `CONFIG`, `SCRIPT`, ...), which the
-//! connection fills afterwards. Several of those fills await. The body's AOF
+//! each queued intercept (`CLIENT`, `CONFIG`, `SCRIPT`, `FUNCTION`, ...), which
+//! the connection fills afterwards. Some of those fills await. The body's AOF
 //! records (and, on monoio, its replication records) used to be appended only
-//! AFTER that await, so a write another client made while `EXEC` was parked
+//! AFTER that await, so a write another client made while `EXEC` was waiting
 //! was logged BEFORE the body although it was applied AFTER it:
 //!
 //! ```text
 //! A: SET k 0
-//! A: MULTI / INCR k / WAIT 1 <ms> / EXEC     (body applied, EXEC parks in WAIT)
+//! A: MULTI / INCR k / SCRIPT LOAD s / EXEC   (body applied, EXEC waits on the
+//!                                             SCRIPT LOAD fan-out)
 //! B: SET k 5                                  -> +OK   (applied after INCR)
-//! A: EXEC reply [1, 0]
+//! A: EXEC reply [1, <sha>]
 //! B: GET k                                    -> "5"   (acknowledged state)
 //! kill -9, restart
 //! GET k                                       -> "6"   (INCR replayed after SET)
 //! ```
 //!
-//! `WAIT n timeout` with more replicas asked for than exist parks for the whole
-//! timeout, which gives a deterministic window for the second client's write —
-//! no test hook is needed.
+//! The await is a queued `SCRIPT LOAD`: filling it fans the script out to every
+//! other shard and waits for each one's ack. One of those shards is kept busy
+//! with `DEBUG SLEEP`, run inside a transaction that shard owns, so the fan-out
+//! — and with it the `EXEC` reply — waits for the sleep to end. That gives a
+//! deterministic window for the second client's write, with no test hook.
 //!
-//! Every server runs `--appendonly yes --appendfsync always`: each reply is
-//! sent after its fsync, so the SIGKILL needs no settle time. At `--shards 4`
-//! the scenario runs once per shard with a key owned by that shard, over ONE
-//! connection, so exactly one iteration takes the connection's LOCAL `EXEC`
-//! path (the one that was wrong) and the others take the owner-routed path,
-//! which logs on the owner in the same stretch as the apply and must stay
-//! right.
+//! (This scenario used to park `EXEC` on a queued `WAIT` asking for more
+//! replicas than exist. Redis answers a `WAIT` inside `MULTI` at once, and so
+//! does moon since moon#1098, so that window is gone. With it went every await
+//! a `--shards 1` `EXEC` could hit: the fan-outs have no other shard to wait
+//! for. The local `EXEC` path is the same code at any shard count, and the
+//! local round below covers it.)
+//!
+//! Which shard a connection lands on is not observable, so every key is raced
+//! once with each other shard stalled. A round opens the window when the stalled
+//! shard is neither A's nor B's. Every server runs `--appendonly yes
+//! --appendfsync always`: each reply is sent after its fsync, so the SIGKILL
+//! needs no settle time. Each shard owns keys, and one connection A runs every
+//! round, so the keys of A's own shard take the connection's LOCAL `EXEC` path
+//! (the one that was wrong) and the others take the owner-routed path, which
+//! logs on the owner in the same stretch as the apply and must stay right.
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 
@@ -41,10 +52,14 @@ use std::time::{Duration, Instant};
 
 use moon::shard::dispatch::key_to_shard;
 
-/// How long the queued `WAIT` parks. Long enough that the second client's
-/// write lands inside it on a loaded host, short enough to keep four
-/// iterations cheap.
-const WAIT_MS: u64 = 1_500;
+const SHARDS: usize = 4;
+/// How long the stalled shard sleeps. Under the 2 s fan-out budget, so the
+/// `SCRIPT LOAD` fan-out waits for it rather than giving up on it.
+const STALL_MS: u64 = 1_000;
+/// Pause between starting the stall and sending the transaction.
+const STEP_MS: u64 = 150;
+/// The script the queued `SCRIPT LOAD` loads.
+const SCRIPT: &str = "return 1084";
 
 fn log_sink(dir: &Path, name: &str) -> Stdio {
     match std::fs::OpenOptions::new()
@@ -102,124 +117,198 @@ fn bulk(v: &str) -> String {
     format!("${}\r\n{v}\r\n", v.len())
 }
 
-/// One key per shard, so that whichever shard the connection landed on, one
-/// of them is owned by it.
-fn keys_covering(shards: usize) -> Vec<String> {
-    let mut keys: Vec<Option<String>> = vec![None; shards];
-    let mut i = 0u32;
-    while keys.iter().any(Option::is_none) {
-        let k = format!("k1084:{i}");
-        let s = key_to_shard(k.as_bytes(), shards);
-        if keys[s].is_none() {
-            keys[s] = Some(k);
-        }
-        i += 1;
-        assert!(i < 100_000, "could not find a key for every shard");
-    }
-    keys.into_iter().flatten().collect()
+/// The first key with `prefix` that shard `shard` owns.
+fn key_on(prefix: &str, shard: usize) -> String {
+    (0u32..100_000)
+        .map(|i| format!("{prefix}:{i}"))
+        .find(|k| key_to_shard(k.as_bytes(), SHARDS) == shard)
+        .expect("a key for every shard")
 }
 
-/// Run the race for one key. On return the server has acknowledged `k = 5`.
-///
-/// `attached` is the number of replicas the server has. The queued `WAIT` asks
-/// for one more, so it parks for its whole timeout and then answers `attached`.
-fn race_one(a: &mut common::Conn, b: &mut common::Conn, key: &str, attached: usize) {
-    assert_eq!(a.send(&["SET", key, "0"]), "+OK\r\n");
+/// One race: the key it writes, the shard that owns it, the shard kept busy.
+struct Round {
+    key: String,
+    owner: usize,
+    stalled: usize,
+}
 
-    // MULTI / INCR / WAIT / EXEC in one write. The replies are read after the
-    // second client has written, while EXEC is parked in WAIT.
-    let wait_ms = WAIT_MS.to_string();
-    let wait_replicas = (attached + 1).to_string();
+/// Every owner shard raced once with each OTHER shard stalled: the owner must
+/// stay free, or the body could not apply while the fan-out waits. Each round
+/// has a key of its own, so a later round cannot overwrite an earlier one's
+/// evidence.
+fn rounds() -> Vec<Round> {
+    let mut out = Vec::new();
+    for owner in 0..SHARDS {
+        for stalled in (0..SHARDS).filter(|&s| s != owner) {
+            out.push(Round {
+                key: key_on(&format!("k1084:o{owner}:s{stalled}"), owner),
+                owner,
+                stalled,
+            });
+        }
+    }
+    out
+}
+
+fn send_raw(c: &mut common::Conn, cmds: &[&[&str]]) {
     let mut batch = Vec::new();
-    for parts in [
-        &["MULTI"][..],
-        &["INCR", key][..],
-        &["WAIT", &wait_replicas, &wait_ms][..],
-        &["EXEC"][..],
-    ] {
+    for parts in cmds {
         batch.extend_from_slice(&common::encode(parts));
     }
-    let sent_at = Instant::now();
-    a.sock.write_all(&batch).expect("write MULTI batch");
+    c.sock.write_all(&batch).expect("write batch");
+}
+
+/// Occupy the thread of shard `shard` for [`STALL_MS`].
+///
+/// `DEBUG SLEEP` blocks the thread that executes it, and a transaction body
+/// executes on the shard that owns its keys — routed there when the
+/// connection lives elsewhere. The replies are left unread; the caller reads
+/// them with [`finish_stall`].
+fn start_stall(port: u16, shard: usize) -> common::Conn {
+    let mut s = common::Conn::open(port);
+    let tagged = format!("{{{}}}:stall", key_on("stall1084", shard));
+    let secs = format!("{:.3}", STALL_MS as f64 / 1000.0);
+    send_raw(
+        &mut s,
+        &[
+            &["MULTI"],
+            &["SET", &tagged, "1"],
+            &["DEBUG", "SLEEP", &secs],
+            &["EXEC"],
+        ],
+    );
+    s
+}
+
+fn finish_stall(mut s: common::Conn) {
+    assert_eq!(
+        s.read_replies(4),
+        "+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n+OK\r\n+OK\r\n",
+        "the stalling transaction must run DEBUG SLEEP"
+    );
+}
+
+/// Run one race. On return the server has acknowledged `key = 5`. Returns
+/// whether B's write provably landed while `EXEC` was still waiting.
+fn race_one(
+    port: u16,
+    a: &mut common::Conn,
+    b: &mut common::Conn,
+    round: &Round,
+    sha: &str,
+) -> bool {
+    let key = round.key.as_str();
+    assert_eq!(a.send(&["SET", key, "0"]), "+OK\r\n");
+
+    let stall = start_stall(port, round.stalled);
+    let stall_start = Instant::now();
+    std::thread::sleep(Duration::from_millis(STEP_MS));
+
+    // MULTI / INCR / SCRIPT LOAD / EXEC in one write. The replies are read
+    // after the second client has written.
+    send_raw(
+        a,
+        &[
+            &["MULTI"],
+            &["INCR", key],
+            &["SCRIPT", "LOAD", SCRIPT],
+            &["EXEC"],
+        ],
+    );
 
     // The body is applied before the intercept is filled: wait until it is
-    // visible, so the write below is provably applied AFTER it.
-    let deadline = sent_at + Duration::from_millis(WAIT_MS / 2);
-    loop {
-        if b.send(&["GET", key]) == bulk("1") {
-            break;
-        }
+    // visible, so the write below is provably applied AFTER it. When A or B
+    // lives on the stalled shard it only becomes visible after the stall;
+    // that round simply does not open the window.
+    let deadline = stall_start + Duration::from_millis(STALL_MS * 5);
+    while b.send(&["GET", key]) != bulk("1") {
         assert!(
             Instant::now() < deadline,
-            "{key}: the EXEC body never became visible while EXEC was parked"
+            "{key}: the EXEC body never became visible"
         );
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(b.send(&["SET", key, "5"]), "+OK\r\n", "{key}: SET k 5");
-    // The race only means something if the write really landed while EXEC
-    // was still parked; otherwise the ordering was never in question.
-    assert!(
-        sent_at.elapsed() < Duration::from_millis(WAIT_MS * 9 / 10),
-        "{key}: the second client's write was too slow to land inside WAIT \
-         ({:?}); the scenario did not exercise the race",
-        sent_at.elapsed()
-    );
+    // The EXEC reply needs the stalled shard's ack for the SCRIPT LOAD
+    // fan-out, so a write acknowledged well before the stall ends landed
+    // while EXEC was still waiting.
+    let in_window = stall_start.elapsed() < Duration::from_millis(STALL_MS - STEP_MS);
 
-    let replies = a.read_replies(4);
     assert_eq!(
-        replies,
-        format!("+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n:1\r\n:{attached}\r\n"),
-        "{key}: MULTI/INCR/WAIT/EXEC replies"
+        a.read_replies(4),
+        format!("+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n:1\r\n{}", bulk(sha)),
+        "{key}: MULTI/INCR/SCRIPT LOAD/EXEC replies"
     );
-    // And EXEC really was parked while it happened. Redis answers a WAIT
-    // queued in MULTI at once; if moon ever does too, this scenario has no
-    // window left and must move to another intercept that awaits, rather than
-    // keep passing without testing anything.
-    assert!(
-        sent_at.elapsed() >= Duration::from_millis(WAIT_MS * 9 / 10),
-        "{key}: EXEC answered after {:?}, so the queued WAIT did not park and \
-         the second client's write did not race it",
-        sent_at.elapsed()
-    );
+    finish_stall(stall);
     assert_eq!(
         b.send(&["GET", key]),
         bulk("5"),
         "{key}: acknowledged value"
     );
+    in_window
 }
 
-fn scenario(shards: usize) {
-    let dir = common::unique_test_dir(&format!("moon-1084-s{shards}"));
-    let (mut server, port) = spawn(&dir, shards);
+/// Run every round over ONE connection A (its shard is fixed, so the keys of
+/// that shard take the local `EXEC` path) and check that the window opened.
+fn race_all(port: u16) -> Vec<Round> {
+    let rounds = rounds();
+    let mut a = common::Conn::open(port);
+    let mut b = common::Conn::open(port);
+    let reply = a.send(&["SCRIPT", "LOAD", SCRIPT]);
+    let sha = reply
+        .strip_prefix("$40\r\n")
+        .and_then(|r| r.strip_suffix("\r\n"))
+        .unwrap_or_else(|| panic!("SCRIPT LOAD answered {reply:?}"))
+        .to_string();
 
-    let keys = keys_covering(shards);
-    {
-        // ONE connection A for every iteration: its shard is fixed, so exactly
-        // one key is local to it at --shards 4.
-        let mut a = common::Conn::open(port);
-        let mut b = common::Conn::open(port);
-        for key in &keys {
-            race_one(&mut a, &mut b, key, 0);
+    let mut opened = [0usize; SHARDS];
+    for round in &rounds {
+        if race_one(port, &mut a, &mut b, round, &sha) {
+            opened[round.owner] += 1;
         }
     }
+    eprintln!("in-window rounds per owner shard: {opened:?}");
+    // Every owner has at least one stalled shard that is neither A's nor B's,
+    // so every owner — A's own shard included — must have raced at least
+    // once. Otherwise the host was too loaded to open the window and a green
+    // result would mean nothing.
+    assert!(
+        opened.iter().all(|&n| n > 0),
+        "some owner shard never raced B's write inside the stall \
+         (in-window rounds per owner: {opened:?}); the local EXEC path may not \
+         have been exercised"
+    );
+    rounds
+}
+
+#[test]
+fn exec_with_waiting_intercept_logs_in_applied_order() {
+    let dir = common::unique_test_dir("moon-1084-exec");
+    let (mut server, port) = spawn(&dir, SHARDS);
+    let rounds = race_all(port);
 
     // appendfsync always: every reply above was sent after its fsync.
     server.kill_now();
     common::wait_for_port_down(port);
-    let (mut restarted, port) = spawn(&dir, shards);
+    let (mut restarted, port) = spawn(&dir, SHARDS);
 
     let mut c = common::Conn::open(port);
-    let wrong: Vec<String> = keys
+    let wrong: Vec<String> = rounds
         .iter()
-        .filter_map(|k| {
-            let got = c.send(&["GET", k]);
-            (got != bulk("5")).then(|| format!("{k}: acknowledged \"5\", recovered {got:?}"))
+        .filter_map(|r| {
+            let got = c.send(&["GET", &r.key]);
+            (got != bulk("5")).then(|| {
+                format!(
+                    "{} (owner {}, stalled {}): acknowledged \"5\", recovered {got:?}",
+                    r.key, r.owner, r.stalled
+                )
+            })
         })
         .collect();
     assert!(
         wrong.is_empty(),
-        "--shards {shards}: recovery replayed the EXEC body after a write that \
-         was applied after it (moon#1084):\n{wrong:#?}\n--- server log ---\n{}",
+        "recovery replayed the EXEC body after a write that was applied after \
+         it (moon#1084):\n{wrong:#?}\n--- server log ---\n{}",
         server_log(&dir)
     );
     drop(c);
@@ -227,20 +316,10 @@ fn scenario(shards: usize) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn exec_with_parked_intercept_logs_in_applied_order_1_shard() {
-    scenario(1);
-}
-
-#[test]
-fn exec_with_parked_intercept_logs_in_applied_order_4_shards() {
-    scenario(4);
-}
-
 /// The replication stream has the same ordering contract as the AOF: a replica
 /// applies the master's records in stream order, so a body recorded after the
-/// parked intercept reached the replica after the other client's write and the
-/// replica settled on `6` while the master held `5`.
+/// waiting intercept reached the replica after the other client's write and
+/// the replica settled on `6` while the master held `5`.
 ///
 /// monoio only: it is the runtime with master-side fan-out. `#[ignore]`d like
 /// every replication suite (two live servers):
@@ -249,10 +328,12 @@ fn exec_with_parked_intercept_logs_in_applied_order_4_shards() {
 /// MOON_BIN=... cargo test --test exec_intercept_log_order_1084 -- --ignored
 /// ```
 #[cfg(feature = "runtime-monoio")]
-fn replication_scenario(shards: usize) {
-    let mdir = common::unique_test_dir(&format!("moon-1084-master-s{shards}"));
-    let rdir = common::unique_test_dir(&format!("moon-1084-replica-s{shards}"));
-    let (mut master, mport) = spawn(&mdir, shards);
+#[test]
+#[ignore]
+fn exec_with_waiting_intercept_replicates_in_applied_order() {
+    let mdir = common::unique_test_dir("moon-1084-master");
+    let rdir = common::unique_test_dir("moon-1084-replica");
+    let (mut master, mport) = spawn(&mdir, SHARDS);
     let (mut replica, rport) = spawn(&rdir, 1);
 
     let mut r = common::Conn::open(rport);
@@ -270,14 +351,10 @@ fn replication_scenario(shards: usize) {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let keys = keys_covering(shards);
-    let mut a = common::Conn::open(mport);
-    let mut b = common::Conn::open(mport);
-    for key in &keys {
-        race_one(&mut a, &mut b, key, 1);
-    }
+    let rounds = race_all(mport);
     // A fence written after every race. The per-key poll below tolerates a
     // stream that is merely behind; the fence bounds how long that can be.
+    let mut a = common::Conn::open(mport);
     assert_eq!(a.send(&["SET", "fence1084", "end"]), "+OK\r\n");
     let fence_deadline = Instant::now() + Duration::from_secs(20);
     while r.send(&["GET", "fence1084"]) != bulk("end") {
@@ -288,7 +365,8 @@ fn replication_scenario(shards: usize) {
         std::thread::sleep(Duration::from_millis(50));
     }
     let mut wrong = Vec::new();
-    for k in &keys {
+    for round in &rounds {
+        let k = round.key.as_str();
         let deadline = Instant::now() + Duration::from_secs(5);
         let got = loop {
             let got = r.send(&["GET", k]);
@@ -299,31 +377,18 @@ fn replication_scenario(shards: usize) {
         };
         if got != bulk("5") {
             wrong.push(format!(
-                "{k}: master acknowledged \"5\", replica holds {got:?}"
+                "{k} (owner {}, stalled {}): master acknowledged \"5\", replica holds {got:?}",
+                round.owner, round.stalled
             ));
         }
     }
     assert!(
         wrong.is_empty(),
-        "--shards {shards}: the replica applied the EXEC body after a write the \
-         master applied after it (moon#1084):\n{wrong:#?}"
+        "the replica applied the EXEC body after a write the master applied \
+         after it (moon#1084):\n{wrong:#?}"
     );
     replica.kill_now();
     master.kill_now();
     let _ = std::fs::remove_dir_all(&mdir);
     let _ = std::fs::remove_dir_all(&rdir);
-}
-
-#[cfg(feature = "runtime-monoio")]
-#[test]
-#[ignore]
-fn exec_with_parked_intercept_replicates_in_applied_order_1_shard() {
-    replication_scenario(1);
-}
-
-#[cfg(feature = "runtime-monoio")]
-#[test]
-#[ignore]
-fn exec_with_parked_intercept_replicates_in_applied_order_4_shards() {
-    replication_scenario(4);
 }

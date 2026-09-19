@@ -262,12 +262,34 @@ pub(crate) fn drain_spsc_shared(
     };
 
     let mut snapshot_seen = false;
+    // moon#769: routed write legs are admitted against this shard's AOF
+    // writer BEFORE they are popped, so before they apply anything. A leg the
+    // writer cannot take yet stays at the head of its ring (its producer's
+    // FIFO) and this ring is left for the next drain; nothing here waits. See
+    // `shard::aof_admission` for the ordering and accounting argument.
+    let mut admission =
+        aof_pool.map(|pool| crate::shard::aof_admission::AdmissionCycle::new(pool, shard_id));
     for idx in rotated_indices(start, n) {
         let consumer = &mut consumers[idx];
         if snapshot_seen {
             break;
         }
         while drained < MAX_DRAIN_PER_CYCLE {
+            if let Some(cycle) = admission.as_mut()
+                && let Some(head) = consumer.first()
+            {
+                match cycle.decide(idx, head) {
+                    crate::shard::aof_admission::Admission::Admit => {}
+                    crate::shard::aof_admission::Admission::Wait => break,
+                    crate::shard::aof_admission::Admission::Refuse => {
+                        if let Some(msg) = consumer.try_pop() {
+                            drained += 1;
+                            crate::shard::aof_admission::refuse_routed_leg(msg);
+                        }
+                        continue;
+                    }
+                }
+            }
             match consumer.try_pop() {
                 Some(msg) => {
                     drained += 1;
@@ -3211,16 +3233,18 @@ pub(crate) fn handle_shard_message_shared(
             // count as the phase-3 mid-drain bound, preventing an infinite drain
             // loop under sustained high write load where the channel never empties.
             let pending_aof_count = aof_pool.map(|p| p.sender(shard_id).len()).unwrap_or(0);
-            // #452.1 snapshot cut (P0 fix): entries spilled into the rewrite
-            // overflow BEFORE this instant have their effects captured by the
-            // snapshot below (the shard mutates before enqueuing/spilling) —
-            // the post-fold overflow drain must NOT write them into the NEW
-            // incr (base already contains them → double-apply of
-            // non-idempotent commands on replay). Record the buffer-side cut
-            // at the same atomic instant as the channel-side count above.
-            if let Some(p) = aof_pool {
-                p.overflow_for(shard_id).mark_cut();
-            }
+            // #455 snapshot epoch, opened at the same atomic instant as the
+            // channel-side count above: every record stamped before it logs a
+            // mutation the snapshot below captures (the shard mutates before
+            // it stamps), wherever that record is — drained, queued, spilled,
+            // or with a producer still parked or awaiting between mutation
+            // and enqueue. Once the new generation is committed, the writer
+            // drops each such record instead of writing it into the NEW incr
+            // on top of a base that already holds its effect (double-apply of
+            // non-idempotent commands on replay).
+            let fold_epoch = aof_pool.map_or(crate::persistence::aof::FoldEpoch::INITIAL, |p| {
+                p.overflow_for(shard_id).advance_epoch()
+            });
             let now_ms = crate::storage::entry::current_time_ms();
             let snapshot = crate::shard::slice::with_shard(|s| {
                 // Shared guards on EVERY db for the whole capture: the same
@@ -3242,6 +3266,7 @@ pub(crate) fn handle_shard_message_shared(
                         pending_aof_count,
                         // moon#902: same atomic instant as the two cuts above.
                         cold_file_watermark: spill_file_id.get(),
+                        fold_epoch,
                     }
                 })
             });
@@ -5468,3 +5493,6 @@ mod drain_rotation_tests {
         assert_eq!(rotated_indices(0, 0).count(), 0);
     }
 }
+
+#[cfg(test)]
+mod aof_admission_tests;

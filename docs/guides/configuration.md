@@ -44,7 +44,7 @@ cores that now auto-gates on shared ones, so it's safe on any host — or use
 |------|---------|-------------|
 | `--appendonly` | `yes` | Enable append-only file persistence (`yes`/`no`) — Moon is durable by default |
 | `--appendfsync` | `everysec` | AOF fsync policy: `always`, `everysec`, or `no` |
-| `--aof-fsync-timeout-ms` | `2000` | Max time a write may block awaiting durability (fsync ack under `always`, writer-queue backpressure under `everysec`) before it fails loudly instead of parking the connection. `0` = unbounded |
+| `--aof-fsync-timeout-ms` | `2000` | Max time a write may block awaiting durability (fsync ack under `always`, writer-queue backpressure under `everysec`) before it fails loudly instead of parking the connection. `0` = unbounded. A write routed to another shard (any `appendfsync` policy) waits for room in that shard's AOF writer queue, unapplied and without blocking the shard, for this long but at most 10 s (`0` = 10 s); then it is refused unapplied |
 | `--wal-kv-log` | `auto` | KV command logging into the per-shard WAL. `auto`: skipped while the AOF is the recovery authority (`--appendonly yes`) and no CDC subscriber is attached — halves write volume at `--shards >= 2`; re-engages automatically when a CDC subscriber attaches. `on`: always log (pre-0.6 behavior; needed for [PITR](pitr.md) or full [CDC](cdc.md) history alongside AOF). `off`: never log KV records |
 | `--appendfilename` | `appendonly.aof` | AOF filename |
 | `--save` | *(none)* | RDB auto-save rules (e.g., `"3600 1 300 100"`) |
