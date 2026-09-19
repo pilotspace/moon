@@ -16,6 +16,8 @@ use std::path::Path;
 /// NTFS journals rename metadata without an explicit directory flush — the
 /// same approach LevelDB/RocksDB take on Windows.
 pub fn fsync_directory(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    dir_fsync_probe::record(dir);
     #[cfg(unix)]
     {
         let f = std::fs::File::open(dir)?;
@@ -32,6 +34,43 @@ pub fn fsync_directory(dir: &Path) -> std::io::Result<()> {
                 format!("not a directory: {}", dir.display()),
             ))
         }
+    }
+}
+
+/// Test-only record of the directory fsyncs this thread issues, each with the
+/// entry names the directory held at that instant: an entry is durable only
+/// if a directory fsync ran after it was created.
+#[cfg(test)]
+pub(crate) mod dir_fsync_probe {
+    use std::cell::RefCell;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    type Log = Vec<(PathBuf, Vec<OsString>)>;
+
+    thread_local! {
+        static LOG: RefCell<Option<Log>> = const { RefCell::new(None) };
+    }
+
+    /// Start recording on this thread.
+    pub(crate) fn start() {
+        LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Stop recording and return what was recorded.
+    pub(crate) fn stop() -> Log {
+        LOG.with(|l| l.borrow_mut().take().unwrap_or_default())
+    }
+
+    pub(super) fn record(dir: &Path) {
+        LOG.with(|l| {
+            if let Some(log) = l.borrow_mut().as_mut() {
+                let names = std::fs::read_dir(dir)
+                    .map(|it| it.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
+                    .unwrap_or_default();
+                log.push((dir.to_path_buf(), names));
+            }
+        });
     }
 }
 

@@ -494,11 +494,14 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          aof_base_size:{}\r\n\
          aof_current_size:{}\r\n\
          aof_backpressure_dropped:{}\r\n\
+         aof_backpressure_stalls:{}\r\n\
+         aof_backpressure_refused:{}\r\n\
          aof_last_fsync_status:{}\r\n\
          aof_fsync_failures:{}\r\n\
          aof_last_append_status:{}\r\n\
          aof_reason_del_dropped:{}\r\n\
          aof_rewrite_overflow_spilled:{}\r\n\
+         aof_rewrite_late_records_folded:{}\r\n\
          spill_batches_flushed:{}\r\n\
          spill_completions_dropped:{}\r\n\
          spill_failed_reinserted:{}\r\n\
@@ -551,6 +554,11 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         aof_current_size,
         crate::persistence::aof::AOF_BACKPRESSURE_DROPPED
             .load(std::sync::atomic::Ordering::Relaxed),
+        // moon#769: routed writes that waited for the AOF writer before
+        // applying, and those refused unapplied when it never caught up.
+        crate::persistence::aof::AOF_BACKPRESSURE_STALLS.load(std::sync::atomic::Ordering::Relaxed),
+        crate::persistence::aof::AOF_BACKPRESSURE_REFUSED
+            .load(std::sync::atomic::Ordering::Relaxed),
         if crate::persistence::aof::aof_last_fsync_ok() {
             "ok"
         } else {
@@ -564,6 +572,10 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         },
         crate::persistence::aof::AOF_REASON_DEL_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
         crate::persistence::aof::rewrite_overflow::AOF_REWRITE_OVERFLOW_SPILLED
+            .load(std::sync::atomic::Ordering::Relaxed),
+        // Records a fold's base already held that reached the writer after
+        // the fold took effect — dropped, not replayed twice (#455).
+        crate::persistence::aof::AOF_REWRITE_LATE_RECORDS_FOLDED
             .load(std::sync::atomic::Ordering::Relaxed),
         crate::storage::tiered::spill_thread::spill_batches_flushed_total(),
         crate::storage::tiered::spill_thread::spill_completion_dropped_total(),

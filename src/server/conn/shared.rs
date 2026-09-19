@@ -951,6 +951,12 @@ pub(crate) fn execute_transaction_sharded(
 /// (lsn = 0; per-shard order is append order, same contract as the
 /// single-command write legs). The tokio handler passes `false` (tokio-side
 /// master fanout is not wired; monoio is the production replication runtime).
+///
+/// `fold_stamp`: the AOF fold epoch read when the body executed
+/// ([`crate::persistence::aof::AofWriterPool::fold_stamp`]), taken before any
+/// await that follows the executor. Every entry carries it, so a fold that
+/// snapshotted the body before these appends are enqueued drops them rather
+/// than replaying the body on top of its base (#455).
 pub(crate) async fn persist_txn_aof(
     ctx: &crate::server::conn::core::ConnectionContext,
     // task #35 + PR #282 review: each entry carries the db THAT command
@@ -959,6 +965,7 @@ pub(crate) async fn persist_txn_aof(
     // body on recovery.
     aof_entries: Vec<(usize, Bytes)>,
     repl_recorded: bool,
+    fold_stamp: crate::persistence::aof::FoldEpoch,
 ) -> Result<(), ()> {
     if aof_entries.is_empty() {
         return Ok(());
@@ -977,7 +984,10 @@ pub(crate) async fn persist_txn_aof(
                 bytes.len(),
             )
         };
-        match pool.send_append_group(ctx.shard_id, lsn, db, bytes).await {
+        match pool
+            .send_append_group(ctx.shard_id, lsn, db, bytes, fold_stamp)
+            .await
+        {
             Ok(true) => barrier_pending = true,
             Ok(false) => {}
             Err(_) => return Err(()),
@@ -1447,7 +1457,25 @@ async fn push_bounded(
 /// On a healthy mesh a push costs microseconds and an ack one round trip, so
 /// this ceiling is never approached; it exists so a wedged shard degrades to a
 /// reported divergence instead of a stalled client.
+///
+/// With AOF on, a target's ring can legitimately hold a routed write parked
+/// for AOF room ahead of the fan-out message, for up to
+/// `AofWriterPool::routed_admission_wait` (moon#769). The budget then grows by
+/// that wait (see [`fanout_budget`]) so a slow disk is not reported as a
+/// divergent shard.
 const FANOUT_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`FANOUT_BUDGET`] plus the longest a routed write can sit parked at the
+/// head of a target's ring, ahead of the fan-out message, waiting for AOF
+/// room. Past that wait the parked write is refused and every later write
+/// that finds no room is refused at once, so the ring moves again.
+fn fanout_budget(ctx: &super::core::ConnectionContext) -> std::time::Duration {
+    FANOUT_BUDGET
+        + ctx
+            .aof_pool
+            .as_ref()
+            .map_or(std::time::Duration::ZERO, |p| p.routed_admission_wait())
+}
 
 /// What a fan-out managed to do, from the point of view of the client waiting
 /// on the command that triggered it.
@@ -1529,7 +1557,8 @@ async fn fanout_to_other_shards(
     let mut reached = 0usize;
     // ONE deadline for pushes and acks together. A wedged mesh must cost the
     // client a bounded wait, not (retry budget + ack budget) x N shards.
-    let deadline = std::time::Instant::now() + FANOUT_BUDGET;
+    let budget = fanout_budget(ctx);
+    let deadline = std::time::Instant::now() + budget;
     for target in 0..ctx.num_shards {
         if target == ctx.shard_id {
             continue;
@@ -1573,7 +1602,7 @@ async fn fanout_to_other_shards(
             Err(_) => {
                 tracing::warn!(
                     "shard {}: {kind} fan-out to shard {target} was pushed but not acked \
-                     within the {FANOUT_BUDGET:?} fan-out budget; that shard may be wedged and \
+                     within the {budget:?} fan-out budget; that shard may be wedged and \
                      is divergent until it drains or the op is re-issued",
                     ctx.shard_id
                 );
