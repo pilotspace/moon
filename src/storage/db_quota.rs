@@ -69,6 +69,20 @@ pub fn db_maxmemory_any_set() -> bool {
     DB_MAXMEMORY_ANY_SET.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Test-only: put the flag back to a previously captured value.
+///
+/// The public publisher above derives the flag from a whole `RuntimeConfig`,
+/// which is the right contract for production (there is exactly one source of
+/// truth) but cannot express "restore whatever was here before" — the config
+/// that produced the old value is long gone by then. Exists so
+/// `eviction::PublishedLimits` can restore this atomic alongside the four it
+/// owns directly, WITHOUT widening `DB_MAXMEMORY_ANY_SET` itself to
+/// `pub(crate)` and handing every module in the crate a way to write it.
+#[cfg(test)]
+pub(crate) fn restore_db_maxmemory_any_set(any: bool) {
+    DB_MAXMEMORY_ANY_SET.store(any, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// OOM error frame for a db-quota breach — distinct wording from the global
 /// `OOM command not allowed when used memory > 'maxmemory'` so operators can
 /// tell the two gates apart in logs/client errors.
@@ -366,18 +380,18 @@ mod tests {
 
     #[test]
     fn publish_and_read_any_set_flag() {
+        // moon#856: `DB_MAXMEMORY_ANY_SET` is process-global, and the manual
+        // reset this test used to end with was the weaker half of the fix the
+        // old comment described — it did not run on the unwind path, so a
+        // failing assertion below left `true` published for the rest of the
+        // `cargo test --lib` process. `PublishedLimits` restores on BOTH paths.
+        let _limits = crate::storage::eviction::PublishedLimits::capture();
+
         publish_db_maxmemory_any_set(&RuntimeConfig::default());
         assert!(!db_maxmemory_any_set());
 
         let rt = rt_with_quota(vec![0, 0, 1024], "noeviction");
         publish_db_maxmemory_any_set(&rt);
         assert!(db_maxmemory_any_set());
-
-        // Reset for other tests running in the same process (atomics are
-        // process-global — tests in this module run serially enough that a
-        // final reset avoids leaking state, though `cargo test` may
-        // interleave with other modules touching the same atomic; this
-        // module only asserts its own writes/reads, not global ordering).
-        publish_db_maxmemory_any_set(&RuntimeConfig::default());
     }
 }

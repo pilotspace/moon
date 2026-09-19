@@ -30,17 +30,25 @@
 # and at 7a87f69f, fifteen unit tests later: 5352 passed / 1 failed. That drift
 # is exactly why the baseline below is a count that is REPORTED, not asserted.
 #
-# That is moon#856, and it is NOT macOS-specific as was believed -- what varies
-# is the RUNNER, not the platform. nextest is kept for the other ~6000 tests;
-# this adds the single-process run back beside it, for ~70-90s.
+# That was moon#856, and it was NOT macOS-specific as was believed -- what
+# varied is the RUNNER, not the platform. nextest is kept for the other ~6000
+# tests; this adds the single-process run back beside it, for ~70-90s.
+#
+# moon#856 is now FIXED and its waiver is RETIRED (see LIBTEST_KNOWN_FAILURES
+# below). It was never a race: `command::config::config_set` publishes five
+# process-global memory-limit atomics on the CONFIG SET path and its unit tests
+# never restored them, so the leak was PERMANENT and only the victim varied.
+# `storage::eviction::PublishedLimits` scopes them now. This gate waives
+# nothing; a single failure is a failure.
 #
 # ── What is ASSERTED, and what is only REPORTED ──────────────────────────
 # ASSERTED: the suite reached its summary; it ran at least $MIN_LIBTEST_TESTS
-# tests; there is at most $LIBTEST_KNOWN_FAILURES failure; and that failure is
-# $LIBTEST_KNOWN_FAILURE by name. Count AND identity, because either alone is
-# too loose: a count-only waiver waves a DIFFERENT single failure through
-# (which is how "this suite always has that one red line" turns into a real
-# regression shipping green), and a name-only one would not notice a second.
+# tests; there is at most $LIBTEST_KNOWN_FAILURES failure (now 0); and, if a
+# waiver is ever re-armed, that failure is $LIBTEST_KNOWN_FAILURE by name.
+# Count AND identity, because either alone is too loose: a count-only waiver
+# waves a DIFFERENT single failure through (which is how "this suite always has
+# that one red line" turns into a real regression shipping green), and a
+# name-only one would not notice a second.
 #
 # REPORTED, gated on nothing: the passed count. It changes every time anyone
 # adds a test, and it is NOT comparable across platforms -- Linux-only `cfg`
@@ -48,39 +56,39 @@
 # Linux than on macOS. A gate on that number would report a phantom +21 on a
 # perfectly correct Linux run. `platform_baseline` below therefore prints the
 # figure for the platform in hand, with the commit and date it was captured,
-# so a human reads `baseline+N passed / 1 failed` and recognises "the known
-# one" instead of a bare red.
+# so a human reads `baseline+N passed / 0 failed` and recognises a healthy run
+# that simply added N tests, instead of an unexplained count.
 #
-# The identity is safe to assert despite the order-dependence: what varies is
+# The identity was safe to assert despite the order-dependence: what varied is
 # which SIBLING poisons the global, not which test carries the fragile
-# assertion. Eight runs across two platforms and two runtimes name the same
-# test. If it ever does move, the gate says so in those words rather than
-# waving it through.
+# assertion. Eight runs across two platforms and two runtimes named the same
+# test.
 #
 # ── DEVELOPER TRAP: re-running the suspect test alone is NOT a control ────
-# These failures are order-dependent by construction. On pristine main the
-# moon#856 test PASSES in isolation and fails only in the full --lib run. An
-# engineer who isolates the red test sees green and concludes their own branch
-# caused it -- the exact inversion of what the isolation check was for. To
-# attribute a NEW failure, re-run this gate on the merge-base, not the test on
-# its own.
+# Cross-test-leak failures are order-dependent by construction. moon#856's
+# victim PASSED in isolation and failed only in the full --lib run. An engineer
+# who isolates the red test sees green and concludes their own branch caused it
+# -- the exact inversion of what the isolation check was for. To attribute a
+# NEW failure, re-run this gate on the merge-base, not the test on its own.
 #
 # ── Maintaining the baseline ─────────────────────────────────────────────
 # Two knobs, both env-overridable, both meant to be edited in this file when
 # the facts change:
 #
-#   LIBTEST_KNOWN_FAILURES (default 1) -- how many failures moon#856 accounts
-#     for. WHEN moon#856 IS FIXED, set this to 0 in this file; the gate then
-#     fails on any failure at all. Until then a run with FEWER failures than
-#     the waiver allows prints a NOTICE naming that exact edit (it does not
-#     fail: an order-dependent bug can hide on a lucky scheduling, and a gate
-#     that grounds healthy branches gets disabled, after which it guards
-#     nothing).
+#   LIBTEST_KNOWN_FAILURES (default 0 since moon#856 was fixed) -- how many
+#     failures a waiver accounts for. At 0 the gate fails on any failure at
+#     all, which is where it should stay. If a new cross-test leak ever has to
+#     be tolerated, raise it AND set LIBTEST_KNOWN_FAILURE, and file the issue.
+#     A run with FEWER failures than a waiver allows prints a NOTICE naming the
+#     edit that retires it (it does not fail: an order-dependent bug can hide
+#     on a lucky scheduling, and a gate that grounds healthy branches gets
+#     disabled, after which it guards nothing).
 #
-#   LIBTEST_KNOWN_FAILURE -- the ONE test name the waiver covers. Retire it
-#     together with the count above. If moon#856's failure ever lands on a
-#     different test, this gate goes red and names both, which is the correct
-#     outcome: that is either a new leak or the same one with a new victim.
+#   LIBTEST_KNOWN_FAILURE (default empty) -- the ONE test name a waiver covers.
+#     Set and retired together with the count above. If the waived failure ever
+#     lands on a different test, this gate goes red and names both, which is
+#     the correct outcome: that is either a new leak or the same one with a new
+#     victim.
 #
 #   platform_baseline() -- the printed reference counts, one branch per
 #     `uname -s`/`uname -m`. Add a branch when the bar starts running on a new
@@ -102,8 +110,20 @@
 set -uo pipefail
 
 MIN_LIBTEST_TESTS="${MIN_LIBTEST_TESTS:-5000}"
-LIBTEST_KNOWN_FAILURES="${LIBTEST_KNOWN_FAILURES:-1}"
-LIBTEST_KNOWN_FAILURE="${LIBTEST_KNOWN_FAILURE:-scripting::bridge::tests::gate_is_skipped_with_spill_sender_when_no_limit_is_configured}"
+# WAIVER RETIRED -- moon#856 is FIXED. `config_set` published five
+# process-global memory-limit atomics and its unit tests never put them back;
+# `storage::eviction::PublishedLimits` now scopes every one of them to the call
+# that makes it. There is no known failure any more, so the gate waives NOTHING
+# and any failure at all fails it.
+#
+# The two knobs stay, empty, rather than being deleted: they are the mechanism
+# for waiving a known failure, and the self-test below proves that mechanism
+# still refuses the things it should. If a NEW cross-test leak is ever found
+# and has to be tolerated for a while, set BOTH -- a count-only waiver waves a
+# different single failure through, which is how "that one red line is normal"
+# turns into a real regression shipping green.
+LIBTEST_KNOWN_FAILURES="${LIBTEST_KNOWN_FAILURES:-0}"
+LIBTEST_KNOWN_FAILURE="${LIBTEST_KNOWN_FAILURE:-}"
 
 # The reference counts, keyed by PLATFORM, and printed for information only --
 # nothing is gated on them (see the header). Keying matters because the counts
@@ -114,24 +134,25 @@ LIBTEST_KNOWN_FAILURE="${LIBTEST_KNOWN_FAILURE:-scripting::bridge::tests::gate_i
 platform_baseline() {
   case "$(uname -s) $(uname -m)" in
     "Darwin arm64")
-      echo "baselines for macOS aarch64, captured 2026-09-10 at 7a87f69f:"
-      echo "  5352 / 1   default features"
-      echo "  4470 / 1   runtime-tokio,jemalloc (no graph, no text-index)" ;;
+      echo "baselines for macOS aarch64, default features re-captured with"
+      echo "  moon#856 fixed (a8eb2efc + the fix, 2026-09-16):"
+      echo "  5559 / 0   default features  (was 5352 / 1 at 7a87f69f)"
+      echo "  4470 / 1   runtime-tokio,jemalloc -- PRE-fix; the 1 is gone now" ;;
     "Linux aarch64")
       echo "baseline for Linux aarch64 (moon-bench-arm), captured at f7c83769:"
-      echo "  5357 / 1   default features"
+      echo "  5357 / 1   default features -- PRE-moon#856-fix; the 1 is gone now"
       echo "  the +21 over macOS is cfg(target_os = \"linux\") tests, not drift" ;;
     "Linux x86_64")
       echo "baseline for Linux x86_64 (hosted ubuntu Check leg), 2026-09-10:"
-      echo "  4501 / 1   runtime-tokio,jemalloc (no graph, no text-index)"
+      echo "  4501 / 1   runtime-tokio,jemalloc -- PRE-moon#856-fix, now 0 failed"
       echo "  no default-features figure captured on this platform yet" ;;
     *)
       echo "no baseline captured for $(uname -s) $(uname -m). The count above is"
       echo "  informational and nothing is gated on it; add a branch to"
       echo "  platform_baseline() rather than borrowing another platform's." ;;
   esac
-  echo "A branch adding N unit tests reads as baseline+N passed / 1 failed."
-  echo "  The 1 is moon#856."
+  echo "A branch adding N unit tests reads as baseline+N passed / 0 failed."
+  echo "  Since moon#856 this gate waives nothing: any failure fails it."
 }
 
 # Evaluate a captured transcript. Separated from running the suite so
@@ -187,10 +208,21 @@ evaluate_transcript() { # evaluate_transcript <transcript> <rc>
   local names unknown
   names="$(sed -n '/^failures:$/,/^test result: /p' <<< "$out" \
     | grep -E '^ +[a-z_][A-Za-z0-9_:]*$' | sed 's/^ *//' | sort -u)"
-  unknown="$(grep -vxF "$LIBTEST_KNOWN_FAILURE" <<< "$names" | grep -v '^$')"
+  # With the waiver retired `LIBTEST_KNOWN_FAILURE` is empty, and an empty
+  # pattern is not a reliable "match nothing" across greps -- spell the two
+  # cases out rather than depend on it.
+  if [ -n "$LIBTEST_KNOWN_FAILURE" ]; then
+    unknown="$(grep -vxF "$LIBTEST_KNOWN_FAILURE" <<< "$names" | grep -v '^$')"
+  else
+    unknown="$(grep -v '^$' <<< "$names")"
+  fi
 
   if [ "$failed" -gt "$LIBTEST_KNOWN_FAILURES" ]; then
-    echo "GATE FAIL: ${failed} failures, waiver covers at most ${LIBTEST_KNOWN_FAILURES}." >&2
+    if [ "$LIBTEST_KNOWN_FAILURES" -eq 0 ]; then
+      echo "GATE FAIL: ${failed} failure(s); this gate waives nothing (moon#856 is fixed)." >&2
+    else
+      echo "GATE FAIL: ${failed} failures, waiver covers at most ${LIBTEST_KNOWN_FAILURES}." >&2
+    fi
     echo "  These are SINGLE-PROCESS failures: the mechanism is process-global" >&2
     echo "  state leaking between tests, so it is ORDER-DEPENDENT. Re-running" >&2
     echo "  the red test ALONE will very likely pass and prove nothing." >&2
@@ -234,18 +266,19 @@ evaluate_transcript() { # evaluate_transcript <transcript> <rc>
   if [ "$failed" -lt "$LIBTEST_KNOWN_FAILURES" ]; then
     echo ""
     echo "  NOTICE: ${failed} failure(s), but the waiver allows ${LIBTEST_KNOWN_FAILURES}."
-    echo "    If moon#856 is fixed, set LIBTEST_KNOWN_FAILURES=0 at the top of"
-    echo "    scripts/libtest-singleproc-gate.sh and close it. Not a failure"
-    echo "    here: the bug is order-dependent and can hide on a lucky run, and"
-    echo "    a gate that grounds healthy branches gets disabled."
+    echo "    If the waived bug is fixed, set LIBTEST_KNOWN_FAILURES=0 at the top"
+    echo "    of scripts/libtest-singleproc-gate.sh, clear LIBTEST_KNOWN_FAILURE"
+    echo "    and close it. Not a failure here: a cross-test leak is"
+    echo "    order-dependent and can hide on a lucky run, and a gate that"
+    echo "    grounds healthy branches gets disabled."
     return 0
   fi
 
   if [ "$failed" -gt 0 ]; then
     echo ""
-    echo "  WARNING: tolerating ${failed} known pre-existing failure(s) (moon#856:"
-    echo "    a maxmemory predicate read from process-global state races sibling"
-    echo "    tests in the same process). Any ADDITIONAL failure fails this gate."
+    echo "  WARNING: tolerating ${failed} known pre-existing failure(s):"
+    echo "    ${LIBTEST_KNOWN_FAILURE}"
+    echo "    Any ADDITIONAL or DIFFERENT failure fails this gate."
   fi
   return 0
 }
@@ -258,8 +291,10 @@ if [ "${1:-}" = "--self-test" ]; then
     got=$(env "$@" bash -c '
       set -uo pipefail
       MIN_LIBTEST_TESTS="${MIN_LIBTEST_TESTS:-5000}"
-      LIBTEST_KNOWN_FAILURES="${LIBTEST_KNOWN_FAILURES:-1}"
-      LIBTEST_KNOWN_FAILURE="${LIBTEST_KNOWN_FAILURE:-'"$LIBTEST_KNOWN_FAILURE"'}"
+      # Mirror the defaults at the top of this file, which are the RETIRED
+      # ones since moon#856: no waiver, no waived name.
+      LIBTEST_KNOWN_FAILURES="${LIBTEST_KNOWN_FAILURES:-0}"
+      LIBTEST_KNOWN_FAILURE="${LIBTEST_KNOWN_FAILURE:-}"
       '"$(declare -f platform_baseline)"'
       '"$(declare -f evaluate_transcript)"'
       evaluate_transcript "$1" "$2" >/dev/null 2>&1; echo $?' _ "$transcript" "$suiterc")
@@ -270,7 +305,11 @@ if [ "${1:-}" = "--self-test" ]; then
   # The real libtest failure block: per-test stdout dumps first, then a plain
   # indented list of names. Both `failures:` headings are reproduced so the
   # name extraction is exercised against the shape it actually meets.
-  K="$LIBTEST_KNOWN_FAILURE"
+  # The test moon#856 used to redden. The waiver that named it is retired, so
+  # this is now just a realistic test name for the synthetic transcripts -- and
+  # for the cases that RE-ARM a waiver via the environment, to prove the
+  # mechanism still refuses what it should.
+  K="scripting::bridge::tests::gate_is_skipped_with_spill_sender_when_no_limit_is_configured"
   blk() { # blk <passed> <failed> <name...>
     local p="$1" f="$2"; shift 2
     printf 'failures:\n\n'
@@ -280,31 +319,41 @@ if [ "${1:-}" = "--self-test" ]; then
     printf '\ntest result: FAILED. %s passed; %s failed; 9 ignored; 0 measured; 0 filtered out\n' "$p" "$f"
   }
 
-  clean="$(printf 'test result: ok. 5352 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out\n')"
-  known="$(blk 5352 1 "$K")"
-  two="$(blk 5351 2 "$K" storage::tests::something_else)"
-  other="$(blk 5352 1 storage::tests::something_else)"
+  clean="$(printf 'test result: ok. 5559 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out\n')"
+  known="$(blk 5558 1 "$K")"
+  two="$(blk 5557 2 "$K" storage::tests::something_else)"
+  other="$(blk 5558 1 storage::tests::something_else)"
   trunc="$(printf 'test scripting::bridge::tests::a ... ok\nerror: could not compile `moon`\n')"
   short="$(printf 'test result: ok. 200 passed; 0 failed; 0 ignored; 0 measured; 5138 filtered out\n')"
   shortfail="$(printf 'failures:\n    %s\n\ntest result: FAILED. 199 passed; 1 failed; 0 ignored; 0 measured; 5138 filtered out\n' "$K")"
-  grew="$(blk 5400 1 "$K")"
-  linux="$(blk 5357 1 "$K")"
+  grew="$(printf 'test result: ok. 5600 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out\n')"
+  linux="$(printf 'test result: ok. 5580 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out\n')"
 
   echo "libtest-singleproc-gate self-test:"
   check "clean run passes"                              0 "$clean"     0
-  check "the one known moon#856 failure is waived"      0 "$known"     101
-  # Count alone would waive this. Identity is what refuses it.
-  check "a DIFFERENT single failure is NOT waived"      1 "$other"     101
-  check "two failures are NOT waived"                   1 "$two"       101
+  # THE retirement check (moon#856): with no waiver armed -- the shipped
+  # default -- the failure this gate used to wave through now fails it. If this
+  # line ever reads ok=0, the waiver has crept back in.
+  check "the retired waiver no longer waives moon#856's victim" 1 "$known" 101
+  check "any single failure FAILS with no waiver armed" 1 "$other"     101
+  check "two failures FAIL with no waiver armed"        1 "$two"       101
   check "truncated run (no summary line) FAILS"         1 "$trunc"     101
   check "short run (200 < 5000 tests) FAILS"            1 "$short"     0
   check "short run that ALSO failed is not waived"      1 "$shortfail" 101
-  check "a branch adding tests still reads as 1 failure" 0 "$grew"     101
+  check "a branch adding tests still passes"            0 "$grew"      0
   # The platform the count baseline does NOT come from: nothing is gated on
   # the count, so a Linux run with ~21 more tests must still pass.
-  check "the Linux count (+21 cfg tests) is not a failure" 0 "$linux"  101
-  check "with the waiver retired, one failure FAILS"    1 "$known"     101 LIBTEST_KNOWN_FAILURES=0
-  check "with the waiver retired, a clean run passes"   0 "$clean"     0   LIBTEST_KNOWN_FAILURES=0
+  check "the Linux count (+21 cfg tests) is not a failure" 0 "$linux"  0
+  # The WAIVER MECHANISM itself, re-armed through the environment. It is kept
+  # (empty) rather than deleted so a future known failure can be tolerated
+  # deliberately -- these three prove it still grants and still refuses.
+  check "a re-armed waiver waives its NAMED failure"    0 "$known"     101 \
+      LIBTEST_KNOWN_FAILURES=1 "LIBTEST_KNOWN_FAILURE=$K"
+  # Count alone would waive this. Identity is what refuses it.
+  check "a re-armed waiver refuses a DIFFERENT failure" 1 "$other"     101 \
+      LIBTEST_KNOWN_FAILURES=1 "LIBTEST_KNOWN_FAILURE=$K"
+  check "a re-armed waiver refuses a SECOND failure"    1 "$two"       101 \
+      LIBTEST_KNOWN_FAILURES=1 "LIBTEST_KNOWN_FAILURE=$K"
   check "a smaller feature set passes its own floor"    0 "$short"     0   MIN_LIBTEST_TESTS=100
   # rc=101 with a clean summary: something failed outside the test results.
   check "unexplained non-zero cargo exit is NOT swallowed" 1 "$clean"  101

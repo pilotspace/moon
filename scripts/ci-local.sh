@@ -555,11 +555,12 @@ run_step "audit-tempdirs"     bash scripts/audit-test-tempdirs.sh       || exit 
 # `EncodingLimits` authority; the guard's self-test proves it can still fail.
 run_step "audit-encoding self" bash scripts/audit-encoding-limits.sh --self-test || exit 1
 run_step "audit-encoding"     bash scripts/audit-encoding-limits.sh     || exit 1
-# moon#904: the single-process lib stage below waives one known failure
-# (moon#856). A waiver that cannot be shown to REFUSE anything is not a gate,
-# so its verdict logic is exercised against synthetic transcripts here, in
-# under a second, before any run is trusted — same shape as the tempdir
-# self-test above and consistency-gate.sh's.
+# moon#904: the single-process lib stage below used to waive one known failure
+# (moon#856); that waiver is RETIRED and it now waives nothing. A gate that
+# cannot be shown to REFUSE anything is not a gate, so its verdict logic is
+# exercised against synthetic transcripts here, in under a second, before any
+# run is trusted — same shape as the tempdir self-test above and
+# consistency-gate.sh's.
 run_step "libtest-gate self"  bash scripts/libtest-singleproc-gate.sh --self-test || exit 1
 run_step "clippy (default)"   env CARGO_TARGET_DIR=target-clippy \
   cargo clippy -- -D warnings                                          || exit 1
