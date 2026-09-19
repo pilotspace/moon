@@ -150,18 +150,35 @@ pub fn record_everysec_fsync_result(writer_idx: usize, ok: bool) {
     }
 }
 
-/// Degraded-state latch (#452.4): `false` once ANY acked append has been
-/// dropped at the writer channel since boot. Unlike the rolling counter
-/// above, this is a sticky health bit — operators (and test harnesses) can
-/// alert on `aof_last_append_status:err` in `INFO persistence` without
-/// diffing counters. It never resets: after a drop the AOF is missing an
-/// acked record for the lifetime of this generation, so "everything is fine
-/// again" would be a lie until a successful rewrite folds live state into a
-/// fresh base. (`BGREWRITEAOF` is the operator remediation; wiring the latch
-/// reset into rewrite completion is deliberate follow-up work tracked in
-/// #452 — reset must only happen if NO drop occurred during the fold.)
-pub static AOF_LAST_APPEND_OK: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+/// Number of AOF writers whose log is missing an acked append that no
+/// committed rewrite has folded back in yet (#452.4, moon#1094). Each writer's
+/// own state lives in its [`rewrite::RewriteOverflow`] (see
+/// `RewriteOverflow::note_append_dropped` / `heal_on_commit`); this counts the
+/// writers in that state, so INFO can report the AND across writers with one
+/// load.
+pub static AOF_WRITERS_MISSING_APPENDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The `aof_last_append_status` / `aof_last_write_status` predicate: `true`
+/// while no writer's log is missing an acked append.
+///
+/// A dropped append is a hole in its writer's log, and the status reads `err`
+/// from the drop on. It returns to `ok` for that writer only when a rewrite
+/// COMMITS whose snapshot was taken after the writer's last drop: the new base
+/// then holds the dropped write's effect. A drop at or after the snapshot is
+/// missing from the new generation too, so it keeps `err`. With the PerShard
+/// layout each writer heals separately, and the status is `ok` only when all
+/// of them are.
+///
+/// Redis resets `aof_last_write_status` on the next successful write (and when
+/// a rewrite reopens the incr), because a failed write there keeps its data
+/// in `aof_buf` and retries it: `err` means "not written yet". Moon drops the
+/// record instead, so "not missing any more" can only mean a committed fold
+/// that postdates the drop.
+#[inline]
+pub fn aof_last_append_ok() -> bool {
+    AOF_WRITERS_MISSING_APPENDS.load(std::sync::atomic::Ordering::Acquire) == 0
+}
 
 /// Whether the last AOF rewrite (`BGREWRITEAOF`, or the #433 auto-rewrite)
 /// completed. Surfaces as INFO `aof_last_bgrewrite_status` — the field an
@@ -171,9 +188,8 @@ pub static AOF_LAST_APPEND_OK: std::sync::atomic::AtomicBool =
 /// `true` before any rewrite has run: Redis reports `ok` on a fresh instance
 /// too, and reporting `err` for "never attempted" would page someone for a
 /// rewrite that was never asked for. Set on every rewrite completion, both
-/// directions — a later success clears an earlier failure, because unlike
-/// `AOF_LAST_APPEND_OK` (which latches a permanently-missing record) a
-/// successful rewrite genuinely restores the invariant.
+/// directions — a later success clears an earlier failure (unlike
+/// [`aof_last_append_ok`], which only a fold postdating the drop can clear).
 pub static AOF_REWRITE_LAST_OK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
@@ -184,13 +200,14 @@ pub static AOF_REWRITE_LAST_OK: std::sync::atomic::AtomicBool =
 pub static AOF_REASON_DEL_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Record `n` dropped acked appends: bumps [`AOF_BACKPRESSURE_DROPPED`] and
-/// latches [`AOF_LAST_APPEND_OK`] to `err`. Every drop site MUST go through
-/// this helper so the degraded-state latch can never miss a loss.
+/// Record `n` acked appends dropped on the writer that owns `overflow`: bumps
+/// [`AOF_BACKPRESSURE_DROPPED`] and marks that writer's log as missing an
+/// append ([`aof_last_append_ok`] reads `err`). Every drop site MUST go
+/// through this helper so the status can never miss a loss.
 #[inline]
-pub fn record_append_dropped(n: u64) {
+pub fn record_append_dropped(overflow: &rewrite::RewriteOverflow, n: u64) {
     AOF_BACKPRESSURE_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-    AOF_LAST_APPEND_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+    overflow.note_append_dropped();
 }
 
 /// Bound for the SPSC-drain path's blocking AOF backpressure
@@ -208,7 +225,7 @@ pub const AOF_SPSC_BACKPRESSURE_BOUND: std::time::Duration = std::time::Duration
 /// smaller loss window. NOT unbounded: a dead writer must not hang the
 /// shard, and a deferred-retry queue would reorder DEL-after-SET on replay —
 /// beyond this bound the drop is counted in [`AOF_REASON_DEL_DROPPED`] and
-/// latches [`AOF_LAST_APPEND_OK`], never silent.
+/// reported by [`aof_last_append_ok`], never silent.
 pub const AOF_REASON_DEL_BACKPRESSURE_BOUND: std::time::Duration =
     std::time::Duration::from_millis(500);
 

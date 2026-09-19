@@ -629,7 +629,7 @@ pub async fn aof_writer_task(
                         };
                         // #455: from here on, records folded into the
                         // committed base are dropped wherever they surface.
-                        fold_floor = outcome.floor_after(fold_floor);
+                        fold_floor = outcome.adopt(fold_floor, &overflow);
                         // #452.1: channel backlog + spilled overflow → current
                         // (committed) incr, in order, before resuming the loop.
                         if let Err(e) =
@@ -676,7 +676,7 @@ pub async fn aof_writer_task(
                             }
                         };
                         // #455: see the Rewrite arm above.
-                        fold_floor = outcome.floor_after(fold_floor);
+                        fold_floor = outcome.adopt(fold_floor, &overflow);
                         // #452.1: channel backlog + spilled overflow → current
                         // (committed) incr, in order, before resuming the loop.
                         if let Err(e) =
@@ -990,7 +990,7 @@ pub async fn aof_writer_task(
                                 .store(false, std::sync::atomic::Ordering::SeqCst);
                             // #455: from here on, records folded into the
                             // committed base are dropped wherever they surface.
-                            fold_floor = outcome.floor_after(fold_floor);
+                            fold_floor = outcome.adopt(fold_floor, &overflow);
                             // #452.1: channel backlog + spilled overflow → the
                             // committed file, in order, before resuming the loop.
                             if let Err(e) =
@@ -1476,7 +1476,7 @@ pub async fn per_shard_aof_writer_task(
                                         // base are dropped wherever they surface
                                         // from here on; an aborted fold keeps the
                                         // floor, so every record is written.
-                                        fold_floor = outcome.floor_after(fold_floor);
+                                        fold_floor = outcome.adopt(fold_floor, &overflow);
                                         // #452.1: drain channel backlog + spilled
                                         // overflow into the committed incr first.
                                         if let Err(e) = overflow.finish_framed(
@@ -1880,7 +1880,7 @@ pub async fn per_shard_aof_writer_task(
                         // #455: records folded into a committed base are dropped
                         // wherever they surface from here on; an aborted fold
                         // keeps the floor, so every record is written.
-                        fold_floor = outcome.floor_after(fold_floor);
+                        fold_floor = outcome.adopt(fold_floor, &overflow);
                         // #452.1: drain channel backlog + spilled overflow into
                         // the committed incr, in order, before the EverySec
                         // post-fold drain below picks up anything newer.
