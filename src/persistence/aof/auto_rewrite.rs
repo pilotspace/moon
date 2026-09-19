@@ -19,6 +19,12 @@
 //!   restart, permanently, so a restart-prone host never rewrote); after a
 //!   completed rewrite, the freshly compacted directory, whose incr is empty.
 //!
+//! One forced rewrite (moon#914 (b)): when boot replayed a legacy tokio
+//! `--shards 1` `appendonly.aof` that has no `MOON.COLDCUT` over existing
+//! cold files, `main.rs` asks this monitor for one rewrite regardless of
+//! size, so every later boot replays a file that opens with its cut. See
+//! [`next_trigger`].
+//!
 //! Design-for-failure:
 //! - A failed dispatch (backpressure, unsupported layout, …) arms a 60 s
 //!   cooldown so the monitor cannot livelock hot-retrying a rewrite that
@@ -200,8 +206,49 @@ pub fn should_trigger(current: u64, base: u64, percentage: u64, min_size: u64) -
     current.saturating_sub(base).saturating_mul(100) / base >= percentage
 }
 
+/// Why the monitor dispatches a rewrite on this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteTrigger {
+    /// Boot asked for one rewrite regardless of size (moon#914 (b): the
+    /// replayed legacy AOF had no `MOON.COLDCUT`, and only a rewrite opens a
+    /// generation with one).
+    Forced,
+    /// The Redis growth predicate ([`should_trigger`]) fired.
+    Growth,
+}
+
+/// The monitor's per-tick decision. Pure so it is unit tested without a
+/// thread or a filesystem.
+///
+/// `busy` (a rewrite or BGSAVE running, or the failed-dispatch cooldown)
+/// defers everything, including a forced rewrite. A pending forced rewrite
+/// then fires regardless of `percentage` and `min_size`: those tune
+/// compaction, and this rewrite is a correctness repair, not compaction.
+pub fn next_trigger(
+    forced_pending: bool,
+    busy: bool,
+    current: u64,
+    base: u64,
+    percentage: u64,
+    min_size: u64,
+) -> Option<RewriteTrigger> {
+    if busy {
+        None
+    } else if forced_pending {
+        Some(RewriteTrigger::Forced)
+    } else if should_trigger(current, base, percentage, min_size) {
+        Some(RewriteTrigger::Growth)
+    } else {
+        None
+    }
+}
+
 /// Spawn the auto-rewrite monitor thread. `percentage == 0` still spawns the
-/// sampler (INFO size freshness) but never dispatches a rewrite.
+/// sampler (INFO size freshness) but never dispatches a growth rewrite.
+///
+/// `force_once`: dispatch one rewrite on the first tick that is not busy,
+/// whatever the size (moon#914 (b)). It stays pending until a rewrite
+/// completes successfully; a failed one retries after the dispatch cooldown.
 ///
 /// Dispatches through [`crate::command::persistence::bgrewriteaof_start_sharded`],
 /// the exact entry the `BGREWRITEAOF` command uses — CAS on the in-progress
@@ -211,11 +258,12 @@ pub fn spawn_monitor(
     shard_databases: Arc<crate::shard::shared_databases::ShardDatabases>,
     percentage: u64,
     min_size: u64,
+    force_once: bool,
 ) {
     let spawned = std::thread::Builder::new()
         .name("aof-auto-rewrite".to_string())
         .spawn(move || {
-            monitor_loop(&pool, &shard_databases, percentage, min_size);
+            monitor_loop(&pool, &shard_databases, percentage, min_size, force_once);
         });
     if let Err(e) = spawned {
         // Non-fatal: manual BGREWRITEAOF still works; sizes go stale.
@@ -228,12 +276,14 @@ fn monitor_loop(
     shard_databases: &Arc<crate::shard::shared_databases::ShardDatabases>,
     percentage: u64,
     min_size: u64,
+    force_once: bool,
 ) {
     use crate::command::persistence::{AOF_REWRITE_IN_PROGRESS, SAVE_IN_PROGRESS};
     use crate::protocol::Frame;
 
     let mut cooldown_until = std::time::Instant::now();
     let mut saw_in_progress = false;
+    let mut forced_pending = force_once;
     info!(
         "aof-auto-rewrite monitor started (percentage={}%, min_size={} bytes)",
         percentage, min_size
@@ -257,24 +307,27 @@ fn monitor_loop(
             continue;
         }
 
-        if percentage == 0
-            || in_progress
+        let busy = in_progress
             || SAVE_IN_PROGRESS.load(Ordering::SeqCst)
-            || std::time::Instant::now() < cooldown_until
-        {
-            continue;
-        }
-
+            || std::time::Instant::now() < cooldown_until;
         let base = AOF_BASE_SIZE.load(Ordering::Relaxed);
-        if !should_trigger(current, base, percentage, min_size) {
+        let Some(trigger) = next_trigger(forced_pending, busy, current, base, percentage, min_size)
+        else {
             continue;
-        }
+        };
 
-        info!(
-            "aof-auto-rewrite: triggering BGREWRITEAOF (current={} base={} \
-             growth>={}%, min_size={})",
-            current, base, percentage, min_size
-        );
+        match trigger {
+            RewriteTrigger::Forced => info!(
+                "aof-auto-rewrite: triggering the one boot-time BGREWRITEAOF so the AOF \
+                 opens with its MOON.COLDCUT (moon#914; current={} bytes)",
+                current
+            ),
+            RewriteTrigger::Growth => info!(
+                "aof-auto-rewrite: triggering BGREWRITEAOF (current={} base={} \
+                 growth>={}%, min_size={})",
+                current, base, percentage, min_size
+            ),
+        }
         match crate::command::persistence::bgrewriteaof_start_sharded(pool, shard_databases.clone())
         {
             Frame::Error(e) => {
@@ -298,14 +351,99 @@ fn monitor_loop(
                 }
                 record_base_size();
                 saw_in_progress = false;
+                if trigger == RewriteTrigger::Forced {
+                    forced_pending = finish_forced_rewrite(
+                        AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst),
+                        super::AOF_REWRITE_LAST_OK.load(Ordering::SeqCst),
+                    );
+                    if forced_pending {
+                        cooldown_until = std::time::Instant::now() + FAILED_DISPATCH_COOLDOWN;
+                    }
+                }
             }
         }
     }
 }
 
+/// Resolve a forced (moon#914 (b)) rewrite after the monitor's bounded wait.
+/// Returns whether it is still pending, i.e. must be dispatched again.
+///
+/// - Completed and OK: done. The AOF now opens with its cut.
+/// - Completed and failed: still pending. The file on disk is the old,
+///   cut-less one (the rewrite renames atomically, so a failure never
+///   publishes a partial file); retry after the cooldown.
+/// - Still running past the wait: not pending. Dispatching again would only
+///   be refused as "already in progress", and the writer logs the outcome.
+///   If that rewrite fails, the next boot detects the cut-less file again.
+fn finish_forced_rewrite(still_running: bool, last_ok: bool) -> bool {
+    if still_running {
+        warn!(
+            "aof-auto-rewrite: the boot-time moon#914 rewrite is still running after the \
+             monitor's wait; not re-dispatching. If it fails, the next boot retries it"
+        );
+        false
+    } else if last_ok {
+        info!(
+            "aof-auto-rewrite: boot-time moon#914 rewrite complete; the AOF now opens with \
+             its MOON.COLDCUT and later boots replay it gated"
+        );
+        false
+    } else {
+        warn!(
+            "aof-auto-rewrite: the boot-time moon#914 rewrite FAILED; the AOF still has no \
+             MOON.COLDCUT. Retrying in {:?}",
+            FAILED_DISPATCH_COOLDOWN
+        );
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::should_trigger;
+    use super::{RewriteTrigger, finish_forced_rewrite, next_trigger, should_trigger};
+
+    /// moon#914 (b): a pending forced rewrite fires on the first idle tick
+    /// even when growth rewrites are disabled or the AOF is under min_size.
+    #[test]
+    fn forced_rewrite_ignores_percentage_and_min_size() {
+        assert_eq!(
+            next_trigger(true, false, 10, 10, 0, u64::MAX),
+            Some(RewriteTrigger::Forced)
+        );
+        assert_eq!(
+            next_trigger(true, false, 0, 0, 100, 64 << 20),
+            Some(RewriteTrigger::Forced)
+        );
+    }
+
+    /// A forced rewrite still waits for a running rewrite / BGSAVE / cooldown.
+    #[test]
+    fn forced_rewrite_waits_while_busy() {
+        assert_eq!(next_trigger(true, true, 10, 10, 0, 0), None);
+        assert_eq!(next_trigger(false, true, u64::MAX, 1, 100, 0), None);
+    }
+
+    /// Without a forced rewrite the monitor is exactly the #433 predicate.
+    #[test]
+    fn unforced_trigger_is_the_growth_predicate() {
+        assert_eq!(
+            next_trigger(false, false, 2000, 1000, 100, 0),
+            Some(RewriteTrigger::Growth)
+        );
+        assert_eq!(next_trigger(false, false, 1999, 1000, 100, 0), None);
+        assert_eq!(next_trigger(false, false, u64::MAX, 1, 0, 0), None);
+    }
+
+    /// Only a failed rewrite keeps the forced rewrite pending.
+    #[test]
+    fn forced_rewrite_stays_pending_only_after_a_failure() {
+        assert!(!finish_forced_rewrite(false, true), "completed OK: done");
+        assert!(finish_forced_rewrite(false, false), "failed: retry");
+        assert!(
+            !finish_forced_rewrite(true, false),
+            "still running: a second dispatch would only be refused"
+        );
+    }
 
     #[test]
     fn percentage_zero_never_triggers() {
