@@ -220,6 +220,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a warning, not folded into db 0. The WAL remains a partial source: it
   is never the recovery authority.
 
+- **`REPLICAOF <hostname> <port>` no longer aborts the server** (moon#1034).
+  On the default monoio runtime, the replica task parsed `host:port` as a
+  socket address with `.expect`, and that parse accepts IP literals only.
+  `REPLICAOF localhost 6379`, or any DNS name (the normal way to name a master
+  in Kubernetes), panicked on the shard thread, and the panic hook aborted
+  the whole process (SIGABRT). This happened after the command had already
+  replied `+OK`. The host is now resolved as redis does it: inside the
+  reconnect loop, with backoff. An IP literal (including `::1` and `[::1]`)
+  needs no lookup. A name is resolved with the system resolver on a helper
+  thread, never on the shard thread, and the wait is bounded at 5 s. At most
+  one lookup is in flight per replica task, even when the resolver hangs.
+  Every resolved address is tried in order, each connect bounded at 5 s:
+  `localhost` gives `::1` first, which is refused when moon binds
+  `127.0.0.1`, so the task falls through to `127.0.0.1`. While a host does not
+  resolve, the node stays up and reports `master_link_status:down`, and it
+  picks the master up once DNS recovers. `REPLICAOF NO ONE` and re-pointing
+  still supersede the task. The tokio build formatted `host:port` into one
+  string, which cannot express an IPv6 literal. It now shares the same
+  resolver.
+
 - **One `GRAPH.*` write no longer makes a restart discard every acknowledged
   KV write** (moon#1018). This hits `runtime-tokio` with `--shards 1` and the
   `graph` feature. That configuration has no `AofManifest`, so recovery picks
