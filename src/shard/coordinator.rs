@@ -301,6 +301,9 @@ pub(crate) async fn execute_txn_on_owner(
     proto: u8,
     // WATCH tokens travel with the body: the CAS check runs on the owner.
     watched: std::collections::HashMap<Bytes, crate::server::conn::shared::WatchToken>,
+    // moon#894: the originating connection's ACL identity, when the body
+    // holds a script; the owner authorizes every inner `redis.call` with it.
+    script_acl: Option<crate::acl::ScriptAcl>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Option<crate::shard::dispatch::TxnExecReply> {
@@ -312,6 +315,7 @@ pub(crate) async fn execute_txn_on_owner(
         reply_tx,
         proto,
         watched,
+        script_acl,
     };
     let msg = ShardMessage::TxnExecute(Box::new(payload));
     let _ = spsc_send(dispatch_tx, my_shard, owner, msg, spsc_notifiers).await;
