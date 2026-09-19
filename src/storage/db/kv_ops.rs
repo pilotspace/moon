@@ -288,6 +288,9 @@ impl Database {
                 if let Some(ref mut ci) = self.cold_index {
                     ci.remove(key);
                 }
+                // moon#1013: the lazy cold-tier expiry — same signal as the
+                // hot drain and the periodic `sweep_expired`.
+                crate::tracking::invalidation::invalidate_server_removed(key);
                 false
             }
             ColdReadOutcome::Miss => false,

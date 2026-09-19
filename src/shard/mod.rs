@@ -8,6 +8,7 @@ pub mod db_plane;
 pub mod disk_monitor;
 pub mod dispatch;
 pub mod event_loop;
+pub mod exec_publish;
 #[cfg(feature = "runtime-monoio")]
 pub(crate) mod idle_park;
 /// MA5: maintenance-window scheduler (cron-style budget multipliers).

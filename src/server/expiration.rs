@@ -91,6 +91,13 @@ pub fn expire_cycle_direct(db: &mut Database, on_removed: &mut dyn FnMut(&[u8]))
     if !db.maybe_has_expiring_keys() {
         return;
     }
+    // moon#1013: sweep 2 reaps against the db's cached clock, which only
+    // commands advance — an idle db never reaped a due hash field, so a
+    // CLIENT TRACKING cache of it was never invalidated. Only when a
+    // hash-field TTL exists: one O(1) emptiness check otherwise.
+    if db.hash_field_ttl_possible() {
+        db.advance_now_to_wall_clock();
+    }
     // moon#552: the latch above only saves a database with ZERO TTL'd keys.
     // A TTL-heavy database entered the cycle every 100ms just to re-derive
     // "nothing due" — allocating a start `Instant`, reading the clock, and
@@ -142,6 +149,8 @@ fn drain_lazy_expired(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
         if db.is_key_expired(key.as_bytes()) {
             db.remove(key.as_bytes());
             on_removed(key.as_bytes());
+            // moon#1013: a lazily-expired key is as gone as a swept one.
+            crate::tracking::invalidation::invalidate_server_removed(key.as_bytes());
         }
     }
 }
@@ -196,6 +205,9 @@ fn expire_cycle(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
             // `remove` unindexes the entry's CURRENT pair via `remove_hot`.
             db.remove(key.as_bytes());
             on_removed(key.as_bytes());
+            // moon#1013: tell CLIENT TRACKING caches the key is gone. One
+            // relaxed load per key when nobody tracks.
+            crate::tracking::invalidation::invalidate_server_removed(key.as_bytes());
         } else if db
             .data()
             .get(key.as_bytes())
@@ -242,13 +254,21 @@ fn expire_cycle(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
     let hash_now_ms = db.now_ms();
     let mut visited = 0u32;
     while let Some((ts, key)) = db.peek_due_hash_expiry(hash_now_ms) {
-        if db.reap_expired_fields_one_hash_at(
+        let outcome = db.reap_expired_fields_one_hash_at(
             key.as_bytes(),
             hash_now_ms,
             HASH_SWEEP_MAX_FIELDS_PER_KEY,
-        ) == ReapOutcome::KeyDeleted
-        {
+        );
+        if outcome == ReapOutcome::KeyDeleted {
             db.remove(key.as_bytes());
+        }
+        // moon#1013: any reaped field changes the hash a tracking client may
+        // have cached. redis 8.6.1 invalidates the key on a field expiry even
+        // when the hash survives (measured: `HPEXPIRE h 1000 FIELDS 1 f` on a
+        // two-field hash pushes `invalidate [h]`). Every outcome but `NoOp`
+        // removed at least one field.
+        if outcome != ReapOutcome::NoOp {
+            crate::tracking::invalidation::invalidate_server_removed(key.as_bytes());
         }
         db.rearm_hash_expiry(ts, &key);
         visited += 1;
@@ -273,6 +293,141 @@ mod tests {
     use super::*;
     use crate::storage::entry::{Entry, current_time_ms};
     use bytes::Bytes;
+
+    // ── moon#1013: every expiry path must invalidate CLIENT TRACKING ────────
+
+    /// Sweep 1 (active whole-key expiry).
+    #[test]
+    fn active_expiry_invalidates_tracking_clients() {
+        let tracker =
+            crate::tracking::invalidation::test_support::GlobalTracker::tracking(b"exp1013:act");
+        let mut db = Database::new();
+        db.set(
+            b"exp1013:act",
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), current_time_ms() - 1),
+        );
+        expire_cycle_direct(&mut db, &mut |_| {});
+        assert!(db.get(b"exp1013:act").is_none(), "precondition: swept");
+        assert_eq!(
+            tracker.invalidated_keys(),
+            vec![Bytes::from_static(b"exp1013:act")]
+        );
+    }
+
+    /// The lazy path: a read hides the key and queues it; the drain deletes
+    /// it and must invalidate.
+    #[test]
+    fn lazy_expiry_drain_invalidates_tracking_clients() {
+        let tracker =
+            crate::tracking::invalidation::test_support::GlobalTracker::tracking(b"exp1013:lazy");
+        let mut db = Database::new();
+        db.set(
+            b"exp1013:lazy",
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), current_time_ms() - 1),
+        );
+        assert!(db.get(b"exp1013:lazy").is_none(), "lazy read hides it");
+        assert_eq!(db.pending_lazy_expired_len(), 1, "queued for the drain");
+        drain_lazy_expired(&mut db, &mut |_| {});
+        assert_eq!(
+            tracker.invalidated_keys(),
+            vec![Bytes::from_static(b"exp1013:lazy")]
+        );
+    }
+
+    /// Sweep 2: a hash-field reap invalidates the hash even when the key
+    /// survives (redis 8.6.1 measured) — and when the whole key goes.
+    #[test]
+    fn hash_field_expiry_invalidates_tracking_clients() {
+        let survives =
+            crate::tracking::invalidation::test_support::GlobalTracker::tracking(b"exp1013:h1");
+        let deleted =
+            crate::tracking::invalidation::test_support::GlobalTracker::tracking(b"exp1013:h2");
+        let mut db = Database::new();
+        seed_hash_with_expired_field(&mut db, b"exp1013:h1", &[(b"f", b"v"), (b"g", b"w")], b"f");
+        seed_hash_with_expired_field(&mut db, b"exp1013:h2", &[(b"f", b"v")], b"f");
+        expire_cycle(&mut db, &mut |_| {});
+        assert!(
+            db.get_hash(b"exp1013:h1").is_ok(),
+            "precondition: h1 survives"
+        );
+        assert_eq!(
+            survives.invalidated_keys(),
+            vec![Bytes::from_static(b"exp1013:h1")]
+        );
+        assert_eq!(
+            deleted.invalidated_keys(),
+            vec![Bytes::from_static(b"exp1013:h2")]
+        );
+    }
+
+    /// An IDLE database: no command has refreshed its cached clock since the
+    /// field became due by the wall clock. The production tick
+    /// (`expire_cycle_direct`) must still reap it and invalidate — before
+    /// moon#1013 it waited for unrelated traffic to advance the clock.
+    #[test]
+    fn idle_db_hash_field_expiry_reaps_and_invalidates() {
+        use crate::storage::db::HashTtlCond;
+        let tracker =
+            crate::tracking::invalidation::test_support::GlobalTracker::tracking(b"exp1013:idle");
+        let mut db = Database::new();
+        let stale = current_time_ms() - 5_000;
+        db.set_cached_now_ms_for_test(stale);
+        {
+            let map = db
+                .get_or_create_hash(b"exp1013:idle")
+                .expect("hash creation must succeed");
+            map.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+            map.insert(Bytes::from_static(b"g"), Bytes::from_static(b"w"));
+        }
+        // Due 4s ago by the wall clock; still 1s in the future by the stale
+        // cached clock, so it is stored rather than short-circuited.
+        assert_eq!(
+            db.hash_set_field_ttl(b"exp1013:idle", b"f", stale + 1_000, HashTtlCond::Always),
+            Ok(1)
+        );
+        expire_cycle_direct(&mut db, &mut |_| {});
+        assert_eq!(
+            db.hash_get_field_ttl_ms(b"exp1013:idle", b"f"),
+            None,
+            "the due field must be reaped on an idle db"
+        );
+        assert_eq!(
+            tracker.invalidated_keys(),
+            vec![Bytes::from_static(b"exp1013:idle")]
+        );
+    }
+
+    /// The clock only moves forward: a clock already ahead of the wall
+    /// (a test's, or a newer command's) is kept.
+    #[test]
+    fn advance_now_never_moves_the_cached_clock_backwards() {
+        let mut db = Database::new();
+        let ahead = current_time_ms() + 60_000;
+        db.set_cached_now_ms_for_test(ahead);
+        db.advance_now_to_wall_clock();
+        assert_eq!(db.now_ms(), ahead);
+        db.set_cached_now_ms_for_test(1);
+        db.advance_now_to_wall_clock();
+        assert!(db.now_ms() >= current_time_ms() - 1_000);
+    }
+
+    /// A live key is NOT invalidated by a sweep that removes something else.
+    #[test]
+    fn expiry_does_not_invalidate_a_live_tracked_key() {
+        let tracker =
+            crate::tracking::invalidation::test_support::GlobalTracker::tracking(b"exp1013:live");
+        let mut db = Database::new();
+        db.set(
+            b"exp1013:live",
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), current_time_ms() + 3_600_000),
+        );
+        db.set(
+            b"exp1013:dead",
+            Entry::new_string_with_expiry(Bytes::from_static(b"v"), current_time_ms() - 1),
+        );
+        expire_cycle_direct(&mut db, &mut |_| {});
+        assert!(tracker.invalidated_keys().is_empty());
+    }
 
     #[test]
     fn test_expire_cycle_removes_expired_keys() {
