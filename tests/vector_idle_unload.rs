@@ -16,16 +16,21 @@
 //!      (the pre-WS3 code path always passed `None` for `vectors_data`,
 //!      which would have degraded this to a quantized ADC-only distance).
 //!
-//! Run (monoio default, matches CI):
-//!   cargo build --release
-//!   cargo test --release --test vector_idle_unload -- --ignored
+//! The functional tests run in every CI leg (moon#1070: while they were
+//! `#[ignore]`d, three of them went red on main and nobody saw it). Only
+//! `cold_unload_reduces_process_rss` stays ignored: it is a measurement, it
+//! reads RSS through `ps` (absent on Windows), and it loads 15,000 x 768d.
+//!
+//! Run (monoio default; pin the binary you just built):
+//!   MOON_BIN=target/release/moon cargo test --release --test vector_idle_unload
+//!   ... -- --ignored   # the RSS measurement too
 //!
 //! tokio runtime:
 //!   cargo build --release --no-default-features \
 //!     --features runtime-tokio,jemalloc,graph,text-index
 //!   cargo test --release --no-default-features \
 //!     --features runtime-tokio,jemalloc,graph,text-index \
-//!     --test vector_idle_unload -- --ignored
+//!     --test vector_idle_unload
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 #![allow(clippy::unwrap_used)]
@@ -456,7 +461,6 @@ fn ft_info_int(c: &mut Client, idx: &str, field: &str) -> i64 {
 /// for a purely-idle transition -- see the doc comment on
 /// `VectorIndex::try_warm_transitions_idle`).
 #[test]
-#[ignore] // Spawns a real server process; run explicitly with `-- --ignored`.
 fn hot_segment_idle_unloads_to_cold_and_preserves_recall() {
     let port = common::reserve_port();
     let dir = unique_dir("s1");
@@ -586,7 +590,6 @@ fn hot_segment_idle_unloads_to_cold_and_preserves_recall() {
 /// delete was silently dropped -- the deleted doc would resurface (and
 /// `num_docs` would over-count) the moment a search touched the index again.
 #[test]
-#[ignore] // Spawns a real server process; run explicitly with `-- --ignored`.
 fn hdel_during_cold_does_not_resurrect() {
     let port = common::reserve_port();
     let dir = unique_dir("s2");
@@ -656,13 +659,65 @@ fn hdel_during_cold_does_not_resurrect() {
     );
 }
 
+/// moon#1070: the off-loop reload (prod-hardening #18) finishes on a worker;
+/// the reloaded segment is not in the index until something installs it. A
+/// DEL that lands in that window is recorded by the COLD stub only -- and the
+/// stub is exactly what the install throws away. The install must replay the
+/// stub's tombstones, or the deleted doc comes back on the next search.
+#[test]
+fn delete_between_cold_reload_and_install_does_not_resurrect() {
+    let port = common::reserve_port();
+    let dir = unique_dir("s4");
+    let idx = "reloaddelidx";
+
+    let _guard = spawn_moon(port, &dir, 2);
+    let mut c = wait_ready(port);
+
+    ft_create(&mut c, idx, DIM, 100);
+    let ids: Vec<u32> = (0..30).collect();
+    hset_batch(&mut c, &format!("{idx}:"), &ids);
+    ft_compact(&mut c, idx);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while ft_info_int(&mut c, idx, "unloaded_segments") < 1 {
+        assert!(
+            Instant::now() < deadline,
+            "segment never transitioned to COLD within 30s"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // First touch: reloads the segment off-loop and answers from it.
+    let probe = fixture_vec(7, DIM);
+    let (key, _) = search_top1(&mut c, idx, &probe);
+    assert_eq!(key, format!("{idx}:7"), "self-match before the delete");
+
+    let r = c.cmd(&[b"DEL", format!("{idx}:7").as_bytes()]);
+    assert_eq!(r, V::Int(1), "DEL must report the key existed");
+
+    // Any later search installs the reloaded segment (if the first did not).
+    let (key_after, _) = search_top1(&mut c, idx, &probe);
+    let (key_again, _) = search_top1(&mut c, idx, &probe);
+    for k in [&key_after, &key_again] {
+        assert!(
+            k != &format!("{idx}:7") && !k.starts_with("vec:"),
+            "the doc deleted after the reload came back: top-1 = {k}"
+        );
+    }
+    assert_eq!(ft_info_int(&mut c, idx, "unloaded_segments"), 0);
+    assert_eq!(
+        ft_info_int(&mut c, idx, "num_docs"),
+        29,
+        "num_docs must count the delete that landed during the reload window"
+    );
+}
+
 /// Same shape as [`hdel_during_cold_does_not_resurrect`] but for the WARM
 /// tier directly (idle disabled -- only the age criterion fires, so the
 /// segment demotes to WARM and is never touched by the COLD path at all).
 /// `WarmSearchSegment` previously had no tombstone mechanism whatsoever; a
 /// HDEL against an already-WARM segment was a silent no-op.
 #[test]
-#[ignore] // Spawns a real server process; run explicitly with `-- --ignored`.
 fn hdel_during_warm_does_not_resurrect() {
     let port = common::reserve_port();
     let dir = unique_dir("s3");
@@ -732,7 +787,7 @@ fn hdel_during_warm_does_not_resurrect() {
 /// flat-to-+1.1% (see CHANGELOG). This is the process-level proxy requested
 /// alongside the FT.INFO counter checks above.
 #[test]
-#[ignore] // Spawns a real server process; run explicitly with `-- --ignored`.
+#[ignore] // A measurement, not a gate: `ps`-based RSS (no `ps` on Windows) over a 15k x 768d load.
 fn cold_unload_reduces_process_rss() {
     // Adversarial review #5 tightened the assertion below to a 15% floor
     // (was a plain `<`). At the ORIGINAL 256d/3,000-vector fixture the hot
