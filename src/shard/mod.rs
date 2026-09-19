@@ -1,6 +1,7 @@
 pub mod affinity;
 /// P4: per-shard autovacuum daemon with cost-based throttle.
 pub mod autovacuum;
+mod checkpoint_heap_files;
 pub mod conn_accept;
 pub mod coordinator;
 /// L4 shared read plane: the per-(shard, db) lock registry.

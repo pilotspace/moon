@@ -1,8 +1,12 @@
 //! Fuzzy checkpoint protocol (PostgreSQL-style) for the disk-offload path.
 //!
-//! CheckpointManager is a **pure state machine** — all I/O (page flush, WAL write,
+//! CheckpointManager is a **state machine** — all I/O (page flush, WAL write,
 //! manifest commit, control file update) is performed by the caller (event loop).
-//! This keeps the checkpoint logic testable without I/O mocking.
+//! This keeps the checkpoint logic testable without I/O mocking. The one
+//! exception is the data-file fsync of step 4: the manager OWNS the handle of
+//! the off-loop helper that performs it ([`DataFileSyncer`]), so a shard can
+//! never have more than one outstanding, but the caller decides when to start
+//! it and polls it without blocking.
 //!
 //! Protocol:
 //! 1. `begin(current_lsn, dirty_count)` — record REDO_LSN, compute pages_per_tick
@@ -24,11 +28,20 @@
 //! whether any page failed to flush
 //! ([`note_page_flush_failed`](CheckpointManager::note_page_flush_failed)); the
 //! caller refuses to finalize until both are clean.
+//!
+//! A heap file that no longer exists leaves the pending set instead of
+//! holding the redo point back forever
+//! ([`forget_data_file`](CheckpointManager::forget_data_file)); the caller
+//! counts it ([`note_data_file_vanished`](CheckpointManager::note_data_file_vanished))
+//! and says whether that was expected. The proof that dropping it is safe is
+//! on `shard::checkpoint_heap_files::stop_waiting_on_vanished_heap_file`.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use crate::persistence::data_file_sync::{DataFileSyncer, DataSyncJob, DataSyncPoll};
 
 /// Determines when a checkpoint should be triggered.
 pub struct CheckpointTrigger {
@@ -132,10 +145,11 @@ pub enum CheckpointAction {
     },
 }
 
-/// Pure state machine for the fuzzy checkpoint protocol.
+/// State machine for the fuzzy checkpoint protocol.
 ///
-/// Does NOT perform any I/O — the caller interprets `CheckpointAction` and
-/// drives the actual page flushes, WAL writes, and metadata updates.
+/// Performs no I/O itself — the caller interprets `CheckpointAction` and
+/// drives the actual page flushes, WAL writes, and metadata updates. The
+/// heap data-file fsync runs on the off-loop helper this manager owns.
 pub struct CheckpointManager {
     state: CheckpointState,
     trigger: CheckpointTrigger,
@@ -148,10 +162,14 @@ pub struct CheckpointManager {
     finalize_retry_at: Option<Instant>,
     /// Consecutive failed finalize attempts, driving exponential backoff.
     finalize_attempts: u32,
-    /// Heap data files (`file_id`s) that a flush has `pwrite`n pages into and
-    /// that no successful fsync has covered yet. Finalize must fsync every
-    /// one of them before it may publish a new redo point.
-    unsynced_data_files: BTreeSet<u64>,
+    /// Heap data files that a flush has `pwrite`n pages into and that no
+    /// successful fsync has covered yet: `file_id` -> the write generation of
+    /// its latest write. Finalize must fsync every one of them before it may
+    /// publish a new redo point. The generation lets a sync result clear a
+    /// file only if nothing wrote to it after the sync batch was taken.
+    unsynced_data_files: BTreeMap<u64, u64>,
+    /// Source of write generations (monotonic).
+    data_write_generation: u64,
     /// A page flush step (FPI append, WAL durability wait or data `pwrite`)
     /// failed during the current checkpoint: some page that was dirty when
     /// the checkpoint began may be neither on disk nor imaged in the WAL
@@ -161,10 +179,28 @@ pub struct CheckpointManager {
     /// the dirty pages undefined after a failed fsync and a retry can report
     /// success for pages that were already dropped (the fsyncgate class), so
     /// this shard never publishes another redo point — the WAL keeps every
-    /// record and recovery replays from the last good checkpoint. Shared
-    /// with the off-loop sync thread, which may finish after its waiter gave
-    /// up.
+    /// record and recovery replays from the last good checkpoint. Set by
+    /// the off-loop fsync helper itself, so a failure is recorded even if
+    /// nobody polls that batch again.
     data_sync_poisoned: Arc<AtomicBool>,
+    /// The off-loop data-file fsync (at most one batch outstanding).
+    data_sync: DataFileSyncer,
+    /// Heap files that vanished before the checkpoint could make them
+    /// durable (see [`VanishedDataFiles`]).
+    vanished_data_files: VanishedDataFiles,
+}
+
+/// Heap data files that no longer existed when the checkpoint came to write
+/// or fsync them, so it stopped waiting on them. Counted, never silent.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VanishedDataFiles {
+    /// The manifest no longer lists the file as live: the cold-tier GC (or
+    /// the boot orphan sweep) retired it, which is the expected cause.
+    pub retired: u64,
+    /// The manifest still lists the file as live: something other than the
+    /// GC removed it. Its keys are lost whatever the checkpoint does; this
+    /// count is the evidence.
+    pub still_registered: u64,
 }
 
 impl CheckpointManager {
@@ -175,32 +211,97 @@ impl CheckpointManager {
             trigger,
             finalize_retry_at: None,
             finalize_attempts: 0,
-            unsynced_data_files: BTreeSet::new(),
+            unsynced_data_files: BTreeMap::new(),
+            data_write_generation: 0,
             page_flush_failed: false,
             data_sync_poisoned: Arc::new(AtomicBool::new(false)),
+            data_sync: DataFileSyncer::new(),
+            vanished_data_files: VanishedDataFiles::default(),
         }
+    }
+
+    /// Replace the data-file fsync primitive (tests inject hanging or
+    /// failing variants).
+    #[cfg(test)]
+    pub fn set_data_sync_fn(&mut self, f: crate::persistence::data_file_sync::DataSyncFn) {
+        self.data_sync.set_sync_fn(f);
     }
 
     /// Record that a flush `pwrite`d a page into heap file `file_id`; the
     /// file joins the set Finalize must fsync before advancing the redo
     /// point.
     pub fn note_data_file_written(&mut self, file_id: u64) {
-        self.unsynced_data_files.insert(file_id);
+        self.data_write_generation += 1;
+        self.unsynced_data_files
+            .insert(file_id, self.data_write_generation);
     }
 
-    /// Heap data files written since the last successful data-file fsync, in
-    /// ascending `file_id` order.
-    pub fn unsynced_data_files(&self) -> Vec<u64> {
-        self.unsynced_data_files.iter().copied().collect()
+    /// Heap data files written since the last successful data-file fsync, as
+    /// `(file_id, generation)` in ascending `file_id` order.
+    pub fn unsynced_data_files(&self) -> Vec<(u64, u64)> {
+        self.unsynced_data_files
+            .iter()
+            .map(|(&file_id, &generation)| (file_id, generation))
+            .collect()
     }
 
-    /// Every file in `synced` is now durable: drop it from the pending set.
-    /// Takes the exact list the caller synced, so a file a concurrent flush
-    /// re-dirtied after the list was taken can never be cleared by accident.
-    pub fn note_data_files_synced(&mut self, synced: &[u64]) {
-        for file_id in synced {
-            self.unsynced_data_files.remove(file_id);
+    /// Heap file `file_id` is durable as of write `generation`: drop it from
+    /// the pending set unless it was written again since (a newer
+    /// generation), in which case that newer write still needs an fsync.
+    pub fn note_data_file_synced(&mut self, file_id: u64, generation: u64) {
+        if self.unsynced_data_files.get(&file_id) == Some(&generation) {
+            self.unsynced_data_files.remove(&file_id);
         }
+    }
+
+    /// Heap file `file_id` no longer exists: no fsync can reach the inode
+    /// that was written, so stop waiting on it. Returns whether it was
+    /// pending.
+    pub fn forget_data_file(&mut self, file_id: u64) -> bool {
+        self.unsynced_data_files.remove(&file_id).is_some()
+    }
+
+    /// Count a heap file the checkpoint stopped waiting on because it no
+    /// longer exists; `still_registered` = the manifest still lists it live.
+    pub fn note_data_file_vanished(&mut self, still_registered: bool) {
+        if still_registered {
+            self.vanished_data_files.still_registered += 1;
+        } else {
+            self.vanished_data_files.retired += 1;
+        }
+    }
+
+    /// Heap files that vanished before the checkpoint could make them
+    /// durable, by cause.
+    #[inline]
+    pub fn vanished_data_files(&self) -> VanishedDataFiles {
+        self.vanished_data_files
+    }
+
+    /// Start fsyncing `jobs` off the shard thread. Never blocks; refuses
+    /// while a batch is outstanding (at most one helper per shard).
+    pub fn start_data_sync(&mut self, jobs: Vec<DataSyncJob>) -> std::io::Result<()> {
+        let poison = Arc::clone(&self.data_sync_poisoned);
+        self.data_sync.start(jobs, poison)
+    }
+
+    /// Observe the outstanding data-file fsync batch without blocking.
+    pub fn poll_data_sync(&mut self, warn_after: Duration) -> DataSyncPoll {
+        self.data_sync.poll(warn_after)
+    }
+
+    /// Whether a data-file fsync batch is outstanding (or its report waits
+    /// to be polled).
+    #[inline]
+    pub fn data_sync_busy(&self) -> bool {
+        self.data_sync.is_busy()
+    }
+
+    /// BLOCK for the outstanding data-file fsync batch, for at most what is
+    /// left of `budget` measured from the batch's start. Only for the forced
+    /// (synchronous) checkpoint. `false` = still outstanding.
+    pub fn wait_data_sync(&mut self, budget: Duration) -> bool {
+        self.data_sync.wait(budget)
     }
 
     /// Record that a page flush step failed this checkpoint (see
@@ -427,8 +528,9 @@ mod tests {
         );
     }
 
-    /// Written heap files stay pending until a sync covering exactly them is
-    /// reported; a file written after the list was taken stays pending.
+    /// Written heap files stay pending until a sync covering their latest
+    /// write is reported: a file written again after the sync batch was
+    /// taken stays pending, and so does a file the batch never covered.
     #[test]
     fn unsynced_data_files_clear_only_what_was_synced() {
         let mut mgr = CheckpointManager::new(make_trigger(300, u64::MAX, 0.9));
@@ -436,10 +538,27 @@ mod tests {
         mgr.note_data_file_written(1);
         mgr.note_data_file_written(3);
         let taken = mgr.unsynced_data_files();
-        assert_eq!(taken, vec![1, 3]);
+        assert_eq!(taken, vec![(1, 2), (3, 3)]);
         mgr.note_data_file_written(2);
-        mgr.note_data_files_synced(&taken);
-        assert_eq!(mgr.unsynced_data_files(), vec![2]);
+        mgr.note_data_file_written(1); // written again after the batch
+        for &(file_id, generation) in &taken {
+            mgr.note_data_file_synced(file_id, generation);
+        }
+        assert_eq!(mgr.unsynced_data_files(), vec![(1, 5), (2, 4)]);
+
+        assert!(mgr.forget_data_file(2));
+        assert!(!mgr.forget_data_file(2));
+        assert_eq!(mgr.unsynced_data_files(), vec![(1, 5)]);
+        mgr.note_data_file_vanished(false);
+        mgr.note_data_file_vanished(true);
+        mgr.note_data_file_vanished(false);
+        assert_eq!(
+            mgr.vanished_data_files(),
+            VanishedDataFiles {
+                retired: 2,
+                still_registered: 1
+            }
+        );
         assert!(!mgr.is_data_sync_poisoned());
         mgr.data_sync_poison()
             .store(true, std::sync::atomic::Ordering::Release);

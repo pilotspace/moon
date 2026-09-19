@@ -1276,6 +1276,10 @@ pub(crate) fn handle_memory_pressure(
 // Checkpoint protocol handlers (disk-offload path)
 // ---------------------------------------------------------------------------
 
+use super::checkpoint_heap_files::{
+    HeapFilesDurability, heap_file_path, make_written_heap_files_durable,
+    stop_waiting_on_vanished_heap_file,
+};
 use crate::persistence::checkpoint::{CheckpointAction, CheckpointManager};
 use crate::persistence::control::ShardControlFile;
 use crate::persistence::manifest::ShardManifest;
@@ -1373,6 +1377,24 @@ pub(crate) fn force_checkpoint(
                  giving up (will retry on the periodic tick path)",
                 shard_id,
                 ticks
+            );
+            return;
+        }
+        // The heap data-file fsync runs off the shard thread and the periodic
+        // tick only polls it. This path is synchronous by contract (BGSAVE,
+        // shutdown, the WAL ceiling), so it waits for the one outstanding
+        // batch — bounded by WAIT_DURABLE_TIMEOUT measured from the batch's
+        // START: a hung disk stalls this shard for that budget once in total,
+        // not once per forced checkpoint, and never starts a second helper.
+        if checkpoint_mgr.data_sync_busy()
+            && !checkpoint_mgr
+                .wait_data_sync(crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT)
+        {
+            tracing::error!(
+                "Shard {}: forced checkpoint: heap data-file fsync still outstanding after \
+                 {:?}; giving up (the periodic tick path finishes it)",
+                shard_id,
+                crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT
             );
             return;
         }
@@ -1557,14 +1579,6 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
     true
 }
 
-/// `{shard_dir}/data/heap-{file_id:06}.mpf` — the KV heap file a checkpoint
-/// flushes dirty pages into.
-fn heap_file_path(shard_dir: &Path, file_id: u64) -> std::path::PathBuf {
-    shard_dir
-        .join("data")
-        .join(format!("heap-{:06}.mpf", file_id))
-}
-
 /// WAL payload of a FullPageImage record:
 /// `file_id(8 LE) + page_offset(8 LE) + flag(1) + page_data`, where the flag is
 /// `0x00` for an uncompressed image and `0x01` for an LZ4-compressed one.
@@ -1585,58 +1599,20 @@ fn full_page_image_payload(file_id: u64, page_offset: u64, data: &[u8]) -> Vec<u
     payload
 }
 
-/// Make every file in `paths` durable (`sync` on each) OFF the shard thread,
-/// waiting at most `timeout` for the result (#452: checkpoint data-file
-/// fsync). The calling shard thread only blocks on the bounded wait, the same
-/// discipline as `WalWriterV3::wait_durable` — the fsync syscalls themselves
-/// run on a short-lived helper thread (checkpoints finalize minutes apart).
-///
-/// Failure classes, which the checkpoint must treat differently:
-/// - a file cannot be OPENED, or the wait times out → `Err`, retryable: no
-///   fsync has reported a failure, so a later attempt proves durability.
-/// - an fsync RETURNS an error → `Err` AND `poison` is set, permanently:
-///   after a failed fsync the kernel may have dropped the dirty pages and a
-///   retry can report success for data that is gone (fsyncgate). The helper
-///   sets the flag itself, so a failure that lands after the waiter timed out
-///   still poisons.
-fn sync_data_files_off_loop(
-    paths: Vec<std::path::PathBuf>,
-    poison: Arc<std::sync::atomic::AtomicBool>,
-    timeout: std::time::Duration,
-    sync: fn(&std::fs::File) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    let (tx, rx) = flume::bounded::<std::io::Result<()>>(1);
-    std::thread::Builder::new()
-        .name("ckpt-data-sync".to_string())
-        .spawn(move || {
-            let result = (|| {
-                for path in &paths {
-                    // Write access: Windows' FlushFileBuffers requires it.
-                    let file = std::fs::OpenOptions::new().write(true).open(path)?;
-                    if let Err(e) = sync(&file) {
-                        poison.store(true, std::sync::atomic::Ordering::Release);
-                        return Err(std::io::Error::new(
-                            e.kind(),
-                            format!("fsync {}: {}", path.display(), e),
-                        ));
-                    }
-                }
-                Ok(())
-            })();
-            // The waiter may have timed out and gone; the poison flag above
-            // is how a late failure still reaches the checkpoint.
-            let _ = tx.send(result);
-        })?;
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(flume::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("data-file fsync did not complete within {timeout:?}"),
-        )),
-        Err(flume::RecvTimeoutError::Disconnected) => Err(std::io::Error::other(
-            "data-file fsync thread exited without a result",
-        )),
-    }
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_FPI: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test hook: the next FullPageImage append on this thread fails.
+#[cfg(test)]
+pub(crate) fn fail_next_full_page_image() {
+    FAIL_NEXT_FPI.with(|c| c.set(true));
+}
+
+#[cfg(test)]
+fn take_full_page_image_fault() -> bool {
+    FAIL_NEXT_FPI.with(|c| c.replace(false))
 }
 
 /// Handle one checkpoint tick. Called from the event loop every 1ms when
@@ -1644,7 +1620,9 @@ fn sync_data_files_off_loop(
 ///
 /// Returns `true` if a finalize step was completed this tick.
 ///
-/// The caller provides all I/O dependencies — CheckpointManager itself is pure state.
+/// The caller provides all I/O dependencies. The only work this tick hands
+/// off is the heap data-file fsync, which runs on the manager's off-loop
+/// helper; the tick never blocks on it.
 ///
 /// After a successful manifest commit at the Finalize step, tombstone GC runs
 /// with the configured two-axis retention policy. GC is in-memory only here;
@@ -1671,59 +1649,59 @@ pub(crate) fn handle_checkpoint_tick(
     match checkpoint_mgr.advance_tick() {
         CheckpointAction::Nothing => false,
         CheckpointAction::FlushPages(count) => {
-            // Log-before-data for torn-page protection (#452): a page's
-            // FullPageImage is appended to the WAL and made DURABLE before the
-            // page is pwritten in place. The FPI is the only thing that can
-            // repair a torn in-place write, so it must be on disk first — the
-            // old sweep collected every FPI and appended them only after the
-            // whole batch had been pwritten, into the writer's memory buffer.
+            // Log-before-data for torn-page protection (#452), one WAL barrier
+            // per batch: `flush_dirty_pages_with_fpi` appends the FullPageImage
+            // of every FPI-pending page in the batch, then calls the barrier
+            // below ONCE, then pwrites the pages. The barrier makes the WAL
+            // durable through the batch's highest page LSN AND its highest FPI
+            // LSN, so every page's change and image are on disk before any
+            // page is overwritten in place — the order a wait per page gives,
+            // for one fsync instead of one per page.
             //
-            // The FPI append and the durability wait are separate callbacks of
-            // `flush_dirty_pages_with_fpi` that both need `wal`; they run
-            // strictly one after the other for a page (never nested), so a
-            // `RefCell` hands the one `&mut` to whichever runs.
+            // The FPI append and the barrier are separate callbacks that both
+            // need `wal`; they never run nested, so a `RefCell` hands the one
+            // `&mut` to whichever runs.
             let wal_cell = std::cell::RefCell::new(&mut *wal);
             let wal_busy = || std::io::Error::other("checkpoint: WAL writer already borrowed");
-            // LSN of the FPI appended for the page being flushed (0 = none);
-            // reset by the write step so it never outlives its page.
-            let page_fpi_lsn = std::cell::Cell::new(0u64);
-            let page_failed = std::cell::Cell::new(false);
-            let mut written_files: Vec<u64> = Vec::new();
+            // Highest FPI LSN appended in this batch (0 = none).
+            let batch_fpi_lsn = std::cell::Cell::new(0u64);
+            let mut written_files: smallvec::SmallVec<[u64; 16]> = smallvec::SmallVec::new();
+            let mut vanished_files: smallvec::SmallVec<[u64; 4]> = smallvec::SmallVec::new();
+            let mut vanished_pages = 0usize;
             let mut fpi_records = 0usize;
             let shard_dir = control_path.parent().unwrap_or(Path::new("."));
 
-            let flushed = page_cache.flush_dirty_pages_with_fpi(
+            let outcome = page_cache.flush_dirty_pages_with_fpi(
                 count,
-                &mut |page_lsn| {
-                    // HARD ordering invariant (log-before-data): the WAL must
-                    // be durable past this page's LSN — and past its FPI —
-                    // before the page pwrite. Bounded blocking wait on the
-                    // off-loop sync agent; Err leaves the page dirty and fails
-                    // this checkpoint's flush (re-flushed before finalize).
-                    let upto = page_lsn.max(page_fpi_lsn.get());
+                &mut |max_page_lsn| {
+                    // HARD ordering invariant (log-before-data). Bounded wait
+                    // on the off-loop WAL sync agent; Err writes no page of
+                    // the batch and fails this checkpoint's flush (the pages
+                    // stay dirty and are re-flushed before finalize).
+                    let upto = max_page_lsn.max(batch_fpi_lsn.get());
                     let mut wal = wal_cell.try_borrow_mut().map_err(|_| wal_busy())?;
-                    let r = if wal.current_lsn() > upto {
+                    if wal.current_lsn() > upto {
                         wal.wait_durable(
                             upto,
                             crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT,
                         )
                     } else {
                         Ok(())
-                    };
-                    if r.is_err() {
-                        page_failed.set(true);
                     }
-                    r
                 },
                 &mut |file_id, page_offset, _is_large, data| {
+                    #[cfg(test)]
+                    if take_full_page_image_fault() {
+                        return Err(std::io::Error::other("injected FPI failure"));
+                    }
                     let payload = full_page_image_payload(file_id, page_offset, data);
                     let mut wal = wal_cell.try_borrow_mut().map_err(|_| wal_busy())?;
-                    page_fpi_lsn.set(wal.append(WalRecordType::FullPageImage, &payload));
+                    let lsn = wal.append(WalRecordType::FullPageImage, &payload);
+                    batch_fpi_lsn.set(batch_fpi_lsn.get().max(lsn));
                     fpi_records += 1;
                     Ok(())
                 },
                 &mut |file_id, page_offset, is_large, data| {
-                    page_fpi_lsn.set(0);
                     // pwrite(2) dirty page to its DataFile at the correct offset.
                     // KV heap pages: {shard_dir}/data/heap-{file_id:06}.mpf
                     // Warm-tier .mpf pages are immutable and never dirtied, so
@@ -1734,15 +1712,29 @@ pub(crate) fn handle_checkpoint_tick(
                         crate::persistence::page::PAGE_4K
                     };
                     let byte_offset = page_offset * page_size as u64;
+                    // Never `create`: a heap file that is gone stays gone.
                     let r = std::fs::OpenOptions::new()
                         .write(true)
                         .open(heap_file_path(shard_dir, file_id))
                         .and_then(|file| crate::util::file_ext::write_at(&file, data, byte_offset));
-                    match r {
+                    match &r {
                         // Written, NOT yet durable: Finalize fsyncs the file
                         // before it may publish a redo point above this page.
-                        Ok(()) => written_files.push(file_id),
-                        Err(_) => page_failed.set(true),
+                        Ok(()) => {
+                            if !written_files.contains(&file_id) {
+                                written_files.push(file_id);
+                            }
+                        }
+                        // The heap file no longer exists: this page can never
+                        // be written anywhere. Handled below — it is not a
+                        // flush failure to retry.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            vanished_pages += 1;
+                            if !vanished_files.contains(&file_id) {
+                                vanished_files.push(file_id);
+                            }
+                        }
+                        Err(_) => {}
                     }
                     r
                 },
@@ -1751,13 +1743,25 @@ pub(crate) fn handle_checkpoint_tick(
             for file_id in written_files {
                 checkpoint_mgr.note_data_file_written(file_id);
             }
-            if page_failed.get() {
+            for file_id in vanished_files {
+                stop_waiting_on_vanished_heap_file(
+                    checkpoint_mgr,
+                    page_cache,
+                    manifest,
+                    file_id,
+                    "page write",
+                );
+            }
+            // Any page the batch did not write for a reason other than its
+            // file being gone — its image, the WAL barrier or its write
+            // failed — is still dirty: Finalize must re-flush it.
+            if outcome.failed > vanished_pages {
                 checkpoint_mgr.note_page_flush_failed();
             }
-            if flushed > 0 {
+            if outcome.flushed > 0 {
                 tracing::trace!(
                     "Checkpoint: flushed {} dirty pages (with FPI, {} FPI records)",
-                    flushed,
+                    outcome.flushed,
                     fpi_records
                 );
             }
@@ -1814,29 +1818,20 @@ pub(crate) fn handle_checkpoint_tick(
                 checkpoint_mgr.note_finalize_failed(std::time::Instant::now());
                 return false;
             }
-            let unsynced = checkpoint_mgr.unsynced_data_files();
-            if !unsynced.is_empty() {
-                let paths = unsynced
-                    .iter()
-                    .map(|&file_id| {
-                        heap_file_path(control_path.parent().unwrap_or(Path::new(".")), file_id)
-                    })
-                    .collect();
-                if let Err(e) = sync_data_files_off_loop(
-                    paths,
-                    checkpoint_mgr.data_sync_poison(),
-                    crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT,
-                    |f| f.sync_data(),
-                ) {
-                    tracing::error!(
-                        "Checkpoint heap data-file fsync failed ({} file(s)): {}",
-                        unsynced.len(),
-                        e
-                    );
+            //    Every heap file the flush wrote must be durable. The fsync
+            //    runs off the shard thread; this tick only polls it.
+            match make_written_heap_files_durable(
+                checkpoint_mgr,
+                page_cache,
+                manifest,
+                control_path.parent().unwrap_or(Path::new(".")),
+            ) {
+                HeapFilesDurability::Durable => {}
+                HeapFilesDurability::Pending => return false,
+                HeapFilesDurability::Failed => {
                     checkpoint_mgr.note_finalize_failed(std::time::Instant::now());
                     return false;
                 }
-                checkpoint_mgr.note_data_files_synced(&unsynced);
             }
 
             // 1. Write WAL checkpoint record with redo_lsn payload
@@ -1980,6 +1975,10 @@ pub(crate) fn handle_checkpoint_tick(
 }
 
 #[cfg(test)]
+#[path = "checkpoint_tick_tests.rs"]
+mod checkpoint_tick_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::persistence::checkpoint::CheckpointTrigger;
@@ -1989,7 +1988,7 @@ mod tests {
     };
 
     /// Count FullPageImage records in a raw WAL segment file.
-    fn count_fpi_records(raw_data: &[u8]) -> usize {
+    pub(super) fn count_fpi_records(raw_data: &[u8]) -> usize {
         let mut offset = WAL_V3_HEADER_SIZE;
         let mut fpi_count = 0usize;
         while offset + 4 <= raw_data.len() {
@@ -2082,11 +2081,13 @@ mod tests {
             if finalized || !checkpoint_mgr.is_active() {
                 break;
             }
-            // Safety: don't loop forever
             assert!(
-                tick_count < 100,
-                "Checkpoint should complete within 100 ticks"
+                tick_count < 5000,
+                "Checkpoint should complete within 5000 ticks"
             );
+            // The heap-file fsync completes off the shard thread; tick at
+            // roughly the event loop's 1 ms cadence while it runs.
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
         // Flush WAL to disk
@@ -2171,9 +2172,12 @@ mod tests {
                 break;
             }
             assert!(
-                tick_count < 100,
-                "Checkpoint should complete within 100 ticks"
+                tick_count < 5000,
+                "Checkpoint should complete within 5000 ticks"
             );
+            // The heap-file fsync completes off the shard thread; tick at
+            // roughly the event loop's 1 ms cadence while it runs.
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
         // Flush WAL to disk
@@ -2194,290 +2198,6 @@ mod tests {
             page_cache.dirty_page_count(),
             0,
             "All dirty pages should be flushed even without FPI"
-        );
-    }
-
-    // ──────────────────────────────────────────────────────────────────
-    // #452 — the checkpoint may only advance the redo point over pages it
-    // has made durable: FPI in the WAL before the page is overwritten in
-    // place, and every heap file it wrote fsynced before the control file
-    // publishes the new redo point (the WAL below it is then recycled).
-    // ──────────────────────────────────────────────────────────────────
-
-    /// A shard with ONE dirty, FPI-pending 4 KiB heap page (file 1, page 0)
-    /// whose modification is WAL record `page_lsn`, and a checkpoint begun
-    /// AFTER that record, so its redo point is strictly above the page's
-    /// change: once it publishes, replay never sees that record again.
-    struct DirtyPageShard {
-        _tmp: tempfile::TempDir,
-        wal_dir: std::path::PathBuf,
-        heap_path: std::path::PathBuf,
-        page_cache: PageCache,
-        wal: WalWriterV3,
-        checkpoint_mgr: CheckpointManager,
-        manifest: ShardManifest,
-        control: ShardControlFile,
-        control_path: std::path::PathBuf,
-        redo_lsn: u64,
-    }
-
-    const PAGE_BYTE: u8 = 0x5A;
-
-    impl DirtyPageShard {
-        fn new() -> Self {
-            let tmp = tempfile::tempdir().unwrap();
-            let shard_dir = tmp.path().join("shard-0");
-            let wal_dir = shard_dir.join("wal-v3");
-            let data_dir = shard_dir.join("data");
-            std::fs::create_dir_all(&wal_dir).unwrap();
-            std::fs::create_dir_all(&data_dir).unwrap();
-            let heap_path = data_dir.join("heap-000001.mpf");
-            std::fs::write(&heap_path, vec![0u8; 4096]).unwrap();
-
-            let mut wal =
-                WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
-            let page_lsn = wal.append(WalRecordType::Command, b"page change");
-            wal.flush_sync().unwrap();
-
-            let page_cache = PageCache::new(4, 0);
-            let handle = page_cache
-                .fetch_page(1, 0, false, |buf| {
-                    buf.fill(PAGE_BYTE);
-                    Ok(())
-                })
-                .unwrap();
-            page_cache.unpin_page(handle);
-            page_cache.mark_dirty(1, 0, page_lsn);
-
-            let redo_lsn = wal.current_lsn();
-            assert!(redo_lsn > page_lsn);
-            let mut checkpoint_mgr =
-                CheckpointManager::new(CheckpointTrigger::new(300, 256 * 1024 * 1024, 0.9));
-            assert!(checkpoint_mgr.begin(redo_lsn, page_cache.dirty_page_count()));
-            page_cache.arm_all_fpi_pending();
-
-            let manifest = ShardManifest::create(&shard_dir.join("manifest.dat")).unwrap();
-            let control = ShardControlFile::new([0u8; 16]);
-            let control_path = ShardControlFile::control_path(&shard_dir, 0);
-            control.write(&control_path).unwrap();
-            Self {
-                _tmp: tmp,
-                wal_dir,
-                heap_path,
-                page_cache,
-                wal,
-                checkpoint_mgr,
-                manifest,
-                control,
-                control_path,
-                redo_lsn,
-            }
-        }
-
-        /// One checkpoint tick; `true` when a Finalize completed.
-        fn tick(&mut self) -> bool {
-            handle_checkpoint_tick(
-                &mut self.checkpoint_mgr,
-                &self.page_cache,
-                &mut self.wal,
-                &mut self.manifest,
-                &mut self.control,
-                &self.control_path,
-                2,
-                300,
-                &mut |_| true,
-            )
-        }
-
-        /// Tick until a Finalize completes, sleeping past the finalize
-        /// backoff between attempts. Panics after `max_ticks`.
-        fn tick_until_finalized(&mut self, max_ticks: usize) {
-            for _ in 0..max_ticks {
-                if self.tick() {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(60));
-            }
-            panic!("checkpoint did not finalize within {max_ticks} ticks");
-        }
-
-        /// The redo point as persisted in the control file on disk.
-        fn published_redo_lsn(&self) -> u64 {
-            ShardControlFile::read(&self.control_path)
-                .unwrap()
-                .last_checkpoint_lsn
-        }
-
-        /// FullPageImage records present in the WAL files on DISK (records
-        /// still in the writer's memory buffer do not count).
-        fn fpi_records_on_disk(&self) -> usize {
-            let mut n = 0;
-            for entry in std::fs::read_dir(&self.wal_dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.extension().is_some_and(|e| e == "wal") {
-                    n += count_fpi_records(&std::fs::read(&path).unwrap());
-                }
-            }
-            n
-        }
-
-        fn heap_page_on_disk(&self) -> Vec<u8> {
-            std::fs::read(&self.heap_path).unwrap()[..4096].to_vec()
-        }
-    }
-
-    /// Log-before-data for torn-page protection: the moment a page's new
-    /// bytes reach its heap file, the FullPageImage that can repair a torn
-    /// write of that page must already be in the WAL on disk. The flush used
-    /// to append every FPI only AFTER the whole batch had been pwritten, into
-    /// the writer's memory buffer — a crash mid-pwrite left a torn page and
-    /// no image anywhere.
-    #[test]
-    fn checkpoint_fpi_reaches_the_wal_before_its_page_reaches_the_heap_file() {
-        let mut shard = DirtyPageShard::new();
-        assert_eq!(shard.fpi_records_on_disk(), 0);
-
-        // One page, one page per tick: this tick flushes it.
-        assert!(!shard.tick());
-        assert!(
-            shard.heap_page_on_disk().iter().all(|&b| b == PAGE_BYTE),
-            "precondition: the flush tick wrote the page into its heap file"
-        );
-        assert_eq!(
-            shard.fpi_records_on_disk(),
-            1,
-            "the page was overwritten in place while its FullPageImage was not yet in \
-             the WAL on disk — a crash in that window leaves a torn page with no image"
-        );
-    }
-
-    /// The checkpoint must not publish a redo point above a page change it
-    /// cannot prove durable. Here the heap file the page was written to
-    /// cannot be opened to fsync it (renamed away): Finalize must refuse —
-    /// publishing would recycle the only WAL record of the change while the
-    /// page sits in the kernel's page cache, unsynced. Once the file is back
-    /// the retry fsyncs it and completes.
-    #[test]
-    fn checkpoint_does_not_publish_redo_over_a_heap_file_it_cannot_fsync() {
-        let mut shard = DirtyPageShard::new();
-        assert!(!shard.tick(), "flush tick");
-        assert!(shard.heap_page_on_disk().iter().all(|&b| b == PAGE_BYTE));
-        let before = shard.published_redo_lsn();
-        assert!(before < shard.redo_lsn);
-
-        let away = shard.heap_path.with_extension("away");
-        std::fs::rename(&shard.heap_path, &away).unwrap();
-        let finalized = shard.tick();
-        assert!(
-            !finalized,
-            "Finalize published redo_lsn {} although the heap file holding the page \
-             written below it could not be fsynced",
-            shard.redo_lsn
-        );
-        assert_eq!(shard.published_redo_lsn(), before);
-        assert_eq!(shard.control.last_checkpoint_lsn, before);
-        assert!(shard.checkpoint_mgr.is_active());
-
-        std::fs::rename(&away, &shard.heap_path).unwrap();
-        shard.tick_until_finalized(20);
-        assert_eq!(shard.published_redo_lsn(), shard.redo_lsn);
-    }
-
-    /// A page that failed to flush (its heap file was missing when the flush
-    /// tick ran) is still dirty and was never imaged or written. The
-    /// checkpoint must not finalize over it; it re-flushes the page and only
-    /// then publishes — with the page's bytes actually in the heap file.
-    #[test]
-    fn checkpoint_does_not_finalize_over_a_page_that_failed_to_flush() {
-        let mut shard = DirtyPageShard::new();
-        let away = shard.heap_path.with_extension("away");
-        std::fs::rename(&shard.heap_path, &away).unwrap();
-
-        assert!(!shard.tick(), "flush tick (the pwrite fails)");
-        assert_eq!(shard.page_cache.dirty_page_count(), 1);
-        let finalized = shard.tick();
-        assert!(
-            !finalized,
-            "Finalize published redo_lsn {} over a page that never reached its heap file",
-            shard.redo_lsn
-        );
-        assert_eq!(shard.published_redo_lsn(), 0);
-
-        std::fs::rename(&away, &shard.heap_path).unwrap();
-        shard.tick_until_finalized(40);
-        assert_eq!(shard.page_cache.dirty_page_count(), 0);
-        assert!(shard.heap_page_on_disk().iter().all(|&b| b == PAGE_BYTE));
-        assert_eq!(shard.published_redo_lsn(), shard.redo_lsn);
-    }
-
-    /// fsyncgate: an fsync that RETURNS an error poisons the shard's
-    /// checkpoints for good — a later fsync of the same file may report
-    /// success for pages the kernel already dropped. A file that merely
-    /// cannot be opened is retryable and poisons nothing.
-    #[test]
-    fn data_file_fsync_error_poisons_but_an_open_failure_does_not() {
-        let tmp = tempfile::tempdir().unwrap();
-        let present = tmp.path().join("heap-000001.mpf");
-        std::fs::write(&present, b"page").unwrap();
-        let timeout = std::time::Duration::from_secs(5);
-
-        let poison = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let missing = tmp.path().join("heap-000002.mpf");
-        let err = sync_data_files_off_loop(vec![missing], Arc::clone(&poison), timeout, |f| {
-            f.sync_data()
-        })
-        .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        assert!(!poison.load(std::sync::atomic::Ordering::Acquire));
-
-        sync_data_files_off_loop(vec![present.clone()], Arc::clone(&poison), timeout, |f| {
-            f.sync_data()
-        })
-        .unwrap();
-        assert!(!poison.load(std::sync::atomic::Ordering::Acquire));
-
-        let err = sync_data_files_off_loop(vec![present], Arc::clone(&poison), timeout, |_| {
-            Err(std::io::Error::other("EIO"))
-        })
-        .unwrap_err();
-        assert!(err.to_string().contains("EIO"), "{err}");
-        assert!(poison.load(std::sync::atomic::Ordering::Acquire));
-    }
-
-    /// Once a data-file fsync has failed on this shard, no checkpoint may
-    /// publish a redo point again — even when every file now syncs fine.
-    #[test]
-    fn checkpoint_never_publishes_redo_after_a_data_file_fsync_error() {
-        let mut shard = DirtyPageShard::new();
-        assert!(!shard.tick(), "flush tick");
-        shard
-            .checkpoint_mgr
-            .data_sync_poison()
-            .store(true, std::sync::atomic::Ordering::Release);
-        for _ in 0..3 {
-            assert!(!shard.tick());
-            std::thread::sleep(std::time::Duration::from_millis(60));
-        }
-        assert_eq!(shard.published_redo_lsn(), 0);
-        assert!(shard.checkpoint_mgr.is_active());
-    }
-
-    /// The FPI payload layout the WAL replay decodes: file_id, page_offset,
-    /// flag, image — compressed only when that is smaller.
-    #[test]
-    fn full_page_image_payload_layout() {
-        let small = full_page_image_payload(7, 3, &[1, 2, 3]);
-        assert_eq!(&small[..8], &7u64.to_le_bytes());
-        assert_eq!(&small[8..16], &3u64.to_le_bytes());
-        assert_eq!(small[16], 0x00);
-        assert_eq!(&small[17..], &[1, 2, 3]);
-
-        let page = vec![0xAB; 4096];
-        let big = full_page_image_payload(1, 0, &page);
-        assert_eq!(big[16], 0x01, "a uniform page compresses");
-        assert_eq!(
-            lz4_flex::decompress_size_prepended(&big[17..]).unwrap(),
-            page
         );
     }
 
