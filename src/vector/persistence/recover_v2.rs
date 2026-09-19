@@ -498,13 +498,15 @@ fn load_segments_and_keymap(
     idx_dir: &Path,
     manifest: &IndexManifest,
 ) -> Option<IndexRecoveryCounters> {
-    let mut immutable: Vec<Arc<ImmutableSegment>> = Vec::with_capacity(manifest.segment_ids.len());
+    // Owned until the keymap gate below has tombstoned the rows that are not
+    // their key's current copy: install-time tombstones need `&mut`.
+    let mut loaded: Vec<ImmutableSegment> = Vec::with_capacity(manifest.segment_ids.len());
     let mut dropped_key_hashes: HashSet<u64> = HashSet::new();
 
     for &segment_id in &manifest.segment_ids {
         match segment_io::read_immutable_segment(idx_dir, segment_id) {
             Ok((seg, collection)) if collection.collection_id == manifest.collection_id => {
-                immutable.push(Arc::new(seg.with_disk_segment_id(Some(segment_id))));
+                loaded.push(seg.with_disk_segment_id(Some(segment_id)));
             }
             Ok((seg, collection)) => {
                 // Degradation level 2: loaded fine, but its collection_id
@@ -565,16 +567,38 @@ fn load_segments_and_keymap(
     // keymap entry with a perfectly matching checksum but NO doc in any
     // loaded segment. Loading such a phantom entry would make the B3 dedup
     // rescan "verify" the key as unchanged and silently drop its document.
-    // Only keys live in a successfully loaded segment may enter the
-    // recovered maps; everything else stays unknown → full re-index from
-    // the AOF rescan.
-    let mut segment_resident: HashSet<u64> = HashSet::new();
-    for seg in &immutable {
-        segment_resident.extend(seg.live_key_hashes());
-    }
-
+    // Only keys whose CURRENT copy (by global_id, see the keymap gate below)
+    // is live in a successfully loaded segment may enter the recovered maps;
+    // everything else stays unknown → full re-index from the AOF rescan.
     let entries =
         manifest::read_keymap_tolerant(idx_dir, manifest.keymap_epoch).unwrap_or_default();
+
+    // Keymap gate (moon#1073). The keymap is the durable record of which copy
+    // of each key is current: it names the copy by global_id. Segments are
+    // written once and never rewritten, so a row that a steady-state
+    // tombstone killed in memory (an HSET re-write, a DEL) comes back from
+    // disk live. Each loaded row is therefore kept only if it is the copy the
+    // keymap names (key_hash AND global_id), and only once; every other live
+    // row is tombstoned in the segment that holds it -- that row only, never
+    // key_hash-wide, so no other segment's copy is touched.
+    let current: HashMap<u64, u32> = entries
+        .iter()
+        .filter(|e| !dropped_key_hashes.contains(&e.key_hash))
+        .map(|e| (e.key_hash, e.global_id))
+        .collect();
+    let (segment_resident, superseded) =
+        supersede_rows_the_keymap_does_not_name(&mut loaded, &current);
+    if superseded > 0 {
+        info!(
+            "vector index {}: {} row(s) in loaded segments are not their key's current \
+             copy (re-written or deleted after the segment was built) — tombstoned in \
+             their segment",
+            String::from_utf8_lossy(name),
+            superseded
+        );
+    }
+    let immutable: Vec<Arc<ImmutableSegment>> = loaded.into_iter().map(Arc::new).collect();
+
     let mut key_hash_to_key = BucketedKeyMap::new();
     let mut key_hash_to_global_id = BucketedKeyMap::new();
     let mut key_hash_to_vec_checksum = BucketedKeyMap::new();
@@ -645,6 +669,44 @@ fn load_segments_and_keymap(
         loaded_segments,
         ..Default::default()
     })
+}
+
+/// Apply the keymap gate to freshly loaded (not yet shared) segments.
+///
+/// `current` maps each key_hash to the global_id of its current copy, as the
+/// persisted keymap names it. A live row survives only if it is that copy and
+/// no earlier segment already kept it; every other live row is tombstoned in
+/// place (an install-time `mvcc.delete_lsn`, so `live_count` stays exact).
+/// Returns the key_hashes whose current copy was found live, and the number of
+/// rows tombstoned.
+fn supersede_rows_the_keymap_does_not_name(
+    segments: &mut [ImmutableSegment],
+    current: &HashMap<u64, u32>,
+) -> (HashSet<u64>, usize) {
+    let mut backed: HashSet<u64> = HashSet::with_capacity(current.len());
+    let mut superseded = 0usize;
+    for seg in segments.iter_mut() {
+        let dead: Vec<u32> = seg
+            .mvcc_headers()
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.delete_lsn == 0)
+            .filter_map(|(pos, h)| {
+                let is_current = current.get(&h.key_hash) == Some(&h.global_id);
+                if is_current && backed.insert(h.key_hash) {
+                    None
+                } else {
+                    Some(pos as u32)
+                }
+            })
+            .collect();
+        superseded += dead.len();
+        for pos in dead {
+            // Same sentinel the install-time reconcile uses.
+            seg.mark_deleted(pos, 1);
+        }
+    }
+    (backed, superseded)
 }
 
 /// Build a copy of `args` with the DEFAULT vector field's (name, value) pair

@@ -2,6 +2,7 @@ pub mod compaction;
 pub mod holder;
 pub mod immutable;
 pub mod ivf;
+pub mod key_index;
 pub mod mutable;
 pub mod raw_f16_store;
 
