@@ -105,6 +105,13 @@ pub struct Shard {
     /// replay read every cold file ungated. Read by `main.rs`, which rewrites
     /// the AOF once so later boots are gated.
     pub replayed_aof_without_cold_cut: bool,
+    /// First cold-tier `file_id` this shard may allocate, proven above every
+    /// id in use (moon#997, moon#893) by [`Self::prove_spill_file_id_seed`] —
+    /// the startup gate `main` and the embedded server run after recovery,
+    /// refusing to start when the seed cannot be proven. `None` when that
+    /// gate did not run or disk-offload is off; `event_loop.rs` reads it once
+    /// to seed the spill counter.
+    pub spill_file_id_seed: Option<u64>,
 }
 
 impl Shard {
@@ -159,7 +166,35 @@ impl Shard {
             recovered_warm_segments: Vec::new(),
             pending_heap_orphans: Vec::new(),
             replayed_aof_without_cold_cut: false,
+            spill_file_id_seed: None,
         }
+    }
+
+    /// Prove where this shard's cold-tier `file_id` counter may resume and
+    /// record it in [`Self::spill_file_id_seed`] (moon#997, moon#893).
+    ///
+    /// The startup gate shared by `main` and the embedded server: call it for
+    /// every shard AFTER [`Self::restore_from_persistence`] (recovery may
+    /// retire directories and entries) and before any shard thread starts
+    /// (nothing can spill yet). Returns the seed — `1`, with the field left
+    /// `None`, when disk-offload is off and no cold file can exist.
+    ///
+    /// # Errors
+    ///
+    /// The seed cannot be proven above every id in use; the caller must
+    /// refuse to start rather than guess (see
+    /// [`crate::storage::tiered::file_id_seed`]).
+    pub fn prove_spill_file_id_seed(
+        &mut self,
+        disk_offload_base: Option<&std::path::Path>,
+    ) -> Result<u64, crate::storage::tiered::file_id_seed::FileIdSeedError> {
+        let Some(base) = disk_offload_base else {
+            return Ok(1);
+        };
+        let shard_dir = base.join(format!("shard-{}", self.id));
+        let seed = crate::storage::tiered::file_id_seed::next_file_id_seed(&shard_dir, self.id)?;
+        self.spill_file_id_seed = Some(seed);
+        Ok(seed)
     }
 
     /// Restore shard state from per-shard snapshot and WAL files at startup.

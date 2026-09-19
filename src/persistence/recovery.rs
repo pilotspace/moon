@@ -203,7 +203,11 @@ pub fn recover_shard_v3_pitr(
     // ── Phase 2: MANIFEST RECOVERY ────────────────────────────────────
     let manifest_path = shard_dir.join(format!("shard-{}.manifest", shard_id));
     if manifest_path.exists() {
-        match ShardManifest::open(&manifest_path) {
+        // A torn create (shorter than the two root pages, no committed entry)
+        // is re-created empty here, the first place a boot opens the manifest,
+        // so every later open — the cold-index rebuild below, the file_id
+        // seed, the event loop — sees a valid one instead of failing forever.
+        match ShardManifest::open_repairing_torn_create(&manifest_path) {
             Ok(manifest) => {
                 let file_count = manifest.files().len();
                 info!(
@@ -356,7 +360,7 @@ pub fn recover_shard_v3_pitr(
             if !stale_warm_ids.is_empty() {
                 let retired = stale_warm_ids.len();
                 for file_id in &stale_warm_ids {
-                    manifest.remove_file(*file_id);
+                    manifest.remove_file(*file_id, PageType::VecCodes);
                 }
                 match manifest.commit() {
                     Ok(()) => info!(
@@ -1406,6 +1410,107 @@ mod tests {
             live.status,
             FileStatus::Active,
             "live segment must not be retired"
+        );
+    }
+
+    /// moon#893 (P0): retiring a dirless warm segment entry must not tombstone
+    /// a live KV spill file that holds the same id.
+    ///
+    /// A restart seed that ignored vector segments re-issued a warm segment's
+    /// id to a spill file, so manifests in the field hold a `VecCodes` and a
+    /// `KvLeaf` entry under one id. When the segment's directory is gone, the
+    /// #546a pass above retires its entry — and `remove_file(id)` matched on
+    /// the id alone, tombstoning the spill file too. Its keys then dropped out
+    /// of the cold index rebuilt a few lines later, and read as absent.
+    #[test]
+    fn test_retiring_dirless_warm_entry_spares_same_id_spill_file() {
+        use crate::persistence::kv_page::ValueType;
+        use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
+        use crate::persistence::page::PageType;
+        use crate::storage::tiered::kv_spill::{
+            SpillEntry, build_kv_spill_batch, write_kv_spill_batch,
+        };
+
+        const SHARED_ID: u64 = 9;
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        let batch = build_kv_spill_batch(
+            &[SpillEntry {
+                key: bytes::Bytes::from_static(b"k893"),
+                value_bytes: bytes::Bytes::from_static(b"cold-only-value"),
+                value_type: ValueType::String,
+                flags: 0,
+                ttl_ms: None,
+            }],
+            SHARED_ID,
+        )
+        .unwrap();
+        let byte_size = write_kv_spill_batch(&shard_dir, SHARED_ID, &batch).unwrap();
+
+        let manifest_path = shard_dir.join("shard-0.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        // The warm segment first (it held the id first), then the spill file
+        // that was re-issued the same id. No `vectors/segment-9/` exists.
+        manifest.add_file(FileEntry {
+            file_id: SHARED_ID,
+            file_type: PageType::VecCodes as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Warm,
+            page_size_log2: 16,
+            page_count: 1,
+            byte_size: 256,
+            created_lsn: 0,
+            db_index: 0,
+            max_key_hash: u64::MAX,
+            last_modified_lsn: 0,
+        });
+        manifest.add_file(FileEntry {
+            file_id: SHARED_ID,
+            file_type: PageType::KvLeaf as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Hot,
+            page_size_log2: 12,
+            page_count: batch.pages.len() as u32,
+            byte_size,
+            created_lsn: 0,
+            db_index: 0,
+            max_key_hash: 0,
+            last_modified_lsn: 0,
+        });
+        manifest.commit().unwrap();
+        drop(manifest);
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
+
+        let reopened = ShardManifest::open(&manifest_path).unwrap();
+        let status_of = |t: PageType| {
+            reopened
+                .files()
+                .iter()
+                .find(|e| e.file_id == SHARED_ID && e.file_type == t as u8)
+                .map(|e| e.status)
+        };
+        assert_eq!(
+            status_of(PageType::VecCodes),
+            Some(FileStatus::Tombstone),
+            "the dirless warm entry is still retired (#546a)"
+        );
+        assert_eq!(
+            status_of(PageType::KvLeaf),
+            Some(FileStatus::Active),
+            "the live spill file sharing its id must NOT be tombstoned"
+        );
+        assert!(
+            databases[0]
+                .cold_index
+                .as_ref()
+                .and_then(|ci| ci.lookup(b"k893"))
+                .is_some(),
+            "the spill file's key must be in the rebuilt cold index, not absent"
         );
     }
 

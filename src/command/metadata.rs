@@ -51,6 +51,21 @@ impl CommandFlags {
     /// path", so adding a command or an intercept can cost throughput but
     /// never correctness. `tests/intercept_flag_drift.rs` guards the other
     /// direction.
+    ///
+    /// **Two consumers, one bit** (moon#937). The moon#507 pipeline guard,
+    /// `server::conn::shared::must_wait_for_pending_remote`, derives "may an
+    /// interceptor consume this command inline?" from this same bit: an
+    /// unmarked command WAITS behind its batch's pending remote writes, a
+    /// marked one is routed by its own key. That replaced a hand-written
+    /// intercept list that failed open and had drifted. The price of failing
+    /// safe is that an unmarked plain keyspace command waits for nothing, so
+    /// the registry is marked completely and
+    /// `routable_commands_no_gate_claims_are_marked_no_intercept_moon937`
+    /// (`shared.rs`) fails when a new routable command is added without it.
+    /// Never mark a command an interceptor claims — through a literal in a
+    /// gate OR a delegated predicate (`is_txn_*`, `is_temporal_*`,
+    /// `is_mq_command`, `is_ws_command`, `is_blocking_command_args`):
+    /// `no_marked_command_fires_a_delegated_gate_predicate` drives those.
     pub const NO_INTERCEPT: Self = Self(1 << 14);
 
     #[inline]
@@ -136,9 +151,12 @@ const W: CommandFlags = CommandFlags::WRITE;
 const R: CommandFlags = CommandFlags::READONLY;
 const WF: CommandFlags = CommandFlags(CommandFlags::WRITE.0 | CommandFlags::FAST.0);
 const RF: CommandFlags = CommandFlags(CommandFlags::READONLY.0 | CommandFlags::FAST.0);
-/// `WF`/`RF` plus [`CommandFlags::NO_INTERCEPT`] — a plain keyspace command no
-/// connection-handler intercept claims. See the flag's docs for why the sense
-/// is inverted.
+/// `W`/`R`/`WF`/`RF` plus [`CommandFlags::NO_INTERCEPT`] — a plain keyspace
+/// command no connection-handler intercept claims. See the flag's docs for why
+/// the sense is inverted, and for the second consumer that makes the mark
+/// load-bearing for pipeline throughput (moon#937).
+const WP: CommandFlags = CommandFlags(W.0 | CommandFlags::NO_INTERCEPT.0);
+const RP: CommandFlags = CommandFlags(R.0 | CommandFlags::NO_INTERCEPT.0);
 const WFP: CommandFlags = CommandFlags(WF.0 | CommandFlags::NO_INTERCEPT.0);
 const RFP: CommandFlags = CommandFlags(RF.0 | CommandFlags::NO_INTERCEPT.0);
 const A: CommandFlags = CommandFlags::ADMIN;
@@ -194,33 +212,33 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "HGET" => CommandMeta { name: "HGET", arity: 3, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HDEL" => CommandMeta { name: "HDEL", arity: -3, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HLEN" => CommandMeta { name: "HLEN", arity: 2, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HMSET" => CommandMeta { name: "HMSET", arity: -4, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HMSET" => CommandMeta { name: "HMSET", arity: -4, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HMGET" => CommandMeta { name: "HMGET", arity: -3, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HKEYS" => CommandMeta { name: "HKEYS", arity: 2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HVALS" => CommandMeta { name: "HVALS", arity: 2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HSCAN" => CommandMeta { name: "HSCAN", arity: -3, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HKEYS" => CommandMeta { name: "HKEYS", arity: 2, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HVALS" => CommandMeta { name: "HVALS", arity: 2, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HSCAN" => CommandMeta { name: "HSCAN", arity: -3, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HSETNX" => CommandMeta { name: "HSETNX", arity: 4, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HGETALL" => CommandMeta { name: "HGETALL", arity: 2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HGETALL" => CommandMeta { name: "HGETALL", arity: 2, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HEXISTS" => CommandMeta { name: "HEXISTS", arity: 3, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HINCRBY" => CommandMeta { name: "HINCRBY", arity: 4, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HINCRBYFLOAT" => CommandMeta { name: "HINCRBYFLOAT", arity: 4, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HRANDFIELD" => CommandMeta { name: "HRANDFIELD", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HRANDFIELD" => CommandMeta { name: "HRANDFIELD", arity: -2, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HSTRLEN" => CommandMeta { name: "HSTRLEN", arity: 3, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     // HEXPIRE-family write: min 6 args = CMD key when FIELDS numfields field
-    "HEXPIRE" => CommandMeta { name: "HEXPIRE", arity: -6, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HPEXPIRE" => CommandMeta { name: "HPEXPIRE", arity: -6, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HEXPIREAT" => CommandMeta { name: "HEXPIREAT", arity: -6, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HPEXPIREAT" => CommandMeta { name: "HPEXPIREAT", arity: -6, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HEXPIRE" => CommandMeta { name: "HEXPIRE", arity: -6, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HPEXPIRE" => CommandMeta { name: "HPEXPIRE", arity: -6, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HEXPIREAT" => CommandMeta { name: "HEXPIREAT", arity: -6, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HPEXPIREAT" => CommandMeta { name: "HPEXPIREAT", arity: -6, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     // HEXPIRE-family read + HPERSIST: min 5 args = CMD key FIELDS numfields field
-    "HEXPIRETIME" => CommandMeta { name: "HEXPIRETIME", arity: -5, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HPEXPIRETIME" => CommandMeta { name: "HPEXPIRETIME", arity: -5, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HTTL" => CommandMeta { name: "HTTL", arity: -5, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HPTTL" => CommandMeta { name: "HPTTL", arity: -5, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HPERSIST" => CommandMeta { name: "HPERSIST", arity: -5, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HEXPIRETIME" => CommandMeta { name: "HEXPIRETIME", arity: -5, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HPEXPIRETIME" => CommandMeta { name: "HPEXPIRETIME", arity: -5, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HTTL" => CommandMeta { name: "HTTL", arity: -5, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HPTTL" => CommandMeta { name: "HPTTL", arity: -5, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HPERSIST" => CommandMeta { name: "HPERSIST", arity: -5, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     // HGETDEL / HGETEX: Valkey 9.1 atomic compound commands (phase 199 / issue #110).
     // min 5 args = CMD key FIELDS numfields field; HGETEX may have an extra mode+arg.
-    "HGETDEL" => CommandMeta { name: "HGETDEL", arity: -5, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HGETEX" => CommandMeta { name: "HGETEX", arity: -5, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HGETDEL" => CommandMeta { name: "HGETDEL", arity: -5, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HGETEX" => CommandMeta { name: "HGETEX", arity: -5, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
 
     // ---- List commands ----
     "LPUSH" => CommandMeta { name: "LPUSH", arity: -3, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
@@ -229,21 +247,21 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "RPOP" => CommandMeta { name: "RPOP", arity: -2, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
     "LLEN" => CommandMeta { name: "LLEN", arity: 2, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
     "LSET" => CommandMeta { name: "LSET", arity: 4, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
-    "LREM" => CommandMeta { name: "LREM", arity: 4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
-    "LPOS" => CommandMeta { name: "LPOS", arity: -3, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
-    "LRANGE" => CommandMeta { name: "LRANGE", arity: 4, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
+    "LREM" => CommandMeta { name: "LREM", arity: 4, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
+    "LPOS" => CommandMeta { name: "LPOS", arity: -3, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
+    "LRANGE" => CommandMeta { name: "LRANGE", arity: 4, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
     "LINDEX" => CommandMeta { name: "LINDEX", arity: 3, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
-    "LINSERT" => CommandMeta { name: "LINSERT", arity: 5, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
-    "LTRIM" => CommandMeta { name: "LTRIM", arity: 4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
-    "LMOVE" => CommandMeta { name: "LMOVE", arity: 5, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: LST },
+    "LINSERT" => CommandMeta { name: "LINSERT", arity: 5, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
+    "LTRIM" => CommandMeta { name: "LTRIM", arity: 4, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
+    "LMOVE" => CommandMeta { name: "LMOVE", arity: 5, flags: WP, first_key: 1, last_key: 2, step: 1, acl_categories: LST },
     // Deprecated in favour of LMOVE but never removed, and still what every
     // major client's `rpoplpush()` sends. Same two-key spec as LMOVE so
     // cluster key extraction agrees; SLOW because Redis categorises it so
     // (moon#520).
-    "RPOPLPUSH" => CommandMeta { name: "RPOPLPUSH", arity: 3, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: AclCategories(AclCategories::LIST.0 | AclCategories::SLOW.0) },
+    "RPOPLPUSH" => CommandMeta { name: "RPOPLPUSH", arity: 3, flags: WP, first_key: 1, last_key: 2, step: 1, acl_categories: AclCategories(AclCategories::LIST.0 | AclCategories::SLOW.0) },
     "LPUSHX" => CommandMeta { name: "LPUSHX", arity: -3, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
     "RPUSHX" => CommandMeta { name: "RPUSHX", arity: -3, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
-    "LMPOP" => CommandMeta { name: "LMPOP", arity: -4, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: LST },
+    "LMPOP" => CommandMeta { name: "LMPOP", arity: -4, flags: WP, first_key: 0, last_key: 0, step: 0, acl_categories: LST },
 
     // ---- Blocking list commands ----
     "BLPOP" => CommandMeta { name: "BLPOP", arity: -3, flags: W, first_key: 1, last_key: -2, step: 1, acl_categories: AclCategories(AclCategories::LIST.0 | AclCategories::SLOW.0) },
@@ -262,32 +280,32 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "SREM" => CommandMeta { name: "SREM", arity: -3, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: SET_CAT },
     "SPOP" => CommandMeta { name: "SPOP", arity: -2, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: SET_CAT },
     "SCARD" => CommandMeta { name: "SCARD", arity: 2, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: SET_CAT },
-    "SDIFF" => CommandMeta { name: "SDIFF", arity: -2, flags: R, first_key: 1, last_key: -1, step: 1, acl_categories: SET_CAT },
-    "SSCAN" => CommandMeta { name: "SSCAN", arity: -3, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: SET_CAT },
-    "SINTER" => CommandMeta { name: "SINTER", arity: -2, flags: R, first_key: 1, last_key: -1, step: 1, acl_categories: SET_CAT },
-    "SUNION" => CommandMeta { name: "SUNION", arity: -2, flags: R, first_key: 1, last_key: -1, step: 1, acl_categories: SET_CAT },
-    "SMEMBERS" => CommandMeta { name: "SMEMBERS", arity: 2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: SET_CAT },
+    "SDIFF" => CommandMeta { name: "SDIFF", arity: -2, flags: RP, first_key: 1, last_key: -1, step: 1, acl_categories: SET_CAT },
+    "SSCAN" => CommandMeta { name: "SSCAN", arity: -3, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: SET_CAT },
+    "SINTER" => CommandMeta { name: "SINTER", arity: -2, flags: RP, first_key: 1, last_key: -1, step: 1, acl_categories: SET_CAT },
+    "SUNION" => CommandMeta { name: "SUNION", arity: -2, flags: RP, first_key: 1, last_key: -1, step: 1, acl_categories: SET_CAT },
+    "SMEMBERS" => CommandMeta { name: "SMEMBERS", arity: 2, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: SET_CAT },
     "SISMEMBER" => CommandMeta { name: "SISMEMBER", arity: 3, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: SET_CAT },
     "SMISMEMBER" => CommandMeta { name: "SMISMEMBER", arity: -3, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: SET_CAT },
-    "SRANDMEMBER" => CommandMeta { name: "SRANDMEMBER", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: SET_CAT },
-    "SDIFFSTORE" => CommandMeta { name: "SDIFFSTORE", arity: -3, flags: W, first_key: 1, last_key: -1, step: 1, acl_categories: SET_CAT },
-    "SINTERSTORE" => CommandMeta { name: "SINTERSTORE", arity: -3, flags: W, first_key: 1, last_key: -1, step: 1, acl_categories: SET_CAT },
-    "SUNIONSTORE" => CommandMeta { name: "SUNIONSTORE", arity: -3, flags: W, first_key: 1, last_key: -1, step: 1, acl_categories: SET_CAT },
-    "SMOVE" => CommandMeta { name: "SMOVE", arity: 4, flags: WF, first_key: 1, last_key: 2, step: 1, acl_categories: SET_CAT },
-    "SINTERCARD" => CommandMeta { name: "SINTERCARD", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SET_CAT },
+    "SRANDMEMBER" => CommandMeta { name: "SRANDMEMBER", arity: -2, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: SET_CAT },
+    "SDIFFSTORE" => CommandMeta { name: "SDIFFSTORE", arity: -3, flags: WP, first_key: 1, last_key: -1, step: 1, acl_categories: SET_CAT },
+    "SINTERSTORE" => CommandMeta { name: "SINTERSTORE", arity: -3, flags: WP, first_key: 1, last_key: -1, step: 1, acl_categories: SET_CAT },
+    "SUNIONSTORE" => CommandMeta { name: "SUNIONSTORE", arity: -3, flags: WP, first_key: 1, last_key: -1, step: 1, acl_categories: SET_CAT },
+    "SMOVE" => CommandMeta { name: "SMOVE", arity: 4, flags: WFP, first_key: 1, last_key: 2, step: 1, acl_categories: SET_CAT },
+    "SINTERCARD" => CommandMeta { name: "SINTERCARD", arity: -3, flags: RP, first_key: 0, last_key: 0, step: 0, acl_categories: SET_CAT },
 
     // ---- Sorted-set commands ----
     "ZADD" => CommandMeta { name: "ZADD", arity: -4, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZREM" => CommandMeta { name: "ZREM", arity: -3, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZCARD" => CommandMeta { name: "ZCARD", arity: 2, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZRANK" => CommandMeta { name: "ZRANK", arity: -3, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
-    "ZSCAN" => CommandMeta { name: "ZSCAN", arity: -3, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZSCAN" => CommandMeta { name: "ZSCAN", arity: -3, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZSCORE" => CommandMeta { name: "ZSCORE", arity: 3, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
-    "ZRANGE" => CommandMeta { name: "ZRANGE", arity: -4, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZRANGE" => CommandMeta { name: "ZRANGE", arity: -4, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZCOUNT" => CommandMeta { name: "ZCOUNT", arity: 4, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZINCRBY" => CommandMeta { name: "ZINCRBY", arity: 4, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
-    "ZPOPMIN" => CommandMeta { name: "ZPOPMIN", arity: -2, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
-    "ZPOPMAX" => CommandMeta { name: "ZPOPMAX", arity: -2, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZPOPMIN" => CommandMeta { name: "ZPOPMIN", arity: -2, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZPOPMAX" => CommandMeta { name: "ZPOPMAX", arity: -2, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZREVRANK" => CommandMeta { name: "ZREVRANK", arity: -3, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     // arity -4, not 4: `WITHSCORES` is optional, so the form is `>= 4`.
     // Found by the moon#559 score-family sweep — the fixed arity made the
@@ -295,39 +313,47 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     // error and abort the whole transaction, while the same command answered
     // fine standalone (the gate is the only arity consumer). Redis 8:
     // `COMMAND INFO ZREVRANGE` -> arity -4.
-    "ZREVRANGE" => CommandMeta { name: "ZREVRANGE", arity: -4, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
-    "ZLEXCOUNT" => CommandMeta { name: "ZLEXCOUNT", arity: 4, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
-    "ZUNIONSTORE" => CommandMeta { name: "ZUNIONSTORE", arity: -4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
-    "ZINTERSTORE" => CommandMeta { name: "ZINTERSTORE", arity: -4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
-    "ZRANGEBYSCORE" => CommandMeta { name: "ZRANGEBYSCORE", arity: -4, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
-    "ZREVRANGEBYSCORE" => CommandMeta { name: "ZREVRANGEBYSCORE", arity: -4, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
-    "ZRANGESTORE" => CommandMeta { name: "ZRANGESTORE", arity: -5, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: ZST },
-    "ZDIFF" => CommandMeta { name: "ZDIFF", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
-    "ZUNION" => CommandMeta { name: "ZUNION", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
-    "ZINTER" => CommandMeta { name: "ZINTER", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
-    "ZINTERCARD" => CommandMeta { name: "ZINTERCARD", arity: -3, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
+    "ZREVRANGE" => CommandMeta { name: "ZREVRANGE", arity: -4, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZLEXCOUNT" => CommandMeta { name: "ZLEXCOUNT", arity: 4, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZUNIONSTORE" => CommandMeta { name: "ZUNIONSTORE", arity: -4, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZINTERSTORE" => CommandMeta { name: "ZINTERSTORE", arity: -4, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZRANGEBYSCORE" => CommandMeta { name: "ZRANGEBYSCORE", arity: -4, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZREVRANGEBYSCORE" => CommandMeta { name: "ZREVRANGEBYSCORE", arity: -4, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZRANGESTORE" => CommandMeta { name: "ZRANGESTORE", arity: -5, flags: WP, first_key: 1, last_key: 2, step: 1, acl_categories: ZST },
+    "ZDIFF" => CommandMeta { name: "ZDIFF", arity: -3, flags: RP, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
+    "ZUNION" => CommandMeta { name: "ZUNION", arity: -3, flags: RP, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
+    "ZINTER" => CommandMeta { name: "ZINTER", arity: -3, flags: RP, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
+    "ZINTERCARD" => CommandMeta { name: "ZINTERCARD", arity: -3, flags: RP, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
     "ZMSCORE" => CommandMeta { name: "ZMSCORE", arity: -3, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
-    "ZRANDMEMBER" => CommandMeta { name: "ZRANDMEMBER", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
-    "ZMPOP" => CommandMeta { name: "ZMPOP", arity: -4, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
+    "ZRANDMEMBER" => CommandMeta { name: "ZRANDMEMBER", arity: -2, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZMPOP" => CommandMeta { name: "ZMPOP", arity: -4, flags: WP, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
+    // moon#959. Arities match redis 8.6.1 as SENT — every arity error below
+    // was compared on the wire, not read off `COMMAND INFO`.
+    "ZRANGEBYLEX" => CommandMeta { name: "ZRANGEBYLEX", arity: -4, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZREVRANGEBYLEX" => CommandMeta { name: "ZREVRANGEBYLEX", arity: -4, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZREMRANGEBYRANK" => CommandMeta { name: "ZREMRANGEBYRANK", arity: 4, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZREMRANGEBYSCORE" => CommandMeta { name: "ZREMRANGEBYSCORE", arity: 4, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZREMRANGEBYLEX" => CommandMeta { name: "ZREMRANGEBYLEX", arity: 4, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZDIFFSTORE" => CommandMeta { name: "ZDIFFSTORE", arity: -4, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
 
     // ---- Stream commands ----
-    "XADD" => CommandMeta { name: "XADD", arity: -5, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
-    "XLEN" => CommandMeta { name: "XLEN", arity: 2, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
-    "XDEL" => CommandMeta { name: "XDEL", arity: -3, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
-    "XACK" => CommandMeta { name: "XACK", arity: -4, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
-    "XTRIM" => CommandMeta { name: "XTRIM", arity: -4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
+    "XADD" => CommandMeta { name: "XADD", arity: -5, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
+    "XLEN" => CommandMeta { name: "XLEN", arity: 2, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
+    "XDEL" => CommandMeta { name: "XDEL", arity: -3, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
+    "XACK" => CommandMeta { name: "XACK", arity: -4, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
+    "XTRIM" => CommandMeta { name: "XTRIM", arity: -4, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
     "XREAD" => CommandMeta { name: "XREAD", arity: -4, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: STM },
-    "XINFO" => CommandMeta { name: "XINFO", arity: -2, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: STM },
-    "XRANGE" => CommandMeta { name: "XRANGE", arity: -4, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
-    "XREVRANGE" => CommandMeta { name: "XREVRANGE", arity: -4, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
-    "XGROUP" => CommandMeta { name: "XGROUP", arity: -2, flags: W, first_key: 2, last_key: 2, step: 1, acl_categories: STM },
-    "XCLAIM" => CommandMeta { name: "XCLAIM", arity: -6, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
-    "XPENDING" => CommandMeta { name: "XPENDING", arity: -3, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
+    "XINFO" => CommandMeta { name: "XINFO", arity: -2, flags: RP, first_key: 0, last_key: 0, step: 0, acl_categories: STM },
+    "XRANGE" => CommandMeta { name: "XRANGE", arity: -4, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
+    "XREVRANGE" => CommandMeta { name: "XREVRANGE", arity: -4, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
+    "XGROUP" => CommandMeta { name: "XGROUP", arity: -2, flags: WP, first_key: 2, last_key: 2, step: 1, acl_categories: STM },
+    "XCLAIM" => CommandMeta { name: "XCLAIM", arity: -6, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
+    "XPENDING" => CommandMeta { name: "XPENDING", arity: -3, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
     "XREADGROUP" => CommandMeta { name: "XREADGROUP", arity: -7, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: STM },
-    "XAUTOCLAIM" => CommandMeta { name: "XAUTOCLAIM", arity: -7, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
+    "XAUTOCLAIM" => CommandMeta { name: "XAUTOCLAIM", arity: -7, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
 
     // ---- Key / generic commands ----
-    "DEL" => CommandMeta { name: "DEL", arity: -2, flags: W, first_key: 1, last_key: -1, step: 1, acl_categories: GEN },
+    "DEL" => CommandMeta { name: "DEL", arity: -2, flags: WP, first_key: 1, last_key: -1, step: 1, acl_categories: GEN },
     "UNLINK" => CommandMeta { name: "UNLINK", arity: -2, flags: WFP, first_key: 1, last_key: -1, step: 1, acl_categories: GEN },
     "EXISTS" => CommandMeta { name: "EXISTS", arity: -2, flags: RFP, first_key: 1, last_key: -1, step: 1, acl_categories: GEN },
     "EXPIRE" => CommandMeta { name: "EXPIRE", arity: -3, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
@@ -336,56 +362,56 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "TTL" => CommandMeta { name: "TTL", arity: 2, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
     "PTTL" => CommandMeta { name: "PTTL", arity: 2, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
     "TYPE" => CommandMeta { name: "TYPE", arity: 2, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
-    "RENAME" => CommandMeta { name: "RENAME", arity: 3, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: GEN },
-    "RENAMENX" => CommandMeta { name: "RENAMENX", arity: 3, flags: WF, first_key: 1, last_key: 2, step: 1, acl_categories: GEN },
+    "RENAME" => CommandMeta { name: "RENAME", arity: 3, flags: WP, first_key: 1, last_key: 2, step: 1, acl_categories: GEN },
+    "RENAMENX" => CommandMeta { name: "RENAMENX", arity: 3, flags: WFP, first_key: 1, last_key: 2, step: 1, acl_categories: GEN },
     "KEYS" => CommandMeta { name: "KEYS", arity: 2, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GEN },
     "SCAN" => CommandMeta { name: "SCAN", arity: -2, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GEN },
-    "OBJECT" => CommandMeta { name: "OBJECT", arity: -2, flags: R, first_key: 2, last_key: 2, step: 1, acl_categories: GEN },
+    "OBJECT" => CommandMeta { name: "OBJECT", arity: -2, flags: RP, first_key: 2, last_key: 2, step: 1, acl_categories: GEN },
     "DBSIZE" => CommandMeta { name: "DBSIZE", arity: 1, flags: RF, first_key: 0, last_key: 0, step: 0, acl_categories: GEN },
     "RANDOMKEY" => CommandMeta { name: "RANDOMKEY", arity: 1, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: GEN },
-    "SORT" => CommandMeta { name: "SORT", arity: -2, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
-    "SORT_RO" => CommandMeta { name: "SORT_RO", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
-    "COPY" => CommandMeta { name: "COPY", arity: -3, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: GEN },
-    "TOUCH" => CommandMeta { name: "TOUCH", arity: -2, flags: RF, first_key: 1, last_key: -1, step: 1, acl_categories: GEN },
+    "SORT" => CommandMeta { name: "SORT", arity: -2, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "SORT_RO" => CommandMeta { name: "SORT_RO", arity: -2, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "COPY" => CommandMeta { name: "COPY", arity: -3, flags: WP, first_key: 1, last_key: 2, step: 1, acl_categories: GEN },
+    "TOUCH" => CommandMeta { name: "TOUCH", arity: -2, flags: RFP, first_key: 1, last_key: -1, step: 1, acl_categories: GEN },
     "EXPIREAT" => CommandMeta { name: "EXPIREAT", arity: -3, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
     "PEXPIREAT" => CommandMeta { name: "PEXPIREAT", arity: -3, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
-    "EXPIRETIME" => CommandMeta { name: "EXPIRETIME", arity: 2, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
-    "PEXPIRETIME" => CommandMeta { name: "PEXPIRETIME", arity: 2, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "EXPIRETIME" => CommandMeta { name: "EXPIRETIME", arity: 2, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "PEXPIRETIME" => CommandMeta { name: "PEXPIRETIME", arity: 2, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
     // moon#636. Arities are redis's: DUMP is 2 (an extra argument is an arity
     // error, not an ignored token) and RESTORE is -4. redis also marks
     // RESTORE `denyoom`; moon has no such flag, so COMMAND INFO reports the
     // smaller set -- a pre-existing property of moon's flag vocabulary, not
     // something specific to this command.
-    "DUMP" => CommandMeta { name: "DUMP", arity: 2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
-    "RESTORE" => CommandMeta { name: "RESTORE", arity: -4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: AclCategories(GEN.0 | DNG.0) },
+    "DUMP" => CommandMeta { name: "DUMP", arity: 2, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "RESTORE" => CommandMeta { name: "RESTORE", arity: -4, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: AclCategories(GEN.0 | DNG.0) },
 
     // ---- Bitmap commands ----
     "GETBIT" => CommandMeta { name: "GETBIT", arity: 3, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
-    "SETBIT" => CommandMeta { name: "SETBIT", arity: 4, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
-    "BITCOUNT" => CommandMeta { name: "BITCOUNT", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
-    "BITOP" => CommandMeta { name: "BITOP", arity: -4, flags: W, first_key: 2, last_key: -1, step: 1, acl_categories: STR },
-    "BITFIELD" => CommandMeta { name: "BITFIELD", arity: -2, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
-    "BITFIELD_RO" => CommandMeta { name: "BITFIELD_RO", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
-    "BITPOS" => CommandMeta { name: "BITPOS", arity: -3, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
-    "LCS" => CommandMeta { name: "LCS", arity: -3, flags: R, first_key: 1, last_key: 2, step: 1, acl_categories: STR },
-    "XSETID" => CommandMeta { name: "XSETID", arity: -3, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
+    "SETBIT" => CommandMeta { name: "SETBIT", arity: 4, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
+    "BITCOUNT" => CommandMeta { name: "BITCOUNT", arity: -2, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
+    "BITOP" => CommandMeta { name: "BITOP", arity: -4, flags: WP, first_key: 2, last_key: -1, step: 1, acl_categories: STR },
+    "BITFIELD" => CommandMeta { name: "BITFIELD", arity: -2, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
+    "BITFIELD_RO" => CommandMeta { name: "BITFIELD_RO", arity: -2, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
+    "BITPOS" => CommandMeta { name: "BITPOS", arity: -3, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
+    "LCS" => CommandMeta { name: "LCS", arity: -3, flags: RP, first_key: 1, last_key: 2, step: 1, acl_categories: STR },
+    "XSETID" => CommandMeta { name: "XSETID", arity: -3, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
 
     // ---- HyperLogLog commands ----
     "PFADD" => CommandMeta { name: "PFADD", arity: -2, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
-    "PFCOUNT" => CommandMeta { name: "PFCOUNT", arity: -2, flags: R, first_key: 1, last_key: -1, step: 1, acl_categories: STR },
-    "PFMERGE" => CommandMeta { name: "PFMERGE", arity: -2, flags: W, first_key: 1, last_key: -1, step: 1, acl_categories: STR },
+    "PFCOUNT" => CommandMeta { name: "PFCOUNT", arity: -2, flags: RP, first_key: 1, last_key: -1, step: 1, acl_categories: STR },
+    "PFMERGE" => CommandMeta { name: "PFMERGE", arity: -2, flags: WP, first_key: 1, last_key: -1, step: 1, acl_categories: STR },
 
     // ---- Geo commands ----
-    "GEOADD" => CommandMeta { name: "GEOADD", arity: -5, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
-    "GEODIST" => CommandMeta { name: "GEODIST", arity: -4, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
-    "GEOHASH" => CommandMeta { name: "GEOHASH", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
-    "GEOPOS" => CommandMeta { name: "GEOPOS", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
-    "GEOSEARCH" => CommandMeta { name: "GEOSEARCH", arity: -7, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
-    "GEOSEARCHSTORE" => CommandMeta { name: "GEOSEARCHSTORE", arity: -8, flags: W, first_key: 1, last_key: 2, step: 1, acl_categories: GEN },
-    "GEORADIUS" => CommandMeta { name: "GEORADIUS", arity: -6, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
-    "GEORADIUS_RO" => CommandMeta { name: "GEORADIUS_RO", arity: -6, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
-    "GEORADIUSBYMEMBER" => CommandMeta { name: "GEORADIUSBYMEMBER", arity: -5, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
-    "GEORADIUSBYMEMBER_RO" => CommandMeta { name: "GEORADIUSBYMEMBER_RO", arity: -5, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "GEOADD" => CommandMeta { name: "GEOADD", arity: -5, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "GEODIST" => CommandMeta { name: "GEODIST", arity: -4, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "GEOHASH" => CommandMeta { name: "GEOHASH", arity: -2, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "GEOPOS" => CommandMeta { name: "GEOPOS", arity: -2, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "GEOSEARCH" => CommandMeta { name: "GEOSEARCH", arity: -7, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "GEOSEARCHSTORE" => CommandMeta { name: "GEOSEARCHSTORE", arity: -8, flags: WP, first_key: 1, last_key: 2, step: 1, acl_categories: GEN },
+    "GEORADIUS" => CommandMeta { name: "GEORADIUS", arity: -6, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "GEORADIUS_RO" => CommandMeta { name: "GEORADIUS_RO", arity: -6, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "GEORADIUSBYMEMBER" => CommandMeta { name: "GEORADIUSBYMEMBER", arity: -5, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "GEORADIUSBYMEMBER_RO" => CommandMeta { name: "GEORADIUSBYMEMBER_RO", arity: -5, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
 
     // ---- Connection / server commands ----
     "PING" => CommandMeta { name: "PING", arity: -1, flags: RF, first_key: 0, last_key: 0, step: 0, acl_categories: CON },
@@ -451,7 +477,7 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "FLUSHDB" => CommandMeta { name: "FLUSHDB", arity: -1, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },
     "FLUSHALL" => CommandMeta { name: "FLUSHALL", arity: -1, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },
     "SWAPDB" => CommandMeta { name: "SWAPDB", arity: 3, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },
-    "MOVE" => CommandMeta { name: "MOVE", arity: 3, flags: W, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
+    "MOVE" => CommandMeta { name: "MOVE", arity: 3, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: GEN },
     "SHUTDOWN" => CommandMeta { name: "SHUTDOWN", arity: -1, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },
     "TIME" => CommandMeta { name: "TIME", arity: 1, flags: RF, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "LOLWUT" => CommandMeta { name: "LOLWUT", arity: -1, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
@@ -1542,6 +1568,10 @@ mod tests {
             b"ZINTERSTORE",
             b"ZRANGESTORE",
             b"ZMPOP",
+            b"ZREMRANGEBYRANK",
+            b"ZREMRANGEBYSCORE",
+            b"ZREMRANGEBYLEX",
+            b"ZDIFFSTORE",
             b"HINCRBYFLOAT",
             b"LSET",
             b"LREM",
@@ -1579,6 +1609,8 @@ mod tests {
             b"SMEMBERS",
             b"SISMEMBER",
             b"ZRANGEBYSCORE",
+            b"ZRANGEBYLEX",
+            b"ZREVRANGEBYLEX",
             b"BITFIELD_RO",
             b"SORT_RO",
             b"GEORADIUS_RO",

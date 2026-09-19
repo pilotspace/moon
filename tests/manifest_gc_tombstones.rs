@@ -78,7 +78,7 @@ fn gc_epoch_satisfied_time_not_satisfied_no_prune() {
     m.commit().unwrap(); // epoch 2
 
     // Tombstone file 2 — epoch recorded is current epoch = 2, time = now
-    m.remove_file(2);
+    m.remove_file(2, PageType::KvLeaf);
     m.commit().unwrap(); // epoch 3
 
     // Advance past retain_epochs (retain=2, current=3, tombstone_epoch=2 → age=1 epoch — NOT satisfied)
@@ -108,7 +108,7 @@ fn gc_time_satisfied_epoch_not_satisfied_no_prune() {
     m.commit().unwrap(); // epoch 2
 
     // Tombstone at epoch 2 (remove_file before commit)
-    m.remove_file(2);
+    m.remove_file(2, PageType::KvLeaf);
     m.commit().unwrap(); // epoch 3 — tombstone_epoch=2 (when remove_file was called), age = epoch 3 - epoch 2 = 1
 
     // Time: pass a now far in the future → time axis satisfied
@@ -134,8 +134,8 @@ fn gc_both_axes_satisfied_prunes_tombstones() {
     m.commit().unwrap(); // epoch 2
 
     // Tombstone files 2 and 4
-    m.remove_file(2);
-    m.remove_file(4);
+    m.remove_file(2, PageType::KvLeaf);
+    m.remove_file(4, PageType::KvLeaf);
     m.commit().unwrap(); // epoch 3, tombstone_epoch recorded as epoch at time of remove_file call = epoch 2
 
     // Advance epoch beyond retain_epochs (retain=1, current=3, age=1 → satisfied when age >= retain)
@@ -177,8 +177,8 @@ fn gc_partial_prune_when_only_some_satisfy_both_axes() {
     m.commit().unwrap(); // epoch 2
 
     // Tombstone files 1 and 2 early (epoch 2)
-    m.remove_file(1);
-    m.remove_file(2);
+    m.remove_file(1, PageType::KvLeaf);
+    m.remove_file(2, PageType::KvLeaf);
     m.commit().unwrap(); // epoch 3
 
     // Advance epochs
@@ -187,7 +187,7 @@ fn gc_partial_prune_when_only_some_satisfy_both_axes() {
     // tombstone 1 and 2 age = 5 - 2 = 3 epochs
 
     // Tombstone file 3 NOW (epoch 5) — recent tombstone
-    m.remove_file(3);
+    m.remove_file(3, PageType::KvLeaf);
     m.commit().unwrap(); // epoch 6
     // tombstone 3 age = 6 - 5 = 1 epoch — NOT satisfied with retain_epochs=3
 
@@ -217,7 +217,7 @@ fn gc_without_commit_leaves_disk_unchanged() {
     m.add_file(make_entry(2));
     m.commit().unwrap(); // epoch 2
 
-    m.remove_file(2);
+    m.remove_file(2, PageType::KvLeaf);
     m.commit().unwrap(); // epoch 3: tombstone committed to disk
 
     // Now GC in memory — both axes trivially satisfied with retain=0 and ancient now
@@ -253,8 +253,8 @@ fn gc_then_commit_persists_pruned_state() {
     }
     m.commit().unwrap(); // epoch 2
 
-    m.remove_file(1);
-    m.remove_file(3);
+    m.remove_file(1, PageType::KvLeaf);
+    m.remove_file(3, PageType::KvLeaf);
     m.commit().unwrap(); // epoch 3
 
     let now_far = Instant::now() + Duration::from_secs(9999);
@@ -285,9 +285,9 @@ fn getters_sum_to_total_entries() {
     }
     m.commit().unwrap();
 
-    m.remove_file(2);
-    m.remove_file(4);
-    m.remove_file(6);
+    m.remove_file(2, PageType::KvLeaf);
+    m.remove_file(4, PageType::KvLeaf);
+    m.remove_file(6, PageType::KvLeaf);
     m.commit().unwrap();
 
     assert_eq!(m.active_entry_count(), 3);

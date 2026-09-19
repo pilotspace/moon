@@ -1765,7 +1765,7 @@ pub async fn handle_connection(
                             ) {
                                 conn.acl_log.push(crate::acl::AclLogEntry {
                                     reason: "command".to_string(),
-                                    object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                                    object: crate::acl::subcommand::command_log_object(cmd, cmd_args),
                                     username: conn.current_user.clone(),
                                     client_addr: peer_addr.clone(),
                                     timestamp_ms: std::time::SystemTime::now()
@@ -1773,6 +1773,8 @@ pub async fn handle_connection(
                                         .unwrap_or_default()
                                         .as_millis() as u64,
                                 });
+                                // moon#1035: inside MULTI a refusal poisons the block.
+                                conn.flag_transaction();
                                 responses.push(Frame::Error(Bytes::from(format!(
                                     "NOPERM {}", deny_reason
                                 ))));
@@ -1795,6 +1797,8 @@ pub async fn handle_connection(
                                         .unwrap_or_default()
                                         .as_millis() as u64,
                                 });
+                                // moon#1035: a denied KEY poisons an open transaction too.
+                                conn.flag_transaction();
                                 responses.push(Frame::Error(Bytes::from(format!(
                                     "NOPERM {}", deny_reason
                                 ))));
@@ -1875,6 +1879,21 @@ pub async fn handle_connection(
                                 crate::server::conn::shared::queue_time_rejection(cmd, cmd_args)
                         {
                             conn.multi_dirty = true;
+                            responses.push(err);
+                            continue;
+                        }
+                        // moon#1035: a PUBLISH to a denied channel is refused
+                        // HERE, poisoning the block, not at EXEC after the rest ran.
+                        if let Some((cmd, cmd_args)) = extract_command(&frame)
+                            && let Some(err) =
+                                crate::server::conn::shared::queued_publish_channel_deny(
+                                    &acl_table,
+                                    &conn.current_user,
+                                    cmd,
+                                    cmd_args,
+                                )
+                        {
+                            conn.flag_transaction();
                             responses.push(err);
                             continue;
                         }

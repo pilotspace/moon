@@ -533,6 +533,36 @@ impl ConnectionState {
         }
     }
 
+    /// Redis's `flagTransaction`: a command was REFUSED while a transaction is
+    /// open, so `EXEC` must abort the whole block. A no-op outside `MULTI`, so
+    /// a refusal site never has to re-check `in_multi` itself.
+    ///
+    /// moon#1035: every ACL refusal must call this. A command denied inside
+    /// `MULTI` used to be answered `NOPERM` and simply not queued, so `EXEC`
+    /// then applied the rest. Measured against redis-server 8.6.1 with a
+    /// `-flushall` user:
+    ///
+    /// ```text
+    /// MULTI / SET mx 1 / FLUSHALL / EXEC
+    ///   redis -> -NOPERM, then -EXECABORT     (mx unset)
+    ///   moon  -> -NOPERM, then *1 +OK         (mx set)
+    /// ```
+    ///
+    /// Redis's `rejectCommand` flags the transaction for EVERY rejection inside
+    /// `MULTI` — command, subcommand, key or channel — without asking why the
+    /// check failed, and the ACL gates call this the same way: on the verdict
+    /// of `check_command_permission(user, cmd, args)` and its siblings. A rule
+    /// those learn to enforce later (per-subcommand `-config|set`) poisons the
+    /// transaction with no change here.
+    ///
+    /// Cleared, like every other queue-time fault, by EXEC, DISCARD and RESET.
+    #[inline]
+    pub fn flag_transaction(&mut self) {
+        if self.in_multi {
+            self.multi_dirty = true;
+        }
+    }
+
     /// D4 (#438): whether this connection may migrate to another shard
     /// RIGHT NOW. `MigratedConnectionState` carries none of the state
     /// checked here (queued MULTI txn, cross-store txn, subscriptions,
