@@ -1852,6 +1852,19 @@ if should_run "blocking"; then
     # moon#570: `{blk}` co-locates the pair -- see the LMOVE row above.
     rcli RPUSH {blk}:src x y z >/dev/null 2>&1; mcli RPUSH {blk}:src x y z >/dev/null 2>&1
     assert_match "BLMOVE (ready)"      BLMOVE {blk}:src {blk}:dst LEFT RIGHT 1
+
+    # moon#989: a multi-key blocking pop serves from the FIRST non-empty key,
+    # exactly once. The reply alone cannot show a SECOND key losing an element
+    # (moon answered correctly while destroying it), so each row is followed by
+    # a read of the key it must not touch. `{blk}` co-locates the three keys.
+    rcli RPUSH {blk}:mp2 B1 B2 >/dev/null 2>&1; mcli RPUSH {blk}:mp2 B1 B2 >/dev/null 2>&1
+    rcli RPUSH {blk}:mp3 C1 C2 >/dev/null 2>&1; mcli RPUSH {blk}:mp3 C1 C2 >/dev/null 2>&1
+    assert_match "BLMPOP (ready, 3 co-located keys)" BLMPOP 1 3 {blk}:mp1 {blk}:mp2 {blk}:mp3 LEFT
+    assert_match "BLMPOP left the later key untouched" LRANGE {blk}:mp3 0 -1
+    rcli ZADD {blk}:zp2 1 B1 2 B2 >/dev/null 2>&1; mcli ZADD {blk}:zp2 1 B1 2 B2 >/dev/null 2>&1
+    rcli ZADD {blk}:zp3 1 C1 2 C2 >/dev/null 2>&1; mcli ZADD {blk}:zp3 1 C1 2 C2 >/dev/null 2>&1
+    assert_match "BZMPOP (ready, 3 co-located keys)" BZMPOP 1 3 {blk}:zp1 {blk}:zp2 {blk}:zp3 MIN
+    assert_match "BZMPOP left the later key untouched" ZRANGE {blk}:zp3 0 -1 WITHSCORES
 fi
 
 # ===========================================================================
