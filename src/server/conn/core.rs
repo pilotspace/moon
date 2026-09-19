@@ -275,6 +275,11 @@ pub(crate) struct ConnectionState {
 
     // Pub/Sub
     pub subscription_count: usize,
+    /// `subscription_count` as of the last time the per-namespace counts were
+    /// published to the client registry for `CLIENT LIST` (`sub`/`psub`/
+    /// `ssub`). Equal means nothing to publish, so a connection that never
+    /// subscribes never takes the pub/sub lock for it.
+    pub published_subscription_count: usize,
     pub subscriber_id: u64,
     pub pubsub_tx: Option<channel::MpscSender<bytes::Bytes>>,
     pub pubsub_rx: Option<channel::MpscReceiver<bytes::Bytes>>,
@@ -355,6 +360,19 @@ pub(crate) struct ConnectionState {
 }
 
 impl ConnectionContext {
+    /// This shard's pub/sub registry together with the remote maps every other
+    /// shard routes its publishes through, so tearing a connection's
+    /// subscriptions down (RESET) clears both, in all three namespaces.
+    #[inline]
+    pub fn shard_pubsub(&self) -> crate::server::conn::shared::ShardPubSub<'_> {
+        crate::server::conn::shared::ShardPubSub {
+            registry: &self.pubsub_registry,
+            remote: &self.all_remote_sub_maps,
+            shard_id: self.shard_id,
+            num_shards: self.num_shards,
+        }
+    }
+
     /// The server-side address clients on this listener connected to, for
     /// `CLIENT INFO`/`CLIENT LIST`'s `laddr` field.
     ///
@@ -403,6 +421,7 @@ impl ConnectionState {
             proto_batch_start: 2,
             acl_log: AclLog::new(acl_max_len),
             subscription_count: 0,
+            published_subscription_count: 0,
             subscriber_id: 0,
             pubsub_tx: None,
             pubsub_rx: None,
@@ -587,6 +606,21 @@ impl ConnectionState {
             self.client_id,
             table,
         );
+    }
+
+    /// The `CLIENT LIST`/`INFO` flag bits this connection's state stands for.
+    ///
+    /// `blocked` is always false: whoever calls this is executing, not parked,
+    /// and the blocked bit is owned by `ClientLiveState::set_blocked`.
+    #[inline]
+    pub fn client_flags(&self) -> crate::client_registry::ClientFlags {
+        crate::client_registry::ClientFlags {
+            subscriber: self.subscription_count > 0,
+            in_multi: self.in_multi,
+            blocked: false,
+            replica: self.saw_replconf,
+            resp3: self.protocol_version >= 3,
+        }
     }
 
     /// Switch the connection's RESP version. Every assignment goes through

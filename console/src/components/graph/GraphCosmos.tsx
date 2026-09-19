@@ -21,9 +21,6 @@ export function GraphCosmos() {
   const graphRef = useRef<Graph | null>(null);
   const prevDataRef = useRef<{ nodeCount: number; edgeCount: number }>({ nodeCount: 0, edgeCount: 0 });
 
-  // If cosmos.gl failed to init, fall back to Canvas2D
-  if (initError) return <GraphCanvas2D />;
-
   const nodes = useGraphStore((s) => s.nodes);
   const edges = useGraphStore((s) => s.edges);
   const positions = useGraphStore((s) => s.positions);
@@ -243,6 +240,11 @@ export function GraphCosmos() {
 
     graph.render();
   }, [nodes, edges, positions, visibleLabels, labelColorMap, degree, nodeIdToIndex, selectedNodeId]);
+
+  // If cosmos.gl failed to init, fall back to Canvas2D. This return sits after
+  // every hook: an early return above them made the re-render that follows a
+  // failed init call fewer hooks than the first render, which React rejects.
+  if (initError) return <GraphCanvas2D />;
 
   return (
     <div

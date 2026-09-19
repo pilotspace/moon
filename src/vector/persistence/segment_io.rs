@@ -255,7 +255,9 @@ fn write_segment_files(
         padded_dimension: collection.padded_dimension,
         metric: metric_to_string(collection.metric),
         quantization: quant_to_string(collection.quantization),
-        live_count: segment.live_count(),
+        // The headers written below carry install-time tombstones only; the
+        // count must agree with them (see `mvcc_live_count`).
+        live_count: segment.mvcc_live_count(),
         total_count: segment.total_count(),
         metadata_checksum: collection.metadata_checksum,
         codebook_version: collection.codebook_version,

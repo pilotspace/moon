@@ -274,6 +274,16 @@ impl TwoDbOp {
         }
     }
 
+    /// The database and key the command writes into — what a client blocked
+    /// in the destination database may now be served from (moon#1068).
+    #[must_use]
+    pub fn into_target(self) -> (usize, Bytes) {
+        match self {
+            TwoDbOp::Move { key, dst_db } => (dst_db, key),
+            TwoDbOp::Copy(ca) => (ca.dst_db, ca.dst_key),
+        }
+    }
+
     /// Run the command against its source and destination databases.
     /// `:1` means the keyspace changed; anything else wrote nothing.
     pub fn apply(&self, src: &mut Database, dst: &mut Database) -> Frame {
@@ -641,6 +651,23 @@ mod tests {
         assert_eq!(err_text(&e), ERR_SAME_OBJECT);
         let (key, dst) = resolve_move(&[bulk("k"), bulk("3")], 2, 16).unwrap();
         assert_eq!((&key[..], dst), (&b"k"[..], 3));
+    }
+
+    #[test]
+    fn two_db_target_is_the_destination_db_and_key() {
+        let mv = resolve_two_db(b"MOVE", &[bulk("m"), bulk("3")], 0, 16)
+            .expect("MOVE is two-db")
+            .expect("valid MOVE");
+        assert_eq!(mv.into_target(), (3, Bytes::from_static(b"m")));
+        let cp = resolve_two_db(
+            b"COPY",
+            &[bulk("a"), bulk("b"), bulk("DB"), bulk("4")],
+            0,
+            16,
+        )
+        .expect("COPY ... DB 4 is two-db")
+        .expect("valid COPY");
+        assert_eq!(cp.into_target(), (4, Bytes::from_static(b"b")));
     }
 
     #[test]

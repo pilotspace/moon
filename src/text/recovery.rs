@@ -105,6 +105,21 @@ impl TextRecoveryState {
         unchanged
     }
 
+    /// Count `key` as present in every loaded index that covers it, without
+    /// reconciling its content: its payload could not be read at boot, but the
+    /// key still exists, so the deletion probe must not remove its doc.
+    pub fn observe(&mut self, text_store: &TextStore, key: &[u8], db_index: u8) {
+        if self.loaded.is_empty() {
+            return;
+        }
+        let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
+        for name in text_store.find_matching_index_names_for_db(key, db_index) {
+            if let Some(seen) = self.observed.get_mut(&name) {
+                seen.insert(key_hash);
+            }
+        }
+    }
+
     /// Deletion probe + stats recompute + one summary line per loaded index.
     pub fn finish(self, text_store: &mut TextStore) {
         for (name, mut c) in self.loaded {

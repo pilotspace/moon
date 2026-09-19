@@ -34,6 +34,13 @@ then walks every key matching an index prefix, re-deriving its postings and
 vectors. Until it finishes the shard answers `-LOADING` to every data command,
 so from a client's point of view the server is down for the whole walk.
 
+Since moon#1074 the walk also covers matching keys that live only in the KV
+cold tier (`src/shard/recovery_rescan.rs`). Each costs one 4 KiB page read from
+its heap file before the reconcile, in file order. The `recovery scanned db`
+line still counts hot keys only; a `recovery found db ... in the cold tier`
+line follows with the cold count. Every measurement below predates this and
+has no cold keys in it.
+
 ## 2. The two anchors, and the definitional gap between them
 
 | interval | production ms/key |
