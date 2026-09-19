@@ -102,19 +102,21 @@ impl DirtyPageShard {
     /// Register heap file 1 in the manifest as a live KV spill file, the
     /// state of a file the cold index still serves keys from.
     fn register_heap_file_as_live(&mut self) {
-        self.manifest.add_file(FileEntry {
-            file_id: 1,
-            file_type: PageType::KvLeaf as u8,
-            status: FileStatus::Active,
-            tier: StorageTier::Hot,
-            page_size_log2: 12,
-            page_count: 1,
-            byte_size: 4096,
-            created_lsn: 0,
-            db_index: 0,
-            max_key_hash: 0,
-            last_modified_lsn: 0,
-        });
+        self.manifest
+            .add_file(FileEntry {
+                file_id: 1,
+                file_type: PageType::KvLeaf as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Hot,
+                page_size_log2: 12,
+                page_count: 1,
+                byte_size: 4096,
+                created_lsn: 0,
+                db_index: 0,
+                max_key_hash: 0,
+                last_modified_lsn: 0,
+            })
+            .unwrap();
     }
 
     /// One checkpoint tick; `true` when a Finalize completed.
