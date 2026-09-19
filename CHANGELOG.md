@@ -229,6 +229,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     of bug as moon#1031, whose general fix — the RESP2/RESP3 line writers —
     remains open).
 
+- **A write that lands data on a key wakes the clients blocked on it, whatever
+  command wrote it** (moon#1059, moon#1069). Only six "producer" commands
+  (`LPUSH`, `RPUSH`, `LMOVE`, `RPOPLPUSH`, `ZADD`, `XADD`) used to wake a
+  blocked client, so a `BLPOP`/`BZPOPMIN`/`XREAD BLOCK` stayed parked until its
+  own timeout — or forever with timeout 0 — beside data it could pop when the
+  key was written by `RENAME`, `RENAMENX`, `COPY`, `MOVE`, `COPY ... DB n`,
+  `SORT ... STORE`, `ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFFSTORE`/`ZRANGESTORE`,
+  `ZINCRBY`, `GEOADD`, `RESTORE`, `SWAPDB`, a script (`EVAL`/`FCALL`), or any
+  of those inside `MULTI`. A `BLMOVE`/`BRPOPLPUSH` served by a wake, or served
+  immediately, pushed onto its destination without waking the `BLPOP` parked
+  there, so move chains stalled at the first hop. The wake is now keyed on the
+  keys a command WRITES (the shared key walker's write positions), not on
+  command names; `MOVE`/`COPY ... DB n` wake the destination database and
+  `SWAPDB` every key parked in either database. A wake-served move feeds its
+  destination's waiters in the same pass, over a worklist bounded by the
+  waiters parked when it began — chains and cycles are served as redis's
+  `handleClientsBlockedOnKeys` serves them. All the keys one command, one
+  `EXEC` or one script made ready form a single batch that is served before
+  the keys the moves it serves push onto. So, with `BLMOVE a c`, `BLMOVE b c`
+  and `BRPOP c` parked, `MULTI; RPUSH a x; RPUSH b y; EXEC` hands the `BRPOP`
+  `y` and leaves `c = [x]`, as redis does. A key that becomes the wrong type
+  for its waiter still leaves the waiter parked, as in redis. The wake costs
+  nothing measurable while a client is parked on the shard: a write that can
+  only produce a string, hash, set, bitmap or HyperLogLog skips the key walk
+  entirely, as redis's `signalKeyAsReady` returns early on type, and the
+  registry is probed with borrowed keys. A 10-key `MSET` with one `BLPOP`
+  parked runs within noise of the build before the wake existed. Every case
+  was measured against redis-server 8.6.1 first (served within about 0.3 s)
+  and now matches it at `--shards 1` and `--shards 4` on both runtimes.
+
+- **The last-resort WAL v3 replay now restores KV writes instead of none**
+  (moon#1026). When `appendonly.aof` is missing and the WAL carries KV records
+  (`--wal-kv-log on`), boot falls back to replaying the WAL. That fallback
+  passed each record's raw RESP payload to dispatch as the command *name*
+  with no arguments. Every record came back "unknown command" and nothing
+  reached the keyspace, yet the boot log said `replayed N WAL v3 records`.
+  Measured end to end at `--shards 2`: 0 of 64 keys came back and the log
+  claimed 35 records. The fallback now uses the same payload decoder as the
+  Phase 4 WAL pass (`replay::replay_resp_payload`), so the two cannot drift.
+  After the fix the same run restores 29 of 64 keys; the other 35 were
+  connection-local writes, which the WAL does not log by design. Both
+  fallback sites (`shard/mod.rs` and recovery Phase 4b) now log the KV
+  commands they **applied**, alongside records read, non-KV commands and
+  undecodable records. The legacy-dir fallback also closes the replay
+  generation, as its AOF sibling does. `replay_wal_auto` had the same defect
+  and uses the same per-record replay now. Each record replays into the db it
+  was written in (moon#1039), so a `MOVE` or `COPY ... DB n` takes its source
+  from that db (moon#1046). A record for a db beyond `--databases` is skipped
+  with a warning, not folded into db 0. The WAL remains a partial source: it
+  is never the recovery authority.
+
+- **`REPLICAOF <hostname> <port>` no longer aborts the server** (moon#1034).
+  On the default monoio runtime, the replica task parsed `host:port` as a
+  socket address with `.expect`, and that parse accepts IP literals only.
+  `REPLICAOF localhost 6379`, or any DNS name (the normal way to name a master
+  in Kubernetes), panicked on the shard thread, and the panic hook aborted
+  the whole process (SIGABRT). This happened after the command had already
+  replied `+OK`. The host is now resolved as redis does it: inside the
+  reconnect loop, with backoff. An IP literal (including `::1` and `[::1]`)
+  needs no lookup. A name is resolved with the system resolver on a helper
+  thread, never on the shard thread, and the wait is bounded at 5 s. At most
+  one lookup is in flight per replica task, even when the resolver hangs.
+  Every resolved address is tried in order, each connect bounded at 5 s:
+  `localhost` gives `::1` first, which is refused when moon binds
+  `127.0.0.1`, so the task falls through to `127.0.0.1`. While a host does not
+  resolve, the node stays up and reports `master_link_status:down`, and it
+  picks the master up once DNS recovers. `REPLICAOF NO ONE` and re-pointing
+  still supersede the task. The tokio build formatted `host:port` into one
+  string, which cannot express an IPv6 literal. It now shares the same
+  resolver.
+
 - **One `GRAPH.*` write no longer makes a restart discard every acknowledged
   KV write** (moon#1018). This hits `runtime-tokio` with `--shards 1` and the
   `graph` feature. That configuration has no `AofManifest`, so recovery picks
