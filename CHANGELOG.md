@@ -235,6 +235,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kill -9`) and checks that the directories persist, nothing is re-encoded,
   and `FT.SEARCH` is identical.
 
+- **`REPLICAOF <hostname> <port>` no longer aborts the server** (moon#1034).
+  On the default monoio runtime, the replica task parsed `host:port` as a
+  socket address with `.expect`, and that parse accepts IP literals only.
+  `REPLICAOF localhost 6379`, or any DNS name (the normal way to name a master
+  in Kubernetes), panicked on the shard thread, and the panic hook aborted
+  the whole process (SIGABRT). This happened after the command had already
+  replied `+OK`. The host is now resolved as redis does it: inside the
+  reconnect loop, with backoff. An IP literal (including `::1` and `[::1]`)
+  needs no lookup. A name is resolved with the system resolver on a helper
+  thread, never on the shard thread, and the wait is bounded at 5 s. At most
+  one lookup is in flight per replica task, even when the resolver hangs.
+  Every resolved address is tried in order, each connect bounded at 5 s:
+  `localhost` gives `::1` first, which is refused when moon binds
+  `127.0.0.1`, so the task falls through to `127.0.0.1`. While a host does not
+  resolve, the node stays up and reports `master_link_status:down`, and it
+  picks the master up once DNS recovers. `REPLICAOF NO ONE` and re-pointing
+  still supersede the task. The tokio build formatted `host:port` into one
+  string, which cannot express an IPv6 literal. It now shares the same
+  resolver.
+
+- **One `GRAPH.*` write no longer makes a restart discard every acknowledged
+  KV write** (moon#1018). This hits `runtime-tokio` with `--shards 1` and the
+  `graph` feature. That configuration has no `AofManifest`, so recovery picks
+  the KV authority itself: the shard's WAL v3 if replaying it produced KV
+  history, otherwise `appendonly.aof`. Every graph write lands in that WAL as a
+  `Command` record. Replay hands it to the graph engine, never to the keyspace,
+  yet it was counted as KV history. The AOF was skipped, and the keys lived
+  only there. Measured with `--appendfsync always` and `kill -9`: DBSIZE
+  3 → 0, and the same again on every later boot. Recovery now counts a record
+  only when replay applied it to the keyspace. The replay engine reports where
+  each record went (keyspace, cold plane, graph, or unhandled), so this does
+  not depend on an exclusion list: moon#914 and this issue each found a record
+  class such a list missed. A record this build cannot handle (for example,
+  `GRAPH.*` without the `graph` feature) no longer counts either. monoio, and
+  tokio with `--shards` ≥ 2, have a manifest and never reach this decision.
+  CI's per-PR `Test (graph)` step now also runs the recovery/replay unit tests
+  and `tests/graph_wal_kv_authority_1018.rs` under `runtime-tokio` + `graph`,
+  a combination no per-PR leg built before. It adds ~19 s.
+
 - **`CLIENT TRACKING ... REDIRECT <id>` now reaches its target, and
   `CLIENT CACHING` works** (moon#1048, moon#1049). Every wire reply below was
   read off redis-server 8.6.1 over a raw socket first.

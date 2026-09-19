@@ -553,6 +553,10 @@ pub fn recover_shard_v3_pitr(
     // WAL: every KV write since the last snapshot was lost on restart.
     let mut kv_commands_replayed = 0usize;
     let mut kv_commands_skipped = 0usize;
+    // `Command` records replay did not apply to the keyspace (graph,
+    // cold-plane, unhandled). Replayed, but not KV history. Reported by the
+    // Phase 4b fallback line so the decision it makes can be audited.
+    let mut wal_non_kv_commands = 0usize;
     // moon#1039: KV records whose header db is beyond the configured
     // `--databases` count. Dropped rather than folded into db 0.
     let mut kv_records_db_out_of_range = 0usize;
@@ -595,26 +599,31 @@ pub fn recover_shard_v3_pitr(
                                     crate::protocol::Frame::SimpleString(s) => s.as_ref(),
                                     _ => continue,
                                 };
-                                engine.replay_command(
+                                let route = engine.replay_command(
                                     databases,
                                     cmd_name,
                                     &arr[1..],
                                     &mut selected_db,
                                 );
                                 result.commands_replayed += 1;
-                                // moon#914: a cold-plane record is not KV
-                                // history. `ColdMarkerSink` mirrors every
-                                // `MOON.SPILLED` into this WAL under
-                                // `--wal-kv-log on`, so counting it made one
-                                // spill marker enough to skip the Phase 4b
-                                // AOF fallback — the WAL (which never holds a
-                                // connection-local write) became the "KV
-                                // authority" and the AOF's entire history was
-                                // discarded. Same class as the FileCreate
-                                // records the gate below already excludes.
-                                if !crate::persistence::cold_records::is_cold_plane_record(cmd_name)
-                                {
+                                // Only a record replay APPLIED to the keyspace
+                                // is KV history. This WAL also carries
+                                // `Command` records that never reach it:
+                                // `ColdMarkerSink`'s `MOON.SPILLED` mirrors
+                                // (moon#914) and every `GRAPH.*` write
+                                // (`GraphStore::wal_pending`, moon#1018). Each
+                                // one counted here made the WAL the "KV
+                                // authority", so Phase 4b skipped the AOF and
+                                // every acknowledged write in it was lost (a
+                                // single graph write took DBSIZE 3 -> 0). The
+                                // engine reports what it did with the record,
+                                // so a record class this code has never heard
+                                // of is excluded as well. A list of excluded
+                                // names would miss it, as it missed these two.
+                                if route.is_kv_history() {
                                     kv_commands_replayed += 1;
+                                } else {
+                                    wal_non_kv_commands += 1;
                                 }
                             }
                         }
@@ -906,8 +915,9 @@ pub fn recover_shard_v3_pitr(
             let aof_path = v2_dir.join("appendonly.aof");
             if aof_path.exists() {
                 info!(
-                    "Shard {}: WAL carried no KV commands, falling back to AOF replay from {:?}",
-                    shard_id, aof_path
+                    "Shard {}: WAL carried no KV commands, falling back to AOF replay from {:?} \
+                     ({} non-KV command record(s) in the WAL: graph / cold-plane / unhandled)",
+                    shard_id, aof_path, wal_non_kv_commands
                 );
                 match crate::persistence::aof::replay_aof(databases, &aof_path, engine) {
                     Ok(n) => {
@@ -2134,6 +2144,117 @@ mod tests {
             2,
             "the AOF is the only KV history here and must be replayed; a WAL \
              holding nothing but a MOON.SPILLED marker is not a KV authority"
+        );
+    }
+
+    /// Writes `records` as consecutive `Command` records into a fresh
+    /// `shard-0/wal-v3/`, and `aof` as the legacy-dir `appendonly.aof`, then
+    /// runs recovery the way tokio `--shards 1` does (no manifest, so
+    /// `kv_authority_elsewhere = false`). Returns db 0.
+    fn recover_wal_commands_over_aof(records: &[&[u8]], aof: &[u8]) -> Database {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let offload_wal_dir = shard_dir.join("wal-v3");
+        std::fs::create_dir_all(&offload_wal_dir).unwrap();
+        let mut wal_data = make_v3_header(0);
+        for (i, rec) in records.iter().enumerate() {
+            write_wal_v3_record(&mut wal_data, i as u64 + 1, WalRecordType::Command, rec);
+        }
+        std::fs::write(offload_wal_dir.join("000000000001.wal"), &wal_data).unwrap();
+
+        let v2_dir = tmp.path().join("legacy");
+        std::fs::create_dir_all(&v2_dir).unwrap();
+        std::fs::write(v2_dir.join("appendonly.aof"), aof).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        recover_shard_v3_with_fallback(
+            &mut databases,
+            0,
+            &shard_dir,
+            &engine,
+            Some(&v2_dir),
+            false,
+        )
+        .unwrap();
+        databases.swap_remove(0)
+    }
+
+    /// `GRAPH.CREATE g`, byte-for-byte what `graph::wal::serialize_graph_create`
+    /// writes into the shard WAL (pinned below under the `graph` feature).
+    const WAL_GRAPH_CREATE: &[u8] = b"*2\r\n$12\r\nGRAPH.CREATE\r\n$1\r\ng\r\n";
+    const AOF_TWO_SETS: &[u8] =
+        b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n";
+
+    /// moon#1018: on tokio `--shards 1` with the `graph` feature every
+    /// `GRAPH.*` write lands in the shard WAL as a `Command` record
+    /// (`GraphStore::wal_pending`). Replay diverts it to the graph collector —
+    /// it never touches the keyspace — but Phase 4 counted it as KV history,
+    /// so ONE graph write made Phase 4b skip `appendonly.aof`: a live
+    /// `kill -9` run went DBSIZE 3 -> 0. Without the `graph` feature the same
+    /// record reaches KV dispatch as an unknown command and applies nothing
+    /// either, so the assertion holds on every feature set.
+    #[test]
+    fn graph_records_in_the_wal_do_not_suppress_the_aof_fallback() {
+        #[cfg(feature = "graph")]
+        assert_eq!(
+            crate::graph::wal::serialize_graph_create(b"g"),
+            WAL_GRAPH_CREATE,
+            "fixture drifted from the bytes the graph write path logs"
+        );
+        #[cfg(feature = "graph")]
+        let add_node = crate::graph::wal::serialize_add_node(
+            b"g",
+            4_294_967_297,
+            &[1],
+            &crate::graph::types::PropertyMap::new(),
+            None,
+        );
+        #[cfg(not(feature = "graph"))]
+        let add_node = b"*6\r\n$13\r\nGRAPH.ADDNODE\r\n$1\r\ng\r\n$10\r\n4294967297\r\n$1\r\n1\r\n$1\r\n1\r\n$1\r\n0\r\n".to_vec();
+
+        let db = recover_wal_commands_over_aof(&[WAL_GRAPH_CREATE, &add_node], AOF_TWO_SETS);
+        assert_eq!(
+            db.len(),
+            2,
+            "the AOF is the only KV history here and must be replayed; a WAL \
+             holding nothing but GRAPH.* records is not a KV authority"
+        );
+    }
+
+    /// moon#1018, the class rather than the instance: a `Command` record that
+    /// no replay path applies to the keyspace — here a record type this build
+    /// has never heard of — has recorded no KV history, whatever its name.
+    /// An exclusion list (#914 cold-plane records, then GRAPH.*) misses the
+    /// next such class; counting only what replay actually applied does not.
+    #[test]
+    fn a_wal_record_replay_never_applies_to_the_keyspace_is_not_kv_history() {
+        let db = recover_wal_commands_over_aof(
+            &[b"*2\r\n$16\r\nMOON.FUTUREPLANE\r\n$1\r\nx\r\n"],
+            AOF_TWO_SETS,
+        );
+        assert_eq!(
+            db.len(),
+            2,
+            "an unknown record applied nothing, so it cannot displace the AOF"
+        );
+    }
+
+    /// The other direction, so the fix cannot be "never count anything": when
+    /// the WAL DOES carry a KV write beside a graph record (`--wal-kv-log on`
+    /// on a path that logs it), it stays the authority and the AOF is not
+    /// replayed on top — replaying both would double-apply the `INCR`.
+    #[test]
+    fn kv_records_beside_graph_records_keep_the_wal_as_the_kv_authority() {
+        let mut db = recover_wal_commands_over_aof(
+            &[WAL_GRAPH_CREATE, b"*2\r\n$4\r\nINCR\r\n$1\r\nn\r\n"],
+            b"*2\r\n$4\r\nINCR\r\n$1\r\nn\r\n",
+        );
+        let n = db.get(b"n").and_then(|e| e.value.as_bytes_owned());
+        assert_eq!(
+            n.as_deref(),
+            Some(&b"1"[..]),
+            "the WAL's INCR is KV history; replaying the AOF too double-applies it"
         );
     }
 
