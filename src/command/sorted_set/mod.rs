@@ -383,11 +383,12 @@ pub(super) fn lex_in_range(member: &[u8], min: &LexBound, max: &LexBound) -> boo
 /// window empty — which is what makes `ZREMRANGEBYRANK z -10 -6` on a
 /// five-member zset remove nothing (redis 8.6.1 answers `(integer) 0`).
 ///
-/// `zrange_by_rank` and `zrange_from_entries` below clamp the STOP as well and
-/// answer `[a]` for the same `ZRANGE z -10 -6`, where redis answers `[]`. That
-/// is a pre-existing divergence in a command moon#959 does not touch; it is
-/// reported separately rather than changed under this issue, and this helper
-/// exists so the new command does not inherit it.
+/// `zrange_by_rank` and `zrange_from_entries` below (used by `ZRANGE`,
+/// `ZREVRANGE` and `ZRANGESTORE`) now call this same helper instead of
+/// clamping the STOP as well — moon#959 introduced it only for
+/// `ZREMRANGEBYRANK` and left the older range commands with the STOP-clamp
+/// bug, which moon#1001 closed by sharing this helper everywhere a rank
+/// window is resolved.
 pub(super) fn rank_window(start_raw: i64, stop_raw: i64, total: usize) -> Option<(usize, usize)> {
     let len = total as i64;
     let mut start = if start_raw < 0 {
@@ -419,7 +420,7 @@ pub(super) fn zrange_by_rank(
     rev: bool,
     withscores: bool,
 ) -> Frame {
-    let total = scores.len() as i64;
+    let total = scores.len();
     if total == 0 {
         return Frame::Array(framevec![]);
     }
@@ -439,28 +440,20 @@ pub(super) fn zrange_by_rank(
         None => return err("ERR value is not an integer or out of range"),
     };
 
-    // Normalize negative indices
-    let start = if start_raw < 0 {
-        (total + start_raw).max(0)
-    } else {
-        start_raw.min(total)
+    // moon#1001: `rank_window` carries the exact redis rule (a STOP still
+    // negative after `len + stop` is NOT clamped to 0), shared with
+    // `zrange_from_entries` and `ZREMRANGEBYRANK` so the three cannot drift.
+    let (start, stop) = match rank_window(start_raw, stop_raw, total) {
+        Some(w) => w,
+        None => return Frame::Array(framevec![]),
     };
-    let stop = if stop_raw < 0 {
-        (total + stop_raw).max(0)
-    } else {
-        stop_raw.min(total - 1)
-    };
-
-    if start > stop {
-        return Frame::Array(framevec![]);
-    }
 
     let mut result = Vec::new();
 
     if rev {
         // Reverse: rank 0 = highest score
-        let rev_start = (total - 1 - stop) as usize;
-        let rev_stop = (total - 1 - start) as usize;
+        let rev_start = total - 1 - stop;
+        let rev_stop = total - 1 - start;
         let entries = scores.range_by_rank(rev_start, rev_stop);
         for (score, member) in entries.into_iter().rev() {
             result.push(Frame::BulkString(member.clone()));
@@ -469,7 +462,7 @@ pub(super) fn zrange_by_rank(
             }
         }
     } else {
-        let entries = scores.range_by_rank(start as usize, stop as usize);
+        let entries = scores.range_by_rank(start, stop);
         for (score, member) in entries {
             result.push(Frame::BulkString(member.clone()));
             if withscores {
@@ -760,22 +753,15 @@ pub(super) fn zrange_from_entries(
             Some(v) => v,
             None => return err("ERR value is not an integer or out of range"),
         };
-        // Normalize negative indices exactly as `zrange_by_rank` does against
-        // the B+tree, so the listpack answer and the B+tree answer cannot
-        // drift apart.
-        let start = if start_raw < 0 {
-            (total + start_raw).max(0)
-        } else {
-            start_raw.min(total)
+        // moon#1001: normalize with the same `rank_window` helper
+        // `zrange_by_rank` uses against the B+tree, so the listpack answer
+        // and the B+tree answer cannot drift apart, and a STOP still
+        // negative after `len + stop` is NOT clamped to 0 (redis leaves it
+        // negative so `start > stop` reports the window empty).
+        let (start, stop) = match rank_window(start_raw, stop_raw, entries.len()) {
+            Some(w) => w,
+            None => return Frame::Array(framevec![]),
         };
-        let stop = if stop_raw < 0 {
-            (total + stop_raw).max(0)
-        } else {
-            stop_raw.min(total - 1)
-        };
-        if start > stop {
-            return Frame::Array(framevec![]);
-        }
         // REV counts ranks from the HIGH-score end. `entries` is
         // score-ascending, so the window [start, stop] in the reversed order
         // is [total-1-stop, total-1-start] here, walked backwards — the same
@@ -789,11 +775,11 @@ pub(super) fn zrange_from_entries(
         // moon#928 — the change that stops a read flattening a listpack — is
         // what surfaced it.
         let slice: Vec<&(Bytes, f64)> = if rev {
-            let lo = (total - 1 - stop) as usize;
-            let hi = (total - 1 - start) as usize;
+            let lo = entries.len() - 1 - stop;
+            let hi = entries.len() - 1 - start;
             entries[lo..=hi].iter().rev().collect()
         } else {
-            entries[start as usize..=stop as usize].iter().collect()
+            entries[start..=stop].iter().collect()
         };
         let result: Vec<Frame> = slice
             .into_iter()
@@ -1386,6 +1372,89 @@ mod tests {
                 assert_eq!(arr.len(), 3); // all elements
             }
             _ => panic!("Expected array"),
+        }
+    }
+
+    /// moon#1001. A STOP still negative after `len + stop` must NOT be
+    /// clamped to 0 — redis leaves it negative so `start > stop` reports the
+    /// window empty. `rank_window` (moon#959) already carries this rule;
+    /// `zrange_by_rank` and `zrange_from_entries` did not use it. Verified
+    /// against a live redis-server 8.6.1 on a five-member zset:
+    /// `ZRANGE r8 -10 -6` -> `*0`, `ZREVRANGE r8 -10 -6` -> `*0`,
+    /// `ZRANGE r8 -10 -6 REV` -> `*0`, `ZRANGESTORE r9 r8 -10 -6` -> `0`.
+    #[test]
+    fn still_negative_stop_is_not_clamped_to_zero() {
+        for member_of in [
+            |c: char| Bytes::from(c.to_string()),
+            |c: char| Bytes::from(format!("{c}{}", "x".repeat(70))), // forces B+tree
+        ] {
+            let mut db = Database::new();
+            let members: Vec<Bytes> = ('a'..='e').map(member_of).collect();
+            for (score, member) in members.iter().enumerate() {
+                run_zadd(
+                    &mut db,
+                    &[b"r8", (score + 1).to_string().as_bytes(), member],
+                );
+            }
+            let first = members[0].clone();
+            let last = members[4].clone();
+
+            assert_eq!(
+                zrange(&mut db, &[bulk(b"r8"), bulk(b"-10"), bulk(b"-6")]),
+                Frame::Array(framevec![]),
+                "ZRANGE r8 -10 -6 on {members:?}"
+            );
+            assert_eq!(
+                zrevrange(&mut db, &[bulk(b"r8"), bulk(b"-10"), bulk(b"-6")]),
+                Frame::Array(framevec![]),
+                "ZREVRANGE r8 -10 -6 on {members:?}"
+            );
+            assert_eq!(
+                zrange(
+                    &mut db,
+                    &[bulk(b"r8"), bulk(b"-10"), bulk(b"-6"), bulk(b"REV")]
+                ),
+                Frame::Array(framevec![]),
+                "ZRANGE r8 -10 -6 REV on {members:?}"
+            );
+            assert_eq!(
+                zrangestore(
+                    &mut db,
+                    &[bulk(b"r9"), bulk(b"r8"), bulk(b"-10"), bulk(b"-6")]
+                ),
+                Frame::Integer(0),
+                "ZRANGESTORE r9 r8 -10 -6 on {members:?}"
+            );
+
+            // Control, taken from the same oracle session: a stop of exactly
+            // `-len` normalises to rank 0 without any clamping, so it was
+            // already correct pre-fix and must stay so (verified against a
+            // live redis-server 8.6.1: `ZRANGE r8 -10 -5` -> `1) "a"`).
+            assert_eq!(
+                zrange(&mut db, &[bulk(b"r8"), bulk(b"-10"), bulk(b"-5")]),
+                Frame::Array(framevec![Frame::BulkString(first.clone())]),
+                "ZRANGE r8 -10 -5 (stop == -len normalises to rank 0)"
+            );
+            assert_eq!(
+                zrange(&mut db, &[bulk(b"r8"), bulk(b"-1"), bulk(b"-3")]),
+                Frame::Array(framevec![]),
+                "ZRANGE r8 -1 -3 (start > stop pre-existing) stays empty"
+            );
+
+            // A single-member zset must not leak the same bug at len == 1.
+            let mut db1 = Database::new();
+            run_zadd(&mut db1, &[b"e1", b"1", &first]);
+            assert_eq!(
+                zrange(&mut db1, &[bulk(b"e1"), bulk(b"-10"), bulk(b"-6")]),
+                Frame::Array(framevec![]),
+                "ZRANGE e1 -10 -6 on a single-member zset"
+            );
+            assert_eq!(
+                zrange(&mut db1, &[bulk(b"e1"), bulk(b"-1"), bulk(b"-1")]),
+                Frame::Array(framevec![Frame::BulkString(first.clone())]),
+                "ZRANGE e1 -1 -1 still returns the sole member"
+            );
+            let _ = &last;
         }
     }
 

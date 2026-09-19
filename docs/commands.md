@@ -42,6 +42,10 @@ Per-field return code on the TTL commands: `-2` = no such field, `-1` = no TTL, 
 
 !!! note
     Blocking commands (`BLPOP`, `BRPOP`, `BLMOVE`) support timeouts and cross-shard wakeup.
+    A multi-key `BLPOP`/`BRPOP`/`BZPOPMIN`/`BZPOPMAX` works at any shard count, with keys
+    on any shards: it pops exactly one element, from the first non-empty key in argument
+    order, as standalone Redis does. `BLMPOP`/`BZMPOP` whose keys span shards are refused
+    with `CROSSSLOT`, like `LMPOP`/`ZMPOP`; co-locate their keys under one `{hash}` tag.
 
 ## Sets (15)
 
