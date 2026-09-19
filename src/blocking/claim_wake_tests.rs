@@ -196,6 +196,7 @@ fn a_lost_claim_put_back_keeps_the_ttl() {
             frame,
             Some(undo),
             ttl,
+            &mut crate::blocking::pop_log::wake_budget(),
         )
         .served();
 
@@ -239,6 +240,7 @@ fn a_won_claim_whose_send_fails_puts_the_element_back() {
         Frame::BulkString(v.clone()),
         Some(WakeUndo::ListFront(smallvec::smallvec![v])),
         ttl,
+        &mut crate::blocking::pop_log::wake_budget(),
     )
     .served();
 

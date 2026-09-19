@@ -117,13 +117,30 @@ pub(crate) fn has_work() -> bool {
     })
 }
 
+/// A fresh backpressure budget for ONE wake pass (or one immediate pop).
+///
+/// [`log_pop`] may block the shard thread while the AOF writer is saturated,
+/// bounded by the budget it is handed. A wake that serves many waiters —
+/// one `RPUSH` with N clients parked, an `EXEC` feeding several keys — shares
+/// one budget across all of its pops, exactly like the SPSC batch arms share
+/// one across a batch, so it stalls the shard for at most one
+/// [`AOF_SPSC_BACKPRESSURE_BOUND`](crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND)
+/// in total rather than one per served pop. Once the budget is spent, a pop
+/// whose record meets a full channel is refused at once (and its waiter told
+/// so) instead of waiting again.
+#[inline]
+pub(crate) fn wake_budget() -> std::time::Duration {
+    crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND
+}
+
 /// Log `record` — the non-blocking command that reproduces a pop this shard
-/// just served in database `db` — to this shard's replication stream and AOF.
+/// just served in database `db` — to this shard's replication stream and AOF,
+/// blocking for at most what is left of `budget` (see [`wake_budget`]).
 ///
 /// MUST be called on the shard thread that performed the pop, in the same
 /// synchronous stretch as the pop, before the reply is sent. See the module
 /// docs for why each of those three matters.
-pub(crate) fn log_pop(db: usize, record: &Frame) -> PopLog {
+pub(crate) fn log_pop(db: usize, record: &Frame, budget: &mut std::time::Duration) -> PopLog {
     SINK.with(|s| {
         let guard = s.borrow();
         let Some(sink) = guard.as_ref() else {
@@ -156,8 +173,7 @@ pub(crate) fn log_pop(db: usize, record: &Frame) -> PopLog {
             AofWriterPool::issue_append_lsn(&sink.repl_state, sink.shard_id, bytes.len())
         };
         if let Some(pool) = sink.aof_pool.as_ref() {
-            let mut budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-            if !pool.send_append_bounded_blocking(sink.shard_id, lsn, db, bytes, &mut budget) {
+            if !pool.send_append_bounded_blocking(sink.shard_id, lsn, db, bytes, budget) {
                 return PopLog::AofLost;
             }
         }
@@ -252,7 +268,10 @@ mod tests {
     fn a_thread_with_no_sink_logs_nothing() {
         uninstall();
         assert!(!has_work());
-        assert_eq!(log_pop(0, &lpop(b"k")), PopLog::Unlogged);
+        assert_eq!(
+            log_pop(0, &lpop(b"k"), &mut wake_budget()),
+            PopLog::Unlogged
+        );
     }
 
     #[test]
@@ -260,7 +279,7 @@ mod tests {
         let (tx, rx) = flume::bounded::<AofMessage>(8);
         install(0, Some(AofWriterPool::top_level(tx)), None);
         assert!(has_work());
-        assert_eq!(log_pop(3, &lpop(b"k")), PopLog::Logged);
+        assert_eq!(log_pop(3, &lpop(b"k"), &mut wake_budget()), PopLog::Logged);
         match rx.try_recv() {
             Ok(AofMessage::Append { db, bytes, .. }) => {
                 assert_eq!(db, 3, "the record carries the db the pop ran in");
@@ -276,7 +295,7 @@ mod tests {
         let (tx, rx) = flume::bounded::<AofMessage>(1);
         drop(rx);
         install(0, Some(AofWriterPool::top_level(tx)), None);
-        assert_eq!(log_pop(0, &lpop(b"k")), PopLog::AofLost);
+        assert_eq!(log_pop(0, &lpop(b"k"), &mut wake_budget()), PopLog::AofLost);
         uninstall();
     }
 
@@ -469,6 +488,58 @@ mod tests {
         // out another bound on the shard thread for the next waiter.
         assert!(second.try_recv().is_err(), "the next waiter stays parked");
         assert_eq!(list(&mut db, &k), vec![b("b")]);
+        uninstall();
+    }
+
+    /// One wake pass shares ONE backpressure budget across every pop it
+    /// logs: with the writer channel full and never drained, the first pop
+    /// spends the whole bound and every later pop in the pass is refused at
+    /// once — the shard thread stalls one bound in total, not one per
+    /// served waiter.
+    #[test]
+    fn a_wake_pass_spends_one_backpressure_budget_across_its_pops() {
+        let (tx, rx) = flume::bounded::<AofMessage>(1);
+        // Fill the channel and keep the receiver alive without draining it:
+        // every append now has to wait for room that never comes.
+        tx.try_send(AofMessage::Append {
+            lsn: 0,
+            db: 0,
+            bytes: Bytes::from_static(b"filler"),
+        })
+        .map_err(|_| ())
+        .expect("room for the filler");
+        install(0, Some(AofWriterPool::top_level(tx)), None);
+        let mut reg = BlockingRegistry::new(0);
+        let mut db = Database::new();
+        let keys = [b("k1"), b("k2"), b("k3")];
+        let waiters: Vec<_> = keys
+            .iter()
+            .map(|k| {
+                db.list_push_back(k, b("v"));
+                park(&mut reg, 0, k, BlockedCommand::BLPop, None)
+            })
+            .collect();
+
+        let mut budget = wake_budget();
+        assert!(crate::blocking::wakeup::wake_keys_budgeted(
+            &mut reg,
+            &mut db,
+            0,
+            keys.iter().cloned(),
+            &mut budget,
+        ));
+
+        assert!(
+            budget.is_zero(),
+            "the pass drew every wait from the one budget it was handed, which is now spent"
+        );
+        for w in &waiters {
+            match w.try_recv() {
+                Ok(Some(Frame::Error(e))) => assert!(e.starts_with(b"MOONERR AOF backpressure")),
+                other => panic!("every served pop meets the full writer, got {other:?}"),
+            }
+        }
+        drop(rx);
         uninstall();
     }
 }

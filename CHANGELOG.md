@@ -215,11 +215,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pop's synchronous stretch, before the reply leaves (wake-served, claim-won
   and immediately-served pops alike); the waiter only confirms the fsync on
   the owner's writer under `appendfsync always`. A write that wakes a waiter
-  (a plain write, `EXEC`, `MOVE`/`COPY ... DB n`) now logs itself before it
-  serves the waiter, so the pop always follows the push that fed it. A record
-  the AOF writer cannot take within its backpressure bound answers the waiter
-  with the same `MOONERR AOF backpressure` error as every other synchronous
-  write, instead of the element.
+  (a plain write, `EXEC`, `MOVE`/`COPY ... DB n` on the connection and on
+  every cross-shard SPSC arm) now logs itself before it serves the waiter, so
+  the pop always follows the push that fed it. A record the AOF writer cannot
+  take within its backpressure bound answers the waiter with the same
+  `MOONERR AOF backpressure` error as every other synchronous write, instead
+  of the element; that error, like `AOF fsync failed`, means the element may
+  have been consumed. One wake pass shares one backpressure bound across all
+  the pops it logs, so a saturated writer stalls the shard thread once, not
+  once per served waiter.
 
 - **A write is logged in the order it was applied, even when it waits after
   applying** (moon#1084). Three paths applied a write, awaited something, and

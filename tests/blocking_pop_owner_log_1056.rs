@@ -31,7 +31,10 @@
 //!   key owned by each of the four shards in turn, waiter on one fixed
 //!   connection (so at least three of four owners are not its shard);
 //!   `appendfsync always`, `kill -9`, restart on the same `--dir`.
-//!   `BLMOVE`/`BRPOPLPUSH` rows check the source AND the destination.
+//!   `BLMOVE`/`BRPOPLPUSH` rows check the source AND the destination. The
+//!   `MOVE`/`COPY ... DB n` rows wake the waiter from another db; for the
+//!   owners the writer connection is not on, they arrive over SPSC and run
+//!   the shared two-db intercept (`spsc_two_db`).
 //! * [`a_pop_is_logged_before_the_writes_that_follow_it`] — `--shards 1`: the
 //!   write that wakes the waiter and a later, order-sensitive write to the
 //!   same key arrive in ONE pipelined batch, so the waiter cannot run between
@@ -328,6 +331,38 @@ fn cross_shard_rows() -> Vec<Row> {
                 owned(&["LRANGE", &dst, "0", "-1"]),
             ],
             expect: vec![arr(&["a"]), arr(&["b"])],
+        });
+        // The waking write is a MOVE / COPY ... DB n into the waiter's db.
+        // For three of the four owners the writer connection is on another
+        // shard, so the write arrives over SPSC and runs the two-db
+        // intercept (`spsc_two_db`), which woke the waiter BEFORE its arm
+        // logged the MOVE: the pop replayed against an empty key and the
+        // MOVE then brought the element back.
+        let mv = key_on("k1056:xmv:", s, SHARDS);
+        rows.push(Row {
+            label: format!("MOVE wakes owner={s}"),
+            pop: owned(&["BLPOP", &mv, "10"]),
+            writes: vec![
+                owned(&["SELECT", "1"]),
+                owned(&["RPUSH", &mv, "a", "b"]),
+                owned(&["MOVE", &mv, "0"]),
+                owned(&["SELECT", "0"]),
+            ],
+            probes: vec![owned(&["LRANGE", &mv, "0", "-1"])],
+            expect: vec![arr(&["b"])],
+        });
+        let cp = key_on("k1056:xcp:", s, SHARDS);
+        rows.push(Row {
+            label: format!("COPY DB wakes owner={s}"),
+            pop: owned(&["BLPOP", &cp, "10"]),
+            writes: vec![
+                owned(&["SELECT", "1"]),
+                owned(&["RPUSH", &cp, "a", "b"]),
+                owned(&["COPY", &cp, &cp, "DB", "0"]),
+                owned(&["SELECT", "0"]),
+            ],
+            probes: vec![owned(&["LRANGE", &cp, "0", "-1"])],
+            expect: vec![arr(&["b"])],
         });
         // A waiter parked on keys of TWO owners (the claim-token path,
         // moon#1019): the second key's owner serves it.

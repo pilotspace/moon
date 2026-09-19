@@ -2123,7 +2123,11 @@ fn log_immediate_pop(cmd: &[u8], args: &[Frame], db_index: usize, frame: Frame) 
     else {
         return (frame, true);
     };
-    match crate::blocking::pop_log::log_pop(db_index, &record) {
+    match crate::blocking::pop_log::log_pop(
+        db_index,
+        &record,
+        &mut crate::blocking::pop_log::wake_budget(),
+    ) {
         crate::blocking::pop_log::PopLog::AofLost => (
             Frame::Error(Bytes::from_static(
                 crate::shard::spsc_handler::AOF_APPEND_LOST_ERR,

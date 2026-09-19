@@ -173,6 +173,19 @@ pub fn ready_keys(
 /// exist at all: a put-back after an await would land on top of other
 /// clients' logged writes while the pop itself was never logged, and the
 /// master would diverge from its AOF and replicas (moon#1023).
+///
+/// moon#1056 NARROWS the A2 guarantee, deliberately. A won serve is now
+/// LOGGED (AOF + replication, `blocking::pop_log`) before its reply is sent,
+/// so the waiter's `fsync_barrier` on the owner covers the record. Once the
+/// record exists, this undo is never applied: a put-back would leave memory
+/// disagreeing with the AOF and every replica. So a waiter whose receiver
+/// drops in the window between that log and the send — reachable only for a
+/// REMOTE waiter whose connection task is torn down without settling its
+/// claim; a local waiter's receiver lives on this thread and is checked just
+/// before — loses the element: consumed, logged, delivered to nobody, exactly
+/// like a client that disconnects right after its reply was written. The
+/// "delivered or still in the key" guarantee holds in full only when no
+/// durability plane is active (nothing logged, so the undo still runs).
 pub(crate) enum WakeUndo {
     /// Values popped from the FRONT of the key, in pop order.
     ListFront(smallvec::SmallVec<[bytes::Bytes; 4]>),
@@ -282,8 +295,9 @@ pub fn try_wake_list_waiter(
     key: &Bytes,
 ) -> bool {
     let mut worklist = ReadyKeys::new();
-    let served = serve_list_key(registry, db, db_index, key, &mut worklist, 0);
-    served | drain_ready(registry, db, db_index, &mut worklist, 0)
+    let mut budget = crate::blocking::pop_log::wake_budget();
+    let served = serve_list_key(registry, db, db_index, key, &mut worklist, 0, &mut budget);
+    served | drain_ready(registry, db, db_index, &mut worklist, 0, &mut budget)
 }
 
 /// Serve a whole batch of ready keys in one database — the keys a write, an
@@ -319,13 +333,33 @@ pub fn wake_keys(
     db_index: usize,
     seeds: impl IntoIterator<Item = Bytes>,
 ) -> bool {
+    wake_keys_budgeted(
+        registry,
+        db,
+        db_index,
+        seeds,
+        &mut crate::blocking::pop_log::wake_budget(),
+    )
+}
+
+/// [`wake_keys`] drawing every pop it logs from the caller's backpressure
+/// `budget` (moon#1056): a wake pass that serves many waiters stalls the
+/// shard thread for at most one bound in total when the AOF writer is
+/// saturated, not one bound per served pop.
+pub(crate) fn wake_keys_budgeted(
+    registry: &mut BlockingRegistry,
+    db: &mut Database,
+    db_index: usize,
+    seeds: impl IntoIterator<Item = Bytes>,
+    budget: &mut std::time::Duration,
+) -> bool {
     let mut worklist = ReadyKeys::new();
     for key in seeds {
         if !worklist.contains(&key) {
             worklist.push(key);
         }
     }
-    drain_ready(registry, db, db_index, &mut worklist, 0)
+    drain_ready(registry, db, db_index, &mut worklist, 0, budget)
 }
 
 /// Serve `worklist[next..]` in order, appending the destinations the serves
@@ -336,11 +370,12 @@ fn drain_ready(
     db_index: usize,
     worklist: &mut ReadyKeys,
     mut next: usize,
+    budget: &mut std::time::Duration,
 ) -> bool {
     let mut served = false;
     while let Some(key) = worklist.get(next).cloned() {
         next += 1;
-        served |= serve_ready_key(registry, db, db_index, &key, worklist, next);
+        served |= serve_ready_key(registry, db, db_index, &key, worklist, next, budget);
     }
     served
 }
@@ -363,12 +398,13 @@ fn serve_ready_key(
     key: &Bytes,
     worklist: &mut ReadyKeys,
     pending_from: usize,
+    budget: &mut std::time::Duration,
 ) -> bool {
     let now_ms = db.now_ms();
     if matches!(db.get_list_ref_if_alive(key, now_ms), Ok(Some(_))) {
-        serve_list_key(registry, db, db_index, key, worklist, pending_from)
+        serve_list_key(registry, db, db_index, key, worklist, pending_from, budget)
     } else if matches!(db.get_sorted_set_ref_if_alive(key, now_ms), Ok(Some(_))) {
-        try_wake_zset_waiter(registry, db, db_index, key)
+        serve_zset_key(registry, db, db_index, key, budget)
     } else if matches!(db.get_stream_if_alive(key, now_ms), Ok(Some(_))) {
         try_wake_stream_waiter(registry, db, db_index, key)
     } else {
@@ -387,6 +423,7 @@ fn serve_list_key(
     key: &Bytes,
     worklist: &mut ReadyKeys,
     pending_from: usize,
+    budget: &mut std::time::Duration,
 ) -> bool {
     // Loop: try waiters until one succeeds (oneshot receiver may be dropped = skip)
     // moon#535: pop only waiters THIS waker can serve. The old blind
@@ -631,6 +668,7 @@ fn serve_list_key(
             result,
             undo,
             expires_at_ms,
+            budget,
         );
         if delivered.served() {
             served = true;
@@ -706,6 +744,11 @@ impl Delivered {
 ///   disconnects after its reply is sent (moon#1023). A local waiter cannot
 ///   reach that case: its receiver lives on this thread and was checked just
 ///   before; a remote one only when its task is torn down without settling.
+///   That element is then consumed and delivered to nobody — the deliberate
+///   price of logging BEFORE the send so the waiter's fsync barrier covers
+///   the record (see [`WakeUndo`]).
+/// * `budget` is the wake pass's shared AOF backpressure budget
+///   ([`crate::blocking::pop_log::wake_budget`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn deliver(
     db: &mut Database,
@@ -717,6 +760,7 @@ pub(crate) fn deliver(
     frame: Frame,
     undo: Option<WakeUndo>,
     expires_at_ms: u64,
+    budget: &mut std::time::Duration,
 ) -> Delivered {
     let won = claim.is_none_or(crate::blocking::ClaimToken::try_claim);
     if !won || reply_tx.is_disconnected() {
@@ -732,7 +776,7 @@ pub(crate) fn deliver(
         && crate::blocking::pop_log::has_work()
         && let Some(record) = crate::blocking::pop_log::served_pop_record(cmd, key, u)
     {
-        match crate::blocking::pop_log::log_pop(db_index, &record) {
+        match crate::blocking::pop_log::log_pop(db_index, &record, budget) {
             crate::blocking::pop_log::PopLog::Unlogged => {}
             crate::blocking::pop_log::PopLog::Logged => logged = true,
             crate::blocking::pop_log::PopLog::AofLost => {
@@ -765,6 +809,25 @@ pub fn try_wake_zset_waiter(
     db: &mut Database,
     db_index: usize,
     key: &Bytes,
+) -> bool {
+    serve_zset_key(
+        registry,
+        db,
+        db_index,
+        key,
+        &mut crate::blocking::pop_log::wake_budget(),
+    )
+}
+
+/// [`try_wake_zset_waiter`] drawing its pop logging from the caller's
+/// backpressure `budget`, so one wake pass stalls the shard thread for at
+/// most one bound however many waiters it serves.
+fn serve_zset_key(
+    registry: &mut BlockingRegistry,
+    db: &mut Database,
+    db_index: usize,
+    key: &Bytes,
+    budget: &mut std::time::Duration,
 ) -> bool {
     // moon#535: pop only waiters THIS waker can serve. The old blind
     // `pop_front` handed us waiters of every family, and the cleanup below —
@@ -894,6 +957,7 @@ pub fn try_wake_zset_waiter(
             result,
             undo,
             expires_at_ms,
+            budget,
         );
         if delivered.served() {
             served = true;
@@ -986,9 +1050,12 @@ pub fn wake_recorded(
         return;
     }
     let mut reg = registry.borrow_mut();
+    // One backpressure budget for the whole transaction's wakes, across its
+    // databases: see `pop_log::wake_budget`.
+    let mut budget = crate::blocking::pop_log::wake_budget();
     for (db_index, keys) in batches_by_db(&reg, recorded) {
         crate::shard::slice::with_shard_db(db_index, |db| {
-            wake_keys(&mut reg, db, db_index, keys);
+            wake_keys_budgeted(&mut reg, db, db_index, keys, &mut budget);
         });
     }
 }
