@@ -501,6 +501,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          aof_last_append_status:{}\r\n\
          aof_reason_del_dropped:{}\r\n\
          aof_rewrite_overflow_spilled:{}\r\n\
+         aof_rewrite_late_records_folded:{}\r\n\
          spill_batches_flushed:{}\r\n\
          spill_completions_dropped:{}\r\n\
          spill_failed_reinserted:{}\r\n\
@@ -570,6 +571,10 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         },
         crate::persistence::aof::AOF_REASON_DEL_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
         crate::persistence::aof::rewrite_overflow::AOF_REWRITE_OVERFLOW_SPILLED
+            .load(std::sync::atomic::Ordering::Relaxed),
+        // Records a fold's base already held that reached the writer after
+        // the fold took effect — dropped, not replayed twice (#455).
+        crate::persistence::aof::AOF_REWRITE_LATE_RECORDS_FOLDED
             .load(std::sync::atomic::Ordering::Relaxed),
         crate::storage::tiered::spill_thread::spill_batches_flushed_total(),
         crate::storage::tiered::spill_thread::spill_completion_dropped_total(),

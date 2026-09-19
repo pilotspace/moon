@@ -269,6 +269,87 @@ pub(crate) fn write_cold_cut_head(
     Ok(())
 }
 
+/// How a rewrite fold ended, from its writer's point of view (#455).
+///
+/// There are exactly two outcomes, because the folds open the new
+/// generation's append handle BEFORE the step that makes that generation the
+/// committed one, and only swap it in after that step succeeded. So "the
+/// manifest flipped but the writer could not switch files" cannot happen. In
+/// that state the writer used to keep appending to the old incr the flip had
+/// deleted, invisible to recovery, and its fsyncs still reported success.
+#[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FoldOutcome {
+    /// The new generation is the committed one and `file` appends to its
+    /// incr. Records stamped below `floor` (the fold's snapshot epoch) are
+    /// inside its base: the writer must drop them from now on.
+    Committed { floor: FoldEpoch },
+    /// The old generation stays committed and `file` still appends to its
+    /// incr. The writer's floor is unchanged.
+    Aborted,
+}
+
+#[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
+impl FoldOutcome {
+    /// The writer's floor after this outcome, given the floor it had before
+    /// the fold.
+    pub(crate) fn floor_after(self, previous: FoldEpoch) -> FoldEpoch {
+        match self {
+            FoldOutcome::Committed { floor } => floor,
+            FoldOutcome::Aborted => previous,
+        }
+    }
+}
+
+/// Open a fold's NEW incr for appending and write its `MOON.COLDCUT` head —
+/// everything a writer needs before it can switch to the new generation,
+/// done while the old one is still committed (#455, see [`FoldOutcome`]).
+#[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
+pub(crate) fn open_new_incr(
+    path: &Path,
+    framed: bool,
+    cold_watermark: u64,
+) -> Result<std::fs::File, MoonError> {
+    #[cfg(test)]
+    if test_fault::fail_new_incr_open() {
+        return Err(AofError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other("injected: new incr cannot be opened"),
+        }
+        .into());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| AofError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+    write_cold_cut_head(&mut file, framed, cold_watermark, path)?;
+    Ok(file)
+}
+
+/// Test-only fault injection for the fold's new-incr open (#455): the step
+/// whose failure used to leave a flipped manifest behind a writer still
+/// appending to the old, deleted incr.
+#[cfg(test)]
+pub(crate) mod test_fault {
+    use std::cell::Cell;
+    thread_local! {
+        static FAIL_NEW_INCR_OPEN: Cell<bool> = const { Cell::new(false) };
+    }
+    /// Make every `open_new_incr` on THIS thread fail until reset. Only the
+    /// monoio folds are driven by unit tests.
+    #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
+    pub(crate) fn set_fail_new_incr_open(fail: bool) {
+        FAIL_NEW_INCR_OPEN.with(|c| c.set(fail));
+    }
+    pub(crate) fn fail_new_incr_open() -> bool {
+        FAIL_NEW_INCR_OPEN.with(Cell::get)
+    }
+}
+
 /// Snapshot databases and generate compacted AOF commands.
 ///
 /// Shared by both the async (tokio) and sync (monoio) rewrite paths.
@@ -324,6 +405,19 @@ pub(crate) struct DrainOutcome {
 
 #[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 impl DrainOutcome {
+    /// Consume a record already folded into the base of the generation being
+    /// drained into (#455): its bytes are NOT written, it still counts as
+    /// drained (the caller's bound counted it), and an `AppendSync` ack parks
+    /// with the others — the base holding its effect is durable, so it
+    /// resolves `Synced` with them at the boundary fsync.
+    pub(crate) fn fold_away(&mut self, msg: AofMessage) {
+        self.drained += 1;
+        AOF_REWRITE_LATE_RECORDS_FOLDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let AofMessage::AppendSync { ack, .. } = msg {
+            self.pending_acks.push(ack);
+        }
+    }
+
     /// Resolve every parked AppendSync ack after the rewrite-boundary fsync.
     /// `synced=true` → `Synced`; `false` → `FsyncFailed`. A fresh `AofAck` is
     /// built per sender so `AofAck` needs no `Copy`/`Clone`. Drains the vec so a
@@ -393,16 +487,18 @@ pub(crate) fn drain_pending_appends_bounded(
     file: &mut std::fs::File,
     max_drain: usize,
     db_ctx: &mut usize,
+    floor: FoldEpoch,
 ) -> Result<DrainOutcome, MoonError> {
     use std::io::Write;
     let mut outcome = DrainOutcome::default();
     while outcome.drained < max_drain {
         match rx.try_recv() {
+            // #455: already in the base of `file`'s generation — skip the
+            // bytes, still count it (the bound counted it) and park its ack.
+            Ok(msg) if is_folded(&msg, floor) => outcome.fold_away(msg),
             Ok(msg) => match msg {
                 AofMessage::Append {
-                    bytes: data,
-                    lsn: _,
-                    db,
+                    bytes: data, db, ..
                 } => {
                     if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), db_ctx) {
                         file.write_all(&sel).map_err(|e| AofError::Io {
@@ -418,9 +514,9 @@ pub(crate) fn drain_pending_appends_bounded(
                 }
                 AofMessage::AppendSync {
                     bytes: data,
-                    lsn: _,
                     db,
                     ack,
+                    ..
                 } => {
                     if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), db_ctx) {
                         file.write_all(&sel).map_err(|e| AofError::Io {
@@ -456,8 +552,9 @@ pub(crate) fn drain_pending_appends(
     rx: &channel::MpscReceiver<AofMessage>,
     file: &mut std::fs::File,
     db_ctx: &mut usize,
+    floor: FoldEpoch,
 ) -> Result<DrainOutcome, MoonError> {
-    drain_pending_appends_bounded(rx, file, usize::MAX, db_ctx)
+    drain_pending_appends_bounded(rx, file, usize::MAX, db_ctx, floor)
 }
 
 /// [F6] Drain at most `max_drain` pending [`AofMessage::Append`] /
@@ -487,6 +584,7 @@ pub(crate) fn drain_pending_appends_framed(
     file: &mut std::fs::File,
     max_drain: usize,
     db_ctx: &mut usize,
+    floor: FoldEpoch,
 ) -> Result<DrainOutcome, MoonError> {
     use std::io::Write;
     let mut outcome = DrainOutcome::default();
@@ -499,11 +597,14 @@ pub(crate) fn drain_pending_appends_framed(
     };
     while outcome.drained < max_drain {
         match rx.try_recv() {
+            // #455: see `drain_pending_appends_bounded`.
+            Ok(msg) if is_folded(&msg, floor) => outcome.fold_away(msg),
             Ok(msg) => match msg {
                 AofMessage::Append {
                     lsn,
                     db,
                     bytes: data,
+                    ..
                 } => {
                     if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), db_ctx) {
                         write_framed(file, 0, &sel).map_err(|e| AofError::Io {
@@ -522,6 +623,7 @@ pub(crate) fn drain_pending_appends_framed(
                     db,
                     bytes: data,
                     ack,
+                    ..
                 } => {
                     // H1-BARRIER: a zero-length AppendSync is an fsync barrier
                     // (pool::fsync_barrier) — it must produce NO on-disk record
@@ -577,10 +679,13 @@ pub(crate) fn drain_pending_appends_framed(
 /// 4. Snapshot this shard's databases under the locks.
 /// 5. Release the locks before the expensive base-RDB write.
 /// 6. Write the new base + new (empty) incr at `coord.new_seq` via
-///    `advance_shard` (which does NOT bump `manifest.seq`), then reopen
-///    `file` to the new incr. Subsequent appends land in the new generation.
+///    `advance_shard` (which does NOT bump `manifest.seq`), and open the new
+///    incr — without switching `file` to it yet.
 /// 7. Signal completion to the coordinator; the last shard commits the
 ///    manifest (single seq flip) and prunes the old generation.
+/// 8. Wait for the committed generation. Only if it is the new one does
+///    `file` switch to the new incr's handle (infallible), and the writer's
+///    floor moves to this fold's snapshot epoch (#455).
 ///
 /// Until step 7's commit, the on-disk manifest still resolves to the old seq,
 /// so a crash anywhere in steps 1-6 recovers the intact old generation.
@@ -634,8 +739,14 @@ pub(crate) fn do_rewrite_per_shard(
     fold_producer: &parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>,
     fold_notifier: &std::sync::Arc<crate::runtime::channel::Notify>,
     last_db: &mut usize,
-) -> Result<bool, MoonError> {
+    floor: FoldEpoch,
+) -> Result<FoldOutcome, MoonError> {
     use ringbuf::traits::Producer;
+    // #455: `file` and `last_db` are only ever switched to the new generation
+    // AFTER the coordinator reports it committed. On every other exit
+    // (`Err`, `Aborted`, panic) they still describe the old incr, which is
+    // then still the committed one — see `FoldOutcome`.
+    //
     // Panic/early-error safety: guarantees `shard_done` runs on EVERY exit
     // (success via `complete()`, `?`-error or panic-unwind via `Drop`). The
     // phase-8 `await_outcome` barrier makes that a liveness requirement, so
@@ -658,7 +769,7 @@ pub(crate) fn do_rewrite_per_shard(
     // task #35: pre/mid drain write into the OLD incr `file` — the SAME
     // stream the live writer was appending to before the fold — so they
     // continue the writer's running db context (`last_db`), not a fresh 0.
-    let mut pre_drain = drain_pending_appends_framed(rx, file, pre_drain_bound, last_db)?;
+    let mut pre_drain = drain_pending_appends_framed(rx, file, pre_drain_bound, last_db, floor)?;
     sync_and_fulfill_drain(&mut pre_drain, file, PathBuf::from("<aof per-shard incr>"))?;
     info!(
         "F6 shard {} phase1 done: drained {} appends ({:.1}ms)",
@@ -769,7 +880,7 @@ pub(crate) fn do_rewrite_per_shard(
     // of pre-snapshot appends the shard reported before building its snapshot. This
     // prevents an infinite drain loop under sustained high write load where new
     // (post-snapshot) appends arrive faster than we can drain them.
-    let mut mid_drain = drain_pending_appends_framed(rx, file, pending_aof_count, last_db)?;
+    let mut mid_drain = drain_pending_appends_framed(rx, file, pending_aof_count, last_db, floor)?;
     sync_and_fulfill_drain(&mut mid_drain, file, PathBuf::from("<aof per-shard incr>"))?;
     info!(
         "F6 shard {} phase3 done: drained {} mid-appends ({:.1}ms total)",
@@ -792,20 +903,12 @@ pub(crate) fn do_rewrite_per_shard(
         let mut m = coord.manifest.lock();
         m.advance_shard(shard_id, coord.new_seq, &rdb_bytes)?
     };
-    *file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&new_incr)
-        .map_err(|e| AofError::Io {
-            path: new_incr.clone(),
-            source: e,
-        })?;
-    write_cold_cut_head(file, true, fold_snapshot.cold_file_watermark, &new_incr)?;
-    // task #35: save the OLD incr's final db context (in case phase 8 rolls
-    // back to it on abort) then reset for the fresh NEW incr — replay always
-    // starts a segment at db 0, so the writer's running context must match.
-    let old_incr_last_db = *last_db;
-    *last_db = 0;
+    // #455: open the new incr NOW, but do not switch to it. Until the
+    // coordinator reports the new generation committed, `file` must keep
+    // appending to the old incr — it is the committed one. Any failure up to
+    // here aborts the whole rewrite (the ShardDoneGuard marks it failed)
+    // with `file` still on the old incr.
+    let new_file = open_new_incr(&new_incr, true, fold_snapshot.cold_file_watermark)?;
 
     info!(
         "F6 per-shard rewrite: shard {} folded (drained {}+{} appends), new seq {}",
@@ -822,44 +925,31 @@ pub(crate) fn do_rewrite_per_shard(
     // performs the single clean `shard_done` and disarms the guard's Drop.
     guard.complete();
 
-    // Phase 8 (barrier-before-resume): block until the terminal writer publishes
-    // the committed generation, then make sure THIS writer's append file points
-    // at it. On the happy path committed == new_seq and *file already points at
-    // new_incr (phase 6) — nothing to do. On an abort/commit-failure the manifest
-    // kept old_seq and pruned our new_seq incr, so reopen *file onto old_seq's
-    // incr; otherwise we keep appending into a discarded generation that recovery
-    // ignores — silent data loss. Replaces the old "RESTART recommended" hazard.
+    // Phase 8 (barrier-before-resume): block until the terminal writer
+    // publishes the committed generation, then switch to it. Nothing here can
+    // fail (#455): on commit the new incr's handle is already open, and on
+    // abort `file` never left the old incr, so there is nothing to reopen.
+    // Before, a commit-then-reopen failure left `file` on the old incr that
+    // the commit had deleted, and every later record was lost silently.
     let committed_seq = coord.await_outcome();
     if committed_seq != coord.new_seq {
-        let committed_incr = coord
-            .manifest
-            .lock()
-            .shard_incr_path_seq(shard_id, committed_seq);
-        *file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&committed_incr)
-            .map_err(|e| AofError::Io {
-                path: committed_incr,
-                source: e,
-            })?;
-        // task #35: rolled back onto the OLD (still-committed) incr — restore
-        // its db context instead of the fresh-incr 0 set above.
-        *last_db = old_incr_last_db;
         warn!(
-            "F6 per-shard rewrite ABORTED: shard {} rolled its append file back to \
-             committed seq {} (no restart needed)",
+            "F6 per-shard rewrite ABORTED: shard {} keeps appending to committed seq {} \
+             (no restart needed)",
             shard_id, committed_seq
         );
-        // Re-verify P0: an abort is NOT a commit — the new base this shard's
-        // snapshot cut refers to was PRUNED. Returning Ok(true) here would
-        // make finish_* discard pre-cut spills (their effects exist only in
-        // the discarded base) and resolve their acks Synced — permanent,
-        // acked data loss. The caller must drain the overflow
-        // write-everything into the rolled-back OLD incr instead.
-        return Ok(false);
+        // An abort is NOT a commit: the new base this shard's snapshot refers
+        // to was PRUNED, so the floor must not move — the caller drains the
+        // overflow write-everything into the old incr.
+        return Ok(FoldOutcome::Aborted);
     }
-    Ok(true)
+    *file = new_file;
+    // Fresh incr: replay starts every incr segment at db 0, so the writer's
+    // db context restarts there too.
+    *last_db = 0;
+    Ok(FoldOutcome::Committed {
+        floor: fold_snapshot.fold_epoch,
+    })
 }
 
 /// Multi-part rewrite: snapshot single-shard databases → RDB base → advance manifest.
@@ -890,11 +980,12 @@ pub(crate) fn do_rewrite_single(
     rx: &channel::MpscReceiver<AofMessage>,
     last_db: &mut usize,
     overflow: &super::rewrite_overflow::RewriteOverflow,
-) -> Result<(), MoonError> {
+    floor: FoldEpoch,
+) -> Result<FoldOutcome, MoonError> {
     // Phase 1: drain pre-rewrite queued appends into old incr, fsync, then
     // resolve their parked AppendSync acks (issue #140). task #35: continues
     // the writer's running db context — this IS the writer's live `file`.
-    let mut pre_drain = drain_pending_appends(rx, file, last_db)?;
+    let mut pre_drain = drain_pending_appends(rx, file, last_db, floor)?;
     sync_and_fulfill_drain(&mut pre_drain, file, manifest.incr_path())?;
 
     // Phase 2: acquire write locks on every database in the shard.
@@ -905,20 +996,15 @@ pub(crate) fn do_rewrite_single(
 
     // Phase 3: drain any appends the handlers sent between phase 1 and phase 2,
     // fsync, then resolve their parked AppendSync acks (issue #140).
-    let mut mid_drain = drain_pending_appends(rx, file, last_db)?;
+    let mut mid_drain = drain_pending_appends(rx, file, last_db, floor)?;
     sync_and_fulfill_drain(&mut mid_drain, file, manifest.incr_path())?;
 
-    // #452.1 snapshot cut (P0 fix): while we hold EVERY db write lock no NEW
-    // mutation can start, so everything spilled so far is pre-snapshot (its
-    // effect will be in the phase-4 snapshot below) and must not be
-    // re-written into the new incr. Known residual gap (re-verify Q1,
-    // tracked as a follow-up issue): paths that enqueue AFTER releasing the
-    // db guard (deferred batch flush, a producer parked in send_async) can
-    // suspend between mutation and enqueue — such a record can land past
-    // this cut (and past `pending_aof_count` on the sharded fold, a gap that
-    // predates the overflow) although its effect is in the snapshot. The
-    // exposure needs channel-full + a fold arriving inside that gap.
-    overflow.mark_cut();
+    // #455 snapshot epoch: while we hold EVERY db write lock no mutation can
+    // start, so every record stamped before this instant logs a mutation the
+    // phase-4 snapshot below captures, wherever that record is: already
+    // drained, in the channel, spilled, or still with a producer that is
+    // parked or awaiting between its mutation and its enqueue.
+    let snapshot_epoch = overflow.advance_epoch();
 
     // Phase 4: snapshot under the write locks. No mutation is possible.
     // moon#902: the cold-file watermark for the new generation's
@@ -951,19 +1037,13 @@ pub(crate) fn do_rewrite_single(
     // and will be processed into the new incr after step 6.
     drop(guards);
 
-    // Phase 6: write new base, advance manifest, reopen.
+    // Phase 6: write new base, open the new incr, THEN flip the manifest; the
+    // switch of `file` below cannot fail (#455, see `FoldOutcome`).
     let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&snapshot)?;
-    let new_incr = manifest.advance(&rdb_bytes)?;
-
-    *file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&new_incr)
-        .map_err(|e| AofError::Io {
-            path: new_incr.clone(),
-            source: e,
-        })?;
-    write_cold_cut_head(file, false, cold_watermark, &new_incr)?;
+    let (_new_incr, new_file) = manifest.advance_with(&rdb_bytes, |new_incr| {
+        open_new_incr(new_incr, false, cold_watermark)
+    })?;
+    *file = new_file;
     // task #35: fresh incr — replay always starts a segment at db 0.
     *last_db = 0;
 
@@ -975,7 +1055,9 @@ pub(crate) fn do_rewrite_single(
         // Caller doesn't currently observe this; logging is the escape hatch.
         warn!("AOF writer: shutdown requested during rewrite (will honor on next recv)");
     }
-    Ok(())
+    Ok(FoldOutcome::Committed {
+        floor: snapshot_epoch,
+    })
 }
 
 /// TopLevel cooperative fold: snapshot shard 0 → merged RDB base → advance manifest.
@@ -1012,7 +1094,8 @@ pub(crate) fn do_rewrite_sharded(
         Arc<crate::runtime::channel::Notify>,
     )>,
     last_db: &mut usize,
-) -> Result<(), MoonError> {
+    floor: FoldEpoch,
+) -> Result<FoldOutcome, MoonError> {
     use ringbuf::traits::Producer;
 
     let _fold_t0 = std::time::Instant::now();
@@ -1035,7 +1118,7 @@ pub(crate) fn do_rewrite_sharded(
     // Phase 1: drain pre-rewrite queued appends into old incr (RAW RESP), fsync.
     // task #35: continues the writer's running db context (this IS the
     // writer's live `file`).
-    let mut pre_drain = drain_pending_appends(rx, file, last_db)?;
+    let mut pre_drain = drain_pending_appends(rx, file, last_db, floor)?;
     sync_and_fulfill_drain(&mut pre_drain, file, manifest.incr_path())?;
     info!(
         "TopLevel fold phase1 done: drained {} appends ({:.1}ms)",
@@ -1112,7 +1195,7 @@ pub(crate) fn do_rewrite_sharded(
     // would be silently lost when `manifest.advance()` deletes the old incr file
     // at the end of phase 4.  This mirrors the identical bound used by
     // `drain_pending_appends_framed` in `do_rewrite_per_shard`.
-    let mut mid_drain = drain_pending_appends_bounded(rx, file, pending_aof_count, last_db)?;
+    let mut mid_drain = drain_pending_appends_bounded(rx, file, pending_aof_count, last_db, floor)?;
     sync_and_fulfill_drain(&mut mid_drain, file, manifest.incr_path())?;
     info!(
         "TopLevel fold phase3 done: drained {} mid-appends ({:.1}ms)",
@@ -1129,16 +1212,12 @@ pub(crate) fn do_rewrite_sharded(
         rdb_bytes.len(),
         _fold_t0.elapsed().as_secs_f64() * 1000.0
     );
-    let new_incr = manifest.advance(&rdb_bytes)?;
-    *file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&new_incr)
-        .map_err(|e| AofError::Io {
-            path: new_incr.clone(),
-            source: e,
-        })?;
-    write_cold_cut_head(file, false, fold_snapshot.cold_file_watermark, &new_incr)?;
+    let (_new_incr, new_file) = manifest.advance_with(&rdb_bytes, |new_incr| {
+        // #455: opened (with its MOON.COLDCUT head) BEFORE the manifest flips,
+        // so switching `file` below cannot fail — see `FoldOutcome`.
+        open_new_incr(new_incr, false, fold_snapshot.cold_file_watermark)
+    })?;
+    *file = new_file;
     // task #35: fresh incr — replay always starts a segment at db 0.
     *last_db = 0;
 
@@ -1149,7 +1228,9 @@ pub(crate) fn do_rewrite_sharded(
     if pre_drain.shutdown_requested || mid_drain.shutdown_requested {
         warn!("TopLevel AOF writer: shutdown requested during rewrite (honored on next recv)");
     }
-    Ok(())
+    Ok(FoldOutcome::Committed {
+        floor: fold_snapshot.fold_epoch,
+    })
 }
 
 /// Rewrite the AOF file with RDB preamble (binary base + empty RESP incremental).
@@ -1234,7 +1315,8 @@ pub(crate) fn rewrite_aof_sharded_sync(
         Arc<crate::runtime::channel::Notify>,
     )>,
     last_db: &mut usize,
-) -> Result<(), MoonError> {
+    floor: FoldEpoch,
+) -> Result<(FoldOutcome, std::fs::File), MoonError> {
     use ringbuf::traits::Producer;
     use std::io::Write as _;
 
@@ -1262,6 +1344,14 @@ pub(crate) fn rewrite_aof_sharded_sync(
     {
         let mut pre_acks: Vec<crate::runtime::channel::OneshotSender<AofAck>> = Vec::new();
         while let Ok(msg) = rx.try_recv() {
+            // #455: already in the base of the file being appended to.
+            if is_folded(&msg, floor) {
+                AOF_REWRITE_LATE_RECORDS_FOLDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let AofMessage::AppendSync { ack, .. } = msg {
+                    pre_acks.push(ack);
+                }
+                continue;
+            }
             match msg {
                 AofMessage::Append {
                     db, bytes: data, ..
@@ -1368,6 +1458,7 @@ pub(crate) fn rewrite_aof_sharded_sync(
     // must land in the new file (aof_path) AFTER the rename in phase 4.
     let pending_aof_count = fold_snapshot.pending_aof_count;
     let cold_watermark = fold_snapshot.cold_file_watermark;
+    let snapshot_epoch = fold_snapshot.fold_epoch;
     let snapshot = fold_snapshot.dbs;
     info!(
         "rewrite_aof_sharded_sync (tokio) snapshot: {} dbs, {} pre-snapshot pending ({:.1}ms)",
@@ -1390,6 +1481,16 @@ pub(crate) fn rewrite_aof_sharded_sync(
         let mut drained = 0usize;
         while drained < pending_aof_count {
             match rx.try_recv() {
+                // #455: already in the base of the file being appended to;
+                // still counted, the bound counted it.
+                Ok(msg) if is_folded(&msg, floor) => {
+                    drained += 1;
+                    AOF_REWRITE_LATE_RECORDS_FOLDED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let AofMessage::AppendSync { ack, .. } = msg {
+                        mid_acks.push(ack);
+                    }
+                }
                 Ok(msg) => match msg {
                     AofMessage::Append {
                         db, bytes: data, ..
@@ -1457,13 +1558,20 @@ pub(crate) fn rewrite_aof_sharded_sync(
     }
 
     // Phase 4: write RDB snapshot to aof_path (atomic tmp → rename).
+    //
+    // #455: the tmp file's handle IS the writer's new append handle. It stays
+    // open across the rename, so after the rename nothing is left that can
+    // fail. The writer used to drop its handle and reopen `aof_path` after the
+    // rename; when that reopen failed, the new file was already published and
+    // the writer had to exit. The handle is positioned at the end of what it
+    // wrote, and this writer is the file's only appender.
     let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&snapshot)?;
     let tmp_path = aof_path.with_extension("aof.tmp");
+    let mut f = std::fs::File::create(&tmp_path).map_err(|e| AofError::Io {
+        path: tmp_path.clone(),
+        source: e,
+    })?;
     {
-        let mut f = std::fs::File::create(&tmp_path).map_err(|e| AofError::Io {
-            path: tmp_path.clone(),
-            source: e,
-        })?;
         f.write_all(&rdb_bytes).map_err(|e| AofError::Io {
             path: tmp_path.clone(),
             source: e,
@@ -1497,6 +1605,22 @@ pub(crate) fn rewrite_aof_sharded_sync(
             e
         ),
     })?;
+    // The rename is the commit point, so a failure below cannot abort: the
+    // writer's handle is already the published file. Fsync the directory so
+    // the new name survives a power loss (a file fsync does not persist its
+    // directory entry); on failure the rename may revert to the old file on a
+    // crash, which is logged loudly because later appends would then be lost.
+    if let Some(parent) = aof_path.parent().filter(|p| !p.as_os_str().is_empty())
+        && let Err(e) = crate::persistence::fsync::fsync_directory(parent)
+    {
+        tracing::error!(
+            "rewrite_aof_sharded_sync (tokio): fsync of {} after publishing {} failed: {}; \
+             the new AOF may not survive a power loss",
+            parent.display(),
+            aof_path.display(),
+            e
+        );
+    }
     // task #35: aof_path now points at a brand-new file (RDB base only) —
     // replay always starts a segment at db 0.
     *last_db = 0;
@@ -1512,7 +1636,12 @@ pub(crate) fn rewrite_aof_sharded_sync(
              (will honor on next recv)"
         );
     }
-    Ok(())
+    Ok((
+        FoldOutcome::Committed {
+            floor: snapshot_epoch,
+        },
+        f,
+    ))
 }
 
 /// Reopen AOF file in append mode after atomic rewrite replaced it.
@@ -1532,3 +1661,196 @@ fn reopen_aof_sync(aof_path: &Path) -> Result<std::fs::File, std::io::Error> {
 pub async fn rewrite_aof(db: SharedDatabases, aof_path: &Path) -> Result<(), MoonError> {
     rewrite_aof_sync(&db, aof_path)
 }
+
+#[cfg(all(test, feature = "runtime-monoio"))]
+mod fold_tests {
+    //! Writer-visible outcome of a fold (#455): the append handle is on the
+    //! committed generation whatever happens, and a record stamped before a
+    //! committed snapshot is never written after it — wherever it surfaces.
+
+    use super::*;
+    use crate::persistence::aof::rewrite_overflow::RewriteOverflow;
+    use crate::persistence::aof_manifest::AofManifest;
+    use crate::storage::Database;
+    use std::io::Write as _;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        dir: std::path::PathBuf,
+        dbs: SharedDatabases,
+        manifest: AofManifest,
+        file: std::fs::File,
+        tx: channel::MpscSender<AofMessage>,
+        rx: channel::MpscReceiver<AofMessage>,
+        overflow: RewriteOverflow,
+    }
+
+    fn fixture() -> Fixture {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        let manifest = AofManifest::initialize(&dir).expect("initialize");
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(manifest.incr_path())
+            .expect("open committed incr");
+        let mut db = Database::new();
+        db.set_string(b"k", Bytes::from_static(b"1"));
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(16);
+        Fixture {
+            _dir: tmp,
+            dir,
+            dbs: Arc::new(vec![parking_lot::RwLock::new(db)]),
+            manifest,
+            file,
+            tx,
+            rx,
+            overflow: RewriteOverflow::new(),
+        }
+    }
+
+    fn append(payload: &'static [u8], epoch: FoldEpoch) -> AofMessage {
+        AofMessage::Append {
+            lsn: 0,
+            db: 0,
+            bytes: Bytes::from_static(payload),
+            epoch,
+        }
+    }
+
+    fn contains(path: &Path, needle: &[u8]) -> bool {
+        std::fs::read(path)
+            .expect("read incr")
+            .windows(needle.len())
+            .any(|w| w == needle)
+    }
+
+    /// The step that used to fail AFTER the manifest flip: opening the new
+    /// incr. It now fails before it, so the fold aborts cleanly and the
+    /// writer keeps appending to the incr recovery will actually replay.
+    #[test]
+    fn a_fold_that_cannot_open_its_new_incr_leaves_the_writer_on_the_committed_one() {
+        let mut fx = fixture();
+        let old_seq = fx.manifest.seq;
+        let old_incr = fx.manifest.incr_path();
+        let mut last_db = 0usize;
+
+        test_fault::set_fail_new_incr_open(true);
+        let res = do_rewrite_single(
+            &fx.dbs,
+            &mut fx.manifest,
+            &mut fx.file,
+            &fx.rx,
+            &mut last_db,
+            &fx.overflow,
+            FoldEpoch::INITIAL,
+        );
+        test_fault::set_fail_new_incr_open(false);
+
+        assert!(res.is_err(), "the fold must report the failure");
+        assert_eq!(fx.manifest.seq, old_seq, "in-memory manifest unchanged");
+        let on_disk = AofManifest::load(&fx.dir)
+            .expect("load")
+            .expect("manifest present");
+        assert_eq!(on_disk.seq, old_seq, "the manifest never flipped");
+        assert!(old_incr.exists(), "the committed incr is still there");
+        assert!(
+            !fx.manifest.incr_path_seq(old_seq + 1).exists(),
+            "the abandoned new incr is removed"
+        );
+
+        let marker = b"*1\r\n$4\r\nPING\r\n";
+        fx.file
+            .write_all(marker)
+            .expect("append after the aborted fold");
+        fx.file.sync_data().expect("fsync");
+        assert!(
+            contains(&old_incr, marker),
+            "appends after the aborted fold must land in the committed incr"
+        );
+    }
+
+    /// A committed fold hands the writer its snapshot epoch and a handle on
+    /// the new incr (opened before the flip).
+    #[test]
+    fn a_committed_fold_reports_its_snapshot_epoch_and_switches_the_handle() {
+        let mut fx = fixture();
+        let old_seq = fx.manifest.seq;
+        let mut last_db = 0usize;
+        let stamped_before = fx.overflow.stamp();
+
+        let outcome = do_rewrite_single(
+            &fx.dbs,
+            &mut fx.manifest,
+            &mut fx.file,
+            &fx.rx,
+            &mut last_db,
+            &fx.overflow,
+            FoldEpoch::INITIAL,
+        )
+        .expect("fold");
+
+        let FoldOutcome::Committed { floor } = outcome else {
+            panic!("expected a committed fold, got {outcome:?}");
+        };
+        assert!(stamped_before.folded_below(floor));
+        assert_eq!(
+            floor,
+            fx.overflow.stamp(),
+            "records stamped from now on are post-snapshot"
+        );
+        assert_eq!(fx.manifest.seq, old_seq + 1);
+
+        let marker = b"*1\r\n$4\r\nPING\r\n";
+        fx.file.write_all(marker).expect("append after the fold");
+        fx.file.sync_data().expect("fsync");
+        assert!(contains(&fx.manifest.incr_path(), marker));
+    }
+
+    /// The double-apply itself: a producer mutated, took its stamp, and was
+    /// held up (parked on a full channel, or awaiting) until after the fold
+    /// committed. Its record reaches the writer after the snapshot, so a
+    /// position cut treats it as new — but the base already holds its effect.
+    #[test]
+    fn a_record_stamped_before_a_committed_snapshot_is_never_written_after_it() {
+        let mut fx = fixture();
+        let mut last_db = 0usize;
+        // INCR k happened (k=1 is in the db) — its record has not been sent.
+        let late = append(b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n", fx.overflow.stamp());
+
+        let outcome = do_rewrite_single(
+            &fx.dbs,
+            &mut fx.manifest,
+            &mut fx.file,
+            &fx.rx,
+            &mut last_db,
+            &fx.overflow,
+            FoldEpoch::INITIAL,
+        )
+        .expect("fold");
+        let floor = outcome.floor_after(FoldEpoch::INITIAL);
+
+        // Now the held-up record arrives, followed by a genuinely new one.
+        fx.tx.try_send(late).expect("send late record");
+        fx.tx
+            .try_send(append(
+                b"*2\r\n$4\r\nPING\r\n$3\r\nnew\r\n",
+                fx.overflow.stamp(),
+            ))
+            .expect("send new record");
+        // The writer's post-fold drain applies the floor.
+        fx.overflow
+            .finish_raw(&fx.rx, &mut fx.file, &mut last_db, floor)
+            .expect("post-fold drain");
+
+        let incr = fx.manifest.incr_path();
+        assert!(
+            !contains(&incr, b"INCR"),
+            "the pre-snapshot INCR is in the base; writing it again double-applies on replay"
+        );
+        assert!(contains(&incr, b"new"), "post-snapshot records are written");
+    }
+}
+
+#[cfg(test)]
+#[path = "rewrite/flat_file_fold_tests.rs"]
+mod flat_file_fold_tests;

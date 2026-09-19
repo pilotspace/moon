@@ -1114,7 +1114,9 @@ pub static SUBCOMMAND_META: phf::Map<&'static str, &'static [SubcommandMeta]> = 
         SubcommandMeta { name: "WHOAMI", arity: 2, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: SRV },
     ],
     "CLIENT" => &[
+        SubcommandMeta { name: "CACHING", arity: 3, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
         SubcommandMeta { name: "GETNAME", arity: 2, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
+        SubcommandMeta { name: "GETREDIR", arity: 2, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
         SubcommandMeta { name: "HELP", arity: 2, flags: CommandFlags::LOADING.union(CommandFlags::STALE), acl_categories: CON },
         SubcommandMeta { name: "ID", arity: 2, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
         SubcommandMeta { name: "INFO", arity: 2, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
@@ -1125,6 +1127,7 @@ pub static SUBCOMMAND_META: phf::Map<&'static str, &'static [SubcommandMeta]> = 
         SubcommandMeta { name: "PAUSE", arity: -3, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
         SubcommandMeta { name: "SETNAME", arity: 3, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
         SubcommandMeta { name: "TRACKING", arity: -3, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
+        SubcommandMeta { name: "TRACKINGINFO", arity: 2, flags: CommandFlags::NOSCRIPT.union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
         SubcommandMeta { name: "UNPAUSE", arity: 2, flags: CommandFlags::ADMIN.union(CommandFlags::NOSCRIPT).union(CommandFlags::LOADING).union(CommandFlags::STALE), acl_categories: CON },
     ],
     "CLUSTER" => &[

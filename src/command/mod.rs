@@ -79,7 +79,26 @@ impl DispatchResult {
             DispatchResult::Response(Frame::Error(_)) | DispatchResult::Quit(Frame::Error(_))
         )
     }
+
+    /// True when `dispatch` has no handler for the command, so nothing ran:
+    /// the reply is [`err_unknown`]'s. Every other error, arity and WRONGTYPE
+    /// included, came from a handler that did run.
+    ///
+    /// WAL replay asks this to tell a record it APPLIED to the keyspace from
+    /// one it could not (moon#1018: only the former is KV history).
+    #[inline]
+    #[must_use]
+    pub fn is_unknown_command(&self) -> bool {
+        matches!(
+            self,
+            DispatchResult::Response(Frame::Error(e)) if e.starts_with(ERR_UNKNOWN_COMMAND_PREFIX)
+        )
+    }
 }
+
+/// The fixed head of [`err_unknown`]'s reply. [`DispatchResult::is_unknown_command`]
+/// matches on it, so the two must not drift (pinned by a unit test).
+const ERR_UNKNOWN_COMMAND_PREFIX: &[u8] = b"ERR unknown command '";
 
 /// Upper bound for the with-duplicates (negative COUNT) arms of
 /// SRANDMEMBER / HRANDFIELD / ZRANDMEMBER. Redis returns exactly |COUNT|
@@ -2005,6 +2024,28 @@ mod tests {
             }
             _ => panic!("Expected error response"),
         }
+    }
+
+    /// moon#1018: WAL replay uses `is_unknown_command` to decide whether a
+    /// record reached the keyspace. It must match `err_unknown` exactly, for
+    /// both of its call sites (the empty name and the fall-through), and must
+    /// not mistake a handler's own error for "no handler".
+    #[test]
+    fn is_unknown_command_matches_err_unknown_and_nothing_else() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        assert!(dispatch(&mut db, b"FAKECMD", &[], &mut selected, 16).is_unknown_command());
+        assert!(dispatch(&mut db, b"", &[], &mut selected, 16).is_unknown_command());
+        assert!(dispatch(&mut db, b"GRAPH.CREATE", &[], &mut selected, 16).is_unknown_command());
+        // A handler ran and refused: arity.
+        let arity = dispatch(&mut db, b"GET", &[], &mut selected, 16);
+        assert!(arity.is_error() && !arity.is_unknown_command());
+        // A handler ran and applied.
+        let args = [
+            Frame::BulkString(Bytes::from_static(b"k")),
+            Frame::BulkString(Bytes::from_static(b"v")),
+        ];
+        assert!(!dispatch(&mut db, b"SET", &args, &mut selected, 16).is_unknown_command());
     }
 
     #[test]

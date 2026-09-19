@@ -58,7 +58,7 @@ use crate::protocol::Frame;
 use crate::pubsub::subscriber::Subscriber;
 use crate::pubsub::{self, PubSubRegistry};
 use crate::storage::eviction::{EvictionRun, evict_to_budget};
-use crate::tracking::{TrackingState, TrackingTable};
+use crate::tracking::TrackingTable;
 
 use super::shared::resolve_ft_search_as_of_lsn;
 use super::{
@@ -109,10 +109,15 @@ where
     // resolve_local_leg_barrier. On barrier failure every enqueued write in
     // the batch is unconfirmed, so every joined slot is patched.
     let mut barrier_idxs: Vec<usize> = Vec::new();
+    // Read once, before any enqueue can park. The entries were applied
+    // earlier in the batch, so this can be later than their mutations — a
+    // fold in between may still replay them — but never earlier, which is
+    // the direction that would lose a record.
+    let fold_stamp = pool.fold_stamp(0);
     for (resp_idx, db, bytes) in aof_entries {
         let lsn =
             crate::persistence::aof::AofWriterPool::issue_append_lsn(repl_state, 0, bytes.len());
-        match pool.send_append_group(0, lsn, db, bytes).await {
+        match pool.send_append_group(0, lsn, db, bytes, fold_stamp).await {
             Ok(true) => barrier_idxs.push(resp_idx),
             Ok(false) => {}
             Err(_) => {
@@ -244,6 +249,17 @@ pub async fn handle_connection(
                 qbuf_limit,
                 qbuf_preauth,
             ));
+        // CLIENT TRACKING REDIRECT inbox: registered only while subscribed,
+        // framed for the current protocol. Every UNSUBSCRIBE, RESET and HELLO
+        // path has run by here, before the connection waits again.
+        crate::tracking::client_cmd::sync_inbox(
+            &mut conn.tracking_inbox,
+            conn.subscription_count > 0,
+            framed.codec().protocol_version() >= 3,
+            conn.pubsub_tx.as_ref(),
+            client_id,
+            &tracking_table,
+        );
         // Subscriber mode: bidirectional select on client commands + published messages
         if conn.subscription_count > 0 {
             #[allow(clippy::unwrap_used)]
@@ -551,7 +567,7 @@ pub async fn handle_connection(
                 let mut break_outer = false;
 
                 // Dispatchable frame: (response_index, frame, is_write, aof_bytes)
-                let mut dispatchable: Vec<(usize, Frame, bool, Option<Bytes>)> = Vec::new();
+                let mut dispatchable: Vec<(usize, Frame, bool, Option<Bytes>, bool)> = Vec::new();
 
                 // === Phase 1: Connection-level intercepts ===
                 for frame in batch {
@@ -623,6 +639,9 @@ pub async fn handle_connection(
 
                     // --- Connection-level command intercepts (no db lock needed) ---
                     if let Some((cmd, cmd_args)) = extract_command(&frame) {
+                        // CLIENT CACHING covers exactly the next command
+                        // (moon#1049); runs before every intercept.
+                        conn.tracking_state.before_command(cmd, conn.in_multi);
                         // AUTH when already conn.authenticated
                         if cmd.eq_ignore_ascii_case(b"AUTH") {
                             let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
@@ -700,44 +719,17 @@ pub async fn handle_connection(
                                         });
                                         continue;
                                     }
-                                    if sub_bytes.eq_ignore_ascii_case(b"TRACKING") {
-                                        match crate::command::client::parse_tracking_args(cmd_args) {
-                                            Ok(config_parsed) => {
-                                                if config_parsed.enable {
-                                                    conn.tracking_state.enabled = true;
-                                                    conn.tracking_state.bcast = config_parsed.bcast;
-                                                    conn.tracking_state.noloop = config_parsed.noloop;
-                                                    conn.tracking_state.optin = config_parsed.optin;
-                                                    conn.tracking_state.optout = config_parsed.optout;
-
-                                                    if conn.tracking_rx.is_none() {
-                                                        let (tx, rx) = channel::mpsc_bounded::<Frame>(256);
-                                                        conn.tracking_state.invalidation_tx = Some(tx.clone());
-                                                        conn.tracking_rx = Some(rx);
-
-                                                        let mut table = tracking_table.lock();
-                                                        table.register_client(client_id, tx);
-                                                        if let Some(target) = config_parsed.redirect {
-                                                            table.set_redirect(client_id, target);
-                                                        }
-                                                        for prefix in &config_parsed.prefixes {
-                                                            table.register_prefix(client_id, prefix.clone(), config_parsed.noloop);
-                                                        }
-                                                    }
-                                                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                                                } else {
-                                                    conn.tracking_state = TrackingState::default();
-                                                    tracking_table.lock().untrack_all(client_id);
-                                                    conn.tracking_rx = None;
-                                                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                                                }
-                                                continue;
-                                            }
-                                            Err(err_frame) => {
-                                                responses.push(err_frame);
-                                                continue;
-                                            }
-                                        }
+                                    // TRACKING, CACHING, TRACKINGINFO, GETREDIR:
+                                    // shared with the other two handlers (moon#1049).
+                                    if let Some(reply) = crate::tracking::client_cmd::handle(
+                                        cmd_args,
+                                        client_id,
+                                        &mut conn.tracking_state,
+                                        &mut conn.tracking_rx,
+                                        &tracking_table,
+                                    ) {
+                                        responses.push(reply);
+                                        continue;
                                     }
                                     if sub_bytes.eq_ignore_ascii_case(b"PAUSE") {
                                         // CLIENT PAUSE timeout [WRITE|ALL]
@@ -965,8 +957,14 @@ pub async fn handle_connection(
                                             // `b` — no single db context applies;
                                             // pass 0 (writer may emit a harmless
                                             // redundant SELECT 0).
-                                            pool.try_send_append_durable(0, lsn, 0, serialized.clone())
-                                                .await
+                                            pool.try_send_append_durable(
+                                                0,
+                                                lsn,
+                                                0,
+                                                serialized.clone(),
+                                                pool.fold_stamp(0),
+                                            )
+                                            .await
                                                 .is_ok()
                                         } else {
                                             true // persistence disabled — no durability requirement
@@ -1186,7 +1184,7 @@ pub async fn handle_connection(
                                 let mut guard = db[conn.selected_db].write();
                                 guard.refresh_now();
                                 let db_count = db.len();
-                                for (resp_idx, disp_frame, is_write, _aof_bytes) in dispatchable.drain(..) {
+                                for (resp_idx, disp_frame, is_write, _aof_bytes, _tracks) in dispatchable.drain(..) {
                                     #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
                                     let (d_cmd, d_args) = extract_command(&disp_frame).unwrap();
                                     if is_write {
@@ -1297,7 +1295,10 @@ pub async fn handle_connection(
                             for (_resp_idx, entry_db, bytes) in aof_entries.drain(..) {
                                 if let Some(ref pool) = aof_pool {
                                     let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                                    match pool.send_append_group(0, lsn, entry_db, bytes).await {
+                                    // Later than the batch's mutations at worst
+                                    // (see `flush_with_aof_ack`), never earlier.
+                                    let stamp = pool.fold_stamp(0);
+                                    match pool.send_append_group(0, lsn, entry_db, bytes, stamp).await {
                                         Ok(true) => aof_barrier_needed = true,
                                         Ok(false) => {}
                                         Err(_) => aof_write_failed = true,
@@ -1366,6 +1367,17 @@ pub async fn handle_connection(
                                     conn.pubsub_tx = Some(tx);
                                     conn.pubsub_rx = Some(rx);
                                 }
+                                // A subscribed connection can be a CLIENT
+                                // TRACKING REDIRECT target (moon#1048):
+                                // reachable before its `subscribe` reply.
+                                crate::tracking::client_cmd::sync_inbox(
+                                    &mut conn.tracking_inbox,
+                                    true,
+                                    framed.codec().protocol_version() >= 3,
+                                    conn.pubsub_tx.as_ref(),
+                                    client_id,
+                                    &tracking_table,
+                                );
                                 let is_pattern = cmd.eq_ignore_ascii_case(b"PSUBSCRIBE");
                                 for arg in cmd_args {
                                     if let Some(channel_or_pattern) = extract_bytes(arg) {
@@ -1558,21 +1570,22 @@ pub async fn handle_connection(
                                 // must invalidate tracked keys, same as the normal
                                 // write path (EXEC previously bypassed this, so a
                                 // SET/DEL/MSET inside MULTI left cached readers
-                                // stale). Self-gated on tracking_active().
+                                // stale). Reads inside it register their keys
+                                // too (moon#1049). Gated on tracking_active().
                                 if crate::tracking::tracking_active() {
                                     if let Frame::Array(ref txn_results) = result {
-                                        for (i, cmd_frame) in conn.command_queue.iter().enumerate() {
-                                            if i >= txn_results.len()
-                                                || matches!(txn_results[i], Frame::Error(_))
-                                            {
-                                                continue;
-                                            }
-                                            if let Some((c, a)) = extract_command(cmd_frame) {
-                                                crate::tracking::invalidation::invalidate_after_write(
-                                                    &tracking_table, c, a, client_id,
-                                                );
-                                            }
-                                        }
+                                        crate::tracking::invalidation::after_transaction(
+                                            &tracking_table,
+                                            &conn.command_queue,
+                                            txn_results,
+                                            client_id,
+                                            // This handler runs CLIENT above its
+                                            // MULTI gate (see `execute_transaction`),
+                                            // so no CLIENT command is queued and
+                                            // the modes at EXEC are the body's.
+                                            conn.tracking_state.modes(),
+                                            conn.tracking_state.enabled,
+                                        );
                                     }
                                 }
                                 // Auto-index HSETs from the transaction
@@ -2225,6 +2238,12 @@ pub async fn handle_connection(
                                     };
                                     let mut graph_aof_failed = false;
                                     let mut graph_barrier_needed = false;
+                                    // #455: read once, before any enqueue can
+                                    // park — no await since the graph mutation.
+                                    let fold_stamp = aof_pool.as_ref().map_or(
+                                        crate::persistence::aof::FoldEpoch::INITIAL,
+                                        |pool| pool.fold_stamp(0),
+                                    );
                                     for record in wal_records {
                                         if let Some(ref pool) = aof_pool {
                                             // Single-shard mode (shard_id = 0).
@@ -2235,7 +2254,13 @@ pub async fn handle_connection(
                                             let bytes = bytes::Bytes::from(record);
                                             let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
                                             match pool
-                                                .send_append_group(0, lsn, conn.selected_db, bytes)
+                                                .send_append_group(
+                                                    0,
+                                                    lsn,
+                                                    conn.selected_db,
+                                                    bytes,
+                                                    fold_stamp,
+                                                )
                                                 .await
                                             {
                                                 Ok(true) => graph_barrier_needed = true,
@@ -2290,7 +2315,12 @@ pub async fn handle_connection(
                             // Reserve a slot in responses for phase 2 to fill
                             let resp_idx = responses.len();
                             responses.push(Frame::Null); // placeholder
-                            dispatchable.push((resp_idx, frame, is_write, aof_bytes));
+                            // Whether this frame's reads are tracked is decided
+                            // NOW: phase 2 runs after every later frame's
+                            // `before_command`, which may already have consumed
+                            // a CLIENT CACHING flag meant for this one (moon#1049).
+                            let tracks = conn.tracking_state.tracks_reads();
+                            dispatchable.push((resp_idx, frame, is_write, aof_bytes, tracks));
                         }
                         None => {
                             responses.push(Frame::Error(Bytes::from_static(
@@ -2342,7 +2372,7 @@ pub async fn handle_connection(
                                     current_db = conn.selected_db;
                                     guard = db[current_db].read();
                                 }
-                                let (resp_idx, ref disp_frame, _, _) = dispatchable[j];
+                                let (resp_idx, ref disp_frame, _, _, tracks_reads) = dispatchable[j];
                                 #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
                                 let (d_cmd, d_args) = extract_command(disp_frame).unwrap();
 
@@ -2587,8 +2617,7 @@ pub async fn handle_connection(
                                 };
                                 // Track EVERY key of a successful read for
                                 // client-side caching invalidation.
-                                if conn.tracking_state.enabled
-                                    && !conn.tracking_state.bcast
+                                if tracks_reads
                                     && !matches!(response, Frame::Error(_))
                                 {
                                     crate::tracking::invalidation::track_read_keys(
@@ -2622,7 +2651,7 @@ pub async fn handle_connection(
                                     guard = db[current_db].write();
                                     guard.refresh_now();
                                 }
-                                let (resp_idx, ref disp_frame, _, ref aof_bytes) = dispatchable[j];
+                                let (resp_idx, ref disp_frame, _, ref aof_bytes, _) = dispatchable[j];
                                 #[allow(clippy::unwrap_used)] // Frame was parsed earlier; extract_command succeeds on valid frames
                                 let (d_cmd, d_args) = extract_command(disp_frame).unwrap();
                                 let rt = runtime_config.read();
@@ -3127,7 +3156,10 @@ pub async fn handle_connection(
                     for (_, entry_db, bytes) in aof_entries {
                         if let Some(ref pool) = aof_pool {
                             let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                            let _ = pool.try_send_append_durable(0, lsn, entry_db, bytes).await;
+                            let stamp = pool.fold_stamp(0);
+                            let _ = pool
+                                .try_send_append_durable(0, lsn, entry_db, bytes, stamp)
+                                .await;
                         }
                         if let Some(ref counter) = change_counter {
                             counter.fetch_add(1, Ordering::Relaxed);
@@ -3158,7 +3190,12 @@ pub async fn handle_connection(
                     std::future::pending().await
                 }
             } => {
-                if let Some(push_frame) = msg {
+                // A RESP2 connection cannot carry a push (the codec would
+                // flatten it into a reply-shaped array); redis writes it
+                // nothing.
+                if let Some(push_frame) = msg.filter(|_| {
+                    crate::tracking::client_cmd::push_deliverable(framed.codec().protocol_version())
+                }) {
                     if !send_bounded!(framed, push_frame, write_timeout, client_id) {
                         break;
                     }
