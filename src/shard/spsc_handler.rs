@@ -262,12 +262,34 @@ pub(crate) fn drain_spsc_shared(
     };
 
     let mut snapshot_seen = false;
+    // moon#769: routed write legs are admitted against this shard's AOF
+    // writer BEFORE they are popped, so before they apply anything. A leg the
+    // writer cannot take yet stays at the head of its ring (its producer's
+    // FIFO) and this ring is left for the next drain; nothing here waits. See
+    // `shard::aof_admission` for the ordering and accounting argument.
+    let mut admission =
+        aof_pool.map(|pool| crate::shard::aof_admission::AdmissionCycle::new(pool, shard_id));
     for idx in rotated_indices(start, n) {
         let consumer = &mut consumers[idx];
         if snapshot_seen {
             break;
         }
         while drained < MAX_DRAIN_PER_CYCLE {
+            if let Some(cycle) = admission.as_mut()
+                && let Some(head) = consumer.first()
+            {
+                match cycle.decide(idx, head) {
+                    crate::shard::aof_admission::Admission::Admit => {}
+                    crate::shard::aof_admission::Admission::Wait => break,
+                    crate::shard::aof_admission::Admission::Refuse => {
+                        if let Some(msg) = consumer.try_pop() {
+                            drained += 1;
+                            crate::shard::aof_admission::refuse_routed_leg(msg);
+                        }
+                        continue;
+                    }
+                }
+            }
             match consumer.try_pop() {
                 Some(msg) => {
                     drained += 1;
@@ -5468,3 +5490,6 @@ mod drain_rotation_tests {
         assert_eq!(rotated_indices(0, 0).count(), 0);
     }
 }
+
+#[cfg(test)]
+mod aof_admission_tests;

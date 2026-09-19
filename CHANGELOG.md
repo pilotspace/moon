@@ -243,6 +243,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     kills a duplicate of the current copy that way), a segment holding the
     dead duplicate could claim the key first and the live copy in another
     segment was then tombstoned, losing the document. Only live rows count now.
+
+- **A slow `everysec` fsync no longer makes a multi-shard server answer
+  "write applied in memory but not queued for persistence"** (moon#769).
+  - **Before.** At `--shards > 1` a write to a key another shard owns runs
+    on that shard, and the shard applied it first and only then waited 5 ms
+    for room in its AOF writer's 10k channel. A writer stalled on a slow
+    fsync fills that channel quickly under pipelined load, so such writes were
+    refused after they were already in memory, and their records never reached
+    the AOF. Redis and Valkey complete the same `redis-benchmark -P 16`
+    workload. The write leg on the connection's own shard already waited up to
+    `--aof-fsync-timeout-ms` (2 s by default).
+  - **Now.** Before a routed write runs, its shard checks that the AOF writer
+    has room for the write's records. The shard thread never waits for it: a
+    write that finds no room stays queued, unapplied, at the head of the queue
+    from the shard that sent it, and is retried on every loop tick, while
+    reads, local connections and the other shards' queues keep flowing. Later
+    commands from the same sending shard wait behind it, so nothing overtakes
+    an earlier write. A stall shorter than `--aof-fsync-timeout-ms` (2 s by
+    default; `0` means 10 s here, and the wait never exceeds 10 s) is
+    absorbed. A write still without room after that is refused **without
+    being applied**, with `-MOONERR AOF backpressure: command not executed,
+    the AOF writer is stalled; retry`, and while the writer stays stalled the
+    next routed writes are refused at once instead of each waiting again. The
+    keyspace, the AOF and the replicas keep agreeing, and the client can
+    retry.
+  - A multi-shard `MSET`, `DEL` or `UNLINK` whose part on a stalled shard is
+    refused while its other parts ran answers `-MOONERR AOF backpressure:
+    command partially executed; ...` instead, because it was not "not
+    executed". A multi-shard `FLUSHALL`/`FLUSHDB` keeps its existing
+    `MOONERR FLUSH partial` reply.
+  - The check applies under every `appendfsync` policy (`always`,
+    `everysec`, `no`): it is about room in the writer's channel, which all
+    three use. Admission reserves room for every write it lets through in
+    the same loop pass, plus 256 spare records for what it cannot count in
+    advance (eviction deletes, a script's extra writes, other shards' fsync
+    barriers). A single write that needs more than that spare can still meet
+    a full channel after it applied and get the existing fail-loud error.
+  - While a rewrite is folding, writes spill to the rewrite overflow instead
+    of waiting. The script-load fan-out budget grows by the admission wait,
+    so a slow disk is not reported as a divergent shard.
+  - `INFO persistence` gains `aof_backpressure_stalls` (routed writes that
+    waited) and `aof_backpressure_refused` (commands refused unapplied).
+  - The write leg on the connection's own shard is unchanged. It still
+    applies the write, waits up to the bound on its connection task, and
+    then reports `ERR AOF fsync failed; write not durable`.
+
+- **`ZRANGESTORE` checks its range before it looks up the source** (moon#1102),
+  the `ZRANGESTORE` sibling of moon#1060. A malformed rank, `BYSCORE` or
+  `BYLEX` bound against a missing source answered `:0` and deleted the
+  destination; against a source of another type it answered `WRONGTYPE`.
+  Redis parses the range first, so both now answer its parse error
+  (`min or max is not a float`, `min or max not valid string range item` or
+  `value is not an integer or out of range`), with or without `REV` and
+  `LIMIT`, and the destination is left alone.
+
+- **A `WAIT` queued inside `MULTI` no longer holds `EXEC` for its timeout**
+  (moon#1098). Redis runs a transaction body with `CLIENT_DENY_BLOCKING`, so a
+  queued `WAIT` answers the current replica ack count at once. Moon filled it
+  with the live `WAIT`, which polled until its deadline:
+  `MULTI / INCR k / WAIT 1 1500 / EXEC` answered after 1.5 s instead of at
+  once, and `WAIT 1 0` inside `MULTI` never answered. The reply is still the
+  number of replicas that have acknowledged the master's current offset, now
+  sampled once, on both runtimes and on the local and owner-routed `EXEC`
+  paths. A `WAIT` outside `MULTI` still blocks as before. (`WAITAOF` is not
+  implemented, so it has no queued form to fix.)
+
+- **The disk-offload checkpoint only publishes a redo point over heap pages it
+  has made durable** (moon#452 item 3). The fuzzy checkpoint pwrote dirty heap
+  pages and never fsynced a heap file, then published `redo_lsn` in the control
+  file and recycled every WAL segment below it — FullPageImages included. A
+  power loss after that recycle could roll a page back with nothing left in the
+  WAL to redo it. Four changes close the protocol:
+  - Finalize fsyncs every heap file the flush wrote before it writes the WAL
+    checkpoint record. The fsync runs on a helper thread and the shard thread
+    never waits for it: each tick polls the helper without blocking, and a
+    shard has at most one helper outstanding, so a hung disk leaves one stuck
+    thread rather than one per retry. Only the shutdown checkpoint, which
+    serves no clients any more, waits for that one helper, for at most
+    `WAIT_DURABLE_TIMEOUT` counted from the helper's start. The WAL-ceiling
+    checkpoint runs while the shard serves clients, so it never waits: it
+    leaves a pending fsync to the periodic tick, and its emergency recycle
+    cuts only below the redo point already published. A failed control-file
+    write no longer leaves the unpublished redo point in memory, where that
+    recycle would have cut below it. If a file cannot be opened, Finalize
+    retries with backoff. If an fsync returns an error, the shard never
+    publishes a redo point again, because a retried fsync can report success
+    for pages the kernel already dropped. The WAL above the last good redo
+    point is kept, and recovery replays from there.
+  - A heap file that no longer exists does not hold the redo point back. The
+    cold-tier GC unlinks a file once its last live key is gone, and only then;
+    nothing references it and no fsync can reach the unlinked inode. So the
+    checkpoint stops waiting on it, drops its pages from the dirty set, counts
+    it and logs it at debug. If the manifest still lists the file as live,
+    something other than the GC removed it: that is counted separately and
+    logged as an error. Without this, every Finalize failed on `NotFound` and
+    the WAL grew until the disk was full.
+  - Log before data, one WAL wait per batch: the flush appends the
+    FullPageImage of every page in the batch, waits once for the WAL to be
+    durable through the batch's highest LSN, and only then overwrites the
+    pages in place. The flush used to collect every image and append them
+    only after the whole batch had been pwritten, into the WAL writer's memory
+    buffer. A crash during the pwrite left a torn page and no image of it
+    anywhere.
+  - A page that fails any flush step (its image, the WAL wait, or its write)
+    makes the checkpoint flush again, keeping its redo point. Before, the page
+    was counted as flushed and the checkpoint finalized over a change that was
+    on disk in neither the heap nor the WAL.
+
+  No production path marks a heap page dirty today (`PageCache::mark_dirty`
+  has no callers outside tests), so this closes the hazard before the first
+  in-place cold-page write can reach it. Pinned by the tests in
+  `shard::persistence_tick::checkpoint_tick_tests`,
+  `persistence::data_file_sync` and `persistence::page_cache`.
+
 - **An AOF rewrite no longer replays a write twice, and a rewrite that fails
   late no longer leaves the writer appending to a deleted file** (moon#455).
   - **Double apply.** A rewrite split the append stream by position: whatever
