@@ -672,6 +672,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both the listpack and B+tree arms, which carried separate copies.
 ### Security
 
+- **`rustls` bumped past RUSTSEC-2026-0285 / GHSA-2mjx-qc3c-rqvc** ("TLS 1.3
+  handshake messages incorrectly accepted across encryption level
+  boundaries"), 0.23.44 → 0.23.45 in `Cargo.lock` (and 0.23.37 → 0.23.45 in
+  `fuzz/Cargo.lock`, which was independently behind). moon's TLS path uses
+  rustls directly and through the vendored `vendor/monoio-rustls`, whose
+  `Cargo.toml` already declared `rustls = "~0.23.4"` — wide enough to admit
+  the patched release without a manifest change. `cargo audit` and
+  `cargo deny check advisories licenses bans sources` are clean on
+  `Cargo.lock`, and both TLS integration suites
+  (`tests/tls_idle_downshift_parity.rs`, `tests/tls_park_keyupdate.rs` — 4
+  tests) pass against a fresh binary on both the monoio and
+  `runtime-tokio,jemalloc` builds. `cargo audit`'s own `.cargo/audit.toml`
+  ignore for RUSTSEC-2026-0097 (rand < 0.9.3, aka GHSA-cq8v-f236-94qc — the
+  same advisory as the `rand` Dependabot alert below) is now moot since
+  `rand` is 0.9.3+ in `Cargo.lock`, so it was removed rather than left as
+  stale documentation. Also picked up while re-locking: the yanked
+  `chacha20` 0.10.0 (pulled in transitively via `rand`) to 0.10.2, in both
+  `Cargo.lock` and `fuzz/Cargo.lock`.
+
 - **Dependabot alerts on `console/pnpm-lock.yaml`, `Cargo.lock` and
   `fuzz/Cargo.lock` cleared with minimal, scoped bumps.** `js-yaml` (4.3.0 →
   4.3.2, GHSA-2883-xcg3-v3hh / GHSA-5p4m-2wfm-xmqj), `baseline-browser-mapping`
