@@ -1852,5 +1852,4 @@ mod fold_tests {
 }
 
 #[cfg(test)]
-#[path = "rewrite/flat_file_fold_tests.rs"]
 mod flat_file_fold_tests;
