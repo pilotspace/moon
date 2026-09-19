@@ -82,7 +82,7 @@ fn crash_manifest_gc_before_commit_recovers_pre_staging_root() {
     m.commit().unwrap(); // epoch 2 on Root B (active_slot = 1)
 
     // Tombstone file #2 and commit — epoch 3 on Root A (active_slot = 0).
-    m.remove_file(2);
+    m.remove_file(2, PageType::KvLeaf);
     m.commit().unwrap(); // epoch 3 holds the tombstone
 
     // Capture the pre-staging state for assertions after simulated crash.

@@ -74,6 +74,7 @@ while [[ $# -gt 0 ]]; do
             echo "  key          - Key commands (DEL, EXISTS, EXPIRE, TTL, RENAME, etc.)"
             echo "  stream       - Stream commands (XADD, XREAD, XRANGE, XGROUP, etc.)"
             echo "  connection   - Connection commands (PING, ECHO, SELECT, INFO, etc.)"
+            echo "  acl          - ACL SETUSER grammar, credentials, key selectors (moon#970/#979/#999)"
             echo "  pubsub       - Pub/Sub commands (SUBSCRIBE, PUBLISH, etc.)"
             echo "  transaction  - Transaction commands (MULTI, EXEC, DISCARD)"
             echo "  scripting    - Lua scripting (EVAL, EVALSHA)"
@@ -1376,6 +1377,141 @@ if should_run "connection"; then
     fi
     mcli SET dg:probe v1 >/dev/null 2>&1
     assert_moon "DEBUG DIGEST returns to its earlier value" "$DG_ONE" DEBUG DIGEST
+
+    # moon#1015: REPLICAOF NO ONE answers like Redis at any shard count. A
+    # replica START is only probed at --shards > 1, where it must be REFUSED
+    # (multi-shard replicas are moon#406) and leave a writable master; at
+    # --shards 1 it would succeed and full-sync this node from the oracle.
+    assert_match "REPLICAOF NO ONE"    REPLICAOF NO ONE
+    if [[ "$SHARDS" -gt 1 ]]; then
+        assert_moon_contains "moon#1015 REPLICAOF refused at shards>1" \
+            "requires --shards 1" REPLICAOF 127.0.0.1 "$PORT_REDIS"
+        assert_moon_contains "moon#1015 refused REPLICAOF keeps role:master" \
+            "role:master" INFO replication
+        assert_moon "moon#1015 refused REPLICAOF keeps the node writable" "OK" SET moon1015:w v
+    fi
+fi
+
+# ===========================================================================
+# ACL (moon#970 / moon#979 / moon#999)
+# ===========================================================================
+#
+# Users are named `tc:acl:*` and keys `tc:acl:*`; the block removes them again.
+#
+# AUTH rows go through ONE connection per server (`acl_session`, stdin mode)
+# and keep stderr, so the AUTH reply itself is compared. `rcli`/`mcli` would be
+# vacuous here: `redis-cli --user u --pass wrong PING` reports the failed AUTH
+# on STDERR (which they discard) and then runs PING as `default`, so a server
+# that wrongly ACCEPTED the password and one that refused it would both print
+# PONG.
+
+if should_run "acl"; then
+    echo ""
+    echo "=== ACL COMMANDS ==="
+
+    acl_session() {
+        local port="$1"; shift
+        printf '%s\n' "$@" | redis-cli -p "$port" 2>&1 || true
+    }
+    assert_acl_session() {
+        local desc="$1"; shift
+        TOTAL=$((TOTAL + 1))
+        local r m
+        r=$(acl_session "$PORT_REDIS" "$@")
+        m=$(acl_session "$PORT_RUST" "$@")
+        if [[ "$r" == "$m" ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: $desc"
+            echo "    REDIS: $(echo "$r" | head -3 | tr '\n' '|')"
+            echo "    MOON:  $(echo "$m" | head -3 | tr '\n' '|')"
+        fi
+    }
+    # One field of ACL GETUSER (`keys`, `channels`, `commands`) on both servers.
+    # The ACL LIST line itself is not comparable: redis adds `sanitize-payload`
+    # and `resetchannels`, which moon does not emit.
+    acl_field() {
+        redis-cli -p "$1" ACL GETUSER "$2" 2>&1 | tr -d '\r' \
+            | awk -v f="$3" 'g { print; exit } $0 == f { g = 1 }' || true
+    }
+    assert_acl_field() {
+        local desc="$1" user="$2" field="$3"
+        TOTAL=$((TOTAL + 1))
+        local r m
+        r=$(acl_field "$PORT_REDIS" "$user" "$field")
+        m=$(acl_field "$PORT_RUST" "$user" "$field")
+        if [[ "$r" == "$m" ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: $desc"
+            echo "    REDIS: $r"
+            echo "    MOON:  $m"
+        fi
+    }
+    acl_both() { rcli "$@" >/dev/null; mcli "$@" >/dev/null; }
+
+    # --- #970: allkeys / allcommands / allchannels were dropped with +OK ----
+    acl_both ACL DELUSER tc:acl:a
+    assert_match "ACL SETUSER allkeys allcommands allchannels" \
+        ACL SETUSER tc:acl:a on '>pw' allkeys allcommands allchannels
+    assert_acl_field "allkeys renders as ~*"      tc:acl:a keys
+    assert_acl_field "allchannels renders as &*"  tc:acl:a channels
+    assert_acl_field "allcommands renders +@all"  tc:acl:a commands
+    assert_acl_session "allkeys+allcommands: the user can SET" \
+        "AUTH tc:acl:a pw" "SET tc:acl:k v"
+    # `~a allkeys` REPLACES the list on redis (renders `~*`, not `~a ~*`).
+    acl_both ACL DELUSER tc:acl:a
+    assert_match "ACL SETUSER ~a %R~b allkeys" \
+        ACL SETUSER tc:acl:a on '>pw' '~tc:acl:x' '%R~tc:acl:y' allkeys +@all
+    assert_acl_field "allkeys replaces earlier patterns" tc:acl:a keys
+
+    # --- #970: %RW~ / lowercase %r~ / %W~ key selectors ------------------------
+    acl_both ACL DELUSER tc:acl:s
+    assert_match "ACL SETUSER %RW~ %r~ %W~" \
+        ACL SETUSER tc:acl:s on '>pw' '%RW~tc:acl:rw*' '%r~tc:acl:r*' '%W~tc:acl:w*' +@all
+    assert_acl_field "key selectors render as redis does" tc:acl:s keys
+    assert_acl_session "%RW~ grants GET" "AUTH tc:acl:s pw" "GET tc:acl:rw1"
+    assert_acl_session "%r~ grants GET"  "AUTH tc:acl:s pw" "GET tc:acl:r1"
+
+    # --- #970/#979: unknown tokens are errors, and create nothing -------------
+    acl_both ACL DELUSER tc:acl:bad
+    # `éx`: a multi-byte first character must be a syntax error, not a crash.
+    for acl_tok in totalnonsense nocommand '%X~k' '+bogus' '#ABC' 'éx'; do
+        assert_match "ACL SETUSER rejects '$acl_tok'" \
+            ACL SETUSER tc:acl:bad on '>pw' "$acl_tok"
+    done
+    assert_match "a rejected ACL SETUSER creates no user" ACL GETUSER tc:acl:bad
+
+    # --- #979: restricting keywords were dropped with +OK ---------------------
+    acl_both ACL DELUSER tc:acl:n
+    acl_both ACL SETUSER tc:acl:n on '>pw' '~*' '&*' +@all
+    assert_match "ACL SETUSER nocommands" ACL SETUSER tc:acl:n nocommands
+    assert_acl_session "nocommands denies PING" "AUTH tc:acl:n pw" "PING"
+    acl_both ACL SETUSER tc:acl:n '>pw' '~*' '&*' +@all
+    assert_match "ACL SETUSER OFF (upper case)" ACL SETUSER tc:acl:n OFF
+    assert_acl_session "OFF refuses AUTH" "AUTH tc:acl:n pw"
+
+    # --- #999: credential fail-open --------------------------------------------
+    acl_both ACL DELUSER tc:acl:p
+    acl_both ACL SETUSER tc:acl:p on nopass '~*' +@all
+    assert_match "ACL SETUSER >pw on a nopass user" ACL SETUSER tc:acl:p '>pw'
+    assert_acl_session ">pw clears nopass: a wrong password is refused" \
+        "AUTH tc:acl:p wrong"
+    assert_acl_session ">pw clears nopass: HELLO AUTH with a wrong password" \
+        "HELLO 3 AUTH tc:acl:p wrong"
+    assert_acl_session ">pw clears nopass: the password works" "AUTH tc:acl:p pw"
+    acl_both ACL DELUSER tc:acl:p
+    acl_both ACL SETUSER tc:acl:p on '>oldpw' '~*' +@all
+    assert_match "ACL SETUSER nopass >newpw (rotation)" \
+        ACL SETUSER tc:acl:p nopass '>newpw'
+    assert_acl_session "nopass drops old hashes: the rotated-out password is refused" \
+        "AUTH tc:acl:p oldpw"
+    assert_acl_session "rotation: the new password works" "AUTH tc:acl:p newpw"
+
+    acl_both ACL DELUSER tc:acl:a tc:acl:s tc:acl:bad tc:acl:n tc:acl:p
+    acl_both DEL tc:acl:k
 fi
 
 # ===========================================================================
@@ -1891,6 +2027,19 @@ if should_run "blocking"; then
     # moon#570: `{blk}` co-locates the pair -- see the LMOVE row above.
     rcli RPUSH {blk}:src x y z >/dev/null 2>&1; mcli RPUSH {blk}:src x y z >/dev/null 2>&1
     assert_match "BLMOVE (ready)"      BLMOVE {blk}:src {blk}:dst LEFT RIGHT 1
+
+    # moon#989: a multi-key blocking pop serves from the FIRST non-empty key,
+    # exactly once. The reply alone cannot show a SECOND key losing an element
+    # (moon answered correctly while destroying it), so each row is followed by
+    # a read of the key it must not touch. `{blk}` co-locates the three keys.
+    rcli RPUSH {blk}:mp2 B1 B2 >/dev/null 2>&1; mcli RPUSH {blk}:mp2 B1 B2 >/dev/null 2>&1
+    rcli RPUSH {blk}:mp3 C1 C2 >/dev/null 2>&1; mcli RPUSH {blk}:mp3 C1 C2 >/dev/null 2>&1
+    assert_match "BLMPOP (ready, 3 co-located keys)" BLMPOP 1 3 {blk}:mp1 {blk}:mp2 {blk}:mp3 LEFT
+    assert_match "BLMPOP left the later key untouched" LRANGE {blk}:mp3 0 -1
+    rcli ZADD {blk}:zp2 1 B1 2 B2 >/dev/null 2>&1; mcli ZADD {blk}:zp2 1 B1 2 B2 >/dev/null 2>&1
+    rcli ZADD {blk}:zp3 1 C1 2 C2 >/dev/null 2>&1; mcli ZADD {blk}:zp3 1 C1 2 C2 >/dev/null 2>&1
+    assert_match "BZMPOP (ready, 3 co-located keys)" BZMPOP 1 3 {blk}:zp1 {blk}:zp2 {blk}:zp3 MIN
+    assert_match "BZMPOP left the later key untouched" ZRANGE {blk}:zp3 0 -1 WITHSCORES
 fi
 
 # ===========================================================================

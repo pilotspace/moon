@@ -2038,6 +2038,32 @@ else
 fi
 redis-cli -p "$PORT_RUST" -n 9 FLUSHDB &>/dev/null || true
 
+# ---------------------------------------------------------------------------
+# moon#1015: a multi-shard node refuses REPLICAOF instead of acking it
+# ---------------------------------------------------------------------------
+#
+# moon-only at --shards > 1: Redis has no shards, and multi-shard replicas are
+# moon#406. Pre-fix the reply was `OK`, the node went read-only (`role:slave`),
+# and it never synced. The refusal must leave the node a writable master.
+#
+# Not run at --shards 1: there REPLICAOF is SUPPOSED to succeed, and pointing
+# this node at the oracle would full-sync it from Redis mid-script.
+# `REPLICAOF NO ONE` is compared against Redis at every shard count.
+assert_both "moon#1015 REPLICAOF NO ONE (shards=$SHARDS)" REPLICAOF NO ONE
+if [[ "$SHARDS" -gt 1 ]]; then
+    ro_reply=$(redis-cli -p "$PORT_RUST" REPLICAOF 127.0.0.1 "$PORT_REDIS" 2>&1) || true
+    if [[ "$ro_reply" == *"--shards 1"*"406"* ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: moon#1015 REPLICAOF refused at shards=$SHARDS"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: moon#1015 REPLICAOF at shards=$SHARDS answered '$ro_reply', want the --shards 1 refusal"
+    fi
+    ro_role=$(redis-cli -p "$PORT_RUST" INFO replication 2>&1 | tr -d '\r' | grep '^role:') || true
+    assert_eq "moon#1015 refused REPLICAOF leaves role:master (shards=$SHARDS)" "role:master" "$ro_role"
+    assert_eq "moon#1015 refused REPLICAOF leaves the node writable (shards=$SHARDS)" "OK" \
+        "$(redis-cli -p "$PORT_RUST" SET moon1015:w v 2>&1)"
+    redis-cli -p "$PORT_RUST" DEL moon1015:w &>/dev/null || true
+fi
+
 # moon#865 -- one command carrying more elements than a listpack's u16 element
 # count can hold. Pre-fix, RPUSH of 70k elements left LLEN reporting 4464
 # (70000 - 65536) and the server had already replied +OK-equivalent. Redis is
@@ -2161,7 +2187,7 @@ mk_norm() {
 # wrong-key pop cannot happen.
 route_probe_multi() {
     local mode="$1" label="$2" n="$3" seeds="$4" probe="$5" check="${6:-}"
-    local i j port s p r m before="" after=""
+    local i j port s p r m before="" after="" after_redis=""
     local wrong=0 refused=0
     local -a keys seedv sv pv
     for i in $(seq 1 "$MK_TRIALS"); do
@@ -2198,6 +2224,7 @@ route_probe_multi() {
         m="$(mk_norm "$(redis-cli -p "$PORT_RUST"  "${pv[@]}" 2>&1)")"
         if [[ -n "$check" ]]; then
             after="$(mk_state "$PORT_RUST" "$check" "${keys[@]}")"
+            after_redis="$(mk_state "$PORT_REDIS" "$check" "${keys[@]}")"
         fi
         # A SUBSTRING test, not an anchored `case` pattern. The reply may carry
         # a leading blank line (see `mk_norm`), and an anchored pattern that
@@ -2218,6 +2245,12 @@ route_probe_multi() {
             fi
         elif [[ "$r" != "$m" ]]; then
             echo "  FAIL detail: ${label}[$i] ($mode) answered '$m'; redis says '$r'"
+            wrong=$((wrong + 1))
+        elif [[ -n "$check" && "$after" != "$after_redis" ]]; then
+            # moon#989: the RIGHT reply is not enough. BLMPOP answered exactly
+            # like redis while popping a second key it never named, and only
+            # the keyspace after the probe could show it.
+            echo "  FAIL detail: ${label}[$i] ($mode) answered like redis but the keyspace differs: moon '$after' vs redis '$after_redis'"
             wrong=$((wrong + 1))
         fi
     done
@@ -2247,9 +2280,33 @@ MK_ROWS=(
   "touch|3|SET %K v|SET %K v|SET %K v|TOUCH %K1 %K2 %K3|GET %K"
   "lmpop|3||RPUSH %K B1 B2|RPUSH %K C1 C2|LMPOP 3 %K1 %K2 %K3 LEFT|LRANGE %K 0 -1"
   "zmpop|3||ZADD %K 1 B1 2 B2|ZADD %K 1 C1 2 C2|ZMPOP 3 %K1 %K2 %K3 MIN|ZRANGE %K 0 -1"
+  # moon#989: the blocking twins. Data is seeded, so neither blocks -- the
+  # 0.1s timeout only bounds a regression that would. `colo` is the row that
+  # caught the defect: the reply matched redis while a second co-located key
+  # lost its head element, visible only through the per-key check.
+  "blmpop|3||RPUSH %K B1 B2|RPUSH %K C1 C2|BLMPOP 0.1 3 %K1 %K2 %K3 LEFT|LRANGE %K 0 -1"
+  "bzmpop|3||ZADD %K 1 B1 2 B2|ZADD %K 1 C1 2 C2|BZMPOP 0.1 3 %K1 %K2 %K3 MIN|ZRANGE %K 0 -1"
 )
 
-for mk_row in "${MK_ROWS[@]}"; do
+# moon#989: the rest of the multi-key blocking-pop family, CO-LOCATED only.
+# They shared BLMPOP's double-pop and are fixed with it, so `colo` must agree
+# with redis byte for byte. Their SPANNING placement is still a known defect
+# (two owner shards can each serve the same waiter) and is deliberately not
+# refused yet -- that is a behaviour decision tracked as moon#1019, so a
+# `span` row here would only assert the bug.
+MK_COLO_ONLY_ROWS=(
+  "blpop|3||RPUSH %K B1 B2|RPUSH %K C1 C2|BLPOP %K1 %K2 %K3 0.1|LRANGE %K 0 -1"
+  "brpop|3||RPUSH %K B1 B2|RPUSH %K C1 C2|BRPOP %K1 %K2 %K3 0.1|LRANGE %K 0 -1"
+  "bzpopmin|3||ZADD %K 1 B1 2 B2|ZADD %K 1 C1 2 C2|BZPOPMIN %K1 %K2 %K3 0.1|ZRANGE %K 0 -1"
+  "bzpopmax|3||ZADD %K 1 B1 2 B2|ZADD %K 1 C1 2 C2|BZPOPMAX %K1 %K2 %K3 0.1|ZRANGE %K 0 -1"
+)
+
+for mk_row in "${MK_ROWS[@]}" "${MK_COLO_ONLY_ROWS[@]/#/colo-only:}"; do
+    mk_modes="span colo"
+    if [[ "$mk_row" == colo-only:* ]]; then
+        mk_modes="colo"
+        mk_row="${mk_row#colo-only:}"
+    fi
     IFS='|' read -r -a mk_f <<<"$mk_row"
     mk_label="${mk_f[0]}"; mk_n="${mk_f[1]}"
     # fields 2..(2+n-1) are the per-key seeds, then the probe, then the check
@@ -2260,8 +2317,9 @@ for mk_row in "${MK_ROWS[@]}"; do
     mk_seeds="${mk_seeds%|}"
     mk_probe="${mk_f[$((2 + mk_n))]}"
     mk_check="${mk_f[$((3 + mk_n))]:-}"
-    route_probe_multi span "$mk_label" "$mk_n" "$mk_seeds" "$mk_probe" "$mk_check"
-    route_probe_multi colo "$mk_label" "$mk_n" "$mk_seeds" "$mk_probe" "$mk_check"
+    for mk_mode in $mk_modes; do
+        route_probe_multi "$mk_mode" "$mk_label" "$mk_n" "$mk_seeds" "$mk_probe" "$mk_check"
+    done
 done
 
 # Non-vacuity. At --shards>1 the span sweep MUST have reached the cross-shard
@@ -2281,7 +2339,7 @@ assert_eq "moon#962 TOUCH is never refused (shards=$SHARDS)" "0" "$MK_TOUCH_REFU
 
 # Tidy up by exact name -- `--scan | xargs -r` is GNU-only and this script runs
 # on macOS too.
-for mk_row in "${MK_ROWS[@]}"; do
+for mk_row in "${MK_ROWS[@]}" "${MK_COLO_ONLY_ROWS[@]}"; do
     IFS='|' read -r -a mk_f <<<"$mk_row"
     for mk_i in $(seq 1 "$MK_TRIALS"); do
         for mk_j in $(seq 1 "${mk_f[1]}"); do
@@ -4466,16 +4524,9 @@ assert_acl_probe() {
 }
 
 # assert_acl_both_denied <desc> <cmd>...  -- both servers must refuse, without
-# requiring identical text.
-#
-# For a CONTAINER command redis names the subcommand it refused
-# (`... to run the 'client|list' command`) because its ACL is per subcommand;
-# moon's permission check only ever sees the bare container, so it names
-# `'client'`. Both DENY -- only the noun differs -- so comparing the strings
-# would fail on a difference that is not a permission difference. Asserting
-# "denied on both" keeps the security property under test without pinning a
-# message moon cannot produce. Per-subcommand matching is tracked separately;
-# when it lands these rows can go back to `assert_acl_probe`.
+# requiring identical text. Used where moon words a key or channel NOPERM
+# differently from redis; a container command's NOPERM now names the same
+# `cmd|sub` redis does, so those rows use `assert_acl_probe`.
 assert_acl_both_denied() {
     local desc="$1"; shift
     local r m
@@ -4584,7 +4635,7 @@ assert_acl_probe "#980 +@read allows SORT_RO" SORT_RO n978:lst ALPHA
 acl_reset_user
 both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all -@dangerous
 assert_acl_probe "#980 -@dangerous denies SWAPDB"      SWAPDB 0 1
-assert_acl_both_denied "#980 -@dangerous denies CLIENT LIST" CLIENT LIST
+assert_acl_probe "#980 -@dangerous denies CLIENT LIST" CLIENT LIST
 assert_acl_probe "#980 -@dangerous denies KEYS"        KEYS 'n978:*'
 assert_acl_probe "#980 -@dangerous denies FLUSHALL"    FLUSHALL
 assert_acl_probe "#980 -@dangerous still allows GET"   GET n978:vic
@@ -4604,6 +4655,36 @@ acl_reset_user
 both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all -get
 assert_acl_probe "#971 +@all -get: GET denied"  GET n978:vic
 assert_acl_probe "#971 +@all -get: SET allowed" SET n978:pol 1
+acl_reset_user
+
+# --- per-subcommand and first-arg rules (`-cmd|sub`, `+cmd|sub`) ----------
+# The check used to probe only the bare command name: `+@all -config|set`
+# answered +OK and CONFIG SET still ran. Last rule wins per subcommand, as in
+# redis; the NOPERM names `config|set`, so the whole reply is compared.
+# CONFIG SET writes maxmemory-samples 5, the default on both servers.
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all '-config|set'
+assert_acl_probe "subcmd +@all -config|set: CONFIG SET denied" CONFIG SET maxmemory-samples 5
+assert_acl_probe "subcmd +@all -config|set: config set denied" config set maxmemory-samples 5
+assert_acl_probe "subcmd +@all -config|set: CONFIG GET allowed" CONFIG GET maxmemory-samples
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' -@all '+config|get' '-config|set'
+assert_acl_probe "subcmd -@all +config|get: CONFIG GET allowed" CONFIG GET maxmemory-samples
+assert_acl_probe "subcmd -@all +config|get: CONFIG SET denied" CONFIG SET maxmemory-samples 5
+assert_acl_probe "subcmd -@all +config|get: CONFIG RESETSTAT denied" CONFIG RESETSTAT
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all -config '+config|get'
+assert_acl_probe "subcmd -config +config|get: CONFIG GET allowed" CONFIG GET maxmemory-samples
+assert_acl_probe "subcmd -config +config|get: CONFIG SET denied" CONFIG SET maxmemory-samples 5
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all '-config|set' +@admin
+assert_acl_probe "subcmd -config|set +@admin: CONFIG SET allowed" CONFIG SET maxmemory-samples 5
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' -@all '+config|get' -@admin
+assert_acl_probe "subcmd +config|get -@admin: CONFIG GET denied" CONFIG GET maxmemory-samples
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' -@all '+select|0'
+assert_acl_probe "first-arg +select|0: SELECT 0 allowed" SELECT 0
+assert_acl_probe "first-arg +select|0: SELECT 1 denied" SELECT 1
 acl_reset_user
 
 # ---------------------------------------------------------------------------
@@ -4718,6 +4799,235 @@ done
 acl_reset_user
 both DEL n978:k n978:vic n978:lst n978:dst n978:pol
 # END acl-category-section -- moon#978/#980
+
+# ===========================================================================
+# BEGIN acl-rule-token-section -- moon#979. Self-contained: reuses the
+# `acl_*` helpers from the #978 section above, touches only users named
+# `n979:*` and keys/channels prefixed `n979:`, and deletes them again.
+# Append new rows INSIDE the markers.
+#
+#   #979  The rule parser matched lowercase literals and ended in `_ => {}`,
+#         so `nocommands`, `OFF`, `RESET`, `RESETKEYS` and every uppercase
+#         token answered +OK and changed NOTHING -- an operator revoking a
+#         compromised credential was told it worked while the account kept
+#         +@all. Redis compares keywords case-insensitively and rejects an
+#         unknown token with `Syntax error`.
+#
+# Every row is a moon-vs-redis comparison. The revocation rows observe
+# ENFORCEMENT (a denied command, a refused AUTH), never a flag read-back.
+# ===========================================================================
+log "=== ACL rule-token grammar (#979) ==="
+
+ACL_U="n979:probe"
+
+# Both servers: a fresh user holding everything -- the state an emergency
+# lockdown starts from, and the state every dropped revocation left behind.
+acl979_full() {
+    acl_reset_user
+    # Clear the probe keys too, so a dropped revocation in an earlier block
+    # (moon SET went through, redis denied) cannot leak into a later GET.
+    both DEL n979:k n979:x n979:y n979:r
+    both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' +@all
+}
+
+# --- revocations that were dropped with +OK ---------------------------------
+# RED on a8eb2efc and on #987 alone: moon answered OK and the probe still ran.
+for acl979_tok in nocommands NOCOMMANDS NoCommands; do
+    acl979_full
+    assert_acl_setuser "#979 $acl979_tok reply" "$acl979_tok"
+    assert_acl_probe   "#979 $acl979_tok denies PING" PING
+    assert_acl_probe   "#979 $acl979_tok denies SET"  SET n979:k 1
+done
+for acl979_tok in OFF Off RESET Reset RESETPASS; do
+    acl979_full
+    assert_acl_setuser "#979 $acl979_tok reply" "$acl979_tok"
+    assert_acl_probe   "#979 $acl979_tok: the password no longer authenticates" PING
+done
+acl979_full
+assert_acl_setuser "#979 RESETKEYS reply" RESETKEYS
+# Key/channel denials use `assert_acl_both_denied`: moon words its NOPERM for a
+# key differently from redis (pre-existing, not this issue) -- both must DENY.
+assert_acl_both_denied "#979 RESETKEYS denies a key command" SET n979:k 1
+assert_acl_probe   "#979 RESETKEYS keeps keyless PING"   PING
+acl979_full
+assert_acl_setuser "#979 RESETCHANNELS reply" RESETCHANNELS
+assert_acl_both_denied "#979 RESETCHANNELS denies PUBLISH" PUBLISH n979:ch 1
+acl979_full
+assert_acl_setuser "#979 -SET (uppercase command) reply" -SET
+assert_acl_probe   "#979 -SET denies SET" SET n979:k 1
+assert_acl_probe   "#979 -SET keeps GET"  GET n979:k
+
+# `nopass` then `>pw2`: redis clears nopass on `>` and clears the password
+# list on `nopass`, so afterwards ONLY pw2 authenticates. moon kept nopass
+# set (any password worked) and kept `pw` stored (the old credential
+# survived the rotation). Both are fail-open.
+acl979_full
+assert_acl_setuser "#979 nopass then >pw2 reply" nopass '>pw2'
+acl979_r=$(acl_as "$PORT_REDIS" "$ACL_U" wrong PING)
+acl979_m=$(acl_as "$PORT_RUST"  "$ACL_U" wrong PING)
+assert_eq "#979 >pw clears nopass: a wrong password is refused" "$acl979_r" "$acl979_m"
+assert_acl_probe "#979 nopass removed the old password: pw is refused" PING
+acl979_r=$(acl_as "$PORT_REDIS" "$ACL_U" pw2 PING)
+acl979_m=$(acl_as "$PORT_RUST"  "$ACL_U" pw2 PING)
+assert_eq "#979 the new password authenticates" "$acl979_r" "$acl979_m"
+
+# --- grants that were dropped with +OK --------------------------------------
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw'
+assert_acl_probe   "#979 baseline: a bare user cannot SET" SET n979:k 1
+assert_acl_setuser "#979 ALLKEYS ALLCOMMANDS ALLCHANNELS reply" ALLKEYS ALLCOMMANDS ALLCHANNELS
+assert_acl_probe   "#979 all* keywords grant SET"     SET n979:k 1
+assert_acl_probe   "#979 all* keywords grant PUBLISH" PUBLISH n979:ch 1
+
+# Key patterns gate KEYED commands only. moon had a blanket "no key patterns
+# -> deny everything" ahead of the keyless check, so `RESETKEYS` (now that it
+# is honoured) also took away PING. RED on a8eb2efc and on #987 alone.
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' +@all
+assert_acl_probe       "#979 no key patterns: keyless PING is allowed" PING
+assert_acl_both_denied "#979 no key patterns: SET is denied"          SET n979:k 1
+
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '&*' +@all
+assert_acl_setuser "#979 %rw~ (lowercase flags) reply" '%rw~n979:x'
+assert_acl_probe   "#979 %rw~n979:x grants SET n979:x" SET n979:x 1
+assert_acl_both_denied "#979 %rw~n979:x denies SET n979:y" SET n979:y 1
+assert_acl_setuser "#979 %r~ reply" '%r~n979:r'
+assert_acl_probe   "#979 %r~n979:r allows GET" GET n979:r
+assert_acl_both_denied "#979 %r~n979:r denies SET" SET n979:r 1
+
+# --- rejected tokens: byte-for-byte error text, and NOTHING applied --------
+acl979_full
+# `éx`: a multi-byte FIRST character crashed #998's tokenizer (byte slice
+# inside `é`, shard panic, whole-server abort). Redis: Syntax error.
+for acl979_tok in bogus BOGUS @read nocommand ')' '+get|' ' on' 'éx'; do
+    assert_acl_setuser "#979 '$acl979_tok' is a syntax error" "$acl979_tok"
+done
+for acl979_tok in +bogus -bogus -flushal + - '+|get' '+config|bogus'; do
+    assert_acl_setuser "#979 '$acl979_tok' is an unknown command" "$acl979_tok"
+done
+acl979_zero=$(printf '0%.0s' $(seq 1 64))
+for acl979_tok in '#zz' '#abc' '#30C952FAB122C3F9759F02A6D95C3758B246B4FEE239957B2D4FEE46E26170C4' '!nonexistent'; do
+    assert_acl_setuser "#979 '$acl979_tok' is a bad password hash" "$acl979_tok"
+done
+assert_acl_setuser "#979 <nope: password does not exist"      '<nope'
+assert_acl_setuser "#979 !<absent hash>: password does not exist" "!$acl979_zero"
+# After every rejection above the user must still hold everything on both.
+assert_acl_probe "#979 rejected tokens left the user intact" SET n979:k 1
+
+# Malformed `%` shapes are checked on a user WITHOUT `~*`: when allkeys is
+# set redis reports "Adding a pattern after the * pattern" ahead of the
+# syntax error, so the byte-for-byte row needs an empty key-pattern list.
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>pw' '&*' +@all
+for acl979_tok in '%X~k' '%RR~k' '%~k' '%' '%RX~k'; do
+    assert_acl_setuser "#979 '$acl979_tok' is a syntax error" "$acl979_tok"
+done
+assert_acl_probe "#979 rejected % tokens left the user intact" PING
+
+# --- valid no-op tokens must be ACCEPTED (every redis ACL LIST line carries
+# sanitize-payload, so refusing it would make a redis-exported file unloadable)
+acl979_full
+assert_acl_setuser "#979 sanitize-payload / clearselectors / '' accepted" \
+    sanitize-payload SKIP-SANITIZE-PAYLOAD clearselectors ''
+assert_acl_probe "#979 no-op tokens keep access" SET n979:k 1
+
+# --- whole-call atomicity ---------------------------------------------------
+# A bad token mid-list: redis rejects the whole modifier list, so the account
+# never comes into existence. moon created it holding +@all.
+acl_reset_user
+assert_acl_setuser "#979 bad token mid-list rejects the whole call" \
+    on '>pw' '~*' '&*' +@all bogus
+assert_both      "#979 rejected call creates no user"      ACL GETUSER "$ACL_U"
+assert_acl_probe "#979 rejected call grants no credential" PING
+# ...and for an EXISTING user the parsed prefix (`off`, `nocommands`) must not
+# stick when a later, state-dependent token (`<nope`) fails.
+acl979_full
+assert_acl_setuser "#979 off nocommands <nope rejects the whole call" off nocommands '<nope'
+assert_acl_probe   "#979 rejected prefix not applied: still on, still allowed" SET n979:k 1
+
+# --- selectors: valid redis grammar moon does not implement. No oracle parity
+# is possible, so assert the moon-only property: REFUSED, never dropped.
+acl979_full
+acl979_m=$(redis-cli -p "$PORT_RUST" ACL SETUSER "$ACL_U" '(+get ~n979:k)' 2>&1) || true
+if [[ "$acl979_m" == ERR* ]]; then
+    PASS=$((PASS + 1))
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: #979 a selector must be refused, not silently dropped"
+    echo "    actual:   $(echo "$acl979_m" | head -c 200)"
+fi
+
+# --- moon#999: credential fail-open ------------------------------------------
+# `>pw` / `#hash` on a `nopass` user must REQUIRE that password. moon left
+# `nopass` set, so ANY password authenticated -- the standard "provisioned
+# nopass for bootstrap, now give it a real password" step left the account
+# open. Probed through AUTH (redis-cli --user/--pass) AND `HELLO 3 AUTH`, the
+# two ways a client authenticates. Only the refusal is compared for HELLO: a
+# successful HELLO reply carries server-identity fields that differ by design.
+acl_reset_user
+both ACL SETUSER "$ACL_U" on nopass '~*' '&*' +@all
+assert_acl_setuser "#999 nopass then >pw reply" '>pw'
+acl979_r=$(acl_as "$PORT_REDIS" "$ACL_U" totallywrong PING)
+acl979_m=$(acl_as "$PORT_RUST"  "$ACL_U" totallywrong PING)
+assert_eq "#999 nopass then >pw: a wrong password is refused (AUTH)" "$acl979_r" "$acl979_m"
+acl979_r=$(redis-cli -p "$PORT_REDIS" HELLO 3 AUTH "$ACL_U" totallywrong 2>&1 | head -1) || true
+acl979_m=$(redis-cli -p "$PORT_RUST"  HELLO 3 AUTH "$ACL_U" totallywrong 2>&1 | head -1) || true
+assert_eq "#999 nopass then >pw: a wrong password is refused (HELLO AUTH)" "$acl979_r" "$acl979_m"
+assert_acl_probe "#999 nopass then >pw: the password itself authenticates" PING
+# Same through a pre-hashed credential: sha256("pw").
+acl_reset_user
+both ACL SETUSER "$ACL_U" on nopass '~*' '&*' +@all
+assert_acl_setuser "#999 nopass then #hash reply" \
+    '#30c952fab122c3f9759f02a6d95c3758b246b4fee239957b2d4fee46e26170c4'
+acl979_r=$(acl_as "$PORT_REDIS" "$ACL_U" totallywrong PING)
+acl979_m=$(acl_as "$PORT_RUST"  "$ACL_U" totallywrong PING)
+assert_eq "#999 nopass then #hash: a wrong password is refused" "$acl979_r" "$acl979_m"
+assert_acl_probe "#999 nopass then #hash: the hashed password authenticates" PING
+# The rotation case with HELLO: >oldpw, nopass, >pw -- `oldpw` must be dead.
+acl_reset_user
+both ACL SETUSER "$ACL_U" on '>oldpw' '~*' '&*' +@all
+assert_acl_setuser "#999 rotation through nopass reply" nopass '>pw'
+acl979_r=$(redis-cli -p "$PORT_REDIS" HELLO 3 AUTH "$ACL_U" oldpw 2>&1 | head -1) || true
+acl979_m=$(redis-cli -p "$PORT_RUST"  HELLO 3 AUTH "$ACL_U" oldpw 2>&1 | head -1) || true
+assert_eq "#999 rotation through nopass: the old password is refused (HELLO AUTH)" "$acl979_r" "$acl979_m"
+
+# --- moon#970: key/channel selectors render as redis renders them -----------
+# `allkeys`/`~*` and `allchannels`/`&*` REPLACE the list in redis, so
+# `~a %R~b allkeys` reports `~*`; moon appended and reported `~a %R~b ~*`.
+# `%RW~` is read+write and reports as `~`. Compared through GETUSER's `keys`
+# and `channels` fields -- the ACL LIST line itself differs by
+# `sanitize-payload`/`resetchannels`, which moon does not emit.
+acl979_field() {
+    redis-cli -p "$1" ACL GETUSER "$ACL_U" 2>&1 | tr -d '\r' \
+        | awk -v f="$2" 'g { print; exit } $0 == f { g = 1 }' || true
+}
+acl_reset_user
+assert_acl_setuser "#970 ~a %R~b allkeys &c allchannels reply" \
+    on '>pw' '~n979:a' '%R~n979:b' allkeys '&n979:c' allchannels +@all
+assert_eq "#970 allkeys replaces the key list (GETUSER keys)" \
+    "$(acl979_field "$PORT_REDIS" keys)" "$(acl979_field "$PORT_RUST" keys)"
+assert_eq "#970 allchannels replaces the channel list (GETUSER channels)" \
+    "$(acl979_field "$PORT_REDIS" channels)" "$(acl979_field "$PORT_RUST" channels)"
+acl_reset_user
+assert_acl_setuser "#970 %RW~ %r~ %W~ reply" \
+    on '>pw' '%RW~n979:rw*' '%r~n979:r*' '%W~n979:w*' +@all
+assert_eq "#970 key selectors render as redis does (GETUSER keys)" \
+    "$(acl979_field "$PORT_REDIS" keys)" "$(acl979_field "$PORT_RUST" keys)"
+assert_acl_probe       "#970 %R~ allows GET"  GET n979:r1
+assert_acl_both_denied "#970 %R~ denies SET"  SET n979:r1 v
+assert_acl_probe       "#970 %W~ allows SET"  SET n979:w1 v
+assert_acl_both_denied "#970 %W~ denies GET"  GET n979:w1
+assert_acl_probe       "#970 %RW~ allows SET" SET n979:rw1 v
+assert_acl_probe       "#970 %RW~ allows GET" GET n979:rw1
+# `totalnonsense` is #970's own example of a non-rule that answered +OK.
+assert_acl_setuser "#970 totalnonsense is a syntax error" totalnonsense
+
+acl_reset_user
+both DEL n979:k n979:x n979:y n979:r n979:w1 n979:rw1
+ACL_U="n978:probe"
+# END acl-rule-token-section -- moon#979
+
 # ===========================================================================
 # moon#981: ACL SAVE must write the base polarity the table holds in memory
 # ===========================================================================
@@ -4796,6 +5106,42 @@ if wait_for_port "$PORT_REDIS" && wait_for_port "$PORT_RUST"; then
             --user rt --pass pw --no-auth-warning FLUSHALL
     done
     both ACL DELUSER rt
+
+    # moon#970/#979/#999 through the same SAVE -> LOAD cycle: every rule
+    # shape this change implements must reload to exactly what redis reloads
+    # it to -- keys, channels AND commands, token order included -- and the
+    # credential fixes must survive the file (a rotated-out password stays
+    # dead, a wrong one stays refused).
+    f970_field() {
+        redis-cli -t 5 -p "$1" ACL GETUSER rk 2>&1 | tr -d '\r' \
+            | awk -v f="$2" 'g { print; exit } $0 == f { g = 1 }' || true
+    }
+    for f970_spec in \
+        "allkeys allchannels allcommands" \
+        "~f970:a %R~f970:b allkeys &f970:c allchannels +@all" \
+        "%RW~f970:rw* %r~f970:r* %W~f970:w* +@all -flushall" \
+        "~* &* +@all nocommands" \
+        "nopass ~* +@all >pw" \
+        "nopass >pw nopass >pw ~* +@all"; do
+        read -r -a f970_rules <<< "$f970_spec"
+        both ACL DELUSER rk
+        both ACL SETUSER rk on '>oldpw' nopass '>pw' "${f970_rules[@]}"
+        for f970_f in keys channels commands; do
+            assert_eq "moon#970 '$f970_spec' GETUSER $f970_f before SAVE" \
+                "$(f970_field "$PORT_REDIS" "$f970_f")" "$(f970_field "$PORT_RUST" "$f970_f")"
+        done
+        assert_both "moon#970 '$f970_spec' ACL SAVE" ACL SAVE
+        assert_both "moon#970 '$f970_spec' ACL LOAD" ACL LOAD
+        for f970_f in keys channels commands; do
+            assert_eq "moon#970 '$f970_spec' GETUSER $f970_f after LOAD" \
+                "$(f970_field "$PORT_REDIS" "$f970_f")" "$(f970_field "$PORT_RUST" "$f970_f")"
+        done
+        for f970_pw in pw oldpw wrong; do
+            assert_both "moon#999 '$f970_spec' AUTH rk $f970_pw after LOAD" \
+                --user rk --pass "$f970_pw" --no-auth-warning PING
+        done
+    done
+    both ACL DELUSER rk
 else
     FAIL=$((FAIL + 1))
     echo "  FAIL: moon#981 servers with --aclfile did not start -- rows did not run"

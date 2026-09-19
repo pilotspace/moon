@@ -348,22 +348,55 @@ pub struct VectorSearchPayload {
 ///
 /// `BlockedCommand::XReadGroup` carries Vec + two Bytes + count options, pushing
 /// the inline variant past 160 B. Boxing collapses it to a pointer.
+///
+/// Carries a SINGLE-key waiter only: `key` is the whole command, so the owner
+/// answers `-WRONGTYPE` for it at registration time (moon#556). Multi-key
+/// waiters register through [`BlockRegisterGroupPayload`] (moon#989).
 pub struct BlockRegisterPayload {
     pub db_index: usize,
     pub key: Bytes,
     pub wait_id: u64,
     pub cmd: crate::blocking::BlockedCommand,
     pub reply_tx: channel::OneshotSender<Option<crate::protocol::Frame>>,
-    /// moon#556: is `key` the ONLY key this waiter is blocked on?
-    ///
-    /// The owning shard answers `-WRONGTYPE` at registration time for a key it
-    /// finds holding the wrong type — but only when it is the whole command.
-    /// For a multi-key waiter the other keys are registered on other shards and
-    /// may be serving concurrently, so an error raised here would race a real
-    /// wake-up whose element has already left the keyspace. Multi-key remote
-    /// registrations therefore keep their pre-#556 behaviour (the key is
-    /// skipped, the client stays blocked on its remaining keys).
-    pub sole_key: bool,
+}
+
+/// One key of a [`BlockRegisterGroupPayload`]: the key, the command its wake
+/// runs, and the channel that wake answers on.
+pub struct BlockRegisterMember {
+    pub key: Bytes,
+    pub cmd: crate::blocking::BlockedCommand,
+    pub reply_tx: channel::OneshotSender<Option<crate::protocol::Frame>>,
+}
+
+/// moon#989: every key ONE shard owns of ONE multi-key blocking waiter,
+/// delivered as a single message.
+///
+/// The multi-key coordinator used to send one [`BlockRegisterPayload`] per
+/// key. The owner handled each in isolation — register, see data, serve — so
+/// a waiter whose co-located keys `b` and `c` both held data was served TWICE:
+/// once when `b`'s registration landed and again when `c`'s did. The client
+/// kept the first reply and dropped the second, and the element in it had
+/// already left the keyspace.
+///
+/// Grouping the keys makes "serve this waiter at most once" a property of one
+/// synchronous stretch of the owner's event loop: every member is registered
+/// under the same `wait_id` before any wake runs, and the wake that serves it
+/// runs `remove_wait`, which unregisters its siblings in the same stretch.
+pub struct BlockRegisterGroupPayload {
+    pub db_index: usize,
+    pub wait_id: u64,
+    /// The keys this shard owns, in the command's argument order — the order
+    /// Redis serves them in. A key named twice appears twice.
+    pub members: Vec<BlockRegisterMember>,
+    /// `true` when `members` is EVERY key of the command, i.e. the keys are
+    /// co-located on this shard. The owner then decides the whole command, the
+    /// way `--shards 1` does, including the `-WRONGTYPE` Redis owes for the
+    /// first existing key of the wrong type. `false` for a waiter whose other
+    /// keys live on other shards: those may be serving concurrently, so an
+    /// error raised here would race a real wake-up whose element has already
+    /// left the keyspace — a wrong-typed key is skipped instead, and the
+    /// client stays blocked on its remaining keys.
+    pub whole_command: bool,
 }
 
 /// Portable raw socket file descriptor type.
@@ -657,6 +690,9 @@ pub enum ShardMessage {
     /// Boxed (Phase 177) — `BlockedCommand::XReadGroup` pushes the inline variant
     /// past 160 B.
     BlockRegister(Box<BlockRegisterPayload>),
+    /// Register every key one shard owns of a multi-key blocked client, in
+    /// one message, so the owner can serve it at most once (moon#989).
+    BlockRegisterGroup(Box<BlockRegisterGroupPayload>),
     /// Cancel a blocked client registration (woken by another shard or timed out).
     BlockCancel { wait_id: u64 },
     /// Register a connected replica's per-shard sender channel with this shard.
