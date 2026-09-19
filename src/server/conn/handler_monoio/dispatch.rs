@@ -2002,9 +2002,9 @@ pub(super) async fn try_handle_blocking<
 
     // `peer_gone_after_serve` (moon#1023): a shard served this client and
     // then found it gone. The serve stands (as in redis), so the tracking
-    // invalidation and the AOF/replication record below run exactly as for a
-    // delivered reply; only the write to the dead socket is skipped. For a
-    // key another shard owns, replay drops that record (moon#1056).
+    // invalidation below runs exactly as for a delivered reply; only the write
+    // to the dead socket is skipped. The pop is already logged — by the shard
+    // that popped (moon#1056).
     let (mut blocking_response, peer_gone_after_serve) = match outcome {
         crate::server::conn::blocking::BlockingOutcome::Reply(frame) => (frame, false),
         crate::server::conn::blocking::BlockingOutcome::ServedPeerGone(frame) => (frame, true),
@@ -2028,79 +2028,38 @@ pub(super) async fn try_handle_blocking<
         conn.client_id,
     );
 
-    // moon#827: the blocking path is an INTERCEPT — exactly like the tracking
-    // invalidation above, it short-circuits the dispatch exit where every
-    // other write meets the AOF and the replication stream, so it has to feed
-    // them itself. It did not: a blocking pop that actually popped was acked
-    // to the client, applied on the master, and propagated NOWHERE. It came
-    // back on the next restart and never happened on a replica.
-    //
-    // Placed beside the invalidation and BEFORE the RESP3 conversion for the
-    // same reason that one is: the record is derived from the RESP2 shapes,
-    // and which key served must not depend on the protocol the client
-    // negotiated.
-    //
-    // The record is the synthesised non-blocking sibling, never the command
-    // itself — a replica applying a literal `BLPOP` would park its apply loop.
-    // `None` whenever nothing was written (timeout, error, miss), so a
-    // non-write reaches neither plane.
-    if let Some(effect) = crate::server::conn::blocking_effect::blocking_effect_record(
-        cmd,
-        cmd_args,
-        &blocking_response,
-    ) {
-        let repl_active = super::ft::replication_fanout_active(ctx);
-        if repl_active || ctx.aof_pool.is_some() {
-            let serialized = crate::persistence::aof::serialize_command_for_log(&effect);
-            // Same contract as the other local-leg writes: when replication is
-            // live the backlog owns the offset and the AOF leg must not
-            // double-advance it (lsn = 0).
-            let lsn = if repl_active {
-                super::ft::record_local_write_db(ctx, conn.selected_db, serialized.clone());
-                0
-            } else {
-                crate::persistence::aof::AofWriterPool::issue_append_lsn(
-                    &ctx.repl_state,
-                    ctx.shard_id,
-                    serialized.len(),
-                )
-            };
-            if let Some(ref pool) = ctx.aof_pool {
-                match pool
-                    .send_append_group(ctx.shard_id, lsn, conn.selected_db, serialized)
-                    .await
-                {
-                    // `appendfsync always`: the element is already out of the
-                    // keyspace and already promised to this client, so the
-                    // fsync is awaited HERE rather than deferred to a batch
-                    // barrier — there is no later frame in this batch to carry
-                    // it, the reply is written immediately below.
-                    Ok(true) => {
-                        if pool.fsync_barrier(ctx.shard_id).await.is_err() {
-                            blocking_response = Frame::Error(bytes::Bytes::from_static(
-                                crate::persistence::aof::AOF_FSYNC_ERR,
-                            ));
-                        }
-                    }
-                    Ok(false) => {}
-                    // Fail loud (PR #211): the pop is applied in memory but
-                    // did not reach the durability machinery. Telling the
-                    // client it succeeded is how the element goes missing
-                    // silently.
-                    Err(_) => {
-                        blocking_response = Frame::Error(bytes::Bytes::from_static(
-                            crate::persistence::aof::AOF_FSYNC_ERR,
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
     if peer_gone_after_serve {
-        // Logged above; nobody left to write the reply to.
+        // Nobody left to write the reply to.
         responses.clear();
         return BlockingResult::PeerGone;
+    }
+
+    // moon#827 / moon#1056: a pop that popped is a write, and its record is
+    // already in the AOF and replication stream of the shard that OWNS the
+    // key — written there, in the pop's own synchronous stretch, before the
+    // reply was sent (`blocking::pop_log`). It is never logged here: this
+    // connection's shard is usually not the owner, whose file is the only one
+    // replay routes that key's records from, and anything logged after the
+    // reply has been handed over can land behind the owner's later writes.
+    //
+    // What stays here is the `appendfsync always` promise: the element is out
+    // of the keyspace and about to be promised to this client, so its fsync
+    // is confirmed on the OWNER's writer before the reply leaves. Placed
+    // BEFORE the RESP3 conversion because the served key is read from the
+    // RESP2 shapes. A no-op under `everysec`/`no`, and for a timeout or an
+    // error (including the owner's own fail-loud reply for a lost append).
+    if let Some(ref pool) = ctx.aof_pool
+        && let Some(owner) = crate::server::conn::blocking_effect::served_pop_owner(
+            cmd,
+            cmd_args,
+            &blocking_response,
+            ctx.num_shards,
+        )
+        && pool.fsync_barrier(owner).await.is_err()
+    {
+        blocking_response = Frame::Error(bytes::Bytes::from_static(
+            crate::persistence::aof::AOF_FSYNC_ERR,
+        ));
     }
 
     // moon#559 / moon#462: this is an INTERCEPT — it short-circuits the
