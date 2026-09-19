@@ -1906,7 +1906,7 @@ impl super::Shard {
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
                         (&mut checkpoint_manager, &page_cache, &mut wal_writer, &mut shard_manifest, &mut control_file, &control_file_path)
                     {
-                        persistence_tick::force_checkpoint(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, shard_id, server_config.manifest_tombstone_retain_epochs, server_config.manifest_tombstone_retain_secs, &mut persistence_tick::graph_checkpoint_hook(persistence_dir.as_deref(), shard_id));
+                        persistence_tick::force_checkpoint(persistence_tick::ForcedCheckpoint::Shutdown, ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, shard_id, server_config.manifest_tombstone_retain_epochs, server_config.manifest_tombstone_retain_secs, &mut persistence_tick::graph_checkpoint_hook(persistence_dir.as_deref(), shard_id));
                     }
                     // Persist graph store to disk on shutdown.
                     #[cfg(feature = "graph")]
@@ -2110,6 +2110,7 @@ impl super::Shard {
                         &control_file_path,
                     ) {
                         persistence_tick::force_checkpoint(
+                            persistence_tick::ForcedCheckpoint::Shutdown,
                             ckpt_mgr,
                             page_cache_inst,
                             wal_v3,

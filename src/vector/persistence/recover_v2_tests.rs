@@ -598,6 +598,42 @@ fn persist_docs(root: &std::path::Path, dim: usize, n: usize) -> (IndexMeta, Vec
     (meta, store)
 }
 
+/// moon#1073: the keymap names each key's current copy by global_id. A loaded
+/// row survives only if it IS that copy, and only once; every other live row
+/// is tombstoned in its own segment (an old copy of a re-written key, a
+/// deleted key's row, a duplicate of the current copy).
+#[test]
+fn keymap_gate_keeps_only_the_copy_the_keymap_names() {
+    // (key_hash, global_id, delete_lsn)
+    let mut segs = vec![
+        // key 1's OLD copy, key 2's current copy, deleted key 3.
+        ImmutableSegment::with_test_rows(&[(1, 0, 0), (2, 1, 0), (3, 2, 0)]),
+        // key 1's current copy, a duplicate of key 2's, an install-dead row.
+        ImmutableSegment::with_test_rows(&[(1, 10, 0), (2, 1, 0), (4, 11, 7)]),
+    ];
+    let current: HashMap<u64, u32> = [(1, 10), (2, 1)].into_iter().collect();
+
+    let (backed, superseded) = supersede_rows_the_keymap_does_not_name(&mut segs, &current);
+
+    assert_eq!(backed, [1u64, 2].into_iter().collect::<HashSet<u64>>());
+    assert_eq!(superseded, 3, "old copy of 1, deleted 3, duplicate of 2");
+    assert_eq!(segs[0].live_key_hashes().collect::<Vec<_>>(), vec![2]);
+    assert_eq!(segs[1].live_key_hashes().collect::<Vec<_>>(), vec![1]);
+    assert_eq!(segs[0].live_count() + segs[1].live_count(), 2);
+}
+
+/// An empty (unreadable) keymap vouches for nothing: every row is tombstoned
+/// and the rescan re-indexes every key, instead of the rescan's fresh copies
+/// sitting beside still-live loaded rows.
+#[test]
+fn keymap_gate_with_no_keymap_keeps_no_row() {
+    let mut segs = vec![ImmutableSegment::with_test_rows(&[(1, 0, 0), (2, 1, 0)])];
+    let (backed, superseded) = supersede_rows_the_keymap_does_not_name(&mut segs, &HashMap::new());
+    assert!(backed.is_empty());
+    assert_eq!(superseded, 2);
+    assert_eq!(segs[0].live_count(), 0);
+}
+
 #[cfg(test)]
 #[path = "recover_v2_warm_tests.rs"]
 mod warm_tests;
