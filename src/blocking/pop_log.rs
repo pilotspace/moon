@@ -141,6 +141,25 @@ pub(crate) fn wake_budget() -> std::time::Duration {
 /// synchronous stretch as the pop, before the reply is sent. See the module
 /// docs for why each of those three matters.
 pub(crate) fn log_pop(db: usize, record: &Frame, budget: &mut std::time::Duration) -> PopLog {
+    log_records(db, std::slice::from_ref(record), budget)
+}
+
+/// [`log_pop`] for a serve that one record cannot describe: a blocking
+/// consumer-group read, which redis propagates as one `XCLAIM` per delivered
+/// entry plus an `XGROUP SETID` (moon#1104, `blocking::stream_log`).
+///
+/// The records are enqueued in order, in this one synchronous stretch, so no
+/// other write on this shard can fall between them. Each one reaches the
+/// replication stream; the AOF takes them in order until one cannot be
+/// enqueued within the budget, and none after it — the AOF then holds a
+/// PREFIX of the serve, which replays to a consistent state (the entries it
+/// does not cover are simply delivered again), never a later record without
+/// the earlier ones.
+pub(crate) fn log_records(
+    db: usize,
+    records: &[Frame],
+    budget: &mut std::time::Duration,
+) -> PopLog {
     SINK.with(|s| {
         let guard = s.borrow();
         let Some(sink) = guard.as_ref() else {
@@ -153,31 +172,40 @@ pub(crate) fn log_pop(db: usize, record: &Frame, budget: &mut std::time::Duratio
         if !repl_active && sink.aof_pool.is_none() {
             return PopLog::Unlogged;
         }
-        let bytes = crate::persistence::aof::serialize_command_for_log(record);
-        // Same offset contract as the connection handler's write tail: when
-        // replication is live the backlog owns the offset and the AOF leg
-        // must not advance it a second time (lsn = 0).
-        let lsn = if repl_active {
-            #[cfg(feature = "runtime-monoio")]
-            if let Some(rs) = sink.repl_state.as_ref() {
-                let g = rs.read();
-                crate::replication::state::record_local_write_db_on(
-                    &g,
-                    sink.shard_id,
-                    db,
-                    bytes.clone(),
-                );
+        let mut outcome = PopLog::Logged;
+        for record in records {
+            let bytes = crate::persistence::aof::serialize_command_for_log(record);
+            // Same offset contract as the connection handler's write tail:
+            // when replication is live the backlog owns the offset and the
+            // AOF leg must not advance it a second time (lsn = 0).
+            let lsn = if repl_active {
+                #[cfg(feature = "runtime-monoio")]
+                if let Some(rs) = sink.repl_state.as_ref() {
+                    let g = rs.read();
+                    crate::replication::state::record_local_write_db_on(
+                        &g,
+                        sink.shard_id,
+                        db,
+                        bytes.clone(),
+                    );
+                }
+                0
+            } else if outcome == PopLog::AofLost {
+                // Nothing more reaches the AOF: issue no lsn for it either.
+                continue;
+            } else {
+                AofWriterPool::issue_append_lsn(&sink.repl_state, sink.shard_id, bytes.len())
+            };
+            if outcome == PopLog::AofLost {
+                continue;
             }
-            0
-        } else {
-            AofWriterPool::issue_append_lsn(&sink.repl_state, sink.shard_id, bytes.len())
-        };
-        if let Some(pool) = sink.aof_pool.as_ref() {
-            if !pool.send_append_bounded_blocking(sink.shard_id, lsn, db, bytes, budget) {
-                return PopLog::AofLost;
+            if let Some(pool) = sink.aof_pool.as_ref()
+                && !pool.send_append_bounded_blocking(sink.shard_id, lsn, db, bytes, budget)
+            {
+                outcome = PopLog::AofLost;
             }
         }
-        PopLog::Logged
+        outcome
     })
 }
 
