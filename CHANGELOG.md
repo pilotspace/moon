@@ -226,6 +226,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shards (`CROSSSLOT`, moon#592/#570), and `MOVE` / `COPY ... DB n` stay on one
   shard, carrying the stored entry and its absolute deadline.
 
+- **A restart no longer drops vector documents whose hash is in the cold tier
+  or carries a field TTL** (moon#1074). At boot, index recovery walks the
+  keyspace, and any recovered document whose key the walk did not see is
+  deleted as "removed while the server was down". The walk read only the hot
+  table, and within it skipped the per-field-TTL hash encoding. So every
+  document whose HASH `allkeys-lru` eviction had spilled to the cold tier, and
+  every document that had had `HEXPIRE` applied to one of its fields, dropped
+  out of `FT.SEARCH` after a restart, while `EXISTS`/`HGETALL` still returned
+  the key. Measured on a 300-document index pushed to the cold tier: 299-300
+  of 300 documents were unfindable after a clean restart, and 294-295 of 300
+  after `kill -9` (the rest were hot at boot). A cold document that was still in the mutable segment at
+  shutdown was never re-indexed at all. The walk now reads cold-tier hashes
+  from disk (one page read per key, in file order) and reads field-TTL hashes
+  without their expired fields. A cold entry that cannot be read keeps its
+  recovered document: a read fault is not a delete. The walk lists keys up
+  front but takes each key's payload only when it reconciles it: the keyspace
+  is not frozen while the walk runs (writes routed from another shard are
+  applied, and eviction spills), so a payload captured at the start could be
+  stale by the time it was reconciled. Text indexes loaded from `.tpost` are
+  reconciled by the same walk.
+
+- **A re-written or deleted vector document stops matching in every tier, at
+  runtime and across a restart, and `FT.INFO num_docs` counts each live key
+  once** (moon#1066, moon#1073). Measured on a real server, 1000 keys, before
+  the fix:
+  - an `HSET` re-write of a key whose old copy was WARM or COLD left that copy
+    live: KNN for the OVERWRITTEN vector still returned the key top-1, and
+    `num_docs` read 1001. The update path tombstoned the mutable and HOT
+    segments only; DEL went through every tier. Both now share one sweep
+    (`SegmentList::tombstone_key`).
+  - across a restart, a HOT segment's copy of a re-written key came back live:
+    Stack B writes a segment once, so a tombstone applied in memory is gone
+    after the reload, and recovery admitted a key when ANY loaded row had its
+    key_hash. After a kill -9 with the re-write still in the mutable segment,
+    the key answered ONLY to its overwritten vector and its current one was
+    lost. A DEL'd key came back as `vec:<id>`. Recovery now keeps a loaded row
+    only if it is the copy the persisted keymap names (key_hash AND
+    global_id), once, and tombstones every other row in its own segment -- no
+    key_hash-wide tombstone, no on-disk format change.
+  - a row killed at install time (the key was deleted or re-written while its
+    background build ran) came back live after HOT -> WARM: `mvcc.mpf` carried
+    the `delete_lsn`, and the warm reader ignored it. It is now a dead row in
+    WARM and COLD, by position, so a live sibling copy of the key stays.
+  - `num_docs` was wrong both ways: a HOT segment never counted a steady-state
+    tombstone (1000 after a DEL of 1000), and every WARM/COLD segment counted
+    every tombstone whether it held the key or not (1998 after one DEL across
+    two segments). A tombstone is now recorded and counted only by the segment
+    holding a live row for the key, through a per-segment key_hash index
+    (4 bytes per row in HOT and WARM segments; a COLD stub keeps 8 bytes per
+    live row). Tombstone sets no longer grow with every DEL in every segment.
+  - `FT.COMPACT` draining an in-flight background merge replayed the sources'
+    tombstones key_hash-wide, killing the NEW copy of a key re-written while
+    the merge ran; it now uses the origin-gated replay the background install
+    already used.
+  - a synchronous merge (`VACUUM VECTOR`, and the autovacuum pass) installed
+    its output without replaying the sources' steady-state tombstones at all:
+    after a DEL, its row matched again top-1 as `vec:<id>` and was counted
+    (`num_docs` 2000 instead of 1999); after a re-write whose new copy was still in the mutable
+    segment, the old copy matched beside it. It now replays them like the
+    background installs.
+  - at boot, a WARM row killed at install time counted as evidence that its
+    segment served the key. When the keymap named that row's copy (recovery
+    kills a duplicate of the current copy that way), a segment holding the
+    dead duplicate could claim the key first and the live copy in another
+    segment was then tombstoned, losing the document. Only live rows count now.
+
 - **A slow `everysec` fsync no longer makes a multi-shard server answer
   "write applied in memory but not queued for persistence"** (moon#769).
   - **Before.** At `--shards > 1` a write to a key another shard owns runs
@@ -380,6 +446,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     loss the committed manifest could name a missing incr, or the old
     `appendonly.aof` could return, losing every record written after the
     rewrite. Both directories are now fsynced before the new file is used.
+
+- **The console lints, and CI runs it** (moon#1082). `pnpm run lint` exited
+  with a missing-config error because ESLint 9 reads only flat config and the
+  console had none. `console/eslint.config.js` now wires the plugins that were
+  already installed (`@eslint/js` and `typescript-eslint` recommended,
+  `react-hooks`, `react-refresh`), and the `unit` job of
+  `console-integration.yml` runs `pnpm run lint` before the tests. Its first
+  run found a real bug: `GraphCosmos` returned its Canvas2D fallback before its
+  hooks, so the re-render after a failed WebGL init called fewer hooks than the
+  first render and React threw; only the parent's error boundary hid it. The
+  fallback now returns after the hooks, with a unit test that failed before the
+  change. `badge.tsx` stops exporting the unused `badgeVariants`, and
+  `no-unused-vars` accepts a leading underscore, the convention `tsc` already
+  applies under `noUnusedParameters`.
 
 - **A COLD vector segment leaves `unloaded` with the search that reloads it,
   and a delete that lands while the reload is waiting to install is no longer
@@ -1323,6 +1403,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CH` as a did-anything-change signal silently skipped those updates. Fixed on
   both the listpack and B+tree arms, which carried separate copies.
 ### Security
+
+- **`fuzz/Cargo.lock` is audited and clean** (moon#1092). The fuzz workspace
+  has its own lockfile, which no gate checked, and it carried
+  RUSTSEC-2026-0204 (`crossbeam-epoch` 0.9.18) and RUSTSEC-2026-0258 (`h2`
+  0.4.13), plus the unsound `anyhow` 1.0.102 and `memmap2` 0.9.10 and the
+  yanked `spin` 0.9.8. Each is bumped to the version the root `Cargo.lock`
+  already ships (0.9.20, 0.4.18, 1.0.104, 0.9.11, 0.9.9), and nothing else in
+  the lockfile moves. `supply-chain.yml` now triggers on `fuzz/Cargo.toml` and
+  `fuzz/Cargo.lock` and runs `cargo audit --file fuzz/Cargo.lock` next to the
+  root audit, so the fuzz lockfile cannot drift behind again unnoticed.
 
 - **Error and status replies can no longer be split by client input**
   (moon#1031). Error text quotes client input (an unknown command name, an

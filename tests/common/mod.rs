@@ -745,13 +745,26 @@ impl Conn {
         self.read_replies(1)
     }
 
+    /// [`Self::send`] for a command whose reply is known to take longer than
+    /// the default 20s budget on a slow host, such as a synchronous index
+    /// build in an unoptimized (`dev` profile) server.
+    pub fn send_within(&mut self, parts: &[&str], budget: Duration) -> String {
+        self.sock.write_all(&encode(parts)).expect("write");
+        self.read_replies_within(1, budget)
+    }
+
     /// Read until exactly `want` complete top-level replies have arrived.
     ///
     /// Panics rather than returning short: a truncated read surfacing as a
     /// wrong value is the failure mode that would make this suite lie about
     /// which defect it caught.
     pub fn read_replies(&mut self, want: usize) -> String {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        self.read_replies_within(want, Duration::from_secs(20))
+    }
+
+    /// [`Self::read_replies`] with an explicit time budget.
+    pub fn read_replies_within(&mut self, want: usize, budget: Duration) -> String {
+        let deadline = Instant::now() + budget;
         let mut chunk = [0u8; 65536];
         loop {
             if let Some(n) = framed_len(&self.spill, want) {
