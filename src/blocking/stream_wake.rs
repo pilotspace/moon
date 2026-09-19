@@ -135,12 +135,21 @@ pub(crate) fn try_wake_stream_waiter_budgeted(
                     noack,
                     ..
                 } => {
-                    if aof_lost
-                        || !group_reader_ready(
-                            db, db_index, key, group, consumer, *noack, *count, budget,
-                        )
-                    {
-                        continue;
+                    match group_reader_ready(
+                        db, db_index, key, group, consumer, *noack, *count, budget,
+                    ) {
+                        GroupReadiness::NotYet => continue,
+                        // moon#1086: the stream or the group is gone, or the
+                        // key holds another type. Redis unblocks the reader
+                        // with the error its read now answers; claimed like
+                        // any other answer, and nothing to log.
+                        GroupReadiness::Gone(err) => {
+                            let won = claim_for_serve(entry);
+                            decisions.push((entry.wait_id, won.then_some(err)));
+                            continue;
+                        }
+                        GroupReadiness::Ready if aof_lost => continue,
+                        GroupReadiness::Ready => {}
                     }
                     if !claim_for_serve(entry) {
                         decisions.push((entry.wait_id, None));
@@ -244,15 +253,12 @@ pub fn stream_register_error(
         // `$`-on-a-future-stream case, and it must park.
         return None;
     };
+    // Redis answers both with one text naming the key and the group.
     let Ok(Some(stream)) = db.get_stream(key) else {
-        return Some(Frame::Error(Bytes::from_static(
-            b"ERR The XREADGROUP subcommand requires the key to exist.",
-        )));
+        return Some(xreadgroup_nogroup(key, group));
     };
     if !stream.groups.contains_key(group.as_ref()) {
-        return Some(Frame::Error(Bytes::from_static(
-            b"NOGROUP No such consumer group for key name",
-        )));
+        return Some(xreadgroup_nogroup(key, group));
     }
     None
 }
@@ -312,6 +318,18 @@ fn served_reply(key: &Bytes, entries: Vec<Frame>) -> Frame {
     ])])
 }
 
+/// What a parked group reader is owed right now.
+enum GroupReadiness {
+    /// A `>` read would deliver.
+    Ready,
+    /// Nothing new yet: stay parked.
+    NotYet,
+    /// The read can never be served as registered — its stream is gone,
+    /// holds another type, or its group was destroyed. Carries the error the
+    /// read answers now (moon#1086).
+    Gone(Frame),
+}
+
 /// Can a `>` read of `group` by `consumer` on `key` deliver something now?
 ///
 /// Read-only as far as the group's delivery state goes (moon#1047: nothing
@@ -321,6 +339,10 @@ fn served_reply(key: &Bytes, entries: Vec<Frame>) -> Frame {
 /// (`XGROUP CREATECONSUMER`, moon#1104). A remote reader's first pass through
 /// here — the one its `BlockRegister` runs — is that moment on this shard; a
 /// local reader already created it in its immediate read.
+///
+/// A reader whose stream or group no longer exists, or whose key now holds
+/// another type, is [`GroupReadiness::Gone`], with the exact error
+/// redis-server 8.6.1 unblocks it with (moon#1086).
 #[allow(clippy::too_many_arguments)]
 fn group_reader_ready(
     db: &mut Database,
@@ -331,12 +353,14 @@ fn group_reader_ready(
     noack: bool,
     count: Option<usize>,
     budget: &mut std::time::Duration,
-) -> bool {
-    let Ok(Some(stream)) = db.get_stream_mut(key) else {
-        return false;
+) -> GroupReadiness {
+    let stream = match db.get_stream_mut(key) {
+        Ok(Some(stream)) => stream,
+        Ok(None) => return GroupReadiness::Gone(xreadgroup_nogroup(key, group)),
+        Err(wrongtype) => return GroupReadiness::Gone(wrongtype),
     };
     let Ok(created) = stream.create_consumer(group, consumer.clone()) else {
-        return false; // no such group
+        return GroupReadiness::Gone(xreadgroup_nogroup(key, group));
     };
     if created && noack && crate::blocking::pop_log::has_work() {
         // Nothing to tell the waiter if this record is refused: it has not
@@ -356,7 +380,19 @@ fn group_reader_ready(
     // `COUNT 0` reads nothing in moon's `read_group_new`, so it can never be
     // served here; deciding otherwise would claim a waiter with nothing to
     // hand it.
-    count != Some(0) && stream.group_has_new(group) == Some(true)
+    if count != Some(0) && stream.group_has_new(group) == Some(true) {
+        GroupReadiness::Ready
+    } else {
+        GroupReadiness::NotYet
+    }
+}
+
+/// `-NOGROUP No such key '<key>' or consumer group '<group>' in XREADGROUP
+/// with GROUP option` — redis's answer to an `XREADGROUP` whose stream or
+/// group does not exist, both when it is issued and when a parked one loses
+/// them (moon#1086).
+pub(crate) fn xreadgroup_nogroup(key: &[u8], group: &[u8]) -> Frame {
+    crate::command::stream::nogroup_key_or_group(key, group, b" in XREADGROUP with GROUP option")
 }
 
 /// Run a claimed group reader's `>` read and log it (moon#1104) in this same
@@ -589,5 +625,110 @@ mod tests {
         );
         assert!(matches!(reply_rx.try_recv(), Ok(Some(Frame::Array(_)))));
         crate::blocking::pop_log::uninstall();
+    }
+
+    /// moon#1086: a group reader whose stream is deleted, retyped, or loses
+    /// its group is answered at once with redis's error; a plain `XREAD`
+    /// parked on the same key stays parked.
+    #[test]
+    fn a_group_reader_whose_stream_goes_is_answered_its_error() {
+        type Change = fn(&mut Database);
+        let nogroup =
+            "NOGROUP No such key 's' or consumer group 'g' in XREADGROUP with GROUP option";
+        let cases: [(&str, Change, &str); 3] = [
+            (
+                "deleted",
+                |db| {
+                    db.remove(b"s");
+                },
+                nogroup,
+            ),
+            (
+                "retyped",
+                |db| {
+                    db.remove(b"s");
+                    db.list_push_back(&Bytes::from_static(b"s"), Bytes::from_static(b"x"));
+                },
+                "WRONGTYPE Operation against a key holding the wrong kind of value",
+            ),
+            (
+                "group destroyed",
+                |db| {
+                    cmd(db, &["XGROUP", "DESTROY", "s", "g"]);
+                },
+                nogroup,
+            ),
+        ];
+        for (label, change, want) in cases {
+            let mut db = Database::new();
+            let mut reg = BlockingRegistry::new(0);
+            cmd(&mut db, &["XGROUP", "CREATE", "s", "g", "$", "MKSTREAM"]);
+            let claim = ClaimToken::new();
+            let group_rx = park_group_reader(&mut reg, "s", "c", Some(claim.clone()));
+            assert!(reg.has_group_readers(), "{label}");
+            let (xtx, xrx) = channel::oneshot();
+            let wait_id = reg.next_wait_id();
+            reg.register(
+                0,
+                b("s"),
+                WaitEntry {
+                    wait_id,
+                    cmd: BlockedCommand::XRead {
+                        streams: vec![(b("s"), StreamSince::Id(StreamId::ZERO))],
+                        count: None,
+                    },
+                    reply_tx: xtx,
+                    deadline: None,
+                    claim: None,
+                },
+            );
+            change(&mut db);
+
+            assert!(
+                try_wake_stream_waiter(&mut reg, &mut db, 0, &b("s")),
+                "{label}"
+            );
+            match group_rx.try_recv() {
+                Ok(Some(Frame::Error(e))) => assert_eq!(&e[..], want.as_bytes(), "{label}"),
+                other => panic!("{label}: expected the error, got {other:?}"),
+            }
+            assert_eq!(
+                claim.settle(),
+                Settled::Claimed,
+                "{label}: answered on a won claim"
+            );
+            assert!(xrx.try_recv().is_err(), "{label}: the XREAD stays parked");
+            assert!(reg.has_waiters(0, b"s"), "{label}");
+            assert!(
+                !reg.has_group_readers(),
+                "{label}: no group reader left parked"
+            );
+        }
+    }
+
+    /// moon#1086 through the write hook itself: a `SET` (`@string`, which the
+    /// cheap gate skips) over a stream reaches its parked group reader while
+    /// one is parked on this thread — and only then.
+    #[test]
+    fn a_set_over_the_stream_reaches_the_parked_group_reader() {
+        let mut db = Database::new();
+        cmd(&mut db, &["XGROUP", "CREATE", "s", "g", "$", "MKSTREAM"]);
+        let set_args = [Frame::BulkString(b("s")), Frame::BulkString(b("x"))];
+        let reg = std::cell::RefCell::new(BlockingRegistry::new(0));
+        assert!(
+            !crate::blocking::wakeup::may_wake(b"SET"),
+            "no group reader parked: SET keeps the cheap gate"
+        );
+        let rx = park_group_reader(&mut reg.borrow_mut(), "s", "c", None);
+        assert!(crate::blocking::wakeup::may_wake(b"SET"));
+        crate::command::string::set(&mut db, &set_args);
+        assert!(crate::blocking::wakeup::wake_written_keys(
+            &reg, &mut db, 0, b"SET", &set_args
+        ));
+        assert!(matches!(rx.try_recv(), Ok(Some(Frame::Error(e))) if e.starts_with(b"WRONGTYPE")));
+        assert!(
+            !crate::blocking::wakeup::may_wake(b"SET"),
+            "and the gate narrows again"
+        );
     }
 }

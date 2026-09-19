@@ -242,6 +242,35 @@ pub struct BlockingRegistry {
     next_id: u64,
     /// Shard ID encoded in upper 16 bits of wait_id for global uniqueness.
     shard_id: usize,
+    /// The waiters blocked in `XREADGROUP` (moon#1086). Redis unblocks such a
+    /// reader when ANY write deletes or retypes its stream, or destroys its
+    /// group — not only when the stream gains entries — so while one is
+    /// parked here, every write is a possible wake source; while none is,
+    /// the write paths keep their cheap gate ([`wakeup::may_wake`]). A group
+    /// reader is registered on exactly one key, and leaves this set exactly
+    /// when it leaves `wait_keys`.
+    group_readers: std::collections::HashSet<u64>,
+}
+
+thread_local! {
+    /// How many `XREADGROUP` waiters the registries on this thread hold. One
+    /// registry per shard thread, so this is that shard's count; it lets the
+    /// write gates that have no registry in hand (a `MULTI` body, a script)
+    /// ask the same question as [`BlockingRegistry::has_group_readers`].
+    static PARKED_GROUP_READERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Is any `XREADGROUP` parked on this shard thread? One `Cell` read.
+#[inline]
+pub fn group_readers_parked_here() -> bool {
+    PARKED_GROUP_READERS.with(|c| c.get() > 0)
+}
+
+impl Drop for BlockingRegistry {
+    fn drop(&mut self) {
+        let n = self.group_readers.len();
+        PARKED_GROUP_READERS.with(|c| c.set(c.get().saturating_sub(n)));
+    }
 }
 
 impl BlockingRegistry {
@@ -256,6 +285,34 @@ impl BlockingRegistry {
             deadlines: std::collections::BinaryHeap::new(),
             next_id: 0,
             shard_id,
+            group_readers: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Is any `XREADGROUP` parked on this shard? O(1).
+    #[inline]
+    pub fn has_group_readers(&self) -> bool {
+        !self.group_readers.is_empty()
+    }
+
+    /// Every `(db, key)` an `XREADGROUP` is parked on, deduplicated — the
+    /// keys a keyspace-wide deletion (`FLUSHDB`, `FLUSHALL`, active expiry)
+    /// may have taken from under a group reader.
+    pub fn group_reader_keys(&self) -> Vec<(usize, Bytes)> {
+        let mut out: Vec<(usize, Bytes)> = Vec::new();
+        for id in &self.group_readers {
+            for k in self.wait_keys.get(id).into_iter().flatten() {
+                if !out.contains(k) {
+                    out.push(k.clone());
+                }
+            }
+        }
+        out
+    }
+
+    fn forget_group_reader(&mut self, wait_id: u64) {
+        if self.group_readers.remove(&wait_id) {
+            PARKED_GROUP_READERS.with(|c| c.set(c.get().saturating_sub(1)));
         }
     }
 
@@ -307,6 +364,11 @@ impl BlockingRegistry {
     /// Push to back of the FIFO queue. Also records in wait_keys for cross-key cleanup.
     pub fn register(&mut self, db_index: usize, key: Bytes, entry: WaitEntry) {
         let wait_id = entry.wait_id;
+        if matches!(entry.cmd, BlockedCommand::XReadGroup { .. })
+            && self.group_readers.insert(wait_id)
+        {
+            PARKED_GROUP_READERS.with(|c| c.set(c.get() + 1));
+        }
         let queue_key = (db_index, key.clone());
 
         if let Some(deadline) = entry.deadline {
@@ -456,6 +518,7 @@ impl BlockingRegistry {
             let Some(keys) = self.wait_keys.remove(id) else {
                 continue;
             };
+            self.forget_group_reader(*id);
             crate::admin::metrics_setup::record_client_unblocked();
             for (sib_db, sib_key) in keys {
                 if sib_db == db_index && sib_key == key {
@@ -476,6 +539,7 @@ impl BlockingRegistry {
     /// Used after a waiter is woken or times out to clean up cross-key registrations.
     pub fn remove_wait(&mut self, wait_id: u64) {
         if let Some(keys) = self.wait_keys.remove(&wait_id) {
+            self.forget_group_reader(wait_id);
             crate::admin::metrics_setup::record_client_unblocked();
             for (db_index, key) in keys {
                 if let Some(queue) = self.queue_mut(db_index, &key) {

@@ -51,6 +51,8 @@ pub fn move_core(src: &mut Database, dst: &mut Database, key: &[u8]) -> Frame {
 
     // Move: insert into dst, TTL is carried inside the Entry value
     dst.set(key, entry);
+    // moon#1086: the key left `src`, where a parked XREADGROUP may wait on it.
+    crate::blocking::wakeup::note_unsignalled_removal();
     Frame::Integer(1)
 }
 

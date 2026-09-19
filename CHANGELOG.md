@@ -199,6 +199,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A parked `XREADGROUP` is answered at once when its stream or group goes
+  away** (moon#1086). Redis unblocks a group reader when any write deletes
+  or retypes its stream or destroys its group; moon left it parked until its
+  own timeout and then answered nil. Every such change now answers it
+  immediately, with redis-server 8.6.1's text: `-NOGROUP No such key 'k' or
+  consumer group 'g' in XREADGROUP with GROUP option` after `DEL`, `UNLINK`,
+  `RENAME` away, `MOVE`, `SWAPDB`, `FLUSHDB`, `FLUSHALL`, `XGROUP DESTROY` or
+  expiry, and `-WRONGTYPE` after `SET` or a `RENAME` of another type onto it —
+  on the connection, inside `MULTI`, from a script, and across shards. A write
+  that names the key signals it directly (while a group reader is parked, the
+  ready-key gate admits every write, not only list/zset/stream writers, and
+  an inline `SET` takes the generic path); a flush, the source side of a
+  `MOVE` and an expiry mark the shard for a recheck its 10 ms blocking tick
+  runs. `XREAD` waiters stay parked, as in redis. The same text now answers
+  an `XREADGROUP` issued against a missing key or group (it said `ERR The
+  XREADGROUP subcommand requires the key to exist.` or `NOGROUP No such
+  consumer group for key name`), and a multi-stream `XREADGROUP` checks every
+  stream and group before reading any, instead of moving the first stream's
+  entries into the PEL and then failing on the second.
+
 - **A blocking `XREADGROUP` that delivers is logged, and survives `kill -9`**
   (moon#1104). A consumer-group read moves what it delivers into the PEL and
   advances the group's last-delivered id, but through `BLOCK` it went through

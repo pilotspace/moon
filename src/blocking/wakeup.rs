@@ -43,6 +43,28 @@ pub fn may_ready_a_key(cmd: &[u8]) -> bool {
     })
 }
 
+/// The gate every write→waiter hook opens with: [`may_ready_a_key`], widened
+/// to EVERY write while an `XREADGROUP` is parked on this shard (moon#1086).
+///
+/// A group reader is owed an answer not only when its stream gains entries
+/// but when any write deletes it (`DEL`, `UNLINK`, `RENAME` away, `MOVE`
+/// away), retypes it (`SET`, `RESTORE ... REPLACE`, ...) or destroys its
+/// group: redis marks the reader `unblock_on_nokey` and answers it `-NOGROUP`
+/// / `-WRONGTYPE` at once (measured against redis-server 8.6.1). Those writes
+/// are `@string`, `@hash`, `@set` as often as not, which the cheap gate
+/// rightly skips for list, zset and `XREAD` waiters. So the widening costs
+/// one thread-local read, and only a shard that actually has a group reader
+/// parked walks the keys of a `SET`.
+#[inline]
+pub fn may_wake(cmd: &[u8]) -> bool {
+    may_ready_a_key(cmd)
+        || (crate::blocking::group_readers_parked_here()
+            && crate::command::metadata::lookup(cmd).is_some_and(|m| {
+                m.flags
+                    .contains(crate::command::metadata::CommandFlags::WRITE)
+            }))
+}
+
 /// Call `f` on every key a write command may have CREATED or GROWN — the keys
 /// a blocked client could now be served from (moon#1059, moon#1069) — in
 /// argument order, BORROWED from `args`.
@@ -139,7 +161,7 @@ pub fn ready_keys(
     args: &[Frame],
 ) -> ReadyKeys {
     let mut keys = ReadyKeys::new();
-    if !registry.has_any_waiters() || !may_ready_a_key(cmd) {
+    if !registry.has_any_waiters() || !may_wake(cmd) {
         return keys;
     }
     for_each_written_key(cmd, args, |k| {
@@ -403,16 +425,28 @@ fn serve_ready_key(
     budget: &mut std::time::Duration,
 ) -> bool {
     let now_ms = db.now_ms();
-    if matches!(db.get_list_ref_if_alive(key, now_ms), Ok(Some(_))) {
+    let served = if matches!(db.get_list_ref_if_alive(key, now_ms), Ok(Some(_))) {
         serve_list_key(registry, db, db_index, key, worklist, pending_from, budget)
     } else if matches!(db.get_sorted_set_ref_if_alive(key, now_ms), Ok(Some(_))) {
         serve_zset_key(registry, db, db_index, key, budget)
     } else if matches!(db.get_stream_if_alive(key, now_ms), Ok(Some(_))) {
-        crate::blocking::stream_wake::try_wake_stream_waiter_budgeted(
+        return crate::blocking::stream_wake::try_wake_stream_waiter_budgeted(
             registry, db, db_index, key, budget,
-        )
+        );
     } else {
         false
+    };
+    // moon#1086: the key is not a stream (any more). A group reader parked on
+    // it is owed `-NOGROUP` (the key is gone) or `-WRONGTYPE` (it holds
+    // something else) now; the stream waker decides both. Plain `XREAD`
+    // waiters stay parked, as in redis.
+    if registry.has_group_readers() {
+        served
+            | crate::blocking::stream_wake::try_wake_stream_waiter_budgeted(
+                registry, db, db_index, key, budget,
+            )
+    } else {
+        served
     }
 }
 
@@ -1124,6 +1158,61 @@ pub fn wake_swapped_dbs(registry: &std::cell::RefCell<BlockingRegistry>, a: usiz
     wake_recorded(registry, recorded);
 }
 
+thread_local! {
+    /// Set when this shard removed keys in a way no write hook names a key
+    /// for — a flush, a `MOVE` out of the source database, active expiry —
+    /// while an `XREADGROUP` was parked here. Drained by
+    /// [`recheck_group_readers`] on the shard's 10 ms blocking tick.
+    static GROUP_READER_RECHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A deletion the ready-key hooks cannot see — `FLUSHDB`, `FLUSHALL`, the
+/// source half of a `MOVE`, an expired key — just ran on this shard.
+///
+/// Redis signals every deleted key (`signalDeletedKeyAsReady`), and a parked
+/// `XREADGROUP` whose stream went with it is answered `-NOGROUP` at once
+/// (moon#1086). These deletions name no key to [`ready_keys`] (a flush names
+/// none, a `MOVE` names the key it wrote in the OTHER database, an expiry is
+/// no command at all), so instead they mark the shard for a recheck of its
+/// parked group readers, which the blocking tick runs within 10 ms. One
+/// thread-local read when no group reader is parked; nothing else.
+#[inline]
+pub fn note_unsignalled_removal() {
+    if crate::blocking::group_readers_parked_here() {
+        GROUP_READER_RECHECK.with(|c| c.set(true));
+    }
+}
+
+/// Run the recheck [`note_unsignalled_removal`] asked for: offer every key a
+/// group reader is parked on to the stream waker, which answers the readers
+/// whose stream or group is gone and serves any that have entries. Called
+/// from the shard's blocking tick, outside any borrow of its slice.
+pub fn recheck_group_readers(registry: &std::cell::RefCell<BlockingRegistry>) {
+    if !GROUP_READER_RECHECK.with(|c| c.replace(false)) {
+        return;
+    }
+    let keys = {
+        let reg = registry.borrow();
+        if !reg.has_group_readers() {
+            return;
+        }
+        reg.group_reader_keys()
+    };
+    let mut reg = registry.borrow_mut();
+    let mut budget = crate::blocking::pop_log::wake_budget();
+    for (db_index, key) in keys {
+        crate::shard::slice::with_shard_db(db_index, |db| {
+            crate::blocking::stream_wake::try_wake_stream_waiter_budgeted(
+                &mut reg,
+                db,
+                db_index,
+                &key,
+                &mut budget,
+            );
+        });
+    }
+}
+
 /// How a script's writes reach the clients blocked on the keys they touched.
 pub enum ScriptWakes<'a> {
     /// Serve them when the script returns, from this shard's registry.
@@ -1176,7 +1265,7 @@ pub fn begin_script_writes(wakes: &ScriptWakes<'_>) {
 /// that cannot produce a list, zset or stream ([`may_ready_a_key`]); a key is
 /// recorded once per script.
 pub fn note_script_write(db_index: usize, cmd: &[u8], args: &[Frame]) {
-    if !SCRIPT_WAKES_ARMED.with(std::cell::Cell::get) || !may_ready_a_key(cmd) {
+    if !SCRIPT_WAKES_ARMED.with(std::cell::Cell::get) || !may_wake(cmd) {
         return;
     }
     SCRIPT_WRITES.with(|w| {
