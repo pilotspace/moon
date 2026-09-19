@@ -191,6 +191,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`MOVE` and `COPY ... DB n` queued inside `MULTI` now run at `EXEC`, into
+  the database they name** (moon#1062). The transaction executors sent every
+  queued command to the single-db dispatch, which cannot reach a second
+  database. `MOVE` answered `-ERR MOVE requires handler-level dispatch` in its
+  slot. `COPY a b DB 4` was worse: it answered `:1`, wrote `b` into the SOURCE
+  db, and logged the command verbatim, so a replica (and AOF replay, once
+  moon#1046 lands) put `b` in db 4 while the master had it in db 0. Every
+  executor now runs both commands against both databases with the same
+  helpers as the live paths: the sharded one on monoio and tokio, the
+  owner-routed `TxnExecute`, and the embedded `handler_single` one. A `SELECT`
+  queued earlier in the body chooses the source db. Only a `:1` is logged,
+  verbatim, under the source db, which is the record the live paths already
+  write.
+
+  In the same family, redis 8.6.1's replies now come back on every path. `MOVE
+  key <current db>` answers `ERR source and destination objects are the same`
+  (it answered `:0`). A negative or too-large db index answers `ERR DB index is
+  out of range` for both `MOVE` and `COPY` (they answered `ERR value is not an
+  integer or out of range` and `ERR invalid DB index`). `COPY k k` gives the
+  same-object error even when `k` is missing.
+
+  **Cross-shard `COPY ... DB n` is refused.** At `--shards > 1`, `COPY src dst
+  DB n` whose two keys hash to different shards was routed by `src` alone, and
+  `dst` was written into `src`'s shard. There, no normally routed read could
+  see it: 24 of 24 constructed split placements acked `:1` and read back nil,
+  and the AOF recorded them on the wrong shard. It now answers the two-key-write
+  `CROSSSLOT` error, as `RENAME` does. A `{hash}` tag co-locates the keys, and
+  `COPY` without a `DB` clause still works across shards.
+
+- **The cold-index rebuild no longer drops entries silently, and an
+  indexed-but-unreadable cold entry is no longer a "miss" in code**
+  (moon#875). `ColdIndex::rebuild_from_manifest_per_db` skipped a heap file
+  that failed to read (any `io::Error`), a page that failed its magic/type/CRC
+  check, and a trailing partial page (`chunks_exact` discards the remainder)
+  with no log line, no counter and no error — and every entry lost that way
+  then read as an ABSENT key, indistinguishable to a client from one that was
+  never written. Two more silent paths were found on the way: a slot inside a
+  CRC-valid page that does not decode (an unknown `ValueType`, i.e. a
+  downgrade), and a file truncated on a page boundary, which no per-page check
+  can see. Every one is now counted by cause (`INFO` →
+  `reclamation_cold_recovery_{files_missing,files_unreadable,files_short,pages_rejected,partial_page_bytes,entries_rejected}_total`),
+  logged with the `file_id` and page, and rolled into one per-shard summary
+  that says `cold index rebuild clean` or `cold index rebuild DEGRADED`. A
+  valid `KvOverflow` page — which `KvLeafPage::from_bytes` also rejects — is
+  classified from its header first and is NOT counted as loss. The decision
+  per class: a `NotFound` file (the orphan sweep's unlink-before-commit crash
+  window, or external removal) is warned about and queued so the sweep
+  retires its manifest entry instead of re-warning on every boot; any other
+  read error is logged at `error` and the file is skipped, never tombstoned,
+  so a restart after the operator fixes it recovers the keys (a recovery
+  `Err` today falls back to v2 recovery, which would discard the whole v3
+  replay — refusing to boot needs a path shard init does not have yet, left
+  as a follow-up); corrupt pages, partial pages and undecodable slots are
+  bytes that are gone, so they are counted and logged. On the read side,
+  `ColdReadOutcome` gained `Unreadable(ColdReadFault)`: `Miss` now means only
+  "no index entry", and a read whose index entry points at bytes that cannot
+  be produced is counted (`reclamation_cold_read_unreadable_total`), logged
+  with its location, and leaves the index entry in place so a later read
+  heals. **At the wire such a key now answers `-IOERR cold tier: key is
+  indexed but its data could not be read (see server log)` instead of nil**,
+  on both dispatch paths: the fabricating accessors (`get_or_create*` and
+  their compact siblings), `INCR*`/`INCRBYFLOAT`, `APPEND`, `SETRANGE`,
+  `GETSET` and `SET … GET|KEEPTTL` refuse BEFORE mutating — previously
+  `INCR` minted a counter from zero and `HSET`/`LPUSH`/… fabricated a fresh
+  value that shadowed the cold copy until the orphan sweep reclaimed it for
+  good — and a dispatch-boundary gate turns every remaining `Database::get`-
+  shaped reply into the error (one relaxed load per command). `EXISTS`,
+  `DBSIZE` and `TYPE` keep reporting the key present, plain `SET` still
+  overwrites (it never reads the old value) and `DEL` discards: the two
+  escape hatches. Proved two ways against the pre-fix binary at `--shards 1`
+  and `4`: (a) a real spill → `BGREWRITEAOF` → `SIGKILL` → on-disk damage →
+  restart lifecycle, where the four damaged keys answered nil with nothing in
+  `INFO` or the log and now come with the counters and the file ids; (b) a
+  file removed and another `chmod 000` under the RUNNING server, where
+  `GET` answered `$-1` for an indexed key and now answers `-IOERR`, `APPEND`
+  and `INCR` are refused, and after `chmod 644` the ORIGINAL value is served.
+
 - **An acknowledged `MOVE` or `COPY src dst DB n` survives `kill -9` and
   restart** (moon#1046). Both commands need two databases, so the live paths
   run them through a two-db intercept, but AOF/WAL replay handed the logged

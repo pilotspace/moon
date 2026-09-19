@@ -111,7 +111,41 @@ pub fn dispatch(
     dispatch_inner(db, cmd, args, selected_db, db_count)
 }
 
+/// moon#875: if the command just executed raised the cold-fault flag — it
+/// read a key that is INDEXED in the cold tier but whose bytes could not be
+/// produced — its reply becomes `-IOERR`, never the nil/0/empty that a
+/// genuinely absent key produces. The fabricating accessors already refuse
+/// before mutating and consume the flag themselves; this is the catch-all
+/// for every `Database::get`-shaped read, which has no error channel of its
+/// own. One relaxed load per command when nothing is pending.
+///
+/// The three dispatch paths: this gates `dispatch` and `dispatch_read`;
+/// `server::conn::try_inline_dispatch` never reads the cold tier (it stands
+/// down to generic dispatch on any cold location), so it cannot raise the
+/// flag and needs no gate.
+#[inline]
+fn cold_fault_gate(db: &Database, result: DispatchResult) -> DispatchResult {
+    if db.take_cold_fault().is_none() {
+        return result;
+    }
+    match result {
+        DispatchResult::Response(_) => DispatchResult::Response(Database::cold_fault_error()),
+        quit @ DispatchResult::Quit(_) => quit,
+    }
+}
+
 fn dispatch_inner(
+    db: &mut Database,
+    cmd: &[u8],
+    args: &[Frame],
+    selected_db: &mut usize,
+    db_count: usize,
+) -> DispatchResult {
+    let result = dispatch_inner_unchecked(db, cmd, args, selected_db, db_count);
+    cold_fault_gate(db, result)
+}
+
+fn dispatch_inner_unchecked(
     db: &mut Database,
     cmd: &[u8],
     args: &[Frame],
@@ -1252,6 +1286,16 @@ pub fn dispatch_read(
 }
 
 fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -> DispatchResult {
+    let result = dispatch_read_inner_unchecked(db, cmd, args, now_ms);
+    cold_fault_gate(db, result)
+}
+
+fn dispatch_read_inner_unchecked(
+    db: &Database,
+    cmd: &[u8],
+    args: &[Frame],
+    now_ms: u64,
+) -> DispatchResult {
     let len = cmd.len();
     if len == 0 {
         return DispatchResult::Response(err_unknown(cmd));
