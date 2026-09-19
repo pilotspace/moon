@@ -1534,6 +1534,8 @@ pub(super) fn try_enforce_acl(
                 .unwrap_or_default()
                 .as_millis() as u64,
         });
+        // moon#1035: inside MULTI a refusal poisons the block (EXECABORT).
+        conn.flag_transaction();
         responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
         return true;
     }
@@ -1554,6 +1556,8 @@ pub(super) fn try_enforce_acl(
                 .unwrap_or_default()
                 .as_millis() as u64,
         });
+        // moon#1035: a denied KEY poisons an open transaction too.
+        conn.flag_transaction();
         responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
         return true;
     }

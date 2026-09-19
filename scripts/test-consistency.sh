@@ -4517,6 +4517,53 @@ assert_acl_probe "#971 +@all -get: GET denied"  GET n978:vic
 assert_acl_probe "#971 +@all -get: SET allowed" SET n978:pol 1
 acl_reset_user
 
+# --- #1035: an ACL refusal inside MULTI poisons the transaction -------------
+# redis refuses a denied command, key or channel at QUEUE time and EXEC then
+# answers EXECABORT, applying nothing. RED on main: moon answered NOPERM, did
+# not queue it, and EXEC applied the rest (`GET` returned `from-txn`).
+#
+# One transaction on one /dev/tcp connection, inline commands. The outcome is
+# normalised to the reply CLASSES (moon's NOPERM text for keys and channels
+# differs from redis's -- a separate, older divergence) plus the key's final
+# value, and compared across the two servers. ECHO after EXEC is the round-trip
+# barrier, as in `watch_cas_outcome`.
+multi_acl_outcome() {  # <port> <user> <key> <refused inline command>
+    local port="$1" user="$2" key="$3" refused="$4" line="" out=""
+    redis-cli -p "$port" DEL "$key" >/dev/null 2>&1 || true
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED_p${port}__"; return 0; }
+    printf 'AUTH %s pw\r\nMULTI\r\nSET %s from-txn\r\n%s\r\nEXEC\r\nECHO txn-done\r\n' \
+        "$user" "$key" "$refused" >&3
+    while IFS= read -r -t 5 line <&3; do
+        line="${line%$'\r'}"
+        case "$line" in
+            -NOPERM*)    out="${out}noperm;" ;;
+            -EXECABORT*) out="${out}execabort;" ;;
+            txn-done)    break ;;
+        esac
+    done
+    exec 3>&-
+    echo "${out}[$(redis-cli -p "$port" GET "$key" 2>&1)]"
+}
+# The denied command is INCR, not something destructive: if the ACL gate itself
+# ever regressed, a denied FLUSHALL here would wipe every row after this one.
+both ACL SETUSER n1035:cmd  reset on '>pw' '~*' '&*' +@all -incr
+both ACL SETUSER n1035:key  reset on '>pw' '~ok:*' '&*' +@all
+both ACL SETUSER n1035:chan reset on '>pw' '~*' resetchannels '&allowed' +@all
+assert_eq "#1035 denied command in MULTI aborts EXEC" \
+    "$(multi_acl_outcome "$PORT_REDIS" n1035:cmd n1035:k1 'INCR n1035:ctr')" \
+    "$(multi_acl_outcome "$PORT_RUST"  n1035:cmd n1035:k1 'INCR n1035:ctr')"
+assert_eq "#1035 denied key in MULTI aborts EXEC" \
+    "$(multi_acl_outcome "$PORT_REDIS" n1035:key ok:n1035 'SET n1035:secret 1')" \
+    "$(multi_acl_outcome "$PORT_RUST"  n1035:key ok:n1035 'SET n1035:secret 1')"
+assert_eq "#1035 denied channel in MULTI aborts EXEC" \
+    "$(multi_acl_outcome "$PORT_REDIS" n1035:chan n1035:k3 'PUBLISH secret x')" \
+    "$(multi_acl_outcome "$PORT_RUST"  n1035:chan n1035:k3 'PUBLISH secret x')"
+assert_eq "#1035 permitted channel in MULTI still commits" \
+    "$(multi_acl_outcome "$PORT_REDIS" n1035:chan n1035:k4 'PUBLISH allowed x')" \
+    "$(multi_acl_outcome "$PORT_RUST"  n1035:chan n1035:k4 'PUBLISH allowed x')"
+both ACL DELUSER n1035:cmd n1035:key n1035:chan
+both DEL n1035:k1 n1035:ctr ok:n1035 n1035:k3 n1035:k4
+
 # ---------------------------------------------------------------------------
 # ACL CAT diff against the live oracle, all 21 redis categories.
 #

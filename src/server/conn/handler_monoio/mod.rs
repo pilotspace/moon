@@ -2127,6 +2127,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     responses.push(err);
                     continue;
                 }
+                // moon#1035: the ACL gate above checks command and keys, never
+                // a PUBLISH channel — refuse a denied one HERE so the block
+                // aborts, instead of at EXEC after the rest of it ran.
+                if let Some(err) = crate::server::conn::shared::queued_publish_channel_deny(
+                    &ctx.acl_table,
+                    &conn.current_user,
+                    cmd,
+                    cmd_args,
+                ) {
+                    conn.flag_transaction();
+                    responses.push(err);
+                    continue;
+                }
                 // Blocking commands must not block at EXEC. Most queue as
                 // their non-blocking twin; the four whose twin answers a
                 // different SHAPE queue unchanged and run in immediate-only
