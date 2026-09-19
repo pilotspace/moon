@@ -89,13 +89,19 @@ enum Repr {
 /// Cheap to clone (`Arc` bump) and `Send`, so it can ride a
 /// `ShardMessage::Execute` to the shard that owns the script's keys.
 #[derive(Clone)]
-pub struct ScriptAcl(Arc<Repr>);
+pub struct ScriptAcl {
+    repr: Arc<Repr>,
+    /// Who ran the script, for CLIENT TRACKING (moon#1089). Not an ACL
+    /// input: it only rides along, so the one value that already travels
+    /// to whichever shard runs the script carries it there too.
+    caller: crate::tracking::ScriptCaller,
+}
 
 // Hand-written: `AclTable` is not `Debug`, and printing a user's rules into a
 // log line would be the wrong default anyway. Only the MODE is shown.
 impl std::fmt::Debug for ScriptAcl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &*self.0 {
+        match &*self.repr {
             Repr::Deny => f.write_str("ScriptAcl::Deny"),
             Repr::Trusted => f.write_str("ScriptAcl::Trusted"),
             Repr::User(u) => write!(f, "ScriptAcl::User({})", u.username),
@@ -121,7 +127,7 @@ impl ScriptAcl {
         // One process-wide allocation, not one per message.
         static DENY: std::sync::LazyLock<Arc<Repr>> =
             std::sync::LazyLock::new(|| Arc::new(Repr::Deny));
-        ScriptAcl(Arc::clone(&DENY))
+        ScriptAcl::from_repr(Arc::clone(&DENY))
     }
 
     /// Identity for a caller that is trusted by construction and has no ACL
@@ -138,7 +144,7 @@ impl ScriptAcl {
     pub fn trusted() -> Self {
         static TRUSTED: std::sync::LazyLock<Arc<Repr>> =
             std::sync::LazyLock::new(|| Arc::new(Repr::Trusted));
-        ScriptAcl(Arc::clone(&TRUSTED))
+        ScriptAcl::from_repr(Arc::clone(&TRUSTED))
     }
 
     /// Resolve `username` against `table` once, at script-start time.
@@ -157,7 +163,7 @@ impl ScriptAcl {
                 guard.version_handle(),
             )
         };
-        ScriptAcl(Arc::new(Repr::User(ScriptAclUser {
+        ScriptAcl::from_repr(Arc::new(Repr::User(ScriptAclUser {
             table: Arc::clone(table),
             username: username.into(),
             version,
@@ -166,11 +172,33 @@ impl ScriptAcl {
         })))
     }
 
+    fn from_repr(repr: Arc<Repr>) -> Self {
+        ScriptAcl {
+            repr,
+            caller: crate::tracking::ScriptCaller::default(),
+        }
+    }
+
+    /// Attach the CLIENT TRACKING identity of the connection running the
+    /// script (moon#1089). Every client-issued script sets it; a script with
+    /// none still invalidates what it writes and registers no reads.
+    #[must_use]
+    pub fn with_caller(mut self, caller: crate::tracking::ScriptCaller) -> Self {
+        self.caller = caller;
+        self
+    }
+
+    /// The CLIENT TRACKING identity attached by [`Self::with_caller`].
+    #[must_use]
+    pub fn caller(&self) -> crate::tracking::ScriptCaller {
+        self.caller
+    }
+
     /// Whether this identity is subject to per-command ACL checks at all.
     /// Diagnostics/tests only — the check itself is [`Self::check`].
     #[must_use]
     pub fn is_enforcing(&self) -> bool {
-        matches!(&*self.0, Repr::User(_) | Repr::Deny)
+        matches!(&*self.repr, Repr::User(_) | Repr::Deny)
     }
 
     /// Authorize one script-issued command. `args` EXCLUDES the command name.
@@ -181,7 +209,7 @@ impl ScriptAcl {
     #[inline]
     #[must_use]
     pub fn check(&self, cmd: &[u8], args: &[Frame]) -> Option<String> {
-        match &*self.0 {
+        match &*self.repr {
             // Hot path for the admin plane: one discriminant test.
             Repr::Trusted => None,
             Repr::Deny => Some(

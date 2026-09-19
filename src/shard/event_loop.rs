@@ -114,6 +114,14 @@ impl super::Shard {
         // on the first accept if this is skipped.
         crate::shard::slice::init_shard(crate::shard::slice::ShardSlice::new(slice_init));
         crate::shard::slice::assert_initialized(self.id);
+        // moon#1056: a blocking pop is logged by the shard that pops it, in
+        // the pop's own synchronous stretch, to THIS shard's AOF and
+        // replication stream. Installed before any command can run.
+        crate::blocking::pop_log::install(
+            self.id,
+            aof_pool.as_ref().map(Arc::clone),
+            repl_state_ext.clone(),
+        );
 
         // Publish disk-offload status for INFO moonstore (set once per shard, idempotent).
         crate::vector::metrics::MOONSTORE_DISK_OFFLOAD_ENABLED.store(

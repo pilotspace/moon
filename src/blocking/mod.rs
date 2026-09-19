@@ -2,6 +2,7 @@ pub mod claim;
 #[cfg(test)]
 mod claim_wake_tests;
 pub mod group;
+pub mod pop_log;
 pub mod wakeup;
 
 pub use claim::{ClaimToken, Settled};

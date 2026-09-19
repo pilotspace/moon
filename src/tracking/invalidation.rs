@@ -146,16 +146,22 @@ pub fn invalidate_keys(
     if keys.is_empty() {
         return;
     }
-    let mut table = table.lock();
-    for key in keys {
-        let recipients = table.invalidate_key(key, writer_client_id);
-        if !recipients.is_empty() {
-            let mut msg = crate::tracking::TrackingMessage::keys(std::slice::from_ref(key));
-            for to in &recipients {
-                msg.deliver(to);
+    // One item per REDIRECT inbox for the whole key list, or for the whole
+    // EXEC body when one has opened a batch (moon#1088). The lock is taken
+    // INSIDE the batch scope, so a batch of this call's own is sent after the
+    // lock is released.
+    crate::tracking::with_delivery_batch(|batch| {
+        let mut table = table.lock();
+        for key in keys {
+            let recipients = table.invalidate_key(key, writer_client_id);
+            if !recipients.is_empty() {
+                let mut msg = crate::tracking::TrackingMessage::keys(std::slice::from_ref(key));
+                for to in &recipients {
+                    batch.deliver(&mut msg, to);
+                }
             }
         }
-    }
+    });
 }
 
 /// Writer id for a removal the SERVER decided on (expiry, eviction).
@@ -241,8 +247,104 @@ pub fn track_read_keys(
     if keys.is_empty() {
         return;
     }
-    let mut table = table.lock();
-    for key in &keys {
+    track_keys(&mut table.lock(), &keys, client_id, noloop);
+}
+
+/// What one command a script ran did to one key (moon#1089).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptKeyEffect {
+    /// The command may have modified the key: invalidate it.
+    Written,
+    /// The command read the key: register it for the script's caller.
+    Read,
+}
+
+/// Append the tracking effects of one command a script ran to `log`: the
+/// keys it may modify ([`written_keys`]), then, when the caller's reads are
+/// tracked, the keys it read. That is the order a command run outside a
+/// script takes effect in.
+pub fn record_script_command(
+    log: &mut Vec<(ScriptKeyEffect, Bytes)>,
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    track_reads: bool,
+) {
+    if crate::command::metadata::is_write(cmd) {
+        log.extend(
+            written_keys(cmd, cmd_args)
+                .into_iter()
+                .map(|k| (ScriptKeyEffect::Written, k)),
+        );
+    }
+    if track_reads && crate::command::metadata::is_read(cmd) {
+        log.extend(
+            command_keys(cmd, cmd_args)
+                .into_iter()
+                .map(|k| (ScriptKeyEffect::Read, k)),
+        );
+    }
+}
+
+/// Apply a script's recorded tracking effects under ONE acquisition of the
+/// tracking mutex, in the order the script made them (moon#1089).
+///
+/// A script runs to completion on the shard that owns its keys. Nothing
+/// else can change those keys while it runs, so applying its effects when
+/// it ends gives the same result as applying each one as it happened.
+/// Measured on redis-server 8.6.1, for a RESP3 caller:
+/// - `GET k` then `SET k` in one script pushes `invalidate [k]` to the
+///   caller, and no push if the caller has NOLOOP;
+/// - `SET k` then `GET k` leaves `k` tracked.
+///
+/// A write invalidates with the caller as the writer, so NOLOOP is judged
+/// against the caller. A read registers only for a caller that still tracks.
+/// A script can run on another shard than its caller, so the caller may have
+/// disconnected, or turned tracking off, before the script ends. A key
+/// registered for a client whose teardown already ran would be an entry
+/// that nothing ever removes. So the caller's registration is checked under
+/// the same lock that adds the keys.
+pub fn apply_script_effects(
+    table: &parking_lot::Mutex<crate::tracking::TrackingTable>,
+    effects: &[(ScriptKeyEffect, Bytes)],
+    client_id: u64,
+    noloop: bool,
+) {
+    if effects.is_empty() {
+        return;
+    }
+    crate::tracking::with_delivery_batch(|batch| {
+        let mut table = table.lock();
+        let caller_tracks = table.is_tracking(client_id);
+        for (effect, key) in effects {
+            let (named, recipients) = match effect {
+                ScriptKeyEffect::Written => (key.clone(), table.invalidate_key(key, client_id)),
+                // Cap eviction (G1): the evicted key's trackers drop their copy.
+                ScriptKeyEffect::Read if caller_tracks => {
+                    match table.track_key(client_id, key, noloop) {
+                        Some(evicted) => evicted,
+                        None => continue,
+                    }
+                }
+                ScriptKeyEffect::Read => continue,
+            };
+            if recipients.is_empty() {
+                continue;
+            }
+            let mut msg = crate::tracking::TrackingMessage::keys(std::slice::from_ref(&named));
+            for to in &recipients {
+                batch.deliver(&mut msg, to);
+            }
+        }
+    });
+}
+
+fn track_keys(
+    table: &mut crate::tracking::TrackingTable,
+    keys: &[Bytes],
+    client_id: u64,
+    noloop: bool,
+) {
+    for key in keys {
         if let Some((evicted_key, recipients)) = table.track_key(client_id, key, noloop) {
             // Cap eviction (G1): tell the evicted key's trackers to drop
             // their cached copy — silently forgetting the tracking entry
@@ -253,6 +355,15 @@ pub fn track_read_keys(
                 msg.deliver(to);
             }
         }
+    }
+}
+
+/// Closes a delivery batch however the scope ends.
+struct FlushOnDrop;
+
+impl Drop for FlushOnDrop {
+    fn drop(&mut self) {
+        crate::tracking::end_delivery_batch();
     }
 }
 
@@ -294,6 +405,9 @@ pub fn after_transaction(
     tracking_now: bool,
 ) {
     let mut modes = before;
+    // The whole body's invalidations reach each REDIRECT inbox as one item.
+    crate::tracking::begin_delivery_batch();
+    let _flush = FlushOnDrop;
     for (cmd_frame, result) in queue.iter().zip(results) {
         let Some((cmd, args)) = crate::server::conn::util::extract_command(cmd_frame) else {
             continue;
@@ -303,6 +417,13 @@ pub fn after_transaction(
         }
         if cmd.eq_ignore_ascii_case(b"CLIENT") {
             crate::tracking::client_cmd::replay_accepted(&mut modes, args);
+            continue;
+        }
+        // A script's own `redis.call`s were tracked by the scripting bridge
+        // as they ran (moon#1089). Its declared keys say nothing about what
+        // it read or wrote: `FCALL` is write-flagged even for a function that
+        // only reads, and `EVAL_RO` is read-flagged whatever it touched.
+        if crate::server::conn::txn_script::is_txn_script(cmd) {
             continue;
         }
         invalidate_after_write(table, cmd, args, client_id);
@@ -982,6 +1103,111 @@ mod tests {
             tracked_after(armed, true, &queue, &results, &["a", "b"]),
             vec!["a", "b"]
         );
+    }
+
+    /// moon#1089: a script queued in MULTI was tracked by the scripting
+    /// bridge as it ran. Its declared keys must not be bookkept again: FCALL
+    /// is write-flagged even for a function that only reads (redis 8.6.1
+    /// sends nothing), and a second pass would push a BCAST tracker twice.
+    #[test]
+    fn queued_scripts_are_left_to_the_bridge() {
+        let table = parking_lot::Mutex::new(crate::tracking::TrackingTable::new());
+        let (tx, rx) = crate::runtime::channel::mpsc_unbounded::<Frame>();
+        {
+            let mut t = table.lock();
+            t.register_client(1, tx);
+            let _ = t.track_key(1, &Bytes::from_static(b"k"), false);
+        }
+        let queue = [
+            cmd(&["FCALL", "r", "1", "k"]),
+            cmd(&["EVAL", "return 1", "1", "k"]),
+            cmd(&["EVAL_RO", "return 1", "1", "e"]),
+        ];
+        let results = [Frame::Null, Frame::Integer(1), Frame::Integer(1)];
+        after_transaction(&table, &queue, &results, 2, on(false, false), true);
+        assert!(
+            pushed_keys(&rx).is_empty(),
+            "FCALL's declared key was invalidated"
+        );
+        let t = table.lock();
+        assert_eq!(t.tracked_clients(&Bytes::from_static(b"k")), vec![1]);
+        assert!(
+            t.tracked_clients(&Bytes::from_static(b"e")).is_empty(),
+            "EVAL_RO's declared key was tracked for the caller"
+        );
+    }
+
+    /// A script can run on another shard than its caller; a read that
+    /// arrives after the caller left (or turned tracking off) must not
+    /// register a key nothing will ever clean up.
+    #[test]
+    fn a_script_read_for_a_departed_caller_registers_nothing() {
+        let table = parking_lot::Mutex::new(crate::tracking::TrackingTable::new());
+        let read = |key: &'static str| {
+            let mut log = Vec::new();
+            record_script_command(&mut log, b"GET", &[bulk(key)], true);
+            log
+        };
+        apply_script_effects(&table, &read("gone"), 77, false);
+        assert!(
+            table
+                .lock()
+                .tracked_clients(&Bytes::from_static(b"gone"))
+                .is_empty()
+        );
+        let (tx, _rx) = crate::runtime::channel::mpsc_unbounded::<Frame>();
+        table.lock().register_client(77, tx);
+        apply_script_effects(&table, &read("here"), 77, false);
+        assert_eq!(
+            table.lock().tracked_clients(&Bytes::from_static(b"here")),
+            vec![77]
+        );
+        table.lock().untrack_all(77);
+    }
+
+    /// A script's effects apply in the order it made them. `GET k` then
+    /// `SET k` leaves the caller told and `k` no longer tracked. `SET k` then
+    /// `GET k` leaves `k` tracked and nobody told. Both match redis 8.6.1.
+    #[test]
+    fn a_script_s_effects_apply_in_order() {
+        let table = parking_lot::Mutex::new(crate::tracking::TrackingTable::new());
+        let (tx, rx) = crate::runtime::channel::mpsc_unbounded::<Frame>();
+        table.lock().register_client(78, tx);
+        let get = |log: &mut Vec<_>, k: &'static str| {
+            record_script_command(log, b"GET", &[bulk(k)], true)
+        };
+        let set = |log: &mut Vec<_>, k: &'static str| {
+            record_script_command(log, b"SET", &[bulk(k), bulk("v")], true)
+        };
+
+        let mut log = Vec::new();
+        get(&mut log, "gs");
+        set(&mut log, "gs");
+        apply_script_effects(&table, &log, 78, false);
+        assert_eq!(rx.try_recv().ok(), Some(invalidation_push(&[key("gs")])));
+        assert!(table.lock().tracked_clients(&key("gs")).is_empty());
+
+        let mut log = Vec::new();
+        set(&mut log, "sg");
+        get(&mut log, "sg");
+        apply_script_effects(&table, &log, 78, false);
+        assert!(
+            rx.try_recv().is_err(),
+            "nobody tracked sg when it was written"
+        );
+        assert_eq!(table.lock().tracked_clients(&key("sg")), vec![78]);
+
+        // NOLOOP: the caller's own write does not tell it.
+        let mut log = Vec::new();
+        get(&mut log, "nl");
+        set(&mut log, "nl");
+        apply_script_effects(&table, &log, 78, true);
+        assert!(rx.try_recv().is_err());
+        table.lock().untrack_all(78);
+    }
+
+    fn key(s: &str) -> Bytes {
+        Bytes::copy_from_slice(s.as_bytes())
     }
 
     /// A queued CLIENT command that EXEC answered with an error changes
