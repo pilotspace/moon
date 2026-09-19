@@ -18,8 +18,11 @@
 #      to the module, so the compiler already refuses the path form; this
 #      catches a re-declaration.
 #   2. In the consultation directories, an upgrade decision must be the
-#      authority's: a `should_upgrade =` line that does not call
-#      `listpack_fits(` is a hand-rolled threshold.
+#      authority's: a `should_upgrade =` STATEMENT (through its closing `;`)
+#      that does not call `listpack_fits(` is a hand-rolled threshold. The
+#      whole statement is read, not one line: rustfmt moves a long right-hand
+#      side onto the next line, and a line-based check then flagged a correct
+#      `listpack_fits` call as a violation.
 #   3. In the consultation directories, no code line re-derives the unit —
 #      `.len() / 2` compared with anything is exactly the moon#896 shape.
 #
@@ -38,6 +41,27 @@ AUTHORITY="src/storage/encoding_limits.rs"
 # Where the policy is consulted: every write command, the codec's decode-side
 # re-derivation, and the persistence loaders that call it.
 CONSULT_DIRS=(src/command src/storage/value_codec.rs src/storage/db src/persistence)
+
+# Print `file:line:text` for every `should_upgrade =` statement under the
+# given roots whose text, read up to its terminating `;`, never calls
+# `listpack_fits(`. Comment lines are skipped, as in `code_lines`.
+upgrade_decisions_outside_authority() {
+    local f
+    grep -rl --include='*.rs' -E 'should_upgrade[[:space:]]*=' "$@" 2>/dev/null \
+        | while IFS= read -r f; do
+            awk -v file="$f" '
+                /^[[:space:]]*(\/\/|\*)/ { next }
+                !open && /should_upgrade[[:space:]]*=/ { open = 1; start = FNR; head = $0; stmt = "" }
+                open {
+                    stmt = stmt $0 "\n"
+                    if ($0 ~ /;/) {
+                        if (stmt !~ /listpack_fits\(/) print file ":" start ":" head
+                        open = 0
+                    }
+                }
+            ' "$f"
+        done
+}
 
 # Print code lines (file:line:text) of `*.rs` under the given roots, with
 # comment lines removed.
@@ -61,9 +85,7 @@ scan() {
         | sed 's/$/   <- retired threshold name; use EncodingLimits (rule 1)/'
 
     # Rule 2: an upgrade decision that is not the authority's.
-    code_lines "${consult[@]}" \
-        | grep -E 'should_upgrade[[:space:]]*=' \
-        | grep -v 'listpack_fits(' \
+    upgrade_decisions_outside_authority "${consult[@]}" \
         | sed 's/$/   <- upgrade check must be EncodingLimits::listpack_fits (rule 2)/'
 
     # Rule 3: a re-derived unit — `.len() / 2` compared with anything.
@@ -84,6 +106,16 @@ pub const LISTPACK_MAX_ENTRIES: usize = 128;
 EOF
     cat > "$tmp/src/command/hash/bad2.rs" <<'EOF'
 let should_upgrade = lp.len() > 128;
+EOF
+    # rustfmt-wrapped: the hand-rolled threshold sits on the NEXT line.
+    cat > "$tmp/src/command/hash/bad5.rs" <<'EOF'
+let should_upgrade =
+    stored.is_some() && lp.len() > 128;
+EOF
+    # rustfmt-wrapped and correct: the authority call is on the next line.
+    cat > "$tmp/src/command/hash/clean_wrapped.rs" <<'EOF'
+let should_upgrade =
+    stored.is_some() && !limits.listpack_fits(Shape::SortedSet, lp);
 EOF
     cat > "$tmp/src/command/hash/bad3.rs" <<'EOF'
 if lp.len() / 2 > limit { promote(); }
@@ -107,19 +139,22 @@ EOF
     local out rc=0
     out="$(scan "$tmp")"
     local want
-    for want in bad1.rs bad2.rs bad3.rs bad4.rs; do
+    for want in bad1.rs bad2.rs bad3.rs bad4.rs bad5.rs; do
         if ! grep -q "$want" <<< "$out"; then
             echo "SELF-TEST FAIL: $want was not flagged"; rc=1
         fi
     done
-    if grep -q 'clean.rs' <<< "$out"; then
-        echo "SELF-TEST FAIL: clean.rs was flagged:"; grep 'clean.rs' <<< "$out"; rc=1
-    fi
+    local ok
+    for ok in clean.rs clean_wrapped.rs; do
+        if grep -q "/$ok:" <<< "$out"; then
+            echo "SELF-TEST FAIL: $ok was flagged:"; grep "/$ok:" <<< "$out"; rc=1
+        fi
+    done
     if grep -q "encoding_limits.rs" <<< "$out"; then
         echo "SELF-TEST FAIL: the authority module was flagged:"; grep 'encoding_limits.rs' <<< "$out"; rc=1
     fi
     if [[ $rc -eq 0 ]]; then
-        echo "audit-encoding-limits self-test: OK (4 violations flagged, 2 clean files passed)"
+        echo "audit-encoding-limits self-test: OK (5 violations flagged, 3 clean files passed)"
     fi
     return $rc
 }

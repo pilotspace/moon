@@ -1581,6 +1581,15 @@ pub(super) async fn try_handle_functions(
     if conn.in_multi {
         return false;
     }
+    // Every name this gate claims is tested HERE, at the top, before the
+    // FUNCTION arm's body. The intercept-gate scanners
+    // (`names_claimed_by_gates` in `shared.rs`'s tests and in
+    // `tests/intercept_flag_drift.rs`) read only a gate's opening region, and
+    // `FCALL`/`FCALL_RO` used to be compared ~1.2 KB further down — past that
+    // window — so neither scanner knew this gate claims them, and a
+    // `NO_INTERCEPT` mark on `FCALL` would have skipped this gate unnoticed.
+    let is_fcall = cmd.eq_ignore_ascii_case(b"FCALL");
+    let is_fcall_ro = cmd.eq_ignore_ascii_case(b"FCALL_RO");
     if cmd.eq_ignore_ascii_case(b"FUNCTION") {
         crate::server::conn::core::ensure_function_registry(func_registry, ctx);
         // Borrow scoped to this block, and released before the fan-out await.
@@ -1609,8 +1618,7 @@ pub(super) async fn try_handle_functions(
         responses.push(response);
         return true;
     }
-    let is_fcall = cmd.eq_ignore_ascii_case(b"FCALL");
-    if is_fcall || cmd.eq_ignore_ascii_case(b"FCALL_RO") {
+    if is_fcall || is_fcall_ro {
         // moon#569: FCALL bodies are ACL-gated per `redis.call`, same as
         // EVAL. Resolved BEFORE routing so the same identity is used whether
         // the call runs here or on the shard that owns the key — routing must

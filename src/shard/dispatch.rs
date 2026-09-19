@@ -1079,6 +1079,12 @@ pub struct TxnExecutePayload {
     /// deployment: the exact silent-guarantee failure this task exists to
     /// remove. Empty for non-WATCH transactions, which is nearly all of them.
     pub watched: std::collections::HashMap<Bytes, crate::server::conn::shared::WatchToken>,
+    /// moon#894: the ORIGINATING connection's ACL identity, present exactly
+    /// when the body queues a script (`EVAL`/`EVALSHA`/`FCALL`, `_RO` twins).
+    /// The owner runs those scripts in the body and authorizes each inner
+    /// `redis.call` as this user — routing must never change what a caller
+    /// may do (moon#569). `None` for a body with no script.
+    pub script_acl: Option<crate::acl::ScriptAcl>,
 }
 
 /// Reply for [`ShardMessage::TxnExecute`].

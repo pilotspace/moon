@@ -387,7 +387,7 @@ pub(crate) fn execute_transaction(
 /// order as the live path).
 pub(crate) fn execute_transaction_sharded(
     shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
-    _shard_id: usize,
+    shard_id: usize,
     command_queue: &[Frame],
     selected_db: usize,
     // `proto`: the connection's protocol version. Each inner reply is
@@ -408,6 +408,10 @@ pub(crate) fn execute_transaction_sharded(
     // transactions, which is why the check below early-outs on `is_empty`
     // before touching the shard at all.
     watched_keys: &HashMap<Bytes, WatchToken>,
+    // moon#894: what a queued EVAL/EVALSHA/FCALL (and `_RO` twins) needs to
+    // run here. `None` when the body holds no script — the caller builds it
+    // only then (`txn_script::queue_has_script`).
+    scripting: Option<&super::txn_script::TxnScripting<'_>>,
 ) -> (Frame, Vec<(usize, Bytes)>, Vec<(usize, Vec<u8>)>) {
     let db_count = shard_databases.db_count();
 
@@ -473,6 +477,39 @@ pub(crate) fn execute_transaction_sharded(
         }
 
         if queue_exec_publish(cmd, cmd_args, &mut results, exec_publishes) {
+            continue;
+        }
+
+        // moon#894: a queued script runs HERE, in body order, instead of
+        // falling through to `dispatch()` — which has no scripting arm and
+        // answered `ERR unknown command` while the rest of the body committed.
+        // Its effect records join `aof_entries` at this position, so replay
+        // and replicas see the script's writes exactly where the client
+        // queued them (see `txn_script` for the full contract).
+        if super::txn_script::is_txn_script(cmd) {
+            let Some(env) = scripting else {
+                results.push(Frame::Error(Bytes::from_static(
+                    b"ERR scripting is unavailable on this shard",
+                )));
+                continue;
+            };
+            let outcome = super::txn_script::run_txn_script(env, cmd, cmd_args, selected, shard_id);
+            aof_entries.extend(outcome.effects);
+            if let Some(which) = outcome.flush {
+                // This shard's half is done; the caller broadcasts the rest
+                // exactly as for a queued FLUSHALL (c10k E2 contract above).
+                exec_flushes.push((
+                    results.len(),
+                    crate::scripting::pending_flush::broadcast_frame(which),
+                    selected,
+                ));
+            }
+            results.push(super::util::apply_resp3_conversion(
+                cmd,
+                cmd_args,
+                outcome.reply,
+                proto,
+            ));
             continue;
         }
 
@@ -1404,6 +1441,12 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
     // from this table, so a future keyless command cannot repeat moon#925 by
     // omission.
     let is_keyless = match (len, b0) {
+        // moon#937: `TXN <BEGIN|COMMIT|ABORT>` — `args[0]` is the subcommand
+        // literal. It is consumed by `try_handle_txn_*`, but the cluster slot
+        // router runs FIRST and used to hash "BEGIN" into one fixed slot for
+        // every client. `COMMAND GETKEYS` already reported it keyless.
+        // Shares `(3, 't')` with `TTL`, which pays one extra compare.
+        (3, b't') => cmd.eq_ignore_ascii_case(b"TXN"),
         (4, b'a') => cmd.eq_ignore_ascii_case(b"AUTH"),
         (4, b'e') => cmd.eq_ignore_ascii_case(b"ECHO") || cmd.eq_ignore_ascii_case(b"EXEC"),
         (4, b'i') => cmd.eq_ignore_ascii_case(b"INFO"),
@@ -1460,6 +1503,15 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
         // arity is 1 and `args.is_empty()` caught it first.
         (12, b'b') => cmd.eq_ignore_ascii_case(b"BGREWRITEAOF"),
         (12, b'p') => cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE"),
+        // moon#937: `TEMPORAL.INVALIDATE <entity_id> <NODE|EDGE> <graph>` —
+        // `args[0]` is a decimal ENTITY ID and the graph name is at `args[2]`
+        // (`command::temporal::validate_invalidate`); hashing "42" is the
+        // fixed-route signature of moon#511 / moon#534. `TEMPORAL.SNAPSHOT_AT`
+        // takes no arguments and was keyless only by the accident of arity
+        // that hid moon#925 — named here so a future optional argument
+        // cannot turn it into a routing key.
+        (19, b't') => cmd.eq_ignore_ascii_case(b"TEMPORAL.INVALIDATE"),
+        (20, b't') => cmd.eq_ignore_ascii_case(b"TEMPORAL.SNAPSHOT_AT"),
         _ => false,
     };
 
@@ -1635,13 +1687,14 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
 ///    predicate is keyed on ROUTABILITY rather than on a list of command names;
 /// 3. it is intercepted inline by a `try_handle_*` handler BEFORE routing runs,
 ///    even though it does have an args[0] that `extract_primary_key` would
-///    happily hash. That is the one case routability cannot see, so those
-///    families are named in [`is_inline_intercepted`].
+///    happily hash. That is the one case routability cannot see, so it is
+///    read off the registry by [`may_be_inline_intercepted`]: a command waits
+///    unless `COMMAND_META` marks it `NO_INTERCEPT`.
 ///
 /// Deferring is conservative: a command wrongly sent down this path is merely
 /// executed at the start of the next batch, which is always correct and costs
 /// one batch boundary. Wrongly calling something SAFE is the direction that
-/// corrupts data, so when in doubt, add it to the wait set.
+/// corrupts data, so when in doubt, leave the command unmarked and it waits.
 /// The shards a command's keys live on, as a bitmask — or `None` when the mask
 /// cannot be trusted and the caller must fall back to waiting.
 ///
@@ -1725,7 +1778,7 @@ pub(crate) fn must_wait_for_pending_remote(
     // silently escape it — the compiler names every call site.
     keys_may_be_rewritten: bool,
 ) -> bool {
-    if is_inline_intercepted(cmd) || extract_primary_key(cmd, args).is_none() {
+    if may_be_inline_intercepted(cmd) || extract_primary_key(cmd, args).is_none() {
         return true;
     }
     if !is_multi_key_command(cmd, args) {
@@ -1921,58 +1974,48 @@ pub(crate) fn single_owner_shard(cmd: &[u8], args: &[Frame], num_shards: usize) 
     }
 }
 
-/// Commands handled INLINE by a `try_handle_*` interceptor before the routing
-/// step, and which `extract_primary_key` would nonetheless answer for.
+/// May a `try_handle_*` interceptor consume `cmd` INLINE, before the routing
+/// step? `true` unless `COMMAND_META` proves otherwise.
 ///
-/// Derived by reading the interceptor chain in `handler_monoio::dispatch` /
-/// `handler_sharded`, not guessed: every other interceptor there guards a
-/// command that `extract_primary_key` already reports keyless (AUTH, HELLO,
-/// CLUSTER, CONFIG, CLIENT, INFO, WAIT, SELECT, KEYS, SCAN, DBSIZE, HOTKEYS,
-/// the persistence verbs …), so those are caught by the keyless arm.
+/// Derived from the registry's [`CommandFlags::NO_INTERCEPT`] bit — the SAME
+/// bit the monoio handler reads to skip its gate chain — rather than from a
+/// list of command names kept here (moon#937). That list was hand-written,
+/// keyed on `(len, first byte)`, and failed OPEN: a missing entry read as
+/// "safe to run now". It had drifted twice before anyone noticed — `TXN` /
+/// `TEMPORAL.*` (moon#937), the blocking family (moon#946) — and `WATCH`,
+/// `SPUBLISH`, `MQ`, `WS` besides, each intercepted through a predicate no
+/// scanner could see.
 ///
-/// **Adding a new inline interceptor means adding its command here.** A new
-/// interceptor for a command with a key-shaped first argument would silently
-/// re-open moon#507 for that command.
-/// `pco10_inline_intercepted_commands_see_their_own_batch` in
-/// `tests/pipeline_cross_shard_ordering.rs` drives EVAL and SWAPDB — the two
-/// entries that touch real keys — and fails if either is dropped from this
-/// list. It cannot prove the list is COMPLETE against a future interceptor;
-/// that is why the doc above says to err toward waiting.
-fn is_inline_intercepted(cmd: &[u8]) -> bool {
-    // Dotted families first, and deliberately so: a length-keyed match below
-    // would swallow `FT.ALIAS` (8 bytes, 'f') into the FCALL_RO/FUNCTION arm
-    // and answer false for it.
-    const DOTTED: [&[u8]; 4] = [b"FT.", b"GRAPH.", b"CDC.", b"TS."];
-    if DOTTED
-        .iter()
-        .any(|p| cmd.len() > p.len() && cmd[..p.len()].eq_ignore_ascii_case(p))
-    {
-        return true;
-    }
-    let len = cmd.len();
-    if len == 0 {
-        return false;
-    }
-    let b0 = cmd[0] | 0x20;
-    match (len, b0) {
-        // Lua and functions read and write real keys through the interceptor,
-        // never through routing.
-        (4, b'e') => cmd.eq_ignore_ascii_case(b"EVAL"),
-        // `EVAL_RO` is also 7 bytes, so this arm answers for both.
-        (7, b'e') => cmd.eq_ignore_ascii_case(b"EVALSHA") || cmd.eq_ignore_ascii_case(b"EVAL_RO"),
-        (10, b'e') => cmd.eq_ignore_ascii_case(b"EVALSHA_RO"),
-        (5, b'f') => cmd.eq_ignore_ascii_case(b"FCALL"),
-        (8, b'f') => cmd.eq_ignore_ascii_case(b"FCALL_RO") || cmd.eq_ignore_ascii_case(b"FUNCTION"),
-        // SWAPDB exchanges whole databases across every shard.
-        // SCRIPT/ACL touch no keyspace data, but they are inline and cost
-        // nothing to serialise behind pending writes.
-        (6, b's') => cmd.eq_ignore_ascii_case(b"SCRIPT") || cmd.eq_ignore_ascii_case(b"SWAPDB"),
-        (3, b'a') => cmd.eq_ignore_ascii_case(b"ACL"),
-        // Container commands for the message-queue and workspace stores.
-        (2, b'm') => cmd.eq_ignore_ascii_case(b"MQ"),
-        (2, b'w') => cmd.eq_ignore_ascii_case(b"WS"),
-        _ => false,
-    }
+/// The derivation fails SAFE in both consumers:
+///
+/// * an unmarked command walks every gate in the handler AND waits here —
+///   adding an interceptor for it needs no edit anywhere;
+/// * the only way to skip the wait is the mark, and a mark on a command a
+///   gate claims is caught by `tests/intercept_flag_drift.rs` (scan) and
+///   `no_marked_command_fires_a_delegated_gate_predicate` (predicates) —
+///   and would, in any case, stop that command's interceptor from running at
+///   all, which no integration test of the command survives.
+///
+/// Fail-safe is not free: an unmarked plain keyspace command waits for
+/// nothing (one batch cut per occurrence, moon#513). So the registry is
+/// marked completely — 165 commands — and
+/// `routable_commands_no_gate_claims_are_marked_no_intercept_moon937` fails
+/// when a new routable command is added without the mark.
+///
+/// An unknown command has no metadata and takes the full gate chain, so it
+/// waits too; the "unknown command" error it earns one batch later is the
+/// same error either way.
+///
+/// Cost: one `metadata::lookup` — a packed-`u64` match for names up to 8
+/// bytes, a `phf` probe beyond — in place of four prefix compares and a
+/// `(len, b0)` match. Reached only when the batch already holds remote work
+/// (`pending_mask != 0`), never on the local-only fast path.
+#[inline]
+fn may_be_inline_intercepted(cmd: &[u8]) -> bool {
+    !crate::command::metadata::lookup(cmd).is_some_and(|m| {
+        m.flags
+            .contains(crate::command::metadata::CommandFlags::NO_INTERCEPT)
+    })
 }
 
 /// If this script's keys all live on ANOTHER shard, run it there and return
@@ -3489,16 +3532,23 @@ mod as_of_tests {
     /// exposed to the same defect, and the keyless table is a hand-maintained
     /// duplicate of a fact `COMMAND_META` already records as `first_key == 0`.
     ///
-    /// This walks the registry and asserts the routing decision agrees. Two
-    /// exclusions, both named rather than inferred:
+    /// This walks the registry and asserts the routing decision agrees. Three
+    /// exclusions, each named rather than inferred:
     ///
-    /// * [`is_inline_intercepted`] — EVAL/FCALL/FUNCTION/SCRIPT/SWAPDB/ACL/
+    /// * [`INTERCEPTOR_ROUTED`] — EVAL/FCALL/FUNCTION/SCRIPT/SWAPDB/ACL/
     ///   MQ/WS and the `FT.`/`GRAPH.`/`CDC.`/`TS.` families. These carry real
     ///   keys (or a real index/graph name) and are routed by their own
     ///   interceptors; declaring them keyless here would be wrong.
     /// * [`COMPUTED_KEY_POSITION`] — commands whose metadata says `first_key
     ///   0` because the key is not at a FIXED index, not because there is no
     ///   key. Each has its own arm in `extract_primary_key` and its own test.
+    /// * [`SHARD_CHANNEL`] — keyless for ACL, not keyless for cluster slots.
+    ///
+    /// `TXN` and `TEMPORAL.*` are deliberately NOT excluded (moon#937). They
+    /// are intercepted, but `args[0]` is a subcommand literal / a decimal
+    /// entity id, and the cluster slot router consults this function BEFORE
+    /// their interceptors run — so they must be keyless here, exactly as
+    /// `COMMAND GETKEYS` already reports them.
     ///
     /// A new keyless command added to `COMMAND_META` and forgotten here fails
     /// this test instead of shipping a one-shard flush.
@@ -3522,26 +3572,31 @@ mod as_of_tests {
             "ZUNION",
             "ZINTERCARD",
         ];
-        /// Consumed by `try_handle_temporal_*` / `try_handle_txn_*`, which run
-        /// before shard routing, so neither reaches the decision this test
-        /// guards. Excluded on that basis alone — **not** because their
-        /// `args[0]` would be a sane routing key:
+        /// `first_key == 0` in the registry because the interceptor that
+        /// consumes the command owns its argument layout — a script body, a
+        /// function name, a database index, an ACL verb, an index or graph
+        /// name — and routing never sees it. `extract_primary_key` answering
+        /// for `args[0]` is harmless for these because nothing consults the
+        /// answer; declaring them keyless would be a lie about their argv.
         ///
-        /// * `TEMPORAL.INVALIDATE <entity_id> <NODE|EDGE> <graph>` — `args[0]`
-        ///   is a decimal ENTITY ID and the graph name is at `args[2]`
-        ///   (`command::temporal::validate_invalidate`). Hashing `"42"` is the
-        ///   fixed-route signature of moon#511 / moon#534.
-        /// * `TXN <BEGIN|COMMIT|ABORT>` — `args[0]` is the subcommand literal.
-        /// * `TEMPORAL.SNAPSHOT_AT` takes no arguments, so `args.is_empty()`
-        ///   catches it — the same accident of arity that hid moon#925.
-        ///
-        /// None of the three is keyless-with-a-key, so none belongs in the
-        /// table above; all three are absent from `is_inline_intercepted`
-        /// despite being inline-intercepted, which is a moon#507 wait-set gap
-        /// with its own issue. Named here so the exclusion is a decision on
-        /// the record rather than a silent gap.
-        const INTERCEPTED_NOT_DECLARED: &[&str] =
-            &["TEMPORAL.INVALIDATE", "TEMPORAL.SNAPSHOT_AT", "TXN"];
+        /// A test-local list, and kept honest below: every entry must be
+        /// claimed by an intercept gate, so an entry cannot outlive the gate
+        /// that justified it.
+        const INTERCEPTOR_ROUTED: &[&str] = &[
+            "EVAL",
+            "EVALSHA",
+            "EVAL_RO",
+            "EVALSHA_RO",
+            "FCALL",
+            "FCALL_RO",
+            "FUNCTION",
+            "SCRIPT",
+            "SWAPDB",
+            "ACL",
+            "MQ",
+            "WS",
+        ];
+        const INTERCEPTOR_ROUTED_FAMILIES: &[&str] = &["FT.", "GRAPH.", "CDC.", "TS."];
         /// Shard-pubsub. `first_key == 0` because the shard CHANNEL is not a
         /// keyspace key — but redis hashes that channel for cluster slot
         /// routing, and in moon the cluster slot router is the ONLY consumer
@@ -3556,15 +3611,33 @@ mod as_of_tests {
         // key-SHAPED, which is the whole trap.
         let args = vec![frame_bulk(b"ASYNC"), frame_bulk(b"1")];
 
+        let claimed = names_claimed_by_gates();
+        let delegated: std::collections::BTreeSet<&str> = delegated_gate_probes()
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect();
+        for name in INTERCEPTOR_ROUTED {
+            assert!(
+                gate_claims(&claimed, name) || delegated.contains(name),
+                "{name} is excluded as interceptor-routed but no intercept gate \
+                 claims it any more — delete it from INTERCEPTOR_ROUTED"
+            );
+        }
+        let interceptor_routed = |name: &str| {
+            INTERCEPTOR_ROUTED.contains(&name)
+                || INTERCEPTOR_ROUTED_FAMILIES
+                    .iter()
+                    .any(|p| name.len() > p.len() && name.starts_with(p))
+        };
+
         let mut unrouted = Vec::new();
         for (name, meta) in crate::command::metadata::COMMAND_META.entries() {
             if meta.first_key != 0 {
                 continue;
             }
             if COMPUTED_KEY_POSITION.contains(name)
-                || INTERCEPTED_NOT_DECLARED.contains(name)
                 || SHARD_CHANNEL.contains(name)
-                || is_inline_intercepted(name.as_bytes())
+                || interceptor_routed(name)
             {
                 continue;
             }
@@ -3589,12 +3662,22 @@ mod as_of_tests {
 
     /// Files holding the connection handler's intercept gates. Kept in step
     /// with `GATE_FILES` in `tests/intercept_flag_drift.rs`.
-    const GATE_FILES: [&str; 5] = [
+    ///
+    /// `watch.rs` is here because `try_handle_multi_exec` delegates `WATCH` /
+    /// `UNWATCH` to `watch::try_handle_watch_unwatch` — a gate whose name
+    /// literals live outside the handler directory. Before it was scanned,
+    /// `WATCH` (routable: `first_key 1`) was claimed by a gate no scanner saw
+    /// and skipped the moon#507 wait: a pipelined `SET k` (remote), `WATCH k`,
+    /// `MULTI … EXEC` aborted EXEC 18 of 24 times on the pre-fix binary,
+    /// because WATCH captured the key's version before its own batch's write
+    /// landed.
+    const GATE_FILES: [&str; 6] = [
         "src/server/conn/handler_monoio/dispatch.rs",
         "src/server/conn/handler_monoio/write.rs",
         "src/server/conn/handler_monoio/txn.rs",
         "src/server/conn/handler_monoio/pubsub.rs",
         "src/server/conn/handler_monoio/ft.rs",
+        "src/server/conn/watch.rs",
     ];
 
     /// Every command name matched by an intercept gate's top-level guard —
@@ -3631,8 +3714,16 @@ mod as_of_tests {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         for rel in GATE_FILES {
             let path = root.join(rel);
+            // Normalise line endings before scanning. The guard window below is a
+            // BYTE budget, and a CRLF checkout (git's default on Windows) spends
+            // one extra byte per line — enough to push the last claim of a long
+            // guard past the cap. That dropped FUNCTION and GRAPH.QUERY on
+            // `Check (Windows)` while every LF platform kept them, i.e. the
+            // verdict depended on the checkout's line endings, not on the code
+            // this audits.
             let src = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("cannot read gate file {}: {e}", path.display()));
+                .unwrap_or_else(|e| panic!("cannot read gate file {}: {e}", path.display()))
+                .replace("\r\n", "\n");
 
             for (idx, _) in src.match_indices("fn try_") {
                 let body = &src[idx..];
@@ -3686,6 +3777,21 @@ mod as_of_tests {
         let blocking =
             |c: &[u8], a: &[Frame]| crate::server::conn::blocking::is_blocking_command_args(c, a);
         vec![
+            // Container stores: `try_handle_mq_command` / `try_handle_ws_command`
+            // delegate to `mq::is_mq_command` / `workspace::is_ws_command`.
+            // Both were in the old hand-written intercept list and both were
+            // invisible to the scan — the moon#942 coupling test never
+            // checked them.
+            (
+                "MQ",
+                vec![frame_bulk(b"PUSH"), frame_bulk(b"q"), frame_bulk(b"v")],
+                crate::mq::is_mq_command(b"MQ"),
+            ),
+            (
+                "WS",
+                vec![frame_bulk(b"CREATE"), frame_bulk(b"w")],
+                crate::workspace::is_ws_command(b"WS"),
+            ),
             (
                 "TXN",
                 vec![frame_bulk(b"BEGIN")],
@@ -3716,6 +3822,106 @@ mod as_of_tests {
                 vec![frame_bulk(b"k"), frame_bulk(b"0")],
                 blocking(b"BLPOP", &[frame_bulk(b"k"), frame_bulk(b"0")]),
             ),
+            (
+                "BRPOP",
+                vec![frame_bulk(b"k"), frame_bulk(b"0")],
+                blocking(b"BRPOP", &[frame_bulk(b"k"), frame_bulk(b"0")]),
+            ),
+            (
+                "BLMOVE",
+                vec![
+                    frame_bulk(b"k"),
+                    frame_bulk(b"d"),
+                    frame_bulk(b"LEFT"),
+                    frame_bulk(b"LEFT"),
+                    frame_bulk(b"0"),
+                ],
+                blocking(b"BLMOVE", &[frame_bulk(b"k")]),
+            ),
+            (
+                "BRPOPLPUSH",
+                vec![frame_bulk(b"k"), frame_bulk(b"d"), frame_bulk(b"0")],
+                blocking(b"BRPOPLPUSH", &[frame_bulk(b"k")]),
+            ),
+            (
+                "BZPOPMIN",
+                vec![frame_bulk(b"k"), frame_bulk(b"0")],
+                blocking(b"BZPOPMIN", &[frame_bulk(b"k")]),
+            ),
+            (
+                "BZPOPMAX",
+                vec![frame_bulk(b"k"), frame_bulk(b"0")],
+                blocking(b"BZPOPMAX", &[frame_bulk(b"k")]),
+            ),
+            (
+                "BLMPOP",
+                vec![
+                    frame_bulk(b"0"),
+                    frame_bulk(b"1"),
+                    frame_bulk(b"k"),
+                    frame_bulk(b"LEFT"),
+                ],
+                blocking(b"BLMPOP", &[frame_bulk(b"0")]),
+            ),
+            (
+                "BZMPOP",
+                vec![
+                    frame_bulk(b"0"),
+                    frame_bulk(b"1"),
+                    frame_bulk(b"k"),
+                    frame_bulk(b"MIN"),
+                ],
+                blocking(b"BZMPOP", &[frame_bulk(b"0")]),
+            ),
+            // The two stream reads are blocking only WITH `BLOCK`, and the
+            // predicate reads the argv to know: probed with the exact shape
+            // that parks, so the row tests the case that matters.
+            (
+                "XREAD",
+                vec![
+                    frame_bulk(b"BLOCK"),
+                    frame_bulk(b"0"),
+                    frame_bulk(b"STREAMS"),
+                    frame_bulk(b"k"),
+                    frame_bulk(b"$"),
+                ],
+                blocking(
+                    b"XREAD",
+                    &[
+                        frame_bulk(b"BLOCK"),
+                        frame_bulk(b"0"),
+                        frame_bulk(b"STREAMS"),
+                        frame_bulk(b"k"),
+                        frame_bulk(b"$"),
+                    ],
+                ),
+            ),
+            (
+                "XREADGROUP",
+                vec![
+                    frame_bulk(b"GROUP"),
+                    frame_bulk(b"g"),
+                    frame_bulk(b"c"),
+                    frame_bulk(b"BLOCK"),
+                    frame_bulk(b"0"),
+                    frame_bulk(b"STREAMS"),
+                    frame_bulk(b"k"),
+                    frame_bulk(b">"),
+                ],
+                blocking(
+                    b"XREADGROUP",
+                    &[
+                        frame_bulk(b"GROUP"),
+                        frame_bulk(b"g"),
+                        frame_bulk(b"c"),
+                        frame_bulk(b"BLOCK"),
+                        frame_bulk(b"0"),
+                        frame_bulk(b"STREAMS"),
+                        frame_bulk(b"k"),
+                        frame_bulk(b">"),
+                    ],
+                ),
+            ),
         ]
     }
 
@@ -3732,54 +3938,32 @@ mod as_of_tests {
     /// }
     /// ```
     ///
-    /// and [`is_inline_intercepted`] fails **OPEN**: a missing entry reads as
-    /// permission, which is moon#507 (acked writes vanishing) and moon#937.
-    /// `tests/intercept_flag_drift.rs` guards the other implication —
-    /// `NO_INTERCEPT(c) => no gate claims c` — whose flag fails SAFE. This is
-    /// the missing half, and it drives the REAL decision function over an
-    /// enumeration of `COMMAND_META` rather than over a hand-maintained list.
+    /// and the first operand is derived from `COMMAND_META`'s `NO_INTERCEPT`
+    /// bit (moon#937): a command waits unless the registry PROVES no gate can
+    /// claim it. `tests/intercept_flag_drift.rs` guards that proof —
+    /// `NO_INTERCEPT(c) => no gate claims c`. This test is the other half: it
+    /// drives the REAL decision function over an enumeration of `COMMAND_META`
+    /// and fails if any gate-claimed command is told "run it now".
     ///
-    /// # The waiver is a recorded decision, not a widening
+    /// # No waiver
     ///
-    /// Two groups answer `false` today and both are named, with a reason each,
-    /// in `WAIVED`. The waiver cannot silently grow or silently rot: the final
-    /// assertion pins the waived-and-still-offending set to exactly those
-    /// names, so a NEW undeclared interceptor fails the first assertion and
-    /// FIXING either group fails the second, forcing the entry out.
+    /// The previous version of this test carried a `WAIVED` list of six
+    /// commands the guard called safe: `TXN`, `TEMPORAL.INVALIDATE`
+    /// (moon#937), `SPUBLISH`/`SSUBSCRIBE`/`SUNSUBSCRIBE`, and `BLPOP`
+    /// (moon#946). With the predicate derived from the registry none of them
+    /// can skip the wait — they are unmarked, and marking any of them would
+    /// fail the drift test — so the waiver is gone rather than emptied.
+    ///
+    /// moon#946 in particular is answered by construction, not by modelling:
+    /// the blocking family is deferred by the #438 guard one statement ABOVE
+    /// this predicate in both handlers whenever `remote_groups` is non-empty,
+    /// and `pending_mask` is set at exactly the sites that push into
+    /// `remote_groups` and cleared with it, so this predicate is never asked
+    /// about a blocking command with remote work pending. The rows below keep
+    /// it honest anyway: if the #438 guard is ever removed, the derived
+    /// predicate is the second line, and it must already say WAIT.
     #[test]
     fn intercepted_commands_wait_for_pending_remote_writes_moon937() {
-        /// `(name, why)`. Every entry is a command a gate consumes inline for
-        /// which the guard currently says "safe to run now".
-        const WAIVED: &[(&str, &str)] = &[
-            // Shard-channel pub/sub. Consumed by try_handle_publish /
-            // try_handle_subscribe_entry / try_handle_unsubscribe before
-            // routing, and `extract_primary_key` answers for them because the
-            // shard CHANNEL is key-shaped — deliberately so: the sibling
-            // `SHARD_CHANNEL` constant above records that declaring them
-            // keyless would drop `MOVED` for shard channels. They mutate the
-            // pub/sub registries and never read or write the keyspace slice,
-            // so the wait they skip protects nothing. INFERRED from reading
-            // those three gates, not measured.
-            ("SPUBLISH", "shard channel; touches no keyspace state"),
-            ("SSUBSCRIBE", "shard channel; touches no keyspace state"),
-            ("SUNSUBSCRIBE", "shard channel; touches no keyspace state"),
-            // moon#937, the live gap. `INTERCEPTED_NOT_DECLARED` above already
-            // names these as absent from `is_inline_intercepted` despite being
-            // inline-intercepted. Fixing them means DECLARING them there,
-            // which widens the cross-shard wait set — a correctness change
-            // belonging to moon#937, deliberately not made from a performance
-            // branch.
-            ("TXN", "moon#937 wait-set gap"),
-            ("TEMPORAL.INVALIDATE", "moon#937 wait-set gap"),
-            // `try_handle_blocking` consumes it, `is_blocking_command_args`
-            // lives outside GATE_FILES so no scanner ever saw it, and the
-            // guard routes it by its own key and says "do not wait". Whether
-            // that is safe depends on the blocking path's own ordering, which
-            // this test does not model. Recorded so it is a named unknown
-            // rather than an absence. Not part of moon#937.
-            ("BLPOP", "blocking gate; ordering not modelled here"),
-        ];
-
         let claimed = names_claimed_by_gates();
         assert!(
             claimed.len() > 20,
@@ -3788,21 +3972,6 @@ mod as_of_tests {
              {claimed:?}",
             claimed.len()
         );
-        // Positive controls: the two entries `pco10` already drives must come
-        // out claimed AND waiting. If either side of the pipeline returns
-        // nothing, this fails before any verdict is read.
-        for probe in ["EVAL", "SWAPDB"] {
-            assert!(
-                gate_claims(&claimed, probe),
-                "{probe} is intercepted but the gate scan did not find it — the \
-                 scan is broken, not the registry"
-            );
-            assert!(
-                is_inline_intercepted(probe.as_bytes()),
-                "{probe} is declared in is_inline_intercepted by inspection; if \
-                 this fails the predicate under test is broken"
-            );
-        }
 
         // TWO probes, and a command offends if EITHER of them skips the wait.
         //
@@ -3812,7 +3981,8 @@ mod as_of_tests {
         //   `extract_primary_key` answers for EVAL/FCALL-style commands too.
         //   With `MODIFIER` alone those come back keyless and the guard waits
         //   for the wrong reason — verified by mutation: deleting `FCALL` from
-        //   `is_inline_intercepted` left the one-probe version GREEN.
+        //   the (then hand-written) intercept list left the one-probe version
+        //   GREEN.
         //
         // `pending` is every shard and `num_shards` is 4, so any `false` below
         // is a genuine "run it now", not an artefact of an empty pending mask.
@@ -3825,6 +3995,29 @@ mod as_of_tests {
             frame_bulk(b"k1"),
             frame_bulk(b"v"),
         ];
+
+        // Positive controls: the two entries `pco10` already drives must come
+        // out claimed AND waiting, through the real decision function. If
+        // either side of the pipeline returns nothing, this fails before any
+        // verdict is read.
+        for probe in ["EVAL", "SWAPDB"] {
+            assert!(
+                gate_claims(&claimed, probe),
+                "{probe} is intercepted but the gate scan did not find it — the \
+                 scan is broken, not the registry"
+            );
+            assert!(
+                must_wait_for_pending_remote(
+                    probe.as_bytes(),
+                    &numkeys,
+                    NUM_SHARDS,
+                    PENDING_ALL,
+                    false
+                ),
+                "{probe} is intercepted and must wait; if this fails the \
+                 predicate under test is broken, not the registry"
+            );
+        }
 
         let mut offenders: Vec<&str> = Vec::new();
         for (name, _meta) in crate::command::metadata::COMMAND_META.entries() {
@@ -3853,33 +4046,170 @@ mod as_of_tests {
         offenders.sort_unstable();
         offenders.dedup();
 
-        let waived: std::collections::BTreeSet<&str> = WAIVED.iter().map(|(n, _)| *n).collect();
-        let unwaived: Vec<&str> = offenders
-            .iter()
-            .copied()
-            .filter(|n| !waived.contains(n))
-            .collect();
         assert!(
-            unwaived.is_empty(),
+            offenders.is_empty(),
             "an intercept gate consumes each of these, but \
              must_wait_for_pending_remote calls them SAFE and runs them against \
-             a shard with undispatched writes pending (moon#507): {unwaived:?}\n\
-             Either declare them in is_inline_intercepted, or, if the gate no \
-             longer claims them, update the gate."
+             a shard with undispatched writes pending (moon#507): {offenders:?}\n\
+             The wait set is derived from NO_INTERCEPT, so this can only happen \
+             if one of them is marked NO_INTERCEPT in COMMAND_META — drop the \
+             mark (a claimed command can never carry it), or, if the gate no \
+             longer claims it, update the gate."
         );
+    }
 
-        let still_offending: Vec<&str> = offenders
-            .iter()
-            .copied()
-            .filter(|n| waived.contains(n))
+    /// The other direction of the same coupling (moon#937): a command that
+    /// routes by its own key and that NO gate claims must carry
+    /// `NO_INTERCEPT`, or the derived predicate makes it wait for nothing.
+    ///
+    /// Deriving the wait set from the registry is fail-SAFE — an unmarked
+    /// command waits — and that is exactly why this assertion exists: safe
+    /// here means one batch cut per occurrence for a plain keyspace command
+    /// (moon#513 measured 32 cuts in 32 interleavings for one such command).
+    /// Enumerated before the derivation landed: 96 routable commands were
+    /// unmarked and unclaimed (`HGETALL`, `LRANGE`, `ZRANGE`, `XADD`,
+    /// `SMEMBERS`, …). They are marked now, and a new plain command added
+    /// without the mark fails here rather than silently over-waiting.
+    ///
+    /// Two ways to satisfy this for a new command, and the choice is a
+    /// decision on the record:
+    ///
+    /// * no gate claims it — mark it `NO_INTERCEPT` in `COMMAND_META`;
+    /// * a gate outside `GATE_FILES` claims it through a delegated predicate —
+    ///   add a row to [`delegated_gate_probes`], which declares the gate to
+    ///   both scanners. Do NOT mark it: `tests/intercept_flag_drift.rs` would
+    ///   not see the gate, and the handler would skip it.
+    ///
+    /// "Routable" is decided by the same three argv shapes the other tests
+    /// use. A command none of them routes (a stream read without `STREAMS`,
+    /// a bare container name) is not a plain keyspace command and is out of
+    /// scope here.
+    #[test]
+    fn routable_commands_no_gate_claims_are_marked_no_intercept_moon937() {
+        use crate::command::metadata::CommandFlags;
+
+        let claimed = names_claimed_by_gates();
+        assert!(claimed.len() > 20, "gate scan broke: {claimed:?}");
+        let delegated: std::collections::BTreeSet<&str> = delegated_gate_probes()
+            .into_iter()
+            .map(|(n, _, _)| n)
             .collect();
-        let expected: Vec<&str> = waived.iter().copied().collect();
-        assert_eq!(
-            still_offending, expected,
-            "the waiver no longer matches reality. If an entry disappeared it \
-             was FIXED — delete it from WAIVED instead of leaving a stale \
-             waiver behind. If one appeared, a new interceptor was added \
-             without declaring it. WAIVED reasons: {WAIVED:?}"
+
+        let plain = vec![frame_bulk(b"k"), frame_bulk(b"v")];
+        let modifier = vec![frame_bulk(b"ASYNC"), frame_bulk(b"1")];
+        let numkeys = vec![
+            frame_bulk(b"body"),
+            frame_bulk(b"1"),
+            frame_bulk(b"k1"),
+            frame_bulk(b"v"),
+        ];
+        let probes = [&plain, &modifier, &numkeys];
+
+        let mut marked = 0usize;
+        let mut unmarked: Vec<&str> = Vec::new();
+        for (name, meta) in crate::command::metadata::COMMAND_META.entries() {
+            if meta.flags.contains(CommandFlags::NO_INTERCEPT) {
+                marked += 1;
+                continue;
+            }
+            if gate_claims(&claimed, name) || delegated.contains(name) {
+                continue;
+            }
+            let routable = probes
+                .iter()
+                .any(|args| extract_primary_key(name.as_bytes(), args).is_some());
+            if routable {
+                unmarked.push(*name);
+            }
+        }
+        unmarked.sort_unstable();
+        assert!(
+            unmarked.is_empty(),
+            "{} commands route by their own key, are claimed by no intercept \
+             gate, and are NOT marked NO_INTERCEPT — each of them waits behind \
+             pending remote writes for nothing (one batch cut per occurrence):\n\
+             {unmarked:?}\n\
+             Mark them in COMMAND_META, or add a delegated_gate_probes row if a \
+             gate outside GATE_FILES really does claim one of them.",
+            unmarked.len()
+        );
+        // Anti-vacuity: the registry really is marked. 67 before this change,
+        // 163 after; a registry that lost its marks would otherwise pass by
+        // making every command "claimed or unroutable".
+        assert!(marked > 100, "only {marked} commands carry NO_INTERCEPT");
+    }
+
+    /// `NO_INTERCEPT` may never be carried by a command that a gate claims
+    /// through a predicate the text scan cannot see (moon#946's blind spot).
+    /// `tests/intercept_flag_drift.rs` guards the six scanned files; this
+    /// drives the delegated predicates themselves over every marked command.
+    ///
+    /// Two consumers hang off the bit, and both break if it lies: the monoio
+    /// handler skips the gate chain, and [`must_wait_for_pending_remote`]
+    /// skips the moon#507 wait.
+    #[test]
+    fn no_marked_command_fires_a_delegated_gate_predicate() {
+        use crate::command::metadata::CommandFlags;
+        use crate::command::temporal::{is_temporal_invalidate, is_temporal_snapshot_at};
+        use crate::command::transaction::{is_txn_abort, is_txn_begin, is_txn_commit};
+        use crate::server::conn::blocking::is_blocking_command_args;
+
+        let txn_sub = |sub: &'static [u8]| vec![frame_bulk(sub)];
+        let block_read = vec![
+            frame_bulk(b"BLOCK"),
+            frame_bulk(b"0"),
+            frame_bulk(b"STREAMS"),
+            frame_bulk(b"k"),
+            frame_bulk(b"$"),
+        ];
+        let group_block_read = vec![
+            frame_bulk(b"GROUP"),
+            frame_bulk(b"g"),
+            frame_bulk(b"c"),
+            frame_bulk(b"BLOCK"),
+            frame_bulk(b"0"),
+            frame_bulk(b"STREAMS"),
+            frame_bulk(b"k"),
+            frame_bulk(b">"),
+        ];
+        let plain = vec![frame_bulk(b"k"), frame_bulk(b"0")];
+
+        let mut checked = 0usize;
+        let mut bad: Vec<&str> = Vec::new();
+        for (name, meta) in crate::command::metadata::COMMAND_META.entries() {
+            if !meta.flags.contains(CommandFlags::NO_INTERCEPT) {
+                continue;
+            }
+            checked += 1;
+            let c = name.as_bytes();
+            let fires = is_txn_begin(c, &txn_sub(b"BEGIN"))
+                || is_txn_commit(c, &txn_sub(b"COMMIT"))
+                || is_txn_abort(c, &txn_sub(b"ABORT"))
+                || is_temporal_snapshot_at(c)
+                || is_temporal_invalidate(c)
+                || crate::mq::is_mq_command(c)
+                || crate::workspace::is_ws_command(c)
+                || is_blocking_command_args(c, &plain)
+                || is_blocking_command_args(c, &block_read)
+                || is_blocking_command_args(c, &group_block_read);
+            if fires {
+                bad.push(*name);
+            }
+        }
+        assert!(checked > 50, "only {checked} marked commands were checked");
+        // Positive control: the predicates fire for the commands they own,
+        // so a silent `false` above is a real verdict and not a dead probe.
+        assert!(is_txn_begin(b"TXN", &txn_sub(b"BEGIN")));
+        assert!(crate::mq::is_mq_command(b"MQ"));
+        assert!(crate::workspace::is_ws_command(b"WS"));
+        assert!(is_blocking_command_args(b"BLPOP", &plain));
+        assert!(is_blocking_command_args(b"XREAD", &block_read));
+        assert!(is_blocking_command_args(b"XREADGROUP", &group_block_read));
+        assert!(
+            bad.is_empty(),
+            "marked NO_INTERCEPT, but a delegated gate predicate claims them — \
+             the handler would skip that gate and the moon#507 guard would \
+             skip the wait: {bad:?}"
         );
     }
 

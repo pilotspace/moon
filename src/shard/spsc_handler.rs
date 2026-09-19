@@ -3155,6 +3155,7 @@ pub(crate) fn handle_shard_message_shared(
                 reply_tx,
                 proto,
                 watched,
+                script_acl,
             } = *payload;
             let mut exec_publishes: Vec<(usize, bytes::Bytes, bytes::Bytes)> = Vec::new();
             // c10k E2: a queued FLUSHDB/FLUSHALL clears only THIS shard's
@@ -3170,6 +3171,41 @@ pub(crate) fn handle_shard_message_shared(
             // originator.
             let mut exec_wakes: Vec<(usize, bytes::Bytes, crate::blocking::WaitFamily)> =
                 Vec::new();
+            // moon#894: a queued script runs in the body on THIS shard's VM,
+            // cache and function registry, as the ORIGINATING user. Built only
+            // when the body holds a script (`script_acl` is `Some` exactly
+            // then). A shard with no Lua runtime leaves it `None`, and the
+            // executor answers each script with an error instead of skipping
+            // it.
+            let txn_script_rt = match (script_acl.as_ref(), lua_rt) {
+                (Some(_), Some(rt)) => rt.vm().map(|vm| {
+                    let slot = crate::scripting::shard_function_registry();
+                    // Build the registry on first use, exactly as the routed
+                    // FCALL arm above does; `try_borrow_mut` for the same
+                    // no-panic-on-the-shard-thread reason.
+                    if let Ok(mut guard) = slot.try_borrow_mut()
+                        && guard.is_none()
+                    {
+                        *guard = Some(crate::scripting::FunctionRegistry::new(
+                            rt.eviction_ctx().clone(),
+                        ));
+                    }
+                    (vm, slot, rt.num_shards())
+                }),
+                _ => None,
+            };
+            let txn_scripting = match (script_acl.as_ref(), txn_script_rt.as_ref()) {
+                (Some(acl), Some((vm, slot, num_shards))) => {
+                    Some(crate::server::conn::txn_script::TxnScripting {
+                        lua: vm,
+                        script_cache,
+                        functions: slot,
+                        script_acl: acl,
+                        num_shards: *num_shards,
+                    })
+                }
+                _ => None,
+            };
             let (result, aof_entries, graph_records) =
                 crate::server::conn::shared::execute_transaction_sharded(
                     shard_databases,
@@ -3182,6 +3218,7 @@ pub(crate) fn handle_shard_message_shared(
                     &mut exec_flushes,
                     &mut exec_wakes,
                     &watched,
+                    txn_scripting.as_ref(),
                 );
             // The waiters are registered HERE, on the owning shard's registry
             // — the same one the live cross-shard write path wakes.
