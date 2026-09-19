@@ -409,6 +409,11 @@ pub struct Database {
     /// AOF-authority replay; decides which cold files the value-giving read
     /// paths may see. `None` outside replay and for legacy generations.
     replay_cold_gate: Option<ReplayColdGate>,
+    /// moon#965: a `MOON.SPILLED` marker was replayed in this generation, so
+    /// the log is #902-era and `finish_replay_cold_reconcile` must use the
+    /// hot-wins resolution even without a `MOON.COLDCUT` head. Reset by
+    /// `finish_replay_cold_reconcile` when it closes the generation.
+    replay_saw_cold_marker: bool,
     /// Hot-key detection sketch, fed by sampled dispatch observations.
     hot_keys: crate::storage::hotkey::HotKeySketch,
     /// Keys whose async spill is IN FLIGHT: enqueued to the spill thread,
@@ -587,6 +592,7 @@ impl Database {
             cold_index: None,
             cold_shard_dir: None,
             replay_cold_gate: None,
+            replay_saw_cold_marker: false,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
             spill_inflight_bytes: 0,
@@ -620,6 +626,7 @@ impl Database {
             cold_index: None,
             cold_shard_dir: None,
             replay_cold_gate: None,
+            replay_saw_cold_marker: false,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
             spill_inflight_bytes: 0,

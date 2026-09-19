@@ -23,6 +23,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hiding the others. Free on a public repo; the one real limit is the
   5-concurrent-macOS-job ceiling, which a single dispatch stays under.
 
+- **The AOF RDB-preamble load no longer wipes the cold plane on restart**
+  (moon#1007). Recovery Phase 3 rebuilds the cold index from the shard
+  manifest; Phase 4b's `replay_aof` then loaded the `MOON` preamble that
+  `BGREWRITEAOF` writes, and `rdb::load_from_bytes` swaps fresh `Database`
+  temporaries over the live ones (`*live = temp`) — dropping `cold_index` and
+  `cold_shard_dir`, live-tier topology the hot snapshot does not carry. The
+  server then came up with a wired-but-EMPTY cold plane and every spilled key
+  read as an ABSENT key, with `DBSIZE` agreeing. Measured at `--shards 1`
+  after any `BGREWRITEAOF`: 28,868 cold keys gone, and gone again on every
+  later boot. The damaged-file scenario that surfaced it is a red herring —
+  an undamaged run loses just as much. Only tokio `--shards 1` takes this
+  path (`--shards >= 2` uses the PerShard manifest, whose `shard_replay`
+  already brackets the same swap via `take_cold_wiring`); monoio is exposed
+  for exactly one boot when upgrading from a legacy AOF, during which an
+  `INCR`/`APPEND` against a vanished key mints from zero and corrupts it
+  permanently. The preamble load is now bracketed the same way, restored
+  BEFORE the RESP tail so replayed `DEL`/`FLUSH*` still tombstone cold. Fixed
+  in `replay_aof` rather than `rdb::load_from_bytes` on purpose: the generic
+  loader also serves replica full-sync and `DEBUG RELOAD` with a FOREIGN
+  dataset, where preserving this node's index would surface stale reads.
+
 - **BEHAVIOUR CHANGE — `ZADD ... GT LT` and a NaN `WEIGHTS` value now error**
   where they previously succeeded (moon#969). `ZADD k GT LT 1 m` used to reply
   `(integer) 1` and, on an existing member, `(integer) 0` with the score left
@@ -100,6 +121,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - a script that errors is one error element, its earlier writes stay, and
     the rest of the body runs;
   - a `WATCH` conflict aborts before any script runs.
+
+- **A write replayed after its key's spill marker is no longer discarded on
+  restart** (moon#965). On `runtime-tokio` with `--shards 1` no `AofManifest`
+  exists, so the AOF never carries a `MOON.COLDCUT` head — but `MOON.SPILLED`
+  markers are emitted unconditionally, so that configuration ran moon#902
+  half-armed. A replayed marker drops the key's hot copy; its next write then
+  replays through `Database::set`'s `Inserted` arm, which by design leaves the
+  cold shadow standing; and with no cut the end-of-replay reconcile took the
+  legacy cold-wins branch and threw the newer write away — logging it as
+  `1 hot shadow(s) demoted to cold stubs`. The issue's "AOF tail loss" title
+  named the wrong mechanism: both writes were on disk and both replayed.
+  A replayed marker now proves the generation is #902-era, and reconcile
+  resolves hot-wins for it whether or not the head carries the cut. That is
+  value-correct in every way a key can end hot and cold there: written after
+  its marker, a stale entry in a still-listed file, or a marker lost under
+  backpressure (both planes then hold the same value). Logs with neither record
+  keep the task #56 path unchanged. `tests/cold_shadow_single_shard_tokio.rs`,
+  written for exactly this configuration, was RED on main for weeks and never
+  ran: it was `#[ignore]`d because it shelled out to `redis-cli`. It now speaks
+  RESP through `common::Conn` and runs in every `runtime-tokio` leg; with the
+  fix inert it fails 3/3 on 36-47 stale probes.
 
 - **The moon#507 pipeline wait set is derived from `COMMAND_META` instead of a
   hand-written list, and `WATCH` inside its own pipeline no longer aborts the
