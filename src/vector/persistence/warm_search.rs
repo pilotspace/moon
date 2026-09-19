@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
@@ -35,6 +35,7 @@ use crate::vector::persistence::warm_segment::{
     VEC_CODES_SUB_HEADER_SIZE, VEC_FULL_SUB_HEADER_SIZE, VEC_GRAPH_SUB_HEADER_SIZE,
     VEC_MVCC_SUB_HEADER_SIZE,
 };
+use crate::vector::segment::key_index::KeyHashIndex;
 use crate::vector::segment::raw_f16_store::RawF16Store;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
 use crate::vector::types::{SearchResult, VectorId};
@@ -86,6 +87,18 @@ pub struct WarmSearchSegment {
     /// arrived just before the transition is not lost either.
     has_tombstones: AtomicBool,
     tombstoned_keys: parking_lot::RwLock<HashSet<u64>>,
+    /// Row positions sorted by key_hash (see `ImmutableSegment::key_index`):
+    /// a tombstone is recorded and counted only by a segment holding a live
+    /// row for the key.
+    key_index: KeyHashIndex,
+    /// Rows the HOT segment had already killed at install time
+    /// (`mvcc.delete_lsn != 0` in `mvcc.mpf`), as a bitset over positions.
+    /// `None` when there are none, so the search path pays nothing.
+    install_dead: Option<Box<[u64]>>,
+    /// Number of set bits in `install_dead`.
+    install_dead_count: u32,
+    /// Rows killed by steady-state tombstones since this segment was built.
+    steady_dead: AtomicU32,
     /// Exact-rerank sidecar (HQ-1 parity, WS3): f16 copy of each original
     /// vector, BFS-ordered, `dimension` halves per entry, extracted from
     /// `vectors.mpf` if the HOT->WARM transition wrote one (see
@@ -166,33 +179,45 @@ fn extract_payloads(mmap: &memmap2::Mmap, page_size: usize, sub_hdr_size: usize)
 /// `key_hash_to_key` lookups downstream fell back to a synthetic `vec:<id>`
 /// key instead of the real one (caught by
 /// `tests/vector_idle_unload.rs`'s post-transition FT.SEARCH assertion).
-fn parse_mvcc_ids(mvcc_payload: &[u8]) -> (Vec<u32>, Vec<u64>) {
+///
+/// `dead` lists the positions whose `delete_lsn` is set: rows an install-time
+/// tombstone killed in the HOT segment (the key was deleted or re-written
+/// while its background build ran). Such a row is dead in every tier, and it
+/// is dead as a ROW: a live sibling row for the same key_hash (the re-written
+/// copy, merged into the same segment) must stay live, so this is positional,
+/// never a key_hash tombstone.
+fn parse_mvcc_ids(mvcc_payload: &[u8]) -> MvccRows {
     const ENTRY_SIZE: usize = 32;
     let count = mvcc_payload.len() / ENTRY_SIZE;
-    let mut global_ids = Vec::with_capacity(count);
-    let mut key_hashes = Vec::with_capacity(count);
-
-    for i in 0..count {
-        let base = i * ENTRY_SIZE;
-        let global_off = base + 4; // skip internal_id (4 bytes)
-        let key_hash_off = global_off + 4; // skip global_id (4 bytes)
-        if key_hash_off + 8 <= mvcc_payload.len() {
-            let global_id = u32::from_le_bytes(
-                mvcc_payload[global_off..global_off + 4]
-                    .try_into()
-                    .expect("4-byte slice"),
-            );
-            let key_hash = u64::from_le_bytes(
-                mvcc_payload[key_hash_off..key_hash_off + 8]
-                    .try_into()
-                    .expect("8-byte slice"),
-            );
-            global_ids.push(global_id);
-            key_hashes.push(key_hash);
+    let mut rows = MvccRows {
+        global_ids: Vec::with_capacity(count),
+        key_hashes: Vec::with_capacity(count),
+        dead: Vec::new(),
+    };
+    for (pos, entry) in mvcc_payload.chunks_exact(ENTRY_SIZE).enumerate() {
+        // internal_id(4) global_id(4) key_hash(8) insert_lsn(8) delete_lsn(8)
+        let (Ok(gid), Ok(kh), Ok(del)) = (
+            <[u8; 4]>::try_from(&entry[4..8]),
+            <[u8; 8]>::try_from(&entry[8..16]),
+            <[u8; 8]>::try_from(&entry[24..32]),
+        ) else {
+            continue;
+        };
+        rows.global_ids.push(u32::from_le_bytes(gid));
+        rows.key_hashes.push(u64::from_le_bytes(kh));
+        if u64::from_le_bytes(del) != 0 {
+            rows.dead.push(pos as u32);
         }
     }
+    rows
+}
 
-    (global_ids, key_hashes)
+/// The per-row MVCC fields a warm segment keeps (see [`parse_mvcc_ids`]).
+struct MvccRows {
+    global_ids: Vec<u32>,
+    key_hashes: Vec<u64>,
+    /// Positions killed by an install-time tombstone, ascending.
+    dead: Vec<u32>,
 }
 
 /// Read every `(key_hash, global_id)` row out of a warm segment's `mvcc.mpf`,
@@ -216,14 +241,19 @@ fn parse_mvcc_ids(mvcc_payload: &[u8]) -> (Vec<u32>, Vec<u64>) {
 /// persisted keymap records the current one. Recovery needs both to supersede
 /// a stale copy per key (moon#893) instead of retiring a whole segment on a
 /// key_hash overlap.
+///
+/// Every row is returned, install-time-dead ones included: the global_id
+/// allocator must resume above all of them, and the keymap never names a dead
+/// row, so the per-key decision cannot pick one. The warm segment itself
+/// keeps a dead row dead (`WarmSearchSegment::install_dead`).
 pub(crate) fn peek_mvcc_rows(segment_dir: &Path) -> std::io::Result<Vec<(u64, u32)>> {
     use crate::vector::persistence::sealed_mmap::{AccessPattern, advise_pattern, map_sealed_file};
 
     let mvcc_mmap = map_sealed_file(&segment_dir.join("mvcc.mpf"))?;
     advise_pattern(&mvcc_mmap, AccessPattern::Sequential)?;
     let mvcc_payload = extract_payloads(&mvcc_mmap, PAGE_4K, VEC_MVCC_SUB_HEADER_SIZE);
-    let (global_ids, key_hashes) = parse_mvcc_ids(&mvcc_payload);
-    Ok(key_hashes.into_iter().zip(global_ids).collect())
+    let rows = parse_mvcc_ids(&mvcc_payload);
+    Ok(rows.key_hashes.into_iter().zip(rows.global_ids).collect())
 }
 
 impl WarmSearchSegment {
@@ -343,7 +373,21 @@ impl WarmSearchSegment {
         })?;
 
         let total_count = graph.num_nodes();
-        let (global_ids, key_hashes) = parse_mvcc_ids(&mvcc_payload);
+        let MvccRows {
+            global_ids,
+            key_hashes,
+            dead,
+        } = parse_mvcc_ids(&mvcc_payload);
+        let key_index = KeyHashIndex::build(key_hashes.len(), |pos| key_hashes[pos as usize]);
+        let (install_dead, install_dead_count) = if dead.is_empty() {
+            (None, 0)
+        } else {
+            let mut bits = vec![0u64; key_hashes.len().div_ceil(64)];
+            for &pos in &dead {
+                bits[pos as usize / 64] |= 1 << (pos % 64);
+            }
+            (Some(bits.into_boxed_slice()), dead.len() as u32)
+        };
 
         Ok(Self {
             segment_id,
@@ -359,7 +403,46 @@ impl WarmSearchSegment {
             last_access_micros: AtomicU64::new(now_micros()),
             has_tombstones: AtomicBool::new(false),
             tombstoned_keys: parking_lot::RwLock::new(HashSet::new()),
+            key_index,
+            install_dead,
+            install_dead_count,
+            steady_dead: AtomicU32::new(0),
         })
+    }
+
+    /// Whether an install-time tombstone killed the row at `pos`.
+    #[inline]
+    fn is_install_dead(&self, pos: usize) -> bool {
+        self.install_dead.as_ref().is_some_and(|bits| {
+            bits.get(pos / 64)
+                .is_some_and(|w| w & (1 << (pos % 64)) != 0)
+        })
+    }
+
+    /// Rows holding `key_hash` that no install-time tombstone killed.
+    fn live_rows_for_key(&self, key_hash: u64) -> u32 {
+        self.key_index
+            .positions(key_hash, |pos| self.key_hashes[pos as usize])
+            .iter()
+            .filter(|&&pos| !self.is_install_dead(pos as usize))
+            .count() as u32
+    }
+
+    /// Sorted key_hashes of every row live right now (neither install-time
+    /// nor steady-state tombstoned) -- what a COLD stub must remember to
+    /// count later tombstones against this segment's own keys.
+    pub fn live_key_hashes_sorted(&self) -> Box<[u64]> {
+        let toms = self.tombstoned_keys.read();
+        let mut live: Vec<u64> = self
+            .key_hashes
+            .iter()
+            .enumerate()
+            .filter(|&(pos, kh)| !self.is_install_dead(pos) && !toms.contains(kh))
+            .map(|(_, &kh)| kh)
+            .collect();
+        drop(toms);
+        live.sort_unstable();
+        live.into_boxed_slice()
     }
 
     /// HNSW search over mmap-backed TQ codes. Same algorithm as ImmutableSegment.
@@ -417,14 +500,20 @@ impl WarmSearchSegment {
         // computed the same way `remap_to_global_ids` does) means a HDEL'd
         // doc never resurfaces, even before a reload: `mark_deleted_by_key_hash`
         // takes effect immediately against an already-resident WarmSearchSegment.
+        // Rows the HOT segment killed at install time are dropped the same way
+        // (by position: a live sibling row of the same key stays).
         if self.has_tombstones.load(Ordering::Acquire) {
             let guard = self.tombstoned_keys.read();
             candidates.retain(|c| {
                 let bfs = self.graph.to_bfs(c.id.0) as usize;
-                self.key_hashes
-                    .get(bfs)
-                    .is_none_or(|kh| !guard.contains(kh))
+                !self.is_install_dead(bfs)
+                    && self
+                        .key_hashes
+                        .get(bfs)
+                        .is_none_or(|kh| !guard.contains(kh))
             });
+        } else if self.install_dead.is_some() {
+            candidates.retain(|c| !self.is_install_dead(self.graph.to_bfs(c.id.0) as usize));
         }
 
         // WS3 / HQ-1 parity: exact rerank from the f16 sidecar when the
@@ -545,9 +634,16 @@ impl WarmSearchSegment {
     /// Mark a key as deleted via interior mutability -- the WARM-tier twin of
     /// `ImmutableSegment::mark_deleted_by_key_hash` (WS3 round-2 resurrection
     /// fix). Takes effect immediately: the next `search_filtered` call
-    /// filters this key_hash out, no reload required. Returns 1 if newly
-    /// tombstoned, 0 if already present.
+    /// filters this key_hash out, no reload required.
+    ///
+    /// Recorded and counted only when this segment holds a live row for the
+    /// key (see `ImmutableSegment::mark_deleted_by_key_hash`). Returns the
+    /// number of rows newly tombstoned.
     pub fn mark_deleted_by_key_hash(&self, key_hash: u64) -> u32 {
+        let rows = self.live_rows_for_key(key_hash);
+        if rows == 0 {
+            return 0;
+        }
         {
             let guard = self.tombstoned_keys.read();
             if guard.contains(&key_hash) {
@@ -557,7 +653,8 @@ impl WarmSearchSegment {
         let mut guard = self.tombstoned_keys.write();
         if guard.insert(key_hash) {
             self.has_tombstones.store(true, Ordering::Release);
-            1
+            self.steady_dead.fetch_add(rows, Ordering::Relaxed);
+            rows
         } else {
             0
         }
@@ -567,16 +664,12 @@ impl WarmSearchSegment {
     /// carry over the source immutable segment's live (steady-state)
     /// tombstones (which `mvcc_raw_bytes` does NOT capture; see
     /// `VectorIndex::try_warm_transitions_idle`), and by `UnloadedSegment::reload`
-    /// to replay tombstones that arrived while the segment was COLD.
+    /// to replay tombstones that arrived while the segment was COLD. Same
+    /// membership rule and count as [`Self::mark_deleted_by_key_hash`].
     pub fn seed_tombstones(&self, key_hashes: &[u64]) {
-        if key_hashes.is_empty() {
-            return;
+        for &kh in key_hashes {
+            self.mark_deleted_by_key_hash(kh);
         }
-        let mut guard = self.tombstoned_keys.write();
-        for kh in key_hashes {
-            guard.insert(*kh);
-        }
-        self.has_tombstones.store(true, Ordering::Release);
     }
 
     /// All currently-tombstoned key hashes (WS3 round 2: used to carry
@@ -586,17 +679,16 @@ impl WarmSearchSegment {
         self.tombstoned_keys.read().iter().copied().collect()
     }
 
-    /// Live document count: `total_count` minus currently-tombstoned entries.
-    /// This is what `FT.INFO`'s `num_docs` must sum (WS3 round-2 resurrection
-    /// fix) -- `total_count()` alone over-reports once a delete lands against
-    /// an already-WARM/COLD segment.
+    /// Live document count: `total_count` minus the rows killed at install
+    /// time and the rows this segment's own tombstones killed since. This is
+    /// what `FT.INFO`'s `num_docs` must sum (WS3 round-2 resurrection fix) --
+    /// `total_count()` alone over-reports once a delete lands against an
+    /// already-WARM/COLD segment.
     #[inline]
     pub fn live_count(&self) -> u32 {
-        if !self.has_tombstones.load(Ordering::Acquire) {
-            return self.total_count;
-        }
-        let dead = self.tombstoned_keys.read().len() as u32;
-        self.total_count.saturating_sub(dead)
+        self.total_count
+            .saturating_sub(self.install_dead_count)
+            .saturating_sub(self.steady_dead.load(Ordering::Relaxed))
     }
 
     /// Estimated resident bytes for this warm segment.
@@ -610,6 +702,8 @@ impl WarmSearchSegment {
             + self.graph.resident_bytes()
             + self.global_ids.len() * std::mem::size_of::<u32>()
             + self.key_hashes.len() * std::mem::size_of::<u64>()
+            + self.key_index.resident_bytes()
+            + self.install_dead.as_ref().map_or(0, |b| b.len() * 8)
             + self.raw_f16.as_ref().map_or(0, RawF16Store::resident_bytes)
     }
 
@@ -851,6 +945,86 @@ mod tests {
         );
     }
 
+    /// moon#1066: a WARM segment records a tombstone only for a key it holds
+    /// a live row for, and a row the HOT segment killed at install time
+    /// (`delete_lsn` set in `mvcc.mpf`) is dead here too -- as a row, so a
+    /// live sibling row of the same key stays live.
+    #[test]
+    fn warm_tombstones_follow_membership_and_install_time_deaths() {
+        distance::init();
+        let collection = Arc::new(CollectionMetadata::new(
+            1,
+            8,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
+        ));
+        let empty_graph = HnswGraph::new(
+            0,
+            16,
+            32,
+            0,
+            0,
+            crate::vector::aligned_buffer::AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            68,
+        );
+        // (key_hash, global_id, delete_lsn): key 20 has a dead old copy and a
+        // live new one; key 40's only row died at install time.
+        let rows: [(u64, u32, u64); 4] = [(10, 0, 0), (20, 1, 7), (20, 2, 0), (40, 3, 7)];
+        let mut mvcc = Vec::new();
+        for (i, (kh, gid, del)) in rows.iter().enumerate() {
+            mvcc.extend_from_slice(&(i as u32).to_le_bytes());
+            mvcc.extend_from_slice(&gid.to_le_bytes());
+            mvcc.extend_from_slice(&kh.to_le_bytes());
+            mvcc.extend_from_slice(&1u64.to_le_bytes());
+            mvcc.extend_from_slice(&del.to_le_bytes());
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let seg_dir = tmp.path().join("segment-3");
+        write_test_mpf_segment(&seg_dir, 3, &[], &empty_graph.to_bytes(), &mvcc);
+        let handle = SegmentHandle::new(3, seg_dir.clone());
+        let warm = WarmSearchSegment::from_files(&seg_dir, 3, collection, handle, false).unwrap();
+
+        assert_eq!(
+            peek_mvcc_rows(&seg_dir).unwrap(),
+            vec![(10, 0), (20, 1), (20, 2), (40, 3)],
+            "recovery sees every row: the gid floor must clear the dead ones too"
+        );
+        assert_eq!(
+            &*warm.live_key_hashes_sorted(),
+            &[10, 20],
+            "install-time deaths are not live; the live sibling of key 20 is"
+        );
+        assert_eq!(warm.mark_deleted_by_key_hash(99), 0, "not held here");
+        assert_eq!(
+            warm.mark_deleted_by_key_hash(40),
+            0,
+            "only row already dead"
+        );
+        assert!(warm.tombstoned_key_hashes().is_empty());
+        assert_eq!(warm.mark_deleted_by_key_hash(20), 1, "one live row killed");
+        assert_eq!(warm.mark_deleted_by_key_hash(20), 0, "idempotent");
+        assert_eq!(&*warm.live_key_hashes_sorted(), &[10]);
+
+        // The COLD stub keeps the same rule without the data resident.
+        let stub =
+            crate::vector::persistence::unloaded_segment::UnloadedSegment::from_warm(&warm, false);
+        assert_eq!(stub.live_count(), 1);
+        assert_eq!(
+            stub.mark_deleted_by_key_hash(20),
+            0,
+            "already dead at unload"
+        );
+        assert_eq!(stub.mark_deleted_by_key_hash(99), 0, "not held here");
+        assert_eq!(stub.live_count(), 1, "foreign keys are never counted");
+        assert_eq!(stub.mark_deleted_by_key_hash(10), 1);
+        assert_eq!(stub.live_count(), 0);
+    }
+
     #[test]
     fn test_warm_search_empty_returns_no_results() {
         distance::init();
@@ -901,12 +1075,14 @@ mod tests {
             mvcc_data.extend_from_slice(&(i + 100).to_le_bytes()); // global_id
             mvcc_data.extend_from_slice(&(0xBEEF_0000_u64 + i as u64).to_le_bytes()); // key_hash
             mvcc_data.extend_from_slice(&0u64.to_le_bytes()); // insert_lsn
-            mvcc_data.extend_from_slice(&0u64.to_le_bytes()); // delete_lsn
+            // delete_lsn: row 1 was killed at install time.
+            mvcc_data.extend_from_slice(&u64::from(i == 1).to_le_bytes());
         }
 
-        let (ids, key_hashes) = parse_mvcc_ids(&mvcc_data);
-        assert_eq!(ids, vec![100, 101, 102]);
-        assert_eq!(key_hashes, vec![0xBEEF_0000, 0xBEEF_0001, 0xBEEF_0002]);
+        let rows = parse_mvcc_ids(&mvcc_data);
+        assert_eq!(rows.global_ids, vec![100, 101, 102]);
+        assert_eq!(rows.key_hashes, vec![0xBEEF_0000, 0xBEEF_0001, 0xBEEF_0002]);
+        assert_eq!(rows.dead, vec![1], "a set delete_lsn marks the row dead");
     }
 
     #[test]

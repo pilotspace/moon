@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use roaring::RoaringBitmap;
@@ -21,6 +21,7 @@ use crate::vector::hnsw::search::{
 };
 #[allow(unused_imports)]
 use crate::vector::hnsw::search_sq::hnsw_search_f32;
+use crate::vector::segment::key_index::KeyHashIndex;
 use crate::vector::segment::raw_f16_store::RawF16Store;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::inner_product::{prepare_query_prod, score_l2_prod};
@@ -98,10 +99,17 @@ pub struct ImmutableSegment {
     // acquires a read lock and checks the set. Contention is nil — tombstones are
     // written at most once per HDEL, and only during deletion.
     //
-    // Note: steady-state tombstones do NOT decrement `live_count()` (prototype
-    // limitation — count becomes a lower bound, not exact).
+    // A steady-state tombstone is recorded, and counted in `steady_dead`, only
+    // by a segment that holds a live row for the key (`key_index`): the set
+    // stays bounded by the segment's own keys, and `live_count()` is exact.
     has_tombstones: AtomicBool,
     tombstoned_keys: parking_lot::RwLock<HashSet<u64>>,
+    /// Row positions sorted by key_hash: "does this segment hold a live copy
+    /// of key K?" in O(log n). Built once in [`Self::new`].
+    key_index: KeyHashIndex,
+    /// Rows killed by steady-state tombstones (install-time kills are already
+    /// out of `live_count`). `live_count()` subtracts it.
+    steady_dead: AtomicU32,
 
     /// Exact-rerank sidecar (HQ-1): f16 copy of each ORIGINAL vector,
     /// BFS-ordered like `vectors_tq`, `dimension` halves per entry. When
@@ -155,6 +163,7 @@ impl ImmutableSegment {
         live_count: u32,
         total_count: u32,
     ) -> Self {
+        let key_index = KeyHashIndex::build(mvcc.len(), |pos| mvcc[pos as usize].key_hash);
         Self {
             graph,
             vectors_tq,
@@ -170,6 +179,8 @@ impl ImmutableSegment {
             created_at: Instant::now(),
             has_tombstones: AtomicBool::new(false),
             tombstoned_keys: parking_lot::RwLock::new(HashSet::new()),
+            key_index,
+            steady_dead: AtomicU32::new(0),
             raw_f16: None,
             suggested_ef: None,
             disk_segment_id: None,
@@ -517,13 +528,21 @@ impl ImmutableSegment {
 
     /// Mark a key as deleted via interior mutability.
     ///
-    /// This is the **steady-state** tombstone path: called when a HDEL or
-    /// `mark_deleted_for_key` fires against an already-Arc'd immutable segment.
-    /// Does **not** modify `mvcc` or `live_count` (prototype limitation; see
-    /// struct field comment above).
+    /// This is the **steady-state** tombstone path: called when a HDEL, a
+    /// `mark_deleted_for_key`, or an update's VEC-1 supersede fires against an
+    /// already-Arc'd immutable segment. Does not modify `mvcc`.
     ///
-    /// Returns 1 if the key was newly tombstoned, 0 if it was already present.
+    /// A segment that holds no live row for `key_hash` records nothing: the
+    /// tombstone belongs to the segment holding the copy, and only that
+    /// segment counts it (`steady_dead`, subtracted by [`Self::live_count`]).
+    ///
+    /// Returns the number of rows newly tombstoned (0 when the segment holds
+    /// no live row for the key, or already tombstoned it).
     pub fn mark_deleted_by_key_hash(&self, key_hash: u64) -> u32 {
+        let rows = self.live_rows_for_key(key_hash);
+        if rows == 0 {
+            return 0;
+        }
         {
             let guard = self.tombstoned_keys.read();
             if guard.contains(&key_hash) {
@@ -534,10 +553,22 @@ impl ImmutableSegment {
         if guard.insert(key_hash) {
             // Release-store so the next `is_live_bfs` Acquire-load sees the set.
             self.has_tombstones.store(true, Ordering::Release);
-            1
+            self.steady_dead.fetch_add(rows, Ordering::Relaxed);
+            rows
         } else {
             0
         }
+    }
+
+    /// Rows holding `key_hash` that no install-time (`mvcc.delete_lsn`)
+    /// tombstone has killed. Steady-state tombstones are not consulted: the
+    /// caller decides with the tombstone set in hand.
+    fn live_rows_for_key(&self, key_hash: u64) -> u32 {
+        self.key_index
+            .positions(key_hash, |pos| self.mvcc[pos as usize].key_hash)
+            .iter()
+            .filter(|&&pos| self.mvcc[pos as usize].delete_lsn == 0)
+            .count() as u32
     }
 
     /// Returns `true` if the entry at `bfs_pos` is live (not deleted).
@@ -979,8 +1010,19 @@ impl ImmutableSegment {
         &self.collection_meta
     }
 
-    /// Number of live (non-deleted) entries.
+    /// Number of live entries: install-time (`mvcc.delete_lsn`) and
+    /// steady-state (`tombstoned_keys`) tombstones both excluded.
     pub fn live_count(&self) -> u32 {
+        self.live_count
+            .saturating_sub(self.steady_dead.load(Ordering::Relaxed))
+    }
+
+    /// Live entries per the MVCC headers alone (install-time tombstones only)
+    /// — the count that agrees with `mvcc_headers()` as serialized to disk.
+    /// Segment persistence records this one: a steady-state tombstone is not
+    /// in the persisted headers, so recording it in the count would make the
+    /// two disagree on reload.
+    pub fn mvcc_live_count(&self) -> u32 {
         self.live_count
     }
 
@@ -1001,7 +1043,8 @@ impl ImmutableSegment {
         // Mapped sidecars report 0: their pages are kernel page cache, not
         // pinned heap — see RawF16Store::resident_bytes.
         let sidecar = self.raw_f16.as_ref().map_or(0, RawF16Store::resident_bytes);
-        graph + tq + qjl + norms + sub + mvcc + sidecar
+        let key_index = self.key_index.resident_bytes();
+        graph + tq + qjl + norms + sub + mvcc + sidecar + key_index
     }
 
     /// Fraction of dead entries: (total - live) / total.
@@ -1238,8 +1281,9 @@ impl ImmutableSegment {
     /// tombstone was recorded against the copies THAT source held; replaying it
     /// key_hash-wide onto the merged output would also kill a NEWER same-key
     /// copy merged in from a sibling segment (the update-then-compact case —
-    /// mass index loss under churn). Real DEL/UNLINK tombstones land in every
-    /// source's interior set, so gating by origin still kills them everywhere.
+    /// mass index loss under churn). A DEL/UNLINK tombstone lands in the set
+    /// of the source holding the key's live copy, so gating by origin kills
+    /// exactly that copy.
     pub fn mark_deleted_by_key_hash_install_from(
         &mut self,
         key_hash: u64,
@@ -1306,6 +1350,10 @@ impl ImmutableSegment {
         self.sub_centroid_signs[src..src + sub_bpv].to_vec()
     }
 }
+
+#[cfg(test)]
+#[path = "immutable_tombstone_tests.rs"]
+mod tombstone_tests;
 
 #[cfg(test)]
 mod tests {

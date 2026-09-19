@@ -4227,14 +4227,13 @@ fn handle_vector_insert(
                 // MVCC-tombstoned at the new version's LSN (older snapshots
                 // keep seeing the old vector; new snapshots see only the new).
             } else {
-                // Old version was compacted (or the gid mapping was stale):
-                // steady-state interior tombstone across immutable segments —
-                // the same path DEL/UNLINK takes via `mark_deleted_for_key` —
-                // plus a defensive mutable scan for the stale-mapping case.
-                snap.mutable.mark_deleted_by_key_hash(key_hash, insert_lsn);
-                for imm in snap.immutable.iter() {
-                    imm.mark_deleted_by_key_hash(key_hash);
-                }
+                // Old version left the mutable segment (compacted into HOT,
+                // since gone WARM or COLD), or the gid mapping was stale:
+                // tombstone it in EVERY tier -- the same sweep DEL/UNLINK
+                // takes via `mark_deleted_for_key` (moon#1066: this used to
+                // stop at HOT, so a WARM/COLD old copy stayed live) -- plus a
+                // defensive mutable scan for the stale-mapping case.
+                snap.tombstone_key(key_hash, insert_lsn);
             }
         }
     }
@@ -4313,14 +4312,12 @@ fn handle_vector_insert_field(
     // so both fields share one logical write event (Phase 165 MVCC contract).
     // When inside a TXN (txn_id != 0), tag with txn_id for uncommitted visibility.
     let snap = fs.segments.load();
-    // VEC-1 (additional fields): tombstone the prior version on update. Field
-    // segments have no `key_hash → global_id` map, so this is the scan path
-    // (mutable is bounded by compact_threshold; immutables are set lookups).
+    // VEC-1 (additional fields): tombstone the prior version on update, in
+    // every tier (moon#1066). Field segments have no `key_hash → global_id`
+    // map, so this is the scan path (mutable is bounded by compact_threshold;
+    // the other tiers are O(log n) membership lookups).
     if txn_id == 0 {
-        snap.mutable.mark_deleted_by_key_hash(key_hash, insert_lsn);
-        for imm in snap.immutable.iter() {
-            imm.mark_deleted_by_key_hash(key_hash);
-        }
+        snap.tombstone_key(key_hash, insert_lsn);
     }
     let _internal_id = if txn_id != 0 {
         snap.mutable

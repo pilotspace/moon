@@ -199,6 +199,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A re-written or deleted vector document stops matching in every tier, at
+  runtime and across a restart, and `FT.INFO num_docs` counts each live key
+  once** (moon#1066, moon#1073). Measured on a real server, 1000 keys, before
+  the fix:
+  - an `HSET` re-write of a key whose old copy was WARM or COLD left that copy
+    live: KNN for the OVERWRITTEN vector still returned the key top-1, and
+    `num_docs` read 1001. The update path tombstoned the mutable and HOT
+    segments only; DEL went through every tier. Both now share one sweep
+    (`SegmentList::tombstone_key`).
+  - across a restart, a HOT segment's copy of a re-written key came back live:
+    Stack B writes a segment once, so a tombstone applied in memory is gone
+    after the reload, and recovery admitted a key when ANY loaded row had its
+    key_hash. After a kill -9 with the re-write still in the mutable segment,
+    the key answered ONLY to its overwritten vector and its current one was
+    lost. A DEL'd key came back as `vec:<id>`. Recovery now keeps a loaded row
+    only if it is the copy the persisted keymap names (key_hash AND
+    global_id), once, and tombstones every other row in its own segment -- no
+    key_hash-wide tombstone, no on-disk format change.
+  - a row killed at install time (the key was deleted or re-written while its
+    background build ran) came back live after HOT -> WARM: `mvcc.mpf` carried
+    the `delete_lsn`, and the warm reader ignored it. It is now a dead row in
+    WARM and COLD, by position, so a live sibling copy of the key stays.
+  - `num_docs` was wrong both ways: a HOT segment never counted a steady-state
+    tombstone (1000 after a DEL of 1000), and every WARM/COLD segment counted
+    every tombstone whether it held the key or not (1998 after one DEL across
+    two segments). A tombstone is now recorded and counted only by the segment
+    holding a live row for the key, through a per-segment key_hash index
+    (4 bytes per row in HOT and WARM segments; a COLD stub keeps 8 bytes per
+    live row). Tombstone sets no longer grow with every DEL in every segment.
+  - `FT.COMPACT` draining an in-flight background merge replayed the sources'
+    tombstones key_hash-wide, killing the NEW copy of a key re-written while
+    the merge ran; it now uses the origin-gated replay the background install
+    already used.
+
 - **Restart no longer deletes warm vector segments it is serving, and a warm
   segment is superseded per key instead of as a whole directory** (moon#893).
   Boot recovery judged a warm segment "already covered" when ANY one of its
