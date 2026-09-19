@@ -399,7 +399,7 @@ impl TrackingTable {
     ///
     /// Known gap: a RESP3 target that neither subscribed nor enabled tracking
     /// has no channel moon can reach (redis would push to it). Giving every
-    /// connection one would cost every idle connection its park.
+    /// connection one would cost every idle connection its park (moon#1078).
     fn route(&mut self, client_id: u64) -> Option<Delivery> {
         let Some(&target) = self.redirects.get(&client_id) else {
             return self

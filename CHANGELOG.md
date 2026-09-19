@@ -232,7 +232,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     unsubscribed.
   - Known gap: a RESP3 redirect target that neither subscribed nor enabled
     tracking itself cannot be reached (redis pushes to it); giving every
-    connection a delivery channel would cost every idle connection its park.
+    connection a delivery channel would cost every idle connection its park
+    (moon#1078).
 
 - **`maxmemory` is one cap again once keys have spilled to disk** (moon#1036).
   Since K4, the 100 ms pressure cascade has held each database to hot bytes
