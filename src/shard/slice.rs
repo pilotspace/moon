@@ -590,29 +590,20 @@ pub fn refresh_db_clock(db_index: usize, clock: &crate::storage::entry::CachedCl
 /// so neither [`with_shard_db`]'s slow path (a second `with_shard`) nor
 /// [`ShardDbSet::with_pair`] (the selected db again) can be used from there.
 ///
-/// Returns `None`, running nothing, when this thread is not a registered shard
-/// thread (`cached_db_set()` absent — unit-test slices) or `db_index` is out of
-/// range. The caller must answer with an error rather than fall back to the
-/// one database it holds.
+/// **Blocks** while a foreign reader or writer holds `db_index`, then runs `f`
+/// — contention is waited out, never refused. Deadlock-freedom, including
+/// taking an index below the one already held, is argued on
+/// [`ShardDbSet::write_second`].
 ///
-/// # Lock order
-///
-/// This may acquire a LOWER index than the one the caller holds, against
-/// [`ShardDbSet::write_pair`]'s ascending rule. That rule orders owner
-/// acquisitions against each other; the owner is the only thread that ever
-/// PARKS on these locks, and it is single-threaded. Every other party —
-/// `try_foreign_db_read` / `try_foreign_db_write` — makes one non-blocking
-/// attempt and holds a single guard while never waiting on anything, so it
-/// cannot be one side of a cycle. The worst case is a short wait for a foreign
-/// reader to finish.
-///
-/// # Panics
-/// On the re-entrancy contract: `db_index` must not be a database this thread
-/// already holds (the caller passes a destination distinct from its source).
+/// Returns `None`, running nothing, only in the structural cases: this thread
+/// is not a registered shard thread (`cached_db_set()` absent — unit-test
+/// slices), `db_index` is out of range, or this thread already holds
+/// `db_index` (which would otherwise deadlock). The caller answers with an
+/// error rather than fall back to the one database it holds.
 #[inline]
 pub fn with_second_shard_db<R>(db_index: usize, f: impl FnOnce(&mut Database) -> R) -> Option<R> {
     let set = cached_db_set()?;
-    let mut guard = set.try_write(db_index)?;
+    let mut guard = set.write_second(db_index)?;
     Some(f(&mut guard))
 }
 
