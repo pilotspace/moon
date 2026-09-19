@@ -240,6 +240,53 @@ pub trait CommandReplayEngine {
     ) -> ReplayRoute;
 }
 
+/// Decode one WAL v3 `Command` record payload and replay every command in it
+/// through `engine`.
+///
+/// The payload is RESP: one or more arrays of `[name, args...]`, exactly what
+/// `aof::serialize_command` writes on the live path. Each array's first
+/// element is the command NAME and the rest are its arguments. `on_route` is
+/// called once per replayed command with the route the engine took, which is
+/// how callers count what reached the keyspace (see [`ReplayRoute`]).
+///
+/// This is the ONE decoder for WAL `Command` payloads. The Phase 4 WAL pass
+/// (`recovery.rs`) and the last-resort fallback
+/// (`wal_v3::replay::replay_wal_v3_dir_commands`) both call it. moon#1026: the
+/// fallback once kept its own copy that passed the whole raw payload as the
+/// command name with no arguments, so every record answered "unknown
+/// command", nothing was applied, and the caller still logged the records as
+/// replayed. Sharing the decoder is what keeps the two paths from drifting.
+///
+/// Decoding stops at the first frame that does not parse, matching Phase 4.
+/// A non-array frame, an empty array, or a name that is not a string is
+/// skipped. Returns the number of commands handed to the engine.
+pub fn replay_resp_payload<E: CommandReplayEngine + ?Sized>(
+    engine: &E,
+    databases: &mut [Database],
+    payload: &[u8],
+    selected_db: &mut usize,
+    mut on_route: impl FnMut(ReplayRoute),
+) -> usize {
+    let mut buf = bytes::BytesMut::from(payload);
+    let parse_cfg = crate::protocol::ParseConfig::default();
+    let mut replayed = 0usize;
+    while let Ok(Some(frame)) = crate::protocol::parse::parse(&mut buf, &parse_cfg) {
+        let Frame::Array(ref arr) = frame else {
+            continue;
+        };
+        let Some((name, args)) = arr.split_first() else {
+            continue;
+        };
+        let cmd_name: &[u8] = match name {
+            Frame::BulkString(s) | Frame::SimpleString(s) => s.as_ref(),
+            _ => continue,
+        };
+        on_route(engine.replay_command(databases, cmd_name, args, selected_db));
+        replayed += 1;
+    }
+    replayed
+}
+
 /// Concrete implementation that delegates to `command::dispatch`.
 ///
 /// This is the **only** place that imports `command::dispatch` for replay
