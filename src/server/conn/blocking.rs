@@ -3004,9 +3004,7 @@ pub(crate) fn try_inline_dispatch(
             });
             drop(rt);
             if let Some(crate::protocol::Frame::Error(msg)) = quota_err {
-                write_buf.extend_from_slice(b"-");
-                write_buf.extend_from_slice(&msg);
-                write_buf.extend_from_slice(b"\r\n");
+                crate::protocol::serialize::put_line(write_buf, b'-', &msg);
                 return 1;
             }
         }

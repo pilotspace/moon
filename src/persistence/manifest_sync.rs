@@ -357,7 +357,7 @@ mod tests {
 
         m.set_inject_sync_delay_ms(200);
         let t0 = Instant::now();
-        m.add_file(make_entry(1));
+        m.add_file(make_entry(1)).unwrap();
         m.commit_deferred().expect("deferred commit send");
         let elapsed = t0.elapsed();
         m.set_inject_sync_delay_ms(0);
@@ -390,7 +390,7 @@ mod tests {
         m.enable_deferred_sync(9);
 
         m.set_inject_sync_delay_ms(100);
-        m.add_file(make_entry(41));
+        m.add_file(make_entry(41)).unwrap();
         m.commit_deferred().expect("deferred send");
         // Barrier must block until the deferred snapshot (or newer) is durable.
         super::flush_all_agents().expect("flush barrier");
@@ -435,7 +435,7 @@ mod tests {
 
         m.set_inject_sync_delay_ms(150);
         let t0 = Instant::now();
-        m.add_file(make_entry(7));
+        m.add_file(make_entry(7)).unwrap();
         m.commit().expect("durable commit");
         let elapsed = t0.elapsed();
         m.set_inject_sync_delay_ms(0);
@@ -467,11 +467,11 @@ mod tests {
         // scheduling can let the worker race the burst commit-by-commit and
         // weaken the coalescing bound into flakiness.
         m.set_inject_sync_delay_ms(100);
-        m.add_file(make_entry(99));
+        m.add_file(make_entry(99)).unwrap();
         m.commit_deferred().expect("priming deferred send");
         std::thread::sleep(Duration::from_millis(50));
         for i in 0..20u64 {
-            m.add_file(make_entry(100 + i));
+            m.add_file(make_entry(100 + i)).unwrap();
             m.commit_deferred().expect("deferred send");
         }
         m.shutdown_deferred();
@@ -519,13 +519,13 @@ mod tests {
         // reproduced the block. Blocking needs commits to arrive while the
         // worker is stuck in persist with no one draining.
         m.set_inject_sync_delay_ms(400);
-        m.add_file(make_entry(999));
+        m.add_file(make_entry(999)).unwrap();
         m.commit_deferred().expect("priming deferred send");
         std::thread::sleep(Duration::from_millis(50));
 
         let t0 = Instant::now();
         for i in 0..100u64 {
-            m.add_file(make_entry(1000 + i));
+            m.add_file(make_entry(1000 + i)).unwrap();
             m.commit_deferred().expect("deferred send");
         }
         let elapsed = t0.elapsed();
@@ -562,7 +562,7 @@ mod tests {
         m.enable_deferred_sync(5);
 
         m.set_inject_persist_error(true);
-        m.add_file(make_entry(1));
+        m.add_file(make_entry(1)).unwrap();
         m.commit_deferred().expect("deferred send");
         // Whether the failing round has already consumed the slot or the
         // barrier's own round persists (and fails) it, the barrier must
@@ -579,7 +579,7 @@ mod tests {
 
         // A newer snapshot that persists successfully heals the latch.
         m.set_inject_persist_error(false);
-        m.add_file(make_entry(2));
+        m.add_file(make_entry(2)).unwrap();
         m.commit_deferred().expect("deferred send");
         assert!(
             super::flush_all_agents().is_ok(),
@@ -604,7 +604,7 @@ mod tests {
             let path = tmp.path().join("shard-6.manifest");
             let mut m = ShardManifest::create(&path).expect("create");
             m.enable_deferred_sync(6);
-            m.add_file(make_entry(1));
+            m.add_file(make_entry(1)).unwrap();
             m.commit_deferred().expect("deferred send");
             // No shutdown_deferred: the agent handle drops with the manifest.
         }
@@ -627,12 +627,12 @@ mod tests {
         let path = tmp.path().join("shard-3.manifest");
         let mut m = ShardManifest::create(&path).expect("create");
         m.enable_deferred_sync(3);
-        m.add_file(make_entry(1));
+        m.add_file(make_entry(1)).unwrap();
         m.commit_deferred().expect("deferred send");
         m.shutdown_deferred();
 
         // Post-shutdown the manifest is inline again: durable commit works.
-        m.add_file(make_entry(2));
+        m.add_file(make_entry(2)).unwrap();
         m.commit().expect("inline commit after shutdown");
         drop(m);
         let reopened = ShardManifest::open(&path).expect("reopen");
