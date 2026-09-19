@@ -267,7 +267,7 @@ fn run_write_eviction_gate(
                     );
                 }),
         );
-        ctx.spill_file_id.set(fid);
+        ctx.spill_file_id.set(ctx.spill_file_id.get().max(fid));
         res
     } else {
         // task #34 (Wave A): plain-drop eviction on the generic per-command

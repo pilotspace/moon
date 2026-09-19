@@ -952,6 +952,45 @@ if should_run "sorted_set"; then
     rcli ZADD z:ch 1 m >/dev/null 2>&1; mcli ZADD z:ch 1 m >/dev/null 2>&1
     assert_match "ZADD CH sub-epsilon"     ZADD z:ch CH 1.0000000000000002 m
     assert_match "ZADD CH moved the score" ZSCORE z:ch m
+
+    # moon#959 -- six commands that answered `ERR unknown command` on moon
+    # (ZRANGEBYLEX, ZREVRANGEBYLEX, ZREMRANGEBYRANK, ZREMRANGEBYSCORE,
+    # ZREMRANGEBYLEX, ZDIFFSTORE) plus `ZADD ... INCR`, which answered an
+    # arity error. Neither harness named any of them, which is how a command
+    # docs/commands.md advertised went missing. Every reply was read off
+    # redis 8.6.1 before the commands were written.
+    rcli ZADD z:959:lex 0 a 0 b 0 c 0 d 0 e >/dev/null 2>&1; mcli ZADD z:959:lex 0 a 0 b 0 c 0 d 0 e >/dev/null 2>&1
+    assert_match "ZRANGEBYLEX"              ZRANGEBYLEX z:959:lex - +
+    assert_match "ZRANGEBYLEX bounds"       ZRANGEBYLEX z:959:lex '[b' '(d'
+    assert_match "ZRANGEBYLEX LIMIT"        ZRANGEBYLEX z:959:lex - + LIMIT 1 2
+    assert_match "ZRANGEBYLEX bad bound"    ZRANGEBYLEX z:959:lex a b
+    assert_match "ZRANGEBYLEX WITHSCORES"   ZRANGEBYLEX z:959:lex - + WITHSCORES
+    assert_match "ZRANGEBYLEX WITHSCORES 1st" ZRANGEBYLEX z:959:lex a b WITHSCORES
+    assert_match "ZREVRANGEBYLEX"           ZREVRANGEBYLEX z:959:lex + -
+    assert_match "ZREVRANGEBYLEX bounds"    ZREVRANGEBYLEX z:959:lex '(d' '[b' LIMIT 0 1
+    rcli ZADD z:959:r 1 a 2 b 3 c 4 d 5 e >/dev/null 2>&1; mcli ZADD z:959:r 1 a 2 b 3 c 4 d 5 e >/dev/null 2>&1
+    assert_match "ZREMRANGEBYRANK"          ZREMRANGEBYRANK z:959:r 0 0
+    assert_match "ZREMRANGEBYRANK neg stop" ZREMRANGEBYRANK z:959:r -10 -6
+    assert_match "ZREMRANGEBYSCORE"         ZREMRANGEBYSCORE z:959:r '(2' 3
+    assert_match "ZREMRANGEBYSCORE bad"     ZREMRANGEBYSCORE z:959:r nan 1
+    assert_match "ZREMRANGEBYLEX"           ZREMRANGEBYLEX z:959:lex '[b' '(d'
+    assert_match "ZREMRANGEBYLEX arity"     ZREMRANGEBYLEX z:959:lex - + x
+    assert_match "ZRANGE after ZREMRANGE"   ZRANGE z:959:r 0 -1 WITHSCORES
+    assert_match "ZREMRANGEBYSCORE drains"  ZREMRANGEBYSCORE z:959:r -inf +inf
+    assert_match "ZREMRANGE drained key"    EXISTS z:959:r
+    assert_match "ZDIFFSTORE"               ZDIFFSTORE {z}:diff 2 {z}:A {z}:B
+    assert_match "ZDIFFSTORE result"        ZRANGE {z}:diff 0 -1 WITHSCORES
+    assert_match "ZDIFFSTORE numkeys 0"     ZDIFFSTORE {z}:diff 0 {z}:A
+    assert_match "ZDIFFSTORE WEIGHTS"       ZDIFFSTORE {z}:diff 1 {z}:A WEIGHTS 1
+    assert_match "ZDIFFSTORE empty deletes" ZDIFFSTORE {z}:diff 2 {z}:A {z}:A
+    assert_match "ZDIFFSTORE dest gone"     EXISTS {z}:diff
+    assert_match "ZADD INCR"                ZADD z:959:i INCR 5 a
+    assert_match "ZADD INCR again"          ZADD z:959:i INCR 2.5 a
+    assert_match "ZADD NX INCR refused"     ZADD z:959:i NX INCR 1 a
+    assert_match "ZADD XX INCR refused"     ZADD z:959:i XX INCR 1 nope
+    assert_match "ZADD GT INCR refused"     ZADD z:959:i GT INCR -1 a
+    assert_match "ZADD LT INCR"             ZADD z:959:i LT INCR -1 a
+    assert_match "ZADD INCR two pairs"      ZADD z:959:i INCR 1 a 2 b
 fi
 
 # ===========================================================================
@@ -1338,6 +1377,19 @@ if should_run "connection"; then
     fi
     mcli SET dg:probe v1 >/dev/null 2>&1
     assert_moon "DEBUG DIGEST returns to its earlier value" "$DG_ONE" DEBUG DIGEST
+
+    # moon#1015: REPLICAOF NO ONE answers like Redis at any shard count. A
+    # replica START is only probed at --shards > 1, where it must be REFUSED
+    # (multi-shard replicas are moon#406) and leave a writable master; at
+    # --shards 1 it would succeed and full-sync this node from the oracle.
+    assert_match "REPLICAOF NO ONE"    REPLICAOF NO ONE
+    if [[ "$SHARDS" -gt 1 ]]; then
+        assert_moon_contains "moon#1015 REPLICAOF refused at shards>1" \
+            "requires --shards 1" REPLICAOF 127.0.0.1 "$PORT_REDIS"
+        assert_moon_contains "moon#1015 refused REPLICAOF keeps role:master" \
+            "role:master" INFO replication
+        assert_moon "moon#1015 refused REPLICAOF keeps the node writable" "OK" SET moon1015:w v
+    fi
 fi
 
 # ===========================================================================

@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Six sorted-set commands that were `unknown command`, and `ZADD ... INCR`**
+  (moon#959). `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZREMRANGEBYRANK`,
+  `ZREMRANGEBYSCORE`, `ZREMRANGEBYLEX` and `ZDIFFSTORE` are implemented, wired
+  into every dispatch path, registered as `@sortedset`, and covered by rows in
+  both parity harnesses; `docs/commands.md` had advertised `ZRANGEBYLEX` while
+  dispatch rejected it. `ZADD ... INCR` — which `redis-py`'s `zadd(...,
+  incr=True)` sends — replies the new score as a bulk string, or nil when
+  `NX`/`XX`/`GT`/`LT` refuse, in Redis's decision order. Every reply, error
+  surface included, was read off redis-server 8.6.1 before the code was
+  written: the range grammar is checked before the key is consulted, a
+  `ZREMRANGEBY*` that drains a key deletes it, a listpack zset is trimmed in
+  place and never converted, and the `used_memory` ledger stays exact on both
+  encodings. `ZDIFFSTORE` joins the `ZUNIONSTORE` family's `numkeys` and
+  option rules, refusing `WEIGHTS`/`AGGREGATE` as `syntax error`, and — because
+  it writes a destination it is not routed on — it also joins the moon#592
+  cross-shard WRITE guard, so `ZDIFFSTORE` across shards is `CROSSSLOT` rather
+  than an ack whose destination lands nowhere. (It shares the guard's
+  `(10, b'z')` match arm with moon#962's `ZINTERCARD`; both spellings are
+  named there.)
+
 ### Changed
 
 - **BEHAVIOUR CHANGE — a command the user's ACL denies inside `MULTI` now
@@ -65,6 +87,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loader also serves replica full-sync and `DEBUG RELOAD` with a FOREIGN
   dataset, where preserving this node's index would surface stale reads.
 
+- **BEHAVIOUR CHANGE — a disk-offload server that cannot prove where its cold
+  file ids resume now refuses to start** (moon#997). If a shard's
+  `data/` or `vectors/` directory exists but cannot be listed, an entry in it
+  cannot be read, or its shard manifest is full-length but cannot be opened,
+  startup exits with `refusing to start: cannot prove shard N's cold file_id
+  seed …`, the OS error, and what is safe to do: for a permission or I/O
+  error nothing needs removing; for a manifest whose two root pages are both
+  corrupt the message says NOT to delete it (the next boot would delete every
+  heap file beside it as an orphan). It used to log a warning and restart the
+  counter at 1, after which the next spill renamed its batch onto the live
+  `heap-000001.mpf` (reproduced on both runtimes at `--shards 1` and `4` with
+  a `-wx` `data/` directory). A manifest shorter than its two root pages is
+  NOT refused: only an interrupted create produces one, it holds no entry, and
+  it is re-created empty with a WARN naming the file. Nothing on disk is
+  changed by a refusal.
+
 - **BEHAVIOUR CHANGE — `ZADD ... GT LT` and a NaN `WEIGHTS` value now error**
   where they previously succeeded (moon#969). `ZADD k GT LT 1 m` used to reply
   `(integer) 1` and, on an existing member, `(integer) 0` with the score left
@@ -114,7 +152,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepted (redis rejects it), so an existing aclfile holding `~* ~x` keeps
   loading.
 
+- **BEHAVIOUR CHANGE — `REPLICAOF`/`SLAVEOF host port` and `CLUSTER REPLICATE`
+  on a `--shards > 1` node now error instead of replying `+OK`** (moon#1015).
+  Streaming replication applies into one shard only (multi-shard replicas are
+  moon#406), so the replica task already refused such a node — but only in the
+  server log, AFTER the handler had acked `+OK`, flipped the node to a
+  read-only replica and killed any running replica task. The node then refused
+  every write while holding none of the master's data. The handlers now refuse
+  first, with `ERR replica mode requires --shards 1: this node runs more than
+  one shard and multi-shard replicas are not supported yet (moon#406)`, and
+  leave the role, the running replica task and the cluster view untouched.
+  `REPLICAOF NO ONE` is unaffected, and so is a `--shards 1` node. One shared
+  predicate gates all four call sites (monoio and tokio `REPLICAOF`, monoio and
+  tokio `CLUSTER REPLICATE`) and the replica task's own guard, so they cannot
+  drift apart. An admin script that retried until `+OK` will now see the error.
+
 ### Fixed
+
+- **`runtime-tokio` with `--shards 1` now opens every AOF generation with a
+  `MOON.COLDCUT`, so a `kill -9` no longer double-applies writes to spilled
+  keys or drops acknowledged post-rewrite writes** (moon#914). This is the one
+  configuration with no `AofManifest` (creating one there wipes state on the
+  next boot, #96), so neither `seed_cold_cut` nor the rewrite's head ever ran.
+  Its replay read every cold file ungated, and moon#902 and moon#912 were both
+  still live with moon#965's fix applied: 79–82 of 216 probes double-applied
+  on the first restart, and 13–14 of 24 acknowledged post-`BGREWRITEAOF` `SET`s
+  came back holding the pre-rewrite value. The legacy `appendonly.aof` now
+  carries the head itself. Boot writes it when the file holds no record yet,
+  and `BGREWRITEAOF` writes it right after the RDB preamble, before the file
+  is renamed into place. The record and its meaning are the same as in the
+  monoio incr head, and no manifest is created. Two fixes ride along. **With
+  `--wal-kv-log on`, a single `MOON.SPILLED` marker mirrored into the WAL was
+  counted as KV history**: recovery took the WAL as the authority, skipped
+  the AOF, and lost its entire history (DBSIZE 248 → 103 after one restart).
+  Cold-plane records no longer count. **The end-of-replay reconcile closed
+  only db 0**, so a gate left on `SELECT 1..N` would have hidden later spills.
+  Every AOF replay path now closes the generation on every database, and
+  `main.rs` warns and closes any gate a missed path leaves open. **Not
+  covered:** an AOF written before this change has no head, and replays
+  ungated until its first rewrite. Run `BGREWRITEAOF` once after upgrading a
+  tokio `--shards 1` deployment that uses disk offload.
 
 - **Scripts queued inside `MULTI` now run at `EXEC`** (moon#894). `EVAL`,
   `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `FCALL` and `FCALL_RO` were answered
@@ -227,6 +304,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   permission set, including moon#981's `+@all -x`, is verified to round-trip
   `SETUSER` -> `LIST`/`GETUSER` -> `SAVE` -> restart with `LOAD` unchanged,
   token order included.
+
+- **A restart no longer re-issues a warm vector segment's id to a KV spill
+  file, and retiring a segment entry no longer tombstones a spill file**
+  (moon#893, moon#997). One per-shard counter names both KV spill files and
+  warm vector segments, but its restart seed scanned `data/heap-*.mpf` only.
+  When the highest id in use belonged to a vector segment, the next spill
+  file took the same id; when that segment's directory later vanished,
+  recovery retired its manifest entry with `remove_file(id)`, which
+  tombstoned every entry with that id — the live spill file's included — so
+  its keys read as **absent** after the restart. Measured before the fix
+  (durable cold keys absent after one restart): monoio 256/894 at
+  `--shards 1` and 540/901 at `--shards 4` after a `BGREWRITEAOF`, 2/4 and
+  4/226 under `--appendonly no`; tokio 514/902 at `--shards 4`, 2/4 and
+  209/219 under `--appendonly no`. The seed is now one authority
+  (`storage::tiered::file_id_seed`): the maximum over every manifest entry
+  of every type and status, every `heap-*.{mpf,tmp}` and every
+  `segment-*` / `.segment-*.staging` directory, computed once after recovery
+  and shared by the spill counter and the `MOON.COLDCUT` watermark.
+  `ShardManifest::remove_file` now matches `(file_id, file_type)`, so a data
+  dir a pre-fix build already wrote the collision into keeps its spill file.
+  Both spill writers refuse to replace an existing `heap-*.mpf`; a re-issued
+  id becomes a failed spill that keeps the values hot instead of overwriting
+  live cold data. The seed scan also no longer skips a directory entry it
+  cannot read.
+
+- **A shard's cold file ids come from one counter that never moves
+  backwards** (moon#893, moon#997). The event loop kept a second copy of the
+  counter, re-synced once per tick. On tokio the cross-shard SPSC drain ran
+  after that sync and advanced the shared counter; the eviction tick and warm
+  vector transitions then allocated from the stale copy, re-issuing the
+  drain's ids, and wrote it back with a plain `set` that moved the shared
+  counter backwards. The copy is gone: every consumer allocates through
+  `file_id_seed::allocate_from`, and every write-back is monotonic.
+
+- **`ShardManifest::create` is atomic** (temp file, fsync, rename, directory
+  fsync). A crash part-way through it used to leave a manifest shorter than
+  its two root pages at the real path, which every later open rejected.
+  Tombstones are also aged per `(file_id, file_type)`, not per id.
+
+- **`ZUNIONSTORE`/`ZINTERSTORE` report `WRONGTYPE` before an option error, and
+  no longer flatten a listpack source** (moon#959). Redis looks every source up
+  before it parses `WEIGHTS`/`AGGREGATE`, so `ZUNIONSTORE d 1 <string-key>
+  BOGUS` is `WRONGTYPE` on redis 8.6.1; moon answered `syntax error`. The store
+  family also read its sources through the promoting accessor, converting a
+  `listpack` source to `skiplist` as a side effect of reading it — the moon#928
+  defect the read-only set operations were already cured of. Both fixes came
+  with the shared implementation `ZDIFFSTORE` now uses.
 - **Commands routed to another shard are counted and timed** (moon#982).
   At `--shards > 1` a command whose key lives on a shard other than the
   connection's went through no telemetry probe at all — neither the
@@ -289,6 +413,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CH` as a did-anything-change signal silently skipped those updates. Fixed on
   both the listpack and B+tree arms, which carried separate copies.
 ### Security
+
+- **Subcommand ACL rules are now enforced** (moon#1030). `+@all -config|set`
+  was accepted, listed and saved, but the permission check only ever looked up
+  the bare command name, so the user could still run `CONFIG SET`. The same
+  gap meant `+config|get` or `+select|0` grants never took effect. The check
+  now consults `cmd|<first arg>` first, with redis's last-rule-wins ordering: a
+  bare rule or category clears that command's subcommand rules. `NOPERM` text
+  and `ACL LOG` name the subcommand (`config|set`). `ACL LIST`, `GETUSER` and
+  `SAVE` emit bare rules before subcommand rules, so a saved file reloads to the
+  same permissions; a line with no subcommand rules is byte-identical.
 
 - **Setting a password on a `nopass` user now actually requires it, and
   `nopass` now revokes the old passwords** (moon#999). Two credential

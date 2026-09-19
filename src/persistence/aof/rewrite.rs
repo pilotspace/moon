@@ -1367,6 +1367,7 @@ pub(crate) fn rewrite_aof_sharded_sync(
     // built the snapshot. Draining more would consume post-snapshot appends that
     // must land in the new file (aof_path) AFTER the rename in phase 4.
     let pending_aof_count = fold_snapshot.pending_aof_count;
+    let cold_watermark = fold_snapshot.cold_file_watermark;
     let snapshot = fold_snapshot.dbs;
     info!(
         "rewrite_aof_sharded_sync (tokio) snapshot: {} dbs, {} pre-snapshot pending ({:.1}ms)",
@@ -1464,6 +1465,22 @@ pub(crate) fn rewrite_aof_sharded_sync(
             source: e,
         })?;
         f.write_all(&rdb_bytes).map_err(|e| AofError::Io {
+            path: tmp_path.clone(),
+            source: e,
+        })?;
+        // moon#914: the new generation opens with `MOON.COLDCUT` — the first
+        // RESP record after the preamble, exactly where the monoio TopLevel
+        // fold (`do_rewrite_sharded`) puts it at the head of its new incr.
+        // The base is hot-only, so a key cold at the snapshot has its only
+        // copy in a cold file below this watermark; without the head the
+        // replay read every cold file ungated and re-applied post-rewrite
+        // writes on top of a later spill of their own result (moon#902).
+        // Written into the tmp file BEFORE the rename, so the file this
+        // rewrite publishes can never exist without its head.
+        f.write_all(&crate::persistence::cold_records::serialize_cold_cut(
+            cold_watermark,
+        ))
+        .map_err(|e| AofError::Io {
             path: tmp_path.clone(),
             source: e,
         })?;

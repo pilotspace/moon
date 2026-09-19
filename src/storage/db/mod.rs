@@ -11,7 +11,7 @@ mod kv_ops;
 #[cfg(test)]
 mod probe_budget;
 
-pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile};
+pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile, close_replay_generation};
 pub(crate) use incr::IncrOutcome;
 
 pub use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef, StreamRef};

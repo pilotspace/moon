@@ -197,7 +197,11 @@ pub fn recover_shard_v3_pitr(
     // ── Phase 2: MANIFEST RECOVERY ────────────────────────────────────
     let manifest_path = shard_dir.join(format!("shard-{}.manifest", shard_id));
     if manifest_path.exists() {
-        match ShardManifest::open(&manifest_path) {
+        // A torn create (shorter than the two root pages, no committed entry)
+        // is re-created empty here, the first place a boot opens the manifest,
+        // so every later open — the cold-index rebuild below, the file_id
+        // seed, the event loop — sees a valid one instead of failing forever.
+        match ShardManifest::open_repairing_torn_create(&manifest_path) {
             Ok(manifest) => {
                 let file_count = manifest.files().len();
                 info!(
@@ -350,7 +354,7 @@ pub fn recover_shard_v3_pitr(
             if !stale_warm_ids.is_empty() {
                 let retired = stale_warm_ids.len();
                 for file_id in &stale_warm_ids {
-                    manifest.remove_file(*file_id);
+                    manifest.remove_file(*file_id, PageType::VecCodes);
                 }
                 match manifest.commit() {
                     Ok(()) => info!(
@@ -505,7 +509,20 @@ pub fn recover_shard_v3_pitr(
                                     &mut selected_db,
                                 );
                                 result.commands_replayed += 1;
-                                kv_commands_replayed += 1;
+                                // moon#914: a cold-plane record is not KV
+                                // history. `ColdMarkerSink` mirrors every
+                                // `MOON.SPILLED` into this WAL under
+                                // `--wal-kv-log on`, so counting it made one
+                                // spill marker enough to skip the Phase 4b
+                                // AOF fallback — the WAL (which never holds a
+                                // connection-local write) became the "KV
+                                // authority" and the AOF's entire history was
+                                // discarded. Same class as the FileCreate
+                                // records the gate below already excludes.
+                                if !crate::persistence::cold_records::is_cold_plane_record(cmd_name)
+                                {
+                                    kv_commands_replayed += 1;
+                                }
                             }
                         }
                     }
@@ -856,8 +873,23 @@ pub fn recover_shard_v3_pitr(
     // moon#902: routed through `finish_replay_cold_reconcile`, which is the
     // task #56 demote for a legacy log and the gated hot-wins reconcile when
     // the replayed log opened with `MOON.COLDCUT`.
-    if !kv_authority_elsewhere && let Some(db0) = databases.first_mut() {
-        let r = db0.finish_replay_cold_reconcile();
+    //
+    // moon#914: EVERY database's open generation, not just db 0's.
+    // `MOON.COLDCUT` installs its gate on every database
+    // (`replay_cold_plane_record`), and a gate that outlives replay hides
+    // every cold file at or past its watermark from the live server — every
+    // key spilled after the boot would then read as absent. The tokio
+    // `--shards 1` AOF carries that head since #914, so closing only db 0
+    // would leave SELECT 1..N gated forever. db 0 keeps its unconditional
+    // call (the task #56 demote for a pre-#902 log, unchanged); dbs 1..N are
+    // closed only when their generation is open, so a pre-#902 log sees no
+    // new cold-wins demote there.
+    if !kv_authority_elsewhere && let Some((db0, rest)) = databases.split_first_mut() {
+        let mut r = db0.finish_replay_cold_reconcile();
+        let rest = crate::storage::db::close_replay_generation(rest);
+        r.gated |= rest.gated;
+        r.hot_demoted += rest.hot_demoted;
+        r.cold_dropped += rest.cold_dropped;
         if r.hot_demoted > 0 || r.cold_dropped > 0 {
             info!(
                 "Shard {}: Phase 4b cold-plane reconcile (gated={}): {} hot shadow(s) demoted \
@@ -1368,6 +1400,107 @@ mod tests {
         );
     }
 
+    /// moon#893 (P0): retiring a dirless warm segment entry must not tombstone
+    /// a live KV spill file that holds the same id.
+    ///
+    /// A restart seed that ignored vector segments re-issued a warm segment's
+    /// id to a spill file, so manifests in the field hold a `VecCodes` and a
+    /// `KvLeaf` entry under one id. When the segment's directory is gone, the
+    /// #546a pass above retires its entry — and `remove_file(id)` matched on
+    /// the id alone, tombstoning the spill file too. Its keys then dropped out
+    /// of the cold index rebuilt a few lines later, and read as absent.
+    #[test]
+    fn test_retiring_dirless_warm_entry_spares_same_id_spill_file() {
+        use crate::persistence::kv_page::ValueType;
+        use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
+        use crate::persistence::page::PageType;
+        use crate::storage::tiered::kv_spill::{
+            SpillEntry, build_kv_spill_batch, write_kv_spill_batch,
+        };
+
+        const SHARED_ID: u64 = 9;
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        let batch = build_kv_spill_batch(
+            &[SpillEntry {
+                key: bytes::Bytes::from_static(b"k893"),
+                value_bytes: bytes::Bytes::from_static(b"cold-only-value"),
+                value_type: ValueType::String,
+                flags: 0,
+                ttl_ms: None,
+            }],
+            SHARED_ID,
+        )
+        .unwrap();
+        let byte_size = write_kv_spill_batch(&shard_dir, SHARED_ID, &batch).unwrap();
+
+        let manifest_path = shard_dir.join("shard-0.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        // The warm segment first (it held the id first), then the spill file
+        // that was re-issued the same id. No `vectors/segment-9/` exists.
+        manifest.add_file(FileEntry {
+            file_id: SHARED_ID,
+            file_type: PageType::VecCodes as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Warm,
+            page_size_log2: 16,
+            page_count: 1,
+            byte_size: 256,
+            created_lsn: 0,
+            db_index: 0,
+            max_key_hash: u64::MAX,
+            last_modified_lsn: 0,
+        });
+        manifest.add_file(FileEntry {
+            file_id: SHARED_ID,
+            file_type: PageType::KvLeaf as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Hot,
+            page_size_log2: 12,
+            page_count: batch.pages.len() as u32,
+            byte_size,
+            created_lsn: 0,
+            db_index: 0,
+            max_key_hash: 0,
+            last_modified_lsn: 0,
+        });
+        manifest.commit().unwrap();
+        drop(manifest);
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
+
+        let reopened = ShardManifest::open(&manifest_path).unwrap();
+        let status_of = |t: PageType| {
+            reopened
+                .files()
+                .iter()
+                .find(|e| e.file_id == SHARED_ID && e.file_type == t as u8)
+                .map(|e| e.status)
+        };
+        assert_eq!(
+            status_of(PageType::VecCodes),
+            Some(FileStatus::Tombstone),
+            "the dirless warm entry is still retired (#546a)"
+        );
+        assert_eq!(
+            status_of(PageType::KvLeaf),
+            Some(FileStatus::Active),
+            "the live spill file sharing its id must NOT be tombstoned"
+        );
+        assert!(
+            databases[0]
+                .cold_index
+                .as_ref()
+                .and_then(|ci| ci.lookup(b"k893"))
+                .is_some(),
+            "the spill file's key must be in the rebuilt cold index, not absent"
+        );
+    }
+
     #[test]
     fn test_recover_kv_heap_entries() {
         use crate::persistence::kv_page::{KvLeafPage, ValueType, write_datafile};
@@ -1661,6 +1794,91 @@ mod tests {
              AOF fallback and every KV write was dropped)",
             result.commands_replayed
         );
+    }
+
+    /// moon#914 (c): under `--wal-kv-log on`, `ColdMarkerSink` mirrors every
+    /// `MOON.SPILLED` into the shard's WAL as a `Command` record. On tokio
+    /// `--shards 1` no connection-local write ever reaches that WAL, so a
+    /// WAL holding ONLY markers has recorded no KV history at all — yet
+    /// Phase 4 counted the marker, Phase 4b skipped the AOF, and every key
+    /// the AOF held vanished (a live `kill -9` run: DBSIZE 248 -> 103).
+    #[test]
+    fn cold_plane_records_in_the_wal_do_not_suppress_the_aof_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let offload_wal_dir = shard_dir.join("wal-v3");
+        std::fs::create_dir_all(&offload_wal_dir).unwrap();
+        let marker = crate::persistence::cold_records::serialize_spilled(
+            7,
+            &[bytes::Bytes::from_static(b"k")],
+        );
+        let mut wal_data = make_v3_header(0);
+        write_wal_v3_record(&mut wal_data, 1, WalRecordType::Command, &marker);
+        std::fs::write(offload_wal_dir.join("000000000001.wal"), &wal_data).unwrap();
+
+        let v2_dir = tmp.path().join("legacy");
+        std::fs::create_dir_all(&v2_dir).unwrap();
+        std::fs::write(
+            v2_dir.join("appendonly.aof"),
+            b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n",
+        )
+        .unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        recover_shard_v3_with_fallback(
+            &mut databases,
+            0,
+            &shard_dir,
+            &engine,
+            Some(&v2_dir),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            databases[0].len(),
+            2,
+            "the AOF is the only KV history here and must be replayed; a WAL \
+             holding nothing but a MOON.SPILLED marker is not a KV authority"
+        );
+    }
+
+    /// moon#914: `MOON.COLDCUT` gates EVERY database, so Phase 4b must close
+    /// the generation on every database — closing only db 0 left SELECT 1..N
+    /// gated after replay, hiding every later cold file from the live server.
+    #[test]
+    fn phase_4b_closes_the_replay_generation_on_every_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        let v2_dir = tmp.path().join("legacy");
+        std::fs::create_dir_all(&v2_dir).unwrap();
+        let mut aof = crate::persistence::cold_records::serialize_cold_cut(1).to_vec();
+        aof.extend_from_slice(b"*2\r\n$6\r\nSELECT\r\n$1\r\n2\r\n");
+        aof.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        std::fs::write(v2_dir.join("appendonly.aof"), &aof).unwrap();
+
+        let mut databases: Vec<Database> = (0..4).map(|_| Database::new()).collect();
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        recover_shard_v3_with_fallback(
+            &mut databases,
+            0,
+            &shard_dir,
+            &engine,
+            Some(&v2_dir),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(databases[2].len(), 1, "the tail replayed into db 2");
+        for (i, db) in databases.iter().enumerate() {
+            assert!(
+                !db.replay_cold_gate_active(),
+                "db {i}: the replay gate outlived recovery"
+            );
+        }
     }
 
     #[test]

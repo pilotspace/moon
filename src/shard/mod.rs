@@ -100,6 +100,13 @@ pub struct Shard {
     /// already accepting connections) is spawned by `event_loop.rs`, which
     /// drains this field via `std::mem::take`.
     pub pending_heap_orphans: Vec<std::path::PathBuf>,
+    /// First cold-tier `file_id` this shard may allocate, proven above every
+    /// id in use (moon#997, moon#893) by [`Self::prove_spill_file_id_seed`] —
+    /// the startup gate `main` and the embedded server run after recovery,
+    /// refusing to start when the seed cannot be proven. `None` when that
+    /// gate did not run or disk-offload is off; `event_loop.rs` reads it once
+    /// to seed the spill counter.
+    pub spill_file_id_seed: Option<u64>,
 }
 
 impl Shard {
@@ -153,7 +160,35 @@ impl Shard {
             vector_store: VectorStore::new(),
             recovered_warm_segments: Vec::new(),
             pending_heap_orphans: Vec::new(),
+            spill_file_id_seed: None,
         }
+    }
+
+    /// Prove where this shard's cold-tier `file_id` counter may resume and
+    /// record it in [`Self::spill_file_id_seed`] (moon#997, moon#893).
+    ///
+    /// The startup gate shared by `main` and the embedded server: call it for
+    /// every shard AFTER [`Self::restore_from_persistence`] (recovery may
+    /// retire directories and entries) and before any shard thread starts
+    /// (nothing can spill yet). Returns the seed — `1`, with the field left
+    /// `None`, when disk-offload is off and no cold file can exist.
+    ///
+    /// # Errors
+    ///
+    /// The seed cannot be proven above every id in use; the caller must
+    /// refuse to start rather than guess (see
+    /// [`crate::storage::tiered::file_id_seed`]).
+    pub fn prove_spill_file_id_seed(
+        &mut self,
+        disk_offload_base: Option<&std::path::Path>,
+    ) -> Result<u64, crate::storage::tiered::file_id_seed::FileIdSeedError> {
+        let Some(base) = disk_offload_base else {
+            return Ok(1);
+        };
+        let shard_dir = base.join(format!("shard-{}", self.id));
+        let seed = crate::storage::tiered::file_id_seed::next_file_id_seed(&shard_dir, self.id)?;
+        self.spill_file_id_seed = Some(seed);
+        Ok(seed)
     }
 
     /// Restore shard state from per-shard snapshot and WAL files at startup.
@@ -354,6 +389,22 @@ impl Shard {
                 Err(e) => {
                     tracing::error!("Shard {}: AOF replay failed: {}", self.id, e);
                 }
+            }
+            // moon#914: close the replay generation on every database. The
+            // tokio `--shards 1` AOF opens with `MOON.COLDCUT`, whose gate
+            // must not outlive replay: main.rs wires the cold tier AFTER this
+            // path when disk-offload is on but its shard dir did not exist
+            // yet, and a lingering gate would then hide every cold file at or
+            // past its watermark — every key spilled after this boot would
+            // read as absent. Runs on the Err arm too: a replay that stopped
+            // at corruption may already have installed the gate.
+            let r = crate::storage::db::close_replay_generation(&mut self.databases);
+            if r.hot_demoted > 0 || r.cold_dropped > 0 {
+                info!(
+                    "Shard {}: AOF replay cold-plane reconcile (gated={}): {} hot shadow(s) \
+                     demoted, {} cold entr(ies) dropped",
+                    self.id, r.gated, r.hot_demoted, r.cold_dropped
+                );
             }
         } else {
             // Disaster fallback ONLY: no AOF at all (lost/rebuilt/never

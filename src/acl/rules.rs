@@ -444,8 +444,9 @@ fn apply_keyword(user: &mut AclUser, kw: Keyword) -> Result<(), AclRuleError> {
 ///
 /// Membership is derived from a live `redis-server 8.6.1` `ACL CAT <cat>`,
 /// restricted to commands Moon implements. Redis classifies per *subcommand*
-/// (`acl|setuser`, `config|get`); [`AclTable::check_command_permission`] only
-/// ever sees the bare container name, so redis's `foo|sub in C` collapses to
+/// (`acl|setuser`, `config|get`); this table is keyed on bare names (explicit
+/// `+foo|sub` / `-foo|sub` rules are per subcommand, see `acl::subcommand`),
+/// so redis's `foo|sub in C` collapses to
 /// bare `foo in C` whenever **at least one** subcommand of `foo` is in `C`.
 /// That direction is deliberate: `-@dangerous` then denies the whole
 /// container. Requiring *every* subcommand to match instead would leave

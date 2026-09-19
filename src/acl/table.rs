@@ -8,6 +8,7 @@ use crate::protocol::Frame;
 use super::rules::{
     AclRuleError, apply_rule, get_category_commands, hash_password, verify_password,
 };
+use super::subcommand::{clear_first_arg_rules, command_log_object, first_arg, permits};
 
 #[derive(Clone, Debug)]
 pub struct KeyPattern {
@@ -195,15 +196,21 @@ impl AclUser {
                         allowed.insert(cmd.to_string());
                         denied.remove(*cmd);
                     }
-                } else if rule.contains('|') {
-                    // subcommand: stored as "cmd|sub", lowercased like every
-                    // other command token. It used to be stored verbatim, so
-                    // `+CONFIG|GET` could never match: `is_command_allowed`
-                    // lowercases the incoming name before probing the set.
-                    allowed.insert(rule.to_ascii_lowercase());
+                    clear_first_arg_rules(allowed, cmds);
+                    clear_first_arg_rules(denied, cmds);
                 } else {
-                    allowed.insert(rule.to_ascii_lowercase());
-                    denied.remove(&rule.to_ascii_lowercase());
+                    // `cmd` or `cmd|sub`, lowercased: the check lowercases
+                    // the incoming name before probing. A bare rule is newer
+                    // than every `cmd|*` rule, so it clears them (see
+                    // `acl::subcommand`); a `cmd|sub` rule replaces its own
+                    // opposite entry, or `-x|y +x|y` would stay denied.
+                    let rule = rule.to_ascii_lowercase();
+                    if !rule.contains('|') {
+                        clear_first_arg_rules(allowed, &[rule.as_str()]);
+                        clear_first_arg_rules(denied, &[rule.as_str()]);
+                    }
+                    denied.remove(&rule);
+                    allowed.insert(rule);
                 }
             }
         }
@@ -264,37 +271,29 @@ impl AclUser {
                         denied.insert(cmd.to_string());
                         allowed.remove(*cmd);
                     }
+                    clear_first_arg_rules(allowed, cmds);
+                    clear_first_arg_rules(denied, cmds);
                 } else {
-                    denied.insert(rule.to_ascii_lowercase());
-                    allowed.remove(&rule.to_ascii_lowercase());
+                    let rule = rule.to_ascii_lowercase();
+                    if !rule.contains('|') {
+                        clear_first_arg_rules(allowed, &[rule.as_str()]);
+                        clear_first_arg_rules(denied, &[rule.as_str()]);
+                    }
+                    allowed.remove(&rule);
+                    denied.insert(rule);
                 }
             }
         }
         Ok(())
     }
 
+    /// Verdict for `cmd` (bare) or `cmd|arg` (a subcommand or first-arg
+    /// invocation), with the same precedence the dispatch-time check uses.
     pub fn is_command_allowed(&self, cmd: &str) -> bool {
         let cmd_lower = cmd.to_ascii_lowercase();
-        match &self.allowed_commands {
-            CommandPermissions::AllAllowed => true,
-            CommandPermissions::Specific {
-                base_allow,
-                allowed,
-                denied,
-            } => {
-                // Deny takes precedence
-                if denied.contains(&cmd_lower) {
-                    return false;
-                }
-                // If explicitly allowed, permit
-                if allowed.contains(&cmd_lower) {
-                    return true;
-                }
-                // Neither set names this command, so the answer is the base
-                // polarity recorded when this `Specific` was created. Never
-                // inferred from set emptiness -- see the field comment.
-                *base_allow
-            }
+        match cmd_lower.split_once('|') {
+            Some((bare, arg)) => permits(&self.allowed_commands, bare, Some(arg.as_bytes())),
+            None => permits(&self.allowed_commands, &cmd_lower, None),
         }
     }
 }
@@ -499,7 +498,7 @@ impl AclTable {
         &self,
         username: &str,
         cmd: &[u8],
-        _args: &[Frame],
+        args: &[Frame],
     ) -> Option<String> {
         // c10k hardening B2: an unknown user is DENIED, never allowed.
         // This used to be `self.users.get(username)?` - `None` means
@@ -522,10 +521,14 @@ impl AclTable {
             return Some(format!("User {} is disabled", username));
         }
         let cmd_str = std::str::from_utf8(cmd).unwrap_or("").to_ascii_lowercase();
-        if !user.is_command_allowed(&cmd_str) {
+        // `argv[1]` takes part: `-config|set` / `+select|0` rules are keyed on
+        // it. Probing the bare name alone let `+@all -config|set` run
+        // `CONFIG SET` (see `acl::subcommand`).
+        if !permits(&user.allowed_commands, &cmd_str, first_arg(args)) {
             return Some(format!(
                 "User {} has no permissions to run the '{}' command",
-                username, cmd_str
+                username,
+                command_log_object(cmd, args)
             ));
         }
         None
