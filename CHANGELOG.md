@@ -979,6 +979,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both the listpack and B+tree arms, which carried separate copies.
 ### Security
 
+- **Error and status replies can no longer be split by client input**
+  (moon#1031). Error text quotes client input (an unknown command name, an
+  `ACL SETUSER` rule), and CR/LF bytes in it were written raw, so one command
+  could produce several RESP replies. That desynchronises any client or proxy
+  that pipelines on a shared connection. Every line-framed reply (`+`, `-`,
+  RESP3 `(`) now goes through one writer that maps CR and LF to spaces, as
+  redis does, and so do the inline quota error and the protocol-error echo.
+  It is allocation-free, and a reply with no CR/LF costs the same as before.
+
 - **`rustls` bumped past RUSTSEC-2026-0285 / GHSA-2mjx-qc3c-rqvc** ("TLS 1.3
   handshake messages incorrectly accepted across encryption level
   boundaries"), 0.23.44 → 0.23.45 in `Cargo.lock` (and 0.23.37 → 0.23.45 in
