@@ -424,6 +424,17 @@ pub(super) async fn try_handle_subscribe<
         conn.pubsub_tx = Some(tx);
         conn.pubsub_rx = Some(rx);
     }
+    // A subscribed connection can be a CLIENT TRACKING REDIRECT target
+    // (moon#1048): reachable by client id before its `subscribe` reply is
+    // written, framed for the protocol it subscribes under.
+    crate::tracking::client_cmd::sync_inbox(
+        &mut conn.tracking_inbox,
+        true,
+        conn.protocol_version >= 3,
+        conn.pubsub_tx.as_ref(),
+        conn.client_id,
+        &ctx.tracking_table,
+    );
     if conn.subscriber_id == 0 {
         conn.subscriber_id = crate::pubsub::next_subscriber_id();
     }
