@@ -429,17 +429,24 @@ impl Shard {
                 &mut self.databases,
                 &DispatchReplayEngine::new(),
             ) {
-                Ok(0) => {}
-                Ok(n) => {
+                Ok(c) if c.records_read == 0 => {}
+                Ok(c) => {
+                    // moon#1026: report what reached the keyspace, not the
+                    // records read. This used to log "replayed N WAL v3
+                    // records" while applying none of them.
                     tracing::warn!(
-                        "Shard {}: no appendonly.aof found — replayed {} WAL v3 \
-                         records as a LAST-RESORT fallback. WAL v3 KV coverage is \
+                        "Shard {}: no appendonly.aof found — applied {} KV command(s) \
+                         from {} WAL v3 record(s) as a LAST-RESORT fallback ({} non-KV \
+                         command(s), {} undecodable record(s)). WAL v3 KV coverage is \
                          partial (gated by --wal-kv-log; connection-local writes \
                          bypass it), so this recovery may be incomplete.",
                         self.id,
-                        n
+                        c.kv_commands_applied,
+                        c.records_read,
+                        c.other_commands,
+                        c.undecodable_records
                     );
-                    total_keys += n;
+                    total_keys += c.kv_commands_applied;
                 }
                 Err(e) => {
                     // #452.2: mid-chain tear ⇒ refuse to boot.
@@ -450,6 +457,18 @@ impl Shard {
                     }
                     tracing::error!("Shard {}: WAL v3 fallback replay failed: {}", self.id, e);
                 }
+            }
+            // The WAL carries `MOON.SPILLED` mirrors (`ColdMarkerSink`), and
+            // now that this fallback applies its records they open a replay
+            // generation exactly as the AOF branch above does. Close it the
+            // same way so the marker state does not outlive replay.
+            let r = crate::storage::db::close_replay_generation(&mut self.databases);
+            if r.hot_demoted > 0 || r.cold_dropped > 0 {
+                info!(
+                    "Shard {}: WAL v3 fallback cold-plane reconcile (gated={}): {} hot \
+                     shadow(s) demoted, {} cold entr(ies) dropped",
+                    self.id, r.gated, r.hot_demoted, r.cold_dropped
+                );
             }
         }
 
@@ -489,6 +508,58 @@ mod tests {
         assert_eq!(shard.id, 0);
         assert_eq!(shard.num_shards, 4);
         assert_eq!(shard.databases.len(), 16);
+    }
+
+    /// moon#1026: the legacy "no appendonly.aof at all" disaster fallback in
+    /// `restore_from_persistence_v2` must restore the WAL's KV writes. The
+    /// records are produced the way the live SPSC path writes them
+    /// (`aof::serialize_command` into a real `WalWriterV3`), so this checks
+    /// the on-disk format end to end, not a hand-rolled payload.
+    #[test]
+    fn legacy_no_aof_fallback_restores_wal_kv_writes() {
+        use crate::persistence::wal_v3::record::WalRecordType;
+        use crate::persistence::wal_v3::segment::{DEFAULT_SEGMENT_SIZE, WalBounds, WalWriterV3};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("shard-0").join("wal-v3");
+        let mut w =
+            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
+        for i in 0..8u32 {
+            let cmd = Frame::Array(framevec![
+                Frame::BulkString(Bytes::from_static(b"SET")),
+                Frame::BulkString(Bytes::from(format!("wal:{i}"))),
+                Frame::BulkString(Bytes::from(format!("val-{i}"))),
+            ]);
+            w.append(
+                WalRecordType::Command,
+                &crate::persistence::aof::serialize_command(&cmd),
+            );
+        }
+        w.flush_sync().unwrap();
+        drop(w);
+        assert!(
+            !tmp.path().join("appendonly.aof").exists(),
+            "precondition: no AOF, so the WAL is the last-resort source"
+        );
+
+        let mut shard = Shard::new(0, 1, 16, RuntimeConfig::default());
+        let restored = shard.restore_from_persistence(tmp.path().to_str().unwrap(), None, false);
+
+        for i in 0..8u32 {
+            let key = format!("wal:{i}");
+            let got = shard.databases[0]
+                .get(key.as_bytes())
+                .and_then(|e| e.value.as_bytes().map(<[u8]>::to_vec));
+            assert_eq!(
+                got.as_deref(),
+                Some(format!("val-{i}").as_bytes()),
+                "{key} must come back from the WAL v3 last-resort fallback"
+            );
+        }
+        assert_eq!(
+            restored, 8,
+            "the fallback reports the KV commands it applied"
+        );
     }
 
     #[test]

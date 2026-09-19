@@ -586,48 +586,37 @@ pub fn recover_shard_v3_pitr(
                         kv_records_db_out_of_range += 1;
                         return;
                     }
-                    // Parse RESP frames from the serialized command payload.
-                    // The payload is RESP-encoded (same format as AOF/WAL v2 blocks).
-                    let mut buf = bytes::BytesMut::from(&record.payload[..]);
-                    let parse_cfg = crate::protocol::ParseConfig::default();
-                    while let Ok(Some(frame)) = crate::protocol::parse::parse(&mut buf, &parse_cfg)
-                    {
-                        if let crate::protocol::Frame::Array(ref arr) = frame {
-                            if !arr.is_empty() {
-                                let cmd_name = match &arr[0] {
-                                    crate::protocol::Frame::BulkString(s) => s.as_ref(),
-                                    crate::protocol::Frame::SimpleString(s) => s.as_ref(),
-                                    _ => continue,
-                                };
-                                let route = engine.replay_command(
-                                    databases,
-                                    cmd_name,
-                                    &arr[1..],
-                                    &mut selected_db,
-                                );
-                                result.commands_replayed += 1;
-                                // Only a record replay APPLIED to the keyspace
-                                // is KV history. This WAL also carries
-                                // `Command` records that never reach it:
-                                // `ColdMarkerSink`'s `MOON.SPILLED` mirrors
-                                // (moon#914) and every `GRAPH.*` write
-                                // (`GraphStore::wal_pending`, moon#1018). Each
-                                // one counted here made the WAL the "KV
-                                // authority", so Phase 4b skipped the AOF and
-                                // every acknowledged write in it was lost (a
-                                // single graph write took DBSIZE 3 -> 0). The
-                                // engine reports what it did with the record,
-                                // so a record class this code has never heard
-                                // of is excluded as well. A list of excluded
-                                // names would miss it, as it missed these two.
-                                if route.is_kv_history() {
-                                    kv_commands_replayed += 1;
-                                } else {
-                                    wal_non_kv_commands += 1;
-                                }
+                    // The payload is RESP (one or more commands). The decoder
+                    // is shared with the last-resort fallback
+                    // (`replay_wal_v3_dir_commands`) so the two cannot drift
+                    // (moon#1026).
+                    crate::persistence::replay::replay_resp_payload(
+                        engine,
+                        databases,
+                        &record.payload,
+                        &mut selected_db,
+                        |route| {
+                            result.commands_replayed += 1;
+                            // Only a record replay APPLIED to the keyspace is
+                            // KV history. This WAL also carries `Command`
+                            // records that never reach it: `ColdMarkerSink`'s
+                            // `MOON.SPILLED` mirrors (moon#914) and every
+                            // `GRAPH.*` write (`GraphStore::wal_pending`,
+                            // moon#1018). Each one counted here made the WAL
+                            // the "KV authority", so Phase 4b skipped the AOF
+                            // and every acknowledged write in it was lost (a
+                            // single graph write took DBSIZE 3 -> 0). The
+                            // engine reports what it did with the record, so a
+                            // record class this code has never heard of is
+                            // excluded as well. A list of excluded names would
+                            // miss it, as it missed these two.
+                            if route.is_kv_history() {
+                                kv_commands_replayed += 1;
+                            } else {
+                                wal_non_kv_commands += 1;
                             }
-                        }
-                    }
+                        },
+                    );
                 }
                 WalRecordType::VectorUpsert
                 | WalRecordType::VectorDelete
@@ -941,18 +930,25 @@ pub fn recover_shard_v3_pitr(
                     databases,
                     engine,
                 ) {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        result.commands_replayed += n;
+                    Ok(c) if c.records_read == 0 => {}
+                    Ok(c) => {
+                        // moon#1026: report what reached the keyspace, not
+                        // the records read. A WAL full of non-KV records used
+                        // to log "replayed N" while recovering nothing.
+                        result.commands_replayed += c.kv_commands_applied;
                         tracing::warn!(
-                            "Shard {}: no appendonly.aof found — replayed {} records \
-                             from legacy-mode WAL v3 at {:?} as a LAST-RESORT \
-                             fallback. WAL v3 KV coverage is partial (gated by \
-                             --wal-kv-log; connection-local writes bypass it), so \
-                             this recovery may be incomplete.",
+                            "Shard {}: no appendonly.aof found — applied {} KV command(s) \
+                             from {} legacy-mode WAL v3 record(s) at {:?} as a LAST-RESORT \
+                             fallback ({} non-KV command(s), {} undecodable record(s)). \
+                             WAL v3 KV coverage is partial (gated by --wal-kv-log; \
+                             connection-local writes bypass it), so this recovery may be \
+                             incomplete.",
                             shard_id,
-                            n,
-                            legacy_wal_v3_dir
+                            c.kv_commands_applied,
+                            c.records_read,
+                            legacy_wal_v3_dir,
+                            c.other_commands,
+                            c.undecodable_records
                         );
                     }
                     Err(e) => {
@@ -2334,6 +2330,12 @@ mod tests {
         assert!(!recover(None).aof_replayed_without_cold_cut);
     }
 
+    /// moon#1026: the last-resort rung must put the WAL's KV records into the
+    /// KEYSPACE. The previous version of this test wrote five `PING` records
+    /// and asserted `commands_replayed == 5`, a record count that passed while
+    /// the helper applied nothing at all (each raw RESP payload reached
+    /// dispatch as the command NAME). Assert what an operator relies on: the
+    /// keys come back, and the count reports only what was applied.
     #[test]
     fn test_legacy_wal_v3_last_resort_when_no_aof() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2347,13 +2349,19 @@ mod tests {
         std::fs::create_dir_all(&legacy_wal_dir).unwrap();
         let mut wal_data = make_v3_header(0);
         for i in 1..=5u64 {
-            write_wal_v3_record(
-                &mut wal_data,
-                i,
-                WalRecordType::Command,
-                b"*1\r\n$4\r\nPING\r\n",
+            let key = format!("lr:{i}");
+            let val = format!("v{i}");
+            let payload = format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n${}\r\n{val}\r\n",
+                key.len(),
+                val.len()
             );
+            write_wal_v3_record(&mut wal_data, i, WalRecordType::Command, payload.as_bytes());
         }
+        // A non-KV record (cold-plane marker) is read but not applied to the
+        // keyspace, so it must not inflate the recovered count.
+        let marker = crate::persistence::cold_records::serialize_spilled(9, &[]);
+        write_wal_v3_record(&mut wal_data, 6, WalRecordType::Command, &marker);
         std::fs::write(legacy_wal_dir.join("000000000001.wal"), &wal_data).unwrap();
 
         let mut databases = vec![Database::new()];
@@ -2368,10 +2376,23 @@ mod tests {
         )
         .unwrap();
 
+        for i in 1..=5u64 {
+            let key = format!("lr:{i}");
+            let got = databases[0]
+                .get(key.as_bytes())
+                .and_then(|e| e.value.as_bytes().map(<[u8]>::to_vec));
+            assert_eq!(
+                got.as_deref(),
+                Some(format!("v{i}").as_bytes()),
+                "with no appendonly.aof, the legacy WAL v3 last-resort fallback \
+                 must restore {key} into the keyspace"
+            );
+        }
+        assert_eq!(databases[0].len(), 5, "exactly the five WAL keys");
         assert_eq!(
             result.commands_replayed, 5,
-            "with no appendonly.aof, the legacy WAL v3 last-resort fallback \
-             must replay what it can"
+            "the rung reports the KV commands it APPLIED (5), not the records \
+             it read (6)"
         );
     }
 
