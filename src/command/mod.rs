@@ -173,7 +173,7 @@ fn dispatch_inner_unchecked(
 ) -> DispatchResult {
     let len = cmd.len();
     if len == 0 {
-        return DispatchResult::Response(err_unknown(cmd));
+        return DispatchResult::Response(err_unknown(cmd, args));
     }
     let b0 = cmd[0] | 0x20; // lowercase first byte
 
@@ -1192,15 +1192,12 @@ fn dispatch_inner_unchecked(
         return DispatchResult::Response(transaction::err_txn_subcommand(args));
     }
 
-    DispatchResult::Response(err_unknown(cmd))
+    DispatchResult::Response(err_unknown(cmd, args))
 }
 
 #[inline]
-fn err_unknown(cmd: &[u8]) -> Frame {
-    Frame::Error(Bytes::from(format!(
-        "ERR unknown command '{}', with args beginning with: ",
-        String::from_utf8_lossy(cmd)
-    )))
+fn err_unknown(cmd: &[u8], args: &[Frame]) -> Frame {
+    helpers::err_unknown_command(cmd, args)
 }
 
 /// Dispatch a read-only command under a shared read lock.
@@ -1317,7 +1314,7 @@ fn dispatch_read_inner_unchecked(
 ) -> DispatchResult {
     let len = cmd.len();
     if len == 0 {
-        return DispatchResult::Response(err_unknown(cmd));
+        return DispatchResult::Response(err_unknown(cmd, args));
     }
     let b0 = cmd[0] | 0x20;
 
@@ -1849,7 +1846,7 @@ fn dispatch_read_inner_unchecked(
     }
 
     // Fallback: should not be reached if metadata::is_read() is correct
-    DispatchResult::Response(err_unknown(cmd))
+    DispatchResult::Response(err_unknown(cmd, args))
 }
 
 #[cfg(test)]

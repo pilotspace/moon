@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use crate::protocol::Frame;
 
@@ -35,6 +35,89 @@ pub fn err_wrong_args(cmd: &str) -> Frame {
     }
     msg.push_str(SUFFIX);
     Frame::Error(Bytes::from(msg))
+}
+
+/// Redis's budget for the unknown-command argument echo below: `call()`
+/// (`src/server.c`) stops concatenating `'<arg>' ` pieces once their combined
+/// length reaches 128 bytes. Measured, not documented — an argument long
+/// enough to reach the budget on its own is truncated mid-argument, and a
+/// budget already spent by earlier arguments shrinks the next one's slice.
+const UNKNOWN_COMMAND_ARGS_BUDGET: usize = 128;
+
+/// Build `unknown command` the way Redis does — moon#1077.
+///
+/// Every one of the three dispatch paths that can decide a command is unknown
+/// (`command::dispatch`, `command::dispatch_read`, and the `MULTI` queue-time
+/// gate in `server::conn::shared::queue_time_rejection`) calls this, so the
+/// three cannot drift the way they had: the live paths never listed the
+/// arguments at all, and the queue-time gate listed them with `', '` between
+/// entries where Redis has no comma, just `'a' 'b' `.
+///
+/// Measured against redis-server 8.6.1, raw socket, one case per row:
+///
+/// ```text
+/// NOSUCHCMD            -> ERR unknown command 'NOSUCHCMD'
+/// NOSUCHCMD a b        -> ERR unknown command 'NOSUCHCMD', with args beginning with: 'a' 'b'
+/// nosuchcmd            -> ERR unknown command 'nosuchcmd'            (client's OWN casing —
+/// NoSuchCmd a b        -> ERR unknown command 'NoSuchCmd', with args beginning with: 'a' 'b'   this is
+///                          the OPPOSITE of the arity error, which lower-cases; see
+///                          reference_redis_error_name_two_rules)
+/// ```
+///
+/// Two behaviours a naive `format!` misses:
+///
+/// * **The suffix is absent, not empty, with zero arguments.** `NOSUCHCMD`
+///   alone has no `, with args beginning with:` at all — that clause only
+///   appears once there is at least one argument to list.
+/// * **An argument is truncated at its first embedded NUL.** Redis formats
+///   each piece with C's `%.*s`, which reads the argument as a NUL-terminated
+///   string despite Moon's (and Redis's own) values being binary-safe. An
+///   argument starting with `\0` therefore prints as `''`, not the byte.
+///
+/// `cmd` and every argument are raw, client-controlled bytes — built here with
+/// `BytesMut`, never `String::from_utf8_lossy`, so a non-UTF8 byte (`\xff`)
+/// reaches the wire unchanged instead of becoming a 3-byte replacement
+/// character. CR and LF ARE substituted with a space: this reply is one RESP
+/// error line, and passing either through verbatim lets a client-chosen
+/// argument split it into extra, forged replies on a pipelined connection
+/// (moon#1031's class of bug, general form still open; this is the narrow
+/// fix for the one builder moon#1077 adds argument-echoing to).
+pub fn err_unknown_command(cmd: &[u8], args: &[Frame]) -> Frame {
+    let mut msg = BytesMut::with_capacity(24 + cmd.len());
+    msg.extend_from_slice(b"ERR unknown command '");
+    push_line_safe(&mut msg, cmd);
+    msg.extend_from_slice(b"'");
+    if !args.is_empty() {
+        msg.extend_from_slice(b", with args beginning with: ");
+        let mut used = 0usize;
+        for a in args {
+            if used >= UNKNOWN_COMMAND_ARGS_BUDGET {
+                break;
+            }
+            let bytes: &[u8] = match a {
+                Frame::BulkString(b) | Frame::SimpleString(b) => b.as_ref(),
+                _ => &[],
+            };
+            let remaining = UNKNOWN_COMMAND_ARGS_BUDGET - used;
+            let capped = &bytes[..bytes.len().min(remaining)];
+            let cut = capped.iter().position(|&b| b == 0).unwrap_or(capped.len());
+            let piece = &capped[..cut];
+            msg.extend_from_slice(b"'");
+            push_line_safe(&mut msg, piece);
+            msg.extend_from_slice(b"' ");
+            used += cut + 3; // 2 quotes + 1 trailing space, matching Redis's sdslen budget
+        }
+    }
+    Frame::Error(msg.freeze())
+}
+
+/// Append `bytes` to `out`, mapping CR and LF to a space so the result can
+/// never be more than one RESP line — see [`err_unknown_command`].
+fn push_line_safe(out: &mut BytesMut, bytes: &[u8]) {
+    out.reserve(bytes.len());
+    for &b in bytes {
+        out.extend_from_slice(&[if b == b'\r' || b == b'\n' { b' ' } else { b }]);
+    }
 }
 
 /// Extract &Bytes from a BulkString or SimpleString frame.
@@ -164,4 +247,134 @@ pub fn help_reply(container: &str, body: &[&'static str]) -> Frame {
         b"    Print this help.",
     )));
     Frame::Array(out.into())
+}
+
+/// moon#1077 — `err_unknown_command`'s exact grammar, measured on redis-server
+/// 8.6.1 raw sockets (`/tmp/oracle-1060-1076-1077/probe.py` in the PR).
+#[cfg(test)]
+mod err_unknown_command_1077_tests {
+    use super::*;
+
+    fn bulk(s: &[u8]) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s))
+    }
+
+    fn text(frame: &Frame) -> Vec<u8> {
+        match frame {
+            Frame::Error(e) => e.to_vec(),
+            other => panic!("expected an error reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_args_has_no_suffix_at_all() {
+        assert_eq!(
+            text(&err_unknown_command(b"NOSUCHCMD", &[])),
+            b"ERR unknown command 'NOSUCHCMD'"
+        );
+    }
+
+    #[test]
+    fn args_are_listed_space_separated_with_no_commas() {
+        assert_eq!(
+            text(&err_unknown_command(
+                b"NOSUCHCMD",
+                &[bulk(b"a"), bulk(b"b")]
+            )),
+            b"ERR unknown command 'NOSUCHCMD', with args beginning with: 'a' 'b' "
+        );
+    }
+
+    /// The client's OWN casing is echoed — the opposite of the arity error,
+    /// which normalises to the registered name (moon#491).
+    #[test]
+    fn command_name_keeps_the_clients_casing() {
+        assert_eq!(
+            text(&err_unknown_command(b"NoSuchCmd", &[bulk(b"a")])),
+            b"ERR unknown command 'NoSuchCmd', with args beginning with: 'a' "
+        );
+    }
+
+    /// C's `%.*s` reads the value as NUL-terminated even though it is
+    /// binary-safe: an argument starting with `\0` prints as `''`.
+    #[test]
+    fn an_argument_truncates_at_its_first_embedded_nul() {
+        assert_eq!(
+            text(&err_unknown_command(
+                b"NOSUCHCMD",
+                &[bulk(&[0, 1, 2, 0xff, 0xfe])]
+            )),
+            b"ERR unknown command 'NOSUCHCMD', with args beginning with: '' "
+        );
+    }
+
+    /// Non-UTF8 bytes reach the wire unchanged — never a lossy replacement
+    /// character.
+    #[test]
+    fn binary_bytes_are_not_utf8_lossy_replaced() {
+        assert_eq!(
+            text(&err_unknown_command(
+                b"NOSUCHCMD",
+                &[bulk(&[0xff, 0xfe, 0xfd])]
+            )),
+            b"ERR unknown command 'NOSUCHCMD', with args beginning with: '\xff\xfe\xfd' "
+        );
+    }
+
+    /// CR and LF are mapped to a space so this reply can never split into a
+    /// second, client-forged RESP line (moon#1031's class of bug) — measured
+    /// against redis-server 8.6.1, which does the same.
+    #[test]
+    fn cr_and_lf_become_spaces_in_both_the_name_and_the_arguments() {
+        assert_eq!(
+            text(&err_unknown_command(b"foo\r\nbar", &[bulk(b"x\r\ny")])),
+            b"ERR unknown command 'foo  bar', with args beginning with: 'x  y' "
+        );
+    }
+
+    /// The combined argument budget is 128 bytes: a single long argument is
+    /// truncated to fit, and a budget already spent shrinks the next one.
+    #[test]
+    fn the_combined_argument_budget_is_128_bytes() {
+        let one_two_eight = vec![b'x'; 128];
+        assert_eq!(
+            text(&err_unknown_command(
+                b"NOSUCHCMD",
+                &[bulk(&vec![b'x'; 300])]
+            )),
+            [
+                b"ERR unknown command 'NOSUCHCMD', with args beginning with: '".as_slice(),
+                one_two_eight.as_slice(),
+                b"' ".as_slice(),
+            ]
+            .concat()
+        );
+
+        let hundred_y = [b'y'; 100];
+        let twenty_five_z = vec![b'z'; 25];
+        assert_eq!(
+            text(&err_unknown_command(
+                b"NOSUCHCMD",
+                &[bulk(&hundred_y), bulk(&[b'z'; 100])]
+            )),
+            [
+                b"ERR unknown command 'NOSUCHCMD', with args beginning with: '".as_slice(),
+                hundred_y.as_slice(),
+                b"' '".as_slice(),
+                twenty_five_z.as_slice(),
+                b"' ".as_slice(),
+            ]
+            .concat()
+        );
+    }
+
+    /// A non-bulk-string argument (never sent by a real RESP client, but
+    /// defensively handled) contributes an empty piece rather than panicking.
+    #[test]
+    fn a_non_bulk_argument_contributes_an_empty_piece() {
+        assert_eq!(
+            text(&err_unknown_command(b"NOSUCHCMD", &[Frame::Integer(5)])),
+            b"ERR unknown command 'NOSUCHCMD', with args beginning with: '' "
+        );
+    }
 }

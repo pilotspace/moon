@@ -232,6 +232,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     tombstones key_hash-wide, killing the NEW copy of a key re-written while
     the merge ran; it now uses the origin-gated replay the background install
     already used.
+- **Three wire-parity gaps found probing redis-server 8.6.1 raw sockets**
+  (moon#1060, moon#1076, moon#1077).
+  - `ZRANGEBYSCORE`, `ZRANGE ... BYSCORE`/`BYLEX` and `ZREVRANGEBYSCORE`
+    (moon#1060) looked a key up before validating the min/max grammar, so a
+    malformed bound against a MISSING key answered an empty array where Redis
+    parses the grammar unconditionally and answers a parse error.
+    `ZRANGEBYLEX`/`ZREVRANGEBYLEX` (moon#959) already had the order right.
+  - Inside `MULTI`, a container subcommand with the wrong number of arguments
+    (`CLIENT CACHING`, `CLIENT SETNAME`, `CONFIG GET`, `CONFIG SET`, ...) was
+    queued instead of aborting the transaction (moon#1076). The queue-time
+    gate checked the container's own arity and, since moon#670, whether the
+    subcommand was known, but never the subcommand's own arity even though
+    `SUBCOMMAND_META` records it. `EXEC` now answers `EXECABORT` the same way
+    it does for an unknown subcommand.
+  - The unknown-command error always appended `, with args beginning with: `
+    and never listed the arguments (moon#1077). Redis appends that clause
+    only when there is at least one argument, then lists each one quoted and
+    space-separated with no commas, truncated at a combined 128-byte budget
+    (and, C's `%.*s` being what it is, at an argument's first embedded NUL).
+    One builder (`command::helpers::err_unknown_command`) now serves
+    `command::dispatch`, `command::dispatch_read` and the `MULTI` queue-time
+    gate, so the three cannot drift the way they had — the live paths never
+    listed arguments and the queue-time gate listed them with `', '` where
+    Redis has no comma. The builder writes raw bytes rather than a lossy
+    `String`, so a non-UTF8 argument reaches the wire unchanged; CR and LF are
+    still mapped to a space so a client-chosen argument cannot split this
+    reply into a second, forged one on a pipelined connection (the same class
+    of bug as moon#1031, whose general fix — the RESP2/RESP3 line writers —
+    remains open).
 
 - **Restart no longer deletes warm vector segments it is serving, and a warm
   segment is superseded per key instead of as a whole directory** (moon#893).

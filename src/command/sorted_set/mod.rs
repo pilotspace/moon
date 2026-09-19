@@ -5066,3 +5066,162 @@ mod missing_commands_959_tests {
         assert_eq!(rank_window(i64::MAX, i64::MAX, 5), None);
     }
 }
+
+/// moon#1060 — `ZRANGEBYSCORE`, `ZRANGE ... BYSCORE`/`BYLEX` and (found in the
+/// same sweep) `ZREVRANGEBYSCORE` used to look the key up BEFORE validating
+/// the min/max grammar, so a malformed bound against a MISSING key answered
+/// `[]` where Redis parses the grammar unconditionally and answers a parse
+/// error. `ZRANGEBYLEX`/`ZREVRANGEBYLEX` (moon#959) already had the order
+/// right — they anchor the "still correct" side of every table below.
+///
+/// Dispatch-path coverage, per CLAUDE.md's three-path rule: every command
+/// here delegates to a `*_readonly` function called from BOTH
+/// `command::dispatch` (`call` below) and `command::dispatch_read` (`call_read`
+/// below); `server::conn::try_inline_dispatch` inlines only `GET`/plain `SET`
+/// and stands down to generic dispatch for everything else, so there is no
+/// third arm for this family to be missing from.
+#[cfg(test)]
+mod missing_key_bound_validation_1060_tests {
+    use super::*;
+    use crate::command::{DispatchResult, dispatch, dispatch_read};
+    use crate::storage::Database;
+
+    fn bs(s: &[u8]) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s))
+    }
+
+    fn argv(args: &[&str]) -> Vec<Frame> {
+        args.iter().map(|a| bs(a.as_bytes())).collect()
+    }
+
+    fn call(db: &mut Database, cmd: &str, args: &[&str]) -> Frame {
+        let mut selected = 0usize;
+        match dispatch(db, cmd.as_bytes(), &argv(args), &mut selected, 16) {
+            DispatchResult::Response(f) => f,
+            DispatchResult::Quit(f) => panic!("unexpected Quit for {cmd}: {f:?}"),
+        }
+    }
+
+    fn call_read(db: &Database, cmd: &str, args: &[&str]) -> Frame {
+        let mut selected = 0usize;
+        let now_ms = db.now_ms();
+        match dispatch_read(db, cmd.as_bytes(), &argv(args), now_ms, &mut selected, 16) {
+            DispatchResult::Response(f) => f,
+            DispatchResult::Quit(f) => panic!("unexpected Quit for {cmd}: {f:?}"),
+        }
+    }
+
+    fn err_text(frame: &Frame) -> String {
+        match frame {
+            Frame::Error(e) => String::from_utf8_lossy(e).into_owned(),
+            other => panic!("expected an error reply, got {other:?}"),
+        }
+    }
+
+    /// Every row: (command, args against a key that does not exist, the
+    /// error Redis gives). Measured against redis-server 8.6.1, raw socket.
+    const BAD_BOUND_ON_MISSING_KEY: &[(&str, &[&str], &str)] = &[
+        (
+            "ZRANGEBYSCORE",
+            &["nokey", "a", "b"],
+            "ERR min or max is not a float",
+        ),
+        (
+            "ZREVRANGEBYSCORE",
+            &["nokey", "a", "b"],
+            "ERR min or max is not a float",
+        ),
+        (
+            "ZRANGE",
+            &["nokey", "a", "b", "BYSCORE"],
+            "ERR min or max is not a float",
+        ),
+        (
+            "ZRANGE",
+            &["nokey", "a", "b", "BYLEX"],
+            "ERR min or max not valid string range item",
+        ),
+        (
+            "ZRANGE",
+            &["nokey", "b", "a", "BYSCORE", "REV"],
+            "ERR min or max is not a float",
+        ),
+    ];
+
+    #[test]
+    fn bad_bound_on_a_missing_key_is_a_parse_error_not_empty_through_dispatch() {
+        for (cmd, args, want) in BAD_BOUND_ON_MISSING_KEY {
+            let mut db = Database::new();
+            let reply = call(&mut db, cmd, args);
+            assert_eq!(err_text(&reply), *want, "{cmd} {args:?} through dispatch()");
+        }
+    }
+
+    #[test]
+    fn bad_bound_on_a_missing_key_is_a_parse_error_not_empty_through_dispatch_read() {
+        for (cmd, args, want) in BAD_BOUND_ON_MISSING_KEY {
+            let db = Database::new();
+            let reply = call_read(&db, cmd, args);
+            assert_eq!(
+                err_text(&reply),
+                *want,
+                "{cmd} {args:?} through dispatch_read()"
+            );
+        }
+    }
+
+    /// Negative control: the SAME commands, on the SAME missing key, with a
+    /// grammatically valid bound, still answer the ordinary empty result —
+    /// this fix must not turn a merely-absent key into an error.
+    #[test]
+    fn valid_bound_on_a_missing_key_still_answers_empty() {
+        let mut db = Database::new();
+        assert_eq!(
+            call(&mut db, "ZRANGEBYSCORE", &["nokey", "0", "10"]),
+            Frame::Array(framevec![])
+        );
+        assert_eq!(
+            call(&mut db, "ZREVRANGEBYSCORE", &["nokey", "10", "0"]),
+            Frame::Array(framevec![])
+        );
+        assert_eq!(
+            call(&mut db, "ZRANGE", &["nokey", "0", "10", "BYSCORE"]),
+            Frame::Array(framevec![])
+        );
+        assert_eq!(
+            call(&mut db, "ZRANGE", &["nokey", "-", "+", "BYLEX"]),
+            Frame::Array(framevec![])
+        );
+    }
+
+    /// The already-correct siblings (moon#959) validate the SAME way; this
+    /// pins that the fix did not have to touch them and that they still do.
+    #[test]
+    fn already_correct_siblings_are_unchanged() {
+        let mut db = Database::new();
+        assert_eq!(
+            err_text(&call(&mut db, "ZRANGEBYLEX", &["nokey", "bad", "bound"])),
+            "ERR min or max not valid string range item"
+        );
+        assert_eq!(
+            err_text(&call(&mut db, "ZREVRANGEBYLEX", &["nokey", "bad", "bound"])),
+            "ERR min or max not valid string range item"
+        );
+    }
+
+    /// On a key that EXISTS, the bad bound already errored before this fix —
+    /// this pins that the fix did not change that arm.
+    #[test]
+    fn bad_bound_on_an_existing_key_is_unchanged() {
+        let mut db = Database::new();
+        assert_eq!(call(&mut db, "ZADD", &["z", "1", "m"]), Frame::Integer(1));
+        for (cmd, args, want) in BAD_BOUND_ON_MISSING_KEY {
+            let args: Vec<&str> = std::iter::once(&"z")
+                .chain(args.iter().skip(1))
+                .copied()
+                .collect();
+            let reply = call(&mut db, cmd, &args);
+            assert_eq!(err_text(&reply), *want, "{cmd} {args:?} on an existing key");
+        }
+    }
+}
