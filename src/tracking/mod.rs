@@ -1,8 +1,9 @@
+pub mod client_cmd;
 pub mod invalidation;
 
 use crate::runtime::channel;
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::protocol::Frame;
@@ -40,7 +41,7 @@ pub fn global_table() -> std::sync::Arc<parking_lot::Mutex<TrackingTable>> {
 }
 
 /// Per-client tracking configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TrackingState {
     pub enabled: bool,
     pub bcast: bool,
@@ -48,26 +49,234 @@ pub struct TrackingState {
     pub optout: bool,
     pub noloop: bool,
     pub redirect: Option<u64>,
+    /// BCAST prefixes, sorted and de-duplicated (redis keeps them in a radix
+    /// tree, which is the order `CLIENT TRACKINGINFO` reports).
     pub prefixes: Vec<Bytes>,
     pub invalidation_tx: Option<channel::MpscSender<Frame>>,
+    /// `CLIENT CACHING yes|no` was given (redis `CLIENT_TRACKING_CACHING`):
+    /// under OPTIN the next command's reads ARE tracked, under OPTOUT they are
+    /// NOT. It covers the next command only — or the whole next transaction —
+    /// see [`TrackingState::before_command`].
+    pub caching: bool,
+    /// The command before the one now executing was a `CLIENT` command.
+    /// Redis clears the CACHING flag after every command except `CLIENT`
+    /// (any subcommand) and except while a MULTI is open.
+    pub prev_was_client: bool,
 }
 
-impl Default for TrackingState {
-    fn default() -> Self {
+impl TrackingState {
+    /// Whether the reads of the command now executing register their keys.
+    ///
+    /// Default mode tracks every read; BCAST tracks none (it is prefix
+    /// driven); OPTIN tracks only after `CLIENT CACHING yes`; OPTOUT tracks
+    /// unless `CLIENT CACHING no` preceded it (redis `trackingRememberKeys`).
+    #[inline]
+    pub fn tracks_reads(&self) -> bool {
+        self.modes().tracks_reads()
+    }
+
+    /// The flags that decide whether a read is tracked, copied out.
+    #[inline]
+    pub fn modes(&self) -> TrackingModes {
+        TrackingModes {
+            enabled: self.enabled,
+            bcast: self.bcast,
+            optin: self.optin,
+            optout: self.optout,
+            noloop: self.noloop,
+            caching: self.caching,
+        }
+    }
+
+    /// Per-command hook, called by every connection handler before it
+    /// executes a top-level command.
+    ///
+    /// Redis clears `CLIENT_TRACKING_CACHING` in `resetClient` after each
+    /// command unless that command was `CLIENT` or the client is inside
+    /// MULTI. Running the same rule one step later — at the start of the NEXT
+    /// command — needs only the previous command's CLIENT-ness, because
+    /// `in_multi` has not changed in between.
+    ///
+    /// Cost when tracking is off: one branch on a connection-local bool.
+    #[inline]
+    pub fn before_command(&mut self, cmd: &[u8], in_multi: bool) {
+        if self.enabled {
+            self.caching_step(cmd, in_multi);
+        }
+    }
+
+    #[inline(never)]
+    fn caching_step(&mut self, cmd: &[u8], in_multi: bool) {
+        if self.caching && !self.prev_was_client && !in_multi {
+            self.caching = false;
+        }
+        self.prev_was_client = cmd.eq_ignore_ascii_case(b"CLIENT");
+    }
+}
+
+/// The part of [`TrackingState`] that decides whether a read registers its
+/// keys, as a `Copy` value.
+///
+/// A MULTI/EXEC body is bookkept after it ran (see
+/// [`invalidation::after_transaction`]), and by then any `CLIENT TRACKING` or
+/// `CLIENT CACHING` queued inside it has already changed the connection's
+/// state. The body is therefore replayed from the modes captured when EXEC
+/// began, applying each queued `CLIENT` command at its own position — the
+/// order redis executes them in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrackingModes {
+    pub enabled: bool,
+    pub bcast: bool,
+    pub optin: bool,
+    pub optout: bool,
+    pub noloop: bool,
+    pub caching: bool,
+}
+
+impl TrackingModes {
+    /// Default mode tracks every read; BCAST tracks none (it is prefix
+    /// driven); OPTIN tracks only after `CLIENT CACHING yes`; OPTOUT tracks
+    /// unless `CLIENT CACHING no` preceded it (redis `trackingRememberKeys`).
+    #[inline]
+    pub fn tracks_reads(&self) -> bool {
+        self.enabled
+            && !self.bcast
+            && !((self.optin && !self.caching) || (self.optout && self.caching))
+    }
+}
+
+/// A connection's pub/sub delivery channel, registered so a REDIRECT source
+/// can reach it.
+///
+/// The channel carries pre-serialised RESP, written verbatim by the
+/// connection's subscriber loop, so the sender frames each message for the
+/// protocol recorded here: RESP2 gets a pub/sub `message` on
+/// `__redis__:invalidate`, RESP3 gets the `invalidate` push.
+#[derive(Clone)]
+pub struct PubSubInbox {
+    pub tx: channel::MpscSender<Bytes>,
+    pub resp3: bool,
+}
+
+/// One recipient of a tracking message, resolved under the table lock by
+/// `TrackingTable::route` and delivered by [`TrackingMessage::deliver`].
+pub enum Delivery {
+    /// The RESP3 push, on a tracking connection's own channel. The receiving
+    /// connection drops it if it speaks RESP2, which cannot carry a push
+    /// (redis sends such a connection nothing).
+    Push(channel::MpscSender<Frame>),
+    /// The pub/sub channel of a subscribed redirect target.
+    PubSub(PubSubInbox),
+    /// The redirect target no longer exists: tell the source, on its own
+    /// channel, with `tracking-redir-broken <target>` (RESP3 only, like the
+    /// invalidation push itself).
+    RedirBroken {
+        source: channel::MpscSender<Frame>,
+        target: u64,
+    },
+}
+
+/// The pub/sub channel RESP2 redirect targets receive invalidations on.
+pub const INVALIDATE_CHANNEL: &[u8] = b"__redis__:invalidate";
+
+/// One invalidation, framed lazily for each kind of recipient.
+///
+/// `payload` is the second element of the message: the array of keys, or
+/// Null for a flush.
+pub struct TrackingMessage {
+    payload: Frame,
+    push: Option<Frame>,
+    resp2_bytes: Option<Bytes>,
+    resp3_bytes: Option<Bytes>,
+}
+
+impl TrackingMessage {
+    /// An invalidation naming `keys`.
+    pub fn keys(keys: &[Bytes]) -> Self {
+        let named: Vec<Frame> = keys.iter().map(|k| Frame::BulkString(k.clone())).collect();
+        Self::with_payload(Frame::Array(named.into()))
+    }
+
+    /// The flush invalidation (FLUSHALL/FLUSHDB): a Null payload means "drop
+    /// everything you have cached".
+    pub fn flush() -> Self {
+        Self::with_payload(Frame::Null)
+    }
+
+    fn with_payload(payload: Frame) -> Self {
         Self {
-            enabled: false,
-            bcast: false,
-            optin: false,
-            optout: false,
-            noloop: false,
-            redirect: None,
-            prefixes: Vec::new(),
-            invalidation_tx: None,
+            payload,
+            push: None,
+            resp2_bytes: None,
+            resp3_bytes: None,
+        }
+    }
+
+    /// `>2 invalidate <payload>`.
+    fn push_frame(&mut self) -> &Frame {
+        let payload = &self.payload;
+        self.push.get_or_insert_with(|| {
+            Frame::Push(crate::framevec![
+                Frame::BulkString(Bytes::from_static(b"invalidate")),
+                payload.clone(),
+            ])
+        })
+    }
+
+    /// Hand the message to one recipient. Never blocks: a full channel drops
+    /// the message SILENTLY. That is a known divergence, not parity — redis
+    /// never drops an invalidation; it disconnects a client whose output
+    /// buffer passes its limit, which a caching client treats as "flush
+    /// everything" (moon#1088).
+    pub fn deliver(&mut self, to: &Delivery) {
+        match to {
+            Delivery::Push(tx) => {
+                let _ = tx.try_send(self.push_frame().clone());
+            }
+            Delivery::PubSub(inbox) => {
+                let bytes = if inbox.resp3 {
+                    if self.resp3_bytes.is_none() {
+                        let mut buf = bytes::BytesMut::new();
+                        crate::protocol::serialize_resp3(self.push_frame(), &mut buf);
+                        self.resp3_bytes = Some(buf.freeze());
+                    }
+                    self.resp3_bytes.clone()
+                } else {
+                    if self.resp2_bytes.is_none() {
+                        // `*3 message __redis__:invalidate <payload>` — the
+                        // exact frame redis-server 8.6.1 writes.
+                        let message = Frame::Array(crate::framevec![
+                            Frame::BulkString(Bytes::from_static(b"message")),
+                            Frame::BulkString(Bytes::from_static(INVALIDATE_CHANNEL)),
+                            self.payload.clone(),
+                        ]);
+                        let mut buf = bytes::BytesMut::new();
+                        crate::protocol::serialize(&message, &mut buf);
+                        self.resp2_bytes = Some(buf.freeze());
+                    }
+                    self.resp2_bytes.clone()
+                };
+                if let Some(b) = bytes {
+                    let _ = inbox.tx.try_send(b);
+                }
+            }
+            Delivery::RedirBroken { source, target } => {
+                let _ = source.try_send(redir_broken_push(*target));
+            }
         }
     }
 }
 
-/// Per-shard tracking table.
+/// `>2 tracking-redir-broken :<target>` — what redis pushes to a RESP3 source
+/// each time an invalidation cannot reach its vanished redirect target.
+pub fn redir_broken_push(target: u64) -> Frame {
+    Frame::Push(crate::framevec![
+        Frame::BulkString(Bytes::from_static(b"tracking-redir-broken")),
+        Frame::Integer(i64::try_from(target).unwrap_or(i64::MAX)),
+    ])
+}
+
+/// Process-wide tracking table (see [`global_table`]).
 ///
 /// Two modes:
 /// 1. Normal (default): track_key records which clients have read a key.
@@ -89,15 +298,33 @@ pub struct TrackingTable {
     /// million). This makes teardown proportional to what the client actually
     /// tracked. Kept exactly in step with `key_clients`: every insertion and
     /// every removal there has a matching update here.
-    client_keys: HashMap<u64, std::collections::HashSet<Bytes>>,
+    client_keys: HashMap<u64, HashSet<Bytes>>,
     /// BCAST mode: list of (client_id, prefix, noloop)
     bcast_clients: Vec<(u64, Bytes, bool)>,
     /// Client channels: client_id -> MpscSender<Frame>
     client_channels: HashMap<u64, channel::MpscSender<Frame>>,
     /// Redirect map: source_client_id -> target_client_id
     redirects: HashMap<u64, u64>,
+    /// Pub/sub delivery channels of connections that have subscribed, keyed
+    /// by client id — how a REDIRECT reaches a target that never enabled
+    /// tracking itself (moon#1048). Registered once per connection, when its
+    /// pub/sub channel is created, and removed when it disconnects.
+    inboxes: HashMap<u64, PubSubInbox>,
+    /// Sources whose redirect target was found gone (`broken_redirect` in
+    /// `CLIENT TRACKINGINFO`). Cleared when the source re-enables or disables
+    /// tracking.
+    broken: HashSet<u64>,
+    /// Whether a client id belongs to a live connection. The client registry
+    /// in production; injectable so the routing rules are unit-testable.
+    is_connected: fn(u64) -> bool,
     /// Maximum keys tracked (bounded table)
     max_keys: usize,
+}
+
+impl Default for TrackingTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TrackingTable {
@@ -113,8 +340,18 @@ impl TrackingTable {
             bcast_clients: Vec::new(),
             client_channels: HashMap::new(),
             redirects: HashMap::new(),
+            inboxes: HashMap::new(),
+            broken: HashSet::new(),
+            is_connected: crate::client_registry::is_registered,
             max_keys,
         }
+    }
+
+    /// Replace the connection-liveness probe (tests).
+    #[cfg(test)]
+    pub(crate) fn with_liveness(mut self, is_connected: fn(u64) -> bool) -> Self {
+        self.is_connected = is_connected;
+        self
     }
 
     /// Register a client's invalidation channel.
@@ -124,14 +361,116 @@ impl TrackingTable {
         }
     }
 
-    /// Register a redirect: invalidations for source go to target.
-    pub fn set_redirect(&mut self, source: u64, target: u64) {
-        self.redirects.insert(source, target);
+    /// Set (or, with `None`, clear) where `source`'s invalidations go.
+    /// Re-enabling tracking replaces the redirect wholesale, and a fresh
+    /// redirect is not broken.
+    pub fn set_redirect(&mut self, source: u64, target: Option<u64>) {
+        match target {
+            Some(t) => {
+                self.redirects.insert(source, t);
+            }
+            None => {
+                self.redirects.remove(&source);
+            }
+        }
+        self.broken.remove(&source);
     }
 
-    /// Register a BCAST prefix for a client.
+    /// Whether an invalidation for `source` has found its redirect target
+    /// gone since tracking was (re-)enabled.
+    pub fn is_redirect_broken(&self, source: u64) -> bool {
+        self.broken.contains(&source)
+    }
+
+    /// Whether `client_id` names a connection that could be a redirect
+    /// target right now.
+    pub fn client_exists(&self, client_id: u64) -> bool {
+        self.client_channels.contains_key(&client_id)
+            || self.inboxes.contains_key(&client_id)
+            || (self.is_connected)(client_id)
+    }
+
+    /// Register the pub/sub channel of a connection that has subscribed.
+    pub fn register_inbox(&mut self, client_id: u64, inbox: PubSubInbox) {
+        self.inboxes.insert(client_id, inbox);
+    }
+
+    /// Drop a disconnecting connection's pub/sub inbox.
+    pub fn unregister_inbox(&mut self, client_id: u64) {
+        self.inboxes.remove(&client_id);
+    }
+
+    /// Register a BCAST prefix for a client. Registering the same prefix
+    /// twice is a no-op (re-enabling BCAST adds prefixes, it does not
+    /// duplicate them); `noloop` is refreshed.
     pub fn register_prefix(&mut self, client_id: u64, prefix: Bytes, noloop: bool) {
+        if let Some(entry) = self
+            .bcast_clients
+            .iter_mut()
+            .find(|(id, p, _)| *id == client_id && *p == prefix)
+        {
+            entry.2 = noloop;
+            return;
+        }
         self.bcast_clients.push((client_id, prefix, noloop));
+    }
+
+    /// Re-enabling tracking replaces NOLOOP for every prefix the client
+    /// already has.
+    pub fn set_bcast_noloop(&mut self, client_id: u64, noloop: bool) {
+        for entry in self.bcast_clients.iter_mut().filter(|e| e.0 == client_id) {
+            entry.2 = noloop;
+        }
+    }
+
+    /// Resolve where one tracker's message goes.
+    ///
+    /// Without a redirect, the tracker's own channel. With one, the target —
+    /// by redis's rules (`sendTrackingMessage`):
+    ///
+    /// * a subscribed RESP2 target gets a pub/sub `message`;
+    /// * a target with its own tracking channel gets the push (RESP3 writes
+    ///   it, RESP2 drops it);
+    /// * a subscribed RESP3 target gets the push through its pub/sub channel;
+    /// * a target that exists but has none of those cannot receive anything —
+    ///   redis drops the message too;
+    /// * a target that no longer exists breaks the redirect: the source is
+    ///   told, and `CLIENT TRACKINGINFO` reports `broken_redirect`.
+    ///
+    /// Known gap: a RESP3 target that neither subscribed nor enabled tracking
+    /// has no channel moon can reach (redis would push to it). Giving every
+    /// connection one would cost every idle connection its park (moon#1078).
+    fn route(&mut self, client_id: u64) -> Option<Delivery> {
+        let Some(&target) = self.redirects.get(&client_id) else {
+            return self
+                .client_channels
+                .get(&client_id)
+                .cloned()
+                .map(Delivery::Push);
+        };
+        let inbox = self.inboxes.get(&target);
+        if let Some(inbox) = inbox.filter(|i| !i.resp3) {
+            return Some(Delivery::PubSub(inbox.clone()));
+        }
+        if let Some(tx) = self.client_channels.get(&target) {
+            return Some(Delivery::Push(tx.clone()));
+        }
+        if let Some(inbox) = inbox {
+            return Some(Delivery::PubSub(inbox.clone()));
+        }
+        // Lock order: this probes the client registry (a striped RwLock) while
+        // the tracking mutex is held. Nothing takes the tracking mutex while
+        // holding a registry stripe — `client_registry::update` closures only
+        // touch the entry — so the order cannot invert. Reached only for a
+        // redirect whose target has neither an inbox nor a tracking channel.
+        if (self.is_connected)(target) {
+            return None;
+        }
+        self.broken.insert(client_id);
+        self.client_channels
+            .get(&client_id)
+            .cloned()
+            .map(|source| Delivery::RedirBroken { source, target })
     }
 
     /// Track that a client has read a key (normal mode).
@@ -140,16 +479,16 @@ impl TrackingTable {
     /// dead code, so a long-lived tracking client reading many distinct
     /// never-written keys grew this table without limit). When tracking a NEW
     /// key would exceed the cap, an arbitrary existing entry is evicted and
-    /// its `(key, senders)` returned — the caller must push an invalidation
-    /// for it so the evicted key's clients drop their cached copy (Redis's
-    /// "fake invalidation" on tracking-table eviction). Returns `None` when
-    /// no eviction occurred.
+    /// its `(key, recipients)` returned — the caller must deliver an
+    /// invalidation for it so the evicted key's clients drop their cached copy
+    /// (Redis's "fake invalidation" on tracking-table eviction). Returns
+    /// `None` when no eviction occurred.
     pub fn track_key(
         &mut self,
         client_id: u64,
         key: &Bytes,
         noloop: bool,
-    ) -> Option<(Bytes, Vec<channel::MpscSender<Frame>>)> {
+    ) -> Option<(Bytes, Vec<Delivery>)> {
         if let Some(clients) = self.key_clients.get_mut(key) {
             if !clients.iter().any(|(id, _)| *id == client_id) {
                 clients.push((client_id, noloop));
@@ -167,17 +506,16 @@ impl TrackingTable {
             #[allow(clippy::unwrap_used)] // len >= 1 guaranteed by the branch
             let victim = self.key_clients.keys().next().unwrap().clone();
             let clients = self.key_clients.remove(&victim).unwrap_or_default();
-            let mut senders = Vec::new();
+            let mut recipients = Vec::new();
             for (cid, _noloop) in clients {
                 Self::forget_client_key(&mut self.client_keys, cid, &victim);
                 // No noloop skip: cap eviction is not a self-write — every
                 // tracker of the victim key must drop its cached copy.
-                let target_id = self.redirects.get(&cid).copied().unwrap_or(cid);
-                if let Some(tx) = self.client_channels.get(&target_id) {
-                    senders.push(tx.clone());
+                if let Some(d) = self.route(cid) {
+                    recipients.push(d);
                 }
             }
-            Some((victim, senders))
+            Some((victim, recipients))
         } else {
             None
         };
@@ -200,14 +538,10 @@ impl TrackingTable {
     }
 
     /// Invalidate a key: collect all clients that tracked this key (normal mode)
-    /// and all BCAST clients whose prefixes match. Returns list of channels to notify.
-    /// Removes the key from the tracking table after collection.
-    pub fn invalidate_key(
-        &mut self,
-        key: &Bytes,
-        writer_client_id: u64,
-    ) -> Vec<channel::MpscSender<Frame>> {
-        let mut to_notify: Vec<channel::MpscSender<Frame>> = Vec::new();
+    /// and all BCAST clients whose prefixes match, resolved to their delivery
+    /// routes. Removes the key from the tracking table after collection.
+    pub fn invalidate_key(&mut self, key: &Bytes, writer_client_id: u64) -> Vec<Delivery> {
+        let mut to_notify: Vec<Delivery> = Vec::new();
 
         // Normal mode: check key_clients
         if let Some(clients) = self.key_clients.remove(key) {
@@ -221,23 +555,26 @@ impl TrackingTable {
                 if noloop && cid == writer_client_id {
                     continue;
                 }
-                let target_id = self.redirects.get(&cid).copied().unwrap_or(cid);
-                if let Some(tx) = self.client_channels.get(&target_id) {
-                    to_notify.push(tx.clone());
+                if let Some(d) = self.route(cid) {
+                    to_notify.push(d);
                 }
             }
         }
 
-        // BCAST mode: check prefix matches
+        // BCAST mode: check prefix matches. Collected first, because routing
+        // needs `&mut self` (it records broken redirects).
+        let mut bcast_hits: smallvec::SmallVec<[u64; 4]> = smallvec::SmallVec::new();
         for (cid, prefix, noloop) in &self.bcast_clients {
             if key.starts_with(prefix.as_ref()) {
                 if *noloop && *cid == writer_client_id {
                     continue;
                 }
-                let target_id = self.redirects.get(cid).copied().unwrap_or(*cid);
-                if let Some(tx) = self.client_channels.get(&target_id) {
-                    to_notify.push(tx.clone());
-                }
+                bcast_hits.push(*cid);
+            }
+        }
+        for cid in bcast_hits {
+            if let Some(d) = self.route(cid) {
+                to_notify.push(d);
             }
         }
 
@@ -245,6 +582,10 @@ impl TrackingTable {
     }
 
     /// Remove all tracking for a client (on disconnect or TRACKING OFF).
+    ///
+    /// Leaves the client's pub/sub inbox alone: that belongs to the
+    /// connection's subscriptions, not its tracking, and another client may
+    /// still redirect to it. [`TrackingTable::unregister_inbox`] drops it.
     pub fn untrack_all(&mut self, client_id: u64) {
         // Visit only the keys this client actually tracked. This used to
         // `retain` over the whole table -- O(tracked keys) per disconnect,
@@ -268,6 +609,7 @@ impl TrackingTable {
             ACTIVE_TRACKERS.fetch_sub(1, Ordering::Relaxed);
         }
         self.redirects.remove(&client_id);
+        self.broken.remove(&client_id);
     }
 
     /// Drop one (client, key) pair from the reverse index, retiring the
@@ -276,7 +618,7 @@ impl TrackingTable {
     /// Free function over the map so callers can hold a borrow of the forward
     /// map across the call.
     fn forget_client_key(
-        client_keys: &mut HashMap<u64, std::collections::HashSet<Bytes>>,
+        client_keys: &mut HashMap<u64, HashSet<Bytes>>,
         client_id: u64,
         key: &Bytes,
     ) {
@@ -290,12 +632,14 @@ impl TrackingTable {
 
     /// Cache-flush invalidation (FLUSHALL/FLUSHDB): every registered client
     /// must drop its whole local cache. Clears the per-key table and returns
-    /// every client channel so the caller can push the RESP3 flush
-    /// invalidation (`invalidate` + Null payload, the Redis convention).
-    pub fn invalidate_all(&mut self) -> Vec<channel::MpscSender<Frame>> {
+    /// every tracking client's route, so the caller can deliver the flush
+    /// invalidation (`invalidate` + Null payload, the Redis convention) — to
+    /// the redirect target where there is one.
+    pub fn invalidate_all(&mut self) -> Vec<Delivery> {
         self.key_clients.clear();
         self.client_keys.clear();
-        self.client_channels.values().cloned().collect()
+        let ids: Vec<u64> = self.client_channels.keys().copied().collect();
+        ids.into_iter().filter_map(|id| self.route(id)).collect()
     }
 }
 
@@ -622,17 +966,285 @@ mod tests {
         let (tx2, rx2) = channel::mpsc_bounded::<Frame>(16);
         table.register_client(1, tx1);
         table.register_client(2, tx2);
-        table.set_redirect(1, 2); // redirect client 1's invalidations to client 2
+        table.set_redirect(1, Some(2)); // redirect client 1's invalidations to client 2
 
         let key = Bytes::from_static(b"foo");
         table.track_key(1, &key, false);
 
-        let senders = table.invalidate_key(&key, 99);
-        assert_eq!(senders.len(), 1);
-        // Send a test frame through the returned sender
-        let push = invalidation::invalidation_push(std::slice::from_ref(&key));
-        senders[0].try_send(push.clone()).unwrap();
+        let recipients = table.invalidate_key(&key, 99);
+        assert_eq!(recipients.len(), 1);
+        let mut msg = TrackingMessage::keys(std::slice::from_ref(&key));
+        msg.deliver(&recipients[0]);
         let received = rx2.try_recv().unwrap();
-        assert_eq!(received, push);
+        assert_eq!(
+            received,
+            invalidation::invalidation_push(std::slice::from_ref(&key))
+        );
+    }
+
+    // ── moon#1048: REDIRECT routing ─────────────────────────────────────
+
+    /// Ids >= 1000 are "connected" for the routing tests below; smaller ids
+    /// behave as disconnected unless the table itself knows them.
+    fn connected_above_1000(id: u64) -> bool {
+        id >= 1000
+    }
+
+    fn inbox(resp3: bool) -> (PubSubInbox, channel::MpscReceiver<Bytes>) {
+        let (tx, rx) = channel::mpsc_unbounded::<Bytes>();
+        (PubSubInbox { tx, resp3 }, rx)
+    }
+
+    fn deliver_all(recipients: &[Delivery], msg: &mut TrackingMessage) {
+        for d in recipients {
+            msg.deliver(d);
+        }
+    }
+
+    /// The issue's case: the target never enabled tracking — it only
+    /// SUBSCRIBEd. It must receive the RESP2 pub/sub form, byte for byte what
+    /// redis-server 8.6.1 writes.
+    #[test]
+    fn redirect_to_a_resp2_subscriber_gets_a_pubsub_message() {
+        let mut table = TrackingTable::new().with_liveness(connected_above_1000);
+        let (src_tx, src_rx) = channel::mpsc_unbounded::<Frame>();
+        table.register_client(1001, src_tx);
+        table.set_redirect(1001, Some(1002));
+        let (ib, ib_rx) = inbox(false);
+        table.register_inbox(1002, ib);
+        let key = Bytes::from_static(b"c:redir");
+        table.track_key(1001, &key, false);
+
+        let recipients = table.invalidate_key(&key, 7);
+        deliver_all(&recipients, &mut TrackingMessage::keys(&[key]));
+        assert_eq!(
+            ib_rx.try_recv().unwrap(),
+            Bytes::from_static(
+                b"*3\r\n$7\r\nmessage\r\n$20\r\n__redis__:invalidate\r\n*1\r\n$7\r\nc:redir\r\n"
+            )
+        );
+        assert!(src_rx.try_recv().is_err(), "the source gets nothing");
+        assert!(!table.is_redirect_broken(1001));
+        table.untrack_all(1001);
+    }
+
+    #[test]
+    fn redirect_to_a_resp3_subscriber_gets_the_push_and_flush_is_null() {
+        let mut table = TrackingTable::new().with_liveness(connected_above_1000);
+        let (src_tx, _src_rx) = channel::mpsc_unbounded::<Frame>();
+        table.register_client(1011, src_tx);
+        table.set_redirect(1011, Some(1012));
+        let (ib, ib_rx) = inbox(true);
+        table.register_inbox(1012, ib);
+        let key = Bytes::from_static(b"k3");
+        table.track_key(1011, &key, false);
+        let recipients = table.invalidate_key(&key, 7);
+        deliver_all(&recipients, &mut TrackingMessage::keys(&[key]));
+        assert_eq!(
+            ib_rx.try_recv().unwrap(),
+            Bytes::from_static(b">2\r\n$10\r\ninvalidate\r\n*1\r\n$2\r\nk3\r\n")
+        );
+
+        // FLUSHALL follows the redirect too.
+        let recipients = table.invalidate_all();
+        deliver_all(&recipients, &mut TrackingMessage::flush());
+        assert_eq!(
+            ib_rx.try_recv().unwrap(),
+            Bytes::from_static(b">2\r\n$10\r\ninvalidate\r\n_\r\n")
+        );
+        table.untrack_all(1011);
+    }
+
+    #[test]
+    fn resp2_flush_reaches_the_redirect_target_as_a_null_message() {
+        let mut table = TrackingTable::new().with_liveness(connected_above_1000);
+        let (src_tx, src_rx) = channel::mpsc_unbounded::<Frame>();
+        table.register_client(1021, src_tx);
+        table.set_redirect(1021, Some(1022));
+        let (ib, ib_rx) = inbox(false);
+        table.register_inbox(1022, ib);
+        let recipients = table.invalidate_all();
+        deliver_all(&recipients, &mut TrackingMessage::flush());
+        assert_eq!(
+            ib_rx.try_recv().unwrap(),
+            Bytes::from_static(b"*3\r\n$7\r\nmessage\r\n$20\r\n__redis__:invalidate\r\n$-1\r\n")
+        );
+        assert!(
+            src_rx.try_recv().is_err(),
+            "the flush went to the source instead of its target"
+        );
+        table.untrack_all(1021);
+    }
+
+    /// A target that exists but has neither subscribed nor enabled tracking
+    /// cannot receive anything; the redirect is NOT broken (redis drops the
+    /// message the same way).
+    #[test]
+    fn redirect_to_a_live_unreachable_target_drops_silently() {
+        let mut table = TrackingTable::new().with_liveness(connected_above_1000);
+        let (src_tx, src_rx) = channel::mpsc_unbounded::<Frame>();
+        table.register_client(1031, src_tx);
+        table.set_redirect(1031, Some(1032));
+        let key = Bytes::from_static(b"k");
+        table.track_key(1031, &key, false);
+        assert!(table.invalidate_key(&key, 7).is_empty());
+        assert!(src_rx.try_recv().is_err());
+        assert!(!table.is_redirect_broken(1031));
+        table.untrack_all(1031);
+    }
+
+    /// The target disconnected: the source is told `tracking-redir-broken`
+    /// once per undeliverable message, and the flag sticks until tracking is
+    /// re-enabled.
+    #[test]
+    fn redirect_to_a_vanished_target_is_broken() {
+        let mut table = TrackingTable::new().with_liveness(connected_above_1000);
+        let (src_tx, src_rx) = channel::mpsc_unbounded::<Frame>();
+        table.register_client(1041, src_tx);
+        table.set_redirect(1041, Some(41)); // 41 < 1000: not connected
+        let key = Bytes::from_static(b"k");
+        table.track_key(1041, &key, false);
+        let recipients = table.invalidate_key(&key, 7);
+        deliver_all(&recipients, &mut TrackingMessage::keys(&[key]));
+        assert_eq!(src_rx.try_recv().unwrap(), redir_broken_push(41));
+        assert!(table.is_redirect_broken(1041));
+
+        // A registered inbox for the target means it is back / reachable.
+        let (ib, _ib_rx) = inbox(false);
+        table.register_inbox(41, ib);
+        assert!(table.client_exists(41));
+        // Re-enabling tracking clears the flag.
+        table.set_redirect(1041, None);
+        assert!(!table.is_redirect_broken(1041));
+        table.untrack_all(1041);
+        table.unregister_inbox(41);
+        assert!(!table.client_exists(41));
+    }
+
+    /// Without a redirect, delivery goes to the tracker's own channel —
+    /// even when the tracker has a pub/sub inbox (redis sends a RESP2
+    /// connection's OWN invalidations nowhere, never as a pub/sub message).
+    #[test]
+    fn own_invalidations_never_use_the_pubsub_inbox() {
+        let mut table = TrackingTable::new().with_liveness(connected_above_1000);
+        let (tx, rx) = channel::mpsc_unbounded::<Frame>();
+        table.register_client(1051, tx);
+        let (ib, ib_rx) = inbox(false);
+        table.register_inbox(1051, ib);
+        let key = Bytes::from_static(b"own");
+        table.track_key(1051, &key, false);
+        let recipients = table.invalidate_key(&key, 7);
+        deliver_all(
+            &recipients,
+            &mut TrackingMessage::keys(std::slice::from_ref(&key)),
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            invalidation::invalidation_push(&[key])
+        );
+        assert!(ib_rx.try_recv().is_err());
+        table.untrack_all(1051);
+        table.unregister_inbox(1051);
+    }
+
+    /// A BCAST source redirects like a default-mode one.
+    #[test]
+    fn bcast_redirect_reaches_the_target() {
+        let mut table = TrackingTable::new().with_liveness(connected_above_1000);
+        let (src_tx, _src_rx) = channel::mpsc_unbounded::<Frame>();
+        table.register_client(1061, src_tx);
+        table.set_redirect(1061, Some(1062));
+        table.register_prefix(1061, Bytes::from_static(b"p:"), false);
+        // Same prefix twice registers once.
+        table.register_prefix(1061, Bytes::from_static(b"p:"), false);
+        let (ib, ib_rx) = inbox(false);
+        table.register_inbox(1062, ib);
+        let recipients = table.invalidate_key(&Bytes::from_static(b"p:1"), 7);
+        assert_eq!(recipients.len(), 1, "one prefix, one message");
+        deliver_all(
+            &recipients,
+            &mut TrackingMessage::keys(&[Bytes::from_static(b"p:1")]),
+        );
+        assert!(ib_rx.try_recv().is_ok());
+        table.untrack_all(1061);
+    }
+
+    // ── moon#1049: CACHING ──────────────────────────────────────────────
+
+    fn state(optin: bool, optout: bool) -> TrackingState {
+        TrackingState {
+            enabled: true,
+            optin,
+            optout,
+            ..TrackingState::default()
+        }
+    }
+
+    #[test]
+    fn optin_tracks_only_after_caching_yes_and_only_for_the_next_command() {
+        let mut s = state(true, false);
+        s.before_command(b"GET", false);
+        assert!(!s.tracks_reads(), "OPTIN without CACHING yes");
+        s.before_command(b"CLIENT", false);
+        s.caching = true; // CLIENT CACHING yes
+        s.before_command(b"GET", false);
+        assert!(s.tracks_reads(), "the command right after CACHING yes");
+        s.before_command(b"GET", false);
+        assert!(!s.tracks_reads(), "the flag covers ONE command");
+    }
+
+    #[test]
+    fn optout_skips_only_the_command_after_caching_no() {
+        let mut s = state(false, true);
+        s.before_command(b"GET", false);
+        assert!(s.tracks_reads(), "OPTOUT tracks by default");
+        s.before_command(b"client", false);
+        s.caching = true; // CLIENT CACHING no
+        s.before_command(b"GET", false);
+        assert!(!s.tracks_reads());
+        s.before_command(b"GET", false);
+        assert!(s.tracks_reads());
+    }
+
+    /// Redis keeps the flag across any CLIENT command and across an open
+    /// MULTI, and drops it after EXEC.
+    #[test]
+    fn caching_survives_client_commands_and_an_open_transaction() {
+        let mut s = state(true, false);
+        s.before_command(b"CLIENT", false);
+        s.caching = true;
+        s.before_command(b"CLIENT", false); // CLIENT ID
+        s.before_command(b"MULTI", false);
+        assert!(s.caching);
+        s.before_command(b"GET", true); // queued
+        s.before_command(b"GET", true); // queued
+        s.before_command(b"EXEC", true);
+        assert!(s.tracks_reads(), "EXEC runs the body with the flag set");
+        s.before_command(b"GET", false);
+        assert!(!s.tracks_reads(), "cleared after EXEC");
+    }
+
+    /// A CACHING queued inside MULTI takes effect when EXEC runs it, and is
+    /// gone for the command after EXEC.
+    #[test]
+    fn caching_set_during_exec_does_not_leak_past_it() {
+        let mut s = state(true, false);
+        s.before_command(b"MULTI", false);
+        s.before_command(b"CLIENT", true); // queued CACHING yes
+        s.before_command(b"EXEC", true);
+        s.caching = true; // EXEC ran the queued CACHING yes
+        s.before_command(b"GET", false);
+        assert!(!s.tracks_reads());
+    }
+
+    #[test]
+    fn default_and_bcast_modes_ignore_the_flag() {
+        let mut s = state(false, false);
+        s.caching = true;
+        assert!(s.tracks_reads(), "default mode tracks every read");
+        s.bcast = true;
+        assert!(!s.tracks_reads(), "BCAST never tracks reads");
+        let off = TrackingState::default();
+        assert!(!off.tracks_reads());
     }
 }

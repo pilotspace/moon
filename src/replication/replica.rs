@@ -17,8 +17,20 @@ use tokio::net::TcpStream;
 use tracing::{info, warn};
 
 use crate::replication::handshake::ReplicaHandshakeState;
+use crate::replication::master_addr::MasterResolver;
 use crate::replication::state::{ReplicationRole, ReplicationState, save_replication_state};
 use crate::shard::shared_databases::ShardDatabases;
+use std::net::SocketAddr;
+
+/// Upper bound on one resolution of the master host (moon#1034). The lookup
+/// keeps running past it on its helper thread and the next attempt picks up
+/// its answer; this only bounds how long the task waits before backing off.
+const MASTER_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on one TCP connect to one resolved master address, so a
+/// black-holed address cannot hold the task for the OS SYN timeout (~75 s)
+/// before the next address is tried.
+const MASTER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Process-global generation counter for replica tasks (attach-under-write
 /// P0, found while testing R2): `REPLICAOF host port` used to spawn a fresh
@@ -115,7 +127,6 @@ pub struct ReplicaTaskConfig {
 /// Reconnects with exponential backoff on disconnect.
 #[cfg(feature = "runtime-tokio")]
 pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
-    let addr = format!("{}:{}", cfg.master_host, cfg.master_port);
     // R0 streaming replication is single-shard only. A multi-shard replica would
     // misread the master's single diskless RDB bulk and mis-route the command
     // stream (see `apply::load_snapshot`, which is thread-local and clears all
@@ -134,6 +145,10 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
         return;
     }
 
+    // moon#1034: resolve the host as redis does (DNS names allowed), inside
+    // the reconnect loop so a DNS failure that later recovers is picked up.
+    // `format!("{host}:{port}")` could not express an IPv6 literal.
+    let mut resolver = MasterResolver::new(&cfg.master_host, cfg.master_port);
     let mut backoff_ms = 500u64;
     const MAX_BACKOFF_MS: u64 = 30_000;
 
@@ -142,25 +157,43 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
             info!("Replica: task superseded (epoch {}), exiting", cfg.epoch);
             return;
         }
-        info!("Replica: connecting to master at {}", addr);
-        match TcpStream::connect(&addr).await {
-            Ok(stream) => {
-                backoff_ms = 500; // reset backoff on successful connect
-                match run_handshake_and_stream(stream, &cfg).await {
-                    Ok(()) => {
-                        info!("Replica: stream ended cleanly, reconnecting...");
-                    }
-                    Err(e) => {
-                        warn!("Replica: stream error: {}, reconnecting...", e);
-                    }
-                }
-            }
+        info!(
+            "Replica: connecting to master at {}:{}",
+            cfg.master_host, cfg.master_port
+        );
+        match resolver
+            .resolve(tokio::time::sleep(MASTER_RESOLVE_TIMEOUT))
+            .await
+        {
             Err(e) => {
                 warn!(
-                    "Replica: connect to {} failed: {}, retrying in {}ms",
-                    addr, e, backoff_ms
+                    "Replica: cannot resolve master host {:?}: {}, retrying in {}ms",
+                    cfg.master_host, e, backoff_ms
                 );
             }
+            Ok(addrs) => match connect_any(&addrs, cfg.epoch).await {
+                Some(stream) => {
+                    backoff_ms = 500; // reset backoff on successful connect
+                    match run_handshake_and_stream(stream, &cfg).await {
+                        Ok(()) => {
+                            info!("Replica: stream ended cleanly, reconnecting...");
+                        }
+                        Err(e) => {
+                            warn!("Replica: stream error: {}, reconnecting...", e);
+                        }
+                    }
+                }
+                // Superseded mid-attempt (REPLICAOF NO ONE / a new target):
+                // the check below exits without a misleading warning.
+                None if superseded(cfg.epoch) => {}
+                None => {
+                    warn!(
+                        "Replica: no address of master {}:{} accepted a connection {:?}, \
+                         retrying in {}ms",
+                        cfg.master_host, cfg.master_port, addrs, backoff_ms
+                    );
+                }
+            },
         }
 
         // A superseded task must not clobber the successor's handshake state.
@@ -180,6 +213,27 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
     }
+}
+
+/// Connect to the first of `addrs` that accepts, in resolver order, each
+/// attempt bounded by [`MASTER_CONNECT_TIMEOUT`]. `None` when none did, or
+/// when the task was superseded between attempts.
+#[cfg(feature = "runtime-tokio")]
+async fn connect_any(addrs: &[SocketAddr], epoch: u64) -> Option<TcpStream> {
+    for addr in addrs {
+        if superseded(epoch) {
+            return None;
+        }
+        match tokio::time::timeout(MASTER_CONNECT_TIMEOUT, TcpStream::connect(*addr)).await {
+            Ok(Ok(stream)) => return Some(stream),
+            Ok(Err(e)) => warn!("Replica: connect to {} failed: {}", addr, e),
+            Err(_) => warn!(
+                "Replica: connect to {} timed out after {:?}",
+                addr, MASTER_CONNECT_TIMEOUT
+            ),
+        }
+    }
+    None
 }
 
 /// Perform the PSYNC2 handshake with master, then stream and apply replication data.
@@ -468,9 +522,6 @@ async fn stream_commands_read_loop(
 /// monoio::time::sleep for backoff.
 #[cfg(feature = "runtime-monoio")]
 pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
-    let addr: std::net::SocketAddr = format!("{}:{}", cfg.master_host, cfg.master_port)
-        .parse()
-        .expect("invalid master address");
     // R0 streaming replication is single-shard only. A multi-shard replica would
     // misread the master's single diskless RDB bulk and mis-route the command
     // stream (see `apply::load_snapshot`, which is thread-local and clears all
@@ -489,6 +540,12 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
         return;
     }
 
+    // moon#1034: this used to parse "{host}:{port}" as a `SocketAddr` with
+    // `.expect`, so any DNS name (`REPLICAOF localhost 6379`) panicked on the
+    // shard thread and the panic hook aborted the process. Resolve inside the
+    // reconnect loop instead: `getaddrinfo` blocks, so it runs on a helper
+    // thread with a bounded wait (see `master_addr`), never on this thread.
+    let mut resolver = MasterResolver::new(&cfg.master_host, cfg.master_port);
     let mut backoff_ms = 500u64;
     const MAX_BACKOFF_MS: u64 = 30_000;
 
@@ -497,25 +554,42 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
             info!("Replica: task superseded (epoch {}), exiting", cfg.epoch);
             return;
         }
-        info!("Replica: connecting to master at {}", addr);
-        match monoio::net::TcpStream::connect(addr).await {
-            Ok(stream) => {
-                backoff_ms = 500;
-                match run_handshake_and_stream(stream, &cfg).await {
-                    Ok(()) => {
-                        info!("Replica: stream ended cleanly, reconnecting...");
-                    }
-                    Err(e) => {
-                        warn!("Replica: stream error: {}, reconnecting...", e);
-                    }
-                }
-            }
+        info!(
+            "Replica: connecting to master at {}:{}",
+            cfg.master_host, cfg.master_port
+        );
+        match resolver
+            .resolve(monoio::time::sleep(MASTER_RESOLVE_TIMEOUT))
+            .await
+        {
             Err(e) => {
                 warn!(
-                    "Replica: connect to {} failed: {}, retrying in {}ms",
-                    addr, e, backoff_ms
+                    "Replica: cannot resolve master host {:?}: {}, retrying in {}ms",
+                    cfg.master_host, e, backoff_ms
                 );
             }
+            Ok(addrs) => match connect_any(&addrs, cfg.epoch).await {
+                Some(stream) => {
+                    backoff_ms = 500;
+                    match run_handshake_and_stream(stream, &cfg).await {
+                        Ok(()) => {
+                            info!("Replica: stream ended cleanly, reconnecting...");
+                        }
+                        Err(e) => {
+                            warn!("Replica: stream error: {}, reconnecting...", e);
+                        }
+                    }
+                }
+                // Superseded mid-attempt: the check below exits quietly.
+                None if superseded(cfg.epoch) => {}
+                None => {
+                    warn!(
+                        "Replica: no address of master {}:{} accepted a connection {:?}, \
+                         retrying in {}ms",
+                        cfg.master_host, cfg.master_port, addrs, backoff_ms
+                    );
+                }
+            },
         }
 
         // A superseded task must not clobber the successor's handshake state.
@@ -534,6 +608,32 @@ pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
         monoio::time::sleep(Duration::from_millis(backoff_ms)).await;
         backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
     }
+}
+
+/// Connect to the first of `addrs` that accepts, in resolver order, each
+/// attempt bounded by [`MASTER_CONNECT_TIMEOUT`]. `None` when none did, or
+/// when the task was superseded between attempts.
+#[cfg(feature = "runtime-monoio")]
+async fn connect_any(addrs: &[SocketAddr], epoch: u64) -> Option<monoio::net::TcpStream> {
+    for addr in addrs {
+        if superseded(epoch) {
+            return None;
+        }
+        match monoio::time::timeout(
+            MASTER_CONNECT_TIMEOUT,
+            monoio::net::TcpStream::connect(*addr),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => return Some(stream),
+            Ok(Err(e)) => warn!("Replica: connect to {} failed: {}", addr, e),
+            Err(_) => warn!(
+                "Replica: connect to {} timed out after {:?}",
+                addr, MASTER_CONNECT_TIMEOUT
+            ),
+        }
+    }
+    None
 }
 
 /// Perform the PSYNC2 handshake with master under monoio, then stream and apply replication data.
