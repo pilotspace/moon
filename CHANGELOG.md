@@ -199,6 +199,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`scripts/test-consistency.sh`: six rows no longer fail with `CROSSSLOT`
+  at `--shards 4`** (moon#1106). `ZRANGESTORE still-negative stop` and five
+  CLIENT TRACKING destination controls named keys on different shards, so
+  they tested the routing refusal instead of the command. Their keys (and
+  their sibling rows') now share a `{tag}`. The redirect-transcript drain
+  used `read -t 0.3`, which macOS `/bin/bash` 3.2 rejects ("invalid timeout
+  specification"), ending the drain at once; it now uses `-t 1`.
+
 - **A COLD vector segment leaves `unloaded` with the search that reloads it,
   and a delete that lands while the reload is waiting to install is no longer
   lost** (moon#1070). Since the off-loop reload pool (prod-hardening #18) a
