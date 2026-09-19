@@ -115,6 +115,9 @@ pub struct DataFileSyncer {
     completed: Option<DataSyncReport>,
     sync_fn: DataSyncFn,
     helpers_started: u64,
+    /// Calls of [`Self::wait`] that found a batch outstanding and blocked on
+    /// it (instrumentation: the periodic tick must never add to this).
+    blocking_waits: u64,
 }
 
 impl Default for DataFileSyncer {
@@ -136,6 +139,7 @@ impl DataFileSyncer {
             completed: None,
             sync_fn,
             helpers_started: 0,
+            blocking_waits: 0,
         }
     }
 
@@ -155,6 +159,12 @@ impl DataFileSyncer {
     #[inline]
     pub fn helpers_started(&self) -> u64 {
         self.helpers_started
+    }
+
+    /// Calls of [`Self::wait`] that blocked on an outstanding batch.
+    #[inline]
+    pub fn blocking_waits(&self) -> u64 {
+        self.blocking_waits
     }
 
     /// Start fsyncing `jobs` on a helper thread. Never blocks.
@@ -239,6 +249,7 @@ impl DataFileSyncer {
         let Some(flight) = self.in_flight.as_ref() else {
             return true;
         };
+        self.blocking_waits += 1;
         let remaining = budget.saturating_sub(flight.started.elapsed());
         match flight.rx.recv_timeout(remaining) {
             Ok(report) => {

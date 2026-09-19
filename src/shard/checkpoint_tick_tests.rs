@@ -47,6 +47,10 @@ const FINALIZE_DEADLINE: Duration = Duration::from_secs(4);
 
 impl DirtyPageShard {
     fn new() -> Self {
+        Self::with_wal_bounds(WalBounds::DEFAULT)
+    }
+
+    fn with_wal_bounds(bounds: WalBounds) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let shard_dir = tmp.path().join("shard-0");
         let wal_dir = shard_dir.join("wal-v3");
@@ -56,8 +60,7 @@ impl DirtyPageShard {
         let heap_path = data_dir.join("heap-000001.mpf");
         std::fs::write(&heap_path, vec![0u8; 4096]).unwrap();
 
-        let mut wal =
-            WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
+        let mut wal = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, bounds).unwrap();
         let page_lsn = wal.append(WalRecordType::Command, b"page change");
         wal.flush_sync().unwrap();
 
@@ -454,11 +457,11 @@ fn finalize_never_blocks_on_the_data_sync_and_never_runs_two_helpers() {
     assert_eq!(HANGING_SYNC_CALLS.load(Ordering::SeqCst), 1);
 }
 
-/// `force_checkpoint` (BGSAVE, shutdown, WAL ceiling) drives the whole
-/// checkpoint synchronously: it must still complete when the data-file
-/// fsync runs on the off-loop helper — here a slow one, far slower than the
-/// forced checkpoint's whole tick budget, so a loop that only polled would
-/// give up before the fsync reported.
+/// The shutdown checkpoint drives the whole checkpoint synchronously: it
+/// must still complete when the data-file fsync runs on the off-loop helper
+/// — here a slow one, far slower than the forced checkpoint's whole tick
+/// budget, so a loop that only polled would give up before the fsync
+/// reported.
 #[test]
 fn forced_checkpoint_completes_through_the_off_loop_data_sync() {
     let mut shard = DirtyPageShard::new();
@@ -470,6 +473,7 @@ fn forced_checkpoint_completes_through_the_off_loop_data_sync() {
     });
     let redo = shard.wal.current_lsn();
     force_checkpoint(
+        ForcedCheckpoint::Shutdown,
         &mut shard.checkpoint_mgr,
         &shard.page_cache,
         &mut shard.wal,
@@ -532,4 +536,129 @@ fn full_page_image_payload_layout() {
         lz4_flex::decompress_size_prepended(&big[17..]).unwrap(),
         page
     );
+}
+
+/// Calls of [`ceiling_hanging_sync`] and its release flag. Only the WAL
+/// ceiling test uses them.
+static CEILING_SYNC_CALLS: AtomicUsize = AtomicUsize::new(0);
+static CEILING_SYNC_RELEASED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A data-file fsync that hangs like a dead disk until the test releases it
+/// (capped at 60 s so a broken test cannot leak a thread forever).
+fn ceiling_hanging_sync(_file: &std::fs::File) -> std::io::Result<()> {
+    CEILING_SYNC_CALLS.fetch_add(1, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !CEILING_SYNC_RELEASED.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+/// The WAL-ceiling trigger runs on the shard thread WHILE IT SERVES
+/// CLIENTS. On a hung disk it must not wait for the heap data-file fsync:
+/// it leaves the checkpoint to the periodic tick and returns. A second
+/// trigger while that fsync is still outstanding must neither wait nor
+/// start a second helper. And its emergency recycle may only cut below the
+/// redo point actually published, which the pending checkpoint has not
+/// moved.
+///
+/// Asserted logically, not by wall time: the syncer counts every blocking
+/// wait it performs, and the hanging fsync is released only after both
+/// triggers have returned.
+#[test]
+fn the_wal_ceiling_trigger_never_waits_on_the_data_file_fsync() {
+    // Ceiling of one byte: any WAL on disk is over it.
+    let mut shard = DirtyPageShard::with_wal_bounds(WalBounds::new(0, 1));
+    // Leave `begin` to the trigger.
+    shard.checkpoint_mgr = CheckpointManager::new(CheckpointTrigger::new(300, u64::MAX, 0.9));
+    shard.checkpoint_mgr.set_data_sync_fn(ceiling_hanging_sync);
+    let published_before = shard.published_redo_lsn();
+
+    let trigger = |shard: &mut DirtyPageShard| {
+        maybe_force_checkpoint_on_wal_overflow(
+            &mut shard.checkpoint_mgr,
+            &mut shard.wal,
+            &shard.page_cache,
+            &mut shard.manifest,
+            &mut shard.control,
+            &shard.control_path,
+            0,
+            Instant::now() - Duration::from_secs(3600),
+            0,
+            &mut |_| true,
+        )
+    };
+    assert!(
+        trigger(&mut shard),
+        "precondition: the WAL is over its ceiling"
+    );
+    let waits_after_first = shard.checkpoint_mgr.data_sync_blocking_waits();
+    assert!(trigger(&mut shard));
+    let waits_after_second = shard.checkpoint_mgr.data_sync_blocking_waits();
+    let still_outstanding = shard.checkpoint_mgr.data_sync_busy();
+    let helpers = shard.checkpoint_mgr.data_sync_helpers_started();
+    let in_memory_redo = shard.control.last_checkpoint_lsn;
+
+    CEILING_SYNC_RELEASED.store(true, Ordering::Release);
+
+    assert!(
+        waits_after_first == 0 && waits_after_second == 0,
+        "the WAL-ceiling trigger blocked the serving shard thread on the heap data-file \
+         fsync ({waits_after_first} blocking wait(s) after the first trigger, \
+         {waits_after_second} after the second); it must leave the checkpoint to the \
+         periodic tick"
+    );
+    assert!(
+        still_outstanding,
+        "precondition: the fsync was still hung when both triggers returned"
+    );
+    assert_eq!(helpers, 1, "a second trigger started a second fsync helper");
+    assert_eq!(
+        in_memory_redo, published_before,
+        "the pending checkpoint moved the redo point the emergency recycle cuts below"
+    );
+    assert_eq!(shard.published_redo_lsn(), published_before);
+
+    // The periodic tick finishes the checkpoint once the disk answers.
+    shard.tick_until_finalized();
+    assert!(shard.published_redo_lsn() > published_before);
+    assert_eq!(CEILING_SYNC_CALLS.load(Ordering::SeqCst), 1);
+}
+
+/// A Finalize whose control-file write fails has NOT published its redo
+/// point, so the in-memory control copy must keep the old one: the WAL
+/// ceiling's emergency recycle (and every other reader) cuts the WAL below
+/// `control.last_checkpoint_lsn`, and cutting below an unpublished redo
+/// point deletes WAL that recovery still starts from.
+#[test]
+fn a_failed_control_file_write_leaves_the_in_memory_redo_point_unpublished() {
+    let mut shard = DirtyPageShard::new();
+    let before = shard.control.clone();
+    // A directory where the control file goes: the atomic rename onto it
+    // fails, after the fsync of the heap file has succeeded.
+    std::fs::remove_file(&shard.control_path).unwrap();
+    std::fs::create_dir(&shard.control_path).unwrap();
+
+    assert!(!shard.tick_for(Duration::from_millis(300)));
+    assert_eq!(
+        (
+            shard.control.last_checkpoint_lsn,
+            shard.control.last_checkpoint_epoch,
+            shard.control.graph_floor_lsn
+        ),
+        (
+            before.last_checkpoint_lsn,
+            before.last_checkpoint_epoch,
+            before.graph_floor_lsn
+        ),
+        "the control file write failed, yet the in-memory copy claims redo_lsn {} is \
+         published",
+        shard.redo_lsn
+    );
+
+    std::fs::remove_dir(&shard.control_path).unwrap();
+    shard.tick_until_finalized();
+    assert_eq!(shard.published_redo_lsn(), shard.redo_lsn);
+    assert_eq!(shard.control.last_checkpoint_lsn, shard.redo_lsn);
 }

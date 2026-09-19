@@ -1317,13 +1317,36 @@ pub(crate) fn graph_checkpoint_hook(
     }
 }
 
-/// Force a complete checkpoint synchronously (used by BGSAVE and shutdown).
+/// Who forces a checkpoint, which decides whether the shard thread may
+/// block on the off-loop heap data-file fsync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForcedCheckpoint {
+    /// Graceful shutdown: the shard serves no clients any more, so it waits
+    /// for the outstanding fsync, bounded by `WAIT_DURABLE_TIMEOUT` counted
+    /// from the helper's start.
+    Shutdown,
+    /// The P6 WAL-ceiling trigger, on the shard thread WHILE IT SERVES
+    /// CLIENTS: never waits on the fsync. When Finalize reports it pending,
+    /// the checkpoint is left to the periodic tick, which polls it.
+    WalCeiling,
+}
+
+/// Force a checkpoint now, driving the state machine synchronously.
+///
+/// Callers: graceful shutdown (both runtimes' event loops,
+/// [`ForcedCheckpoint::Shutdown`]) and the P6 WAL-ceiling trigger
+/// ([`maybe_force_checkpoint_on_wal_overflow`],
+/// [`ForcedCheckpoint::WalCeiling`]). BGSAVE does not come here: it only
+/// `force_begin`s, and the periodic tick drives that checkpoint.
 ///
 /// Calls `force_begin` to bypass trigger conditions, then drives the
-/// checkpoint state machine to completion in a tight loop. No-op if a
-/// checkpoint is already active.
+/// checkpoint state machine in a tight loop until it completes, or — for
+/// `WalCeiling` — until the heap data-file fsync is pending. No-op if a
+/// checkpoint is already active (so a later trigger never starts a second
+/// fsync helper).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn force_checkpoint(
+    mode: ForcedCheckpoint,
     checkpoint_mgr: &mut CheckpointManager,
     page_cache: &PageCache,
     wal: &mut WalWriterV3,
@@ -1381,22 +1404,38 @@ pub(crate) fn force_checkpoint(
             return;
         }
         // The heap data-file fsync runs off the shard thread and the periodic
-        // tick only polls it. This path is synchronous by contract (BGSAVE,
-        // shutdown, the WAL ceiling), so it waits for the one outstanding
-        // batch — bounded by WAIT_DURABLE_TIMEOUT measured from the batch's
-        // START: a hung disk stalls this shard for that budget once in total,
-        // not once per forced checkpoint, and never starts a second helper.
-        if checkpoint_mgr.data_sync_busy()
-            && !checkpoint_mgr
-                .wait_data_sync(crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT)
-        {
-            tracing::error!(
-                "Shard {}: forced checkpoint: heap data-file fsync still outstanding after \
-                 {:?}; giving up (the periodic tick path finishes it)",
-                shard_id,
-                crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT
-            );
-            return;
+        // tick only polls it; Finalize just reported it pending.
+        if checkpoint_mgr.data_sync_busy() {
+            match mode {
+                // Serving clients: never block on the fsync. The periodic
+                // tick polls it and finishes this checkpoint; until then the
+                // published redo point does not move.
+                ForcedCheckpoint::WalCeiling => {
+                    info!(
+                        "Shard {}: WAL-ceiling checkpoint: heap data-file fsync pending; \
+                         the periodic tick finishes the checkpoint",
+                        shard_id
+                    );
+                    return;
+                }
+                // No clients any more: wait for the one outstanding batch,
+                // bounded by WAIT_DURABLE_TIMEOUT counted from the batch's
+                // START, so a hung disk delays shutdown by that budget once.
+                ForcedCheckpoint::Shutdown => {
+                    if !checkpoint_mgr
+                        .wait_data_sync(crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT)
+                    {
+                        tracing::error!(
+                            "Shard {}: shutdown checkpoint: heap data-file fsync still \
+                             outstanding after {:?}; giving up (the redo point stays where \
+                             it is and recovery replays the WAL from there)",
+                            shard_id,
+                            crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT
+                        );
+                        return;
+                    }
+                }
+            }
         }
     }
     info!("Shard {}: forced checkpoint complete", shard_id);
@@ -1518,11 +1557,14 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
         wal.max_wal_bytes()
     );
 
-    // Force a synchronous checkpoint (drives the state machine to completion).
-    // If checkpoint is already active, force_checkpoint is a no-op — the
-    // in-progress checkpoint will advance next tick and the recycle will run
-    // in handle_checkpoint_tick's Finalize arm.
+    // Force a checkpoint (drives the state machine until it completes or its
+    // heap data-file fsync is pending — this runs while the shard serves
+    // clients, so it never waits on that fsync). If a checkpoint is already
+    // active, force_checkpoint is a no-op — the in-progress checkpoint will
+    // advance next tick and the recycle will run in handle_checkpoint_tick's
+    // Finalize arm.
     force_checkpoint(
+        ForcedCheckpoint::WalCeiling,
         checkpoint_mgr,
         page_cache,
         wal,
@@ -1538,9 +1580,13 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
     // Aggressive recycle — bypass min_wal_bytes floor.
     // Use control.last_checkpoint_lsn (the LSN of the last *completed*
     // checkpoint) rather than wal.current_lsn()-1. If force_checkpoint above
-    // was a no-op (checkpoint already active) or failed silently, using the
-    // current WAL head would be unsafe — we would recycle segments whose dirty
-    // pages have not been flushed to data files yet.
+    // was a no-op (checkpoint already active), left its checkpoint pending on
+    // the data-file fsync, or failed silently, using the current WAL head
+    // would be unsafe — we would recycle segments whose dirty pages have not
+    // been made durable in their data files yet. The in-memory `control` is
+    // the PUBLISHED redo point: Finalize only advances it together with a
+    // successful control-file write (it restores the old values if that
+    // write fails).
     //
     // Kernel M3 K2 review round 2 / P1-1: same min-across-planes floor as
     // every other recycle call site (Finalize, Pass C, VACUUM) — KV alone
@@ -1923,10 +1969,23 @@ pub(crate) fn handle_checkpoint_tick(
             // graph engine's own replay-skip authority; `graph_floor_lsn`
             // here is a recycle-decision mirror of that SAME value, so the
             // two can never disagree.
+            //    The in-memory copy is what the WAL recyclers cut below (step 6
+            //    and the P6 ceiling's emergency recycle), so it must only ever
+            //    hold a PUBLISHED redo point: if the write fails, restore it.
+            let published = (
+                control.last_checkpoint_lsn,
+                control.last_checkpoint_epoch,
+                control.graph_floor_lsn,
+            );
             control.last_checkpoint_lsn = redo_lsn;
             control.last_checkpoint_epoch = manifest.epoch();
             control.graph_floor_lsn = graph_floor_lsn;
             if let Err(e) = control.write(control_path) {
+                (
+                    control.last_checkpoint_lsn,
+                    control.last_checkpoint_epoch,
+                    control.graph_floor_lsn,
+                ) = published;
                 tracing::error!("Checkpoint control file update failed: {}", e);
                 checkpoint_mgr.note_finalize_failed(std::time::Instant::now());
                 return false;

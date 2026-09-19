@@ -297,6 +297,19 @@ impl CheckpointManager {
         self.data_sync.is_busy()
     }
 
+    /// Data-file fsync helper threads started over this manager's lifetime.
+    #[inline]
+    pub fn data_sync_helpers_started(&self) -> u64 {
+        self.data_sync.helpers_started()
+    }
+
+    /// Times the shard thread BLOCKED on an outstanding data-file fsync
+    /// batch ([`Self::wait_data_sync`]); only a shutdown checkpoint may.
+    #[inline]
+    pub fn data_sync_blocking_waits(&self) -> u64 {
+        self.data_sync.blocking_waits()
+    }
+
     /// BLOCK for the outstanding data-file fsync batch, for at most what is
     /// left of `budget` measured from the batch's start. Only for the forced
     /// (synchronous) checkpoint. `false` = still outstanding.

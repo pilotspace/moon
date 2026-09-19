@@ -209,13 +209,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     checkpoint record. The fsync runs on a helper thread and the shard thread
     never waits for it: each tick polls the helper without blocking, and a
     shard has at most one helper outstanding, so a hung disk leaves one stuck
-    thread rather than one per retry. The forced checkpoint (BGSAVE, shutdown,
-    WAL ceiling), which is synchronous by design, waits for that one helper
-    for at most `WAIT_DURABLE_TIMEOUT` counted from the helper's start. If a
-    file cannot be opened, Finalize retries with backoff. If an fsync returns
-    an error, the shard never publishes a redo point again, because a retried
-    fsync can report success for pages the kernel already dropped. The WAL
-    above the last good redo point is kept, and recovery replays from there.
+    thread rather than one per retry. Only the shutdown checkpoint, which
+    serves no clients any more, waits for that one helper, for at most
+    `WAIT_DURABLE_TIMEOUT` counted from the helper's start. The WAL-ceiling
+    checkpoint runs while the shard serves clients, so it never waits: it
+    leaves a pending fsync to the periodic tick, and its emergency recycle
+    cuts only below the redo point already published. A failed control-file
+    write no longer leaves the unpublished redo point in memory, where that
+    recycle would have cut below it. If a file cannot be opened, Finalize
+    retries with backoff. If an fsync returns an error, the shard never
+    publishes a redo point again, because a retried fsync can report success
+    for pages the kernel already dropped. The WAL above the last good redo
+    point is kept, and recovery replays from there.
   - A heap file that no longer exists does not hold the redo point back. The
     cold-tier GC unlinks a file once its last live key is gone, and only then;
     nothing references it and no fsync can reach the unlinked inode. So the
