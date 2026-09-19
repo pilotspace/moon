@@ -604,6 +604,17 @@ pub(super) fn try_handle_config(
     true
 }
 
+/// Answer every client parked on this node `-UNBLOCKED` as it becomes a
+/// replica (redis's `disconnectAllBlockedClients`); each connection closes
+/// once the error is written. A replica runs on one shard (moon#1015 refuses
+/// `REPLICAOF` on more), so this shard's registry holds every one of them.
+fn release_clients_blocked_as_master(ctx: &ConnectionContext) {
+    let _ = ctx
+        .blocking_registry
+        .borrow_mut()
+        .unblock_all(crate::blocking::UNBLOCKED_ROLE_CHANGE);
+}
+
 /// Handle REPLICAOF / SLAVEOF. Returns `true` if consumed.
 #[inline]
 pub(super) fn try_handle_replicaof(
@@ -655,6 +666,7 @@ pub(super) fn try_handle_replicaof(
                         blocking_registry: Some(ctx.blocking_registry.clone()),
                         shard_databases: ctx.shard_databases.clone(),
                     };
+                    release_clients_blocked_as_master(ctx);
                     monoio::spawn(crate::replication::replica::run_replica_task(cfg));
                 }
                 ReplicaofAction::PromoteToMaster => {
@@ -1918,6 +1930,10 @@ pub(super) enum BlockingResult {
     /// c10k A1: the client vanished while blocked. Its registrations are gone;
     /// the caller must close the connection WITHOUT writing a reply.
     PeerGone,
+    /// The node became a replica while this client was blocked: the
+    /// `-UNBLOCKED` reply is encoded, and the caller must close the
+    /// connection once it is written, without running the batch's tail.
+    HandledThenClose,
 }
 
 /// Handle blocking commands (BLPOP, BRPOP, BLMOVE, etc.).
@@ -2088,6 +2104,9 @@ pub(super) async fn try_handle_blocking<
     // Encode blocking response directly
     codec.encode_frame(&blocking_response, write_buf);
     responses.clear();
+    if crate::blocking::is_role_change_unblock(&blocking_response) {
+        return BlockingResult::HandledThenClose;
+    }
     BlockingResult::Handled
 }
 

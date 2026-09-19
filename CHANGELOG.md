@@ -212,6 +212,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SWAPDB`). Blocking pops and `XREADGROUP` stay refused with `-READONLY` on
   a replica, in both servers.
 
+- **Becoming a replica releases every blocked client.** A client parked
+  on a node that then ran `REPLICAOF host port` stayed parked. Before the
+  fix above, nothing woke it until its timeout. After it, the first
+  replicated push served it: a `BLPOP` took the element out of the
+  replica's copy only. Every parked client is now answered `-UNBLOCKED force unblock from
+  blocking operation, instance state changed (master -> replica?)` and its
+  connection closed, dropping anything pipelined behind the blocking
+  command. That is redis's `disconnectAllBlockedClients` (text and close
+  checked against redis-server 8.6.1, for `BLPOP`, `XREADGROUP` and `XREAD`).
+
 - **Waiters a refused AOF record left parked are served once the writer has
   room** (moon#1111). When the AOF writer could not take a served pop's
   record within the backpressure bound, the wake stopped (every further serve

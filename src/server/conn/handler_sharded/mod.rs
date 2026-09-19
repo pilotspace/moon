@@ -1772,8 +1772,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                             blocking_response,
                             conn.protocol_version,
                         );
+                        let close_after = crate::blocking::is_role_change_unblock(&blocking_response);
                         responses = Vec::with_capacity(1);
                         responses.push(blocking_response);
+                        // The node became a replica: write the `-UNBLOCKED`
+                        // reply and close, dropping anything pipelined behind
+                        // it, as redis does.
+                        if close_after {
+                            should_quit = true;
+                            break;
+                        }
                         // A1: anything left in read_buf is either this batch's
                         // unparsed tail or bytes the peer watch carried; parse
                         // before awaiting the next read either way.

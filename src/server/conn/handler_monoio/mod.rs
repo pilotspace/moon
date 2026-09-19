@@ -2739,6 +2739,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // c10k A1: peer vanished mid-block. Nothing to write; the
                 // registry entry and maxclients slot are released by returning.
                 dispatch::BlockingResult::PeerGone => return (MonoioHandlerResult::Done, None),
+                // The node became a replica: write the `-UNBLOCKED` reply and
+                // close, dropping anything pipelined behind it, as redis does.
+                dispatch::BlockingResult::HandledThenClose => {
+                    should_quit = true;
+                    break;
+                }
             }
 
             // --- MULTI queue mode: queue commands when in transaction ---

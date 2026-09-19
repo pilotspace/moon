@@ -189,3 +189,153 @@ fn a_replicated_write_wakes_a_reader_parked_on_the_replica() {
         );
     }
 }
+
+/// Everything a raw connection receives until the server closes it, or until
+/// `limit` passes with the connection still open (then `closed` is false).
+fn read_to_close(mut s: std::net::TcpStream, limit: Duration) -> (String, bool, Duration) {
+    use std::io::Read;
+    let start = Instant::now();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 512];
+    s.set_read_timeout(Some(Duration::from_millis(50)))
+        .expect("set_read_timeout");
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => return (String::from_utf8_lossy(&got).into(), true, start.elapsed()),
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if start.elapsed() > limit {
+                    return (String::from_utf8_lossy(&got).into(), false, start.elapsed());
+                }
+            }
+            Err(_) => return (String::from_utf8_lossy(&got).into(), true, start.elapsed()),
+        }
+    }
+}
+
+/// A client blocked on a node when it becomes a replica is answered
+/// `-UNBLOCKED` and disconnected, as redis's `disconnectAllBlockedClients`
+/// does. Left parked, a blocking pop would be served by the first replicated
+/// push and take the element out of the replica's copy only. redis-server
+/// 8.6.1, three clients parked on a master that is then pointed at another:
+///
+/// ```text
+/// BLPOP l 0 (+ a pipelined PING)       -> -UNBLOCKED force unblock from blocking
+/// XREADGROUP GROUP g c BLOCK 0 ... >   ->   operation, instance state changed
+/// XREAD BLOCK 0 STREAMS s $            ->   (master -> replica?)   then EOF
+/// ```
+///
+/// The pipelined `PING` is never answered: the connection closes after the
+/// error.
+#[test]
+#[ignore = "replication: monoio master, run with --include-ignored"]
+fn becoming_a_replica_unblocks_every_parked_client() {
+    use std::io::Write;
+    const UNBLOCKED: &str = "-UNBLOCKED force unblock from blocking operation, instance state \
+                             changed (master -> replica?)\r\n";
+    let mdir = unique_test_dir("replica_unblock_master");
+    let ndir = unique_test_dir("replica_unblock_node");
+    let (_m, mport) = spawn_listening_guarded(|p| spawn(p, &mdir, 1));
+    let (_n, nport) = spawn_listening_guarded(|p| spawn(p, &ndir, 1));
+    let mut n = Conn::open(nport);
+    assert!(
+        n.send(&["XGROUP", "CREATE", "{t1096}u", "g", "$", "MKSTREAM"])
+            .starts_with("+OK")
+    );
+    let parked: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "BLPOP + PING",
+            [
+                common::encode(&["BLPOP", "{t1096}l", "0"]),
+                common::encode(&["PING"]),
+            ]
+            .concat(),
+        ),
+        (
+            "XREADGROUP",
+            common::encode(&[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "BLOCK",
+                "0",
+                "STREAMS",
+                "{t1096}u",
+                ">",
+            ]),
+        ),
+        (
+            "XREAD",
+            common::encode(&["XREAD", "BLOCK", "0", "STREAMS", "{t1096}u", "$"]),
+        ),
+    ];
+    let readers: Vec<_> = parked
+        .into_iter()
+        .map(|(label, bytes)| {
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", nport)).expect("connect");
+            s.write_all(&bytes).expect("write");
+            (label, s)
+        })
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while blocked_clients(nport) < 3 {
+        assert!(Instant::now() < deadline, "the three clients never parked");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        n.send(&["REPLICAOF", "127.0.0.1", &mport.to_string()])
+            .starts_with("+OK")
+    );
+    let waiters: Vec<_> = readers
+        .into_iter()
+        .map(|(label, s)| {
+            std::thread::spawn(move || (label, read_to_close(s, Duration::from_secs(3))))
+        })
+        .collect();
+    // What a parked pop would do if left alone: take the master's push.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !n
+        .send(&["INFO", "replication"])
+        .contains("master_link_status:up")
+    {
+        assert!(Instant::now() < deadline, "replica link never came up");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut m = Conn::open(mport);
+    assert_eq!(m.send(&["RPUSH", "{t1096}l", "a", "b"]), ":2\r\n");
+    let mut failures = Vec::new();
+    for w in waiters {
+        let (label, (got, closed, after)) = w.join().expect("reader thread");
+        if got != UNBLOCKED || !closed || after > Duration::from_millis(1500) {
+            failures.push(format!(
+                "{label}: got {got:?} closed={closed} after {after:.0?}; redis answers \
+                 {UNBLOCKED:?} and closes at REPLICAOF"
+            ));
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut llen = n.send(&["LLEN", "{t1096}l"]);
+    while llen == ":0\r\n" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        llen = n.send(&["LLEN", "{t1096}l"]);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let llen = n.send(&["LLEN", "{t1096}l"]);
+    if llen != ":2\r\n" {
+        failures.push(format!(
+            "the replica holds LLEN {llen:?} of the master's 2: a client parked before \
+             REPLICAOF popped the replicated push"
+        ));
+    }
+    assert!(
+        failures.is_empty(),
+        "a node that becomes a replica must release its blocked clients:\n  {}",
+        failures.join("\n  ")
+    );
+}
