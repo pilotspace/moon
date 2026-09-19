@@ -248,6 +248,60 @@ fn watch_conflict(db_index: usize, watched: &HashMap<Bytes, WatchToken>) -> bool
     })
 }
 
+/// The database write guards `execute_transaction` holds for a whole body.
+///
+/// Normally just the db selected at EXEC time. A body holding a `MOVE` or a
+/// `COPY ... DB n` also writes a second db whose index is known only from the
+/// command, so for those bodies every db is taken up front, in ascending
+/// order — the same order `with_two_dbs_locked` uses — and held to the end of
+/// the body. Taking the destination lazily while holding the source would
+/// invert that order whenever the destination is the lower index, and could
+/// deadlock against a concurrent MOVE going the other way.
+#[cfg(feature = "runtime-tokio")]
+enum TxnLocks<'a> {
+    One(parking_lot::RwLockWriteGuard<'a, Database>),
+    All(Vec<parking_lot::RwLockWriteGuard<'a, Database>>),
+}
+
+#[cfg(feature = "runtime-tokio")]
+impl<'a> TxnLocks<'a> {
+    fn acquire(db: &'a SharedDatabases, entry_db: usize, command_queue: &[Frame]) -> Self {
+        let needs_two_dbs = command_queue.iter().any(|f| {
+            extract_command(f).is_some_and(|(cmd, args)| {
+                cmd.eq_ignore_ascii_case(b"MOVE")
+                    || (cmd.eq_ignore_ascii_case(b"COPY") && copy_has_db_clause(args))
+            })
+        });
+        if needs_two_dbs {
+            TxnLocks::All(db.iter().map(|lock| lock.write()).collect())
+        } else {
+            TxnLocks::One(db[entry_db].write())
+        }
+    }
+
+    fn primary(&mut self, entry_db: usize) -> &mut Database {
+        match self {
+            TxnLocks::One(guard) => guard,
+            TxnLocks::All(guards) => &mut guards[entry_db],
+        }
+    }
+
+    /// `(src, dst)` for two distinct held dbs, or `None` when only one is held.
+    fn pair(&mut self, src: usize, dst: usize) -> Option<(&mut Database, &mut Database)> {
+        let TxnLocks::All(guards) = self else {
+            return None;
+        };
+        let (low_idx, high_idx) = (src.min(dst), src.max(dst));
+        if low_idx == high_idx || high_idx >= guards.len() {
+            return None;
+        }
+        let (below, from_high) = guards.split_at_mut(high_idx);
+        let low: &mut Database = &mut below[low_idx];
+        let high: &mut Database = &mut from_high[0];
+        Some(if src < dst { (low, high) } else { (high, low) })
+    }
+}
+
 /// Execute a queued transaction atomically under a single database lock.
 ///
 /// Checks WATCH versions first -- if any watched key's version has changed since
@@ -263,13 +317,17 @@ pub(crate) fn execute_transaction(
     selected_db: &mut usize,
     exec_publishes: &mut Vec<ExecPublish>,
 ) -> (Frame, Vec<Bytes>) {
-    let mut guard = db[*selected_db].write();
     let db_count = db.len();
-    guard.refresh_now();
+    // Every body command runs against the db selected at EXEC time (the
+    // caller attributes every record to it), so that db is also the source
+    // of a queued MOVE / COPY ... DB n.
+    let entry_db = *selected_db;
+    let mut locks = TxnLocks::acquire(db, entry_db, command_queue);
+    locks.primary(entry_db).refresh_now();
 
     // Check WATCH versions -- if any key's version changed, abort
     for (key, watched_version) in watched_keys {
-        let current_version = guard.get_version(key);
+        let current_version = locks.primary(entry_db).get_version(key);
         if current_version != watched_version.version {
             // Null ARRAY, not null bulk: Redis answers an aborted EXEC with
             // `*-1`, and every client library decodes EXEC as an array — so
@@ -320,7 +378,9 @@ pub(crate) fn execute_transaction(
         // for a queued BLPOP.
         if crate::server::conn::blocking_txn::queues_unrewritten(cmd) {
             if let Some(outcome) = crate::server::conn::blocking_txn::try_exec_blocking_in_txn(
-                cmd, cmd_args, &mut guard,
+                cmd,
+                cmd_args,
+                locks.primary(entry_db),
             ) {
                 if let Some(effect) = outcome.effect {
                     let mut buf = BytesMut::new();
@@ -340,7 +400,46 @@ pub(crate) fn execute_transaction(
         // the caller attributes every entry to that one db.
         let is_write = metadata::is_persisted_write(cmd);
 
-        let result = dispatch(&mut *guard, cmd, cmd_args, selected_db, db_count);
+        // moon#1062: MOVE / COPY ... DB n need the destination db too — the
+        // single-db `dispatch()` below errored on MOVE and wrote a COPY into
+        // the source db. `TxnLocks::acquire` already holds every database for
+        // a body that contains one. Record verbatim on `:1` only, as the live
+        // intercepts do; the caller files it under `entry_db`, the source.
+        if let Some(two_db) =
+            crate::command::keyspace::move_cmd::resolve_two_db(cmd, cmd_args, entry_db, db_count)
+        {
+            let response = match two_db {
+                Err(reply) => reply,
+                Ok(op) => match locks.pair(entry_db, op.dst_db()) {
+                    Some((src, dst)) => {
+                        dst.refresh_now();
+                        op.apply(src, dst)
+                    }
+                    // Unreachable: `acquire` takes every db whenever the body
+                    // holds a MOVE or a COPY with a DB clause, which is the
+                    // only way `resolve_two_db` yields `Ok`. Refuse rather
+                    // than write the wrong db.
+                    None => Frame::Error(Bytes::from_static(
+                        b"ERR MOVE/COPY could not lock its destination database",
+                    )),
+                },
+            };
+            if matches!(response, Frame::Integer(1)) {
+                aof_entries.push(crate::persistence::aof::serialize_command_for_log(
+                    cmd_frame,
+                ));
+            }
+            results.push(response);
+            continue;
+        }
+
+        let result = dispatch(
+            locks.primary(entry_db),
+            cmd,
+            cmd_args,
+            selected_db,
+            db_count,
+        );
         let response = match result {
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f, // QUIT inside MULTI just returns OK
@@ -596,6 +695,43 @@ pub(crate) fn execute_transaction_sharded(
             results.push(super::util::apply_resp3_conversion(
                 cmd, cmd_args, response, proto,
             ));
+            continue;
+        }
+
+        // moon#1062: `MOVE` and `COPY ... DB n` need two databases, which the
+        // single-db `dispatch()` below cannot give them — MOVE answered its
+        // "requires handler-level dispatch" error, and COPY ignored the DB
+        // clause and wrote the copy into the SOURCE db while its record (which
+        // replicas and replay apply into the named db) was logged verbatim.
+        // Run them here instead, with the same helpers every live path uses.
+        //
+        // `selected` is the source: a SELECT queued earlier in the body has
+        // already redirected it, exactly as for every other command here. The
+        // record is the command verbatim, under that db, and only on `:1` —
+        // the live intercepts' rule, so a no-op leaves no record.
+        if let Some(two_db) =
+            crate::command::keyspace::move_cmd::resolve_two_db(cmd, cmd_args, selected, db_count)
+        {
+            let response = match two_db {
+                Err(reply) => reply,
+                // `resolve_two_db` never yields `dst_db == selected`, so
+                // `with_pair`'s distinct-index precondition holds; both
+                // indexes were bounds-checked against `db_count`.
+                Ok(op) => crate::shard::slice::with_shard(|s| {
+                    s.databases.with_pair(selected, op.dst_db(), |src, dst| {
+                        src.refresh_now_from_cache(cached_clock);
+                        dst.refresh_now_from_cache(cached_clock);
+                        op.apply(src, dst)
+                    })
+                }),
+            };
+            if matches!(response, Frame::Integer(1)) {
+                aof_entries.push((
+                    selected,
+                    crate::persistence::aof::serialize_command_for_log(cmd_frame),
+                ));
+            }
+            results.push(response);
             continue;
         }
 
@@ -2525,7 +2661,9 @@ pub(crate) fn cross_shard_multikey_rejection(
     args: &[Frame],
     num_shards: usize,
 ) -> Option<Frame> {
-    if num_shards <= 1 || !touches_a_key_it_did_not_route_on(cmd) {
+    if num_shards <= 1
+        || !(touches_a_key_it_did_not_route_on(cmd) || is_copy_with_db_clause(cmd, args))
+    {
         return None;
     }
     // The shared key-position walker (moon#582) — the same one ACL and cache
@@ -2604,15 +2742,43 @@ pub(crate) fn is_multi_key_command(cmd: &[u8], args: &[Frame]) -> bool {
         // owned by the handlers' two-db interception (cross-db + cross-shard
         // simultaneously is unsupported, as before).
         (4, b'c') => {
-            args.len() >= 2
-                && cmd.eq_ignore_ascii_case(b"COPY")
-                && !args
-                    .iter()
-                    .skip(2)
-                    .any(|a| matches!(a, Frame::BulkString(o) if o.eq_ignore_ascii_case(b"DB")))
+            args.len() >= 2 && cmd.eq_ignore_ascii_case(b"COPY") && !copy_has_db_clause(args)
         }
         _ => false,
     }
+}
+
+/// moon#1062: `COPY src dst DB n [REPLACE]` joins the two-key write family.
+///
+/// Without the DB clause, `COPY` is coordinator-routed and correct across
+/// shards (`is_multi_key_command`). WITH it, the command is excluded from the
+/// coordinator (which cannot pick a second database) and routed by `src`
+/// alone, so the owner of `src` ran the two-db intercept against ITS slice and
+/// wrote `dst` there. Measured at `--shards 4` with 12 constructed split
+/// placements: every `COPY src dst DB 3` and `COPY src dst DB 0` acked `:1`
+/// and the destination was unreadable by a normally routed `GET` (while
+/// `DBSIZE`, which sums the shards, counted it). The AOF logged it on the
+/// wrong shard too, so a restart kept it misplaced.
+///
+/// Refused like the rest of the family, from the key names alone before
+/// anything is touched. Kept out of `touches_a_key_it_did_not_route_on`
+/// because that list is keyed on the command name alone and a DB-less COPY
+/// must keep fanning out.
+fn is_copy_with_db_clause(cmd: &[u8], args: &[Frame]) -> bool {
+    cmd.len() == 4 && cmd.eq_ignore_ascii_case(b"COPY") && copy_has_db_clause(args)
+}
+
+/// True when a `COPY src dst ...` argv carries a `DB` clause.
+///
+/// One predicate for every consumer that must agree on it: the multi-key
+/// router (a COPY with a DB clause is not coordinator-routed), the cross-shard
+/// refusal (moon#1062: the same command is refused when its keys span shards)
+/// and the embedded transaction executor's lock plan. Only the option tokens
+/// after the two key names are inspected, so a key named `DB` is not a clause.
+pub(crate) fn copy_has_db_clause(args: &[Frame]) -> bool {
+    args.iter()
+        .skip(2)
+        .any(|a| matches!(a, Frame::BulkString(o) if o.eq_ignore_ascii_case(b"DB")))
 }
 
 /// moon#570: the refusal a non-blocking list MOVE is owed when its two keys
@@ -6063,5 +6229,133 @@ mod queued_publish_channel_tests {
         assert!(queued_publish_channel_deny(&t, "c", b"SET", &argv(&["secret", "x"])).is_none());
         // Malformed: the queue gate's arity check owns this reply.
         assert!(queued_publish_channel_deny(&t, "c", b"PUBLISH", &[]).is_none());
+    }
+}
+
+/// moon#1062 on the embedded (`handler_single`) executor: `MOVE` and
+/// `COPY ... DB n` queued inside MULTI must reach their destination db, and
+/// only a write that changed the keyspace may leave a record. The sharded
+/// executor is covered end to end by `tests/multi_move_copy_db_1062.rs`; this
+/// one is reachable only through the library entry point, so it is driven
+/// directly.
+#[cfg(all(test, feature = "runtime-tokio"))]
+mod embedded_txn_two_db_tests {
+    use super::*;
+
+    fn cmd(parts: &[&str]) -> Frame {
+        let items: Vec<Frame> = parts
+            .iter()
+            .map(|p| Frame::BulkString(Bytes::from(p.to_string())))
+            .collect();
+        Frame::Array(items.into())
+    }
+
+    fn set(db: &mut Database, key: &str, val: &str) {
+        db.set(
+            key.as_bytes(),
+            crate::storage::entry::Entry::new_string(Bytes::from(val.to_owned())),
+        );
+    }
+
+    fn value(dbs: &SharedDatabases, idx: usize, key: &str) -> Option<Vec<u8>> {
+        let mut db = dbs[idx].write();
+        let mut selected = idx;
+        let out = dispatch(
+            &mut db,
+            b"GET",
+            &[Frame::BulkString(Bytes::from(key.to_owned()))],
+            &mut selected,
+            16,
+        );
+        match out {
+            DispatchResult::Response(Frame::BulkString(b)) => Some(b.to_vec()),
+            _ => None,
+        }
+    }
+
+    fn err(text: &'static str) -> Frame {
+        Frame::Error(Bytes::from_static(text.as_bytes()))
+    }
+
+    #[test]
+    fn move_and_copy_db_inside_multi_write_the_named_db() {
+        let dbs: SharedDatabases = Arc::new(
+            (0..16)
+                .map(|_| parking_lot::RwLock::new(Database::new()))
+                .collect(),
+        );
+        {
+            let mut src = dbs[5].write();
+            set(&mut src, "m", "mv");
+            set(&mut src, "c", "cv");
+            set(&mut src, "coll", "src");
+        }
+        set(&mut dbs[1].write(), "coll", "dst");
+
+        // EXEC from db 5; destinations both below (1, 0) and above (9) it, so
+        // the pair is borrowed in both orders.
+        let queue = vec![
+            cmd(&["MOVE", "m", "1"]),
+            cmd(&["COPY", "c", "c2", "DB", "0"]),
+            cmd(&["COPY", "c", "c3", "db", "9", "REPLACE"]),
+            cmd(&["MOVE", "coll", "1"]),
+            cmd(&["MOVE", "c", "5"]),
+            cmd(&["COPY", "c", "c4", "DB", "16"]),
+            cmd(&["COPY", "c", "c5", "DB", "5"]),
+            cmd(&["GET", "c"]),
+        ];
+        let mut selected = 5usize;
+        let mut publishes = Vec::new();
+        let (reply, aof) =
+            execute_transaction(&dbs, &queue, &HashMap::new(), &mut selected, &mut publishes);
+
+        let Frame::Array(items) = reply else {
+            panic!("EXEC must answer an array, got {reply:?}");
+        };
+        assert_eq!(
+            items.to_vec(),
+            vec![
+                Frame::Integer(1),
+                Frame::Integer(1),
+                Frame::Integer(1),
+                Frame::Integer(0),
+                err("ERR source and destination objects are the same"),
+                err("ERR DB index is out of range"),
+                // A DB clause naming the source db is a plain same-db copy.
+                Frame::Integer(1),
+                Frame::BulkString(Bytes::from_static(b"cv")),
+            ]
+        );
+
+        assert_eq!(
+            value(&dbs, 5, "m"),
+            None,
+            "MOVE must take the key out of db 5"
+        );
+        assert_eq!(value(&dbs, 1, "m").as_deref(), Some(&b"mv"[..]));
+        assert_eq!(value(&dbs, 0, "c2").as_deref(), Some(&b"cv"[..]));
+        assert_eq!(value(&dbs, 9, "c3").as_deref(), Some(&b"cv"[..]));
+        assert_eq!(value(&dbs, 5, "c5").as_deref(), Some(&b"cv"[..]));
+        assert_eq!(
+            value(&dbs, 5, "c2"),
+            None,
+            "COPY ... DB 0 must not write db 5"
+        );
+        assert_eq!(
+            value(&dbs, 5, "c3"),
+            None,
+            "COPY ... DB 9 must not write db 5"
+        );
+        assert_eq!(value(&dbs, 5, "coll").as_deref(), Some(&b"src"[..]));
+        assert_eq!(value(&dbs, 1, "coll").as_deref(), Some(&b"dst"[..]));
+
+        // One record per write that changed the keyspace, verbatim, in body
+        // order: the three two-db commands that answered :1 and the same-db
+        // COPY. The no-op MOVE and the two errors leave none.
+        let want: Vec<Bytes> = [0usize, 1, 2, 6]
+            .iter()
+            .map(|&i| crate::persistence::aof::serialize_command_for_log(&queue[i]))
+            .collect();
+        assert_eq!(aof, want);
     }
 }
