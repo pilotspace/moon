@@ -3625,39 +3625,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                     };
 
-                    // D-2: keyless FLUSHDB/FLUSHALL routed local-only cleared just
-                    // this shard — broadcast to every other shard (outside the
-                    // with_shard closure: this awaits). Any failed leg turns the
-                    // reply into an explicit partial-flush error, never silent +OK.
-                    if !matches!(response, Frame::Error(_))
+                    // D-2: a keyless FLUSHDB/FLUSHALL cleared only this shard;
+                    // the broadcast to the others runs below, AFTER this
+                    // shard's own record is logged (moon#1084).
+                    let local_flush = !matches!(response, Frame::Error(_))
                         && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
-                            || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
-                    {
-                        if ctx.num_shards > 1 {
-                            if let Err(e) = crate::shard::coordinator::coordinate_flush_broadcast(
-                                &frame,
-                                ctx.shard_id,
-                                // Typed on this connection: the shard that ran
-                                // it is this one.
-                                ctx.shard_id,
-                                ctx.num_shards,
-                                conn.selected_db,
-                                &ctx.dispatch_tx,
-                                &ctx.spsc_notifiers,
-                            )
-                            .await
-                            {
-                                response = e;
-                            }
-                        }
-                        // CLIENT TRACKING: a flush drops every cached key —
-                        // push the RESP3 flush invalidation (invalidate + Null)
-                        // to all tracking clients. Process-global table: one
-                        // hook at the originating connection covers all shards.
-                        if !matches!(response, Frame::Error(_)) {
-                            crate::tracking::invalidation::invalidate_flush(&ctx.tracking_table);
-                        }
-                    }
+                            || cmd.eq_ignore_ascii_case(b"FLUSHALL"));
 
                     // AOF logging for successful local writes.
                     // H1: durable path awaits fsync under appendfsync=always.
@@ -3748,6 +3721,49 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         ready,
                     );
 
+                    // D-2: broadcast the flush to every other shard (outside
+                    // the with_shard closure: this awaits). Any failed leg
+                    // turns the reply into an explicit partial-flush error,
+                    // never silent +OK.
+                    //
+                    // moon#1084: only now, with this shard's record logged
+                    // above. The broadcast awaits, and a write another client
+                    // made to THIS shard during that await used to reach the
+                    // log BEFORE the flush it followed — replay then ran the
+                    // flush over it, and a key acknowledged after the flush
+                    // was gone after a restart.
+                    if local_flush {
+                        let mut flushed_everywhere = true;
+                        if ctx.num_shards > 1 {
+                            if let Err(e) = crate::shard::coordinator::coordinate_flush_broadcast(
+                                &frame,
+                                ctx.shard_id,
+                                // Typed on this connection: the shard that ran
+                                // it is this one.
+                                ctx.shard_id,
+                                ctx.num_shards,
+                                conn.selected_db,
+                                &ctx.dispatch_tx,
+                                &ctx.spsc_notifiers,
+                            )
+                            .await
+                            {
+                                flushed_everywhere = false;
+                                // An AOF failure already replaced the reply;
+                                // it is the more serious of the two.
+                                if !aof_failed {
+                                    response = e;
+                                }
+                            }
+                        }
+                        // CLIENT TRACKING: a flush drops every cached key —
+                        // push the RESP3 flush invalidation (invalidate + Null)
+                        // to all tracking clients. Process-global table: one
+                        // hook at the originating connection covers all shards.
+                        if flushed_everywhere {
+                            crate::tracking::invalidation::invalidate_flush(&ctx.tracking_table);
+                        }
+                    }
                     // Suppress downstream effects on AOF failure — the
                     // client sees the error frame, no tracking churn.
                     if aof_failed {

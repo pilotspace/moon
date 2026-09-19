@@ -805,26 +805,14 @@ pub(super) async fn try_handle_multi_exec(
                 &watched,
                 txn_scripting.as_ref(),
             );
-            // moon#639: fill the slots the executor left for connection-level
-            // intercepts.
-            {
-                let queued_for_intercepts =
-                    crate::server::conn::shared::txn_intercept_snapshot(&conn.command_queue);
-                let switch_index = responses.len();
-                super::txn_intercepts::fill_txn_intercept_slots(
-                    &mut result,
-                    &queued_for_intercepts,
-                    conn,
-                    ctx,
-                    shutdown,
-                    switch_index,
-                    func_registry,
-                )
-                .await;
-            }
-            // moon#606: the body recorded the keys it made ready; they are
-            // woken below, once the body is LOGGED (moon#1056).
-
+            // moon#1084: log the body in the SAME synchronous stretch as the
+            // executor that just applied it, and only then await anything —
+            // the same order as the monoio handler (see its comment). The
+            // intercept fill below awaits (a queued `WAIT` parks for its
+            // timeout, `SCRIPT`/`FUNCTION` fan out), and a write another
+            // client applied during that await used to be logged BEFORE this
+            // body, so replay applied the two in the wrong order.
+            //
             // task #52: flush the graph-leg wal-v3 records collected by the
             // txn executor. Replication is monoio-only by design (see
             // `handler_monoio::write`'s EXEC handling) — this tokio/sharded
@@ -844,11 +832,11 @@ pub(super) async fn try_handle_multi_exec(
             // shard's AOF via the same group-commit path as normal writes, then
             // issue ONE fsync barrier under appendfsync=always before acking.
             // All keys are local here (Phase A rejected foreign-owned bodies),
-            // so ctx.shard_id is the correct AOF target. On barrier failure we
-            // surface AOF_FSYNC_ERR instead of a false EXEC success — parity
-            // with the normal write path.
-            let persisted =
-                crate::server::conn::shared::persist_txn_aof(ctx, aof_entries, false).await;
+            // so ctx.shard_id is the correct AOF target. The enqueue does not
+            // suspend unless the writer channel is full; only the barrier waits.
+            let persisted = crate::server::conn::shared::persist_txn_aof(ctx, aof_entries, false)
+                .await
+                .is_ok();
             // moon#606: raise the wakes the body recorded. A producer queued
             // inside MULTI reaches none of the live write path's hooks, so
             // without this a `MULTI ; LPUSH k v ; EXEC` left a client blocked
@@ -862,16 +850,35 @@ pub(super) async fn try_handle_multi_exec(
             // reported as an error, not rolled back), so a waiter left asleep
             // would answer null for a key that demonstrably has data.
             crate::blocking::wakeup::wake_recorded(&ctx.blocking_registry, exec_wakes.drain(..));
-            if persisted.is_err() {
+            if !persisted {
                 conn.command_queue.clear();
                 // Durability could not be guaranteed: report the error and
                 // suppress any queued PUBLISH fan-out — the client sees EXEC
                 // fail, so it must not observe the txn's pub/sub side effects.
+                // Its queued intercepts do not run either, exactly as on the
+                // owner-routed path above when the owner's append is lost.
                 exec_publishes.clear();
                 responses.push(Frame::Error(Bytes::from_static(
                     crate::persistence::aof::AOF_FSYNC_ERR,
                 )));
                 return true;
+            }
+            // moon#639: fill the slots the executor left for connection-level
+            // intercepts.
+            {
+                let queued_for_intercepts =
+                    crate::server::conn::shared::txn_intercept_snapshot(&conn.command_queue);
+                let switch_index = responses.len();
+                super::txn_intercepts::fill_txn_intercept_slots(
+                    &mut result,
+                    &queued_for_intercepts,
+                    conn,
+                    ctx,
+                    shutdown,
+                    switch_index,
+                    func_registry,
+                )
+                .await;
             }
             // CLIENT TRACKING: invalidate keys written inside the txn and
             // register keys it read, same as the normal paths (EXEC previously
