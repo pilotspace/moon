@@ -1,16 +1,25 @@
 //! #455: a rewrite fold must not double-apply a write whose AOF record is
 //! enqueued after an await that follows the mutation.
 //!
-//! `EXEC` runs its body synchronously, then fills the slots of connection
-//! intercepts queued inside it (`WAIT`, `CONFIG`, ...), which can await, and
-//! only then enqueues the body's AOF records. A `BGREWRITEAOF` whose snapshot
-//! lands in that window captures the body's effect in the new base. The fold
-//! used to split records by position, so the late records went into the new
-//! incr and replayed on top of the base: an `INCR` inside such an `EXEC` came
-//! back from a restart applied twice.
+//! `EXEC` used to run its body synchronously, then fill the slots of
+//! connection intercepts queued inside it (`WAIT`, `CONFIG`, ...), which can
+//! await, and only then enqueue the body's AOF records. A `BGREWRITEAOF` whose
+//! snapshot landed in that window captured the body's effect in the new base,
+//! and the fold, which split records by position, put the late records into
+//! the new incr: an `INCR` inside such an `EXEC` came back from a restart
+//! applied twice.
 //!
-//! Records now carry the fold epoch read when the body ran, and the writer
-//! drops every record stamped below the committed snapshot's epoch.
+//! Two changes now close it from both sides. Records carry the fold epoch
+//! read when the mutation ran, and the writer drops every record stamped
+//! below the committed snapshot's epoch. The writer side is pinned by the
+//! unit tests in `persistence::aof`, including a record that reaches the
+//! channel only after the snapshot, which is what a producer parked on a
+//! full channel produces. And since moon#1084 the `EXEC` body is logged
+//! before the intercepts await, so in this scenario its records reach the
+//! writer before the fold's cut and the late-record window no longer opens.
+//! This test keeps the end-to-end guarantee for the scenario that exposed
+//! the bug: a rewrite during a parked `EXEC`, then kill -9, applies the
+//! `INCR` exactly once.
 //!
 //! Black-box over a real `moon` process (needs a prebuilt binary):
 //!
@@ -120,7 +129,8 @@ fn run_case(shards: usize) {
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // Fold while EXEC's AOF records are not yet enqueued.
+    // Fold while EXEC is still parked in WAIT, after its body ran. (The
+    // wait below asserts the rewrite completed ok inside that window.)
     let reply = b.send(&["BGREWRITEAOF"]);
     assert!(reply.starts_with('+'), "BGREWRITEAOF refused: {reply:?}");
     wait_rewrite_done(
@@ -137,7 +147,6 @@ fn run_case(shards: usize) {
         exec_sent.elapsed() >= Duration::from_millis(WAIT_MS),
         "EXEC returned before WAIT ran out — the window under test never opened"
     );
-    let info = b.send(&["INFO", "persistence"]);
 
     server.kill_now();
     let (mut server, port) = spawn(dir.path(), shards);
@@ -147,15 +156,6 @@ fn run_case(shards: usize) {
         "$1\r\n1\r\n",
         "shards={shards}: the INCR committed by EXEC must be applied exactly once after \
          restart (2 = the record was replayed on top of a base that already held it)"
-    );
-    // The late records were seen, and dropped, by the writer — the path under
-    // test actually ran.
-    let folded: u64 = info_field(&info, "aof_rewrite_late_records_folded")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    assert!(
-        folded >= 1,
-        "expected the late EXEC record to be dropped by the writer: {info}"
     );
     server.kill_now();
 }
