@@ -403,6 +403,16 @@ pub struct Database {
     pub db_index: usize,
     /// Cold index for disk-offloaded KV entries (None when disk-offload disabled).
     pub cold_index: Option<crate::storage::tiered::cold_index::ColdIndex>,
+    /// moon#875: raised by a cold read-through that found the key INDEXED
+    /// but its bytes unreadable, consumed by whoever answers the client —
+    /// a fabricating accessor (refuses before mutating) or the dispatch
+    /// boundary (`command::cold_fault_gate`), which turns the reply into
+    /// `-IOERR`. Every raise happens inside a command's own execution and
+    /// every command's dispatch takes it, so it never outlives the command
+    /// that raised it. `0` = none, else `ColdReadFaultReason as u8 + 1`.
+    /// Atomic (not `Cell`) because a `Database` lives in an `RwLock` slot
+    /// and must stay `Sync`; the common path is one relaxed load.
+    pub(crate) cold_fault: std::sync::atomic::AtomicU8,
     /// Shard directory for cold reads (None when disk-offload disabled).
     pub cold_shard_dir: Option<std::path::PathBuf>,
     /// moon#902: installed by a replayed `MOON.COLDCUT` for the length of an
@@ -590,6 +600,7 @@ impl Database {
             pending_expired: Vec::new(),
             db_index: 0,
             cold_index: None,
+            cold_fault: std::sync::atomic::AtomicU8::new(0),
             cold_shard_dir: None,
             replay_cold_gate: None,
             replay_saw_cold_marker: false,
@@ -624,6 +635,7 @@ impl Database {
             pending_expired: Vec::new(),
             db_index: 0,
             cold_index: None,
+            cold_fault: std::sync::atomic::AtomicU8::new(0),
             cold_shard_dir: None,
             replay_cold_gate: None,
             replay_saw_cold_marker: false,

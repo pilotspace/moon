@@ -1310,7 +1310,7 @@ mod tests {
         // into a fresh index whose map already holds one entry per key, so no
         // overwrite fires and `pending_unlink` is empty there by construction
         // — true before this change and after it.
-        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &m2);
+        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &m2).per_db;
         assert_eq!(per_db.len(), 1, "one db");
         let bulk = per_db.remove(0).1;
         assert_eq!(bulk.len(), 2, "`gone` + `kept`");
@@ -1419,7 +1419,7 @@ mod tests {
             "precondition: manifest order is newest-first"
         );
 
-        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &manifest);
+        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &manifest).per_db;
         assert_eq!(per_db.len(), 1, "one db");
         let index = per_db.remove(0).1;
         assert_eq!(index.len(), 2, "`dup` is one key, not two");
@@ -1473,7 +1473,7 @@ mod tests {
         })
         .unwrap();
         m2.commit().unwrap();
-        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &m2);
+        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &m2).per_db;
         let index = per_db.remove(0).1;
         assert_eq!(index.len(), 1);
         let loc = index.lookup(b"twice").unwrap();
@@ -1532,7 +1532,7 @@ mod tests {
         }
         manifest.commit().unwrap();
 
-        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &manifest);
+        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &manifest).per_db;
         per_db.sort_by_key(|(db, _)| *db);
         let dbs: Vec<usize> = per_db.iter().map(|(db, _)| *db).collect();
         assert_eq!(dbs, vec![0, 3], "one index per db present in the manifest");
