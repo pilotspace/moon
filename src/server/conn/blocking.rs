@@ -2764,7 +2764,11 @@ pub(crate) fn try_inline_dispatch(
     // `budget` and `est` were already computed on this path; only the branch
     // below is new.
     let budget = shard_databases.elastic_budget(shard_id);
-    let est = crate::shard::slice::with_shard_db(selected_db, |db| db.estimated_memory());
+    // moon#1036: `budgeted_memory` (cold index included) — the figure the
+    // generic gate's `evict_to_budget` and the tick's pressure cascade both
+    // compare against. With `estimated_memory` here this pre-gate answered
+    // "no pressure" for a shard the cascade was holding over its cap.
+    let est = crate::shard::slice::with_shard_db(selected_db, |db| db.budgeted_memory());
     let needs_eviction = !crate::storage::eviction::inline_write_can_skip_eviction(est, budget);
 
     // moon#660: THE safety condition. With a live `spill_sender`, generic
