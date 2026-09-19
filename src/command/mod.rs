@@ -111,7 +111,41 @@ pub fn dispatch(
     dispatch_inner(db, cmd, args, selected_db, db_count)
 }
 
+/// moon#875: if the command just executed raised the cold-fault flag — it
+/// read a key that is INDEXED in the cold tier but whose bytes could not be
+/// produced — its reply becomes `-IOERR`, never the nil/0/empty that a
+/// genuinely absent key produces. The fabricating accessors already refuse
+/// before mutating and consume the flag themselves; this is the catch-all
+/// for every `Database::get`-shaped read, which has no error channel of its
+/// own. One relaxed load per command when nothing is pending.
+///
+/// The three dispatch paths: this gates `dispatch` and `dispatch_read`;
+/// `server::conn::try_inline_dispatch` never reads the cold tier (it stands
+/// down to generic dispatch on any cold location), so it cannot raise the
+/// flag and needs no gate.
+#[inline]
+fn cold_fault_gate(db: &Database, result: DispatchResult) -> DispatchResult {
+    if db.take_cold_fault().is_none() {
+        return result;
+    }
+    match result {
+        DispatchResult::Response(_) => DispatchResult::Response(Database::cold_fault_error()),
+        quit @ DispatchResult::Quit(_) => quit,
+    }
+}
+
 fn dispatch_inner(
+    db: &mut Database,
+    cmd: &[u8],
+    args: &[Frame],
+    selected_db: &mut usize,
+    db_count: usize,
+) -> DispatchResult {
+    let result = dispatch_inner_unchecked(db, cmd, args, selected_db, db_count);
+    cold_fault_gate(db, result)
+}
+
+fn dispatch_inner_unchecked(
     db: &mut Database,
     cmd: &[u8],
     args: &[Frame],
@@ -996,6 +1030,9 @@ fn dispatch_inner(
             if cmd.eq_ignore_ascii_case(b"ZINTERCARD") {
                 return resp(sorted_set::zintercard(db, args));
             }
+            if cmd.eq_ignore_ascii_case(b"ZDIFFSTORE") {
+                return resp(sorted_set::zdiffstore(db, args));
+            }
         }
         // 11-letter commands
         (11, b'p') => {
@@ -1042,6 +1079,9 @@ fn dispatch_inner(
             if cmd.eq_ignore_ascii_case(b"ZRANDMEMBER") {
                 return resp(sorted_set::zrandmember(db, args));
             }
+            if cmd.eq_ignore_ascii_case(b"ZRANGEBYLEX") {
+                return resp(sorted_set::zrangebylex(db, args));
+            }
         }
         // 11-letter commands (hash)
         (11, b'h') => {
@@ -1074,6 +1114,15 @@ fn dispatch_inner(
             }
         }
         // 14-letter commands
+        (14, b'z') => {
+            // ZREVRANGEBYLEX ZREMRANGEBYLEX
+            if cmd.eq_ignore_ascii_case(b"ZREVRANGEBYLEX") {
+                return resp(sorted_set::zrevrangebylex(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"ZREMRANGEBYLEX") {
+                return resp(sorted_set::zremrangebylex(db, args));
+            }
+        }
         (14, b'g') => {
             // GEOSEARCHSTORE
             if cmd.eq_ignore_ascii_case(b"GEOSEARCHSTORE") {
@@ -1085,6 +1134,16 @@ fn dispatch_inner(
             // ZREVRANGEBYSCORE
             if cmd.eq_ignore_ascii_case(b"ZREVRANGEBYSCORE") {
                 return resp(sorted_set::zrevrangebyscore(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"ZREMRANGEBYSCORE") {
+                return resp(sorted_set::zremrangebyscore(db, args));
+            }
+        }
+        // 15-letter commands
+        (15, b'z') => {
+            // ZREMRANGEBYRANK
+            if cmd.eq_ignore_ascii_case(b"ZREMRANGEBYRANK") {
+                return resp(sorted_set::zremrangebyrank(db, args));
             }
         }
         // 17-letter commands
@@ -1208,6 +1267,7 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         | (12, b'h') // HPEXPIRETIME
         | (12, b'g') // GEORADIUS_RO
         | (13, b'z') // ZRANGEBYSCORE
+        | (14, b'z') // ZREVRANGEBYLEX
         | (16, b'z') // ZREVRANGEBYSCORE
         | (20, b'g') // GEORADIUSBYMEMBER_RO
     )
@@ -1226,6 +1286,16 @@ pub fn dispatch_read(
 }
 
 fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -> DispatchResult {
+    let result = dispatch_read_inner_unchecked(db, cmd, args, now_ms);
+    cold_fault_gate(db, result)
+}
+
+fn dispatch_read_inner_unchecked(
+    db: &Database,
+    cmd: &[u8],
+    args: &[Frame],
+    now_ms: u64,
+) -> DispatchResult {
     let len = cmd.len();
     if len == 0 {
         return DispatchResult::Response(err_unknown(cmd));
@@ -1615,6 +1685,12 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
                 return resp(sorted_set::zrevrangebyscore_readonly(db, args, now_ms));
             }
         }
+        (14, b'z') => {
+            // ZREVRANGEBYLEX
+            if cmd.eq_ignore_ascii_case(b"ZREVRANGEBYLEX") {
+                return resp(sorted_set::zrevrangebylex_readonly(db, args, now_ms));
+            }
+        }
         // ---- new arms (contract v2): buckets that don't conflict with pre-existing ones ----
         (3, b'l') => {
             // LCS
@@ -1727,6 +1803,9 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             // ZRANDMEMBER (11 bytes)
             if cmd.eq_ignore_ascii_case(b"ZRANDMEMBER") {
                 return resp(sorted_set::zrandmember_readonly(db, args, now_ms));
+            }
+            if cmd.eq_ignore_ascii_case(b"ZRANGEBYLEX") {
+                return resp(sorted_set::zrangebylex_readonly(db, args, now_ms));
             }
         }
         (11, b'b') => {
@@ -2360,6 +2439,8 @@ mod tests {
             b"ZLEXCOUNT",
             b"ZRANGEBYSCORE",
             b"ZREVRANGEBYSCORE",
+            b"ZRANGEBYLEX",
+            b"ZREVRANGEBYLEX",
             b"LLEN",
             b"LRANGE",
             b"LINDEX",

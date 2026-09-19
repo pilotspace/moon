@@ -1870,6 +1870,41 @@ fn main() -> anyhow::Result<()> {
                 // the empty-manifest replay regression.
             }
         }
+
+        // moon#914: tokio --shards 1 — the one configuration with no
+        // `AofManifest` (see the regression boundary above: a manifest here
+        // wipes the v2-loaded state on the next boot, #96) — still needs its
+        // replay generation opened by `MOON.COLDCUT`, or recovery reads every
+        // cold file ungated and re-applies each non-idempotent write on top
+        // of the value it already produced (moon#902's double-apply). The
+        // legacy single-file AOF carries the head itself instead: written
+        // here when the file holds no record yet, and by
+        // `rewrite_aof_sharded_sync` after every rewrite's RDB preamble. No
+        // manifest is created, so the #96 wipe cannot recur.
+        // Runs regardless of whether a manifest exists: under tokio a
+        // single-shard manifest is ignored (warned above) and `appendonly.aof`
+        // is the authority either way. A non-empty AOF without a head (written
+        // before this fix) is left alone — see `seed_cold_cut_if_fresh`.
+        #[cfg(not(feature = "runtime-monoio"))]
+        if num_shards == 1 {
+            let aof_path = base_dir.join(&config.appendfilename);
+            let seeded = moon::persistence::cold_records::seed_cold_cut_if_fresh(
+                &aof_path,
+                cold_file_watermark(&spill_seeds, 0),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to seed the AOF cold-plane cut in {} (moon#914)",
+                    aof_path.display()
+                )
+            })?;
+            if seeded {
+                info!(
+                    "Opened AOF generation {} with its MOON.COLDCUT head (moon#914)",
+                    aof_path.display()
+                );
+            }
+        }
     }
 
     // (The former standalone tokio "multi-part AOF ignored" warn block was
@@ -1884,6 +1919,90 @@ fn main() -> anyhow::Result<()> {
     // re-evicted key misses and disk-offload silently loses data across a
     // restart. No-op when already consumed.
     reattach_cold_wiring(&mut shards, &mut preserved_cold_wiring);
+
+    // moon#914 backstop: no replay generation may outlive recovery. Every
+    // replay path closes its own (`close_replay_generation`,
+    // `reconcile_replay_cold_plane`); a gate still installed here means a
+    // path was missed, and serving with it would hide every cold file at or
+    // past its watermark — keys spilled after this boot would read as
+    // absent. Close it (the same resolution replay would have made) and say
+    // so, rather than serve a keyspace with an invisible cold tier.
+    for shard in shards.iter_mut() {
+        let shard_id = shard.id;
+        for (db_index, db) in shard.databases.iter_mut().enumerate() {
+            if db.replay_cold_gate_active() {
+                let r = db.finish_replay_cold_reconcile();
+                tracing::warn!(
+                    shard_id,
+                    db_index,
+                    cold_dropped = r.cold_dropped,
+                    "AOF replay left its MOON.COLDCUT gate open; closed it before serving \
+                     (moon#914 — a recovery path is missing its close_replay_generation)"
+                );
+            }
+        }
+    }
+
+    // moon#914 (b): tokio --shards 1 replayed a legacy `appendonly.aof` (one
+    // written before #1017, so it has no `MOON.COLDCUT`) while cold files
+    // existed. That replay read every cold file ungated, so a write logged
+    // before its key was spilled may just have been applied twice. The log
+    // has no record of which writes preceded which spill, so this boot's
+    // damage can't be undone. It can be stopped from compounding: nothing
+    // else rewrites this file, and every later boot would replay the same
+    // headless log over the re-spilled result. One rewrite opens the file
+    // with its cut (`rewrite_aof_sharded_sync`), so every later boot is
+    // gated. The #433 monitor dispatches it through the BGREWRITEAOF entry
+    // after the shards start. Accept is not blocked, and a crash before the
+    // rename leaves the old file authoritative, so the next boot retries.
+    // monoio (manifest, cut since #911) and multi-shard (PerShard manifest)
+    // never take this path. "Cold files existed" is read from the proven
+    // seed (`spill_seeds`, moon#997): it clears every heap file, so no cold
+    // file is missed; a warm vector segment alone also lifts it, which costs
+    // one unneeded rewrite, never a skipped one.
+    let force_legacy_aof_rewrite = cfg!(not(feature = "runtime-monoio"))
+        && num_shards == 1
+        && shards[0].replayed_aof_without_cold_cut
+        && cold_file_watermark(&spill_seeds, 0) > 1
+        && {
+            // The replay reads `<dir>/appendonly.aof`; the writer appends to
+            // `<dir>/<appendfilename>`. A rewrite can only repair the file
+            // that was replayed.
+            let replayed = std::path::Path::new(&config.dir).join("appendonly.aof");
+            let aof_bytes = std::fs::metadata(&replayed).map_or(0, |m| m.len());
+            let writes_replayed_file = config.appendfilename == "appendonly.aof";
+            if aof_pool.is_some() && writes_replayed_file {
+                tracing::warn!(
+                    "moon#914: replayed a legacy appendonly.aof ({}, {} bytes) with no \
+                     MOON.COLDCUT head over existing cold files. This boot's replay could \
+                     not be gated: a write logged before its key was spilled may have been \
+                     applied twice, and that cannot be undone. To stop it compounding on \
+                     every later boot, moon now runs ONE background AOF rewrite. One-time \
+                     cost: the hot dataset written and fsynced as a new RDB-preamble AOF. \
+                     Clients are served meanwhile. Later boots replay a file that opens with \
+                     its cut.",
+                    replayed.display(),
+                    aof_bytes
+                );
+                true
+            } else {
+                tracing::warn!(
+                    "moon#914: replayed a legacy appendonly.aof ({}, {} bytes) with no \
+                     MOON.COLDCUT head over existing cold files. This boot's replay could \
+                     not be gated, and moon CANNOT rewrite it: {}. Every boot will replay \
+                     it ungated again. Run with --appendonly yes and the default \
+                     --appendfilename once, then BGREWRITEAOF.",
+                    replayed.display(),
+                    aof_bytes,
+                    if aof_pool.is_none() {
+                        "appendonly is off"
+                    } else {
+                        "--appendfilename names a different file than the one replayed"
+                    }
+                );
+                false
+            }
+        };
 
     // Extract databases from all shards and wrap in ShardDatabases
     let all_dbs: Vec<Vec<moon::storage::Database>> = shards
@@ -1953,6 +2072,7 @@ fn main() -> anyhow::Result<()> {
             shard_databases.clone(),
             config.auto_aof_rewrite_percentage,
             min_size,
+            force_legacy_aof_rewrite,
         );
     }
 

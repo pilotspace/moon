@@ -952,6 +952,57 @@ if should_run "sorted_set"; then
     rcli ZADD z:ch 1 m >/dev/null 2>&1; mcli ZADD z:ch 1 m >/dev/null 2>&1
     assert_match "ZADD CH sub-epsilon"     ZADD z:ch CH 1.0000000000000002 m
     assert_match "ZADD CH moved the score" ZSCORE z:ch m
+
+    # moon#959 -- six commands that answered `ERR unknown command` on moon
+    # (ZRANGEBYLEX, ZREVRANGEBYLEX, ZREMRANGEBYRANK, ZREMRANGEBYSCORE,
+    # ZREMRANGEBYLEX, ZDIFFSTORE) plus `ZADD ... INCR`, which answered an
+    # arity error. Neither harness named any of them, which is how a command
+    # docs/commands.md advertised went missing. Every reply was read off
+    # redis 8.6.1 before the commands were written.
+    rcli ZADD z:959:lex 0 a 0 b 0 c 0 d 0 e >/dev/null 2>&1; mcli ZADD z:959:lex 0 a 0 b 0 c 0 d 0 e >/dev/null 2>&1
+    assert_match "ZRANGEBYLEX"              ZRANGEBYLEX z:959:lex - +
+    assert_match "ZRANGEBYLEX bounds"       ZRANGEBYLEX z:959:lex '[b' '(d'
+    assert_match "ZRANGEBYLEX LIMIT"        ZRANGEBYLEX z:959:lex - + LIMIT 1 2
+    assert_match "ZRANGEBYLEX bad bound"    ZRANGEBYLEX z:959:lex a b
+    assert_match "ZRANGEBYLEX WITHSCORES"   ZRANGEBYLEX z:959:lex - + WITHSCORES
+    assert_match "ZRANGEBYLEX WITHSCORES 1st" ZRANGEBYLEX z:959:lex a b WITHSCORES
+    assert_match "ZREVRANGEBYLEX"           ZREVRANGEBYLEX z:959:lex + -
+    assert_match "ZREVRANGEBYLEX bounds"    ZREVRANGEBYLEX z:959:lex '(d' '[b' LIMIT 0 1
+    rcli ZADD z:959:r 1 a 2 b 3 c 4 d 5 e >/dev/null 2>&1; mcli ZADD z:959:r 1 a 2 b 3 c 4 d 5 e >/dev/null 2>&1
+    assert_match "ZREMRANGEBYRANK"          ZREMRANGEBYRANK z:959:r 0 0
+    assert_match "ZREMRANGEBYRANK neg stop" ZREMRANGEBYRANK z:959:r -10 -6
+
+    # moon#1001 -- ZRANGE, ZREVRANGE and ZRANGESTORE clamped a STOP still
+    # negative after `len + stop` to 0 (the same rule ZREMRANGEBYRANK above
+    # already gets right), so `ZRANGE z -10 -6` on a five-member zset
+    # answered one element where redis answers an empty array.
+    rcli ZADD z:1001:r 1 a 2 b 3 c 4 d 5 e >/dev/null 2>&1; mcli ZADD z:1001:r 1 a 2 b 3 c 4 d 5 e >/dev/null 2>&1
+    assert_match "ZRANGE neg stop"          ZRANGE z:1001:r -10 -6
+    assert_match "ZREVRANGE neg stop"       ZREVRANGE z:1001:r -10 -6
+    assert_match "ZRANGE REV neg stop"      ZRANGE z:1001:r -10 -6 REV
+    assert_match "ZRANGESTORE neg stop"     ZRANGESTORE {z1001}:d z:1001:r -10 -6
+    assert_match "ZRANGESTORE dest empty"   ZRANGE {z1001}:d 0 -1
+    assert_match "ZRANGE stop == -len"      ZRANGE z:1001:r -10 -5
+    assert_match "ZREMRANGEBYSCORE"         ZREMRANGEBYSCORE z:959:r '(2' 3
+    assert_match "ZREMRANGEBYSCORE bad"     ZREMRANGEBYSCORE z:959:r nan 1
+    assert_match "ZREMRANGEBYLEX"           ZREMRANGEBYLEX z:959:lex '[b' '(d'
+    assert_match "ZREMRANGEBYLEX arity"     ZREMRANGEBYLEX z:959:lex - + x
+    assert_match "ZRANGE after ZREMRANGE"   ZRANGE z:959:r 0 -1 WITHSCORES
+    assert_match "ZREMRANGEBYSCORE drains"  ZREMRANGEBYSCORE z:959:r -inf +inf
+    assert_match "ZREMRANGE drained key"    EXISTS z:959:r
+    assert_match "ZDIFFSTORE"               ZDIFFSTORE {z}:diff 2 {z}:A {z}:B
+    assert_match "ZDIFFSTORE result"        ZRANGE {z}:diff 0 -1 WITHSCORES
+    assert_match "ZDIFFSTORE numkeys 0"     ZDIFFSTORE {z}:diff 0 {z}:A
+    assert_match "ZDIFFSTORE WEIGHTS"       ZDIFFSTORE {z}:diff 1 {z}:A WEIGHTS 1
+    assert_match "ZDIFFSTORE empty deletes" ZDIFFSTORE {z}:diff 2 {z}:A {z}:A
+    assert_match "ZDIFFSTORE dest gone"     EXISTS {z}:diff
+    assert_match "ZADD INCR"                ZADD z:959:i INCR 5 a
+    assert_match "ZADD INCR again"          ZADD z:959:i INCR 2.5 a
+    assert_match "ZADD NX INCR refused"     ZADD z:959:i NX INCR 1 a
+    assert_match "ZADD XX INCR refused"     ZADD z:959:i XX INCR 1 nope
+    assert_match "ZADD GT INCR refused"     ZADD z:959:i GT INCR -1 a
+    assert_match "ZADD LT INCR"             ZADD z:959:i LT INCR -1 a
+    assert_match "ZADD INCR two pairs"      ZADD z:959:i INCR 1 a 2 b
 fi
 
 # ===========================================================================
@@ -1007,6 +1058,22 @@ if should_run "key"; then
     rcli SET k:cpdst2 old >/dev/null 2>&1; mcli SET k:cpdst2 old >/dev/null 2>&1
     assert_match "COPY no REPLACE"     COPY k:cpsrc k:cpdst2
     assert_match "COPY REPLACE"        COPY k:cpsrc k:cpdst2 REPLACE
+    # moon#1062: redis's wording for the two-db family. MOVE into the current
+    # db and COPY of a key onto itself are "same object" errors even when the
+    # key is missing (redis checks before the lookup); a negative or too-large
+    # db index is "DB index is out of range" for both commands.
+    rcli SET {k}:mv mvval >/dev/null 2>&1; mcli SET {k}:mv mvval >/dev/null 2>&1
+    assert_match "MOVE same db"        MOVE {k}:mv 0
+    assert_match "MOVE db -1"          MOVE {k}:mv -1
+    assert_match "MOVE db 99"          MOVE {k}:mv 99
+    assert_match "MOVE db not int"     MOVE {k}:mv x
+    assert_match "COPY missing onto itself" COPY {k}:nokey {k}:nokey
+    assert_match "COPY DB -1"          COPY {k}:mv {k}:mv2 DB -1
+    assert_match "COPY DB 99"          COPY {k}:mv {k}:mv2 DB 99
+    assert_match "COPY DB 5"           COPY {k}:mv {k}:mv2 DB 5
+    assert_match "GET after COPY DB 5" -n 5 GET {k}:mv2
+    assert_match "MOVE db 6"           MOVE {k}:mv 6
+    assert_match "GET after MOVE db 6" -n 6 GET {k}:mv
     assert_match "UNLINK"              UNLINK {k}:renamed
     assert_moon_ok "DBSIZE"            DBSIZE
     assert_moon_ok "SCAN cursor"       SCAN 0
@@ -1351,6 +1418,93 @@ if should_run "connection"; then
             "role:master" INFO replication
         assert_moon "moon#1015 refused REPLICAOF keeps the node writable" "OK" SET moon1015:w v
     fi
+
+    # moon#1013: CLIENT TRACKING must invalidate a key that EXPIRES, like one a
+    # command writes. redis-cli cannot see RESP3 pushes, so each server gets one
+    # held-open /dev/tcp connection that tracks the key with a read and then
+    # sends NOTHING until the push arrives (4s bound) -- the push can only come
+    # from the server's own expiry tick. The hash row is the idle-db case: moon's
+    # field reaper used to wait for a command to advance the db's cached clock.
+    trk1013_probe() {
+        local port="$1" key="$2" read_cmd="$3" line="" seen="" deadline=$((SECONDS + 4))
+        exec 4<>"/dev/tcp/127.0.0.1/${port}" || { echo "CONNECT_FAILED"; return 0; }
+        printf 'HELLO 3\r\nCLIENT TRACKING ON\r\n%s\r\n' "$read_cmd" >&4
+        while (( SECONDS < deadline )); do
+            if IFS= read -r -t 1 line <&4; then
+                seen="${seen}${line%$'\r'}|"
+                case "$seen" in *invalidate*"|${key}|"*) break ;; esac
+            fi
+        done
+        exec 4>&-
+        case "$seen" in *invalidate*"|${key}|"*) echo "PUSH" ;; *) echo "NONE" ;; esac
+    }
+    for port in "$PORT_REDIS" "$PORT_RUST"; do
+        redis-cli -p "$port" DEL trk1013:s trk1013:h > /dev/null 2>&1 || true
+    done
+    # Seed each server right before ITS probe: a 1s TTL seeded on both up front
+    # would lapse on the second server while the first one's probe waits.
+    redis-cli -p "$PORT_REDIS" SET trk1013:s v PX 1000 > /dev/null 2>&1 || true
+    trk1013_s_redis=$(trk1013_probe "$PORT_REDIS" trk1013:s "GET trk1013:s")
+    redis-cli -p "$PORT_RUST" SET trk1013:s v PX 1000 > /dev/null 2>&1 || true
+    trk1013_s_moon=$(trk1013_probe "$PORT_RUST" trk1013:s "GET trk1013:s")
+    TOTAL=$((TOTAL + 1))
+    if [ "$trk1013_s_moon" = "PUSH" ] && [ "$trk1013_s_redis" = "PUSH" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TRACKING-EXPIRY-01 expired key must push invalidate (moon#1013): redis=$trk1013_s_redis moon=$trk1013_s_moon"
+    fi
+    for port in "$PORT_REDIS" "$PORT_RUST"; do
+        redis-cli -p "$port" HSET trk1013:h f v g w > /dev/null 2>&1 || true
+    done
+    redis-cli -p "$PORT_REDIS" HPEXPIRE trk1013:h 1000 FIELDS 1 f > /dev/null 2>&1 || true
+    trk1013_h_redis=$(trk1013_probe "$PORT_REDIS" trk1013:h "HGET trk1013:h g")
+    redis-cli -p "$PORT_RUST" HPEXPIRE trk1013:h 1000 FIELDS 1 f > /dev/null 2>&1 || true
+    trk1013_h_moon=$(trk1013_probe "$PORT_RUST" trk1013:h "HGET trk1013:h g")
+    TOTAL=$((TOTAL + 1))
+    if [ "$trk1013_h_moon" = "PUSH" ] && [ "$trk1013_h_redis" = "PUSH" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TRACKING-EXPIRY-02 expired hash field must push invalidate (moon#1013): redis=$trk1013_h_redis moon=$trk1013_h_moon"
+    fi
+
+    # moon#1049: CLIENT CACHING answered "unknown subcommand", and the other
+    # client-side-caching introspection subcommands did not exist. Every row is
+    # a fresh connection (tracking off) unless it pipes a session.
+    assert_match "moon#1049 CLIENT CACHING yes, tracking off"  CLIENT CACHING yes
+    assert_match "moon#1049 CLIENT CACHING arity"              CLIENT CACHING
+    assert_match "moon#1049 CLIENT TRACKINGINFO, tracking off" CLIENT TRACKINGINFO
+    assert_match "moon#1049 CLIENT GETREDIR, tracking off"     CLIENT GETREDIR
+    assert_match "moon#1049 TRACKING OPTIN+OPTOUT refused"     CLIENT TRACKING on OPTIN OPTOUT
+    assert_match "moon#1049 TRACKING BCAST+OPTIN refused"      CLIENT TRACKING on BCAST OPTIN
+    assert_match "moon#1049 TRACKING unknown option"           CLIENT TRACKING on FOO
+    assert_match "moon#1048 REDIRECT to a missing client"      CLIENT TRACKING on REDIRECT 987654
+    # Connection-scoped state needs ONE connection per server: redis-cli holds
+    # a single connection for commands piped on stdin.
+    trk1049_session() {
+        local port="$1"; shift
+        printf '%s\n' "$@" | redis-cli -p "$port" 2>/dev/null || true
+    }
+    for trk1049_case in \
+        "CLIENT TRACKING on OPTIN|CLIENT CACHING yes|CLIENT TRACKINGINFO" \
+        "CLIENT TRACKING on OPTIN|CLIENT CACHING no|CLIENT CACHING maybe" \
+        "CLIENT TRACKING on OPTOUT|CLIENT CACHING no|CLIENT TRACKINGINFO" \
+        "CLIENT TRACKING on OPTIN|CLIENT TRACKING on OPTOUT" \
+        "CLIENT TRACKING on BCAST PREFIX zz PREFIX aa|CLIENT TRACKING on BCAST PREFIX aab|CLIENT TRACKINGINFO"; do
+        IFS='|' read -r -a trk1049_cmds <<< "$trk1049_case"
+        trk1049_r=$(trk1049_session "$PORT_REDIS" "${trk1049_cmds[@]}")
+        trk1049_m=$(trk1049_session "$PORT_RUST" "${trk1049_cmds[@]}")
+        TOTAL=$((TOTAL + 1))
+        if [[ "$trk1049_r" == "$trk1049_m" ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: moon#1049 session [$trk1049_case]"
+            echo "    REDIS: $(echo "$trk1049_r" | tr '\n' ' ')"
+            echo "    MOON:  $(echo "$trk1049_m" | tr '\n' ' ')"
+        fi
+    done
 fi
 
 # ===========================================================================
@@ -1518,6 +1672,31 @@ if should_run "transaction"; then
         echo "    GOT: $(echo "$tx_moon" | head -5)"
     fi
 
+    # --- MOVE and COPY ... DB n inside MULTI (moon#1062) -------------------
+    #
+    # EXEC answered MOVE with "requires handler-level dispatch", and COPY ...
+    # DB 4 answered 1 while writing the copy into the SOURCE db. Compared with
+    # redis: the EXEC transcript, then where each key landed.
+    for tx_srv in rcli mcli; do
+        $tx_srv SET {tx1062}a 1 >/dev/null 2>&1
+        $tx_srv SET {tx1062}b 2 >/dev/null 2>&1
+    done
+    TOTAL=$((TOTAL + 1))
+    tx_mc_r=$(printf 'MULTI\nMOVE {tx1062}a 3\nCOPY {tx1062}b {tx1062}c DB 4\nEXEC\n' \
+        | redis-cli -p "$PORT_REDIS" 2>&1 | tr '\n' ' ' || true)
+    tx_mc_m=$(printf 'MULTI\nMOVE {tx1062}a 3\nCOPY {tx1062}b {tx1062}c DB 4\nEXEC\n' \
+        | redis-cli -p "$PORT_RUST" 2>&1 | tr '\n' ' ' || true)
+    tx_mc_r="${tx_mc_r}| $(rcli -n 3 GET {tx1062}a) $(rcli -n 4 GET {tx1062}c) $(rcli EXISTS {tx1062}a {tx1062}c)"
+    tx_mc_m="${tx_mc_m}| $(mcli -n 3 GET {tx1062}a) $(mcli -n 4 GET {tx1062}c) $(mcli EXISTS {tx1062}a {tx1062}c)"
+    if [ "$tx_mc_r" = "$tx_mc_m" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TXN-MOVECOPY-01 MOVE / COPY ... DB n inside MULTI"
+        echo "    REDIS: $tx_mc_r"
+        echo "    MOON:  $tx_mc_m"
+    fi
+
     # DISCARD (must be inside MULTI)
     TOTAL=$((TOTAL + 1))
     tx_discard=$(printf 'MULTI\nDISCARD\n' | redis-cli -p "$PORT_RUST" 2>/dev/null || true)
@@ -1606,6 +1785,30 @@ if should_run "transaction"; then
         echo "  FAIL: FN-MULTI-02 expected queue-time refusal + EXECABORT, got: $(echo "$fn_bogus" | tr '\n' ' ')"
     fi
 
+    # --- An ACL refusal inside MULTI aborts the transaction (moon#1035) ---
+    #
+    # redis 8.6.1 refuses a command the user may not run at QUEUE time and
+    # EXEC answers -EXECABORT with nothing applied. Moon answered NOPERM and
+    # then EXEC applied the rest. Verdict read from the KEY, as TXN-SUB-01
+    # does. The denied command is INCR, not something destructive: were the ACL
+    # gate itself ever to regress, a denied FLUSHALL would wipe later rows.
+    TOTAL=$((TOTAL + 1))
+    mcli ACL SETUSER tx:acl1035 reset on '>pw' '~*' '&*' +@all -incr > /dev/null 2>&1
+    mcli DEL tx:acl1035 tx:acl1035:n > /dev/null 2>&1
+    tx_acl=$(printf 'MULTI\nSET tx:acl1035 ran\nINCR tx:acl1035:n\nEXEC\n' \
+        | redis-cli -p "$PORT_RUST" --user tx:acl1035 --pass pw --no-auth-warning 2>&1 || true)
+    tx_acl_key=$(mcli GET tx:acl1035 2>/dev/null || true)
+    mcli ACL DELUSER tx:acl1035 > /dev/null 2>&1
+    if [ -n "$tx_acl_key" ]; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TXN-ACL-01 the transaction RAN despite a denied command (tx:acl1035=$tx_acl_key)"
+    elif echo "$tx_acl" | qgrep -q "NOPERM" && echo "$tx_acl" | qgrep -q "EXECABORT"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TXN-ACL-01 expected NOPERM + EXECABORT, got: $(echo "$tx_acl" | tr '\n' ' ')"
+    fi
+
     # --- Scripts inside MULTI (moon#894) -----------------------------------
     #
     # EVAL/EVALSHA/EVAL_RO/FCALL were queued and then answered `unknown
@@ -1648,6 +1851,27 @@ if should_run "transaction"; then
         echo "  FAIL: SCRIPT-MULTI-02 EXEC transcript differs from Redis (moon#894)"
         echo "    redis: $(echo "$sc894_redis" | tr '\n' ' ')"
         echo "    moon:  $(echo "$sc894_moon" | tr '\n' ' ')"
+    fi
+
+    # --- SPUBLISH inside MULTI (moon#1043) ---------------------------------
+    #
+    # A queued SPUBLISH answered `unknown command` at EXEC while the rest of the
+    # body committed. With no subscriber the receiver count is 0 on both
+    # servers, so this row compares the transcript byte for byte (the slot must
+    # be an integer, not an error); tests/spublish_in_multi_1043.rs and the
+    # consistency row check delivery to live subscribers.
+    sp1043_body=$(printf '%s\n' 'MULTI' 'SET {tx1043}k 1' 'SPUBLISH sch1043 hi' 'PUBLISH ch1043 hi' 'EXEC')
+    for srv in mcli rcli; do $srv DEL "{tx1043}k" > /dev/null; done
+    sp1043_moon=$(printf '%s\n' "$sp1043_body" | redis-cli -p "$PORT_RUST" 2>&1 || true)
+    sp1043_redis=$(printf '%s\n' "$sp1043_body" | redis-cli -p "$PORT_REDIS" 2>&1 || true)
+    TOTAL=$((TOTAL + 1))
+    if [ "$sp1043_moon" = "$sp1043_redis" ] && ! echo "$sp1043_moon" | qgrep -q "unknown command"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: SPUBLISH-MULTI-01 SPUBLISH inside MULTI must run at EXEC (moon#1043)"
+        echo "    redis: $(echo "$sp1043_redis" | tr '\n' ' ')"
+        echo "    moon:  $(echo "$sp1043_moon" | tr '\n' ' ')"
     fi
 
     # --- Container HELP (moon#698) ----------------------------------------

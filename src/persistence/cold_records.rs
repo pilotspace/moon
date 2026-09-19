@@ -57,6 +57,47 @@ pub fn frame_unoffset(resp: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Whether `cmd` is one of the replay-only cold-plane records. They are not
+/// KV history: a log holding nothing else has not recorded a single client
+/// write, so a replay pass must not count them when deciding whether it was
+/// the KV authority (moon#914 — a WAL copy of a `MOON.SPILLED` marker used to
+/// suppress the AOF fallback and discard the AOF's entire history).
+#[inline]
+pub fn is_cold_plane_record(cmd: &[u8]) -> bool {
+    cmd.eq_ignore_ascii_case(COLD_CUT) || cmd.eq_ignore_ascii_case(SPILLED)
+}
+
+/// moon#914: open a legacy single-file AOF generation with its
+/// `MOON.COLDCUT <watermark>` head — the layout `runtime-tokio` with
+/// `--shards 1` uses, which has no `AofManifest` and therefore never runs
+/// `AofManifest::seed_cold_cut`.
+///
+/// Writes the head only when the file is absent or EMPTY, i.e. when no
+/// record of this generation exists yet, so it is always the first record.
+/// A non-empty file already has its head (written here or by the rewrite
+/// that produced it) or is a legacy generation that predates the cut; a head
+/// appended to its tail would gate only the records after it, so it is left
+/// untouched. The write is fsynced before returning — like `seed_cold_cut` —
+/// so the head is durable before any client write can be acknowledged.
+///
+/// Returns whether the head was written.
+pub fn seed_cold_cut_if_fresh(path: &std::path::Path, watermark: u64) -> std::io::Result<bool> {
+    use std::io::Write;
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > 0 => return Ok(false),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(&serialize_cold_cut(watermark))?;
+    file.sync_data()?;
+    Ok(true)
+}
+
 #[inline]
 fn frame_u64(f: &Frame) -> Option<u64> {
     match f {
@@ -205,6 +246,52 @@ mod tests {
             &[Frame::BulkString(Bytes::from_static(b"3"))],
             9
         ));
+    }
+
+    #[test]
+    fn cold_plane_records_are_recognised_case_insensitively() {
+        assert!(is_cold_plane_record(b"MOON.SPILLED"));
+        assert!(is_cold_plane_record(b"moon.coldcut"));
+        assert!(!is_cold_plane_record(b"SET"));
+        assert!(!is_cold_plane_record(b"MOON.SPILL"));
+    }
+
+    /// moon#914: the head goes into an absent or empty legacy AOF as its
+    /// FIRST record, and never into a file that already holds records.
+    #[test]
+    fn seed_cold_cut_if_fresh_writes_only_the_first_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("appendonly.aof");
+
+        assert!(seed_cold_cut_if_fresh(&path, 9).unwrap(), "absent → seeded");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serialize_cold_cut(9).as_ref()
+        );
+        assert!(
+            !seed_cold_cut_if_fresh(&path, 12).unwrap(),
+            "a second boot must not append another head"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serialize_cold_cut(9).as_ref()
+        );
+
+        let empty = dir.path().join("empty.aof");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(seed_cold_cut_if_fresh(&empty, 3).unwrap(), "empty → seeded");
+
+        // A legacy generation: records but no head. Appending one at the
+        // tail would gate only what follows it — leave the file alone.
+        let legacy = dir.path().join("legacy.aof");
+        let set = serialize_command(&Frame::Array(crate::framevec![
+            Frame::BulkString(Bytes::from_static(b"SET")),
+            Frame::BulkString(Bytes::from_static(b"k")),
+            Frame::BulkString(Bytes::from_static(b"v")),
+        ]));
+        std::fs::write(&legacy, &set).unwrap();
+        assert!(!seed_cold_cut_if_fresh(&legacy, 3).unwrap());
+        assert_eq!(std::fs::read(&legacy).unwrap(), set.as_ref());
     }
 
     #[test]

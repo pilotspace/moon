@@ -16,10 +16,8 @@ use crate::command::connection as conn_cmd;
 use crate::command::metadata;
 use crate::protocol::Frame;
 use crate::runtime::cancel::CancellationToken;
-use crate::runtime::channel;
 use crate::server::conn::core::{ConnectionContext, ConnectionState};
 use crate::server::conn::util::extract_bytes;
-use crate::tracking::TrackingState;
 use crate::workspace::strip_workspace_prefix_from_response;
 
 use super::{extract_command, handle_blocking_command_monoio, handle_config, is_multi_key_command};
@@ -437,34 +435,17 @@ pub(super) fn try_handle_cluster_routing(
             }
         }
 
-        // CROSSSLOT check for multi-key commands
-        if is_multi_key_command(cmd, cmd_args) {
-            let first_slot = slot;
-            let mut cross_slot = false;
-            // COPY's keys are exactly args[0..2]; trailing args are the
-            // REPLACE literal, which must not be slot-checked.
-            let key_args: &[Frame] = if cmd.eq_ignore_ascii_case(b"COPY") {
-                &cmd_args[..cmd_args.len().min(2)]
-            } else {
-                cmd_args
-            };
-            for arg in key_args.iter().skip(1) {
-                if let Some(k) = match arg {
-                    Frame::BulkString(b) => Some(b.as_ref()),
-                    _ => None,
-                } {
-                    if crate::cluster::slots::slot_for_key(k) != first_slot {
-                        cross_slot = true;
-                        break;
-                    }
-                }
-            }
-            if cross_slot {
-                responses.push(Frame::Error(Bytes::from_static(
-                    b"CROSSSLOT Keys in request don't hash to the same slot",
-                )));
-                return true;
-            }
+        // CROSSSLOT check for multi-key commands. moon#1012: only KEY
+        // positions are slot-checked — `MSET {t}a x {t}b y` is one slot, and
+        // `x`/`y` are values. `keys_span_slots` reads the positions from the
+        // shared key walker; the sharded handler calls the same function.
+        if is_multi_key_command(cmd, cmd_args)
+            && crate::cluster::slots::keys_span_slots(cmd, cmd_args, slot)
+        {
+            responses.push(Frame::Error(Bytes::from_static(
+                b"CROSSSLOT Keys in request don't hash to the same slot",
+            )));
+            return true;
         }
     }
     false
@@ -1105,45 +1086,23 @@ pub(super) fn try_handle_client_tracking(
     let Some(sub_bytes) = extract_bytes(sub) else {
         return false;
     };
-    if !sub_bytes.eq_ignore_ascii_case(b"TRACKING") {
+    if !crate::tracking::client_cmd::is_tracking_subcommand(&sub_bytes) {
         return false;
     }
-    match crate::command::client::parse_tracking_args(cmd_args) {
-        Ok(config_parsed) => {
-            if config_parsed.enable {
-                conn.tracking_state.enabled = true;
-                conn.tracking_state.bcast = config_parsed.bcast;
-                conn.tracking_state.noloop = config_parsed.noloop;
-                conn.tracking_state.optin = config_parsed.optin;
-                conn.tracking_state.optout = config_parsed.optout;
-
-                if conn.tracking_rx.is_none() {
-                    let (tx, rx) = channel::mpsc_bounded::<Frame>(256);
-                    conn.tracking_state.invalidation_tx = Some(tx.clone());
-                    conn.tracking_rx = Some(rx);
-
-                    let mut table = ctx.tracking_table.lock();
-                    table.register_client(client_id, tx);
-                    if let Some(target) = config_parsed.redirect {
-                        table.set_redirect(client_id, target);
-                    }
-                    for prefix in &config_parsed.prefixes {
-                        table.register_prefix(client_id, prefix.clone(), config_parsed.noloop);
-                    }
-                }
-                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-            } else {
-                conn.tracking_state = TrackingState::default();
-                ctx.tracking_table.lock().untrack_all(client_id);
-                conn.tracking_rx = None;
-                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-            }
+    // TRACKING, CACHING, TRACKINGINFO, GETREDIR — one implementation shared
+    // with the other two handlers (moon#1049).
+    match crate::tracking::client_cmd::handle(
+        cmd_args,
+        client_id,
+        &mut conn.tracking_state,
+        &mut conn.tracking_rx,
+        &ctx.tracking_table,
+    ) {
+        Some(reply) => {
+            responses.push(reply);
             true
         }
-        Err(err_frame) => {
-            responses.push(err_frame);
-            true
-        }
+        None => false,
     }
 }
 
@@ -1168,7 +1127,7 @@ pub(super) fn try_handle_client_admin(
             // unknown-subcommand fallback below must not swallow it — that
             // regression (H-3 reorder, #258) made CLIENT TRACKING answer
             // "unknown subcommand" on the entire monoio runtime.
-            if sub_bytes.eq_ignore_ascii_case(b"TRACKING") {
+            if crate::tracking::client_cmd::is_tracking_subcommand(&sub_bytes) {
                 return false;
             }
             if sub_bytes.eq_ignore_ascii_case(b"LIST") {
@@ -1552,6 +1511,8 @@ pub(super) fn try_enforce_acl(
                 .unwrap_or_default()
                 .as_millis() as u64,
         });
+        // moon#1035: inside MULTI a refusal poisons the block (EXECABORT).
+        conn.flag_transaction();
         responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
         return true;
     }
@@ -1572,6 +1533,8 @@ pub(super) fn try_enforce_acl(
                 .unwrap_or_default()
                 .as_millis() as u64,
         });
+        // moon#1035: a denied KEY poisons an open transaction too.
+        conn.flag_transaction();
         responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
         return true;
     }
@@ -1885,7 +1848,7 @@ pub(super) async fn try_handle_cross_shard_commands(
                 cmd_args,
                 conn.client_id,
             );
-            if conn.tracking_state.enabled && !conn.tracking_state.bcast {
+            if conn.tracking_state.tracks_reads() {
                 crate::tracking::invalidation::track_read_keys(
                     &ctx.tracking_table,
                     cmd,
@@ -2005,8 +1968,14 @@ pub(super) async fn try_handle_blocking<
     .await;
     drop(blocked_guard);
 
-    let mut blocking_response = match outcome {
-        crate::server::conn::blocking::BlockingOutcome::Reply(frame) => frame,
+    // `peer_gone_after_serve` (moon#1023): a shard served this client and
+    // then found it gone. The serve stands (as in redis), so the tracking
+    // invalidation and the AOF/replication record below run exactly as for a
+    // delivered reply; only the write to the dead socket is skipped. For a
+    // key another shard owns, replay drops that record (moon#1056).
+    let (mut blocking_response, peer_gone_after_serve) = match outcome {
+        crate::server::conn::blocking::BlockingOutcome::Reply(frame) => (frame, false),
+        crate::server::conn::blocking::BlockingOutcome::ServedPeerGone(frame) => (frame, true),
         crate::server::conn::blocking::BlockingOutcome::PeerGone => {
             responses.clear();
             return BlockingResult::PeerGone;
@@ -2094,6 +2063,12 @@ pub(super) async fn try_handle_blocking<
                 }
             }
         }
+    }
+
+    if peer_gone_after_serve {
+        // Logged above; nobody left to write the reply to.
+        responses.clear();
+        return BlockingResult::PeerGone;
     }
 
     // moon#559 / moon#462: this is an INTERCEPT — it short-circuits the

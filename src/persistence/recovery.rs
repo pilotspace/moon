@@ -78,6 +78,12 @@ pub struct RecoveryResult {
     /// traffic, so restart-to-ready stays seconds-scale regardless of
     /// cold-plane size. See `storage::tiered::kv_spill::classify_orphan_heap_files`.
     pub pending_heap_orphans: Vec<std::path::PathBuf>,
+    /// moon#914 (b): Phase 4b replayed the legacy `appendonly.aof` and no
+    /// `MOON.COLDCUT` opened it, so every cold file was readable during that
+    /// replay. Such a file was written before the cut existed (a pre-#1017
+    /// tokio `--shards 1` AOF). The caller decides whether to rewrite it so
+    /// the next replay is gated; see `main.rs`.
+    pub aof_replayed_without_cold_cut: bool,
     // NOTE: the ColdIndex rebuilt in Phase 3 is attached directly to
     // `databases[0]` BEFORE Phase 4 replay (never returned here) so that
     // replayed deletes tombstone the cold plane — see the Phase 3 comment.
@@ -395,75 +401,123 @@ pub fn recover_shard_v3_pitr(
     // path normal (non-restart) cold read-through already uses. This is the
     // ONLY place a KvLeaf DataFile is read during recovery now.
     if manifest_path.exists() {
-        if let Ok(manifest) = ShardManifest::open(&manifest_path) {
-            let per_db =
-                crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest_per_db(
-                    shard_dir, &manifest,
-                );
-            // Observability parity with the removed hot-reload loop's
-            // counter: report how many keys the cold tier recovered, NOT
-            // how many were loaded into RAM (zero, by design).
-            result.kv_heap_entries_loaded = per_db.iter().map(|(_, ci)| ci.len()).sum();
-            // Attach each database's index to ITS database (#139 — spilled
-            // SELECT >0 keys used to recover into db0's index, unreachable
-            // from their own db) BEFORE Phase 4 replay. Replayed
-            // DEL/UNLINK/FLUSH*/EXPIRE-past must tombstone the cold plane:
-            // with `cold_index == None`, `remove_counting_cold()`/`clear()`
-            // are silent no-ops (`as_mut()` on None), so a key deleted in
-            // the WAL tail resurrects via cold read-through after restart
-            // whenever the crash lands inside the pre-orphan-sweep window
-            // (the manifest entry is still Active until the sweep).
-            for (db_index, cold_idx) in per_db {
-                info!(
-                    "Shard {}: rebuilt cold index for db {} with {} entries",
+        match ShardManifest::open(&manifest_path) {
+            Err(e) => {
+                // Phase 2 already warned that the manifest failed to open;
+                // this is the CONSEQUENCE, which that line does not state:
+                // no cold index at all, so every spilled key reads as an
+                // absent key until the manifest is repaired (moon#875).
+                tracing::error!(
                     shard_id,
-                    db_index,
-                    cold_idx.len()
+                    path = %manifest_path.display(),
+                    err = %e,
+                    "cold recovery: manifest unreadable, cold index NOT rebuilt — every \
+                     spilled key of this shard reads as ABSENT until the manifest is repaired \
+                     and the server restarts"
                 );
-                match databases.get_mut(db_index) {
-                    Some(db) => {
-                        db.cold_shard_dir = Some(shard_dir.to_path_buf());
-                        match db.cold_index.as_mut() {
-                            Some(existing) => existing.merge(cold_idx),
-                            None => db.cold_index = Some(cold_idx),
+            }
+            Ok(manifest) => {
+                let crate::storage::tiered::cold_index::ColdRebuild { per_db, report } =
+                    crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest_per_db(
+                        shard_dir, &manifest,
+                    );
+                // moon#875: the one line that distinguishes a clean rebuild
+                // from one that skipped forty files. Loss classes are counted
+                // into `INFO` too, so a monitor can alarm on them.
+                crate::command::info_reclamation::record_cold_recovery_report(&report);
+                if report.is_degraded() {
+                    tracing::error!(
+                        shard_id,
+                        files_attempted = report.files_attempted,
+                        files_read = report.files_read,
+                        files_missing = report.files_missing,
+                        files_unreadable = report.files_unreadable,
+                        files_short = report.files_short,
+                        short_file_bytes = report.short_file_bytes,
+                        pages_scanned = report.pages_scanned,
+                        pages_rejected = report.pages_rejected,
+                        partial_page_bytes = report.partial_page_bytes,
+                        entries_recovered = report.entries_recovered,
+                        entries_rejected = report.entries_rejected,
+                        "cold index rebuild DEGRADED: some spilled keys were NOT recovered and \
+                     now read as absent — see the `cold recovery:` lines above for the files"
+                    );
+                } else {
+                    info!(
+                        shard_id,
+                        files_read = report.files_read,
+                        pages_scanned = report.pages_scanned,
+                        pages_overflow = report.pages_overflow,
+                        entries_recovered = report.entries_recovered,
+                        "cold index rebuild clean"
+                    );
+                }
+                // Observability parity with the removed hot-reload loop's
+                // counter: report how many keys the cold tier recovered, NOT
+                // how many were loaded into RAM (zero, by design).
+                result.kv_heap_entries_loaded = per_db.iter().map(|(_, ci)| ci.len()).sum();
+                // Attach each database's index to ITS database (#139 — spilled
+                // SELECT >0 keys used to recover into db0's index, unreachable
+                // from their own db) BEFORE Phase 4 replay. Replayed
+                // DEL/UNLINK/FLUSH*/EXPIRE-past must tombstone the cold plane:
+                // with `cold_index == None`, `remove_counting_cold()`/`clear()`
+                // are silent no-ops (`as_mut()` on None), so a key deleted in
+                // the WAL tail resurrects via cold read-through after restart
+                // whenever the crash lands inside the pre-orphan-sweep window
+                // (the manifest entry is still Active until the sweep).
+                for (db_index, cold_idx) in per_db {
+                    info!(
+                        "Shard {}: rebuilt cold index for db {} with {} entries",
+                        shard_id,
+                        db_index,
+                        cold_idx.len()
+                    );
+                    match databases.get_mut(db_index) {
+                        Some(db) => {
+                            db.cold_shard_dir = Some(shard_dir.to_path_buf());
+                            match db.cold_index.as_mut() {
+                                Some(existing) => existing.merge(cold_idx),
+                                None => db.cold_index = Some(cold_idx),
+                            }
                         }
-                    }
-                    None => {
-                        // --databases was reduced below what this manifest
-                        // was written under. The keys are unreachable either
-                        // way (their db no longer exists); refuse to attach
-                        // them to a WRONG db and say so loudly instead of
-                        // silently resurrecting them elsewhere.
-                        tracing::warn!(
-                            shard_id,
-                            db_index,
-                            entries = cold_idx.len(),
-                            "cold recovery: manifest references a logical db beyond the \
+                        None => {
+                            // --databases was reduced below what this manifest
+                            // was written under. The keys are unreachable either
+                            // way (their db no longer exists); refuse to attach
+                            // them to a WRONG db and say so loudly instead of
+                            // silently resurrecting them elsewhere.
+                            tracing::warn!(
+                                shard_id,
+                                db_index,
+                                entries = cold_idx.len(),
+                                "cold recovery: manifest references a logical db beyond the \
                              configured --databases count; its spilled keys are NOT attached \
                              (unreachable until the server is restarted with enough databases)"
-                        );
+                            );
+                        }
                     }
                 }
-            }
-            // Crash-orphan sweep (task #55): heap files written but never
-            // registered in the manifest (crash between spill write and
-            // manifest commit) leak disk forever otherwise. Manifest opened
-            // OK — safe to classify. Only CLASSIFY here (cheap: read_dir +
-            // HashSet membership, no `remove_file` syscalls) so recovery
-            // stays fast at any cold-plane size; the actual deletes are
-            // deferred to a background sweep the caller starts once the
-            // shard is serving traffic (see `Shard::restore_from_persistence`
-            // / `event_loop.rs`'s `pending_heap_orphans` handoff).
-            let pending =
-                crate::storage::tiered::kv_spill::classify_orphan_heap_files(shard_dir, &manifest);
-            if !pending.is_empty() {
-                info!(
-                    "Shard {}: classified {} crash-orphaned heap file(s), deferred for background reclaim",
-                    shard_id,
-                    pending.len()
+                // Crash-orphan sweep (task #55): heap files written but never
+                // registered in the manifest (crash between spill write and
+                // manifest commit) leak disk forever otherwise. Manifest opened
+                // OK — safe to classify. Only CLASSIFY here (cheap: read_dir +
+                // HashSet membership, no `remove_file` syscalls) so recovery
+                // stays fast at any cold-plane size; the actual deletes are
+                // deferred to a background sweep the caller starts once the
+                // shard is serving traffic (see `Shard::restore_from_persistence`
+                // / `event_loop.rs`'s `pending_heap_orphans` handoff).
+                let pending = crate::storage::tiered::kv_spill::classify_orphan_heap_files(
+                    shard_dir, &manifest,
                 );
+                if !pending.is_empty() {
+                    info!(
+                        "Shard {}: classified {} crash-orphaned heap file(s), deferred for background reclaim",
+                        shard_id,
+                        pending.len()
+                    );
+                }
+                result.pending_heap_orphans = pending;
             }
-            result.pending_heap_orphans = pending;
         }
     }
 
@@ -477,6 +531,9 @@ pub fn recover_shard_v3_pitr(
     // WAL: every KV write since the last snapshot was lost on restart.
     let mut kv_commands_replayed = 0usize;
     let mut kv_commands_skipped = 0usize;
+    // moon#1039: KV records whose header db is beyond the configured
+    // `--databases` count. Dropped rather than folded into db 0.
+    let mut kv_records_db_out_of_range = 0usize;
     let wal_dir = shard_dir.join("wal-v3");
     if wal_dir.exists() {
         let mut selected_db = 0usize;
@@ -487,6 +544,20 @@ pub fn recover_shard_v3_pitr(
                         // The AOF replays this write after this pass; applying
                         // it here would only be wiped (see the fn docs).
                         kv_commands_skipped += 1;
+                        return;
+                    }
+                    // moon#1039: every record starts in the db it was written
+                    // for. The payload is a bare command (no `SELECT`), so a
+                    // context carried over from the previous record would be
+                    // wrong; a record with no db context (db-agnostic, or
+                    // pre-#1039) replays into db 0 as it always has.
+                    selected_db = record.replay_db();
+                    if selected_db >= databases.len() {
+                        // A restart with fewer `--databases` than the writer
+                        // had: the record's db does not exist. Folding it into
+                        // db 0 (what `replay_command` would do) is the very
+                        // cross-db corruption this guards against.
+                        kv_records_db_out_of_range += 1;
                         return;
                     }
                     // Parse RESP frames from the serialized command payload.
@@ -509,7 +580,20 @@ pub fn recover_shard_v3_pitr(
                                     &mut selected_db,
                                 );
                                 result.commands_replayed += 1;
-                                kv_commands_replayed += 1;
+                                // moon#914: a cold-plane record is not KV
+                                // history. `ColdMarkerSink` mirrors every
+                                // `MOON.SPILLED` into this WAL under
+                                // `--wal-kv-log on`, so counting it made one
+                                // spill marker enough to skip the Phase 4b
+                                // AOF fallback — the WAL (which never holds a
+                                // connection-local write) became the "KV
+                                // authority" and the AOF's entire history was
+                                // discarded. Same class as the FileCreate
+                                // records the gate below already excludes.
+                                if !crate::persistence::cold_records::is_cold_plane_record(cmd_name)
+                                {
+                                    kv_commands_replayed += 1;
+                                }
                             }
                         }
                     }
@@ -717,6 +801,16 @@ pub fn recover_shard_v3_pitr(
                         shard_id, kv_commands_skipped
                     );
                 }
+                if kv_records_db_out_of_range > 0 {
+                    tracing::warn!(
+                        shard_id,
+                        records = kv_records_db_out_of_range,
+                        databases = databases.len(),
+                        "WAL v3 KV records for a logical db beyond the configured \
+                         --databases count were NOT replayed (restart with enough \
+                         databases to recover them)"
+                    );
+                }
             }
             Err(e) => {
                 // #452.2: a mid-chain tear must ABORT boot, not degrade to a
@@ -782,6 +876,9 @@ pub fn recover_shard_v3_pitr(
     // demoted right below and then wiped. A 2.2M-key instance logged
     // "no appendonly.aof found — replayed 2397677 records from legacy-mode
     // WAL v3" on every boot while holding a perfectly good manifest AOF.
+    // moon#914 (b): set when the AOF below replayed at least one record, so
+    // the reconcile can report whether a cut opened it.
+    let mut aof_replayed = false;
     if kv_commands_replayed == 0 && !kv_authority_elsewhere {
         if let Some(v2_dir) = v2_persistence_dir {
             let aof_path = v2_dir.join("appendonly.aof");
@@ -793,6 +890,7 @@ pub fn recover_shard_v3_pitr(
                 match crate::persistence::aof::replay_aof(databases, &aof_path, engine) {
                     Ok(n) => {
                         result.commands_replayed += n;
+                        aof_replayed = n > 0;
                         info!("Shard {}: AOF fallback replayed {} commands", shard_id, n);
                     }
                     Err(e) => {
@@ -860,8 +958,26 @@ pub fn recover_shard_v3_pitr(
     // moon#902: routed through `finish_replay_cold_reconcile`, which is the
     // task #56 demote for a legacy log and the gated hot-wins reconcile when
     // the replayed log opened with `MOON.COLDCUT`.
-    if !kv_authority_elsewhere && let Some(db0) = databases.first_mut() {
-        let r = db0.finish_replay_cold_reconcile();
+    //
+    // moon#914: EVERY database's open generation, not just db 0's.
+    // `MOON.COLDCUT` installs its gate on every database
+    // (`replay_cold_plane_record`), and a gate that outlives replay hides
+    // every cold file at or past its watermark from the live server — every
+    // key spilled after the boot would then read as absent. The tokio
+    // `--shards 1` AOF carries that head since #914, so closing only db 0
+    // would leave SELECT 1..N gated forever. db 0 keeps its unconditional
+    // call (the task #56 demote for a pre-#902 log, unchanged); dbs 1..N are
+    // closed only when their generation is open, so a pre-#902 log sees no
+    // new cold-wins demote there.
+    if !kv_authority_elsewhere && let Some((db0, rest)) = databases.split_first_mut() {
+        let mut r = db0.finish_replay_cold_reconcile();
+        let rest = crate::storage::db::close_replay_generation(rest);
+        r.gated |= rest.gated;
+        r.hot_demoted += rest.hot_demoted;
+        r.cold_dropped += rest.cold_dropped;
+        // `gated` is true exactly when a `MOON.COLDCUT` installed its gate
+        // during this replay, so an AOF that replayed without one has no cut.
+        result.aof_replayed_without_cold_cut = aof_replayed && !r.gated;
         if r.hot_demoted > 0 || r.cold_dropped > 0 {
             info!(
                 "Shard {}: Phase 4b cold-plane reconcile (gated={}): {} hot shadow(s) demoted \
@@ -1041,6 +1157,82 @@ mod tests {
         let ctl = ShardControlFile::read(&ctl_path).unwrap();
         assert_eq!(ctl.shard_state, ShardState::Running);
         assert_eq!(ctl.wal_flush_lsn, 3);
+    }
+
+    /// moon#1039: a WAL holding both pre-#1039 records (no db context) and
+    /// db-carrying records replays each record into its own db. A db-less
+    /// record AFTER a db-3 record still lands in db 0 — the context is per
+    /// record, never carried over — and a record for a db beyond the
+    /// configured count is dropped, never folded into db 0.
+    #[test]
+    fn phase4_replays_mixed_format_wal_per_record_db_1039() {
+        use crate::persistence::wal_v3::record::write_wal_v3_record_in_db;
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let wal_dir = shard_dir.join("wal-v3");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let set = |k: &str, v: &str| {
+            format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\n{k}\r\n${}\r\n{v}\r\n",
+                k.len(),
+                v.len()
+            )
+            .into_bytes()
+        };
+        let mut data = make_v3_header(0);
+        // pre-#1039 record: no db context
+        write_wal_v3_record(&mut data, 1, WalRecordType::Command, &set("old_a", "0"));
+        write_wal_v3_record_in_db(
+            &mut data,
+            2,
+            WalRecordType::Command,
+            Some(3),
+            &set("b", "3"),
+        );
+        // pre-#1039 record after a db-3 record: must NOT inherit db 3
+        write_wal_v3_record(&mut data, 3, WalRecordType::Command, &set("old_c", "0"));
+        write_wal_v3_record_in_db(
+            &mut data,
+            4,
+            WalRecordType::Command,
+            Some(0),
+            &set("d", "0"),
+        );
+        // db 20 does not exist with 16 databases
+        write_wal_v3_record_in_db(
+            &mut data,
+            5,
+            WalRecordType::Command,
+            Some(20),
+            &set("e", "x"),
+        );
+        std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
+
+        let mut databases: Vec<Database> = (0..16).map(|_| Database::new()).collect();
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
+        assert_eq!(result.last_lsn, 5);
+
+        let has = |dbs: &mut [Database], db: usize, key: &'static [u8]| dbs[db].exists(key);
+        assert!(has(&mut databases, 0, b"old_a"), "pre-#1039 record -> db 0");
+        assert!(has(&mut databases, 3, b"b"), "db-3 record -> db 3");
+        assert!(
+            !has(&mut databases, 0, b"b"),
+            "db-3 record leaked into db 0"
+        );
+        assert!(
+            has(&mut databases, 0, b"old_c"),
+            "a db-less record must not inherit the previous record's db"
+        );
+        assert!(!has(&mut databases, 3, b"old_c"));
+        assert!(has(&mut databases, 0, b"d"), "explicit db-0 record -> db 0");
+        for db in 0..16 {
+            assert!(
+                !has(&mut databases, db, b"e"),
+                "a record for a nonexistent db must be dropped, found in db {db}"
+            );
+        }
     }
 
     /// P3b — PITR end-to-end: write 10 WAL commands, recover with
@@ -1766,6 +1958,130 @@ mod tests {
              AOF fallback and every KV write was dropped)",
             result.commands_replayed
         );
+    }
+
+    /// moon#914 (c): under `--wal-kv-log on`, `ColdMarkerSink` mirrors every
+    /// `MOON.SPILLED` into the shard's WAL as a `Command` record. On tokio
+    /// `--shards 1` no connection-local write ever reaches that WAL, so a
+    /// WAL holding ONLY markers has recorded no KV history at all — yet
+    /// Phase 4 counted the marker, Phase 4b skipped the AOF, and every key
+    /// the AOF held vanished (a live `kill -9` run: DBSIZE 248 -> 103).
+    #[test]
+    fn cold_plane_records_in_the_wal_do_not_suppress_the_aof_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let offload_wal_dir = shard_dir.join("wal-v3");
+        std::fs::create_dir_all(&offload_wal_dir).unwrap();
+        let marker = crate::persistence::cold_records::serialize_spilled(
+            7,
+            &[bytes::Bytes::from_static(b"k")],
+        );
+        let mut wal_data = make_v3_header(0);
+        write_wal_v3_record(&mut wal_data, 1, WalRecordType::Command, &marker);
+        std::fs::write(offload_wal_dir.join("000000000001.wal"), &wal_data).unwrap();
+
+        let v2_dir = tmp.path().join("legacy");
+        std::fs::create_dir_all(&v2_dir).unwrap();
+        std::fs::write(
+            v2_dir.join("appendonly.aof"),
+            b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n",
+        )
+        .unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        recover_shard_v3_with_fallback(
+            &mut databases,
+            0,
+            &shard_dir,
+            &engine,
+            Some(&v2_dir),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            databases[0].len(),
+            2,
+            "the AOF is the only KV history here and must be replayed; a WAL \
+             holding nothing but a MOON.SPILLED marker is not a KV authority"
+        );
+    }
+
+    /// moon#914: `MOON.COLDCUT` gates EVERY database, so Phase 4b must close
+    /// the generation on every database — closing only db 0 left SELECT 1..N
+    /// gated after replay, hiding every later cold file from the live server.
+    #[test]
+    fn phase_4b_closes_the_replay_generation_on_every_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        let v2_dir = tmp.path().join("legacy");
+        std::fs::create_dir_all(&v2_dir).unwrap();
+        let mut aof = crate::persistence::cold_records::serialize_cold_cut(1).to_vec();
+        aof.extend_from_slice(b"*2\r\n$6\r\nSELECT\r\n$1\r\n2\r\n");
+        aof.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        std::fs::write(v2_dir.join("appendonly.aof"), &aof).unwrap();
+
+        let mut databases: Vec<Database> = (0..4).map(|_| Database::new()).collect();
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        recover_shard_v3_with_fallback(
+            &mut databases,
+            0,
+            &shard_dir,
+            &engine,
+            Some(&v2_dir),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(databases[2].len(), 1, "the tail replayed into db 2");
+        for (i, db) in databases.iter().enumerate() {
+            assert!(
+                !db.replay_cold_gate_active(),
+                "db {i}: the replay gate outlived recovery"
+            );
+        }
+    }
+
+    /// moon#914 (b): recovery reports an AOF that replayed without a
+    /// `MOON.COLDCUT` (a pre-#1017 file) and does not report one that opened
+    /// with its cut, an empty one, or a boot with no AOF at all. `main.rs`
+    /// rewrites the AOF once on that signal.
+    #[test]
+    fn phase_4b_reports_an_aof_replayed_without_its_cold_cut() {
+        fn recover(aof: Option<&[u8]>) -> RecoveryResult {
+            let tmp = tempfile::tempdir().unwrap();
+            let shard_dir = tmp.path().join("shard-0");
+            std::fs::create_dir_all(&shard_dir).unwrap();
+            let v2_dir = tmp.path().join("legacy");
+            std::fs::create_dir_all(&v2_dir).unwrap();
+            if let Some(bytes) = aof {
+                std::fs::write(v2_dir.join("appendonly.aof"), bytes).unwrap();
+            }
+            let mut databases: Vec<Database> = (0..2).map(|_| Database::new()).collect();
+            recover_shard_v3_with_fallback(
+                &mut databases,
+                0,
+                &shard_dir,
+                &crate::persistence::replay::DispatchReplayEngine::new(),
+                Some(&v2_dir),
+                false,
+            )
+            .unwrap()
+        }
+        let set = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
+        let mut headed = crate::persistence::cold_records::serialize_cold_cut(4).to_vec();
+        headed.extend_from_slice(set);
+
+        assert!(
+            recover(Some(set)).aof_replayed_without_cold_cut,
+            "a legacy AOF with records and no head must be reported"
+        );
+        assert!(!recover(Some(&headed)).aof_replayed_without_cold_cut);
+        assert!(!recover(Some(b"")).aof_replayed_without_cold_cut);
+        assert!(!recover(None).aof_replayed_without_cold_cut);
     }
 
     #[test]

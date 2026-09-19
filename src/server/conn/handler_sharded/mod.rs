@@ -467,6 +467,11 @@ pub(crate) async fn handle_connection_sharded_inner<
             break;
         }
 
+        // CLIENT TRACKING REDIRECT inbox: registered only while subscribed,
+        // framed for the current protocol. Every UNSUBSCRIBE, RESET and HELLO
+        // path has run by here, before the connection waits again.
+        conn.sync_tracking_inbox(&ctx.tracking_table);
+
         // --- Subscriber mode: bidirectional select on client commands + published messages ---
         //
         // RESP2 ONLY, matching the monoio handler. A subscribed RESP3
@@ -751,7 +756,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                             continue;
                         }
                     };
-
+                    // CLIENT CACHING covers exactly the next command (moon#1049).
+                    // Before every intercept, so an unknown or refused command
+                    // consumes the flag exactly as redis's resetClient does.
+                    conn.tracking_state.before_command(cmd, conn.in_multi);
 
                     // Every intercept below answers through `shaped!()`, never through
                     // `responses` directly: an intercept short-circuits the dispatch exit
@@ -983,6 +991,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 client_addr: peer_addr.clone(),
                                 timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
                             });
+                            // moon#1035: inside MULTI a refusal poisons the block.
+                            conn.flag_transaction();
                             responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                             continue;
                         }
@@ -996,6 +1006,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 client_addr: peer_addr.clone(),
                                 timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
                             });
+                            // moon#1035: a denied KEY poisons an open transaction too.
+                            conn.flag_transaction();
                             responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                             continue;
                         }
@@ -1087,6 +1099,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // than applying the half that happened to be valid.
                         if let Some(err) = crate::server::conn::shared::queue_time_rejection(cmd, cmd_args) {
                             conn.multi_dirty = true;
+                            responses.push(err);
+                            continue;
+                        }
+                        // moon#1035: the ACL gate above checks command and keys,
+                        // never a PUBLISH channel — refuse a denied one HERE so
+                        // the block aborts, instead of at EXEC after the rest ran.
+                        if let Some(err) = crate::server::conn::shared::queued_publish_channel_deny(
+                            &ctx.acl_table,
+                            &conn.current_user,
+                            cmd,
+                            cmd_args,
+                        ) {
+                            conn.flag_transaction();
                             responses.push(err);
                             continue;
                         }
@@ -1309,33 +1334,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         continue;
                                     }
                                 }
-                                if is_multi_key_command(cmd, cmd_args) {
-                                    let first_slot = slot;
-                                    let mut cross_slot = false;
-                                    // COPY's keys are exactly args[0..2]; trailing args
-                                    // are the REPLACE literal — not slot-checked.
-                                    let key_args: &[Frame] = if cmd.eq_ignore_ascii_case(b"COPY") {
-                                        &cmd_args[..cmd_args.len().min(2)]
-                                    } else {
-                                        cmd_args
-                                    };
-                                    for arg in key_args.iter().skip(1) {
-                                        if let Some(k) = match arg {
-                                            Frame::BulkString(b) => Some(b.as_ref()),
-                                            _ => None,
-                                        } {
-                                            if crate::cluster::slots::slot_for_key(k) != first_slot {
-                                                cross_slot = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if cross_slot {
-                                        responses.push(Frame::Error(Bytes::from_static(
-                                            b"CROSSSLOT Keys in request don't hash to the same slot",
-                                        )));
-                                        continue;
-                                    }
+                                // moon#1012: only KEY positions are slot-checked
+                                // (`MSET {t}a x {t}b y` is one slot). Same function
+                                // as handler_monoio's cluster routing.
+                                if is_multi_key_command(cmd, cmd_args)
+                                    && crate::cluster::slots::keys_span_slots(cmd, cmd_args, slot)
+                                {
+                                    responses.push(Frame::Error(Bytes::from_static(
+                                        b"CROSSSLOT Keys in request don't hash to the same slot",
+                                    )));
+                                    continue;
                                 }
                             }
                         }
@@ -1632,30 +1640,31 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- MULTI / EXEC_CMD / DISCARD ---
-                    let mut exec_publishes: Vec<(usize, Bytes, Bytes)> = Vec::new();
+                    let mut exec_publishes: Vec<crate::shard::exec_publish::ExecPublish> = Vec::new();
                     if write::try_handle_multi_exec(cmd, cmd_args, &mut conn, ctx, &mut responses, &mut exec_publishes, &shutdown, &func_registry).await {
-                        // C2: PUBLISH queued inside MULTI fans out only now — after the
-                        // transaction body has been applied — and its placeholder in the
-                        // EXEC reply array is patched with the real receiver count.
+                        // C2: a PUBLISH or SPUBLISH (moon#1043) queued inside MULTI
+                        // fans out only now — after the transaction body has been
+                        // applied — into its own namespace, and its placeholder in
+                        // the EXEC reply array is patched with the receiver count.
                         if !exec_publishes.is_empty() {
                             let exec_idx = responses.len() - 1;
-                            for (inner, ch, msg) in exec_publishes.drain(..) {
-                                // Channel ACL gates the txn PUBLISH path (C2
+                            for p in exec_publishes.drain(..) {
+                                // Channel ACL gates the txn publish path (C2
                                 // security): a denied channel is patched with
                                 // NOPERM and never fanned out.
                                 let patched = match crate::server::conn::shared::publish_channel_acl_deny(
                                     &ctx.acl_table,
                                     &conn.current_user,
-                                    &ch,
+                                    &p.channel,
                                 ) {
                                     Some(err) => err,
                                     None => Frame::Integer(
-                                        crate::server::conn::shared::publish_post_txn(ctx, &shutdown, &ch, &msg).await,
+                                        crate::server::conn::shared::publish_post_txn(ctx, &shutdown, &p.channel, &p.message, p.kind).await,
                                     ),
                                 };
                                 if let Frame::Array(items) = &mut responses[exec_idx] {
-                                    if inner < items.len() {
-                                        items[inner] = patched;
+                                    if p.slot < items.len() {
+                                        items[p.slot] = patched;
                                     }
                                 }
                             }
@@ -1701,8 +1710,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                             &mut stream, &mut read_buf,
                         ).await;
                         drop(blocked_guard);
-                        let mut blocking_response = match blocking_outcome {
-                            crate::server::conn::blocking::BlockingOutcome::Reply(frame) => frame,
+                        // `peer_gone_after_serve` (moon#1023): the serve stands,
+                        // so it is invalidated and logged below exactly as a
+                        // delivered reply — AOF only on this runtime, and
+                        // dropped on replay for a remote key (moon#1056); only
+                        // the write is skipped.
+                        let (mut blocking_response, peer_gone_after_serve) = match blocking_outcome {
+                            crate::server::conn::blocking::BlockingOutcome::Reply(frame) => (frame, false),
+                            crate::server::conn::blocking::BlockingOutcome::ServedPeerGone(frame) => (frame, true),
                             // Peer vanished mid-block: registrations are torn
                             // down, nothing to reply to, close the connection.
                             crate::server::conn::blocking::BlockingOutcome::PeerGone => {
@@ -1782,6 +1797,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                             }
                         }
                     }
+                        if peer_gone_after_serve {
+                            // Logged above; nobody left to write the reply to.
+                            arena.reset();
+                            return (HandlerResult::Done, None);
+                        }
                         let blocking_response = apply_resp3_conversion(
                             cmd,
                             cmd_args,
@@ -2091,7 +2111,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             resp3_shape,
                         ) {
                             responses.push(Frame::Null); // filled by the fold
-                            if conn.tracking_state.enabled && !conn.tracking_state.bcast {
+                            if conn.tracking_state.tracks_reads() {
                                 crate::tracking::invalidation::track_read_keys(
                                     &ctx.tracking_table,
                                     cmd,
@@ -2189,7 +2209,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 cmd_args,
                                 client_id,
                             );
-                            if conn.tracking_state.enabled && !conn.tracking_state.bcast {
+                            if conn.tracking_state.tracks_reads() {
                                 crate::tracking::invalidation::track_read_keys(
                                     &ctx.tracking_table,
                                     cmd,
@@ -2306,18 +2326,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                             use crate::command::keyspace::move_cmd as ksmv;
                             let src_db = conn.selected_db;
                             let db_count = ctx.shard_databases.db_count();
-                            let response = match ksmv::parse_move_args(cmd_args, db_count) {
+                            // `resolve_move` refuses `dst_db == src_db` with
+                            // redis's same-object error (moon#1062).
+                            let response = match ksmv::resolve_move(cmd_args, src_db, db_count) {
                                 Err(e) => e,
-                                Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
                                 Ok((key, dst_db)) => {
                                     // Unconditional slice path: ShardSlice is always initialized.
                                     // L4: `with_pair` is the exact contract
                                     // `with_two_slice_dbs` had — asserts the
                                     // indexes differ, panics out of range,
                                     // acquires ascending, hands the closure
-                                    // (src, dst). The `dst_db == src_db` match
-                                    // arm above short-circuits, so the
-                                    // distinct-db assert cannot fire here.
+                                    // (src, dst). `resolve_move` never yields
+                                    // `dst_db == src_db`, so the distinct-db
+                                    // assert cannot fire here.
                                     crate::shard::slice::with_shard(|s| {
                                         s.databases.with_pair(src_db, dst_db, |src, dst| {
                                             ksmv::move_core(src, dst, &key)
@@ -2951,8 +2972,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     );
                                 }
                             }
-                            if conn.tracking_state.enabled
-                                && !conn.tracking_state.bcast
+                            if conn.tracking_state.tracks_reads()
                                 && !matches!(response, Frame::Error(_))
                             {
                                 crate::tracking::invalidation::track_read_keys(
@@ -3011,7 +3031,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // Remote READ by a tracking client: register the keys
                         // now (Redis tracks reads even for missing keys, so
                         // registering before the reply is faithful).
-                        if conn.tracking_state.enabled && !conn.tracking_state.bcast {
+                        if conn.tracking_state.tracks_reads() {
                             crate::tracking::invalidation::track_read_keys(
                                 &ctx.tracking_table,
                                 cmd,
@@ -3531,7 +3551,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                     None => std::future::pending().await,
                 }
             } => {
-                if let Some(push_frame) = push {
+                // A RESP2 connection cannot carry a push; redis writes it
+                // nothing (its invalidations reach it only as a REDIRECT
+                // target, through the pub/sub channel).
+                if let Some(push_frame) = push.filter(|_| {
+                    crate::tracking::client_cmd::push_deliverable(conn.protocol_version)
+                }) {
                     write_buf.clear();
                     crate::protocol::serialize_resp3(&push_frame, &mut write_buf);
                     if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) {

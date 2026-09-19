@@ -320,6 +320,11 @@ pub(crate) struct ConnectionState {
     // Tracking
     pub tracking_state: TrackingState,
     pub tracking_rx: Option<channel::MpscReceiver<Frame>>,
+    /// This connection's pub/sub channel, registered as a CLIENT TRACKING
+    /// REDIRECT inbox while it is subscribed (moon#1048); kept in step by
+    /// [`ConnectionState::sync_tracking_inbox`]. Dropping it — on any exit
+    /// from the handler — unregisters.
+    pub tracking_inbox: Option<crate::tracking::client_cmd::InboxGuard>,
 
     // WATCH/EXEC optimistic locking. Read by all three dispatch paths — the
     // `handler_single only` note and its dead_code allow were accurate right up
@@ -413,6 +418,7 @@ impl ConnectionState {
             saw_replconf: false,
             tracking_state: TrackingState::default(),
             tracking_rx: None,
+            tracking_inbox: None,
             watched_keys: HashMap::new(),
             affinity_tracker: if num_shards > 1 && can_migrate {
                 Some(AffinityTracker::new(shard_id, num_shards))
@@ -531,6 +537,54 @@ impl ConnectionState {
         if let Some(txn) = self.active_cross_txn.as_mut() {
             txn.record_rejected_op(cmd);
         }
+    }
+
+    /// Redis's `flagTransaction`: a command was REFUSED while a transaction is
+    /// open, so `EXEC` must abort the whole block. A no-op outside `MULTI`, so
+    /// a refusal site never has to re-check `in_multi` itself.
+    ///
+    /// moon#1035: every ACL refusal must call this. A command denied inside
+    /// `MULTI` used to be answered `NOPERM` and simply not queued, so `EXEC`
+    /// then applied the rest. Measured against redis-server 8.6.1 with a
+    /// `-flushall` user:
+    ///
+    /// ```text
+    /// MULTI / SET mx 1 / FLUSHALL / EXEC
+    ///   redis -> -NOPERM, then -EXECABORT     (mx unset)
+    ///   moon  -> -NOPERM, then *1 +OK         (mx set)
+    /// ```
+    ///
+    /// Redis's `rejectCommand` flags the transaction for EVERY rejection inside
+    /// `MULTI` — command, subcommand, key or channel — without asking why the
+    /// check failed, and the ACL gates call this the same way: on the verdict
+    /// of `check_command_permission(user, cmd, args)` and its siblings. A rule
+    /// those learn to enforce later (per-subcommand `-config|set`) poisons the
+    /// transaction with no change here.
+    ///
+    /// Cleared, like every other queue-time fault, by EXEC, DISCARD and RESET.
+    #[inline]
+    pub fn flag_transaction(&mut self) {
+        if self.in_multi {
+            self.multi_dirty = true;
+        }
+    }
+
+    /// Bring the REDIRECT inbox in step with this connection's subscription
+    /// count and protocol — see [`crate::tracking::client_cmd::sync_inbox`].
+    /// Two connection-local loads when nothing changed.
+    #[inline]
+    pub fn sync_tracking_inbox(
+        &mut self,
+        table: &std::sync::Arc<parking_lot::Mutex<crate::tracking::TrackingTable>>,
+    ) {
+        crate::tracking::client_cmd::sync_inbox(
+            &mut self.tracking_inbox,
+            self.subscription_count > 0,
+            self.protocol_version >= 3,
+            self.pubsub_tx.as_ref(),
+            self.client_id,
+            table,
+        );
     }
 
     /// D4 (#438): whether this connection may migrate to another shard

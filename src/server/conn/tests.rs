@@ -1323,6 +1323,32 @@ fn migration_eligibility_gate() {
     );
 }
 
+/// moon#1035: `flag_transaction` is redis's `flagTransaction` — it poisons an
+/// OPEN transaction and is a no-op outside one. The no-op half matters as much
+/// as the other: a flag set outside MULTI would leak into the NEXT transaction
+/// and abort it for a refusal that happened before it began.
+#[test]
+fn flag_transaction_poisons_only_an_open_transaction() {
+    let mut c = crate::server::conn::core::ConnectionState::new(
+        1,
+        "127.0.0.1:1".to_string(),
+        &None,
+        0,
+        4,
+        true,
+        128,
+        None,
+    );
+    c.flag_transaction();
+    assert!(
+        !c.multi_dirty,
+        "a refusal outside MULTI must not poison a later transaction"
+    );
+    c.in_multi = true;
+    c.flag_transaction();
+    assert!(c.multi_dirty, "a refusal inside MULTI must poison it");
+}
+
 /// moon#660: a plain `SET` must NOT inline while `CLIENT PAUSE` is in force.
 ///
 /// `client_pause::check_pause` is consulted once per frame in the GENERIC loop,
@@ -1421,10 +1447,18 @@ fn test_inline_set_stands_down_under_client_pause() {
 /// `maxmemory` of 1 byte makes `inline_write_can_skip_eviction` false for any
 /// non-empty shard, so the two calls below differ ONLY in the operand under
 /// test. The hints are process-global, which is why this runs under
-/// `inline_test_lock()` and restores them before returning.
+/// `inline_test_lock()` and scopes them with `PublishedLimits`.
+///
+/// moon#856: the restore used to be a manual `publish_maxmemory_hints(default)`
+/// placed before the assertions — deliberately, so a failing assert could not
+/// poison the next test to take the lock. It could not cover a panic INSIDE
+/// `run` (`try_inline_dispatch` is the code under test), which would skip it
+/// entirely. The guard restores on the unwind path too, so the manual line is
+/// gone and the ordering no longer matters.
 #[test]
 fn test_inline_set_bails_only_when_a_spill_sender_is_live() {
     let _serial = inline_test_lock();
+    let _limits = crate::storage::eviction::PublishedLimits::capture();
     let dbs = make_dbs();
     let cmd = b"*3\r\n$3\r\nSET\r\n$6\r\nekey01\r\n$3\r\nbar\r\n";
     let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
@@ -1462,9 +1496,8 @@ fn test_inline_set_bails_only_when_a_spill_sender_is_live() {
     let (no_sender, _, _) = run(false);
     let (with_sender, left, answered) = run(true);
 
-    // Restore before asserting, so a failure cannot leave the statics poisoned
-    // for whatever test takes the lock next.
-    crate::storage::eviction::publish_maxmemory_hints(&crate::config::RuntimeConfig::default());
+    // No manual restore here: `_limits` above puts the hints back when this
+    // test returns OR unwinds (moon#856).
 
     // CONTROL: with no spill sender there is nothing to route victims to, so
     // eviction pressure alone must NOT stand the inline path down. Without
@@ -1486,6 +1519,103 @@ fn test_inline_set_bails_only_when_a_spill_sender_is_live() {
         "the declined command must be left byte-for-byte in read_buf"
     );
     assert_eq!(answered, 0, "the inline path must not answer when it bails");
+}
+
+/// moon#1036: the inline pre-gate must charge the cold index, as the pressure
+/// cascade and the generic gate do.
+///
+/// `maxmemory` is published BETWEEN the two figures: the hot set alone fits,
+/// the hot set plus the cold index's RAM does not. The cascade evicts at that
+/// budget (it publishes hot + cold index), so eviction is due and a live spill
+/// sender means the inline path must stand down. Before the fix the pre-gate
+/// compared hot bytes only, answered "no pressure" and inlined — measured on
+/// the Linux runner as a burst of inlined writes after every 100 ms tick.
+#[test]
+fn test_inline_set_pre_gate_charges_the_cold_index() {
+    let _serial = inline_test_lock();
+    let dbs = make_dbs();
+    let cmd = b"*3\r\n$3\r\nSET\r\n$6\r\nckey01\r\n$3\r\nbar\r\n";
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
+    let rt_config = make_rt_config();
+
+    let (hot, ci) = crate::shard::slice::with_shard_db(0, |db| {
+        for i in 0..32 {
+            db.set(
+                format!("hot:{i:04}").as_bytes(),
+                Entry::new_string(Bytes::from(vec![b'v'; 200])),
+            );
+        }
+        let mut index = crate::storage::tiered::cold_index::ColdIndex::new();
+        for i in 0..256u16 {
+            index.insert(
+                Bytes::from(format!("cold:{i:06}")),
+                crate::storage::tiered::cold_index::ColdLocation {
+                    file_id: 1,
+                    page_idx: 0,
+                    slot_idx: i,
+                    ttl_ms: None,
+                    value_type: crate::persistence::kv_page::ValueType::String,
+                },
+            );
+        }
+        let ci = index.resident_bytes();
+        db.cold_index = Some(index);
+        (db.estimated_memory(), ci)
+    });
+    assert!(ci > 0, "fixture: the cold index must occupy RAM");
+
+    let run = |maxmemory: usize| {
+        let cfg = crate::config::RuntimeConfig {
+            maxmemory,
+            ..crate::config::RuntimeConfig::default()
+        };
+        crate::storage::eviction::publish_maxmemory_hints(&cfg);
+        let mut read_buf = BytesMut::from(&cmd[..]);
+        let mut write_buf = BytesMut::new();
+        let consumed = try_inline_dispatch(
+            &mut read_buf,
+            &mut write_buf,
+            &dbs,
+            0,
+            0,
+            &aof_pool,
+            &None,
+            0,
+            1,
+            true,
+            true,
+            false,
+            &rt_config,
+            true, // spill_sender_active: victims must be SPILLED, not dropped
+            &mut test_probe(),
+        );
+        (consumed, read_buf.len())
+    };
+
+    // Budget between the figures: hot fits, hot + cold index does not.
+    let (between, left) = run(hot + ci / 2);
+    // CONTROL: a budget above both figures — nothing to evict, must inline.
+    let (roomy, _) = run((hot + ci) * 4);
+
+    crate::storage::eviction::publish_maxmemory_hints(&crate::config::RuntimeConfig::default());
+
+    assert_eq!(
+        roomy, 1,
+        "CONTROL: with room for hot + cold index the inline path must run"
+    );
+    assert_eq!(
+        between,
+        0,
+        "hot ({hot}) fits the budget but hot + cold index ({}) does not; the \
+         pressure cascade evicts here, so the inline path must stand down to \
+         the spilling generic gate instead of skipping eviction",
+        hot + ci
+    );
+    assert_eq!(
+        left,
+        cmd.len(),
+        "the declined command must stay in read_buf"
+    );
 }
 
 /// moon#660: a plain `SET` must NOT inline while this shard is still loading.

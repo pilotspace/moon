@@ -10,6 +10,9 @@ fn main() {
     // Rerun if environment changes
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    // `src/blocking/claim.rs` switches to loom's atomics under `--cfg loom`
+    // (it is compiled into tests/loom_blocking_claim.rs); declare the name.
+    println!("cargo::rustc-check-cfg=cfg(loom)");
 
     if let Some(version) = detect_cuda_version() {
         println!("cargo:rustc-cfg=has_cuda_toolkit");
