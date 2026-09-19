@@ -3130,6 +3130,65 @@ assert_eq "tracking: REDIRECT target resubscribed after RESET gets the RESP2 mes
     "$(tracking_redirect_transcript "$PORT_RUST" tcr:k2 "$TRK_RESUB_RESP2")"
 
 # ---------------------------------------------------------------------------
+# moon#1089 -- scripts are visible to CLIENT TRACKING. A write made through
+# `redis.call` invalidated nothing, and a read made inside a script was never
+# tracked for the client that ran it. The read row's script is spelled with Lua
+# long strings (`[[GET]]`) so the inline command needs no quoting.
+# ---------------------------------------------------------------------------
+TRK_EVAL_GET='EVAL return(redis.call([[GET]],KEYS[1])) 1 tev:r'
+both SET tev:r v
+both SET tev:w v
+assert_tracking_mode "tracking: a read made by EVAL is tracked (moon#1089)" \
+    "tev:r" OPTOUT "" "$TRK_EVAL_GET" SET tev:r v2
+assert_tracking_mode "tracking: a write made by EVAL invalidates (moon#1089)" \
+    "tev:w" OPTOUT "" "GET tev:w" EVAL "return redis.call('SET', KEYS[1], 'x')" 1 tev:w
+assert_tracking_mode "tracking: OPTIN, EVAL read without CACHING yes is not tracked (moon#1089)" \
+    "tev:r" OPTIN "" "$TRK_EVAL_GET" SET tev:r v3
+assert_tracking_mode "tracking: OPTIN, EVAL read after CACHING yes is tracked [control]" \
+    "tev:r" OPTIN "$CACHING_YES" "$TRK_EVAL_GET" SET tev:r v4
+
+# ---------------------------------------------------------------------------
+# moon#1090 -- a RESP2 subscriber pipelines past its last UNSUBSCRIBE. Redis
+# judges each command by the state it runs in, so the commands after the
+# UNSUBSCRIBE run normally; moon refused them with the subscriber-context
+# error (monoio) or left them unanswered (tokio). One write, whole transcript.
+# ---------------------------------------------------------------------------
+pipelined_transcript() {
+    local port="$1" payload="$2" line="" seen=""
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf '%s' "$payload" >&3
+    while IFS= read -r -t 1 line <&3; do
+        seen="${seen}${line%$'\r'}|"
+    done
+    exec 3>&-
+    echo "${seen:-NONE}"
+}
+TRK_UNSUB_PIPE=$'SUBSCRIBE x\r\nUNSUBSCRIBE\r\nSET tps:k v\r\nGET tps:k\r\n'
+TRK_RESET_PIPE=$'SUBSCRIBE x\r\nRESET\r\nSET tps:r v\r\nGET tps:r\r\n'
+assert_eq "pubsub: commands pipelined after the last UNSUBSCRIBE run (moon#1090)" \
+    "$(pipelined_transcript "$PORT_REDIS" "$TRK_UNSUB_PIPE")" \
+    "$(pipelined_transcript "$PORT_RUST" "$TRK_UNSUB_PIPE")"
+assert_eq "pubsub: commands pipelined after RESET run (moon#1090)" \
+    "$(pipelined_transcript "$PORT_REDIS" "$TRK_RESET_PIPE")" \
+    "$(pipelined_transcript "$PORT_RUST" "$TRK_RESET_PIPE")"
+
+# ---------------------------------------------------------------------------
+# moon#1078 -- CLIENT INFO reports tracking: `flags=t` (plus `B` for BCAST)
+# and `redir=` (0 with no redirect, -1 with tracking off). Moon hard-coded
+# `flags=N redir=-1`. Only those two fields are compared.
+# ---------------------------------------------------------------------------
+client_info_tracking_fields() {
+    local port="$1"; shift
+    printf '%s\n' "$@" CLIENT\ INFO | redis-cli -p "$port" 2>/dev/null \
+        | grep -o 'flags=[^ ]* \|redir=[^ ]* ' | tr -d '\n' || true
+}
+for tci_case in "CLIENT TRACKING on" "CLIENT TRACKING on BCAST" "CLIENT TRACKING on OPTIN" "PING"; do
+    assert_eq "CLIENT INFO tracking fields after [$tci_case] (moon#1078)" \
+        "$(client_info_tracking_fields "$PORT_REDIS" "$tci_case")" \
+        "$(client_info_tracking_fields "$PORT_RUST" "$tci_case")"
+done
+
+# ---------------------------------------------------------------------------
 # moon#644 -- every BLOCKING pop modifies the keyspace and must invalidate.
 #
 # `try_handle_blocking` is a THIRTEENTH write path, and nobody gave it the

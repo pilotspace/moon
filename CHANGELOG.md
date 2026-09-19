@@ -243,6 +243,139 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     kills a duplicate of the current copy that way), a segment holding the
     dead duplicate could claim the key first and the live copy in another
     segment was then tombstoned, losing the document. Only live rows count now.
+- **A COLD vector segment leaves `unloaded` with the search that reloads it,
+  and a delete that lands while the reload is waiting to install is no longer
+  lost** (moon#1070). Since the off-loop reload pool (prod-hardening #18) a
+  search only SUBMITTED the reload and answered from it; the reloaded segment
+  sat in the pool until some later search installed it, while the COLD stub
+  stayed the index's segment and the only place a DEL could be recorded. The
+  install then threw the stub away without replaying it: a document deleted
+  after the first search came back, as `vec:<id>`, on the next one (reproduced
+  on a real server). The install now replays the stub's tombstones, and the
+  yielding FT.SEARCH handlers install finished reloads as soon as the query
+  that awaited them is back on the shard, so `FT.INFO unloaded_segments` drops
+  to 0 with that search. Four `tests/vector_idle_unload.rs` tests that were
+  `#[ignore]`d -- and silently red on main -- now run in CI; only the
+  `ps`-based RSS measurement stays ignored.
+
+- **A restart no longer re-issues a cold-tier file id, which could apply a
+  write twice** (moon#1067). A restart resumes the shard's cold file-id
+  counter at one past the highest id the manifest or the disk still holds.
+  Manifest tombstone GC could prune the entry that held the highest id once
+  its file was reclaimed, and the counter then moved backwards. The AOF
+  appends to the same generation across restarts, so the generation still
+  held a `MOON.SPILLED <id>` record for the old file. On replay, that record
+  made the re-issued id readable early, and a write logged before its key
+  was spilled into the new file was applied on top of the value it had
+  already produced. Measured with `--appendonly yes --disk-offload enable`
+  and the tombstone retention at zero: `RPUSH X a` once, then spill, restart,
+  spill again, restart, and `LRANGE X` read `a a`, after both `kill -9` and
+  `SHUTDOWN`, on both runtimes. The same sequence with the default retention
+  (tombstones outlive the restart) read `a`. GC now keeps the tombstone that
+  holds the highest file id until a higher id is in the manifest. That pins
+  at most one manifest entry per shard. No on-disk format change.
+
+- **CLIENT TRACKING never drops an invalidation silently, scripts are
+  tracked, and a RESP2 subscriber's pipeline follows its live subscription
+  count** (moon#1088, moon#1089, moon#1090, refs moon#1078). Every wire reply
+  was read off redis-server 8.6.1 over a raw socket first.
+  - moon#1088: a tracking connection's invalidations went through a 256-slot
+    channel with `try_send`, so one 400-key `MSET` delivered 256 pushes and the
+    client kept serving the other 144 keys stale. The queue is now unbounded in
+    slots and bounded in bytes by `--client-output-buffer-limit-normal`; past
+    it the connection is closed through the `CLIENT KILL` path, which is what
+    redis does at its output-buffer limit (measured: `normal 8192 0 0` closes
+    the tracker on that `MSET`). The limit bounds what is QUEUED, as redis's
+    bounds its output buffer. A tracker that stops reading is always closed.
+    A tracker whose connection drains the queue on another shard thread
+    while the burst arrives can receive every push instead. A burst is
+    written in socket writes that never exceed that limit, and a RESP2
+    connection, which redis writes nothing for its own invalidations, queues
+    nothing. The RESP2/RESP3 switch takes effect at the `HELLO` itself, so a
+    pipelined `HELLO 3` / `GET k` / `BLPOP` still gets the push for `k`. A
+    RESP3 tracker that runs `MONITOR` keeps receiving its pushes, as on
+    redis; on monoio it used to receive none. A REDIRECT target that is
+    subscribed receives through its pub/sub channel: one command's
+    invalidations, or a whole script's or `EXEC` body's, now take one slot
+    there instead of one per key, and a target whose channel is still full is
+    disconnected rather than silently shorted.
+  - moon#1089: a write made through `redis.call` invalidated nothing, and a
+    read made inside a script was never tracked. The scripting bridge now
+    applies tracking to every command a script runs, as redis does inside
+    `call()`: writes invalidate (NOLOOP judged against the caller), reads
+    register for the client that ran the script under its OPTIN/OPTOUT/CACHING
+    state. `EVAL`, `EVALSHA`, `EVAL_RO`, `FCALL`, `FCALL_RO`, scripts routed to
+    another shard and scripts queued inside `MULTI` are all covered, and a
+    `FCALL` of a function that only reads no longer counts as a write of its
+    keys. A script's tracking effects are recorded without a lock as it runs
+    and applied in order under one tracking lock when it ends, so a script's
+    `redis.call`s do not each contend for the process-wide tracking mutex.
+  - moon#1090: commands a RESP2 client pipelined after its last `UNSUBSCRIBE`
+    (or `RESET`) were refused with the subscriber-context error on monoio and
+    left unanswered on tokio. The subscriber gate now judges each command by
+    the subscription count it runs under, and hands the rest of the batch back
+    to the normal path.
+  - moon#1078: `CLIENT LIST` and `CLIENT INFO` report tracking — `flags=t`,
+    `R` for a broken redirect, `B` for BCAST, and `redir=` (`0` with no
+    redirect, `-1` with tracking off). A RESP3 REDIRECT target that neither
+    subscribed nor enabled tracking still receives nothing: reaching it needs
+    either a channel on every RESP3 connection, which keeps each one out of
+    idle task parking (measured on monoio, macOS, `--conn-park-secs 2`: 2000
+    idle `HELLO 3` connections report `parked_clients:2000`, the same
+    connections holding a channel `parked_clients:0`), or a cross-thread wake of
+    a parked connection, which the idle-park machinery does not have. That
+    part of moon#1078 stays open.
+- **A served blocking pop is logged by the shard that popped it, at the moment
+  it popped** (moon#1056, moon#1097). Since moon#827 a `BLPOP`/`BRPOP`/
+  `BLMOVE`/`BRPOPLPUSH`/`BLMPOP`/`BZPOPMIN`/`BZPOPMAX`/`BZMPOP` that popped
+  propagated a synthesised record, but the WAITER's connection wrote it,
+  after the reply had reached it. At `--shards > 1` that is usually not the
+  shard owning the key, so the record sat in the wrong shard's AOF and replay
+  dropped it: 33 of 48 probes in the new kill -9 test (four owners, one
+  waiter connection, `appendfsync always`) came back with the popped element
+  restored. At any shard count the record could also land behind a later
+  write to the same key (`[a,b]`, pop `a`, `LPUSH x` recovered as `[a,b]`
+  instead of `[x,b]`, on disk and on a replica), and an AOF rewrite snapshot
+  could fall between the pop and its record, applying the pop twice. The
+  owner now appends the record to its own AOF and replication stream in the
+  pop's synchronous stretch, before the reply leaves (wake-served, claim-won
+  and immediately-served pops alike); the waiter only confirms the fsync on
+  the owner's writer under `appendfsync always`. A write that wakes a waiter
+  (a plain write, `EXEC`, `MOVE`/`COPY ... DB n` on the connection and on
+  every cross-shard SPSC arm) now logs itself before it serves the waiter, so
+  the pop always follows the push that fed it. A record the AOF writer cannot
+  take within its backpressure bound answers the waiter with the same
+  `MOONERR AOF backpressure` error as every other synchronous write, instead
+  of the element; that error, like `AOF fsync failed`, means the element may
+  have been consumed. One wake pass shares one backpressure bound across all
+  the pops it logs, so a saturated writer stalls the shard thread once, not
+  once per served waiter.
+
+- **A write is logged in the order it was applied, even when it waits after
+  applying** (moon#1084). Three paths applied a write, awaited something, and
+  only then appended it to the AOF (and, on monoio, to the replication
+  stream), so a write another client made in between was logged first and
+  replay applied the two in the wrong order:
+  - `EXEC` with a queued connection intercept (`WAIT`, `CLIENT`, `CONFIG`,
+    `SCRIPT`, `FUNCTION`, ...) logged its body after filling the intercept
+    replies. `SET k 0`, then `MULTI / INCR k / WAIT 1 1500 / EXEC` with
+    another client's `SET k 5` landing while `EXEC` was parked in `WAIT`:
+    the server acknowledged `5`, and after `kill -9` it recovered `6`; a
+    replica settled on `6` too. Seen on both runtimes at `--shards 1` and
+    `--shards 4`. The body is now logged and replicated right after it
+    runs, before any intercept is filled; the intercepts do not change the
+    keyspace. If the append fails, `EXEC` reports the error without running
+    the intercepts, as the owner-routed path already did.
+  - A typed `FLUSHDB`/`FLUSHALL` at `--shards > 1` logged this shard's flush
+    after broadcasting it to the other shards, so a key written to this shard
+    during the broadcast was replayed BEFORE the flush and vanished after a
+    restart. The flush is now logged before the broadcast, which also means a
+    broadcast that fails part-way no longer leaves this shard's flush out of
+    the log.
+  - A scattered `MSET` logged its local slice after awaiting the remote legs,
+    so a newer write to one of its local keys was replayed under the `MSET`
+    value. The slice is now logged right after it is applied.
+
 - **Three wire-parity gaps found probing redis-server 8.6.1 raw sockets**
   (moon#1060, moon#1076, moon#1077).
   - `ZRANGEBYSCORE`, `ZRANGE ... BYSCORE`/`BYLEX` and `ZREVRANGEBYSCORE`

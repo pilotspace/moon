@@ -74,7 +74,7 @@ pub(super) fn try_handle_hello(
     );
     if !matches!(&response, Frame::Error(_)) {
         crate::server::conn::shared::note_protocol_switch(conn, switch_index, new_proto);
-        conn.protocol_version = new_proto;
+        conn.set_protocol_version(new_proto);
     }
     if let Some(name) = new_name {
         conn.client_name = Some(name);

@@ -158,17 +158,30 @@ impl UnloadedSegment {
             self.handle.clone(),
             self.mlock_codes,
         )?;
-        // Replay every tombstone recorded while this segment was COLD (plus whatever it already carried at
-        // unload time) onto the freshly-reloaded segment, so a HDEL'd doc
-        // does not resurface just because the segment went through the COLD
-        // tier.
-        let toms = self.pending_tombstones.read();
-        if !toms.is_empty() {
-            let list: Vec<u64> = toms.iter().copied().collect();
-            drop(toms);
-            warm.seed_tombstones(&list);
-        }
+        // Replay every tombstone recorded while this segment was COLD (plus
+        // whatever it already carried at unload time) onto the freshly
+        // reloaded segment, so a HDEL'd doc does not resurface just because
+        // the segment went through the COLD tier.
+        self.replay_tombstones_onto(&warm);
         Ok(warm)
+    }
+
+    /// Apply every tombstone this stub holds to `warm`, a reload of it.
+    ///
+    /// [`Self::reload`] does this once, when it runs. An off-loop reload
+    /// (`reload_pool`) runs on a worker and is installed LATER, and until the
+    /// install this stub is still the index's COLD segment: a DEL in between
+    /// is recorded here only. The install must call this again, or that delete
+    /// is lost with the stub (moon#1070). Idempotent: a tombstone already
+    /// applied is a no-op.
+    pub fn replay_tombstones_onto(&self, warm: &WarmSearchSegment) {
+        let toms = self.pending_tombstones.read();
+        if toms.is_empty() {
+            return;
+        }
+        let list: Vec<u64> = toms.iter().copied().collect();
+        drop(toms);
+        warm.seed_tombstones(&list);
     }
 
     /// Approximate resident bytes of the stub itself -- a handful of scalars,

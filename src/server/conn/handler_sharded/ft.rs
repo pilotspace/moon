@@ -608,8 +608,13 @@ async fn ft_command_inner(
             } => {
                 // #18: await any off-loop COLD→WARM reloads submitted at
                 // capture (parks this task, not the shard thread) so the scan
-                // below sees full recall while siblings keep running.
-                snapshot.await_pending_reloads().await;
+                // below sees full recall while siblings keep running. Then
+                // install them into the index (moon#1070): the segment leaves
+                // COLD with the query that touched it, and no later DEL can be
+                // recorded by a stub about to vanish.
+                if snapshot.await_pending_reloads().await > 0 {
+                    crate::shard::slice::with_shard(|s| s.vector_store.install_completed_reloads());
+                }
                 let results = crate::vector::segment::holder::SegmentHolder::search_mvcc_yielding(
                     &mut *snapshot,
                     crate::vector::segment::holder::ft_search_yield_budget(),

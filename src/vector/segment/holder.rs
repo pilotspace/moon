@@ -260,9 +260,14 @@ impl SearchSnapshot {
     /// `unloaded` (retried at the next capture) and this query answers with
     /// degraded recall rather than hanging or crashing. No-op (no await) when
     /// nothing was submitted, i.e. the common path.
-    pub async fn await_pending_reloads(&mut self) {
+    ///
+    /// Returns the number of reloaded segments spliced in. When it is non-zero
+    /// the caller must install them into the index (`VectorStore::
+    /// install_completed_reloads`) once it is back on the shard: this snapshot
+    /// is the query's own copy, and the index still lists the COLD stubs.
+    pub async fn await_pending_reloads(&mut self) -> usize {
         if self.pending_reloads.is_empty() {
-            return;
+            return 0;
         }
         let receivers = std::mem::take(&mut self.pending_reloads);
         let mut reloaded: Vec<Arc<crate::vector::persistence::warm_search::WarmSearchSegment>> =
@@ -280,8 +285,9 @@ impl SearchSnapshot {
             }
         }
         if reloaded.is_empty() {
-            return;
+            return 0;
         }
+        let spliced = reloaded.len();
 
         let cur = &self.segments;
         let mut new_warm = cur.warm.clone();
@@ -301,6 +307,7 @@ impl SearchSnapshot {
             warm: new_warm,
             unloaded: new_unloaded,
         });
+        spliced
     }
 }
 
@@ -1214,6 +1221,16 @@ mod tests {
         dir: &std::path::Path,
         seg_id: u64,
     ) -> Arc<crate::vector::persistence::unloaded_segment::UnloadedSegment> {
+        make_unloaded_stub_with_keys(dir, seg_id, &[])
+    }
+
+    /// [`make_unloaded_stub`] whose `mvcc.mpf` names one live row per key in
+    /// `keys` (the graph stays empty: tombstone bookkeeping never reads it).
+    fn make_unloaded_stub_with_keys(
+        dir: &std::path::Path,
+        seg_id: u64,
+        keys: &[u64],
+    ) -> Arc<crate::vector::persistence::unloaded_segment::UnloadedSegment> {
         use crate::storage::tiered::SegmentHandle;
         use crate::vector::hnsw::graph::HnswGraph;
         use crate::vector::persistence::unloaded_segment::UnloadedSegment;
@@ -1238,9 +1255,18 @@ mod tests {
             68,
         );
         let graph_bytes = empty_graph.to_bytes();
+        // internal_id(4) global_id(4) key_hash(8) insert_lsn(8) delete_lsn(8)
+        let mut mvcc = Vec::with_capacity(keys.len() * 32);
+        for (i, kh) in keys.iter().enumerate() {
+            mvcc.extend_from_slice(&(i as u32).to_le_bytes());
+            mvcc.extend_from_slice(&(i as u32).to_le_bytes());
+            mvcc.extend_from_slice(&kh.to_le_bytes());
+            mvcc.extend_from_slice(&1u64.to_le_bytes());
+            mvcc.extend_from_slice(&0u64.to_le_bytes());
+        }
         write_codes_mpf(&seg_dir.join("codes.mpf"), seg_id, &[]).unwrap();
         write_graph_mpf(&seg_dir.join("graph.mpf"), seg_id, &graph_bytes).unwrap();
-        write_mvcc_mpf(&seg_dir.join("mvcc.mpf"), seg_id, &[]).unwrap();
+        write_mvcc_mpf(&seg_dir.join("mvcc.mpf"), seg_id, &mvcc).unwrap();
 
         let handle = SegmentHandle::new(seg_id, seg_dir.clone());
         let warm = WarmSearchSegment::from_files(
@@ -1427,6 +1453,51 @@ mod tests {
         let snap = holder.load();
         assert_eq!(snap.warm.len(), 1, "segment now resident in WARM");
         assert!(snap.unloaded.is_empty(), "no COLD stubs remain");
+    }
+
+    /// moon#1070: an off-loop reload finishes on a worker, but until it is
+    /// installed the COLD stub is still the index's segment -- a DEL in that
+    /// window is recorded by the stub alone. The install must replay it onto
+    /// the reloaded segment, or the stub (and the delete) are simply dropped.
+    #[test]
+    fn install_completed_reload_replays_tombstones_recorded_after_the_reload() {
+        distance::init();
+        crate::vector::reload_pool::init_global(1);
+        if crate::vector::reload_pool::global().is_none() {
+            // Another test disabled the global pool: every reload is then the
+            // blocking one, which has no reload-to-install window at all.
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let collection = make_test_collection(128);
+        let holder = SegmentHolder::new(128, collection.clone());
+        // A segment id no other test in this binary submits to the global pool.
+        let stub = make_unloaded_stub_with_keys(tmp.path(), 1_070_001, &[41, 42]);
+        holder.swap(SegmentList {
+            mutable: Arc::new(MutableSegment::new(128, collection)),
+            immutable: Vec::new(),
+            ivf: Vec::new(),
+            warm: Vec::new(),
+            unloaded: vec![Arc::clone(&stub)],
+        });
+
+        let receivers = holder.submit_unloaded_reloads();
+        assert_eq!(receivers.len(), 1, "one off-loop reload submitted");
+        assert!(receivers[0].recv().expect("worker replies").is_ok());
+
+        // The reload has RUN; the DEL lands now, on the stub still installed.
+        assert_eq!(holder.load().unloaded.len(), 1);
+        holder.load().unloaded[0].mark_deleted_by_key_hash(42);
+
+        assert_eq!(holder.install_completed_reloads(), 1);
+        let snap = holder.load();
+        assert!(snap.unloaded.is_empty(), "the stub is gone");
+        assert_eq!(
+            snap.warm[0].tombstoned_key_hashes(),
+            vec![42],
+            "the delete recorded by the stub after the reload survives the install"
+        );
+        assert_eq!(holder.install_completed_reloads(), 0, "nothing left");
     }
 
     /// #18 (snapshot half): `await_pending_reloads` splices a reloaded segment
