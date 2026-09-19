@@ -1593,6 +1593,50 @@ if should_run "transaction"; then
         echo "  FAIL: FN-MULTI-02 expected queue-time refusal + EXECABORT, got: $(echo "$fn_bogus" | tr '\n' ' ')"
     fi
 
+    # --- Scripts inside MULTI (moon#894) -----------------------------------
+    #
+    # EVAL/EVALSHA/EVAL_RO/FCALL were queued and then answered `unknown
+    # command` at EXEC while the rest of the body committed. As with moon#697,
+    # the verdict is read from the KEYS, not from EXEC's reply: the pre-fix
+    # EXEC array was full-length, so a length check passes on the bug. The
+    # transcript is also compared to Redis byte for byte. `{tx894}`
+    # co-locates every key so the row compares the command, not the routing,
+    # at --shards > 1. The sha is SHA1 of the script body, so both servers
+    # agree on it.
+    sc894_set="return redis.call('SET',KEYS[1],ARGV[1])"
+    sc894_sha="cf63a54c34e159e75e5a3fe4794bb2ea636ee005"
+    sc894_lib="$(printf "#!lua name=tx894\nredis.register_function('tx894set', function(keys, args) return redis.call('SET', keys[1], args[1]) end)")"
+    for srv in mcli rcli; do
+        $srv DEL "{tx894}before" "{tx894}eval" "{tx894}sha" "{tx894}ro" "{tx894}fcall" "{tx894}after" > /dev/null
+        $srv SCRIPT LOAD "$sc894_set" > /dev/null
+        $srv FUNCTION LOAD REPLACE "$sc894_lib" > /dev/null
+    done
+    sc894_body=$(printf '%s\n' 'MULTI' 'SET {tx894}before 1' \
+        "EVAL \"$sc894_set\" 1 {tx894}eval e" \
+        "EVALSHA $sc894_sha 1 {tx894}sha s" \
+        "EVAL_RO \"return redis.call('GET',KEYS[1])\" 1 {tx894}before" \
+        'FCALL tx894set 1 {tx894}fcall f' \
+        'SET {tx894}after 2' 'EXEC')
+    sc894_moon=$(printf '%s\n' "$sc894_body" | redis-cli -p "$PORT_RUST" 2>&1 || true)
+    sc894_redis=$(printf '%s\n' "$sc894_body" | redis-cli -p "$PORT_REDIS" 2>&1 || true)
+    TOTAL=$((TOTAL + 1))
+    sc894_keys=$(mcli MGET "{tx894}before" "{tx894}eval" "{tx894}sha" "{tx894}fcall" "{tx894}after" | tr '\n' ' ')
+    if [ "$sc894_keys" = "1 e s f 2 " ] && ! echo "$sc894_moon" | qgrep -q "unknown command"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: SCRIPT-MULTI-01 scripts inside MULTI must apply (moon#894): keys='$sc894_keys' exec=$(echo "$sc894_moon" | tr '\n' ' ')"
+    fi
+    TOTAL=$((TOTAL + 1))
+    if [ "$sc894_moon" = "$sc894_redis" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: SCRIPT-MULTI-02 EXEC transcript differs from Redis (moon#894)"
+        echo "    redis: $(echo "$sc894_redis" | tr '\n' ' ')"
+        echo "    moon:  $(echo "$sc894_moon" | tr '\n' ' ')"
+    fi
+
     # --- Container HELP (moon#698) ----------------------------------------
     #
     # Redis gives every container a HELP subcommand answering an array of SIMPLE
@@ -2872,15 +2916,19 @@ if should_run "vector"; then
     # `set -euo pipefail` that killed the run outright -- on a clean machine
     # the FIRST of these (nothing to kill yet) aborted the script before
     # NUMERIC-07, so MQ, txn_kv, eviction and the RESULT SUMMARY never ran.
-    pkill -f 'moon --port 6411' 2>/dev/null || true
-    pkill -f 'moon --port 6414' 2>/dev/null || true
+    # A previous aborted run's servers are found by THIS row's temp-dir names,
+    # not by the binary name: `MOON_BIN` can point at any file, and a pattern
+    # like 'moon --port 6411' never matches e.g. `moon-v0.8.9 --port 6411`.
+    pkill -f 'moon-n7-[14][.]' 2>/dev/null || true
     sleep 1
     # Fresh dirs here too -- these two would otherwise reload `nidx` from the
     # repo root and report a cross-shard "match" that came from disk.
     N7_DIR1=$(mktemp -d "${TMPDIR:-/tmp}/moon-n7-1.XXXXXX")
     N7_DIR2=$(mktemp -d "${TMPDIR:-/tmp}/moon-n7-4.XXXXXX")
-    ./target/release/moon --port 6411 --shards 1 --protected-mode no --dir "$N7_DIR1" --disk-free-min-pct 0 > /tmp/moon-6411.log 2>&1 &
-    ./target/release/moon --port 6414 --shards 4 --protected-mode no --dir "$N7_DIR2" --disk-free-min-pct 0 > /tmp/moon-6414.log 2>&1 &
+    "$RUST_BINARY" --port 6411 --shards 1 --protected-mode no --dir "$N7_DIR1" --disk-free-min-pct 0 > /tmp/moon-6411.log 2>&1 &
+    N7_PID1=$!
+    "$RUST_BINARY" --port 6414 --shards 4 --protected-mode no --dir "$N7_DIR2" --disk-free-min-pct 0 > /tmp/moon-6414.log 2>&1 &
+    N7_PID2=$!
     sleep 2
     for PORT in 6411 6414; do
         redis-cli -p $PORT FT.CREATE nidx ON HASH PREFIX 1 n: SCHEMA status TAG score NUMERIC > /dev/null 2>&1 || true
@@ -2903,8 +2951,10 @@ if should_run "vector"; then
     # `set -euo pipefail` that killed the run outright -- on a clean machine
     # the FIRST of these (nothing to kill yet) aborted the script before
     # NUMERIC-07, so MQ, txn_kv, eviction and the RESULT SUMMARY never ran.
-    pkill -f 'moon --port 6411' 2>/dev/null || true
-    pkill -f 'moon --port 6414' 2>/dev/null || true
+    # Kill exactly the two servers this row started. The old name-based pkill
+    # silently missed any `MOON_BIN` not literally named `moon` and leaked both.
+    kill "$N7_PID1" "$N7_PID2" 2>/dev/null || true
+    wait "$N7_PID1" "$N7_PID2" 2>/dev/null || true
 
     echo "  ft_aggregate: done"
 fi

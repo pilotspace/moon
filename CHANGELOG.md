@@ -64,6 +64,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Scripts queued inside `MULTI` now run at `EXEC`** (moon#894). `EVAL`,
+  `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `FCALL` and `FCALL_RO` were answered
+  `+QUEUED` and then `-ERR unknown command` at `EXEC`, while the rest of the
+  transaction committed. That one step was silently dropped from an otherwise
+  successful transaction, and the reply array was still full length. The
+  transaction executor now runs a queued script in place, in body order, on
+  whichever shard the body runs. The moon#247 locality rules apply unchanged:
+  a script whose declared keys live on another shard routes the whole body to
+  that owner, and a body spanning shards is refused with `CROSSSLOT` before
+  anything runs. Every inner `redis.call` is authorized as the calling user,
+  on the owner too.
+
+  The script's effect records are captured and spliced into the body's own
+  record list, so they reach the AOF, the WAL and the replication stream in
+  body order and exactly once. Letting the script emit them directly, as it
+  does outside `MULTI`, would log `SET k 1; EVAL "APPEND k x"` as
+  `APPEND k x; SET k 1`, and a restart would read `1` where the master
+  answered `1x`. A mutation run that disabled the capture reproduced exactly
+  that divergence after `SIGKILL`.
+
+  Semantics match redis-server 8.6.1:
+  - an unknown sha is `NOSCRIPT` in its slot;
+  - `EVAL_RO` refuses a write;
+  - a script that errors is one error element, its earlier writes stay, and
+    the rest of the body runs;
+  - a `WATCH` conflict aborts before any script runs.
+
+- **The moon#507 pipeline wait set is derived from `COMMAND_META` instead of a
+  hand-written list, and `WATCH` inside its own pipeline no longer aborts the
+  transaction** (moon#937, moon#946). `must_wait_for_pending_remote` decides
+  whether a pipelined command may run while its batch's earlier cross-shard
+  writes are still undispatched; its list of inline-intercepted commands was a
+  `(len, first byte)` table that failed OPEN and had drifted — `TXN`,
+  `TEMPORAL.INVALIDATE` (moon#937), the blocking family (moon#946), and, found
+  on the way, `WATCH`, `SPUBLISH`/`SSUBSCRIBE`/`SUNSUBSCRIBE`, `MQ` and `WS`,
+  each intercepted through a predicate the drift scanner could not see. The
+  predicate now reads the registry's `NO_INTERCEPT` bit — the same bit the
+  connection handler uses to skip its gate chain — so a command waits unless
+  the registry proves no interceptor can claim it, and both consumers fail
+  safe. To keep that free, the 98 routable commands no gate claims (`HGETALL`,
+  `LRANGE`, `ZRANGE`, `XADD`, `SMEMBERS`, …) are now marked `NO_INTERCEPT`
+  (67 → 165), which also lets the handler skip its gate chain for them; a
+  coupling test fails in either direction — a claimed command that is marked,
+  or a routable unclaimed one that is not. **Behaviour change**, measured at
+  `--shards 4` with remote writes pending in the same batch: `TXN BEGIN`,
+  `TEMPORAL.INVALIDATE`, `SPUBLISH` and `WATCH` now wait for those writes to
+  land (they ran inline before); `GET`/`HMSET`/`LRANGE`/`ZRANGE`/`XADD` still
+  do not wait. The user-visible one is `WATCH`: `SET k; WATCH k; MULTI; GET k;
+  EXEC` in one write aborted the transaction 18 of 24 times because `WATCH`
+  captured the key's version before its own batch's `SET` landed (redis 8.6.1:
+  0 of 24). `TXN` and `TEMPORAL.*` also join `extract_primary_key`'s keyless
+  table, so the cluster slot router no longer hashes `"BEGIN"` or an entity id
+  into one fixed slot. moon#946 is closed as a documented non-bug: the blocking
+  family is deferred by the #438 early-flush guard one statement above this
+  predicate in both handlers whenever remote work is pending, and the derived
+  predicate now says wait for them regardless.
+
 - **`ACL SETUSER` implements `allkeys`, `allcommands`, `allchannels` and
   every spelling of the `%R~` / `%W~` / `%RW~` key selectors** (moon#970).
   All were dropped with `+OK`, so a user provisioned with the standard redis
