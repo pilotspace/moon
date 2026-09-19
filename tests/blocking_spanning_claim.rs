@@ -25,11 +25,15 @@
 //!
 //! ## Placement
 //!
-//! A test cannot choose which shard its connection lands on (macOS sends every
-//! connection to one shard; Linux's `SO_REUSEPORT` hash decides). So every
-//! single-key row is run for a key owned by EVERY shard in turn — at least
-//! `SHARDS - 1` of them are remote to wherever the connections landed — and the
-//! spanning rows put three keys on three different shards.
+//! A test cannot choose which shard its connection lands on. macOS sends every
+//! connection to one shard. On Linux each new connection lands independently:
+//! the kernel's `SO_REUSEPORT` hash picks a per-shard listener or the central
+//! one, which deals round-robin. So every single-key row is run for a key owned
+//! by EVERY shard in turn, and the spanning rows put three keys on three
+//! different shards. On macOS at least `SHARDS - 1` owners are then remote to
+//! the connection. On Linux that holds only on average: any row can land on its
+//! own owner. A test that needs a REMOTE owner (bsc8) therefore retries a row
+//! with a fresh connection until one lands elsewhere.
 
 mod common;
 
@@ -851,6 +855,18 @@ fn bsc7_a_slow_owner_does_not_stretch_the_timeout() {
 // moon#1023 — a disconnected serve is never undone over later writes
 // ---------------------------------------------------------------------------
 
+/// How many fresh waiter connections bsc8 tries for each owner before it stops
+/// trying to race that owner.
+///
+/// A waiter whose connection lands on its key's owner has no race to lose.
+/// Its own thread serves it, and it unregisters in the same stretch that
+/// notices the disconnect, so a later push stays in the key. Only a REMOTE
+/// owner can serve inside the window. On Linux about one connection in
+/// `SHARDS` lands on the owner, so an owner fails all eight tries about once in
+/// 4^8 = 65,536. On macOS every connection lands on one shard, so that one owner
+/// spends all eight tries and is never raced.
+const PLACEMENT_ATTEMPTS: usize = 8;
+
 /// A client in `BLPOP k 0` disconnects while an owner serves it; meanwhile a
 /// third party writes the key. The serve STANDS — as in redis, which pops and
 /// propagates when it serves and loses the reply with the socket — so the
@@ -868,35 +884,49 @@ fn bsc7_a_slow_owner_does_not_stretch_the_timeout() {
 /// diverges from its AOF the same way on origin/main, so an AOF comparison
 /// here would measure that pre-existing gap, not the restore this test is
 /// about.
+///
+/// Only a waiter on a REMOTE owner can race: see [`PLACEMENT_ATTEMPTS`].
 #[test]
 fn bsc8_a_disconnected_serve_is_never_undone_over_later_writes() {
     let m = spawn_moon(SHARDS, Some(SETTLE_MS));
     let mut admin = Conn::open(m.port);
     let mut wrong = Vec::new();
     let mut raced = [0usize; 2];
+    let mut tries: [Vec<String>; 2] = [Vec::new(), Vec::new()];
     for (seq, what) in ["RPUSH b; LPOP", "DEL"].into_iter().enumerate() {
         for owner in 0..SHARDS {
             let k = key_owned_by("f3", owner, seq);
-            let _ = admin.send(&["DEL", &k]);
-            await_blocked(&mut admin, 0, "before block");
-            let mut sock = TcpStream::connect(("127.0.0.1", m.port)).expect("connect");
-            sock.write_all(&common::encode(&["BLPOP", &k, "0"]))
-                .expect("write");
-            await_blocked(&mut admin, 1, "waiter registration");
-            let _ = sock.shutdown(std::net::Shutdown::Both);
-            drop(sock);
-            std::thread::sleep(Duration::from_millis(150));
-            // Inside the window: the serve, then a third party's writes.
-            push_one(&mut admin, Kind::List, &k, "a");
-            let served = if seq == 0 {
-                push_one(&mut admin, Kind::List, &k, "b");
-                canon(&admin.send(&["LPOP", &k])) == "b"
-            } else {
-                canon(&admin.send(&["DEL", &k])) == "0"
+            // One race per owner, sampled over fresh connections until one
+            // lands on a shard other than the owner (see PLACEMENT_ATTEMPTS).
+            let mut attempts = 0;
+            let served = loop {
+                attempts += 1;
+                let _ = admin.send(&["DEL", &k]);
+                await_blocked(&mut admin, 0, "before block");
+                let mut sock = TcpStream::connect(("127.0.0.1", m.port)).expect("connect");
+                sock.write_all(&common::encode(&["BLPOP", &k, "0"]))
+                    .expect("write");
+                await_blocked(&mut admin, 1, "waiter registration");
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+                drop(sock);
+                std::thread::sleep(Duration::from_millis(150));
+                // Inside the window: the serve, then a third party's writes.
+                push_one(&mut admin, Kind::List, &k, "a");
+                let served = if seq == 0 {
+                    push_one(&mut admin, Kind::List, &k, "b");
+                    canon(&admin.send(&["LPOP", &k])) == "b"
+                } else {
+                    canon(&admin.send(&["DEL", &k])) == "0"
+                };
+                if served || attempts == PLACEMENT_ATTEMPTS {
+                    break served;
+                }
+                // Not served inside the window: this connection landed on
+                // the key's owner, which serves nothing after the disconnect.
+                // Nothing to check; try another connection.
             };
+            tries[seq].push(format!("owner {owner}: {attempts}"));
             if !served {
-                // The waiter was not served inside the window (its own shard
-                // observed the disconnect first); nothing to check.
                 let _ = admin.send(&["DEL", &k]);
                 continue;
             }
@@ -910,15 +940,21 @@ fn bsc8_a_disconnected_serve_is_never_undone_over_later_writes() {
             }
         }
     }
-    for (seq, n) in raced.iter().enumerate() {
-        assert!(
-            *n >= SHARDS - 1,
-            "sequence {seq}: only {n} of {SHARDS} serves landed inside the window — the race was not exercised"
-        );
-    }
     assert!(
         wrong.is_empty(),
         "a disconnected serve was undone on top of later writes (moon#1023):\n{}",
         wrong.join("\n")
     );
+    // Non-vacuity: at least SHARDS-1 distinct owners must really have served
+    // a disconnected waiter inside the window. If the window is not held open,
+    // no push lands in it, and this fails however many connections were tried.
+    for (seq, n) in raced.iter().enumerate() {
+        assert!(
+            *n >= SHARDS - 1,
+            "sequence {seq}: only {n} of {SHARDS} owners served inside the window, after up to \
+             {PLACEMENT_ATTEMPTS} connections each (connections per owner: {}) — the race was \
+             not exercised",
+            tries[seq].join(", ")
+        );
+    }
 }
