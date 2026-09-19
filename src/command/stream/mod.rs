@@ -791,6 +791,74 @@ mod tests {
         );
     }
 
+    /// Every id is checked before any stream is read, as redis's
+    /// `xreadCommand` does. A bad id on a later stream used to be found only
+    /// after `>` had moved the first stream's entries into its PEL, so the
+    /// client got an error while those entries sat delivered and unacked.
+    /// Texts from redis-server 8.6.1.
+    #[test]
+    fn test_xreadgroup_checks_every_id_before_reading() {
+        let mut db = Database::new();
+        setup_stream_with_group(&mut db, b"a", 2, b"g");
+        setup_stream_with_group(&mut db, b"b", 0, b"g");
+        let err = |f: Frame| match f {
+            Frame::Error(e) => String::from_utf8_lossy(&e).into_owned(),
+            other => panic!("expected an error, got {other:?}"),
+        };
+        let meaningless = |id: &str| {
+            format!(
+                "ERR The {id} ID is meaningless in the context of XREADGROUP: you want to read \
+                 the history of this consumer by specifying a proper ID, or use the > ID to get \
+                 new messages. The {id} ID would just return an empty result set."
+            )
+        };
+        let invalid = "ERR Invalid stream ID specified as stream command argument".to_string();
+        let rows: [(&[u8], String); 8] = [
+            (b"$", meaningless("$")),
+            (b"+", meaningless("+")),
+            (b"-", invalid.clone()),
+            (b"bad", invalid.clone()),
+            (b"1-x", invalid.clone()),
+            (b"1-2-3", invalid.clone()),
+            (b"18446744073709551616", invalid.clone()),
+            (b"*", invalid.clone()),
+        ];
+        for (id, want) in rows {
+            let args = make_args(&[b"GROUP", b"g", b"c", b"STREAMS", b"a", b"b", b">", id]);
+            assert_eq!(
+                err(xreadgroup(&mut db, &args)),
+                want,
+                "id {:?}",
+                String::from_utf8_lossy(id)
+            );
+            let pending = xpending(&mut db, &make_args(&[b"a", b"g"]));
+            let Frame::Array(summary) = pending else {
+                panic!("XPENDING summary: {pending:?}");
+            };
+            assert_eq!(
+                summary[0],
+                Frame::Integer(0),
+                "id {:?}: the first stream was read before the second id was checked",
+                String::from_utf8_lossy(id)
+            );
+        }
+        // Per stream: the key and group first, then the id — so a bad id on
+        // an earlier stream wins over a missing group on a later one.
+        assert_eq!(
+            err(xreadgroup(
+                &mut db,
+                &make_args(&[b"GROUP", b"g", b"c", b"STREAMS", b"a", b"nob", b"bad", b">"])
+            )),
+            invalid
+        );
+        // A history read with a valid id still reads.
+        let ok = xreadgroup(
+            &mut db,
+            &make_args(&[b"GROUP", b"g", b"c", b"STREAMS", b"a", b"b", b"0", b"0-0"]),
+        );
+        assert!(matches!(ok, Frame::Array(_)), "{ok:?}");
+    }
+
     #[test]
     fn test_xautoclaim_idle_entries() {
         let mut db = Database::new();

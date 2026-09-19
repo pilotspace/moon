@@ -298,12 +298,17 @@ impl BlockingRegistry {
     /// Every `(db, key)` an `XREADGROUP` is parked on, deduplicated — the
     /// keys a keyspace-wide deletion (`FLUSHDB`, `FLUSHALL`, active expiry)
     /// may have taken from under a group reader.
+    ///
+    /// Hash-deduplicated: many readers tailing one stream share a key, and a
+    /// linear `contains` made this quadratic in the parked readers.
     pub fn group_reader_keys(&self) -> Vec<(usize, Bytes)> {
+        let mut seen: std::collections::HashSet<(usize, &[u8])> =
+            std::collections::HashSet::with_capacity(self.group_readers.len());
         let mut out: Vec<(usize, Bytes)> = Vec::new();
         for id in &self.group_readers {
-            for k in self.wait_keys.get(id).into_iter().flatten() {
-                if !out.contains(k) {
-                    out.push(k.clone());
+            for (db, key) in self.wait_keys.get(id).into_iter().flatten() {
+                if seen.insert((*db, key.as_ref())) {
+                    out.push((*db, key.clone()));
                 }
             }
         }
@@ -767,6 +772,40 @@ mod tests {
     fn test_has_waiters_empty() {
         let reg = BlockingRegistry::new(0);
         assert!(!reg.has_waiters(0, &Bytes::from_static(b"nokey")));
+    }
+
+    /// Readers tailing one stream share its key: each `(db, key)` is named
+    /// once, whatever the number of readers on it.
+    #[test]
+    fn group_reader_keys_names_each_key_once() {
+        let mut reg = BlockingRegistry::new(0);
+        let (s, t) = (Bytes::from_static(b"s"), Bytes::from_static(b"t"));
+        let mut receivers = Vec::new();
+        for (db, key) in [(0, &s), (0, &s), (0, &s), (0, &t), (1, &s)] {
+            let (tx, rx) = crate::runtime::channel::oneshot();
+            receivers.push(rx);
+            let wait_id = reg.next_wait_id();
+            reg.register(
+                db,
+                key.clone(),
+                WaitEntry {
+                    wait_id,
+                    cmd: BlockedCommand::XReadGroup {
+                        group: Bytes::from_static(b"g"),
+                        consumer: Bytes::from_static(b"c"),
+                        streams: vec![(key.clone(), StreamSince::Latest)],
+                        count: None,
+                        noack: false,
+                    },
+                    reply_tx: tx,
+                    deadline: None,
+                    claim: None,
+                },
+            );
+        }
+        let mut keys = reg.group_reader_keys();
+        keys.sort();
+        assert_eq!(keys, vec![(0, s.clone()), (0, t), (1, s)]);
     }
 }
 
