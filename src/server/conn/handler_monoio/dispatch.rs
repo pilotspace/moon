@@ -16,10 +16,8 @@ use crate::command::connection as conn_cmd;
 use crate::command::metadata;
 use crate::protocol::Frame;
 use crate::runtime::cancel::CancellationToken;
-use crate::runtime::channel;
 use crate::server::conn::core::{ConnectionContext, ConnectionState};
 use crate::server::conn::util::extract_bytes;
-use crate::tracking::TrackingState;
 use crate::workspace::strip_workspace_prefix_from_response;
 
 use super::{extract_command, handle_blocking_command_monoio, handle_config, is_multi_key_command};
@@ -1088,45 +1086,23 @@ pub(super) fn try_handle_client_tracking(
     let Some(sub_bytes) = extract_bytes(sub) else {
         return false;
     };
-    if !sub_bytes.eq_ignore_ascii_case(b"TRACKING") {
+    if !crate::tracking::client_cmd::is_tracking_subcommand(&sub_bytes) {
         return false;
     }
-    match crate::command::client::parse_tracking_args(cmd_args) {
-        Ok(config_parsed) => {
-            if config_parsed.enable {
-                conn.tracking_state.enabled = true;
-                conn.tracking_state.bcast = config_parsed.bcast;
-                conn.tracking_state.noloop = config_parsed.noloop;
-                conn.tracking_state.optin = config_parsed.optin;
-                conn.tracking_state.optout = config_parsed.optout;
-
-                if conn.tracking_rx.is_none() {
-                    let (tx, rx) = channel::mpsc_bounded::<Frame>(256);
-                    conn.tracking_state.invalidation_tx = Some(tx.clone());
-                    conn.tracking_rx = Some(rx);
-
-                    let mut table = ctx.tracking_table.lock();
-                    table.register_client(client_id, tx);
-                    if let Some(target) = config_parsed.redirect {
-                        table.set_redirect(client_id, target);
-                    }
-                    for prefix in &config_parsed.prefixes {
-                        table.register_prefix(client_id, prefix.clone(), config_parsed.noloop);
-                    }
-                }
-                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-            } else {
-                conn.tracking_state = TrackingState::default();
-                ctx.tracking_table.lock().untrack_all(client_id);
-                conn.tracking_rx = None;
-                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-            }
+    // TRACKING, CACHING, TRACKINGINFO, GETREDIR — one implementation shared
+    // with the other two handlers (moon#1049).
+    match crate::tracking::client_cmd::handle(
+        cmd_args,
+        client_id,
+        &mut conn.tracking_state,
+        &mut conn.tracking_rx,
+        &ctx.tracking_table,
+    ) {
+        Some(reply) => {
+            responses.push(reply);
             true
         }
-        Err(err_frame) => {
-            responses.push(err_frame);
-            true
-        }
+        None => false,
     }
 }
 
@@ -1151,7 +1127,7 @@ pub(super) fn try_handle_client_admin(
             // unknown-subcommand fallback below must not swallow it — that
             // regression (H-3 reorder, #258) made CLIENT TRACKING answer
             // "unknown subcommand" on the entire monoio runtime.
-            if sub_bytes.eq_ignore_ascii_case(b"TRACKING") {
+            if crate::tracking::client_cmd::is_tracking_subcommand(&sub_bytes) {
                 return false;
             }
             if sub_bytes.eq_ignore_ascii_case(b"LIST") {
@@ -1872,7 +1848,7 @@ pub(super) async fn try_handle_cross_shard_commands(
                 cmd_args,
                 conn.client_id,
             );
-            if conn.tracking_state.enabled && !conn.tracking_state.bcast {
+            if conn.tracking_state.tracks_reads() {
                 crate::tracking::invalidation::track_read_keys(
                     &ctx.tracking_table,
                     cmd,

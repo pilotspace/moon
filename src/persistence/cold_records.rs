@@ -57,16 +57,6 @@ pub fn frame_unoffset(resp: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Whether `cmd` is one of the replay-only cold-plane records. They are not
-/// KV history: a log holding nothing else has not recorded a single client
-/// write, so a replay pass must not count them when deciding whether it was
-/// the KV authority (moon#914 — a WAL copy of a `MOON.SPILLED` marker used to
-/// suppress the AOF fallback and discard the AOF's entire history).
-#[inline]
-pub fn is_cold_plane_record(cmd: &[u8]) -> bool {
-    cmd.eq_ignore_ascii_case(COLD_CUT) || cmd.eq_ignore_ascii_case(SPILLED)
-}
-
 /// moon#914: open a legacy single-file AOF generation with its
 /// `MOON.COLDCUT <watermark>` head — the layout `runtime-tokio` with
 /// `--shards 1` uses, which has no `AofManifest` and therefore never runs
@@ -250,10 +240,11 @@ mod tests {
 
     #[test]
     fn cold_plane_records_are_recognised_case_insensitively() {
-        assert!(is_cold_plane_record(b"MOON.SPILLED"));
-        assert!(is_cold_plane_record(b"moon.coldcut"));
-        assert!(!is_cold_plane_record(b"SET"));
-        assert!(!is_cold_plane_record(b"MOON.SPILL"));
+        let mut dbs = vec![Database::new()];
+        assert!(replay_cold_plane_record(&mut dbs, b"moon.spilled", &[], 0));
+        assert!(replay_cold_plane_record(&mut dbs, b"MOON.COLDCUT", &[], 0));
+        assert!(!replay_cold_plane_record(&mut dbs, b"SET", &[], 0));
+        assert!(!replay_cold_plane_record(&mut dbs, b"MOON.SPILL", &[], 0));
     }
 
     /// moon#914: the head goes into an absent or empty legacy AOF as its

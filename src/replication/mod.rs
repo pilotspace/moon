@@ -6,6 +6,7 @@ pub mod expire_rewrite;
 pub mod graph_sync;
 pub mod handshake;
 pub mod master;
+pub mod master_addr;
 pub mod mq_sync;
 pub mod reason_del;
 pub mod replica;
