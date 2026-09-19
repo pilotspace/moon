@@ -201,14 +201,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its own (the kernel's `SO_REUSEPORT` hash, or the central listener's
   round-robin), so two local owners in one sequence failed the run. Measured
   in a Linux container: 6/10 failures on both `origin/main` and #1045's
-  own tested head `80885575` in a Linux container. #1045's own dispatch
-  showed it too: `TRY 1 FAIL`, then `FLAKY 2/3`. It was not the merge. The
-  test now tries up to 8 fresh connections per owner until one lands on
-  another shard, and keeps the same `SHARDS - 1` precondition. It passed
-  20/20 on Linux against the same binary. It still fails when the settle
-  window is not held open ("0 of 4 owners … 8 connections each"), and it
-  fails 8/8 SERVE UNDONE against the old restore server (`ffacf2ef`). Test
-  only; the server is unchanged.
+  own tested head `80885575`. #1045's own dispatch showed it too: `TRY 1
+  FAIL`, then `FLAKY 2/3`. It was not the merge. The test now tries up to 8
+  fresh connections per owner until one lands on another shard, and keeps
+  the same `SHARDS - 1` precondition. It passed 20/20 on Linux against the
+  same binary. It still fails when the settle window is not held open ("0 of
+  4 owners … 8 connections each"). Against the old restore server
+  (`ffacf2ef`) it fails with 8/8 SERVE UNDONE: the correctness assertion
+  now runs before the precondition, where the old test could report "only 2
+  of 4" instead. Test only; the server is unchanged.
+- **`MOVE` and `COPY ... DB n` queued inside `MULTI` now run at `EXEC`, into
+  the database they name** (moon#1062). The transaction executors sent every
+  queued command to the single-db dispatch, which cannot reach a second
+  database. `MOVE` answered `-ERR MOVE requires handler-level dispatch` in its
+  slot. `COPY a b DB 4` was worse: it answered `:1`, wrote `b` into the SOURCE
+  db, and logged the command verbatim, so a replica (and AOF replay, once
+  moon#1046 lands) put `b` in db 4 while the master had it in db 0. Every
+  executor now runs both commands against both databases with the same
+  helpers as the live paths: the sharded one on monoio and tokio, the
+  owner-routed `TxnExecute`, and the embedded `handler_single` one. A `SELECT`
+  queued earlier in the body chooses the source db. Only a `:1` is logged,
+  verbatim, under the source db, which is the record the live paths already
+  write.
+
+  In the same family, redis 8.6.1's replies now come back on every path. `MOVE
+  key <current db>` answers `ERR source and destination objects are the same`
+  (it answered `:0`). A negative or too-large db index answers `ERR DB index is
+  out of range` for both `MOVE` and `COPY` (they answered `ERR value is not an
+  integer or out of range` and `ERR invalid DB index`). `COPY k k` gives the
+  same-object error even when `k` is missing.
+
+  **Cross-shard `COPY ... DB n` is refused.** At `--shards > 1`, `COPY src dst
+  DB n` whose two keys hash to different shards was routed by `src` alone, and
+  `dst` was written into `src`'s shard. There, no normally routed read could
+  see it: 24 of 24 constructed split placements acked `:1` and read back nil,
+  and the AOF recorded them on the wrong shard. It now answers the two-key-write
+  `CROSSSLOT` error, as `RENAME` does. A `{hash}` tag co-locates the keys, and
+  `COPY` without a `DB` clause still works across shards.
+
 - **The cold-index rebuild no longer drops entries silently, and an
   indexed-but-unreadable cold entry is no longer a "miss" in code**
   (moon#875). `ColdIndex::rebuild_from_manifest_per_db` skipped a heap file

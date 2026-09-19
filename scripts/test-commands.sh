@@ -1058,6 +1058,22 @@ if should_run "key"; then
     rcli SET k:cpdst2 old >/dev/null 2>&1; mcli SET k:cpdst2 old >/dev/null 2>&1
     assert_match "COPY no REPLACE"     COPY k:cpsrc k:cpdst2
     assert_match "COPY REPLACE"        COPY k:cpsrc k:cpdst2 REPLACE
+    # moon#1062: redis's wording for the two-db family. MOVE into the current
+    # db and COPY of a key onto itself are "same object" errors even when the
+    # key is missing (redis checks before the lookup); a negative or too-large
+    # db index is "DB index is out of range" for both commands.
+    rcli SET {k}:mv mvval >/dev/null 2>&1; mcli SET {k}:mv mvval >/dev/null 2>&1
+    assert_match "MOVE same db"        MOVE {k}:mv 0
+    assert_match "MOVE db -1"          MOVE {k}:mv -1
+    assert_match "MOVE db 99"          MOVE {k}:mv 99
+    assert_match "MOVE db not int"     MOVE {k}:mv x
+    assert_match "COPY missing onto itself" COPY {k}:nokey {k}:nokey
+    assert_match "COPY DB -1"          COPY {k}:mv {k}:mv2 DB -1
+    assert_match "COPY DB 99"          COPY {k}:mv {k}:mv2 DB 99
+    assert_match "COPY DB 5"           COPY {k}:mv {k}:mv2 DB 5
+    assert_match "GET after COPY DB 5" -n 5 GET {k}:mv2
+    assert_match "MOVE db 6"           MOVE {k}:mv 6
+    assert_match "GET after MOVE db 6" -n 6 GET {k}:mv
     assert_match "UNLINK"              UNLINK {k}:renamed
     assert_moon_ok "DBSIZE"            DBSIZE
     assert_moon_ok "SCAN cursor"       SCAN 0
@@ -1617,6 +1633,31 @@ if should_run "transaction"; then
         FAIL=$((FAIL + 1))
         echo "  FAIL: MULTI/EXEC pipeline"
         echo "    GOT: $(echo "$tx_moon" | head -5)"
+    fi
+
+    # --- MOVE and COPY ... DB n inside MULTI (moon#1062) -------------------
+    #
+    # EXEC answered MOVE with "requires handler-level dispatch", and COPY ...
+    # DB 4 answered 1 while writing the copy into the SOURCE db. Compared with
+    # redis: the EXEC transcript, then where each key landed.
+    for tx_srv in rcli mcli; do
+        $tx_srv SET {tx1062}a 1 >/dev/null 2>&1
+        $tx_srv SET {tx1062}b 2 >/dev/null 2>&1
+    done
+    TOTAL=$((TOTAL + 1))
+    tx_mc_r=$(printf 'MULTI\nMOVE {tx1062}a 3\nCOPY {tx1062}b {tx1062}c DB 4\nEXEC\n' \
+        | redis-cli -p "$PORT_REDIS" 2>&1 | tr '\n' ' ' || true)
+    tx_mc_m=$(printf 'MULTI\nMOVE {tx1062}a 3\nCOPY {tx1062}b {tx1062}c DB 4\nEXEC\n' \
+        | redis-cli -p "$PORT_RUST" 2>&1 | tr '\n' ' ' || true)
+    tx_mc_r="${tx_mc_r}| $(rcli -n 3 GET {tx1062}a) $(rcli -n 4 GET {tx1062}c) $(rcli EXISTS {tx1062}a {tx1062}c)"
+    tx_mc_m="${tx_mc_m}| $(mcli -n 3 GET {tx1062}a) $(mcli -n 4 GET {tx1062}c) $(mcli EXISTS {tx1062}a {tx1062}c)"
+    if [ "$tx_mc_r" = "$tx_mc_m" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TXN-MOVECOPY-01 MOVE / COPY ... DB n inside MULTI"
+        echo "    REDIS: $tx_mc_r"
+        echo "    MOON:  $tx_mc_m"
     fi
 
     # DISCARD (must be inside MULTI)
