@@ -43,6 +43,8 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::persistence::aof::AofWriterPool;
 use crate::protocol::Frame;
 use crate::replication::state::ReplicationState;
@@ -161,6 +163,77 @@ pub(crate) fn log_pop(db: usize, record: &Frame) -> PopLog {
         }
         PopLog::Logged
     })
+}
+
+/// The non-blocking command that reproduces a pop a wake just performed on
+/// `key`, built from what the pop actually TOOK rather than from what the
+/// waiter asked for: a `BLMPOP ... COUNT 10` that found three elements is
+/// logged as popping three.
+///
+/// `None` when the undo does not describe a pop this waiter's command can
+/// make, which no caller produces — a record invented from a shape this does
+/// not understand would corrupt a replica far more cheaply than omitting it.
+pub(crate) fn served_pop_record(
+    cmd: &crate::blocking::BlockedCommand,
+    key: &Bytes,
+    undo: &crate::blocking::wakeup::WakeUndo,
+) -> Option<Frame> {
+    use crate::blocking::wakeup::WakeUndo;
+    use crate::blocking::{BlockedCommand, Direction};
+
+    fn bulk(s: &'static [u8]) -> Frame {
+        Frame::BulkString(Bytes::from_static(s))
+    }
+    fn side(d: Direction) -> Frame {
+        match d {
+            Direction::Left => bulk(b"LEFT"),
+            Direction::Right => bulk(b"RIGHT"),
+        }
+    }
+    // `POP key` for one element, `POP key n` for several — the two spellings
+    // replay identically, and the short one is what a single pop always was.
+    fn pop(name: &'static [u8], key: &Bytes, n: usize) -> Option<Frame> {
+        match n {
+            0 => None,
+            1 => Some(Frame::Array(crate::framevec![
+                bulk(name),
+                Frame::BulkString(key.clone()),
+            ])),
+            n => {
+                let mut digits = itoa::Buffer::new();
+                Some(Frame::Array(crate::framevec![
+                    bulk(name),
+                    Frame::BulkString(key.clone()),
+                    Frame::BulkString(Bytes::copy_from_slice(digits.format(n).as_bytes())),
+                ]))
+            }
+        }
+    }
+    match undo {
+        WakeUndo::ListFront(vals) => pop(b"LPOP", key, vals.len()),
+        WakeUndo::ListBack(vals) => pop(b"RPOP", key, vals.len()),
+        WakeUndo::Moved {
+            destination,
+            wherefrom,
+            whereto,
+            ..
+        } => Some(Frame::Array(crate::framevec![
+            bulk(b"LMOVE"),
+            Frame::BulkString(key.clone()),
+            Frame::BulkString(destination.clone()),
+            side(*wherefrom),
+            side(*whereto),
+        ])),
+        WakeUndo::Zset(pairs) => {
+            let min = match cmd {
+                BlockedCommand::BZPopMin => true,
+                BlockedCommand::BZPopMax => false,
+                BlockedCommand::BZMPop { min, .. } => *min,
+                _ => return None,
+            };
+            pop(if min { b"ZPOPMIN" } else { b"ZPOPMAX" }, key, pairs.len())
+        }
+    }
 }
 
 #[cfg(test)]
