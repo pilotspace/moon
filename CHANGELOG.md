@@ -169,6 +169,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A tokio `--shards 1` AOF written before `MOON.COLDCUT` existed no longer
+  compounds its damage on every restart** (moon#914 (b)). Such a file has no
+  cut, so replay reads every cold file ungated and re-applies a write on top of
+  the spilled copy of its own result. Nothing rewrote the file, so each boot
+  replayed the same log over the last boot's re-spilled values. Measured on a
+  synthesized legacy file: all 96 non-idempotent probes grew again on every
+  boot (a five-element list read 5 or 10, then 10 or 15, then 15 or 20), and
+  the 24 `SET` controls stayed put. When boot replays a cut-less
+  `appendonly.aof` while cold files exist, moon now logs a WARN and runs ONE
+  background AOF rewrite through the #433 auto-rewrite monitor. The rewritten
+  file opens with its cut, so boots 2..N serve exactly what boot 1 served.
+  The first boot's damage can't be undone: the log doesn't record which writes
+  preceded which spill. The rewrite is dispatched after the shards start and
+  doesn't block accept. A crash before its atomic rename leaves the old file
+  authoritative, and the next boot retries. A failed rewrite retries after 60
+  s. `tests/legacy_aof_rewrite_on_boot_914.rs` is RED 3/3 without the fix
+  (96 probes changed boot to boot) and GREEN 3/3 with it. The tokio TopLevel
+  rewrite now also sets INFO `aof_last_bgrewrite_status`, which it never did.
+
+  **BEHAVIOUR CHANGE:** the first boot after upgrading a tokio `--shards 1`
+  deployment that uses disk offload may run one AOF rewrite, even with
+  `auto-aof-rewrite-percentage 0`. It costs one snapshot of the hot dataset
+  written and fsynced as a new RDB-preamble AOF. Measured on macOS for local
+  iteration (not a Linux number), with 100k keys and 46 cold files, on a loaded
+  host: boot-to-accept was unchanged within noise (48-72 ms with the trigger,
+  58-97 ms without). The rewrite took 17-30 ms, wrote 8.0 MB (the 10.2 MB
+  legacy AOF shrank to 8.0 MB), and finished about 1.1 s after spawn, one
+  monitor tick. With
+  `--appendonly no`, or an `--appendfilename` other than `appendonly.aof`,
+  moon can't rewrite the file that was replayed. It logs a WARN naming the
+  manual remedy instead.
+
 - **WAL v3 KV records now replay into the database they were written in**
   (moon#1039, P0). Under `--wal-kv-log on`, a write that executes on a shard
   thread (a pipelined cross-shard write, an active-expiry reason-DEL, a

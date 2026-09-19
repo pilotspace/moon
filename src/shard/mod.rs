@@ -101,6 +101,11 @@ pub struct Shard {
     /// already accepting connections) is spawned by `event_loop.rs`, which
     /// drains this field via `std::mem::take`.
     pub pending_heap_orphans: Vec<std::path::PathBuf>,
+    /// moon#914 (b): this shard's recovery replayed `appendonly.aof` and no
+    /// `MOON.COLDCUT` opened it (a file from before the cut existed), so the
+    /// replay read every cold file ungated. Read by `main.rs`, which rewrites
+    /// the AOF once so later boots are gated.
+    pub replayed_aof_without_cold_cut: bool,
     /// First cold-tier `file_id` this shard may allocate, proven above every
     /// id in use (moon#997, moon#893) by [`Self::prove_spill_file_id_seed`] —
     /// the startup gate `main` and the embedded server run after recovery,
@@ -161,6 +166,7 @@ impl Shard {
             vector_store: VectorStore::new(),
             recovered_warm_segments: Vec::new(),
             pending_heap_orphans: Vec::new(),
+            replayed_aof_without_cold_cut: false,
             spill_file_id_seed: None,
         }
     }
@@ -288,6 +294,7 @@ impl Shard {
                         // Stage the paths for `event_loop.rs` to reclaim in
                         // the background once this shard is serving traffic.
                         self.pending_heap_orphans = result.pending_heap_orphans;
+                        self.replayed_aof_without_cold_cut = result.aof_replayed_without_cold_cut;
                         return result.commands_replayed;
                     }
                     Err(e) => {
@@ -378,6 +385,7 @@ impl Shard {
                 self.id
             );
         } else if aof_path.exists() {
+            let mut aof_replayed = false;
             match crate::persistence::aof::replay_aof(
                 &mut self.databases,
                 &aof_path,
@@ -386,6 +394,7 @@ impl Shard {
                 Ok(n) => {
                     info!("Shard {}: replayed {} AOF commands", self.id, n);
                     total_keys += n;
+                    aof_replayed = n > 0;
                 }
                 Err(e) => {
                     tracing::error!("Shard {}: AOF replay failed: {}", self.id, e);
@@ -400,6 +409,9 @@ impl Shard {
             // read as absent. Runs on the Err arm too: a replay that stopped
             // at corruption may already have installed the gate.
             let r = crate::storage::db::close_replay_generation(&mut self.databases);
+            // moon#914 (b): `gated` is true exactly when a `MOON.COLDCUT`
+            // opened this replay.
+            self.replayed_aof_without_cold_cut = aof_replayed && !r.gated;
             if r.hot_demoted > 0 || r.cold_dropped > 0 {
                 info!(
                     "Shard {}: AOF replay cold-plane reconcile (gated={}): {} hot shadow(s) \
