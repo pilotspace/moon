@@ -28,7 +28,7 @@ use moon::persistence::aof::group_commit::{
     AOF_GROUP_COMMIT_MAX_BATCH, AOF_GROUP_COMMIT_MAX_BYTES, CommitOutcome, GroupCommitBatch,
     GroupCommitSink, collect_group_commit_batch, commit_group_commit_batch,
 };
-use moon::persistence::aof::{AofAck, AofMessage};
+use moon::persistence::aof::{AofAck, AofMessage, FoldEpoch};
 use moon::runtime::channel::{OneshotReceiver, oneshot};
 use std::collections::VecDeque;
 
@@ -39,6 +39,7 @@ fn append(data: &[u8]) -> AofMessage {
         lsn: 0,
         db: 0,
         bytes: Bytes::copy_from_slice(data),
+        epoch: FoldEpoch::INITIAL,
     }
 }
 
@@ -50,6 +51,7 @@ fn append_sync(data: &[u8]) -> (AofMessage, OneshotReceiver<AofAck>) {
             db: 0,
             bytes: Bytes::copy_from_slice(data),
             ack: tx,
+            epoch: FoldEpoch::INITIAL,
         },
         rx,
     )

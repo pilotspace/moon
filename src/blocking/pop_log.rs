@@ -547,6 +547,7 @@ mod tests {
             lsn: 0,
             db: 0,
             bytes: Bytes::from_static(b"filler"),
+            epoch: crate::persistence::aof::FoldEpoch::INITIAL,
         })
         .map_err(|_| ())
         .expect("room for the filler");

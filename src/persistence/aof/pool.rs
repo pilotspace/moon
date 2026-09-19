@@ -7,6 +7,16 @@ use super::*;
 #[cfg(feature = "runtime-monoio")]
 use super::rewrite::drain_pending_appends;
 
+/// Result of one non-parking enqueue attempt ([`AofWriterPool::try_append_now`]).
+enum AppendNow {
+    /// The record is in the channel or the rewrite overflow.
+    Enqueued,
+    /// The channel is full and no fold has the overflow armed: retry later.
+    WouldBlock,
+    /// The record can never be accepted (writer gone, overflow cap reached).
+    Refused(AofAck),
+}
+
 #[derive(Clone)]
 pub struct AofWriterPool {
     senders: Vec<channel::MpscSender<AofMessage>>,
@@ -266,6 +276,10 @@ impl AofWriterPool {
     /// the only overhead is one `match` and the implicit Future state
     /// machine; benchmarked at ~5 ns per call on the EverySec hot path,
     /// far below the per-write WAL/replication cost.
+    ///
+    /// `stamp` is [`Self::fold_stamp`] read in the same synchronous section as
+    /// the mutation this record logs (#455) — never after an `.await` that
+    /// followed it.
     #[inline]
     pub async fn try_send_append_durable(
         &self,
@@ -273,10 +287,11 @@ impl AofWriterPool {
         lsn: u64,
         db: usize,
         bytes: Bytes,
+        stamp: FoldEpoch,
     ) -> Result<(), AofAck> {
         match self.fsync_policy {
             FsyncPolicy::Always => {
-                let rx = self.try_send_append_sync(shard_id, lsn, db, bytes);
+                let rx = self.try_send_append_sync(shard_id, lsn, db, bytes, stamp);
                 // F2 (design-for-failure): bound the wait so a stalled disk
                 // can't park this connection forever. On elapse the write is
                 // failed — the entry may still land on disk later, but
@@ -298,10 +313,30 @@ impl AofWriterPool {
                 // enqueue (NOT fsync) under `fsync_timeout`, and a failed
                 // enqueue surfaces as Err so the client never gets a false
                 // success for a write the durability machinery never saw.
-                self.send_append_backpressure(shard_id, lsn, db, bytes)
+                self.send_append_backpressure(shard_id, lsn, db, bytes, stamp)
                     .await
             }
         }
+    }
+
+    /// The fold epoch of `shard_id`'s writer, to stamp a record with (#455).
+    ///
+    /// Read it in the SAME synchronous section as the mutation the record
+    /// logs, and hand it to [`Self::send_append_group`] /
+    /// [`Self::try_send_append_durable`] even if the enqueue happens later
+    /// (after an `.await`, or in a loop that may park). A rewrite fold advances
+    /// the epoch at its snapshot instant. A record stamped before that instant
+    /// is folded into the new base instead of being written a second time
+    /// into the new incr, wherever it reaches the writer. See
+    /// [`FoldEpoch`](super::FoldEpoch).
+    ///
+    /// The synchronous producers (`try_send_append`,
+    /// `send_append_bounded_blocking`, `try_send_append_ordered`) read it
+    /// themselves: they cannot suspend between their caller's mutation and
+    /// their own entry.
+    #[inline]
+    pub fn fold_stamp(&self, shard_id: usize) -> FoldEpoch {
+        self.overflow_for(shard_id).stamp()
     }
 
     /// Group-commit append for coordinator LOCAL legs (v3-5 local-leg fix).
@@ -319,6 +354,11 @@ impl AofWriterPool {
     /// `Ok(false)` when the writer loop owns the fsync cadence
     /// (`EverySec`/`No`), and `Err(_)` when the append never reached the
     /// writer — the caller must surface an error frame, never `+OK`.
+    ///
+    /// `stamp`: [`Self::fold_stamp`] read in the same synchronous section as
+    /// the mutation (#455). Read it once BEFORE a multi-record enqueue loop,
+    /// not per record: a park on record `i` can span a fold snapshot, and
+    /// the records after it are just as pre-snapshot as record `i`.
     #[inline]
     pub async fn send_append_group(
         &self,
@@ -326,10 +366,123 @@ impl AofWriterPool {
         lsn: u64,
         db: usize,
         bytes: Bytes,
+        stamp: FoldEpoch,
     ) -> Result<bool, AofAck> {
-        self.send_append_backpressure(shard_id, lsn, db, bytes)
+        self.send_append_backpressure(shard_id, lsn, db, bytes, stamp)
             .await?;
         Ok(matches!(self.fsync_policy, FsyncPolicy::Always))
+    }
+
+    /// Enqueue a record and apply its mutation in ONE synchronous section, for
+    /// a producer that must not mutate before its record is accepted (SWAPDB:
+    /// no rollback exists, so nothing may change if the enqueue fails).
+    ///
+    /// The fold's exactly-once contract needs the record's stamp, its position
+    /// in the writer's stream, and the mutation to fall on the same side of a
+    /// fold snapshot. The snapshot runs on the shard thread (the `AofFold`
+    /// handler), so for a caller on that same shard thread (the only kind this
+    /// is for) it can only land at a suspension point. Here the stamp is
+    /// read, the record is enqueued without parking, and `apply` runs, with no
+    /// suspension point between them:
+    ///
+    /// - snapshot before this section: the mutation is not in the base, the
+    ///   record is stamped at or above the snapshot epoch and sits after the
+    ///   fold's cut, so the new incr keeps it.
+    /// - snapshot after this section: the mutation is in the base, the record
+    ///   is before the cut and goes to the old incr, which the base replaces.
+    ///
+    /// A parking `send_async` cannot give this: the receiver moves a parked
+    /// message into the queue on the writer thread, so the enqueue instant is
+    /// unrelated to when this task resumes, and a snapshot can fall between
+    /// the two.
+    ///
+    /// While the channel is full (and no fold has the overflow armed), this
+    /// waits for room WITHOUT holding the record, polling every millisecond on
+    /// the runtime timer. The wait suspends only this task, never the shard
+    /// thread. It is bounded by the pool's `fsync_timeout`; `ZERO` keeps the
+    /// legacy unbounded wait. On `Err`, `apply` never ran and nothing was
+    /// enqueued.
+    ///
+    /// Returns `apply`'s result and whether the caller must confirm durability
+    /// with ONE [`Self::fsync_barrier`] (`Always`), exactly like
+    /// [`Self::send_append_group`]. That barrier runs AFTER the mutation: an
+    /// fsync failure is then reported on a mutation that stays applied, which
+    /// is what every other `Always` write does.
+    pub async fn append_then_apply<R>(
+        &self,
+        shard_id: usize,
+        lsn: u64,
+        db: usize,
+        bytes: Bytes,
+        apply: impl FnOnce() -> R,
+    ) -> Result<(R, bool), AofAck> {
+        let deadline = if self.fsync_timeout.is_zero() {
+            None
+        } else {
+            Some(std::time::Instant::now() + self.fsync_timeout)
+        };
+        loop {
+            match self.try_append_now(shard_id, lsn, db, bytes.clone()) {
+                AppendNow::Enqueued => {
+                    return Ok((apply(), matches!(self.fsync_policy, FsyncPolicy::Always)));
+                }
+                AppendNow::Refused(ack) => return Err(ack),
+                AppendNow::WouldBlock => {
+                    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        warn!(
+                            "AOF writer channel full (shard {}): append refused after {:?}; \
+                             the mutation was not applied",
+                            shard_id, self.fsync_timeout
+                        );
+                        return Err(AofAck::ChannelFull);
+                    }
+                    Self::room_poll_sleep().await;
+                }
+            }
+        }
+    }
+
+    /// One non-parking enqueue attempt, stamped at the enqueue instant. Honours
+    /// the rewrite overflow's spill-first ordering exactly like
+    /// [`Self::send_append_backpressure`].
+    fn try_append_now(&self, shard_id: usize, lsn: u64, db: usize, bytes: Bytes) -> AppendNow {
+        use super::rewrite_overflow::SpillReject;
+        let ovf = self.overflow_for(shard_id);
+        let msg = AofMessage::Append {
+            lsn,
+            db,
+            bytes,
+            epoch: ovf.stamp(),
+        };
+        let msg = if ovf.spill_first() {
+            match ovf.try_spill(msg) {
+                Ok(()) => return AppendNow::Enqueued,
+                Err(SpillReject::Disarmed(returned)) => returned,
+                // Older records are buffered and the cap is reached: nothing
+                // was applied yet, so refusing keeps memory and log equal.
+                Err(SpillReject::CapExceeded) => return AppendNow::Refused(AofAck::ChannelFull),
+            }
+        } else {
+            msg
+        };
+        match self.sender(shard_id).try_send(msg) {
+            Ok(()) => AppendNow::Enqueued,
+            Err(flume::TrySendError::Disconnected(_)) => AppendNow::Refused(AofAck::WriteFailed),
+            Err(flume::TrySendError::Full(msg)) => match ovf.try_spill(msg) {
+                Ok(()) => AppendNow::Enqueued,
+                Err(SpillReject::Disarmed(_)) => AppendNow::WouldBlock,
+                Err(SpillReject::CapExceeded) => AppendNow::Refused(AofAck::ChannelFull),
+            },
+        }
+    }
+
+    /// The poll interval of [`Self::append_then_apply`]'s wait for room.
+    async fn room_poll_sleep() {
+        const ROOM_POLL: Duration = Duration::from_millis(1);
+        #[cfg(feature = "runtime-monoio")]
+        monoio::time::sleep(ROOM_POLL).await;
+        #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-monoio")))]
+        tokio::time::sleep(ROOM_POLL).await;
     }
 
     /// Durability barrier for cross-shard pipelined writes under
@@ -374,7 +527,10 @@ impl AofWriterPool {
                 // preceding Append messages (ordered channel) then ack Synced.
                 // db=0: a zero-length barrier writes no record, so it can
                 // never trigger (or need) a SELECT injection.
-                let rx = self.try_send_append_sync(shard_id, 0, 0, Bytes::new());
+                // A barrier logs no mutation, so it is never folded away
+                // whatever its stamp (see `keep_unless_folded`).
+                let rx =
+                    self.try_send_append_sync(shard_id, 0, 0, Bytes::new(), FoldEpoch::INITIAL);
                 // F2 bounded await — same semantics as try_send_append_durable.
                 match Self::await_ack(rx, self.fsync_timeout).await {
                     AckOutcome::Ack(AofAck::Synced) => Ok(()),
@@ -469,19 +625,24 @@ impl AofWriterPool {
     #[inline]
     pub fn try_send_append(&self, shard_id: usize, lsn: u64, db: usize, bytes: Bytes) -> bool {
         let ovf = self.overflow_for(shard_id);
+        // #455: synchronous — no suspension between the caller's mutation
+        // and this read, so the stamp is the mutation's epoch.
+        let epoch = ovf.stamp();
+        let msg = AofMessage::Append {
+            lsn,
+            db,
+            bytes,
+            epoch,
+        };
         // #452.1 ordering rule 1: while this writer's rewrite overflow holds
         // spilled appends, every new append must also spill — a `try_send`
         // that succeeds here would be replayed BEFORE the older spilled ones.
         if ovf.spill_first() {
-            match ovf.try_spill(AofMessage::Append { lsn, db, bytes }) {
+            match ovf.try_spill(msg) {
                 Ok(()) => return true,
                 // Drain just completed — the channel is live again.
-                Err(super::rewrite_overflow::SpillReject::Disarmed(AofMessage::Append {
-                    lsn,
-                    db,
-                    bytes,
-                })) => {
-                    return self.try_send_append_no_spill(shard_id, lsn, db, bytes);
+                Err(super::rewrite_overflow::SpillReject::Disarmed(msg)) => {
+                    return self.try_send_append_no_spill(shard_id, lsn, msg);
                 }
                 // Cap reached with older records buffered: dropping keeps
                 // replay order monotone; the channel would invert it.
@@ -496,18 +657,15 @@ impl AofWriterPool {
                 }
             }
         }
-        self.try_send_append_no_spill(shard_id, lsn, db, bytes)
+        self.try_send_append_no_spill(shard_id, lsn, msg)
     }
 
     /// [`Self::try_send_append`] minus the spill-first gate: `try_send`, then
     /// on Full one spill attempt (rewrite in progress), then the pre-existing
-    /// counted drop.
+    /// counted drop. `lsn` is `msg`'s, for the log line.
     #[inline]
-    fn try_send_append_no_spill(&self, shard_id: usize, lsn: u64, db: usize, bytes: Bytes) -> bool {
-        match self
-            .sender(shard_id)
-            .try_send(AofMessage::Append { lsn, db, bytes })
-        {
+    fn try_send_append_no_spill(&self, shard_id: usize, lsn: u64, msg: AofMessage) -> bool {
+        match self.sender(shard_id).try_send(msg) {
             Ok(()) => true,
             Err(e) => {
                 let reason = match &e {
@@ -610,7 +768,15 @@ impl AofWriterPool {
         budget: &mut Duration,
     ) -> bool {
         use super::rewrite_overflow::SpillReject;
-        let mut msg = AofMessage::Append { lsn, db, bytes };
+        // #455: synchronous — the stamp is the caller's mutation epoch, and
+        // a block below holds the whole thread, so no fold can interleave.
+        let epoch = self.fold_stamp(shard_id);
+        let mut msg = AofMessage::Append {
+            lsn,
+            db,
+            bytes,
+            epoch,
+        };
         // #452.1 ordering rule 1: while the rewrite overflow holds spilled
         // appends, keep spilling — see `try_send_append`. A cap-exceeded
         // refusal must DROP (with accounting), never proceed to the channel:
@@ -714,9 +880,18 @@ impl AofWriterPool {
         lsn: u64,
         db: usize,
         bytes: Bytes,
+        epoch: FoldEpoch,
     ) -> Result<(), AofAck> {
         use super::rewrite_overflow::SpillReject;
-        let mut msg = AofMessage::Append { lsn, db, bytes };
+        // #455: `epoch` was read at the caller's mutation. This function can
+        // park in `send_async` below, and a fold snapshot can land during
+        // that park; the stamp classifies the record correctly either way.
+        let mut msg = AofMessage::Append {
+            lsn,
+            db,
+            bytes,
+            epoch,
+        };
         // #452.1 ordering rule 1 (P0 fix): this path MUST honor the spill
         // gate like every other producer — the fold's phase-1/3 drains free
         // channel slots mid-fold, so an ungated `try_send` here could place
@@ -826,6 +1001,7 @@ impl AofWriterPool {
         lsn: u64,
         db: usize,
         bytes: Bytes,
+        epoch: FoldEpoch,
     ) -> crate::runtime::channel::OneshotReceiver<AofAck> {
         use super::rewrite_overflow::SpillReject;
         let (ack_tx, ack_rx) = crate::runtime::channel::oneshot::<AofAck>();
@@ -834,6 +1010,7 @@ impl AofWriterPool {
             db,
             bytes,
             ack: ack_tx,
+            epoch,
         };
         // #452.1 ordering rule 1 (P0 fix): AppendSync producers (always-path
         // appends and zero-length fsync barriers) must honor the spill gate
@@ -931,6 +1108,8 @@ impl AofWriterPool {
             lsn: tagged_lsn,
             db,
             bytes,
+            // #455: synchronous producer — see `fold_stamp`.
+            epoch: self.fold_stamp(shard_id),
         };
         // #452.1 (re-verify Q2): this leg must honor the same spill-first
         // gate as every other producer — an ungated try_send during a fold
@@ -1286,7 +1465,7 @@ mod pool_tests {
         // SPSC ring, so the fold will error out. The test verifies the abort path,
         // which is triggered by the fold guard's error handling.
         let mut last_db: usize = 0;
-        let _ = do_rewrite_per_shard(
+        let outcome = do_rewrite_per_shard(
             0,
             &shard_dbs,
             &mut file,
@@ -1295,6 +1474,14 @@ mod pool_tests {
             &fold_producer,
             &fold_notifier,
             &mut last_db,
+            FoldEpoch::INITIAL,
+        );
+        assert!(
+            !matches!(
+                outcome,
+                Ok(super::super::rewrite::FoldOutcome::Committed { .. })
+            ),
+            "an aborted fold must never report its generation committed"
         );
 
         // Abort kept the old generation committed and pruned the new-gen incr.
@@ -1530,7 +1717,8 @@ mod pool_tests {
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
-        let recv = pool.try_send_append_sync(0, 99, 0, Bytes::from_static(b"SET k v"));
+        let recv =
+            pool.try_send_append_sync(0, 99, 0, Bytes::from_static(b"SET k v"), FoldEpoch::INITIAL);
 
         // Drain the queue; the writer would normally do this. Capture the
         // ack sender, do the (mock) durable write, then ack Synced.
@@ -1561,7 +1749,7 @@ mod pool_tests {
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
-        let recv = pool.try_send_append_sync(0, 7, 0, Bytes::from_static(b"x"));
+        let recv = pool.try_send_append_sync(0, 7, 0, Bytes::from_static(b"x"), FoldEpoch::INITIAL);
 
         // Drain the message but DROP the ack sender without sending.
         match rx0.try_recv() {
@@ -1581,7 +1769,7 @@ mod pool_tests {
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
-        let recv = pool.try_send_append_sync(0, 1, 0, Bytes::from_static(b"x"));
+        let recv = pool.try_send_append_sync(0, 1, 0, Bytes::from_static(b"x"), FoldEpoch::INITIAL);
         let ack = match rx0.try_recv() {
             Ok(AofMessage::AppendSync { ack, .. }) => ack,
             other => panic!("expected AppendSync, got {:?}", other.is_ok()),
@@ -1598,7 +1786,7 @@ mod pool_tests {
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
-        let recv = pool.try_send_append_sync(0, 1, 0, Bytes::from_static(b"x"));
+        let recv = pool.try_send_append_sync(0, 1, 0, Bytes::from_static(b"x"), FoldEpoch::INITIAL);
         let ack = match rx0.try_recv() {
             Ok(AofMessage::AppendSync { ack, .. }) => ack,
             other => panic!("expected AppendSync, got {:?}", other.is_ok()),
@@ -1621,7 +1809,8 @@ mod pool_tests {
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
-        let recv = pool.try_send_append_sync(0, 99, 0, Bytes::from_static(b"SET k v"));
+        let recv =
+            pool.try_send_append_sync(0, 99, 0, Bytes::from_static(b"SET k v"), FoldEpoch::INITIAL);
 
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -1629,8 +1818,14 @@ mod pool_tests {
             .open(&incr)
             .unwrap();
         let mut last_db: usize = 0;
-        let mut outcome =
-            drain_pending_appends_framed(&rx0, &mut file, usize::MAX, &mut last_db).unwrap();
+        let mut outcome = drain_pending_appends_framed(
+            &rx0,
+            &mut file,
+            usize::MAX,
+            &mut last_db,
+            FoldEpoch::INITIAL,
+        )
+        .unwrap();
 
         // CONTRACT: drained + parked, NOT yet acked.
         assert_eq!(outcome.drained, 1, "the AppendSync was drained");
@@ -1665,7 +1860,7 @@ mod pool_tests {
 
         // A real append followed by a barrier (empty payload).
         pool.try_send_append(0, 5, 0, Bytes::from_static(b"*1\r\n$4\r\nPING\r\n"));
-        let barrier_recv = pool.try_send_append_sync(0, 0, 0, Bytes::new());
+        let barrier_recv = pool.try_send_append_sync(0, 0, 0, Bytes::new(), FoldEpoch::INITIAL);
 
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -1673,8 +1868,14 @@ mod pool_tests {
             .open(&incr)
             .unwrap();
         let mut last_db: usize = 0;
-        let mut outcome =
-            drain_pending_appends_framed(&rx0, &mut file, usize::MAX, &mut last_db).unwrap();
+        let mut outcome = drain_pending_appends_framed(
+            &rx0,
+            &mut file,
+            usize::MAX,
+            &mut last_db,
+            FoldEpoch::INITIAL,
+        )
+        .unwrap();
 
         assert_eq!(outcome.drained, 2, "both messages count toward drained");
         assert_eq!(outcome.pending_acks.len(), 1, "barrier ack parked");
@@ -1727,8 +1928,14 @@ mod pool_tests {
             .open(&incr)
             .unwrap();
         let mut last_db: usize = 0;
-        let outcome =
-            drain_pending_appends_framed(&rx0, &mut file, usize::MAX, &mut last_db).unwrap();
+        let outcome = drain_pending_appends_framed(
+            &rx0,
+            &mut file,
+            usize::MAX,
+            &mut last_db,
+            FoldEpoch::INITIAL,
+        )
+        .unwrap();
         assert_eq!(outcome.drained, 3, "all three real appends were drained");
         assert_eq!(
             last_db, 0,
@@ -1781,7 +1988,8 @@ mod pool_tests {
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
-        let recv = pool.try_send_append_sync(0, 7, 0, Bytes::from_static(b"SET a b"));
+        let recv =
+            pool.try_send_append_sync(0, 7, 0, Bytes::from_static(b"SET a b"), FoldEpoch::INITIAL);
 
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -1789,7 +1997,8 @@ mod pool_tests {
             .open(&incr)
             .unwrap();
         let mut last_db: usize = 0;
-        let mut outcome = drain_pending_appends(&rx0, &mut file, &mut last_db).unwrap();
+        let mut outcome =
+            drain_pending_appends(&rx0, &mut file, &mut last_db, FoldEpoch::INITIAL).unwrap();
         assert_eq!(
             outcome.pending_acks.len(),
             1,
@@ -1826,7 +2035,7 @@ mod pool_tests {
 
         let start = Instant::now();
         let res = pool
-            .try_send_append_durable(0, 1, 0, Bytes::from_static(b"x"))
+            .try_send_append_durable(0, 1, 0, Bytes::from_static(b"x"), FoldEpoch::INITIAL)
             .await;
         let elapsed = start.elapsed();
 
@@ -1864,7 +2073,7 @@ mod pool_tests {
         });
 
         let res = pool
-            .try_send_append_durable(0, 1, 0, Bytes::from_static(b"x"))
+            .try_send_append_durable(0, 1, 0, Bytes::from_static(b"x"), FoldEpoch::INITIAL)
             .await;
         assert_eq!(res, Ok(()), "ack within the bound must succeed");
         drop(_rx1);
@@ -1926,18 +2135,21 @@ mod pool_tests {
             lsn: 1,
             db: 0,
             bytes: Bytes::from_static(b"AAAA"),
+            epoch: FoldEpoch::INITIAL,
         })
         .unwrap();
         tx.try_send(AofMessage::Append {
             lsn: 2,
             db: 0,
             bytes: Bytes::from_static(b"BBBB"),
+            epoch: FoldEpoch::INITIAL,
         })
         .unwrap();
         tx.try_send(AofMessage::Append {
             lsn: 3,
             db: 0,
             bytes: Bytes::from_static(b"CCCC"),
+            epoch: FoldEpoch::INITIAL,
         })
         .unwrap();
 
@@ -1949,6 +2161,7 @@ mod pool_tests {
             db: 0,
             bytes: Bytes::from_static(b"DDDD"),
             ack: ack_tx,
+            epoch: FoldEpoch::INITIAL,
         })
         .unwrap();
 
@@ -2029,7 +2242,7 @@ mod pool_tests {
 
         // The handler MUST await this BEFORE flushing responses to the client
         let result = pool
-            .try_send_append_durable(0, 1, 0, Bytes::from_static(b"SET k v"))
+            .try_send_append_durable(0, 1, 0, Bytes::from_static(b"SET k v"), FoldEpoch::INITIAL)
             .await;
         mock_writer.await.expect("mock writer completed");
 
@@ -2109,7 +2322,8 @@ mod pool_tests {
         let pool = AofWriterPool::top_level(tx0);
 
         let before = AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
-        let recv = pool.try_send_append_sync(0, 1, 0, Bytes::from_static(b"SET k v"));
+        let recv =
+            pool.try_send_append_sync(0, 1, 0, Bytes::from_static(b"SET k v"), FoldEpoch::INITIAL);
 
         // The channel was full — ChannelFull is returned immediately without
         // a writer round-trip.
@@ -2169,6 +2383,7 @@ mod pool_tests {
             55,
             0,
             Bytes::from_static(b"SWAPDB 0 1"),
+            FoldEpoch::INITIAL,
         ));
 
         handle.join().expect("ack dropper thread");
@@ -2202,6 +2417,7 @@ mod pool_tests {
             56,
             0,
             Bytes::from_static(b"SWAPDB 0 1"),
+            FoldEpoch::INITIAL,
         ));
 
         assert!(
@@ -2235,6 +2451,7 @@ mod pool_tests {
             77,
             0,
             Bytes::from_static(b"MSET k v"),
+            FoldEpoch::INITIAL,
         ));
 
         assert_eq!(
@@ -2268,6 +2485,7 @@ mod pool_tests {
             78,
             0,
             Bytes::from_static(b"MSET k v"),
+            FoldEpoch::INITIAL,
         ));
         assert_eq!(
             result,
@@ -2291,6 +2509,7 @@ mod pool_tests {
             79,
             0,
             Bytes::from_static(b"MSET k v"),
+            FoldEpoch::INITIAL,
         ));
         assert!(
             result.is_err(),
@@ -2420,6 +2639,7 @@ mod pool_tests {
             lsn: 0,
             db: 0,
             bytes: Bytes::from_static(b"x"),
+            epoch: FoldEpoch::INITIAL,
         })
         .unwrap();
         let pool = AofWriterPool::top_level_with_policy(
@@ -2430,7 +2650,7 @@ mod pool_tests {
 
         let before = AOF_BACKPRESSURE_DROPPED.load(Ordering::Relaxed);
         let res = pool
-            .try_send_append_durable(0, 1, 0, Bytes::from_static(b"SET k v"))
+            .try_send_append_durable(0, 1, 0, Bytes::from_static(b"SET k v"), FoldEpoch::INITIAL)
             .await;
         assert_eq!(
             res,
@@ -2454,6 +2674,7 @@ mod pool_tests {
             lsn: 0,
             db: 0,
             bytes: Bytes::from_static(b"x"),
+            epoch: FoldEpoch::INITIAL,
         })
         .unwrap();
         let pool = AofWriterPool::top_level_with_policy(
@@ -2470,7 +2691,7 @@ mod pool_tests {
         });
 
         let res = pool
-            .try_send_append_durable(0, 1, 0, Bytes::from_static(b"SET k v"))
+            .try_send_append_durable(0, 1, 0, Bytes::from_static(b"SET k v"), FoldEpoch::INITIAL)
             .await;
         assert_eq!(
             res,
@@ -2562,6 +2783,7 @@ mod pool_tests {
             lsn: 0,
             db: 0,
             bytes: Bytes::from_static(b"x"),
+            epoch: FoldEpoch::INITIAL,
         })
         .unwrap();
         let pool = AofWriterPool::top_level_with_policy(
@@ -2602,6 +2824,7 @@ mod pool_tests {
             lsn: 0,
             db: 0,
             bytes: Bytes::from_static(b"x"),
+            epoch: FoldEpoch::INITIAL,
         })
         .unwrap();
         let pool = AofWriterPool::top_level_with_policy(
@@ -2677,6 +2900,7 @@ mod pool_tests {
                 lsn: 1,
                 db: 0,
                 bytes: Bytes::from_static(b"older-buffered"),
+                epoch: FoldEpoch::INITIAL,
             })
             .is_ok()
         );
@@ -2701,6 +2925,7 @@ mod pool_tests {
                 lsn: 1,
                 db: 0,
                 bytes: Bytes::from_static(b"older-spilled"),
+                epoch: FoldEpoch::INITIAL,
             })
             .is_ok()
         );
@@ -2711,6 +2936,7 @@ mod pool_tests {
             2,
             0,
             Bytes::from_static(b"newer"),
+            FoldEpoch::INITIAL,
         ));
         assert!(result.is_ok(), "spilled append must report enqueued");
         assert!(
@@ -2736,11 +2962,13 @@ mod pool_tests {
                 lsn: 1,
                 db: 0,
                 bytes: Bytes::from_static(b"older-spilled"),
+                epoch: FoldEpoch::INITIAL,
             })
             .is_ok()
         );
 
-        let ack_rx = pool.try_send_append_sync(0, 2, 0, Bytes::from_static(b"durable"));
+        let ack_rx =
+            pool.try_send_append_sync(0, 2, 0, Bytes::from_static(b"durable"), FoldEpoch::INITIAL);
         assert!(
             rx.is_empty(),
             "gated AppendSync must spill, never enter the channel while older \
@@ -2760,7 +2988,7 @@ mod pool_tests {
             .unwrap();
         let mut db_ctx = 0usize;
         pool.overflow_for(0)
-            .finish_framed(&rx, &mut file, &mut db_ctx, true)
+            .finish_framed(&rx, &mut file, &mut db_ctx, FoldEpoch::INITIAL)
             .unwrap();
         assert_eq!(
             ack_rx.try_recv(),

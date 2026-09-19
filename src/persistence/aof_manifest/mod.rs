@@ -1005,6 +1005,34 @@ impl AofManifest {
     ///
     /// Returns the path to the new incremental file (caller should switch writing to it).
     pub fn advance(&mut self, rdb_bytes: &[u8]) -> Result<PathBuf, crate::error::MoonError> {
+        self.advance_with(rdb_bytes, |_| Ok(()))
+            .map(|(path, ())| path)
+    }
+
+    /// [`advance`](Self::advance), with a `prepare` step that runs on the new
+    /// incremental file AFTER it is created and BEFORE the manifest flips to
+    /// it (#455). The AOF writer opens its append handle there, so everything
+    /// that can fail happens while the old generation is still the committed
+    /// one. Once this returns `Ok`, the writer's handle points at the committed
+    /// generation, and switching to it cannot fail.
+    ///
+    /// Before this, the writer reopened the new incr only after `advance`
+    /// returned. When that reopen failed, the manifest had already flipped,
+    /// but the writer treated the rewrite as aborted. It kept appending to the
+    /// old incr, which the flip had deleted, so every later record was
+    /// invisible to recovery, while the everysec/`always` fsync on the dead
+    /// inode kept reporting success.
+    ///
+    /// All-or-nothing: on `Err` the manifest (on disk and `self.seq`) still
+    /// names the old generation and the old files are untouched. A failure
+    /// from the new incr's creation onwards also removes the new base and incr
+    /// (best effort). A failed `write_manifest` cannot have flipped anything,
+    /// because its last fallible step is the rename itself.
+    pub fn advance_with<T>(
+        &mut self,
+        rdb_bytes: &[u8],
+        prepare: impl FnOnce(&Path) -> Result<T, crate::error::MoonError>,
+    ) -> Result<(PathBuf, T), crate::error::MoonError> {
         let old_seq = self.seq;
         let new_seq = old_seq + 1;
 
@@ -1045,18 +1073,48 @@ impl AofManifest {
 
         // 2. Create empty new incremental file
         let new_incr = self.incr_path_seq(new_seq);
-        std::fs::File::create(&new_incr).map_err(|e| crate::error::AofError::Io {
-            path: new_incr.clone(),
-            source: e,
-        })?;
+        let discard_new_generation = |why: &dyn std::fmt::Display| {
+            warn!(
+                "AOF advance to seq {} abandoned before the manifest flip ({}); \
+                 seq {} stays committed",
+                new_seq, why, old_seq
+            );
+            let _ = std::fs::remove_file(&new_incr);
+            let _ = std::fs::remove_file(&new_base);
+        };
+        if let Err(e) = std::fs::File::create(&new_incr) {
+            discard_new_generation(&e);
+            return Err(crate::error::AofError::Io {
+                path: new_incr.clone(),
+                source: e,
+            }
+            .into());
+        }
+
+        // 2b. Caller's preparation of the new incr (#455): runs while the old
+        //     generation is still the committed one.
+        let prepared = match prepare(&new_incr) {
+            Ok(t) => t,
+            Err(e) => {
+                discard_new_generation(&e);
+                return Err(e);
+            }
+        };
 
         // 3. Update manifest (atomic)
         self.seq = new_seq;
-        self.write_manifest()
-            .map_err(|e| crate::error::AofError::Io {
+        if let Err(e) = self.write_manifest() {
+            // The rename is write_manifest's last fallible step: an error
+            // means the on-disk manifest still names `old_seq`. Keep the
+            // in-memory manifest in agreement with it.
+            self.seq = old_seq;
+            discard_new_generation(&e);
+            return Err(crate::error::AofError::Io {
                 path: self.manifest_path(),
                 source: e,
-            })?;
+            }
+            .into());
+        }
 
         // 4. Delete old files — ONLY once it is safe (deep-review D1/D4).
         //
@@ -1081,7 +1139,7 @@ impl AofManifest {
                  generation seq {} on disk as the durability backstop",
                 e, old_seq
             );
-            return Ok(new_incr);
+            return Ok((new_incr, prepared));
         }
         if let Some(parent) = self.manifest_path().parent() {
             if let Err(e) = fsync_directory(parent) {
@@ -1092,7 +1150,7 @@ impl AofManifest {
                      manifest flip is not)",
                     e, old_seq
                 );
-                return Ok(new_incr);
+                return Ok((new_incr, prepared));
             }
         }
         let old_base = self.base_path_seq(old_seq);
@@ -1119,7 +1177,7 @@ impl AofManifest {
             new_incr.display()
         );
 
-        Ok(new_incr)
+        Ok((new_incr, prepared))
     }
 }
 
@@ -1461,5 +1519,116 @@ mod tests_v2 {
         assert_eq!(m.layout, AofLayout::TopLevel);
 
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod advance_tests {
+    //! `advance` / `advance_with` are all-or-nothing: on `Err` the manifest
+    //! on disk AND in memory still names the old generation.
+
+    use super::*;
+
+    /// Make `write_manifest` fail before its rename: its tmp path is a
+    /// directory, so `File::create` on it errors.
+    fn block_manifest_write(m: &AofManifest) -> PathBuf {
+        let blocker = m.manifest_path().with_extension("tmp");
+        std::fs::create_dir_all(&blocker).expect("create blocker dir");
+        blocker
+    }
+
+    #[test]
+    fn failed_manifest_write_leaves_the_old_generation_committed_in_memory_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut m = AofManifest::initialize(dir.path()).expect("initialize");
+        let old_seq = m.seq;
+        let old_incr = m.incr_path_seq(old_seq);
+        let blocker = block_manifest_write(&m);
+
+        assert!(
+            m.advance(b"new-base").is_err(),
+            "a manifest that cannot be written must fail the advance"
+        );
+        assert_eq!(
+            m.seq, old_seq,
+            "the on-disk manifest still names the old seq; the in-memory one must agree"
+        );
+        let on_disk = AofManifest::load(dir.path())
+            .expect("load")
+            .expect("manifest present");
+        assert_eq!(on_disk.seq, old_seq);
+        assert_eq!(
+            m.incr_path(),
+            old_incr,
+            "the writer's incr path must still be the committed one"
+        );
+        assert!(old_incr.exists(), "the committed incr must be untouched");
+        assert!(
+            !m.incr_path_seq(old_seq + 1).exists() && !m.base_path_seq(old_seq + 1).exists(),
+            "the abandoned generation's files must be removed"
+        );
+
+        // Once the fault clears, the next advance lands on old_seq + 1 — not
+        // on a seq whose predecessor was never committed.
+        std::fs::remove_dir(&blocker).expect("remove blocker");
+        m.advance(b"new-base")
+            .expect("advance after the fault clears");
+        assert_eq!(m.seq, old_seq + 1);
+        let on_disk = AofManifest::load(dir.path())
+            .expect("load")
+            .expect("manifest present");
+        assert_eq!(on_disk.seq, old_seq + 1);
+    }
+
+    #[test]
+    fn failed_prepare_abandons_the_new_generation_before_the_flip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut m = AofManifest::initialize(dir.path()).expect("initialize");
+        let old_seq = m.seq;
+
+        let res = m.advance_with(
+            b"new-base",
+            |_new_incr| -> Result<(), crate::error::MoonError> {
+                Err(crate::error::AofError::RewriteFailed {
+                    detail: "injected".to_string(),
+                }
+                .into())
+            },
+        );
+        assert!(res.is_err());
+        assert_eq!(m.seq, old_seq);
+        let on_disk = AofManifest::load(dir.path())
+            .expect("load")
+            .expect("manifest present");
+        assert_eq!(on_disk.seq, old_seq, "the manifest must never flip");
+        assert!(m.incr_path_seq(old_seq).exists());
+        assert!(
+            !m.incr_path_seq(old_seq + 1).exists() && !m.base_path_seq(old_seq + 1).exists(),
+            "the abandoned generation's files must be removed"
+        );
+    }
+
+    #[test]
+    fn prepare_runs_on_the_new_incr_before_the_flip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut m = AofManifest::initialize(dir.path()).expect("initialize");
+        let old_seq = m.seq;
+        let manifest_dir = dir.path().to_path_buf();
+
+        let (new_incr, seen_seq) = m
+            .advance_with(b"new-base", |new_incr| {
+                assert!(new_incr.exists(), "prepare sees the created incr");
+                let on_disk = AofManifest::load(&manifest_dir)
+                    .expect("load")
+                    .expect("manifest present");
+                Ok(on_disk.seq)
+            })
+            .expect("advance_with");
+        assert_eq!(
+            seen_seq, old_seq,
+            "prepare must run while the old seq is committed"
+        );
+        assert_eq!(m.seq, old_seq + 1);
+        assert_eq!(new_incr, m.incr_path_seq(old_seq + 1));
     }
 }
