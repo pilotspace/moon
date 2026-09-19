@@ -302,6 +302,24 @@ impl<'a> TxnLocks<'a> {
     }
 }
 
+/// moon#1069: record, for the post-EXEC wake, the keys a queued write touched
+/// in `db` — only when someone on the shard was blocked when EXEC began and
+/// the command can produce a list, zset or stream at all.
+fn record_exec_wakes(
+    exec_wakes: &mut Vec<(usize, Bytes)>,
+    wake_armed: bool,
+    db: usize,
+    cmd: &[u8],
+    args: &[Frame],
+) {
+    if !wake_armed || !crate::blocking::wakeup::may_ready_a_key(cmd) {
+        return;
+    }
+    crate::blocking::wakeup::for_each_written_key(cmd, args, |k| {
+        exec_wakes.push((db, k.clone()));
+    });
+}
+
 /// Execute a queued transaction atomically under a single database lock.
 ///
 /// Checks WATCH versions first -- if any watched key's version has changed since
@@ -503,6 +521,10 @@ pub(crate) fn execute_transaction_sharded(
     // with the db each was written in. Raised by the CALLER after the body,
     // never here — see the collection site below for why.
     exec_wakes: &mut Vec<(usize, Bytes)>,
+    // moon#1069: was anyone blocked on this shard when EXEC began? Nothing can
+    // register while the body runs (one synchronous stretch), so `false`
+    // means no key of this body can wake anybody, and none is recorded.
+    wake_armed: bool,
     // WATCH/CAS (task `watch-cas-transactions`): the versions this connection
     // recorded at WATCH time. Empty for the overwhelming majority of
     // transactions, which is why the check below early-outs on `is_empty`
@@ -593,7 +615,9 @@ pub(crate) fn execute_transaction_sharded(
                 )));
                 continue;
             };
-            let outcome = super::txn_script::run_txn_script(env, cmd, cmd_args, selected, shard_id);
+            let outcome = super::txn_script::run_txn_script(
+                env, cmd, cmd_args, selected, shard_id, wake_armed,
+            );
             aof_entries.extend(outcome.effects);
             // moon#1069: the keys the script's own `redis.call` writes touched.
             exec_wakes.extend(outcome.ready);
@@ -644,11 +668,7 @@ pub(crate) fn execute_transaction_sharded(
                     aof_entries.push((selected, buf.freeze()));
                     // moon#1059: a queued BLMOVE that moved pushed onto its
                     // destination, which a client may be blocked on.
-                    exec_wakes.extend(
-                        crate::blocking::wakeup::written_keys(cmd, cmd_args)
-                            .into_iter()
-                            .map(|k| (selected, k)),
-                    );
+                    record_exec_wakes(exec_wakes, wake_armed, selected, cmd, cmd_args);
                 }
                 results.push(super::util::apply_resp3_conversion(
                     cmd,
@@ -742,9 +762,11 @@ pub(crate) fn execute_transaction_sharded(
                 // moon#1069: the key now exists in the database it names; a
                 // client blocked on it there is served after EXEC, like every
                 // other key this body wrote (see `exec_wakes` below).
-                if let Some(target) = crate::blocking::wakeup::cross_db_write_target(
-                    cmd, cmd_args, selected, db_count,
-                ) {
+                if wake_armed
+                    && let Some(target) = crate::blocking::wakeup::cross_db_write_target(
+                        cmd, cmd_args, selected, db_count,
+                    )
+                {
                     exec_wakes.push(target);
                 }
             }
@@ -810,11 +832,7 @@ pub(crate) fn execute_transaction_sharded(
         // (`MOVE` / `COPY ... DB n` never get here: the moon#1062 arm above
         // runs them and records the key in the database they wrote.)
         if !matches!(&response, Frame::Error(_)) {
-            exec_wakes.extend(
-                crate::blocking::wakeup::written_keys(cmd, cmd_args)
-                    .into_iter()
-                    .map(|k| (entry_db, k)),
-            );
+            record_exec_wakes(exec_wakes, wake_armed, entry_db, cmd, cmd_args);
         }
 
         // Auto-index: if HSET succeeded, check for vector index match

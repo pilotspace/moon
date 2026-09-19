@@ -120,6 +120,9 @@ pub(crate) fn run_txn_script(
     args: &[Frame],
     db_idx: usize,
     shard_id: usize,
+    // moon#1069: the EXEC executor's "is anyone blocked" snapshot; `false`
+    // records none of the script's writes for waking.
+    wake_armed: bool,
 ) -> TxnScriptOutcome {
     let is_fcall = cmd.eq_ignore_ascii_case(b"FCALL");
     let is_fcall_ro = cmd.eq_ignore_ascii_case(b"FCALL_RO");
@@ -152,13 +155,14 @@ pub(crate) fn run_txn_script(
         None => None,
     };
 
+    // moon#1069: deferred — the keys this script writes are served with the
+    // rest of the transaction's, after EXEC (`ready`).
+    let wake = crate::blocking::wakeup::ScriptWakes::Defer { armed: wake_armed };
     let ((reply, flush), effects) =
         crate::scripting::bridge::capture_txn_effects(|| {
             crate::shard::slice::with_shard(|s| {
                 let db_count = s.databases.db_count();
-                // moon#1069: `None` — the keys this script writes are served
-                // with the rest of the transaction's, after EXEC (`ready`).
-                crate::scripting::pending_flush::run_and_complete(s, db_idx, None, |db| {
+                crate::scripting::pending_flush::run_and_complete(s, db_idx, wake, |db| {
                     match registry {
                         Some(reg) if is_fcall => crate::command::functions::handle_fcall(
                             reg,

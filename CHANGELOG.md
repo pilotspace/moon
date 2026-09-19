@@ -207,10 +207,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SWAPDB` every key parked in either database. A wake-served move feeds its
   destination's waiters in the same pass, over a worklist bounded by the
   waiters parked when it began — chains and cycles are served as redis's
-  `handleClientsBlockedOnKeys` serves them. A key that becomes the wrong type
-  for its waiter still leaves the waiter parked, as in redis. Every case was
-  measured against redis-server 8.6.1 first (served within about 0.3 s) and
-  now matches it at `--shards 1` and `--shards 4` on both runtimes.
+  `handleClientsBlockedOnKeys` serves them. All the keys one command, one
+  `EXEC` or one script made ready form a single batch that is served before
+  the keys the moves it serves push onto. So, with `BLMOVE a c`, `BLMOVE b c`
+  and `BRPOP c` parked, `MULTI; RPUSH a x; RPUSH b y; EXEC` hands the `BRPOP`
+  `y` and leaves `c = [x]`, as redis does. A key that becomes the wrong type
+  for its waiter still leaves the waiter parked, as in redis. The wake costs
+  nothing measurable while a client is parked on the shard: a write that can
+  only produce a string, hash, set, bitmap or HyperLogLog skips the key walk
+  entirely, as redis's `signalKeyAsReady` returns early on type, and the
+  registry is probed with borrowed keys. A 10-key `MSET` with one `BLPOP`
+  parked runs within noise of the build before the wake existed. Every case
+  was measured against redis-server 8.6.1 first (served within about 0.3 s)
+  and now matches it at `--shards 1` and `--shards 4` on both runtimes.
 
 - **`test`/`ci`: `cargo test --release --lib` is green on `main` again — five
   `CONFIG SET` tests were permanently leaking a published `maxmemory` into every

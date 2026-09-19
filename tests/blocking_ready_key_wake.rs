@@ -47,9 +47,8 @@ use std::time::{Duration, Instant};
 const BLOCK_SECS: &str = "5";
 /// A reply later than this did not come from the write.
 const WOKEN_WITHIN: Duration = Duration::from_secs(2);
-/// Gap between parking two clients, so their FIFO order is the order parked,
-/// and between the last park and the write.
-const SETTLE: Duration = Duration::from_millis(300);
+/// How long a client may take to register as blocked after it was sent.
+const PARK_WITHIN: Duration = Duration::from_secs(5);
 /// Hash tags: distinct tags land on distinct shards at `--shards 4`, so each
 /// case runs on both the local and the remote route.
 const TAGS: [&str; 3] = ["a", "b", "c"];
@@ -209,6 +208,36 @@ fn run_write(port: u16, w: &WriteStep) -> Vec<String> {
     }
 }
 
+/// `blocked_clients` from `INFO clients`: one per waiter registered on its
+/// key's owning shard (each waiter here blocks on exactly one key).
+fn blocked_clients(admin: &mut Conn) -> usize {
+    let info = admin.send(&["INFO", "clients"]);
+    info.lines()
+        .find_map(|l| l.strip_prefix("blocked_clients:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Poll until exactly `want` clients are registered as blocked. Parking the
+/// next waiter only after the previous one is REGISTERED makes their FIFO
+/// order the order they were parked in, and writing only after the last one
+/// is registered means the write cannot race a waiter that is still on its
+/// way in — without a sleep long enough for a slow CI runner.
+fn await_blocked(admin: &mut Conn, want: usize, case: &str) {
+    let deadline = Instant::now() + PARK_WITHIN;
+    loop {
+        let n = blocked_clients(admin);
+        if n == want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{case}: blocked_clients stuck at {n}, want {want}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// One scenario: seed, park every waiter in order, write, then check every
 /// reply and every post-condition. Failures are appended, not panicked, so
 /// one run reports the whole table.
@@ -231,10 +260,13 @@ fn run_case(port: u16, case: Case, failures: &mut Vec<String>) {
             case.name
         );
     }
+    // The previous case's waiters have all answered, but a server may drop
+    // the registration a moment after the reply is on the wire.
+    await_blocked(&mut seed, 0, &case.name);
     let mut handles = Vec::new();
-    for w in &case.waiters {
+    for (i, w) in case.waiters.iter().enumerate() {
         handles.push(park(port, w));
-        std::thread::sleep(SETTLE);
+        await_blocked(&mut seed, i + 1, &case.name);
     }
     for r in run_write(port, &case.write) {
         if r.starts_with('-') {
@@ -289,6 +321,30 @@ fn wake_served_moves(tag: &str) -> Vec<Case> {
     );
     let (a2, b2, c2, a3, b3) = (k("a", 2), k("b", 2), k("c", 2), k("a", 3), k("b", 3));
     let (src5, dst5) = (k("src", 5), k("dst", 5));
+    let (a6, b6, c6, a7, b7, c7) = (
+        k("a", 6),
+        k("b", 6),
+        k("c", 6),
+        k("a", 7),
+        k("b", 7),
+        k("c", 7),
+    );
+    // Redis serves ALL the keys one command made ready as one batch before
+    // the keys the moves it served push onto: with `BLMOVE a c`, `BLMOVE b c`
+    // and `BRPOP c` parked, one EXEC (or one script) pushing onto `a` then `b`
+    // runs both moves first, so `BRPOP` takes `y` and `c` keeps `x`
+    // (redis-server 8.6.1). Serving `c` between the two moves hands it `x`.
+    let order = |name: &str, a: &str, b: &str, c: &str, write: WriteStep| Case {
+        name: format!("{name} [{tag}]"),
+        setup: vec![],
+        waiters: vec![
+            waiter(&["BLMOVE", a, c, "LEFT", "RIGHT", BLOCK_SECS], "x"),
+            waiter(&["BLMOVE", b, c, "LEFT", "RIGHT", BLOCK_SECS], "y"),
+            waiter(&["BRPOP", c, BLOCK_SECS], "y"),
+        ],
+        write,
+        after: vec![(argv(&["LRANGE", c, "0", "-1"]), "*1\r\n$1\r\nx\r\n".into())],
+    };
     vec![
         Case {
             name: format!("BLMOVE-wake -> BLPOP dst [{tag}]"),
@@ -360,6 +416,31 @@ fn wake_served_moves(tag: &str) -> Vec<Case> {
             write: cmds(&[&["BLMOVE", &src5, &dst5, "LEFT", "RIGHT", "1"]]),
             after: vec![(argv(&["LLEN", &dst5]), ":0".into())],
         },
+        order(
+            "order: MULTI RPUSH a x; RPUSH b y; EXEC",
+            &a6,
+            &b6,
+            &c6,
+            cmds(&[
+                &["MULTI"],
+                &["RPUSH", &a6, "x"],
+                &["RPUSH", &b6, "y"],
+                &["EXEC"],
+            ]),
+        ),
+        order(
+            "order: EVAL RPUSH a x; RPUSH b y",
+            &a7,
+            &b7,
+            &c7,
+            cmds(&[&[
+                "EVAL",
+                "redis.call('RPUSH', KEYS[1], 'x'); return redis.call('RPUSH', KEYS[2], 'y')",
+                "2",
+                &a7,
+                &b7,
+            ]]),
+        ),
     ]
 }
 

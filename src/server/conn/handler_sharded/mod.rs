@@ -1250,7 +1250,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             crate::scripting::pending_flush::run_and_complete(
                                 s,
                                 conn.selected_db,
-                                Some(&ctx.blocking_registry),
+                                crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
                                 |db| {
                             if script_is_eval {
                                 crate::scripting::handle_eval(
@@ -1491,7 +1491,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 crate::scripting::pending_flush::run_and_complete(
                                     s,
                                     conn.selected_db,
-                                    Some(&ctx.blocking_registry),
+                                    crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
                                     |db| {
                                 // moon#569: FCALL runs under the caller's
                                 // ACL. Built once and shared by both arms —

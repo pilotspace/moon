@@ -3549,14 +3549,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 // acquisition even when `new_sel_db == sel_db`.
                                 let mut wake_guard = s.databases.write(new_sel_db);
                                 let mut reg = ctx.blocking_registry.borrow_mut();
-                                for key in &ready {
-                                    crate::blocking::wakeup::wake_key(
-                                        &mut reg,
-                                        &mut wake_guard,
-                                        new_sel_db,
-                                        key,
-                                    );
-                                }
+                                crate::blocking::wakeup::wake_keys(
+                                    &mut reg,
+                                    &mut wake_guard,
+                                    new_sel_db,
+                                    ready,
+                                );
                             }
                         }
 

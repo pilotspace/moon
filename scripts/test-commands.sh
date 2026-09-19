@@ -2316,6 +2316,12 @@ if should_run "blocking"; then
     # The control: a key that becomes the WRONG type leaves the waiter parked.
     wake_row "wake: RENAME a zset onto a BLPOP key leaves it parked (moon#1069)" \
         "ZADD {rkw13}s 1 m" "RENAME {rkw13}s {rkw13}d" "0:BLPOP {rkw13}d 2"
+    # redis serves every key one command made ready as ONE batch before the
+    # keys the moves it serves push onto: BRPOP c takes y, not x.
+    wake_row "wake: one script's ready keys are one batch, served before the moves they feed (moon#1069)" \
+        "" "EVAL redis.call('RPUSH',KEYS[1],'x');return(redis.call('RPUSH',KEYS[2],'y')) 2 {rkw14}a {rkw14}b" \
+        "0:BLMOVE {rkw14}a {rkw14}c LEFT RIGHT 2" "0:BLMOVE {rkw14}b {rkw14}c LEFT RIGHT 2" \
+        "0:BRPOP {rkw14}c 2"
 fi
 
 # ===========================================================================

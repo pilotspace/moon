@@ -566,7 +566,7 @@ pub(crate) fn handle_shard_message_shared(
                         crate::scripting::pending_flush::run_and_complete(
                             s,
                             db_idx,
-                            Some(blocking_registry),
+                            crate::blocking::wakeup::ScriptWakes::Serve(blocking_registry),
                             |db| {
                                 if is_plain_eval {
                                     crate::scripting::handle_eval(
@@ -676,7 +676,7 @@ pub(crate) fn handle_shard_message_shared(
                         crate::scripting::pending_flush::run_and_complete(
                             s,
                             db_idx,
-                            Some(blocking_registry),
+                            crate::blocking::wakeup::ScriptWakes::Serve(blocking_registry),
                             |db| {
                                 // moon#569 + moon#514: the ACL that travels with
                                 // `ShardMessage::Execute` is the ORIGIN connection's, so a
@@ -3257,6 +3257,7 @@ pub(crate) fn handle_shard_message_shared(
                     &mut exec_publishes,
                     &mut exec_flushes,
                     &mut exec_wakes,
+                    blocking_registry.borrow().has_any_waiters(),
                     &watched,
                     txn_scripting.as_ref(),
                 );

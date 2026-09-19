@@ -800,6 +800,7 @@ pub(super) async fn try_handle_multi_exec(
                 exec_publishes,
                 &mut exec_flushes,
                 &mut exec_wakes,
+                ctx.blocking_registry.borrow().has_any_waiters(),
                 &watched,
                 txn_scripting.as_ref(),
             );

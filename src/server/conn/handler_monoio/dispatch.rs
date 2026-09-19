@@ -258,7 +258,7 @@ pub(super) async fn try_handle_evalsha(
         crate::scripting::pending_flush::run_and_complete(
             s,
             conn.selected_db,
-            Some(&ctx.blocking_registry),
+            crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
             |db| {
                 crate::scripting::handle_evalsha(
                     &ctx.lua,
@@ -344,7 +344,7 @@ pub(super) async fn try_handle_eval(
         crate::scripting::pending_flush::run_and_complete(
             s,
             conn.selected_db,
-            Some(&ctx.blocking_registry),
+            crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
             |db| {
                 crate::scripting::handle_eval(
                     &ctx.lua,
@@ -1679,7 +1679,7 @@ pub(super) async fn try_handle_functions(
                 crate::scripting::pending_flush::run_and_complete(
                     s,
                     conn.selected_db,
-                    Some(&ctx.blocking_registry),
+                    crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
                     |db| {
                         if is_fcall {
                             crate::command::functions::handle_fcall(

@@ -211,8 +211,17 @@ impl WaitEntry {
 ///
 /// Wrapped in `Rc<RefCell<...>>` by the shard, same pattern as PubSubRegistry.
 pub struct BlockingRegistry {
-    /// (db_index, key) -> FIFO queue of waiting clients.
-    waiters: HashMap<(usize, Bytes), VecDeque<WaitEntry>>,
+    /// db_index -> key -> FIFO queue of waiting clients.
+    ///
+    /// Nested rather than keyed on `(db_index, Bytes)` so a queue can be
+    /// probed with a BORROWED key (`&[u8]`, via `Bytes: Borrow<[u8]>`): the
+    /// post-write wake asks "does anyone wait on this key?" for every key a
+    /// write touches while any client is blocked on the shard, and a tuple
+    /// key made each of those probes clone the key — one atomic
+    /// increment/decrement per key per write (moon#1069 review). Invariant:
+    /// no empty queue and no empty inner map is ever left behind, which is
+    /// what makes [`has_any_waiters`](Self::has_any_waiters) exact.
+    waiters: HashMap<usize, HashMap<Bytes, VecDeque<WaitEntry>>>,
     /// wait_id -> list of (db_index, key) for cross-key cleanup on wakeup/timeout.
     wait_keys: HashMap<u64, Vec<(usize, Bytes)>>,
     /// Deadline index (c10k W6): min-heap of (deadline, db_index, key) for
@@ -247,6 +256,42 @@ impl BlockingRegistry {
         }
     }
 
+    /// The queue on `(db_index, key)`, probed without cloning the key.
+    #[inline]
+    fn queue(&self, db_index: usize, key: &[u8]) -> Option<&VecDeque<WaitEntry>> {
+        self.waiters.get(&db_index)?.get(key)
+    }
+
+    #[inline]
+    fn queue_mut(&mut self, db_index: usize, key: &[u8]) -> Option<&mut VecDeque<WaitEntry>> {
+        self.waiters.get_mut(&db_index)?.get_mut(key)
+    }
+
+    fn queue_or_insert(&mut self, db_index: usize, key: Bytes) -> &mut VecDeque<WaitEntry> {
+        self.waiters
+            .entry(db_index)
+            .or_default()
+            .entry(key)
+            .or_default()
+    }
+
+    /// Drop the queue on `(db_index, key)`, and the db's map with it when that
+    /// was its last queue — the invariant `has_any_waiters` relies on.
+    fn remove_queue(&mut self, db_index: usize, key: &[u8]) {
+        if let Some(inner) = self.waiters.get_mut(&db_index) {
+            inner.remove(key);
+            if inner.is_empty() {
+                self.waiters.remove(&db_index);
+            }
+        }
+    }
+
+    fn remove_queue_if_empty(&mut self, db_index: usize, key: &[u8]) {
+        if self.queue(db_index, key).is_none_or(VecDeque::is_empty) {
+            self.remove_queue(db_index, key);
+        }
+    }
+
     /// Returns and increments the next wait_id.
     /// Upper 16 bits encode shard_id, lower 48 bits are a per-shard counter.
     pub fn next_wait_id(&mut self) -> u64 {
@@ -266,9 +311,7 @@ impl BlockingRegistry {
                 .push(std::cmp::Reverse((deadline, db_index, key)));
         }
 
-        self.waiters
-            .entry(queue_key.clone())
-            .or_insert_with(VecDeque::new)
+        self.queue_or_insert(db_index, queue_key.1.clone())
             .push_back(entry);
 
         // A wait_id appears in `wait_keys` exactly while its client is
@@ -286,16 +329,9 @@ impl BlockingRegistry {
     /// Pop the first waiter from the FIFO queue for (db_index, key).
     /// Removes the key from the waiters map if the queue becomes empty.
     pub fn pop_front(&mut self, db_index: usize, key: &Bytes) -> Option<WaitEntry> {
-        let queue_key = (db_index, key.clone());
-        let entry = {
-            let queue = self.waiters.get_mut(&queue_key)?;
-            let entry = queue.pop_front()?;
-            entry
-        };
+        let entry = self.queue_mut(db_index, key)?.pop_front()?;
         // Clean up empty queue
-        if self.waiters.get(&queue_key).map_or(true, |q| q.is_empty()) {
-            self.waiters.remove(&queue_key);
-        }
+        self.remove_queue_if_empty(db_index, key);
         Some(entry)
     }
 
@@ -318,15 +354,12 @@ impl BlockingRegistry {
         key: &Bytes,
         family: WaitFamily,
     ) -> Option<WaitEntry> {
-        let queue_key = (db_index, key.clone());
         let entry = {
-            let queue = self.waiters.get_mut(&queue_key)?;
+            let queue = self.queue_mut(db_index, key)?;
             let idx = queue.iter().position(|e| e.cmd.family() == family)?;
             queue.remove(idx)?
         };
-        if self.waiters.get(&queue_key).is_none_or(|q| q.is_empty()) {
-            self.waiters.remove(&queue_key);
-        }
+        self.remove_queue_if_empty(db_index, key);
         Some(entry)
     }
 
@@ -338,9 +371,7 @@ impl BlockingRegistry {
     /// The waiter never left `wait_keys`, and its deadline heap entry was
     /// never consumed, so nothing else needs restoring.
     pub fn requeue_front(&mut self, db_index: usize, key: &Bytes, entry: WaitEntry) {
-        self.waiters
-            .entry((db_index, key.clone()))
-            .or_default()
+        self.queue_or_insert(db_index, key.clone())
             .push_front(entry);
     }
 
@@ -357,8 +388,8 @@ impl BlockingRegistry {
     /// `XADD` cannot serve must stay parked until its own deadline. Popping
     /// first and answering `None` on a miss — what the destructive wakers do —
     /// would unblock those readers with a premature null.
-    pub fn waiters_on(&self, db_index: usize, key: &Bytes) -> Option<&VecDeque<WaitEntry>> {
-        self.waiters.get(&(db_index, key.clone()))
+    pub fn waiters_on(&self, db_index: usize, key: &[u8]) -> Option<&VecDeque<WaitEntry>> {
+        self.queue(db_index, key)
     }
 
     /// Remove every waiter on `(db_index, key)` whose id is in `ids`, and hand
@@ -400,8 +431,7 @@ impl BlockingRegistry {
         if ids.is_empty() {
             return taken;
         }
-        let queue_key = (db_index, key.clone());
-        if let Some(queue) = self.waiters.get_mut(&queue_key) {
+        if let Some(queue) = self.queue_mut(db_index, key) {
             let mut kept = VecDeque::with_capacity(queue.len());
             while let Some(entry) = queue.pop_front() {
                 if ids.binary_search(&entry.wait_id).is_ok() {
@@ -411,7 +441,7 @@ impl BlockingRegistry {
                 }
             }
             if kept.is_empty() {
-                self.waiters.remove(&queue_key);
+                self.remove_queue(db_index, key);
             } else {
                 *queue = kept;
             }
@@ -424,14 +454,14 @@ impl BlockingRegistry {
                 continue;
             };
             crate::admin::metrics_setup::record_client_unblocked();
-            for sibling in keys {
-                if sibling == queue_key {
+            for (sib_db, sib_key) in keys {
+                if sib_db == db_index && sib_key == key {
                     continue;
                 }
-                if let Some(queue) = self.waiters.get_mut(&sibling) {
+                if let Some(queue) = self.queue_mut(sib_db, &sib_key) {
                     queue.retain(|e| e.wait_id != *id);
                     if queue.is_empty() {
-                        self.waiters.remove(&sibling);
+                        self.remove_queue(sib_db, &sib_key);
                     }
                 }
             }
@@ -444,11 +474,11 @@ impl BlockingRegistry {
     pub fn remove_wait(&mut self, wait_id: u64) {
         if let Some(keys) = self.wait_keys.remove(&wait_id) {
             crate::admin::metrics_setup::record_client_unblocked();
-            for queue_key in keys {
-                if let Some(queue) = self.waiters.get_mut(&queue_key) {
+            for (db_index, key) in keys {
+                if let Some(queue) = self.queue_mut(db_index, &key) {
                     queue.retain(|e| e.wait_id != wait_id);
                     if queue.is_empty() {
-                        self.waiters.remove(&queue_key);
+                        self.remove_queue(db_index, &key);
                     }
                 }
             }
@@ -480,17 +510,16 @@ impl BlockingRegistry {
     /// makes ready all at once (moon#1069). O(parked keys); `SWAPDB` is rare.
     pub fn waited_keys(&self, db_index: usize) -> Vec<Bytes> {
         self.waiters
-            .keys()
-            .filter(|(db, _)| *db == db_index)
-            .map(|(_, key)| key.clone())
-            .collect()
+            .get(&db_index)
+            .map(|inner| inner.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
-    /// Check if any waiters exist for this (db_index, key).
-    pub fn has_waiters(&self, db_index: usize, key: &Bytes) -> bool {
-        self.waiters
-            .get(&(db_index, key.clone()))
-            .map_or(false, |q| !q.is_empty())
+    /// Check if any waiters exist for this (db_index, key). Borrowed probe:
+    /// no clone of the key (moon#1069 review).
+    #[inline]
+    pub fn has_waiters(&self, db_index: usize, key: &[u8]) -> bool {
+        self.queue(db_index, key).is_some_and(|q| !q.is_empty())
     }
 
     /// Expire all timed-out waiters. Sends None through their reply channels.
@@ -513,10 +542,9 @@ impl BlockingRegistry {
         {
             #[allow(clippy::unwrap_used)] // peek above just proved non-empty
             let std::cmp::Reverse((_, db_index, key)) = self.deadlines.pop().unwrap();
-            let queue_key = (db_index, key);
             // A missing queue is a STALE heap entry (waiter served/cancelled
             // before its deadline) — the lazy-invalidation no-op.
-            let Some(queue) = self.waiters.get_mut(&queue_key) else {
+            let Some(queue) = self.queue_mut(db_index, &key) else {
                 continue;
             };
             let mut i = 0;
@@ -533,7 +561,7 @@ impl BlockingRegistry {
                 }
             }
             if queue.is_empty() {
-                self.waiters.remove(&queue_key);
+                self.remove_queue(db_index, &key);
             }
         }
 

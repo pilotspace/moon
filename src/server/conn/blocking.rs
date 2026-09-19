@@ -476,8 +476,9 @@ where
             immediate_scan(cmd, args, &keys, db, shard_id, num_shards)
         });
         if let Some(frame) = maybe_frame {
-            // moon#1059: an immediate BLMOVE pushed onto its destination.
-            if !matches!(frame, Frame::Error(_)) {
+            // moon#1059: an immediate BLMOVE pushed onto its destination. A
+            // plain pop only takes data, so it has nothing to signal.
+            if !matches!(frame, Frame::Error(_)) && move_endpoints(cmd, args).is_some() {
                 crate::blocking::wakeup::wake_written_keys_on_shard(
                     blocking_registry,
                     selected_db,
@@ -821,8 +822,9 @@ where
         if let Some(frame) = immediate_result {
             // moon#1059: an immediate BLMOVE pushed onto its destination,
             // which a client may be blocked on — the same serve a parked
-            // BLMOVE's wake now gives it (`try_wake_list_waiter`).
-            if !matches!(frame, Frame::Error(_)) {
+            // BLMOVE's wake now gives it (`try_wake_list_waiter`). A plain pop
+            // (BLPOP, BZPOPMIN, BLMPOP, ...) only takes data: nothing to signal.
+            if !matches!(frame, Frame::Error(_)) && move_endpoints(cmd, args).is_some() {
                 crate::blocking::wakeup::wake_written_keys_on_shard(
                     blocking_registry,
                     selected_db,
