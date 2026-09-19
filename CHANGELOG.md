@@ -245,6 +245,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     one connection drops the excess silently (moon#1088), and writes and
     reads made by scripts are invisible to tracking (moon#1089).
 
+- **`blocking_spanning_claim` bsc8 no longer fails its precondition on
+  Linux when a waiter lands on its key's owner** (moon#1083). The test raced
+  one waiter connection per owner shard and required at least `SHARDS - 1`
+  of the four races to happen. Only a waiter on a REMOTE owner can race,
+  because a waiter on its own owner has no claim token and unregisters as
+  soon as it sees the disconnect. That requirement holds on macOS, where
+  every connection lands on one shard. On Linux each connection is placed on
+  its own (the kernel's `SO_REUSEPORT` hash, or the central listener's
+  round-robin), so two local owners in one sequence failed the run. Measured
+  in a Linux container: 6/10 failures on both `origin/main` and #1045's
+  own tested head `80885575`. #1045's own dispatch showed it too: `TRY 1
+  FAIL`, then `FLAKY 2/3`. It was not the merge. The test now tries up to 8
+  fresh connections per owner until one lands on another shard, and keeps
+  the same `SHARDS - 1` precondition. It passed 20/20 on Linux against the
+  same binary. It still fails when the settle window is not held open ("0 of
+  4 owners … 8 connections each"). Against the old restore server
+  (`ffacf2ef`) it fails with 8/8 SERVE UNDONE: the correctness assertion
+  now runs before the precondition, where the old test could report "only 2
+  of 4" instead. Test only; the server is unchanged.
+
 - **`test`/`ci`: `cargo test --release --lib` is green on `main` again — five
   `CONFIG SET` tests were permanently leaking a published `maxmemory` into every
   test that ran after them, and the CI waiver hiding it is retired
