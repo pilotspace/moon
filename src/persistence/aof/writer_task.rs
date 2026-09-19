@@ -948,6 +948,12 @@ pub async fn aof_writer_task(
                             };
                             // Drop sf — caller will reopen aof_path below.
                             drop(sf);
+                            // INFO `aof_last_bgrewrite_status`, and the moon#914
+                            // boot-time rewrite's retry decision. Stored BEFORE
+                            // the in-progress flag clears, so a reader that sees
+                            // the flag clear also sees this rewrite's outcome.
+                            super::AOF_REWRITE_LAST_OK
+                                .store(committed, std::sync::atomic::Ordering::SeqCst);
                             crate::command::persistence::AOF_REWRITE_IN_PROGRESS
                                 .store(false, std::sync::atomic::Ordering::SeqCst);
                             let reopen_result: Result<tokio::fs::File, _> =
