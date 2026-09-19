@@ -92,6 +92,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the rest of the body runs;
   - a `WATCH` conflict aborts before any script runs.
 
+- **A write replayed after its key's spill marker is no longer discarded on
+  restart** (moon#965). On `runtime-tokio` with `--shards 1` no `AofManifest`
+  exists, so the AOF never carries a `MOON.COLDCUT` head — but `MOON.SPILLED`
+  markers are emitted unconditionally, so that configuration ran moon#902
+  half-armed. A replayed marker drops the key's hot copy; its next write then
+  replays through `Database::set`'s `Inserted` arm, which by design leaves the
+  cold shadow standing; and with no cut the end-of-replay reconcile took the
+  legacy cold-wins branch and threw the newer write away — logging it as
+  `1 hot shadow(s) demoted to cold stubs`. The issue's "AOF tail loss" title
+  named the wrong mechanism: both writes were on disk and both replayed.
+  A replayed marker now proves the generation is #902-era, and reconcile
+  resolves hot-wins for it whether or not the head carries the cut. That is
+  value-correct in every way a key can end hot and cold there: written after
+  its marker, a stale entry in a still-listed file, or a marker lost under
+  backpressure (both planes then hold the same value). Logs with neither record
+  keep the task #56 path unchanged. `tests/cold_shadow_single_shard_tokio.rs`,
+  written for exactly this configuration, was RED on main for weeks and never
+  ran: it was `#[ignore]`d because it shelled out to `redis-cli`. It now speaks
+  RESP through `common::Conn` and runs in every `runtime-tokio` leg; with the
+  fix inert it fails 3/3 on 36-47 stale probes.
+
 - **The moon#507 pipeline wait set is derived from `COMMAND_META` instead of a
   hand-written list, and `WATCH` inside its own pipeline no longer aborts the
   transaction** (moon#937, moon#946). `must_wait_for_pending_remote` decides

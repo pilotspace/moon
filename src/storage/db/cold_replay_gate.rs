@@ -36,8 +36,13 @@
 //! that is hot AND still cold at that point was rebuilt by the AOF alone
 //! (its marker was lost in the crash tail, or its cold entry is a stale file
 //! the manifest still lists) — the hot copy is the complete history, so the
-//! COLD entry is dropped. A generation with no `MOON.COLDCUT` (written before
-//! this fix) installs no gate and keeps the pre-existing behaviour verbatim.
+//! COLD entry is dropped. A generation that carries `MOON.SPILLED` markers
+//! but no `MOON.COLDCUT` head resolves the same way (moon#965): seeing a
+//! marker is proof the log is #902-era, and whether the head also carries the
+//! cut is an artifact of which runtime wrote the AOF — `runtime-tokio` with
+//! `--shards 1` never creates the `AofManifest` that seeds it. Only a log
+//! with neither record (written before #902) installs no gate and keeps the
+//! pre-existing task #56 behaviour verbatim.
 
 use std::collections::HashSet;
 
@@ -73,13 +78,15 @@ impl ReplayColdGate {
 /// What [`Database::finish_replay_cold_reconcile`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReplayColdReconcile {
-    /// `true` when a gate was installed (a `MOON.COLDCUT`-opened generation):
-    /// hot∩cold shadows resolved hot-wins by dropping the cold entry.
+    /// `true` when a gate was installed (a `MOON.COLDCUT`-opened generation).
+    /// Reporting only — the hot-wins resolution below also runs for a
+    /// marker-bearing generation with no head (moon#965), so a `false` here
+    /// no longer implies the task #56 pass ran.
     pub gated: bool,
-    /// Hot copies dropped in favour of the cold entry (legacy generation only,
-    /// the task #56 `demote_replayed_cold_shadows` pass).
+    /// Hot copies dropped in favour of the cold entry (pre-#902 generation
+    /// only, the task #56 `demote_replayed_cold_shadows` pass).
     pub hot_demoted: usize,
-    /// Cold entries dropped in favour of the hot copy (gated generation only).
+    /// Cold entries dropped in favour of the hot copy.
     pub cold_dropped: usize,
 }
 
@@ -137,14 +144,27 @@ impl Database {
     /// readable for the rest of the replay. A key whose cold entry points at a
     /// LATER file is left alone — that later file's own marker will cut it.
     ///
-    /// Returns how many hot copies were dropped. Safe to call without a gate
-    /// (legacy generation): the drop is still exact, and the end-of-replay
-    /// demote pass would have made the same decision less precisely.
+    /// Returns how many hot copies were dropped.
+    ///
+    /// Safe to call without a gate (a generation whose head carries no
+    /// `MOON.COLDCUT` — every AOF written under `runtime-tokio` with
+    /// `--shards 1`, the one config `main.rs` deliberately leaves without an
+    /// `AofManifest`): the drop itself is exact either way, but it is NOT
+    /// free of consequence, which moon#965 is the record of. Dropping the
+    /// hot copy here means the key's NEXT write record replays through
+    /// [`Database::set`]'s `Inserted` arm, and that arm deliberately leaves
+    /// the cold shadow standing — so the key ends replay hot AND cold, and
+    /// the legacy `demote_replayed_cold_shadows` resolution then discards a
+    /// write that provably post-dates the cold copy. Seeing a marker at all
+    /// is proof the log is #902-era, so it is recorded here and
+    /// [`Self::finish_replay_cold_reconcile`] uses the hot-wins resolution
+    /// for the rest of the generation.
     pub fn replay_cold_spilled<'k>(
         &mut self,
         file_id: u64,
         keys: impl IntoIterator<Item = &'k [u8]>,
     ) -> usize {
+        self.replay_saw_cold_marker = true;
         let mut dropped = 0usize;
         for key in keys {
             let current = self.cold_index.as_ref().and_then(|ci| ci.lookup(key));
@@ -169,19 +189,36 @@ impl Database {
     ///   in RAM but whose file stayed Active). The hot copy is the complete
     ///   history; the cold entry is dropped (its file is reclaimed by the
     ///   orphan sweep once no key references it).
-    /// * Legacy generation (no `MOON.COLDCUT` seen): the task #56 behaviour,
+    /// * Legacy generation (no `MOON.COLDCUT` seen) that nevertheless carried
+    ///   `MOON.SPILLED` markers: same hot-wins resolution (moon#965). A
+    ///   marker is proof the log is #902-era; whether its head also carries
+    ///   the cut is an artifact of which runtime created the AOF, not of the
+    ///   data. Enumerating how a key can be hot AND cold here shows hot-wins
+    ///   is value-correct in every case: it was written after its marker (the
+    ///   hot copy is newest), or its cold entry is stale in a file the
+    ///   manifest still lists (likewise), or its own marker was lost under
+    ///   AOF backpressure — in which case both planes hold the SAME value and
+    ///   hot-wins costs only restart-as-cold for that one key, which the
+    ///   marker's emit site already documents as the accepted price of losing
+    ///   it. Read visibility is untouched: no gate is installed, so every
+    ///   cold file stays readable during replay exactly as before.
+    /// * Pre-#902 generation (no cut, no markers — an AOF written by an older
+    ///   build): the task #56 behaviour,
     ///   [`Self::demote_replayed_cold_shadows`], unchanged.
     pub fn finish_replay_cold_reconcile(&mut self) -> ReplayColdReconcile {
-        let Some(_gate) = self.replay_cold_gate.take() else {
+        let gate = self.replay_cold_gate.take();
+        let saw_marker = std::mem::take(&mut self.replay_saw_cold_marker);
+        if gate.is_none() && !saw_marker {
             return ReplayColdReconcile {
                 gated: false,
                 hot_demoted: self.demote_replayed_cold_shadows(),
                 cold_dropped: 0,
             };
-        };
+        }
+        let gated = gate.is_some();
         let Some(ci) = self.cold_index.as_ref() else {
             return ReplayColdReconcile {
-                gated: true,
+                gated,
                 ..Default::default()
             };
         };
@@ -199,7 +236,7 @@ impl Database {
             }
         }
         ReplayColdReconcile {
-            gated: true,
+            gated,
             hot_demoted: 0,
             cold_dropped,
         }
@@ -356,6 +393,68 @@ mod tests {
         );
         assert!(!db.is_hot(b"shadow"));
         assert!(db.cold_index.as_ref().unwrap().lookup(b"shadow").is_some());
+    }
+
+    /// moon#965 red/green. A generation with `MOON.SPILLED` markers but NO
+    /// `MOON.COLDCUT` head — which is EVERY AOF written under
+    /// `runtime-tokio` + `--shards 1`, the one config `main.rs` deliberately
+    /// leaves without an `AofManifest` (and therefore without
+    /// `seed_cold_cut`).
+    ///
+    /// The marker drops the replay-built hot copy (restart-as-cold), so the
+    /// key's NEXT write record replays through `set`'s `Inserted` arm, which
+    /// deliberately leaves the cold shadow standing. Resolving that shadow
+    /// cold-wins discards a write that provably post-dates the cold copy:
+    /// the live server answered `v2`, the restarted one answers `v1`.
+    ///
+    /// Observed end-to-end before the fix (same crash image, one variable):
+    ///
+    /// ```text
+    /// as_is             GET -> v1-…  reconcile (gated=false): 1 hot shadow demoted
+    /// +MOON.COLDCUT     GET -> v2-…  reconcile (gated=true):  1 cold entry dropped
+    /// ```
+    #[test]
+    fn a_write_after_its_marker_beats_the_cold_copy_in_a_legacy_generation() {
+        let mut db = db_with_cold(&[(b"k", 5)]);
+        // No `install_replay_cold_gate` — this generation has no MOON.COLDCUT.
+        assert!(!db.replay_cold_gate_active());
+
+        // Replay, in log order: the key's own SET, the spill completion's
+        // marker, then a LATER SET of the same key.
+        db.set(b"k", Entry::new_string(Bytes::from_static(b"v1")));
+        assert_eq!(db.replay_cold_spilled(5, [b"k".as_slice()]), 1);
+        assert!(!db.is_hot(b"k"), "the marker cut the key to cold");
+        db.set(b"k", Entry::new_string(Bytes::from_static(b"v2")));
+
+        let outcome = db.finish_replay_cold_reconcile();
+        assert_eq!(
+            outcome.hot_demoted, 0,
+            "the hot copy post-dates the marker that produced the cold entry; \
+             demoting it serves the OLDER value after a restart (moon#965)"
+        );
+        assert_eq!(
+            outcome.cold_dropped, 1,
+            "the stale cold entry is what must go"
+        );
+        assert!(db.is_hot(b"k"), "the newer write must survive the restart");
+        assert!(db.cold_index.as_ref().unwrap().lookup(b"k").is_none());
+    }
+
+    /// The complement: a marker-bearing generation must NOT start keeping hot
+    /// copies of keys whose markers cut them and were never written again —
+    /// that is restart-as-cold, the whole point of task #56, and the fix must
+    /// leave it intact.
+    #[test]
+    fn a_key_cut_by_its_marker_and_never_rewritten_stays_cold() {
+        let mut db = db_with_cold(&[(b"k", 5)]);
+        db.set(b"k", Entry::new_string(Bytes::from_static(b"v1")));
+        assert_eq!(db.replay_cold_spilled(5, [b"k".as_slice()]), 1);
+
+        let outcome = db.finish_replay_cold_reconcile();
+        assert_eq!(outcome.hot_demoted, 0);
+        assert_eq!(outcome.cold_dropped, 0);
+        assert!(!db.is_hot(b"k"), "restart-as-cold is preserved");
+        assert!(db.cold_index.as_ref().unwrap().lookup(b"k").is_some());
     }
 
     #[test]
