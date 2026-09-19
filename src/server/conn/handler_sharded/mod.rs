@@ -1713,10 +1713,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                         ).await;
                         drop(blocked_guard);
                         // `peer_gone_after_serve` (moon#1023): the serve stands,
-                        // so it is invalidated and logged below exactly as a
-                        // delivered reply — AOF only on this runtime, and
-                        // dropped on replay for a remote key (moon#1056); only
-                        // the write is skipped.
+                        // so it is invalidated below exactly as a delivered
+                        // reply; only the write is skipped. The pop is already
+                        // logged by the shard that popped (moon#1056).
                         let (mut blocking_response, peer_gone_after_serve) = match blocking_outcome {
                             crate::server::conn::blocking::BlockingOutcome::Reply(frame) => (frame, false),
                             crate::server::conn::blocking::BlockingOutcome::ServedPeerGone(frame) => (frame, true),
@@ -1740,73 +1739,31 @@ pub(crate) async fn handle_connection_sharded_inner<
                         &blocking_response,
                         conn.client_id,
                     );
-
-                    // moon#827: the blocking path is an INTERCEPT — exactly
-                    // like the tracking invalidation above, it short-circuits
-                    // the dispatch exit where every other write meets the AOF,
-                    // so it has to feed it itself. It did not: a blocking pop
-                    // that actually popped was acked to the client, applied on
-                    // the master, and propagated NOWHERE — it came back on the
-                    // next restart and never happened on a replica.
-                    //
-                    // Placed beside the invalidation and BEFORE the RESP3
-                    // conversion for the same reason that one is: the record
-                    // is derived from the RESP2 shapes, and which key served
-                    // must not depend on the protocol the client negotiated.
-                    //
-                    // The record is the synthesised non-blocking sibling,
-                    // never the command itself — a replica applying a literal
-                    // `BLPOP` would park its apply loop. `None` whenever
-                    // nothing was written, so a non-write reaches neither
-                    // plane.
-                    if let Some(effect) =
-                        crate::server::conn::blocking_effect::blocking_effect_record(
-                            cmd,
-                            cmd_args,
-                            &blocking_response,
-                        )
-                        && let Some(ref pool) = ctx.aof_pool
-                    {
-                        let bytes = aof::serialize_command_for_log(&effect);
-                        let lsn = aof::AofWriterPool::issue_append_lsn(
-                            &ctx.repl_state,
-                            ctx.shard_id,
-                            bytes.len(),
-                        );
-                        // Fold epoch read now, not at serve time — see the
-                        // monoio blocking path: later than the pop at worst.
-                        let stamp = pool.fold_stamp(ctx.shard_id);
-                        match pool
-                            .send_append_group(ctx.shard_id, lsn, conn.selected_db, bytes, stamp)
-                            .await
-                        {
-                            // `appendfsync always`: the element is already out
-                            // of the keyspace and already promised to this
-                            // client, so the fsync is awaited HERE rather than
-                            // deferred to the batch barrier — the reply is
-                            // pushed immediately below, with no later frame to
-                            // carry it.
-                            Ok(true) => {
-                                if pool.fsync_barrier(ctx.shard_id).await.is_err() {
-                                    blocking_response =
-                                        Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR));
-                                }
-                            }
-                            Ok(false) => {}
-                            // Fail loud (PR #211): applied in memory but not
-                            // queued for persistence. Telling the client it
-                            // succeeded is how the element goes missing.
-                            Err(_) => {
-                                blocking_response =
-                                    Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR));
-                            }
-                        }
-                    }
                         if peer_gone_after_serve {
-                            // Logged above; nobody left to write the reply to.
+                            // Nobody left to write the reply to.
                             arena.reset();
                             return (HandlerResult::Done, None);
                         }
+                    // moon#827 / moon#1056: the pop's record is already in the
+                    // AOF of the shard that OWNS the key, written in the pop's
+                    // own synchronous stretch before the reply was sent
+                    // (`blocking::pop_log`) — see the monoio twin for why it
+                    // is never logged here. What stays is the `appendfsync
+                    // always` promise: confirm the fsync on the owner's
+                    // writer before the reply leaves. A no-op under
+                    // `everysec`/`no` and for a reply that popped nothing.
+                    if let Some(ref pool) = ctx.aof_pool
+                        && let Some(owner) =
+                            crate::server::conn::blocking_effect::served_pop_owner(
+                                cmd,
+                                cmd_args,
+                                &blocking_response,
+                                ctx.num_shards,
+                            )
+                        && pool.fsync_barrier(owner).await.is_err()
+                    {
+                        blocking_response = Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR));
+                    }
                         let blocking_response = apply_resp3_conversion(
                             cmd,
                             cmd_args,
@@ -2344,6 +2301,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                             let db_count = ctx.shard_databases.db_count();
                             // `resolve_move` refuses `dst_db == src_db` with
                             // redis's same-object error (moon#1062).
+                            // moon#1069: the key now exists in `dst_db` — the
+                            // wake target, raised once the MOVE is logged
+                            // (moon#1056).
+                            let mut wake_target: Option<(usize, Bytes)> = None;
                             let response = match ksmv::resolve_move(cmd_args, src_db, db_count) {
                                 Err(e) => e,
                                 Ok((key, dst_db)) => {
@@ -2355,25 +2316,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     // (src, dst). `resolve_move` never yields
                                     // `dst_db == src_db`, so the distinct-db
                                     // assert cannot fire here.
-                                    crate::shard::slice::with_shard(|s| {
+                                    let reply = crate::shard::slice::with_shard(|s| {
                                         s.databases.with_pair(src_db, dst_db, |src, dst| {
-                                            let reply = ksmv::move_core(src, dst, &key);
-                                            // moon#1069: the key now exists in `dst_db`.
-                                            crate::blocking::wakeup::wake_cross_db_write(
-                                                &ctx.blocking_registry,
-                                                dst,
-                                                dst_db,
-                                                &key,
-                                                &reply,
-                                            );
-                                            reply
+                                            ksmv::move_core(src, dst, &key)
                                         })
-                                    })
+                                    });
+                                    wake_target = Some((dst_db, key));
+                                    reply
                                 }
                             };
                             // AOF only on actual success (:1). Matches handler_single
                             // — `:0` (key absent) is a no-op and must not log.
                             // H1: durable path awaits fsync under appendfsync=always.
+                            let mut aof_failed = false;
                             if matches!(response, Frame::Integer(1)) {
                                 if let Some(ref bytes) = aof_bytes {
                                     if let Some(ref pool) = ctx.aof_pool {
@@ -2395,17 +2350,27 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                 local_leg_write_idxs.push(responses.len())
                                             }
                                             Ok(false) => {}
-                                            Err(_) => {
-                                                responses.push(Frame::Error(Bytes::from_static(
-                                                    aof::AOF_FSYNC_ERR,
-                                                )));
-                                                continue;
-                                            }
+                                            Err(_) => aof_failed = true,
                                         }
                                     }
                                 }
                             }
-                            responses.push(response);
+                            // moon#1056: wake AFTER the MOVE is logged, so a
+                            // pop it feeds is logged behind it — whether or
+                            // not the AOF leg failed (the key moved anyway).
+                            if let Some((dst_db, key)) = wake_target {
+                                crate::blocking::wakeup::wake_cross_db_write_on_shard(
+                                    &ctx.blocking_registry,
+                                    dst_db,
+                                    &key,
+                                    &response,
+                                );
+                            }
+                            responses.push(if aof_failed {
+                                Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR))
+                            } else {
+                                response
+                            });
                             continue;
                         }
 
@@ -2426,6 +2391,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     )));
                                     continue;
                                 }
+                                // moon#1069: the copy now exists in `dst_db` —
+                                // the wake target, raised once the COPY is
+                                // logged (moon#1056).
+                                let mut wake_target: Option<(usize, Bytes)> = None;
                                 let response = match copy_result {
                                     Err(e) => e,
                                     Ok(ca) => {
@@ -2440,31 +2409,25 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         // routing same-db COPY to the plain
                                         // write path, so `ca.dst_db != src_db`
                                         // holds on every path that reaches here.
-                                        crate::shard::slice::with_shard(|s| {
+                                        let reply = crate::shard::slice::with_shard(|s| {
                                             s.databases.with_pair(src_db, ca.dst_db, |src, dst| {
-                                                let reply = ksmv::copy_core(
+                                                ksmv::copy_core(
                                                     src,
                                                     dst,
                                                     &ca.src_key,
                                                     &ca.dst_key,
                                                     ca.replace,
-                                                );
-                                                // moon#1069: the copy now exists in `dst_db`.
-                                                crate::blocking::wakeup::wake_cross_db_write(
-                                                    &ctx.blocking_registry,
-                                                    dst,
-                                                    ca.dst_db,
-                                                    &ca.dst_key,
-                                                    &reply,
-                                                );
-                                                reply
+                                                )
                                             })
-                                        })
+                                        });
+                                        wake_target = Some((ca.dst_db, ca.dst_key));
+                                        reply
                                     }
                                 };
                                 // AOF only on actual success (:1). Matches handler_single
                                 // — `:0` (key absent / dst exists w/o REPLACE) is a no-op.
                                 // H1: durable path awaits fsync under appendfsync=always.
+                                let mut aof_failed = false;
                                 if matches!(response, Frame::Integer(1)) {
                                     if let Some(ref bytes) = aof_bytes {
                                         if let Some(ref pool) = ctx.aof_pool {
@@ -2486,17 +2449,25 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                     local_leg_write_idxs.push(responses.len())
                                                 }
                                                 Ok(false) => {}
-                                                Err(_) => {
-                                                    responses.push(Frame::Error(Bytes::from_static(
-                                                        aof::AOF_FSYNC_ERR,
-                                                    )));
-                                                    continue;
-                                                }
+                                                Err(_) => aof_failed = true,
                                             }
                                         }
                                     }
                                 }
-                                responses.push(response);
+                                // moon#1056: wake after the COPY is logged — see MOVE.
+                                if let Some((dst_db, dst_key)) = wake_target {
+                                    crate::blocking::wakeup::wake_cross_db_write_on_shard(
+                                        &ctx.blocking_registry,
+                                        dst_db,
+                                        &dst_key,
+                                        &response,
+                                    );
+                                }
+                                responses.push(if aof_failed {
+                                    Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR))
+                                } else {
+                                    response
+                                });
                                 continue;
                             }
                             // No DB clause or same-db: fall through to normal write path
@@ -2516,7 +2487,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // eviction fails (caller pushes + continues). Latency is
                             // recorded inside `do_write` through the connection's
                             // `LatencyProbe` (moon#941).
-                            type WriteOutcome = Result<Frame, Frame>;
+                            type WriteOutcome =
+                                Result<(Frame, crate::blocking::wakeup::ReadyKeys), Frame>;
                             // Takes the whole ShardSlice (not just the Database):
                             // the KV undo-log capture below records write intents on
                             // s.kv_write_intents, and re-entering with_shard from
@@ -2688,33 +2660,28 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     DispatchResult::Response(f) => f,
                                     DispatchResult::Quit(f) => { should_quit = true; f }
                                 };
-                                if !matches!(response, Frame::Error(_)) {
-                                    // moon#595/moon#1069: the shared hook — see
-                                    // the twin in handler_monoio. It wakes the
-                                    // waiters on every key this write touched.
-                                    //
-                                    // moon#942 does NOT apply here, and that is
-                                    // deliberate rather than an omission. This
-                                    // arm reuses `db_guard`, which already spans
-                                    // eviction → undo capture → dispatch → this
-                                    // call, so a write with no waiter pays
-                                    // nothing extra for the no-op. `handler_monoio`
-                                    // drops its write guard right after
-                                    // `dispatch` (the index hooks re-enter the
-                                    // slice) and so had to take a SECOND one
-                                    // here — that acquisition is the one gated
-                                    // on `ready_keys`. Adding a gate here would
-                                    // buy nothing and would put a second copy of
-                                    // the predicate in the tree.
-                                    crate::blocking::wakeup::wake_written_keys(
-                                        &ctx.blocking_registry,
-                                        db,
+                                // moon#595/moon#1069: the shared hook — see
+                                // the twin in handler_monoio. It wakes the
+                                // waiters on every key this write touched.
+                                //
+                                // moon#1056: only the keys are decided here,
+                                // against the registry alone (the same
+                                // `ready_keys` gate as the monoio twin). The
+                                // wake itself runs once this write is LOGGED,
+                                // below: a waiter it serves logs its pop at
+                                // the moment it pops, and that record must
+                                // follow the write that fed it.
+                                let ready = if matches!(response, Frame::Error(_)) {
+                                    crate::blocking::wakeup::ReadyKeys::new()
+                                } else {
+                                    crate::blocking::wakeup::ready_keys(
+                                        &ctx.blocking_registry.borrow(),
                                         conn.selected_db,
                                         cmd,
                                         cmd_args,
-                                    );
-                                }
-                                Ok(response)
+                                    )
+                                };
+                                Ok((response, ready))
                             };
 
                             // Unconditional slice path: ShardSlice is always initialized.
@@ -2730,7 +2697,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 |pool| pool.fold_stamp(ctx.shard_id),
                             );
 
-                            let mut response: Frame = match write_outcome {
+                            let (mut response, ready): (Frame, crate::blocking::wakeup::ReadyKeys) = match write_outcome {
                                 Ok(t) => t,
                                 Err(oom_frame) => {
                                     responses.push(oom_frame);
@@ -2907,6 +2874,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     }
                                 }
                             }
+                            // moon#1056: serve the clients blocked on a key
+                            // this write touched now that its record is
+                            // enqueued, so every pop the wake logs follows it.
+                            // Whether or not the AOF leg failed: the data is
+                            // in the keyspace either way.
+                            crate::blocking::wakeup::wake_ready_keys_on_shard(
+                                &ctx.blocking_registry,
+                                conn.selected_db,
+                                ready,
+                            );
                             // D-2: broadcast the flush to every other shard so the
                             // whole keyspace flushes. Any failed leg turns the reply
                             // into an explicit partial-flush error (never silent +OK).

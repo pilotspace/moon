@@ -474,11 +474,12 @@ where
         // Check immediate availability via the thread-local slice.
         let maybe_frame = crate::shard::slice::with_shard_db(selected_db, |db| {
             immediate_scan(cmd, args, &keys, db, shard_id, num_shards)
+                .map(|frame| log_immediate_pop(cmd, args, selected_db, frame))
         });
-        if let Some(frame) = maybe_frame {
+        if let Some((frame, popped)) = maybe_frame {
             // moon#1059: an immediate BLMOVE pushed onto its destination. A
             // plain pop only takes data, so it has nothing to signal.
-            if !matches!(frame, Frame::Error(_)) && move_endpoints(cmd, args).is_some() {
+            if popped && move_endpoints(cmd, args).is_some() {
                 crate::blocking::wakeup::wake_written_keys_on_shard(
                     blocking_registry,
                     selected_db,
@@ -818,13 +819,14 @@ where
     {
         let immediate_result = crate::shard::slice::with_shard_db(selected_db, |db| {
             immediate_scan(cmd, args, &keys, db, shard_id, num_shards)
+                .map(|frame| log_immediate_pop(cmd, args, selected_db, frame))
         });
-        if let Some(frame) = immediate_result {
+        if let Some((frame, popped)) = immediate_result {
             // moon#1059: an immediate BLMOVE pushed onto its destination,
             // which a client may be blocked on — the same serve a parked
             // BLMOVE's wake now gives it (`try_wake_list_waiter`). A plain pop
             // (BLPOP, BZPOPMIN, BLMPOP, ...) only takes data: nothing to signal.
-            if !matches!(frame, Frame::Error(_)) && move_endpoints(cmd, args).is_some() {
+            if popped && move_endpoints(cmd, args).is_some() {
                 crate::blocking::wakeup::wake_written_keys_on_shard(
                     blocking_registry,
                     selected_db,
@@ -2090,6 +2092,52 @@ pub(crate) fn immediate_scan(
         }
     }
     None
+}
+
+/// Log an immediately-served blocking pop on THIS shard — the one that just
+/// popped — in the same synchronous stretch as the pop (moon#1056), and say
+/// whether anything was taken.
+///
+/// `immediate_scan` only ever pops a key this shard owns (a remote key is
+/// served by its owner's `BlockRegister` handler, through
+/// `wakeup::deliver`), so the connection's shard IS the owner here and its
+/// AOF and replication stream are the right ones. Logging here, before the
+/// reply leaves and before the move's destination wake below, puts the record
+/// ahead of anything the pop enables, exactly as every other write on this
+/// shard is ordered.
+///
+/// Returns the reply to send and `true` if the scan TOOK something (so a
+/// `BLMOVE` still wakes its destination even when the record itself was lost:
+/// the element is on the destination either way). A lost AOF append turns the
+/// reply into the same fail-loud error every synchronous write gets; errors
+/// and stream reads (whose reply names no single popped key) log nothing.
+fn log_immediate_pop(cmd: &[u8], args: &[Frame], db_index: usize, frame: Frame) -> (Frame, bool) {
+    if matches!(frame, Frame::Error(_)) {
+        return (frame, false);
+    }
+    if !crate::blocking::pop_log::has_work() {
+        return (frame, true);
+    }
+    let Some(record) =
+        crate::server::conn::blocking_effect::blocking_effect_record(cmd, args, &frame)
+    else {
+        return (frame, true);
+    };
+    match crate::blocking::pop_log::log_pop(
+        db_index,
+        &record,
+        &mut crate::blocking::pop_log::wake_budget(),
+    ) {
+        crate::blocking::pop_log::PopLog::AofLost => (
+            Frame::Error(Bytes::from_static(
+                crate::shard::spsc_handler::AOF_APPEND_LOST_ERR,
+            )),
+            true,
+        ),
+        crate::blocking::pop_log::PopLog::Logged | crate::blocking::pop_log::PopLog::Unlogged => {
+            (frame, true)
+        }
+    }
 }
 
 /// The (source, destination) pair of a list MOVE, or `None` for anything else.
