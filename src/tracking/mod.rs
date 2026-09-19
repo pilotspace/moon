@@ -1,5 +1,8 @@
 pub mod client_cmd;
 pub mod invalidation;
+pub mod queue;
+
+pub use queue::{InvalidationRx, InvalidationTx, invalidation_queue};
 
 use crate::runtime::channel;
 use bytes::Bytes;
@@ -52,7 +55,7 @@ pub struct TrackingState {
     /// BCAST prefixes, sorted and de-duplicated (redis keeps them in a radix
     /// tree, which is the order `CLIENT TRACKINGINFO` reports).
     pub prefixes: Vec<Bytes>,
-    pub invalidation_tx: Option<channel::MpscSender<Frame>>,
+    pub invalidation_tx: Option<InvalidationTx>,
     /// `CLIENT CACHING yes|no` was given (redis `CLIENT_TRACKING_CACHING`):
     /// under OPTIN the next command's reads ARE tracked, under OPTOUT they are
     /// NOT. It covers the next command only — or the whole next transaction —
@@ -73,6 +76,12 @@ impl TrackingState {
     #[inline]
     pub fn tracks_reads(&self) -> bool {
         self.modes().tracks_reads()
+    }
+
+    /// The tracking identity of a script this connection runs now.
+    #[inline]
+    pub fn script_caller(&self, client_id: u64) -> ScriptCaller {
+        self.modes().script_caller(client_id)
     }
 
     /// The flags that decide whether a read is tracked, copied out.
@@ -143,6 +152,95 @@ impl TrackingModes {
             && !self.bcast
             && !((self.optin && !self.caching) || (self.optout && self.caching))
     }
+
+    /// The tracking identity a script run by `client_id` under these modes
+    /// carries into its `redis.call`s.
+    #[inline]
+    pub fn script_caller(&self, client_id: u64) -> ScriptCaller {
+        ScriptCaller {
+            client_id,
+            track_reads: self.tracks_reads(),
+            noloop: self.noloop,
+        }
+    }
+}
+
+/// Who ran a script, as CLIENT TRACKING needs to know it (moon#1089).
+///
+/// Redis applies tracking inside `call()`, so every command a script runs is
+/// covered: a write invalidates (`signalModifiedKey`), and a read is
+/// remembered for the client that ran the script (`trackingRememberKeys`
+/// with `server.current_client`), under that client's OPTIN/OPTOUT/CACHING
+/// state as it stood when the script started — `CLIENT CACHING` covers the
+/// whole `EVAL`. Moon's scripting bridge does the same through this value,
+/// which rides with the script's ACL identity to whichever shard runs it.
+///
+/// `Default` is "no client": writes still invalidate (with no NOLOOP
+/// exemption) and reads register nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScriptCaller {
+    /// The calling connection; 0 when there is none (client ids start at 1).
+    pub client_id: u64,
+    /// Whether the caller's reads register their keys.
+    pub track_reads: bool,
+    /// The caller's NOLOOP flag, recorded with each key it tracks.
+    pub noloop: bool,
+}
+
+/// Entries the running script's effect log may hold before they are applied
+/// early. Applying early changes nothing (the effects are applied in order
+/// either way); it only stops one huge script from growing the log without
+/// bound. Also the capacity a thread keeps once a script has ended.
+const SCRIPT_EFFECTS_BATCH: usize = 4096;
+
+thread_local! {
+    /// The tracking effects of the script running on this thread, in the
+    /// order it made them (moon#1089). A script runs to completion without
+    /// yielding, so one log per thread is enough. Nothing is locked while the
+    /// script runs; [`ScriptCaller::finish_script`] applies the log under
+    /// ONE acquisition of the tracking mutex when the script ends.
+    static SCRIPT_EFFECTS: std::cell::RefCell<Vec<(invalidation::ScriptKeyEffect, Bytes)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl ScriptCaller {
+    /// Record the tracking effects of one command a script ran successfully:
+    /// the keys it may have modified, and, if the caller tracks reads, the
+    /// keys it read. Takes no lock.
+    ///
+    /// Callers gate on [`tracking_active`], so with nobody tracking a script
+    /// pays one relaxed load per `redis.call` and never reaches here.
+    #[cold]
+    #[inline(never)]
+    pub fn after_script_command(&self, cmd: &[u8], args: &[Frame]) {
+        SCRIPT_EFFECTS.with_borrow_mut(|log| {
+            invalidation::record_script_command(log, cmd, args, self.track_reads);
+            if log.len() >= SCRIPT_EFFECTS_BATCH {
+                self.apply_script_effects(log);
+            }
+        });
+    }
+
+    /// Apply, then forget, what [`ScriptCaller::after_script_command`]
+    /// recorded for the script that just ended. The scripting bridge calls
+    /// it on every exit path of a script. A script that recorded nothing
+    /// costs one thread-local check.
+    #[inline]
+    pub fn finish_script(&self) {
+        SCRIPT_EFFECTS.with_borrow_mut(|log| {
+            if !log.is_empty() {
+                self.apply_script_effects(log);
+            }
+        });
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn apply_script_effects(&self, log: &mut Vec<(invalidation::ScriptKeyEffect, Bytes)>) {
+        invalidation::apply_script_effects(&global_table(), log, self.client_id, self.noloop);
+        log.clear();
+        log.shrink_to(SCRIPT_EFFECTS_BATCH);
+    }
 }
 
 /// A connection's pub/sub delivery channel, registered so a REDIRECT source
@@ -156,6 +254,44 @@ impl TrackingModes {
 pub struct PubSubInbox {
     pub tx: channel::MpscSender<Bytes>,
     pub resp3: bool,
+    /// The connection the channel belongs to.
+    pub owner: u64,
+}
+
+impl PubSubInbox {
+    /// Queue invalidation bytes for the target. Never drops silently
+    /// (moon#1088): a target whose channel is full is disconnected — redis's
+    /// answer to a client past its output-buffer limit, which a caching
+    /// client treats as "flush everything". A closed channel means the target
+    /// is gone.
+    ///
+    /// The channel is the connection's pub/sub channel, whose 256 slots are
+    /// PUBLISH's slow-subscriber policy. Growing it for invalidations would
+    /// put a length check (a channel lock) on every published message,
+    /// tracking or not, so it keeps its size, and [`DeliveryBatch`] spends one
+    /// slot per COMMAND rather than per key instead. What remains is loud, not
+    /// silent: more than 256 commands' worth of invalidations queued while the
+    /// target does not read closes the target, where redis would still be
+    /// buffering them.
+    fn offer(&self, bytes: Bytes) {
+        if let Err(flume::TrySendError::Full(_)) = self.tx.try_send(bytes) {
+            self.overflow();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn overflow(&self) {
+        tracing::warn!(
+            client_id = self.owner,
+            "CLIENT TRACKING: a REDIRECT target's delivery queue is full; closing the \
+             connection rather than dropping invalidations"
+        );
+        crate::client_registry::kill_clients(
+            &crate::client_registry::KillFilter::Id(self.owner),
+            None,
+        );
+    }
 }
 
 /// One recipient of a tracking message, resolved under the table lock by
@@ -164,16 +300,24 @@ pub enum Delivery {
     /// The RESP3 push, on a tracking connection's own channel. The receiving
     /// connection drops it if it speaks RESP2, which cannot carry a push
     /// (redis sends such a connection nothing).
-    Push(channel::MpscSender<Frame>),
+    Push(InvalidationTx),
     /// The pub/sub channel of a subscribed redirect target.
     PubSub(PubSubInbox),
     /// The redirect target no longer exists: tell the source, on its own
     /// channel, with `tracking-redir-broken <target>` (RESP3 only, like the
     /// invalidation push itself).
-    RedirBroken {
-        source: channel::MpscSender<Frame>,
-        target: u64,
-    },
+    RedirBroken { source: InvalidationTx, target: u64 },
+}
+
+/// A tracking client as `CLIENT LIST`/`CLIENT INFO` describe it: the `t`
+/// flag is implied, `R` is `broken_redirect`, `B` is `bcast`, and `redir=` is
+/// `redirect` (0 for none). Measured on redis-server 8.6.1: `flags=t redir=0`,
+/// `flags=tB`, `flags=tRB redir=<gone id>`; tracking off is `flags=N redir=-1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientTrackingView {
+    pub redirect: u64,
+    pub broken_redirect: bool,
+    pub bcast: bool,
 }
 
 /// The pub/sub channel RESP2 redirect targets receive invalidations on.
@@ -223,46 +367,166 @@ impl TrackingMessage {
         })
     }
 
-    /// Hand the message to one recipient. Never blocks: a full channel drops
-    /// the message SILENTLY. That is a known divergence, not parity — redis
-    /// never drops an invalidation; it disconnects a client whose output
-    /// buffer passes its limit, which a caching client treats as "flush
-    /// everything" (moon#1088).
+    /// Hand the message to one recipient. Never blocks, and never drops
+    /// silently (moon#1088): redis never loses an invalidation — it
+    /// disconnects a client whose output buffer passes its limit, which a
+    /// caching client treats as "flush everything" — and neither does moon
+    /// (see [`queue`] and [`PubSubInbox::offer`]).
     pub fn deliver(&mut self, to: &Delivery) {
         match to {
-            Delivery::Push(tx) => {
-                let _ = tx.try_send(self.push_frame().clone());
+            Delivery::Push(tx) => tx.send(self.push_frame().clone()),
+            Delivery::PubSub(inbox) => inbox.offer(self.inbox_bytes(inbox.resp3)),
+            Delivery::RedirBroken { source, target } => source.send(redir_broken_push(*target)),
+        }
+    }
+
+    /// The message framed for a pub/sub inbox of the given protocol,
+    /// serialised once per protocol however many inboxes receive it.
+    fn inbox_bytes(&mut self, resp3: bool) -> Bytes {
+        if resp3 {
+            if let Some(b) = &self.resp3_bytes {
+                return b.clone();
             }
-            Delivery::PubSub(inbox) => {
-                let bytes = if inbox.resp3 {
-                    if self.resp3_bytes.is_none() {
-                        let mut buf = bytes::BytesMut::new();
-                        crate::protocol::serialize_resp3(self.push_frame(), &mut buf);
-                        self.resp3_bytes = Some(buf.freeze());
+            let mut buf = bytes::BytesMut::new();
+            crate::protocol::serialize_resp3(self.push_frame(), &mut buf);
+            self.resp3_bytes.insert(buf.freeze()).clone()
+        } else {
+            if let Some(b) = &self.resp2_bytes {
+                return b.clone();
+            }
+            // `*3 message __redis__:invalidate <payload>` — the exact frame
+            // redis-server 8.6.1 writes.
+            let message = Frame::Array(crate::framevec![
+                Frame::BulkString(Bytes::from_static(b"message")),
+                Frame::BulkString(Bytes::from_static(INVALIDATE_CHANNEL)),
+                self.payload.clone(),
+            ]);
+            let mut buf = bytes::BytesMut::new();
+            crate::protocol::serialize(&message, &mut buf);
+            self.resp2_bytes.insert(buf.freeze()).clone()
+        }
+    }
+}
+
+/// The deliveries of one command's invalidations, with everything bound for
+/// the same pub/sub inbox coalesced into ONE channel item.
+///
+/// A REDIRECT target's inbox is the connection's pub/sub channel, whose slots
+/// are shared with PUBLISH. One item per key would let a single wide write
+/// (`MSET` of thousands of keys, or `DEL` of a big key list) fill it while the
+/// target is not reading; one item per command keeps even a long pipeline of
+/// such writes far inside it. The receiving loop writes each item verbatim,
+/// so the wire is unchanged: the same messages, in the same order.
+///
+/// Collecting takes no copy: each message is serialised once per protocol
+/// ([`TrackingMessage`] caches it) and every inbox keeps a cheap `Bytes`
+/// handle to it. The pieces are joined only in [`DeliveryBatch::flush`],
+/// which callers run after releasing the tracking mutex. A one-message batch,
+/// which is every single-key write, is offered as the shared `Bytes` itself
+/// with no copy at all.
+#[derive(Default)]
+pub struct DeliveryBatch {
+    inboxes: smallvec::SmallVec<[(PubSubInbox, smallvec::SmallVec<[Bytes; 1]>); 2]>,
+}
+
+impl DeliveryBatch {
+    /// Deliver `msg` to `to`: at once for a tracking channel, or added to the
+    /// inbox's pending item.
+    pub fn deliver(&mut self, msg: &mut TrackingMessage, to: &Delivery) {
+        let Delivery::PubSub(inbox) = to else {
+            msg.deliver(to);
+            return;
+        };
+        let bytes = msg.inbox_bytes(inbox.resp3);
+        match self
+            .inboxes
+            .iter_mut()
+            .find(|(i, _)| i.owner == inbox.owner)
+        {
+            Some((_, pieces)) => pieces.push(bytes),
+            None => self
+                .inboxes
+                .push((inbox.clone(), smallvec::smallvec![bytes])),
+        }
+    }
+
+    /// Send every inbox its item: the lone message as is, or all of them
+    /// joined in order.
+    pub fn flush(self) {
+        for (inbox, pieces) in self.inboxes {
+            let item = match pieces.as_slice() {
+                [one] => one.clone(),
+                many => {
+                    let len = many.iter().map(Bytes::len).sum();
+                    let mut buf = bytes::BytesMut::with_capacity(len);
+                    for piece in many {
+                        buf.extend_from_slice(piece);
                     }
-                    self.resp3_bytes.clone()
-                } else {
-                    if self.resp2_bytes.is_none() {
-                        // `*3 message __redis__:invalidate <payload>` — the
-                        // exact frame redis-server 8.6.1 writes.
-                        let message = Frame::Array(crate::framevec![
-                            Frame::BulkString(Bytes::from_static(b"message")),
-                            Frame::BulkString(Bytes::from_static(INVALIDATE_CHANNEL)),
-                            self.payload.clone(),
-                        ]);
-                        let mut buf = bytes::BytesMut::new();
-                        crate::protocol::serialize(&message, &mut buf);
-                        self.resp2_bytes = Some(buf.freeze());
-                    }
-                    self.resp2_bytes.clone()
-                };
-                if let Some(b) = bytes {
-                    let _ = inbox.tx.try_send(b);
+                    buf.freeze()
                 }
-            }
-            Delivery::RedirBroken { source, target } => {
-                let _ = source.try_send(redir_broken_push(*target));
-            }
+            };
+            inbox.offer(item);
+        }
+    }
+}
+
+thread_local! {
+    /// The batch a synchronous multi-command unit (an EXEC body's
+    /// bookkeeping) collects its inbox deliveries into, and how many nested
+    /// units hold it open. See [`begin_delivery_batch`].
+    static OPEN_BATCH: std::cell::RefCell<(u32, Option<DeliveryBatch>)> =
+        const { std::cell::RefCell::new((0, None)) };
+}
+
+/// Open (or join) this thread's delivery batch, so every invalidation until
+/// the matching [`end_delivery_batch`] reaches each REDIRECT inbox as ONE
+/// channel item (moon#1088).
+///
+/// For units that run to completion WITHOUT yielding, such as the
+/// bookkeeping of an EXEC body. Their target cannot drain its channel in
+/// between, so a body of hundreds of writes would otherwise take hundreds of
+/// slots. (A script needs none: its effects are applied in one call when it
+/// ends.) Never hold one across an `.await`: other connections' deliveries
+/// on this thread would wait for it.
+pub fn begin_delivery_batch() {
+    OPEN_BATCH.with_borrow_mut(|(depth, batch)| {
+        *depth += 1;
+        if batch.is_none() {
+            *batch = Some(DeliveryBatch::default());
+        }
+    });
+}
+
+/// Close the unit opened by [`begin_delivery_batch`]; the outermost close
+/// sends everything collected. A close with nothing open is a no-op.
+pub fn end_delivery_batch() {
+    let done = OPEN_BATCH.with_borrow_mut(|(depth, batch)| {
+        if *depth == 0 {
+            return None;
+        }
+        *depth -= 1;
+        if *depth == 0 { batch.take() } else { None }
+    });
+    if let Some(batch) = done {
+        batch.flush();
+    }
+}
+
+/// Run `f` with this thread's open delivery batch, or, when none is open,
+/// with a fresh one that is sent as soon as `f` returns.
+pub(crate) fn with_delivery_batch<R>(f: impl FnOnce(&mut DeliveryBatch) -> R) -> R {
+    let open = OPEN_BATCH.with_borrow_mut(|(_, batch)| batch.take());
+    match open {
+        Some(mut batch) => {
+            let r = f(&mut batch);
+            OPEN_BATCH.with_borrow_mut(|(_, slot)| *slot = Some(batch));
+            r
+        }
+        None => {
+            let mut batch = DeliveryBatch::default();
+            let r = f(&mut batch);
+            batch.flush();
+            r
         }
     }
 }
@@ -301,8 +565,8 @@ pub struct TrackingTable {
     client_keys: HashMap<u64, HashSet<Bytes>>,
     /// BCAST mode: list of (client_id, prefix, noloop)
     bcast_clients: Vec<(u64, Bytes, bool)>,
-    /// Client channels: client_id -> MpscSender<Frame>
-    client_channels: HashMap<u64, channel::MpscSender<Frame>>,
+    /// Client channels: client_id -> its invalidation queue.
+    client_channels: HashMap<u64, InvalidationTx>,
     /// Redirect map: source_client_id -> target_client_id
     redirects: HashMap<u64, u64>,
     /// Pub/sub delivery channels of connections that have subscribed, keyed
@@ -355,8 +619,8 @@ impl TrackingTable {
     }
 
     /// Register a client's invalidation channel.
-    pub fn register_client(&mut self, client_id: u64, tx: channel::MpscSender<Frame>) {
-        if self.client_channels.insert(client_id, tx).is_none() {
+    pub fn register_client(&mut self, client_id: u64, tx: impl Into<InvalidationTx>) {
+        if self.client_channels.insert(client_id, tx.into()).is_none() {
             ACTIVE_TRACKERS.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -374,6 +638,44 @@ impl TrackingTable {
             }
         }
         self.broken.remove(&source);
+    }
+
+    /// Whether `client_id` has tracking enabled (its channel is registered).
+    pub fn is_tracking(&self, client_id: u64) -> bool {
+        self.client_channels.contains_key(&client_id)
+    }
+
+    /// What `CLIENT LIST`/`CLIENT INFO` report about `client_id`'s tracking,
+    /// or `None` when it has tracking off (moon#1078).
+    pub fn client_view(&self, client_id: u64) -> Option<ClientTrackingView> {
+        if !self.is_tracking(client_id) {
+            return None;
+        }
+        Some(ClientTrackingView {
+            redirect: self.redirects.get(&client_id).copied().unwrap_or(0),
+            broken_redirect: self.broken.contains(&client_id),
+            bcast: self.bcast_clients.iter().any(|(id, _, _)| *id == client_id),
+        })
+    }
+
+    /// [`Self::client_view`] for every tracking client, for one `CLIENT
+    /// LIST`. Proportional to the number of tracking clients, not of
+    /// connections.
+    pub fn client_views(&self) -> HashMap<u64, ClientTrackingView> {
+        // One pass over the BCAST registrations, not one per client: this
+        // runs under the tracking mutex every write path waits on.
+        let bcast: HashSet<u64> = self.bcast_clients.iter().map(|(id, _, _)| *id).collect();
+        self.client_channels
+            .keys()
+            .map(|&id| {
+                let view = ClientTrackingView {
+                    redirect: self.redirects.get(&id).copied().unwrap_or(0),
+                    broken_redirect: self.broken.contains(&id),
+                    bcast: bcast.contains(&id),
+                };
+                (id, view)
+            })
+            .collect()
     }
 
     /// Whether an invalidation for `source` has found its redirect target
@@ -437,9 +739,25 @@ impl TrackingTable {
     /// * a target that no longer exists breaks the redirect: the source is
     ///   told, and `CLIENT TRACKINGINFO` reports `broken_redirect`.
     ///
-    /// Known gap: a RESP3 target that neither subscribed nor enabled tracking
-    /// has no channel moon can reach (redis would push to it). Giving every
-    /// connection one would cost every idle connection its park (moon#1078).
+    /// Known gap (moon#1078, left open on purpose): a RESP3 target that
+    /// neither subscribed nor enabled tracking has no channel moon can reach,
+    /// so it gets nothing where redis pushes to it. The two ways to close it
+    /// were weighed and neither is taken here:
+    ///
+    /// * a channel for every RESP3 connection: a connection holding one waits
+    ///   in a select that never parks. Measured (monoio on macOS,
+    ///   `--shards 1`, `--conn-park-secs 2`, 2000 idle `HELLO 3` connections,
+    ///   twice):
+    ///   without a channel `parked_clients:2000`; with one (`CLIENT TRACKING
+    ///   on`) `parked_clients:0`. Every RESP3 client would lose c1M parking.
+    /// * install a channel lazily and wake the target: the target may be
+    ///   parked in a cancelable read registered in its OWN shard's
+    ///   thread-local idle registry, or task-exited behind a readiness
+    ///   watcher, or in a tokio select — none of which another thread can
+    ///   wake today except by `shutdown(2)` (`CLIENT KILL`). It needs a new
+    ///   shard-mesh message and a wake arm in every park stage on both
+    ///   runtimes; that is a change to the c1M park machinery, not to
+    ///   tracking, and belongs in its own PR.
     fn route(&mut self, client_id: u64) -> Option<Delivery> {
         let Some(&target) = self.redirects.get(&client_id) else {
             return self
@@ -992,7 +1310,134 @@ mod tests {
 
     fn inbox(resp3: bool) -> (PubSubInbox, channel::MpscReceiver<Bytes>) {
         let (tx, rx) = channel::mpsc_unbounded::<Bytes>();
-        (PubSubInbox { tx, resp3 }, rx)
+        (
+            PubSubInbox {
+                tx,
+                resp3,
+                owner: 0,
+            },
+            rx,
+        )
+    }
+
+    /// moon#1088: one command's invalidations for one REDIRECT inbox travel
+    /// as ONE channel item, byte-identical to the per-key messages redis
+    /// writes, so a wide write cannot fill the subscriber's channel.
+    #[test]
+    fn a_wide_write_reaches_an_inbox_as_one_item() {
+        let mut table = TrackingTable::new().with_liveness(connected_above_1000);
+        let (src_tx, _src_rx) = channel::mpsc_unbounded::<Frame>();
+        table.register_client(1071, src_tx);
+        table.set_redirect(1071, Some(1072));
+        let (ib, ib_rx) = inbox(false);
+        table.register_inbox(1072, ib);
+        let keys: Vec<Bytes> = (0..400).map(|i| Bytes::from(format!("w:{i}"))).collect();
+        for k in &keys {
+            table.track_key(1071, k, false);
+        }
+        let mut batch = DeliveryBatch::default();
+        for k in &keys {
+            let mut msg = TrackingMessage::keys(std::slice::from_ref(k));
+            for to in &table.invalidate_key(k, 7) {
+                batch.deliver(&mut msg, to);
+            }
+        }
+        batch.flush();
+        let item = ib_rx.try_recv().expect("one item");
+        assert!(ib_rx.try_recv().is_err(), "exactly one item for the burst");
+        let mut want = Vec::new();
+        for k in &keys {
+            want.extend_from_slice(
+                format!(
+                    "*3\r\n$7\r\nmessage\r\n$20\r\n__redis__:invalidate\r\n*1\r\n${}\r\n{}\r\n",
+                    k.len(),
+                    String::from_utf8_lossy(k)
+                )
+                .as_bytes(),
+            );
+        }
+        assert_eq!(item.as_ref(), want.as_slice());
+        table.untrack_all(1071);
+    }
+
+    /// A script or EXEC body holds the thread's batch open across many
+    /// commands: every invalidation for one inbox leaves as ONE item when the
+    /// outermost unit closes, and nothing leaves before.
+    #[test]
+    fn an_open_batch_spans_many_commands() {
+        let table =
+            parking_lot::Mutex::new(TrackingTable::new().with_liveness(connected_above_1000));
+        let (src_tx, _src_rx) = channel::mpsc_unbounded::<Frame>();
+        let (ib, ib_rx) = inbox(true);
+        {
+            let mut t = table.lock();
+            t.register_client(1081, src_tx);
+            t.set_redirect(1081, Some(1082));
+            t.register_inbox(1082, ib);
+        }
+        let keys: Vec<Bytes> = (0..300).map(|i| Bytes::from(format!("b:{i}"))).collect();
+        for k in &keys {
+            table.lock().track_key(1081, k, false);
+        }
+        begin_delivery_batch();
+        begin_delivery_batch(); // nested unit (a script inside a transaction)
+        for k in &keys {
+            invalidation::invalidate_keys(&table, std::slice::from_ref(k), 7);
+        }
+        end_delivery_batch();
+        assert!(ib_rx.try_recv().is_err(), "an inner close sends nothing");
+        end_delivery_batch();
+        let item = ib_rx.try_recv().expect("one item at the outermost close");
+        assert!(
+            ib_rx.try_recv().is_err(),
+            "exactly one item for 300 commands"
+        );
+        assert_eq!(item.len(), pushes_len(&keys), "every key, byte for byte");
+        end_delivery_batch(); // unbalanced close is a no-op
+        table.lock().untrack_all(1081);
+    }
+
+    /// Serialised length of one RESP3 invalidation push per key.
+    fn pushes_len(keys: &[Bytes]) -> usize {
+        keys.iter()
+            .map(|k| {
+                let mut b = bytes::BytesMut::new();
+                crate::protocol::serialize_resp3(
+                    &invalidation::invalidation_push(std::slice::from_ref(k)),
+                    &mut b,
+                );
+                b.len()
+            })
+            .sum()
+    }
+
+    /// moon#1088: an invalidation that finds the target's channel full is
+    /// never dropped quietly — the target is disconnected, as redis closes a
+    /// client past its output-buffer limit.
+    #[test]
+    fn a_full_inbox_disconnects_its_owner() {
+        const OWNER: u64 = 9_108_801;
+        let live = crate::client_registry::register(
+            OWNER,
+            "127.0.0.1:1".into(),
+            "127.0.0.1:2".into(),
+            "default".into(),
+            0,
+            -1,
+        );
+        let (tx, rx) = channel::mpsc_bounded::<Bytes>(2);
+        let ib = PubSubInbox {
+            tx,
+            resp3: false,
+            owner: OWNER,
+        };
+        ib.offer(Bytes::from_static(b"1"));
+        ib.offer(Bytes::from_static(b"2"));
+        assert!(!live.is_killed(), "room left: nothing to do");
+        ib.offer(Bytes::from_static(b"3"));
+        assert!(live.is_killed(), "a full inbox must close its owner");
+        assert_eq!(rx.len(), 2);
+        crate::client_registry::deregister(OWNER);
     }
 
     fn deliver_all(recipients: &[Delivery], msg: &mut TrackingMessage) {
