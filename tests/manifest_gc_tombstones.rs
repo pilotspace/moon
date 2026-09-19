@@ -54,8 +54,8 @@ fn gc_no_tombstones_returns_zero() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("shard-0.manifest");
     let mut m = ShardManifest::create(&path).unwrap();
-    m.add_file(make_entry(1));
-    m.add_file(make_entry(2));
+    m.add_file(make_entry(1)).unwrap();
+    m.add_file(make_entry(2)).unwrap();
     m.commit().unwrap();
 
     let now = Instant::now() + Duration::from_secs(999);
@@ -72,9 +72,9 @@ fn gc_epoch_satisfied_time_not_satisfied_no_prune() {
     let path = tmp.path().join("shard-0.manifest");
     let mut m = ShardManifest::create(&path).unwrap();
 
-    m.add_file(make_entry(1));
-    m.add_file(make_entry(2));
-    m.add_file(make_entry(3));
+    m.add_file(make_entry(1)).unwrap();
+    m.add_file(make_entry(2)).unwrap();
+    m.add_file(make_entry(3)).unwrap();
     m.commit().unwrap(); // epoch 2
 
     // Tombstone file 2 — epoch recorded is current epoch = 2, time = now
@@ -103,8 +103,8 @@ fn gc_time_satisfied_epoch_not_satisfied_no_prune() {
     let path = tmp.path().join("shard-0.manifest");
     let mut m = ShardManifest::create(&path).unwrap();
 
-    m.add_file(make_entry(1));
-    m.add_file(make_entry(2));
+    m.add_file(make_entry(1)).unwrap();
+    m.add_file(make_entry(2)).unwrap();
     m.commit().unwrap(); // epoch 2
 
     // Tombstone at epoch 2 (remove_file before commit)
@@ -129,7 +129,7 @@ fn gc_both_axes_satisfied_prunes_tombstones() {
 
     // Add 5 files
     for i in 1..=5 {
-        m.add_file(make_entry(i));
+        m.add_file(make_entry(i)).unwrap();
     }
     m.commit().unwrap(); // epoch 2
 
@@ -172,7 +172,7 @@ fn gc_partial_prune_when_only_some_satisfy_both_axes() {
     let mut m = ShardManifest::create(&path).unwrap();
 
     for i in 1..=4 {
-        m.add_file(make_entry(i));
+        m.add_file(make_entry(i)).unwrap();
     }
     m.commit().unwrap(); // epoch 2
 
@@ -213,8 +213,8 @@ fn gc_without_commit_leaves_disk_unchanged() {
     let path = tmp.path().join("shard-0.manifest");
     let mut m = ShardManifest::create(&path).unwrap();
 
-    m.add_file(make_entry(1));
-    m.add_file(make_entry(2));
+    m.add_file(make_entry(1)).unwrap();
+    m.add_file(make_entry(2)).unwrap();
     m.commit().unwrap(); // epoch 2
 
     m.remove_file(2, PageType::KvLeaf);
@@ -249,7 +249,7 @@ fn gc_then_commit_persists_pruned_state() {
     let mut m = ShardManifest::create(&path).unwrap();
 
     for i in 1..=3 {
-        m.add_file(make_entry(i));
+        m.add_file(make_entry(i)).unwrap();
     }
     m.commit().unwrap(); // epoch 2
 
@@ -281,7 +281,7 @@ fn getters_sum_to_total_entries() {
     let mut m = ShardManifest::create(&path).unwrap();
 
     for i in 1..=6 {
-        m.add_file(make_entry(i));
+        m.add_file(make_entry(i)).unwrap();
     }
     m.commit().unwrap();
 

@@ -479,19 +479,21 @@ fn spill_batch_shared_file_survives_cold_read_after_kill9() {
 
     let manifest_path = shard_dir.join("shard-0.manifest");
     let mut manifest = ShardManifest::create(&manifest_path).expect("create seed manifest");
-    manifest.add_file(FileEntry {
-        file_id,
-        file_type: PageType::KvLeaf as u8,
-        status: FileStatus::Active,
-        tier: StorageTier::Hot,
-        page_size_log2: 12,
-        page_count: batch.pages.len() as u32,
-        byte_size,
-        created_lsn: 0,
-        db_index: 0,
-        max_key_hash: 0,
-        last_modified_lsn: 0,
-    });
+    manifest
+        .add_file(FileEntry {
+            file_id,
+            file_type: PageType::KvLeaf as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Hot,
+            page_size_log2: 12,
+            page_count: batch.pages.len() as u32,
+            byte_size,
+            created_lsn: 0,
+            db_index: 0,
+            max_key_hash: 0,
+            last_modified_lsn: 0,
+        })
+        .unwrap();
     manifest.commit().expect("commit seed manifest");
 
     let extra: Vec<String> = vec![

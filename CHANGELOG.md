@@ -246,6 +246,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-place cold-page write can reach it. Pinned by the tests in
   `shard::persistence_tick::checkpoint_tick_tests`,
   `persistence::data_file_sync` and `persistence::page_cache`.
+- **Restart no longer deletes warm vector segments it is serving, and a warm
+  segment is superseded per key instead of as a whole directory** (moon#893).
+  Boot recovery judged a warm segment "already covered" when ANY one of its
+  key_hashes was already indexed, and then ran `remove_dir_all` on its
+  directory. Two ways in, both measured on a real server with 1000 warm keys:
+  re-inserting ONE key and compacting it into a HOT segment retired the whole
+  directory on the next boot, and the other 999 vectors were re-encoded; and
+  a manifest written by an older build that lists one segment id twice (its
+  id counter re-issued live ids) had the directory attached on the first
+  entry and deleted on the second. Worse, when the re-inserted key's own
+  segment had also gone warm, recovery registered the key under its new
+  global_id, attached the older segment, and deleted the newer one: after the
+  restart the key answered to its OVERWRITTEN vector and its current one was
+  gone. Now each key is decided on its own. The persisted keymap names a key's
+  current copy by global_id. A copy that is not that one, or that another live
+  segment already serves, is tombstoned in that segment only. The rest stay
+  served from it. A directory is retired only when none of its keys is live,
+  never one recovery attached. The directory is renamed out of discovery's
+  reach before it is deleted, so a crash mid-delete cannot leave a
+  half-deleted segment. Each segment id is handled once. Duplicate manifest
+  entries are collapsed at boot and healed on disk, keeping the last. For a
+  spill file, that last entry is the one that describes the file.
+  `ShardManifest::add_file` now refuses a second entry for an
+  `(id, type)` that is already listed (it returns `DuplicateFileEntry`),
+  and a warm transition onto an id whose directory or entry already exists
+  is refused before anything is written, where it used to commit the entry
+  and then fail the rename with `ENOTEMPTY`. A spill batch whose file id the
+  manifest already lists puts its keys back in RAM from their in-flight
+  payloads, never publishes them cold, and is counted in the new INFO field
+  `spill_completion_id_rejected`. A reattached warm segment raises the
+  vector global_id allocator above its own ids, so a key written after the
+  restart can never be given an id a warm row already holds. Covered by
+  `tests/warm_segment_restart_893.rs`, which restarts twice (clean and
+  `kill -9`) and checks that the directories persist, nothing is re-encoded,
+  and `FT.SEARCH` is identical.
+
+- **A write that lands data on a key wakes the clients blocked on it, whatever
+  command wrote it** (moon#1059, moon#1069). Only six "producer" commands
+  (`LPUSH`, `RPUSH`, `LMOVE`, `RPOPLPUSH`, `ZADD`, `XADD`) used to wake a
+  blocked client, so a `BLPOP`/`BZPOPMIN`/`XREAD BLOCK` stayed parked until its
+  own timeout — or forever with timeout 0 — beside data it could pop when the
+  key was written by `RENAME`, `RENAMENX`, `COPY`, `MOVE`, `COPY ... DB n`,
+  `SORT ... STORE`, `ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFFSTORE`/`ZRANGESTORE`,
+  `ZINCRBY`, `GEOADD`, `RESTORE`, `SWAPDB`, a script (`EVAL`/`FCALL`), or any
+  of those inside `MULTI`. A `BLMOVE`/`BRPOPLPUSH` served by a wake, or served
+  immediately, pushed onto its destination without waking the `BLPOP` parked
+  there, so move chains stalled at the first hop. The wake is now keyed on the
+  keys a command WRITES (the shared key walker's write positions), not on
+  command names; `MOVE`/`COPY ... DB n` wake the destination database and
+  `SWAPDB` every key parked in either database. A wake-served move feeds its
+  destination's waiters in the same pass, over a worklist bounded by the
+  waiters parked when it began — chains and cycles are served as redis's
+  `handleClientsBlockedOnKeys` serves them. All the keys one command, one
+  `EXEC` or one script made ready form a single batch that is served before
+  the keys the moves it serves push onto. So, with `BLMOVE a c`, `BLMOVE b c`
+  and `BRPOP c` parked, `MULTI; RPUSH a x; RPUSH b y; EXEC` hands the `BRPOP`
+  `y` and leaves `c = [x]`, as redis does. A key that becomes the wrong type
+  for its waiter still leaves the waiter parked, as in redis. The wake costs
+  nothing measurable while a client is parked on the shard: a write that can
+  only produce a string, hash, set, bitmap or HyperLogLog skips the key walk
+  entirely, as redis's `signalKeyAsReady` returns early on type, and the
+  registry is probed with borrowed keys. A 10-key `MSET` with one `BLPOP`
+  parked runs within noise of the build before the wake existed. Every case
+  was measured against redis-server 8.6.1 first (served within about 0.3 s)
+  and now matches it at `--shards 1` and `--shards 4` on both runtimes.
+
 - **The last-resort WAL v3 replay now restores KV writes instead of none**
   (moon#1026). When `appendonly.aof` is missing and the WAL carries KV records
   (`--wal-kv-log on`), boot falls back to replaying the WAL. That fallback

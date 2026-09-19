@@ -374,8 +374,10 @@ mod tests {
         // Tombstone does too (its file may still be open by a reader until
         // gc_tombstones prunes it).
         let mut m = ShardManifest::create(&tmp.path().join("shard-3.manifest")).unwrap();
-        m.add_file(entry(40, PageType::KvLeaf, FileStatus::Active));
-        m.add_file(entry(55, PageType::VecCodes, FileStatus::Tombstone));
+        m.add_file(entry(40, PageType::KvLeaf, FileStatus::Active))
+            .unwrap();
+        m.add_file(entry(55, PageType::VecCodes, FileStatus::Tombstone))
+            .unwrap();
         m.commit().unwrap();
         assert_eq!(next_file_id_seed(tmp.path(), 3).unwrap(), 56);
 

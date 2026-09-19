@@ -11,6 +11,26 @@ use std::time::Instant;
 
 use crate::persistence::page::{MOONPAGE_HEADER_SIZE, MoonPageHeader, PAGE_4K, PageType};
 
+/// [`ShardManifest::add_file`] refused an entry because the manifest already
+/// lists one with the same `(file_id, file_type)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "manifest already lists file_id {file_id} (type {file_type}); refusing a second \
+     entry for it"
+)]
+pub struct DuplicateFileEntry {
+    /// The id that was already listed.
+    pub file_id: u64,
+    /// The `PageType` discriminant of both entries.
+    pub file_type: u8,
+}
+
+impl From<DuplicateFileEntry> for std::io::Error {
+    fn from(e: DuplicateFileEntry) -> Self {
+        std::io::Error::new(std::io::ErrorKind::AlreadyExists, e)
+    }
+}
+
 /// File lifecycle status within the manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -723,7 +743,111 @@ impl ShardManifest {
     }
 
     /// Add a file entry to the manifest (in-memory only until commit).
-    pub fn add_file(&mut self, entry: FileEntry) {
+    ///
+    /// # Errors
+    ///
+    /// Refuses, leaving the manifest untouched, when an entry with the same
+    /// `(file_id, file_type)` is already listed in ANY status (moon#893). Two
+    /// entries for one `(id, type)` name one path, so the second can only mean
+    /// the id was re-issued: the new artifact did not land where the manifest
+    /// would say it did. Appending anyway is how one warm segment id collected
+    /// several Active entries, and recovery then walked the directory twice and
+    /// deleted it on the second pass. A tombstoned entry counts too — its file
+    /// may still be on disk inside the tombstone retention window.
+    ///
+    /// Rejecting rather than replacing is deliberate: the existing entry is the
+    /// one that describes what is on disk, and replacing it would, for a spill
+    /// file, re-attribute its keys to the new entry's `db_index`.
+    pub fn add_file(&mut self, entry: FileEntry) -> Result<(), DuplicateFileEntry> {
+        if self.has_entry(entry.file_id, entry.file_type) {
+            tracing::error!(
+                file_id = entry.file_id,
+                file_type = entry.file_type,
+                "manifest: refusing a second entry for a file id already listed \
+                 (the id was re-issued; the manifest keeps the entry it has)"
+            );
+            return Err(DuplicateFileEntry {
+                file_id: entry.file_id,
+                file_type: entry.file_type,
+            });
+        }
+        self.active_root.entries.push(entry);
+        Ok(())
+    }
+
+    /// Whether an entry with this `(file_id, file_type)` is listed, in any
+    /// status — exactly the condition under which [`Self::add_file`] refuses.
+    pub fn has_entry(&self, file_id: u64, file_type: u8) -> bool {
+        self.active_root
+            .entries
+            .iter()
+            .any(|e| e.file_id == file_id && e.file_type == file_type)
+    }
+
+    /// Collapse duplicate Active entries — several entries with one
+    /// `(file_id, file_type)` — down to the LAST of them, and return how many
+    /// were dropped (in-memory only until commit).
+    ///
+    /// Heals manifests written by builds before moon#893, whose `add_file`
+    /// appended without a check while the id counter re-issued live ids. The
+    /// last entry is the one kept because it describes what is on disk: an
+    /// older build renamed its newer spill batch over the file, and a warm
+    /// segment's directory is found by id alone. Tombstoned entries are left
+    /// as they are; they never reach a reader.
+    pub fn dedupe_active_entries(&mut self) -> usize {
+        let entries = &mut self.active_root.entries;
+        let mut last: HashMap<(u64, u8), usize> = HashMap::new();
+        for (i, e) in entries.iter().enumerate() {
+            if e.status == FileStatus::Active {
+                last.insert((e.file_id, e.file_type), i);
+            }
+        }
+        let active = entries
+            .iter()
+            .filter(|e| e.status == FileStatus::Active)
+            .count();
+        if last.len() == active {
+            return 0;
+        }
+        // A dropped duplicate that names a DIFFERENT logical db than the kept
+        // one moves that spill file's keys to the kept entry's db on the next
+        // cold-index rebuild. Keeping the last is still the best evidence of
+        // what the file holds, but the move must not be silent.
+        for (i, e) in entries.iter().enumerate() {
+            if e.status != FileStatus::Active {
+                continue;
+            }
+            if let Some(&k) = last.get(&(e.file_id, e.file_type))
+                && k != i
+                && let Some(kept) = entries.get(k)
+                && kept.db_index != e.db_index
+            {
+                tracing::warn!(
+                    file_id = e.file_id,
+                    file_type = e.file_type,
+                    dropped_db = e.db_index,
+                    kept_db = kept.db_index,
+                    "manifest: dropping a duplicate entry that names a different db than \
+                     the entry kept; the file's keys are attributed to the kept db"
+                );
+            }
+        }
+        let before = entries.len();
+        let mut i = 0usize;
+        entries.retain(|e| {
+            let keep =
+                e.status != FileStatus::Active || last.get(&(e.file_id, e.file_type)) == Some(&i);
+            i += 1;
+            keep
+        });
+        before - entries.len()
+    }
+
+    /// Append `entry` with NO duplicate check — the append semantics of the
+    /// builds before moon#893, kept only so tests can reproduce a manifest an
+    /// older build already wrote.
+    #[cfg(test)]
+    pub(crate) fn push_entry_unchecked(&mut self, entry: FileEntry) {
         self.active_root.entries.push(entry);
     }
 
@@ -1590,13 +1714,13 @@ mod tests {
         assert_eq!(m.active_slot(), 0); // Root A is active after create
 
         // First commit: writes to Root B (inactive), then flips active to 1
-        m.add_file(make_entry(1));
+        m.add_file(make_entry(1)).unwrap();
         m.commit().unwrap();
         assert_eq!(m.epoch(), 2);
         assert_eq!(m.active_slot(), 1); // Now Root B is active
 
         // Second commit: writes to Root A (inactive), then flips active to 0
-        m.add_file(make_entry(2));
+        m.add_file(make_entry(2)).unwrap();
         m.commit().unwrap();
         assert_eq!(m.epoch(), 3);
         assert_eq!(m.active_slot(), 0); // Back to Root A
@@ -1621,7 +1745,7 @@ mod tests {
 
         // Seed committed state large enough to exercise inline + overflow.
         for id in 1..=80 {
-            m.add_file(make_entry(id));
+            m.add_file(make_entry(id)).unwrap();
         }
         m.commit().unwrap();
 
@@ -1638,7 +1762,7 @@ mod tests {
 
         // The next commit MUST reattach to the real manifest first. Without the
         // guard this write lands in the orphaned inode and is lost on recovery.
-        m.add_file(make_entry(999));
+        m.add_file(make_entry(999)).unwrap();
         m.commit().unwrap();
         assert!(
             !m.needs_reopen(),
@@ -1664,19 +1788,19 @@ mod tests {
         let mut m = ShardManifest::create(&path).unwrap();
         // epoch 1 on Root A
 
-        m.add_file(make_entry(1));
+        m.add_file(make_entry(1)).unwrap();
         m.commit().unwrap(); // epoch 2 on Root B
 
-        m.add_file(make_entry(2));
+        m.add_file(make_entry(2)).unwrap();
         m.commit().unwrap(); // epoch 3 on Root A
 
-        m.add_file(make_entry(3));
+        m.add_file(make_entry(3)).unwrap();
         m.commit().unwrap(); // epoch 4 on Root B
 
-        m.add_file(make_entry(4));
+        m.add_file(make_entry(4)).unwrap();
         m.commit().unwrap(); // epoch 5 on Root A
 
-        m.add_file(make_entry(5));
+        m.add_file(make_entry(5)).unwrap();
         m.commit().unwrap(); // epoch 6 on Root B
 
         // Root A has epoch 5 (entries 1-4), Root B has epoch 6 (entries 1-5)
@@ -1694,10 +1818,10 @@ mod tests {
 
         let mut m = ShardManifest::create(&path).unwrap();
 
-        m.add_file(make_entry(1));
+        m.add_file(make_entry(1)).unwrap();
         m.commit().unwrap(); // epoch 2 on Root B
 
-        m.add_file(make_entry(2));
+        m.add_file(make_entry(2)).unwrap();
         m.commit().unwrap(); // epoch 3 on Root A
 
         // Corrupt Root A (offset 0) payload
@@ -1753,7 +1877,7 @@ mod tests {
 
         // Add exactly 70 entries
         for i in 0..70u64 {
-            m.add_file(make_entry(i + 1));
+            m.add_file(make_entry(i + 1)).unwrap();
         }
         m.commit().unwrap();
 
@@ -1765,7 +1889,7 @@ mod tests {
         // (was: commit rejected the 71st entry).
         drop(m2);
         let mut m3 = ShardManifest::open(&path).unwrap();
-        m3.add_file(make_entry(71));
+        m3.add_file(make_entry(71)).unwrap();
         m3.commit()
             .expect("71st entry must persist via an overflow page");
         drop(m3);
@@ -1789,7 +1913,7 @@ mod tests {
         let n = 200u64; // ~3 overflow pages worth
         let mut m = ShardManifest::create(&path).unwrap();
         for i in 0..n {
-            m.add_file(make_entry(i + 1));
+            m.add_file(make_entry(i + 1)).unwrap();
         }
         m.commit()
             .expect("manifest must persist >70 entries via overflow pages");
@@ -1828,13 +1952,13 @@ mod tests {
 
         let mut m = ShardManifest::create(&path).unwrap();
         for i in 0..n1 {
-            m.add_file(make_entry(i + 1));
+            m.add_file(make_entry(i + 1)).unwrap();
         }
         m.commit().expect("state1 (>cap) must commit via overflow");
         // state2: extend to n2 and commit again (flips active slot; state1's
         // root remains in the now-inactive slot as the last-good fallback).
         for i in n1..n2 {
-            m.add_file(make_entry(i + 1));
+            m.add_file(make_entry(i + 1)).unwrap();
         }
         m.commit().expect("state2 (>cap) must commit via overflow");
         drop(m);
@@ -1878,7 +2002,7 @@ mod tests {
 
         let mut m = ShardManifest::create(&path).unwrap();
         for i in 0..100u64 {
-            m.add_file(make_entry(i + 1));
+            m.add_file(make_entry(i + 1)).unwrap();
         }
         // Each commit re-appends the overflow run; without compaction the file
         // would grow ~1 page per commit (60+ dead runs). Compaction bounds it.
@@ -1912,7 +2036,7 @@ mod tests {
 
         let mut m = ShardManifest::create(&path).unwrap();
         for i in 0..200u64 {
-            m.add_file(make_entry(i + 1));
+            m.add_file(make_entry(i + 1)).unwrap();
         }
         m.commit().unwrap();
 
@@ -1940,7 +2064,7 @@ mod tests {
         let path = tmp.path().join("shard-0.manifest");
 
         let mut m = ShardManifest::create(&path).unwrap();
-        m.add_file(make_entry(1));
+        m.add_file(make_entry(1)).unwrap();
         m.commit().unwrap();
         drop(m);
 
@@ -2029,9 +2153,9 @@ mod tests {
 
         let mut m = ShardManifest::create(&path).unwrap();
 
-        m.add_file(make_entry(1));
-        m.add_file(make_entry(2));
-        m.add_file(make_entry(3));
+        m.add_file(make_entry(1)).unwrap();
+        m.add_file(make_entry(2)).unwrap();
+        m.add_file(make_entry(3)).unwrap();
         m.commit().unwrap();
 
         // Remove file 2
@@ -2055,8 +2179,8 @@ mod tests {
         let mut m = ShardManifest::create(&path).unwrap();
         let mut warm = make_entry(5);
         warm.file_type = PageType::VecCodes as u8;
-        m.add_file(warm);
-        m.add_file(make_entry(5)); // KvLeaf, same id
+        m.add_file(warm).unwrap();
+        m.add_file(make_entry(5)).unwrap(); // KvLeaf, same id
         m.commit().unwrap();
 
         m.remove_file(5, PageType::KvLeaf);
@@ -2129,8 +2253,8 @@ mod tests {
         let mut warm = make_entry(5);
         warm.file_type = PageType::VecCodes as u8;
         warm.tier = StorageTier::Warm;
-        m.add_file(warm);
-        m.add_file(make_entry(5)); // KvLeaf, same id
+        m.add_file(warm).unwrap();
+        m.add_file(make_entry(5)).unwrap(); // KvLeaf, same id
         m.commit().unwrap();
 
         m.remove_file(5, PageType::VecCodes);
@@ -2147,13 +2271,79 @@ mod tests {
         assert_eq!(status(PageType::KvLeaf), Some(FileStatus::Active));
     }
 
+    /// moon#893: `add_file` appended without a check, so a re-issued id
+    /// collected a second Active entry for one path. It must refuse — in any
+    /// status of the existing entry — and leave the manifest as it was, on
+    /// disk too.
+    #[test]
+    fn test_add_file_refuses_a_second_entry_for_one_id_and_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+        let mut m = ShardManifest::create(&path).unwrap();
+
+        m.add_file(make_entry(4)).unwrap();
+        let mut again = make_entry(4);
+        again.db_index = 7;
+        assert_eq!(
+            m.add_file(again.clone()),
+            Err(DuplicateFileEntry {
+                file_id: 4,
+                file_type: PageType::KvLeaf as u8,
+            })
+        );
+        m.commit().unwrap();
+        let reopened = ShardManifest::open(&path).unwrap();
+        assert_eq!(
+            reopened.files(),
+            &[make_entry(4)][..],
+            "the first entry is kept"
+        );
+
+        // A tombstoned entry still owns its id: its file may still be on disk.
+        m.remove_file(4, PageType::KvLeaf);
+        assert!(m.add_file(again).is_err());
+        assert!(m.has_entry(4, PageType::KvLeaf as u8));
+        assert!(!m.has_entry(4, PageType::VecCodes as u8));
+    }
+
+    /// Manifests an older build wrote with duplicates must heal, keeping the
+    /// LAST Active entry per `(id, type)` and leaving tombstones and distinct
+    /// entries alone.
+    #[test]
+    fn test_dedupe_active_entries_keeps_the_last_of_each() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = ShardManifest::create(&tmp.path().join("shard-0.manifest")).unwrap();
+        let with_db = |id: u64, db: u64| FileEntry {
+            db_index: db,
+            ..make_entry(id)
+        };
+        let mut tomb = make_entry(1);
+        tomb.status = FileStatus::Tombstone;
+        let mut warm1 = make_entry(1);
+        warm1.file_type = PageType::VecCodes as u8;
+        m.push_entry_unchecked(tomb.clone());
+        m.push_entry_unchecked(with_db(1, 0));
+        m.push_entry_unchecked(warm1.clone());
+        m.push_entry_unchecked(with_db(2, 0));
+        m.push_entry_unchecked(with_db(1, 1));
+        m.push_entry_unchecked(with_db(1, 2));
+
+        assert_eq!(m.dedupe_active_entries(), 2);
+        assert_eq!(
+            m.files(),
+            &[tomb, warm1, with_db(2, 0), with_db(1, 2)][..],
+            "order preserved, last Active kept"
+        );
+        assert_eq!(m.dedupe_active_entries(), 0, "idempotent");
+    }
+
     #[test]
     fn test_manifest_update_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("shard-0.manifest");
 
         let mut m = ShardManifest::create(&path).unwrap();
-        m.add_file(make_entry(1));
+        m.add_file(make_entry(1)).unwrap();
         m.commit().unwrap();
 
         m.update_file(1, |e| {
@@ -2192,14 +2382,14 @@ mod tests {
         injector.set_inject_persist_error(true);
 
         // The victim shares nothing with the injector but the process.
-        victim.add_file(make_entry(1));
+        victim.add_file(make_entry(1)).unwrap();
         victim
             .commit()
             .expect("another manifest's injected failure must not fail this commit");
 
         // Control: the knob is actually armed. Without this, deleting the
         // injection entirely would satisfy the assertion above.
-        injector.add_file(make_entry(1));
+        injector.add_file(make_entry(1)).unwrap();
         assert!(
             injector.commit().is_err(),
             "the manifest that armed injection must still fail its own persist"

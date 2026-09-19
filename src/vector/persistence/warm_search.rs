@@ -195,8 +195,9 @@ fn parse_mvcc_ids(mvcc_payload: &[u8]) -> (Vec<u32>, Vec<u64>) {
     (global_ids, key_hashes)
 }
 
-/// Read just the `key_hash` set out of a warm segment's `mvcc.mpf`, without
-/// touching `codes.mpf`/`graph.mpf` or requiring a `CollectionMetadata`.
+/// Read every `(key_hash, global_id)` row out of a warm segment's `mvcc.mpf`,
+/// without touching `codes.mpf`/`graph.mpf` or requiring a
+/// `CollectionMetadata`.
 ///
 /// Used by `VectorStore::register_warm_segments` to decide which recovered
 /// index actually owns a warm segment (PR review finding #2):
@@ -209,14 +210,20 @@ fn parse_mvcc_ids(mvcc_payload: &[u8]) -> (Vec<u32>, Vec<u64>) {
 /// Ownership must instead be decided by evidence — the segment's own
 /// key_hashes checked against each candidate index's persisted keymap — and
 /// this only needs the cheap mvcc.mpf read to get that evidence.
-pub(crate) fn peek_key_hashes(segment_dir: &Path) -> std::io::Result<Vec<u64>> {
+///
+/// The global_id says WHICH copy of a key a row holds: a key re-inserted after
+/// its segment went warm keeps its key_hash but gets a new global_id, and the
+/// persisted keymap records the current one. Recovery needs both to supersede
+/// a stale copy per key (moon#893) instead of retiring a whole segment on a
+/// key_hash overlap.
+pub(crate) fn peek_mvcc_rows(segment_dir: &Path) -> std::io::Result<Vec<(u64, u32)>> {
     use crate::vector::persistence::sealed_mmap::{AccessPattern, advise_pattern, map_sealed_file};
 
     let mvcc_mmap = map_sealed_file(&segment_dir.join("mvcc.mpf"))?;
     advise_pattern(&mvcc_mmap, AccessPattern::Sequential)?;
     let mvcc_payload = extract_payloads(&mvcc_mmap, PAGE_4K, VEC_MVCC_SUB_HEADER_SIZE);
-    let (_global_ids, key_hashes) = parse_mvcc_ids(&mvcc_payload);
-    Ok(key_hashes)
+    let (global_ids, key_hashes) = parse_mvcc_ids(&mvcc_payload);
+    Ok(key_hashes.into_iter().zip(global_ids).collect())
 }
 
 impl WarmSearchSegment {
