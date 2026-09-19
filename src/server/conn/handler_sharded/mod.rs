@@ -2341,6 +2341,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                 lsn,
                                                 conn.selected_db,
                                                 bytes.clone(),
+                                                pool.fold_stamp(ctx.shard_id),
                                             )
                                             .await
                                         {
@@ -2439,6 +2440,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                     lsn,
                                                     conn.selected_db,
                                                     bytes.clone(),
+                                                    pool.fold_stamp(ctx.shard_id),
                                                 )
                                                 .await
                                             {
@@ -2687,6 +2689,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // Unconditional slice path: ShardSlice is always initialized.
                             let write_outcome: WriteOutcome =
                                 crate::shard::slice::with_shard(|s| do_write(s, &mut conn));
+                            // #455: the AOF record below can park on a full
+                            // writer channel before it is enqueued; its fold
+                            // epoch is read here, in the mutation's no-await
+                            // stretch (see the monoio handler's generic write
+                            // leg).
+                            let fold_stamp = ctx.aof_pool.as_ref().map_or(
+                                aof::FoldEpoch::INITIAL,
+                                |pool| pool.fold_stamp(ctx.shard_id),
+                            );
 
                             let (mut response, ready): (Frame, crate::blocking::wakeup::ReadyKeys) = match write_outcome {
                                 Ok(t) => t,
@@ -2849,6 +2860,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                 lsn,
                                                 conn.selected_db,
                                                 bytes,
+                                                fold_stamp,
                                             )
                                             .await
                                         {

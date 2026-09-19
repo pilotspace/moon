@@ -474,7 +474,16 @@ async fn run_on_owner_persist(
         let serialized = crate::persistence::aof::serialize_command(&Frame::Array(
             command_parts.to_vec().into(),
         ));
-        match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
+        match persist_local_leg(
+            aof_pool,
+            repl_state,
+            my_shard,
+            db_index,
+            serialized,
+            local_fold_stamp(aof_pool, my_shard),
+        )
+        .await
+        {
             Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
             Err(()) => {
                 return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
@@ -529,7 +538,16 @@ async fn run_local_persist(
     parts.push(bulk_static(cmd));
     parts.extend_from_slice(args);
     let serialized = crate::persistence::aof::serialize_command(&Frame::Array(parts.into()));
-    match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
+    match persist_local_leg(
+        aof_pool,
+        repl_state,
+        my_shard,
+        db_index,
+        serialized,
+        local_fold_stamp(aof_pool, my_shard),
+    )
+    .await
+    {
         Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
         Err(()) => return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR)),
     }
@@ -582,6 +600,14 @@ type ReplStateRef<'a> =
 /// so the offset ran permanently ahead of what a replica could ACK and
 /// `WAIT` answered `:0` forever (`--appendonly yes`), while with no AOF pool
 /// the leg neither counted nor shipped and the replica silently diverged.
+///
+/// # Fold epoch (#455)
+///
+/// `fold_stamp` is [`local_fold_stamp`] read right after the local mutation,
+/// before any await. Most callers mutate and call this with no await in
+/// between; the scattered MSET awaits its remote legs first, and a fold that
+/// snapshots its local keys in that window must drop this record instead of
+/// replaying it over later writes.
 async fn persist_local_leg(
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     repl_state: ReplStateRef<'_>,
@@ -592,6 +618,7 @@ async fn persist_local_leg(
     // record so the replica applies it in the same db.
     db: usize,
     serialized: Bytes,
+    fold_stamp: crate::persistence::aof::FoldEpoch,
 ) -> Result<bool, ()> {
     let repl_active = crate::replication::state::fanout_active_for(repl_state);
     if !repl_active && aof_pool.is_none() {
@@ -618,10 +645,25 @@ async fn persist_local_leg(
     let Some(pool) = aof_pool else {
         return Ok(false);
     };
-    match pool.send_append_group(my_shard, lsn, db, serialized).await {
+    match pool
+        .send_append_group(my_shard, lsn, db, serialized, fold_stamp)
+        .await
+    {
         Ok(needs_barrier) => Ok(needs_barrier),
         Err(_) => Err(()),
     }
+}
+
+/// The AOF fold epoch of `my_shard`'s writer, or the initial epoch when AOF is
+/// off. Read it in the same no-await stretch as the mutation it stamps.
+#[inline]
+fn local_fold_stamp(
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    my_shard: usize,
+) -> crate::persistence::aof::FoldEpoch {
+    aof_pool.map_or(crate::persistence::aof::FoldEpoch::INITIAL, |pool| {
+        pool.fold_stamp(my_shard)
+    })
 }
 
 /// Serialize an `MSET k v ...` command over `pairs` for AOF logging of a local
@@ -1528,7 +1570,16 @@ async fn coordinate_mset(
         // owned by my_shard — matching the local single-key write contract.
         if let Some(pairs) = groups.get(&my_shard) {
             let serialized = serialize_local_mset(pairs);
-            match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
+            match persist_local_leg(
+                aof_pool,
+                repl_state,
+                my_shard,
+                db_index,
+                serialized,
+                local_fold_stamp(aof_pool, my_shard),
+            )
+            .await
+            {
                 Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
                 Err(()) => {
                     return Frame::Error(Bytes::from_static(
@@ -1565,7 +1616,12 @@ async fn coordinate_mset(
             // slice back on top of it. A failed append is reported once every
             // leg has been dispatched and drained, as before.
             let serialized = serialize_local_mset(kv_pairs);
-            match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
+            // Stamped here, in the same synchronous stretch as the apply
+            // above: the append below may park before it enqueues (#455).
+            let stamp = local_fold_stamp(aof_pool, my_shard);
+            match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized, stamp)
+                .await
+            {
                 Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
                 Err(()) => local_append_failed = true,
             }
@@ -1693,7 +1749,16 @@ async fn coordinate_msetnx(
         if matches!(resp, Frame::Integer(1)) {
             let serialized =
                 crate::persistence::aof::serialize_command(&Frame::Array(command_parts.into()));
-            match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
+            match persist_local_leg(
+                aof_pool,
+                repl_state,
+                my_shard,
+                db_index,
+                serialized,
+                local_fold_stamp(aof_pool, my_shard),
+            )
+            .await
+            {
                 Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
                 Err(()) => {
                     return Frame::Error(Bytes::from_static(
@@ -1774,7 +1839,16 @@ async fn coordinate_multi_del_or_exists(
             parts.extend_from_slice(args);
             let serialized =
                 crate::persistence::aof::serialize_command(&Frame::Array(parts.into()));
-            match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
+            match persist_local_leg(
+                aof_pool,
+                repl_state,
+                my_shard,
+                db_index,
+                serialized,
+                local_fold_stamp(aof_pool, my_shard),
+            )
+            .await
+            {
                 Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
                 Err(()) => {
                     return Frame::Error(Bytes::from_static(
@@ -1807,8 +1881,15 @@ async fn coordinate_multi_del_or_exists(
                     parts.extend_from_slice(key_args);
                     let serialized =
                         crate::persistence::aof::serialize_command(&Frame::Array(parts.into()));
-                    match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized)
-                        .await
+                    match persist_local_leg(
+                        aof_pool,
+                        repl_state,
+                        my_shard,
+                        db_index,
+                        serialized,
+                        local_fold_stamp(aof_pool, my_shard),
+                    )
+                    .await
                     {
                         Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
                         Err(()) => {
@@ -3605,12 +3686,18 @@ pub(crate) fn aggregate_doc_freq(
 ///
 /// `appendfsync=always` requires every shard's SWAPDB record to be fsynced
 /// to disk BEFORE the client observes `+OK`. This function:
-///   1. Appends the LOCAL shard's record via
-///      `AofWriterPool::send_append_group` (the same v3-5 group-commit
-///      primitive [`persist_local_leg`] uses for MSET/BITOP/COPY/DEL local
-///      legs) and, when `Always`, awaits ONE `fsync_barrier(my_shard)`
-///      BEFORE performing the swap — a failure aborts with NO mutation
-///      applied anywhere on this shard yet.
+///   1. Enqueues the LOCAL shard's record and performs the local swap in
+///      ONE synchronous section (`AofWriterPool::append_then_apply`), then,
+///      when `Always`, awaits ONE `fsync_barrier(my_shard)`. The record's
+///      fold stamp, its position in the writer's stream and the swap must
+///      fall on the same side of every AOF rewrite snapshot, or a fold that
+///      snapshots between them folds the record away while its swap is
+///      missing from the new base, and the acked SWAPDB is lost on restart.
+///      An enqueue that fails (writer gone, channel still full after
+///      `--aof-fsync-timeout-ms`) aborts with NO mutation anywhere. A local
+///      barrier that fails is reported the way a remote one is: the swap
+///      stays applied on every shard and the reply says durability is
+///      unconfirmed.
 ///   2. Dispatches `ShardMessage::SwapDb` to every remote shard.
 ///   3. After EACH remote ack, issues ONE `fsync_barrier(target)`. Because
 ///      the remote's `Append` was enqueued into that shard's AOF writer
@@ -3665,11 +3752,16 @@ pub async fn coordinate_swapdb(
     // handler_single.rs, but the monoio handler routes ALL shard counts here
     // (at shards=1 the remote loop is simply empty).
     debug_assert!(num_shards >= 1);
-    // Local shard first: durable append BEFORE the swap AND before any
-    // remote dispatch. SWAPDB has no command-level rollback; anything that
-    // can fail must fail while NOTHING in the cluster has mutated —
-    // dispatching remotes first (the pre-fix order) meant a local abort
-    // left N-1 shards swapped and this one not.
+    // Set when the local fsync barrier fails after the swap was applied. The
+    // remote legs still run, so every shard ends up swapped, and the reply
+    // reports the unconfirmed durability.
+    let mut local_durability_err: Option<Frame> = None;
+    // Local shard first: the record is accepted by the AOF writer BEFORE the
+    // swap, and both happen before any remote dispatch. SWAPDB has no
+    // command-level rollback; an enqueue that can fail must fail while
+    // NOTHING in the cluster has mutated — dispatching remotes first (the
+    // pre-fix order) meant a local abort left N-1 shards swapped and this
+    // one not.
     {
         let mut a_buf = itoa::Buffer::new();
         let mut b_buf = itoa::Buffer::new();
@@ -3694,9 +3786,9 @@ pub async fn coordinate_swapdb(
         }
 
         // AOF pool — the actual multi-shard recovery authority (defect 2).
-        // Same v3-5 group-commit contract `persist_local_leg` uses for
-        // MSET/BITOP/COPY/DEL: enqueue fire-and-forget, then ONE barrier
-        // under `Always` instead of a per-write awaited fsync.
+        // Group commit, like `persist_local_leg` for MSET/BITOP/COPY/DEL:
+        // enqueue without awaiting the fsync, then ONE barrier under
+        // `Always` instead of a per-write awaited fsync.
         //
         // `lsn = 0` (moon#815): the replication record emitted below via
         // `record_local_write_global` advances the per-shard + master offset
@@ -3707,45 +3799,54 @@ pub async fn coordinate_swapdb(
         // the wire. When no `ReplicationState` exists, `issue_append_lsn`
         // returned 0 anyway; per-shard AOF order is preserved by write order,
         // not by LSN value (see `wal_append_and_fanout`).
-        if let Some(pool) = aof_pool {
-            match pool
-                .send_append_group(my_shard, 0, 0, serialized.clone())
-                .await
-            {
-                Ok(needs_barrier) => {
-                    if needs_barrier && pool.fsync_barrier(my_shard).await.is_err() {
-                        return Frame::Error(bytes::Bytes::from_static(
-                            crate::persistence::aof::AOF_FSYNC_ERR,
-                        ));
-                    }
-                }
-                Err(_) => {
-                    return Frame::Error(bytes::Bytes::from_static(
-                        crate::persistence::aof::AOF_FSYNC_ERR,
-                    ));
-                }
-            }
-        }
-
-        // Local durability confirmed (or persistence disabled) — apply the
-        // swap.
-        crate::shard::slice::with_shard(|s| {
-            if a != b {
-                s.databases.swap(a, b);
-            }
-        });
-
+        // Enqueue the record, swap, and emit the replication record with no
+        // suspension point in between (see "Durability" above). Nothing is
+        // mutated unless the AOF writer accepted the record.
+        //
         // #386 — replication plane, exactly once per client SWAPDB. Today's
         // replica applies the merged wire as ONE stream, so the record must
-        // appear on it exactly once: the coordinator emits it here, AFTER
-        // the durability gate (an abort above never reaches this line, so a
-        // failed SWAPDB can never ship to replicas) and after the local
-        // swap; the remote legs' SPSC arms write AOF/WAL only. Safe on both
+        // appear on it exactly once: the coordinator emits it here, only once
+        // the swap is applied (an enqueue abort never runs this closure, so a
+        // refused SWAPDB can never ship to replicas), and in the same
+        // synchronous section as the swap, so no write another client makes
+        // into the swapped dbs can reach the replication stream ahead of it.
+        // The remote legs' SPSC arms write AOF/WAL only. Safe on both
         // runtimes: this runs on the shard's own OS thread (monoio shard
         // thread / tokio per-shard LocalSet), whose event loop drains
         // `self_msg`. When #406 lands per-shard demuxed replicas this must
         // flip to per-shard emission.
-        crate::replication::state::record_local_write_global(my_shard, serialized);
+        let repl_record = serialized.clone();
+        let apply_local = move || {
+            crate::shard::slice::with_shard(|s| {
+                if a != b {
+                    s.databases.swap(a, b);
+                }
+            });
+            crate::replication::state::record_local_write_global(my_shard, repl_record);
+        };
+        if let Some(pool) = aof_pool {
+            match pool
+                .append_then_apply(my_shard, 0, 0, serialized, apply_local)
+                .await
+            {
+                Ok(((), needs_barrier)) => {
+                    if needs_barrier && pool.fsync_barrier(my_shard).await.is_err() {
+                        local_durability_err = Some(Frame::Error(bytes::Bytes::from_static(
+                            b"ERR SWAPDB durability unconfirmed on this shard \
+                              (fsync barrier failed after the swap was already applied)",
+                        )));
+                    }
+                }
+                // The record was never accepted and nothing was swapped.
+                Err(_) => {
+                    return Frame::Error(bytes::Bytes::from_static(
+                        b"ERR SWAPDB aborted: AOF enqueue failed (persistence backpressure)",
+                    ));
+                }
+            }
+        } else {
+            apply_local();
+        }
     }
 
     // ChannelMesh has no self-send slot (target_index panics when my_id == target_id).
@@ -3772,7 +3873,7 @@ pub async fn coordinate_swapdb(
     // Every leg is drained even after a failure (mirrors `coordinate_mset`):
     // a timed-out/closed/unconfirmed leg must not collapse into a false OK,
     // but it also must not skip confirming the OTHER shards.
-    let mut leg_err: Option<Frame> = None;
+    let mut leg_err: Option<Frame> = local_durability_err;
     for (target, rx) in targets.into_iter().zip(receivers) {
         match rx.recv().await {
             Ok(()) => {
@@ -4247,3 +4348,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod swapdb_fold_tests;

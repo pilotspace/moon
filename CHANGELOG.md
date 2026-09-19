@@ -246,6 +246,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-place cold-page write can reach it. Pinned by the tests in
   `shard::persistence_tick::checkpoint_tick_tests`,
   `persistence::data_file_sync` and `persistence::page_cache`.
+
+- **An AOF rewrite no longer replays a write twice, and a rewrite that fails
+  late no longer leaves the writer appending to a deleted file** (moon#455).
+  - **Double apply.** A rewrite split the append stream by position: whatever
+    reached the writer after its snapshot went into the new incr. A write
+    whose record arrives after the snapshot while its effect is already in the
+    snapshot was therefore replayed on top of the new base after a restart. An
+    `INCR` came back incremented twice, an `LPUSH` pushed twice. Records reach
+    the writer late when the producer awaits between the mutation and the
+    enqueue: an `EXEC` whose body holds `WAIT`, `CONFIG` or another connection
+    intercept, the local half of a multi-shard `FLUSHDB`/`FLUSHALL` (which
+    could then wipe writes the base had taken after it), the local slice of a
+    multi-shard `MSET`, or any producer parked on a full AOF channel. Every
+    record now carries the rewrite epoch in force when its mutation ran. Once
+    a rewrite takes effect, the writer drops each record stamped before that
+    rewrite's snapshot, wherever the record surfaces. An aborted rewrite drops
+    nothing. `INFO persistence` counts the dropped records as
+    `aof_rewrite_late_records_folded`.
+  - **Late failure.** The writer opened the new incr only after the manifest
+    had switched to it. If that open failed, the rewrite was reported aborted
+    while the manifest named the new generation, and the writer kept
+    appending, and fsyncing, into the old incr the switch had deleted. Nothing
+    it wrote after that could be recovered. The new incr is now opened before
+    the manifest switches, so every failure leaves the old generation
+    committed and the writer on it. A failed manifest write also no longer
+    advances the in-memory sequence past the one on disk.
+  - **SWAPDB during a rewrite.** `SWAPDB` logged its record, awaited, and
+    only then swapped. A rewrite that snapshotted in that gap had a base
+    without the swap and dropped (or folded into the old incr) the record, so
+    the acknowledged `SWAPDB` was gone after a restart. The record is now
+    enqueued, the swap applied and the replication record emitted in one
+    synchronous step; while the AOF channel is full, `SWAPDB` waits for room
+    without holding its record, and is refused unapplied after
+    `--aof-fsync-timeout-ms`. Under `appendfsync always` the fsync is now
+    confirmed after the swap, so an fsync failure is reported on a swap that
+    stays applied on every shard, like any other `always` write.
+  - **Directory fsyncs.** A per-shard rewrite created the new incr after its
+    last fsync of the shard directory, and the tokio `--shards 1` rewrite
+    renamed its new file into place without a directory fsync. After a power
+    loss the committed manifest could name a missing incr, or the old
+    `appendonly.aof` could return, losing every record written after the
+    rewrite. Both directories are now fsynced before the new file is used.
+
+- **A COLD vector segment leaves `unloaded` with the search that reloads it,
+  and a delete that lands while the reload is waiting to install is no longer
+  lost** (moon#1070). Since the off-loop reload pool (prod-hardening #18) a
+  search only SUBMITTED the reload and answered from it; the reloaded segment
+  sat in the pool until some later search installed it, while the COLD stub
+  stayed the index's segment and the only place a DEL could be recorded. The
+  install then threw the stub away without replaying it: a document deleted
+  after the first search came back, as `vec:<id>`, on the next one (reproduced
+  on a real server). The install now replays the stub's tombstones, and the
+  yielding FT.SEARCH handlers install finished reloads as soon as the query
+  that awaited them is back on the shard, so `FT.INFO unloaded_segments` drops
+  to 0 with that search. Four `tests/vector_idle_unload.rs` tests that were
+  `#[ignore]`d -- and silently red on main -- now run in CI; only the
+  `ps`-based RSS measurement stays ignored.
+
+- **A restart no longer re-issues a cold-tier file id, which could apply a
+  write twice** (moon#1067). A restart resumes the shard's cold file-id
+  counter at one past the highest id the manifest or the disk still holds.
+  Manifest tombstone GC could prune the entry that held the highest id once
+  its file was reclaimed, and the counter then moved backwards. The AOF
+  appends to the same generation across restarts, so the generation still
+  held a `MOON.SPILLED <id>` record for the old file. On replay, that record
+  made the re-issued id readable early, and a write logged before its key
+  was spilled into the new file was applied on top of the value it had
+  already produced. Measured with `--appendonly yes --disk-offload enable`
+  and the tombstone retention at zero: `RPUSH X a` once, then spill, restart,
+  spill again, restart, and `LRANGE X` read `a a`, after both `kill -9` and
+  `SHUTDOWN`, on both runtimes. The same sequence with the default retention
+  (tombstones outlive the restart) read `a`. GC now keeps the tombstone that
+  holds the highest file id until a higher id is in the manifest. That pins
+  at most one manifest entry per shard. No on-disk format change.
+
 - **CLIENT TRACKING never drops an invalidation silently, scripts are
   tracked, and a RESP2 subscriber's pipeline follows its live subscription
   count** (moon#1088, moon#1089, moon#1090, refs moon#1078). Every wire reply
