@@ -213,6 +213,8 @@ pub(crate) struct ConnectionState {
     pub client_id: u64,
     #[allow(dead_code)] // Used in Phase 4 (shared dispatch extraction)
     pub peer_addr: String,
+    /// RESP version. Read freely; assign only through
+    /// [`ConnectionState::set_protocol_version`].
     pub protocol_version: u8,
     pub selected_db: usize,
     pub authenticated: bool,
@@ -319,7 +321,7 @@ pub(crate) struct ConnectionState {
 
     // Tracking
     pub tracking_state: TrackingState,
-    pub tracking_rx: Option<channel::MpscReceiver<Frame>>,
+    pub tracking_rx: Option<crate::tracking::InvalidationRx>,
     /// This connection's pub/sub channel, registered as a CLIENT TRACKING
     /// REDIRECT inbox while it is subscribed (moon#1048); kept in step by
     /// [`ConnectionState::sync_tracking_inbox`]. Dropping it — on any exit
@@ -585,6 +587,24 @@ impl ConnectionState {
             self.client_id,
             table,
         );
+    }
+
+    /// Switch the connection's RESP version. Every assignment goes through
+    /// here (HELLO, RESET, and a HELLO queued in MULTI).
+    ///
+    /// A tracking connection's own invalidation queue discards while it
+    /// speaks RESP2 (see `InvalidationRx::set_deliverable`), and writers on
+    /// other threads read that flag when they invalidate. It must therefore
+    /// change together with the protocol. Waiting until the connection loop
+    /// next comes round is too late: a pipelined `HELLO 3` / `GET k` /
+    /// `BLPOP` parks the connection before then, and the push for `k` would
+    /// be discarded after the table had already forgotten `k`.
+    #[inline]
+    pub fn set_protocol_version(&mut self, version: u8) {
+        self.protocol_version = version;
+        if let Some(rx) = &self.tracking_rx {
+            rx.set_deliverable(crate::tracking::client_cmd::push_deliverable(version));
+        }
     }
 
     /// D4 (#438): whether this connection may migrate to another shard
