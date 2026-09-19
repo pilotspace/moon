@@ -339,7 +339,14 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                 }
             }
             if sub_break { return SubscriberAction::BreakOuter; }
-            if conn.subscription_count == 0 { return SubscriberAction::Continue; }
+            if conn.subscription_count == 0 {
+                // moon#1090: the parse loop stopped at the command that left
+                // the connection unsubscribed. Whatever the client pipelined
+                // after it is still in `read_buf`; mark it carried so the
+                // normal path parses it now instead of parking in read().
+                *carried_input = !read_buf.is_empty();
+                return SubscriberAction::Continue;
+            }
         }
         msg = rx.recv_async() => {
             match msg {
