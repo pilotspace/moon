@@ -14,6 +14,7 @@ use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch};
 use crate::config::{RuntimeConfig, ServerConfig};
 use crate::protocol::Frame;
+use crate::shard::exec_publish::{ExecPublish, PublishKind};
 use crate::shard::shared_databases::ShardDatabases;
 #[cfg(feature = "runtime-tokio")]
 use crate::storage::Database;
@@ -260,7 +261,7 @@ pub(crate) fn execute_transaction(
     command_queue: &[Frame],
     watched_keys: &HashMap<Bytes, WatchToken>,
     selected_db: &mut usize,
-    exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
+    exec_publishes: &mut Vec<ExecPublish>,
 ) -> (Frame, Vec<Bytes>) {
     let mut guard = db[*selected_db].write();
     let db_count = db.len();
@@ -397,7 +398,7 @@ pub(crate) fn execute_transaction_sharded(
     // the calling context.
     proto: u8,
     cached_clock: &CachedClock,
-    exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
+    exec_publishes: &mut Vec<ExecPublish>,
     exec_flushes: &mut Vec<(usize, Frame, usize)>,
     // moon#606: keys this body wrote that a blocked client may be waiting on.
     // Raised by the CALLER after the body, never here — see the collection
@@ -814,34 +815,46 @@ pub(crate) async fn persist_txn_aof(
     Ok(())
 }
 
-/// Shared PUBLISH-inside-MULTI intercept for both transaction executors (C2).
+/// Shared PUBLISH/SPUBLISH-inside-MULTI intercept for every transaction
+/// executor (C2; SPUBLISH since moon#1043).
 ///
-/// Returns `true` when `cmd` is PUBLISH: pushes a `Frame::Integer(0)`
-/// placeholder (or an arity error) into `results` and records
-/// `(result_index, channel, message)` in `exec_publishes` so the caller can
-/// fan the message out AFTER the transaction body and patch the placeholder
-/// with the real receiver count.
+/// Returns `true` when `cmd` is `PUBLISH` or `SPUBLISH`: pushes a
+/// `Frame::Integer(0)` placeholder (or an arity error) into `results` and
+/// records an [`ExecPublish`] so the caller can fan the message out AFTER the
+/// transaction body, into the right namespace, and patch the placeholder with
+/// the real receiver count.
+///
+/// moon#1043: this matched `PUBLISH` only, so a queued `SPUBLISH` fell through
+/// to `dispatch()` — which has no pub/sub arm — and EXEC answered
+/// `ERR unknown command` for that slot while the rest of the body committed:
+/// the shard-channel message was silently dropped.
 fn queue_exec_publish(
     cmd: &[u8],
     cmd_args: &[Frame],
     results: &mut Vec<Frame>,
-    exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
+    exec_publishes: &mut Vec<ExecPublish>,
 ) -> bool {
-    if !cmd.eq_ignore_ascii_case(b"PUBLISH") {
+    let Some(kind) = PublishKind::of(cmd) else {
         return false;
-    }
+    };
     if cmd_args.len() != 2 {
-        results.push(Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'publish' command",
-        )));
+        results.push(Frame::Error(Bytes::from_static(match kind {
+            PublishKind::Global => b"ERR wrong number of arguments for 'publish' command",
+            PublishKind::Shard => b"ERR wrong number of arguments for 'spublish' command",
+        })));
         return true;
     }
     match (
         super::util::extract_bytes(&cmd_args[0]),
         super::util::extract_bytes(&cmd_args[1]),
     ) {
-        (Some(ch), Some(msg)) => {
-            exec_publishes.push((results.len(), ch, msg));
+        (Some(channel), Some(message)) => {
+            exec_publishes.push(ExecPublish {
+                slot: results.len(),
+                channel,
+                message,
+                kind,
+            });
             results.push(Frame::Integer(0)); // patched by the caller post-txn
         }
         _ => results.push(Frame::Error(Bytes::from_static(
@@ -849,6 +862,86 @@ fn queue_exec_publish(
         ))),
     }
     true
+}
+
+#[cfg(test)]
+mod exec_publish_queue_tests {
+    //! moon#1043: both publish verbs queue a placeholder plus a deferred
+    //! fan-out record tagged with the RIGHT namespace.
+    use super::{ExecPublish, PublishKind, queue_exec_publish};
+    use crate::protocol::Frame;
+    use bytes::Bytes;
+
+    fn argv(parts: &[&'static str]) -> Vec<Frame> {
+        parts
+            .iter()
+            .map(|p| Frame::BulkString(Bytes::from_static(p.as_bytes())))
+            .collect()
+    }
+
+    fn record(p: &ExecPublish) -> (usize, &[u8], &[u8], PublishKind) {
+        (p.slot, &p.channel[..], &p.message[..], p.kind)
+    }
+
+    #[test]
+    fn spublish_and_publish_queue_into_their_own_namespace() {
+        let mut results = vec![Frame::SimpleString(Bytes::from_static(b"OK"))];
+        let mut pubs = Vec::new();
+        assert!(queue_exec_publish(
+            b"spublish",
+            &argv(&["sch", "m1"]),
+            &mut results,
+            &mut pubs
+        ));
+        assert!(queue_exec_publish(
+            b"PUBLISH",
+            &argv(&["ch", "m2"]),
+            &mut results,
+            &mut pubs
+        ));
+        assert_eq!(results.len(), 3, "one placeholder per publish");
+        assert!(matches!(results[1], Frame::Integer(0)));
+        assert!(matches!(results[2], Frame::Integer(0)));
+        assert_eq!(
+            pubs.iter().map(record).collect::<Vec<_>>(),
+            vec![
+                (1, &b"sch"[..], &b"m1"[..], PublishKind::Shard),
+                (2, &b"ch"[..], &b"m2"[..], PublishKind::Global),
+            ]
+        );
+    }
+
+    #[test]
+    fn spublish_arity_error_names_spublish_and_records_nothing() {
+        let mut results = Vec::new();
+        let mut pubs = Vec::new();
+        assert!(queue_exec_publish(
+            b"SPUBLISH",
+            &argv(&["only-channel"]),
+            &mut results,
+            &mut pubs
+        ));
+        assert!(pubs.is_empty());
+        assert!(matches!(
+            &results[0],
+            Frame::Error(e) if &e[..] == b"ERR wrong number of arguments for 'spublish' command"
+        ));
+    }
+
+    #[test]
+    fn other_commands_are_not_intercepted() {
+        let mut results = Vec::new();
+        let mut pubs = Vec::new();
+        for cmd in [&b"SSUBSCRIBE"[..], b"SET", b"PUBSUB"] {
+            assert!(!queue_exec_publish(
+                cmd,
+                &argv(&["a", "b"]),
+                &mut results,
+                &mut pubs
+            ));
+        }
+        assert!(results.is_empty() && pubs.is_empty());
+    }
 }
 
 /// Channel-ACL gate for PUBLISH. Returns the `NOPERM` error frame when `user`
@@ -896,28 +989,44 @@ pub(crate) fn pubsub_command_acl_deny(
         .map(|reason| Frame::Error(Bytes::from(format!("NOPERM {reason}"))))
 }
 
-/// Fan out one EXEC-queued PUBLISH (C2): local shard synchronously, remote
-/// shards via targeted `PubSubPublish` SPSC messages, awaited so the returned
-/// count matches the immediate-PUBLISH path. Called by the sharded handlers
+/// Fan out one EXEC-queued PUBLISH or SPUBLISH (C2, moon#1043): local shard
+/// synchronously, remote shards via targeted SPSC messages, awaited so the
+/// returned count matches the immediate path. Called by the sharded handlers
 /// after `execute_transaction_sharded` returns — i.e. after every write queued
-/// before the PUBLISH has been applied.
+/// before the publish has been applied.
+///
+/// `kind` picks the namespace end to end, exactly as the immediate
+/// `try_handle_publish` does: the local registry (`publish_shared` vs
+/// `spublish_shared`), the remote-subscriber map (`target_shards` vs
+/// `shard_target_shards`) and the SPSC message (`PubSubPublish` vs a
+/// one-pair `SPublishBatch`). A shard channel's subscribers are registered on
+/// their connections' shards, so SPUBLISH fans out the same way PUBLISH does.
 pub(crate) async fn publish_post_txn(
     ctx: &super::core::ConnectionContext,
     shutdown: &crate::runtime::cancel::CancellationToken,
     channel: &Bytes,
     message: &Bytes,
+    kind: PublishKind,
 ) -> i64 {
     use crate::shard::mesh::ChannelMesh;
     use ringbuf::traits::Producer;
 
-    let local_count = crate::pubsub::publish_shared(&ctx.pubsub_registry, channel, message);
-    let remote_targets: Vec<usize> = ctx
-        .remote_subscriber_map
-        .read()
-        .target_shards(channel)
-        .into_iter()
-        .filter(|&t| t != ctx.shard_id)
-        .collect();
+    let local_count = match kind {
+        PublishKind::Global => {
+            crate::pubsub::publish_shared(&ctx.pubsub_registry, channel, message)
+        }
+        PublishKind::Shard => {
+            crate::pubsub::spublish_shared(&ctx.pubsub_registry, channel, message)
+        }
+    };
+    let targets = {
+        let map = ctx.remote_subscriber_map.read();
+        match kind {
+            PublishKind::Global => map.target_shards(channel),
+            PublishKind::Shard => map.shard_target_shards(channel),
+        }
+    };
+    let remote_targets: Vec<usize> = targets.into_iter().filter(|&t| t != ctx.shard_id).collect();
     if remote_targets.is_empty() {
         return local_count;
     }
@@ -930,13 +1039,21 @@ pub(crate) async fn publish_post_txn(
         // transiently-full ring no longer loses the message. The borrow of
         // `dispatch_tx` is taken+released inside each attempt, never held
         // across the backoff await.
-        let mut pending = Some(crate::shard::dispatch::ShardMessage::PubSubPublish(
-            Box::new(crate::shard::dispatch::PubSubPublishPayload {
-                channel: channel.clone(),
-                message: message.clone(),
+        let mut pending = Some(match kind {
+            PublishKind::Global => crate::shard::dispatch::ShardMessage::PubSubPublish(Box::new(
+                crate::shard::dispatch::PubSubPublishPayload {
+                    channel: channel.clone(),
+                    message: message.clone(),
+                    slot: slot.clone(),
+                },
+            )),
+            // No single-pair SPUBLISH variant exists; a one-pair batch lands in
+            // the target's SHARDED registry and adds its count to `slot`.
+            PublishKind::Shard => crate::shard::dispatch::ShardMessage::SPublishBatch {
+                pairs: vec![(channel.clone(), message.clone())],
                 slot: slot.clone(),
-            }),
-        ));
+            },
+        });
         let idx = ChannelMesh::target_index(ctx.shard_id, *target);
         let outcome = crate::shard::dispatch::push_with_backpressure(
             shutdown,
@@ -966,7 +1083,7 @@ pub(crate) async fn publish_post_txn(
                 // reply can't hang — but LOUDLY: this is real message loss to
                 // that shard's subscribers (was a silent drop pre-E1).
                 tracing::warn!(
-                    "shard {}: EXEC PUBLISH fan-out to shard {target} dropped ({outcome:?})",
+                    "shard {}: EXEC {kind:?} publish fan-out to shard {target} dropped ({outcome:?})",
                     ctx.shard_id
                 );
                 crate::admin::metrics_setup::record_xshard_fanout_drop("publish");

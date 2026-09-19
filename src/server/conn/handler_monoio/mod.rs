@@ -2567,7 +2567,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
 
             // --- MULTI / EXEC / DISCARD ---
-            let mut exec_publishes: Vec<(usize, Bytes, Bytes)> = Vec::new();
+            let mut exec_publishes: Vec<crate::shard::exec_publish::ExecPublish> = Vec::new();
             if !skip_name_gates
                 && write::try_handle_multi_exec(
                     cmd,
@@ -2582,30 +2582,31 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 )
                 .await
             {
-                // C2: PUBLISH queued inside MULTI fans out only now — after the
-                // transaction body has been applied — and its placeholder in the
-                // EXEC reply array is patched with the real receiver count.
+                // C2: a PUBLISH or SPUBLISH (moon#1043) queued inside MULTI fans
+                // out only now — after the transaction body has been applied —
+                // into its own namespace, and its placeholder in the EXEC reply
+                // array is patched with the real receiver count.
                 if !exec_publishes.is_empty() {
                     let exec_idx = responses.len() - 1;
-                    for (inner, ch, msg) in exec_publishes.drain(..) {
-                        // Channel ACL gates the txn PUBLISH path (C2 security):
+                    for p in exec_publishes.drain(..) {
+                        // Channel ACL gates the txn publish path (C2 security):
                         // a denied channel is patched with NOPERM, never sent.
                         let patched = match crate::server::conn::shared::publish_channel_acl_deny(
                             &ctx.acl_table,
                             &conn.current_user,
-                            &ch,
+                            &p.channel,
                         ) {
                             Some(err) => err,
                             None => Frame::Integer(
                                 crate::server::conn::shared::publish_post_txn(
-                                    ctx, &shutdown, &ch, &msg,
+                                    ctx, &shutdown, &p.channel, &p.message, p.kind,
                                 )
                                 .await,
                             ),
                         };
                         if let Frame::Array(items) = &mut responses[exec_idx] {
-                            if inner < items.len() {
-                                items[inner] = patched;
+                            if p.slot < items.len() {
+                                items[p.slot] = patched;
                             }
                         }
                     }

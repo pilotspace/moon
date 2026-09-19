@@ -1503,7 +1503,8 @@ pub async fn handle_connection(
                                     );
                                     continue;
                                 }
-                                let mut exec_publishes: Vec<(usize, Bytes, Bytes)> = Vec::new();
+                                let mut exec_publishes: Vec<crate::shard::exec_publish::ExecPublish> =
+                                    Vec::new();
                                 // PR #282 review: `execute_transaction` holds
                                 // ONE guard on the db selected at EXEC time —
                                 // every body write physically lands there,
@@ -1526,18 +1527,30 @@ pub async fn handle_connection(
                                 // Channel ACL gates this path too (C2 security):
                                 // a denied channel is patched with NOPERM and
                                 // never delivered, matching the immediate path.
-                                for (inner, ch, msg) in exec_publishes.drain(..) {
+                                // moon#1043: SPUBLISH lands in the shard-channel
+                                // namespace, never the global one.
+                                for p in exec_publishes.drain(..) {
                                     let patched = match crate::server::conn::shared::publish_channel_acl_deny(
                                         &acl_table,
                                         &conn.current_user,
-                                        &ch,
+                                        &p.channel,
                                     ) {
                                         Some(err) => err,
-                                        None => Frame::Integer(pubsub_registry.lock().publish(&ch, &msg)),
+                                        None => {
+                                            let mut registry = pubsub_registry.lock();
+                                            Frame::Integer(match p.kind {
+                                                crate::shard::exec_publish::PublishKind::Global => {
+                                                    registry.publish(&p.channel, &p.message)
+                                                }
+                                                crate::shard::exec_publish::PublishKind::Shard => {
+                                                    registry.spublish(&p.channel, &p.message)
+                                                }
+                                            })
+                                        }
                                     };
                                     if let Frame::Array(items) = &mut result {
-                                        if inner < items.len() {
-                                            items[inner] = patched;
+                                        if p.slot < items.len() {
+                                            items[p.slot] = patched;
                                         }
                                     }
                                 }

@@ -148,6 +148,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`SPUBLISH` queued inside `MULTI` is now delivered at `EXEC`** (moon#1043).
+  The command was answered `+QUEUED`, then `EXEC` answered
+  `-ERR unknown command` for that slot while the rest of the transaction
+  committed, so the shard-channel message was silently dropped. The
+  transaction executors intercepted `PUBLISH` for their deferred post-body
+  fan-out but not `SPUBLISH`, which fell through to the keyspace dispatch
+  table. Now both are recorded with their namespace, an enum and not a bool,
+  since the two namespaces can share a channel name without sharing
+  subscribers. After the body, each fans out through the same registry,
+  remote-subscriber map, and SPSC message as its immediate form. This holds
+  on every handler, including an owner-routed EXEC at `--shards > 1`. The
+  channel ACL is checked at fan-out exactly as for `PUBLISH`, so a denied
+  channel answers `NOPERM` in its slot and is never delivered. Measured
+  against redis 8.6.1 at `--shards 1` and `--shards 4`: the EXEC reply
+  (`*2 +OK :3`) and delivery to every subscriber now match.
+
 - **`runtime-tokio` with `--shards 1` now opens every AOF generation with a
   `MOON.COLDCUT`, so a `kill -9` no longer double-applies writes to spilled
   keys or drops acknowledged post-rewrite writes** (moon#914). This is the one
