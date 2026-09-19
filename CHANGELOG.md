@@ -191,6 +191,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The disk-offload checkpoint only publishes a redo point over heap pages it
+  has made durable** (moon#452 item 3). The fuzzy checkpoint pwrote dirty heap
+  pages and never fsynced a heap file, then published `redo_lsn` in the control
+  file and recycled every WAL segment below it — FullPageImages included. A
+  power loss after that recycle could roll a page back with nothing left in the
+  WAL to redo it. Three changes close the protocol:
+  - Finalize fsyncs every heap file the flush wrote before it writes the WAL
+    checkpoint record. The fsync runs on a helper thread, and the shard thread
+    waits for it with the same bounded wait (`WAIT_DURABLE_TIMEOUT`) it
+    already uses for WAL durability. If a file cannot be opened, or the wait
+    times out, Finalize retries later with backoff. If an fsync returns an
+    error, the shard never publishes a redo point again, because a retried
+    fsync can report success for pages the kernel already dropped. The WAL
+    above the last good redo point is kept, and recovery replays from there.
+  - Each page's FullPageImage is appended to the WAL and made durable before
+    the page is overwritten in place. The flush used to collect every image and
+    append them only after the whole batch had been pwritten, into the WAL
+    writer's memory buffer. A crash during the pwrite left a torn page and no
+    image of it anywhere.
+  - A page that fails to flush makes the checkpoint flush again, keeping its
+    redo point. Before, the page was counted as flushed and the checkpoint
+    finalized over a change that was on disk in neither the heap nor the WAL.
+
+  No production path marks a heap page dirty today (`PageCache::mark_dirty`
+  has no callers outside tests), so this closes the hazard before the first
+  in-place cold-page write can reach it. Pinned by four
+  `shard::persistence_tick` tests: three were red before the change, and a
+  fourth covers the fsync-error poison.
+
 - **`maxmemory` is one cap again once keys have spilled to disk** (moon#1036).
   Since K4, the 100 ms pressure cascade has held each database to hot bytes
   PLUS its cold index's RAM. The per-write gates did not: the inline `SET`

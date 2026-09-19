@@ -8,9 +8,26 @@
 //! 1. `begin(current_lsn, dirty_count)` — record REDO_LSN, compute pages_per_tick
 //! 2. `advance_tick()` returns `FlushPages(n)` until all dirty pages flushed
 //! 3. `advance_tick()` returns `Finalize { redo_lsn }` when all pages done
-//! 4. Caller writes WAL checkpoint record, commits manifest, updates control file
+//! 4. Caller makes every heap data file the flush wrote durable (off-loop
+//!    fsync), then writes the WAL checkpoint record, commits the manifest and
+//!    updates the control file
 //! 5. `complete()` — reset to Idle, reset trigger timer
+//!
+//! Step 4's data-file fsync is what makes advancing the redo point safe: the
+//! control-file update publishes `redo_lsn` as the replay start, and the WAL
+//! recycle that follows deletes every record (and every FullPageImage) below
+//! it. A page that was `pwrite`n but never fsynced lives only in the page
+//! cache of the kernel at that instant, so a power loss after the recycle
+//! would roll the page back with nothing left in the WAL to redo it (#452).
+//! The manager tracks which files need that fsync
+//! ([`note_data_file_written`](CheckpointManager::note_data_file_written)) and
+//! whether any page failed to flush
+//! ([`note_page_flush_failed`](CheckpointManager::note_page_flush_failed)); the
+//! caller refuses to finalize until both are clean.
 
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// Determines when a checkpoint should be triggered.
@@ -131,6 +148,23 @@ pub struct CheckpointManager {
     finalize_retry_at: Option<Instant>,
     /// Consecutive failed finalize attempts, driving exponential backoff.
     finalize_attempts: u32,
+    /// Heap data files (`file_id`s) that a flush has `pwrite`n pages into and
+    /// that no successful fsync has covered yet. Finalize must fsync every
+    /// one of them before it may publish a new redo point.
+    unsynced_data_files: BTreeSet<u64>,
+    /// A page flush step (FPI append, WAL durability wait or data `pwrite`)
+    /// failed during the current checkpoint: some page that was dirty when
+    /// the checkpoint began may be neither on disk nor imaged in the WAL
+    /// above `redo_lsn`, so this checkpoint must not finalize as-is.
+    page_flush_failed: bool,
+    /// Sticky: a data-file fsync returned an error. POSIX leaves the state of
+    /// the dirty pages undefined after a failed fsync and a retry can report
+    /// success for pages that were already dropped (the fsyncgate class), so
+    /// this shard never publishes another redo point — the WAL keeps every
+    /// record and recovery replays from the last good checkpoint. Shared
+    /// with the off-loop sync thread, which may finish after its waiter gave
+    /// up.
+    data_sync_poisoned: Arc<AtomicBool>,
 }
 
 impl CheckpointManager {
@@ -141,6 +175,90 @@ impl CheckpointManager {
             trigger,
             finalize_retry_at: None,
             finalize_attempts: 0,
+            unsynced_data_files: BTreeSet::new(),
+            page_flush_failed: false,
+            data_sync_poisoned: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Record that a flush `pwrite`d a page into heap file `file_id`; the
+    /// file joins the set Finalize must fsync before advancing the redo
+    /// point.
+    pub fn note_data_file_written(&mut self, file_id: u64) {
+        self.unsynced_data_files.insert(file_id);
+    }
+
+    /// Heap data files written since the last successful data-file fsync, in
+    /// ascending `file_id` order.
+    pub fn unsynced_data_files(&self) -> Vec<u64> {
+        self.unsynced_data_files.iter().copied().collect()
+    }
+
+    /// Every file in `synced` is now durable: drop it from the pending set.
+    /// Takes the exact list the caller synced, so a file a concurrent flush
+    /// re-dirtied after the list was taken can never be cleared by accident.
+    pub fn note_data_files_synced(&mut self, synced: &[u64]) {
+        for file_id in synced {
+            self.unsynced_data_files.remove(file_id);
+        }
+    }
+
+    /// Record that a page flush step failed this checkpoint (see
+    /// `page_flush_failed`).
+    pub fn note_page_flush_failed(&mut self) {
+        self.page_flush_failed = true;
+    }
+
+    /// Whether a page flush step failed since the checkpoint's flush phase
+    /// (re)started.
+    #[inline]
+    pub fn page_flush_failed(&self) -> bool {
+        self.page_flush_failed
+    }
+
+    /// Re-run the flush phase of the CURRENT checkpoint over the pages that
+    /// are still dirty, keeping its `redo_lsn`. Used when a page failed to
+    /// flush: the pages that failed are still dirty (and still FPI-pending),
+    /// so flushing them again completes the checkpoint's contract without
+    /// giving up the redo point it began with. No-op while idle.
+    pub fn restart_flush(&mut self, dirty_count: usize) {
+        let redo_lsn = match self.state {
+            CheckpointState::Idle => return,
+            CheckpointState::InProgress { redo_lsn, .. }
+            | CheckpointState::Finalizing { redo_lsn } => redo_lsn,
+        };
+        self.page_flush_failed = false;
+        self.state = self.flush_state(redo_lsn, dirty_count);
+    }
+
+    /// Handle for the off-loop data-file sync to poison this manager on an
+    /// fsync error (see `data_sync_poisoned`).
+    pub fn data_sync_poison(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.data_sync_poisoned)
+    }
+
+    /// Whether a data-file fsync ever failed on this shard.
+    #[inline]
+    pub fn is_data_sync_poisoned(&self) -> bool {
+        self.data_sync_poisoned.load(Ordering::Acquire)
+    }
+
+    /// The state a flush phase starts in for `dirty_count` pages.
+    fn flush_state(&self, redo_lsn: u64, dirty_count: usize) -> CheckpointState {
+        // If no dirty pages, go straight to Finalizing (still need WAL record + manifest)
+        if dirty_count == 0 {
+            return CheckpointState::Finalizing { redo_lsn };
+        }
+        // Compute how many ticks we have to spread the page flushes over.
+        // ticks = timeout_secs * completion_fraction * 1000 (since tick is 1ms)
+        let ticks =
+            (self.trigger.timeout_secs as f64 * self.trigger.completion_fraction * 1000.0) as usize;
+        let pages_per_tick = (dirty_count / ticks.max(1)).clamp(1, 16);
+        CheckpointState::InProgress {
+            redo_lsn,
+            dirty_count,
+            flushed: 0,
+            pages_per_tick,
         }
     }
 
@@ -182,27 +300,8 @@ impl CheckpointManager {
         if self.state != CheckpointState::Idle {
             return false;
         }
-
-        // If no dirty pages, go straight to Finalizing (still need WAL record + manifest)
-        if dirty_count == 0 {
-            self.state = CheckpointState::Finalizing {
-                redo_lsn: current_lsn,
-            };
-            return true;
-        }
-
-        // Compute how many ticks we have to spread the page flushes over.
-        // ticks = timeout_secs * completion_fraction * 1000 (since tick is 1ms)
-        let ticks =
-            (self.trigger.timeout_secs as f64 * self.trigger.completion_fraction * 1000.0) as usize;
-        let pages_per_tick = (dirty_count / ticks.max(1)).clamp(1, 16);
-
-        self.state = CheckpointState::InProgress {
-            redo_lsn: current_lsn,
-            dirty_count,
-            flushed: 0,
-            pages_per_tick,
-        };
+        self.page_flush_failed = false;
+        self.state = self.flush_state(current_lsn, dirty_count);
         true
     }
 
@@ -248,6 +347,7 @@ impl CheckpointManager {
     /// and control file update are all done.
     pub fn complete(&mut self) {
         self.state = CheckpointState::Idle;
+        self.page_flush_failed = false;
         self.trigger.reset();
         self.reset_finalize_backoff();
     }
@@ -287,6 +387,63 @@ mod tests {
 
     fn make_trigger(timeout_secs: u64, max_wal_bytes: u64, completion: f64) -> CheckpointTrigger {
         CheckpointTrigger::new(timeout_secs, max_wal_bytes, completion)
+    }
+
+    /// A page flush failure re-runs the flush phase of the SAME checkpoint:
+    /// the redo point it began with is kept, the failure flag clears.
+    #[test]
+    fn restart_flush_keeps_the_redo_point() {
+        let mut mgr = CheckpointManager::new(make_trigger(300, u64::MAX, 0.9));
+        assert!(mgr.begin(42, 1));
+        assert_eq!(mgr.advance_tick(), CheckpointAction::FlushPages(1));
+        mgr.note_page_flush_failed();
+        assert!(mgr.page_flush_failed());
+        assert_eq!(
+            mgr.advance_tick(),
+            CheckpointAction::Finalize { redo_lsn: 42 }
+        );
+
+        mgr.restart_flush(1);
+        assert!(!mgr.page_flush_failed());
+        assert_eq!(mgr.advance_tick(), CheckpointAction::FlushPages(1));
+        assert_eq!(
+            mgr.advance_tick(),
+            CheckpointAction::Finalize { redo_lsn: 42 }
+        );
+
+        // Nothing left dirty: straight back to Finalizing, same redo point.
+        mgr.restart_flush(0);
+        assert_eq!(
+            mgr.advance_tick(),
+            CheckpointAction::Finalize { redo_lsn: 42 }
+        );
+
+        mgr.complete();
+        mgr.restart_flush(5);
+        assert_eq!(
+            mgr.advance_tick(),
+            CheckpointAction::Nothing,
+            "no-op while idle"
+        );
+    }
+
+    /// Written heap files stay pending until a sync covering exactly them is
+    /// reported; a file written after the list was taken stays pending.
+    #[test]
+    fn unsynced_data_files_clear_only_what_was_synced() {
+        let mut mgr = CheckpointManager::new(make_trigger(300, u64::MAX, 0.9));
+        mgr.note_data_file_written(3);
+        mgr.note_data_file_written(1);
+        mgr.note_data_file_written(3);
+        let taken = mgr.unsynced_data_files();
+        assert_eq!(taken, vec![1, 3]);
+        mgr.note_data_file_written(2);
+        mgr.note_data_files_synced(&taken);
+        assert_eq!(mgr.unsynced_data_files(), vec![2]);
+        assert!(!mgr.is_data_sync_poisoned());
+        mgr.data_sync_poison()
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(mgr.is_data_sync_poisoned());
     }
 
     #[test]
