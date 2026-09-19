@@ -707,21 +707,35 @@ pub fn try_wake_zset_waiter(
 /// (and, through them, the moves they chain into), zset pops, stream reads.
 /// Returns true if a blocked client was answered.
 ///
-/// A key holds one type, so at most one family is ever served; the others find
-/// the key of the wrong type and leave their waiters parked where they were,
+/// A key holds one type, so exactly one family's waker runs — the one the key
+/// now holds — and every other family's waiters stay parked where they were,
 /// which is redis's behaviour for a key that became the wrong type under a
 /// waiter (measured against redis-server 8.6.1: `RENAME` a zset onto a key a
 /// `BLPOP` is parked on leaves the `BLPOP` parked until its own timeout).
+///
+/// Dispatching on the type, rather than offering the key to all three wakers,
+/// is what keeps this O(1) in the waiters of the OTHER families: the zset and
+/// stream wakers each walk the key's queue looking for their own family, and a
+/// hot queue key with ten thousand parked `BLPOP`s would otherwise pay two
+/// full queue scans on every `LPUSH`. Read-only probes (moon#832); a key that
+/// is absent or of a type no waiter can use (a string, a hash, a set) wakes
+/// nobody.
 pub fn wake_key(
     registry: &mut BlockingRegistry,
     db: &mut Database,
     db_index: usize,
     key: &Bytes,
 ) -> bool {
-    let list = try_wake_list_waiter(registry, db, db_index, key);
-    let zset = try_wake_zset_waiter(registry, db, db_index, key);
-    let stream = try_wake_stream_waiter(registry, db, db_index, key);
-    list | zset | stream
+    let now_ms = db.now_ms();
+    if matches!(db.get_list_ref_if_alive(key, now_ms), Ok(Some(_))) {
+        try_wake_list_waiter(registry, db, db_index, key)
+    } else if matches!(db.get_sorted_set_ref_if_alive(key, now_ms), Ok(Some(_))) {
+        try_wake_zset_waiter(registry, db, db_index, key)
+    } else if matches!(db.get_stream_if_alive(key, now_ms), Ok(Some(_))) {
+        try_wake_stream_waiter(registry, db, db_index, key)
+    } else {
+        false
+    }
 }
 
 /// The one write→waiter hook: after a write command succeeded in `db_index`,
@@ -1892,5 +1906,35 @@ mod wake_written_keys_tests {
             vec![(0, Bytes::from_static(b"q")), (2, Bytes::from_static(b"z"))]
         );
         assert!(take_script_writes().is_empty());
+    }
+
+    /// `wake_key` on a list key serves its `BLPOP` and leaves a `BZPOPMIN`
+    /// parked ahead of it in the same queue, unanswered and in place. (That it
+    /// does so WITHOUT scanning the queue for zset and stream waiters is a
+    /// cost, not a behaviour, and is not observable here.)
+    #[test]
+    fn wake_key_leaves_other_families_parked_in_place() {
+        let mut db = Database::new();
+        let reg = RefCell::new(BlockingRegistry::new(0));
+        let zpop = park(&reg, "k", 1, BlockedCommand::BZPopMin);
+        let lpop = park(&reg, "k", 2, BlockedCommand::BLPop);
+        let _ = crate::command::list::rpush(&mut db, &args(&["k", "v"]));
+        assert!(wake_key(
+            &mut reg.borrow_mut(),
+            &mut db,
+            0,
+            &Bytes::from_static(b"k")
+        ));
+        assert!(served(&lpop).is_some(), "the list waiter was not served");
+        assert!(
+            served(&zpop).is_none(),
+            "a zset waiter answered from a list"
+        );
+        let reg = reg.borrow();
+        let queue = reg
+            .waiters_on(0, &Bytes::from_static(b"k"))
+            .expect("the zset waiter is still queued");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].wait_id, 1);
     }
 }
