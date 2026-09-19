@@ -2319,6 +2319,7 @@ pub(crate) fn handle_shard_message_shared(
                 wait_id,
                 cmd,
                 reply_tx,
+                claim,
             } = *payload;
             // moon#556: THIS shard owns the key, so it is the only one that
             // can answer the type question for it. A blocking pop on an
@@ -2357,8 +2358,13 @@ pub(crate) fn handle_shard_message_shared(
             });
             if let Some(err) = type_error {
                 // Never registered, so there is nothing to unwind: the
-                // client's `BlockCancel` on the way out is a no-op.
-                let _ = reply_tx.send(Some(err));
+                // client's `BlockCancel` on the way out is a no-op. The error
+                // is an answer like any other, so it is sent only on a won
+                // claim (moon#1023): a waiter that already gave up has its
+                // reply, and must not find a second one in flight.
+                if claim.try_claim() {
+                    let _ = reply_tx.send(Some(err));
+                }
                 return;
             }
             // moon#595: bind this waiter's `$` against the stream as THIS
@@ -2376,6 +2382,7 @@ pub(crate) fn handle_shard_message_shared(
                 cmd,
                 reply_tx,
                 deadline: None, // Remote registrations don't manage timeout locally
+                claim: Some(claim),
             };
             let mut reg = blocking_registry.borrow_mut();
             reg.register(db_index, key.clone(), entry);
@@ -2391,9 +2398,11 @@ pub(crate) fn handle_shard_message_shared(
             });
         }
         ShardMessage::BlockRegisterGroup(payload) => {
-            // moon#989: every key this shard owns of one multi-key waiter, in
-            // ONE message — so registering, type-checking and serving them is
-            // one synchronous stretch and the waiter is served at most once.
+            // moon#989: one run of keys this shard owns of one multi-key
+            // waiter, in ONE message — so registering, type-checking and
+            // serving them is one synchronous stretch and the waiter is served
+            // at most once here; its claim token (moon#1019) makes that "at
+            // most once" hold across shards too.
             let db_index = payload.db_index;
             let mut reg = blocking_registry.borrow_mut();
             crate::shard::slice::with_shard_db(db_index, |guard| {
@@ -2402,6 +2411,20 @@ pub(crate) fn handle_shard_message_shared(
         }
         ShardMessage::BlockCancel { wait_id } => {
             blocking_registry.borrow_mut().remove_wait(wait_id);
+        }
+        ShardMessage::BlockRestore(payload) => {
+            // moon#1023: a serve this shard committed reached a client that
+            // was already gone. Put the element back and offer it to whoever
+            // else is parked on the key.
+            let crate::shard::dispatch::BlockRestorePayload {
+                db_index,
+                key,
+                undo,
+            } = *payload;
+            let mut reg = blocking_registry.borrow_mut();
+            crate::shard::slice::with_shard_db(db_index, |guard| {
+                crate::blocking::wakeup::restore_and_rewake(&mut reg, guard, db_index, &key, undo);
+            });
         }
         ShardMessage::GetKeysInSlot {
             db_index,

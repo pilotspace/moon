@@ -24,7 +24,7 @@ use super::util::extract_bytes;
 /// shard that owns its key. Fails the command instead of the two silent
 /// alternatives the old code had: replying nil at t=0 (protocol violation) or
 /// blocking forever on a key nobody is watching.
-const BLOCK_REGISTER_FAILED: &[u8] =
+pub(super) const BLOCK_REGISTER_FAILED: &[u8] =
     b"MOONERR blocking registration failed: owning shard not draining";
 
 /// What a blocking command produced.
@@ -185,7 +185,7 @@ async fn peer_wake_ends_wait_monoio<S: monoio::io::AsyncReadRent>(
 /// the plane-wide bound.
 ///
 /// Returns `false` if the message could not be delivered.
-async fn push_block_msg(
+pub(super) async fn push_block_msg(
     shutdown: &CancellationToken,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     my_shard: usize,
@@ -287,6 +287,10 @@ async fn cancel_multikey_registrations(
         }
     }
 }
+
+use super::blocking_multikey::{
+    BlockCtx, WaitEnd, finish_unserved, register_runs, settle_delay_for_test,
+};
 
 /// The full set of client-blocking commands (the ones whose handler may
 /// early-flush accumulated responses and await outside the batch loop).
@@ -468,13 +472,27 @@ where
 
     let deadline = deadline_after(timeout_secs);
 
+    let ctx = BlockCtx {
+        selected_db,
+        blocking_registry,
+        shard_id,
+        num_shards,
+        dispatch_tx,
+        shutdown,
+        notifiers: None,
+    };
+
     // --- Single-key fast path: one registration, direct await (zero overhead) ---
     if keys.len() == 1 {
         let target = key_to_shard(&keys[0], num_shards);
         let is_remote = target != shard_id;
         let (reply_tx, mut reply_rx) = channel::oneshot::<Option<Frame>>();
         let wait_id = blocking_registry.borrow_mut().next_wait_id();
-        if is_remote {
+        // moon#1023: a remote owner serves on another thread, so the wait can
+        // end while a serve is in flight. The token decides which happened.
+        // A local waiter needs none: this thread is the only one serving it.
+        let claim = is_remote.then(crate::blocking::ClaimToken::new);
+        if let Some(token) = &claim {
             // Remote registration via SPSC — bounded and shutdown-aware
             // (A4/A5). The borrow above is released before this await.
             let msg = ShardMessage::BlockRegister(Box::new(
@@ -484,6 +502,7 @@ where
                     wait_id,
                     cmd: blocked_cmd_factory(),
                     reply_tx,
+                    claim: token.clone(),
                 },
             ));
             if !push_block_msg(shutdown, dispatch_tx, shard_id, target, msg, None).await {
@@ -498,6 +517,7 @@ where
                 cmd: local_blocked_cmd(&blocked_cmd_factory, selected_db, &keys[0]),
                 reply_tx,
                 deadline,
+                claim: None,
             };
             blocking_registry
                 .borrow_mut()
@@ -510,29 +530,22 @@ where
         // the block resolves. `&mut reply_rx` is re-selected across turns
         // safely: `OneshotReceiver` caches its inner `flume` future, so the
         // waker registration survives and no wake-up is lost.
-        let result = if let Some(dl) = deadline {
+        let ended: Result<Frame, WaitEnd> = if let Some(dl) = deadline {
             let sleep = tokio::time::sleep(dl.saturating_duration_since(std::time::Instant::now()));
             tokio::pin!(sleep);
             loop {
                 tokio::select! {
                     res = &mut reply_rx => {
                         break match res {
-                            Ok(Some(frame)) => Some(frame),
-                            Ok(None) | Err(_) => Some(Frame::NullArray),
+                            Ok(Some(frame)) => Ok(frame),
+                            Ok(None) | Err(_) => Ok(Frame::NullArray),
                         };
                     }
-                    _ = &mut sleep => {
-                        blocking_registry.borrow_mut().remove_wait(wait_id);
-                        break Some(Frame::NullArray);
-                    }
-                    _ = shutdown.cancelled() => {
-                        blocking_registry.borrow_mut().remove_wait(wait_id);
-                        break Some(Frame::Error(Bytes::from_static(b"ERR server shutting down")));
-                    }
+                    _ = &mut sleep => break Err(WaitEnd::Timeout),
+                    _ = shutdown.cancelled() => break Err(WaitEnd::Shutdown),
                     read = stream.read_buf(carry) => {
                         if peer_wake_ends_wait(read, carry) {
-                            blocking_registry.borrow_mut().remove_wait(wait_id);
-                            break None;
+                            break Err(WaitEnd::PeerGone);
                         }
                     }
                 }
@@ -542,21 +555,32 @@ where
                 tokio::select! {
                     res = &mut reply_rx => {
                         break match res {
-                            Ok(Some(frame)) => Some(frame),
-                            Ok(None) | Err(_) => Some(Frame::NullArray),
+                            Ok(Some(frame)) => Ok(frame),
+                            Ok(None) | Err(_) => Ok(Frame::NullArray),
                         };
                     }
-                    _ = shutdown.cancelled() => {
-                        blocking_registry.borrow_mut().remove_wait(wait_id);
-                        break Some(Frame::Error(Bytes::from_static(b"ERR server shutting down")));
-                    }
+                    _ = shutdown.cancelled() => break Err(WaitEnd::Shutdown),
                     read = stream.read_buf(carry) => {
                         if peer_wake_ends_wait(read, carry) {
-                            blocking_registry.borrow_mut().remove_wait(wait_id);
-                            break None;
+                            break Err(WaitEnd::PeerGone);
                         }
                     }
                 }
+            }
+        };
+        let outcome = match ended {
+            Ok(frame) => BlockingOutcome::Reply(frame),
+            Err(end) => {
+                // Same synchronous stretch as the arm that ended the wait: a
+                // local waiter is unregistered before anything else can run.
+                blocking_registry.borrow_mut().remove_wait(wait_id);
+                settle_delay_for_test().await;
+                let served = super::blocking_multikey::settle(
+                    claim.as_ref(),
+                    &mut futures::stream::once(&mut reply_rx),
+                )
+                .await;
+                finish_unserved(&ctx, end, served, &*blocked_cmd_factory, &keys).await
             }
         };
         // Cleanup remote registration on timeout/shutdown.
@@ -591,25 +615,21 @@ where
         // A1: the cancel above runs for a vanished peer too — that is the
         // whole point. Leaving the owner-side `WaitEntry` behind is what made
         // a disconnected `BLPOP key 0` unreapable.
-        return match result {
-            Some(frame) => BlockingOutcome::Reply(frame),
-            None => BlockingOutcome::PeerGone,
-        };
+        return outcome;
     }
 
     // --- Multi-key coordinator: register on ALL keys across local + remote shards ---
-    // Uses FuturesUnordered for first-wakeup-wins semantics. moon#989: remote
-    // keys travel as ONE group per owner shard — the owner serves this waiter
-    // at most once only because it sees all of its keys in one message. See
-    // `blocking_multikey` for the protocol and what it does not cover.
+    // Uses FuturesUnordered for first-wakeup-wins semantics. See
+    // `blocking_multikey` for the protocol: runs in argument order, one claim
+    // token per waiter with any remote key (moon#989, moon#1019).
     //
     // A4/A5: every registration is built under one borrow and the remote ones
     // are STAGED, pushed only after the borrow is released.
     let super::blocking_multikey::StagedWait {
         wait_id,
         mut receivers,
-        pending_remote,
-        remote_shards: registered_remote_shards,
+        claim,
+        pending_runs,
     } = super::blocking_multikey::stage_multikey_wait(
         &mut blocking_registry.borrow_mut(),
         &keys,
@@ -624,81 +644,77 @@ where
     // A5: a silently dropped registration leaves this waiter blocked on a key
     // nobody is watching — it would sleep through data that IS available.
     // Fail the whole command instead, after unwinding what did register.
-    let mut registration_failed = false;
-    for (target, msg) in pending_remote {
-        if !push_block_msg(shutdown, dispatch_tx, shard_id, target, msg, None).await {
-            registration_failed = true;
-            break;
+    let mut registered_remote_shards: Vec<usize> = Vec::new();
+    let registered = match &claim {
+        Some(token) => {
+            register_runs(
+                &ctx,
+                wait_id,
+                token,
+                pending_runs,
+                &mut registered_remote_shards,
+            )
+            .await
         }
-    }
-    if registration_failed {
-        cancel_multikey_registrations(
-            shutdown,
-            blocking_registry,
-            dispatch_tx,
-            shard_id,
-            wait_id,
-            &registered_remote_shards,
-            None,
-        )
-        .await;
-        drop(receivers);
-        return BlockingOutcome::Reply(Frame::Error(Bytes::from_static(BLOCK_REGISTER_FAILED)));
-    }
+        None => true,
+    };
 
     // Await first successful result from any key/shard.
     // FuturesUnordered may return Err (sender dropped by remove_wait cleanup) before
     // returning the successful Ok. We must skip Err/None results and keep polling.
     //
-    // A1: `peer_gone` breaks the same loop as every other terminal condition,
+    // A1: `PeerGone` ends the same loop as every other terminal condition,
     // so the shared cleanup below runs identically — a vanished multi-key
     // waiter unwinds ALL of its registrations, local and remote.
-    let mut peer_gone = false;
-    let frame = if let Some(dl) = deadline {
+    let ended: Result<Frame, WaitEnd> = if !registered {
+        Err(WaitEnd::RegisterFailed)
+    } else if let Some(dl) = deadline {
         let sleep = tokio::time::sleep(dl.saturating_duration_since(std::time::Instant::now()));
         tokio::pin!(sleep);
-        let mut result_frame = Frame::NullArray;
         loop {
             tokio::select! {
                 result = receivers.next() => {
                     match result {
-                        Some(Ok(Some(frame))) => { result_frame = frame; break; }
+                        Some(Ok(Some(frame))) => break Ok(frame),
                         Some(Ok(None)) | Some(Err(_)) => continue, // cancelled/dropped, try next
-                        None => break, // all receivers exhausted
+                        None => break Err(WaitEnd::Timeout), // all receivers exhausted
                     }
                 }
-                _ = &mut sleep => break,
-                _ = shutdown.cancelled() => {
-                    result_frame = Frame::Error(Bytes::from_static(b"ERR server shutting down"));
-                    break;
-                }
+                _ = &mut sleep => break Err(WaitEnd::Timeout),
+                _ = shutdown.cancelled() => break Err(WaitEnd::Shutdown),
                 read = stream.read_buf(carry) => {
-                    if peer_wake_ends_wait(read, carry) { peer_gone = true; break; }
+                    if peer_wake_ends_wait(read, carry) { break Err(WaitEnd::PeerGone); }
                 }
             }
         }
-        result_frame
     } else {
-        let mut result_frame = Frame::NullArray;
         loop {
             tokio::select! {
                 result = receivers.next() => {
                     match result {
-                        Some(Ok(Some(frame))) => { result_frame = frame; break; }
+                        Some(Ok(Some(frame))) => break Ok(frame),
                         Some(Ok(None)) | Some(Err(_)) => continue, // cancelled/dropped, try next
-                        None => break,
+                        None => break Err(WaitEnd::Timeout),
                     }
                 }
-                _ = shutdown.cancelled() => {
-                    result_frame = Frame::Error(Bytes::from_static(b"ERR server shutting down"));
-                    break;
-                }
+                _ = shutdown.cancelled() => break Err(WaitEnd::Shutdown),
                 read = stream.read_buf(carry) => {
-                    if peer_wake_ends_wait(read, carry) { peer_gone = true; break; }
+                    if peer_wake_ends_wait(read, carry) { break Err(WaitEnd::PeerGone); }
                 }
             }
         }
-        result_frame
+    };
+
+    let outcome = match ended {
+        Ok(frame) => BlockingOutcome::Reply(frame),
+        Err(end) => {
+            // Local registrations go first, in the same synchronous stretch
+            // as the arm that ended the wait; then the token (moon#1023).
+            blocking_registry.borrow_mut().remove_wait(wait_id);
+            settle_delay_for_test().await;
+            let served = super::blocking_multikey::settle(claim.as_ref(), &mut receivers).await;
+            finish_unserved(&ctx, end, served, &*blocked_cmd_factory, &keys).await
+        }
     };
 
     // Cleanup: cancel all remaining registrations (local + remote)
@@ -712,14 +728,10 @@ where
         None,
     )
     .await;
-    // Drop remaining receivers; remote senders get Err on send -- harmless
+    // Every receiver is settled: either a reply was taken, or the claim token
+    // is closed so no shard can send one (see `blocking_multikey::settle`).
     drop(receivers);
-
-    if peer_gone {
-        BlockingOutcome::PeerGone
-    } else {
-        BlockingOutcome::Reply(frame)
-    }
+    outcome
 }
 
 /// Monoio version of handle_blocking_command.
@@ -790,13 +802,25 @@ where
 
     let deadline = deadline_after(timeout_secs);
 
+    let ctx = BlockCtx {
+        selected_db,
+        blocking_registry,
+        shard_id,
+        num_shards,
+        dispatch_tx,
+        shutdown,
+        notifiers: Some(spsc_notifiers),
+    };
+
     // --- Single-key fast path: one registration, direct await (zero overhead) ---
     if keys.len() == 1 {
         let target = key_to_shard(&keys[0], num_shards);
         let is_remote = target != shard_id;
         let (reply_tx, mut reply_rx) = channel::oneshot::<Option<Frame>>();
         let wait_id = blocking_registry.borrow_mut().next_wait_id();
-        if is_remote {
+        // moon#1023: see the tokio twin — only a remote owner needs a token.
+        let claim = is_remote.then(crate::blocking::ClaimToken::new);
+        if let Some(token) = &claim {
             // A4: the old `loop { try_push; sleep(10µs) }` had no retry cap
             // and no shutdown arm — a saturated owner turned this into a
             // zombie connection that also blocked graceful shutdown.
@@ -807,6 +831,7 @@ where
                     wait_id,
                     cmd: blocked_cmd_factory(),
                     reply_tx,
+                    claim: token.clone(),
                 },
             ));
             if !push_block_msg(
@@ -829,6 +854,7 @@ where
                 cmd: local_blocked_cmd(&blocked_cmd_factory, selected_db, &keys[0]),
                 reply_tx,
                 deadline,
+                claim: None,
             };
             blocking_registry
                 .borrow_mut()
@@ -838,7 +864,7 @@ where
         // A1: see the tokio twin for why these are loops. The peer arm only
         // awaits READINESS; the read that follows happens after the select!
         // has already resolved, where no cancellation can reach it.
-        let result = if let Some(dl) = deadline {
+        let ended: Result<Frame, WaitEnd> = if let Some(dl) = deadline {
             let mut sleep = std::pin::pin!(monoio::time::sleep(
                 dl.saturating_duration_since(std::time::Instant::now())
             ));
@@ -846,23 +872,16 @@ where
                 let ready = monoio::select! {
                     res = &mut reply_rx => {
                         break match res {
-                            Ok(Some(frame)) => Some(frame),
-                            Ok(None) | Err(_) => Some(Frame::NullArray),
+                            Ok(Some(frame)) => Ok(frame),
+                            Ok(None) | Err(_) => Ok(Frame::NullArray),
                         };
                     }
-                    _ = &mut sleep => {
-                        blocking_registry.borrow_mut().remove_wait(wait_id);
-                        break Some(Frame::NullArray);
-                    }
-                    _ = shutdown.cancelled() => {
-                        blocking_registry.borrow_mut().remove_wait(wait_id);
-                        break Some(Frame::Error(Bytes::from_static(b"ERR server shutting down")));
-                    }
+                    _ = &mut sleep => break Err(WaitEnd::Timeout),
+                    _ = shutdown.cancelled() => break Err(WaitEnd::Shutdown),
                     r = stream.peer_readable() => r,
                 };
                 if peer_wake_ends_wait_monoio(ready, stream, &mut peer_scratch, carry).await {
-                    blocking_registry.borrow_mut().remove_wait(wait_id);
-                    break None;
+                    break Err(WaitEnd::PeerGone);
                 }
             }
         } else {
@@ -870,20 +889,31 @@ where
                 let ready = monoio::select! {
                     res = &mut reply_rx => {
                         break match res {
-                            Ok(Some(frame)) => Some(frame),
-                            Ok(None) | Err(_) => Some(Frame::NullArray),
+                            Ok(Some(frame)) => Ok(frame),
+                            Ok(None) | Err(_) => Ok(Frame::NullArray),
                         };
                     }
-                    _ = shutdown.cancelled() => {
-                        blocking_registry.borrow_mut().remove_wait(wait_id);
-                        break Some(Frame::Error(Bytes::from_static(b"ERR server shutting down")));
-                    }
+                    _ = shutdown.cancelled() => break Err(WaitEnd::Shutdown),
                     r = stream.peer_readable() => r,
                 };
                 if peer_wake_ends_wait_monoio(ready, stream, &mut peer_scratch, carry).await {
-                    blocking_registry.borrow_mut().remove_wait(wait_id);
-                    break None;
+                    break Err(WaitEnd::PeerGone);
                 }
+            }
+        };
+        let outcome = match ended {
+            Ok(frame) => BlockingOutcome::Reply(frame),
+            Err(end) => {
+                // A local waiter is unregistered in the same synchronous
+                // stretch that ended the wait; see the tokio twin.
+                blocking_registry.borrow_mut().remove_wait(wait_id);
+                settle_delay_for_test().await;
+                let served = super::blocking_multikey::settle(
+                    claim.as_ref(),
+                    &mut futures::stream::once(&mut reply_rx),
+                )
+                .await;
+                finish_unserved(&ctx, end, served, &*blocked_cmd_factory, &keys).await
             }
         };
         if is_remote {
@@ -899,25 +929,21 @@ where
             )
             .await;
         }
-        return match result {
-            Some(frame) => BlockingOutcome::Reply(frame),
-            None => BlockingOutcome::PeerGone,
-        };
+        return outcome;
     }
 
     // --- Multi-key coordinator: register on ALL keys across local + remote shards ---
-    // Uses FuturesUnordered for first-wakeup-wins semantics. moon#989: remote
-    // keys travel as ONE group per owner shard — the owner serves this waiter
-    // at most once only because it sees all of its keys in one message. See
-    // `blocking_multikey` for the protocol and what it does not cover.
+    // Uses FuturesUnordered for first-wakeup-wins semantics. See
+    // `blocking_multikey` for the protocol: runs in argument order, one claim
+    // token per waiter with any remote key (moon#989, moon#1019).
     //
     // A4/A5: every registration is built under one borrow and the remote ones
     // are STAGED, pushed only after the borrow is released.
     let super::blocking_multikey::StagedWait {
         wait_id,
         mut receivers,
-        pending_remote,
-        remote_shards: registered_remote_shards,
+        claim,
+        pending_runs,
     } = super::blocking_multikey::stage_multikey_wait(
         &mut blocking_registry.borrow_mut(),
         &keys,
@@ -929,91 +955,74 @@ where
         deadline,
     ); // borrow dropped -- CRITICAL before await
 
-    let mut registration_failed = false;
-    for (target, msg) in pending_remote {
-        if !push_block_msg(
-            shutdown,
-            dispatch_tx,
-            shard_id,
-            target,
-            msg,
-            Some(&spsc_notifiers[target]),
-        )
-        .await
-        {
-            registration_failed = true;
-            break;
+    let mut registered_remote_shards: Vec<usize> = Vec::new();
+    let registered = match &claim {
+        Some(token) => {
+            register_runs(
+                &ctx,
+                wait_id,
+                token,
+                pending_runs,
+                &mut registered_remote_shards,
+            )
+            .await
         }
-    }
-    if registration_failed {
-        cancel_multikey_registrations(
-            shutdown,
-            blocking_registry,
-            dispatch_tx,
-            shard_id,
-            wait_id,
-            &registered_remote_shards,
-            Some(spsc_notifiers),
-        )
-        .await;
-        drop(receivers);
-        return BlockingOutcome::Reply(Frame::Error(Bytes::from_static(BLOCK_REGISTER_FAILED)));
-    }
+        None => true,
+    };
 
     // Await first successful result from any key/shard.
     // FuturesUnordered may return Err (sender dropped by remove_wait cleanup) before
     // returning the successful Ok. We must skip Err/None results and keep polling.
-    let mut peer_gone = false;
-    let frame = if let Some(dl) = deadline {
+    let ended: Result<Frame, WaitEnd> = if !registered {
+        Err(WaitEnd::RegisterFailed)
+    } else if let Some(dl) = deadline {
         let mut sleep = std::pin::pin!(monoio::time::sleep(
             dl.saturating_duration_since(std::time::Instant::now())
         ));
-        let mut result_frame = Frame::NullArray;
         loop {
             let ready = monoio::select! {
                 result = receivers.next() => {
                     match result {
-                        Some(Ok(Some(frame))) => { result_frame = frame; break; }
+                        Some(Ok(Some(frame))) => break Ok(frame),
                         Some(Ok(None)) | Some(Err(_)) => continue, // cancelled/dropped, try next
-                        None => break, // all receivers exhausted
+                        None => break Err(WaitEnd::Timeout), // all receivers exhausted
                     }
                 }
-                _ = &mut sleep => break,
-                _ = shutdown.cancelled() => {
-                    result_frame = Frame::Error(Bytes::from_static(b"ERR server shutting down"));
-                    break;
-                }
+                _ = &mut sleep => break Err(WaitEnd::Timeout),
+                _ = shutdown.cancelled() => break Err(WaitEnd::Shutdown),
                 r = stream.peer_readable() => r,
             };
             if peer_wake_ends_wait_monoio(ready, stream, &mut peer_scratch, carry).await {
-                peer_gone = true;
-                break;
+                break Err(WaitEnd::PeerGone);
             }
         }
-        result_frame
     } else {
-        let mut result_frame = Frame::NullArray;
         loop {
             let ready = monoio::select! {
                 result = receivers.next() => {
                     match result {
-                        Some(Ok(Some(frame))) => { result_frame = frame; break; }
+                        Some(Ok(Some(frame))) => break Ok(frame),
                         Some(Ok(None)) | Some(Err(_)) => continue, // cancelled/dropped, try next
-                        None => break,
+                        None => break Err(WaitEnd::Timeout),
                     }
                 }
-                _ = shutdown.cancelled() => {
-                    result_frame = Frame::Error(Bytes::from_static(b"ERR server shutting down"));
-                    break;
-                }
+                _ = shutdown.cancelled() => break Err(WaitEnd::Shutdown),
                 r = stream.peer_readable() => r,
             };
             if peer_wake_ends_wait_monoio(ready, stream, &mut peer_scratch, carry).await {
-                peer_gone = true;
-                break;
+                break Err(WaitEnd::PeerGone);
             }
         }
-        result_frame
+    };
+
+    let outcome = match ended {
+        Ok(frame) => BlockingOutcome::Reply(frame),
+        Err(end) => {
+            blocking_registry.borrow_mut().remove_wait(wait_id);
+            settle_delay_for_test().await;
+            let served = super::blocking_multikey::settle(claim.as_ref(), &mut receivers).await;
+            finish_unserved(&ctx, end, served, &*blocked_cmd_factory, &keys).await
+        }
     };
 
     // Cleanup: cancel all remaining registrations (local + remote)
@@ -1027,14 +1036,9 @@ where
         Some(spsc_notifiers),
     )
     .await;
-    // Drop remaining receivers; remote senders get Err on send -- harmless
+    // Every receiver is settled — see the tokio twin.
     drop(receivers);
-
-    if peer_gone {
-        BlockingOutcome::PeerGone
-    } else {
-        BlockingOutcome::Reply(frame)
-    }
+    outcome
 }
 
 /// Parse timeout from a blocking command.
@@ -2027,8 +2031,15 @@ pub(crate) fn immediate_scan(
         // can only produce a wrong answer from a stale look-alike, and since
         // moon#556 that includes inventing a `-WRONGTYPE` for a key whose real
         // owner holds the right type.
+        //
+        // moon#1019: and it STOPS there rather than skipping ahead. Redis
+        // serves the first non-empty key in argument order; a later local key
+        // can only be decided once every earlier key's owner has looked, which
+        // is what the coordinator's run-by-run registration does
+        // (`blocking_multikey`). Popping a later local key here served the
+        // wrong key whenever an earlier remote one held data.
         if num_shards > 1 && key_to_shard(key, num_shards) != shard_id {
-            continue;
+            break;
         }
         // moon#556: the type gate runs BEFORE the pop attempt and before any
         // registration, so a wrong-typed key is an error rather than a wait.

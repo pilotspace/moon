@@ -192,6 +192,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covered:** an AOF written before this change has no head, and replays
   ungated until its first rewrite. Run `BGREWRITEAOF` once after upgrading a
   tokio `--shards 1` deployment that uses disk offload.
+- **A multi-key `BLPOP`/`BRPOP`/`BZPOPMIN`/`BZPOPMAX` whose keys span shards
+  pops exactly one element, from the first non-empty key in argument order**
+  (moon#1019). At `--shards > 1` such a command could pop the WRONG key (the
+  client's shard served a later key it owned over an earlier non-empty key
+  another shard owned) or pop on two or three shards at once and deliver one
+  reply, destroying the other elements. These commands keep working across
+  shards — an untagged `BLPOP q1 q2 q3 0` worker loop is not refused — and now
+  answer as standalone Redis does, including `-WRONGTYPE` for the first
+  existing key of the wrong type. A waiter registered on several shards carries
+  one claim token: a shard pops, must then win the token before it answers,
+  and puts the element back in the same step if it loses. The keys are
+  registered in argument order, one run of same-shard keys at a time, and each
+  run is acknowledged before the next, so a later key never answers ahead of an
+  earlier non-empty one. This costs one extra round trip per remote run that is
+  not the last. Co-located keys and single-key waits pay nothing extra, and a
+  waiter whose keys all live on its own shard carries no token. Measured at
+  `--shards 4` (`tests/blocking_spanning_claim.rs`, macOS, both runtimes, before
+  → after): immediate pops differing from Redis 91/192 (monoio) and 95/192
+  (tokio) → 0/192; the `-WRONGTYPE` ladder skipped 14/16 and 10/16 → 0/16;
+  concurrent pushes to three owners destroyed elements in 39/80 and 64/80
+  waits → 0/80.
+- **A blocking pop no longer loses an element that is served as its timeout,
+  disconnect or shutdown fires** (moon#1023). The wait path sent `BlockCancel`
+  and dropped its receivers. A serve that landed between the two went into a
+  still-live receiver, so the owner's undo, which runs only when its send
+  fails, never ran, and the element was dropped with the receiver. The waiter
+  now closes its claim token first. If no shard has claimed it, none can any
+  more, and there is nothing to drain. If one has, its reply is taken: it is
+  delivered on a timeout or shutdown (the client was served before the end of
+  the wait was observed), and its element is put back in its key when the
+  client is gone. Measured with a test-only window
+  (`MOON_TEST_BLOCK_SETTLE_DELAY_MS`) at `--shards 4`, both runtimes: a push
+  racing a timeout destroyed its element 13/16 → 0/16, and a push racing a
+  disconnect 14/16 → 0/16.
+- **One push that carries several elements serves every parked waiter those
+  elements cover**, as Redis does. Two clients in `BLPOP k 2` and one
+  `RPUSH k a b` used to answer one waiter and leave the other parked next to
+  `b` until its timeout; now both are answered at once.
 
 - **Scripts queued inside `MULTI` now run at `EXEC`** (moon#894). `EVAL`,
   `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `FCALL` and `FCALL_RO` were answered
@@ -301,10 +339,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BLPOP`, `BZPOPMIN` × 16 tags × 3 server instances, against redis 8.6.1): 139
   of 192 probes destroyed an element before, 0 after; `--shards 1` was and is 0. The client now sends ONE registration per owner shard carrying
   every key it owns, and the owner registers, type-checks and serves them in
-  one synchronous stretch, so a waiter is served at most once there. A
-  spanning `BLPOP`/`BRPOP`/`BZPOPMIN`/`BZPOPMAX` can still be served by two
-  owner shards at once; that placement is unchanged by this fix and is
-  tracked as moon#1019.
+  one synchronous stretch, so a waiter is served at most once there.
 
 - **`ACL SETUSER` implements `allkeys`, `allcommands`, `allchannels` and
   every spelling of the `%R~` / `%W~` / `%RW~` key selectors** (moon#970).

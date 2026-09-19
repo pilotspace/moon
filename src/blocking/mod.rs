@@ -1,5 +1,8 @@
+pub mod claim;
 pub mod group;
 pub mod wakeup;
+
+pub use claim::{ClaimToken, Settled};
 
 use std::collections::{HashMap, VecDeque};
 
@@ -184,6 +187,22 @@ pub struct WaitEntry {
     pub reply_tx: crate::runtime::channel::OneshotSender<Option<Frame>>,
     /// Absolute deadline (None = block forever, 0 timeout).
     pub deadline: Option<std::time::Instant>,
+    /// moon#1019/#1023: the single-winner claim shared by every registration
+    /// of a waiter that is registered on more than one thread. `None` for a
+    /// waiter whose keys all live on its own shard — one thread serves it, so
+    /// it needs no arbitration. See [`claim`].
+    pub claim: Option<ClaimToken>,
+}
+
+impl WaitEntry {
+    /// Nobody can use a serve from this shard any more: the client is gone,
+    /// or (for a waiter registered on several threads) another shard already
+    /// won it or the waiter gave up. Checked BEFORE a waker touches the
+    /// datastore, so a settled waiter never causes a mutation.
+    #[inline]
+    pub fn is_settled(&self) -> bool {
+        self.reply_tx.is_disconnected() || self.claim.as_ref().is_some_and(|c| !c.is_open())
+    }
 }
 
 /// Per-shard blocking registry. Manages FIFO wait queues keyed by (db_index, key).
@@ -519,6 +538,7 @@ mod tests {
             cmd: BlockedCommand::BLPop,
             reply_tx: tx,
             deadline: None,
+            claim: None,
         };
         let key = Bytes::from_static(b"mylist");
         reg.register(0, key.clone(), entry);
@@ -545,6 +565,7 @@ mod tests {
                 cmd: BlockedCommand::BLPop,
                 reply_tx: tx1,
                 deadline: None,
+                claim: None,
             },
         );
 
@@ -558,6 +579,7 @@ mod tests {
                 cmd: BlockedCommand::BRPop,
                 reply_tx: tx2,
                 deadline: None,
+                claim: None,
             },
         );
 
@@ -583,6 +605,7 @@ mod tests {
                 cmd: BlockedCommand::BLPop,
                 reply_tx: tx1,
                 deadline: None,
+                claim: None,
             },
         );
         let (tx2, _rx2) = crate::runtime::channel::oneshot();
@@ -594,6 +617,7 @@ mod tests {
                 cmd: BlockedCommand::BLPop,
                 reply_tx: tx2,
                 deadline: None,
+                claim: None,
             },
         );
 
@@ -628,6 +652,7 @@ mod deadline_heap_tests {
                 cmd: BlockedCommand::BLPop,
                 reply_tx: tx,
                 deadline,
+                claim: None,
             },
         )
     }
@@ -711,6 +736,7 @@ mod deadline_heap_tests {
                     cmd: BlockedCommand::BLPop,
                     reply_tx: tx,
                     deadline,
+                    claim: None,
                 },
             );
         }
@@ -743,6 +769,7 @@ mod deadline_heap_tests {
                     cmd,
                     reply_tx: tx,
                     deadline: None,
+                    claim: None,
                 },
             );
         }
@@ -791,6 +818,7 @@ mod deadline_heap_tests {
                 cmd: BlockedCommand::BZPopMin,
                 reply_tx: tx,
                 deadline: None,
+                claim: None,
             },
         );
         assert!(reg.has_waiters(0, &key), "the queue is NOT empty");
