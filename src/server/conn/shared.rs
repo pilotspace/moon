@@ -302,6 +302,24 @@ impl<'a> TxnLocks<'a> {
     }
 }
 
+/// moon#1069: record, for the post-EXEC wake, the keys a queued write touched
+/// in `db` — only when someone on the shard was blocked when EXEC began and
+/// the command can produce a list, zset or stream at all.
+fn record_exec_wakes(
+    exec_wakes: &mut Vec<(usize, Bytes)>,
+    wake_armed: bool,
+    db: usize,
+    cmd: &[u8],
+    args: &[Frame],
+) {
+    if !wake_armed || !crate::blocking::wakeup::may_ready_a_key(cmd) {
+        return;
+    }
+    crate::blocking::wakeup::for_each_written_key(cmd, args, |k| {
+        exec_wakes.push((db, k.clone()));
+    });
+}
+
 /// Execute a queued transaction atomically under a single database lock.
 ///
 /// Checks WATCH versions first -- if any watched key's version has changed since
@@ -499,10 +517,14 @@ pub(crate) fn execute_transaction_sharded(
     cached_clock: &CachedClock,
     exec_publishes: &mut Vec<ExecPublish>,
     exec_flushes: &mut Vec<(usize, Frame, usize)>,
-    // moon#606: keys this body wrote that a blocked client may be waiting on.
-    // Raised by the CALLER after the body, never here — see the collection
-    // site below for why.
-    exec_wakes: &mut Vec<(usize, Bytes, crate::blocking::WaitFamily)>,
+    // moon#606: keys this body wrote that a blocked client may be waiting on,
+    // with the db each was written in. Raised by the CALLER after the body,
+    // never here — see the collection site below for why.
+    exec_wakes: &mut Vec<(usize, Bytes)>,
+    // moon#1069: was anyone blocked on this shard when EXEC began? Nothing can
+    // register while the body runs (one synchronous stretch), so `false`
+    // means no key of this body can wake anybody, and none is recorded.
+    wake_armed: bool,
     // WATCH/CAS (task `watch-cas-transactions`): the versions this connection
     // recorded at WATCH time. Empty for the overwhelming majority of
     // transactions, which is why the check below early-outs on `is_empty`
@@ -593,8 +615,12 @@ pub(crate) fn execute_transaction_sharded(
                 )));
                 continue;
             };
-            let outcome = super::txn_script::run_txn_script(env, cmd, cmd_args, selected, shard_id);
+            let outcome = super::txn_script::run_txn_script(
+                env, cmd, cmd_args, selected, shard_id, wake_armed,
+            );
             aof_entries.extend(outcome.effects);
+            // moon#1069: the keys the script's own `redis.call` writes touched.
+            exec_wakes.extend(outcome.ready);
             if let Some(which) = outcome.flush {
                 // This shard's half is done; the caller broadcasts the rest
                 // exactly as for a queued FLUSHALL (c10k E2 contract above).
@@ -640,6 +666,9 @@ pub(crate) fn execute_transaction_sharded(
                     let mut buf = bytes::BytesMut::new();
                     crate::protocol::serialize::serialize(&effect, &mut buf);
                     aof_entries.push((selected, buf.freeze()));
+                    // moon#1059: a queued BLMOVE that moved pushed onto its
+                    // destination, which a client may be blocked on.
+                    record_exec_wakes(exec_wakes, wake_armed, selected, cmd, cmd_args);
                 }
                 results.push(super::util::apply_resp3_conversion(
                     cmd,
@@ -730,6 +759,16 @@ pub(crate) fn execute_transaction_sharded(
                     selected,
                     crate::persistence::aof::serialize_command_for_log(cmd_frame),
                 ));
+                // moon#1069: the key now exists in the database it names; a
+                // client blocked on it there is served after EXEC, like every
+                // other key this body wrote (see `exec_wakes` below).
+                if wake_armed
+                    && let Some(target) = crate::blocking::wakeup::cross_db_write_target(
+                        cmd, cmd_args, selected, db_count,
+                    )
+                {
+                    exec_wakes.push(target);
+                }
             }
             results.push(response);
             continue;
@@ -772,10 +811,12 @@ pub(crate) fn execute_transaction_sharded(
             }
         }
 
-        // moon#606: a producer queued inside MULTI must wake whoever is
-        // blocked on the key it wrote. This executor reaches none of the live
-        // wake hooks, so a `MULTI ; LPUSH k v ; EXEC` used to leave a `BLPOP k`
-        // asleep until its own timeout.
+        // moon#606: a write queued inside MULTI must wake whoever is blocked on
+        // a key it wrote. This executor reaches none of the live wake hooks, so
+        // a `MULTI ; LPUSH k v ; EXEC` used to leave a `BLPOP k` asleep until
+        // its own timeout — and, until moon#1069, so did a queued `RENAME`,
+        // `COPY`, `SORT ... STORE`, ... because only six "producer" names were
+        // recorded here. Now every key the command may have written is.
         //
         // Recorded for the caller rather than raised here, for two reasons.
         // It matches Redis, which defers to the ready-keys pass that runs
@@ -786,14 +827,12 @@ pub(crate) fn execute_transaction_sharded(
         //
         // The caller's own registry is the right one: `TxnLocality` rejects a
         // cross-shard body outright, so the shard executing this owns every
-        // key in it.
-        if !matches!(&response, Frame::Error(_))
-            && let Some(family) = crate::blocking::wakeup::producer_family(cmd)
-            && let Some(key) = cmd_args
-                .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
-                .and_then(super::util::extract_bytes)
-        {
-            exec_wakes.push((entry_db, key, family));
+        // key in it. The caller filters by "has a waiter" before touching a
+        // database, so recording a key nobody waits on costs one entry here.
+        // (`MOVE` / `COPY ... DB n` never get here: the moon#1062 arm above
+        // runs them and records the key in the database they wrote.)
+        if !matches!(&response, Frame::Error(_)) {
+            record_exec_wakes(exec_wakes, wake_armed, entry_db, cmd, cmd_args);
         }
 
         // Auto-index: if HSET succeeded, check for vector index match

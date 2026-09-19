@@ -476,6 +476,16 @@ where
             immediate_scan(cmd, args, &keys, db, shard_id, num_shards)
         });
         if let Some(frame) = maybe_frame {
+            // moon#1059: an immediate BLMOVE pushed onto its destination. A
+            // plain pop only takes data, so it has nothing to signal.
+            if !matches!(frame, Frame::Error(_)) && move_endpoints(cmd, args).is_some() {
+                crate::blocking::wakeup::wake_written_keys_on_shard(
+                    blocking_registry,
+                    selected_db,
+                    cmd,
+                    args,
+                );
+            }
             return BlockingOutcome::Reply(frame);
         }
         // Borrow released at with_shard_db boundary — safe before await.
@@ -810,6 +820,18 @@ where
             immediate_scan(cmd, args, &keys, db, shard_id, num_shards)
         });
         if let Some(frame) = immediate_result {
+            // moon#1059: an immediate BLMOVE pushed onto its destination,
+            // which a client may be blocked on — the same serve a parked
+            // BLMOVE's wake now gives it (`try_wake_list_waiter`). A plain pop
+            // (BLPOP, BZPOPMIN, BLMPOP, ...) only takes data: nothing to signal.
+            if !matches!(frame, Frame::Error(_)) && move_endpoints(cmd, args).is_some() {
+                crate::blocking::wakeup::wake_written_keys_on_shard(
+                    blocking_registry,
+                    selected_db,
+                    cmd,
+                    args,
+                );
+            }
             return BlockingOutcome::Reply(frame);
         }
     }
@@ -2345,7 +2367,9 @@ pub(crate) fn format_blocking_score(score: f64) -> String {
 ///   - Metrics / slowlog recording (matches existing inline GET behaviour)
 ///
 ///   Side-effects not applicable to plain SET:
-///   - Blocking-waiter wakeup (only for LPUSH/RPUSH/ZADD, not SET)
+///   - Blocking-waiter wakeup (moon#1069: every write wakes the keys it
+///     touched, but a STRING satisfies no blocked client — a list, zset or
+///     stream waiter on a key a SET overwrites stays parked, as in redis)
 ///   - Vector auto-index (only for HSET, not SET)
 ///
 /// Returns the number of commands inlined (0 if none, 1 on success).
@@ -2936,9 +2960,7 @@ pub(crate) fn try_inline_dispatch(
             });
             drop(rt);
             if let Some(crate::protocol::Frame::Error(msg)) = quota_err {
-                write_buf.extend_from_slice(b"-");
-                write_buf.extend_from_slice(&msg);
-                write_buf.extend_from_slice(b"\r\n");
+                crate::protocol::serialize::put_line(write_buf, b'-', &msg);
                 return 1;
             }
         }
