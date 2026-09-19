@@ -187,7 +187,7 @@ pub fn spill_to_datafile(
         db_index: db_index as u64,
         max_key_hash: 0,
         last_modified_lsn: 0,
-    });
+    })?;
     manifest.commit()?;
 
     // Update cold index with the spilled key's disk location. `ttl_ms` is
@@ -1233,19 +1233,21 @@ mod tests {
                 .collect();
             let batch = build_kv_spill_batch(&entries, file_id).unwrap();
             let byte_size = write_kv_spill_batch(shard_dir, file_id, &batch).unwrap();
-            manifest.add_file(FileEntry {
-                file_id,
-                file_type: PageType::KvLeaf as u8,
-                status: FileStatus::Active,
-                tier: StorageTier::Hot,
-                page_size_log2: 12,
-                page_count: batch.pages.len() as u32,
-                byte_size,
-                created_lsn: 0,
-                db_index: 0,
-                max_key_hash: 0,
-                last_modified_lsn: 0,
-            });
+            manifest
+                .add_file(FileEntry {
+                    file_id,
+                    file_type: PageType::KvLeaf as u8,
+                    status: FileStatus::Active,
+                    tier: StorageTier::Hot,
+                    page_size_log2: 12,
+                    page_count: batch.pages.len() as u32,
+                    byte_size,
+                    created_lsn: 0,
+                    db_index: 0,
+                    max_key_hash: 0,
+                    last_modified_lsn: 0,
+                })
+                .unwrap();
         }
         manifest.commit().unwrap();
 
@@ -1298,7 +1300,8 @@ mod tests {
                 db_index: 0,
                 max_key_hash: 0,
                 last_modified_lsn: 0,
-            });
+            })
+            .unwrap();
         }
         m2.commit().unwrap();
 
@@ -1392,19 +1395,21 @@ mod tests {
             )
             .unwrap()
             .len();
-            manifest.add_file(FileEntry {
-                file_id,
-                file_type: PageType::KvLeaf as u8,
-                status: FileStatus::Active,
-                tier: StorageTier::Hot,
-                page_size_log2: 12,
-                page_count: (byte_size / crate::persistence::page::PAGE_4K as u64) as u32,
-                byte_size,
-                created_lsn: 0,
-                db_index: 0,
-                max_key_hash: 0,
-                last_modified_lsn: 0,
-            });
+            manifest
+                .add_file(FileEntry {
+                    file_id,
+                    file_type: PageType::KvLeaf as u8,
+                    status: FileStatus::Active,
+                    tier: StorageTier::Hot,
+                    page_size_log2: 12,
+                    page_count: (byte_size / crate::persistence::page::PAGE_4K as u64) as u32,
+                    byte_size,
+                    created_lsn: 0,
+                    db_index: 0,
+                    max_key_hash: 0,
+                    last_modified_lsn: 0,
+                })
+                .unwrap();
         }
         manifest.commit().unwrap();
         let ids: Vec<u64> = manifest.files().iter().map(|e| e.file_id).collect();
@@ -1465,7 +1470,8 @@ mod tests {
             db_index: 0,
             max_key_hash: 0,
             last_modified_lsn: 0,
-        });
+        })
+        .unwrap();
         m2.commit().unwrap();
         let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &m2).per_db;
         let index = per_db.remove(0).1;
@@ -1508,19 +1514,21 @@ mod tests {
                 .collect();
             let batch = build_kv_spill_batch(&entries, file_id).unwrap();
             let byte_size = write_kv_spill_batch(shard_dir, file_id, &batch).unwrap();
-            manifest.add_file(FileEntry {
-                file_id,
-                file_type: PageType::KvLeaf as u8,
-                status: FileStatus::Active,
-                tier: StorageTier::Hot,
-                page_size_log2: 12,
-                page_count: batch.pages.len() as u32,
-                byte_size,
-                created_lsn: 0,
-                db_index: db,
-                max_key_hash: 0,
-                last_modified_lsn: 0,
-            });
+            manifest
+                .add_file(FileEntry {
+                    file_id,
+                    file_type: PageType::KvLeaf as u8,
+                    status: FileStatus::Active,
+                    tier: StorageTier::Hot,
+                    page_size_log2: 12,
+                    page_count: batch.pages.len() as u32,
+                    byte_size,
+                    created_lsn: 0,
+                    db_index: db,
+                    max_key_hash: 0,
+                    last_modified_lsn: 0,
+                })
+                .unwrap();
         }
         manifest.commit().unwrap();
 
@@ -1586,19 +1594,21 @@ mod tests {
         // 2. Register the file in a manifest exactly as apply_spill_completions does.
         let manifest_path = shard_dir.join("shard.manifest");
         let mut manifest = ShardManifest::create(&manifest_path).unwrap();
-        manifest.add_file(FileEntry {
-            file_id,
-            file_type: PageType::KvLeaf as u8,
-            status: FileStatus::Active,
-            tier: StorageTier::Hot,
-            page_size_log2: 12,
-            page_count: batch.pages.len() as u32,
-            byte_size,
-            created_lsn: 0,
-            db_index: 0,
-            max_key_hash: 0,
-            last_modified_lsn: 0,
-        });
+        manifest
+            .add_file(FileEntry {
+                file_id,
+                file_type: PageType::KvLeaf as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Hot,
+                page_size_log2: 12,
+                page_count: batch.pages.len() as u32,
+                byte_size,
+                created_lsn: 0,
+                db_index: 0,
+                max_key_hash: 0,
+                last_modified_lsn: 0,
+            })
+            .unwrap();
         manifest.commit().unwrap();
 
         // 3. Rebuild the cold index FROM THE MANIFEST (the recovery path under test).
@@ -1802,19 +1812,21 @@ mod tests {
 
         let manifest_path = shard_dir.join("shard.manifest");
         let mut manifest = ShardManifest::create(&manifest_path).unwrap();
-        manifest.add_file(FileEntry {
-            file_id,
-            file_type: PageType::KvLeaf as u8,
-            status: FileStatus::Active,
-            tier: StorageTier::Hot,
-            page_size_log2: 12,
-            page_count: batch.pages.len() as u32,
-            byte_size,
-            created_lsn: 0,
-            db_index: 0,
-            max_key_hash: 0,
-            last_modified_lsn: 0,
-        });
+        manifest
+            .add_file(FileEntry {
+                file_id,
+                file_type: PageType::KvLeaf as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Hot,
+                page_size_log2: 12,
+                page_count: batch.pages.len() as u32,
+                byte_size,
+                created_lsn: 0,
+                db_index: 0,
+                max_key_hash: 0,
+                last_modified_lsn: 0,
+            })
+            .unwrap();
         manifest.commit().unwrap();
 
         let rebuilt = ColdIndex::rebuild_from_manifest(shard_dir, &manifest);
@@ -1881,19 +1893,21 @@ mod tests {
 
         let manifest_path = shard_dir.join("shard.manifest");
         let mut manifest = ShardManifest::create(&manifest_path).unwrap();
-        manifest.add_file(FileEntry {
-            file_id,
-            file_type: PageType::KvLeaf as u8,
-            status: FileStatus::Active,
-            tier: StorageTier::Hot,
-            page_size_log2: 12,
-            page_count: batch.pages.len() as u32,
-            byte_size,
-            created_lsn: 0,
-            db_index: 0,
-            max_key_hash: 0,
-            last_modified_lsn: 0,
-        });
+        manifest
+            .add_file(FileEntry {
+                file_id,
+                file_type: PageType::KvLeaf as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Hot,
+                page_size_log2: 12,
+                page_count: batch.pages.len() as u32,
+                byte_size,
+                created_lsn: 0,
+                db_index: 0,
+                max_key_hash: 0,
+                last_modified_lsn: 0,
+            })
+            .unwrap();
         manifest.commit().unwrap();
 
         let rebuilt = ColdIndex::rebuild_from_manifest(shard_dir, &manifest);

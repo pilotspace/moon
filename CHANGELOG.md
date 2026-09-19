@@ -285,6 +285,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     loss the committed manifest could name a missing incr, or the old
     `appendonly.aof` could return, losing every record written after the
     rewrite. Both directories are now fsynced before the new file is used.
+- **Restart no longer deletes warm vector segments it is serving, and a warm
+  segment is superseded per key instead of as a whole directory** (moon#893).
+  Boot recovery judged a warm segment "already covered" when ANY one of its
+  key_hashes was already indexed, and then ran `remove_dir_all` on its
+  directory. Two ways in, both measured on a real server with 1000 warm keys:
+  re-inserting ONE key and compacting it into a HOT segment retired the whole
+  directory on the next boot, and the other 999 vectors were re-encoded; and
+  a manifest written by an older build that lists one segment id twice (its
+  id counter re-issued live ids) had the directory attached on the first
+  entry and deleted on the second. Worse, when the re-inserted key's own
+  segment had also gone warm, recovery registered the key under its new
+  global_id, attached the older segment, and deleted the newer one: after the
+  restart the key answered to its OVERWRITTEN vector and its current one was
+  gone. Now each key is decided on its own. The persisted keymap names a key's
+  current copy by global_id. A copy that is not that one, or that another live
+  segment already serves, is tombstoned in that segment only. The rest stay
+  served from it. A directory is retired only when none of its keys is live,
+  never one recovery attached. The directory is renamed out of discovery's
+  reach before it is deleted, so a crash mid-delete cannot leave a
+  half-deleted segment. Each segment id is handled once. Duplicate manifest
+  entries are collapsed at boot and healed on disk, keeping the last. For a
+  spill file, that last entry is the one that describes the file.
+  `ShardManifest::add_file` now refuses a second entry for an
+  `(id, type)` that is already listed (it returns `DuplicateFileEntry`),
+  and a warm transition onto an id whose directory or entry already exists
+  is refused before anything is written, where it used to commit the entry
+  and then fail the rename with `ENOTEMPTY`. A spill batch whose file id the
+  manifest already lists puts its keys back in RAM from their in-flight
+  payloads, never publishes them cold, and is counted in the new INFO field
+  `spill_completion_id_rejected`. A reattached warm segment raises the
+  vector global_id allocator above its own ids, so a key written after the
+  restart can never be given an id a warm row already holds. Covered by
+  `tests/warm_segment_restart_893.rs`, which restarts twice (clean and
+  `kill -9`) and checks that the directories persist, nothing is re-encoded,
+  and `FT.SEARCH` is identical.
+
 - **A write that lands data on a key wakes the clients blocked on it, whatever
   command wrote it** (moon#1059, moon#1069). Only six "producer" commands
   (`LPUSH`, `RPUSH`, `LMOVE`, `RPOPLPUSH`, `ZADD`, `XADD`) used to wake a
@@ -1028,6 +1064,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CH` as a did-anything-change signal silently skipped those updates. Fixed on
   both the listpack and B+tree arms, which carried separate copies.
 ### Security
+
+- **Error and status replies can no longer be split by client input**
+  (moon#1031). Error text quotes client input (an unknown command name, an
+  `ACL SETUSER` rule), and CR/LF bytes in it were written raw, so one command
+  could produce several RESP replies. That desynchronises any client or proxy
+  that pipelines on a shared connection. Every line-framed reply (`+`, `-`,
+  RESP3 `(`) now goes through one writer that maps CR and LF to spaces, as
+  redis does, and so do the inline quota error and the protocol-error echo.
+  It is allocation-free, and a reply with no CR/LF costs the same as before.
 
 - **`rustls` bumped past RUSTSEC-2026-0285 / GHSA-2mjx-qc3c-rqvc** ("TLS 1.3
   handshake messages incorrectly accepted across encryption level
