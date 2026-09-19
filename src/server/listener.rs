@@ -132,6 +132,9 @@ pub async fn run_with_shutdown(
             ),
             Err(e) => error!("AOF load failed: {}. Starting with empty database.", e),
         }
+        // moon#914: an AOF opened by `MOON.COLDCUT` installs a replay gate on
+        // every database; it must not outlive replay.
+        let _ = crate::storage::db::close_replay_generation(&mut dbs_vec);
         // Put databases back
         for (lock, restored_db) in db.iter().zip(dbs_vec.into_iter()) {
             *lock.write() = restored_db;

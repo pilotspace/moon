@@ -1,3 +1,4 @@
+pub mod group;
 pub mod wakeup;
 
 use std::collections::{HashMap, VecDeque};
@@ -417,6 +418,16 @@ impl BlockingRegistry {
                 }
             }
         }
+    }
+
+    /// Is `wait_id` still registered on at least one key of this shard?
+    ///
+    /// `false` once it has been served, cancelled, timed out or reaped as
+    /// dead — every one of those runs `remove_wait`. moon#989's group
+    /// registration uses it to stop consulting a waiter's later keys the
+    /// moment an earlier one has served it.
+    pub fn is_waiting(&self, wait_id: u64) -> bool {
+        self.wait_keys.contains_key(&wait_id)
     }
 
     /// Check if any waiters exist for this (db_index, key).

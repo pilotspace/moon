@@ -32,6 +32,32 @@ pub struct SlowlogEntry {
     pub client_name: Bytes,
 }
 
+/// The argv a dispatch path can offer the slowlog.
+///
+/// Every path that runs a command has its argv in ONE of two shapes: a parsed
+/// multibulk (`Frame::Array` payload) or, on the inline `GET`/`SET` fast path,
+/// raw slices of the read buffer. Both are borrowed — nothing is copied
+/// unless the sample crosses the threshold.
+#[derive(Debug, Clone, Copy)]
+pub enum SlowlogArgv<'a> {
+    /// A parsed multibulk. Non-bulk elements log as `?`.
+    Frames(&'a [Frame]),
+    /// Raw argv, command name first, as the inline fast path sees it.
+    Raw(&'a [&'a [u8]]),
+    /// Not a multibulk (a frame that is not an array): nothing to log.
+    None,
+}
+
+impl<'a> From<&'a Frame> for SlowlogArgv<'a> {
+    #[inline]
+    fn from(frame: &'a Frame) -> Self {
+        match frame {
+            Frame::Array(args) => SlowlogArgv::Frames(args.as_slice()),
+            _ => SlowlogArgv::None,
+        }
+    }
+}
+
 /// Global slowlog buffer.
 ///
 /// `max_len` and `threshold_us` are stored as atomics so the global
@@ -71,32 +97,80 @@ impl Slowlog {
         client_addr: &[u8],
         client_name: &[u8],
     ) {
+        self.maybe_record_argv(
+            duration_us,
+            SlowlogArgv::Frames(command),
+            client_addr,
+            client_name,
+        );
+    }
+
+    /// Record a command if it exceeds the slowlog threshold, from whichever
+    /// argv shape the dispatch path has (moon#963: the inline `GET`/`SET`
+    /// path never builds a `Frame`, so it hands over raw byte slices).
+    ///
+    /// Cheap on the common path: one relaxed load and a compare. Argv is
+    /// copied only once the sample has crossed the threshold.
+    #[inline]
+    pub fn maybe_record_argv(
+        &self,
+        duration_us: u64,
+        argv: SlowlogArgv<'_>,
+        client_addr: &[u8],
+        client_name: &[u8],
+    ) {
         let threshold = self.threshold_us.load(Ordering::Relaxed);
         if duration_us < threshold {
             return;
         }
+        // Not a multibulk: there is no argv to show, and an entry whose
+        // command renders as an empty array is noise, not a record.
+        if matches!(argv, SlowlogArgv::None) {
+            return;
+        }
+        self.push(duration_us, argv, client_addr, client_name);
+    }
 
+    /// The cold half of [`Self::maybe_record_argv`]: allocate the entry and
+    /// push it. Out of line so the hot path inlines only the threshold test.
+    #[cold]
+    #[inline(never)]
+    fn push(
+        &self,
+        duration_us: u64,
+        argv: SlowlogArgv<'_>,
+        client_addr: &[u8],
+        client_name: &[u8],
+    ) {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        // Truncate each arg to 128 bytes
-        let cmd_args: Vec<Bytes> = command
-            .iter()
-            .take(128) // max 128 args logged
-            .map(|f| match f {
-                Frame::BulkString(b) => {
-                    if b.len() > 128 {
-                        Bytes::copy_from_slice(&b[..128])
-                    } else {
-                        b.clone()
+        // Truncate to 128 args, each to 128 bytes (Redis convention).
+        let cmd_args: Vec<Bytes> = match argv {
+            SlowlogArgv::Frames(frames) => frames
+                .iter()
+                .take(128)
+                .map(|f| match f {
+                    Frame::BulkString(b) => {
+                        if b.len() > 128 {
+                            Bytes::copy_from_slice(&b[..128])
+                        } else {
+                            b.clone()
+                        }
                     }
-                }
-                _ => Bytes::from_static(b"?"),
-            })
-            .collect();
+                    _ => Bytes::from_static(b"?"),
+                })
+                .collect(),
+            SlowlogArgv::Raw(args) => args
+                .iter()
+                .take(128)
+                .map(|a| Bytes::copy_from_slice(&a[..a.len().min(128)]))
+                .collect(),
+            SlowlogArgv::None => Vec::new(),
+        };
 
         let entry = SlowlogEntry {
             id,

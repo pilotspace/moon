@@ -440,7 +440,6 @@ pub(crate) async fn handle_blocking_command<S>(
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    use futures::stream::FuturesUnordered;
     use tokio::io::AsyncReadExt;
 
     // Parse timeout (last argument for all blocking commands)
@@ -485,9 +484,6 @@ where
                     wait_id,
                     cmd: blocked_cmd_factory(),
                     reply_tx,
-                    // The single-key fast path: this key IS the command, so
-                    // the owner may answer a type error for it (moon#556).
-                    sole_key: true,
                 },
             ));
             if !push_block_msg(shutdown, dispatch_tx, shard_id, target, msg, None).await {
@@ -602,56 +598,28 @@ where
     }
 
     // --- Multi-key coordinator: register on ALL keys across local + remote shards ---
-    // Uses FuturesUnordered for first-wakeup-wins semantics.
-    let wait_id;
-    let mut receivers: FuturesUnordered<channel::OneshotReceiver<Option<Frame>>> =
-        FuturesUnordered::new();
-    let mut registered_remote_shards: Vec<usize> = Vec::new();
-
-    // A4/A5: build every registration under one borrow, but STAGE the remote
-    // ones and push them only after the borrow is released — the old code
-    // pushed while holding both borrows, which forced the bare `try_push`
-    // (no await possible, so no backpressure retry and no shutdown arm).
-    let mut pending_remote: Vec<(usize, ShardMessage)> = Vec::new();
-    {
-        let mut reg = blocking_registry.borrow_mut();
-        wait_id = reg.next_wait_id();
-
-        for key in &keys {
-            let target = key_to_shard(key, num_shards);
-            let (tx, rx) = channel::oneshot::<Option<Frame>>();
-            receivers.push(rx);
-
-            if target == shard_id {
-                // Local registration
-                let entry = crate::blocking::WaitEntry {
-                    wait_id,
-                    cmd: local_blocked_cmd(&blocked_cmd_factory, selected_db, key),
-                    reply_tx: tx,
-                    deadline,
-                };
-                reg.register(selected_db, key.clone(), entry);
-            } else {
-                // Remote registration via SPSC
-                let msg = ShardMessage::BlockRegister(Box::new(
-                    crate::shard::dispatch::BlockRegisterPayload {
-                        db_index: selected_db,
-                        key: key.clone(),
-                        wait_id,
-                        cmd: blocked_cmd_factory(),
-                        reply_tx: tx,
-                        // One of several keys — see `sole_key`'s docs for why
-                        // the owner must NOT decide the whole command here.
-                        sole_key: false,
-                    },
-                ));
-                pending_remote.push((target, msg));
-                if !registered_remote_shards.contains(&target) {
-                    registered_remote_shards.push(target);
-                }
-            }
-        }
-    } // borrows dropped -- CRITICAL before await
+    // Uses FuturesUnordered for first-wakeup-wins semantics. moon#989: remote
+    // keys travel as ONE group per owner shard — the owner serves this waiter
+    // at most once only because it sees all of its keys in one message. See
+    // `blocking_multikey` for the protocol and what it does not cover.
+    //
+    // A4/A5: every registration is built under one borrow and the remote ones
+    // are STAGED, pushed only after the borrow is released.
+    let super::blocking_multikey::StagedWait {
+        wait_id,
+        mut receivers,
+        pending_remote,
+        remote_shards: registered_remote_shards,
+    } = super::blocking_multikey::stage_multikey_wait(
+        &mut blocking_registry.borrow_mut(),
+        &keys,
+        &|key| local_blocked_cmd(&blocked_cmd_factory, selected_db, key),
+        &*blocked_cmd_factory,
+        selected_db,
+        shard_id,
+        num_shards,
+        deadline,
+    ); // borrow dropped -- CRITICAL before await
 
     // A5: a silently dropped registration leaves this waiter blocked on a key
     // nobody is watching — it would sleep through data that IS available.
@@ -793,8 +761,6 @@ pub(crate) async fn handle_blocking_command_monoio<S>(
 where
     S: super::handler_monoio::idle_park::IdleParkRead,
 {
-    use futures::stream::FuturesUnordered;
-
     // Parse timeout (last argument for all blocking commands)
     let timeout_secs = match parse_blocking_timeout(cmd, args) {
         Ok(t) => t,
@@ -841,9 +807,6 @@ where
                     wait_id,
                     cmd: blocked_cmd_factory(),
                     reply_tx,
-                    // The single-key fast path: this key IS the command, so
-                    // the owner may answer a type error for it (moon#556).
-                    sole_key: true,
                 },
             ));
             if !push_block_msg(
@@ -943,54 +906,28 @@ where
     }
 
     // --- Multi-key coordinator: register on ALL keys across local + remote shards ---
-    // Uses FuturesUnordered for first-wakeup-wins semantics.
-    let wait_id;
-    let mut receivers: FuturesUnordered<channel::OneshotReceiver<Option<Frame>>> =
-        FuturesUnordered::new();
-    let mut registered_remote_shards: Vec<usize> = Vec::new();
-
-    // A4/A5: stage remote registrations, push them after the borrow is
-    // released. See the tokio twin for the full rationale.
-    let mut pending_remote: Vec<(usize, ShardMessage)> = Vec::new();
-    {
-        let mut reg = blocking_registry.borrow_mut();
-        wait_id = reg.next_wait_id();
-
-        for key in &keys {
-            let target = key_to_shard(key, num_shards);
-            let (tx, rx) = channel::oneshot::<Option<Frame>>();
-            receivers.push(rx);
-
-            if target == shard_id {
-                // Local registration
-                let entry = crate::blocking::WaitEntry {
-                    wait_id,
-                    cmd: local_blocked_cmd(&blocked_cmd_factory, selected_db, key),
-                    reply_tx: tx,
-                    deadline,
-                };
-                reg.register(selected_db, key.clone(), entry);
-            } else {
-                // Remote registration via SPSC
-                let msg = ShardMessage::BlockRegister(Box::new(
-                    crate::shard::dispatch::BlockRegisterPayload {
-                        db_index: selected_db,
-                        key: key.clone(),
-                        wait_id,
-                        cmd: blocked_cmd_factory(),
-                        reply_tx: tx,
-                        // One of several keys — see `sole_key`'s docs for why
-                        // the owner must NOT decide the whole command here.
-                        sole_key: false,
-                    },
-                ));
-                pending_remote.push((target, msg));
-                if !registered_remote_shards.contains(&target) {
-                    registered_remote_shards.push(target);
-                }
-            }
-        }
-    } // borrows dropped -- CRITICAL before await
+    // Uses FuturesUnordered for first-wakeup-wins semantics. moon#989: remote
+    // keys travel as ONE group per owner shard — the owner serves this waiter
+    // at most once only because it sees all of its keys in one message. See
+    // `blocking_multikey` for the protocol and what it does not cover.
+    //
+    // A4/A5: every registration is built under one borrow and the remote ones
+    // are STAGED, pushed only after the borrow is released.
+    let super::blocking_multikey::StagedWait {
+        wait_id,
+        mut receivers,
+        pending_remote,
+        remote_shards: registered_remote_shards,
+    } = super::blocking_multikey::stage_multikey_wait(
+        &mut blocking_registry.borrow_mut(),
+        &keys,
+        &|key| local_blocked_cmd(&blocked_cmd_factory, selected_db, key),
+        &*blocked_cmd_factory,
+        selected_db,
+        shard_id,
+        num_shards,
+        deadline,
+    ); // borrow dropped -- CRITICAL before await
 
     let mut registration_failed = false;
     for (target, msg) in pending_remote {
@@ -2055,6 +1992,23 @@ pub(crate) fn immediate_scan(
     }) {
         return Some(err);
     }
+    // moon#989: a `BLMPOP`/`BZMPOP` whose keys span shards is refused here,
+    // before anything is popped or registered — the rule moon#962 applies to
+    // their non-blocking twins. "Pop from the FIRST non-empty key in argument
+    // order, exactly once" is a property of the whole key vector, and no shard
+    // can see the whole vector: this scan skips the keys it does not own (and
+    // so served a LATER local key over an earlier remote one), and two owners
+    // could each serve the same waiter. Refusing is decided from the key names
+    // alone, so it cannot lose an element. Co-located keys (`{hash}` tags) are
+    // unaffected and answer exactly as at `--shards 1`.
+    //
+    // The family list lives in `cross_shard_multikey_rejection`, the same
+    // guard the non-blocking dispatch path and scripts consult; of the
+    // blocking commands only these two are in it (a blocking stream read
+    // names one stream, and one key cannot span shards).
+    if let Some(err) = super::shared::cross_shard_multikey_rejection(cmd, args, num_shards) {
+        return Some(err);
+    }
     // moon#595: a stream read is answered by running the reader itself, not by
     // the per-key ladder below — its reply names the streams that had data
     // rather than the one key that served, and `XREADGROUP` needs the group
@@ -2398,6 +2352,11 @@ pub(crate) fn try_inline_dispatch(
     // pressure, leaving `read_buf` untouched. See the block comment on
     // `can_inline_writes` in `handler_monoio/mod.rs` for the full invariant.
     spill_sender_active: bool,
+    // moon#963: the connection's latency probe. This path answers `GET`/`SET`
+    // without entering generic dispatch, so it has to time them itself — and
+    // the parameter is mandatory rather than an `Option` precisely so that
+    // "silently uninstrumented arm" cannot be spelled at a call site.
+    probe: &mut crate::admin::metrics_setup::LatencyProbe<'_>,
 ) -> usize {
     let buf = &read_buf[..];
     let len = buf.len();
@@ -2569,26 +2528,36 @@ pub(crate) fn try_inline_dispatch(
                 }
             }
         };
-        let served = crate::shard::slice::with_shard_db_read(selected_db, |db| {
-            // #459: a key mid-spill is in neither hot nor cold, so the miss
-            // arm would frame `$-1` inline for a key that exists and that
-            // EXISTS reports as present. Pulling it back (RAM only, no disk
-            // read) mutates, so it is the one case that still needs the
-            // exclusive guard — retaken below. Costs one `is_empty()` load
-            // per inline GET on a server that is not spilling, which is
-            // every server without --disk-offload.
-            if !db.spill_inflight_is_empty() {
-                return None;
-            }
-            Some(serve(db))
-        });
-        let (outcome, cold_loc) = match served {
-            Some(served) => served,
-            None => crate::shard::slice::with_shard_db(selected_db, |db| {
-                db.promote_inflight_if_present(key_bytes, now_ms);
-                serve(&*db)
-            }),
-        };
+        // moon#963: the timed interval is the lookup — the analogue of the
+        // generic path's `dispatch_read`. Argv is borrowed from the read
+        // buffer; nothing is copied unless a sample crosses the threshold.
+        let argv: [&[u8]; 2] = [&buf[8..11], key_bytes];
+        let (outcome, cold_loc) = probe.observe(
+            &buf[8..11],
+            crate::admin::slowlog::SlowlogArgv::Raw(&argv),
+            || {
+                let served = crate::shard::slice::with_shard_db_read(selected_db, |db| {
+                    // #459: a key mid-spill is in neither hot nor cold, so the miss
+                    // arm would frame `$-1` inline for a key that exists and that
+                    // EXISTS reports as present. Pulling it back (RAM only, no disk
+                    // read) mutates, so it is the one case that still needs the
+                    // exclusive guard — retaken below. Costs one `is_empty()` load
+                    // per inline GET on a server that is not spilling, which is
+                    // every server without --disk-offload.
+                    if !db.spill_inflight_is_empty() {
+                        return None;
+                    }
+                    Some(serve(db))
+                });
+                match served {
+                    Some(served) => served,
+                    None => crate::shard::slice::with_shard_db(selected_db, |db| {
+                        db.promote_inflight_if_present(key_bytes, now_ms);
+                        serve(&*db)
+                    }),
+                }
+            },
+        );
         match outcome {
             GetOutcome::Handled => {
                 let _ = read_buf.split_to(consumed);
@@ -2944,36 +2913,49 @@ pub(crate) fn try_inline_dispatch(
 
         let key = frozen.slice(key_start..key_end);
         let value = frozen.slice(val_start..val_end);
+        // moon#963: the timed interval is the write — the analogue of the
+        // generic path's `dispatch`. Argv borrows `frozen` (no copy).
+        let argv: [&[u8]; 3] = [
+            &frozen[8..11],
+            &frozen[key_start..key_end],
+            &frozen[val_start..val_end],
+        ];
         // `move` closure: `key` and `value` are consumed here (last use), so the
         // entry/set take ownership — no Bytes refcount bump+drop pair per SET.
-        crate::shard::slice::with_shard_db(selected_db, move |db| {
-            if db.hot_keys().tick() {
-                db.hot_keys().observe(&key);
-            }
-            // moon#558: this path frames a plain SET straight from the read
-            // buffer — it never builds a `Frame`, never enters
-            // `command::dispatch`, and never reaches
-            // `spsc_handler::cow_intercept`. It must still stash the key's
-            // epoch-start value while a BGSAVE is in flight, or the snapshot
-            // serializes the overwritten value for a segment it has not
-            // written yet. One thread-local `bool` load when no snapshot is
-            // armed, which is every SET on a server that is not saving.
-            crate::persistence::snapshot_cow::capture_key_pre_image(db, selected_db, &key);
-            let mut entry = crate::storage::entry::Entry::new_string(value);
-            entry.set_last_access(db.now());
-            entry.set_access_counter(5);
-            // Same reason as the inline GET above: a plain `SET k v` is served
-            // HERE and never reaches `string::set`, so the notification has to
-            // be queued on this path too or it exists only for SETs complex
-            // enough to fall out of the fast path.
-            crate::notify::notify_keyspace_event(
-                crate::notify::NotifyFlags::STRING,
-                "set",
-                &key,
-                selected_db,
-            );
-            db.set(&key, entry);
-        });
+        probe.observe(
+            &frozen[8..11],
+            crate::admin::slowlog::SlowlogArgv::Raw(&argv),
+            || {
+                crate::shard::slice::with_shard_db(selected_db, move |db| {
+                    if db.hot_keys().tick() {
+                        db.hot_keys().observe(&key);
+                    }
+                    // moon#558: this path frames a plain SET straight from the read
+                    // buffer — it never builds a `Frame`, never enters
+                    // `command::dispatch`, and never reaches
+                    // `spsc_handler::cow_intercept`. It must still stash the key's
+                    // epoch-start value while a BGSAVE is in flight, or the snapshot
+                    // serializes the overwritten value for a segment it has not
+                    // written yet. One thread-local `bool` load when no snapshot is
+                    // armed, which is every SET on a server that is not saving.
+                    crate::persistence::snapshot_cow::capture_key_pre_image(db, selected_db, &key);
+                    let mut entry = crate::storage::entry::Entry::new_string(value);
+                    entry.set_last_access(db.now());
+                    entry.set_access_counter(5);
+                    // Same reason as the inline GET above: a plain `SET k v` is served
+                    // HERE and never reaches `string::set`, so the notification has to
+                    // be queued on this path too or it exists only for SETs complex
+                    // enough to fall out of the fast path.
+                    crate::notify::notify_keyspace_event(
+                        crate::notify::NotifyFlags::STRING,
+                        "set",
+                        &key,
+                        selected_db,
+                    );
+                    db.set(&key, entry);
+                })
+            },
+        );
     }
 
     // AOF: reuse the frozen RESP bytes directly (Arc clone, zero-copy).
@@ -3042,6 +3024,8 @@ pub(crate) fn try_inline_dispatch_loop(
     runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
     // moon#660: forwarded verbatim to `try_inline_dispatch`.
     spill_sender_active: bool,
+    // moon#963: forwarded verbatim to `try_inline_dispatch`.
+    probe: &mut crate::admin::metrics_setup::LatencyProbe<'_>,
 ) -> usize {
     if cluster_enabled {
         return 0;
@@ -3063,6 +3047,7 @@ pub(crate) fn try_inline_dispatch_loop(
             resp3,
             runtime_config,
             spill_sender_active,
+            probe,
         );
         if n == 0 {
             break;

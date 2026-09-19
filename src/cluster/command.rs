@@ -123,6 +123,17 @@ pub fn handle_cluster_info(cs: &Arc<RwLock<ClusterState>>, _self_addr: SocketAdd
     Frame::BulkString(Bytes::from(info))
 }
 
+/// Whether `args` (the arguments after `CLUSTER`) name the `REPLICATE`
+/// subcommand — the one CLUSTER subcommand that turns this node into a
+/// replica. Callers gate it on shard count before running it (moon#1015).
+pub fn is_cluster_replicate(args: &[Frame]) -> bool {
+    matches!(
+        args.first(),
+        Some(Frame::BulkString(b)) | Some(Frame::SimpleString(b))
+            if b.eq_ignore_ascii_case(b"REPLICATE")
+    )
+}
+
 /// The address to replicate from, for a `CLUSTER REPLICATE <node-id>` that
 /// just succeeded.
 ///
@@ -138,11 +149,7 @@ pub fn cluster_replicate_target(
     args: &[Frame],
     cs: &Arc<RwLock<ClusterState>>,
 ) -> Option<(String, u16)> {
-    let sub = match args.first() {
-        Some(Frame::BulkString(b)) | Some(Frame::SimpleString(b)) => b,
-        _ => return None,
-    };
-    if !sub.eq_ignore_ascii_case(b"REPLICATE") {
+    if !is_cluster_replicate(args) {
         return None;
     }
     let master_id = extract_string(args.get(1)?);
@@ -911,6 +918,18 @@ mod tests {
     fn make_cs() -> Arc<RwLock<ClusterState>> {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379);
         Arc::new(RwLock::new(ClusterState::new("a".repeat(40), addr)))
+    }
+
+    /// moon#1015: the shard-count gate keys on this, so it must match
+    /// REPLICATE in any casing and nothing else.
+    #[test]
+    fn is_cluster_replicate_matches_only_the_replicate_subcommand() {
+        let bulk = |s: &'static str| Frame::BulkString(Bytes::from_static(s.as_bytes()));
+        assert!(is_cluster_replicate(&[bulk("REPLICATE"), bulk("id")]));
+        assert!(is_cluster_replicate(&[bulk("replicate")]));
+        assert!(!is_cluster_replicate(&[bulk("REPLICAS"), bulk("id")]));
+        assert!(!is_cluster_replicate(&[bulk("INFO")]));
+        assert!(!is_cluster_replicate(&[]));
     }
 
     /// CLUSTER-06

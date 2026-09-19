@@ -37,11 +37,109 @@ fn make_rt_config() -> parking_lot::RwLock<crate::config::RuntimeConfig> {
 /// stand down and that sibling fails for a reason nothing in its body
 /// mentions. The `loading` twin does not need this — it drives a
 /// `thread_local!` — but it takes the lock anyway so the two stay symmetric.
+/// A throwaway probe for `try_inline_dispatch`'s mandatory telemetry
+/// parameter (moon#963). Leaks two small structs per call — test-only, and
+/// what lets every existing call site stay a one-line change.
+fn test_probe() -> crate::admin::metrics_setup::LatencyProbe<'static> {
+    crate::admin::metrics_setup::LatencyProbe::new(
+        Box::leak(Box::new(crate::admin::metrics_setup::CommandSampler::new())),
+        Box::leak(Box::new(
+            crate::admin::metrics_setup::CachedMetricsHandles::new(),
+        )),
+        b"",
+        b"",
+    )
+}
+
 fn inline_test_lock() -> parking_lot::MutexGuard<'static, ()> {
     // The SAME mutex `client_pause`'s own tests take — not a second one. Two
     // disjoint mutexes would leave `test_pause_and_check`'s `pause(5000, ..)`
     // free to run concurrently with an inline SET here and redden its CONTROL.
     crate::client_pause::pause_test_lock()
+}
+
+/// moon#963: the inline fast path times what it serves. 16 inline `GET`s on
+/// one probe produce exactly one sampled tick, and that sample carries the
+/// command's argv into the slowlog — so `SLOWLOG` and the duration histogram
+/// both see the path that answers plain `GET`/`SET`. Deleting the
+/// `probe.observe` wrap around the lookup (the pre-fix shape) leaves the
+/// slowlog empty and this fails.
+#[test]
+fn inline_get_and_set_are_observed_by_the_probe() {
+    let _serial = inline_test_lock();
+    let dbs = make_dbs();
+    crate::shard::slice::with_shard_db(0, |db| {
+        db.set(b"foo", Entry::new_string(Bytes::from_static(b"bar")));
+    });
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
+    let rt_config = make_rt_config();
+    let mut sampler = crate::admin::metrics_setup::CommandSampler::new();
+    let mut cache = crate::admin::metrics_setup::CachedMetricsHandles::new();
+    let slowlog = crate::admin::slowlog::Slowlog::new(128, 0); // log every sample
+    let mut probe = crate::admin::metrics_setup::LatencyProbe::with_slowlog(
+        &mut sampler,
+        &mut cache,
+        &slowlog,
+        b"127.0.0.1:7",
+        b"unit",
+    );
+
+    let mut run = |wire: &[u8], reads: bool, writes: bool| {
+        let mut read_buf = BytesMut::from(wire);
+        let mut write_buf = BytesMut::new();
+        let n = try_inline_dispatch(
+            &mut read_buf,
+            &mut write_buf,
+            &dbs,
+            0,
+            0,
+            &aof_pool,
+            &None,
+            0,
+            1,
+            reads,
+            writes,
+            false,
+            &rt_config,
+            false,
+            &mut probe,
+        );
+        assert_eq!(n, 1, "the command must have been served inline");
+        assert!(read_buf.is_empty());
+    };
+    for _ in 0..16 {
+        run(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n", true, false);
+    }
+    for _ in 0..16 {
+        run(
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbaz\r\n",
+            false,
+            true,
+        );
+    }
+    drop(probe);
+
+    let entries = slowlog.get(None);
+    assert_eq!(
+        entries.len(),
+        2,
+        "one sampled tick per 16 commands: {entries:?}"
+    );
+    // Most recent first.
+    assert_eq!(
+        entries[0].command,
+        vec![
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"foo"),
+            Bytes::from_static(b"baz")
+        ]
+    );
+    assert_eq!(
+        entries[1].command,
+        vec![Bytes::from_static(b"GET"), Bytes::from_static(b"foo")]
+    );
+    assert_eq!(entries[0].client_addr, Bytes::from_static(b"127.0.0.1:7"));
+    assert_eq!(entries[0].client_name, Bytes::from_static(b"unit"));
 }
 
 #[test]
@@ -71,6 +169,7 @@ fn test_inline_get_hit() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     assert_eq!(result, 1);
     assert!(read_buf.is_empty());
@@ -129,6 +228,7 @@ fn test_inline_get_does_not_wait_behind_a_shared_reader() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     let waited = started.elapsed();
     let _ = release_tx.send(());
@@ -184,6 +284,7 @@ fn test_inline_get_answers_a_mid_spill_key() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     assert_eq!(result, 1);
     assert_eq!(
@@ -231,6 +332,7 @@ fn test_inline_get_hit_byte_parity_sizes() {
             false, // resp3: a RESP2 connection (moon#522)
             &rt_config,
             false, // spill_sender_active (moon#660): no spill thread in unit tests
+            &mut test_probe(),
         );
 
         let mut expected = Vec::new();
@@ -280,6 +382,7 @@ fn test_inline_get_miss() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     assert_eq!(result, 1);
     assert!(read_buf.is_empty());
@@ -320,6 +423,7 @@ fn test_inline_get_miss_null_spelling_follows_protocol() {
             resp3,
             &rt_config,
             false, // spill_sender_active (moon#660): no spill thread in unit tests
+            &mut test_probe(),
         );
 
         assert_eq!(result, 1, "resp3={resp3}: the miss must still inline");
@@ -366,6 +470,7 @@ fn test_inline_get_hit_is_protocol_independent() {
             resp3,
             &rt_config,
             false, // spill_sender_active (moon#660): no spill thread in unit tests
+            &mut test_probe(),
         );
         assert_eq!(result, 1);
         assert_eq!(
@@ -403,6 +508,7 @@ fn test_inline_set_falls_through_when_writes_disabled() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     assert_eq!(result, 0, "SET should fall through inline dispatch");
     assert_eq!(read_buf.len(), original_len, "buffer should be untouched");
@@ -435,6 +541,7 @@ fn test_inline_set_executes_when_writes_enabled() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     assert_eq!(result, 1, "SET should be inlined");
     assert!(read_buf.is_empty(), "buffer should be consumed");
@@ -496,6 +603,7 @@ fn test_inline_set_stands_down_when_aof_writer_is_full() {
         false, // resp3
         &rt_config,
         false, // spill_sender_active
+        &mut test_probe(),
     );
     let took = started.elapsed();
     assert_eq!(
@@ -543,6 +651,7 @@ fn test_inline_set_stands_down_when_aof_writer_is_full() {
         false,
         &rt_config,
         false,
+        &mut test_probe(),
     );
     assert_eq!(result, 1, "with room in the channel the SET inlines");
     assert!(read_buf.is_empty());
@@ -599,6 +708,7 @@ fn test_inline_set_captures_snapshot_pre_image() {
         false, // resp3
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     let pending = snapshot_cow::pending_for_test();
     snapshot_cow::disarm();
@@ -649,6 +759,7 @@ fn test_inline_get_captures_nothing_under_snapshot() {
         false,
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     let pending = snapshot_cow::pending_for_test();
     snapshot_cow::disarm();
@@ -683,6 +794,7 @@ fn test_inline_set_with_options_falls_through() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     assert_eq!(result, 0, "SET with options should fall through");
     assert_eq!(read_buf.len(), original_len);
@@ -714,6 +826,7 @@ fn test_inline_fallthrough() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     assert_eq!(result, 0);
     assert_eq!(read_buf.len(), original_len);
@@ -752,6 +865,7 @@ fn test_inline_mixed_batch() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     assert_eq!(total, 1);
     assert_eq!(&write_buf[..], b"$3\r\nbar\r\n");
@@ -793,6 +907,7 @@ fn test_inline_get_refused_when_reads_not_inlinable() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     assert_eq!(total, 0, "GET must not be inlined when reads are gated off");
     assert_eq!(
@@ -833,6 +948,7 @@ fn test_inline_case_insensitive() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     assert_eq!(result, 1);
     assert!(read_buf.is_empty());
@@ -865,6 +981,7 @@ fn test_inline_partial() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     assert_eq!(result, 0);
     assert_eq!(read_buf.len(), original_len);
@@ -902,6 +1019,7 @@ fn test_inline_set_with_aof_falls_through_when_writes_disabled() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     assert_eq!(
         result, 0,
@@ -942,6 +1060,7 @@ fn test_inline_multiple_gets() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     assert_eq!(total, 2);
     assert!(read_buf.is_empty());
@@ -979,6 +1098,7 @@ fn test_inline_loop_disabled_in_cluster_mode() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     assert_eq!(
         total, 0,
@@ -1062,6 +1182,7 @@ fn test_inline_get_declines_for_cold_key_instead_of_blocking() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     let elapsed = start.elapsed();
 
@@ -1117,6 +1238,7 @@ fn test_inline_get_genuine_miss_still_answers_inline() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        &mut test_probe(),
     );
     assert_eq!(result, 1);
     assert!(read_buf.is_empty());
@@ -1201,6 +1323,32 @@ fn migration_eligibility_gate() {
     );
 }
 
+/// moon#1035: `flag_transaction` is redis's `flagTransaction` — it poisons an
+/// OPEN transaction and is a no-op outside one. The no-op half matters as much
+/// as the other: a flag set outside MULTI would leak into the NEXT transaction
+/// and abort it for a refusal that happened before it began.
+#[test]
+fn flag_transaction_poisons_only_an_open_transaction() {
+    let mut c = crate::server::conn::core::ConnectionState::new(
+        1,
+        "127.0.0.1:1".to_string(),
+        &None,
+        0,
+        4,
+        true,
+        128,
+        None,
+    );
+    c.flag_transaction();
+    assert!(
+        !c.multi_dirty,
+        "a refusal outside MULTI must not poison a later transaction"
+    );
+    c.in_multi = true;
+    c.flag_transaction();
+    assert!(c.multi_dirty, "a refusal inside MULTI must poison it");
+}
+
 /// moon#660: a plain `SET` must NOT inline while `CLIENT PAUSE` is in force.
 ///
 /// `client_pause::check_pause` is consulted once per frame in the GENERIC loop,
@@ -1240,6 +1388,7 @@ fn test_inline_set_stands_down_under_client_pause() {
         false,
         &rt_config,
         false,
+        &mut test_probe(),
     );
     assert_eq!(control, 1, "CONTROL: an unpaused plain SET must inline");
     assert!(read_buf.is_empty(), "CONTROL: buffer should be consumed");
@@ -1263,6 +1412,7 @@ fn test_inline_set_stands_down_under_client_pause() {
         false,
         &rt_config,
         false,
+        &mut test_probe(),
     );
     crate::client_pause::unpause();
 
@@ -1330,6 +1480,7 @@ fn test_inline_set_bails_only_when_a_spill_sender_is_live() {
             false,
             &rt_config,
             spill_sender_active,
+            &mut test_probe(),
         );
         (consumed, read_buf.len(), write_buf.len())
     };
@@ -1400,6 +1551,7 @@ fn test_inline_set_stands_down_while_loading() {
         false,
         &rt_config,
         false,
+        &mut test_probe(),
     );
     assert_eq!(control, 1, "CONTROL: a SET must inline when not loading");
 
@@ -1422,6 +1574,7 @@ fn test_inline_set_stands_down_while_loading() {
         false,
         &rt_config,
         false,
+        &mut test_probe(),
     );
     crate::shard::loading::set_loading(false);
 

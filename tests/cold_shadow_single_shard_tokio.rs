@@ -22,17 +22,17 @@
 //! bare top-level SET so it is provably going through the normal dispatch
 //! path rather than any inline fast path.
 //!
-//! To actually exercise the tokio-runtime code path this test targets, MUST
-//! be run against a binary built WITHOUT default features:
-//!   cargo build --release --no-default-features --features runtime-tokio,jemalloc
-//!   MOON_BIN=./target/release/moon cargo test --release \
-//!       --test cold_shadow_single_shard_tokio -- --ignored --nocapture
+//! It runs in the ordinary suite. `common::find_moon_binary()` resolves
+//! `CARGO_BIN_EXE_moon`, which cargo builds with the SAME features as this
+//! test, so the `runtime-tokio` legs (`Check (macOS)`, `Check (Windows)`)
+//! drive a tokio binary — the configuration the bug lives in — with no
+//! `MOON_BIN` to remember. Under default features it drives monoio, where the
+//! scenario is still a valid regression guard, just not this specific gap.
 //!
-//! `common::find_moon_binary()` falls back to a default-features (monoio)
-//! build if `MOON_BIN` is unset — the scenario below is a valid regression
-//! guard either way (the `Database::set` fix and the Phase 4b demotion call
-//! are both runtime-agnostic), but only a tokio-feature binary proves this
-//! SPECIFIC gap (main.rs's manifest branches never running) is closed.
+//! It used to be `#[ignore]`d because it shelled out to `redis-cli`, which
+//! the hosted runners do not install. That kept it off every gate while it
+//! was RED on main for weeks (moon#965): 37 probes answered the stale v1. It
+//! now speaks RESP itself through `common::Conn`.
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 
@@ -100,15 +100,34 @@ fn probe_key(i: usize) -> String {
     format!("probe:{}", i)
 }
 
-fn assert_no_error_reply(op: &str, out: &std::process::Output) {
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+/// A write that the server refused must fail the test loudly: a `-ERR` or a
+/// `MOONERR diskfull` reply would otherwise leave the key absent, and the
+/// recovery assertions below would then be measuring the refusal, not replay.
+fn assert_ok_reply(op: &str, reply: &str) {
     assert!(
-        out.status.success() && !stdout.contains("MOONERR") && !stdout.starts_with("ERR"),
-        "redis-cli {op} rejected by server: stdout={} stderr={}",
-        stdout.trim(),
-        stderr.trim()
+        reply.starts_with("+OK") && !reply.contains("MOONERR"),
+        "{op} rejected by server: {:?}",
+        reply.trim_end()
     );
+}
+
+/// Decode one RESP bulk-string reply: `$<len>\r\n<bytes>\r\n` is a value,
+/// `$-1` (RESP2) or `_` (RESP3) is nil. Anything else is a protocol surprise
+/// and fails the test rather than being read as a miss.
+fn bulk_or_nil(op: &str, reply: &str) -> Option<String> {
+    if reply.starts_with("$-1") || reply.starts_with('_') {
+        return None;
+    }
+    let body = reply
+        .strip_prefix('$')
+        .unwrap_or_else(|| panic!("{op}: expected a bulk string or nil, got {reply:?}"));
+    let (len, rest) = body
+        .split_once("\r\n")
+        .unwrap_or_else(|| panic!("{op}: truncated bulk header {reply:?}"));
+    let len: usize = len
+        .parse()
+        .unwrap_or_else(|_| panic!("{op}: bad bulk length {reply:?}"));
+    Some(rest[..len].to_string())
 }
 
 /// SETEX rather than plain SET — the monoio write-gate/inline-SET gotcha:
@@ -116,34 +135,13 @@ fn assert_no_error_reply(op: &str, out: &std::process::Output) {
 /// normal dispatch this test wants to exercise. SETEX always carries an
 /// expiry argument, forcing the full command path.
 fn redis_setex(port: u16, key: &str, ttl_secs: u64, value: &str) {
-    let out = Command::new("redis-cli")
-        .args([
-            "-p",
-            &port.to_string(),
-            "SETEX",
-            key,
-            &ttl_secs.to_string(),
-            value,
-        ])
-        .output()
-        .expect("redis-cli SETEX");
-    assert_no_error_reply(&format!("SETEX {key}"), &out);
+    let reply = common::Conn::open(port).send(&["SETEX", key, &ttl_secs.to_string(), value]);
+    assert_ok_reply(&format!("SETEX {key}"), &reply);
 }
 
 fn redis_get(port: u16, key: &str) -> Option<String> {
-    let out = Command::new("redis-cli")
-        .args(["-p", &port.to_string(), "GET", key])
-        .output()
-        .expect("redis-cli GET");
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() || s == "(nil)" {
-        None
-    } else {
-        Some(s)
-    }
+    let reply = common::Conn::open(port).send(&["GET", key]);
+    bulk_or_nil(&format!("GET {key}"), &reply)
 }
 
 /// Long TTL so expiry never interferes with the crash-recovery window; the
@@ -233,7 +231,6 @@ fn restart_moon_alive(port: u16, dir: &std::path::Path) -> common::ServerGuard {
 }
 
 #[test]
-#[ignore] // requires a built moon binary (MOON_BIN or target/release/moon) + redis-cli
 fn single_shard_overwritten_cold_key_returns_new_value_after_crash() {
     let dir = unique_dir("overwrite");
     std::fs::create_dir_all(&dir).expect("create test dir");

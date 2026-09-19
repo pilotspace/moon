@@ -1189,8 +1189,12 @@ async fn test_txn_commit_wal_crash_recovery() {
                     })
                 })
                 .is_some();
-            let single = std::fs::metadata(&single_file_aof)
-                .map(|m| m.len() > 0)
+            // The rewrite's RDB preamble (`MOON` magic at offset 0), NOT
+            // "non-empty": since moon#914 a fresh tokio AOF opens with its
+            // `MOON.COLDCUT` head at boot, so non-empty no longer means the
+            // rewrite (or even the first write flush) has landed.
+            let single = std::fs::read(&single_file_aof)
+                .map(|b| b.starts_with(b"MOON"))
                 .unwrap_or(false);
             if base_rdb || single {
                 break true;

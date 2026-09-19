@@ -83,7 +83,7 @@ pub(super) fn spsc_eviction_gate(
                 .budget(budget)
                 .report(on_plain_drop),
         );
-        spill_file_id.set(fid);
+        spill_file_id.set(spill_file_id.get().max(fid));
         res
     } else {
         evict_to_budget(
@@ -161,6 +161,13 @@ pub(crate) fn drain_spsc_shared(
     spill_sender: Option<&flume::Sender<SpillRequest>>,
     spill_file_id: &Rc<Cell<u64>>,
     disk_offload_dir: Option<&std::path::Path>,
+    // moon#982: this shard's command sampler + metric-handle cache. Every
+    // command a drain cycle executes on behalf of ANOTHER shard's connection
+    // is observed through one `LatencyProbe` built from these, so a routed
+    // command lands in `total_commands_processed` and the duration
+    // histogram exactly like a connection-local one.
+    sampler: &mut crate::admin::metrics_setup::CommandSampler,
+    metrics: &mut crate::admin::metrics_setup::CachedMetricsHandles,
 ) -> bool {
     const MAX_DRAIN_PER_CYCLE: usize = 256;
     let mut drained = 0;
@@ -201,6 +208,15 @@ pub(crate) fn drain_spsc_shared(
         DRAIN_SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
     execute_batch.clear();
     other_messages.clear();
+
+    // moon#982: ONE probe per drain cycle — the inline loop's one-per-batch
+    // shape. The command's own client is on another thread and the message
+    // does not carry its identity, so a slowlog entry produced here has an
+    // empty client address/name. The probe is dropped explicitly below,
+    // before the scratch buffers go back, which is what flushes this
+    // cycle's observed count into the thread's `total_commands_processed`
+    // slot as one add.
+    let mut probe = crate::admin::metrics_setup::LatencyProbe::new(sampler, metrics, b"", b"");
 
     // Self-queue FIRST: same-shard tasks (inline PSYNC RegisterReplica,
     // local-write ReplicaLiveFanout) cannot SPSC to their own shard — the
@@ -350,6 +366,7 @@ pub(crate) fn drain_spsc_shared(
                 spill_sender,
                 spill_file_id,
                 disk_offload_dir,
+                &mut probe,
             );
         }
     }
@@ -387,8 +404,12 @@ pub(crate) fn drain_spsc_shared(
             spill_sender,
             spill_file_id,
             disk_offload_dir,
+            &mut probe,
         );
     }
+
+    // moon#982: land this cycle's routed-command count before the cycle ends.
+    drop(probe);
 
     // Return the (now drained) scratch buffers so their capacity is reused
     // by the next drain cycle.
@@ -401,6 +422,15 @@ pub(crate) fn drain_spsc_shared(
     // self-re-notify so the tail is drained on the next loop iteration instead
     // of stranding until the next periodic tick.
     drained >= MAX_DRAIN_PER_CYCLE || snapshot_seen
+}
+
+/// The slowlog view of a routed command's frame, whether the arm holds it as
+/// `Arc<Frame>` (`Execute*`, `PipelineBatch*`) or `Frame` (`MultiExecute*`).
+#[inline]
+fn slowlog_argv<F: std::borrow::Borrow<crate::protocol::Frame>>(
+    frame: &F,
+) -> crate::admin::slowlog::SlowlogArgv<'_> {
+    crate::admin::slowlog::SlowlogArgv::from(frame.borrow())
 }
 
 /// Process a single cross-shard message using shared database access.
@@ -452,6 +482,11 @@ pub(crate) fn handle_shard_message_shared(
     spill_sender: Option<&flume::Sender<SpillRequest>>,
     spill_file_id: &Rc<Cell<u64>>,
     disk_offload_dir: Option<&std::path::Path>,
+    // moon#982: the drain cycle's telemetry probe. Every arm that runs a
+    // client command through `cmd_dispatch` observes it here — the same
+    // `observe` the connection handlers use, so there is one spelling of
+    // "time this command" on both sides of the SPSC boundary.
+    probe: &mut crate::admin::metrics_setup::LatencyProbe<'_>,
 ) {
     match msg {
         ShardMessage::Execute {
@@ -981,7 +1016,11 @@ pub(crate) fn handle_shard_message_shared(
                             let mut db = s.databases.write(db_idx);
                             db.refresh_now_from_cache(cached_clock);
                             let mut selected = db_idx;
-                            let result = cmd_dispatch(&mut db, cmd, args, &mut selected, db_count);
+                            // moon#982: routed command — the timed interval is
+                            // exactly the dispatch, as on the local paths.
+                            let result = probe.observe(cmd, slowlog_argv(&command), || {
+                                cmd_dispatch(&mut db, cmd, args, &mut selected, db_count)
+                            });
                             let frame = match result {
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => f,
@@ -1215,7 +1254,11 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     let mut selected = db_idx;
-                    let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
+                    // moon#982: routed command — the timed interval is exactly
+                    // the dispatch, as on the local paths.
+                    let result = probe.observe(cmd, slowlog_argv(cmd_frame), || {
+                        cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count)
+                    });
                     let frame = match result {
                         DispatchResult::Response(f) => f,
                         DispatchResult::Quit(f) => f,
@@ -1412,7 +1455,11 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     let mut selected = db_idx;
-                    let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
+                    // moon#982: routed command — the timed interval is exactly
+                    // the dispatch, as on the local paths.
+                    let result = probe.observe(cmd, slowlog_argv(cmd_frame), || {
+                        cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count)
+                    });
                     let frame = match result {
                         DispatchResult::Response(f) => f,
                         DispatchResult::Quit(f) => f,
@@ -1654,7 +1701,11 @@ pub(crate) fn handle_shard_message_shared(
                             let mut db = s.databases.write(db_idx);
                             db.refresh_now_from_cache(cached_clock);
                             let mut selected = db_idx;
-                            let result = cmd_dispatch(&mut db, cmd, args, &mut selected, db_count);
+                            // moon#982: routed command — the timed interval is
+                            // exactly the dispatch, as on the local paths.
+                            let result = probe.observe(cmd, slowlog_argv(&command), || {
+                                cmd_dispatch(&mut db, cmd, args, &mut selected, db_count)
+                            });
                             let frame = match result {
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => f,
@@ -1846,7 +1897,11 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     let mut selected = db_idx;
-                    let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
+                    // moon#982: routed command — the timed interval is exactly
+                    // the dispatch, as on the local paths.
+                    let result = probe.observe(cmd, slowlog_argv(cmd_frame), || {
+                        cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count)
+                    });
                     let frame = match result {
                         DispatchResult::Response(f) => f,
                         DispatchResult::Quit(f) => f,
@@ -2044,7 +2099,11 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     let mut selected = db_idx;
-                    let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
+                    // moon#982: routed command — the timed interval is exactly
+                    // the dispatch, as on the local paths.
+                    let result = probe.observe(cmd, slowlog_argv(cmd_frame), || {
+                        cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count)
+                    });
                     let frame = match result {
                         DispatchResult::Response(f) => f,
                         DispatchResult::Quit(f) => f,
@@ -2260,7 +2319,6 @@ pub(crate) fn handle_shard_message_shared(
                 wait_id,
                 cmd,
                 reply_tx,
-                sole_key,
             } = *payload;
             // moon#556: THIS shard owns the key, so it is the only one that
             // can answer the type question for it. A blocking pop on an
@@ -2270,38 +2328,33 @@ pub(crate) fn handle_shard_message_shared(
             // remote case keeps the old behaviour (the waker finds nothing to
             // pop and answers a null the client reads as "empty").
             //
-            // Gated on `sole_key`: for a multi-key waiter the sibling keys are
-            // registered on other shards and may be serving right now, and an
-            // error raised here would race a real wake-up whose element has
-            // already left the keyspace. Those keep the pre-#556 behaviour.
+            // Unconditional since moon#989: this message now carries only a
+            // single-key waiter (the key IS the command). Multi-key waiters
+            // register through `BlockRegisterGroup`, which makes the same
+            // decision only when it holds every key of the command.
             let mut cmd = cmd;
-            let type_error = if sole_key {
-                crate::shard::slice::with_shard_db(db_index, |guard| {
-                    match cmd.family() {
-                        // moon#832: a type probe before parking a waiter must
-                        // not rewrite the value it is probing — `get_list`
-                        // (via `get_promoted`) flattened the list's compact
-                        // encoding on every remote blocking registration.
-                        crate::blocking::WaitFamily::List => {
-                            let now_ms = guard.now_ms();
-                            guard.get_list_ref_if_alive(&key, now_ms).err()
-                        }
-                        crate::blocking::WaitFamily::ZSet => guard.get_sorted_set(&key).err(),
-                        // moon#595: `-WRONGTYPE` for a stream read on the
-                        // wrong type, plus XREADGROUP's missing-key and
-                        // missing-group errors. The client's own scan cannot
-                        // see a key it does not own, so — exactly as moon#556
-                        // argued for the pops — the check has to happen here
-                        // too or the remote case parks on a key that can never
-                        // serve it.
-                        crate::blocking::WaitFamily::Stream => {
-                            crate::blocking::wakeup::stream_register_error(guard, &key, &cmd)
-                        }
+            let type_error = crate::shard::slice::with_shard_db(db_index, |guard| {
+                match cmd.family() {
+                    // moon#832: a type probe before parking a waiter must not
+                    // rewrite the value it is probing — `get_list` (via
+                    // `get_promoted`) flattened the list's compact encoding
+                    // on every remote blocking registration.
+                    crate::blocking::WaitFamily::List => {
+                        let now_ms = guard.now_ms();
+                        guard.get_list_ref_if_alive(&key, now_ms).err()
                     }
-                })
-            } else {
-                None
-            };
+                    crate::blocking::WaitFamily::ZSet => guard.get_sorted_set(&key).err(),
+                    // moon#595: `-WRONGTYPE` for a stream read on the wrong
+                    // type, plus XREADGROUP's missing-key and missing-group
+                    // errors. The client's own scan cannot see a key it does
+                    // not own, so — exactly as moon#556 argued for the pops —
+                    // the check has to happen here too or the remote case
+                    // parks on a key that can never serve it.
+                    crate::blocking::WaitFamily::Stream => {
+                        crate::blocking::wakeup::stream_register_error(guard, &key, &cmd)
+                    }
+                }
+            });
             if let Some(err) = type_error {
                 // Never registered, so there is nothing to unwind: the
                 // client's `BlockCancel` on the way out is a no-op.
@@ -2335,6 +2388,16 @@ pub(crate) fn handle_shard_message_shared(
                         &mut reg, guard, db_index, &key,
                     );
                 }
+            });
+        }
+        ShardMessage::BlockRegisterGroup(payload) => {
+            // moon#989: every key this shard owns of one multi-key waiter, in
+            // ONE message — so registering, type-checking and serving them is
+            // one synchronous stretch and the waiter is served at most once.
+            let db_index = payload.db_index;
+            let mut reg = blocking_registry.borrow_mut();
+            crate::shard::slice::with_shard_db(db_index, |guard| {
+                crate::blocking::group::register_group(&mut reg, guard, *payload);
             });
         }
         ShardMessage::BlockCancel { wait_id } => {
@@ -3096,6 +3159,7 @@ pub(crate) fn handle_shard_message_shared(
                 reply_tx,
                 proto,
                 watched,
+                script_acl,
             } = *payload;
             let mut exec_publishes: Vec<(usize, bytes::Bytes, bytes::Bytes)> = Vec::new();
             // c10k E2: a queued FLUSHDB/FLUSHALL clears only THIS shard's
@@ -3111,6 +3175,41 @@ pub(crate) fn handle_shard_message_shared(
             // originator.
             let mut exec_wakes: Vec<(usize, bytes::Bytes, crate::blocking::WaitFamily)> =
                 Vec::new();
+            // moon#894: a queued script runs in the body on THIS shard's VM,
+            // cache and function registry, as the ORIGINATING user. Built only
+            // when the body holds a script (`script_acl` is `Some` exactly
+            // then). A shard with no Lua runtime leaves it `None`, and the
+            // executor answers each script with an error instead of skipping
+            // it.
+            let txn_script_rt = match (script_acl.as_ref(), lua_rt) {
+                (Some(_), Some(rt)) => rt.vm().map(|vm| {
+                    let slot = crate::scripting::shard_function_registry();
+                    // Build the registry on first use, exactly as the routed
+                    // FCALL arm above does; `try_borrow_mut` for the same
+                    // no-panic-on-the-shard-thread reason.
+                    if let Ok(mut guard) = slot.try_borrow_mut()
+                        && guard.is_none()
+                    {
+                        *guard = Some(crate::scripting::FunctionRegistry::new(
+                            rt.eviction_ctx().clone(),
+                        ));
+                    }
+                    (vm, slot, rt.num_shards())
+                }),
+                _ => None,
+            };
+            let txn_scripting = match (script_acl.as_ref(), txn_script_rt.as_ref()) {
+                (Some(acl), Some((vm, slot, num_shards))) => {
+                    Some(crate::server::conn::txn_script::TxnScripting {
+                        lua: vm,
+                        script_cache,
+                        functions: slot,
+                        script_acl: acl,
+                        num_shards: *num_shards,
+                    })
+                }
+                _ => None,
+            };
             let (result, aof_entries, graph_records) =
                 crate::server::conn::shared::execute_transaction_sharded(
                     shard_databases,
@@ -3123,6 +3222,7 @@ pub(crate) fn handle_shard_message_shared(
                     &mut exec_flushes,
                     &mut exec_wakes,
                     &watched,
+                    txn_scripting.as_ref(),
                 );
             // The waiters are registered HERE, on the owning shard's registry
             // — the same one the live cross-shard write path wakes.
@@ -4917,6 +5017,8 @@ mod drain_cap_tests {
         // unset (evict_active == false) is the fast, no-op path.
         let rtcfg = Arc::new(parking_lot::RwLock::new(RuntimeConfig::default()));
         let spill_fid = Rc::new(Cell::new(1u64));
+        let mut sampler = crate::admin::metrics_setup::CommandSampler::new();
+        let mut metrics = crate::admin::metrics_setup::CachedMetricsHandles::new();
 
         // BlockCancel messages don't touch ShardSlice, so no init_shard needed.
         // First cycle: 300 queued > 256 cap -> drains exactly 256, reports tail.
@@ -4948,6 +5050,8 @@ mod drain_cap_tests {
             None,
             &spill_fid,
             None,
+            &mut sampler,
+            &mut metrics,
         );
         assert!(
             hit_cap,
@@ -4983,6 +5087,8 @@ mod drain_cap_tests {
             None,
             &spill_fid,
             None,
+            &mut sampler,
+            &mut metrics,
         );
         assert!(
             !hit_cap2,
@@ -4990,6 +5096,143 @@ mod drain_cap_tests {
         );
         use ringbuf::traits::Observer;
         assert!(consumers[0].is_empty(), "all 300 messages must be consumed");
+    }
+
+    fn argv(parts: &[&'static [u8]]) -> crate::protocol::Frame {
+        crate::protocol::Frame::Array(crate::protocol::FrameVec::from(
+            parts
+                .iter()
+                .map(|p| crate::protocol::Frame::BulkString(bytes::Bytes::from_static(p)))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    /// moon#982: every command an SPSC execute arm runs is observed by the
+    /// drain cycle's probe, so it lands in this thread's
+    /// `total_commands_processed` slot when the probe drops — one
+    /// `PipelineBatchSlotted` of three plus one `ExecuteSlotted` is four,
+    /// on a thread that ran nothing else. Pre-fix the delta was 0.
+    #[test]
+    fn routed_commands_land_in_total_commands_processed() {
+        // A fresh OS thread: `init_shard` is once-per-thread and the counter
+        // slot is per-thread, so nothing else can move the delta.
+        std::thread::spawn(|| {
+            let (shard_databases_inner, mut inits) =
+                ShardDatabases::new(vec![vec![Database::new()]]);
+            crate::shard::slice::init_shard(crate::shard::slice::ShardSlice::new(inits.remove(0)));
+            let shard_databases = Arc::new(shard_databases_inner);
+            let rb = HeapRb::<ShardMessage>::new(8);
+            let (mut prod, cons) = rb.split();
+
+            let batch_slot = Arc::new(crate::server::response_slot::ResponseSlot::new());
+            let single_slot = Arc::new(crate::server::response_slot::ResponseSlot::new());
+            assert!(
+                prod.try_push(ShardMessage::PipelineBatchSlotted {
+                    db_index: 0,
+                    commands: vec![
+                        Arc::new(argv(&[b"SET", b"k", b"v"])),
+                        Arc::new(argv(&[b"GET", b"k"])),
+                        Arc::new(argv(&[b"INCR", b"n"])),
+                    ],
+                    response_slot: crate::shard::dispatch::ResponseSlotPtr(Arc::clone(&batch_slot)),
+                })
+                .is_ok()
+            );
+            assert!(
+                prod.try_push(ShardMessage::ExecuteSlotted {
+                    db_index: 0,
+                    command: Arc::new(argv(&[b"GET", b"k"])),
+                    response_slot: crate::shard::dispatch::ResponseSlotPtr(Arc::clone(
+                        &single_slot
+                    )),
+                })
+                .is_ok()
+            );
+            let mut consumers = vec![cons];
+
+            let pubsub = parking_lot::RwLock::new(PubSubRegistry::new());
+            let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
+            let mut pending_snapshot = None;
+            let mut snapshot_state: Option<SnapshotState> = None;
+            let mut wal_writer: Option<WalWriterV3> = None;
+            let backlog: crate::replication::backlog::SharedBacklog =
+                Arc::new(parking_lot::Mutex::new(None));
+            let mut replica_txs = Vec::new();
+            let offsets: Option<crate::replication::state::OffsetHandle> = None;
+            let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
+            let clock = CachedClock::new();
+            let mut migrations = Vec::new();
+            let mut cdc = Vec::new();
+            let mut manifest = None;
+            let mut autovacuum =
+                crate::shard::autovacuum::AutovacuumDaemon::new(Default::default());
+            let rtcfg = Arc::new(parking_lot::RwLock::new(RuntimeConfig::default()));
+            let spill_fid = Rc::new(Cell::new(1u64));
+            let mut sampler = crate::admin::metrics_setup::CommandSampler::new();
+            let mut metrics = crate::admin::metrics_setup::CachedMetricsHandles::new();
+
+            let before = crate::admin::metrics_setup::this_thread_commands();
+            drain_spsc_shared(
+                &shard_databases,
+                &mut consumers,
+                &pubsub,
+                &blocking,
+                &mut pending_snapshot,
+                &mut snapshot_state,
+                &mut wal_writer,
+                &backlog,
+                &mut replica_txs,
+                &offsets,
+                0,
+                &script_cache,
+                None,
+                &clock,
+                &mut migrations,
+                &mut cdc,
+                &mut manifest,
+                1000,
+                8,
+                0.2,
+                &mut autovacuum,
+                None,
+                true,
+                &rtcfg,
+                None,
+                &spill_fid,
+                None,
+                &mut sampler,
+                &mut metrics,
+            );
+            let counted = crate::admin::metrics_setup::this_thread_commands() - before;
+
+            // The arms ran: the replies are the real ones.
+            let batch = batch_slot
+                .try_take()
+                .expect("PipelineBatchSlotted filled its slot");
+            assert_eq!(batch.len(), 3);
+            assert!(
+                matches!(&batch[0], crate::protocol::Frame::SimpleString(s) if s.as_ref() == b"OK"),
+                "{:?}",
+                batch[0]
+            );
+            assert!(
+                matches!(&batch[2], crate::protocol::Frame::Integer(1)),
+                "{:?}",
+                batch[2]
+            );
+            let single = single_slot
+                .try_take()
+                .expect("ExecuteSlotted filled its slot");
+            assert_eq!(single.len(), 1);
+
+            assert_eq!(
+                counted, 4,
+                "moon#982: four routed commands executed by the SPSC arms must all land in \
+                 total_commands_processed"
+            );
+        })
+        .join()
+        .expect("shard thread");
     }
 }
 

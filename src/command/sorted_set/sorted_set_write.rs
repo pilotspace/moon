@@ -1,9 +1,9 @@
 use bytes::Bytes;
-use std::collections::HashMap;
+use ordered_float::OrderedFloat;
 
 use crate::protocol::Frame;
 use crate::storage::Database;
-use crate::storage::db::{Shape, zset_member_cost, zset_table_bytes};
+use crate::storage::db::{Shape, SortedSetRef, zset_member_cost, zset_table_bytes};
 use crate::storage::listpack::PairUpdate;
 use crate::storage::zset_score::{ScoreBuf, render_score};
 
@@ -11,8 +11,9 @@ use crate::command::helpers::{all_args_are_bytes, err, err_wrong_args, extract_b
 use crate::command::sorted_set::work_budget;
 
 use super::{
-    AggregateOp, clamp_nan_to_zero, format_score, format_score_bytes, zadd_member, zrange_by_lex,
-    zrange_by_rank, zrange_by_score, zrem_member, zset_insert_absent, zset_update_existing,
+    LexBound, ScoreBound, format_score, format_score_bytes, lex_in_range, parse_bounded_count,
+    parse_lex_bound, parse_score_bound, rank_window, zrem_member, zset_insert_absent,
+    zset_update_existing,
 };
 
 // ---------------------------------------------------------------------------
@@ -102,7 +103,7 @@ fn resolved_pair<'a>(
 // through `render_score`); the closures below read it as 0.0 so the member is
 // still FOUND and updated in place rather than duplicated.
 
-/// ZADD key [NX|XX] [GT|LT] [CH] score member [score member ...]
+/// ZADD key [NX|XX] [GT|LT] [CH] [INCR] score member [score member ...]
 pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 3 {
         return err_wrong_args("ZADD");
@@ -118,6 +119,7 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     let mut gt = false;
     let mut lt = false;
     let mut ch = false;
+    let mut incr = false;
     let mut i = 1;
 
     while i < args.len() {
@@ -140,6 +142,9 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
         } else if arg.eq_ignore_ascii_case(b"CH") {
             ch = true;
             i += 1;
+        } else if arg.eq_ignore_ascii_case(b"INCR") {
+            incr = true;
+            i += 1;
         } else {
             break;
         }
@@ -149,15 +154,44 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
     if nx && xx {
         return err("ERR XX and NX options at the same time are not compatible");
     }
-    // NX and GT/LT are not compatible
-    if nx && (gt || lt) {
-        return err("ERR GT, LT, and NX options at the same time are not compatible");
+    // GT, LT and NX are pairwise incompatible (moon#969). The old guard only
+    // caught `nx && (gt || lt)`, so `GT LT` was ACCEPTED and then silently did
+    // nothing — Redis's `zaddGenericCommand` rejects all three pairings, and
+    // its message says "and/or".
+    if (gt && nx) || (lt && nx) || (gt && lt) {
+        return err("ERR GT, LT, and/or NX options at the same time are not compatible");
     }
 
     // Remaining args must be score member pairs
     let remaining = &args[i..];
-    if remaining.is_empty() || !remaining.len().is_multiple_of(2) {
+    if remaining.is_empty() {
         return err_wrong_args("ZADD");
+    }
+    // An ODD tail is a different class from NO tail (moon#969): Redis fails
+    // `ZADD k 1 a 2` in `zaddGenericCommand` with `syntax error`, and only a
+    // command with no pairs at all (`ZADD k NX`) trips `commandCheckArity`.
+    if !remaining.len().is_multiple_of(2) {
+        return err("ERR syntax error");
+    }
+
+    // `INCR` (moon#959): ZINCRBY's arithmetic under ZADD's flags, replying the
+    // new score as a bulk string, or nil when a flag refused the write. Redis
+    // checks the pair count AFTER the parity and flag-pairing rules above, so
+    // `ZADD k INCR 1` is `syntax error` and `ZADD k INCR NX XX 1 a 2 b` is the
+    // NX/XX error — both verified on redis 8.6.1. The increment is parsed by
+    // the ONE parser every `score member` pair goes through, so a NaN or a
+    // non-float is refused with `ZADD`'s own message before the keyspace is
+    // touched.
+    if incr {
+        if remaining.len() != 2 {
+            return err("ERR INCR option supports a single increment-element pair");
+        }
+        let (increment, member) = match parse_zadd_pair(&remaining[0], &remaining[1]) {
+            Ok(pair) => pair,
+            Err(e) => return e,
+        };
+        // `CH` has no effect on the INCR reply, as on Redis.
+        return zincr_member(db, key, increment, member, IncrFlags { nx, xx, gt, lt });
     }
 
     // moon#814: validate EVERY pair BEFORE touching the keyspace.
@@ -313,10 +347,14 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                         work_budget::note_stored_score_parse();
                         let old = current.as_score().unwrap_or(0.0);
                         old_score = old;
+                        // `gt && lt` no longer reaches here: the guard above
+                        // rejects that pairing outright (moon#969). The arm
+                        // that used to sit between `nx` and `gt` answered
+                        // `false` — a SILENT no-op for a command Redis
+                        // refuses — and is gone rather than left unreachable,
+                        // so relaxing the guard cannot quietly resurrect it.
                         let should_update = if nx {
                             false // NX: never update existing
-                        } else if gt && lt {
-                            false // GT+LT together: never update
                         } else if gt {
                             score > old
                         } else if lt {
@@ -337,7 +375,18 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                             // `CH` is on the `consults_old` side, so
                             // `old_score` is the real stored score whenever
                             // this tally can be read.
-                            if (old_score - score).abs() > f64::EPSILON {
+                            //
+                            // moon#792: EXACTLY, as Redis's `zsetAdd` does
+                            // (`if (score != curscore)`). An absolute
+                            // `f64::EPSILON` window called any move smaller
+                            // than ~2.2e-16 "unchanged" REGARDLESS of
+                            // magnitude, so rescoring 1e-10 to 1.0000001e-10 —
+                            // a change of six significant figures — replied 0
+                            // while the stored score really did move, and the
+                            // next read disagreed with the reply. Neither side
+                            // can be NaN: `parse_zadd_pair` rejects a NaN
+                            // score, so `!=` is total here.
+                            if old_score != score {
                                 changed += 1;
                             }
                         }
@@ -432,10 +481,12 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
         // so the score never has to be looked up a second time to write it.
         let mut accepted = false;
         let existing_score: Option<f64> = zset_update_existing(members, scores, member, |old| {
+            // The second of the two `gt && lt` fallthroughs moon#969 left
+            // standing (the listpack arm has the other). The guard at the top
+            // of `zadd` now rejects the pairing, so this arm was both dead and
+            // wrong; it is removed rather than left unreachable.
             let should_update = if nx {
                 false // NX: never update existing
-            } else if gt && lt {
-                false // GT+LT together: never update (mutually exclusive)
             } else if gt {
                 score > old
             } else if lt {
@@ -452,9 +503,15 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                 // `accepted` is the closure's own decision, read back rather
                 // than re-derived: the flag logic has ONE spelling, so the
                 // write and the `CH` tally can never disagree about it.
-                // `changed` then reports whether the score MOVED, on the same
-                // epsilon rule this command has always used.
-                if accepted && (old - score).abs() > f64::EPSILON {
+                //
+                // moon#792, the B+tree half: `changed` reports whether the
+                // score MOVED, compared EXACTLY as Redis's `zsetAdd` does. The
+                // old absolute `f64::EPSILON` window disagreed with
+                // `zset_update_existing`, which decides on `to_bits()` — so a
+                // sub-epsilon rescore really was written to both structures
+                // and then reported as no change. Neither side can be NaN
+                // (`parse_zadd_pair` rejects a NaN score).
+                if accepted && old != score {
                     changed += 1;
                 }
             }
@@ -595,6 +652,229 @@ pub fn zrem(db: &mut Database, args: &[Frame]) -> Frame {
     Frame::Integer(removed)
 }
 
+// ---------------------------------------------------------------------------
+// ZREMRANGEBYRANK / ZREMRANGEBYSCORE / ZREMRANGEBYLEX (moon#959)
+// ---------------------------------------------------------------------------
+
+/// The window a `ZREMRANGEBY*` command deletes, parsed BEFORE the keyspace is
+/// touched so a bad bound never fabricates or reclaims a key — Redis parses
+/// the range first and only then looks the key up, so `ZREMRANGEBYSCORE
+/// nokey a 1` is `min or max is not a float` and not `0`.
+enum RemRange {
+    Rank(i64, i64),
+    Score(ScoreBound, ScoreBound),
+    Lex(LexBound, LexBound),
+}
+
+impl RemRange {
+    /// The members of a score-sorted decode that fall inside the window.
+    /// Borrowed from `entries`, which is the caller's own copy, so the
+    /// listpack they came from can be mutated while these are consumed.
+    fn select<'a>(&self, entries: &'a [(Bytes, f64)]) -> Vec<&'a Bytes> {
+        match self {
+            RemRange::Rank(start, stop) => match rank_window(*start, *stop, entries.len()) {
+                Some((lo, hi)) => entries[lo..=hi].iter().map(|(m, _)| m).collect(),
+                None => Vec::new(),
+            },
+            RemRange::Score(min, max) => entries
+                .iter()
+                .filter(|(_, s)| min.includes(*s) && max.includes_upper(*s))
+                .map(|(m, _)| m)
+                .collect(),
+            RemRange::Lex(min, max) => entries
+                .iter()
+                .filter(|(m, _)| lex_in_range(m, min, max))
+                .map(|(m, _)| m)
+                .collect(),
+        }
+    }
+}
+
+/// ZREMRANGEBYRANK key start stop
+pub fn zremrangebyrank(db: &mut Database, args: &[Frame]) -> Frame {
+    let (key, min_b, max_b) = match zremrange_args(args, "ZREMRANGEBYRANK") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    // A rank index is read with a NULL message on Redis, so the generic
+    // integer error is the right class here (moon#969 documents the same for
+    // ZRANGE's indices).
+    let parse = |b: &[u8]| -> Result<i64, Frame> {
+        std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| err("ERR value is not an integer or out of range"))
+    };
+    let (start, stop) = match (parse(min_b), parse(max_b)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return e,
+    };
+    zremrange_impl(db, key, RemRange::Rank(start, stop))
+}
+
+/// ZREMRANGEBYSCORE key min max
+pub fn zremrangebyscore(db: &mut Database, args: &[Frame]) -> Frame {
+    let (key, min_b, max_b) = match zremrange_args(args, "ZREMRANGEBYSCORE") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (min, max) = match (parse_score_bound(min_b), parse_score_bound(max_b)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return e,
+    };
+    zremrange_impl(db, key, RemRange::Score(min, max))
+}
+
+/// ZREMRANGEBYLEX key min max
+pub fn zremrangebylex(db: &mut Database, args: &[Frame]) -> Frame {
+    let (key, min_b, max_b) = match zremrange_args(args, "ZREMRANGEBYLEX") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (min, max) = match (parse_lex_bound(min_b), parse_lex_bound(max_b)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return e,
+    };
+    zremrange_impl(db, key, RemRange::Lex(min, max))
+}
+
+/// The `key min max` shape all three share: exactly three arguments (their
+/// registered arity is 4), every one a bulk string.
+fn zremrange_args<'a>(
+    args: &'a [Frame],
+    cmd: &'static str,
+) -> Result<(&'a Bytes, &'a Bytes, &'a Bytes), Frame> {
+    if args.len() != 3 {
+        return Err(err_wrong_args(cmd));
+    }
+    match (
+        extract_bytes(&args[0]),
+        extract_bytes(&args[1]),
+        extract_bytes(&args[2]),
+    ) {
+        (Some(k), Some(min), Some(max)) => Ok((k, min, max)),
+        _ => Err(err_wrong_args(cmd)),
+    }
+}
+
+/// Delete every member inside `range` and reply how many went.
+///
+/// The same two-arm shape as `zrem` (moon#897): a listpack is trimmed in
+/// place and never converted — a removal cannot cross a threshold upward —
+/// and the B+tree arm credits each member's cost and the table shrink exactly
+/// as `zrem` does. A key that drains to empty is removed on both arms, which
+/// is also what reclaims the empty container `get_or_create_zset_listpack`
+/// fabricates for a missing key, so `ZREMRANGEBYRANK nokey 0 1` answers `0`
+/// and leaves no key behind.
+///
+/// The victims are materialised before the first removal on both arms: a
+/// listpack keeps insertion order, so the window is decided on a score-sorted
+/// decode (bounded by `zset-max-listpack-entries`), and a B+tree cannot be
+/// mutated while its iterator is live. The B+tree list holds `Bytes` handles,
+/// which are reference-count bumps rather than copies.
+fn zremrange_impl(db: &mut Database, key: &[u8], range: RemRange) -> Frame {
+    match db.get_or_create_zset_listpack(key) {
+        Ok(Some(lp)) => {
+            // Listpack `estimate_memory()` is O(1) (capacity-based).
+            let before = lp.estimate_memory();
+            let entries = SortedSetRef::Listpack(&*lp).entries_sorted();
+            let mut removed = 0i64;
+            for member in range.select(&entries) {
+                // `remove_pair` matches the FIELD half only — the member,
+                // never the score — and drains both entries in one scan.
+                if lp.remove_pair(member) {
+                    removed += 1;
+                }
+            }
+            let after = lp.estimate_memory();
+            let is_empty = lp.is_empty();
+            // `lp`'s borrow of `db` ends here.
+            db.adjust_memory(before, after);
+            if is_empty {
+                db.remove(key);
+            }
+            return Frame::Integer(removed);
+        }
+        // Already the full B+tree form (or a cold-promoted value, which never
+        // decodes compact): fall through.
+        Ok(None) => {}
+        Err(e) => return e, // WRONGTYPE
+    }
+
+    let (members, scores) = match db.get_or_create_sorted_set(key) {
+        Ok(pair) => pair,
+        Err(e) => return e,
+    };
+
+    let victims: Vec<Bytes> = match &range {
+        RemRange::Rank(start, stop) => match rank_window(*start, *stop, scores.len()) {
+            Some((lo, hi)) => scores
+                .range_by_rank(lo, hi)
+                .into_iter()
+                .map(|(_, m)| m.clone())
+                .collect(),
+            None => Vec::new(),
+        },
+        RemRange::Score(min, max) => {
+            // `BPTree::range` wants `lo <= hi`; a reversed pair is an empty
+            // window on Redis (`ZREMRANGEBYSCORE k 3 1` removes nothing), and
+            // the bound filters keep an exclusive or infinite edge exact.
+            let lo = OrderedFloat(min.value());
+            let hi = OrderedFloat(max.value());
+            if lo > hi {
+                Vec::new()
+            } else {
+                scores
+                    .range(lo, hi)
+                    .filter(|(s, _)| min.includes(s.0) && max.includes_upper(s.0))
+                    .map(|(_, m)| m.clone())
+                    .collect()
+            }
+        }
+        RemRange::Lex(min, max) => scores
+            .iter()
+            .filter(|(_, m)| lex_in_range(m, min, max))
+            .map(|(_, m)| m.clone())
+            .collect(),
+    };
+
+    let mut removed = 0i64;
+    let mut credit: usize = 0;
+    let table_before = zset_table_bytes(members, scores);
+    for member in &victims {
+        if zrem_member(members, scores, member) {
+            removed += 1;
+            credit += zset_member_cost(member);
+        }
+    }
+    let is_empty = members.is_empty();
+    let table_after = zset_table_bytes(members, scores);
+    // `members`/`scores`' borrow of `db` ends above.
+    db.credit_memory(credit);
+    // Unconditional, as in `zrem`: `db.remove` credits `entry_overhead`
+    // recomputed from the CURRENT value, and a shrunken table's capacity
+    // must be credited here or it is stranded.
+    db.adjust_memory(table_before, table_after);
+    if is_empty {
+        db.remove(key);
+    }
+    Frame::Integer(removed)
+}
+
+// ---------------------------------------------------------------------------
+// ZINCRBY, and the arithmetic core it shares with `ZADD ... INCR`
+// ---------------------------------------------------------------------------
+
+/// The `ZADD` flags that bear on an increment (moon#959). All false for a
+/// plain `ZINCRBY`.
+#[derive(Debug, Clone, Copy, Default)]
+struct IncrFlags {
+    nx: bool,
+    xx: bool,
+    gt: bool,
+    lt: bool,
+}
+
 /// ZINCRBY key increment member
 pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 3 {
@@ -609,7 +889,7 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("ZINCRBY"),
     };
     let member = match extract_bytes(&args[2]) {
-        Some(b) => b.clone(),
+        Some(b) => b,
         None => return err_wrong_args("ZINCRBY"),
     };
 
@@ -625,6 +905,27 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
         return err("ERR value is not a valid float");
     }
 
+    zincr_member(db, key, increment, member, IncrFlags::default())
+}
+
+/// Add `increment` to `member`'s score, creating the member at `increment`
+/// when it is absent, and reply the new score — or nil when a flag refused
+/// the write.
+///
+/// The decision order is Redis's `zsetAdd` with `ZADD_IN_INCR`, verified on
+/// redis 8.6.1: for a PRESENT member, `NX` refuses before the sum is even
+/// formed; then a NaN sum is `ERR resulting score is not a number (NaN)` with
+/// nothing written; then `GT`/`LT` refuse a sum that does not move the score
+/// the right way (`GT` with a zero increment is a refusal). For an ABSENT
+/// member only `XX` refuses; `GT`/`LT` never block a first insert. A refusal
+/// on a key this call had to fabricate leaves no key behind.
+fn zincr_member(
+    db: &mut Database,
+    key: &[u8],
+    increment: f64,
+    member: &Bytes,
+    flags: IncrFlags,
+) -> Frame {
     // Listpack path (moon#897). ZINCRBY is the leaderboard primitive, and
     // before this it took the eager `get_or_create_sorted_set`: one ZINCRBY
     // flattened a three-member zset to `skiplist` permanently (nothing
@@ -644,6 +945,12 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
             Ok(Some(lp)) => {
                 // Listpack `estimate_memory()` is O(1) (capacity-based).
                 let before = lp.estimate_memory();
+                // Why the closure declined, when it did. `Unchanged` alone
+                // cannot say: it is a NaN sum for a plain ZINCRBY and a flag
+                // refusal under `ZADD ... INCR`, and the two reply
+                // differently.
+                let mut reached_nan = false;
+                let mut refused = false;
                 // ONE scan (moon#942): the walk that finds the member carries
                 // the byte offsets its score is rewritten at, so there is no
                 // second walk back to an ordinal.
@@ -652,23 +959,25 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
                 // its RENDERED text, and `render_score(NaN)` writes `NaN`,
                 // which `parse_score` refuses — the score would read back as
                 // 0.0 and the member would silently change value. `increment`
-                // is already proven non-NaN above, so this is reachable only
-                // as `±inf + ∓inf`, which in turn means the member already
-                // exists (a fresh member starts at 0.0) — so declining here
-                // never leaves a key created-and-abandoned.
-                //
-                // Declining hands the case to the B+tree arm below, which is
-                // byte-for-byte what EVERY ZINCRBY did before this branch
-                // existed. moon's reply there (`NaN`) diverges from redis
-                // 8.6.1, which answers
-                // `ERR resulting score is not a number (NaN)` and leaves the
-                // score untouched — a real, PRE-EXISTING divergence that this
-                // change deliberately does not alter, and that a NaN must
-                // never reach a listpack in the meantime.
-                let outcome = lp.update_pair_value(&member, |current| {
+                // is already proven non-NaN by every caller, so this is
+                // reachable only as `±inf + ∓inf`, which in turn means the
+                // member already exists (a fresh member starts at 0.0) — so
+                // declining here never leaves a key created-and-abandoned.
+                let outcome = lp.update_pair_value(member, |current| {
+                    if flags.nx {
+                        // NX: the member is present, which is all it needs.
+                        refused = true;
+                        return None;
+                    }
                     work_budget::note_stored_score_parse();
-                    let new_score = current.as_score().unwrap_or(0.0) + increment;
+                    let old = current.as_score().unwrap_or(0.0);
+                    let new_score = old + increment;
                     if new_score.is_nan() {
+                        reached_nan = true;
+                        return None;
+                    }
+                    if (flags.gt && new_score <= old) || (flags.lt && new_score >= old) {
+                        refused = true;
                         return None;
                     }
                     // One stack buffer; `render_score` is byte-identical to
@@ -685,17 +994,38 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
                     // reply below does not render the score a second time.
                     PairUpdate::Replaced(rendered) => Some(rendered),
                     PairUpdate::Absent => {
-                        // A fresh member starts at 0.0 and `increment` is
-                        // already proven non-NaN, so this rendering can never
-                        // be the NaN the arm above guards against.
-                        let mut rendered = ScoreBuf::new();
-                        render_score(increment, &mut rendered);
-                        lp.push_back(&member);
-                        lp.push_back(&rendered);
-                        Some(rendered)
+                        if flags.xx {
+                            // XX: never create. The container may be one
+                            // this call fabricated; the empty check below
+                            // reclaims it.
+                            refused = true;
+                            None
+                        } else {
+                            // A fresh member starts at 0.0 and `increment` is
+                            // already proven non-NaN, so this rendering can
+                            // never be the NaN the arm above guards against.
+                            let mut rendered = ScoreBuf::new();
+                            render_score(increment, &mut rendered);
+                            lp.push_back(member);
+                            lp.push_back(&rendered);
+                            Some(rendered)
+                        }
                     }
-                    // NaN. The listpack was not touched, and this is the
-                    // answer (moon#960): redis 8.6.1 replies
+                    // NaN, or a flag refusal: the listpack was not touched.
+                    PairUpdate::Unchanged => None,
+                };
+
+                let after = lp.estimate_memory();
+                // The upgrade check, from the same authority as the gate:
+                // it converts `lp.len()` (member AND score entries) to
+                // members itself — the moon#896 unit.
+                let should_upgrade =
+                    stored.is_some() && !limits.listpack_fits(Shape::SortedSet, lp);
+                let is_empty = lp.is_empty();
+                // `lp`'s borrow of `db` ends here.
+                db.adjust_memory(before, after);
+                if reached_nan {
+                    // This is the answer (moon#960): redis 8.6.1 replies
                     // `ERR resulting score is not a number (NaN)` and leaves
                     // the score alone. Returning here rather than falling
                     // through also keeps the encoding intact — the B+tree arm
@@ -703,36 +1033,38 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
                     // so falling through would flatten the listpack
                     // permanently (moon#832: nothing demotes) as a side
                     // effect of a command that errors and stores nothing.
-                    PairUpdate::Unchanged => {
-                        return err("ERR resulting score is not a number (NaN)");
-                    }
-                };
-
+                    return err("ERR resulting score is not a number (NaN)");
+                }
+                if is_empty {
+                    // Only reachable as an `XX` refusal on a fabricated
+                    // container — the same rule `zadd` applies.
+                    db.remove(key);
+                }
+                if refused {
+                    return Frame::Null;
+                }
+                if should_upgrade {
+                    // Self-accounting: the accessor bills the one-time
+                    // listpack -> B+tree swing itself (moon#788/#810).
+                    db.upgrade_zset_listpack_to_bptree(key);
+                }
+                // Reply with the bytes we STORED, not a second rendering:
+                // one copy out of the stack buffer instead of the
+                // `format_score` -> `String` allocation the B+tree arm
+                // below still pays (`src/command/` is a no-`String`
+                // path). `render_score` is pinned byte-identical to
+                // `format_score_bytes` by
+                // `listpack_score_rendering_matches_zscore_rendering`, so
+                // this is the same text either way — and it is now the
+                // same text a later ZSCORE reads out of the listpack, by
+                // construction rather than by two formatters agreeing.
                 if let Some(rendered) = stored {
-                    let after = lp.estimate_memory();
-                    // The upgrade check, from the same authority as the gate:
-                    // it converts `lp.len()` (member AND score entries) to
-                    // members itself — the moon#896 unit.
-                    let should_upgrade = !limits.listpack_fits(Shape::SortedSet, lp);
-                    // `lp`'s borrow of `db` ends here.
-                    db.adjust_memory(before, after);
-                    if should_upgrade {
-                        // Self-accounting: the accessor bills the one-time
-                        // listpack -> B+tree swing itself (moon#788/#810).
-                        db.upgrade_zset_listpack_to_bptree(key);
-                    }
-                    // Reply with the bytes we STORED, not a second rendering:
-                    // one copy out of the stack buffer instead of the
-                    // `format_score` -> `String` allocation the B+tree arm
-                    // below still pays (`src/command/` is a no-`String`
-                    // path). `render_score` is pinned byte-identical to
-                    // `format_score_bytes` by
-                    // `listpack_score_rendering_matches_zscore_rendering`, so
-                    // this is the same text either way — and it is now the
-                    // same text a later ZSCORE reads out of the listpack, by
-                    // construction rather than by two formatters agreeing.
                     return Frame::BulkString(Bytes::copy_from_slice(&rendered));
                 }
+                // `stored` is `None` exactly when `reached_nan || refused`,
+                // both returned above. Kept as a real match rather than an
+                // `unwrap`, as the mutation loops in `zadd` are.
+                return Frame::Null;
             }
             // Already the full B+tree form (or a cold-promoted value, which
             // never decodes compact): fall through.
@@ -746,7 +1078,7 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
 
-    let member_cost = zset_member_cost(&member);
+    let member_cost = zset_member_cost(member);
     let table_before = zset_table_bytes(members, scores);
     // ONE hash lookup (moon#942): the same lookup that reads the current score
     // writes `current + increment` back through the slot it found. It used to
@@ -758,10 +1090,19 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
     // from the closure is `zset_update_existing`'s "leave it alone", so the
     // old score survives and neither map is touched.
     let mut reached_nan = false;
-    let is_new = zset_update_existing(members, scores, &member, |current| {
+    let mut refused = false;
+    let is_new = zset_update_existing(members, scores, member, |current| {
+        if flags.nx {
+            refused = true;
+            return None;
+        }
         let candidate = current + increment;
         if candidate.is_nan() {
             reached_nan = true;
+            return None;
+        }
+        if (flags.gt && candidate <= current) || (flags.lt && candidate >= current) {
+            refused = true;
             return None;
         }
         new_score = candidate;
@@ -771,19 +1112,28 @@ pub fn zincrby(db: &mut Database, args: &[Frame]) -> Frame {
     if reached_nan {
         return err("ERR resulting score is not a number (NaN)");
     }
-    if is_new {
+    let inserted = is_new && !flags.xx;
+    if inserted {
         // A member that was not there starts at 0.0, so its new score is the
         // increment itself — already in `new_score`.
-        zset_insert_absent(members, scores, member, new_score);
+        zset_insert_absent(members, scores, member.clone(), new_score);
     }
+    let is_empty = members.is_empty();
     let table_after = zset_table_bytes(members, scores);
     // `members`/`scores`' borrow of `db` ends above.
-    if is_new {
+    if inserted {
         db.charge_memory(member_cost);
     }
     db.adjust_memory(table_before, table_after);
+    if is_empty {
+        // `XX` refused the only member a fabricated container would have had.
+        db.remove(key);
+    }
+    if refused || (is_new && flags.xx) {
+        return Frame::Null;
+    }
 
-    Frame::BulkString(Bytes::from(format_score(new_score)))
+    Frame::BulkString(format_score_bytes(new_score))
 }
 
 /// ZPOPMIN key [count]
@@ -801,12 +1151,17 @@ pub fn zpopmin(db: &mut Database, args: &[Frame]) -> Frame {
             Some(b) => b,
             None => return err_wrong_args("ZPOPMIN"),
         };
-        match std::str::from_utf8(count_bytes)
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-        {
-            Some(c) if c >= 0 => c as usize,
-            _ => return err("ERR value is not an integer or out of range"),
+        // moon#969: Redis reads this with `getPositiveLongFromObject`, which
+        // carries its OWN message for every failure — non-numeric and
+        // negative alike. moon answered the generic integer error, a
+        // different exception type in every client that maps them.
+        match parse_bounded_count(
+            count_bytes,
+            0,
+            "ERR value is out of range, must be positive",
+        ) {
+            Ok(c) => c,
+            Err(e) => return e,
         }
     } else {
         1
@@ -867,12 +1222,17 @@ pub fn zpopmax(db: &mut Database, args: &[Frame]) -> Frame {
             Some(b) => b,
             None => return err_wrong_args("ZPOPMAX"),
         };
-        match std::str::from_utf8(count_bytes)
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-        {
-            Some(c) if c >= 0 => c as usize,
-            _ => return err("ERR value is not an integer or out of range"),
+        // moon#969: Redis reads this with `getPositiveLongFromObject`, which
+        // carries its OWN message for every failure — non-numeric and
+        // negative alike. moon answered the generic integer error, a
+        // different exception type in every client that maps them.
+        match parse_bounded_count(
+            count_bytes,
+            0,
+            "ERR value is out of range, must be positive",
+        ) {
+            Ok(c) => c,
+            Err(e) => return e,
         }
     } else {
         1
@@ -918,367 +1278,6 @@ pub fn zpopmax(db: &mut Database, args: &[Frame]) -> Frame {
     Frame::Array(result.into())
 }
 
-/// ZUNIONSTORE destination numkeys key [key ...] [WEIGHTS weight ...] [AGGREGATE SUM|MIN|MAX]
-pub fn zunionstore(db: &mut Database, args: &[Frame]) -> Frame {
-    zstore_impl(db, args, false)
-}
-
-/// ZINTERSTORE destination numkeys key [key ...] [WEIGHTS weight ...] [AGGREGATE SUM|MIN|MAX]
-pub fn zinterstore(db: &mut Database, args: &[Frame]) -> Frame {
-    zstore_impl(db, args, true)
-}
-
-fn zstore_impl(db: &mut Database, args: &[Frame], intersect: bool) -> Frame {
-    let cmd_name = if intersect {
-        "ZINTERSTORE"
-    } else {
-        "ZUNIONSTORE"
-    };
-    if args.len() < 3 {
-        return err_wrong_args(cmd_name);
-    }
-    let dest = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args(cmd_name),
-    };
-    let numkeys_bytes = match extract_bytes(&args[1]) {
-        Some(b) => b,
-        None => return err_wrong_args(cmd_name),
-    };
-    let numkeys: usize = match std::str::from_utf8(numkeys_bytes)
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(n) => n,
-        None => return err("ERR value is not an integer or out of range"),
-    };
-
-    if numkeys == 0 || args.len() < 2 + numkeys {
-        return err_wrong_args(cmd_name);
-    }
-
-    // Collect source keys
-    let source_keys: Vec<Bytes> = (0..numkeys)
-        .map(|j| {
-            extract_bytes(&args[2 + j])
-                .cloned()
-                .unwrap_or_else(|| Bytes::new())
-        })
-        .collect();
-
-    // Parse WEIGHTS and AGGREGATE
-    let mut weights: Vec<f64> = vec![1.0; numkeys];
-    let mut aggregate = AggregateOp::Sum;
-    let mut i = 2 + numkeys;
-
-    while i < args.len() {
-        let opt = match extract_bytes(&args[i]) {
-            Some(b) => b.as_ref(),
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-        if opt.eq_ignore_ascii_case(b"WEIGHTS") {
-            for w in 0..numkeys {
-                if i + 1 + w >= args.len() {
-                    return err_wrong_args(cmd_name);
-                }
-                let wb = match extract_bytes(&args[i + 1 + w]) {
-                    Some(b) => b,
-                    None => return err_wrong_args(cmd_name),
-                };
-                let wval: f64 = match std::str::from_utf8(wb).ok().and_then(|s| s.parse().ok()) {
-                    Some(v) => v,
-                    None => return err("ERR weight value is not a float"),
-                };
-                weights[w] = wval;
-            }
-            i += 1 + numkeys;
-        } else if opt.eq_ignore_ascii_case(b"AGGREGATE") {
-            if i + 1 >= args.len() {
-                return err_wrong_args(cmd_name);
-            }
-            let agg_b = match extract_bytes(&args[i + 1]) {
-                Some(b) => b.as_ref(),
-                None => return err_wrong_args(cmd_name),
-            };
-            aggregate = if agg_b.eq_ignore_ascii_case(b"SUM") {
-                AggregateOp::Sum
-            } else if agg_b.eq_ignore_ascii_case(b"MIN") {
-                AggregateOp::Min
-            } else if agg_b.eq_ignore_ascii_case(b"MAX") {
-                AggregateOp::Max
-            } else {
-                return err("ERR syntax error");
-            };
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-
-    // Read all source sets into a temporary structure
-    let mut source_data: Vec<HashMap<Bytes, f64>> = Vec::with_capacity(numkeys);
-    for key in &source_keys {
-        match db.get_sorted_set(key) {
-            Ok(Some((members, _))) => {
-                source_data.push(members.clone());
-            }
-            Ok(None) => {
-                source_data.push(HashMap::new());
-            }
-            Err(e) => return e,
-        }
-    }
-
-    // Compute result
-    let mut result_map: HashMap<Bytes, f64> = HashMap::new();
-
-    if intersect {
-        // Start with first set's members
-        if let Some(first) = source_data.first() {
-            for (member, score) in first {
-                let weighted = clamp_nan_to_zero(*score * weights[0]);
-                let mut final_score = weighted;
-                let mut in_all = true;
-
-                for (idx, src) in source_data.iter().enumerate().skip(1) {
-                    match src.get(member) {
-                        Some(s) => {
-                            let ws = clamp_nan_to_zero(*s * weights[idx]);
-                            final_score = match aggregate {
-                                AggregateOp::Sum => clamp_nan_to_zero(final_score + ws),
-                                AggregateOp::Min => final_score.min(ws),
-                                AggregateOp::Max => final_score.max(ws),
-                            };
-                        }
-                        None => {
-                            in_all = false;
-                            break;
-                        }
-                    }
-                }
-
-                if in_all {
-                    result_map.insert(member.clone(), final_score);
-                }
-            }
-        }
-    } else {
-        // Union: all members from all sets
-        for (idx, src) in source_data.iter().enumerate() {
-            for (member, score) in src {
-                let weighted = clamp_nan_to_zero(*score * weights[idx]);
-                result_map
-                    .entry(member.clone())
-                    .and_modify(|existing| {
-                        *existing = match aggregate {
-                            AggregateOp::Sum => clamp_nan_to_zero(*existing + weighted),
-                            AggregateOp::Min => existing.min(weighted),
-                            AggregateOp::Max => existing.max(weighted),
-                        };
-                    })
-                    .or_insert(weighted);
-            }
-        }
-    }
-
-    let result_size = result_map.len() as i64;
-
-    // Remove destination key first, then create new sorted set
-    db.remove(dest);
-
-    if !result_map.is_empty() {
-        let (members, scores) = match db.get_or_create_sorted_set(dest) {
-            Ok(pair) => pair,
-            Err(e) => return e,
-        };
-
-        // `dest` was just removed/recreated above, so every member here is
-        // new -- charge each unconditionally (O(1) per member, no full
-        // recompute of the destination sorted set).
-        let mut mem_charge: usize = 0;
-        let table_before = zset_table_bytes(members, scores);
-        for (member, score) in result_map {
-            mem_charge += zset_member_cost(&member);
-            zadd_member(members, scores, member, score);
-        }
-        let table_after = zset_table_bytes(members, scores);
-        // `members`/`scores`' borrow of `db` ends above.
-        db.charge_memory(mem_charge);
-        db.adjust_memory(table_before, table_after);
-    }
-
-    Frame::Integer(result_size)
-}
-
-// ---------------------------------------------------------------------------
-// ZRANGESTORE dst src min max [BYSCORE | BYLEX] [REV] [LIMIT offset count]
-// ---------------------------------------------------------------------------
-
-/// ZRANGESTORE dst src min max [BYSCORE | BYLEX] [REV] [LIMIT offset count]
-///
-/// Stores the result of a ZRANGE into `dst`, replacing it. Returns the cardinality of `dst`.
-pub fn zrangestore(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() < 4 {
-        return err_wrong_args("ZRANGESTORE");
-    }
-    let dst = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZRANGESTORE"),
-    };
-    let src = match extract_bytes(&args[1]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZRANGESTORE"),
-    };
-    let min_arg = match extract_bytes(&args[2]) {
-        Some(b) => b.clone(),
-        None => return err_wrong_args("ZRANGESTORE"),
-    };
-    let max_arg = match extract_bytes(&args[3]) {
-        Some(b) => b.clone(),
-        None => return err_wrong_args("ZRANGESTORE"),
-    };
-
-    // Parse optional flags (same as ZRANGE but no WITHSCORES)
-    let mut by_score = false;
-    let mut by_lex = false;
-    let mut rev = false;
-    let mut limit_offset: Option<i64> = None;
-    let mut limit_count: Option<i64> = None;
-
-    let mut i = 4;
-    while i < args.len() {
-        let opt = match extract_bytes(&args[i]) {
-            Some(b) => b.as_ref(),
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-        if opt.eq_ignore_ascii_case(b"BYSCORE") {
-            by_score = true;
-            i += 1;
-        } else if opt.eq_ignore_ascii_case(b"BYLEX") {
-            by_lex = true;
-            i += 1;
-        } else if opt.eq_ignore_ascii_case(b"REV") {
-            rev = true;
-            i += 1;
-        } else if opt.eq_ignore_ascii_case(b"LIMIT") {
-            if i + 2 < args.len() {
-                let off_b = match extract_bytes(&args[i + 1]) {
-                    Some(b) => b,
-                    None => return err_wrong_args("ZRANGESTORE"),
-                };
-                let cnt_b = match extract_bytes(&args[i + 2]) {
-                    Some(b) => b,
-                    None => return err_wrong_args("ZRANGESTORE"),
-                };
-                limit_offset = std::str::from_utf8(off_b).ok().and_then(|s| s.parse().ok());
-                limit_count = std::str::from_utf8(cnt_b).ok().and_then(|s| s.parse().ok());
-                if limit_offset.is_none() || limit_count.is_none() {
-                    return err("ERR value is not an integer or out of range");
-                }
-                i += 3;
-            } else {
-                return err_wrong_args("ZRANGESTORE");
-            }
-        } else {
-            return err("ERR syntax error");
-        }
-    }
-
-    if by_score && by_lex {
-        return err("ERR BYSCORE and BYLEX options are not compatible");
-    }
-    if limit_offset.is_some() && !by_score && !by_lex {
-        return err(
-            "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
-        );
-    }
-
-    // Run ZRANGE on src, collecting (member, score) pairs
-    let entries: Vec<(Bytes, f64)> = match db.get_sorted_set(src) {
-        Ok(Some((members, scores))) => {
-            let frame = if by_score {
-                zrange_by_score(
-                    members,
-                    scores,
-                    &min_arg,
-                    &max_arg,
-                    rev,
-                    true,
-                    limit_offset,
-                    limit_count,
-                )
-            } else if by_lex {
-                zrange_by_lex(
-                    scores,
-                    &min_arg,
-                    &max_arg,
-                    rev,
-                    true,
-                    members,
-                    limit_offset,
-                    limit_count,
-                )
-            } else {
-                zrange_by_rank(scores, &min_arg, &max_arg, rev, true)
-            };
-            // Parse the Frame::Array([member, score, member, score, ...]) into Vec<(Bytes, f64)>
-            match frame {
-                Frame::Array(arr) => {
-                    let mut result = Vec::with_capacity(arr.len() / 2);
-                    let mut idx = 0;
-                    while idx + 1 < arr.len() {
-                        if let (Frame::BulkString(m), Frame::BulkString(s)) =
-                            (&arr[idx], &arr[idx + 1])
-                        {
-                            if let Ok(score) = std::str::from_utf8(s).unwrap_or("0").parse::<f64>()
-                            {
-                                result.push((m.clone(), score));
-                            }
-                        }
-                        idx += 2;
-                    }
-                    result
-                }
-                Frame::Error(_) => return frame,
-                _ => Vec::with_capacity(0),
-            }
-        }
-        Ok(None) => Vec::with_capacity(0),
-        Err(e) => return e,
-    };
-
-    let count = entries.len() as i64;
-
-    // Replace dst with the result
-    db.remove(dst);
-
-    if !entries.is_empty() {
-        let (dst_members, dst_scores) = match db.get_or_create_sorted_set(dst) {
-            Ok(pair) => pair,
-            Err(e) => return e,
-        };
-        // `dst` was just removed/recreated above, so every entry is new.
-        let mut mem_charge: usize = 0;
-        let table_before = zset_table_bytes(dst_members, dst_scores);
-        for (member, score) in entries {
-            mem_charge += zset_member_cost(&member);
-            zadd_member(dst_members, dst_scores, member, score);
-        }
-        let table_after = zset_table_bytes(dst_members, dst_scores);
-        // `dst_members`/`dst_scores`' borrow of `db` ends above.
-        db.charge_memory(mem_charge);
-        db.adjust_memory(table_before, table_after);
-    }
-
-    Frame::Integer(count)
-}
-
 // ---------------------------------------------------------------------------
 // ZMPOP numkeys key [key ...] MIN|MAX [COUNT n]
 // ---------------------------------------------------------------------------
@@ -1295,16 +1294,18 @@ pub fn zmpop(db: &mut Database, args: &[Frame]) -> Frame {
         Some(b) => b,
         None => return err_wrong_args("ZMPOP"),
     };
-    let numkeys: usize = match std::str::from_utf8(numkeys_bytes)
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(n) if n > 0 => n,
-        _ => return err("ERR numkeys can't be non-positive value"),
-    };
+    // ZMPOP does NOT take the two-class split the ZUNIONSTORE family takes:
+    // Redis reads it with `getRangeLongFromObject(…, 1, LONG_MAX, …,
+    // "numkeys should be greater than 0")`, one message for every failure
+    // (moon#969). Verified against redis-server 8.6.1, including `notanint`.
+    let numkeys =
+        match parse_bounded_count(numkeys_bytes, 1, "ERR numkeys should be greater than 0") {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
 
     if args.len() < 1 + numkeys + 1 {
-        return err_wrong_args("ZMPOP");
+        return err("ERR syntax error");
     }
 
     let keys: Vec<Bytes> = (0..numkeys)
@@ -1340,16 +1341,18 @@ pub fn zmpop(db: &mut Database, args: &[Frame]) -> Frame {
             }
         };
         if opt.eq_ignore_ascii_case(b"COUNT") {
+            // A dangling `COUNT` is `syntax error` (moon#969), the same class
+            // the bare-token arm below already answers.
             if i + 1 >= args.len() {
-                return err_wrong_args("ZMPOP");
+                return err("ERR syntax error");
             }
             let cb = match extract_bytes(&args[i + 1]) {
                 Some(b) => b,
-                None => return err_wrong_args("ZMPOP"),
+                None => return err("ERR syntax error"),
             };
-            pop_count = match std::str::from_utf8(cb).ok().and_then(|s| s.parse().ok()) {
-                Some(c) if c > 0 => c,
-                _ => return err("ERR value is not an integer or out of range"),
+            pop_count = match parse_bounded_count(cb, 1, "ERR count should be greater than 0") {
+                Ok(c) => c,
+                Err(e) => return e,
             };
             i += 2;
         } else {

@@ -1226,24 +1226,16 @@ pub async fn handle_connection(
                                             }
                                         }
                                     }
-                                    let dispatch_start = std::time::Instant::now();
-                                    let result = dispatch(&mut *guard, d_cmd, d_args, &mut conn.selected_db, db_count);
-                                    let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
-                                    if let Ok(cmd_str) = std::str::from_utf8(d_cmd) {
-                                        crate::admin::metrics_setup::record_command_cached(
-                                            cmd_str,
-                                            elapsed_us,
-                                            &mut conn.cached_metrics,
-                                        );
-                                    }
-                                    if let Frame::Array(ref args) = disp_frame {
-                                        crate::admin::metrics_setup::global_slowlog().maybe_record(
-                                            elapsed_us,
-                                            args.as_slice(),
-                                            peer_addr.as_bytes(),
-                                            conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
-                                        );
-                                    }
+                                    let mut probe = crate::admin::metrics_setup::LatencyProbe::new(
+                                        &mut conn.sampler,
+                                        &mut conn.cached_metrics,
+                                        peer_addr.as_bytes(),
+                                        conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                    );
+                                    let result = probe.observe(d_cmd, crate::admin::slowlog::SlowlogArgv::from(&disp_frame), || {
+                                        dispatch(&mut *guard, d_cmd, d_args, &mut conn.selected_db, db_count)
+                                    });
+                                    drop(probe);
                                     let (response, quit) = match result {
                                         DispatchResult::Response(f) => (f, false),
                                         DispatchResult::Quit(f) => (f, true),
@@ -1773,7 +1765,7 @@ pub async fn handle_connection(
                             ) {
                                 conn.acl_log.push(crate::acl::AclLogEntry {
                                     reason: "command".to_string(),
-                                    object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                                    object: crate::acl::subcommand::command_log_object(cmd, cmd_args),
                                     username: conn.current_user.clone(),
                                     client_addr: peer_addr.clone(),
                                     timestamp_ms: std::time::SystemTime::now()
@@ -1781,6 +1773,8 @@ pub async fn handle_connection(
                                         .unwrap_or_default()
                                         .as_millis() as u64,
                                 });
+                                // moon#1035: inside MULTI a refusal poisons the block.
+                                conn.flag_transaction();
                                 responses.push(Frame::Error(Bytes::from(format!(
                                     "NOPERM {}", deny_reason
                                 ))));
@@ -1803,6 +1797,8 @@ pub async fn handle_connection(
                                         .unwrap_or_default()
                                         .as_millis() as u64,
                                 });
+                                // moon#1035: a denied KEY poisons an open transaction too.
+                                conn.flag_transaction();
                                 responses.push(Frame::Error(Bytes::from(format!(
                                     "NOPERM {}", deny_reason
                                 ))));
@@ -1883,6 +1879,21 @@ pub async fn handle_connection(
                                 crate::server::conn::shared::queue_time_rejection(cmd, cmd_args)
                         {
                             conn.multi_dirty = true;
+                            responses.push(err);
+                            continue;
+                        }
+                        // moon#1035: a PUBLISH to a denied channel is refused
+                        // HERE, poisoning the block, not at EXEC after the rest ran.
+                        if let Some((cmd, cmd_args)) = extract_command(&frame)
+                            && let Some(err) =
+                                crate::server::conn::shared::queued_publish_channel_deny(
+                                    &acl_table,
+                                    &conn.current_user,
+                                    cmd,
+                                    cmd_args,
+                                )
+                        {
+                            conn.flag_transaction();
                             responses.push(err);
                             continue;
                         }
@@ -2547,24 +2558,16 @@ pub async fn handle_connection(
                                     // Other DEBUG subcommands fall through to dispatch_read.
                                 }
 
-                                let dispatch_start = std::time::Instant::now();
-                                let result = dispatch_read(&*guard, d_cmd, d_args, now_ms, &mut conn.selected_db, db_count);
-                                let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
-                                if let Ok(cmd_str) = std::str::from_utf8(d_cmd) {
-                                    crate::admin::metrics_setup::record_command_cached(
-                                        cmd_str,
-                                        elapsed_us,
-                                        &mut conn.cached_metrics,
-                                    );
-                                }
-                                if let Frame::Array(ref args) = *disp_frame {
-                                    crate::admin::metrics_setup::global_slowlog().maybe_record(
-                                        elapsed_us,
-                                        args.as_slice(),
-                                        peer_addr.as_bytes(),
-                                        conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
-                                    );
-                                }
+                                let mut probe = crate::admin::metrics_setup::LatencyProbe::new(
+                                    &mut conn.sampler,
+                                    &mut conn.cached_metrics,
+                                    peer_addr.as_bytes(),
+                                    conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                );
+                                let result = probe.observe(d_cmd, crate::admin::slowlog::SlowlogArgv::from(disp_frame), || {
+                                    dispatch_read(&*guard, d_cmd, d_args, now_ms, &mut conn.selected_db, db_count)
+                                });
+                                drop(probe);
                                 let (response, quit) = match result {
                                     DispatchResult::Response(f) => (f, false),
                                     DispatchResult::Quit(f) => (f, true),
@@ -2921,24 +2924,16 @@ pub async fn handle_connection(
                                 // HSET auto-indexing: after dispatch, check for vector index match
                                 let is_hset = d_cmd.eq_ignore_ascii_case(b"HSET");
 
-                                let dispatch_start = std::time::Instant::now();
-                                let result = dispatch(&mut *guard, d_cmd, d_args, &mut conn.selected_db, db_count);
-                                let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
-                                if let Ok(cmd_str) = std::str::from_utf8(d_cmd) {
-                                    crate::admin::metrics_setup::record_command_cached(
-                                        cmd_str,
-                                        elapsed_us,
-                                        &mut conn.cached_metrics,
-                                    );
-                                }
-                                if let Frame::Array(ref args) = *disp_frame {
-                                    crate::admin::metrics_setup::global_slowlog().maybe_record(
-                                        elapsed_us,
-                                        args.as_slice(),
-                                        peer_addr.as_bytes(),
-                                        conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
-                                    );
-                                }
+                                let mut probe = crate::admin::metrics_setup::LatencyProbe::new(
+                                    &mut conn.sampler,
+                                    &mut conn.cached_metrics,
+                                    peer_addr.as_bytes(),
+                                    conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                );
+                                let result = probe.observe(d_cmd, crate::admin::slowlog::SlowlogArgv::from(disp_frame), || {
+                                    dispatch(&mut *guard, d_cmd, d_args, &mut conn.selected_db, db_count)
+                                });
+                                drop(probe);
                                 let (response, quit) = match result {
                                     DispatchResult::Response(f) => (f, false),
                                     DispatchResult::Quit(f) => (f, true),
