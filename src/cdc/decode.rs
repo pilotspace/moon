@@ -197,6 +197,7 @@ mod tests {
             lsn,
             record_type: WalRecordType::Command,
             flags: 0,
+            db_index: None,
             payload: payload.to_vec(),
         }
     }
@@ -274,6 +275,7 @@ mod tests {
             lsn: 5,
             record_type: WalRecordType::TemporalUpsert,
             flags: 0,
+            db_index: None,
             payload,
         };
         let event = decode_wal_record(&rec, 1);
@@ -306,6 +308,7 @@ mod tests {
             lsn: 99,
             record_type: WalRecordType::Checkpoint,
             flags: 0,
+            db_index: None,
             payload: payload.to_vec(),
         };
         let event = decode_wal_record(&rec, 2);
@@ -331,6 +334,7 @@ mod tests {
             lsn: 3,
             record_type: WalRecordType::GraphTemporal,
             flags: 0,
+            db_index: None,
             payload,
         };
         let event = decode_wal_record(&rec, 0);

@@ -30,6 +30,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BEHAVIOUR CHANGE — once the cold tier holds keys, a write is checked
+  against `maxmemory` using hot bytes PLUS the cold index's RAM, not hot bytes
+  alone** (moon#1036).
+  - **Who is affected:** servers running `maxmemory-policy noeviction`, and
+    `volatile-*` servers whose volatile keys run out. They now answer `-OOM`
+    earlier than before, by the size of the cold index. `allkeys-*` servers
+    reply the same; they spill more hot keys to disk to stay under the cap.
+  - **When it applies:** only with `--disk-offload` enabled and only after keys
+    have spilled. A server with an empty cold tier behaves exactly as before.
+  - **Why this is correct:** the cold index (one entry per spilled key) is
+    resident RAM. The 100 ms pressure cascade has charged it against
+    `maxmemory` since K4. Until now the per-write gates did not, so the shard
+    ran over the cascade's cap between ticks. `noeviction` / `volatile-*`
+    writes are now refused at the cap the server was already enforcing,
+    instead of up to one tick later.
+  - **What to do:** if writes that used to fit now hit `-OOM`, raise
+    `maxmemory` by the cold index's size. INFO reports it as `cold_index_bytes`
+    in the `# MoonStore` section, and Prometheus as
+    `moon_memory_bytes{kind="cold_index"}`. Both are refreshed by the cold
+    orphan sweep (`--cold-orphan-sweep-interval-secs`, 60 s default), so leave
+    some headroom for growth between samples.
+
 - **BEHAVIOUR CHANGE — a command the user's ACL denies inside `MULTI` now
   aborts the whole transaction** (moon#1035). `EXEC` answers
   `-EXECABORT Transaction discarded because of previous errors.` and applies
@@ -187,6 +209,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without a `BGREWRITEAOF` in the middle, the restarted keyspace now matches
   the acknowledged one exactly (per-db `DBSIZE`, values and TTLs). Before the
   fix, 117 of those checks failed without a rewrite and 61 with one.
+
+- **`maxmemory` is one cap again once keys have spilled to disk** (moon#1036).
+  Since K4, the 100 ms pressure cascade has held each database to hot bytes
+  PLUS its cold index's RAM. The per-write gates did not: the inline `SET`
+  pre-gate and `evict_to_budget` without `.total()` compared hot bytes only.
+  So each tick the cascade spilled a cold index's worth of hot keys, and the
+  write path let writers refill that room without evicting. Plain `SET`s
+  inlined into it while the shard was over the cascade's cap. The shard ran
+  over budget between ticks, and every tick spilled extra keys. An
+  instrumented build classified every inlined write (1,809 across 6 runs):
+  all of them saw fresh hints and a shard under budget by hot bytes but over
+  it once the cold index was counted. None was a stale-hint slip. With a
+  CI-speed writer this reproduced 247-389 inlined writes out of 2000; CI's
+  red `g2_bail_out_fires_under_pressure_shards1` runs showed 53-297. All
+  eviction gates now read one figure, `Database::budgeted_memory()`: the
+  inline pre-gate, `evict_to_budget`'s default, the tick publish and the
+  timer sweep. After the fix the count is 0 of 2000 in every run, with or
+  without contention. The G2 test's window is now paced so the cascade runs
+  inside it on any host, and its bound is a constant (5) rather than 2% of
+  the writes.
+
+- **A tokio `--shards 1` AOF written before `MOON.COLDCUT` existed no longer
+  compounds its damage on every restart** (moon#914 (b)). Such a file has no
+  cut, so replay reads every cold file ungated and re-applies a write on top of
+  the spilled copy of its own result. Nothing rewrote the file, so each boot
+  replayed the same log over the last boot's re-spilled values. Measured on a
+  synthesized legacy file: all 96 non-idempotent probes grew again on every
+  boot (a five-element list read 5 or 10, then 10 or 15, then 15 or 20), and
+  the 24 `SET` controls stayed put. When boot replays a cut-less
+  `appendonly.aof` while cold files exist, moon now logs a WARN and runs ONE
+  background AOF rewrite through the #433 auto-rewrite monitor. The rewritten
+  file opens with its cut, so boots 2..N serve exactly what boot 1 served.
+  The first boot's damage can't be undone: the log doesn't record which writes
+  preceded which spill. The rewrite is dispatched after the shards start and
+  doesn't block accept. A crash before its atomic rename leaves the old file
+  authoritative, and the next boot retries. A failed rewrite retries after 60
+  s. `tests/legacy_aof_rewrite_on_boot_914.rs` is RED 3/3 without the fix
+  (96 probes changed boot to boot) and GREEN 3/3 with it. The tokio TopLevel
+  rewrite now also sets INFO `aof_last_bgrewrite_status`, which it never did.
+
+  **BEHAVIOUR CHANGE:** the first boot after upgrading a tokio `--shards 1`
+  deployment that uses disk offload may run one AOF rewrite, even with
+  `auto-aof-rewrite-percentage 0`. It costs one snapshot of the hot dataset
+  written and fsynced as a new RDB-preamble AOF. Measured on macOS for local
+  iteration (not a Linux number), with 100k keys and 46 cold files, on a loaded
+  host: boot-to-accept was unchanged within noise (48-72 ms with the trigger,
+  58-97 ms without). The rewrite took 17-30 ms, wrote 8.0 MB (the 10.2 MB
+  legacy AOF shrank to 8.0 MB), and finished about 1.1 s after spawn, one
+  monitor tick. With
+  `--appendonly no`, or an `--appendfilename` other than `appendonly.aof`,
+  moon can't rewrite the file that was replayed. It logs a WARN naming the
+  manual remedy instead.
+
+- **WAL v3 KV records now replay into the database they were written in**
+  (moon#1039, P0). Under `--wal-kv-log on`, a write that executes on a shard
+  thread (a pipelined cross-shard write, an active-expiry reason-DEL, a
+  `MOON.SPILLED` cold marker) was logged as a bare command with no `SELECT`,
+  and recovery replayed every shard's WAL starting from db 0. When the WAL was
+  the KV authority, a restart put every db 1-15 write into db 0, and a DEL
+  logged for db 3 deleted db 0's key of the same name. On the tokio runtime at
+  `--shards 1` the WAL is the authority by default, so a plain SIGKILL and
+  restart with the AOF untouched was enough: an expiry in db 3 erased db 0's
+  `k`. On monoio, and at `--shards 4`, it took a missing multi-part AOF
+  manifest (`k3_1` answered from db 0, db 3 empty). The db now travels in the record header: a new flag
+  bit plus the two header bytes that were always-zero padding. Old WALs still
+  replay (a record with no db context goes to db 0, as before, and never
+  inherits the previous record's db), and an older binary still reads a new
+  WAL without error. A record for a db beyond the configured `--databases`
+  count is dropped with a warning instead of being folded into db 0.
 
 - **`SPUBLISH` queued inside `MULTI` is now delivered at `EXEC`** (moon#1043).
   The command was answered `+QUEUED`, then `EXEC` answered
