@@ -2519,7 +2519,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                             )
                                             .budget(budget),
                                         );
-                                        ctx.spill_file_id.set(fid);
+                                        ctx.spill_file_id.set(ctx.spill_file_id.get().max(fid));
                                         res
                                     } else {
                                         evict_to_budget(db, &rt, EvictionRun::plain().budget(budget))

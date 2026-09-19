@@ -44,6 +44,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loader also serves replica full-sync and `DEBUG RELOAD` with a FOREIGN
   dataset, where preserving this node's index would surface stale reads.
 
+- **BEHAVIOUR CHANGE — a disk-offload server that cannot prove where its cold
+  file ids resume now refuses to start** (moon#997). If a shard's
+  `data/` or `vectors/` directory exists but cannot be listed, an entry in it
+  cannot be read, or its shard manifest is full-length but cannot be opened,
+  startup exits with `refusing to start: cannot prove shard N's cold file_id
+  seed …`, the OS error, and what is safe to do: for a permission or I/O
+  error nothing needs removing; for a manifest whose two root pages are both
+  corrupt the message says NOT to delete it (the next boot would delete every
+  heap file beside it as an orphan). It used to log a warning and restart the
+  counter at 1, after which the next spill renamed its batch onto the live
+  `heap-000001.mpf` (reproduced on both runtimes at `--shards 1` and `4` with
+  a `-wx` `data/` directory). A manifest shorter than its two root pages is
+  NOT refused: only an interrupted create produces one, it holds no entry, and
+  it is re-created empty with a WARN naming the file. Nothing on disk is
+  changed by a refusal.
+
 - **BEHAVIOUR CHANGE — `ZADD ... GT LT` and a NaN `WEIGHTS` value now error**
   where they previously succeeded (moon#969). `ZADD k GT LT 1 m` used to reply
   `(integer) 1` and, on an existing member, `(integer) 0` with the score left
@@ -206,6 +222,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   permission set, including moon#981's `+@all -x`, is verified to round-trip
   `SETUSER` -> `LIST`/`GETUSER` -> `SAVE` -> restart with `LOAD` unchanged,
   token order included.
+
+- **A restart no longer re-issues a warm vector segment's id to a KV spill
+  file, and retiring a segment entry no longer tombstones a spill file**
+  (moon#893, moon#997). One per-shard counter names both KV spill files and
+  warm vector segments, but its restart seed scanned `data/heap-*.mpf` only.
+  When the highest id in use belonged to a vector segment, the next spill
+  file took the same id; when that segment's directory later vanished,
+  recovery retired its manifest entry with `remove_file(id)`, which
+  tombstoned every entry with that id — the live spill file's included — so
+  its keys read as **absent** after the restart. Measured before the fix
+  (durable cold keys absent after one restart): monoio 256/894 at
+  `--shards 1` and 540/901 at `--shards 4` after a `BGREWRITEAOF`, 2/4 and
+  4/226 under `--appendonly no`; tokio 514/902 at `--shards 4`, 2/4 and
+  209/219 under `--appendonly no`. The seed is now one authority
+  (`storage::tiered::file_id_seed`): the maximum over every manifest entry
+  of every type and status, every `heap-*.{mpf,tmp}` and every
+  `segment-*` / `.segment-*.staging` directory, computed once after recovery
+  and shared by the spill counter and the `MOON.COLDCUT` watermark.
+  `ShardManifest::remove_file` now matches `(file_id, file_type)`, so a data
+  dir a pre-fix build already wrote the collision into keeps its spill file.
+  Both spill writers refuse to replace an existing `heap-*.mpf`; a re-issued
+  id becomes a failed spill that keeps the values hot instead of overwriting
+  live cold data. The seed scan also no longer skips a directory entry it
+  cannot read.
+
+- **A shard's cold file ids come from one counter that never moves
+  backwards** (moon#893, moon#997). The event loop kept a second copy of the
+  counter, re-synced once per tick. On tokio the cross-shard SPSC drain ran
+  after that sync and advanced the shared counter; the eviction tick and warm
+  vector transitions then allocated from the stale copy, re-issuing the
+  drain's ids, and wrote it back with a plain `set` that moved the shared
+  counter backwards. The copy is gone: every consumer allocates through
+  `file_id_seed::allocate_from`, and every write-back is monotonic.
+
+- **`ShardManifest::create` is atomic** (temp file, fsync, rename, directory
+  fsync). A crash part-way through it used to leave a manifest shorter than
+  its two root pages at the real path, which every later open rejected.
+  Tombstones are also aged per `(file_id, file_type)`, not per id.
+
 - **Commands routed to another shard are counted and timed** (moon#982).
   At `--shards > 1` a command whose key lives on a shard other than the
   connection's went through no telemetry probe at all — neither the

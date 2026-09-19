@@ -83,7 +83,8 @@ fn should_run_recovery(persistence_dir: Option<&str>, disk_offload_enabled: bool
 ///
 /// # Returns
 /// `Ok(())` on clean shutdown. Returns `Err` if the persistence directory
-/// is unusable, AOF manifest is corrupt, or a shard thread fails to spawn.
+/// is unusable, AOF manifest is corrupt, a shard's cold file_id seed cannot
+/// be proven (moon#997), or a shard thread fails to spawn.
 pub async fn run_embedded(
     mut config: ServerConfig,
     cancel: CancellationToken,
@@ -298,6 +299,17 @@ pub async fn run_embedded(
             shard
         })
         .collect();
+
+    // moon#997 / moon#893: the cold file_id startup gate — same rule as
+    // main.rs. An unprovable seed is refused, never guessed.
+    for shard in &mut shards {
+        let id = shard.id;
+        shard
+            .prove_spill_file_id_seed(disk_offload_base.as_deref())
+            .with_context(|| {
+                format!("refusing to start: cannot prove shard {id}'s cold file_id seed")
+            })?;
+    }
 
     // NOTE: multi-part AOF (appendonlydir/ manifest) is intentionally NOT used here.
     //
