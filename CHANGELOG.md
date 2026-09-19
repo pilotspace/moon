@@ -799,6 +799,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both the listpack and B+tree arms, which carried separate copies.
 ### Security
 
+- **`rustls` bumped past RUSTSEC-2026-0285 / GHSA-2mjx-qc3c-rqvc** ("TLS 1.3
+  handshake messages incorrectly accepted across encryption level
+  boundaries"), 0.23.44 → 0.23.45 in `Cargo.lock` (and 0.23.37 → 0.23.45 in
+  `fuzz/Cargo.lock`, which was independently behind). moon's TLS path uses
+  rustls directly and through the vendored `vendor/monoio-rustls`, whose
+  `Cargo.toml` already declared `rustls = "~0.23.4"` — wide enough to admit
+  the patched release without a manifest change. `cargo audit` and
+  `cargo deny check advisories licenses bans sources` are clean on
+  `Cargo.lock`, and both TLS integration suites
+  (`tests/tls_idle_downshift_parity.rs`, `tests/tls_park_keyupdate.rs` — 4
+  tests) pass against a fresh binary on both the monoio and
+  `runtime-tokio,jemalloc` builds. `cargo audit`'s own `.cargo/audit.toml`
+  ignore for RUSTSEC-2026-0097 (rand < 0.9.3, aka GHSA-cq8v-f236-94qc — the
+  same advisory as the `rand` Dependabot alert below) is now moot since
+  `rand` is 0.9.3+ in `Cargo.lock`, so it was removed rather than left as
+  stale documentation. Also picked up while re-locking: the yanked
+  `chacha20` 0.10.0 (pulled in transitively via `rand`) to 0.10.2, in both
+  `Cargo.lock` and `fuzz/Cargo.lock`.
+
+- **Dependabot alerts on `console/pnpm-lock.yaml`, `Cargo.lock` and
+  `fuzz/Cargo.lock` cleared with minimal, scoped bumps.** `js-yaml` (4.3.0 →
+  4.3.2, GHSA-2883-xcg3-v3hh / GHSA-5p4m-2wfm-xmqj), `baseline-browser-mapping`
+  (2.10.43 → 2.11.25, GHSA-w5vr-8v7q-w6rv), `fflate` (0.8.2 → 0.8.3 and
+  0.6.10 → 0.6.11, GHSA-px8p-9vwx-vf98), `@humanfs/node` (0.16.7 → 0.16.8,
+  GHSA-p498-v437-472g), `browserslist` (4.28.6 → 4.29.0, GHSA-73wf-gq98-2v4g),
+  `react-router` (7.18.1 → 7.18.4, GHSA-qwww-vcr4-c8h2), `dompurify` (3.4.12 →
+  3.4.15, GHSA-55q2-fjhq-7xh7) and `postcss` (8.5.15 → 8.5.28,
+  GHSA-fxqj-rqcc-2cmp / GHSA-r28c-9q8g-f849) are all transitive dev/runtime
+  deps several levels deep behind `eslint`, `vite`, `@react-three/drei`,
+  `@vitejs/plugin-react`, `react-router-dom` and `@cosmos.gl/graph`; each is
+  pinned via a version-bounded `pnpm.overrides` entry rather than an
+  unconstrained bump, so no direct dependency's declared range and no major
+  version moved (an unbounded override on `react-router` first resolved to
+  the incompatible 8.x line and was re-bounded to `<8`). `rand` (0.9.2 →
+  0.9.3 in `Cargo.lock`, pulled in via `metrics-util`; 0.10.0 → 0.10.1 in
+  `fuzz/Cargo.lock`, GHSA-cq8v-f236-94qc) via `cargo update -p rand
+  --precise`. `nltk` (`sdk/python/uv.lock`, GHSA-8mgp-746c-j5xp, no patched
+  version exists upstream) is left as-is: it reaches the SDK only
+  transitively through the optional `moondb[llamaindex]` extra's
+  `llama-index-core` dependency, which imports only
+  `nltk.tokenize.PunktSentenceTokenizer`, `nltk.corpus.stopwords`,
+  `nltk.data.find` and `nltk.download` — never the vulnerable model-artifact
+  APIs (`TransitionParser.train`/`parse`, `AveragedPerceptron.save`/`load`,
+  `PerceptronTagger.save_to_json`, `save_maxent_params`), and the advisory's
+  own PoC additionally requires the consumer to opt into
+  `nltk.pathsec.ENFORCE=True`, which neither moondb nor llama-index-core sets.
+
 - **Subcommand ACL rules are now enforced** (moon#1030). `+@all -config|set`
   was accepted, listed and saved, but the permission check only ever looked up
   the bare command name, so the user could still run `CONFIG SET`. The same
