@@ -2587,6 +2587,25 @@ impl VectorStore {
             .collect()
     }
 
+    /// Install every finished off-loop COLD reload, in every index, without
+    /// submitting new ones (see `SegmentHolder::install_completed_reloads`).
+    /// Called by the yielding FT.SEARCH handlers once a query that awaited
+    /// reloads is back on the shard (moon#1070). Cheap when there is nothing
+    /// to install: one `is_empty()` per holder. Returns the number installed.
+    pub fn install_completed_reloads(&self) -> usize {
+        self.indexes
+            .values()
+            .map(|idx| {
+                idx.segments.install_completed_reloads()
+                    + idx
+                        .field_segments
+                        .values()
+                        .map(|fs| fs.segments.install_completed_reloads())
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
     /// Attempt warm transitions for ALL indexes. Called from persistence tick.
     ///
     /// Returns the total number of segments transitioned across all indexes.
