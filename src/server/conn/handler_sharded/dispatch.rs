@@ -709,10 +709,17 @@ pub(super) async fn try_handle_swapdb(
 /// master offset or the timeout expires; reply with the acked count. Runs at
 /// the connection layer because it awaits — the generic dispatch path is
 /// synchronous (it used to hard-code `:0`). Returns `true` if consumed.
+///
+/// `deny_blocking` is set when the `WAIT` was queued inside `MULTI` and is
+/// being filled at `EXEC` (moon#1098). Redis runs a transaction body with
+/// `CLIENT_DENY_BLOCKING`, and `waitCommand` then answers the current ack
+/// count at once instead of blocking — so does this: one sample, no poll, no
+/// timeout honoured. `WAIT n 0` would otherwise hold `EXEC` for a year.
 pub(super) async fn try_handle_wait(
     cmd: &[u8],
     cmd_args: &[Frame],
     ctx: &ConnectionContext,
+    deny_blocking: bool,
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"WAIT") {
@@ -745,6 +752,7 @@ pub(super) async fn try_handle_wait(
         timeout_ms
     };
     let count = match ctx.repl_state.as_ref() {
+        Some(rs) if deny_blocking => crate::replication::master::count_acked_replicas(rs),
         Some(rs) => {
             crate::replication::master::wait_for_replicas(num_required as usize, timeout_ms, rs)
                 .await
