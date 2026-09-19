@@ -254,20 +254,25 @@ pub(super) async fn try_handle_evalsha(
         // moon#685: `run_and_complete`, not a bare index, so a script's flush
         // finishes on the other fifteen databases — and reports what is left
         // for `finish_script_flush` to broadcast once this borrow has ended.
-        crate::scripting::pending_flush::run_and_complete(s, conn.selected_db, |db| {
-            crate::scripting::handle_evalsha(
-                &ctx.lua,
-                &ctx.script_cache,
-                cmd_args,
-                db,
-                ctx.shard_id,
-                ctx.num_shards,
-                conn.selected_db,
-                db_count,
-                &script_acl,
-                read_only,
-            )
-        })
+        crate::scripting::pending_flush::run_and_complete(
+            s,
+            conn.selected_db,
+            crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
+            |db| {
+                crate::scripting::handle_evalsha(
+                    &ctx.lua,
+                    &ctx.script_cache,
+                    cmd_args,
+                    db,
+                    ctx.shard_id,
+                    ctx.num_shards,
+                    conn.selected_db,
+                    db_count,
+                    &script_acl,
+                    read_only,
+                )
+            },
+        )
     });
     // moon#831: read the write flag BEFORE the await below — it is a
     // thread-local and another connection's script may run on this thread
@@ -336,20 +341,25 @@ pub(super) async fn try_handle_eval(
     let (response, pending_flush) = crate::shard::slice::with_shard(|s| {
         let db_count = s.databases.db_count();
         // moon#685: see `try_handle_evalsha`.
-        crate::scripting::pending_flush::run_and_complete(s, conn.selected_db, |db| {
-            crate::scripting::handle_eval(
-                &ctx.lua,
-                &ctx.script_cache,
-                cmd_args,
-                db,
-                ctx.shard_id,
-                ctx.num_shards,
-                conn.selected_db,
-                db_count,
-                &script_acl,
-                read_only,
-            )
-        })
+        crate::scripting::pending_flush::run_and_complete(
+            s,
+            conn.selected_db,
+            crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
+            |db| {
+                crate::scripting::handle_eval(
+                    &ctx.lua,
+                    &ctx.script_cache,
+                    cmd_args,
+                    db,
+                    ctx.shard_id,
+                    ctx.num_shards,
+                    conn.selected_db,
+                    db_count,
+                    &script_acl,
+                    read_only,
+                )
+            },
+        )
     });
     // moon#831: read the write flag BEFORE the await below — it is a
     // thread-local and another connection's script may run on this thread
@@ -1481,6 +1491,12 @@ pub(super) async fn try_handle_swapdb(
         &ctx.repl_state,
     )
     .await;
+    // moon#1069: the local leg swapped this shard's two databases; every
+    // key parked on in either may now hold data. Remote shards serve their
+    // own waiters from the `SwapDb` arm.
+    if !matches!(response, Frame::Error(_)) {
+        crate::blocking::wakeup::wake_swapped_dbs(&ctx.blocking_registry, a, b);
+    }
     responses.push(response);
     true
 }
@@ -1640,31 +1656,36 @@ pub(super) async fn try_handle_functions(
                 let db_count = s.databases.db_count();
                 // moon#685: a FUNCTION body reaches `redis.call` through the same
                 // bridge an EVAL does, so it needs the same completion.
-                crate::scripting::pending_flush::run_and_complete(s, conn.selected_db, |db| {
-                    if is_fcall {
-                        crate::command::functions::handle_fcall(
-                            reg,
-                            cmd_args,
-                            db,
-                            ctx.shard_id,
-                            ctx.num_shards,
-                            conn.selected_db,
-                            db_count,
-                            &script_acl,
-                        )
-                    } else {
-                        crate::command::functions::handle_fcall_ro(
-                            reg,
-                            cmd_args,
-                            db,
-                            ctx.shard_id,
-                            ctx.num_shards,
-                            conn.selected_db,
-                            db_count,
-                            &script_acl,
-                        )
-                    }
-                })
+                crate::scripting::pending_flush::run_and_complete(
+                    s,
+                    conn.selected_db,
+                    crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
+                    |db| {
+                        if is_fcall {
+                            crate::command::functions::handle_fcall(
+                                reg,
+                                cmd_args,
+                                db,
+                                ctx.shard_id,
+                                ctx.num_shards,
+                                conn.selected_db,
+                                db_count,
+                                &script_acl,
+                            )
+                        } else {
+                            crate::command::functions::handle_fcall_ro(
+                                reg,
+                                cmd_args,
+                                db,
+                                ctx.shard_id,
+                                ctx.num_shards,
+                                conn.selected_db,
+                                db_count,
+                                &script_acl,
+                            )
+                        }
+                    },
+                )
             })
         };
         // moon#831: read BEFORE the await — see `try_handle_eval`.
@@ -1841,6 +1862,17 @@ pub(super) async fn try_handle_cross_shard_commands(
         // barrier failure; only successful writes join the barrier set.
         if local_barrier_pending && !matches!(response, Frame::Error(_)) {
             local_leg_write_idxs.push(responses.len());
+        }
+        // moon#1069: the coordinator ran this shard's leg (a same-shard
+        // `COPY`, or this shard's slice of a spanning write) outside every
+        // write tail — serve whoever is blocked on a key it wrote here.
+        if !matches!(response, Frame::Error(_)) {
+            crate::blocking::wakeup::wake_written_keys_on_shard(
+                &ctx.blocking_registry,
+                conn.selected_db,
+                cmd,
+                cmd_args,
+            );
         }
         // CLIENT TRACKING: multi-key writes (DEL/MSET/UNLINK/…) invalidate
         // every key; multi-key reads (MGET) by a tracking client register

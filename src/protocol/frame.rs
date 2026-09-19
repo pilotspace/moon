@@ -304,7 +304,16 @@ impl ProtoFault {
                 // Redis prints the raw byte. A non-printable one renders as
                 // whatever the terminal makes of it, which is Redis's
                 // behavior too — matching it matters more than prettiness.
-                format!("Protocol error: expected '$', got '{}'", *b as char)
+                // Except CR and LF: this text is written to the socket as a
+                // raw `-ERR` line, not through `serialize::put_line`, so a raw
+                // CR/LF would end the reply early. Redis prints a space
+                // (`addReplyErrorFormat` maps both), and so do we.
+                let shown = if matches!(*b, b'\r' | b'\n') {
+                    ' '
+                } else {
+                    *b as char
+                };
+                format!("Protocol error: expected '$', got '{shown}'")
             }
             other => other.wire_text().to_string(),
         }
@@ -364,6 +373,26 @@ impl Default for ParseConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The protocol-fault text echoes one client byte and is written raw, so
+    /// a CR or LF there must become a space (redis-server 8.6.1:
+    /// `*1\r\n\r\n` -> `-ERR Protocol error: expected '$', got ' '`).
+    #[test]
+    fn proto_fault_text_never_echoes_cr_or_lf() {
+        for b in [b'\r', b'\n'] {
+            for fault in [ProtoFault::ExpectedDollar(b), ProtoFault::UnknownType(b)] {
+                assert_eq!(
+                    fault.wire_text_owned(),
+                    "Protocol error: expected '$', got ' '"
+                );
+            }
+        }
+        assert_eq!(
+            ProtoFault::ExpectedDollar(b'x').wire_text_owned(),
+            "Protocol error: expected '$', got 'x'"
+        );
+    }
+
     #[test]
     fn frame_size_measurement() {
         let size = std::mem::size_of::<Frame>();

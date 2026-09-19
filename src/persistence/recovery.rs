@@ -305,6 +305,26 @@ pub fn recover_shard_v3_pitr(
             // in-process guard covers new failures; this covers orphans from a
             // kill -9 or an older build.
             crate::storage::tiered::warm_tier::sweep_orphan_staging(&vectors_dir);
+            // moon#893: a manifest written by an older build can list one id
+            // several times (the id counter re-issued live ids and `add_file`
+            // appended without a check). Discovery handed such a directory to
+            // `register_warm_segments` once per entry, and the second hand-over
+            // deleted the directory the first had attached. Collapse them
+            // before discovery and heal them on disk with the commit below.
+            // If that commit fails, warm discovery here is still deduped, but
+            // the ColdIndex rebuild further down re-opens the manifest from
+            // disk and so still reads the duplicated spill entries this boot
+            // (the pre-#893 behaviour); the next boot retries the heal.
+            let duplicates_dropped = manifest.dedupe_active_entries();
+            if duplicates_dropped > 0 {
+                tracing::warn!(
+                    "Shard {}: manifest listed {} duplicate file entr{} (written by an \
+                     older build) — collapsed to one entry per file",
+                    shard_id,
+                    duplicates_dropped,
+                    if duplicates_dropped == 1 { "y" } else { "ies" }
+                );
+            }
             // Collected while iterating `manifest.files()` (an immutable borrow)
             // and applied after the loop ends.
             let mut stale_warm_ids: Vec<u64> = Vec::new();
@@ -357,7 +377,7 @@ pub fn recover_shard_v3_pitr(
             // Commit the retirements in ONE manifest generation rather than one
             // per entry: a store with thousands of stale entries would
             // otherwise pay thousands of dual-root swaps on the boot path.
-            if !stale_warm_ids.is_empty() {
+            if !stale_warm_ids.is_empty() || duplicates_dropped > 0 {
                 let retired = stale_warm_ids.len();
                 for file_id in &stale_warm_ids {
                     manifest.remove_file(*file_id, PageType::VecCodes);
@@ -365,15 +385,17 @@ pub fn recover_shard_v3_pitr(
                 match manifest.commit() {
                     Ok(()) => info!(
                         "Shard {}: retired {} stale warm segment entry(ies) whose directories \
-                         were already deleted",
-                        shard_id, retired
+                         were already deleted, dropped {} duplicate entry(ies)",
+                        shard_id, retired, duplicates_dropped
                     ),
                     Err(e) => tracing::warn!(
                         "Shard {}: failed to commit retirement of {} stale warm segment \
-                         entry(ies): {e} — recovery is unaffected (the entries are skipped \
-                         either way), but the next boot will re-walk them",
+                         entry(ies) and {} duplicate entry(ies): {e} — warm discovery is \
+                         unaffected (this boot already skips both), but the next boot will \
+                         re-walk them",
                         shard_id,
-                        retired
+                        retired,
+                        duplicates_dropped
                     ),
                 }
             }
@@ -531,6 +553,10 @@ pub fn recover_shard_v3_pitr(
     // WAL: every KV write since the last snapshot was lost on restart.
     let mut kv_commands_replayed = 0usize;
     let mut kv_commands_skipped = 0usize;
+    // `Command` records replay did not apply to the keyspace (graph,
+    // cold-plane, unhandled). Replayed, but not KV history. Reported by the
+    // Phase 4b fallback line so the decision it makes can be audited.
+    let mut wal_non_kv_commands = 0usize;
     // moon#1039: KV records whose header db is beyond the configured
     // `--databases` count. Dropped rather than folded into db 0.
     let mut kv_records_db_out_of_range = 0usize;
@@ -560,43 +586,37 @@ pub fn recover_shard_v3_pitr(
                         kv_records_db_out_of_range += 1;
                         return;
                     }
-                    // Parse RESP frames from the serialized command payload.
-                    // The payload is RESP-encoded (same format as AOF/WAL v2 blocks).
-                    let mut buf = bytes::BytesMut::from(&record.payload[..]);
-                    let parse_cfg = crate::protocol::ParseConfig::default();
-                    while let Ok(Some(frame)) = crate::protocol::parse::parse(&mut buf, &parse_cfg)
-                    {
-                        if let crate::protocol::Frame::Array(ref arr) = frame {
-                            if !arr.is_empty() {
-                                let cmd_name = match &arr[0] {
-                                    crate::protocol::Frame::BulkString(s) => s.as_ref(),
-                                    crate::protocol::Frame::SimpleString(s) => s.as_ref(),
-                                    _ => continue,
-                                };
-                                engine.replay_command(
-                                    databases,
-                                    cmd_name,
-                                    &arr[1..],
-                                    &mut selected_db,
-                                );
-                                result.commands_replayed += 1;
-                                // moon#914: a cold-plane record is not KV
-                                // history. `ColdMarkerSink` mirrors every
-                                // `MOON.SPILLED` into this WAL under
-                                // `--wal-kv-log on`, so counting it made one
-                                // spill marker enough to skip the Phase 4b
-                                // AOF fallback — the WAL (which never holds a
-                                // connection-local write) became the "KV
-                                // authority" and the AOF's entire history was
-                                // discarded. Same class as the FileCreate
-                                // records the gate below already excludes.
-                                if !crate::persistence::cold_records::is_cold_plane_record(cmd_name)
-                                {
-                                    kv_commands_replayed += 1;
-                                }
+                    // The payload is RESP (one or more commands). The decoder
+                    // is shared with the last-resort fallback
+                    // (`replay_wal_v3_dir_commands`) so the two cannot drift
+                    // (moon#1026).
+                    crate::persistence::replay::replay_resp_payload(
+                        engine,
+                        databases,
+                        &record.payload,
+                        &mut selected_db,
+                        |route| {
+                            result.commands_replayed += 1;
+                            // Only a record replay APPLIED to the keyspace is
+                            // KV history. This WAL also carries `Command`
+                            // records that never reach it: `ColdMarkerSink`'s
+                            // `MOON.SPILLED` mirrors (moon#914) and every
+                            // `GRAPH.*` write (`GraphStore::wal_pending`,
+                            // moon#1018). Each one counted here made the WAL
+                            // the "KV authority", so Phase 4b skipped the AOF
+                            // and every acknowledged write in it was lost (a
+                            // single graph write took DBSIZE 3 -> 0). The
+                            // engine reports what it did with the record, so a
+                            // record class this code has never heard of is
+                            // excluded as well. A list of excluded names would
+                            // miss it, as it missed these two.
+                            if route.is_kv_history() {
+                                kv_commands_replayed += 1;
+                            } else {
+                                wal_non_kv_commands += 1;
                             }
-                        }
-                    }
+                        },
+                    );
                 }
                 WalRecordType::VectorUpsert
                 | WalRecordType::VectorDelete
@@ -884,8 +904,9 @@ pub fn recover_shard_v3_pitr(
             let aof_path = v2_dir.join("appendonly.aof");
             if aof_path.exists() {
                 info!(
-                    "Shard {}: WAL carried no KV commands, falling back to AOF replay from {:?}",
-                    shard_id, aof_path
+                    "Shard {}: WAL carried no KV commands, falling back to AOF replay from {:?} \
+                     ({} non-KV command record(s) in the WAL: graph / cold-plane / unhandled)",
+                    shard_id, aof_path, wal_non_kv_commands
                 );
                 match crate::persistence::aof::replay_aof(databases, &aof_path, engine) {
                     Ok(n) => {
@@ -909,18 +930,25 @@ pub fn recover_shard_v3_pitr(
                     databases,
                     engine,
                 ) {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        result.commands_replayed += n;
+                    Ok(c) if c.records_read == 0 => {}
+                    Ok(c) => {
+                        // moon#1026: report what reached the keyspace, not
+                        // the records read. A WAL full of non-KV records used
+                        // to log "replayed N" while recovering nothing.
+                        result.commands_replayed += c.kv_commands_applied;
                         tracing::warn!(
-                            "Shard {}: no appendonly.aof found — replayed {} records \
-                             from legacy-mode WAL v3 at {:?} as a LAST-RESORT \
-                             fallback. WAL v3 KV coverage is partial (gated by \
-                             --wal-kv-log; connection-local writes bypass it), so \
-                             this recovery may be incomplete.",
+                            "Shard {}: no appendonly.aof found — applied {} KV command(s) \
+                             from {} legacy-mode WAL v3 record(s) at {:?} as a LAST-RESORT \
+                             fallback ({} non-KV command(s), {} undecodable record(s)). \
+                             WAL v3 KV coverage is partial (gated by --wal-kv-log; \
+                             connection-local writes bypass it), so this recovery may be \
+                             incomplete.",
                             shard_id,
-                            n,
-                            legacy_wal_v3_dir
+                            c.kv_commands_applied,
+                            c.records_read,
+                            legacy_wal_v3_dir,
+                            c.other_commands,
+                            c.undecodable_records
                         );
                     }
                     Err(e) => {
@@ -1435,32 +1463,36 @@ mod tests {
         // Create a manifest with one warm VecCodes entry and one hot entry
         let manifest_path = shard_dir.join("shard-0.manifest");
         let mut manifest = ShardManifest::create(&manifest_path).unwrap();
-        manifest.add_file(FileEntry {
-            file_id: 42,
-            file_type: PageType::VecCodes as u8,
-            status: FileStatus::Active,
-            tier: StorageTier::Warm,
-            page_size_log2: 16,
-            page_count: 10,
-            byte_size: 655360,
-            created_lsn: 1,
-            db_index: 0,
-            max_key_hash: u64::MAX,
-            last_modified_lsn: 1,
-        });
-        manifest.add_file(FileEntry {
-            file_id: 99,
-            file_type: PageType::KvLeaf as u8,
-            status: FileStatus::Active,
-            tier: StorageTier::Hot,
-            page_size_log2: 12,
-            page_count: 5,
-            byte_size: 20480,
-            created_lsn: 2,
-            db_index: 0,
-            max_key_hash: u64::MAX,
-            last_modified_lsn: 2,
-        });
+        manifest
+            .add_file(FileEntry {
+                file_id: 42,
+                file_type: PageType::VecCodes as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Warm,
+                page_size_log2: 16,
+                page_count: 10,
+                byte_size: 655360,
+                created_lsn: 1,
+                db_index: 0,
+                max_key_hash: u64::MAX,
+                last_modified_lsn: 1,
+            })
+            .unwrap();
+        manifest
+            .add_file(FileEntry {
+                file_id: 99,
+                file_type: PageType::KvLeaf as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Hot,
+                page_size_log2: 12,
+                page_count: 5,
+                byte_size: 20480,
+                created_lsn: 2,
+                db_index: 0,
+                max_key_hash: u64::MAX,
+                last_modified_lsn: 2,
+            })
+            .unwrap();
         manifest.commit().unwrap();
         drop(manifest);
 
@@ -1477,6 +1509,101 @@ mod tests {
         assert_eq!(result.warm_segments.len(), 1);
         assert_eq!(result.warm_segments[0].0, 42);
         assert_eq!(result.warm_segments[0].1, seg_dir);
+    }
+
+    /// A manifest an older build wrote can list one warm segment id several
+    /// times (moon#893: the id counter re-issued live ids, and `add_file`
+    /// appended without a check). Discovery must hand the directory over ONCE —
+    /// the second hand-over is what let `register_warm_segments` delete the
+    /// directory it had just attached — and the duplicates must be healed on
+    /// disk so the next boot does not meet them again. A duplicated spill-file
+    /// entry is collapsed the same way, keeping the LAST entry: an older build
+    /// renamed its newer batch over the file, so the last entry is the one
+    /// that describes what is on disk.
+    #[test]
+    fn test_recovery_collapses_duplicate_manifest_entries_and_heals_them_on_disk() {
+        use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
+        use crate::persistence::page::PageType;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let manifest_path = shard_dir.join("shard-0.manifest");
+        let warm = |byte_size: u64| FileEntry {
+            file_id: 7,
+            file_type: PageType::VecCodes as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Warm,
+            page_size_log2: 16,
+            page_count: 1,
+            byte_size,
+            created_lsn: 0,
+            db_index: 0,
+            max_key_hash: u64::MAX,
+            last_modified_lsn: 0,
+        };
+        let spill = |db_index: u64| FileEntry {
+            file_id: 9,
+            file_type: PageType::KvLeaf as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Hot,
+            page_size_log2: 12,
+            page_count: 1,
+            byte_size: 4096,
+            created_lsn: 0,
+            db_index,
+            max_key_hash: 0,
+            last_modified_lsn: 0,
+        };
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        manifest.push_entry_unchecked(warm(100));
+        manifest.push_entry_unchecked(spill(0));
+        manifest.push_entry_unchecked(warm(200));
+        manifest.push_entry_unchecked(warm(300));
+        manifest.push_entry_unchecked(spill(3));
+        manifest.commit().unwrap();
+        drop(manifest);
+
+        let seg_dir = shard_dir.join("vectors").join("segment-7");
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        std::fs::write(seg_dir.join("codes.mpf"), [0u8; 64]).unwrap();
+
+        for boot in 1..=2 {
+            let mut databases = vec![Database::new()];
+            let engine = crate::persistence::replay::DispatchReplayEngine::new();
+            let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
+            assert_eq!(
+                result.warm_segments,
+                vec![(7, seg_dir.clone())],
+                "boot {boot}: a duplicated warm segment id must be handed over exactly once"
+            );
+
+            let reopened = ShardManifest::open(&manifest_path).unwrap();
+            let active = |id: u64, ty: PageType| -> Vec<FileEntry> {
+                reopened
+                    .files()
+                    .iter()
+                    .filter(|e| {
+                        e.file_id == id && e.file_type == ty as u8 && e.status == FileStatus::Active
+                    })
+                    .cloned()
+                    .collect()
+            };
+            let seg = active(7, PageType::VecCodes);
+            assert_eq!(
+                seg.len(),
+                1,
+                "boot {boot}: duplicates must be healed ON DISK"
+            );
+            assert_eq!(seg[0].byte_size, 300, "the last entry is the one kept");
+            let heap = active(9, PageType::KvLeaf);
+            assert_eq!(heap.len(), 1, "boot {boot}: spill-file duplicates too");
+            assert_eq!(
+                heap[0].db_index, 3,
+                "the last spill entry describes the file"
+            );
+            assert!(seg_dir.join("codes.mpf").exists());
+        }
     }
 
     /// Recovery must RETIRE a manifest entry whose segment directory is gone,
@@ -1505,19 +1632,21 @@ mod tests {
         let mut manifest = ShardManifest::create(&manifest_path).unwrap();
         // 7 = present on disk. 40, 41 = directories already deleted.
         for id in [7u64, 40, 41] {
-            manifest.add_file(FileEntry {
-                file_id: id,
-                file_type: PageType::VecCodes as u8,
-                status: FileStatus::Active,
-                tier: StorageTier::Warm,
-                page_size_log2: 16,
-                page_count: 10,
-                byte_size: 655360,
-                created_lsn: 1,
-                db_index: 0,
-                max_key_hash: u64::MAX,
-                last_modified_lsn: 1,
-            });
+            manifest
+                .add_file(FileEntry {
+                    file_id: id,
+                    file_type: PageType::VecCodes as u8,
+                    status: FileStatus::Active,
+                    tier: StorageTier::Warm,
+                    page_size_log2: 16,
+                    page_count: 10,
+                    byte_size: 655360,
+                    created_lsn: 1,
+                    db_index: 0,
+                    max_key_hash: u64::MAX,
+                    last_modified_lsn: 1,
+                })
+                .unwrap();
         }
         manifest.commit().unwrap();
         drop(manifest);
@@ -1604,32 +1733,36 @@ mod tests {
         let mut manifest = ShardManifest::create(&manifest_path).unwrap();
         // The warm segment first (it held the id first), then the spill file
         // that was re-issued the same id. No `vectors/segment-9/` exists.
-        manifest.add_file(FileEntry {
-            file_id: SHARED_ID,
-            file_type: PageType::VecCodes as u8,
-            status: FileStatus::Active,
-            tier: StorageTier::Warm,
-            page_size_log2: 16,
-            page_count: 1,
-            byte_size: 256,
-            created_lsn: 0,
-            db_index: 0,
-            max_key_hash: u64::MAX,
-            last_modified_lsn: 0,
-        });
-        manifest.add_file(FileEntry {
-            file_id: SHARED_ID,
-            file_type: PageType::KvLeaf as u8,
-            status: FileStatus::Active,
-            tier: StorageTier::Hot,
-            page_size_log2: 12,
-            page_count: batch.pages.len() as u32,
-            byte_size,
-            created_lsn: 0,
-            db_index: 0,
-            max_key_hash: 0,
-            last_modified_lsn: 0,
-        });
+        manifest
+            .add_file(FileEntry {
+                file_id: SHARED_ID,
+                file_type: PageType::VecCodes as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Warm,
+                page_size_log2: 16,
+                page_count: 1,
+                byte_size: 256,
+                created_lsn: 0,
+                db_index: 0,
+                max_key_hash: u64::MAX,
+                last_modified_lsn: 0,
+            })
+            .unwrap();
+        manifest
+            .add_file(FileEntry {
+                file_id: SHARED_ID,
+                file_type: PageType::KvLeaf as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Hot,
+                page_size_log2: 12,
+                page_count: batch.pages.len() as u32,
+                byte_size,
+                created_lsn: 0,
+                db_index: 0,
+                max_key_hash: 0,
+                last_modified_lsn: 0,
+            })
+            .unwrap();
         manifest.commit().unwrap();
         drop(manifest);
 
@@ -1678,19 +1811,21 @@ mod tests {
         // Create manifest with one KvLeaf/Active entry
         let manifest_path = shard_dir.join("shard-0.manifest");
         let mut manifest = ShardManifest::create(&manifest_path).unwrap();
-        manifest.add_file(FileEntry {
-            file_id: 7,
-            file_type: PageType::KvLeaf as u8,
-            status: FileStatus::Active,
-            tier: StorageTier::Hot,
-            page_size_log2: 12,
-            page_count: 1,
-            byte_size: 4096,
-            created_lsn: 1,
-            db_index: 0,
-            max_key_hash: u64::MAX,
-            last_modified_lsn: 1,
-        });
+        manifest
+            .add_file(FileEntry {
+                file_id: 7,
+                file_type: PageType::KvLeaf as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Hot,
+                page_size_log2: 12,
+                page_count: 1,
+                byte_size: 4096,
+                created_lsn: 1,
+                db_index: 0,
+                max_key_hash: u64::MAX,
+                last_modified_lsn: 1,
+            })
+            .unwrap();
         manifest.commit().unwrap();
         drop(manifest);
 
@@ -2008,6 +2143,117 @@ mod tests {
         );
     }
 
+    /// Writes `records` as consecutive `Command` records into a fresh
+    /// `shard-0/wal-v3/`, and `aof` as the legacy-dir `appendonly.aof`, then
+    /// runs recovery the way tokio `--shards 1` does (no manifest, so
+    /// `kv_authority_elsewhere = false`). Returns db 0.
+    fn recover_wal_commands_over_aof(records: &[&[u8]], aof: &[u8]) -> Database {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let offload_wal_dir = shard_dir.join("wal-v3");
+        std::fs::create_dir_all(&offload_wal_dir).unwrap();
+        let mut wal_data = make_v3_header(0);
+        for (i, rec) in records.iter().enumerate() {
+            write_wal_v3_record(&mut wal_data, i as u64 + 1, WalRecordType::Command, rec);
+        }
+        std::fs::write(offload_wal_dir.join("000000000001.wal"), &wal_data).unwrap();
+
+        let v2_dir = tmp.path().join("legacy");
+        std::fs::create_dir_all(&v2_dir).unwrap();
+        std::fs::write(v2_dir.join("appendonly.aof"), aof).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        recover_shard_v3_with_fallback(
+            &mut databases,
+            0,
+            &shard_dir,
+            &engine,
+            Some(&v2_dir),
+            false,
+        )
+        .unwrap();
+        databases.swap_remove(0)
+    }
+
+    /// `GRAPH.CREATE g`, byte-for-byte what `graph::wal::serialize_graph_create`
+    /// writes into the shard WAL (pinned below under the `graph` feature).
+    const WAL_GRAPH_CREATE: &[u8] = b"*2\r\n$12\r\nGRAPH.CREATE\r\n$1\r\ng\r\n";
+    const AOF_TWO_SETS: &[u8] =
+        b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n";
+
+    /// moon#1018: on tokio `--shards 1` with the `graph` feature every
+    /// `GRAPH.*` write lands in the shard WAL as a `Command` record
+    /// (`GraphStore::wal_pending`). Replay diverts it to the graph collector —
+    /// it never touches the keyspace — but Phase 4 counted it as KV history,
+    /// so ONE graph write made Phase 4b skip `appendonly.aof`: a live
+    /// `kill -9` run went DBSIZE 3 -> 0. Without the `graph` feature the same
+    /// record reaches KV dispatch as an unknown command and applies nothing
+    /// either, so the assertion holds on every feature set.
+    #[test]
+    fn graph_records_in_the_wal_do_not_suppress_the_aof_fallback() {
+        #[cfg(feature = "graph")]
+        assert_eq!(
+            crate::graph::wal::serialize_graph_create(b"g"),
+            WAL_GRAPH_CREATE,
+            "fixture drifted from the bytes the graph write path logs"
+        );
+        #[cfg(feature = "graph")]
+        let add_node = crate::graph::wal::serialize_add_node(
+            b"g",
+            4_294_967_297,
+            &[1],
+            &crate::graph::types::PropertyMap::new(),
+            None,
+        );
+        #[cfg(not(feature = "graph"))]
+        let add_node = b"*6\r\n$13\r\nGRAPH.ADDNODE\r\n$1\r\ng\r\n$10\r\n4294967297\r\n$1\r\n1\r\n$1\r\n1\r\n$1\r\n0\r\n".to_vec();
+
+        let db = recover_wal_commands_over_aof(&[WAL_GRAPH_CREATE, &add_node], AOF_TWO_SETS);
+        assert_eq!(
+            db.len(),
+            2,
+            "the AOF is the only KV history here and must be replayed; a WAL \
+             holding nothing but GRAPH.* records is not a KV authority"
+        );
+    }
+
+    /// moon#1018, the class rather than the instance: a `Command` record that
+    /// no replay path applies to the keyspace — here a record type this build
+    /// has never heard of — has recorded no KV history, whatever its name.
+    /// An exclusion list (#914 cold-plane records, then GRAPH.*) misses the
+    /// next such class; counting only what replay actually applied does not.
+    #[test]
+    fn a_wal_record_replay_never_applies_to_the_keyspace_is_not_kv_history() {
+        let db = recover_wal_commands_over_aof(
+            &[b"*2\r\n$16\r\nMOON.FUTUREPLANE\r\n$1\r\nx\r\n"],
+            AOF_TWO_SETS,
+        );
+        assert_eq!(
+            db.len(),
+            2,
+            "an unknown record applied nothing, so it cannot displace the AOF"
+        );
+    }
+
+    /// The other direction, so the fix cannot be "never count anything": when
+    /// the WAL DOES carry a KV write beside a graph record (`--wal-kv-log on`
+    /// on a path that logs it), it stays the authority and the AOF is not
+    /// replayed on top — replaying both would double-apply the `INCR`.
+    #[test]
+    fn kv_records_beside_graph_records_keep_the_wal_as_the_kv_authority() {
+        let mut db = recover_wal_commands_over_aof(
+            &[WAL_GRAPH_CREATE, b"*2\r\n$4\r\nINCR\r\n$1\r\nn\r\n"],
+            b"*2\r\n$4\r\nINCR\r\n$1\r\nn\r\n",
+        );
+        let n = db.get(b"n").and_then(|e| e.value.as_bytes_owned());
+        assert_eq!(
+            n.as_deref(),
+            Some(&b"1"[..]),
+            "the WAL's INCR is KV history; replaying the AOF too double-applies it"
+        );
+    }
+
     /// moon#914: `MOON.COLDCUT` gates EVERY database, so Phase 4b must close
     /// the generation on every database — closing only db 0 left SELECT 1..N
     /// gated after replay, hiding every later cold file from the live server.
@@ -2084,6 +2330,12 @@ mod tests {
         assert!(!recover(None).aof_replayed_without_cold_cut);
     }
 
+    /// moon#1026: the last-resort rung must put the WAL's KV records into the
+    /// KEYSPACE. The previous version of this test wrote five `PING` records
+    /// and asserted `commands_replayed == 5`, a record count that passed while
+    /// the helper applied nothing at all (each raw RESP payload reached
+    /// dispatch as the command NAME). Assert what an operator relies on: the
+    /// keys come back, and the count reports only what was applied.
     #[test]
     fn test_legacy_wal_v3_last_resort_when_no_aof() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2097,13 +2349,19 @@ mod tests {
         std::fs::create_dir_all(&legacy_wal_dir).unwrap();
         let mut wal_data = make_v3_header(0);
         for i in 1..=5u64 {
-            write_wal_v3_record(
-                &mut wal_data,
-                i,
-                WalRecordType::Command,
-                b"*1\r\n$4\r\nPING\r\n",
+            let key = format!("lr:{i}");
+            let val = format!("v{i}");
+            let payload = format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n${}\r\n{val}\r\n",
+                key.len(),
+                val.len()
             );
+            write_wal_v3_record(&mut wal_data, i, WalRecordType::Command, payload.as_bytes());
         }
+        // A non-KV record (cold-plane marker) is read but not applied to the
+        // keyspace, so it must not inflate the recovered count.
+        let marker = crate::persistence::cold_records::serialize_spilled(9, &[]);
+        write_wal_v3_record(&mut wal_data, 6, WalRecordType::Command, &marker);
         std::fs::write(legacy_wal_dir.join("000000000001.wal"), &wal_data).unwrap();
 
         let mut databases = vec![Database::new()];
@@ -2118,10 +2376,23 @@ mod tests {
         )
         .unwrap();
 
+        for i in 1..=5u64 {
+            let key = format!("lr:{i}");
+            let got = databases[0]
+                .get(key.as_bytes())
+                .and_then(|e| e.value.as_bytes().map(<[u8]>::to_vec));
+            assert_eq!(
+                got.as_deref(),
+                Some(format!("v{i}").as_bytes()),
+                "with no appendonly.aof, the legacy WAL v3 last-resort fallback \
+                 must restore {key} into the keyspace"
+            );
+        }
+        assert_eq!(databases[0].len(), 5, "exactly the five WAL keys");
         assert_eq!(
             result.commands_replayed, 5,
-            "with no appendonly.aof, the legacy WAL v3 last-resort fallback \
-             must replay what it can"
+            "the rung reports the KV commands it APPLIED (5), not the records \
+             it read (6)"
         );
     }
 

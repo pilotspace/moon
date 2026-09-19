@@ -683,6 +683,12 @@ pub(super) async fn try_handle_swapdb(
         &ctx.repl_state,
     )
     .await;
+    // moon#1069: the local leg swapped this shard's two databases; every
+    // key parked on in either may now hold data. Remote shards serve their
+    // own waiters from the `SwapDb` arm.
+    if !matches!(response, Frame::Error(_)) {
+        crate::blocking::wakeup::wake_swapped_dbs(&ctx.blocking_registry, a, b);
+    }
     responses.push(response);
     true
 }

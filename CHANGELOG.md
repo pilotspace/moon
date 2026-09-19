@@ -240,6 +240,131 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     connections holding a channel `parked_clients:0`), or a cross-thread wake of
     a parked connection, which the idle-park machinery does not have. That
     part of moon#1078 stays open.
+- **Restart no longer deletes warm vector segments it is serving, and a warm
+  segment is superseded per key instead of as a whole directory** (moon#893).
+  Boot recovery judged a warm segment "already covered" when ANY one of its
+  key_hashes was already indexed, and then ran `remove_dir_all` on its
+  directory. Two ways in, both measured on a real server with 1000 warm keys:
+  re-inserting ONE key and compacting it into a HOT segment retired the whole
+  directory on the next boot, and the other 999 vectors were re-encoded; and
+  a manifest written by an older build that lists one segment id twice (its
+  id counter re-issued live ids) had the directory attached on the first
+  entry and deleted on the second. Worse, when the re-inserted key's own
+  segment had also gone warm, recovery registered the key under its new
+  global_id, attached the older segment, and deleted the newer one: after the
+  restart the key answered to its OVERWRITTEN vector and its current one was
+  gone. Now each key is decided on its own. The persisted keymap names a key's
+  current copy by global_id. A copy that is not that one, or that another live
+  segment already serves, is tombstoned in that segment only. The rest stay
+  served from it. A directory is retired only when none of its keys is live,
+  never one recovery attached. The directory is renamed out of discovery's
+  reach before it is deleted, so a crash mid-delete cannot leave a
+  half-deleted segment. Each segment id is handled once. Duplicate manifest
+  entries are collapsed at boot and healed on disk, keeping the last. For a
+  spill file, that last entry is the one that describes the file.
+  `ShardManifest::add_file` now refuses a second entry for an
+  `(id, type)` that is already listed (it returns `DuplicateFileEntry`),
+  and a warm transition onto an id whose directory or entry already exists
+  is refused before anything is written, where it used to commit the entry
+  and then fail the rename with `ENOTEMPTY`. A spill batch whose file id the
+  manifest already lists puts its keys back in RAM from their in-flight
+  payloads, never publishes them cold, and is counted in the new INFO field
+  `spill_completion_id_rejected`. A reattached warm segment raises the
+  vector global_id allocator above its own ids, so a key written after the
+  restart can never be given an id a warm row already holds. Covered by
+  `tests/warm_segment_restart_893.rs`, which restarts twice (clean and
+  `kill -9`) and checks that the directories persist, nothing is re-encoded,
+  and `FT.SEARCH` is identical.
+
+- **A write that lands data on a key wakes the clients blocked on it, whatever
+  command wrote it** (moon#1059, moon#1069). Only six "producer" commands
+  (`LPUSH`, `RPUSH`, `LMOVE`, `RPOPLPUSH`, `ZADD`, `XADD`) used to wake a
+  blocked client, so a `BLPOP`/`BZPOPMIN`/`XREAD BLOCK` stayed parked until its
+  own timeout — or forever with timeout 0 — beside data it could pop when the
+  key was written by `RENAME`, `RENAMENX`, `COPY`, `MOVE`, `COPY ... DB n`,
+  `SORT ... STORE`, `ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFFSTORE`/`ZRANGESTORE`,
+  `ZINCRBY`, `GEOADD`, `RESTORE`, `SWAPDB`, a script (`EVAL`/`FCALL`), or any
+  of those inside `MULTI`. A `BLMOVE`/`BRPOPLPUSH` served by a wake, or served
+  immediately, pushed onto its destination without waking the `BLPOP` parked
+  there, so move chains stalled at the first hop. The wake is now keyed on the
+  keys a command WRITES (the shared key walker's write positions), not on
+  command names; `MOVE`/`COPY ... DB n` wake the destination database and
+  `SWAPDB` every key parked in either database. A wake-served move feeds its
+  destination's waiters in the same pass, over a worklist bounded by the
+  waiters parked when it began — chains and cycles are served as redis's
+  `handleClientsBlockedOnKeys` serves them. All the keys one command, one
+  `EXEC` or one script made ready form a single batch that is served before
+  the keys the moves it serves push onto. So, with `BLMOVE a c`, `BLMOVE b c`
+  and `BRPOP c` parked, `MULTI; RPUSH a x; RPUSH b y; EXEC` hands the `BRPOP`
+  `y` and leaves `c = [x]`, as redis does. A key that becomes the wrong type
+  for its waiter still leaves the waiter parked, as in redis. The wake costs
+  nothing measurable while a client is parked on the shard: a write that can
+  only produce a string, hash, set, bitmap or HyperLogLog skips the key walk
+  entirely, as redis's `signalKeyAsReady` returns early on type, and the
+  registry is probed with borrowed keys. A 10-key `MSET` with one `BLPOP`
+  parked runs within noise of the build before the wake existed. Every case
+  was measured against redis-server 8.6.1 first (served within about 0.3 s)
+  and now matches it at `--shards 1` and `--shards 4` on both runtimes.
+
+- **The last-resort WAL v3 replay now restores KV writes instead of none**
+  (moon#1026). When `appendonly.aof` is missing and the WAL carries KV records
+  (`--wal-kv-log on`), boot falls back to replaying the WAL. That fallback
+  passed each record's raw RESP payload to dispatch as the command *name*
+  with no arguments. Every record came back "unknown command" and nothing
+  reached the keyspace, yet the boot log said `replayed N WAL v3 records`.
+  Measured end to end at `--shards 2`: 0 of 64 keys came back and the log
+  claimed 35 records. The fallback now uses the same payload decoder as the
+  Phase 4 WAL pass (`replay::replay_resp_payload`), so the two cannot drift.
+  After the fix the same run restores 29 of 64 keys; the other 35 were
+  connection-local writes, which the WAL does not log by design. Both
+  fallback sites (`shard/mod.rs` and recovery Phase 4b) now log the KV
+  commands they **applied**, alongside records read, non-KV commands and
+  undecodable records. The legacy-dir fallback also closes the replay
+  generation, as its AOF sibling does. `replay_wal_auto` had the same defect
+  and uses the same per-record replay now. Each record replays into the db it
+  was written in (moon#1039), so a `MOVE` or `COPY ... DB n` takes its source
+  from that db (moon#1046). A record for a db beyond `--databases` is skipped
+  with a warning, not folded into db 0. The WAL remains a partial source: it
+  is never the recovery authority.
+
+- **`REPLICAOF <hostname> <port>` no longer aborts the server** (moon#1034).
+  On the default monoio runtime, the replica task parsed `host:port` as a
+  socket address with `.expect`, and that parse accepts IP literals only.
+  `REPLICAOF localhost 6379`, or any DNS name (the normal way to name a master
+  in Kubernetes), panicked on the shard thread, and the panic hook aborted
+  the whole process (SIGABRT). This happened after the command had already
+  replied `+OK`. The host is now resolved as redis does it: inside the
+  reconnect loop, with backoff. An IP literal (including `::1` and `[::1]`)
+  needs no lookup. A name is resolved with the system resolver on a helper
+  thread, never on the shard thread, and the wait is bounded at 5 s. At most
+  one lookup is in flight per replica task, even when the resolver hangs.
+  Every resolved address is tried in order, each connect bounded at 5 s:
+  `localhost` gives `::1` first, which is refused when moon binds
+  `127.0.0.1`, so the task falls through to `127.0.0.1`. While a host does not
+  resolve, the node stays up and reports `master_link_status:down`, and it
+  picks the master up once DNS recovers. `REPLICAOF NO ONE` and re-pointing
+  still supersede the task. The tokio build formatted `host:port` into one
+  string, which cannot express an IPv6 literal. It now shares the same
+  resolver.
+
+- **One `GRAPH.*` write no longer makes a restart discard every acknowledged
+  KV write** (moon#1018). This hits `runtime-tokio` with `--shards 1` and the
+  `graph` feature. That configuration has no `AofManifest`, so recovery picks
+  the KV authority itself: the shard's WAL v3 if replaying it produced KV
+  history, otherwise `appendonly.aof`. Every graph write lands in that WAL as a
+  `Command` record. Replay hands it to the graph engine, never to the keyspace,
+  yet it was counted as KV history. The AOF was skipped, and the keys lived
+  only there. Measured with `--appendfsync always` and `kill -9`: DBSIZE
+  3 → 0, and the same again on every later boot. Recovery now counts a record
+  only when replay applied it to the keyspace. The replay engine reports where
+  each record went (keyspace, cold plane, graph, or unhandled), so this does
+  not depend on an exclusion list: moon#914 and this issue each found a record
+  class such a list missed. A record this build cannot handle (for example,
+  `GRAPH.*` without the `graph` feature) no longer counts either. monoio, and
+  tokio with `--shards` ≥ 2, have a manifest and never reach this decision.
+  CI's per-PR `Test (graph)` step now also runs the recovery/replay unit tests
+  and `tests/graph_wal_kv_authority_1018.rs` under `runtime-tokio` + `graph`,
+  a combination no per-PR leg built before. It adds ~19 s.
 
 - **`CLIENT TRACKING ... REDIRECT <id>` now reaches its target, and
   `CLIENT CACHING` works** (moon#1048, moon#1049). Every wire reply below was
@@ -894,6 +1019,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CH` as a did-anything-change signal silently skipped those updates. Fixed on
   both the listpack and B+tree arms, which carried separate copies.
 ### Security
+
+- **Error and status replies can no longer be split by client input**
+  (moon#1031). Error text quotes client input (an unknown command name, an
+  `ACL SETUSER` rule), and CR/LF bytes in it were written raw, so one command
+  could produce several RESP replies. That desynchronises any client or proxy
+  that pipelines on a shared connection. Every line-framed reply (`+`, `-`,
+  RESP3 `(`) now goes through one writer that maps CR and LF to spaces, as
+  redis does, and so do the inline quota error and the protocol-error echo.
+  It is allocation-free, and a reply with no CR/LF costs the same as before.
 
 - **`rustls` bumped past RUSTSEC-2026-0285 / GHSA-2mjx-qc3c-rqvc** ("TLS 1.3
   handshake messages incorrectly accepted across encryption level

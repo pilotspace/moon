@@ -131,6 +131,43 @@ fn is_hexpire_family_write(cmd: &[u8]) -> bool {
         || cmd.eq_ignore_ascii_case(b"HPERSIST")
 }
 
+/// Where [`CommandReplayEngine::replay_command`] sent one replayed record.
+///
+/// Recovery uses this to decide whether a log is the KV authority: only
+/// [`ReplayRoute::Keyspace`] is KV history. The engine is the one party that
+/// knows what it did with a record, so the classification lives here rather
+/// than in a list of names the counter excludes. That list has already missed
+/// two record classes: cold-plane markers (moon#914) and `GRAPH.*` (moon#1018).
+/// Each time, one non-KV record made recovery skip `appendonly.aof` and lose
+/// every acknowledged write in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayRoute {
+    /// Applied to the KV keyspace: a `command::dispatch` handler ran, or a
+    /// replay shim that mutates the database slice (SWAPDB, FLUSHALL, MOVE /
+    /// `COPY ... DB n`, the HEXPIRE family) did.
+    Keyspace,
+    /// A replay-only cold-plane cut record (`MOON.COLDCUT` / `MOON.SPILLED`):
+    /// it moves the cold-tier gate. It is not a key write.
+    ColdPlane,
+    /// Diverted to the graph collector (well-formed or not). The graph engine
+    /// applies it in its own pass, and it never reaches the keyspace.
+    Graph,
+    /// No replay path handles it: KV dispatch answered "unknown command", so
+    /// nothing was applied. This covers any record class this build has no
+    /// handler for, such as `GRAPH.*` in a build without the `graph` feature.
+    Unhandled,
+}
+
+impl ReplayRoute {
+    /// Whether the record is KV history, i.e. replay applied it to the
+    /// keyspace.
+    #[inline]
+    #[must_use]
+    pub fn is_kv_history(self) -> bool {
+        matches!(self, ReplayRoute::Keyspace)
+    }
+}
+
 /// Replay `MOVE` or `COPY ... DB n` against the two databases it names
 /// (moon#1046).
 ///
@@ -192,15 +229,62 @@ pub trait CommandReplayEngine {
     /// Replay a single parsed command against the database slice.
     ///
     /// `selected_db` may be mutated by SELECT commands during replay.
-    /// The response is intentionally discarded -- replay cares only about
-    /// side effects on the databases.
+    /// The command's reply is discarded; replay cares only about its side
+    /// effects. The returned [`ReplayRoute`] says which path those went to.
     fn replay_command(
         &self,
         databases: &mut [Database],
         cmd: &[u8],
         args: &[Frame],
         selected_db: &mut usize,
-    );
+    ) -> ReplayRoute;
+}
+
+/// Decode one WAL v3 `Command` record payload and replay every command in it
+/// through `engine`.
+///
+/// The payload is RESP: one or more arrays of `[name, args...]`, exactly what
+/// `aof::serialize_command` writes on the live path. Each array's first
+/// element is the command NAME and the rest are its arguments. `on_route` is
+/// called once per replayed command with the route the engine took, which is
+/// how callers count what reached the keyspace (see [`ReplayRoute`]).
+///
+/// This is the ONE decoder for WAL `Command` payloads. The Phase 4 WAL pass
+/// (`recovery.rs`) and the last-resort fallback
+/// (`wal_v3::replay::replay_wal_v3_dir_commands`) both call it. moon#1026: the
+/// fallback once kept its own copy that passed the whole raw payload as the
+/// command name with no arguments, so every record answered "unknown
+/// command", nothing was applied, and the caller still logged the records as
+/// replayed. Sharing the decoder is what keeps the two paths from drifting.
+///
+/// Decoding stops at the first frame that does not parse, matching Phase 4.
+/// A non-array frame, an empty array, or a name that is not a string is
+/// skipped. Returns the number of commands handed to the engine.
+pub fn replay_resp_payload<E: CommandReplayEngine + ?Sized>(
+    engine: &E,
+    databases: &mut [Database],
+    payload: &[u8],
+    selected_db: &mut usize,
+    mut on_route: impl FnMut(ReplayRoute),
+) -> usize {
+    let mut buf = bytes::BytesMut::from(payload);
+    let parse_cfg = crate::protocol::ParseConfig::default();
+    let mut replayed = 0usize;
+    while let Ok(Some(frame)) = crate::protocol::parse::parse(&mut buf, &parse_cfg) {
+        let Frame::Array(ref arr) = frame else {
+            continue;
+        };
+        let Some((name, args)) = arr.split_first() else {
+            continue;
+        };
+        let cmd_name: &[u8] = match name {
+            Frame::BulkString(s) | Frame::SimpleString(s) => s.as_ref(),
+            _ => continue,
+        };
+        on_route(engine.replay_command(databases, cmd_name, args, selected_db));
+        replayed += 1;
+    }
+    replayed
 }
 
 /// Concrete implementation that delegates to `command::dispatch`.
@@ -250,7 +334,7 @@ impl CommandReplayEngine for DispatchReplayEngine {
         cmd: &[u8],
         args: &[Frame],
         selected_db: &mut usize,
-    ) {
+    ) -> ReplayRoute {
         // moon#902: replay-only cold-plane cut records (`MOON.COLDCUT`,
         // `MOON.SPILLED`) act on the databases directly and never reach
         // dispatch — a client sending one gets "unknown command".
@@ -260,7 +344,7 @@ impl CommandReplayEngine for DispatchReplayEngine {
             args,
             *selected_db,
         ) {
-            return;
+            return ReplayRoute::ColdPlane;
         }
 
         // Intercept graph commands and route to the collector instead of KV dispatch.
@@ -307,7 +391,7 @@ impl CommandReplayEngine for DispatchReplayEngine {
                         args.len()
                     );
                 }
-                return;
+                return ReplayRoute::Graph;
             }
         }
 
@@ -335,7 +419,7 @@ impl CommandReplayEngine for DispatchReplayEngine {
                     // Out-of-range or same-index — silently skip (same as Redis).
                 }
             }
-            return;
+            return ReplayRoute::Keyspace;
         }
 
         let db_count = databases.len();
@@ -362,7 +446,10 @@ impl CommandReplayEngine for DispatchReplayEngine {
                         String::from_utf8_lossy(&e)
                     );
                 }
-                return;
+                // KV history even when refused (bad arity, missing source,
+                // destination db out of range): a keyspace handler ran, the
+                // same rule SWAPDB and dispatch arity errors follow.
+                return ReplayRoute::Keyspace;
             }
             // COPY without a DB clause, or `DB <selected>`: single-db path.
         }
@@ -382,7 +469,7 @@ impl CommandReplayEngine for DispatchReplayEngine {
             if !matches!(resp, Frame::Error(_)) {
                 crate::command::server_admin::flush_every_database(databases, *selected_db);
             }
-            return;
+            return ReplayRoute::Keyspace;
         }
 
         // Phase 200 — HEXPIRE-family replay shims.
@@ -402,16 +489,21 @@ impl CommandReplayEngine for DispatchReplayEngine {
             } else {
                 let _ = replay_hexpire_family(db, cmd, args);
             }
-            return;
+            return ReplayRoute::Keyspace;
         }
 
-        let _ = crate::command::dispatch(
+        let reply = crate::command::dispatch(
             &mut databases[*selected_db],
             cmd,
             args,
             selected_db,
             db_count,
         );
+        if reply.is_unknown_command() {
+            ReplayRoute::Unhandled
+        } else {
+            ReplayRoute::Keyspace
+        }
     }
 }
 
@@ -688,6 +780,118 @@ mod tests {
             Some(abs_ms),
             "replay must accept the recorded TTL irrespective of NX/XX/GT/LT"
         );
+    }
+
+    // ── ReplayRoute (moon#1018) ───────────────────────────────────────────────
+
+    /// Each replay path reports where the record went, so recovery counts KV
+    /// history by what replay did rather than by a list of names. Only a
+    /// record that reached the keyspace is `Keyspace`, including one a
+    /// handler refused (arity, WRONGTYPE): a handler ran.
+    #[test]
+    fn every_replay_path_reports_its_route() {
+        let engine = DispatchReplayEngine::new();
+        let mut dbs: Vec<Database> = (0..2).map(|_| Database::new()).collect();
+        let mut sel = 0usize;
+        let mut route =
+            |cmd: &[u8], args: &[Frame]| engine.replay_command(&mut dbs, cmd, args, &mut sel);
+
+        assert_eq!(
+            route(b"SET", &[bulk(b"k"), bulk(b"v")]),
+            ReplayRoute::Keyspace
+        );
+        assert_eq!(
+            route(b"GET", &[]),
+            ReplayRoute::Keyspace,
+            "arity error: a handler ran"
+        );
+        assert_eq!(
+            route(b"SWAPDB", &[bulk(b"0"), bulk(b"1")]),
+            ReplayRoute::Keyspace
+        );
+        assert_eq!(route(b"FLUSHALL", &[]), ReplayRoute::Keyspace);
+        assert_eq!(
+            route(
+                b"HPERSIST",
+                &[bulk(b"h"), bulk(b"FIELDS"), bulk(b"1"), bulk(b"f")]
+            ),
+            ReplayRoute::Keyspace
+        );
+
+        assert_eq!(
+            route(b"MOON.COLDCUT", &[bulk(b"1")]),
+            ReplayRoute::ColdPlane
+        );
+        assert_eq!(route(b"moon.spilled", &[]), ReplayRoute::ColdPlane);
+
+        // Without the `graph` feature KV dispatch has no GRAPH.* handler, so
+        // the record is unhandled. Either way it is not KV history.
+        let graph = route(b"GRAPH.CREATE", &[bulk(b"g")]);
+        #[cfg(feature = "graph")]
+        assert_eq!(graph, ReplayRoute::Graph);
+        #[cfg(not(feature = "graph"))]
+        assert_eq!(graph, ReplayRoute::Unhandled);
+        assert!(!graph.is_kv_history());
+
+        assert_eq!(
+            route(b"MOON.FUTUREPLANE", &[bulk(b"x")]),
+            ReplayRoute::Unhandled
+        );
+
+        assert!(ReplayRoute::Keyspace.is_kv_history());
+        for r in [
+            ReplayRoute::ColdPlane,
+            ReplayRoute::Graph,
+            ReplayRoute::Unhandled,
+        ] {
+            assert!(!r.is_kv_history(), "{r:?} is not KV history");
+        }
+    }
+
+    /// MOVE and `COPY ... DB n` replay through the two-db intercept, not
+    /// `command::dispatch`, and are KV history like every other keyspace
+    /// write: a WAL carrying them is the KV authority. A record the intercept
+    /// refuses (destination db this server lacks, bad arity) still went to a
+    /// keyspace handler, so it is `Keyspace` too, as a refused SWAPDB is.
+    #[test]
+    fn move_and_copy_db_replay_route_is_keyspace() {
+        let engine = DispatchReplayEngine::new();
+        let mut dbs = sixteen_dbs();
+        put(&mut dbs[0], b"k", b"v", 0);
+        let mut sel = 0usize;
+        let mut route =
+            |cmd: &[u8], args: &[Frame]| engine.replay_command(&mut dbs, cmd, args, &mut sel);
+
+        assert_eq!(
+            route(b"COPY", &[bulk(b"k"), bulk(b"k2"), bulk(b"DB"), bulk(b"5")]),
+            ReplayRoute::Keyspace,
+            "COPY ... DB n"
+        );
+        assert_eq!(
+            route(b"move", &[bulk(b"k"), bulk(b"3")]),
+            ReplayRoute::Keyspace,
+            "MOVE"
+        );
+        assert_eq!(
+            route(b"MOVE", &[bulk(b"k"), bulk(b"99")]),
+            ReplayRoute::Keyspace,
+            "MOVE refused: destination db out of range"
+        );
+        assert_eq!(
+            route(
+                b"COPY",
+                &[bulk(b"k"), bulk(b"k2"), bulk(b"DB"), bulk(b"99")]
+            ),
+            ReplayRoute::Keyspace,
+            "COPY refused: destination db out of range"
+        );
+        assert_eq!(
+            route(b"MOVE", &[bulk(b"k")]),
+            ReplayRoute::Keyspace,
+            "MOVE refused: arity"
+        );
+        assert_eq!(get_key(&mut dbs[3], b"k").as_deref(), Some(b"v".as_ref()));
+        assert_eq!(get_key(&mut dbs[5], b"k2").as_deref(), Some(b"v".as_ref()));
     }
 
     // ── MOVE / COPY ... DB n replay intercept (moon#1046) ────────────────────
