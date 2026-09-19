@@ -210,20 +210,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     workload. The write leg on the connection's own shard already waited up to
     `--aof-fsync-timeout-ms` (2 s by default).
   - **Now.** Before a routed write runs, its shard checks that the AOF writer
-    has room for the write's records, waiting up to the same
-    `--aof-fsync-timeout-ms`. A stall shorter than that is absorbed. A write
-    that still finds no room is refused **without being applied**, with
-    `-MOONERR AOF backpressure: command not executed, the AOF writer is
-    stalled; retry`. The keyspace, the AOF and the replicas keep agreeing, and
-    the client can retry.
-  - Reads never wait. A stalled writer costs a shard at most one bound per
-    drain cycle, not one per command. While a rewrite is folding, writes
-    spill to the rewrite overflow instead of waiting.
+    has room for the write's records. The shard thread never waits for it: a
+    write that finds no room stays queued, unapplied, at the head of the queue
+    from the shard that sent it, and is retried on every loop tick, while
+    reads, local connections and the other shards' queues keep flowing. Later
+    commands from the same sending shard wait behind it, so nothing overtakes
+    an earlier write. A stall shorter than `--aof-fsync-timeout-ms` (2 s by
+    default; `0` means 10 s here, and the wait never exceeds 10 s) is
+    absorbed. A write still without room after that is refused **without
+    being applied**, with `-MOONERR AOF backpressure: command not executed,
+    the AOF writer is stalled; retry`, and while the writer stays stalled the
+    next routed writes are refused at once instead of each waiting again. The
+    keyspace, the AOF and the replicas keep agreeing, and the client can
+    retry.
+  - A multi-shard `MSET`, `DEL` or `UNLINK` whose part on a stalled shard is
+    refused while its other parts ran answers `-MOONERR AOF backpressure:
+    command partially executed; ...` instead, because it was not "not
+    executed". A multi-shard `FLUSHALL`/`FLUSHDB` keeps its existing
+    `MOONERR FLUSH partial` reply.
+  - The check applies under every `appendfsync` policy (`always`,
+    `everysec`, `no`): it is about room in the writer's channel, which all
+    three use. Admission reserves room for every write it lets through in
+    the same loop pass, plus 256 spare records for what it cannot count in
+    advance (eviction deletes, a script's extra writes, other shards' fsync
+    barriers). A single write that needs more than that spare can still meet
+    a full channel after it applied and get the existing fail-loud error.
+  - While a rewrite is folding, writes spill to the rewrite overflow instead
+    of waiting. The script-load fan-out budget grows by the admission wait,
+    so a slow disk is not reported as a divergent shard.
   - `INFO persistence` gains `aof_backpressure_stalls` (routed writes that
     waited) and `aof_backpressure_refused` (commands refused unapplied).
   - The write leg on the connection's own shard is unchanged. It still
-    applies the write, waits up to the bound, and then reports
-    `ERR AOF fsync failed; write not durable`.
+    applies the write, waits up to the bound on its connection task, and
+    then reports `ERR AOF fsync failed; write not durable`.
+
 - **An AOF rewrite no longer replays a write twice, and a rewrite that fails
   late no longer leaves the writer appending to a deleted file** (moon#455).
   - **Double apply.** A rewrite split the append stream by position: whatever

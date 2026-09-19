@@ -260,6 +260,28 @@ pub(crate) async fn recv_reply_bounded<T: Send + 'static>(
         .map_err(|_| channel::RecvError)
 }
 
+/// The reply for a multi-shard write whose leg on some shard answered `err`.
+///
+/// A leg its owner refused before running it
+/// ([`AOF_BACKPRESSURE_REFUSED_ERR`](crate::shard::aof_admission::AOF_BACKPRESSURE_REFUSED_ERR))
+/// says "not executed", which is only true of the whole command when no
+/// other part of it ran. When the local slice or another leg was applied,
+/// the reply says the command was partially executed instead (moon#769).
+/// Every other error passes through unchanged.
+fn refused_leg_error(err: Frame, other_parts_ran: bool) -> Frame {
+    match &err {
+        Frame::Error(e)
+            if other_parts_ran
+                && e.as_ref() == crate::shard::aof_admission::AOF_BACKPRESSURE_REFUSED_ERR =>
+        {
+            Frame::Error(Bytes::from_static(
+                crate::shard::aof_admission::AOF_BACKPRESSURE_PARTIAL_ERR,
+            ))
+        }
+        _ => err,
+    }
+}
+
 /// Send one full command to a REMOTE shard and await its reply.
 async fn run_remote(
     target_shard: usize,
@@ -1634,15 +1656,19 @@ async fn coordinate_mset(
     // applied) — but a timed-out, closed, or errored leg must NOT collapse
     // into OK: that would acknowledge an unconfirmed distributed write.
     let mut leg_err: Option<Frame> = None;
+    // Whether any part of the MSET ran: the local slice, or a remote leg
+    // that answered without an error.
+    let mut applied_parts = usize::from(groups.contains_key(&my_shard));
     for reply_rx in pending_shards {
         match recv_reply_bounded(reply_rx).await {
-            Ok(frames) => {
-                if leg_err.is_none()
-                    && let Some(err) = frames.into_iter().find(|f| matches!(f, Frame::Error(_)))
-                {
-                    leg_err = Some(err);
+            Ok(frames) => match frames.into_iter().find(|f| matches!(f, Frame::Error(_))) {
+                Some(err) => {
+                    if leg_err.is_none() {
+                        leg_err = Some(err);
+                    }
                 }
-            }
+                None => applied_parts += 1,
+            },
             Err(_) => {
                 if leg_err.is_none() {
                     leg_err = Some(Frame::Error(Bytes::from_static(
@@ -1678,7 +1704,7 @@ async fn coordinate_mset(
     }
 
     if let Some(err) = leg_err {
-        return err;
+        return refused_leg_error(err, applied_parts > 0);
     }
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
@@ -1926,23 +1952,41 @@ async fn coordinate_multi_del_or_exists(
         }
     }
 
+    // Every leg is drained even after an error, so the reply can say
+    // whether any part of the command ran.
+    let mut leg_err: Option<Frame> = None;
+    let mut applied_parts = usize::from(groups.contains_key(&my_shard));
     for reply_rx in pending_shards {
         match recv_reply_bounded(reply_rx).await {
             Ok(frames) => {
+                let mut leg_failed = false;
                 for frame in frames {
                     match frame {
                         Frame::Integer(n) => total_count += n,
-                        Frame::Error(_) => return frame,
+                        Frame::Error(_) => {
+                            leg_failed = true;
+                            if leg_err.is_none() {
+                                leg_err = Some(frame);
+                            }
+                        }
                         _ => {}
                     }
                 }
+                if !leg_failed {
+                    applied_parts += 1;
+                }
             }
             Err(_) => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR cross-shard reply channel closed during DEL/UNLINK",
-                ));
+                if leg_err.is_none() {
+                    leg_err = Some(Frame::Error(Bytes::from_static(
+                        b"ERR cross-shard reply channel closed during DEL/UNLINK",
+                    )));
+                }
             }
         }
+    }
+    if let Some(err) = leg_err {
+        return refused_leg_error(err, applied_parts > 0);
     }
 
     Frame::Integer(total_count)
@@ -4354,3 +4398,6 @@ mod tests {
 
 #[cfg(test)]
 mod swapdb_fold_tests;
+
+#[cfg(test)]
+mod refused_leg_tests;

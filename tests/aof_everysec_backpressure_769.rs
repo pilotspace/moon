@@ -11,10 +11,12 @@
 //! and would never reach the AOF. The generic local leg waits up to
 //! `--aof-fsync-timeout-ms` (2 s) for the same channel.
 //!
-//! The drain now admits each routed leg against its writer BEFORE applying it.
-//! It waits up to the same `--aof-fsync-timeout-ms` bound, and when the writer
-//! still has no room it refuses the leg unapplied
-//! (`MOONERR AOF backpressure: command not executed, ...`).
+//! The drain now admits each routed leg against its writer BEFORE applying it,
+//! without ever waiting on the shard thread: a leg without room stays parked,
+//! unapplied, at the head of its producer's ring for up to the same
+//! `--aof-fsync-timeout-ms` bound, and is then refused unapplied
+//! (`MOONERR AOF backpressure: command not executed, ...`). A multi-shard
+//! `MSET` whose other legs ran reports `... command partially executed ...`.
 //!
 //! `MOON_TEST_AOF_FSYNC_STALL_MS` holds the writer's everysec fsync (the
 //! moon#769 mechanism, deterministic on any host; see
@@ -282,4 +284,81 @@ fn a_routed_write_the_writer_cannot_take_is_refused_and_not_applied() {
             "{key} was refused as not executed, but it was written"
         );
     }
+}
+
+const PARTIAL_ERR_PREFIX: &str = "MOONERR AOF backpressure: command partially executed";
+
+/// A multi-shard `MSET` whose leg on a stalled shard is refused unapplied,
+/// while its other legs ran, must not answer "command not executed": that
+/// is only true when none of its keys was written. It reports the partial
+/// failure instead.
+#[test]
+#[ignore]
+fn a_multi_shard_mset_with_a_refused_leg_reports_a_partial_failure() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_server, port) = common::spawn_listening_guarded(|port| {
+        start_moon(port, dir.path(), &["--aof-fsync-timeout-ms", "10"], "1500")
+    });
+    // Load keeps the writers' channels full across their stalls.
+    let stop = Arc::new(AtomicBool::new(false));
+    let loader = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut tag = 1000usize;
+            while !stop.load(Ordering::Relaxed) {
+                let _ = bursts(port, tag, Duration::from_millis(500));
+                tag += 1;
+            }
+        })
+    };
+
+    const KEYS: usize = 32;
+    let started = Instant::now();
+    let mut c = common::Conn::open(port);
+    let (mut refused_or_partial, mut partial, mut msets) = (0usize, 0usize, 0usize);
+    let mut round = 0usize;
+    while started.elapsed() < Duration::from_secs(12) {
+        let keys: Vec<String> = (0..KEYS).map(|i| format!("m{round}:{i}")).collect();
+        let mut args: Vec<&str> = vec!["MSET"];
+        for k in &keys {
+            args.push(k);
+            args.push("v");
+        }
+        let reply = c.send(&args);
+        msets += 1;
+        let text = reply.trim_end().trim_start_matches('-');
+        if text.starts_with(REFUSED_ERR_PREFIX) {
+            refused_or_partial += 1;
+            // "Not executed" is only honest if no key of this MSET exists.
+            let mut probe = common::Conn::open(port);
+            let written: Vec<&String> = keys
+                .iter()
+                .filter(|k| probe.send(&["EXISTS", k]) == ":1\r\n")
+                .collect();
+            assert!(
+                written.is_empty(),
+                "MSET answered `{text}` but {} of its {KEYS} keys were written, e.g. {:?}",
+                written.len(),
+                written.first()
+            );
+        } else if text.starts_with(PARTIAL_ERR_PREFIX) {
+            refused_or_partial += 1;
+            partial += 1;
+        }
+        round += 1;
+        if refused_or_partial > 0 && started.elapsed() >= Duration::from_millis(3500) {
+            break;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    loader.join().expect("loader");
+    assert!(
+        refused_or_partial > 0,
+        "vacuity guard: {msets} MSETs across a 1500 ms stall against a 10 ms bound never met a \
+         refused leg — the stall did not bite"
+    );
+    eprintln!("{msets} MSETs, {refused_or_partial} with a refused leg, {partial} partial");
 }
