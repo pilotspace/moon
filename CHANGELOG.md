@@ -213,8 +213,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shutdown was never re-indexed at all. The walk now reads cold-tier hashes
   from disk (one page read per key, in file order) and reads field-TTL hashes
   without their expired fields. A cold entry that cannot be read keeps its
-  recovered document: a read fault is not a delete. Text indexes loaded from
-  `.tpost` are reconciled by the same walk.
+  recovered document: a read fault is not a delete. The walk lists keys up
+  front but takes each key's payload only when it reconciles it: the keyspace
+  is not frozen while the walk runs (writes routed from another shard are
+  applied, and eviction spills), so a payload captured at the start could be
+  stale by the time it was reconciled. Text indexes loaded from `.tpost` are
+  reconciled by the same walk.
 - **A write is logged in the order it was applied, even when it waits after
   applying** (moon#1084). Three paths applied a write, awaited something, and
   only then appended it to the AOF (and, on monoio, to the replication

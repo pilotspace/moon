@@ -3042,34 +3042,18 @@ async fn recover_indexes_task(
         for db_idx in 0..db_count {
             // Every live indexed hash must be observed here: the deletion
             // probe after this walk tombstones any recovered document whose
-            // key it did not see. Hot keys are captured now; keys that live
-            // only in the KV cold tier are listed now and read slice by slice
-            // below (moon#1074). See `shard::recovery_rescan`.
+            // key it did not see. Keys (hot, and cold-only) are LISTED now and
+            // each is resolved as it is reconciled, because the keyspace moves
+            // while the walk yields: writes routed here from another shard
+            // are applied, and the eviction tick spills (moon#1074). See
+            // `shard::recovery_rescan`.
             let scan_started = std::time::Instant::now();
             let now_ms = crate::storage::entry::current_time_ms();
-            let (matching, cold) = crate::shard::slice::with_shard_db(db_idx, |db| {
-                let hot: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = db
-                    .data()
-                    .iter()
-                    .filter_map(|(key, entry)| {
-                        let key_bytes = key.as_bytes();
-                        if !rescan_prefixes.any_matching(key_bytes) {
-                            return None;
-                        }
-                        crate::shard::recovery_rescan::hash_rescan_args(
-                            key_bytes,
-                            entry.as_redis_value(),
-                            now_ms,
-                        )
-                        .map(|args| (key_bytes.to_vec(), args))
-                    })
-                    .collect();
-                let cold =
-                    crate::shard::recovery_rescan::ColdCandidates::collect(db, &rescan_prefixes);
-                (hot, cold)
+            let keys = crate::shard::slice::with_shard_db(db_idx, |db| {
+                crate::shard::recovery_rescan::RescanKeys::collect(db, &rescan_prefixes)
             });
-            let hot_in_db = matching.len();
-            let cold_in_db = cold.as_ref().map_or(0, |c| c.len());
+            let hot_in_db = keys.hot_len();
+            let cold_in_db = keys.cold_len();
 
             if hot_in_db + cold_in_db > 0 {
                 let total_in_db = hot_in_db + cold_in_db;
@@ -3094,9 +3078,10 @@ async fn recover_indexes_task(
                 }
                 // moon#476: `with_shard` takes a SYNCHRONOUS closure, so
                 // an `.await` cannot live inside it. Slicing lets the
-                // task yield BETWEEN slices while each slice still runs
-                // inside exactly one `with_shard` — which is also what
-                // `recover_v2`'s re-entrancy rule requires.
+                // task yield BETWEEN slices; within a slice, each stride
+                // of keys is reconciled inside one `with_shard` (never
+                // nested in `with_shard_db` — `recover_v2`'s re-entrancy
+                // rule).
                 //
                 // The slice is TIME-bounded, not count-bounded. A fixed
                 // 1024-key chunk was ~12 ms at the ~12 us/key this was
@@ -3105,7 +3090,7 @@ async fn recover_indexes_task(
                 // live instance measured ~10 ms/key, turning each chunk
                 // into a 10 s silence during which every PING timed out.
                 // `RESCAN_SLICE_BUDGET` caps the silence at roughly one
-                // budget plus one key, whatever the per-key cost.
+                // budget plus one stride, whatever the per-key cost.
                 const RESCAN_SLICE_BUDGET: std::time::Duration =
                     std::time::Duration::from_millis(10);
                 // How often to read the clock inside a slice: 16 keys is
@@ -3116,86 +3101,88 @@ async fn recover_indexes_task(
                 let clock_stride = total_in_db.clamp(1, 16);
                 let mut done_in_db = 0usize;
                 while done_in_db < total_in_db {
-                    crate::shard::slice::with_shard(|s| {
-                        let slice_started = std::time::Instant::now();
-                        while done_in_db < total_in_db {
-                            // B3 dedup rescan: verifies each matching
-                            // key against any recovered durable state
-                            // (manifest/segment/keymap) before deciding
-                            // whether to fully re-encode. Indexes with
-                            // no durable state (fresh/no manifest) fall
-                            // through to the same full-rescan behavior
-                            // this replaced. See `recover_v2` docs.
-                            if let Some((key, args)) = matching.get(done_in_db) {
-                                recovery_state.reconcile_key(
-                                    &mut s.vector_store,
-                                    &mut s.text_store,
-                                    key,
-                                    args,
-                                    db_idx as u8,
-                                );
-                            } else if let Some((key, read)) = cold
-                                .as_ref()
-                                .and_then(|c| c.read(done_in_db - hot_in_db, now_ms))
-                            {
-                                use crate::shard::recovery_rescan::ColdRescan;
+                    let slice_started = std::time::Instant::now();
+                    while done_in_db < total_in_db {
+                        // One stride: resolve each key under the db guard,
+                        // read cold payloads with no guard held, reconcile
+                        // under the shard slice. No `.await` in between, so
+                        // nothing routed to this shard can change a key
+                        // between its resolve and its reconcile.
+                        let end = (done_in_db + clock_stride).min(total_in_db);
+                        let resolved = crate::shard::slice::with_shard_db(db_idx, |db| {
+                            keys.resolve(db, done_in_db..end, now_ms)
+                        });
+                        let reads: Vec<crate::shard::recovery_rescan::Rescan> = resolved
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, r)| keys.read(keys.key(done_in_db + i), r, now_ms))
+                            .collect();
+                        crate::shard::slice::with_shard(|s| {
+                            use crate::shard::recovery_rescan::Rescan;
+                            for (i, read) in reads.into_iter().enumerate() {
+                                let key = keys.key(done_in_db + i);
+                                // B3 dedup rescan: verifies each matching
+                                // key against any recovered durable state
+                                // (manifest/segment/keymap) before deciding
+                                // whether to fully re-encode. Indexes with
+                                // no durable state (fresh/no manifest) fall
+                                // through to the same full-rescan behavior
+                                // this replaced. See `recover_v2` docs.
                                 match read {
-                                    ColdRescan::Hash(args) => recovery_state.reconcile_key(
+                                    Rescan::Hash(args) => recovery_state.reconcile_key(
                                         &mut s.vector_store,
                                         &mut s.text_store,
                                         key,
                                         &args,
                                         db_idx as u8,
                                     ),
-                                    ColdRescan::Unreadable => recovery_state.observe_unreadable(
+                                    Rescan::Unreadable => recovery_state.observe_unreadable(
                                         &s.vector_store,
                                         &s.text_store,
                                         key,
                                         db_idx as u8,
                                     ),
-                                    ColdRescan::Absent => {}
+                                    Rescan::Absent => {}
                                 }
                             }
-                            reindexed += 1;
-                            done_in_db += 1;
-                            // Counter gate first: a recovery that finishes
-                            // in milliseconds must not pay `Instant::now()`
-                            // per key to prove it had nothing to say.
-                            if done_in_db % clock_stride == 0 {
-                                let now = std::time::Instant::now();
-                                if progress.tick_at(reindexed as u64, now) {
-                                    // Both rates, labelled, plus an ETA from
-                                    // the RECENT one: the cumulative average
-                                    // alone read 10x low on a live instance
-                                    // and turned a 25-minute remainder into
-                                    // a "4 hours, must be wedged" decision.
-                                    // `-1` = unknown (nothing moved yet); a
-                                    // number the reader can act on otherwise.
-                                    let eta_secs = progress
-                                        .eta_secs(done_in_db as u64, total_in_db as u64, now)
-                                        .unwrap_or(-1.0);
-                                    info!(
-                                        "Shard {}: recovery reconciling db {} \
-                                             key {}/{} ({} total, {:.0} keys/s avg, \
-                                             {:.0} keys/s recent, ETA for this db {:.0}s, \
-                                             {:.0}s elapsed)",
-                                        shard_id,
-                                        db_idx,
-                                        done_in_db,
-                                        total_in_db,
-                                        reindexed,
-                                        progress.keys_per_sec(reindexed as u64, now),
-                                        progress.recent_keys_per_sec(reindexed as u64, now),
-                                        eta_secs,
-                                        progress.elapsed_secs(now),
-                                    );
-                                }
-                                if now.duration_since(slice_started) >= RESCAN_SLICE_BUDGET {
-                                    break;
-                                }
-                            }
+                        });
+                        reindexed += end - done_in_db;
+                        done_in_db = end;
+                        // One clock read per stride: a recovery that
+                        // finishes in milliseconds must not pay
+                        // `Instant::now()` per key to prove it had nothing
+                        // to say.
+                        let now = std::time::Instant::now();
+                        if progress.tick_at(reindexed as u64, now) {
+                            // Both rates, labelled, plus an ETA from the
+                            // RECENT one: the cumulative average alone read
+                            // 10x low on a live instance and turned a
+                            // 25-minute remainder into a "4 hours, must be
+                            // wedged" decision. `-1` = unknown (nothing moved
+                            // yet); a number the reader can act on otherwise.
+                            let eta_secs = progress
+                                .eta_secs(done_in_db as u64, total_in_db as u64, now)
+                                .unwrap_or(-1.0);
+                            info!(
+                                "Shard {}: recovery reconciling db {} \
+                                     key {}/{} ({} total, {:.0} keys/s avg, \
+                                     {:.0} keys/s recent, ETA for this db {:.0}s, \
+                                     {:.0}s elapsed)",
+                                shard_id,
+                                db_idx,
+                                done_in_db,
+                                total_in_db,
+                                reindexed,
+                                progress.keys_per_sec(reindexed as u64, now),
+                                progress.recent_keys_per_sec(reindexed as u64, now),
+                                eta_secs,
+                                progress.elapsed_secs(now),
+                            );
                         }
-                    });
+                        if now.duration_since(slice_started) >= RESCAN_SLICE_BUDGET {
+                            break;
+                        }
+                    }
                     // Hand the thread back so the event loop can serve the
                     // connections this shard has already accepted.
                     crate::runtime::cooperative_yield().await;

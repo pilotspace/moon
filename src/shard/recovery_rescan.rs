@@ -17,10 +17,17 @@
 //! * a hash with a per-field TTL (`HashWithTtl`, after `HEXPIRE`). It is a
 //!   hash in every other respect, but the walk skipped its variant.
 //!
-//! No command can write the keyspace while the shard is loading
-//! (`shard::loading`), so the cold candidates collected under the db guard stay
-//! valid while their payloads are read slice by slice afterwards.
+//! The keyspace is NOT frozen while the walk runs. The walk yields between
+//! slices, and although this shard refuses commands from its own connections
+//! while it loads (`shard::loading`), writes routed to it from another shard
+//! (SPSC) are applied, and the eviction tick can spill a hot key. So the walk
+//! lists KEYS up front and resolves each one's current state at the moment it
+//! is reconciled ([`RescanKeys::resolve`]): hot, mid-spill, cold, or gone.
+//! Resolving, reading a cold payload and reconciling run with no `.await`
+//! between them, so no write can land in between; a key that changed since
+//! the listing is reconciled as it is now, never from a stale payload.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
@@ -73,71 +80,130 @@ pub(crate) fn hash_rescan_args(
     (args.len() > 1).then_some(args)
 }
 
-/// The indexed keys of one db that live only in the KV cold tier, with the
-/// location to read each from.
-pub(crate) struct ColdCandidates {
-    shard_dir: PathBuf,
-    keys: Vec<(Bytes, ColdLocation)>,
+/// Every key of one db that an index prefix covers: the hot ones first, then
+/// the ones that were only in the cold tier when the list was taken, sorted
+/// by heap file and page so their reads walk each file forwards.
+pub(crate) struct RescanKeys {
+    keys: Vec<Bytes>,
+    hot: usize,
+    shard_dir: Option<PathBuf>,
 }
 
-impl ColdCandidates {
-    /// Every cold-index key that an index prefix covers and that has no hot
-    /// copy (a hot copy shadows the cold one, and the hot walk already saw
-    /// it). Sorted by file and page, so the reads that follow walk each heap
-    /// file forwards. `None` when this db has no cold tier.
-    pub(crate) fn collect(db: &Database, prefixes: &PrefixMap) -> Option<Self> {
-        let shard_dir = db.cold_shard_dir.as_ref()?;
-        let index = db.cold_index.as_ref()?;
-        let mut keys: Vec<(Bytes, ColdLocation)> = index
+impl RescanKeys {
+    /// List the keys. Takes no payload: each key is resolved when it is
+    /// reconciled ([`Self::resolve`]).
+    pub(crate) fn collect(db: &Database, prefixes: &PrefixMap) -> Self {
+        let mut keys: Vec<Bytes> = db
+            .data()
             .iter()
-            .filter(|(key, _)| prefixes.any_matching(key) && !db.is_hot(key))
-            .map(|(key, loc)| (key.clone(), *loc))
+            .map(|(key, _)| key.as_bytes())
+            .filter(|key| prefixes.any_matching(key))
+            .map(Bytes::copy_from_slice)
             .collect();
-        if keys.is_empty() {
-            return None;
+        let hot = keys.len();
+        if let Some(index) = db.cold_index.as_ref() {
+            let mut cold: Vec<(&Bytes, &ColdLocation)> = index
+                .iter()
+                .filter(|(key, _)| prefixes.any_matching(key) && !db.is_hot(key))
+                .collect();
+            cold.sort_unstable_by_key(|(_, loc)| (loc.file_id, loc.page_idx, loc.slot_idx));
+            keys.extend(cold.into_iter().map(|(key, _)| key.clone()));
         }
-        keys.sort_unstable_by_key(|(_, loc)| (loc.file_id, loc.page_idx, loc.slot_idx));
-        Some(Self {
-            shard_dir: shard_dir.clone(),
+        Self {
             keys,
-        })
+            hot,
+            shard_dir: db.cold_shard_dir.clone(),
+        }
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.keys.len()
+    /// Keys that were hot when the list was taken.
+    pub(crate) fn hot_len(&self) -> usize {
+        self.hot
     }
 
-    /// The `i`th candidate's key, and what reading it produced.
-    pub(crate) fn read(&self, i: usize, now_ms: u64) -> Option<(&[u8], ColdRescan)> {
-        let (key, loc) = self.keys.get(i)?;
-        Some((key, read_cold_rescan(&self.shard_dir, key, *loc, now_ms)))
+    /// Keys that were only in the cold tier when the list was taken.
+    pub(crate) fn cold_len(&self) -> usize {
+        self.keys.len() - self.hot
+    }
+
+    pub(crate) fn key(&self, i: usize) -> &[u8] {
+        self.keys.get(i).map_or(&[], |k| k.as_ref())
+    }
+
+    /// What each key in `range` is NOW. Call under the db guard, then
+    /// [`Self::read`] each result with the guard released, then reconcile,
+    /// with no `.await` anywhere in between.
+    pub(crate) fn resolve(&self, db: &Database, range: Range<usize>, now_ms: u64) -> Vec<Resolved> {
+        self.keys
+            .get(range)
+            .unwrap_or_default()
+            .iter()
+            .map(|key| resolve_key(db, key, now_ms))
+            .collect()
+    }
+
+    /// Finish a resolved key: a cold location is read from disk (one page
+    /// read). Holds no guard.
+    pub(crate) fn read(&self, key: &[u8], resolved: Resolved, now_ms: u64) -> Rescan {
+        match resolved {
+            Resolved::Hash(args) => Rescan::Hash(args),
+            Resolved::Absent => Rescan::Absent,
+            Resolved::Cold(loc) => match self.shard_dir.as_deref() {
+                Some(dir) => read_cold_rescan(dir, key, loc, now_ms),
+                None => Rescan::Unreadable,
+            },
+        }
     }
 }
 
-/// What a cold candidate's payload says about its indexed documents.
-pub(crate) enum ColdRescan {
-    /// A live hash: reconcile it like a hot one.
+/// A key's state at the moment it is resolved.
+pub(crate) enum Resolved {
+    /// Hot, or mid-spill (its payload is still in RAM): the arguments.
     Hash(Vec<Frame>),
-    /// Expired, gone, or not a hash: leave it unobserved, exactly like a hot
-    /// key of the same shape.
+    /// Only in the cold tier, at this location: read it.
+    Cold(ColdLocation),
+    /// Gone, expired, or not a hash.
     Absent,
-    /// Indexed, but its bytes could not be read (moon#875). The key still
-    /// exists (`EXISTS` answers 1, a read answers `-IOERR`), and a later read
-    /// may succeed, so its recovered documents must be kept, not deleted.
+}
+
+fn resolve_key(db: &Database, key: &[u8], now_ms: u64) -> Resolved {
+    let hash = |args: Option<Vec<Frame>>| args.map_or(Resolved::Absent, Resolved::Hash);
+    if let Some(entry) = db.data().get(key) {
+        return hash(hash_rescan_args(key, entry.as_redis_value(), now_ms));
+    }
+    // Mid-spill: left hot RAM, not yet in the cold index.
+    if let Some(entry) = db.spill_inflight_entry(key, now_ms) {
+        return hash(hash_rescan_args(key, entry.as_redis_value(), now_ms));
+    }
+    match db.cold_index.as_ref().and_then(|index| index.lookup(key)) {
+        Some(loc) => Resolved::Cold(loc),
+        None => Resolved::Absent,
+    }
+}
+
+/// What a key's current payload says about its indexed documents.
+pub(crate) enum Rescan {
+    /// A live hash: reconcile it.
+    Hash(Vec<Frame>),
+    /// Expired, gone, or not a hash: leave it unobserved.
+    Absent,
+    /// Indexed in the cold tier, but its bytes could not be read (moon#875).
+    /// The key still exists (`EXISTS` answers 1, a read answers `-IOERR`), and
+    /// a later read may succeed, so its recovered documents must be kept.
     Unreadable,
 }
 
-fn read_cold_rescan(shard_dir: &Path, key: &[u8], loc: ColdLocation, now_ms: u64) -> ColdRescan {
+fn read_cold_rescan(shard_dir: &Path, key: &[u8], loc: ColdLocation, now_ms: u64) -> Rescan {
     match read_cold_entry(shard_dir, loc, now_ms, None) {
         ColdReadOutcome::Hit(value, _ttl) => {
             let value = CompactValue::from_redis_value(value);
             match hash_rescan_args(key, value.as_redis_value(), now_ms) {
-                Some(args) => ColdRescan::Hash(args),
-                None => ColdRescan::Absent,
+                Some(args) => Rescan::Hash(args),
+                None => Rescan::Absent,
             }
         }
-        ColdReadOutcome::Expired | ColdReadOutcome::Miss => ColdRescan::Absent,
-        ColdReadOutcome::Unreadable(_) => ColdRescan::Unreadable,
+        ColdReadOutcome::Expired | ColdReadOutcome::Miss => Rescan::Absent,
+        ColdReadOutcome::Unreadable(_) => Rescan::Unreadable,
     }
 }
 
@@ -146,6 +212,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::persistence::kv_page::ValueType;
+    use crate::storage::entry::{Entry, RedisValue};
+    use crate::storage::tiered::cold_index::ColdIndex;
 
     fn frames(args: &[Frame]) -> Vec<Vec<u8>> {
         args.iter()
@@ -154,6 +223,128 @@ mod tests {
                 other => panic!("not a bulk string: {other:?}"),
             })
             .collect()
+    }
+
+    fn hash_entry(field: &'static [u8], value: &'static [u8]) -> Entry {
+        let mut map = HashMap::new();
+        map.insert(Bytes::from_static(field), Bytes::from_static(value));
+        let mut entry = Entry::new_string(Bytes::new());
+        entry.value = CompactValue::from_redis_value(RedisValue::Hash(Box::new(map)));
+        entry
+    }
+
+    fn cold_loc(file_id: u64) -> ColdLocation {
+        ColdLocation {
+            file_id,
+            page_idx: 0,
+            slot_idx: 0,
+            ttl_ms: None,
+            value_type: ValueType::Hash,
+        }
+    }
+
+    fn prefixes() -> PrefixMap {
+        let mut p = PrefixMap::new();
+        p.insert(&Bytes::from_static(b"idx"), &[Bytes::from_static(b"doc:")]);
+        p
+    }
+
+    #[test]
+    fn keys_are_listed_hot_first_then_cold_only_in_file_order() {
+        let mut db = Database::new();
+        db.set(b"doc:hot", hash_entry(b"vec", b"1"));
+        db.set(b"other:hot", hash_entry(b"vec", b"1"));
+        let mut ci = ColdIndex::new();
+        ci.insert(Bytes::from_static(b"doc:c9"), cold_loc(9));
+        ci.insert(Bytes::from_static(b"doc:c2"), cold_loc(2));
+        // Shadowed by its hot copy: listed once, as hot.
+        ci.insert(Bytes::from_static(b"doc:hot"), cold_loc(1));
+        db.cold_index = Some(ci);
+
+        let keys = RescanKeys::collect(&db, &prefixes());
+        assert_eq!((keys.hot_len(), keys.cold_len()), (1, 2));
+        let n = keys.hot_len() + keys.cold_len();
+        let listed: Vec<&[u8]> = (0..n).map(|i| keys.key(i)).collect();
+        assert_eq!(
+            listed,
+            vec![
+                b"doc:hot".as_slice(),
+                b"doc:c2".as_slice(),
+                b"doc:c9".as_slice()
+            ]
+        );
+    }
+
+    /// The keyspace moves while the walk runs: each key is taken as it is
+    /// when resolved, not as it was listed.
+    #[test]
+    fn a_key_is_resolved_as_it_is_now_not_as_it_was_listed() {
+        let mut db = Database::new();
+        db.set(b"doc:a", hash_entry(b"vec", b"old"));
+        db.set(b"doc:b", hash_entry(b"vec", b"1"));
+        let mut ci = ColdIndex::new();
+        ci.insert(Bytes::from_static(b"doc:c"), cold_loc(3));
+        ci.insert(Bytes::from_static(b"doc:d"), cold_loc(4));
+        db.cold_index = Some(ci);
+        let keys = RescanKeys::collect(&db, &prefixes());
+
+        // After the listing: a is re-written, b deleted, c promoted to hot and
+        // re-written, d deleted from the cold tier.
+        db.set(b"doc:a", hash_entry(b"vec", b"new"));
+        db.remove(b"doc:b");
+        db.set(b"doc:c", hash_entry(b"vec", b"hot"));
+        if let Some(ci) = db.cold_index.as_mut() {
+            ci.remove(b"doc:c");
+            ci.remove(b"doc:d");
+        }
+
+        let got: Vec<(Vec<u8>, Option<Vec<Vec<u8>>>)> = keys
+            .resolve(&db, 0..keys.hot_len() + keys.cold_len(), 0)
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let args = match r {
+                    Resolved::Hash(args) => Some(frames(&args)),
+                    Resolved::Cold(_) => panic!("{:?} is no longer cold", keys.key(i)),
+                    Resolved::Absent => None,
+                };
+                (keys.key(i).to_vec(), args)
+            })
+            .collect();
+        let field = |v: &[u8]| Some(vec![b"vec".to_vec(), v.to_vec()]);
+        let with_key = |k: &[u8], v: &[u8]| {
+            field(v).map(|mut f| {
+                f.insert(0, k.to_vec());
+                f
+            })
+        };
+        let mut want = vec![
+            (b"doc:a".to_vec(), with_key(b"doc:a", b"new")),
+            (b"doc:b".to_vec(), None),
+            (b"doc:c".to_vec(), with_key(b"doc:c", b"hot")),
+            (b"doc:d".to_vec(), None),
+        ];
+        let mut got = got;
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_still_cold_key_resolves_to_its_current_location() {
+        let mut db = Database::new();
+        let mut ci = ColdIndex::new();
+        ci.insert(Bytes::from_static(b"doc:c"), cold_loc(3));
+        db.cold_index = Some(ci);
+        let keys = RescanKeys::collect(&db, &prefixes());
+        if let Some(ci) = db.cold_index.as_mut() {
+            // Re-spilled to another file since the listing.
+            ci.insert(Bytes::from_static(b"doc:c"), cold_loc(8));
+        }
+        match keys.resolve(&db, 0..1, 0).pop() {
+            Some(Resolved::Cold(loc)) => assert_eq!(loc.file_id, 8),
+            _ => panic!("doc:c must resolve to its current cold location"),
+        }
     }
 
     #[test]
