@@ -126,6 +126,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both the listpack and B+tree arms, which carried separate copies.
 ### Security
 
+- **Error and status replies can no longer be split by client input**
+  (moon#1031). Error text quotes client input (an unknown command name, an
+  `ACL SETUSER` rule), and CR/LF bytes in it were written raw, so one command
+  could produce several RESP replies. That desynchronises any client or proxy
+  that pipelines on a shared connection. Every line-framed reply (`+`, `-`,
+  RESP3 `(`) now goes through one writer that maps CR and LF to spaces, as
+  redis does, and so do the inline quota error and the protocol-error echo.
+  It is allocation-free, and a reply with no CR/LF costs the same as before.
+
 - **An ACL category Moon does not implement is an error, not a grant of every
   command** (moon#978). `get_category_commands` ended in `_ => &[]`, so an
   unknown category resolved to an EMPTY command list rather than failing.
