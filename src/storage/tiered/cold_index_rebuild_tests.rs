@@ -41,19 +41,21 @@ fn corpus(shard_dir: &Path, files: &[(u64, usize, Vec<SpillEntry>)]) -> ShardMan
     for (file_id, db, entries) in files {
         let batch = build_kv_spill_batch(entries, *file_id).unwrap();
         let byte_size = write_kv_spill_batch(shard_dir, *file_id, &batch).unwrap();
-        manifest.add_file(FileEntry {
-            file_id: *file_id,
-            file_type: PageType::KvLeaf as u8,
-            status: FileStatus::Active,
-            tier: StorageTier::Hot,
-            page_size_log2: 12,
-            page_count: batch.pages.len() as u32,
-            byte_size,
-            created_lsn: 0,
-            db_index: *db as u64,
-            max_key_hash: 0,
-            last_modified_lsn: 0,
-        });
+        manifest
+            .add_file(FileEntry {
+                file_id: *file_id,
+                file_type: PageType::KvLeaf as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Hot,
+                page_size_log2: 12,
+                page_count: batch.pages.len() as u32,
+                byte_size,
+                created_lsn: 0,
+                db_index: *db as u64,
+                max_key_hash: 0,
+                last_modified_lsn: 0,
+            })
+            .expect("corpus file ids are unique, so add_file never refuses one");
     }
     manifest.commit().unwrap();
     manifest
