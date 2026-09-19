@@ -434,6 +434,43 @@ mod tests {
             .collect()
     }
 
+    /// THE way this module calls `CONFIG SET`. Identical arguments and return
+    /// value to `super::config_set`; the only difference is that every
+    /// process-global limit the call publishes is restored when it returns.
+    ///
+    /// moon#856: `config_set` is production code and publishes to five
+    /// process-global atomics (`MAXMEMORY_GLOBAL`, `MAXMEMORY_HINT`,
+    /// `MAXMEMORY_PER_SHARD_HINT`, `MAXMEMORY_POLICY_GLOBAL`,
+    /// `DB_MAXMEMORY_ANY_SET`). Five tests here drove it and never put them
+    /// back, so under `cargo test --lib` — ONE process for the whole suite —
+    /// the next test to read that state failed. The victim was order-dependent;
+    /// the leak was permanent. Scoping it here fixes the WRITER rather than
+    /// hardening each of the readers one by one.
+    fn config_set_scoped(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
+        let _limits = crate::storage::eviction::PublishedLimits::capture();
+        super::config_set(runtime_config, args)
+    }
+
+    /// Belt AND braces. `use super::*` above also pulls the UNGUARDED
+    /// `super::config_set` into this module's namespace, so "route every call
+    /// through `config_set_scoped`" would be a CONVENTION — and a convention a
+    /// new test can silently break is exactly what moon#856 was. A
+    /// module-local item shadows a glob import, so the plain spelling resolves
+    /// HERE and picks up the guard too: nothing in this module can reach the
+    /// unguarded function without spelling out `super::config_set`.
+    ///
+    /// Unused on purpose — it exists to intercept the NAME. The call sites
+    /// below say `config_set_scoped` so a reader sees the scoping without
+    /// having to know this shadow is here.
+    #[expect(
+        dead_code,
+        reason = "moon#856: shadows the glob-imported `config_set` so a forgotten \
+                  call cannot reach the unguarded publisher; never called itself"
+    )]
+    fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
+        config_set_scoped(runtime_config, args)
+    }
+
     /// moon#586 (RED before the fix): `CONFIG SET maxmemory 4gb` — the
     /// spelling redis documents and every runbook uses — was rejected with
     /// `ERR Invalid argument`, forcing an operator applying a cap under
@@ -459,7 +496,7 @@ mod tests {
             let mut rt = RuntimeConfig::default();
             let args = make_args(&[b"maxmemory", input]);
             assert_eq!(
-                config_set(&mut rt, &args),
+                config_set_scoped(&mut rt, &args),
                 Frame::SimpleString(Bytes::from_static(b"OK")),
                 "CONFIG SET maxmemory {} must be accepted",
                 String::from_utf8_lossy(input)
@@ -496,7 +533,7 @@ mod tests {
             let mut rt = RuntimeConfig::default();
             let args = make_args(&[b"maxmemory", input]);
             assert!(
-                matches!(config_set(&mut rt, &args), Frame::Error(_)),
+                matches!(config_set_scoped(&mut rt, &args), Frame::Error(_)),
                 "CONFIG SET maxmemory '{}' must be rejected",
                 String::from_utf8_lossy(input)
             );
@@ -514,7 +551,7 @@ mod tests {
         };
         let args = make_args(&[b"db-maxmemory", b"1:512mb"]);
         assert_eq!(
-            config_set(&mut rt, &args),
+            config_set_scoped(&mut rt, &args),
             Frame::SimpleString(Bytes::from_static(b"OK"))
         );
         assert_eq!(rt.db_maxmemory[1], 512 * 1024 * 1024);
@@ -573,7 +610,7 @@ mod tests {
     fn test_config_set_maxmemory() {
         let mut rt = RuntimeConfig::default();
         let args = make_args(&[b"maxmemory", b"1048576"]);
-        let result = config_set(&mut rt, &args);
+        let result = config_set_scoped(&mut rt, &args);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
         assert_eq!(rt.maxmemory, 1048576);
     }
@@ -582,7 +619,7 @@ mod tests {
     fn test_config_set_policy() {
         let mut rt = RuntimeConfig::default();
         let args = make_args(&[b"maxmemory-policy", b"allkeys-lru"]);
-        let result = config_set(&mut rt, &args);
+        let result = config_set_scoped(&mut rt, &args);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
         assert_eq!(rt.maxmemory_policy, "allkeys-lru");
     }
@@ -591,7 +628,7 @@ mod tests {
     fn test_config_set_invalid_policy() {
         let mut rt = RuntimeConfig::default();
         let args = make_args(&[b"maxmemory-policy", b"invalid"]);
-        let result = config_set(&mut rt, &args);
+        let result = config_set_scoped(&mut rt, &args);
         assert!(matches!(result, Frame::Error(_)));
     }
 
@@ -599,7 +636,7 @@ mod tests {
     fn test_config_set_unknown_param() {
         let mut rt = RuntimeConfig::default();
         let args = make_args(&[b"unknownparam", b"value"]);
-        let result = config_set(&mut rt, &args);
+        let result = config_set_scoped(&mut rt, &args);
         assert!(matches!(result, Frame::Error(_)));
     }
 
@@ -607,7 +644,7 @@ mod tests {
     fn test_config_set_multiple_params() {
         let mut rt = RuntimeConfig::default();
         let args = make_args(&[b"maxmemory", b"2048", b"maxmemory-policy", b"allkeys-lfu"]);
-        let result = config_set(&mut rt, &args);
+        let result = config_set_scoped(&mut rt, &args);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
         assert_eq!(rt.maxmemory, 2048);
         assert_eq!(rt.maxmemory_policy, "allkeys-lfu");
@@ -654,7 +691,7 @@ mod tests {
     fn test_config_set_db_maxmemory() {
         let mut rt = rt_with_dbs(16);
         let args = make_args(&[b"db-maxmemory", b"3:1048576"]);
-        let result = config_set(&mut rt, &args);
+        let result = config_set_scoped(&mut rt, &args);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
         assert_eq!(rt.db_maxmemory[3], 1048576);
         // Sibling dbs untouched.
@@ -667,7 +704,7 @@ mod tests {
         let mut rt = rt_with_dbs(4);
         rt.db_maxmemory[1] = 500;
         let args = make_args(&[b"db-maxmemory", b"1:0"]);
-        let result = config_set(&mut rt, &args);
+        let result = config_set_scoped(&mut rt, &args);
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
         assert_eq!(rt.db_maxmemory[1], 0);
     }
@@ -676,7 +713,7 @@ mod tests {
     fn test_config_set_db_maxmemory_out_of_range_errors() {
         let mut rt = rt_with_dbs(4);
         let args = make_args(&[b"db-maxmemory", b"99:1024"]);
-        let result = config_set(&mut rt, &args);
+        let result = config_set_scoped(&mut rt, &args);
         match result {
             Frame::Error(msg) => {
                 assert!(String::from_utf8_lossy(&msg).contains("out of range"));
@@ -692,7 +729,7 @@ mod tests {
         let mut rt = rt_with_dbs(4);
         for bad in [b"garbage" as &[u8], b"1", b"a:1024", b"1:notbytes"] {
             let args = make_args(&[b"db-maxmemory", bad]);
-            let result = config_set(&mut rt, &args);
+            let result = config_set_scoped(&mut rt, &args);
             assert!(
                 matches!(result, Frame::Error(_)),
                 "expected error for malformed entry {:?}",
