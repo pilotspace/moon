@@ -4570,6 +4570,89 @@ done
 acl_reset_user
 both DEL n978:k n978:vic n978:lst n978:dst n978:pol
 # END acl-category-section -- moon#978/#980
+# ===========================================================================
+# moon#981: ACL SAVE must write the base polarity the table holds in memory
+# ===========================================================================
+# `CommandPermissions::Specific` carries `base_allow` (moon#971), but the
+# serializer behind ACL SAVE / ACL LIST / ACL GETUSER dropped it and emitted
+# `-@all` for EVERY Specific user. A `+@all -flushall` service account was
+# written to disk as `-@all -flushall` and came back from ACL LOAD (or a
+# restart with --aclfile) able to run NOTHING. It fails closed, so it is an
+# outage rather than an escalation -- and a silent one: SAVE and LOAD both
+# answered +OK.
+#
+# Both servers are restarted with an --aclfile: ACL SAVE refuses without one
+# on both engines, and redis will not CONFIG SET it at runtime. Runs LAST for
+# that reason -- nothing downstream should inherit these servers.
+#
+# The `-@all +get +set` user is the in-run control: its base polarity was
+# already written correctly, so its rows are green on the pre-fix binary and
+# prove the section discriminates rather than failing on its own setup.
+echo "=== moon#981: ACL SAVE / ACL LOAD keeps a '+@all -<cmd>' user ==="
+
+F981_DIR=$(mktemp -d /tmp/moon-consistency-acl.XXXXXX)
+F981_REDIS_ACL="$F981_DIR/redis-users.acl"
+F981_MOON_ACL="$F981_DIR/moon-users.acl"
+: > "$F981_REDIS_ACL"
+: > "$F981_MOON_ACL"
+
+# The main redis has no aclfile; replace it with one that does.
+if [[ -n "${REDIS_PID:-}" ]]; then
+    kill "$REDIS_PID" 2>/dev/null || true
+    wait "$REDIS_PID" 2>/dev/null || true
+fi
+pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
+sleep 0.3
+redis-server --port "$PORT_REDIS" --save "" --appendonly no --loglevel warning \
+    --aclfile "$F981_REDIS_ACL" --daemonize no &>/dev/null &
+REDIS_PID=$!
+
+stop_moon
+new_moon_dir
+"$RUST_BINARY" --port "$PORT_RUST" --shards "$SHARDS" --dir "$MOON_DATA_DIR" \
+    --aclfile "$F981_MOON_ACL" &>/dev/null &
+RUST_PID=$!
+
+if wait_for_port "$PORT_REDIS" && wait_for_port "$PORT_RUST"; then
+    # The `commands` value of ACL GETUSER: the line after the `commands` key.
+    f981_commands() {
+        redis-cli -t 5 -p "$1" ACL GETUSER rt 2>&1 | tr -d '\r' \
+            | awk 'f { print; exit } /^commands$/ { f = 1 }' || true
+    }
+    # The command-rule tail of the user's line in the ACL file. Redis also
+    # writes `sanitize-payload`, which moon does not, so only the rules from
+    # the `@all` token onward are compared.
+    f981_file_rules() {
+        grep '^user rt ' "$1" | grep -o '[+-]@all.*' || true
+    }
+
+    for f981_spec in "+@all -flushall" "-@all +get +set"; do
+        read -r -a f981_rules <<< "$f981_spec"
+        both ACL DELUSER rt
+        both ACL SETUSER rt on '>pw' '~*' '&*' "${f981_rules[@]}"
+
+        assert_eq "moon#981 '$f981_spec' GETUSER commands before SAVE" \
+            "$(f981_commands "$PORT_REDIS")" "$(f981_commands "$PORT_RUST")"
+        assert_both "moon#981 '$f981_spec' ACL SAVE" ACL SAVE
+        assert_eq "moon#981 '$f981_spec' rules written to the ACL file" \
+            "$(f981_file_rules "$F981_REDIS_ACL")" "$(f981_file_rules "$F981_MOON_ACL")"
+        assert_both "moon#981 '$f981_spec' ACL LOAD" ACL LOAD
+        assert_eq "moon#981 '$f981_spec' GETUSER commands after LOAD" \
+            "$(f981_commands "$PORT_REDIS")" "$(f981_commands "$PORT_RUST")"
+        # What the user can actually DO after the reload -- the outage itself.
+        assert_both "moon#981 '$f981_spec' GET as rt after LOAD" \
+            --user rt --pass pw --no-auth-warning GET f981:k
+        assert_both "moon#981 '$f981_spec' HSET as rt after LOAD" \
+            --user rt --pass pw --no-auth-warning HSET f981:h f v
+        assert_both "moon#981 '$f981_spec' FLUSHALL as rt after LOAD" \
+            --user rt --pass pw --no-auth-warning FLUSHALL
+    done
+    both ACL DELUSER rt
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: moon#981 servers with --aclfile did not start -- rows did not run"
+fi
+rm -rf "$F981_DIR"
 
 echo "============================================"
 echo "  Data Consistency Test Results"
