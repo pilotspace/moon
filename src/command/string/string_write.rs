@@ -164,12 +164,18 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Get old value if needed
     let old_value = if get_old {
-        db.get(key).map(|e| match e.value.as_bytes_owned() {
+        let old = db.get(key).map(|e| match e.value.as_bytes_owned() {
             Some(v) => Frame::BulkString(v),
             None => Frame::Error(Bytes::from_static(
                 b"WRONGTYPE Operation against a key holding the wrong kind of value",
             )),
-        })
+        });
+        // moon#875: `SET k v GET` promised the old value; if it is indexed
+        // but unreadable, refuse rather than overwrite and answer nil.
+        if old.is_none() && db.take_cold_fault().is_some() {
+            return Database::cold_fault_error();
+        }
+        old
     } else {
         None
     };
@@ -209,7 +215,12 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
         expires_at_ms
     } else if keepttl {
         // Preserve existing TTL
-        db.get(key).map(|e| e.expires_at_ms()).unwrap_or(0)
+        let ttl = db.get(key).map(|e| e.expires_at_ms());
+        // moon#875: KEEPTTL depends on the old entry; unreadable = refuse.
+        if ttl.is_none() && db.take_cold_fault().is_some() {
+            return Database::cold_fault_error();
+        }
+        ttl.unwrap_or(0)
     } else {
         0
     };
@@ -451,7 +462,12 @@ fn incrby_general(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
                 }
             }
         }
-        None => (0, 0),
+        None => {
+            if db.take_cold_fault().is_some() {
+                return Database::cold_fault_error();
+            }
+            (0, 0)
+        }
     };
 
     let new_val = match current.checked_add(delta) {
@@ -540,7 +556,12 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
                 }
             }
         }
-        None => (0.0, 0),
+        None => {
+            if db.take_cold_fault().is_some() {
+                return Database::cold_fault_error();
+            }
+            (0.0, 0)
+        }
     };
 
     let result = current + increment;
@@ -599,7 +620,14 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
                 }
             }
         }
-        None => (None, 0),
+        None => {
+            // moon#875: an indexed-but-unreadable cold copy must not be
+            // silently replaced by a value built from nothing.
+            if db.take_cold_fault().is_some() {
+                return Database::cold_fault_error();
+            }
+            (None, 0)
+        }
     };
 
     // Enforce the 512MB max string size (matches SETRANGE/SETBIT); APPEND
@@ -689,7 +717,14 @@ pub fn setrange(db: &mut Database, args: &[Frame]) -> Frame {
                 }
             }
         }
-        None => (None, 0),
+        None => {
+            // moon#875: an indexed-but-unreadable cold copy must not be
+            // silently replaced by a value built from nothing.
+            if db.take_cold_fault().is_some() {
+                return Database::cold_fault_error();
+            }
+            (None, 0)
+        }
     };
 
     let mut buf = existing_data.unwrap_or_default();
@@ -840,6 +875,9 @@ pub fn getset(db: &mut Database, args: &[Frame]) -> Frame {
             b"WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
     });
+    if old.is_none() && db.take_cold_fault().is_some() {
+        return Database::cold_fault_error();
+    }
 
     // Check-before-mutate (Redis parity): a wrong-type key must return WRONGTYPE
     // and stay untouched. Previously db.set_string ran unconditionally, destroying it.

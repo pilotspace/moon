@@ -1645,6 +1645,34 @@ spublish_in_multi_outcome() {
 assert_eq "moon#1043 SPUBLISH inside MULTI delivered at EXEC (shards=$SHARDS)" \
     "$(spublish_in_multi_outcome "$PORT_REDIS")" "$(spublish_in_multi_outcome "$PORT_RUST")"
 
+# ---------------------------------------------------------------------------
+# moon#1062: MOVE and COPY ... DB n queued inside MULTI
+# ---------------------------------------------------------------------------
+#
+# Pre-fix, EXEC answered MOVE with `ERR MOVE requires handler-level dispatch`,
+# and `COPY a c DB 4` answered :1 but wrote `c` into the SOURCE db. The verdict
+# is the EXEC transcript plus where each key ended up in dbs 0, 3 and 4 — the
+# placement is what the COPY bug got wrong while its reply looked right.
+move_copy_in_multi_outcome() {
+    local port=$1 db
+    for db in 0 3 4; do
+        redis-cli -p "$port" -n "$db" DEL "{tx1062}a" "{tx1062}b" "{tx1062}c" >/dev/null 2>&1 || true
+    done
+    redis-cli -p "$port" SET "{tx1062}a" 1 >/dev/null 2>&1 || true
+    redis-cli -p "$port" SET "{tx1062}b" 2 >/dev/null 2>&1 || true
+    local reply
+    reply=$(printf '%s\n' 'MULTI' 'MOVE {tx1062}a 3' 'COPY {tx1062}b {tx1062}c DB 4' \
+        'MOVE {tx1062}b 0' 'COPY {tx1062}b {tx1062}c DB 99' 'EXEC' \
+        | redis-cli -p "$port" 2>&1 | tr '\n' ' ' || true)
+    local where=""
+    for db in 0 3 4; do
+        where="${where}db${db}:$(redis-cli -p "$port" -n "$db" EXISTS "{tx1062}a" "{tx1062}b" "{tx1062}c" 2>&1),"
+    done
+    echo "${reply}| ${where}"
+}
+assert_eq "moon#1062 MOVE and COPY ... DB n inside MULTI (shards=$SHARDS)" \
+    "$(move_copy_in_multi_outcome "$PORT_REDIS")" "$(move_copy_in_multi_outcome "$PORT_RUST")"
+
 # ===========================================================================
 # RESP2 null TYPE parity (moon#482)
 # ===========================================================================
@@ -2013,6 +2041,13 @@ if [[ "$SHARDS" -gt 1 ]]; then
         # destination is empty on a normally-routed read.
         "georadiusstore|GEOADD %S 15 37 Here|GEORADIUS %S 15 37 200 km STORE %D|ZCARD %D"
         "georadiusbymemberstoredist|GEOADD %S 15 37 Here|GEORADIUSBYMEMBER %S Here 200 km STOREDIST %D|ZCARD %D"
+        # moon#1062: COPY with a DB clause is not coordinator-routed, so it
+        # ran on the SOURCE's owner and wrote the destination there (24/24
+        # constructed split placements acked :1 and were unreadable). The
+        # read selects the db the command named; `DB 0` is the same-db form,
+        # which took the same wrong route.
+        "copydb|SET %S VALUE-1|COPY %S %D DB 3|-n 3 EXISTS %D"
+        "copydbsame|SET %S VALUE-1|COPY %S %D DB 0|EXISTS %D"
     )
     xw_lost=0
     xw_refused=0

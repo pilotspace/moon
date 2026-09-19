@@ -119,23 +119,52 @@ pub fn parse_move_args(args: &[Frame], db_count: usize) -> Result<(Bytes, usize)
             )));
         }
     };
-    let db_index: usize = match std::str::from_utf8(db_str)
+    let db_index = parse_db_index(db_str, db_count)?;
+    Ok((key, db_index))
+}
+
+/// Parse a destination db token the way redis does: a token that is not an
+/// integer is `ERR value is not an integer or out of range`; an integer that
+/// names no database — negative included — is `ERR DB index is out of range`.
+fn parse_db_index(tok: &[u8], db_count: usize) -> Result<usize, Frame> {
+    let n = std::str::from_utf8(tok)
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
-    {
-        Some(n) if n >= 0 => n as usize,
-        _ => {
-            return Err(Frame::Error(Bytes::from_static(
+        .ok_or_else(|| {
+            Frame::Error(Bytes::from_static(
                 b"ERR value is not an integer or out of range",
-            )));
-        }
-    };
-    if db_index >= db_count {
-        return Err(Frame::Error(Bytes::from_static(
-            b"ERR DB index is out of range",
-        )));
+            ))
+        })?;
+    match usize::try_from(n) {
+        Ok(idx) if idx < db_count => Ok(idx),
+        _ => Err(Frame::Error(Bytes::from_static(ERR_DB_OUT_OF_RANGE))),
     }
-    Ok((key, db_index))
+}
+
+/// Redis's reply for a db index that names no database.
+const ERR_DB_OUT_OF_RANGE: &[u8] = b"ERR DB index is out of range";
+
+/// Redis's reply for `MOVE key <current db>` and `COPY k k [DB <current db>]`.
+pub const ERR_SAME_OBJECT: &[u8] = b"ERR source and destination objects are the same";
+
+/// `MOVE key db` resolved against the source db: the key and the destination
+/// db, or the command's error reply.
+///
+/// Unlike [`parse_move_args`] this also refuses a destination equal to
+/// `src_db` with redis's `ERR source and destination objects are the same`
+/// (redis checks it before looking the key up, so a missing key gets the same
+/// error). Every live MOVE path and the transaction executors use this, so the
+/// command answers identically wherever it runs.
+pub fn resolve_move(
+    args: &[Frame],
+    src_db: usize,
+    db_count: usize,
+) -> Result<(Bytes, usize), Frame> {
+    let (key, dst_db) = parse_move_args(args, db_count)?;
+    if dst_db == src_db {
+        return Err(Frame::Error(Bytes::from_static(ERR_SAME_OBJECT)));
+    }
+    Ok((key, dst_db))
 }
 
 /// Parsed result for COPY when it includes a `DB n` clause targeting a different database.
@@ -187,22 +216,10 @@ pub fn parse_copy_db_args(
                 Some(t) => t,
                 None => return Some(Err(Frame::Error(Bytes::from_static(b"ERR syntax error")))),
             };
-            let n: usize = match std::str::from_utf8(db_tok)
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok())
-            {
-                Some(v) if v >= 0 => v as usize,
-                _ => {
-                    return Some(Err(Frame::Error(Bytes::from_static(
-                        b"ERR value is not an integer or out of range",
-                    ))));
-                }
+            let n = match parse_db_index(db_tok, db_count) {
+                Ok(n) => n,
+                Err(e) => return Some(Err(e)),
             };
-            if n >= db_count {
-                return Some(Err(Frame::Error(Bytes::from_static(
-                    b"ERR invalid DB index",
-                ))));
-            }
             dst_db_opt = Some(n);
             i += 1;
         } else {
@@ -224,6 +241,71 @@ pub fn parse_copy_db_args(
         dst_db,
         replace,
     }))
+}
+
+// ── Transaction-executor entry point ──────────────────────────────────────────
+
+/// A `MOVE`, or a `COPY` whose `DB` clause names another database, resolved
+/// against the database it runs in.
+///
+/// The MULTI/EXEC executors run each queued command through the single-db
+/// `dispatch()`, which cannot see a second database. They ask
+/// [`resolve_two_db`] first and, on `Some(Ok(op))`, hand [`TwoDbOp::apply`]
+/// the source and destination databases — the same [`move_core`] /
+/// [`copy_core`] the live intercepts, the replica apply path and AOF replay
+/// use, so every path writes the same keyspace.
+#[derive(Debug)]
+pub enum TwoDbOp {
+    /// `MOVE key dst_db`.
+    Move { key: Bytes, dst_db: usize },
+    /// `COPY src dst DB dst_db [REPLACE]`.
+    Copy(CopyDbArgs),
+}
+
+impl TwoDbOp {
+    /// The database the command writes into (never the source db).
+    #[must_use]
+    pub fn dst_db(&self) -> usize {
+        match self {
+            TwoDbOp::Move { dst_db, .. } => *dst_db,
+            TwoDbOp::Copy(ca) => ca.dst_db,
+        }
+    }
+
+    /// Run the command against its source and destination databases.
+    /// `:1` means the keyspace changed; anything else wrote nothing.
+    pub fn apply(&self, src: &mut Database, dst: &mut Database) -> Frame {
+        match self {
+            TwoDbOp::Move { key, .. } => move_core(src, dst, key),
+            TwoDbOp::Copy(ca) => copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace),
+        }
+    }
+}
+
+/// Classify one command for the transaction executors.
+///
+/// * `None` — not a two-db command. That includes a `COPY` without a `DB`
+///   clause and one whose `DB` names `src_db`: both are ordinary same-db
+///   copies for the single-db dispatch.
+/// * `Some(Err(reply))` — the command's own error, which is its whole reply
+///   (redis's wording: see [`resolve_move`] and [`parse_copy_db_args`]).
+/// * `Some(Ok(op))` — apply `op` to `(src_db, op.dst_db())`.
+#[must_use]
+pub fn resolve_two_db(
+    cmd: &[u8],
+    args: &[Frame],
+    src_db: usize,
+    db_count: usize,
+) -> Option<Result<TwoDbOp, Frame>> {
+    if cmd.eq_ignore_ascii_case(b"MOVE") {
+        return Some(
+            resolve_move(args, src_db, db_count).map(|(key, dst_db)| TwoDbOp::Move { key, dst_db }),
+        );
+    }
+    if cmd.eq_ignore_ascii_case(b"COPY") {
+        return parse_copy_db_args(args, src_db, db_count).map(|r| r.map(TwoDbOp::Copy));
+    }
+    None
 }
 
 // ── RwLock-based two-db helper (handler_single path) ──────────────────────────
@@ -515,6 +597,113 @@ mod tests {
         ];
         let err = parse_copy_db_args(&args, 0, 16).unwrap().unwrap_err();
         assert!(matches!(err, Frame::Error(_)));
+    }
+
+    // ── redis error wording (moon#1062) ─────────────────────────────────────────
+
+    fn bulk(s: &str) -> Frame {
+        Frame::BulkString(Bytes::from(s.to_owned()))
+    }
+
+    fn err_text(f: &Frame) -> &[u8] {
+        match f {
+            Frame::Error(e) => e,
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn db_index_errors_use_redis_wording() {
+        // A token that is not an integer, then integers naming no database —
+        // negative included, which redis reports as out of range, not as
+        // "not an integer".
+        let e = parse_move_args(&[bulk("k"), bulk("x")], 16).unwrap_err();
+        assert_eq!(err_text(&e), b"ERR value is not an integer or out of range");
+        for bad in ["-1", "16", "99"] {
+            let e = parse_move_args(&[bulk("k"), bulk(bad)], 16).unwrap_err();
+            assert_eq!(err_text(&e), ERR_DB_OUT_OF_RANGE, "MOVE k {bad}");
+            let e = parse_copy_db_args(&[bulk("a"), bulk("b"), bulk("DB"), bulk(bad)], 0, 16)
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(err_text(&e), ERR_DB_OUT_OF_RANGE, "COPY a b DB {bad}");
+        }
+        let e = parse_copy_db_args(&[bulk("a"), bulk("b"), bulk("DB"), bulk("x")], 0, 16)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err_text(&e), b"ERR value is not an integer or out of range");
+    }
+
+    #[test]
+    fn move_into_the_source_db_is_redis_same_object_error() {
+        let e = resolve_move(&[bulk("k"), bulk("2")], 2, 16).unwrap_err();
+        assert_eq!(err_text(&e), ERR_SAME_OBJECT);
+        let (key, dst) = resolve_move(&[bulk("k"), bulk("3")], 2, 16).unwrap();
+        assert_eq!((&key[..], dst), (&b"k"[..], 3));
+    }
+
+    #[test]
+    fn resolve_two_db_classifies_what_needs_two_databases() {
+        // Not a two-db command at all.
+        assert!(resolve_two_db(b"SET", &[bulk("k"), bulk("v")], 0, 16).is_none());
+        // COPY without a DB clause, and with one naming the source db, is an
+        // ordinary same-db copy for the single-db dispatch.
+        assert!(resolve_two_db(b"COPY", &[bulk("a"), bulk("b")], 0, 16).is_none());
+        assert!(
+            resolve_two_db(
+                b"copy",
+                &[bulk("a"), bulk("b"), bulk("DB"), bulk("5")],
+                5,
+                16
+            )
+            .is_none()
+        );
+        // Errors are the whole reply.
+        let e = resolve_two_db(b"MOVE", &[bulk("k"), bulk("0")], 0, 16)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err_text(&e), ERR_SAME_OBJECT);
+        // Both commands, any casing, name their destination.
+        let op = resolve_two_db(b"move", &[bulk("k"), bulk("3")], 0, 16)
+            .unwrap()
+            .unwrap();
+        assert_eq!(op.dst_db(), 3);
+        let op = resolve_two_db(
+            b"COPY",
+            &[bulk("a"), bulk("b"), bulk("db"), bulk("4"), bulk("replace")],
+            0,
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(op.dst_db(), 4);
+    }
+
+    #[test]
+    fn two_db_op_apply_moves_and_copies_between_the_given_dbs() {
+        let mut src = make_db();
+        let mut dst = make_db();
+        set_str(&mut src, "m", "mv");
+        set_str(&mut src, "c", "cv");
+        let mv = resolve_two_db(b"MOVE", &[bulk("m"), bulk("1")], 0, 16)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mv.apply(&mut src, &mut dst), Frame::Integer(1));
+        assert!(!src.exists(b"m") && dst.exists(b"m"));
+        // A second MOVE finds the source empty: a no-op.
+        assert_eq!(mv.apply(&mut src, &mut dst), Frame::Integer(0));
+
+        let cp = resolve_two_db(
+            b"COPY",
+            &[bulk("c"), bulk("c2"), bulk("DB"), bulk("1")],
+            0,
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cp.apply(&mut src, &mut dst), Frame::Integer(1));
+        assert!(src.exists(b"c") && dst.exists(b"c2") && !src.exists(b"c2"));
+        // Without REPLACE a second copy collides.
+        assert_eq!(cp.apply(&mut src, &mut dst), Frame::Integer(0));
     }
 
     // ── with_two_dbs_locked ─────────────────────────────────────────────────────
