@@ -311,6 +311,10 @@ pub fn recover_shard_v3_pitr(
             // `register_warm_segments` once per entry, and the second hand-over
             // deleted the directory the first had attached. Collapse them
             // before discovery and heal them on disk with the commit below.
+            // If that commit fails, warm discovery here is still deduped, but
+            // the ColdIndex rebuild further down re-opens the manifest from
+            // disk and so still reads the duplicated spill entries this boot
+            // (the pre-#893 behaviour); the next boot retries the heal.
             let duplicates_dropped = manifest.dedupe_active_entries();
             if duplicates_dropped > 0 {
                 tracing::warn!(

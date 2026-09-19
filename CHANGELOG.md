@@ -195,7 +195,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(id, type)` that is already listed (it returns `DuplicateFileEntry`),
   and a warm transition onto an id whose directory or entry already exists
   is refused before anything is written, where it used to commit the entry
-  and then fail the rename with `ENOTEMPTY`. Covered by
+  and then fail the rename with `ENOTEMPTY`. A spill batch whose file id the
+  manifest already lists puts its keys back in RAM from their in-flight
+  payloads, never publishes them cold, and is counted in the new INFO field
+  `spill_completion_id_rejected`. A reattached warm segment raises the
+  vector global_id allocator above its own ids, so a key written after the
+  restart can never be given an id a warm row already holds. Covered by
   `tests/warm_segment_restart_893.rs`, which restarts twice (clean and
   `kill -9`) and checks that the directories persist, nothing is re-encoded,
   and `FT.SEARCH` is identical.

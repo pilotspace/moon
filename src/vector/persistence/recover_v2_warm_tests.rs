@@ -1505,3 +1505,60 @@ fn a_key_in_two_warm_segments_keeps_the_copy_the_keymap_names() {
         "the stale copy of doc:3 is still searchable"
     );
 }
+
+/// The global_id allocator must resume ABOVE every global_id a reattached warm
+/// segment holds. Recovery seeds the mutable segment's base from Stack B's
+/// `next_global_id` alone; when Stack B's manifest lags the warm tier (a lost
+/// async snapshot, `appendonly no`), a key re-written after the restart could
+/// be handed a global_id an attached warm row already carries — and the
+/// per-key rule, which trusts global_ids to tell copies apart, would then
+/// take the old row for the current one on the next boot.
+#[test]
+fn a_reattached_warm_segment_raises_the_global_id_allocator_above_its_rows() {
+    let n = 12usize;
+    let fx = build_warm_fixture(n, None, false);
+    let (id, dir) = fx.warm[0].clone();
+    let warm_gids: std::collections::HashSet<u32> =
+        crate::vector::persistence::warm_search::peek_mvcc_rows(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|(_, gid)| gid)
+            .collect();
+    let max_warm_gid = *warm_gids.iter().max().unwrap();
+
+    // Stack B lagging: its manifest predates every warm row's global_id.
+    let idx_dir = manifest::index_persist_dir(fx.tmp.path(), b"idx");
+    let mut m = manifest::read_manifest_tolerant(&idx_dir).unwrap();
+    m.next_global_id = 0;
+    manifest::write_manifest_atomic(&idx_dir, &m).unwrap();
+
+    let mut fresh = reboot(&fx, vec![(id, dir.clone())]);
+    let next = fresh
+        .get_index(b"idx")
+        .unwrap()
+        .segments
+        .load()
+        .mutable
+        .next_global_id();
+    assert!(
+        next > max_warm_gid,
+        "the allocator resumes at {next}, at or below warm global_id {max_warm_gid}"
+    );
+
+    // A key re-written now gets a global_id no warm row holds, and is served.
+    hset(&mut fresh, "doc:3", f32_blob(fx.dim, REINSERT_SEED));
+    let new_gid = gid_of(&fresh, "doc:3");
+    assert!(
+        !warm_gids.contains(&new_gid),
+        "re-written doc:3 was given global_id {new_gid}, which a warm row already holds"
+    );
+    let got = fresh
+        .search_index(
+            b"idx",
+            &blob_to_f32(&f32_blob(fx.dim, REINSERT_SEED)),
+            1,
+            64,
+        )
+        .unwrap();
+    assert_eq!(got.first().copied(), Some(new_gid));
+}

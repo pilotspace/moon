@@ -809,6 +809,29 @@ impl ShardManifest {
         if last.len() == active {
             return 0;
         }
+        // A dropped duplicate that names a DIFFERENT logical db than the kept
+        // one moves that spill file's keys to the kept entry's db on the next
+        // cold-index rebuild. Keeping the last is still the best evidence of
+        // what the file holds, but the move must not be silent.
+        for (i, e) in entries.iter().enumerate() {
+            if e.status != FileStatus::Active {
+                continue;
+            }
+            if let Some(&k) = last.get(&(e.file_id, e.file_type))
+                && k != i
+                && let Some(kept) = entries.get(k)
+                && kept.db_index != e.db_index
+            {
+                tracing::warn!(
+                    file_id = e.file_id,
+                    file_type = e.file_type,
+                    dropped_db = e.db_index,
+                    kept_db = kept.db_index,
+                    "manifest: dropping a duplicate entry that names a different db than \
+                     the entry kept; the file's keys are attributed to the kept db"
+                );
+            }
+        }
         let before = entries.len();
         let mut i = 0usize;
         entries.retain(|e| {

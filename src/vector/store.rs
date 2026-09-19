@@ -1658,6 +1658,42 @@ pub struct VectorStore {
     prefix_map: crate::util::prefix_map::PrefixMap,
 }
 
+/// Make `mutable`'s global_id allocator resume strictly above `max_gid`, the
+/// highest global_id held by a warm segment just reattached at boot.
+///
+/// Only an EMPTY mutable segment may be re-based: its global_ids are
+/// `base + internal_id`, so moving the base under live entries would renumber
+/// them. At boot it is always empty here (the rescan that fills it runs after
+/// `register_warm_segments`); if it is not, the collision risk is logged
+/// instead of rewriting ids.
+fn raise_global_id_floor(
+    mutable: &crate::vector::segment::mutable::MutableSegment,
+    max_gid: u32,
+    segment_id: u64,
+    index: &str,
+) {
+    if mutable.next_global_id() > max_gid {
+        return;
+    }
+    let Some(floor) = max_gid.checked_add(1) else {
+        tracing::error!(
+            "warm segment {segment_id} for index {index:?} holds global_id u32::MAX — \
+             the allocator cannot resume above it"
+        );
+        return;
+    };
+    if mutable.len() == 0 {
+        mutable.set_global_id_base(floor);
+    } else {
+        tracing::error!(
+            "warm segment {segment_id} for index {index:?}: its global_ids reach {max_gid} \
+             but the non-empty mutable segment allocates from {} — new inserts may reuse \
+             a warm row's global_id",
+            mutable.next_global_id()
+        );
+    }
+}
+
 /// Read `manifest.json` and the keymap file for whatever epoch it points to,
 /// as a matched pair, tolerating the narrow TOCTOU window where a concurrent
 /// snapshot job (`run_snapshot_job`) advances the manifest to a NEW epoch and
@@ -2855,25 +2891,19 @@ impl VectorStore {
                 continue;
             };
 
-            // Finding #1, decided PER KEY (moon#893). The owner's persisted
-            // keymap names the current copy of every key by global_id; this
-            // segment's rows say which copies it holds. A key's copy here is
-            // dead — tombstoned in THIS segment only, never key_hash-wide —
-            // when:
-            // - the keymap has no entry for it (an async snapshot never
-            //   committed for it: the rescan re-indexes it fresh);
-            // - the keymap names a different global_id (the key was
-            //   re-inserted after this segment went warm: this copy is
-            //   stale, the current one lives in another segment or is
-            //   re-indexed by the rescan);
-            // - the owner's in-memory keymap already holds it (Stack B
-            //   reloaded the same copy as HOT — the crash-before-GC race —
-            //   or a segment attached earlier in this batch serves it).
-            // Everything else is live here. The old test, `.any()` over the
-            // key_hashes, retired the WHOLE directory on a single overlap, so
-            // one re-inserted key cost every sibling its persisted copy; and
-            // on a repeated manifest entry it matched the keys the first
-            // visit had just registered.
+            // Invariant (moon#893): a warm segment serves exactly the keys for
+            // which it holds the copy the owner's persisted keymap names (by
+            // global_id) and no other live segment serves yet. Every other
+            // copy it holds is tombstoned in THIS segment only — never
+            // key_hash-wide, so no other segment's copy is touched:
+            // - no keymap entry: no snapshot ever recorded the key, so the
+            //   rescan re-indexes it fresh;
+            // - a different global_id: the key was re-written after this
+            //   segment went warm, and this copy is stale;
+            // - already in the owner's in-memory keymap: Stack B reloaded the
+            //   same copy as HOT, or a segment attached earlier in this batch
+            //   serves it.
+            // A segment is never retired for holding one superseded key.
             let owner_keymap = keymap_cache.get(&owner_name).and_then(|c| c.as_ref());
             let mut live: Vec<&KeymapEntry> = Vec::with_capacity(seg_key_hash_set.len());
             let mut dead: Vec<u64> = Vec::new();
@@ -2965,6 +2995,15 @@ impl VectorStore {
                     }
 
                     let old = idx.segments.load();
+                    // The global_id allocator must resume above every
+                    // global_id this segment holds. Recovery seeds it from
+                    // Stack B's `next_global_id` alone, which can lag the warm
+                    // tier; a key re-written later must never be given an id a
+                    // warm row carries, or the per-key rule above could take
+                    // that row for the current copy on the next boot.
+                    if let Some(max_gid) = seg_rows.iter().map(|&(_, gid)| gid).max() {
+                        raise_global_id_floor(&old.mutable, max_gid, *segment_id, &owner_label);
+                    }
                     let mut new_warm = old.warm.clone();
                     new_warm.push(std::sync::Arc::new(warm_seg));
                     let new_list = crate::vector::segment::SegmentList {

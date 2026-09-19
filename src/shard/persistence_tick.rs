@@ -789,6 +789,43 @@ impl ColdMarkerSink<'_> {
     }
 }
 
+/// Put one key of a spill batch that will NOT be published back into the hot
+/// table from its in-flight payload (moon#893). Same guards as the
+/// failed-pwrite branch of [`apply_completion_vec`]: only the newest request
+/// for the key may re-insert, and a key re-created meanwhile is left alone.
+fn rehydrate_unpublished_spill(
+    entry: &crate::storage::tiered::spill_thread::SpillCompletionEntry,
+    file_id: u64,
+) {
+    crate::shard::slice::with_shard_db(entry.db_index, |db| {
+        if !db.spill_inflight_is_newest(&entry.key, entry.req_file_id) {
+            // Deleted, overwritten, read-promoted or re-evicted in flight:
+            // the newer state owns the key.
+            crate::storage::tiered::spill_thread::record_spill_completion_superseded();
+            return;
+        }
+        let payload = db.spill_inflight_payload(&entry.key, entry.req_file_id);
+        db.spill_inflight_clear(&entry.key, entry.req_file_id);
+        if db.get_version(&entry.key) != 0 {
+            return;
+        }
+        match payload.and_then(|(vt, bytes, ttl)| {
+            crate::storage::eviction::rehydrate_spill_payload(vt, &bytes, ttl)
+        }) {
+            Some(hot) => {
+                db.set(&entry.key, hot);
+                crate::storage::tiered::spill_thread::record_spill_failed_reinserted();
+            }
+            None => tracing::error!(
+                file_id,
+                key_len = entry.key.len(),
+                "Spill completion refused AND its payload does not rehydrate — key lost \
+                 until AOF-replay restart"
+            ),
+        }
+    });
+}
+
 /// Apply a batch of spill completions: ONE manifest `add_file`+commit per file,
 /// one `cold_index` insert per KV entry within it. Shared by the live drain
 /// (`apply_spill_completions`) and the shutdown final-flush drain.
@@ -886,7 +923,28 @@ fn apply_completion_vec(
 
         // RAM-only manifest update; durability handled once per batch below.
         if let Some(ref mut manifest) = *shard_manifest {
-            manifest.add_file(c.file_entry).unwrap();
+            if let Err(e) = manifest.add_file(c.file_entry) {
+                // moon#893: the manifest already lists this id (Active, or
+                // Tombstoned inside its retention window), so it does not
+                // describe the file this batch wrote and nothing may point at
+                // it. Unreachable while the file_id seed holds. The hot
+                // entries were removed at enqueue: each key's only copy is its
+                // in-flight payload, so put it back in RAM exactly as the
+                // failed-pwrite branch above does, or it stays readable only
+                // from `spill_inflight` until a restart.
+                crate::storage::tiered::spill_thread::record_spill_completion_id_rejected();
+                tracing::error!(
+                    file_id,
+                    keys = c.entries.len(),
+                    error = %e,
+                    "Spill completion refused: the manifest already lists this file id \
+                     (it was re-issued); re-inserting the batch's keys into the hot table"
+                );
+                for entry in &c.entries {
+                    rehydrate_unpublished_spill(entry, file_id);
+                }
+                continue;
+            }
             manifest_dirty = true;
         }
 
@@ -2572,5 +2630,124 @@ mod tests {
             "second no-op pass doubles the lag again"
         );
         assert!(run(&mut wal, &mut control, 4 * LAG_MS + 1));
+    }
+
+    /// moon#893 review: a spill completion whose file id the manifest already
+    /// lists (Active, or Tombstoned inside its retention window) is refused by
+    /// `ShardManifest::add_file`. The completion path used to `unwrap()` that
+    /// — a panic on the shard thread. It must instead put every key back in
+    /// the hot table from its in-flight payload (the hot entry was removed at
+    /// enqueue, so `spill_inflight` holds the only copy) and publish nothing
+    /// to the cold index, since the manifest does not describe that file.
+    #[test]
+    fn spill_completion_for_an_already_listed_id_rehydrates_its_keys() {
+        use crate::persistence::kv_page::ValueType;
+        use crate::persistence::manifest::{FileEntry, FileStatus, StorageTier};
+        use crate::persistence::page::PageType;
+        use crate::shard::slice::{ShardSlice, init_shard, test_support::make_init, with_shard_db};
+        use crate::storage::db::PendingSpill;
+        use crate::storage::tiered::spill_thread::{SpillCompletion, SpillCompletionEntry};
+
+        for tombstoned in [false, true] {
+            std::thread::spawn(move || {
+                init_shard(ShardSlice::new(make_init(0, 1)));
+                let tmp = tempfile::tempdir().unwrap();
+                let entry = |id: u64| FileEntry {
+                    file_id: id,
+                    file_type: PageType::KvLeaf as u8,
+                    status: FileStatus::Active,
+                    tier: StorageTier::Hot,
+                    page_size_log2: 12,
+                    page_count: 1,
+                    byte_size: 4096,
+                    created_lsn: 0,
+                    db_index: 0,
+                    max_key_hash: 0,
+                    last_modified_lsn: 0,
+                };
+                let mut manifest =
+                    ShardManifest::create(&tmp.path().join("shard-0.manifest")).unwrap();
+                manifest.add_file(entry(5)).unwrap();
+                if tombstoned {
+                    manifest.remove_file(5, PageType::KvLeaf);
+                }
+                let before = manifest.files().to_vec();
+
+                let keys: Vec<bytes::Bytes> = (0..3)
+                    .map(|i| bytes::Bytes::from(format!("k{i}")))
+                    .collect();
+                with_shard_db(0, |db| {
+                    db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
+                    for (i, k) in keys.iter().enumerate() {
+                        db.spill_inflight_mark(
+                            k.clone(),
+                            PendingSpill {
+                                req_id: 100 + i as u64,
+                                value_type: ValueType::String,
+                                value_bytes: bytes::Bytes::from(format!("v{i}")),
+                                ttl_ms: None,
+                            },
+                        );
+                    }
+                });
+                let completion = SpillCompletion {
+                    file_entry: entry(5),
+                    entries: keys
+                        .iter()
+                        .enumerate()
+                        .map(|(i, k)| SpillCompletionEntry {
+                            key: k.clone(),
+                            db_index: 0,
+                            page_idx: 0,
+                            slot_idx: i as u16,
+                            ttl_ms: None,
+                            value_type: ValueType::String,
+                            req_file_id: 100 + i as u64,
+                        })
+                        .collect(),
+                    success: true,
+                    failed_request: None,
+                };
+                let mut sink = ColdMarkerSink {
+                    aof_pool: None,
+                    wal_writer: None,
+                    shard_id: 0,
+                    wal_kv_log: false,
+                };
+                let mut shard_manifest = Some(manifest);
+                apply_completion_vec(vec![completion], &mut shard_manifest, &mut sink);
+
+                assert_eq!(
+                    shard_manifest.as_ref().unwrap().files(),
+                    &before[..],
+                    "tombstoned={tombstoned}: the manifest keeps the entry it had"
+                );
+                with_shard_db(0, |db| {
+                    assert!(
+                        db.spill_inflight_is_empty(),
+                        "tombstoned={tombstoned}: in-flight records must be retired"
+                    );
+                    for (i, k) in keys.iter().enumerate() {
+                        assert!(
+                            db.cold_index.as_ref().unwrap().lookup(k).is_none(),
+                            "tombstoned={tombstoned}: {k:?} must not be published cold"
+                        );
+                        let e = db.data().get(k.as_ref()).unwrap_or_else(|| {
+                            panic!("tombstoned={tombstoned}: {k:?} is in neither plane")
+                        });
+                        assert_eq!(e.value.as_bytes(), Some(format!("v{i}").as_bytes()),);
+                    }
+                });
+            })
+            .join()
+            .unwrap_or_else(|e| {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                panic!("tombstoned={tombstoned}: {msg}")
+            });
+        }
     }
 }

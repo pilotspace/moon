@@ -685,6 +685,25 @@ impl Database {
         self.spill_inflight.get(key).map(|p| p.req_id) == Some(req_id)
     }
 
+    /// The pending payload of `req_id`'s in-flight record for `key` — its
+    /// value type, bytes (a refcount clone, not a copy) and TTL — when that
+    /// request is still the newest for the key. For completion paths that
+    /// must put a key back in RAM because its spill cannot be published.
+    pub fn spill_inflight_payload(
+        &self,
+        key: &[u8],
+        req_id: u64,
+    ) -> Option<(
+        crate::persistence::kv_page::ValueType,
+        bytes::Bytes,
+        Option<u64>,
+    )> {
+        self.spill_inflight
+            .get(key)
+            .filter(|p| p.req_id == req_id)
+            .map(|p| (p.value_type, p.value_bytes.clone(), p.ttl_ms))
+    }
+
     /// Consume the in-flight record for `key` if (and only if) it belongs
     /// to `req_id`; a newer request's record is left for its own completion.
     pub fn spill_inflight_clear(&mut self, key: &[u8], req_id: u64) {
