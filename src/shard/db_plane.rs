@@ -174,6 +174,39 @@ impl ShardDbSet {
         })
     }
 
+    /// OWNER ONLY — an exclusive guard on a SECOND database, taken while this
+    /// thread already holds a guard on another one: a script's `MOVE` /
+    /// `COPY ... DB n` (moon#1068), whose own db stays locked for the whole
+    /// script.
+    ///
+    /// **Blocks** until a foreign reader or writer holding `idx` lets go, like
+    /// [`ShardDbSet::write`]. That cannot deadlock even though `idx` may be
+    /// below the index already held, against [`ShardDbSet::write_pair`]'s
+    /// ascending rule: that rule orders the OWNER's acquisitions against each
+    /// other, and the owner is the only thread that ever parks on these
+    /// locks. Foreign parties ([`ShardDbSet::try_read`],
+    /// [`ShardDbSet::try_write_foreign`]) make one non-blocking attempt and
+    /// hold a single guard without waiting on anything, so they cannot be one
+    /// side of a cycle.
+    ///
+    /// `None` only for the two structural cases, never for contention:
+    /// `idx` is out of range, or this thread already holds `idx`. The second
+    /// would deadlock on a real `RwLock` (and panics in
+    /// [`ShardDbSet::write`]); here it is a refusal the caller turns into an
+    /// error reply, so a caller bug cannot take the shard thread down.
+    #[inline]
+    pub fn write_second(&self, idx: usize) -> Option<DbWriteGuard<'_>> {
+        let cell = self.dbs.get(idx)?;
+        if guard_depth::is_held(idx) {
+            return None;
+        }
+        let _depth = guard_depth::acquire(idx);
+        Some(DbWriteGuard {
+            inner: cell.write(),
+            _depth,
+        })
+    }
+
     /// OWNER ONLY — like [`ShardDbSet::read`] but `None` instead of a panic
     /// when `idx` is out of range.
     #[inline]
@@ -358,6 +391,14 @@ mod guard_depth {
         DepthToken(idx)
     }
 
+    /// Whether this thread holds a guard on `idx`. An index beyond
+    /// [`TRACKED`] is never reported held (moon has never supported that
+    /// many databases).
+    #[inline]
+    pub(super) fn is_held(idx: usize) -> bool {
+        idx < TRACKED && HELD.with(|h| h.get() & (1u64 << idx) != 0)
+    }
+
     /// Test-only view of the mask.
     #[cfg(test)]
     pub(super) fn held_mask() -> u64 {
@@ -509,6 +550,54 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// moon#1068: a script holding its own db waits for a FOREIGN reader of
+    /// the destination db and then gets it — contention is a wait, never a
+    /// refusal. Only the structural cases refuse: the db this thread already
+    /// holds, and an index out of range.
+    #[test]
+    fn write_second_waits_for_a_foreign_reader_and_refuses_only_structurally() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let set = std::sync::Arc::new(set_of(4));
+        let own = set.write(0);
+
+        // A foreign shard thread takes a read guard on db 1 and holds it.
+        let (held_tx, held_rx) = mpsc::channel();
+        let foreign = std::sync::Arc::clone(&set);
+        let reader = std::thread::spawn(move || {
+            let guard = foreign.try_read(1).expect("db 1 is free");
+            held_tx.send(()).expect("signal held");
+            std::thread::sleep(Duration::from_millis(50));
+            drop(guard);
+        });
+        held_rx.recv().expect("reader holds db 1");
+
+        let start = Instant::now();
+        let second = set.write_second(1);
+        let waited = start.elapsed();
+        assert!(
+            second.is_some(),
+            "contention must be waited out, not refused"
+        );
+        assert!(
+            waited >= Duration::from_millis(30),
+            "the guard was granted while the foreign reader still held db 1 ({waited:?})"
+        );
+        drop(second);
+        reader.join().expect("reader thread");
+
+        // Structural refusals: the db already held here, and a missing db.
+        assert!(
+            set.write_second(0).is_none(),
+            "re-entry must refuse, not deadlock"
+        );
+        assert!(set.write_second(9).is_none(), "out of range must refuse");
+        drop(own);
+        // Once released, the same index is available again.
+        assert!(set.write_second(0).is_some());
+    }
 
     fn set_of(db_count: usize) -> ShardDbSet {
         let dbs: Box<[CachePadded<RwLock<Database>>]> = (0..db_count)

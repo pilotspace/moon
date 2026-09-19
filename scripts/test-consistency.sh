@@ -1041,17 +1041,17 @@ both DEL "{z1102}s"
 # `*0`, `ZRANGE r8 -10 -6 REV` -> `*0`, `ZRANGESTORE r9 r8 -10 -6` -> `0`.
 # `zrange_by_rank` (B+tree) and `zrange_from_entries` (listpack) both now
 # call the same `rank_window` helper `ZREMRANGEBYRANK` above already used.
-both ZADD z:1001:rank 1 a 2 b 3 c 4 d 5 e
-assert_both "ZRANGE still-negative stop"        ZRANGE z:1001:rank -10 -6
-assert_both "ZREVRANGE still-negative stop"     ZREVRANGE z:1001:rank -10 -6
-assert_both "ZRANGE REV still-negative stop"    ZRANGE z:1001:rank -10 -6 REV
-assert_both "ZRANGESTORE still-negative stop"   ZRANGESTORE {z1001}:d z:1001:rank -10 -6
+both ZADD {z1001}:rank 1 a 2 b 3 c 4 d 5 e
+assert_both "ZRANGE still-negative stop"        ZRANGE {z1001}:rank -10 -6
+assert_both "ZREVRANGE still-negative stop"     ZREVRANGE {z1001}:rank -10 -6
+assert_both "ZRANGE REV still-negative stop"    ZRANGE {z1001}:rank -10 -6 REV
+assert_both "ZRANGESTORE still-negative stop"   ZRANGESTORE {z1001}:d {z1001}:rank -10 -6
 assert_both "ZRANGESTORE dest left empty"       ZRANGE {z1001}:d 0 -1
 # Controls: a stop of exactly -len normalises to rank 0 without clamping
 # (already correct pre-fix), and start > stop after normalisation was
 # already handled.
-assert_both "ZRANGE stop == -len"               ZRANGE z:1001:rank -10 -5
-assert_both "ZRANGE start > stop"               ZRANGE z:1001:rank -1 -3
+assert_both "ZRANGE stop == -len"               ZRANGE {z1001}:rank -10 -5
+assert_both "ZRANGE start > stop"               ZRANGE {z1001}:rank -1 -3
 both ZADD z:1001:one 1 solo
 assert_both "ZRANGE len=1 still-negative stop"  ZRANGE z:1001:one -10 -6
 assert_both "ZRANGE len=1 stop == -len"         ZRANGE z:1001:one -1 -1
@@ -1715,6 +1715,63 @@ assert_eq "moon#1062 MOVE and COPY ... DB n inside MULTI (shards=$SHARDS)" \
     "$(move_copy_in_multi_outcome "$PORT_REDIS")" "$(move_copy_in_multi_outcome "$PORT_RUST")"
 
 # ---------------------------------------------------------------------------
+# moon#1068: MOVE and COPY ... DB n issued from a script (EVAL and FCALL)
+# ---------------------------------------------------------------------------
+#
+# Pre-fix, `redis.call('MOVE', ...)` answered `ERR MOVE requires handler-level
+# dispatch`, and `redis.call('COPY', a, c, 'DB', 4)` answered :1 but wrote `c`
+# into the SCRIPT's db. The verdict is every reply plus where each key ended up
+# in dbs 0, 3, 4 and 5, and the absolute deadline the moved key kept.
+script_move_copy_outcome() {
+    local port=$1 db
+    for db in 0 3 4 5; do
+        redis-cli -p "$port" -n "$db" DEL "{sc1068}a" "{sc1068}b" "{sc1068}c" >/dev/null 2>&1 || true
+    done
+    redis-cli -p "$port" SET "{sc1068}a" 1 PXAT 4102444800000 >/dev/null 2>&1 || true
+    redis-cli -p "$port" SET "{sc1068}b" 2 >/dev/null 2>&1 || true
+    redis-cli -p "$port" FUNCTION LOAD REPLACE $'#!lua name=sc1068\nredis.register_function(\'mv\', function(keys, args) return redis.call(\'MOVE\', keys[1], args[1]) end)\n' >/dev/null 2>&1 || true
+    local reply
+    reply="$(redis-cli -p "$port" EVAL "redis.call('MOVE', KEYS[1], '3'); return redis.call('COPY', KEYS[2], KEYS[3], 'DB', '4')" 3 "{sc1068}a" "{sc1068}b" "{sc1068}c" 2>&1)"
+    reply+=" $(redis-cli -p "$port" EVAL "return {redis.pcall('MOVE', KEYS[1], '0'), redis.pcall('COPY', KEYS[1], KEYS[2], 'DB', '99')}" 2 "{sc1068}b" "{sc1068}c" 2>&1 | tr '\n' ' ')"
+    reply+=" $(redis-cli -p "$port" FCALL mv 1 "{sc1068}b" 5 2>&1)"
+    local where=""
+    for db in 0 3 4 5; do
+        where="${where}db${db}:$(redis-cli -p "$port" -n "$db" EXISTS "{sc1068}a" "{sc1068}b" "{sc1068}c" 2>&1),"
+    done
+    where+="at:$(redis-cli -p "$port" -n 3 PEXPIRETIME "{sc1068}a" 2>&1)"
+    redis-cli -p "$port" FUNCTION DELETE sc1068 >/dev/null 2>&1 || true
+    echo "${reply} | ${where}"
+}
+assert_eq "moon#1068 MOVE and COPY ... DB n from a script (shards=$SHARDS)" \
+    "$(script_move_copy_outcome "$PORT_REDIS")" "$(script_move_copy_outcome "$PORT_RUST")"
+
+# ---------------------------------------------------------------------------
+# moon#1095: COPY keeps the source's ABSOLUTE deadline
+# ---------------------------------------------------------------------------
+#
+# Untagged pairs, so at --shards 4 most of them straddle shards. Pre-fix the
+# cross-shard COPY carried a RELATIVE TTL (PTTL on the source's shard, PEXPIRE
+# on the destination's), which moved the deadline by the clock drift between
+# the two reads. Compared by PEXPIRETIME, which reads no clock: redis answers
+# the source's deadline for every copy.
+copy_deadline_outcome() {
+    # One connection, 64 trials: SET src PX, PEXPIRETIME src, COPY, PEXPIRETIME
+    # dst. Prints one '=' per trial whose two deadlines agree, '!' otherwise.
+    local port=$1 i
+    for ((i = 1; i <= 64; i++)); do
+        printf 'DEL cpd1095:src%d cpd1095:dst%d\n' "$i" "$i"
+        printf 'SET cpd1095:src%d v PX 500000\n' "$i"
+        printf 'PEXPIRETIME cpd1095:src%d\n' "$i"
+        printf 'COPY cpd1095:src%d cpd1095:dst%d\n' "$i" "$i"
+        printf 'PEXPIRETIME cpd1095:dst%d\n' "$i"
+    done | redis-cli -p "$port" 2>&1 \
+        | awk 'NR % 5 == 3 { want = $0 } NR % 5 == 0 { printf "%s", (want == $0 ? "=" : "!") }'
+    echo
+}
+assert_eq "moon#1095 COPY keeps the absolute deadline (shards=$SHARDS)" \
+    "$(copy_deadline_outcome "$PORT_REDIS")" "$(copy_deadline_outcome "$PORT_RUST")"
+
+# ---------------------------------------------------------------------------
 # moon#1076: a container subcommand with the wrong arity is queued instead of
 # aborting the transaction
 # ---------------------------------------------------------------------------
@@ -2168,6 +2225,12 @@ wake_row "wake: SORT ... STORE wakes BLPOP on the destination (moon#1069)" \
     "RPUSH {rkw10}s 3 1 2" "SORT {rkw10}s STORE {rkw10}d" "0:BLPOP {rkw10}d 2"
 wake_row "wake: EVAL RPUSH wakes BLPOP (moon#1069)" \
     "" "EVAL return(redis.call('RPUSH',KEYS[1],'x')) 1 {rkw11}k" "0:BLPOP {rkw11}k 2"
+wake_row "wake: EVAL MOVE wakes BLPOP parked in the target db (moon#1068)" \
+    "RPUSH {rkw15}l v" "EVAL return(redis.call('MOVE',KEYS[1],'3')) 1 {rkw15}l" \
+    "3:BLPOP {rkw15}l 2"
+wake_row "wake: EVAL COPY ... DB n wakes BLPOP parked in db n (moon#1068)" \
+    "RPUSH {rkw16}l v" "EVAL return(redis.call('COPY',KEYS[1],KEYS[1],'DB','3')) 1 {rkw16}l" \
+    "3:BLPOP {rkw16}l 2"
 wake_row "wake: ZINCRBY creating a zset wakes BZPOPMIN (moon#1069)" \
     "" "ZINCRBY {rkw12}z 1 m" "0:BZPOPMIN {rkw12}z 2"
 # The control: a key that becomes the WRONG type leaves the waiter parked.
@@ -2956,50 +3019,50 @@ assert_tracking() {
         "$(tracking_push_for "$PORT_RUST"  "$watched" "$read_cmd" "$@")"
 }
 
-both ZADD tz:a 1 m
-both ZADD tz:b 1 m
+both ZADD {tz}:a 1 m
+both ZADD {tz}:b 1 m
 assert_tracking "tracking: ZUNIONSTORE SOURCE not invalidated" \
-    "tz:a" "ZRANGE tz:a 0 -1" ZUNIONSTORE tz:d 2 tz:a tz:b
+    "{tz}:a" "ZRANGE {tz}:a 0 -1" ZUNIONSTORE {tz}:d 2 {tz}:a {tz}:b
 assert_tracking "tracking: ZUNIONSTORE DEST invalidated [control]" \
-    "tz:d" "ZRANGE tz:d 0 -1" ZUNIONSTORE tz:d 2 tz:a tz:b
+    "{tz}:d" "ZRANGE {tz}:d 0 -1" ZUNIONSTORE {tz}:d 2 {tz}:a {tz}:b
 assert_tracking "tracking: ZINTERSTORE SOURCE not invalidated" \
-    "tz:a" "ZRANGE tz:a 0 -1" ZINTERSTORE tz:i 2 tz:a tz:b
+    "{tz}:a" "ZRANGE {tz}:a 0 -1" ZINTERSTORE {tz}:i 2 {tz}:a {tz}:b
 assert_tracking "tracking: ZINTERSTORE DEST invalidated [control]" \
-    "tz:i" "ZRANGE tz:i 0 -1" ZINTERSTORE tz:i 2 tz:a tz:b
+    "{tz}:i" "ZRANGE {tz}:i 0 -1" ZINTERSTORE {tz}:i 2 {tz}:a {tz}:b
 
-both RPUSH tl:s b a
+both RPUSH {tl}:s b a
 assert_tracking "tracking: SORT..STORE SOURCE not invalidated" \
-    "tl:s" "LRANGE tl:s 0 -1" SORT tl:s ALPHA STORE tl:d
+    "{tl}:s" "LRANGE {tl}:s 0 -1" SORT {tl}:s ALPHA STORE {tl}:d
 assert_tracking "tracking: SORT..STORE DEST invalidated [control]" \
-    "tl:d" "LRANGE tl:d 0 -1" SORT tl:s ALPHA STORE tl:d
+    "{tl}:d" "LRANGE {tl}:d 0 -1" SORT {tl}:s ALPHA STORE {tl}:d
 # SORT is a WRITE-flagged command that writes NOTHING without STORE.
 assert_tracking "tracking: SORT without STORE invalidates nothing" \
-    "tl:s" "LRANGE tl:s 0 -1" SORT tl:s ALPHA
+    "{tl}:s" "LRANGE {tl}:s 0 -1" SORT {tl}:s ALPHA
 
-both SADD ts:a x
-both SADD ts:b x
+both SADD {ts}:a x
+both SADD {ts}:b x
 assert_tracking "tracking: SINTERSTORE SOURCE not invalidated" \
-    "ts:a" "SMEMBERS ts:a" SINTERSTORE ts:d ts:a ts:b
+    "{ts}:a" "SMEMBERS {ts}:a" SINTERSTORE {ts}:d {ts}:a {ts}:b
 assert_tracking "tracking: SINTERSTORE DEST invalidated [control]" \
-    "ts:d" "SMEMBERS ts:d" SINTERSTORE ts:d ts:a ts:b
+    "{ts}:d" "SMEMBERS {ts}:d" SINTERSTORE {ts}:d {ts}:a {ts}:b
 
-both SET tb:a x
-both SET tb:b y
+both SET {tbo}:a x
+both SET {tbo}:b y
 assert_tracking "tracking: BITOP SOURCE not invalidated" \
-    "tb:a" "GET tb:a" BITOP AND tb:d tb:a tb:b
+    "{tbo}:a" "GET {tbo}:a" BITOP AND {tbo}:d {tbo}:a {tbo}:b
 assert_tracking "tracking: BITOP DEST invalidated [control]" \
-    "tb:d" "GET tb:d" BITOP AND tb:d tb:a tb:b
+    "{tbo}:d" "GET {tbo}:d" BITOP AND {tbo}:d {tbo}:a {tbo}:b
 
-both SET tc:a v
+both SET {tc}:a v
 assert_tracking "tracking: COPY SOURCE not invalidated" \
-    "tc:a" "GET tc:a" COPY tc:a tc:d
+    "{tc}:a" "GET {tc}:a" COPY {tc}:a {tc}:d
 assert_tracking "tracking: COPY DEST invalidated [control]" \
-    "tc:d" "GET tc:d" COPY tc:a tc:d REPLACE
+    "{tc}:d" "GET {tc}:d" COPY {tc}:a {tc}:d REPLACE
 
 assert_tracking "tracking: ZRANGESTORE SOURCE not invalidated" \
-    "tz:a" "ZRANGE tz:a 0 -1" ZRANGESTORE tz:r tz:a 0 -1
+    "{tz}:a" "ZRANGE {tz}:a 0 -1" ZRANGESTORE {tz}:r {tz}:a 0 -1
 assert_tracking "tracking: ZRANGESTORE DEST invalidated [control]" \
-    "tz:r" "ZRANGE tz:r 0 -1" ZRANGESTORE tz:r tz:a 0 -1
+    "{tz}:r" "ZRANGE {tz}:r 0 -1" ZRANGESTORE {tz}:r {tz}:a 0 -1
 
 # ---------------------------------------------------------------------------
 # moon#1013 -- a key that EXPIRES must invalidate exactly like one a command
@@ -3138,7 +3201,9 @@ tracking_redirect_transcript() {
     if [[ -n "$prelude" ]]; then
         while IFS= read -r step; do
             printf '%s\r\n' "$step" >&3
-            while IFS= read -r -t 0.3 line <&3; do :; done
+            # Integer timeout: macOS /bin/bash 3.2 rejects `-t 0.3` ("invalid
+            # timeout specification"), which ended this drain at once there.
+            while IFS= read -r -t 1 line <&3; do :; done
         done <<< "$prelude"
     fi
     printf 'SUBSCRIBE __redis__:invalidate\r\n' >&3
@@ -3217,6 +3282,52 @@ assert_eq "pubsub: commands pipelined after RESET run (moon#1090)" \
     "$(pipelined_transcript "$PORT_RUST" "$TRK_RESET_PIPE")"
 
 # ---------------------------------------------------------------------------
+# moon#1105 -- CLIENT INFO of a subscribed connection, and RESET sent from
+# RESP2 subscriber mode. Measured on redis 8.6.1: a RESP3 subscriber is
+# `flags=P sub=1 psub=0 ssub=0 resp=3` (moon: `flags=S sub=0 resp=2`; `S` is
+# redis's REPLICA flag), and RESET from RESP2 subscriber mode returns to db 0,
+# tracking off and no name (moon kept all three). One write per case; only
+# the fields below are compared (id, addr, age differ by nature).
+# ---------------------------------------------------------------------------
+client_state_fields() {
+    local port="$1" payload="$2" line="" seen=""
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf '%s' "$payload" >&3
+    while IFS= read -r -t 1 line <&3; do
+        seen="${seen}${line%$'\r'} "
+    done
+    exec 3>&-
+    grep -oE ' (flags|db|sub|psub|ssub|redir|resp|name)=[^ ]*' <<< "$seen" | tr -d '\n' || true
+}
+CS_RESP3_SUB=$'HELLO 3\r\nSUBSCRIBE {cs}:x\r\nCLIENT INFO\r\n'
+CS_RESP3_ALL=$'HELLO 3\r\nSUBSCRIBE {cs}:x\r\nPSUBSCRIBE {cs}:p*\r\nSSUBSCRIBE {cs}:s\r\nCLIENT INFO\r\n'
+CS_RESP3_NONE=$'HELLO 3\r\nCLIENT INFO\r\n'
+CS_RESET_RESP2=$'SELECT 3\r\nCLIENT TRACKING on\r\nCLIENT SETNAME nm\r\nSUBSCRIBE {cs}:x\r\nRESET\r\nCLIENT INFO\r\n'
+CS_RESET_RESP3=$'HELLO 3\r\nSELECT 3\r\nCLIENT TRACKING on\r\nSSUBSCRIBE {cs}:s\r\nRESET\r\nCLIENT INFO\r\n'
+for cs_case in CS_RESP3_SUB CS_RESP3_ALL CS_RESP3_NONE CS_RESET_RESP2 CS_RESET_RESP3; do
+    assert_eq "CLIENT INFO subscriber state [$cs_case] (moon#1105)" \
+        "$(client_state_fields "$PORT_REDIS" "${!cs_case}")" \
+        "$(client_state_fields "$PORT_RUST" "${!cs_case}")"
+done
+# RESET must drop every namespace: a RESP3 shard subscription left behind was
+# still counted by SPUBLISH.
+reset_leftover_receivers() {
+    local port="$1" sub="$2" pub="$3" line="" n=""
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'HELLO 3\r\n%s {cs}:left\r\nRESET\r\n' "$sub" >&3
+    while IFS= read -r -t 1 line <&3; do :; done
+    n=$(redis-cli -p "$port" "$pub" '{cs}:left' hi 2>&1 || true)
+    exec 3>&-
+    echo "$n"
+}
+assert_eq "RESET drops a RESP3 SSUBSCRIBE (moon#1105)" \
+    "$(reset_leftover_receivers "$PORT_REDIS" SSUBSCRIBE SPUBLISH)" \
+    "$(reset_leftover_receivers "$PORT_RUST" SSUBSCRIBE SPUBLISH)"
+assert_eq "RESET drops a RESP3 SUBSCRIBE (moon#1105)" \
+    "$(reset_leftover_receivers "$PORT_REDIS" SUBSCRIBE PUBLISH)" \
+    "$(reset_leftover_receivers "$PORT_RUST" SUBSCRIBE PUBLISH)"
+
+# ---------------------------------------------------------------------------
 # moon#1078 -- CLIENT INFO reports tracking: `flags=t` (plus `B` for BCAST)
 # and `redir=` (0 with no redirect, -1 with tracking off). Moon hard-coded
 # `flags=N redir=-1`. Only those two fields are compared.
@@ -3292,9 +3403,9 @@ assert_tracking "tracking: DEL invalidates its key [control]" \
     "tp:d" "GET tp:d" DEL tp:d
 assert_tracking "tracking: MSET invalidates every key [control]" \
     "tp:m2" "GET tp:m2" MSET tp:m1 1 tp:m2 2
-both SET tp:rs v
+both SET {tp}:rs v
 assert_tracking "tracking: RENAME invalidates its source [control]" \
-    "tp:rs" "GET tp:rs" RENAME tp:rs tp:rd
+    "{tp}:rs" "GET {tp}:rs" RENAME {tp}:rs {tp}:rd
 assert_both "COMMAND COUNT arity" COMMAND COUNT extra
 assert_both "COMMAND INFO unknown name" COMMAND INFO definitely-not-a-command
 

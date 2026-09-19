@@ -30,6 +30,11 @@ jobs:
       - name: Install console deps
         working-directory: console
         run: pnpm install --frozen-lockfile
+      # ESLint 9 flat config lives in console/eslint.config.js. Without this
+      # step a missing or broken lint setup went unnoticed (moon#1082).
+      - name: Lint
+        working-directory: console
+        run: pnpm run lint
       - name: Unit tests
         working-directory: console
         run: pnpm test

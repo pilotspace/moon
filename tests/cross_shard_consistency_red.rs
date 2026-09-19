@@ -356,6 +356,8 @@ fn cdg6b_copy_cross_shard() {
         Resp::Simple("OK".into())
     );
     assert_eq!(c.cmd_s(&["PEXPIRE", src, "500000"]), Resp::Int(1));
+    let src_deadline = pexpiretime(&mut c, src);
+    assert!(src_deadline > 0, "src carries a deadline ({src_deadline})");
 
     // Plain cross-shard COPY: value lands on dst's shard, TTL preserved
     let r = c.cmd_s(&["COPY", src, dst]);
@@ -365,8 +367,18 @@ fn cdg6b_copy_cross_shard() {
         Resp::Bulk(Some(b"copy_value".to_vec())),
         "dst readable on its own shard"
     );
+    // moon#1095: the copy keeps the source's ABSOLUTE deadline, to the
+    // millisecond. Compared as PEXPIRETIME, which reads the stored deadline
+    // and no clock, so the assertion is exact and cannot flake. A PTTL bound
+    // (the old `<= 500000`) is measured against each shard's own cached
+    // clock, and those tick independently: it is what failed intermittently.
+    assert_eq!(
+        pexpiretime(&mut c, dst),
+        src_deadline,
+        "COPY across shards must keep the source's absolute expiry"
+    );
     match c.cmd_s(&["PTTL", dst]) {
-        Resp::Int(ttl) => assert!(ttl > 0 && ttl <= 500_000, "COPY preserves TTL (PTTL={ttl})"),
+        Resp::Int(ttl) => assert!(ttl > 0, "the copy is live and expiring (PTTL={ttl})"),
         other => panic!("PTTL reply {other:?}"),
     }
 
@@ -375,12 +387,13 @@ fn cdg6b_copy_cross_shard() {
     assert_eq!(c.cmd_s(&["COPY", src, dst2]), Resp::Int(0));
     assert_eq!(c.cmd_s(&["GET", dst2]), Resp::Bulk(Some(b"old".to_vec())));
 
-    // REPLACE overwrites
+    // REPLACE overwrites, and the destination takes the source's deadline
     assert_eq!(c.cmd_s(&["COPY", src, dst2, "REPLACE"]), Resp::Int(1));
     assert_eq!(
         c.cmd_s(&["GET", dst2]),
         Resp::Bulk(Some(b"copy_value".to_vec()))
     );
+    assert_eq!(pexpiretime(&mut c, dst2), src_deadline);
 
     // Missing source → Int(0)
     assert_eq!(c.cmd_s(&["COPY", "cdg6b:nope", dst2]), Resp::Int(0));
@@ -411,6 +424,82 @@ fn cdg6b_copy_cross_shard() {
         c.cmd_s(&["GET", dst2]),
         Resp::Bulk(Some(b"copy_value".to_vec()))
     );
+}
+
+/// `PEXPIRETIME key` as an integer (-1 no expiry, -2 no key).
+fn pexpiretime(c: &mut Conn, key: &str) -> i64 {
+    match c.cmd_s(&["PEXPIRETIME", key]) {
+        Resp::Int(at) => at,
+        other => panic!("PEXPIRETIME {key} reply {other:?}"),
+    }
+}
+
+/// moon#1095: across many cross-shard pairs, the copy's deadline is the
+/// source's, exactly — with REPLACE onto a destination that had its own TTL,
+/// and with no deadline at all (the copy must then be persistent, not keep the
+/// destination's old TTL).
+///
+/// Before the fix the TTL crossed as a RELATIVE duration: PTTL read on the
+/// source shard's clock, PEXPIRE re-anchored on the destination's, one hop
+/// apart. Any millisecond tick between the two, or any skew between the two
+/// shards' cached clocks, moved the deadline — so one trial is a coin flip and
+/// many trials make the failure certain. After the fix the comparison is exact.
+#[test]
+fn copy_cross_shard_keeps_the_absolute_expiry() {
+    const TRIALS: usize = 64;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (child, port) = common::spawn_listening(|port| spawn_moon(port, dir.path(), SHARDS));
+    let _guard = ServerGuard(child);
+    drop(wait_ready(port));
+    let mut c = Conn::open(port);
+
+    let mut moved = Vec::new();
+    for i in 0..TRIALS {
+        let src = format!("copy-abs:src{i}");
+        let owner = key_to_shard(src.as_bytes(), SHARDS as usize);
+        let dst = (0..)
+            .map(|j| format!("copy-abs:dst{i}-{j}"))
+            .find(|d| key_to_shard(d.as_bytes(), SHARDS as usize) != owner)
+            .expect("a destination on another shard");
+        assert_eq!(c.cmd_s(&["SET", &src, "v"]), Resp::Simple("OK".into()));
+        assert_eq!(c.cmd_s(&["PEXPIRE", &src, "500000"]), Resp::Int(1));
+        let want = pexpiretime(&mut c, &src);
+        // Every other trial overwrites a destination that carries its own TTL.
+        if i % 2 == 1 {
+            assert_eq!(
+                c.cmd_s(&["SET", &dst, "old", "PX", "900000"]),
+                Resp::Simple("OK".into())
+            );
+            assert_eq!(c.cmd_s(&["COPY", &src, &dst, "REPLACE"]), Resp::Int(1));
+        } else {
+            assert_eq!(c.cmd_s(&["COPY", &src, &dst]), Resp::Int(1));
+        }
+        let got = pexpiretime(&mut c, &dst);
+        if got != want {
+            moved.push(format!("{src} -> {dst}: deadline {want} became {got}"));
+        }
+    }
+    assert!(
+        moved.is_empty(),
+        "cross-shard COPY moved the expiry in {} of {TRIALS} trials:\n{moved:#?}",
+        moved.len()
+    );
+
+    // No deadline on the source: the copy is persistent, even over a
+    // destination that had one.
+    let src = "copy-abs:plain";
+    let owner = key_to_shard(src.as_bytes(), SHARDS as usize);
+    let dst = (0..)
+        .map(|j| format!("copy-abs:plaindst{j}"))
+        .find(|d| key_to_shard(d.as_bytes(), SHARDS as usize) != owner)
+        .expect("a destination on another shard");
+    assert_eq!(c.cmd_s(&["SET", src, "v"]), Resp::Simple("OK".into()));
+    assert_eq!(
+        c.cmd_s(&["SET", &dst, "old", "PX", "900000"]),
+        Resp::Simple("OK".into())
+    );
+    assert_eq!(c.cmd_s(&["COPY", src, &dst, "REPLACE"]), Resp::Int(1));
+    assert_eq!(c.cmd_s(&["PTTL", &dst]), Resp::Int(-1));
 }
 
 // ---------------------------------------------------------------------------

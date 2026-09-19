@@ -581,6 +581,32 @@ pub fn refresh_db_clock(db_index: usize, clock: &crate::storage::entry::CachedCl
     }
 }
 
+/// Exclusive access to a SECOND database of this shard, for a caller that is
+/// already inside a guard on another one it cannot hand back — a script's
+/// `redis.call('MOVE', ...)` / `redis.call('COPY', ..., 'DB', n)` (moon#1068).
+///
+/// A script runs inside `pending_flush::run_and_complete`'s guard on the
+/// selected database, which itself often runs inside a [`with_shard`] borrow,
+/// so neither [`with_shard_db`]'s slow path (a second `with_shard`) nor
+/// [`ShardDbSet::with_pair`] (the selected db again) can be used from there.
+///
+/// **Blocks** while a foreign reader or writer holds `db_index`, then runs `f`
+/// — contention is waited out, never refused. Deadlock-freedom, including
+/// taking an index below the one already held, is argued on
+/// [`ShardDbSet::write_second`].
+///
+/// Returns `None`, running nothing, only in the structural cases: this thread
+/// is not a registered shard thread (`cached_db_set()` absent — unit-test
+/// slices), `db_index` is out of range, or this thread already holds
+/// `db_index` (which would otherwise deadlock). The caller answers with an
+/// error rather than fall back to the one database it holds.
+#[inline]
+pub fn with_second_shard_db<R>(db_index: usize, f: impl FnOnce(&mut Database) -> R) -> Option<R> {
+    let set = cached_db_set()?;
+    let mut guard = set.write_second(db_index)?;
+    Some(f(&mut guard))
+}
+
 /// The foreign fast path: serve a read of `shard`'s database on THIS thread.
 ///
 /// Returns `None` — meaning the caller must fall through to the SPSC path it
