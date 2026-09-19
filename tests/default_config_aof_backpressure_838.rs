@@ -45,7 +45,9 @@
 //! user-data dir with its `moon.lock` and whatever the last run left there),
 //! `--admin-port` (the instrument: `moon_dispatch_path_total`, recorded on the
 //! dispatch path whether or not a listener exists, moon#774). Test C adds the
-//! one non-default flag its contract is about, `--aof-fsync-timeout-ms`.
+//! one non-default flag its contract is about, `--aof-fsync-timeout-ms`, and
+//! `--auto-aof-rewrite-percentage 0` so no rewrite clears the status it reads
+//! (moon#1094).
 //!
 //! ## Reddening proof (`origin/main` @ `6251429f`, GCE c3-standard-8 Linux,
 //! `MOON_BIN=moon-833-6251429f`, `--test-threads=1`)
@@ -527,8 +529,18 @@ fn default_server_completes_pipelined_set_bursts_across_a_writer_stall() {
 
 #[test]
 fn refused_write_past_the_fsync_timeout_is_applied_and_reported() {
+    // Auto-rewrite off: ~2.7M SETs cross the 64 MB `auto-aof-rewrite-min-size`,
+    // and since moon#1094 a rewrite that commits after the drops correctly
+    // clears `aof_last_append_status` again (its base holds the dropped
+    // writes), which would race the INFO read below. The refusal path under
+    // test is the same either way.
     let server = spawn_server(
-        &["--aof-fsync-timeout-ms", "100"],
+        &[
+            "--aof-fsync-timeout-ms",
+            "100",
+            "--auto-aof-rewrite-percentage",
+            "0",
+        ],
         &[("MOON_TEST_AOF_FSYNC_STALL_MS", "1500")],
     );
     let started = Instant::now();
@@ -587,7 +599,7 @@ fn refused_write_past_the_fsync_timeout_is_applied_and_reported() {
     let info = info_persistence(server.port);
     assert!(
         info.contains("aof_last_append_status:err"),
-        "INFO must latch the dropped append:\n{info}"
+        "INFO must report the dropped append:\n{info}"
     );
     assert!(
         server.lost_log_lines() >= 1,
