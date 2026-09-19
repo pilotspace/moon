@@ -169,6 +169,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An acknowledged `MOVE` or `COPY src dst DB n` survives `kill -9` and
+  restart** (moon#1046). Both commands need two databases, so the live paths
+  run them through a two-db intercept, but AOF/WAL replay handed the logged
+  record to the single-db dispatch. `MOVE` hit its "requires handler-level
+  dispatch" error and replay dropped the error, so the key came back in its
+  source db. `COPY ... DB n` copied within the source db instead: the
+  destination copy was lost and a stray key appeared in the source db. The
+  replay engine now intercepts both, the way it already did for `SWAPDB` and
+  `FLUSHALL`. It applies them with the same parsers and core helpers as the
+  live intercept, using the record's `SELECT` context as the source db. MOVE
+  onto an existing key, COPY without `REPLACE` onto an existing key, and a
+  missing source all stay no-ops. The TTL moves with the entry, and replaying
+  a record twice does nothing the second time. A record naming a db the
+  server no longer has is skipped with a warning. On both runtimes, at
+  `--shards 1` and `--shards 4`, with `--appendfsync always`, and with or
+  without a `BGREWRITEAOF` in the middle, the restarted keyspace now matches
+  the acknowledged one exactly (per-db `DBSIZE`, values and TTLs). Before the
+  fix, 117 of those checks failed without a rewrite and 61 with one.
+
 - **`runtime-tokio` with `--shards 1` now opens every AOF generation with a
   `MOON.COLDCUT`, so a `kill -9` no longer double-applies writes to spilled
   keys or drops acknowledged post-rewrite writes** (moon#914). This is the one
