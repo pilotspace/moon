@@ -406,6 +406,72 @@ fn survives_kill9(shards: usize) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A replica attached BEFORE the transactions must end with the master's
+/// keyspace: the records the EXEC path streams are applied by the replica's
+/// two-db apply path, so the master has to have written the same dbs.
+fn replica_agrees(master_shards: usize) {
+    let mdir = common::unique_test_dir(&format!("moon-1062-repl-m{master_shards}"));
+    let rdir = common::unique_test_dir("moon-1062-repl-r");
+    let (mut master, mport) = spawn(&mdir, master_shards);
+    let (mut replica, rport) = spawn(&rdir, 1);
+    let mut r = common::Conn::open(rport);
+    expect(
+        &mut r,
+        &["REPLICAOF", "127.0.0.1", &mport.to_string()],
+        "+OK\r\n",
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !r
+        .send(&["INFO", "replication"])
+        .contains("master_link_status:up")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica link never came up\n{}",
+            server_log(&rdir)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let mut m = common::Conn::open(mport);
+    let mut model: Model = Vec::new();
+    for i in 0..SETS {
+        model.extend(run_set(&mut m, i));
+    }
+    let live = diff_against(&mut m, &model);
+    assert!(live.is_empty(), "master differs from redis: {live:#?}");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut diverged = diff_against(&mut r, &model);
+    while !diverged.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        diverged = diff_against(&mut r, &model);
+    }
+    assert!(
+        diverged.is_empty(),
+        "master --shards {master_shards}: the replica's keyspace differs from the \
+         master's ({} problems):\n{diverged:#?}",
+        diverged.len()
+    );
+    drop((m, r));
+    master.kill_now();
+    replica.kill_now();
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+}
+
+#[test]
+#[ignore] // Replication suite: needs a monoio binary and a real link; run explicitly.
+fn multi_move_copy_db_replica_agrees_1_shard_master() {
+    replica_agrees(1);
+}
+
+#[test]
+#[ignore] // Replication suite: needs a monoio binary and a real link; run explicitly.
+fn multi_move_copy_db_replica_agrees_4_shard_master() {
+    replica_agrees(4);
+}
+
 #[test]
 fn multi_move_copy_db_matches_redis_1_shard() {
     live_matches_redis(1);

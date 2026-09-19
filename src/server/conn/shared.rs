@@ -6231,3 +6231,131 @@ mod queued_publish_channel_tests {
         assert!(queued_publish_channel_deny(&t, "c", b"PUBLISH", &[]).is_none());
     }
 }
+
+/// moon#1062 on the embedded (`handler_single`) executor: `MOVE` and
+/// `COPY ... DB n` queued inside MULTI must reach their destination db, and
+/// only a write that changed the keyspace may leave a record. The sharded
+/// executor is covered end to end by `tests/multi_move_copy_db_1062.rs`; this
+/// one is reachable only through the library entry point, so it is driven
+/// directly.
+#[cfg(all(test, feature = "runtime-tokio"))]
+mod embedded_txn_two_db_tests {
+    use super::*;
+
+    fn cmd(parts: &[&str]) -> Frame {
+        let items: Vec<Frame> = parts
+            .iter()
+            .map(|p| Frame::BulkString(Bytes::from(p.to_string())))
+            .collect();
+        Frame::Array(items.into())
+    }
+
+    fn set(db: &mut Database, key: &str, val: &str) {
+        db.set(
+            key.as_bytes(),
+            crate::storage::entry::Entry::new_string(Bytes::from(val.to_owned())),
+        );
+    }
+
+    fn value(dbs: &SharedDatabases, idx: usize, key: &str) -> Option<Vec<u8>> {
+        let mut db = dbs[idx].write();
+        let mut selected = idx;
+        let out = dispatch(
+            &mut db,
+            b"GET",
+            &[Frame::BulkString(Bytes::from(key.to_owned()))],
+            &mut selected,
+            16,
+        );
+        match out {
+            DispatchResult::Response(Frame::BulkString(b)) => Some(b.to_vec()),
+            _ => None,
+        }
+    }
+
+    fn err(text: &'static str) -> Frame {
+        Frame::Error(Bytes::from_static(text.as_bytes()))
+    }
+
+    #[test]
+    fn move_and_copy_db_inside_multi_write_the_named_db() {
+        let dbs: SharedDatabases = Arc::new(
+            (0..16)
+                .map(|_| parking_lot::RwLock::new(Database::new()))
+                .collect(),
+        );
+        {
+            let mut src = dbs[5].write();
+            set(&mut src, "m", "mv");
+            set(&mut src, "c", "cv");
+            set(&mut src, "coll", "src");
+        }
+        set(&mut dbs[1].write(), "coll", "dst");
+
+        // EXEC from db 5; destinations both below (1, 0) and above (9) it, so
+        // the pair is borrowed in both orders.
+        let queue = vec![
+            cmd(&["MOVE", "m", "1"]),
+            cmd(&["COPY", "c", "c2", "DB", "0"]),
+            cmd(&["COPY", "c", "c3", "db", "9", "REPLACE"]),
+            cmd(&["MOVE", "coll", "1"]),
+            cmd(&["MOVE", "c", "5"]),
+            cmd(&["COPY", "c", "c4", "DB", "16"]),
+            cmd(&["COPY", "c", "c5", "DB", "5"]),
+            cmd(&["GET", "c"]),
+        ];
+        let mut selected = 5usize;
+        let mut publishes = Vec::new();
+        let (reply, aof) =
+            execute_transaction(&dbs, &queue, &HashMap::new(), &mut selected, &mut publishes);
+
+        let Frame::Array(items) = reply else {
+            panic!("EXEC must answer an array, got {reply:?}");
+        };
+        assert_eq!(
+            items.to_vec(),
+            vec![
+                Frame::Integer(1),
+                Frame::Integer(1),
+                Frame::Integer(1),
+                Frame::Integer(0),
+                err("ERR source and destination objects are the same"),
+                err("ERR DB index is out of range"),
+                // A DB clause naming the source db is a plain same-db copy.
+                Frame::Integer(1),
+                Frame::BulkString(Bytes::from_static(b"cv")),
+            ]
+        );
+
+        assert_eq!(
+            value(&dbs, 5, "m"),
+            None,
+            "MOVE must take the key out of db 5"
+        );
+        assert_eq!(value(&dbs, 1, "m").as_deref(), Some(&b"mv"[..]));
+        assert_eq!(value(&dbs, 0, "c2").as_deref(), Some(&b"cv"[..]));
+        assert_eq!(value(&dbs, 9, "c3").as_deref(), Some(&b"cv"[..]));
+        assert_eq!(value(&dbs, 5, "c5").as_deref(), Some(&b"cv"[..]));
+        assert_eq!(
+            value(&dbs, 5, "c2"),
+            None,
+            "COPY ... DB 0 must not write db 5"
+        );
+        assert_eq!(
+            value(&dbs, 5, "c3"),
+            None,
+            "COPY ... DB 9 must not write db 5"
+        );
+        assert_eq!(value(&dbs, 5, "coll").as_deref(), Some(&b"src"[..]));
+        assert_eq!(value(&dbs, 1, "coll").as_deref(), Some(&b"dst"[..]));
+
+        // One record per write that changed the keyspace, verbatim, in body
+        // order: the three two-db commands that answered :1 and the same-db
+        // COPY. The no-op MOVE and the two errors leave none.
+        let want: Vec<Bytes> = [0usize, 1, 2, 6]
+            .iter()
+            .map(|&i| crate::persistence::aof::serialize_command_for_log(&queue[i]))
+            .collect();
+        assert_eq!(aof, want);
+    }
+}
