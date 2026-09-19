@@ -78,6 +78,12 @@ pub struct RecoveryResult {
     /// traffic, so restart-to-ready stays seconds-scale regardless of
     /// cold-plane size. See `storage::tiered::kv_spill::classify_orphan_heap_files`.
     pub pending_heap_orphans: Vec<std::path::PathBuf>,
+    /// moon#914 (b): Phase 4b replayed the legacy `appendonly.aof` and no
+    /// `MOON.COLDCUT` opened it, so every cold file was readable during that
+    /// replay. Such a file was written before the cut existed (a pre-#1017
+    /// tokio `--shards 1` AOF). The caller decides whether to rewrite it so
+    /// the next replay is gated; see `main.rs`.
+    pub aof_replayed_without_cold_cut: bool,
     // NOTE: the ColdIndex rebuilt in Phase 3 is attached directly to
     // `databases[0]` BEFORE Phase 4 replay (never returned here) so that
     // replayed deletes tombstone the cold plane — see the Phase 3 comment.
@@ -495,6 +501,9 @@ pub fn recover_shard_v3_pitr(
     // WAL: every KV write since the last snapshot was lost on restart.
     let mut kv_commands_replayed = 0usize;
     let mut kv_commands_skipped = 0usize;
+    // moon#1039: KV records whose header db is beyond the configured
+    // `--databases` count. Dropped rather than folded into db 0.
+    let mut kv_records_db_out_of_range = 0usize;
     let wal_dir = shard_dir.join("wal-v3");
     if wal_dir.exists() {
         let mut selected_db = 0usize;
@@ -505,6 +514,20 @@ pub fn recover_shard_v3_pitr(
                         // The AOF replays this write after this pass; applying
                         // it here would only be wiped (see the fn docs).
                         kv_commands_skipped += 1;
+                        return;
+                    }
+                    // moon#1039: every record starts in the db it was written
+                    // for. The payload is a bare command (no `SELECT`), so a
+                    // context carried over from the previous record would be
+                    // wrong; a record with no db context (db-agnostic, or
+                    // pre-#1039) replays into db 0 as it always has.
+                    selected_db = record.replay_db();
+                    if selected_db >= databases.len() {
+                        // A restart with fewer `--databases` than the writer
+                        // had: the record's db does not exist. Folding it into
+                        // db 0 (what `replay_command` would do) is the very
+                        // cross-db corruption this guards against.
+                        kv_records_db_out_of_range += 1;
                         return;
                     }
                     // Parse RESP frames from the serialized command payload.
@@ -748,6 +771,16 @@ pub fn recover_shard_v3_pitr(
                         shard_id, kv_commands_skipped
                     );
                 }
+                if kv_records_db_out_of_range > 0 {
+                    tracing::warn!(
+                        shard_id,
+                        records = kv_records_db_out_of_range,
+                        databases = databases.len(),
+                        "WAL v3 KV records for a logical db beyond the configured \
+                         --databases count were NOT replayed (restart with enough \
+                         databases to recover them)"
+                    );
+                }
             }
             Err(e) => {
                 // #452.2: a mid-chain tear must ABORT boot, not degrade to a
@@ -813,6 +846,9 @@ pub fn recover_shard_v3_pitr(
     // demoted right below and then wiped. A 2.2M-key instance logged
     // "no appendonly.aof found — replayed 2397677 records from legacy-mode
     // WAL v3" on every boot while holding a perfectly good manifest AOF.
+    // moon#914 (b): set when the AOF below replayed at least one record, so
+    // the reconcile can report whether a cut opened it.
+    let mut aof_replayed = false;
     if kv_commands_replayed == 0 && !kv_authority_elsewhere {
         if let Some(v2_dir) = v2_persistence_dir {
             let aof_path = v2_dir.join("appendonly.aof");
@@ -824,6 +860,7 @@ pub fn recover_shard_v3_pitr(
                 match crate::persistence::aof::replay_aof(databases, &aof_path, engine) {
                     Ok(n) => {
                         result.commands_replayed += n;
+                        aof_replayed = n > 0;
                         info!("Shard {}: AOF fallback replayed {} commands", shard_id, n);
                     }
                     Err(e) => {
@@ -908,6 +945,9 @@ pub fn recover_shard_v3_pitr(
         r.gated |= rest.gated;
         r.hot_demoted += rest.hot_demoted;
         r.cold_dropped += rest.cold_dropped;
+        // `gated` is true exactly when a `MOON.COLDCUT` installed its gate
+        // during this replay, so an AOF that replayed without one has no cut.
+        result.aof_replayed_without_cold_cut = aof_replayed && !r.gated;
         if r.hot_demoted > 0 || r.cold_dropped > 0 {
             info!(
                 "Shard {}: Phase 4b cold-plane reconcile (gated={}): {} hot shadow(s) demoted \
@@ -1087,6 +1127,82 @@ mod tests {
         let ctl = ShardControlFile::read(&ctl_path).unwrap();
         assert_eq!(ctl.shard_state, ShardState::Running);
         assert_eq!(ctl.wal_flush_lsn, 3);
+    }
+
+    /// moon#1039: a WAL holding both pre-#1039 records (no db context) and
+    /// db-carrying records replays each record into its own db. A db-less
+    /// record AFTER a db-3 record still lands in db 0 — the context is per
+    /// record, never carried over — and a record for a db beyond the
+    /// configured count is dropped, never folded into db 0.
+    #[test]
+    fn phase4_replays_mixed_format_wal_per_record_db_1039() {
+        use crate::persistence::wal_v3::record::write_wal_v3_record_in_db;
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let wal_dir = shard_dir.join("wal-v3");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let set = |k: &str, v: &str| {
+            format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\n{k}\r\n${}\r\n{v}\r\n",
+                k.len(),
+                v.len()
+            )
+            .into_bytes()
+        };
+        let mut data = make_v3_header(0);
+        // pre-#1039 record: no db context
+        write_wal_v3_record(&mut data, 1, WalRecordType::Command, &set("old_a", "0"));
+        write_wal_v3_record_in_db(
+            &mut data,
+            2,
+            WalRecordType::Command,
+            Some(3),
+            &set("b", "3"),
+        );
+        // pre-#1039 record after a db-3 record: must NOT inherit db 3
+        write_wal_v3_record(&mut data, 3, WalRecordType::Command, &set("old_c", "0"));
+        write_wal_v3_record_in_db(
+            &mut data,
+            4,
+            WalRecordType::Command,
+            Some(0),
+            &set("d", "0"),
+        );
+        // db 20 does not exist with 16 databases
+        write_wal_v3_record_in_db(
+            &mut data,
+            5,
+            WalRecordType::Command,
+            Some(20),
+            &set("e", "x"),
+        );
+        std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
+
+        let mut databases: Vec<Database> = (0..16).map(|_| Database::new()).collect();
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
+        assert_eq!(result.last_lsn, 5);
+
+        let has = |dbs: &mut [Database], db: usize, key: &'static [u8]| dbs[db].exists(key);
+        assert!(has(&mut databases, 0, b"old_a"), "pre-#1039 record -> db 0");
+        assert!(has(&mut databases, 3, b"b"), "db-3 record -> db 3");
+        assert!(
+            !has(&mut databases, 0, b"b"),
+            "db-3 record leaked into db 0"
+        );
+        assert!(
+            has(&mut databases, 0, b"old_c"),
+            "a db-less record must not inherit the previous record's db"
+        );
+        assert!(!has(&mut databases, 3, b"old_c"));
+        assert!(has(&mut databases, 0, b"d"), "explicit db-0 record -> db 0");
+        for db in 0..16 {
+            assert!(
+                !has(&mut databases, db, b"e"),
+                "a record for a nonexistent db must be dropped, found in db {db}"
+            );
+        }
     }
 
     /// P3b — PITR end-to-end: write 10 WAL commands, recover with
@@ -2004,6 +2120,45 @@ mod tests {
                 "db {i}: the replay gate outlived recovery"
             );
         }
+    }
+
+    /// moon#914 (b): recovery reports an AOF that replayed without a
+    /// `MOON.COLDCUT` (a pre-#1017 file) and does not report one that opened
+    /// with its cut, an empty one, or a boot with no AOF at all. `main.rs`
+    /// rewrites the AOF once on that signal.
+    #[test]
+    fn phase_4b_reports_an_aof_replayed_without_its_cold_cut() {
+        fn recover(aof: Option<&[u8]>) -> RecoveryResult {
+            let tmp = tempfile::tempdir().unwrap();
+            let shard_dir = tmp.path().join("shard-0");
+            std::fs::create_dir_all(&shard_dir).unwrap();
+            let v2_dir = tmp.path().join("legacy");
+            std::fs::create_dir_all(&v2_dir).unwrap();
+            if let Some(bytes) = aof {
+                std::fs::write(v2_dir.join("appendonly.aof"), bytes).unwrap();
+            }
+            let mut databases: Vec<Database> = (0..2).map(|_| Database::new()).collect();
+            recover_shard_v3_with_fallback(
+                &mut databases,
+                0,
+                &shard_dir,
+                &crate::persistence::replay::DispatchReplayEngine::new(),
+                Some(&v2_dir),
+                false,
+            )
+            .unwrap()
+        }
+        let set = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
+        let mut headed = crate::persistence::cold_records::serialize_cold_cut(4).to_vec();
+        headed.extend_from_slice(set);
+
+        assert!(
+            recover(Some(set)).aof_replayed_without_cold_cut,
+            "a legacy AOF with records and no head must be reported"
+        );
+        assert!(!recover(Some(&headed)).aof_replayed_without_cold_cut);
+        assert!(!recover(Some(b"")).aof_replayed_without_cold_cut);
+        assert!(!recover(None).aof_replayed_without_cold_cut);
     }
 
     #[test]

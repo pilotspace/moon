@@ -763,8 +763,11 @@ impl ColdMarkerSink<'_> {
         }
         let data = crate::persistence::cold_records::serialize_spilled(file_id, keys);
         if wal_leg && let Some(w) = self.wal_writer.as_deref_mut() {
-            w.append(
+            // moon#1039: the marker is db-scoped (replay applies it to the
+            // selected db's cold index) — carry the db in the header.
+            w.append_in_db(
                 crate::persistence::wal_v3::record::WalRecordType::Command,
+                db,
                 &data,
             );
         }

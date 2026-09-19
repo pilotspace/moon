@@ -11,13 +11,29 @@
 //! 4       8     lsn (u64 LE) — monotonic log sequence number
 //! 12      1     record_type (u8)
 //! 13      1     flags (u8)
-//! 14      2     padding (zeroes)
+//! 14      2     db_index (u16 LE) when FLAG_DB_INDEX is set, else zeroes
 //! 16      N     payload (raw or LZ4-compressed)
 //! 16+N    4     crc32c (u32 LE) — over bytes [4..16+N]
 //! ```
+//!
+//! **db context (moon#1039).** A KV `Command` record is a bare RESP command
+//! with no `SELECT`, so the logical database it executed in travels in the
+//! header: [`FLAG_DB_INDEX`] set, db in bytes 14..16. The field lives in what
+//! was always-zero padding, so the change is compatible in both directions:
+//! - a new binary reads an old record (flag clear) as "no db context", which
+//!   replay treats as db 0 — exactly what the old binary did;
+//! - an old binary reads a new record without error (it never inspected the
+//!   padding or unknown flag bits, and the CRC covers the bytes as written);
+//!   it just keeps placing the record in db 0, as before.
+//!
+//! The payload is untouched, so CDC consumers still see the bare command.
 
 /// LZ4 compression flag (bit 0).
 pub const FLAG_LZ4_COMPRESSED: u8 = 0x01;
+
+/// db-context flag (bit 1, moon#1039): header bytes 14..16 carry the
+/// record's logical database index (u16 LE). See the module docs.
+pub const FLAG_DB_INDEX: u8 = 0x02;
 
 /// Minimum payload size for FPI LZ4 compression.
 pub const FPI_COMPRESS_THRESHOLD: usize = 256;
@@ -147,8 +163,22 @@ pub struct WalRecord {
     pub record_type: WalRecordType,
     /// Record flags (compression, etc.).
     pub flags: u8,
+    /// Logical database the record executed in, when the writer recorded
+    /// one ([`FLAG_DB_INDEX`]). `None` for db-agnostic records and for every
+    /// record written before moon#1039.
+    pub db_index: Option<u16>,
     /// Decompressed payload bytes.
     pub payload: Vec<u8>,
+}
+
+impl WalRecord {
+    /// The database a KV `Command` record replays into: the recorded db, or
+    /// db 0 for a record with no db context (db-agnostic, or written before
+    /// moon#1039 — where db 0 is what every earlier build replayed it into).
+    #[inline]
+    pub fn replay_db(&self) -> usize {
+        self.db_index.map_or(0, usize::from)
+    }
 }
 
 /// Serialize a WAL v3 record into `buf`.
@@ -161,6 +191,18 @@ pub fn write_wal_v3_record(
     buf: &mut Vec<u8>,
     lsn: u64,
     record_type: WalRecordType,
+    payload: &[u8],
+) -> usize {
+    write_wal_v3_record_in_db(buf, lsn, record_type, None, payload)
+}
+
+/// [`write_wal_v3_record`] with the record's logical database in the header
+/// (moon#1039). `db_index: None` writes the pre-#1039 byte layout exactly.
+pub fn write_wal_v3_record_in_db(
+    buf: &mut Vec<u8>,
+    lsn: u64,
+    record_type: WalRecordType,
+    db_index: Option<u16>,
     payload: &[u8],
 ) -> usize {
     let start = buf.len();
@@ -179,6 +221,10 @@ pub fn write_wal_v3_record(
     } else {
         (std::borrow::Cow::Borrowed(payload), 0u8)
     };
+    let (flags, db_bytes) = match db_index {
+        Some(db) => (flags | FLAG_DB_INDEX, db.to_le_bytes()),
+        None => (flags, [0u8; 2]),
+    };
 
     // record_len = 4 (len field) + 12 (header) + payload + 4 (crc)
     let record_len = (MIN_RECORD_SIZE + actual_payload.len()) as u32;
@@ -186,12 +232,12 @@ pub fn write_wal_v3_record(
     // Write record_len
     buf.extend_from_slice(&record_len.to_le_bytes());
 
-    // Write header: lsn(8) + type(1) + flags(1) + pad(2) = 12 bytes
+    // Write header: lsn(8) + type(1) + flags(1) + db_index(2) = 12 bytes
     let crc_start = buf.len();
     buf.extend_from_slice(&lsn.to_le_bytes());
     buf.push(record_type as u8);
     buf.push(flags);
-    buf.extend_from_slice(&[0u8; 2]); // padding
+    buf.extend_from_slice(&db_bytes); // zeroes unless FLAG_DB_INDEX
 
     // Write payload
     buf.extend_from_slice(&actual_payload);
@@ -234,7 +280,8 @@ pub fn read_wal_v3_record(data: &[u8]) -> Option<WalRecord> {
     ]);
     let record_type = WalRecordType::from_u8(data[12])?;
     let flags = data[13];
-    // data[14..16] = padding
+    // data[14..16] = db_index when FLAG_DB_INDEX is set, else zero padding.
+    let db_index = (flags & FLAG_DB_INDEX != 0).then(|| u16::from_le_bytes([data[14], data[15]]));
 
     // Extract payload
     let payload_raw = &data[16..record_len - 4];
@@ -252,6 +299,7 @@ pub fn read_wal_v3_record(data: &[u8]) -> Option<WalRecord> {
         lsn,
         record_type,
         flags,
+        db_index,
         payload,
     })
 }
@@ -452,6 +500,74 @@ pub fn encode_xact_commit_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// moon#1039: the db rides in the header and round-trips; the payload is
+    /// untouched (CDC sees the bare command).
+    #[test]
+    fn db_index_round_trips_in_the_header_1039() {
+        let payload = b"*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n";
+        for db in [0u16, 3, 15, 255, u16::MAX] {
+            let mut buf = Vec::new();
+            write_wal_v3_record_in_db(&mut buf, 7, WalRecordType::Command, Some(db), payload);
+            let record = read_wal_v3_record(&buf).expect("should parse");
+            assert_eq!(record.db_index, Some(db));
+            assert_eq!(record.replay_db(), usize::from(db));
+            assert_eq!(record.flags & FLAG_DB_INDEX, FLAG_DB_INDEX);
+            assert_eq!(record.payload, payload);
+        }
+    }
+
+    /// moon#1039 compatibility, both directions.
+    ///
+    /// - Old -> new: a record with no db context is byte-identical to what
+    ///   every pre-#1039 build wrote, and reads back as "no context" (db 0).
+    /// - New -> old: the only bytes a db-carrying record changes are the
+    ///   flags bit, the former padding, and the CRC over them. A pre-#1039
+    ///   reader never looked at either field, so it parses the record and
+    ///   just replays it into db 0 as it always did.
+    #[test]
+    fn db_less_record_is_the_pre_1039_layout_1039() {
+        let payload = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
+        let mut old = Vec::new();
+        write_wal_v3_record(&mut old, 9, WalRecordType::Command, payload);
+        let mut none = Vec::new();
+        write_wal_v3_record_in_db(&mut none, 9, WalRecordType::Command, None, payload);
+        assert_eq!(old, none, "db_index None must write the pre-#1039 bytes");
+        assert_eq!(
+            &old[13..16],
+            &[0, 0, 0],
+            "flags + padding were zero pre-#1039"
+        );
+        let record = read_wal_v3_record(&old).expect("should parse");
+        assert_eq!(record.db_index, None);
+        assert_eq!(record.replay_db(), 0);
+
+        let mut new = Vec::new();
+        write_wal_v3_record_in_db(&mut new, 9, WalRecordType::Command, Some(3), payload);
+        assert_eq!(old.len(), new.len(), "no size change");
+        let n = old.len();
+        let differing: Vec<usize> = (0..n).filter(|&i| old[i] != new[i]).collect();
+        assert!(
+            differing
+                .iter()
+                .all(|&i| (13..16).contains(&i) || i >= n - 4),
+            "only flags/db/crc bytes may differ, got {differing:?}"
+        );
+        assert_eq!(&new[4..13], &old[4..13], "lsn + type unchanged");
+        assert_eq!(&new[16..n - 4], &old[16..n - 4], "payload unchanged");
+    }
+
+    /// The db flag must not be mistaken for compression and vice versa.
+    #[test]
+    fn db_flag_is_independent_of_lz4_flag_1039() {
+        let payload = vec![0xABu8; FPI_COMPRESS_THRESHOLD * 4];
+        let mut buf = Vec::new();
+        write_wal_v3_record_in_db(&mut buf, 1, WalRecordType::FullPageImage, Some(2), &payload);
+        let record = read_wal_v3_record(&buf).expect("should parse");
+        assert_eq!(record.flags & FLAG_LZ4_COMPRESSED, FLAG_LZ4_COMPRESSED);
+        assert_eq!(record.db_index, Some(2));
+        assert_eq!(record.payload, payload);
+    }
 
     #[test]
     fn test_roundtrip_command_record() {
