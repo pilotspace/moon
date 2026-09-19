@@ -809,6 +809,14 @@ pub(super) async fn try_handle_multi_exec(
                 &watched,
                 txn_scripting.as_ref(),
             );
+            // #455: read in the executor's no-await stretch — see the monoio
+            // EXEC path.
+            let fold_stamp = ctx
+                .aof_pool
+                .as_ref()
+                .map_or(crate::persistence::aof::FoldEpoch::INITIAL, |pool| {
+                    pool.fold_stamp(ctx.shard_id)
+                });
             // moon#1084: log the body in the SAME synchronous stretch as the
             // executor that just applied it, and only then await anything —
             // the same order as the monoio handler (see its comment). The
@@ -838,9 +846,10 @@ pub(super) async fn try_handle_multi_exec(
             // All keys are local here (Phase A rejected foreign-owned bodies),
             // so ctx.shard_id is the correct AOF target. The enqueue does not
             // suspend unless the writer channel is full; only the barrier waits.
-            let persisted = crate::server::conn::shared::persist_txn_aof(ctx, aof_entries, false)
-                .await
-                .is_ok();
+            let persisted =
+                crate::server::conn::shared::persist_txn_aof(ctx, aof_entries, false, fold_stamp)
+                    .await
+                    .is_ok();
             // moon#606: raise the wakes the body recorded. A producer queued
             // inside MULTI reaches none of the live write path's hooks, so
             // without this a `MULTI ; LPUSH k v ; EXEC` left a client blocked
