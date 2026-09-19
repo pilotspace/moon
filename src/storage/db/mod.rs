@@ -1085,6 +1085,24 @@ impl Database {
         self.cached_now_ms = current_time_ms();
     }
 
+    /// Advance the cached clock to the wall clock — never backwards.
+    ///
+    /// For the active-expiry tick (moon#1013). The hash-field sweep reaps
+    /// against `cached_now_ms` (so it can never reap a field a read would
+    /// still see), but only commands refresh that clock — so on an IDLE
+    /// database a due field sat unreaped, and its CLIENT TRACKING
+    /// invalidation unsent, until unrelated traffic touched the db. Moving
+    /// the clock forward before the sweep keeps the reap and the read filter
+    /// on one clock; refusing to move it backwards keeps a clock a test (or
+    /// a newer command) already advanced.
+    pub fn advance_now_to_wall_clock(&mut self) {
+        let now_ms = current_time_ms();
+        if now_ms > self.cached_now_ms {
+            self.cached_now = current_secs();
+            self.cached_now_ms = now_ms;
+        }
+    }
+
     /// Return the base timestamp for TTL delta computation.
     #[inline]
     pub fn base_timestamp(&self) -> u32 {
