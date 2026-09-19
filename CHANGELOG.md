@@ -199,6 +199,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A COLD vector segment leaves `unloaded` with the search that reloads it,
+  and a delete that lands while the reload is waiting to install is no longer
+  lost** (moon#1070). Since the off-loop reload pool (prod-hardening #18) a
+  search only SUBMITTED the reload and answered from it; the reloaded segment
+  sat in the pool until some later search installed it, while the COLD stub
+  stayed the index's segment and the only place a DEL could be recorded. The
+  install then threw the stub away without replaying it: a document deleted
+  after the first search came back, as `vec:<id>`, on the next one (reproduced
+  on a real server). The install now replays the stub's tombstones, and the
+  yielding FT.SEARCH handlers install finished reloads as soon as the query
+  that awaited them is back on the shard, so `FT.INFO unloaded_segments` drops
+  to 0 with that search. Four `tests/vector_idle_unload.rs` tests that were
+  `#[ignore]`d -- and silently red on main -- now run in CI; only the
+  `ps`-based RSS measurement stays ignored.
+
 - **Three wire-parity gaps found probing redis-server 8.6.1 raw sockets**
   (moon#1060, moon#1076, moon#1077).
   - `ZRANGEBYSCORE`, `ZRANGE ... BYSCORE`/`BYLEX` and `ZREVRANGEBYSCORE`
