@@ -288,10 +288,70 @@ impl Database {
                 if let Some(ref mut ci) = self.cold_index {
                     ci.remove(key);
                 }
+                // moon#1013: the lazy cold-tier expiry — same signal as the
+                // hot drain and the periodic `sweep_expired`.
+                crate::tracking::invalidation::invalidate_server_removed(key);
                 false
             }
             ColdReadOutcome::Miss => false,
+            // moon#875: indexed, but the bytes could not be produced. NOT a
+            // miss: the index entry is kept (a transient I/O error must not
+            // permanently drop the key; the next read retries) and nothing
+            // is fabricated in hot RAM. `read_cold_entry` has already
+            // counted and logged the fault with its location. The caller
+            // sees "not hot" and the command answers as it would for an
+            // absent key — see `ColdReadOutcome::Unreadable` for why the
+            // wire reply is not yet an error.
+            ColdReadOutcome::Unreadable(fault) => {
+                self.note_cold_fault(fault.reason);
+                false
+            }
         }
+    }
+
+    /// Raise the moon#875 cold-fault flag — see the field docs.
+    #[inline]
+    pub(crate) fn note_cold_fault(
+        &self,
+        reason: crate::storage::tiered::cold_read::ColdReadFaultReason,
+    ) {
+        self.cold_fault
+            .store(reason as u8 + 1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Is a cold fault pending for the command currently executing?
+    #[inline]
+    #[must_use]
+    pub fn cold_fault_pending(&self) -> bool {
+        self.cold_fault.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+
+    /// Consume the pending cold fault, if any. One relaxed load when none is
+    /// pending — the only cost every command pays.
+    #[inline]
+    pub fn take_cold_fault(
+        &self,
+    ) -> Option<crate::storage::tiered::cold_read::ColdReadFaultReason> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.cold_fault.load(Relaxed) == 0 {
+            return None;
+        }
+        let code = self.cold_fault.swap(0, Relaxed);
+        crate::storage::tiered::cold_read::ColdReadFaultReason::from_code(code.wrapping_sub(1))
+    }
+
+    /// The reply for a key that is indexed in the cold tier but whose bytes
+    /// could not be read. An ERROR, never nil: "key not found" is a
+    /// legitimate answer a client acts on, and nothing above this layer
+    /// could otherwise tell a lost cold entry from a key never written.
+    /// `IOERR` is Redis's own prefix for a disk read that failed. Static
+    /// bytes — no allocation on the reply path.
+    #[inline]
+    #[must_use]
+    pub fn cold_fault_error() -> Frame {
+        Frame::Error(Bytes::from_static(
+            b"IOERR cold tier: key is indexed but its data could not be read (see server log)",
+        ))
     }
 
     /// Cheap (no disk I/O, no promotion) check for whether `key` is present

@@ -654,6 +654,33 @@ fn aof_bytes(dir: &std::path::Path) -> u64 {
     total
 }
 
+/// Wait until some AOF file (either layout) contains `needle`, i.e. the write
+/// that produced it has been flushed. Panics after 10s.
+fn aof_wait_contains(dir: &std::path::Path, needle: &[u8]) {
+    let files = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+        let mut out = vec![dir.join("appendonly.aof")];
+        if let Ok(rd) = std::fs::read_dir(dir.join("appendonlydir")) {
+            out.extend(rd.filter_map(|e| e.ok()).map(|e| e.path()));
+        }
+        out
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let found = files(dir)
+            .iter()
+            .any(|p| std::fs::read(p).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle)));
+        if found {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{:?} never reached the AOF within 10s",
+            String::from_utf8_lossy(needle)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Wait until the AOF length is non-zero (if `expect_nonzero`) and stable
 /// across two consecutive samples. AOF flush cadence is runtime-dependent
 /// (monoio flushes on a 1ms tick; tokio batches on the everysec schedule),
@@ -746,6 +773,12 @@ fn cdg3_read_arms_are_pure_reads() {
     c.cmd_s(&["XADD", "live:s", "1-1", "f", "v"]);
     c.cmd_s(&["ZADD", "live:z", "1", "a"]);
     c.cmd_s(&["GEOADD", "live:g", "13.361389", "38.115556", "Palermo"]);
+    // Wait for the LAST fixture to reach the file before taking the baseline.
+    // "Non-zero and stable" is not enough: since moon#914 a fresh tokio AOF
+    // opens with its `MOON.COLDCUT` head at boot, so the file is non-zero
+    // before a single fixture is flushed, and an everysec flush landing inside
+    // the read loop below would read as "a read appended to the AOF".
+    aof_wait_contains(dir.path(), b"live:g");
     let before = aof_quiesce(dir.path(), true);
     assert!(before > 0, "fixtures must have hit the AOF");
     for _ in 0..200 {

@@ -746,10 +746,14 @@ gives 100.0%.
 > `total_dispatch_cross_read_fast` stays at 0. The server logs a warning at startup when
 > the flag is enabled on that runtime.
 
-The default is `off`. Turn it on deliberately, and only for the workload shape it was
-measured on.
+The default is `auto`. `off` is the rollback: it restores the SPSC hop for every
+cross-shard read without a rebuild.
 
-#### What it was measured to do
+#### The measurement that first held the default at `off`
+
+This is the moon#768 run that kept the flag `off` until moon#777. It is kept because the
+p=16 variance it shows is real; its low in-place rates are the half-populated-keyspace
+artefact explained above, not a property of the path.
 
 Two-box GCE ARM (`t2a-standard-8` server, dedicated load generator), the same binary with
 the flag off vs on, ABBA-ordered, n=10 reps per cell, server-side CPU/op from
@@ -765,11 +769,12 @@ The `--shards 1` row is the negative control, not a result: every read there is 
 local, so the path fires 0.0% of the time and must show nothing. It does. That is what
 makes the `--shards 8` row credible.
 
-**The default is `off` because of the p=16 row, not because of doubt about p=1.** At depth
-16 the effect is not measurable at n=10, and the enabled leg's run-to-run variance roughly
-doubles (sd 1.24 vs 0.55 µs/op) instead of shifting — a contention signature rather than a
-uniform regression. Until that is understood, enable it for shallow-pipeline, multi-shard
-read workloads and measure your own before trusting it deeper.
+The p=16 row is what held the default at `off`, not any doubt about p=1. At depth 16 the
+effect is not measurable at n=10, and the enabled leg's run-to-run variance roughly doubles
+(sd 1.24 vs 0.55 µs/op) instead of shifting, which looks like contention rather than a
+uniform regression. The populated-keyspace measurement above explains the variance as a
+wandering hit rate. On a deep-pipeline workload, still compare against `off` on your own
+data.
 
 #### What the fast path declines
 
@@ -808,8 +813,9 @@ The `--cross-shard-fast-path` flag is a Phase 0 observability and safety valve f
 5-phase shared-nothing migration documented in
 `.planning/shared-nothing-migration/PLAN.md`.
 
-In Phase 3, the fast path will be deleted and all cross-shard reads will route through
-SPSC. In Phase 4, `RwLock<Database>` is replaced with per-thread owned state (`ShardSlice`
+That plan (last revised May 2026) predates moon#777, which made the fast path the default,
+and it has not been revised since. Its Phase 3 step, deleting the fast path and routing all
+cross-shard reads through SPSC, is a proposal, not a scheduled change. In Phase 4, `RwLock<Database>` is replaced with per-thread owned state (`ShardSlice`
 + `thread_local!`), eliminating lock contention entirely. The `--cross-shard-fast-path=off`
 flag previews that future behavior and can be used to validate SPSC-only routing in
 staging today.

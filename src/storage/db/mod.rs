@@ -11,7 +11,7 @@ mod kv_ops;
 #[cfg(test)]
 mod probe_budget;
 
-pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile};
+pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile, close_replay_generation};
 pub(crate) use incr::IncrOutcome;
 
 pub use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef, StreamRef};
@@ -403,12 +403,27 @@ pub struct Database {
     pub db_index: usize,
     /// Cold index for disk-offloaded KV entries (None when disk-offload disabled).
     pub cold_index: Option<crate::storage::tiered::cold_index::ColdIndex>,
+    /// moon#875: raised by a cold read-through that found the key INDEXED
+    /// but its bytes unreadable, consumed by whoever answers the client —
+    /// a fabricating accessor (refuses before mutating) or the dispatch
+    /// boundary (`command::cold_fault_gate`), which turns the reply into
+    /// `-IOERR`. Every raise happens inside a command's own execution and
+    /// every command's dispatch takes it, so it never outlives the command
+    /// that raised it. `0` = none, else `ColdReadFaultReason as u8 + 1`.
+    /// Atomic (not `Cell`) because a `Database` lives in an `RwLock` slot
+    /// and must stay `Sync`; the common path is one relaxed load.
+    pub(crate) cold_fault: std::sync::atomic::AtomicU8,
     /// Shard directory for cold reads (None when disk-offload disabled).
     pub cold_shard_dir: Option<std::path::PathBuf>,
     /// moon#902: installed by a replayed `MOON.COLDCUT` for the length of an
     /// AOF-authority replay; decides which cold files the value-giving read
     /// paths may see. `None` outside replay and for legacy generations.
     replay_cold_gate: Option<ReplayColdGate>,
+    /// moon#965: a `MOON.SPILLED` marker was replayed in this generation, so
+    /// the log is #902-era and `finish_replay_cold_reconcile` must use the
+    /// hot-wins resolution even without a `MOON.COLDCUT` head. Reset by
+    /// `finish_replay_cold_reconcile` when it closes the generation.
+    replay_saw_cold_marker: bool,
     /// Hot-key detection sketch, fed by sampled dispatch observations.
     hot_keys: crate::storage::hotkey::HotKeySketch,
     /// Keys whose async spill is IN FLIGHT: enqueued to the spill thread,
@@ -585,8 +600,10 @@ impl Database {
             pending_expired: Vec::new(),
             db_index: 0,
             cold_index: None,
+            cold_fault: std::sync::atomic::AtomicU8::new(0),
             cold_shard_dir: None,
             replay_cold_gate: None,
+            replay_saw_cold_marker: false,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
             spill_inflight_bytes: 0,
@@ -618,8 +635,10 @@ impl Database {
             pending_expired: Vec::new(),
             db_index: 0,
             cold_index: None,
+            cold_fault: std::sync::atomic::AtomicU8::new(0),
             cold_shard_dir: None,
             replay_cold_gate: None,
+            replay_saw_cold_marker: false,
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
             spill_inflight_bytes: 0,
@@ -1078,6 +1097,24 @@ impl Database {
         self.cached_now_ms = current_time_ms();
     }
 
+    /// Advance the cached clock to the wall clock — never backwards.
+    ///
+    /// For the active-expiry tick (moon#1013). The hash-field sweep reaps
+    /// against `cached_now_ms` (so it can never reap a field a read would
+    /// still see), but only commands refresh that clock — so on an IDLE
+    /// database a due field sat unreaped, and its CLIENT TRACKING
+    /// invalidation unsent, until unrelated traffic touched the db. Moving
+    /// the clock forward before the sweep keeps the reap and the read filter
+    /// on one clock; refusing to move it backwards keeps a clock a test (or
+    /// a newer command) already advanced.
+    pub fn advance_now_to_wall_clock(&mut self) {
+        let now_ms = current_time_ms();
+        if now_ms > self.cached_now_ms {
+            self.cached_now = current_secs();
+            self.cached_now_ms = now_ms;
+        }
+    }
+
     /// Return the base timestamp for TTL delta computation.
     #[inline]
     pub fn base_timestamp(&self) -> u32 {
@@ -1111,6 +1148,31 @@ impl Database {
     /// to chase memory that cannot drop yet.
     pub fn estimated_memory(&self) -> usize {
         self.used_memory.saturating_add(self.spill_inflight_bytes)
+    }
+
+    /// The figure `maxmemory` holds this database to: [`Self::estimated_memory`]
+    /// plus the RAM its [`ColdIndex`](crate::storage::tiered::cold_index::ColdIndex)
+    /// occupies for the keys it has spilled.
+    ///
+    /// THE single definition every eviction decision compares against a
+    /// budget. The 100 ms pressure cascade has charged the cold index since
+    /// K4 (the tick publishes this sum as the shard's memory), while the
+    /// per-write gates — `evict_to_budget`'s default total and the inline
+    /// pre-gate `inline_write_can_skip_eviction` — compared the budget
+    /// against `estimated_memory()` alone. moon#1036: one shard, two
+    /// effective caps, `ColdIndex::resident_bytes()` apart. Every tick the
+    /// cascade spilled a cold-index's worth of hot keys that the per-write
+    /// gate then let writers refill without evicting, so the shard sawtoothed
+    /// above the cascade's cap between ticks, and a burst of writes inlined
+    /// after every tick even though the shard was over what the cascade
+    /// enforces.
+    ///
+    /// O(1): one `Option` test and one field read beside the two that
+    /// `estimated_memory` already does, so it stays a per-write read.
+    #[inline]
+    pub fn budgeted_memory(&self) -> usize {
+        self.estimated_memory()
+            .saturating_add(self.cold_index.as_ref().map_or(0, |ci| ci.resident_bytes()))
     }
 
     /// Resident bytes attributed to this database (alias for `estimated_memory`,

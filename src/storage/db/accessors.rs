@@ -283,6 +283,12 @@ impl Database {
         // `promote_cold_if_present`'s own return value instead.
         let state = self.hot_state(key, now_ms);
         if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            // moon#875: the cold copy is indexed but unreadable — refuse
+            // BEFORE fabricating, or the fresh container shadows the bytes
+            // and the orphan sweep reclaims them for good.
+            if self.take_cold_fault().is_some() {
+                return Err(Self::cold_fault_error());
+            }
             self.insert_fresh(key, K::new_entry());
         }
         let Some(entry) = self.data.get_mut(key) else {
@@ -533,6 +539,12 @@ impl Database {
         // re-issuing `contains_key`.
         let state = self.hot_state(key, now_ms);
         if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            // moon#875: the cold copy is indexed but unreadable — refuse
+            // BEFORE fabricating, or the fresh container shadows the bytes
+            // and the orphan sweep reclaims them for good.
+            if self.take_cold_fault().is_some() {
+                return Err(Self::cold_fault_error());
+            }
             self.insert_fresh(key, Entry::new_set_intset());
         }
         let entry = self.data.get_mut(key).unwrap();
@@ -609,6 +621,12 @@ impl Database {
         // re-issuing `contains_key`.
         let state = self.hot_state(key, now_ms);
         if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            // moon#875: the cold copy is indexed but unreadable — refuse
+            // BEFORE fabricating, or the fresh container shadows the bytes
+            // and the orphan sweep reclaims them for good.
+            if self.take_cold_fault().is_some() {
+                return Err(Self::cold_fault_error());
+            }
             self.insert_fresh(key, Entry::new_hash_listpack());
         }
         let entry = self.data.get_mut(key).unwrap();
@@ -689,6 +707,12 @@ impl Database {
         // re-issuing `contains_key`.
         let state = self.hot_state(key, now_ms);
         if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            // moon#875: the cold copy is indexed but unreadable — refuse
+            // BEFORE fabricating, or the fresh container shadows the bytes
+            // and the orphan sweep reclaims them for good.
+            if self.take_cold_fault().is_some() {
+                return Err(Self::cold_fault_error());
+            }
             self.insert_fresh(key, Entry::new_list_listpack());
         }
         let entry = self.data.get_mut(key).unwrap();
@@ -810,6 +834,12 @@ impl Database {
         // `SetHandle::Full` arm below rather than being fabricated over.
         let state = self.hot_state(key, now_ms);
         if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            // moon#875: the cold copy is indexed but unreadable — refuse
+            // BEFORE fabricating, or the fresh container shadows the bytes
+            // and the orphan sweep reclaims them for good.
+            if self.take_cold_fault().is_some() {
+                return Err(Self::cold_fault_error());
+            }
             self.insert_fresh(key, Entry::new_set_listpack());
         }
         // moon#942: the intset -> listpack edge runs on the handle this
@@ -939,6 +969,12 @@ impl Database {
         // rather than being fabricated over.
         let state = self.hot_state(key, now_ms);
         if state != HotState::Live && !self.settle_not_live(key, now_ms, state) {
+            // moon#875: the cold copy is indexed but unreadable — refuse
+            // BEFORE fabricating, or the fresh container shadows the bytes
+            // and the orphan sweep reclaims them for good.
+            if self.take_cold_fault().is_some() {
+                return Err(Self::cold_fault_error());
+            }
             self.insert_fresh(key, Entry::new_sorted_set_listpack());
         }
         let entry = self.data.get_mut(key).unwrap();
@@ -1142,9 +1178,19 @@ impl Database {
         if self.replay_cold_gate_active() {
             self.cold_location_visible(key)?;
         }
-        let (value, _ttl) =
-            crate::storage::tiered::cold_read::cold_read_through(ci, shard_dir, key, now_ms)?;
-        Some(value)
+        use crate::storage::tiered::cold_read::ColdReadOutcome;
+        match crate::storage::tiered::cold_read::cold_read_through_outcome(
+            ci, shard_dir, key, now_ms,
+        ) {
+            ColdReadOutcome::Hit(value, _ttl) => Some(value),
+            ColdReadOutcome::Unreadable(fault) => {
+                // moon#875: indexed, unreadable. Not absence — raise the
+                // fault so the reply becomes `-IOERR` at the boundary.
+                self.note_cold_fault(fault.reason);
+                None
+            }
+            ColdReadOutcome::Expired | ColdReadOutcome::Miss => None,
+        }
     }
 
     /// Cheap, in-memory cold-index lookup. Returns the disk location plus a

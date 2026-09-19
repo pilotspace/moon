@@ -65,9 +65,10 @@ pub(crate) fn try_two_db_intercept(
     disk_offload_dir: Option<&std::path::Path>,
 ) -> Option<Frame> {
     if cmd.eq_ignore_ascii_case(b"MOVE") {
-        let response = match ksmv::parse_move_args(args, db_count) {
+        // `resolve_move` refuses `dst_db == db_idx` with redis's same-object
+        // error (moon#1062), so `with_pair`'s distinct-index assert holds.
+        let response = match ksmv::resolve_move(args, db_idx, db_count) {
             Err(e) => e,
-            Ok((_key, dst_db)) if dst_db == db_idx => Frame::Integer(0),
             Ok((key, dst_db)) => {
                 // Refresh expiry clock on BOTH databases before the move so
                 // an expired source key behaves as "not found" and an

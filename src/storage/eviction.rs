@@ -181,6 +181,74 @@ pub(crate) fn force_write_gate(active: bool) -> ForceWriteGate {
     ForceWriteGate(prev)
 }
 
+/// Test-only RAII guard: snapshots EVERY process-global *published* memory
+/// limit on construction and restores all five on `Drop`.
+///
+/// ── Why this exists (moon#856) ───────────────────────────────────────────
+/// These atomics are written by PRODUCTION code. `command::config::config_set`
+/// calls `publish_maxmemory`, `publish_maxmemory_hints`,
+/// `publish_maxmemory_policy` and `db_quota::publish_db_maxmemory_any_set` on
+/// the `CONFIG SET` path, so a unit test that drives `config_set` mutates
+/// process-global state that OUTLIVES it. Under `cargo test --lib` — one
+/// process for the whole suite, unlike nextest's process-per-test — whichever
+/// test later READ that state failed. That is why moon#856 looked
+/// order-dependent (the victim varies) while the cause was not (the leak is
+/// permanent). Five `command::config::tests` cases leaked one, each
+/// individually sufficient to redden
+/// `scripting::bridge::tests::gate_is_skipped_with_spill_sender_when_no_limit_is_configured`.
+///
+/// ── Why `Drop`, and not a manual restore at the end of the body ──────────
+/// A manual restore is SKIPPED on the unwind path, so a test that panics
+/// mid-body leaks worse than one that never restored at all: the poison
+/// outlives a run that has already failed and reddens an innocent sibling on
+/// top of it. `Drop` runs on both the normal and the unwind path, which is the
+/// entire point. Three tests restored manually before this guard existed
+/// (`write_gate_active_tracks_maxmemory_and_db_quota_atomics`,
+/// `maxmemory_publish_and_is_set_roundtrip`, and `db_quota`'s
+/// `publish_and_read_any_set_flag`, whose own comment conceded the gap).
+///
+/// Nesting is LIFO-correct: an inner guard restores the state as of ITS
+/// construction, the outer one the true original.
+///
+/// NOT a substitute for [`force_write_gate`]: that overrides the PREDICATE on
+/// one thread, this one scopes the PUBLISHED VALUES process-wide.
+#[cfg(test)]
+pub(crate) struct PublishedLimits {
+    maxmemory_global: u64,
+    maxmemory_hint: usize,
+    maxmemory_per_shard_hint: usize,
+    maxmemory_policy: u8,
+    db_maxmemory_any_set: bool,
+}
+
+#[cfg(test)]
+impl PublishedLimits {
+    /// Snapshot all five published atomics; restored when the guard drops.
+    #[must_use]
+    pub(crate) fn capture() -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        Self {
+            maxmemory_global: MAXMEMORY_GLOBAL.load(Relaxed),
+            maxmemory_hint: MAXMEMORY_HINT.load(Relaxed),
+            maxmemory_per_shard_hint: MAXMEMORY_PER_SHARD_HINT.load(Relaxed),
+            maxmemory_policy: MAXMEMORY_POLICY_GLOBAL.load(Relaxed),
+            db_maxmemory_any_set: crate::storage::db_quota::db_maxmemory_any_set(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublishedLimits {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        MAXMEMORY_GLOBAL.store(self.maxmemory_global, Relaxed);
+        MAXMEMORY_HINT.store(self.maxmemory_hint, Relaxed);
+        MAXMEMORY_PER_SHARD_HINT.store(self.maxmemory_per_shard_hint, Relaxed);
+        MAXMEMORY_POLICY_GLOBAL.store(self.maxmemory_policy, Relaxed);
+        crate::storage::db_quota::restore_db_maxmemory_any_set(self.db_maxmemory_any_set);
+    }
+}
+
 /// Publish the maxmemory hints. MUST be called wherever `maxmemory` (or the
 /// shard count it is divided by) changes: server startup after the resolved
 /// `num_shards` is written, and `CONFIG SET maxmemory`. A missed publish is
@@ -689,7 +757,10 @@ pub fn evict_to_budget(
         None => &mut noop,
     };
 
-    let mut current_total = run.total_memory.unwrap_or_else(|| db.estimated_memory());
+    // moon#1036: `budgeted_memory`, not `estimated_memory` — the same figure
+    // the pressure cascade publishes and evicts against, so a per-write run
+    // and a tick run enforce one cap, not two a cold index apart.
+    let mut current_total = run.total_memory.unwrap_or_else(|| db.budgeted_memory());
     // moon#600: consecutive iterations that claimed progress but changed
     // NOTHING observable. See `EVICTION_STALL_LIMIT`.
     let mut stalled = 0usize;
@@ -807,6 +878,22 @@ pub fn evict_to_budget(
     }
 
     Ok(())
+}
+
+/// Report one plain-dropped victim: to CLIENT TRACKING, then to the caller's
+/// sink (moon#1013).
+///
+/// The ONE place a plain drop is announced, so no eviction entry point —
+/// `evict_to_budget`'s sinks or `db_quota`'s direct `evict_one_with_spill`
+/// with a no-op sink — can delete a tracked key silently. redis 8.6.1 pushes
+/// `invalidate` for an evicted key (measured: `allkeys-random`,
+/// `maxmemory 1`). A SPILLED victim is deliberately not reported: it stays
+/// cold-readable with the same value, so a client's cached copy is still
+/// correct.
+#[inline]
+fn report_plain_drop(on_plain_drop: &mut dyn FnMut(&[u8]), key: &[u8]) {
+    crate::tracking::invalidation::invalidate_server_removed(key);
+    on_plain_drop(key);
 }
 
 /// Consecutive eviction iterations allowed to claim progress while changing
@@ -927,65 +1014,6 @@ pub fn compute_elastic_budget(shard_id: usize, base: usize, used: &[usize]) -> u
         return base;
     }
     base.saturating_add(surplus / hot)
-}
-
-/// Seed value for a shard's spill `file_id` counter after recovery.
-///
-/// On restart, AOF/RDB replay re-populates the hot tier and the persistence
-/// cascade re-evicts the excess. If the counter restarted at 1 it would mint
-/// `heap-000001.mpf`, `heap-000257.mpf`, … — the *same names* recovery just
-/// loaded — and atomically overwrite cold files the rebuilt `cold_index` still
-/// references, silently corrupting cold read-through (the B-2 bug).
-///
-/// Scanning the on-disk `<shard_dir>/data/heap-NNNNNN.mpf` files (rather than
-/// the manifest) is deliberate: a spill that wrote its `.mpf` but crashed
-/// before the manifest commit leaves an orphan the manifest doesn't know about,
-/// yet it still occupies a filename that must not be clobbered. The physical
-/// files are the authority on what can be overwritten.
-///
-/// Returns `max(existing file_id) + 1`. Because each batch file is named after
-/// its first request's `file_id` (gaps are harmless — recovery iterates
-/// manifest entries, see `spill_thread`), any seed strictly above the current
-/// max guarantees every future filename is new. Returns `1` when disk-offload
-/// is off, the directory is absent, or it holds no heap files — identical to
-/// the historical default, so a fresh server and the live hot path are
-/// unchanged by this seeding.
-#[must_use]
-pub fn next_spill_file_id_seed(shard_dir: Option<&Path>) -> u64 {
-    let Some(dir) = shard_dir else { return 1 };
-    let data_dir = dir.join("data");
-    let entries = match std::fs::read_dir(&data_dir) {
-        Ok(e) => e,
-        Err(e) => {
-            // NotFound is the normal fresh-server case (data/ not created yet).
-            // Anything else (permissions, I/O) is anomalous: fail safe to the
-            // legacy default but surface it so a misseed can't hide silently.
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    dir = %data_dir.display(),
-                    error = %e,
-                    "spill file_id seed: could not scan cold dir; defaulting to 1"
-                );
-            }
-            return 1;
-        }
-    };
-    let mut max_id: Option<u64> = None;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if let Some(id) = name
-            .to_str()
-            .and_then(|n| n.strip_prefix("heap-"))
-            .and_then(|r| r.strip_suffix(".mpf"))
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            max_id = Some(max_id.map_or(id, |m| m.max(id)));
-        }
-    }
-    match max_id {
-        Some(m) => m + 1,
-        None => 1,
-    }
 }
 
 /// Maximum victims collected into a single durable batch by
@@ -1221,7 +1249,7 @@ fn evict_batch_durable(
             db.remove(key.as_bytes());
             crate::admin::metrics_setup::record_expiring_spill_skipped();
             crate::admin::metrics_setup::record_eviction();
-            on_plain_drop(key.as_bytes());
+            report_plain_drop(on_plain_drop, key.as_bytes());
             // A drop reclaims RAM immediately, so it counts toward the same
             // deficit the staged (not-yet-written) victims are sized against.
             staged_bytes += before.saturating_sub(db.estimated_memory());
@@ -1354,7 +1382,7 @@ fn evict_one_async_spill(
             db.remove(key.as_bytes());
             crate::admin::metrics_setup::record_expiring_spill_skipped();
             crate::admin::metrics_setup::record_eviction();
-            on_plain_drop(key.as_bytes());
+            report_plain_drop(on_plain_drop, key.as_bytes());
             return true;
         }
         // Fail-closed: a value that cannot be faithfully serialized must not
@@ -1494,7 +1522,7 @@ pub(crate) fn evict_one_with_spill(
     let removed = db.remove(key.as_bytes()).is_some();
     if removed {
         crate::admin::metrics_setup::record_eviction();
-        on_plain_drop(key.as_bytes());
+        report_plain_drop(on_plain_drop, key.as_bytes());
     }
     true
 }
@@ -1770,6 +1798,11 @@ mod tests {
     #[test]
     fn write_gate_active_tracks_maxmemory_and_db_quota_atomics() {
         use crate::storage::db_quota::publish_db_maxmemory_any_set;
+        // moon#856: every store below hits a PROCESS-GLOBAL atomic. The final
+        // lines happen to leave both unset, but only on the success path — a
+        // panic anywhere in between used to leave a published limit behind for
+        // the rest of the suite. The guard restores on the unwind path too.
+        let _limits = PublishedLimits::capture();
         publish_maxmemory(0);
         publish_db_maxmemory_any_set(&RuntimeConfig::default());
         assert!(!write_gate_active(), "no limit published: gate inactive");
@@ -1794,6 +1827,9 @@ mod tests {
 
     #[test]
     fn maxmemory_publish_and_is_set_roundtrip() {
+        // moon#856: same reasoning as the test above — the trailing
+        // `publish_maxmemory(0)` only runs when every assertion held.
+        let _limits = PublishedLimits::capture();
         // Unset (0) => maxmemory_is_set() is false.
         publish_maxmemory(0);
         assert!(!maxmemory_is_set());
@@ -2129,6 +2165,40 @@ mod tests {
         assert!(
             db.data().get(b"old" as &[u8]).is_none(),
             "LRU eviction failed to remove the oldest key within 50 rounds",
+        );
+    }
+
+    /// moon#1013: a plain-dropped victim invalidates CLIENT TRACKING caches —
+    /// through `evict_to_budget` AND through the direct `evict_one_with_spill`
+    /// call `db_quota` makes with a no-op sink (the hook sits below both).
+    #[test]
+    fn plain_eviction_invalidates_tracking_clients() {
+        use crate::tracking::invalidation::test_support::GlobalTracker;
+        let via_budget = GlobalTracker::tracking(b"ev1013:budget");
+        let mut db = Database::new();
+        db.set_string(b"ev1013:budget", Bytes::from_static(b"v"));
+        let config = make_config(1, "allkeys-random");
+        assert!(evict_to_budget(&mut db, &config, EvictionRun::plain()).is_ok());
+        assert_eq!(db.len(), 0, "precondition: evicted");
+        assert_eq!(
+            via_budget.invalidated_keys(),
+            vec![Bytes::from_static(b"ev1013:budget")]
+        );
+
+        let via_quota = GlobalTracker::tracking(b"ev1013:quota");
+        db.set_string(b"ev1013:quota", Bytes::from_static(b"v"));
+        let policy = EvictionPolicy::from_str("allkeys-random");
+        assert!(evict_one_with_spill(
+            &mut db,
+            &config,
+            &policy,
+            None,
+            &mut |_| {}
+        ));
+        assert_eq!(db.len(), 0, "precondition: evicted");
+        assert_eq!(
+            via_quota.invalidated_keys(),
+            vec![Bytes::from_static(b"ev1013:quota")]
         );
     }
 
@@ -3149,47 +3219,6 @@ mod tests {
         assert_eq!(db.len(), 0);
     }
 
-    // ── B-2: post-crash cold-spill file_id seeding ──────────────────────────
-    // The spill file_id counter must resume ABOVE every recovered `heap-*.mpf`
-    // so post-restart re-eviction never overwrites a cold file the rebuilt
-    // cold_index still points at (which silently corrupts cold read-through).
-
-    /// `None` dir (disk-offload off) → seed 1 (historical default, no change).
-    #[test]
-    fn test_spill_seed_none_dir_is_one() {
-        assert_eq!(next_spill_file_id_seed(None), 1);
-    }
-
-    /// Fresh server (dir absent / empty) → seed 1 == legacy behaviour, so the
-    /// live read-through hot path cannot regress from this change.
-    #[test]
-    fn test_spill_seed_fresh_server_is_one() {
-        let tmp = tempfile::tempdir().unwrap();
-        // data/ does not exist yet
-        assert_eq!(next_spill_file_id_seed(Some(tmp.path())), 1);
-        // data/ exists but empty
-        std::fs::create_dir_all(tmp.path().join("data")).unwrap();
-        assert_eq!(next_spill_file_id_seed(Some(tmp.path())), 1);
-    }
-
-    /// With recovered heap files, seed = max(file_id) + 1 so the next batch's
-    /// filename is strictly greater than any existing one (filenames are the
-    /// first request id of each batch; gaps are harmless).
-    #[test]
-    fn test_spill_seed_resumes_above_max_recovered() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        for id in [1u64, 257, 513] {
-            std::fs::write(data.join(format!("heap-{id:06}.mpf")), b"x").unwrap();
-        }
-        // non-heap files and bad names must be ignored
-        std::fs::write(data.join("manifest.bin"), b"x").unwrap();
-        std::fs::write(data.join("heap-notanum.mpf"), b"x").unwrap();
-        std::fs::write(data.join("base-000999.rdb"), b"x").unwrap();
-        assert_eq!(next_spill_file_id_seed(Some(tmp.path())), 514);
-    }
-
     /// The lock-free inline-write pre-gate must skip the runtime-config lock
     /// ONLY when the slow path (`evict_to_budget`, no-op iff
     /// `total <= budget`) would provably do nothing. Tests the pure decision
@@ -3408,6 +3437,95 @@ mod tests {
         assert!(
             spill_files <= 4,
             "40 victims must batch into shared files, got {spill_files}"
+        );
+    }
+
+    /// Fill `db` with a cold index of `n` entries, as spill completions leave
+    /// it. Returns the index's `resident_bytes()`.
+    fn seed_cold_index(db: &mut Database, n: usize) -> usize {
+        let mut ci = crate::storage::tiered::cold_index::ColdIndex::new();
+        for i in 0..n {
+            ci.insert(
+                Bytes::from(format!("cold:{i:06}")),
+                crate::storage::tiered::cold_index::ColdLocation {
+                    file_id: 1,
+                    page_idx: 0,
+                    slot_idx: i as u16,
+                    ttl_ms: None,
+                    value_type: ValueType::String,
+                },
+            );
+        }
+        let bytes = ci.resident_bytes();
+        db.cold_index = Some(ci);
+        bytes
+    }
+
+    /// moon#1036: a per-write eviction run (no `.total()`) must hold the
+    /// database to the SAME figure the 100 ms pressure cascade does — hot
+    /// bytes PLUS the cold index's RAM (`run_eviction_tick` publishes that
+    /// sum and the cascade evicts against it).
+    ///
+    /// The budget below sits between the two figures: the hot set alone fits,
+    /// the hot set plus the cold index does not. Before the fix the per-write
+    /// run compared `estimated_memory()` and evicted nothing, while the next
+    /// tick's cascade evicted — one shard, two caps.
+    #[test]
+    fn evict_to_budget_charges_the_cold_index_like_the_cascade() {
+        let mut db = Database::new();
+        for i in 0..64 {
+            db.set_string(
+                format!("hot:{i:04}").as_bytes(),
+                Bytes::from(vec![b'v'; 200]),
+            );
+        }
+        let ci = seed_cold_index(&mut db, 256);
+        let hot = db.estimated_memory();
+        assert!(ci > 0, "fixture: the cold index must occupy RAM");
+        // What the tick publishes for this db and the cascade evicts against.
+        let cascade_figure = hot + ci;
+        let budget = hot + ci / 2;
+        assert!(
+            hot <= budget && cascade_figure > budget,
+            "fixture: budget between"
+        );
+
+        // CONTROL: the cascade's own call shape evicts at this budget.
+        let mut control = Database::new();
+        for i in 0..64 {
+            control.set_string(
+                format!("hot:{i:04}").as_bytes(),
+                Bytes::from(vec![b'v'; 200]),
+            );
+        }
+        seed_cold_index(&mut control, 256);
+        let config = make_config(budget, "allkeys-lru");
+        evict_to_budget(
+            &mut control,
+            &config,
+            EvictionRun::plain().total(cascade_figure),
+        )
+        .expect("cascade-shaped run");
+        assert!(
+            control.len() < 64,
+            "CONTROL: the cascade evicts at this budget"
+        );
+
+        // The per-write shape must agree with it.
+        evict_to_budget(&mut db, &config, EvictionRun::plain()).expect("per-write run");
+        assert!(
+            db.len() < 64,
+            "a per-write eviction run left all 64 hot keys in place at a budget \
+             the pressure cascade enforces by evicting: it compared the budget \
+             against hot bytes only ({hot}) and ignored the cold index ({ci} \
+             bytes) the cascade charges — two effective caps on one shard"
+        );
+        let hot_after = db.estimated_memory();
+        assert!(
+            hot_after + ci <= budget,
+            "the per-write run must leave hot + cold index ({} ) within budget \
+             ({budget})",
+            hot_after + ci
         );
     }
 

@@ -240,7 +240,9 @@ fn ch3_help_does_not_advertise_subcommands_moon_refuses() {
         ("FUNCTION", &["DUMP", "RESTORE", "STATS", "KILL"][..]),
         ("SCRIPT", &["KILL", "DEBUG"][..]),
         ("COMMAND", &["GETKEYSANDFLAGS"][..]),
-        ("CLIENT", &["CACHING", "GETREDIR", "REPLY", "SETINFO"][..]),
+        // CACHING and GETREDIR left this list when they started dispatching
+        // (moon#1049); TRACKINGINFO was never on it.
+        ("CLIENT", &["REPLY", "SETINFO"][..]),
     ] {
         let items = help_lines(&mut c, container);
         for name in absent {

@@ -83,7 +83,7 @@ pub(super) fn spsc_eviction_gate(
                 .budget(budget)
                 .report(on_plain_drop),
         );
-        spill_file_id.set(fid);
+        spill_file_id.set(spill_file_id.get().max(fid));
         res
     } else {
         evict_to_budget(
@@ -2319,8 +2319,15 @@ pub(crate) fn handle_shard_message_shared(
                 wait_id,
                 cmd,
                 reply_tx,
-                sole_key,
+                claim,
             } = *payload;
+            // The waiter already gave up (its wait ended before this message
+            // was drained). Registering it would only leave a ghost entry for
+            // the next push to reap; answering it an error nobody reads is
+            // worse.
+            if !claim.is_open() {
+                return;
+            }
             // moon#556: THIS shard owns the key, so it is the only one that
             // can answer the type question for it. A blocking pop on an
             // existing key of the wrong type is an immediate `-WRONGTYPE` in
@@ -2329,42 +2336,42 @@ pub(crate) fn handle_shard_message_shared(
             // remote case keeps the old behaviour (the waker finds nothing to
             // pop and answers a null the client reads as "empty").
             //
-            // Gated on `sole_key`: for a multi-key waiter the sibling keys are
-            // registered on other shards and may be serving right now, and an
-            // error raised here would race a real wake-up whose element has
-            // already left the keyspace. Those keep the pre-#556 behaviour.
+            // Unconditional since moon#989: this message now carries only a
+            // single-key waiter (the key IS the command). Multi-key waiters
+            // register through `BlockRegisterGroup`, which makes the same
+            // decision only when it holds every key of the command.
             let mut cmd = cmd;
-            let type_error = if sole_key {
-                crate::shard::slice::with_shard_db(db_index, |guard| {
-                    match cmd.family() {
-                        // moon#832: a type probe before parking a waiter must
-                        // not rewrite the value it is probing — `get_list`
-                        // (via `get_promoted`) flattened the list's compact
-                        // encoding on every remote blocking registration.
-                        crate::blocking::WaitFamily::List => {
-                            let now_ms = guard.now_ms();
-                            guard.get_list_ref_if_alive(&key, now_ms).err()
-                        }
-                        crate::blocking::WaitFamily::ZSet => guard.get_sorted_set(&key).err(),
-                        // moon#595: `-WRONGTYPE` for a stream read on the
-                        // wrong type, plus XREADGROUP's missing-key and
-                        // missing-group errors. The client's own scan cannot
-                        // see a key it does not own, so — exactly as moon#556
-                        // argued for the pops — the check has to happen here
-                        // too or the remote case parks on a key that can never
-                        // serve it.
-                        crate::blocking::WaitFamily::Stream => {
-                            crate::blocking::wakeup::stream_register_error(guard, &key, &cmd)
-                        }
+            let type_error = crate::shard::slice::with_shard_db(db_index, |guard| {
+                match cmd.family() {
+                    // moon#832: a type probe before parking a waiter must not
+                    // rewrite the value it is probing — `get_list` (via
+                    // `get_promoted`) flattened the list's compact encoding
+                    // on every remote blocking registration.
+                    crate::blocking::WaitFamily::List => {
+                        let now_ms = guard.now_ms();
+                        guard.get_list_ref_if_alive(&key, now_ms).err()
                     }
-                })
-            } else {
-                None
-            };
+                    crate::blocking::WaitFamily::ZSet => guard.get_sorted_set(&key).err(),
+                    // moon#595: `-WRONGTYPE` for a stream read on the wrong
+                    // type, plus XREADGROUP's missing-key and missing-group
+                    // errors. The client's own scan cannot see a key it does
+                    // not own, so — exactly as moon#556 argued for the pops —
+                    // the check has to happen here too or the remote case
+                    // parks on a key that can never serve it.
+                    crate::blocking::WaitFamily::Stream => {
+                        crate::blocking::wakeup::stream_register_error(guard, &key, &cmd)
+                    }
+                }
+            });
             if let Some(err) = type_error {
                 // Never registered, so there is nothing to unwind: the
-                // client's `BlockCancel` on the way out is a no-op.
-                let _ = reply_tx.send(Some(err));
+                // client's `BlockCancel` on the way out is a no-op. The error
+                // is an answer like any other, so it is sent only on a won
+                // claim (moon#1023): a waiter that already gave up has its
+                // reply, and must not find a second one in flight.
+                if claim.try_claim() {
+                    let _ = reply_tx.send(Some(err));
+                }
                 return;
             }
             // moon#595: bind this waiter's `$` against the stream as THIS
@@ -2382,6 +2389,7 @@ pub(crate) fn handle_shard_message_shared(
                 cmd,
                 reply_tx,
                 deadline: None, // Remote registrations don't manage timeout locally
+                claim: Some(claim),
             };
             let mut reg = blocking_registry.borrow_mut();
             reg.register(db_index, key.clone(), entry);
@@ -2394,6 +2402,21 @@ pub(crate) fn handle_shard_message_shared(
                         &mut reg, guard, db_index, &key,
                     );
                 }
+            });
+        }
+        ShardMessage::BlockRegisterGroup(payload) => {
+            // moon#989: one run of keys this shard owns of one multi-key
+            // waiter, in ONE message — so registering, type-checking and
+            // serving them is one synchronous stretch and the waiter is served
+            // at most once here; its claim token (moon#1019) makes that "at
+            // most once" hold across shards too.
+            let db_index = payload.db_index;
+            if payload.ack.is_some() {
+                crate::blocking::group::stall_acked_run_for_test();
+            }
+            let mut reg = blocking_registry.borrow_mut();
+            crate::shard::slice::with_shard_db(db_index, |guard| {
+                crate::blocking::group::register_group(&mut reg, guard, *payload);
             });
         }
         ShardMessage::BlockCancel { wait_id } => {
@@ -3155,8 +3178,9 @@ pub(crate) fn handle_shard_message_shared(
                 reply_tx,
                 proto,
                 watched,
+                script_acl,
             } = *payload;
-            let mut exec_publishes: Vec<(usize, bytes::Bytes, bytes::Bytes)> = Vec::new();
+            let mut exec_publishes: Vec<crate::shard::exec_publish::ExecPublish> = Vec::new();
             // c10k E2: a queued FLUSHDB/FLUSHALL clears only THIS shard's
             // slice. Collect them and hand them back to the originator, which
             // broadcasts to the other shards (see `TxnExecReply::exec_flushes`
@@ -3170,6 +3194,41 @@ pub(crate) fn handle_shard_message_shared(
             // originator.
             let mut exec_wakes: Vec<(usize, bytes::Bytes, crate::blocking::WaitFamily)> =
                 Vec::new();
+            // moon#894: a queued script runs in the body on THIS shard's VM,
+            // cache and function registry, as the ORIGINATING user. Built only
+            // when the body holds a script (`script_acl` is `Some` exactly
+            // then). A shard with no Lua runtime leaves it `None`, and the
+            // executor answers each script with an error instead of skipping
+            // it.
+            let txn_script_rt = match (script_acl.as_ref(), lua_rt) {
+                (Some(_), Some(rt)) => rt.vm().map(|vm| {
+                    let slot = crate::scripting::shard_function_registry();
+                    // Build the registry on first use, exactly as the routed
+                    // FCALL arm above does; `try_borrow_mut` for the same
+                    // no-panic-on-the-shard-thread reason.
+                    if let Ok(mut guard) = slot.try_borrow_mut()
+                        && guard.is_none()
+                    {
+                        *guard = Some(crate::scripting::FunctionRegistry::new(
+                            rt.eviction_ctx().clone(),
+                        ));
+                    }
+                    (vm, slot, rt.num_shards())
+                }),
+                _ => None,
+            };
+            let txn_scripting = match (script_acl.as_ref(), txn_script_rt.as_ref()) {
+                (Some(acl), Some((vm, slot, num_shards))) => {
+                    Some(crate::server::conn::txn_script::TxnScripting {
+                        lua: vm,
+                        script_cache,
+                        functions: slot,
+                        script_acl: acl,
+                        num_shards: *num_shards,
+                    })
+                }
+                _ => None,
+            };
             let (result, aof_entries, graph_records) =
                 crate::server::conn::shared::execute_transaction_sharded(
                     shard_databases,
@@ -3182,6 +3241,7 @@ pub(crate) fn handle_shard_message_shared(
                     &mut exec_flushes,
                     &mut exec_wakes,
                     &watched,
+                    txn_scripting.as_ref(),
                 );
             // The waiters are registered HERE, on the owning shard's registry
             // — the same one the live cross-shard write path wakes.
@@ -4530,10 +4590,16 @@ pub(crate) fn wal_append_and_fanout(
     // KV command would be written and then discarded by Phase-B recovery —
     // pure write amplification (measured 2.7× file bytes at shards=4).
     // FPI/checkpoint/feature records are unaffected (different entry points).
+    //
+    // moon#1039: `data` is a bare command with no `SELECT`, so the db it ran
+    // in rides in the record header. Without it replay started every shard
+    // at db 0 and recovered every db 1-15 write — and every reason-DEL — into
+    // db 0.
     if wal_kv_log {
         if let Some(w) = wal_writer {
-            w.append(
+            w.append_in_db(
                 crate::persistence::wal_v3::record::WalRecordType::Command,
+                db,
                 data,
             );
         }
@@ -4925,6 +4991,88 @@ mod wal_append_tests {
             std::fs::metadata(&seg).unwrap().len() > base_len,
             "with wal_kv_log true the KV record must be logged to the WAL"
         );
+    }
+
+    /// moon#1039: a KV record logged for db N must replay into db N.
+    ///
+    /// Before the fix the WAL copy carried no db context and Phase-4 replay
+    /// started every shard at `selected_db = 0`, so every write from db 1-15
+    /// recovered into db 0 — and a DEL logged for db 3 (an active-expiry
+    /// reason-DEL, say) deleted db 0's same-named key.
+    #[test]
+    fn wal_kv_record_replays_into_the_db_it_was_written_to_1039() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let mut w3 = Some(
+            WalWriterV3::new(
+                0,
+                &shard_dir.join("wal-v3"),
+                16 * 1024 * 1024,
+                WalBounds::DEFAULT,
+            )
+            .unwrap(),
+        );
+        let backlog: SharedBacklog = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let mut log = |db: usize, cmd: &[u8]| {
+            wal_append_and_fanout(
+                cmd,
+                db,
+                &mut w3,
+                &backlog,
+                &mut vec![],
+                &None,
+                0,
+                None,
+                true, // wal_kv_log
+                &mut std::time::Duration::from_millis(5),
+            );
+        };
+        log(0, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4\r\nkeep\r\n");
+        log(3, b"*3\r\n$3\r\nSET\r\n$2\r\nk3\r\n$2\r\nv3\r\n");
+        log(3, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4\r\ngone\r\n");
+        log(3, b"*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n");
+        log(7, b"*3\r\n$3\r\nSET\r\n$2\r\nk7\r\n$2\r\nv7\r\n");
+        w3.as_mut().unwrap().flush_sync().unwrap();
+        drop(w3);
+
+        let mut databases: Vec<Database> = (0..16).map(|_| Database::new()).collect();
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        crate::persistence::recovery::recover_shard_v3(&mut databases, 0, &shard_dir, &engine)
+            .unwrap();
+
+        let get = |dbs: &mut [Database], db: usize, key: &'static [u8]| {
+            let mut selected = db;
+            let args = crate::framevec![crate::protocol::Frame::BulkString(
+                bytes::Bytes::from_static(key)
+            )];
+            match crate::command::dispatch(&mut dbs[db], b"GET", &args, &mut selected, 16) {
+                crate::command::DispatchResult::Response(crate::protocol::Frame::BulkString(v)) => {
+                    Some(v)
+                }
+                _ => None,
+            }
+        };
+        assert_eq!(
+            get(&mut databases, 3, b"k3").as_deref(),
+            Some(&b"v3"[..]),
+            "a write logged for db 3 must replay into db 3"
+        );
+        assert_eq!(
+            get(&mut databases, 7, b"k7").as_deref(),
+            Some(&b"v7"[..]),
+            "a write logged for db 7 must replay into db 7"
+        );
+        assert_eq!(
+            get(&mut databases, 0, b"k3"),
+            None,
+            "db 3's key leaked into db 0"
+        );
+        assert_eq!(
+            get(&mut databases, 0, b"k").as_deref(),
+            Some(&b"keep"[..]),
+            "a DEL logged for db 3 must not delete db 0's same-named key"
+        );
+        assert_eq!(get(&mut databases, 3, b"k"), None, "db 3's DEL must apply");
     }
 }
 

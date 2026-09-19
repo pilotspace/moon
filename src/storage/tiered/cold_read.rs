@@ -23,9 +23,87 @@ pub enum ColdReadOutcome {
     Hit(RedisValue, Option<u64>),
     /// Entry found but its TTL has passed — caller must remove the index entry.
     Expired,
-    /// Not found / file unreadable / corrupt. The index entry is left alone:
-    /// a transient I/O error must not permanently drop the key.
+    /// The cold index has NO entry for the key. The only outcome that means
+    /// "absent".
     Miss,
+    /// The cold index HAS an entry, but the bytes it points at could not be
+    /// produced: file missing or unreadable, page corrupt, slot undecodable,
+    /// overflow chain broken (moon#875). This is NOT absence — the key is
+    /// indexed, `EXISTS` says 1, `DBSIZE` counts it — and it must never be
+    /// folded into [`Self::Miss`] by a caller that has a way to say so.
+    /// The index entry is deliberately left alone: a transient I/O error
+    /// must not permanently drop the key, and a later read retries.
+    ///
+    /// At the wire the command answers `-IOERR` (see
+    /// `Database::cold_fault_error`): the fault is noted on the `Database`
+    /// by the two read-through funnels (`promote_cold_outcome`,
+    /// `get_cold_value`), the fabricating accessors refuse BEFORE mutating,
+    /// and the dispatch boundary turns any remaining reply into the error.
+    /// It is also counted in `INFO` (`reclamation_cold_read_unreadable_total`)
+    /// and logged with its location by [`read_cold_entry`].
+    Unreadable(ColdReadFault),
+}
+
+/// Why an indexed cold entry could not be read. Carried on
+/// [`ColdReadOutcome::Unreadable`] so the log line names the exact page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColdReadFault {
+    pub location: ColdLocation,
+    pub reason: ColdReadFaultReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ColdReadFaultReason {
+    /// The heap file is not on disk.
+    FileMissing,
+    /// The heap file exists but could not be opened or read.
+    FileUnreadable,
+    /// The page at `page_idx` failed its magic/type/CRC check.
+    PageRejected,
+    /// The slot at `slot_idx` is out of range or does not decode.
+    SlotUndecodable,
+    /// The value's overflow chain could not be followed.
+    OverflowBroken,
+    /// The collection body did not deserialize.
+    ValueUndecodable,
+}
+
+impl ColdReadFaultReason {
+    /// Inverse of `as u8`, for the `Database::cold_fault` flag.
+    #[must_use]
+    pub fn from_code(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => Self::FileMissing,
+            1 => Self::FileUnreadable,
+            2 => Self::PageRejected,
+            3 => Self::SlotUndecodable,
+            4 => Self::OverflowBroken,
+            5 => Self::ValueUndecodable,
+            _ => return None,
+        })
+    }
+}
+
+/// Every unreadable-but-indexed cold read funnels through here: count it in
+/// `INFO`, and log the first few (then every power of two) with the exact
+/// location so an operator can find the file. Rate-limited because a client
+/// hammering one broken key must not turn the log into the disk it is
+/// reporting on.
+fn note_unreadable(fault: ColdReadFault) -> ColdReadOutcome {
+    let n = crate::command::info_reclamation::record_cold_read_unreadable();
+    if n <= 16 || n.is_power_of_two() {
+        tracing::error!(
+            file_id = fault.location.file_id,
+            page_idx = fault.location.page_idx,
+            slot_idx = fault.location.slot_idx,
+            reason = ?fault.reason,
+            total = n,
+            "cold read: key is INDEXED but its data could not be read; answered as a miss \
+             to the client. The index entry is kept so a later read retries"
+        );
+    }
+    ColdReadOutcome::Unreadable(fault)
 }
 
 /// Attempt to read a cold KV entry from disk.
@@ -42,7 +120,7 @@ pub fn cold_read_through(
 ) -> Option<(RedisValue, Option<u64>)> {
     match cold_read_through_outcome(cold_index, shard_dir, key, now_ms) {
         ColdReadOutcome::Hit(v, ttl) => Some((v, ttl)),
-        ColdReadOutcome::Expired | ColdReadOutcome::Miss => None,
+        ColdReadOutcome::Expired | ColdReadOutcome::Miss | ColdReadOutcome::Unreadable(_) => None,
     }
 }
 
@@ -86,7 +164,7 @@ pub fn read_cold_entry_at(
 ) -> Option<(RedisValue, Option<u64>)> {
     match read_cold_entry(shard_dir, location, now_ms, None) {
         ColdReadOutcome::Hit(v, ttl) => Some((v, ttl)),
-        ColdReadOutcome::Expired | ColdReadOutcome::Miss => None,
+        ColdReadOutcome::Expired | ColdReadOutcome::Miss | ColdReadOutcome::Unreadable(_) => None,
     }
 }
 
@@ -100,7 +178,7 @@ pub fn read_cold_entry_at_cached(
 ) -> Option<(RedisValue, Option<u64>)> {
     match read_cold_entry(shard_dir, location, now_ms, page_cache) {
         ColdReadOutcome::Hit(v, ttl) => Some((v, ttl)),
-        ColdReadOutcome::Expired | ColdReadOutcome::Miss => None,
+        ColdReadOutcome::Expired | ColdReadOutcome::Miss | ColdReadOutcome::Unreadable(_) => None,
     }
 }
 
@@ -145,6 +223,14 @@ pub(crate) fn read_cold_entry(
     let file_path = shard_dir
         .join("data")
         .join(format!("heap-{:06}.mpf", location.file_id));
+    let fault = |reason: ColdReadFaultReason| note_unreadable(ColdReadFault { location, reason });
+    let io_reason = |e: &std::io::Error| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ColdReadFaultReason::FileMissing
+        } else {
+            ColdReadFaultReason::FileUnreadable
+        }
+    };
 
     let page_offset = (location.page_idx as u64) * (PAGE_4K as u64);
 
@@ -153,16 +239,12 @@ pub(crate) fn read_cold_entry(
             // file_id namespaces the PageCache key by the on-disk DataFile's
             // own id (unique per shard, per `ColdLocation::file_id`) -- no
             // collision risk with other files sharing this PageCache pool.
-            let Ok(handle) = pc.fetch_page(location.file_id, page_offset, false, |buf| {
-                let Ok(file) = std::fs::File::open(&file_path) else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "cold data file missing",
-                    ));
-                };
+            let handle = match pc.fetch_page(location.file_id, page_offset, false, |buf| {
+                let file = std::fs::File::open(&file_path)?;
                 crate::util::file_ext::read_exact_at(&file, buf, page_offset)
-            }) else {
-                return ColdReadOutcome::Miss;
+            }) {
+                Ok(h) => h,
+                Err(e) => return fault(io_reason(&e)),
             };
             let data = pc.page_data(&handle);
             let mut buf = [0u8; PAGE_4K];
@@ -172,24 +254,25 @@ pub(crate) fn read_cold_entry(
             buf
         }
         None => {
-            let Ok(file) = std::fs::File::open(&file_path) else {
-                return ColdReadOutcome::Miss;
+            let file = match std::fs::File::open(&file_path) {
+                Ok(f) => f,
+                Err(e) => return fault(io_reason(&e)),
             };
             // Read only the specific 4KB page identified by page_idx (pread,
             // no whole-file read).
             let mut buf = [0u8; PAGE_4K];
             if crate::util::file_ext::read_exact_at(&file, &mut buf, page_offset).is_err() {
-                return ColdReadOutcome::Miss;
+                return fault(ColdReadFaultReason::FileUnreadable);
             }
             buf
         }
     };
 
     let Some(page) = crate::persistence::kv_page::KvLeafPage::from_bytes(leaf_buf) else {
-        return ColdReadOutcome::Miss;
+        return fault(ColdReadFaultReason::PageRejected);
     };
     let Some(entry) = page.get(location.slot_idx) else {
-        return ColdReadOutcome::Miss;
+        return fault(ColdReadFaultReason::SlotUndecodable);
     };
 
     // Check TTL expiry
@@ -204,19 +287,20 @@ pub(crate) fn read_cold_entry(
     let value_bytes = if entry.flags & entry_flags::OVERFLOW != 0 {
         // Overflow pointer: start_page_idx as u32 LE
         if entry.value.len() < 4 {
-            return ColdReadOutcome::Miss;
+            return fault(ColdReadFaultReason::OverflowBroken);
         }
         let Ok(ptr_bytes) = <[u8; 4]>::try_from(&entry.value[..4]) else {
-            return ColdReadOutcome::Miss;
+            return fault(ColdReadFaultReason::OverflowBroken);
         };
         let start_page_idx = u32::from_le_bytes(ptr_bytes) as usize;
         // Only read the full file when following an overflow chain.
-        let Ok(file_data) = std::fs::read(&file_path) else {
-            return ColdReadOutcome::Miss;
+        let file_data = match std::fs::read(&file_path) {
+            Ok(d) => d,
+            Err(e) => return fault(io_reason(&e)),
         };
         match read_overflow_chain(&file_data, start_page_idx) {
             Some(v) => v,
-            None => return ColdReadOutcome::Miss,
+            None => return fault(ColdReadFaultReason::OverflowBroken),
         }
     } else {
         entry.value
@@ -227,7 +311,7 @@ pub(crate) fn read_cold_entry(
         ValueType::String => RedisValue::String(Bytes::from(value_bytes)),
         _ => match kv_serde::deserialize_collection(&value_bytes, entry.value_type) {
             Some(v) => v,
-            None => return ColdReadOutcome::Miss,
+            None => return fault(ColdReadFaultReason::ValueUndecodable),
         },
     };
 
@@ -363,16 +447,25 @@ mod tests {
                 ColdReadOutcome::Hit(..) => "Hit",
                 ColdReadOutcome::Expired => "Expired",
                 ColdReadOutcome::Miss => "Miss",
+                ColdReadOutcome::Unreadable(_) => "Unreadable",
             }
         );
 
         // Sanity: the uncached path against the same (now-missing) file
-        // really does miss -- proves the test's premise (a real second pread
-        // would fail) rather than the file having survived by luck.
+        // really does fail -- proves the test's premise (a real second pread
+        // would fail) rather than the file having survived by luck. moon#875:
+        // and it fails as UNREADABLE, not as a miss — the key is indexed.
         let r3 = cold_read_through_outcome(&cold_index, shard_dir, b"cachekey", 0);
         assert!(
-            matches!(r3, ColdReadOutcome::Miss),
-            "uncached read against the moved-away file must miss (test premise check)"
+            matches!(
+                r3,
+                ColdReadOutcome::Unreadable(ColdReadFault {
+                    reason: ColdReadFaultReason::FileMissing,
+                    ..
+                })
+            ),
+            "uncached read against the moved-away file must be Unreadable(FileMissing) \
+             (test premise check)"
         );
     }
 
@@ -486,6 +579,44 @@ mod tests {
         assert!(
             db.cold_index.as_ref().unwrap().lookup(b"stale").is_none(),
             "expired cold entry must be reclaimed from the index on read"
+        );
+    }
+
+    /// moon#1013: both cold-tier expiry reclaims — lazy (on read) and the
+    /// periodic `sweep_expired` — invalidate CLIENT TRACKING caches, like a
+    /// hot-plane expiry. A tracked key can be spilled and then expire on disk.
+    #[test]
+    fn cold_expiry_invalidates_tracking_clients() {
+        use crate::tracking::invalidation::test_support::GlobalTracker;
+        let _guard = TEST_DELAY_LOCK.lock().unwrap();
+
+        let on_read = GlobalTracker::tracking(b"cold1013:read");
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = db_with_spilled_key(tmp.path(), b"cold1013:read", b"old", Some(1));
+        assert!(db.get(b"cold1013:read").is_none(), "expired cold reads nil");
+        assert_eq!(
+            on_read.invalidated_keys(),
+            vec![Bytes::from_static(b"cold1013:read")]
+        );
+
+        let by_sweep = GlobalTracker::tracking(b"cold1013:sweep");
+        let tmp2 = tempfile::tempdir().unwrap();
+        let mut db2 = db_with_spilled_key(tmp2.path(), b"cold1013:sweep", b"old", Some(1));
+        let stats = db2
+            .cold_index
+            .as_mut()
+            .unwrap()
+            .sweep_expired(
+                1_001,
+                tmp2.path(),
+                None,
+                crate::storage::tiered::cold_index::MAX_EXPIRED_SWEEP_BATCH,
+            )
+            .unwrap();
+        assert_eq!(stats.entries_reclaimed, 1, "precondition: swept");
+        assert_eq!(
+            by_sweep.invalidated_keys(),
+            vec![Bytes::from_static(b"cold1013:sweep")]
         );
     }
 
@@ -617,5 +748,227 @@ mod tests {
             }
             _ => panic!("expected String, got {:?}", value.type_name()),
         }
+    }
+
+    // =======================================================================
+    // moon#875: indexed-but-unreadable is NOT a miss.
+    // =======================================================================
+
+    fn heap_path_of(shard_dir: &std::path::Path, file_id: u64) -> std::path::PathBuf {
+        shard_dir
+            .join("data")
+            .join(format!("heap-{file_id:06}.mpf"))
+    }
+
+    #[test]
+    fn unindexed_key_is_a_miss_but_a_missing_file_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let db = db_with_spilled_key(shard_dir, b"k875", b"value", None);
+        let ci = db.cold_index.as_ref().unwrap();
+
+        assert!(
+            matches!(
+                cold_read_through_outcome(ci, shard_dir, b"never-written", 0),
+                ColdReadOutcome::Miss
+            ),
+            "no index entry is the ONLY thing that means absent"
+        );
+        assert!(matches!(
+            cold_read_through_outcome(ci, shard_dir, b"k875", 0),
+            ColdReadOutcome::Hit(..)
+        ));
+
+        std::fs::remove_file(heap_path_of(shard_dir, 40)).unwrap();
+        let before = crate::command::info_reclamation::RECL_COLD_READ_UNREADABLE_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let r = cold_read_through_outcome(ci, shard_dir, b"k875", 0);
+        let after = crate::command::info_reclamation::RECL_COLD_READ_UNREADABLE_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            matches!(
+                r,
+                ColdReadOutcome::Unreadable(ColdReadFault {
+                    reason: ColdReadFaultReason::FileMissing,
+                    location,
+                }) if location.file_id == 40
+            ),
+            "indexed key whose file is gone must be Unreadable(FileMissing) with its location"
+        );
+        assert!(after > before, "the fault must be counted for INFO");
+    }
+
+    #[test]
+    fn corrupt_page_is_unreadable_with_page_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let db = db_with_spilled_key(shard_dir, b"crc", b"value", None);
+        let ci = db.cold_index.as_ref().unwrap();
+        let p = heap_path_of(shard_dir, 40);
+        let mut bytes = std::fs::read(&p).unwrap();
+        bytes[64 + 1] ^= 0xFF;
+        std::fs::write(&p, &bytes).unwrap();
+        assert!(matches!(
+            cold_read_through_outcome(ci, shard_dir, b"crc", 0),
+            ColdReadOutcome::Unreadable(ColdReadFault {
+                reason: ColdReadFaultReason::PageRejected,
+                ..
+            })
+        ));
+    }
+
+    /// The promoting path: an unreadable entry promotes nothing, fabricates
+    /// nothing, and — the load-bearing part — leaves the index entry in place
+    /// so a later read retries and the orphan sweep cannot reclaim the file.
+    #[test]
+    fn promote_keeps_the_index_entry_when_the_bytes_are_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let mut db = db_with_spilled_key(shard_dir, b"stuck", b"value", None);
+        let p = heap_path_of(shard_dir, 40);
+        std::fs::remove_file(&p).unwrap();
+
+        assert!(!db.promote_cold_if_present(b"stuck", 0));
+        assert!(!db.is_hot(b"stuck"), "nothing may be fabricated in hot RAM");
+        assert!(
+            db.cold_index.as_ref().unwrap().lookup(b"stuck").is_some(),
+            "the index entry must survive an unreadable read"
+        );
+        assert!(
+            db.exists_if_alive(b"stuck", 0),
+            "EXISTS still sees the indexed key — it is not absent"
+        );
+    }
+
+    // =======================================================================
+    // moon#875: at the wire, indexed-but-unreadable answers -IOERR, not nil.
+    // =======================================================================
+
+    fn args(parts: &[&str]) -> Vec<crate::protocol::Frame> {
+        parts
+            .iter()
+            .map(|p| crate::protocol::Frame::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+            .collect()
+    }
+
+    fn run(
+        db: &mut crate::storage::db::Database,
+        cmd: &str,
+        parts: &[&str],
+    ) -> crate::protocol::Frame {
+        let mut selected = 0usize;
+        match crate::command::dispatch(db, cmd.as_bytes(), &args(parts), &mut selected, 16) {
+            crate::command::DispatchResult::Response(f)
+            | crate::command::DispatchResult::Quit(f) => f,
+        }
+    }
+
+    fn run_read(
+        db: &crate::storage::db::Database,
+        cmd: &str,
+        parts: &[&str],
+    ) -> crate::protocol::Frame {
+        let mut selected = 0usize;
+        match crate::command::dispatch_read(db, cmd.as_bytes(), &args(parts), 0, &mut selected, 16)
+        {
+            crate::command::DispatchResult::Response(f)
+            | crate::command::DispatchResult::Quit(f) => f,
+        }
+    }
+
+    fn is_ioerr(f: &crate::protocol::Frame) -> bool {
+        matches!(f, crate::protocol::Frame::Error(e) if e.starts_with(b"IOERR cold tier"))
+    }
+
+    #[test]
+    fn indexed_but_unreadable_key_answers_ioerr_and_writes_refuse_before_mutating() {
+        use crate::protocol::Frame;
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let mut db = db_with_spilled_key(shard_dir, b"k875", b"the-cold-value", None);
+        let heap = heap_path_of(shard_dir, 40);
+        let parked = shard_dir.join("parked.mpf");
+        std::fs::rename(&heap, &parked).unwrap();
+
+        // Reads: an ERROR, never nil — on both dispatch paths.
+        assert!(is_ioerr(&run(&mut db, "GET", &["k875"])), "exclusive GET");
+        assert!(
+            is_ioerr(&run_read(&db, "GET", &["k875"])),
+            "shared-read GET"
+        );
+        assert!(is_ioerr(&run(&mut db, "STRLEN", &["k875"])), "STRLEN");
+        // Still indexed: the key is not absent.
+        assert_eq!(run(&mut db, "EXISTS", &["k875"]), Frame::Integer(1));
+        // The flag never outlives the command that raised it.
+        assert_eq!(
+            run(&mut db, "PING", &[]),
+            Frame::SimpleString(Bytes::from_static(b"PONG"))
+        );
+        // A genuinely absent key is still a plain miss.
+        assert_eq!(run(&mut db, "GET", &["never-written"]), Frame::Null);
+
+        // Writes that depend on or would shadow the old value: refused, and
+        // nothing is fabricated in hot RAM.
+        for (cmd, parts) in [
+            ("INCR", vec!["k875"]),
+            ("INCRBYFLOAT", vec!["k875", "1.5"]),
+            ("APPEND", vec!["k875", "x"]),
+            ("SETRANGE", vec!["k875", "0", "x"]),
+            ("GETSET", vec!["k875", "x"]),
+            ("HSET", vec!["k875", "f", "v"]),
+            ("LPUSH", vec!["k875", "x"]),
+            ("SADD", vec!["k875", "x"]),
+            ("ZADD", vec!["k875", "1", "x"]),
+            // Streams have no compact sibling: XADD is the one command that
+            // reaches the generic `get_or_create::<K>` site directly (the
+            // four above take the listpack/intset siblings first).
+            ("XADD", vec!["k875", "*", "f", "v"]),
+            ("SET", vec!["k875", "x", "GET"]),
+            ("SET", vec!["k875", "x", "KEEPTTL"]),
+        ] {
+            let f = run(&mut db, cmd, &parts);
+            assert!(is_ioerr(&f), "{cmd} must answer IOERR, got {f:?}");
+            assert!(!db.is_hot(b"k875"), "{cmd} must not fabricate a hot value");
+            assert!(
+                db.cold_index.as_ref().unwrap().lookup(b"k875").is_some(),
+                "{cmd} must leave the index entry in place"
+            );
+        }
+
+        // The bytes come back: the retained index entry heals the read.
+        std::fs::rename(&parked, &heap).unwrap();
+        assert_eq!(
+            run(&mut db, "GET", &["k875"]),
+            Frame::BulkString(Bytes::from_static(b"the-cold-value")),
+            "once readable again the value is served — nothing was tombstoned or shadowed"
+        );
+    }
+
+    #[test]
+    fn plain_set_and_del_remain_the_escape_hatches() {
+        use crate::protocol::Frame;
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let mut db = db_with_spilled_key(shard_dir, b"k875", b"the-cold-value", None);
+        std::fs::remove_file(heap_path_of(shard_dir, 40)).unwrap();
+        assert!(is_ioerr(&run(&mut db, "GET", &["k875"])));
+
+        // A plain SET does not read the old value: it overwrites, as in Redis.
+        assert_eq!(
+            run(&mut db, "SET", &["k875", "fresh"]),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
+        assert_eq!(
+            run(&mut db, "GET", &["k875"]),
+            Frame::BulkString(Bytes::from_static(b"fresh"))
+        );
+
+        // DEL discards the unreadable entry; afterwards the key is absent.
+        let mut db2 = db_with_spilled_key(tmp.path(), b"k876", b"v", None);
+        std::fs::remove_file(heap_path_of(tmp.path(), 40)).unwrap();
+        assert!(is_ioerr(&run(&mut db2, "GET", &["k876"])));
+        assert_eq!(run(&mut db2, "DEL", &["k876"]), Frame::Integer(1));
+        assert_eq!(run(&mut db2, "GET", &["k876"]), Frame::Null);
+        assert_eq!(run(&mut db2, "EXISTS", &["k876"]), Frame::Integer(0));
     }
 }

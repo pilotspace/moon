@@ -10,10 +10,8 @@ use std::sync::Arc;
 use crate::command::connection as conn_cmd;
 use crate::command::metadata;
 use crate::protocol::Frame;
-use crate::runtime::channel;
 use crate::server::conn::core::{ConnectionContext, ConnectionState};
 use crate::server::conn::util::extract_bytes;
-use crate::tracking::TrackingState;
 use crate::workspace::strip_workspace_prefix_from_response;
 
 use super::handle_config;
@@ -61,46 +59,17 @@ pub(super) fn try_handle_client_command(
                 });
                 return true;
             }
-            if sub_bytes.eq_ignore_ascii_case(b"TRACKING") {
-                match crate::command::client::parse_tracking_args(cmd_args) {
-                    Ok(config_parsed) => {
-                        if config_parsed.enable {
-                            conn.tracking_state.enabled = true;
-                            conn.tracking_state.bcast = config_parsed.bcast;
-                            conn.tracking_state.noloop = config_parsed.noloop;
-                            conn.tracking_state.optin = config_parsed.optin;
-                            conn.tracking_state.optout = config_parsed.optout;
-                            if conn.tracking_rx.is_none() {
-                                let (tx, rx) = channel::mpsc_bounded::<Frame>(256);
-                                conn.tracking_state.invalidation_tx = Some(tx.clone());
-                                conn.tracking_rx = Some(rx);
-                                let mut table = ctx.tracking_table.lock();
-                                table.register_client(client_id, tx);
-                                if let Some(target) = config_parsed.redirect {
-                                    table.set_redirect(client_id, target);
-                                }
-                                for prefix in &config_parsed.prefixes {
-                                    table.register_prefix(
-                                        client_id,
-                                        prefix.clone(),
-                                        config_parsed.noloop,
-                                    );
-                                }
-                            }
-                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                        } else {
-                            conn.tracking_state = TrackingState::default();
-                            ctx.tracking_table.lock().untrack_all(client_id);
-                            conn.tracking_rx = None;
-                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                        }
-                        return true;
-                    }
-                    Err(err_frame) => {
-                        responses.push(err_frame);
-                        return true;
-                    }
-                }
+            // TRACKING, CACHING, TRACKINGINFO, GETREDIR: shared with the
+            // other two handlers (moon#1049).
+            if let Some(reply) = crate::tracking::client_cmd::handle(
+                cmd_args,
+                client_id,
+                &mut conn.tracking_state,
+                &mut conn.tracking_rx,
+                &ctx.tracking_table,
+            ) {
+                responses.push(reply);
+                return true;
             }
             if sub_bytes.eq_ignore_ascii_case(b"LIST") {
                 // Update our own entry before listing
@@ -288,6 +257,15 @@ pub(super) fn try_handle_replicaof(
     }
     use crate::command::connection::{ReplicaofAction, replicaof};
     let (resp, action) = replicaof(cmd_args);
+    // moon#1015: a multi-shard node cannot run the replica task. Refuse here,
+    // BEFORE the role flip and the epoch bump below — acking `+OK` first left
+    // the node read-only, killed any running replica task, and never synced.
+    if matches!(action, Some(ReplicaofAction::StartReplication { .. }))
+        && let Some(refusal) = crate::replication::replica::replica_start_refusal(ctx.num_shards)
+    {
+        responses.push(refusal);
+        return true;
+    }
     if let Some(action) = action {
         if let Some(ref rs) = ctx.repl_state {
             match action {

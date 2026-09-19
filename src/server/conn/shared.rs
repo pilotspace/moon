@@ -14,6 +14,7 @@ use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch};
 use crate::config::{RuntimeConfig, ServerConfig};
 use crate::protocol::Frame;
+use crate::shard::exec_publish::{ExecPublish, PublishKind};
 use crate::shard::shared_databases::ShardDatabases;
 #[cfg(feature = "runtime-tokio")]
 use crate::storage::Database;
@@ -247,6 +248,60 @@ fn watch_conflict(db_index: usize, watched: &HashMap<Bytes, WatchToken>) -> bool
     })
 }
 
+/// The database write guards `execute_transaction` holds for a whole body.
+///
+/// Normally just the db selected at EXEC time. A body holding a `MOVE` or a
+/// `COPY ... DB n` also writes a second db whose index is known only from the
+/// command, so for those bodies every db is taken up front, in ascending
+/// order — the same order `with_two_dbs_locked` uses — and held to the end of
+/// the body. Taking the destination lazily while holding the source would
+/// invert that order whenever the destination is the lower index, and could
+/// deadlock against a concurrent MOVE going the other way.
+#[cfg(feature = "runtime-tokio")]
+enum TxnLocks<'a> {
+    One(parking_lot::RwLockWriteGuard<'a, Database>),
+    All(Vec<parking_lot::RwLockWriteGuard<'a, Database>>),
+}
+
+#[cfg(feature = "runtime-tokio")]
+impl<'a> TxnLocks<'a> {
+    fn acquire(db: &'a SharedDatabases, entry_db: usize, command_queue: &[Frame]) -> Self {
+        let needs_two_dbs = command_queue.iter().any(|f| {
+            extract_command(f).is_some_and(|(cmd, args)| {
+                cmd.eq_ignore_ascii_case(b"MOVE")
+                    || (cmd.eq_ignore_ascii_case(b"COPY") && copy_has_db_clause(args))
+            })
+        });
+        if needs_two_dbs {
+            TxnLocks::All(db.iter().map(|lock| lock.write()).collect())
+        } else {
+            TxnLocks::One(db[entry_db].write())
+        }
+    }
+
+    fn primary(&mut self, entry_db: usize) -> &mut Database {
+        match self {
+            TxnLocks::One(guard) => guard,
+            TxnLocks::All(guards) => &mut guards[entry_db],
+        }
+    }
+
+    /// `(src, dst)` for two distinct held dbs, or `None` when only one is held.
+    fn pair(&mut self, src: usize, dst: usize) -> Option<(&mut Database, &mut Database)> {
+        let TxnLocks::All(guards) = self else {
+            return None;
+        };
+        let (low_idx, high_idx) = (src.min(dst), src.max(dst));
+        if low_idx == high_idx || high_idx >= guards.len() {
+            return None;
+        }
+        let (below, from_high) = guards.split_at_mut(high_idx);
+        let low: &mut Database = &mut below[low_idx];
+        let high: &mut Database = &mut from_high[0];
+        Some(if src < dst { (low, high) } else { (high, low) })
+    }
+}
+
 /// Execute a queued transaction atomically under a single database lock.
 ///
 /// Checks WATCH versions first -- if any watched key's version has changed since
@@ -260,15 +315,19 @@ pub(crate) fn execute_transaction(
     command_queue: &[Frame],
     watched_keys: &HashMap<Bytes, WatchToken>,
     selected_db: &mut usize,
-    exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
+    exec_publishes: &mut Vec<ExecPublish>,
 ) -> (Frame, Vec<Bytes>) {
-    let mut guard = db[*selected_db].write();
     let db_count = db.len();
-    guard.refresh_now();
+    // Every body command runs against the db selected at EXEC time (the
+    // caller attributes every record to it), so that db is also the source
+    // of a queued MOVE / COPY ... DB n.
+    let entry_db = *selected_db;
+    let mut locks = TxnLocks::acquire(db, entry_db, command_queue);
+    locks.primary(entry_db).refresh_now();
 
     // Check WATCH versions -- if any key's version changed, abort
     for (key, watched_version) in watched_keys {
-        let current_version = guard.get_version(key);
+        let current_version = locks.primary(entry_db).get_version(key);
         if current_version != watched_version.version {
             // Null ARRAY, not null bulk: Redis answers an aborted EXEC with
             // `*-1`, and every client library decodes EXEC as an array — so
@@ -319,7 +378,9 @@ pub(crate) fn execute_transaction(
         // for a queued BLPOP.
         if crate::server::conn::blocking_txn::queues_unrewritten(cmd) {
             if let Some(outcome) = crate::server::conn::blocking_txn::try_exec_blocking_in_txn(
-                cmd, cmd_args, &mut guard,
+                cmd,
+                cmd_args,
+                locks.primary(entry_db),
             ) {
                 if let Some(effect) = outcome.effect {
                     let mut buf = BytesMut::new();
@@ -339,7 +400,46 @@ pub(crate) fn execute_transaction(
         // the caller attributes every entry to that one db.
         let is_write = metadata::is_persisted_write(cmd);
 
-        let result = dispatch(&mut *guard, cmd, cmd_args, selected_db, db_count);
+        // moon#1062: MOVE / COPY ... DB n need the destination db too — the
+        // single-db `dispatch()` below errored on MOVE and wrote a COPY into
+        // the source db. `TxnLocks::acquire` already holds every database for
+        // a body that contains one. Record verbatim on `:1` only, as the live
+        // intercepts do; the caller files it under `entry_db`, the source.
+        if let Some(two_db) =
+            crate::command::keyspace::move_cmd::resolve_two_db(cmd, cmd_args, entry_db, db_count)
+        {
+            let response = match two_db {
+                Err(reply) => reply,
+                Ok(op) => match locks.pair(entry_db, op.dst_db()) {
+                    Some((src, dst)) => {
+                        dst.refresh_now();
+                        op.apply(src, dst)
+                    }
+                    // Unreachable: `acquire` takes every db whenever the body
+                    // holds a MOVE or a COPY with a DB clause, which is the
+                    // only way `resolve_two_db` yields `Ok`. Refuse rather
+                    // than write the wrong db.
+                    None => Frame::Error(Bytes::from_static(
+                        b"ERR MOVE/COPY could not lock its destination database",
+                    )),
+                },
+            };
+            if matches!(response, Frame::Integer(1)) {
+                aof_entries.push(crate::persistence::aof::serialize_command_for_log(
+                    cmd_frame,
+                ));
+            }
+            results.push(response);
+            continue;
+        }
+
+        let result = dispatch(
+            locks.primary(entry_db),
+            cmd,
+            cmd_args,
+            selected_db,
+            db_count,
+        );
         let response = match result {
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f, // QUIT inside MULTI just returns OK
@@ -387,7 +487,7 @@ pub(crate) fn execute_transaction(
 /// order as the live path).
 pub(crate) fn execute_transaction_sharded(
     shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
-    _shard_id: usize,
+    shard_id: usize,
     command_queue: &[Frame],
     selected_db: usize,
     // `proto`: the connection's protocol version. Each inner reply is
@@ -397,7 +497,7 @@ pub(crate) fn execute_transaction_sharded(
     // the calling context.
     proto: u8,
     cached_clock: &CachedClock,
-    exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
+    exec_publishes: &mut Vec<ExecPublish>,
     exec_flushes: &mut Vec<(usize, Frame, usize)>,
     // moon#606: keys this body wrote that a blocked client may be waiting on.
     // Raised by the CALLER after the body, never here — see the collection
@@ -408,6 +508,10 @@ pub(crate) fn execute_transaction_sharded(
     // transactions, which is why the check below early-outs on `is_empty`
     // before touching the shard at all.
     watched_keys: &HashMap<Bytes, WatchToken>,
+    // moon#894: what a queued EVAL/EVALSHA/FCALL (and `_RO` twins) needs to
+    // run here. `None` when the body holds no script — the caller builds it
+    // only then (`txn_script::queue_has_script`).
+    scripting: Option<&super::txn_script::TxnScripting<'_>>,
 ) -> (Frame, Vec<(usize, Bytes)>, Vec<(usize, Vec<u8>)>) {
     let db_count = shard_databases.db_count();
 
@@ -473,6 +577,39 @@ pub(crate) fn execute_transaction_sharded(
         }
 
         if queue_exec_publish(cmd, cmd_args, &mut results, exec_publishes) {
+            continue;
+        }
+
+        // moon#894: a queued script runs HERE, in body order, instead of
+        // falling through to `dispatch()` — which has no scripting arm and
+        // answered `ERR unknown command` while the rest of the body committed.
+        // Its effect records join `aof_entries` at this position, so replay
+        // and replicas see the script's writes exactly where the client
+        // queued them (see `txn_script` for the full contract).
+        if super::txn_script::is_txn_script(cmd) {
+            let Some(env) = scripting else {
+                results.push(Frame::Error(Bytes::from_static(
+                    b"ERR scripting is unavailable on this shard",
+                )));
+                continue;
+            };
+            let outcome = super::txn_script::run_txn_script(env, cmd, cmd_args, selected, shard_id);
+            aof_entries.extend(outcome.effects);
+            if let Some(which) = outcome.flush {
+                // This shard's half is done; the caller broadcasts the rest
+                // exactly as for a queued FLUSHALL (c10k E2 contract above).
+                exec_flushes.push((
+                    results.len(),
+                    crate::scripting::pending_flush::broadcast_frame(which),
+                    selected,
+                ));
+            }
+            results.push(super::util::apply_resp3_conversion(
+                cmd,
+                cmd_args,
+                outcome.reply,
+                proto,
+            ));
             continue;
         }
 
@@ -558,6 +695,43 @@ pub(crate) fn execute_transaction_sharded(
             results.push(super::util::apply_resp3_conversion(
                 cmd, cmd_args, response, proto,
             ));
+            continue;
+        }
+
+        // moon#1062: `MOVE` and `COPY ... DB n` need two databases, which the
+        // single-db `dispatch()` below cannot give them — MOVE answered its
+        // "requires handler-level dispatch" error, and COPY ignored the DB
+        // clause and wrote the copy into the SOURCE db while its record (which
+        // replicas and replay apply into the named db) was logged verbatim.
+        // Run them here instead, with the same helpers every live path uses.
+        //
+        // `selected` is the source: a SELECT queued earlier in the body has
+        // already redirected it, exactly as for every other command here. The
+        // record is the command verbatim, under that db, and only on `:1` —
+        // the live intercepts' rule, so a no-op leaves no record.
+        if let Some(two_db) =
+            crate::command::keyspace::move_cmd::resolve_two_db(cmd, cmd_args, selected, db_count)
+        {
+            let response = match two_db {
+                Err(reply) => reply,
+                // `resolve_two_db` never yields `dst_db == selected`, so
+                // `with_pair`'s distinct-index precondition holds; both
+                // indexes were bounds-checked against `db_count`.
+                Ok(op) => crate::shard::slice::with_shard(|s| {
+                    s.databases.with_pair(selected, op.dst_db(), |src, dst| {
+                        src.refresh_now_from_cache(cached_clock);
+                        dst.refresh_now_from_cache(cached_clock);
+                        op.apply(src, dst)
+                    })
+                }),
+            };
+            if matches!(response, Frame::Integer(1)) {
+                aof_entries.push((
+                    selected,
+                    crate::persistence::aof::serialize_command_for_log(cmd_frame),
+                ));
+            }
+            results.push(response);
             continue;
         }
 
@@ -777,34 +951,46 @@ pub(crate) async fn persist_txn_aof(
     Ok(())
 }
 
-/// Shared PUBLISH-inside-MULTI intercept for both transaction executors (C2).
+/// Shared PUBLISH/SPUBLISH-inside-MULTI intercept for every transaction
+/// executor (C2; SPUBLISH since moon#1043).
 ///
-/// Returns `true` when `cmd` is PUBLISH: pushes a `Frame::Integer(0)`
-/// placeholder (or an arity error) into `results` and records
-/// `(result_index, channel, message)` in `exec_publishes` so the caller can
-/// fan the message out AFTER the transaction body and patch the placeholder
-/// with the real receiver count.
+/// Returns `true` when `cmd` is `PUBLISH` or `SPUBLISH`: pushes a
+/// `Frame::Integer(0)` placeholder (or an arity error) into `results` and
+/// records an [`ExecPublish`] so the caller can fan the message out AFTER the
+/// transaction body, into the right namespace, and patch the placeholder with
+/// the real receiver count.
+///
+/// moon#1043: this matched `PUBLISH` only, so a queued `SPUBLISH` fell through
+/// to `dispatch()` — which has no pub/sub arm — and EXEC answered
+/// `ERR unknown command` for that slot while the rest of the body committed:
+/// the shard-channel message was silently dropped.
 fn queue_exec_publish(
     cmd: &[u8],
     cmd_args: &[Frame],
     results: &mut Vec<Frame>,
-    exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
+    exec_publishes: &mut Vec<ExecPublish>,
 ) -> bool {
-    if !cmd.eq_ignore_ascii_case(b"PUBLISH") {
+    let Some(kind) = PublishKind::of(cmd) else {
         return false;
-    }
+    };
     if cmd_args.len() != 2 {
-        results.push(Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'publish' command",
-        )));
+        results.push(Frame::Error(Bytes::from_static(match kind {
+            PublishKind::Global => b"ERR wrong number of arguments for 'publish' command",
+            PublishKind::Shard => b"ERR wrong number of arguments for 'spublish' command",
+        })));
         return true;
     }
     match (
         super::util::extract_bytes(&cmd_args[0]),
         super::util::extract_bytes(&cmd_args[1]),
     ) {
-        (Some(ch), Some(msg)) => {
-            exec_publishes.push((results.len(), ch, msg));
+        (Some(channel), Some(message)) => {
+            exec_publishes.push(ExecPublish {
+                slot: results.len(),
+                channel,
+                message,
+                kind,
+            });
             results.push(Frame::Integer(0)); // patched by the caller post-txn
         }
         _ => results.push(Frame::Error(Bytes::from_static(
@@ -814,15 +1000,96 @@ fn queue_exec_publish(
     true
 }
 
+#[cfg(test)]
+mod exec_publish_queue_tests {
+    //! moon#1043: both publish verbs queue a placeholder plus a deferred
+    //! fan-out record tagged with the RIGHT namespace.
+    use super::{ExecPublish, PublishKind, queue_exec_publish};
+    use crate::protocol::Frame;
+    use bytes::Bytes;
+
+    fn argv(parts: &[&'static str]) -> Vec<Frame> {
+        parts
+            .iter()
+            .map(|p| Frame::BulkString(Bytes::from_static(p.as_bytes())))
+            .collect()
+    }
+
+    fn record(p: &ExecPublish) -> (usize, &[u8], &[u8], PublishKind) {
+        (p.slot, &p.channel[..], &p.message[..], p.kind)
+    }
+
+    #[test]
+    fn spublish_and_publish_queue_into_their_own_namespace() {
+        let mut results = vec![Frame::SimpleString(Bytes::from_static(b"OK"))];
+        let mut pubs = Vec::new();
+        assert!(queue_exec_publish(
+            b"spublish",
+            &argv(&["sch", "m1"]),
+            &mut results,
+            &mut pubs
+        ));
+        assert!(queue_exec_publish(
+            b"PUBLISH",
+            &argv(&["ch", "m2"]),
+            &mut results,
+            &mut pubs
+        ));
+        assert_eq!(results.len(), 3, "one placeholder per publish");
+        assert!(matches!(results[1], Frame::Integer(0)));
+        assert!(matches!(results[2], Frame::Integer(0)));
+        assert_eq!(
+            pubs.iter().map(record).collect::<Vec<_>>(),
+            vec![
+                (1, &b"sch"[..], &b"m1"[..], PublishKind::Shard),
+                (2, &b"ch"[..], &b"m2"[..], PublishKind::Global),
+            ]
+        );
+    }
+
+    #[test]
+    fn spublish_arity_error_names_spublish_and_records_nothing() {
+        let mut results = Vec::new();
+        let mut pubs = Vec::new();
+        assert!(queue_exec_publish(
+            b"SPUBLISH",
+            &argv(&["only-channel"]),
+            &mut results,
+            &mut pubs
+        ));
+        assert!(pubs.is_empty());
+        assert!(matches!(
+            &results[0],
+            Frame::Error(e) if &e[..] == b"ERR wrong number of arguments for 'spublish' command"
+        ));
+    }
+
+    #[test]
+    fn other_commands_are_not_intercepted() {
+        let mut results = Vec::new();
+        let mut pubs = Vec::new();
+        for cmd in [&b"SSUBSCRIBE"[..], b"SET", b"PUBSUB"] {
+            assert!(!queue_exec_publish(
+                cmd,
+                &argv(&["a", "b"]),
+                &mut results,
+                &mut pubs
+            ));
+        }
+        assert!(results.is_empty() && pubs.is_empty());
+    }
+}
+
 /// Channel-ACL gate for PUBLISH. Returns the `NOPERM` error frame when `user`
 /// lacks permission on `channel` (caller must skip the fan-out and patch the
 /// reply with it), or `None` when allowed.
 ///
 /// Used by both the immediate single-handler PUBLISH and the transactional
 /// (MULTI/EXEC) fan-out in all three handlers, so a client denied a channel
-/// cannot wrap `PUBLISH` in `MULTI/EXEC` to bypass the check. Moon has no
-/// queue-time EXECABORT machinery, so the transactional check runs at fan-out
-/// time rather than at queue time.
+/// cannot wrap `PUBLISH` in `MULTI/EXEC` to bypass the check. Since moon#1035
+/// the channel is ALSO checked at queue time ([`queued_publish_channel_deny`]),
+/// which poisons the transaction as redis does; this EXEC-time check remains
+/// for rules that change between queue and EXEC.
 pub(crate) fn publish_channel_acl_deny(
     acl_table: &std::sync::RwLock<crate::acl::AclTable>,
     user: &str,
@@ -833,6 +1100,47 @@ pub(crate) fn publish_channel_acl_deny(
     guard
         .check_channel_permission(user, channel)
         .map(|reason| Frame::Error(Bytes::from(format!("NOPERM {reason}"))))
+}
+
+/// Queue-time channel-ACL check for a `PUBLISH`/`SPUBLISH` sent inside `MULTI`
+/// (moon#1035). Returns the `NOPERM` frame the caller answers INSTEAD of
+/// `+QUEUED`, after flagging the transaction; `None` for every other command
+/// and for a permitted channel.
+///
+/// The generic ACL gate checks the command and its keys but never a channel —
+/// outside a transaction `PUBLISH` checks its own channel in its intercept, and
+/// inside one the intercept is skipped so the command can queue. The channel
+/// was therefore only checked by the EXEC-time fan-out above, after the rest
+/// of the block had applied. Measured against redis-server 8.6.1, `&allowed`
+/// user:
+///
+/// ```text
+/// MULTI / SET c1 1 / PUBLISH secret x / EXEC
+///   redis -> +QUEUED -NOPERM -EXECABORT          (c1 unset)
+///   moon  -> +QUEUED +QUEUED *2 +OK -NOPERM      (c1 SET)
+/// ```
+///
+/// The reply is [`publish_channel_acl_deny`]'s, the frame moon already answers
+/// for the same `PUBLISH` outside a transaction, so the two cannot drift. The
+/// EXEC-time check stays: ACL rules can change between queue and EXEC, and
+/// redis re-checks there too.
+///
+/// A malformed argv (no channel) returns `None`; the queue gate's arity check
+/// has already refused it.
+pub(crate) fn queued_publish_channel_deny(
+    acl_table: &std::sync::RwLock<crate::acl::AclTable>,
+    user: &str,
+    cmd: &[u8],
+    args: &[Frame],
+) -> Option<Frame> {
+    if !(cmd.eq_ignore_ascii_case(b"PUBLISH") || cmd.eq_ignore_ascii_case(b"SPUBLISH")) {
+        return None;
+    }
+    let channel = match args.first() {
+        Some(Frame::BulkString(b) | Frame::SimpleString(b)) => b.as_ref(),
+        _ => return None,
+    };
+    publish_channel_acl_deny(acl_table, user, channel)
 }
 
 /// Command-level ACL gate for the pub/sub intercepts (H-3). PUBLISH/SUBSCRIBE/
@@ -859,28 +1167,44 @@ pub(crate) fn pubsub_command_acl_deny(
         .map(|reason| Frame::Error(Bytes::from(format!("NOPERM {reason}"))))
 }
 
-/// Fan out one EXEC-queued PUBLISH (C2): local shard synchronously, remote
-/// shards via targeted `PubSubPublish` SPSC messages, awaited so the returned
-/// count matches the immediate-PUBLISH path. Called by the sharded handlers
+/// Fan out one EXEC-queued PUBLISH or SPUBLISH (C2, moon#1043): local shard
+/// synchronously, remote shards via targeted SPSC messages, awaited so the
+/// returned count matches the immediate path. Called by the sharded handlers
 /// after `execute_transaction_sharded` returns — i.e. after every write queued
-/// before the PUBLISH has been applied.
+/// before the publish has been applied.
+///
+/// `kind` picks the namespace end to end, exactly as the immediate
+/// `try_handle_publish` does: the local registry (`publish_shared` vs
+/// `spublish_shared`), the remote-subscriber map (`target_shards` vs
+/// `shard_target_shards`) and the SPSC message (`PubSubPublish` vs a
+/// one-pair `SPublishBatch`). A shard channel's subscribers are registered on
+/// their connections' shards, so SPUBLISH fans out the same way PUBLISH does.
 pub(crate) async fn publish_post_txn(
     ctx: &super::core::ConnectionContext,
     shutdown: &crate::runtime::cancel::CancellationToken,
     channel: &Bytes,
     message: &Bytes,
+    kind: PublishKind,
 ) -> i64 {
     use crate::shard::mesh::ChannelMesh;
     use ringbuf::traits::Producer;
 
-    let local_count = crate::pubsub::publish_shared(&ctx.pubsub_registry, channel, message);
-    let remote_targets: Vec<usize> = ctx
-        .remote_subscriber_map
-        .read()
-        .target_shards(channel)
-        .into_iter()
-        .filter(|&t| t != ctx.shard_id)
-        .collect();
+    let local_count = match kind {
+        PublishKind::Global => {
+            crate::pubsub::publish_shared(&ctx.pubsub_registry, channel, message)
+        }
+        PublishKind::Shard => {
+            crate::pubsub::spublish_shared(&ctx.pubsub_registry, channel, message)
+        }
+    };
+    let targets = {
+        let map = ctx.remote_subscriber_map.read();
+        match kind {
+            PublishKind::Global => map.target_shards(channel),
+            PublishKind::Shard => map.shard_target_shards(channel),
+        }
+    };
+    let remote_targets: Vec<usize> = targets.into_iter().filter(|&t| t != ctx.shard_id).collect();
     if remote_targets.is_empty() {
         return local_count;
     }
@@ -893,13 +1217,21 @@ pub(crate) async fn publish_post_txn(
         // transiently-full ring no longer loses the message. The borrow of
         // `dispatch_tx` is taken+released inside each attempt, never held
         // across the backoff await.
-        let mut pending = Some(crate::shard::dispatch::ShardMessage::PubSubPublish(
-            Box::new(crate::shard::dispatch::PubSubPublishPayload {
-                channel: channel.clone(),
-                message: message.clone(),
+        let mut pending = Some(match kind {
+            PublishKind::Global => crate::shard::dispatch::ShardMessage::PubSubPublish(Box::new(
+                crate::shard::dispatch::PubSubPublishPayload {
+                    channel: channel.clone(),
+                    message: message.clone(),
+                    slot: slot.clone(),
+                },
+            )),
+            // No single-pair SPUBLISH variant exists; a one-pair batch lands in
+            // the target's SHARDED registry and adds its count to `slot`.
+            PublishKind::Shard => crate::shard::dispatch::ShardMessage::SPublishBatch {
+                pairs: vec![(channel.clone(), message.clone())],
                 slot: slot.clone(),
-            }),
-        ));
+            },
+        });
         let idx = ChannelMesh::target_index(ctx.shard_id, *target);
         let outcome = crate::shard::dispatch::push_with_backpressure(
             shutdown,
@@ -929,7 +1261,7 @@ pub(crate) async fn publish_post_txn(
                 // reply can't hang — but LOUDLY: this is real message loss to
                 // that shard's subscribers (was a silent drop pre-E1).
                 tracing::warn!(
-                    "shard {}: EXEC PUBLISH fan-out to shard {target} dropped ({outcome:?})",
+                    "shard {}: EXEC {kind:?} publish fan-out to shard {target} dropped ({outcome:?})",
                     ctx.shard_id
                 );
                 crate::admin::metrics_setup::record_xshard_fanout_drop("publish");
@@ -2104,14 +2436,6 @@ pub(crate) const CROSS_SHARD_WRITE_ERROR: &[u8] =
 ///   entry points (`blocking::immediate_scan`, `blocking::wakeup`) that this
 ///   pre-routing guard cannot see. Two overlapping guards for one family would
 ///   be worse than one complete one.
-/// * `ZDIFFSTORE` — not implemented in moon (unknown command), so there is
-///   no write to misplace, and claiming `CROSSSLOT` would send a client
-///   chasing hash tags for a command that will never work.
-///   `tests/two_key_write_cross_shard.rs::t2k4` fails the moment it starts
-///   working, which is when it must be added here. `GEORADIUS`/
-///   `GEORADIUSBYMEMBER` used to sit in this same bucket; moon#645
-///   implemented their `STORE`/`STOREDIST` clause, so they moved INTO the
-///   family below in the same change that made them able to write.
 /// * `TOUCH` — the one member of the moon#962 family that is genuinely
 ///   per-key decomposable. It is in `is_multi_key_command` and
 ///   [`splittable_read_kind`], so it FANS OUT and sums, exactly like `EXISTS`.
@@ -2158,6 +2482,24 @@ pub(crate) const CROSS_SHARD_WRITE_ERROR: &[u8] =
 /// this list once it merges properly; each such change removes an error and
 /// cannot regress correctness, which is the direction that is safe to defer.
 ///
+/// # moon#959 — `ZDIFFSTORE` is IN the family, and used not to be
+///
+/// This block used to carry a `ZDIFFSTORE` bullet in the EXCLUDED list above,
+/// reading "not implemented in moon (unknown command), so there is no write to
+/// misplace". moon#959 implemented it, so that sentence is now false and the
+/// bullet is gone: `ZDIFFSTORE dst numkeys src ...` routes on `dst` and reads
+/// every source, the identical shape to `ZUNIONSTORE`/`ZINTERSTORE`. It is
+/// matched in the `(10, b'z')` arm below, which it SHARES with `ZINTERCARD` —
+/// same length, same first byte, so an arm that names only one of them
+/// silently drops the other.
+///
+/// `GEORADIUS`/`GEORADIUSBYMEMBER` made the same trip when moon#645 gave them
+/// a `STORE`/`STOREDIST` clause. The tripwire that forces the migration is
+/// `tests/two_key_write_cross_shard.rs::t2k4`, and the measured cost of
+/// skipping it is in `t2k1`: with the `ZDIFFSTORE` spelling removed from the
+/// arm below and everything else in place, 12 of 180 placements at
+/// `--shards 4` ack `ZDIFFSTORE` while the destination lands nowhere.
+///
 /// Matched on `(len, first byte)` first so a single-key command falls through
 /// after one integer compare and never reaches the key walk.
 fn touches_a_key_it_did_not_route_on(cmd: &[u8]) -> bool {
@@ -2197,11 +2539,25 @@ fn touches_a_key_it_did_not_route_on(cmd: &[u8]) -> bool {
         // path — strictly worse than either endpoint. See the family doc
         // above for the measured pop.
         (5, b'l') => cmd.eq_ignore_ascii_case(b"LMPOP"),
+        // moon#989: the blocking twins. They never reach the pre-routing
+        // guard — the connection handlers intercept every blocking command
+        // first — so `blocking::immediate_scan` consults this function itself,
+        // before it pops or registers anything. Listed HERE so there is one
+        // family list, not two that can drift.
+        (6, b'b') => cmd.eq_ignore_ascii_case(b"BLMPOP") || cmd.eq_ignore_ascii_case(b"BZMPOP"),
         (3, b'l') => cmd.eq_ignore_ascii_case(b"LCS"),
         (5, b'z') => cmd.eq_ignore_ascii_case(b"ZMPOP") || cmd.eq_ignore_ascii_case(b"ZDIFF"),
         (6, b's') => cmd.eq_ignore_ascii_case(b"SINTER") || cmd.eq_ignore_ascii_case(b"SUNION"),
         (6, b'z') => cmd.eq_ignore_ascii_case(b"ZINTER") || cmd.eq_ignore_ascii_case(b"ZUNION"),
-        (10, b'z') => cmd.eq_ignore_ascii_case(b"ZINTERCARD"),
+        // One arm, two unrelated additions: `ZINTERCARD` is a moon#962
+        // multi-key READ, `ZDIFFSTORE` a moon#959 two-key WRITE routed on its
+        // destination. They collide on `(10, b'z')`, so naming only one of
+        // them here silently drops the other from the guard — for
+        // `ZDIFFSTORE` that is the moon#592 misdirected write, measured in
+        // `t2k1`. Keep both spellings.
+        (10, b'z') => {
+            cmd.eq_ignore_ascii_case(b"ZINTERCARD") || cmd.eq_ignore_ascii_case(b"ZDIFFSTORE")
+        }
         (14, b'g') => cmd.eq_ignore_ascii_case(b"GEOSEARCHSTORE"),
         // `GEORADIUS src ... STORE|STOREDIST dst` (moon#645). Without the
         // clause the walker reports one key and this check is a no-op, so no
@@ -2305,7 +2661,9 @@ pub(crate) fn cross_shard_multikey_rejection(
     args: &[Frame],
     num_shards: usize,
 ) -> Option<Frame> {
-    if num_shards <= 1 || !touches_a_key_it_did_not_route_on(cmd) {
+    if num_shards <= 1
+        || !(touches_a_key_it_did_not_route_on(cmd) || is_copy_with_db_clause(cmd, args))
+    {
         return None;
     }
     // The shared key-position walker (moon#582) — the same one ACL and cache
@@ -2384,15 +2742,43 @@ pub(crate) fn is_multi_key_command(cmd: &[u8], args: &[Frame]) -> bool {
         // owned by the handlers' two-db interception (cross-db + cross-shard
         // simultaneously is unsupported, as before).
         (4, b'c') => {
-            args.len() >= 2
-                && cmd.eq_ignore_ascii_case(b"COPY")
-                && !args
-                    .iter()
-                    .skip(2)
-                    .any(|a| matches!(a, Frame::BulkString(o) if o.eq_ignore_ascii_case(b"DB")))
+            args.len() >= 2 && cmd.eq_ignore_ascii_case(b"COPY") && !copy_has_db_clause(args)
         }
         _ => false,
     }
+}
+
+/// moon#1062: `COPY src dst DB n [REPLACE]` joins the two-key write family.
+///
+/// Without the DB clause, `COPY` is coordinator-routed and correct across
+/// shards (`is_multi_key_command`). WITH it, the command is excluded from the
+/// coordinator (which cannot pick a second database) and routed by `src`
+/// alone, so the owner of `src` ran the two-db intercept against ITS slice and
+/// wrote `dst` there. Measured at `--shards 4` with 12 constructed split
+/// placements: every `COPY src dst DB 3` and `COPY src dst DB 0` acked `:1`
+/// and the destination was unreadable by a normally routed `GET` (while
+/// `DBSIZE`, which sums the shards, counted it). The AOF logged it on the
+/// wrong shard too, so a restart kept it misplaced.
+///
+/// Refused like the rest of the family, from the key names alone before
+/// anything is touched. Kept out of `touches_a_key_it_did_not_route_on`
+/// because that list is keyed on the command name alone and a DB-less COPY
+/// must keep fanning out.
+fn is_copy_with_db_clause(cmd: &[u8], args: &[Frame]) -> bool {
+    cmd.len() == 4 && cmd.eq_ignore_ascii_case(b"COPY") && copy_has_db_clause(args)
+}
+
+/// True when a `COPY src dst ...` argv carries a `DB` clause.
+///
+/// One predicate for every consumer that must agree on it: the multi-key
+/// router (a COPY with a DB clause is not coordinator-routed), the cross-shard
+/// refusal (moon#1062: the same command is refused when its keys span shards)
+/// and the embedded transaction executor's lock plan. Only the option tokens
+/// after the two key names are inspected, so a key named `DB` is not a clause.
+pub(crate) fn copy_has_db_clause(args: &[Frame]) -> bool {
+    args.iter()
+        .skip(2)
+        .any(|a| matches!(a, Frame::BulkString(o) if o.eq_ignore_ascii_case(b"DB")))
 }
 
 /// moon#570: the refusal a non-blocking list MOVE is owed when its two keys
@@ -5035,6 +5421,12 @@ mod cross_shard_write_tests {
         ("ZRANGESTORE", &["{d}", "{s}", "0", "-1"]),
         ("ZUNIONSTORE", &["{d}", "1", "{s}"]),
         ("ZINTERSTORE", &["{d}", "1", "{s}"]),
+        // moon#959 implemented ZDIFFSTORE. Until it did, the test below
+        // asserted the OPPOSITE — that the guard must not claim it — because
+        // an unimplemented command has no write to misplace. It shares the
+        // `(10, b'z')` arm with `ZINTERCARD`, so this row is what fails if a
+        // future edit narrows that arm back to one spelling.
+        ("ZDIFFSTORE", &["{d}", "1", "{s}"]),
         ("PFMERGE", &["{d}", "{s}"]),
         (
             "GEOSEARCHSTORE",
@@ -5191,15 +5583,11 @@ mod cross_shard_write_tests {
             cross_shard_multikey_rejection(b"TOUCH", &two, N).is_none(),
             "TOUCH is per-key decomposable and must fan out, never be refused"
         );
-        // ZDIFFSTORE is still unimplemented, and shares a `(10, 'z')` arm with
-        // ZINTERCARD. Claiming CROSSSLOT for it would send a client chasing
-        // hash tags for a command that will never work — the `t2k4` tripwire
-        // in `tests/two_key_write_cross_shard.rs` owns the migration.
-        assert!(
-            cross_shard_multikey_rejection(b"ZDIFFSTORE", &[bulk(&far), bulk("1"), bulk(src)], N)
-                .is_none(),
-            "ZDIFFSTORE is unimplemented; t2k4 owns the moment that changes"
-        );
+        // ZDIFFSTORE used to be asserted here as OUT of the family, on the
+        // grounds that an unimplemented command has no write to misplace.
+        // moon#959 implemented it, so it moved INTO `FAMILY` above and is
+        // asserted positively there — the migration the `t2k4` tripwire in
+        // `tests/two_key_write_cross_shard.rs` existed to force.
 
         // A SORT with no STORE clause names one key: nothing to straddle.
         let sort_ro = [bulk(src), bulk("LIMIT"), bulk("0"), bulk("10")];
@@ -5788,5 +6176,186 @@ mod pending_shard_mask_tests {
             "a single-key command routes by its own key and is ordered by the \
              slotted batch itself"
         );
+    }
+}
+
+#[cfg(test)]
+mod queued_publish_channel_tests {
+    //! moon#1035: the queue-time channel check for `PUBLISH`/`SPUBLISH` inside
+    //! `MULTI`. The end-to-end EXECABORT is proven against a live server in
+    //! `tests/multi_acl_queue_time_1035.rs`; this pins the predicate itself.
+    use super::{publish_channel_acl_deny, queued_publish_channel_deny};
+    use crate::acl::AclTable;
+    use crate::protocol::Frame;
+    use bytes::Bytes;
+
+    fn table() -> std::sync::RwLock<AclTable> {
+        let mut t = AclTable::new();
+        t.apply_setuser(
+            "c",
+            &["on", "nopass", "~*", "resetchannels", "&allowed", "+@all"],
+        );
+        std::sync::RwLock::new(t)
+    }
+
+    fn argv(parts: &[&str]) -> Vec<Frame> {
+        parts
+            .iter()
+            .map(|p| Frame::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+            .collect()
+    }
+
+    #[test]
+    fn denied_channel_is_refused_with_the_top_level_reply() {
+        let t = table();
+        for verb in [&b"PUBLISH"[..], b"SPUBLISH", b"publish"] {
+            let got = queued_publish_channel_deny(&t, "c", verb, &argv(&["secret", "x"]));
+            let top = publish_channel_acl_deny(&t, "c", b"secret");
+            assert!(
+                got.is_some(),
+                "{verb:?} to a denied channel must be refused"
+            );
+            assert_eq!(got, top, "the queue-time reply must be the top-level one");
+        }
+    }
+
+    #[test]
+    fn permitted_channel_and_other_commands_pass() {
+        let t = table();
+        assert!(
+            queued_publish_channel_deny(&t, "c", b"PUBLISH", &argv(&["allowed", "x"])).is_none()
+        );
+        // Not a publish: the first argument is a key, never a channel.
+        assert!(queued_publish_channel_deny(&t, "c", b"SET", &argv(&["secret", "x"])).is_none());
+        // Malformed: the queue gate's arity check owns this reply.
+        assert!(queued_publish_channel_deny(&t, "c", b"PUBLISH", &[]).is_none());
+    }
+}
+
+/// moon#1062 on the embedded (`handler_single`) executor: `MOVE` and
+/// `COPY ... DB n` queued inside MULTI must reach their destination db, and
+/// only a write that changed the keyspace may leave a record. The sharded
+/// executor is covered end to end by `tests/multi_move_copy_db_1062.rs`; this
+/// one is reachable only through the library entry point, so it is driven
+/// directly.
+#[cfg(all(test, feature = "runtime-tokio"))]
+mod embedded_txn_two_db_tests {
+    use super::*;
+
+    fn cmd(parts: &[&str]) -> Frame {
+        let items: Vec<Frame> = parts
+            .iter()
+            .map(|p| Frame::BulkString(Bytes::from(p.to_string())))
+            .collect();
+        Frame::Array(items.into())
+    }
+
+    fn set(db: &mut Database, key: &str, val: &str) {
+        db.set(
+            key.as_bytes(),
+            crate::storage::entry::Entry::new_string(Bytes::from(val.to_owned())),
+        );
+    }
+
+    fn value(dbs: &SharedDatabases, idx: usize, key: &str) -> Option<Vec<u8>> {
+        let mut db = dbs[idx].write();
+        let mut selected = idx;
+        let out = dispatch(
+            &mut db,
+            b"GET",
+            &[Frame::BulkString(Bytes::from(key.to_owned()))],
+            &mut selected,
+            16,
+        );
+        match out {
+            DispatchResult::Response(Frame::BulkString(b)) => Some(b.to_vec()),
+            _ => None,
+        }
+    }
+
+    fn err(text: &'static str) -> Frame {
+        Frame::Error(Bytes::from_static(text.as_bytes()))
+    }
+
+    #[test]
+    fn move_and_copy_db_inside_multi_write_the_named_db() {
+        let dbs: SharedDatabases = Arc::new(
+            (0..16)
+                .map(|_| parking_lot::RwLock::new(Database::new()))
+                .collect(),
+        );
+        {
+            let mut src = dbs[5].write();
+            set(&mut src, "m", "mv");
+            set(&mut src, "c", "cv");
+            set(&mut src, "coll", "src");
+        }
+        set(&mut dbs[1].write(), "coll", "dst");
+
+        // EXEC from db 5; destinations both below (1, 0) and above (9) it, so
+        // the pair is borrowed in both orders.
+        let queue = vec![
+            cmd(&["MOVE", "m", "1"]),
+            cmd(&["COPY", "c", "c2", "DB", "0"]),
+            cmd(&["COPY", "c", "c3", "db", "9", "REPLACE"]),
+            cmd(&["MOVE", "coll", "1"]),
+            cmd(&["MOVE", "c", "5"]),
+            cmd(&["COPY", "c", "c4", "DB", "16"]),
+            cmd(&["COPY", "c", "c5", "DB", "5"]),
+            cmd(&["GET", "c"]),
+        ];
+        let mut selected = 5usize;
+        let mut publishes = Vec::new();
+        let (reply, aof) =
+            execute_transaction(&dbs, &queue, &HashMap::new(), &mut selected, &mut publishes);
+
+        let Frame::Array(items) = reply else {
+            panic!("EXEC must answer an array, got {reply:?}");
+        };
+        assert_eq!(
+            items.to_vec(),
+            vec![
+                Frame::Integer(1),
+                Frame::Integer(1),
+                Frame::Integer(1),
+                Frame::Integer(0),
+                err("ERR source and destination objects are the same"),
+                err("ERR DB index is out of range"),
+                // A DB clause naming the source db is a plain same-db copy.
+                Frame::Integer(1),
+                Frame::BulkString(Bytes::from_static(b"cv")),
+            ]
+        );
+
+        assert_eq!(
+            value(&dbs, 5, "m"),
+            None,
+            "MOVE must take the key out of db 5"
+        );
+        assert_eq!(value(&dbs, 1, "m").as_deref(), Some(&b"mv"[..]));
+        assert_eq!(value(&dbs, 0, "c2").as_deref(), Some(&b"cv"[..]));
+        assert_eq!(value(&dbs, 9, "c3").as_deref(), Some(&b"cv"[..]));
+        assert_eq!(value(&dbs, 5, "c5").as_deref(), Some(&b"cv"[..]));
+        assert_eq!(
+            value(&dbs, 5, "c2"),
+            None,
+            "COPY ... DB 0 must not write db 5"
+        );
+        assert_eq!(
+            value(&dbs, 5, "c3"),
+            None,
+            "COPY ... DB 9 must not write db 5"
+        );
+        assert_eq!(value(&dbs, 5, "coll").as_deref(), Some(&b"src"[..]));
+        assert_eq!(value(&dbs, 1, "coll").as_deref(), Some(&b"dst"[..]));
+
+        // One record per write that changed the keyspace, verbatim, in body
+        // order: the three two-db commands that answered :1 and the same-db
+        // COPY. The no-op MOVE and the two errors leave none.
+        let want: Vec<Bytes> = [0usize, 1, 2, 6]
+            .iter()
+            .map(|&i| crate::persistence::aof::serialize_command_for_log(&queue[i]))
+            .collect();
+        assert_eq!(aof, want);
     }
 }

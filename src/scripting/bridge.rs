@@ -192,6 +192,11 @@ impl LuaEvictionCtx {
         let rt = inner.runtime_config.read();
         let budget = inner.shard_databases.elastic_budget(inner.shard_id);
         let mut on_plain_drop = |key: &[u8]| {
+            // moon#894: same body-order rule as `emit_effect`.
+            #[cfg(feature = "runtime-monoio")]
+            if capture_txn_del(db_index, key) {
+                return;
+            }
             #[cfg(feature = "runtime-monoio")]
             crate::replication::reason_del::record_reason_del_conn(
                 &inner.repl_state,
@@ -219,7 +224,7 @@ impl LuaEvictionCtx {
                     .budget(budget)
                     .report(&mut on_plain_drop),
             );
-            inner.spill_file_id.set(fid);
+            inner.spill_file_id.set(inner.spill_file_id.get().max(fid));
             res
         } else {
             evict_to_budget(
@@ -268,6 +273,11 @@ impl LuaEvictionCtx {
     /// derived from frame AND reply, so `redis.call('SPOP', k)` propagates as
     /// `SREM k <member>` and `redis.call('XADD', k, '*', …)` with its ID.
     fn emit_effect(&self, db_index: usize, cmd_and_args: &[Frame], reply: &Frame) {
+        // moon#894: inside a MULTI/EXEC body the effect joins the body's own
+        // record list, in order, instead of racing ahead of it.
+        if capture_txn_effect(db_index, cmd_and_args, reply) {
+            return;
+        }
         let Some(inner) = self.0.as_ref() else {
             return;
         };
@@ -281,6 +291,87 @@ impl LuaEvictionCtx {
             reply,
         );
     }
+}
+
+/// One captured durability record: the db it executed in, and its serialized
+/// command bytes (the same shape the MULTI/EXEC executor collects).
+pub(crate) type CapturedEffect = (usize, Bytes);
+
+thread_local! {
+    /// moon#894: while a MULTI/EXEC body runs a queued script, that script's
+    /// effect records land here instead of going straight to the AOF writer
+    /// and the replication stream.
+    ///
+    /// Outside a transaction a script emits each effect the moment its
+    /// `redis.call` succeeds, which is the right order because nothing else
+    /// runs on the shard meanwhile. Inside `EXEC` the body's OTHER writes are
+    /// collected and appended only after the whole body has run. A script
+    /// emitting directly would therefore put its effects AHEAD of the writes
+    /// queued before it: `SET k 1; EVAL "SET k 2"` would be logged `SET k 2;
+    /// SET k 1`, and a restart or a replica would read `1` where the master
+    /// answered `2`. Capturing puts the script's records into the body's list
+    /// at the script's own position.
+    ///
+    /// `None` outside a capture. Only the synchronous executor arms it, and
+    /// `capture_txn_effects` resets it on every exit path.
+    static TXN_EFFECT_CAPTURE: RefCell<Option<Vec<CapturedEffect>>> = const { RefCell::new(None) };
+}
+
+/// Run `run` with this thread's script-effect emission diverted into a
+/// buffer, and return that buffer in emission order (moon#894).
+///
+/// For the MULTI/EXEC executor only: `run` must be synchronous (no `.await`
+/// can happen inside a closure), so no other connection's script can
+/// interleave on this shard thread while the capture is armed.
+pub(crate) fn capture_txn_effects<R>(run: impl FnOnce() -> R) -> (R, Vec<CapturedEffect>) {
+    /// Disarms the capture even if `run` unwinds, so a panic cannot leave
+    /// every later script on this thread writing into a dead buffer.
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            TXN_EFFECT_CAPTURE.with(|c| c.borrow_mut().take());
+        }
+    }
+    TXN_EFFECT_CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    let disarm = Disarm;
+    let out = run();
+    let captured = TXN_EFFECT_CAPTURE
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_default();
+    drop(disarm);
+    (out, captured)
+}
+
+/// Record a script write effect into the armed capture. Returns `false`
+/// (nothing done) when no capture is armed.
+fn capture_txn_effect(db_index: usize, cmd_and_args: &[Frame], reply: &Frame) -> bool {
+    TXN_EFFECT_CAPTURE.with(|c| {
+        let mut slot = c.borrow_mut();
+        let Some(buf) = slot.as_mut() else {
+            return false;
+        };
+        let frame = Frame::Array(crate::protocol::FrameVec::from_vec(cmd_and_args.to_vec()));
+        // moon#825: frame AND reply, exactly as `record_effect_write` derives
+        // it. `None` means the reply proves nothing was written.
+        if let Some(bytes) = crate::persistence::aof::serialize_effect_for_log(&frame, reply) {
+            buf.push((db_index, bytes));
+        }
+        true
+    })
+}
+
+/// Record an eviction plain-drop `DEL` into the armed capture. Returns
+/// `false` when no capture is armed.
+#[cfg(feature = "runtime-monoio")]
+fn capture_txn_del(db_index: usize, key: &[u8]) -> bool {
+    TXN_EFFECT_CAPTURE.with(|c| {
+        let mut slot = c.borrow_mut();
+        let Some(buf) = slot.as_mut() else {
+            return false;
+        };
+        buf.push((db_index, crate::replication::reason_del::serialize_del(key)));
+        true
+    })
 }
 
 thread_local! {
@@ -770,15 +861,31 @@ mod tests {
     /// write. GREEN: keyed on the STATE predicate
     /// `eviction::write_gate_active()`.
     ///
-    /// `MAXMEMORY_GLOBAL` / `DB_MAXMEMORY_ANY_SET` are process-global and
-    /// other tests in this binary publish them, so each attempt samples both
-    /// before and after the gate call and only counts when they were unset
-    /// throughout. The probe counter is thread-local, so it cannot be moved
-    /// by another test's `evict_to_budget` call.
+    /// `MAXMEMORY_GLOBAL` / `DB_MAXMEMORY_ANY_SET` are process-global, so this
+    /// test ESTABLISHES the unset state it needs under a `PublishedLimits`
+    /// guard rather than observing whatever ambient state the suite left
+    /// behind, and the guard puts back what was there on drop.
+    ///
+    /// It used to loop 100 attempts, sampling both atomics around each gate
+    /// call and `continue`-ing when a sibling had a limit published — then
+    /// panicking with "could not observe an unset maxmemory in 100 attempts".
+    /// That retry made a PERMANENT leak (moon#856: five `command::config`
+    /// tests published a limit and never restored it) read as a flake for
+    /// months, and the CI waiver built on top of it kept the suite green. Both
+    /// are gone: the assertion below fires immediately and names the state it
+    /// actually saw. The probe counter is thread-local, so no other test's
+    /// `evict_to_budget` call can move it.
     #[test]
     fn gate_is_skipped_with_spill_sender_when_no_limit_is_configured() {
         use crate::storage::db_quota::db_maxmemory_any_set;
-        use crate::storage::eviction::{evict_to_budget_entries_on_this_thread, maxmemory_is_set};
+        use crate::storage::eviction::{
+            PublishedLimits, evict_to_budget_entries_on_this_thread, maxmemory_bytes,
+            maxmemory_is_set,
+        };
+
+        let _limits = PublishedLimits::capture();
+        crate::storage::eviction::publish_maxmemory(0);
+        crate::storage::db_quota::publish_db_maxmemory_any_set(&RuntimeConfig::default());
 
         let (shard_databases, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
         let runtime_config = Arc::new(parking_lot::RwLock::new(make_config(0, "allkeys-lru")));
@@ -802,36 +909,40 @@ mod tests {
         }
         let len_before = db.len();
 
-        for _attempt in 0..100 {
-            let limit_before = maxmemory_is_set() || db_maxmemory_any_set();
-            let entries_before = evict_to_budget_entries_on_this_thread();
-            let result = ctx.gate(&mut db, 0);
-            let entries_after = evict_to_budget_entries_on_this_thread();
-            let limit_after = maxmemory_is_set() || db_maxmemory_any_set();
-            assert!(
-                result.is_ok(),
-                "no limit configured: the gate must never reject"
-            );
-            if limit_before || limit_after {
-                // Another test had a limit published during this attempt;
-                // the skip is not expected then. Try again.
-                std::thread::yield_now();
-                continue;
-            }
-            assert_eq!(
-                db.len(),
-                len_before,
-                "nothing may be evicted without a limit"
-            );
-            assert_eq!(
-                entries_after, entries_before,
-                "no maxmemory and no db quota: the Lua write gate must not enter \
-                 evict_to_budget just because a spill sender is wired"
-            );
-            return;
-        }
-        panic!(
-            "could not observe an unset maxmemory in 100 attempts; check for a test leaking a published limit"
+        // PRECONDITION, asserted rather than hoped for: the guard above put
+        // both atomics in the unset state this test is about. If this fires,
+        // something published a limit between the guard and here.
+        assert!(
+            !maxmemory_is_set() && !db_maxmemory_any_set(),
+            "precondition: no limit may be published here, but maxmemory={} \
+             db_maxmemory_any_set={} — a sibling test is leaking one (moon#856)",
+            maxmemory_bytes(),
+            db_maxmemory_any_set()
+        );
+
+        let entries_before = evict_to_budget_entries_on_this_thread();
+        let result = ctx.gate(&mut db, 0);
+        let entries_after = evict_to_budget_entries_on_this_thread();
+
+        assert!(
+            result.is_ok(),
+            "no limit configured: the gate must never reject"
+        );
+        assert_eq!(
+            db.len(),
+            len_before,
+            "nothing may be evicted without a limit (maxmemory={}, db_maxmemory_any_set={})",
+            maxmemory_bytes(),
+            db_maxmemory_any_set()
+        );
+        assert_eq!(
+            entries_after,
+            entries_before,
+            "no maxmemory and no db quota: the Lua write gate must not enter \
+             evict_to_budget just because a spill sender is wired \
+             (observed maxmemory={}, db_maxmemory_any_set={})",
+            maxmemory_bytes(),
+            db_maxmemory_any_set()
         );
     }
 

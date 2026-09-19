@@ -1,4 +1,10 @@
+pub mod claim;
+#[cfg(test)]
+mod claim_wake_tests;
+pub mod group;
 pub mod wakeup;
+
+pub use claim::{ClaimToken, Settled};
 
 use std::collections::{HashMap, VecDeque};
 
@@ -183,6 +189,22 @@ pub struct WaitEntry {
     pub reply_tx: crate::runtime::channel::OneshotSender<Option<Frame>>,
     /// Absolute deadline (None = block forever, 0 timeout).
     pub deadline: Option<std::time::Instant>,
+    /// moon#1019/#1023: the single-winner claim shared by every registration
+    /// of a waiter that is registered on more than one thread. `None` for a
+    /// waiter whose keys all live on its own shard — one thread serves it, so
+    /// it needs no arbitration. See [`claim`].
+    pub claim: Option<ClaimToken>,
+}
+
+impl WaitEntry {
+    /// Nobody can use a serve from this shard any more: the client is gone,
+    /// or (for a waiter registered on several threads) another shard already
+    /// won it or the waiter gave up. Checked BEFORE a waker touches the
+    /// datastore, so a settled waiter never causes a mutation.
+    #[inline]
+    pub fn is_settled(&self) -> bool {
+        self.reply_tx.is_disconnected() || self.claim.as_ref().is_some_and(|c| !c.is_open())
+    }
 }
 
 /// Per-shard blocking registry. Manages FIFO wait queues keyed by (db_index, key).
@@ -308,6 +330,20 @@ impl BlockingRegistry {
         Some(entry)
     }
 
+    /// Undo a [`pop_front_of_family`](Self::pop_front_of_family) whose
+    /// waiter this wake could not serve: put it back at the FRONT of the
+    /// queue, ahead of the rest of its family, so FIFO among the clients
+    /// competing for the same data is unchanged.
+    ///
+    /// The waiter never left `wait_keys`, and its deadline heap entry was
+    /// never consumed, so nothing else needs restoring.
+    pub fn requeue_front(&mut self, db_index: usize, key: &Bytes, entry: WaitEntry) {
+        self.waiters
+            .entry((db_index, key.clone()))
+            .or_default()
+            .push_front(entry);
+    }
+
     /// The waiters queued on `(db_index, key)`, in FIFO order, for a caller
     /// that needs to DECIDE before it removes anything (moon#595).
     ///
@@ -419,6 +455,16 @@ impl BlockingRegistry {
         }
     }
 
+    /// Is `wait_id` still registered on at least one key of this shard?
+    ///
+    /// `false` once it has been served, cancelled, timed out or reaped as
+    /// dead — every one of those runs `remove_wait`. moon#989's group
+    /// registration uses it to stop consulting a waiter's later keys the
+    /// moment an earlier one has served it.
+    pub fn is_waiting(&self, wait_id: u64) -> bool {
+        self.wait_keys.contains_key(&wait_id)
+    }
+
     /// Check if any waiters exist for this (db_index, key).
     pub fn has_waiters(&self, db_index: usize, key: &Bytes) -> bool {
         self.waiters
@@ -475,14 +521,15 @@ impl BlockingRegistry {
             let _ = reply_tx.send(None);
         }
 
-        // Clean up wait_keys for timed-out ids
-        // Deduplicate ids first
+        // Take every timed-out waiter off ALL its keys, not just the ones
+        // swept above. A sibling registration may carry no deadline (a later
+        // run of a spanning wait is registered through `register_group`,
+        // which has none), so no heap entry ever sweeps it; and once
+        // `wait_keys` forgets the id, nothing else can find it either.
         timed_out_ids.sort_unstable();
         timed_out_ids.dedup();
         for id in timed_out_ids {
-            if self.wait_keys.remove(&id).is_some() {
-                crate::admin::metrics_setup::record_client_unblocked();
-            }
+            self.remove_wait(id);
         }
         visited
     }
@@ -508,6 +555,7 @@ mod tests {
             cmd: BlockedCommand::BLPop,
             reply_tx: tx,
             deadline: None,
+            claim: None,
         };
         let key = Bytes::from_static(b"mylist");
         reg.register(0, key.clone(), entry);
@@ -534,6 +582,7 @@ mod tests {
                 cmd: BlockedCommand::BLPop,
                 reply_tx: tx1,
                 deadline: None,
+                claim: None,
             },
         );
 
@@ -547,6 +596,7 @@ mod tests {
                 cmd: BlockedCommand::BRPop,
                 reply_tx: tx2,
                 deadline: None,
+                claim: None,
             },
         );
 
@@ -572,6 +622,7 @@ mod tests {
                 cmd: BlockedCommand::BLPop,
                 reply_tx: tx1,
                 deadline: None,
+                claim: None,
             },
         );
         let (tx2, _rx2) = crate::runtime::channel::oneshot();
@@ -583,6 +634,7 @@ mod tests {
                 cmd: BlockedCommand::BLPop,
                 reply_tx: tx2,
                 deadline: None,
+                claim: None,
             },
         );
 
@@ -617,6 +669,7 @@ mod deadline_heap_tests {
                 cmd: BlockedCommand::BLPop,
                 reply_tx: tx,
                 deadline,
+                claim: None,
             },
         )
     }
@@ -700,6 +753,7 @@ mod deadline_heap_tests {
                     cmd: BlockedCommand::BLPop,
                     reply_tx: tx,
                     deadline,
+                    claim: None,
                 },
             );
         }
@@ -707,6 +761,46 @@ mod deadline_heap_tests {
         assert_eq!(visited, 2);
         assert!(!reg.has_waiters(0, &Bytes::from_static(b"mk1")));
         assert!(!reg.has_waiters(0, &Bytes::from_static(b"mk2")));
+    }
+
+    /// One waiter, one id, registered on key A WITH the client's deadline and
+    /// on key B WITHOUT one — a spanning `BLPOP a b c 1` registers its leading
+    /// local keys with the deadline and a later local run through
+    /// `register_group`, which has none. The sweep that times the waiter out
+    /// on A must take its registration off B too: once `wait_keys` forgets
+    /// the id, `remove_wait` and the connection's cancel fan-out have nothing
+    /// left to find it by, and B's entry would sit there until B is pushed.
+    #[test]
+    fn expiry_removes_undeadlined_sibling_registrations() {
+        let mut reg = BlockingRegistry::new(0);
+        let now = Instant::now();
+        let id = reg.next_wait_id();
+        let (a, b) = (Bytes::from_static(b"A"), Bytes::from_static(b"B"));
+        for (key, deadline) in [
+            (a.clone(), Some(now - Duration::from_millis(1))),
+            (b.clone(), None),
+        ] {
+            let (tx, _rx) = crate::runtime::channel::oneshot();
+            reg.register(
+                0,
+                key,
+                WaitEntry {
+                    wait_id: id,
+                    cmd: BlockedCommand::BLPop,
+                    reply_tx: tx,
+                    deadline,
+                    claim: None,
+                },
+            );
+        }
+        reg.expire_timed_out(now);
+        reg.remove_wait(id);
+        assert!(!reg.has_waiters(0, &a));
+        assert!(
+            !reg.has_waiters(0, &b),
+            "the undeadlined sibling registration outlived its timed-out waiter"
+        );
+        assert!(!reg.is_waiting(id));
     }
 
     /// moon#535: a waker must be able to take ITS waiter out of a queue that
@@ -732,6 +826,7 @@ mod deadline_heap_tests {
                     cmd,
                     reply_tx: tx,
                     deadline: None,
+                    claim: None,
                 },
             );
         }
@@ -780,6 +875,7 @@ mod deadline_heap_tests {
                 cmd: BlockedCommand::BZPopMin,
                 reply_tx: tx,
                 deadline: None,
+                claim: None,
             },
         );
         assert!(reg.has_waiters(0, &key), "the queue is NOT empty");
