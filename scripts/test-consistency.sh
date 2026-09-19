@@ -2040,7 +2040,7 @@ mk_norm() {
 # wrong-key pop cannot happen.
 route_probe_multi() {
     local mode="$1" label="$2" n="$3" seeds="$4" probe="$5" check="${6:-}"
-    local i j port s p r m before="" after=""
+    local i j port s p r m before="" after="" after_redis=""
     local wrong=0 refused=0
     local -a keys seedv sv pv
     for i in $(seq 1 "$MK_TRIALS"); do
@@ -2077,6 +2077,7 @@ route_probe_multi() {
         m="$(mk_norm "$(redis-cli -p "$PORT_RUST"  "${pv[@]}" 2>&1)")"
         if [[ -n "$check" ]]; then
             after="$(mk_state "$PORT_RUST" "$check" "${keys[@]}")"
+            after_redis="$(mk_state "$PORT_REDIS" "$check" "${keys[@]}")"
         fi
         # A SUBSTRING test, not an anchored `case` pattern. The reply may carry
         # a leading blank line (see `mk_norm`), and an anchored pattern that
@@ -2097,6 +2098,12 @@ route_probe_multi() {
             fi
         elif [[ "$r" != "$m" ]]; then
             echo "  FAIL detail: ${label}[$i] ($mode) answered '$m'; redis says '$r'"
+            wrong=$((wrong + 1))
+        elif [[ -n "$check" && "$after" != "$after_redis" ]]; then
+            # moon#989: the RIGHT reply is not enough. BLMPOP answered exactly
+            # like redis while popping a second key it never named, and only
+            # the keyspace after the probe could show it.
+            echo "  FAIL detail: ${label}[$i] ($mode) answered like redis but the keyspace differs: moon '$after' vs redis '$after_redis'"
             wrong=$((wrong + 1))
         fi
     done
@@ -2126,9 +2133,33 @@ MK_ROWS=(
   "touch|3|SET %K v|SET %K v|SET %K v|TOUCH %K1 %K2 %K3|GET %K"
   "lmpop|3||RPUSH %K B1 B2|RPUSH %K C1 C2|LMPOP 3 %K1 %K2 %K3 LEFT|LRANGE %K 0 -1"
   "zmpop|3||ZADD %K 1 B1 2 B2|ZADD %K 1 C1 2 C2|ZMPOP 3 %K1 %K2 %K3 MIN|ZRANGE %K 0 -1"
+  # moon#989: the blocking twins. Data is seeded, so neither blocks -- the
+  # 0.1s timeout only bounds a regression that would. `colo` is the row that
+  # caught the defect: the reply matched redis while a second co-located key
+  # lost its head element, visible only through the per-key check.
+  "blmpop|3||RPUSH %K B1 B2|RPUSH %K C1 C2|BLMPOP 0.1 3 %K1 %K2 %K3 LEFT|LRANGE %K 0 -1"
+  "bzmpop|3||ZADD %K 1 B1 2 B2|ZADD %K 1 C1 2 C2|BZMPOP 0.1 3 %K1 %K2 %K3 MIN|ZRANGE %K 0 -1"
 )
 
-for mk_row in "${MK_ROWS[@]}"; do
+# moon#989: the rest of the multi-key blocking-pop family, CO-LOCATED only.
+# They shared BLMPOP's double-pop and are fixed with it, so `colo` must agree
+# with redis byte for byte. Their SPANNING placement is still a known defect
+# (two owner shards can each serve the same waiter) and is deliberately not
+# refused yet -- that is a behaviour decision tracked as moon#1019, so a
+# `span` row here would only assert the bug.
+MK_COLO_ONLY_ROWS=(
+  "blpop|3||RPUSH %K B1 B2|RPUSH %K C1 C2|BLPOP %K1 %K2 %K3 0.1|LRANGE %K 0 -1"
+  "brpop|3||RPUSH %K B1 B2|RPUSH %K C1 C2|BRPOP %K1 %K2 %K3 0.1|LRANGE %K 0 -1"
+  "bzpopmin|3||ZADD %K 1 B1 2 B2|ZADD %K 1 C1 2 C2|BZPOPMIN %K1 %K2 %K3 0.1|ZRANGE %K 0 -1"
+  "bzpopmax|3||ZADD %K 1 B1 2 B2|ZADD %K 1 C1 2 C2|BZPOPMAX %K1 %K2 %K3 0.1|ZRANGE %K 0 -1"
+)
+
+for mk_row in "${MK_ROWS[@]}" "${MK_COLO_ONLY_ROWS[@]/#/colo-only:}"; do
+    mk_modes="span colo"
+    if [[ "$mk_row" == colo-only:* ]]; then
+        mk_modes="colo"
+        mk_row="${mk_row#colo-only:}"
+    fi
     IFS='|' read -r -a mk_f <<<"$mk_row"
     mk_label="${mk_f[0]}"; mk_n="${mk_f[1]}"
     # fields 2..(2+n-1) are the per-key seeds, then the probe, then the check
@@ -2139,8 +2170,9 @@ for mk_row in "${MK_ROWS[@]}"; do
     mk_seeds="${mk_seeds%|}"
     mk_probe="${mk_f[$((2 + mk_n))]}"
     mk_check="${mk_f[$((3 + mk_n))]:-}"
-    route_probe_multi span "$mk_label" "$mk_n" "$mk_seeds" "$mk_probe" "$mk_check"
-    route_probe_multi colo "$mk_label" "$mk_n" "$mk_seeds" "$mk_probe" "$mk_check"
+    for mk_mode in $mk_modes; do
+        route_probe_multi "$mk_mode" "$mk_label" "$mk_n" "$mk_seeds" "$mk_probe" "$mk_check"
+    done
 done
 
 # Non-vacuity. At --shards>1 the span sweep MUST have reached the cross-shard
@@ -2160,7 +2192,7 @@ assert_eq "moon#962 TOUCH is never refused (shards=$SHARDS)" "0" "$MK_TOUCH_REFU
 
 # Tidy up by exact name -- `--scan | xargs -r` is GNU-only and this script runs
 # on macOS too.
-for mk_row in "${MK_ROWS[@]}"; do
+for mk_row in "${MK_ROWS[@]}" "${MK_COLO_ONLY_ROWS[@]}"; do
     IFS='|' read -r -a mk_f <<<"$mk_row"
     for mk_i in $(seq 1 "$MK_TRIALS"); do
         for mk_j in $(seq 1 "${mk_f[1]}"); do
