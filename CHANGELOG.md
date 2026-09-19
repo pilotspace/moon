@@ -220,6 +220,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RESP through `common::Conn` and runs in every `runtime-tokio` leg; with the
   fix inert it fails 3/3 on 36-47 stale probes.
 
+- **Cluster mode no longer refuses `MSET`/`MSETNX` with `CROSSSLOT` when a
+  VALUE hashes to another slot** (moon#1012). The cluster pre-check slot-hashed
+  every argument after the routing key as if it were a key, so
+  `MSET {t}a x {t}b y` — two keys in one slot — was refused because `x` hashed
+  elsewhere; only a user who hash-tagged their values got through. It now reads
+  key positions from the shared key walker (`acl::keyspec::command_key_positions`,
+  the one ACL, the moon#592 cross-shard write guard and cache invalidation
+  already use): `MSET`'s `first/last/step` of `1, -1, 2`. Measured against
+  redis-server 8.6.1 on one node holding all 16384 slots, 15 rows
+  (`MSET`/`MSETNX`/`MGET`/`DEL`/`BITOP`/`COPY`, same-slot and spanning) are now
+  byte-identical on both runtimes at `--shards 1` and `--shards 4`; before, 4
+  accepted writes were refused. Keys genuinely in two slots are still
+  `CROSSSLOT`. `COPY`'s `REPLACE` literal and `BITOP`'s operation token now fall
+  out of their key specs instead of a special case.
+
 - **The moon#507 pipeline wait set is derived from `COMMAND_META` instead of a
   hand-written list, and `WATCH` inside its own pipeline no longer aborts the
   transaction** (moon#937, moon#946). `must_wait_for_pending_remote` decides
