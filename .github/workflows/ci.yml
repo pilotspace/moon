@@ -103,10 +103,13 @@ jobs:
       # silently, so its self-test runs here: pure bash, no server, <1s.
       - name: Consistency-gate self-test (moon#762)
         run: bash scripts/consistency-gate.sh --self-test
-      # Same reasoning for the single-process lib gate (moon#904): it waives
-      # one known failure (moon#856) and rejects a truncated run, and a waiver
-      # that quietly stops refusing anything is indistinguishable from a green
-      # build. Pure bash against synthetic transcripts, <1s, no cargo.
+      # Same reasoning for the single-process lib gate (moon#904). Its waiver
+      # for moon#856 is RETIRED — it now waives nothing — and a gate that
+      # quietly stops refusing anything is indistinguishable from a green
+      # build, so its verdict logic (including "the retired waiver no longer
+      # waives moon#856's victim", and the waiver mechanism re-armed through
+      # the environment) is exercised against synthetic transcripts here.
+      # Pure bash, <1s, no cargo.
       - name: Libtest-singleproc-gate self-test (moon#904)
         run: bash scripts/libtest-singleproc-gate.sh --self-test
       # Nothing else in CI compiles `fuzz/`, and it showed: `mq_registry_blob`
