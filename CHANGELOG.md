@@ -1142,6 +1142,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both the listpack and B+tree arms, which carried separate copies.
 ### Security
 
+- **`fuzz/Cargo.lock` is audited and clean** (moon#1092). The fuzz workspace
+  has its own lockfile, which no gate checked, and it carried
+  RUSTSEC-2026-0204 (`crossbeam-epoch` 0.9.18) and RUSTSEC-2026-0258 (`h2`
+  0.4.13), plus the unsound `anyhow` 1.0.102 and `memmap2` 0.9.10 and the
+  yanked `spin` 0.9.8. Each is bumped to the version the root `Cargo.lock`
+  already ships (0.9.20, 0.4.18, 1.0.104, 0.9.11, 0.9.9), and nothing else in
+  the lockfile moves. `supply-chain.yml` now triggers on `fuzz/Cargo.toml` and
+  `fuzz/Cargo.lock` and runs `cargo audit --file fuzz/Cargo.lock` next to the
+  root audit, so the fuzz lockfile cannot drift behind again unnoticed.
+
 - **Error and status replies can no longer be split by client input**
   (moon#1031). Error text quotes client input (an unknown command name, an
   `ACL SETUSER` rule), and CR/LF bytes in it were written raw, so one command
