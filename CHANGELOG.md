@@ -240,6 +240,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     loss the committed manifest could name a missing incr, or the old
     `appendonly.aof` could return, losing every record written after the
     rewrite. Both directories are now fsynced before the new file is used.
+
+- **A COLD vector segment leaves `unloaded` with the search that reloads it,
+  and a delete that lands while the reload is waiting to install is no longer
+  lost** (moon#1070). Since the off-loop reload pool (prod-hardening #18) a
+  search only SUBMITTED the reload and answered from it; the reloaded segment
+  sat in the pool until some later search installed it, while the COLD stub
+  stayed the index's segment and the only place a DEL could be recorded. The
+  install then threw the stub away without replaying it: a document deleted
+  after the first search came back, as `vec:<id>`, on the next one (reproduced
+  on a real server). The install now replays the stub's tombstones, and the
+  yielding FT.SEARCH handlers install finished reloads as soon as the query
+  that awaited them is back on the shard, so `FT.INFO unloaded_segments` drops
+  to 0 with that search. Four `tests/vector_idle_unload.rs` tests that were
+  `#[ignore]`d -- and silently red on main -- now run in CI; only the
+  `ps`-based RSS measurement stays ignored.
+
+- **A restart no longer re-issues a cold-tier file id, which could apply a
+  write twice** (moon#1067). A restart resumes the shard's cold file-id
+  counter at one past the highest id the manifest or the disk still holds.
+  Manifest tombstone GC could prune the entry that held the highest id once
+  its file was reclaimed, and the counter then moved backwards. The AOF
+  appends to the same generation across restarts, so the generation still
+  held a `MOON.SPILLED <id>` record for the old file. On replay, that record
+  made the re-issued id readable early, and a write logged before its key
+  was spilled into the new file was applied on top of the value it had
+  already produced. Measured with `--appendonly yes --disk-offload enable`
+  and the tombstone retention at zero: `RPUSH X a` once, then spill, restart,
+  spill again, restart, and `LRANGE X` read `a a`, after both `kill -9` and
+  `SHUTDOWN`, on both runtimes. The same sequence with the default retention
+  (tombstones outlive the restart) read `a`. GC now keeps the tombstone that
+  holds the highest file id until a higher id is in the manifest. That pins
+  at most one manifest entry per shard. No on-disk format change.
+
 - **CLIENT TRACKING never drops an invalidation silently, scripts are
   tracked, and a RESP2 subscriber's pipeline follows its live subscription
   count** (moon#1088, moon#1089, moon#1090, refs moon#1078). Every wire reply
