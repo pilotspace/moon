@@ -323,3 +323,56 @@ fn a_read_of_a_missing_key_or_group_answers_redis_text() {
         }
     }
 }
+
+/// The recheck a flush arms looks at every parked group reader's stream; it
+/// must not write to them. A reader parked on `s` with nothing new, a client
+/// watching `s`, and a `FLUSHDB` of ANOTHER database: redis-server 8.6.1
+/// runs the watcher's `EXEC` (nothing in `s` changed); moon aborted it,
+/// because the recheck took `s` mutably and stamped its `WATCH` version.
+#[test]
+fn a_recheck_that_serves_nothing_does_not_abort_a_watcher() {
+    for shards in [1, 4] {
+        let dir = unique_test_dir(&format!("xreadgroup_nokey_1086_watch_s{shards}"));
+        let (_guard, port) = spawn_listening_guarded(|p| spawn(p, &dir, shards));
+        let mut c = Conn::open(port);
+        for owner in 0..shards {
+            let s = format!("{}s", tag_on(owner, shards));
+            assert!(c.send(&["FLUSHALL"]).starts_with("+OK"));
+            assert!(
+                c.send(&["XGROUP", "CREATE", &s, "g", "$", "MKSTREAM"])
+                    .starts_with("+OK")
+            );
+            let read = cmd(&[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "BLOCK",
+                "1500",
+                "STREAMS",
+                &s,
+                ">",
+            ]);
+            let reader = std::thread::spawn(move || {
+                let mut w = Conn::open(port);
+                let refs: Vec<&str> = read.iter().map(String::as_str).collect();
+                w.send(&refs)
+            });
+            await_blocked(port);
+            let mut watcher = Conn::open(port);
+            assert!(watcher.send(&["WATCH", &s]).starts_with("+OK"));
+            let mut other = Conn::open(port);
+            assert!(other.send(&["SELECT", "1"]).starts_with("+OK"));
+            assert!(other.send(&["FLUSHDB"]).starts_with("+OK"));
+            // The recheck runs on the next 10 ms blocking tick.
+            std::thread::sleep(Duration::from_millis(100));
+            let exec = watcher.pipeline(&[&["MULTI"], &["PING"], &["EXEC"]]);
+            assert!(
+                exec.ends_with("*1\r\n+PONG\r\n"),
+                "shards={shards} owner={owner}: EXEC aborted after a FLUSHDB of another db: \
+                 {exec:?}"
+            );
+            assert_eq!(reader.join().expect("reader"), "*-1\r\n");
+        }
+    }
+}

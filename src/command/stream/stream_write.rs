@@ -618,19 +618,31 @@ pub fn xreadgroup(db: &mut Database, args: &[Frame]) -> Frame {
     //     empty entry list.
     //
     // Only when nothing at all was served does the reply become the null array.
-    // Every stream and its group is checked BEFORE any is read, as redis's
-    // `xreadCommand` does: a `>` read of the first stream moves entries into
-    // its PEL, so failing on a later stream afterwards would hand the client
-    // an error while those entries sit delivered-and-unacked, never to be
-    // returned by `>` again.
+    // Every stream, its group AND its id are checked BEFORE any is read, in
+    // redis's `xreadCommand` order (per stream: type, group, id): a `>` read
+    // of the first stream moves entries into its PEL, so failing on a later
+    // stream afterwards would hand the client an error while those entries
+    // sit delivered-and-unacked, never to be returned by `>` again.
     for i in 0..num_streams {
-        let Some(key) = extract_bytes(&args[keys_start + i]) else {
+        let (Some(key), Some(id)) = (
+            extract_bytes(&args[keys_start + i]),
+            extract_bytes(&args[ids_start + i]),
+        ) else {
             return err_wrong_args("XREADGROUP");
         };
         match db.get_stream(key) {
             Ok(Some(s)) if s.groups.contains_key(group.as_ref()) => {}
             Ok(_) => return nogroup_key_or_group(key, &group, XREADGROUP_NOGROUP_SUFFIX),
             Err(e) => return e,
+        }
+        match id.as_ref() {
+            b">" => {}
+            b"$" => return Frame::Error(Bytes::from_static(XREADGROUP_DOLLAR_ID)),
+            b"+" => return Frame::Error(Bytes::from_static(XREADGROUP_PLUS_ID)),
+            other if parse_strict_id(other).is_none() => {
+                return Frame::Error(Bytes::from_static(INVALID_STREAM_ID));
+            }
+            _ => {}
         }
     }
 
@@ -885,6 +897,15 @@ const XREADGROUP_NOGROUP_SUFFIX: &[u8] = b" in XREADGROUP with GROUP option";
 /// Redis's text for an argument that is not a stream id
 /// (`streamParseStrictIDOrReply`).
 const INVALID_STREAM_ID: &[u8] = b"ERR Invalid stream ID specified as stream command argument";
+
+/// `$` and `+` name positions in the stream, not in a consumer's history, so
+/// redis refuses them in `XREADGROUP` with these texts (redis-server 8.6.1).
+const XREADGROUP_DOLLAR_ID: &[u8] = b"ERR The $ ID is meaningless in the context of XREADGROUP: \
+you want to read the history of this consumer by specifying a proper ID, or use the > ID to get \
+new messages. The $ ID would just return an empty result set.";
+const XREADGROUP_PLUS_ID: &[u8] = b"ERR The + ID is meaningless in the context of XREADGROUP: \
+you want to read the history of this consumer by specifying a proper ID, or use the > ID to get \
+new messages. The + ID would just return an empty result set.";
 
 /// `-NOGROUP No such key '<key>' or consumer group '<group>'<suffix>`, the
 /// text redis's XCLAIM (empty `suffix`) and XREADGROUP

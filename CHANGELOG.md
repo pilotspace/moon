@@ -250,9 +250,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs. `XREAD` waiters stay parked, as in redis. The same text now answers
   an `XREADGROUP` issued against a missing key or group (it said `ERR The
   XREADGROUP subcommand requires the key to exist.` or `NOGROUP No such
-  consumer group for key name`), and a multi-stream `XREADGROUP` checks every
-  stream and group before reading any, instead of moving the first stream's
-  entries into the PEL and then failing on the second.
+  consumer group for key name`). A multi-stream `XREADGROUP` now checks
+  every stream, group and id before it reads any stream. It used to move the
+  first stream's entries into the PEL and then fail on the second. Ids are
+  checked with redis's texts:
+  - `$` and `+` get `ERR The $ ID is meaningless in the context of XREADGROUP: ...`
+    (and the `+` form of it) instead of being parsed.
+  - A malformed id (`-`, `bad`, `1-x`, an out-of-range number) gets `ERR Invalid stream ID
+    specified as stream command argument`. `+` and `-` used to be accepted as ids.
 
 - **A blocking `XREADGROUP` that delivers is logged, and survives `kill -9`**
   (moon#1104). A consumer-group read moves what it delivers into the PEL and
@@ -290,6 +295,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   between answered nil while the entries sat undelivered in its PEL, and a
   `>` loop never saw them again. The waker now claims first and reads only on
   a won claim, the claim-token order moon#1045 gave the list and zset wakers.
+  The readiness check before the claim is read-only. It used to take the
+  stream mutably, and a wake that served nothing then aborted every `EXEC`
+  watching the stream. A consumer the check must create does not signal
+  watchers, as in redis.
 
 - **An AOF rewrite no longer replays a write twice, and a rewrite that fails
   late no longer leaves the writer appending to a deleted file** (moon#455).
