@@ -1096,7 +1096,9 @@ fn tracking_on_inside_transaction_4_shards() {
 fn redirect_target_protocol_changes(shards: &str) {
     let m = spawn_moon(shards);
     type Setup = &'static [&'static [&'static str]];
-    let cases: [(&str, Setup, fn(&str) -> Vec<u8>, fn(&str) -> Vec<u8>); 3] = [
+    type Framing = fn(&str) -> Vec<u8>;
+    // (case, target setup, the framing redis sends, the wrong framing)
+    let cases: [(&str, Setup, Framing, Framing); 3] = [
         (
             "resubscribed after HELLO 3",
             &[
