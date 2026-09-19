@@ -126,6 +126,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **WAL v3 KV records now replay into the database they were written in**
+  (moon#1039, P0). Under `--wal-kv-log on`, a write that executes on a shard
+  thread (a pipelined cross-shard write, an active-expiry reason-DEL, a
+  `MOON.SPILLED` cold marker) was logged as a bare command with no `SELECT`,
+  and recovery replayed every shard's WAL starting from db 0. When the WAL was
+  the KV authority, a restart put every db 1-15 write into db 0, and a DEL
+  logged for db 3 deleted db 0's key of the same name. On the tokio runtime at
+  `--shards 1` the WAL is the authority by default, so a plain SIGKILL and
+  restart with the AOF untouched was enough: an expiry in db 3 erased db 0's
+  `k`. On monoio, and at `--shards 4`, it took a missing multi-part AOF
+  manifest (`k3_1` answered from db 0, db 3 empty). The db now travels in the record header: a new flag
+  bit plus the two header bytes that were always-zero padding. Old WALs still
+  replay (a record with no db context goes to db 0, as before, and never
+  inherits the previous record's db), and an older binary still reads a new
+  WAL without error. A record for a db beyond the configured `--databases`
+  count is dropped with a warning instead of being folded into db 0.
+
 - **Scripts queued inside `MULTI` now run at `EXEC`** (moon#894). `EVAL`,
   `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `FCALL` and `FCALL_RO` were answered
   `+QUEUED` and then `-ERR unknown command` at `EXEC`, while the rest of the

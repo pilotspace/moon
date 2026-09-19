@@ -29,7 +29,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::record::{WalRecordType, read_wal_v3_record, write_wal_v3_record};
+use super::record::{
+    WalRecordType, read_wal_v3_record, write_wal_v3_record, write_wal_v3_record_in_db,
+};
 
 /// WAL v3 magic bytes (shared with v2 for detection).
 pub const WAL_V3_MAGIC: &[u8; 6] = b"RRDWAL";
@@ -534,6 +536,33 @@ impl WalWriterV3 {
         let lsn = self.next_lsn;
         self.next_lsn += 1;
         write_wal_v3_record(&mut self.buf, lsn, record_type, payload);
+        lsn
+    }
+
+    /// [`Self::append`] for a db-scoped KV `Command` record: `db` rides in
+    /// the record header so replay applies the command to the database it
+    /// executed in (moon#1039). Returns the assigned LSN.
+    pub fn append_in_db(&mut self, record_type: WalRecordType, db: usize, payload: &[u8]) -> u64 {
+        let lsn = self.next_lsn;
+        self.next_lsn += 1;
+        // `--databases` is capped at `MAX_DATABASES` (256); the const assert
+        // below makes raising it past the u16 header field a build error, so
+        // this arm is unreachable today. It stays fallible (no unwrap) and
+        // loud rather than silently truncating the db.
+        const _: () = assert!(crate::config::MAX_DATABASES <= u16::MAX as usize + 1);
+        let db_index = match u16::try_from(db) {
+            Ok(db) => Some(db),
+            Err(_) => {
+                tracing::error!(
+                    db,
+                    lsn,
+                    "WAL record db index exceeds the u16 header field; logged without db \
+                     context (it will replay into db 0)"
+                );
+                None
+            }
+        };
+        write_wal_v3_record_in_db(&mut self.buf, lsn, record_type, db_index, payload);
         lsn
     }
 

@@ -4571,10 +4571,16 @@ pub(crate) fn wal_append_and_fanout(
     // KV command would be written and then discarded by Phase-B recovery —
     // pure write amplification (measured 2.7× file bytes at shards=4).
     // FPI/checkpoint/feature records are unaffected (different entry points).
+    //
+    // moon#1039: `data` is a bare command with no `SELECT`, so the db it ran
+    // in rides in the record header. Without it replay started every shard
+    // at db 0 and recovered every db 1-15 write — and every reason-DEL — into
+    // db 0.
     if wal_kv_log {
         if let Some(w) = wal_writer {
-            w.append(
+            w.append_in_db(
                 crate::persistence::wal_v3::record::WalRecordType::Command,
+                db,
                 data,
             );
         }
@@ -4966,6 +4972,88 @@ mod wal_append_tests {
             std::fs::metadata(&seg).unwrap().len() > base_len,
             "with wal_kv_log true the KV record must be logged to the WAL"
         );
+    }
+
+    /// moon#1039: a KV record logged for db N must replay into db N.
+    ///
+    /// Before the fix the WAL copy carried no db context and Phase-4 replay
+    /// started every shard at `selected_db = 0`, so every write from db 1-15
+    /// recovered into db 0 — and a DEL logged for db 3 (an active-expiry
+    /// reason-DEL, say) deleted db 0's same-named key.
+    #[test]
+    fn wal_kv_record_replays_into_the_db_it_was_written_to_1039() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let mut w3 = Some(
+            WalWriterV3::new(
+                0,
+                &shard_dir.join("wal-v3"),
+                16 * 1024 * 1024,
+                WalBounds::DEFAULT,
+            )
+            .unwrap(),
+        );
+        let backlog: SharedBacklog = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let mut log = |db: usize, cmd: &[u8]| {
+            wal_append_and_fanout(
+                cmd,
+                db,
+                &mut w3,
+                &backlog,
+                &mut vec![],
+                &None,
+                0,
+                None,
+                true, // wal_kv_log
+                &mut std::time::Duration::from_millis(5),
+            );
+        };
+        log(0, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4\r\nkeep\r\n");
+        log(3, b"*3\r\n$3\r\nSET\r\n$2\r\nk3\r\n$2\r\nv3\r\n");
+        log(3, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4\r\ngone\r\n");
+        log(3, b"*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n");
+        log(7, b"*3\r\n$3\r\nSET\r\n$2\r\nk7\r\n$2\r\nv7\r\n");
+        w3.as_mut().unwrap().flush_sync().unwrap();
+        drop(w3);
+
+        let mut databases: Vec<Database> = (0..16).map(|_| Database::new()).collect();
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        crate::persistence::recovery::recover_shard_v3(&mut databases, 0, &shard_dir, &engine)
+            .unwrap();
+
+        let get = |dbs: &mut [Database], db: usize, key: &'static [u8]| {
+            let mut selected = db;
+            let args = crate::framevec![crate::protocol::Frame::BulkString(
+                bytes::Bytes::from_static(key)
+            )];
+            match crate::command::dispatch(&mut dbs[db], b"GET", &args, &mut selected, 16) {
+                crate::command::DispatchResult::Response(crate::protocol::Frame::BulkString(v)) => {
+                    Some(v)
+                }
+                _ => None,
+            }
+        };
+        assert_eq!(
+            get(&mut databases, 3, b"k3").as_deref(),
+            Some(&b"v3"[..]),
+            "a write logged for db 3 must replay into db 3"
+        );
+        assert_eq!(
+            get(&mut databases, 7, b"k7").as_deref(),
+            Some(&b"v7"[..]),
+            "a write logged for db 7 must replay into db 7"
+        );
+        assert_eq!(
+            get(&mut databases, 0, b"k3"),
+            None,
+            "db 3's key leaked into db 0"
+        );
+        assert_eq!(
+            get(&mut databases, 0, b"k").as_deref(),
+            Some(&b"keep"[..]),
+            "a DEL logged for db 3 must not delete db 0's same-named key"
+        );
+        assert_eq!(get(&mut databases, 3, b"k"), None, "db 3's DEL must apply");
     }
 }
 
