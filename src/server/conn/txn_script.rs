@@ -95,6 +95,9 @@ pub(crate) struct TxnScriptOutcome {
     /// A flush the script performed. This shard's half is already done; the
     /// caller broadcasts the rest.
     pub flush: Option<PendingFlush>,
+    /// moon#1069: the keys the script's writes touched, with their db, for
+    /// the EXEC executor's recorded wakes.
+    pub ready: Vec<(usize, Bytes)>,
 }
 
 impl TxnScriptOutcome {
@@ -103,6 +106,7 @@ impl TxnScriptOutcome {
             reply: Frame::Error(Bytes::from_static(msg)),
             effects: Vec::new(),
             flush: None,
+            ready: Vec::new(),
         }
     }
 }
@@ -148,57 +152,62 @@ pub(crate) fn run_txn_script(
         None => None,
     };
 
-    let ((reply, flush), effects) = crate::scripting::bridge::capture_txn_effects(|| {
-        crate::shard::slice::with_shard(|s| {
-            let db_count = s.databases.db_count();
-            crate::scripting::pending_flush::run_and_complete(s, db_idx, |db| match registry {
-                Some(reg) if is_fcall => crate::command::functions::handle_fcall(
-                    reg,
-                    args,
-                    db,
-                    shard_id,
-                    env.num_shards,
-                    db_idx,
-                    db_count,
-                    env.script_acl,
-                ),
-                Some(reg) => crate::command::functions::handle_fcall_ro(
-                    reg,
-                    args,
-                    db,
-                    shard_id,
-                    env.num_shards,
-                    db_idx,
-                    db_count,
-                    env.script_acl,
-                ),
-                None if is_body => crate::scripting::handle_eval(
-                    env.lua,
-                    env.script_cache,
-                    args,
-                    db,
-                    shard_id,
-                    env.num_shards,
-                    db_idx,
-                    db_count,
-                    env.script_acl,
-                    read_only,
-                ),
-                None => crate::scripting::handle_evalsha(
-                    env.lua,
-                    env.script_cache,
-                    args,
-                    db,
-                    shard_id,
-                    env.num_shards,
-                    db_idx,
-                    db_count,
-                    env.script_acl,
-                    read_only,
-                ),
+    let ((reply, flush), effects) =
+        crate::scripting::bridge::capture_txn_effects(|| {
+            crate::shard::slice::with_shard(|s| {
+                let db_count = s.databases.db_count();
+                // moon#1069: `None` — the keys this script writes are served
+                // with the rest of the transaction's, after EXEC (`ready`).
+                crate::scripting::pending_flush::run_and_complete(s, db_idx, None, |db| {
+                    match registry {
+                        Some(reg) if is_fcall => crate::command::functions::handle_fcall(
+                            reg,
+                            args,
+                            db,
+                            shard_id,
+                            env.num_shards,
+                            db_idx,
+                            db_count,
+                            env.script_acl,
+                        ),
+                        Some(reg) => crate::command::functions::handle_fcall_ro(
+                            reg,
+                            args,
+                            db,
+                            shard_id,
+                            env.num_shards,
+                            db_idx,
+                            db_count,
+                            env.script_acl,
+                        ),
+                        None if is_body => crate::scripting::handle_eval(
+                            env.lua,
+                            env.script_cache,
+                            args,
+                            db,
+                            shard_id,
+                            env.num_shards,
+                            db_idx,
+                            db_count,
+                            env.script_acl,
+                            read_only,
+                        ),
+                        None => crate::scripting::handle_evalsha(
+                            env.lua,
+                            env.script_cache,
+                            args,
+                            db,
+                            shard_id,
+                            env.num_shards,
+                            db_idx,
+                            db_count,
+                            env.script_acl,
+                            read_only,
+                        ),
+                    }
+                })
             })
-        })
-    });
+        });
     drop(registry_guard);
     // The moon#831 batch-barrier flag is how the live path learns a script
     // wrote. Here the captured `effects` carry that fact to the executor's own
@@ -209,6 +218,7 @@ pub(crate) fn run_txn_script(
         reply,
         effects,
         flush,
+        ready: crate::blocking::wakeup::take_script_writes(),
     }
 }
 

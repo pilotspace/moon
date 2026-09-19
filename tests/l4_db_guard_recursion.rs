@@ -7,8 +7,8 @@
 //!
 //! 1. The old `&mut s.databases[i]` borrow ended silently under NLL. A guard
 //!    does not — it lives to end of scope. Where the write path later calls
-//!    `with_all` (FLUSHALL) or re-acquires the same index (`wake_producer`
-//!    after a SELECT), a missing `drop` is a **runtime** panic,
+//!    `with_all` (FLUSHALL) or re-acquires the same index (the wake
+//!    hook after a SELECT), a missing `drop` is a **runtime** panic,
 //!    `"db guard held recursively"`, not a compile error.
 //! 2. That panic fires on essentially every write command, so its absence is
 //!    the thing worth pinning — and it is only reachable over a real socket
@@ -80,7 +80,7 @@ fn write_path_survives_every_command_family_that_reacquires_its_db() {
         );
     }
 
-    // ── SELECT then write: `wake_producer` re-acquires the selected db ────
+    // ── SELECT then write: the wake hook re-acquires the selected db ────
     // This is the interaction that fires whenever the new db equals the one
     // the write guard was taken on.
     for db in ["0", "1", "2", "0"] {

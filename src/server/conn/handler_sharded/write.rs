@@ -779,8 +779,7 @@ pub(super) async fn try_handle_multi_exec(
             // c10k E2: a queued FLUSHDB/FLUSHALL clears only this shard.
             let mut exec_flushes: Vec<(usize, Frame, usize)> = Vec::new();
             // moon#606: keys the body wrote that a blocked client may be on.
-            let mut exec_wakes: Vec<(usize, bytes::Bytes, crate::blocking::WaitFamily)> =
-                Vec::new();
+            let mut exec_wakes: Vec<(usize, bytes::Bytes)> = Vec::new();
             let txn_scripting =
                 txn_script_acl
                     .as_ref()
@@ -832,12 +831,7 @@ pub(super) async fn try_handle_multi_exec(
             // cannot be persisted is reported as an error, not rolled back), so
             // a waiter left asleep would answer null for a key that
             // demonstrably has data.
-            for (wake_db, wake_key, family) in exec_wakes.drain(..) {
-                let mut reg = ctx.blocking_registry.borrow_mut();
-                crate::shard::slice::with_shard_db(wake_db, |db| {
-                    crate::blocking::wakeup::wake_family(&mut reg, db, wake_db, &wake_key, family);
-                });
-            }
+            crate::blocking::wakeup::wake_recorded(&ctx.blocking_registry, exec_wakes.drain(..));
 
             // task #52: flush the graph-leg wal-v3 records collected by the
             // txn executor. Replication is monoio-only by design (see

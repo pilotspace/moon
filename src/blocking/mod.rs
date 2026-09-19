@@ -465,6 +465,27 @@ impl BlockingRegistry {
         self.wait_keys.contains_key(&wait_id)
     }
 
+    /// Is ANY client blocked on this shard? O(1). The gate in front of every
+    /// post-write wake (moon#1069), so a shard with nobody blocked — the
+    /// steady state of every non-queue workload — never walks a write's keys.
+    /// Every path that empties a queue removes it from `waiters`, so an empty
+    /// map means no waiter; a queue ever left behind empty would only make
+    /// this answer `true` needlessly — a wasted walk, never a missed wake.
+    #[inline]
+    pub fn has_any_waiters(&self) -> bool {
+        !self.waiters.is_empty()
+    }
+
+    /// Every key a client is parked on in database `db_index` — what `SWAPDB`
+    /// makes ready all at once (moon#1069). O(parked keys); `SWAPDB` is rare.
+    pub fn waited_keys(&self, db_index: usize) -> Vec<Bytes> {
+        self.waiters
+            .keys()
+            .filter(|(db, _)| *db == db_index)
+            .map(|(_, key)| key.clone())
+            .collect()
+    }
+
     /// Check if any waiters exist for this (db_index, key).
     pub fn has_waiters(&self, db_index: usize, key: &Bytes) -> bool {
         self.waiters

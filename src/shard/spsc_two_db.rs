@@ -14,10 +14,11 @@
 //! corruption) and MOVE returned a loud-but-wrong "cross-db not supported"
 //! error on every arm except the plain `Execute` one.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::blocking::BlockingRegistry;
 use crate::command::keyspace::move_cmd as ksmv;
 use crate::config::RuntimeConfig;
 use crate::protocol::Frame;
@@ -63,6 +64,9 @@ pub(crate) fn try_two_db_intercept(
     spill_sender: Option<&flume::Sender<SpillRequest>>,
     spill_file_id: &Rc<Cell<u64>>,
     disk_offload_dir: Option<&std::path::Path>,
+    // moon#1069: the waiters on the key this writes into the OTHER database
+    // are served here — this intercept replaces every generic write tail.
+    blocking_registry: &RefCell<BlockingRegistry>,
 ) -> Option<Frame> {
     if cmd.eq_ignore_ascii_case(b"MOVE") {
         let response = match ksmv::parse_move_args(args, db_count) {
@@ -75,7 +79,16 @@ pub(crate) fn try_two_db_intercept(
                 databases.with_pair(db_idx, dst_db, |src, dst| {
                     src.refresh_now_from_cache(cached_clock);
                     dst.refresh_now_from_cache(cached_clock);
-                    ksmv::move_core(src, dst, &key)
+                    let reply = ksmv::move_core(src, dst, &key);
+                    // moon#1069: the key now exists in `dst_db`.
+                    crate::blocking::wakeup::wake_cross_db_write(
+                        blocking_registry,
+                        dst,
+                        dst_db,
+                        &key,
+                        &reply,
+                    );
+                    reply
                 })
             }
         };
@@ -123,7 +136,16 @@ pub(crate) fn try_two_db_intercept(
                         return oom;
                     }
                 }
-                ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
+                let reply = ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace);
+                // moon#1069: the copy now exists in `ca.dst_db`.
+                crate::blocking::wakeup::wake_cross_db_write(
+                    blocking_registry,
+                    dst,
+                    ca.dst_db,
+                    &ca.dst_key,
+                    &reply,
+                );
+                reply
             }),
         };
         return Some(response);

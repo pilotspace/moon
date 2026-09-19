@@ -6,56 +6,88 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 
-/// Does `cmd` PUSH onto a list, and so possibly satisfy a blocked
-/// `BLPOP`/`BRPOP`/`BLMOVE`/`BRPOPLPUSH` waiter?
+/// Most writes name one or two keys; the waker's worklist starts from these
+/// and only spills to the heap for a wide multi-key write.
+pub type ReadyKeys = smallvec::SmallVec<[Bytes; 2]>;
+
+/// Every key a write command may have CREATED or GROWN — the keys a blocked
+/// client could now be served from (moon#1059, moon#1069).
 ///
-/// Every dispatch site reaches this through [`wake_producer`], never by
-/// open-coding the test: a producer that one site wakes on and another does
-/// not is a routing-dependent hang — the waiter returns instantly or blocks to
-/// its timeout depending on which shard owns the key, which reads as a flake
-/// rather than as a bug. It was open-coded at eight sites until moon#623. `RPOPLPUSH` is `LMOVE ... RIGHT LEFT` and
-/// so must answer identically here (moon#520).
-#[inline]
-pub fn is_list_producer(cmd: &[u8]) -> bool {
-    cmd.eq_ignore_ascii_case(b"LPUSH")
-        || cmd.eq_ignore_ascii_case(b"RPUSH")
-        || cmd.eq_ignore_ascii_case(b"LMOVE")
-        || cmd.eq_ignore_ascii_case(b"RPOPLPUSH")
+/// This is redis's `signalKeyAsReady`, raised from the keyspace write itself
+/// (`dbAdd`, `setKey`, `lmoveHandlePush`, ...), expressed through the one key
+/// walker every other consumer shares ([`command_key_positions`]): the
+/// positions a command may MODIFY. Keyed on what a command WRITES, never on a
+/// list of command names. The list it replaced — `LPUSH`/`RPUSH`/`LMOVE`/
+/// `RPOPLPUSH`/`ZADD`/`XADD` — was the model of the system, and every writer
+/// it did not name (`RENAME`, `COPY`, `SORT ... STORE`, `ZUNIONSTORE`,
+/// `ZRANGESTORE`, `ZINCRBY`, `GEOADD`, `RESTORE`, ...) left a client blocked
+/// beside data it could have had.
+///
+/// Over-inclusive on purpose, in the direction that is merely wasted work: a
+/// key that was DELETED (`RENAME`'s source, `LMOVE`'s emptied source) or that
+/// now holds the wrong type for its waiters is offered too, and the wakers
+/// find nothing to serve and leave every waiter parked exactly where it was.
+/// Missing a key is a waiter asleep until its own timeout.
+///
+/// `MOVE` and `COPY ... DB n` write a key in ANOTHER database; that half is
+/// [`cross_db_write_target`], raised by the two-database intercepts.
+///
+/// [`command_key_positions`]: crate::acl::keyspec::command_key_positions
+pub fn written_keys(cmd: &[u8], args: &[Frame]) -> ReadyKeys {
+    use crate::acl::keyspec::{KeyPositions, KeyRole, command_key_positions};
+    let positions = match command_key_positions(cmd, args) {
+        // `AtPlusComputed` is `SORT ... BY w_*`: the computed names are only
+        // ever READ, and the `STORE` destination is still named.
+        KeyPositions::At(idx) | KeyPositions::AtPlusComputed(idx) => idx,
+        KeyPositions::None | KeyPositions::Unknown => return ReadyKeys::new(),
+    };
+    positions
+        .iter()
+        .filter(|at| at.role == KeyRole::Write)
+        .filter_map(|at| args.get(at.idx))
+        .filter_map(crate::server::connection::extract_bytes)
+        .collect()
 }
 
-/// Does `cmd` write data that could satisfy SOME blocked waiter — list, zset
-/// or stream?
-///
-/// The gate in front of every wakeup ladder, and it is a function for the same
-/// reason [`is_list_producer`] is: it was open-coded at ten dispatch sites,
-/// eight of which said `is_list_producer(cmd) || ZADD || XADD` while the two
-/// connection handlers said only `is_list_producer(cmd) || ZADD`. That
-/// difference is half of moon#595 — with the missing `XADD`, a stream reader
-/// blocked on a key its OWN shard owned could never be woken, because the
-/// local write path did not consider stream waiters to exist. It reads as a
-/// routing-dependent hang: the same `XADD` wakes or does not wake depending on
-/// whether the writer's connection happens to live on the key's shard.
-///
-/// Producers that gain a blocking consumer later must be added HERE, once.
-#[inline]
-pub fn is_producer(cmd: &[u8]) -> bool {
-    is_list_producer(cmd) || cmd.eq_ignore_ascii_case(b"ZADD") || cmd.eq_ignore_ascii_case(b"XADD")
-}
-
-/// Index of the argument naming the key a producer WRITES to — the key a
-/// blocked client is waiting on.
-///
-/// `LMOVE`/`RPOPLPUSH` push to their DESTINATION (`args[1]`); everything else
-/// that shares these wakeup guards (`LPUSH`, `RPUSH`, `ZADD`, `XADD`) writes
-/// to `args[0]`. Waking on `LMOVE`'s source is a no-op dressed as a wakeup:
-/// the element left that key.
-#[inline]
-pub fn producer_wake_key_index(cmd: &[u8]) -> usize {
-    if cmd.eq_ignore_ascii_case(b"LMOVE") || cmd.eq_ignore_ascii_case(b"RPOPLPUSH") {
-        1
-    } else {
-        0
+/// The database and key a successful `MOVE` or `COPY ... DB n` wrote into, or
+/// `None` for anything else — including a same-db `COPY`, whose destination
+/// [`written_keys`] already names in the command's own database.
+pub fn cross_db_write_target(
+    cmd: &[u8],
+    args: &[Frame],
+    db_index: usize,
+    db_count: usize,
+) -> Option<(usize, Bytes)> {
+    use crate::command::keyspace::move_cmd as ksmv;
+    if cmd.eq_ignore_ascii_case(b"MOVE") {
+        let (key, dst_db) = ksmv::parse_move_args(args, db_count).ok()?;
+        return (dst_db != db_index).then_some((dst_db, key));
     }
+    if cmd.eq_ignore_ascii_case(b"COPY") {
+        let ca = ksmv::parse_copy_db_args(args, db_index, db_count)?.ok()?;
+        return Some((ca.dst_db, ca.dst_key));
+    }
+    None
+}
+
+/// [`written_keys`] narrowed to the keys that have a client parked on them in
+/// `db_index` — decided against the registry alone, so a caller can ask it
+/// BEFORE paying for an exclusive database guard (moon#942).
+///
+/// Empty — and without walking the argv at all — while nothing on this shard
+/// is blocked, which is the steady state of every non-queue workload.
+pub fn ready_keys(
+    registry: &BlockingRegistry,
+    db_index: usize,
+    cmd: &[u8],
+    args: &[Frame],
+) -> ReadyKeys {
+    if !registry.has_any_waiters() {
+        return ReadyKeys::new();
+    }
+    let mut keys = written_keys(cmd, args);
+    keys.retain(|k| registry.has_waiters(db_index, k));
+    keys
 }
 
 /// What a wake attempt consumed from the datastore, so it can be put back if
@@ -180,9 +212,29 @@ impl WakeUndo {
     }
 }
 
-/// Called after LPUSH/RPUSH successfully adds elements to a list key.
-/// Pops the first waiter (FIFO) and executes the appropriate pop operation.
-/// Returns true if a blocked client was woken (element was consumed by the waiter).
+/// Serve the list waiters parked on `key` — and then every key those serves
+/// made ready in turn. Returns true if a blocked client was answered.
+///
+/// A `BLMOVE`/`BRPOPLPUSH` served here PUSHES onto its destination, which is
+/// exactly as much a write as the `LPUSH` that woke it, so the destination's
+/// own waiters are owed a serve too (moon#1059). Before, they stayed parked
+/// beside the element until their timeout — nothing ever looked at the
+/// destination again. Redis gets this from `handleClientsBlockedOnKeys`,
+/// which keeps draining `server.ready_keys` while serving adds to it; this is
+/// the same loop over a worklist, in the same order: every waiter of the key
+/// being served first, then the keys that made ready, oldest first.
+///
+/// A key already served earlier in the walk is enqueued AGAIN when a later hop
+/// pushes onto it (`BLMOVE a b`, `BLMOVE b a`, `BLPOP a`: the element comes back
+/// to `a` and its next waiter takes it, as in redis). Only a key still waiting
+/// in the worklist is not enqueued twice.
+///
+/// **Bounded without a cap.** A key joins the worklist only when a move waiter
+/// has just been SERVED, and a served waiter leaves the registry in the same
+/// step; nothing registers during this synchronous stretch. So the walk can
+/// enqueue at most one key per waiter parked when it began, even through
+/// cycles. The destination is on this shard: a move across shards is refused
+/// before it can park (`cross_shard_move_refusal`).
 ///
 /// The caller must hold mutable borrows on both the registry and the database.
 pub fn try_wake_list_waiter(
@@ -190,6 +242,28 @@ pub fn try_wake_list_waiter(
     db: &mut Database,
     db_index: usize,
     key: &Bytes,
+) -> bool {
+    let mut worklist = ReadyKeys::new();
+    let mut served = serve_list_key(registry, db, db_index, key, &mut worklist, 0);
+    let mut next = 0;
+    while let Some(ready) = worklist.get(next).cloned() {
+        next += 1;
+        served |= serve_list_key(registry, db, db_index, &ready, &mut worklist, next);
+    }
+    served
+}
+
+/// One key's turn in [`try_wake_list_waiter`]: pop the key's list waiters
+/// (FIFO) and execute each one's pop while the key has data. The destination
+/// of every move served here is appended to `worklist` unless it is already
+/// pending there (`worklist[pending_from..]`).
+fn serve_list_key(
+    registry: &mut BlockingRegistry,
+    db: &mut Database,
+    db_index: usize,
+    key: &Bytes,
+    worklist: &mut ReadyKeys,
+    pending_from: usize,
 ) -> bool {
     // Loop: try waiters until one succeeds (oneshot receiver may be dropped = skip)
     // moon#535: pop only waiters THIS waker can serve. The old blind
@@ -206,7 +280,20 @@ pub fn try_wake_list_waiter(
     // callers that cannot promise that. (A waiter popped below for a pop that
     // yields nothing is put back too — never answered nil, which redis never
     // sends a timeout-0 waiter.)
+    //
+    // moon#1069: and a key that is not a LIST has nothing for a list waiter —
+    // checked here, before any waiter is popped, because this is now raised
+    // for every key a write touched, not only for keys a push just grew. The
+    // `BLMOVE` arm below answers `-WRONGTYPE` for a wrong-typed DESTINATION
+    // before it pops; without this, a `SET` on a `BLMOVE`'s SOURCE would have
+    // reached that arm and unblocked the client with the destination's error,
+    // where redis (`serveClientsBlockedOnKey` matches the key's type to the
+    // waiter's first) leaves it parked. Read-only probe (moon#832).
     if !db.exists(key) {
+        return false;
+    }
+    let now_ms = db.now_ms();
+    if !matches!(db.get_list_ref_if_alive(key, now_ms), Ok(Some(_))) {
         return false;
     }
     let mut served = false;
@@ -400,6 +487,17 @@ pub fn try_wake_list_waiter(
         // Clean up all other key registrations for this wait_id
         registry.remove_wait(wait_id);
 
+        // moon#1059: a move that goes through made its destination ready.
+        // Only a move that actually MOVED — its undo says so; a `-WRONGTYPE`
+        // answer carries none — and not the rotate form, whose destination is
+        // the key this loop is still serving.
+        let moved_to = match &undo {
+            Some(WakeUndo::Moved { destination, .. }) if destination != key => {
+                Some(destination.clone())
+            }
+            _ => None,
+        };
+
         if deliver(
             db,
             key,
@@ -410,6 +508,11 @@ pub fn try_wake_list_waiter(
             expires_at_ms,
         ) {
             served = true;
+            if let Some(dest) = moved_to
+                && !worklist[pending_from..].contains(&dest)
+            {
+                worklist.push(dest);
+            }
             // moon#1019: one push can carry several elements, and
             // Redis keeps serving the key's waiters while it has data. Stopping
             // after the first left the rest parked next to data they could
@@ -600,94 +703,211 @@ pub fn try_wake_zset_waiter(
     served
 }
 
-/// Which waker a producer command's write should raise, or `None` when the
-/// command is not a producer at all.
+/// Serve every waiter `key` can now satisfy, whatever family it is: list pops
+/// (and, through them, the moves they chain into), zset pops, stream reads.
+/// Returns true if a blocked client was answered.
 ///
-/// Pairs with [`producer_wake_key_index`]: together they are everything a
-/// write site needs to raise the right wake, so a new execution path can hook
-/// in without re-deriving the command-to-waker mapping and getting it subtly
-/// wrong. `EXEC` was such a path — it ran producers through its own executor
-/// and reached none of the existing hooks, so a `MULTI ; LPUSH k v ; EXEC`
-/// left a client blocked on `k` asleep until its own timeout (moon#606).
-///
-/// It is also the **gate** a call site must use when the only reason it would
-/// acquire a database guard is to call [`wake_producer`]: this needs the
-/// command NAME alone, so the question can and should be asked *before* paying
-/// for the `&mut Database`. `handler_monoio`'s write tail does exactly that
-/// (moon#942) — it used to take an exclusive guard on every successful write
-/// just so `wake_producer` could return `None` inside it for `INCR`, `SADD`
-/// and `HSET`.
-///
-/// A gate that hoists this decision must call THIS function, never a
-/// hand-written list of command names. The two must not be able to disagree:
-/// a gate narrower than the mapping is a lost wakeup whose visibility depends
-/// on which shard owns the key, so it reads as a flake rather than as a bug
-/// (moon#595, moon#623).
-pub fn producer_family(cmd: &[u8]) -> Option<crate::blocking::WaitFamily> {
-    if !is_producer(cmd) {
-        return None;
-    }
-    Some(if is_list_producer(cmd) {
-        crate::blocking::WaitFamily::List
-    } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-        crate::blocking::WaitFamily::ZSet
-    } else {
-        crate::blocking::WaitFamily::Stream
-    })
-}
-
-/// Raise `family`'s waker for `key`. Returns true if a client was answered.
-pub fn wake_family(
+/// A key holds one type, so at most one family is ever served; the others find
+/// the key of the wrong type and leave their waiters parked where they were,
+/// which is redis's behaviour for a key that became the wrong type under a
+/// waiter (measured against redis-server 8.6.1: `RENAME` a zset onto a key a
+/// `BLPOP` is parked on leaves the `BLPOP` parked until its own timeout).
+pub fn wake_key(
     registry: &mut BlockingRegistry,
     db: &mut Database,
     db_index: usize,
     key: &Bytes,
-    family: crate::blocking::WaitFamily,
 ) -> bool {
-    match family {
-        crate::blocking::WaitFamily::List => try_wake_list_waiter(registry, db, db_index, key),
-        crate::blocking::WaitFamily::ZSet => try_wake_zset_waiter(registry, db, db_index, key),
-        crate::blocking::WaitFamily::Stream => try_wake_stream_waiter(registry, db, db_index, key),
-    }
+    let list = try_wake_list_waiter(registry, db, db_index, key);
+    let zset = try_wake_zset_waiter(registry, db, db_index, key);
+    let stream = try_wake_stream_waiter(registry, db, db_index, key);
+    list | zset | stream
 }
 
-/// The one producer→waiter hook: given a command that just executed
-/// successfully, wake whoever was blocked on the key it wrote.
+/// The one write→waiter hook: after a write command succeeded in `db_index`,
+/// serve whoever is blocked on a key it wrote. Returns true if a blocked
+/// client was answered.
 ///
-/// Call this instead of open-coding the trio `is_producer`, then
-/// `producer_wake_key_index`, then a three-way family match. Every dispatch
-/// path used to carry its own copy — eight of them — and a path that reached
-/// none of them looked perfectly healthy in review and in CI. That is how
-/// `XADD` on a locally
-/// owned stream (moon#595) and every write inside `MULTI`/`EXEC` (moon#606)
-/// each shipped a lost wakeup. Keeping the mapping in one function means a
-/// future producer command is taught here once (moon#623).
+/// Every dispatch site that runs a write calls THIS — never a hand-rolled
+/// subset. It replaces a hook keyed on six "producer" command names, and the
+/// lesson of its history is that a site or a command the hook does not reach
+/// looks perfectly healthy in review and in CI: `XADD` on a locally owned
+/// stream (moon#595), every write inside `MULTI`/`EXEC` (moon#606), and then
+/// every writer that was not a push (moon#1069).
 ///
 /// The caller keeps its own success gate (`is_write && !error`, or just
-/// `!error`) — it differs per path and is not part of the mapping.
-///
-/// Borrows `registry` only after the command is known to be a producer with a
-/// key, so the common non-producer write pays no `RefCell` borrow.
-///
-/// Returns true if a blocked client was answered.
-pub fn wake_producer(
+/// `!error`) — it differs per path and is not part of the mapping. A command
+/// whose written key holds nothing a waiter wants (a `SET`, a `DEL`) costs
+/// one registry probe per written key, and only while that key has a waiter.
+pub fn wake_written_keys(
     registry: &std::cell::RefCell<BlockingRegistry>,
     db: &mut Database,
     db_index: usize,
     cmd: &[u8],
     args: &[Frame],
 ) -> bool {
-    let Some(family) = producer_family(cmd) else {
-        return false;
-    };
-    let Some(key) = args
-        .get(producer_wake_key_index(cmd))
-        .and_then(crate::server::connection::extract_bytes)
-    else {
-        return false;
-    };
     let mut reg = registry.borrow_mut();
-    wake_family(&mut reg, db, db_index, &key, family)
+    let keys = ready_keys(&reg, db_index, cmd, args);
+    let mut woke = false;
+    for key in &keys {
+        woke |= wake_key(&mut reg, db, db_index, key);
+    }
+    woke
+}
+
+/// Serve the waiters on each `(db, key)` a write recorded for later — the
+/// deferred form of [`wake_written_keys`], for an executor that could not
+/// reach the registry while it ran (a `MULTI` body, a script).
+///
+/// Raised after the whole body, as redis does: EXEC and EVAL are each one
+/// command, so every waiter sees the whole transaction or script applied,
+/// never half of it. Must run on the shard that owns the keys — the one the
+/// body ran on — and outside any borrow of that shard's slice.
+pub fn wake_recorded(
+    registry: &std::cell::RefCell<BlockingRegistry>,
+    recorded: impl IntoIterator<Item = (usize, Bytes)>,
+) {
+    // A body of ten thousand writes on a shard nobody is blocked on pays one
+    // check, not ten thousand lookups.
+    if !registry.borrow().has_any_waiters() {
+        return;
+    }
+    for (db_index, key) in recorded {
+        let mut reg = registry.borrow_mut();
+        if !reg.has_waiters(db_index, &key) {
+            continue;
+        }
+        crate::shard::slice::with_shard_db(db_index, |db| {
+            wake_key(&mut reg, db, db_index, &key);
+        });
+    }
+}
+
+/// [`wake_written_keys`] for a write whose LOCAL leg ran somewhere with no
+/// write tail — the multi-key coordinator, which runs a same-shard `COPY`
+/// (and this shard's slice of every spanning write) straight through the
+/// dispatcher. Its remote legs are Execute messages and are woken on their
+/// owners like any other write; this is the one leg nothing else reaches.
+///
+/// Only keys with a waiter in THIS shard's registry are served, and a waiter
+/// only ever parks on the shard that owns its key, so a key the coordinator
+/// wrote on another shard is never touched here. Call outside any borrow of
+/// this shard's slice.
+pub fn wake_written_keys_on_shard(
+    registry: &std::cell::RefCell<BlockingRegistry>,
+    db_index: usize,
+    cmd: &[u8],
+    args: &[Frame],
+) {
+    let keys = ready_keys(&registry.borrow(), db_index, cmd, args);
+    if !keys.is_empty() {
+        wake_recorded(registry, keys.into_iter().map(|k| (db_index, k)));
+    }
+}
+
+/// `SWAPDB a b` just exchanged two of this shard's databases: every key a
+/// client is parked on in either of them may now hold data. Redis serves them
+/// the same way (`swapdb` -> `scanDatabaseForReadyKeys`, measured against
+/// redis-server 8.6.1: a `BLPOP k` parked in db 3 is served by `SWAPDB 0 3`
+/// when db 0 held `k`). Call outside any borrow of this shard's slice.
+pub fn wake_swapped_dbs(registry: &std::cell::RefCell<BlockingRegistry>, a: usize, b: usize) {
+    if a == b || !registry.borrow().has_any_waiters() {
+        return;
+    }
+    let recorded: Vec<(usize, Bytes)> = {
+        let reg = registry.borrow();
+        [a, b]
+            .into_iter()
+            .flat_map(|db| reg.waited_keys(db).into_iter().map(move |k| (db, k)))
+            .collect()
+    };
+    wake_recorded(registry, recorded);
+}
+
+thread_local! {
+    /// The keys the script running on this shard thread has written so far,
+    /// with the db each was written in — the script's half of redis's ready
+    /// set, served once the script returns (see [`note_script_write`]).
+    /// Per-shard-thread state, never shared, like `pending_flush::PENDING`.
+    static SCRIPT_WRITES: std::cell::RefCell<Vec<(usize, Bytes)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record the keys a successful `redis.call` write inside a script touched.
+///
+/// A script reaches the keyspace from `scripting::bridge` through one
+/// `&mut Database`, with no registry in scope and no way to serve a waiter
+/// without breaking the script's atomicity — so, like a flush the script
+/// issues, the wake is recorded here and finished one frame up by
+/// [`crate::scripting::pending_flush::run_and_complete`] (or, for a script
+/// queued in `MULTI`, by the EXEC executor's own recorded wakes).
+///
+/// A run of writes to one key records it once; anything else is filtered by
+/// "has a waiter" when the record is served.
+pub fn note_script_write(db_index: usize, cmd: &[u8], args: &[Frame]) {
+    let keys = written_keys(cmd, args);
+    if keys.is_empty() {
+        return;
+    }
+    SCRIPT_WRITES.with(|w| {
+        let mut w = w.borrow_mut();
+        for key in keys {
+            if w.last().is_none_or(|(db, k)| *db != db_index || *k != key) {
+                w.push((db_index, key));
+            }
+        }
+    });
+}
+
+/// Take everything [`note_script_write`] recorded, leaving the thread clean
+/// for the next script.
+pub fn take_script_writes() -> Vec<(usize, Bytes)> {
+    SCRIPT_WRITES.with(|w| std::mem::take(&mut *w.borrow_mut()))
+}
+
+/// Serve the waiters on the keys a finished script wrote, on the shard whose
+/// databases are `databases` — for a caller that already holds this shard's
+/// slice, where [`wake_recorded`]'s own slice borrow would re-enter it.
+pub fn wake_script_writes(
+    registry: &std::cell::RefCell<BlockingRegistry>,
+    databases: &crate::shard::db_plane::ShardDbSet,
+) {
+    let recorded = take_script_writes();
+    if recorded.is_empty() {
+        return;
+    }
+    let mut reg = registry.borrow_mut();
+    for (db_index, key) in recorded {
+        if reg.has_waiters(db_index, &key) {
+            let mut db = databases.write(db_index);
+            wake_key(&mut reg, &mut db, db_index, &key);
+        }
+    }
+}
+
+/// Wake the waiters on the key a `MOVE` or `COPY ... DB n` just wrote into
+/// `dst` (database `dst_db`), given the command's reply. The two-database
+/// intercepts run before, and instead of, every generic write tail, so this is
+/// their half of [`wake_written_keys`]: redis signals the key from the
+/// destination database's `dbAdd`.
+///
+/// Only `:1` wrote anything; `:0` (source missing, destination occupied
+/// without `REPLACE`) and every error leave `dst` as it was.
+pub fn wake_cross_db_write(
+    registry: &std::cell::RefCell<BlockingRegistry>,
+    dst: &mut Database,
+    dst_db: usize,
+    key: &Bytes,
+    reply: &Frame,
+) -> bool {
+    if !matches!(reply, Frame::Integer(1)) {
+        return false;
+    }
+    let mut reg = registry.borrow_mut();
+    if !reg.has_waiters(dst_db, key) {
+        return false;
+    }
+    wake_key(&mut reg, dst, dst_db, key)
 }
 
 /// Called after `XADD` adds an entry to a stream key, and again right after a
@@ -1293,14 +1513,15 @@ mod cross_shard_wait_id_tests {
     }
 }
 
-/// The mapping [`wake_producer`] owns: which commands wake, which argument
-/// names the key, which family's queue gets raised.
+/// The mapping [`wake_written_keys`] owns: which keys a write makes ready, and
+/// what serving them does — including the moves a serve chains into.
 ///
-/// Until moon#623 this trio was open-coded at eight dispatch sites, so a site
-/// could disagree with its siblings and the disagreement showed up only as a
-/// routing-dependent hang. These pin the single copy.
+/// Until moon#623 this was open-coded at eight dispatch sites, so a site could
+/// disagree with its siblings and the disagreement showed up only as a
+/// routing-dependent hang; until moon#1069 it named six commands. These pin
+/// the single copy.
 #[cfg(test)]
-mod wake_producer_tests {
+mod wake_written_keys_tests {
     use super::*;
     use crate::blocking::WaitEntry;
     use crate::storage::Database;
@@ -1349,7 +1570,7 @@ mod wake_producer_tests {
             Frame::Integer(1)
         );
         assert!(
-            wake_producer(&reg, &mut db, 0, b"LPUSH", &argv),
+            wake_written_keys(&reg, &mut db, 0, b"LPUSH", &argv),
             "LPUSH must wake the BLPOP parked on its key"
         );
         assert!(served(&rx).is_some(), "the parked reader got no reply");
@@ -1377,7 +1598,7 @@ mod wake_producer_tests {
         assert!(matches!(moved, Frame::BulkString(_)), "LMOVE: {moved:?}");
 
         assert!(
-            wake_producer(&reg, &mut db, 0, b"LMOVE", &argv),
+            wake_written_keys(&reg, &mut db, 0, b"LMOVE", &argv),
             "LMOVE must wake the waiter on its DESTINATION"
         );
         assert!(served(&on_dst).is_some(), "destination waiter left parked");
@@ -1396,8 +1617,8 @@ mod wake_producer_tests {
 
         let argv = args(&["wp:list", "v"]);
         assert!(
-            !wake_producer(&reg, &mut db, 0, b"GET", &argv),
-            "GET is not a producer"
+            !wake_written_keys(&reg, &mut db, 0, b"GET", &argv),
+            "GET writes nothing"
         );
         assert!(served(&rx).is_none(), "a non-producer answered a waiter");
     }
@@ -1432,9 +1653,244 @@ mod wake_producer_tests {
             Frame::BulkString(_)
         ));
         assert!(
-            wake_producer(&reg, &mut db, 0, b"XADD", &argv),
+            wake_written_keys(&reg, &mut db, 0, b"XADD", &argv),
             "XADD must wake the XREAD parked on its key"
         );
         assert!(served(&rx).is_some(), "stream reader left parked");
+    }
+
+    fn park(
+        reg: &RefCell<BlockingRegistry>,
+        key: &str,
+        wait_id: u64,
+        cmd: BlockedCommand,
+    ) -> crate::runtime::channel::OneshotReceiver<Option<Frame>> {
+        let (tx, rx) = crate::runtime::channel::oneshot();
+        reg.borrow_mut().register(
+            0,
+            Bytes::copy_from_slice(key.as_bytes()),
+            WaitEntry {
+                wait_id,
+                cmd,
+                reply_tx: tx,
+                deadline: None,
+                claim: None,
+            },
+        );
+        rx
+    }
+
+    fn blmove(dst: &str) -> BlockedCommand {
+        BlockedCommand::BLMove {
+            destination: Bytes::copy_from_slice(dst.as_bytes()),
+            wherefrom: Direction::Left,
+            whereto: Direction::Right,
+        }
+    }
+
+    fn keys(v: &[&str]) -> ReadyKeys {
+        v.iter()
+            .map(|k| Bytes::copy_from_slice(k.as_bytes()))
+            .collect()
+    }
+
+    /// moon#1069: the ready keys are the positions a command WRITES, from the
+    /// shared key walker — the destination of every `*STORE`, both keys of a
+    /// rename, and nothing for a read.
+    #[test]
+    fn written_keys_are_the_write_positions_of_any_command() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            ("RENAME", &["s", "d"], &["s", "d"]),
+            ("COPY", &["s", "d"], &["d"]),
+            ("SORT", &["s", "STORE", "d"], &["d"]),
+            ("SORT", &["s", "BY", "w_*", "STORE", "d"], &["d"]),
+            ("ZUNIONSTORE", &["d", "2", "a", "b"], &["d"]),
+            ("ZRANGESTORE", &["d", "s", "0", "-1"], &["d"]),
+            ("ZINCRBY", &["z", "1", "m"], &["z"]),
+            ("GEOADD", &["g", "1", "2", "p"], &["g"]),
+            ("RESTORE", &["k", "0", "payload"], &["k"]),
+            ("LMOVE", &["s", "d", "LEFT", "LEFT"], &["s", "d"]),
+            ("EVAL", &["return 1", "1", "k"], &["k"]),
+            ("GET", &["k"], &[]),
+            ("ZRANGE", &["k", "0", "-1"], &[]),
+        ];
+        for (cmd, argv, want) in cases {
+            assert_eq!(
+                written_keys(cmd.as_bytes(), &args(argv)),
+                keys(want),
+                "{cmd} {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_db_target_names_the_other_database_only() {
+        let t =
+            |cmd: &str, argv: &[&str]| cross_db_write_target(cmd.as_bytes(), &args(argv), 0, 16);
+        assert_eq!(t("MOVE", &["k", "3"]), Some((3, Bytes::from_static(b"k"))));
+        assert_eq!(
+            t("COPY", &["s", "d", "DB", "3"]),
+            Some((3, Bytes::from_static(b"d")))
+        );
+        assert_eq!(t("MOVE", &["k", "0"]), None, "same-db MOVE writes nothing");
+        assert_eq!(
+            t("COPY", &["s", "d"]),
+            None,
+            "same-db COPY is written_keys'"
+        );
+        assert_eq!(t("COPY", &["s", "d", "DB", "0"]), None);
+        assert_eq!(t("RENAME", &["s", "d"]), None);
+    }
+
+    /// moon#1069: a key created by something other than a push wakes its
+    /// waiter — here the destination of a `RENAME`.
+    #[test]
+    fn a_rename_destination_wakes_its_waiter() {
+        let mut db = Database::new();
+        let reg = RefCell::new(BlockingRegistry::new(0));
+        let rx = park(&reg, "d", 1, BlockedCommand::BLPop);
+        // The keyspace effect of `RENAME s d` on a one-element list.
+        let _ = crate::command::list::lpush(&mut db, &args(&["d", "v"]));
+        assert!(wake_written_keys(
+            &reg,
+            &mut db,
+            0,
+            b"RENAME",
+            &args(&["s", "d"])
+        ));
+        assert!(
+            served(&rx).is_some(),
+            "the waiter on the destination stayed parked"
+        );
+        assert!(!db.exists(b"d"), "the waiter must have taken the element");
+    }
+
+    /// moon#1059: a `BLMOVE` served by a wake pushes onto its destination, and
+    /// the destination's own waiter is served in the same pass.
+    #[test]
+    fn a_wake_served_move_feeds_the_destination_waiter() {
+        let mut db = Database::new();
+        let reg = RefCell::new(BlockingRegistry::new(0));
+        let mover = park(&reg, "src", 1, blmove("dst"));
+        let popper = park(&reg, "dst", 2, BlockedCommand::BLPop);
+        let _ = crate::command::list::rpush(&mut db, &args(&["src", "x"]));
+        assert!(try_wake_list_waiter(
+            &mut reg.borrow_mut(),
+            &mut db,
+            0,
+            &Bytes::from_static(b"src")
+        ));
+        assert_eq!(
+            served(&mover),
+            Some(Frame::BulkString(Bytes::from_static(b"x")))
+        );
+        assert!(
+            served(&popper).is_some(),
+            "BLPOP on the destination left parked"
+        );
+        assert!(
+            !db.exists(b"dst"),
+            "the element must have reached the BLPOP"
+        );
+        assert!(!reg.borrow().has_any_waiters());
+    }
+
+    /// A key served earlier in the walk becomes ready AGAIN when a later hop
+    /// pushes back onto it — `a -> b`, `b -> a`, then `BLPOP a` takes it.
+    /// Measured against redis-server 8.6.1: all three are answered `x`.
+    #[test]
+    fn a_move_cycle_serves_every_waiter_and_terminates() {
+        let mut db = Database::new();
+        let reg = RefCell::new(BlockingRegistry::new(0));
+        let ab = park(&reg, "a", 1, blmove("b"));
+        let ba = park(&reg, "b", 2, blmove("a"));
+        let pop_a = park(&reg, "a", 3, BlockedCommand::BLPop);
+        let _ = crate::command::list::rpush(&mut db, &args(&["a", "x"]));
+        assert!(try_wake_list_waiter(
+            &mut reg.borrow_mut(),
+            &mut db,
+            0,
+            &Bytes::from_static(b"a")
+        ));
+        assert!(served(&ab).is_some());
+        assert!(served(&ba).is_some());
+        assert!(
+            served(&pop_a).is_some(),
+            "the element came back to `a` unserved"
+        );
+        assert!(!db.exists(b"a") && !db.exists(b"b"));
+    }
+
+    /// A ring of movers with one element and no final consumer ends once every
+    /// mover has been served: the walk is bounded by the waiters parked when it
+    /// began, not by a cap.
+    #[test]
+    fn a_ring_of_movers_is_bounded_by_its_waiters() {
+        let mut db = Database::new();
+        let reg = RefCell::new(BlockingRegistry::new(0));
+        let ring = ["r0", "r1", "r2", "r3"];
+        let rxs: Vec<_> = (0..ring.len())
+            .map(|i| {
+                park(
+                    &reg,
+                    ring[i],
+                    i as u64 + 1,
+                    blmove(ring[(i + 1) % ring.len()]),
+                )
+            })
+            .collect();
+        let _ = crate::command::list::rpush(&mut db, &args(&["r0", "x"]));
+        assert!(try_wake_list_waiter(
+            &mut reg.borrow_mut(),
+            &mut db,
+            0,
+            &Bytes::from_static(b"r0")
+        ));
+        for rx in &rxs {
+            assert!(served(rx).is_some(), "a mover in the ring was skipped");
+        }
+        // Four hops of one element: it ends on `r0` again.
+        assert!(db.exists(b"r0"));
+        assert!(!reg.borrow().has_any_waiters());
+    }
+
+    /// The source-type guard: a `SET` on a `BLMOVE`'s source must leave the
+    /// mover parked, even when its DESTINATION is of the wrong type — redis
+    /// matches the key's type to the waiter before looking at the destination.
+    #[test]
+    fn a_wrong_typed_source_leaves_a_mover_parked() {
+        let mut db = Database::new();
+        let reg = RefCell::new(BlockingRegistry::new(0));
+        db.set_string(b"dst", Bytes::from_static(b"str"));
+        let rx = park(&reg, "src", 1, blmove("dst"));
+        db.set_string(b"src", Bytes::from_static(b"str"));
+        assert!(!wake_written_keys(
+            &reg,
+            &mut db,
+            0,
+            b"SET",
+            &args(&["src", "str"])
+        ));
+        assert!(
+            served(&rx).is_none(),
+            "a string source answered a list waiter"
+        );
+        assert!(reg.borrow().has_waiters(0, &Bytes::from_static(b"src")));
+    }
+
+    /// Script writes are recorded per key (a run of writes to one key once)
+    /// and taken exactly once.
+    #[test]
+    fn script_writes_are_recorded_then_taken_once() {
+        let _ = take_script_writes();
+        note_script_write(0, b"RPUSH", &args(&["q", "a"]));
+        note_script_write(0, b"RPUSH", &args(&["q", "b"]));
+        note_script_write(2, b"ZADD", &args(&["z", "1", "m"]));
+        note_script_write(0, b"GET", &args(&["q"]));
+        assert_eq!(
+            take_script_writes(),
+            vec![(0, Bytes::from_static(b"q")), (2, Bytes::from_static(b"z"))]
+        );
+        assert!(take_script_writes().is_empty());
     }
 }

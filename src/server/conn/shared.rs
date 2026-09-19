@@ -400,10 +400,10 @@ pub(crate) fn execute_transaction_sharded(
     cached_clock: &CachedClock,
     exec_publishes: &mut Vec<ExecPublish>,
     exec_flushes: &mut Vec<(usize, Frame, usize)>,
-    // moon#606: keys this body wrote that a blocked client may be waiting on.
-    // Raised by the CALLER after the body, never here — see the collection
-    // site below for why.
-    exec_wakes: &mut Vec<(usize, Bytes, crate::blocking::WaitFamily)>,
+    // moon#606: keys this body wrote that a blocked client may be waiting on,
+    // with the db each was written in. Raised by the CALLER after the body,
+    // never here — see the collection site below for why.
+    exec_wakes: &mut Vec<(usize, Bytes)>,
     // WATCH/CAS (task `watch-cas-transactions`): the versions this connection
     // recorded at WATCH time. Empty for the overwhelming majority of
     // transactions, which is why the check below early-outs on `is_empty`
@@ -496,6 +496,8 @@ pub(crate) fn execute_transaction_sharded(
             };
             let outcome = super::txn_script::run_txn_script(env, cmd, cmd_args, selected, shard_id);
             aof_entries.extend(outcome.effects);
+            // moon#1069: the keys the script's own `redis.call` writes touched.
+            exec_wakes.extend(outcome.ready);
             if let Some(which) = outcome.flush {
                 // This shard's half is done; the caller broadcasts the rest
                 // exactly as for a queued FLUSHALL (c10k E2 contract above).
@@ -541,6 +543,13 @@ pub(crate) fn execute_transaction_sharded(
                     let mut buf = bytes::BytesMut::new();
                     crate::protocol::serialize::serialize(&effect, &mut buf);
                     aof_entries.push((selected, buf.freeze()));
+                    // moon#1059: a queued BLMOVE that moved pushed onto its
+                    // destination, which a client may be blocked on.
+                    exec_wakes.extend(
+                        crate::blocking::wakeup::written_keys(cmd, cmd_args)
+                            .into_iter()
+                            .map(|k| (selected, k)),
+                    );
                 }
                 results.push(super::util::apply_resp3_conversion(
                     cmd,
@@ -636,10 +645,12 @@ pub(crate) fn execute_transaction_sharded(
             }
         }
 
-        // moon#606: a producer queued inside MULTI must wake whoever is
-        // blocked on the key it wrote. This executor reaches none of the live
-        // wake hooks, so a `MULTI ; LPUSH k v ; EXEC` used to leave a `BLPOP k`
-        // asleep until its own timeout.
+        // moon#606: a write queued inside MULTI must wake whoever is blocked on
+        // a key it wrote. This executor reaches none of the live wake hooks, so
+        // a `MULTI ; LPUSH k v ; EXEC` used to leave a `BLPOP k` asleep until
+        // its own timeout — and, until moon#1069, so did a queued `RENAME`,
+        // `COPY`, `SORT ... STORE`, ... because only six "producer" names were
+        // recorded here. Now every key the command may have written is.
         //
         // Recorded for the caller rather than raised here, for two reasons.
         // It matches Redis, which defers to the ready-keys pass that runs
@@ -650,14 +661,22 @@ pub(crate) fn execute_transaction_sharded(
         //
         // The caller's own registry is the right one: `TxnLocality` rejects a
         // cross-shard body outright, so the shard executing this owns every
-        // key in it.
-        if !matches!(&response, Frame::Error(_))
-            && let Some(family) = crate::blocking::wakeup::producer_family(cmd)
-            && let Some(key) = cmd_args
-                .get(crate::blocking::wakeup::producer_wake_key_index(cmd))
-                .and_then(super::util::extract_bytes)
-        {
-            exec_wakes.push((entry_db, key, family));
+        // key in it. The caller filters by "has a waiter" before touching a
+        // database, so recording a key nobody waits on costs one entry here.
+        if !matches!(&response, Frame::Error(_)) {
+            exec_wakes.extend(
+                crate::blocking::wakeup::written_keys(cmd, cmd_args)
+                    .into_iter()
+                    .map(|k| (entry_db, k)),
+            );
+            // `MOVE` / `COPY ... DB n` write into ANOTHER database.
+            if matches!(&response, Frame::Integer(1))
+                && let Some(target) = crate::blocking::wakeup::cross_db_write_target(
+                    cmd, cmd_args, entry_db, db_count,
+                )
+            {
+                exec_wakes.push(target);
+            }
         }
 
         // Auto-index: if HSET succeeded, check for vector index match
