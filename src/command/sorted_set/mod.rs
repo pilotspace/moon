@@ -5225,3 +5225,194 @@ mod missing_key_bound_validation_1060_tests {
         }
     }
 }
+
+/// moon#1102 — `ZRANGESTORE` had the moon#1060 defect: it looked the SOURCE key
+/// up before validating the range grammar, so a malformed bound against a
+/// missing source answered `:0` — and, worse, went on to DELETE the
+/// destination, which a parse error must never touch. Redis parses the whole
+/// grammar (rank, `BYSCORE` or `BYLEX` bounds) before its key lookup, so the
+/// error wins over a missing or wrong-type source.
+///
+/// Dispatch-path coverage: `ZRANGESTORE` is a write, reached only through
+/// `command::dispatch` (`call` below). `command::dispatch_read` serves reads
+/// and `server::conn::try_inline_dispatch` inlines only `GET`/plain `SET`, so
+/// neither has an arm to be missing from.
+#[cfg(test)]
+mod zrangestore_bound_validation_1102_tests {
+    use super::*;
+    use crate::command::{DispatchResult, dispatch};
+    use crate::storage::Database;
+
+    fn call(db: &mut Database, args: &[&str]) -> Frame {
+        let cmd = args[0];
+        let argv: Vec<Frame> = args[1..]
+            .iter()
+            .map(|a| Frame::BulkString(Bytes::copy_from_slice(a.as_bytes())))
+            .collect();
+        let mut selected = 0usize;
+        match dispatch(db, cmd.as_bytes(), &argv, &mut selected, 16) {
+            DispatchResult::Response(f) => f,
+            DispatchResult::Quit(f) => panic!("unexpected Quit for {args:?}: {f:?}"),
+        }
+    }
+
+    fn err_text(frame: &Frame) -> String {
+        match frame {
+            Frame::Error(e) => String::from_utf8_lossy(e).into_owned(),
+            other => panic!("expected an error reply, got {other:?}"),
+        }
+    }
+
+    const NOT_A_FLOAT: &str = "ERR min or max is not a float";
+    const NOT_A_LEX_ITEM: &str = "ERR min or max not valid string range item";
+    const NOT_AN_INT: &str = "ERR value is not an integer or out of range";
+
+    /// Every row: (arguments after `ZRANGESTORE dst src`, the error Redis
+    /// gives when `src` does not exist). Measured against redis-server 8.6.1
+    /// over a raw socket.
+    const BAD_RANGE: &[(&[&str], &str)] = &[
+        (&["a", "b", "BYSCORE"], NOT_A_FLOAT),
+        (&["0", "b", "BYSCORE"], NOT_A_FLOAT),
+        (&["(1", "(a", "BYSCORE"], NOT_A_FLOAT),
+        (&["nan", "1", "BYSCORE"], NOT_A_FLOAT),
+        (&["a", "b", "BYSCORE", "REV"], NOT_A_FLOAT),
+        (&["a", "b", "BYSCORE", "LIMIT", "0", "1"], NOT_A_FLOAT),
+        (
+            &["a", "b", "BYSCORE", "REV", "LIMIT", "0", "1"],
+            NOT_A_FLOAT,
+        ),
+        (&["a", "b", "BYLEX"], NOT_A_LEX_ITEM),
+        (&["b", "a", "BYLEX", "REV"], NOT_A_LEX_ITEM),
+        (&["a", "b", "BYLEX", "LIMIT", "0", "1"], NOT_A_LEX_ITEM),
+        (
+            &["a", "b", "BYLEX", "REV", "LIMIT", "0", "1"],
+            NOT_A_LEX_ITEM,
+        ),
+        (&["a", "b"], NOT_AN_INT),
+        (&["0", "b"], NOT_AN_INT),
+        (&["a", "1"], NOT_AN_INT),
+        (&["a", "b", "REV"], NOT_AN_INT),
+        (&["1.5", "2"], NOT_AN_INT),
+        (&["99999999999999999999", "1"], NOT_AN_INT),
+    ];
+
+    fn zrangestore(db: &mut Database, src: &str, range: &[&str]) -> Frame {
+        let mut args = vec!["ZRANGESTORE", "dst", src];
+        args.extend_from_slice(range);
+        call(db, &args)
+    }
+
+    #[test]
+    fn bad_range_on_a_missing_source_is_a_parse_error() {
+        for (range, want) in BAD_RANGE {
+            let mut db = Database::new();
+            let reply = zrangestore(&mut db, "nokey", range);
+            assert_eq!(err_text(&reply), *want, "ZRANGESTORE dst nokey {range:?}");
+        }
+    }
+
+    /// The parse error must leave the destination alone. Before the fix the
+    /// missing-source arm fell through to "store the empty result", which
+    /// deletes `dst` — a malformed command destroyed data.
+    #[test]
+    fn bad_range_on_a_missing_source_does_not_delete_the_destination() {
+        for (range, _) in BAD_RANGE {
+            let mut db = Database::new();
+            let _ = call(&mut db, &["SET", "dst", "keep"]);
+            let _ = zrangestore(&mut db, "nokey", range);
+            assert_eq!(
+                call(&mut db, &["EXISTS", "dst"]),
+                Frame::Integer(1),
+                "ZRANGESTORE dst nokey {range:?} must not delete dst"
+            );
+        }
+    }
+
+    /// Redis answers the parse error even when the source holds another type:
+    /// the grammar is checked before the key is looked up at all.
+    #[test]
+    fn bad_range_on_a_wrong_type_source_is_a_parse_error_not_wrongtype() {
+        for (range, want) in BAD_RANGE {
+            let mut db = Database::new();
+            let _ = call(&mut db, &["SET", "str", "x"]);
+            let reply = zrangestore(&mut db, "str", range);
+            assert_eq!(err_text(&reply), *want, "ZRANGESTORE dst str {range:?}");
+        }
+    }
+
+    /// On an existing zset the bad range already errored before the fix; this
+    /// pins that the reordering did not change that arm.
+    #[test]
+    fn bad_range_on_an_existing_source_is_unchanged() {
+        for (range, want) in BAD_RANGE {
+            let mut db = Database::new();
+            assert_eq!(call(&mut db, &["ZADD", "z", "1", "m"]), Frame::Integer(1));
+            let reply = zrangestore(&mut db, "z", range);
+            assert_eq!(err_text(&reply), *want, "ZRANGESTORE dst z {range:?}");
+        }
+    }
+
+    /// Negative controls: a VALID range on a missing source is still the
+    /// ordinary empty store (`:0`, and the destination is removed, as Redis
+    /// does), and a valid range on a wrong-type source is still WRONGTYPE.
+    #[test]
+    fn valid_range_on_a_missing_or_wrong_type_source_is_unchanged() {
+        for range in [
+            &["0", "1", "BYSCORE"][..],
+            &["(0", "+inf", "BYSCORE", "REV", "LIMIT", "0", "1"][..],
+            &["-", "+", "BYLEX"][..],
+            &["[a", "(b", "BYLEX", "LIMIT", "0", "1"][..],
+            &["0", "-1"][..],
+            &["0", "-1", "REV"][..],
+        ] {
+            let mut db = Database::new();
+            let _ = call(&mut db, &["SET", "dst", "keep"]);
+            assert_eq!(
+                zrangestore(&mut db, "nokey", range),
+                Frame::Integer(0),
+                "ZRANGESTORE dst nokey {range:?}"
+            );
+            assert_eq!(
+                call(&mut db, &["EXISTS", "dst"]),
+                Frame::Integer(0),
+                "an empty ZRANGESTORE result removes dst ({range:?})"
+            );
+            let _ = call(&mut db, &["SET", "str", "x"]);
+            assert!(
+                err_text(&zrangestore(&mut db, "str", range)).starts_with("WRONGTYPE"),
+                "ZRANGESTORE dst str {range:?}"
+            );
+        }
+    }
+
+    /// Option errors are still reported before the range is parsed, as in
+    /// Redis: `LIMIT` without `BYSCORE`/`BYLEX` and a non-integer `LIMIT`.
+    #[test]
+    fn option_errors_still_win_over_the_range() {
+        let mut db = Database::new();
+        assert_eq!(
+            err_text(&zrangestore(
+                &mut db,
+                "nokey",
+                &["a", "b", "LIMIT", "0", "1"]
+            )),
+            "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX"
+        );
+        assert_eq!(
+            err_text(&zrangestore(
+                &mut db,
+                "nokey",
+                &["a", "b", "BYSCORE", "LIMIT", "x", "1"]
+            )),
+            NOT_AN_INT
+        );
+        assert_eq!(
+            err_text(&zrangestore(
+                &mut db,
+                "nokey",
+                &["a", "b", "BYSCORE", "WITHSCORES"]
+            )),
+            "ERR syntax error"
+        );
+    }
+}
