@@ -482,19 +482,12 @@ fn multi_move_copy_db_matches_redis_4_shards() {
     live_matches_redis(4);
 }
 
-// The two restart legs need the AOF replay engine to apply MOVE / COPY ... DB n
-// records against both databases, which is moon#1046 (PR #1064). Without it
-// the master is now right and replay is wrong. Drop these two `ignore`s when
-// that fix is on main. They pass 2/2 on this branch merged with it, on both
-// runtimes.
 #[test]
-#[ignore = "needs the moon#1046 replay fix (PR #1064); remove this ignore once it is on main"]
 fn multi_move_copy_db_survives_kill9_1_shard() {
     survives_kill9(1);
 }
 
 #[test]
-#[ignore = "needs the moon#1046 replay fix (PR #1064); remove this ignore once it is on main"]
 fn multi_move_copy_db_survives_kill9_4_shards() {
     survives_kill9(4);
 }
