@@ -199,6 +199,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A re-written or deleted vector document stops matching in every tier, at
+  runtime and across a restart, and `FT.INFO num_docs` counts each live key
+  once** (moon#1066, moon#1073). Measured on a real server, 1000 keys, before
+  the fix:
+  - an `HSET` re-write of a key whose old copy was WARM or COLD left that copy
+    live: KNN for the OVERWRITTEN vector still returned the key top-1, and
+    `num_docs` read 1001. The update path tombstoned the mutable and HOT
+    segments only; DEL went through every tier. Both now share one sweep
+    (`SegmentList::tombstone_key`).
+  - across a restart, a HOT segment's copy of a re-written key came back live:
+    Stack B writes a segment once, so a tombstone applied in memory is gone
+    after the reload, and recovery admitted a key when ANY loaded row had its
+    key_hash. After a kill -9 with the re-write still in the mutable segment,
+    the key answered ONLY to its overwritten vector and its current one was
+    lost. A DEL'd key came back as `vec:<id>`. Recovery now keeps a loaded row
+    only if it is the copy the persisted keymap names (key_hash AND
+    global_id), once, and tombstones every other row in its own segment -- no
+    key_hash-wide tombstone, no on-disk format change.
+  - a row killed at install time (the key was deleted or re-written while its
+    background build ran) came back live after HOT -> WARM: `mvcc.mpf` carried
+    the `delete_lsn`, and the warm reader ignored it. It is now a dead row in
+    WARM and COLD, by position, so a live sibling copy of the key stays.
+  - `num_docs` was wrong both ways: a HOT segment never counted a steady-state
+    tombstone (1000 after a DEL of 1000), and every WARM/COLD segment counted
+    every tombstone whether it held the key or not (1998 after one DEL across
+    two segments). A tombstone is now recorded and counted only by the segment
+    holding a live row for the key, through a per-segment key_hash index
+    (4 bytes per row in HOT and WARM segments; a COLD stub keeps 8 bytes per
+    live row). Tombstone sets no longer grow with every DEL in every segment.
+  - `FT.COMPACT` draining an in-flight background merge replayed the sources'
+    tombstones key_hash-wide, killing the NEW copy of a key re-written while
+    the merge ran; it now uses the origin-gated replay the background install
+    already used.
+  - a synchronous merge (`VACUUM VECTOR`, and the autovacuum pass) installed
+    its output without replaying the sources' steady-state tombstones at all:
+    after a DEL, its row matched again top-1 as `vec:<id>` and was counted
+    (`num_docs` 2000 instead of 1999); after a re-write whose new copy was still in the mutable
+    segment, the old copy matched beside it. It now replays them like the
+    background installs.
+  - at boot, a WARM row killed at install time counted as evidence that its
+    segment served the key. When the keymap named that row's copy (recovery
+    kills a duplicate of the current copy that way), a segment holding the
+    dead duplicate could claim the key first and the live copy in another
+    segment was then tombstoned, losing the document. Only live rows count now.
+
+- **A slow `everysec` fsync no longer makes a multi-shard server answer
+  "write applied in memory but not queued for persistence"** (moon#769).
+  - **Before.** At `--shards > 1` a write to a key another shard owns runs
+    on that shard, and the shard applied it first and only then waited 5 ms
+    for room in its AOF writer's 10k channel. A writer stalled on a slow
+    fsync fills that channel quickly under pipelined load, so such writes were
+    refused after they were already in memory, and their records never reached
+    the AOF. Redis and Valkey complete the same `redis-benchmark -P 16`
+    workload. The write leg on the connection's own shard already waited up to
+    `--aof-fsync-timeout-ms` (2 s by default).
+  - **Now.** Before a routed write runs, its shard checks that the AOF writer
+    has room for the write's records. The shard thread never waits for it: a
+    write that finds no room stays queued, unapplied, at the head of the queue
+    from the shard that sent it, and is retried on every loop tick, while
+    reads, local connections and the other shards' queues keep flowing. Later
+    commands from the same sending shard wait behind it, so nothing overtakes
+    an earlier write. A stall shorter than `--aof-fsync-timeout-ms` (2 s by
+    default; `0` means 10 s here, and the wait never exceeds 10 s) is
+    absorbed. A write still without room after that is refused **without
+    being applied**, with `-MOONERR AOF backpressure: command not executed,
+    the AOF writer is stalled; retry`, and while the writer stays stalled the
+    next routed writes are refused at once instead of each waiting again. The
+    keyspace, the AOF and the replicas keep agreeing, and the client can
+    retry.
+  - A multi-shard `MSET`, `DEL` or `UNLINK` whose part on a stalled shard is
+    refused while its other parts ran answers `-MOONERR AOF backpressure:
+    command partially executed; ...` instead, because it was not "not
+    executed". A multi-shard `FLUSHALL`/`FLUSHDB` keeps its existing
+    `MOONERR FLUSH partial` reply.
+  - The check applies under every `appendfsync` policy (`always`,
+    `everysec`, `no`): it is about room in the writer's channel, which all
+    three use. Admission reserves room for every write it lets through in
+    the same loop pass, plus 256 spare records for what it cannot count in
+    advance (eviction deletes, a script's extra writes, other shards' fsync
+    barriers). A single write that needs more than that spare can still meet
+    a full channel after it applied and get the existing fail-loud error.
+  - While a rewrite is folding, writes spill to the rewrite overflow instead
+    of waiting. The script-load fan-out budget grows by the admission wait,
+    so a slow disk is not reported as a divergent shard.
+  - `INFO persistence` gains `aof_backpressure_stalls` (routed writes that
+    waited) and `aof_backpressure_refused` (commands refused unapplied).
+  - The write leg on the connection's own shard is unchanged. It still
+    applies the write, waits up to the bound on its connection task, and
+    then reports `ERR AOF fsync failed; write not durable`.
+
 - **`ZRANGESTORE` checks its range before it looks up the source** (moon#1102),
   the `ZRANGESTORE` sibling of moon#1060. A malformed rank, `BYSCORE` or
   `BYLEX` bound against a missing source answered `:0` and deleted the

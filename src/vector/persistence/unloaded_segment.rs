@@ -1,9 +1,11 @@
 //! `UnloadedSegment` -- true COLD tier: a WARM/HOT segment's on-disk `.mpf`
 //! files with EVERY in-memory structure dropped (no TQ/SQ8 codes, no HNSW
 //! graph, no f16 exact-rerank sidecar). Only a small stub remains resident:
-//! segment id, collection metadata (needed to reload), a doc count (for
-//! `FT.INFO`), whether it had a sidecar (for the coverage counter, without
-//! reloading), and a `SegmentHandle` keeping the directory alive.
+//! segment id, collection metadata (needed to reload), the sorted key_hashes
+//! of its live rows (8 bytes per row: so a delete is counted, and `FT.INFO`'s
+//! `num_docs` stays exact, only by the stub that holds the key), whether it
+//! had a sidecar (for the coverage counter, without reloading), and a
+//! `SegmentHandle` keeping the directory alive.
 //!
 //! This is the WS3-round-2 fix for the finding that `WarmSearchSegment`
 //! (the pre-existing WARM tier) does not actually reduce RSS: it copies
@@ -42,14 +44,21 @@ pub struct UnloadedSegment {
     /// Keeps the on-disk segment directory alive (not tombstoned) until
     /// this index/segment is explicitly dropped or flushed.
     handle: SegmentHandle,
-    /// WS3 round-2 resurrection fix: key_hashes tombstoned while this
-    /// segment is COLD (a HDEL that lands after unload), plus any
+    /// Key_hashes tombstoned while this segment is COLD (a HDEL that lands after unload), plus any
     /// tombstones the source `WarmSearchSegment` already carried at unload
     /// time (so a WARM -> COLD transition never loses a live delete).
     /// Applied to the freshly-reloaded `WarmSearchSegment` in [`Self::reload`]
     /// and used by [`Self::live_count`] to keep `FT.INFO`'s `num_docs`
     /// correct without requiring a reload just to answer the count.
     pending_tombstones: parking_lot::RwLock<HashSet<u64>>,
+    /// Sorted key_hashes of the rows that were live at unload time. A
+    /// tombstone is recorded, and counted, only when this segment holds the
+    /// key: without it every stub counted every delete, so `num_docs` dropped
+    /// once per COLD segment instead of once. 8 bytes per live row -- the one
+    /// per-row cost a stub keeps.
+    live_keys: Box<[u64]>,
+    /// Rows among `live_keys` killed by tombstones recorded while COLD.
+    dead_since_unload: std::sync::atomic::AtomicU32,
 }
 
 impl UnloadedSegment {
@@ -67,27 +76,45 @@ impl UnloadedSegment {
             mlock_codes,
             handle: warm.handle_clone(),
             pending_tombstones: parking_lot::RwLock::new(carried_over),
+            live_keys: warm.live_key_hashes_sorted(),
+            dead_since_unload: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
     /// Mark a key as deleted while this segment is COLD -- the stub records
-    /// it without requiring a reload (WS3 round-2 resurrection fix). Applied
-    /// to the reloaded `WarmSearchSegment` on the next [`Self::reload`].
-    /// Returns 1 if newly tombstoned, 0 if already present.
+    /// it without requiring a reload, so the doc cannot come back through
+    /// the COLD tier. Applied to the reloaded `WarmSearchSegment` on the next [`Self::reload`].
+    ///
+    /// Recorded and counted only when the segment held a live row for the
+    /// key at unload time (the WARM/HOT membership rule). Returns the number
+    /// of rows newly tombstoned.
     pub fn mark_deleted_by_key_hash(&self, key_hash: u64) -> u32 {
+        let start = self.live_keys.partition_point(|&kh| kh < key_hash);
+        let rows = self.live_keys[start..].partition_point(|&kh| kh == key_hash) as u32;
+        if rows == 0 {
+            return 0;
+        }
         let mut guard = self.pending_tombstones.write();
-        if guard.insert(key_hash) { 1 } else { 0 }
+        if guard.insert(key_hash) {
+            self.dead_since_unload
+                .fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+            rows
+        } else {
+            0
+        }
     }
 
-    /// Live document count: `doc_count` (captured at unload time) minus
-    /// pending tombstones recorded while COLD. This is what `FT.INFO`'s
-    /// `num_docs` must sum instead of [`Self::total_count`] (which is the
-    /// raw capture-time count and does not reflect deletes that arrived
+    /// Live document count: the rows live at unload time minus the ones
+    /// tombstoned while COLD. This is what `FT.INFO`'s `num_docs` must sum
+    /// instead of [`Self::total_count`] (which is the raw capture-time count,
+    /// dead rows included, and does not reflect deletes that arrived
     /// afterward).
     #[inline]
     pub fn live_count(&self) -> u32 {
-        self.doc_count
-            .saturating_sub(self.pending_tombstones.read().len() as u32)
+        (self.live_keys.len() as u32).saturating_sub(
+            self.dead_since_unload
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     #[inline]
@@ -131,11 +158,10 @@ impl UnloadedSegment {
             self.handle.clone(),
             self.mlock_codes,
         )?;
-        // WS3 round-2 resurrection fix: replay every tombstone recorded
-        // while this segment was COLD (plus whatever it already carried at
-        // unload time) onto the freshly-reloaded segment, so a HDEL'd doc
-        // does not resurface just because the segment went through the COLD
-        // tier.
+        // Replay every tombstone recorded while this segment was COLD (plus
+        // whatever it already carried at unload time) onto the freshly
+        // reloaded segment, so a HDEL'd doc does not resurface just because
+        // the segment went through the COLD tier.
         self.replay_tombstones_onto(&warm);
         Ok(warm)
     }
@@ -158,12 +184,13 @@ impl UnloadedSegment {
         warm.seed_tombstones(&list);
     }
 
-    /// Approximate resident bytes of the stub itself -- a handful of scalars
-    /// plus an `Arc` bump, not the megabytes-to-gigabytes the segment held
-    /// before unloading. Used for `FT.INFO`/observability, not enforcement.
+    /// Approximate resident bytes of the stub itself -- a handful of scalars,
+    /// an `Arc` bump and 8 bytes per live row (`live_keys`), not the
+    /// megabytes-to-gigabytes the segment held before unloading. Used for
+    /// `FT.INFO`/observability, not enforcement.
     #[inline]
     pub fn resident_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
+        std::mem::size_of::<Self>() + self.live_keys.len() * std::mem::size_of::<u64>()
     }
 }
 

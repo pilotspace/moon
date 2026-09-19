@@ -1457,7 +1457,25 @@ async fn push_bounded(
 /// On a healthy mesh a push costs microseconds and an ack one round trip, so
 /// this ceiling is never approached; it exists so a wedged shard degrades to a
 /// reported divergence instead of a stalled client.
+///
+/// With AOF on, a target's ring can legitimately hold a routed write parked
+/// for AOF room ahead of the fan-out message, for up to
+/// `AofWriterPool::routed_admission_wait` (moon#769). The budget then grows by
+/// that wait (see [`fanout_budget`]) so a slow disk is not reported as a
+/// divergent shard.
 const FANOUT_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`FANOUT_BUDGET`] plus the longest a routed write can sit parked at the
+/// head of a target's ring, ahead of the fan-out message, waiting for AOF
+/// room. Past that wait the parked write is refused and every later write
+/// that finds no room is refused at once, so the ring moves again.
+fn fanout_budget(ctx: &super::core::ConnectionContext) -> std::time::Duration {
+    FANOUT_BUDGET
+        + ctx
+            .aof_pool
+            .as_ref()
+            .map_or(std::time::Duration::ZERO, |p| p.routed_admission_wait())
+}
 
 /// What a fan-out managed to do, from the point of view of the client waiting
 /// on the command that triggered it.
@@ -1539,7 +1557,8 @@ async fn fanout_to_other_shards(
     let mut reached = 0usize;
     // ONE deadline for pushes and acks together. A wedged mesh must cost the
     // client a bounded wait, not (retry budget + ack budget) x N shards.
-    let deadline = std::time::Instant::now() + FANOUT_BUDGET;
+    let budget = fanout_budget(ctx);
+    let deadline = std::time::Instant::now() + budget;
     for target in 0..ctx.num_shards {
         if target == ctx.shard_id {
             continue;
@@ -1583,7 +1602,7 @@ async fn fanout_to_other_shards(
             Err(_) => {
                 tracing::warn!(
                     "shard {}: {kind} fan-out to shard {target} was pushed but not acked \
-                     within the {FANOUT_BUDGET:?} fan-out budget; that shard may be wedged and \
+                     within the {budget:?} fan-out budget; that shard may be wedged and \
                      is divergent until it drains or the op is re-issued",
                     ctx.shard_id
                 );

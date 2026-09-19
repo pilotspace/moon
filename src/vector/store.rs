@@ -818,6 +818,36 @@ fn bulk_freeze_cap(mutable_len: usize, compact_threshold: usize) -> usize {
     }
 }
 
+/// Reapply to a freshly merged (not yet shared) segment the steady-state
+/// tombstones its sources received while the merge was running.
+///
+/// Gated by ORIGIN: a source's tombstone may only kill merged entries whose
+/// global_id came from THAT source. A tombstone is recorded only by the
+/// segment holding a live copy of the key, so the gate kills exactly that
+/// copy. An HSET re-write tombstones the OLD copy's home segment while the
+/// NEW copy lives on (mutable, or a sibling source merged into the same
+/// output); a key_hash-wide replay would kill the new copy too (mass loss
+/// under update churn).
+///
+/// Shared by the background install (`poll_install_merge`) and the
+/// force-merge drain, so the two cannot diverge again.
+fn reapply_merge_window_tombstones(
+    merged: &mut crate::vector::segment::immutable::ImmutableSegment,
+    sources: &[Arc<crate::vector::segment::immutable::ImmutableSegment>],
+) {
+    for src in sources {
+        let tombs = src.tombstoned_key_hashes();
+        if tombs.is_empty() {
+            continue;
+        }
+        let src_gids: std::collections::HashSet<u32> =
+            src.mvcc_headers().iter().map(|h| h.global_id).collect();
+        for kh in tombs {
+            merged.mark_deleted_by_key_hash_install_from(kh, &src_gids);
+        }
+    }
+}
+
 /// Walk the window `[0..frozen_len)` of `segments.mutable` and apply
 /// post-freeze tombstones to `immutable` before it is wrapped in `Arc`.
 ///
@@ -1286,24 +1316,9 @@ impl VectorIndex {
         // merge_immutable already dropped entries with mvcc.delete_lsn != 0
         // at snapshot time.  Any `mark_deleted_by_key_hash` call that landed
         // AFTER the worker snapshot only wrote to the source Arc's interior
-        // `tombstoned_keys` set.  Apply those to the merged output — but gated
-        // by ORIGIN: a source's tombstone may only kill merged entries whose
-        // global_id came from that source. An HSET update interior-tombstones
-        // the OLD copy's home segment while the NEW copy lives on (mutable or
-        // a sibling segment); a hash-wide replay would kill the new copy too
-        // (mass loss under update churn). Real DEL/UNLINK tombstones are
-        // recorded in EVERY segment's interior set, so they still apply.
-        for src in &inflight.merged_sources {
-            let tombs = src.tombstoned_key_hashes();
-            if tombs.is_empty() {
-                continue;
-            }
-            let src_gids: std::collections::HashSet<u32> =
-                src.mvcc_headers().iter().map(|h| h.global_id).collect();
-            for kh in tombs {
-                merged.mark_deleted_by_key_hash_install_from(kh, &src_gids);
-            }
-        }
+        // `tombstoned_keys` set.  Apply those to the merged output, gated by
+        // ORIGIN (see `reapply_merge_window_tombstones`).
+        reapply_merge_window_tombstones(&mut merged, &inflight.merged_sources);
 
         // ── Defensive swap: verify sources are still in the immutable list ────
         let snap = self.segments.load();
@@ -2407,25 +2422,12 @@ impl VectorStore {
     /// Shared by the default field and each secondary VECTOR field so a
     /// deleted document cannot resurrect through any field's search path.
     fn tombstone_key_in_holder(holder: &SegmentHolder, key_hash: u64) {
-        let snap = holder.load();
-        // Tombstone in mutable segment (always present).
-        snap.mutable.mark_deleted_by_key_hash(key_hash, 1);
-        // Also tombstone any already-compacted immutable segments that
-        // may still contain the key (steady-state interior tombstone).
-        for imm in snap.immutable.iter() {
-            imm.mark_deleted_by_key_hash(key_hash);
-        }
-        // WS3 round-2 resurrection fix (adversarial review #1): WARM and
-        // COLD (unloaded) segments must also be tombstoned, or a HDEL'd doc
-        // resurfaces the next time that segment is searched (WARM: takes
-        // effect immediately, no reload) or reloaded (COLD: the stub queues
-        // the tombstone and replays it in `UnloadedSegment::reload`).
-        for warm in snap.warm.iter() {
-            warm.mark_deleted_by_key_hash(key_hash);
-        }
-        for stub in snap.unloaded.iter() {
-            stub.mark_deleted_by_key_hash(key_hash);
-        }
+        // Every tier: mutable, immutable (steady-state interior tombstone),
+        // WARM and COLD (unloaded). A tier left out keeps serving the deleted
+        // doc the next time that segment is searched (WARM: takes effect
+        // immediately, no reload) or reloaded (COLD: the stub queues the
+        // tombstone and replays it onto the reloaded segment).
+        holder.load().tombstone_key(key_hash, 1);
     }
 
     fn tombstone_key_in_index(&mut self, idx_name: &Bytes, key_hash: u64) -> bool {
@@ -2828,11 +2830,19 @@ impl VectorStore {
                 }
             };
             let seg_key_hash_set: std::collections::HashSet<u64> =
-                seg_rows.iter().map(|&(kh, _)| kh).collect();
-            // Which copy of each key this segment holds (a key can have two
-            // rows here: a dead old copy and a live new one).
-            let seg_copies: std::collections::HashSet<(u64, u32)> =
-                seg_rows.iter().copied().collect();
+                seg_rows.iter().map(|r| r.key_hash).collect();
+            // Which LIVE copy of each key this segment holds (a key can have
+            // two rows here: a dead old copy and a live new one). An
+            // install-dead row is never evidence that this segment serves its
+            // key, even when the keymap names that very copy: recovery kills a
+            // duplicate of the current copy while the keymap keeps naming it.
+            // Every row, dead ones included, still counts for ownership and
+            // for the global_id floor below.
+            let seg_copies: std::collections::HashSet<(u64, u32)> = seg_rows
+                .iter()
+                .filter(|r| !r.dead)
+                .map(|r| (r.key_hash, r.global_id))
+                .collect();
 
             // Finding #2: decide ownership from persisted keymap evidence
             // (majority-match), never from `from_files` success alone. The
@@ -3020,7 +3030,7 @@ impl VectorStore {
                     // tier; a key re-written later must never be given an id a
                     // warm row carries, or the per-key rule above could take
                     // that row for the current copy on the next boot.
-                    if let Some(max_gid) = seg_rows.iter().map(|&(_, gid)| gid).max() {
+                    if let Some(max_gid) = seg_rows.iter().map(|r| r.global_id).max() {
                         raise_global_id_floor(&old.mutable, max_gid, *segment_id, &owner_label);
                     }
                     let mut new_warm = old.warm.clone();
@@ -3208,12 +3218,11 @@ impl VectorStore {
         if let Some(inflight) = idx.bg_merge_inflight.take() {
             // Block until the worker finishes.
             if let Ok(Ok(mut merged)) = inflight.reply_rx.recv() {
-                // Reapply window deletes.
-                for src in &inflight.merged_sources {
-                    for kh in src.tombstoned_key_hashes() {
-                        merged.mark_deleted_by_key_hash_install(kh);
-                    }
-                }
+                // Reapply window deletes -- origin-gated, exactly like the
+                // background install (`poll_install_merge`). This drain used
+                // the key_hash-wide variant, which also killed the NEW copy
+                // of a key re-written while the merge ran.
+                reapply_merge_window_tombstones(&mut merged, &inflight.merged_sources);
                 let snap = idx.segments.load();
                 let merged_arc = Arc::new(merged);
                 let mut new_immutable: Vec<
@@ -3301,7 +3310,12 @@ impl VectorStore {
             recall_tolerance,
             persist.as_ref().map(|(p, id)| (p.as_path(), *id)),
         ) {
-            Ok(merged) => {
+            Ok(mut merged) => {
+                // `merge_immutable` drops only install-time dead rows; the
+                // sources' steady-state tombstones (DELs and re-writes since
+                // they were sealed) must be replayed onto the output before
+                // it is shared, exactly as the two background installs do.
+                reapply_merge_window_tombstones(&mut merged, &segs);
                 let live = merged.live_count() as usize;
                 // Atomically swap: replace all immutable segments with the single merged one.
                 merged.mark_installed();
@@ -5336,6 +5350,161 @@ mod bg_compact_tests {
         assert_eq!(
             count, 1,
             "updated-then-merged key must survive install (0=lost, 2=duplicate), got {count}"
+        );
+    }
+
+    /// The same update-across-segments shape, but the in-flight background
+    /// merge is DRAINED by a forced merge (FT.COMPACT's path) instead of being
+    /// installed by `poll_install_merge`. The drain replayed seg1's tombstone
+    /// key_hash-wide, killing the new copy merged in from seg2.
+    #[test]
+    fn test_forced_drain_of_bg_merge_keeps_an_updated_key() {
+        distance::init();
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        const T: usize = 15;
+        for i in 0..T {
+            let key = format!("doc:{i}");
+            insert(&mut store, key.as_bytes(), random_vec(64, i as u64));
+        }
+        store.force_compact_index(b"idx").unwrap();
+
+        let updated_hash = xxhash_rust::xxh64::xxh64(b"doc:5", 0);
+        store.mark_deleted_for_key(b"doc:5");
+        let new_vec = random_vec(64, 555);
+        store
+            .insert_vector(b"idx", &new_vec, updated_hash, Bytes::from_static(b"doc:5"))
+            .unwrap();
+        for i in T..2 * T {
+            let key = format!("doc:{i}");
+            insert(&mut store, key.as_bytes(), random_vec(64, i as u64));
+        }
+        store.force_compact_index(b"idx").unwrap();
+
+        let idx = store.get_index_mut(b"idx").unwrap();
+        assert!(idx.begin_background_merge(&compactor), "merge dispatched");
+        store
+            .force_merge_index_with_tolerance(b"idx", 0.0)
+            .expect("forced merge drains the in-flight one");
+        assert_eq!(
+            store
+                .get_index(b"idx")
+                .unwrap()
+                .segments
+                .load()
+                .immutable
+                .len(),
+            1,
+            "the drained merge installed"
+        );
+
+        let results = search_key_hashes(&mut store, &new_vec, 2 * T + 5);
+        let count = results.iter().filter(|&&h| h == updated_hash).count();
+        assert_eq!(
+            count, 1,
+            "updated key must survive a drained merge (0=lost, 2=duplicate), got {count}"
+        );
+    }
+
+    /// Two HOT segments, a steady-state DEL on one, then a SYNCHRONOUS merge
+    /// (`VACUUM VECTOR` / `FT.COMPACT` with no background merge in flight).
+    /// `merge_immutable` skips only install-time dead rows (`delete_lsn != 0`),
+    /// so the merged output must replay the sources' steady-state tombstones
+    /// before it is installed, or the deleted key matches again.
+    #[test]
+    fn test_sync_merge_drops_a_steady_state_deleted_key() {
+        distance::init();
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        const T: usize = 15;
+        for i in 0..T {
+            insert(
+                &mut store,
+                format!("doc:{i}").as_bytes(),
+                random_vec(64, i as u64),
+            );
+        }
+        store.force_compact_index(b"idx").unwrap();
+        for i in T..2 * T {
+            insert(
+                &mut store,
+                format!("doc:{i}").as_bytes(),
+                random_vec(64, i as u64),
+            );
+        }
+        store.force_compact_index(b"idx").unwrap();
+
+        let victim_hash = xxhash_rust::xxh64::xxh64(b"doc:5", 0);
+        store.mark_deleted_for_key(b"doc:5");
+
+        let stats = store
+            .force_merge_index_with_tolerance(b"idx", 0.0)
+            .expect("synchronous merge");
+        assert_eq!(stats.segments_merged, 2, "the synchronous path merged");
+        assert_eq!(stats.live_vectors, 2 * T - 1, "the deleted key is not live");
+
+        let results = search_key_hashes(&mut store, &random_vec(64, 5), 2 * T + 5);
+        assert!(
+            !results.contains(&victim_hash),
+            "a key deleted before a synchronous merge must not match after it"
+        );
+    }
+
+    /// The update shape of the test above: the key is re-written after both
+    /// segments sealed, so its OLD copy is in seg1 (steady-state tombstoned by
+    /// the re-write) and its NEW copy is still in the mutable segment. The
+    /// merge's own key_hash dedup cannot help: only one copy is among its
+    /// sources. Exactly one copy, the new one, may survive.
+    #[test]
+    fn test_sync_merge_drops_the_superseded_copy_of_an_updated_key() {
+        distance::init();
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        const T: usize = 15;
+        for i in 0..T {
+            insert(
+                &mut store,
+                format!("doc:{i}").as_bytes(),
+                random_vec(64, i as u64),
+            );
+        }
+        store.force_compact_index(b"idx").unwrap();
+        for i in T..2 * T {
+            insert(
+                &mut store,
+                format!("doc:{i}").as_bytes(),
+                random_vec(64, i as u64),
+            );
+        }
+        store.force_compact_index(b"idx").unwrap();
+
+        let updated_hash = xxhash_rust::xxh64::xxh64(b"doc:5", 0);
+        store.mark_deleted_for_key(b"doc:5");
+        let new_vec = random_vec(64, 555);
+        store
+            .insert_vector(b"idx", &new_vec, updated_hash, Bytes::from_static(b"doc:5"))
+            .unwrap();
+
+        let stats = store
+            .force_merge_index_with_tolerance(b"idx", 0.0)
+            .expect("synchronous merge");
+        assert_eq!(stats.segments_merged, 2, "the synchronous path merged");
+        assert_eq!(
+            stats.live_vectors,
+            2 * T - 1,
+            "the merged output holds no live copy of the re-written key"
+        );
+
+        let results = search_key_hashes(&mut store, &new_vec, 2 * T + 5);
+        let count = results.iter().filter(|&&h| h == updated_hash).count();
+        assert_eq!(
+            count, 1,
+            "an updated key must keep exactly its new copy through a synchronous merge \
+             (0=lost, 2=old copy resurrected), got {count}"
         );
     }
 
