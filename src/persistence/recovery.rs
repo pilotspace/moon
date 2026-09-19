@@ -477,6 +477,9 @@ pub fn recover_shard_v3_pitr(
     // WAL: every KV write since the last snapshot was lost on restart.
     let mut kv_commands_replayed = 0usize;
     let mut kv_commands_skipped = 0usize;
+    // moon#1039: KV records whose header db is beyond the configured
+    // `--databases` count. Dropped rather than folded into db 0.
+    let mut kv_records_db_out_of_range = 0usize;
     let wal_dir = shard_dir.join("wal-v3");
     if wal_dir.exists() {
         let mut selected_db = 0usize;
@@ -487,6 +490,20 @@ pub fn recover_shard_v3_pitr(
                         // The AOF replays this write after this pass; applying
                         // it here would only be wiped (see the fn docs).
                         kv_commands_skipped += 1;
+                        return;
+                    }
+                    // moon#1039: every record starts in the db it was written
+                    // for. The payload is a bare command (no `SELECT`), so a
+                    // context carried over from the previous record would be
+                    // wrong; a record with no db context (db-agnostic, or
+                    // pre-#1039) replays into db 0 as it always has.
+                    selected_db = record.replay_db();
+                    if selected_db >= databases.len() {
+                        // A restart with fewer `--databases` than the writer
+                        // had: the record's db does not exist. Folding it into
+                        // db 0 (what `replay_command` would do) is the very
+                        // cross-db corruption this guards against.
+                        kv_records_db_out_of_range += 1;
                         return;
                     }
                     // Parse RESP frames from the serialized command payload.
@@ -728,6 +745,16 @@ pub fn recover_shard_v3_pitr(
                         "Shard {}: skipped {} WAL v3 KV command record(s) — the multi-part \
                          AOF is the KV authority and is replayed after this pass",
                         shard_id, kv_commands_skipped
+                    );
+                }
+                if kv_records_db_out_of_range > 0 {
+                    tracing::warn!(
+                        shard_id,
+                        records = kv_records_db_out_of_range,
+                        databases = databases.len(),
+                        "WAL v3 KV records for a logical db beyond the configured \
+                         --databases count were NOT replayed (restart with enough \
+                         databases to recover them)"
                     );
                 }
             }
@@ -1069,6 +1096,82 @@ mod tests {
         let ctl = ShardControlFile::read(&ctl_path).unwrap();
         assert_eq!(ctl.shard_state, ShardState::Running);
         assert_eq!(ctl.wal_flush_lsn, 3);
+    }
+
+    /// moon#1039: a WAL holding both pre-#1039 records (no db context) and
+    /// db-carrying records replays each record into its own db. A db-less
+    /// record AFTER a db-3 record still lands in db 0 — the context is per
+    /// record, never carried over — and a record for a db beyond the
+    /// configured count is dropped, never folded into db 0.
+    #[test]
+    fn phase4_replays_mixed_format_wal_per_record_db_1039() {
+        use crate::persistence::wal_v3::record::write_wal_v3_record_in_db;
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let wal_dir = shard_dir.join("wal-v3");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let set = |k: &str, v: &str| {
+            format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\n{k}\r\n${}\r\n{v}\r\n",
+                k.len(),
+                v.len()
+            )
+            .into_bytes()
+        };
+        let mut data = make_v3_header(0);
+        // pre-#1039 record: no db context
+        write_wal_v3_record(&mut data, 1, WalRecordType::Command, &set("old_a", "0"));
+        write_wal_v3_record_in_db(
+            &mut data,
+            2,
+            WalRecordType::Command,
+            Some(3),
+            &set("b", "3"),
+        );
+        // pre-#1039 record after a db-3 record: must NOT inherit db 3
+        write_wal_v3_record(&mut data, 3, WalRecordType::Command, &set("old_c", "0"));
+        write_wal_v3_record_in_db(
+            &mut data,
+            4,
+            WalRecordType::Command,
+            Some(0),
+            &set("d", "0"),
+        );
+        // db 20 does not exist with 16 databases
+        write_wal_v3_record_in_db(
+            &mut data,
+            5,
+            WalRecordType::Command,
+            Some(20),
+            &set("e", "x"),
+        );
+        std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
+
+        let mut databases: Vec<Database> = (0..16).map(|_| Database::new()).collect();
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        let result = recover_shard_v3(&mut databases, 0, &shard_dir, &engine).unwrap();
+        assert_eq!(result.last_lsn, 5);
+
+        let has = |dbs: &mut [Database], db: usize, key: &'static [u8]| dbs[db].exists(key);
+        assert!(has(&mut databases, 0, b"old_a"), "pre-#1039 record -> db 0");
+        assert!(has(&mut databases, 3, b"b"), "db-3 record -> db 3");
+        assert!(
+            !has(&mut databases, 0, b"b"),
+            "db-3 record leaked into db 0"
+        );
+        assert!(
+            has(&mut databases, 0, b"old_c"),
+            "a db-less record must not inherit the previous record's db"
+        );
+        assert!(!has(&mut databases, 3, b"old_c"));
+        assert!(has(&mut databases, 0, b"d"), "explicit db-0 record -> db 0");
+        for db in 0..16 {
+            assert!(
+                !has(&mut databases, db, b"e"),
+                "a record for a nonexistent db must be dropped, found in db {db}"
+            );
+        }
     }
 
     /// P3b — PITR end-to-end: write 10 WAL commands, recover with
