@@ -92,6 +92,21 @@ pub enum AofAck {
 pub static AOF_BACKPRESSURE_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Routed write legs that had to wait, before applying anything, for their
+/// shard's AOF writer to make room (moon#769). Exposed in INFO as
+/// `aof_backpressure_stalls`. Non-zero means the writer fell a full channel
+/// behind, usually a slow fsync, and the shard absorbed it by waiting instead
+/// of refusing.
+pub static AOF_BACKPRESSURE_STALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Commands refused WITHOUT being applied because their shard's AOF writer
+/// could not take their records within `--aof-fsync-timeout-ms` (moon#769).
+/// Exposed in INFO as `aof_backpressure_refused`. Nothing is lost when this
+/// is counted: the refused commands never ran.
+pub static AOF_BACKPRESSURE_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Total everysec deadline-fsync failures across all AOF writers (both
 /// runtimes, both layouts). Monotonic; exposed as `aof_fsync_failures`.
 pub static AOF_FSYNC_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

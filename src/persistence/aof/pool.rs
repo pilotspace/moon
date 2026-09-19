@@ -577,6 +577,81 @@ impl AofWriterPool {
         self.sender(shard_id).is_full() && !self.overflow_for(shard_id).is_armed()
     }
 
+    /// How long a write may wait for its AOF record to be accepted: the
+    /// `--aof-fsync-timeout-ms` bound the async write legs already await
+    /// under. `Duration::ZERO` means unbounded.
+    #[inline]
+    pub fn append_wait_bound(&self) -> Duration {
+        self.fsync_timeout
+    }
+
+    /// Free slots in `shard_id`'s writer channel right now (`usize::MAX` for
+    /// an unbounded channel). One queue-length read.
+    #[inline]
+    pub fn free_append_slots(&self, shard_id: usize) -> usize {
+        let tx = self.sender(shard_id);
+        tx.capacity()
+            .map_or(usize::MAX, |cap| cap.saturating_sub(tx.len()))
+    }
+
+    /// Admission for a write that has NOT been applied yet (moon#769).
+    ///
+    /// Blocks the calling thread until `shard_id`'s writer can take `records`
+    /// more appends without blocking, and returns `true`. "Can take" means one
+    /// of: the channel has that many free slots (a request larger than the
+    /// channel only needs it empty), or a rewrite fold has the overflow armed
+    /// (the appends spill instead of blocking). Returns `false` when
+    /// `deadline` passes first, or when the writer is gone. The caller must
+    /// then refuse the write unapplied.
+    ///
+    /// This replaces "apply, then block
+    /// [`AOF_SPSC_BACKPRESSURE_BOUND`](super::AOF_SPSC_BACKPRESSURE_BOUND)
+    /// (5 ms) for the record, then report a write that is in memory but will
+    /// never reach the AOF". A routed write now waits as long as the async
+    /// legs do, before anything is applied.
+    ///
+    /// Exact at `--shards 1` and for the routed legs of a shard, whose
+    /// appends all come from the calling thread. The residual is a
+    /// producer this does not count (an eviction reason-DEL, a script that
+    /// logs more than one record), and the post-apply bounded block still
+    /// covers it.
+    ///
+    /// Blocking the shard thread is deliberate and bounded. It only happens
+    /// while the writer is a full channel behind (a stalled disk), and a
+    /// shard that cannot persist a write gains nothing by accepting more.
+    /// Polls with a short exponential backoff: flume has no wait-for-capacity
+    /// primitive.
+    pub fn await_append_room(
+        &self,
+        shard_id: usize,
+        records: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> bool {
+        if records == 0 {
+            return true;
+        }
+        let tx = self.sender(shard_id);
+        let needed = tx.capacity().map_or(records, |cap| records.min(cap));
+        let mut backoff = Duration::from_micros(50);
+        loop {
+            if tx.is_disconnected() {
+                return false;
+            }
+            if self.free_append_slots(shard_id) >= needed || self.overflow_for(shard_id).is_armed()
+            {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            let nap = match deadline {
+                Some(d) if now >= d => return false,
+                Some(d) => backoff.min(d - now),
+                None => backoff,
+            };
+            std::thread::sleep(nap);
+            backoff = (backoff * 2).min(Duration::from_millis(1));
+        }
+    }
+
     /// Append with bounded *blocking* backpressure — for synchronous callers
     /// (the shard event loop's SPSC drain) that cannot await.
     ///

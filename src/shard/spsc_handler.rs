@@ -338,7 +338,19 @@ pub(crate) fn drain_spsc_shared(
 
     // Process Execute/PipelineBatch/MultiExecute batch under single borrow_mut
     if !execute_batch.is_empty() {
+        // moon#769: routed write legs are admitted against this shard's AOF
+        // writer BEFORE they apply anything. A leg the writer cannot take
+        // within `--aof-fsync-timeout-ms` is refused unapplied, instead of
+        // being applied and then reported as not persisted. One wait bound
+        // per drain cycle, shared by every leg in it.
+        let mut aof_admission_deadline: Option<Option<std::time::Instant>> = None;
         for msg in execute_batch.drain(..) {
+            if let Some(pool) = aof_pool
+                && !admit_routed_leg(pool, shard_id, &msg, &mut aof_admission_deadline)
+            {
+                refuse_routed_leg(msg);
+                continue;
+            }
             handle_shard_message_shared(
                 shard_databases,
                 pubsub_registry,
@@ -4558,6 +4570,166 @@ fn record_ws_registry_write(
 pub(crate) const AOF_APPEND_LOST_ERR: &[u8] =
     b"MOONERR AOF backpressure: write applied in memory but not queued for persistence";
 
+/// Reply for a routed command refused BEFORE it ran, because its shard's AOF
+/// writer could not take its records within `--aof-fsync-timeout-ms`
+/// (moon#769). Unlike [`AOF_APPEND_LOST_ERR`], nothing was applied: the
+/// keyspace, the AOF and the replicas all still agree, and the client can
+/// retry.
+pub(crate) const AOF_BACKPRESSURE_REFUSED_ERR: &[u8] =
+    b"MOONERR AOF backpressure: command not executed, the AOF writer is stalled; retry";
+
+/// Whether `cmd` can produce an AOF record: write-flagged, or a script /
+/// function that may replicate the writes it issues.
+#[inline]
+fn may_log_to_aof(cmd: &[u8]) -> bool {
+    use crate::command::metadata::CommandFlags;
+    crate::command::metadata::lookup(cmd).is_some_and(|m| {
+        m.flags.contains(CommandFlags::WRITE) || m.flags.contains(CommandFlags::MAY_REPLICATE)
+    })
+}
+
+#[inline]
+fn frame_may_log(frame: &crate::protocol::Frame) -> bool {
+    extract_command_static(frame).is_some_and(|(cmd, _)| may_log_to_aof(cmd))
+}
+
+/// Commands in a routed write leg, an upper bound on the AOF records it can
+/// enqueue: `None` for a message that is not a routed command leg. Cheap:
+/// no classification.
+fn routed_leg_len(msg: &ShardMessage) -> Option<usize> {
+    match msg {
+        ShardMessage::Execute { .. } | ShardMessage::ExecuteSlotted { .. } => Some(1),
+        ShardMessage::PipelineBatch { commands, .. }
+        | ShardMessage::PipelineBatchSlotted { commands, .. } => Some(commands.len()),
+        ShardMessage::MultiExecute { commands, .. }
+        | ShardMessage::MultiExecuteSlotted { commands, .. } => Some(commands.len()),
+        ShardMessage::TxnExecute(payload) => Some(payload.commands.len()),
+        _ => None,
+    }
+}
+
+/// The AOF records a routed write leg will enqueue once applied: one per
+/// command that can log (scripts count as one, a lower bound — the
+/// post-apply bounded block covers the rest).
+fn routed_leg_records(msg: &ShardMessage) -> usize {
+    match msg {
+        ShardMessage::Execute { command, .. } | ShardMessage::ExecuteSlotted { command, .. } => {
+            usize::from(frame_may_log(command))
+        }
+        ShardMessage::PipelineBatch { commands, .. }
+        | ShardMessage::PipelineBatchSlotted { commands, .. } => {
+            commands.iter().filter(|c| frame_may_log(c)).count()
+        }
+        ShardMessage::MultiExecute { commands, .. }
+        | ShardMessage::MultiExecuteSlotted { commands, .. } => {
+            commands.iter().filter(|(_, c)| frame_may_log(c)).count()
+        }
+        ShardMessage::TxnExecute(payload) => {
+            payload.commands.iter().filter(|c| frame_may_log(c)).count()
+        }
+        _ => 0,
+    }
+}
+
+/// Admission of one routed leg against its shard's AOF writer (moon#769),
+/// BEFORE the leg applies anything. `deadline` is the drain cycle's shared
+/// wait bound, set the first time a leg in the cycle has to wait, so a
+/// stalled writer holds the shard thread at most one bound per cycle.
+///
+/// Fast path: one queue-length read when the channel has room for every
+/// command in the leg.
+fn admit_routed_leg(
+    pool: &crate::persistence::aof::AofWriterPool,
+    shard_id: usize,
+    msg: &ShardMessage,
+    deadline: &mut Option<Option<std::time::Instant>>,
+) -> bool {
+    let Some(upper) = routed_leg_len(msg) else {
+        return true;
+    };
+    let free = pool.free_append_slots(shard_id);
+    if free >= upper {
+        return true;
+    }
+    let records = routed_leg_records(msg);
+    if records <= free {
+        return true;
+    }
+    if pool.await_append_room(shard_id, records, Some(std::time::Instant::now())) {
+        // Room appeared (or a fold armed the overflow) without waiting.
+        return true;
+    }
+    let deadline = *deadline.get_or_insert_with(|| {
+        let bound = pool.append_wait_bound();
+        (!bound.is_zero()).then(|| std::time::Instant::now() + bound)
+    });
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        // This cycle already spent its bound on an earlier leg.
+        return false;
+    }
+    crate::persistence::aof::AOF_BACKPRESSURE_STALLS
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    pool.await_append_room(shard_id, records, deadline)
+}
+
+/// Answer a routed leg that [`admit_routed_leg`] refused, without running
+/// any of it: every command's reply is [`AOF_BACKPRESSURE_REFUSED_ERR`].
+fn refuse_routed_leg(msg: ShardMessage) {
+    let err =
+        || crate::protocol::Frame::Error(bytes::Bytes::from_static(AOF_BACKPRESSURE_REFUSED_ERR));
+    let refused = routed_leg_len(&msg).unwrap_or(0) as u64;
+    crate::persistence::aof::AOF_BACKPRESSURE_REFUSED
+        .fetch_add(refused, std::sync::atomic::Ordering::Relaxed);
+    match msg {
+        ShardMessage::Execute { reply_tx, .. } => {
+            let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(err()));
+        }
+        ShardMessage::PipelineBatch {
+            commands, reply_tx, ..
+        } => {
+            let _ = reply_tx.send(commands.iter().map(|_| err()).collect());
+        }
+        ShardMessage::MultiExecute {
+            commands, reply_tx, ..
+        } => {
+            let _ = reply_tx.send(commands.iter().map(|_| err()).collect());
+        }
+        ShardMessage::ExecuteSlotted { response_slot, .. } => {
+            // Arc-owned slot: deref is safe, refcount keeps it alive.
+            response_slot.0.fill(vec![err()]);
+        }
+        ShardMessage::PipelineBatchSlotted {
+            commands,
+            response_slot,
+            ..
+        } => {
+            response_slot
+                .0
+                .fill(commands.iter().map(|_| err()).collect());
+        }
+        ShardMessage::MultiExecuteSlotted {
+            commands,
+            response_slot,
+            ..
+        } => {
+            response_slot
+                .0
+                .fill(commands.iter().map(|_| err()).collect());
+        }
+        ShardMessage::TxnExecute(payload) => {
+            let _ = payload.reply_tx.send(crate::shard::dispatch::TxnExecReply {
+                result: err(),
+                exec_publishes: Vec::new(),
+                exec_flushes: Vec::new(),
+                wrote: false,
+                append_lost: false,
+            });
+        }
+        // `routed_leg_len` admits every other message unconditionally.
+        _ => {}
+    }
+}
+
 /// Returns `false` iff the AOF append was NOT enqueued (bounded backpressure
 /// exhausted / writer gone) — callers with a per-command response frame MUST
 /// replace it with [`AOF_APPEND_LOST_ERR`]. WAL/replica fan-out remains
@@ -5378,5 +5550,292 @@ mod drain_rotation_tests {
     #[test]
     fn zero_consumers_is_empty_not_panic() {
         assert_eq!(rotated_indices(0, 0).count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod aof_admission_tests {
+    //! moon#769: a routed write leg is admitted against its shard's AOF
+    //! writer BEFORE it applies anything. It waits for the writer as long as
+    //! `--aof-fsync-timeout-ms` allows, and when the writer never catches up
+    //! it is refused unapplied, never applied-then-reported-lost.
+
+    use super::*;
+    use crate::persistence::aof::{AofMessage, AofWriterPool, FsyncPolicy};
+    use crate::runtime::channel::mpsc_bounded;
+    use ringbuf::HeapRb;
+    use ringbuf::traits::{Producer, Split};
+    use std::time::{Duration, Instant};
+
+    fn argv(parts: &[&'static [u8]]) -> crate::protocol::Frame {
+        crate::protocol::Frame::Array(crate::protocol::FrameVec::from(
+            parts
+                .iter()
+                .map(|p| crate::protocol::Frame::BulkString(bytes::Bytes::from_static(p)))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn filler() -> AofMessage {
+        AofMessage::Append {
+            lsn: 0,
+            db: 0,
+            bytes: bytes::Bytes::from_static(b"*1\r\n$4\r\nPING\r\n"),
+        }
+    }
+
+    fn is_refusal(f: &crate::protocol::Frame) -> bool {
+        matches!(f, crate::protocol::Frame::Error(e) if e.as_ref() == AOF_BACKPRESSURE_REFUSED_ERR)
+    }
+
+    /// Run ONE drain cycle over `msgs` on this thread's (freshly initialised)
+    /// shard, with `pool` as the AOF writer pool. Returns how long it took.
+    fn drain_once(msgs: Vec<ShardMessage>, pool: &Arc<AofWriterPool>) -> Duration {
+        let (shard_databases_inner, mut inits) = ShardDatabases::new(vec![vec![Database::new()]]);
+        crate::shard::slice::init_shard(crate::shard::slice::ShardSlice::new(inits.remove(0)));
+        let shard_databases = Arc::new(shard_databases_inner);
+        let rb = HeapRb::<ShardMessage>::new(16);
+        let (mut prod, cons) = rb.split();
+        for m in msgs {
+            assert!(prod.try_push(m).is_ok(), "ring accepts the test messages");
+        }
+        let mut consumers = vec![cons];
+        let pubsub = parking_lot::RwLock::new(PubSubRegistry::new());
+        let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
+        let mut pending_snapshot = None;
+        let mut snapshot_state: Option<SnapshotState> = None;
+        let mut wal_writer: Option<WalWriterV3> = None;
+        let backlog: crate::replication::backlog::SharedBacklog =
+            Arc::new(parking_lot::Mutex::new(None));
+        let mut replica_txs = Vec::new();
+        let offsets: Option<crate::replication::state::OffsetHandle> = None;
+        let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
+        let clock = CachedClock::new();
+        let mut migrations = Vec::new();
+        let mut cdc = Vec::new();
+        let mut manifest = None;
+        let mut autovacuum = crate::shard::autovacuum::AutovacuumDaemon::new(Default::default());
+        let rtcfg = Arc::new(parking_lot::RwLock::new(RuntimeConfig::default()));
+        let spill_fid = Rc::new(Cell::new(1u64));
+        let mut sampler = crate::admin::metrics_setup::CommandSampler::new();
+        let mut metrics = crate::admin::metrics_setup::CachedMetricsHandles::new();
+        let started = Instant::now();
+        drain_spsc_shared(
+            &shard_databases,
+            &mut consumers,
+            &pubsub,
+            &blocking,
+            &mut pending_snapshot,
+            &mut snapshot_state,
+            &mut wal_writer,
+            &backlog,
+            &mut replica_txs,
+            &offsets,
+            0,
+            &script_cache,
+            None,
+            &clock,
+            &mut migrations,
+            &mut cdc,
+            &mut manifest,
+            1000,
+            8,
+            0.2,
+            &mut autovacuum,
+            Some(pool),
+            false, // wal_kv_log
+            &rtcfg,
+            None,
+            &spill_fid,
+            None,
+            &mut sampler,
+            &mut metrics,
+        );
+        started.elapsed()
+    }
+
+    fn key_exists(key: &[u8]) -> bool {
+        crate::shard::slice::with_shard_db(0, |db| db.exists(key))
+    }
+
+    /// The writer stays a full channel behind for longer than the wait
+    /// bound: the whole leg is refused, and NONE of it ran — no key written,
+    /// no record queued. Before the fix the leg was applied, then its record
+    /// hit a 5 ms bound and the client got "write applied in memory but not
+    /// queued for persistence" for a write that the AOF will never see.
+    #[test]
+    fn a_leg_the_writer_cannot_take_is_refused_without_running() {
+        std::thread::spawn(|| {
+            let (tx, rx) = mpsc_bounded::<AofMessage>(2);
+            tx.try_send(filler()).unwrap();
+            tx.try_send(filler()).unwrap();
+            let pool = Arc::new(AofWriterPool::top_level_with_policy(
+                tx,
+                FsyncPolicy::EverySec,
+                Duration::from_millis(40),
+            ));
+            let slot = Arc::new(crate::server::response_slot::ResponseSlot::new());
+            let msg = ShardMessage::PipelineBatchSlotted {
+                db_index: 0,
+                commands: vec![
+                    Arc::new(argv(&[b"SET", b"k", b"v"])),
+                    Arc::new(argv(&[b"INCR", b"n"])),
+                ],
+                response_slot: crate::shard::dispatch::ResponseSlotPtr(Arc::clone(&slot)),
+            };
+            let took = drain_once(vec![msg], &pool);
+
+            let replies = slot.try_take().expect("the refused leg still answers");
+            assert_eq!(replies.len(), 2);
+            assert!(
+                replies.iter().all(is_refusal),
+                "every command of a refused leg answers the not-executed error: {replies:?}"
+            );
+            assert!(!key_exists(b"k"), "a refused SET must not have run");
+            assert!(!key_exists(b"n"), "a refused INCR must not have run");
+            assert_eq!(rx.len(), 2, "a refused leg must queue no AOF record");
+            assert!(
+                took >= Duration::from_millis(40),
+                "the leg must wait out the bound before refusing (took {took:?})"
+            );
+        })
+        .join()
+        .expect("shard thread");
+    }
+
+    /// A writer that catches up within the bound: the leg waits, then runs
+    /// normally — the everysec stall is absorbed, not turned into an error.
+    #[test]
+    fn a_leg_waits_for_a_writer_that_catches_up_within_the_bound() {
+        std::thread::spawn(|| {
+            let (tx, rx) = mpsc_bounded::<AofMessage>(2);
+            tx.try_send(filler()).unwrap();
+            tx.try_send(filler()).unwrap();
+            let pool = Arc::new(AofWriterPool::top_level_with_policy(
+                tx,
+                FsyncPolicy::EverySec,
+                Duration::from_secs(5),
+            ));
+            // The "writer": stalled 150 ms (a slow fsync), then drains.
+            let writer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                let mut got = Vec::new();
+                while let Ok(m) = rx.recv_timeout(Duration::from_millis(500)) {
+                    got.push(m);
+                }
+                got
+            });
+            let slot = Arc::new(crate::server::response_slot::ResponseSlot::new());
+            let msg = ShardMessage::ExecuteSlotted {
+                db_index: 0,
+                command: Arc::new(argv(&[b"SET", b"k", b"v"])),
+                response_slot: crate::shard::dispatch::ResponseSlotPtr(Arc::clone(&slot)),
+            };
+            let took = drain_once(vec![msg], &pool);
+
+            let replies = slot.try_take().expect("the leg answers");
+            assert!(
+                matches!(&replies[..], [crate::protocol::Frame::SimpleString(s)] if s.as_ref() == b"OK"),
+                "a leg admitted after the writer caught up runs normally: {replies:?}"
+            );
+            assert!(key_exists(b"k"));
+            assert!(
+                took >= Duration::from_millis(100),
+                "the leg waited for the writer (took {took:?})"
+            );
+            drop(pool);
+            let got = writer.join().expect("writer thread");
+            assert_eq!(got.len(), 3, "both fillers and the SET's record reached the writer");
+        })
+        .join()
+        .expect("shard thread");
+    }
+
+    /// Reads log nothing, so a stalled writer never delays them.
+    #[test]
+    fn a_read_leg_is_never_held_by_a_stalled_writer() {
+        std::thread::spawn(|| {
+            let (tx, _rx) = mpsc_bounded::<AofMessage>(1);
+            tx.try_send(filler()).unwrap();
+            let pool = Arc::new(AofWriterPool::top_level_with_policy(
+                tx,
+                FsyncPolicy::EverySec,
+                Duration::from_secs(5),
+            ));
+            let slot = Arc::new(crate::server::response_slot::ResponseSlot::new());
+            let msg = ShardMessage::ExecuteSlotted {
+                db_index: 0,
+                command: Arc::new(argv(&[b"GET", b"k"])),
+                response_slot: crate::shard::dispatch::ResponseSlotPtr(Arc::clone(&slot)),
+            };
+            let took = drain_once(vec![msg], &pool);
+            let replies = slot.try_take().expect("the read answers");
+            assert!(!replies.iter().any(is_refusal));
+            assert!(
+                took < Duration::from_secs(4),
+                "a read must not wait on the AOF writer (took {took:?})"
+            );
+        })
+        .join()
+        .expect("shard thread");
+    }
+
+    /// One wait bound per drain cycle: the second leg of a cycle whose first
+    /// leg already waited out the bound is refused at once, so a stalled
+    /// writer holds the shard thread one bound per cycle, not one per leg.
+    #[test]
+    fn a_stalled_writer_costs_one_bound_per_cycle_not_per_leg() {
+        std::thread::spawn(|| {
+            let (tx, _rx) = mpsc_bounded::<AofMessage>(1);
+            tx.try_send(filler()).unwrap();
+            let pool = Arc::new(AofWriterPool::top_level_with_policy(
+                tx,
+                FsyncPolicy::EverySec,
+                Duration::from_millis(200),
+            ));
+            let slots: Vec<_> = (0..5)
+                .map(|_| Arc::new(crate::server::response_slot::ResponseSlot::new()))
+                .collect();
+            let msgs = slots
+                .iter()
+                .map(|s| ShardMessage::ExecuteSlotted {
+                    db_index: 0,
+                    command: Arc::new(argv(&[b"SET", b"k", b"v"])),
+                    response_slot: crate::shard::dispatch::ResponseSlotPtr(Arc::clone(s)),
+                })
+                .collect();
+            let took = drain_once(msgs, &pool);
+            for s in &slots {
+                let r = s.try_take().expect("each leg answers");
+                assert!(r.iter().all(is_refusal), "{r:?}");
+            }
+            assert!(
+                took < Duration::from_millis(800),
+                "five legs must share one 200 ms bound, not wait 5 x 200 ms (took {took:?})"
+            );
+        })
+        .join()
+        .expect("shard thread");
+    }
+
+    #[test]
+    fn room_is_immediate_while_a_fold_has_the_overflow_armed() {
+        let (tx, _rx) = mpsc_bounded::<AofMessage>(1);
+        tx.try_send(filler()).unwrap();
+        let pool =
+            AofWriterPool::top_level_with_policy(tx, FsyncPolicy::EverySec, Duration::from_secs(5));
+        pool.overflow_for(0).arm();
+        let started = Instant::now();
+        assert!(pool.await_append_room(0, 1, Some(started + Duration::from_secs(5))));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn no_room_is_ever_granted_by_a_writer_that_is_gone() {
+        let (tx, rx) = mpsc_bounded::<AofMessage>(1);
+        let pool =
+            AofWriterPool::top_level_with_policy(tx, FsyncPolicy::EverySec, Duration::from_secs(5));
+        drop(rx);
+        assert!(!pool.await_append_room(0, 1, None));
     }
 }

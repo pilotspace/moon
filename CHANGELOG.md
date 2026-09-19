@@ -191,6 +191,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A slow `everysec` fsync no longer makes a multi-shard server answer
+  "write applied in memory but not queued for persistence"** (moon#769).
+  - **Before.** At `--shards > 1` a write to a key another shard owns runs
+    on that shard, and the shard applied it first and only then waited 5 ms
+    for room in its AOF writer's 10k channel. A writer stalled on a slow
+    fsync fills that channel quickly under pipelined load, so such writes were
+    refused after they were already in memory, and their records never reached
+    the AOF. Redis and Valkey complete the same `redis-benchmark -P 16`
+    workload. The write leg on the connection's own shard already waited up to
+    `--aof-fsync-timeout-ms` (2 s by default).
+  - **Now.** Before a routed write runs, its shard checks that the AOF writer
+    has room for the write's records, waiting up to the same
+    `--aof-fsync-timeout-ms`. A stall shorter than that is absorbed. A write
+    that still finds no room is refused **without being applied**, with
+    `-MOONERR AOF backpressure: command not executed, the AOF writer is
+    stalled; retry`. The keyspace, the AOF and the replicas keep agreeing, and
+    the client can retry.
+  - Reads never wait. A stalled writer costs a shard at most one bound per
+    drain cycle, not one per command. While a rewrite is folding, writes
+    spill to the rewrite overflow instead of waiting.
+  - `INFO persistence` gains `aof_backpressure_stalls` (routed writes that
+    waited) and `aof_backpressure_refused` (commands refused unapplied).
+  - The write leg on the connection's own shard is unchanged. It still
+    applies the write, waits up to the bound, and then reports
+    `ERR AOF fsync failed; write not durable`.
+
 - **The cold-index rebuild no longer drops entries silently, and an
   indexed-but-unreadable cold entry is no longer a "miss" in code**
   (moon#875). `ColdIndex::rebuild_from_manifest_per_db` skipped a heap file
