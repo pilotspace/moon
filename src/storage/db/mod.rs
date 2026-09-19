@@ -1150,6 +1150,31 @@ impl Database {
         self.used_memory.saturating_add(self.spill_inflight_bytes)
     }
 
+    /// The figure `maxmemory` holds this database to: [`Self::estimated_memory`]
+    /// plus the RAM its [`ColdIndex`](crate::storage::tiered::cold_index::ColdIndex)
+    /// occupies for the keys it has spilled.
+    ///
+    /// THE single definition every eviction decision compares against a
+    /// budget. The 100 ms pressure cascade has charged the cold index since
+    /// K4 (the tick publishes this sum as the shard's memory), while the
+    /// per-write gates — `evict_to_budget`'s default total and the inline
+    /// pre-gate `inline_write_can_skip_eviction` — compared the budget
+    /// against `estimated_memory()` alone. moon#1036: one shard, two
+    /// effective caps, `ColdIndex::resident_bytes()` apart. Every tick the
+    /// cascade spilled a cold-index's worth of hot keys that the per-write
+    /// gate then let writers refill without evicting, so the shard sawtoothed
+    /// above the cascade's cap between ticks, and a burst of writes inlined
+    /// after every tick even though the shard was over what the cascade
+    /// enforces.
+    ///
+    /// O(1): one `Option` test and one field read beside the two that
+    /// `estimated_memory` already does, so it stays a per-write read.
+    #[inline]
+    pub fn budgeted_memory(&self) -> usize {
+        self.estimated_memory()
+            .saturating_add(self.cold_index.as_ref().map_or(0, |ci| ci.resident_bytes()))
+    }
+
     /// Resident bytes attributed to this database (alias for `estimated_memory`,
     /// kept distinct so observability call sites use the canonical name).
     /// O(1), zero allocation -- reads the per-shard `used_memory` accumulator
