@@ -2237,6 +2237,15 @@ mk_norm() {
     printf '%s' "$1" | sort | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//'
 }
 
+# moon#1019: multi-key blocking pops that must ANSWER at any placement -- a
+# CROSSSLOT for them is a regression, not an acceptable refusal.
+mk_must_answer() {
+    case "$1" in
+        blpop|brpop|bzpopmin|bzpopmax) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # mode(span|colo) label nkeys seed-templates(|-separated, one per key, %K)
 #   probe(%K1..%Kn) [check(%K)]
 #
@@ -2297,6 +2306,9 @@ route_probe_multi() {
                 MK_TOUCH_REFUSED=$((MK_TOUCH_REFUSED + 1))
                 echo "  FAIL detail: touch[$i] was refused; it is per-key decomposable and must fan out"
                 wrong=$((wrong + 1))
+            elif mk_must_answer "$label"; then
+                echo "  FAIL detail: ${label}[$i] was refused; moon#1019 keeps a spanning ${label} working, as standalone redis does"
+                wrong=$((wrong + 1))
             elif [[ -n "$check" && "$before" != "$after" ]]; then
                 echo "  FAIL detail: ${label}[$i] refused but the keyspace MOVED: '$before' -> '$after'"
                 wrong=$((wrong + 1))
@@ -2344,27 +2356,19 @@ MK_ROWS=(
   # lost its head element, visible only through the per-key check.
   "blmpop|3||RPUSH %K B1 B2|RPUSH %K C1 C2|BLMPOP 0.1 3 %K1 %K2 %K3 LEFT|LRANGE %K 0 -1"
   "bzmpop|3||ZADD %K 1 B1 2 B2|ZADD %K 1 C1 2 C2|BZMPOP 0.1 3 %K1 %K2 %K3 MIN|ZRANGE %K 0 -1"
-)
-
-# moon#989: the rest of the multi-key blocking-pop family, CO-LOCATED only.
-# They shared BLMPOP's double-pop and are fixed with it, so `colo` must agree
-# with redis byte for byte. Their SPANNING placement is still a known defect
-# (two owner shards can each serve the same waiter) and is deliberately not
-# refused yet -- that is a behaviour decision tracked as moon#1019, so a
-# `span` row here would only assert the bug.
-MK_COLO_ONLY_ROWS=(
+  # moon#989 + moon#1019: the rest of the multi-key blocking-pop family. Unlike
+  # BLMPOP/BZMPOP they are NOT refused across shards (a product decision:
+  # untagged `BLPOP q1 q2 q3 0` worker loops keep working, as on standalone
+  # redis), so `span` must answer exactly like redis, keyspace included --
+  # see `mk_must_answer`.
   "blpop|3||RPUSH %K B1 B2|RPUSH %K C1 C2|BLPOP %K1 %K2 %K3 0.1|LRANGE %K 0 -1"
   "brpop|3||RPUSH %K B1 B2|RPUSH %K C1 C2|BRPOP %K1 %K2 %K3 0.1|LRANGE %K 0 -1"
   "bzpopmin|3||ZADD %K 1 B1 2 B2|ZADD %K 1 C1 2 C2|BZPOPMIN %K1 %K2 %K3 0.1|ZRANGE %K 0 -1"
   "bzpopmax|3||ZADD %K 1 B1 2 B2|ZADD %K 1 C1 2 C2|BZPOPMAX %K1 %K2 %K3 0.1|ZRANGE %K 0 -1"
 )
 
-for mk_row in "${MK_ROWS[@]}" "${MK_COLO_ONLY_ROWS[@]/#/colo-only:}"; do
+for mk_row in "${MK_ROWS[@]}"; do
     mk_modes="span colo"
-    if [[ "$mk_row" == colo-only:* ]]; then
-        mk_modes="colo"
-        mk_row="${mk_row#colo-only:}"
-    fi
     IFS='|' read -r -a mk_f <<<"$mk_row"
     mk_label="${mk_f[0]}"; mk_n="${mk_f[1]}"
     # fields 2..(2+n-1) are the per-key seeds, then the probe, then the check
@@ -2397,7 +2401,7 @@ assert_eq "moon#962 TOUCH is never refused (shards=$SHARDS)" "0" "$MK_TOUCH_REFU
 
 # Tidy up by exact name -- `--scan | xargs -r` is GNU-only and this script runs
 # on macOS too.
-for mk_row in "${MK_ROWS[@]}" "${MK_COLO_ONLY_ROWS[@]}"; do
+for mk_row in "${MK_ROWS[@]}"; do
     IFS='|' read -r -a mk_f <<<"$mk_row"
     for mk_i in $(seq 1 "$MK_TRIALS"); do
         for mk_j in $(seq 1 "${mk_f[1]}"); do
