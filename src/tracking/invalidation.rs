@@ -158,6 +158,53 @@ pub fn invalidate_keys(
     }
 }
 
+/// Writer id for a removal the SERVER decided on (expiry, eviction).
+///
+/// Client ids start at 1 (`command::connection::next_client_id`), so no NOLOOP
+/// client ever matches it: an expiry is nobody's own write. Measured against
+/// redis-server 8.6.1 — a NOLOOP client that `SET k v PX 1000` itself and then
+/// read `k` still receives `invalidate [k]` when `k` expires.
+const SERVER_REMOVAL_WRITER: u64 = 0;
+
+/// Invalidate one key the server removed on its own — TTL expiry (active
+/// sweep, lazy drain, hash-field reap, cold-tier reclaim) or eviction
+/// (moon#1013).
+///
+/// Every way a key can change or disappear must reach tracking clients, or a
+/// client-side cache serves the old value forever. Before moon#1013 only
+/// command writes invalidated; redis 8.6.1 pushes `invalidate` on expiry and
+/// eviction in every tracking mode (default, BCAST, OPTIN/OPTOUT, NOLOOP,
+/// RESP2 REDIRECT).
+///
+/// Hot-path contract: with no tracking client this is ONE relaxed atomic load
+/// and a not-taken branch — no allocation, no lock. The expiry sweep calls it
+/// once per removed key, so the key copy and the table lock live in the cold
+/// helper below and are paid only while somebody is tracking.
+///
+/// Callable from any shard thread: the table is process-global and each
+/// sender is a cross-thread flume channel, so the owner shard of an expiring
+/// key pushes straight into a reader connected on another shard — the same
+/// route a cross-shard write takes, with nothing to await.
+#[inline]
+pub fn invalidate_server_removed(key: &[u8]) {
+    if !crate::tracking::tracking_active() {
+        return;
+    }
+    invalidate_server_removed_in(&crate::tracking::global_table(), key);
+}
+
+/// [`invalidate_server_removed`] against an explicit table (unit tests; the
+/// public entry point always uses the global one). Not gated — the caller
+/// has already decided somebody may be tracking.
+#[cold]
+#[inline(never)]
+fn invalidate_server_removed_in(
+    table: &parking_lot::Mutex<crate::tracking::TrackingTable>,
+    key: &[u8],
+) {
+    invalidate_keys(table, &[Bytes::copy_from_slice(key)], SERVER_REMOVAL_WRITER);
+}
+
 /// FLUSHALL/FLUSHDB invalidation: push the RESP3 flush invalidation
 /// (`invalidate` + Null) to every registered tracking client and clear the
 /// per-key table. Called once at the ORIGINATING connection (the table is
@@ -290,12 +337,148 @@ fn collect_keys(
     keys
 }
 
+/// Test fixture for server-initiated invalidation (moon#1013): one tracking
+/// registration on the GLOBAL table, the table the expiry sweep and eviction
+/// actually reach.
+///
+/// Unit tests run in parallel inside one process, so each tracker takes a
+/// unique client id from a range no real connection allocates, and each test
+/// tracks a key name nobody else uses. `Drop` unregisters, returning
+/// `ACTIVE_TRACKERS` to where it was.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_CLIENT: AtomicU64 = AtomicU64::new(u64::MAX / 2);
+
+    pub(crate) struct GlobalTracker {
+        id: u64,
+        rx: crate::runtime::channel::MpscReceiver<Frame>,
+    }
+
+    impl GlobalTracker {
+        /// Register a fresh client that has read (tracks) `key`.
+        pub(crate) fn tracking(key: &[u8]) -> Self {
+            let id = NEXT_TEST_CLIENT.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = crate::runtime::channel::mpsc_unbounded::<Frame>();
+            let table = crate::tracking::global_table();
+            let mut t = table.lock();
+            t.register_client(id, tx);
+            let _ = t.track_key(id, &Bytes::copy_from_slice(key), false);
+            Self { id, rx }
+        }
+
+        /// Keys named by every `invalidate` push received so far.
+        pub(crate) fn invalidated_keys(&self) -> Vec<Bytes> {
+            let mut keys = Vec::new();
+            while let Ok(frame) = self.rx.try_recv() {
+                let Frame::Push(items) = frame else { continue };
+                if let Some(Frame::Array(named)) = items.get(1) {
+                    for k in named.iter() {
+                        if let Frame::BulkString(k) = k {
+                            keys.push(k.clone());
+                        }
+                    }
+                }
+            }
+            keys
+        }
+    }
+
+    impl Drop for GlobalTracker {
+        fn drop(&mut self) {
+            crate::tracking::global_table().lock().untrack_all(self.id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn bulk(s: &'static str) -> Frame {
         Frame::BulkString(Bytes::from_static(s.as_bytes()))
+    }
+
+    fn pushed_keys(rx: &crate::runtime::channel::MpscReceiver<Frame>) -> Vec<Bytes> {
+        let mut keys = Vec::new();
+        while let Ok(Frame::Push(items)) = rx.try_recv() {
+            if let Some(Frame::Array(named)) = items.get(1) {
+                for k in named.iter() {
+                    if let Frame::BulkString(k) = k {
+                        keys.push(k.clone());
+                    }
+                }
+            }
+        }
+        keys
+    }
+
+    /// moon#1013: a server-initiated removal is nobody's own write, so NOLOOP
+    /// must not suppress it (redis 8.6.1: a NOLOOP client that set the key
+    /// itself still hears about its expiry), and the tracking entry is
+    /// consumed exactly like a write's.
+    #[test]
+    fn server_removal_reaches_a_noloop_tracker_and_consumes_the_entry() {
+        let table = parking_lot::Mutex::new(crate::tracking::TrackingTable::new());
+        let (tx, rx) = crate::runtime::channel::mpsc_unbounded::<Frame>();
+        let key = Bytes::from_static(b"srv:noloop");
+        {
+            let mut t = table.lock();
+            t.register_client(1, tx);
+            let _ = t.track_key(1, &key, true); // NOLOOP
+        }
+        invalidate_server_removed_in(&table, &key);
+        assert_eq!(pushed_keys(&rx), vec![key.clone()]);
+        assert!(
+            table.lock().tracked_clients(&key).is_empty(),
+            "the invalidation must consume the tracking entry"
+        );
+        table.lock().untrack_all(1);
+    }
+
+    /// BCAST prefix and REDIRECT route a server removal exactly like a write.
+    #[test]
+    fn server_removal_honours_bcast_prefix_and_redirect() {
+        let table = parking_lot::Mutex::new(crate::tracking::TrackingTable::new());
+        let (bcast_tx, bcast_rx) = crate::runtime::channel::mpsc_unbounded::<Frame>();
+        let (target_tx, target_rx) = crate::runtime::channel::mpsc_unbounded::<Frame>();
+        let key = Bytes::from_static(b"bc:k");
+        {
+            let mut t = table.lock();
+            t.register_client(10, bcast_tx);
+            t.register_prefix(10, Bytes::from_static(b"bc:"), false);
+            // Client 11 tracks the key but redirects to client 12.
+            t.register_client(12, target_tx);
+            t.set_redirect(11, 12);
+            let _ = t.track_key(11, &key, false);
+        }
+        invalidate_server_removed_in(&table, &key);
+        assert_eq!(pushed_keys(&bcast_rx), vec![key.clone()], "BCAST prefix");
+        assert_eq!(
+            pushed_keys(&target_rx),
+            vec![key.clone()],
+            "REDIRECT target"
+        );
+        // A key outside the prefix reaches nobody.
+        invalidate_server_removed_in(&table, b"other");
+        assert!(pushed_keys(&bcast_rx).is_empty());
+        let mut t = table.lock();
+        t.untrack_all(10);
+        t.untrack_all(11);
+        t.untrack_all(12);
+    }
+
+    /// The public entry point reaches the GLOBAL table.
+    #[test]
+    fn invalidate_server_removed_uses_the_global_table() {
+        let tracker = test_support::GlobalTracker::tracking(b"srv:global:1013");
+        invalidate_server_removed(b"srv:global:1013");
+        assert_eq!(
+            tracker.invalidated_keys(),
+            vec![Bytes::from_static(b"srv:global:1013")]
+        );
     }
 
     #[test]
