@@ -2,7 +2,7 @@
 #![allow(unused_imports, unused_variables, unreachable_code, clippy::empty_loop)]
 
 use super::rewrite::{
-    do_rewrite_per_shard, drain_pending_appends_framed, rewrite_aof_sharded_sync,
+    FoldOutcome, do_rewrite_per_shard, drain_pending_appends_framed, rewrite_aof_sharded_sync,
     sync_and_fulfill_drain,
 };
 use super::*;
@@ -206,6 +206,7 @@ mod poll_recv_tests {
                 lsn: 7,
                 db: 0,
                 bytes: bytes::Bytes::from_static(b"x"),
+                epoch: FoldEpoch::INITIAL,
             })
             .is_ok()
         );
@@ -228,6 +229,7 @@ mod poll_recv_tests {
                     lsn: 1,
                     db: 0,
                     bytes: bytes::Bytes::from_static(b"y"),
+                    epoch: FoldEpoch::INITIAL,
                 })
                 .is_ok()
             );
@@ -370,6 +372,12 @@ pub async fn aof_writer_task(
     // file: replay starts a segment at db 0).
     #[cfg(feature = "runtime-tokio")]
     let mut last_db: usize = 0;
+    // #455: snapshot epoch of the generation this writer appends to; records
+    // stamped below it are already in that generation's base and are dropped
+    // wherever they are dequeued. Moves only when a fold's generation is
+    // committed (see `FoldOutcome`).
+    #[cfg(feature = "runtime-tokio")]
+    let mut fold_floor = FoldEpoch::INITIAL;
 
     // Monoio path: multi-part AOF (base RDB + incremental RESP) with sync I/O.
     //
@@ -491,6 +499,8 @@ pub async fn aof_writer_task(
         // Resets to 0 whenever a NEW incr/base file becomes the append
         // target (fresh manifest segment — replay starts each incr at db 0).
         let mut last_db: usize = 0;
+        // #455: see the tokio declaration above.
+        let mut fold_floor = FoldEpoch::INITIAL;
 
         loop {
             // Group commit: wait (bounded) for one message, then
@@ -534,8 +544,13 @@ pub async fn aof_writer_task(
                 );
                 // task #35: inject SELECT <db> records ahead of any db switch
                 // before committing — rides the same write path as any other
-                // record (raw bytes on this TopLevel format).
-                batch.data = inject_select_records(std::mem::take(&mut batch.data), &mut last_db);
+                // record (raw bytes on this TopLevel format). #455: drops
+                // records already folded into the committed base first.
+                batch.data = inject_select_records(
+                    std::mem::take(&mut batch.data),
+                    fold_floor,
+                    &mut last_db,
+                );
 
                 // -- commit the data batch (one fsync under Always; deadline under everysec) --
                 if !batch.data.is_empty() {
@@ -594,27 +609,31 @@ pub async fn aof_writer_task(
                                 error!("AOF pre-rewrite sync failed (seq {}): {}", manifest.seq, e);
                             }
                         }
-                        let committed = match do_rewrite_single(
+                        let outcome = match do_rewrite_single(
                             &db,
                             &mut manifest,
                             &mut file,
                             &rx,
                             &mut last_db,
                             &overflow,
+                            fold_floor,
                         ) {
-                            Ok(()) => {
+                            Ok(outcome) => {
                                 write_error = false; // Reset on successful rewrite
-                                true
+                                outcome
                             }
                             Err(e) => {
                                 error!("AOF rewrite failed (seq {}): {}", manifest.seq, e);
-                                false
+                                FoldOutcome::Aborted
                             }
                         };
+                        // #455: from here on, records folded into the
+                        // committed base are dropped wherever they surface.
+                        fold_floor = outcome.floor_after(fold_floor);
                         // #452.1: channel backlog + spilled overflow → current
                         // (committed) incr, in order, before resuming the loop.
-                        // On commit, pre-cut spills fold into the new base.
-                        if let Err(e) = overflow.finish_raw(&rx, &mut file, &mut last_db, committed)
+                        if let Err(e) =
+                            overflow.finish_raw(&rx, &mut file, &mut last_db, fold_floor)
                         {
                             error!(
                                 "AOF rewrite overflow drain failed (seq {}): {}",
@@ -638,27 +657,30 @@ pub async fn aof_writer_task(
                         // use the AofFold SPSC protocol instead of the deleted RwLock
                         // path.  `fold_channels` is `None` only if main.rs failed to
                         // wire them at startup (Arc::get_mut race — logged at boot).
-                        let committed = match do_rewrite_sharded(
+                        let outcome = match do_rewrite_sharded(
                             &shard_dbs,
                             &mut manifest,
                             &mut file,
                             &rx,
                             fold_channels.as_ref(),
                             &mut last_db,
+                            fold_floor,
                         ) {
-                            Ok(()) => {
+                            Ok(outcome) => {
                                 write_error = false;
-                                true
+                                outcome
                             }
                             Err(e) => {
                                 error!("AOF rewrite failed (seq {}): {}", manifest.seq, e);
-                                false
+                                FoldOutcome::Aborted
                             }
                         };
+                        // #455: see the Rewrite arm above.
+                        fold_floor = outcome.floor_after(fold_floor);
                         // #452.1: channel backlog + spilled overflow → current
                         // (committed) incr, in order, before resuming the loop.
-                        // On commit, pre-cut spills fold into the new base.
-                        if let Err(e) = overflow.finish_raw(&rx, &mut file, &mut last_db, committed)
+                        if let Err(e) =
+                            overflow.finish_raw(&rx, &mut file, &mut last_db, fold_floor)
                         {
                             error!(
                                 "AOF rewrite overflow drain failed (seq {}): {}",
@@ -770,9 +792,13 @@ pub async fn aof_writer_task(
                     );
                     // task #35: inject SELECT <db> records ahead of any db
                     // switch before committing (see the monoio TopLevel loop
-                    // above).
-                    batch.data =
-                        inject_select_records(std::mem::take(&mut batch.data), &mut last_db);
+                    // above). #455: drops records already folded into the
+                    // committed base first.
+                    batch.data = inject_select_records(
+                        std::mem::take(&mut batch.data),
+                        fold_floor,
+                        &mut last_db,
+                    );
 
                     // -- write the data batch inline (async), then ONE fsync --
                     if !batch.data.is_empty() {
@@ -891,15 +917,15 @@ pub async fn aof_writer_task(
                             // fresh file, in order, before resuming the loop.
                             {
                                 let mut sf = writer.into_inner().into_std().await;
-                                // committed=false (write-everything): the legacy
-                                // read-lock snapshot has no exact cut instant, so
-                                // no spill can safely be classified pre-snapshot.
-                                // Double-apply exposure for records enqueued
-                                // during the racy snapshot is a pre-existing
-                                // property of this legacy path (channel entries
-                                // behave identically).
+                                // Floor unchanged (write-everything): the legacy
+                                // read-lock snapshot has no exact snapshot instant,
+                                // so it opens no fold epoch and no record can
+                                // safely be classified pre-snapshot. Double-apply
+                                // exposure for records enqueued during the racy
+                                // snapshot is a pre-existing property of this
+                                // legacy path (channel entries behave identically).
                                 if let Err(e) =
-                                    overflow.finish_raw(&rx, &mut sf, &mut last_db, false)
+                                    overflow.finish_raw(&rx, &mut sf, &mut last_db, fold_floor)
                                 {
                                     error!("AOF rewrite overflow drain failed: {}", e);
                                 }
@@ -922,66 +948,57 @@ pub async fn aof_writer_task(
                             // C4 TopLevel cooperative fold (tokio path):
                             // flush + sync the BufWriter (skip if torn), convert to
                             // std::fs::File for the sync fold (same pattern as tokio
-                            // per-shard), then reopen for appending.
+                            // per-shard).
                             if !write_error {
                                 let _ = writer.flush().await;
                                 let _ = writer.get_ref().sync_data().await;
                             }
                             let mut sf = writer.into_inner().into_std().await;
-                            let committed = match rewrite_aof_sharded_sync(
+                            // #455: on success the fold hands back the handle of
+                            // the file it just published (opened BEFORE its
+                            // rename), so nothing is reopened after the flip; on
+                            // failure `sf` is still the untouched old file.
+                            let fold = rewrite_aof_sharded_sync(
                                 &shard_dbs,
                                 &aof_path,
                                 &rx,
                                 &mut sf,
                                 fold_channels.as_ref(),
                                 &mut last_db,
-                            ) {
+                                fold_floor,
+                            );
+                            let (outcome, mut active) = match fold {
                                 // Fold rewrote aof_path clean — the latch resets.
-                                Ok(()) => {
+                                Ok((outcome, new_file)) => {
                                     write_error = false;
-                                    true
+                                    (outcome, new_file)
                                 }
                                 Err(e) => {
                                     error!("AOF rewrite (sharded) failed: {}", e);
-                                    false
+                                    (FoldOutcome::Aborted, sf)
                                 }
                             };
-                            // Drop sf — caller will reopen aof_path below.
-                            drop(sf);
                             // INFO `aof_last_bgrewrite_status`, and the moon#914
                             // boot-time rewrite's retry decision. Stored BEFORE
                             // the in-progress flag clears, so a reader that sees
                             // the flag clear also sees this rewrite's outcome.
-                            super::AOF_REWRITE_LAST_OK
-                                .store(committed, std::sync::atomic::Ordering::SeqCst);
+                            super::AOF_REWRITE_LAST_OK.store(
+                                matches!(outcome, FoldOutcome::Committed { .. }),
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
                             crate::command::persistence::AOF_REWRITE_IN_PROGRESS
                                 .store(false, std::sync::atomic::Ordering::SeqCst);
-                            let reopen_result: Result<tokio::fs::File, _> =
-                                tokio::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open(&aof_path)
-                                    .await;
-                            match reopen_result {
-                                Ok(f) => writer = tokio::io::BufWriter::new(f),
-                                Err(e) => {
-                                    error!("Failed to reopen AOF after rewrite: {}", e);
-                                    overflow.disarm_dropping();
-                                    return;
-                                }
-                            }
+                            // #455: from here on, records folded into the
+                            // committed base are dropped wherever they surface.
+                            fold_floor = outcome.floor_after(fold_floor);
                             // #452.1: channel backlog + spilled overflow → the
-                            // fresh file, in order, before resuming the loop.
+                            // committed file, in order, before resuming the loop.
+                            if let Err(e) =
+                                overflow.finish_raw(&rx, &mut active, &mut last_db, fold_floor)
                             {
-                                let mut sf = writer.into_inner().into_std().await;
-                                // On commit, pre-cut spills fold into the new base.
-                                if let Err(e) =
-                                    overflow.finish_raw(&rx, &mut sf, &mut last_db, committed)
-                                {
-                                    error!("AOF rewrite overflow drain failed: {}", e);
-                                }
-                                writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(sf));
+                                error!("AOF rewrite overflow drain failed: {}", e);
                             }
+                            writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(active));
                             // Back-date so the channel backlog that accumulated
                             // during the blocking fold reaches disk within ~100ms
                             // + wake floor — a SIGKILL shortly after rewrite
@@ -1198,6 +1215,8 @@ pub async fn per_shard_aof_writer_task(
         // task #35: AOF db-aware writer — see the monoio TopLevel loop's docs
         // near the top of this file for the full rationale.
         let mut last_db: usize = 0;
+        // #455: see the TopLevel declaration near the top of this file.
+        let mut fold_floor = FoldEpoch::INITIAL;
         // (No `interval` here: the EverySec flush deadline is enforced by the
         // timeout-bounded recv in the loop below, which wakes at least every
         // `idle_wait.current()` (50ms floor, escalates to 1s while idle)
@@ -1270,6 +1289,7 @@ pub async fn per_shard_aof_writer_task(
                             // changes before this batch's framed writes go out.
                             batch.data = inject_select_records(
                                 std::mem::take(&mut batch.data),
+                                fold_floor,
                                 &mut last_db,
                             );
 
@@ -1432,25 +1452,38 @@ pub async fn per_shard_aof_writer_task(
                                         let res = do_rewrite_per_shard(
                                             shard_id, &shard_dbs, &mut sf, &rx, &coord,
                                             &fold_producer, &fold_notifier, &mut last_db,
+                                            fold_floor,
                                         );
-                                        // `sf` is left on the committed generation by
-                                        // the fold's internal barrier: NEW incr on
-                                        // success, OLD incr on abort/pre-reopen error.
-                                        // The fold's ShardDoneGuard already did
-                                        // `shard_done` for every exit, so do NOT
-                                        // decrement again. Wrap `sf` back either way.
+                                        // `sf` is on the committed generation: the
+                                        // NEW incr only when the fold reports
+                                        // Committed, the untouched OLD incr on every
+                                        // other exit. The fold's ShardDoneGuard
+                                        // already did `shard_done` for every exit,
+                                        // so do NOT decrement again.
+                                        let outcome = match res {
+                                            Ok(outcome) => outcome,
+                                            Err(e) => {
+                                                error!(
+                                                    "F6 tokio per-shard rewrite: shard {} fold failed: {}. \
+                                                     Rewrite aborted by the fold guard; old generation \
+                                                     stays authoritative.",
+                                                    shard_id, e
+                                                );
+                                                FoldOutcome::Aborted
+                                            }
+                                        };
+                                        // #455: records folded into a committed
+                                        // base are dropped wherever they surface
+                                        // from here on; an aborted fold keeps the
+                                        // floor, so every record is written.
+                                        fold_floor = outcome.floor_after(fold_floor);
                                         // #452.1: drain channel backlog + spilled
                                         // overflow into the committed incr first.
-                                        // On commit, pre-cut spills fold into base.
-                                        // committed = Ok(true) ONLY: an
-                                        // aborted fold (Ok(false)) pruned the
-                                        // new base — pre-cut spills must be
-                                        // WRITTEN, not discarded (re-verify P0).
                                         if let Err(e) = overflow.finish_framed(
                                             &rx,
                                             &mut sf,
                                             &mut last_db,
-                                            matches!(res, Ok(true)),
+                                            fold_floor,
                                         ) {
                                             error!(
                                                 "F6 tokio per-shard rewrite: shard {} overflow \
@@ -1461,14 +1494,6 @@ pub async fn per_shard_aof_writer_task(
                                         writer = tokio::io::BufWriter::new(
                                             tokio::fs::File::from_std(sf),
                                         );
-                                        if let Err(e) = res {
-                                            error!(
-                                                "F6 tokio per-shard rewrite: shard {} fold failed: {}. \
-                                                 Rewrite aborted by the fold guard; old generation \
-                                                 stays authoritative.",
-                                                shard_id, e
-                                            );
-                                        }
                                     }
                                 }
                                 Some(AofMessage::Shutdown) => {
@@ -1640,6 +1665,8 @@ pub async fn per_shard_aof_writer_task(
         // task #35: AOF db-aware writer — see the monoio TopLevel loop's docs
         // near the top of this file for the full rationale.
         let mut last_db: usize = 0;
+        // #455: see the TopLevel declaration near the top of this file.
+        let mut fold_floor = FoldEpoch::INITIAL;
         // Test-only fault injection: if MOON_TEST_AOF_FSYNC_FAIL=1 is set in
         // the environment at writer task startup, every AppendSync ack resolves
         // as FsyncFailed instead of Synced. Read once before the loop so there
@@ -1705,7 +1732,11 @@ pub async fn per_shard_aof_writer_task(
                 );
                 // task #35: inject SELECT <db> records on db-context changes
                 // before this batch's framed writes go into batch_buf.
-                batch.data = inject_select_records(std::mem::take(&mut batch.data), &mut last_db);
+                batch.data = inject_select_records(
+                    std::mem::take(&mut batch.data),
+                    fold_floor,
+                    &mut last_db,
+                );
 
                 if !batch.data.is_empty() {
                     if write_error {
@@ -1827,33 +1858,35 @@ pub async fn per_shard_aof_writer_task(
                             &fold_producer,
                             &fold_notifier,
                             &mut last_db,
+                            fold_floor,
                         );
-                        if let Err(ref e) = fold_res {
-                            // The fold's ShardDoneGuard already marked the rewrite
-                            // failed and decremented on this error exit (committing
-                            // new_seq with a shard missing its new base would break
-                            // recovery), so do NOT decrement again here. `file` is left
-                            // on the OLD incr (error exits are pre-reopen).
-                            error!(
-                                "F6 per-shard rewrite: shard {} fold failed: {}. \
-                                 Rewrite aborted by the fold guard; old generation \
-                                 stays authoritative.",
-                                shard_id, e
-                            );
-                        }
+                        let outcome = match fold_res {
+                            Ok(outcome) => outcome,
+                            Err(e) => {
+                                // The fold's ShardDoneGuard already marked the
+                                // rewrite failed and decremented on this error exit
+                                // (committing new_seq with a shard missing its new
+                                // base would break recovery), so do NOT decrement
+                                // again here. `file` is still the OLD incr.
+                                error!(
+                                    "F6 per-shard rewrite: shard {} fold failed: {}. \
+                                     Rewrite aborted by the fold guard; old generation \
+                                     stays authoritative.",
+                                    shard_id, e
+                                );
+                                FoldOutcome::Aborted
+                            }
+                        };
+                        // #455: records folded into a committed base are dropped
+                        // wherever they surface from here on; an aborted fold
+                        // keeps the floor, so every record is written.
+                        fold_floor = outcome.floor_after(fold_floor);
                         // #452.1: drain channel backlog + spilled overflow into
                         // the committed incr, in order, before the EverySec
                         // post-fold drain below picks up anything newer.
-                        // On commit, pre-cut spills fold into the new base.
-                        // committed = Ok(true) ONLY (re-verify P0): an aborted
-                        // fold (Ok(false)) rolled back to the OLD incr and the
-                        // new base was pruned — pre-cut spills must be written.
-                        if let Err(e) = overflow.finish_framed(
-                            &rx,
-                            &mut file,
-                            &mut last_db,
-                            matches!(fold_res, Ok(true)),
-                        ) {
+                        if let Err(e) =
+                            overflow.finish_framed(&rx, &mut file, &mut last_db, fold_floor)
+                        {
                             error!(
                                 "F6 per-shard rewrite: shard {} overflow drain failed: {}",
                                 shard_id, e
@@ -1877,6 +1910,7 @@ pub async fn per_shard_aof_writer_task(
                                 &mut file,
                                 usize::MAX,
                                 &mut last_db,
+                                fold_floor,
                             ) {
                                 if let Err(e) = sync_and_fulfill_drain(
                                     &mut post_drain,

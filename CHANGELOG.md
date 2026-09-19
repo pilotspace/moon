@@ -199,6 +199,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ZRANGESTORE` checks its range before it looks up the source** (moon#1102),
+  the `ZRANGESTORE` sibling of moon#1060. A malformed rank, `BYSCORE` or
+  `BYLEX` bound against a missing source answered `:0` and deleted the
+  destination; against a source of another type it answered `WRONGTYPE`.
+  Redis parses the range first, so both now answer its parse error
+  (`min or max is not a float`, `min or max not valid string range item` or
+  `value is not an integer or out of range`), with or without `REV` and
+  `LIMIT`, and the destination is left alone.
+
 - **A `WAIT` queued inside `MULTI` no longer holds `EXEC` for its timeout**
   (moon#1098). Redis runs a transaction body with `CLIENT_DENY_BLOCKING`, so a
   queued `WAIT` answers the current replica ack count at once. Moon filled it
@@ -210,14 +219,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   paths. A `WAIT` outside `MULTI` still blocks as before. (`WAITAOF` is not
   implemented, so it has no queued form to fix.)
 
-- **`ZRANGESTORE` checks its range before it looks up the source** (moon#1102),
-  the `ZRANGESTORE` sibling of moon#1060. A malformed rank, `BYSCORE` or
-  `BYLEX` bound against a missing source answered `:0` and deleted the
-  destination; against a source of another type it answered `WRONGTYPE`.
-  Redis parses the range first, so both now answer its parse error
-  (`min or max is not a float`, `min or max not valid string range item` or
-  `value is not an integer or out of range`), with or without `REV` and
-  `LIMIT`, and the destination is left alone.
+- **The disk-offload checkpoint only publishes a redo point over heap pages it
+  has made durable** (moon#452 item 3). The fuzzy checkpoint pwrote dirty heap
+  pages and never fsynced a heap file, then published `redo_lsn` in the control
+  file and recycled every WAL segment below it — FullPageImages included. A
+  power loss after that recycle could roll a page back with nothing left in the
+  WAL to redo it. Four changes close the protocol:
+  - Finalize fsyncs every heap file the flush wrote before it writes the WAL
+    checkpoint record. The fsync runs on a helper thread and the shard thread
+    never waits for it: each tick polls the helper without blocking, and a
+    shard has at most one helper outstanding, so a hung disk leaves one stuck
+    thread rather than one per retry. Only the shutdown checkpoint, which
+    serves no clients any more, waits for that one helper, for at most
+    `WAIT_DURABLE_TIMEOUT` counted from the helper's start. The WAL-ceiling
+    checkpoint runs while the shard serves clients, so it never waits: it
+    leaves a pending fsync to the periodic tick, and its emergency recycle
+    cuts only below the redo point already published. A failed control-file
+    write no longer leaves the unpublished redo point in memory, where that
+    recycle would have cut below it. If a file cannot be opened, Finalize
+    retries with backoff. If an fsync returns an error, the shard never
+    publishes a redo point again, because a retried fsync can report success
+    for pages the kernel already dropped. The WAL above the last good redo
+    point is kept, and recovery replays from there.
+  - A heap file that no longer exists does not hold the redo point back. The
+    cold-tier GC unlinks a file once its last live key is gone, and only then;
+    nothing references it and no fsync can reach the unlinked inode. So the
+    checkpoint stops waiting on it, drops its pages from the dirty set, counts
+    it and logs it at debug. If the manifest still lists the file as live,
+    something other than the GC removed it: that is counted separately and
+    logged as an error. Without this, every Finalize failed on `NotFound` and
+    the WAL grew until the disk was full.
+  - Log before data, one WAL wait per batch: the flush appends the
+    FullPageImage of every page in the batch, waits once for the WAL to be
+    durable through the batch's highest LSN, and only then overwrites the
+    pages in place. The flush used to collect every image and append them
+    only after the whole batch had been pwritten, into the WAL writer's memory
+    buffer. A crash during the pwrite left a torn page and no image of it
+    anywhere.
+  - A page that fails any flush step (its image, the WAL wait, or its write)
+    makes the checkpoint flush again, keeping its redo point. Before, the page
+    was counted as flushed and the checkpoint finalized over a change that was
+    on disk in neither the heap nor the WAL.
+
+  No production path marks a heap page dirty today (`PageCache::mark_dirty`
+  has no callers outside tests), so this closes the hazard before the first
+  in-place cold-page write can reach it. Pinned by the tests in
+  `shard::persistence_tick::checkpoint_tick_tests`,
+  `persistence::data_file_sync` and `persistence::page_cache`.
+
+- **An AOF rewrite no longer replays a write twice, and a rewrite that fails
+  late no longer leaves the writer appending to a deleted file** (moon#455).
+  - **Double apply.** A rewrite split the append stream by position: whatever
+    reached the writer after its snapshot went into the new incr. A write
+    whose record arrives after the snapshot while its effect is already in the
+    snapshot was therefore replayed on top of the new base after a restart. An
+    `INCR` came back incremented twice, an `LPUSH` pushed twice. Records reach
+    the writer late when the producer awaits between the mutation and the
+    enqueue: an `EXEC` whose body holds `WAIT`, `CONFIG` or another connection
+    intercept, the local half of a multi-shard `FLUSHDB`/`FLUSHALL` (which
+    could then wipe writes the base had taken after it), the local slice of a
+    multi-shard `MSET`, or any producer parked on a full AOF channel. Every
+    record now carries the rewrite epoch in force when its mutation ran. Once
+    a rewrite takes effect, the writer drops each record stamped before that
+    rewrite's snapshot, wherever the record surfaces. An aborted rewrite drops
+    nothing. `INFO persistence` counts the dropped records as
+    `aof_rewrite_late_records_folded`.
+  - **Late failure.** The writer opened the new incr only after the manifest
+    had switched to it. If that open failed, the rewrite was reported aborted
+    while the manifest named the new generation, and the writer kept
+    appending, and fsyncing, into the old incr the switch had deleted. Nothing
+    it wrote after that could be recovered. The new incr is now opened before
+    the manifest switches, so every failure leaves the old generation
+    committed and the writer on it. A failed manifest write also no longer
+    advances the in-memory sequence past the one on disk.
+  - **SWAPDB during a rewrite.** `SWAPDB` logged its record, awaited, and
+    only then swapped. A rewrite that snapshotted in that gap had a base
+    without the swap and dropped (or folded into the old incr) the record, so
+    the acknowledged `SWAPDB` was gone after a restart. The record is now
+    enqueued, the swap applied and the replication record emitted in one
+    synchronous step; while the AOF channel is full, `SWAPDB` waits for room
+    without holding its record, and is refused unapplied after
+    `--aof-fsync-timeout-ms`. Under `appendfsync always` the fsync is now
+    confirmed after the swap, so an fsync failure is reported on a swap that
+    stays applied on every shard, like any other `always` write.
+  - **Directory fsyncs.** A per-shard rewrite created the new incr after its
+    last fsync of the shard directory, and the tokio `--shards 1` rewrite
+    renamed its new file into place without a directory fsync. After a power
+    loss the committed manifest could name a missing incr, or the old
+    `appendonly.aof` could return, losing every record written after the
+    rewrite. Both directories are now fsynced before the new file is used.
+
+- **A COLD vector segment leaves `unloaded` with the search that reloads it,
+  and a delete that lands while the reload is waiting to install is no longer
+  lost** (moon#1070). Since the off-loop reload pool (prod-hardening #18) a
+  search only SUBMITTED the reload and answered from it; the reloaded segment
+  sat in the pool until some later search installed it, while the COLD stub
+  stayed the index's segment and the only place a DEL could be recorded. The
+  install then threw the stub away without replaying it: a document deleted
+  after the first search came back, as `vec:<id>`, on the next one (reproduced
+  on a real server). The install now replays the stub's tombstones, and the
+  yielding FT.SEARCH handlers install finished reloads as soon as the query
+  that awaited them is back on the shard, so `FT.INFO unloaded_segments` drops
+  to 0 with that search. Four `tests/vector_idle_unload.rs` tests that were
+  `#[ignore]`d -- and silently red on main -- now run in CI; only the
+  `ps`-based RSS measurement stays ignored.
 
 - **A restart no longer re-issues a cold-tier file id, which could apply a
   write twice** (moon#1067). A restart resumes the shard's cold file-id
