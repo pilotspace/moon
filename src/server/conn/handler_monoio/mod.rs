@@ -3158,7 +3158,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // ascending, hands the closure (src, dst).
                         Ok((key, dst_db)) => crate::shard::slice::with_shard(|s| {
                             s.databases.with_pair(src_db, dst_db, |src, dst| {
-                                ksmv::move_core(src, dst, &key)
+                                let reply = ksmv::move_core(src, dst, &key);
+                                // moon#1069: the key now exists in `dst_db`.
+                                crate::blocking::wakeup::wake_cross_db_write(
+                                    &ctx.blocking_registry,
+                                    dst,
+                                    dst_db,
+                                    &key,
+                                    &reply,
+                                );
+                                reply
                             })
                         }),
                     };
@@ -3241,7 +3250,22 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             // `with_pair`'s distinct-db assert cannot fire.
                             Ok(ca) => crate::shard::slice::with_shard(|s| {
                                 s.databases.with_pair(src_db, ca.dst_db, |src, dst| {
-                                    ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
+                                    let reply = ksmv::copy_core(
+                                        src,
+                                        dst,
+                                        &ca.src_key,
+                                        &ca.dst_key,
+                                        ca.replace,
+                                    );
+                                    // moon#1069: the copy now exists in `dst_db`.
+                                    crate::blocking::wakeup::wake_cross_db_write(
+                                        &ctx.blocking_registry,
+                                        dst,
+                                        ca.dst_db,
+                                        &ca.dst_key,
+                                        &reply,
+                                    );
+                                    reply
                                 })
                             }),
                         };
@@ -3518,42 +3542,51 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
                         // Blocking wakeup: re-borrow db by index (NLL)
                         //
-                        // moon#942: the gate is `producer_family` — the SAME
-                        // predicate `wake_producer` opens with — asked BEFORE
-                        // the guard rather than inside it. `producer_family`
-                        // needs only the command NAME, so the exclusive guard
-                        // below was previously acquired on every successful
-                        // write merely to discover there was nothing to wake:
-                        // it returns `None` for `INCR`, `SADD` and `HSET`,
-                        // three of the five families moon#942 targets. The set
-                        // of `wake_producer` calls is unchanged; only the
-                        // no-op guard acquisitions are gone.
+                        // moon#942: the gate is `ready_keys` — the SAME
+                        // predicate `wake_written_keys` opens with — asked
+                        // BEFORE the guard rather than inside it. It needs only
+                        // the registry and the argv, so the exclusive guard
+                        // below is acquired only when a key this write touched
+                        // has a client parked on it; before moon#942 it was
+                        // taken on every successful write merely to discover
+                        // there was nothing to wake.
                         //
-                        // It MUST stay `producer_family` and must never become
-                        // a hand-written list of command names. A gate that
-                        // disagrees with `wake_producer`'s own is a lost
-                        // wakeup that depends on which shard owns the key, so
-                        // it reads as a flake rather than as a bug — that is
-                        // moon#595 (this gate omitted XADD, so a stream reader
-                        // blocked on a key THIS shard owns was never woken by
-                        // a local write, while the same XADD arriving over
-                        // SPSC woke it) and moon#623 (ten open-coded copies of
-                        // the same test, two of which disagreed). Pinned by
-                        // `tests/wakeup_local_write_gate.rs` at 1 and 4 shards.
-                        if !is_error && crate::blocking::wakeup::producer_family(cmd).is_some() {
-                            // L4: fresh guard on the POST-dispatch db (a
-                            // queued SELECT may have moved it). The write-path
-                            // guard above was dropped after `dispatch`, so
-                            // this cannot be a recursive acquisition even when
-                            // `new_sel_db == sel_db`.
-                            let mut wake_guard = s.databases.write(new_sel_db);
-                            crate::blocking::wakeup::wake_producer(
-                                &ctx.blocking_registry,
-                                &mut wake_guard,
+                        // It MUST stay `ready_keys` and must never become a
+                        // hand-written list of command names. A gate that
+                        // disagrees with the hook's own is a lost wakeup that
+                        // depends on which shard owns the key, so it reads as a
+                        // flake rather than as a bug — that is moon#595 (this
+                        // gate omitted XADD, so a stream reader blocked on a
+                        // key THIS shard owns was never woken by a local
+                        // write, while the same XADD arriving over SPSC woke
+                        // it), moon#623 (ten open-coded copies of the same
+                        // test, two of which disagreed) and moon#1069 (a gate
+                        // of six "producer" names, so RENAME/COPY/SORT STORE/
+                        // ZUNIONSTORE/... woke nobody). Pinned by
+                        // `tests/wakeup_local_write_gate.rs` and
+                        // `tests/blocking_ready_key_wake.rs` at 1 and 4 shards.
+                        if !is_error {
+                            let ready = crate::blocking::wakeup::ready_keys(
+                                &ctx.blocking_registry.borrow(),
                                 new_sel_db,
                                 cmd,
                                 cmd_args,
                             );
+                            if !ready.is_empty() {
+                                // L4: fresh guard on the POST-dispatch db (a
+                                // queued SELECT may have moved it). The
+                                // write-path guard above was dropped after
+                                // `dispatch`, so this cannot be a recursive
+                                // acquisition even when `new_sel_db == sel_db`.
+                                let mut wake_guard = s.databases.write(new_sel_db);
+                                let mut reg = ctx.blocking_registry.borrow_mut();
+                                crate::blocking::wakeup::wake_keys(
+                                    &mut reg,
+                                    &mut wake_guard,
+                                    new_sel_db,
+                                    ready,
+                                );
+                            }
                         }
 
                         Ok((result, new_sel_db, hset_inserts))

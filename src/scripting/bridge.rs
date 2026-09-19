@@ -700,6 +700,12 @@ pub fn make_redis_call_fn(
             // normal read-write script).
             if cmd_is_write && !matches!(frame, Frame::Error(_)) {
                 eviction_ctx.emit_effect(db_idx, &frames, &frame);
+                // moon#1069: a key this write created may have a client blocked
+                // on it. Recorded, not served: the waiters see the script's
+                // result once it has finished, exactly as redis serves its
+                // ready keys after EVAL returns, and this closure has neither
+                // the registry nor a way to reach another database.
+                crate::blocking::wakeup::note_script_write(db_idx, &cmd_bytes, &frames[1..]);
             }
 
             Ok(frame)
