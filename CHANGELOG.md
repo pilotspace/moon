@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`CLIENT TRACKINGINFO` and `CLIENT GETREDIR`** (refs moon#632), matching
+  redis 8.6.1 byte for byte: flags (`on`/`off`, `bcast`, `optin`,
+  `caching-yes`, `optout`, `caching-no`, `noloop`, `broken_redirect`), the
+  redirect id (`0` for none, `-1` with tracking off) and the sorted BCAST
+  prefixes; a map with a set of flags under RESP3. Both, and `CLIENT CACHING`
+  (moon#1049), are published in `COMMAND` and `CLIENT HELP` and queue inside
+  `MULTI`.
+
 - **Six sorted-set commands that were `unknown command`, and `ZADD ... INCR`**
   (moon#959). `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZREMRANGEBYRANK`,
   `ZREMRANGEBYSCORE`, `ZREMRANGEBYLEX` and `ZDIFFSTORE` are implemented, wired
@@ -230,6 +238,179 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CI's per-PR `Test (graph)` step now also runs the recovery/replay unit tests
   and `tests/graph_wal_kv_authority_1018.rs` under `runtime-tokio` + `graph`,
   a combination no per-PR leg built before. It adds ~19 s.
+
+- **`CLIENT TRACKING ... REDIRECT <id>` now reaches its target, and
+  `CLIENT CACHING` works** (moon#1048, moon#1049). Every wire reply below was
+  read off redis-server 8.6.1 over a raw socket first.
+  - REDIRECT (the RESP2 client-side-caching pattern): a target subscribed to
+    `__redis__:invalidate` received nothing, for a write, an expiry, a BCAST
+    match or a `FLUSHALL`. It now gets `*3 message __redis__:invalidate
+    *1 <key>` (a flush sends a null payload); a RESP3 target gets the
+    `invalidate` push. `REDIRECT` to an id that does not exist (or `0`, or a
+    negative id) is refused with `-ERR The client ID you want redirect to does
+    not exist`, and when the target disconnects a RESP3 source is told
+    `tracking-redir-broken <id>` and `CLIENT TRACKINGINFO` reports
+    `broken_redirect`. Invalidations reach a target on any shard.
+  - `CLIENT CACHING yes|no` answered "unknown subcommand", so OPTIN tracked
+    every read and OPTOUT could opt out of none. It is implemented with redis's
+    errors and its one-command lifetime: the flag covers the NEXT command (or
+    the whole next transaction), survives other `CLIENT` subcommands and an
+    open `MULTI`, and is consumed by anything else — an unknown command
+    included.
+  - Reads inside `MULTI`/`EXEC` are now tracked, as redis tracks them; before
+    this only a transaction's writes invalidated. Each read is tracked under
+    the modes in force at its own position in the body: a `CLIENT CACHING`
+    queued mid-body covers only the commands after it, and a
+    `CLIENT TRACKING on` queued in the body tracks the reads after it — on
+    the local and the routed EXEC path alike.
+  - A REDIRECT target's invalidations are framed for the protocol it speaks
+    now (a `HELLO` or `RESET` since it first subscribed is honoured), and a
+    target that has unsubscribed from everything gets nothing, as in redis,
+    instead of collecting invalidations that its next `SUBSCRIBE` replayed.
+  - `CLIENT TRACKING` option errors now follow redis: an unknown option is
+    `syntax error`, `OPTIN` with `OPTOUT` and either with `BCAST` are refused,
+    switching OPTIN/OPTOUT or BCAST without turning tracking off first is
+    refused, a second `REDIRECT` is refused, overlapping BCAST prefixes are
+    refused, and re-enabling tracking replaces the redirect and flags instead
+    of being silently ignored.
+  - A RESP2 connection with tracking on (and no redirect) no longer has a
+    RESP3 `>` push frame written into its reply stream; redis sends it nothing.
+  - A RESP3 connection that tracks and is also subscribed now receives its
+    invalidations while idle; on the monoio runtime they waited until it
+    unsubscribed.
+  - Known gap: a RESP3 redirect target that neither subscribed nor enabled
+    tracking itself cannot be reached (redis pushes to it); giving every
+    connection a delivery channel would cost every idle connection its park
+    (moon#1078). Also still open: a burst of more than 256 invalidations to
+    one connection drops the excess silently (moon#1088), and writes and
+    reads made by scripts are invisible to tracking (moon#1089).
+
+- **`blocking_spanning_claim` bsc8 no longer fails its precondition on
+  Linux when a waiter lands on its key's owner** (moon#1083). The test raced
+  one waiter connection per owner shard and required at least `SHARDS - 1`
+  of the four races to happen. Only a waiter on a REMOTE owner can race,
+  because a waiter on its own owner has no claim token and unregisters as
+  soon as it sees the disconnect. That requirement holds on macOS, where
+  every connection lands on one shard. On Linux each connection is placed on
+  its own (the kernel's `SO_REUSEPORT` hash, or the central listener's
+  round-robin), so two local owners in one sequence failed the run. Measured
+  in a Linux container: 6/10 failures on both `origin/main` and #1045's
+  own tested head `80885575`. #1045's own dispatch showed it too: `TRY 1
+  FAIL`, then `FLAKY 2/3`. It was not the merge. The test now tries up to 8
+  fresh connections per owner until one lands on another shard, and keeps
+  the same `SHARDS - 1` precondition. It passed 20/20 on Linux against the
+  same binary. It still fails when the settle window is not held open ("0 of
+  4 owners … 8 connections each"). Against the old restore server
+  (`ffacf2ef`) it fails with 8/8 SERVE UNDONE: the correctness assertion
+  now runs before the precondition, where the old test could report "only 2
+  of 4" instead. Test only; the server is unchanged.
+
+- **`test`/`ci`: `cargo test --release --lib` is green on `main` again — five
+  `CONFIG SET` tests were permanently leaking a published `maxmemory` into every
+  test that ran after them, and the CI waiver hiding it is retired
+  (moon#856).** Not a race, as it had been read for months, but a PERMANENT leak
+  through PRODUCTION code: `config_set` publishes to five process-global atomics
+  on the `CONFIG SET` path (`MAXMEMORY_GLOBAL`, `MAXMEMORY_HINT`,
+  `MAXMEMORY_PER_SHARD_HINT`, `MAXMEMORY_POLICY_GLOBAL`, `DB_MAXMEMORY_ANY_SET`)
+  and the tests driving it never put them back. Under `cargo test --lib` — one
+  process for the whole suite, unlike nextest's process-per-test — whichever test
+  later READ that state failed, which is why the victim
+  (`scripting::bridge::tests::gate_is_skipped_with_spill_sender_when_no_limit_is_configured`)
+  looked order-dependent while the cause was not. Measured on `a8eb2efc`: 5558
+  passed / 1 failed before, 5559 / 0 after; each of the five writers was proven
+  individually sufficient by running it alone with the victim under
+  `--test-threads=1`, and `-- --skip command::config` passed 5541 / 0 as the
+  attribution control. A `#[cfg(test)]` `PublishedLimits` RAII guard in
+  `storage::eviction` now snapshots all five and restores them on `Drop` —
+  including the UNWIND path, which the three tests that restored manually at the
+  end of their bodies did not cover, so a mid-body panic there leaked worse than
+  never restoring at all. The `command::config` tests call through a
+  `config_set_scoped` helper, and a module-local shadow of the glob-imported
+  `config_set` makes reaching the unguarded publisher from that module
+  impossible rather than merely discouraged. `scripts/libtest-singleproc-gate.sh`
+  no longer waives anything (`LIBTEST_KNOWN_FAILURES=0`, `LIBTEST_KNOWN_FAILURE`
+  empty); its self-test gains "the retired waiver no longer waives moon#856's
+  victim" plus three cases that re-arm the waiver mechanism through the
+  environment and prove it still grants and still refuses. The victim's
+  100-attempt retry loop — what let a deterministic leak read as a flake — is
+  deleted in favour of a single assertion that names the state it observed.
+
+- **`MOVE` and `COPY ... DB n` queued inside `MULTI` now run at `EXEC`, into
+  the database they name** (moon#1062). The transaction executors sent every
+  queued command to the single-db dispatch, which cannot reach a second
+  database. `MOVE` answered `-ERR MOVE requires handler-level dispatch` in its
+  slot. `COPY a b DB 4` was worse: it answered `:1`, wrote `b` into the SOURCE
+  db, and logged the command verbatim, so a replica (and AOF replay, once
+  moon#1046 lands) put `b` in db 4 while the master had it in db 0. Every
+  executor now runs both commands against both databases with the same
+  helpers as the live paths: the sharded one on monoio and tokio, the
+  owner-routed `TxnExecute`, and the embedded `handler_single` one. A `SELECT`
+  queued earlier in the body chooses the source db. Only a `:1` is logged,
+  verbatim, under the source db, which is the record the live paths already
+  write.
+
+  In the same family, redis 8.6.1's replies now come back on every path. `MOVE
+  key <current db>` answers `ERR source and destination objects are the same`
+  (it answered `:0`). A negative or too-large db index answers `ERR DB index is
+  out of range` for both `MOVE` and `COPY` (they answered `ERR value is not an
+  integer or out of range` and `ERR invalid DB index`). `COPY k k` gives the
+  same-object error even when `k` is missing.
+
+  **Cross-shard `COPY ... DB n` is refused.** At `--shards > 1`, `COPY src dst
+  DB n` whose two keys hash to different shards was routed by `src` alone, and
+  `dst` was written into `src`'s shard. There, no normally routed read could
+  see it: 24 of 24 constructed split placements acked `:1` and read back nil,
+  and the AOF recorded them on the wrong shard. It now answers the two-key-write
+  `CROSSSLOT` error, as `RENAME` does. A `{hash}` tag co-locates the keys, and
+  `COPY` without a `DB` clause still works across shards.
+
+- **The cold-index rebuild no longer drops entries silently, and an
+  indexed-but-unreadable cold entry is no longer a "miss" in code**
+  (moon#875). `ColdIndex::rebuild_from_manifest_per_db` skipped a heap file
+  that failed to read (any `io::Error`), a page that failed its magic/type/CRC
+  check, and a trailing partial page (`chunks_exact` discards the remainder)
+  with no log line, no counter and no error — and every entry lost that way
+  then read as an ABSENT key, indistinguishable to a client from one that was
+  never written. Two more silent paths were found on the way: a slot inside a
+  CRC-valid page that does not decode (an unknown `ValueType`, i.e. a
+  downgrade), and a file truncated on a page boundary, which no per-page check
+  can see. Every one is now counted by cause (`INFO` →
+  `reclamation_cold_recovery_{files_missing,files_unreadable,files_short,pages_rejected,partial_page_bytes,entries_rejected}_total`),
+  logged with the `file_id` and page, and rolled into one per-shard summary
+  that says `cold index rebuild clean` or `cold index rebuild DEGRADED`. A
+  valid `KvOverflow` page — which `KvLeafPage::from_bytes` also rejects — is
+  classified from its header first and is NOT counted as loss. The decision
+  per class: a `NotFound` file (the orphan sweep's unlink-before-commit crash
+  window, or external removal) is warned about and queued so the sweep
+  retires its manifest entry instead of re-warning on every boot; any other
+  read error is logged at `error` and the file is skipped, never tombstoned,
+  so a restart after the operator fixes it recovers the keys (a recovery
+  `Err` today falls back to v2 recovery, which would discard the whole v3
+  replay — refusing to boot needs a path shard init does not have yet, left
+  as a follow-up); corrupt pages, partial pages and undecodable slots are
+  bytes that are gone, so they are counted and logged. On the read side,
+  `ColdReadOutcome` gained `Unreadable(ColdReadFault)`: `Miss` now means only
+  "no index entry", and a read whose index entry points at bytes that cannot
+  be produced is counted (`reclamation_cold_read_unreadable_total`), logged
+  with its location, and leaves the index entry in place so a later read
+  heals. **At the wire such a key now answers `-IOERR cold tier: key is
+  indexed but its data could not be read (see server log)` instead of nil**,
+  on both dispatch paths: the fabricating accessors (`get_or_create*` and
+  their compact siblings), `INCR*`/`INCRBYFLOAT`, `APPEND`, `SETRANGE`,
+  `GETSET` and `SET … GET|KEEPTTL` refuse BEFORE mutating — previously
+  `INCR` minted a counter from zero and `HSET`/`LPUSH`/… fabricated a fresh
+  value that shadowed the cold copy until the orphan sweep reclaimed it for
+  good — and a dispatch-boundary gate turns every remaining `Database::get`-
+  shaped reply into the error (one relaxed load per command). `EXISTS`,
+  `DBSIZE` and `TYPE` keep reporting the key present, plain `SET` still
+  overwrites (it never reads the old value) and `DEL` discards: the two
+  escape hatches. Proved two ways against the pre-fix binary at `--shards 1`
+  and `4`: (a) a real spill → `BGREWRITEAOF` → `SIGKILL` → on-disk damage →
+  restart lifecycle, where the four damaged keys answered nil with nothing in
+  `INFO` or the log and now come with the counters and the file ids; (b) a
+  file removed and another `chmod 000` under the RUNNING server, where
+  `GET` answered `$-1` for an indexed key and now answers `-IOERR`, `APPEND`
+  and `INCR` are refused, and after `chmod 644` the ORIGINAL value is served.
 
 - **An acknowledged `MOVE` or `COPY src dst DB n` survives `kill -9` and
   restart** (moon#1046). Both commands need two databases, so the live paths
@@ -711,6 +892,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CH` as a did-anything-change signal silently skipped those updates. Fixed on
   both the listpack and B+tree arms, which carried separate copies.
 ### Security
+
+- **`rustls` bumped past RUSTSEC-2026-0285 / GHSA-2mjx-qc3c-rqvc** ("TLS 1.3
+  handshake messages incorrectly accepted across encryption level
+  boundaries"), 0.23.44 → 0.23.45 in `Cargo.lock` (and 0.23.37 → 0.23.45 in
+  `fuzz/Cargo.lock`, which was independently behind). moon's TLS path uses
+  rustls directly and through the vendored `vendor/monoio-rustls`, whose
+  `Cargo.toml` already declared `rustls = "~0.23.4"` — wide enough to admit
+  the patched release without a manifest change. `cargo audit` and
+  `cargo deny check advisories licenses bans sources` are clean on
+  `Cargo.lock`, and both TLS integration suites
+  (`tests/tls_idle_downshift_parity.rs`, `tests/tls_park_keyupdate.rs` — 4
+  tests) pass against a fresh binary on both the monoio and
+  `runtime-tokio,jemalloc` builds. `cargo audit`'s own `.cargo/audit.toml`
+  ignore for RUSTSEC-2026-0097 (rand < 0.9.3, aka GHSA-cq8v-f236-94qc — the
+  same advisory as the `rand` Dependabot alert below) is now moot since
+  `rand` is 0.9.3+ in `Cargo.lock`, so it was removed rather than left as
+  stale documentation. Also picked up while re-locking: the yanked
+  `chacha20` 0.10.0 (pulled in transitively via `rand`) to 0.10.2, in both
+  `Cargo.lock` and `fuzz/Cargo.lock`.
+
+- **Dependabot alerts on `console/pnpm-lock.yaml`, `Cargo.lock` and
+  `fuzz/Cargo.lock` cleared with minimal, scoped bumps.** `js-yaml` (4.3.0 →
+  4.3.2, GHSA-2883-xcg3-v3hh / GHSA-5p4m-2wfm-xmqj), `baseline-browser-mapping`
+  (2.10.43 → 2.11.25, GHSA-w5vr-8v7q-w6rv), `fflate` (0.8.2 → 0.8.3 and
+  0.6.10 → 0.6.11, GHSA-px8p-9vwx-vf98), `@humanfs/node` (0.16.7 → 0.16.8,
+  GHSA-p498-v437-472g), `browserslist` (4.28.6 → 4.29.0, GHSA-73wf-gq98-2v4g),
+  `react-router` (7.18.1 → 7.18.4, GHSA-qwww-vcr4-c8h2), `dompurify` (3.4.12 →
+  3.4.15, GHSA-55q2-fjhq-7xh7) and `postcss` (8.5.15 → 8.5.28,
+  GHSA-fxqj-rqcc-2cmp / GHSA-r28c-9q8g-f849) are all transitive dev/runtime
+  deps several levels deep behind `eslint`, `vite`, `@react-three/drei`,
+  `@vitejs/plugin-react`, `react-router-dom` and `@cosmos.gl/graph`; each is
+  pinned via a version-bounded `pnpm.overrides` entry rather than an
+  unconstrained bump, so no direct dependency's declared range and no major
+  version moved (an unbounded override on `react-router` first resolved to
+  the incompatible 8.x line and was re-bounded to `<8`). `rand` (0.9.2 →
+  0.9.3 in `Cargo.lock`, pulled in via `metrics-util`; 0.10.0 → 0.10.1 in
+  `fuzz/Cargo.lock`, GHSA-cq8v-f236-94qc) via `cargo update -p rand
+  --precise`. `nltk` (`sdk/python/uv.lock`, GHSA-8mgp-746c-j5xp, no patched
+  version exists upstream) is left as-is: it reaches the SDK only
+  transitively through the optional `moondb[llamaindex]` extra's
+  `llama-index-core` dependency, which imports only
+  `nltk.tokenize.PunktSentenceTokenizer`, `nltk.corpus.stopwords`,
+  `nltk.data.find` and `nltk.download` — never the vulnerable model-artifact
+  APIs (`TransitionParser.train`/`parse`, `AveragedPerceptron.save`/`load`,
+  `PerceptronTagger.save_to_json`, `save_maxent_params`), and the advisory's
+  own PoC additionally requires the consumer to opt into
+  `nltk.pathsec.ENFORCE=True`, which neither moondb nor llama-index-core sets.
 
 - **Subcommand ACL rules are now enforced** (moon#1030). `+@all -config|set`
   was accepted, listed and saved, but the permission check only ever looked up

@@ -548,6 +548,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
             break;
         }
 
+        // CLIENT TRACKING REDIRECT inbox: registered only while subscribed,
+        // framed for the current protocol. Every UNSUBSCRIBE, RESET and HELLO
+        // path has run by here, before the connection waits again.
+        conn.sync_tracking_inbox(&ctx.tracking_table);
+
         // Subscriber mode: bidirectional select on client commands + published messages.
         //
         // RESP2 ONLY. Under RESP3 a subscribed connection stays in the normal
@@ -1049,6 +1054,22 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // above documents; the pre-park sizing re-arms it.
                     delivery = msg.ok();
                 }
+                // A RESP3 subscriber can ALSO be tracking. It parks here, not
+                // in the tracking select below, so its own invalidations must
+                // be read here too — they used to wait until it unsubscribed
+                // (redis 8.6.1 pushes them at once). Pending when not tracking.
+                push = async {
+                    match conn.tracking_rx {
+                        Some(ref trx) => trx.recv_async().await.ok(),
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(frame) = push {
+                        let mut push_buf = BytesMut::new();
+                        crate::protocol::serialize_resp3(&frame, &mut push_buf);
+                        delivery = Some(push_buf.freeze());
+                    }
+                }
             }
             if let Some(data) = delivery {
                 if !write_all_bounded!(
@@ -1145,6 +1166,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
             }
             if let Some(frame) = push_frame {
+                // A RESP2 connection cannot carry a push; redis writes it
+                // nothing (its invalidations reach it only as a REDIRECT
+                // target, through the pub/sub channel).
+                if !crate::tracking::client_cmd::push_deliverable(conn.protocol_version) {
+                    continue;
+                }
                 let mut push_buf = BytesMut::new();
                 crate::protocol::serialize_resp3(&frame, &mut push_buf);
                 if !write_all_bounded!(
@@ -1804,6 +1831,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     continue;
                 }
             };
+            // CLIENT CACHING covers exactly the next command (moon#1049).
+            // Before every intercept, so an unknown or refused command
+            // consumes the flag exactly as redis's resetClient does.
+            conn.tracking_state.before_command(cmd, conn.in_multi);
 
             // Every intercept below answers through `shaped!()`, never through
             // `responses` directly: an intercept short-circuits the dispatch exit
@@ -2792,7 +2823,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // A tracking client registers the READ's keys once, for the
                     // whole command — same contract as the coordinator branch
                     // and as a remote single-key read.
-                    if conn.tracking_state.enabled && !conn.tracking_state.bcast {
+                    if conn.tracking_state.tracks_reads() {
                         crate::tracking::invalidation::track_read_keys(
                             &ctx.tracking_table,
                             cmd,
@@ -3116,13 +3147,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     use crate::command::keyspace::move_cmd as ksmv;
                     let src_db = conn.selected_db;
                     let db_count = ctx.shard_databases.db_count();
-                    let response = match ksmv::parse_move_args(cmd_args, db_count) {
+                    // `resolve_move` refuses `dst_db == src_db` with redis's
+                    // same-object error (moon#1062).
+                    let response = match ksmv::resolve_move(cmd_args, src_db, db_count) {
                         Err(e) => e,
-                        Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
                         // L4: `with_pair` is the exact contract
                         // `with_two_slice_dbs` had — asserts the indexes
-                        // differ (the `dst_db == src_db` arm above
-                        // short-circuits), panics out of range, acquires
+                        // differ (`resolve_move` never yields
+                        // `dst_db == src_db`), panics out of range, acquires
                         // ascending, hands the closure (src, dst).
                         Ok((key, dst_db)) => crate::shard::slice::with_shard(|s| {
                             s.databases.with_pair(src_db, dst_db, |src, dst| {
@@ -3825,10 +3857,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
                     // Track every key of a successful local read (MGET a b
                     // must track both, not just the first).
-                    if conn.tracking_state.enabled
-                        && !conn.tracking_state.bcast
-                        && !matches!(response, Frame::Error(_))
-                    {
+                    if conn.tracking_state.tracks_reads() && !matches!(response, Frame::Error(_)) {
                         crate::tracking::invalidation::track_read_keys(
                             &ctx.tracking_table,
                             cmd,
@@ -3954,8 +3983,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // tracking registration, RESP3 shaping, workspace prefix
                         // stripping. A fast path that skipped any of these would
                         // answer differently from the slow path it replaces.
-                        if conn.tracking_state.enabled
-                            && !conn.tracking_state.bcast
+                        if conn.tracking_state.tracks_reads()
                             && !matches!(response, Frame::Error(_))
                         {
                             crate::tracking::invalidation::track_read_keys(
@@ -4007,7 +4035,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // Remote READ by a tracking client: register the keys now
                 // (Redis tracks reads even for missing keys, so registering
                 // before the reply is faithful).
-                if conn.tracking_state.enabled && !conn.tracking_state.bcast {
+                if conn.tracking_state.tracks_reads() {
                     crate::tracking::invalidation::track_read_keys(
                         &ctx.tracking_table,
                         cmd,

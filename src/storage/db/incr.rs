@@ -255,12 +255,15 @@ impl Database {
     /// older spilled body. The only caller is the `else` arm of the `get_mut`
     /// in [`Database::incr_string`], which has just looked.
     fn incr_absent(&mut self, key: &[u8], delta: i64, now_ms: u64, now_secs: u32) -> IncrOutcome {
-        if self.promote_cold_known_absent(key, now_ms) {
+        if self.promote_cold_known_absent(key, now_ms) || self.cold_fault_pending() {
             // The key was in the cold tier or on the in-flight spill plane and
             // is hot again. Its real value is whatever was promoted, which is
             // emphatically not zero — hand it to the general path, which
             // re-reads it. Rare by construction (a counter has to have been
             // evicted first) and correctness, not speed, decides it.
+            // moon#875: same exit when the cold copy is indexed but
+            // UNREADABLE — the general path answers `-IOERR` instead of
+            // minting a counter from zero over bytes it could not read.
             return IncrOutcome::NotHot;
         }
 
