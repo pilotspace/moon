@@ -350,6 +350,16 @@ pub fn live_handle(id: u64) -> Option<Arc<ClientLiveState>> {
     stripe(id).read().get(&id).map(|e| Arc::clone(&e.live))
 }
 
+/// Whether a connection with this id is currently connected.
+///
+/// `CLIENT TRACKING ... REDIRECT <id>` needs exactly this answer twice: at
+/// registration (redis refuses an id that does not exist) and when an
+/// invalidation cannot reach the target (a vanished target is a BROKEN
+/// redirect, one that exists but cannot receive is not).
+pub fn is_registered(id: u64) -> bool {
+    stripe(id).read().contains_key(&id)
+}
+
 /// Deregister a client connection.
 pub fn deregister(id: u64) {
     if let Some(entry) = stripe(id).write().remove(&id) {
