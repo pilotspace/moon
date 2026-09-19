@@ -1302,7 +1302,19 @@ fn evict_batch_durable(
         }
 
         let file_id = completion.file_entry.file_id;
-        manifest.add_file(completion.file_entry);
+        if let Err(e) = manifest.add_file(completion.file_entry) {
+            // Unreachable while the id seed holds (moon#997/#893): the spill
+            // writer refuses to overwrite an existing file first. If it ever
+            // happens, the manifest keeps the entry that describes the file on
+            // disk, and these keys stay hot rather than point at it.
+            warn!(
+                file_id,
+                error = %e,
+                "kv_spill: manifest already lists this spill file id; retaining hot \
+                 values for this batch"
+            );
+            continue;
+        }
         if let Err(e) = manifest.commit() {
             warn!(
                 file_id,
