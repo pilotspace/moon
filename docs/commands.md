@@ -42,14 +42,21 @@ Per-field return code on the TTL commands: `-2` = no such field, `-1` = no TTL, 
 
 !!! note
     Blocking commands (`BLPOP`, `BRPOP`, `BLMOVE`) support timeouts and cross-shard wakeup.
+    A multi-key `BLPOP`/`BRPOP`/`BZPOPMIN`/`BZPOPMAX` works at any shard count, with keys
+    on any shards: it pops exactly one element, from the first non-empty key in argument
+    order, as standalone Redis does. `BLMPOP`/`BZMPOP` whose keys span shards are refused
+    with `CROSSSLOT`, like `LMPOP`/`ZMPOP`; co-locate their keys under one `{hash}` tag.
 
 ## Sets (15)
 
 `SADD`, `SREM`, `SMEMBERS`, `SCARD`, `SISMEMBER`, `SMISMEMBER`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SRANDMEMBER`, `SPOP`, `SSCAN`
 
-## Sorted sets (21)
+## Sorted sets (35)
 
-`ZADD`, `ZREM`, `ZSCORE`, `ZCARD`, `ZINCRBY`, `ZRANK`, `ZREVRANK`, `ZPOPMIN`, `ZPOPMAX`, `ZSCAN`, `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZRANGEBYLEX`, `ZCOUNT`, `ZLEXCOUNT`, `ZUNIONSTORE`, `ZINTERSTORE`, `BZPOPMIN`, `BZPOPMAX`
+`ZADD`, `ZREM`, `ZSCORE`, `ZCARD`, `ZINCRBY`, `ZRANK`, `ZREVRANK`, `ZPOPMIN`, `ZPOPMAX`, `ZSCAN`, `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZCOUNT`, `ZLEXCOUNT`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYLEX`, `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE`, `ZRANGESTORE`, `ZDIFF`, `ZUNION`, `ZINTER`, `ZINTERCARD`, `ZMSCORE`, `ZRANDMEMBER`, `ZMPOP`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`
+
+!!! tip
+    `ZADD` supports `NX`, `XX`, `GT`, `LT`, `CH` and `INCR`, matching Redis 6.2+ behavior. Every command in this list was sent to a live moon server and answered (moon#959 re-verified the table command by command, not from `COMMAND INFO`, after it had advertised an unimplemented one).
 
 ## Geospatial (8)
 

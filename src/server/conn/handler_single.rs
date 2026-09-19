@@ -1503,7 +1503,8 @@ pub async fn handle_connection(
                                     );
                                     continue;
                                 }
-                                let mut exec_publishes: Vec<(usize, Bytes, Bytes)> = Vec::new();
+                                let mut exec_publishes: Vec<crate::shard::exec_publish::ExecPublish> =
+                                    Vec::new();
                                 // PR #282 review: `execute_transaction` holds
                                 // ONE guard on the db selected at EXEC time —
                                 // every body write physically lands there,
@@ -1526,18 +1527,30 @@ pub async fn handle_connection(
                                 // Channel ACL gates this path too (C2 security):
                                 // a denied channel is patched with NOPERM and
                                 // never delivered, matching the immediate path.
-                                for (inner, ch, msg) in exec_publishes.drain(..) {
+                                // moon#1043: SPUBLISH lands in the shard-channel
+                                // namespace, never the global one.
+                                for p in exec_publishes.drain(..) {
                                     let patched = match crate::server::conn::shared::publish_channel_acl_deny(
                                         &acl_table,
                                         &conn.current_user,
-                                        &ch,
+                                        &p.channel,
                                     ) {
                                         Some(err) => err,
-                                        None => Frame::Integer(pubsub_registry.lock().publish(&ch, &msg)),
+                                        None => {
+                                            let mut registry = pubsub_registry.lock();
+                                            Frame::Integer(match p.kind {
+                                                crate::shard::exec_publish::PublishKind::Global => {
+                                                    registry.publish(&p.channel, &p.message)
+                                                }
+                                                crate::shard::exec_publish::PublishKind::Shard => {
+                                                    registry.spublish(&p.channel, &p.message)
+                                                }
+                                            })
+                                        }
                                     };
                                     if let Frame::Array(items) = &mut result {
-                                        if inner < items.len() {
-                                            items[inner] = patched;
+                                        if p.slot < items.len() {
+                                            items[p.slot] = patched;
                                         }
                                     }
                                 }
@@ -1765,7 +1778,7 @@ pub async fn handle_connection(
                             ) {
                                 conn.acl_log.push(crate::acl::AclLogEntry {
                                     reason: "command".to_string(),
-                                    object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                                    object: crate::acl::subcommand::command_log_object(cmd, cmd_args),
                                     username: conn.current_user.clone(),
                                     client_addr: peer_addr.clone(),
                                     timestamp_ms: std::time::SystemTime::now()
@@ -1773,6 +1786,8 @@ pub async fn handle_connection(
                                         .unwrap_or_default()
                                         .as_millis() as u64,
                                 });
+                                // moon#1035: inside MULTI a refusal poisons the block.
+                                conn.flag_transaction();
                                 responses.push(Frame::Error(Bytes::from(format!(
                                     "NOPERM {}", deny_reason
                                 ))));
@@ -1795,6 +1810,8 @@ pub async fn handle_connection(
                                         .unwrap_or_default()
                                         .as_millis() as u64,
                                 });
+                                // moon#1035: a denied KEY poisons an open transaction too.
+                                conn.flag_transaction();
                                 responses.push(Frame::Error(Bytes::from(format!(
                                     "NOPERM {}", deny_reason
                                 ))));
@@ -1875,6 +1892,21 @@ pub async fn handle_connection(
                                 crate::server::conn::shared::queue_time_rejection(cmd, cmd_args)
                         {
                             conn.multi_dirty = true;
+                            responses.push(err);
+                            continue;
+                        }
+                        // moon#1035: a PUBLISH to a denied channel is refused
+                        // HERE, poisoning the block, not at EXEC after the rest ran.
+                        if let Some((cmd, cmd_args)) = extract_command(&frame)
+                            && let Some(err) =
+                                crate::server::conn::shared::queued_publish_channel_deny(
+                                    &acl_table,
+                                    &conn.current_user,
+                                    cmd,
+                                    cmd_args,
+                                )
+                        {
+                            conn.flag_transaction();
                             responses.push(err);
                             continue;
                         }

@@ -978,11 +978,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                             drop(acl_guard);
                             conn.acl_log.push(crate::acl::AclLogEntry {
                                 reason: "command".to_string(),
-                                object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+                                object: crate::acl::subcommand::command_log_object(cmd, cmd_args),
                                 username: conn.current_user.clone(),
                                 client_addr: peer_addr.clone(),
                                 timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
                             });
+                            // moon#1035: inside MULTI a refusal poisons the block.
+                            conn.flag_transaction();
                             responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                             continue;
                         }
@@ -996,6 +998,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 client_addr: peer_addr.clone(),
                                 timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
                             });
+                            // moon#1035: a denied KEY poisons an open transaction too.
+                            conn.flag_transaction();
                             responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                             continue;
                         }
@@ -1087,6 +1091,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // than applying the half that happened to be valid.
                         if let Some(err) = crate::server::conn::shared::queue_time_rejection(cmd, cmd_args) {
                             conn.multi_dirty = true;
+                            responses.push(err);
+                            continue;
+                        }
+                        // moon#1035: the ACL gate above checks command and keys,
+                        // never a PUBLISH channel — refuse a denied one HERE so
+                        // the block aborts, instead of at EXEC after the rest ran.
+                        if let Some(err) = crate::server::conn::shared::queued_publish_channel_deny(
+                            &ctx.acl_table,
+                            &conn.current_user,
+                            cmd,
+                            cmd_args,
+                        ) {
+                            conn.flag_transaction();
                             responses.push(err);
                             continue;
                         }
@@ -1309,33 +1326,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         continue;
                                     }
                                 }
-                                if is_multi_key_command(cmd, cmd_args) {
-                                    let first_slot = slot;
-                                    let mut cross_slot = false;
-                                    // COPY's keys are exactly args[0..2]; trailing args
-                                    // are the REPLACE literal — not slot-checked.
-                                    let key_args: &[Frame] = if cmd.eq_ignore_ascii_case(b"COPY") {
-                                        &cmd_args[..cmd_args.len().min(2)]
-                                    } else {
-                                        cmd_args
-                                    };
-                                    for arg in key_args.iter().skip(1) {
-                                        if let Some(k) = match arg {
-                                            Frame::BulkString(b) => Some(b.as_ref()),
-                                            _ => None,
-                                        } {
-                                            if crate::cluster::slots::slot_for_key(k) != first_slot {
-                                                cross_slot = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if cross_slot {
-                                        responses.push(Frame::Error(Bytes::from_static(
-                                            b"CROSSSLOT Keys in request don't hash to the same slot",
-                                        )));
-                                        continue;
-                                    }
+                                // moon#1012: only KEY positions are slot-checked
+                                // (`MSET {t}a x {t}b y` is one slot). Same function
+                                // as handler_monoio's cluster routing.
+                                if is_multi_key_command(cmd, cmd_args)
+                                    && crate::cluster::slots::keys_span_slots(cmd, cmd_args, slot)
+                                {
+                                    responses.push(Frame::Error(Bytes::from_static(
+                                        b"CROSSSLOT Keys in request don't hash to the same slot",
+                                    )));
+                                    continue;
                                 }
                             }
                         }
@@ -1632,30 +1632,31 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- MULTI / EXEC_CMD / DISCARD ---
-                    let mut exec_publishes: Vec<(usize, Bytes, Bytes)> = Vec::new();
+                    let mut exec_publishes: Vec<crate::shard::exec_publish::ExecPublish> = Vec::new();
                     if write::try_handle_multi_exec(cmd, cmd_args, &mut conn, ctx, &mut responses, &mut exec_publishes, &shutdown, &func_registry).await {
-                        // C2: PUBLISH queued inside MULTI fans out only now — after the
-                        // transaction body has been applied — and its placeholder in the
-                        // EXEC reply array is patched with the real receiver count.
+                        // C2: a PUBLISH or SPUBLISH (moon#1043) queued inside MULTI
+                        // fans out only now — after the transaction body has been
+                        // applied — into its own namespace, and its placeholder in
+                        // the EXEC reply array is patched with the receiver count.
                         if !exec_publishes.is_empty() {
                             let exec_idx = responses.len() - 1;
-                            for (inner, ch, msg) in exec_publishes.drain(..) {
-                                // Channel ACL gates the txn PUBLISH path (C2
+                            for p in exec_publishes.drain(..) {
+                                // Channel ACL gates the txn publish path (C2
                                 // security): a denied channel is patched with
                                 // NOPERM and never fanned out.
                                 let patched = match crate::server::conn::shared::publish_channel_acl_deny(
                                     &ctx.acl_table,
                                     &conn.current_user,
-                                    &ch,
+                                    &p.channel,
                                 ) {
                                     Some(err) => err,
                                     None => Frame::Integer(
-                                        crate::server::conn::shared::publish_post_txn(ctx, &shutdown, &ch, &msg).await,
+                                        crate::server::conn::shared::publish_post_txn(ctx, &shutdown, &p.channel, &p.message, p.kind).await,
                                     ),
                                 };
                                 if let Frame::Array(items) = &mut responses[exec_idx] {
-                                    if inner < items.len() {
-                                        items[inner] = patched;
+                                    if p.slot < items.len() {
+                                        items[p.slot] = patched;
                                     }
                                 }
                             }
@@ -1701,8 +1702,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                             &mut stream, &mut read_buf,
                         ).await;
                         drop(blocked_guard);
-                        let mut blocking_response = match blocking_outcome {
-                            crate::server::conn::blocking::BlockingOutcome::Reply(frame) => frame,
+                        // `peer_gone_after_serve` (moon#1023): the serve stands,
+                        // so it is invalidated and logged below exactly as a
+                        // delivered reply — AOF only on this runtime, and
+                        // dropped on replay for a remote key (moon#1056); only
+                        // the write is skipped.
+                        let (mut blocking_response, peer_gone_after_serve) = match blocking_outcome {
+                            crate::server::conn::blocking::BlockingOutcome::Reply(frame) => (frame, false),
+                            crate::server::conn::blocking::BlockingOutcome::ServedPeerGone(frame) => (frame, true),
                             // Peer vanished mid-block: registrations are torn
                             // down, nothing to reply to, close the connection.
                             crate::server::conn::blocking::BlockingOutcome::PeerGone => {
@@ -1782,6 +1789,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                             }
                         }
                     }
+                        if peer_gone_after_serve {
+                            // Logged above; nobody left to write the reply to.
+                            arena.reset();
+                            return (HandlerResult::Done, None);
+                        }
                         let blocking_response = apply_resp3_conversion(
                             cmd,
                             cmd_args,
@@ -2519,7 +2531,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                             )
                                             .budget(budget),
                                         );
-                                        ctx.spill_file_id.set(fid);
+                                        ctx.spill_file_id.set(ctx.spill_file_id.get().max(fid));
                                         res
                                     } else {
                                         evict_to_budget(db, &rt, EvictionRun::plain().budget(budget))

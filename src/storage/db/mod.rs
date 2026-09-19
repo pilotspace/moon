@@ -1085,6 +1085,24 @@ impl Database {
         self.cached_now_ms = current_time_ms();
     }
 
+    /// Advance the cached clock to the wall clock — never backwards.
+    ///
+    /// For the active-expiry tick (moon#1013). The hash-field sweep reaps
+    /// against `cached_now_ms` (so it can never reap a field a read would
+    /// still see), but only commands refresh that clock — so on an IDLE
+    /// database a due field sat unreaped, and its CLIENT TRACKING
+    /// invalidation unsent, until unrelated traffic touched the db. Moving
+    /// the clock forward before the sweep keeps the reap and the read filter
+    /// on one clock; refusing to move it backwards keeps a clock a test (or
+    /// a newer command) already advanced.
+    pub fn advance_now_to_wall_clock(&mut self) {
+        let now_ms = current_time_ms();
+        if now_ms > self.cached_now_ms {
+            self.cached_now = current_secs();
+            self.cached_now_ms = now_ms;
+        }
+    }
+
     /// Return the base timestamp for TTL delta computation.
     #[inline]
     pub fn base_timestamp(&self) -> u32 {
@@ -1118,6 +1136,31 @@ impl Database {
     /// to chase memory that cannot drop yet.
     pub fn estimated_memory(&self) -> usize {
         self.used_memory.saturating_add(self.spill_inflight_bytes)
+    }
+
+    /// The figure `maxmemory` holds this database to: [`Self::estimated_memory`]
+    /// plus the RAM its [`ColdIndex`](crate::storage::tiered::cold_index::ColdIndex)
+    /// occupies for the keys it has spilled.
+    ///
+    /// THE single definition every eviction decision compares against a
+    /// budget. The 100 ms pressure cascade has charged the cold index since
+    /// K4 (the tick publishes this sum as the shard's memory), while the
+    /// per-write gates — `evict_to_budget`'s default total and the inline
+    /// pre-gate `inline_write_can_skip_eviction` — compared the budget
+    /// against `estimated_memory()` alone. moon#1036: one shard, two
+    /// effective caps, `ColdIndex::resident_bytes()` apart. Every tick the
+    /// cascade spilled a cold-index's worth of hot keys that the per-write
+    /// gate then let writers refill without evicting, so the shard sawtoothed
+    /// above the cascade's cap between ticks, and a burst of writes inlined
+    /// after every tick even though the shard was over what the cascade
+    /// enforces.
+    ///
+    /// O(1): one `Option` test and one field read beside the two that
+    /// `estimated_memory` already does, so it stays a per-write read.
+    #[inline]
+    pub fn budgeted_memory(&self) -> usize {
+        self.estimated_memory()
+            .saturating_add(self.cold_index.as_ref().map_or(0, |ci| ci.resident_bytes()))
     }
 
     /// Resident bytes attributed to this database (alias for `estimated_memory`,

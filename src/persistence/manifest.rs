@@ -285,7 +285,8 @@ pub struct ManifestRoot {
 ///
 /// `FileEntry` has no on-disk field for when a tombstone was created (the v2
 /// layout is frozen; P6 owns format v3). Tombstone metadata is therefore kept
-/// in an in-memory side table (`tombstone_registry`) keyed by `file_id`.
+/// in an in-memory side table (`tombstone_registry`) keyed by
+/// `(file_id, file_type)`.
 ///
 /// On `open()`, all tombstoned entries are seeded with `(current_epoch,
 /// Instant::now())` — a conservative re-clocking that is safe because a
@@ -397,18 +398,73 @@ pub struct ShardManifest {
     path: PathBuf,
     /// Currently active root (the last successfully committed state).
     active_root: ManifestRoot,
-    /// In-memory registry of tombstoned files: file_id → (tombstone_epoch, tombstoned_at).
+    /// In-memory registry of tombstoned files: (file_id, file_type) →
+    /// (tombstone_epoch, tombstoned_at). Keyed by type as well as id for the
+    /// same reason `remove_file` matches on both (moon#893): two artifacts of
+    /// different kinds can share an id, and each tombstone ages on its own.
     ///
     /// `tombstone_epoch` is the `active_root.epoch` at the moment `remove_file` was called
     /// (i.e. the epoch of the root that will be committed next, which equals current + 1
     /// after the commit flip — we record the pre-commit value so age = current - tombstone_epoch).
     /// `tombstoned_at` is a monotonic `Instant` for wall-clock retention.
-    tombstone_registry: HashMap<u64, (u64, Instant)>,
+    tombstone_registry: HashMap<(u64, u8), (u64, Instant)>,
     /// Test-only knob handles, shared with this manifest's [`ManifestIo`]. Held
     /// here as well as there so a test can arm injection and read the persist
     /// count after `enable_deferred_sync` has moved the io to the sync thread.
     #[cfg(test)]
     knobs: TestKnobs,
+}
+
+/// Write a brand-new manifest image so a crash can never leave a prefix of it
+/// at `path`: temp file, fsync, rename, fsync the directory.
+///
+/// `create` used to `std::fs::write` straight to `path`. A SIGKILL or ENOSPC
+/// part-way left a file shorter than the two root pages, which `open` rejects
+/// on every later boot. The temp name is fixed per manifest, so a leftover
+/// from a crash is simply truncated by the next create.
+fn write_new_manifest_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let Some(name) = path.file_name() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("manifest path has no file name: {}", path.display()),
+        ));
+    };
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let tmp = parent.join(format!(".{}.creating", name.to_string_lossy()));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        #[cfg(test)]
+        if let Some(n) = torn_create_knob::take() {
+            // Simulated crash after `n` bytes reached the file.
+            f.write_all(&bytes[..n.min(bytes.len())])?;
+            return Err(std::io::Error::other("injected crash mid-create"));
+        }
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    crate::persistence::fsync::fsync_directory(parent)
+}
+
+/// Test-only: make the next `create` on THIS thread die after `n` bytes.
+#[cfg(test)]
+pub(crate) mod torn_create_knob {
+    use std::cell::Cell;
+
+    thread_local! {
+        static AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn arm(after_bytes: usize) {
+        AFTER.with(|c| c.set(Some(after_bytes)));
+    }
+
+    pub(super) fn take() -> Option<usize> {
+        AFTER.with(Cell::take)
+    }
 }
 
 impl ShardManifest {
@@ -432,20 +488,15 @@ impl ShardManifest {
         };
         Self::serialize_root(&root, 0, &mut buf[..PAGE_4K]);
 
-        // Write file
-        std::fs::write(path, &buf)?;
+        // Temp + fsync + rename + dir fsync: `path` either does not exist or
+        // holds both root pages, never a prefix of them (see
+        // `write_new_manifest_file`).
+        write_new_manifest_file(path, &buf)?;
 
-        // Open for R/W and sync
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)?;
-        file.sync_data()?;
-
-        // fsync parent directory for metadata durability
-        if let Some(parent) = path.parent() {
-            crate::persistence::fsync::fsync_directory(parent)?;
-        }
 
         #[cfg(test)]
         let knobs = TestKnobs::default();
@@ -466,6 +517,35 @@ impl ShardManifest {
             #[cfg(test)]
             knobs,
         })
+    }
+
+    /// Whether the manifest file at `path` is a torn [`Self::create`]: shorter
+    /// than the two root pages every manifest starts with.
+    ///
+    /// Nothing but an interrupted create can produce one — commits rewrite a
+    /// root page in place inside those first `2 * PAGE_4K` bytes and
+    /// compaction replaces the file by rename — so such a file holds no
+    /// committed entry and references no cold file. Builds from before create
+    /// became atomic wrote it in place, so data dirs in the field can hold one.
+    pub fn is_torn_create(path: &Path) -> std::io::Result<bool> {
+        Ok(std::fs::metadata(path)?.len() < (2 * PAGE_4K) as u64)
+    }
+
+    /// [`Self::open`], except that a torn create ([`Self::is_torn_create`]) is
+    /// replaced by a fresh empty manifest, with a WARN naming the file, instead
+    /// of failing on every boot. A manifest of normal length whose roots are
+    /// both corrupt still fails: that one DID hold entries.
+    pub fn open_repairing_torn_create(path: &Path) -> std::io::Result<Self> {
+        if Self::is_torn_create(path)? {
+            tracing::warn!(
+                path = %path.display(),
+                "shard manifest is shorter than its two root pages: an interrupted \
+                 create that committed no entry and references no cold file - \
+                 re-creating it empty (the torn file is safe to remove)"
+            );
+            return Self::create(path);
+        }
+        Self::open(path)
     }
 
     /// Open an existing manifest file and recover the latest valid root.
@@ -523,7 +603,7 @@ impl ShardManifest {
         let mut tombstone_registry = HashMap::new();
         for entry in &active_root.entries {
             if entry.status == FileStatus::Tombstone {
-                tombstone_registry.insert(entry.file_id, (current_epoch, now));
+                tombstone_registry.insert((entry.file_id, entry.file_type), (current_epoch, now));
             }
         }
 
@@ -647,21 +727,31 @@ impl ShardManifest {
         self.active_root.entries.push(entry);
     }
 
-    /// Mark a file as Tombstone by file_id (in-memory only until commit).
+    /// Mark the `file_type` file with `file_id` as Tombstone (in-memory only
+    /// until commit).
+    ///
+    /// Matches on `(file_id, file_type)`, never on the id alone (moon#893).
+    /// A KV spill file (`KvLeaf`, `data/heap-{id}.mpf`) and a warm vector
+    /// segment (`VecCodes`, `vectors/segment-{id}/`) are different artifacts,
+    /// and a manifest written before the file_id seed covered every artifact
+    /// kind can hold one of each under the same id. Retiring a vanished
+    /// segment's entry by id alone tombstoned the live spill file beside it,
+    /// and every key in it read as absent after the next restart.
     ///
     /// Records the tombstone in the in-memory registry with the current epoch
     /// and wall-clock instant so `gc_tombstones` can enforce two-axis retention.
     /// The epoch recorded is the pre-commit epoch; after `commit()` the active
     /// epoch is incremented by 1, so tombstone age in epochs = current_epoch - tombstone_epoch.
-    pub fn remove_file(&mut self, file_id: u64) {
+    pub fn remove_file(&mut self, file_id: u64, file_type: PageType) {
+        let file_type = file_type as u8;
         for entry in &mut self.active_root.entries {
-            if entry.file_id == file_id {
+            if entry.file_id == file_id && entry.file_type == file_type {
                 entry.status = FileStatus::Tombstone;
                 // Register tombstone with current epoch and monotonic clock.
                 // Use entry() to avoid overwriting an existing registry entry
                 // if remove_file is called twice for the same file_id.
                 self.tombstone_registry
-                    .entry(file_id)
+                    .entry((file_id, file_type))
                     .or_insert_with(|| (self.active_root.epoch, Instant::now()));
             }
         }
@@ -708,8 +798,9 @@ impl ShardManifest {
             if entry.status != FileStatus::Tombstone {
                 return true; // keep all non-tombstone entries
             }
-            let Some(&(tombstone_epoch, tombstoned_at)) =
-                self.tombstone_registry.get(&entry.file_id)
+            let Some(&(tombstone_epoch, tombstoned_at)) = self
+                .tombstone_registry
+                .get(&(entry.file_id, entry.file_type))
             else {
                 // No registry entry — conservatively retain (should not happen in
                 // normal operation; seeded on open() and written in remove_file()).
@@ -732,10 +823,13 @@ impl ShardManifest {
 
         // Clean up registry entries for pruned tombstones.
         if pruned > 0 {
-            let live_ids: std::collections::HashSet<u64> =
-                self.active_root.entries.iter().map(|e| e.file_id).collect();
-            self.tombstone_registry
-                .retain(|file_id, _| live_ids.contains(file_id));
+            let live: std::collections::HashSet<(u64, u8)> = self
+                .active_root
+                .entries
+                .iter()
+                .map(|e| (e.file_id, e.file_type))
+                .collect();
+            self.tombstone_registry.retain(|key, _| live.contains(key));
         }
 
         pruned
@@ -1823,7 +1917,7 @@ mod tests {
         m.commit().unwrap();
 
         // id 150 lives in the overflow region (inline cap is 70).
-        m.remove_file(150);
+        m.remove_file(150, PageType::KvLeaf);
         let pruned = m.gc_tombstones(0, 0, std::time::Instant::now());
         assert_eq!(pruned, 1, "overflow-region tombstone must be prunable");
         m.commit().unwrap();
@@ -1941,7 +2035,7 @@ mod tests {
         m.commit().unwrap();
 
         // Remove file 2
-        m.remove_file(2);
+        m.remove_file(2, PageType::KvLeaf);
         m.commit().unwrap();
 
         let m2 = ShardManifest::open(&path).unwrap();
@@ -1949,6 +2043,108 @@ mod tests {
         assert_eq!(m2.files()[1].status, FileStatus::Tombstone);
         assert_eq!(m2.files()[0].status, FileStatus::Active);
         assert_eq!(m2.files()[2].status, FileStatus::Active);
+    }
+
+    /// Two artifacts sharing an id age as two tombstones: GC prunes the older
+    /// one and keeps the one tombstoned later (the registry used to be keyed
+    /// by id alone, so the later tombstone inherited the earlier one's age).
+    #[test]
+    fn test_tombstones_sharing_an_id_age_independently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+        let mut m = ShardManifest::create(&path).unwrap();
+        let mut warm = make_entry(5);
+        warm.file_type = PageType::VecCodes as u8;
+        m.add_file(warm);
+        m.add_file(make_entry(5)); // KvLeaf, same id
+        m.commit().unwrap();
+
+        m.remove_file(5, PageType::KvLeaf);
+        m.commit().unwrap();
+        m.commit().unwrap();
+        m.remove_file(5, PageType::VecCodes);
+
+        let pruned = m.gc_tombstones(2, 0, Instant::now());
+        assert_eq!(pruned, 1, "only the tombstone two epochs old is due");
+        let left: Vec<u8> = m.files().iter().map(|e| e.file_type).collect();
+        assert_eq!(left, vec![PageType::VecCodes as u8]);
+    }
+
+    /// A create that dies part-way must leave NO file at the manifest path —
+    /// never a prefix shorter than the two root pages, which every later
+    /// `open` rejects (moon#997 review).
+    #[test]
+    fn test_create_that_dies_midway_leaves_no_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        torn_create_knob::arm(100);
+        assert!(ShardManifest::create(&path).is_err(), "the injected crash");
+        assert!(
+            !path.exists(),
+            "a crashed create left {} bytes at the manifest path",
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+        );
+
+        // The next create succeeds over the leftover temp file.
+        let m = ShardManifest::create(&path).unwrap();
+        assert_eq!(m.files().len(), 0);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (2 * PAGE_4K) as u64
+        );
+    }
+
+    /// A torn create already on disk (written by an older build) is replaced
+    /// by an empty manifest; a full-length corrupt one still fails.
+    #[test]
+    fn test_open_repairing_torn_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+        std::fs::write(&path, vec![0u8; 100]).unwrap();
+        assert!(ShardManifest::open(&path).is_err(), "precondition: torn");
+        assert!(ShardManifest::is_torn_create(&path).unwrap());
+
+        let m = ShardManifest::open_repairing_torn_create(&path).unwrap();
+        assert_eq!(m.files().len(), 0);
+        drop(m);
+        assert!(ShardManifest::open(&path).is_ok(), "repaired on disk");
+
+        std::fs::write(&path, vec![0xA5u8; 2 * PAGE_4K]).unwrap();
+        assert!(!ShardManifest::is_torn_create(&path).unwrap());
+        assert!(
+            ShardManifest::open_repairing_torn_create(&path).is_err(),
+            "a full-length manifest with both roots corrupt held entries: never re-create it"
+        );
+    }
+
+    /// moon#893: one id, two artifact kinds — `remove_file` retires only the
+    /// kind it is asked for.
+    #[test]
+    fn test_remove_file_matches_file_type_not_id_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        let mut m = ShardManifest::create(&path).unwrap();
+        let mut warm = make_entry(5);
+        warm.file_type = PageType::VecCodes as u8;
+        warm.tier = StorageTier::Warm;
+        m.add_file(warm);
+        m.add_file(make_entry(5)); // KvLeaf, same id
+        m.commit().unwrap();
+
+        m.remove_file(5, PageType::VecCodes);
+        m.commit().unwrap();
+
+        let m2 = ShardManifest::open(&path).unwrap();
+        let status = |t: PageType| {
+            m2.files()
+                .iter()
+                .find(|e| e.file_type == t as u8)
+                .map(|e| e.status)
+        };
+        assert_eq!(status(PageType::VecCodes), Some(FileStatus::Tombstone));
+        assert_eq!(status(PageType::KvLeaf), Some(FileStatus::Active));
     }
 
     #[test]

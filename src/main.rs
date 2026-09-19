@@ -1437,6 +1437,34 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
 
+    // moon#997 / moon#893: prove every shard's cold file_id seed before any
+    // shard can spill or transition a vector segment. The seed must clear
+    // every id a spill file, a warm segment or a manifest entry holds; one
+    // that cannot be proven (an unlistable directory, an unreadable entry, an
+    // unopenable manifest) is refused, never guessed — a guessed seed renames
+    // a new spill onto a live heap file or tombstones one. After recovery
+    // (which retires entries and directories), before replay (which does not
+    // spill). The same numbers seed `MOON.COLDCUT` below, so the watermark and
+    // the event loop's counter are one value, not two scans.
+    let spill_seeds: Vec<u64> = {
+        use anyhow::Context;
+        let mut seeds = Vec::with_capacity(shards.len());
+        for shard in &mut shards {
+            let id = shard.id;
+            seeds.push(
+                shard
+                    .prove_spill_file_id_seed(disk_offload_base.as_deref())
+                    .with_context(|| {
+                        format!(
+                            "refusing to start: cannot prove shard {id}'s cold file_id seed is \
+                             above every file in use; fix the error below and restart"
+                        )
+                    })?,
+            );
+        }
+        seeds
+    };
+
     // Multi-part AOF replay/init layered on top of v2/v3 recovery.
     // Priority: if appendonlydir/ manifest exists → load multi-part (skip legacy v2 fallback).
     // Otherwise v2 already handled legacy appendonly.aof during restore_from_persistence.
@@ -1472,9 +1500,9 @@ fn main() -> anyhow::Result<()> {
     // files — preserving the local index there would surface stale reads. Here
     // the loaded base + replayed incrs are this node's own data, so the rebuilt
     // index is authoritative. Pairs with the spill file_id seed
-    // (eviction.rs::next_spill_file_id_seed): the seed keeps recovered cold
-    // files immutable so these preserved entries stay valid until the
-    // steady-state cascade refreshes them.
+    // (`spill_seeds` above): the seed keeps recovered cold files immutable so
+    // these preserved entries stay valid until the steady-state cascade
+    // refreshes them.
     type PreservedColdWiring = Vec<
         Vec<(
             Option<std::path::PathBuf>,
@@ -1514,11 +1542,11 @@ fn main() -> anyhow::Result<()> {
 
     // moon#902: the `MOON.COLDCUT` watermark for a freshly initialized AOF
     // generation — the shard's next cold file id, i.e. exactly the seed the
-    // event loop's `spill_file_id` counter starts from, so every cold file
-    // that exists at this boot is below it.
-    fn cold_file_watermark(disk_offload_base: Option<&std::path::Path>, shard_id: u16) -> u64 {
-        let shard_dir = disk_offload_base.map(|b| b.join(format!("shard-{shard_id}")));
-        moon::storage::eviction::next_spill_file_id_seed(shard_dir.as_deref())
+    // event loop's `spill_file_id` counter starts from (the same proven
+    // value, `spill_seeds`), so every cold file that exists at this boot is
+    // below it and every file spilled after it is not.
+    fn cold_file_watermark(spill_seeds: &[u64], shard_id: u16) -> u64 {
+        spill_seeds.get(usize::from(shard_id)).copied().unwrap_or(1)
     }
 
     // Close the AOF-authority replay's cold-plane cut (moon#902) — call
@@ -1789,7 +1817,7 @@ fn main() -> anyhow::Result<()> {
                     let fresh = AofManifest::initialize_with_base(&base_dir, &rdb_bytes)
                         .with_context(|| "failed to initialize AOF manifest with base")?;
                     fresh
-                        .seed_cold_cut(|sid| cold_file_watermark(disk_offload_base.as_deref(), sid))
+                        .seed_cold_cut(|sid| cold_file_watermark(&spill_seeds, sid))
                         .with_context(|| "failed to seed the AOF cold-plane cut (moon#902)")?;
                     info!(
                         "First-upgrade: captured legacy state as AOF base seq 1 ({} bytes)",
@@ -1820,7 +1848,7 @@ fn main() -> anyhow::Result<()> {
                 let fresh = AofManifest::initialize_multi(&base_dir, shard_count_u16)
                     .with_context(|| "failed to initialize PerShard AOF manifest")?;
                 fresh
-                    .seed_cold_cut(|sid| cold_file_watermark(disk_offload_base.as_deref(), sid))
+                    .seed_cold_cut(|sid| cold_file_watermark(&spill_seeds, sid))
                     .with_context(|| "failed to seed the AOF cold-plane cut (moon#902)")?;
                 info!(
                     "Initialized PerShard AOF manifest for {} shards at {}",
@@ -1834,7 +1862,7 @@ fn main() -> anyhow::Result<()> {
                     let fresh = AofManifest::initialize(&base_dir)
                         .with_context(|| "failed to initialize AOF manifest")?;
                     fresh
-                        .seed_cold_cut(|sid| cold_file_watermark(disk_offload_base.as_deref(), sid))
+                        .seed_cold_cut(|sid| cold_file_watermark(&spill_seeds, sid))
                         .with_context(|| "failed to seed the AOF cold-plane cut (moon#902)")?;
                 }
                 // tokio --shards 1 fresh: no manifest (v2 single-file recovery
@@ -1862,7 +1890,7 @@ fn main() -> anyhow::Result<()> {
             let aof_path = base_dir.join(&config.appendfilename);
             let seeded = moon::persistence::cold_records::seed_cold_cut_if_fresh(
                 &aof_path,
-                cold_file_watermark(disk_offload_base.as_deref(), 0),
+                cold_file_watermark(&spill_seeds, 0),
             )
             .with_context(|| {
                 format!(
@@ -1914,6 +1942,67 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    // moon#914 (b): tokio --shards 1 replayed a legacy `appendonly.aof` (one
+    // written before #1017, so it has no `MOON.COLDCUT`) while cold files
+    // existed. That replay read every cold file ungated, so a write logged
+    // before its key was spilled may just have been applied twice. The log
+    // has no record of which writes preceded which spill, so this boot's
+    // damage can't be undone. It can be stopped from compounding: nothing
+    // else rewrites this file, and every later boot would replay the same
+    // headless log over the re-spilled result. One rewrite opens the file
+    // with its cut (`rewrite_aof_sharded_sync`), so every later boot is
+    // gated. The #433 monitor dispatches it through the BGREWRITEAOF entry
+    // after the shards start. Accept is not blocked, and a crash before the
+    // rename leaves the old file authoritative, so the next boot retries.
+    // monoio (manifest, cut since #911) and multi-shard (PerShard manifest)
+    // never take this path. "Cold files existed" is read from the proven
+    // seed (`spill_seeds`, moon#997): it clears every heap file, so no cold
+    // file is missed; a warm vector segment alone also lifts it, which costs
+    // one unneeded rewrite, never a skipped one.
+    let force_legacy_aof_rewrite = cfg!(not(feature = "runtime-monoio"))
+        && num_shards == 1
+        && shards[0].replayed_aof_without_cold_cut
+        && cold_file_watermark(&spill_seeds, 0) > 1
+        && {
+            // The replay reads `<dir>/appendonly.aof`; the writer appends to
+            // `<dir>/<appendfilename>`. A rewrite can only repair the file
+            // that was replayed.
+            let replayed = std::path::Path::new(&config.dir).join("appendonly.aof");
+            let aof_bytes = std::fs::metadata(&replayed).map_or(0, |m| m.len());
+            let writes_replayed_file = config.appendfilename == "appendonly.aof";
+            if aof_pool.is_some() && writes_replayed_file {
+                tracing::warn!(
+                    "moon#914: replayed a legacy appendonly.aof ({}, {} bytes) with no \
+                     MOON.COLDCUT head over existing cold files. This boot's replay could \
+                     not be gated: a write logged before its key was spilled may have been \
+                     applied twice, and that cannot be undone. To stop it compounding on \
+                     every later boot, moon now runs ONE background AOF rewrite. One-time \
+                     cost: the hot dataset written and fsynced as a new RDB-preamble AOF. \
+                     Clients are served meanwhile. Later boots replay a file that opens with \
+                     its cut.",
+                    replayed.display(),
+                    aof_bytes
+                );
+                true
+            } else {
+                tracing::warn!(
+                    "moon#914: replayed a legacy appendonly.aof ({}, {} bytes) with no \
+                     MOON.COLDCUT head over existing cold files. This boot's replay could \
+                     not be gated, and moon CANNOT rewrite it: {}. Every boot will replay \
+                     it ungated again. Run with --appendonly yes and the default \
+                     --appendfilename once, then BGREWRITEAOF.",
+                    replayed.display(),
+                    aof_bytes,
+                    if aof_pool.is_none() {
+                        "appendonly is off"
+                    } else {
+                        "--appendfilename names a different file than the one replayed"
+                    }
+                );
+                false
+            }
+        };
 
     // Extract databases from all shards and wrap in ShardDatabases
     let all_dbs: Vec<Vec<moon::storage::Database>> = shards
@@ -1983,6 +2072,7 @@ fn main() -> anyhow::Result<()> {
             shard_databases.clone(),
             config.auto_aof_rewrite_percentage,
             min_size,
+            force_legacy_aof_rewrite,
         );
     }
 

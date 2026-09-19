@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use bytes::Bytes;
 
 use crate::acl::rules::{acl_category_names, get_category_commands};
-use crate::acl::{AclLog, AclLogEntry, AclTable, CommandPermissions};
+use crate::acl::{AclLog, AclLogEntry, AclTable};
 use crate::config::RuntimeConfig;
 use crate::framevec;
 use crate::protocol::Frame;
@@ -125,50 +125,22 @@ pub fn handle_acl(
                     // Space-joined into ONE string below, the way Redis
                     // sends them — collected as `String` here so the join is
                     // the only place the wire form is decided.
+                    // One key-pattern renderer for SAVE, LIST and GETUSER; the
+                    // copy that lived here rendered a no-access pattern as a
+                    // write grant.
                     let keys: Vec<String> = user
                         .key_patterns
                         .iter()
-                        .map(|kp| {
-                            if kp.read && kp.write {
-                                format!("~{}", kp.pattern)
-                            } else if kp.read {
-                                format!("%R~{}", kp.pattern)
-                            } else {
-                                format!("%W~{}", kp.pattern)
-                            }
-                        })
+                        .filter_map(crate::acl::io::key_pattern_to_rule)
                         .collect();
                     let channels: Vec<String> = user
                         .channel_patterns
                         .iter()
                         .map(|cp| format!("&{}", cp))
                         .collect();
-                    let commands = match &user.allowed_commands {
-                        CommandPermissions::AllAllowed => "+@all".to_string(),
-                        // #978: same concealment as `user_to_acl_line` --
-                        // `base_allow` was dropped and `-@all` hardcoded, so
-                        // `ACL GETUSER` reported a base-allow user as having no
-                        // commands. Both renderers now show the polarity.
-                        CommandPermissions::Specific {
-                            base_allow,
-                            allowed,
-                            denied,
-                        } => {
-                            let mut parts =
-                                vec![if *base_allow { "+@all" } else { "-@all" }.to_string()];
-                            let mut allowed_sorted: Vec<&String> = allowed.iter().collect();
-                            allowed_sorted.sort();
-                            for a in allowed_sorted {
-                                parts.push(format!("+{}", a));
-                            }
-                            let mut denied_sorted: Vec<&String> = denied.iter().collect();
-                            denied_sorted.sort();
-                            for d in denied_sorted {
-                                parts.push(format!("-{}", d));
-                            }
-                            parts.join(" ")
-                        }
-                    };
+                    // One serializer for SAVE, LIST and GETUSER (moon#981): a
+                    // second copy here inverted `+@all -x` into `-@all -x`.
+                    let commands = crate::acl::io::command_rules_to_string(&user.allowed_commands);
                     // The reply is a Map, and the serializer downgrades a Map
                     // to the flat `[k, v, …]` array on RESP2 — so this one
                     // construction is correct under both protocols and needs no
@@ -231,7 +203,26 @@ pub fn handle_acl(
                     ));
                 }
             };
-            let rules: Vec<&str> = args[1..].iter().filter_map(|f| extract_str(f)).collect();
+            // Every argument is a rule; none may be dropped. `filter_map`
+            // here used to discard a non-UTF-8 argument and still answer
+            // `OK` (#970) -- reject the whole call instead, before locking.
+            let mut rules: Vec<&str> = Vec::with_capacity(args.len() - 1);
+            for arg in &args[1..] {
+                match extract_str(arg) {
+                    Some(rule) => rules.push(rule),
+                    None => {
+                        let shown = match arg {
+                            Frame::BulkString(b) | Frame::SimpleString(b) => {
+                                String::from_utf8_lossy(b).into_owned()
+                            }
+                            _ => String::new(),
+                        };
+                        return Frame::Error(Bytes::from(
+                            crate::acl::rules::AclRuleError::NotUtf8.to_setuser_error(&shown),
+                        ));
+                    }
+                }
+            }
             let Ok(mut table) = acl_table.write() else {
                 return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
             };
@@ -839,5 +830,140 @@ mod tests {
         ];
         let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
         assert!(matches!(result, Frame::Error(_)));
+    }
+
+    /// moon#981: the `commands` field must report the base polarity the
+    /// table holds. A `+@all -flushall` user was reported as
+    /// `-@all -flushall` -- the same inversion `ACL SAVE` wrote to disk, from
+    /// a second copy of the same serializer. Redis 8.6.1 answers
+    /// `+@all -flushall` on the wire.
+    #[test]
+    fn getuser_reports_the_allow_all_base_of_a_user_with_one_revocation() {
+        let table = make_acl_table();
+        let mut log = AclLog::new(128);
+        let rc = make_runtime_config();
+
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"SETUSER")),
+            Frame::BulkString(Bytes::from_static(b"rt")),
+            Frame::BulkString(Bytes::from_static(b"on")),
+            Frame::BulkString(Bytes::from_static(b"+@all")),
+            Frame::BulkString(Bytes::from_static(b"-flushall")),
+        ];
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
+        assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
+
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"GETUSER")),
+            Frame::BulkString(Bytes::from_static(b"rt")),
+        ];
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
+        let Frame::Map(pairs) = result else {
+            panic!("Expected Map from GETUSER, got {result:?}");
+        };
+        assert_eq!(
+            pairs[2].0,
+            Frame::BulkString(Bytes::from_static(b"commands"))
+        );
+        assert_eq!(
+            pairs[2].1,
+            Frame::BulkString(Bytes::from_static(b"+@all -flushall")),
+            "GETUSER must report the allow-all base, not invert it"
+        );
+    }
+
+    /// moon#970: a non-UTF-8 rule argument used to be DROPPED by
+    /// `filter_map(extract_str)` while SETUSER answered `OK` -- the rest of
+    /// the list applied as if the operator had never typed it. It must reject
+    /// the whole call and create nothing.
+    #[test]
+    fn setuser_rejects_a_non_utf8_rule_instead_of_dropping_it() {
+        let table = make_acl_table();
+        let mut log = AclLog::new(128);
+        let rc = make_runtime_config();
+
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"SETUSER")),
+            Frame::BulkString(Bytes::from_static(b"bin")),
+            Frame::BulkString(Bytes::from_static(b"on")),
+            Frame::BulkString(Bytes::from_static(b"nopass")),
+            Frame::BulkString(Bytes::from_static(b"+@all")),
+            Frame::BulkString(Bytes::from_static(b"-\xff\xfe")),
+        ];
+        let result = handle_acl(&args, &table, &mut log, "default", "127.0.0.1:1234", &rc, 0);
+        let Frame::Error(msg) = &result else {
+            panic!("a non-UTF-8 rule must be an error, got {result:?}");
+        };
+        assert!(
+            msg.starts_with(b"ERR Error in ACL SETUSER modifier '-"),
+            "got {msg:?}"
+        );
+        assert!(
+            msg.ends_with(b"': ACL rules must be valid UTF-8"),
+            "got {msg:?}"
+        );
+        assert!(
+            table.read().expect("lock").get_user("bin").is_none(),
+            "the passwordless +@all prefix must not be committed"
+        );
+    }
+
+    /// moon#970 + one renderer: GETUSER's `keys` field and the LIST/SAVE
+    /// line agree token for token, and both render redis's shapes --
+    /// `%RW~` as `~`, one-sided grants as `%R~`/`%W~`, and `allkeys` as a
+    /// lone `~*` that replaced what came before it.
+    #[test]
+    fn getuser_keys_and_list_line_render_key_selectors_identically() {
+        let table = make_acl_table();
+        let mut log = AclLog::new(128);
+        let rc = make_runtime_config();
+        let setuser =
+            |table: &Arc<RwLock<AclTable>>, log: &mut AclLog, name: &str, rules: &[&str]| {
+                let mut args = vec![
+                    Frame::BulkString(Bytes::from_static(b"SETUSER")),
+                    Frame::BulkString(Bytes::copy_from_slice(name.as_bytes())),
+                ];
+                args.extend(
+                    rules
+                        .iter()
+                        .map(|r| Frame::BulkString(Bytes::copy_from_slice(r.as_bytes()))),
+                );
+                let result = handle_acl(&args, table, log, "default", "127.0.0.1:1234", &rc, 0);
+                assert_eq!(
+                    result,
+                    Frame::SimpleString(Bytes::from_static(b"OK")),
+                    "SETUSER {name} {rules:?}"
+                );
+            };
+        let getuser_keys = |table: &Arc<RwLock<AclTable>>, log: &mut AclLog, name: &str| {
+            let args = vec![
+                Frame::BulkString(Bytes::from_static(b"GETUSER")),
+                Frame::BulkString(Bytes::copy_from_slice(name.as_bytes())),
+            ];
+            let result = handle_acl(&args, table, log, "default", "127.0.0.1:1234", &rc, 0);
+            let Frame::Map(pairs) = result else {
+                panic!("Expected Map from GETUSER, got {result:?}");
+            };
+            assert_eq!(pairs[3].0, Frame::BulkString(Bytes::from_static(b"keys")));
+            pairs[3].1.clone()
+        };
+
+        setuser(&table, &mut log, "sel", &["%RW~rw:*", "%r~r:*", "%W~w:*"]);
+        assert_eq!(
+            getuser_keys(&table, &mut log, "sel"),
+            Frame::BulkString(Bytes::from_static(b"~rw:* %R~r:* %W~w:*"))
+        );
+        let line = {
+            let t = table.read().expect("lock");
+            crate::acl::io::user_to_acl_line(t.get_user("sel").expect("created"))
+        };
+        assert!(line.contains(" ~rw:* %R~r:* %W~w:* "), "LIST line: {line}");
+
+        setuser(&table, &mut log, "sel", &["allkeys"]);
+        assert_eq!(
+            getuser_keys(&table, &mut log, "sel"),
+            Frame::BulkString(Bytes::from_static(b"~*")),
+            "allkeys replaces the list, as redis renders it"
+        );
     }
 }

@@ -214,6 +214,19 @@ const PROBES: &[Probe] = &[
         src_untouched: ":2\r\n",
         src_after_success: None,
     },
+    // moon#959 implemented ZDIFFSTORE, which is what moved it out of the
+    // t2k4 tripwire below and into the family.
+    Probe {
+        label: "ZDIFFSTORE",
+        seed: &[&["ZADD", "{s}", "1", "a", "2", "b"]],
+        argv: &["ZDIFFSTORE", "{d}", "1", "{s}"],
+        dst_probe: &["ZCARD", "{d}"],
+        dst_landed: ":2\r\n",
+        dst_absent: ":0\r\n",
+        src_probe: &["ZCARD", "{s}"],
+        src_untouched: ":2\r\n",
+        src_after_success: None,
+    },
     Probe {
         label: "PFMERGE",
         seed: &[&["PFADD", "{s}", "a", "b", "c"]],
@@ -549,23 +562,19 @@ fn t2k3_hash_tagged_pairs_still_work_at_four_shards() {
     );
 }
 
-/// Tripwire for the member of the family moon does not implement yet.
+/// Tripwire for store forms moon does not implement (or must never accept).
 ///
-/// `ZDIFFSTORE` is not in the dispatch table, so it cannot misplace a
-/// destination today, which is the only reason it is absent from `PROBES`
-/// and from the routing guard.
+/// If a row here ever answers a success, it started working — and it went in
+/// WITHOUT a cross-shard guard, which means it shipped the moon#592 defect.
+/// Add it to `PROBES` and to `shared::touches_a_key_it_did_not_route_on`'s
+/// family list in the same change.
 ///
-/// If this test ever fails, it started working — and it went in WITHOUT a
-/// cross-shard guard, which means it shipped the moon#592 defect. Add it to
-/// `PROBES` and to `shared::touches_a_key_it_did_not_route_on`'s family list
-/// in the same change.
-///
-/// `GEORADIUS`/`GEORADIUSBYMEMBER ... STORE` were the other two rows here
-/// until moon#645. They now work, so they are covered by `PROBES` above —
-/// which is exactly the migration this tripwire exists to force. The `_RO`
-/// twins still refuse the clause and are checked below, because a read-only
-/// command that started writing would be a worse defect than the one this
-/// file is about.
+/// `GEORADIUS`/`GEORADIUSBYMEMBER ... STORE` were rows here until moon#645,
+/// and `ZDIFFSTORE` until moon#959. They now work, so they are covered by
+/// `PROBES` above — which is exactly the migration this tripwire exists to
+/// force. The `_RO` twins still refuse the clause and are checked below,
+/// because a read-only command that started writing would be a worse defect
+/// than the one this file is about.
 #[test]
 fn t2k4_unimplemented_store_forms_stay_unimplemented_or_get_a_guard() {
     let m = spawn_moon(SHARDS);
@@ -587,7 +596,6 @@ fn t2k4_unimplemented_store_forms_stay_unimplemented_or_get_a_guard() {
         assert_eq!(seeded, ":2\r\n", "GEOADD must seed {src}");
     }
     let cases: &[(&str, &[&str])] = &[
-        ("ZDIFFSTORE", &["ZDIFFSTORE", "t2k:zd:d", "1", "t2k:zd:s"]),
         (
             "GEORADIUS_RO STORE",
             &[

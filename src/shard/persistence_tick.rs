@@ -295,7 +295,8 @@ pub(crate) fn check_warm_transitions(
     manifest: &mut ShardManifest,
     warm_after_secs: u64,
     idle_after_secs: u64,
-    next_file_id: &mut u64,
+    // The shard's one cold file_id counter (`file_id_seed::allocate_from`).
+    spill_file_id: &std::cell::Cell<u64>,
     shard_id: usize,
     wal: &mut Option<WalWriterV3>,
 ) {
@@ -304,14 +305,16 @@ pub(crate) fn check_warm_transitions(
     if crate::shard::disk_monitor::is_dir_lost() {
         return;
     }
-    let count = vector_store.try_warm_transitions_all_idle(
-        shard_dir,
-        manifest,
-        warm_after_secs,
-        idle_after_secs,
-        next_file_id,
-        wal,
-    );
+    let count = crate::storage::tiered::file_id_seed::allocate_from(spill_file_id, |next| {
+        vector_store.try_warm_transitions_all_idle(
+            shard_dir,
+            manifest,
+            warm_after_secs,
+            idle_after_secs,
+            next,
+            wal,
+        )
+    });
     if count > 0 {
         info!(
             "Shard {}: transitioned {} segment(s) to warm tier",
@@ -409,9 +412,9 @@ pub(crate) fn enforce_warm_mmap_budget(
 /// loops.
 ///
 /// Drains background spill completions, runs the memory-pressure cascade if
-/// enabled, otherwise falls back to plain `timers::run_eviction`. Finally
-/// publishes the latest `next_file_id` back to the shared `Rc<Cell>` so
-/// connection handlers spawning fresh spills do not collide on file IDs.
+/// enabled, otherwise falls back to plain `timers::run_eviction`. Every file
+/// id it spills under is allocated from `spill_file_id`, the shard's one
+/// counter (`file_id_seed::allocate_from`) — never from a copy of it.
 ///
 /// Extracted from `event_loop.rs` so the file stays under the 1500-line cap
 /// and so both runtime arms cannot drift.
@@ -424,7 +427,6 @@ pub(crate) fn run_eviction_tick(
     server_config: &std::sync::Arc<crate::config::ServerConfig>,
     runtime_config: &std::sync::Arc<parking_lot::RwLock<crate::config::RuntimeConfig>>,
     page_cache: &Option<PageCache>,
-    next_file_id: &mut u64,
     wal_v3_writer: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
     script_cache: &std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
     // moon#506: the shard's ONE Lua VM slot (`event_loop`'s `lua_rc`, the same
@@ -553,19 +555,19 @@ pub(crate) fn run_eviction_tick(
         // -- see storage::tiered::cold_index::ColdIndex::resident_bytes doc
         // comment). This is a per-db O(1) accumulator read, same complexity
         // class as estimated_memory() itself, so folding it in here does not
-        // change this tick's cost -- and it is intentionally NOT folded into
-        // Database::estimated_memory()/resident_bytes() themselves, which
-        // stay untouched O(1) hot-path reads for the per-write eviction
-        // pre-gate (inline_write_can_skip_eviction / evict_to_budget).
+        // change this tick's cost. It stays out of `estimated_memory()` (INFO's
+        // used_memory and the per-db quota keep their meaning); the sum is
+        // `Database::budgeted_memory()`.
+        //
+        // moon#1036: that sum used to be open-coded HERE only, while the
+        // per-write gates (`inline_write_can_skip_eviction`, `evict_to_budget`
+        // without `.total()`) compared `estimated_memory()` alone. The cascade
+        // then evicted a cold index's worth of hot keys every tick that the
+        // write path let writers refill — two caps on one shard. Every gate now
+        // reads the one accessor (the timer path in `timers::run_eviction` too).
         let used = crate::shard::slice::with_shard(|s| {
-            s.databases.with_all_read(|dbs| {
-                dbs.iter()
-                    .map(|db| {
-                        db.estimated_memory()
-                            + db.cold_index.as_ref().map_or(0, |ci| ci.resident_bytes())
-                    })
-                    .sum::<usize>()
-            })
+            s.databases
+                .with_all_read(|dbs| dbs.iter().map(|db| db.budgeted_memory()).sum::<usize>())
         });
         shard_databases.publish_memory(shard_id, used);
         // Elastic budgets only exist under a finite maxmemory cap.
@@ -616,6 +618,10 @@ pub(crate) fn run_eviction_tick(
         crate::admin::metrics_setup::update_allocator_overhead_bytes(allocator_overhead);
     }
 
+    // Allocate through the shard's one counter: the cursor starts at the
+    // counter's current value and is written back with `max` below.
+    let mut cursor = spill_file_id.get();
+    let next_file_id = &mut cursor;
     if server_config.disk_offload_enabled()
         && should_run_pressure_cascade(
             runtime_config,
@@ -680,8 +686,8 @@ pub(crate) fn run_eviction_tick(
         );
     }
 
-    // Sync file ID back to the shared Cell so connection handlers see it.
-    spill_file_id.set(*next_file_id);
+    // Monotonic write-back: never lower the counter (moon#997 review).
+    spill_file_id.set(spill_file_id.get().max(cursor));
 }
 
 /// Drain any final spill completions and shut down the spill thread.
@@ -757,8 +763,11 @@ impl ColdMarkerSink<'_> {
         }
         let data = crate::persistence::cold_records::serialize_spilled(file_id, keys);
         if wal_leg && let Some(w) = self.wal_writer.as_deref_mut() {
-            w.append(
+            // moon#1039: the marker is db-scoped (replay applies it to the
+            // selected db's cold index) — carry the db in the header.
+            w.append_in_db(
                 crate::persistence::wal_v3::record::WalRecordType::Command,
+                db,
                 &data,
             );
         }
@@ -2338,6 +2347,73 @@ mod tests {
     /// counter arm — and the defect was a sample written into one of them.
     /// The VM sample must therefore live ONLY in `run_eviction_tick`, the body
     /// both arms call, never inline in a runtime-specific arm.
+    /// moon#997 review, pinned structurally: a shard's cold file ids have ONE
+    /// home, the shared `spill_file_id` counter.
+    ///
+    /// The event loop used to keep a second copy (`next_file_id`), re-synced
+    /// with `max` once per tick. On tokio the cross-shard SPSC drain ran after
+    /// that sync and advanced the counter; the eviction tick and warm
+    /// transitions then allocated from the stale copy — re-issuing the drain's
+    /// ids — and `run_eviction_tick` wrote it back with a plain `set`, moving
+    /// the counter BACKWARDS so the next handler spill re-issued them again.
+    /// The interleaving depends on tick timing, so this pins the two
+    /// properties that make it impossible instead of racing for it:
+    /// no second copy exists, and no write-back can lower the counter.
+    #[test]
+    fn test_cold_file_id_counter_has_one_home_and_never_moves_back() {
+        let event_loop_src = include_str!("event_loop.rs");
+        let copies: Vec<usize> = event_loop_src
+            .match_indices("next_file_id")
+            .filter(|(i, _)| !event_loop_src[*i..].starts_with("next_file_id_seed"))
+            .map(|(i, _)| event_loop_src[..i].lines().count())
+            .collect();
+        assert!(
+            copies.is_empty(),
+            "event_loop.rs keeps a second cold file_id counter (`next_file_id`, lines \
+             {copies:?}); allocate from `spill_file_id` via file_id_seed::allocate_from"
+        );
+
+        // Every write-back to the shared counter outside the seed must be
+        // monotonic. Test modules are excluded (they quote the pattern).
+        let sources = [
+            (
+                "shard/persistence_tick.rs",
+                include_str!("persistence_tick.rs"),
+            ),
+            ("shard/spsc_handler.rs", include_str!("spsc_handler.rs")),
+            ("shard/event_loop.rs", event_loop_src),
+            (
+                "server/conn/handler_monoio/mod.rs",
+                include_str!("../server/conn/handler_monoio/mod.rs"),
+            ),
+            (
+                "server/conn/handler_sharded/mod.rs",
+                include_str!("../server/conn/handler_sharded/mod.rs"),
+            ),
+            (
+                "scripting/bridge.rs",
+                include_str!("../scripting/bridge.rs"),
+            ),
+        ];
+        let mut lowering: Vec<String> = Vec::new();
+        for (name, src) in sources {
+            let body = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+            for (n, line) in body.lines().enumerate() {
+                if line.contains("spill_file_id.set(")
+                    && !line.contains(".max(")
+                    && !line.contains("spill_file_id.set(spill_seed)")
+                {
+                    lowering.push(format!("{name}:{}: {}", n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            lowering.is_empty(),
+            "a write-back can move the shard's cold file_id counter backwards and \
+             re-issue ids already on disk: {lowering:#?}"
+        );
+    }
+
     #[test]
     fn test_lua_vm_sample_lives_only_in_the_shared_tick_body() {
         let event_loop_src = include_str!("event_loop.rs");

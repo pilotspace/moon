@@ -187,6 +187,22 @@ fn replay_kv_record(
     counts.records_read += 1;
     match record.record_type {
         WalRecordType::Command => {
+            // moon#1039: the record's own db, never a context carried over
+            // from the previous record (the payload is a bare command with no
+            // `SELECT`). A record with no db context replays into db 0.
+            *selected_db = record.replay_db();
+            if *selected_db >= databases.len() {
+                // A restart with fewer `--databases` than the writer had.
+                // `replay_command` would clamp the db to 0, folding this
+                // write into db 0: the cross-db corruption #1039 fixed.
+                tracing::warn!(
+                    lsn = record.lsn,
+                    db = *selected_db,
+                    databases = databases.len(),
+                    "WAL replay: KV record for a db beyond --databases — skipped, not folded into db 0"
+                );
+                return;
+            }
             let decoded = crate::persistence::replay::replay_resp_payload(
                 engine,
                 databases,
@@ -853,6 +869,80 @@ mod tests {
                 other_commands: 2,
                 undecodable_records: 0,
             }
+        );
+    }
+
+    /// The last-resort replay puts every KV record into the db it was written
+    /// in (moon#1039), MOVE and `COPY ... DB n` included: their source db is
+    /// the record's db (moon#1046). A record for a db this server does not
+    /// have is skipped, never folded into db 0.
+    #[test]
+    fn last_resort_dir_replay_honours_each_records_db() {
+        use super::super::record::write_wal_v3_record_in_db;
+        use crate::storage::Database;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal-v3");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let mut data = make_v3_header(0);
+        let mut lsn = 0u64;
+        let mut push = |data: &mut Vec<u8>, db: Option<u16>, payload: &[u8]| {
+            lsn += 1;
+            write_wal_v3_record_in_db(data, lsn, WalRecordType::Command, db, payload);
+        };
+        push(&mut data, Some(3), &resp(&[b"SET", b"k", b"v3"]));
+        // No db context (a pre-#1039 record): db 0, not the previous record's.
+        push(&mut data, None, &resp(&[b"SET", b"k", b"v0"]));
+        // db 9 on a 4-db server: skipped. Folded into db 0 it would
+        // overwrite db 0's `k`.
+        push(&mut data, Some(9), &resp(&[b"SET", b"k", b"v9"]));
+        push(&mut data, Some(2), &resp(&[b"SET", b"m", b"vm"]));
+        push(&mut data, Some(2), &resp(&[b"MOVE", b"m", b"1"]));
+        push(
+            &mut data,
+            Some(3),
+            &resp(&[b"COPY", b"k", b"c", b"DB", b"0"]),
+        );
+        std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
+
+        let mut databases: Vec<Database> = (0..4).map(|_| Database::new()).collect();
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        let counts = replay_wal_v3_dir_commands(&wal_dir, &mut databases, &engine).unwrap();
+
+        assert_eq!(
+            string_value(&mut databases[3], b"k").as_deref(),
+            Some(&b"v3"[..]),
+            "a db-3 record replays into db 3"
+        );
+        assert_eq!(
+            string_value(&mut databases[0], b"k").as_deref(),
+            Some(&b"v0"[..]),
+            "a record with no db context replays into db 0, and the \
+             out-of-range db-9 record must not land there"
+        );
+        assert_eq!(
+            string_value(&mut databases[1], b"m").as_deref(),
+            Some(&b"vm"[..]),
+            "MOVE logged in db 2 moves db 2's key into db 1"
+        );
+        assert!(databases[2].get(b"m").is_none(), "MOVE left the source db");
+        assert_eq!(
+            string_value(&mut databases[0], b"c").as_deref(),
+            Some(&b"v3"[..]),
+            "COPY ... DB 0 logged in db 3 copies db 3's key"
+        );
+        let per_db: Vec<usize> = databases.iter().map(Database::len).collect();
+        assert_eq!(per_db, [2, 1, 0, 1]);
+        assert_eq!(
+            counts,
+            WalKvReplayCounts {
+                records_read: 6,
+                kv_commands_applied: 5,
+                other_commands: 0,
+                undecodable_records: 0,
+            },
+            "the skipped db-9 record is read but not applied"
         );
     }
 

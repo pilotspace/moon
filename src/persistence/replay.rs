@@ -143,8 +143,8 @@ fn is_hexpire_family_write(cmd: &[u8]) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayRoute {
     /// Applied to the KV keyspace: a `command::dispatch` handler ran, or a
-    /// replay shim that mutates the database slice (SWAPDB, FLUSHALL, the
-    /// HEXPIRE family) did.
+    /// replay shim that mutates the database slice (SWAPDB, FLUSHALL, MOVE /
+    /// `COPY ... DB n`, the HEXPIRE family) did.
     Keyspace,
     /// A replay-only cold-plane cut record (`MOON.COLDCUT` / `MOON.SPILLED`):
     /// it moves the cold-tier gate. It is not a key write.
@@ -166,6 +166,59 @@ impl ReplayRoute {
     pub fn is_kv_history(self) -> bool {
         matches!(self, ReplayRoute::Keyspace)
     }
+}
+
+/// Replay `MOVE` or `COPY ... DB n` against the two databases it names
+/// (moon#1046).
+///
+/// `src_db` is the replay db context (the `SELECT` the record was logged
+/// under) and must be `< databases.len()`. Uses the same parsers and core
+/// helpers as the live two-db intercept (`shard::spsc_two_db`) and the
+/// replica apply path, so a replayed record lands exactly as it did live:
+/// a MOVE onto an existing key, a MOVE or COPY of a missing source, and a
+/// COPY onto an existing key without `REPLACE` all stay no-ops, and the TTL
+/// travels inside the entry.
+///
+/// Re-replaying an already-applied record is harmless: a second MOVE finds
+/// the source empty, and a second COPY writes the same entry again (or is a
+/// collision no-op without `REPLACE`).
+///
+/// Returns `None` for a COPY without a `DB` clause or with `DB <src_db>`,
+/// which the single-db dispatch path handles. Otherwise returns the reply
+/// the command would have produced; an error means nothing was applied.
+fn replay_two_db(
+    databases: &mut [Database],
+    cmd: &[u8],
+    args: &[Frame],
+    src_db: usize,
+) -> Option<Frame> {
+    use crate::command::keyspace::move_cmd as ksmv;
+
+    let db_count = databases.len();
+    // `with_two_slice_dbs` panics on equal or out-of-range indexes. Neither
+    // can reach it: the caller clamps `src_db` into range, both parsers
+    // reject a destination `>= db_count`, and the same-db cases are handled
+    // before the call.
+    if src_db >= db_count {
+        return None;
+    }
+    if cmd.eq_ignore_ascii_case(b"MOVE") {
+        let resp = match ksmv::parse_move_args(args, db_count) {
+            Err(e) => e,
+            Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
+            Ok((key, dst_db)) => ksmv::with_two_slice_dbs(databases, src_db, dst_db, |src, dst| {
+                ksmv::move_core(src, dst, &key)
+            }),
+        };
+        return Some(resp);
+    }
+    let resp = match ksmv::parse_copy_db_args(args, src_db, db_count)? {
+        Err(e) => e,
+        Ok(ca) => ksmv::with_two_slice_dbs(databases, src_db, ca.dst_db, |src, dst| {
+            ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
+        }),
+    };
+    Some(resp)
 }
 
 /// Trait that abstracts command dispatch for AOF/WAL replay.
@@ -377,6 +430,28 @@ impl CommandReplayEngine for DispatchReplayEngine {
                 db_count
             );
             *selected_db = 0;
+        }
+
+        // moon#1046: MOVE and `COPY ... DB n` need the source AND the
+        // destination database, so they cannot go through the single-db
+        // `command::dispatch` either: MOVE errors there, and COPY with a DB
+        // clause copies within the source db. Either way an acknowledged
+        // two-db write came back undone after a restart.
+        if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
+            if let Some(resp) = replay_two_db(databases, cmd, args, *selected_db) {
+                if let Frame::Error(e) = resp {
+                    tracing::warn!(
+                        "AOF/WAL replay: {} record not applied: {}",
+                        String::from_utf8_lossy(cmd),
+                        String::from_utf8_lossy(&e)
+                    );
+                }
+                // KV history even when refused (bad arity, missing source,
+                // destination db out of range): a keyspace handler ran, the
+                // same rule SWAPDB and dispatch arity errors follow.
+                return ReplayRoute::Keyspace;
+            }
+            // COPY without a DB clause, or `DB <selected>`: single-db path.
         }
 
         // moon#677: FLUSHALL needs the full slice for the same reason SWAPDB
@@ -709,10 +784,6 @@ mod tests {
 
     // ── ReplayRoute (moon#1018) ───────────────────────────────────────────────
 
-    fn bulk(s: &'static [u8]) -> Frame {
-        Frame::BulkString(bytes::Bytes::from_static(s))
-    }
-
     /// Each replay path reports where the record went, so recovery counts KV
     /// history by what replay did rather than by a list of names. Only a
     /// record that reached the keyspace is `Keyspace`, including one a
@@ -775,5 +846,225 @@ mod tests {
         ] {
             assert!(!r.is_kv_history(), "{r:?} is not KV history");
         }
+    }
+
+    /// MOVE and `COPY ... DB n` replay through the two-db intercept, not
+    /// `command::dispatch`, and are KV history like every other keyspace
+    /// write: a WAL carrying them is the KV authority. A record the intercept
+    /// refuses (destination db this server lacks, bad arity) still went to a
+    /// keyspace handler, so it is `Keyspace` too, as a refused SWAPDB is.
+    #[test]
+    fn move_and_copy_db_replay_route_is_keyspace() {
+        let engine = DispatchReplayEngine::new();
+        let mut dbs = sixteen_dbs();
+        put(&mut dbs[0], b"k", b"v", 0);
+        let mut sel = 0usize;
+        let mut route =
+            |cmd: &[u8], args: &[Frame]| engine.replay_command(&mut dbs, cmd, args, &mut sel);
+
+        assert_eq!(
+            route(b"COPY", &[bulk(b"k"), bulk(b"k2"), bulk(b"DB"), bulk(b"5")]),
+            ReplayRoute::Keyspace,
+            "COPY ... DB n"
+        );
+        assert_eq!(
+            route(b"move", &[bulk(b"k"), bulk(b"3")]),
+            ReplayRoute::Keyspace,
+            "MOVE"
+        );
+        assert_eq!(
+            route(b"MOVE", &[bulk(b"k"), bulk(b"99")]),
+            ReplayRoute::Keyspace,
+            "MOVE refused: destination db out of range"
+        );
+        assert_eq!(
+            route(
+                b"COPY",
+                &[bulk(b"k"), bulk(b"k2"), bulk(b"DB"), bulk(b"99")]
+            ),
+            ReplayRoute::Keyspace,
+            "COPY refused: destination db out of range"
+        );
+        assert_eq!(
+            route(b"MOVE", &[bulk(b"k")]),
+            ReplayRoute::Keyspace,
+            "MOVE refused: arity"
+        );
+        assert_eq!(get_key(&mut dbs[3], b"k").as_deref(), Some(b"v".as_ref()));
+        assert_eq!(get_key(&mut dbs[5], b"k2").as_deref(), Some(b"v".as_ref()));
+    }
+
+    // ── MOVE / COPY ... DB n replay intercept (moon#1046) ────────────────────
+    //
+    // Both commands need the source AND the destination database; the
+    // single-db `command::dispatch` can reach only one. Replay must apply them
+    // with the same core helpers the live two-db intercept uses.
+
+    fn bulk(b: &[u8]) -> Frame {
+        Frame::BulkString(bytes::Bytes::copy_from_slice(b))
+    }
+
+    fn sixteen_dbs() -> Vec<Database> {
+        (0..16).map(|_| Database::new()).collect()
+    }
+
+    fn put(db: &mut Database, key: &[u8], value: &[u8], expires_at_ms: u64) {
+        let mut entry = Entry::new_string(bytes::Bytes::copy_from_slice(value));
+        entry.set_expires_at_ms(expires_at_ms);
+        db.set(&bytes::Bytes::copy_from_slice(key), entry);
+    }
+
+    fn ttl_of(db: &mut Database, key: &[u8]) -> Option<u64> {
+        db.get(key).map(|e| e.expires_at_ms())
+    }
+
+    #[test]
+    fn replay_move_relocates_key_and_keeps_ttl() {
+        let engine = DispatchReplayEngine::new();
+        let mut dbs = sixteen_dbs();
+        let at = dbs[0].now_ms() + 60_000;
+        put(&mut dbs[0], b"k", b"v", at);
+        let mut selected = 0usize;
+        engine.replay_command(&mut dbs, b"MOVE", &[bulk(b"k"), bulk(b"3")], &mut selected);
+        assert_eq!(
+            get_key(&mut dbs[0], b"k"),
+            None,
+            "MOVE must leave the source db"
+        );
+        assert_eq!(get_key(&mut dbs[3], b"k").as_deref(), Some(b"v".as_ref()));
+        assert_eq!(ttl_of(&mut dbs[3], b"k"), Some(at), "MOVE carries the TTL");
+        assert_eq!(selected, 0, "MOVE must not change the replay db context");
+    }
+
+    #[test]
+    fn replay_move_uses_selected_db_as_source() {
+        let engine = DispatchReplayEngine::new();
+        let mut dbs = sixteen_dbs();
+        put(&mut dbs[7], b"k", b"v7", 0);
+        put(&mut dbs[0], b"k", b"v0", 0);
+        let mut selected = 7usize;
+        engine.replay_command(&mut dbs, b"MOVE", &[bulk(b"k"), bulk(b"2")], &mut selected);
+        assert_eq!(get_key(&mut dbs[7], b"k"), None);
+        assert_eq!(get_key(&mut dbs[2], b"k").as_deref(), Some(b"v7".as_ref()));
+        assert_eq!(
+            get_key(&mut dbs[0], b"k").as_deref(),
+            Some(b"v0".as_ref()),
+            "db 0 is not the source when the record was logged under SELECT 7"
+        );
+    }
+
+    #[test]
+    fn replay_move_onto_existing_key_is_noop() {
+        let engine = DispatchReplayEngine::new();
+        let mut dbs = sixteen_dbs();
+        put(&mut dbs[0], b"k", b"src", 0);
+        put(&mut dbs[3], b"k", b"dst", 0);
+        let mut selected = 0usize;
+        engine.replay_command(&mut dbs, b"MOVE", &[bulk(b"k"), bulk(b"3")], &mut selected);
+        assert_eq!(get_key(&mut dbs[0], b"k").as_deref(), Some(b"src".as_ref()));
+        assert_eq!(get_key(&mut dbs[3], b"k").as_deref(), Some(b"dst".as_ref()));
+    }
+
+    /// Re-replaying a MOVE that was already applied changes nothing: the
+    /// source no longer holds the key.
+    #[test]
+    fn replay_move_twice_is_idempotent() {
+        let engine = DispatchReplayEngine::new();
+        let mut dbs = sixteen_dbs();
+        put(&mut dbs[0], b"k", b"v", 0);
+        let mut selected = 0usize;
+        let args = [bulk(b"k"), bulk(b"3")];
+        engine.replay_command(&mut dbs, b"MOVE", &args, &mut selected);
+        engine.replay_command(&mut dbs, b"MOVE", &args, &mut selected);
+        assert_eq!(get_key(&mut dbs[0], b"k"), None);
+        assert_eq!(get_key(&mut dbs[3], b"k").as_deref(), Some(b"v".as_ref()));
+    }
+
+    /// A record naming a db this server does not have (restarted with fewer
+    /// `--databases`) is skipped without a panic and without touching the key.
+    #[test]
+    fn replay_move_and_copy_out_of_range_db_skip() {
+        let engine = DispatchReplayEngine::new();
+        let mut dbs = sixteen_dbs();
+        put(&mut dbs[0], b"k", b"v", 0);
+        let mut selected = 0usize;
+        engine.replay_command(&mut dbs, b"MOVE", &[bulk(b"k"), bulk(b"99")], &mut selected);
+        engine.replay_command(
+            &mut dbs,
+            b"COPY",
+            &[bulk(b"k"), bulk(b"k2"), bulk(b"DB"), bulk(b"99")],
+            &mut selected,
+        );
+        assert_eq!(get_key(&mut dbs[0], b"k").as_deref(), Some(b"v".as_ref()));
+        assert_eq!(get_key(&mut dbs[0], b"k2"), None);
+        assert_eq!(dbs.iter().map(Database::len).sum::<usize>(), 1);
+    }
+
+    #[test]
+    fn replay_copy_db_writes_the_destination_db() {
+        let engine = DispatchReplayEngine::new();
+        let mut dbs = sixteen_dbs();
+        let at = dbs[0].now_ms() + 60_000;
+        put(&mut dbs[0], b"k", b"v", at);
+        let mut selected = 0usize;
+        engine.replay_command(
+            &mut dbs,
+            b"COPY",
+            &[bulk(b"k"), bulk(b"k2"), bulk(b"DB"), bulk(b"5")],
+            &mut selected,
+        );
+        assert_eq!(get_key(&mut dbs[0], b"k").as_deref(), Some(b"v".as_ref()));
+        assert_eq!(get_key(&mut dbs[5], b"k2").as_deref(), Some(b"v".as_ref()));
+        assert_eq!(ttl_of(&mut dbs[5], b"k2"), Some(at), "COPY carries the TTL");
+        assert_eq!(
+            get_key(&mut dbs[0], b"k2"),
+            None,
+            "a COPY ... DB 5 must not land in the source db"
+        );
+    }
+
+    #[test]
+    fn replay_copy_db_honours_replace() {
+        let engine = DispatchReplayEngine::new();
+        let mut dbs = sixteen_dbs();
+        put(&mut dbs[0], b"a", b"new", 0);
+        put(&mut dbs[5], b"b", b"old", 0);
+        let mut selected = 0usize;
+        let no_replace = [bulk(b"a"), bulk(b"b"), bulk(b"DB"), bulk(b"5")];
+        engine.replay_command(&mut dbs, b"COPY", &no_replace, &mut selected);
+        assert_eq!(
+            get_key(&mut dbs[5], b"b").as_deref(),
+            Some(b"old".as_ref()),
+            "without REPLACE an existing destination key is kept"
+        );
+        let replace = [
+            bulk(b"a"),
+            bulk(b"b"),
+            bulk(b"DB"),
+            bulk(b"5"),
+            bulk(b"REPLACE"),
+        ];
+        engine.replay_command(&mut dbs, b"COPY", &replace, &mut selected);
+        assert_eq!(get_key(&mut dbs[5], b"b").as_deref(), Some(b"new".as_ref()));
+    }
+
+    /// `COPY ... DB <selected>` and a COPY without a DB clause stay on the
+    /// single-db path.
+    #[test]
+    fn replay_copy_same_db_still_copies_in_place() {
+        let engine = DispatchReplayEngine::new();
+        let mut dbs = sixteen_dbs();
+        put(&mut dbs[2], b"a", b"v", 0);
+        let mut selected = 2usize;
+        engine.replay_command(
+            &mut dbs,
+            b"COPY",
+            &[bulk(b"a"), bulk(b"b"), bulk(b"DB"), bulk(b"2")],
+            &mut selected,
+        );
+        engine.replay_command(&mut dbs, b"COPY", &[bulk(b"a"), bulk(b"c")], &mut selected);
+        assert_eq!(get_key(&mut dbs[2], b"b").as_deref(), Some(b"v".as_ref()));
+        assert_eq!(get_key(&mut dbs[2], b"c").as_deref(), Some(b"v".as_ref()));
+        assert_eq!(dbs.iter().map(Database::len).sum::<usize>(), 3);
     }
 }
