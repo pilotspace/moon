@@ -895,6 +895,21 @@ impl ShardManifest {
     ///   Guards against pruning files that a long-running reader holds open;
     ///   `retain_secs` must be ≥ the longest expected reader snapshot age.
     ///
+    /// ## The highest file id is never pruned
+    ///
+    /// A tombstone holding the highest `file_id` of any entry is kept whatever
+    /// its age (moon#1067). It is the only durable record of how far the
+    /// shard's id counter got: a restart resumes the counter at one past the
+    /// highest id the manifest or the disk still holds
+    /// (`tiered::file_id_seed`), so pruning this entry after its file was
+    /// reclaimed moves the counter backwards and re-issues ids. The AOF
+    /// generation still carries `MOON.SPILLED <id>` for the OLD file, and on
+    /// replay that record authorises the re-issued id early: a write logged
+    /// before its key was spilled into the new file is applied on top of the
+    /// value it already produced. Once a higher id is in the manifest, the
+    /// kept tombstone is no longer the highest and ages out normally. At most
+    /// one id is pinned (one entry per file type that shares it).
+    ///
     /// ## Crash safety
     ///
     /// This method is in-memory only — it does **not** commit. The caller must
@@ -917,10 +932,14 @@ impl ShardManifest {
     pub fn gc_tombstones(&mut self, retain_epochs: u64, retain_secs: u64, now: Instant) -> usize {
         let current_epoch = self.active_root.epoch;
         let mut pruned = 0usize;
+        let high_water = self.active_root.entries.iter().map(|e| e.file_id).max();
 
         self.active_root.entries.retain(|entry| {
             if entry.status != FileStatus::Tombstone {
                 return true; // keep all non-tombstone entries
+            }
+            if Some(entry.file_id) == high_water {
+                return true; // the id counter's only durable high-water mark
             }
             let Some(&(tombstone_epoch, tombstoned_at)) = self
                 .tombstone_registry
@@ -2181,6 +2200,8 @@ mod tests {
         warm.file_type = PageType::VecCodes as u8;
         m.add_file(warm).unwrap();
         m.add_file(make_entry(5)).unwrap(); // KvLeaf, same id
+        // A higher id, so neither tombstone is the pinned high-water mark.
+        m.add_file(make_entry(6)).unwrap();
         m.commit().unwrap();
 
         m.remove_file(5, PageType::KvLeaf);
@@ -2190,8 +2211,11 @@ mod tests {
 
         let pruned = m.gc_tombstones(2, 0, Instant::now());
         assert_eq!(pruned, 1, "only the tombstone two epochs old is due");
-        let left: Vec<u8> = m.files().iter().map(|e| e.file_type).collect();
-        assert_eq!(left, vec![PageType::VecCodes as u8]);
+        let left: Vec<(u64, u8)> = m.files().iter().map(|e| (e.file_id, e.file_type)).collect();
+        assert_eq!(
+            left,
+            vec![(5, PageType::VecCodes as u8), (6, PageType::KvLeaf as u8)]
+        );
     }
 
     /// A create that dies part-way must leave NO file at the manifest path —

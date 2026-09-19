@@ -81,8 +81,10 @@ fn crash_manifest_gc_before_commit_recovers_pre_staging_root() {
     m.add_file(make_entry(2)).unwrap();
     m.commit().unwrap(); // epoch 2 on Root B (active_slot = 1)
 
-    // Tombstone file #2 and commit — epoch 3 on Root A (active_slot = 0).
-    m.remove_file(2, PageType::KvLeaf);
+    // Tombstone file #1 and commit — epoch 3 on Root A (active_slot = 0).
+    // Not #2: GC never prunes the highest file id (moon#1067), and this
+    // scenario needs a tombstone that zero retention does prune.
+    m.remove_file(1, PageType::KvLeaf);
     m.commit().unwrap(); // epoch 3 holds the tombstone
 
     // Capture the pre-staging state for assertions after simulated crash.
@@ -130,7 +132,7 @@ fn crash_manifest_gc_before_commit_recovers_pre_staging_root() {
     assert_eq!(
         m3.active_entry_count(),
         1,
-        "post-crash recovery: one non-tombstone entry (file_id=1) must be visible",
+        "post-crash recovery: one non-tombstone entry (file_id=2) must be visible",
     );
 }
 

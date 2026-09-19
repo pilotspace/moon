@@ -236,6 +236,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `>` loop never saw them again. The waker now claims first and reads only on
   a won claim, the claim-token order moon#1045 gave the list and zset wakers.
 
+- **A restart no longer re-issues a cold-tier file id, which could apply a
+  write twice** (moon#1067). A restart resumes the shard's cold file-id
+  counter at one past the highest id the manifest or the disk still holds.
+  Manifest tombstone GC could prune the entry that held the highest id once
+  its file was reclaimed, and the counter then moved backwards. The AOF
+  appends to the same generation across restarts, so the generation still
+  held a `MOON.SPILLED <id>` record for the old file. On replay, that record
+  made the re-issued id readable early, and a write logged before its key
+  was spilled into the new file was applied on top of the value it had
+  already produced. Measured with `--appendonly yes --disk-offload enable`
+  and the tombstone retention at zero: `RPUSH X a` once, then spill, restart,
+  spill again, restart, and `LRANGE X` read `a a`, after both `kill -9` and
+  `SHUTDOWN`, on both runtimes. The same sequence with the default retention
+  (tombstones outlive the restart) read `a`. GC now keeps the tombstone that
+  holds the highest file id until a higher id is in the manifest. That pins
+  at most one manifest entry per shard. No on-disk format change.
+
+- **CLIENT TRACKING never drops an invalidation silently, scripts are
+  tracked, and a RESP2 subscriber's pipeline follows its live subscription
+  count** (moon#1088, moon#1089, moon#1090, refs moon#1078). Every wire reply
+  was read off redis-server 8.6.1 over a raw socket first.
+  - moon#1088: a tracking connection's invalidations went through a 256-slot
+    channel with `try_send`, so one 400-key `MSET` delivered 256 pushes and the
+    client kept serving the other 144 keys stale. The queue is now unbounded in
+    slots and bounded in bytes by `--client-output-buffer-limit-normal`; past
+    it the connection is closed through the `CLIENT KILL` path, which is what
+    redis does at its output-buffer limit (measured: `normal 8192 0 0` closes
+    the tracker on that `MSET`). The limit bounds what is QUEUED, as redis's
+    bounds its output buffer. A tracker that stops reading is always closed.
+    A tracker whose connection drains the queue on another shard thread
+    while the burst arrives can receive every push instead. A burst is
+    written in socket writes that never exceed that limit, and a RESP2
+    connection, which redis writes nothing for its own invalidations, queues
+    nothing. The RESP2/RESP3 switch takes effect at the `HELLO` itself, so a
+    pipelined `HELLO 3` / `GET k` / `BLPOP` still gets the push for `k`. A
+    RESP3 tracker that runs `MONITOR` keeps receiving its pushes, as on
+    redis; on monoio it used to receive none. A REDIRECT target that is
+    subscribed receives through its pub/sub channel: one command's
+    invalidations, or a whole script's or `EXEC` body's, now take one slot
+    there instead of one per key, and a target whose channel is still full is
+    disconnected rather than silently shorted.
+  - moon#1089: a write made through `redis.call` invalidated nothing, and a
+    read made inside a script was never tracked. The scripting bridge now
+    applies tracking to every command a script runs, as redis does inside
+    `call()`: writes invalidate (NOLOOP judged against the caller), reads
+    register for the client that ran the script under its OPTIN/OPTOUT/CACHING
+    state. `EVAL`, `EVALSHA`, `EVAL_RO`, `FCALL`, `FCALL_RO`, scripts routed to
+    another shard and scripts queued inside `MULTI` are all covered, and a
+    `FCALL` of a function that only reads no longer counts as a write of its
+    keys. A script's tracking effects are recorded without a lock as it runs
+    and applied in order under one tracking lock when it ends, so a script's
+    `redis.call`s do not each contend for the process-wide tracking mutex.
+  - moon#1090: commands a RESP2 client pipelined after its last `UNSUBSCRIBE`
+    (or `RESET`) were refused with the subscriber-context error on monoio and
+    left unanswered on tokio. The subscriber gate now judges each command by
+    the subscription count it runs under, and hands the rest of the batch back
+    to the normal path.
+  - moon#1078: `CLIENT LIST` and `CLIENT INFO` report tracking — `flags=t`,
+    `R` for a broken redirect, `B` for BCAST, and `redir=` (`0` with no
+    redirect, `-1` with tracking off). A RESP3 REDIRECT target that neither
+    subscribed nor enabled tracking still receives nothing: reaching it needs
+    either a channel on every RESP3 connection, which keeps each one out of
+    idle task parking (measured on monoio, macOS, `--conn-park-secs 2`: 2000
+    idle `HELLO 3` connections report `parked_clients:2000`, the same
+    connections holding a channel `parked_clients:0`), or a cross-thread wake of
+    a parked connection, which the idle-park machinery does not have. That
+    part of moon#1078 stays open.
+
 - **A served blocking pop is logged by the shard that popped it, at the moment
   it popped** (moon#1056, moon#1097). Since moon#827 a `BLPOP`/`BRPOP`/
   `BLMOVE`/`BRPOPLPUSH`/`BLMPOP`/`BZPOPMIN`/`BZPOPMAX`/`BZMPOP` that popped
