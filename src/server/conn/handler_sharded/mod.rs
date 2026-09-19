@@ -2326,18 +2326,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                             use crate::command::keyspace::move_cmd as ksmv;
                             let src_db = conn.selected_db;
                             let db_count = ctx.shard_databases.db_count();
-                            let response = match ksmv::parse_move_args(cmd_args, db_count) {
+                            // `resolve_move` refuses `dst_db == src_db` with
+                            // redis's same-object error (moon#1062).
+                            let response = match ksmv::resolve_move(cmd_args, src_db, db_count) {
                                 Err(e) => e,
-                                Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
                                 Ok((key, dst_db)) => {
                                     // Unconditional slice path: ShardSlice is always initialized.
                                     // L4: `with_pair` is the exact contract
                                     // `with_two_slice_dbs` had — asserts the
                                     // indexes differ, panics out of range,
                                     // acquires ascending, hands the closure
-                                    // (src, dst). The `dst_db == src_db` match
-                                    // arm above short-circuits, so the
-                                    // distinct-db assert cannot fire here.
+                                    // (src, dst). `resolve_move` never yields
+                                    // `dst_db == src_db`, so the distinct-db
+                                    // assert cannot fire here.
                                     crate::shard::slice::with_shard(|s| {
                                         s.databases.with_pair(src_db, dst_db, |src, dst| {
                                             ksmv::move_core(src, dst, &key)

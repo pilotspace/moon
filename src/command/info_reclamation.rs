@@ -402,7 +402,75 @@ pub fn write_reclamation_section(buf: &mut String) {
         RECL_COLD_EXPIRED_BYTES_RECLAIMED_TOTAL.load(Ordering::Relaxed),
     );
 
+    // -- Cold-tier recovery loss (moon#875): what the cold-index rebuild
+    //    could NOT read at boot, by cause, summed over shards. Each unit is a
+    //    slice of the keyspace that now reads as ABSENT. Any non-zero value
+    //    is a degraded recovery — alarm on it. --
+    let _ = write!(
+        buf,
+        "reclamation_cold_recovery_files_missing_total:{}\r\n\
+         reclamation_cold_recovery_files_unreadable_total:{}\r\n\
+         reclamation_cold_recovery_files_short_total:{}\r\n\
+         reclamation_cold_recovery_pages_rejected_total:{}\r\n\
+         reclamation_cold_recovery_partial_page_bytes_total:{}\r\n\
+         reclamation_cold_recovery_entries_rejected_total:{}\r\n\
+         reclamation_cold_read_unreadable_total:{}\r\n",
+        RECL_COLD_RECOVERY_FILES_MISSING_TOTAL.load(Ordering::Relaxed),
+        RECL_COLD_RECOVERY_FILES_UNREADABLE_TOTAL.load(Ordering::Relaxed),
+        RECL_COLD_RECOVERY_FILES_SHORT_TOTAL.load(Ordering::Relaxed),
+        RECL_COLD_RECOVERY_PAGES_REJECTED_TOTAL.load(Ordering::Relaxed),
+        RECL_COLD_RECOVERY_PARTIAL_PAGE_BYTES_TOTAL.load(Ordering::Relaxed),
+        RECL_COLD_RECOVERY_ENTRIES_REJECTED_TOTAL.load(Ordering::Relaxed),
+        RECL_COLD_READ_UNREADABLE_TOTAL.load(Ordering::Relaxed),
+    );
+
     buf.push_str("\r\n");
+}
+
+// ---------------------------------------------------------------------------
+// moon#875: cold-tier recovery loss + read-time unreadable counters
+// ---------------------------------------------------------------------------
+//
+// The cold-index rebuild used to skip an unreadable file, a corrupt page and
+// a partial trailing page with no trace, and every entry it skipped then
+// read as an absent key. These count each skip by cause (see
+// `storage::tiered::cold_index::ColdRebuildReport` for the classes) so the
+// loss is visible in `INFO` on the instance that suffered it, not only in a
+// log line that may have rotated away.
+
+/// Active manifest heap files that were not on disk at rebuild.
+pub static RECL_COLD_RECOVERY_FILES_MISSING_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Heap files that failed to read for any reason but `NotFound`.
+pub static RECL_COLD_RECOVERY_FILES_UNREADABLE_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Heap files shorter than their manifest `byte_size`.
+pub static RECL_COLD_RECOVERY_FILES_SHORT_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Heap pages rejected for a bad header, a foreign page type or a CRC mismatch.
+pub static RECL_COLD_RECOVERY_PAGES_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Bytes found in trailing partial pages (never produced by the writer).
+pub static RECL_COLD_RECOVERY_PARTIAL_PAGE_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Slots inside valid pages that did not decode.
+pub static RECL_COLD_RECOVERY_ENTRIES_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Read-time: cold reads whose index entry pointed at bytes that could not
+/// be produced (file missing/unreadable, page corrupt, slot undecodable).
+/// Each one answered as a miss to the client while the key stayed indexed.
+pub static RECL_COLD_READ_UNREADABLE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Add one shard's rebuild report to the process-wide totals.
+#[inline]
+pub fn record_cold_recovery_report(r: &crate::storage::tiered::cold_index::ColdRebuildReport) {
+    RECL_COLD_RECOVERY_FILES_MISSING_TOTAL.fetch_add(r.files_missing, Ordering::Relaxed);
+    RECL_COLD_RECOVERY_FILES_UNREADABLE_TOTAL.fetch_add(r.files_unreadable, Ordering::Relaxed);
+    RECL_COLD_RECOVERY_FILES_SHORT_TOTAL.fetch_add(r.files_short, Ordering::Relaxed);
+    RECL_COLD_RECOVERY_PAGES_REJECTED_TOTAL.fetch_add(r.pages_rejected, Ordering::Relaxed);
+    RECL_COLD_RECOVERY_PARTIAL_PAGE_BYTES_TOTAL.fetch_add(r.partial_page_bytes, Ordering::Relaxed);
+    RECL_COLD_RECOVERY_ENTRIES_REJECTED_TOTAL.fetch_add(r.entries_rejected, Ordering::Relaxed);
+}
+
+/// Count one read-time unreadable cold entry. Returns the new total, so the
+/// caller can rate-limit its log line.
+#[inline]
+pub fn record_cold_read_unreadable() -> u64 {
+    RECL_COLD_READ_UNREADABLE_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 // ---------------------------------------------------------------------------
