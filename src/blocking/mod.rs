@@ -3,6 +3,8 @@ pub mod claim;
 mod claim_wake_tests;
 pub mod group;
 pub mod pop_log;
+pub(crate) mod stream_log;
+pub mod stream_wake;
 pub mod wakeup;
 
 pub use claim::{ClaimToken, Settled};

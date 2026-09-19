@@ -199,6 +199,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A blocked `XREADGROUP` that times out as it is served no longer strands
+  entries in its PEL** (moon#1047). The owner's stream waker ran the read —
+  moving the entries into the consumer's PEL and advancing the cursor —
+  before claiming a remote waiter; a waiter whose timeout settled its claim in
+  between answered nil while the entries sat undelivered in its PEL, and a
+  `>` loop never saw them again. The waker now claims first and reads only on
+  a won claim, the claim-token order moon#1045 gave the list and zset wakers.
+  The readiness check before the claim is read-only. It used to take the
+  stream mutably, and a wake that served nothing then aborted every `EXEC`
+  watching the stream. A consumer the check must create does not signal
+  watchers, as in redis.
+
+- **`XCLAIM` honours its options** (moon#1104). Every argument that parsed as
+  a stream id was claimed, so `RETRYCOUNT 1` claimed entry `1-0` and a
+  `TIME` value claimed another, and `IDLE`, `TIME`, `RETRYCOUNT`, `FORCE`,
+  `JUSTID` and `LASTID` were ignored — which also meant the records redis
+  propagates for a group read (and moon now logs) could not be replayed. The
+  ids now run until the first non-id argument and every option is applied as
+  in redis 8.6.1, with its error texts: `NOGROUP No such key 'k' or consumer
+  group 'g'` for a missing key or group (it answered an empty array),
+  `Unrecognized XCLAIM option`, and the `Invalid ... argument for XCLAIM`
+  family.
+
+- **A blocking `XREADGROUP` that delivers is logged, and survives `kill -9`**
+  (moon#1104). A consumer-group read moves what it delivers into the PEL and
+  advances the group's last-delivered id, but through `BLOCK` it went through
+  the blocking intercept and nothing reached the AOF or the replication
+  stream: after a restart the PEL was empty, the cursor was back, and the next
+  `>` reader was handed the same entries again (every row of the new kill -9
+  test, `--shards 1` and `--shards 4`, immediate and parked, with and without
+  `NOACK`). The shard that serves the read now logs, in the read's own
+  synchronous stretch and before the reply leaves, what redis-server 8.6.1
+  propagates for it: one `XCLAIM key group consumer 0 id TIME t RETRYCOUNT n
+  FORCE JUSTID LASTID id` per delivered entry, `XGROUP SETID` for the cursor,
+  and `XGROUP CREATECONSUMER` for a `NOACK` read that created its consumer
+  (`ENTRIESREAD` is omitted because moon keeps no such counter, and the
+  records are not wrapped in `MULTI`, which moon's log never carries). Under
+  `appendfsync always` the reader confirms the fsync on the stream owner's
+  writer, as a blocking pop does; a record the writer refuses answers the
+  reader with the standard `MOONERR AOF backpressure` error.
+
 - **A cross-shard `COPY` keeps the source's absolute expiry** (moon#1095). The
   TTL crossed as a relative duration — `PTTL` read on the source shard's
   cached clock, `PEXPIRE` re-anchored on the destination's — so the copy's
