@@ -1692,6 +1692,63 @@ assert_eq "moon#1062 MOVE and COPY ... DB n inside MULTI (shards=$SHARDS)" \
     "$(move_copy_in_multi_outcome "$PORT_REDIS")" "$(move_copy_in_multi_outcome "$PORT_RUST")"
 
 # ---------------------------------------------------------------------------
+# moon#1068: MOVE and COPY ... DB n issued from a script (EVAL and FCALL)
+# ---------------------------------------------------------------------------
+#
+# Pre-fix, `redis.call('MOVE', ...)` answered `ERR MOVE requires handler-level
+# dispatch`, and `redis.call('COPY', a, c, 'DB', 4)` answered :1 but wrote `c`
+# into the SCRIPT's db. The verdict is every reply plus where each key ended up
+# in dbs 0, 3, 4 and 5, and the absolute deadline the moved key kept.
+script_move_copy_outcome() {
+    local port=$1 db
+    for db in 0 3 4 5; do
+        redis-cli -p "$port" -n "$db" DEL "{sc1068}a" "{sc1068}b" "{sc1068}c" >/dev/null 2>&1 || true
+    done
+    redis-cli -p "$port" SET "{sc1068}a" 1 PXAT 4102444800000 >/dev/null 2>&1 || true
+    redis-cli -p "$port" SET "{sc1068}b" 2 >/dev/null 2>&1 || true
+    redis-cli -p "$port" FUNCTION LOAD REPLACE $'#!lua name=sc1068\nredis.register_function(\'mv\', function(keys, args) return redis.call(\'MOVE\', keys[1], args[1]) end)\n' >/dev/null 2>&1 || true
+    local reply
+    reply="$(redis-cli -p "$port" EVAL "redis.call('MOVE', KEYS[1], '3'); return redis.call('COPY', KEYS[2], KEYS[3], 'DB', '4')" 3 "{sc1068}a" "{sc1068}b" "{sc1068}c" 2>&1)"
+    reply+=" $(redis-cli -p "$port" EVAL "return {redis.pcall('MOVE', KEYS[1], '0'), redis.pcall('COPY', KEYS[1], KEYS[2], 'DB', '99')}" 2 "{sc1068}b" "{sc1068}c" 2>&1 | tr '\n' ' ')"
+    reply+=" $(redis-cli -p "$port" FCALL mv 1 "{sc1068}b" 5 2>&1)"
+    local where=""
+    for db in 0 3 4 5; do
+        where="${where}db${db}:$(redis-cli -p "$port" -n "$db" EXISTS "{sc1068}a" "{sc1068}b" "{sc1068}c" 2>&1),"
+    done
+    where+="at:$(redis-cli -p "$port" -n 3 PEXPIRETIME "{sc1068}a" 2>&1)"
+    redis-cli -p "$port" FUNCTION DELETE sc1068 >/dev/null 2>&1 || true
+    echo "${reply} | ${where}"
+}
+assert_eq "moon#1068 MOVE and COPY ... DB n from a script (shards=$SHARDS)" \
+    "$(script_move_copy_outcome "$PORT_REDIS")" "$(script_move_copy_outcome "$PORT_RUST")"
+
+# ---------------------------------------------------------------------------
+# moon#1095: COPY keeps the source's ABSOLUTE deadline
+# ---------------------------------------------------------------------------
+#
+# Untagged pairs, so at --shards 4 most of them straddle shards. Pre-fix the
+# cross-shard COPY carried a RELATIVE TTL (PTTL on the source's shard, PEXPIRE
+# on the destination's), which moved the deadline by the clock drift between
+# the two reads. Compared by PEXPIRETIME, which reads no clock: redis answers
+# the source's deadline for every copy.
+copy_deadline_outcome() {
+    # One connection, 64 trials: SET src PX, PEXPIRETIME src, COPY, PEXPIRETIME
+    # dst. Prints one '=' per trial whose two deadlines agree, '!' otherwise.
+    local port=$1 i
+    for ((i = 1; i <= 64; i++)); do
+        printf 'DEL cpd1095:src%d cpd1095:dst%d\n' "$i" "$i"
+        printf 'SET cpd1095:src%d v PX 500000\n' "$i"
+        printf 'PEXPIRETIME cpd1095:src%d\n' "$i"
+        printf 'COPY cpd1095:src%d cpd1095:dst%d\n' "$i" "$i"
+        printf 'PEXPIRETIME cpd1095:dst%d\n' "$i"
+    done | redis-cli -p "$port" 2>&1 \
+        | awk 'NR % 5 == 3 { want = $0 } NR % 5 == 0 { printf "%s", (want == $0 ? "=" : "!") }'
+    echo
+}
+assert_eq "moon#1095 COPY keeps the absolute deadline (shards=$SHARDS)" \
+    "$(copy_deadline_outcome "$PORT_REDIS")" "$(copy_deadline_outcome "$PORT_RUST")"
+
+# ---------------------------------------------------------------------------
 # moon#1076: a container subcommand with the wrong arity is queued instead of
 # aborting the transaction
 # ---------------------------------------------------------------------------
@@ -2124,6 +2181,12 @@ wake_row "wake: SORT ... STORE wakes BLPOP on the destination (moon#1069)" \
     "RPUSH {rkw10}s 3 1 2" "SORT {rkw10}s STORE {rkw10}d" "0:BLPOP {rkw10}d 2"
 wake_row "wake: EVAL RPUSH wakes BLPOP (moon#1069)" \
     "" "EVAL return(redis.call('RPUSH',KEYS[1],'x')) 1 {rkw11}k" "0:BLPOP {rkw11}k 2"
+wake_row "wake: EVAL MOVE wakes BLPOP parked in the target db (moon#1068)" \
+    "RPUSH {rkw15}l v" "EVAL return(redis.call('MOVE',KEYS[1],'3')) 1 {rkw15}l" \
+    "3:BLPOP {rkw15}l 2"
+wake_row "wake: EVAL COPY ... DB n wakes BLPOP parked in db n (moon#1068)" \
+    "RPUSH {rkw16}l v" "EVAL return(redis.call('COPY',KEYS[1],KEYS[1],'DB','3')) 1 {rkw16}l" \
+    "3:BLPOP {rkw16}l 2"
 wake_row "wake: ZINCRBY creating a zset wakes BZPOPMIN (moon#1069)" \
     "" "ZINCRBY {rkw12}z 1 m" "0:BZPOPMIN {rkw12}z 2"
 # The control: a key that becomes the WRONG type leaves the waiter parked.
