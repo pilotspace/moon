@@ -106,6 +106,10 @@ fn parse(raw: &str) -> V {
         *i = end + 2;
         match tag {
             "+" => V::Str(line.to_owned()),
+            "-" if line.starts_with("LOADING") => panic!(
+                "server error reply: {line} — a command reached the server before \
+                 `await_loaded` saw loading finish"
+            ),
             "-" => panic!("server error reply: {line}"),
             ":" => V::Int(line.parse().unwrap()),
             "$" => {
@@ -171,13 +175,47 @@ fn start(dir: &Path, warm_after_secs: u64) -> Server {
             .spawn()
             .expect("spawn moon (build it first, or set MOON_BIN)")
     });
-    let mut c = Conn::open(port);
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while c.send(&["PING"]) != "+PONG\r\n" {
-        assert!(Instant::now() < deadline, "server never answered PING");
+    await_loaded(port);
+    Server { guard, port }
+}
+
+/// Block until the server has finished loading, not merely until it accepts.
+///
+/// The listener accepts connections BEFORE recovery ends — vector recovery
+/// (warm reattach, keyspace rescan) runs after it — and until then every data
+/// and FT.* command is refused with `-LOADING` (moon#476). That window is
+/// milliseconds on a fast macOS host and long enough on a loaded Linux runner
+/// to swallow the first command of every boot. Done means both: INFO reports
+/// `loading:0`, and a keyspace read is answered rather than refused.
+fn await_loaded(port: u16) {
+    const DEADLINE: Duration = Duration::from_secs(180);
+    let start = Instant::now();
+    let mut refused = 0u32;
+    loop {
+        let mut c = Conn::open(port);
+        let info = c.send(&["INFO", "persistence"]);
+        let read = c.send(&["EXISTS", "moon893:probe"]);
+        if info.contains("loading:0\r\n") && read.starts_with(':') {
+            // Printed with the test's output, so a CI log shows how long the
+            // loading window really was on that host.
+            eprintln!(
+                "await_loaded: port {port} loaded after {:?} ({refused} polls answered loading)",
+                start.elapsed()
+            );
+            return;
+        }
+        refused += 1;
+        let last = format!("INFO loading line: {:?}; EXISTS: {read:?}", {
+            info.lines()
+                .find(|l| l.starts_with("loading:"))
+                .unwrap_or("<absent>")
+        });
+        assert!(
+            start.elapsed() < DEADLINE,
+            "server still loading after {DEADLINE:?}; last replies: {last}"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
-    Server { guard, port }
 }
 
 impl Server {
