@@ -30,6 +30,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BEHAVIOUR CHANGE — once the cold tier holds keys, a write is checked
+  against `maxmemory` using hot bytes PLUS the cold index's RAM, not hot bytes
+  alone** (moon#1036).
+  - **Who is affected:** servers running `maxmemory-policy noeviction`, and
+    `volatile-*` servers whose volatile keys run out. They now answer `-OOM`
+    earlier than before, by the size of the cold index. `allkeys-*` servers
+    reply the same; they spill more hot keys to disk to stay under the cap.
+  - **When it applies:** only with `--disk-offload` enabled and only after keys
+    have spilled. A server with an empty cold tier behaves exactly as before.
+  - **Why this is correct:** the cold index (one entry per spilled key) is
+    resident RAM. The 100 ms pressure cascade has charged it against
+    `maxmemory` since K4. Until now the per-write gates did not, so the shard
+    ran over the cascade's cap between ticks. `noeviction` / `volatile-*`
+    writes are now refused at the cap the server was already enforcing,
+    instead of up to one tick later.
+  - **What to do:** if writes that used to fit now hit `-OOM`, raise
+    `maxmemory` by the cold index's size. INFO reports it as `cold_index_bytes`
+    in the `# MoonStore` section, and Prometheus as
+    `moon_memory_bytes{kind="cold_index"}`. Both are refreshed by the cold
+    orphan sweep (`--cold-orphan-sweep-interval-secs`, 60 s default), so leave
+    some headroom for growth between samples.
+
 - **BEHAVIOUR CHANGE — a command the user's ACL denies inside `MULTI` now
   aborts the whole transaction** (moon#1035). `EXEC` answers
   `-EXECABORT Transaction discarded because of previous errors.` and applies
