@@ -957,11 +957,15 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
-                            blocking_registry,
                         )
                     });
-                    if let Some(mut response) = intercepted {
-                        if matches!(response, crate::protocol::Frame::Integer(1)) {
+                    if let Some(crate::shard::spsc_two_db::TwoDbOutcome {
+                        mut response,
+                        wake: two_db_wake,
+                    }) = intercepted
+                    {
+                        let wrote = matches!(response, crate::protocol::Frame::Integer(1));
+                        if wrote {
                             let serialized = aof::serialize_command(&command);
                             let mut aof_budget =
                                 crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
@@ -982,6 +986,16 @@ pub(crate) fn handle_shard_message_shared(
                                 );
                             }
                         }
+                        // moon#1056: wake the destination only now that the command is
+                        // logged — a pop the wake serves is logged as it pops.
+                        crate::shard::slice::with_shard(|s| {
+                            crate::shard::spsc_two_db::wake_two_db_target(
+                                blocking_registry,
+                                &s.databases,
+                                two_db_wake,
+                                wrote,
+                            )
+                        });
                         let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(response));
                         return;
                     }
@@ -1193,7 +1207,10 @@ pub(crate) fn handle_shard_message_shared(
                     // once, so it must run before `guard` narrows to a single
                     // db below.
                     if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
-                        if let Some(response) = crate::shard::spsc_two_db::try_two_db_intercept(
+                        if let Some(crate::shard::spsc_two_db::TwoDbOutcome {
+                            response,
+                            wake: two_db_wake,
+                        }) = crate::shard::spsc_two_db::try_two_db_intercept(
                             cmd,
                             args,
                             &s.databases,
@@ -1207,7 +1224,6 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
-                            blocking_registry,
                         ) {
                             let mut aof_ok = true;
                             if matches!(response, crate::protocol::Frame::Integer(1))
@@ -1232,6 +1248,14 @@ pub(crate) fn handle_shard_message_shared(
                                     &mut aof_budget,
                                 );
                             }
+                            // moon#1056: wake the destination only now that the command is
+                            // logged — a pop the wake serves is logged as it pops.
+                            crate::shard::spsc_two_db::wake_two_db_target(
+                                blocking_registry,
+                                &s.databases,
+                                two_db_wake,
+                                matches!(response, crate::protocol::Frame::Integer(1)),
+                            );
                             results.push(if aof_ok {
                                 response
                             } else {
@@ -1395,7 +1419,10 @@ pub(crate) fn handle_shard_message_shared(
                     // too, mirroring the Execute arm's pre-existing behavior
                     // (not new for this fix — see the Gap A commit body).
                     if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
-                        if let Some(response) = crate::shard::spsc_two_db::try_two_db_intercept(
+                        if let Some(crate::shard::spsc_two_db::TwoDbOutcome {
+                            response,
+                            wake: two_db_wake,
+                        }) = crate::shard::spsc_two_db::try_two_db_intercept(
                             cmd,
                             args,
                             &s.databases,
@@ -1409,7 +1436,6 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
-                            blocking_registry,
                         ) {
                             let mut aof_ok = true;
                             if matches!(response, crate::protocol::Frame::Integer(1))
@@ -1434,6 +1460,14 @@ pub(crate) fn handle_shard_message_shared(
                                     &mut aof_budget,
                                 );
                             }
+                            // moon#1056: wake the destination only now that the command is
+                            // logged — a pop the wake serves is logged as it pops.
+                            crate::shard::spsc_two_db::wake_two_db_target(
+                                blocking_registry,
+                                &s.databases,
+                                two_db_wake,
+                                matches!(response, crate::protocol::Frame::Integer(1)),
+                            );
                             results.push(if aof_ok {
                                 response
                             } else {
@@ -1653,11 +1687,15 @@ pub(crate) fn handle_shard_message_shared(
                         spill_sender,
                         spill_file_id,
                         disk_offload_dir,
-                        blocking_registry,
                     )
                 });
-                if let Some(mut response) = intercepted {
-                    if matches!(response, crate::protocol::Frame::Integer(1)) {
+                if let Some(crate::shard::spsc_two_db::TwoDbOutcome {
+                    mut response,
+                    wake: two_db_wake,
+                }) = intercepted
+                {
+                    let wrote = matches!(response, crate::protocol::Frame::Integer(1));
+                    if wrote {
                         let serialized = aof::serialize_command(&command);
                         let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
                         if !wal_append_and_fanout(
@@ -1677,6 +1715,16 @@ pub(crate) fn handle_shard_message_shared(
                             ));
                         }
                     }
+                    // moon#1056: wake the destination only now that the command is
+                    // logged — a pop the wake serves is logged as it pops.
+                    crate::shard::slice::with_shard(|s| {
+                        crate::shard::spsc_two_db::wake_two_db_target(
+                            blocking_registry,
+                            &s.databases,
+                            two_db_wake,
+                            wrote,
+                        )
+                    });
                     // Arc-owned slot: deref is safe, refcount keeps it alive.
                     let slot = &*response_slot.0;
                     slot.fill(vec![response]);
@@ -1839,7 +1887,10 @@ pub(crate) fn handle_shard_message_shared(
                     // once, so it must run before `guard` narrows to a single
                     // db below.
                     if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
-                        if let Some(response) = crate::shard::spsc_two_db::try_two_db_intercept(
+                        if let Some(crate::shard::spsc_two_db::TwoDbOutcome {
+                            response,
+                            wake: two_db_wake,
+                        }) = crate::shard::spsc_two_db::try_two_db_intercept(
                             cmd,
                             args,
                             &s.databases,
@@ -1853,7 +1904,6 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
-                            blocking_registry,
                         ) {
                             let mut aof_ok = true;
                             if matches!(response, crate::protocol::Frame::Integer(1))
@@ -1878,6 +1928,14 @@ pub(crate) fn handle_shard_message_shared(
                                     &mut aof_budget,
                                 );
                             }
+                            // moon#1056: wake the destination only now that the command is
+                            // logged — a pop the wake serves is logged as it pops.
+                            crate::shard::spsc_two_db::wake_two_db_target(
+                                blocking_registry,
+                                &s.databases,
+                                two_db_wake,
+                                matches!(response, crate::protocol::Frame::Integer(1)),
+                            );
                             results.push(if aof_ok {
                                 response
                             } else {
@@ -2042,7 +2100,10 @@ pub(crate) fn handle_shard_message_shared(
                     // too, mirroring the Execute arm's pre-existing behavior
                     // (not new for this fix — see the Gap A commit body).
                     if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
-                        if let Some(response) = crate::shard::spsc_two_db::try_two_db_intercept(
+                        if let Some(crate::shard::spsc_two_db::TwoDbOutcome {
+                            response,
+                            wake: two_db_wake,
+                        }) = crate::shard::spsc_two_db::try_two_db_intercept(
                             cmd,
                             args,
                             &s.databases,
@@ -2056,7 +2117,6 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
-                            blocking_registry,
                         ) {
                             let mut aof_ok = true;
                             if matches!(response, crate::protocol::Frame::Integer(1))
@@ -2081,6 +2141,14 @@ pub(crate) fn handle_shard_message_shared(
                                     &mut aof_budget,
                                 );
                             }
+                            // moon#1056: wake the destination only now that the command is
+                            // logged — a pop the wake serves is logged as it pops.
+                            crate::shard::spsc_two_db::wake_two_db_target(
+                                blocking_registry,
+                                &s.databases,
+                                two_db_wake,
+                                matches!(response, crate::protocol::Frame::Integer(1)),
+                            );
                             results.push(if aof_ok {
                                 response
                             } else {
@@ -3287,8 +3355,8 @@ pub(crate) fn handle_shard_message_shared(
                     txn_scripting.as_ref(),
                 );
             // The waiters are registered HERE, on the owning shard's registry
-            // — the same one the live cross-shard write path wakes.
-            crate::blocking::wakeup::wake_recorded(blocking_registry, exec_wakes.drain(..));
+            // — the same one the live cross-shard write path wakes. They are
+            // woken below, once the body is logged (moon#1056).
             // task #52: this arm is the CROSS-SHARD EXEC hop (the accepting
             // connection's shard differs from the owner shard, which by
             // construction only happens at num_shards > 1) -- graph
@@ -3338,6 +3406,13 @@ pub(crate) fn handle_shard_message_shared(
                     append_lost = true;
                 }
             }
+            // moon#606 / moon#1056: serve the waiters the body made ready —
+            // AFTER its records are in this shard's AOF and replication
+            // stream, because a waiter served here has its pop logged by this
+            // shard as it pops, and that record must follow the push that fed
+            // it. Still inside this arm's synchronous stretch, so no other
+            // write on this shard can come between.
+            crate::blocking::wakeup::wake_recorded(blocking_registry, exec_wakes.drain(..));
             let _ = reply_tx.send(crate::shard::dispatch::TxnExecReply {
                 result,
                 exec_publishes,

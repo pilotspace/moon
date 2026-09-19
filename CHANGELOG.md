@@ -285,6 +285,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     loss the committed manifest could name a missing incr, or the old
     `appendonly.aof` could return, losing every record written after the
     rewrite. Both directories are now fsynced before the new file is used.
+- **A served blocking pop is logged by the shard that popped it, at the moment
+  it popped** (moon#1056, moon#1097). Since moon#827 a `BLPOP`/`BRPOP`/
+  `BLMOVE`/`BRPOPLPUSH`/`BLMPOP`/`BZPOPMIN`/`BZPOPMAX`/`BZMPOP` that popped
+  propagated a synthesised record, but the WAITER's connection wrote it,
+  after the reply had reached it. At `--shards > 1` that is usually not the
+  shard owning the key, so the record sat in the wrong shard's AOF and replay
+  dropped it: 33 of 48 probes in the new kill -9 test (four owners, one
+  waiter connection, `appendfsync always`) came back with the popped element
+  restored. At any shard count the record could also land behind a later
+  write to the same key (`[a,b]`, pop `a`, `LPUSH x` recovered as `[a,b]`
+  instead of `[x,b]`, on disk and on a replica), and an AOF rewrite snapshot
+  could fall between the pop and its record, applying the pop twice. The
+  owner now appends the record to its own AOF and replication stream in the
+  pop's synchronous stretch, before the reply leaves (wake-served, claim-won
+  and immediately-served pops alike); the waiter only confirms the fsync on
+  the owner's writer under `appendfsync always`. A write that wakes a waiter
+  (a plain write, `EXEC`, `MOVE`/`COPY ... DB n` on the connection and on
+  every cross-shard SPSC arm) now logs itself before it serves the waiter, so
+  the pop always follows the push that fed it. A record the AOF writer cannot
+  take within its backpressure bound answers the waiter with the same
+  `MOONERR AOF backpressure` error as every other synchronous write, instead
+  of the element; that error, like `AOF fsync failed`, means the element may
+  have been consumed. One wake pass shares one backpressure bound across all
+  the pops it logs, so a saturated writer stalls the shard thread once, not
+  once per served waiter.
+
 - **A write is logged in the order it was applied, even when it waits after
   applying** (moon#1084). Three paths applied a write, awaited something, and
   only then appended it to the AOF (and, on monoio, to the replication

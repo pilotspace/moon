@@ -55,13 +55,18 @@
 //! - the extra records of a script or function that writes more than once,
 //! - `fsync_barrier`s other shards' connections push into this writer
 //!   (the `SWAPDB` coordinator, `appendfsync always` batches),
-//! - the records of non-routed arms (`SwapDb`) handled later in the cycle.
+//! - the records of non-routed arms (`SwapDb`) handled later in the cycle,
+//! - the pops a write serves: a push that wakes blocked waiters logs one
+//!   record per served pop, on this shard, as it pops
+//!   (`blocking::pop_log`).
 //!
 //! What remains: a single leg whose uncounted records exceed the headroom
-//! (a script writing hundreds of keys, a write that evicts hundreds) can
-//! still meet a full channel after it applied. That falls back to the
-//! existing post-apply bounded block and its fail-loud
-//! `AOF_APPEND_LOST_ERR`, which is rare now instead of routine. And a leg
+//! (a script writing hundreds of keys, a write that evicts hundreds, a push
+//! that serves hundreds of waiters) can still meet a full channel after it
+//! applied. That falls back to the existing post-apply bounded block and
+//! its fail-loud `AOF_APPEND_LOST_ERR` (for a served pop, `pop_log`'s own
+//! bounded producer and its backpressure error to the waiter), which is
+//! rare now instead of routine. And a leg
 //! with more records than the channel holds is admitted only once the
 //! channel is empty; under sustained local writes to the same shard it can
 //! wait out its bound and be refused.

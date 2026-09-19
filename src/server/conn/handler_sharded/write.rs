@@ -851,11 +851,13 @@ pub(super) async fn try_handle_multi_exec(
             // without this a `MULTI ; LPUSH k v ; EXEC` left a client blocked
             // on `k` asleep until its own timeout.
             //
-            // Raised after the body's records are enqueued, and whether or
-            // not the barrier failed: the elements are in the keyspace either
-            // way (an EXEC that cannot be persisted is reported as an error,
-            // not rolled back), so a waiter left asleep would answer null for
-            // a key that demonstrably has data.
+            // moon#1056: raised AFTER the body is in the AOF (above). A waiter
+            // served here has its pop logged by this shard as it pops, so an
+            // earlier wake would put the pop ahead of the push that fed it.
+            // Raised whether or not persisting failed: the elements are in
+            // the keyspace either way (an EXEC that cannot be persisted is
+            // reported as an error, not rolled back), so a waiter left asleep
+            // would answer null for a key that demonstrably has data.
             crate::blocking::wakeup::wake_recorded(&ctx.blocking_registry, exec_wakes.drain(..));
             if !persisted {
                 conn.command_queue.clear();

@@ -173,6 +173,19 @@ pub fn ready_keys(
 /// exist at all: a put-back after an await would land on top of other
 /// clients' logged writes while the pop itself was never logged, and the
 /// master would diverge from its AOF and replicas (moon#1023).
+///
+/// moon#1056 NARROWS the A2 guarantee, deliberately. A won serve is now
+/// LOGGED (AOF + replication, `blocking::pop_log`) before its reply is sent,
+/// so the waiter's `fsync_barrier` on the owner covers the record. Once the
+/// record exists, this undo is never applied: a put-back would leave memory
+/// disagreeing with the AOF and every replica. So a waiter whose receiver
+/// drops in the window between that log and the send — reachable only for a
+/// REMOTE waiter whose connection task is torn down without settling its
+/// claim; a local waiter's receiver lives on this thread and is checked just
+/// before — loses the element: consumed, logged, delivered to nobody, exactly
+/// like a client that disconnects right after its reply was written. The
+/// "delivered or still in the key" guarantee holds in full only when no
+/// durability plane is active (nothing logged, so the undo still runs).
 pub(crate) enum WakeUndo {
     /// Values popped from the FRONT of the key, in pop order.
     ListFront(smallvec::SmallVec<[bytes::Bytes; 4]>),
@@ -282,8 +295,9 @@ pub fn try_wake_list_waiter(
     key: &Bytes,
 ) -> bool {
     let mut worklist = ReadyKeys::new();
-    let served = serve_list_key(registry, db, db_index, key, &mut worklist, 0);
-    served | drain_ready(registry, db, db_index, &mut worklist, 0)
+    let mut budget = crate::blocking::pop_log::wake_budget();
+    let served = serve_list_key(registry, db, db_index, key, &mut worklist, 0, &mut budget);
+    served | drain_ready(registry, db, db_index, &mut worklist, 0, &mut budget)
 }
 
 /// Serve a whole batch of ready keys in one database — the keys a write, an
@@ -319,13 +333,33 @@ pub fn wake_keys(
     db_index: usize,
     seeds: impl IntoIterator<Item = Bytes>,
 ) -> bool {
+    wake_keys_budgeted(
+        registry,
+        db,
+        db_index,
+        seeds,
+        &mut crate::blocking::pop_log::wake_budget(),
+    )
+}
+
+/// [`wake_keys`] drawing every pop it logs from the caller's backpressure
+/// `budget` (moon#1056): a wake pass that serves many waiters stalls the
+/// shard thread for at most one bound in total when the AOF writer is
+/// saturated, not one bound per served pop.
+pub(crate) fn wake_keys_budgeted(
+    registry: &mut BlockingRegistry,
+    db: &mut Database,
+    db_index: usize,
+    seeds: impl IntoIterator<Item = Bytes>,
+    budget: &mut std::time::Duration,
+) -> bool {
     let mut worklist = ReadyKeys::new();
     for key in seeds {
         if !worklist.contains(&key) {
             worklist.push(key);
         }
     }
-    drain_ready(registry, db, db_index, &mut worklist, 0)
+    drain_ready(registry, db, db_index, &mut worklist, 0, budget)
 }
 
 /// Serve `worklist[next..]` in order, appending the destinations the serves
@@ -336,11 +370,12 @@ fn drain_ready(
     db_index: usize,
     worklist: &mut ReadyKeys,
     mut next: usize,
+    budget: &mut std::time::Duration,
 ) -> bool {
     let mut served = false;
     while let Some(key) = worklist.get(next).cloned() {
         next += 1;
-        served |= serve_ready_key(registry, db, db_index, &key, worklist, next);
+        served |= serve_ready_key(registry, db, db_index, &key, worklist, next, budget);
     }
     served
 }
@@ -363,12 +398,13 @@ fn serve_ready_key(
     key: &Bytes,
     worklist: &mut ReadyKeys,
     pending_from: usize,
+    budget: &mut std::time::Duration,
 ) -> bool {
     let now_ms = db.now_ms();
     if matches!(db.get_list_ref_if_alive(key, now_ms), Ok(Some(_))) {
-        serve_list_key(registry, db, db_index, key, worklist, pending_from)
+        serve_list_key(registry, db, db_index, key, worklist, pending_from, budget)
     } else if matches!(db.get_sorted_set_ref_if_alive(key, now_ms), Ok(Some(_))) {
-        try_wake_zset_waiter(registry, db, db_index, key)
+        serve_zset_key(registry, db, db_index, key, budget)
     } else if matches!(db.get_stream_if_alive(key, now_ms), Ok(Some(_))) {
         try_wake_stream_waiter(registry, db, db_index, key)
     } else {
@@ -387,6 +423,7 @@ fn serve_list_key(
     key: &Bytes,
     worklist: &mut ReadyKeys,
     pending_from: usize,
+    budget: &mut std::time::Duration,
 ) -> bool {
     // Loop: try waiters until one succeeds (oneshot receiver may be dropped = skip)
     // moon#535: pop only waiters THIS waker can serve. The old blind
@@ -621,20 +658,32 @@ fn serve_list_key(
             _ => None,
         };
 
-        if deliver(
+        let delivered = deliver(
             db,
+            db_index,
             key,
+            &cmd,
             reply_tx,
             claim.as_ref(),
             result,
             undo,
             expires_at_ms,
-        ) {
+            budget,
+        );
+        if delivered.served() {
             served = true;
             if let Some(dest) = moved_to
                 && !worklist[pending_from..].contains(&dest)
             {
                 worklist.push(dest);
+            }
+            // moon#1056: the AOF writer could not take this pop's record
+            // within the backpressure bound. Every further serve here would
+            // wait out a bound of its own on the shard thread; leave the rest
+            // parked beside their data instead (a later write to the key, or
+            // their own timeout, reaches them).
+            if delivered == Delivered::ServedAofLost {
+                break;
             }
             // moon#1019: one push can carry several elements, and
             // Redis keeps serving the key's waiters while it has data. Stopping
@@ -650,35 +699,106 @@ fn serve_list_key(
     served
 }
 
+/// How [`deliver`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivered {
+    /// The waiter has its reply, and the pop is logged wherever logging is on.
+    Served,
+    /// The waiter was answered, but the AOF append of the pop was lost (the
+    /// writer stayed saturated past its bound). The pop stands and the waiter
+    /// was told so with an error instead of the element.
+    ServedAofLost,
+    /// Nobody took the serve: a lost claim, or a waiter gone before the reply
+    /// could be sent.
+    NotServed,
+}
+
+impl Delivered {
+    /// A waiter was answered.
+    #[inline]
+    pub(crate) fn served(self) -> bool {
+        !matches!(self, Delivered::NotServed)
+    }
+}
+
 /// The tail every destructive wake shares, once the element is popped and the
-/// reply built: decide whether this waiter gets it, and put it back if not.
-/// Returns true if the waiter was answered. A waker with nothing to hand a
-/// waiter never gets here — it leaves the waiter parked instead.
+/// reply built: decide whether this waiter gets it, log the pop, and put it
+/// back if nobody takes it. A waker with nothing to hand a waiter never gets
+/// here — it leaves the waiter parked instead.
 ///
 /// * moon#1019: a waiter registered on several threads is served by exactly
 ///   one of them — whichever wins its [`ClaimToken`](crate::blocking::ClaimToken).
 ///   The claim is attempted with the element already in hand, so a lost claim
 ///   restores it here, in the same synchronous stretch as the pop, where no
 ///   other client can have observed the round trip.
-/// * A2: a failed send (the receiver dropped after the liveness check) restores
-///   the element and moves on instead of destroying it.
+/// * moon#1056: a won serve is LOGGED here, by the shard that popped, before
+///   the reply leaves ([`crate::blocking::pop_log`]). This is the owner's
+///   thread and the pop's own synchronous stretch, so the record lands in the
+///   owner's AOF and replication stream in the same order as the owner's
+///   other writes. The waiter logs nothing.
+/// * A2: a failed send (the receiver dropped after the liveness check)
+///   restores the element and moves on instead of destroying it — when the
+///   pop reached no durability plane. Once it has been logged, putting the
+///   element back would leave memory disagreeing with the AOF and the
+///   replicas, so the serve stands, exactly as it does for a client that
+///   disconnects after its reply is sent (moon#1023). A local waiter cannot
+///   reach that case: its receiver lives on this thread and was checked just
+///   before; a remote one only when its task is torn down without settling.
+///   That element is then consumed and delivered to nobody — the deliberate
+///   price of logging BEFORE the send so the waiter's fsync barrier covers
+///   the record (see [`WakeUndo`]).
+/// * `budget` is the wake pass's shared AOF backpressure budget
+///   ([`crate::blocking::pop_log::wake_budget`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn deliver(
     db: &mut Database,
+    db_index: usize,
     key: &Bytes,
+    cmd: &BlockedCommand,
     reply_tx: crate::runtime::channel::OneshotSender<Option<Frame>>,
     claim: Option<&crate::blocking::ClaimToken>,
     frame: Frame,
     undo: Option<WakeUndo>,
     expires_at_ms: u64,
-) -> bool {
+    budget: &mut std::time::Duration,
+) -> Delivered {
     let won = claim.is_none_or(crate::blocking::ClaimToken::try_claim);
-    if won && reply_tx.send(Some(frame)).is_ok() {
-        return true;
+    if !won || reply_tx.is_disconnected() {
+        if let Some(undo) = undo {
+            undo.restore_keeping_ttl(db, key, expires_at_ms);
+        }
+        return Delivered::NotServed;
     }
-    if let Some(undo) = undo {
+    let mut frame = frame;
+    let mut logged = false;
+    let mut aof_lost = false;
+    if let Some(u) = undo.as_ref()
+        && crate::blocking::pop_log::has_work()
+        && let Some(record) = crate::blocking::pop_log::served_pop_record(cmd, key, u)
+    {
+        match crate::blocking::pop_log::log_pop(db_index, &record, budget) {
+            crate::blocking::pop_log::PopLog::Unlogged => {}
+            crate::blocking::pop_log::PopLog::Logged => logged = true,
+            crate::blocking::pop_log::PopLog::AofLost => {
+                logged = true;
+                aof_lost = true;
+                frame = Frame::Error(Bytes::from_static(
+                    crate::shard::spsc_handler::AOF_APPEND_LOST_ERR,
+                ));
+            }
+        }
+    }
+    if reply_tx.send(Some(frame)).is_ok() {
+        return if aof_lost {
+            Delivered::ServedAofLost
+        } else {
+            Delivered::Served
+        };
+    }
+    if !logged && let Some(undo) = undo {
         undo.restore_keeping_ttl(db, key, expires_at_ms);
     }
-    false
+    Delivered::NotServed
 }
 
 /// Called after ZADD successfully adds elements to a sorted set key.
@@ -689,6 +809,25 @@ pub fn try_wake_zset_waiter(
     db: &mut Database,
     db_index: usize,
     key: &Bytes,
+) -> bool {
+    serve_zset_key(
+        registry,
+        db,
+        db_index,
+        key,
+        &mut crate::blocking::pop_log::wake_budget(),
+    )
+}
+
+/// [`try_wake_zset_waiter`] drawing its pop logging from the caller's
+/// backpressure `budget`, so one wake pass stalls the shard thread for at
+/// most one bound however many waiters it serves.
+fn serve_zset_key(
+    registry: &mut BlockingRegistry,
+    db: &mut Database,
+    db_index: usize,
+    key: &Bytes,
+    budget: &mut std::time::Duration,
 ) -> bool {
     // moon#535: pop only waiters THIS waker can serve. The old blind
     // `pop_front` handed us waiters of every family, and the cleanup below —
@@ -807,18 +946,22 @@ pub fn try_wake_zset_waiter(
 
         registry.remove_wait(wait_id);
 
-        // Claim / A2 / keep-serving-while-data: see try_wake_list_waiter.
-        if deliver(
+        // Claim / log / A2 / keep-serving-while-data: see try_wake_list_waiter.
+        let delivered = deliver(
             db,
+            db_index,
             key,
+            &cmd,
             reply_tx,
             claim.as_ref(),
             result,
             undo,
             expires_at_ms,
-        ) {
+            budget,
+        );
+        if delivered.served() {
             served = true;
-            if !db.exists(key) {
+            if delivered == Delivered::ServedAofLost || !db.exists(key) {
                 break;
             }
         }
@@ -907,9 +1050,12 @@ pub fn wake_recorded(
         return;
     }
     let mut reg = registry.borrow_mut();
+    // One backpressure budget for the whole transaction's wakes, across its
+    // databases: see `pop_log::wake_budget`.
+    let mut budget = crate::blocking::pop_log::wake_budget();
     for (db_index, keys) in batches_by_db(&reg, recorded) {
         crate::shard::slice::with_shard_db(db_index, |db| {
-            wake_keys(&mut reg, db, db_index, keys);
+            wake_keys_budgeted(&mut reg, db, db_index, keys, &mut budget);
         });
     }
 }
@@ -931,6 +1077,21 @@ pub fn wake_written_keys_on_shard(
     args: &[Frame],
 ) {
     let keys = ready_keys(&registry.borrow(), db_index, cmd, args);
+    wake_ready_keys_on_shard(registry, db_index, keys);
+}
+
+/// Serve `keys` — decided earlier by [`ready_keys`] — in `db_index` of this
+/// shard. For a write path that must decide the keys while it still holds its
+/// write guard but may only WAKE once its own record is logged (moon#1056): a
+/// wake logs each pop it performs as it performs it, so running it before the
+/// write that fed it is logged would put the pop ahead of that write in the
+/// AOF and the replication stream. Call outside any borrow of this shard's
+/// slice.
+pub fn wake_ready_keys_on_shard(
+    registry: &std::cell::RefCell<BlockingRegistry>,
+    db_index: usize,
+    keys: ReadyKeys,
+) {
     if keys.is_empty() {
         return;
     }
@@ -1074,6 +1235,25 @@ pub fn wake_cross_db_write(
         return false;
     }
     wake_key(&mut reg, dst, dst_db, key)
+}
+
+/// [`wake_cross_db_write`] for a caller that no longer holds the destination
+/// database — one that logs the `MOVE`/`COPY ... DB n` first and wakes after
+/// (moon#1056: a pop the wake performs is logged as it happens, so it must
+/// follow the write that fed it). Call outside any borrow of this shard's
+/// slice.
+pub fn wake_cross_db_write_on_shard(
+    registry: &std::cell::RefCell<BlockingRegistry>,
+    dst_db: usize,
+    key: &Bytes,
+    reply: &Frame,
+) -> bool {
+    if !matches!(reply, Frame::Integer(1)) || !registry.borrow().has_waiters(dst_db, key) {
+        return false;
+    }
+    crate::shard::slice::with_shard_db(dst_db, |dst| {
+        wake_cross_db_write(registry, dst, dst_db, key, reply)
+    })
 }
 
 /// Called after `XADD` adds an entry to a stream key, and again right after a
