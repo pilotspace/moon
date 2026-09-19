@@ -647,7 +647,7 @@ impl AofWriterPool {
                 // Cap reached with older records buffered: dropping keeps
                 // replay order monotone; the channel would invert it.
                 Err(_) => {
-                    super::record_append_dropped(1);
+                    super::record_append_dropped(self.overflow_for(shard_id), 1);
                     tracing::error!(
                         "AOF append LOST for shard {} (lsn {}): rewrite overflow cap reached",
                         shard_id,
@@ -681,7 +681,7 @@ impl AofWriterPool {
                 }
                 // #452.4: EVERY acked-append drop routes through the
                 // accounting helper (counter + sticky degraded latch).
-                super::record_append_dropped(1);
+                super::record_append_dropped(self.overflow_for(shard_id), 1);
                 warn!(
                     "AOF append dropped for shard {} (lsn {}): channel {}",
                     shard_id, lsn, reason
@@ -788,7 +788,7 @@ impl AofWriterPool {
                 Ok(()) => return true,
                 Err(SpillReject::Disarmed(returned)) => msg = returned,
                 Err(SpillReject::CapExceeded) => {
-                    super::record_append_dropped(1);
+                    super::record_append_dropped(self.overflow_for(shard_id), 1);
                     tracing::error!(
                         "AOF append LOST for shard {} (lsn {}): rewrite overflow cap reached",
                         shard_id,
@@ -801,7 +801,7 @@ impl AofWriterPool {
         match self.sender(shard_id).try_send(msg) {
             Ok(()) => return true,
             Err(flume::TrySendError::Disconnected(_)) => {
-                super::record_append_dropped(1);
+                super::record_append_dropped(self.overflow_for(shard_id), 1);
                 warn!(
                     "AOF append dropped for shard {} (lsn {}): channel disconnected",
                     shard_id, lsn
@@ -816,7 +816,7 @@ impl AofWriterPool {
             Ok(()) => return true,
             Err(SpillReject::Disarmed(returned)) => msg = returned,
             Err(SpillReject::CapExceeded) => {
-                super::record_append_dropped(1);
+                super::record_append_dropped(self.overflow_for(shard_id), 1);
                 tracing::error!(
                     "AOF append LOST for shard {} (lsn {}): rewrite overflow cap reached",
                     shard_id,
@@ -826,7 +826,7 @@ impl AofWriterPool {
             }
         }
         if budget.is_zero() {
-            super::record_append_dropped(1);
+            super::record_append_dropped(self.overflow_for(shard_id), 1);
             tracing::error!(
                 "AOF append LOST for shard {} (lsn {}): batch backpressure budget exhausted; \
                  backpressure_dropped={}",
@@ -847,7 +847,7 @@ impl AofWriterPool {
             Ok(()) => true,
             Err(e) => {
                 if matches!(e, flume::SendTimeoutError::Timeout(_)) {
-                    super::record_append_dropped(1);
+                    super::record_append_dropped(self.overflow_for(shard_id), 1);
                 }
                 tracing::error!(
                     "AOF append LOST for shard {} (lsn {}): writer still {} after {:?} \
@@ -905,7 +905,7 @@ impl AofWriterPool {
                 Ok(()) => return Ok(()),
                 Err(SpillReject::Disarmed(returned)) => msg = returned,
                 Err(SpillReject::CapExceeded) => {
-                    super::record_append_dropped(1);
+                    super::record_append_dropped(self.overflow_for(shard_id), 1);
                     return Err(AofAck::ChannelFull);
                 }
             }
@@ -924,7 +924,7 @@ impl AofWriterPool {
             Ok(()) => return Ok(()),
             Err(SpillReject::Disarmed(returned)) => msg = returned,
             Err(SpillReject::CapExceeded) => {
-                super::record_append_dropped(1);
+                super::record_append_dropped(self.overflow_for(shard_id), 1);
                 return Err(AofAck::ChannelFull);
             }
         }
@@ -963,7 +963,7 @@ impl AofWriterPool {
             };
         }
         if outcome == Err(AofAck::ChannelFull) {
-            super::record_append_dropped(1);
+            super::record_append_dropped(self.overflow_for(shard_id), 1);
             warn!(
                 "AOF writer channel full (shard {}): everysec append dropped after {:?} \
                  backpressure bound; backpressure_dropped={}",
@@ -1026,7 +1026,7 @@ impl AofWriterPool {
                 Ok(()) => return ack_rx,
                 Err(SpillReject::Disarmed(returned)) => msg = returned,
                 Err(SpillReject::CapExceeded) => {
-                    super::record_append_dropped(1);
+                    super::record_append_dropped(self.overflow_for(shard_id), 1);
                     let (pre_tx, pre_rx) = crate::runtime::channel::oneshot::<AofAck>();
                     let _ = pre_tx.send(AofAck::ChannelFull);
                     return pre_rx;
@@ -1046,7 +1046,7 @@ impl AofWriterPool {
                 // signal ChannelFull back to the caller via a pre-filled
                 // oneshot so the caller's `.await` resolves immediately to
                 // Err(AofAck::ChannelFull) without a writer round-trip.
-                super::record_append_dropped(1);
+                super::record_append_dropped(self.overflow_for(shard_id), 1);
                 warn!(
                     "AOF writer channel full (shard {}): AppendSync dropped; \
                      backpressure_dropped={}",
@@ -1122,7 +1122,7 @@ impl AofWriterPool {
                 Ok(()) => return,
                 Err(super::rewrite_overflow::SpillReject::Disarmed(m)) => m,
                 Err(super::rewrite_overflow::SpillReject::CapExceeded) => {
-                    super::record_append_dropped(1);
+                    super::record_append_dropped(self.overflow_for(shard_id), 1);
                     tracing::error!("AOF ordered append dropped: rewrite overflow cap exceeded");
                     return;
                 }
@@ -1135,14 +1135,14 @@ impl AofWriterPool {
             Err(flume::TrySendError::Full(m)) => match overflow.try_spill(m) {
                 Ok(()) => {}
                 Err(_) => {
-                    super::record_append_dropped(1);
+                    super::record_append_dropped(self.overflow_for(shard_id), 1);
                     tracing::error!(
                         "AOF ordered append dropped: writer channel full and overflow unavailable"
                     );
                 }
             },
             Err(flume::TrySendError::Disconnected(_)) => {
-                super::record_append_dropped(1);
+                super::record_append_dropped(self.overflow_for(shard_id), 1);
             }
         }
     }
@@ -2720,8 +2720,12 @@ mod pool_tests {
             &mut budget
         ));
         assert!(
-            !super::super::AOF_LAST_APPEND_OK.load(std::sync::atomic::Ordering::Relaxed),
-            "a dropped acked append must latch aof_last_append_status:err"
+            pool.overflow_for(0).is_missing_appends(),
+            "a dropped acked append must mark its writer as missing an append"
+        );
+        assert!(
+            !super::super::aof_last_append_ok(),
+            "a dropped acked append must report aof_last_append_status:err"
         );
     }
 

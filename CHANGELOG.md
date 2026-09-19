@@ -199,6 +199,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`aof_last_append_status` and `aof_last_write_status` return to `ok` after a
+  rewrite that covers the dropped append** (moon#1094). The status latched to
+  `err` at the first dropped acked append and stayed there for the life of the
+  process, even after `BGREWRITEAOF` folded the live keyspace, the dropped
+  write included, into a fresh base. Each AOF writer now tags a drop with its
+  fold epoch, and clears it when a fold COMMITS whose snapshot was taken after
+  that drop (the same `folded_below` rule moon#455 uses to drop records the
+  new base already holds). A drop after the snapshot, an aborted fold, or a
+  drop on another writer keeps `err`; with the PerShard layout the status is
+  the AND across writers. Redis clears `aof_last_write_status` on the next
+  successful write because it keeps the failed data in `aof_buf` and retries
+  it; moon drops the record, so only a covering rewrite makes the log whole.
+  A reason-DEL drop no longer sets a second, never-clearing latch of its own.
+
 - **An AOF rewrite no longer replays a write twice, and a rewrite that fails
   late no longer leaves the writer appending to a deleted file** (moon#455).
   - **Double apply.** A rewrite split the append stream by position: whatever
