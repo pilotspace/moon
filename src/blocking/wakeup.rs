@@ -621,20 +621,31 @@ fn serve_list_key(
             _ => None,
         };
 
-        if deliver(
+        let delivered = deliver(
             db,
+            db_index,
             key,
+            &cmd,
             reply_tx,
             claim.as_ref(),
             result,
             undo,
             expires_at_ms,
-        ) {
+        );
+        if delivered.served() {
             served = true;
             if let Some(dest) = moved_to
                 && !worklist[pending_from..].contains(&dest)
             {
                 worklist.push(dest);
+            }
+            // moon#1056: the AOF writer could not take this pop's record
+            // within the backpressure bound. Every further serve here would
+            // wait out a bound of its own on the shard thread; leave the rest
+            // parked beside their data instead (a later write to the key, or
+            // their own timeout, reaches them).
+            if delivered == Delivered::ServedAofLost {
+                break;
             }
             // moon#1019: one push can carry several elements, and
             // Redis keeps serving the key's waiters while it has data. Stopping
@@ -650,35 +661,168 @@ fn serve_list_key(
     served
 }
 
+/// How [`deliver`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivered {
+    /// The waiter has its reply, and the pop is logged wherever logging is on.
+    Served,
+    /// The waiter was answered, but the AOF append of the pop was lost (the
+    /// writer stayed saturated past its bound). The pop stands and the waiter
+    /// was told so with an error instead of the element.
+    ServedAofLost,
+    /// Nobody took the serve: a lost claim, or a waiter gone before the reply
+    /// could be sent.
+    NotServed,
+}
+
+impl Delivered {
+    /// A waiter was answered.
+    #[inline]
+    pub(crate) fn served(self) -> bool {
+        !matches!(self, Delivered::NotServed)
+    }
+}
+
+/// The non-blocking command that reproduces a pop a wake just performed on
+/// `key` (moon#1056), built from what the pop actually TOOK rather than from
+/// what the waiter asked for: a `BLMPOP ... COUNT 10` that found three
+/// elements is logged as popping three.
+///
+/// `None` when the undo does not describe a pop this waiter's command can
+/// make, which no caller produces — a record invented from a shape this does
+/// not understand would corrupt a replica far more cheaply than omitting it.
+pub(crate) fn served_pop_record(
+    cmd: &BlockedCommand,
+    key: &Bytes,
+    undo: &WakeUndo,
+) -> Option<Frame> {
+    fn bulk(s: &'static [u8]) -> Frame {
+        Frame::BulkString(Bytes::from_static(s))
+    }
+    fn side(d: Direction) -> Frame {
+        match d {
+            Direction::Left => bulk(b"LEFT"),
+            Direction::Right => bulk(b"RIGHT"),
+        }
+    }
+    // `POP key` for one element, `POP key n` for several — the two spellings
+    // replay identically, and the short one is what a single pop always was.
+    fn pop(name: &'static [u8], key: &Bytes, n: usize) -> Option<Frame> {
+        match n {
+            0 => None,
+            1 => Some(Frame::Array(framevec![
+                bulk(name),
+                Frame::BulkString(key.clone()),
+            ])),
+            n => {
+                let mut digits = itoa::Buffer::new();
+                Some(Frame::Array(framevec![
+                    bulk(name),
+                    Frame::BulkString(key.clone()),
+                    Frame::BulkString(Bytes::copy_from_slice(digits.format(n).as_bytes())),
+                ]))
+            }
+        }
+    }
+    match undo {
+        WakeUndo::ListFront(vals) => pop(b"LPOP", key, vals.len()),
+        WakeUndo::ListBack(vals) => pop(b"RPOP", key, vals.len()),
+        WakeUndo::Moved {
+            destination,
+            wherefrom,
+            whereto,
+            ..
+        } => Some(Frame::Array(framevec![
+            bulk(b"LMOVE"),
+            Frame::BulkString(key.clone()),
+            Frame::BulkString(destination.clone()),
+            side(*wherefrom),
+            side(*whereto),
+        ])),
+        WakeUndo::Zset(pairs) => {
+            let min = match cmd {
+                BlockedCommand::BZPopMin => true,
+                BlockedCommand::BZPopMax => false,
+                BlockedCommand::BZMPop { min, .. } => *min,
+                _ => return None,
+            };
+            pop(if min { b"ZPOPMIN" } else { b"ZPOPMAX" }, key, pairs.len())
+        }
+    }
+}
+
 /// The tail every destructive wake shares, once the element is popped and the
-/// reply built: decide whether this waiter gets it, and put it back if not.
-/// Returns true if the waiter was answered. A waker with nothing to hand a
-/// waiter never gets here — it leaves the waiter parked instead.
+/// reply built: decide whether this waiter gets it, log the pop, and put it
+/// back if nobody takes it. A waker with nothing to hand a waiter never gets
+/// here — it leaves the waiter parked instead.
 ///
 /// * moon#1019: a waiter registered on several threads is served by exactly
 ///   one of them — whichever wins its [`ClaimToken`](crate::blocking::ClaimToken).
 ///   The claim is attempted with the element already in hand, so a lost claim
 ///   restores it here, in the same synchronous stretch as the pop, where no
 ///   other client can have observed the round trip.
-/// * A2: a failed send (the receiver dropped after the liveness check) restores
-///   the element and moves on instead of destroying it.
+/// * moon#1056: a won serve is LOGGED here, by the shard that popped, before
+///   the reply leaves ([`crate::blocking::pop_log`]). This is the owner's
+///   thread and the pop's own synchronous stretch, so the record lands in the
+///   owner's AOF and replication stream in the same order as the owner's
+///   other writes. The waiter logs nothing.
+/// * A2: a failed send (the receiver dropped after the liveness check)
+///   restores the element and moves on instead of destroying it — when the
+///   pop reached no durability plane. Once it has been logged, putting the
+///   element back would leave memory disagreeing with the AOF and the
+///   replicas, so the serve stands, exactly as it does for a client that
+///   disconnects after its reply is sent (moon#1023). A local waiter cannot
+///   reach that case: its receiver lives on this thread and was checked just
+///   before; a remote one only when its task is torn down without settling.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn deliver(
     db: &mut Database,
+    db_index: usize,
     key: &Bytes,
+    cmd: &BlockedCommand,
     reply_tx: crate::runtime::channel::OneshotSender<Option<Frame>>,
     claim: Option<&crate::blocking::ClaimToken>,
     frame: Frame,
     undo: Option<WakeUndo>,
     expires_at_ms: u64,
-) -> bool {
+) -> Delivered {
     let won = claim.is_none_or(crate::blocking::ClaimToken::try_claim);
-    if won && reply_tx.send(Some(frame)).is_ok() {
-        return true;
+    if !won || reply_tx.is_disconnected() {
+        if let Some(undo) = undo {
+            undo.restore_keeping_ttl(db, key, expires_at_ms);
+        }
+        return Delivered::NotServed;
     }
-    if let Some(undo) = undo {
+    let mut frame = frame;
+    let mut logged = false;
+    let mut aof_lost = false;
+    if let Some(u) = undo.as_ref()
+        && crate::blocking::pop_log::has_work()
+        && let Some(record) = served_pop_record(cmd, key, u)
+    {
+        match crate::blocking::pop_log::log_pop(db_index, &record) {
+            crate::blocking::pop_log::PopLog::Unlogged => {}
+            crate::blocking::pop_log::PopLog::Logged => logged = true,
+            crate::blocking::pop_log::PopLog::AofLost => {
+                logged = true;
+                aof_lost = true;
+                frame = Frame::Error(Bytes::from_static(
+                    crate::shard::spsc_handler::AOF_APPEND_LOST_ERR,
+                ));
+            }
+        }
+    }
+    if reply_tx.send(Some(frame)).is_ok() {
+        return if aof_lost {
+            Delivered::ServedAofLost
+        } else {
+            Delivered::Served
+        };
+    }
+    if !logged && let Some(undo) = undo {
         undo.restore_keeping_ttl(db, key, expires_at_ms);
     }
-    false
+    Delivered::NotServed
 }
 
 /// Called after ZADD successfully adds elements to a sorted set key.
@@ -807,18 +951,21 @@ pub fn try_wake_zset_waiter(
 
         registry.remove_wait(wait_id);
 
-        // Claim / A2 / keep-serving-while-data: see try_wake_list_waiter.
-        if deliver(
+        // Claim / log / A2 / keep-serving-while-data: see try_wake_list_waiter.
+        let delivered = deliver(
             db,
+            db_index,
             key,
+            &cmd,
             reply_tx,
             claim.as_ref(),
             result,
             undo,
             expires_at_ms,
-        ) {
+        );
+        if delivered.served() {
             served = true;
-            if !db.exists(key) {
+            if delivered == Delivered::ServedAofLost || !db.exists(key) {
                 break;
             }
         }
@@ -931,6 +1078,21 @@ pub fn wake_written_keys_on_shard(
     args: &[Frame],
 ) {
     let keys = ready_keys(&registry.borrow(), db_index, cmd, args);
+    wake_ready_keys_on_shard(registry, db_index, keys);
+}
+
+/// Serve `keys` — decided earlier by [`ready_keys`] — in `db_index` of this
+/// shard. For a write path that must decide the keys while it still holds its
+/// write guard but may only WAKE once its own record is logged (moon#1056): a
+/// wake logs each pop it performs as it performs it, so running it before the
+/// write that fed it is logged would put the pop ahead of that write in the
+/// AOF and the replication stream. Call outside any borrow of this shard's
+/// slice.
+pub fn wake_ready_keys_on_shard(
+    registry: &std::cell::RefCell<BlockingRegistry>,
+    db_index: usize,
+    keys: ReadyKeys,
+) {
     if keys.is_empty() {
         return;
     }
@@ -1074,6 +1236,25 @@ pub fn wake_cross_db_write(
         return false;
     }
     wake_key(&mut reg, dst, dst_db, key)
+}
+
+/// [`wake_cross_db_write`] for a caller that no longer holds the destination
+/// database — one that logs the `MOVE`/`COPY ... DB n` first and wakes after
+/// (moon#1056: a pop the wake performs is logged as it happens, so it must
+/// follow the write that fed it). Call outside any borrow of this shard's
+/// slice.
+pub fn wake_cross_db_write_on_shard(
+    registry: &std::cell::RefCell<BlockingRegistry>,
+    dst_db: usize,
+    key: &Bytes,
+    reply: &Frame,
+) -> bool {
+    if !matches!(reply, Frame::Integer(1)) || !registry.borrow().has_waiters(dst_db, key) {
+        return false;
+    }
+    crate::shard::slice::with_shard_db(dst_db, |dst| {
+        wake_cross_db_write(registry, dst, dst_db, key, reply)
+    })
 }
 
 /// Called after `XADD` adds an entry to a stream key, and again right after a

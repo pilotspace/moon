@@ -3262,8 +3262,8 @@ pub(crate) fn handle_shard_message_shared(
                     txn_scripting.as_ref(),
                 );
             // The waiters are registered HERE, on the owning shard's registry
-            // — the same one the live cross-shard write path wakes.
-            crate::blocking::wakeup::wake_recorded(blocking_registry, exec_wakes.drain(..));
+            // — the same one the live cross-shard write path wakes. They are
+            // woken below, once the body is logged (moon#1056).
             // task #52: this arm is the CROSS-SHARD EXEC hop (the accepting
             // connection's shard differs from the owner shard, which by
             // construction only happens at num_shards > 1) -- graph
@@ -3313,6 +3313,13 @@ pub(crate) fn handle_shard_message_shared(
                     append_lost = true;
                 }
             }
+            // moon#606 / moon#1056: serve the waiters the body made ready —
+            // AFTER its records are in this shard's AOF and replication
+            // stream, because a waiter served here has its pop logged by this
+            // shard as it pops, and that record must follow the push that fed
+            // it. Still inside this arm's synchronous stretch, so no other
+            // write on this shard can come between.
+            crate::blocking::wakeup::wake_recorded(blocking_registry, exec_wakes.drain(..));
             let _ = reply_tx.send(crate::shard::dispatch::TxnExecReply {
                 result,
                 exec_publishes,

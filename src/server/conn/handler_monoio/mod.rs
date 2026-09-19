@@ -3149,6 +3149,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let db_count = ctx.shard_databases.db_count();
                     // `resolve_move` refuses `dst_db == src_db` with redis's
                     // same-object error (moon#1062).
+                    // moon#1069: the key now exists in `dst_db` — the wake
+                    // target, raised below once the MOVE is logged (moon#1056).
+                    let mut wake_target: Option<(usize, bytes::Bytes)> = None;
                     let response = match ksmv::resolve_move(cmd_args, src_db, db_count) {
                         Err(e) => e,
                         // L4: `with_pair` is the exact contract
@@ -3156,25 +3159,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // differ (`resolve_move` never yields
                         // `dst_db == src_db`), panics out of range, acquires
                         // ascending, hands the closure (src, dst).
-                        Ok((key, dst_db)) => crate::shard::slice::with_shard(|s| {
-                            s.databases.with_pair(src_db, dst_db, |src, dst| {
-                                let reply = ksmv::move_core(src, dst, &key);
-                                // moon#1069: the key now exists in `dst_db`.
-                                crate::blocking::wakeup::wake_cross_db_write(
-                                    &ctx.blocking_registry,
-                                    dst,
-                                    dst_db,
-                                    &key,
-                                    &reply,
-                                );
-                                reply
-                            })
-                        }),
+                        Ok((key, dst_db)) => {
+                            let reply = crate::shard::slice::with_shard(|s| {
+                                s.databases.with_pair(src_db, dst_db, |src, dst| {
+                                    ksmv::move_core(src, dst, &key)
+                                })
+                            });
+                            wake_target = Some((dst_db, key));
+                            reply
+                        }
                     };
                     // AOF only on actual success (:1). Matches handler_single.
                     // H1 fix: durable path under `appendfsync=always`
                     // awaits the writer's fsync ack before responding to
                     // the client.
+                    let mut aof_failed = false;
                     if matches!(response, Frame::Integer(1)) {
                         // v0.7 local-leg live replication — same contract as
                         // the main write leg: record (backlog+offset, sync)
@@ -3197,30 +3196,43 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     serialized.len(),
                                 )
                             };
-                            let Some(ref pool) = ctx.aof_pool else {
-                                responses.push(response);
-                                continue;
-                            };
-                            match pool
-                                .send_append_group(ctx.shard_id, lsn, conn.selected_db, serialized)
-                                .await
-                            {
-                                // Always: durability confirmed by ONE
-                                // fsync_barrier per batch (resolve_local_leg_barrier
-                                // before serialization) instead of an awaited
-                                // fsync per pipelined command.
-                                Ok(true) => local_leg_write_idxs.push(responses.len()),
-                                Ok(false) => {}
-                                Err(_) => {
-                                    responses.push(Frame::Error(bytes::Bytes::from_static(
-                                        aof::AOF_FSYNC_ERR,
-                                    )));
-                                    continue;
+                            if let Some(ref pool) = ctx.aof_pool {
+                                match pool
+                                    .send_append_group(
+                                        ctx.shard_id,
+                                        lsn,
+                                        conn.selected_db,
+                                        serialized,
+                                    )
+                                    .await
+                                {
+                                    // Always: durability confirmed by ONE
+                                    // fsync_barrier per batch (resolve_local_leg_barrier
+                                    // before serialization) instead of an awaited
+                                    // fsync per pipelined command.
+                                    Ok(true) => local_leg_write_idxs.push(responses.len()),
+                                    Ok(false) => {}
+                                    Err(_) => aof_failed = true,
                                 }
                             }
                         }
                     }
-                    responses.push(response);
+                    // moon#1056: wake AFTER the MOVE is logged, so a pop it
+                    // feeds is logged behind it. Whether or not the AOF leg
+                    // failed: the key is in `dst_db` either way.
+                    if let Some((dst_db, key)) = wake_target {
+                        crate::blocking::wakeup::wake_cross_db_write_on_shard(
+                            &ctx.blocking_registry,
+                            dst_db,
+                            &key,
+                            &response,
+                        );
+                    }
+                    responses.push(if aof_failed {
+                        Frame::Error(bytes::Bytes::from_static(aof::AOF_FSYNC_ERR))
+                    } else {
+                        response
+                    });
                     continue;
                 }
 
@@ -3241,6 +3253,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             )));
                             continue;
                         }
+                        // moon#1069: the copy now exists in `dst_db` — the
+                        // wake target, raised once the COPY is logged
+                        // (moon#1056).
+                        let mut wake_target: Option<(usize, bytes::Bytes)> = None;
                         let response = match copy_result {
                             Err(e) => e,
                             // L4: see the MOVE arm. `parse_copy_db_args`
@@ -3248,30 +3264,26 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             // through to the plain write path), so
                             // `ca.dst_db != src_db` holds here and
                             // `with_pair`'s distinct-db assert cannot fire.
-                            Ok(ca) => crate::shard::slice::with_shard(|s| {
-                                s.databases.with_pair(src_db, ca.dst_db, |src, dst| {
-                                    let reply = ksmv::copy_core(
-                                        src,
-                                        dst,
-                                        &ca.src_key,
-                                        &ca.dst_key,
-                                        ca.replace,
-                                    );
-                                    // moon#1069: the copy now exists in `dst_db`.
-                                    crate::blocking::wakeup::wake_cross_db_write(
-                                        &ctx.blocking_registry,
-                                        dst,
-                                        ca.dst_db,
-                                        &ca.dst_key,
-                                        &reply,
-                                    );
-                                    reply
-                                })
-                            }),
+                            Ok(ca) => {
+                                let reply = crate::shard::slice::with_shard(|s| {
+                                    s.databases.with_pair(src_db, ca.dst_db, |src, dst| {
+                                        ksmv::copy_core(
+                                            src,
+                                            dst,
+                                            &ca.src_key,
+                                            &ca.dst_key,
+                                            ca.replace,
+                                        )
+                                    })
+                                });
+                                wake_target = Some((ca.dst_db, ca.dst_key));
+                                reply
+                            }
                         };
                         // AOF only on actual success (:1). Matches handler_single
                         // — `:0` (key absent / dst exists w/o REPLACE) is a no-op.
                         // H1: durable path awaits fsync under appendfsync=always.
+                        let mut aof_failed = false;
                         if matches!(response, Frame::Integer(1)) {
                             // v0.7 local-leg live replication — same contract
                             // as the main write leg (record backlog+offset
@@ -3294,32 +3306,38 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                         serialized.len(),
                                     )
                                 };
-                                let Some(ref pool) = ctx.aof_pool else {
-                                    responses.push(response);
-                                    continue;
-                                };
-                                match pool
-                                    .send_append_group(
-                                        ctx.shard_id,
-                                        lsn,
-                                        conn.selected_db,
-                                        serialized,
-                                    )
-                                    .await
-                                {
-                                    // Same one-barrier-per-batch contract as MOVE.
-                                    Ok(true) => local_leg_write_idxs.push(responses.len()),
-                                    Ok(false) => {}
-                                    Err(_) => {
-                                        responses.push(Frame::Error(bytes::Bytes::from_static(
-                                            aof::AOF_FSYNC_ERR,
-                                        )));
-                                        continue;
+                                if let Some(ref pool) = ctx.aof_pool {
+                                    match pool
+                                        .send_append_group(
+                                            ctx.shard_id,
+                                            lsn,
+                                            conn.selected_db,
+                                            serialized,
+                                        )
+                                        .await
+                                    {
+                                        // Same one-barrier-per-batch contract as MOVE.
+                                        Ok(true) => local_leg_write_idxs.push(responses.len()),
+                                        Ok(false) => {}
+                                        Err(_) => aof_failed = true,
                                     }
                                 }
                             }
                         }
-                        responses.push(response);
+                        // moon#1056: wake after the COPY is logged — see MOVE.
+                        if let Some((dst_db, dst_key)) = wake_target {
+                            crate::blocking::wakeup::wake_cross_db_write_on_shard(
+                                &ctx.blocking_registry,
+                                dst_db,
+                                &dst_key,
+                                &response,
+                            );
+                        }
+                        responses.push(if aof_failed {
+                            Frame::Error(bytes::Bytes::from_static(aof::AOF_FSYNC_ERR))
+                        } else {
+                            response
+                        });
                         continue;
                     }
                     // No DB clause or same-db: fall through to normal write path
@@ -3354,6 +3372,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             DispatchResult,
                             usize,
                             smallvec::SmallVec<[(bytes::Bytes, u64); 4]>,
+                            crate::blocking::wakeup::ReadyKeys,
                         ),
                         Frame,
                     > = crate::shard::slice::with_shard(|s| {
@@ -3565,35 +3584,30 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // ZUNIONSTORE/... woke nobody). Pinned by
                         // `tests/wakeup_local_write_gate.rs` and
                         // `tests/blocking_ready_key_wake.rs` at 1 and 4 shards.
-                        if !is_error {
-                            let ready = crate::blocking::wakeup::ready_keys(
+                        //
+                        // moon#1056: only the KEYS are decided here. The wake
+                        // itself runs below, once this write's own record is
+                        // in the AOF and the replication stream: a waiter it
+                        // serves logs its pop at the moment it pops, and that
+                        // record must come AFTER the write that fed it, or
+                        // replay pops an empty key and then re-adds the
+                        // element.
+                        let ready = if is_error {
+                            crate::blocking::wakeup::ReadyKeys::new()
+                        } else {
+                            crate::blocking::wakeup::ready_keys(
                                 &ctx.blocking_registry.borrow(),
                                 new_sel_db,
                                 cmd,
                                 cmd_args,
-                            );
-                            if !ready.is_empty() {
-                                // L4: fresh guard on the POST-dispatch db (a
-                                // queued SELECT may have moved it). The
-                                // write-path guard above was dropped after
-                                // `dispatch`, so this cannot be a recursive
-                                // acquisition even when `new_sel_db == sel_db`.
-                                let mut wake_guard = s.databases.write(new_sel_db);
-                                let mut reg = ctx.blocking_registry.borrow_mut();
-                                crate::blocking::wakeup::wake_keys(
-                                    &mut reg,
-                                    &mut wake_guard,
-                                    new_sel_db,
-                                    ready,
-                                );
-                            }
-                        }
+                            )
+                        };
 
-                        Ok((result, new_sel_db, hset_inserts))
+                        Ok((result, new_sel_db, hset_inserts, ready))
                     });
 
                     // Unpack write result — OOM causes immediate continue
-                    let (result, new_selected_db, hset_inserts) = match write_result {
+                    let (result, new_selected_db, hset_inserts, ready) = match write_result {
                         Ok(t) => t,
                         Err(oom_frame) => {
                             responses.push(oom_frame);
@@ -3719,6 +3733,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             }
                         }
                     }
+                    // moon#1056: serve the clients blocked on a key this
+                    // write touched — AFTER its record is enqueued above, so
+                    // every pop the wake performs (and logs, on this shard,
+                    // as it pops) follows the write that fed it in the AOF
+                    // and the replication stream. Raised whether or not the
+                    // AOF leg failed: the data is in the keyspace either way,
+                    // and a waiter left asleep beside it would answer null.
+                    // Fresh guard on the POST-dispatch db (a queued SELECT
+                    // may have moved it); the write guard is long released.
+                    crate::blocking::wakeup::wake_ready_keys_on_shard(
+                        &ctx.blocking_registry,
+                        new_selected_db,
+                        ready,
+                    );
+
                     // Suppress downstream effects on AOF failure — the
                     // client sees the error frame, no tracking churn.
                     if aof_failed {

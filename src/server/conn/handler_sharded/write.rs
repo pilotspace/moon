@@ -822,18 +822,8 @@ pub(super) async fn try_handle_multi_exec(
                 )
                 .await;
             }
-            // moon#606: raise the wakes the body recorded. A producer queued
-            // inside MULTI reaches none of the live write path's hooks, so
-            // without this a `MULTI ; LPUSH k v ; EXEC` left a client blocked
-            // on `k` asleep until its own timeout.
-            //
-            // Positioned exactly where the live path's hooks sit relative to
-            // the AOF barrier, and raised whether or not that barrier later
-            // fails: the elements are in the keyspace either way (an EXEC that
-            // cannot be persisted is reported as an error, not rolled back), so
-            // a waiter left asleep would answer null for a key that
-            // demonstrably has data.
-            crate::blocking::wakeup::wake_recorded(&ctx.blocking_registry, exec_wakes.drain(..));
+            // moon#606: the body recorded the keys it made ready; they are
+            // woken below, once the body is LOGGED (moon#1056).
 
             // task #52: flush the graph-leg wal-v3 records collected by the
             // txn executor. Replication is monoio-only by design (see
@@ -857,10 +847,22 @@ pub(super) async fn try_handle_multi_exec(
             // so ctx.shard_id is the correct AOF target. On barrier failure we
             // surface AOF_FSYNC_ERR instead of a false EXEC success — parity
             // with the normal write path.
-            if crate::server::conn::shared::persist_txn_aof(ctx, aof_entries, false)
-                .await
-                .is_err()
-            {
+            let persisted =
+                crate::server::conn::shared::persist_txn_aof(ctx, aof_entries, false).await;
+            // moon#606: raise the wakes the body recorded. A producer queued
+            // inside MULTI reaches none of the live write path's hooks, so
+            // without this a `MULTI ; LPUSH k v ; EXEC` left a client blocked
+            // on `k` asleep until its own timeout.
+            //
+            // moon#1056: raised AFTER the body is in the AOF (above). A waiter
+            // served here has its pop logged by this shard as it pops, so an
+            // earlier wake would put the pop ahead of the push that fed it.
+            // Raised whether or not persisting failed: the elements are in
+            // the keyspace either way (an EXEC that cannot be persisted is
+            // reported as an error, not rolled back), so a waiter left asleep
+            // would answer null for a key that demonstrably has data.
+            crate::blocking::wakeup::wake_recorded(&ctx.blocking_registry, exec_wakes.drain(..));
+            if persisted.is_err() {
                 conn.command_queue.clear();
                 // Durability could not be guaranteed: report the error and
                 // suppress any queued PUBLISH fan-out — the client sees EXEC
