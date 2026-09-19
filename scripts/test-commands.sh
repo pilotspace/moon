@@ -1645,6 +1645,30 @@ if should_run "transaction"; then
         echo "  FAIL: FN-MULTI-02 expected queue-time refusal + EXECABORT, got: $(echo "$fn_bogus" | tr '\n' ' ')"
     fi
 
+    # --- An ACL refusal inside MULTI aborts the transaction (moon#1035) ---
+    #
+    # redis 8.6.1 refuses a command the user may not run at QUEUE time and
+    # EXEC answers -EXECABORT with nothing applied. Moon answered NOPERM and
+    # then EXEC applied the rest. Verdict read from the KEY, as TXN-SUB-01
+    # does. The denied command is INCR, not something destructive: were the ACL
+    # gate itself ever to regress, a denied FLUSHALL would wipe later rows.
+    TOTAL=$((TOTAL + 1))
+    mcli ACL SETUSER tx:acl1035 reset on '>pw' '~*' '&*' +@all -incr > /dev/null 2>&1
+    mcli DEL tx:acl1035 tx:acl1035:n > /dev/null 2>&1
+    tx_acl=$(printf 'MULTI\nSET tx:acl1035 ran\nINCR tx:acl1035:n\nEXEC\n' \
+        | redis-cli -p "$PORT_RUST" --user tx:acl1035 --pass pw --no-auth-warning 2>&1 || true)
+    tx_acl_key=$(mcli GET tx:acl1035 2>/dev/null || true)
+    mcli ACL DELUSER tx:acl1035 > /dev/null 2>&1
+    if [ -n "$tx_acl_key" ]; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TXN-ACL-01 the transaction RAN despite a denied command (tx:acl1035=$tx_acl_key)"
+    elif echo "$tx_acl" | qgrep -q "NOPERM" && echo "$tx_acl" | qgrep -q "EXECABORT"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TXN-ACL-01 expected NOPERM + EXECABORT, got: $(echo "$tx_acl" | tr '\n' ' ')"
+    fi
+
     # --- Scripts inside MULTI (moon#894) -----------------------------------
     #
     # EVAL/EVALSHA/EVAL_RO/FCALL were queued and then answered `unknown

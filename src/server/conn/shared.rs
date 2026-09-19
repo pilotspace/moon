@@ -857,9 +857,10 @@ fn queue_exec_publish(
 ///
 /// Used by both the immediate single-handler PUBLISH and the transactional
 /// (MULTI/EXEC) fan-out in all three handlers, so a client denied a channel
-/// cannot wrap `PUBLISH` in `MULTI/EXEC` to bypass the check. Moon has no
-/// queue-time EXECABORT machinery, so the transactional check runs at fan-out
-/// time rather than at queue time.
+/// cannot wrap `PUBLISH` in `MULTI/EXEC` to bypass the check. Since moon#1035
+/// the channel is ALSO checked at queue time ([`queued_publish_channel_deny`]),
+/// which poisons the transaction as redis does; this EXEC-time check remains
+/// for rules that change between queue and EXEC.
 pub(crate) fn publish_channel_acl_deny(
     acl_table: &std::sync::RwLock<crate::acl::AclTable>,
     user: &str,
@@ -870,6 +871,47 @@ pub(crate) fn publish_channel_acl_deny(
     guard
         .check_channel_permission(user, channel)
         .map(|reason| Frame::Error(Bytes::from(format!("NOPERM {reason}"))))
+}
+
+/// Queue-time channel-ACL check for a `PUBLISH`/`SPUBLISH` sent inside `MULTI`
+/// (moon#1035). Returns the `NOPERM` frame the caller answers INSTEAD of
+/// `+QUEUED`, after flagging the transaction; `None` for every other command
+/// and for a permitted channel.
+///
+/// The generic ACL gate checks the command and its keys but never a channel —
+/// outside a transaction `PUBLISH` checks its own channel in its intercept, and
+/// inside one the intercept is skipped so the command can queue. The channel
+/// was therefore only checked by the EXEC-time fan-out above, after the rest
+/// of the block had applied. Measured against redis-server 8.6.1, `&allowed`
+/// user:
+///
+/// ```text
+/// MULTI / SET c1 1 / PUBLISH secret x / EXEC
+///   redis -> +QUEUED -NOPERM -EXECABORT          (c1 unset)
+///   moon  -> +QUEUED +QUEUED *2 +OK -NOPERM      (c1 SET)
+/// ```
+///
+/// The reply is [`publish_channel_acl_deny`]'s, the frame moon already answers
+/// for the same `PUBLISH` outside a transaction, so the two cannot drift. The
+/// EXEC-time check stays: ACL rules can change between queue and EXEC, and
+/// redis re-checks there too.
+///
+/// A malformed argv (no channel) returns `None`; the queue gate's arity check
+/// has already refused it.
+pub(crate) fn queued_publish_channel_deny(
+    acl_table: &std::sync::RwLock<crate::acl::AclTable>,
+    user: &str,
+    cmd: &[u8],
+    args: &[Frame],
+) -> Option<Frame> {
+    if !(cmd.eq_ignore_ascii_case(b"PUBLISH") || cmd.eq_ignore_ascii_case(b"SPUBLISH")) {
+        return None;
+    }
+    let channel = match args.first() {
+        Some(Frame::BulkString(b) | Frame::SimpleString(b)) => b.as_ref(),
+        _ => return None,
+    };
+    publish_channel_acl_deny(acl_table, user, channel)
 }
 
 /// Command-level ACL gate for the pub/sub intercepts (H-3). PUBLISH/SUBSCRIBE/
@@ -5851,5 +5893,58 @@ mod pending_shard_mask_tests {
             "a single-key command routes by its own key and is ordered by the \
              slotted batch itself"
         );
+    }
+}
+
+#[cfg(test)]
+mod queued_publish_channel_tests {
+    //! moon#1035: the queue-time channel check for `PUBLISH`/`SPUBLISH` inside
+    //! `MULTI`. The end-to-end EXECABORT is proven against a live server in
+    //! `tests/multi_acl_queue_time_1035.rs`; this pins the predicate itself.
+    use super::{publish_channel_acl_deny, queued_publish_channel_deny};
+    use crate::acl::AclTable;
+    use crate::protocol::Frame;
+    use bytes::Bytes;
+
+    fn table() -> std::sync::RwLock<AclTable> {
+        let mut t = AclTable::new();
+        t.apply_setuser(
+            "c",
+            &["on", "nopass", "~*", "resetchannels", "&allowed", "+@all"],
+        );
+        std::sync::RwLock::new(t)
+    }
+
+    fn argv(parts: &[&str]) -> Vec<Frame> {
+        parts
+            .iter()
+            .map(|p| Frame::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+            .collect()
+    }
+
+    #[test]
+    fn denied_channel_is_refused_with_the_top_level_reply() {
+        let t = table();
+        for verb in [&b"PUBLISH"[..], b"SPUBLISH", b"publish"] {
+            let got = queued_publish_channel_deny(&t, "c", verb, &argv(&["secret", "x"]));
+            let top = publish_channel_acl_deny(&t, "c", b"secret");
+            assert!(
+                got.is_some(),
+                "{verb:?} to a denied channel must be refused"
+            );
+            assert_eq!(got, top, "the queue-time reply must be the top-level one");
+        }
+    }
+
+    #[test]
+    fn permitted_channel_and_other_commands_pass() {
+        let t = table();
+        assert!(
+            queued_publish_channel_deny(&t, "c", b"PUBLISH", &argv(&["allowed", "x"])).is_none()
+        );
+        // Not a publish: the first argument is a key, never a channel.
+        assert!(queued_publish_channel_deny(&t, "c", b"SET", &argv(&["secret", "x"])).is_none());
+        // Malformed: the queue gate's arity check owns this reply.
+        assert!(queued_publish_channel_deny(&t, "c", b"PUBLISH", &[]).is_none());
     }
 }

@@ -30,6 +30,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BEHAVIOUR CHANGE — a command the user's ACL denies inside `MULTI` now
+  aborts the whole transaction** (moon#1035). `EXEC` answers
+  `-EXECABORT Transaction discarded because of previous errors.` and applies
+  nothing, where it used to apply every command except the denied one.
+  Measured against redis-server 8.6.1 with a `+@all -flushall` user:
+  `MULTI / SET mx 1 / FLUSHALL / EXEC` answered `*1 +OK` on moon (`mx` set)
+  and `-EXECABORT` on redis (`mx` unset); moon now matches. The denied command
+  still gets its `-NOPERM` reply at queue time, with the same text and the same
+  ACL LOG behaviour as outside a transaction. This covers every ACL refusal —
+  command, key pattern, and channel pattern: `PUBLISH`/`SPUBLISH` to a denied
+  channel inside `MULTI` used to answer `+QUEUED` and was refused only inside
+  `EXEC`'s reply after the rest had applied; it is now refused at queue time.
+  Holds on both runtimes, at `--shards 1` and `--shards 4` (including a body
+  routed to its owner shard, moon#247), pipelined or not; `DISCARD` clears the
+  poison and the aborted `EXEC` clears `WATCH`es. Each handler's ACL gate
+  calls one `ConnectionState::flag_transaction` on the verdict of
+  `check_command_permission(user, cmd, args)`, so per-subcommand rules
+  (`-config|set`) poison the transaction as soon as that check enforces them.
+  A client that relied on the partial commit — treating the `NOPERM` as a
+  per-command failure and the rest as applied — now sees nothing applied.
+
 - **`Check (macOS)` and `Check (Windows)` run their tests in three shards**,
   cutting the critical path of a `workflow_dispatch` roughly in half. Measured
   on a real run before changing anything: the macOS job spent 146s compiling

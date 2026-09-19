@@ -983,6 +983,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 client_addr: peer_addr.clone(),
                                 timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
                             });
+                            // moon#1035: inside MULTI a refusal poisons the block.
+                            conn.flag_transaction();
                             responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                             continue;
                         }
@@ -996,6 +998,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 client_addr: peer_addr.clone(),
                                 timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
                             });
+                            // moon#1035: a denied KEY poisons an open transaction too.
+                            conn.flag_transaction();
                             responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                             continue;
                         }
@@ -1087,6 +1091,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // than applying the half that happened to be valid.
                         if let Some(err) = crate::server::conn::shared::queue_time_rejection(cmd, cmd_args) {
                             conn.multi_dirty = true;
+                            responses.push(err);
+                            continue;
+                        }
+                        // moon#1035: the ACL gate above checks command and keys,
+                        // never a PUBLISH channel — refuse a denied one HERE so
+                        // the block aborts, instead of at EXEC after the rest ran.
+                        if let Some(err) = crate::server::conn::shared::queued_publish_channel_deny(
+                            &ctx.acl_table,
+                            &conn.current_user,
+                            cmd,
+                            cmd_args,
+                        ) {
+                            conn.flag_transaction();
                             responses.push(err);
                             continue;
                         }
