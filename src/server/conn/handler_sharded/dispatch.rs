@@ -77,19 +77,11 @@ pub(super) fn try_handle_client_command(
             }
             if sub_bytes.eq_ignore_ascii_case(b"LIST") {
                 // Update our own entry before listing
-                crate::client_registry::update(client_id, |e| {
-                    e.live.touch(
-                        conn.selected_db,
-                        crate::client_registry::ClientFlags {
-                            subscriber: conn.subscription_count > 0,
-                            in_multi: conn.in_multi,
-                            // Executing CLIENT LIST/INFO means not blocked.
-                            blocked: false,
-                            replica: conn.saw_replconf,
-                        },
-                        crate::storage::entry::current_time_ms(),
-                    );
-                });
+                crate::server::conn::shared::publish_own_client_state(
+                    client_id,
+                    conn,
+                    &ctx.shard_pubsub(),
+                );
                 let list = crate::client_registry::client_list();
                 responses.push(Frame::BulkString(Bytes::from(list)));
                 return true;
@@ -97,19 +89,11 @@ pub(super) fn try_handle_client_command(
             if sub_bytes.eq_ignore_ascii_case(b"INFO") {
                 // Derive flags from CURRENT conn state (same as the LIST path
                 // above) — reloading e.live.flags would freeze stale bits.
-                crate::client_registry::update(client_id, |e| {
-                    e.live.touch(
-                        conn.selected_db,
-                        crate::client_registry::ClientFlags {
-                            subscriber: conn.subscription_count > 0,
-                            in_multi: conn.in_multi,
-                            // Executing CLIENT LIST/INFO means not blocked.
-                            blocked: false,
-                            replica: conn.saw_replconf,
-                        },
-                        crate::storage::entry::current_time_ms(),
-                    );
-                });
+                crate::server::conn::shared::publish_own_client_state(
+                    client_id,
+                    conn,
+                    &ctx.shard_pubsub(),
+                );
                 let info = crate::client_registry::client_info(client_id).unwrap_or_default();
                 // No conversion call here any more: `responses` is an
                 // `InterceptReplies`, which applies the RESP3 policy on push.

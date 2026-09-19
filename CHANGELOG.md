@@ -199,6 +199,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`scripts/test-consistency.sh`: six rows no longer fail with `CROSSSLOT`
+  at `--shards 4`** (moon#1106). `ZRANGESTORE still-negative stop` and five
+  CLIENT TRACKING destination controls named keys on different shards, so
+  they tested the routing refusal instead of the command. Their keys (and
+  their sibling rows') now share a `{tag}`. The redirect-transcript drain
+  used `read -t 0.3`, which macOS `/bin/bash` 3.2 rejects ("invalid timeout
+  specification"), ending the drain at once; it now uses `-t 1`.
+
+- **`CLIENT INFO` / `CLIENT LIST` report a subscriber's flag, counts and
+  protocol, and `RESET` from RESP2 subscriber mode resets everything**
+  (moon#1105), matching redis 8.6.1 on both runtimes. A subscribed client was
+  listed as `flags=S` (redis's REPLICA flag) with `sub=0 psub=0 ssub=0` and
+  `resp=2` whatever it held; it is now `P` with its real channel, pattern and
+  shard-channel counts, every client's `resp` follows `HELLO`, and flag
+  characters combine in redis's order (`Px`, `Pb`, then `t`/`R`/`B`) instead
+  of keeping only the first. `RESET` sent from the RESP2 subscriber loop only
+  unsubscribed, so the connection kept its db, `CLIENT TRACKING`, name and
+  authentication; both handlers now run the same `RESET` as everywhere else.
+  That shared `RESET` also tore down only channels and patterns: a RESP3
+  client's `SSUBSCRIBE` survived it, and `SPUBLISH` still counted it as a
+  receiver. It now clears all three namespaces and the remote shard maps.
+
+- **A restart no longer drops vector documents whose hash is in the cold tier
+  or carries a field TTL** (moon#1074). At boot, index recovery walks the
+  keyspace, and any recovered document whose key the walk did not see is
+  deleted as "removed while the server was down". The walk read only the hot
+  table, and within it skipped the per-field-TTL hash encoding. So every
+  document whose HASH `allkeys-lru` eviction had spilled to the cold tier, and
+  every document that had had `HEXPIRE` applied to one of its fields, dropped
+  out of `FT.SEARCH` after a restart, while `EXISTS`/`HGETALL` still returned
+  the key. Measured on a 300-document index pushed to the cold tier: 299-300
+  of 300 documents were unfindable after a clean restart, and 294-295 of 300
+  after `kill -9` (the rest were hot at boot). A cold document that was still in the mutable segment at
+  shutdown was never re-indexed at all. The walk now reads cold-tier hashes
+  from disk (one page read per key, in file order) and reads field-TTL hashes
+  without their expired fields. A cold entry that cannot be read keeps its
+  recovered document: a read fault is not a delete. The walk lists keys up
+  front but takes each key's payload only when it reconciles it: the keyspace
+  is not frozen while the walk runs (writes routed from another shard are
+  applied, and eviction spills), so a payload captured at the start could be
+  stale by the time it was reconciled. Text indexes loaded from `.tpost` are
+  reconciled by the same walk.
+
 - **A re-written or deleted vector document stops matching in every tier, at
   runtime and across a restart, and `FT.INFO num_docs` counts each live key
   once** (moon#1066, moon#1073). Measured on a real server, 1000 keys, before
@@ -412,6 +455,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     loss the committed manifest could name a missing incr, or the old
     `appendonly.aof` could return, losing every record written after the
     rewrite. Both directories are now fsynced before the new file is used.
+
+- **The console lints, and CI runs it** (moon#1082). `pnpm run lint` exited
+  with a missing-config error because ESLint 9 reads only flat config and the
+  console had none. `console/eslint.config.js` now wires the plugins that were
+  already installed (`@eslint/js` and `typescript-eslint` recommended,
+  `react-hooks`, `react-refresh`), and the `unit` job of
+  `console-integration.yml` runs `pnpm run lint` before the tests. Its first
+  run found a real bug: `GraphCosmos` returned its Canvas2D fallback before its
+  hooks, so the re-render after a failed WebGL init called fewer hooks than the
+  first render and React threw; only the parent's error boundary hid it. The
+  fallback now returns after the hooks, with a unit test that failed before the
+  change. `badge.tsx` stops exporting the unused `badgeVariants`, and
+  `no-unused-vars` accepts a leading underscore, the convention `tsc` already
+  applies under `noUnusedParameters`.
 
 - **A COLD vector segment leaves `unloaded` with the search that reloads it,
   and a delete that lands while the reload is waiting to install is no longer
@@ -1355,6 +1412,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CH` as a did-anything-change signal silently skipped those updates. Fixed on
   both the listpack and B+tree arms, which carried separate copies.
 ### Security
+
+- **`fuzz/Cargo.lock` is audited and clean** (moon#1092). The fuzz workspace
+  has its own lockfile, which no gate checked, and it carried
+  RUSTSEC-2026-0204 (`crossbeam-epoch` 0.9.18) and RUSTSEC-2026-0258 (`h2`
+  0.4.13), plus the unsound `anyhow` 1.0.102 and `memmap2` 0.9.10 and the
+  yanked `spin` 0.9.8. Each is bumped to the version the root `Cargo.lock`
+  already ships (0.9.20, 0.4.18, 1.0.104, 0.9.11, 0.9.9), and nothing else in
+  the lockfile moves. `supply-chain.yml` now triggers on `fuzz/Cargo.toml` and
+  `fuzz/Cargo.lock` and runs `cargo audit --file fuzz/Cargo.lock` next to the
+  root audit, so the fuzz lockfile cannot drift behind again unnoticed.
 
 - **Error and status replies can no longer be split by client input**
   (moon#1031). Error text quotes client input (an unknown command name, an

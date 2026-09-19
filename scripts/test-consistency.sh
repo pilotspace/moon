@@ -1041,17 +1041,17 @@ both DEL "{z1102}s"
 # `*0`, `ZRANGE r8 -10 -6 REV` -> `*0`, `ZRANGESTORE r9 r8 -10 -6` -> `0`.
 # `zrange_by_rank` (B+tree) and `zrange_from_entries` (listpack) both now
 # call the same `rank_window` helper `ZREMRANGEBYRANK` above already used.
-both ZADD z:1001:rank 1 a 2 b 3 c 4 d 5 e
-assert_both "ZRANGE still-negative stop"        ZRANGE z:1001:rank -10 -6
-assert_both "ZREVRANGE still-negative stop"     ZREVRANGE z:1001:rank -10 -6
-assert_both "ZRANGE REV still-negative stop"    ZRANGE z:1001:rank -10 -6 REV
-assert_both "ZRANGESTORE still-negative stop"   ZRANGESTORE {z1001}:d z:1001:rank -10 -6
+both ZADD {z1001}:rank 1 a 2 b 3 c 4 d 5 e
+assert_both "ZRANGE still-negative stop"        ZRANGE {z1001}:rank -10 -6
+assert_both "ZREVRANGE still-negative stop"     ZREVRANGE {z1001}:rank -10 -6
+assert_both "ZRANGE REV still-negative stop"    ZRANGE {z1001}:rank -10 -6 REV
+assert_both "ZRANGESTORE still-negative stop"   ZRANGESTORE {z1001}:d {z1001}:rank -10 -6
 assert_both "ZRANGESTORE dest left empty"       ZRANGE {z1001}:d 0 -1
 # Controls: a stop of exactly -len normalises to rank 0 without clamping
 # (already correct pre-fix), and start > stop after normalisation was
 # already handled.
-assert_both "ZRANGE stop == -len"               ZRANGE z:1001:rank -10 -5
-assert_both "ZRANGE start > stop"               ZRANGE z:1001:rank -1 -3
+assert_both "ZRANGE stop == -len"               ZRANGE {z1001}:rank -10 -5
+assert_both "ZRANGE start > stop"               ZRANGE {z1001}:rank -1 -3
 both ZADD z:1001:one 1 solo
 assert_both "ZRANGE len=1 still-negative stop"  ZRANGE z:1001:one -10 -6
 assert_both "ZRANGE len=1 stop == -len"         ZRANGE z:1001:one -1 -1
@@ -2956,50 +2956,50 @@ assert_tracking() {
         "$(tracking_push_for "$PORT_RUST"  "$watched" "$read_cmd" "$@")"
 }
 
-both ZADD tz:a 1 m
-both ZADD tz:b 1 m
+both ZADD {tz}:a 1 m
+both ZADD {tz}:b 1 m
 assert_tracking "tracking: ZUNIONSTORE SOURCE not invalidated" \
-    "tz:a" "ZRANGE tz:a 0 -1" ZUNIONSTORE tz:d 2 tz:a tz:b
+    "{tz}:a" "ZRANGE {tz}:a 0 -1" ZUNIONSTORE {tz}:d 2 {tz}:a {tz}:b
 assert_tracking "tracking: ZUNIONSTORE DEST invalidated [control]" \
-    "tz:d" "ZRANGE tz:d 0 -1" ZUNIONSTORE tz:d 2 tz:a tz:b
+    "{tz}:d" "ZRANGE {tz}:d 0 -1" ZUNIONSTORE {tz}:d 2 {tz}:a {tz}:b
 assert_tracking "tracking: ZINTERSTORE SOURCE not invalidated" \
-    "tz:a" "ZRANGE tz:a 0 -1" ZINTERSTORE tz:i 2 tz:a tz:b
+    "{tz}:a" "ZRANGE {tz}:a 0 -1" ZINTERSTORE {tz}:i 2 {tz}:a {tz}:b
 assert_tracking "tracking: ZINTERSTORE DEST invalidated [control]" \
-    "tz:i" "ZRANGE tz:i 0 -1" ZINTERSTORE tz:i 2 tz:a tz:b
+    "{tz}:i" "ZRANGE {tz}:i 0 -1" ZINTERSTORE {tz}:i 2 {tz}:a {tz}:b
 
-both RPUSH tl:s b a
+both RPUSH {tl}:s b a
 assert_tracking "tracking: SORT..STORE SOURCE not invalidated" \
-    "tl:s" "LRANGE tl:s 0 -1" SORT tl:s ALPHA STORE tl:d
+    "{tl}:s" "LRANGE {tl}:s 0 -1" SORT {tl}:s ALPHA STORE {tl}:d
 assert_tracking "tracking: SORT..STORE DEST invalidated [control]" \
-    "tl:d" "LRANGE tl:d 0 -1" SORT tl:s ALPHA STORE tl:d
+    "{tl}:d" "LRANGE {tl}:d 0 -1" SORT {tl}:s ALPHA STORE {tl}:d
 # SORT is a WRITE-flagged command that writes NOTHING without STORE.
 assert_tracking "tracking: SORT without STORE invalidates nothing" \
-    "tl:s" "LRANGE tl:s 0 -1" SORT tl:s ALPHA
+    "{tl}:s" "LRANGE {tl}:s 0 -1" SORT {tl}:s ALPHA
 
-both SADD ts:a x
-both SADD ts:b x
+both SADD {ts}:a x
+both SADD {ts}:b x
 assert_tracking "tracking: SINTERSTORE SOURCE not invalidated" \
-    "ts:a" "SMEMBERS ts:a" SINTERSTORE ts:d ts:a ts:b
+    "{ts}:a" "SMEMBERS {ts}:a" SINTERSTORE {ts}:d {ts}:a {ts}:b
 assert_tracking "tracking: SINTERSTORE DEST invalidated [control]" \
-    "ts:d" "SMEMBERS ts:d" SINTERSTORE ts:d ts:a ts:b
+    "{ts}:d" "SMEMBERS {ts}:d" SINTERSTORE {ts}:d {ts}:a {ts}:b
 
-both SET tb:a x
-both SET tb:b y
+both SET {tbo}:a x
+both SET {tbo}:b y
 assert_tracking "tracking: BITOP SOURCE not invalidated" \
-    "tb:a" "GET tb:a" BITOP AND tb:d tb:a tb:b
+    "{tbo}:a" "GET {tbo}:a" BITOP AND {tbo}:d {tbo}:a {tbo}:b
 assert_tracking "tracking: BITOP DEST invalidated [control]" \
-    "tb:d" "GET tb:d" BITOP AND tb:d tb:a tb:b
+    "{tbo}:d" "GET {tbo}:d" BITOP AND {tbo}:d {tbo}:a {tbo}:b
 
-both SET tc:a v
+both SET {tc}:a v
 assert_tracking "tracking: COPY SOURCE not invalidated" \
-    "tc:a" "GET tc:a" COPY tc:a tc:d
+    "{tc}:a" "GET {tc}:a" COPY {tc}:a {tc}:d
 assert_tracking "tracking: COPY DEST invalidated [control]" \
-    "tc:d" "GET tc:d" COPY tc:a tc:d REPLACE
+    "{tc}:d" "GET {tc}:d" COPY {tc}:a {tc}:d REPLACE
 
 assert_tracking "tracking: ZRANGESTORE SOURCE not invalidated" \
-    "tz:a" "ZRANGE tz:a 0 -1" ZRANGESTORE tz:r tz:a 0 -1
+    "{tz}:a" "ZRANGE {tz}:a 0 -1" ZRANGESTORE {tz}:r {tz}:a 0 -1
 assert_tracking "tracking: ZRANGESTORE DEST invalidated [control]" \
-    "tz:r" "ZRANGE tz:r 0 -1" ZRANGESTORE tz:r tz:a 0 -1
+    "{tz}:r" "ZRANGE {tz}:r 0 -1" ZRANGESTORE {tz}:r {tz}:a 0 -1
 
 # ---------------------------------------------------------------------------
 # moon#1013 -- a key that EXPIRES must invalidate exactly like one a command
@@ -3138,7 +3138,9 @@ tracking_redirect_transcript() {
     if [[ -n "$prelude" ]]; then
         while IFS= read -r step; do
             printf '%s\r\n' "$step" >&3
-            while IFS= read -r -t 0.3 line <&3; do :; done
+            # Integer timeout: macOS /bin/bash 3.2 rejects `-t 0.3` ("invalid
+            # timeout specification"), which ended this drain at once there.
+            while IFS= read -r -t 1 line <&3; do :; done
         done <<< "$prelude"
     fi
     printf 'SUBSCRIBE __redis__:invalidate\r\n' >&3
@@ -3217,6 +3219,52 @@ assert_eq "pubsub: commands pipelined after RESET run (moon#1090)" \
     "$(pipelined_transcript "$PORT_RUST" "$TRK_RESET_PIPE")"
 
 # ---------------------------------------------------------------------------
+# moon#1105 -- CLIENT INFO of a subscribed connection, and RESET sent from
+# RESP2 subscriber mode. Measured on redis 8.6.1: a RESP3 subscriber is
+# `flags=P sub=1 psub=0 ssub=0 resp=3` (moon: `flags=S sub=0 resp=2`; `S` is
+# redis's REPLICA flag), and RESET from RESP2 subscriber mode returns to db 0,
+# tracking off and no name (moon kept all three). One write per case; only
+# the fields below are compared (id, addr, age differ by nature).
+# ---------------------------------------------------------------------------
+client_state_fields() {
+    local port="$1" payload="$2" line="" seen=""
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf '%s' "$payload" >&3
+    while IFS= read -r -t 1 line <&3; do
+        seen="${seen}${line%$'\r'} "
+    done
+    exec 3>&-
+    grep -oE ' (flags|db|sub|psub|ssub|redir|resp|name)=[^ ]*' <<< "$seen" | tr -d '\n' || true
+}
+CS_RESP3_SUB=$'HELLO 3\r\nSUBSCRIBE {cs}:x\r\nCLIENT INFO\r\n'
+CS_RESP3_ALL=$'HELLO 3\r\nSUBSCRIBE {cs}:x\r\nPSUBSCRIBE {cs}:p*\r\nSSUBSCRIBE {cs}:s\r\nCLIENT INFO\r\n'
+CS_RESP3_NONE=$'HELLO 3\r\nCLIENT INFO\r\n'
+CS_RESET_RESP2=$'SELECT 3\r\nCLIENT TRACKING on\r\nCLIENT SETNAME nm\r\nSUBSCRIBE {cs}:x\r\nRESET\r\nCLIENT INFO\r\n'
+CS_RESET_RESP3=$'HELLO 3\r\nSELECT 3\r\nCLIENT TRACKING on\r\nSSUBSCRIBE {cs}:s\r\nRESET\r\nCLIENT INFO\r\n'
+for cs_case in CS_RESP3_SUB CS_RESP3_ALL CS_RESP3_NONE CS_RESET_RESP2 CS_RESET_RESP3; do
+    assert_eq "CLIENT INFO subscriber state [$cs_case] (moon#1105)" \
+        "$(client_state_fields "$PORT_REDIS" "${!cs_case}")" \
+        "$(client_state_fields "$PORT_RUST" "${!cs_case}")"
+done
+# RESET must drop every namespace: a RESP3 shard subscription left behind was
+# still counted by SPUBLISH.
+reset_leftover_receivers() {
+    local port="$1" sub="$2" pub="$3" line="" n=""
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'HELLO 3\r\n%s {cs}:left\r\nRESET\r\n' "$sub" >&3
+    while IFS= read -r -t 1 line <&3; do :; done
+    n=$(redis-cli -p "$port" "$pub" '{cs}:left' hi 2>&1 || true)
+    exec 3>&-
+    echo "$n"
+}
+assert_eq "RESET drops a RESP3 SSUBSCRIBE (moon#1105)" \
+    "$(reset_leftover_receivers "$PORT_REDIS" SSUBSCRIBE SPUBLISH)" \
+    "$(reset_leftover_receivers "$PORT_RUST" SSUBSCRIBE SPUBLISH)"
+assert_eq "RESET drops a RESP3 SUBSCRIBE (moon#1105)" \
+    "$(reset_leftover_receivers "$PORT_REDIS" SUBSCRIBE PUBLISH)" \
+    "$(reset_leftover_receivers "$PORT_RUST" SUBSCRIBE PUBLISH)"
+
+# ---------------------------------------------------------------------------
 # moon#1078 -- CLIENT INFO reports tracking: `flags=t` (plus `B` for BCAST)
 # and `redir=` (0 with no redirect, -1 with tracking off). Moon hard-coded
 # `flags=N redir=-1`. Only those two fields are compared.
@@ -3292,9 +3340,9 @@ assert_tracking "tracking: DEL invalidates its key [control]" \
     "tp:d" "GET tp:d" DEL tp:d
 assert_tracking "tracking: MSET invalidates every key [control]" \
     "tp:m2" "GET tp:m2" MSET tp:m1 1 tp:m2 2
-both SET tp:rs v
+both SET {tp}:rs v
 assert_tracking "tracking: RENAME invalidates its source [control]" \
-    "tp:rs" "GET tp:rs" RENAME tp:rs tp:rd
+    "{tp}:rs" "GET {tp}:rs" RENAME {tp}:rs {tp}:rd
 assert_both "COMMAND COUNT arity" COMMAND COUNT extra
 assert_both "COMMAND INFO unknown name" COMMAND INFO definitely-not-a-command
 
