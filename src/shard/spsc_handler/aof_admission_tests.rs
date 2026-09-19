@@ -308,8 +308,11 @@ fn an_expired_wait_refuses_unapplied_and_fails_the_next_legs_fast() {
     on_shard_thread(|| {
         let (pool, rx) = writer(1, 1, Duration::from_millis(20));
         let mut shard = Shard::new(1);
-        let (a, b) = (slot(), slot());
+        let (a, read, b) = (slot(), slot(), slot());
         shard.send(0, one(argv(&[b"SET", b"a", b"1"]), &a));
+        // A read between the two writes is admitted (it logs nothing), but
+        // it proves no room: it must not close the circuit.
+        shard.send(0, one(argv(&[b"GET", b"a"]), &read));
         shard.send(0, one(argv(&[b"SET", b"b", b"1"]), &b));
 
         let mut cycles = 0;
@@ -323,9 +326,10 @@ fn an_expired_wait_refuses_unapplied_and_fails_the_next_legs_fast() {
             std::thread::sleep(Duration::from_millis(1));
             shard.drain(&pool);
         }
+        assert!(read.try_take().is_some(), "the read behind it ran");
         let rb = b
             .try_take()
-            .expect("the next leg failed fast in the same cycle");
+            .expect("the next write failed fast in the same cycle, although a read ran between");
         assert!(rb.iter().all(is_refusal), "{rb:?}");
         assert!(
             !key_exists(b"a") && !key_exists(b"b"),

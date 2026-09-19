@@ -174,12 +174,13 @@ impl<'a> AdmissionCycle<'a> {
             .saturating_add(upper)
             .saturating_add(ROUTED_ADMISSION_HEADROOM);
         if free >= fast_need && !self.pool.append_writer_gone(self.shard_id) {
-            return self.admit(ring, upper);
+            return self.admit(ring, upper, true);
         }
         let records = routed_leg_records(msg);
         if records == 0 {
-            // A read logs nothing and never waits.
-            return self.admit(ring, 0);
+            // A read logs nothing and never waits. It found no room, so it
+            // must not close an open circuit.
+            return self.admit(ring, 0, false);
         }
         if self.pool.append_writer_gone(self.shard_id) {
             // Nothing can ever log it: refusing now is the only honest answer.
@@ -191,7 +192,7 @@ impl<'a> AdmissionCycle<'a> {
             records,
             ROUTED_ADMISSION_HEADROOM,
         ) {
-            return self.admit(ring, records);
+            return self.admit(ring, records, true);
         }
         let now = Instant::now();
         let wait = self.pool.routed_admission_wait();
@@ -227,14 +228,18 @@ impl<'a> AdmissionCycle<'a> {
         })
     }
 
-    fn admit(&mut self, ring: usize, records: usize) -> Admission {
+    /// `room_found`: the writer had room for this leg's records (as opposed
+    /// to a read admitted because it logs nothing). Only that closes an open
+    /// circuit.
+    fn admit(&mut self, ring: usize, records: usize, room_found: bool) -> Admission {
         self.reserved = self.reserved.saturating_add(records);
         if self.heads_dirty {
             HEADS.with(|h| {
                 let mut h = h.borrow_mut();
-                // Room was found: the circuit closes, and this ring's head
-                // (if it had been parked) is no longer waiting.
-                h.stalled = false;
+                if room_found {
+                    h.stalled = false;
+                }
+                // This ring's head (if it had been parked) is no longer waiting.
                 slot(&mut h, ring).take();
             });
         }
