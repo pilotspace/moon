@@ -1583,7 +1583,7 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                     // --- WAIT (R1): blocks on replica ACKs; must run at the
                     // connection layer (generic dispatch is synchronous) ---
-                    if dispatch::try_handle_wait(cmd, cmd_args, ctx, shaped!()).await {
+                    if dispatch::try_handle_wait(cmd, cmd_args, ctx, false, shaped!()).await {
                         continue;
                     }
 

@@ -2413,7 +2413,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // layer; generic dispatch is synchronous and used to answer :0.
             if !skip_name_gates
                 && cmd_len == 4
-                && dispatch::try_handle_wait(cmd, cmd_args, ctx, shaped!()).await
+                && dispatch::try_handle_wait(cmd, cmd_args, ctx, false, shaped!()).await
             {
                 continue;
             }

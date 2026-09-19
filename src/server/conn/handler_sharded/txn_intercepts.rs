@@ -254,10 +254,13 @@ pub(super) async fn run_txn_connection_intercept(
                 conn.protocol_version,
             ),
         )
+        // moon#1098: `true` = deny blocking. Inside EXEC a WAIT answers the
+        // current ack count at once, as redis does, instead of parking EXEC.
         || super::dispatch::try_handle_wait(
             cmd,
             cmd_args,
             ctx,
+            true,
             &mut crate::server::conn::intercept::InterceptReplies::new(
                 &mut out,
                 cmd,

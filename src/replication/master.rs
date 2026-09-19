@@ -925,6 +925,34 @@ fn drain_ack_offsets(buf: &mut bytes::BytesMut) -> Result<Vec<u64>, ()> {
     }
 }
 
+/// How many replicas have acknowledged at least `target_offset`.
+fn acked_count(rs: &ReplicationState, target_offset: u64) -> usize {
+    rs.replicas
+        .iter()
+        .filter(|r| {
+            let ack: u64 = r
+                .ack_offsets
+                .iter()
+                .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+                .sum();
+            ack >= target_offset
+        })
+        .count()
+}
+
+/// `WAIT` for a client that may not block — one queued inside `MULTI`
+/// (moon#1098): the number of replicas that have ALREADY acknowledged the
+/// master's current offset, sampled once.
+///
+/// Redis answers such a `WAIT` with `replicationCountAcksByOffset(...)` at once,
+/// because `EXEC` runs its body with `CLIENT_DENY_BLOCKING`. The target is the
+/// same one [`wait_for_replicas`] uses — the master's offset, not a per-client
+/// write offset — so the count never claims an ack the live `WAIT` would not.
+pub fn count_acked_replicas(repl_state: &Arc<RwLock<ReplicationState>>) -> usize {
+    let rs = repl_state.read();
+    acked_count(&rs, rs.total_offset())
+}
+
 /// WAIT command: block until N replicas acknowledge >= target_offset, or timeout expires.
 ///
 /// Returns the count of replicas that have acknowledged the offset.
@@ -941,26 +969,13 @@ pub async fn wait_for_replicas(
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(1));
 
     loop {
-        let acked_count = {
-            let rs = repl_state.read();
-            rs.replicas
-                .iter()
-                .filter(|r| {
-                    let ack: u64 = r
-                        .ack_offsets
-                        .iter()
-                        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
-                        .sum();
-                    ack >= target_offset
-                })
-                .count()
-        };
+        let acked = acked_count(&repl_state.read(), target_offset);
 
-        if acked_count >= num_required {
-            return acked_count;
+        if acked >= num_required {
+            return acked;
         }
         if std::time::Instant::now() >= deadline {
-            return acked_count;
+            return acked;
         }
         #[cfg(feature = "runtime-tokio")]
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -973,6 +988,45 @@ pub async fn wait_for_replicas(
 mod tests {
     #[cfg(feature = "runtime-tokio")]
     use super::*;
+
+    /// moon#1098: the non-blocking count answers from the acks already
+    /// recorded against the master's CURRENT offset, summed across shards.
+    #[test]
+    fn count_acked_replicas_samples_acks_against_the_current_offset() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let state = std::sync::Arc::new(parking_lot::RwLock::new(
+            crate::replication::state::ReplicationState::new(2, "a".repeat(40), "b".repeat(40)),
+        ));
+        assert_eq!(
+            super::count_acked_replicas(&state),
+            0,
+            "no replica attached"
+        );
+
+        let replica = |id: u64, acks: [u64; 2]| crate::replication::state::ReplicaInfo {
+            id,
+            addr: std::net::SocketAddr::from(([127, 0, 0, 1], 6000 + id as u16)),
+            ack_offsets: acks.iter().map(|a| AtomicU64::new(*a)).collect(),
+            shard_txs: Vec::new(),
+            last_ack_time: AtomicU64::new(0),
+        };
+        {
+            let mut rs = state.write();
+            rs.increment_shard_offset(0, 60);
+            rs.increment_shard_offset(1, 40); // master offset = 100
+            rs.replicas.push(replica(1, [60, 40])); // caught up
+            rs.replicas.push(replica(2, [60, 39])); // one byte behind
+        }
+        assert_eq!(super::count_acked_replicas(&state), 1);
+
+        state.read().replicas[1].ack_offsets[1].store(40, Ordering::Relaxed);
+        assert_eq!(super::count_acked_replicas(&state), 2);
+
+        // A new write moves the target past both acks.
+        state.read().increment_shard_offset(0, 1);
+        assert_eq!(super::count_acked_replicas(&state), 0);
+    }
 
     #[cfg(feature = "runtime-tokio")]
     #[tokio::test]
