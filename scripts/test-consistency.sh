@@ -2663,6 +2663,61 @@ assert_tracking "tracking: ZRANGESTORE DEST invalidated [control]" \
     "tz:r" "ZRANGE tz:r 0 -1" ZRANGESTORE tz:r tz:a 0 -1
 
 # ---------------------------------------------------------------------------
+# moon#1013 -- a key that EXPIRES must invalidate exactly like one a command
+# writes. Moon's expiry sweep deleted the key and told keyspace notifications
+# and replicas, but never CLIENT TRACKING, so a client-side cache served the
+# expired value forever. Measured against redis 8.6.1: every row below pushes
+# `invalidate` for the watched key; moon pushed NOTHING at --shards 1 and 4.
+#
+# The probe tracks the key with a read, then holds the RESP3 connection open
+# with NO further traffic until the push arrives or 4s pass -- so the push can
+# only come from the server's own expiry tick. The hash row is the idle-db
+# case: before the fix, moon's field reaper waited for a command to advance
+# the db's cached clock.
+# ---------------------------------------------------------------------------
+tracking_expiry_push_for() {
+    local port="$1" watched="$2" tracking_opts="$3" read_cmd="$4" setup_fn="$5"
+    # Seed THIS server immediately before its own probe: seeding both up front
+    # would let the second server's short TTL lapse during the first's wait.
+    "$setup_fn" "$port"
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'HELLO 3\r\nCLIENT TRACKING ON%s\r\n%s\r\n' "$tracking_opts" "$read_cmd" >&3
+    local line="" seen="" got="NONE" deadline=$((SECONDS + 4))
+    while (( SECONDS < deadline )); do
+        if IFS= read -r -t 1 line <&3; then
+            seen="${seen}${line%$'\r'}|"
+            case "$seen" in *invalidate*"|${watched}|"*) break ;; esac
+        fi
+    done
+    exec 3>&-
+    case "$seen" in
+        *invalidate*"|${watched}|"*) got="PUSH:${watched}" ;;
+        *invalidate*)                got="PUSH:other" ;;
+    esac
+    echo "$got"
+}
+
+assert_tracking_expiry() {
+    local desc="$1" watched="$2" tracking_opts="$3" read_cmd="$4" setup_fn="$5"
+    assert_eq "$desc" \
+        "$(tracking_expiry_push_for "$PORT_REDIS" "$watched" "$tracking_opts" "$read_cmd" "$setup_fn")" \
+        "$(tracking_expiry_push_for "$PORT_RUST"  "$watched" "$tracking_opts" "$read_cmd" "$setup_fn")"
+}
+
+tx_seed_str()  { redis-cli -p "$1" SET tx:str v PX 1000 >/dev/null 2>&1 || true; }
+tx_seed_bc()   { redis-cli -p "$1" SET tx:bc v PX 1000 >/dev/null 2>&1 || true; }
+tx_seed_hash() {
+    redis-cli -p "$1" HSET tx:h f v g w >/dev/null 2>&1 || true
+    redis-cli -p "$1" HPEXPIRE tx:h 1000 FIELDS 1 f >/dev/null 2>&1 || true
+}
+assert_tracking_expiry "tracking: expired string invalidated (moon#1013)" \
+    "tx:str" "" "GET tx:str" tx_seed_str
+assert_tracking_expiry "tracking: BCAST prefix, expired key invalidated (moon#1013)" \
+    "tx:bc" " BCAST PREFIX tx:b" "PING" tx_seed_bc
+assert_tracking_expiry "tracking: expired hash FIELD invalidates the hash (moon#1013)" \
+    "tx:h" "" "HGET tx:h g" tx_seed_hash
+
+# ---------------------------------------------------------------------------
 # moon#644 -- every BLOCKING pop modifies the keyspace and must invalidate.
 #
 # `try_handle_blocking` is a THIRTEENTH write path, and nobody gave it the

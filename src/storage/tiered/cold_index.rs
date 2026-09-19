@@ -610,6 +610,9 @@ impl ColdIndex {
         let mut stats = SweepStats::default();
         for key in &expired_keys {
             if let Some(old) = self.remove_raw(key.as_ref()) {
+                // moon#1013: a tracked key can be spilled and then expire on
+                // disk; its trackers must hear about it like a hot expiry.
+                crate::tracking::invalidation::invalidate_server_removed(key.as_ref());
                 stats.entries_reclaimed += 1;
                 self.resident_bytes = self
                     .resident_bytes
