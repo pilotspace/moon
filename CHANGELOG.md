@@ -199,6 +199,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`scripts/test-consistency.sh`: six rows no longer fail with `CROSSSLOT`
+  at `--shards 4`** (moon#1106). `ZRANGESTORE still-negative stop` and five
+  CLIENT TRACKING destination controls named keys on different shards, so
+  they tested the routing refusal instead of the command. Their keys (and
+  their sibling rows') now share a `{tag}`. The redirect-transcript drain
+  used `read -t 0.3`, which macOS `/bin/bash` 3.2 rejects ("invalid timeout
+  specification"), ending the drain at once; it now uses `-t 1`.
+
+- **`CLIENT INFO` / `CLIENT LIST` report a subscriber's flag, counts and
+  protocol, and `RESET` from RESP2 subscriber mode resets everything**
+  (moon#1105), matching redis 8.6.1 on both runtimes. A subscribed client was
+  listed as `flags=S` (redis's REPLICA flag) with `sub=0 psub=0 ssub=0` and
+  `resp=2` whatever it held; it is now `P` with its real channel, pattern and
+  shard-channel counts, every client's `resp` follows `HELLO`, and flag
+  characters combine in redis's order (`Px`, `Pb`, then `t`/`R`/`B`) instead
+  of keeping only the first. `RESET` sent from the RESP2 subscriber loop only
+  unsubscribed, so the connection kept its db, `CLIENT TRACKING`, name and
+  authentication; both handlers now run the same `RESET` as everywhere else.
+  That shared `RESET` also tore down only channels and patterns: a RESP3
+  client's `SSUBSCRIBE` survived it, and `SPUBLISH` still counted it as a
+  receiver. It now clears all three namespaces and the remote shard maps.
+
 - **A restart no longer drops vector documents whose hash is in the cold tier
   or carries a field TTL** (moon#1074). At boot, index recovery walks the
   keyspace, and any recovered document whose key the walk did not see is
