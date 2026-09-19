@@ -12,7 +12,7 @@
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
@@ -125,6 +125,14 @@ pub struct ClientLiveState {
     pub pending_out_bytes: AtomicU64,
     /// Cumulative reply bytes successfully written — `tot-net-out`.
     pub tot_net_out: AtomicU64,
+    /// Channel, pattern and shard-channel subscription counts — `sub`,
+    /// `psub`, `ssub`. Published by the connection's own task through
+    /// [`ClientLiveState::set_pubsub_counts`] whenever its subscriptions
+    /// change, because another shard's `CLIENT LIST` cannot read this
+    /// connection's pub/sub registry.
+    pub sub: AtomicU32,
+    pub psub: AtomicU32,
+    pub ssub: AtomicU32,
 }
 
 impl ClientLiveState {
@@ -142,6 +150,18 @@ impl ClientLiveState {
             Ordering::Relaxed,
         );
         self.flags.store(flags.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Record the subscription counts `CLIENT LIST`/`INFO` report as
+    /// `sub`/`psub`/`ssub`. Same single-writer, relaxed discipline as
+    /// [`touch`]: only the connection's own task calls it.
+    #[inline]
+    pub fn set_pubsub_counts(&self, counts: PubSubCounts) {
+        let clamp = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        self.sub.store(clamp(counts.channels), Ordering::Relaxed);
+        self.psub.store(clamp(counts.patterns), Ordering::Relaxed);
+        self.ssub
+            .store(clamp(counts.shard_channels), Ordering::Relaxed);
     }
 
     /// Mark a reply write as in flight. One relaxed store, on a path that is
@@ -235,9 +255,20 @@ pub struct ClientEntry {
     pub live: Arc<ClientLiveState>,
 }
 
+/// A connection's subscriptions per pub/sub namespace, as `CLIENT LIST`
+/// reports them (`sub`, `psub`, `ssub`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PubSubCounts {
+    pub channels: usize,
+    pub patterns: usize,
+    pub shard_channels: usize,
+}
+
 /// Client connection flags (matches Redis CLIENT LIST flag characters).
 #[derive(Clone, Copy, Default)]
 pub struct ClientFlags {
+    /// Holds at least one channel, pattern or shard-channel subscription:
+    /// redis's `P` (`CLIENT_PUBSUB`), whatever the protocol.
     pub subscriber: bool,
     pub in_multi: bool,
     pub blocked: bool,
@@ -249,20 +280,33 @@ pub struct ClientFlags {
     /// [`kill_idle_clients`] needs the same exemption: a replica link is
     /// idle between writes by design and must never be idle-closed.
     pub replica: bool,
+    /// Speaks RESP3 (`HELLO 3`) — `resp=3`. Not a flag character; it rides in
+    /// the same byte so one store publishes it with the rest.
+    pub resp3: bool,
 }
 
 impl ClientFlags {
-    /// Format as Redis-compatible flag string (e.g., "N", "S", "x").
-    pub fn to_flag_str(self) -> &'static str {
-        if self.subscriber {
-            "S"
-        } else if self.in_multi {
-            "x"
-        } else if self.blocked {
-            "b"
-        } else {
-            "N"
+    /// Write the redis flag characters these bits stand for into `out`, in
+    /// redis's order (`catClientInfoString`: `P`, `x`, `b`), returning how
+    /// many were written. Writes nothing when no bit is set; the caller adds
+    /// the tracking characters and falls back to `N`.
+    ///
+    /// `P` is the pub/sub flag. moon used to print `S` here, which redis uses
+    /// for a REPLICA connection.
+    #[inline]
+    pub fn write_flag_chars(self, out: &mut [u8; 3]) -> usize {
+        let mut n = 0;
+        for (on, c) in [
+            (self.subscriber, b'P'),
+            (self.in_multi, b'x'),
+            (self.blocked, b'b'),
+        ] {
+            if on {
+                out[n] = c;
+                n += 1;
+            }
         }
+        n
     }
 
     /// Pack into one byte for `ClientLiveState::flags`.
@@ -272,6 +316,7 @@ impl ClientFlags {
             | ((self.in_multi as u8) << 1)
             | ((self.blocked as u8) << 2)
             | ((self.replica as u8) << 3)
+            | ((self.resp3 as u8) << 4)
     }
 
     /// Unpack from `ClientLiveState::flags`.
@@ -282,6 +327,7 @@ impl ClientFlags {
             in_multi: bits & 2 != 0,
             blocked: bits & 4 != 0,
             replica: bits & 8 != 0,
+            resp3: bits & 16 != 0,
         }
     }
 }
@@ -305,6 +351,9 @@ pub fn register(
         last_cmd_ms: AtomicU64::new(0),
         pending_out_bytes: AtomicU64::new(0),
         tot_net_out: AtomicU64::new(0),
+        sub: AtomicU32::new(0),
+        psub: AtomicU32::new(0),
+        ssub: AtomicU32::new(0),
         flags: AtomicU8::new(ClientFlags::default().to_bits()),
         kill_flag: AtomicBool::new(false),
         kill_fd,
@@ -725,30 +774,31 @@ fn format_client_line(
     let last_cmd_secs = live.last_cmd_ms.load(Ordering::Relaxed) / 1000;
     let idle = age.saturating_sub(last_cmd_secs);
     let name = entry.name.as_deref().unwrap_or("");
-    let base = ClientFlags::from_bits(live.flags.load(Ordering::Relaxed)).to_flag_str();
-    // At most one base char plus `tRB`.
-    let mut flags_buf = [0u8; 4];
-    let flags: &str = match tracking {
-        None => base,
-        Some(t) => {
-            let mut n = 0;
-            let mut push = |c: u8| {
+    let bits = ClientFlags::from_bits(live.flags.load(Ordering::Relaxed));
+    // Redis's order: `P`, `x`, `b`, then tracking's `t`, `R`, `B`; `N` when
+    // none applies.
+    let mut base = [0u8; 3];
+    let base_len = bits.write_flag_chars(&mut base);
+    let mut flags_buf = [0u8; 6];
+    flags_buf[..base_len].copy_from_slice(&base[..base_len]);
+    let mut n = base_len;
+    if let Some(t) = tracking {
+        for (on, c) in [(true, b't'), (t.broken_redirect, b'R'), (t.bcast, b'B')] {
+            if on {
                 flags_buf[n] = c;
                 n += 1;
-            };
-            if base != "N" {
-                push(base.as_bytes()[0]);
             }
-            push(b't');
-            if t.broken_redirect {
-                push(b'R');
-            }
-            if t.bcast {
-                push(b'B');
-            }
-            std::str::from_utf8(&flags_buf[..n]).unwrap_or(base)
         }
-    };
+    }
+    if n == 0 {
+        flags_buf[0] = b'N';
+        n = 1;
+    }
+    let flags = std::str::from_utf8(&flags_buf[..n]).unwrap_or("N");
+    let resp = if bits.resp3 { 3 } else { 2 };
+    let sub = live.sub.load(Ordering::Relaxed);
+    let psub = live.psub.load(Ordering::Relaxed);
+    let ssub = live.ssub.load(Ordering::Relaxed);
     let redir = tracking.map_or(-1, |t| i64::try_from(t.redirect).unwrap_or(i64::MAX));
     let db = live.db.load(Ordering::Relaxed);
     // c10k C1: `obl`/`omem` report the reply bytes this connection is holding
@@ -762,9 +812,9 @@ fn format_client_line(
     let _ = writeln!(
         buf,
         "id={} addr={} laddr={} fd=0 name={} age={} idle={} flags={} db={} \
-         sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 \
+         sub={} psub={} ssub={} multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 \
          tot-net-in=0 tot-net-out={} rbs=1024 rbp=0 obl={} oll=0 omem={} tot-mem={} events=r \
-         cmd=NULL user={} redir={} resp=2 lib-name= lib-ver=",
+         cmd=NULL user={} redir={} resp={} lib-name= lib-ver=",
         entry.id,
         entry.addr,
         entry.laddr,
@@ -773,12 +823,16 @@ fn format_client_line(
         idle,
         flags,
         db,
+        sub,
+        psub,
+        ssub,
         tot_net_out,
         omem,
         omem,
         omem,
         entry.user,
         redir,
+        resp,
     );
 }
 
@@ -1053,9 +1107,89 @@ mod tests {
 
     #[test]
     fn test_flags_bits_roundtrip() {
-        for bits in 0..8u8 {
+        for bits in 0..32u8 {
             assert_eq!(ClientFlags::from_bits(bits).to_bits(), bits);
         }
+    }
+
+    /// moon#1105: the pub/sub flag is redis's `P` (moon printed `S`, which is
+    /// redis's REPLICA flag), flags compose in redis's order instead of
+    /// keeping only the first, and `resp`/`sub`/`psub`/`ssub` report the
+    /// connection instead of constants. Expected values read off
+    /// redis-server 8.6.1 (`HELLO 3` + `SUBSCRIBE x` + `PSUBSCRIBE p*` +
+    /// `SSUBSCRIBE sx`, `CLIENT INFO` inside `MULTI`/`EXEC`).
+    #[test]
+    fn client_info_reports_pubsub_flag_counts_and_protocol() {
+        let id = 999_040;
+        let live = register(
+            id,
+            "10.0.0.4:7000".into(),
+            "127.0.0.1:6379".into(),
+            "default".into(),
+            0,
+            -1,
+        );
+        let field = |info: &str, key: &str| -> String {
+            info.split(' ')
+                .find_map(|p| p.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+                .unwrap_or_default()
+                .trim_end()
+                .to_string()
+        };
+
+        let info = client_info(id).expect("registered");
+        assert_eq!(field(&info, "flags"), "N");
+        assert_eq!(field(&info, "resp"), "2");
+        assert_eq!(field(&info, "sub"), "0");
+
+        live.touch(
+            0,
+            ClientFlags {
+                subscriber: true,
+                resp3: true,
+                ..Default::default()
+            },
+            live.connected_at_epoch_ms,
+        );
+        live.set_pubsub_counts(PubSubCounts {
+            channels: 1,
+            patterns: 1,
+            shard_channels: 1,
+        });
+        let info = client_info(id).expect("registered");
+        assert_eq!(field(&info, "flags"), "P");
+        assert_eq!(field(&info, "resp"), "3");
+        assert_eq!(field(&info, "sub"), "1");
+        assert_eq!(field(&info, "psub"), "1");
+        assert_eq!(field(&info, "ssub"), "1");
+
+        live.touch(
+            0,
+            ClientFlags {
+                subscriber: true,
+                in_multi: true,
+                resp3: true,
+                ..Default::default()
+            },
+            live.connected_at_epoch_ms,
+        );
+        live.set_blocked(true);
+        let info = client_info(id).expect("registered");
+        assert_eq!(field(&info, "flags"), "Pxb");
+
+        // A replica link stays unsurfaced: redis's `S` is not printed for it.
+        live.touch(
+            0,
+            ClientFlags {
+                replica: true,
+                ..Default::default()
+            },
+            live.connected_at_epoch_ms,
+        );
+        let info = client_info(id).expect("registered");
+        assert_eq!(field(&info, "flags"), "N");
+        assert_eq!(field(&info, "resp"), "2");
+        deregister(id);
     }
 
     #[test]
@@ -1382,17 +1516,18 @@ mod idle_timeout_tests {
                 in_multi: true,
                 blocked: false,
                 replica: true,
+                resp3: true,
             },
             live.connected_at_epoch_ms,
         );
 
         live.set_blocked(true);
         let f = ClientFlags::from_bits(live.flags.load(Ordering::Relaxed));
-        assert!(f.subscriber && f.in_multi && f.replica && f.blocked);
+        assert!(f.subscriber && f.in_multi && f.replica && f.blocked && f.resp3);
 
         live.set_blocked(false);
         let f = ClientFlags::from_bits(live.flags.load(Ordering::Relaxed));
-        assert!(f.subscriber && f.in_multi && f.replica && !f.blocked);
+        assert!(f.subscriber && f.in_multi && f.replica && !f.blocked && f.resp3);
         deregister(9_030);
     }
 
@@ -1464,7 +1599,10 @@ mod idle_timeout_tests {
                 "t:1".into(),
                 "127.0.0.1:6379".into(),
                 "default".into(),
-                908,
+                // Synthetic shard ids no other test sweeps: the idle-timeout
+                // tests own 900-909, and an idle entry registered on one of
+                // theirs gets reaped by their sweep and miscounted.
+                918,
                 -1,
             );
             let t1 = TOTAL_CLIENTS.load(Ordering::Relaxed);
@@ -1473,7 +1611,7 @@ mod idle_timeout_tests {
                 "t:1".into(),
                 "127.0.0.1:6379".into(),
                 "default".into(),
-                909,
+                919,
                 -1,
             );
             let t2 = TOTAL_CLIENTS.load(Ordering::Relaxed);
