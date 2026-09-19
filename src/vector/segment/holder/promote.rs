@@ -131,13 +131,9 @@ impl SegmentHolder {
         let mut receivers = Vec::new();
         let mut installed = 0usize;
         for stub in snap.unloaded.iter() {
-            if let Some(seg) = pool.take_completed(stub.segment_id()) {
+            if let Some(seg) = take_completed_reload(pool, stub) {
                 // A prior query already reloaded this off-loop — install it now
                 // so future queries hit WARM and the stub's memory is freed.
-                tracing::info!(
-                    segment_id = stub.segment_id(),
-                    "COLD segment installed from completed off-loop reload"
-                );
                 new_warm.push(seg);
                 installed += 1;
             } else {
@@ -160,4 +156,65 @@ impl SegmentHolder {
         }
         receivers
     }
+
+    /// Install every off-loop reload of this holder's COLD stubs that has
+    /// already finished, WITHOUT submitting new ones. Non-blocking: a cheap
+    /// in-memory swap under the reload lock. Returns the number installed.
+    ///
+    /// Called right after a yielding FT.SEARCH has awaited its reloads
+    /// (moon#1070), so a COLD segment leaves `unloaded` with the query that
+    /// touched it rather than with whichever query happens to come next: until
+    /// then the reloaded segment sat in the pool, resident but invisible to
+    /// `FT.INFO` and to the mmap budget, and the stub stayed the index's
+    /// tombstone sink.
+    pub fn install_completed_reloads(&self) -> usize {
+        {
+            let snap = self.segments.load();
+            if snap.unloaded.is_empty() {
+                return 0;
+            }
+        }
+        let Some(pool) = crate::vector::reload_pool::global() else {
+            return 0;
+        };
+        let _guard = self.reload_lock.lock();
+        let snap = self.segments.load();
+        let mut new_warm = snap.warm.clone();
+        let mut still_unloaded: Vec<Arc<UnloadedSegment>> = Vec::new();
+        let mut installed = 0usize;
+        for stub in snap.unloaded.iter() {
+            match take_completed_reload(pool, stub) {
+                Some(seg) => {
+                    new_warm.push(seg);
+                    installed += 1;
+                }
+                None => still_unloaded.push(Arc::clone(stub)),
+            }
+        }
+        if installed > 0 {
+            self.segments.store(Arc::new(
+                snap.with_warm_and_unloaded(new_warm, still_unloaded),
+            ));
+        }
+        installed
+    }
+}
+
+/// Take `stub`'s finished off-loop reload out of the pool, ready to install.
+///
+/// The worker applied the stub's tombstones when the reload RAN; every DEL
+/// since then was recorded by the stub alone, which the install is about to
+/// drop. Replay them onto the reloaded segment first (moon#1070), or the
+/// deleted docs come back as soon as it is installed.
+fn take_completed_reload(
+    pool: &crate::vector::reload_pool::SegmentReloadPool,
+    stub: &UnloadedSegment,
+) -> Option<Arc<crate::vector::persistence::warm_search::WarmSearchSegment>> {
+    let seg = pool.take_completed(stub.segment_id())?;
+    stub.replay_tombstones_onto(&seg);
+    tracing::info!(
+        segment_id = stub.segment_id(),
+        "COLD segment installed from completed off-loop reload"
+    );
+    Some(seg)
 }

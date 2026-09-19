@@ -24,6 +24,13 @@
 //! new file), while an entry whose file is already gone is in the manifest
 //! only.
 //!
+//! Nothing else records the highest id ever issued, so the manifest must not
+//! lose it: `ShardManifest::gc_tombstones` never prunes the tombstone holding
+//! the highest id (moon#1067). Without that, a shard whose newest files were
+//! all reclaimed resumed below ids its current AOF generation had already
+//! named in `MOON.SPILLED` records. Replay then authorised the re-issued id at
+//! the OLD record and applied writes on top of the values they had produced.
+//!
 //! It fails CLOSED. A directory it cannot list, an entry it cannot read, or a
 //! manifest it cannot open is an error, never a smaller number: a seed that
 //! cannot be proven above every live id is not a seed. The caller refuses to
@@ -491,6 +498,32 @@ mod tests {
                 "a {len}-byte manifest holds no entry; the disk still counts"
             );
         }
+    }
+
+    /// Every file reclaimed and every tombstone past retention: the seed must
+    /// still clear every id the shard ever issued (moon#1067). A re-issued id
+    /// is authorised during AOF replay by the OLD file's `MOON.SPILLED`
+    /// record, which double-applies writes logged before the new spill.
+    #[test]
+    fn seed_does_not_move_backwards_when_tombstone_gc_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+        let mut m = ShardManifest::create(&path).unwrap();
+        for id in 1..=3 {
+            m.add_file(entry(id, PageType::KvLeaf, FileStatus::Active))
+                .unwrap();
+        }
+        m.commit().unwrap();
+        for id in 1..=3 {
+            m.remove_file(id, PageType::KvLeaf);
+        }
+        m.commit().unwrap();
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        assert_eq!(m.gc_tombstones(0, 0, later), 2, "ids 1 and 2 are due");
+        m.commit().unwrap();
+        drop(m);
+
+        assert_eq!(next_file_id_seed(tmp.path(), 0).unwrap(), 4);
     }
 
     #[test]

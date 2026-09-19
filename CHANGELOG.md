@@ -244,6 +244,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     applies the write, waits up to the bound on its connection task, and
     then reports `ERR AOF fsync failed; write not durable`.
 
+- **The disk-offload checkpoint only publishes a redo point over heap pages it
+  has made durable** (moon#452 item 3). The fuzzy checkpoint pwrote dirty heap
+  pages and never fsynced a heap file, then published `redo_lsn` in the control
+  file and recycled every WAL segment below it — FullPageImages included. A
+  power loss after that recycle could roll a page back with nothing left in the
+  WAL to redo it. Four changes close the protocol:
+  - Finalize fsyncs every heap file the flush wrote before it writes the WAL
+    checkpoint record. The fsync runs on a helper thread and the shard thread
+    never waits for it: each tick polls the helper without blocking, and a
+    shard has at most one helper outstanding, so a hung disk leaves one stuck
+    thread rather than one per retry. Only the shutdown checkpoint, which
+    serves no clients any more, waits for that one helper, for at most
+    `WAIT_DURABLE_TIMEOUT` counted from the helper's start. The WAL-ceiling
+    checkpoint runs while the shard serves clients, so it never waits: it
+    leaves a pending fsync to the periodic tick, and its emergency recycle
+    cuts only below the redo point already published. A failed control-file
+    write no longer leaves the unpublished redo point in memory, where that
+    recycle would have cut below it. If a file cannot be opened, Finalize
+    retries with backoff. If an fsync returns an error, the shard never
+    publishes a redo point again, because a retried fsync can report success
+    for pages the kernel already dropped. The WAL above the last good redo
+    point is kept, and recovery replays from there.
+  - A heap file that no longer exists does not hold the redo point back. The
+    cold-tier GC unlinks a file once its last live key is gone, and only then;
+    nothing references it and no fsync can reach the unlinked inode. So the
+    checkpoint stops waiting on it, drops its pages from the dirty set, counts
+    it and logs it at debug. If the manifest still lists the file as live,
+    something other than the GC removed it: that is counted separately and
+    logged as an error. Without this, every Finalize failed on `NotFound` and
+    the WAL grew until the disk was full.
+  - Log before data, one WAL wait per batch: the flush appends the
+    FullPageImage of every page in the batch, waits once for the WAL to be
+    durable through the batch's highest LSN, and only then overwrites the
+    pages in place. The flush used to collect every image and append them
+    only after the whole batch had been pwritten, into the WAL writer's memory
+    buffer. A crash during the pwrite left a torn page and no image of it
+    anywhere.
+  - A page that fails any flush step (its image, the WAL wait, or its write)
+    makes the checkpoint flush again, keeping its redo point. Before, the page
+    was counted as flushed and the checkpoint finalized over a change that was
+    on disk in neither the heap nor the WAL.
+
+  No production path marks a heap page dirty today (`PageCache::mark_dirty`
+  has no callers outside tests), so this closes the hazard before the first
+  in-place cold-page write can reach it. Pinned by the tests in
+  `shard::persistence_tick::checkpoint_tick_tests`,
+  `persistence::data_file_sync` and `persistence::page_cache`.
+
 - **An AOF rewrite no longer replays a write twice, and a rewrite that fails
   late no longer leaves the writer appending to a deleted file** (moon#455).
   - **Double apply.** A rewrite split the append stream by position: whatever
@@ -285,6 +333,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     loss the committed manifest could name a missing incr, or the old
     `appendonly.aof` could return, losing every record written after the
     rewrite. Both directories are now fsynced before the new file is used.
+
+- **A COLD vector segment leaves `unloaded` with the search that reloads it,
+  and a delete that lands while the reload is waiting to install is no longer
+  lost** (moon#1070). Since the off-loop reload pool (prod-hardening #18) a
+  search only SUBMITTED the reload and answered from it; the reloaded segment
+  sat in the pool until some later search installed it, while the COLD stub
+  stayed the index's segment and the only place a DEL could be recorded. The
+  install then threw the stub away without replaying it: a document deleted
+  after the first search came back, as `vec:<id>`, on the next one (reproduced
+  on a real server). The install now replays the stub's tombstones, and the
+  yielding FT.SEARCH handlers install finished reloads as soon as the query
+  that awaited them is back on the shard, so `FT.INFO unloaded_segments` drops
+  to 0 with that search. Four `tests/vector_idle_unload.rs` tests that were
+  `#[ignore]`d -- and silently red on main -- now run in CI; only the
+  `ps`-based RSS measurement stays ignored.
+
+- **A restart no longer re-issues a cold-tier file id, which could apply a
+  write twice** (moon#1067). A restart resumes the shard's cold file-id
+  counter at one past the highest id the manifest or the disk still holds.
+  Manifest tombstone GC could prune the entry that held the highest id once
+  its file was reclaimed, and the counter then moved backwards. The AOF
+  appends to the same generation across restarts, so the generation still
+  held a `MOON.SPILLED <id>` record for the old file. On replay, that record
+  made the re-issued id readable early, and a write logged before its key
+  was spilled into the new file was applied on top of the value it had
+  already produced. Measured with `--appendonly yes --disk-offload enable`
+  and the tombstone retention at zero: `RPUSH X a` once, then spill, restart,
+  spill again, restart, and `LRANGE X` read `a a`, after both `kill -9` and
+  `SHUTDOWN`, on both runtimes. The same sequence with the default retention
+  (tombstones outlive the restart) read `a`. GC now keeps the tombstone that
+  holds the highest file id until a higher id is in the manifest. That pins
+  at most one manifest entry per shard. No on-disk format change.
+
 - **CLIENT TRACKING never drops an invalidation silently, scripts are
   tracked, and a RESP2 subscriber's pipeline follows its live subscription
   count** (moon#1088, moon#1089, moon#1090, refs moon#1078). Every wire reply
