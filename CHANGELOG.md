@@ -219,6 +219,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `value is not an integer or out of range`), with or without `REV` and
   `LIMIT`, and the destination is left alone.
 
+- **A restart no longer re-issues a cold-tier file id, which could apply a
+  write twice** (moon#1067). A restart resumes the shard's cold file-id
+  counter at one past the highest id the manifest or the disk still holds.
+  Manifest tombstone GC could prune the entry that held the highest id once
+  its file was reclaimed, and the counter then moved backwards. The AOF
+  appends to the same generation across restarts, so the generation still
+  held a `MOON.SPILLED <id>` record for the old file. On replay, that record
+  made the re-issued id readable early, and a write logged before its key
+  was spilled into the new file was applied on top of the value it had
+  already produced. Measured with `--appendonly yes --disk-offload enable`
+  and the tombstone retention at zero: `RPUSH X a` once, then spill, restart,
+  spill again, restart, and `LRANGE X` read `a a`, after both `kill -9` and
+  `SHUTDOWN`, on both runtimes. The same sequence with the default retention
+  (tombstones outlive the restart) read `a`. GC now keeps the tombstone that
+  holds the highest file id until a higher id is in the manifest. That pins
+  at most one manifest entry per shard. No on-disk format change.
+
 - **CLIENT TRACKING never drops an invalidation silently, scripts are
   tracked, and a RESP2 subscriber's pipeline follows its live subscription
   count** (moon#1088, moon#1089, moon#1090, refs moon#1078). Every wire reply

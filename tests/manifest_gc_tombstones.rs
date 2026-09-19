@@ -217,7 +217,8 @@ fn gc_without_commit_leaves_disk_unchanged() {
     m.add_file(make_entry(2)).unwrap();
     m.commit().unwrap(); // epoch 2
 
-    m.remove_file(2, PageType::KvLeaf);
+    // File 1, not file 2: GC never prunes the highest file id (moon#1067).
+    m.remove_file(1, PageType::KvLeaf);
     m.commit().unwrap(); // epoch 3: tombstone committed to disk
 
     // Now GC in memory — both axes trivially satisfied with retain=0 and ancient now
@@ -253,8 +254,9 @@ fn gc_then_commit_persists_pruned_state() {
     }
     m.commit().unwrap(); // epoch 2
 
+    // Files 1 and 2, not 3: GC never prunes the highest file id (moon#1067).
     m.remove_file(1, PageType::KvLeaf);
-    m.remove_file(3, PageType::KvLeaf);
+    m.remove_file(2, PageType::KvLeaf);
     m.commit().unwrap(); // epoch 3
 
     let now_far = Instant::now() + Duration::from_secs(9999);
@@ -264,13 +266,52 @@ fn gc_then_commit_persists_pruned_state() {
     // Commit pruned state
     m.commit().unwrap(); // epoch 4
 
-    // Re-open: only file 2 should remain
+    // Re-open: only file 3 should remain
     let m2 = ShardManifest::open(&path).unwrap();
     assert_eq!(m2.files().len(), 1);
-    assert_eq!(m2.files()[0].file_id, 2);
+    assert_eq!(m2.files()[0].file_id, 3);
     assert_eq!(m2.files()[0].status, FileStatus::Active);
     assert_eq!(m2.tombstone_count(), 0);
     assert_eq!(m2.active_entry_count(), 1);
+}
+
+/// The tombstone holding the highest file id is the id counter's only durable
+/// high-water mark, so GC keeps it whatever its age, and lets it age out once
+/// a higher id is in the manifest (moon#1067).
+#[test]
+fn gc_keeps_the_highest_file_id_until_a_higher_one_exists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("shard-0.manifest");
+    let mut m = ShardManifest::create(&path).unwrap();
+    for i in 1..=3 {
+        m.add_file(make_entry(i)).unwrap();
+    }
+    m.commit().unwrap();
+    for i in 1..=3 {
+        m.remove_file(i, PageType::KvLeaf);
+    }
+    m.commit().unwrap();
+
+    let now_far = Instant::now() + Duration::from_secs(9999);
+    assert_eq!(m.gc_tombstones(0, 0, now_far), 2, "ids 1 and 2 are due");
+    m.commit().unwrap();
+    let m2 = ShardManifest::open(&path).unwrap();
+    let left: Vec<(u64, FileStatus)> = m2.files().iter().map(|e| (e.file_id, e.status)).collect();
+    assert_eq!(
+        left,
+        vec![(3, FileStatus::Tombstone)],
+        "id 3 survives reopen"
+    );
+
+    m.add_file(make_entry(4)).unwrap();
+    m.commit().unwrap();
+    assert_eq!(
+        m.gc_tombstones(0, 0, now_far),
+        1,
+        "with id 4 in the manifest, id 3 ages out normally"
+    );
+    let ids: Vec<u64> = m.files().iter().map(|e| e.file_id).collect();
+    assert_eq!(ids, vec![4]);
 }
 
 /// P1 — getters: active_entry_count + tombstone_count are consistent.
