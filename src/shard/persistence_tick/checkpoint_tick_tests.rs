@@ -6,7 +6,7 @@
 //! exists cannot hold a redo point back forever, and the off-loop data-file
 //! fsync never blocks the shard thread nor piles up helper threads.
 //!
-//! Lives beside `persistence_tick.rs` (a child module of it) because that
+//! A child module of `persistence_tick.rs`, in its own file because that
 //! file is already past the 1500-line cap.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -584,7 +584,9 @@ fn the_wal_ceiling_trigger_never_waits_on_the_data_file_fsync() {
             &mut shard.control,
             &shard.control_path,
             0,
-            Instant::now() - Duration::from_secs(3600),
+            // A lag of 0 ms is always satisfied. (Not `now - 1h`: Windows
+            // `Instant` counts from boot and underflows on a fresh CI host.)
+            Instant::now(),
             0,
             &mut |_| true,
         )

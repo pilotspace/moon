@@ -2034,7 +2034,6 @@ pub(crate) fn handle_checkpoint_tick(
 }
 
 #[cfg(test)]
-#[path = "checkpoint_tick_tests.rs"]
 mod checkpoint_tick_tests;
 
 #[cfg(test)]
