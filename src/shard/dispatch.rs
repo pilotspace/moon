@@ -1181,6 +1181,12 @@ pub struct AofFoldSnapshot {
     /// rewrite writes it as the `MOON.COLDCUT` head of the new incr so a
     /// replay knows those files are a valid base for every record after it.
     pub cold_file_watermark: u64,
+    /// #455: the writer's fold epoch opened at the same instant. Records
+    /// stamped below it log mutations this snapshot captured, wherever they
+    /// are when the fold completes (drained, queued, spilled, or still with a
+    /// parked producer). Once the fold's generation is committed, its writer
+    /// drops every such record instead of writing it into the new incr.
+    pub fold_epoch: crate::persistence::aof::FoldEpoch,
 }
 
 // ShardMessage is Send because all fields are Send. ResponseSlotPtr wraps an

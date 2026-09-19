@@ -191,6 +191,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An AOF rewrite no longer replays a write twice, and a rewrite that fails
+  late no longer leaves the writer appending to a deleted file** (moon#455).
+  - **Double apply.** A rewrite split the append stream by position: whatever
+    reached the writer after its snapshot went into the new incr. A write
+    whose record arrives after the snapshot while its effect is already in the
+    snapshot was therefore replayed on top of the new base after a restart. An
+    `INCR` came back incremented twice, an `LPUSH` pushed twice. Records reach
+    the writer late when the producer awaits between the mutation and the
+    enqueue: an `EXEC` whose body holds `WAIT`, `CONFIG` or another connection
+    intercept, the local half of a multi-shard `FLUSHDB`/`FLUSHALL` (which
+    could then wipe writes the base had taken after it), the local slice of a
+    multi-shard `MSET`, or any producer parked on a full AOF channel. Every
+    record now carries the rewrite epoch in force when its mutation ran. Once
+    a rewrite takes effect, the writer drops each record stamped before that
+    rewrite's snapshot, wherever the record surfaces. An aborted rewrite drops
+    nothing. `INFO persistence` counts the dropped records as
+    `aof_rewrite_late_records_folded`.
+  - **Late failure.** The writer opened the new incr only after the manifest
+    had switched to it. If that open failed, the rewrite was reported aborted
+    while the manifest named the new generation, and the writer kept
+    appending, and fsyncing, into the old incr the switch had deleted. Nothing
+    it wrote after that could be recovered. The new incr is now opened before
+    the manifest switches, so every failure leaves the old generation
+    committed and the writer on it. A failed manifest write also no longer
+    advances the in-memory sequence past the one on disk.
+
 - **`maxmemory` is one cap again once keys have spilled to disk** (moon#1036).
   Since K4, the 100 ms pressure cascade has held each database to hot bytes
   PLUS its cold index's RAM. The per-write gates did not: the inline `SET`

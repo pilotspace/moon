@@ -2052,8 +2052,14 @@ pub(super) async fn try_handle_blocking<
                 )
             };
             if let Some(ref pool) = ctx.aof_pool {
+                // Fold epoch read NOW, not when the pop was served: the serve
+                // may have happened on a waker before this task resumed, so
+                // this stamp can be later than the mutation (a fold in that
+                // gap can still double-apply the pop), never earlier (which
+                // would drop a record the fold's base does not contain).
+                let stamp = pool.fold_stamp(ctx.shard_id);
                 match pool
-                    .send_append_group(ctx.shard_id, lsn, conn.selected_db, serialized)
+                    .send_append_group(ctx.shard_id, lsn, conn.selected_db, serialized, stamp)
                     .await
                 {
                     // `appendfsync always`: the element is already out of the

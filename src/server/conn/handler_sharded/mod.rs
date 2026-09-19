@@ -1757,8 +1757,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                             ctx.shard_id,
                             bytes.len(),
                         );
+                        // Fold epoch read now, not at serve time — see the
+                        // monoio blocking path: later than the pop at worst.
+                        let stamp = pool.fold_stamp(ctx.shard_id);
                         match pool
-                            .send_append_group(ctx.shard_id, lsn, conn.selected_db, bytes)
+                            .send_append_group(ctx.shard_id, lsn, conn.selected_db, bytes, stamp)
                             .await
                         {
                             // `appendfsync always`: the element is already out
@@ -2339,6 +2342,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                 lsn,
                                                 conn.selected_db,
                                                 bytes.clone(),
+                                                pool.fold_stamp(ctx.shard_id),
                                             )
                                             .await
                                         {
@@ -2414,6 +2418,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                     lsn,
                                                     conn.selected_db,
                                                     bytes.clone(),
+                                                    pool.fold_stamp(ctx.shard_id),
                                                 )
                                                 .await
                                             {
@@ -2658,6 +2663,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // Unconditional slice path: ShardSlice is always initialized.
                             let write_outcome: WriteOutcome =
                                 crate::shard::slice::with_shard(|s| do_write(s, &mut conn));
+                            // #455: the AOF record below is enqueued after the
+                            // FLUSH broadcast's await; its fold epoch is read
+                            // here, in the mutation's no-await stretch (see the
+                            // monoio handler's generic write leg).
+                            let fold_stamp = ctx.aof_pool.as_ref().map_or(
+                                aof::FoldEpoch::INITIAL,
+                                |pool| pool.fold_stamp(ctx.shard_id),
+                            );
 
                             let mut response: Frame = match write_outcome {
                                 Ok(t) => t,
@@ -2846,6 +2859,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                 lsn,
                                                 conn.selected_db,
                                                 bytes,
+                                                fold_stamp,
                                             )
                                             .await
                                         {

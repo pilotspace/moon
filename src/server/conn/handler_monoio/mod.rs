@@ -3160,8 +3160,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 responses.push(response);
                                 continue;
                             };
+                            // No await since `move_core`: the fold epoch
+                            // read here is the mutation's.
+                            let stamp = pool.fold_stamp(ctx.shard_id);
                             match pool
-                                .send_append_group(ctx.shard_id, lsn, conn.selected_db, serialized)
+                                .send_append_group(
+                                    ctx.shard_id,
+                                    lsn,
+                                    conn.selected_db,
+                                    serialized,
+                                    stamp,
+                                )
                                 .await
                             {
                                 // Always: durability confirmed by ONE
@@ -3242,12 +3251,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     responses.push(response);
                                     continue;
                                 };
+                                // No await since `copy_core` (see MOVE).
+                                let stamp = pool.fold_stamp(ctx.shard_id);
                                 match pool
                                     .send_append_group(
                                         ctx.shard_id,
                                         lsn,
                                         conn.selected_db,
                                         serialized,
+                                        stamp,
                                     )
                                     .await
                                 {
@@ -3537,6 +3549,18 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     };
                     drop(probe);
                     conn.selected_db = new_selected_db;
+                    // #455: the AOF record below is enqueued after the FLUSH
+                    // broadcast's await, and a fold can snapshot in between.
+                    // Its fold epoch is read here, in the same no-await stretch
+                    // as the mutation, so a fold whose base already holds this
+                    // write drops the record instead of replaying it on top
+                    // (for FLUSHDB: wiping writes the base took after it).
+                    let fold_stamp = ctx
+                        .aof_pool
+                        .as_ref()
+                        .map_or(aof::FoldEpoch::INITIAL, |pool| {
+                            pool.fold_stamp(ctx.shard_id)
+                        });
 
                     let mut response = match result {
                         DispatchResult::Response(f) => f,
@@ -3639,6 +3663,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                         lsn,
                                         conn.selected_db,
                                         serialized,
+                                        fold_stamp,
                                     )
                                     .await
                                 {

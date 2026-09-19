@@ -474,7 +474,16 @@ async fn run_on_owner_persist(
         let serialized = crate::persistence::aof::serialize_command(&Frame::Array(
             command_parts.to_vec().into(),
         ));
-        match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
+        match persist_local_leg(
+            aof_pool,
+            repl_state,
+            my_shard,
+            db_index,
+            serialized,
+            local_fold_stamp(aof_pool, my_shard),
+        )
+        .await
+        {
             Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
             Err(()) => {
                 return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
@@ -529,7 +538,16 @@ async fn run_local_persist(
     parts.push(bulk_static(cmd));
     parts.extend_from_slice(args);
     let serialized = crate::persistence::aof::serialize_command(&Frame::Array(parts.into()));
-    match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
+    match persist_local_leg(
+        aof_pool,
+        repl_state,
+        my_shard,
+        db_index,
+        serialized,
+        local_fold_stamp(aof_pool, my_shard),
+    )
+    .await
+    {
         Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
         Err(()) => return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR)),
     }
@@ -582,6 +600,14 @@ type ReplStateRef<'a> =
 /// so the offset ran permanently ahead of what a replica could ACK and
 /// `WAIT` answered `:0` forever (`--appendonly yes`), while with no AOF pool
 /// the leg neither counted nor shipped and the replica silently diverged.
+///
+/// # Fold epoch (#455)
+///
+/// `fold_stamp` is [`local_fold_stamp`] read right after the local mutation,
+/// before any await. Most callers mutate and call this with no await in
+/// between; the scattered MSET awaits its remote legs first, and a fold that
+/// snapshots its local keys in that window must drop this record instead of
+/// replaying it over later writes.
 async fn persist_local_leg(
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     repl_state: ReplStateRef<'_>,
@@ -592,6 +618,7 @@ async fn persist_local_leg(
     // record so the replica applies it in the same db.
     db: usize,
     serialized: Bytes,
+    fold_stamp: crate::persistence::aof::FoldEpoch,
 ) -> Result<bool, ()> {
     let repl_active = crate::replication::state::fanout_active_for(repl_state);
     if !repl_active && aof_pool.is_none() {
@@ -618,10 +645,25 @@ async fn persist_local_leg(
     let Some(pool) = aof_pool else {
         return Ok(false);
     };
-    match pool.send_append_group(my_shard, lsn, db, serialized).await {
+    match pool
+        .send_append_group(my_shard, lsn, db, serialized, fold_stamp)
+        .await
+    {
         Ok(needs_barrier) => Ok(needs_barrier),
         Err(_) => Err(()),
     }
+}
+
+/// The AOF fold epoch of `my_shard`'s writer, or the initial epoch when AOF is
+/// off. Read it in the same no-await stretch as the mutation it stamps.
+#[inline]
+fn local_fold_stamp(
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    my_shard: usize,
+) -> crate::persistence::aof::FoldEpoch {
+    aof_pool.map_or(crate::persistence::aof::FoldEpoch::INITIAL, |pool| {
+        pool.fold_stamp(my_shard)
+    })
 }
 
 /// Serialize an `MSET k v ...` command over `pairs` for AOF logging of a local
@@ -1528,7 +1570,16 @@ async fn coordinate_mset(
         // owned by my_shard — matching the local single-key write contract.
         if let Some(pairs) = groups.get(&my_shard) {
             let serialized = serialize_local_mset(pairs);
-            match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
+            match persist_local_leg(
+                aof_pool,
+                repl_state,
+                my_shard,
+                db_index,
+                serialized,
+                local_fold_stamp(aof_pool, my_shard),
+            )
+            .await
+            {
                 Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
                 Err(()) => {
                     return Frame::Error(Bytes::from_static(
@@ -1541,6 +1592,10 @@ async fn coordinate_mset(
     }
 
     let mut pending_shards: Vec<channel::OneshotReceiver<Vec<Frame>>> = Vec::new();
+    // The local slice is persisted only after every remote leg answers; its
+    // fold epoch is the one current when it was applied (see
+    // `persist_local_leg`).
+    let mut local_stamp = crate::persistence::aof::FoldEpoch::INITIAL;
 
     for (shard_id, kv_pairs) in &groups {
         if *shard_id == my_shard {
@@ -1550,6 +1605,7 @@ async fn coordinate_mset(
                     db.set_string(key, value.clone());
                 }
             });
+            local_stamp = local_fold_stamp(aof_pool, my_shard);
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
             let commands: Vec<(Bytes, Frame)> = kv_pairs
@@ -1604,7 +1660,16 @@ async fn coordinate_mset(
     // write keys this shard doesn't own).
     if let Some(pairs) = groups.get(&my_shard) {
         let serialized = serialize_local_mset(pairs);
-        match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
+        match persist_local_leg(
+            aof_pool,
+            repl_state,
+            my_shard,
+            db_index,
+            serialized,
+            local_stamp,
+        )
+        .await
+        {
             Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
             Err(()) => {
                 return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
@@ -1687,7 +1752,16 @@ async fn coordinate_msetnx(
         if matches!(resp, Frame::Integer(1)) {
             let serialized =
                 crate::persistence::aof::serialize_command(&Frame::Array(command_parts.into()));
-            match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
+            match persist_local_leg(
+                aof_pool,
+                repl_state,
+                my_shard,
+                db_index,
+                serialized,
+                local_fold_stamp(aof_pool, my_shard),
+            )
+            .await
+            {
                 Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
                 Err(()) => {
                     return Frame::Error(Bytes::from_static(
@@ -1768,7 +1842,16 @@ async fn coordinate_multi_del_or_exists(
             parts.extend_from_slice(args);
             let serialized =
                 crate::persistence::aof::serialize_command(&Frame::Array(parts.into()));
-            match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
+            match persist_local_leg(
+                aof_pool,
+                repl_state,
+                my_shard,
+                db_index,
+                serialized,
+                local_fold_stamp(aof_pool, my_shard),
+            )
+            .await
+            {
                 Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
                 Err(()) => {
                     return Frame::Error(Bytes::from_static(
@@ -1801,8 +1884,15 @@ async fn coordinate_multi_del_or_exists(
                     parts.extend_from_slice(key_args);
                     let serialized =
                         crate::persistence::aof::serialize_command(&Frame::Array(parts.into()));
-                    match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized)
-                        .await
+                    match persist_local_leg(
+                        aof_pool,
+                        repl_state,
+                        my_shard,
+                        db_index,
+                        serialized,
+                        local_fold_stamp(aof_pool, my_shard),
+                    )
+                    .await
                     {
                         Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
                         Err(()) => {
@@ -3702,8 +3792,13 @@ pub async fn coordinate_swapdb(
         // returned 0 anyway; per-shard AOF order is preserved by write order,
         // not by LSN value (see `wal_append_and_fanout`).
         if let Some(pool) = aof_pool {
+            // Logged BEFORE the swap, so the only epoch available is the one
+            // current at enqueue. A fold that snapshots between this append
+            // and the swap below misses the swap in its base and drops this
+            // record — the same loss window the fold had before epochs.
+            let stamp = pool.fold_stamp(my_shard);
             match pool
-                .send_append_group(my_shard, 0, 0, serialized.clone())
+                .send_append_group(my_shard, 0, 0, serialized.clone(), stamp)
                 .await
             {
                 Ok(needs_barrier) => {

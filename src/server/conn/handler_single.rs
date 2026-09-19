@@ -109,10 +109,15 @@ where
     // resolve_local_leg_barrier. On barrier failure every enqueued write in
     // the batch is unconfirmed, so every joined slot is patched.
     let mut barrier_idxs: Vec<usize> = Vec::new();
+    // Read once, before any enqueue can park. The entries were applied
+    // earlier in the batch, so this can be later than their mutations — a
+    // fold in between may still replay them — but never earlier, which is
+    // the direction that would lose a record.
+    let fold_stamp = pool.fold_stamp(0);
     for (resp_idx, db, bytes) in aof_entries {
         let lsn =
             crate::persistence::aof::AofWriterPool::issue_append_lsn(repl_state, 0, bytes.len());
-        match pool.send_append_group(0, lsn, db, bytes).await {
+        match pool.send_append_group(0, lsn, db, bytes, fold_stamp).await {
             Ok(true) => barrier_idxs.push(resp_idx),
             Ok(false) => {}
             Err(_) => {
@@ -965,8 +970,14 @@ pub async fn handle_connection(
                                             // `b` — no single db context applies;
                                             // pass 0 (writer may emit a harmless
                                             // redundant SELECT 0).
-                                            pool.try_send_append_durable(0, lsn, 0, serialized.clone())
-                                                .await
+                                            pool.try_send_append_durable(
+                                                0,
+                                                lsn,
+                                                0,
+                                                serialized.clone(),
+                                                pool.fold_stamp(0),
+                                            )
+                                            .await
                                                 .is_ok()
                                         } else {
                                             true // persistence disabled — no durability requirement
@@ -1297,7 +1308,10 @@ pub async fn handle_connection(
                             for (_resp_idx, entry_db, bytes) in aof_entries.drain(..) {
                                 if let Some(ref pool) = aof_pool {
                                     let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                                    match pool.send_append_group(0, lsn, entry_db, bytes).await {
+                                    // Later than the batch's mutations at worst
+                                    // (see `flush_with_aof_ack`), never earlier.
+                                    let stamp = pool.fold_stamp(0);
+                                    match pool.send_append_group(0, lsn, entry_db, bytes, stamp).await {
                                         Ok(true) => aof_barrier_needed = true,
                                         Ok(false) => {}
                                         Err(_) => aof_write_failed = true,
@@ -3126,7 +3140,10 @@ pub async fn handle_connection(
                     for (_, entry_db, bytes) in aof_entries {
                         if let Some(ref pool) = aof_pool {
                             let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                            let _ = pool.try_send_append_durable(0, lsn, entry_db, bytes).await;
+                            let stamp = pool.fold_stamp(0);
+                            let _ = pool
+                                .try_send_append_durable(0, lsn, entry_db, bytes, stamp)
+                                .await;
                         }
                         if let Some(ref counter) = change_counter {
                             counter.fetch_add(1, Ordering::Relaxed);

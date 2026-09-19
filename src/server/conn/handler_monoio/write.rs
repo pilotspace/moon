@@ -995,6 +995,17 @@ pub(super) async fn try_handle_multi_exec(
                 &watched,
                 txn_scripting.as_ref(),
             );
+            // #455: the body's AOF records are enqueued only after the
+            // intercept slots below are filled, and those can await (WAIT,
+            // ...), so a fold can snapshot the body in between. The fold
+            // epoch is read here, in the executor's no-await stretch, so a
+            // fold whose base already holds the body drops its records.
+            let fold_stamp = ctx
+                .aof_pool
+                .as_ref()
+                .map_or(crate::persistence::aof::FoldEpoch::INITIAL, |pool| {
+                    pool.fold_stamp(ctx.shard_id)
+                });
             // moon#639: fill the slots the executor left for connection-level
             // intercepts. Snapshotted first because filling takes `&mut conn`
             // and the queue lives on it; the clone happens only when the body
@@ -1096,9 +1107,14 @@ pub(super) async fn try_handle_multi_exec(
             // so ctx.shard_id is the correct AOF target. On barrier failure we
             // surface AOF_FSYNC_ERR instead of a false EXEC success — parity
             // with the normal write path.
-            if crate::server::conn::shared::persist_txn_aof(ctx, aof_entries, repl_active)
-                .await
-                .is_err()
+            if crate::server::conn::shared::persist_txn_aof(
+                ctx,
+                aof_entries,
+                repl_active,
+                fold_stamp,
+            )
+            .await
+            .is_err()
             {
                 conn.command_queue.clear();
                 // Durability could not be guaranteed: report the error and

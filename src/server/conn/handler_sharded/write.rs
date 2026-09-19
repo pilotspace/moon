@@ -804,6 +804,14 @@ pub(super) async fn try_handle_multi_exec(
                 &watched,
                 txn_scripting.as_ref(),
             );
+            // #455: read in the executor's no-await stretch — see the monoio
+            // EXEC path.
+            let fold_stamp = ctx
+                .aof_pool
+                .as_ref()
+                .map_or(crate::persistence::aof::FoldEpoch::INITIAL, |pool| {
+                    pool.fold_stamp(ctx.shard_id)
+                });
             // moon#639: fill the slots the executor left for connection-level
             // intercepts.
             {
@@ -861,7 +869,7 @@ pub(super) async fn try_handle_multi_exec(
             // so ctx.shard_id is the correct AOF target. On barrier failure we
             // surface AOF_FSYNC_ERR instead of a false EXEC success — parity
             // with the normal write path.
-            if crate::server::conn::shared::persist_txn_aof(ctx, aof_entries, false)
+            if crate::server::conn::shared::persist_txn_aof(ctx, aof_entries, false, fold_stamp)
                 .await
                 .is_err()
             {

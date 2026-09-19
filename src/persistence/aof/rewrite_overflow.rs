@@ -53,21 +53,31 @@ pub(crate) const AOF_REWRITE_OVERFLOW_DEFAULT_MAX_BYTES: usize = 256 << 20;
 /// the guard — see the fold's exactly-once doc), so the buffer's push order
 /// matches mutation order across threads too.
 ///
-/// # Snapshot cut (exactly-once)
+/// # Snapshot epoch (exactly-once)
 ///
-/// The fold's C4 contract splits appends at the snapshot instant:
-/// PRE-snapshot appends have their effects captured by the new base RDB
-/// (the shard mutates BEFORE enqueuing/spilling), so they are drained into
-/// the OLD incr (deleted at `manifest.advance`) and must never reach the
-/// NEW incr — replaying them on top of the base double-applies
-/// non-idempotent commands (INCR/APPEND/LPUSH…). The channel side is cut by
-/// `pending_aof_count`; the buffer side is cut by [`mark_cut`](Self::mark_cut),
-/// called at the same atomic instant (the AofFold handler / under the
-/// all-db write guards). On a COMMITTED fold, [`finish_framed`] /
-/// [`finish_raw`] discard entries `[0..cut)` (acking their parked
-/// `AppendSync`s — the base makes them durable) and write only `[cut..)`
-/// into the new incr. On an ABORTED fold everything is written to the
-/// rolled-back OLD incr (the old base predates all of it).
+/// The fold's C4 contract splits appends at the snapshot instant.
+/// PRE-snapshot appends have their effects captured by the new base RDB (the
+/// shard mutates BEFORE enqueuing/spilling), so they must never reach the NEW
+/// incr: replaying them on top of the base double-applies non-idempotent
+/// commands (INCR/APPEND/LPUSH…).
+///
+/// The split is by [`FoldEpoch`], not by position. This overflow also owns
+/// its writer's epoch counter: producers stamp every record with
+/// [`stamp`](Self::stamp) in the same synchronous section as the mutation,
+/// and the fold calls [`advance_epoch`](Self::advance_epoch) at the snapshot
+/// instant (the AofFold handler, or under the all-db write guards). A position
+/// cut (channel length, buffer length at the snapshot) misses a record whose
+/// producer was parked or awaiting between mutation and enqueue — the record
+/// lands past the cut while its effect is in the base (#455). The epoch
+/// classifies it correctly wherever it lands.
+///
+/// When the fold's generation takes effect, [`finish_framed`] /
+/// [`finish_raw`] are given the snapshot epoch as their `floor`. They drop
+/// every buffered or channel entry stamped below it, acking parked
+/// `AppendSync`s (the base makes them durable), and write the rest. The writer
+/// keeps applying the same floor to everything it dequeues later. When the
+/// fold aborts, the floor stays where it was: the old base predates all of it,
+/// so everything is written into the old incr.
 pub struct RewriteOverflow {
     /// True from fold start until the post-fold drain completes. Read with
     /// `Acquire` on the producer's cold (channel-Full) path only.
@@ -78,13 +88,10 @@ pub struct RewriteOverflow {
     /// Payload bytes currently buffered; enforces `max_bytes`.
     bytes: std::sync::atomic::AtomicUsize,
     max_bytes: usize,
-    /// Buffer length at the fold's snapshot instant — entries below this
-    /// index are pre-snapshot (see "Snapshot cut" above). Written by
-    /// [`mark_cut`](Self::mark_cut) under the buffer lock; 0 when no cut
-    /// was recorded (fold aborted before its snapshot, or an arm without
-    /// an exact snapshot instant — both treat the whole buffer as
-    /// post-snapshot/write-everything, which can never lose data).
-    cut: std::sync::atomic::AtomicUsize,
+    /// This writer's fold epoch (see "Snapshot epoch" above). Advanced only
+    /// at a fold's snapshot instant; read by every producer when it stamps
+    /// a record.
+    epoch: std::sync::atomic::AtomicU64,
 }
 
 /// Why [`RewriteOverflow::try_spill`] refused a message — the two reasons
@@ -116,28 +123,38 @@ impl RewriteOverflow {
             buf: parking_lot::Mutex::new(Vec::new()),
             bytes: std::sync::atomic::AtomicUsize::new(0),
             max_bytes,
-            cut: std::sync::atomic::AtomicUsize::new(0),
+            epoch: std::sync::atomic::AtomicU64::new(FoldEpoch::INITIAL.0),
         }
     }
 
     /// Arm at fold start. Called by the writer task immediately before
-    /// entering a `do_rewrite_*` fold. Resets the snapshot cut — a fold
-    /// that never reaches its snapshot leaves it 0 (write-everything).
+    /// entering a `do_rewrite_*` fold.
     pub(crate) fn arm(&self) {
-        self.cut.store(0, std::sync::atomic::Ordering::Release);
         self.armed.store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Record the snapshot cut: everything spilled so far is pre-snapshot.
-    /// MUST be called at the fold's snapshot instant, under whatever
-    /// exclusion makes that instant exact (the shard's AofFold handler —
-    /// same instant as the `pending_aof_count` capture — or the writer
-    /// while holding every db write guard). Takes the buffer lock so the
-    /// recorded length can't race a concurrent spill.
-    pub(crate) fn mark_cut(&self) {
-        let buf = self.buf.lock();
-        self.cut
-            .store(buf.len(), std::sync::atomic::Ordering::Release);
+    /// The fold epoch a record logging a mutation made RIGHT NOW belongs to.
+    /// Producers MUST read it in the same synchronous section as the
+    /// mutation (see "Snapshot epoch" above): reading it after an `.await`
+    /// that followed the mutation can stamp a pre-snapshot record as
+    /// post-snapshot.
+    #[inline]
+    pub fn stamp(&self) -> FoldEpoch {
+        FoldEpoch(self.epoch.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Open a new fold epoch and return it: every record stamped before this
+    /// call is pre-snapshot, every record stamped after it is post-snapshot.
+    /// MUST be called at the fold's snapshot instant, under whatever exclusion
+    /// makes that instant exact: the shard's AofFold handler (same instant as
+    /// the `pending_aof_count` capture), or the writer while it holds every db
+    /// write guard.
+    pub(crate) fn advance_epoch(&self) -> FoldEpoch {
+        FoldEpoch(
+            self.epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                .saturating_add(1),
+        )
     }
 
     /// Test-only: number of currently buffered spilled messages.
@@ -203,33 +220,35 @@ impl RewriteOverflow {
     /// resolves parked `AppendSync` acks, and disarms. Always disarms and
     /// clears — even on write error (the loss is then counted and logged,
     /// never silent, and producers stop spilling into a dead buffer).
-    /// `committed`: whether the fold REPLACED the base (manifest advanced /
-    /// file renamed). On `true`, pre-cut entries are discarded — their
-    /// effects are in the new base and writing them would double-apply. On
-    /// `false` (abort — `file` is the rolled-back OLD incr) everything is
-    /// written: the old base predates every buffered entry.
+    ///
+    /// `floor`: the writer's floor AFTER the fold's outcome is known. That is
+    /// the fold's snapshot epoch when its generation took effect (`file` is
+    /// the new incr), and the unchanged previous floor when the fold aborted
+    /// (`file` is still the old incr). Entries stamped below it are already in
+    /// the base of `file`'s generation. They are dropped, because writing them
+    /// would double-apply. Everything else is written, in order.
     #[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
     pub(crate) fn finish_framed(
         &self,
         rx: &channel::MpscReceiver<AofMessage>,
         file: &mut std::fs::File,
         db_ctx: &mut usize,
-        committed: bool,
+        floor: FoldEpoch,
     ) -> Result<(), MoonError> {
-        self.finish_inner(rx, file, db_ctx, true, committed)
+        self.finish_inner(rx, file, db_ctx, true, floor)
     }
 
     /// Post-fold drain + disarm, TopLevel RAW RESP format (no framing).
-    /// See [`finish_framed`](Self::finish_framed) for `committed`.
+    /// See [`finish_framed`](Self::finish_framed) for `floor`.
     #[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
     pub(crate) fn finish_raw(
         &self,
         rx: &channel::MpscReceiver<AofMessage>,
         file: &mut std::fs::File,
         db_ctx: &mut usize,
-        committed: bool,
+        floor: FoldEpoch,
     ) -> Result<(), MoonError> {
-        self.finish_inner(rx, file, db_ctx, false, committed)
+        self.finish_inner(rx, file, db_ctx, false, floor)
     }
 
     #[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
@@ -239,7 +258,7 @@ impl RewriteOverflow {
         file: &mut std::fs::File,
         db_ctx: &mut usize,
         framed: bool,
-        committed: bool,
+        floor: FoldEpoch,
     ) -> Result<(), MoonError> {
         use std::io::Write;
         // Two-phase drain (deep-review P2): the buffer lock is held only for
@@ -255,17 +274,11 @@ impl RewriteOverflow {
         // - Disarm happens under the buffer lock in the empty-swap round
         //   (rule 3's "no append slips between written and disarmed").
         //
-        // Snapshot cut: on a committed fold, entries below the cut are
-        // pre-snapshot — their effects are in the new base RDB. Skip their
-        // bytes; park their AppendSync acks with the others (the advance's
-        // base fsync made them durable before finish ran). Only the FIRST
-        // swap can contain pre-cut entries (nothing drains the buffer
-        // between `mark_cut` and this call).
-        let cut = if committed {
-            self.cut.load(std::sync::atomic::Ordering::Acquire)
-        } else {
-            0
-        };
+        // Snapshot epoch: entries stamped below `floor` are pre-snapshot —
+        // their effects are in the base of the generation `file` belongs to.
+        // Skip their bytes; park their AppendSync acks with the others (the
+        // base was fsynced before the floor was raised). The channel drains
+        // below apply the same filter.
         let io_err = |e: std::io::Error| {
             MoonError::from(AofError::Io {
                 path: PathBuf::from("<aof rewrite overflow drain>"),
@@ -284,7 +297,6 @@ impl RewriteOverflow {
             };
         let mut drained_overflow = 0usize;
         let mut folded_into_base = 0usize;
-        let mut first_swap = true;
         let result = (|| -> Result<(), MoonError> {
             // (a) channel first — everything in it is older than the buffer
             // (ordering rule 2: producers spill while armed, so nothing new
@@ -292,9 +304,9 @@ impl RewriteOverflow {
             // length so we never consume appends enqueued after this point.
             let chan_bound = rx.len();
             let mut outcome = if framed {
-                drain_pending_appends_framed(rx, file, chan_bound, db_ctx)?
+                drain_pending_appends_framed(rx, file, chan_bound, db_ctx, floor)?
             } else {
-                drain_pending_appends_bounded(rx, file, chan_bound, db_ctx)?
+                drain_pending_appends_bounded(rx, file, chan_bound, db_ctx, floor)?
             };
             // (b) then the buffered overflow: swap-write rounds until a swap
             // finds the buffer empty (that round disarms under the lock).
@@ -320,20 +332,14 @@ impl RewriteOverflow {
                 let late = rx.len();
                 if late > 0 {
                     let o = if framed {
-                        drain_pending_appends_framed(rx, file, late, db_ctx)?
+                        drain_pending_appends_framed(rx, file, late, db_ctx, floor)?
                     } else {
-                        drain_pending_appends_bounded(rx, file, late, db_ctx)?
+                        drain_pending_appends_bounded(rx, file, late, db_ctx, floor)?
                     };
                     outcome.drained += o.drained;
                     outcome.shutdown_requested |= o.shutdown_requested;
                     outcome.pending_acks.extend(o.pending_acks);
                 }
-                let batch_cut = if first_swap {
-                    cut.min(spilled.len())
-                } else {
-                    0
-                };
-                first_swap = false;
                 // Drain-by-index so a mid-batch write error can count the
                 // un-written remainder as dropped (re-verify: fail-loud) —
                 // `?` inside a consuming for-loop silently discards it.
@@ -341,19 +347,22 @@ impl RewriteOverflow {
                 let batch_total = spilled.len();
                 let mut batch_consumed = 0usize;
                 for (idx, msg) in spilled.drain(..).enumerate() {
-                    // Pre-cut entries: effect already in the committed base —
-                    // writing the record would double-apply on replay. Ack
-                    // any parked AppendSync (durable via the base) and skip.
-                    if idx < batch_cut {
+                    // Pre-snapshot entries: effect already in the base of
+                    // `file`'s generation — writing the record would
+                    // double-apply on replay. Ack any parked AppendSync
+                    // (durable via the base) and skip.
+                    if is_folded(&msg, floor) {
                         folded_into_base += 1;
                         batch_consumed += 1;
+                        super::AOF_REWRITE_LATE_RECORDS_FOLDED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if let AofMessage::AppendSync { ack, .. } = msg {
                             outcome.pending_acks.push(ack);
                         }
                         continue;
                     }
                     match msg {
-                        AofMessage::Append { lsn, db, bytes } => {
+                        AofMessage::Append { lsn, db, bytes, .. } => {
                             let r = select_prefix_if_needed(db, bytes.is_empty(), db_ctx)
                                 .map_or(Ok(()), |sel| write_record(file, 0, &sel))
                                 .and_then(|()| write_record(file, lsn, &bytes));
@@ -370,6 +379,7 @@ impl RewriteOverflow {
                             db,
                             bytes,
                             ack,
+                            ..
                         } => {
                             // Zero-length AppendSync = fsync barrier: no
                             // on-disk record, ack parks for the boundary
@@ -533,11 +543,26 @@ mod tests {
     use std::io::Read;
 
     fn append(lsn: u64, payload: &'static [u8]) -> AofMessage {
+        append_at(lsn, payload, FoldEpoch::INITIAL)
+    }
+
+    fn append_at(lsn: u64, payload: &'static [u8], epoch: FoldEpoch) -> AofMessage {
         AofMessage::Append {
             lsn,
             db: 0,
             bytes: Bytes::from_static(payload),
+            epoch,
         }
+    }
+
+    fn incr_file(dir: &std::path::Path, name: &str) -> (std::path::PathBuf, std::fs::File) {
+        let path = dir.join(name);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        (path, file)
     }
 
     /// Parse the PerShard framed format back: `[u64 lsn LE][u32 len LE][bytes]`.
@@ -602,7 +627,7 @@ mod tests {
             let _guard = ovf.arm_scoped();
             assert!(ovf.try_spill(append(1, b"a")).is_ok());
             let mut db_ctx = 0usize;
-            ovf.finish_framed(&rx, &mut file, &mut db_ctx, false)
+            ovf.finish_framed(&rx, &mut file, &mut db_ctx, FoldEpoch::INITIAL)
                 .unwrap();
             // finish disarmed the overflow; the guard drop below must be a
             // no-op (armed=false), not a second disarm-with-accounting.
@@ -636,7 +661,7 @@ mod tests {
         let mut file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
         let mut db_ctx = 0usize;
         let before = AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
-        let res = ovf.finish_framed(&rx, &mut file, &mut db_ctx, false);
+        let res = ovf.finish_framed(&rx, &mut file, &mut db_ctx, FoldEpoch::INITIAL);
         assert!(res.is_err(), "writes to a read-only handle must fail");
         let after = AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
         // >= not ==: process-global counter, parallel tests may bump it.
@@ -692,7 +717,7 @@ mod tests {
             .open(&path)
             .unwrap();
         let mut db_ctx = 0usize;
-        ovf.finish_framed(&rx, &mut file, &mut db_ctx, true)
+        ovf.finish_framed(&rx, &mut file, &mut db_ctx, FoldEpoch::INITIAL)
             .unwrap();
 
         let records = read_framed(&path);
@@ -761,7 +786,7 @@ mod tests {
             .unwrap();
         let mut db_ctx = 0usize;
         pool.overflow_for(0)
-            .finish_framed(&rx, &mut file, &mut db_ctx, true)
+            .finish_framed(&rx, &mut file, &mut db_ctx, FoldEpoch::INITIAL)
             .unwrap();
         let lsns: Vec<u64> = read_framed(&path).into_iter().map(|(l, _)| l).collect();
         assert_eq!(lsns, vec![3, 4]);
@@ -773,18 +798,17 @@ mod tests {
         ));
     }
 
-    /// P0 fix (adversarial review): entries spilled BEFORE the fold's
-    /// snapshot instant have their effects captured by the new base RDB — a
-    /// COMMITTED fold must not re-write them into the new incr, or
-    /// non-idempotent commands (INCR/APPEND/LPUSH…) double-apply on replay.
-    /// Their parked AppendSync acks still resolve Synced (durable via the
-    /// base).
+    /// Entries stamped BEFORE the fold's snapshot have their effects in the
+    /// new base: once that generation takes effect they must not be written
+    /// into its incr, or non-idempotent commands (INCR/APPEND/LPUSH…)
+    /// double-apply on replay. Their parked AppendSync acks still resolve
+    /// Synced (durable via the base).
     #[test]
-    fn committed_finish_discards_pre_cut_entries() {
+    fn finish_drops_entries_stamped_below_the_floor() {
         let (_tx, rx) = channel::mpsc_bounded::<AofMessage>(1);
         let ovf = RewriteOverflow::new();
         ovf.arm();
-        assert!(ovf.try_spill(append(1, b"pre-a")).is_ok());
+        assert!(ovf.try_spill(append_at(1, b"pre-a", ovf.stamp())).is_ok());
         let (ack_tx, ack_rx) = crate::runtime::channel::oneshot::<AofAck>();
         assert!(
             ovf.try_spill(AofMessage::AppendSync {
@@ -792,56 +816,78 @@ mod tests {
                 db: 0,
                 bytes: Bytes::from_static(b"pre-b"),
                 ack: ack_tx,
+                epoch: ovf.stamp(),
             })
             .is_ok()
         );
-        // Snapshot instant: everything above is pre-snapshot.
-        ovf.mark_cut();
-        assert!(ovf.try_spill(append(3, b"post-c")).is_ok());
+        // Snapshot instant: everything stamped above is pre-snapshot.
+        let snapshot = ovf.advance_epoch();
+        assert!(ovf.try_spill(append_at(3, b"post-c", ovf.stamp())).is_ok());
 
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("incr.aof");
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .unwrap();
+        let (path, mut file) = incr_file(tmp.path(), "incr.aof");
         let mut db_ctx = 0usize;
-        ovf.finish_framed(&rx, &mut file, &mut db_ctx, true)
+        ovf.finish_framed(&rx, &mut file, &mut db_ctx, snapshot)
             .unwrap();
 
         assert_eq!(
             read_framed(&path),
             vec![(3, b"post-c".to_vec())],
-            "pre-cut entries are in the committed base and must NOT be re-written"
+            "pre-snapshot entries are in the committed base and must NOT be re-written"
         );
         assert_eq!(
             ack_rx.try_recv(),
             Ok(AofAck::Synced),
-            "a discarded pre-cut AppendSync is durable via the base and must still ack"
+            "a dropped pre-snapshot AppendSync is durable via the base and must still ack"
         );
     }
 
-    /// Abort mirror of the cut: the rolled-back OLD base predates every
-    /// spilled entry, so ALL of them must be written to the old incr.
+    /// The case a position cut got wrong: a producer mutated before the
+    /// snapshot but reached the CHANNEL only after it (parked on a full
+    /// channel, or awaiting between mutation and enqueue). By position it is
+    /// "post-cut"; by its stamp it is pre-snapshot and must be dropped.
     #[test]
-    fn aborted_finish_writes_all_entries_ignoring_cut() {
-        let (_tx, rx) = channel::mpsc_bounded::<AofMessage>(1);
+    fn finish_drops_a_late_channel_record_stamped_before_the_snapshot() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
         let ovf = RewriteOverflow::new();
         ovf.arm();
-        assert!(ovf.try_spill(append(1, b"pre-a")).is_ok());
-        ovf.mark_cut();
-        assert!(ovf.try_spill(append(2, b"post-b")).is_ok());
+        // Mutation happens, its stamp is taken — then the producer is held
+        // up across the snapshot.
+        let late_stamp = ovf.stamp();
+        let snapshot = ovf.advance_epoch();
+        tx.try_send(append_at(1, b"late-pre", late_stamp)).unwrap();
+        tx.try_send(append_at(2, b"post", ovf.stamp())).unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("incr.aof");
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .unwrap();
+        let (path, mut file) = incr_file(tmp.path(), "incr.aof");
         let mut db_ctx = 0usize;
-        ovf.finish_framed(&rx, &mut file, &mut db_ctx, false)
+        ovf.finish_framed(&rx, &mut file, &mut db_ctx, snapshot)
+            .unwrap();
+
+        assert_eq!(
+            read_framed(&path),
+            vec![(2, b"post".to_vec())],
+            "a record whose mutation preceded the snapshot is in the base, wherever it lands"
+        );
+    }
+
+    /// Abort: the old base predates every entry, so the floor is unchanged
+    /// and ALL of them are written to the old incr — including those stamped
+    /// before the aborted fold's snapshot.
+    #[test]
+    fn aborted_finish_writes_all_entries() {
+        let (_tx, rx) = channel::mpsc_bounded::<AofMessage>(1);
+        let ovf = RewriteOverflow::new();
+        let floor_before = FoldEpoch::INITIAL;
+        ovf.arm();
+        assert!(ovf.try_spill(append_at(1, b"pre-a", ovf.stamp())).is_ok());
+        let _aborted_snapshot = ovf.advance_epoch();
+        assert!(ovf.try_spill(append_at(2, b"post-b", ovf.stamp())).is_ok());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, mut file) = incr_file(tmp.path(), "incr.aof");
+        let mut db_ctx = 0usize;
+        ovf.finish_framed(&rx, &mut file, &mut db_ctx, floor_before)
             .unwrap();
 
         assert_eq!(
@@ -851,41 +897,98 @@ mod tests {
         );
     }
 
-    /// `arm()` must reset the previous fold's cut — a stale cut would
-    /// silently discard post-snapshot entries of the NEXT fold (data loss).
+    /// Each fold only drops what its OWN snapshot covers: entries stamped
+    /// after an earlier fold's snapshot survive a later fold that never
+    /// took effect, and are dropped by the next one that does.
     #[test]
-    fn rearm_resets_stale_cut() {
+    fn a_later_fold_drops_only_what_its_own_snapshot_covers() {
         let (_tx, rx) = channel::mpsc_bounded::<AofMessage>(1);
         let ovf = RewriteOverflow::new();
-        ovf.arm();
-        assert!(ovf.try_spill(append(1, b"fold1")).is_ok());
-        ovf.mark_cut();
         let tmp = tempfile::tempdir().unwrap();
-        let path1 = tmp.path().join("incr1.aof");
-        let mut f1 = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path1)
-            .unwrap();
         let mut db_ctx = 0usize;
-        ovf.finish_framed(&rx, &mut f1, &mut db_ctx, true).unwrap();
-        assert!(read_framed(&path1).is_empty());
 
-        // Second fold: no mark_cut this time — nothing may be discarded.
+        // Fold 1 takes effect.
         ovf.arm();
-        assert!(ovf.try_spill(append(2, b"fold2")).is_ok());
-        let path2 = tmp.path().join("incr2.aof");
-        let mut f2 = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path2)
-            .unwrap();
-        ovf.finish_framed(&rx, &mut f2, &mut db_ctx, true).unwrap();
-        assert_eq!(
-            read_framed(&path2),
-            vec![(2, b"fold2".to_vec())],
-            "a stale cut from the previous fold must not discard this fold's entries"
+        assert!(
+            ovf.try_spill(append_at(1, b"fold1-pre", ovf.stamp()))
+                .is_ok()
         );
+        let floor1 = ovf.advance_epoch();
+        let (p1, mut f1) = incr_file(tmp.path(), "incr1.aof");
+        ovf.finish_framed(&rx, &mut f1, &mut db_ctx, floor1)
+            .unwrap();
+        assert!(read_framed(&p1).is_empty());
+
+        // Fold 2 aborts: the floor stays at fold 1's snapshot.
+        ovf.arm();
+        assert!(
+            ovf.try_spill(append_at(2, b"after-fold1", ovf.stamp()))
+                .is_ok()
+        );
+        let _aborted = ovf.advance_epoch();
+        let (p2, mut f2) = incr_file(tmp.path(), "incr2.aof");
+        ovf.finish_framed(&rx, &mut f2, &mut db_ctx, floor1)
+            .unwrap();
+        assert_eq!(
+            read_framed(&p2),
+            vec![(2, b"after-fold1".to_vec())],
+            "fold 1's floor must not drop a record stamped after its snapshot"
+        );
+
+        // Fold 3 takes effect: a record stamped during fold 2's epoch is
+        // now inside the base.
+        ovf.arm();
+        let stamped_before_fold3 = ovf.stamp();
+        let floor3 = ovf.advance_epoch();
+        assert!(
+            ovf.try_spill(append_at(3, b"before-fold3", stamped_before_fold3))
+                .is_ok()
+        );
+        assert!(
+            ovf.try_spill(append_at(4, b"after-fold3", ovf.stamp()))
+                .is_ok()
+        );
+        let (p3, mut f3) = incr_file(tmp.path(), "incr3.aof");
+        ovf.finish_framed(&rx, &mut f3, &mut db_ctx, floor3)
+            .unwrap();
+        assert_eq!(read_framed(&p3), vec![(4, b"after-fold3".to_vec())]);
+    }
+
+    /// A zero-length AppendSync is an fsync barrier, not a record: it logs
+    /// nothing, so no floor may swallow it — its ack must wait for the
+    /// boundary fsync like any other barrier.
+    #[test]
+    fn finish_never_drops_a_barrier() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(1);
+        let ovf = RewriteOverflow::new();
+        ovf.arm();
+        let (ack_tx, ack_rx) = crate::runtime::channel::oneshot::<AofAck>();
+        tx.try_send(AofMessage::AppendSync {
+            lsn: 0,
+            db: 0,
+            bytes: Bytes::new(),
+            ack: ack_tx,
+            epoch: FoldEpoch::INITIAL,
+        })
+        .unwrap();
+        let floor = ovf.advance_epoch();
+        assert!(!is_folded(
+            &AofMessage::Append {
+                lsn: 0,
+                db: 0,
+                bytes: Bytes::new(),
+                epoch: FoldEpoch::INITIAL,
+            },
+            floor
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, mut file) = incr_file(tmp.path(), "incr.aof");
+        let mut db_ctx = 0usize;
+        ovf.finish_framed(&rx, &mut file, &mut db_ctx, floor)
+            .unwrap();
+
+        assert_eq!(ack_rx.try_recv(), Ok(AofAck::Synced));
+        assert!(read_framed(&path).is_empty());
     }
 
     /// AppendSync entries spilled during a fold must park their acks until
@@ -903,6 +1006,7 @@ mod tests {
                 db: 0,
                 bytes: Bytes::from_static(b"durable"),
                 ack: ack_tx,
+                epoch: FoldEpoch::INITIAL,
             })
             .is_ok()
         );
@@ -915,7 +1019,7 @@ mod tests {
             .open(&path)
             .unwrap();
         let mut db_ctx = 0usize;
-        ovf.finish_framed(&rx, &mut file, &mut db_ctx, true)
+        ovf.finish_framed(&rx, &mut file, &mut db_ctx, FoldEpoch::INITIAL)
             .unwrap();
 
         assert_eq!(ack_rx.try_recv(), Ok(AofAck::Synced));
