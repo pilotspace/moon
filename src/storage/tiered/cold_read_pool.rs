@@ -273,6 +273,7 @@ mod tests {
                     ColdReadOutcome::Hit(..) => "Hit(non-string)",
                     ColdReadOutcome::Expired => "Expired",
                     ColdReadOutcome::Miss => "Miss",
+                    ColdReadOutcome::Unreadable(_) => "Unreadable",
                 }
             ),
         }
@@ -299,6 +300,7 @@ mod tests {
                     ColdReadOutcome::Hit(..) => "Hit(non-string)",
                     ColdReadOutcome::Expired => "Expired",
                     ColdReadOutcome::Miss => "Miss",
+                    ColdReadOutcome::Unreadable(_) => "Unreadable",
                 }
             ),
         }
