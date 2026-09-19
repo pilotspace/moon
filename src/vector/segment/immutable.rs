@@ -529,7 +529,7 @@ impl ImmutableSegment {
     /// Mark a key as deleted via interior mutability.
     ///
     /// This is the **steady-state** tombstone path: called when a HDEL, a
-    /// `mark_deleted_for_key`, or an update's VEC-1 supersede fires against an
+    /// `mark_deleted_for_key`, or an update superseding the old copy fires against an
     /// already-Arc'd immutable segment. Does not modify `mvcc`.
     ///
     /// A segment that holds no live row for `key_hash` records nothing: the

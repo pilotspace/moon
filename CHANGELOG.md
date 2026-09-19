@@ -232,6 +232,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     tombstones key_hash-wide, killing the NEW copy of a key re-written while
     the merge ran; it now uses the origin-gated replay the background install
     already used.
+  - a synchronous merge (`VACUUM VECTOR`, and the autovacuum pass) installed
+    its output without replaying the sources' steady-state tombstones at all:
+    after a DEL, its row matched again top-1 as `vec:<id>` and was counted
+    (`num_docs` 2000 instead of 1999); after a re-write whose new copy was still in the mutable
+    segment, the old copy matched beside it. It now replays them like the
+    background installs.
+  - at boot, a WARM row killed at install time counted as evidence that its
+    segment served the key. When the keymap named that row's copy (recovery
+    kills a duplicate of the current copy that way), a segment holding the
+    dead duplicate could claim the key first and the live copy in another
+    segment was then tombstoned, losing the document. Only live rows count now.
 - **Three wire-parity gaps found probing redis-server 8.6.1 raw sockets**
   (moon#1060, moon#1076, moon#1077).
   - `ZRANGEBYSCORE`, `ZRANGE ... BYSCORE`/`BYLEX` and `ZREVRANGEBYSCORE`

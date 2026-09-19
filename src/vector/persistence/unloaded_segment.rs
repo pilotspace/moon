@@ -44,8 +44,7 @@ pub struct UnloadedSegment {
     /// Keeps the on-disk segment directory alive (not tombstoned) until
     /// this index/segment is explicitly dropped or flushed.
     handle: SegmentHandle,
-    /// WS3 round-2 resurrection fix: key_hashes tombstoned while this
-    /// segment is COLD (a HDEL that lands after unload), plus any
+    /// Key_hashes tombstoned while this segment is COLD (a HDEL that lands after unload), plus any
     /// tombstones the source `WarmSearchSegment` already carried at unload
     /// time (so a WARM -> COLD transition never loses a live delete).
     /// Applied to the freshly-reloaded `WarmSearchSegment` in [`Self::reload`]
@@ -83,8 +82,8 @@ impl UnloadedSegment {
     }
 
     /// Mark a key as deleted while this segment is COLD -- the stub records
-    /// it without requiring a reload (WS3 round-2 resurrection fix). Applied
-    /// to the reloaded `WarmSearchSegment` on the next [`Self::reload`].
+    /// it without requiring a reload, so the doc cannot come back through
+    /// the COLD tier. Applied to the reloaded `WarmSearchSegment` on the next [`Self::reload`].
     ///
     /// Recorded and counted only when the segment held a live row for the
     /// key at unload time (the WARM/HOT membership rule). Returns the number
@@ -159,8 +158,7 @@ impl UnloadedSegment {
             self.handle.clone(),
             self.mlock_codes,
         )?;
-        // WS3 round-2 resurrection fix: replay every tombstone recorded
-        // while this segment was COLD (plus whatever it already carried at
+        // Replay every tombstone recorded while this segment was COLD (plus whatever it already carried at
         // unload time) onto the freshly-reloaded segment, so a HDEL'd doc
         // does not resurface just because the segment went through the COLD
         // tier.

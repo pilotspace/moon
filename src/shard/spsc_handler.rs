@@ -4210,7 +4210,7 @@ fn handle_vector_insert(
     // TXN snapshot isolation. When inside a TXN (txn_id != 0), use the
     // transactional variant so non-TXN readers see the entry as uncommitted.
     let snap = idx.segments.load();
-    // VEC-1: an HSET on an already-indexed key is an UPDATE — tombstone the
+    // An HSET on an already-indexed key is an UPDATE — tombstone the
     // prior version BEFORE appending, or the index accumulates stale
     // duplicates (doc returned twice, num_docs inflating under churn).
     // Non-txn path only: a txn's tombstone must not leak to other readers
@@ -4312,8 +4312,8 @@ fn handle_vector_insert_field(
     // so both fields share one logical write event (Phase 165 MVCC contract).
     // When inside a TXN (txn_id != 0), tag with txn_id for uncommitted visibility.
     let snap = fs.segments.load();
-    // VEC-1 (additional fields): tombstone the prior version on update, in
-    // every tier (moon#1066). Field segments have no `key_hash → global_id`
+    // An update of an additional VECTOR field tombstones the prior version in
+    // every tier, as the default field does (moon#1066). Field segments have no `key_hash → global_id`
     // map, so this is the scan path (mutable is bounded by compact_threshold;
     // the other tiers are O(log n) membership lookups).
     if txn_id == 0 {

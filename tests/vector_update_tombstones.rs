@@ -712,3 +712,68 @@ fn delete_during_the_build_stays_deleted_in_warm() {
 fn rewrite_during_the_build_stays_superseded_in_warm() {
     written_during_the_build_then_warm("buildwarm-rw", true);
 }
+
+// ---------------------------------------------------------------------------
+// A synchronous merge (`VACUUM VECTOR`, the autovacuum pass) folds HOT
+// segments into one. It must carry the sources' steady-state tombstones.
+// ---------------------------------------------------------------------------
+
+/// Two HOT segments, the key's only copy in the first; DEL or re-write it,
+/// then `VACUUM VECTOR` merges both segments synchronously.
+fn two_hot_segments_then_vacuum(tag: &str, rewrite: bool) {
+    let dir = fresh_dir(tag);
+    let srv = start(&dir, 3600, 0);
+    seed_hot(&srv, &dir);
+    let mut c = srv.conn();
+    hset_range(&mut c, N..2 * N);
+    assert_eq!(c.send(&["FT.COMPACT", "idx"]), "+OK\r\n");
+    wait_for("a second HOT segment", 120, || {
+        info_int(&mut c, "graph_segments") == 2
+    });
+    let expect = if rewrite {
+        rewrite_target(&mut c);
+        2 * N
+    } else {
+        assert_eq!(c.send(&["DEL", &format!("doc:{TARGET}")]), ":1\r\n");
+        2 * N - 1
+    };
+    let merged = c.send(&["VACUUM", "VECTOR", "idx"]);
+    assert!(
+        merged.starts_with("+Merged 2 segments into 1"),
+        "instrument: VACUUM VECTOR did not merge: {merged:?}"
+    );
+    let check = |c: &mut Conn, when: &str| {
+        if rewrite {
+            assert_serves_current(c, when, expect);
+        } else {
+            let got = knn(c, &original(TARGET));
+            let docs = info_int(c, "num_docs");
+            assert!(
+                !got.first()
+                    .is_some_and(|k| k == &format!("doc:{TARGET}") || k.starts_with("vec:"))
+                    && docs == expect as i64,
+                "{when}: the deleted key matches again ({got:?}) or is counted \
+                 (num_docs = {docs}, expected {expect}); merge reply {merged:?}"
+            );
+        }
+    };
+    check(&mut c, "after VACUUM VECTOR");
+    // The merged segment was written to disk before the tombstones were
+    // replayed onto it; the keymap is what keeps the dead copy dead at boot.
+    srv.shutdown();
+    let srv = start(&dir, 3600, 0);
+    let mut c = srv.conn();
+    check(&mut c, "after VACUUM VECTOR and a restart");
+    srv.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn vacuum_merge_keeps_a_deleted_key_deleted() {
+    two_hot_segments_then_vacuum("vacuum-del", false);
+}
+
+#[test]
+fn vacuum_merge_keeps_only_the_current_copy_of_a_rewritten_key() {
+    two_hot_segments_then_vacuum("vacuum-rw", true);
+}

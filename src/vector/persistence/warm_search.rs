@@ -77,8 +77,7 @@ pub struct WarmSearchSegment {
     /// LRU ordering without requiring a mutable reference to the budget.
     /// Relaxed ordering is sufficient: approximate recency is all we need.
     last_access_micros: AtomicU64,
-    /// WS3 round-2 resurrection fix: steady-state tombstones recorded
-    /// against this WARM segment after it left the HOT tier (a HDEL that
+    /// Steady-state tombstones recorded against this WARM segment after it left the HOT tier (a HDEL that
     /// lands while the segment is already WARM or COLD). Mirrors
     /// `ImmutableSegment::tombstoned_keys`/`has_tombstones` exactly — same
     /// fast-path-skips-the-lock design. Seeded at construction time (via
@@ -242,18 +241,50 @@ struct MvccRows {
 /// a stale copy per key (moon#893) instead of retiring a whole segment on a
 /// key_hash overlap.
 ///
-/// Every row is returned, install-time-dead ones included: the global_id
-/// allocator must resume above all of them, and the keymap never names a dead
-/// row, so the per-key decision cannot pick one. The warm segment itself
-/// keeps a dead row dead (`WarmSearchSegment::install_dead`).
-pub(crate) fn peek_mvcc_rows(segment_dir: &Path) -> std::io::Result<Vec<(u64, u32)>> {
+/// Every row is returned, install-time-dead ones included and flagged: the
+/// global_id allocator must resume above all of them, but a dead row is NOT
+/// evidence that this segment serves its key. A keymap can name a dead row's
+/// `(key_hash, global_id)`: recovery kills a duplicate of the current copy
+/// with an install-time tombstone while the keymap still names that copy, and
+/// the duplicate carries its dead flag into WARM. Counting it as live would
+/// let the dead copy claim the key and the real one be tombstoned. The warm
+/// segment itself keeps a dead row dead (`WarmSearchSegment::install_dead`).
+pub(crate) fn peek_mvcc_rows(segment_dir: &Path) -> std::io::Result<Vec<PeekedRow>> {
+    let rows = parse_mvcc_ids(&read_mvcc_payload(segment_dir)?);
+    let mut dead = rows.dead.iter().copied().peekable();
+    Ok(rows
+        .key_hashes
+        .into_iter()
+        .zip(rows.global_ids)
+        .enumerate()
+        .map(|(pos, (key_hash, global_id))| PeekedRow {
+            key_hash,
+            global_id,
+            dead: dead.next_if_eq(&(pos as u32)).is_some(),
+        })
+        .collect())
+}
+
+/// One row of a warm segment's `mvcc.mpf`, as [`peek_mvcc_rows`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeekedRow {
+    pub key_hash: u64,
+    pub global_id: u32,
+    /// Killed by an install-time tombstone (`delete_lsn != 0`).
+    pub dead: bool,
+}
+
+/// The raw 32-byte-per-row payload of a warm segment's `mvcc.mpf`.
+pub(crate) fn read_mvcc_payload(segment_dir: &Path) -> std::io::Result<Vec<u8>> {
     use crate::vector::persistence::sealed_mmap::{AccessPattern, advise_pattern, map_sealed_file};
 
     let mvcc_mmap = map_sealed_file(&segment_dir.join("mvcc.mpf"))?;
     advise_pattern(&mvcc_mmap, AccessPattern::Sequential)?;
-    let mvcc_payload = extract_payloads(&mvcc_mmap, PAGE_4K, VEC_MVCC_SUB_HEADER_SIZE);
-    let rows = parse_mvcc_ids(&mvcc_payload);
-    Ok(rows.key_hashes.into_iter().zip(rows.global_ids).collect())
+    Ok(extract_payloads(
+        &mvcc_mmap,
+        PAGE_4K,
+        VEC_MVCC_SUB_HEADER_SIZE,
+    ))
 }
 
 impl WarmSearchSegment {
@@ -431,17 +462,26 @@ impl WarmSearchSegment {
     /// Sorted key_hashes of every row live right now (neither install-time
     /// nor steady-state tombstoned) -- what a COLD stub must remember to
     /// count later tombstones against this segment's own keys.
+    ///
+    /// Runs on the shard thread at every WARM->COLD unload, so it walks
+    /// `key_index` (already in key_hash order) instead of sorting: one O(n)
+    /// pass and one allocation, the stub's own copy.
     pub fn live_key_hashes_sorted(&self) -> Box<[u64]> {
         let toms = self.tombstoned_keys.read();
-        let mut live: Vec<u64> = self
-            .key_hashes
-            .iter()
-            .enumerate()
-            .filter(|&(pos, kh)| !self.is_install_dead(pos) && !toms.contains(kh))
-            .map(|(_, &kh)| kh)
-            .collect();
+        let order = self.key_index.sorted_positions();
+        let mut live: Vec<u64> = Vec::with_capacity(order.len());
+        for &pos in order {
+            let pos = pos as usize;
+            if self.is_install_dead(pos) {
+                continue;
+            }
+            if let Some(&kh) = self.key_hashes.get(pos)
+                && !toms.contains(&kh)
+            {
+                live.push(kh);
+            }
+        }
         drop(toms);
-        live.sort_unstable();
         live.into_boxed_slice()
     }
 
@@ -492,8 +532,7 @@ impl WarmSearchSegment {
             None,
         );
 
-        // WS3 round-2 resurrection fix: drop steady-state-tombstoned entries
-        // BEFORE rerank/truncate, mirroring `ImmutableSegment::search`'s
+        // Drop steady-state-tombstoned entries BEFORE rerank/truncate, mirroring `ImmutableSegment::search`'s
         // ordering exactly -- a tombstone must neither consume the
         // exact-rerank 4*k budget nor leave a stale ADC score mixed into the
         // post-rerank top-k. Filtering here (by BFS position -> key_hash,
@@ -632,8 +671,7 @@ impl WarmSearchSegment {
     }
 
     /// Mark a key as deleted via interior mutability -- the WARM-tier twin of
-    /// `ImmutableSegment::mark_deleted_by_key_hash` (WS3 round-2 resurrection
-    /// fix). Takes effect immediately: the next `search_filtered` call
+    /// `ImmutableSegment::mark_deleted_by_key_hash`. Takes effect immediately: the next `search_filtered` call
     /// filters this key_hash out, no reload required.
     ///
     /// Recorded and counted only when this segment holds a live row for the
@@ -681,9 +719,8 @@ impl WarmSearchSegment {
 
     /// Live document count: `total_count` minus the rows killed at install
     /// time and the rows this segment's own tombstones killed since. This is
-    /// what `FT.INFO`'s `num_docs` must sum (WS3 round-2 resurrection fix) --
-    /// `total_count()` alone over-reports once a delete lands against an
-    /// already-WARM/COLD segment.
+    /// what `FT.INFO`'s `num_docs` must sum: `total_count()` alone
+    /// over-reports once a delete lands against an already-WARM/COLD segment.
     #[inline]
     pub fn live_count(&self) -> u32 {
         self.total_count
@@ -989,10 +1026,16 @@ mod tests {
         let handle = SegmentHandle::new(3, seg_dir.clone());
         let warm = WarmSearchSegment::from_files(&seg_dir, 3, collection, handle, false).unwrap();
 
+        let peeked: Vec<(u64, u32, bool)> = peek_mvcc_rows(&seg_dir)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.key_hash, r.global_id, r.dead))
+            .collect();
         assert_eq!(
-            peek_mvcc_rows(&seg_dir).unwrap(),
-            vec![(10, 0), (20, 1), (20, 2), (40, 3)],
-            "recovery sees every row: the gid floor must clear the dead ones too"
+            peeked,
+            vec![(10, 0, false), (20, 1, true), (20, 2, false), (40, 3, true)],
+            "recovery sees every row, dead ones flagged: the gid floor must clear \
+             them, but they are no evidence of a live copy"
         );
         assert_eq!(
             &*warm.live_key_hashes_sorted(),

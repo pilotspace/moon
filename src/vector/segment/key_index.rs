@@ -9,9 +9,14 @@
 //! whether they held the key or not.
 //!
 //! The index is the segment's row positions sorted by key_hash (4 bytes per
-//! row), built once when the segment is constructed -- on the compaction or
-//! merge worker, or on the boot/reload thread, never on the shard thread's
-//! delete path. Lookup is two binary searches.
+//! row), built once when the segment is constructed: one O(n log n) sort.
+//! That is usually off the shard thread (the background compaction and merge
+//! workers, the off-loop reload pool, boot recovery), but not always: an
+//! inline `FT.COMPACT`, a synchronous merge, the synchronous HOT->WARM
+//! transition and a synchronous COLD reload (`promote_unloaded`) build it on
+//! the shard thread, alongside the far larger work each of those already
+//! does there. The delete path never builds it. Lookup is two binary
+//! searches.
 
 /// Row positions sorted by the key_hash of the row they name.
 ///
@@ -46,6 +51,11 @@ impl KeyHashIndex {
             .partition_point(|&pos| key_hash_at(pos) < key_hash);
         let len = self.order[start..].partition_point(|&pos| key_hash_at(pos) == key_hash);
         &self.order[start..start + len]
+    }
+
+    /// Every row position, in ascending key_hash order.
+    pub fn sorted_positions(&self) -> &[u32] {
+        &self.order
     }
 
     /// Heap bytes held by the index.

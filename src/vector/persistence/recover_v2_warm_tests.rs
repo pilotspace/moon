@@ -659,7 +659,7 @@ fn warm_reattach_picks_correct_index_among_same_dim_indexes() {
             crate::vector::persistence::warm_search::peek_mvcc_rows(&dir)
                 .unwrap()
                 .into_iter()
-                .map(|(kh, _)| kh)
+                .map(|r| r.key_hash)
                 .collect();
         if hashes == key_hashes_a {
             segment_for_a = Some((file_id, dir));
@@ -1522,7 +1522,7 @@ fn a_reattached_warm_segment_raises_the_global_id_allocator_above_its_rows() {
         crate::vector::persistence::warm_search::peek_mvcc_rows(&dir)
             .unwrap()
             .into_iter()
-            .map(|(_, gid)| gid)
+            .map(|r| r.global_id)
             .collect();
     let max_warm_gid = *warm_gids.iter().max().unwrap();
 
@@ -1562,3 +1562,6 @@ fn a_reattached_warm_segment_raises_the_global_id_allocator_above_its_rows() {
         .unwrap();
     assert_eq!(got.first().copied(), Some(new_gid));
 }
+
+#[path = "recover_v2_warm_dead_row_tests.rs"]
+mod dead_row_tests;
