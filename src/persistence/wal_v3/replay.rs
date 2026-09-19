@@ -78,6 +78,9 @@ pub fn replay_wal_auto(
                 let on_command = &mut |record: &WalRecord| {
                     match record.record_type {
                         WalRecordType::Command => {
+                            // moon#1039: the record's own db, never a
+                            // context carried over from the previous record.
+                            selected_db = record.replay_db();
                             // Parse RESP from payload and dispatch
                             engine.replay_command(
                                 databases,
@@ -205,6 +208,9 @@ pub fn replay_wal_v3_dir_commands(
     let on_command = &mut |record: &WalRecord| {
         match record.record_type {
             WalRecordType::Command => {
+                // moon#1039: the record's own db, never a context carried
+                // over from the previous record.
+                selected_db = record.replay_db();
                 engine.replay_command(databases, &record.payload, &[], &mut selected_db);
             }
             WalRecordType::XactBegin => {
