@@ -1968,8 +1968,14 @@ pub(super) async fn try_handle_blocking<
     .await;
     drop(blocked_guard);
 
-    let mut blocking_response = match outcome {
-        crate::server::conn::blocking::BlockingOutcome::Reply(frame) => frame,
+    // `peer_gone_after_serve` (moon#1023): a shard served this client and
+    // then found it gone. The serve stands (as in redis), so the tracking
+    // invalidation and the AOF/replication record below run exactly as for a
+    // delivered reply; only the write to the dead socket is skipped. For a
+    // key another shard owns, replay drops that record (moon#1056).
+    let (mut blocking_response, peer_gone_after_serve) = match outcome {
+        crate::server::conn::blocking::BlockingOutcome::Reply(frame) => (frame, false),
+        crate::server::conn::blocking::BlockingOutcome::ServedPeerGone(frame) => (frame, true),
         crate::server::conn::blocking::BlockingOutcome::PeerGone => {
             responses.clear();
             return BlockingResult::PeerGone;
@@ -2057,6 +2063,12 @@ pub(super) async fn try_handle_blocking<
                 }
             }
         }
+    }
+
+    if peer_gone_after_serve {
+        // Logged above; nobody left to write the reply to.
+        responses.clear();
+        return BlockingResult::PeerGone;
     }
 
     // moon#559 / moon#462: this is an INTERCEPT — it short-circuits the
