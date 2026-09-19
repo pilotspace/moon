@@ -54,6 +54,12 @@ fn spawn(shards: u32) -> Server {
                 "everysec",
                 "--aof-fsync-timeout-ms",
                 "100",
+                // The only rewrite is the test's own BGREWRITEAOF. The bursts
+                // can cross the 64 MB auto-rewrite minimum on a fast host, and
+                // an auto-rewrite committing after the drops would correctly
+                // clear the status before the test reads `err`.
+                "--auto-aof-rewrite-percentage",
+                "0",
                 "--disk-free-min-pct",
                 "0",
             ])
@@ -156,7 +162,8 @@ fn status_heals_after_a_covering_rewrite(shards: u32) {
     assert_eq!(
         info_field(srv.port, "aof_last_append_status"),
         "err",
-        "shards={shards}: a dropped acked append must report err"
+        "shards={shards}: a dropped acked append must report err ({refused} refused; {})",
+        command(srv.port, &["INFO", "persistence"]).replace('\n', " ")
     );
     assert_eq!(info_field(srv.port, "aof_last_write_status"), "err");
 
