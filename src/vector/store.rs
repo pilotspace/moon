@@ -1682,7 +1682,7 @@ fn raise_global_id_floor(
         );
         return;
     };
-    if mutable.len() == 0 {
+    if mutable.is_empty() {
         mutable.set_global_id_base(floor);
     } else {
         tracing::error!(
