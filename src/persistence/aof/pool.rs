@@ -735,6 +735,63 @@ impl AofWriterPool {
         self.sender(shard_id).is_full() && !self.overflow_for(shard_id).is_armed()
     }
 
+    /// How long a routed write leg may wait, parked at the head of its
+    /// producer's SPSC ring, for this pool's writer to make room (moon#769):
+    /// `--aof-fsync-timeout-ms`, with `0` (unbounded for the async legs)
+    /// mapped to [`ROUTED_ADMISSION_WAIT_CAP`], and never above that cap.
+    ///
+    /// [`ROUTED_ADMISSION_WAIT_CAP`]: crate::shard::aof_admission::ROUTED_ADMISSION_WAIT_CAP
+    #[inline]
+    pub fn routed_admission_wait(&self) -> Duration {
+        let cap = crate::shard::aof_admission::ROUTED_ADMISSION_WAIT_CAP;
+        if self.fsync_timeout.is_zero() {
+            cap
+        } else {
+            self.fsync_timeout.min(cap)
+        }
+    }
+
+    /// Free slots in `shard_id`'s writer channel right now (`usize::MAX` for
+    /// an unbounded channel). One queue-length read.
+    #[inline]
+    pub fn free_append_slots(&self, shard_id: usize) -> usize {
+        let tx = self.sender(shard_id);
+        tx.capacity()
+            .map_or(usize::MAX, |cap| cap.saturating_sub(tx.len()))
+    }
+
+    /// `true` once `shard_id`'s writer is gone: nothing sent to it can ever be
+    /// logged.
+    #[inline]
+    pub fn append_writer_gone(&self, shard_id: usize) -> bool {
+        self.sender(shard_id).is_disconnected()
+    }
+
+    /// Whether `shard_id`'s writer can take `records` more appends plus
+    /// `headroom` spare, on top of `reserved` appends already promised
+    /// (moon#769 admission). Never blocks.
+    ///
+    /// A request larger than the channel only needs the channel empty (plus
+    /// `reserved`). A rewrite fold with the overflow armed takes any number:
+    /// the appends spill instead of blocking.
+    pub fn has_append_room(
+        &self,
+        shard_id: usize,
+        reserved: usize,
+        records: usize,
+        headroom: usize,
+    ) -> bool {
+        if self.overflow_for(shard_id).is_armed() {
+            return true;
+        }
+        let tx = self.sender(shard_id);
+        let Some(cap) = tx.capacity() else {
+            return true;
+        };
+        let need = reserved.saturating_add(records.saturating_add(headroom).min(cap));
+        self.free_append_slots(shard_id) >= need
+    }
+
     /// Append with bounded *blocking* backpressure — for synchronous callers
     /// (the shard event loop's SPSC drain) that cannot await.
     ///

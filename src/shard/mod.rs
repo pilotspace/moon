@@ -1,4 +1,5 @@
 pub mod affinity;
+pub(crate) mod aof_admission;
 /// P4: per-shard autovacuum daemon with cost-based throttle.
 pub mod autovacuum;
 mod checkpoint_heap_files;
