@@ -951,6 +951,12 @@ pub(crate) fn execute_transaction_sharded(
 /// (lsn = 0; per-shard order is append order, same contract as the
 /// single-command write legs). The tokio handler passes `false` (tokio-side
 /// master fanout is not wired; monoio is the production replication runtime).
+///
+/// `fold_stamp`: the AOF fold epoch read when the body executed
+/// ([`crate::persistence::aof::AofWriterPool::fold_stamp`]), taken before any
+/// await that follows the executor. Every entry carries it, so a fold that
+/// snapshotted the body before these appends are enqueued drops them rather
+/// than replaying the body on top of its base (#455).
 pub(crate) async fn persist_txn_aof(
     ctx: &crate::server::conn::core::ConnectionContext,
     // task #35 + PR #282 review: each entry carries the db THAT command
@@ -959,6 +965,7 @@ pub(crate) async fn persist_txn_aof(
     // body on recovery.
     aof_entries: Vec<(usize, Bytes)>,
     repl_recorded: bool,
+    fold_stamp: crate::persistence::aof::FoldEpoch,
 ) -> Result<(), ()> {
     if aof_entries.is_empty() {
         return Ok(());
@@ -977,7 +984,10 @@ pub(crate) async fn persist_txn_aof(
                 bytes.len(),
             )
         };
-        match pool.send_append_group(ctx.shard_id, lsn, db, bytes).await {
+        match pool
+            .send_append_group(ctx.shard_id, lsn, db, bytes, fold_stamp)
+            .await
+        {
             Ok(true) => barrier_pending = true,
             Ok(false) => {}
             Err(_) => return Err(()),

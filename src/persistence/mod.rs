@@ -7,6 +7,7 @@ pub mod clog;
 pub mod cold_records;
 pub mod compression;
 pub mod control;
+pub mod data_file_sync;
 pub mod dir_lock;
 pub mod dump_payload;
 pub mod fsync;
