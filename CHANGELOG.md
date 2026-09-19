@@ -243,6 +243,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     kills a duplicate of the current copy that way), a segment holding the
     dead duplicate could claim the key first and the live copy in another
     segment was then tombstoned, losing the document. Only live rows count now.
+- **An AOF rewrite no longer replays a write twice, and a rewrite that fails
+  late no longer leaves the writer appending to a deleted file** (moon#455).
+  - **Double apply.** A rewrite split the append stream by position: whatever
+    reached the writer after its snapshot went into the new incr. A write
+    whose record arrives after the snapshot while its effect is already in the
+    snapshot was therefore replayed on top of the new base after a restart. An
+    `INCR` came back incremented twice, an `LPUSH` pushed twice. Records reach
+    the writer late when the producer awaits between the mutation and the
+    enqueue: an `EXEC` whose body holds `WAIT`, `CONFIG` or another connection
+    intercept, the local half of a multi-shard `FLUSHDB`/`FLUSHALL` (which
+    could then wipe writes the base had taken after it), the local slice of a
+    multi-shard `MSET`, or any producer parked on a full AOF channel. Every
+    record now carries the rewrite epoch in force when its mutation ran. Once
+    a rewrite takes effect, the writer drops each record stamped before that
+    rewrite's snapshot, wherever the record surfaces. An aborted rewrite drops
+    nothing. `INFO persistence` counts the dropped records as
+    `aof_rewrite_late_records_folded`.
+  - **Late failure.** The writer opened the new incr only after the manifest
+    had switched to it. If that open failed, the rewrite was reported aborted
+    while the manifest named the new generation, and the writer kept
+    appending, and fsyncing, into the old incr the switch had deleted. Nothing
+    it wrote after that could be recovered. The new incr is now opened before
+    the manifest switches, so every failure leaves the old generation
+    committed and the writer on it. A failed manifest write also no longer
+    advances the in-memory sequence past the one on disk.
+  - **SWAPDB during a rewrite.** `SWAPDB` logged its record, awaited, and
+    only then swapped. A rewrite that snapshotted in that gap had a base
+    without the swap and dropped (or folded into the old incr) the record, so
+    the acknowledged `SWAPDB` was gone after a restart. The record is now
+    enqueued, the swap applied and the replication record emitted in one
+    synchronous step; while the AOF channel is full, `SWAPDB` waits for room
+    without holding its record, and is refused unapplied after
+    `--aof-fsync-timeout-ms`. Under `appendfsync always` the fsync is now
+    confirmed after the swap, so an fsync failure is reported on a swap that
+    stays applied on every shard, like any other `always` write.
+  - **Directory fsyncs.** A per-shard rewrite created the new incr after its
+    last fsync of the shard directory, and the tokio `--shards 1` rewrite
+    renamed its new file into place without a directory fsync. After a power
+    loss the committed manifest could name a missing incr, or the old
+    `appendonly.aof` could return, losing every record written after the
+    rewrite. Both directories are now fsynced before the new file is used.
+
 - **A COLD vector segment leaves `unloaded` with the search that reloads it,
   and a delete that lands while the reload is waiting to install is no longer
   lost** (moon#1070). Since the off-loop reload pool (prod-hardening #18) a
