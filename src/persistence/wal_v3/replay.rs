@@ -72,92 +72,20 @@ pub fn replay_wal_auto(
                 Err(crate::error::WalError::UnsupportedVersion { version: 2 }.into())
             }
             3 => {
-                // v3 format — replay commands through engine
-                let mut commands_replayed = 0usize;
+                // v3 format: the same per-record replay as the directory
+                // helper below, so a single file and a directory cannot
+                // disagree about what a record means (moon#1026).
+                let mut counts = WalKvReplayCounts::default();
                 let mut selected_db = 0usize;
                 let on_command = &mut |record: &WalRecord| {
-                    match record.record_type {
-                        WalRecordType::Command => {
-                            // Parse RESP from payload and dispatch
-                            engine.replay_command(
-                                databases,
-                                &record.payload,
-                                &[],
-                                &mut selected_db,
-                            );
-                        }
-                        WalRecordType::XactBegin => {
-                            // XactBegin: payload contains txn_id (u64 LE)
-                            // No action needed - commit or abort will follow
-                            tracing::trace!(lsn = record.lsn, "WAL replay: XactBegin");
-                        }
-                        WalRecordType::XactCommit => {
-                            // XactCommit: db-index-aware KV replay
-                            replay_xact_commit(databases, &record.payload);
-                            tracing::trace!(lsn = record.lsn, "WAL replay: XactCommit");
-                        }
-                        WalRecordType::XactAbort => {
-                            // XactAbort: no action - changes were never committed
-                            tracing::trace!(lsn = record.lsn, "WAL replay: XactAbort");
-                        }
-                        WalRecordType::TemporalUpsert => {
-                            // Decode payload and log for temporal KV index restoration.
-                            // Full state restoration happens in ShardDatabases::replay_temporal_wal
-                            // (TemporalKvIndex lives on ShardDatabases, not on databases: &mut [Database]).
-                            if let Some((key, valid_from, _system_from, _value)) =
-                                crate::persistence::wal_v3::record::decode_temporal_upsert(
-                                    &record.payload,
-                                )
-                            {
-                                tracing::debug!(
-                                    lsn = record.lsn,
-                                    key_len = key.len(),
-                                    valid_from = valid_from,
-                                    "WAL replay: TemporalUpsert (deferred to temporal replay path)"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    lsn = record.lsn,
-                                    "WAL replay: malformed TemporalUpsert payload"
-                                );
-                            }
-                        }
-                        WalRecordType::GraphTemporal => {
-                            // Decode payload and log for graph entity valid_to restoration.
-                            // Full state restoration happens in ShardDatabases::replay_temporal_wal
-                            // (GraphStore lives on ShardDatabases, not on databases: &mut [Database]).
-                            if let Some((entity_id, is_node, valid_to, _system_from)) =
-                                crate::persistence::wal_v3::record::decode_graph_temporal(
-                                    &record.payload,
-                                )
-                            {
-                                tracing::debug!(
-                                    lsn = record.lsn,
-                                    entity_id = entity_id,
-                                    is_node = is_node,
-                                    valid_to = valid_to,
-                                    "WAL replay: GraphTemporal (deferred to temporal replay path)"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    lsn = record.lsn,
-                                    "WAL replay: malformed GraphTemporal payload"
-                                );
-                            }
-                        }
-                        _ => {
-                            // Other record types (Vector*, Checkpoint, etc.)
-                        }
-                    }
-                    commands_replayed += 1;
+                    replay_kv_record(record, databases, engine, &mut selected_db, &mut counts);
                 };
                 let on_fpi = &mut |_record: &WalRecord| {
                     // FPI unconditionally overwrites — handled by caller in full recovery
                 };
-                let result = replay_wal_v3_file(path, 0, on_command, on_fpi)
-                    .map_err(|e| crate::error::MoonError::Io(e))?;
-                let _ = result;
-                Ok(commands_replayed)
+                replay_wal_v3_file(path, 0, on_command, on_fpi)
+                    .map_err(crate::error::MoonError::Io)?;
+                Ok(counts.kv_commands_applied)
             }
             other => Err(crate::error::WalError::UnsupportedVersion {
                 version: other as u32,
@@ -170,10 +98,40 @@ pub fn replay_wal_auto(
     }
 }
 
+/// What the last-resort WAL v3 replay did (moon#1026).
+///
+/// `records_read` alone says nothing about recovery: a WAL routinely holds
+/// records that never reach the keyspace (cold-plane markers, `GRAPH.*`,
+/// temporal and vector records). Callers report
+/// [`kv_commands_applied`](Self::kv_commands_applied), which is what an
+/// operator can expect to find in the keyspace afterwards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalKvReplayCounts {
+    /// WAL records walked, of every type.
+    pub records_read: usize,
+    /// Commands replay applied to the KV keyspace: every `Command`-record
+    /// command the engine routed to [`ReplayRoute::Keyspace`], plus every
+    /// SET/DEL op of an `XactCommit` forward image.
+    ///
+    /// [`ReplayRoute::Keyspace`]: crate::persistence::replay::ReplayRoute::Keyspace
+    pub kv_commands_applied: usize,
+    /// Commands decoded from `Command` records that did NOT reach the
+    /// keyspace: cold-plane markers, graph writes, and anything dispatch
+    /// answered "unknown command" to.
+    pub other_commands: usize,
+    /// `Command` records whose payload decoded to no command at all
+    /// (corrupt or not RESP). Nothing from them was applied.
+    pub undecodable_records: usize,
+}
+
 /// Replay every Command/XactCommit record across all segments in a WAL v3
 /// directory through `engine`, applying the same record-type dispatch as
 /// `replay_wal_auto`'s v3 branch (this function is the multi-segment,
 /// directory-scoped counterpart — `replay_wal_auto` only handles one file).
+///
+/// `Command` payloads go through
+/// [`replay_resp_payload`](crate::persistence::replay::replay_resp_payload),
+/// the decoder the Phase 4 WAL pass uses, so the two cannot drift.
 ///
 /// Used by legacy (non-disk-offload) shard recovery: WAL v3 is written even
 /// when `--disk-offload` is off (rooted at `<persistence_dir>/shard-N/wal-v3`,
@@ -184,65 +142,28 @@ pub fn replay_wal_auto(
 /// KV writes bypass WAL v3 entirely even when it is on (measured 79.2%
 /// incomplete WAL-only recovery, see `tmp/WRITE-DIAG.md`). The retired
 /// WAL v2 "prefer the WAL, skip the AOF" contract must NOT be applied to
-/// this helper — a non-empty return typically counts temporal/graph/txn
-/// records while ALL local KV data lives only in the AOF. Callers replay
-/// `appendonly.aof` as the authority and use this helper ONLY as a
-/// last-resort fallback when no AOF exists (partial recovery beats none),
-/// logging a loud partial-coverage warning when they do.
+/// this helper — the WAL typically holds temporal/graph/txn records while
+/// ALL local KV data lives only in the AOF. Callers replay `appendonly.aof`
+/// as the authority and use this helper ONLY as a last-resort fallback when
+/// no AOF exists (partial recovery beats none), logging a loud
+/// partial-coverage warning that reports
+/// [`WalKvReplayCounts::kv_commands_applied`], not the records read.
 ///
-/// Returns `Ok(0)` (not an error) when `wal_dir` does not exist or is empty.
+/// Returns all-zero counts (not an error) when `wal_dir` does not exist or is
+/// empty.
 pub fn replay_wal_v3_dir_commands(
     wal_dir: &Path,
     databases: &mut [crate::storage::Database],
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
-) -> std::io::Result<usize> {
+) -> std::io::Result<WalKvReplayCounts> {
+    let mut counts = WalKvReplayCounts::default();
     if !wal_dir.exists() {
-        return Ok(0);
+        return Ok(counts);
     }
 
-    let mut commands_replayed = 0usize;
     let mut selected_db = 0usize;
     let on_command = &mut |record: &WalRecord| {
-        match record.record_type {
-            WalRecordType::Command => {
-                engine.replay_command(databases, &record.payload, &[], &mut selected_db);
-            }
-            WalRecordType::XactBegin => {
-                tracing::trace!(lsn = record.lsn, "WAL replay: XactBegin");
-            }
-            WalRecordType::XactCommit => {
-                replay_xact_commit(databases, &record.payload);
-                tracing::trace!(lsn = record.lsn, "WAL replay: XactCommit");
-            }
-            WalRecordType::XactAbort => {
-                tracing::trace!(lsn = record.lsn, "WAL replay: XactAbort");
-            }
-            WalRecordType::TemporalUpsert => {
-                if decode_temporal_upsert(&record.payload).is_none() {
-                    tracing::warn!(
-                        lsn = record.lsn,
-                        "WAL replay: malformed TemporalUpsert payload"
-                    );
-                }
-                // Full state restoration happens in the temporal replay path
-                // (TemporalKvIndex lives on ShardDatabases, not on databases).
-            }
-            WalRecordType::GraphTemporal => {
-                if decode_graph_temporal(&record.payload).is_none() {
-                    tracing::warn!(
-                        lsn = record.lsn,
-                        "WAL replay: malformed GraphTemporal payload"
-                    );
-                }
-                // Full state restoration happens in the graph replay path
-                // (GraphStore lives on ShardDatabases, not on databases).
-            }
-            _ => {
-                // Other record types (Vector*, Checkpoint, etc.) are not
-                // meaningful for the legacy KV-only replay path.
-            }
-        }
-        commands_replayed += 1;
+        replay_kv_record(record, databases, engine, &mut selected_db, &mut counts);
     };
     let on_fpi = &mut |_record: &WalRecord| {
         // No page cache in legacy (non-disk-offload) mode; FPI records are
@@ -251,7 +172,78 @@ pub fn replay_wal_v3_dir_commands(
     };
 
     replay_wal_v3_dir(wal_dir, 0, on_command, on_fpi)?;
-    Ok(commands_replayed)
+    Ok(counts)
+}
+
+/// Replay one WAL v3 record for the KV-only paths (`replay_wal_auto`,
+/// [`replay_wal_v3_dir_commands`]) and account for it in `counts`.
+fn replay_kv_record(
+    record: &WalRecord,
+    databases: &mut [crate::storage::Database],
+    engine: &dyn crate::persistence::replay::CommandReplayEngine,
+    selected_db: &mut usize,
+    counts: &mut WalKvReplayCounts,
+) {
+    counts.records_read += 1;
+    match record.record_type {
+        WalRecordType::Command => {
+            let decoded = crate::persistence::replay::replay_resp_payload(
+                engine,
+                databases,
+                &record.payload,
+                selected_db,
+                |route| {
+                    if route.is_kv_history() {
+                        counts.kv_commands_applied += 1;
+                    } else {
+                        counts.other_commands += 1;
+                    }
+                },
+            );
+            if decoded == 0 {
+                counts.undecodable_records += 1;
+                tracing::warn!(
+                    lsn = record.lsn,
+                    len = record.payload.len(),
+                    "WAL replay: Command record decoded to no command — skipped"
+                );
+            }
+        }
+        WalRecordType::XactBegin => {
+            tracing::trace!(lsn = record.lsn, "WAL replay: XactBegin");
+        }
+        WalRecordType::XactCommit => {
+            counts.kv_commands_applied += replay_xact_commit(databases, &record.payload);
+            tracing::trace!(lsn = record.lsn, "WAL replay: XactCommit");
+        }
+        WalRecordType::XactAbort => {
+            tracing::trace!(lsn = record.lsn, "WAL replay: XactAbort");
+        }
+        WalRecordType::TemporalUpsert => {
+            if decode_temporal_upsert(&record.payload).is_none() {
+                tracing::warn!(
+                    lsn = record.lsn,
+                    "WAL replay: malformed TemporalUpsert payload"
+                );
+            }
+            // Full state restoration happens in the temporal replay path
+            // (TemporalKvIndex lives on ShardDatabases, not on databases).
+        }
+        WalRecordType::GraphTemporal => {
+            if decode_graph_temporal(&record.payload).is_none() {
+                tracing::warn!(
+                    lsn = record.lsn,
+                    "WAL replay: malformed GraphTemporal payload"
+                );
+            }
+            // Full state restoration happens in the graph replay path
+            // (GraphStore lives on ShardDatabases, not on databases).
+        }
+        _ => {
+            // Other record types (Vector*, Checkpoint, etc.) are not
+            // meaningful for the legacy KV-only replay path.
+        }
+    }
 }
 
 /// Replay all WAL v3 segment files in a directory.
@@ -639,10 +631,12 @@ pub fn resolve_target_time_to_lsn(
 ///
 /// Vector and graph ops are handled by their respective replay paths
 /// (VectorTxnCommit already exists).
-fn replay_xact_commit(databases: &mut [crate::storage::Database], payload: &[u8]) {
+///
+/// Returns the number of KV ops applied.
+fn replay_xact_commit(databases: &mut [crate::storage::Database], payload: &[u8]) -> usize {
     if payload.len() < 16 {
         tracing::warn!("XactCommit payload too short: {} bytes", payload.len());
-        return;
+        return 0;
     }
 
     let txn_id = u64::from_le_bytes([
@@ -667,18 +661,20 @@ fn replay_xact_commit(databases: &mut [crate::storage::Database], payload: &[u8]
         );
         0
     };
-    replay_xact_kv_ops(&mut databases[target], payload, 16, kv_op_count);
+    replay_xact_kv_ops(&mut databases[target], payload, 16, kv_op_count)
 }
 
 /// Shared op-loop for XactCommit: apply `kv_op_count` SET/DEL ops read
 /// from `payload` starting at `offset` to `db`. Truncation-defensive — a
-/// short payload warns and stops rather than panicking.
+/// short payload warns and stops rather than panicking. Returns the number
+/// of ops applied.
 fn replay_xact_kv_ops(
     db: &mut crate::storage::Database,
     payload: &[u8],
     mut offset: usize,
     kv_op_count: usize,
-) {
+) -> usize {
+    let mut applied = 0usize;
     for _ in 0..kv_op_count {
         if offset >= payload.len() {
             tracing::warn!("XactCommit payload truncated at op boundary");
@@ -730,16 +726,19 @@ fn replay_xact_kv_ops(
                 offset += value_len;
 
                 db.set_string(&key, value);
+                applied += 1;
             }
             1 => {
                 // DEL
                 db.remove(&key);
+                applied += 1;
             }
             _ => {
                 tracing::warn!(op_type, "Unknown KV op type in XactCommit");
             }
         }
     }
+    applied
 }
 
 #[cfg(test)]
@@ -765,6 +764,162 @@ mod tests {
         header[6] = 2; // version = 2
         header[7..9].copy_from_slice(&shard_id.to_le_bytes());
         header
+    }
+
+    /// RESP-encode one command exactly as the live write path does before it
+    /// appends a WAL `Command` record (`aof::serialize_command`).
+    fn resp(parts: &[&[u8]]) -> Vec<u8> {
+        let frame = crate::protocol::Frame::Array(
+            parts
+                .iter()
+                .map(|p| crate::protocol::Frame::BulkString(bytes::Bytes::copy_from_slice(p)))
+                .collect(),
+        );
+        crate::persistence::aof::serialize_command(&frame).to_vec()
+    }
+
+    fn string_value(db: &mut crate::storage::Database, key: &[u8]) -> Option<Vec<u8>> {
+        db.get(key)
+            .and_then(|e| e.value.as_bytes().map(|b| b.to_vec()))
+    }
+
+    /// moon#1026: the last-resort helper must APPLY the KV records it reads.
+    /// It used to hand each record's raw RESP payload to the engine as the
+    /// command NAME with no arguments, so dispatch answered "unknown command"
+    /// for every record, nothing reached the keyspace, and the caller still
+    /// logged "replayed N records". Assert on the keyspace, not on a count.
+    #[test]
+    fn last_resort_dir_replay_applies_kv_records_to_the_keyspace() {
+        use crate::storage::Database;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal-v3");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let mut data = make_v3_header(0);
+        let mut lsn = 0u64;
+        let mut push = |data: &mut Vec<u8>, payload: &[u8]| {
+            lsn += 1;
+            write_wal_v3_record(data, lsn, WalRecordType::Command, payload);
+        };
+        push(&mut data, &resp(&[b"SET", b"k:a", b"va"]));
+        push(&mut data, &resp(&[b"HSET", b"k:h", b"f", b"vh"]));
+        // One record, two frames: Phase 4 decodes every frame in a payload.
+        let mut two = resp(&[b"SET", b"k:b", b"vb"]);
+        two.extend_from_slice(&resp(&[b"SET", b"k:c", b"vc"]));
+        push(&mut data, &two);
+        // A later write wins: replay order is record order.
+        push(&mut data, &resp(&[b"SET", b"k:a", b"va2"]));
+        // Non-KV records: a cold-plane marker and a command no build has.
+        push(
+            &mut data,
+            &crate::persistence::cold_records::serialize_spilled(7, &[]),
+        );
+        push(&mut data, &resp(&[b"NOSUCHCMD", b"x"]));
+        std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        let counts = replay_wal_v3_dir_commands(&wal_dir, &mut databases, &engine).unwrap();
+
+        assert_eq!(
+            string_value(&mut databases[0], b"k:a").as_deref(),
+            Some(&b"va2"[..]),
+            "SET records must be applied, in order"
+        );
+        assert_eq!(
+            string_value(&mut databases[0], b"k:b").as_deref(),
+            Some(&b"vb"[..])
+        );
+        assert_eq!(
+            string_value(&mut databases[0], b"k:c").as_deref(),
+            Some(&b"vc"[..])
+        );
+        assert!(
+            databases[0].get(b"k:h").is_some(),
+            "HSET record must create the hash"
+        );
+        assert_eq!(databases[0].len(), 4, "exactly the four KV keys");
+
+        // The count reports what was APPLIED, not what was read: 6 records,
+        // 5 KV commands (SET, HSET, SET+SET in one record, SET), and two
+        // commands that went elsewhere (the cold-plane marker and the
+        // unknown command).
+        assert_eq!(
+            counts,
+            WalKvReplayCounts {
+                records_read: 6,
+                kv_commands_applied: 5,
+                other_commands: 2,
+                undecodable_records: 0,
+            }
+        );
+    }
+
+    /// A `Command` record whose payload is not RESP applies nothing and is
+    /// reported as undecodable rather than silently counted.
+    #[test]
+    fn last_resort_dir_replay_reports_undecodable_records() {
+        use crate::storage::Database;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal-v3");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let mut data = make_v3_header(0);
+        write_wal_v3_record(&mut data, 1, WalRecordType::Command, b"SET k v");
+        write_wal_v3_record(
+            &mut data,
+            2,
+            WalRecordType::Command,
+            &resp(&[b"SET", b"k", b"v"]),
+        );
+        std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        let counts = replay_wal_v3_dir_commands(&wal_dir, &mut databases, &engine).unwrap();
+        assert_eq!(counts.records_read, 2);
+        assert_eq!(counts.kv_commands_applied, 1);
+        assert_eq!(counts.undecodable_records, 1);
+        assert_eq!(databases[0].len(), 1);
+    }
+
+    /// `replay_wal_auto`'s v3 branch shares the per-record replay, so a single
+    /// segment file restores its KV records too (it had the same raw-payload
+    /// defect as the directory helper).
+    #[test]
+    fn wal_auto_v3_file_applies_kv_records() {
+        use crate::storage::Database;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let seg = tmp.path().join("000000000001.wal");
+        let mut data = make_v3_header(0);
+        write_wal_v3_record(
+            &mut data,
+            1,
+            WalRecordType::Command,
+            &resp(&[b"SET", b"a", b"1"]),
+        );
+        write_wal_v3_record(
+            &mut data,
+            2,
+            WalRecordType::Command,
+            &resp(&[b"SET", b"b", b"2"]),
+        );
+        std::fs::write(&seg, &data).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        let applied = replay_wal_auto(&mut databases, &seg, &engine).unwrap();
+        assert_eq!(applied, 2);
+        assert_eq!(
+            string_value(&mut databases[0], b"a").as_deref(),
+            Some(&b"1"[..])
+        );
+        assert_eq!(
+            string_value(&mut databases[0], b"b").as_deref(),
+            Some(&b"2"[..])
+        );
     }
 
     // D-1: XactCommit must replay KV ops into the db the transaction ran

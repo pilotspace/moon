@@ -64,6 +64,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The last-resort WAL v3 replay now restores KV writes instead of none**
+  (moon#1026). When `appendonly.aof` is missing and the WAL carries KV records
+  (`--wal-kv-log on`), boot falls back to replaying the WAL. That fallback
+  passed each record's raw RESP payload to dispatch as the command *name*
+  with no arguments. Every record came back "unknown command" and nothing
+  reached the keyspace, yet the boot log said `replayed N WAL v3 records`.
+  Measured end to end at `--shards 2`: 0 of 64 keys came back and the log
+  claimed 35 records. The fallback now uses the same payload decoder as the
+  Phase 4 WAL pass (`replay::replay_resp_payload`), so the two cannot drift.
+  After the fix the same run restores 29 of 64 keys; the other 35 were
+  connection-local writes, which the WAL does not log by design. Both
+  fallback sites (`shard/mod.rs` and recovery Phase 4b) now log the KV
+  commands they **applied**, alongside records read, non-KV commands and
+  undecodable records. The legacy-dir fallback also closes the replay
+  generation, as its AOF sibling does. `replay_wal_auto` had the same defect
+  and uses the same per-record replay now. The WAL remains a partial source:
+  it is never the recovery authority.
+
 - **One `GRAPH.*` write no longer makes a restart discard every acknowledged
   KV write** (moon#1018). This hits `runtime-tokio` with `--shards 1` and the
   `graph` feature. That configuration has no `AofManifest`, so recovery picks
