@@ -1541,6 +1541,7 @@ async fn coordinate_mset(
     }
 
     let mut pending_shards: Vec<channel::OneshotReceiver<Vec<Frame>>> = Vec::new();
+    let mut local_append_failed = false;
 
     for (shard_id, kv_pairs) in &groups {
         if *shard_id == my_shard {
@@ -1550,6 +1551,24 @@ async fn coordinate_mset(
                     db.set_string(key, value.clone());
                 }
             });
+            // Local leg (review Finding 1): persist a synthesized MSET over
+            // ONLY the local keys. The remote slices persist themselves on
+            // their owner shards via MultiExecute -> wal_append_and_fanout;
+            // my_shard must not log their keys (replay re-dispatches raw
+            // commands, so a full-command log here would try to write keys
+            // this shard doesn't own).
+            //
+            // moon#1084: logged HERE, right after the apply and before the
+            // remote legs are awaited. Logged after them, a write another
+            // client made to one of these keys during the wait reached the
+            // log first although it was applied second, and replay put this
+            // slice back on top of it. A failed append is reported once every
+            // leg has been dispatched and drained, as before.
+            let serialized = serialize_local_mset(kv_pairs);
+            match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
+                Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
+                Err(()) => local_append_failed = true,
+            }
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
             let commands: Vec<(Bytes, Frame)> = kv_pairs
@@ -1574,8 +1593,7 @@ async fn coordinate_mset(
     }
 
     // Drain ALL remote acks even after a failure (every leg was already
-    // dispatched, and the local leg below must still persist what this shard
-    // applied) — but a timed-out, closed, or errored leg must NOT collapse
+    // dispatched) — but a timed-out, closed, or errored leg must NOT collapse
     // into OK: that would acknowledge an unconfirmed distributed write.
     let mut leg_err: Option<Frame> = None;
     for reply_rx in pending_shards {
@@ -1597,21 +1615,9 @@ async fn coordinate_mset(
         }
     }
 
-    // Local leg (review Finding 1): persist a synthesized MSET over ONLY the
-    // local keys. The remote slices persisted themselves on their owner shards
-    // via MultiExecute -> wal_append_and_fanout; my_shard must not log their keys
-    // (replay re-dispatches raw commands, so a full-command log here would try to
-    // write keys this shard doesn't own).
-    if let Some(pairs) = groups.get(&my_shard) {
-        let serialized = serialize_local_mset(pairs);
-        match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized).await {
-            Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
-            Err(()) => {
-                return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
-            }
-        }
+    if local_append_failed {
+        return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
     }
-
     if let Some(err) = leg_err {
         return err;
     }
