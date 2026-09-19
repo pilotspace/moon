@@ -28,21 +28,27 @@ for mod in src/protocol src/command src/shard src/storage src/persistence src/se
         file=$(echo "$line" | cut -d: -f1)
         lineno=$(echo "$line" | cut -d: -f2)
 
-        # Skip files that are test-only modules (e.g., tests.rs included via #[cfg(test)] mod tests;)
+        # Skip files that are test-only modules: `<stem>.rs` whose declaration
+        # in its parent (`<dir>/mod.rs`, or the 2018-style `<dir>.rs`) is
+        # `mod <stem>;` directly under a cfg(test) attribute — `tests.rs` via
+        # `#[cfg(test)] mod tests;`, and equally `foo_tests.rs` via
+        # `#[cfg(test)] mod foo_tests;`. A module NOT gated that way is still
+        # audited, whatever its name. Handles both simple #[cfg(test)] and
+        # compound #[cfg(all(test, ...))].
         basename=$(basename "$file")
-        if [ "$basename" = "tests.rs" ]; then
-            # Check if the parent mod.rs has a cfg(test) attribute adjacent to mod tests
-            # Handles both simple #[cfg(test)] and compound #[cfg(all(test, ...))]
+        stem="${basename%.rs}"
+        if [ "$stem" != "mod" ] && [ "$stem" != "lib" ] && [ "$stem" != "main" ]; then
             dir=$(dirname "$file")
-            parent_mod="$dir/mod.rs"
-            if [ -f "$parent_mod" ] && awk '
-                /^[[:space:]]*#\[cfg\(.*test.*\)\]/ { cfg_test = 1; next }
-                cfg_test && /^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+tests/ { found = 1; exit }
-                { cfg_test = 0 }
-                END { exit(found ? 0 : 1) }
-            ' "$parent_mod"; then
-                continue
-            fi
+            for parent_mod in "$dir/mod.rs" "$dir.rs"; do
+                if [ -f "$parent_mod" ] && awk -v stem="$stem" '
+                    /^[[:space:]]*#\[cfg\(.*test.*\)\]/ { cfg_test = 1; next }
+                    cfg_test && $0 ~ ("^[[:space:]]*(pub(\\([a-z]+\\))?[[:space:]]+)?mod[[:space:]]+" stem "[[:space:]]*;") { found = 1; exit }
+                    { cfg_test = 0 }
+                    END { exit(found ? 0 : 1) }
+                ' "$parent_mod"; then
+                    continue 2
+                fi
+            done
         fi
 
         # Check if we're inside a #[cfg(test)] module

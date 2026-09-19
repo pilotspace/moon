@@ -73,25 +73,60 @@ pub fn producer_wake_key_index(cmd: &[u8]) -> usize {
 ///      known-dead waiter never causes a mutation at all (the common case);
 ///   2. this undo covers the residual race — the receiver can drop between
 ///      that check and the send.
-enum WakeUndo {
+///
+/// moon#1019 adds a third user: a shard that pops for a waiter registered on
+/// several threads and then LOSES the waiter's claim puts the element back
+/// with this, in the same synchronous stretch as the pop.
+///
+/// Every user runs it in the SAME synchronous stretch as the pop, so nothing
+/// else can have touched the key in between. That is the whole reason it may
+/// exist at all: a put-back after an await would land on top of other
+/// clients' logged writes while the pop itself was never logged, and the
+/// master would diverge from its AOF and replicas (moon#1023).
+pub(crate) enum WakeUndo {
     /// Values popped from the FRONT of the key, in pop order.
     ListFront(smallvec::SmallVec<[bytes::Bytes; 4]>),
     /// Values popped from the BACK of the key, in pop order.
     ListBack(smallvec::SmallVec<[bytes::Bytes; 4]>),
-    /// BLMOVE: one value left the key via `wherefrom` and was pushed onto
+    /// BLMOVE: `value` left the key via `wherefrom` and was pushed onto
     /// `destination` via `whereto`. Undoing means reversing BOTH halves.
     Moved {
         destination: Bytes,
         wherefrom: Direction,
         whereto: Direction,
+        value: Bytes,
     },
     /// (member, score) pairs popped from the sorted set at the key.
     Zset(smallvec::SmallVec<[(bytes::Bytes, f64); 4]>),
 }
 
+/// The absolute TTL of `key` (ms), or 0 when it has none or is absent.
+///
+/// Read BEFORE a pop that may be put back: a pop that empties the key removes
+/// it, TTL and all, and the put-back recreates it from nothing.
+pub(crate) fn expiry_of(db: &mut Database, key: &Bytes) -> u64 {
+    db.get(key)
+        .filter(|e| e.has_expiry())
+        .map_or(0, |e| e.expires_at_ms())
+}
+
 impl WakeUndo {
+    /// [`restore`](Self::restore), then give the key back the TTL it had
+    /// before the pop — `expires_at_ms` from [`expiry_of`], 0 for none.
+    ///
+    /// A pop that emptied the key removed it, and `restore` recreates it
+    /// through the create-on-push path with NO TTL; without this the master
+    /// would hold forever a key its replicas expire. A key that survived the
+    /// pop still carries its TTL, and is left alone.
+    pub(crate) fn restore_keeping_ttl(self, db: &mut Database, key: &Bytes, expires_at_ms: u64) {
+        self.restore(db, key);
+        if expires_at_ms != 0 && expiry_of(db, key) == 0 {
+            db.set_expiry(key, expires_at_ms);
+        }
+    }
+
     /// Put everything back exactly where it came from.
-    fn restore(self, db: &mut Database, key: &Bytes) {
+    pub(crate) fn restore(self, db: &mut Database, key: &Bytes) {
         match self {
             // Pops came off the front in order [v0, v1, ..]; pushing them
             // back front-first in REVERSE order restores the original
@@ -110,20 +145,29 @@ impl WakeUndo {
                 destination,
                 wherefrom,
                 whereto,
+                value,
             } => {
-                // Take back the element we just pushed onto the destination.
-                // It is still at the end we pushed it to: this runs on the
-                // shard thread with no await in between, so nothing else can
-                // have touched the list.
+                // Take back the element that was pushed onto the destination.
+                // It is still at the end it was pushed to — this runs on the
+                // shard thread with no await in between. The value check is a
+                // guard, not a branch any caller expects to take: if the end
+                // ever held something else, the move STANDS (the element is
+                // misplaced by the client's own command, never lost) rather
+                // than taking another client's element.
                 let moved = match whereto {
                     Direction::Left => db.list_pop_front(&destination),
                     Direction::Right => db.list_pop_back(&destination),
                 };
-                if let Some(v) = moved {
-                    match wherefrom {
+                match moved {
+                    Some(v) if v == value => match wherefrom {
                         Direction::Left => db.list_push_front(key, v),
                         Direction::Right => db.list_push_back(key, v),
-                    }
+                    },
+                    Some(other) => match whereto {
+                        Direction::Left => db.list_push_front(&destination, other),
+                        Direction::Right => db.list_push_back(&destination, other),
+                    },
+                    None => {}
                 }
             }
             // Sorted sets are order-free: reinsertion order is irrelevant.
@@ -156,25 +200,39 @@ pub fn try_wake_list_waiter(
     // The loop condition moved from `has_waiters` to the pop itself: a queue
     // holding only foreign waiters is not empty, so the old condition would
     // now spin forever.
+    // A key that holds nothing has nothing for anyone: leave every waiter
+    // parked without touching the queue. Every producer calls this after a
+    // successful push, so the key exists; this is the cheap exit for the
+    // callers that cannot promise that. (A waiter popped below for a pop that
+    // yields nothing is put back too — never answered nil, which redis never
+    // sends a timeout-0 waiter.)
+    if !db.exists(key) {
+        return false;
+    }
+    let mut served = false;
     while let Some(waiter) =
         registry.pop_front_of_family(db_index, key, crate::blocking::WaitFamily::List)
     {
+        // A2: never mutate the datastore on behalf of a waiter whose client
+        // is already gone — nor, since moon#1019, one that another shard has
+        // already served or that has given up. Reap the registration and move
+        // to the next waiter with the key untouched.
+        if waiter.is_settled() {
+            registry.remove_wait(waiter.wait_id);
+            continue;
+        }
         let crate::blocking::WaitEntry {
             wait_id,
             cmd,
             reply_tx,
-            ..
+            claim,
+            deadline,
         } = waiter;
 
-        // A2: never mutate the datastore on behalf of a waiter whose client
-        // is already gone. Reap the registration and move to the next waiter
-        // with the key untouched.
-        if reply_tx.is_disconnected() {
-            registry.remove_wait(wait_id);
-            continue;
-        }
-
         // Execute the pop based on command type
+        // The TTL the key has before this pop, in case the pop empties it
+        // and has to be put back.
+        let expires_at_ms = expiry_of(db, key);
         let (result, undo) = match &cmd {
             BlockedCommand::BLPop => {
                 // Pop from left, return [key, value]
@@ -266,11 +324,12 @@ pub fn try_wake_list_waiter(
                                 Direction::Right => db.list_push_back(destination, v.clone()),
                             }
                             (
-                                Some(Frame::BulkString(v)),
+                                Some(Frame::BulkString(v.clone())),
                                 Some(WakeUndo::Moved {
                                     destination: destination.clone(),
                                     wherefrom: *wherefrom,
                                     whereto: *whereto,
+                                    value: v,
                                 }),
                             )
                         }
@@ -316,24 +375,82 @@ pub fn try_wake_list_waiter(
             _ => (None, None),
         };
 
+        // Nothing to pop: the key holds another type (a waiter of this
+        // family parked on it while it was absent, then another client
+        // created it as something else), or it emptied under a caller that
+        // runs every waker. This waker has nothing for the waiter, so it must
+        // not answer it — nil is a reply redis never sends a timeout-0 waiter.
+        // Put it back where it was and stop; every other waiter of this
+        // family would find the same nothing.
+        let Some(result) = result else {
+            registry.requeue_front(
+                db_index,
+                key,
+                crate::blocking::WaitEntry {
+                    wait_id,
+                    cmd,
+                    reply_tx,
+                    deadline,
+                    claim,
+                },
+            );
+            break;
+        };
+
         // Clean up all other key registrations for this wait_id
         registry.remove_wait(wait_id);
 
-        if let Some(frame) = result {
-            if reply_tx.send(Some(frame)).is_ok() {
-                return true;
+        if deliver(
+            db,
+            key,
+            reply_tx,
+            claim.as_ref(),
+            result,
+            undo,
+            expires_at_ms,
+        ) {
+            served = true;
+            // moon#1019: one push can carry several elements, and
+            // Redis keeps serving the key's waiters while it has data. Stopping
+            // after the first left the rest parked next to data they could
+            // have had — and a waiter parked on several keys was offered each
+            // of them exactly once by `register_group`, so it stayed parked
+            // even when a key it was registered on still held elements.
+            if !db.exists(key) {
+                break;
             }
-            // A2 residual race: the receiver dropped between the liveness
-            // check above and this send. Put the data back and offer it to
-            // the next waiter instead of destroying it.
-            if let Some(undo) = undo {
-                undo.restore(db, key);
-            }
-            continue;
         }
-        // If pop returned None (list became empty -- shouldn't happen in single-threaded
-        // model but handle gracefully), try next waiter
-        let _ = reply_tx.send(None);
+    }
+    served
+}
+
+/// The tail every destructive wake shares, once the element is popped and the
+/// reply built: decide whether this waiter gets it, and put it back if not.
+/// Returns true if the waiter was answered. A waker with nothing to hand a
+/// waiter never gets here — it leaves the waiter parked instead.
+///
+/// * moon#1019: a waiter registered on several threads is served by exactly
+///   one of them — whichever wins its [`ClaimToken`](crate::blocking::ClaimToken).
+///   The claim is attempted with the element already in hand, so a lost claim
+///   restores it here, in the same synchronous stretch as the pop, where no
+///   other client can have observed the round trip.
+/// * A2: a failed send (the receiver dropped after the liveness check) restores
+///   the element and moves on instead of destroying it.
+pub(crate) fn deliver(
+    db: &mut Database,
+    key: &Bytes,
+    reply_tx: crate::runtime::channel::OneshotSender<Option<Frame>>,
+    claim: Option<&crate::blocking::ClaimToken>,
+    frame: Frame,
+    undo: Option<WakeUndo>,
+    expires_at_ms: u64,
+) -> bool {
+    let won = claim.is_none_or(crate::blocking::ClaimToken::try_claim);
+    if won && reply_tx.send(Some(frame)).is_ok() {
+        return true;
+    }
+    if let Some(undo) = undo {
+        undo.restore_keeping_ttl(db, key, expires_at_ms);
     }
     false
 }
@@ -355,22 +472,36 @@ pub fn try_wake_zset_waiter(
     // The loop condition moved from `has_waiters` to the pop itself: a queue
     // holding only foreign waiters is not empty, so the old condition would
     // now spin forever.
+    // A key that holds nothing has nothing for anyone: leave every waiter
+    // parked without touching the queue. Every producer calls this after a
+    // successful push, so the key exists; this is the cheap exit for the
+    // callers that cannot promise that. (A waiter popped below for a pop that
+    // yields nothing is put back too — never answered nil, which redis never
+    // sends a timeout-0 waiter.)
+    if !db.exists(key) {
+        return false;
+    }
+    let mut served = false;
     while let Some(waiter) =
         registry.pop_front_of_family(db_index, key, crate::blocking::WaitFamily::ZSet)
     {
+        // A2 / moon#1019: see try_wake_list_waiter — never pop for a waiter
+        // nobody can use a serve from.
+        if waiter.is_settled() {
+            registry.remove_wait(waiter.wait_id);
+            continue;
+        }
         let crate::blocking::WaitEntry {
             wait_id,
             cmd,
             reply_tx,
-            ..
+            claim,
+            deadline,
         } = waiter;
 
-        // A2: see try_wake_list_waiter — never pop for a dead client.
-        if reply_tx.is_disconnected() {
-            registry.remove_wait(wait_id);
-            continue;
-        }
-
+        // The TTL the key has before this pop, in case the pop empties it
+        // and has to be put back.
+        let expires_at_ms = expiry_of(db, key);
         let (result, undo) = match &cmd {
             BlockedCommand::BZPopMin => match db.zset_pop_min(key) {
                 Some((member, score)) => (
@@ -432,22 +563,41 @@ pub fn try_wake_zset_waiter(
             // Unreachable since moon#535 — see try_wake_list_waiter.
             _ => (None, None),
         };
+        // Nothing to pop: see try_wake_list_waiter — leave the waiter parked.
+        let Some(result) = result else {
+            registry.requeue_front(
+                db_index,
+                key,
+                crate::blocking::WaitEntry {
+                    wait_id,
+                    cmd,
+                    reply_tx,
+                    deadline,
+                    claim,
+                },
+            );
+            break;
+        };
 
         registry.remove_wait(wait_id);
 
-        if let Some(frame) = result {
-            if reply_tx.send(Some(frame)).is_ok() {
-                return true;
+        // Claim / A2 / keep-serving-while-data: see try_wake_list_waiter.
+        if deliver(
+            db,
+            key,
+            reply_tx,
+            claim.as_ref(),
+            result,
+            undo,
+            expires_at_ms,
+        ) {
+            served = true;
+            if !db.exists(key) {
+                break;
             }
-            // A2 residual race — restore and offer to the next waiter.
-            if let Some(undo) = undo {
-                undo.restore(db, key);
-            }
-            continue;
         }
-        let _ = reply_tx.send(None);
     }
-    false
+    served
 }
 
 /// Which waker a producer command's write should raise, or `None` when the
@@ -607,7 +757,10 @@ pub fn try_wake_stream_waiter(
             // leaves the entries in the stream and only records them in the
             // PEL of a consumer that vanished, which is precisely Redis's
             // dead-consumer state (recoverable via `XAUTOCLAIM`).
-            if entry.reply_tx.is_disconnected() {
+            //
+            // moon#1023: a remote reader whose wait already ended (its claim
+            // token is settled) is exactly as gone.
+            if entry.is_settled() {
                 decisions.push((entry.wait_id, None));
             } else if let Some(frame) = serve_stream_waiter(&entry.cmd, db, key) {
                 decisions.push((entry.wait_id, Some(frame)));
@@ -642,6 +795,13 @@ pub fn try_wake_stream_waiter(
         let Some(frame) = slot.1.take() else {
             continue; // the disconnected client — removed, nothing to send
         };
+        // moon#1023: a reader that gave up between the decision and here
+        // must not be answered — its client already has its null. Nothing to
+        // restore: the entries are still in the stream (XREADGROUP's PEL
+        // side effect is the same dead-consumer state as the A2 case below).
+        if entry.claim.as_ref().is_some_and(|c| !c.try_claim()) {
+            continue;
+        }
         if entry.reply_tx.send(Some(frame)).is_ok() {
             woke = true;
         }
@@ -800,6 +960,7 @@ mod dead_waiter_tests {
                 cmd,
                 reply_tx: tx,
                 deadline: None,
+                claim: None,
             },
         );
         rx
@@ -1036,6 +1197,7 @@ mod cross_shard_wait_id_tests {
                 },
                 reply_tx: tx,
                 deadline: None,
+                claim: None,
             },
         );
         rx
@@ -1164,6 +1326,7 @@ mod wake_producer_tests {
                 cmd: BlockedCommand::BLPop,
                 reply_tx: tx,
                 deadline: None,
+                claim: None,
             },
         );
         rx
@@ -1259,6 +1422,7 @@ mod wake_producer_tests {
                 },
                 reply_tx: tx,
                 deadline: None,
+                claim: None,
             },
         );
 
