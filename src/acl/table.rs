@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::config::ServerConfig;
 use crate::protocol::Frame;
 
-use super::rules::{apply_rule, get_category_commands, hash_password, verify_password};
+use super::rules::{
+    AclRuleError, apply_rule, get_category_commands, hash_password, verify_password,
+};
+use super::subcommand::{clear_first_arg_rules, command_log_object, first_arg, permits};
 
 #[derive(Clone, Debug)]
 pub struct KeyPattern {
@@ -158,47 +161,97 @@ impl AclUser {
             && channels_unrestricted;
     }
 
-    pub fn allow_command(&mut self, rule: &str) {
-        if rule == "@all" {
+    /// Resolve the category named by a `+@x` / `-@x` rule.
+    ///
+    /// Split out so that **both** `allow_command` and `deny_command` resolve
+    /// before they touch `self`. That ordering is the #978 fix: the old code
+    /// resolved an unknown category to an empty slice and then mutated anyway.
+    fn resolve_category(rule: &str) -> Result<&'static [&'static str], AclRuleError> {
+        get_category_commands(rule)
+            .ok_or_else(|| AclRuleError::UnknownCategory(rule.trim_start_matches('@').to_string()))
+    }
+
+    /// Grant `rule` (a bare command, a `cmd|sub`, or `@category`).
+    ///
+    /// An unresolvable category returns `Err` and leaves `self` unchanged.
+    pub fn allow_command(&mut self, rule: &str) -> Result<(), AclRuleError> {
+        if rule.eq_ignore_ascii_case("@all") {
             self.allowed_commands = CommandPermissions::AllAllowed;
-            return;
+            return Ok(());
         }
+        // Resolve BEFORE the borrow of self.allowed_commands, so an unknown
+        // category bails out with nothing mutated.
+        let category = if rule.starts_with('@') {
+            Some(Self::resolve_category(rule)?)
+        } else {
+            None
+        };
         match &mut self.allowed_commands {
             CommandPermissions::AllAllowed => {} // already all allowed
             CommandPermissions::Specific {
                 allowed, denied, ..
             } => {
-                if rule.starts_with('@') {
-                    for cmd in get_category_commands(rule) {
+                if let Some(cmds) = category {
+                    for cmd in cmds {
                         allowed.insert(cmd.to_string());
                         denied.remove(*cmd);
                     }
-                } else if let Some(idx) = rule.find('|') {
-                    // subcommand: store as "cmd|sub"
-                    allowed.insert(rule[..idx].to_string() + "|" + &rule[idx + 1..]);
+                    clear_first_arg_rules(allowed, cmds);
+                    clear_first_arg_rules(denied, cmds);
                 } else {
-                    allowed.insert(rule.to_ascii_lowercase());
-                    denied.remove(&rule.to_ascii_lowercase());
+                    // `cmd` or `cmd|sub`, lowercased: the check lowercases
+                    // the incoming name before probing. A bare rule is newer
+                    // than every `cmd|*` rule, so it clears them (see
+                    // `acl::subcommand`); a `cmd|sub` rule replaces its own
+                    // opposite entry, or `-x|y +x|y` would stay denied.
+                    let rule = rule.to_ascii_lowercase();
+                    if !rule.contains('|') {
+                        clear_first_arg_rules(allowed, &[rule.as_str()]);
+                        clear_first_arg_rules(denied, &[rule.as_str()]);
+                    }
+                    denied.remove(&rule);
+                    allowed.insert(rule);
                 }
             }
         }
+        Ok(())
     }
 
-    pub fn deny_command(&mut self, rule: &str) {
-        if rule == "@all" {
+    /// Revoke `rule` (a bare command, a `cmd|sub`, or `@category`).
+    ///
+    /// An unresolvable category returns `Err` and leaves `self` unchanged.
+    ///
+    /// # #978
+    ///
+    /// The `AllAllowed` arm below rebuilds the permission set as
+    /// `Specific { base_allow: true, .. }`. That is correct *given* a resolved
+    /// category -- the user really did have everything, and is now losing one
+    /// category. It was catastrophic only because an unknown category reached
+    /// it with an empty command list, producing `base_allow: true` with an
+    /// empty `denied` set: every command allowed, reported by `ACL LIST` as
+    /// `-@all`. With `resolve_category` returning `Err` above, this arm is now
+    /// unreachable from an unknown category, and `denied` is non-empty for
+    /// every category Moon resolves.
+    pub fn deny_command(&mut self, rule: &str) -> Result<(), AclRuleError> {
+        if rule.eq_ignore_ascii_case("@all") {
             self.allowed_commands = CommandPermissions::Specific {
                 base_allow: false,
                 allowed: HashSet::new(),
                 denied: HashSet::new(),
             };
-            return;
+            return Ok(());
         }
+        let category = if rule.starts_with('@') {
+            Some(Self::resolve_category(rule)?)
+        } else {
+            None
+        };
         match &mut self.allowed_commands {
             CommandPermissions::AllAllowed => {
                 // Transition to Specific with everything allowed except this
                 let mut denied = HashSet::new();
-                if rule.starts_with('@') {
-                    for cmd in get_category_commands(rule) {
+                if let Some(cmds) = category {
+                    for cmd in cmds {
                         denied.insert(cmd.to_string());
                     }
                 } else {
@@ -213,41 +266,34 @@ impl AclUser {
             CommandPermissions::Specific {
                 allowed, denied, ..
             } => {
-                if rule.starts_with('@') {
-                    for cmd in get_category_commands(rule) {
+                if let Some(cmds) = category {
+                    for cmd in cmds {
                         denied.insert(cmd.to_string());
                         allowed.remove(*cmd);
                     }
+                    clear_first_arg_rules(allowed, cmds);
+                    clear_first_arg_rules(denied, cmds);
                 } else {
-                    denied.insert(rule.to_ascii_lowercase());
-                    allowed.remove(&rule.to_ascii_lowercase());
+                    let rule = rule.to_ascii_lowercase();
+                    if !rule.contains('|') {
+                        clear_first_arg_rules(allowed, &[rule.as_str()]);
+                        clear_first_arg_rules(denied, &[rule.as_str()]);
+                    }
+                    allowed.remove(&rule);
+                    denied.insert(rule);
                 }
             }
         }
+        Ok(())
     }
 
+    /// Verdict for `cmd` (bare) or `cmd|arg` (a subcommand or first-arg
+    /// invocation), with the same precedence the dispatch-time check uses.
     pub fn is_command_allowed(&self, cmd: &str) -> bool {
         let cmd_lower = cmd.to_ascii_lowercase();
-        match &self.allowed_commands {
-            CommandPermissions::AllAllowed => true,
-            CommandPermissions::Specific {
-                base_allow,
-                allowed,
-                denied,
-            } => {
-                // Deny takes precedence
-                if denied.contains(&cmd_lower) {
-                    return false;
-                }
-                // If explicitly allowed, permit
-                if allowed.contains(&cmd_lower) {
-                    return true;
-                }
-                // Neither set names this command, so the answer is the base
-                // polarity recorded when this `Specific` was created. Never
-                // inferred from set emptiness -- see the field comment.
-                *base_allow
-            }
+        match cmd_lower.split_once('|') {
+            Some((bare, arg)) => permits(&self.allowed_commands, bare, Some(arg.as_bytes())),
+            None => permits(&self.allowed_commands, &cmd_lower, None),
         }
     }
 }
@@ -374,20 +420,51 @@ impl AclTable {
         users
     }
 
-    /// Apply ACL SETUSER rules to create or modify a user.
-    /// Creates user if not exists (default-deny for new non-default users).
-    pub fn apply_setuser(&mut self, username: &str, rules: &[&str]) {
-        let user = self.users.entry(username.to_string()).or_insert_with(|| {
-            if username == "default" {
-                AclUser::new_default_nopass()
-            } else {
-                AclUser::default_deny(username.to_string())
-            }
-        });
+    /// Apply ACL SETUSER rules to create or modify a user, rejecting the whole
+    /// call if any rule is invalid (#978, #979).
+    ///
+    /// Validate-then-commit: the rules are applied to a **copy** of the user
+    /// (or a fresh default-deny user), and the copy replaces the stored user
+    /// only once every rule applied. A rejected `ACL SETUSER` therefore leaves
+    /// the table byte-identical -- matching `redis-server`, which neither
+    /// creates the user nor applies the prefix of the rule list that parsed.
+    /// Applying to a copy is what lets state-dependent rules (`<pw` for a
+    /// password the user does not hold) be reported as well as grammar
+    /// errors.
+    ///
+    /// Returns the offending rule alongside the error so the caller can build
+    /// redis's `Error in ACL SETUSER modifier '<rule>': ...` text.
+    pub fn try_apply_setuser<'r>(
+        &mut self,
+        username: &str,
+        rules: &[&'r str],
+    ) -> Result<(), (&'r str, AclRuleError)> {
+        let mut user = match self.users.get(username) {
+            Some(existing) => existing.clone(),
+            None if username == "default" => AclUser::new_default_nopass(),
+            None => AclUser::default_deny(username.to_string()),
+        };
         for rule in rules {
-            apply_rule(user, rule);
+            apply_rule(&mut user, rule).map_err(|err| (*rule, err))?;
         }
+        self.users.insert(username.to_string(), user);
         self.bump_version();
+        Ok(())
+    }
+
+    /// Test fixture: apply ACL SETUSER rules and PANIC if any is rejected.
+    ///
+    /// Test-only on purpose. Every production path reports to a client or a
+    /// log and must call [`Self::try_apply_setuser`]. A fixture that swallowed
+    /// the error would, under validate-then-commit, build NO user at all for a
+    /// list with one bad token, and every "is denied" assertion in that test
+    /// would then pass vacuously against an absent user.
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn apply_setuser(&mut self, username: &str, rules: &[&str]) {
+        if let Err((rule, err)) = self.try_apply_setuser(username, rules) {
+            panic!("test fixture rule {rule:?} for user {username:?} was rejected: {err}");
+        }
     }
 
     /// Authenticate username+password. Returns Some(username) on success, None on failure.
@@ -421,7 +498,7 @@ impl AclTable {
         &self,
         username: &str,
         cmd: &[u8],
-        _args: &[Frame],
+        args: &[Frame],
     ) -> Option<String> {
         // c10k hardening B2: an unknown user is DENIED, never allowed.
         // This used to be `self.users.get(username)?` - `None` means
@@ -444,10 +521,14 @@ impl AclTable {
             return Some(format!("User {} is disabled", username));
         }
         let cmd_str = std::str::from_utf8(cmd).unwrap_or("").to_ascii_lowercase();
-        if !user.is_command_allowed(&cmd_str) {
+        // `argv[1]` takes part: `-config|set` / `+select|0` rules are keyed on
+        // it. Probing the bare name alone let `+@all -config|set` run
+        // `CONFIG SET` (see `acl::subcommand`).
+        if !permits(&user.allowed_commands, &cmd_str, first_arg(args)) {
             return Some(format!(
                 "User {} has no permissions to run the '{}' command",
-                username, cmd_str
+                username,
+                command_log_object(cmd, args)
             ));
         }
         None
@@ -479,9 +560,15 @@ impl AclTable {
         if user.unrestricted {
             return None;
         }
-        if user.key_patterns.is_empty() {
-            return Some(format!("User {} has no key permissions", username));
-        }
+        // NOTE (#979): there used to be an early `key_patterns.is_empty()`
+        // deny here, ahead of the keyless-command check below. It made a user
+        // with no key patterns unable to run PING, DBSIZE or any other command
+        // that names no key -- redis gates only KEYED commands on key
+        // patterns (`RESETKEYS` then `FLUSHALL` is permitted there). The loop
+        // at the bottom already denies every keyed command when the pattern
+        // list is empty (`any` over nothing is false), so removing the early
+        // return loses no protection.
+        //
         // ~* (read+write) shortcut -- fast path for users that have
         // unrestricted keys but restricted commands (so `unrestricted`
         // above was false for other reasons).
@@ -588,8 +675,8 @@ mod tests {
     #[test]
     fn revoking_the_last_grant_of_a_restricted_user_does_not_escalate() {
         let mut user = AclUser::default_deny("u".to_string());
-        user.deny_command("@all");
-        user.allow_command("get");
+        user.deny_command("@all").expect("rule must apply");
+        user.allow_command("get").expect("rule must apply");
         assert!(
             user.is_command_allowed("get"),
             "precondition: +get took effect"
@@ -599,7 +686,7 @@ mod tests {
             "precondition: -@all still denies set"
         );
 
-        user.deny_command("get");
+        user.deny_command("get").expect("rule must apply");
 
         assert!(
             !user.is_command_allowed("get"),
@@ -623,8 +710,8 @@ mod tests {
     #[test]
     fn regranting_a_denied_command_restores_the_allow_all_base() {
         let mut user = AclUser::default_deny("u".to_string());
-        user.allow_command("@all");
-        user.deny_command("get");
+        user.allow_command("@all").expect("rule must apply");
+        user.deny_command("get").expect("rule must apply");
         assert!(
             !user.is_command_allowed("get"),
             "precondition: -get took effect"
@@ -634,7 +721,7 @@ mod tests {
             "precondition: +@all still allows set"
         );
 
-        user.allow_command("get");
+        user.allow_command("get").expect("rule must apply");
 
         assert!(
             user.is_command_allowed("get"),
@@ -653,10 +740,10 @@ mod tests {
     #[test]
     fn base_polarity_survives_repeated_flips() {
         let mut deny_based = AclUser::default_deny("d".to_string());
-        deny_based.deny_command("@all");
+        deny_based.deny_command("@all").expect("rule must apply");
         for _ in 0..3 {
-            deny_based.allow_command("get");
-            deny_based.deny_command("get");
+            deny_based.allow_command("get").expect("rule must apply");
+            deny_based.deny_command("get").expect("rule must apply");
         }
         assert!(
             !deny_based.is_command_allowed("set"),
@@ -664,10 +751,10 @@ mod tests {
         );
 
         let mut allow_based = AclUser::default_deny("a".to_string());
-        allow_based.allow_command("@all");
+        allow_based.allow_command("@all").expect("rule must apply");
         for _ in 0..3 {
-            allow_based.deny_command("get");
-            allow_based.allow_command("get");
+            allow_based.deny_command("get").expect("rule must apply");
+            allow_based.allow_command("get").expect("rule must apply");
         }
         assert!(
             allow_based.is_command_allowed("set"),
@@ -923,8 +1010,18 @@ mod tests {
 
         // -@transaction must cover Moon's MVCC TXN/TEMPORAL extensions the
         // same way it covers MULTI/EXEC.
+        //
+        // #980: these used to probe a bare `TEMPORAL`, which Moon does not
+        // dispatch at all -- `TEMPORAL` alone answers `ERR unknown command`.
+        // The category table matched that same phantom name, so the carve-out
+        // never covered either real command and this assertion could not fail.
+        // Probe what the connection handler actually accepts.
         table.apply_setuser("notxn", &["on", "nopass", "~*", "+@all", "-@transaction"]);
-        for cmd in [b"TXN".as_ref(), b"TEMPORAL".as_ref()] {
+        for cmd in [
+            b"TXN".as_ref(),
+            b"TEMPORAL.SNAPSHOT_AT".as_ref(),
+            b"TEMPORAL.INVALIDATE".as_ref(),
+        ] {
             assert!(
                 table
                     .check_command_permission("notxn", cmd, &args)
@@ -947,7 +1044,8 @@ mod tests {
         table.apply_setuser("full", &["on", "nopass", "~*", "+@all"]);
         for cmd in [
             b"TXN".as_ref(),
-            b"TEMPORAL".as_ref(),
+            b"TEMPORAL.SNAPSHOT_AT".as_ref(),
+            b"TEMPORAL.INVALIDATE".as_ref(),
             b"WS".as_ref(),
             b"MQ".as_ref(),
             b"CDC.READ".as_ref(),
@@ -1204,5 +1302,189 @@ mod tests {
         );
         assert!(table.get_user("bob").is_some());
         assert!(table.get_user("alice").is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // #979 -- validate-then-commit at the table layer, and enforcement of
+    // the tokens the parser used to drop, observed through the same
+    // `check_*_permission` calls the connection handler makes.
+    // ---------------------------------------------------------------
+
+    /// A bad token ANYWHERE in the list: no user created, no version bump,
+    /// no credential. Redis rejects the whole modifier list the same way.
+    #[test]
+    fn test_try_apply_setuser_is_atomic_for_a_new_user() {
+        let mut table = AclTable::new_empty();
+        let v0 = table.version();
+        let err = table
+            .try_apply_setuser("svc", &["on", ">pw", "~*", "&*", "+@all", "bogus"])
+            .expect_err("unknown token must reject the call");
+        assert_eq!(err, ("bogus", AclRuleError::Syntax));
+        assert!(table.get_user("svc").is_none(), "no user may be created");
+        assert!(
+            table.authenticate("svc", "pw").is_none(),
+            "no credential may exist"
+        );
+        assert_eq!(
+            table.version(),
+            v0,
+            "a rejected call must not bump the version"
+        );
+    }
+
+    /// The prefix that parsed (`off`, `nocommands`) must NOT be applied when
+    /// a later token fails, and the failure may be state-dependent (`<nope`)
+    /// -- which is why the rules run on a copy, not a pre-validation pass.
+    #[test]
+    fn test_try_apply_setuser_is_atomic_for_an_existing_user() {
+        let mut table = AclTable::new_empty();
+        table
+            .try_apply_setuser("svc", &["on", ">pw", "~*", "&*", "+@all"])
+            .expect("valid rules must apply");
+        let v1 = table.version();
+        let err = table
+            .try_apply_setuser("svc", &["off", "nocommands", "<nope"])
+            .expect_err("removing an absent password must reject the call");
+        assert_eq!(err, ("<nope", AclRuleError::NoSuchPassword));
+        let user = table.get_user("svc").expect("user still exists");
+        assert!(user.enabled, "`off` from the rejected call must not stick");
+        assert!(
+            user.is_command_allowed("flushall"),
+            "`nocommands` from the rejected call must not stick"
+        );
+        assert!(user.unrestricted());
+        assert_eq!(table.version(), v1);
+    }
+
+    /// A bad token LAST in the list still discards the whole call, not
+    /// "everything but the bad rule": the passwordless `+@all` prefix must not
+    /// be committed.
+    #[test]
+    fn test_try_apply_setuser_discards_the_whole_call_on_a_trailing_bad_rule() {
+        let mut table = AclTable::new_empty();
+        let err = table
+            .try_apply_setuser("svc", &["on", "nopass", "~*", "+@all", "nocommand"])
+            .expect_err("`nocommand` (no s) is not a keyword");
+        assert_eq!(err, ("nocommand", AclRuleError::Syntax));
+        assert!(table.get_user("svc").is_none());
+    }
+
+    /// The test fixture must fail LOUDLY on a rejected rule. If it swallowed
+    /// the error, a typo in a fixture would build no user and every denial
+    /// assertion in that test would pass against an absent user.
+    #[test]
+    #[should_panic(expected = "test fixture rule \"nocommand\"")]
+    fn test_apply_setuser_fixture_panics_on_a_rejected_rule() {
+        let mut table = AclTable::new_empty();
+        table.apply_setuser("svc", &["on", "nopass", "nocommand"]);
+    }
+
+    /// The #979 headline, end to end through the table: a `+@all` user is
+    /// locked down with the exact tokens an operator types in an emergency,
+    /// and each one is observed to DENY -- through `check_command_permission`
+    /// / `check_key_permission` / `check_channel_permission` / `authenticate`,
+    /// not through a flag read-back.
+    #[test]
+    fn test_revocation_tokens_are_enforced() {
+        fn full_table() -> AclTable {
+            let mut table = AclTable::new_empty();
+            table
+                .try_apply_setuser("svc", &["on", ">pw", "~*", "&*", "+@all"])
+                .expect("valid rules must apply");
+            assert!(table.is_user_unrestricted("svc"));
+            table
+        }
+        let key_args = [Frame::BulkString(Bytes::from_static(b"k"))];
+
+        // nocommands -> every command denied.
+        let mut t = full_table();
+        t.try_apply_setuser("svc", &["nocommands"])
+            .expect("must apply");
+        assert!(
+            t.check_command_permission("svc", b"FLUSHALL", &[])
+                .is_some()
+        );
+        assert!(t.check_command_permission("svc", b"PING", &[]).is_some());
+
+        // OFF -> cannot authenticate.
+        let mut t = full_table();
+        t.try_apply_setuser("svc", &["OFF"]).expect("must apply");
+        assert!(t.authenticate("svc", "pw").is_none());
+
+        // RESET -> cannot authenticate, and nothing is allowed.
+        let mut t = full_table();
+        t.try_apply_setuser("svc", &["RESET"]).expect("must apply");
+        assert!(t.authenticate("svc", "pw").is_none());
+        assert!(t.check_command_permission("svc", b"PING", &[]).is_some());
+
+        // RESETKEYS -> a key command is denied; a keyless one still runs.
+        let mut t = full_table();
+        t.try_apply_setuser("svc", &["RESETKEYS"])
+            .expect("must apply");
+        assert!(
+            t.check_key_permission("svc", b"SET", &key_args, true)
+                .is_some()
+        );
+        assert!(t.check_command_permission("svc", b"PING", &[]).is_none());
+
+        // RESETCHANNELS -> a channel is denied.
+        let mut t = full_table();
+        t.try_apply_setuser("svc", &["RESETCHANNELS"])
+            .expect("must apply");
+        assert!(t.check_channel_permission("svc", b"ch").is_some());
+
+        // RESETPASS -> the old password no longer authenticates.
+        let mut t = full_table();
+        t.try_apply_setuser("svc", &["RESETPASS"])
+            .expect("must apply");
+        assert!(t.authenticate("svc", "pw").is_none());
+
+        // -FLUSHALL (uppercase command) -> that command denied, others not.
+        let mut t = full_table();
+        t.try_apply_setuser("svc", &["-FLUSHALL"])
+            .expect("must apply");
+        assert!(
+            t.check_command_permission("svc", b"FLUSHALL", &[])
+                .is_some()
+        );
+        assert!(t.check_command_permission("svc", b"PING", &[]).is_none());
+
+        // nopass then >pw2 -> the wrong password AND the old one must FAIL
+        // (both fail-open before: nopass stayed set, and `pw` stayed stored).
+        let mut t = full_table();
+        t.try_apply_setuser("svc", &["nopass", ">pw2"])
+            .expect("must apply");
+        assert!(t.authenticate("svc", "wrong").is_none());
+        assert!(
+            t.authenticate("svc", "pw").is_none(),
+            "old credential must be gone"
+        );
+        assert!(t.authenticate("svc", "pw2").is_some());
+    }
+
+    /// The grant side: from nothing, the three `all*` keywords in upper case
+    /// build a fully unrestricted user.
+    #[test]
+    fn test_grant_keywords_are_enforced() {
+        let mut t = AclTable::new_empty();
+        t.try_apply_setuser("svc", &["on", ">pw"])
+            .expect("must apply");
+        let key_args = [Frame::BulkString(Bytes::from_static(b"k"))];
+        assert!(
+            t.check_command_permission("svc", b"SET", &key_args)
+                .is_some()
+        );
+        t.try_apply_setuser("svc", &["ALLKEYS", "ALLCOMMANDS", "ALLCHANNELS"])
+            .expect("must apply");
+        assert!(
+            t.check_command_permission("svc", b"SET", &key_args)
+                .is_none()
+        );
+        assert!(
+            t.check_key_permission("svc", b"SET", &key_args, true)
+                .is_none()
+        );
+        assert!(t.check_channel_permission("svc", b"ch").is_none());
+        assert!(t.is_user_unrestricted("svc"));
     }
 }

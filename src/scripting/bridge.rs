@@ -192,6 +192,11 @@ impl LuaEvictionCtx {
         let rt = inner.runtime_config.read();
         let budget = inner.shard_databases.elastic_budget(inner.shard_id);
         let mut on_plain_drop = |key: &[u8]| {
+            // moon#894: same body-order rule as `emit_effect`.
+            #[cfg(feature = "runtime-monoio")]
+            if capture_txn_del(db_index, key) {
+                return;
+            }
             #[cfg(feature = "runtime-monoio")]
             crate::replication::reason_del::record_reason_del_conn(
                 &inner.repl_state,
@@ -219,7 +224,7 @@ impl LuaEvictionCtx {
                     .budget(budget)
                     .report(&mut on_plain_drop),
             );
-            inner.spill_file_id.set(fid);
+            inner.spill_file_id.set(inner.spill_file_id.get().max(fid));
             res
         } else {
             evict_to_budget(
@@ -268,6 +273,11 @@ impl LuaEvictionCtx {
     /// derived from frame AND reply, so `redis.call('SPOP', k)` propagates as
     /// `SREM k <member>` and `redis.call('XADD', k, '*', …)` with its ID.
     fn emit_effect(&self, db_index: usize, cmd_and_args: &[Frame], reply: &Frame) {
+        // moon#894: inside a MULTI/EXEC body the effect joins the body's own
+        // record list, in order, instead of racing ahead of it.
+        if capture_txn_effect(db_index, cmd_and_args, reply) {
+            return;
+        }
         let Some(inner) = self.0.as_ref() else {
             return;
         };
@@ -281,6 +291,87 @@ impl LuaEvictionCtx {
             reply,
         );
     }
+}
+
+/// One captured durability record: the db it executed in, and its serialized
+/// command bytes (the same shape the MULTI/EXEC executor collects).
+pub(crate) type CapturedEffect = (usize, Bytes);
+
+thread_local! {
+    /// moon#894: while a MULTI/EXEC body runs a queued script, that script's
+    /// effect records land here instead of going straight to the AOF writer
+    /// and the replication stream.
+    ///
+    /// Outside a transaction a script emits each effect the moment its
+    /// `redis.call` succeeds, which is the right order because nothing else
+    /// runs on the shard meanwhile. Inside `EXEC` the body's OTHER writes are
+    /// collected and appended only after the whole body has run. A script
+    /// emitting directly would therefore put its effects AHEAD of the writes
+    /// queued before it: `SET k 1; EVAL "SET k 2"` would be logged `SET k 2;
+    /// SET k 1`, and a restart or a replica would read `1` where the master
+    /// answered `2`. Capturing puts the script's records into the body's list
+    /// at the script's own position.
+    ///
+    /// `None` outside a capture. Only the synchronous executor arms it, and
+    /// `capture_txn_effects` resets it on every exit path.
+    static TXN_EFFECT_CAPTURE: RefCell<Option<Vec<CapturedEffect>>> = const { RefCell::new(None) };
+}
+
+/// Run `run` with this thread's script-effect emission diverted into a
+/// buffer, and return that buffer in emission order (moon#894).
+///
+/// For the MULTI/EXEC executor only: `run` must be synchronous (no `.await`
+/// can happen inside a closure), so no other connection's script can
+/// interleave on this shard thread while the capture is armed.
+pub(crate) fn capture_txn_effects<R>(run: impl FnOnce() -> R) -> (R, Vec<CapturedEffect>) {
+    /// Disarms the capture even if `run` unwinds, so a panic cannot leave
+    /// every later script on this thread writing into a dead buffer.
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            TXN_EFFECT_CAPTURE.with(|c| c.borrow_mut().take());
+        }
+    }
+    TXN_EFFECT_CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    let disarm = Disarm;
+    let out = run();
+    let captured = TXN_EFFECT_CAPTURE
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_default();
+    drop(disarm);
+    (out, captured)
+}
+
+/// Record a script write effect into the armed capture. Returns `false`
+/// (nothing done) when no capture is armed.
+fn capture_txn_effect(db_index: usize, cmd_and_args: &[Frame], reply: &Frame) -> bool {
+    TXN_EFFECT_CAPTURE.with(|c| {
+        let mut slot = c.borrow_mut();
+        let Some(buf) = slot.as_mut() else {
+            return false;
+        };
+        let frame = Frame::Array(crate::protocol::FrameVec::from_vec(cmd_and_args.to_vec()));
+        // moon#825: frame AND reply, exactly as `record_effect_write` derives
+        // it. `None` means the reply proves nothing was written.
+        if let Some(bytes) = crate::persistence::aof::serialize_effect_for_log(&frame, reply) {
+            buf.push((db_index, bytes));
+        }
+        true
+    })
+}
+
+/// Record an eviction plain-drop `DEL` into the armed capture. Returns
+/// `false` when no capture is armed.
+#[cfg(feature = "runtime-monoio")]
+fn capture_txn_del(db_index: usize, key: &[u8]) -> bool {
+    TXN_EFFECT_CAPTURE.with(|c| {
+        let mut slot = c.borrow_mut();
+        let Some(buf) = slot.as_mut() else {
+            return false;
+        };
+        buf.push((db_index, crate::replication::reason_del::serialize_del(key)));
+        true
+    })
 }
 
 thread_local! {

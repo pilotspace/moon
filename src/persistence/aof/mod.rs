@@ -838,8 +838,35 @@ fn replay_aof_with_resync(
 
     // Detect RDB preamble: if the file starts with "MOON" magic, load the binary
     // RDB section first, then replay any RESP commands appended after it.
+    //
+    // The preamble load must not take the cold tier down with it.
+    // `rdb::load_from_bytes` builds fresh `Database::new()` temporaries and
+    // swaps them wholesale over the live ones (`*live = temp`), which drops
+    // `cold_shard_dir` and the `cold_index` Phase 3 just rebuilt from the
+    // shard manifest — live-tier topology the hot snapshot does not carry.
+    // Without this bracket a `--shards 1` restart after any `BGREWRITEAOF`
+    // came up with an EMPTY cold index and every spilled key read as an
+    // absent key. Same capture/restore as
+    // `aof_manifest::shard_replay::take_cold_wiring`, and for the same
+    // reason it is restored BEFORE the RESP tail below: replayed
+    // DEL/UNLINK/FLUSH*/EXPIRE-past must reach the cold plane, and with
+    // `cold_index == None` those paths are silent no-ops.
+    //
+    // This is `replay_aof`, which only ever replays THIS node's own log, so
+    // preserving is always correct here — unlike the generic `rdb::load`,
+    // which also serves replica full-sync and `DEBUG RELOAD` with a FOREIGN
+    // dataset whose values do not live in this node's cold files.
     let (rdb_keys, resp_start) = if data.starts_with(b"MOON") {
-        match crate::persistence::rdb::load_from_bytes(databases, &data) {
+        let cold_wiring: Vec<_> = databases
+            .iter_mut()
+            .map(|db| (db.cold_shard_dir.take(), db.cold_index.take()))
+            .collect();
+        let loaded = crate::persistence::rdb::load_from_bytes(databases, &data);
+        for (db, (cold_shard_dir, cold_index)) in databases.iter_mut().zip(cold_wiring) {
+            db.cold_shard_dir = cold_shard_dir;
+            db.cold_index = cold_index;
+        }
+        match loaded {
             Ok((keys, consumed)) => {
                 info!(
                     "AOF RDB preamble loaded: {} keys ({} bytes)",
@@ -1519,5 +1546,77 @@ mod tests {
         record_everysec_fsync_result(61, true);
         assert!(aof_last_fsync_ok());
         assert_eq!(AOF_FSYNC_FAILURES.load(Ordering::Relaxed), before + 1);
+    }
+
+    /// An AOF that opens with an RDB preamble (what `BGREWRITEAOF` writes in
+    /// the legacy single-file layout) must NOT take the cold tier down with
+    /// it. `rdb::load_from_bytes` swaps a fresh `Database` over each live one
+    /// (`*live = temp`), and `cold_index` / `cold_shard_dir` are live-tier
+    /// topology that the hot snapshot does not carry — so the swap used to
+    /// silently drop the index recovery had just rebuilt from the manifest,
+    /// and every spilled key then read as an ABSENT key.
+    #[test]
+    fn rdb_preamble_replay_keeps_the_rebuilt_cold_index() {
+        use crate::persistence::kv_page::ValueType;
+        use crate::storage::tiered::cold_index::{ColdIndex, ColdLocation};
+
+        let dir = tempdir().unwrap();
+        let aof_path = dir.path().join("preamble.aof");
+
+        // A base RDB holding one hot key, then a RESP tail — exactly the
+        // shape `rewrite_aof` leaves behind.
+        let mut hot = vec![Database::new()];
+        hot[0].set(b"hot:key", Entry::new_string(Bytes::from_static(b"v")));
+        let mut blob = crate::persistence::rdb::save_to_bytes(&hot).unwrap();
+        let mut tail = BytesMut::new();
+        serialize::serialize(&make_command(&[b"SET", b"tail:key", b"t"]), &mut tail);
+        blob.extend_from_slice(&tail);
+        std::fs::write(&aof_path, &blob).unwrap();
+
+        // The live database as recovery leaves it: a cold index rebuilt from
+        // the shard manifest, wired to its shard dir.
+        let mut cold = ColdIndex::new();
+        cold.insert(
+            Bytes::from_static(b"spilled:key"),
+            ColdLocation {
+                file_id: 1,
+                page_idx: 0,
+                slot_idx: 0,
+                ttl_ms: None,
+                value_type: ValueType::String,
+            },
+        );
+        let mut dbs = vec![Database::new()];
+        dbs[0].cold_shard_dir = Some(dir.path().to_path_buf());
+        dbs[0].cold_index = Some(cold);
+
+        replay_aof(&mut dbs, &aof_path, &DispatchReplayEngine::new()).unwrap();
+
+        assert!(
+            dbs[0].get(b"hot:key").is_some(),
+            "the RDB preamble must still load its hot keys"
+        );
+        assert!(
+            dbs[0].get(b"tail:key").is_some(),
+            "the RESP tail after the preamble must still replay"
+        );
+        assert_eq!(
+            dbs[0].cold_shard_dir.as_deref(),
+            Some(dir.path()),
+            "the RDB preamble swap must not unwire the cold tier"
+        );
+        let ci = dbs[0]
+            .cold_index
+            .as_ref()
+            .expect("the rebuilt cold index must survive the RDB preamble swap");
+        assert_eq!(
+            ci.len(),
+            1,
+            "the rebuilt cold index must survive the RDB preamble swap with its entries"
+        );
+        assert!(
+            ci.lookup(b"spilled:key").is_some(),
+            "the spilled key must still resolve after the preamble load"
+        );
     }
 }

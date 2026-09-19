@@ -686,7 +686,9 @@ impl super::Shard {
                 std::fs::create_dir_all(&shard_dir).ok();
                 let manifest_path = shard_dir.join(format!("shard-{}.manifest", shard_id));
                 if manifest_path.exists() {
-                    match crate::persistence::manifest::ShardManifest::open(&manifest_path) {
+                    match crate::persistence::manifest::ShardManifest::open_repairing_torn_create(
+                        &manifest_path,
+                    ) {
                         Ok(m) => Some(m),
                         Err(e) => {
                             tracing::warn!("Shard {}: shard manifest open failed: {}", shard_id, e);
@@ -793,18 +795,40 @@ impl super::Shard {
             .clone()
             .map(|base| base.join(format!("shard-{}", shard_id)));
 
-        // B-2: resume the spill file_id counter ABOVE every recovered
-        // `heap-*.mpf`. Without this the counter restarts at 1 each boot and
-        // post-restart re-eviction overwrites cold files the rebuilt cold_index
-        // still points at, silently corrupting post-crash cold read-through.
-        // Fresh server / disk-offload off → seed 1 (unchanged from before).
-        let spill_seed =
-            crate::storage::eviction::next_spill_file_id_seed(disk_offload_dir.as_deref());
+        // B-2 / moon#997 / moon#893: resume the file_id counter — shared by
+        // KV spill files and warm vector segments — above EVERY id in use, or
+        // a restart re-mints a live `heap-*.mpf` / `segment-*` name. The
+        // startup gate (`Shard::prove_spill_file_id_seed`, run by `main` and
+        // the embedded server) proved the seed and refused to start if it
+        // could not. A shard reaching here without that gate proves it now,
+        // under the same fail-closed rule. Disk-offload off → 1: no cold
+        // file can exist.
+        let spill_seed = match (self.spill_file_id_seed, disk_offload_dir.as_deref()) {
+            (Some(seed), _) => seed,
+            (None, None) => 1,
+            (None, Some(dir)) => {
+                match crate::storage::tiered::file_id_seed::next_file_id_seed(dir, shard_id) {
+                    Ok(seed) => seed,
+                    Err(e) => {
+                        tracing::error!(
+                            "REFUSING TO START: shard {}: {} — a guessed cold file_id could \
+                             overwrite or tombstone live cold data",
+                            shard_id,
+                            e
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+        };
+        // The shard's ONE cold file_id counter: every consumer allocates from
+        // it through `file_id_seed::allocate_from` — there is no second copy
+        // to fall behind it (moon#997 review).
         spill_file_id.set(spill_seed);
-        let mut next_file_id: u64 = spill_seed;
         if spill_seed > 1 {
             info!(
-                "Shard {}: spill file_id counter seeded at {} from recovered cold files",
+                "Shard {}: cold file_id counter seeded at {} (above every spill file, \
+                 warm segment and manifest entry in use)",
                 shard_id, spill_seed
             );
         }
@@ -1058,6 +1082,13 @@ impl super::Shard {
         let mut pending_cdc_subscribes: Vec<crate::shard::dispatch::CdcSubscribePayload> =
             Vec::new();
 
+        // moon#982: this shard's sampler + metric-handle cache for the commands
+        // it executes on behalf of OTHER shards' connections (the SPSC execute
+        // arms). Lives for the whole event loop so the 1-in-16 cadence counts
+        // across drain cycles, like a connection's sampler counts across batches.
+        let mut spsc_sampler = crate::admin::metrics_setup::CommandSampler::new();
+        let mut spsc_metrics = crate::admin::metrics_setup::CachedMetricsHandles::new();
+
         // Per-shard VectorStore: use the SHARED instance from ShardDatabases.
         // This ensures handler_sharded FT.* commands and SPSC auto-indexing
         // (triggered by HSET) operate on the SAME VectorStore.
@@ -1307,6 +1338,8 @@ impl super::Shard {
                         spill_sender.as_ref(),
                         &spill_file_id,
                         disk_offload_dir.as_deref(),
+                        &mut spsc_sampler,
+                        &mut spsc_metrics,
                     );
                     if hit_cap {
                         // M3: capped drain may have left a tail — re-arm immediately
@@ -1397,8 +1430,6 @@ impl super::Shard {
                 // Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll
                 _ = periodic_interval.0.tick() => {
                     cached_clock.update();
-                    // Sync file ID from shared Cell (handlers may have incremented it)
-                    next_file_id = next_file_id.max(spill_file_id.get());
 
                     let mut pending_snapshot = None;
                     // No outer with_shard — each arm takes its own flat borrow.
@@ -1426,6 +1457,8 @@ impl super::Shard {
                         spill_sender.as_ref(),
                         &spill_file_id,
                         disk_offload_dir.as_deref(),
+                        &mut spsc_sampler,
+                        &mut spsc_metrics,
                     );
                     if hit_cap {
                         // M3: capped drain may have left a tail — re-arm immediately
@@ -1685,7 +1718,7 @@ impl super::Shard {
                                     manifest,
                                     server_config.segment_warm_after,
                                     server_config.engine_offload_idle_secs,
-                                    &mut next_file_id,
+                                    &spill_file_id,
                                     shard_id,
                                     &mut wal_writer,
                                 );
@@ -1767,7 +1800,6 @@ impl super::Shard {
                         &server_config,
                         &runtime_config,
                         &page_cache,
-                        &mut next_file_id,
                         &mut wal_writer,
                         &script_cache_rc,
                         &lua_rc,
@@ -2206,6 +2238,8 @@ impl super::Shard {
                     spill_sender.as_ref(),
                     &spill_file_id,
                     disk_offload_dir.as_deref(),
+                    &mut spsc_sampler,
+                    &mut spsc_metrics,
                 );
                 if hit_cap {
                     // M3: the drain stopped at its per-cycle cap (or a snapshot
@@ -2304,7 +2338,6 @@ impl super::Shard {
                 // 10 idle) so the counter keeps counting nominal milliseconds.
                 monoio_tick_counter = monoio_tick_counter.wrapping_add(idle_park.counter_step());
                 cached_clock.update();
-                next_file_id = next_file_id.max(spill_file_id.get());
 
                 persistence_tick::check_auto_save_trigger(
                     &snapshot_trigger_rx,
@@ -2452,7 +2485,6 @@ impl super::Shard {
                         &server_config,
                         &runtime_config,
                         &page_cache,
-                        &mut next_file_id,
                         &mut wal_writer,
                         &script_cache_rc,
                         &lua_rc,
@@ -2585,7 +2617,7 @@ impl super::Shard {
                                     manifest,
                                     server_config.segment_warm_after,
                                     server_config.engine_offload_idle_secs,
-                                    &mut next_file_id,
+                                    &spill_file_id,
                                     shard_id,
                                     &mut wal_writer,
                                 );

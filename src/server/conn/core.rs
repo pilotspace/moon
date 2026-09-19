@@ -331,13 +331,15 @@ pub(crate) struct ConnectionState {
     pub affinity_tracker: Option<AffinityTracker>,
     pub migration_target: Option<usize>,
 
-    /// Per-connection command counter used for 1-in-N latency sampling on the
-    /// hot dispatch path. Wraps on overflow. Sampling avoids the ~30–40 ns
-    /// `Instant::now()` tax per command while still producing statistically
-    /// accurate latency histograms. Slowlog coverage degrades to 1/16 but
-    /// only matters when threshold <~ expected per-op latency; default 10 ms
-    /// threshold effectively never fires on pipelined workloads regardless.
-    pub cmd_counter: u32,
+    /// Per-connection 1-in-16 latency sampler for the hot dispatch path.
+    /// Sampling avoids the ~30–40 ns `Instant::now()` tax per command while
+    /// still producing statistically accurate latency histograms. Slowlog
+    /// coverage degrades to 1/16 but only matters when threshold <~ expected
+    /// per-op latency; default 10 ms threshold effectively never fires on
+    /// pipelined workloads regardless. The counter is private to the sampler:
+    /// every handler times a command through `LatencyProbe::observe`
+    /// (moon#941, moon#963), never by re-deriving the cadence here.
+    pub sampler: crate::admin::metrics_setup::CommandSampler,
 
     /// Cached Prometheus metric handles for the most recently executed
     /// command on this connection. A cache hit skips the recorder backend's
@@ -418,7 +420,7 @@ impl ConnectionState {
                 None
             },
             migration_target: None,
-            cmd_counter: 0,
+            sampler: crate::admin::metrics_setup::CommandSampler::new(),
             cached_metrics: crate::admin::metrics_setup::CachedMetricsHandles::new(),
             cached_acl_unrestricted: false,
             cached_acl_version: 0,
@@ -528,6 +530,36 @@ impl ConnectionState {
     pub fn mark_cross_txn_rejected(&mut self, cmd: &[u8]) {
         if let Some(txn) = self.active_cross_txn.as_mut() {
             txn.record_rejected_op(cmd);
+        }
+    }
+
+    /// Redis's `flagTransaction`: a command was REFUSED while a transaction is
+    /// open, so `EXEC` must abort the whole block. A no-op outside `MULTI`, so
+    /// a refusal site never has to re-check `in_multi` itself.
+    ///
+    /// moon#1035: every ACL refusal must call this. A command denied inside
+    /// `MULTI` used to be answered `NOPERM` and simply not queued, so `EXEC`
+    /// then applied the rest. Measured against redis-server 8.6.1 with a
+    /// `-flushall` user:
+    ///
+    /// ```text
+    /// MULTI / SET mx 1 / FLUSHALL / EXEC
+    ///   redis -> -NOPERM, then -EXECABORT     (mx unset)
+    ///   moon  -> -NOPERM, then *1 +OK         (mx set)
+    /// ```
+    ///
+    /// Redis's `rejectCommand` flags the transaction for EVERY rejection inside
+    /// `MULTI` — command, subcommand, key or channel — without asking why the
+    /// check failed, and the ACL gates call this the same way: on the verdict
+    /// of `check_command_permission(user, cmd, args)` and its siblings. A rule
+    /// those learn to enforce later (per-subcommand `-config|set`) poisons the
+    /// transaction with no change here.
+    ///
+    /// Cleared, like every other queue-time fault, by EXEC, DISCARD and RESET.
+    #[inline]
+    pub fn flag_transaction(&mut self) {
+        if self.in_multi {
+            self.multi_dirty = true;
         }
     }
 

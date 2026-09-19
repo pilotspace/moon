@@ -92,6 +92,7 @@ pub fn write_kv_spill_pages(
     let data_dir = shard_dir.join("data");
     std::fs::create_dir_all(&data_dir)?;
     let file_path = data_dir.join(format!("heap-{file_id:06}.mpf"));
+    refuse_to_replace(&file_path)?;
 
     if pages.overflow.is_empty() {
         write_datafile(&file_path, &[&pages.leaf])?;
@@ -440,6 +441,7 @@ pub fn write_kv_spill_batch(shard_dir: &Path, file_id: u64, batch: &BatchPages) 
 
     let final_path = data_dir.join(format!("heap-{file_id:06}.mpf"));
     let tmp_path = data_dir.join(format!("heap-{file_id:06}.tmp"));
+    refuse_to_replace(&final_path)?;
 
     {
         let mut file = std::fs::File::create(&tmp_path)?;
@@ -456,6 +458,39 @@ pub fn write_kv_spill_batch(shard_dir: &Path, file_id: u64, batch: &BatchPages) 
 
     let total_pages = batch.pages.len() as u64;
     Ok(total_pages * PAGE_4K as u64)
+}
+
+/// A spill never replaces an existing `heap-*.mpf` (moon#997).
+///
+/// Both writers finish with a rename (`atomic_write_durable` / the batch's own
+/// temp+rename), and a POSIX rename silently replaces its target. The restart
+/// seed puts every new id above every file on disk, so an existing file under
+/// the name means the counter re-issued an id that is still live — overwriting
+/// it destroys every key the cold index points into it. Refusing turns that
+/// into a failed spill, which both spill paths already handle by keeping the
+/// values hot (the async path counts it in `spill_failed_reinserted`). One
+/// `lstat` per spill file.
+///
+/// Two writers exist per shard — the background spill thread and the
+/// event-loop's durable batch (`eviction::evict_batch_durable`) — and a file
+/// is named after its batch's first id. Both draw ids from the shard's ONE
+/// counter (`file_id_seed::allocate_from`, never moved backwards), so no two
+/// batches share a first id and the check-then-rename window has no second
+/// writer for the same name. This check is the backstop if that invariant is
+/// ever broken again: the loser fails its spill instead of replacing a file.
+/// It cannot stop two writers racing on the same `.tmp`; the one counter does.
+fn refuse_to_replace(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to overwrite existing spill file {} (file_id re-issued)",
+                path.display()
+            ),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Startup sweep of crash-orphaned heap files in `{shard_dir}/data`.
@@ -1008,6 +1043,42 @@ mod tests {
         }
     }
 
+    /// moon#997: a re-issued file_id must fail the spill, never rename over the
+    /// live file — through both writers.
+    #[test]
+    fn test_spill_writers_refuse_to_replace_an_existing_heap_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let file_id = 12u64;
+        let live = build_kv_spill_batch(&make_inline_entries(3), file_id).unwrap();
+        write_kv_spill_batch(shard_dir, file_id, &live).unwrap();
+        let path = shard_dir
+            .join("data")
+            .join(format!("heap-{file_id:06}.mpf"));
+        let before = std::fs::read(&path).unwrap();
+
+        let other = build_kv_spill_batch(&make_inline_entries(1), file_id).unwrap();
+        let err = write_kv_spill_batch(shard_dir, file_id, &other).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            !shard_dir
+                .join("data")
+                .join(format!("heap-{file_id:06}.tmp"))
+                .exists(),
+            "the refused batch must not leave a .tmp behind"
+        );
+
+        let pages = build_kv_spill_pages(b"k", b"v", ValueType::String, 0, None, file_id).unwrap();
+        let err = write_kv_spill_pages(shard_dir, file_id, &pages).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the live heap file must be byte-identical after both refusals"
+        );
+    }
+
     /// write_kv_spill_batch must produce an atomic file and
     /// read_cold_entry_at must recover every entry by (page_idx, slot_idx).
     #[test]
@@ -1267,6 +1338,143 @@ mod tests {
         assert_eq!(
             bulk.referenced_file_count(),
             by_hand.referenced_file_count()
+        );
+    }
+
+    /// moon#983: the duplicate-key winner is decided by `file_id`, never by
+    /// where the file sits in the manifest.
+    ///
+    /// The sibling test above pushes the older file first, so "last in
+    /// manifest order" and "highest file_id" agree and it cannot tell the two
+    /// rules apart. Here the NEWER file (higher id, the re-spill) is pushed
+    /// FIRST — the shape a `CONFIG SET appendonly` flip produces when an
+    /// async completion lands after a durable batch was already committed —
+    /// and the rebuilt index must still point at the higher `file_id`.
+    /// Pre-fix this resolved `dup` to file 401 and cold read-through served
+    /// the superseded value after every restart.
+    ///
+    /// Second shape, same rule one level down: one FILE holding the same key
+    /// twice (two requests for a key that was overwritten while its first
+    /// spill request sat in the flush buffer) must resolve to the later
+    /// `(page_idx, slot_idx)`.
+    #[test]
+    fn test_983_rebuild_duplicate_key_resolves_by_file_id_not_manifest_order() {
+        use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
+        use crate::persistence::page::PageType;
+        use crate::storage::tiered::cold_index::ColdIndex;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+
+        // Written to disk in id order (401 is genuinely the older spill),
+        // but REGISTERED newest-first. Both Active — no sweep ran.
+        for (file_id, keys) in [(401u64, vec!["dup", "only-in-401"]), (402u64, vec!["dup"])] {
+            let entries: Vec<SpillEntry> = keys
+                .iter()
+                .map(|k| SpillEntry {
+                    key: Bytes::from(k.to_string()),
+                    value_bytes: Bytes::from(format!("v-from-{file_id}")),
+                    value_type: ValueType::String,
+                    flags: 0,
+                    ttl_ms: None,
+                })
+                .collect();
+            let batch = build_kv_spill_batch(&entries, file_id).unwrap();
+            write_kv_spill_batch(shard_dir, file_id, &batch).unwrap();
+        }
+        for file_id in [402u64, 401] {
+            let byte_size = std::fs::metadata(
+                shard_dir
+                    .join("data")
+                    .join(format!("heap-{file_id:06}.mpf")),
+            )
+            .unwrap()
+            .len();
+            manifest.add_file(FileEntry {
+                file_id,
+                file_type: PageType::KvLeaf as u8,
+                status: FileStatus::Active,
+                tier: StorageTier::Hot,
+                page_size_log2: 12,
+                page_count: (byte_size / crate::persistence::page::PAGE_4K as u64) as u32,
+                byte_size,
+                created_lsn: 0,
+                db_index: 0,
+                max_key_hash: 0,
+                last_modified_lsn: 0,
+            });
+        }
+        manifest.commit().unwrap();
+        let ids: Vec<u64> = manifest.files().iter().map(|e| e.file_id).collect();
+        assert_eq!(
+            ids,
+            vec![402, 401],
+            "precondition: manifest order is newest-first"
+        );
+
+        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &manifest);
+        assert_eq!(per_db.len(), 1, "one db");
+        let index = per_db.remove(0).1;
+        assert_eq!(index.len(), 2, "`dup` is one key, not two");
+        assert_eq!(
+            index.lookup(b"dup").map(|l| l.file_id),
+            Some(402),
+            "the HIGHER file_id must win the duplicate key regardless of manifest order"
+        );
+        assert_eq!(
+            index.lookup(b"only-in-401").map(|l| l.file_id),
+            Some(401),
+            "file 401's un-superseded key survives"
+        );
+        assert_eq!(index.referenced_file_count(), 2);
+        assert_eq!(index.pending_unlink_len(), 0);
+
+        // Same key twice in ONE file: later slot wins.
+        let manifest_path2 = shard_dir.join("shard2.manifest");
+        let mut m2 = ShardManifest::create(&manifest_path2).unwrap();
+        let entries: Vec<SpillEntry> = ["twice", "twice"]
+            .iter()
+            .enumerate()
+            .map(|(i, k)| SpillEntry {
+                key: Bytes::from(k.to_string()),
+                value_bytes: Bytes::from(format!("copy-{i}")),
+                value_type: ValueType::String,
+                flags: 0,
+                ttl_ms: None,
+            })
+            .collect();
+        let batch = build_kv_spill_batch(&entries, 403).unwrap();
+        assert_eq!(batch.locations.len(), 2, "both copies packed");
+        let later = *batch.locations.last().unwrap();
+        assert!(
+            later > batch.locations[0],
+            "precondition: the second copy lands at a later (page, slot)"
+        );
+        let byte_size = write_kv_spill_batch(shard_dir, 403, &batch).unwrap();
+        m2.add_file(FileEntry {
+            file_id: 403,
+            file_type: PageType::KvLeaf as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Hot,
+            page_size_log2: 12,
+            page_count: batch.pages.len() as u32,
+            byte_size,
+            created_lsn: 0,
+            db_index: 0,
+            max_key_hash: 0,
+            last_modified_lsn: 0,
+        });
+        m2.commit().unwrap();
+        let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &m2);
+        let index = per_db.remove(0).1;
+        assert_eq!(index.len(), 1);
+        let loc = index.lookup(b"twice").unwrap();
+        assert_eq!(
+            (loc.page_idx, loc.slot_idx),
+            later,
+            "within one file the later (page_idx, slot_idx) copy must win"
         );
     }
 

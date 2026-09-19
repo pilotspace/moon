@@ -158,6 +158,15 @@ pub(super) fn try_handle_cluster(
         return false;
     }
     if let Some(ref cs) = ctx.cluster_state {
+        // moon#1015: refuse before `handle_cluster_command` relabels this node
+        // as a replica and before the role flip / epoch bump below.
+        if crate::cluster::command::is_cluster_replicate(cmd_args)
+            && let Some(refusal) =
+                crate::replication::replica::replica_start_refusal(ctx.num_shards)
+        {
+            responses.push(refusal);
+            return true;
+        }
         #[allow(clippy::unwrap_used)] // Fallback "127.0.0.1:6379" is a valid literal
         let self_addr: std::net::SocketAddr = format!("127.0.0.1:{}", ctx.config_port)
             .parse()
@@ -428,34 +437,17 @@ pub(super) fn try_handle_cluster_routing(
             }
         }
 
-        // CROSSSLOT check for multi-key commands
-        if is_multi_key_command(cmd, cmd_args) {
-            let first_slot = slot;
-            let mut cross_slot = false;
-            // COPY's keys are exactly args[0..2]; trailing args are the
-            // REPLACE literal, which must not be slot-checked.
-            let key_args: &[Frame] = if cmd.eq_ignore_ascii_case(b"COPY") {
-                &cmd_args[..cmd_args.len().min(2)]
-            } else {
-                cmd_args
-            };
-            for arg in key_args.iter().skip(1) {
-                if let Some(k) = match arg {
-                    Frame::BulkString(b) => Some(b.as_ref()),
-                    _ => None,
-                } {
-                    if crate::cluster::slots::slot_for_key(k) != first_slot {
-                        cross_slot = true;
-                        break;
-                    }
-                }
-            }
-            if cross_slot {
-                responses.push(Frame::Error(Bytes::from_static(
-                    b"CROSSSLOT Keys in request don't hash to the same slot",
-                )));
-                return true;
-            }
+        // CROSSSLOT check for multi-key commands. moon#1012: only KEY
+        // positions are slot-checked — `MSET {t}a x {t}b y` is one slot, and
+        // `x`/`y` are values. `keys_span_slots` reads the positions from the
+        // shared key walker; the sharded handler calls the same function.
+        if is_multi_key_command(cmd, cmd_args)
+            && crate::cluster::slots::keys_span_slots(cmd, cmd_args, slot)
+        {
+            responses.push(Frame::Error(Bytes::from_static(
+                b"CROSSSLOT Keys in request don't hash to the same slot",
+            )));
+            return true;
         }
     }
     false
@@ -614,6 +606,15 @@ pub(super) fn try_handle_replicaof(
     }
     use crate::command::connection::{ReplicaofAction, replicaof};
     let (resp, action) = replicaof(cmd_args);
+    // moon#1015: a multi-shard node cannot run the replica task. Refuse here,
+    // BEFORE the role flip and the epoch bump below — acking `+OK` first left
+    // the node read-only, killed any running replica task, and never synced.
+    if matches!(action, Some(ReplicaofAction::StartReplication { .. }))
+        && let Some(refusal) = crate::replication::replica::replica_start_refusal(ctx.num_shards)
+    {
+        responses.push(refusal);
+        return true;
+    }
     if let Some(action) = action {
         if let Some(ref rs) = ctx.repl_state {
             match action {
@@ -1526,7 +1527,7 @@ pub(super) fn try_enforce_acl(
         drop(acl_guard);
         conn.acl_log.push(crate::acl::AclLogEntry {
             reason: "command".to_string(),
-            object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
+            object: crate::acl::subcommand::command_log_object(cmd, cmd_args),
             username: conn.current_user.clone(),
             client_addr: peer_addr.to_string(),
             timestamp_ms: std::time::SystemTime::now()
@@ -1534,6 +1535,8 @@ pub(super) fn try_enforce_acl(
                 .unwrap_or_default()
                 .as_millis() as u64,
         });
+        // moon#1035: inside MULTI a refusal poisons the block (EXECABORT).
+        conn.flag_transaction();
         responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
         return true;
     }
@@ -1554,6 +1557,8 @@ pub(super) fn try_enforce_acl(
                 .unwrap_or_default()
                 .as_millis() as u64,
         });
+        // moon#1035: a denied KEY poisons an open transaction too.
+        conn.flag_transaction();
         responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
         return true;
     }
@@ -1581,6 +1586,15 @@ pub(super) async fn try_handle_functions(
     if conn.in_multi {
         return false;
     }
+    // Every name this gate claims is tested HERE, at the top, before the
+    // FUNCTION arm's body. The intercept-gate scanners
+    // (`names_claimed_by_gates` in `shared.rs`'s tests and in
+    // `tests/intercept_flag_drift.rs`) read only a gate's opening region, and
+    // `FCALL`/`FCALL_RO` used to be compared ~1.2 KB further down — past that
+    // window — so neither scanner knew this gate claims them, and a
+    // `NO_INTERCEPT` mark on `FCALL` would have skipped this gate unnoticed.
+    let is_fcall = cmd.eq_ignore_ascii_case(b"FCALL");
+    let is_fcall_ro = cmd.eq_ignore_ascii_case(b"FCALL_RO");
     if cmd.eq_ignore_ascii_case(b"FUNCTION") {
         crate::server::conn::core::ensure_function_registry(func_registry, ctx);
         // Borrow scoped to this block, and released before the fan-out await.
@@ -1609,8 +1623,7 @@ pub(super) async fn try_handle_functions(
         responses.push(response);
         return true;
     }
-    let is_fcall = cmd.eq_ignore_ascii_case(b"FCALL");
-    if is_fcall || cmd.eq_ignore_ascii_case(b"FCALL_RO") {
+    if is_fcall || is_fcall_ro {
         // moon#569: FCALL bodies are ACL-gated per `redis.call`, same as
         // EVAL. Resolved BEFORE routing so the same identity is used whether
         // the call runs here or on the shard that owns the key — routing must
