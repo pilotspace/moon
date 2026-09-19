@@ -3175,6 +3175,52 @@ assert_eq "pubsub: commands pipelined after RESET run (moon#1090)" \
     "$(pipelined_transcript "$PORT_RUST" "$TRK_RESET_PIPE")"
 
 # ---------------------------------------------------------------------------
+# moon#1105 -- CLIENT INFO of a subscribed connection, and RESET sent from
+# RESP2 subscriber mode. Measured on redis 8.6.1: a RESP3 subscriber is
+# `flags=P sub=1 psub=0 ssub=0 resp=3` (moon: `flags=S sub=0 resp=2`; `S` is
+# redis's REPLICA flag), and RESET from RESP2 subscriber mode returns to db 0,
+# tracking off and no name (moon kept all three). One write per case; only
+# the fields below are compared (id, addr, age differ by nature).
+# ---------------------------------------------------------------------------
+client_state_fields() {
+    local port="$1" payload="$2" line="" seen=""
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf '%s' "$payload" >&3
+    while IFS= read -r -t 1 line <&3; do
+        seen="${seen}${line%$'\r'} "
+    done
+    exec 3>&-
+    grep -oE ' (flags|db|sub|psub|ssub|redir|resp|name)=[^ ]*' <<< "$seen" | tr -d '\n' || true
+}
+CS_RESP3_SUB=$'HELLO 3\r\nSUBSCRIBE {cs}:x\r\nCLIENT INFO\r\n'
+CS_RESP3_ALL=$'HELLO 3\r\nSUBSCRIBE {cs}:x\r\nPSUBSCRIBE {cs}:p*\r\nSSUBSCRIBE {cs}:s\r\nCLIENT INFO\r\n'
+CS_RESP3_NONE=$'HELLO 3\r\nCLIENT INFO\r\n'
+CS_RESET_RESP2=$'SELECT 3\r\nCLIENT TRACKING on\r\nCLIENT SETNAME nm\r\nSUBSCRIBE {cs}:x\r\nRESET\r\nCLIENT INFO\r\n'
+CS_RESET_RESP3=$'HELLO 3\r\nSELECT 3\r\nCLIENT TRACKING on\r\nSSUBSCRIBE {cs}:s\r\nRESET\r\nCLIENT INFO\r\n'
+for cs_case in CS_RESP3_SUB CS_RESP3_ALL CS_RESP3_NONE CS_RESET_RESP2 CS_RESET_RESP3; do
+    assert_eq "CLIENT INFO subscriber state [$cs_case] (moon#1105)" \
+        "$(client_state_fields "$PORT_REDIS" "${!cs_case}")" \
+        "$(client_state_fields "$PORT_RUST" "${!cs_case}")"
+done
+# RESET must drop every namespace: a RESP3 shard subscription left behind was
+# still counted by SPUBLISH.
+reset_leftover_receivers() {
+    local port="$1" sub="$2" pub="$3" line="" n=""
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'HELLO 3\r\n%s {cs}:left\r\nRESET\r\n' "$sub" >&3
+    while IFS= read -r -t 1 line <&3; do :; done
+    n=$(redis-cli -p "$port" "$pub" '{cs}:left' hi 2>&1 || true)
+    exec 3>&-
+    echo "$n"
+}
+assert_eq "RESET drops a RESP3 SSUBSCRIBE (moon#1105)" \
+    "$(reset_leftover_receivers "$PORT_REDIS" SSUBSCRIBE SPUBLISH)" \
+    "$(reset_leftover_receivers "$PORT_RUST" SSUBSCRIBE SPUBLISH)"
+assert_eq "RESET drops a RESP3 SUBSCRIBE (moon#1105)" \
+    "$(reset_leftover_receivers "$PORT_REDIS" SUBSCRIBE PUBLISH)" \
+    "$(reset_leftover_receivers "$PORT_RUST" SUBSCRIBE PUBLISH)"
+
+# ---------------------------------------------------------------------------
 # moon#1078 -- CLIENT INFO reports tracking: `flags=t` (plus `B` for BCAST)
 # and `redir=` (0 with no redirect, -1 with tracking off). Moon hard-coded
 # `flags=N redir=-1`. Only those two fields are compared.
