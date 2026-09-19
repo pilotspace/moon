@@ -422,6 +422,7 @@ pub async fn handle_connection(
                                         );
                                         if !matches!(&response, Frame::Error(_)) {
                                             framed.codec_mut().set_protocol_version(new_proto);
+                                            conn.set_protocol_version(new_proto);
                                         }
                                         if let Some(name) = new_name {
                                             conn.client_name = Some(name);
@@ -608,6 +609,7 @@ pub async fn handle_connection(
                                 // CRITICAL: Set protocol version BEFORE sending response (Pitfall 6)
                                 if !matches!(&response, Frame::Error(_)) {
                                     framed.codec_mut().set_protocol_version(new_proto);
+                                    conn.set_protocol_version(new_proto);
                                 }
                                 if let Some(name) = new_name {
                                     conn.client_name = Some(name);
@@ -664,6 +666,7 @@ pub async fn handle_connection(
                             // CRITICAL: Set protocol version BEFORE sending response (Pitfall 6)
                             if !matches!(&response, Frame::Error(_)) {
                                 framed.codec_mut().set_protocol_version(new_proto);
+                                conn.set_protocol_version(new_proto);
                             }
                             if let Some(name) = new_name {
                                 conn.client_name = Some(name);
@@ -722,6 +725,12 @@ pub async fn handle_connection(
                                         &mut conn.tracking_state,
                                         &mut conn.tracking_rx,
                                         &tracking_table,
+                                        crate::tracking::client_cmd::QueueSpec {
+                                            cap_bytes: runtime_config
+                                                .read()
+                                                .client_output_buffer_limit_normal,
+                                            resp3: framed.codec().protocol_version() >= 3,
+                                        },
                                     ) {
                                         responses.push(reply);
                                         continue;
@@ -3155,8 +3164,8 @@ pub async fn handle_connection(
             }
             // Deliver tracking invalidation Push frames to client
             msg = async {
-                if let Some(ref mut rx) = conn.tracking_rx {
-                    rx.recv_async().await.ok()
+                if let Some(ref rx) = conn.tracking_rx {
+                    rx.recv().await
                 } else {
                     std::future::pending().await
                 }

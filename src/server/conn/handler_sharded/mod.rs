@@ -712,7 +712,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         responses.len(),
                                         new_proto,
                                     );
-                                    conn.protocol_version = new_proto;
+                                    conn.set_protocol_version(new_proto);
                                 }
                                 if let Some(name) = new_name {
                                     conn.client_name = Some(name);
@@ -1235,7 +1235,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                         let script_acl = crate::acl::ScriptAcl::for_user(
                             &ctx.acl_table,
                             &conn.current_user,
-                        );
+                        )
+                        .with_caller(conn.tracking_state.script_caller(conn.client_id));
                         if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
                             cmd,
                             cmd_args,
@@ -1464,7 +1465,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                             let script_acl = crate::acl::ScriptAcl::for_user(
                                 &ctx.acl_table,
                                 &conn.current_user,
-                            );
+                            )
+                            .with_caller(conn.tracking_state.script_caller(conn.client_id));
                             // moon#514 defect 1 (== moon#508): route to the
                             // shard owning the key instead of refusing
                             // CROSSSLOT because the key is not local. Same
@@ -3584,21 +3586,22 @@ pub(crate) async fn handle_connection_sharded_inner<
             // off — zero cost for non-tracking connections.
             push = async {
                 match conn.tracking_rx {
-                    Some(ref rx) => rx.recv_async().await.ok(),
+                    Some(ref rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
             } => {
                 // A RESP2 connection cannot carry a push; redis writes it
                 // nothing (its invalidations reach it only as a REDIRECT
-                // target, through the pub/sub channel).
-                if let Some(push_frame) = push.filter(|_| {
-                    crate::tracking::client_cmd::push_deliverable(conn.protocol_version)
-                }) {
-                    write_buf.clear();
-                    crate::protocol::serialize_resp3(&push_frame, &mut write_buf);
-                    if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) {
-                        break;
-                    }
+                // target, through the pub/sub channel). `coalesce` consumes
+                // the queued frames either way, and batches a burst into one
+                // write for a RESP3 connection.
+                let deliverable =
+                    crate::tracking::client_cmd::push_deliverable(conn.protocol_version);
+                if let (Some(push_frame), Some(trx)) = (push, conn.tracking_rx.as_ref())
+                    && let Some(push_bytes) = trx.coalesce(push_frame, deliverable)
+                    && !write_all_bounded!(stream, &push_bytes, write_timeout, out_cap_normal, client_live, client_id)
+                {
+                    break;
                 }
             }
             _ = shutdown.cancelled() => {
