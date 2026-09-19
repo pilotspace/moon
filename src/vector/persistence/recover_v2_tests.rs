@@ -479,36 +479,8 @@ fn recover_finish_tombstones_keys_missing_from_rescan() {
 
     let tmp = tempfile::tempdir().unwrap();
     let dim = 8usize;
-
-    let mut store = VectorStore::new();
-    store.set_persist_dir(tmp.path().to_path_buf());
-    let meta = make_meta("idx", dim as u32, "doc:");
-    store.create_index(meta.clone()).unwrap();
-
     let n = 5usize;
-    for i in 0..n {
-        let key = format!("doc:{i}");
-        let blob = f32_blob(dim, i as u32 + 1);
-        let args = vec![
-            Frame::BulkString(Bytes::from(key.clone())),
-            Frame::BulkString(Bytes::from_static(b"vec")),
-            Frame::BulkString(blob),
-        ];
-        let _ = crate::shard::spsc_handler::auto_index_hset_public(
-            &mut store,
-            &mut TextStore::new(),
-            key.as_bytes(),
-            &args,
-            0,
-        );
-    }
-    {
-        let idx = store.get_index_mut(b"idx").unwrap();
-        idx.force_compact();
-    }
-    let idx_dir = manifest::index_persist_dir(tmp.path(), b"idx");
-    wait_for_manifest(&idx_dir)
-        .expect("manifest must land within the timeout via global_snapshot_pool()");
+    let (meta, _store) = persist_docs(tmp.path(), dim, n);
 
     // Recover into a FRESH store, but only rescan n-1 of the n keys —
     // "doc:3" is simulated as deleted from the keyspace between restarts
@@ -566,6 +538,64 @@ fn recover_finish_tombstones_keys_missing_from_rescan() {
         n - 1,
         "the other n-1 keys (all observed) must remain indexed"
     );
+}
+
+/// A key the rescan knows exists but could not read (an unreadable cold-tier
+/// entry) is observed without being reconciled: `finish()` must keep its
+/// recovered document, not take the read fault for a delete.
+#[test]
+fn recover_finish_keeps_a_key_whose_payload_could_not_be_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (meta, _store) = persist_docs(tmp.path(), 8, 3);
+
+    let mut fresh = VectorStore::new();
+    fresh.set_persist_dir(tmp.path().to_path_buf());
+    let mut state = RecoveryState::new();
+    state.create_index(&mut fresh, tmp.path(), &meta);
+    state.snapshot_recovered_baseline(&fresh);
+
+    let text_store = TextStore::new();
+    for i in 0..3 {
+        state.observe_unreadable(&fresh, &text_store, format!("doc:{i}").as_bytes(), 0);
+    }
+    state.finish(&mut fresh, tmp.path());
+
+    let idx = fresh.get_index(b"idx").unwrap();
+    assert_eq!(
+        idx.key_hash_to_global_id.len(),
+        3,
+        "an observed-but-unreadable key must keep its recovered document"
+    );
+}
+
+/// Index `doc:0..n` into a persisted HOT segment under `root`, and wait for
+/// its manifest. Returns the index definition and the (still live) store.
+fn persist_docs(root: &std::path::Path, dim: usize, n: usize) -> (IndexMeta, VectorStore) {
+    use crate::protocol::Frame;
+
+    let mut store = VectorStore::new();
+    store.set_persist_dir(root.to_path_buf());
+    let meta = make_meta("idx", dim as u32, "doc:");
+    store.create_index(meta.clone()).unwrap();
+    for i in 0..n {
+        let key = format!("doc:{i}");
+        let args = vec![
+            Frame::BulkString(Bytes::from(key.clone())),
+            Frame::BulkString(Bytes::from_static(b"vec")),
+            Frame::BulkString(f32_blob(dim, i as u32 + 1)),
+        ];
+        let _ = crate::shard::spsc_handler::auto_index_hset_public(
+            &mut store,
+            &mut TextStore::new(),
+            key.as_bytes(),
+            &args,
+            0,
+        );
+    }
+    store.get_index_mut(b"idx").unwrap().force_compact();
+    wait_for_manifest(&manifest::index_persist_dir(root, b"idx"))
+        .expect("manifest must land within the timeout via global_snapshot_pool()");
+    (meta, store)
 }
 
 #[cfg(test)]

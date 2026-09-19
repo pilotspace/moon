@@ -3040,56 +3040,40 @@ async fn recover_indexes_task(
             }
         }
         for db_idx in 0..db_count {
-            let collect_matching =
-                |db: &crate::storage::Database| -> Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> {
-                    let mut matching: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = Vec::new();
-                    for (key, entry) in db.data().iter() {
+            // Every live indexed hash must be observed here: the deletion
+            // probe after this walk tombstones any recovered document whose
+            // key it did not see. Hot keys are captured now; keys that live
+            // only in the KV cold tier are listed now and read slice by slice
+            // below (moon#1074). See `shard::recovery_rescan`.
+            let scan_started = std::time::Instant::now();
+            let now_ms = crate::storage::entry::current_time_ms();
+            let (matching, cold) = crate::shard::slice::with_shard_db(db_idx, |db| {
+                let hot: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = db
+                    .data()
+                    .iter()
+                    .filter_map(|(key, entry)| {
                         let key_bytes = key.as_bytes();
                         if !rescan_prefixes.any_matching(key_bytes) {
-                            continue;
+                            return None;
                         }
-                        let mut args = Vec::new();
-                        args.push(crate::protocol::Frame::BulkString(
-                            bytes::Bytes::copy_from_slice(key_bytes),
-                        ));
-                        match entry.as_redis_value() {
-                            crate::storage::compact_value::RedisValueRef::Hash(map) => {
-                                for (field, value) in map.iter() {
-                                    args.push(crate::protocol::Frame::BulkString(
-                                        bytes::Bytes::copy_from_slice(field),
-                                    ));
-                                    args.push(crate::protocol::Frame::BulkString(
-                                        bytes::Bytes::copy_from_slice(value),
-                                    ));
-                                }
-                            }
-                            crate::storage::compact_value::RedisValueRef::HashListpack(lp) => {
-                                let entries: Vec<_> = lp.iter().collect();
-                                let mut j = 0;
-                                while j + 1 < entries.len() {
-                                    args.push(crate::protocol::Frame::BulkString(
-                                        bytes::Bytes::from(entries[j].as_bytes()),
-                                    ));
-                                    args.push(crate::protocol::Frame::BulkString(
-                                        bytes::Bytes::from(entries[j + 1].as_bytes()),
-                                    ));
-                                    j += 2;
-                                }
-                            }
-                            _ => continue,
-                        }
-                        if args.len() > 1 {
-                            matching.push((key_bytes.to_vec(), args));
-                        }
-                    }
-                    matching
-                };
-            let scan_started = std::time::Instant::now();
-            let matching =
-                { crate::shard::slice::with_shard_db(db_idx, |db| collect_matching(db)) };
+                        crate::shard::recovery_rescan::hash_rescan_args(
+                            key_bytes,
+                            entry.as_redis_value(),
+                            now_ms,
+                        )
+                        .map(|args| (key_bytes.to_vec(), args))
+                    })
+                    .collect();
+                let cold =
+                    crate::shard::recovery_rescan::ColdCandidates::collect(db, &rescan_prefixes);
+                (hot, cold)
+            });
+            let hot_in_db = matching.len();
+            let cold_in_db = cold.as_ref().map_or(0, |c| c.len());
 
-            if !matching.is_empty() {
-                let total_in_db = matching.len();
+            if hot_in_db + cold_in_db > 0 {
+                let total_in_db = hot_in_db + cold_in_db;
+
                 // The scan is its own phase: it used to be silently folded
                 // into the first progress line's "elapsed", which is how a
                 // live instance's cumulative keys/s read 10x below its
@@ -3098,9 +3082,16 @@ async fn recover_indexes_task(
                     "Shard {}: recovery scanned db {}: {} key(s) match an index prefix ({:.2?})",
                     shard_id,
                     db_idx,
-                    total_in_db,
+                    hot_in_db,
                     scan_started.elapsed()
                 );
+                if cold_in_db > 0 {
+                    info!(
+                        "Shard {}: recovery found db {}: {} more key(s) in the cold tier \
+                         match an index prefix; reading them",
+                        shard_id, db_idx, cold_in_db
+                    );
+                }
                 // moon#476: `with_shard` takes a SYNCHRONOUS closure, so
                 // an `.await` cannot live inside it. Slicing lets the
                 // task yield BETWEEN slices while each slice still runs
@@ -3128,7 +3119,6 @@ async fn recover_indexes_task(
                     crate::shard::slice::with_shard(|s| {
                         let slice_started = std::time::Instant::now();
                         while done_in_db < total_in_db {
-                            let (key, args) = &matching[done_in_db];
                             // B3 dedup rescan: verifies each matching
                             // key against any recovered durable state
                             // (manifest/segment/keymap) before deciding
@@ -3136,13 +3126,36 @@ async fn recover_indexes_task(
                             // no durable state (fresh/no manifest) fall
                             // through to the same full-rescan behavior
                             // this replaced. See `recover_v2` docs.
-                            recovery_state.reconcile_key(
-                                &mut s.vector_store,
-                                &mut s.text_store,
-                                key,
-                                args,
-                                db_idx as u8,
-                            );
+                            if let Some((key, args)) = matching.get(done_in_db) {
+                                recovery_state.reconcile_key(
+                                    &mut s.vector_store,
+                                    &mut s.text_store,
+                                    key,
+                                    args,
+                                    db_idx as u8,
+                                );
+                            } else if let Some((key, read)) = cold
+                                .as_ref()
+                                .and_then(|c| c.read(done_in_db - hot_in_db, now_ms))
+                            {
+                                use crate::shard::recovery_rescan::ColdRescan;
+                                match read {
+                                    ColdRescan::Hash(args) => recovery_state.reconcile_key(
+                                        &mut s.vector_store,
+                                        &mut s.text_store,
+                                        key,
+                                        &args,
+                                        db_idx as u8,
+                                    ),
+                                    ColdRescan::Unreadable => recovery_state.observe_unreadable(
+                                        &s.vector_store,
+                                        &s.text_store,
+                                        key,
+                                        db_idx as u8,
+                                    ),
+                                    ColdRescan::Absent => {}
+                                }
+                            }
                             reindexed += 1;
                             done_in_db += 1;
                             // Counter gate first: a recovery that finishes

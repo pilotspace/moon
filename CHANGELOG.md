@@ -199,6 +199,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A restart no longer drops vector documents whose hash is in the cold tier
+  or carries a field TTL** (moon#1074). At boot, index recovery walks the
+  keyspace, and any recovered document whose key the walk did not see is
+  deleted as "removed while the server was down". The walk read only the hot
+  table, and within it skipped the per-field-TTL hash encoding. So every
+  document whose HASH `allkeys-lru` eviction had spilled to the cold tier, and
+  every document that had had `HEXPIRE` applied to one of its fields, dropped
+  out of `FT.SEARCH` after a restart, while `EXISTS`/`HGETALL` still returned
+  the key. Measured on a 300-document index pushed to the cold tier: 299-300
+  of 300 documents were unfindable after a clean restart, and 294-295 of 300
+  after `kill -9` (the rest were hot at boot). A cold document that was still in the mutable segment at
+  shutdown was never re-indexed at all. The walk now reads cold-tier hashes
+  from disk (one page read per key, in file order) and reads field-TTL hashes
+  without their expired fields. A cold entry that cannot be read keeps its
+  recovered document: a read fault is not a delete. Text indexes loaded from
+  `.tpost` are reconciled by the same walk.
 - **A write is logged in the order it was applied, even when it waits after
   applying** (moon#1084). Three paths applied a write, awaited something, and
   only then appended it to the AOF (and, on monoio, to the replication

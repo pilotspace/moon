@@ -22,6 +22,7 @@ pub mod mesh;
 pub(crate) mod mq_exec;
 pub mod numa;
 pub mod persistence_tick;
+pub(crate) mod recovery_rescan;
 pub mod remote_subscriber_map;
 #[cfg(feature = "text-index")]
 pub mod scatter_aggregate;
