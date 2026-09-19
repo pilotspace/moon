@@ -2749,15 +2749,19 @@ if should_run "vector"; then
     # `set -euo pipefail` that killed the run outright -- on a clean machine
     # the FIRST of these (nothing to kill yet) aborted the script before
     # NUMERIC-07, so MQ, txn_kv, eviction and the RESULT SUMMARY never ran.
-    pkill -f 'moon --port 6411' 2>/dev/null || true
-    pkill -f 'moon --port 6414' 2>/dev/null || true
+    # A previous aborted run's servers are found by THIS row's temp-dir names,
+    # not by the binary name: `MOON_BIN` can point at any file, and a pattern
+    # like 'moon --port 6411' never matches e.g. `moon-v0.8.9 --port 6411`.
+    pkill -f 'moon-n7-[14][.]' 2>/dev/null || true
     sleep 1
     # Fresh dirs here too -- these two would otherwise reload `nidx` from the
     # repo root and report a cross-shard "match" that came from disk.
     N7_DIR1=$(mktemp -d "${TMPDIR:-/tmp}/moon-n7-1.XXXXXX")
     N7_DIR2=$(mktemp -d "${TMPDIR:-/tmp}/moon-n7-4.XXXXXX")
-    ./target/release/moon --port 6411 --shards 1 --protected-mode no --dir "$N7_DIR1" --disk-free-min-pct 0 > /tmp/moon-6411.log 2>&1 &
-    ./target/release/moon --port 6414 --shards 4 --protected-mode no --dir "$N7_DIR2" --disk-free-min-pct 0 > /tmp/moon-6414.log 2>&1 &
+    "$RUST_BINARY" --port 6411 --shards 1 --protected-mode no --dir "$N7_DIR1" --disk-free-min-pct 0 > /tmp/moon-6411.log 2>&1 &
+    N7_PID1=$!
+    "$RUST_BINARY" --port 6414 --shards 4 --protected-mode no --dir "$N7_DIR2" --disk-free-min-pct 0 > /tmp/moon-6414.log 2>&1 &
+    N7_PID2=$!
     sleep 2
     for PORT in 6411 6414; do
         redis-cli -p $PORT FT.CREATE nidx ON HASH PREFIX 1 n: SCHEMA status TAG score NUMERIC > /dev/null 2>&1 || true
@@ -2780,8 +2784,10 @@ if should_run "vector"; then
     # `set -euo pipefail` that killed the run outright -- on a clean machine
     # the FIRST of these (nothing to kill yet) aborted the script before
     # NUMERIC-07, so MQ, txn_kv, eviction and the RESULT SUMMARY never ran.
-    pkill -f 'moon --port 6411' 2>/dev/null || true
-    pkill -f 'moon --port 6414' 2>/dev/null || true
+    # Kill exactly the two servers this row started. The old name-based pkill
+    # silently missed any `MOON_BIN` not literally named `moon` and leaked both.
+    kill "$N7_PID1" "$N7_PID2" 2>/dev/null || true
+    wait "$N7_PID1" "$N7_PID2" 2>/dev/null || true
 
     echo "  ft_aggregate: done"
 fi
