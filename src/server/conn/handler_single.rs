@@ -244,6 +244,17 @@ pub async fn handle_connection(
                 qbuf_limit,
                 qbuf_preauth,
             ));
+        // CLIENT TRACKING REDIRECT inbox: registered only while subscribed,
+        // framed for the current protocol. Every UNSUBSCRIBE, RESET and HELLO
+        // path has run by here, before the connection waits again.
+        crate::tracking::client_cmd::sync_inbox(
+            &mut conn.tracking_inbox,
+            conn.subscription_count > 0,
+            framed.codec().protocol_version() >= 3,
+            conn.pubsub_tx.as_ref(),
+            client_id,
+            &tracking_table,
+        );
         // Subscriber mode: bidirectional select on client commands + published messages
         if conn.subscription_count > 0 {
             #[allow(clippy::unwrap_used)]
@@ -1339,17 +1350,20 @@ pub async fn handle_connection(
                                 if conn.pubsub_tx.is_none() {
                                     let (tx, rx) = channel::mpsc_bounded::<Bytes>(256);
                                     conn.subscriber_id = pubsub::next_subscriber_id();
-                                    // A subscribed connection can be a CLIENT
-                                    // TRACKING REDIRECT target (moon#1048).
-                                    conn.tracking_inbox = Some(crate::tracking::client_cmd::register_inbox(
-                                        client_id,
-                                        &tx,
-                                        framed.codec().protocol_version() >= 3,
-                                        &tracking_table,
-                                    ));
                                     conn.pubsub_tx = Some(tx);
                                     conn.pubsub_rx = Some(rx);
                                 }
+                                // A subscribed connection can be a CLIENT
+                                // TRACKING REDIRECT target (moon#1048):
+                                // reachable before its `subscribe` reply.
+                                crate::tracking::client_cmd::sync_inbox(
+                                    &mut conn.tracking_inbox,
+                                    true,
+                                    framed.codec().protocol_version() >= 3,
+                                    conn.pubsub_tx.as_ref(),
+                                    client_id,
+                                    &tracking_table,
+                                );
                                 let is_pattern = cmd.eq_ignore_ascii_case(b"PSUBSCRIBE");
                                 for arg in cmd_args {
                                     if let Some(channel_or_pattern) = extract_bytes(arg) {
@@ -1551,7 +1565,12 @@ pub async fn handle_connection(
                                             &conn.command_queue,
                                             txn_results,
                                             client_id,
-                                            &conn.tracking_state,
+                                            // This handler runs CLIENT above its
+                                            // MULTI gate (see `execute_transaction`),
+                                            // so no CLIENT command is queued and
+                                            // the modes at EXEC are the body's.
+                                            conn.tracking_state.modes(),
+                                            conn.tracking_state.enabled,
                                         );
                                     }
                                 }

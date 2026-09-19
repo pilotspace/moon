@@ -548,6 +548,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
             break;
         }
 
+        // CLIENT TRACKING REDIRECT inbox: registered only while subscribed,
+        // framed for the current protocol. Every UNSUBSCRIBE, RESET and HELLO
+        // path has run by here, before the connection waits again.
+        conn.sync_tracking_inbox(&ctx.tracking_table);
+
         // Subscriber mode: bidirectional select on client commands + published messages.
         //
         // RESP2 ONLY. Under RESP3 a subscribed connection stays in the normal

@@ -218,7 +218,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     open `MULTI`, and is consumed by anything else — an unknown command
     included.
   - Reads inside `MULTI`/`EXEC` are now tracked, as redis tracks them; before
-    this only a transaction's writes invalidated.
+    this only a transaction's writes invalidated. Each read is tracked under
+    the modes in force at its own position in the body: a `CLIENT CACHING`
+    queued mid-body covers only the commands after it, and a
+    `CLIENT TRACKING on` queued in the body tracks the reads after it — on
+    the local and the routed EXEC path alike.
+  - A REDIRECT target's invalidations are framed for the protocol it speaks
+    now (a `HELLO` or `RESET` since it first subscribed is honoured), and a
+    target that has unsubscribed from everything gets nothing, as in redis,
+    instead of collecting invalidations that its next `SUBSCRIBE` replayed.
   - `CLIENT TRACKING` option errors now follow redis: an unknown option is
     `syntax error`, `OPTIN` with `OPTOUT` and either with `BCAST` are refused,
     switching OPTIN/OPTOUT or BCAST without turning tracking off first is
@@ -233,7 +241,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Known gap: a RESP3 redirect target that neither subscribed nor enabled
     tracking itself cannot be reached (redis pushes to it); giving every
     connection a delivery channel would cost every idle connection its park
-    (moon#1078).
+    (moon#1078). Also still open: a burst of more than 256 invalidations to
+    one connection drops the excess silently (moon#1088), and writes and
+    reads made by scripts are invisible to tracking (moon#1089).
 
 - **`ZRANGE`, `ZREVRANGE` and `ZRANGESTORE` no longer clamp a still-negative
   STOP to 0** (moon#1001). Redis's rank-window rule only clamps a

@@ -196,17 +196,20 @@ pub(super) async fn try_handle_subscribe_entry<S: monoio::io::AsyncWriteRent>(
     // Allocate pubsub channel if not yet created
     if conn.pubsub_tx.is_none() {
         let (tx, rx) = crate::runtime::channel::mpsc_bounded::<bytes::Bytes>(256);
-        // A subscribed connection can be a CLIENT TRACKING REDIRECT target
-        // (moon#1048): make its channel reachable by client id.
-        conn.tracking_inbox = Some(crate::tracking::client_cmd::register_inbox(
-            conn.client_id,
-            &tx,
-            conn.protocol_version >= 3,
-            &ctx.tracking_table,
-        ));
         conn.pubsub_tx = Some(tx);
         conn.pubsub_rx = Some(rx);
     }
+    // A subscribed connection can be a CLIENT TRACKING REDIRECT target
+    // (moon#1048): reachable by client id before its `subscribe` reply is
+    // written, framed for the protocol it subscribes under.
+    crate::tracking::client_cmd::sync_inbox(
+        &mut conn.tracking_inbox,
+        true,
+        conn.protocol_version >= 3,
+        conn.pubsub_tx.as_ref(),
+        conn.client_id,
+        &ctx.tracking_table,
+    );
     if conn.subscriber_id == 0 {
         conn.subscriber_id = crate::pubsub::next_subscriber_id();
     }

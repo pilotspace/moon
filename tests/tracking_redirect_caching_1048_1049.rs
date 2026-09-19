@@ -941,6 +941,297 @@ fn caching_in_transaction_4_shards() {
     caching_in_transaction("4");
 }
 
+/// Hash tags for the transaction cases. At `--shards 4` some land on the
+/// connection's own shard (the body runs locally) and some on another (the
+/// body is routed to the owner), so both EXEC paths are exercised.
+const TXN_TAGS: usize = 8;
+
+/// A `CLIENT CACHING` queued in the MIDDLE of a transaction covers only the
+/// commands after it (redis 8.6.1, per key):
+///
+/// | mode   | body                                          | pushed      |
+/// |--------|-----------------------------------------------|-------------|
+/// | OPTOUT | `GET {t}:a / CLIENT CACHING no  / GET {t}:b`  | `{t}:a` only |
+/// | OPTIN  | `GET {t}:a / CLIENT CACHING yes / GET {t}:b`  | `{t}:b` only |
+///
+/// Moon applied the queued flag to the whole body: OPTOUT went silent on
+/// `{t}:a` (a client caching it stays stale forever) and OPTIN tracked
+/// `{t}:a` spuriously.
+fn caching_mid_transaction(shards: &str) {
+    let m = spawn_moon(shards);
+    let mut failures = Vec::new();
+    for (mode, word, tracked, untracked) in [("OPTOUT", "no", "a", "b"), ("OPTIN", "yes", "b", "a")]
+    {
+        let mut delivered_positive = 0;
+        for t in 0..TXN_TAGS {
+            let mut c = Resp::connect(m.port);
+            c.cmd(&["HELLO", "3"]);
+            assert_eq!(
+                c.reply(&["CLIENT", "TRACKING", "on", mode]),
+                b"+OK\r\n".to_vec()
+            );
+            let mut w = Resp::connect(m.port);
+            let key = |s: &str| format!("{{mid{mode}{t}}}:{s}");
+            let (a, b) = (key("a"), key("b"));
+            w.cmd(&["MSET", &a, "1", &b, "2"]);
+            c.cmd(&["MULTI"]);
+            c.cmd(&["GET", &a]);
+            c.cmd(&["CLIENT", "CACHING", word]);
+            c.cmd(&["GET", &b]);
+            let reply = c.reply(&["EXEC"]);
+            if reply != b"*3\r\n$1\r\n1\r\n+OK\r\n$1\r\n2\r\n".to_vec() {
+                failures.push(format!(
+                    "{mode} tag {t}: EXEC reply {:?}",
+                    String::from_utf8_lossy(&reply)
+                ));
+                continue;
+            }
+            let (pos, neg) = (key(tracked), key(untracked));
+            // The untracked key is written FIRST, so by the time the tracked
+            // key's push has arrived its push would have had every chance.
+            w.cmd(&["SET", &neg, "x"]);
+            w.cmd(&["SET", &pos, "x"]);
+            let got = delivered(
+                &mut c,
+                std::slice::from_ref(&pos),
+                push_for,
+                Duration::from_secs(3),
+            );
+            delivered_positive += got;
+            c.pump(Duration::from_millis(300));
+            if c.saw(&push_for(&neg)) {
+                failures.push(format!(
+                    "{mode} tag {t}: {neg} is untracked in redis 8.6.1 but was pushed. \
+                     wire: {:?}",
+                    String::from_utf8_lossy(&c.buf)
+                ));
+            }
+        }
+        if delivered_positive * 2 <= TXN_TAGS {
+            failures.push(format!(
+                "{mode}: the tracked key ({{t}}:{tracked}) was pushed for only \
+                 {delivered_positive}/{TXN_TAGS} tags (redis 8.6.1 pushes every one)"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "--shards {shards}:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn caching_mid_transaction_1_shard() {
+    caching_mid_transaction("1");
+}
+
+#[test]
+fn caching_mid_transaction_4_shards() {
+    caching_mid_transaction("4");
+}
+
+/// `MULTI / CLIENT TRACKING on / GET k / EXEC` tracks `k` (redis 8.6.1). On
+/// the routed EXEC path moon bookkept the body BEFORE the queued TRACKING on
+/// had run, so nothing was tracked.
+fn tracking_on_inside_transaction(shards: &str) {
+    let m = spawn_moon(shards);
+    let mut w = Resp::connect(m.port);
+    let mut got = 0;
+    let mut wire = String::new();
+    for t in 0..TXN_TAGS {
+        let mut c = Resp::connect(m.port);
+        c.cmd(&["HELLO", "3"]);
+        let k = format!("{{oni{t}}}:k");
+        w.cmd(&["SET", &k, "1"]);
+        c.cmd(&["MULTI"]);
+        c.cmd(&["CLIENT", "TRACKING", "on"]);
+        c.cmd(&["GET", &k]);
+        assert_eq!(
+            c.reply(&["EXEC"]),
+            b"*2\r\n+OK\r\n$1\r\n1\r\n".to_vec(),
+            "--shards {shards} tag {t}"
+        );
+        w.cmd(&["SET", &k, "2"]);
+        let one = delivered(
+            &mut c,
+            std::slice::from_ref(&k),
+            push_for,
+            Duration::from_secs(3),
+        );
+        if one == 0 {
+            wire.push_str(&format!("tag {t}: {:?}\n", String::from_utf8_lossy(&c.buf)));
+        }
+        got += one;
+    }
+    assert!(
+        got * 2 > TXN_TAGS,
+        "--shards {shards}: only {got}/{TXN_TAGS} transactions that enabled tracking \
+         had their read tracked (redis 8.6.1: every one)\n{wire}"
+    );
+}
+
+#[test]
+fn tracking_on_inside_transaction_1_shard() {
+    tracking_on_inside_transaction("1");
+}
+
+#[test]
+fn tracking_on_inside_transaction_4_shards() {
+    tracking_on_inside_transaction("4");
+}
+
+/// A REDIRECT target gets its invalidation framed for the protocol it speaks
+/// NOW, not the one it spoke when it first subscribed (redis 8.6.1):
+///
+/// | target                                              | redis           |
+/// |-----------------------------------------------------|-----------------|
+/// | `SUBSCRIBE x / UNSUBSCRIBE / HELLO 3 / SUBSCRIBE inv` | `>2 invalidate` |
+/// | `HELLO 3 / SUBSCRIBE x / RESET / SUBSCRIBE inv`       | `*3 message`    |
+/// | `HELLO 3 / SUBSCRIBE inv / HELLO 2`                   | `*3 message`    |
+///
+/// Moon fixed the framing at the first SUBSCRIBE, so the RESP3 target got a
+/// RESP2 message and the RESP2 targets got a push, which a RESP2 client
+/// cannot parse.
+fn redirect_target_protocol_changes(shards: &str) {
+    let m = spawn_moon(shards);
+    type Setup = &'static [&'static [&'static str]];
+    let cases: [(&str, Setup, fn(&str) -> Vec<u8>, fn(&str) -> Vec<u8>); 3] = [
+        (
+            "resubscribed after HELLO 3",
+            &[
+                &["SUBSCRIBE", "x"],
+                &["UNSUBSCRIBE"],
+                &["HELLO", "3"],
+                &["SUBSCRIBE", "__redis__:invalidate"],
+            ],
+            push_for,
+            message_for,
+        ),
+        (
+            "resubscribed after RESET",
+            &[
+                &["HELLO", "3"],
+                &["SUBSCRIBE", "x"],
+                &["RESET"],
+                &["SUBSCRIBE", "__redis__:invalidate"],
+            ],
+            message_for,
+            push_for,
+        ),
+        (
+            "HELLO 2 while subscribed",
+            &[
+                &["HELLO", "3"],
+                &["SUBSCRIBE", "__redis__:invalidate"],
+                &["HELLO", "2"],
+            ],
+            message_for,
+            push_for,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (n, (name, setup, want, wrong)) in cases.iter().enumerate() {
+        let mut target = Resp::connect(m.port);
+        let tid = client_id(&mut target);
+        for step in setup.iter() {
+            target.cmd(step);
+        }
+        target.clear();
+        let mut source = Resp::connect(m.port);
+        assert_eq!(
+            source.reply(&["CLIENT", "TRACKING", "on", "REDIRECT", &tid]),
+            b"+OK\r\n".to_vec()
+        );
+        let mut writer = Resp::connect(m.port);
+        let ks = keys(&format!("rtp{n}:"));
+        for k in &ks {
+            writer.cmd(&["SET", k, "v"]);
+            source.cmd(&["GET", k]);
+        }
+        for k in &ks {
+            writer.cmd(&["SET", k, "v2"]);
+        }
+        let got = delivered(&mut target, &ks, *want, Duration::from_secs(4));
+        let misframed = ks.iter().filter(|k| target.saw(&wrong(k))).count();
+        if got * 2 <= N || misframed > 0 {
+            failures.push(format!(
+                "{name}: {got}/{N} framed for the target's protocol, {misframed} framed for \
+                 the wrong one. wire: {:?}",
+                String::from_utf8_lossy(&target.buf)
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "--shards {shards}:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn redirect_target_protocol_changes_1_shard() {
+    redirect_target_protocol_changes("1");
+}
+
+#[test]
+fn redirect_target_protocol_changes_4_shards() {
+    redirect_target_protocol_changes("4");
+}
+
+/// A RESP2 target that unsubscribed from everything gets nothing (redis
+/// 8.6.1 drops the invalidation). Moon queued it on the target's pub/sub
+/// channel and wrote it right after the target's next SUBSCRIBE reply.
+fn unsubscribed_redirect_target(shards: &str) {
+    let m = spawn_moon(shards);
+    let (mut target, mut source) = resp2_redirect_pair(m.port, &[]);
+    let mut writer = Resp::connect(m.port);
+    let old = keys("uns-old:");
+    for k in &old {
+        writer.cmd(&["SET", k, "v"]);
+        source.cmd(&["GET", k]);
+    }
+    assert_eq!(
+        target.reply(&["UNSUBSCRIBE"]),
+        b"*3\r\n$11\r\nunsubscribe\r\n$20\r\n__redis__:invalidate\r\n:0\r\n".to_vec()
+    );
+    for k in &old {
+        writer.cmd(&["SET", k, "v2"]);
+    }
+    // Give every one of those invalidations time to be routed (or dropped).
+    target.pump(Duration::from_millis(500));
+    target.cmd(&["SUBSCRIBE", "__redis__:invalidate"]);
+    // Control: delivery works again once the target is subscribed.
+    let new = keys("uns-new:");
+    for k in &new {
+        writer.cmd(&["SET", k, "v"]);
+        source.cmd(&["GET", k]);
+    }
+    for k in &new {
+        writer.cmd(&["SET", k, "v2"]);
+    }
+    let got = delivered(&mut target, &new, message_for, Duration::from_secs(4));
+    assert_majority("resubscribed REDIRECT target", shards, got, N, &target);
+    target.pump(Duration::from_millis(300));
+    let leaked: Vec<&String> = old.iter().filter(|k| target.saw(&message_for(k))).collect();
+    assert!(
+        leaked.is_empty(),
+        "--shards {shards}: invalidations raised while the target was unsubscribed were \
+         delivered after it resubscribed: {leaked:?}. wire: {:?}",
+        String::from_utf8_lossy(&target.buf)
+    );
+}
+
+#[test]
+fn unsubscribed_redirect_target_1_shard() {
+    unsubscribed_redirect_target("1");
+}
+
+#[test]
+fn unsubscribed_redirect_target_4_shards() {
+    unsubscribed_redirect_target("4");
+}
+
 // ═══════════════════════ TRACKINGINFO / GETREDIR parity ════════════════════
 
 type InfoCase<'a> = (&'a [&'a [&'a str]], &'a [&'a str], &'a str, &'a [&'a str]);

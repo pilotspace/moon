@@ -265,36 +265,49 @@ pub fn track_read_keys(
 /// reads of a transaction (measured on 8.6.1: `MULTI / GET k / EXEC` then an
 /// outside `SET k` pushes `invalidate [k]`), and moon tracked none of them.
 ///
-/// The CACHING flag is not cleared between a transaction's commands, and a
-/// `CLIENT CACHING` queued INSIDE it arms the flag for the commands after it.
-/// Both are replayed here from `state` — the connection's state as of EXEC —
-/// because the queued `CLIENT` command itself only runs after the body (its
-/// slot is filled in by the connection, which owns that state).
+/// A read is tracked under the modes in force at ITS position in the body.
+/// The queued `CLIENT` commands (`TRACKING`, `CACHING`) run in the
+/// connection's intercept pass, which has already applied all of them by the
+/// time this runs — so the body is replayed from `before`, the connection's
+/// modes captured when EXEC began, applying each `CLIENT` command EXEC
+/// answered without an error at its own position (redis 8.6.1:
+/// `MULTI / GET a / CLIENT CACHING no / GET b / EXEC` under OPTOUT tracks `a`
+/// and not `b`; `MULTI / CLIENT TRACKING on / GET k / EXEC` tracks `k`). The
+/// CACHING flag is never cleared between a transaction's commands.
 ///
-/// `results` is the EXEC reply array, one entry per queued command. The
-/// caller gates this on `tracking_active()`.
+/// `tracking_now` is whether the connection tracks once the whole body ran.
+/// When it does not, nothing is registered: the connection has no channel to
+/// hear about the keys, and a disabled connection never cleans the table up.
+/// When it does, reads before a queued `TRACKING off` still register, which is
+/// what redis does (its `off` leaves the key table alone, so re-enabling in
+/// the same body brings them back).
+///
+/// Call it AFTER the intercept pass, so `results` holds the real replies of
+/// the queued `CLIENT` commands. `results` is the EXEC reply array, one entry
+/// per queued command. The caller gates this on `tracking_active()`.
 pub fn after_transaction(
     table: &parking_lot::Mutex<crate::tracking::TrackingTable>,
     queue: &[Frame],
     results: &[Frame],
     client_id: u64,
-    state: &crate::tracking::TrackingState,
+    before: crate::tracking::TrackingModes,
+    tracking_now: bool,
 ) {
-    let mut caching = state.caching;
+    let mut modes = before;
     for (cmd_frame, result) in queue.iter().zip(results) {
         let Some((cmd, args)) = crate::server::conn::util::extract_command(cmd_frame) else {
             continue;
         };
-        if crate::tracking::client_cmd::caching_would_arm(state, cmd, args) {
-            caching = true;
-            continue;
-        }
         if matches!(result, Frame::Error(_)) {
             continue;
         }
+        if cmd.eq_ignore_ascii_case(b"CLIENT") {
+            crate::tracking::client_cmd::replay_accepted(&mut modes, args);
+            continue;
+        }
         invalidate_after_write(table, cmd, args, client_id);
-        if state.enabled && !state.bcast && state.caching_permits(caching) {
-            track_read_keys(table, cmd, args, client_id, state.noloop);
+        if tracking_now && modes.tracks_reads() {
+            track_read_keys(table, cmd, args, client_id, modes.noloop);
         }
     }
 }
@@ -891,6 +904,126 @@ mod tests {
                 Frame::BulkString(Bytes::from_static(b"invalidate")),
                 Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"foo"))]),
             ])
+        );
+    }
+
+    fn cmd(parts: &[&'static str]) -> Frame {
+        Frame::Array(parts.iter().map(|p| bulk(p)).collect::<Vec<_>>().into())
+    }
+
+    fn ok_reply() -> Frame {
+        Frame::SimpleString(Bytes::from_static(b"OK"))
+    }
+
+    /// Replay `queue` (command `i` answered `results[i]`) for client 1 and
+    /// report which of `keys` it left tracked.
+    fn tracked_after(
+        before: crate::tracking::TrackingModes,
+        tracking_now: bool,
+        queue: &[Frame],
+        results: &[Frame],
+        keys: &[&'static str],
+    ) -> Vec<&'static str> {
+        let table = parking_lot::Mutex::new(crate::tracking::TrackingTable::new());
+        let (tx, _rx) = crate::runtime::channel::mpsc_unbounded::<Frame>();
+        table.lock().register_client(1, tx);
+        after_transaction(&table, queue, results, 1, before, tracking_now);
+        let t = table.lock();
+        keys.iter()
+            .copied()
+            .filter(|k| t.tracked_clients(&Bytes::from_static(k.as_bytes())) == vec![1])
+            .collect()
+    }
+
+    fn on(optin: bool, optout: bool) -> crate::tracking::TrackingModes {
+        crate::tracking::TrackingModes {
+            enabled: true,
+            optin,
+            optout,
+            ..Default::default()
+        }
+    }
+
+    /// A `CLIENT CACHING` queued in the middle of a transaction covers only
+    /// the commands after it (redis 8.6.1), under OPTOUT and OPTIN alike.
+    #[test]
+    fn caching_queued_mid_body_covers_only_what_follows() {
+        let queue = [
+            cmd(&["GET", "a"]),
+            cmd(&["CLIENT", "CACHING", "no"]),
+            cmd(&["GET", "b"]),
+        ];
+        let results = [bulk("1"), ok_reply(), bulk("2")];
+        assert_eq!(
+            tracked_after(on(false, true), true, &queue, &results, &["a", "b"]),
+            vec!["a"],
+            "OPTOUT: CACHING no opts out b only"
+        );
+
+        let queue = [
+            cmd(&["GET", "a"]),
+            cmd(&["CLIENT", "CACHING", "yes"]),
+            cmd(&["GET", "b"]),
+        ];
+        assert_eq!(
+            tracked_after(on(true, false), true, &queue, &results, &["a", "b"]),
+            vec!["b"],
+            "OPTIN: CACHING yes opts in b only"
+        );
+
+        // CACHING yes armed before MULTI covers the whole body.
+        let armed = crate::tracking::TrackingModes {
+            caching: true,
+            ..on(true, false)
+        };
+        let queue = [cmd(&["GET", "a"]), cmd(&["GET", "b"])];
+        let results = [bulk("1"), bulk("2")];
+        assert_eq!(
+            tracked_after(armed, true, &queue, &results, &["a", "b"]),
+            vec!["a", "b"]
+        );
+    }
+
+    /// A queued CLIENT command that EXEC answered with an error changes
+    /// nothing.
+    #[test]
+    fn a_refused_queued_caching_arms_nothing() {
+        let queue = [cmd(&["CLIENT", "CACHING", "yes"]), cmd(&["GET", "a"])];
+        let results = [
+            Frame::Error(Bytes::from_static(b"ERR CLIENT CACHING YES is only valid")),
+            bulk("1"),
+        ];
+        assert!(tracked_after(on(true, false), true, &queue, &results, &["a"]).is_empty());
+    }
+
+    /// `CLIENT TRACKING on` queued inside the body tracks the reads after it,
+    /// and a transaction that leaves tracking off registers nothing.
+    #[test]
+    fn tracking_switched_inside_the_body() {
+        let queue = [cmd(&["CLIENT", "TRACKING", "on"]), cmd(&["GET", "k"])];
+        let results = [ok_reply(), bulk("1")];
+        let off = crate::tracking::TrackingModes::default();
+        assert_eq!(
+            tracked_after(off, true, &queue, &results, &["k"]),
+            vec!["k"]
+        );
+
+        let queue = [cmd(&["GET", "a"]), cmd(&["CLIENT", "TRACKING", "off"])];
+        let results = [bulk("1"), ok_reply()];
+        assert!(tracked_after(on(false, false), false, &queue, &results, &["a"]).is_empty());
+
+        // redis 8.6.1: `off` leaves the key table alone, so re-enabling in
+        // the same body keeps the earlier read tracked.
+        let queue = [
+            cmd(&["GET", "a"]),
+            cmd(&["CLIENT", "TRACKING", "off"]),
+            cmd(&["CLIENT", "TRACKING", "on"]),
+            cmd(&["GET", "b"]),
+        ];
+        let results = [bulk("1"), ok_reply(), ok_reply(), bulk("2")];
+        assert_eq!(
+            tracked_after(on(false, false), true, &queue, &results, &["a", "b"]),
+            vec!["a", "b"]
         );
     }
 

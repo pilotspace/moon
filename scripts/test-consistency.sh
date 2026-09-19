@@ -2830,14 +2830,40 @@ assert_tracking_mode "tracking: OPTOUT read without CACHING is tracked [control]
 assert_tracking_mode "tracking: CACHING yes covers the NEXT command only (moon#1049)" \
     "tcc:k" OPTIN "${CACHING_YES}"$'PING\r\n' "GET tcc:k" SET tcc:k v6
 
+# A CACHING queued in the MIDDLE of MULTI covers only the commands after it.
+# Moon applied it to the whole body: OPTOUT stopped tracking the read before
+# it, OPTIN tracked it. Hash-tagged so the body is single-slot at any
+# --shards N.
+both MSET '{tcm}:a' 1 '{tcm}:b' 2
+TXN_MID_NO=$'MULTI\r\nGET {tcm}:a\r\nCLIENT CACHING no\r\nGET {tcm}:b\r\nEXEC'
+TXN_MID_YES=$'MULTI\r\nGET {tcm}:a\r\nCLIENT CACHING yes\r\nGET {tcm}:b\r\nEXEC'
+assert_tracking_mode "tracking: OPTOUT, read BEFORE a mid-MULTI CACHING no is tracked" \
+    "{tcm}:a" OPTOUT "" "$TXN_MID_NO" SET '{tcm}:a' x1
+assert_tracking_mode "tracking: OPTOUT, read AFTER a mid-MULTI CACHING no is not tracked" \
+    "{tcm}:b" OPTOUT "" "$TXN_MID_NO" SET '{tcm}:b' x2
+assert_tracking_mode "tracking: OPTIN, read BEFORE a mid-MULTI CACHING yes is not tracked" \
+    "{tcm}:a" OPTIN "" "$TXN_MID_YES" SET '{tcm}:a' x3
+assert_tracking_mode "tracking: OPTIN, read AFTER a mid-MULTI CACHING yes is tracked" \
+    "{tcm}:b" OPTIN "" "$TXN_MID_YES" SET '{tcm}:b' x4
+
+# $3 (optional): newline-separated inline commands the target runs before
+# subscribing to `__redis__:invalidate`, each sent on its own and its reply
+# drained -- not pipelined, so each one runs in the state the one before it
+# left behind.
 tracking_redirect_transcript() {
-    local port="$1" key="$2"
+    local port="$1" key="$2" prelude="${3:-}"
     exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
-    local line="" id=""
+    local line="" id="" step=""
     printf 'CLIENT ID\r\n' >&3
     IFS= read -r -t 2 line <&3 || true
     id="${line#:}"
     id="${id%$'\r'}"
+    if [[ -n "$prelude" ]]; then
+        while IFS= read -r step; do
+            printf '%s\r\n' "$step" >&3
+            while IFS= read -r -t 0.3 line <&3; do :; done
+        done <<< "$prelude"
+    fi
     printf 'SUBSCRIBE __redis__:invalidate\r\n' >&3
     while IFS= read -r -t 1 line <&3; do :; done
     exec 4<>"/dev/tcp/127.0.0.1/${port}" || { exec 3>&-; echo "__CONNECT_FAILED__:${port}"; return 0; }
@@ -2856,6 +2882,19 @@ both SET tcr:k v
 assert_eq "tracking: RESP2 REDIRECT target gets message on __redis__:invalidate (moon#1048)" \
     "$(tracking_redirect_transcript "$PORT_REDIS" tcr:k)" \
     "$(tracking_redirect_transcript "$PORT_RUST" tcr:k)"
+
+# The target's framing follows the protocol it speaks when it (re)subscribes,
+# not the one of its first SUBSCRIBE: RESP3 gets the push, RESP2 the message.
+TRK_RESUB_RESP3=$'SUBSCRIBE x\nUNSUBSCRIBE\nHELLO 3'
+TRK_RESUB_RESP2=$'HELLO 3\nSUBSCRIBE x\nRESET'
+both SET tcr:k3 v
+assert_eq "tracking: REDIRECT target resubscribed after HELLO 3 gets the RESP3 push" \
+    "$(tracking_redirect_transcript "$PORT_REDIS" tcr:k3 "$TRK_RESUB_RESP3")" \
+    "$(tracking_redirect_transcript "$PORT_RUST" tcr:k3 "$TRK_RESUB_RESP3")"
+both SET tcr:k2 v
+assert_eq "tracking: REDIRECT target resubscribed after RESET gets the RESP2 message" \
+    "$(tracking_redirect_transcript "$PORT_REDIS" tcr:k2 "$TRK_RESUB_RESP2")" \
+    "$(tracking_redirect_transcript "$PORT_RUST" tcr:k2 "$TRK_RESUB_RESP2")"
 
 # ---------------------------------------------------------------------------
 # moon#644 -- every BLOCKING pop modifies the keyspace and must invalidate.

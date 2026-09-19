@@ -72,14 +72,20 @@ impl TrackingState {
     /// unless `CLIENT CACHING no` preceded it (redis `trackingRememberKeys`).
     #[inline]
     pub fn tracks_reads(&self) -> bool {
-        self.enabled && !self.bcast && self.caching_permits(self.caching)
+        self.modes().tracks_reads()
     }
 
-    /// The OPTIN/OPTOUT rule alone, for a given CACHING flag. Split out so a
-    /// transaction body can replay the flag a queued `CLIENT CACHING` sets.
+    /// The flags that decide whether a read is tracked, copied out.
     #[inline]
-    pub fn caching_permits(&self, caching: bool) -> bool {
-        !((self.optin && !caching) || (self.optout && caching))
+    pub fn modes(&self) -> TrackingModes {
+        TrackingModes {
+            enabled: self.enabled,
+            bcast: self.bcast,
+            optin: self.optin,
+            optout: self.optout,
+            noloop: self.noloop,
+            caching: self.caching,
+        }
     }
 
     /// Per-command hook, called by every connection handler before it
@@ -105,6 +111,37 @@ impl TrackingState {
             self.caching = false;
         }
         self.prev_was_client = cmd.eq_ignore_ascii_case(b"CLIENT");
+    }
+}
+
+/// The part of [`TrackingState`] that decides whether a read registers its
+/// keys, as a `Copy` value.
+///
+/// A MULTI/EXEC body is bookkept after it ran (see
+/// [`invalidation::after_transaction`]), and by then any `CLIENT TRACKING` or
+/// `CLIENT CACHING` queued inside it has already changed the connection's
+/// state. The body is therefore replayed from the modes captured when EXEC
+/// began, applying each queued `CLIENT` command at its own position — the
+/// order redis executes them in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrackingModes {
+    pub enabled: bool,
+    pub bcast: bool,
+    pub optin: bool,
+    pub optout: bool,
+    pub noloop: bool,
+    pub caching: bool,
+}
+
+impl TrackingModes {
+    /// Default mode tracks every read; BCAST tracks none (it is prefix
+    /// driven); OPTIN tracks only after `CLIENT CACHING yes`; OPTOUT tracks
+    /// unless `CLIENT CACHING no` preceded it (redis `trackingRememberKeys`).
+    #[inline]
+    pub fn tracks_reads(&self) -> bool {
+        self.enabled
+            && !self.bcast
+            && !((self.optin && !self.caching) || (self.optout && self.caching))
     }
 }
 
@@ -187,7 +224,10 @@ impl TrackingMessage {
     }
 
     /// Hand the message to one recipient. Never blocks: a full channel drops
-    /// the message, exactly as a slow pub/sub subscriber loses one.
+    /// the message SILENTLY. That is a known divergence, not parity — redis
+    /// never drops an invalidation; it disconnects a client whose output
+    /// buffer passes its limit, which a caching client treats as "flush
+    /// everything" (moon#1088).
     pub fn deliver(&mut self, to: &Delivery) {
         match to {
             Delivery::Push(tx) => {

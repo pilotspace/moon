@@ -227,16 +227,36 @@ fn caching(args: &[Frame], state: &mut TrackingState) -> Frame {
     ok()
 }
 
-/// Whether the queued command `cmd args` is a `CLIENT CACHING` that
-/// [`caching`] would accept for `state` — i.e. one that arms the flag for
-/// the transaction commands after it.
-pub fn caching_would_arm(state: &TrackingState, cmd: &[u8], args: &[Frame]) -> bool {
-    if !state.enabled || !cmd.eq_ignore_ascii_case(b"CLIENT") || args.len() != 2 {
-        return false;
+/// Apply to `modes` the effect a queued `CLIENT <args>` had, given that EXEC
+/// answered it WITHOUT an error. `args` starts at the subcommand.
+///
+/// This is the transaction replay's view of [`tracking`] and [`caching`]: an
+/// accepted `TRACKING off` resets every flag (as [`disable`] does), an
+/// accepted `TRACKING on` replaces the mode flags and keeps CACHING (as
+/// `enableTracking` does), and an accepted `CACHING` arms the flag. Any other
+/// subcommand leaves the modes alone. Because only accepted commands are
+/// replayed, none of the mode checks need repeating here.
+pub fn replay_accepted(modes: &mut crate::tracking::TrackingModes, args: &[Frame]) {
+    let Some(Frame::BulkString(sub) | Frame::SimpleString(sub)) = args.first() else {
+        return;
+    };
+    if sub.eq_ignore_ascii_case(b"CACHING") {
+        modes.caching = true;
+    } else if sub.eq_ignore_ascii_case(b"TRACKING") {
+        // The redirect target existed when the command ran; its existence
+        // does not affect the modes.
+        match crate::command::client::parse_tracking_args(args, |_| true) {
+            Ok(cfg) if cfg.enable => {
+                modes.enabled = true;
+                modes.bcast = cfg.bcast;
+                modes.optin = cfg.optin;
+                modes.optout = cfg.optout;
+                modes.noloop = cfg.noloop;
+            }
+            Ok(_) => *modes = crate::tracking::TrackingModes::default(),
+            Err(_) => {}
+        }
     }
-    let word = |f: &Frame, w: &[u8]| matches!(f, Frame::BulkString(s) | Frame::SimpleString(s) if s.eq_ignore_ascii_case(w));
-    word(&args[0], b"CACHING")
-        && ((word(&args[1], b"YES") && state.optin) || (word(&args[1], b"NO") && state.optout))
 }
 
 /// The `redirect` field redis reports: the target id, 0 for none, -1 when
@@ -319,6 +339,9 @@ fn get_redir(args: &[Frame], state: &TrackingState) -> Frame {
 /// the pub/sub channel along.
 pub struct InboxGuard {
     client_id: u64,
+    /// The protocol the inbox was registered with, which is how deliveries
+    /// to it are framed.
+    resp3: bool,
     table: std::sync::Arc<parking_lot::Mutex<TrackingTable>>,
 }
 
@@ -336,11 +359,77 @@ impl Drop for InboxGuard {
     }
 }
 
-/// Register a connection's freshly created pub/sub channel as a REDIRECT
-/// inbox. Called once per connection, where the channel is created — before
-/// its first subscription, which is what makes a connection a target that
-/// can actually receive. Costs one table lock per subscribing connection,
-/// never per command.
+/// Keep a connection's REDIRECT inbox in step with its pub/sub state.
+///
+/// Redis sends a redirect target a pub/sub `message` only while it is
+/// subscribed (RESP2), frames it for the target's protocol at send time, and
+/// drops the invalidation otherwise. The inbox is the only thing a source can
+/// see, so it must follow the connection:
+/// - registered while `subscribed`, and only then — a target that
+///   unsubscribed from everything must not collect invalidations that its
+///   next `SUBSCRIBE` would then replay;
+/// - re-registered when the protocol moves (`HELLO`, `RESET`), because
+///   deliveries are framed from the protocol recorded here.
+///
+/// Each handler calls this where a subscription starts (so the inbox exists
+/// before the `subscribe` reply is written) and once per pass of its
+/// connection loop (so an unsubscribe, a RESET or a HELLO, from whichever
+/// path ran it, is picked up before the connection waits again). The in-step
+/// check is two connection-local loads; the lock is taken only on a change.
+#[inline]
+pub fn sync_inbox(
+    slot: &mut Option<InboxGuard>,
+    subscribed: bool,
+    resp3: bool,
+    tx: Option<&channel::MpscSender<Bytes>>,
+    client_id: u64,
+    table: &std::sync::Arc<parking_lot::Mutex<TrackingTable>>,
+) {
+    let in_step = match slot {
+        None => !subscribed,
+        Some(guard) => subscribed && guard.resp3 == resp3,
+    };
+    if !in_step {
+        resync_inbox(slot, subscribed, resp3, tx, client_id, table);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn resync_inbox(
+    slot: &mut Option<InboxGuard>,
+    subscribed: bool,
+    resp3: bool,
+    tx: Option<&channel::MpscSender<Bytes>>,
+    client_id: u64,
+    table: &std::sync::Arc<parking_lot::Mutex<TrackingTable>>,
+) {
+    match (subscribed, tx) {
+        (true, Some(tx)) => {
+            if let Some(guard) = slot.as_mut() {
+                // Same channel, new protocol: overwrite the entry in place.
+                // Replacing the guard instead would let the old one's drop
+                // unregister the new entry.
+                table.lock().register_inbox(
+                    client_id,
+                    crate::tracking::PubSubInbox {
+                        tx: tx.clone(),
+                        resp3,
+                    },
+                );
+                guard.resp3 = resp3;
+            } else {
+                *slot = Some(register_inbox(client_id, tx, resp3, table));
+            }
+        }
+        // Unsubscribed (or, defensively, no channel to register): dropping
+        // the guard unregisters.
+        _ => *slot = None,
+    }
+}
+
+/// Register a connection's pub/sub channel as a REDIRECT inbox. Handlers go
+/// through [`sync_inbox`]; this is its registration step.
 #[must_use = "dropping the guard unregisters the inbox"]
 pub fn register_inbox(
     client_id: u64,
@@ -357,6 +446,7 @@ pub fn register_inbox(
     );
     InboxGuard {
         client_id,
+        resp3,
         table: std::sync::Arc::clone(table),
     }
 }
@@ -570,23 +660,95 @@ mod tests {
         );
     }
 
+    /// The transaction replay must land on exactly the modes the live handler
+    /// produced, command by command — otherwise a transaction tracks under
+    /// flags the connection never had.
     #[test]
-    fn caching_would_arm_only_for_an_accepted_caching() {
-        let mut s = TrackingState {
-            enabled: true,
-            optin: true,
-            ..TrackingState::default()
+    fn replay_agrees_with_the_live_handler() {
+        let sequences: &[&[&[&str]]] = &[
+            &[
+                &["TRACKING", "on", "OPTOUT"],
+                &["CACHING", "no"],
+                &["CACHING", "yes"],
+                &["TRACKING", "on", "OPTOUT", "NOLOOP"],
+                &["TRACKING", "off"],
+            ],
+            &[
+                &["CACHING", "yes"],
+                &["TRACKING", "on", "OPTIN"],
+                &["CACHING", "yes"],
+                &["TRACKING", "on", "OPTOUT"],
+                &["TRACKING", "on", "OPTIN", "NOLOOP"],
+                &["TRACKING", "on", "BCAST"],
+                &["TRACKINGINFO"],
+                &["GETREDIR"],
+            ],
+            &[
+                &["TRACKING", "on", "BCAST", "PREFIX", "a"],
+                &["TRACKING", "on"],
+                &["TRACKING", "on", "BCAST", "PREFIX", "b", "NOLOOP"],
+                &["TRACKING", "bogus"],
+                &["TRACKING", "off"],
+                &["TRACKING", "on", "REDIRECT", "5001"],
+                &["TRACKING", "on", "REDIRECT", "12"],
+            ],
+        ];
+        for (n, seq) in sequences.iter().enumerate() {
+            let mut c = Conn::new(4100 + n as u64);
+            let mut modes = c.state.modes();
+            for step in seq.iter() {
+                let reply = c.run(step);
+                if !matches!(reply, Frame::Error(_)) {
+                    replay_accepted(&mut modes, &args(step));
+                }
+                assert_eq!(
+                    modes,
+                    c.state.modes(),
+                    "sequence {n}, after {step:?} answered {reply:?}"
+                );
+            }
+        }
+    }
+
+    fn inbox_resp3(table: &parking_lot::Mutex<TrackingTable>, id: u64) -> Option<bool> {
+        table.lock().inboxes.get(&id).map(|i| i.resp3)
+    }
+
+    /// The inbox exists exactly while the connection is subscribed, framed
+    /// for its CURRENT protocol.
+    #[test]
+    fn the_inbox_follows_subscription_and_protocol() {
+        let c = Conn::new(4200);
+        let (tx, _rx) = channel::mpsc_unbounded::<Bytes>();
+        let mut slot: Option<InboxGuard> = None;
+        let sync = |slot: &mut Option<InboxGuard>, subscribed: bool, resp3: bool| {
+            sync_inbox(slot, subscribed, resp3, Some(&tx), c.id, &c.table);
         };
-        assert!(caching_would_arm(&s, b"client", &args(&["caching", "YES"])));
-        assert!(!caching_would_arm(&s, b"CLIENT", &args(&["CACHING", "no"])));
-        assert!(!caching_would_arm(&s, b"CLIENT", &args(&["CACHING"])));
-        assert!(!caching_would_arm(&s, b"CLIENT", &args(&["ID", "yes"])));
-        s.enabled = false;
-        assert!(!caching_would_arm(
-            &s,
-            b"CLIENT",
-            &args(&["CACHING", "yes"])
-        ));
+
+        sync(&mut slot, false, false);
+        assert_eq!(inbox_resp3(&c.table, c.id), None, "never subscribed");
+
+        sync(&mut slot, true, false);
+        assert_eq!(inbox_resp3(&c.table, c.id), Some(false), "RESP2 SUBSCRIBE");
+
+        sync(&mut slot, false, false);
+        assert_eq!(
+            inbox_resp3(&c.table, c.id),
+            None,
+            "unsubscribed from everything: invalidations must not queue up"
+        );
+
+        // SUBSCRIBE x; UNSUBSCRIBE; HELLO 3; SUBSCRIBE ...
+        sync(&mut slot, true, true);
+        assert_eq!(inbox_resp3(&c.table, c.id), Some(true), "RESP3 resubscribe");
+
+        // HELLO 2 while still subscribed.
+        sync(&mut slot, true, false);
+        assert_eq!(inbox_resp3(&c.table, c.id), Some(false), "HELLO 2 in place");
+        assert!(slot.as_ref().is_some_and(|g| !g.resp3));
+
+        drop(slot);
+        assert_eq!(inbox_resp3(&c.table, c.id), None, "guard dropped");
     }
 
     /// TRACKING OFF is about this connection's own tracking; its pub/sub

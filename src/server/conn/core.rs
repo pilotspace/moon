@@ -321,8 +321,9 @@ pub(crate) struct ConnectionState {
     pub tracking_state: TrackingState,
     pub tracking_rx: Option<channel::MpscReceiver<Frame>>,
     /// This connection's pub/sub channel, registered as a CLIENT TRACKING
-    /// REDIRECT inbox the first time it is created (moon#1048). Dropping it —
-    /// on any exit from the handler — unregisters.
+    /// REDIRECT inbox while it is subscribed (moon#1048); kept in step by
+    /// [`ConnectionState::sync_tracking_inbox`]. Dropping it — on any exit
+    /// from the handler — unregisters.
     pub tracking_inbox: Option<crate::tracking::client_cmd::InboxGuard>,
 
     // WATCH/EXEC optimistic locking. Read by all three dispatch paths — the
@@ -566,6 +567,24 @@ impl ConnectionState {
         if self.in_multi {
             self.multi_dirty = true;
         }
+    }
+
+    /// Bring the REDIRECT inbox in step with this connection's subscription
+    /// count and protocol — see [`crate::tracking::client_cmd::sync_inbox`].
+    /// Two connection-local loads when nothing changed.
+    #[inline]
+    pub fn sync_tracking_inbox(
+        &mut self,
+        table: &std::sync::Arc<parking_lot::Mutex<crate::tracking::TrackingTable>>,
+    ) {
+        crate::tracking::client_cmd::sync_inbox(
+            &mut self.tracking_inbox,
+            self.subscription_count > 0,
+            self.protocol_version >= 3,
+            self.pubsub_tx.as_ref(),
+            self.client_id,
+            table,
+        );
     }
 
     /// D4 (#438): whether this connection may migrate to another shard
