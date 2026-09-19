@@ -981,8 +981,8 @@ assert_both "ZREVRANGEBYLEX reversed bounds"    ZREVRANGEBYLEX z:959:lex - +
 both ZADD z:959:rank 1 a 2 b 3 c 4 d 5 e
 assert_both "ZREMRANGEBYRANK 0 0"               ZREMRANGEBYRANK z:959:rank 0 0
 # A stop still negative after normalisation is NOT clamped to 0 -- nothing
-# is removed. (ZRANGE's own helper clamps it; that divergence is out of
-# moon#959's scope and is reported separately.)
+# is removed. `ZRANGE`/`ZREVRANGE`/`ZRANGESTORE` shared this helper's rule
+# once moon#1001 closed the divergence noted here; see that section below.
 assert_both "ZREMRANGEBYRANK -10 -6"            ZREMRANGEBYRANK z:959:rank -10 -6
 assert_both "ZREMRANGEBYRANK 3 1"               ZREMRANGEBYRANK z:959:rank 3 1
 assert_both "ZREMRANGEBYRANK 1 -2"              ZREMRANGEBYRANK z:959:rank 1 -2
@@ -992,6 +992,30 @@ assert_both "ZREMRANGEBYRANK arity"             ZREMRANGEBYRANK z:959:rank 1
 assert_both "ZREMRANGEBYRANK missing key"       ZREMRANGEBYRANK z:959:nokey 0 1
 assert_both "ZREMRANGEBYRANK drains"            ZREMRANGEBYRANK z:959:rank 0 -1
 assert_both "ZREMRANGEBYRANK drained key gone"  EXISTS z:959:rank
+
+# moon#1001 -- ZRANGE, ZREVRANGE and ZRANGESTORE clamped a STOP still
+# negative after `len + stop` to 0, so `ZRANGE z -10 -6` on a five-member
+# zset answered one element where redis answers an empty array. Verified
+# against redis 8.6.1: `ZRANGE r8 -10 -6` -> `*0`, `ZREVRANGE r8 -10 -6` ->
+# `*0`, `ZRANGE r8 -10 -6 REV` -> `*0`, `ZRANGESTORE r9 r8 -10 -6` -> `0`.
+# `zrange_by_rank` (B+tree) and `zrange_from_entries` (listpack) both now
+# call the same `rank_window` helper `ZREMRANGEBYRANK` above already used.
+both ZADD z:1001:rank 1 a 2 b 3 c 4 d 5 e
+assert_both "ZRANGE still-negative stop"        ZRANGE z:1001:rank -10 -6
+assert_both "ZREVRANGE still-negative stop"     ZREVRANGE z:1001:rank -10 -6
+assert_both "ZRANGE REV still-negative stop"    ZRANGE z:1001:rank -10 -6 REV
+assert_both "ZRANGESTORE still-negative stop"   ZRANGESTORE {z1001}:d z:1001:rank -10 -6
+assert_both "ZRANGESTORE dest left empty"       ZRANGE {z1001}:d 0 -1
+# Controls: a stop of exactly -len normalises to rank 0 without clamping
+# (already correct pre-fix), and start > stop after normalisation was
+# already handled.
+assert_both "ZRANGE stop == -len"               ZRANGE z:1001:rank -10 -5
+assert_both "ZRANGE start > stop"               ZRANGE z:1001:rank -1 -3
+both ZADD z:1001:one 1 solo
+assert_both "ZRANGE len=1 still-negative stop"  ZRANGE z:1001:one -10 -6
+assert_both "ZRANGE len=1 stop == -len"         ZRANGE z:1001:one -1 -1
+assert_both "ZRANGE len=0 still-negative stop"  ZRANGE z:1001:nokey -10 -6
+
 both ZADD z:959:score 1 a 2 b 3 c 4 d 5 e
 assert_both "ZREMRANGEBYSCORE (2 3"             ZREMRANGEBYSCORE z:959:score '(2' 3
 assert_both "ZREMRANGEBYSCORE 3 1"              ZREMRANGEBYSCORE z:959:score 3 1
