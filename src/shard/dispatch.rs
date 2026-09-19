@@ -1139,14 +1139,15 @@ pub struct TxnExecutePayload {
 /// Reply for [`ShardMessage::TxnExecute`].
 ///
 /// Carries the executed result frame (a `Frame::Array` of per-command
-/// responses, with `Frame::Integer(0)` placeholders for any queued PUBLISH),
-/// the deferred PUBLISH fan-out list `(result_index, channel, message)` the
+/// responses, with `Frame::Integer(0)` placeholders for any queued PUBLISH or
+/// SPUBLISH), the deferred fan-out list (one
+/// [`ExecPublish`](crate::shard::exec_publish::ExecPublish) each) the
 /// originator patches after fanning out, and whether the body performed any
 /// durable write (so the originator can issue one `fsync_barrier` to the owner
 /// under `appendfsync=always`).
 pub struct TxnExecReply {
     pub result: crate::protocol::Frame,
-    pub exec_publishes: Vec<(usize, Bytes, Bytes)>,
+    pub exec_publishes: Vec<crate::shard::exec_publish::ExecPublish>,
     /// c10k E2: keyless FLUSHDB/FLUSHALL executed in the body, as
     /// `(result_index, command, db)`. The owner shard clears only its OWN
     /// slice, so the ORIGINATOR must broadcast each of these to the remaining

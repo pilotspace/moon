@@ -1390,6 +1390,56 @@ if should_run "connection"; then
             "role:master" INFO replication
         assert_moon "moon#1015 refused REPLICAOF keeps the node writable" "OK" SET moon1015:w v
     fi
+
+    # moon#1013: CLIENT TRACKING must invalidate a key that EXPIRES, like one a
+    # command writes. redis-cli cannot see RESP3 pushes, so each server gets one
+    # held-open /dev/tcp connection that tracks the key with a read and then
+    # sends NOTHING until the push arrives (4s bound) -- the push can only come
+    # from the server's own expiry tick. The hash row is the idle-db case: moon's
+    # field reaper used to wait for a command to advance the db's cached clock.
+    trk1013_probe() {
+        local port="$1" key="$2" read_cmd="$3" line="" seen="" deadline=$((SECONDS + 4))
+        exec 4<>"/dev/tcp/127.0.0.1/${port}" || { echo "CONNECT_FAILED"; return 0; }
+        printf 'HELLO 3\r\nCLIENT TRACKING ON\r\n%s\r\n' "$read_cmd" >&4
+        while (( SECONDS < deadline )); do
+            if IFS= read -r -t 1 line <&4; then
+                seen="${seen}${line%$'\r'}|"
+                case "$seen" in *invalidate*"|${key}|"*) break ;; esac
+            fi
+        done
+        exec 4>&-
+        case "$seen" in *invalidate*"|${key}|"*) echo "PUSH" ;; *) echo "NONE" ;; esac
+    }
+    for port in "$PORT_REDIS" "$PORT_RUST"; do
+        redis-cli -p "$port" DEL trk1013:s trk1013:h > /dev/null 2>&1 || true
+    done
+    # Seed each server right before ITS probe: a 1s TTL seeded on both up front
+    # would lapse on the second server while the first one's probe waits.
+    redis-cli -p "$PORT_REDIS" SET trk1013:s v PX 1000 > /dev/null 2>&1 || true
+    trk1013_s_redis=$(trk1013_probe "$PORT_REDIS" trk1013:s "GET trk1013:s")
+    redis-cli -p "$PORT_RUST" SET trk1013:s v PX 1000 > /dev/null 2>&1 || true
+    trk1013_s_moon=$(trk1013_probe "$PORT_RUST" trk1013:s "GET trk1013:s")
+    TOTAL=$((TOTAL + 1))
+    if [ "$trk1013_s_moon" = "PUSH" ] && [ "$trk1013_s_redis" = "PUSH" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TRACKING-EXPIRY-01 expired key must push invalidate (moon#1013): redis=$trk1013_s_redis moon=$trk1013_s_moon"
+    fi
+    for port in "$PORT_REDIS" "$PORT_RUST"; do
+        redis-cli -p "$port" HSET trk1013:h f v g w > /dev/null 2>&1 || true
+    done
+    redis-cli -p "$PORT_REDIS" HPEXPIRE trk1013:h 1000 FIELDS 1 f > /dev/null 2>&1 || true
+    trk1013_h_redis=$(trk1013_probe "$PORT_REDIS" trk1013:h "HGET trk1013:h g")
+    redis-cli -p "$PORT_RUST" HPEXPIRE trk1013:h 1000 FIELDS 1 f > /dev/null 2>&1 || true
+    trk1013_h_moon=$(trk1013_probe "$PORT_RUST" trk1013:h "HGET trk1013:h g")
+    TOTAL=$((TOTAL + 1))
+    if [ "$trk1013_h_moon" = "PUSH" ] && [ "$trk1013_h_redis" = "PUSH" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: TRACKING-EXPIRY-02 expired hash field must push invalidate (moon#1013): redis=$trk1013_h_redis moon=$trk1013_h_moon"
+    fi
 fi
 
 # ===========================================================================
@@ -1711,6 +1761,27 @@ if should_run "transaction"; then
         echo "  FAIL: SCRIPT-MULTI-02 EXEC transcript differs from Redis (moon#894)"
         echo "    redis: $(echo "$sc894_redis" | tr '\n' ' ')"
         echo "    moon:  $(echo "$sc894_moon" | tr '\n' ' ')"
+    fi
+
+    # --- SPUBLISH inside MULTI (moon#1043) ---------------------------------
+    #
+    # A queued SPUBLISH answered `unknown command` at EXEC while the rest of the
+    # body committed. With no subscriber the receiver count is 0 on both
+    # servers, so this row compares the transcript byte for byte (the slot must
+    # be an integer, not an error); tests/spublish_in_multi_1043.rs and the
+    # consistency row check delivery to live subscribers.
+    sp1043_body=$(printf '%s\n' 'MULTI' 'SET {tx1043}k 1' 'SPUBLISH sch1043 hi' 'PUBLISH ch1043 hi' 'EXEC')
+    for srv in mcli rcli; do $srv DEL "{tx1043}k" > /dev/null; done
+    sp1043_moon=$(printf '%s\n' "$sp1043_body" | redis-cli -p "$PORT_RUST" 2>&1 || true)
+    sp1043_redis=$(printf '%s\n' "$sp1043_body" | redis-cli -p "$PORT_REDIS" 2>&1 || true)
+    TOTAL=$((TOTAL + 1))
+    if [ "$sp1043_moon" = "$sp1043_redis" ] && ! echo "$sp1043_moon" | qgrep -q "unknown command"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: SPUBLISH-MULTI-01 SPUBLISH inside MULTI must run at EXEC (moon#1043)"
+        echo "    redis: $(echo "$sp1043_redis" | tr '\n' ' ')"
+        echo "    moon:  $(echo "$sp1043_moon" | tr '\n' ' ')"
     fi
 
     # --- Container HELP (moon#698) ----------------------------------------
