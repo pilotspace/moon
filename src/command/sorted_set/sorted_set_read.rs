@@ -469,6 +469,28 @@ pub fn zrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     } else {
         (min_arg, max_arg)
     };
+    // moon#1060: Redis parses the range grammar unconditionally, before ever
+    // looking the key up — a malformed bound against a MISSING key is a parse
+    // error, not an empty array. `zrange_by_score`/`zrange_by_lex` below
+    // already validate, but only on the `Ok(Some(zref))` arm; `Ok(None)`
+    // short-circuited straight to `[]` without calling them. Validate here
+    // too, matching `ZCOUNT`/`ZLEXCOUNT` and the already-correct
+    // `ZRANGEBYLEX`/`ZREVRANGEBYLEX`.
+    if by_score {
+        if let Err(e) = parse_score_bound(&min_arg) {
+            return e;
+        }
+        if let Err(e) = parse_score_bound(&max_arg) {
+            return e;
+        }
+    } else if by_lex {
+        if let Err(e) = parse_lex_bound(&min_arg) {
+            return e;
+        }
+        if let Err(e) = parse_lex_bound(&max_arg) {
+            return e;
+        }
+    }
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(Some(zref)) => {
             match (&zref, zref.members_map(), zref.bptree()) {
@@ -615,6 +637,14 @@ pub fn zrangebyscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Fra
             return err("ERR syntax error");
         }
     }
+    // moon#1060: parse the score grammar before the key lookup — see the
+    // identical comment in `zrange_readonly`.
+    if let Err(e) = parse_score_bound(&min_arg) {
+        return e;
+    }
+    if let Err(e) = parse_score_bound(&max_arg) {
+        return e;
+    }
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(Some(zref)) => match (zref.members_map(), zref.bptree()) {
             (Some(members), Some(scores)) => zrange_by_score(
@@ -704,6 +734,15 @@ pub fn zrevrangebyscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> 
             // mis-spelled option into a DIFFERENT, successful command.
             return err("ERR syntax error");
         }
+    }
+    // moon#1060: same defect as `ZRANGEBYSCORE`, found in the same sweep — the
+    // sibling command's Ok(None) arm also short-circuited to `[]` without
+    // validating min/max first. Parse before the key lookup.
+    if let Err(e) = parse_score_bound(&min_arg) {
+        return e;
+    }
+    if let Err(e) = parse_score_bound(&max_arg) {
+        return e;
     }
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(Some(zref)) => match (zref.members_map(), zref.bptree()) {
