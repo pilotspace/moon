@@ -489,6 +489,44 @@ mod tests {
         );
     }
 
+    /// moon#1013: both cold-tier expiry reclaims — lazy (on read) and the
+    /// periodic `sweep_expired` — invalidate CLIENT TRACKING caches, like a
+    /// hot-plane expiry. A tracked key can be spilled and then expire on disk.
+    #[test]
+    fn cold_expiry_invalidates_tracking_clients() {
+        use crate::tracking::invalidation::test_support::GlobalTracker;
+        let _guard = TEST_DELAY_LOCK.lock().unwrap();
+
+        let on_read = GlobalTracker::tracking(b"cold1013:read");
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = db_with_spilled_key(tmp.path(), b"cold1013:read", b"old", Some(1));
+        assert!(db.get(b"cold1013:read").is_none(), "expired cold reads nil");
+        assert_eq!(
+            on_read.invalidated_keys(),
+            vec![Bytes::from_static(b"cold1013:read")]
+        );
+
+        let by_sweep = GlobalTracker::tracking(b"cold1013:sweep");
+        let tmp2 = tempfile::tempdir().unwrap();
+        let mut db2 = db_with_spilled_key(tmp2.path(), b"cold1013:sweep", b"old", Some(1));
+        let stats = db2
+            .cold_index
+            .as_mut()
+            .unwrap()
+            .sweep_expired(
+                1_001,
+                tmp2.path(),
+                None,
+                crate::storage::tiered::cold_index::MAX_EXPIRED_SWEEP_BATCH,
+            )
+            .unwrap();
+        assert_eq!(stats.entries_reclaimed, 1, "precondition: swept");
+        assert_eq!(
+            by_sweep.invalidated_keys(),
+            vec![Bytes::from_static(b"cold1013:sweep")]
+        );
+    }
+
     /// R1 (H-2, proactive reclaim): a cold entry that EXPIRES and is NEVER
     /// re-read must still be reclaimed. The on-read reclaim proven above only
     /// fires when a caller actually issues a `GET` — a TTL'd key that expires

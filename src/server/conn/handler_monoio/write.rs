@@ -721,7 +721,7 @@ pub(super) async fn try_handle_multi_exec(
     conn: &mut ConnectionState,
     ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
-    exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
+    exec_publishes: &mut Vec<crate::shard::exec_publish::ExecPublish>,
     // moon#639: EXEC now runs the queued connection-level intercepts itself.
     // `SCRIPT LOAD` needs the shutdown token for its bounded shard fan-out and
     // `HELLO` needs the codec to switch protocol, so both travel down here.

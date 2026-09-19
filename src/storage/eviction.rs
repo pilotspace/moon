@@ -877,6 +877,22 @@ pub fn evict_to_budget(
     Ok(())
 }
 
+/// Report one plain-dropped victim: to CLIENT TRACKING, then to the caller's
+/// sink (moon#1013).
+///
+/// The ONE place a plain drop is announced, so no eviction entry point —
+/// `evict_to_budget`'s sinks or `db_quota`'s direct `evict_one_with_spill`
+/// with a no-op sink — can delete a tracked key silently. redis 8.6.1 pushes
+/// `invalidate` for an evicted key (measured: `allkeys-random`,
+/// `maxmemory 1`). A SPILLED victim is deliberately not reported: it stays
+/// cold-readable with the same value, so a client's cached copy is still
+/// correct.
+#[inline]
+fn report_plain_drop(on_plain_drop: &mut dyn FnMut(&[u8]), key: &[u8]) {
+    crate::tracking::invalidation::invalidate_server_removed(key);
+    on_plain_drop(key);
+}
+
 /// Consecutive eviction iterations allowed to claim progress while changing
 /// nothing observable, before [`evict_to_budget`] gives up with `OOM`
 /// (moon#600).
@@ -1230,7 +1246,7 @@ fn evict_batch_durable(
             db.remove(key.as_bytes());
             crate::admin::metrics_setup::record_expiring_spill_skipped();
             crate::admin::metrics_setup::record_eviction();
-            on_plain_drop(key.as_bytes());
+            report_plain_drop(on_plain_drop, key.as_bytes());
             // A drop reclaims RAM immediately, so it counts toward the same
             // deficit the staged (not-yet-written) victims are sized against.
             staged_bytes += before.saturating_sub(db.estimated_memory());
@@ -1363,7 +1379,7 @@ fn evict_one_async_spill(
             db.remove(key.as_bytes());
             crate::admin::metrics_setup::record_expiring_spill_skipped();
             crate::admin::metrics_setup::record_eviction();
-            on_plain_drop(key.as_bytes());
+            report_plain_drop(on_plain_drop, key.as_bytes());
             return true;
         }
         // Fail-closed: a value that cannot be faithfully serialized must not
@@ -1503,7 +1519,7 @@ pub(crate) fn evict_one_with_spill(
     let removed = db.remove(key.as_bytes()).is_some();
     if removed {
         crate::admin::metrics_setup::record_eviction();
-        on_plain_drop(key.as_bytes());
+        report_plain_drop(on_plain_drop, key.as_bytes());
     }
     true
 }
@@ -2146,6 +2162,40 @@ mod tests {
         assert!(
             db.data().get(b"old" as &[u8]).is_none(),
             "LRU eviction failed to remove the oldest key within 50 rounds",
+        );
+    }
+
+    /// moon#1013: a plain-dropped victim invalidates CLIENT TRACKING caches —
+    /// through `evict_to_budget` AND through the direct `evict_one_with_spill`
+    /// call `db_quota` makes with a no-op sink (the hook sits below both).
+    #[test]
+    fn plain_eviction_invalidates_tracking_clients() {
+        use crate::tracking::invalidation::test_support::GlobalTracker;
+        let via_budget = GlobalTracker::tracking(b"ev1013:budget");
+        let mut db = Database::new();
+        db.set_string(b"ev1013:budget", Bytes::from_static(b"v"));
+        let config = make_config(1, "allkeys-random");
+        assert!(evict_to_budget(&mut db, &config, EvictionRun::plain()).is_ok());
+        assert_eq!(db.len(), 0, "precondition: evicted");
+        assert_eq!(
+            via_budget.invalidated_keys(),
+            vec![Bytes::from_static(b"ev1013:budget")]
+        );
+
+        let via_quota = GlobalTracker::tracking(b"ev1013:quota");
+        db.set_string(b"ev1013:quota", Bytes::from_static(b"v"));
+        let policy = EvictionPolicy::from_str("allkeys-random");
+        assert!(evict_one_with_spill(
+            &mut db,
+            &config,
+            &policy,
+            None,
+            &mut |_| {}
+        ));
+        assert_eq!(db.len(), 0, "precondition: evicted");
+        assert_eq!(
+            via_quota.invalidated_keys(),
+            vec![Bytes::from_static(b"ev1013:quota")]
         );
     }
 
