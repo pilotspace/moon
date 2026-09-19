@@ -209,11 +209,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     slots and bounded in bytes by `--client-output-buffer-limit-normal`; past
     it the connection is closed through the `CLIENT KILL` path, which is what
     redis does at its output-buffer limit (measured: `normal 8192 0 0` closes
-    the tracker on that `MSET`). A burst is written in one socket write. A
-    REDIRECT target that is subscribed receives through its pub/sub channel:
-    one command's invalidations now take one slot there instead of one per
-    key, and a target whose channel is still full is disconnected rather than
-    silently shorted.
+    the tracker on that `MSET`). A burst is written in socket writes that
+    never exceed that limit, and a RESP2 connection, which redis writes
+    nothing for its own invalidations, queues nothing. A REDIRECT target that
+    is subscribed receives through its pub/sub channel: one command's
+    invalidations, or a whole script's or `EXEC` body's, now take one slot
+    there instead of one per key, and a target whose channel is still full is
+    disconnected rather than silently shorted.
   - moon#1089: a write made through `redis.call` invalidated nothing, and a
     read made inside a script was never tracked. The scripting bridge now
     applies tracking to every command a script runs, as redis does inside
