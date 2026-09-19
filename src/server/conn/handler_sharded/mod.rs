@@ -467,6 +467,11 @@ pub(crate) async fn handle_connection_sharded_inner<
             break;
         }
 
+        // CLIENT TRACKING REDIRECT inbox: registered only while subscribed,
+        // framed for the current protocol. Every UNSUBSCRIBE, RESET and HELLO
+        // path has run by here, before the connection waits again.
+        conn.sync_tracking_inbox(&ctx.tracking_table);
+
         // --- Subscriber mode: bidirectional select on client commands + published messages ---
         //
         // RESP2 ONLY, matching the monoio handler. A subscribed RESP3
@@ -751,7 +756,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                             continue;
                         }
                     };
-
+                    // CLIENT CACHING covers exactly the next command (moon#1049).
+                    // Before every intercept, so an unknown or refused command
+                    // consumes the flag exactly as redis's resetClient does.
+                    conn.tracking_state.before_command(cmd, conn.in_multi);
 
                     // Every intercept below answers through `shaped!()`, never through
                     // `responses` directly: an intercept short-circuits the dispatch exit
@@ -2105,7 +2113,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             resp3_shape,
                         ) {
                             responses.push(Frame::Null); // filled by the fold
-                            if conn.tracking_state.enabled && !conn.tracking_state.bcast {
+                            if conn.tracking_state.tracks_reads() {
                                 crate::tracking::invalidation::track_read_keys(
                                     &ctx.tracking_table,
                                     cmd,
@@ -2214,7 +2222,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 cmd_args,
                                 client_id,
                             );
-                            if conn.tracking_state.enabled && !conn.tracking_state.bcast {
+                            if conn.tracking_state.tracks_reads() {
                                 crate::tracking::invalidation::track_read_keys(
                                     &ctx.tracking_table,
                                     cmd,
@@ -3001,8 +3009,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     );
                                 }
                             }
-                            if conn.tracking_state.enabled
-                                && !conn.tracking_state.bcast
+                            if conn.tracking_state.tracks_reads()
                                 && !matches!(response, Frame::Error(_))
                             {
                                 crate::tracking::invalidation::track_read_keys(
@@ -3061,7 +3068,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // Remote READ by a tracking client: register the keys
                         // now (Redis tracks reads even for missing keys, so
                         // registering before the reply is faithful).
-                        if conn.tracking_state.enabled && !conn.tracking_state.bcast {
+                        if conn.tracking_state.tracks_reads() {
                             crate::tracking::invalidation::track_read_keys(
                                 &ctx.tracking_table,
                                 cmd,
@@ -3581,7 +3588,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                     None => std::future::pending().await,
                 }
             } => {
-                if let Some(push_frame) = push {
+                // A RESP2 connection cannot carry a push; redis writes it
+                // nothing (its invalidations reach it only as a REDIRECT
+                // target, through the pub/sub channel).
+                if let Some(push_frame) = push.filter(|_| {
+                    crate::tracking::client_cmd::push_deliverable(conn.protocol_version)
+                }) {
                     write_buf.clear();
                     crate::protocol::serialize_resp3(&push_frame, &mut write_buf);
                     if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) {

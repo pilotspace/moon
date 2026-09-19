@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`CLIENT TRACKINGINFO` and `CLIENT GETREDIR`** (refs moon#632), matching
+  redis 8.6.1 byte for byte: flags (`on`/`off`, `bcast`, `optin`,
+  `caching-yes`, `optout`, `caching-no`, `noloop`, `broken_redirect`), the
+  redirect id (`0` for none, `-1` with tracking off) and the sorted BCAST
+  prefixes; a map with a set of flags under RESP3. Both, and `CLIENT CACHING`
+  (moon#1049), are published in `COMMAND` and `CLIENT HELP` and queue inside
+  `MULTI`.
+
 - **Six sorted-set commands that were `unknown command`, and `ZADD ... INCR`**
   (moon#959). `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZREMRANGEBYRANK`,
   `ZREMRANGEBYSCORE`, `ZREMRANGEBYLEX` and `ZDIFFSTORE` are implemented, wired
@@ -220,6 +228,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parked runs within noise of the build before the wake existed. Every case
   was measured against redis-server 8.6.1 first (served within about 0.3 s)
   and now matches it at `--shards 1` and `--shards 4` on both runtimes.
+
+- **One `GRAPH.*` write no longer makes a restart discard every acknowledged
+  KV write** (moon#1018). This hits `runtime-tokio` with `--shards 1` and the
+  `graph` feature. That configuration has no `AofManifest`, so recovery picks
+  the KV authority itself: the shard's WAL v3 if replaying it produced KV
+  history, otherwise `appendonly.aof`. Every graph write lands in that WAL as a
+  `Command` record. Replay hands it to the graph engine, never to the keyspace,
+  yet it was counted as KV history. The AOF was skipped, and the keys lived
+  only there. Measured with `--appendfsync always` and `kill -9`: DBSIZE
+  3 → 0, and the same again on every later boot. Recovery now counts a record
+  only when replay applied it to the keyspace. The replay engine reports where
+  each record went (keyspace, cold plane, graph, or unhandled), so this does
+  not depend on an exclusion list: moon#914 and this issue each found a record
+  class such a list missed. A record this build cannot handle (for example,
+  `GRAPH.*` without the `graph` feature) no longer counts either. monoio, and
+  tokio with `--shards` ≥ 2, have a manifest and never reach this decision.
+  CI's per-PR `Test (graph)` step now also runs the recovery/replay unit tests
+  and `tests/graph_wal_kv_authority_1018.rs` under `runtime-tokio` + `graph`,
+  a combination no per-PR leg built before. It adds ~19 s.
+
+- **`CLIENT TRACKING ... REDIRECT <id>` now reaches its target, and
+  `CLIENT CACHING` works** (moon#1048, moon#1049). Every wire reply below was
+  read off redis-server 8.6.1 over a raw socket first.
+  - REDIRECT (the RESP2 client-side-caching pattern): a target subscribed to
+    `__redis__:invalidate` received nothing, for a write, an expiry, a BCAST
+    match or a `FLUSHALL`. It now gets `*3 message __redis__:invalidate
+    *1 <key>` (a flush sends a null payload); a RESP3 target gets the
+    `invalidate` push. `REDIRECT` to an id that does not exist (or `0`, or a
+    negative id) is refused with `-ERR The client ID you want redirect to does
+    not exist`, and when the target disconnects a RESP3 source is told
+    `tracking-redir-broken <id>` and `CLIENT TRACKINGINFO` reports
+    `broken_redirect`. Invalidations reach a target on any shard.
+  - `CLIENT CACHING yes|no` answered "unknown subcommand", so OPTIN tracked
+    every read and OPTOUT could opt out of none. It is implemented with redis's
+    errors and its one-command lifetime: the flag covers the NEXT command (or
+    the whole next transaction), survives other `CLIENT` subcommands and an
+    open `MULTI`, and is consumed by anything else — an unknown command
+    included.
+  - Reads inside `MULTI`/`EXEC` are now tracked, as redis tracks them; before
+    this only a transaction's writes invalidated. Each read is tracked under
+    the modes in force at its own position in the body: a `CLIENT CACHING`
+    queued mid-body covers only the commands after it, and a
+    `CLIENT TRACKING on` queued in the body tracks the reads after it — on
+    the local and the routed EXEC path alike.
+  - A REDIRECT target's invalidations are framed for the protocol it speaks
+    now (a `HELLO` or `RESET` since it first subscribed is honoured), and a
+    target that has unsubscribed from everything gets nothing, as in redis,
+    instead of collecting invalidations that its next `SUBSCRIBE` replayed.
+  - `CLIENT TRACKING` option errors now follow redis: an unknown option is
+    `syntax error`, `OPTIN` with `OPTOUT` and either with `BCAST` are refused,
+    switching OPTIN/OPTOUT or BCAST without turning tracking off first is
+    refused, a second `REDIRECT` is refused, overlapping BCAST prefixes are
+    refused, and re-enabling tracking replaces the redirect and flags instead
+    of being silently ignored.
+  - A RESP2 connection with tracking on (and no redirect) no longer has a
+    RESP3 `>` push frame written into its reply stream; redis sends it nothing.
+  - A RESP3 connection that tracks and is also subscribed now receives its
+    invalidations while idle; on the monoio runtime they waited until it
+    unsubscribed.
+  - Known gap: a RESP3 redirect target that neither subscribed nor enabled
+    tracking itself cannot be reached (redis pushes to it); giving every
+    connection a delivery channel would cost every idle connection its park
+    (moon#1078). Also still open: a burst of more than 256 invalidations to
+    one connection drops the excess silently (moon#1088), and writes and
+    reads made by scripts are invisible to tracking (moon#1089).
 
 - **`blocking_spanning_claim` bsc8 no longer fails its precondition on
   Linux when a waiter lands on its key's owner** (moon#1083). The test raced

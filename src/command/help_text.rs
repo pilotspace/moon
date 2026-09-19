@@ -67,6 +67,10 @@ const HELP_BODIES: &[(&str, &[&str])] = &[
     (
         "CLIENT",
         &[
+            "CACHING (YES|NO)",
+            "    Enable/disable tracking of the keys for next command in OPTIN/OPTOUT modes.",
+            "GETREDIR",
+            "    Return the client ID we are redirecting to when tracking is enabled.",
             "GETNAME",
             "    Return the name of the current connection.",
             "ID",
@@ -96,6 +100,8 @@ const HELP_BODIES: &[(&str, &[&str])] = &[
             "TRACKING (ON|OFF) [REDIRECT <id>] [BCAST] [PREFIX <prefix> [...]]",
             "         [OPTIN] [OPTOUT] [NOLOOP]",
             "    Control server assisted client side caching.",
+            "TRACKINGINFO",
+            "    Report tracking status for the current connection.",
             "UNPAUSE",
             "    Stop the current client pause, resuming traffic.",
         ],
