@@ -78,10 +78,12 @@ pub fn producer_wake_key_index(cmd: &[u8]) -> usize {
 /// several threads and then LOSES the waiter's claim puts the element back
 /// with this, in the same synchronous stretch as the pop.
 ///
-/// moon#1023 adds a fourth: a waiter whose client vanished while a serve was
-/// already committed rebuilds the undo from the reply it received
-/// ([`WakeUndo::from_reply`]) and hands it back to the key's owner.
-pub enum WakeUndo {
+/// Every user runs it in the SAME synchronous stretch as the pop, so nothing
+/// else can have touched the key in between. That is the whole reason it may
+/// exist at all: a put-back after an await would land on top of other
+/// clients' logged writes while the pop itself was never logged, and the
+/// master would diverge from its AOF and replicas (review F3 on PR #1045).
+pub(crate) enum WakeUndo {
     /// Values popped from the FRONT of the key, in pop order.
     ListFront(smallvec::SmallVec<[bytes::Bytes; 4]>),
     /// Values popped from the BACK of the key, in pop order.
@@ -98,121 +100,33 @@ pub enum WakeUndo {
     Zset(smallvec::SmallVec<[(bytes::Bytes, f64); 4]>),
 }
 
-impl WakeUndo {
-    /// The family whose waiters a restore can feed — the waker to re-run
-    /// after putting the element back.
-    pub fn family(&self) -> crate::blocking::WaitFamily {
-        match self {
-            WakeUndo::ListFront(_) | WakeUndo::ListBack(_) | WakeUndo::Moved { .. } => {
-                crate::blocking::WaitFamily::List
-            }
-            WakeUndo::Zset(_) => crate::blocking::WaitFamily::ZSet,
-        }
-    }
+/// The absolute TTL of `key` (ms), or 0 when it has none or is absent.
+///
+/// Read BEFORE a pop that may be put back: a pop that empties the key removes
+/// it, TTL and all, and the put-back recreates it from nothing (review F4).
+pub(crate) fn expiry_of(db: &mut Database, key: &Bytes) -> u64 {
+    db.get(key)
+        .filter(|e| e.has_expiry())
+        .map_or(0, |e| e.expires_at_ms())
+}
 
-    /// Rebuild the undo for a serve from the REPLY it produced (moon#1023):
-    /// the key it names and what left it.
+impl WakeUndo {
+    /// [`restore`](Self::restore), then give the key back the TTL it had
+    /// before the pop — `expires_at_ms` from [`expiry_of`], 0 for none.
     ///
-    /// The reply is the only record the waiter has — the owner that popped
-    /// kept nothing — and it is sufficient, because every destructive reply
-    /// names its key and carries the popped values verbatim. `keys` is the
-    /// command's key list; only `BLMOVE`/`BRPOPLPUSH`, whose reply is the bare
-    /// element, need it (they have exactly one source key).
-    ///
-    /// `None` for anything that removed nothing: an error, a null, a stream
-    /// read (`XREAD` leaves the entries in the stream; `XREADGROUP` leaves them
-    /// in the PEL of a consumer that vanished — Redis's own dead-consumer
-    /// state, recoverable with `XAUTOCLAIM`).
-    pub fn from_reply(
-        cmd: &BlockedCommand,
-        keys: &[Bytes],
-        frame: &Frame,
-    ) -> Option<(Bytes, Self)> {
-        fn bulk(f: &Frame) -> Option<&Bytes> {
-            match f {
-                Frame::BulkString(b) => Some(b),
-                _ => None,
-            }
-        }
-        fn score(f: &Frame) -> Option<f64> {
-            std::str::from_utf8(bulk(f)?).ok()?.parse::<f64>().ok()
-        }
-        match (cmd, frame) {
-            (BlockedCommand::BLPop | BlockedCommand::BRPop, Frame::Array(parts))
-                if parts.len() == 2 =>
-            {
-                let key = bulk(&parts[0])?.clone();
-                let v = smallvec::smallvec![bulk(&parts[1])?.clone()];
-                let undo = if matches!(cmd, BlockedCommand::BLPop) {
-                    WakeUndo::ListFront(v)
-                } else {
-                    WakeUndo::ListBack(v)
-                };
-                Some((key, undo))
-            }
-            (BlockedCommand::BZPopMin | BlockedCommand::BZPopMax, Frame::Array(parts))
-                if parts.len() == 3 =>
-            {
-                let key = bulk(&parts[0])?.clone();
-                let member = bulk(&parts[1])?.clone();
-                Some((
-                    key,
-                    WakeUndo::Zset(smallvec::smallvec![(member, score(&parts[2])?)]),
-                ))
-            }
-            (BlockedCommand::BLMPop { dir, .. }, Frame::Array(parts)) if parts.len() == 2 => {
-                let key = bulk(&parts[0])?.clone();
-                let Frame::Array(elems) = &parts[1] else {
-                    return None;
-                };
-                let vals = elems
-                    .iter()
-                    .map(|e| bulk(e).cloned())
-                    .collect::<Option<smallvec::SmallVec<[Bytes; 4]>>>()?;
-                let undo = match dir {
-                    Direction::Left => WakeUndo::ListFront(vals),
-                    Direction::Right => WakeUndo::ListBack(vals),
-                };
-                Some((key, undo))
-            }
-            (BlockedCommand::BZMPop { .. }, Frame::Array(parts)) if parts.len() == 2 => {
-                let key = bulk(&parts[0])?.clone();
-                let Frame::Array(elems) = &parts[1] else {
-                    return None;
-                };
-                let pairs = elems
-                    .iter()
-                    .map(|e| match e {
-                        Frame::Array(p) if p.len() == 2 => {
-                            Some((bulk(&p[0])?.clone(), score(&p[1])?))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Option<smallvec::SmallVec<[(Bytes, f64); 4]>>>()?;
-                Some((key, WakeUndo::Zset(pairs)))
-            }
-            (
-                BlockedCommand::BLMove {
-                    destination,
-                    wherefrom,
-                    whereto,
-                },
-                Frame::BulkString(value),
-            ) => Some((
-                keys.first()?.clone(),
-                WakeUndo::Moved {
-                    destination: destination.clone(),
-                    wherefrom: *wherefrom,
-                    whereto: *whereto,
-                    value: value.clone(),
-                },
-            )),
-            _ => None,
+    /// Review F4: a pop that emptied the key removed it, and `restore`
+    /// recreates it through the create-on-push path with NO TTL. The master
+    /// then held forever a key its replicas expire. A key that survived the
+    /// pop still carries its TTL, and is left alone.
+    pub(crate) fn restore_keeping_ttl(self, db: &mut Database, key: &Bytes, expires_at_ms: u64) {
+        self.restore(db, key);
+        if expires_at_ms != 0 && expiry_of(db, key) == 0 {
+            db.set_expiry(key, expires_at_ms);
         }
     }
 
     /// Put everything back exactly where it came from.
-    pub fn restore(self, db: &mut Database, key: &Bytes) {
+    pub(crate) fn restore(self, db: &mut Database, key: &Bytes) {
         match self {
             // Pops came off the front in order [v0, v1, ..]; pushing them
             // back front-first in REVERSE order restores the original
@@ -234,13 +148,12 @@ impl WakeUndo {
                 value,
             } => {
                 // Take back the element that was pushed onto the destination.
-                // On the wake path it is certainly still at the end it was
-                // pushed to — this runs on the shard thread with no await in
-                // between. A restore rebuilt from a reply (moon#1023) runs
-                // later, so the end is checked: if something else has been
-                // pushed there since, the move STANDS. The element is then in
-                // the destination rather than the source — misplaced by the
-                // client's own command, never lost.
+                // It is still at the end it was pushed to — this runs on the
+                // shard thread with no await in between. The value check is a
+                // guard, not a branch any caller expects to take: if the end
+                // ever held something else, the move STANDS (the element is
+                // misplaced by the client's own command, never lost) rather
+                // than taking another client's element.
                 let moved = match whereto {
                     Direction::Left => db.list_pop_front(&destination),
                     Direction::Right => db.list_pop_back(&destination),
@@ -287,6 +200,14 @@ pub fn try_wake_list_waiter(
     // The loop condition moved from `has_waiters` to the pop itself: a queue
     // holding only foreign waiters is not empty, so the old condition would
     // now spin forever.
+    // Review F1: a wake on a key that holds nothing must answer NOBODY. The
+    // loop below pops a waiter before it pops data, and a waiter popped for
+    // nothing is answered `None` — nil to a `BLPOP k 0`, which Redis never
+    // sends. Every producer calls this after a successful push, so the key
+    // exists; this guards the callers that cannot promise that.
+    if !db.exists(key) {
+        return false;
+    }
     let mut served = false;
     while let Some(waiter) =
         registry.pop_front_of_family(db_index, key, crate::blocking::WaitFamily::List)
@@ -308,6 +229,9 @@ pub fn try_wake_list_waiter(
         } = waiter;
 
         // Execute the pop based on command type
+        // Review F4: the TTL the key has before this pop, in case the pop
+        // empties it and has to be put back.
+        let expires_at_ms = expiry_of(db, key);
         let (result, undo) = match &cmd {
             BlockedCommand::BLPop => {
                 // Pop from left, return [key, value]
@@ -453,7 +377,15 @@ pub fn try_wake_list_waiter(
         // Clean up all other key registrations for this wait_id
         registry.remove_wait(wait_id);
 
-        if deliver(db, key, reply_tx, claim.as_ref(), result, undo) {
+        if deliver(
+            db,
+            key,
+            reply_tx,
+            claim.as_ref(),
+            result,
+            undo,
+            expires_at_ms,
+        ) {
             served = true;
             // moon#1019 review P3: one push can carry several elements, and
             // Redis keeps serving the key's waiters while it has data. Stopping
@@ -480,13 +412,14 @@ pub fn try_wake_list_waiter(
 ///   other client can have observed the round trip.
 /// * A2: a failed send (the receiver dropped after the liveness check) restores
 ///   the element and moves on instead of destroying it.
-fn deliver(
+pub(crate) fn deliver(
     db: &mut Database,
     key: &Bytes,
     reply_tx: crate::runtime::channel::OneshotSender<Option<Frame>>,
     claim: Option<&crate::blocking::ClaimToken>,
     result: Option<Frame>,
     undo: Option<WakeUndo>,
+    expires_at_ms: u64,
 ) -> bool {
     let Some(frame) = result else {
         // Nothing was popped (the key emptied under a registration that
@@ -499,7 +432,7 @@ fn deliver(
         return true;
     }
     if let Some(undo) = undo {
-        undo.restore(db, key);
+        undo.restore_keeping_ttl(db, key, expires_at_ms);
     }
     false
 }
@@ -521,6 +454,14 @@ pub fn try_wake_zset_waiter(
     // The loop condition moved from `has_waiters` to the pop itself: a queue
     // holding only foreign waiters is not empty, so the old condition would
     // now spin forever.
+    // Review F1: a wake on a key that holds nothing must answer NOBODY. The
+    // loop below pops a waiter before it pops data, and a waiter popped for
+    // nothing is answered `None` — nil to a `BLPOP k 0`, which Redis never
+    // sends. Every producer calls this after a successful push, so the key
+    // exists; this guards the callers that cannot promise that.
+    if !db.exists(key) {
+        return false;
+    }
     let mut served = false;
     while let Some(waiter) =
         registry.pop_front_of_family(db_index, key, crate::blocking::WaitFamily::ZSet)
@@ -539,6 +480,9 @@ pub fn try_wake_zset_waiter(
             ..
         } = waiter;
 
+        // Review F4: the TTL the key has before this pop, in case the pop
+        // empties it and has to be put back.
+        let expires_at_ms = expiry_of(db, key);
         let (result, undo) = match &cmd {
             BlockedCommand::BZPopMin => match db.zset_pop_min(key) {
                 Some((member, score)) => (
@@ -604,7 +548,15 @@ pub fn try_wake_zset_waiter(
         registry.remove_wait(wait_id);
 
         // Claim / A2 / keep-serving-while-data: see try_wake_list_waiter.
-        if deliver(db, key, reply_tx, claim.as_ref(), result, undo) {
+        if deliver(
+            db,
+            key,
+            reply_tx,
+            claim.as_ref(),
+            result,
+            undo,
+            expires_at_ms,
+        ) {
             served = true;
             if !db.exists(key) {
                 break;
@@ -612,25 +564,6 @@ pub fn try_wake_zset_waiter(
         }
     }
     served
-}
-
-/// Put back an element whose serve was committed but could not be delivered
-/// (moon#1023: the client vanished while the reply was in flight), then offer
-/// it to whoever else is parked on the key.
-///
-/// Runs on the shard that OWNS `key` — directly when that is the waiter's own
-/// shard, otherwise from a `BlockRestore` message. Returns true if the
-/// restored data answered another waiter.
-pub fn restore_and_rewake(
-    registry: &mut BlockingRegistry,
-    db: &mut Database,
-    db_index: usize,
-    key: &Bytes,
-    undo: WakeUndo,
-) -> bool {
-    let family = undo.family();
-    undo.restore(db, key);
-    wake_family(registry, db, db_index, key, family)
 }
 
 /// Which waker a producer command's write should raise, or `None` when the

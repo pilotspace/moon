@@ -411,15 +411,6 @@ pub struct BlockRegisterGroupPayload {
     pub ack: Option<channel::OneshotSender<()>>,
 }
 
-/// moon#1023: put back an element whose serve was committed but could not be
-/// delivered — the waiter's client vanished while the reply was in flight.
-/// Sent by the waiter to the shard that owns `key`.
-pub struct BlockRestorePayload {
-    pub db_index: usize,
-    pub key: Bytes,
-    pub undo: crate::blocking::wakeup::WakeUndo,
-}
-
 /// Portable raw socket file descriptor type.
 ///
 /// On Unix this is `std::os::unix::io::RawFd` (i32). On Windows (and any other
@@ -717,9 +708,6 @@ pub enum ShardMessage {
     BlockRegisterGroup(Box<BlockRegisterGroupPayload>),
     /// Cancel a blocked client registration (woken by another shard or timed out).
     BlockCancel { wait_id: u64 },
-    /// Put back an element whose committed serve could not be delivered
-    /// (moon#1023). Boxed like its siblings.
-    BlockRestore(Box<BlockRestorePayload>),
     /// Register a connected replica's per-shard sender channel with this shard.
     /// Called once per shard per replica when a new replica connection is established.
     /// The shard adds a [`ReplicaFanout`] entry to its replica_txs list for

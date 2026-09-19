@@ -2321,6 +2321,13 @@ pub(crate) fn handle_shard_message_shared(
                 reply_tx,
                 claim,
             } = *payload;
+            // The waiter already gave up (its wait ended before this message
+            // was drained). Registering it would only leave a ghost entry for
+            // the next push to reap; answering it an error nobody reads is
+            // worse.
+            if !claim.is_open() {
+                return;
+            }
             // moon#556: THIS shard owns the key, so it is the only one that
             // can answer the type question for it. A blocking pop on an
             // existing key of the wrong type is an immediate `-WRONGTYPE` in
@@ -2404,6 +2411,9 @@ pub(crate) fn handle_shard_message_shared(
             // at most once here; its claim token (moon#1019) makes that "at
             // most once" hold across shards too.
             let db_index = payload.db_index;
+            if payload.ack.is_some() {
+                crate::blocking::group::stall_acked_run_for_test();
+            }
             let mut reg = blocking_registry.borrow_mut();
             crate::shard::slice::with_shard_db(db_index, |guard| {
                 crate::blocking::group::register_group(&mut reg, guard, *payload);
@@ -2411,20 +2421,6 @@ pub(crate) fn handle_shard_message_shared(
         }
         ShardMessage::BlockCancel { wait_id } => {
             blocking_registry.borrow_mut().remove_wait(wait_id);
-        }
-        ShardMessage::BlockRestore(payload) => {
-            // moon#1023: a serve this shard committed reached a client that
-            // was already gone. Put the element back and offer it to whoever
-            // else is parked on the key.
-            let crate::shard::dispatch::BlockRestorePayload {
-                db_index,
-                key,
-                undo,
-            } = *payload;
-            let mut reg = blocking_registry.borrow_mut();
-            crate::shard::slice::with_shard_db(db_index, |guard| {
-                crate::blocking::wakeup::restore_and_rewake(&mut reg, guard, db_index, &key, undo);
-            });
         }
         ShardMessage::GetKeysInSlot {
             db_index,

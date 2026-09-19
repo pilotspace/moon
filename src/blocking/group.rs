@@ -70,6 +70,25 @@ pub fn register_group(
     }
 }
 
+/// Test-only fault injection: hold this owner shard's thread for this many
+/// milliseconds before it handles a run that a waiter is waiting to have
+/// ACKNOWLEDGED — an owner busy with other work, as far as the waiter can
+/// tell. Read once; unset or unparsable is a no-op. Production cost: one
+/// `OnceLock` load per acknowledged run (spanning waiters only).
+pub fn stall_acked_run_for_test() {
+    static STALL: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    let stall = *STALL.get_or_init(|| {
+        std::env::var("MOON_TEST_BLOCK_ACK_STALL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(std::time::Duration::ZERO)
+    });
+    if !stall.is_zero() {
+        std::thread::sleep(stall);
+    }
+}
+
 fn register_run(
     registry: &mut BlockingRegistry,
     db: &mut Database,

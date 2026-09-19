@@ -41,6 +41,15 @@ pub(crate) enum BlockingOutcome {
     /// `shutdown(2)`). Every registration this waiter held has already been
     /// torn down; the caller must close the connection without replying.
     PeerGone,
+    /// The peer went away, but a shard had ALREADY served it: the element
+    /// left the keyspace and the frame is its reply (moon#1023, review F3).
+    ///
+    /// The serve stands, as in redis. The caller must do everything it does
+    /// for a delivered reply EXCEPT write it: invalidate tracking and append
+    /// the pop's AOF/replication record, so the master and every replica keep
+    /// one history. Then it closes the connection as for
+    /// [`PeerGone`](BlockingOutcome::PeerGone).
+    ServedPeerGone(Frame),
 }
 
 /// Scratch size for one drain of a blocked client's socket. Only ever used by
@@ -476,7 +485,6 @@ where
         selected_db,
         blocking_registry,
         shard_id,
-        num_shards,
         dispatch_tx,
         shutdown,
         notifiers: None,
@@ -580,7 +588,7 @@ where
                     &mut futures::stream::once(&mut reply_rx),
                 )
                 .await;
-                finish_unserved(&ctx, end, served, &*blocked_cmd_factory, &keys).await
+                finish_unserved(end, served)
             }
         };
         // Cleanup remote registration on timeout/shutdown.
@@ -653,10 +661,11 @@ where
                 token,
                 pending_runs,
                 &mut registered_remote_shards,
+                deadline,
             )
             .await
         }
-        None => true,
+        None => Ok(()),
     };
 
     // Await first successful result from any key/shard.
@@ -666,8 +675,11 @@ where
     // A1: `PeerGone` ends the same loop as every other terminal condition,
     // so the shared cleanup below runs identically — a vanished multi-key
     // waiter unwinds ALL of its registrations, local and remote.
-    let ended: Result<Frame, WaitEnd> = if !registered {
-        Err(WaitEnd::RegisterFailed)
+    // Review F2: a registration phase that ended the wait (the client's
+    // deadline passed while an owner was slow to acknowledge, or shutdown)
+    // is settled exactly like the same end inside the loop.
+    let ended: Result<Frame, WaitEnd> = if let Err(end) = registered {
+        Err(end)
     } else if let Some(dl) = deadline {
         let sleep = tokio::time::sleep(dl.saturating_duration_since(std::time::Instant::now()));
         tokio::pin!(sleep);
@@ -713,7 +725,7 @@ where
             blocking_registry.borrow_mut().remove_wait(wait_id);
             settle_delay_for_test().await;
             let served = super::blocking_multikey::settle(claim.as_ref(), &mut receivers).await;
-            finish_unserved(&ctx, end, served, &*blocked_cmd_factory, &keys).await
+            finish_unserved(end, served)
         }
     };
 
@@ -806,7 +818,6 @@ where
         selected_db,
         blocking_registry,
         shard_id,
-        num_shards,
         dispatch_tx,
         shutdown,
         notifiers: Some(spsc_notifiers),
@@ -913,7 +924,7 @@ where
                     &mut futures::stream::once(&mut reply_rx),
                 )
                 .await;
-                finish_unserved(&ctx, end, served, &*blocked_cmd_factory, &keys).await
+                finish_unserved(end, served)
             }
         };
         if is_remote {
@@ -964,17 +975,21 @@ where
                 token,
                 pending_runs,
                 &mut registered_remote_shards,
+                deadline,
             )
             .await
         }
-        None => true,
+        None => Ok(()),
     };
 
     // Await first successful result from any key/shard.
     // FuturesUnordered may return Err (sender dropped by remove_wait cleanup) before
     // returning the successful Ok. We must skip Err/None results and keep polling.
-    let ended: Result<Frame, WaitEnd> = if !registered {
-        Err(WaitEnd::RegisterFailed)
+    // Review F2: a registration phase that ended the wait (the client's
+    // deadline passed while an owner was slow to acknowledge, or shutdown)
+    // is settled exactly like the same end inside the loop.
+    let ended: Result<Frame, WaitEnd> = if let Err(end) = registered {
+        Err(end)
     } else if let Some(dl) = deadline {
         let mut sleep = std::pin::pin!(monoio::time::sleep(
             dl.saturating_duration_since(std::time::Instant::now())
@@ -1021,7 +1036,7 @@ where
             blocking_registry.borrow_mut().remove_wait(wait_id);
             settle_delay_for_test().await;
             let served = super::blocking_multikey::settle(claim.as_ref(), &mut receivers).await;
-            finish_unserved(&ctx, end, served, &*blocked_cmd_factory, &keys).await
+            finish_unserved(end, served)
         }
     };
 

@@ -43,8 +43,9 @@
 //! * `Dead` — no shard served and none ever can; the receivers hold nothing of
 //!   value and are dropped. This is why no drain is needed on this branch.
 //! * `Claimed` — a serve is committed and its reply is in flight on exactly one
-//!   receiver; it is taken, and then delivered (timeout, shutdown) or its
-//!   element restored to its owner (vanished peer).
+//!   receiver; it is taken, and then delivered (timeout, shutdown) or, for a
+//!   vanished peer, left standing and logged like a delivered reply
+//!   ([`finish_unserved`] says why it is never put back).
 //!
 //! A waiter with no token (every key local) settles by draining after its
 //! synchronous `remove_wait`: nothing can send after that on a single thread,
@@ -203,18 +204,31 @@ where
     match claim.map(ClaimToken::settle) {
         Some(Settled::Dead) => None,
         Some(Settled::Claimed) => await_committed(receivers).await,
-        None => {
-            // Local only. Every sender was dropped by `remove_wait` or has
-            // already sent, so each poll resolves; the bound is belt and
-            // braces against a stream that yields spuriously.
-            for _ in 0..1024 {
-                match receivers.next().now_or_never() {
-                    Some(Some(Ok(Some(frame)))) => return Some(frame),
-                    Some(Some(_)) => continue,
-                    Some(None) | None => return None,
-                }
-            }
-            None
+        None => drain_resolved(receivers),
+    }
+}
+
+/// Local only: every sender was dropped by `remove_wait` or has already
+/// sent, so every receiver is resolved and one pass finds any buffered reply
+/// — for any number of keys.
+///
+/// A `Pending` from a resolved set can only be `FuturesUnordered`'s
+/// cooperative yield (it hands back control after polling `len` futures and
+/// wakes itself); the next poll resumes where it stopped. So a `Pending` ends
+/// the drain only when the poll before it made no progress either — two in a
+/// row with nothing consumed means the set is genuinely empty of ready items.
+fn drain_resolved<S>(receivers: &mut S) -> Option<Frame>
+where
+    S: futures::Stream<Item = Result<Option<Frame>, channel::RecvError>> + Unpin,
+{
+    let mut idle = false;
+    loop {
+        match receivers.next().now_or_never() {
+            Some(Some(Ok(Some(frame)))) => return Some(frame),
+            Some(Some(_)) => idle = false,
+            Some(None) => return None,
+            None if idle => return None,
+            None => idle = true,
         }
     }
 }
@@ -261,49 +275,56 @@ where
     }
 }
 
-/// Wait for a run's acknowledgement, bounded and shutdown-aware. `false`
-/// means the run's owner did not answer — treat as a failed registration.
+/// Wait for a run's acknowledgement — but never past the client's own
+/// deadline, and never through a shutdown (review F2 on PR #1045).
+///
+/// The registration phase runs BEFORE the wait loop arms the client's timer,
+/// so this is the only thing standing between a slow owner and the client's
+/// timeout: `BLPOP q1 q2 q3 1` against an owner busy for 5 s used to answer at
+/// ~5 s, and past 30 s it answered `MOONERR` instead of nil. Now:
+///
+/// * the ack arrives → `Ok(())`, register the next run;
+/// * the deadline passes first → [`WaitEnd::Timeout`], settled and cleaned up
+///   exactly like a timeout in the wait loop (an earlier run may have served
+///   the waiter meanwhile — the settle finds that);
+/// * shutdown → [`WaitEnd::Shutdown`], the ordinary shutdown reply;
+/// * the owner dropped the ack unsent (it is shutting down and discarded the
+///   message) → [`WaitEnd::RegisterFailed`].
+///
+/// With no deadline (`timeout 0`) there is no bound: the client asked to wait
+/// forever, and an owner that never answers is a wedged shard — an incident a
+/// fabricated error would only hide.
 pub(super) async fn await_run_ack(
     ack: channel::OneshotReceiver<()>,
-    shutdown: &crate::runtime::cancel::CancellationToken,
-) -> bool {
+    shutdown: &CancellationToken,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), WaitEnd> {
     use crate::runtime::race::{Arm, race2};
     use crate::runtime::{TimerImpl, traits::RuntimeTimer};
     let ack = std::pin::pin!(ack);
     let stop = std::pin::pin!(async {
         let cancelled = std::pin::pin!(shutdown.cancelled());
-        let bound = std::pin::pin!(TimerImpl::sleep(
-            crate::shard::dispatch::XSHARD_REPLY_TIMEOUT
-        ));
-        let _ = race2(cancelled, bound).await;
+        match deadline {
+            Some(dl) => {
+                let sleep = std::pin::pin!(TimerImpl::sleep(
+                    dl.saturating_duration_since(std::time::Instant::now())
+                ));
+                match race2(cancelled, sleep).await {
+                    Arm::First(()) => WaitEnd::Shutdown,
+                    Arm::Second(()) => WaitEnd::Timeout,
+                }
+            }
+            None => {
+                cancelled.await;
+                WaitEnd::Shutdown
+            }
+        }
     });
-    matches!(race2(ack, stop).await, Arm::First(Ok(())))
-}
-
-/// What a committed serve that could not be delivered must do: the element
-/// goes back to `key` on `owner` (moon#1023).
-pub(super) struct Restore {
-    pub owner: usize,
-    pub key: Bytes,
-    pub undo: crate::blocking::wakeup::WakeUndo,
-}
-
-/// Rebuild the restore for `frame`, a committed reply whose client is gone.
-/// `None` when the reply removed nothing (an error, a stream read).
-pub(super) fn restore_for(
-    cmd: &BlockedCommand,
-    keys: &[Bytes],
-    frame: &Frame,
-    shard_id: usize,
-    num_shards: usize,
-) -> Option<Restore> {
-    let (key, undo) = crate::blocking::wakeup::WakeUndo::from_reply(cmd, keys, frame)?;
-    let owner = if num_shards > 1 {
-        key_to_shard(&key, num_shards)
-    } else {
-        shard_id
-    };
-    Some(Restore { owner, key, undo })
+    match race2(ack, stop).await {
+        Arm::First(Ok(())) => Ok(()),
+        Arm::First(Err(_)) => Err(WaitEnd::RegisterFailed),
+        Arm::Second(end) => Err(end),
+    }
 }
 
 /// Test-only fault injection (moon#1023): hold a blocking wait that ended
@@ -333,7 +354,6 @@ pub(super) struct BlockCtx<'a> {
     pub(super) selected_db: usize,
     pub(super) blocking_registry: &'a Rc<RefCell<crate::blocking::BlockingRegistry>>,
     pub(super) shard_id: usize,
-    pub(super) num_shards: usize,
     pub(super) dispatch_tx: &'a Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     pub(super) shutdown: &'a CancellationToken,
     pub(super) notifiers: Option<&'a [std::sync::Arc<channel::Notify>]>,
@@ -351,16 +371,19 @@ impl BlockCtx<'_> {
 /// Stops early once the claim is taken — an earlier run already answered the
 /// waiter (a pop or a `-WRONGTYPE`), so nothing after it may be consulted.
 /// Every owner a registration was delivered to is appended to `registered`,
-/// for the `BlockCancel` fan-out. Returns `false` if a run could not be
-/// registered: its ring stayed full for the whole push budget, or its owner
-/// never acknowledged.
+/// for the `BlockCancel` fan-out.
+///
+/// `Err` ends the wait before the wait loop starts, with the reason to settle
+/// it by: [`WaitEnd::RegisterFailed`] when a run could not be delivered, or
+/// whatever ended the wait for an acknowledgement ([`await_run_ack`]).
 pub(super) async fn register_runs(
     ctx: &BlockCtx<'_>,
     wait_id: u64,
     claim: &crate::blocking::ClaimToken,
     runs: Vec<PendingRun>,
     registered: &mut Vec<usize>,
-) -> bool {
+    deadline: Option<std::time::Instant>,
+) -> Result<(), WaitEnd> {
     let total = runs.len();
     for (i, run) in runs.into_iter().enumerate() {
         if !claim.is_open() {
@@ -405,105 +428,56 @@ pub(super) async fn register_runs(
         )
         .await
         {
-            return false;
+            return Err(WaitEnd::RegisterFailed);
         }
         if !registered.contains(&owner) {
             registered.push(owner);
         }
-        if let Some(ack) = ack_rx
-            && !await_run_ack(ack, ctx.shutdown).await
-        {
-            return false;
+        if let Some(ack) = ack_rx {
+            await_run_ack(ack, ctx.shutdown, deadline).await?;
         }
     }
-    true
+    Ok(())
 }
 
 /// The answer a wait owes once it ended without a reply from a key.
 ///
-/// `served` is the committed serve [`settle`](settle)
-/// found, if any (moon#1023). A client that is still connected receives it —
-/// on a timeout redis would have answered it too (the serve happened before
-/// the timeout was observed), and on shutdown the reply is the only place the
-/// element still exists. A client that is gone cannot receive it, so its
-/// element goes back to the key it came from.
-pub(super) async fn finish_unserved(
-    ctx: &BlockCtx<'_>,
+/// `served` is the committed serve [`settle`] found, if any (moon#1023). A
+/// client that is still connected receives it — on a timeout redis would have
+/// answered it too (the serve happened before the timeout was observed), and
+/// on shutdown the reply is the only place the element still exists.
+///
+/// A client that is GONE cannot receive it, and the serve STANDS: the caller
+/// logs its effect exactly as for a delivered reply and closes
+/// ([`ServedPeerGone`](super::blocking::BlockingOutcome::ServedPeerGone)).
+/// That is what redis does — it pops and propagates when it serves, and a
+/// client that disconnects with the reply in its output buffer loses it.
+///
+/// Putting the element back instead (the first cut of moon#1023) is not
+/// sound here (review F3 on PR #1045). The owner's pop is not logged when it
+/// happens; its record is written by the connection, from the reply. A
+/// restore therefore lands AFTER whatever other clients logged meanwhile, on
+/// top of a pop the log never saw. `RPUSH k a` → served, client gone →
+/// `RPUSH k b; LPOP k` (logged) → restore `a`: the master holds `[a]` while
+/// the AOF and every replica replay `[b]`. Logging the restore does not help
+/// either — the unlogged pop is still missing from the history it would be
+/// appended to. Only "the serve happened, and is logged" keeps one history.
+pub(super) fn finish_unserved(
     end: WaitEnd,
     served: Option<Frame>,
-    cmd: &dyn Fn() -> crate::blocking::BlockedCommand,
-    keys: &[Bytes],
 ) -> super::blocking::BlockingOutcome {
+    use super::blocking::BlockingOutcome;
     match (end, served) {
-        (WaitEnd::PeerGone, Some(frame)) => {
-            restore_undelivered(ctx, &cmd(), keys, &frame).await;
-            super::blocking::BlockingOutcome::PeerGone
-        }
-        (_, Some(frame)) => super::blocking::BlockingOutcome::Reply(frame),
-        (WaitEnd::Timeout, None) => super::blocking::BlockingOutcome::Reply(Frame::NullArray),
-        (WaitEnd::Shutdown, None) => super::blocking::BlockingOutcome::Reply(Frame::Error(
-            Bytes::from_static(b"ERR server shutting down"),
-        )),
-        (WaitEnd::PeerGone, None) => super::blocking::BlockingOutcome::PeerGone,
-        (WaitEnd::RegisterFailed, None) => super::blocking::BlockingOutcome::Reply(Frame::Error(
+        (WaitEnd::PeerGone, Some(frame)) => BlockingOutcome::ServedPeerGone(frame),
+        (_, Some(frame)) => BlockingOutcome::Reply(frame),
+        (WaitEnd::Timeout, None) => BlockingOutcome::Reply(Frame::NullArray),
+        (WaitEnd::Shutdown, None) => BlockingOutcome::Reply(Frame::Error(Bytes::from_static(
+            b"ERR server shutting down",
+        ))),
+        (WaitEnd::PeerGone, None) => BlockingOutcome::PeerGone,
+        (WaitEnd::RegisterFailed, None) => BlockingOutcome::Reply(Frame::Error(
             Bytes::from_static(super::blocking::BLOCK_REGISTER_FAILED),
         )),
-    }
-}
-
-/// Put a committed-but-undeliverable serve's element back on the shard that
-/// owns its key, and let whoever else is parked there have it (moon#1023).
-///
-/// Nothing was logged for it: the AOF/replication record of a blocking pop is
-/// written by the connection from the reply it DELIVERS (`blocking_effect`),
-/// and this reply is never delivered — so an in-memory restore leaves the
-/// durability planes consistent.
-async fn restore_undelivered(
-    ctx: &BlockCtx<'_>,
-    cmd: &crate::blocking::BlockedCommand,
-    keys: &[Bytes],
-    frame: &Frame,
-) {
-    let Some(Restore { owner, key, undo }) =
-        restore_for(cmd, keys, frame, ctx.shard_id, ctx.num_shards)
-    else {
-        return;
-    };
-    if owner == ctx.shard_id {
-        crate::shard::slice::with_shard_db(ctx.selected_db, |db| {
-            crate::blocking::wakeup::restore_and_rewake(
-                &mut ctx.blocking_registry.borrow_mut(),
-                db,
-                ctx.selected_db,
-                &key,
-                undo,
-            );
-        });
-        return;
-    }
-    let msg = ShardMessage::BlockRestore(Box::new(crate::shard::dispatch::BlockRestorePayload {
-        db_index: ctx.selected_db,
-        key,
-        undo,
-    }));
-    if !super::blocking::push_block_msg(
-        ctx.shutdown,
-        ctx.dispatch_tx,
-        ctx.shard_id,
-        owner,
-        msg,
-        ctx.notifier(owner),
-    )
-    .await
-    {
-        // Same budget as every blocking control message (A4); an owner that
-        // does not drain its ring for ~0.5 s is already an incident.
-        tracing::warn!(
-            from_shard = ctx.shard_id,
-            owner_shard = owner,
-            "BlockRestore undelivered: owner shard not draining; the element of a serve \
-             whose client disconnected is lost"
-        );
     }
 }
 
@@ -662,35 +636,41 @@ mod tests {
         assert_eq!(block_on(settle(None, &mut rxs)), Some(frame));
     }
 
-    /// The restore names the key's OWNER, which is where the element must go.
+    /// Review P3: the local drain is correct for ANY key count. It used to
+    /// give up after 1024 items, so a reply behind 1024+ closed receivers
+    /// (a `BLPOP` over that many keys) was dropped with its element.
     #[test]
-    fn restore_targets_the_owner_of_the_replied_key() {
-        const N: usize = 4;
-        let key = pick(3, "r", N);
-        let frame = Frame::Array(crate::framevec![
-            Frame::BulkString(key.clone()),
-            Frame::BulkString(Bytes::from_static(b"v")),
-        ]);
-        let r = restore_for(
-            &BlockedCommand::BLPop,
-            std::slice::from_ref(&key),
-            &frame,
-            0,
-            N,
-        )
-        .expect("a pop is restorable");
-        assert_eq!(r.owner, 3);
-        assert_eq!(r.key, key);
-        assert!(
-            restore_for(
-                &BlockedCommand::BLPop,
-                &[key],
-                &Frame::Error(Bytes::from_static(b"ERR x")),
-                0,
-                N
-            )
-            .is_none(),
-            "an error removed nothing"
-        );
+    fn settle_local_drain_finds_a_reply_behind_any_number_of_keys() {
+        for closed in [0usize, 1, 1_023, 1_024, 5_000] {
+            let mut rxs: FuturesUnordered<channel::OneshotReceiver<Option<Frame>>> =
+                FuturesUnordered::new();
+            for _ in 0..closed {
+                let (tx, rx) = channel::oneshot::<Option<Frame>>();
+                rxs.push(rx);
+                drop(tx);
+            }
+            let (tx, rx) = channel::oneshot();
+            rxs.push(rx);
+            let frame = Frame::BulkString(Bytes::from_static(b"v"));
+            assert!(tx.send(Some(frame.clone())).is_ok());
+            assert_eq!(
+                block_on(settle(None, &mut rxs)),
+                Some(frame),
+                "{closed} closed receivers ahead of the reply"
+            );
+        }
+    }
+
+    /// The local drain also terminates when there is nothing to find.
+    #[test]
+    fn settle_local_drain_of_closed_receivers_yields_nothing() {
+        let mut rxs: FuturesUnordered<channel::OneshotReceiver<Option<Frame>>> =
+            FuturesUnordered::new();
+        for _ in 0..3_000 {
+            let (tx, rx) = channel::oneshot::<Option<Frame>>();
+            rxs.push(rx);
+            drop(tx);
+        }
+        assert!(block_on(settle(None, &mut rxs)).is_none());
     }
 }

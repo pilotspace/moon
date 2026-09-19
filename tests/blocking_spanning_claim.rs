@@ -53,20 +53,51 @@ struct Moon {
     child: Child,
     port: u16,
     tmp_dir: std::path::PathBuf,
+    /// A restart test owns its data dir and must keep it across the kill.
+    keep_dir: bool,
 }
 
 impl Drop for Moon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.tmp_dir);
+        if !self.keep_dir {
+            let _ = std::fs::remove_dir_all(&self.tmp_dir);
+        }
     }
 }
 
+/// The two test hooks this suite drives. Every spawn sets or clears BOTH, so
+/// a value in the test runner's own environment can never leak in.
+const HOOKS: [&str; 2] = [
+    "MOON_TEST_BLOCK_SETTLE_DELAY_MS",
+    "MOON_TEST_BLOCK_ACK_STALL_MS",
+];
+
 fn spawn_moon(shards: usize, settle_delay_ms: Option<u64>) -> Moon {
-    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"));
+    let env: Vec<(&str, u64)> = settle_delay_ms
+        .map(|ms| (HOOKS[0], ms))
+        .into_iter()
+        .collect();
+    spawn_moon_opts(shards, &env, &["--appendonly", "no"], None)
+}
+
+/// `env`: hook values to set. `extra`: extra server flags. `dir`: a data dir
+/// the caller owns (kept on drop, for restart tests); `None` for a fresh one.
+fn spawn_moon_opts(
+    shards: usize,
+    env: &[(&str, u64)],
+    extra: &[&str],
+    dir: Option<&std::path::Path>,
+) -> Moon {
+    // `MOON_BIN` first, so a RED/GREEN A/B runs the binary it names.
+    let bin = common::find_moon_binary();
+    let dir_for = |port: u16| match dir {
+        Some(d) => d.to_path_buf(),
+        None => std::env::temp_dir().join(format!("moon-bsc-{port}")),
+    };
     let (child, port) = common::spawn_listening(|port| {
-        let tmp_dir = std::env::temp_dir().join(format!("moon-bsc-{port}"));
+        let tmp_dir = dir_for(port);
         let _ = std::fs::create_dir_all(&tmp_dir);
         let mut cmd = Command::new(&bin);
         cmd.args([
@@ -76,32 +107,38 @@ fn spawn_moon(shards: usize, settle_delay_ms: Option<u64>) -> Moon {
             &shards.to_string(),
             "--admin-port",
             "0",
-            "--appendonly",
-            "no",
             "--disk-free-min-pct",
             "0",
             "--dir",
             tmp_dir.to_str().unwrap_or("/tmp"),
         ])
+        .args(extra)
         .stdout(Stdio::null())
         .stderr(
-            std::fs::File::create(tmp_dir.join("moon.stderr")).expect("create moon stderr log"),
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(tmp_dir.join("moon.stderr"))
+                .expect("open moon stderr log"),
         );
-        match settle_delay_ms {
-            Some(ms) => {
-                cmd.env("MOON_TEST_BLOCK_SETTLE_DELAY_MS", ms.to_string());
-            }
-            None => {
-                cmd.env_remove("MOON_TEST_BLOCK_SETTLE_DELAY_MS");
+        for hook in HOOKS {
+            match env.iter().find(|(k, _)| *k == hook) {
+                Some((_, v)) => {
+                    cmd.env(hook, v.to_string());
+                }
+                None => {
+                    cmd.env_remove(hook);
+                }
             }
         }
         cmd.spawn().expect("spawn moon")
     });
-    let tmp_dir = std::env::temp_dir().join(format!("moon-bsc-{port}"));
+    let tmp_dir = dir_for(port);
     let moon = Moon {
         child,
         port,
         tmp_dir,
+        keep_dir: dir.is_some(),
     };
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
@@ -650,11 +687,17 @@ fn bsc4_timeout_racing_a_serve_keeps_the_element() {
     );
 }
 
-/// A wait whose client DISCONNECTS while an owner serves it: nobody can
-/// receive the element, so it must be back in the key.
+/// A wait whose client DISCONNECTS: once the server has observed it, no owner
+/// may serve the dead waiter — a later push stays in the key, as in redis.
+///
+/// A serve that commits BEFORE the disconnect is observed stands (redis serves
+/// a client whose socket closed but is not yet noticed, and propagates the
+/// pop); that serve is logged like a delivered reply, and bsc8 proves the
+/// master and its AOF agree about it. Putting the element back instead would
+/// land on top of third-party writes the log already holds.
 #[test]
-fn bsc5_disconnect_racing_a_serve_restores_the_element() {
-    let m = spawn_moon(SHARDS, Some(SETTLE_MS));
+fn bsc5_a_push_after_an_observed_disconnect_stays_in_the_key() {
+    let m = spawn_moon(SHARDS, None);
     let mut admin = Conn::open(m.port);
     let mut lost = Vec::new();
     let mut runs = 0usize;
@@ -681,22 +724,22 @@ fn bsc5_disconnect_racing_a_serve_restores_the_element() {
         let mut sock = TcpStream::connect(("127.0.0.1", m.port)).expect("connect");
         sock.write_all(&common::encode(&argv)).expect("write");
         await_blocked(&mut admin, owners(&keys), "waiter registration");
-        // The peer goes away; the server notices, and holds the window open.
+        // The peer goes away; wait until the server has observed it.
         let _ = sock.shutdown(std::net::Shutdown::Both);
         drop(sock);
-        std::thread::sleep(Duration::from_millis(150));
+        await_blocked(&mut admin, 0, "disconnect observed");
         push_one(&mut admin, Kind::List, &push_key, "v");
-        std::thread::sleep(Duration::from_millis(SETTLE_MS + 400));
+        std::thread::sleep(Duration::from_millis(200));
         let left = card(&mut admin, Kind::List, &push_key);
         if left != 1 {
             lost.push(format!(
-                "  {label}: pushed 1, nobody received it, left {left}  <-- ELEMENT DESTROYED"
+                "  {label}: pushed 1 after the disconnect was observed, left {left}  <-- SERVED A DEAD WAITER"
             ));
         }
     }
     assert!(
         lost.is_empty(),
-        "{} of {runs} disconnected waits destroyed a racing serve (moon#1023):\n{}",
+        "{} of {runs} observed disconnects still consumed a later push (moon#1023):\n{}",
         lost.len(),
         lost.join("\n")
     );
@@ -752,6 +795,129 @@ fn bsc6_one_push_serves_every_waiter_its_elements_cover() {
     assert!(
         wrong.is_empty(),
         "one push served one waiter:\n{}",
+        wrong.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review F2 — the run acknowledgement must not outlive the client's timeout
+// ---------------------------------------------------------------------------
+
+/// How long `MOON_TEST_BLOCK_ACK_STALL_MS` holds an owner before it answers
+/// an acknowledged run — a shard busy with other work, as far as the waiter
+/// can tell.
+const ACK_STALL_MS: u64 = 3_000;
+
+/// `BLPOP q1 q2 q3 0.5` with a slow owner answers at its OWN timeout: nil at
+/// ~0.5 s, not whenever the owner gets round to acknowledging (and never a
+/// `MOONERR`). The registration phase used to wait for the ack with no regard
+/// for the client's deadline.
+#[test]
+fn bsc7_a_slow_owner_does_not_stretch_the_timeout() {
+    let m = spawn_moon_opts(
+        SHARDS,
+        &[(HOOKS[1], ACK_STALL_MS)],
+        &["--appendonly", "no"],
+        None,
+    );
+    let mut wrong = Vec::new();
+    for i in 0..2 {
+        let keys = spanning_three("stall", i);
+        let mut probe = Conn::open(m.port);
+        let argv: Vec<String> = ["BLPOP", &keys[0], &keys[1], &keys[2], "0.5"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let started = Instant::now();
+        let reply = send(&mut probe, &argv);
+        let took = started.elapsed();
+        if reply != "nil" || took >= Duration::from_millis(1_500) {
+            wrong.push(format!(
+                "  placement {i}: BLPOP ... 0.5 answered {reply} after {took:?} \
+                 (want nil at ~0.5s; an owner stalled {ACK_STALL_MS}ms)"
+            ));
+        }
+        // Let the stalled owner drain before the next placement.
+        std::thread::sleep(Duration::from_millis(ACK_STALL_MS + 200));
+    }
+    assert!(
+        wrong.is_empty(),
+        "the client timeout waited on a slow owner:\n{}",
+        wrong.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review F3 — a disconnected serve is never undone over later writes
+// ---------------------------------------------------------------------------
+
+/// A client in `BLPOP k 0` disconnects while an owner serves it; meanwhile a
+/// third party writes the key. The serve STANDS — as in redis, which pops and
+/// propagates when it serves and loses the reply with the socket — so the
+/// master ends with exactly the keyspace that history produces.
+///
+/// The old peer-gone restore put `a` back after the third party's writes had
+/// been applied and logged, on top of a pop the log never saw: after
+/// `RPUSH k b; LPOP k` the master held `[a]` while the AOF replayed `[b]`, and
+/// after `DEL k` the deleted key came back.
+///
+/// This asserts the master, not the AOF, on purpose. The record of ANY
+/// blocking serve, delivered or not, is written by the waiter's connection
+/// (moon#827), to the connection's own shard AOF; for a key owned by another
+/// shard replay drops it. A DELIVERED cross-shard `BLPOP` diverges from its
+/// AOF the same way on origin/main, so an AOF comparison here would measure
+/// that pre-existing gap, not the restore this test is about.
+#[test]
+fn bsc8_a_disconnected_serve_is_never_undone_over_later_writes() {
+    let m = spawn_moon(SHARDS, Some(SETTLE_MS));
+    let mut admin = Conn::open(m.port);
+    let mut wrong = Vec::new();
+    let mut raced = [0usize; 2];
+    for (seq, what) in ["RPUSH b; LPOP", "DEL"].into_iter().enumerate() {
+        for owner in 0..SHARDS {
+            let k = key_owned_by("f3", owner, seq);
+            let _ = admin.send(&["DEL", &k]);
+            await_blocked(&mut admin, 0, "before block");
+            let mut sock = TcpStream::connect(("127.0.0.1", m.port)).expect("connect");
+            sock.write_all(&common::encode(&["BLPOP", &k, "0"]))
+                .expect("write");
+            await_blocked(&mut admin, 1, "waiter registration");
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+            drop(sock);
+            std::thread::sleep(Duration::from_millis(150));
+            // Inside the window: the serve, then a third party's writes.
+            push_one(&mut admin, Kind::List, &k, "a");
+            let served = if seq == 0 {
+                push_one(&mut admin, Kind::List, &k, "b");
+                canon(&admin.send(&["LPOP", &k])) == "b"
+            } else {
+                canon(&admin.send(&["DEL", &k])) == "0"
+            };
+            if !served {
+                // The waiter was not served inside the window (its own shard
+                // observed the disconnect first); nothing to check.
+                let _ = admin.send(&["DEL", &k]);
+                continue;
+            }
+            raced[seq] += 1;
+            std::thread::sleep(Duration::from_millis(SETTLE_MS + 400));
+            if card(&mut admin, Kind::List, &k) != 0 {
+                let now = contents(&mut admin, Kind::List, &k);
+                wrong.push(format!(
+                    "  {what} owner={owner}: served `a`, then {what}; the master now holds {now}  <-- SERVE UNDONE"
+                ));
+            }
+        }
+    }
+    for (seq, n) in raced.iter().enumerate() {
+        assert!(
+            *n >= SHARDS - 1,
+            "sequence {seq}: only {n} of {SHARDS} serves landed inside the window — the race was not exercised"
+        );
+    }
+    assert!(
+        wrong.is_empty(),
+        "a disconnected serve was undone on top of later writes (review F3):\n{}",
         wrong.join("\n")
     );
 }

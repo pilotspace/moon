@@ -219,13 +219,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still-live receiver, so the owner's undo, which runs only when its send
   fails, never ran, and the element was dropped with the receiver. The waiter
   now closes its claim token first. If no shard has claimed it, none can any
-  more, and there is nothing to drain. If one has, its reply is taken: it is
-  delivered on a timeout or shutdown (the client was served before the end of
-  the wait was observed), and its element is put back in its key when the
-  client is gone. Measured with a test-only window
-  (`MOON_TEST_BLOCK_SETTLE_DELAY_MS`) at `--shards 4`, both runtimes: a push
-  racing a timeout destroyed its element 13/16 → 0/16, and a push racing a
-  disconnect 14/16 → 0/16.
+  more, and there is nothing to drain. If one has, its reply is taken and
+  delivered on a timeout or shutdown: the client was served before the end of
+  the wait was observed. If the client is gone, the serve stands, as it does
+  in Redis: it is recorded in the AOF and replication stream exactly like a
+  delivered reply (tracking invalidation included), and the reply is dropped
+  with the socket. The element is not put back. A put-back would land after
+  whatever other clients wrote to the key in the meantime, on top of a pop
+  that was never logged. After `RPUSH k b; LPOP k` the master would then hold
+  `[a]` while its AOF replays `[b]`, and a `DEL k` would be undone. Measured
+  with a test-only window (`MOON_TEST_BLOCK_SETTLE_DELAY_MS`) at `--shards 4`
+  on both runtimes:
+  - a push racing a timeout destroyed its element 13/16 → 0/16;
+  - a served-then-disconnected waiter's element came back over later writes
+    6/6 → 0/6 (monoio).
+- **A spanning blocking pop's timeout is the client's timeout.** Each
+  cross-shard registration step waits for its owner's acknowledgement. That
+  wait was bounded only by the 30 s internal reply timeout, not by the
+  client's deadline. So `BLPOP q1 q2 q3 1` with a stalled owner answered after
+  the stall, or with a `MOONERR` after 30 s, and a shutdown during the wait
+  also answered `MOONERR`. The acknowledgement now races the client's deadline
+  and shutdown, and each ends the wait with its normal reply (nil, or the
+  shutdown error). With a 3 s test-only owner stall (`MOON_TEST_BLOCK_ACK_STALL_MS`),
+  `BLPOP k1 k2 k3 0.5` answered after 3.0 s and 6.0 s (both runtimes) → nil in
+  under 1.5 s.
+- **A blocking pop's element that must go back (the waiter was won by another
+  shard, or its reply could not be sent) keeps the key's TTL.** When that pop
+  had emptied the key, the put-back recreated it with no TTL, so the master
+  kept a key that every replica expired. The encoding is not preserved: the
+  key is recreated in the natural encoding for its size. A wake on a key that
+  holds nothing now answers nobody, instead of answering a parked `BLPOP k 0`
+  with nil.
 - **One push that carries several elements serves every parked waiter those
   elements cover**, as Redis does. Two clients in `BLPOP k 2` and one
   `RPUSH k a b` used to answer one waiter and leave the other parked next to

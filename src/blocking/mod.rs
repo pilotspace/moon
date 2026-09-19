@@ -1,4 +1,6 @@
 pub mod claim;
+#[cfg(test)]
+mod claim_wake_tests;
 pub mod group;
 pub mod wakeup;
 
