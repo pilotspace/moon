@@ -1763,6 +1763,27 @@ if should_run "transaction"; then
         echo "    moon:  $(echo "$sc894_moon" | tr '\n' ' ')"
     fi
 
+    # --- SPUBLISH inside MULTI (moon#1043) ---------------------------------
+    #
+    # A queued SPUBLISH answered `unknown command` at EXEC while the rest of the
+    # body committed. With no subscriber the receiver count is 0 on both
+    # servers, so this row compares the transcript byte for byte (the slot must
+    # be an integer, not an error); tests/spublish_in_multi_1043.rs and the
+    # consistency row check delivery to live subscribers.
+    sp1043_body=$(printf '%s\n' 'MULTI' 'SET {tx1043}k 1' 'SPUBLISH sch1043 hi' 'PUBLISH ch1043 hi' 'EXEC')
+    for srv in mcli rcli; do $srv DEL "{tx1043}k" > /dev/null; done
+    sp1043_moon=$(printf '%s\n' "$sp1043_body" | redis-cli -p "$PORT_RUST" 2>&1 || true)
+    sp1043_redis=$(printf '%s\n' "$sp1043_body" | redis-cli -p "$PORT_REDIS" 2>&1 || true)
+    TOTAL=$((TOTAL + 1))
+    if [ "$sp1043_moon" = "$sp1043_redis" ] && ! echo "$sp1043_moon" | qgrep -q "unknown command"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: SPUBLISH-MULTI-01 SPUBLISH inside MULTI must run at EXEC (moon#1043)"
+        echo "    redis: $(echo "$sp1043_redis" | tr '\n' ' ')"
+        echo "    moon:  $(echo "$sp1043_moon" | tr '\n' ' ')"
+    fi
+
     # --- Container HELP (moon#698) ----------------------------------------
     #
     # Redis gives every container a HELP subcommand answering an array of SIMPLE

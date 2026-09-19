@@ -1587,6 +1587,40 @@ script_in_multi_outcome() {
 assert_eq "moon#894 scripts inside MULTI run at EXEC in body order (shards=$SHARDS)" \
     "$(script_in_multi_outcome "$PORT_REDIS")" "$(script_in_multi_outcome "$PORT_RUST")"
 
+# ---------------------------------------------------------------------------
+# moon#1043: SPUBLISH queued inside MULTI is delivered at EXEC
+# ---------------------------------------------------------------------------
+#
+# Pre-fix, EXEC answered `unknown command` for the SPUBLISH slot while the rest
+# of the body committed, and the shard-channel subscriber got nothing. The
+# probe holds an SSUBSCRIBE connection open (/dev/tcp, as the tracking probes
+# do), runs the body through redis-cli, and reports the EXEC transcript, the
+# key, and whether the message ARRIVED — the delivery is the verdict, since a
+# receiver count alone cannot show where the message went.
+spublish_in_multi_outcome() {
+    local port=$1 line="" seen="" got="NONE" deadline
+    redis-cli -p "$port" DEL "{tx1043c}k" >/dev/null 2>&1 || true
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'SSUBSCRIBE sch1043c\r\n' >&3
+    while IFS= read -r -t 1 line <&3; do
+        case "$line" in *sch1043c*) break ;; esac
+    done
+    local reply
+    reply=$(printf '%s\n' 'MULTI' 'SET {tx1043c}k 1' 'SPUBLISH sch1043c m1043c' 'EXEC' \
+        | redis-cli -p "$port" 2>&1 | tr '\n' ' ' || true)
+    deadline=$((SECONDS + 3))
+    while (( SECONDS < deadline )); do
+        if IFS= read -r -t 1 line <&3; then
+            seen="${seen}${line%$'\r'}|"
+            case "$seen" in *m1043c*) got="DELIVERED"; break ;; esac
+        fi
+    done
+    exec 3>&-
+    echo "${reply}| $(redis-cli -p "$port" GET "{tx1043c}k" 2>&1) | ${got}"
+}
+assert_eq "moon#1043 SPUBLISH inside MULTI delivered at EXEC (shards=$SHARDS)" \
+    "$(spublish_in_multi_outcome "$PORT_REDIS")" "$(spublish_in_multi_outcome "$PORT_RUST")"
+
 # ===========================================================================
 # RESP2 null TYPE parity (moon#482)
 # ===========================================================================
