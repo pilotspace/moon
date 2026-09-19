@@ -1599,7 +1599,10 @@ mod idle_timeout_tests {
                 "t:1".into(),
                 "127.0.0.1:6379".into(),
                 "default".into(),
-                908,
+                // Synthetic shard ids no other test sweeps: the idle-timeout
+                // tests own 900-909, and an idle entry registered on one of
+                // theirs gets reaped by their sweep and miscounted.
+                918,
                 -1,
             );
             let t1 = TOTAL_CLIENTS.load(Ordering::Relaxed);
@@ -1608,7 +1611,7 @@ mod idle_timeout_tests {
                 "t:1".into(),
                 "127.0.0.1:6379".into(),
                 "default".into(),
-                909,
+                919,
                 -1,
             );
             let t2 = TOTAL_CLIENTS.load(Ordering::Relaxed);
