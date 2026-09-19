@@ -797,10 +797,14 @@ pub(super) async fn try_handle_multi_exec(
                     )
                     .await;
                     crate::server::conn::core::ensure_function_registry(func_registry, ctx);
-                    Some(crate::acl::ScriptAcl::for_user(
-                        &ctx.acl_table,
-                        &conn.current_user,
-                    ))
+                    // A queued script tracks under the modes the body
+                    // starts under (moon#1089). Known gap: a `CLIENT
+                    // CACHING`/`TRACKING` queued BEFORE the script in the
+                    // same body is not applied to it (redis applies it).
+                    Some(
+                        crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user)
+                            .with_caller(tracking_before.script_caller(conn.client_id)),
+                    )
                 } else {
                     None
                 };
@@ -1081,11 +1085,15 @@ pub(super) async fn try_handle_multi_exec(
             // without this a `MULTI ; LPUSH k v ; EXEC` left a client blocked
             // on `k` asleep until its own timeout.
             //
-            // Raised after the body's records are enqueued, and whether or
-            // not the barrier failed: the elements are in the keyspace either
-            // way (an EXEC that cannot be persisted is reported as an error,
-            // not rolled back), so a waiter left asleep would answer null for
-            // a key that demonstrably has data.
+            // moon#1056: raised AFTER the body's records are in the
+            // replication stream and the AOF (above). A waiter served here
+            // has its pop logged by this shard at the moment it pops, so an
+            // earlier wake would put the pop ahead of the push that fed it,
+            // and replay would pop an empty key and then re-add the element.
+            // Raised whether or not persisting failed: the elements are in
+            // the keyspace either way (an EXEC that cannot be persisted is
+            // reported as an error, not rolled back), so a waiter left asleep
+            // would answer null for a key that demonstrably has data.
             crate::blocking::wakeup::wake_recorded(&ctx.blocking_registry, exec_wakes.drain(..));
             if !persisted {
                 conn.command_queue.clear();

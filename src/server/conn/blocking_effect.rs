@@ -187,9 +187,84 @@ pub(crate) fn blocking_effect_record(cmd: &[u8], args: &[Frame], reply: &Frame) 
     ]))
 }
 
+/// The shard owning the key a served blocking pop took from, or `None` when
+/// `reply` records no pop (a timeout, an error, a stream read).
+///
+/// Since moon#1056 that shard — not the waiter's — logs the pop, at the
+/// moment it pops (`crate::blocking::pop_log`). Under `appendfsync always`
+/// the waiter confirms durability with `fsync_barrier` on THIS shard before
+/// it answers its client; the owner enqueued the record before it sent the
+/// reply, and the writer channel is ordered, so the barrier covers it.
+///
+/// Borrows only: the key is read from the same place
+/// [`blocking_effect_record`] reads it (the source argument of a move, the
+/// first element of every other reply), without building the record.
+pub(crate) fn served_pop_owner(
+    cmd: &[u8],
+    args: &[Frame],
+    reply: &Frame,
+    num_shards: usize,
+) -> Option<usize> {
+    let key: &[u8] = match reply {
+        Frame::BulkString(_)
+            if cmd.eq_ignore_ascii_case(b"BLMOVE") || cmd.eq_ignore_ascii_case(b"BRPOPLPUSH") =>
+        {
+            match args.first() {
+                Some(Frame::BulkString(src)) => src,
+                _ => return None,
+            }
+        }
+        Frame::Array(items) => match items.first() {
+            Some(Frame::BulkString(key)) => key,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(crate::shard::dispatch::key_to_shard(key, num_shards))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_owner_is_the_shard_of_the_key_that_served() {
+        use crate::shard::dispatch::key_to_shard;
+        let n = 4;
+        let pop = Frame::Array(framevec![bs(b"k2"), bs(b"v")]);
+        assert_eq!(
+            served_pop_owner(b"BLPOP", &[bs(b"k1"), bs(b"k2"), bs(b"0")], &pop, n),
+            Some(key_to_shard(b"k2", n)),
+            "the reply names the key that served, not the first one asked for"
+        );
+        let moved = bs(b"v");
+        assert_eq!(
+            served_pop_owner(
+                b"BLMOVE",
+                &[bs(b"s"), bs(b"d"), bs(b"LEFT"), bs(b"RIGHT"), bs(b"0")],
+                &moved,
+                n
+            ),
+            Some(key_to_shard(b"s", n)),
+            "a move is owned by its source"
+        );
+        for miss in [
+            Frame::Null,
+            Frame::NullArray,
+            Frame::Error(Bytes::from_static(b"ERR x")),
+        ] {
+            assert_eq!(
+                served_pop_owner(b"BLPOP", &[bs(b"k"), bs(b"0")], &miss, n),
+                None
+            );
+        }
+        // XREAD answers [[stream, entries]]: no single popped key, no owner.
+        let xread = Frame::Array(framevec![Frame::Array(framevec![
+            bs(b"s"),
+            Frame::Array(framevec![])
+        ])]);
+        assert_eq!(served_pop_owner(b"XREAD", &[], &xread, n), None);
+    }
 
     fn bs(b: &[u8]) -> Frame {
         Frame::BulkString(Bytes::copy_from_slice(b))
