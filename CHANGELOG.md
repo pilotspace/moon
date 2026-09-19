@@ -212,6 +212,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measured against redis-server 8.6.1 first (served within about 0.3 s) and
   now matches it at `--shards 1` and `--shards 4` on both runtimes.
 
+- **`MOVE` and `COPY ... DB n` queued inside `MULTI` now run at `EXEC`, into
+  the database they name** (moon#1062). The transaction executors sent every
+  queued command to the single-db dispatch, which cannot reach a second
+  database. `MOVE` answered `-ERR MOVE requires handler-level dispatch` in its
+  slot. `COPY a b DB 4` was worse: it answered `:1`, wrote `b` into the SOURCE
+  db, and logged the command verbatim, so a replica (and AOF replay, once
+  moon#1046 lands) put `b` in db 4 while the master had it in db 0. Every
+  executor now runs both commands against both databases with the same
+  helpers as the live paths: the sharded one on monoio and tokio, the
+  owner-routed `TxnExecute`, and the embedded `handler_single` one. A `SELECT`
+  queued earlier in the body chooses the source db. Only a `:1` is logged,
+  verbatim, under the source db, which is the record the live paths already
+  write.
+
+  In the same family, redis 8.6.1's replies now come back on every path. `MOVE
+  key <current db>` answers `ERR source and destination objects are the same`
+  (it answered `:0`). A negative or too-large db index answers `ERR DB index is
+  out of range` for both `MOVE` and `COPY` (they answered `ERR value is not an
+  integer or out of range` and `ERR invalid DB index`). `COPY k k` gives the
+  same-object error even when `k` is missing.
+
+  **Cross-shard `COPY ... DB n` is refused.** At `--shards > 1`, `COPY src dst
+  DB n` whose two keys hash to different shards was routed by `src` alone, and
+  `dst` was written into `src`'s shard. There, no normally routed read could
+  see it: 24 of 24 constructed split placements acked `:1` and read back nil,
+  and the AOF recorded them on the wrong shard. It now answers the two-key-write
+  `CROSSSLOT` error, as `RENAME` does. A `{hash}` tag co-locates the keys, and
+  `COPY` without a `DB` clause still works across shards.
+
 - **The cold-index rebuild no longer drops entries silently, and an
   indexed-but-unreadable cold entry is no longer a "miss" in code**
   (moon#875). `ColdIndex::rebuild_from_manifest_per_db` skipped a heap file

@@ -431,6 +431,7 @@ fn keyspace_writers(tag: &str) -> Vec<Case> {
         key("e", 105),
     );
     let xs = key("xs", 104);
+    let (l3, l4) = (key("l", 106), key("l", 107));
     out.extend([
         Case {
             name: format!("MOVE into db 3 [{tag}]"),
@@ -454,6 +455,30 @@ fn keyspace_writers(tag: &str) -> Vec<Case> {
             write: cmds(&[&["COPY", &l2, &l2, "DB", "3"]]),
             // The source keeps its copy.
             after: vec![(argv(&["LLEN", &l2]), ":1".into())],
+        },
+        // moon#1062 made both run inside MULTI into the db they name; the
+        // waiter there is served after EXEC.
+        Case {
+            name: format!("MULTI MOVE into db 3 EXEC [{tag}]"),
+            setup: vec![argv(&["RPUSH", &l3, "v"])],
+            waiters: vec![Waiter {
+                db: 3,
+                cmd: argv(&["BLPOP", &l3, BLOCK_SECS]),
+                expect: Some("v".into()),
+            }],
+            write: cmds(&[&["MULTI"], &["MOVE", &l3, "3"], &["EXEC"]]),
+            after: vec![(argv(&["EXISTS", &l3]), ":0".into())],
+        },
+        Case {
+            name: format!("MULTI COPY ... DB 3 EXEC [{tag}]"),
+            setup: vec![argv(&["RPUSH", &l4, "v"])],
+            waiters: vec![Waiter {
+                db: 3,
+                cmd: argv(&["BLPOP", &l4, BLOCK_SECS]),
+                expect: Some("v".into()),
+            }],
+            write: cmds(&[&["MULTI"], &["COPY", &l4, &l4, "DB", "3"], &["EXEC"]]),
+            after: vec![(argv(&["LLEN", &l4]), ":1".into())],
         },
         Case {
             name: format!("ZINCRBY creates the zset [{tag}]"),

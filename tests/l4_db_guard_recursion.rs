@@ -159,12 +159,14 @@ fn two_db_commands_hold_both_guards_without_deadlocking() {
     assert_ok(&c.send(&["MOVE", "mk", "1"]), "MOVE 3->1");
 
     // same-db MOVE must short-circuit BEFORE `with_pair`, whose distinct-index
-    // assert would otherwise panic the shard thread.
+    // assert would otherwise panic the shard thread. It answers redis 8.6.1's
+    // same-object error (moon#1062; it used to answer `:0`), and the commands
+    // below on the same connection prove the shard survived it.
     assert_ok(&c.send(&["SELECT", "1"]), "SELECT 1");
     let same = c.send(&["MOVE", "mk", "1"]);
-    assert!(
-        same.starts_with(":0"),
-        "same-db MOVE returns 0, never panics: {same:?}"
+    assert_eq!(
+        same, "-ERR source and destination objects are the same\r\n",
+        "same-db MOVE answers redis's error, never panics"
     );
 
     // cross-db COPY, both orders
