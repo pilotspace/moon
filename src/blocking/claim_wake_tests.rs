@@ -181,7 +181,24 @@ fn a_lost_claim_put_back_keeps_the_ttl() {
         let claim = ClaimToken::new();
         assert!(claim.clone().try_claim());
         let (tx, rx) = channel::oneshot();
-        let served = deliver(&mut db, &k, tx, Some(&claim), frame, Some(undo), ttl);
+        let cmd = if family == "list" {
+            BlockedCommand::BLPop
+        } else {
+            BlockedCommand::BZPopMin
+        };
+        let served = deliver(
+            &mut db,
+            0,
+            &k,
+            &cmd,
+            tx,
+            Some(&claim),
+            frame,
+            Some(undo),
+            ttl,
+            &mut crate::blocking::pop_log::wake_budget(),
+        )
+        .served();
 
         assert!(!served, "{family}: a lost claim serves nothing");
         assert!(rx.try_recv().is_err(), "{family}: and sends nothing");
@@ -215,13 +232,17 @@ fn a_won_claim_whose_send_fails_puts_the_element_back() {
     drop(rx);
     let served = deliver(
         &mut db,
+        0,
         &k,
+        &BlockedCommand::BLPop,
         tx,
         Some(&claim),
         Frame::BulkString(v.clone()),
         Some(WakeUndo::ListFront(smallvec::smallvec![v])),
         ttl,
-    );
+        &mut crate::blocking::pop_log::wake_budget(),
+    )
+    .served();
 
     assert!(!served, "a failed send serves nobody");
     assert!(!claim.is_open(), "the claim was won");
