@@ -191,6 +191,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`blocking_spanning_claim` bsc8 no longer fails its precondition on
+  Linux when a waiter lands on its key's owner** (moon#1083). The test raced
+  one waiter connection per owner shard and required at least `SHARDS - 1`
+  of the four races to happen. Only a waiter on a REMOTE owner can race,
+  because a waiter on its own owner has no claim token and unregisters as
+  soon as it sees the disconnect. That requirement holds on macOS, where
+  every connection lands on one shard. On Linux each connection is placed on
+  its own (the kernel's `SO_REUSEPORT` hash, or the central listener's
+  round-robin), so two local owners in one sequence failed the run. Measured
+  in a Linux container: 6/10 failures on both `origin/main` and #1045's
+  own tested head `80885575` in a Linux container. #1045's own dispatch
+  showed it too: `TRY 1 FAIL`, then `FLAKY 2/3`. It was not the merge. The
+  test now tries up to 8 fresh connections per owner until one lands on
+  another shard, and keeps the same `SHARDS - 1` precondition. It passed
+  20/20 on Linux against the same binary. It still fails when the settle
+  window is not held open ("0 of 4 owners … 8 connections each"), and it
+  fails 8/8 SERVE UNDONE against the old restore server (`ffacf2ef`). Test
+  only; the server is unchanged.
 - **The cold-index rebuild no longer drops entries silently, and an
   indexed-but-unreadable cold entry is no longer a "miss" in code**
   (moon#875). `ColdIndex::rebuild_from_manifest_per_db` skipped a heap file
