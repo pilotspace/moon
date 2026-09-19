@@ -126,6 +126,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`runtime-tokio` with `--shards 1` now opens every AOF generation with a
+  `MOON.COLDCUT`, so a `kill -9` no longer double-applies writes to spilled
+  keys or drops acknowledged post-rewrite writes** (moon#914). This is the one
+  configuration with no `AofManifest` (creating one there wipes state on the
+  next boot, #96), so neither `seed_cold_cut` nor the rewrite's head ever ran.
+  Its replay read every cold file ungated, and moon#902 and moon#912 were both
+  still live with moon#965's fix applied: 79–82 of 216 probes double-applied
+  on the first restart, and 13–14 of 24 acknowledged post-`BGREWRITEAOF` `SET`s
+  came back holding the pre-rewrite value. The legacy `appendonly.aof` now
+  carries the head itself. Boot writes it when the file holds no record yet,
+  and `BGREWRITEAOF` writes it right after the RDB preamble, before the file
+  is renamed into place. The record and its meaning are the same as in the
+  monoio incr head, and no manifest is created. Two fixes ride along. **With
+  `--wal-kv-log on`, a single `MOON.SPILLED` marker mirrored into the WAL was
+  counted as KV history**: recovery took the WAL as the authority, skipped
+  the AOF, and lost its entire history (DBSIZE 248 → 103 after one restart).
+  Cold-plane records no longer count. **The end-of-replay reconcile closed
+  only db 0**, so a gate left on `SELECT 1..N` would have hidden later spills.
+  Every AOF replay path now closes the generation on every database, and
+  `main.rs` warns and closes any gate a missed path leaves open. **Not
+  covered:** an AOF written before this change has no head, and replays
+  ungated until its first rewrite. Run `BGREWRITEAOF` once after upgrading a
+  tokio `--shards 1` deployment that uses disk offload.
+
 - **Scripts queued inside `MULTI` now run at `EXEC`** (moon#894). `EVAL`,
   `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `FCALL` and `FCALL_RO` were answered
   `+QUEUED` and then `-ERR unknown command` at `EXEC`, while the rest of the
