@@ -191,6 +191,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ZRANGE`, `ZREVRANGE` and `ZRANGESTORE` no longer clamp a still-negative
+  STOP to 0** (moon#1001). Redis's rank-window rule only clamps a
+  still-negative START; a STOP still negative after `len + stop` is left
+  negative, so `start > stop` reports the window empty. Both range helpers
+  (`zrange_by_rank` against the B+tree, `zrange_from_entries` against a
+  listpack) instead did `(len + stop).max(0)`, turning `-1` into rank `0`.
+  Verified against redis-server 8.6.1 on a five-member zset: `ZRANGE z -10
+  -6` answered `[a]` where redis answers `[]` (also wrong on `ZREVRANGE`,
+  `ZRANGE ... REV` and `ZRANGESTORE`, which shares the same helper). Both
+  helpers now call the `rank_window` helper moon#959 added for
+  `ZREMRANGEBYRANK`, so the four commands cannot drift apart again.
+
 - **`maxmemory` is one cap again once keys have spilled to disk** (moon#1036).
   Since K4, the 100 ms pressure cascade has held each database to hot bytes
   PLUS its cold index's RAM. The per-write gates did not: the inline `SET`
