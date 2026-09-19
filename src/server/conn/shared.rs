@@ -387,7 +387,7 @@ pub(crate) fn execute_transaction(
 /// order as the live path).
 pub(crate) fn execute_transaction_sharded(
     shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
-    _shard_id: usize,
+    shard_id: usize,
     command_queue: &[Frame],
     selected_db: usize,
     // `proto`: the connection's protocol version. Each inner reply is
@@ -408,6 +408,10 @@ pub(crate) fn execute_transaction_sharded(
     // transactions, which is why the check below early-outs on `is_empty`
     // before touching the shard at all.
     watched_keys: &HashMap<Bytes, WatchToken>,
+    // moon#894: what a queued EVAL/EVALSHA/FCALL (and `_RO` twins) needs to
+    // run here. `None` when the body holds no script — the caller builds it
+    // only then (`txn_script::queue_has_script`).
+    scripting: Option<&super::txn_script::TxnScripting<'_>>,
 ) -> (Frame, Vec<(usize, Bytes)>, Vec<(usize, Vec<u8>)>) {
     let db_count = shard_databases.db_count();
 
@@ -473,6 +477,39 @@ pub(crate) fn execute_transaction_sharded(
         }
 
         if queue_exec_publish(cmd, cmd_args, &mut results, exec_publishes) {
+            continue;
+        }
+
+        // moon#894: a queued script runs HERE, in body order, instead of
+        // falling through to `dispatch()` — which has no scripting arm and
+        // answered `ERR unknown command` while the rest of the body committed.
+        // Its effect records join `aof_entries` at this position, so replay
+        // and replicas see the script's writes exactly where the client
+        // queued them (see `txn_script` for the full contract).
+        if super::txn_script::is_txn_script(cmd) {
+            let Some(env) = scripting else {
+                results.push(Frame::Error(Bytes::from_static(
+                    b"ERR scripting is unavailable on this shard",
+                )));
+                continue;
+            };
+            let outcome = super::txn_script::run_txn_script(env, cmd, cmd_args, selected, shard_id);
+            aof_entries.extend(outcome.effects);
+            if let Some(which) = outcome.flush {
+                // This shard's half is done; the caller broadcasts the rest
+                // exactly as for a queued FLUSHALL (c10k E2 contract above).
+                exec_flushes.push((
+                    results.len(),
+                    crate::scripting::pending_flush::broadcast_frame(which),
+                    selected,
+                ));
+            }
+            results.push(super::util::apply_resp3_conversion(
+                cmd,
+                cmd_args,
+                outcome.reply,
+                proto,
+            ));
             continue;
         }
 
