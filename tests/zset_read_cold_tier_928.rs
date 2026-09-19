@@ -73,6 +73,8 @@ fn read(db: &mut Database, name: &str, args: &[&[u8]]) -> Frame {
         "ZREVRANGE" => sorted_set::zrevrange(db, &f),
         "ZRANGEBYSCORE" => sorted_set::zrangebyscore(db, &f),
         "ZREVRANGEBYSCORE" => sorted_set::zrevrangebyscore(db, &f),
+        "ZRANGEBYLEX" => sorted_set::zrangebylex(db, &f),
+        "ZREVRANGEBYLEX" => sorted_set::zrevrangebylex(db, &f),
         "ZCOUNT" => sorted_set::zcount(db, &f),
         "ZLEXCOUNT" => sorted_set::zlexcount(db, &f),
         "ZMSCORE" => sorted_set::zmscore(db, &f),
@@ -102,6 +104,10 @@ fn reads() -> Vec<(&'static str, Vec<&'static [u8]>)> {
             vec![&b"z"[..], b"-inf", b"+inf", b"WITHSCORES"],
         ),
         ("ZREVRANGEBYSCORE", vec![&b"z"[..], b"+inf", b"-inf"]),
+        // moon#959: the two lex reads share the helpers above and must answer
+        // a cold zset the same way.
+        ("ZRANGEBYLEX", vec![&b"z"[..], b"-", b"+"]),
+        ("ZREVRANGEBYLEX", vec![&b"z"[..], b"+", b"[b"]),
         ("ZCOUNT", vec![&b"z"[..], b"(1", b"3"]),
         ("ZLEXCOUNT", vec![&b"z"[..], b"[b", b"+"]),
         ("ZMSCORE", vec![&b"z"[..], b"a", b"nope", b"c"]),

@@ -4701,6 +4701,89 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
     (port, token)
 }
 
+/// moon#1035 on the in-process single-thread handler (`handler_single`), the
+/// third of the three connection handlers — the monoio and sharded-tokio ones
+/// are covered by `tests/multi_acl_queue_time_1035.rs` against a real binary.
+///
+/// An ACL refusal inside MULTI — command, key or channel — must poison the
+/// transaction: redis-server 8.6.1 answers `-NOPERM` at queue time and then
+/// `-EXECABORT`, applying nothing. Moon used to apply the rest.
+#[tokio::test]
+async fn test_multi_acl_refusal_poisons_exec_single_handler() {
+    let (port, shutdown) = start_server().await;
+    let mut admin = connect_single(port).await;
+    for rules in [
+        &[
+            "u",
+            "reset",
+            "on",
+            "nopass",
+            "~*",
+            "&*",
+            "+@all",
+            "-flushall",
+        ][..],
+        &["k", "reset", "on", "nopass", "~ok:*", "&*", "+@all"][..],
+        &[
+            "c",
+            "reset",
+            "on",
+            "nopass",
+            "~*",
+            "resetchannels",
+            "&allowed",
+            "+@all",
+        ][..],
+    ] {
+        let r: String = redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg(rules)
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+        assert_eq!(r, "OK", "ACL SETUSER {rules:?}");
+    }
+
+    // (user, the refused command, the key the queued SET writes)
+    let cases: [(&str, &[&str], &str); 3] = [
+        ("u", &["FLUSHALL"], "single:cmd"),
+        ("k", &["SET", "secret", "1"], "ok:single"),
+        ("c", &["PUBLISH", "secret", "x"], "single:chan"),
+    ];
+    for (user, refused, key) in cases {
+        let client = redis::Client::open(format!("redis://{user}:x@127.0.0.1:{port}/")).unwrap();
+        let mut c = client
+            .get_multiplexed_async_connection_with_config(&test_conn_config())
+            .await
+            .unwrap();
+        let ok: String = redis::cmd("MULTI").query_async(&mut c).await.unwrap();
+        assert_eq!(ok, "OK");
+        let queued: String = redis::cmd("SET")
+            .arg(key)
+            .arg("1")
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(queued, "QUEUED", "{user}: SET {key}");
+        let denied: redis::RedisResult<redis::Value> = redis::cmd(refused[0])
+            .arg(&refused[1..])
+            .query_async(&mut c)
+            .await;
+        let err = denied.expect_err("the refused command must be refused at queue time");
+        assert_eq!(err.code(), Some("NOPERM"), "{user}: {refused:?} -> {err:?}");
+        let exec: redis::RedisResult<redis::Value> = redis::cmd("EXEC").query_async(&mut c).await;
+        let err = exec.expect_err("EXEC must abort a poisoned transaction");
+        assert_eq!(err.code(), Some("EXECABORT"), "{user}: EXEC -> {err:?}");
+        let v: Option<String> = admin.get(key).await.unwrap();
+        assert_eq!(
+            v, None,
+            "{user}: the aborted transaction must apply nothing"
+        );
+    }
+
+    shutdown.cancel();
+}
+
 /// ACL-01 + ACL-02: SETUSER creates user, GETUSER returns user info
 #[tokio::test]
 async fn test_acl_setuser_and_getuser() {

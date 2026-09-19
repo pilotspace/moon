@@ -75,6 +75,35 @@ impl ReplayColdGate {
     }
 }
 
+/// Close every OPEN replay generation among `databases` and sum what
+/// [`Database::finish_replay_cold_reconcile`] did (`gated` is true if any
+/// database was gated).
+///
+/// `MOON.COLDCUT` installs its gate on every database, so a caller that
+/// closes only some of them leaves the rest gated after replay — and a gate
+/// that outlives replay hides every cold file at or past its watermark from
+/// the live server (moon#914). Every caller that replays an AOF generation
+/// closes it through here, once, after the replay and before serving.
+///
+/// Only a database whose generation is open (gated, or marker-bearing — see
+/// [`Database::replay_generation_open`]) is touched. A pre-#902 log opens
+/// nothing, and running the task #56 cold-wins demote on a database whose
+/// caller never ran it before would be a behaviour change that can discard a
+/// write newer than its cold copy (moon#965's class) — not this helper's job.
+pub fn close_replay_generation(databases: &mut [Database]) -> ReplayColdReconcile {
+    let mut total = ReplayColdReconcile::default();
+    for db in databases.iter_mut() {
+        if !db.replay_generation_open() {
+            continue;
+        }
+        let r = db.finish_replay_cold_reconcile();
+        total.gated |= r.gated;
+        total.hot_demoted += r.hot_demoted;
+        total.cold_dropped += r.cold_dropped;
+    }
+    total
+}
+
 /// What [`Database::finish_replay_cold_reconcile`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReplayColdReconcile {
@@ -114,6 +143,15 @@ impl Database {
     #[inline]
     pub fn replay_cold_gate_active(&self) -> bool {
         self.replay_cold_gate.is_some()
+    }
+
+    /// Whether a #902-era replay generation is open on this database and
+    /// must be closed by [`Self::finish_replay_cold_reconcile`]: a
+    /// `MOON.COLDCUT` installed a gate, or a `MOON.SPILLED` marker was
+    /// replayed (moon#965). `false` for a pre-#902 log and outside replay.
+    #[inline]
+    pub fn replay_generation_open(&self) -> bool {
+        self.replay_cold_gate.is_some() || self.replay_saw_cold_marker
     }
 
     /// The gate, for tests and diagnostics.
@@ -455,6 +493,32 @@ mod tests {
         assert_eq!(outcome.cold_dropped, 0);
         assert!(!db.is_hot(b"k"), "restart-as-cold is preserved");
         assert!(db.cold_index.as_ref().unwrap().lookup(b"k").is_some());
+    }
+
+    /// moon#914: `close_replay_generation` closes every OPEN generation —
+    /// a gate on any database must not outlive replay — and leaves a
+    /// pre-#902 database (no gate, no marker) exactly as it was: no task #56
+    /// cold-wins demote where its caller never ran one.
+    #[test]
+    fn close_replay_generation_closes_open_generations_only() {
+        let mut gated = db_with_cold(&[(b"k", 5)]);
+        gated.install_replay_cold_gate(1);
+        gated.set(b"k", Entry::new_string(Bytes::from_static(b"new")));
+
+        let mut legacy = db_with_cold(&[(b"k", 5)]);
+        legacy.set(b"k", Entry::new_string(Bytes::from_static(b"new")));
+
+        let mut dbs = vec![gated, legacy];
+        let r = close_replay_generation(&mut dbs);
+        assert!(r.gated);
+        assert_eq!(r.cold_dropped, 1, "the gated db resolves hot-wins");
+        assert_eq!(r.hot_demoted, 0, "no cold-wins demote anywhere");
+        assert!(!dbs[0].replay_generation_open());
+        assert!(dbs[0].is_hot(b"k"));
+        assert!(
+            dbs[1].is_hot(b"k") && dbs[1].cold_index.as_ref().unwrap().lookup(b"k").is_some(),
+            "a pre-#902 db is left untouched"
+        );
     }
 
     #[test]

@@ -952,6 +952,122 @@ both ZADD z:792:bt 1 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 assert_both "ZADD CH sub-epsilon (bptree)"      ZADD z:792:bt CH 1.0000000000000002 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 assert_both "ZADD CH bptree moved score"        ZSCORE z:792:bt bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
+# moon#959 -- six commands that answered `ERR unknown command` on moon
+# (ZRANGEBYLEX, ZREVRANGEBYLEX, ZREMRANGEBYRANK, ZREMRANGEBYSCORE,
+# ZREMRANGEBYLEX, ZDIFFSTORE) plus `ZADD ... INCR`, which answered an arity
+# error. Every reply was read off redis 8.6.1 before the commands were
+# written, error surface included: the bounds grammar is checked BEFORE the
+# key (a bad bound on a missing key is an error, not an empty array), a
+# drained key is deleted, and WRONGTYPE never clobbers the value it refused.
+both ZADD z:959:lex 0 a 0 b 0 c 0 d 0 e
+assert_both "ZRANGEBYLEX all"                   ZRANGEBYLEX z:959:lex - +
+assert_both "ZRANGEBYLEX [b (d"                 ZRANGEBYLEX z:959:lex '[b' '(d'
+assert_both "ZRANGEBYLEX LIMIT 1 2"             ZRANGEBYLEX z:959:lex - + LIMIT 1 2
+assert_both "ZRANGEBYLEX LIMIT -1 2"            ZRANGEBYLEX z:959:lex - + LIMIT -1 2
+assert_both "ZRANGEBYLEX reversed bounds"       ZRANGEBYLEX z:959:lex + -
+assert_both "ZRANGEBYLEX bad bound"             ZRANGEBYLEX z:959:lex a b
+assert_both "ZRANGEBYLEX bad bound missing key" ZRANGEBYLEX z:959:nokey a b
+assert_both "ZRANGEBYLEX WITHSCORES"            ZRANGEBYLEX z:959:lex - + WITHSCORES
+assert_both "ZRANGEBYLEX WITHSCORES beats bound" ZRANGEBYLEX z:959:lex a b WITHSCORES
+assert_both "ZRANGEBYLEX LIMIT beats WITHSCORES" ZRANGEBYLEX z:959:lex - + WITHSCORES LIMIT 1
+assert_both "ZRANGEBYLEX dangling LIMIT"        ZRANGEBYLEX z:959:lex - + LIMIT 1
+assert_both "ZRANGEBYLEX LIMIT notanint"        ZRANGEBYLEX z:959:lex - + LIMIT notanint 1
+assert_both "ZRANGEBYLEX unknown token"         ZRANGEBYLEX z:959:lex - + BOGUS
+assert_both "ZRANGEBYLEX missing key"           ZRANGEBYLEX z:959:nokey - +
+assert_both "ZREVRANGEBYLEX all"                ZREVRANGEBYLEX z:959:lex + -
+assert_both "ZREVRANGEBYLEX (d [b"              ZREVRANGEBYLEX z:959:lex '(d' '[b'
+assert_both "ZREVRANGEBYLEX LIMIT"              ZREVRANGEBYLEX z:959:lex + - LIMIT 1 2
+assert_both "ZREVRANGEBYLEX reversed bounds"    ZREVRANGEBYLEX z:959:lex - +
+both ZADD z:959:rank 1 a 2 b 3 c 4 d 5 e
+assert_both "ZREMRANGEBYRANK 0 0"               ZREMRANGEBYRANK z:959:rank 0 0
+# A stop still negative after normalisation is NOT clamped to 0 -- nothing
+# is removed. (ZRANGE's own helper clamps it; that divergence is out of
+# moon#959's scope and is reported separately.)
+assert_both "ZREMRANGEBYRANK -10 -6"            ZREMRANGEBYRANK z:959:rank -10 -6
+assert_both "ZREMRANGEBYRANK 3 1"               ZREMRANGEBYRANK z:959:rank 3 1
+assert_both "ZREMRANGEBYRANK 1 -2"              ZREMRANGEBYRANK z:959:rank 1 -2
+assert_both "ZREMRANGEBYRANK left"              ZRANGE z:959:rank 0 -1 WITHSCORES
+assert_both "ZREMRANGEBYRANK notanint"          ZREMRANGEBYRANK z:959:rank notanint 1
+assert_both "ZREMRANGEBYRANK arity"             ZREMRANGEBYRANK z:959:rank 1
+assert_both "ZREMRANGEBYRANK missing key"       ZREMRANGEBYRANK z:959:nokey 0 1
+assert_both "ZREMRANGEBYRANK drains"            ZREMRANGEBYRANK z:959:rank 0 -1
+assert_both "ZREMRANGEBYRANK drained key gone"  EXISTS z:959:rank
+both ZADD z:959:score 1 a 2 b 3 c 4 d 5 e
+assert_both "ZREMRANGEBYSCORE (2 3"             ZREMRANGEBYSCORE z:959:score '(2' 3
+assert_both "ZREMRANGEBYSCORE 3 1"              ZREMRANGEBYSCORE z:959:score 3 1
+assert_both "ZREMRANGEBYSCORE 5 inf"            ZREMRANGEBYSCORE z:959:score 5 inf
+assert_both "ZREMRANGEBYSCORE left"             ZRANGE z:959:score 0 -1 WITHSCORES
+assert_both "ZREMRANGEBYSCORE nan"              ZREMRANGEBYSCORE z:959:score nan 1
+assert_both "ZREMRANGEBYSCORE bad on missing"   ZREMRANGEBYSCORE z:959:nokey a 1
+assert_both "ZREMRANGEBYSCORE drains"           ZREMRANGEBYSCORE z:959:score -inf +inf
+assert_both "ZREMRANGEBYSCORE drained key gone" EXISTS z:959:score
+both ZADD z:959:lex2 0 a 0 b 0 c 0 d 0 e
+assert_both "ZREMRANGEBYLEX [b (d"              ZREMRANGEBYLEX z:959:lex2 '[b' '(d'
+assert_both "ZREMRANGEBYLEX (c +"               ZREMRANGEBYLEX z:959:lex2 '(c' +
+assert_both "ZREMRANGEBYLEX left"               ZRANGE z:959:lex2 0 -1
+assert_both "ZREMRANGEBYLEX bad bound"          ZREMRANGEBYLEX z:959:lex2 a b
+assert_both "ZREMRANGEBYLEX arity"              ZREMRANGEBYLEX z:959:lex2 - + x
+assert_both "ZREMRANGEBYLEX drains"             ZREMRANGEBYLEX z:959:lex2 - +
+assert_both "ZREMRANGEBYLEX drained key gone"   EXISTS z:959:lex2
+both SET z:959:str v
+assert_both "ZRANGEBYLEX WRONGTYPE"             ZRANGEBYLEX z:959:str - +
+assert_both "ZREVRANGEBYLEX WRONGTYPE"          ZREVRANGEBYLEX z:959:str + -
+assert_both "ZREMRANGEBYRANK WRONGTYPE"         ZREMRANGEBYRANK z:959:str 0 1
+assert_both "ZREMRANGEBYSCORE WRONGTYPE"        ZREMRANGEBYSCORE z:959:str 0 1
+assert_both "ZREMRANGEBYLEX WRONGTYPE"          ZREMRANGEBYLEX z:959:str - +
+assert_both "WRONGTYPE left the string"         GET z:959:str
+# ZDIFFSTORE joins the ZUNIONSTORE family: the same two numkeys classes, the
+# same overrun rule, and EVERY option token refused (it takes none). Redis
+# looks the sources up before it parses the options, so WRONGTYPE outranks
+# an option error on all three STORE commands. `{z959}` co-locates the
+# destination with its sources (moon#592).
+both ZADD {z959}:a 1 a 2 b 3 c 4 d 5 e
+both ZADD {z959}:b 1 a 2 b
+both ZADD {z959}:c 2 b 9 x
+both SET {z959}:str v
+assert_both "ZDIFFSTORE two sources"            ZDIFFSTORE {z959}:diff 2 {z959}:a {z959}:b
+assert_both "ZDIFFSTORE result"                 ZRANGE {z959}:diff 0 -1 WITHSCORES
+assert_both "ZDIFFSTORE three sources"          ZDIFFSTORE {z959}:diff 3 {z959}:a {z959}:b {z959}:c
+assert_both "ZDIFFSTORE result 3"               ZRANGE {z959}:diff 0 -1 WITHSCORES
+assert_both "ZDIFFSTORE missing first source"   ZDIFFSTORE {z959}:diff 2 {z959}:nokey {z959}:a
+assert_both "ZDIFFSTORE empty deletes dest"     EXISTS {z959}:diff
+assert_both "ZDIFFSTORE dest is a source"       ZDIFFSTORE {z959}:c 2 {z959}:a {z959}:c
+assert_both "ZDIFFSTORE dest-as-source result"  ZRANGE {z959}:c 0 -1 WITHSCORES
+assert_both "ZDIFFSTORE numkeys 0"              ZDIFFSTORE {z959}:diff 0 {z959}:a
+assert_both "ZDIFFSTORE numkeys -1"             ZDIFFSTORE {z959}:diff -1 {z959}:a
+assert_both "ZDIFFSTORE numkeys notanint"       ZDIFFSTORE {z959}:diff notanint {z959}:a
+assert_both "ZDIFFSTORE numkeys overruns"       ZDIFFSTORE {z959}:diff 2 {z959}:a
+assert_both "ZDIFFSTORE WEIGHTS refused"        ZDIFFSTORE {z959}:diff 1 {z959}:a WEIGHTS 1
+assert_both "ZDIFFSTORE AGGREGATE refused"      ZDIFFSTORE {z959}:diff 1 {z959}:a AGGREGATE SUM
+assert_both "ZDIFFSTORE unknown token"          ZDIFFSTORE {z959}:diff 1 {z959}:a BOGUS
+assert_both "ZDIFFSTORE arity"                  ZDIFFSTORE {z959}:diff 1
+assert_both "ZDIFFSTORE WRONGTYPE source"       ZDIFFSTORE {z959}:diff 2 {z959}:a {z959}:str
+assert_both "ZDIFFSTORE WRONGTYPE beats option" ZDIFFSTORE {z959}:diff 1 {z959}:str BOGUS
+assert_both "ZUNIONSTORE WRONGTYPE beats option" ZUNIONSTORE {z959}:diff 1 {z959}:str BOGUS
+assert_both "ZINTERSTORE WRONGTYPE beats WEIGHTS" ZINTERSTORE {z959}:diff 2 {z959}:a {z959}:str WEIGHTS 1 1
+assert_both "ZDIFFSTORE errors made no dest"    EXISTS {z959}:diff
+# ZADD ... INCR: ZINCRBY's arithmetic under ZADD's flags, the new score as
+# a bulk string, nil when a flag refuses.
+assert_both "ZADD INCR new member"              ZADD z:959:incr INCR 5 a
+assert_both "ZADD INCR existing"                ZADD z:959:incr INCR 2.5 a
+assert_both "ZADD NX INCR present"              ZADD z:959:incr NX INCR 1 a
+assert_both "ZADD NX INCR absent"               ZADD z:959:incr NX INCR 1 n
+assert_both "ZADD XX INCR absent"               ZADD z:959:incr XX INCR 1 nope
+assert_both "ZADD XX INCR present"              ZADD z:959:incr XX INCR 1 a
+assert_both "ZADD GT INCR refused"              ZADD z:959:incr GT INCR -1 a
+assert_both "ZADD GT INCR zero refused"         ZADD z:959:incr GT INCR 0 a
+assert_both "ZADD LT INCR"                      ZADD z:959:incr LT INCR -1 a
+assert_both "ZADD XX GT INCR absent"            ZADD z:959:incr XX GT INCR 1 q
+assert_both "ZADD INCR CH"                      ZADD z:959:incr INCR CH 1 a
+assert_both "ZADD INCR two pairs"               ZADD z:959:incr INCR 1 a 2 b
+assert_both "ZADD INCR odd tail"                ZADD z:959:incr INCR 1
+assert_both "ZADD INCR nan"                     ZADD z:959:incr INCR nan a
+assert_both "ZADD INCR inf"                     ZADD z:959:incr INCR inf a
+assert_both "ZADD INCR inf + -inf"              ZADD z:959:incr INCR -inf a
+assert_both "ZADD INCR after refusals"          ZRANGE z:959:incr 0 -1 WITHSCORES
+assert_both "ZADD XX INCR on missing key"       ZADD z:959:incr:xx XX INCR 1 a
+assert_both "ZADD XX INCR made no key"          EXISTS z:959:incr:xx
+
 # Exactly zset-max-listpack-entries (128) members is STILL a listpack; one
 # more promotes to a skiplist on both. One ZADD per step, not 129 — each
 # `both` spawns two redis-cli processes.
@@ -1826,6 +1942,11 @@ if [[ "$SHARDS" -gt 1 ]]; then
         "zrangestore|ZADD %S 1 a 2 b|ZRANGESTORE %D %S 0 -1|ZCARD %D"
         "zunionstore|ZADD %S 1 a 2 b|ZUNIONSTORE %D 1 %S|ZCARD %D"
         "zinterstore|ZADD %S 1 a 2 b|ZINTERSTORE %D 1 %S|ZCARD %D"
+        # moon#959: ZDIFFSTORE joined the family the moment it stopped being
+        # `unknown command` -- same shape as its two siblings above, routed on
+        # the destination and reading every source. Without the guard arm it
+        # acks :2 and the destination is empty on a normally-routed read.
+        "zdiffstore|ZADD %S 1 a 2 b|ZDIFFSTORE %D 1 %S|ZCARD %D"
         "pfmerge|PFADD %S a b c|PFMERGE %D %S|PFCOUNT %D"
         "geosearchstore|GEOADD %S 15 37 Here|GEOSEARCHSTORE %D %S FROMLONLAT 15 37 BYRADIUS 200 km ASC|ZCARD %D"
         "sortstore|RPUSH %S 3 1 2|SORT %S STORE %D|LLEN %D"
@@ -4565,6 +4686,52 @@ both ACL SETUSER "$ACL_U" on '>pw' '~*' '&*' -@all '+select|0'
 assert_acl_probe "first-arg +select|0: SELECT 0 allowed" SELECT 0
 assert_acl_probe "first-arg +select|0: SELECT 1 denied" SELECT 1
 acl_reset_user
+# --- #1035: an ACL refusal inside MULTI poisons the transaction -------------
+# redis refuses a denied command, key or channel at QUEUE time and EXEC then
+# answers EXECABORT, applying nothing. RED on main: moon answered NOPERM, did
+# not queue it, and EXEC applied the rest (`GET` returned `from-txn`).
+#
+# One transaction on one /dev/tcp connection, inline commands. The outcome is
+# normalised to the reply CLASSES (moon's NOPERM text for keys and channels
+# differs from redis's -- a separate, older divergence) plus the key's final
+# value, and compared across the two servers. ECHO after EXEC is the round-trip
+# barrier, as in `watch_cas_outcome`.
+multi_acl_outcome() {  # <port> <user> <key> <refused inline command>
+    local port="$1" user="$2" key="$3" refused="$4" line="" out=""
+    redis-cli -p "$port" DEL "$key" >/dev/null 2>&1 || true
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED_p${port}__"; return 0; }
+    printf 'AUTH %s pw\r\nMULTI\r\nSET %s from-txn\r\n%s\r\nEXEC\r\nECHO txn-done\r\n' \
+        "$user" "$key" "$refused" >&3
+    while IFS= read -r -t 5 line <&3; do
+        line="${line%$'\r'}"
+        case "$line" in
+            -NOPERM*)    out="${out}noperm;" ;;
+            -EXECABORT*) out="${out}execabort;" ;;
+            txn-done)    break ;;
+        esac
+    done
+    exec 3>&-
+    echo "${out}[$(redis-cli -p "$port" GET "$key" 2>&1)]"
+}
+# The denied command is INCR, not something destructive: if the ACL gate itself
+# ever regressed, a denied FLUSHALL here would wipe every row after this one.
+both ACL SETUSER n1035:cmd  reset on '>pw' '~*' '&*' +@all -incr
+both ACL SETUSER n1035:key  reset on '>pw' '~ok:*' '&*' +@all
+both ACL SETUSER n1035:chan reset on '>pw' '~*' resetchannels '&allowed' +@all
+assert_eq "#1035 denied command in MULTI aborts EXEC" \
+    "$(multi_acl_outcome "$PORT_REDIS" n1035:cmd n1035:k1 'INCR n1035:ctr')" \
+    "$(multi_acl_outcome "$PORT_RUST"  n1035:cmd n1035:k1 'INCR n1035:ctr')"
+assert_eq "#1035 denied key in MULTI aborts EXEC" \
+    "$(multi_acl_outcome "$PORT_REDIS" n1035:key ok:n1035 'SET n1035:secret 1')" \
+    "$(multi_acl_outcome "$PORT_RUST"  n1035:key ok:n1035 'SET n1035:secret 1')"
+assert_eq "#1035 denied channel in MULTI aborts EXEC" \
+    "$(multi_acl_outcome "$PORT_REDIS" n1035:chan n1035:k3 'PUBLISH secret x')" \
+    "$(multi_acl_outcome "$PORT_RUST"  n1035:chan n1035:k3 'PUBLISH secret x')"
+assert_eq "#1035 permitted channel in MULTI still commits" \
+    "$(multi_acl_outcome "$PORT_REDIS" n1035:chan n1035:k4 'PUBLISH allowed x')" \
+    "$(multi_acl_outcome "$PORT_RUST"  n1035:chan n1035:k4 'PUBLISH allowed x')"
+both ACL DELUSER n1035:cmd n1035:key n1035:chan
+both DEL n1035:k1 n1035:ctr ok:n1035 n1035:k3 n1035:k4
 
 # ---------------------------------------------------------------------------
 # ACL CAT diff against the live oracle, all 21 redis categories.

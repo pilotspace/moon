@@ -437,34 +437,17 @@ pub(super) fn try_handle_cluster_routing(
             }
         }
 
-        // CROSSSLOT check for multi-key commands
-        if is_multi_key_command(cmd, cmd_args) {
-            let first_slot = slot;
-            let mut cross_slot = false;
-            // COPY's keys are exactly args[0..2]; trailing args are the
-            // REPLACE literal, which must not be slot-checked.
-            let key_args: &[Frame] = if cmd.eq_ignore_ascii_case(b"COPY") {
-                &cmd_args[..cmd_args.len().min(2)]
-            } else {
-                cmd_args
-            };
-            for arg in key_args.iter().skip(1) {
-                if let Some(k) = match arg {
-                    Frame::BulkString(b) => Some(b.as_ref()),
-                    _ => None,
-                } {
-                    if crate::cluster::slots::slot_for_key(k) != first_slot {
-                        cross_slot = true;
-                        break;
-                    }
-                }
-            }
-            if cross_slot {
-                responses.push(Frame::Error(Bytes::from_static(
-                    b"CROSSSLOT Keys in request don't hash to the same slot",
-                )));
-                return true;
-            }
+        // CROSSSLOT check for multi-key commands. moon#1012: only KEY
+        // positions are slot-checked — `MSET {t}a x {t}b y` is one slot, and
+        // `x`/`y` are values. `keys_span_slots` reads the positions from the
+        // shared key walker; the sharded handler calls the same function.
+        if is_multi_key_command(cmd, cmd_args)
+            && crate::cluster::slots::keys_span_slots(cmd, cmd_args, slot)
+        {
+            responses.push(Frame::Error(Bytes::from_static(
+                b"CROSSSLOT Keys in request don't hash to the same slot",
+            )));
+            return true;
         }
     }
     false
@@ -1552,6 +1535,8 @@ pub(super) fn try_enforce_acl(
                 .unwrap_or_default()
                 .as_millis() as u64,
         });
+        // moon#1035: inside MULTI a refusal poisons the block (EXECABORT).
+        conn.flag_transaction();
         responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
         return true;
     }
@@ -1572,6 +1557,8 @@ pub(super) fn try_enforce_acl(
                 .unwrap_or_default()
                 .as_millis() as u64,
         });
+        // moon#1035: a denied KEY poisons an open transaction too.
+        conn.flag_transaction();
         responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
         return true;
     }

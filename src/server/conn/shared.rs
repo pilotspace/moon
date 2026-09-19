@@ -857,9 +857,10 @@ fn queue_exec_publish(
 ///
 /// Used by both the immediate single-handler PUBLISH and the transactional
 /// (MULTI/EXEC) fan-out in all three handlers, so a client denied a channel
-/// cannot wrap `PUBLISH` in `MULTI/EXEC` to bypass the check. Moon has no
-/// queue-time EXECABORT machinery, so the transactional check runs at fan-out
-/// time rather than at queue time.
+/// cannot wrap `PUBLISH` in `MULTI/EXEC` to bypass the check. Since moon#1035
+/// the channel is ALSO checked at queue time ([`queued_publish_channel_deny`]),
+/// which poisons the transaction as redis does; this EXEC-time check remains
+/// for rules that change between queue and EXEC.
 pub(crate) fn publish_channel_acl_deny(
     acl_table: &std::sync::RwLock<crate::acl::AclTable>,
     user: &str,
@@ -870,6 +871,47 @@ pub(crate) fn publish_channel_acl_deny(
     guard
         .check_channel_permission(user, channel)
         .map(|reason| Frame::Error(Bytes::from(format!("NOPERM {reason}"))))
+}
+
+/// Queue-time channel-ACL check for a `PUBLISH`/`SPUBLISH` sent inside `MULTI`
+/// (moon#1035). Returns the `NOPERM` frame the caller answers INSTEAD of
+/// `+QUEUED`, after flagging the transaction; `None` for every other command
+/// and for a permitted channel.
+///
+/// The generic ACL gate checks the command and its keys but never a channel —
+/// outside a transaction `PUBLISH` checks its own channel in its intercept, and
+/// inside one the intercept is skipped so the command can queue. The channel
+/// was therefore only checked by the EXEC-time fan-out above, after the rest
+/// of the block had applied. Measured against redis-server 8.6.1, `&allowed`
+/// user:
+///
+/// ```text
+/// MULTI / SET c1 1 / PUBLISH secret x / EXEC
+///   redis -> +QUEUED -NOPERM -EXECABORT          (c1 unset)
+///   moon  -> +QUEUED +QUEUED *2 +OK -NOPERM      (c1 SET)
+/// ```
+///
+/// The reply is [`publish_channel_acl_deny`]'s, the frame moon already answers
+/// for the same `PUBLISH` outside a transaction, so the two cannot drift. The
+/// EXEC-time check stays: ACL rules can change between queue and EXEC, and
+/// redis re-checks there too.
+///
+/// A malformed argv (no channel) returns `None`; the queue gate's arity check
+/// has already refused it.
+pub(crate) fn queued_publish_channel_deny(
+    acl_table: &std::sync::RwLock<crate::acl::AclTable>,
+    user: &str,
+    cmd: &[u8],
+    args: &[Frame],
+) -> Option<Frame> {
+    if !(cmd.eq_ignore_ascii_case(b"PUBLISH") || cmd.eq_ignore_ascii_case(b"SPUBLISH")) {
+        return None;
+    }
+    let channel = match args.first() {
+        Some(Frame::BulkString(b) | Frame::SimpleString(b)) => b.as_ref(),
+        _ => return None,
+    };
+    publish_channel_acl_deny(acl_table, user, channel)
 }
 
 /// Command-level ACL gate for the pub/sub intercepts (H-3). PUBLISH/SUBSCRIBE/
@@ -2141,14 +2183,6 @@ pub(crate) const CROSS_SHARD_WRITE_ERROR: &[u8] =
 ///   entry points (`blocking::immediate_scan`, `blocking::wakeup`) that this
 ///   pre-routing guard cannot see. Two overlapping guards for one family would
 ///   be worse than one complete one.
-/// * `ZDIFFSTORE` — not implemented in moon (unknown command), so there is
-///   no write to misplace, and claiming `CROSSSLOT` would send a client
-///   chasing hash tags for a command that will never work.
-///   `tests/two_key_write_cross_shard.rs::t2k4` fails the moment it starts
-///   working, which is when it must be added here. `GEORADIUS`/
-///   `GEORADIUSBYMEMBER` used to sit in this same bucket; moon#645
-///   implemented their `STORE`/`STOREDIST` clause, so they moved INTO the
-///   family below in the same change that made them able to write.
 /// * `TOUCH` — the one member of the moon#962 family that is genuinely
 ///   per-key decomposable. It is in `is_multi_key_command` and
 ///   [`splittable_read_kind`], so it FANS OUT and sums, exactly like `EXISTS`.
@@ -2194,6 +2228,24 @@ pub(crate) const CROSS_SHARD_WRITE_ERROR: &[u8] =
 /// property of the key vector. A later PR may remove any single command from
 /// this list once it merges properly; each such change removes an error and
 /// cannot regress correctness, which is the direction that is safe to defer.
+///
+/// # moon#959 — `ZDIFFSTORE` is IN the family, and used not to be
+///
+/// This block used to carry a `ZDIFFSTORE` bullet in the EXCLUDED list above,
+/// reading "not implemented in moon (unknown command), so there is no write to
+/// misplace". moon#959 implemented it, so that sentence is now false and the
+/// bullet is gone: `ZDIFFSTORE dst numkeys src ...` routes on `dst` and reads
+/// every source, the identical shape to `ZUNIONSTORE`/`ZINTERSTORE`. It is
+/// matched in the `(10, b'z')` arm below, which it SHARES with `ZINTERCARD` —
+/// same length, same first byte, so an arm that names only one of them
+/// silently drops the other.
+///
+/// `GEORADIUS`/`GEORADIUSBYMEMBER` made the same trip when moon#645 gave them
+/// a `STORE`/`STOREDIST` clause. The tripwire that forces the migration is
+/// `tests/two_key_write_cross_shard.rs::t2k4`, and the measured cost of
+/// skipping it is in `t2k1`: with the `ZDIFFSTORE` spelling removed from the
+/// arm below and everything else in place, 12 of 180 placements at
+/// `--shards 4` ack `ZDIFFSTORE` while the destination lands nowhere.
 ///
 /// Matched on `(len, first byte)` first so a single-key command falls through
 /// after one integer compare and never reaches the key walk.
@@ -2244,7 +2296,15 @@ fn touches_a_key_it_did_not_route_on(cmd: &[u8]) -> bool {
         (5, b'z') => cmd.eq_ignore_ascii_case(b"ZMPOP") || cmd.eq_ignore_ascii_case(b"ZDIFF"),
         (6, b's') => cmd.eq_ignore_ascii_case(b"SINTER") || cmd.eq_ignore_ascii_case(b"SUNION"),
         (6, b'z') => cmd.eq_ignore_ascii_case(b"ZINTER") || cmd.eq_ignore_ascii_case(b"ZUNION"),
-        (10, b'z') => cmd.eq_ignore_ascii_case(b"ZINTERCARD"),
+        // One arm, two unrelated additions: `ZINTERCARD` is a moon#962
+        // multi-key READ, `ZDIFFSTORE` a moon#959 two-key WRITE routed on its
+        // destination. They collide on `(10, b'z')`, so naming only one of
+        // them here silently drops the other from the guard — for
+        // `ZDIFFSTORE` that is the moon#592 misdirected write, measured in
+        // `t2k1`. Keep both spellings.
+        (10, b'z') => {
+            cmd.eq_ignore_ascii_case(b"ZINTERCARD") || cmd.eq_ignore_ascii_case(b"ZDIFFSTORE")
+        }
         (14, b'g') => cmd.eq_ignore_ascii_case(b"GEOSEARCHSTORE"),
         // `GEORADIUS src ... STORE|STOREDIST dst` (moon#645). Without the
         // clause the walker reports one key and this check is a no-op, so no
@@ -5078,6 +5138,12 @@ mod cross_shard_write_tests {
         ("ZRANGESTORE", &["{d}", "{s}", "0", "-1"]),
         ("ZUNIONSTORE", &["{d}", "1", "{s}"]),
         ("ZINTERSTORE", &["{d}", "1", "{s}"]),
+        // moon#959 implemented ZDIFFSTORE. Until it did, the test below
+        // asserted the OPPOSITE — that the guard must not claim it — because
+        // an unimplemented command has no write to misplace. It shares the
+        // `(10, b'z')` arm with `ZINTERCARD`, so this row is what fails if a
+        // future edit narrows that arm back to one spelling.
+        ("ZDIFFSTORE", &["{d}", "1", "{s}"]),
         ("PFMERGE", &["{d}", "{s}"]),
         (
             "GEOSEARCHSTORE",
@@ -5234,15 +5300,11 @@ mod cross_shard_write_tests {
             cross_shard_multikey_rejection(b"TOUCH", &two, N).is_none(),
             "TOUCH is per-key decomposable and must fan out, never be refused"
         );
-        // ZDIFFSTORE is still unimplemented, and shares a `(10, 'z')` arm with
-        // ZINTERCARD. Claiming CROSSSLOT for it would send a client chasing
-        // hash tags for a command that will never work — the `t2k4` tripwire
-        // in `tests/two_key_write_cross_shard.rs` owns the migration.
-        assert!(
-            cross_shard_multikey_rejection(b"ZDIFFSTORE", &[bulk(&far), bulk("1"), bulk(src)], N)
-                .is_none(),
-            "ZDIFFSTORE is unimplemented; t2k4 owns the moment that changes"
-        );
+        // ZDIFFSTORE used to be asserted here as OUT of the family, on the
+        // grounds that an unimplemented command has no write to misplace.
+        // moon#959 implemented it, so it moved INTO `FAMILY` above and is
+        // asserted positively there — the migration the `t2k4` tripwire in
+        // `tests/two_key_write_cross_shard.rs` existed to force.
 
         // A SORT with no STORE clause names one key: nothing to straddle.
         let sort_ro = [bulk(src), bulk("LIMIT"), bulk("0"), bulk("10")];
@@ -5831,5 +5893,58 @@ mod pending_shard_mask_tests {
             "a single-key command routes by its own key and is ordered by the \
              slotted batch itself"
         );
+    }
+}
+
+#[cfg(test)]
+mod queued_publish_channel_tests {
+    //! moon#1035: the queue-time channel check for `PUBLISH`/`SPUBLISH` inside
+    //! `MULTI`. The end-to-end EXECABORT is proven against a live server in
+    //! `tests/multi_acl_queue_time_1035.rs`; this pins the predicate itself.
+    use super::{publish_channel_acl_deny, queued_publish_channel_deny};
+    use crate::acl::AclTable;
+    use crate::protocol::Frame;
+    use bytes::Bytes;
+
+    fn table() -> std::sync::RwLock<AclTable> {
+        let mut t = AclTable::new();
+        t.apply_setuser(
+            "c",
+            &["on", "nopass", "~*", "resetchannels", "&allowed", "+@all"],
+        );
+        std::sync::RwLock::new(t)
+    }
+
+    fn argv(parts: &[&str]) -> Vec<Frame> {
+        parts
+            .iter()
+            .map(|p| Frame::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+            .collect()
+    }
+
+    #[test]
+    fn denied_channel_is_refused_with_the_top_level_reply() {
+        let t = table();
+        for verb in [&b"PUBLISH"[..], b"SPUBLISH", b"publish"] {
+            let got = queued_publish_channel_deny(&t, "c", verb, &argv(&["secret", "x"]));
+            let top = publish_channel_acl_deny(&t, "c", b"secret");
+            assert!(
+                got.is_some(),
+                "{verb:?} to a denied channel must be refused"
+            );
+            assert_eq!(got, top, "the queue-time reply must be the top-level one");
+        }
+    }
+
+    #[test]
+    fn permitted_channel_and_other_commands_pass() {
+        let t = table();
+        assert!(
+            queued_publish_channel_deny(&t, "c", b"PUBLISH", &argv(&["allowed", "x"])).is_none()
+        );
+        // Not a publish: the first argument is a key, never a channel.
+        assert!(queued_publish_channel_deny(&t, "c", b"SET", &argv(&["secret", "x"])).is_none());
+        // Malformed: the queue gate's arity check owns this reply.
+        assert!(queued_publish_channel_deny(&t, "c", b"PUBLISH", &[]).is_none());
     }
 }

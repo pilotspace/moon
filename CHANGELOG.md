@@ -6,7 +6,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Six sorted-set commands that were `unknown command`, and `ZADD ... INCR`**
+  (moon#959). `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZREMRANGEBYRANK`,
+  `ZREMRANGEBYSCORE`, `ZREMRANGEBYLEX` and `ZDIFFSTORE` are implemented, wired
+  into every dispatch path, registered as `@sortedset`, and covered by rows in
+  both parity harnesses; `docs/commands.md` had advertised `ZRANGEBYLEX` while
+  dispatch rejected it. `ZADD ... INCR` — which `redis-py`'s `zadd(...,
+  incr=True)` sends — replies the new score as a bulk string, or nil when
+  `NX`/`XX`/`GT`/`LT` refuse, in Redis's decision order. Every reply, error
+  surface included, was read off redis-server 8.6.1 before the code was
+  written: the range grammar is checked before the key is consulted, a
+  `ZREMRANGEBY*` that drains a key deletes it, a listpack zset is trimmed in
+  place and never converted, and the `used_memory` ledger stays exact on both
+  encodings. `ZDIFFSTORE` joins the `ZUNIONSTORE` family's `numkeys` and
+  option rules, refusing `WEIGHTS`/`AGGREGATE` as `syntax error`, and — because
+  it writes a destination it is not routed on — it also joins the moon#592
+  cross-shard WRITE guard, so `ZDIFFSTORE` across shards is `CROSSSLOT` rather
+  than an ack whose destination lands nowhere. (It shares the guard's
+  `(10, b'z')` match arm with moon#962's `ZINTERCARD`; both spellings are
+  named there.)
+
 ### Changed
+
+- **BEHAVIOUR CHANGE — a command the user's ACL denies inside `MULTI` now
+  aborts the whole transaction** (moon#1035). `EXEC` answers
+  `-EXECABORT Transaction discarded because of previous errors.` and applies
+  nothing, where it used to apply every command except the denied one.
+  Measured against redis-server 8.6.1 with a `+@all -flushall` user:
+  `MULTI / SET mx 1 / FLUSHALL / EXEC` answered `*1 +OK` on moon (`mx` set)
+  and `-EXECABORT` on redis (`mx` unset); moon now matches. The denied command
+  still gets its `-NOPERM` reply at queue time, with the same text and the same
+  ACL LOG behaviour as outside a transaction. This covers every ACL refusal —
+  command, key pattern, and channel pattern: `PUBLISH`/`SPUBLISH` to a denied
+  channel inside `MULTI` used to answer `+QUEUED` and was refused only inside
+  `EXEC`'s reply after the rest had applied; it is now refused at queue time.
+  Holds on both runtimes, at `--shards 1` and `--shards 4` (including a body
+  routed to its owner shard, moon#247), pipelined or not; `DISCARD` clears the
+  poison and the aborted `EXEC` clears `WATCH`es. Each handler's ACL gate
+  calls one `ConnectionState::flag_transaction` on the verdict of
+  `check_command_permission(user, cmd, args)`, so per-subcommand rules
+  (`-config|set`) poison the transaction as soon as that check enforces them.
+  A client that relied on the partial commit — treating the `NOPERM` as a
+  per-command failure and the rest as applied — now sees nothing applied.
 
 - **`Check (macOS)` and `Check (Windows)` run their tests in three shards**,
   cutting the critical path of a `workflow_dispatch` roughly in half. Measured
@@ -143,6 +186,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WAL without error. A record for a db beyond the configured `--databases`
   count is dropped with a warning instead of being folded into db 0.
 
+- **`runtime-tokio` with `--shards 1` now opens every AOF generation with a
+  `MOON.COLDCUT`, so a `kill -9` no longer double-applies writes to spilled
+  keys or drops acknowledged post-rewrite writes** (moon#914). This is the one
+  configuration with no `AofManifest` (creating one there wipes state on the
+  next boot, #96), so neither `seed_cold_cut` nor the rewrite's head ever ran.
+  Its replay read every cold file ungated, and moon#902 and moon#912 were both
+  still live with moon#965's fix applied: 79–82 of 216 probes double-applied
+  on the first restart, and 13–14 of 24 acknowledged post-`BGREWRITEAOF` `SET`s
+  came back holding the pre-rewrite value. The legacy `appendonly.aof` now
+  carries the head itself. Boot writes it when the file holds no record yet,
+  and `BGREWRITEAOF` writes it right after the RDB preamble, before the file
+  is renamed into place. The record and its meaning are the same as in the
+  monoio incr head, and no manifest is created. Two fixes ride along. **With
+  `--wal-kv-log on`, a single `MOON.SPILLED` marker mirrored into the WAL was
+  counted as KV history**: recovery took the WAL as the authority, skipped
+  the AOF, and lost its entire history (DBSIZE 248 → 103 after one restart).
+  Cold-plane records no longer count. **The end-of-replay reconcile closed
+  only db 0**, so a gate left on `SELECT 1..N` would have hidden later spills.
+  Every AOF replay path now closes the generation on every database, and
+  `main.rs` warns and closes any gate a missed path leaves open. **Not
+  covered:** an AOF written before this change has no head, and replays
+  ungated until its first rewrite. Run `BGREWRITEAOF` once after upgrading a
+  tokio `--shards 1` deployment that uses disk offload.
+
 - **Scripts queued inside `MULTI` now run at `EXEC`** (moon#894). `EVAL`,
   `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `FCALL` and `FCALL_RO` were answered
   `+QUEUED` and then `-ERR unknown command` at `EXEC`, while the rest of the
@@ -190,6 +257,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ran: it was `#[ignore]`d because it shelled out to `redis-cli`. It now speaks
   RESP through `common::Conn` and runs in every `runtime-tokio` leg; with the
   fix inert it fails 3/3 on 36-47 stale probes.
+
+- **Cluster mode no longer refuses `MSET`/`MSETNX` with `CROSSSLOT` when a
+  VALUE hashes to another slot** (moon#1012). The cluster pre-check slot-hashed
+  every argument after the routing key as if it were a key, so
+  `MSET {t}a x {t}b y` — two keys in one slot — was refused because `x` hashed
+  elsewhere; only a user who hash-tagged their values got through. It now reads
+  key positions from the shared key walker (`acl::keyspec::command_key_positions`,
+  the one ACL, the moon#592 cross-shard write guard and cache invalidation
+  already use): `MSET`'s `first/last/step` of `1, -1, 2`. Measured against
+  redis-server 8.6.1 on one node holding all 16384 slots, 15 rows
+  (`MSET`/`MSETNX`/`MGET`/`DEL`/`BITOP`/`COPY`, same-slot and spanning) are now
+  byte-identical on both runtimes at `--shards 1` and `--shards 4`; before, 4
+  accepted writes were refused. Keys genuinely in two slots are still
+  `CROSSSLOT`. `COPY`'s `REPLACE` literal and `BITOP`'s operation token now fall
+  out of their key specs instead of a special case.
 
 - **The moon#507 pipeline wait set is derived from `COMMAND_META` instead of a
   hand-written list, and `WATCH` inside its own pipeline no longer aborts the
@@ -293,6 +375,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its two root pages at the real path, which every later open rejected.
   Tombstones are also aged per `(file_id, file_type)`, not per id.
 
+- **`ZUNIONSTORE`/`ZINTERSTORE` report `WRONGTYPE` before an option error, and
+  no longer flatten a listpack source** (moon#959). Redis looks every source up
+  before it parses `WEIGHTS`/`AGGREGATE`, so `ZUNIONSTORE d 1 <string-key>
+  BOGUS` is `WRONGTYPE` on redis 8.6.1; moon answered `syntax error`. The store
+  family also read its sources through the promoting accessor, converting a
+  `listpack` source to `skiplist` as a side effect of reading it — the moon#928
+  defect the read-only set operations were already cured of. Both fixes came
+  with the shared implementation `ZDIFFSTORE` now uses.
 - **Commands routed to another shard are counted and timed** (moon#982).
   At `--shards > 1` a command whose key lives on a shard other than the
   connection's went through no telemetry probe at all — neither the

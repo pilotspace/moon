@@ -1,8 +1,12 @@
+mod sorted_set_lex;
 mod sorted_set_read;
+mod sorted_set_store;
 mod sorted_set_write;
 mod work_budget;
 
+pub use sorted_set_lex::*;
 pub use sorted_set_read::*;
+pub use sorted_set_store::*;
 pub use sorted_set_write::*;
 
 use bytes::Bytes;
@@ -370,6 +374,43 @@ pub(super) fn lex_in_range(member: &[u8], min: &LexBound, max: &LexBound) -> boo
 // ---------------------------------------------------------------------------
 // Shared range helpers
 // ---------------------------------------------------------------------------
+
+/// Resolve a `start stop` rank pair the way Redis's `zremrangeGenericCommand`
+/// does, returning the inclusive window or `None` when it is empty.
+///
+/// A negative index counts from the end. A START still negative after that is
+/// clamped to 0; a STOP still negative is NOT, so `start > stop` reports the
+/// window empty — which is what makes `ZREMRANGEBYRANK z -10 -6` on a
+/// five-member zset remove nothing (redis 8.6.1 answers `(integer) 0`).
+///
+/// `zrange_by_rank` and `zrange_from_entries` below clamp the STOP as well and
+/// answer `[a]` for the same `ZRANGE z -10 -6`, where redis answers `[]`. That
+/// is a pre-existing divergence in a command moon#959 does not touch; it is
+/// reported separately rather than changed under this issue, and this helper
+/// exists so the new command does not inherit it.
+pub(super) fn rank_window(start_raw: i64, stop_raw: i64, total: usize) -> Option<(usize, usize)> {
+    let len = total as i64;
+    let mut start = if start_raw < 0 {
+        len.saturating_add(start_raw)
+    } else {
+        start_raw
+    };
+    let mut stop = if stop_raw < 0 {
+        len.saturating_add(stop_raw)
+    } else {
+        stop_raw
+    };
+    if start < 0 {
+        start = 0;
+    }
+    if start > stop || start >= len {
+        return None;
+    }
+    if stop >= len {
+        stop = len - 1;
+    }
+    Some((start as usize, stop as usize))
+}
 
 pub(super) fn zrange_by_rank(
     scores: &BPTree,
@@ -3982,5 +4023,977 @@ mod zadd_listpack_batch_tests {
             crate::command::sorted_set::zcard(&mut db, &[bs(b"acc")]),
             Frame::Integer(40_000)
         );
+    }
+}
+
+/// moon#959 — the six commands that used to be `unknown command`, and
+/// `ZADD ... INCR`. Every expectation below was read off redis-server 8.6.1
+/// on the wire (`/tmp/z959/oracle_vs_control.txt` in the PR) before the code
+/// was written; the reply bytes are what these assert, not `COMMAND INFO`.
+///
+/// Dispatch-path coverage, stated per CLAUDE.md's three-path rule:
+/// * `command::dispatch` (the mutable path MULTI/EXEC, Lua and every write
+///   take) — every `call(...)` below goes through it.
+/// * `command::dispatch_read` (the shared-lock path a bare read takes) —
+///   `call_read(...)` for the two lex reads, plus the prefilter check in
+///   `dispatch_read_serves_the_lex_reads`.
+/// * `server::conn::try_inline_dispatch` inlines exactly `GET` and a plain
+///   `SET` (`blocking.rs`); every other command falls through to generic
+///   dispatch, so there is no arm for a zset command to be missing from.
+#[cfg(test)]
+mod missing_commands_959_tests {
+    use super::*;
+    use crate::command::{DispatchResult, dispatch, dispatch_read, is_dispatch_read_supported};
+    use crate::storage::Database;
+
+    fn bs(s: &[u8]) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s))
+    }
+
+    fn argv(args: &[&str]) -> Vec<Frame> {
+        args.iter().map(|a| bs(a.as_bytes())).collect()
+    }
+
+    /// Through the real mutable dispatch table, so a missing arm shows up as
+    /// `unknown command` rather than as a handler that was never reached.
+    fn call(db: &mut Database, cmd: &str, args: &[&str]) -> Frame {
+        let mut selected = 0usize;
+        match dispatch(db, cmd.as_bytes(), &argv(args), &mut selected, 16) {
+            DispatchResult::Response(f) => f,
+            DispatchResult::Quit(f) => panic!("unexpected Quit for {cmd}: {f:?}"),
+        }
+    }
+
+    /// Through the shared-lock read table.
+    fn call_read(db: &Database, cmd: &str, args: &[&str]) -> Frame {
+        let mut selected = 0usize;
+        let now_ms = db.now_ms();
+        match dispatch_read(db, cmd.as_bytes(), &argv(args), now_ms, &mut selected, 16) {
+            DispatchResult::Response(f) => f,
+            DispatchResult::Quit(f) => panic!("unexpected Quit for {cmd}: {f:?}"),
+        }
+    }
+
+    fn seed(db: &mut Database, key: &str, pairs: &[(&str, &str)]) {
+        let mut a = vec![key];
+        for (s, m) in pairs {
+            a.push(s);
+            a.push(m);
+        }
+        let n = call(db, "ZADD", &a);
+        assert_eq!(n, Frame::Integer(pairs.len() as i64), "seeding {key}");
+    }
+
+    const FIVE: &[(&str, &str)] = &[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d"), ("5", "e")];
+    const LEX: &[(&str, &str)] = &[("0", "a"), ("0", "b"), ("0", "c"), ("0", "d"), ("0", "e")];
+
+    /// A member past `zset-max-listpack-value` (64) forces the B+tree form.
+    /// All `z`s so it sorts AFTER every fixture member under a lex range.
+    const LONG: &str = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+
+    fn strings(frame: &Frame) -> Vec<String> {
+        match frame {
+            Frame::Array(items) => items
+                .iter()
+                .map(|f| match f {
+                    Frame::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+                    other => panic!("not a bulk string: {other:?}"),
+                })
+                .collect(),
+            other => panic!("not an array: {other:?}"),
+        }
+    }
+
+    fn range(db: &mut Database, key: &str) -> Vec<String> {
+        strings(&call(db, "ZRANGE", &[key, "0", "-1"]))
+    }
+
+    fn err_text(frame: &Frame) -> String {
+        match frame {
+            Frame::Error(e) => String::from_utf8_lossy(e).into_owned(),
+            other => panic!("expected an error reply, got {other:?}"),
+        }
+    }
+
+    fn encoding_of(db: &mut Database, key: &str) -> String {
+        match crate::command::key::object(db, &[bs(b"ENCODING"), bs(key.as_bytes())]) {
+            Frame::BulkString(b) => String::from_utf8_lossy(&b).into_owned(),
+            other => panic!("OBJECT ENCODING did not reply a bulk string: {other:?}"),
+        }
+    }
+
+    fn exists(db: &mut Database, key: &str) -> bool {
+        call(db, "EXISTS", &[key]) == Frame::Integer(1)
+    }
+
+    fn ledger_exact(db: &mut Database, step: &str) {
+        let running = db.estimated_memory();
+        db.recalculate_memory();
+        let recomputed = db.estimated_memory();
+        assert_eq!(
+            running, recomputed,
+            "{step}: ledger {running} != recount {recomputed}"
+        );
+    }
+
+    // ── the tripwire: nothing here is `unknown command` any more ────────
+
+    #[test]
+    fn all_six_are_dispatched_and_the_negative_control_is_not() {
+        let mut db = Database::new();
+        seed(&mut db, "z", FIVE);
+        for (cmd, args) in [
+            ("ZRANGEBYLEX", &["z", "-", "+"][..]),
+            ("ZREVRANGEBYLEX", &["z", "+", "-"][..]),
+            ("ZREMRANGEBYRANK", &["z", "0", "0"][..]),
+            ("ZREMRANGEBYSCORE", &["z", "0", "0"][..]),
+            ("ZREMRANGEBYLEX", &["z", "[zz", "[zz"][..]),
+            ("ZDIFFSTORE", &["d", "1", "z"][..]),
+        ] {
+            let reply = call(&mut db, cmd, args);
+            assert!(
+                !matches!(&reply, Frame::Error(e) if e.starts_with(b"ERR unknown command")),
+                "{cmd} is still unknown to dispatch: {reply:?}"
+            );
+            // Lower-case, as redis-py sends it.
+            let reply = call(&mut db, &cmd.to_ascii_lowercase(), args);
+            assert!(
+                !matches!(&reply, Frame::Error(e) if e.starts_with(b"ERR unknown command")),
+                "{cmd} (lower-case) is still unknown to dispatch: {reply:?}"
+            );
+        }
+        // The negative control: the same shape the issue used, still refused.
+        let reply = call(&mut db, "ZNOTACOMMAND", &["z"]);
+        assert!(
+            err_text(&reply).starts_with("ERR unknown command"),
+            "{reply:?}"
+        );
+    }
+
+    #[test]
+    fn registry_carries_the_six_with_the_sortedset_category() {
+        use crate::command::metadata::{AclCategories, CommandFlags, lookup};
+        for (name, write, arity) in [
+            ("ZRANGEBYLEX", false, -4),
+            ("ZREVRANGEBYLEX", false, -4),
+            ("ZREMRANGEBYRANK", true, 4),
+            ("ZREMRANGEBYSCORE", true, 4),
+            ("ZREMRANGEBYLEX", true, 4),
+            ("ZDIFFSTORE", true, -4),
+        ] {
+            let meta = lookup(name.as_bytes()).unwrap_or_else(|| panic!("{name} not registered"));
+            assert_eq!(meta.arity, arity, "{name} arity");
+            assert_eq!(
+                meta.flags.contains(CommandFlags::WRITE),
+                write,
+                "{name} write flag"
+            );
+            assert_eq!(
+                meta.flags.contains(CommandFlags::READONLY),
+                !write,
+                "{name} read flag"
+            );
+            assert!(
+                meta.acl_categories.contains(AclCategories::SORTEDSET),
+                "{name} must be @sortedset"
+            );
+            assert_eq!(meta.first_key, 1, "{name} first key");
+        }
+    }
+
+    #[test]
+    fn dispatch_read_serves_the_lex_reads() {
+        let mut db = Database::new();
+        seed(&mut db, "lex", LEX);
+        assert!(is_dispatch_read_supported(b"ZRANGEBYLEX"));
+        assert!(is_dispatch_read_supported(b"ZREVRANGEBYLEX"));
+        assert_eq!(
+            strings(&call_read(&db, "ZRANGEBYLEX", &["lex", "[b", "(d"])),
+            ["b", "c"]
+        );
+        assert_eq!(
+            strings(&call_read(&db, "ZREVRANGEBYLEX", &["lex", "(d", "[b"])),
+            ["c", "b"]
+        );
+        // The read path answered from the listpack without flattening it.
+        assert_eq!(encoding_of(&mut db, "lex"), "listpack");
+    }
+
+    // ── ZRANGEBYLEX / ZREVRANGEBYLEX ─────────────────────────────────────
+
+    #[test]
+    fn zrangebylex_bounds_and_limit_match_the_oracle() {
+        for promote in [false, true] {
+            let mut db = Database::new();
+            seed(&mut db, "lex", LEX);
+            if promote {
+                call(&mut db, "ZADD", &["lex", "0", LONG]);
+                assert_eq!(encoding_of(&mut db, "lex"), "skiplist");
+            }
+            let r = |db: &mut Database, a: &[&str]| strings(&call(db, "ZRANGEBYLEX", a));
+            let tail: &[&str] = if promote { &[LONG] } else { &[] };
+            let mut all = vec!["a", "b", "c", "d", "e"];
+            all.extend_from_slice(tail);
+            assert_eq!(r(&mut db, &["lex", "-", "+"]), all, "promote={promote}");
+            assert_eq!(r(&mut db, &["lex", "[b", "(d"]), ["b", "c"]);
+            assert_eq!(r(&mut db, &["lex", "(b", "[d"]), ["c", "d"]);
+            assert_eq!(r(&mut db, &["lex", "[c", "[c"]), ["c"]);
+            // `(` and `[` alone are exclusive/inclusive EMPTY strings: every
+            // member is > "" and none is <= "".
+            assert!(r(&mut db, &["lex", "(", "["]).is_empty());
+            assert_eq!(
+                r(&mut db, &["lex", "-", "+", "LIMIT", "1", "2"]),
+                ["b", "c"]
+            );
+            assert!(r(&mut db, &["lex", "-", "+", "LIMIT", "-1", "2"]).is_empty());
+            assert!(r(&mut db, &["lex", "-", "+", "LIMIT", "0", "0"]).is_empty());
+            let mut from_b = vec!["b", "c", "d", "e"];
+            from_b.extend_from_slice(tail);
+            assert_eq!(r(&mut db, &["lex", "-", "+", "LIMIT", "1", "-1"]), from_b);
+            // Reversed bounds are an empty range, not an error.
+            assert!(r(&mut db, &["lex", "+", "-"]).is_empty());
+            // Lower-case option token.
+            assert_eq!(
+                r(&mut db, &["lex", "-", "+", "limit", "1", "2"]),
+                ["b", "c"]
+            );
+            assert!(r(&mut db, &["nokey", "-", "+"]).is_empty());
+        }
+    }
+
+    #[test]
+    fn zrevrangebylex_takes_max_then_min_and_walks_backwards() {
+        let mut db = Database::new();
+        seed(&mut db, "lex", LEX);
+        let r = |db: &mut Database, a: &[&str]| strings(&call(db, "ZREVRANGEBYLEX", a));
+        assert_eq!(r(&mut db, &["lex", "+", "-"]), ["e", "d", "c", "b", "a"]);
+        assert_eq!(r(&mut db, &["lex", "[d", "(b"]), ["d", "c"]);
+        assert_eq!(r(&mut db, &["lex", "(d", "[b"]), ["c", "b"]);
+        assert!(r(&mut db, &["lex", "-", "+"]).is_empty());
+        assert_eq!(
+            r(&mut db, &["lex", "+", "-", "LIMIT", "1", "2"]),
+            ["d", "c"]
+        );
+        assert_eq!(
+            r(&mut db, &["lex", "+", "-", "LIMIT", "1", "-1"]),
+            ["d", "c", "b", "a"]
+        );
+        assert!(r(&mut db, &["lex", "+", "-", "LIMIT", "-1", "2"]).is_empty());
+    }
+
+    #[test]
+    fn zrangebylex_error_surface_matches_the_oracle() {
+        let mut db = Database::new();
+        seed(&mut db, "lex", LEX);
+        call(&mut db, "SET", &["str", "v"]);
+        let e = |db: &mut Database, cmd: &str, a: &[&str]| err_text(&call(db, cmd, a));
+        for cmd in ["ZRANGEBYLEX", "ZREVRANGEBYLEX"] {
+            let lc = cmd.to_ascii_lowercase();
+            assert_eq!(
+                e(&mut db, cmd, &["lex", "-"]),
+                format!("ERR wrong number of arguments for '{lc}' command")
+            );
+            assert_eq!(
+                e(&mut db, cmd, &["lex", "a", "b"]),
+                "ERR min or max not valid string range item"
+            );
+            assert_eq!(
+                e(&mut db, cmd, &["lex", "", "+"]),
+                "ERR min or max not valid string range item"
+            );
+            // The grammar is checked BEFORE the key: a missing key with a bad
+            // bound is still an error, not an empty array.
+            assert_eq!(
+                e(&mut db, cmd, &["nokey", "a", "b"]),
+                "ERR min or max not valid string range item"
+            );
+            assert_eq!(
+                e(&mut db, cmd, &["lex", "-", "+", "WITHSCORES"]),
+                "ERR syntax error, WITHSCORES not supported in combination with BYLEX"
+            );
+            // ... and the WITHSCORES refusal outranks a bad bound. (The
+            // first draft had these the other way round; the oracle sweep of
+            // the built binary caught it, which is why every row is sent.)
+            assert_eq!(
+                e(&mut db, cmd, &["lex", "a", "b", "WITHSCORES"]),
+                "ERR syntax error, WITHSCORES not supported in combination with BYLEX"
+            );
+            assert_eq!(
+                e(&mut db, cmd, &["lex", "-", "+", "LIMIT", "1"]),
+                "ERR syntax error"
+            );
+            assert_eq!(
+                e(&mut db, cmd, &["lex", "-", "+", "BOGUS"]),
+                "ERR syntax error"
+            );
+            assert_eq!(
+                e(&mut db, cmd, &["lex", "-", "+", "LIMIT", "notanint", "1"]),
+                "ERR value is not an integer or out of range"
+            );
+            assert_eq!(
+                e(&mut db, cmd, &["lex", "-", "+", "LIMIT", "1", "notanint"]),
+                "ERR value is not an integer or out of range"
+            );
+            // The option loop runs first: a dangling LIMIT beats a bad bound.
+            assert_eq!(
+                e(&mut db, cmd, &["lex", "a", "b", "LIMIT", "1"]),
+                "ERR syntax error"
+            );
+            assert!(e(&mut db, cmd, &["str", "-", "+"]).starts_with("WRONGTYPE"));
+        }
+    }
+
+    // ── ZREMRANGEBYRANK ──────────────────────────────────────────────────
+
+    #[test]
+    fn zremrangebyrank_normalises_ranks_like_redis() {
+        for promote in [false, true] {
+            let cases: &[(&str, &str, i64, &[&str])] = &[
+                ("0", "0", 1, &["b", "c", "d", "e"]),
+                ("-2", "-1", 2, &["a", "b", "c"]),
+                ("3", "1", 0, &["a", "b", "c", "d", "e"]),
+                ("0", "100", 5, &[]),
+                ("-100", "1", 2, &["c", "d", "e"]),
+                ("5", "10", 0, &["a", "b", "c", "d", "e"]),
+                ("-1", "-3", 0, &["a", "b", "c", "d", "e"]),
+                // A stop still negative after normalisation is NOT clamped
+                // to 0: redis 8.6.1 removes nothing here.
+                ("-10", "-6", 0, &["a", "b", "c", "d", "e"]),
+                ("2", "-2", 2, &["a", "b", "e"]),
+                ("0", "-1", 5, &[]),
+            ];
+            for (start, stop, removed, left) in cases {
+                let mut db = Database::new();
+                seed(&mut db, "r", FIVE);
+                if promote {
+                    // Promote WITHOUT changing the membership under test.
+                    call(&mut db, "ZADD", &["r", "9", LONG]);
+                    call(&mut db, "ZREM", &["r", LONG]);
+                    assert_eq!(encoding_of(&mut db, "r"), "skiplist");
+                } else {
+                    assert_eq!(encoding_of(&mut db, "r"), "listpack");
+                }
+                assert_eq!(
+                    call(&mut db, "ZREMRANGEBYRANK", &["r", start, stop]),
+                    Frame::Integer(*removed),
+                    "ZREMRANGEBYRANK r {start} {stop} promote={promote}"
+                );
+                if left.is_empty() {
+                    assert!(!exists(&mut db, "r"), "drained key must be gone");
+                } else {
+                    assert_eq!(
+                        range(&mut db, "r"),
+                        *left,
+                        "{start} {stop} promote={promote}"
+                    );
+                    // A removal never converts the encoding (moon#897).
+                    assert_eq!(
+                        encoding_of(&mut db, "r"),
+                        if promote { "skiplist" } else { "listpack" }
+                    );
+                }
+                ledger_exact(
+                    &mut db,
+                    &format!("ZREMRANGEBYRANK {start} {stop} promote={promote}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zremrangebyrank_error_surface_and_missing_key() {
+        let mut db = Database::new();
+        seed(&mut db, "r", FIVE);
+        call(&mut db, "SET", &["str", "v"]);
+        let e = |db: &mut Database, a: &[&str]| err_text(&call(db, "ZREMRANGEBYRANK", a));
+        for bad in [
+            &["r", "notanint", "1"][..],
+            &["r", "1", "notanint"],
+            &["r", "1.5", "2"],
+        ] {
+            assert_eq!(
+                e(&mut db, bad),
+                "ERR value is not an integer or out of range"
+            );
+        }
+        for bad in [&["r", "1"][..], &["r", "1", "2", "3"], &["r"]] {
+            assert_eq!(
+                e(&mut db, bad),
+                "ERR wrong number of arguments for 'zremrangebyrank' command"
+            );
+        }
+        assert!(e(&mut db, &["str", "0", "1"]).starts_with("WRONGTYPE"));
+        assert_eq!(
+            range(&mut db, "r").len(),
+            5,
+            "no error may have removed anything"
+        );
+        // A bad index on a MISSING key is still the integer error (the range
+        // is parsed before the lookup), and a good one answers 0 and creates
+        // nothing.
+        assert_eq!(
+            e(&mut db, &["nokey", "x", "1"]),
+            "ERR value is not an integer or out of range"
+        );
+        assert_eq!(
+            call(&mut db, "ZREMRANGEBYRANK", &["nokey", "0", "1"]),
+            Frame::Integer(0)
+        );
+        assert!(!exists(&mut db, "nokey"));
+        ledger_exact(&mut db, "after the error surface");
+    }
+
+    // ── ZREMRANGEBYSCORE ─────────────────────────────────────────────────
+
+    #[test]
+    fn zremrangebyscore_bounds_match_the_oracle() {
+        for promote in [false, true] {
+            let cases: &[(&str, &str, i64, &[&str])] = &[
+                ("2", "3", 2, &["a", "d", "e"]),
+                ("(2", "3", 1, &["a", "b", "d", "e"]),
+                ("-inf", "+inf", 5, &[]),
+                ("3", "1", 0, &["a", "b", "c", "d", "e"]),
+                ("+inf", "-inf", 0, &["a", "b", "c", "d", "e"]),
+                ("(1", "(1", 0, &["a", "b", "c", "d", "e"]),
+                ("(1", "2", 1, &["a", "c", "d", "e"]),
+                ("(5", "inf", 0, &["a", "b", "c", "d", "e"]),
+                ("5", "inf", 1, &["a", "b", "c", "d"]),
+            ];
+            for (min, max, removed, left) in cases {
+                let mut db = Database::new();
+                seed(&mut db, "s", FIVE);
+                if promote {
+                    call(&mut db, "ZADD", &["s", "9", LONG]);
+                    call(&mut db, "ZREM", &["s", LONG]);
+                    assert_eq!(encoding_of(&mut db, "s"), "skiplist");
+                }
+                assert_eq!(
+                    call(&mut db, "ZREMRANGEBYSCORE", &["s", min, max]),
+                    Frame::Integer(*removed),
+                    "ZREMRANGEBYSCORE s {min} {max} promote={promote}"
+                );
+                if left.is_empty() {
+                    assert!(!exists(&mut db, "s"));
+                } else {
+                    assert_eq!(range(&mut db, "s"), *left, "{min} {max} promote={promote}");
+                }
+                ledger_exact(
+                    &mut db,
+                    &format!("ZREMRANGEBYSCORE {min} {max} promote={promote}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zremrangebyscore_error_surface_and_missing_key() {
+        let mut db = Database::new();
+        seed(&mut db, "s", FIVE);
+        call(&mut db, "SET", &["str", "v"]);
+        let e = |db: &mut Database, a: &[&str]| err_text(&call(db, "ZREMRANGEBYSCORE", a));
+        for bad in [&["s", "nan", "1"][..], &["s", "a", "1"], &["s", "1", "a"]] {
+            assert_eq!(e(&mut db, bad), "ERR min or max is not a float");
+        }
+        for bad in [&["s", "1"][..], &["s", "1", "2", "3"]] {
+            assert_eq!(
+                e(&mut db, bad),
+                "ERR wrong number of arguments for 'zremrangebyscore' command"
+            );
+        }
+        assert!(e(&mut db, &["str", "0", "1"]).starts_with("WRONGTYPE"));
+        assert_eq!(
+            e(&mut db, &["nokey", "x", "1"]),
+            "ERR min or max is not a float"
+        );
+        assert_eq!(
+            call(&mut db, "ZREMRANGEBYSCORE", &["nokey", "0", "1"]),
+            Frame::Integer(0)
+        );
+        assert!(!exists(&mut db, "nokey"));
+        assert_eq!(range(&mut db, "s").len(), 5);
+    }
+
+    // ── ZREMRANGEBYLEX ───────────────────────────────────────────────────
+
+    #[test]
+    fn zremrangebylex_bounds_match_the_oracle() {
+        for promote in [false, true] {
+            let cases: &[(&str, &str, i64, &[&str])] = &[
+                ("[b", "(d", 2, &["a", "d", "e"]),
+                ("-", "+", 5, &[]),
+                ("+", "-", 0, &["a", "b", "c", "d", "e"]),
+                ("(c", "+", 2, &["a", "b", "c"]),
+                ("[zz", "[zz", 0, &["a", "b", "c", "d", "e"]),
+            ];
+            for (min, max, removed, left) in cases {
+                let mut db = Database::new();
+                seed(&mut db, "l", LEX);
+                if promote {
+                    call(&mut db, "ZADD", &["l", "0", LONG]);
+                    call(&mut db, "ZREM", &["l", LONG]);
+                    assert_eq!(encoding_of(&mut db, "l"), "skiplist");
+                }
+                assert_eq!(
+                    call(&mut db, "ZREMRANGEBYLEX", &["l", min, max]),
+                    Frame::Integer(*removed),
+                    "ZREMRANGEBYLEX l {min} {max} promote={promote}"
+                );
+                if left.is_empty() {
+                    assert!(!exists(&mut db, "l"));
+                } else {
+                    assert_eq!(range(&mut db, "l"), *left, "{min} {max} promote={promote}");
+                }
+                ledger_exact(
+                    &mut db,
+                    &format!("ZREMRANGEBYLEX {min} {max} promote={promote}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zremrangebylex_error_surface_and_missing_key() {
+        let mut db = Database::new();
+        seed(&mut db, "l", LEX);
+        call(&mut db, "SET", &["str", "v"]);
+        let e = |db: &mut Database, a: &[&str]| err_text(&call(db, "ZREMRANGEBYLEX", a));
+        assert_eq!(
+            e(&mut db, &["l", "a", "b"]),
+            "ERR min or max not valid string range item"
+        );
+        assert_eq!(
+            e(&mut db, &["l", "", "+"]),
+            "ERR min or max not valid string range item"
+        );
+        for bad in [&["l", "-"][..], &["l", "-", "+", "x"]] {
+            assert_eq!(
+                e(&mut db, bad),
+                "ERR wrong number of arguments for 'zremrangebylex' command"
+            );
+        }
+        assert!(e(&mut db, &["str", "-", "+"]).starts_with("WRONGTYPE"));
+        assert_eq!(
+            e(&mut db, &["nokey", "x", "1"]),
+            "ERR min or max not valid string range item"
+        );
+        assert_eq!(
+            call(&mut db, "ZREMRANGEBYLEX", &["nokey", "-", "+"]),
+            Frame::Integer(0)
+        );
+        assert!(!exists(&mut db, "nokey"));
+        assert_eq!(range(&mut db, "l").len(), 5);
+    }
+
+    // ── ZDIFFSTORE ───────────────────────────────────────────────────────
+
+    fn scored(db: &mut Database, key: &str) -> Vec<String> {
+        strings(&call(db, "ZRANGE", &[key, "0", "-1", "WITHSCORES"]))
+    }
+
+    #[test]
+    fn zdiffstore_computes_the_difference_with_first_source_scores() {
+        let mut db = Database::new();
+        seed(&mut db, "z", FIVE);
+        seed(&mut db, "z2", &[("1", "a"), ("2", "b")]);
+        seed(&mut db, "z3", &[("2", "b"), ("9", "x")]);
+        assert_eq!(
+            call(&mut db, "ZDIFFSTORE", &["d1", "2", "z", "z2"]),
+            Frame::Integer(3)
+        );
+        assert_eq!(scored(&mut db, "d1"), ["c", "3", "d", "4", "e", "5"]);
+        assert_eq!(
+            call(&mut db, "ZDIFFSTORE", &["d2", "1", "z"]),
+            Frame::Integer(5)
+        );
+        assert_eq!(
+            call(&mut db, "ZDIFFSTORE", &["d3", "2", "z", "nokey"]),
+            Frame::Integer(5)
+        );
+        assert_eq!(
+            call(&mut db, "ZDIFFSTORE", &["d8", "3", "z", "z2", "z3"]),
+            Frame::Integer(3)
+        );
+        assert_eq!(scored(&mut db, "d8"), ["c", "3", "d", "4", "e", "5"]);
+        // Sources are read before the destination is replaced, so a
+        // destination that is also a source is diffed from its OLD content.
+        assert_eq!(
+            call(&mut db, "ZDIFFSTORE", &["z3", "2", "z", "z3"]),
+            Frame::Integer(4)
+        );
+        assert_eq!(
+            scored(&mut db, "z3"),
+            ["a", "1", "c", "3", "d", "4", "e", "5"]
+        );
+        assert_eq!(
+            call(&mut db, "ZDIFFSTORE", &["z2", "1", "z2"]),
+            Frame::Integer(2)
+        );
+        assert_eq!(scored(&mut db, "z2"), ["a", "1", "b", "2"]);
+        // Lower-case, as a client library sends it.
+        assert_eq!(
+            call(&mut db, "zdiffstore", &["d9", "1", "z"]),
+            Frame::Integer(5)
+        );
+        // Reading a listpack source did not flatten it.
+        assert_eq!(encoding_of(&mut db, "z"), "listpack");
+        ledger_exact(&mut db, "after the ZDIFFSTORE happy paths");
+    }
+
+    #[test]
+    fn zdiffstore_empty_result_deletes_the_destination() {
+        let mut db = Database::new();
+        seed(&mut db, "z", FIVE);
+        assert_eq!(
+            call(&mut db, "ZDIFFSTORE", &["d4", "2", "nokey", "z"]),
+            Frame::Integer(0)
+        );
+        assert!(!exists(&mut db, "d4"));
+        // Even a destination of another type is replaced — by nothing.
+        call(&mut db, "SET", &["d5", "x"]);
+        assert_eq!(
+            call(&mut db, "ZDIFFSTORE", &["d5", "2", "z", "z"]),
+            Frame::Integer(0)
+        );
+        assert!(!exists(&mut db, "d5"));
+        ledger_exact(&mut db, "after an empty ZDIFFSTORE");
+    }
+
+    #[test]
+    fn zdiffstore_error_surface_matches_the_oracle() {
+        let mut db = Database::new();
+        seed(&mut db, "z", FIVE);
+        call(&mut db, "SET", &["str", "v"]);
+        let e = |db: &mut Database, a: &[&str]| err_text(&call(db, "ZDIFFSTORE", a));
+        // The two-class numkeys split (moon#969).
+        assert_eq!(
+            e(&mut db, &["d", "0", "z"]),
+            "ERR at least 1 input key is needed for 'zdiffstore' command"
+        );
+        assert_eq!(
+            e(&mut db, &["d", "-1", "z"]),
+            "ERR at least 1 input key is needed for 'zdiffstore' command"
+        );
+        assert_eq!(
+            e(&mut db, &["d", "notanint", "z"]),
+            "ERR value is not an integer or out of range"
+        );
+        // Arity first: no key named at all.
+        for bad in [&["d", "1"][..], &["d"], &["d", "0"]] {
+            assert_eq!(
+                e(&mut db, bad),
+                "ERR wrong number of arguments for 'zdiffstore' command"
+            );
+        }
+        // numkeys overrunning the key list, and every option token: ZDIFFSTORE
+        // takes none, so WEIGHTS/AGGREGATE are as unknown as BOGUS.
+        assert_eq!(e(&mut db, &["d", "2", "z"]), "ERR syntax error");
+        for opts in [
+            &["WEIGHTS", "1"][..],
+            &["AGGREGATE", "SUM"],
+            &["WITHSCORES"],
+            &["BOGUS"],
+        ] {
+            let mut a = vec!["d", "1", "z"];
+            a.extend_from_slice(opts);
+            assert_eq!(e(&mut db, &a), "ERR syntax error", "{opts:?}");
+        }
+        assert!(
+            !exists(&mut db, "d"),
+            "no error may have created the destination"
+        );
+        // WRONGTYPE from either position, and it outranks an option error:
+        // Redis looks the sources up before it parses the options.
+        assert!(e(&mut db, &["d", "2", "str", "z"]).starts_with("WRONGTYPE"));
+        assert!(e(&mut db, &["d", "2", "z", "str"]).starts_with("WRONGTYPE"));
+        assert!(e(&mut db, &["d", "1", "str", "BOGUS"]).starts_with("WRONGTYPE"));
+        // ... while a numkeys error or an overrun is decided before the lookup.
+        assert_eq!(
+            e(&mut db, &["d", "0", "str", "BOGUS"]),
+            "ERR at least 1 input key is needed for 'zdiffstore' command"
+        );
+        assert_eq!(e(&mut db, &["d", "2", "str"]), "ERR syntax error");
+        // The destination's type is irrelevant until the write.
+        assert_eq!(e(&mut db, &["str", "1", "z", "BOGUS"]), "ERR syntax error");
+        assert!(!exists(&mut db, "d"));
+    }
+
+    /// The precedence fix above applies to the whole family, since the three
+    /// share one implementation: `ZUNIONSTORE d 1 <string> BOGUS` is
+    /// WRONGTYPE on redis 8.6.1, and was `syntax error` on moon.
+    #[test]
+    fn zunionstore_wrongtype_outranks_an_option_error() {
+        let mut db = Database::new();
+        seed(&mut db, "z", FIVE);
+        call(&mut db, "SET", &["str", "v"]);
+        for (cmd, opts) in [
+            ("ZUNIONSTORE", &["BOGUS"][..]),
+            ("ZUNIONSTORE", &["WEIGHTS", "nan"]),
+            ("ZINTERSTORE", &["WEIGHTS", "1"]),
+        ] {
+            let mut a = vec!["d", "2", "z", "str"];
+            a.extend_from_slice(opts);
+            assert!(
+                err_text(&call(&mut db, cmd, &a)).starts_with("WRONGTYPE"),
+                "{cmd} {opts:?}"
+            );
+        }
+        // A well-typed source with a bad option is still the option's error.
+        assert_eq!(
+            err_text(&call(&mut db, "ZUNIONSTORE", &["d", "1", "z", "BOGUS"])),
+            "ERR syntax error"
+        );
+        assert_eq!(
+            err_text(&call(
+                &mut db,
+                "ZUNIONSTORE",
+                &["d", "1", "z", "WEIGHTS", "nan"]
+            )),
+            "ERR weight value is not a float"
+        );
+        // And reading a listpack source through the store family leaves it a
+        // listpack (the moon#928 defect, closed for this family too).
+        assert_eq!(
+            call(&mut db, "ZUNIONSTORE", &["u", "1", "z"]),
+            Frame::Integer(5)
+        );
+        assert_eq!(encoding_of(&mut db, "z"), "listpack");
+    }
+
+    // ── ZADD ... INCR ────────────────────────────────────────────────────
+
+    fn bulk_text(frame: &Frame) -> String {
+        match frame {
+            Frame::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+            other => panic!("expected a bulk string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zadd_incr_replies_the_new_score_on_both_encodings() {
+        for promote in [false, true] {
+            let mut db = Database::new();
+            let key = "i";
+            if promote {
+                call(&mut db, "ZADD", &[key, "1", LONG]);
+                assert_eq!(encoding_of(&mut db, key), "skiplist");
+            }
+            let incr = |db: &mut Database, a: &[&str]| call(db, "ZADD", a);
+            assert_eq!(bulk_text(&incr(&mut db, &[key, "INCR", "5", "a"])), "5");
+            assert_eq!(bulk_text(&incr(&mut db, &[key, "INCR", "2.5", "a"])), "7.5");
+            assert_eq!(
+                bulk_text(&incr(&mut db, &[key, "INCR", "1e3", "big"])),
+                "1000"
+            );
+            assert_eq!(
+                bulk_text(&incr(&mut db, &[key, "INCR", "0.1", "big"])),
+                "1000.1"
+            );
+            // Option order does not matter, and CH has no say in the reply.
+            assert_eq!(
+                bulk_text(&incr(&mut db, &[key, "CH", "INCR", "1", "a"])),
+                "8.5"
+            );
+            assert_eq!(
+                bulk_text(&incr(&mut db, &[key, "INCR", "CH", "1", "a"])),
+                "9.5"
+            );
+            assert_eq!(bulk_text(&incr(&mut db, &[key, "incr", "1", "a"])), "10.5");
+            assert_eq!(bulk_text(&call(&mut db, "ZSCORE", &[key, "a"])), "10.5");
+            if !promote {
+                assert_eq!(encoding_of(&mut db, key), "listpack");
+            }
+            ledger_exact(&mut db, &format!("after ZADD INCR promote={promote}"));
+        }
+    }
+
+    #[test]
+    fn zadd_incr_honours_nx_xx_gt_lt_like_redis() {
+        for promote in [false, true] {
+            let mut db = Database::new();
+            let key = "i";
+            if promote {
+                call(&mut db, "ZADD", &[key, "1", LONG]);
+            }
+            let incr = |db: &mut Database, a: &[&str]| call(db, "ZADD", a);
+            assert_eq!(bulk_text(&incr(&mut db, &[key, "INCR", "5", "a"])), "5");
+            // NX: refuses a present member, admits a new one.
+            assert_eq!(incr(&mut db, &[key, "NX", "INCR", "1", "a"]), Frame::Null);
+            assert_eq!(
+                bulk_text(&incr(&mut db, &[key, "NX", "INCR", "1", "newm"])),
+                "1"
+            );
+            // XX: refuses a new member, admits a present one.
+            assert_eq!(
+                incr(&mut db, &[key, "XX", "INCR", "1", "nope"]),
+                Frame::Null
+            );
+            assert_eq!(
+                bulk_text(&incr(&mut db, &[key, "XX", "INCR", "1", "a"])),
+                "6"
+            );
+            // GT/LT: only a move in the right direction; zero is a refusal.
+            assert_eq!(incr(&mut db, &[key, "GT", "INCR", "-1", "a"]), Frame::Null);
+            assert_eq!(
+                bulk_text(&incr(&mut db, &[key, "GT", "INCR", "1", "a"])),
+                "7"
+            );
+            assert_eq!(incr(&mut db, &[key, "LT", "INCR", "1", "a"]), Frame::Null);
+            assert_eq!(
+                bulk_text(&incr(&mut db, &[key, "LT", "INCR", "-1", "a"])),
+                "6"
+            );
+            assert_eq!(incr(&mut db, &[key, "GT", "INCR", "0", "a"]), Frame::Null);
+            assert_eq!(incr(&mut db, &[key, "LT", "INCR", "0", "a"]), Frame::Null);
+            // GT/LT never block a first insert; XX+GT does.
+            assert_eq!(
+                bulk_text(&incr(&mut db, &[key, "GT", "INCR", "1", "zz"])),
+                "1"
+            );
+            assert_eq!(
+                bulk_text(&incr(&mut db, &[key, "LT", "INCR", "1", "yy"])),
+                "1"
+            );
+            assert_eq!(
+                incr(&mut db, &[key, "XX", "GT", "INCR", "1", "qq"]),
+                Frame::Null
+            );
+            // A refusal wrote nothing.
+            assert_eq!(bulk_text(&call(&mut db, "ZSCORE", &[key, "a"])), "6");
+            assert_eq!(call(&mut db, "ZSCORE", &[key, "qq"]), Frame::Null);
+            ledger_exact(
+                &mut db,
+                &format!("after flagged ZADD INCR promote={promote}"),
+            );
+        }
+    }
+
+    #[test]
+    fn zadd_incr_refusal_on_a_missing_key_creates_nothing() {
+        let mut db = Database::new();
+        assert_eq!(
+            call(&mut db, "ZADD", &["i3", "XX", "INCR", "1", "a"]),
+            Frame::Null
+        );
+        assert!(!exists(&mut db, "i3"));
+        // The B+tree arm too: a member too long for a listpack.
+        assert_eq!(
+            call(&mut db, "ZADD", &["i4", "XX", "INCR", "1", LONG]),
+            Frame::Null
+        );
+        assert!(!exists(&mut db, "i4"));
+        assert_eq!(
+            bulk_text(&call(&mut db, "ZADD", &["i3", "NX", "INCR", "1", "a"])),
+            "1"
+        );
+        ledger_exact(&mut db, "after refused ZADD INCR on missing keys");
+    }
+
+    #[test]
+    fn zadd_incr_error_surface_matches_the_oracle() {
+        let mut db = Database::new();
+        seed(&mut db, "i", &[("1", "a")]);
+        call(&mut db, "SET", &["str", "v"]);
+        let e = |db: &mut Database, a: &[&str]| err_text(&call(db, "ZADD", a));
+        assert_eq!(
+            e(&mut db, &["i", "INCR", "1", "a", "2", "b"]),
+            "ERR INCR option supports a single increment-element pair"
+        );
+        assert_eq!(
+            e(&mut db, &["i", "INCR"]),
+            "ERR wrong number of arguments for 'zadd' command"
+        );
+        // Parity is checked before the pair count ...
+        assert_eq!(e(&mut db, &["i", "INCR", "1"]), "ERR syntax error");
+        assert_eq!(
+            e(&mut db, &["i", "INCR", "1", "a", "2"]),
+            "ERR syntax error"
+        );
+        // ... and the flag pairings before both.
+        assert_eq!(
+            e(&mut db, &["i", "INCR", "NX", "XX", "1", "a", "2", "b"]),
+            "ERR XX and NX options at the same time are not compatible"
+        );
+        assert_eq!(
+            e(&mut db, &["i", "INCR", "GT", "LT", "1", "a"]),
+            "ERR GT, LT, and/or NX options at the same time are not compatible"
+        );
+        assert_eq!(
+            e(&mut db, &["i", "INCR", "nan", "a"]),
+            "ERR value is not a valid float"
+        );
+        assert_eq!(
+            e(&mut db, &["i", "INCR", "notafloat", "a"]),
+            "ERR value is not a valid float"
+        );
+        assert!(e(&mut db, &["str", "INCR", "1", "a"]).starts_with("WRONGTYPE"));
+        // inf + -inf is NaN: refused with the ZINCRBY message, score untouched.
+        assert_eq!(
+            bulk_text(&call(&mut db, "ZADD", &["i", "INCR", "inf", "a"])),
+            "inf"
+        );
+        assert_eq!(
+            e(&mut db, &["i", "INCR", "-inf", "a"]),
+            "ERR resulting score is not a number (NaN)"
+        );
+        assert_eq!(bulk_text(&call(&mut db, "ZSCORE", &["i", "a"])), "inf");
+        assert_eq!(
+            encoding_of(&mut db, "i"),
+            "listpack",
+            "an erroring INCR must not flatten"
+        );
+        // NX outranks the NaN check: the sum is never formed for a present
+        // member under NX.
+        assert_eq!(
+            call(&mut db, "ZADD", &["i", "NX", "INCR", "-inf", "a"]),
+            Frame::Null
+        );
+    }
+
+    /// The plain ZINCRBY went through the refactored core; its contract is
+    /// unchanged.
+    #[test]
+    fn zincrby_is_unchanged_by_the_shared_core() {
+        let mut db = Database::new();
+        assert_eq!(bulk_text(&call(&mut db, "ZINCRBY", &["z", "5", "a"])), "5");
+        assert_eq!(
+            bulk_text(&call(&mut db, "ZINCRBY", &["z", "-2.5", "a"])),
+            "2.5"
+        );
+        assert_eq!(
+            bulk_text(&call(&mut db, "ZINCRBY", &["z", "inf", "a"])),
+            "inf"
+        );
+        assert_eq!(
+            err_text(&call(&mut db, "ZINCRBY", &["z", "-inf", "a"])),
+            "ERR resulting score is not a number (NaN)"
+        );
+        assert_eq!(
+            err_text(&call(&mut db, "ZINCRBY", &["z", "nan", "a"])),
+            "ERR value is not a valid float"
+        );
+        assert_eq!(encoding_of(&mut db, "z"), "listpack");
+        assert_eq!(bulk_text(&call(&mut db, "ZINCRBY", &["z", "1", LONG])), "1");
+        assert_eq!(encoding_of(&mut db, "z"), "skiplist");
+        assert_eq!(
+            bulk_text(&call(&mut db, "ZINCRBY", &["z", "1", "a"])),
+            "inf"
+        );
+        ledger_exact(&mut db, "after ZINCRBY through the shared core");
+    }
+
+    #[test]
+    fn rank_window_follows_the_redis_rule() {
+        assert_eq!(rank_window(0, 0, 5), Some((0, 0)));
+        assert_eq!(rank_window(-2, -1, 5), Some((3, 4)));
+        assert_eq!(rank_window(3, 1, 5), None);
+        assert_eq!(rank_window(0, 100, 5), Some((0, 4)));
+        assert_eq!(rank_window(-100, 1, 5), Some((0, 1)));
+        assert_eq!(rank_window(5, 10, 5), None);
+        assert_eq!(rank_window(-1, -3, 5), None);
+        assert_eq!(rank_window(-10, -6, 5), None);
+        assert_eq!(rank_window(2, -2, 5), Some((2, 3)));
+        assert_eq!(rank_window(0, -1, 0), None);
+        assert_eq!(rank_window(i64::MIN, i64::MAX, 5), Some((0, 4)));
+        assert_eq!(rank_window(i64::MAX, i64::MAX, 5), None);
     }
 }

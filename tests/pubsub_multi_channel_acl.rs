@@ -219,7 +219,9 @@ fn run_channel_acl(shards: &str) {
     //    also be NOPERM — the txn path must not be a bypass.
     c.clear();
     c.cmd(&["MULTI"]);
-    c.cmd(&["PUBLISH", "denied:y", "hi"]); // +QUEUED
+    // -NOPERM at queue time since moon#1035 (EXEC then answers EXECABORT);
+    // it was +QUEUED and refused inside EXEC's reply before.
+    c.cmd(&["PUBLISH", "denied:y", "hi"]);
     c.cmd(&["EXEC"]);
     assert!(
         c.saw(b"NOPERM"),
