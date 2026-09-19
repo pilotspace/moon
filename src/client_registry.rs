@@ -402,10 +402,17 @@ pub fn client_list() -> String {
     // Redis makes no CLIENT LIST ordering guarantee.
     let mut result =
         String::with_capacity(TOTAL_CLIENTS.load(Ordering::Relaxed).saturating_mul(128));
+    // moon#1078: tracking state, snapshotted BEFORE any registry stripe is
+    // locked. The permitted order is tracking mutex, then a stripe (routing
+    // probes liveness under the tracking lock), so it must never be taken
+    // while a stripe is held.
+    let tracking = crate::tracking::tracking_active()
+        .then(|| crate::tracking::global_table().lock().client_views());
     for lock in REGISTRY.iter() {
         let stripe = lock.read();
         for entry in stripe.values() {
-            format_client_line(&mut result, entry, now);
+            let view = tracking.as_ref().and_then(|t| t.get(&entry.id));
+            format_client_line(&mut result, entry, now, view);
         }
     }
     // Remove trailing newline if present
@@ -418,9 +425,13 @@ pub fn client_list() -> String {
 /// Format a single client's info (for CLIENT INFO).
 pub fn client_info(id: u64) -> Option<String> {
     let now = Instant::now();
+    // Before the stripe lock — see `client_list`.
+    let view = crate::tracking::tracking_active()
+        .then(|| crate::tracking::global_table().lock().client_view(id))
+        .flatten();
     stripe(id).read().get(&id).map(|entry| {
         let mut result = String::with_capacity(128);
-        format_client_line(&mut result, entry, now);
+        format_client_line(&mut result, entry, now, view.as_ref());
         if result.ends_with('\n') {
             result.pop();
         }
@@ -699,18 +710,46 @@ pub fn parse_kill_args(args: &[&[u8]]) -> Option<KillFilter> {
 /// unknown) rather than omitted — see docs/redis-compat.md for the list of
 /// fields that are structurally present but not yet semantically populated.
 ///
-/// `redir` and the tracking flag char (`t`) are intentionally left at their
-/// "off" defaults (`redir=-1`, never appended to `flags`): PR #234 is adding
-/// real CLIENT TRACKING state, and that work owns wiring these two fields to
-/// live data. Do not add tracking introspection here — it would conflict.
-fn format_client_line(buf: &mut String, entry: &ClientEntry, now: Instant) {
+/// `tracking` is the client's CLIENT TRACKING state, `None` when it is off
+/// (moon#1078): it appends redis's `t`/`R`/`B` flag chars, in redis's order,
+/// and fills `redir` (the target id, 0 for none, -1 when tracking is off).
+fn format_client_line(
+    buf: &mut String,
+    entry: &ClientEntry,
+    now: Instant,
+    tracking: Option<&crate::tracking::ClientTrackingView>,
+) {
     use std::fmt::Write;
     let live = &*entry.live;
     let age = now.duration_since(live.connected_at).as_secs();
     let last_cmd_secs = live.last_cmd_ms.load(Ordering::Relaxed) / 1000;
     let idle = age.saturating_sub(last_cmd_secs);
     let name = entry.name.as_deref().unwrap_or("");
-    let flags = ClientFlags::from_bits(live.flags.load(Ordering::Relaxed)).to_flag_str();
+    let base = ClientFlags::from_bits(live.flags.load(Ordering::Relaxed)).to_flag_str();
+    // At most one base char plus `tRB`.
+    let mut flags_buf = [0u8; 4];
+    let flags: &str = match tracking {
+        None => base,
+        Some(t) => {
+            let mut n = 0;
+            let mut push = |c: u8| {
+                flags_buf[n] = c;
+                n += 1;
+            };
+            if base != "N" {
+                push(base.as_bytes()[0]);
+            }
+            push(b't');
+            if t.broken_redirect {
+                push(b'R');
+            }
+            if t.bcast {
+                push(b'B');
+            }
+            std::str::from_utf8(&flags_buf[..n]).unwrap_or(base)
+        }
+    };
+    let redir = tracking.map_or(-1, |t| i64::try_from(t.redirect).unwrap_or(i64::MAX));
     let db = live.db.load(Ordering::Relaxed);
     // c10k C1: `obl`/`omem` report the reply bytes this connection is holding
     // in an in-flight write. A client that stops reading pins that memory for
@@ -725,7 +764,7 @@ fn format_client_line(buf: &mut String, entry: &ClientEntry, now: Instant) {
         "id={} addr={} laddr={} fd=0 name={} age={} idle={} flags={} db={} \
          sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 \
          tot-net-in=0 tot-net-out={} rbs=1024 rbp=0 obl={} oll=0 omem={} tot-mem={} events=r \
-         cmd=NULL user={} redir=-1 resp=2 lib-name= lib-ver=",
+         cmd=NULL user={} redir={} resp=2 lib-name= lib-ver=",
         entry.id,
         entry.addr,
         entry.laddr,
@@ -739,6 +778,7 @@ fn format_client_line(buf: &mut String, entry: &ClientEntry, now: Instant) {
         omem,
         omem,
         entry.user,
+        redir,
     );
 }
 

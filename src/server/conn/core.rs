@@ -319,7 +319,7 @@ pub(crate) struct ConnectionState {
 
     // Tracking
     pub tracking_state: TrackingState,
-    pub tracking_rx: Option<channel::MpscReceiver<Frame>>,
+    pub tracking_rx: Option<crate::tracking::InvalidationRx>,
     /// This connection's pub/sub channel, registered as a CLIENT TRACKING
     /// REDIRECT inbox while it is subscribed (moon#1048); kept in step by
     /// [`ConnectionState::sync_tracking_inbox`]. Dropping it — on any exit

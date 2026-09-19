@@ -395,6 +395,11 @@ thread_local! {
     /// somehow reaches a VM outside `set_script_db` refuses every command
     /// instead of inheriting the previous script's caller.
     static SCRIPT_ACL: RefCell<ScriptAcl> = RefCell::new(ScriptAcl::deny());
+    /// moon#1089: the CLIENT TRACKING identity of the connection running the
+    /// CURRENT script, taken from its `ScriptAcl` by [`set_script_db`] and
+    /// reset by [`clear_script_db`]. `Copy`, so reading it costs nothing.
+    static SCRIPT_CALLER: Cell<crate::tracking::ScriptCaller> =
+        const { Cell::new(crate::tracking::ScriptCaller { client_id: 0, track_reads: false, noloop: false }) };
 }
 
 /// Set the thread-local database pointer and caller identity before script
@@ -413,6 +418,7 @@ pub fn set_script_db(
     CURRENT_DB_IDX.with(|c| c.set(db_idx));
     CURRENT_DB_COUNT.with(|c| c.set(db_count));
     SCRIPT_HAD_WRITE.with(|c| c.set(false));
+    SCRIPT_CALLER.with(|c| c.set(acl.caller()));
     SCRIPT_ACL.with(|c| *c.borrow_mut() = acl.clone());
 }
 
@@ -422,6 +428,7 @@ pub fn clear_script_db() {
     SCRIPT_READ_ONLY.with(|c| c.set(false));
     // Back to fail-closed: nothing may run until the next `set_script_db`.
     SCRIPT_ACL.with(|c| *c.borrow_mut() = ScriptAcl::deny());
+    SCRIPT_CALLER.with(|c| c.set(crate::tracking::ScriptCaller::default()));
 }
 
 /// Set the read-only flag for the current script execution (FCALL_RO).
@@ -700,6 +707,22 @@ pub fn make_redis_call_fn(
             // normal read-write script).
             if cmd_is_write && !matches!(frame, Frame::Error(_)) {
                 eviction_ctx.emit_effect(db_idx, &frames, &frame);
+            }
+
+            // moon#1089: CLIENT TRACKING sees every command a script runs, as
+            // redis applies it inside `call()` — a write invalidates the keys
+            // it modified, and a read registers its keys for the client that
+            // ran the script, under that client's OPTIN/OPTOUT/CACHING state.
+            // The connection handlers' own hooks cannot: they see `EVAL`, not
+            // what it did. This is the one place every script command passes,
+            // on whichever shard the script runs (the tracking table is
+            // process-global). Flushes are invalidated where the script's
+            // flush is completed (`finish_script_flush`). One relaxed load per
+            // `redis.call` when nobody is tracking.
+            if crate::tracking::tracking_active() && !matches!(frame, Frame::Error(_)) {
+                SCRIPT_CALLER
+                    .with(Cell::get)
+                    .after_script_command(&cmd_bytes, &frames[1..]);
             }
 
             Ok(frame)

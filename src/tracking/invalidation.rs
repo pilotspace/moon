@@ -147,15 +147,18 @@ pub fn invalidate_keys(
         return;
     }
     let mut table = table.lock();
+    // One item per REDIRECT inbox for the whole key list (moon#1088).
+    let mut batch = crate::tracking::DeliveryBatch::default();
     for key in keys {
         let recipients = table.invalidate_key(key, writer_client_id);
         if !recipients.is_empty() {
             let mut msg = crate::tracking::TrackingMessage::keys(std::slice::from_ref(key));
             for to in &recipients {
-                msg.deliver(to);
+                batch.deliver(&mut msg, to);
             }
         }
     }
+    batch.flush();
 }
 
 /// Writer id for a removal the SERVER decided on (expiry, eviction).
@@ -241,8 +244,43 @@ pub fn track_read_keys(
     if keys.is_empty() {
         return;
     }
+    track_keys(&mut table.lock(), &keys, client_id, noloop);
+}
+
+/// [`track_read_keys`] for a read a SCRIPT made (moon#1089).
+///
+/// A script can run on another shard than its caller, so the caller may have
+/// disconnected, or turned tracking off, by the time the read registers.
+/// Registering a key for a client whose teardown already ran would leave an
+/// entry nothing ever removes, so the registration is checked under the same
+/// lock that adds the keys.
+pub fn track_script_read_keys(
+    table: &parking_lot::Mutex<crate::tracking::TrackingTable>,
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    client_id: u64,
+    noloop: bool,
+) {
+    if !crate::command::metadata::is_read(cmd) {
+        return;
+    }
+    let keys = command_keys(cmd, cmd_args);
+    if keys.is_empty() {
+        return;
+    }
     let mut table = table.lock();
-    for key in &keys {
+    if table.is_tracking(client_id) {
+        track_keys(&mut table, &keys, client_id, noloop);
+    }
+}
+
+fn track_keys(
+    table: &mut crate::tracking::TrackingTable,
+    keys: &[Bytes],
+    client_id: u64,
+    noloop: bool,
+) {
+    for key in keys {
         if let Some((evicted_key, recipients)) = table.track_key(client_id, key, noloop) {
             // Cap eviction (G1): tell the evicted key's trackers to drop
             // their cached copy — silently forgetting the tracking entry
@@ -303,6 +341,13 @@ pub fn after_transaction(
         }
         if cmd.eq_ignore_ascii_case(b"CLIENT") {
             crate::tracking::client_cmd::replay_accepted(&mut modes, args);
+            continue;
+        }
+        // A script's own `redis.call`s were tracked by the scripting bridge
+        // as they ran (moon#1089). Its declared keys say nothing about what
+        // it read or wrote: `FCALL` is write-flagged even for a function that
+        // only reads, and `EVAL_RO` is read-flagged whatever it touched.
+        if crate::server::conn::txn_script::is_txn_script(cmd) {
             continue;
         }
         invalidate_after_write(table, cmd, args, client_id);
@@ -982,6 +1027,61 @@ mod tests {
             tracked_after(armed, true, &queue, &results, &["a", "b"]),
             vec!["a", "b"]
         );
+    }
+
+    /// moon#1089: a script queued in MULTI was tracked by the scripting
+    /// bridge as it ran. Its declared keys must not be bookkept again: FCALL
+    /// is write-flagged even for a function that only reads (redis 8.6.1
+    /// sends nothing), and a second pass would push a BCAST tracker twice.
+    #[test]
+    fn queued_scripts_are_left_to_the_bridge() {
+        let table = parking_lot::Mutex::new(crate::tracking::TrackingTable::new());
+        let (tx, rx) = crate::runtime::channel::mpsc_unbounded::<Frame>();
+        {
+            let mut t = table.lock();
+            t.register_client(1, tx);
+            let _ = t.track_key(1, &Bytes::from_static(b"k"), false);
+        }
+        let queue = [
+            cmd(&["FCALL", "r", "1", "k"]),
+            cmd(&["EVAL", "return 1", "1", "k"]),
+            cmd(&["EVAL_RO", "return 1", "1", "e"]),
+        ];
+        let results = [Frame::Null, Frame::Integer(1), Frame::Integer(1)];
+        after_transaction(&table, &queue, &results, 2, on(false, false), true);
+        assert!(
+            pushed_keys(&rx).is_empty(),
+            "FCALL's declared key was invalidated"
+        );
+        let t = table.lock();
+        assert_eq!(t.tracked_clients(&Bytes::from_static(b"k")), vec![1]);
+        assert!(
+            t.tracked_clients(&Bytes::from_static(b"e")).is_empty(),
+            "EVAL_RO's declared key was tracked for the caller"
+        );
+    }
+
+    /// A script can run on another shard than its caller; a read that
+    /// arrives after the caller left (or turned tracking off) must not
+    /// register a key nothing will ever clean up.
+    #[test]
+    fn a_script_read_for_a_departed_caller_registers_nothing() {
+        let table = parking_lot::Mutex::new(crate::tracking::TrackingTable::new());
+        track_script_read_keys(&table, b"GET", &[bulk("gone")], 77, false);
+        assert!(
+            table
+                .lock()
+                .tracked_clients(&Bytes::from_static(b"gone"))
+                .is_empty()
+        );
+        let (tx, _rx) = crate::runtime::channel::mpsc_unbounded::<Frame>();
+        table.lock().register_client(77, tx);
+        track_script_read_keys(&table, b"GET", &[bulk("here")], 77, false);
+        assert_eq!(
+            table.lock().tracked_clients(&Bytes::from_static(b"here")),
+            vec![77]
+        );
+        table.lock().untrack_all(77);
     }
 
     /// A queued CLIENT command that EXEC answered with an error changes

@@ -797,10 +797,12 @@ pub(super) async fn try_handle_multi_exec(
                     )
                     .await;
                     crate::server::conn::core::ensure_function_registry(func_registry, ctx);
-                    Some(crate::acl::ScriptAcl::for_user(
-                        &ctx.acl_table,
-                        &conn.current_user,
-                    ))
+                    // A queued script tracks under the modes the body
+                    // starts under (moon#1089).
+                    Some(
+                        crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user)
+                            .with_caller(tracking_before.script_caller(conn.client_id)),
+                    )
                 } else {
                     None
                 };

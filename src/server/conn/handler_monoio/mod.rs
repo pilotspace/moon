@@ -934,7 +934,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     let data = resp_buf.freeze();
                                                     let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                     if wr.is_err() { return (MonoioHandlerResult::Done, None); }
-                                                    break;
+                                                    // The count is 0 now: the check below hands the
+                                                    // rest of the batch back to the normal path.
                                                 }
                                                 _ => {
                                                     // One allow-list, one text — see
@@ -948,6 +949,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     if wr.is_err() { return (MonoioHandlerResult::Done, None); }
                                                 }
                                             }
+                                        }
+                                        // moon#1090: the allow-list holds only while the
+                                        // connection is subscribed, judged per command as
+                                        // redis does. Once this command left it with no
+                                        // subscription, the rest of the batch belongs to the
+                                        // normal dispatch path: hand it back unparsed. Without
+                                        // the carry flag the main loop would park in read()
+                                        // with those commands already sitting in `read_buf`.
+                                        if conn.subscription_count == 0 {
+                                            carried_input = !read_buf.is_empty();
+                                            break;
                                         }
                                     }
                                     Ok(None) => break, // need more data
@@ -1060,14 +1072,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // (redis 8.6.1 pushes them at once). Pending when not tracking.
                 push = async {
                     match conn.tracking_rx {
-                        Some(ref trx) => trx.recv_async().await.ok(),
+                        Some(ref trx) => trx.recv().await,
                         None => std::future::pending().await,
                     }
                 } => {
-                    if let Some(frame) = push {
-                        let mut push_buf = BytesMut::new();
-                        crate::protocol::serialize_resp3(&frame, &mut push_buf);
-                        delivery = Some(push_buf.freeze());
+                    if let (Some(frame), Some(trx)) = (push, conn.tracking_rx.as_ref()) {
+                        delivery = trx.coalesce(frame, true);
                     }
                 }
             }
@@ -1158,25 +1168,27 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
                 push = async {
                     match conn.tracking_rx {
-                        Some(ref rx) => rx.recv_async().await.ok(),
+                        Some(ref rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
                 } => {
                     push_frame = push;
                 }
             }
-            if let Some(frame) = push_frame {
+            if let (Some(frame), Some(trx)) = (push_frame, conn.tracking_rx.as_ref()) {
                 // A RESP2 connection cannot carry a push; redis writes it
                 // nothing (its invalidations reach it only as a REDIRECT
-                // target, through the pub/sub channel).
-                if !crate::tracking::client_cmd::push_deliverable(conn.protocol_version) {
+                // target, through the pub/sub channel). `coalesce` consumes
+                // the queued frames either way, and batches a burst into one
+                // write for a RESP3 connection.
+                let deliverable =
+                    crate::tracking::client_cmd::push_deliverable(conn.protocol_version);
+                let Some(push_bytes) = trx.coalesce(frame, deliverable) else {
                     continue;
-                }
-                let mut push_buf = BytesMut::new();
-                crate::protocol::serialize_resp3(&frame, &mut push_buf);
+                };
                 if !write_all_bounded!(
                     stream,
-                    push_buf.freeze(),
+                    push_bytes,
                     write_timeout,
                     out_cap_normal,
                     client_live,

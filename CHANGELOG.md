@@ -199,6 +199,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CLIENT TRACKING never drops an invalidation silently, scripts are
+  tracked, and a RESP2 subscriber's pipeline follows its live subscription
+  count** (moon#1088, moon#1089, moon#1090, refs moon#1078). Every wire reply
+  was read off redis-server 8.6.1 over a raw socket first.
+  - moon#1088: a tracking connection's invalidations went through a 256-slot
+    channel with `try_send`, so one 400-key `MSET` delivered 256 pushes and the
+    client kept serving the other 144 keys stale. The queue is now unbounded in
+    slots and bounded in bytes by `--client-output-buffer-limit-normal`; past
+    it the connection is closed through the `CLIENT KILL` path, which is what
+    redis does at its output-buffer limit (measured: `normal 8192 0 0` closes
+    the tracker on that `MSET`). A burst is written in one socket write. A
+    REDIRECT target that is subscribed receives through its pub/sub channel:
+    one command's invalidations now take one slot there instead of one per
+    key, and a target whose channel is still full is disconnected rather than
+    silently shorted.
+  - moon#1089: a write made through `redis.call` invalidated nothing, and a
+    read made inside a script was never tracked. The scripting bridge now
+    applies tracking to every command a script runs, as redis does inside
+    `call()`: writes invalidate (NOLOOP judged against the caller), reads
+    register for the client that ran the script under its OPTIN/OPTOUT/CACHING
+    state. `EVAL`, `EVALSHA`, `EVAL_RO`, `FCALL`, `FCALL_RO`, scripts routed to
+    another shard and scripts queued inside `MULTI` are all covered, and a
+    `FCALL` of a function that only reads no longer counts as a write of its
+    keys.
+  - moon#1090: commands a RESP2 client pipelined after its last `UNSUBSCRIBE`
+    (or `RESET`) were refused with the subscriber-context error on monoio and
+    left unanswered on tokio. The subscriber gate now judges each command by
+    the subscription count it runs under, and hands the rest of the batch back
+    to the normal path.
+  - moon#1078: `CLIENT LIST` and `CLIENT INFO` report tracking — `flags=t`,
+    `R` for a broken redirect, `B` for BCAST, and `redir=` (`0` with no
+    redirect, `-1` with tracking off). A RESP3 REDIRECT target that neither
+    subscribed nor enabled tracking still receives nothing: reaching it needs
+    either a channel on every RESP3 connection, which keeps each one out of
+    idle task parking (measured on monoio, macOS, `--conn-park-secs 2`: 2000
+    idle `HELLO 3` connections report `parked_clients:2000`, the same
+    connections holding a channel `parked_clients:0`), or a cross-thread wake of
+    a parked connection, which the idle-park machinery does not have. That
+    part of moon#1078 stays open.
+
 - **`CLIENT TRACKING ... REDIRECT <id>` now reaches its target, and
   `CLIENT CACHING` works** (moon#1048, moon#1049). Every wire reply below was
   read off redis-server 8.6.1 over a raw socket first.

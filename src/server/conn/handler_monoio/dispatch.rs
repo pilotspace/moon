@@ -235,7 +235,8 @@ pub(super) async fn try_handle_evalsha(
     // moon#569: resolve the caller ONCE per script, then let every inner
     // `redis.call` be authorized against it (locally or on the shard this
     // script routes to).
-    let script_acl = crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user);
+    let script_acl = crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user)
+        .with_caller(conn.tracking_state.script_caller(conn.client_id));
     if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
         cmd,
         cmd_args,
@@ -318,7 +319,8 @@ pub(super) async fn try_handle_eval(
     // in that order over the same SPSC ring.
     crate::server::conn::shared::eval_script_fanout(ctx, shutdown, cmd_args).await;
     // moon#569: see `try_handle_evalsha`.
-    let script_acl = crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user);
+    let script_acl = crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user)
+        .with_caller(conn.tracking_state.script_caller(conn.client_id));
     if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
         cmd,
         cmd_args,
@@ -1097,6 +1099,7 @@ pub(super) fn try_handle_client_tracking(
         &mut conn.tracking_state,
         &mut conn.tracking_rx,
         &ctx.tracking_table,
+        ctx.runtime_config.read().client_output_buffer_limit_normal,
     ) {
         Some(reply) => {
             responses.push(reply);
@@ -1604,7 +1607,8 @@ pub(super) async fn try_handle_functions(
         // EVAL. Resolved BEFORE routing so the same identity is used whether
         // the call runs here or on the shard that owns the key — routing must
         // never change what a caller is allowed to do.
-        let script_acl = crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user);
+        let script_acl = crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user)
+            .with_caller(conn.tracking_state.script_caller(conn.client_id));
         // moon#514 defect 1 — the same root cause as moon#508. FCALL used to
         // require every key to hash to the CONNECTION's shard, so a single
         // key living anywhere else was refused `CROSSSLOT`; one key cannot

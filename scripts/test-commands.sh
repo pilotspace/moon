@@ -1505,6 +1505,78 @@ if should_run "connection"; then
             echo "    MOON:  $(echo "$trk1049_m" | tr '\n' ' ')"
         fi
     done
+
+    # moon#1089: a write made by a script invalidates, and a read made by a
+    # script is tracked for its caller. One held-open RESP3 tracker per server;
+    # `$2` is what it runs to cache the key, the rest is what another client
+    # then runs to change it. The script read uses Lua long strings so the
+    # inline command needs no quoting.
+    trk1089_probe() {
+        local port="$1" read_cmd="$2" line="" seen=""; shift 2
+        exec 4<>"/dev/tcp/127.0.0.1/${port}" || { echo "CONNECT_FAILED"; return 0; }
+        printf 'HELLO 3\r\nCLIENT TRACKING ON\r\n%s\r\n' "$read_cmd" >&4
+        while IFS= read -r -t 1 line <&4; do :; done
+        redis-cli -p "$port" "$@" > /dev/null 2>&1 || true
+        while IFS= read -r -t 1 line <&4; do seen="${seen}${line%$'\r'}|"; done
+        exec 4>&-
+        case "$seen" in *invalidate*"|trk1089:k|"*) echo "PUSH" ;; *) echo "NONE" ;; esac
+    }
+    for trk1089_case in \
+        "GET trk1089:k|EVAL|return redis.call('SET', KEYS[1], 'x')|1|trk1089:k" \
+        "EVAL return(redis.call([[GET]],KEYS[1])) 1 trk1089:k|SET|trk1089:k|y"; do
+        IFS='|' read -r -a trk1089_args <<< "$trk1089_case"
+        trk1089_r=$(trk1089_probe "$PORT_REDIS" "${trk1089_args[@]}")
+        trk1089_m=$(trk1089_probe "$PORT_RUST" "${trk1089_args[@]}")
+        TOTAL=$((TOTAL + 1))
+        if [ "$trk1089_r" = "PUSH" ] && [ "$trk1089_m" = "PUSH" ]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: moon#1089 script tracking [${trk1089_args[0]}]: redis=$trk1089_r moon=$trk1089_m"
+        fi
+    done
+
+    # moon#1090: commands a RESP2 subscriber pipelines after its last
+    # UNSUBSCRIBE (or RESET) run normally. One write per server; the whole
+    # reply transcript is compared.
+    pipe1090_transcript() {
+        local port="$1" line="" seen=""
+        exec 4<>"/dev/tcp/127.0.0.1/${port}" || { echo "CONNECT_FAILED"; return 0; }
+        printf '%s' "$2" >&4
+        while IFS= read -r -t 1 line <&4; do seen="${seen}${line%$'\r'}|"; done
+        exec 4>&-
+        echo "${seen:-NONE}"
+    }
+    for pipe1090 in $'SUBSCRIBE x\r\nUNSUBSCRIBE\r\nSET p1090 v\r\nGET p1090\r\n' \
+                    $'SUBSCRIBE x\r\nRESET\r\nSET p1090r v\r\nGET p1090r\r\n' \
+                    $'PSUBSCRIBE p*\r\nPUNSUBSCRIBE\r\nPING\r\n'; do
+        pipe1090_r=$(pipe1090_transcript "$PORT_REDIS" "$pipe1090")
+        pipe1090_m=$(pipe1090_transcript "$PORT_RUST" "$pipe1090")
+        TOTAL=$((TOTAL + 1))
+        if [[ "$pipe1090_r" == "$pipe1090_m" ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: moon#1090 pipelined past the last unsubscribe"
+            echo "    REDIS: $pipe1090_r"
+            echo "    MOON:  $pipe1090_m"
+        fi
+    done
+
+    # moon#1078: CLIENT INFO reports tracking as `flags=t` and `redir=`.
+    for trk1078_case in "CLIENT TRACKING on" "CLIENT TRACKING on BCAST"; do
+        trk1078_r=$(trk1049_session "$PORT_REDIS" "$trk1078_case" "CLIENT INFO" \
+            | grep -o 'flags=[^ ]* \|redir=[^ ]* ' | tr -d '\n' || true)
+        trk1078_m=$(trk1049_session "$PORT_RUST" "$trk1078_case" "CLIENT INFO" \
+            | grep -o 'flags=[^ ]* \|redir=[^ ]* ' | tr -d '\n' || true)
+        TOTAL=$((TOTAL + 1))
+        if [[ -n "$trk1078_r" && "$trk1078_r" == "$trk1078_m" ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: moon#1078 CLIENT INFO after [$trk1078_case]: redis=$trk1078_r moon=$trk1078_m"
+        fi
+    done
 fi
 
 # ===========================================================================

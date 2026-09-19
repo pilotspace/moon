@@ -722,6 +722,7 @@ pub async fn handle_connection(
                                         &mut conn.tracking_state,
                                         &mut conn.tracking_rx,
                                         &tracking_table,
+                                        runtime_config.read().client_output_buffer_limit_normal,
                                     ) {
                                         responses.push(reply);
                                         continue;
@@ -3155,8 +3156,8 @@ pub async fn handle_connection(
             }
             // Deliver tracking invalidation Push frames to client
             msg = async {
-                if let Some(ref mut rx) = conn.tracking_rx {
-                    rx.recv_async().await.ok()
+                if let Some(ref rx) = conn.tracking_rx {
+                    rx.recv().await
                 } else {
                     std::future::pending().await
                 }
