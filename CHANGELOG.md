@@ -44,6 +44,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The moon#507 pipeline wait set is derived from `COMMAND_META` instead of a
+  hand-written list, and `WATCH` inside its own pipeline no longer aborts the
+  transaction** (moon#937, moon#946). `must_wait_for_pending_remote` decides
+  whether a pipelined command may run while its batch's earlier cross-shard
+  writes are still undispatched; its list of inline-intercepted commands was a
+  `(len, first byte)` table that failed OPEN and had drifted — `TXN`,
+  `TEMPORAL.INVALIDATE` (moon#937), the blocking family (moon#946), and, found
+  on the way, `WATCH`, `SPUBLISH`/`SSUBSCRIBE`/`SUNSUBSCRIBE`, `MQ` and `WS`,
+  each intercepted through a predicate the drift scanner could not see. The
+  predicate now reads the registry's `NO_INTERCEPT` bit — the same bit the
+  connection handler uses to skip its gate chain — so a command waits unless
+  the registry proves no interceptor can claim it, and both consumers fail
+  safe. To keep that free, the 98 routable commands no gate claims (`HGETALL`,
+  `LRANGE`, `ZRANGE`, `XADD`, `SMEMBERS`, …) are now marked `NO_INTERCEPT`
+  (67 → 165), which also lets the handler skip its gate chain for them; a
+  coupling test fails in either direction — a claimed command that is marked,
+  or a routable unclaimed one that is not. **Behaviour change**, measured at
+  `--shards 4` with remote writes pending in the same batch: `TXN BEGIN`,
+  `TEMPORAL.INVALIDATE`, `SPUBLISH` and `WATCH` now wait for those writes to
+  land (they ran inline before); `GET`/`HMSET`/`LRANGE`/`ZRANGE`/`XADD` still
+  do not wait. The user-visible one is `WATCH`: `SET k; WATCH k; MULTI; GET k;
+  EXEC` in one write aborted the transaction 18 of 24 times because `WATCH`
+  captured the key's version before its own batch's `SET` landed (redis 8.6.1:
+  0 of 24). `TXN` and `TEMPORAL.*` also join `extract_primary_key`'s keyless
+  table, so the cluster slot router no longer hashes `"BEGIN"` or an entity id
+  into one fixed slot. moon#946 is closed as a documented non-bug: the blocking
+  family is deferred by the #438 early-flush guard one statement above this
+  predicate in both handlers whenever remote work is pending, and the derived
+  predicate now says wait for them regardless.
+
 - **Multi-key blocking pops no longer destroy an element from a key they did
   not answer with** (moon#989). `BLMPOP`, `BZMPOP`, `BLPOP`, `BRPOP`,
   `BZPOPMIN` and `BZPOPMAX` over keys co-located under one `{hash}` tag replied
