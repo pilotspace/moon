@@ -327,6 +327,14 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "ZMSCORE" => CommandMeta { name: "ZMSCORE", arity: -3, flags: RFP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZRANDMEMBER" => CommandMeta { name: "ZRANDMEMBER", arity: -2, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
     "ZMPOP" => CommandMeta { name: "ZMPOP", arity: -4, flags: WP, first_key: 0, last_key: 0, step: 0, acl_categories: ZST },
+    // moon#959. Arities match redis 8.6.1 as SENT — every arity error below
+    // was compared on the wire, not read off `COMMAND INFO`.
+    "ZRANGEBYLEX" => CommandMeta { name: "ZRANGEBYLEX", arity: -4, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZREVRANGEBYLEX" => CommandMeta { name: "ZREVRANGEBYLEX", arity: -4, flags: RP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZREMRANGEBYRANK" => CommandMeta { name: "ZREMRANGEBYRANK", arity: 4, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZREMRANGEBYSCORE" => CommandMeta { name: "ZREMRANGEBYSCORE", arity: 4, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZREMRANGEBYLEX" => CommandMeta { name: "ZREMRANGEBYLEX", arity: 4, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
+    "ZDIFFSTORE" => CommandMeta { name: "ZDIFFSTORE", arity: -4, flags: WP, first_key: 1, last_key: 1, step: 1, acl_categories: ZST },
 
     // ---- Stream commands ----
     "XADD" => CommandMeta { name: "XADD", arity: -5, flags: WFP, first_key: 1, last_key: 1, step: 1, acl_categories: STM },
@@ -1560,6 +1568,10 @@ mod tests {
             b"ZINTERSTORE",
             b"ZRANGESTORE",
             b"ZMPOP",
+            b"ZREMRANGEBYRANK",
+            b"ZREMRANGEBYSCORE",
+            b"ZREMRANGEBYLEX",
+            b"ZDIFFSTORE",
             b"HINCRBYFLOAT",
             b"LSET",
             b"LREM",
@@ -1597,6 +1609,8 @@ mod tests {
             b"SMEMBERS",
             b"SISMEMBER",
             b"ZRANGEBYSCORE",
+            b"ZRANGEBYLEX",
+            b"ZREVRANGEBYLEX",
             b"BITFIELD_RO",
             b"SORT_RO",
             b"GEORADIUS_RO",

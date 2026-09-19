@@ -2141,14 +2141,6 @@ pub(crate) const CROSS_SHARD_WRITE_ERROR: &[u8] =
 ///   entry points (`blocking::immediate_scan`, `blocking::wakeup`) that this
 ///   pre-routing guard cannot see. Two overlapping guards for one family would
 ///   be worse than one complete one.
-/// * `ZDIFFSTORE` — not implemented in moon (unknown command), so there is
-///   no write to misplace, and claiming `CROSSSLOT` would send a client
-///   chasing hash tags for a command that will never work.
-///   `tests/two_key_write_cross_shard.rs::t2k4` fails the moment it starts
-///   working, which is when it must be added here. `GEORADIUS`/
-///   `GEORADIUSBYMEMBER` used to sit in this same bucket; moon#645
-///   implemented their `STORE`/`STOREDIST` clause, so they moved INTO the
-///   family below in the same change that made them able to write.
 /// * `TOUCH` — the one member of the moon#962 family that is genuinely
 ///   per-key decomposable. It is in `is_multi_key_command` and
 ///   [`splittable_read_kind`], so it FANS OUT and sums, exactly like `EXISTS`.
@@ -2194,6 +2186,24 @@ pub(crate) const CROSS_SHARD_WRITE_ERROR: &[u8] =
 /// property of the key vector. A later PR may remove any single command from
 /// this list once it merges properly; each such change removes an error and
 /// cannot regress correctness, which is the direction that is safe to defer.
+///
+/// # moon#959 — `ZDIFFSTORE` is IN the family, and used not to be
+///
+/// This block used to carry a `ZDIFFSTORE` bullet in the EXCLUDED list above,
+/// reading "not implemented in moon (unknown command), so there is no write to
+/// misplace". moon#959 implemented it, so that sentence is now false and the
+/// bullet is gone: `ZDIFFSTORE dst numkeys src ...` routes on `dst` and reads
+/// every source, the identical shape to `ZUNIONSTORE`/`ZINTERSTORE`. It is
+/// matched in the `(10, b'z')` arm below, which it SHARES with `ZINTERCARD` —
+/// same length, same first byte, so an arm that names only one of them
+/// silently drops the other.
+///
+/// `GEORADIUS`/`GEORADIUSBYMEMBER` made the same trip when moon#645 gave them
+/// a `STORE`/`STOREDIST` clause. The tripwire that forces the migration is
+/// `tests/two_key_write_cross_shard.rs::t2k4`, and the measured cost of
+/// skipping it is in `t2k1`: with the `ZDIFFSTORE` spelling removed from the
+/// arm below and everything else in place, 12 of 180 placements at
+/// `--shards 4` ack `ZDIFFSTORE` while the destination lands nowhere.
 ///
 /// Matched on `(len, first byte)` first so a single-key command falls through
 /// after one integer compare and never reaches the key walk.
@@ -2244,7 +2254,15 @@ fn touches_a_key_it_did_not_route_on(cmd: &[u8]) -> bool {
         (5, b'z') => cmd.eq_ignore_ascii_case(b"ZMPOP") || cmd.eq_ignore_ascii_case(b"ZDIFF"),
         (6, b's') => cmd.eq_ignore_ascii_case(b"SINTER") || cmd.eq_ignore_ascii_case(b"SUNION"),
         (6, b'z') => cmd.eq_ignore_ascii_case(b"ZINTER") || cmd.eq_ignore_ascii_case(b"ZUNION"),
-        (10, b'z') => cmd.eq_ignore_ascii_case(b"ZINTERCARD"),
+        // One arm, two unrelated additions: `ZINTERCARD` is a moon#962
+        // multi-key READ, `ZDIFFSTORE` a moon#959 two-key WRITE routed on its
+        // destination. They collide on `(10, b'z')`, so naming only one of
+        // them here silently drops the other from the guard — for
+        // `ZDIFFSTORE` that is the moon#592 misdirected write, measured in
+        // `t2k1`. Keep both spellings.
+        (10, b'z') => {
+            cmd.eq_ignore_ascii_case(b"ZINTERCARD") || cmd.eq_ignore_ascii_case(b"ZDIFFSTORE")
+        }
         (14, b'g') => cmd.eq_ignore_ascii_case(b"GEOSEARCHSTORE"),
         // `GEORADIUS src ... STORE|STOREDIST dst` (moon#645). Without the
         // clause the walker reports one key and this check is a no-op, so no
@@ -5078,6 +5096,12 @@ mod cross_shard_write_tests {
         ("ZRANGESTORE", &["{d}", "{s}", "0", "-1"]),
         ("ZUNIONSTORE", &["{d}", "1", "{s}"]),
         ("ZINTERSTORE", &["{d}", "1", "{s}"]),
+        // moon#959 implemented ZDIFFSTORE. Until it did, the test below
+        // asserted the OPPOSITE — that the guard must not claim it — because
+        // an unimplemented command has no write to misplace. It shares the
+        // `(10, b'z')` arm with `ZINTERCARD`, so this row is what fails if a
+        // future edit narrows that arm back to one spelling.
+        ("ZDIFFSTORE", &["{d}", "1", "{s}"]),
         ("PFMERGE", &["{d}", "{s}"]),
         (
             "GEOSEARCHSTORE",
@@ -5234,15 +5258,11 @@ mod cross_shard_write_tests {
             cross_shard_multikey_rejection(b"TOUCH", &two, N).is_none(),
             "TOUCH is per-key decomposable and must fan out, never be refused"
         );
-        // ZDIFFSTORE is still unimplemented, and shares a `(10, 'z')` arm with
-        // ZINTERCARD. Claiming CROSSSLOT for it would send a client chasing
-        // hash tags for a command that will never work — the `t2k4` tripwire
-        // in `tests/two_key_write_cross_shard.rs` owns the migration.
-        assert!(
-            cross_shard_multikey_rejection(b"ZDIFFSTORE", &[bulk(&far), bulk("1"), bulk(src)], N)
-                .is_none(),
-            "ZDIFFSTORE is unimplemented; t2k4 owns the moment that changes"
-        );
+        // ZDIFFSTORE used to be asserted here as OUT of the family, on the
+        // grounds that an unimplemented command has no write to misplace.
+        // moon#959 implemented it, so it moved INTO `FAMILY` above and is
+        // asserted positively there — the migration the `t2k4` tripwire in
+        // `tests/two_key_write_cross_shard.rs` existed to force.
 
         // A SORT with no STORE clause names one key: nothing to straddle.
         let sort_ro = [bulk(src), bulk("LIMIT"), bulk("0"), bulk("10")];

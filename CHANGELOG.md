@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Six sorted-set commands that were `unknown command`, and `ZADD ... INCR`**
+  (moon#959). `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZREMRANGEBYRANK`,
+  `ZREMRANGEBYSCORE`, `ZREMRANGEBYLEX` and `ZDIFFSTORE` are implemented, wired
+  into every dispatch path, registered as `@sortedset`, and covered by rows in
+  both parity harnesses; `docs/commands.md` had advertised `ZRANGEBYLEX` while
+  dispatch rejected it. `ZADD ... INCR` — which `redis-py`'s `zadd(...,
+  incr=True)` sends — replies the new score as a bulk string, or nil when
+  `NX`/`XX`/`GT`/`LT` refuse, in Redis's decision order. Every reply, error
+  surface included, was read off redis-server 8.6.1 before the code was
+  written: the range grammar is checked before the key is consulted, a
+  `ZREMRANGEBY*` that drains a key deletes it, a listpack zset is trimmed in
+  place and never converted, and the `used_memory` ledger stays exact on both
+  encodings. `ZDIFFSTORE` joins the `ZUNIONSTORE` family's `numkeys` and
+  option rules, refusing `WEIGHTS`/`AGGREGATE` as `syntax error`, and — because
+  it writes a destination it is not routed on — it also joins the moon#592
+  cross-shard WRITE guard, so `ZDIFFSTORE` across shards is `CROSSSLOT` rather
+  than an ack whose destination lands nowhere. (It shares the guard's
+  `(10, b'z')` match arm with moon#962's `ZINTERCARD`; both spellings are
+  named there.)
+
 ### Changed
 
 - **`Check (macOS)` and `Check (Windows)` run their tests in three shards**,
@@ -300,6 +322,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its two root pages at the real path, which every later open rejected.
   Tombstones are also aged per `(file_id, file_type)`, not per id.
 
+- **`ZUNIONSTORE`/`ZINTERSTORE` report `WRONGTYPE` before an option error, and
+  no longer flatten a listpack source** (moon#959). Redis looks every source up
+  before it parses `WEIGHTS`/`AGGREGATE`, so `ZUNIONSTORE d 1 <string-key>
+  BOGUS` is `WRONGTYPE` on redis 8.6.1; moon answered `syntax error`. The store
+  family also read its sources through the promoting accessor, converting a
+  `listpack` source to `skiplist` as a side effect of reading it — the moon#928
+  defect the read-only set operations were already cured of. Both fixes came
+  with the shared implementation `ZDIFFSTORE` now uses.
 - **Commands routed to another shard are counted and timed** (moon#982).
   At `--shards > 1` a command whose key lives on a shard other than the
   connection's went through no telemetry probe at all — neither the
