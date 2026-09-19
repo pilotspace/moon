@@ -585,35 +585,40 @@ pub(crate) fn handle_shard_message_shared(
                     // `coordinator::broadcast_txn_flushes` uses for MULTI.
                     let (frame, pending_flush) = crate::shard::slice::with_shard(|s| {
                         let db_count = s.databases.db_count();
-                        crate::scripting::pending_flush::run_and_complete(s, db_idx, |db| {
-                            if is_plain_eval {
-                                crate::scripting::handle_eval(
-                                    &vm,
-                                    script_cache,
-                                    args,
-                                    db,
-                                    shard_id,
-                                    rt.num_shards(),
-                                    db_idx,
-                                    db_count,
-                                    &script_acl,
-                                    read_only,
-                                )
-                            } else {
-                                crate::scripting::handle_evalsha(
-                                    &vm,
-                                    script_cache,
-                                    args,
-                                    db,
-                                    shard_id,
-                                    rt.num_shards(),
-                                    db_idx,
-                                    db_count,
-                                    &script_acl,
-                                    read_only,
-                                )
-                            }
-                        })
+                        crate::scripting::pending_flush::run_and_complete(
+                            s,
+                            db_idx,
+                            crate::blocking::wakeup::ScriptWakes::Serve(blocking_registry),
+                            |db| {
+                                if is_plain_eval {
+                                    crate::scripting::handle_eval(
+                                        &vm,
+                                        script_cache,
+                                        args,
+                                        db,
+                                        shard_id,
+                                        rt.num_shards(),
+                                        db_idx,
+                                        db_count,
+                                        &script_acl,
+                                        read_only,
+                                    )
+                                } else {
+                                    crate::scripting::handle_evalsha(
+                                        &vm,
+                                        script_cache,
+                                        args,
+                                        db,
+                                        shard_id,
+                                        rt.num_shards(),
+                                        db_idx,
+                                        db_count,
+                                        &script_acl,
+                                        read_only,
+                                    )
+                                }
+                            },
+                        )
                     });
                     let _ = reply_tx.send(crate::shard::dispatch::ExecReply {
                         frame,
@@ -690,38 +695,43 @@ pub(crate) fn handle_shard_message_shared(
                     // performed here.
                     let (frame, pending_flush) = crate::shard::slice::with_shard(|s| {
                         let db_count = s.databases.db_count();
-                        crate::scripting::pending_flush::run_and_complete(s, db_idx, |db| {
-                            // moon#569 + moon#514: the ACL that travels with
-                            // `ShardMessage::Execute` is the ORIGIN connection's, so a
-                            // routed FCALL authorizes each inner `redis.call` exactly as
-                            // it would have on the shard the client is attached to.
-                            // Using this shard's own identity instead would let routing —
-                            // an implementation detail the client cannot see — decide
-                            // permissions.
-                            if is_fcall {
-                                crate::command::functions::handle_fcall(
-                                    reg,
-                                    args,
-                                    db,
-                                    shard_id,
-                                    rt.num_shards(),
-                                    db_idx,
-                                    db_count,
-                                    &script_acl,
-                                )
-                            } else {
-                                crate::command::functions::handle_fcall_ro(
-                                    reg,
-                                    args,
-                                    db,
-                                    shard_id,
-                                    rt.num_shards(),
-                                    db_idx,
-                                    db_count,
-                                    &script_acl,
-                                )
-                            }
-                        })
+                        crate::scripting::pending_flush::run_and_complete(
+                            s,
+                            db_idx,
+                            crate::blocking::wakeup::ScriptWakes::Serve(blocking_registry),
+                            |db| {
+                                // moon#569 + moon#514: the ACL that travels with
+                                // `ShardMessage::Execute` is the ORIGIN connection's, so a
+                                // routed FCALL authorizes each inner `redis.call` exactly as
+                                // it would have on the shard the client is attached to.
+                                // Using this shard's own identity instead would let routing —
+                                // an implementation detail the client cannot see — decide
+                                // permissions.
+                                if is_fcall {
+                                    crate::command::functions::handle_fcall(
+                                        reg,
+                                        args,
+                                        db,
+                                        shard_id,
+                                        rt.num_shards(),
+                                        db_idx,
+                                        db_count,
+                                        &script_acl,
+                                    )
+                                } else {
+                                    crate::command::functions::handle_fcall_ro(
+                                        reg,
+                                        args,
+                                        db,
+                                        shard_id,
+                                        rt.num_shards(),
+                                        db_idx,
+                                        db_count,
+                                        &script_acl,
+                                    )
+                                }
+                            },
+                        )
                     });
                     drop(guard);
                     let _ = reply_tx.send(crate::shard::dispatch::ExecReply {
@@ -947,6 +957,7 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
+                            blocking_registry,
                         )
                     });
                     if let Some(mut response) = intercepted {
@@ -1077,7 +1088,7 @@ pub(crate) fn handle_shard_message_shared(
 
                             // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
                             if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                                crate::blocking::wakeup::wake_producer(
+                                crate::blocking::wakeup::wake_written_keys(
                                     blocking_registry,
                                     &mut db,
                                     db_idx,
@@ -1196,6 +1207,7 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
+                            blocking_registry,
                         ) {
                             let mut aof_ok = true;
                             if matches!(response, crate::protocol::Frame::Integer(1))
@@ -1314,7 +1326,7 @@ pub(crate) fn handle_shard_message_shared(
                             }
                         }
 
-                        crate::blocking::wakeup::wake_producer(
+                        crate::blocking::wakeup::wake_written_keys(
                             blocking_registry,
                             &mut guard,
                             db_idx,
@@ -1397,6 +1409,7 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
+                            blocking_registry,
                         ) {
                             let mut aof_ok = true;
                             if matches!(response, crate::protocol::Frame::Integer(1))
@@ -1575,7 +1588,7 @@ pub(crate) fn handle_shard_message_shared(
 
                     // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        crate::blocking::wakeup::wake_producer(
+                        crate::blocking::wakeup::wake_written_keys(
                             blocking_registry,
                             &mut guard,
                             db_idx,
@@ -1640,6 +1653,7 @@ pub(crate) fn handle_shard_message_shared(
                         spill_sender,
                         spill_file_id,
                         disk_offload_dir,
+                        blocking_registry,
                     )
                 });
                 if let Some(mut response) = intercepted {
@@ -1760,7 +1774,7 @@ pub(crate) fn handle_shard_message_shared(
                             }
 
                             if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                                crate::blocking::wakeup::wake_producer(
+                                crate::blocking::wakeup::wake_written_keys(
                                     blocking_registry,
                                     &mut db,
                                     db_idx,
@@ -1839,6 +1853,7 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
+                            blocking_registry,
                         ) {
                             let mut aof_ok = true;
                             if matches!(response, crate::protocol::Frame::Integer(1))
@@ -1957,7 +1972,7 @@ pub(crate) fn handle_shard_message_shared(
                             }
                         }
 
-                        crate::blocking::wakeup::wake_producer(
+                        crate::blocking::wakeup::wake_written_keys(
                             blocking_registry,
                             &mut guard,
                             db_idx,
@@ -2041,6 +2056,7 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
+                            blocking_registry,
                         ) {
                             let mut aof_ok = true;
                             if matches!(response, crate::protocol::Frame::Integer(1))
@@ -2219,7 +2235,7 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        crate::blocking::wakeup::wake_producer(
+                        crate::blocking::wakeup::wake_written_keys(
                             blocking_registry,
                             &mut guard,
                             db_idx,
@@ -2948,6 +2964,8 @@ pub(crate) fn handle_shard_message_shared(
                     s.databases.swap(a, b);
                 }
             });
+            // moon#1069: a key parked on in either db may now hold data.
+            crate::blocking::wakeup::wake_swapped_dbs(blocking_registry, a, b);
 
             // Notify the coordinator that this shard completed its swap.
             let _ = reply_tx.send(());
@@ -3217,8 +3235,7 @@ pub(crate) fn handle_shard_message_shared(
             // num_shards > 1 is usually not the connection's own shard, so a
             // transaction wakes waiters here far more often than on the
             // originator.
-            let mut exec_wakes: Vec<(usize, bytes::Bytes, crate::blocking::WaitFamily)> =
-                Vec::new();
+            let mut exec_wakes: Vec<(usize, bytes::Bytes)> = Vec::new();
             // moon#894: a queued script runs in the body on THIS shard's VM,
             // cache and function registry, as the ORIGINATING user. Built only
             // when the body holds a script (`script_acl` is `Some` exactly
@@ -3265,17 +3282,13 @@ pub(crate) fn handle_shard_message_shared(
                     &mut exec_publishes,
                     &mut exec_flushes,
                     &mut exec_wakes,
+                    blocking_registry.borrow().has_any_waiters(),
                     &watched,
                     txn_scripting.as_ref(),
                 );
             // The waiters are registered HERE, on the owning shard's registry
             // — the same one the live cross-shard write path wakes.
-            for (wake_db, wake_key, family) in exec_wakes.drain(..) {
-                let mut reg = blocking_registry.borrow_mut();
-                crate::shard::slice::with_shard_db(wake_db, |db| {
-                    crate::blocking::wakeup::wake_family(&mut reg, db, wake_db, &wake_key, family);
-                });
-            }
+            crate::blocking::wakeup::wake_recorded(blocking_registry, exec_wakes.drain(..));
             // task #52: this arm is the CROSS-SHARD EXEC hop (the accepting
             // connection's shard differs from the owner shard, which by
             // construction only happens at num_shards > 1) -- graph

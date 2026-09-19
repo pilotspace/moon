@@ -1938,6 +1938,140 @@ if [[ "$(date +%s%N)" =~ ^[0-9]+$ ]]; then
     done
 fi
 
+# ===========================================================================
+# A write that lands data on a key wakes the clients parked on it, whatever
+# command wrote it (moon#1059, moon#1069)
+# ===========================================================================
+# Only a push used to wake anybody: a BLMOVE served by a wake left the BLPOP
+# parked on its destination asleep beside the element, and RENAME / COPY /
+# MOVE / COPY ... DB n / SORT ... STORE / ZUNIONSTORE / EVAL never woke a
+# client blocked on the key they created. Each row parks its waiters on FRESH
+# connections (a blocking reply desynchronises a shared one), runs the write
+# from another connection, and compares every waiter's reply with redis's. A
+# waiter that is not woken answers the null array at its own 2 s timeout, so
+# the reply BYTES alone tell a wake from a miss.
+#
+# wake_park PORT OUT DB CMD... -- run inline CMD in db DB on a fresh
+# connection; write its reply, flattened to one line, to OUT.
+wake_park() {
+    local port="$1" out="$2" db="$3"; shift 3
+    local line reply n i
+    if ! exec 5<>"/dev/tcp/127.0.0.1/${port}"; then
+        echo "__CONNECT_FAILED__" >"$out"
+        return 0
+    fi
+    if [[ "$db" != 0 ]]; then
+        printf 'SELECT %s\r\n' "$db" >&5
+        IFS= read -r -t 5 line <&5 || true
+    fi
+    printf '%s\r\n' "$*" >&5
+    line=""
+    IFS= read -r -t 10 line <&5 || true
+    reply="${line%$'\r'}"
+    case "$reply" in
+        '*'[1-9]*)
+            n="${reply#\*}"
+            for ((i = 0; i < 2 * n; i++)); do
+                line=""
+                IFS= read -r -t 2 line <&5 || true
+                reply+=" ${line%$'\r'}"
+            done
+            ;;
+        '$'[0-9]*)
+            line=""
+            IFS= read -r -t 2 line <&5 || true
+            reply+=" ${line%$'\r'}"
+            ;;
+    esac
+    exec 5>&-
+    echo "$reply" >"$out"
+}
+
+# wake_run PORT SETUP WRITE WAITER... -- SETUP and WRITE are '|'-separated
+# commands (space-split, so a Lua body must not contain spaces); each WAITER is
+# "DB:COMMAND". Prints every waiter's reply in park order.
+wake_run() {
+    local port="$1" setup="$2" write="$3"; shift 3
+    local tmp c spec p i=0 j pids="" res=""
+    local -a argv
+    tmp=$(mktemp -d)
+    if [[ -n "$setup" ]]; then
+        while IFS= read -r c; do
+            read -r -a argv <<<"$c"
+            redis-cli -p "$port" "${argv[@]}" >/dev/null 2>&1 || true
+        done < <(tr '|' '\n' <<<"$setup")
+    fi
+    for spec in "$@"; do
+        i=$((i + 1))
+        # Unquoted on purpose: the command is word-split into its arguments.
+        wake_park "$port" "$tmp/$i" "${spec%%:*}" ${spec#*:} &
+        pids+=" $!"
+        sleep 0.2
+    done
+    sleep 0.2
+    while IFS= read -r c; do
+        read -r -a argv <<<"$c"
+        redis-cli -p "$port" "${argv[@]}" >/dev/null 2>&1 || true
+    done < <(tr '|' '\n' <<<"$write")
+    for p in $pids; do wait "$p" 2>/dev/null || true; done
+    for ((j = 1; j <= i; j++)); do res+="[$(cat "$tmp/$j" 2>/dev/null || true)]"; done
+    rm -rf "$tmp"
+    echo "$res"
+}
+
+wake_row() {  # wake_row DESC SETUP WRITE WAITER...
+    local desc="$1"; shift
+    local r m
+    TOTAL=$((TOTAL + 1))
+    r=$(wake_run "$PORT_REDIS" "$@")
+    m=$(wake_run "$PORT_RUST" "$@")
+    if [[ "$r" == "$m" ]]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $desc"
+        echo "    REDIS: $r"
+        echo "    MOON:  $m"
+    fi
+}
+
+wake_row "wake: BLMOVE served by a wake feeds BLPOP on its destination (moon#1059)" \
+    "" "RPUSH {rkw1}s x" \
+    "0:BLMOVE {rkw1}s {rkw1}d LEFT RIGHT 2" "0:BLPOP {rkw1}d 2"
+wake_row "wake: a chain BLMOVE a->b, BLMOVE b->c, BLPOP c (moon#1059)" \
+    "" "RPUSH {rkw2}a x" \
+    "0:BLMOVE {rkw2}a {rkw2}b LEFT RIGHT 2" "0:BLMOVE {rkw2}b {rkw2}c LEFT RIGHT 2" \
+    "0:BLPOP {rkw2}c 2"
+wake_row "wake: an immediate BLMOVE feeds BLPOP on its destination (moon#1059)" \
+    "RPUSH {rkw3}s u" "BLMOVE {rkw3}s {rkw3}d LEFT RIGHT 1" "0:BLPOP {rkw3}d 2"
+wake_row "wake: RENAME wakes BLPOP on the destination (moon#1069)" \
+    "RPUSH {rkw4}s v" "RENAME {rkw4}s {rkw4}d" "0:BLPOP {rkw4}d 2"
+wake_row "wake: COPY wakes BLPOP on the destination (moon#1069)" \
+    "RPUSH {rkw5}s v" "COPY {rkw5}s {rkw5}d" "0:BLPOP {rkw5}d 2"
+wake_row "wake: MOVE wakes BLPOP parked in the target db (moon#1069)" \
+    "RPUSH {rkw6}l v" "MOVE {rkw6}l 3" "3:BLPOP {rkw6}l 2"
+wake_row "wake: COPY ... DB n wakes BLPOP parked in db n (moon#1069)" \
+    "RPUSH {rkw7}l v" "COPY {rkw7}l {rkw7}l DB 3" "3:BLPOP {rkw7}l 2"
+wake_row "wake: RENAME a zset wakes BZPOPMIN on the destination (moon#1069)" \
+    "ZADD {rkw8}s 1 m" "RENAME {rkw8}s {rkw8}d" "0:BZPOPMIN {rkw8}d 2"
+wake_row "wake: ZUNIONSTORE wakes BZPOPMIN on the destination (moon#1069)" \
+    "ZADD {rkw9}s 1 m" "ZUNIONSTORE {rkw9}d 1 {rkw9}s" "0:BZPOPMIN {rkw9}d 2"
+wake_row "wake: SORT ... STORE wakes BLPOP on the destination (moon#1069)" \
+    "RPUSH {rkw10}s 3 1 2" "SORT {rkw10}s STORE {rkw10}d" "0:BLPOP {rkw10}d 2"
+wake_row "wake: EVAL RPUSH wakes BLPOP (moon#1069)" \
+    "" "EVAL return(redis.call('RPUSH',KEYS[1],'x')) 1 {rkw11}k" "0:BLPOP {rkw11}k 2"
+wake_row "wake: ZINCRBY creating a zset wakes BZPOPMIN (moon#1069)" \
+    "" "ZINCRBY {rkw12}z 1 m" "0:BZPOPMIN {rkw12}z 2"
+# The control: a key that becomes the WRONG type leaves the waiter parked.
+wake_row "wake: RENAME a zset onto a BLPOP key leaves it parked (moon#1069)" \
+    "ZADD {rkw13}s 1 m" "RENAME {rkw13}s {rkw13}d" "0:BLPOP {rkw13}d 2"
+# redis serves every key one command made ready as ONE batch before the
+# keys the moves it serves push onto: BRPOP c takes y, not x.
+wake_row "wake: one script's ready keys are one batch, served before the moves they feed (moon#1069)" \
+    "" "EVAL redis.call('RPUSH',KEYS[1],'x');return(redis.call('RPUSH',KEYS[2],'y')) 2 {rkw14}a {rkw14}b" \
+    "0:BLMOVE {rkw14}a {rkw14}c LEFT RIGHT 2" "0:BLMOVE {rkw14}b {rkw14}c LEFT RIGHT 2" \
+    "0:BRPOP {rkw14}c 2"
+
 # ---------------------------------------------------------------------------
 # Shard-routing parity (moon#533, moon#534)
 #

@@ -1258,6 +1258,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             crate::scripting::pending_flush::run_and_complete(
                                 s,
                                 conn.selected_db,
+                                crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
                                 |db| {
                             if script_is_eval {
                                 crate::scripting::handle_eval(
@@ -1498,6 +1499,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 crate::scripting::pending_flush::run_and_complete(
                                     s,
                                     conn.selected_db,
+                                    crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
                                     |db| {
                                 // moon#569: FCALL runs under the caller's
                                 // ACL. Built once and shared by both arms —
@@ -2202,6 +2204,17 @@ pub(crate) async fn handle_connection_sharded_inner<
                         if local_barrier_pending && !matches!(response, Frame::Error(_)) {
                             local_leg_write_idxs.push(responses.len());
                         }
+                        // moon#1069: the coordinator ran this shard's leg
+                        // outside every write tail — serve whoever is blocked
+                        // on a key it wrote here (see the monoio twin).
+                        if !matches!(response, Frame::Error(_)) {
+                            crate::blocking::wakeup::wake_written_keys_on_shard(
+                                &ctx.blocking_registry,
+                                conn.selected_db,
+                                cmd,
+                                cmd_args,
+                            );
+                        }
                         // CLIENT TRACKING: multi-key writes (DEL/MSET/UNLINK/…)
                         // invalidate every key; multi-key reads (MGET) by a
                         // tracking client register every key.
@@ -2344,7 +2357,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     // assert cannot fire here.
                                     crate::shard::slice::with_shard(|s| {
                                         s.databases.with_pair(src_db, dst_db, |src, dst| {
-                                            ksmv::move_core(src, dst, &key)
+                                            let reply = ksmv::move_core(src, dst, &key);
+                                            // moon#1069: the key now exists in `dst_db`.
+                                            crate::blocking::wakeup::wake_cross_db_write(
+                                                &ctx.blocking_registry,
+                                                dst,
+                                                dst_db,
+                                                &key,
+                                                &reply,
+                                            );
+                                            reply
                                         })
                                     })
                                 }
@@ -2420,7 +2442,22 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         // holds on every path that reaches here.
                                         crate::shard::slice::with_shard(|s| {
                                             s.databases.with_pair(src_db, ca.dst_db, |src, dst| {
-                                                ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
+                                                let reply = ksmv::copy_core(
+                                                    src,
+                                                    dst,
+                                                    &ca.src_key,
+                                                    &ca.dst_key,
+                                                    ca.replace,
+                                                );
+                                                // moon#1069: the copy now exists in `dst_db`.
+                                                crate::blocking::wakeup::wake_cross_db_write(
+                                                    &ctx.blocking_registry,
+                                                    dst,
+                                                    ca.dst_db,
+                                                    &ca.dst_key,
+                                                    &reply,
+                                                );
+                                                reply
                                             })
                                         })
                                     }
@@ -2499,7 +2536,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 // verbatim; `write()`'s own out-of-range panic
                                 // does not carry the shard id. This guard spans
                                 // eviction → undo capture → dispatch →
-                                // wake_producer, exactly the span the
+                                // wake_written_keys, exactly the span the
                                 // `&mut Database` borrow covered, and drops when
                                 // `do_write` returns.
                                 #[allow(clippy::unwrap_used)] // mirror with_shard_db's panic semantics
@@ -2652,24 +2689,24 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     DispatchResult::Quit(f) => { should_quit = true; f }
                                 };
                                 if !matches!(response, Frame::Error(_)) {
-                                    // moon#595: shared gate — see the twin in
-                                    // handler_monoio. Omitting XADD here made a
-                                    // locally-owned stream key unwakeable.
+                                    // moon#595/moon#1069: the shared hook — see
+                                    // the twin in handler_monoio. It wakes the
+                                    // waiters on every key this write touched.
                                     //
                                     // moon#942 does NOT apply here, and that is
                                     // deliberate rather than an omission. This
                                     // arm reuses `db_guard`, which already spans
                                     // eviction → undo capture → dispatch → this
-                                    // call, so a non-producer write pays nothing
-                                    // extra for the no-op. `handler_monoio`
+                                    // call, so a write with no waiter pays
+                                    // nothing extra for the no-op. `handler_monoio`
                                     // drops its write guard right after
                                     // `dispatch` (the index hooks re-enter the
                                     // slice) and so had to take a SECOND one
-                                    // here — that acquisition is the one now
-                                    // gated on `producer_family`. Adding a gate
-                                    // here would buy nothing and would put a
-                                    // second copy of the predicate in the tree.
-                                    crate::blocking::wakeup::wake_producer(
+                                    // here — that acquisition is the one gated
+                                    // on `ready_keys`. Adding a gate here would
+                                    // buy nothing and would put a second copy of
+                                    // the predicate in the tree.
+                                    crate::blocking::wakeup::wake_written_keys(
                                         &ctx.blocking_registry,
                                         db,
                                         conn.selected_db,

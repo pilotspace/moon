@@ -137,12 +137,22 @@ pub fn broadcast_frame(which: PendingFlush) -> Frame {
 /// next, unrelated script on this shard thread would flush the whole server.
 /// Clearing first makes the failure mode "a flush is dropped", never "a flush
 /// happens that nobody asked for".
+///
+/// moon#1069: the same completion serves the clients blocked on a key the
+/// script wrote. `ScriptWakes::Serve` names this shard's registry, which owns
+/// every key a script may write here; `ScriptWakes::Defer` leaves the record
+/// for a caller that must defer it further (a script queued in `MULTI` is
+/// served with the rest of the transaction's writes, after `EXEC`), which
+/// takes it with [`crate::blocking::wakeup::take_script_writes`]. The record
+/// is cleared first for the same reason the flush record is.
 pub(crate) fn run_and_complete<R>(
     slice: &mut crate::shard::slice::ShardSlice,
     db_idx: usize,
+    wakes: crate::blocking::wakeup::ScriptWakes<'_>,
     run: impl FnOnce(&mut Database) -> R,
 ) -> (R, Option<PendingFlush>) {
     let _ = take();
+    crate::blocking::wakeup::begin_script_writes(&wakes);
     // The guard is scoped tightly: `run` gets exclusive access, then the
     // guard drops BEFORE the FLUSHALL branch below, which re-acquires every
     // database through `with_all`. Holding both would trip the re-entrancy
@@ -167,6 +177,9 @@ pub(crate) fn run_and_complete<R>(
             db_idx as u8,
         );
         crate::shard::mq_exec::auto_drop_mq_streams_on_flush(slice, db_idx);
+    }
+    if let crate::blocking::wakeup::ScriptWakes::Serve(registry) = wakes {
+        crate::blocking::wakeup::wake_script_writes(registry, &slice.databases);
     }
     (out, pending)
 }

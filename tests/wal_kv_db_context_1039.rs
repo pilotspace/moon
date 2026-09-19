@@ -35,7 +35,7 @@ fn log_sink(dir: &Path, name: &str) -> Stdio {
     }
 }
 
-fn spawn(dir: &Path, shards: usize) -> (common::ServerGuard, u16) {
+fn spawn(dir: &Path, shards: usize, extra: &[&str]) -> (common::ServerGuard, u16) {
     std::fs::create_dir_all(dir).expect("create test dir");
     common::spawn_listening_guarded(|port| {
         Command::new(common::find_moon_binary())
@@ -53,6 +53,7 @@ fn spawn(dir: &Path, shards: usize) -> (common::ServerGuard, u16) {
                 "--dir",
             ])
             .arg(dir)
+            .args(extra)
             .env("RUST_LOG", "moon=info")
             .stdout(log_sink(dir, "server.out"))
             .stderr(log_sink(dir, "server.err"))
@@ -102,6 +103,25 @@ fn wal_cmds_replayed_since(dir: &Path, from: usize) -> usize {
         .sum()
 }
 
+/// Sum of the KV commands the last-resort WAL fallback (no AOF, disk-offload
+/// off: `replay_wal_v3_dir_commands`) reports it applied, over every shard's
+/// "applied N KV command(s)" line logged AFTER byte offset `from`.
+fn wal_last_resort_applied_since(dir: &Path, from: usize) -> usize {
+    let log = read_log(dir);
+    log.get(from..)
+        .unwrap_or("")
+        .lines()
+        .filter(|l| l.contains("LAST-RESORT"))
+        .filter_map(|l| {
+            let rest = l.split("applied ").nth(1)?;
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })
+        .sum()
+}
+
 /// SIGKILL and restart on `dir`. With `drop_aof`, remove the AOF first so
 /// the WAL is the KV authority on every runtime.
 fn crash_and_restart(
@@ -109,6 +129,7 @@ fn crash_and_restart(
     dir: &Path,
     shards: usize,
     drop_aof: bool,
+    extra: &[&str],
 ) -> (common::ServerGuard, u16, usize) {
     // The WAL buffer reaches the OS at 4 KiB or on the 1 s sync cadence,
     // whichever first; these tests write far less than 4 KiB, so wait out
@@ -129,7 +150,7 @@ fn crash_and_restart(
         let _ = std::fs::remove_file(&aof_file);
     }
     let log_mark = read_log(dir).len();
-    let (guard, port) = spawn(dir, shards);
+    let (guard, port) = spawn(dir, shards, extra);
     (guard, port, log_mark)
 }
 
@@ -148,10 +169,27 @@ fn keys_in(conn: &mut common::Conn, db: usize) -> Vec<String> {
 /// into another db.
 #[test]
 fn cross_shard_wal_writes_recover_into_their_own_db_4_shards() {
+    cross_shard_case("moon-1039-s4", &[], wal_cmds_replayed_since);
+}
+
+/// The same with `--disk-offload disable`. With the AOF gone, boot takes
+/// the last-resort WAL fallback (`replay_wal_v3_dir_commands`), not Phase 4.
+/// That path decodes the same records and must honour their db the same way
+/// (moon#1026 made it apply them at all).
+#[test]
+fn cross_shard_wal_writes_recover_into_their_own_db_last_resort_4_shards() {
+    cross_shard_case(
+        "moon-1039-s4-lr",
+        &["--disk-offload", "disable"],
+        wal_last_resort_applied_since,
+    );
+}
+
+fn cross_shard_case(name: &str, extra: &[&str], replayed_since: fn(&Path, usize) -> usize) {
     const DBS: [usize; 4] = [0, 3, 7, 15];
     const PER_DB: usize = 40;
-    let dir = common::unique_test_dir("moon-1039-s4");
-    let (mut server, port) = spawn(&dir, 4);
+    let dir = common::unique_test_dir(name);
+    let (mut server, port) = spawn(&dir, 4, extra);
     {
         // PIPELINED: a pipelined batch is what fans the foreign-owned SETs
         // out to their owner shards' threads (`PipelineBatch`), and a write
@@ -175,8 +213,8 @@ fn cross_shard_wal_writes_recover_into_their_own_db_4_shards() {
             );
         }
     }
-    let (_restarted, port, log_mark) = crash_and_restart(&mut server, &dir, 4, true);
-    let replayed = wal_cmds_replayed_since(&dir, log_mark);
+    let (_restarted, port, log_mark) = crash_and_restart(&mut server, &dir, 4, true, extra);
+    let replayed = replayed_since(&dir, log_mark);
     assert!(
         replayed > 0,
         "the WAL replayed no KV commands on restart — this test proved nothing.\n{}",
@@ -230,7 +268,7 @@ fn cross_shard_wal_writes_recover_into_their_own_db_4_shards() {
 /// the WAL's KV records, so that variant must simply stay correct there.
 fn expiry_del_case(drop_aof: bool) {
     let dir = common::unique_test_dir("moon-1039-s1");
-    let (mut server, port) = spawn(&dir, 1);
+    let (mut server, port) = spawn(&dir, 1, &[]);
     {
         let mut c = common::Conn::open(port);
         assert!(c.send(&["SET", "k", "keep"]).starts_with("+OK"));
@@ -249,7 +287,7 @@ fn expiry_del_case(drop_aof: bool) {
     // Let ACTIVE expiry (not a lazy read) reap db 3's `k`: that path logs the
     // reason-DEL to the WAL. Never touch db 3's `k` until after the restart.
     std::thread::sleep(Duration::from_millis(1500));
-    let (_restarted, port, log_mark) = crash_and_restart(&mut server, &dir, 1, drop_aof);
+    let (_restarted, port, log_mark) = crash_and_restart(&mut server, &dir, 1, drop_aof, &[]);
     let wal_is_kv_authority = drop_aof || !cfg!(feature = "runtime-monoio");
     if wal_is_kv_authority {
         let replayed = wal_cmds_replayed_since(&dir, log_mark);
