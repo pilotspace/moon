@@ -199,6 +199,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A write is logged in the order it was applied, even when it waits after
+  applying** (moon#1084). Three paths applied a write, awaited something, and
+  only then appended it to the AOF (and, on monoio, to the replication
+  stream), so a write another client made in between was logged first and
+  replay applied the two in the wrong order:
+  - `EXEC` with a queued connection intercept (`WAIT`, `CLIENT`, `CONFIG`,
+    `SCRIPT`, `FUNCTION`, ...) logged its body after filling the intercept
+    replies. `SET k 0`, then `MULTI / INCR k / WAIT 1 1500 / EXEC` with
+    another client's `SET k 5` landing while `EXEC` was parked in `WAIT`:
+    the server acknowledged `5`, and after `kill -9` it recovered `6`; a
+    replica settled on `6` too. Seen on both runtimes at `--shards 1` and
+    `--shards 4`. The body is now logged and replicated right after it
+    runs, before any intercept is filled; the intercepts do not change the
+    keyspace. If the append fails, `EXEC` reports the error without running
+    the intercepts, as the owner-routed path already did.
+  - A typed `FLUSHDB`/`FLUSHALL` at `--shards > 1` logged this shard's flush
+    after broadcasting it to the other shards, so a key written to this shard
+    during the broadcast was replayed BEFORE the flush and vanished after a
+    restart. The flush is now logged before the broadcast, which also means a
+    broadcast that fails part-way no longer leaves this shard's flush out of
+    the log.
+  - A scattered `MSET` logged its local slice after awaiting the remote legs,
+    so a newer write to one of its local keys was replayed under the `MSET`
+    value. The slice is now logged right after it is applied.
+
 - **Three wire-parity gaps found probing redis-server 8.6.1 raw sockets**
   (moon#1060, moon#1076, moon#1077).
   - `ZRANGEBYSCORE`, `ZRANGE ... BYSCORE`/`BYLEX` and `ZREVRANGEBYSCORE`
