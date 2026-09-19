@@ -113,6 +113,24 @@ pub struct Consumer {
     pub seen_time: u64,
 }
 
+/// The options of one `XCLAIM`, parsed (see [`Stream::xclaim`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct XclaimOptions {
+    /// `min-idle-time`: an already-pending entry idle for less is skipped.
+    pub min_idle: u64,
+    /// The delivery time to stamp, as `TIME` gave it or `now - IDLE`;
+    /// `None` stamps now. Out-of-range values are clamped to now.
+    pub delivery_time: Option<i64>,
+    /// `RETRYCOUNT`: the delivery count to set; `None` increments it.
+    pub retry_count: Option<u64>,
+    /// `FORCE`: create the PEL entry for an id that is not pending.
+    pub force: bool,
+    /// `JUSTID`: reply with ids and leave the delivery count alone.
+    pub justid: bool,
+    /// `LASTID`: raise the group's last-delivered id to this, never lower it.
+    pub last_id: Option<StreamId>,
+}
+
 impl Stream {
     pub fn new() -> Self {
         Stream {
@@ -341,6 +359,22 @@ impl Stream {
         }
     }
 
+    /// Would a `>` read of `group_name` deliver anything right now — is there
+    /// an entry after the group's last-delivered id? `None` when the group
+    /// does not exist. Read-only: lets a waker decide a group reader is
+    /// servable, and win its claim, BEFORE the read moves anything into a PEL
+    /// (moon#1047).
+    pub fn group_has_new(&self, group_name: &[u8]) -> Option<bool> {
+        let group = self.groups.get(group_name)?;
+        let last = group.last_delivered_id;
+        Some(
+            self.entries
+                .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+                .next()
+                .is_some(),
+        )
+    }
+
     /// Read new entries for a consumer group (> semantics).
     /// Auto-creates consumer. Adds entries to PEL. Updates last_delivered_id.
     pub fn read_group_new(
@@ -525,52 +559,100 @@ impl Stream {
         Ok(results)
     }
 
-    /// Claim pending entries for a different consumer.
+    /// `XCLAIM`: move pending entries to `consumer_name`, redis's
+    /// `xclaimCommand` semantics option for option. Returns the ids claimed,
+    /// in argument order; every one of them names an entry that still exists,
+    /// so a caller rendering full entries always finds them.
+    ///
+    /// This is also how a consumer-group read is REPLAYED: redis propagates
+    /// `XREADGROUP` as one `XCLAIM key group consumer 0 id TIME t RETRYCOUNT n
+    /// FORCE JUSTID LASTID id` per delivered entry, and moon's blocking group
+    /// reads log the same records (moon#1104). `FORCE` is what recreates the
+    /// PEL entry on the replaying side, `TIME` / `RETRYCOUNT` restore its
+    /// delivery metadata exactly, and `LASTID` never moves the cursor back.
+    ///
+    /// * An id whose entry was deleted from the stream is not claimable, and a
+    ///   PEL entry left behind for it is dropped.
+    /// * `FORCE` creates a PEL entry for an id that exists in the stream but
+    ///   is not pending; `min_idle` does not apply to it.
+    /// * The delivery count is set to `retry_count` when given, otherwise
+    ///   incremented unless `justid`.
     pub fn xclaim(
         &mut self,
-        group_name: &Bytes,
+        group_name: &[u8],
         consumer_name: &Bytes,
-        min_idle_time: u64,
         ids: &[StreamId],
-    ) -> Result<Vec<(StreamId, Vec<(Bytes, Bytes)>)>, &'static str> {
+        opts: &XclaimOptions,
+    ) -> Result<Vec<StreamId>, &'static str> {
+        let entries = &self.entries;
         let group = self
             .groups
-            .get_mut(group_name.as_ref())
+            .get_mut(group_name)
             .ok_or("NOGROUP No such consumer group for key name")?;
+        let now = current_time_ms();
+        if let Some(last) = opts.last_id
+            && last > group.last_delivered_id
+        {
+            group.last_delivered_id = last;
+        }
+        // Redis clamps a bogus TIME/IDLE (negative, or in the future) to now
+        // rather than failing a command that may already have claimed.
+        let delivery_time = match opts.delivery_time {
+            Some(t) if t >= 0 && (t as u64) <= now => t as u64,
+            _ => now,
+        };
         Self::ensure_consumer(group, consumer_name);
 
-        let now = current_time_ms();
-        let mut results = Vec::new();
-        for id in ids {
-            if let Some(pe) = group.pel.get_mut(id) {
-                let idle = now.saturating_sub(pe.delivery_time);
-                if idle < min_idle_time {
-                    continue;
+        let mut claimed = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if !entries.contains_key(&id) {
+                if let Some(stale) = group.pel.remove(&id)
+                    && let Some(c) = group.consumers.get_mut(&stale.consumer)
+                {
+                    c.pending.remove(&id);
                 }
-
-                // Remove from old consumer's pending
-                let old_consumer = pe.consumer.clone();
-                if let Some(c) = group.consumers.get_mut(&old_consumer) {
-                    c.pending.remove(id);
+                continue;
+            }
+            let forced = if group.pel.contains_key(&id) {
+                false
+            } else if opts.force {
+                group.pel.insert(
+                    id,
+                    PendingEntry {
+                        consumer: consumer_name.clone(),
+                        delivery_time: now,
+                        delivery_count: 1,
+                    },
+                );
+                true
+            } else {
+                continue;
+            };
+            let Some(pe) = group.pel.get_mut(&id) else {
+                continue;
+            };
+            if !forced && opts.min_idle > 0 && now.saturating_sub(pe.delivery_time) < opts.min_idle
+            {
+                continue;
+            }
+            if forced || pe.consumer != *consumer_name {
+                if !forced && let Some(c) = group.consumers.get_mut(&pe.consumer) {
+                    c.pending.remove(&id);
                 }
-
-                // Transfer ownership
                 pe.consumer = consumer_name.clone();
-                pe.delivery_time = now;
-                pe.delivery_count += 1;
-
-                // Add to new consumer's pending
                 if let Some(c) = group.consumers.get_mut(consumer_name) {
-                    c.pending.insert(*id, ());
-                }
-
-                // Add entry data to results
-                if let Some(fields) = self.entries.get(id) {
-                    results.push((*id, fields.clone()));
+                    c.pending.insert(id, ());
                 }
             }
+            pe.delivery_time = delivery_time;
+            match opts.retry_count {
+                Some(n) => pe.delivery_count = n,
+                None if !opts.justid => pe.delivery_count += 1,
+                None => {}
+            }
+            claimed.push(id);
         }
-        Ok(results)
+        Ok(claimed)
     }
 
     /// Auto-claim idle pending entries SCAN-style.

@@ -663,6 +663,134 @@ mod tests {
         }
     }
 
+    /// The PEL entry for `id` as `(consumer, delivery_time, delivery_count)`.
+    fn pel_entry(db: &mut Database, key: &[u8], id: StreamId) -> Option<(Bytes, u64, u64)> {
+        let stream = db.get_stream(key).ok()??;
+        let pe = stream.groups.get(b"g".as_ref())?.pel.get(&id)?.clone();
+        Some((pe.consumer, pe.delivery_time, pe.delivery_count))
+    }
+
+    /// moon#1104: the numeric VALUE of an option is not an id to claim. Moon
+    /// used to parse every argument that looked like an id as one, so
+    /// `RETRYCOUNT 1` claimed entry `1-0` and `TIME ...` claimed another.
+    #[test]
+    fn test_xclaim_option_values_are_not_ids() {
+        let mut db = Database::new();
+        setup_stream_with_group(&mut db, b"s", 3, b"g");
+        xreadgroup(
+            &mut db,
+            &make_args(&[b"GROUP", b"g", b"alice", b"STREAMS", b"s", b">"]),
+        );
+        let reply = xclaim(
+            &mut db,
+            &make_args(&[
+                b"s",
+                b"g",
+                b"bob",
+                b"0",
+                b"2-0",
+                b"RETRYCOUNT",
+                b"1",
+                b"JUSTID",
+            ]),
+        );
+        assert_eq!(
+            reply,
+            Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"2-0"))])
+        );
+        let first = pel_entry(&mut db, b"s", StreamId { ms: 1, seq: 0 }).unwrap();
+        assert_eq!(first.0.as_ref(), b"alice", "1-0 was never asked for");
+    }
+
+    /// moon#1104: the record a consumer-group read replays as — `FORCE`
+    /// creates the pending entry, `TIME` / `RETRYCOUNT` restore its delivery
+    /// metadata, `LASTID` raises (never lowers) the group's cursor, `JUSTID`
+    /// answers ids.
+    #[test]
+    fn test_xclaim_force_time_retrycount_lastid_rebuild_a_delivery() {
+        let mut db = Database::new();
+        setup_stream_with_group(&mut db, b"s", 3, b"g");
+        let reply = xclaim(
+            &mut db,
+            &make_args(&[
+                b"s",
+                b"g",
+                b"c",
+                b"0",
+                b"2-0",
+                b"TIME",
+                b"1000",
+                b"RETRYCOUNT",
+                b"1",
+                b"FORCE",
+                b"JUSTID",
+                b"LASTID",
+                b"2-0",
+            ]),
+        );
+        assert_eq!(
+            reply,
+            Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"2-0"))])
+        );
+        assert_eq!(
+            pel_entry(&mut db, b"s", StreamId { ms: 2, seq: 0 }),
+            Some((Bytes::from_static(b"c"), 1000, 1))
+        );
+        let last = |db: &mut Database| {
+            db.get_stream(b"s").unwrap().unwrap().groups[b"g".as_ref()].last_delivered_id
+        };
+        assert_eq!(last(&mut db), StreamId { ms: 2, seq: 0 });
+        // A LASTID behind the cursor leaves it where it is.
+        xclaim(
+            &mut db,
+            &make_args(&[b"s", b"g", b"c", b"0", b"2-0", b"JUSTID", b"LASTID", b"1-0"]),
+        );
+        assert_eq!(last(&mut db), StreamId { ms: 2, seq: 0 });
+        // Without FORCE an entry that is not pending is not claimed.
+        let reply = xclaim(&mut db, &make_args(&[b"s", b"g", b"c", b"0", b"3-0"]));
+        assert_eq!(reply, Frame::Array(framevec![]));
+        assert_eq!(pel_entry(&mut db, b"s", StreamId { ms: 3, seq: 0 }), None);
+    }
+
+    /// Redis's answers for a missing key or group and an unknown option.
+    #[test]
+    fn test_xclaim_errors_match_redis() {
+        let mut db = Database::new();
+        let err = |f: Frame| match f {
+            Frame::Error(e) => String::from_utf8_lossy(&e).into_owned(),
+            other => panic!("expected an error, got {other:?}"),
+        };
+        assert_eq!(
+            err(xclaim(
+                &mut db,
+                &make_args(&[b"nokey", b"g", b"c", b"0", b"1-1"])
+            )),
+            "NOGROUP No such key 'nokey' or consumer group 'g'"
+        );
+        setup_stream_with_group(&mut db, b"s", 1, b"g");
+        assert_eq!(
+            err(xclaim(
+                &mut db,
+                &make_args(&[b"s", b"nog", b"c", b"0", b"1-0"])
+            )),
+            "NOGROUP No such key 's' or consumer group 'nog'"
+        );
+        assert_eq!(
+            err(xclaim(
+                &mut db,
+                &make_args(&[b"s", b"g", b"c", b"0", b"1-0", b"BOGUS"])
+            )),
+            "ERR Unrecognized XCLAIM option 'BOGUS'"
+        );
+        assert_eq!(
+            err(xclaim(
+                &mut db,
+                &make_args(&[b"s", b"g", b"c", b"x", b"1-0"])
+            )),
+            "ERR Invalid min-idle-time argument for XCLAIM"
+        );
+    }
+
     #[test]
     fn test_xautoclaim_idle_entries() {
         let mut db = Database::new();
