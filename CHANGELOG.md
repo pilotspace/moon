@@ -30,6 +30,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BEHAVIOUR CHANGE — once the cold tier holds keys, a write is checked
+  against `maxmemory` using hot bytes PLUS the cold index's RAM, not hot bytes
+  alone** (moon#1036).
+  - **Who is affected:** servers running `maxmemory-policy noeviction`, and
+    `volatile-*` servers whose volatile keys run out. They now answer `-OOM`
+    earlier than before, by the size of the cold index. `allkeys-*` servers
+    reply the same; they spill more hot keys to disk to stay under the cap.
+  - **When it applies:** only with `--disk-offload` enabled and only after keys
+    have spilled. A server with an empty cold tier behaves exactly as before.
+  - **Why this is correct:** the cold index (one entry per spilled key) is
+    resident RAM. The 100 ms pressure cascade has charged it against
+    `maxmemory` since K4. Until now the per-write gates did not, so the shard
+    ran over the cascade's cap between ticks. `noeviction` / `volatile-*`
+    writes are now refused at the cap the server was already enforcing,
+    instead of up to one tick later.
+  - **What to do:** if writes that used to fit now hit `-OOM`, raise
+    `maxmemory` by the cold index's size. INFO reports it as `cold_index_bytes`
+    in the `# MoonStore` section, and Prometheus as
+    `moon_memory_bytes{kind="cold_index"}`. Both are refreshed by the cold
+    orphan sweep (`--cold-orphan-sweep-interval-secs`, 60 s default), so leave
+    some headroom for growth between samples.
+
 - **BEHAVIOUR CHANGE — a command the user's ACL denies inside `MULTI` now
   aborts the whole transaction** (moon#1035). `EXEC` answers
   `-EXECABORT Transaction discarded because of previous errors.` and applies
@@ -198,6 +220,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CROSSSLOT` error, as `RENAME` does. A `{hash}` tag co-locates the keys, and
   `COPY` without a `DB` clause still works across shards.
 
+- **An acknowledged `MOVE` or `COPY src dst DB n` survives `kill -9` and
+  restart** (moon#1046). Both commands need two databases, so the live paths
+  run them through a two-db intercept, but AOF/WAL replay handed the logged
+  record to the single-db dispatch. `MOVE` hit its "requires handler-level
+  dispatch" error and replay dropped the error, so the key came back in its
+  source db. `COPY ... DB n` copied within the source db instead: the
+  destination copy was lost and a stray key appeared in the source db. The
+  replay engine now intercepts both, the way it already did for `SWAPDB` and
+  `FLUSHALL`. It applies them with the same parsers and core helpers as the
+  live intercept, using the record's `SELECT` context as the source db. MOVE
+  onto an existing key, COPY without `REPLACE` onto an existing key, and a
+  missing source all stay no-ops. The TTL moves with the entry, and replaying
+  a record twice does nothing the second time. A record naming a db the
+  server no longer has is skipped with a warning. On both runtimes, at
+  `--shards 1` and `--shards 4`, with `--appendfsync always`, and with or
+  without a `BGREWRITEAOF` in the middle, the restarted keyspace now matches
+  the acknowledged one exactly (per-db `DBSIZE`, values and TTLs). Before the
+  fix, 117 of those checks failed without a rewrite and 61 with one.
+
+- **`ZRANGE`, `ZREVRANGE` and `ZRANGESTORE` no longer clamp a still-negative
+  STOP to 0** (moon#1001). Redis's rank-window rule only clamps a
+  still-negative START; a STOP still negative after `len + stop` is left
+  negative, so `start > stop` reports the window empty. Both range helpers
+  (`zrange_by_rank` against the B+tree, `zrange_from_entries` against a
+  listpack) instead did `(len + stop).max(0)`, turning `-1` into rank `0`.
+  Verified against redis-server 8.6.1 on a five-member zset: `ZRANGE z -10
+  -6` answered `[a]` where redis answers `[]` (also wrong on `ZREVRANGE`,
+  `ZRANGE ... REV` and `ZRANGESTORE`, which shares the same helper). Both
+  helpers now call the `rank_window` helper moon#959 added for
+  `ZREMRANGEBYRANK`, so the four commands cannot drift apart again.
+
+- **`maxmemory` is one cap again once keys have spilled to disk** (moon#1036).
+  Since K4, the 100 ms pressure cascade has held each database to hot bytes
+  PLUS its cold index's RAM. The per-write gates did not: the inline `SET`
+  pre-gate and `evict_to_budget` without `.total()` compared hot bytes only.
+  So each tick the cascade spilled a cold index's worth of hot keys, and the
+  write path let writers refill that room without evicting. Plain `SET`s
+  inlined into it while the shard was over the cascade's cap. The shard ran
+  over budget between ticks, and every tick spilled extra keys. An
+  instrumented build classified every inlined write (1,809 across 6 runs):
+  all of them saw fresh hints and a shard under budget by hot bytes but over
+  it once the cold index was counted. None was a stale-hint slip. With a
+  CI-speed writer this reproduced 247-389 inlined writes out of 2000; CI's
+  red `g2_bail_out_fires_under_pressure_shards1` runs showed 53-297. All
+  eviction gates now read one figure, `Database::budgeted_memory()`: the
+  inline pre-gate, `evict_to_budget`'s default, the tick publish and the
+  timer sweep. After the fix the count is 0 of 2000 in every run, with or
+  without contention. The G2 test's window is now paced so the cascade runs
+  inside it on any host, and its bound is a constant (5) rather than 2% of
+  the writes.
+
 - **A tokio `--shards 1` AOF written before `MOON.COLDCUT` existed no longer
   compounds its damage on every restart** (moon#914 (b)). Such a file has no
   cut, so replay reads every cold file ungated and re-applies a write on top of
@@ -286,6 +359,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covered:** an AOF written before this change has no head, and replays
   ungated until its first rewrite. Run `BGREWRITEAOF` once after upgrading a
   tokio `--shards 1` deployment that uses disk offload.
+- **A multi-key `BLPOP`/`BRPOP`/`BZPOPMIN`/`BZPOPMAX` whose keys span shards
+  pops exactly one element, from the first non-empty key in argument order**
+  (moon#1019). At `--shards > 1` such a command could pop the WRONG key (the
+  client's shard served a later key it owned over an earlier non-empty key
+  another shard owned) or pop on two or three shards at once and deliver one
+  reply, destroying the other elements. These commands keep working across
+  shards — an untagged `BLPOP q1 q2 q3 0` worker loop is not refused — and now
+  answer as standalone Redis does, including `-WRONGTYPE` for the first
+  existing key of the wrong type. A waiter registered on several shards carries
+  one claim token: a shard pops, must then win the token before it answers,
+  and puts the element back in the same step if it loses. The keys are
+  registered in argument order, one run of same-shard keys at a time, and each
+  run is acknowledged before the next, so a later key never answers ahead of an
+  earlier non-empty one. This costs one extra round trip per remote run that is
+  not the last. Co-located keys and single-key waits pay nothing extra, and a
+  waiter whose keys all live on its own shard carries no token. Measured at
+  `--shards 4` (`tests/blocking_spanning_claim.rs`, macOS, both runtimes, before
+  → after): immediate pops differing from Redis 91/192 (monoio) and 95/192
+  (tokio) → 0/192; the `-WRONGTYPE` ladder skipped 14/16 and 10/16 → 0/16;
+  concurrent pushes to three owners destroyed elements in 39/80 and 64/80
+  waits → 0/80.
+- **A blocking pop no longer loses an element that is served as its timeout,
+  disconnect or shutdown fires** (moon#1023). The wait path sent `BlockCancel`
+  and dropped its receivers. A serve that landed between the two went into a
+  still-live receiver, so the owner's undo, which runs only when its send
+  fails, never ran, and the element was dropped with the receiver. The waiter
+  now closes its claim token first. If no shard has claimed it, none can any
+  more, and there is nothing to drain. If one has, its reply is taken and
+  delivered on a timeout or shutdown: the client was served before the end of
+  the wait was observed. If the client is gone, the serve stands, as it does
+  in Redis: its effect is recorded through the same path as a delivered
+  reply (tracking invalidation included), and the reply is dropped with the
+  socket. That path has two known gaps, which this change inherits and does
+  not close. The record goes to the connection's shard AOF, so for a key owned
+  by another shard, replay drops it (moon#1056). On `runtime-tokio`, the
+  record is appended to the AOF only, never to the replication stream. The
+  element is not put back. A put-back would land after
+  whatever other clients wrote to the key in the meantime, on top of a pop
+  that was never logged. After `RPUSH k b; LPOP k` the master would then hold
+  `[a]` while its AOF replays `[b]`, and a `DEL k` would be undone. Measured
+  with a test-only window (`MOON_TEST_BLOCK_SETTLE_DELAY_MS`) at `--shards 4`
+  on both runtimes:
+  - a push racing a timeout destroyed its element 13/16 → 0/16;
+  - a served-then-disconnected waiter's element came back over later writes
+    6/6 → 0/6 (monoio).
+- **A spanning blocking pop's timeout is the client's timeout.** Each
+  cross-shard registration step waits for its owner's acknowledgement. That
+  wait was bounded only by the 30 s internal reply timeout, not by the
+  client's deadline. So `BLPOP q1 q2 q3 1` with a stalled owner answered after
+  the stall, or with a `MOONERR` after 30 s, and a shutdown during the wait
+  also answered `MOONERR`. The acknowledgement now races the client's deadline
+  and shutdown, and each ends the wait with its normal reply (nil, or the
+  shutdown error). With a 3 s test-only owner stall (`MOON_TEST_BLOCK_ACK_STALL_MS`),
+  `BLPOP k1 k2 k3 0.5` answered after 3.0 s and 6.0 s (both runtimes) → nil in
+  under 1.5 s.
+- **A blocking pop's element that must go back (the waiter was won by another
+  shard, or its reply could not be sent) keeps the key's TTL.** When that pop
+  had emptied the key, the put-back recreated it with no TTL, so the master
+  kept a key that every replica expired. The encoding is not preserved: the
+  key is recreated in the natural encoding for its size. A wake on a key that
+  holds nothing now answers nobody, instead of answering a parked `BLPOP k 0`
+  with nil.
+- **A blocking pop parked on a key that now holds another type stays
+  parked.** Example: `BZPOPMIN k 0` parks, then `RPUSH k x y` creates `k` as
+  a list, then a remote `BLPOP k 0` registers. That registration runs every
+  waker on `k`. The zset waker took the `BZPOPMIN` waiter, found nothing to
+  pop, and answered it nil, which Redis never sends a timeout-0 waiter. A
+  waker with nothing to pop now puts the waiter back at the front of its
+  queue, unanswered.
+- **A timed-out spanning wait no longer leaves a registration behind.** A
+  later local run of a spanning wait (`BLPOP a b c 1`, with `a` and `c` local
+  and `b` remote) was registered without the client's deadline. The timeout
+  sweep removed the waiter's deadlined entries and forgot its id, which
+  orphaned that entry until its key was next pushed. The sweep now removes
+  every registration of a timed-out waiter.
+- **One push that carries several elements serves every parked waiter those
+  elements cover**, as Redis does. Two clients in `BLPOP k 2` and one
+  `RPUSH k a b` used to answer one waiter and leave the other parked next to
+  `b` until its timeout; now both are answered at once.
 
 - **`CLIENT TRACKING` now invalidates a key that expires or is evicted**
   (moon#1013). Only command writes used to push `invalidate`, so a
@@ -424,10 +576,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BLPOP`, `BZPOPMIN` × 16 tags × 3 server instances, against redis 8.6.1): 139
   of 192 probes destroyed an element before, 0 after; `--shards 1` was and is 0. The client now sends ONE registration per owner shard carrying
   every key it owns, and the owner registers, type-checks and serves them in
-  one synchronous stretch, so a waiter is served at most once there. A
-  spanning `BLPOP`/`BRPOP`/`BZPOPMIN`/`BZPOPMAX` can still be served by two
-  owner shards at once; that placement is unchanged by this fix and is
-  tracked as moon#1019.
+  one synchronous stretch, so a waiter is served at most once there.
 
 - **`ACL SETUSER` implements `allkeys`, `allcommands`, `allchannels` and
   every spelling of the `%R~` / `%W~` / `%RW~` key selectors** (moon#970).

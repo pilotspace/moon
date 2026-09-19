@@ -184,8 +184,11 @@ pub(crate) fn run_eviction(
         let db_count = shard_databases.db_count();
         let mut kv_total: usize = 0;
         for i in 0..db_count {
+            // moon#1036: the same per-db figure every other eviction gate
+            // compares against (hot bytes + cold index RAM). Identical to
+            // `estimated_memory()` when disk-offload is off (no cold index).
             kv_total = kv_total.saturating_add(crate::shard::slice::with_shard_db(i, |db| {
-                db.estimated_memory()
+                db.budgeted_memory()
             }));
         }
         // Running aggregate: each db's eviction reduces it by what that db

@@ -971,6 +971,18 @@ if should_run "sorted_set"; then
     rcli ZADD z:959:r 1 a 2 b 3 c 4 d 5 e >/dev/null 2>&1; mcli ZADD z:959:r 1 a 2 b 3 c 4 d 5 e >/dev/null 2>&1
     assert_match "ZREMRANGEBYRANK"          ZREMRANGEBYRANK z:959:r 0 0
     assert_match "ZREMRANGEBYRANK neg stop" ZREMRANGEBYRANK z:959:r -10 -6
+
+    # moon#1001 -- ZRANGE, ZREVRANGE and ZRANGESTORE clamped a STOP still
+    # negative after `len + stop` to 0 (the same rule ZREMRANGEBYRANK above
+    # already gets right), so `ZRANGE z -10 -6` on a five-member zset
+    # answered one element where redis answers an empty array.
+    rcli ZADD z:1001:r 1 a 2 b 3 c 4 d 5 e >/dev/null 2>&1; mcli ZADD z:1001:r 1 a 2 b 3 c 4 d 5 e >/dev/null 2>&1
+    assert_match "ZRANGE neg stop"          ZRANGE z:1001:r -10 -6
+    assert_match "ZREVRANGE neg stop"       ZREVRANGE z:1001:r -10 -6
+    assert_match "ZRANGE REV neg stop"      ZRANGE z:1001:r -10 -6 REV
+    assert_match "ZRANGESTORE neg stop"     ZRANGESTORE {z1001}:d z:1001:r -10 -6
+    assert_match "ZRANGESTORE dest empty"   ZRANGE {z1001}:d 0 -1
+    assert_match "ZRANGE stop == -len"      ZRANGE z:1001:r -10 -5
     assert_match "ZREMRANGEBYSCORE"         ZREMRANGEBYSCORE z:959:r '(2' 3
     assert_match "ZREMRANGEBYSCORE bad"     ZREMRANGEBYSCORE z:959:r nan 1
     assert_match "ZREMRANGEBYLEX"           ZREMRANGEBYLEX z:959:lex '[b' '(d'
