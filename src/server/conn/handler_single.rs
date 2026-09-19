@@ -2897,9 +2897,10 @@ pub async fn handle_connection(
                                 // dispatch() only receives one &mut Database; intercept here.
                                 if d_cmd.eq_ignore_ascii_case(b"MOVE") {
                                     let src_db = conn.selected_db;
-                                    let response = match crate::command::keyspace::move_cmd::parse_move_args(d_args, db_count) {
+                                    // `resolve_move` refuses `dst_db == src_db`
+                                    // with redis's same-object error (moon#1062).
+                                    let response = match crate::command::keyspace::move_cmd::resolve_move(d_args, src_db, db_count) {
                                         Err(e) => e,
-                                        Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
                                         Ok((key, dst_db)) => {
                                             // Release single-db guard before acquiring two-db locks
                                             drop(guard);

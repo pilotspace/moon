@@ -1447,10 +1447,18 @@ fn test_inline_set_stands_down_under_client_pause() {
 /// `maxmemory` of 1 byte makes `inline_write_can_skip_eviction` false for any
 /// non-empty shard, so the two calls below differ ONLY in the operand under
 /// test. The hints are process-global, which is why this runs under
-/// `inline_test_lock()` and restores them before returning.
+/// `inline_test_lock()` and scopes them with `PublishedLimits`.
+///
+/// moon#856: the restore used to be a manual `publish_maxmemory_hints(default)`
+/// placed before the assertions — deliberately, so a failing assert could not
+/// poison the next test to take the lock. It could not cover a panic INSIDE
+/// `run` (`try_inline_dispatch` is the code under test), which would skip it
+/// entirely. The guard restores on the unwind path too, so the manual line is
+/// gone and the ordering no longer matters.
 #[test]
 fn test_inline_set_bails_only_when_a_spill_sender_is_live() {
     let _serial = inline_test_lock();
+    let _limits = crate::storage::eviction::PublishedLimits::capture();
     let dbs = make_dbs();
     let cmd = b"*3\r\n$3\r\nSET\r\n$6\r\nekey01\r\n$3\r\nbar\r\n";
     let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
@@ -1488,9 +1496,8 @@ fn test_inline_set_bails_only_when_a_spill_sender_is_live() {
     let (no_sender, _, _) = run(false);
     let (with_sender, left, answered) = run(true);
 
-    // Restore before asserting, so a failure cannot leave the statics poisoned
-    // for whatever test takes the lock next.
-    crate::storage::eviction::publish_maxmemory_hints(&crate::config::RuntimeConfig::default());
+    // No manual restore here: `_limits` above puts the hints back when this
+    // test returns OR unwinds (moon#856).
 
     // CONTROL: with no spill sender there is nothing to route victims to, so
     // eviction pressure alone must NOT stand the inline path down. Without
