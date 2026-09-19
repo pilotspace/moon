@@ -73,16 +73,17 @@ pub fn copy(db: &mut Database, args: &[Frame]) -> Frame {
         i += 1;
     }
 
+    // Same key in the same db: an error, checked BEFORE the lookup exactly as
+    // redis does, so `COPY missing missing` is the error too, not `:0`.
+    if src == dst {
+        return Frame::Error(Bytes::from_static(
+            crate::command::keyspace::move_cmd::ERR_SAME_OBJECT,
+        ));
+    }
+
     // Redis returns 0 (not error) when source doesn't exist
     if !db.exists(src) {
         return Frame::Integer(0);
-    }
-
-    // Same key: Redis 7.x returns ERR for source == destination
-    if src == dst {
-        return Frame::Error(Bytes::from_static(
-            b"ERR source and destination objects are the same",
-        ));
     }
 
     // Check if destination exists
