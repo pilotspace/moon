@@ -7,6 +7,16 @@ use super::*;
 #[cfg(feature = "runtime-monoio")]
 use super::rewrite::drain_pending_appends;
 
+/// Result of one non-parking enqueue attempt ([`AofWriterPool::try_append_now`]).
+enum AppendNow {
+    /// The record is in the channel or the rewrite overflow.
+    Enqueued,
+    /// The channel is full and no fold has the overflow armed: retry later.
+    WouldBlock,
+    /// The record can never be accepted (writer gone, overflow cap reached).
+    Refused(AofAck),
+}
+
 #[derive(Clone)]
 pub struct AofWriterPool {
     senders: Vec<channel::MpscSender<AofMessage>>,
@@ -361,6 +371,118 @@ impl AofWriterPool {
         self.send_append_backpressure(shard_id, lsn, db, bytes, stamp)
             .await?;
         Ok(matches!(self.fsync_policy, FsyncPolicy::Always))
+    }
+
+    /// Enqueue a record and apply its mutation in ONE synchronous section, for
+    /// a producer that must not mutate before its record is accepted (SWAPDB:
+    /// no rollback exists, so nothing may change if the enqueue fails).
+    ///
+    /// The fold's exactly-once contract needs the record's stamp, its position
+    /// in the writer's stream, and the mutation to fall on the same side of a
+    /// fold snapshot. The snapshot runs on the shard thread (the `AofFold`
+    /// handler), so for a caller on that same shard thread (the only kind this
+    /// is for) it can only land at a suspension point. Here the stamp is
+    /// read, the record is enqueued without parking, and `apply` runs, with no
+    /// suspension point between them:
+    ///
+    /// - snapshot before this section: the mutation is not in the base, the
+    ///   record is stamped at or above the snapshot epoch and sits after the
+    ///   fold's cut, so the new incr keeps it.
+    /// - snapshot after this section: the mutation is in the base, the record
+    ///   is before the cut and goes to the old incr, which the base replaces.
+    ///
+    /// A parking `send_async` cannot give this: the receiver moves a parked
+    /// message into the queue on the writer thread, so the enqueue instant is
+    /// unrelated to when this task resumes, and a snapshot can fall between
+    /// the two.
+    ///
+    /// While the channel is full (and no fold has the overflow armed), this
+    /// waits for room WITHOUT holding the record, polling every millisecond on
+    /// the runtime timer. The wait suspends only this task, never the shard
+    /// thread. It is bounded by the pool's `fsync_timeout`; `ZERO` keeps the
+    /// legacy unbounded wait. On `Err`, `apply` never ran and nothing was
+    /// enqueued.
+    ///
+    /// Returns `apply`'s result and whether the caller must confirm durability
+    /// with ONE [`Self::fsync_barrier`] (`Always`), exactly like
+    /// [`Self::send_append_group`]. That barrier runs AFTER the mutation: an
+    /// fsync failure is then reported on a mutation that stays applied, which
+    /// is what every other `Always` write does.
+    pub async fn append_then_apply<R>(
+        &self,
+        shard_id: usize,
+        lsn: u64,
+        db: usize,
+        bytes: Bytes,
+        apply: impl FnOnce() -> R,
+    ) -> Result<(R, bool), AofAck> {
+        let deadline = if self.fsync_timeout.is_zero() {
+            None
+        } else {
+            Some(std::time::Instant::now() + self.fsync_timeout)
+        };
+        loop {
+            match self.try_append_now(shard_id, lsn, db, bytes.clone()) {
+                AppendNow::Enqueued => {
+                    return Ok((apply(), matches!(self.fsync_policy, FsyncPolicy::Always)));
+                }
+                AppendNow::Refused(ack) => return Err(ack),
+                AppendNow::WouldBlock => {
+                    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        warn!(
+                            "AOF writer channel full (shard {}): append refused after {:?}; \
+                             the mutation was not applied",
+                            shard_id, self.fsync_timeout
+                        );
+                        return Err(AofAck::ChannelFull);
+                    }
+                    Self::room_poll_sleep().await;
+                }
+            }
+        }
+    }
+
+    /// One non-parking enqueue attempt, stamped at the enqueue instant. Honours
+    /// the rewrite overflow's spill-first ordering exactly like
+    /// [`Self::send_append_backpressure`].
+    fn try_append_now(&self, shard_id: usize, lsn: u64, db: usize, bytes: Bytes) -> AppendNow {
+        use super::rewrite_overflow::SpillReject;
+        let ovf = self.overflow_for(shard_id);
+        let msg = AofMessage::Append {
+            lsn,
+            db,
+            bytes,
+            epoch: ovf.stamp(),
+        };
+        let msg = if ovf.spill_first() {
+            match ovf.try_spill(msg) {
+                Ok(()) => return AppendNow::Enqueued,
+                Err(SpillReject::Disarmed(returned)) => returned,
+                // Older records are buffered and the cap is reached: nothing
+                // was applied yet, so refusing keeps memory and log equal.
+                Err(SpillReject::CapExceeded) => return AppendNow::Refused(AofAck::ChannelFull),
+            }
+        } else {
+            msg
+        };
+        match self.sender(shard_id).try_send(msg) {
+            Ok(()) => AppendNow::Enqueued,
+            Err(flume::TrySendError::Disconnected(_)) => AppendNow::Refused(AofAck::WriteFailed),
+            Err(flume::TrySendError::Full(msg)) => match ovf.try_spill(msg) {
+                Ok(()) => AppendNow::Enqueued,
+                Err(SpillReject::Disarmed(_)) => AppendNow::WouldBlock,
+                Err(SpillReject::CapExceeded) => AppendNow::Refused(AofAck::ChannelFull),
+            },
+        }
+    }
+
+    /// The poll interval of [`Self::append_then_apply`]'s wait for room.
+    async fn room_poll_sleep() {
+        const ROOM_POLL: Duration = Duration::from_millis(1);
+        #[cfg(feature = "runtime-monoio")]
+        monoio::time::sleep(ROOM_POLL).await;
+        #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-monoio")))]
+        tokio::time::sleep(ROOM_POLL).await;
     }
 
     /// Durability barrier for cross-shard pipelined writes under

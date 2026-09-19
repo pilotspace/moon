@@ -55,7 +55,7 @@ pub(crate) const AOF_REWRITE_OVERFLOW_DEFAULT_MAX_BYTES: usize = 256 << 20;
 ///
 /// # Snapshot epoch (exactly-once)
 ///
-/// The fold's C4 contract splits appends at the snapshot instant.
+/// A cooperative fold splits appends at its snapshot instant.
 /// PRE-snapshot appends have their effects captured by the new base RDB (the
 /// shard mutates BEFORE enqueuing/spilling), so they must never reach the NEW
 /// incr: replaying them on top of the base double-applies non-idempotent

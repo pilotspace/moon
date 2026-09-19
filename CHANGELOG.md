@@ -216,6 +216,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the manifest switches, so every failure leaves the old generation
     committed and the writer on it. A failed manifest write also no longer
     advances the in-memory sequence past the one on disk.
+  - **SWAPDB during a rewrite.** `SWAPDB` logged its record, awaited, and
+    only then swapped. A rewrite that snapshotted in that gap had a base
+    without the swap and dropped (or folded into the old incr) the record, so
+    the acknowledged `SWAPDB` was gone after a restart. The record is now
+    enqueued, the swap applied and the replication record emitted in one
+    synchronous step; while the AOF channel is full, `SWAPDB` waits for room
+    without holding its record, and is refused unapplied after
+    `--aof-fsync-timeout-ms`. Under `appendfsync always` the fsync is now
+    confirmed after the swap, so an fsync failure is reported on a swap that
+    stays applied on every shard, like any other `always` write.
+  - **Directory fsyncs.** A per-shard rewrite created the new incr after its
+    last fsync of the shard directory, and the tokio `--shards 1` rewrite
+    renamed its new file into place without a directory fsync. After a power
+    loss the committed manifest could name a missing incr, or the old
+    `appendonly.aof` could return, losing every record written after the
+    rewrite. Both directories are now fsynced before the new file is used.
 
 - **`blocking_spanning_claim` bsc8 no longer fails its precondition on
   Linux when a waiter lands on its key's owner** (moon#1083). The test raced

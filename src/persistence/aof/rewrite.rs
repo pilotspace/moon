@@ -944,7 +944,8 @@ pub(crate) fn do_rewrite_per_shard(
         return Ok(FoldOutcome::Aborted);
     }
     *file = new_file;
-    // task #35: fresh incr — replay always starts a segment at db 0.
+    // Fresh incr: replay starts every incr segment at db 0, so the writer's
+    // db context restarts there too.
     *last_db = 0;
     Ok(FoldOutcome::Committed {
         floor: fold_snapshot.fold_epoch,
@@ -1604,6 +1605,22 @@ pub(crate) fn rewrite_aof_sharded_sync(
             e
         ),
     })?;
+    // The rename is the commit point, so a failure below cannot abort: the
+    // writer's handle is already the published file. Fsync the directory so
+    // the new name survives a power loss (a file fsync does not persist its
+    // directory entry); on failure the rename may revert to the old file on a
+    // crash, which is logged loudly because later appends would then be lost.
+    if let Some(parent) = aof_path.parent().filter(|p| !p.as_os_str().is_empty())
+        && let Err(e) = crate::persistence::fsync::fsync_directory(parent)
+    {
+        tracing::error!(
+            "rewrite_aof_sharded_sync (tokio): fsync of {} after publishing {} failed: {}; \
+             the new AOF may not survive a power loss",
+            parent.display(),
+            aof_path.display(),
+            e
+        );
+    }
     // task #35: aof_path now points at a brand-new file (RDB base only) —
     // replay always starts a segment at db 0.
     *last_db = 0;
@@ -1833,3 +1850,7 @@ mod fold_tests {
         assert!(contains(&incr, b"new"), "post-snapshot records are written");
     }
 }
+
+#[cfg(test)]
+#[path = "rewrite/flat_file_fold_tests.rs"]
+mod flat_file_fold_tests;
