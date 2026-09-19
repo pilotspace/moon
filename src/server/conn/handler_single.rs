@@ -2239,6 +2239,12 @@ pub async fn handle_connection(
                                     };
                                     let mut graph_aof_failed = false;
                                     let mut graph_barrier_needed = false;
+                                    // #455: read once, before any enqueue can
+                                    // park — no await since the graph mutation.
+                                    let fold_stamp = aof_pool.as_ref().map_or(
+                                        crate::persistence::aof::FoldEpoch::INITIAL,
+                                        |pool| pool.fold_stamp(0),
+                                    );
                                     for record in wal_records {
                                         if let Some(ref pool) = aof_pool {
                                             // Single-shard mode (shard_id = 0).
@@ -2249,7 +2255,13 @@ pub async fn handle_connection(
                                             let bytes = bytes::Bytes::from(record);
                                             let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
                                             match pool
-                                                .send_append_group(0, lsn, conn.selected_db, bytes)
+                                                .send_append_group(
+                                                    0,
+                                                    lsn,
+                                                    conn.selected_db,
+                                                    bytes,
+                                                    fold_stamp,
+                                                )
                                                 .await
                                             {
                                                 Ok(true) => graph_barrier_needed = true,
