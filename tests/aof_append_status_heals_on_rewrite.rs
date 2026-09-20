@@ -79,7 +79,7 @@ fn spawn(shards: u32) -> Server {
                 "--disk-free-min-pct",
                 "0",
             ])
-            .env("MOON_TEST_AOF_FSYNC_STALL_MS", "0")
+            .env("MOON_TEST_AOF_FSYNC_STALL_MS", "1500")
             .stdout(std::process::Stdio::null())
             .stderr(common::server_stderr(&dir))
             .spawn()
