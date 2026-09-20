@@ -199,6 +199,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A parked `XREADGROUP` is answered at once when its stream or group goes
+  away** (moon#1086). Redis unblocks a group reader when any write deletes
+  or retypes its stream or destroys its group; moon left it parked until its
+  own timeout and then answered nil. Every such change now answers it
+  immediately, with redis-server 8.6.1's text: `-NOGROUP No such key 'k' or
+  consumer group 'g' in XREADGROUP with GROUP option` after `DEL`, `UNLINK`,
+  `RENAME` away, `MOVE`, `SWAPDB`, `FLUSHDB`, `FLUSHALL`, `XGROUP DESTROY` or
+  expiry, and `-WRONGTYPE` after `SET` or a `RENAME` of another type onto it —
+  on the connection, inside `MULTI`, from a script, and across shards. A write
+  that names the key signals it directly (while a group reader is parked, the
+  ready-key gate admits every write, not only list/zset/stream writers, and
+  an inline `SET` takes the generic path); a flush, the source side of a
+  `MOVE` and an expiry mark the shard for a recheck its 10 ms blocking tick
+  runs. `XREAD` waiters stay parked, as in redis. The same text now answers
+  an `XREADGROUP` issued against a missing key or group (it said `ERR The
+  XREADGROUP subcommand requires the key to exist.` or `NOGROUP No such
+  consumer group for key name`). A multi-stream `XREADGROUP` now checks
+  every stream, group and id before it reads any stream. It used to move the
+  first stream's entries into the PEL and then fail on the second. Ids are
+  checked with redis's texts:
+  - `$` and `+` get `ERR The $ ID is meaningless in the context of XREADGROUP: ...`
+    (and the `+` form of it) instead of being parsed.
+  - A malformed id (`-`, `bad`, `1-x`, an out-of-range number) gets `ERR Invalid stream ID
+    specified as stream command argument`. `+` and `-` used to be accepted as ids.
+
+- **A blocked `XREADGROUP` that times out as it is served no longer strands
+  entries in its PEL** (moon#1047). The owner's stream waker ran the read —
+  moving the entries into the consumer's PEL and advancing the cursor —
+  before claiming a remote waiter; a waiter whose timeout settled its claim in
+  between answered nil while the entries sat undelivered in its PEL, and a
+  `>` loop never saw them again. The waker now claims first and reads only on
+  a won claim, the claim-token order moon#1045 gave the list and zset wakers.
+  The readiness check before the claim is read-only. It used to take the
+  stream mutably, and a wake that served nothing then aborted every `EXEC`
+  watching the stream. A consumer the check must create does not signal
+  watchers, as in redis.
+
+- **`XCLAIM` honours its options** (moon#1104). Every argument that parsed as
+  a stream id was claimed, so `RETRYCOUNT 1` claimed entry `1-0` and a
+  `TIME` value claimed another, and `IDLE`, `TIME`, `RETRYCOUNT`, `FORCE`,
+  `JUSTID` and `LASTID` were ignored — which also meant the records redis
+  propagates for a group read (and moon now logs) could not be replayed. The
+  ids now run until the first non-id argument and every option is applied as
+  in redis 8.6.1, with its error texts: `NOGROUP No such key 'k' or consumer
+  group 'g'` for a missing key or group (it answered an empty array),
+  `Unrecognized XCLAIM option`, and the `Invalid ... argument for XCLAIM`
+  family.
+
+- **A blocking `XREADGROUP` that delivers is logged, and survives `kill -9`**
+  (moon#1104). A consumer-group read moves what it delivers into the PEL and
+  advances the group's last-delivered id, but through `BLOCK` it went through
+  the blocking intercept and nothing reached the AOF or the replication
+  stream: after a restart the PEL was empty, the cursor was back, and the next
+  `>` reader was handed the same entries again (every row of the new kill -9
+  test, `--shards 1` and `--shards 4`, immediate and parked, with and without
+  `NOACK`). The shard that serves the read now logs, in the read's own
+  synchronous stretch and before the reply leaves, what redis-server 8.6.1
+  propagates for it: one `XCLAIM key group consumer 0 id TIME t RETRYCOUNT n
+  FORCE JUSTID LASTID id` per delivered entry, `XGROUP SETID` for the cursor,
+  and `XGROUP CREATECONSUMER` for a `NOACK` read that created its consumer
+  (`ENTRIESREAD` is omitted because moon keeps no such counter, and the
+  records are not wrapped in `MULTI`, which moon's log never carries). Under
+  `appendfsync always` the reader confirms the fsync on the stream owner's
+  writer, as a blocking pop does; a record the writer refuses answers the
+  reader with the standard `MOONERR AOF backpressure` error.
+
+- **A cross-shard `COPY` keeps the source's absolute expiry** (moon#1095). The
+  TTL crossed as a relative duration — `PTTL` read on the source shard's
+  cached clock, `PEXPIRE` re-anchored on the destination's — so the copy's
+  deadline moved by the drift between the two (measured: `PTTL` 500004 after
+  `PEXPIRE 500000`; 5 to 32 of 64 copies moved per run). The copy now carries
+  the source's `PEXPIRETIME` and is written as one `SET dst v PXAT <deadline>
+  [NX]`, which also closes the window in which a crash between the old `SET`
+  and `PEXPIRE` left a copy that never expired. Every other cross-shard hop
+  that could carry a TTL was audited: `RENAME`/`RENAMENX`, `SMOVE`,
+  `LMOVE`/`BLMOVE`, `SORT ... STORE` and the `*STORE` family are refused across
+  shards (`CROSSSLOT`, moon#592/#570), and `MOVE` / `COPY ... DB n` stay on one
+  shard, carrying the stored entry and its absolute deadline.
+
+- **`MOVE` and `COPY ... DB n` work inside scripts, and land where the effect
+  record says** (moon#1068). A script reaches the keyspace through the one
+  database it runs in, so `redis.call('MOVE', k, n)` answered `ERR MOVE requires
+  handler-level dispatch`, and `redis.call('COPY', a, b, 'DB', n)` answered `:1`
+  while writing `b` into the SCRIPT's database — and logged `COPY a b DB n` to
+  the AOF and the replication stream, which a replica and a restart apply into
+  db `n`. Both now run from `EVAL`, `EVALSHA`, `FCALL` and a script queued in
+  `MULTI` exactly as on the connection, as redis 8.6.1 does: the reply, the
+  landing database, the key's absolute deadline, `REPLACE`, redis's errors for
+  the script's own db and an out-of-range db, and one verbatim effect record on
+  `:1` only. A client blocked on the key in the destination database is served
+  once the script returns, after the record is logged (the moon#1056 rule), so
+  a restart neither loses nor resurrects the element it popped.
+
 - **`scripts/test-consistency.sh`: six rows no longer fail with `CROSSSLOT`
   at `--shards 4`** (moon#1106). `ZRANGESTORE still-negative stop` and five
   CLIENT TRACKING destination controls named keys on different shards, so

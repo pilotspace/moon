@@ -312,7 +312,7 @@ fn record_exec_wakes(
     cmd: &[u8],
     args: &[Frame],
 ) {
-    if !wake_armed || !crate::blocking::wakeup::may_ready_a_key(cmd) {
+    if !wake_armed || !crate::blocking::wakeup::may_wake(cmd) {
         return;
     }
     crate::blocking::wakeup::for_each_written_key(cmd, args, |k| {
