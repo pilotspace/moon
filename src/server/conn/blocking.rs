@@ -2858,6 +2858,17 @@ pub(crate) fn try_inline_dispatch(
         return 0;
     }
 
+    // ---- Parked XREADGROUP gate (moon#1086) ----
+    //
+    // A `SET` over a stream that a parked `XREADGROUP` waits on owes that
+    // reader `-WRONGTYPE` now. Only the generic write tail raises the
+    // ready-key signal (`wakeup::ready_keys`), so while a group reader is
+    // parked on this shard a SET takes the generic path. One thread-local
+    // read otherwise; before anything is consumed.
+    if crate::blocking::group_readers_parked_here() {
+        return 0;
+    }
+
     // ---- CLIENT PAUSE pre-gate (moon#660: MUST precede `read_buf` consumption) ----
     //
     // `client_pause::check_pause` is consulted once per FRAME in the generic

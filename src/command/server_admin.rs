@@ -67,6 +67,8 @@ pub fn flushdb(db: &mut Database, args: &[Frame]) -> Frame {
         return Frame::Error(Bytes::from_static(b"ERR syntax error"));
     }
     db.clear();
+    // moon#1086: a parked XREADGROUP may have lost its stream.
+    crate::blocking::wakeup::note_unsignalled_removal();
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
@@ -87,6 +89,8 @@ pub fn flushall(db: &mut Database, args: &[Frame]) -> Frame {
         return Frame::Error(Bytes::from_static(b"ERR syntax error"));
     }
     db.clear();
+    // moon#1086: a parked XREADGROUP may have lost its stream.
+    crate::blocking::wakeup::note_unsignalled_removal();
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
@@ -125,6 +129,7 @@ pub fn flush_every_database_locked(databases: &[parking_lot::RwLock<Database>]) 
     for database in databases {
         database.write().clear();
     }
+    crate::blocking::wakeup::note_unsignalled_removal();
 }
 
 fn check_flush_args(args: &[Frame]) -> bool {

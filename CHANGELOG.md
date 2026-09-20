@@ -199,6 +199,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A parked `XREADGROUP` is answered at once when its stream or group goes
+  away** (moon#1086). Redis unblocks a group reader when any write deletes
+  or retypes its stream or destroys its group; moon left it parked until its
+  own timeout and then answered nil. Every such change now answers it
+  immediately, with redis-server 8.6.1's text: `-NOGROUP No such key 'k' or
+  consumer group 'g' in XREADGROUP with GROUP option` after `DEL`, `UNLINK`,
+  `RENAME` away, `MOVE`, `SWAPDB`, `FLUSHDB`, `FLUSHALL`, `XGROUP DESTROY` or
+  expiry, and `-WRONGTYPE` after `SET` or a `RENAME` of another type onto it —
+  on the connection, inside `MULTI`, from a script, and across shards. A write
+  that names the key signals it directly (while a group reader is parked, the
+  ready-key gate admits every write, not only list/zset/stream writers, and
+  an inline `SET` takes the generic path); a flush, the source side of a
+  `MOVE` and an expiry mark the shard for a recheck its 10 ms blocking tick
+  runs. `XREAD` waiters stay parked, as in redis. The same text now answers
+  an `XREADGROUP` issued against a missing key or group (it said `ERR The
+  XREADGROUP subcommand requires the key to exist.` or `NOGROUP No such
+  consumer group for key name`). A multi-stream `XREADGROUP` now checks
+  every stream, group and id before it reads any stream. It used to move the
+  first stream's entries into the PEL and then fail on the second. Ids are
+  checked with redis's texts:
+  - `$` and `+` get `ERR The $ ID is meaningless in the context of XREADGROUP: ...`
+    (and the `+` form of it) instead of being parsed.
+  - A malformed id (`-`, `bad`, `1-x`, an out-of-range number) gets `ERR Invalid stream ID
+    specified as stream command argument`. `+` and `-` used to be accepted as ids.
+
 - **A blocked `XREADGROUP` that times out as it is served no longer strands
   entries in its PEL** (moon#1047). The owner's stream waker ran the read —
   moving the entries into the consumer's PEL and advancing the cursor —
