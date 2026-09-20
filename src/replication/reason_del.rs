@@ -157,7 +157,9 @@ pub(crate) fn record_reason_del(
 fn record_reason_del_dropped(key: &[u8]) {
     crate::persistence::aof::AOF_REASON_DEL_DROPPED
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    crate::persistence::aof::AOF_LAST_APPEND_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+    // `aof_last_append_status` is already `err`: the pool's drop site
+    // recorded this loss against its writer (`record_append_dropped`), which
+    // is what lets a later rewrite that covers it clear the status again.
     tracing::error!(
         "reason-DEL LOST for key {:?}: AOF writer saturated past the escalated bound — \
          restart replay will RESURRECT this key unless a rewrite completes first",
@@ -493,8 +495,12 @@ mod tests {
             "dropped reason-DEL must increment AOF_REASON_DEL_DROPPED (before={before}, after={after})"
         );
         assert!(
-            !crate::persistence::aof::AOF_LAST_APPEND_OK.load(std::sync::atomic::Ordering::Relaxed),
-            "dropped reason-DEL must latch aof_last_append_status:err"
+            pool.overflow_for(0).is_missing_appends(),
+            "dropped reason-DEL must mark its writer as missing an append"
+        );
+        assert!(
+            !crate::persistence::aof::aof_last_append_ok(),
+            "dropped reason-DEL must report aof_last_append_status:err"
         );
         drop(rx);
     }

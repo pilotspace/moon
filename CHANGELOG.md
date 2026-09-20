@@ -219,6 +219,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time, and appending only the missing marker to it recovers correctly), and
   present on `3b596be0` too — it predates moon#1085, moon#1075 and moon#1118.
 
+- **Waiters a refused AOF record left parked are served once the writer has
+  room** (moon#1111). When the AOF writer could not take a served pop's
+  record within the backpressure bound, the wake stopped (every further serve
+  would have waited out another bound on the shard thread) and the waiters
+  behind it stayed parked beside data until another write to the key or their
+  own timeout — never, for `BLPOP k 0` on a queue whose producer went quiet.
+  The key is now remembered and retried by the shard's 10 ms blocking tick as
+  soon as the writer has room again (never while it is still full, so the
+  retry spends no bound on the shard thread), each serve still logged in its
+  own synchronous stretch; stream group readers skipped for the same reason
+  are retried the same way.
+
+- **Becoming a replica releases every blocked client.** A client parked
+  on a node that then ran `REPLICAOF host port` stayed parked. Before the
+  fix above, nothing woke it until its timeout. After it, the first
+  replicated push served it: a `BLPOP` took the element out of the
+  replica's copy only. Every parked client is now answered `-UNBLOCKED force unblock from
+  blocking operation, instance state changed (master -> replica?)` and its
+  connection closed, dropping anything pipelined behind the blocking
+  command. That is redis's `disconnectAllBlockedClients` (text and close
+  checked against redis-server 8.6.1, for `BLPOP`, `XREADGROUP` and `XREAD`).
+
+- **A replica wakes the clients blocked on what replication writes**
+  (moon#1096). Every write a replica holds arrives through
+  `replication::apply`, and nothing there reached the ready-key hook, so an
+  `XREAD BLOCK` parked on a replica answered nil at its own timeout while
+  its stream filled. Each applied command now serves the clients blocked on
+  the keys it wrote, through the master's own hook — its written keys, both
+  databases of a `SWAPDB`, the destination of a `MOVE`/`COPY ... DB n` —
+  after the write is applied, as redis does (`signalKeyAsReady` from the
+  keyspace write; measured against redis-server 8.6.1: woken 0.41 s after a
+  master `XADD` issued 0.4 s into the wait, also through `MULTI`, `MOVE` and
+  `SWAPDB`). Blocking pops and `XREADGROUP` stay refused with `-READONLY` on
+  a replica, in both servers.
+
 - **A parked `XREADGROUP` is answered at once when its stream or group goes
   away** (moon#1086). Redis unblocks a group reader when any write deletes
   or retypes its stream or destroys its group; moon left it parked until its
@@ -512,6 +547,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-place cold-page write can reach it. Pinned by the tests in
   `shard::persistence_tick::checkpoint_tick_tests`,
   `persistence::data_file_sync` and `persistence::page_cache`.
+
+- **`aof_last_append_status` and `aof_last_write_status` return to `ok` after a
+  rewrite that covers the dropped append** (moon#1094). The status latched to
+  `err` at the first dropped acked append and stayed there for the life of the
+  process, even after `BGREWRITEAOF` folded the live keyspace, the dropped
+  write included, into a fresh base. Each AOF writer now tags a drop with its
+  fold epoch, and clears it when a fold COMMITS whose snapshot was taken after
+  that drop (the same `folded_below` rule moon#455 uses to drop records the
+  new base already holds). A drop after the snapshot, an aborted fold, or a
+  drop on another writer keeps `err`; with the PerShard layout the status is
+  the AND across writers. Redis clears `aof_last_write_status` on the next
+  successful write because it keeps the failed data in `aof_buf` and retries
+  it; moon drops the record, so only a covering rewrite makes the log whole.
+  A reason-DEL drop no longer sets a second, never-clearing latch of its own.
 
 - **An AOF rewrite no longer replays a write twice, and a rewrite that fails
   late no longer leaves the writer appending to a deleted file** (moon#455).

@@ -277,6 +277,7 @@ impl ApplyOutcome {
 pub(crate) fn apply_local(
     rc: &ReplCommand,
     shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
+    blocking_registry: Option<&std::cell::RefCell<crate::blocking::BlockingRegistry>>,
 ) -> ApplyOutcome {
     use crate::command::{DispatchResult, dispatch as cmd_dispatch};
     use crate::shard::spsc_handler::extract_command_static;
@@ -308,6 +309,7 @@ pub(crate) fn apply_local(
             None => ApplyOutcome::NoShardSlice,
         };
     }
+    let mut wake = ReplicaWake::None;
     let result = crate::shard::slice::try_with_shard(|s| -> bool {
         let db_count = s.databases.db_count();
         if db_count == 0 {
@@ -374,7 +376,9 @@ pub(crate) fn apply_local(
         // level") and `warn_on_error` only logs — so without this intercept
         // every streamed SWAPDB silently no-ops on the replica.
         if cmd.eq_ignore_ascii_case(b"SWAPDB") {
-            apply_swapdb(cmd, args, &s.databases);
+            if let Some((a, b)) = apply_swapdb(cmd, args, &s.databases) {
+                wake = ReplicaWake::Swapped(a, b);
+            }
             return true;
         }
 
@@ -387,6 +391,11 @@ pub(crate) fn apply_local(
         if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
             if let Some(resp) = apply_two_db(cmd, args, &s.databases, db_idx, db_count) {
                 warn_on_error(cmd, &resp);
+                if let Some((dst_db, key)) =
+                    crate::blocking::wakeup::cross_db_write_target(cmd, args, db_idx, db_count)
+                {
+                    wake = ReplicaWake::CrossDb(dst_db, key, resp);
+                }
                 return true;
             }
             // COPY with no DB clause / same-db COPY: fall through to dispatch.
@@ -413,14 +422,52 @@ pub(crate) fn apply_local(
         // `auto_delete_vectors` docs).
         if !matches!(resp, Frame::Error(_)) {
             apply_index_parity_hooks(s, cmd, args, db_idx as u8);
+            wake = ReplicaWake::Written(db_idx);
         }
         warn_on_error(cmd, &resp);
         true
     });
+    // moon#1096: serve the clients blocked on what this write touched, as
+    // the master's own write paths do (`wakeup::wake_written_keys` and its
+    // SWAPDB / MOVE / COPY ... DB twins) — outside the slice borrow above,
+    // after the write is applied. Redis does the same on a replica:
+    // `signalKeyAsReady` runs from the keyspace write whoever issued it, and
+    // the ready keys are served after each command applied from the master.
+    // On a read-only replica only `XREAD BLOCK` can be parked (every blocking
+    // pop is a write and answers `-READONLY`, in redis and here), but the
+    // hook is the same one, so nothing here is stream-specific.
+    if let Some(registry) = blocking_registry {
+        match wake {
+            ReplicaWake::None => {}
+            ReplicaWake::Written(db) => {
+                crate::blocking::wakeup::wake_written_keys_on_shard(registry, db, cmd, args);
+            }
+            ReplicaWake::Swapped(a, b) => {
+                crate::blocking::wakeup::wake_swapped_dbs(registry, a, b);
+            }
+            ReplicaWake::CrossDb(dst_db, key, resp) => {
+                crate::blocking::wakeup::wake_cross_db_write_on_shard(
+                    registry, dst_db, &key, &resp,
+                );
+            }
+        }
+    }
     match result {
         Some(ok) => ApplyOutcome::from_poison_bool(ok),
         None => ApplyOutcome::NoShardSlice,
     }
+}
+
+/// Which keys an applied replicated write made ready (moon#1096).
+enum ReplicaWake {
+    /// Nothing a blocked client could be served from.
+    None,
+    /// A generic write in this db: its written keys.
+    Written(usize),
+    /// `SWAPDB a b`: every waited key of both.
+    Swapped(usize, usize),
+    /// `MOVE` / `COPY ... DB n`: the key it wrote in `dst_db`, and its reply.
+    CrossDb(usize, bytes::Bytes, Frame),
 }
 
 /// Apply a replicated `WS.CREATE.APPLY` record (Wave B ws-plane): install the
@@ -830,7 +877,11 @@ fn warn_on_error(cmd: &[u8], resp: &Frame) {
 /// skip with a warn: the replica must never poison its stream over an index
 /// the master accepted (e.g. a replica configured with fewer `--databases`),
 /// it just can't honor it.
-fn apply_swapdb(cmd: &[u8], args: &[Frame], databases: &crate::shard::db_plane::ShardDbSet) {
+fn apply_swapdb(
+    cmd: &[u8],
+    args: &[Frame],
+    databases: &crate::shard::db_plane::ShardDbSet,
+) -> Option<(usize, usize)> {
     let parse_idx = |f: &Frame| match f {
         Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse::<usize>().ok(),
         Frame::Integer(n) => usize::try_from(*n).ok(),
@@ -843,14 +894,16 @@ fn apply_swapdb(cmd: &[u8], args: &[Frame], databases: &crate::shard::db_plane::
     ) {
         (Some(a), Some(b)) if a != b && a < db_count && b < db_count => {
             databases.swap(a, b);
+            Some((a, b))
         }
-        (Some(a), Some(b)) if a == b => {} // same-index: no-op, matches Redis
+        (Some(a), Some(b)) if a == b => None, // same-index: no-op, matches Redis
         _ => {
             tracing::warn!(
                 "replication apply: skipping {} with unusable args (out of range for {} local dbs)",
                 String::from_utf8_lossy(cmd),
                 db_count
             );
+            None
         }
     }
 }
@@ -1360,7 +1413,7 @@ mod tests {
             // GRAPH.ADDNODE with a missing required arg — `collect_command`
             // rejects it (wrong shape), never a valid mutation.
             let rc = repl_cmd(b"GRAPH.ADDNODE", &[b"mygraph"]);
-            apply_local(&rc, shard_databases)
+            apply_local(&rc, shard_databases, None)
         });
         assert!(
             matches!(outcome, ApplyOutcome::Poisoned),
@@ -1382,7 +1435,7 @@ mod tests {
             // Missing the single payload bulk-string arg every MQ._REPL.*
             // record requires.
             let rc = repl_cmd(MQ_REPL_PUSH, &[]);
-            apply_local(&rc, shard_databases)
+            apply_local(&rc, shard_databases, None)
         });
         assert!(
             matches!(outcome, ApplyOutcome::Poisoned),
@@ -1400,7 +1453,7 @@ mod tests {
         let outcome = on_fresh_shard(|shard_databases| {
             // Wrong arg count (`parse_invalidate_at` requires exactly 4).
             let rc = repl_cmd(b"TEMPORAL.INVALIDATE-AT", &[b"g", b"N"]);
-            apply_local(&rc, shard_databases)
+            apply_local(&rc, shard_databases, None)
         });
         assert!(
             matches!(outcome, ApplyOutcome::Poisoned),
@@ -1415,7 +1468,7 @@ mod tests {
         let before = poison_count();
         let (outcome, registry_after) = on_fresh_shard(|shard_databases| {
             let rc = repl_cmd(crate::workspace::repl::WS_CREATE_APPLY_CMD, &[]); // missing payload
-            let outcome = apply_local(&rc, shard_databases);
+            let outcome = apply_local(&rc, shard_databases, None);
             let count = shard_databases
                 .workspace_registry()
                 .as_ref()
@@ -1439,7 +1492,7 @@ mod tests {
         let before = poison_count();
         let outcome = on_fresh_shard(|shard_databases| {
             let rc = repl_cmd(crate::workspace::repl::WS_DROP_APPLY_CMD, &[]); // missing payload
-            apply_local(&rc, shard_databases)
+            apply_local(&rc, shard_databases, None)
         });
         assert!(
             matches!(outcome, ApplyOutcome::Poisoned),
@@ -1454,7 +1507,7 @@ mod tests {
         let before = poison_count();
         let outcome = on_fresh_shard(|shard_databases| {
             let rc = repl_cmd(b"SET", &[b"k", b"v"]);
-            apply_local(&rc, shard_databases)
+            apply_local(&rc, shard_databases, None)
         });
         assert!(matches!(outcome, ApplyOutcome::Applied));
         assert_eq!(
