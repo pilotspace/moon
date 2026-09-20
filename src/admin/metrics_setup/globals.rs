@@ -189,11 +189,14 @@ static GLOBAL_SLOWLOG: once_cell::sync::Lazy<crate::admin::slowlog::Slowlog> =
 /// Must be called before any command processing. If called after commands
 /// have already been recorded, the old entries are lost (new instance).
 /// In practice this is called once from main() before shards start.
-pub fn init_global_slowlog(max_len: usize, threshold_us: u64) {
+pub fn init_global_slowlog(max_len: usize, threshold_us: i64) {
     // Force initialization of the Lazy with default, then reconfigure.
     // Since Slowlog fields are behind a Mutex, we just reset.
     let sl = global_slowlog();
     sl.reconfigure(max_len, threshold_us);
+    // Calibrate the per-command clock here, before any shard accepts a
+    // connection, rather than on the first timed command (moon#994).
+    crate::admin::metrics_setup::init_command_clock();
 }
 
 /// Get a reference to the global slowlog.

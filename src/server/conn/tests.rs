@@ -58,12 +58,13 @@ fn inline_test_lock() -> parking_lot::MutexGuard<'static, ()> {
     crate::client_pause::pause_test_lock()
 }
 
-/// moon#963: the inline fast path times what it serves. 16 inline `GET`s on
-/// one probe produce exactly one sampled tick, and that sample carries the
-/// command's argv into the slowlog — so `SLOWLOG` and the duration histogram
-/// both see the path that answers plain `GET`/`SET`. Deleting the
+/// moon#963: the inline fast path times what it serves, and each timed
+/// command carries its argv into the slowlog — so `SLOWLOG` and the duration
+/// histogram both see the path that answers plain `GET`/`SET`. Deleting the
 /// `probe.observe` wrap around the lookup (the pre-fix shape) leaves the
-/// slowlog empty and this fails.
+/// slowlog empty and this fails. moon#994: with the slowlog enabled EVERY
+/// inline command is timed, not one in sixteen — 3 `GET`s then 3 `SET`s on
+/// one short-lived probe leave six entries.
 #[test]
 fn inline_get_and_set_are_observed_by_the_probe() {
     let _serial = inline_test_lock();
@@ -107,10 +108,10 @@ fn inline_get_and_set_are_observed_by_the_probe() {
         assert_eq!(n, 1, "the command must have been served inline");
         assert!(read_buf.is_empty());
     };
-    for _ in 0..16 {
+    for _ in 0..3 {
         run(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n", true, false);
     }
-    for _ in 0..16 {
+    for _ in 0..3 {
         run(
             b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbaz\r\n",
             false,
@@ -120,11 +121,7 @@ fn inline_get_and_set_are_observed_by_the_probe() {
     drop(probe);
 
     let entries = slowlog.get(None);
-    assert_eq!(
-        entries.len(),
-        2,
-        "one sampled tick per 16 commands: {entries:?}"
-    );
+    assert_eq!(entries.len(), 6, "every command is timed: {entries:?}");
     // Most recent first.
     assert_eq!(
         entries[0].command,
@@ -135,7 +132,7 @@ fn inline_get_and_set_are_observed_by_the_probe() {
         ]
     );
     assert_eq!(
-        entries[1].command,
+        entries[3].command,
         vec![Bytes::from_static(b"GET"), Bytes::from_static(b"foo")]
     );
     assert_eq!(entries[0].client_addr, Bytes::from_static(b"127.0.0.1:7"));

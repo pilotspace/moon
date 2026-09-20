@@ -177,9 +177,8 @@ fn bump_total_commands() {
 }
 
 /// Count `n` commands in this thread's total-commands slot as ONE relaxed
-/// add. [`LatencyProbe`] flushes through here on drop, which is what lets the
-/// inline loop (moon#660) keep its per-batch accounting while sharing the
-/// generic paths' spelling. `n == 0` costs nothing.
+/// add. The inline loop (moon#660) books its whole batch through here before
+/// it answers. `n == 0` costs nothing.
 #[inline]
 pub(crate) fn bump_total_commands_by(n: u64) {
     if n == 0 {
@@ -188,6 +187,57 @@ pub(crate) fn bump_total_commands_by(n: u64) {
     COMMAND_COUNTER_SLOT.with(|&slot| {
         COMMAND_COUNTERS[slot].0.fetch_add(n, Ordering::Relaxed);
     });
+}
+
+// ── moon#775 / moon#1002: ONE client-command boundary ───────────────────
+//
+// `total_commands_processed` means what redis means by it: commands the
+// CLIENT issued that executed. It is counted where the connection handler
+// admits a command for execution — never where a shard executes a piece of
+// one. The two used to be the same place only at `--shards 1`:
+//
+// - a routed command was counted by the SHARD that ran it, and a coordinator
+//   command (4-key `MSET`, `DEL`, `KEYS`, `DBSIZE`, ...) once per LEG it was
+//   split into — 3-5x high at `--shards 4` (moon#1002);
+// - every command answered by a connection-level intercept (`INFO`, `MULTI`,
+//   `EXEC`, `EVAL`, blocking commands, `CONFIG`, ...) was never counted at
+//   all, because the counter rode the dispatch-time latency probe and those
+//   commands never reach dispatch;
+// - the inline `GET`/`SET` fast path, the ONE path redis-benchmark exercises,
+//   had no counter before #993, which is moon#775's "dead on Linux".
+//
+// The counting rule (redis's): a command counts when it passes admission
+// (known name, right arity, authorized, not queued inside MULTI) — it then
+// executes, even if it fails. `EXEC` adds the queued commands it runs, and a
+// script adds every `redis.call` it issues, because redis runs each of those
+// through `call()` too.
+
+/// Count one client command that has passed the connection-level admission
+/// gates, if redis would have admitted its name, arity and subcommand (see
+/// `metadata::admits_command`). `meta` is the caller's
+/// `metadata::lookup(cmd)`; `args` excludes the command name.
+#[inline]
+pub fn count_client_command(
+    meta: Option<&crate::command::metadata::CommandMeta>,
+    cmd: &[u8],
+    args: &[crate::protocol::Frame],
+) {
+    if crate::command::metadata::admits_command(meta, cmd, args) {
+        bump_total_commands();
+    }
+}
+
+/// [`count_client_command`] for a site that has not looked the name up.
+#[inline]
+pub fn count_client_command_by_name(cmd: &[u8], args: &[crate::protocol::Frame]) {
+    count_client_command(crate::command::metadata::lookup(cmd), cmd, args);
+}
+
+/// Count `n` commands a transaction's `EXEC` ran (the queued commands, which
+/// were not counted when they were queued), or an inline batch answered.
+#[inline]
+pub fn count_client_commands(n: u64) {
+    bump_total_commands_by(n);
 }
 
 /// This thread's slot of the sharded total-commands counter. Used by the

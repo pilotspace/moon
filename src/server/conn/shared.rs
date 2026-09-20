@@ -2943,6 +2943,24 @@ impl PubSubTeardown for parking_lot::Mutex<crate::pubsub::PubSubRegistry> {
     }
 }
 
+/// Count the queued commands an `EXEC` just ran (moon#775).
+///
+/// A queued command is not counted when it is queued (it has not executed);
+/// redis counts it when `EXEC` runs it, through the same `call()` as any
+/// other command. The EXEC reply is the proof of what ran: an array holds one
+/// reply per executed command (errors included — a command that ran and
+/// failed still ran), while an aborted transaction answers `EXECABORT`, a
+/// failed `WATCH` answers a null, and `EXEC` without `MULTI` an error — none
+/// of which ran anything. `EXEC` itself is counted at the client boundary.
+#[inline]
+pub(crate) fn count_exec_body(cmd: &[u8], reply: Option<&Frame>) {
+    if cmd.eq_ignore_ascii_case(b"EXEC")
+        && let Some(Frame::Array(items)) = reply
+    {
+        crate::admin::metrics_setup::count_client_commands(items.len() as u64);
+    }
+}
+
 /// Commands that EXECUTE while a transaction is open instead of queueing.
 ///
 /// Redis's list is exactly six: MULTI, EXEC, DISCARD, WATCH, RESET, QUIT.

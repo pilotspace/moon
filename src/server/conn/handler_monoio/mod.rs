@@ -613,6 +613,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 match codec.decode_frame(&mut read_buf) {
                                     Ok(Some(frame)) => {
                                         if let Some((cmd, cmd_args)) = extract_command(&frame) {
+                                            // moon#775: a subscribed connection's commands are
+                                            // client commands too; the refused ones (outside the
+                                            // allow-list) never execute and are not counted.
+                                            if crate::server::conn::subscriber_mode::allowed_in_subscriber_mode(cmd) {
+                                                crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
+                                            }
                                             match cmd {
                                                 _ if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") => {
                                                     if cmd_args.is_empty() {
@@ -1664,9 +1670,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             crate::shard::slice::refresh_db_clock(conn.selected_db, &ctx.cached_clock);
             // moon#963: one probe per batch. Every command the loop inlines
             // is timed through it (the parameter is mandatory — see
-            // `try_inline_dispatch`), and dropping it lands the whole batch
-            // in `total_commands_processed` as ONE add, which is the
-            // moon#660 accounting this site used to do by hand.
+            // `try_inline_dispatch`).
             let mut probe = crate::admin::metrics_setup::LatencyProbe::new(
                 &mut conn.sampler,
                 &mut conn.cached_metrics,
@@ -1702,6 +1706,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 &mut probe,
             );
             drop(probe);
+            // moon#775: the inline loop is a client-command boundary of its
+            // own — every command it answers is one the client sent — so the
+            // batch lands in `total_commands_processed` here, as ONE add
+            // (moon#660), before any reply is written.
+            crate::admin::metrics_setup::count_client_commands(inlined as u64);
             crate::admin::metrics_setup::record_dispatch_local_inline(inlined as u64);
             if inlined > 0 && read_buf.is_empty() {
                 // All commands were inlined -- flush write_buf and continue
@@ -1903,8 +1912,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 };
             }
             // --- QUIT ---
+            //
+            // moon#775: the connection-state verbs answered here, before the
+            // client-command boundary further down, execute too — each counts
+            // itself on the way out.
             if cmd.eq_ignore_ascii_case(b"QUIT") {
                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                 should_quit = true;
                 break;
             }
@@ -1913,6 +1927,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if cmd.eq_ignore_ascii_case(b"ASKING") {
                 conn.asking = true;
                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                 continue;
             }
 
@@ -1922,6 +1937,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // measured refusal rather than a misleading +OK, because a
             // client that gets +OK believes replica reads are enabled.
             if cmd.eq_ignore_ascii_case(b"READONLY") || cmd.eq_ignore_ascii_case(b"READWRITE") {
+                crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                 if let Some(err) = crate::cluster::readonly_verb_reply(cmd, cmd_args) {
                     responses.push(err);
                     continue;
@@ -2040,6 +2056,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     shaped!(),
                 )
             {
+                crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                 continue;
             }
             if !conn.in_multi
@@ -2057,6 +2074,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     None,
                 )
             {
+                crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                 continue;
             }
             // RESET sits ABOVE the ACL gate deliberately: the registry marks it
@@ -2078,6 +2096,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     Some(&mut codec),
                 )
             {
+                crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                 continue;
             }
 
@@ -2240,6 +2259,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
 
+            // === CLIENT-COMMAND BOUNDARY (moon#775, moon#1002) ===
+            //
+            // Every command below this line has passed admission — auth, the
+            // loading gate, ACL, the workspace rewrite, and MULTI queueing —
+            // and is about to execute on SOME path: an intercept, generic
+            // dispatch, the inline cross-shard read, a routed SPSC message,
+            // the coordinator, a blocking wait. This is the one place it is
+            // counted, so it counts once however many shards or legs it then
+            // touches. The lookup is the one the name-gate below needs anyway;
+            // unknown names and wrong arities are refused by redis before
+            // `call()` and are not counted. `EXEC`'s queued commands are added
+            // where it answers.
+            let cmd_meta = crate::command::metadata::lookup(cmd);
+            crate::admin::metrics_setup::count_client_command(cmd_meta, cmd, cmd_args);
+
             // --- MONITOR: attach, and the rules that apply once attached ---
             //
             // BELOW the ACL gate and BELOW the MULTI queue gate, deliberately.
@@ -2321,7 +2355,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // Fail-safe by construction: an unknown command has no metadata and
             // an unmarked one has no bit, so both take the full chain. Only an
             // explicitly-marked command skips it.
-            let skip_name_gates = crate::command::metadata::lookup(cmd).is_some_and(|m| {
+            let skip_name_gates = cmd_meta.is_some_and(|m| {
                 m.flags
                     .contains(crate::command::metadata::CommandFlags::NO_INTERCEPT)
             }) && !conn.in_multi
@@ -2671,6 +2705,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 )
                 .await
             {
+                crate::server::conn::shared::count_exec_body(cmd, responses.last());
                 // C2: a PUBLISH or SPUBLISH (moon#1043) queued inside MULTI fans
                 // out only now — after the transaction body has been applied —
                 // into its own namespace, and its placeholder in the EXEC reply
@@ -2881,10 +2916,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let now_ms = ctx.cached_clock.ms();
                     let cur_db = conn.selected_db;
                     // moon#982: the local PART of a spanning read executes
-                    // here and is observed here; each remote part is observed
-                    // by the shard that executes it. A spanning read therefore
-                    // counts once per shard it touches — what a cluster client
-                    // splitting it per node would produce.
+                    // here and is timed here; each remote part is timed by the
+                    // shard that executes it. It is COUNTED once, at the
+                    // client-command boundary, however many parts it has
+                    // (moon#1002).
                     let mut probe = crate::admin::metrics_setup::LatencyProbe::new(
                         &mut conn.sampler,
                         &mut conn.cached_metrics,

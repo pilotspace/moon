@@ -679,6 +679,14 @@ pub fn make_redis_call_fn(
             // monitor is attached.
             crate::monitor::feed_frames(db_idx, "lua", &cmd_bytes, &frames[1..]);
 
+            // moon#775: redis runs every `redis.call` through `call()`, so each
+            // one counts in `total_commands_processed` beside the EVAL that
+            // issued it. Counted here — the one place every script command
+            // passes, on whichever shard the script runs — after the refusals
+            // above (ACL, SELECT, read-only, replica, cross-shard, OOM), which
+            // redis does not count either.
+            crate::admin::metrics_setup::count_client_command_by_name(&cmd_bytes, &frames[1..]);
+
             let frame = db.execute_command(&cmd_bytes, &frames[1..], &mut db_idx, db_count);
 
             // moon#685: a flush issued from Lua has to reach as far as the

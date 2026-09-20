@@ -1659,6 +1659,12 @@ impl super::Shard {
                 }
                 // WAL fsync + MVCC sweep on 1-second interval
                 _ = wal_sync_interval.0.tick() => {
+                    // moon#775: `instantaneous_ops_per_sec` is the delta of
+                    // `total_commands_processed` over this 1 s tick; nothing
+                    // sampled it, so INFO reported 0 under any load.
+                    if shard_id == 0 {
+                        crate::admin::metrics_setup::sample_ops_per_sec();
+                    }
                     timers::sync_wal_v3(&mut wal_writer);
                     // D1: idle-timeout enforcement, same policy and cadence as
                     // the monoio chore (the per-connection timeout wrapper it
@@ -2526,6 +2532,12 @@ impl super::Shard {
                 // P6 is gated here (not per-1ms tick) to avoid the read_dir
                 // syscall overhead of wal.stats() on the hot path.
                 if monoio_tick_counter % 1000 == 0 {
+                    // moon#775: `instantaneous_ops_per_sec` is the delta of
+                    // `total_commands_processed` over this 1 s tick; nothing
+                    // sampled it, so INFO reported 0 under any load.
+                    if shard_id == 0 {
+                        crate::admin::metrics_setup::sample_ops_per_sec();
+                    }
                     // `.tpost`: encode dirty text indexes (2 ms budget) for
                     // the off-loop writer.
                     crate::shard::slice::with_shard(|s| {

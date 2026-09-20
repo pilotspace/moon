@@ -1026,6 +1026,79 @@ pub fn is_read(cmd: &[u8]) -> bool {
     lookup(cmd).is_some_and(|m| m.flags.contains(CommandFlags::READONLY))
 }
 
+/// Whether a command passes the name and arity admission that redis applies
+/// BEFORE it executes a command — the rule `total_commands_processed` counts
+/// by (moon#775, moon#1002).
+///
+/// `args` excludes the command name. An unknown name, a wrong arity, or an
+/// unknown container subcommand (`CONFIG BOGUS`) is refused by redis without
+/// executing (`rejected_calls`), so it is not a processed command; a command
+/// that executes and fails (`WRONGTYPE`, `EXEC` without `MULTI`) is. Every
+/// case measured on redis-server 8.6.1.
+///
+/// `meta` is the caller's [`lookup`] of `cmd`, passed in so a site that
+/// already holds it pays nothing more than an integer compare. The container
+/// check costs a table probe, and only for a command without
+/// [`CommandFlags::NO_INTERCEPT`] — never a plain keyspace command.
+///
+/// A dotted name absent from the table (a module-style family intercepted
+/// before dispatch) is admitted, for the reason `queue_time_rejection` gives:
+/// refusing an unregistered family here would make a working command vanish
+/// from the counter, which is strictly worse than counting a typo.
+#[inline]
+pub fn admits_command(meta: Option<&CommandMeta>, cmd: &[u8], args: &[crate::protocol::Frame]) -> bool {
+    let Some(m) = meta else {
+        return cmd.contains(&b'.');
+    };
+    if !m.accepts_argc(args.len() + 1) {
+        return false;
+    }
+    if m.flags.contains(CommandFlags::NO_INTERCEPT) {
+        return true;
+    }
+    admits_container_subcommand(cmd, args)
+}
+
+/// The container half of [`admits_command`], out of line: `CONFIG GET`'s
+/// subcommand must be recognised and, when published, called with its own
+/// arity. A non-container, or a container called bare, is admitted here.
+#[inline(never)]
+fn admits_container_subcommand(cmd: &[u8], args: &[crate::protocol::Frame]) -> bool {
+    let Some(sub) = args.first().and_then(|f| match f {
+        crate::protocol::Frame::BulkString(b) | crate::protocol::Frame::SimpleString(b) => {
+            Some(b.as_ref())
+        }
+        _ => None,
+    }) else {
+        return true;
+    };
+    if !has_subcommands(cmd) {
+        return true;
+    }
+    match lookup_subcommand(cmd, sub) {
+        Some(s) => {
+            let given = args.len() + 1;
+            let want = s.arity.unsigned_abs() as usize;
+            if s.arity >= 0 { given == want } else { given >= want }
+        }
+        None => is_known_subcommand(cmd, sub),
+    }
+}
+
+impl CommandMeta {
+    /// `argc` (INCLUDING the command name) satisfies this command's arity:
+    /// positive = exact, negative = minimum.
+    #[inline]
+    pub fn accepts_argc(&self, argc: usize) -> bool {
+        let want = self.arity.unsigned_abs() as usize;
+        if self.arity >= 0 {
+            argc == want
+        } else {
+            argc >= want
+        }
+    }
+}
+
 /// Return the total number of commands in the registry.
 pub fn command_count() -> usize {
     COMMAND_META.len()
@@ -1249,6 +1322,19 @@ pub fn lookup_subcommand(container: &[u8], sub: &[u8]) -> Option<&'static Subcom
     let subs = SUBCOMMAND_META.get(upper)?;
     subs.iter()
         .find(|s| s.name.as_bytes().eq_ignore_ascii_case(sub))
+}
+
+/// Does `container` have a subcommand table (is it a container command)?
+pub fn has_subcommands(container: &[u8]) -> bool {
+    let len = container.len();
+    if len == 0 || len > 20 {
+        return false;
+    }
+    let mut buf = [0u8; 20];
+    for (i, &b) in container.iter().enumerate() {
+        buf[i] = b.to_ascii_uppercase();
+    }
+    std::str::from_utf8(&buf[..len]).is_ok_and(|upper| SUBCOMMAND_META.contains_key(upper))
 }
 
 /// Subcommands dispatch RECOGNISES but [`SUBCOMMAND_META`] deliberately does
@@ -1720,6 +1806,42 @@ mod tests {
     }
 
     /// Verify specific arity values match Redis conventions.
+    #[test]
+    fn admits_command_applies_redis_name_and_arity_rules() {
+        use crate::protocol::Frame;
+        fn argv(parts: &[&str]) -> Vec<Frame> {
+            parts
+                .iter()
+                .map(|p| Frame::BulkString(bytes::Bytes::copy_from_slice(p.as_bytes())))
+                .collect()
+        }
+        let admits = |cmd: &str, args: &[&str]| {
+            admits_command(lookup(cmd.as_bytes()), cmd.as_bytes(), &argv(args))
+        };
+        assert!(admits("GET", &["k"]));
+        assert!(!admits("GET", &[]), "wrong arity is refused");
+        assert!(!admits("GET", &["a", "b"]), "exact arity is exact");
+        assert!(admits("SET", &["k", "v"]));
+        assert!(admits("SET", &["k", "v", "EX", "1", "NX"]), "variadic minimum");
+        assert!(!admits("SET", &["k"]));
+        assert!(admits("PING", &[]));
+        assert!(admits("PING", &["hi"]));
+        assert!(!admits("NOSUCHCMD", &[]), "unknown name");
+        assert!(admits("NOSUCH.FAMILY", &[]), "an unregistered dotted family is not refused");
+        // Containers: redis refuses an unknown subcommand and a subcommand's
+        // wrong arity before `call()`.
+        assert!(admits("CONFIG", &["GET", "maxmemory"]));
+        assert!(!admits("CONFIG", &["BOGUS"]), "unknown subcommand");
+        assert!(!admits("CONFIG", &["GET"]), "subcommand arity");
+        assert!(admits("CLIENT", &["ID"]));
+        assert!(!admits("CLIENT", &["NOSUCH"]));
+        assert!(admits("FUNCTION", &["DUMP"]), "recognised but unpublished");
+        assert!(admits("SLOWLOG", &["LEN"]));
+        // A non-container intercepted command is not mistaken for one.
+        assert!(admits("EVAL", &["return 1", "0"]));
+        assert!(admits("INFO", &["stats"]));
+    }
+
     #[test]
     fn arity_values() {
         assert_eq!(lookup(b"GET").unwrap().arity, 2);

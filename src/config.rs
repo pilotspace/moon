@@ -62,11 +62,20 @@ pub struct ServerConfig {
     #[arg(long = "console-rate-burst", default_value_t = 2000.0)]
     pub console_rate_burst: f64,
 
-    /// Slowlog threshold in microseconds (commands slower than this are logged)
-    #[arg(long = "slowlog-log-slower-than", default_value_t = 10000)]
-    pub slowlog_log_slower_than: u64,
+    /// Slowlog threshold in microseconds: commands taking at least this long
+    /// are logged; 0 logs every command, a negative value disables the
+    /// slowlog (and command timing for it). Live: `CONFIG SET
+    /// slowlog-log-slower-than`.
+    #[arg(
+        long = "slowlog-log-slower-than",
+        default_value_t = 10000,
+        allow_negative_numbers = true,
+        value_parser = clap::value_parser!(i64).range(-1..)
+    )]
+    pub slowlog_log_slower_than: i64,
 
-    /// Maximum entries in the slowlog
+    /// Maximum entries in the slowlog (0 disables it). Live: `CONFIG SET
+    /// slowlog-max-len`.
     #[arg(long = "slowlog-max-len", default_value_t = 128)]
     pub slowlog_max_len: usize,
 
@@ -2679,6 +2688,19 @@ mod tests {
         assert_eq!(config.appendfsync, "always");
         assert_eq!(config.save, Some("3600 1 300 100".to_string()));
         assert_eq!(config.appendfilename, "my.aof");
+    }
+
+    #[test]
+    fn slowlog_flags_default_to_redis_and_accept_a_negative_threshold() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(config.slowlog_log_slower_than, 10_000);
+        assert_eq!(config.slowlog_max_len, 128);
+        let config = ServerConfig::parse_from(["moon", "--slowlog-log-slower-than", "-1"]);
+        assert_eq!(config.slowlog_log_slower_than, -1);
+        assert!(
+            ServerConfig::try_parse_from(["moon", "--slowlog-log-slower-than", "-2"]).is_err(),
+            "redis's range is -1..=i64::MAX"
+        );
     }
 
     #[test]

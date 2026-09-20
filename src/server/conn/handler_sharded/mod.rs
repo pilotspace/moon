@@ -687,6 +687,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     });
                                 }
                                 responses.push(response);
+                                // moon#775: a pre-auth AUTH executes (and may fail).
+                                crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                                 continue;
                             }
                             Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"HELLO") => {
@@ -731,10 +733,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     }
                                 }
                                 responses.push(response);
+                                crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                                 continue;
                             }
-                            Some((cmd, _)) if cmd.eq_ignore_ascii_case(b"QUIT") => {
+                            Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"QUIT") => {
                                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                                 should_quit = true;
                                 break;
                             }
@@ -783,8 +787,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                         };
                     }
                     // --- QUIT ---
+                    //
+                    // moon#775: the connection-state verbs answered here, before
+                    // the client-command boundary further down, execute too —
+                    // each counts itself on the way out.
                     if cmd.eq_ignore_ascii_case(b"QUIT") {
                         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                        crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                         should_quit = true;
                         break;
                     }
@@ -793,6 +802,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     if cmd.eq_ignore_ascii_case(b"ASKING") {
                         conn.asking = true;
                         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                        crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                         continue;
                     }
 
@@ -802,6 +812,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // measured refusal rather than a misleading +OK, because a
                     // client that gets +OK believes replica reads are enabled.
                     if cmd.eq_ignore_ascii_case(b"READONLY") || cmd.eq_ignore_ascii_case(b"READWRITE") {
+                        crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                         if let Some(err) = crate::cluster::readonly_verb_reply(cmd, cmd_args) {
                             responses.push(err);
                             continue;
@@ -903,6 +914,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             &mut responses,
                         )
                     {
+                        crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                         continue;
                     }
 
@@ -920,6 +932,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             &mut responses,
                         )
                     {
+                        crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                         continue;
                     }
 
@@ -945,6 +958,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         &mut responses,
                         None,
                     ) {
+                        crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                         continue;
                     }
 
@@ -1140,6 +1154,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                         responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
                         continue;
                     }
+
+                    // === CLIENT-COMMAND BOUNDARY (moon#775, moon#1002) ===
+                    //
+                    // Same placement and rule as handler_monoio: everything below
+                    // has passed auth, loading, ACL, the workspace rewrite and
+                    // MULTI queueing, and is counted here ONCE — however many
+                    // shards or coordinator legs it then touches. `EXEC`'s queued
+                    // commands are added where it answers.
+                    crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
 
                     // --- MONITOR: attach, and the rules once attached ---
                     //
@@ -1646,6 +1669,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // --- MULTI / EXEC_CMD / DISCARD ---
                     let mut exec_publishes: Vec<crate::shard::exec_publish::ExecPublish> = Vec::new();
                     if write::try_handle_multi_exec(cmd, cmd_args, &mut conn, ctx, &mut responses, &mut exec_publishes, &shutdown, &func_registry).await {
+                        crate::server::conn::shared::count_exec_body(cmd, responses.last());
                         // C2: a PUBLISH or SPUBLISH (moon#1043) queued inside MULTI
                         // fans out only now — after the transaction body has been
                         // applied — into its own namespace, and its placeholder in
