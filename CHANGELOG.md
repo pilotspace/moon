@@ -199,6 +199,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Waiters a refused AOF record left parked are served once the writer has
+  room** (moon#1111). When the AOF writer could not take a served pop's
+  record within the backpressure bound, the wake stopped (every further serve
+  would have waited out another bound on the shard thread) and the waiters
+  behind it stayed parked beside data until another write to the key or their
+  own timeout — never, for `BLPOP k 0` on a queue whose producer went quiet.
+  The key is now remembered and retried by the shard's 10 ms blocking tick as
+  soon as the writer has room again (never while it is still full, so the
+  retry spends no bound on the shard thread), each serve still logged in its
+  own synchronous stretch; stream group readers skipped for the same reason
+  are retried the same way.
+
+- **Becoming a replica releases every blocked client.** A client parked
+  on a node that then ran `REPLICAOF host port` stayed parked. Before the
+  fix above, nothing woke it until its timeout. After it, the first
+  replicated push served it: a `BLPOP` took the element out of the
+  replica's copy only. Every parked client is now answered `-UNBLOCKED force unblock from
+  blocking operation, instance state changed (master -> replica?)` and its
+  connection closed, dropping anything pipelined behind the blocking
+  command. That is redis's `disconnectAllBlockedClients` (text and close
+  checked against redis-server 8.6.1, for `BLPOP`, `XREADGROUP` and `XREAD`).
+
+- **A replica wakes the clients blocked on what replication writes**
+  (moon#1096). Every write a replica holds arrives through
+  `replication::apply`, and nothing there reached the ready-key hook, so an
+  `XREAD BLOCK` parked on a replica answered nil at its own timeout while
+  its stream filled. Each applied command now serves the clients blocked on
+  the keys it wrote, through the master's own hook — its written keys, both
+  databases of a `SWAPDB`, the destination of a `MOVE`/`COPY ... DB n` —
+  after the write is applied, as redis does (`signalKeyAsReady` from the
+  keyspace write; measured against redis-server 8.6.1: woken 0.41 s after a
+  master `XADD` issued 0.4 s into the wait, also through `MULTI`, `MOVE` and
+  `SWAPDB`). Blocking pops and `XREADGROUP` stay refused with `-READONLY` on
+  a replica, in both servers.
+
 - **A parked `XREADGROUP` is answered at once when its stream or group goes
   away** (moon#1086). Redis unblocks a group reader when any write deletes
   or retypes its stream or destroys its group; moon left it parked until its

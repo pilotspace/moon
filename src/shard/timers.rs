@@ -266,6 +266,9 @@ pub(crate) fn expire_blocked_clients(blocking_rc: &Rc<RefCell<BlockingRegistry>>
     // moon#1086: a flush, a MOVE away or an expiry may have taken a parked
     // XREADGROUP's stream; answer it now rather than at its own timeout.
     crate::blocking::wakeup::recheck_group_readers(blocking_rc);
+    // moon#1111: serve the waiters a wake left parked beside data because
+    // the AOF writer refused a record, once it has room again.
+    crate::blocking::wakeup::retry_deferred_wakes(blocking_rc);
 }
 
 /// Checkpoint tick interval in milliseconds.

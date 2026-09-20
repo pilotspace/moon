@@ -280,8 +280,17 @@ pub(super) fn try_handle_replicaof(
                         listening_port: 0,
                         epoch,
                         stream_db: std::sync::atomic::AtomicUsize::new(0),
+                        blocking_registry: Some(ctx.blocking_registry.clone()),
                         shard_databases: ctx.shard_databases.clone(),
                     };
+                    // Every client parked here as a master is answered
+                    // `-UNBLOCKED` and closed (redis's
+                    // `disconnectAllBlockedClients`). One shard: moon#1015
+                    // refuses `REPLICAOF` on more, so this registry holds all.
+                    let _ = ctx
+                        .blocking_registry
+                        .borrow_mut()
+                        .unblock_all(crate::blocking::UNBLOCKED_ROLE_CHANGE);
                     tokio::task::spawn_local(crate::replication::replica::run_replica_task(cfg));
                 }
                 ReplicaofAction::PromoteToMaster => {

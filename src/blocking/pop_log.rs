@@ -117,6 +117,20 @@ pub(crate) fn has_work() -> bool {
     })
 }
 
+/// Could this shard's AOF writer take a record right now without blocking?
+/// `true` with no AOF at all. The retry of a wake that stopped at a refused
+/// record (moon#1111) waits for this, so it never spends a backpressure
+/// bound on the shard thread while the writer is still saturated.
+pub(crate) fn writer_has_room() -> bool {
+    SINK.with(|s| {
+        s.borrow().as_ref().is_none_or(|sink| {
+            sink.aof_pool
+                .as_ref()
+                .is_none_or(|pool| !pool.append_would_block(sink.shard_id))
+        })
+    })
+}
+
 /// A fresh backpressure budget for ONE wake pass (or one immediate pop).
 ///
 /// [`log_pop`] may block the shard thread while the AOF writer is saturated,
@@ -570,5 +584,66 @@ mod tests {
         }
         drop(rx);
         uninstall();
+    }
+
+    /// moon#1111: the waiter a lost append left parked beside data is served
+    /// by the shard's blocking tick as soon as the writer has room again —
+    /// with no further write to the key — and not before.
+    #[test]
+    fn a_waiter_left_parked_by_a_lost_append_is_served_once_the_writer_has_room() {
+        std::thread::spawn(|| {
+            use crate::shard::slice::{
+                ShardSlice, init_shard, test_support::make_init, with_shard_db,
+            };
+            init_shard(ShardSlice::new(make_init(0, 1)));
+            let (tx, rx) = flume::bounded::<AofMessage>(1);
+            // Full, and never drained until we say so: every append waits out
+            // its budget and is refused.
+            tx.try_send(AofMessage::Append {
+                lsn: 0,
+                db: 0,
+                bytes: Bytes::from_static(b"filler"),
+                epoch: crate::persistence::aof::FoldEpoch::INITIAL,
+            })
+            .map_err(|_| ())
+            .expect("room for the filler");
+            install(0, Some(AofWriterPool::top_level(tx)), None);
+            let reg = std::cell::RefCell::new(BlockingRegistry::new(0));
+            let k = b("k");
+            let first = park(&mut reg.borrow_mut(), 0, &k, BlockedCommand::BLPop, None);
+            let second = park(&mut reg.borrow_mut(), 0, &k, BlockedCommand::BLPop, None);
+            with_shard_db(0, |db| {
+                db.list_push_back(&k, b("a"));
+                db.list_push_back(&k, b("b"));
+                assert!(try_wake_list_waiter(&mut reg.borrow_mut(), db, 0, &k));
+            });
+            assert!(matches!(first.try_recv(), Ok(Some(Frame::Error(_)))));
+            assert!(second.try_recv().is_err(), "left parked by the lost append");
+
+            // Still saturated: the tick leaves it parked and spends nothing.
+            let rc = std::rc::Rc::new(reg);
+            crate::shard::timers::expire_blocked_clients(&rc);
+            assert!(
+                second.try_recv().is_err(),
+                "no retry while the writer is full"
+            );
+
+            // The writer drains: the next tick serves it, logging the pop.
+            assert_eq!(drain(&rx).len(), 1, "only the filler was ever enqueued");
+            crate::shard::timers::expire_blocked_clients(&rc);
+            match second.try_recv() {
+                Ok(Some(Frame::Array(items))) => {
+                    assert_eq!(items.get(1), Some(&Frame::BulkString(b("b"))));
+                }
+                other => panic!("the parked waiter was not served: {other:?}"),
+            }
+            assert_eq!(
+                drain(&rx),
+                vec![(0, b"*2\r\n$4\r\nLPOP\r\n$1\r\nk\r\n".to_vec())]
+            );
+            uninstall();
+        })
+        .join()
+        .expect("test thread");
     }
 }
