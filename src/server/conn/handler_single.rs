@@ -1266,7 +1266,6 @@ pub async fn handle_connection(
                                     let result = probe.observe(d_cmd, crate::admin::slowlog::SlowlogArgv::from(&disp_frame), || {
                                         dispatch(&mut *guard, d_cmd, d_args, &mut conn.selected_db, db_count)
                                     });
-                                    drop(probe);
                                     let (response, quit) = match result {
                                         DispatchResult::Response(f) => (f, false),
                                         DispatchResult::Quit(f) => (f, true),
@@ -2644,7 +2643,6 @@ pub async fn handle_connection(
                                 let result = probe.observe(d_cmd, crate::admin::slowlog::SlowlogArgv::from(disp_frame), || {
                                     dispatch_read(&*guard, d_cmd, d_args, now_ms, &mut conn.selected_db, db_count)
                                 });
-                                drop(probe);
                                 let (response, quit) = match result {
                                     DispatchResult::Response(f) => (f, false),
                                     DispatchResult::Quit(f) => (f, true),
@@ -3010,7 +3008,6 @@ pub async fn handle_connection(
                                 let result = probe.observe(d_cmd, crate::admin::slowlog::SlowlogArgv::from(disp_frame), || {
                                     dispatch(&mut *guard, d_cmd, d_args, &mut conn.selected_db, db_count)
                                 });
-                                drop(probe);
                                 let (response, quit) = match result {
                                     DispatchResult::Response(f) => (f, false),
                                     DispatchResult::Quit(f) => (f, true),

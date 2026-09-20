@@ -1705,7 +1705,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 spill_sender_active,
                 &mut probe,
             );
-            drop(probe);
             // moon#775: the inline loop is a client-command boundary of its
             // own — every command it answers is one the client sent — so the
             // batch lands in `total_commands_processed` here, as ONE add
@@ -2975,7 +2974,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
                         }
                     }
-                    drop(probe);
                     crate::admin::metrics_setup::record_pipeline_multikey_fanout();
                     continue;
                 }
@@ -3701,7 +3699,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             continue;
                         }
                     };
-                    drop(probe);
                     conn.selected_db = new_selected_db;
                     // #455: the AOF record below can park on a full writer
                     // channel before it is enqueued, and a fold can snapshot
@@ -4023,7 +4020,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             })
                         },
                     );
-                    drop(probe);
                     conn.selected_db = sel_db;
 
                     let response = match result {
@@ -4155,7 +4151,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             }
                         })
                         .flatten();
-                    drop(probe);
                     if let Some(response) = served {
                         conn.selected_db = fast_sel;
                         // Post-processing mirrors the LOCAL read path exactly —

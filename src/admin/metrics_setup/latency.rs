@@ -232,7 +232,6 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(3));
             });
         }
-        drop(probe);
         let entries = slowlog.get(None);
         assert_eq!(
             entries.len(),
@@ -263,7 +262,6 @@ mod tests {
         let mut probe = LatencyProbe::with_slowlog(&mut sampler, &mut cache, &slowlog, b"", b"");
         let argv: [&[u8]; 1] = [b"PING"];
         probe.observe(b"PING", raw(&argv), || ());
-        drop(probe);
         assert_eq!(slowlog.len(), 1);
     }
 
@@ -284,7 +282,6 @@ mod tests {
                     i
                 });
             }
-            drop(probe);
             assert_eq!(sum, (0..48).sum::<u32>(), "observe returns the closure's value");
             assert_eq!(slowlog.len(), 0);
         }
@@ -311,7 +308,6 @@ mod tests {
         for _ in 0..32 {
             probe.observe(b"PING", SlowlogArgv::from(&frame), || ());
         }
-        drop(probe);
         assert_eq!(slowlog.len(), 0);
     }
 
@@ -328,7 +324,6 @@ mod tests {
             Frame::Integer(7),
         ]));
         probe.observe(b"SET", SlowlogArgv::from(&frame), || ());
-        drop(probe);
         let entries = slowlog.get(None);
         assert_eq!(entries.len(), 1);
         assert_eq!(

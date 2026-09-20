@@ -431,7 +431,6 @@ pub(crate) fn drain_spsc_shared(
     }
 
     // moon#982: land this cycle's routed-command count before the cycle ends.
-    drop(probe);
 
     // Return the (now drained) scratch buffers so their capacity is reused
     // by the next drain cycle.

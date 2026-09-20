@@ -118,7 +118,6 @@ fn inline_get_and_set_are_observed_by_the_probe() {
             true,
         );
     }
-    drop(probe);
 
     let entries = slowlog.get(None);
     assert_eq!(entries.len(), 6, "every command is timed: {entries:?}");

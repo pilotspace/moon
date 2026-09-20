@@ -2163,7 +2163,6 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
                                 }
                             }
-                            drop(probe);
                             crate::admin::metrics_setup::record_pipeline_multikey_fanout();
                             continue;
                         }
@@ -2681,7 +2680,6 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 let result = probe.observe(cmd, crate::admin::slowlog::SlowlogArgv::from(&frame), || {
                                     dispatch(db, cmd, cmd_args, &mut conn.selected_db, db_count)
                                 });
-                                drop(probe);
                                 let response = match result {
                                     DispatchResult::Response(f) => f,
                                     DispatchResult::Quit(f) => { should_quit = true; f }
@@ -3034,7 +3032,6 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     )
                                 })
                             });
-                            drop(probe);
                             let response = match result {
                                 DispatchResult::Response(f) => f,
                                 DispatchResult::Quit(f) => { should_quit = true; f }
