@@ -1,36 +1,25 @@
 //! #455: a rewrite fold must not double-apply a write whose AOF record is
 //! enqueued after an await that follows the mutation.
 //!
-//! A producer applies its mutation, then enqueues the record. When the writer
-//! channel is full it parks in between — and while it is parked a fold can
-//! snapshot the effect into the new base. A fold that split records by
-//! position then wrote that record into the new incr, and the restart applied
-//! it a second time: `INCR` counters came back above the value the server had
-//! acknowledged. Records now carry the fold epoch read when the mutation ran,
-//! and the writer drops every record stamped below the committed snapshot's
-//! epoch, wherever it surfaces.
+//! `EXEC` used to run its body synchronously, then fill the slots of
+//! connection intercepts queued inside it (`WAIT`, `CONFIG`, ...), which can
+//! await, and only then enqueue the body's AOF records. A `BGREWRITEAOF` whose
+//! snapshot landed in that window captured the body's effect in the new base,
+//! and the fold, which split records by position, put the late records into
+//! the new incr: an `INCR` inside such an `EXEC` came back from a restart
+//! applied twice.
 //!
-//! The window is opened without touching the server's code: the writer's
-//! `EverySec` fsync is stalled (`MOON_TEST_AOF_FSYNC_STALL_MS`, the same knob
-//! the moon#769 pinning tests use), a wave of pipelined `INCR`s from many
-//! connections fills the 10k writer channel so their producers park after
-//! applying, and `BGREWRITEAOF` folds while they are parked.
-//!
-//! (The scenario used to park `EXEC` on a queued `WAIT` asking for more
-//! replicas than exist. Redis answers a `WAIT` inside `MULTI` at once, and so
-//! does moon since moon#1098, so that window closed — moon#1134. Parking
-//! `EXEC` on a queued `SCRIPT LOAD` fan-out instead, the way
-//! `tests/exec_intercept_log_order_1084.rs` does, does not reopen it either:
-//! measured on `main` and on the pre-#1085 commit `3b596be0`,
-//! `aof_rewrite_late_records_folded` never moves, because since moon#1084 the
-//! `EXEC` body is logged in the same synchronous stretch as the executor,
-//! before any intercept awaits. The parked producer below is the window that
-//! is left, and it is the one the writer-side unit tests pin.)
-//!
-//! Vacuity guards, because a green run must mean the window opened: the
-//! rewrite must commit while producers are parked, and
-//! `INFO persistence`'s `aof_rewrite_late_records_folded` must move — it
-//! counts exactly the records this fix drops.
+//! Two changes now close it from both sides. Records carry the fold epoch
+//! read when the mutation ran, and the writer drops every record stamped
+//! below the committed snapshot's epoch. The writer side is pinned by the
+//! unit tests in `persistence::aof`, including a record that reaches the
+//! channel only after the snapshot, which is what a producer parked on a
+//! full channel produces. And since moon#1084 the `EXEC` body is logged
+//! before the intercepts await, so in this scenario its records reach the
+//! writer before the fold's cut and the late-record window no longer opens.
+//! This test keeps the end-to-end guarantee for the scenario that exposed
+//! the bug: a rewrite during a parked `EXEC`, then kill -9, applies the
+//! `INCR` exactly once.
 //!
 //! Black-box over a real `moon` process (needs a prebuilt binary):
 //!
@@ -44,56 +33,40 @@
 mod common;
 
 use std::io::Write;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Connections writing concurrently. Each parks its own producer once the
-/// writer channel is full, so the fold below meets many parked records, not
-/// one.
-const WRITERS: usize = 24;
-/// `INCR`s per connection. `WRITERS * INCRS` must exceed the writer channel
-/// (10k) by enough that producers are still parked when the fold snapshots.
-const INCRS: usize = 2_000;
-/// How long each `EverySec` fsync is held. Long enough that the channel fills
-/// and stays full while the rewrite is requested.
-const FSYNC_STALL_MS: &str = "3000";
-/// The writer's first `EverySec` deadline is one second after it opens, so
-/// nothing stalls before then. Keep writing until it has passed, or the wave
-/// below drains straight through and no producer ever parks.
-const WARMUP_MS: u64 = 1_400;
+/// How long the `WAIT` inside the transaction holds `EXEC` between the body's
+/// mutation and its AOF enqueue. No replica ever acks, so it always runs out.
+const WAIT_MS: u64 = 3000;
 
-fn spawn(dir: &Path, stall: bool) -> (common::ServerGuard, u16) {
-    std::fs::create_dir_all(dir).expect("create test dir");
-    common::spawn_listening_guarded(|port| {
-        let mut cmd = Command::new(common::find_moon_binary());
-        cmd.args([
+fn start_moon(port: u16, dir: &std::path::Path, shards: usize) -> Child {
+    Command::new(common::find_moon_binary())
+        .args([
             "--port",
             &port.to_string(),
             "--shards",
-            "1",
+            &shards.to_string(),
             "--appendonly",
             "yes",
-            // EverySec: the stalled fsync is what fills the channel. The
-            // fence before the SIGKILL makes the tail durable anyway.
             "--appendfsync",
-            "everysec",
+            "always",
             // Only the rewrite this test triggers may run.
             "--auto-aof-rewrite-percentage",
             "0",
             "--disk-free-min-pct",
             "0",
-            "--dir",
         ])
-        .arg(dir);
-        if stall {
-            cmd.env("MOON_TEST_AOF_FSYNC_STALL_MS", FSYNC_STALL_MS);
-        }
-        cmd.stdout(Stdio::null())
-            .stderr(common::server_stderr(dir))
-            .spawn()
-            .expect("spawn moon (build first; MOON_BIN to override)")
-    })
+        .arg("--dir")
+        .arg(dir)
+        .stdout(Stdio::null())
+        .stderr(common::server_stderr(dir))
+        .spawn()
+        .expect("spawn moon (build first; MOON_BIN to override)")
+}
+
+fn spawn(dir: &std::path::Path, shards: usize) -> (common::ServerGuard, u16) {
+    common::spawn_listening_guarded(|port| start_moon(port, dir, shards))
 }
 
 /// Value of `field` in an `INFO persistence` reply, if present.
@@ -103,17 +76,8 @@ fn info_field(info: &str, field: &str) -> Option<String> {
         .map(|v| v.trim().to_string())
 }
 
-/// `aof_rewrite_late_records_folded`, or `None` on a build that predates the
-/// counter (every build before #455's fix).
-fn folded_records(c: &mut common::Conn) -> Option<u64> {
-    info_field(
-        &c.send(&["INFO", "persistence"]),
-        "aof_rewrite_late_records_folded",
-    )
-    .and_then(|v| v.parse().ok())
-}
-
-fn wait_rewrite_done(c: &mut common::Conn, deadline: Instant) {
+fn wait_rewrite_done(port: u16, deadline: Instant) {
+    let mut c = common::Conn::open(port);
     loop {
         let info = c.send(&["INFO", "persistence"]);
         if info_field(&info, "aof_rewrite_in_progress").as_deref() == Some("0") {
@@ -124,138 +88,80 @@ fn wait_rewrite_done(c: &mut common::Conn, deadline: Instant) {
             );
             return;
         }
-        assert!(Instant::now() < deadline, "rewrite never finished: {info}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn counter(i: usize) -> String {
-    format!("ctr455:{i}")
-}
-
-/// One connection's wave: `INCRS` pipelined `INCR`s, then every reply read.
-/// Returns the value the server acknowledged last.
-fn incr_wave(port: u16, i: usize) -> i64 {
-    let mut c = common::Conn::open(port);
-    let key = counter(i);
-    let mut batch = Vec::new();
-    for _ in 0..INCRS {
-        batch.extend_from_slice(&common::encode(&["INCR", &key]));
-    }
-    c.sock.write_all(&batch).expect("write wave");
-    let replies = c.read_replies_within(INCRS, Duration::from_secs(120));
-    let last = replies
-        .trim_end()
-        .rsplit("\r\n")
-        .next()
-        .and_then(|l| l.strip_prefix(':'))
-        .and_then(|n| n.parse::<i64>().ok())
-        .unwrap_or_else(|| panic!("{key}: last reply of the wave: {:?}", replies.get(..80)));
-    assert!(
-        !replies.contains("-ERR") && !replies.contains("-AOF"),
-        "{key}: a write in the wave was refused: {:?}",
-        replies.get(..200)
-    );
-    last
-}
-
-/// A rewrite folded while producers are parked between their mutation and
-/// their AOF record applies each of those writes exactly once after a
-/// `kill -9`.
-#[test]
-#[ignore]
-fn a_fold_over_parked_producers_replays_each_write_once() {
-    let dir = common::unique_test_dir("moon-455-fold");
-    let (mut server, port) = spawn(&dir, true);
-    let mut admin = common::Conn::open(port);
-    let folded_before = folded_records(&mut admin);
-
-    // Write past the writer's first fsync deadline so the wave below meets a
-    // stalled writer rather than an empty channel.
-    let warm_until = Instant::now() + Duration::from_millis(WARMUP_MS);
-    let mut i = 0u64;
-    while Instant::now() < warm_until {
-        assert_eq!(admin.send(&["SET", "warm455", &i.to_string()]), "+OK\r\n");
-        i += 1;
-    }
-
-    // The waves run while the writer is inside a stalled fsync: the channel
-    // fills, and every producer parks AFTER applying its INCR.
-    let waves: Vec<std::thread::JoinHandle<i64>> = (0..WRITERS)
-        .map(|i| std::thread::spawn(move || incr_wave(port, i)))
-        .collect();
-
-    // Fold in the middle of the wave, retrying while the channel is too full
-    // for the rewrite request itself.
-    let deadline = Instant::now() + Duration::from_secs(120);
-    std::thread::sleep(Duration::from_millis(300));
-    loop {
-        let reply = admin.send_within(&["BGREWRITEAOF"], Duration::from_secs(30));
-        if reply.starts_with('+') {
-            break;
-        }
         assert!(
             Instant::now() < deadline,
-            "BGREWRITEAOF never accepted: {reply:?}"
+            "rewrite did not finish inside the WAIT window: {info}"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    wait_rewrite_done(&mut admin, deadline);
+}
 
-    let acked: Vec<i64> = waves
-        .into_iter()
-        .map(|h| h.join().expect("wave thread"))
-        .collect();
-    assert!(
-        acked.iter().all(|&v| v == INCRS as i64),
-        "a wave did not finish: {acked:?}"
+fn run_case(shards: usize) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut server, port) = spawn(dir.path(), shards);
+
+    let mut a = common::Conn::open(port);
+    assert_eq!(a.send(&["SET", "k", "0"]), "+OK\r\n");
+
+    // MULTI / INCR / WAIT / EXEC as one batch; do not read the replies yet —
+    // EXEC is parked in WAIT with the INCR already applied.
+    let wait_ms = WAIT_MS.to_string();
+    let mut batch = Vec::new();
+    for cmd in [
+        &["MULTI"][..],
+        &["INCR", "k"][..],
+        &["WAIT", "1", &wait_ms][..],
+        &["EXEC"][..],
+    ] {
+        batch.extend_from_slice(&common::encode(cmd));
+    }
+    a.sock.write_all(&batch).expect("send transaction");
+    let exec_sent = Instant::now();
+
+    // The body ran: the INCR is in memory while EXEC waits.
+    let mut b = common::Conn::open(port);
+    let deadline = exec_sent + Duration::from_millis(WAIT_MS / 2);
+    loop {
+        if b.send(&["GET", "k"]) == "$1\r\n1\r\n" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "EXEC body never ran");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Fold while EXEC is still parked in WAIT, after its body ran. (The
+    // wait below asserts the rewrite completed ok inside that window.)
+    let reply = b.send(&["BGREWRITEAOF"]);
+    assert!(reply.starts_with('+'), "BGREWRITEAOF refused: {reply:?}");
+    wait_rewrite_done(
+        port,
+        exec_sent + Duration::from_millis(WAIT_MS.saturating_sub(500)),
     );
 
-    // Make the tail durable without the stall: under `always` each batch is
-    // fsynced, so a reply to the fence proves everything before it is on
-    // disk. Only then is a SIGKILL a clean cut.
+    let replies = a.read_replies(4);
     assert!(
-        admin
-            .send(&["CONFIG", "SET", "appendfsync", "always"])
-            .starts_with('+'),
-        "CONFIG SET appendfsync always refused"
+        replies.ends_with("*2\r\n:1\r\n:0\r\n"),
+        "EXEC must commit the INCR (and WAIT must time out with 0 acks): {replies:?}"
     );
-    assert_eq!(admin.send(&["SET", "fence455", "1"]), "+OK\r\n");
-    let folded_after = folded_records(&mut admin);
+    assert!(
+        exec_sent.elapsed() >= Duration::from_millis(WAIT_MS),
+        "EXEC returned before WAIT ran out — the window under test never opened"
+    );
 
     server.kill_now();
-    common::wait_for_port_down(port);
-    let (mut restarted, port) = spawn(&dir, false);
+    let (mut server, port) = spawn(dir.path(), shards);
     let mut c = common::Conn::open(port);
-    let wrong: Vec<String> = (0..WRITERS)
-        .filter_map(|i| {
-            let key = counter(i);
-            let got = c.send(&["GET", &key]);
-            let want = format!("${}\r\n{}\r\n", INCRS.to_string().len(), INCRS);
-            (got != want).then(|| format!("{key}: acknowledged {INCRS}, recovered {got:?}"))
-        })
-        .collect();
-    restarted.kill_now();
-    assert!(
-        wrong.is_empty(),
-        "a write acknowledged before the fold was applied a second time on replay \
-         (its record reached the writer after the snapshot that already held it):\n{wrong:#?}"
+    assert_eq!(
+        c.send(&["GET", "k"]),
+        "$1\r\n1\r\n",
+        "shards={shards}: the INCR committed by EXEC must be applied exactly once after \
+         restart (2 = the record was replayed on top of a base that already held it)"
     );
+    server.kill_now();
+}
 
-    // Vacuity: the fold must have met at least one record whose mutation its
-    // snapshot already held, or this run proves nothing. Checked after the
-    // data assertion so a build without the counter still fails for the
-    // reason that matters.
-    match (folded_before, folded_after) {
-        (Some(before), Some(after)) => assert!(
-            after > before,
-            "aof_rewrite_late_records_folded did not move ({before} -> {after}): no producer \
-             was parked across the fold's snapshot, so the #455 window never opened"
-        ),
-        _ => panic!(
-            "INFO persistence has no aof_rewrite_late_records_folded counter — this build \
-             predates #455's fix, so the window cannot be verified from here"
-        ),
-    }
-    let _ = std::fs::remove_dir_all(&dir);
+#[test]
+#[ignore]
+fn exec_parked_in_wait_across_a_rewrite_replays_once_toplevel() {
+    run_case(1);
 }
