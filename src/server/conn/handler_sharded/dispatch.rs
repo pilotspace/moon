@@ -77,19 +77,11 @@ pub(super) fn try_handle_client_command(
             }
             if sub_bytes.eq_ignore_ascii_case(b"LIST") {
                 // Update our own entry before listing
-                crate::client_registry::update(client_id, |e| {
-                    e.live.touch(
-                        conn.selected_db,
-                        crate::client_registry::ClientFlags {
-                            subscriber: conn.subscription_count > 0,
-                            in_multi: conn.in_multi,
-                            // Executing CLIENT LIST/INFO means not blocked.
-                            blocked: false,
-                            replica: conn.saw_replconf,
-                        },
-                        crate::storage::entry::current_time_ms(),
-                    );
-                });
+                crate::server::conn::shared::publish_own_client_state(
+                    client_id,
+                    conn,
+                    &ctx.shard_pubsub(),
+                );
                 let list = crate::client_registry::client_list();
                 responses.push(Frame::BulkString(Bytes::from(list)));
                 return true;
@@ -97,19 +89,11 @@ pub(super) fn try_handle_client_command(
             if sub_bytes.eq_ignore_ascii_case(b"INFO") {
                 // Derive flags from CURRENT conn state (same as the LIST path
                 // above) — reloading e.live.flags would freeze stale bits.
-                crate::client_registry::update(client_id, |e| {
-                    e.live.touch(
-                        conn.selected_db,
-                        crate::client_registry::ClientFlags {
-                            subscriber: conn.subscription_count > 0,
-                            in_multi: conn.in_multi,
-                            // Executing CLIENT LIST/INFO means not blocked.
-                            blocked: false,
-                            replica: conn.saw_replconf,
-                        },
-                        crate::storage::entry::current_time_ms(),
-                    );
-                });
+                crate::server::conn::shared::publish_own_client_state(
+                    client_id,
+                    conn,
+                    &ctx.shard_pubsub(),
+                );
                 let info = crate::client_registry::client_info(client_id).unwrap_or_default();
                 // No conversion call here any more: `responses` is an
                 // `InterceptReplies`, which applies the RESP3 policy on push.
@@ -296,8 +280,17 @@ pub(super) fn try_handle_replicaof(
                         listening_port: 0,
                         epoch,
                         stream_db: std::sync::atomic::AtomicUsize::new(0),
+                        blocking_registry: Some(ctx.blocking_registry.clone()),
                         shard_databases: ctx.shard_databases.clone(),
                     };
+                    // Every client parked here as a master is answered
+                    // `-UNBLOCKED` and closed (redis's
+                    // `disconnectAllBlockedClients`). One shard: moon#1015
+                    // refuses `REPLICAOF` on more, so this registry holds all.
+                    let _ = ctx
+                        .blocking_registry
+                        .borrow_mut()
+                        .unblock_all(crate::blocking::UNBLOCKED_ROLE_CHANGE);
                     tokio::task::spawn_local(crate::replication::replica::run_replica_task(cfg));
                 }
                 ReplicaofAction::PromoteToMaster => {

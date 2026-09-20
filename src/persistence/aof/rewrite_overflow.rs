@@ -92,6 +92,14 @@ pub struct RewriteOverflow {
     /// at a fold's snapshot instant; read by every producer when it stamps
     /// a record.
     epoch: std::sync::atomic::AtomicU64,
+    /// Whether this writer's log is missing an acked append, and since when:
+    /// `0` for no hole, otherwise one more than the highest fold epoch
+    /// current at any drop not yet folded back in (see "Dropped appends"
+    /// on [`Self::note_append_dropped`]). A mutex, not an atomic, so a drop
+    /// and a heal on the same writer cannot interleave between reading this
+    /// and moving [`AOF_WRITERS_MISSING_APPENDS`]. Taken only on a drop or a
+    /// committed fold.
+    missing_since: parking_lot::Mutex<u64>,
 }
 
 /// Why [`RewriteOverflow::try_spill`] refused a message — the two reasons
@@ -124,7 +132,50 @@ impl RewriteOverflow {
             bytes: std::sync::atomic::AtomicUsize::new(0),
             max_bytes,
             epoch: std::sync::atomic::AtomicU64::new(FoldEpoch::INITIAL.0),
+            missing_since: parking_lot::Mutex::new(0),
         }
+    }
+
+    /// Record that an acked append for this writer was dropped (moon#1094).
+    ///
+    /// # Dropped appends
+    ///
+    /// The drop is tagged with the fold epoch current when it happens. The
+    /// dropped record's mutation happened before the drop, so before that
+    /// epoch's end: any fold whose snapshot epoch is ABOVE it captured the
+    /// mutation in its base. That is the same `folded_below` rule the writer
+    /// applies to the records it drops after a commit, read at the drop
+    /// instead of the stamp, which can only be later, so the rule errs
+    /// towards reporting a hole. Only the latest drop matters: a fold that
+    /// covers it covers every earlier one.
+    pub(crate) fn note_append_dropped(&self) {
+        let at = self.stamp().0.saturating_add(1);
+        let mut missing = self.missing_since.lock();
+        if *missing == 0 {
+            AOF_WRITERS_MISSING_APPENDS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        *missing = (*missing).max(at);
+    }
+
+    /// Clear this writer's hole if the fold that just COMMITTED with snapshot
+    /// epoch `floor` postdates its latest drop (see
+    /// [`Self::note_append_dropped`]). Called by the writer when it adopts a
+    /// committed floor, and never for an aborted fold: the old base covers
+    /// nothing new. A drop at or after the snapshot keeps the hole, because
+    /// the new generation lacks that record too.
+    pub(crate) fn heal_on_commit(&self, floor: FoldEpoch) {
+        let mut missing = self.missing_since.lock();
+        if *missing != 0 && FoldEpoch(*missing - 1).folded_below(floor) {
+            *missing = 0;
+            AOF_WRITERS_MISSING_APPENDS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    /// Whether this writer's log is missing an acked append no committed
+    /// fold has covered yet.
+    #[cfg(test)]
+    pub(crate) fn is_missing_appends(&self) -> bool {
+        *self.missing_since.lock() != 0
     }
 
     /// Arm at fold start. Called by the writer task immediately before
@@ -425,7 +476,7 @@ impl RewriteOverflow {
                     // false Synced.
                     let lost = (batch_total - batch_consumed) as u64;
                     if lost > 0 {
-                        super::record_append_dropped(lost);
+                        super::record_append_dropped(self, lost);
                     }
                     return Err(e);
                 }
@@ -461,7 +512,7 @@ impl RewriteOverflow {
             let mut buf = self.buf.lock();
             let lost = buf.len() as u64;
             if lost > 0 {
-                super::record_append_dropped(lost);
+                super::record_append_dropped(self, lost);
             }
             buf.clear();
             self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -487,7 +538,7 @@ impl RewriteOverflow {
         let mut buf = self.buf.lock();
         let lost = buf.len() as u64;
         if lost > 0 {
-            super::record_append_dropped(lost);
+            super::record_append_dropped(self, lost);
             error!(
                 "rewrite overflow discarded {} spilled appends — writer exiting without a usable file",
                 lost
@@ -1024,5 +1075,85 @@ mod tests {
 
         assert_eq!(ack_rx.try_recv(), Ok(AofAck::Synced));
         assert_eq!(read_framed(&path), vec![(7, b"durable".to_vec())]);
+    }
+
+    // --- moon#1094: aof_last_append_status heals only on a covering commit ---
+    use crate::persistence::aof::rewrite::FoldOutcome;
+    //
+    // Per-writer state is asserted, not the process-wide counter: other tests
+    // in this binary drop appends on their own pools in parallel.
+
+    /// A drop before the snapshot is inside the committed base: the writer's
+    /// hole closes when that fold commits.
+    #[test]
+    fn a_committed_fold_after_the_drop_clears_the_hole() {
+        let ovf = RewriteOverflow::new();
+        super::super::record_append_dropped(&ovf, 1);
+        assert!(ovf.is_missing_appends(), "a drop must open a hole");
+        let floor = ovf.advance_epoch();
+        let adopted = FoldOutcome::Committed { floor }.adopt(FoldEpoch::INITIAL, &ovf);
+        assert_eq!(adopted, floor);
+        assert!(
+            !ovf.is_missing_appends(),
+            "the committed base holds the dropped write: the hole must close"
+        );
+    }
+
+    /// A drop between the snapshot and the commit is missing from the new
+    /// generation too: that commit must not clear it. The next fold that
+    /// commits does.
+    #[test]
+    fn a_drop_during_the_fold_survives_its_commit() {
+        let ovf = RewriteOverflow::new();
+        super::super::record_append_dropped(&ovf, 1);
+        let floor1 = ovf.advance_epoch();
+        // Lands after the snapshot instant, before the writer adopts.
+        super::super::record_append_dropped(&ovf, 1);
+        let f = FoldOutcome::Committed { floor: floor1 }.adopt(FoldEpoch::INITIAL, &ovf);
+        assert!(
+            ovf.is_missing_appends(),
+            "a drop after the snapshot is not in the base: the status must stay err"
+        );
+        let floor2 = ovf.advance_epoch();
+        FoldOutcome::Committed { floor: floor2 }.adopt(f, &ovf);
+        assert!(
+            !ovf.is_missing_appends(),
+            "a later committed fold covers it"
+        );
+    }
+
+    /// An aborted fold leaves the old base, which covers nothing new.
+    #[test]
+    fn an_aborted_fold_keeps_the_hole() {
+        let ovf = RewriteOverflow::new();
+        super::super::record_append_dropped(&ovf, 1);
+        let _snapshot = ovf.advance_epoch();
+        let f = FoldOutcome::Aborted.adopt(FoldEpoch::INITIAL, &ovf);
+        assert_eq!(f, FoldEpoch::INITIAL);
+        assert!(ovf.is_missing_appends());
+    }
+
+    /// Writers heal separately: one writer's clean commit says nothing about
+    /// another writer's drop, and the process-wide status counts both.
+    #[test]
+    fn each_writer_heals_on_its_own_commit() {
+        let a = RewriteOverflow::new();
+        let b = RewriteOverflow::new();
+        super::super::record_append_dropped(&a, 1);
+        super::super::record_append_dropped(&b, 1);
+        let floor_a = a.advance_epoch();
+        FoldOutcome::Committed { floor: floor_a }.adopt(FoldEpoch::INITIAL, &a);
+        assert!(!a.is_missing_appends());
+        assert!(
+            b.is_missing_appends(),
+            "b's hole is untouched by a's commit"
+        );
+        assert!(
+            !super::super::aof_last_append_ok(),
+            "one writer still missing an append keeps the status err"
+        );
+        let floor_b = b.advance_epoch();
+        FoldOutcome::Committed { floor: floor_b }.adopt(FoldEpoch::INITIAL, &b);
+        assert!(!b.is_missing_appends());
     }
 }

@@ -309,24 +309,26 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                 sub_break = true;
                                 break;
                             } else if cmd.eq_ignore_ascii_case(b"RESET") {
-                                // All three namespaces, plus the remote maps — see the
-                                // matching arm in handler_monoio for why leaving
-                                // `shard_channels` populated corrupts the reply stream.
-                                let gone_ch = { ctx.pubsub_registry.write().unsubscribe_all(conn.subscriber_id) };
-                                let gone_pat = { ctx.pubsub_registry.write().punsubscribe_all(conn.subscriber_id) };
-                                let gone_shard = { ctx.pubsub_registry.write().sunsubscribe_all(conn.subscriber_id) };
-                                for ch in &gone_ch {
-                                    unpropagate_subscription(&ctx.all_remote_sub_maps, ch, ctx.shard_id, ctx.num_shards, false);
-                                }
-                                for pat in &gone_pat {
-                                    unpropagate_subscription(&ctx.all_remote_sub_maps, pat, ctx.shard_id, ctx.num_shards, true);
-                                }
-                                for ch in &gone_shard {
-                                    unpropagate_shard_subscription(&ctx.all_remote_sub_maps, ch, ctx.shard_id, ctx.num_shards);
-                                }
-                                conn.subscription_count = 0;
+                                // The SAME RESET as everywhere else (moon#1105) — see the
+                                // matching arm in handler_monoio. This arm used to only
+                                // unsubscribe, so db, tracking, name and auth survived it.
+                                // No codec here: `conn.protocol_version` is authoritative.
+                                let mut out: Vec<Frame> = Vec::with_capacity(1);
+                                crate::server::conn::shared::try_handle_reset(
+                                    cmd,
+                                    cmd_args,
+                                    conn.client_id,
+                                    conn,
+                                    &ctx.requirepass,
+                                    &ctx.tracking_table,
+                                    &ctx.shard_pubsub(),
+                                    &mut out,
+                                    None,
+                                );
                                 write_buf.clear();
-                                ser(conn, &Frame::SimpleString(Bytes::from_static(b"RESET")), write_buf);
+                                for resp in &out {
+                                    ser(conn, resp, write_buf);
+                                }
                                 if stream.write_all(write_buf).await.is_err() { sub_break = true; break; }
                             } else {
                                 let cmd_str = String::from_utf8_lossy(cmd);

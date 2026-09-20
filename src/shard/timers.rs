@@ -51,6 +51,9 @@ pub(crate) fn run_active_expiry(
         for i in 0..db_count {
             crate::shard::slice::with_shard_db(i, |db| {
                 crate::server::expiration::expire_cycle_direct(db, &mut |key| {
+                    // moon#1086: an expired stream may have a group reader
+                    // parked on it.
+                    crate::blocking::wakeup::note_unsignalled_removal();
                     // Cache-invalidation consumers subscribe to this to drop
                     // their copy. Queued here and delivered by the shard
                     // loop's own drain — there is no connection to attribute
@@ -260,6 +263,12 @@ pub(crate) fn run_eviction(
 pub(crate) fn expire_blocked_clients(blocking_rc: &Rc<RefCell<BlockingRegistry>>) {
     let now = std::time::Instant::now();
     let _ = blocking_rc.borrow_mut().expire_timed_out(now);
+    // moon#1086: a flush, a MOVE away or an expiry may have taken a parked
+    // XREADGROUP's stream; answer it now rather than at its own timeout.
+    crate::blocking::wakeup::recheck_group_readers(blocking_rc);
+    // moon#1111: serve the waiters a wake left parked beside data because
+    // the AOF writer refused a record, once it has room again.
+    crate::blocking::wakeup::retry_deferred_wakes(blocking_rc);
 }
 
 /// Checkpoint tick interval in milliseconds.

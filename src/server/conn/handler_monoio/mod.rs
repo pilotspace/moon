@@ -553,6 +553,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // path has run by here, before the connection waits again.
         conn.sync_tracking_inbox(&ctx.tracking_table);
 
+        // CLIENT LIST's `P` flag and `sub`/`psub`/`ssub` for this connection,
+        // before it waits again: the subscriber-mode loop below never reaches
+        // the batch-end publish, and a connection that just left subscriber
+        // mode would otherwise stay listed as subscribed until its next batch.
+        crate::server::conn::shared::publish_pubsub_counts(
+            &client_live,
+            &ctx.shard_pubsub(),
+            &mut conn,
+            ctx.cached_clock.ms(),
+        );
+
         // Subscriber mode: bidirectional select on client commands + published messages.
         //
         // RESP2 ONLY. Under RESP3 a subscribed connection stays in the normal
@@ -907,36 +918,31 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     return (MonoioHandlerResult::Done, None); // exit connection
                                                 }
                                                 _ if cmd.eq_ignore_ascii_case(b"RESET") => {
-                                                    // The sanctioned way out of subscriber mode.
-                                                    // Only the SHARDED handler used to accept it,
-                                                    // so which answer a client got depended on the
-                                                    // shard count.
-                                                    //
-                                                    // All THREE namespaces, and the remote maps
-                                                    // with them. Clearing only two leaves the
-                                                    // connection listed under `shard_channels`
-                                                    // while it believes it is back to issuing
-                                                    // ordinary commands — an unsolicited
-                                                    // `smessage` then lands in its reply stream
-                                                    // and desynchronises every reply after it,
-                                                    // which is the very defect this task exists
-                                                    // to fix.
-                                                    let gone_ch = { ctx.pubsub_registry.write().unsubscribe_all(conn.subscriber_id) };
-                                                    let gone_pat = { ctx.pubsub_registry.write().punsubscribe_all(conn.subscriber_id) };
-                                                    let gone_shard = { ctx.pubsub_registry.write().sunsubscribe_all(conn.subscriber_id) };
-                                                    for ch in &gone_ch {
-                                                        unpropagate_subscription(&ctx.all_remote_sub_maps, ch, ctx.shard_id, ctx.num_shards, false);
-                                                    }
-                                                    for pat in &gone_pat {
-                                                        unpropagate_subscription(&ctx.all_remote_sub_maps, pat, ctx.shard_id, ctx.num_shards, true);
-                                                    }
-                                                    for ch in &gone_shard {
-                                                        unpropagate_shard_subscription(&ctx.all_remote_sub_maps, ch, ctx.shard_id, ctx.num_shards);
-                                                    }
-                                                    conn.subscription_count = 0;
-                                                    let resp = Frame::SimpleString(Bytes::from_static(b"RESET"));
+                                                    // The sanctioned way out of subscriber mode, and
+                                                    // the SAME RESET as everywhere else (moon#1105):
+                                                    // this arm used to only unsubscribe, so db,
+                                                    // tracking, name and auth survived a RESET sent
+                                                    // from here. `shard_pubsub` tears down all three
+                                                    // namespaces and the remote maps; a shard
+                                                    // subscription left behind would push `smessage`
+                                                    // into the reply stream of a connection that
+                                                    // believes it is back to ordinary commands.
+                                                    let mut out: Vec<Frame> = Vec::with_capacity(1);
+                                                    crate::server::conn::shared::try_handle_reset(
+                                                        cmd,
+                                                        cmd_args,
+                                                        client_id,
+                                                        &mut conn,
+                                                        &ctx.requirepass,
+                                                        &ctx.tracking_table,
+                                                        &ctx.shard_pubsub(),
+                                                        &mut out,
+                                                        Some(&mut codec),
+                                                    );
                                                     let mut resp_buf = BytesMut::new();
-                                                    codec.encode_frame(&resp, &mut resp_buf);
+                                                    for resp in &out {
+                                                        codec.encode_frame(resp, &mut resp_buf);
+                                                    }
                                                     let data = resp_buf.freeze();
                                                     let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                     if wr.is_err() { return (MonoioHandlerResult::Done, None); }
@@ -2090,7 +2096,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     &mut conn,
                     &ctx.requirepass,
                     &ctx.tracking_table,
-                    &*ctx.pubsub_registry,
+                    &ctx.shard_pubsub(),
                     &mut responses,
                     Some(&mut codec),
                 )
@@ -2593,7 +2599,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
             if !skip_name_gates
-                && dispatch::try_handle_client_admin(cmd, cmd_args, client_id, &conn, shaped!())
+                && dispatch::try_handle_client_admin(
+                    cmd,
+                    cmd_args,
+                    client_id,
+                    &conn,
+                    &ctx.shard_pubsub(),
+                    shaped!(),
+                )
             {
                 continue;
             }
@@ -2773,6 +2786,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // c10k A1: peer vanished mid-block. Nothing to write; the
                 // registry entry and maxclients slot are released by returning.
                 dispatch::BlockingResult::PeerGone => return (MonoioHandlerResult::Done, None),
+                // The node became a replica: write the `-UNBLOCKED` reply and
+                // close, dropping anything pipelined behind it, as redis does.
+                dispatch::BlockingResult::HandledThenClose => {
+                    should_quit = true;
+                    break;
+                }
             }
 
             // --- MULTI queue mode: queue commands when in transaction ---
@@ -4662,17 +4681,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // Update live state after each batch — lock-free (QW8, 2026-06
         // review: this was a global registry write lock per batch), and
         // clock-free (shard-cached ms, not Instant::now()).
-        client_live.touch(
-            conn.selected_db,
-            crate::client_registry::ClientFlags {
-                subscriber: conn.subscription_count > 0,
-                in_multi: conn.in_multi,
-                // A batch just completed, so this connection is by definition
-                // not blocked right now; the blocked bit is owned by
-                // `set_blocked` around the blocking await.
-                blocked: false,
-                replica: conn.saw_replconf,
-            },
+        // A batch just completed, so this connection is by definition not
+        // blocked right now; the blocked bit is owned by `set_blocked` around
+        // the blocking await.
+        client_live.touch(conn.selected_db, conn.client_flags(), ctx.cached_clock.ms());
+        crate::server::conn::shared::publish_pubsub_counts(
+            &client_live,
+            &ctx.shard_pubsub(),
+            &mut conn,
             ctx.cached_clock.ms(),
         );
 

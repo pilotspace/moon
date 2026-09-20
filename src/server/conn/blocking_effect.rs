@@ -187,8 +187,9 @@ pub(crate) fn blocking_effect_record(cmd: &[u8], args: &[Frame], reply: &Frame) 
     ]))
 }
 
-/// The shard owning the key a served blocking pop took from, or `None` when
-/// `reply` records no pop (a timeout, an error, a stream read).
+/// The shard owning the key a served blocking pop took from — or the stream a
+/// blocking `XREADGROUP` delivered from — or `None` when `reply` records no
+/// write (a timeout, an error, a plain `XREAD`).
 ///
 /// Since moon#1056 that shard — not the waiter's — logs the pop, at the
 /// moment it pops (`crate::blocking::pop_log`). Under `appendfsync always`
@@ -214,6 +215,18 @@ pub(crate) fn served_pop_owner(
                 _ => return None,
             }
         }
+        // moon#1104: a blocking `XREADGROUP` that delivered wrote the group's
+        // PEL and cursor on the stream's owner, which logged it there. Its
+        // reply is `[[stream, entries]]` — one stream, since a blocking read
+        // names exactly one. A plain `XREAD` wrote nothing and has no owner
+        // to wait for.
+        Frame::Array(items) if cmd.eq_ignore_ascii_case(b"XREADGROUP") => match items.first() {
+            Some(Frame::Array(pair)) => match pair.first() {
+                Some(Frame::BulkString(key)) => key,
+                _ => return None,
+            },
+            _ => return None,
+        },
         Frame::Array(items) => match items.first() {
             Some(Frame::BulkString(key)) => key,
             _ => return None,
@@ -264,6 +277,12 @@ mod tests {
             Frame::Array(framevec![])
         ])]);
         assert_eq!(served_pop_owner(b"XREAD", &[], &xread, n), None);
+        // XREADGROUP answers the same shape and DID write, on the stream's
+        // owner (moon#1104).
+        assert_eq!(
+            served_pop_owner(b"XREADGROUP", &[], &xread, n),
+            Some(key_to_shard(b"s", n))
+        );
     }
 
     fn bs(b: &[u8]) -> Frame {

@@ -3,6 +3,8 @@ pub mod claim;
 mod claim_wake_tests;
 pub mod group;
 pub mod pop_log;
+pub(crate) mod stream_log;
+pub mod stream_wake;
 pub mod wakeup;
 
 pub use claim::{ClaimToken, Settled};
@@ -11,6 +13,18 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::protocol::Frame;
 use bytes::Bytes;
+
+/// What a client blocked on a node that becomes a replica is answered, before
+/// its connection is closed — redis-server 8.6.1's text, byte for byte.
+pub const UNBLOCKED_ROLE_CHANGE: &[u8] =
+    b"UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)";
+
+/// Is `reply` the role-change unblock? The connection that receives it is
+/// closed once the reply is written, as redis does.
+#[inline]
+pub fn is_role_change_unblock(reply: &Frame) -> bool {
+    matches!(reply, Frame::Error(e) if e.as_ref() == UNBLOCKED_ROLE_CHANGE)
+}
 
 /// Direction for LMOVE/BLMOVE pop/push operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +254,35 @@ pub struct BlockingRegistry {
     next_id: u64,
     /// Shard ID encoded in upper 16 bits of wait_id for global uniqueness.
     shard_id: usize,
+    /// The waiters blocked in `XREADGROUP` (moon#1086). Redis unblocks such a
+    /// reader when ANY write deletes or retypes its stream, or destroys its
+    /// group — not only when the stream gains entries — so while one is
+    /// parked here, every write is a possible wake source; while none is,
+    /// the write paths keep their cheap gate ([`wakeup::may_wake`]). A group
+    /// reader is registered on exactly one key, and leaves this set exactly
+    /// when it leaves `wait_keys`.
+    group_readers: std::collections::HashSet<u64>,
+}
+
+thread_local! {
+    /// How many `XREADGROUP` waiters the registries on this thread hold. One
+    /// registry per shard thread, so this is that shard's count; it lets the
+    /// write gates that have no registry in hand (a `MULTI` body, a script)
+    /// ask the same question as [`BlockingRegistry::has_group_readers`].
+    static PARKED_GROUP_READERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Is any `XREADGROUP` parked on this shard thread? One `Cell` read.
+#[inline]
+pub fn group_readers_parked_here() -> bool {
+    PARKED_GROUP_READERS.with(|c| c.get() > 0)
+}
+
+impl Drop for BlockingRegistry {
+    fn drop(&mut self) {
+        let n = self.group_readers.len();
+        PARKED_GROUP_READERS.with(|c| c.set(c.get().saturating_sub(n)));
+    }
 }
 
 impl BlockingRegistry {
@@ -254,6 +297,39 @@ impl BlockingRegistry {
             deadlines: std::collections::BinaryHeap::new(),
             next_id: 0,
             shard_id,
+            group_readers: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Is any `XREADGROUP` parked on this shard? O(1).
+    #[inline]
+    pub fn has_group_readers(&self) -> bool {
+        !self.group_readers.is_empty()
+    }
+
+    /// Every `(db, key)` an `XREADGROUP` is parked on, deduplicated — the
+    /// keys a keyspace-wide deletion (`FLUSHDB`, `FLUSHALL`, active expiry)
+    /// may have taken from under a group reader.
+    ///
+    /// Hash-deduplicated: many readers tailing one stream share a key, and a
+    /// linear `contains` made this quadratic in the parked readers.
+    pub fn group_reader_keys(&self) -> Vec<(usize, Bytes)> {
+        let mut seen: std::collections::HashSet<(usize, &[u8])> =
+            std::collections::HashSet::with_capacity(self.group_readers.len());
+        let mut out: Vec<(usize, Bytes)> = Vec::new();
+        for id in &self.group_readers {
+            for (db, key) in self.wait_keys.get(id).into_iter().flatten() {
+                if seen.insert((*db, key.as_ref())) {
+                    out.push((*db, key.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    fn forget_group_reader(&mut self, wait_id: u64) {
+        if self.group_readers.remove(&wait_id) {
+            PARKED_GROUP_READERS.with(|c| c.set(c.get().saturating_sub(1)));
         }
     }
 
@@ -305,6 +381,11 @@ impl BlockingRegistry {
     /// Push to back of the FIFO queue. Also records in wait_keys for cross-key cleanup.
     pub fn register(&mut self, db_index: usize, key: Bytes, entry: WaitEntry) {
         let wait_id = entry.wait_id;
+        if matches!(entry.cmd, BlockedCommand::XReadGroup { .. })
+            && self.group_readers.insert(wait_id)
+        {
+            PARKED_GROUP_READERS.with(|c| c.set(c.get() + 1));
+        }
         let queue_key = (db_index, key.clone());
 
         if let Some(deadline) = entry.deadline {
@@ -454,6 +535,7 @@ impl BlockingRegistry {
             let Some(keys) = self.wait_keys.remove(id) else {
                 continue;
             };
+            self.forget_group_reader(*id);
             crate::admin::metrics_setup::record_client_unblocked();
             for (sib_db, sib_key) in keys {
                 if sib_db == db_index && sib_key == key {
@@ -474,6 +556,7 @@ impl BlockingRegistry {
     /// Used after a waiter is woken or times out to clean up cross-key registrations.
     pub fn remove_wait(&mut self, wait_id: u64) {
         if let Some(keys) = self.wait_keys.remove(&wait_id) {
+            self.forget_group_reader(wait_id);
             crate::admin::metrics_setup::record_client_unblocked();
             for (db_index, key) in keys {
                 if let Some(queue) = self.queue_mut(db_index, &key) {
@@ -484,6 +567,46 @@ impl BlockingRegistry {
                 }
             }
         }
+    }
+
+    /// Answer every client parked on this shard the error `reason` and forget
+    /// them all. Returns how many were answered (a waiter whose client is
+    /// already gone, or whose claim another shard won, is dropped silently).
+    ///
+    /// For a role change: a node that becomes a replica must not serve
+    /// the clients it parked as a master. A blocking pop left parked there
+    /// is served by the first replicated push, which takes the element out
+    /// of the replica's copy only. Redis's `disconnectAllBlockedClients`
+    /// does the same, with [`UNBLOCKED_ROLE_CHANGE`].
+    pub fn unblock_all(&mut self, reason: &'static [u8]) -> usize {
+        let mut answered = 0;
+        let waiters = std::mem::take(&mut self.waiters);
+        for entry in waiters
+            .into_values()
+            .flat_map(HashMap::into_values)
+            .flatten()
+        {
+            // A waiter on several keys has one entry per key; the first one
+            // met answers it, the rest drop their senders.
+            if self.wait_keys.remove(&entry.wait_id).is_none() {
+                continue;
+            }
+            crate::admin::metrics_setup::record_client_unblocked();
+            if entry.claim.as_ref().is_none_or(ClaimToken::try_claim)
+                && entry
+                    .reply_tx
+                    .send(Some(Frame::Error(Bytes::from_static(reason))))
+                    .is_ok()
+            {
+                answered += 1;
+            }
+        }
+        let group_readers = self.group_readers.len();
+        self.group_readers.clear();
+        PARKED_GROUP_READERS.with(|c| c.set(c.get().saturating_sub(group_readers)));
+        self.wait_keys.clear();
+        self.deadlines.clear();
+        answered
     }
 
     /// Is `wait_id` still registered on at least one key of this shard?
@@ -701,6 +824,137 @@ mod tests {
     fn test_has_waiters_empty() {
         let reg = BlockingRegistry::new(0);
         assert!(!reg.has_waiters(0, &Bytes::from_static(b"nokey")));
+    }
+
+    /// Readers tailing one stream share its key: each `(db, key)` is named
+    /// once, whatever the number of readers on it.
+    #[test]
+    fn group_reader_keys_names_each_key_once() {
+        let mut reg = BlockingRegistry::new(0);
+        let (s, t) = (Bytes::from_static(b"s"), Bytes::from_static(b"t"));
+        let mut receivers = Vec::new();
+        for (db, key) in [(0, &s), (0, &s), (0, &s), (0, &t), (1, &s)] {
+            let (tx, rx) = crate::runtime::channel::oneshot();
+            receivers.push(rx);
+            let wait_id = reg.next_wait_id();
+            reg.register(
+                db,
+                key.clone(),
+                WaitEntry {
+                    wait_id,
+                    cmd: BlockedCommand::XReadGroup {
+                        group: Bytes::from_static(b"g"),
+                        consumer: Bytes::from_static(b"c"),
+                        streams: vec![(key.clone(), StreamSince::Latest)],
+                        count: None,
+                        noack: false,
+                    },
+                    reply_tx: tx,
+                    deadline: None,
+                    claim: None,
+                },
+            );
+        }
+        let mut keys = reg.group_reader_keys();
+        keys.sort();
+        assert_eq!(keys, vec![(0, s.clone()), (0, t), (1, s)]);
+    }
+
+    /// A role change answers each waiter once — a waiter on two keys too —
+    /// skips one whose claim another shard won, and leaves nothing behind:
+    /// no queue, no deadline, no parked group reader.
+    #[test]
+    fn unblock_all_answers_every_waiter_once_and_empties_the_registry() {
+        use crate::runtime::channel::oneshot;
+        let mut reg = BlockingRegistry::new(0);
+        let (a, b) = (Bytes::from_static(b"a"), Bytes::from_static(b"b"));
+        let reason = UNBLOCKED_ROLE_CHANGE;
+
+        // One waiter on two keys, with a deadline.
+        let multi = reg.next_wait_id();
+        let (tx1, rx1) = oneshot();
+        let (tx2, rx2) = oneshot();
+        for (key, tx) in [(a.clone(), tx1), (b.clone(), tx2)] {
+            let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+            reg.register(
+                0,
+                key,
+                WaitEntry {
+                    wait_id: multi,
+                    cmd: BlockedCommand::BLPop,
+                    reply_tx: tx,
+                    deadline,
+                    claim: None,
+                },
+            );
+        }
+        // A group reader.
+        let (tx3, rx3) = oneshot();
+        let id3 = reg.next_wait_id();
+        reg.register(
+            3,
+            a.clone(),
+            WaitEntry {
+                wait_id: id3,
+                cmd: BlockedCommand::XReadGroup {
+                    group: Bytes::from_static(b"g"),
+                    consumer: Bytes::from_static(b"c"),
+                    streams: vec![(a.clone(), StreamSince::Latest)],
+                    count: None,
+                    noack: false,
+                },
+                reply_tx: tx3,
+                deadline: None,
+                claim: None,
+            },
+        );
+        assert!(group_readers_parked_here());
+        // A remote waiter another shard has already served.
+        let won_elsewhere = ClaimToken::new();
+        assert!(won_elsewhere.try_claim());
+        let (tx4, rx4) = oneshot();
+        let id4 = reg.next_wait_id();
+        reg.register(
+            0,
+            b.clone(),
+            WaitEntry {
+                wait_id: id4,
+                cmd: BlockedCommand::BLPop,
+                reply_tx: tx4,
+                deadline: None,
+                claim: Some(won_elsewhere),
+            },
+        );
+
+        assert_eq!(reg.unblock_all(reason), 2);
+
+        let answer = Some(Frame::Error(Bytes::from_static(reason)));
+        let multi_answers = [rx1.try_recv().ok(), rx2.try_recv().ok()];
+        assert_eq!(
+            multi_answers
+                .iter()
+                .filter(|r| **r == Some(answer.clone()))
+                .count(),
+            1,
+            "the two-key waiter is answered exactly once: {multi_answers:?}"
+        );
+        assert_eq!(rx3.try_recv().ok(), Some(answer));
+        assert!(
+            rx4.try_recv().is_err(),
+            "a claim lost elsewhere is not answered"
+        );
+        assert!(is_role_change_unblock(&Frame::Error(Bytes::from_static(
+            reason
+        ))));
+
+        assert!(!reg.has_any_waiters());
+        assert!(!reg.is_waiting(multi) && !reg.is_waiting(id3) && !reg.is_waiting(id4));
+        assert!(!reg.has_group_readers());
+        assert!(!group_readers_parked_here());
+        assert_eq!(
+            reg.expire_timed_out(std::time::Instant::now() + std::time::Duration::from_secs(120)),
+            0
+        );
     }
 }
 

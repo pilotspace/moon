@@ -14,6 +14,8 @@ on:
       - 'Cargo.lock'
       - 'deny.toml'
       - '.cargo/audit.toml'
+      - 'fuzz/Cargo.toml'
+      - 'fuzz/Cargo.lock'
       - '.github/workflows/supply-chain.yml'
   pull_request:
     branches: [main]
@@ -22,6 +24,8 @@ on:
       - 'Cargo.lock'
       - 'deny.toml'
       - '.cargo/audit.toml'
+      - 'fuzz/Cargo.toml'
+      - 'fuzz/Cargo.lock'
       - '.github/workflows/supply-chain.yml'
   schedule:
     # Weekly, independent of code changes -- RUSTSEC advisories are
@@ -53,7 +57,14 @@ jobs:
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         with:
           tool: cargo-audit@0.22.2
-      - run: cargo audit
+      - name: cargo audit (root workspace)
+        run: cargo audit
+      # fuzz/ is a separate workspace with its own lockfile. Its targets link
+      # moon's library and run nightly on hosted runners, so a vulnerable
+      # transitive dependency there is still shipped CI code. Run from the
+      # repo root so .cargo/audit.toml applies to both lockfiles.
+      - name: cargo audit (fuzz workspace)
+        run: cargo audit --file fuzz/Cargo.lock
 
   # -- cargo deny: advisories + license allowlist + ban rules + sources -
   deny:

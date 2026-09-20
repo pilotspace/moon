@@ -6,6 +6,8 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 
+pub use crate::blocking::stream_wake::{stream_register_error, try_wake_stream_waiter};
+
 /// The ready keys of one write, in the order it wrote them. Most writes name
 /// one or two; only a wide multi-key write spills to the heap.
 pub type ReadyKeys = smallvec::SmallVec<[Bytes; 2]>;
@@ -39,6 +41,28 @@ pub fn may_ready_a_key(cmd: &[u8]) -> bool {
                 .iter()
                 .any(|family| m.acl_categories.contains(*family))
     })
+}
+
+/// The gate every write→waiter hook opens with: [`may_ready_a_key`], widened
+/// to EVERY write while an `XREADGROUP` is parked on this shard (moon#1086).
+///
+/// A group reader is owed an answer not only when its stream gains entries
+/// but when any write deletes it (`DEL`, `UNLINK`, `RENAME` away, `MOVE`
+/// away), retypes it (`SET`, `RESTORE ... REPLACE`, ...) or destroys its
+/// group: redis marks the reader `unblock_on_nokey` and answers it `-NOGROUP`
+/// / `-WRONGTYPE` at once (measured against redis-server 8.6.1). Those writes
+/// are `@string`, `@hash`, `@set` as often as not, which the cheap gate
+/// rightly skips for list, zset and `XREAD` waiters. So the widening costs
+/// one thread-local read, and only a shard that actually has a group reader
+/// parked walks the keys of a `SET`.
+#[inline]
+pub fn may_wake(cmd: &[u8]) -> bool {
+    may_ready_a_key(cmd)
+        || (crate::blocking::group_readers_parked_here()
+            && crate::command::metadata::lookup(cmd).is_some_and(|m| {
+                m.flags
+                    .contains(crate::command::metadata::CommandFlags::WRITE)
+            }))
 }
 
 /// Call `f` on every key a write command may have CREATED or GROWN — the keys
@@ -137,7 +161,7 @@ pub fn ready_keys(
     args: &[Frame],
 ) -> ReadyKeys {
     let mut keys = ReadyKeys::new();
-    if !registry.has_any_waiters() || !may_ready_a_key(cmd) {
+    if !registry.has_any_waiters() || !may_wake(cmd) {
         return keys;
     }
     for_each_written_key(cmd, args, |k| {
@@ -401,14 +425,28 @@ fn serve_ready_key(
     budget: &mut std::time::Duration,
 ) -> bool {
     let now_ms = db.now_ms();
-    if matches!(db.get_list_ref_if_alive(key, now_ms), Ok(Some(_))) {
+    let served = if matches!(db.get_list_ref_if_alive(key, now_ms), Ok(Some(_))) {
         serve_list_key(registry, db, db_index, key, worklist, pending_from, budget)
     } else if matches!(db.get_sorted_set_ref_if_alive(key, now_ms), Ok(Some(_))) {
         serve_zset_key(registry, db, db_index, key, budget)
     } else if matches!(db.get_stream_if_alive(key, now_ms), Ok(Some(_))) {
-        try_wake_stream_waiter(registry, db, db_index, key)
+        return crate::blocking::stream_wake::try_wake_stream_waiter_budgeted(
+            registry, db, db_index, key, budget,
+        );
     } else {
         false
+    };
+    // moon#1086: the key is not a stream (any more). A group reader parked on
+    // it is owed `-NOGROUP` (the key is gone) or `-WRONGTYPE` (it holds
+    // something else) now; the stream waker decides both. Plain `XREAD`
+    // waiters stay parked, as in redis.
+    if registry.has_group_readers() {
+        served
+            | crate::blocking::stream_wake::try_wake_stream_waiter_budgeted(
+                registry, db, db_index, key, budget,
+            )
+    } else {
+        served
     }
 }
 
@@ -680,9 +718,11 @@ fn serve_list_key(
             // moon#1056: the AOF writer could not take this pop's record
             // within the backpressure bound. Every further serve here would
             // wait out a bound of its own on the shard thread; leave the rest
-            // parked beside their data instead (a later write to the key, or
-            // their own timeout, reaches them).
+            // parked beside their data instead; the key is retried once the
+            // writer has room again (moon#1111), not left for a later write
+            // to the key or the waiters' own timeouts.
             if delivered == Delivered::ServedAofLost {
+                defer_wake(db_index, key);
                 break;
             }
             // moon#1019: one push can carry several elements, and
@@ -961,7 +1001,12 @@ fn serve_zset_key(
         );
         if delivered.served() {
             served = true;
-            if delivered == Delivered::ServedAofLost || !db.exists(key) {
+            if delivered == Delivered::ServedAofLost {
+                // moon#1111: see serve_list_key.
+                defer_wake(db_index, key);
+                break;
+            }
+            if !db.exists(key) {
                 break;
             }
         }
@@ -1120,6 +1165,105 @@ pub fn wake_swapped_dbs(registry: &std::cell::RefCell<BlockingRegistry>, a: usiz
     wake_recorded(registry, recorded);
 }
 
+thread_local! {
+    /// Set when this shard removed keys in a way no write hook names a key
+    /// for — a flush, a `MOVE` out of the source database, active expiry —
+    /// while an `XREADGROUP` was parked here. Drained by
+    /// [`recheck_group_readers`] on the shard's 10 ms blocking tick.
+    static GROUP_READER_RECHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A deletion the ready-key hooks cannot see — `FLUSHDB`, `FLUSHALL`, the
+/// source half of a `MOVE`, an expired key — just ran on this shard.
+///
+/// Redis signals every deleted key (`signalDeletedKeyAsReady`), and a parked
+/// `XREADGROUP` whose stream went with it is answered `-NOGROUP` at once
+/// (moon#1086). These deletions name no key to [`ready_keys`] (a flush names
+/// none, a `MOVE` names the key it wrote in the OTHER database, an expiry is
+/// no command at all), so instead they mark the shard for a recheck of its
+/// parked group readers, which the blocking tick runs within 10 ms. One
+/// thread-local read when no group reader is parked; nothing else.
+#[inline]
+pub fn note_unsignalled_removal() {
+    if crate::blocking::group_readers_parked_here() {
+        GROUP_READER_RECHECK.with(|c| c.set(true));
+    }
+}
+
+/// Run the recheck [`note_unsignalled_removal`] asked for: offer every key a
+/// group reader is parked on to the stream waker, which answers the readers
+/// whose stream or group is gone and serves any that have entries. Called
+/// from the shard's blocking tick, outside any borrow of its slice.
+pub fn recheck_group_readers(registry: &std::cell::RefCell<BlockingRegistry>) {
+    if !GROUP_READER_RECHECK.with(|c| c.replace(false)) {
+        return;
+    }
+    let keys = {
+        let reg = registry.borrow();
+        if !reg.has_group_readers() {
+            return;
+        }
+        reg.group_reader_keys()
+    };
+    let mut reg = registry.borrow_mut();
+    let mut budget = crate::blocking::pop_log::wake_budget();
+    for (db_index, key) in keys {
+        crate::shard::slice::with_shard_db(db_index, |db| {
+            crate::blocking::stream_wake::try_wake_stream_waiter_budgeted(
+                &mut reg,
+                db,
+                db_index,
+                &key,
+                &mut budget,
+            );
+        });
+    }
+}
+
+thread_local! {
+    /// Keys whose wake stopped at a record the AOF writer refused, with
+    /// waiters possibly still parked beside data (moon#1111). Retried by
+    /// [`retry_deferred_wakes`] once the writer has room.
+    static DEFERRED_WAKES: std::cell::RefCell<Vec<(usize, Bytes)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A wake on `key` stopped early because the AOF writer refused a served
+/// pop's record (`Delivered::ServedAofLost`): every further serve in that
+/// pass would have waited out another bound on the shard thread, so the
+/// waiters behind it were left parked. Remember the key, so they are served
+/// as soon as the writer can take records again — without needing another
+/// write to the key, which for a producer that has gone quiet never comes
+/// (moon#1111). Allocates only on that already-failing path.
+pub(crate) fn defer_wake(db_index: usize, key: &Bytes) {
+    DEFERRED_WAKES.with(|d| {
+        let mut d = d.borrow_mut();
+        if !d.iter().any(|(db, k)| *db == db_index && k == key) {
+            d.push((db_index, key.clone()));
+        }
+    });
+}
+
+/// The deferred keys, once the writer has room; `None` (and nothing taken)
+/// while there is nothing deferred or the writer is still saturated.
+pub(crate) fn take_deferred_wakes() -> Option<Vec<(usize, Bytes)>> {
+    let pending = DEFERRED_WAKES.with(|d| !d.borrow().is_empty());
+    if !pending || !crate::blocking::pop_log::writer_has_room() {
+        return None;
+    }
+    Some(DEFERRED_WAKES.with(|d| std::mem::take(&mut *d.borrow_mut())))
+}
+
+/// Retry the wakes [`defer_wake`] recorded, as one batch per database with a
+/// fresh backpressure budget, if the writer has room. A serve that meets a
+/// saturated writer again defers its key again, for the next tick. Called
+/// from the shard's 10 ms blocking tick, outside any borrow of its slice.
+pub fn retry_deferred_wakes(registry: &std::cell::RefCell<BlockingRegistry>) {
+    if let Some(keys) = take_deferred_wakes() {
+        wake_recorded(registry, keys);
+    }
+}
+
 /// How a script's writes reach the clients blocked on the keys they touched.
 pub enum ScriptWakes<'a> {
     /// Serve them when the script returns, from this shard's registry.
@@ -1172,7 +1316,7 @@ pub fn begin_script_writes(wakes: &ScriptWakes<'_>) {
 /// that cannot produce a list, zset or stream ([`may_ready_a_key`]); a key is
 /// recorded once per script.
 pub fn note_script_write(db_index: usize, cmd: &[u8], args: &[Frame]) {
-    if !SCRIPT_WAKES_ARMED.with(std::cell::Cell::get) || !may_ready_a_key(cmd) {
+    if !SCRIPT_WAKES_ARMED.with(std::cell::Cell::get) || !may_wake(cmd) {
         return;
     }
     SCRIPT_WRITES.with(|w| {
@@ -1182,6 +1326,25 @@ pub fn note_script_write(db_index: usize, cmd: &[u8], args: &[Frame]) {
                 w.push((db_index, key.clone()));
             }
         });
+    });
+}
+
+/// [`note_script_write`] for the key a script's `MOVE` / `COPY ... DB n`
+/// wrote into ANOTHER database (moon#1068) — the script half of
+/// [`cross_db_write_target`]. The caller passes it only for a `:1` reply.
+///
+/// Served with the script's other ready keys once it returns, which is after
+/// the bridge has logged the command: a pop the wake performs is logged as it
+/// happens, so it must follow the write that fed it (moon#1056).
+pub fn note_script_cross_db_write(dst_db: usize, key: &Bytes) {
+    if !SCRIPT_WAKES_ARMED.with(std::cell::Cell::get) {
+        return;
+    }
+    SCRIPT_WRITES.with(|w| {
+        let mut w = w.borrow_mut();
+        if !w.iter().any(|(db, k)| *db == dst_db && k == key) {
+            w.push((dst_db, key.clone()));
+        }
     });
 }
 
@@ -1254,255 +1417,6 @@ pub fn wake_cross_db_write_on_shard(
     crate::shard::slice::with_shard_db(dst_db, |dst| {
         wake_cross_db_write(registry, dst, dst_db, key, reply)
     })
-}
-
-/// Called after `XADD` adds an entry to a stream key, and again right after a
-/// remote `BlockRegister` lands, to serve whatever stream readers that key now
-/// has parked on it.
-///
-/// Returns true if at least one blocked client was answered.
-///
-/// # Why this is not shaped like the list and zset wakers
-///
-/// Those wakers CONSUME: a pushed element belongs to exactly one waiter, so
-/// `pop_front_of_family` + answer + `return true` is the whole operation, and
-/// a waiter they cannot serve means the key really is empty.
-///
-/// Stream reads are non-destructive, and both halves of that matter
-/// (both measured against redis-server 8.6.1):
-///
-/// * **one `XADD` wakes EVERY parked `XREAD`.** Two clients on
-///   `XREAD BLOCK 5000 STREAMS k $` each receive the entry from a single
-///   `XADD`. Stopping at the first served waiter would have left the second
-///   parked until its deadline.
-/// * **a waiter this `XADD` cannot serve must stay parked.** The pre-#595
-///   code ran `remove_wait` + `reply_tx.send(None)` for every waiter it
-///   popped, servable or not — so an `XADD` at an id BELOW a `$`-bound
-///   reader's cursor, or an `XREADGROUP` whose entries a sibling consumer
-///   just took, unblocked that reader with a premature null. That same
-///   `send(None)` is what would have fired on the re-check the
-///   `BlockRegister` handler runs immediately after registering, making a
-///   remote `XREAD BLOCK` answer null the instant it was registered.
-///
-/// So this walks the key's stream-family waiters in FIFO order, decides each
-/// one against the store while it is still queued ([`peek_wait`]), and only
-/// removes the ones it can actually answer ([`take_wait`]). Nothing is ever
-/// answered `None` here; a waiter that is not served stays registered and is
-/// released by its own deadline, its client's disconnect, or a later `XADD`.
-///
-/// [`peek_wait`]: BlockingRegistry::peek_wait
-/// [`take_wait`]: BlockingRegistry::take_wait
-pub fn try_wake_stream_waiter(
-    registry: &mut BlockingRegistry,
-    db: &mut Database,
-    db_index: usize,
-    key: &Bytes,
-) -> bool {
-    // Decide first, mutate second. One pass over the queue, with every waiter
-    // still in place, so a decision of "cannot serve" costs nothing and leaves
-    // FIFO order untouched.
-    //
-    // Queue order is NOT `wait_id` order (moon#620). An id is
-    // `(shard_id << 48) | counter`, minted by the registry of the shard the
-    // waiter's CONNECTION lives on, while the queue belongs to the shard that
-    // owns the KEY — so a reader on shard 3 that parks before a reader on
-    // shard 1 puts the larger id first. Everything downstream of here treats
-    // the two orders as independent.
-    let mut decisions: smallvec::SmallVec<[(u64, Option<Frame>); 4]> = smallvec::SmallVec::new();
-    {
-        let Some(queue) = registry.waiters_on(db_index, key) else {
-            return false;
-        };
-        for entry in queue
-            .iter()
-            .filter(|e| e.cmd.family() == crate::blocking::WaitFamily::Stream)
-        {
-            // c10k A2: a client that already went away must not consume the
-            // wake a live sibling needs. There is nothing to undo on this
-            // path — `XREAD` mutates nothing, and `XREADGROUP`'s delivery
-            // leaves the entries in the stream and only records them in the
-            // PEL of a consumer that vanished, which is precisely Redis's
-            // dead-consumer state (recoverable via `XAUTOCLAIM`).
-            //
-            // moon#1023: a remote reader whose wait already ended (its claim
-            // token is settled) is exactly as gone.
-            if entry.is_settled() {
-                decisions.push((entry.wait_id, None));
-            } else if let Some(frame) = serve_stream_waiter(&entry.cmd, db, key) {
-                decisions.push((entry.wait_id, Some(frame)));
-            }
-            // Anything else stays REGISTERED and is released by its own
-            // deadline, its client's disconnect, or a later XADD. It is never
-            // answered `None` here.
-        }
-    }
-    if decisions.is_empty() {
-        return false;
-    }
-
-    // `take_waits` looks each id up with a binary search, so it must be handed
-    // a SORTED slice — queue order will not do (see above). An unsorted slice
-    // makes the search miss ids that are present, which silently leaves those
-    // waiters parked until their own deadline: the lost wakeup moon#620 was
-    // filed for.
-    let mut ids: smallvec::SmallVec<[u64; 4]> = decisions.iter().map(|(id, _)| *id).collect();
-    ids.sort_unstable();
-
-    let mut woke = false;
-    // Pair each returned entry with its decision BY `wait_id`, never by
-    // position: `take_waits` hands entries back in queue order while `ids` is
-    // sorted, and a positional pairing would hand one reader the entries
-    // computed for another's cursor.
-    for entry in registry.take_waits(db_index, key, &ids) {
-        let Some(slot) = decisions.iter_mut().find(|(id, _)| *id == entry.wait_id) else {
-            debug_assert!(false, "take_waits returned an entry we did not ask for");
-            continue;
-        };
-        let Some(frame) = slot.1.take() else {
-            continue; // the disconnected client — removed, nothing to send
-        };
-        // moon#1023: a reader that gave up between the decision and here
-        // must not be answered — its client already has its null. Nothing to
-        // restore: the entries are still in the stream (XREADGROUP's PEL
-        // side effect is the same dead-consumer state as the A2 case below).
-        if entry.claim.as_ref().is_some_and(|c| !c.try_claim()) {
-            continue;
-        }
-        if entry.reply_tx.send(Some(frame)).is_ok() {
-            woke = true;
-        }
-        // A failed send is the residual A2 race — the receiver dropped between
-        // the check above and here. Nothing to restore: the entries are still
-        // in the stream.
-    }
-    woke
-}
-
-/// The error a blocking stream read owes its client IMMEDIATELY, decided on
-/// the shard that owns `key` (moon#595).
-///
-/// Registering is the wrong answer to a question the keyspace has already
-/// settled. `-WRONGTYPE` and `XREADGROUP`'s two errors are permanent for as
-/// long as the key is what it is: a group that does not exist cannot start
-/// existing because someone `XADD`s to the stream, so a waiter parked on that
-/// hope would burn its whole budget and then answer the null array.
-///
-/// It runs HERE, in the `BlockRegister` handler, and not only in the client's
-/// own pre-registration scan, because that scan can see only the keys its
-/// shard owns. Without this, `XREADGROUP GROUP nope c BLOCK 800 STREAMS k >`
-/// answered `-NOGROUP` in 0.000 s when `k` hashed to the client's own shard
-/// and parked for the full 800 ms when it did not — the same command, two
-/// answers, decided by a hash.
-///
-/// `None` means "nothing settled; park".
-pub fn stream_register_error(
-    db: &mut Database,
-    key: &Bytes,
-    cmd: &BlockedCommand,
-) -> Option<Frame> {
-    // Wrong type is wrong type for both stream readers.
-    if let Some(err) = db.get_stream(key).err() {
-        return Some(err);
-    }
-    let BlockedCommand::XReadGroup { group, .. } = cmd else {
-        // A plain XREAD on a missing key is not an error — that is exactly the
-        // `$`-on-a-future-stream case, and it must park.
-        return None;
-    };
-    let Ok(Some(stream)) = db.get_stream(key) else {
-        return Some(Frame::Error(Bytes::from_static(
-            b"ERR The XREADGROUP subcommand requires the key to exist.",
-        )));
-    };
-    if !stream.groups.contains_key(group.as_ref()) {
-        return Some(Frame::Error(Bytes::from_static(
-            b"NOGROUP No such consumer group for key name",
-        )));
-    }
-    None
-}
-
-/// The reply a parked stream reader is owed by the current state of `key`, or
-/// `None` if this key cannot serve it yet.
-///
-/// Split out of [`try_wake_stream_waiter`] so the "can I serve this?" question
-/// is answerable against a borrowed [`WaitEntry`], which is what keeps an
-/// unservable waiter in the queue.
-fn serve_stream_waiter(cmd: &BlockedCommand, db: &mut Database, key: &Bytes) -> Option<Frame> {
-    use crate::command::stream::format_entry;
-    use crate::storage::stream::StreamId;
-
-    // Each arm builds its own frames: `range` hands back BORROWED field lists
-    // while `read_group_new` hands back owned ones, so there is no common
-    // `entries` type to carry out of the match.
-    let entry_frames: Vec<Frame> = match cmd {
-        BlockedCommand::XRead { streams, count } => {
-            // `find` rather than an index: a multi-key XREAD registers the
-            // same command on several keys and only this key's cursor applies.
-            //
-            // `StreamSince::Latest` here means `$` was never bound to a
-            // number. That is a binding bug, not a client state — and it
-            // resolves to "serve nothing" deliberately: treating it as `0-0`
-            // would replay the stream's whole history to a client that asked
-            // only for what arrives next.
-            let since = streams
-                .iter()
-                .find(|(k, _)| k == key)
-                .and_then(|(_, since)| since.id())?;
-            let start = if since.seq == u64::MAX {
-                StreamId {
-                    ms: since.ms.saturating_add(1),
-                    seq: 0,
-                }
-            } else {
-                StreamId {
-                    ms: since.ms,
-                    seq: since.seq.saturating_add(1),
-                }
-            };
-            let stream = db.get_stream(key).ok()??;
-            let entries = stream.range(start, StreamId::MAX, *count);
-            if entries.is_empty() {
-                return None;
-            }
-            entries
-                .into_iter()
-                .map(|(id, fields)| format_entry(id, fields))
-                .collect()
-        }
-        BlockedCommand::XReadGroup {
-            group,
-            consumer,
-            count,
-            noack,
-            ..
-        } => {
-            let stream = db.get_stream_mut(key).ok()??;
-            // Only reaches the store when a live waiter is actually waiting on
-            // it, so the PEL side effect never happens on behalf of a client
-            // that has already gone (checked by the caller).
-            let entries = stream
-                .read_group_new(group, consumer, *count, *noack)
-                .ok()?;
-            if entries.is_empty() {
-                return None;
-            }
-            entries
-                .iter()
-                .map(|(id, fields)| format_entry(*id, fields))
-                .collect()
-        }
-        // Unreachable since moon#535: `family()` routes only the two stream
-        // commands here, and `family_wait_ids` filtered on it.
-        _ => return None,
-    };
-    // Only the stream that actually had entries appears, which is both what
-    // Redis answers a woken reader and what moon#594 made the non-blocking
-    // XREAD do.
-    Some(Frame::Array(framevec![Frame::Array(framevec![
-        Frame::BulkString(key.clone()),
-        Frame::Array(entry_frames.into()),
-    ])]))
 }
 
 #[cfg(test)]
@@ -2238,6 +2152,23 @@ mod wake_written_keys_tests {
             vec![(0, Bytes::from_static(b"q")), (2, Bytes::from_static(b"z"))]
         );
         assert!(take_script_writes().is_empty());
+    }
+
+    /// moon#1068: a script's `MOVE` / `COPY ... DB n` records the key in the
+    /// DESTINATION db, once, among the script's other ready keys — and only
+    /// while the script's wakes are armed.
+    #[test]
+    fn script_cross_db_writes_record_the_destination() {
+        let q = Bytes::from_static(b"q");
+        begin_script_writes(&ScriptWakes::Defer { armed: true });
+        note_script_write(0, b"RPUSH", &args(&["q", "a"]));
+        note_script_cross_db_write(9, &q);
+        note_script_cross_db_write(9, &q);
+        assert_eq!(take_script_writes(), vec![(0, q.clone()), (9, q.clone())]);
+
+        begin_script_writes(&ScriptWakes::Defer { armed: false });
+        note_script_cross_db_write(9, &q);
+        assert!(take_script_writes().is_empty(), "recorded while disarmed");
     }
 
     /// A script that starts while nobody on the shard is blocked records

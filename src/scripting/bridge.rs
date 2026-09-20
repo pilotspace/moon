@@ -687,7 +687,32 @@ pub fn make_redis_call_fn(
             // redis does not count either.
             crate::admin::metrics_setup::count_client_command_by_name(&cmd_bytes, &frames[1..]);
 
-            let frame = db.execute_command(&cmd_bytes, &frames[1..], &mut db_idx, db_count);
+            // moon#1068: `MOVE` and `COPY ... DB n` write a SECOND database,
+            // which `execute_command` (one `&mut Database`) cannot reach: MOVE
+            // hit its "requires handler-level dispatch" arm, and COPY ignored
+            // the DB clause and wrote the copy into THIS db while the effect
+            // record below named db n — so replicas and replay put the key
+            // where the master did not. Same resolver and cores as the
+            // connection, MULTI and replay paths (`move_cmd::resolve_two_db`).
+            // `None` = an ordinary command, including a same-db COPY.
+            let two_db = crate::command::keyspace::move_cmd::resolve_two_db(
+                &cmd_bytes,
+                &frames[1..],
+                db_idx,
+                db_count,
+            );
+            let (frame, cross_db_write) = match two_db {
+                None => (
+                    db.execute_command(&cmd_bytes, &frames[1..], &mut db_idx, db_count),
+                    None,
+                ),
+                Some(Err(reply)) => (reply, None),
+                Some(Ok(op)) => {
+                    let reply = run_two_db_op(db, &op, &eviction_ctx);
+                    let target = matches!(reply, Frame::Integer(1)).then(|| op.into_target());
+                    (reply, Some(target))
+                }
+            };
 
             // moon#685: a flush issued from Lua has to reach as far as the
             // same flush issued on the connection — `FLUSHDB` the selected
@@ -719,14 +744,30 @@ pub fn make_redis_call_fn(
             // for FCALL_RO / EVAL_RO (`cmd_is_write` implies the read-only
             // gate above already passed, so a write here only happens in a
             // normal read-write script).
-            if cmd_is_write && !matches!(frame, Frame::Error(_)) {
-                eviction_ctx.emit_effect(db_idx, &frames, &frame);
-                // moon#1069: a key this write created may have a client blocked
-                // on it. Recorded, not served: the waiters see the script's
-                // result once it has finished, exactly as redis serves its
-                // ready keys after EVAL returns, and this closure has neither
-                // the registry nor a way to reach another database.
-                crate::blocking::wakeup::note_script_write(db_idx, &cmd_bytes, &frames[1..]);
+            match cross_db_write {
+                // moon#1068: a two-database write is recorded only when it
+                // wrote (`:1`), verbatim, under the SOURCE db — the rule every
+                // live path follows and what redis logs. A replica and replay
+                // apply it with the same cores, into the db it names. The
+                // woken key is the one in the DESTINATION db, recorded after
+                // the effect so the wake follows the log (moon#1056).
+                Some(Some((dst_db, key))) => {
+                    eviction_ctx.emit_effect(db_idx, &frames, &frame);
+                    crate::blocking::wakeup::note_script_cross_db_write(dst_db, &key);
+                }
+                // `:0` (source missing, destination occupied) or an error:
+                // nothing was written, so nothing is logged or woken.
+                Some(None) => {}
+                None if cmd_is_write && !matches!(frame, Frame::Error(_)) => {
+                    eviction_ctx.emit_effect(db_idx, &frames, &frame);
+                    // moon#1069: a key this write created may have a client
+                    // blocked on it. Recorded, not served: the waiters see the
+                    // script's result once it has finished, exactly as redis
+                    // serves its ready keys after EVAL returns, and this
+                    // closure has no registry in scope.
+                    crate::blocking::wakeup::note_script_write(db_idx, &cmd_bytes, &frames[1..]);
+                }
+                None => {}
             }
 
             // moon#1089: CLIENT TRACKING sees every command a script runs, as
@@ -761,6 +802,43 @@ pub fn make_redis_call_fn(
         }
 
         crate::scripting::types::frame_to_lua_value(lua, &result)
+    })
+}
+
+/// moon#1068: run a script's `MOVE` / `COPY ... DB n` between `src` — the
+/// database the script is pinned to, whose guard the caller already holds —
+/// and the destination database `op` names, reached through
+/// [`crate::shard::slice::with_second_shard_db`].
+///
+/// A `COPY` grows the destination, so it runs the same eviction gate as any
+/// other write, against the destination (the connection path's rule, in
+/// `spsc_two_db`); a `MOVE` is net-zero and the caller has already gated the
+/// source. The destination's expiry clock is refreshed first, as the MULTI
+/// executor does, so an expired destination key cannot block the write.
+///
+/// On a thread outside the registered database plane (unit-test slices) the
+/// destination cannot be reached, and the command is refused rather than
+/// applied to the one database in hand.
+fn run_two_db_op(
+    src: &mut crate::storage::Database,
+    op: &crate::command::keyspace::move_cmd::TwoDbOp,
+    eviction_ctx: &LuaEvictionCtx,
+) -> Frame {
+    use crate::command::keyspace::move_cmd::TwoDbOp;
+    let dst_db = op.dst_db();
+    crate::shard::slice::with_second_shard_db(dst_db, |dst| {
+        dst.refresh_now();
+        if matches!(op, TwoDbOp::Copy(_))
+            && let Err(oom) = eviction_ctx.gate(dst, dst_db)
+        {
+            return oom;
+        }
+        op.apply(src, dst)
+    })
+    .unwrap_or_else(|| {
+        Frame::Error(Bytes::from_static(
+            b"ERR MOVE/COPY could not lock its destination database",
+        ))
     })
 }
 
@@ -1127,6 +1205,96 @@ mod tests {
             }
             _ => panic!("expected a string pre-image"),
         }
+    }
+
+    /// moon#1068 — a script's `COPY ... DB n` must never land in the script's
+    /// OWN database. Before the fix the bridge ran it through the single-db
+    /// dispatch, which ignored the DB clause: `:1`, and `b` written into the
+    /// source db while the effect record named db 4.
+    ///
+    /// A unit-test thread is outside the registered database plane, so the
+    /// destination cannot be reached here: the command must refuse and leave
+    /// the database untouched rather than fall back to the one it holds.
+    /// (The reachable case — the copy landing in db 4 — is pinned end to end
+    /// by `tests/script_move_copy_db_1068.rs`.) `MOVE`, which errored before
+    /// the fix, must likewise leave the key where it was.
+    #[test]
+    fn script_two_db_write_never_lands_in_the_scripts_own_db() {
+        let lua = crate::scripting::setup_lua_vm(LuaEvictionCtx::disabled()).unwrap();
+        let cache = std::rc::Rc::new(std::cell::RefCell::new(crate::scripting::ScriptCache::new()));
+        let mut db = Database::new();
+        db.set_string(b"a", Bytes::from_static(b"1"));
+        let run = |db: &mut Database, body: &'static [u8], keys: &[&'static [u8]]| {
+            let mut args = vec![
+                Frame::BulkString(Bytes::from_static(body)),
+                Frame::BulkString(Bytes::from(keys.len().to_string())),
+            ];
+            args.extend(
+                keys.iter()
+                    .map(|k| Frame::BulkString(Bytes::from_static(k))),
+            );
+            crate::scripting::handle_eval(
+                &lua,
+                &cache,
+                &args,
+                db,
+                0,
+                1,
+                0,
+                16,
+                &ScriptAcl::trusted(),
+                false,
+            )
+        };
+
+        let copy = run(
+            &mut db,
+            b"return redis.pcall('COPY', KEYS[1], KEYS[2], 'DB', '4')",
+            &[b"a", b"b"],
+        );
+        assert!(
+            matches!(copy, Frame::Error(_)),
+            "an unreachable destination must refuse, got {copy:?}"
+        );
+        assert!(
+            !db.exists(b"b"),
+            "COPY ... DB 4 wrote the copy into the script's own db"
+        );
+
+        let mv = run(
+            &mut db,
+            b"return redis.pcall('MOVE', KEYS[1], '3')",
+            &[b"a"],
+        );
+        assert!(matches!(mv, Frame::Error(_)), "got {mv:?}");
+        assert!(
+            db.exists(b"a"),
+            "a refused MOVE must leave the key in place"
+        );
+
+        // The two-db errors are redis's, decided before any database is
+        // touched: the script's own db, and a db that does not exist.
+        let same = run(
+            &mut db,
+            b"return redis.pcall('MOVE', KEYS[1], '0')",
+            &[b"a"],
+        );
+        assert_eq!(
+            same,
+            Frame::Error(Bytes::from_static(
+                b"ERR source and destination objects are the same"
+            ))
+        );
+        let range = run(
+            &mut db,
+            b"return redis.pcall('COPY', KEYS[1], KEYS[2], 'DB', '99')",
+            &[b"a", b"b"],
+        );
+        assert_eq!(
+            range,
+            Frame::Error(Bytes::from_static(b"ERR DB index is out of range"))
+        );
+        assert!(!db.exists(b"b"));
     }
 
     /// moon#517 gap 1 — a script's write effect must reach the AOF plane on

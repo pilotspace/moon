@@ -473,8 +473,7 @@ where
     {
         // Check immediate availability via the thread-local slice.
         let maybe_frame = crate::shard::slice::with_shard_db(selected_db, |db| {
-            immediate_scan(cmd, args, &keys, db, shard_id, num_shards)
-                .map(|frame| log_immediate_pop(cmd, args, selected_db, frame))
+            immediate_serve(cmd, args, &keys, db, selected_db, shard_id, num_shards)
         });
         if let Some((frame, popped)) = maybe_frame {
             // moon#1059: an immediate BLMOVE pushed onto its destination. A
@@ -818,8 +817,7 @@ where
     // Exclusive guard on purpose: `immediate_scan` POPS when it finds data.
     {
         let immediate_result = crate::shard::slice::with_shard_db(selected_db, |db| {
-            immediate_scan(cmd, args, &keys, db, shard_id, num_shards)
-                .map(|frame| log_immediate_pop(cmd, args, selected_db, frame))
+            immediate_serve(cmd, args, &keys, db, selected_db, shard_id, num_shards)
         });
         if let Some((frame, popped)) = immediate_result {
             // moon#1059: an immediate BLMOVE pushed onto its destination,
@@ -2094,6 +2092,114 @@ pub(crate) fn immediate_scan(
     None
 }
 
+/// [`immediate_scan`], plus the durability record of whatever it served, on
+/// THIS shard in the same synchronous stretch (moon#1056, moon#1104). Returns
+/// the reply to send and whether anything was taken, as
+/// [`log_immediate_pop`] does.
+fn immediate_serve(
+    cmd: &[u8],
+    args: &[Frame],
+    keys: &[Bytes],
+    db: &mut Database,
+    db_index: usize,
+    shard_id: usize,
+    num_shards: usize,
+) -> Option<(Frame, bool)> {
+    if let Some(target) = local_group_read(cmd, args, keys, shard_id, num_shards) {
+        return immediate_group_read(cmd, args, keys, db, db_index, shard_id, num_shards, &target);
+    }
+    immediate_scan(cmd, args, keys, db, shard_id, num_shards)
+        .map(|frame| log_immediate_pop(cmd, args, db_index, frame))
+}
+
+/// The stream, group, consumer and `NOACK` of a blocking `XREADGROUP` whose
+/// one stream this shard owns — the read [`immediate_scan`] runs here rather
+/// than deferring to the owner.
+struct GroupReadTarget {
+    key: Bytes,
+    group: Bytes,
+    consumer: Bytes,
+    noack: bool,
+}
+
+fn local_group_read(
+    cmd: &[u8],
+    args: &[Frame],
+    keys: &[Bytes],
+    shard_id: usize,
+    num_shards: usize,
+) -> Option<GroupReadTarget> {
+    let shape = stream_read_shape(cmd, args)?;
+    let (gi, ci) = shape.group?;
+    let [key] = keys else {
+        return None;
+    };
+    if num_shards > 1 && key_to_shard(key, num_shards) != shard_id {
+        return None;
+    }
+    Some(GroupReadTarget {
+        key: key.clone(),
+        group: shape_arg(args, gi)?,
+        consumer: shape_arg(args, ci)?,
+        noack: shape.noack,
+    })
+}
+
+/// A blocking `XREADGROUP` run immediately on the shard that owns its stream,
+/// logged as redis propagates it (moon#1104, `blocking::stream_log`): the
+/// `XCLAIM`s and `XGROUP SETID` of what it delivered, or — when it found
+/// nothing and parks — the `XGROUP CREATECONSUMER` a `NOACK` read owes for a
+/// consumer it created. The group's state before the read is what the
+/// records are computed against, so it is taken here, before the read runs.
+#[allow(clippy::too_many_arguments)]
+fn immediate_group_read(
+    cmd: &[u8],
+    args: &[Frame],
+    keys: &[Bytes],
+    db: &mut Database,
+    db_index: usize,
+    shard_id: usize,
+    num_shards: usize,
+    t: &GroupReadTarget,
+) -> Option<(Frame, bool)> {
+    use crate::blocking::stream_log;
+    let before = crate::blocking::pop_log::has_work()
+        .then(|| stream_log::group_read_before(db, &t.key, &t.group, &t.consumer))
+        .flatten();
+    let reply = immediate_scan(cmd, args, keys, db, shard_id, num_shards);
+    let Some(before) = before else {
+        return reply.map(|frame| (frame, true));
+    };
+    let ids = reply
+        .as_ref()
+        .map(stream_log::delivered_ids)
+        .unwrap_or_default();
+    let records =
+        stream_log::group_read_records(db, &t.key, &t.group, &t.consumer, t.noack, &before, &ids);
+    if records.is_empty() {
+        return reply.map(|frame| (frame, true));
+    }
+    let lost = crate::blocking::pop_log::log_records(
+        db_index,
+        &records,
+        &mut crate::blocking::pop_log::wake_budget(),
+    ) == crate::blocking::pop_log::PopLog::AofLost;
+    // A read that parks has no reply to carry the error; one that delivered
+    // answers it instead of the entries, as a blocking pop does.
+    reply.map(|frame| {
+        if lost && !matches!(frame, Frame::Error(_)) {
+            (
+                Frame::Error(Bytes::from_static(
+                    crate::shard::spsc_handler::AOF_APPEND_LOST_ERR,
+                )),
+                true,
+            )
+        } else {
+            (frame, true)
+        }
+    })
+}
+
 /// Log an immediately-served blocking pop on THIS shard — the one that just
 /// popped — in the same synchronous stretch as the pop (moon#1056), and say
 /// whether anything was taken.
@@ -2749,6 +2855,17 @@ pub(crate) fn try_inline_dispatch(
         return 0;
     };
     if consumed > len || buf[val_end] != b'\r' || buf[val_end + 1] != b'\n' {
+        return 0;
+    }
+
+    // ---- Parked XREADGROUP gate (moon#1086) ----
+    //
+    // A `SET` over a stream that a parked `XREADGROUP` waits on owes that
+    // reader `-WRONGTYPE` now. Only the generic write tail raises the
+    // ready-key signal (`wakeup::ready_keys`), so while a group reader is
+    // parked on this shard a SET takes the generic path. One thread-local
+    // read otherwise; before anything is consumed.
+    if crate::blocking::group_readers_parked_here() {
         return 0;
     }
 

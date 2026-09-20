@@ -472,6 +472,17 @@ pub(crate) async fn handle_connection_sharded_inner<
         // path has run by here, before the connection waits again.
         conn.sync_tracking_inbox(&ctx.tracking_table);
 
+        // CLIENT LIST's `P` flag and `sub`/`psub`/`ssub` for this connection,
+        // before it waits again: the subscriber-mode loop below never reaches
+        // the batch-end publish, and a connection that just left subscriber
+        // mode would otherwise stay listed as subscribed until its next batch.
+        crate::server::conn::shared::publish_pubsub_counts(
+            &client_live,
+            &ctx.shard_pubsub(),
+            &mut conn,
+            ctx.cached_clock.ms(),
+        );
+
         // --- Subscriber mode: bidirectional select on client commands + published messages ---
         //
         // RESP2 ONLY, matching the monoio handler. A subscribed RESP3
@@ -954,7 +965,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         &mut conn,
                         &ctx.requirepass,
                         &ctx.tracking_table,
-                        &*ctx.pubsub_registry,
+                        &ctx.shard_pubsub(),
                         &mut responses,
                         None,
                     ) {
@@ -1796,8 +1807,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                             blocking_response,
                             conn.protocol_version,
                         );
+                        let close_after = crate::blocking::is_role_change_unblock(&blocking_response);
                         responses = Vec::with_capacity(1);
                         responses.push(blocking_response);
+                        // The node became a replica: write the `-UNBLOCKED`
+                        // reply and close, dropping anything pipelined behind
+                        // it, as redis does.
+                        if close_after {
+                            should_quit = true;
+                            break;
+                        }
                         // A1: anything left in read_buf is either this batch's
                         // unparsed tail or bytes the peer watch carried; parse
                         // before awaiting the next read either way.
@@ -3505,17 +3524,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // Update live state after each batch — lock-free (QW8, 2026-06
                 // review: this was a global registry write lock per batch), and
                 // clock-free (shard-cached ms, not Instant::now()).
-                client_live.touch(
-                    conn.selected_db,
-                    crate::client_registry::ClientFlags {
-                        subscriber: conn.subscription_count > 0,
-                        in_multi: conn.in_multi,
-                        // A batch just completed, so this connection is by
-                        // definition not blocked right now; the blocked bit is
-                        // owned by `set_blocked` around the blocking await.
-                        blocked: false,
-                        replica: conn.saw_replconf,
-                    },
+                // A batch just completed, so this connection is by definition
+                // not blocked right now; the blocked bit is owned by
+                // `set_blocked` around the blocking await.
+                client_live.touch(conn.selected_db, conn.client_flags(), ctx.cached_clock.ms());
+                crate::server::conn::shared::publish_pubsub_counts(
+                    &client_live,
+                    &ctx.shard_pubsub(),
+                    &mut conn,
                     ctx.cached_clock.ms(),
                 );
 
