@@ -618,6 +618,34 @@ pub fn xreadgroup(db: &mut Database, args: &[Frame]) -> Frame {
     //     empty entry list.
     //
     // Only when nothing at all was served does the reply become the null array.
+    // Every stream, its group AND its id are checked BEFORE any is read, in
+    // redis's `xreadCommand` order (per stream: type, group, id): a `>` read
+    // of the first stream moves entries into its PEL, so failing on a later
+    // stream afterwards would hand the client an error while those entries
+    // sit delivered-and-unacked, never to be returned by `>` again.
+    for i in 0..num_streams {
+        let (Some(key), Some(id)) = (
+            extract_bytes(&args[keys_start + i]),
+            extract_bytes(&args[ids_start + i]),
+        ) else {
+            return err_wrong_args("XREADGROUP");
+        };
+        match db.get_stream(key) {
+            Ok(Some(s)) if s.groups.contains_key(group.as_ref()) => {}
+            Ok(_) => return nogroup_key_or_group(key, &group, XREADGROUP_NOGROUP_SUFFIX),
+            Err(e) => return e,
+        }
+        match id.as_ref() {
+            b">" => {}
+            b"$" => return Frame::Error(Bytes::from_static(XREADGROUP_DOLLAR_ID)),
+            b"+" => return Frame::Error(Bytes::from_static(XREADGROUP_PLUS_ID)),
+            other if parse_strict_id(other).is_none() => {
+                return Frame::Error(Bytes::from_static(INVALID_STREAM_ID));
+            }
+            _ => {}
+        }
+    }
+
     let mut results = Vec::new();
 
     for i in 0..num_streams {
@@ -632,15 +660,17 @@ pub fn xreadgroup(db: &mut Database, args: &[Frame]) -> Frame {
 
         let is_new = id_bytes.as_ref() == b">";
 
+        // Redis answers a missing key and a missing group with one text
+        // naming both (moon#1086) — the same text a parked reader gets when
+        // its stream or group goes away under it.
         let stream = match db.get_stream_mut(key) {
             Ok(Some(s)) => s,
-            Ok(None) => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR The XREADGROUP subcommand requires the key to exist.",
-                ));
-            }
+            Ok(None) => return nogroup_key_or_group(key, &group, XREADGROUP_NOGROUP_SUFFIX),
             Err(e) => return e,
         };
+        if !stream.groups.contains_key(group.as_ref()) {
+            return nogroup_key_or_group(key, &group, XREADGROUP_NOGROUP_SUFFIX);
+        }
 
         let entries = if is_new {
             match stream.read_group_new(&group, &consumer, count, noack) {
@@ -732,71 +762,185 @@ pub fn xack(db: &mut Database, args: &[Frame]) -> Frame {
     }
 }
 
-/// XCLAIM key group consumer min-idle-time id [id ...]
+/// XCLAIM key group consumer min-idle-time id [id ...] [IDLE ms] [TIME ms]
+/// [RETRYCOUNT count] [FORCE] [JUSTID] [LASTID id]
+///
+/// Parsed the way redis's `xclaimCommand` parses it: the ids run until the
+/// first argument that is not a strict stream id, and only then do options
+/// start — an option's numeric VALUE (`TIME 1700000000000`, `RETRYCOUNT 1`)
+/// is never mistaken for an id to claim. Every option is honoured, because
+/// this is the command a consumer-group read is replayed as (moon#1104; see
+/// [`crate::storage::stream::Stream::xclaim`]).
 pub fn xclaim(db: &mut Database, args: &[Frame]) -> Frame {
+    use crate::storage::stream::XclaimOptions;
+
     if args.len() < 5 {
         return err_wrong_args("XCLAIM");
     }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("XCLAIM"),
-    };
-    let group = match extract_bytes(&args[1]) {
-        Some(g) => g.clone(),
-        None => return err_wrong_args("XCLAIM"),
-    };
-    let consumer = match extract_bytes(&args[2]) {
-        Some(c) => c.clone(),
-        None => return err_wrong_args("XCLAIM"),
-    };
-    let min_idle_bytes = match extract_bytes(&args[3]) {
-        Some(b) => b,
-        None => return err_wrong_args("XCLAIM"),
-    };
-    let min_idle = match std::str::from_utf8(min_idle_bytes) {
-        Ok(s) => match s.parse::<u64>() {
-            Ok(v) => v,
-            Err(_) => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR value is not an integer or out of range",
-                ));
-            }
-        },
-        Err(_) => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR value is not an integer or out of range",
-            ));
-        }
+    let (Some(key), Some(group), Some(consumer)) = (
+        extract_bytes(&args[0]),
+        extract_bytes(&args[1]),
+        extract_bytes(&args[2]),
+    ) else {
+        return err_wrong_args("XCLAIM");
     };
 
-    let mut ids = Vec::new();
-    for arg in &args[4..] {
-        let id_bytes = match extract_bytes(arg) {
-            Some(b) => b,
-            None => continue, // Skip options like JUSTID, FORCE, etc.
-        };
-        match StreamId::parse(id_bytes, 0) {
-            Ok(id) => ids.push(id),
-            Err(_) => continue, // Skip unrecognized args (could be options)
+    // Redis answers the key and the group before it looks at any other
+    // argument: WRONGTYPE, then NOGROUP naming both.
+    let has_group = match db.get_stream(key) {
+        Ok(Some(stream)) => stream.groups.contains_key(group.as_ref()),
+        Ok(None) => false,
+        Err(e) => return e,
+    };
+    if !has_group {
+        return nogroup_key_or_group(key, group, b"");
+    }
+
+    let Some(min_idle) = extract_bytes(&args[3]).and_then(|b| parse_ll(b)) else {
+        return Frame::Error(Bytes::from_static(
+            b"ERR Invalid min-idle-time argument for XCLAIM",
+        ));
+    };
+    let mut opts = XclaimOptions {
+        min_idle: min_idle.max(0) as u64,
+        ..XclaimOptions::default()
+    };
+
+    let mut ids: Vec<StreamId> = Vec::with_capacity(args.len() - 4);
+    let mut j = 4;
+    while j < args.len() {
+        match extract_bytes(&args[j]).and_then(|b| parse_strict_id(b)) {
+            Some(id) => ids.push(id),
+            None => break,
         }
+        j += 1;
+    }
+
+    let now = crate::storage::entry::current_time_ms() as i64;
+    while j < args.len() {
+        let Some(opt) = extract_bytes(&args[j]) else {
+            return err_wrong_args("XCLAIM");
+        };
+        let more = j + 1 < args.len();
+        let value = || args.get(j + 1).and_then(extract_bytes);
+        if opt.eq_ignore_ascii_case(b"FORCE") {
+            opts.force = true;
+        } else if opt.eq_ignore_ascii_case(b"JUSTID") {
+            opts.justid = true;
+        } else if opt.eq_ignore_ascii_case(b"IDLE") && more {
+            let Some(idle) = value().and_then(|b| parse_ll(b)) else {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR Invalid IDLE option argument for XCLAIM",
+                ));
+            };
+            opts.delivery_time = Some(now.saturating_sub(idle));
+            j += 1;
+        } else if opt.eq_ignore_ascii_case(b"TIME") && more {
+            let Some(time) = value().and_then(|b| parse_ll(b)) else {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR Invalid TIME option argument for XCLAIM",
+                ));
+            };
+            opts.delivery_time = Some(time);
+            j += 1;
+        } else if opt.eq_ignore_ascii_case(b"RETRYCOUNT") && more {
+            let Some(count) = value().and_then(|b| parse_ll(b)) else {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR Invalid RETRYCOUNT option argument for XCLAIM",
+                ));
+            };
+            // Redis keeps -1 as "not given": a negative count increments.
+            opts.retry_count = u64::try_from(count).ok();
+            j += 1;
+        } else if opt.eq_ignore_ascii_case(b"LASTID") && more {
+            let Some(id) = value().and_then(|b| parse_strict_id(b)) else {
+                return Frame::Error(Bytes::from_static(INVALID_STREAM_ID));
+            };
+            opts.last_id = Some(id);
+            j += 1;
+        } else {
+            let mut msg = Vec::with_capacity(34 + opt.len());
+            msg.extend_from_slice(b"ERR Unrecognized XCLAIM option '");
+            msg.extend_from_slice(opt);
+            msg.push(b'\'');
+            return Frame::Error(Bytes::from(msg));
+        }
+        j += 1;
     }
 
     let stream = match db.get_stream_mut(key) {
         Ok(Some(s)) => s,
-        Ok(None) => return Frame::Array(framevec![]),
+        Ok(None) => return nogroup_key_or_group(key, group, b""),
         Err(e) => return e,
     };
+    let claimed = match stream.xclaim(group, consumer, &ids, &opts) {
+        Ok(c) => c,
+        Err(_) => return nogroup_key_or_group(key, group, b""),
+    };
+    let frames: Vec<Frame> = if opts.justid {
+        claimed
+            .into_iter()
+            .map(|id| Frame::BulkString(id.to_bytes()))
+            .collect()
+    } else {
+        claimed
+            .into_iter()
+            .filter_map(|id| stream.entries.get(&id).map(|f| format_entry(id, f)))
+            .collect()
+    };
+    Frame::Array(frames.into())
+}
 
-    match stream.xclaim(&group, &consumer, min_idle, &ids) {
-        Ok(entries) => {
-            let frames: Vec<Frame> = entries
-                .iter()
-                .map(|(id, fields)| format_entry(*id, fields))
-                .collect();
-            Frame::Array(frames.into())
-        }
-        Err(e) => Frame::Error(Bytes::from(e)),
+/// The tail redis's XREADGROUP adds to its NOGROUP text.
+const XREADGROUP_NOGROUP_SUFFIX: &[u8] = b" in XREADGROUP with GROUP option";
+
+/// Redis's text for an argument that is not a stream id
+/// (`streamParseStrictIDOrReply`).
+const INVALID_STREAM_ID: &[u8] = b"ERR Invalid stream ID specified as stream command argument";
+
+/// `$` and `+` name positions in the stream, not in a consumer's history, so
+/// redis refuses them in `XREADGROUP` with these texts (redis-server 8.6.1).
+const XREADGROUP_DOLLAR_ID: &[u8] = b"ERR The $ ID is meaningless in the context of XREADGROUP: \
+you want to read the history of this consumer by specifying a proper ID, or use the > ID to get \
+new messages. The $ ID would just return an empty result set.";
+const XREADGROUP_PLUS_ID: &[u8] = b"ERR The + ID is meaningless in the context of XREADGROUP: \
+you want to read the history of this consumer by specifying a proper ID, or use the > ID to get \
+new messages. The + ID would just return an empty result set.";
+
+/// `-NOGROUP No such key '<key>' or consumer group '<group>'<suffix>`, the
+/// text redis's XCLAIM (empty `suffix`) and XREADGROUP
+/// (`" in XREADGROUP with GROUP option"`) answer for a missing key or group.
+pub(crate) fn nogroup_key_or_group(key: &[u8], group: &[u8], suffix: &[u8]) -> Frame {
+    let mut msg = Vec::with_capacity(48 + key.len() + group.len() + suffix.len());
+    msg.extend_from_slice(b"NOGROUP No such key '");
+    msg.extend_from_slice(key);
+    msg.extend_from_slice(b"' or consumer group '");
+    msg.extend_from_slice(group);
+    msg.push(b'\'');
+    msg.extend_from_slice(suffix);
+    Frame::Error(Bytes::from(msg))
+}
+
+/// Redis's `string2ll` accept-set: an optional `-`, then `0` or digits not
+/// starting with `0`. No `+`, no spaces, no leading zeros.
+fn parse_ll(b: &[u8]) -> Option<i64> {
+    let digits = b.strip_prefix(b"-").unwrap_or(b);
+    if digits.is_empty()
+        || !digits.iter().all(u8::is_ascii_digit)
+        || (digits.len() > 1 && digits[0] == b'0')
+    {
+        return None;
     }
+    std::str::from_utf8(b).ok()?.parse().ok()
+}
+
+/// A stream id as redis's STRICT parser takes it: `ms` or `ms-seq`. The
+/// range shorthands `-` / `+` and the auto forms `*` / `ms-*` are not ids.
+fn parse_strict_id(b: &[u8]) -> Option<StreamId> {
+    if matches!(b, b"-" | b"+" | b"*") || b.ends_with(b"-*") {
+        return None;
+    }
+    StreamId::parse(b, 0).ok()
 }
 
 /// XAUTOCLAIM key group consumer min-idle-time start [COUNT count]

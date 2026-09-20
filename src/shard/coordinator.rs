@@ -942,8 +942,8 @@ async fn coordinate_bitop(
 ///
 /// `COPY src dst [REPLACE]` — same-shard pairs (hash tags) forward to the
 /// owning shard and keep full any-type fidelity via the local copy path.
-/// Cross-shard pairs transfer STRING values exactly (value + TTL, NX unless
-/// REPLACE); cross-shard non-string values return an explicit error instead
+/// Cross-shard pairs transfer STRING values exactly (value + ABSOLUTE expiry,
+/// NX unless REPLACE); cross-shard non-string values return an explicit error instead
 /// of silently corrupting (full-fidelity transfer is DUMP/RESTORE territory,
 /// tracked in the task backlog). `COPY ... DB n` never reaches this path
 /// (excluded in `is_multi_key_command`; the handlers' two-db interception
@@ -1051,9 +1051,16 @@ async fn coordinate_copy(
         Frame::Error(e) => return Frame::Error(e),
         _ => return Frame::Integer(0), // src missing
     };
-    let ttl_ms = match run_on_owner(
+    // moon#1095: the source's ABSOLUTE deadline (unix ms), never its
+    // remaining TTL. A relative TTL is measured on the source shard's cached
+    // clock and re-anchored on the destination's, and the two clocks are
+    // independent ticks: whenever the destination's `now` was ahead, the copy
+    // outlived its source (measured: PTTL 500004 after PEXPIRE 500000). The
+    // absolute deadline needs no clock on either side, so the copy expires in
+    // the same millisecond as the source, as redis's COPY does.
+    let expires_at_ms = match run_on_owner(
         &src,
-        &[bulk_static(b"PTTL"), bulk(&src)],
+        &[bulk_static(b"PEXPIRETIME"), bulk(&src)],
         my_shard,
         num_shards,
         db_index,
@@ -1064,22 +1071,17 @@ async fn coordinate_copy(
     )
     .await
     {
-        Frame::Integer(t) if t > 0 => Some(t),
+        Frame::Integer(at) if at > 0 => Some(at),
         Frame::Integer(-2) => return Frame::Integer(0), // expired between reads
         _ => None,
     };
 
-    // Write to dst's shard: NX unless REPLACE, then restore TTL.
-    let set_parts: Vec<Frame> = if replace {
-        vec![bulk_static(b"SET"), bulk(&dst), Frame::BulkString(value)]
-    } else {
-        vec![
-            bulk_static(b"SET"),
-            bulk(&dst),
-            Frame::BulkString(value),
-            bulk_static(b"NX"),
-        ]
-    };
+    // Write to dst's shard in ONE command: NX unless REPLACE, and the deadline
+    // as `PXAT`. One command also closes the window the old SET-then-PEXPIRE
+    // pair had, where a crash or an error between the two left a copy that
+    // never expired. With no deadline, the plain SET clears any TTL a REPLACEd
+    // destination carried, as redis does.
+    let set_parts = copy_destination_write(&dst, value, expires_at_ms, replace);
     let set_reply = run_on_owner_persist(
         &dst,
         &set_parts,
@@ -1103,34 +1105,38 @@ async fn coordinate_copy(
         // Null reply = NX refused (dst exists); anything else is unexpected.
         _ => return Frame::Integer(0),
     }
-    if let Some(t) = ttl_ms {
-        let mut ttl_buf = itoa::Buffer::new();
-        let reply = run_on_owner_persist(
-            &dst,
-            &[
-                bulk_static(b"PEXPIRE"),
-                bulk(&dst),
-                Frame::BulkString(Bytes::copy_from_slice(ttl_buf.format(t).as_bytes())),
-            ],
-            my_shard,
-            num_shards,
-            db_index,
-            shard_databases,
-            dispatch_tx,
-            spsc_notifiers,
-            cached_clock,
-            aof_pool,
-            repl_state,
-            local_barrier_pending,
-            // :0 = key vanished between SET and PEXPIRE — no TTL was set.
-            |r| matches!(r, Frame::Integer(1)),
-        )
-        .await;
-        if let Frame::Error(e) = reply {
-            return Frame::Error(e);
-        }
-    }
     Frame::Integer(1)
+}
+
+/// The destination half of a cross-shard `COPY`:
+/// `SET dst value [PXAT expires_at_ms] [NX]` (moon#1095).
+///
+/// `expires_at_ms` is the source's `PEXPIRETIME` — an absolute unix-ms
+/// deadline, carried verbatim so the copy expires in the same millisecond as
+/// its source whatever either shard's clock reads. `None` (no deadline) writes
+/// a persistent copy, clearing a TTL a REPLACEd destination had. `NX` unless
+/// `replace`, so an existing destination is refused, never overwritten.
+fn copy_destination_write(
+    dst: &Bytes,
+    value: Bytes,
+    expires_at_ms: Option<i64>,
+    replace: bool,
+) -> Vec<Frame> {
+    let mut parts: Vec<Frame> = Vec::with_capacity(6);
+    parts.push(bulk_static(b"SET"));
+    parts.push(bulk(dst));
+    parts.push(Frame::BulkString(value));
+    if let Some(at) = expires_at_ms {
+        let mut at_buf = itoa::Buffer::new();
+        parts.push(bulk_static(b"PXAT"));
+        parts.push(Frame::BulkString(Bytes::copy_from_slice(
+            at_buf.format(at).as_bytes(),
+        )));
+    }
+    if !replace {
+        parts.push(bulk_static(b"NX"));
+    }
+    parts
 }
 
 /// Extract Bytes from a Frame argument.
@@ -3950,6 +3956,43 @@ pub async fn coordinate_swapdb(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame_words(parts: &[Frame]) -> Vec<&[u8]> {
+        parts
+            .iter()
+            .map(|f| match f {
+                Frame::BulkString(b) => b.as_ref(),
+                other => panic!("expected bulk strings, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// moon#1095: the destination write carries the source's ABSOLUTE
+    /// deadline verbatim, as `PXAT`, in the same command as the value — never
+    /// a relative TTL re-anchored on the destination shard's clock, and never
+    /// a second command that a crash can separate from the first.
+    #[test]
+    fn cross_shard_copy_writes_the_absolute_deadline_in_one_command() {
+        let dst = Bytes::from_static(b"d");
+        let v = || Bytes::from_static(b"v");
+        let at = Some(4_102_444_800_000_i64);
+        let want_nx: Vec<&[u8]> = vec![b"SET", b"d", b"v", b"PXAT", b"4102444800000", b"NX"];
+        assert_eq!(
+            frame_words(&copy_destination_write(&dst, v(), at, false)),
+            want_nx
+        );
+        let want_replace: Vec<&[u8]> = vec![b"SET", b"d", b"v", b"PXAT", b"4102444800000"];
+        assert_eq!(
+            frame_words(&copy_destination_write(&dst, v(), at, true)),
+            want_replace
+        );
+        // No deadline: a plain SET, which also clears a REPLACEd key's TTL.
+        let want_plain: Vec<&[u8]> = vec![b"SET", b"d", b"v"];
+        assert_eq!(
+            frame_words(&copy_destination_write(&dst, v(), None, true)),
+            want_plain
+        );
+    }
 
     // Both arms are driven at a millisecond timeout via `recv_reply_within`
     // rather than the real 30s constant. Gated to runtime-tokio because the

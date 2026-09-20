@@ -1463,6 +1463,22 @@ impl Database {
     /// Promotes a cold-spilled stream back to hot RAM on miss (P0
     /// cold-collection-visibility fix) — this accessor takes `&mut self`.
     pub fn get_stream_mut(&mut self, key: &[u8]) -> Result<Option<&mut StreamData>, Frame> {
+        self.stream_mut(key, true)
+    }
+
+    /// A mutable stream WITHOUT stamping the key's `WATCH` version, for the
+    /// one change redis makes to a stream without signalling its watchers:
+    /// creating the consumer of a blocked `XREADGROUP`
+    /// (`keyModified(..., signal=0)`, "only update LRM"). Every write a
+    /// client can observe goes through [`get_stream_mut`](Self::get_stream_mut).
+    pub fn get_stream_mut_unsignalled(
+        &mut self,
+        key: &[u8],
+    ) -> Result<Option<&mut StreamData>, Frame> {
+        self.stream_mut(key, false)
+    }
+
+    fn stream_mut(&mut self, key: &[u8], stamp: bool) -> Result<Option<&mut StreamData>, Frame> {
         let now_ms = self.cached_now_ms;
         // moon#942: one lookup for the preamble, one to hand the stream out.
         let state = self.hot_state(key, now_ms);
@@ -1473,7 +1489,9 @@ impl Database {
             None => Ok(None),
             Some(entry) => {
                 // moon#926 — see `stamp_mutation`. A miss stamps nothing.
-                stamp_mutation(entry);
+                if stamp {
+                    stamp_mutation(entry);
+                }
                 match entry.value.as_redis_value_mut() {
                     Some(RedisValue::Stream(s)) => Ok(Some(s.as_mut())),
                     Some(_) => Err(Self::wrongtype_error()),

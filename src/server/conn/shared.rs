@@ -312,7 +312,7 @@ fn record_exec_wakes(
     cmd: &[u8],
     args: &[Frame],
 ) {
-    if !wake_armed || !crate::blocking::wakeup::may_ready_a_key(cmd) {
+    if !wake_armed || !crate::blocking::wakeup::may_wake(cmd) {
         return;
     }
     crate::blocking::wakeup::for_each_written_key(cmd, args, |k| {
@@ -2923,24 +2923,159 @@ pub(crate) enum TxnLocality {
 /// `Mutex`. That difference is the sole reason `try_handle_reset` cannot simply
 /// take a `&ConnectionContext`, and it is not worth a second copy of RESET.
 pub(crate) trait PubSubTeardown {
-    /// Drop every channel AND pattern subscription held by `subscriber_id`.
+    /// Drop every channel, pattern AND shard-channel subscription held by
+    /// `subscriber_id`.
+    ///
+    /// All three: a RESP3 connection may hold sharded subscriptions outside
+    /// subscriber mode, and one left registered after RESET is still counted
+    /// by `SPUBLISH` (moon#1105) and can push `smessage` into the reply stream
+    /// of a connection that believes it is back to ordinary commands.
     fn unsubscribe_all_for(&self, subscriber_id: u64);
+
+    /// The subscriptions `subscriber_id` holds per namespace, for `CLIENT
+    /// LIST`/`INFO`'s `sub`, `psub` and `ssub`.
+    fn subscription_counts(&self, subscriber_id: u64) -> crate::client_registry::PubSubCounts;
 }
 
-impl PubSubTeardown for parking_lot::RwLock<crate::pubsub::PubSubRegistry> {
-    fn unsubscribe_all_for(&self, subscriber_id: u64) {
-        let mut reg = self.write();
-        reg.unsubscribe_all(subscriber_id);
-        reg.punsubscribe_all(subscriber_id);
+fn registry_counts(
+    reg: &crate::pubsub::PubSubRegistry,
+    subscriber_id: u64,
+) -> crate::client_registry::PubSubCounts {
+    crate::client_registry::PubSubCounts {
+        channels: reg.channel_subscription_count(subscriber_id),
+        patterns: reg.pattern_subscription_count(subscriber_id),
+        shard_channels: reg.shard_subscription_count(subscriber_id),
     }
 }
 
+/// A shard's registry plus the remote maps other shards route publishes
+/// through (see `ConnectionContext::shard_pubsub`). Tearing a subscription
+/// down must clear both, as every UNSUBSCRIBE path does.
+pub(crate) struct ShardPubSub<'a> {
+    pub registry: &'a parking_lot::RwLock<crate::pubsub::PubSubRegistry>,
+    pub remote: &'a [std::sync::Arc<
+        parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>,
+    >],
+    pub shard_id: usize,
+    pub num_shards: usize,
+}
+
+impl PubSubTeardown for ShardPubSub<'_> {
+    fn unsubscribe_all_for(&self, subscriber_id: u64) {
+        // Released before the remote maps are touched: no nested locks.
+        let (channels, patterns, shard_channels) = {
+            let mut reg = self.registry.write();
+            (
+                reg.unsubscribe_all(subscriber_id),
+                reg.punsubscribe_all(subscriber_id),
+                reg.sunsubscribe_all(subscriber_id),
+            )
+        };
+        for ch in &channels {
+            super::util::unpropagate_subscription(
+                self.remote,
+                ch,
+                self.shard_id,
+                self.num_shards,
+                false,
+            );
+        }
+        for pat in &patterns {
+            super::util::unpropagate_subscription(
+                self.remote,
+                pat,
+                self.shard_id,
+                self.num_shards,
+                true,
+            );
+        }
+        for ch in &shard_channels {
+            super::util::unpropagate_shard_subscription(
+                self.remote,
+                ch,
+                self.shard_id,
+                self.num_shards,
+            );
+        }
+    }
+
+    fn subscription_counts(&self, subscriber_id: u64) -> crate::client_registry::PubSubCounts {
+        registry_counts(&self.registry.read(), subscriber_id)
+    }
+}
+
+/// `handler_single` has one registry and no other shard to tell.
 impl PubSubTeardown for parking_lot::Mutex<crate::pubsub::PubSubRegistry> {
     fn unsubscribe_all_for(&self, subscriber_id: u64) {
         let mut reg = self.lock();
         reg.unsubscribe_all(subscriber_id);
         reg.punsubscribe_all(subscriber_id);
+        reg.sunsubscribe_all(subscriber_id);
     }
+
+    fn subscription_counts(&self, subscriber_id: u64) -> crate::client_registry::PubSubCounts {
+        registry_counts(&self.lock(), subscriber_id)
+    }
+}
+
+fn own_subscription_counts(
+    pubsub: &dyn PubSubTeardown,
+    subscriber_id: u64,
+) -> crate::client_registry::PubSubCounts {
+    if subscriber_id == 0 {
+        // Never subscribed: no registry holds anything for it.
+        crate::client_registry::PubSubCounts::default()
+    } else {
+        pubsub.subscription_counts(subscriber_id)
+    }
+}
+
+/// Publish the connection's per-namespace subscription counts, and the flag
+/// bits and db that go with them, for other clients' `CLIENT LIST`, when they
+/// may have changed since the last publish.
+///
+/// Called at the end of every batch and at the top of every connection-loop
+/// iteration, which is the only point the RESP2 subscriber-mode loop passes
+/// (a RESET there also moves the db). A connection whose subscription count
+/// did not move pays one comparison and takes no lock.
+#[inline]
+pub(crate) fn publish_pubsub_counts(
+    live: &crate::client_registry::ClientLiveState,
+    pubsub: &dyn PubSubTeardown,
+    conn: &mut super::core::ConnectionState,
+    now_epoch_ms: u64,
+) {
+    if conn.subscription_count == conn.published_subscription_count {
+        return;
+    }
+    live.set_pubsub_counts(own_subscription_counts(pubsub, conn.subscriber_id));
+    live.touch(conn.selected_db, conn.client_flags(), now_epoch_ms);
+    conn.published_subscription_count = conn.subscription_count;
+}
+
+/// Refresh this connection's own registry entry from its CURRENT state, for a
+/// `CLIENT LIST`/`CLIENT INFO` it is about to answer.
+///
+/// The batch-end publish runs after the reply is built, so without this the
+/// listing would show the state before this batch (a `HELLO 3` or `SUBSCRIBE`
+/// earlier in it would be missing).
+pub(crate) fn publish_own_client_state(
+    client_id: u64,
+    conn: &super::core::ConnectionState,
+    pubsub: &dyn PubSubTeardown,
+) {
+    // Counted before the registry stripe is locked: the pub/sub lock is never
+    // taken while a stripe is held.
+    let counts = own_subscription_counts(pubsub, conn.subscriber_id);
+    let flags = conn.client_flags();
+    crate::client_registry::update(client_id, |e| {
+        e.live.touch(
+            conn.selected_db,
+            flags,
+            crate::storage::entry::current_time_ms(),
+        );
+        e.live.set_pubsub_counts(counts);
+    });
 }
 
 /// Commands that EXECUTE while a transaction is open instead of queueing.

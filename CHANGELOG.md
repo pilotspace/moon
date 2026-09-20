@@ -199,6 +199,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The `#455` end-to-end fold test opens its window again** (moon#1134). It
+  parked `EXEC` on a queued `WAIT`, which answers at once since moon#1098, so
+  its own vacuity guard failed every run on main and the shipped exactly-once
+  guarantee was left with no end-to-end cover. It now opens the window the
+  writer-side unit tests pin: a stalled `EverySec` fsync fills the writer
+  channel, many pipelined `INCR` producers park between applying their
+  mutation and enqueueing its record, and the fold snapshots while they are
+  parked. It asserts that `aof_rewrite_late_records_folded` moved, so a green
+  run proves a record really did reach the writer after the snapshot that
+  already held its mutation.
+
 - **A key spilled again after a `BGREWRITEAOF` keeps its pre-rewrite value
   across a `kill -9`, even when the respill's `MOON.SPILLED` marker never
   reached the AOF** (moon#1140). The marker is emitted into the AOF writer's
@@ -219,16 +230,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time, and appending only the missing marker to it recovers correctly), and
   present on `3b596be0` too — it predates moon#1085, moon#1075 and moon#1118.
 
-- **The `#455` end-to-end fold test opens its window again** (moon#1134). It
-  parked `EXEC` on a queued `WAIT`, which answers at once since moon#1098, so
-  its own vacuity guard failed every run on main and the shipped exactly-once
-  guarantee was left with no end-to-end cover. It now opens the window the
-  writer-side unit tests pin: a stalled `EverySec` fsync fills the writer
-  channel, many pipelined `INCR` producers park between applying their
-  mutation and enqueueing its record, and the fold snapshots while they are
-  parked. It asserts that `aof_rewrite_late_records_folded` moved, so a green
-  run proves a record really did reach the writer after the snapshot that
-  already held its mutation.
+- **A parked `XREADGROUP` is answered at once when its stream or group goes
+  away** (moon#1086). Redis unblocks a group reader when any write deletes
+  or retypes its stream or destroys its group; moon left it parked until its
+  own timeout and then answered nil. Every such change now answers it
+  immediately, with redis-server 8.6.1's text: `-NOGROUP No such key 'k' or
+  consumer group 'g' in XREADGROUP with GROUP option` after `DEL`, `UNLINK`,
+  `RENAME` away, `MOVE`, `SWAPDB`, `FLUSHDB`, `FLUSHALL`, `XGROUP DESTROY` or
+  expiry, and `-WRONGTYPE` after `SET` or a `RENAME` of another type onto it —
+  on the connection, inside `MULTI`, from a script, and across shards. A write
+  that names the key signals it directly (while a group reader is parked, the
+  ready-key gate admits every write, not only list/zset/stream writers, and
+  an inline `SET` takes the generic path); a flush, the source side of a
+  `MOVE` and an expiry mark the shard for a recheck its 10 ms blocking tick
+  runs. `XREAD` waiters stay parked, as in redis. The same text now answers
+  an `XREADGROUP` issued against a missing key or group (it said `ERR The
+  XREADGROUP subcommand requires the key to exist.` or `NOGROUP No such
+  consumer group for key name`). A multi-stream `XREADGROUP` now checks
+  every stream, group and id before it reads any stream. It used to move the
+  first stream's entries into the PEL and then fail on the second. Ids are
+  checked with redis's texts:
+  - `$` and `+` get `ERR The $ ID is meaningless in the context of XREADGROUP: ...`
+    (and the `+` form of it) instead of being parsed.
+  - A malformed id (`-`, `bad`, `1-x`, an out-of-range number) gets `ERR Invalid stream ID
+    specified as stream command argument`. `+` and `-` used to be accepted as ids.
+
+- **A blocked `XREADGROUP` that times out as it is served no longer strands
+  entries in its PEL** (moon#1047). The owner's stream waker ran the read —
+  moving the entries into the consumer's PEL and advancing the cursor —
+  before claiming a remote waiter; a waiter whose timeout settled its claim in
+  between answered nil while the entries sat undelivered in its PEL, and a
+  `>` loop never saw them again. The waker now claims first and reads only on
+  a won claim, the claim-token order moon#1045 gave the list and zset wakers.
+  The readiness check before the claim is read-only. It used to take the
+  stream mutably, and a wake that served nothing then aborted every `EXEC`
+  watching the stream. A consumer the check must create does not signal
+  watchers, as in redis.
+
+- **`XCLAIM` honours its options** (moon#1104). Every argument that parsed as
+  a stream id was claimed, so `RETRYCOUNT 1` claimed entry `1-0` and a
+  `TIME` value claimed another, and `IDLE`, `TIME`, `RETRYCOUNT`, `FORCE`,
+  `JUSTID` and `LASTID` were ignored — which also meant the records redis
+  propagates for a group read (and moon now logs) could not be replayed. The
+  ids now run until the first non-id argument and every option is applied as
+  in redis 8.6.1, with its error texts: `NOGROUP No such key 'k' or consumer
+  group 'g'` for a missing key or group (it answered an empty array),
+  `Unrecognized XCLAIM option`, and the `Invalid ... argument for XCLAIM`
+  family.
+
+- **A blocking `XREADGROUP` that delivers is logged, and survives `kill -9`**
+  (moon#1104). A consumer-group read moves what it delivers into the PEL and
+  advances the group's last-delivered id, but through `BLOCK` it went through
+  the blocking intercept and nothing reached the AOF or the replication
+  stream: after a restart the PEL was empty, the cursor was back, and the next
+  `>` reader was handed the same entries again (every row of the new kill -9
+  test, `--shards 1` and `--shards 4`, immediate and parked, with and without
+  `NOACK`). The shard that serves the read now logs, in the read's own
+  synchronous stretch and before the reply leaves, what redis-server 8.6.1
+  propagates for it: one `XCLAIM key group consumer 0 id TIME t RETRYCOUNT n
+  FORCE JUSTID LASTID id` per delivered entry, `XGROUP SETID` for the cursor,
+  and `XGROUP CREATECONSUMER` for a `NOACK` read that created its consumer
+  (`ENTRIESREAD` is omitted because moon keeps no such counter, and the
+  records are not wrapped in `MULTI`, which moon's log never carries). Under
+  `appendfsync always` the reader confirms the fsync on the stream owner's
+  writer, as a blocking pop does; a record the writer refuses answers the
+  reader with the standard `MOONERR AOF backpressure` error.
+
+- **A cross-shard `COPY` keeps the source's absolute expiry** (moon#1095). The
+  TTL crossed as a relative duration — `PTTL` read on the source shard's
+  cached clock, `PEXPIRE` re-anchored on the destination's — so the copy's
+  deadline moved by the drift between the two (measured: `PTTL` 500004 after
+  `PEXPIRE 500000`; 5 to 32 of 64 copies moved per run). The copy now carries
+  the source's `PEXPIRETIME` and is written as one `SET dst v PXAT <deadline>
+  [NX]`, which also closes the window in which a crash between the old `SET`
+  and `PEXPIRE` left a copy that never expired. Every other cross-shard hop
+  that could carry a TTL was audited: `RENAME`/`RENAMENX`, `SMOVE`,
+  `LMOVE`/`BLMOVE`, `SORT ... STORE` and the `*STORE` family are refused across
+  shards (`CROSSSLOT`, moon#592/#570), and `MOVE` / `COPY ... DB n` stay on one
+  shard, carrying the stored entry and its absolute deadline.
+
+- **`MOVE` and `COPY ... DB n` work inside scripts, and land where the effect
+  record says** (moon#1068). A script reaches the keyspace through the one
+  database it runs in, so `redis.call('MOVE', k, n)` answered `ERR MOVE requires
+  handler-level dispatch`, and `redis.call('COPY', a, b, 'DB', n)` answered `:1`
+  while writing `b` into the SCRIPT's database — and logged `COPY a b DB n` to
+  the AOF and the replication stream, which a replica and a restart apply into
+  db `n`. Both now run from `EVAL`, `EVALSHA`, `FCALL` and a script queued in
+  `MULTI` exactly as on the connection, as redis 8.6.1 does: the reply, the
+  landing database, the key's absolute deadline, `REPLACE`, redis's errors for
+  the script's own db and an out-of-range db, and one verbatim effect record on
+  `:1` only. A client blocked on the key in the destination database is served
+  once the script returns, after the record is logged (the moon#1056 rule), so
+  a restart neither loses nor resurrects the element it popped.
+
+- **`scripts/test-consistency.sh`: six rows no longer fail with `CROSSSLOT`
+  at `--shards 4`** (moon#1106). `ZRANGESTORE still-negative stop` and five
+  CLIENT TRACKING destination controls named keys on different shards, so
+  they tested the routing refusal instead of the command. Their keys (and
+  their sibling rows') now share a `{tag}`. The redirect-transcript drain
+  used `read -t 0.3`, which macOS `/bin/bash` 3.2 rejects ("invalid timeout
+  specification"), ending the drain at once; it now uses `-t 1`.
+
+- **`CLIENT INFO` / `CLIENT LIST` report a subscriber's flag, counts and
+  protocol, and `RESET` from RESP2 subscriber mode resets everything**
+  (moon#1105), matching redis 8.6.1 on both runtimes. A subscribed client was
+  listed as `flags=S` (redis's REPLICA flag) with `sub=0 psub=0 ssub=0` and
+  `resp=2` whatever it held; it is now `P` with its real channel, pattern and
+  shard-channel counts, every client's `resp` follows `HELLO`, and flag
+  characters combine in redis's order (`Px`, `Pb`, then `t`/`R`/`B`) instead
+  of keeping only the first. `RESET` sent from the RESP2 subscriber loop only
+  unsubscribed, so the connection kept its db, `CLIENT TRACKING`, name and
+  authentication; both handlers now run the same `RESET` as everywhere else.
+  That shared `RESET` also tore down only channels and patterns: a RESP3
+  client's `SSUBSCRIBE` survived it, and `SPUBLISH` still counted it as a
+  receiver. It now clears all three namespaces and the remote shard maps.
 
 - **A restart no longer drops vector documents whose hash is in the cold tier
   or carries a field TTL** (moon#1074). At boot, index recovery walks the
@@ -450,6 +565,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     loss the committed manifest could name a missing incr, or the old
     `appendonly.aof` could return, losing every record written after the
     rewrite. Both directories are now fsynced before the new file is used.
+
+- **The console lints, and CI runs it** (moon#1082). `pnpm run lint` exited
+  with a missing-config error because ESLint 9 reads only flat config and the
+  console had none. `console/eslint.config.js` now wires the plugins that were
+  already installed (`@eslint/js` and `typescript-eslint` recommended,
+  `react-hooks`, `react-refresh`), and the `unit` job of
+  `console-integration.yml` runs `pnpm run lint` before the tests. Its first
+  run found a real bug: `GraphCosmos` returned its Canvas2D fallback before its
+  hooks, so the re-render after a failed WebGL init called fewer hooks than the
+  first render and React threw; only the parent's error boundary hid it. The
+  fallback now returns after the hooks, with a unit test that failed before the
+  change. `badge.tsx` stops exporting the unused `badgeVariants`, and
+  `no-unused-vars` accepts a leading underscore, the convention `tsc` already
+  applies under `noUnusedParameters`.
 
 - **A COLD vector segment leaves `unloaded` with the search that reloads it,
   and a delete that lands while the reload is waiting to install is no longer
@@ -1393,6 +1522,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CH` as a did-anything-change signal silently skipped those updates. Fixed on
   both the listpack and B+tree arms, which carried separate copies.
 ### Security
+
+- **`fuzz/Cargo.lock` is audited and clean** (moon#1092). The fuzz workspace
+  has its own lockfile, which no gate checked, and it carried
+  RUSTSEC-2026-0204 (`crossbeam-epoch` 0.9.18) and RUSTSEC-2026-0258 (`h2`
+  0.4.13), plus the unsound `anyhow` 1.0.102 and `memmap2` 0.9.10 and the
+  yanked `spin` 0.9.8. Each is bumped to the version the root `Cargo.lock`
+  already ships (0.9.20, 0.4.18, 1.0.104, 0.9.11, 0.9.9), and nothing else in
+  the lockfile moves. `supply-chain.yml` now triggers on `fuzz/Cargo.toml` and
+  `fuzz/Cargo.lock` and runs `cargo audit --file fuzz/Cargo.lock` next to the
+  root audit, so the fuzz lockfile cannot drift behind again unnoticed.
 
 - **Error and status replies can no longer be split by client input**
   (moon#1031). Error text quotes client input (an unknown command name, an

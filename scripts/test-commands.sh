@@ -2210,6 +2210,27 @@ if should_run "scripting"; then
         assert_match "FCALL single key (key $i)" FCALL cmdset 1 "fn:k$i" "v$i"
         assert_match "FCALL value landed (key $i)" GET "fn:k$i"
     done
+    # moon#1068: MOVE and COPY ... DB n issued from a script. MOVE answered
+    # "requires handler-level dispatch"; COPY ... DB 4 answered 1 and wrote the
+    # copy into the SCRIPT's db. Compared with redis: the reply, then where the
+    # key landed and its absolute deadline (PEXPIRETIME is clock-free).
+    for srv in rcli mcli; do
+        $srv SET {sc1068}a av PXAT 4102444800000 >/dev/null 2>&1
+        $srv SET {sc1068}b bv >/dev/null 2>&1
+    done
+    assert_match "EVAL MOVE"           EVAL "return redis.call('MOVE', KEYS[1], '3')" 1 {sc1068}a
+    assert_match "EVAL MOVE landed"    -n 3 GET {sc1068}a
+    assert_match "EVAL MOVE deadline"  -n 3 PEXPIRETIME {sc1068}a
+    assert_match "EVAL MOVE left src"  EXISTS {sc1068}a
+    assert_match "EVAL MOVE same db"   EVAL "return redis.pcall('MOVE', KEYS[1], '0')" 1 {sc1068}b
+    assert_match "EVAL COPY DB 4"      EVAL "return redis.call('COPY', KEYS[1], KEYS[2], 'DB', '4')" 2 {sc1068}b {sc1068}c
+    assert_match "EVAL COPY DB 4 landed" -n 4 GET {sc1068}c
+    assert_match "EVAL COPY DB 4 not in db 0" EXISTS {sc1068}c
+    assert_match "EVAL COPY DB 99"     EVAL "return redis.pcall('COPY', KEYS[1], KEYS[2], 'DB', '99')" 2 {sc1068}b {sc1068}c
+    FN_MC=$'#!lua name=mc1068\nredis.register_function(\'mv\', function(keys, args) return redis.call(\'MOVE\', keys[1], args[1]) end)\n'
+    assert_match "FUNCTION LOAD (MOVE lib)" FUNCTION LOAD "$FN_MC"
+    assert_match "FCALL MOVE"          FCALL mv 1 {sc1068}b 5
+    assert_match "FCALL MOVE landed"   -n 5 GET {sc1068}b
     assert_match "FUNCTION DELETE"     FUNCTION DELETE cmdlib
     for i in 1 2 3 4; do
         assert_match "FCALL after DELETE (key $i)" FCALL cmdset 1 "fn:d$i" x
@@ -2511,6 +2532,12 @@ if should_run "blocking"; then
         "RPUSH {rkw10}s 3 1 2" "SORT {rkw10}s STORE {rkw10}d" "0:BLPOP {rkw10}d 2"
     wake_row "wake: EVAL RPUSH wakes BLPOP (moon#1069)" \
         "" "EVAL return(redis.call('RPUSH',KEYS[1],'x')) 1 {rkw11}k" "0:BLPOP {rkw11}k 2"
+    wake_row "wake: EVAL MOVE wakes BLPOP parked in the target db (moon#1068)" \
+        "RPUSH {rkw15}l v" "EVAL return(redis.call('MOVE',KEYS[1],'3')) 1 {rkw15}l" \
+        "3:BLPOP {rkw15}l 2"
+    wake_row "wake: EVAL COPY ... DB n wakes BLPOP parked in db n (moon#1068)" \
+        "RPUSH {rkw16}l v" "EVAL return(redis.call('COPY',KEYS[1],KEYS[1],'DB','3')) 1 {rkw16}l" \
+        "3:BLPOP {rkw16}l 2"
     wake_row "wake: ZINCRBY creating a zset wakes BZPOPMIN (moon#1069)" \
         "" "ZINCRBY {rkw12}z 1 m" "0:BZPOPMIN {rkw12}z 2"
     # The control: a key that becomes the WRONG type leaves the waiter parked.
