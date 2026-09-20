@@ -102,6 +102,29 @@ impl SegmentList {
             ..self.clone()
         }
     }
+
+    /// Tombstone every copy of `key_hash` this snapshot holds, in EVERY tier:
+    /// the mutable segment (MVCC, at `mutable_delete_lsn`), each HOT
+    /// (immutable) segment, each WARM segment, and each COLD stub (queued for
+    /// its reload). DEL/UNLINK/HDEL and an update's supersede of the old copy
+    /// both go through here, so the two can never cover different tiers again
+    /// (moon#1066: the update path skipped WARM and COLD).
+    ///
+    /// Each segment records and counts the tombstone only when it holds a live
+    /// row for the key, so `num_docs` drops by exactly the rows killed.
+    pub fn tombstone_key(&self, key_hash: u64, mutable_delete_lsn: u64) {
+        self.mutable
+            .mark_deleted_by_key_hash(key_hash, mutable_delete_lsn);
+        for imm in &self.immutable {
+            imm.mark_deleted_by_key_hash(key_hash);
+        }
+        for warm in &self.warm {
+            warm.mark_deleted_by_key_hash(key_hash);
+        }
+        for stub in &self.unloaded {
+            stub.mark_deleted_by_key_hash(key_hash);
+        }
+    }
 }
 
 /// Bounded cooperative-yield cap for the FT.SEARCH local slice

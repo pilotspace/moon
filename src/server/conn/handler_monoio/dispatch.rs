@@ -1153,6 +1153,7 @@ pub(super) fn try_handle_client_admin(
     cmd_args: &[Frame],
     client_id: u64,
     conn: &ConnectionState,
+    pubsub: &dyn crate::server::conn::shared::PubSubTeardown,
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"CLIENT") {
@@ -1169,19 +1170,7 @@ pub(super) fn try_handle_client_admin(
                 return false;
             }
             if sub_bytes.eq_ignore_ascii_case(b"LIST") {
-                crate::client_registry::update(client_id, |e| {
-                    e.live.touch(
-                        conn.selected_db,
-                        crate::client_registry::ClientFlags {
-                            subscriber: conn.subscription_count > 0,
-                            in_multi: conn.in_multi,
-                            // Executing CLIENT LIST/INFO means not blocked.
-                            blocked: false,
-                            replica: conn.saw_replconf,
-                        },
-                        crate::storage::entry::current_time_ms(),
-                    );
-                });
+                crate::server::conn::shared::publish_own_client_state(client_id, conn, pubsub);
                 let list = crate::client_registry::client_list();
                 responses.push(Frame::BulkString(Bytes::from(list)));
                 return true;
@@ -1189,19 +1178,7 @@ pub(super) fn try_handle_client_admin(
             if sub_bytes.eq_ignore_ascii_case(b"INFO") {
                 // Derive flags from CURRENT conn state (same as the LIST path
                 // above) — reloading e.live.flags would freeze stale bits.
-                crate::client_registry::update(client_id, |e| {
-                    e.live.touch(
-                        conn.selected_db,
-                        crate::client_registry::ClientFlags {
-                            subscriber: conn.subscription_count > 0,
-                            in_multi: conn.in_multi,
-                            // Executing CLIENT LIST/INFO means not blocked.
-                            blocked: false,
-                            replica: conn.saw_replconf,
-                        },
-                        crate::storage::entry::current_time_ms(),
-                    );
-                });
+                crate::server::conn::shared::publish_own_client_state(client_id, conn, pubsub);
                 let info = crate::client_registry::client_info(client_id).unwrap_or_default();
                 // No conversion call here any more: `responses` is an
                 // `InterceptReplies`, which applies the RESP3 policy on push.
@@ -2190,7 +2167,14 @@ pub(super) async fn run_txn_connection_intercept(
         || try_handle_wait(cmd, cmd_args, ctx, true, shaped!()).await
         || try_handle_client_early(cmd, cmd_args, client_id, conn, shaped!())
         || try_handle_client_tracking(cmd, cmd_args, client_id, conn, ctx, shaped!())
-        || try_handle_client_admin(cmd, cmd_args, client_id, conn, shaped!())
+        || try_handle_client_admin(
+            cmd,
+            cmd_args,
+            client_id,
+            conn,
+            &ctx.shard_pubsub(),
+            shaped!(),
+        )
         || super::pubsub::try_handle_pubsub_introspection(cmd, cmd_args, ctx, &mut out)
         || crate::server::conn::shared::try_handle_function_in_txn(
             cmd,

@@ -1329,6 +1329,25 @@ pub fn note_script_write(db_index: usize, cmd: &[u8], args: &[Frame]) {
     });
 }
 
+/// [`note_script_write`] for the key a script's `MOVE` / `COPY ... DB n`
+/// wrote into ANOTHER database (moon#1068) — the script half of
+/// [`cross_db_write_target`]. The caller passes it only for a `:1` reply.
+///
+/// Served with the script's other ready keys once it returns, which is after
+/// the bridge has logged the command: a pop the wake performs is logged as it
+/// happens, so it must follow the write that fed it (moon#1056).
+pub fn note_script_cross_db_write(dst_db: usize, key: &Bytes) {
+    if !SCRIPT_WAKES_ARMED.with(std::cell::Cell::get) {
+        return;
+    }
+    SCRIPT_WRITES.with(|w| {
+        let mut w = w.borrow_mut();
+        if !w.iter().any(|(db, k)| *db == dst_db && k == key) {
+            w.push((dst_db, key.clone()));
+        }
+    });
+}
+
 /// Take everything [`note_script_write`] recorded and disarm, leaving the
 /// thread clean for the next script. The thread's buffer keeps its capacity;
 /// the returned `Vec` allocates only when something was recorded.
@@ -2133,6 +2152,23 @@ mod wake_written_keys_tests {
             vec![(0, Bytes::from_static(b"q")), (2, Bytes::from_static(b"z"))]
         );
         assert!(take_script_writes().is_empty());
+    }
+
+    /// moon#1068: a script's `MOVE` / `COPY ... DB n` records the key in the
+    /// DESTINATION db, once, among the script's other ready keys — and only
+    /// while the script's wakes are armed.
+    #[test]
+    fn script_cross_db_writes_record_the_destination() {
+        let q = Bytes::from_static(b"q");
+        begin_script_writes(&ScriptWakes::Defer { armed: true });
+        note_script_write(0, b"RPUSH", &args(&["q", "a"]));
+        note_script_cross_db_write(9, &q);
+        note_script_cross_db_write(9, &q);
+        assert_eq!(take_script_writes(), vec![(0, q.clone()), (9, q.clone())]);
+
+        begin_script_writes(&ScriptWakes::Defer { armed: false });
+        note_script_cross_db_write(9, &q);
+        assert!(take_script_writes().is_empty(), "recorded while disarmed");
     }
 
     /// A script that starts while nobody on the shard is blocked records
