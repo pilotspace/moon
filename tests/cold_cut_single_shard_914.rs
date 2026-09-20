@@ -422,7 +422,9 @@ fn probe_markers_on_disk(dir: &std::path::Path, fams: &[&str]) -> usize {
             continue;
         };
         while let Some((parts, next)) = resp_record(&buf, pos) {
-            if parts[0] == b"MOON.SPILLED" && parts.iter().skip(2).any(|k| is_probe(k)) {
+            if parts.first() == Some(&&b"MOON.SPILLED"[..])
+                && parts.iter().skip(2).any(|k| is_probe(k))
+            {
                 n += 1;
             }
             pos = next;
@@ -447,7 +449,7 @@ fn drop_spilled_markers(dir: &std::path::Path) -> usize {
         let mut out = buf[..head].to_vec();
         let mut pos = head;
         while let Some((parts, next)) = resp_record(&buf, pos) {
-            if parts[0] == b"MOON.SPILLED" {
+            if parts.first() == Some(&&b"MOON.SPILLED"[..]) {
                 removed += 1;
             } else {
                 out.extend_from_slice(&buf[pos..next]);

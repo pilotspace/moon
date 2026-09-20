@@ -219,15 +219,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time, and appending only the missing marker to it recovers correctly), and
   present on `3b596be0` too — it predates moon#1085, moon#1075 and moon#1118.
 
-- **A restart no longer drops vector documents
-
 - **The `#455` end-to-end fold test opens its window again** (moon#1134). It
   parked `EXEC` on a queued `WAIT`, which answers at once since moon#1098, so
-  its own vacuity guard failed every run on main. It now holds `EXEC` on a
-  queued `SCRIPT LOAD` whose fan-out waits for a shard busy in `DEBUG SLEEP`,
-  and asserts that `aof_rewrite_late_records_folded` moved, so a green run
-  proves a record really did reach the writer after the snapshot that already
-  held its mutation. whose hash is in the cold tier
+  its own vacuity guard failed every run on main and the shipped exactly-once
+  guarantee was left with no end-to-end cover. It now opens the window the
+  writer-side unit tests pin: a stalled `EverySec` fsync fills the writer
+  channel, many pipelined `INCR` producers park between applying their
+  mutation and enqueueing its record, and the fold snapshots while they are
+  parked. It asserts that `aof_rewrite_late_records_folded` moved, so a green
+  run proves a record really did reach the writer after the snapshot that
+  already held its mutation.
+
+- **A restart no longer drops vector documents whose hash is in the cold tier
   or carries a field TTL** (moon#1074). At boot, index recovery walks the
   keyspace, and any recovered document whose key the walk did not see is
   deleted as "removed while the server was down". The walk read only the hot

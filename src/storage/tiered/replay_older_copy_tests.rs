@@ -198,7 +198,7 @@ fn the_rebuild_keeps_superseded_copies_until_replay_closes() {
     spill_files(tmp.path(), &manifest_path, files);
     let manifest = ShardManifest::open(&manifest_path).expect("open manifest");
     let mut per_db = ColdIndex::rebuild_from_manifest_per_db(tmp.path(), &manifest).per_db;
-    let (_, mut index) = per_db.remove(0);
+    let (_, index) = per_db.remove(0);
 
     assert_eq!(index.lookup(b"k").map(|l| l.file_id), Some(12));
     let older: Vec<u64> = index.older_copies(b"k").iter().map(|l| l.file_id).collect();

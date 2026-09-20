@@ -432,6 +432,11 @@ impl ColdIndex {
     /// referrer the old `file_id` is queued for unlink — the hot∩cold sweep can
     /// never see such a file because no key references it anymore.
     pub fn insert(&mut self, key: Bytes, location: ColdLocation) {
+        // A fresh location supersedes the rebuild's view of this key, so the
+        // copies recorded behind the entry it replaces are no longer a base
+        // anything may fall back to. Free outside recovery: the map this
+        // consults is empty on the live path.
+        self.release_older_copies_of(&key);
         let new_file = location.file_id;
         let key_len = key.len();
         let h = scan_h48(&key);
