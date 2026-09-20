@@ -199,6 +199,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A key spilled again after a `BGREWRITEAOF` keeps its pre-rewrite value
+  across a `kill -9`, even when the respill's `MOON.SPILLED` marker never
+  reached the AOF** (moon#1140). The marker is emitted into the AOF writer's
+  channel while the spill file's manifest entry is committed by the
+  manifest-sync thread, so a process death (or AOF backpressure) can leave the
+  file named by the manifest with nothing in the log that authorizes it. The
+  rebuilt cold index points the key at that newest file, the `MOON.COLDCUT`
+  gate hides it, and the copy below the cut — the only base the generation's
+  records were written against — was shadowed by it. Every post-rewrite write
+  then replayed onto an empty value and the end-of-replay resolution kept that
+  truncated copy: a list acknowledged as `a,b,c,d,e,f` came back as `f`, an
+  `INCRBY` counter as `1` instead of `8`. A gated replay now falls back to the
+  key's newest AUTHORIZED copy, which is what the newest-wins index would hold
+  had the hidden file never been written; the rebuild keeps the copies it
+  superseded for the length of the generation and releases them when it
+  closes. Reproduced on both runtimes at `--shards 1` (a 200 ms `kill -9`
+  after the respill failed 2 of 4 runs; the crash image fails recovery every
+  time, and appending only the missing marker to it recovers correctly), and
+  present on `3b596be0` too — it predates moon#1085, moon#1075 and moon#1118.
+
 - **Waiters a refused AOF record left parked are served once the writer has
   room** (moon#1111). When the AOF writer could not take a served pop's
   record within the backpressure bound, the wake stopped (every further serve

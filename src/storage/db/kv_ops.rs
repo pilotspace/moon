@@ -224,10 +224,11 @@ impl Database {
             return true;
         }
         if matches!(outcome, ColdReadOutcome::Hit(..) | ColdReadOutcome::Expired) {
+            // The location a read may use right now: the index entry, or
+            // during a gated replay the older authorized copy the gate hands
+            // out in its place (moon#1140).
             let still_valid = self
-                .cold_index
-                .as_ref()
-                .and_then(|ci| ci.lookup(key))
+                .cold_location_visible(key)
                 .is_some_and(|current| current == expected_location);
             if !still_valid {
                 // The cold entry this outcome was read from is gone (DEL/

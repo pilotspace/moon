@@ -164,6 +164,21 @@ pub struct ColdIndex {
     /// tick would regress the workload this index exists for. See
     /// [`Self::resident_bytes`] for the read side.
     resident_bytes: usize,
+    /// Copies of a key that a rebuild found in OLDER files than the one the
+    /// key now points at, newest first. Recovery-only: filled by
+    /// [`Self::rebuild_from_manifest_per_db`] and released when the AOF
+    /// replay generation closes ([`Self::release_older_copies`]). Nothing on
+    /// the live path inserts here.
+    ///
+    /// moon#1140: a replay gated by `MOON.COLDCUT <w>` hides every file at or
+    /// past `w` until its `MOON.SPILLED` marker replays. A key cold at the
+    /// rewrite and spilled again afterwards points at the newer file, and
+    /// when that file's marker never reached the AOF (SIGKILL before the
+    /// writer flushed it, or dropped under backpressure) while its manifest
+    /// entry did, the key's only replayable base is the older copy below the
+    /// cut. The gate reads it from here instead of treating the key as
+    /// absent, which replayed every post-rewrite write onto an empty value.
+    older_copies: HashMap<Bytes, Vec<ColdLocation>>,
 }
 
 /// Approximate fixed cost of one cold-index entry beyond the key bytes: the
@@ -333,6 +348,50 @@ impl ColdIndex {
             file_refs: HashMap::new(),
             pending_unlink: Vec::new(),
             resident_bytes: 0,
+            older_copies: HashMap::new(),
+        }
+    }
+
+    /// The copies of `key` a rebuild found behind its current entry, newest
+    /// first (see the `older_copies` field). Empty outside recovery.
+    #[inline]
+    pub fn older_copies(&self, key: &[u8]) -> &[ColdLocation] {
+        if self.older_copies.is_empty() {
+            return &[];
+        }
+        self.older_copies.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    /// Drop the superseded copies once replay no longer needs them, releasing
+    /// the file reference each one holds. A file left with no referrer joins
+    /// the unlink queue here — exactly where the rebuild would have put it had
+    /// the copies never been retained. Returns how many keys carried any.
+    pub fn release_older_copies(&mut self) -> usize {
+        let older = std::mem::take(&mut self.older_copies);
+        let keys = older.len();
+        for location in older.into_values().flatten() {
+            if self.ref_dec(location.file_id) {
+                self.pending_unlink.push(location.file_id);
+            }
+        }
+        keys
+    }
+
+    /// Release the superseded copies of one key. A key leaving the index
+    /// (DEL/UNLINK, promotion back to RAM, expiry reclaim) has no reader left
+    /// for the copies behind it, so they release their file references here
+    /// rather than waiting for the end of the generation.
+    fn release_older_copies_of(&mut self, key: &[u8]) {
+        if self.older_copies.is_empty() {
+            return;
+        }
+        let Some(copies) = self.older_copies.remove(key) else {
+            return;
+        };
+        for location in copies {
+            if self.ref_dec(location.file_id) {
+                self.pending_unlink.push(location.file_id);
+            }
         }
     }
 
@@ -373,6 +432,11 @@ impl ColdIndex {
     /// referrer the old `file_id` is queued for unlink — the hot∩cold sweep can
     /// never see such a file because no key references it anymore.
     pub fn insert(&mut self, key: Bytes, location: ColdLocation) {
+        // A fresh location supersedes the rebuild's view of this key, so the
+        // copies recorded behind the entry it replaces are no longer a base
+        // anything may fall back to. Free outside recovery: the map this
+        // consults is empty on the live path.
+        self.release_older_copies_of(&key);
         let new_file = location.file_id;
         let key_len = key.len();
         let h = scan_h48(&key);
@@ -415,6 +479,7 @@ impl ColdIndex {
     /// Decrements the backing file's live-ref count; if this removes the file's
     /// last referrer, the `file_id` is queued for unlink by the next sweep.
     pub fn remove(&mut self, key: &[u8]) -> bool {
+        self.release_older_copies_of(key);
         if let Some(old) = self.remove_raw(key) {
             if self.ref_dec(old.file_id) {
                 self.pending_unlink.push(old.file_id);
@@ -434,6 +499,7 @@ impl ColdIndex {
     /// the manifest handle this method deliberately does not need.
     pub fn clear_all(&mut self) {
         self.map.clear();
+        self.older_copies = HashMap::new();
         self.resident_bytes = 0;
         for (&file_id, _) in self.file_refs.iter() {
             self.pending_unlink.push(file_id);
@@ -460,6 +526,15 @@ impl ColdIndex {
     pub fn merge(&mut self, other: ColdIndex) {
         for ((_h, key), location) in other.map {
             self.insert(key, location);
+        }
+        // The copies a gated replay may fall back to, each with the file
+        // reference it holds. The loop above rebuilt the references of the
+        // entries in FRONT of them only.
+        for (key, copies) in other.older_copies {
+            for location in &copies {
+                self.ref_inc(location.file_id);
+            }
+            self.older_copies.entry(key).or_default().extend(copies);
         }
     }
 
@@ -1157,15 +1232,35 @@ impl ColdIndex {
             a.0.cmp(&b.0)
                 .then_with(|| b.1.recency_key().cmp(&a.1.recency_key()))
         });
-        pairs.dedup_by(|later, first| later.0 == first.0);
+        // Keep the first (newest) of each equal-key run in the map; the rest
+        // are the older copies a gated replay may still need (moon#1140).
+        let mut older_copies: HashMap<Bytes, Vec<ColdLocation>> = HashMap::new();
+        let mut newest: Vec<((u64, Bytes), ColdLocation)> = Vec::with_capacity(pairs.len());
+        for (key, loc) in pairs {
+            match newest.last() {
+                Some((prev, _)) if *prev == key => {
+                    older_copies.entry(key.1).or_default().push(loc);
+                }
+                _ => newest.push((key, loc)),
+            }
+        }
 
-        let map: BTreeMap<(u64, Bytes), ColdLocation> = pairs.into_iter().collect();
+        let map: BTreeMap<(u64, Bytes), ColdLocation> = newest.into_iter().collect();
 
         let mut file_refs: HashMap<u64, u32> = HashMap::with_capacity(seen_files.len());
         let mut resident_bytes = 0usize;
         for ((_, key), loc) in &map {
             *file_refs.entry(loc.file_id).or_insert(0) += 1;
             resident_bytes += cold_entry_cost(key.len());
+        }
+        // A retained copy is a referrer too: a gated replay may read it, so
+        // its file must not be unlinked underneath that read. The reference
+        // is given back by `release_older_copies`, which queues the file then
+        // if nothing else holds it. `resident_bytes` is deliberately NOT
+        // charged — it accounts one cost per distinct key, and these keys are
+        // already counted by the map entry in front of them.
+        for location in older_copies.values().flatten() {
+            *file_refs.entry(location.file_id).or_insert(0) += 1;
         }
 
         let pending_unlink: Vec<u64> = seen_files
@@ -1178,6 +1273,7 @@ impl ColdIndex {
             file_refs,
             pending_unlink,
             resident_bytes,
+            older_copies,
         }
     }
 }

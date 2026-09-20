@@ -1312,9 +1312,24 @@ mod tests {
         // — true before this change and after it.
         let mut per_db = ColdIndex::rebuild_from_manifest_per_db(shard_dir, &m2).per_db;
         assert_eq!(per_db.len(), 1, "one db");
-        let bulk = per_db.remove(0).1;
+        let mut bulk = per_db.remove(0).1;
         assert_eq!(bulk.len(), 2, "`gone` + `kept`");
         assert_eq!(bulk.lookup(b"gone").map(|l| l.file_id), Some(304));
+        // The rebuild keeps `gone`'s superseded copy in 303 so a gated replay
+        // can still read it, and that copy holds 303's reference: a replay
+        // that has not authorized 304 yet reads the older value, and unlinking
+        // 303 underneath it would lose the key entirely. So 303 is pinned, not
+        // queued, until the copies are released.
+        assert_eq!(
+            bulk.referenced_file_count(),
+            2,
+            "303 stays referenced while it still backs `gone`'s superseded copy"
+        );
+        assert_eq!(bulk.pending_unlink_len(), 0, "nothing is unlinkable yet");
+
+        // Replay over: the superseded copies go, and 303 makes the zero-ref
+        // transition into `pending_unlink` that `ref_dec` used to make.
+        assert_eq!(bulk.release_older_copies(), 1, "one key had an older copy");
         assert_eq!(
             bulk.referenced_file_count(),
             1,

@@ -6,6 +6,8 @@ pub mod cold_read_pool;
 pub mod file_id_seed;
 pub mod kv_serde;
 pub mod kv_spill;
+#[cfg(test)]
+mod replay_older_copy_tests;
 pub mod segment_handle;
 pub mod spill_thread;
 pub mod warm_tier;
