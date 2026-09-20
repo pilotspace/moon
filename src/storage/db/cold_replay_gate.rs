@@ -26,6 +26,21 @@
 //!   hot copy the preceding records rebuilt (restart-as-cold, exactly where
 //!   task #56 wanted it), and let later records hydrate from it.
 //!
+//! A marker is best-effort, and moon#1140 is what that costs: the manifest
+//! entry of a spill file is committed by the manifest-sync thread while its
+//! marker is still in the AOF writer's channel or user-space buffer, and a
+//! `SIGKILL` (or a marker dropped under AOF backpressure) leaves the file
+//! named by the manifest with no record of it in the log. The rebuilt index
+//! then points the key at that file — newest wins — and the copy BELOW the
+//! cut, the one the generation's records are written against, is shadowed.
+//! Treating the key as absent lost every pre-rewrite element of it: the
+//! replayed post-rewrite write built a fresh value and the end-of-replay
+//! resolution kept it. So while the gate hides a key's newest copy, the read
+//! paths fall back to its newest AUTHORIZED copy — exactly what the index
+//! would hold had the hidden file never been written. The rebuild keeps those
+//! superseded copies (`ColdIndex::older_copies`) for the length of the
+//! generation and releases them when it closes.
+//!
 //! While the gate is installed, a cold entry is INVISIBLE to the value-giving
 //! read paths (`cold_contains_alive`, `get_cold_value`, `cold_lookup_location`)
 //! unless its file is authorized by one of the two records above. Tombstoning
@@ -94,6 +109,11 @@ pub fn close_replay_generation(databases: &mut [Database]) -> ReplayColdReconcil
     let mut total = ReplayColdReconcile::default();
     for db in databases.iter_mut() {
         if !db.replay_generation_open() {
+            // Nothing replayed through a gate here, so the rebuild's older
+            // copies (moon#1140) have no reader left.
+            if let Some(ci) = db.cold_index.as_mut() {
+                ci.release_older_copies();
+            }
             continue;
         }
         let r = db.finish_replay_cold_reconcile();
@@ -167,11 +187,28 @@ impl Database {
     /// This is the ONE choke point for every value-giving cold read
     /// (`cold_contains_alive`, `get_cold_value`, `cold_lookup_location`).
     /// Tombstoning paths deliberately bypass it.
+    ///
+    /// moon#1140: when the key's newest copy is not authorized yet, its
+    /// newest AUTHORIZED older copy (one the rebuild found behind it) is the
+    /// visible one. A file below the cut is a valid base for every record of
+    /// the generation, and a newer file whose marker is missing must not hide
+    /// it: that marker is best-effort (lost when the process dies before the
+    /// writer flushed it, or dropped under backpressure) while the file's
+    /// manifest entry is committed on its own. Treating the key as absent
+    /// replayed each post-rewrite write onto an empty value, and the
+    /// end-of-replay resolution then kept that truncated hot copy. The older
+    /// copy is exactly what the newest-wins index would have held had the
+    /// unauthorized file never been written.
     #[inline]
     pub(super) fn cold_location_visible(&self, key: &[u8]) -> Option<ColdLocation> {
-        let location = self.cold_index.as_ref()?.lookup(key)?;
+        let ci = self.cold_index.as_ref()?;
+        let location = ci.lookup(key)?;
         match self.replay_cold_gate.as_ref() {
-            Some(gate) if !gate.is_authorized(location.file_id) => None,
+            Some(gate) if !gate.is_authorized(location.file_id) => ci
+                .older_copies(key)
+                .iter()
+                .find(|older| gate.is_authorized(older.file_id))
+                .copied(),
             _ => Some(location),
         }
     }
@@ -246,6 +283,10 @@ impl Database {
     pub fn finish_replay_cold_reconcile(&mut self) -> ReplayColdReconcile {
         let gate = self.replay_cold_gate.take();
         let saw_marker = std::mem::take(&mut self.replay_saw_cold_marker);
+        // moon#1140: the older copies only served gated reads; none remain.
+        if let Some(ci) = self.cold_index.as_mut() {
+            ci.release_older_copies();
+        }
         if gate.is_none() && !saw_marker {
             return ReplayColdReconcile {
                 gated: false,

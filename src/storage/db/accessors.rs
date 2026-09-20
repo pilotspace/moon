@@ -1171,17 +1171,14 @@ impl Database {
             return Some(value);
         }
         let shard_dir = self.cold_shard_dir.as_ref()?;
-        let ci = self.cold_index.as_ref()?;
         // moon#902: an AOF-authority replay may not read a value from a cold
-        // file the log has not cut yet (see `cold_replay_gate`). Outside
-        // replay this is the same lookup `cold_read_through` repeats.
-        if self.replay_cold_gate_active() {
-            self.cold_location_visible(key)?;
-        }
+        // file the log has not cut yet (see `cold_replay_gate`), and reads
+        // the older authorized copy in that case (moon#1140). Outside replay
+        // this is the plain index lookup.
+        let location = self.cold_location_visible(key)?;
         use crate::storage::tiered::cold_read::ColdReadOutcome;
-        match crate::storage::tiered::cold_read::cold_read_through_outcome(
-            ci, shard_dir, key, now_ms,
-        ) {
+        match crate::storage::tiered::cold_read::read_cold_entry(shard_dir, location, now_ms, None)
+        {
             ColdReadOutcome::Hit(value, _ttl) => Some(value),
             ColdReadOutcome::Unreadable(fault) => {
                 // moon#875: indexed, unreadable. Not absence — raise the

@@ -21,7 +21,12 @@
 //!      hot-only, so the cold copy is the ONLY copy. 2a is moon#912's exact
 //!      SET-only shape (an acknowledged `v2` came back `v1`); 2b spills the
 //!      post-rewrite values again before the kill (double-apply), which needs
-//!      the rewrite to re-open the cut.
+//!      the rewrite to re-open the cut. 2c is 2b with every post-rewrite
+//!      `MOON.SPILLED` marker removed from the crash image (moon#1140): a
+//!      marker is best-effort (a SIGKILL before the writer flushes it, or
+//!      backpressure, loses it) while its file's manifest entry commits on
+//!      its own, so recovery must not depend on it to find the pre-rewrite
+//!      copy of a key.
 //!   3. **`--wal-kv-log on`** — leg 1 with the WAL leg of `ColdMarkerSink`
 //!      live. A WAL holding only markers must not displace the AOF as the
 //!      recovery authority (it has never recorded a client write here).
@@ -359,6 +364,102 @@ fn wal_kv_log_on_kill9_cycles_apply_every_write_exactly_once() {
     kill_cycles("cold-cut-914-wal", &["--wal-kv-log", "on"]);
 }
 
+const COLD_CUT_HEAD: &[u8] = b"*2\r\n$12\r\nMOON.COLDCUT\r\n";
+
+/// Every file that can hold the rewritten generation's RESP records: the
+/// legacy single file (tokio `--shards 1`) and the manifest layout's incr
+/// files (monoio).
+fn aof_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = vec![dir.join("appendonly.aof")];
+    if let Ok(rd) = std::fs::read_dir(dir.join("appendonlydir")) {
+        out.extend(
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.to_str().is_some_and(|n| n.ends_with(".incr.aof"))),
+        );
+    }
+    out.retain(|p| p.is_file());
+    out
+}
+
+/// One RESP array record at `pos`: its parts and the offset after it.
+/// `None` for anything else, including a torn tail.
+fn resp_record(buf: &[u8], pos: usize) -> Option<(Vec<&[u8]>, usize)> {
+    fn line(buf: &[u8], pos: usize, tag: u8) -> Option<(usize, usize)> {
+        if buf.get(pos) != Some(&tag) {
+            return None;
+        }
+        let end = pos + buf.get(pos..)?.windows(2).position(|w| w == b"\r\n")?;
+        let n = std::str::from_utf8(&buf[pos + 1..end]).ok()?.parse().ok()?;
+        Some((n, end + 2))
+    }
+    let (count, mut p) = line(buf, pos, b'*')?;
+    let mut parts = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (len, start) = line(buf, p, b'$')?;
+        parts.push(buf.get(start..start + len)?);
+        p = start + len + 2;
+        if p > buf.len() {
+            return None;
+        }
+    }
+    Some((parts, p))
+}
+
+/// Post-rewrite `MOON.SPILLED` records on disk that name a probe key.
+fn probe_markers_on_disk(dir: &std::path::Path, fams: &[&str]) -> usize {
+    let is_probe = |k: &[u8]| {
+        fams.iter()
+            .any(|f| k.starts_with(format!("{f}:").as_bytes()))
+    };
+    let mut n = 0;
+    for path in aof_files(dir) {
+        let buf = std::fs::read(&path).unwrap_or_default();
+        let Some(mut pos) = buf
+            .windows(COLD_CUT_HEAD.len())
+            .position(|w| w == COLD_CUT_HEAD)
+        else {
+            continue;
+        };
+        while let Some((parts, next)) = resp_record(&buf, pos) {
+            if parts[0] == b"MOON.SPILLED" && parts.iter().skip(2).any(|k| is_probe(k)) {
+                n += 1;
+            }
+            pos = next;
+        }
+    }
+    n
+}
+
+/// Remove every `MOON.SPILLED` record after the rewritten generation's
+/// `MOON.COLDCUT` head from the crash image, as if each had died with the
+/// process. Returns how many were removed.
+fn drop_spilled_markers(dir: &std::path::Path) -> usize {
+    let mut removed = 0;
+    for path in aof_files(dir) {
+        let buf = std::fs::read(&path).expect("read AOF");
+        let Some(head) = buf
+            .windows(COLD_CUT_HEAD.len())
+            .position(|w| w == COLD_CUT_HEAD)
+        else {
+            continue;
+        };
+        let mut out = buf[..head].to_vec();
+        let mut pos = head;
+        while let Some((parts, next)) = resp_record(&buf, pos) {
+            if parts[0] == b"MOON.SPILLED" {
+                removed += 1;
+            } else {
+                out.extend_from_slice(&buf[pos..next]);
+            }
+            pos = next;
+        }
+        out.extend_from_slice(&buf[pos..]);
+        std::fs::write(&path, out).expect("rewrite AOF");
+    }
+    removed
+}
+
 fn post_rewrite_expected(fam: &str) -> String {
     match fam {
         "l" => "a,b,c,d,e,f",
@@ -383,7 +484,7 @@ fn post_rewrite_expected(fam: &str) -> String {
 /// post-rewrite values AGAIN before the kill, so replay meets a cold file
 /// newer than the rewrite — the case that needs the rewritten generation to
 /// re-open the cut rather than inherit none.
-fn post_rewrite(leg: &str, fams: &[&str], respill: bool) {
+fn post_rewrite(leg: &str, fams: &[&str], respill: bool, lose_markers: bool) {
     let dir = common::unique_test_dir(leg);
     std::fs::create_dir_all(&dir).expect("create dir");
 
@@ -423,6 +524,19 @@ fn post_rewrite(leg: &str, fams: &[&str], respill: bool) {
             drive_filler(&mut c, "1");
         }
         std::thread::sleep(Duration::from_secs(1));
+        if lose_markers {
+            // Wait for a respill of a probe key to be logged: dropping it
+            // below is what this leg is about, so it must exist first.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while probe_markers_on_disk(&dir, fams) == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "{leg}: no post-rewrite MOON.SPILLED naming a probe key reached the AOF \
+                     — nothing was respilled, the run would be vacuous"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
     let cold_files = count_cold_files(&dir);
     guard.kill_now();
@@ -431,6 +545,10 @@ fn post_rewrite(leg: &str, fams: &[&str], respill: bool) {
         cold_files > 0,
         "{leg}: no cold data files at the SIGKILL — vacuous run"
     );
+    if lose_markers {
+        let removed = drop_spilled_markers(&dir);
+        assert!(removed > 0, "{leg}: no marker to drop — vacuous run");
+    }
 
     let (child, port2) = start_moon(&dir, &[]);
     let mut guard2 = common::ServerGuard::new(child);
@@ -439,28 +557,57 @@ fn post_rewrite(leg: &str, fams: &[&str], respill: bool) {
         audit(&mut c, fams, post_rewrite_expected)
     };
     guard2.kill_now();
-    let _ = std::fs::remove_dir_all(&dir);
+    // Keep the data dir (server.err, AOF, manifest, heap files) when the
+    // audit fails: a lost write is only explainable from the crash image.
+    if present >= fams.len() * PROBES / 2 && bad.is_empty() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     assert!(
         present >= fams.len() * PROBES / 2,
-        "{leg}: only {present} probes survived"
+        "{leg}: only {present} probes survived (data dir kept: {})",
+        dir.display()
     );
     assert!(
         bad.is_empty(),
         "{leg}: {} acknowledged post-rewrite write(s) did not survive a kill -9 exactly \
-         once (moon#914 — the rewritten generation opened without a MOON.COLDCUT): {}",
+         once (moon#914 — the rewritten generation opened without a MOON.COLDCUT; \
+         moon#1140 — a respill whose marker was lost hid the pre-rewrite copy): {} \
+         (data dir kept: {})",
         bad.len(),
-        bad.join("; ")
+        bad.join("; "),
+        dir.display()
     );
 }
 
 /// Leg 2a — moon#912's shape: kill while the post-rewrite writes are hot.
 #[test]
 fn post_rewrite_write_to_a_cold_key_survives_kill9() {
-    post_rewrite("cold-cut-914-rewrite", &["s"], false);
+    post_rewrite("cold-cut-914-rewrite", &["s"], false, false);
 }
 
 /// Leg 2b — the post-rewrite values are spilled again before the kill.
 #[test]
 fn post_rewrite_write_respilled_survives_kill9_exactly_once() {
-    post_rewrite("cold-cut-914-rewrite-respill", &["l", "n", "ap", "s"], true);
+    post_rewrite(
+        "cold-cut-914-rewrite-respill",
+        &["l", "n", "ap", "s"],
+        true,
+        false,
+    );
+}
+
+/// Leg 2c — moon#1140: 2b with the respill's `MOON.SPILLED` markers lost.
+/// The respilled files are in the manifest, so the rebuilt index points each
+/// respilled key at a file past the cut that no marker authorizes. Before
+/// the fix the replay then read no base for the key at all: `l:17` came back
+/// `"f"` (want `"a,b,c,d,e,f"`), the shape a hosted-macOS run hit when its
+/// SIGKILL beat the writer's flush of those markers.
+#[test]
+fn post_rewrite_respill_survives_its_spill_markers_being_lost() {
+    post_rewrite(
+        "cold-cut-914-rewrite-lost-markers",
+        &["l", "n", "ap", "s"],
+        true,
+        true,
+    );
 }
