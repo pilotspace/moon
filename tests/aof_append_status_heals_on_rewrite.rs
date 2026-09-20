@@ -9,9 +9,25 @@
 //!
 //! The drop is forced with the writer-side test hook the moon#838 suite uses:
 //! `MOON_TEST_AOF_FSYNC_STALL_MS` holds the writer before each everysec
-//! proactive fsync, and `--aof-fsync-timeout-ms 100` makes the generic leg
-//! give up waiting long before the stall ends, so pipelined SETs are refused
-//! and their records dropped.
+//! proactive fsync, and `--aof-fsync-timeout-ms 100` makes the generic LOCAL
+//! leg give up waiting long before the stall ends: the write is applied, its
+//! record is dropped, and the client gets `ERR AOF fsync failed`. That is the
+//! drop this status reports.
+//!
+//! At `--shards 4` a write for a key another shard owns is a ROUTED leg, and
+//! since moon#769 the owning shard admits it against its writer BEFORE
+//! applying it: under the stall it is refused unapplied
+//! (`aof_backpressure_refused`), nothing is dropped, and the status correctly
+//! stays `ok`. An untagged burst is therefore almost all routed, drops
+//! nothing, and proves nothing about this status.
+//!
+//! So each burst is hash-tagged to a single shard, and a round sends one
+//! burst per shard down ONE connection. A connection is served by exactly one
+//! shard, so whichever shard it landed on, exactly one of a round's bursts is
+//! all-local for it — the local leg is the only one that is applied first and
+//! can then have its record dropped. Every run asserts that precondition,
+//! `aof_backpressure_dropped > 0`, before it asserts `err`, so the test can
+//! never again pass or fail on a drop that never happened.
 //!
 //! The third case in the issue (a drop that lands during the fold, after its
 //! snapshot, keeps `err`) cannot be timed deterministically from outside the
@@ -63,7 +79,7 @@ fn spawn(shards: u32) -> Server {
                 "--disk-free-min-pct",
                 "0",
             ])
-            .env("MOON_TEST_AOF_FSYNC_STALL_MS", "1500")
+            .env("MOON_TEST_AOF_FSYNC_STALL_MS", "0")
             .stdout(std::process::Stdio::null())
             .stderr(common::server_stderr(&dir))
             .spawn()
@@ -106,37 +122,91 @@ fn info_field(port: u16, field: &str) -> String {
         .to_string()
 }
 
-/// Pipelined SET bursts until at least one is refused. Returns how many were.
-fn drop_some_appends(port: u16, tag: &str) -> usize {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut refused = 0usize;
-    let mut round = 0usize;
-    while refused == 0 && Instant::now() < deadline {
-        let mut s = connect(port);
-        const N: usize = 20_000;
-        let mut wire = Vec::with_capacity(N * 48);
-        for i in 0..N {
-            wire.extend_from_slice(&common::encode(&[
-                "SET",
-                &format!("{tag}:{round}:{i}"),
-                "v",
-            ]));
+fn info_count(port: u16, field: &str) -> u64 {
+    info_field(port, field)
+        .parse()
+        .unwrap_or_else(|e| panic!("INFO {field} is not a number: {e}"))
+}
+
+/// One hash tag per shard, so a burst's keys all belong to one shard. Found
+/// with moon's own routing function rather than hard-coded.
+fn tags_per_shard(shards: u32) -> Vec<String> {
+    let n = shards as usize;
+    let mut tags: Vec<Option<String>> = vec![None; n];
+    for i in 0.. {
+        let tag = format!("s{i}");
+        let shard = moon::shard::dispatch::key_to_shard(tag.as_bytes(), n);
+        if tags[shard].is_none() {
+            tags[shard] = Some(tag);
         }
-        s.write_all(&wire).unwrap();
-        let mut raw = Vec::new();
-        let mut chunk = [0u8; 65536];
-        while common::framed_len(&raw, N).is_none() {
-            let n = s.read(&mut chunk).expect("read burst replies");
-            assert!(n > 0, "server closed mid-burst");
-            raw.extend_from_slice(&chunk[..n]);
+        if tags.iter().all(Option::is_some) {
+            break;
         }
-        refused += raw
-            .split(|&b| b == b'\n')
-            .filter(|l| l.first() == Some(&b'-'))
-            .count();
-        round += 1;
     }
-    refused
+    tags.into_iter().flatten().collect()
+}
+
+/// Commands per burst. More than the 10k writer channel holds, so a burst the
+/// writer cannot drain (it is inside the fsync stall) fills it.
+const BURST: usize = 20_000;
+
+/// One pipelined SET burst, every key tagged to `tag`'s shard, on `s`.
+/// Returns how many replies were errors.
+///
+/// A burst the owning shard refuses is answered with an ~85-byte error per
+/// command — about 1.7 MB, far more than the socket buffers hold. Writing the
+/// whole burst before reading any of it would wedge both sides: the server
+/// blocks writing replies, so it stops reading, so the burst never finishes
+/// being sent. The write runs on its own thread and the replies are drained
+/// here as they arrive.
+fn burst(s: &TcpStream, tag: &str, round: usize) -> usize {
+    let mut wire = Vec::with_capacity(BURST * 48);
+    for i in 0..BURST {
+        wire.extend_from_slice(&common::encode(&[
+            "SET",
+            &format!("{{{tag}}}:{round}:{i}"),
+            "v",
+        ]));
+    }
+    let mut w = s.try_clone().expect("try_clone");
+    let writer = std::thread::spawn(move || w.write_all(&wire).expect("write burst"));
+
+    let mut r: &TcpStream = s;
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 65536];
+    while common::framed_len(&raw, BURST).is_none() {
+        let n = r.read(&mut chunk).expect("read burst replies");
+        assert!(n > 0, "server closed mid-burst");
+        raw.extend_from_slice(&chunk[..n]);
+    }
+    writer.join().expect("burst writer thread");
+    raw.split(|&b| b == b'\n')
+        .filter(|l| l.first() == Some(&b'-'))
+        .count()
+}
+
+/// Pipelined SET bursts until the server reports a dropped acked append
+/// (`aof_backpressure_dropped > 0`). Each round opens one connection and
+/// sends one burst per shard down it, so one of them is guaranteed to be all
+/// LOCAL legs for that connection's shard — the only legs that are applied
+/// and then dropped rather than refused unapplied. Returns the error replies
+/// seen, for the failure message.
+fn drop_some_appends(port: u16, shards: u32) -> usize {
+    let tags = tags_per_shard(shards);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut errors = 0usize;
+    let mut round = 0usize;
+    while info_count(port, "aof_backpressure_dropped") == 0 && Instant::now() < deadline {
+        let s = connect(port);
+        for tag in &tags {
+            errors += burst(&s, tag, round);
+            round += 1;
+            if info_count(port, "aof_backpressure_dropped") > 0 {
+                return errors;
+            }
+        }
+    }
+    errors
 }
 
 fn wait_for_rewrite(port: u16) {
@@ -154,15 +224,20 @@ fn status_heals_after_a_covering_rewrite(shards: u32) {
     let srv = spawn(shards);
     assert_eq!(info_field(srv.port, "aof_last_append_status"), "ok");
 
-    let refused = drop_some_appends(srv.port, "drop");
+    let errors = drop_some_appends(srv.port, shards);
+    // The premise, asserted on the server's own counter: an acked append was
+    // applied and its record dropped. A refusal (routed, unapplied) is not
+    // one, loses nothing, and must not be mistaken for it.
     assert!(
-        refused > 0,
-        "shards={shards}: the stall hook must drop at least one append, or this test proves nothing"
+        info_count(srv.port, "aof_backpressure_dropped") > 0,
+        "shards={shards}: no acked append was dropped ({errors} error replies; {}), so \
+         there is nothing for the status to report",
+        command(srv.port, &["INFO", "persistence"]).replace('\n', " ")
     );
     assert_eq!(
         info_field(srv.port, "aof_last_append_status"),
         "err",
-        "shards={shards}: a dropped acked append must report err ({refused} refused; {})",
+        "shards={shards}: a dropped acked append must report err ({errors} error replies; {})",
         command(srv.port, &["INFO", "persistence"]).replace('\n', " ")
     );
     assert_eq!(info_field(srv.port, "aof_last_write_status"), "err");
