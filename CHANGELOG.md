@@ -199,17 +199,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **The `#455` end-to-end fold test opens its window again** (moon#1134). It
-  parked `EXEC` on a queued `WAIT`, which answers at once since moon#1098, so
-  its own vacuity guard failed every run on main and the shipped exactly-once
-  guarantee was left with no end-to-end cover. It now opens the window the
-  writer-side unit tests pin: a stalled `EverySec` fsync fills the writer
-  channel, many pipelined `INCR` producers park between applying their
-  mutation and enqueueing its record, and the fold snapshots while they are
-  parked. It asserts that `aof_rewrite_late_records_folded` moved, so a green
-  run proves a record really did reach the writer after the snapshot that
-  already held its mutation.
-
 - **A key spilled again after a `BGREWRITEAOF` keeps its pre-rewrite value
   across a `kill -9`, even when the respill's `MOON.SPILLED` marker never
   reached the AOF** (moon#1140). The marker is emitted into the AOF writer's
