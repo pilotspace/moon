@@ -534,7 +534,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         // string-matches. `aof_last_write_status` shares its source with
         // Moon's own `aof_last_append_status` below — the same fact under the
         // name a redis-py/ioredis health check actually looks for.
-        if crate::persistence::aof::AOF_LAST_APPEND_OK.load(std::sync::atomic::Ordering::Relaxed) {
+        if crate::persistence::aof::aof_last_append_ok() {
             "ok"
         } else {
             "err"
@@ -565,7 +565,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
             "err"
         },
         crate::persistence::aof::AOF_FSYNC_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
-        if crate::persistence::aof::AOF_LAST_APPEND_OK.load(std::sync::atomic::Ordering::Relaxed) {
+        if crate::persistence::aof::aof_last_append_ok() {
             "ok"
         } else {
             "err"

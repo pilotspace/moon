@@ -299,6 +299,18 @@ impl FoldOutcome {
             FoldOutcome::Aborted => previous,
         }
     }
+
+    /// What a writer does when its fold ends: take the floor
+    /// ([`Self::floor_after`]) and, for a committed fold, let the new base
+    /// cover the appends this writer dropped before the snapshot, so
+    /// `aof_last_append_status` returns to `ok` if nothing was dropped since
+    /// (moon#1094, see `RewriteOverflow::heal_on_commit`).
+    pub(crate) fn adopt(self, previous: FoldEpoch, overflow: &RewriteOverflow) -> FoldEpoch {
+        if let FoldOutcome::Committed { floor } = self {
+            overflow.heal_on_commit(floor);
+        }
+        self.floor_after(previous)
+    }
 }
 
 /// Open a fold's NEW incr for appending and write its `MOON.COLDCUT` head —
