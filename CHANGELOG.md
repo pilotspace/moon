@@ -269,6 +269,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deletes anything, and deletes nothing if that commit fails. At most one
   entry per boot whatever the orphan backlog; a crash between the commit and
   the unlink re-sweeps the file on the next boot instead of leaking it.
+- **`test`: the ACL CAT diff in `scripts/test-consistency.sh` no longer
+  truncates the suite under a non-C locale.** Its `sort -u` and `comm` ran
+  under the caller's collation; under `en_US.UTF-8` GNU `comm` rejected the
+  sorted files as out of order, `set -e` ended the run, and the consistency
+  gate reported a TRUNCATED RUN on a freshly provisioned Ubuntu 26.04 VM
+  (reproduced on main `b65a73aa`). Both now run with `LC_ALL=C`; the gate
+  completes, tolerating only the documented moon#536 row.
 
 - **A key spilled again after a `BGREWRITEAOF` keeps its pre-rewrite value
   across a `kill -9`, even when the respill's `MOON.SPILLED` marker never

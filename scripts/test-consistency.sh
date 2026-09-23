@@ -5447,11 +5447,11 @@ log "--- ACL CAT: 21-category diff vs the live oracle ---"
 
 ACL_CAT_DIR=$(mktemp -d /tmp/moon-aclcat.XXXXXX)
 redis-cli -p "$PORT_RUST" COMMAND LIST 2>/dev/null | tr -d '\r' | tr 'A-Z' 'a-z' \
-    | grep -v '|' | sort -u > "$ACL_CAT_DIR/moon-cmds"
+    | grep -v '|' | LC_ALL=C sort -u > "$ACL_CAT_DIR/moon-cmds"
 
 acl_cat_fetch() {  # <port> <category> <outfile>
     redis-cli -p "$1" ACL CAT "$2" 2>/dev/null | tr -d '\r' | tr 'A-Z' 'a-z' \
-        | sed 's/|.*//' | sort -u > "$3"
+        | sed 's/|.*//' | LC_ALL=C sort -u > "$3"
 }
 
 ACL_CAT_TOTAL_MISSING=0
@@ -5465,9 +5465,9 @@ for acl_cat in $(redis-cli -p "$PORT_REDIS" ACL CAT 2>/dev/null | tr -d '\r' | s
         continue
     fi
     # redis members moon implements, vs what moon actually classifies
-    comm -12 "$ACL_CAT_DIR/r" "$ACL_CAT_DIR/moon-cmds" > "$ACL_CAT_DIR/expected"
-    comm -13 "$ACL_CAT_DIR/m" "$ACL_CAT_DIR/expected"  > "$ACL_CAT_DIR/missing"
-    comm -13 "$ACL_CAT_DIR/r" "$ACL_CAT_DIR/m"         > "$ACL_CAT_DIR/extra"
+    LC_ALL=C comm -12 "$ACL_CAT_DIR/r" "$ACL_CAT_DIR/moon-cmds" > "$ACL_CAT_DIR/expected"
+    LC_ALL=C comm -13 "$ACL_CAT_DIR/m" "$ACL_CAT_DIR/expected"  > "$ACL_CAT_DIR/missing"
+    LC_ALL=C comm -13 "$ACL_CAT_DIR/r" "$ACL_CAT_DIR/m"         > "$ACL_CAT_DIR/extra"
     n_missing=$(wc -l < "$ACL_CAT_DIR/missing" | tr -d ' ')
     n_extra=$(wc -l < "$ACL_CAT_DIR/extra" | tr -d ' ')
     ACL_CAT_TOTAL_MISSING=$((ACL_CAT_TOTAL_MISSING + n_missing))
@@ -5495,15 +5495,15 @@ for acl_cat in $(redis-cli -p "$PORT_REDIS" ACL CAT 2>/dev/null | tr -d '\r' | s
             acl_cat_fetch "$PORT_REDIS" admin "$ACL_CAT_DIR/ra"
             acl_cat_fetch "$PORT_REDIS" dangerous "$ACL_CAT_DIR/rd"
             redis-cli -p "$PORT_REDIS" COMMAND LIST 2>/dev/null | tr -d '\r' \
-                | tr 'A-Z' 'a-z' | sed 's/|.*//' | sort -u > "$ACL_CAT_DIR/rcmds"
+                | tr 'A-Z' 'a-z' | sed 's/|.*//' | LC_ALL=C sort -u > "$ACL_CAT_DIR/rcmds"
             # only judge commands redis actually knows
-            comm -12 "$ACL_CAT_DIR/extra" "$ACL_CAT_DIR/rcmds" > "$ACL_CAT_DIR/extra_known"
+            LC_ALL=C comm -12 "$ACL_CAT_DIR/extra" "$ACL_CAT_DIR/rcmds" > "$ACL_CAT_DIR/extra_known"
             if [[ "$acl_cat" == "write" || "$acl_cat" == "slow" ]]; then
                 : > "$ACL_CAT_DIR/priv"   # @write/@slow legitimately overlap
             else
                 sort -u "$ACL_CAT_DIR/rw" "$ACL_CAT_DIR/ra" "$ACL_CAT_DIR/rd" > "$ACL_CAT_DIR/priv"
             fi
-            comm -12 "$ACL_CAT_DIR/extra_known" "$ACL_CAT_DIR/priv" > "$ACL_CAT_DIR/esc"
+            LC_ALL=C comm -12 "$ACL_CAT_DIR/extra_known" "$ACL_CAT_DIR/priv" > "$ACL_CAT_DIR/esc"
             if [[ -s "$ACL_CAT_DIR/esc" ]]; then
                 FAIL=$((FAIL + 1))
                 echo "  FAIL: +@$acl_cat grants commands redis classifies as write/admin/dangerous: $(tr '\n' ' ' < "$ACL_CAT_DIR/esc")"
