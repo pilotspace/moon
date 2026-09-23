@@ -453,13 +453,26 @@ impl RecoveryState {
         // for keys the rescan already touched (verified-unchanged or
         // re-indexed) are irrelevant here (they WERE observed), so a
         // shrunk-but-still-present entry is fine.
+        //
+        // moon#1124: a key the LIVE write path indexed during the walk (a
+        // write routed here from another shard) is current too, even when the
+        // walk never listed it — deleted while the server was down, then
+        // re-created mid-walk. The ledger is read, not taken: the caller ends
+        // it after the text plane's probe has read it as well.
         let mut counters = self.counters;
+        // Decide every index's victims first (the ledger borrows the store),
+        // then tombstone.
+        let mut plan: Vec<(&Bytes, Vec<Vec<u8>>)> = Vec::new();
+        let live = vector_store.recovery_live_writes();
         for (name, original) in &self.original_key_hashes {
             let observed = self.observed_key_hashes.get(name);
             let mut to_delete: Vec<Vec<u8>> = Vec::new();
             if let Some(idx) = vector_store.get_index(name) {
+                let db = idx.meta.db_index;
                 for kh in original {
-                    if observed.is_some_and(|o| o.contains(kh)) {
+                    if observed.is_some_and(|o| o.contains(kh))
+                        || live.is_some_and(|l| l.written(db, *kh))
+                    {
                         continue;
                     }
                     if let Some(key_bytes) = idx.key_hash_to_key.get(kh) {
@@ -467,6 +480,9 @@ impl RecoveryState {
                     }
                 }
             }
+            plan.push((name, to_delete));
+        }
+        for (name, to_delete) in plan {
             for key_bytes in &to_delete {
                 vector_store.mark_deleted_for_key_in_index(name, key_bytes);
             }

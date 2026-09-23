@@ -244,6 +244,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same records are written from every executor — connection, cross-shard,
   `MULTI`/`EXEC` and Lua. A read over several streams writes one record per
   stream, each its own AOF record.
+- **A document written to a shard while that shard runs its boot index
+  rescan stays searchable** (moon#1124). Writes routed from another shard are
+  applied during the walk (the `-LOADING` gate guards only the connection
+  path), and the rescan's deletion probe tombstoned every recovered document
+  whose key the walk had not observed — including a key that was deleted
+  while the server was down and re-created by a routed `HSET` mid-walk. The
+  key existed and `FT.SEARCH` never returned it. The live auto-index hook now
+  records `(db, key)` in a shard-local ledger while recovery runs, a live
+  `DEL`/`UNLINK` forgets it again, and both the vector and the text probe
+  skip a recorded key. Outside recovery the ledger is `None`: one branch per
+  indexed write. A 2-shard kill-9 restart that lands the write mid-walk
+  (`tests/vector_rescan_live_write.rs`) lost the document on every in-window
+  run before the fix (4/4) and keeps it after (6/6).
 
 - **A key spilled again after a `BGREWRITEAOF` keeps its pre-rewrite value
   across a `kill -9`, even when the respill's `MOON.SPILLED` marker never

@@ -2930,7 +2930,11 @@ async fn recover_indexes_task(
     // this can't happen any earlier without silently excluding
     // every WARM key from `finish()`'s deletion probe. Must run
     // before the rescan loop below (phase 2).
+    // moon#1124: from here until the finish below, the live write path
+    // records every key it indexes, so the deletion probe spares a document
+    // a routed write created mid-walk.
     crate::shard::slice::with_shard(|s| {
+        s.vector_store.begin_recovery_live_writes();
         recovery_state.snapshot_recovered_baseline(&s.vector_store);
     });
 
@@ -3220,9 +3224,13 @@ async fn recover_indexes_task(
             // Text plane: deletion probe + stats recompute + orphan sweep for
             // the indexes loaded from `.tpost`.
             #[cfg(feature = "text-index")]
-            text_recovery.finish(&mut s.text_store);
+            text_recovery.finish(&mut s.text_store, s.vector_store.recovery_live_writes());
         });
     }
+    // Unconditional: the steady-state write path goes back to one branch.
+    crate::shard::slice::with_shard(|s| {
+        let _ = s.vector_store.end_recovery_live_writes();
+    });
 }
 
 #[cfg(test)]

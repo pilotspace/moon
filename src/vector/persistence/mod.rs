@@ -1,3 +1,4 @@
+pub mod live_writes;
 pub mod manifest;
 pub mod mmap_budget;
 /// B3: startup recovery — load segments/keymap from the B1/B2 durability
