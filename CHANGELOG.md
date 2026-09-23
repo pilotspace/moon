@@ -199,6 +199,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A script's plain `COPY` to an undeclared key on another shard is refused
+  with `CROSSSLOT` instead of acking a copy nobody can read** (moon#1133). On a
+  connection a DB-less `COPY` is coordinator-routed and correct across shards;
+  a script has no coordinator, and `route_script_keys` sees only the declared
+  keys. So `EVAL "return redis.call('COPY', KEYS[1], ARGV[1])" 1 src dst` with
+  `dst` owned by another shard wrote the copy into the source's shard under a
+  name normal routing never looks for there — at `--shards 4`, `:1` for 8 of 8
+  destinations, 1 of 8 readable, `DBSIZE` counting all 8. The scripting
+  bridge's cross-shard guard now covers plain `COPY` (with or without
+  `REPLACE`) like the rest of the two-key write family, for `EVAL`, `EVALSHA`
+  and `FCALL`. Same-shard and `{hash}`-tagged pairs, `--shards 1`, and `COPY`
+  sent on a connection are unchanged.
+
 - **A key spilled again after a `BGREWRITEAOF` keeps its pre-rewrite value
   across a `kill -9`, even when the respill's `MOON.SPILLED` marker never
   reached the AOF** (moon#1140). The marker is emitted into the AOF writer's
