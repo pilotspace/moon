@@ -4062,6 +4062,7 @@ pub fn auto_index_hset_recover(
         0,
         db_index,
         text_unchanged,
+        false,
     )
 }
 
@@ -4073,7 +4074,16 @@ fn auto_index_hset(
     txn_id: u64,
     db_index: u8,
 ) -> smallvec::SmallVec<[(bytes::Bytes, u64); 4]> {
-    auto_index_hset_inner(vector_store, text_store, key, args, txn_id, db_index, &[])
+    auto_index_hset_inner(
+        vector_store,
+        text_store,
+        key,
+        args,
+        txn_id,
+        db_index,
+        &[],
+        true,
+    )
 }
 
 fn auto_index_hset_inner(
@@ -4084,6 +4094,7 @@ fn auto_index_hset_inner(
     txn_id: u64,
     db_index: u8,
     text_unchanged: &[bytes::Bytes],
+    live: bool,
 ) -> smallvec::SmallVec<[(bytes::Bytes, u64); 4]> {
     let mut inserted: smallvec::SmallVec<[(bytes::Bytes, u64); 4]> = smallvec::SmallVec::new();
     let matching_names = vector_store.find_matching_index_names_for_db(key, db_index);
@@ -4093,6 +4104,13 @@ fn auto_index_hset_inner(
     }
     if matching_names.is_empty() && text_matching.is_empty() {
         return inserted;
+    }
+    // moon#1124: while boot recovery runs, a live write marks the key so the
+    // recovery deletion probe cannot delete the document indexed here. One
+    // `None` check once recovery is over. The walk's own reconcile passes
+    // `live = false`: it records what it observes itself.
+    if live {
+        vector_store.note_live_index_write(key, db_index);
     }
 
     // Allocate ONE monotonic insert_lsn per HSET so the MVCC visibility rule

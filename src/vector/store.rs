@@ -1671,6 +1671,10 @@ pub struct VectorStore {
     /// this key?" in O(key length) instead of O(indexes) — see
     /// `crate::util::prefix_map`.
     prefix_map: crate::util::prefix_map::PrefixMap,
+    /// `Some` only while this shard's boot index recovery runs: keys the
+    /// live auto-index path wrote meanwhile, which the recovery deletion
+    /// probe must not remove (moon#1124). `None` in steady state.
+    recovery_live_writes: Option<crate::vector::persistence::live_writes::LiveWriteLedger>,
 }
 
 /// Make `mutable`'s global_id allocator resume strictly above `max_gid`, the
@@ -1759,6 +1763,40 @@ impl VectorStore {
             persist_dir: None,
             version_token: AtomicU64::new(0),
             prefix_map: crate::util::prefix_map::PrefixMap::new(),
+            recovery_live_writes: None,
+        }
+    }
+
+    /// Start recording live index writes for the boot recovery's deletion
+    /// probe (moon#1124). Call before the recovery walk lists keys.
+    pub fn begin_recovery_live_writes(&mut self) {
+        self.recovery_live_writes =
+            Some(crate::vector::persistence::live_writes::LiveWriteLedger::default());
+    }
+
+    /// Stop recording and hand the ledger to the recovery `finish` calls.
+    /// Afterwards the live path is back to one `None` check per write.
+    pub fn end_recovery_live_writes(
+        &mut self,
+    ) -> crate::vector::persistence::live_writes::LiveWriteLedger {
+        self.recovery_live_writes.take().unwrap_or_default()
+    }
+
+    /// The ledger of keys the live path wrote since
+    /// [`Self::begin_recovery_live_writes`], if recovery is running.
+    #[must_use]
+    pub fn recovery_live_writes(
+        &self,
+    ) -> Option<&crate::vector::persistence::live_writes::LiveWriteLedger> {
+        self.recovery_live_writes.as_ref()
+    }
+
+    /// Live auto-index hook: `key` was just indexed in `db_index`. A no-op
+    /// (one branch) unless boot recovery is running.
+    #[inline]
+    pub fn note_live_index_write(&mut self, key: &[u8], db_index: u8) {
+        if let Some(ledger) = self.recovery_live_writes.as_mut() {
+            ledger.note_write(db_index, xxhash_rust::xxh64::xxh64(key, 0));
         }
     }
 
@@ -2371,6 +2409,9 @@ impl VectorStore {
     ///
     /// NOTE (WS5a): NOT db-scoped — see [`Self::find_matching_index_names`].
     pub fn mark_deleted_for_key(&mut self, key: &[u8]) {
+        if let Some(ledger) = self.recovery_live_writes.as_mut() {
+            ledger.note_delete_any_db(xxhash_rust::xxh64::xxh64(key, 0));
+        }
         let matching_names = self.find_matching_index_names(key);
         if matching_names.is_empty() {
             return;
@@ -2388,6 +2429,11 @@ impl VectorStore {
 
     /// Db-scoped variant of [`Self::mark_deleted_for_key`].
     pub fn mark_deleted_for_key_for_db(&mut self, key: &[u8], db_index: u8) {
+        // Before the no-vector-index early return: a text-only index's
+        // recovery probe reads the same ledger (moon#1124).
+        if let Some(ledger) = self.recovery_live_writes.as_mut() {
+            ledger.note_delete(db_index, xxhash_rust::xxh64::xxh64(key, 0));
+        }
         let matching_names = self.find_matching_index_names_for_db(key, db_index);
         if matching_names.is_empty() {
             return;
