@@ -568,6 +568,94 @@ fn recover_finish_keeps_a_key_whose_payload_could_not_be_read() {
     );
 }
 
+/// moon#1124: a write routed here while the boot walk runs. `doc:2` and
+/// `doc:3` were deleted while the server was down, so the walk never lists
+/// them. Mid-walk a live HSET re-creates `doc:2` with a new vector, and
+/// `doc:3` is re-created and then DELeted live. `finish()` must keep the live
+/// copy of `doc:2` (it used to tombstone it: the key exists, FT.SEARCH never
+/// returned it) and leave `doc:3` deleted.
+#[test]
+fn recover_finish_keeps_a_document_a_live_write_recreated_mid_walk() {
+    use crate::protocol::Frame;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dim = 8usize;
+    let (meta, _store) = persist_docs(tmp.path(), dim, 4);
+
+    let mut fresh = VectorStore::new();
+    fresh.set_persist_dir(tmp.path().to_path_buf());
+    let mut state = RecoveryState::new();
+    state.create_index(&mut fresh, tmp.path(), &meta);
+    // Production order (event_loop.rs): arm the ledger, then the baseline.
+    fresh.begin_recovery_live_writes();
+    state.snapshot_recovered_baseline(&fresh);
+
+    let hset = |i: usize, seed: u32| {
+        vec![
+            Frame::BulkString(Bytes::from(format!("doc:{i}"))),
+            Frame::BulkString(Bytes::from_static(b"vec")),
+            Frame::BulkString(f32_blob(dim, seed)),
+        ]
+    };
+    let mut text_store = TextStore::new();
+    // The walk lists and reconciles doc:0 and doc:1 only.
+    state.reconcile_key(&mut fresh, &mut text_store, b"doc:0", &hset(0, 1), 0);
+    // Routed writes land between two strides.
+    let new_blob_seed = 999;
+    let _ = crate::shard::spsc_handler::auto_index_hset_public(
+        &mut fresh,
+        &mut text_store,
+        b"doc:2",
+        &hset(2, new_blob_seed),
+        0,
+    );
+    let _ = crate::shard::spsc_handler::auto_index_hset_public(
+        &mut fresh,
+        &mut text_store,
+        b"doc:3",
+        &hset(3, 777),
+        0,
+    );
+    crate::shard::spsc_handler::auto_delete_vectors(
+        &mut fresh,
+        &[Frame::BulkString(Bytes::from_static(b"doc:3"))],
+        0,
+    );
+    state.reconcile_key(&mut fresh, &mut text_store, b"doc:1", &hset(1, 2), 0);
+
+    let kh2 = xxhash_rust::xxh64::xxh64(b"doc:2", 0);
+    let live_gid = *fresh
+        .get_index(b"idx")
+        .unwrap()
+        .key_hash_to_global_id
+        .get(&kh2)
+        .unwrap();
+    state.finish(&mut fresh, tmp.path());
+    let _ = fresh.end_recovery_live_writes();
+
+    let idx = fresh.get_index(b"idx").unwrap();
+    assert_eq!(
+        idx.key_hash_to_global_id.get(&kh2),
+        Some(&live_gid),
+        "the copy a live write indexed mid-walk must survive the deletion probe"
+    );
+    assert_eq!(
+        idx.key_hash_to_vec_checksum.get(&kh2).copied(),
+        Some(xxhash_rust::xxh64::xxh64(&f32_blob(dim, new_blob_seed), 0)),
+        "and it is the live vector, not the pre-restart one"
+    );
+    let kh3 = xxhash_rust::xxh64::xxh64(b"doc:3", 0);
+    assert!(
+        !idx.key_hash_to_global_id.contains_key(&kh3),
+        "written then DELeted live mid-walk: must end deleted"
+    );
+    assert_eq!(idx.key_hash_to_global_id.len(), 3, "doc:0, doc:1, doc:2");
+
+    // Recovery over: the live path records nothing any more.
+    fresh.note_live_index_write(b"doc:9", 0);
+    assert!(fresh.recovery_live_writes().is_none());
+}
+
 /// Index `doc:0..n` into a persisted HOT segment under `root`, and wait for
 /// its manifest. Returns the index definition and the (still live) store.
 fn persist_docs(root: &std::path::Path, dim: usize, n: usize) -> (IndexMeta, VectorStore) {
