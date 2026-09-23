@@ -738,7 +738,10 @@ impl super::Shard {
         // first accepted connection and never contends with the shard's own
         // spill/cold-index state (crash orphans are by definition NOT
         // referenced by the manifest or any in-memory index, so deleting
-        // them needs no `with_shard`/manifest-commit synchronization).
+        // them needs no `with_shard`/manifest-commit synchronization). The one
+        // manifest write they need — reserving the highest orphan id so the
+        // file-id seed cannot drop below it once they are gone (moon#1114) —
+        // recovery already committed before handing these paths over.
         //
         // No epoch-fence race is possible here: the file-id namespace is
         // monotonic and the snapshot of "which on-disk files are orphaned"

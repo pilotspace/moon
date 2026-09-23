@@ -507,13 +507,25 @@ fn refuse_to_replace(path: &Path) -> io::Result<()> {
 /// Returns the number of files removed. I/O errors are logged and skipped —
 /// a sweep failure must never abort recovery.
 ///
+/// Reserves the highest orphan id in `manifest` first (moon#1114, see
+/// [`crate::storage::tiered::orphan_reservation`]) and removes nothing if
+/// that commit fails.
+///
 /// Runs classification + deletion in one synchronous pass — kept for tests
 /// and any caller that genuinely wants blocking behavior. The startup path
 /// (task #55) instead calls [`classify_orphan_heap_files`] synchronously
 /// (cheap: metadata-only) and defers [`remove_orphan_heap_file`] per entry
 /// to a background sweep so `remove_file` I/O never blocks readiness.
-pub fn sweep_orphan_heap_files(shard_dir: &Path, manifest: &ShardManifest) -> usize {
+pub fn sweep_orphan_heap_files(shard_dir: &Path, manifest: &mut ShardManifest) -> usize {
     let candidates = classify_orphan_heap_files(shard_dir, manifest);
+    if let Err(e) =
+        crate::storage::tiered::orphan_reservation::reserve_orphan_high_water(manifest, &candidates)
+    {
+        warn!(
+            "cold-tier sweep: cannot reserve the orphan id high-water mark, removing nothing: {e}"
+        );
+        return 0;
+    }
     let removed = candidates.len();
     for path in candidates {
         remove_orphan_heap_file(&path);
@@ -549,8 +561,15 @@ pub fn classify_orphan_heap_files(shard_dir: &Path, manifest: &ShardManifest) ->
     let Ok(read_dir) = std::fs::read_dir(&data_dir) else {
         return Vec::new();
     };
-    let registered: std::collections::HashSet<u64> =
-        manifest.files().iter().map(|e| e.file_id).collect();
+    // An id reservation (moon#1114) records an orphan's id, not its file:
+    // the file it names is still an orphan, or a crash between the
+    // reservation commit and the unlink would leak it forever.
+    let registered: std::collections::HashSet<u64> = manifest
+        .files()
+        .iter()
+        .filter(|e| !e.is_id_reservation())
+        .map(|e| e.file_id)
+        .collect();
 
     let mut orphans = Vec::new();
     for dir_entry in read_dir.flatten() {
@@ -661,7 +680,7 @@ mod tests {
         // Unrelated file: must not be touched.
         std::fs::write(data_dir.join("notes.txt"), b"keep me").unwrap();
 
-        let removed = sweep_orphan_heap_files(shard_dir, &manifest);
+        let removed = sweep_orphan_heap_files(shard_dir, &mut manifest);
 
         assert_eq!(removed, 2, "orphan .mpf + stale .tmp must both be removed");
         assert!(
@@ -679,6 +698,13 @@ mod tests {
         assert!(
             data_dir.join("notes.txt").exists(),
             "unrelated files must survive"
+        );
+        // moon#1114: the highest orphan id outlives the file.
+        assert!(
+            manifest
+                .files()
+                .iter()
+                .any(|e| e.file_id == 99 && e.is_id_reservation())
         );
     }
 

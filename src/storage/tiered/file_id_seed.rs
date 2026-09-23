@@ -22,7 +22,9 @@
 //! file but crashed before the manifest commit is on disk only (and a
 //! crash-orphan sweep deletes that path later, so reusing it would delete the
 //! new file), while an entry whose file is already gone is in the manifest
-//! only.
+//! only. Before that sweep deletes anything, recovery reserves the highest
+//! orphan id in the manifest (`orphan_reservation`, moon#1114), so the disk
+//! scan is never the only record of an id a `MOON.SPILLED` marker names.
 //!
 //! Nothing else records the highest id ever issued, so the manifest must not
 //! lose it: `ShardManifest::gc_tombstones` never prunes the tombstone holding

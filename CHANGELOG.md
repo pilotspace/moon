@@ -199,6 +199,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The boot crash-orphan sweep no longer lets a cold file id be issued twice
+  in one AOF generation** (moon#1114). A spill's `MOON.SPILLED <N>` marker
+  reaches the AOF before its deferred manifest commit; a crash in between
+  leaves `heap-<N>.mpf` on disk with no manifest entry. The next boot deleted
+  it as a crash orphan, and nothing recorded `N` once it was gone, so the boot
+  after that resumed the id counter at or below `N` and re-issued it. The old
+  marker then authorised the new file early on replay: `RPUSH X a` once read
+  back `a a`. Recovery now commits the highest orphan id to the manifest as a
+  page-less Tombstone (an id reservation, no format change) before the sweep
+  deletes anything, and deletes nothing if that commit fails. At most one
+  entry per boot whatever the orphan backlog; a crash between the commit and
+  the unlink re-sweeps the file on the next boot instead of leaking it.
 - **A document written to a shard while that shard runs its boot index
   rescan stays searchable** (moon#1124). Writes routed from another shard are
   applied during the walk (the `-LOADING` gate guards only the connection

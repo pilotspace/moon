@@ -180,6 +180,18 @@ impl FileEntry {
         buf[48..56].copy_from_slice(&self.last_modified_lsn.to_le_bytes());
     }
 
+    /// Whether this entry only reserves a retired `KvLeaf` id and never
+    /// described a file ([`ShardManifest::reserve_retired_id`], moon#1114): a
+    /// Tombstone with zero pages and zero bytes. A real spill entry always
+    /// has at least one page, so the two cannot be confused, and no field or
+    /// value outside the existing v2 layout is used.
+    pub fn is_id_reservation(&self) -> bool {
+        self.file_type == PageType::KvLeaf as u8
+            && self.status == FileStatus::Tombstone
+            && self.page_count == 0
+            && self.byte_size == 0
+    }
+
     /// Deserialize a v2 FileEntry (56 bytes) from `buf`.
     ///
     /// Returns `None` if `buf.len() < 56`.
@@ -879,6 +891,41 @@ impl ShardManifest {
                     .or_insert_with(|| (self.active_root.epoch, Instant::now()));
             }
         }
+    }
+
+    /// Record `file_id` — an id this manifest never listed — as a retired
+    /// `KvLeaf` id, so the cold file-id counter's high-water mark survives the
+    /// deletion of the unmanifested `heap-{file_id}.mpf` that held it
+    /// (moon#1114). In-memory only until commit.
+    ///
+    /// The entry is a [`FileEntry::is_id_reservation`]: a Tombstone with no
+    /// pages, which no reader treats as data. `gc_tombstones` ages it out
+    /// like any tombstone, except while it holds the highest id (moon#1067).
+    ///
+    /// Returns `false`, leaving the manifest untouched, when an entry for
+    /// `(file_id, KvLeaf)` is already listed in any status.
+    pub fn reserve_retired_id(&mut self, file_id: u64) -> bool {
+        let file_type = PageType::KvLeaf as u8;
+        if self.has_entry(file_id, file_type) {
+            return false;
+        }
+        self.active_root.entries.push(FileEntry {
+            file_id,
+            file_type,
+            status: FileStatus::Tombstone,
+            tier: StorageTier::Cold,
+            page_size_log2: 12,
+            page_count: 0,
+            byte_size: 0,
+            created_lsn: 0,
+            db_index: 0,
+            max_key_hash: 0,
+            last_modified_lsn: 0,
+        });
+        self.tombstone_registry
+            .entry((file_id, file_type))
+            .or_insert_with(|| (self.active_root.epoch, Instant::now()));
+        true
     }
 
     /// Physically remove tombstoned entries that satisfy BOTH retention axes.
