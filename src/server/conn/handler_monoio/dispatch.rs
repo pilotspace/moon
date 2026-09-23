@@ -87,6 +87,8 @@ pub(super) fn check_auth_gate(
                 });
             }
             responses.push(response);
+            // moon#775: a pre-auth AUTH executes (and may fail) — redis counts it.
+            crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
             AuthGateResult::Consumed
         }
         Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"HELLO") => {
@@ -130,10 +132,12 @@ pub(super) fn check_auth_gate(
                 }
             }
             responses.push(response);
+            crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
             AuthGateResult::Consumed
         }
-        Some((cmd, _)) if cmd.eq_ignore_ascii_case(b"QUIT") => {
+        Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"QUIT") => {
             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+            crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
             AuthGateResult::Quit
         }
         _ => AuthGateResult::NotAuth,

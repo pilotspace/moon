@@ -357,7 +357,8 @@ impl CachedMetricsHandles {
     /// One execution of `cmd`: bump its counter and, when the call was a
     /// sampled one, record its duration. The single sink behind
     /// [`LatencyProbe::observe`](crate::admin::metrics_setup::LatencyProbe::observe);
-    /// does NOT touch `total_commands_processed` (the probe batches that).
+    /// does NOT touch `total_commands_processed` (the client-command
+    /// boundary counts that, once per command — moon#1002).
     #[inline]
     pub(super) fn observe(&mut self, cmd: &[u8], elapsed_us: Option<u64>) {
         if !METRICS_INITIALIZED.load(Ordering::Relaxed) {

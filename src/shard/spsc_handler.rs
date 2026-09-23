@@ -164,8 +164,10 @@ pub(crate) fn drain_spsc_shared(
     // moon#982: this shard's command sampler + metric-handle cache. Every
     // command a drain cycle executes on behalf of ANOTHER shard's connection
     // is observed through one `LatencyProbe` built from these, so a routed
-    // command lands in `total_commands_processed` and the duration
-    // histogram exactly like a connection-local one.
+    // command lands in the duration histogram and the slowlog exactly like a
+    // connection-local one. It is NOT counted in `total_commands_processed`
+    // here: the origin connection counted it at the client-command boundary
+    // (moon#1002 — counting here booked one per coordinator leg).
     sampler: &mut crate::admin::metrics_setup::CommandSampler,
     metrics: &mut crate::admin::metrics_setup::CachedMetricsHandles,
 ) -> bool {
@@ -213,9 +215,7 @@ pub(crate) fn drain_spsc_shared(
     // shape. The command's own client is on another thread and the message
     // does not carry its identity, so a slowlog entry produced here has an
     // empty client address/name. The probe is dropped explicitly below,
-    // before the scratch buffers go back, which is what flushes this
-    // cycle's observed count into the thread's `total_commands_processed`
-    // slot as one add.
+    // before the scratch buffers go back.
     let mut probe = crate::admin::metrics_setup::LatencyProbe::new(sampler, metrics, b"", b"");
 
     // Self-queue FIRST: same-shard tasks (inline PSYNC RegisterReplica,
@@ -431,7 +431,6 @@ pub(crate) fn drain_spsc_shared(
     }
 
     // moon#982: land this cycle's routed-command count before the cycle ends.
-    drop(probe);
 
     // Return the (now drained) scratch buffers so their capacity is reused
     // by the next drain cycle.
@@ -5360,13 +5359,14 @@ mod drain_cap_tests {
         ))
     }
 
-    /// moon#982: every command an SPSC execute arm runs is observed by the
-    /// drain cycle's probe, so it lands in this thread's
-    /// `total_commands_processed` slot when the probe drops — one
-    /// `PipelineBatchSlotted` of three plus one `ExecuteSlotted` is four,
-    /// on a thread that ran nothing else. Pre-fix the delta was 0.
+    /// moon#1002: the SPSC execute arms run commands — and coordinator LEGS
+    /// of commands — on behalf of a connection on another shard, which
+    /// already counted each client command at its boundary. The arms must
+    /// execute (the replies are real) and book nothing in this thread's
+    /// `total_commands_processed` slot; booking here is what made a 4-key
+    /// `MSET` count ~3 at `--shards 4`.
     #[test]
-    fn routed_commands_land_in_total_commands_processed() {
+    fn routed_commands_are_not_counted_by_the_executing_shard() {
         // A fresh OS thread: `init_shard` is once-per-thread and the counter
         // slot is per-thread, so nothing else can move the delta.
         std::thread::spawn(|| {
@@ -5479,9 +5479,9 @@ mod drain_cap_tests {
             assert_eq!(single.len(), 1);
 
             assert_eq!(
-                counted, 4,
-                "moon#982: four routed commands executed by the SPSC arms must all land in \
-                 total_commands_processed"
+                counted, 0,
+                "moon#1002: the origin connection counts a routed command; the shard \
+                 that executes it (or one leg of it) must not count it again"
             );
         })
         .join()

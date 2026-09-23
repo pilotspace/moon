@@ -236,6 +236,12 @@ pub async fn handle_connection(
                     match result {
                         Some(Ok(frame)) => {
                             if let Some((cmd, cmd_args)) = extract_command(&frame) {
+                                // moon#775: allowed subscriber-mode commands count.
+                                if crate::server::conn::subscriber_mode::allowed_in_subscriber_mode(cmd) {
+                                    crate::admin::metrics_setup::count_client_command_by_name(
+                                        cmd, cmd_args,
+                                    );
+                                }
                                 match cmd {
                                     _ if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") => {
                                         if cmd_args.is_empty() {
@@ -565,6 +571,7 @@ pub async fn handle_connection(
                                     });
                                 }
                                 responses.push(response);
+                                crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                                 continue;
                             }
                             Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"HELLO") => {
@@ -594,11 +601,13 @@ pub async fn handle_connection(
                                     conn.adopt_user(uname, &acl_table);
                                 }
                                 responses.push(response);
+                                crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                                 continue;
                             }
-                            Some((cmd, _)) if cmd.eq_ignore_ascii_case(b"QUIT") => {
+                            Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"QUIT") => {
                                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                 should_quit = true;
+                                crate::admin::metrics_setup::count_client_command_by_name(cmd, cmd_args);
                                 break;
                             }
                             _ => {
@@ -615,6 +624,21 @@ pub async fn handle_connection(
                         // CLIENT CACHING covers exactly the next command
                         // (moon#1049); runs before every intercept.
                         conn.tracking_state.before_command(cmd, conn.in_multi);
+                        // === CLIENT-COMMAND BOUNDARY (moon#775, moon#1002) ===
+                        //
+                        // This handler (the `listener::run` library path) answers
+                        // its connection intercepts ahead of its ACL gate, so it
+                        // counts at their entry: once per command, except one
+                        // that MULTI will queue — `EXEC` adds those when it runs
+                        // them. A NOPERM refusal here is counted, which the two
+                        // production handlers (ACL above their boundary) do not.
+                        if !conn.in_multi
+                            || crate::server::conn::shared::is_transaction_control(cmd)
+                        {
+                            crate::admin::metrics_setup::count_client_command_by_name(
+                                cmd, cmd_args,
+                            );
+                        }
                         // AUTH when already conn.authenticated
                         if cmd.eq_ignore_ascii_case(b"AUTH") {
                             let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &acl_table);
@@ -1220,7 +1244,6 @@ pub async fn handle_connection(
                                     let result = probe.observe(d_cmd, crate::admin::slowlog::SlowlogArgv::from(&disp_frame), || {
                                         dispatch(&mut *guard, d_cmd, d_args, &mut conn.selected_db, db_count)
                                     });
-                                    drop(probe);
                                     let (response, quit) = match result {
                                         DispatchResult::Response(f) => (f, false),
                                         DispatchResult::Quit(f) => (f, true),
@@ -1699,6 +1722,7 @@ pub async fn handle_connection(
                                 debug_assert_eq!(responses.len(), exec_resp_idx);
                                 responses.push(result);
                             }
+                            crate::server::conn::shared::count_exec_body(cmd, responses.last());
                             continue;
                         }
                         // DISCARD
@@ -2587,7 +2611,6 @@ pub async fn handle_connection(
                                 let result = probe.observe(d_cmd, crate::admin::slowlog::SlowlogArgv::from(disp_frame), || {
                                     dispatch_read(&*guard, d_cmd, d_args, now_ms, &mut conn.selected_db, db_count)
                                 });
-                                drop(probe);
                                 let (response, quit) = match result {
                                     DispatchResult::Response(f) => (f, false),
                                     DispatchResult::Quit(f) => (f, true),
@@ -2969,7 +2992,6 @@ pub async fn handle_connection(
                                 let result = probe.observe(d_cmd, crate::admin::slowlog::SlowlogArgv::from(disp_frame), || {
                                     dispatch(&mut *guard, d_cmd, d_args, &mut conn.selected_db, db_count)
                                 });
-                                drop(probe);
                                 let (response, quit) = match result {
                                     DispatchResult::Response(f) => (f, false),
                                     DispatchResult::Quit(f) => (f, true),

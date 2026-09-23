@@ -90,6 +90,22 @@ pub fn config_get(
         (b"maxclients", runtime_config.maxclients.to_string()),
         (b"timeout", runtime_config.timeout.to_string()),
         (b"tcp-keepalive", runtime_config.tcp_keepalive.to_string()),
+        // moon#995: the slowlog lives in one process-wide ring, not in
+        // `RuntimeConfig`, so both values are read from it. The order is the
+        // one redis-server 8.6.1 answers `CONFIG GET slowlog*` in, read off
+        // the wire: `slowlog-log-slower-than` first, then `slowlog-max-len`.
+        (
+            b"slowlog-log-slower-than",
+            crate::admin::metrics_setup::global_slowlog()
+                .threshold_us()
+                .to_string(),
+        ),
+        (
+            b"slowlog-max-len",
+            crate::admin::metrics_setup::global_slowlog()
+                .max_len()
+                .to_string(),
+        ),
     ];
 
     let mut result = Vec::new();
@@ -124,6 +140,13 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
             b"ERR wrong number of arguments for 'config|set' command",
         ));
     }
+
+    // moon#995: the two slowlog parameters are validated here but applied
+    // only once every pair has been accepted, so a refused `CONFIG SET`
+    // leaves them untouched — as redis leaves every parameter of a refused
+    // multi-pair `CONFIG SET`.
+    let mut slowlog_threshold: Option<i64> = None;
+    let mut slowlog_max_len: Option<usize> = None;
 
     // Process pairs of param-name param-value
     let mut i = 0;
@@ -312,6 +335,18 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
                     )));
                 }
             },
+            "slowlog-log-slower-than" => {
+                match parse_bounded_ll(&value_bytes, -1, i64::MAX) {
+                    Ok(v) => slowlog_threshold = Some(v),
+                    Err(reason) => return config_set_failed(&param_name, reason),
+                }
+            }
+            "slowlog-max-len" => match parse_bounded_ll(&value_bytes, 0, i64::MAX) {
+                // `usize` is 64 bits on every supported target; a value past
+                // it could only arrive on a 32-bit build, where it saturates.
+                Ok(v) => slowlog_max_len = Some(usize::try_from(v).unwrap_or(usize::MAX)),
+                Err(reason) => return config_set_failed(&param_name, reason),
+            },
             _ => {
                 return Frame::Error(Bytes::from(format!(
                     "ERR Unsupported CONFIG parameter: {}",
@@ -323,7 +358,77 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
         i += 2;
     }
 
+    let slowlog = crate::admin::metrics_setup::global_slowlog();
+    if let Some(max_len) = slowlog_max_len {
+        slowlog.set_max_len(max_len);
+    }
+    if let Some(threshold) = slowlog_threshold {
+        slowlog.set_threshold_us(threshold);
+    }
+
     Frame::SimpleString(Bytes::from_static(b"OK"))
+}
+
+/// Why a numeric `CONFIG SET` value was refused, in redis's words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumericConfigError {
+    /// Not a canonical base-10 `long long`.
+    NotAnInteger,
+    /// Parsed, but outside `[min, max]`.
+    OutOfRange { min: i64, max: i64 },
+}
+
+/// Parse a `CONFIG SET` integer the way redis's `string2ll` does — no sign
+/// but a leading `-`, no leading zeros, no `-0`, no whitespace, no unit
+/// suffix, no overflow — then bound it to `[min, max]`.
+///
+/// Measured on redis-server 8.6.1: `+5`, `05`, `-0`, ` 5`, `1.5`, `0x10`,
+/// `10mb` and `9223372036854775808` are all "couldn't be parsed into an
+/// integer"; `-2` for `slowlog-log-slower-than` is out of range.
+fn parse_bounded_ll(value: &[u8], min: i64, max: i64) -> Result<i64, NumericConfigError> {
+    let parsed = parse_redis_ll(value).ok_or(NumericConfigError::NotAnInteger)?;
+    if (min..=max).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(NumericConfigError::OutOfRange { min, max })
+    }
+}
+
+/// Redis's `string2ll`: the canonical decimal spelling of an `i64` and
+/// nothing else.
+fn parse_redis_ll(value: &[u8]) -> Option<i64> {
+    let (negative, digits) = match value.split_first()? {
+        (b'-', rest) => (true, rest),
+        _ => (false, value),
+    };
+    let (&first, _) = digits.split_first()?;
+    if !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    // "0" alone is the only spelling that may start with a zero, and it
+    // takes no sign.
+    if first == b'0' && (digits.len() > 1 || negative) {
+        return None;
+    }
+    // All ASCII digits, so this is valid UTF-8; `i64::from_str` then does
+    // the overflow check (and accepts `i64::MIN` through the sign).
+    let text = std::str::from_utf8(value).ok()?;
+    text.parse::<i64>().ok()
+}
+
+/// Redis's generic `CONFIG SET` refusal envelope around a numeric reason.
+fn config_set_failed(param: &str, reason: NumericConfigError) -> Frame {
+    let detail = match reason {
+        NumericConfigError::NotAnInteger => {
+            "argument couldn't be parsed into an integer".to_string()
+        }
+        NumericConfigError::OutOfRange { min, max } => {
+            format!("argument must be between {min} and {max} inclusive")
+        }
+    };
+    Frame::Error(Bytes::from(format!(
+        "ERR CONFIG SET failed (possibly related to argument '{param}') - {detail}"
+    )))
 }
 
 /// CONFIG REWRITE — serialize current runtime config to a Redis-style config file.
@@ -469,6 +574,89 @@ mod tests {
     )]
     fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
         config_set_scoped(runtime_config, args)
+    }
+
+    /// moon#995: redis's `string2ll` — the canonical decimal spelling of an
+    /// `i64` and nothing else (every case measured on redis-server 8.6.1).
+    #[test]
+    fn parse_redis_ll_accepts_only_the_canonical_spelling() {
+        for (input, want) in [
+            (&b"0"[..], Some(0)),
+            (b"-1", Some(-1)),
+            (b"10000", Some(10_000)),
+            (b"9223372036854775807", Some(i64::MAX)),
+            (b"-9223372036854775808", Some(i64::MIN)),
+            (b"", None),
+            (b"-", None),
+            (b"+5", None),
+            (b"05", None),
+            (b"007", None),
+            (b"-0", None),
+            (b" 5", None),
+            (b"5 ", None),
+            (b"1.5", None),
+            (b"0x10", None),
+            (b"10mb", None),
+            (b"abc", None),
+            (b"9223372036854775808", None),
+            (b"--1", None),
+        ] {
+            assert_eq!(
+                parse_redis_ll(input),
+                want,
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// moon#995: a refused value answers redis's exact envelope and applies
+    /// nothing — including a VALID slowlog pair earlier in the same call.
+    #[test]
+    fn config_set_slowlog_refusals_match_redis_and_apply_nothing() {
+        let slowlog = crate::admin::metrics_setup::global_slowlog();
+        let (threshold, max_len) = (slowlog.threshold_us(), slowlog.max_len());
+        let parse_err = |p: &str| {
+            Frame::Error(Bytes::from(format!(
+                "ERR CONFIG SET failed (possibly related to argument '{p}') - \
+                 argument couldn't be parsed into an integer"
+            )))
+        };
+        let mut rt = RuntimeConfig::default();
+        assert_eq!(
+            config_set_scoped(&mut rt, &make_args(&[b"slowlog-log-slower-than", b"abc"])),
+            parse_err("slowlog-log-slower-than")
+        );
+        assert_eq!(
+            config_set_scoped(&mut rt, &make_args(&[b"slowlog-log-slower-than", b"-2"])),
+            Frame::Error(Bytes::from_static(
+                b"ERR CONFIG SET failed (possibly related to argument \
+                  'slowlog-log-slower-than') - argument must be between -1 and \
+                  9223372036854775807 inclusive"
+            ))
+        );
+        assert_eq!(
+            config_set_scoped(&mut rt, &make_args(&[b"slowlog-max-len", b"-1"])),
+            Frame::Error(Bytes::from_static(
+                b"ERR CONFIG SET failed (possibly related to argument \
+                  'slowlog-max-len') - argument must be between 0 and \
+                  9223372036854775807 inclusive"
+            ))
+        );
+        assert_eq!(
+            config_set_scoped(
+                &mut rt,
+                &make_args(&[
+                    b"slowlog-max-len",
+                    b"7",
+                    b"slowlog-log-slower-than",
+                    b"1.5"
+                ])
+            ),
+            parse_err("slowlog-log-slower-than")
+        );
+        assert_eq!(slowlog.threshold_us(), threshold);
+        assert_eq!(slowlog.max_len(), max_len, "the valid max-len was not applied");
     }
 
     /// moon#586 (RED before the fix): `CONFIG SET maxmemory 4gb` — the

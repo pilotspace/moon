@@ -1823,6 +1823,7 @@ dependencies = [
  "ordered-float",
  "parking_lot",
  "phf",
+ "quanta",
  "rand 0.10.2",
  "redis",
  "ringbuf",

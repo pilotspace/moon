@@ -92,6 +92,13 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                 match crate::protocol::parse(read_buf, parse_config) {
                     Ok(Some(frame)) => {
                         if let Some((cmd, cmd_args)) = extract_command(&frame) {
+                            // moon#775: a subscribed connection's allowed commands
+                            // execute and count; the refused ones do not.
+                            if crate::server::conn::subscriber_mode::allowed_in_subscriber_mode(cmd) {
+                                crate::admin::metrics_setup::count_client_command_by_name(
+                                    cmd, cmd_args,
+                                );
+                            }
                             if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") {
                                 if cmd_args.is_empty() {
                                     let err = Frame::Error(Bytes::from_static(b"ERR wrong number of arguments for 'subscribe' command"));
