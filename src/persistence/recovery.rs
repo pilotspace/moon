@@ -438,7 +438,7 @@ pub fn recover_shard_v3_pitr(
                      and the server restarts"
                 );
             }
-            Ok(manifest) => {
+            Ok(mut manifest) => {
                 let crate::storage::tiered::cold_index::ColdRebuild { per_db, report } =
                     crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest_per_db(
                         shard_dir, &manifest,
@@ -528,9 +528,36 @@ pub fn recover_shard_v3_pitr(
                 // deferred to a background sweep the caller starts once the
                 // shard is serving traffic (see `Shard::restore_from_persistence`
                 // / `event_loop.rs`'s `pending_heap_orphans` handoff).
-                let pending = crate::storage::tiered::kv_spill::classify_orphan_heap_files(
+                let mut pending = crate::storage::tiered::kv_spill::classify_orphan_heap_files(
                     shard_dir, &manifest,
                 );
+                // moon#1114: an orphan's id may be named by a `MOON.SPILLED`
+                // marker in this AOF generation. Reserve the highest orphan id
+                // in the manifest, durably, BEFORE anything is deleted, or the
+                // next boot's seed drops below it and re-issues it. On failure
+                // delete nothing: the files keep the seed's disk scan above
+                // them and the next boot retries.
+                if !pending.is_empty() {
+                    match crate::storage::tiered::orphan_reservation::reserve_orphan_high_water(
+                        &mut manifest,
+                        &pending,
+                    ) {
+                        Ok(Some(id)) => info!(
+                            "Shard {}: reserved crash-orphan file id {} in the manifest before reclaim",
+                            shard_id, id
+                        ),
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                "Shard {}: cannot commit the crash-orphan id reservation: {e} — \
+                                 keeping {} orphaned heap file(s) on disk this boot",
+                                shard_id,
+                                pending.len()
+                            );
+                            pending.clear();
+                        }
+                    }
+                }
                 if !pending.is_empty() {
                     info!(
                         "Shard {}: classified {} crash-orphaned heap file(s), deferred for background reclaim",
