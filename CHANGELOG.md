@@ -199,6 +199,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The library entry point logs a write before another connection can log a
+  later one** (moon#1099). `handler_single`, which `listener::run_with_shutdown`
+  and `moon::server::handle_connection` drive, collected a pipelined batch's
+  AOF records and sent them after the batch: after its `WAIT` / `CLIENT PAUSE`
+  awaits, after the reply writes under `everysec`, and always after the db
+  lock was released. A write from another connection that was applied later
+  could be logged first, and replay restored the older value (`MULTI / SET k 1
+  / EXEC / WAIT` with a `SET k 2` during the `WAIT` replayed `1`; eight
+  connections pipelining `APPEND`s to shared keys replayed a different order
+  on every run). Each record is now enqueued while the guard it was applied
+  under is held — inside `EXEC`'s body, inside `MOVE` / `COPY ... DB n`'s two-db
+  section, and with every db held across `FLUSHALL`'s clear. Room in the
+  writer is awaited before the guard is taken; the `appendfsync always` fsync
+  barrier stays one per batch. A record that cannot be enqueued now turns its
+  reply into `WRITEFAIL` under `everysec` / `no` too, where it used to be
+  dropped after `+OK`. The shipped binary (`run_sharded`) was not affected.
 - **A script's plain `COPY` to an undeclared key on another shard is refused
   with `CROSSSLOT` instead of acking a copy nobody can read** (moon#1133). On a
   connection a DB-less `COPY` is coordinator-routed and correct across shards;
