@@ -1227,18 +1227,22 @@ pub async fn handle_connection(
                                     };
                                     // moon#825: reply-derived record (`_aof_bytes` is
                                     // pre-filled only for the two-db intercepts, which
-                                    // never reach this loop); `None` when the reply
+                                    // never reach this loop); no record when the reply
                                     // proves nothing was written.
                                     if is_write
                                         && aof_log.enabled()
                                         && metadata::is_persisted_write(d_cmd)
                                         && !matches!(&response, Frame::Error(_))
                                     {
-                                        if let Some(bytes) = crate::persistence::aof::serialize_effect_for_log(&disp_frame, &response) {
+                                        for bytes in crate::persistence::aof::serialize_effect_for_log(&disp_frame, &response) {
                                             // moon#1099: enqueued under the guard it
                                             // was applied under. resp_idx lets the
                                             // flush patch the slot on failure.
-                                            aof_log.append_locked(resp_idx, conn.selected_db, bytes);
+                                            // moon#1130: a later record without an
+                                            // earlier one would replay out of order.
+                                            if !aof_log.append_locked(resp_idx, conn.selected_db, bytes) {
+                                                break;
+                                            }
                                         }
                                     }
                                     // Apply RESP3 response conversion if needed
@@ -1513,7 +1517,9 @@ pub async fn handle_connection(
                                     &conn.watched_keys,
                                     &mut conn.selected_db,
                                     &mut exec_publishes,
-                                    |bytes| aof_log.append_locked(exec_resp_idx, txn_db, bytes),
+                                    |bytes| {
+                                        let _ = aof_log.append_locked(exec_resp_idx, txn_db, bytes);
+                                    },
                                 );
                                 // C2: fan out PUBLISHes queued in the txn only
                                 // now — after the transaction body — and patch
@@ -3047,8 +3053,10 @@ pub async fn handle_connection(
                                             }
                                             crate::blocking::wakeup::note_unsignalled_removal();
                                             if aof_log.enabled() {
-                                                if let Some(bytes) = crate::persistence::aof::serialize_effect_for_log(disp_frame, &response) {
-                                                    aof_log.append_locked(resp_idx, conn.selected_db, bytes);
+                                                for bytes in crate::persistence::aof::serialize_effect_for_log(disp_frame, &response) {
+                                                    if !aof_log.append_locked(resp_idx, conn.selected_db, bytes) {
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         }
@@ -3092,7 +3100,7 @@ pub async fn handle_connection(
                                             &tracking_table,
                                         );
                                     }
-                                    // moon#825: reply-derived record; `None` when the
+                                    // moon#825: reply-derived record; none when the
                                     // reply proves nothing was written.
                                     // moon#1099: enqueued here, under the guard the
                                     // write was applied under. FLUSHALL logged
@@ -3101,8 +3109,10 @@ pub async fn handle_connection(
                                         && metadata::is_persisted_write(d_cmd)
                                         && !d_cmd.eq_ignore_ascii_case(b"FLUSHALL")
                                     {
-                                        if let Some(bytes) = crate::persistence::aof::serialize_effect_for_log(disp_frame, &response) {
-                                            aof_log.append_locked(resp_idx, conn.selected_db, bytes);
+                                        for bytes in crate::persistence::aof::serialize_effect_for_log(disp_frame, &response) {
+                                            if !aof_log.append_locked(resp_idx, conn.selected_db, bytes) {
+                                                break;
+                                            }
                                         }
                                     }
                                 }

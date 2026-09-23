@@ -2866,31 +2866,35 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // awaited its own fsync (the 8x P16 deficit vs Redis).
                             let mut aof_failed = false;
                             let mut aof_barrier_pending = false;
-                            // moon#825: reply-derived record; `None` when the reply
-                            // proves nothing was written (see `aof_wanted` above).
-                            let aof_bytes = if aof_wanted { aof::serialize_effect_for_log(&frame, &response) } else { None };
-                            if let Some(bytes) = aof_bytes {
-                                if !matches!(response, Frame::Error(_)) {
-                                    if let Some(ref pool) = ctx.aof_pool {
-                                        let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
-                                        match pool
-                                            .send_append_group(
-                                                ctx.shard_id,
-                                                lsn,
-                                                conn.selected_db,
-                                                bytes,
-                                                fold_stamp,
-                                            )
-                                            .await
-                                        {
-                                            Ok(true) => aof_barrier_pending = true,
-                                            Ok(false) => {}
-                                            Err(_) => {
-                                                response = Frame::Error(Bytes::from_static(
-                                                    aof::AOF_FSYNC_ERR,
-                                                ));
-                                                aof_failed = true;
-                                            }
+                            // moon#825: reply-derived records; none when the reply
+                            // proves nothing was written (see `aof_wanted` above),
+                            // several appended one by one (moon#1130).
+                            let aof_records = if aof_wanted && !matches!(response, Frame::Error(_)) {
+                                aof::serialize_effect_for_log(&frame, &response)
+                            } else {
+                                aof::EffectLog::new()
+                            };
+                            if let Some(ref pool) = ctx.aof_pool {
+                                for bytes in aof_records {
+                                    let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
+                                    match pool
+                                        .send_append_group(
+                                            ctx.shard_id,
+                                            lsn,
+                                            conn.selected_db,
+                                            bytes,
+                                            fold_stamp,
+                                        )
+                                        .await
+                                    {
+                                        Ok(true) => aof_barrier_pending = true,
+                                        Ok(false) => {}
+                                        Err(_) => {
+                                            response = Frame::Error(Bytes::from_static(
+                                                aof::AOF_FSYNC_ERR,
+                                            ));
+                                            aof_failed = true;
+                                            break;
                                         }
                                     }
                                 }

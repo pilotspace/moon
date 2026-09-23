@@ -792,24 +792,34 @@ fn serialize_command_for_log_at(frame: &Frame, now_ms: u64) -> Bytes {
 /// `HEXPIRE`/`HGETEX EX` (relative field deadlines), `RESTORE` with a
 /// relative TTL — is rewritten to the effect the master actually applied
 /// (`replication::effect_rewrite`), then the frame-only expire rewrite runs
-/// on whatever propagates verbatim. Returns `None` when the reply proves
+/// on whatever propagates verbatim. Returns the records to append, in
+/// order — one for almost every command, several for a consumer-group read
+/// over more than one stream (moon#1130), and NONE when the reply proves
 /// nothing was written (an error, a `Null` `SPOP`, a refused `EXPIRE … NX`):
 /// a no-op must reach neither plane, and an empty payload is the writer's
 /// fsync-barrier marker, so the caller MUST skip the append rather than
-/// append an empty record.
+/// append an empty record. Each record is ONE command and must be appended
+/// as its own record: the framed AOF replays one command per record header.
 ///
 /// Must run on the shard that executed the command, in the same tick: the
 /// absolute deadlines are recomputed from `current_time_ms()`, which
 /// `CachedClock::update` writes from the same read as `Database::now_ms`.
-pub fn serialize_effect_for_log(frame: &Frame, reply: &Frame) -> Option<Bytes> {
+pub fn serialize_effect_for_log(frame: &Frame, reply: &Frame) -> EffectLog {
     use crate::replication::effect_rewrite::{Propagation, rewrite_effect_for_propagation};
     let now_ms = crate::storage::entry::current_time_ms();
+    let mut out = EffectLog::new();
     match rewrite_effect_for_propagation(frame, reply, now_ms) {
-        Propagation::Skip => None,
-        Propagation::Rewritten(effect) => Some(serialize_command(&effect)),
-        Propagation::Verbatim => Some(serialize_command_for_log_at(frame, now_ms)),
+        Propagation::Skip => {}
+        Propagation::Rewritten(effect) => out.push(serialize_command(&effect)),
+        Propagation::Records(records) => out.extend(records.iter().map(serialize_command)),
+        Propagation::Verbatim => out.push(serialize_command_for_log_at(frame, now_ms)),
     }
+    out
 }
+
+/// The log records one write propagates as ([`serialize_effect_for_log`]):
+/// inline for the single record nearly every command has.
+pub type EffectLog = smallvec::SmallVec<[Bytes; 1]>;
 
 /// Serialized `SELECT <db>` RESP record for AOF db-context injection
 /// (task #35). Same wire form the replay engines already execute

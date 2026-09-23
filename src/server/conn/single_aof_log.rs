@@ -93,13 +93,16 @@ impl<'a> SingleAofLog<'a> {
 
     /// Enqueue the record of a write that was just applied, for reply slot
     /// `resp_idx`, attributed to `db`. Call it while the guard the write
-    /// was applied under is still held. Never parks.
-    pub(crate) fn append_locked(&mut self, resp_idx: usize, db: usize, bytes: Bytes) {
+    /// was applied under is still held. Never parks. Returns whether the
+    /// record reached the writer (`true` when persistence is off), so a
+    /// multi-record effect can stop at the first refusal.
+    pub(crate) fn append_locked(&mut self, resp_idx: usize, db: usize, bytes: Bytes) -> bool {
         let Some(pool) = self.pool else {
-            return;
+            return true;
         };
         let lsn = AofWriterPool::issue_append_lsn(self.repl_state, 0, bytes.len());
-        if pool.send_append_bounded_blocking(0, lsn, db, bytes, &mut self.budget) {
+        let sent = pool.send_append_bounded_blocking(0, lsn, db, bytes, &mut self.budget);
+        if sent {
             if pool.fsync_policy() == FsyncPolicy::Always {
                 self.barrier_idxs.push(resp_idx);
             }
@@ -109,6 +112,7 @@ impl<'a> SingleAofLog<'a> {
         if let Some(counter) = self.change_counter {
             counter.fetch_add(1, Ordering::Relaxed);
         }
+        sent
     }
 
     /// Confirm the batch: under `always`, ONE fsync barrier for every record

@@ -3747,19 +3747,27 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // moon#825: the record is derived from the REPLY, never
                         // the verbatim frame — `SPOP`/`XADD *` and the relative-
                         // TTL family do not reproduce themselves on replay.
-                        // `None` means the reply proves nothing was written.
-                        let serialized = if repl_active || ctx.aof_pool.is_some() {
+                        // No record means the reply proves nothing was
+                        // written; several are appended one by one (moon#1130).
+                        let records = if repl_active || ctx.aof_pool.is_some() {
                             aof::serialize_effect_for_log(&frame, &response)
                         } else {
-                            None
+                            aof::EffectLog::new()
                         };
-                        if let Some(serialized) = serialized {
-                            let lsn = if repl_active {
+                        // Every record reaches the replication stream in
+                        // this same no-await stretch, before the first AOF
+                        // append can suspend.
+                        if repl_active {
+                            for serialized in &records {
                                 ft::record_local_write_db(
                                     ctx,
                                     conn.selected_db,
                                     serialized.clone(),
                                 );
+                            }
+                        }
+                        for serialized in records {
+                            let lsn = if repl_active {
                                 0
                             } else {
                                 aof::AofWriterPool::issue_append_lsn(
@@ -3788,6 +3796,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                         aof_failed = true;
                                     }
                                 }
+                            }
+                            if aof_failed {
+                                break;
                             }
                         }
                     }
