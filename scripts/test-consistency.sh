@@ -2353,6 +2353,11 @@ if [[ "$SHARDS" -gt 1 ]]; then
         # which took the same wrong route.
         "copydb|SET %S VALUE-1|COPY %S %D DB 3|-n 3 EXISTS %D"
         "copydbsame|SET %S VALUE-1|COPY %S %D DB 0|EXISTS %D"
+        # moon#1133: a script's PLAIN COPY whose destination arrives through
+        # ARGV. On a connection COPY is coordinator-routed; a script has no
+        # coordinator, so the copy landed on the source's shard (8/8 acked :1,
+        # 1/8 readable). The body has no spaces: the templates are word-split.
+        "scriptcopy|SET %S VALUE-1|EVAL return(redis.call('COPY',KEYS[1],ARGV[1])) 1 %S %D|EXISTS %D"
     )
     xw_lost=0
     xw_refused=0
