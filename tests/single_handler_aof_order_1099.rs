@@ -77,8 +77,8 @@ async fn stop(token: CancellationToken, task: tokio::task::JoinHandle<()>) {
 
 async fn connect(port: u16) -> redis::aio::MultiplexedConnection {
     let client = redis::Client::open(format!("redis://127.0.0.1:{port}/")).unwrap();
-    let cfg = redis::AsyncConnectionConfig::new()
-        .set_response_timeout(Some(Duration::from_secs(30)));
+    let cfg =
+        redis::AsyncConnectionConfig::new().set_response_timeout(Some(Duration::from_secs(30)));
     client
         .get_multiplexed_async_connection_with_config(&cfg)
         .await
@@ -87,7 +87,11 @@ async fn connect(port: u16) -> redis::aio::MultiplexedConnection {
 
 async fn get(port: u16, key: &str) -> Option<String> {
     let mut c = connect(port).await;
-    redis::cmd("GET").arg(key).query_async(&mut c).await.unwrap()
+    redis::cmd("GET")
+        .arg(key)
+        .query_async(&mut c)
+        .await
+        .unwrap()
 }
 
 fn resp(args: &[&str]) -> Vec<u8> {
@@ -111,7 +115,11 @@ async fn read_lines(s: &mut TcpStream, n: usize) -> String {
             .await
             .expect("reply within 15s")
             .unwrap();
-        assert!(r > 0, "server closed the connection: {:?}", String::from_utf8_lossy(&buf));
+        assert!(
+            r > 0,
+            "server closed the connection: {:?}",
+            String::from_utf8_lossy(&buf)
+        );
         buf.extend_from_slice(&chunk[..r]);
     }
     String::from_utf8_lossy(&buf).into_owned()
@@ -199,7 +207,9 @@ async fn concurrent_writers_replay_to_the_live_values() {
                 s.write_all(&batch).await.unwrap();
                 let got = read_lines(&mut s, PIPELINE).await;
                 assert!(
-                    got.split("\r\n").filter(|l| !l.is_empty()).all(|l| l.starts_with(':')),
+                    got.split("\r\n")
+                        .filter(|l| !l.is_empty())
+                        .all(|l| l.starts_with(':')),
                     "every APPEND acked with its length: {got:?}"
                 );
             }

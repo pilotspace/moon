@@ -325,8 +325,11 @@ fn record_exec_wakes(
 /// Checks WATCH versions first -- if any watched key's version has changed since
 /// the snapshot was taken, the transaction is aborted and Frame::Null is returned.
 ///
-/// Returns the result Frame (Array of responses, or Null on abort) and a Vec of
-/// AOF byte entries for write commands that succeeded (caller sends them async).
+/// Returns the result Frame (Array of responses, or Null on abort). Each
+/// successful write's AOF record is handed to `log` right after the write is
+/// applied, while every database guard of the body is still held (moon#1099):
+/// the caller enqueues it there, so another connection cannot apply after this
+/// body and still be logged before it.
 #[cfg(feature = "runtime-tokio")]
 pub(crate) fn execute_transaction(
     db: &SharedDatabases,
@@ -334,7 +337,8 @@ pub(crate) fn execute_transaction(
     watched_keys: &HashMap<Bytes, WatchToken>,
     selected_db: &mut usize,
     exec_publishes: &mut Vec<ExecPublish>,
-) -> (Frame, Vec<Bytes>) {
+    mut log: impl FnMut(Bytes),
+) -> Frame {
     let db_count = db.len();
     // Every body command runs against the db selected at EXEC time (the
     // caller attributes every record to it), so that db is also the source
@@ -351,13 +355,12 @@ pub(crate) fn execute_transaction(
             // `*-1`, and every client library decodes EXEC as an array — so
             // the abort path is precisely the one optimistic-locking code is
             // written to handle (moon#482).
-            return (Frame::NullArray, Vec::new()); // Transaction aborted
+            return Frame::NullArray; // Transaction aborted
         }
     }
 
     // Execute all queued commands atomically (under the same lock)
     let mut results = Vec::with_capacity(command_queue.len());
-    let mut aof_entries: Vec<Bytes> = Vec::new();
 
     for cmd_frame in command_queue {
         // Extract command name and args (zero-alloc)
@@ -403,7 +406,7 @@ pub(crate) fn execute_transaction(
                 if let Some(effect) = outcome.effect {
                     let mut buf = BytesMut::new();
                     crate::protocol::serialize::serialize(&effect, &mut buf);
-                    aof_entries.push(buf.freeze());
+                    log(buf.freeze());
                 }
                 results.push(outcome.reply);
                 continue;
@@ -443,7 +446,7 @@ pub(crate) fn execute_transaction(
                 },
             };
             if matches!(response, Frame::Integer(1)) {
-                aof_entries.push(crate::persistence::aof::serialize_command_for_log(
+                log(crate::persistence::aof::serialize_command_for_log(
                     cmd_frame,
                 ));
             }
@@ -472,14 +475,14 @@ pub(crate) fn execute_transaction(
             if let Some(bytes) =
                 crate::persistence::aof::serialize_effect_for_log(cmd_frame, &response)
             {
-                aof_entries.push(bytes);
+                log(bytes);
             }
         }
 
         results.push(response);
     }
 
-    (Frame::Array(results.into()), aof_entries)
+    Frame::Array(results.into())
 }
 
 /// Execute a queued transaction on the local shard (sharded path).
@@ -6635,8 +6638,15 @@ mod embedded_txn_two_db_tests {
         ];
         let mut selected = 5usize;
         let mut publishes = Vec::new();
-        let (reply, aof) =
-            execute_transaction(&dbs, &queue, &HashMap::new(), &mut selected, &mut publishes);
+        let mut aof: Vec<Bytes> = Vec::new();
+        let reply = execute_transaction(
+            &dbs,
+            &queue,
+            &HashMap::new(),
+            &mut selected,
+            &mut publishes,
+            |b| aof.push(b),
+        );
 
         let Frame::Array(items) = reply else {
             panic!("EXEC must answer an array, got {reply:?}");
