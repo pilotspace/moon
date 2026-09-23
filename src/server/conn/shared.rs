@@ -325,8 +325,11 @@ fn record_exec_wakes(
 /// Checks WATCH versions first -- if any watched key's version has changed since
 /// the snapshot was taken, the transaction is aborted and Frame::Null is returned.
 ///
-/// Returns the result Frame (Array of responses, or Null on abort) and a Vec of
-/// AOF byte entries for write commands that succeeded (caller sends them async).
+/// Returns the result Frame (Array of responses, or Null on abort). Each
+/// successful write's AOF record is handed to `log` right after the write is
+/// applied, while every database guard of the body is still held (moon#1099):
+/// the caller enqueues it there, so another connection cannot apply after this
+/// body and still be logged before it.
 #[cfg(feature = "runtime-tokio")]
 pub(crate) fn execute_transaction(
     db: &SharedDatabases,
@@ -334,7 +337,8 @@ pub(crate) fn execute_transaction(
     watched_keys: &HashMap<Bytes, WatchToken>,
     selected_db: &mut usize,
     exec_publishes: &mut Vec<ExecPublish>,
-) -> (Frame, Vec<Bytes>) {
+    mut log: impl FnMut(Bytes),
+) -> Frame {
     let db_count = db.len();
     // Every body command runs against the db selected at EXEC time (the
     // caller attributes every record to it), so that db is also the source
@@ -351,13 +355,12 @@ pub(crate) fn execute_transaction(
             // `*-1`, and every client library decodes EXEC as an array — so
             // the abort path is precisely the one optimistic-locking code is
             // written to handle (moon#482).
-            return (Frame::NullArray, Vec::new()); // Transaction aborted
+            return Frame::NullArray; // Transaction aborted
         }
     }
 
     // Execute all queued commands atomically (under the same lock)
     let mut results = Vec::with_capacity(command_queue.len());
-    let mut aof_entries: Vec<Bytes> = Vec::new();
 
     for cmd_frame in command_queue {
         // Extract command name and args (zero-alloc)
@@ -403,7 +406,7 @@ pub(crate) fn execute_transaction(
                 if let Some(effect) = outcome.effect {
                     let mut buf = BytesMut::new();
                     crate::protocol::serialize::serialize(&effect, &mut buf);
-                    aof_entries.push(buf.freeze());
+                    log(buf.freeze());
                 }
                 results.push(outcome.reply);
                 continue;
@@ -443,7 +446,7 @@ pub(crate) fn execute_transaction(
                 },
             };
             if matches!(response, Frame::Integer(1)) {
-                aof_entries.push(crate::persistence::aof::serialize_command_for_log(
+                log(crate::persistence::aof::serialize_command_for_log(
                     cmd_frame,
                 ));
             }
@@ -469,17 +472,15 @@ pub(crate) fn execute_transaction(
         // write the raw frame, bypassing even the expire rewrite. `None`
         // means the reply proves nothing was written.
         if is_write && !matches!(&response, Frame::Error(_)) {
-            if let Some(bytes) =
-                crate::persistence::aof::serialize_effect_for_log(cmd_frame, &response)
-            {
-                aof_entries.push(bytes);
+            for bytes in crate::persistence::aof::serialize_effect_for_log(cmd_frame, &response) {
+                log(bytes);
             }
         }
 
         results.push(response);
     }
 
-    (Frame::Array(results.into()), aof_entries)
+    Frame::Array(results.into())
 }
 
 /// Execute a queued transaction on the local shard (sharded path).
@@ -802,11 +803,9 @@ pub(crate) fn execute_transaction_sharded(
         // moon#825: serialized AFTER dispatch, from the frame AND the reply —
         // a queued `SPOP` or `XADD key *` does not reproduce itself, and this
         // executor used to write the raw frame, bypassing even the expire
-        // rewrite. `None` means the reply proves nothing was written.
+        // rewrite. No record means the reply proves nothing was written.
         if is_write && !matches!(&response, Frame::Error(_)) {
-            if let Some(bytes) =
-                crate::persistence::aof::serialize_effect_for_log(cmd_frame, &response)
-            {
+            for bytes in crate::persistence::aof::serialize_effect_for_log(cmd_frame, &response) {
                 aof_entries.push((entry_db, bytes));
             }
         }
@@ -2734,6 +2733,15 @@ pub(crate) fn cross_shard_multikey_rejection(
     {
         return None;
     }
+    keys_span_shards_rejection(cmd, args, num_shards)
+}
+
+/// The key walk shared by [`cross_shard_multikey_rejection`] and
+/// [`script_cross_shard_rejection`]: `CROSSSLOT` when the key positions of
+/// `cmd` resolve to more than one shard, `None` otherwise (including every
+/// malformed argv, which keeps its own error). Callers decide WHICH commands
+/// are walked; this decides only whether their keys span shards.
+fn keys_span_shards_rejection(cmd: &[u8], args: &[Frame], num_shards: usize) -> Option<Frame> {
     // The shared key-position walker (moon#582) — the same one ACL and cache
     // invalidation use, so `SORT ... STORE dst` and `ZUNIONSTORE dst numkeys
     // ...` are enumerated by the code that already knows those layouts rather
@@ -2773,6 +2781,37 @@ pub(crate) fn cross_shard_multikey_rejection(
         }
     }
     None
+}
+
+/// The cross-shard refusal a `redis.call` from Lua is owed: the connection
+/// family of [`cross_shard_multikey_rejection`] PLUS the DB-less `COPY`
+/// (moon#1133).
+///
+/// On a connection a plain `COPY src dst [REPLACE]` is coordinator-routed
+/// (`is_multi_key_command` -> `coordinate_copy`) and correct across shards, so
+/// the connection guard must keep letting it through. A script has no
+/// coordinator: every `redis.call` runs against the one slice the script was
+/// routed to, and `route_script_keys` sees only the DECLARED keys. An
+/// undeclared destination (`ARGV`, or built in Lua) owned by another shard was
+/// written into the source's slice under a name normal routing never looks
+/// for there — measured at `--shards 4`, `:1` for 8 of 8 placements, 1 of 8
+/// readable, `DBSIZE` counting all of them.
+///
+/// Refused with the family's `CROSSSLOT` from the key names alone, before
+/// anything is touched, exactly like `RENAME`. Both key positions come from
+/// the shared walker (`COPY` is `first_key 1, last_key 2`), so the trailing
+/// `REPLACE` / `DB n` tokens are never read as keys. Same-shard and
+/// `{hash}`-tagged pairs are untouched.
+#[must_use]
+pub(crate) fn script_cross_shard_rejection(
+    cmd: &[u8],
+    args: &[Frame],
+    num_shards: usize,
+) -> Option<Frame> {
+    if num_shards > 1 && cmd.len() == 4 && cmd.eq_ignore_ascii_case(b"COPY") {
+        return keys_span_shards_rejection(cmd, args, num_shards);
+    }
+    cross_shard_multikey_rejection(cmd, args, num_shards)
 }
 
 /// Check if a command is a multi-key command requiring VLL coordination.
@@ -5708,7 +5747,9 @@ mod cross_shard_write_tests {
     //! destination is SEARCHED for with the routing hash the server itself
     //! uses, so the test cannot pass by accident on a lucky literal.
 
-    use super::{CROSS_SHARD_WRITE_ERROR, cross_shard_multikey_rejection};
+    use super::{
+        CROSS_SHARD_WRITE_ERROR, cross_shard_multikey_rejection, script_cross_shard_rejection,
+    };
     use crate::protocol::Frame;
     use crate::shard::dispatch::key_to_shard;
     use bytes::Bytes;
@@ -5948,6 +5989,80 @@ mod cross_shard_write_tests {
             cross_shard_multikey_rejection(b"RENAME", &[bulk("k"), bulk("k")], 64).is_none(),
             "RENAME k k names one key"
         );
+    }
+
+    /// moon#1133: a script has no coordinator, so a plain `COPY` issued from
+    /// Lua whose destination lives on another shard must be refused like the
+    /// rest of the two-key family — while the CONNECTION guard must keep
+    /// letting it through to `coordinate_copy`, which is correct across shards.
+    #[test]
+    fn a_scripts_plain_copy_across_shards_is_refused() {
+        let src = "src";
+        let far = far_from(src);
+        let near = near_to(src);
+        let crossslot = Some(Frame::Error(Bytes::from_static(CROSS_SHARD_WRITE_ERROR)));
+        let spellings: [&[u8]; 3] = [b"COPY", b"copy", b"CoPy"];
+        let tails: [&[&str]; 5] = [
+            &[],
+            &["REPLACE"],
+            &["DB", "0"],
+            &["DB", "3", "REPLACE"],
+            &["REPLACE", "DB", "3"],
+        ];
+        for cmd in spellings {
+            for tail in tails {
+                let argv = |d: &str| -> Vec<Frame> {
+                    let mut v = vec![bulk(src), bulk(d)];
+                    v.extend(tail.iter().map(|t| bulk(t)));
+                    v
+                };
+                let label = String::from_utf8_lossy(cmd);
+                // Cross-shard: refused, whatever option tokens follow.
+                assert_eq!(
+                    script_cross_shard_rejection(cmd, &argv(&far), N),
+                    crossslot,
+                    "script {label} src {far} {tail:?} must be CROSSSLOT"
+                );
+                // Same shard (no tag) and {hash}-tagged: never refused.
+                assert!(
+                    script_cross_shard_rejection(cmd, &argv(&near), N).is_none(),
+                    "script {label} src {near} {tail:?} is co-located"
+                );
+                let tagged = vec![bulk("{t}:s"), bulk("{t}:d")];
+                assert!(
+                    script_cross_shard_rejection(cmd, &tagged, N).is_none(),
+                    "script {label} {{t}}:s {{t}}:d is co-located"
+                );
+                // One shard: nothing to cross.
+                assert!(
+                    script_cross_shard_rejection(cmd, &argv(&far), 1).is_none(),
+                    "--shards 1 never refuses"
+                );
+            }
+            // The connection guard is unchanged for the DB-less form.
+            assert!(
+                cross_shard_multikey_rejection(cmd, &[bulk(src), bulk(&far)], N).is_none(),
+                "the connection path coordinator-routes a DB-less COPY; it must not be refused"
+            );
+            assert!(
+                cross_shard_multikey_rejection(cmd, &[bulk(src), bulk(&far), bulk("REPLACE")], N)
+                    .is_none(),
+                "the connection path coordinator-routes COPY ... REPLACE"
+            );
+        }
+        // Malformed: arity error, not CROSSSLOT.
+        assert!(script_cross_shard_rejection(b"COPY", &[bulk(src)], N).is_none());
+        assert!(script_cross_shard_rejection(b"COPY", &[], N).is_none());
+        assert!(
+            script_cross_shard_rejection(b"COPY", &[bulk(src), Frame::Integer(7)], N).is_none()
+        );
+        // The rest of the family still flows through the script guard.
+        assert_eq!(
+            script_cross_shard_rejection(b"RENAME", &[bulk(src), bulk(&far)], N),
+            crossslot
+        );
+        // Single-key commands never reach a refusal.
+        assert!(script_cross_shard_rejection(b"SET", &[bulk(&far), bulk("v")], N).is_none());
     }
 }
 
@@ -6635,8 +6750,15 @@ mod embedded_txn_two_db_tests {
         ];
         let mut selected = 5usize;
         let mut publishes = Vec::new();
-        let (reply, aof) =
-            execute_transaction(&dbs, &queue, &HashMap::new(), &mut selected, &mut publishes);
+        let mut aof: Vec<Bytes> = Vec::new();
+        let reply = execute_transaction(
+            &dbs,
+            &queue,
+            &HashMap::new(),
+            &mut selected,
+            &mut publishes,
+            |b| aof.push(b),
+        );
 
         let Frame::Array(items) = reply else {
             panic!("EXEC must answer an array, got {reply:?}");

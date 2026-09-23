@@ -11,4 +11,5 @@ pub mod mq_sync;
 pub mod reason_del;
 pub mod replica;
 pub mod state;
+pub mod stream_effect;
 pub mod ws_sync;

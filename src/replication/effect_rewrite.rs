@@ -25,6 +25,7 @@
 //! | `HEXPIRE`/`HPEXPIRE key ttl [cond] FIELDS n …` | per-field codes | `HPEXPIREAT key <abs> FIELDS m <fields set or deleted>` |
 //! | `HGETEX key EX\|PX ttl FIELDS n …` | per-field values | `HPEXPIREAT key <abs> FIELDS m <fields that exist>` |
 //! | `RESTORE key ttl payload …` | `+OK` | `RESTORE key <abs> payload … ABSTTL` |
+//! | `XREADGROUP` / `XCLAIM` / `XAUTOCLAIM` | entries / ids | `XCLAIM … 0 <ids> TIME <ms> … FORCE` (+ cursor), see [`crate::replication::stream_effect`] |
 //!
 //! A reply that proves nothing was written (`SPOP` on a missing key, a
 //! refused `EXPIRE … NX`, an `HEXPIRE` whose every field was skipped) yields
@@ -48,6 +49,10 @@ pub enum Propagation {
     Verbatim,
     /// Propagate this deterministic effect instead of the command.
     Rewritten(Frame),
+    /// Propagate these deterministic effects instead, in order (moon#1130:
+    /// a consumer-group read over several streams). Each is its own log
+    /// record — the AOF frames exactly one command per record.
+    Records(crate::replication::stream_effect::StreamEffects),
     /// The command wrote nothing: propagate nothing.
     Skip,
 }
@@ -138,6 +143,12 @@ pub fn rewrite_effect_for_propagation(frame: &Frame, reply: &Frame, now_ms: u64)
         rewrite_hgetex(args, reply, now_ms)
     } else if eq_ignore_ascii(cmd, b"RESTORE") {
         rewrite_restore(args, now_ms)
+    } else if eq_ignore_ascii(cmd, b"XREADGROUP") {
+        crate::replication::stream_effect::rewrite_xreadgroup(args, reply, now_ms)
+    } else if eq_ignore_ascii(cmd, b"XCLAIM") {
+        crate::replication::stream_effect::rewrite_xclaim(args, reply, now_ms)
+    } else if eq_ignore_ascii(cmd, b"XAUTOCLAIM") {
+        crate::replication::stream_effect::rewrite_xautoclaim(args, reply, now_ms)
     } else {
         Propagation::Verbatim
     }
