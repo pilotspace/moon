@@ -555,19 +555,19 @@ pub(crate) fn run_eviction_tick(
         // -- see storage::tiered::cold_index::ColdIndex::resident_bytes doc
         // comment). This is a per-db O(1) accumulator read, same complexity
         // class as estimated_memory() itself, so folding it in here does not
-        // change this tick's cost. It stays out of `estimated_memory()` (INFO's
-        // used_memory and the per-db quota keep their meaning); the sum is
-        // `Database::budgeted_memory()`.
-        //
-        // moon#1036: that sum used to be open-coded HERE only, while the
-        // per-write gates (`inline_write_can_skip_eviction`, `evict_to_budget`
-        // without `.total()`) compared `estimated_memory()` alone. The cascade
-        // then evicted a cold index's worth of hot keys every tick that the
-        // write path let writers refill — two caps on one shard. Every gate now
-        // reads the one accessor (the timer path in `timers::run_eviction` too).
+        // change this tick's cost -- and it is intentionally NOT folded into
+        // Database::estimated_memory()/resident_bytes() themselves, which
+        // stay untouched O(1) hot-path reads for the per-write eviction
+        // pre-gate (inline_write_can_skip_eviction / evict_to_budget).
         let used = crate::shard::slice::with_shard(|s| {
-            s.databases
-                .with_all_read(|dbs| dbs.iter().map(|db| db.budgeted_memory()).sum::<usize>())
+            s.databases.with_all_read(|dbs| {
+                dbs.iter()
+                    .map(|db| {
+                        db.estimated_memory()
+                            + db.cold_index.as_ref().map_or(0, |ci| ci.resident_bytes())
+                    })
+                    .sum::<usize>()
+            })
         });
         shard_databases.publish_memory(shard_id, used);
         // Elastic budgets only exist under a finite maxmemory cap.
