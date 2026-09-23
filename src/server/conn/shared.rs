@@ -469,9 +469,7 @@ pub(crate) fn execute_transaction(
         // write the raw frame, bypassing even the expire rewrite. `None`
         // means the reply proves nothing was written.
         if is_write && !matches!(&response, Frame::Error(_)) {
-            if let Some(bytes) =
-                crate::persistence::aof::serialize_effect_for_log(cmd_frame, &response)
-            {
+            for bytes in crate::persistence::aof::serialize_effect_for_log(cmd_frame, &response) {
                 aof_entries.push(bytes);
             }
         }
@@ -802,11 +800,9 @@ pub(crate) fn execute_transaction_sharded(
         // moon#825: serialized AFTER dispatch, from the frame AND the reply —
         // a queued `SPOP` or `XADD key *` does not reproduce itself, and this
         // executor used to write the raw frame, bypassing even the expire
-        // rewrite. `None` means the reply proves nothing was written.
+        // rewrite. No record means the reply proves nothing was written.
         if is_write && !matches!(&response, Frame::Error(_)) {
-            if let Some(bytes) =
-                crate::persistence::aof::serialize_effect_for_log(cmd_frame, &response)
-            {
+            for bytes in crate::persistence::aof::serialize_effect_for_log(cmd_frame, &response) {
                 aof_entries.push((entry_db, bytes));
             }
         }

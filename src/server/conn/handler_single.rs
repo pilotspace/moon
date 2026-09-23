@@ -1249,14 +1249,14 @@ pub async fn handle_connection(
                                     };
                                     // moon#825: reply-derived record (`_aof_bytes` is
                                     // pre-filled only for the two-db intercepts, which
-                                    // never reach this loop); `None` when the reply
+                                    // never reach this loop); no record when the reply
                                     // proves nothing was written.
                                     if is_write
                                         && aof_pool.is_some()
                                         && metadata::is_persisted_write(d_cmd)
                                         && !matches!(&response, Frame::Error(_))
                                     {
-                                        if let Some(bytes) = crate::persistence::aof::serialize_effect_for_log(&disp_frame, &response) {
+                                        for bytes in crate::persistence::aof::serialize_effect_for_log(&disp_frame, &response) {
                                             // Carry resp_idx so the Always-policy flush can
                                             // patch responses[resp_idx] on fsync failure.
                                             aof_entries.push((resp_idx, conn.selected_db, bytes));
@@ -3098,10 +3098,10 @@ pub async fn handle_connection(
                                             &tracking_table,
                                         );
                                     }
-                                    // moon#825: reply-derived record; `None` when the
+                                    // moon#825: reply-derived record; none when the
                                     // reply proves nothing was written.
                                     if metadata::is_persisted_write(d_cmd) && aof_pool.is_some() {
-                                        if let Some(bytes) = crate::persistence::aof::serialize_effect_for_log(disp_frame, &response) {
+                                        for bytes in crate::persistence::aof::serialize_effect_for_log(disp_frame, &response) {
                                             aof_entries.push((resp_idx, conn.selected_db, bytes));
                                         }
                                     }

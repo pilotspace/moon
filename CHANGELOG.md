@@ -199,6 +199,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A plain `XREADGROUP`, and `XCLAIM` / `XAUTOCLAIM`, are logged as the
+  effect they had, so consumer-group state survives a restart and reaches
+  replicas intact** (moon#1130). All three were written to the AOF and the
+  replication stream verbatim, and their outcome depends on the clock: the
+  replayed read stamped every pending entry with the REPLAY time (idle times
+  restarted from zero after a `kill -9`), and a replayed `XCLAIM ... 1000`
+  then found the entry a few ms idle and claimed nothing, so `XPENDING` named
+  the old owner again. They now propagate as redis does: a `>` read as
+  `XCLAIM key group consumer 0 <ids> TIME <delivery-ms> RETRYCOUNT 1 FORCE
+  JUSTID LASTID <last>` per stream served (`XGROUP CREATECONSUMER` +
+  `XGROUP SETID` under `NOACK`), a claim as `XCLAIM ... 0 <claimed ids> TIME
+  <ms> ... FORCE` with its own `RETRYCOUNT`/`JUSTID`/`LASTID`, and an
+  `XAUTOCLAIM` as one `XCLAIM` of the entries it claimed and the deleted ones
+  it dropped. Reads that deliver nothing, and history reads, log nothing. The
+  same records are written from every executor — connection, cross-shard,
+  `MULTI`/`EXEC` and Lua. A read over several streams writes one record per
+  stream, each its own AOF record.
+
 - **A key spilled again after a `BGREWRITEAOF` keeps its pre-rewrite value
   across a `kill -9`, even when the respill's `MOON.SPILLED` marker never
   reached the AOF** (moon#1140). The marker is emitted into the AOF writer's

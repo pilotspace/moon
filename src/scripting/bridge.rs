@@ -352,8 +352,8 @@ fn capture_txn_effect(db_index: usize, cmd_and_args: &[Frame], reply: &Frame) ->
         };
         let frame = Frame::Array(crate::protocol::FrameVec::from_vec(cmd_and_args.to_vec()));
         // moon#825: frame AND reply, exactly as `record_effect_write` derives
-        // it. `None` means the reply proves nothing was written.
-        if let Some(bytes) = crate::persistence::aof::serialize_effect_for_log(&frame, reply) {
+        // it. No record means the reply proves nothing was written.
+        for bytes in crate::persistence::aof::serialize_effect_for_log(&frame, reply) {
             buf.push((db_index, bytes));
         }
         true

@@ -1078,13 +1078,11 @@ pub(crate) fn handle_shard_message_shared(
                             if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                                 // moon#825: the record is derived from the REPLY, never the
                                 // verbatim frame — `SPOP`/`XADD *` and the relative-TTL family
-                                // do not reproduce themselves on replay. `None` means the reply
+                                // do not reproduce themselves on replay. No record means the reply
                                 // proves nothing was written, so nothing is appended.
-                                if let Some(serialized) =
-                                    aof::serialize_effect_for_log(&command, &frame)
-                                {
-                                    let mut aof_budget =
-                                        crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+                                let mut aof_budget =
+                                    crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+                                for serialized in aof::serialize_effect_for_log(&command, &frame) {
                                     aof_ok = wal_append_and_fanout(
                                         &serialized,
                                         db_idx,
@@ -1097,6 +1095,11 @@ pub(crate) fn handle_shard_message_shared(
                                         wal_kv_log,
                                         &mut aof_budget,
                                     );
+                                    // A later record without an earlier one would
+                                    // replay out of order: stop at the first refusal.
+                                    if !aof_ok {
+                                        break;
+                                    }
                                 }
                             }
 
@@ -1330,11 +1333,9 @@ pub(crate) fn handle_shard_message_shared(
                         if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log) {
                             // moon#825: the record is derived from the REPLY, never the
                             // verbatim frame — `SPOP`/`XADD *` and the relative-TTL family
-                            // do not reproduce themselves on replay. `None` means the reply
+                            // do not reproduce themselves on replay. No record means the reply
                             // proves nothing was written, so nothing is appended.
-                            if let Some(serialized) =
-                                aof::serialize_effect_for_log(cmd_frame, &frame)
-                            {
+                            for serialized in aof::serialize_effect_for_log(cmd_frame, &frame) {
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
                                     db_idx,
@@ -1347,6 +1348,11 @@ pub(crate) fn handle_shard_message_shared(
                                     wal_kv_log,
                                     &mut aof_budget,
                                 );
+                                // A later record without an earlier one would
+                                // replay out of order: stop at the first refusal.
+                                if !aof_ok {
+                                    break;
+                                }
                             }
                         }
 
@@ -1541,11 +1547,9 @@ pub(crate) fn handle_shard_message_shared(
                         if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log) {
                             // moon#825: the record is derived from the REPLY, never the
                             // verbatim frame — `SPOP`/`XADD *` and the relative-TTL family
-                            // do not reproduce themselves on replay. `None` means the reply
+                            // do not reproduce themselves on replay. No record means the reply
                             // proves nothing was written, so nothing is appended.
-                            if let Some(serialized) =
-                                aof::serialize_effect_for_log(cmd_frame, &frame)
-                            {
+                            for serialized in aof::serialize_effect_for_log(cmd_frame, &frame) {
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
                                     db_idx,
@@ -1568,6 +1572,11 @@ pub(crate) fn handle_shard_message_shared(
                                     wal_kv_log,
                                     &mut aof_budget,
                                 );
+                                // A later record without an earlier one would
+                                // replay out of order: stop at the first refusal.
+                                if !aof_ok {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1799,13 +1808,11 @@ pub(crate) fn handle_shard_message_shared(
                             if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                                 // moon#825: the record is derived from the REPLY, never the
                                 // verbatim frame — `SPOP`/`XADD *` and the relative-TTL family
-                                // do not reproduce themselves on replay. `None` means the reply
+                                // do not reproduce themselves on replay. No record means the reply
                                 // proves nothing was written, so nothing is appended.
-                                if let Some(serialized) =
-                                    aof::serialize_effect_for_log(&command, &frame)
-                                {
-                                    let mut aof_budget =
-                                        crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+                                let mut aof_budget =
+                                    crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+                                for serialized in aof::serialize_effect_for_log(&command, &frame) {
                                     aof_ok = wal_append_and_fanout(
                                         &serialized,
                                         db_idx,
@@ -1818,6 +1825,11 @@ pub(crate) fn handle_shard_message_shared(
                                         wal_kv_log,
                                         &mut aof_budget,
                                     );
+                                    // A later record without an earlier one would
+                                    // replay out of order: stop at the first refusal.
+                                    if !aof_ok {
+                                        break;
+                                    }
                                 }
                             }
 
@@ -2010,11 +2022,9 @@ pub(crate) fn handle_shard_message_shared(
                         if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log) {
                             // moon#825: the record is derived from the REPLY, never the
                             // verbatim frame — `SPOP`/`XADD *` and the relative-TTL family
-                            // do not reproduce themselves on replay. `None` means the reply
+                            // do not reproduce themselves on replay. No record means the reply
                             // proves nothing was written, so nothing is appended.
-                            if let Some(serialized) =
-                                aof::serialize_effect_for_log(cmd_frame, &frame)
-                            {
+                            for serialized in aof::serialize_effect_for_log(cmd_frame, &frame) {
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
                                     db_idx,
@@ -2027,6 +2037,11 @@ pub(crate) fn handle_shard_message_shared(
                                     wal_kv_log,
                                     &mut aof_budget,
                                 );
+                                // A later record without an earlier one would
+                                // replay out of order: stop at the first refusal.
+                                if !aof_ok {
+                                    break;
+                                }
                             }
                         }
 
@@ -2222,11 +2237,9 @@ pub(crate) fn handle_shard_message_shared(
                         if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log) {
                             // moon#825: the record is derived from the REPLY, never the
                             // verbatim frame — `SPOP`/`XADD *` and the relative-TTL family
-                            // do not reproduce themselves on replay. `None` means the reply
+                            // do not reproduce themselves on replay. No record means the reply
                             // proves nothing was written, so nothing is appended.
-                            if let Some(serialized) =
-                                aof::serialize_effect_for_log(cmd_frame, &frame)
-                            {
+                            for serialized in aof::serialize_effect_for_log(cmd_frame, &frame) {
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
                                     db_idx,
@@ -2250,6 +2263,11 @@ pub(crate) fn handle_shard_message_shared(
                                     wal_kv_log,
                                     &mut aof_budget,
                                 );
+                                // A later record without an earlier one would
+                                // replay out of order: stop at the first refusal.
+                                if !aof_ok {
+                                    break;
+                                }
                             }
                         }
                     }
