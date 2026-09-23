@@ -46,7 +46,7 @@ macro_rules! send_bounded {
 
 use futures::{FutureExt, SinkExt, StreamExt};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use tokio_util::codec::Framed;
 
@@ -67,6 +67,7 @@ use super::{
 };
 use crate::framevec;
 use crate::server::codec::RespCodec;
+use crate::server::conn::single_aof_log::SingleAofLog;
 
 /// Flush AOF entries and responses under the `appendfsync=always` ordering contract (H1).
 ///
@@ -87,58 +88,23 @@ use crate::server::codec::RespCodec;
 ///   tests pass any `Sink<Frame>` mock.
 /// - `responses` — per-command response slots; fsync failures patch the
 ///   corresponding slot to `Frame::Error`.
-/// - `aof_entries` — `(resp_idx, db, bytes)`: bytes to fsync (executed in `db`),
-///   slot to patch on failure.
-/// - `pool` — AOF writer pool (caller must ensure Always policy).
-/// - `repl_state` — replication state for LSN issuance (`&None` in tests).
-/// - `change_counter` — auto-save dirty counter (`&None` if not configured).
+/// - `aof_log` — the batch's AOF log: every record is already enqueued, in
+///   the stretch that applied its write (moon#1099); this runs its ONE fsync
+///   barrier and patches the slots whose record failed.
 pub(crate) async fn flush_with_aof_ack<S>(
     sink: &mut S,
     mut responses: Vec<Frame>,
-    aof_entries: Vec<(usize, usize, Bytes)>,
-    pool: &crate::persistence::aof::AofWriterPool,
-    repl_state: &Option<Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>>,
-    change_counter: &Option<Arc<AtomicU64>>,
+    aof_log: &mut SingleAofLog<'_>,
 ) -> bool
 where
     S: futures::Sink<Frame> + Unpin,
 {
-    // Phase 1 — group commit: enqueue every append fire-and-forget, then
-    // confirm the whole batch with ONE fsync barrier (Always) instead of an
-    // awaited fsync per entry — same contract as the sharded handlers'
-    // resolve_local_leg_barrier. On barrier failure every enqueued write in
-    // the batch is unconfirmed, so every joined slot is patched.
-    let mut barrier_idxs: Vec<usize> = Vec::new();
-    // Read once, before any enqueue can park. The entries were applied
-    // earlier in the batch, so this can be later than their mutations — a
-    // fold in between may still replay them — but never earlier, which is
-    // the direction that would lose a record.
-    let fold_stamp = pool.fold_stamp(0);
-    for (resp_idx, db, bytes) in aof_entries {
-        let lsn =
-            crate::persistence::aof::AofWriterPool::issue_append_lsn(repl_state, 0, bytes.len());
-        match pool.send_append_group(0, lsn, db, bytes, fold_stamp).await {
-            Ok(true) => barrier_idxs.push(resp_idx),
-            Ok(false) => {}
-            Err(_) => {
-                if resp_idx < responses.len() {
-                    responses[resp_idx] =
-                        Frame::Error(Bytes::from_static(b"WRITEFAIL aof fsync failed"));
-                }
-            }
-        }
-        if let Some(counter) = change_counter {
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    if !barrier_idxs.is_empty() && pool.fsync_barrier(0).await.is_err() {
-        for resp_idx in barrier_idxs {
-            if resp_idx < responses.len() {
-                responses[resp_idx] =
-                    Frame::Error(Bytes::from_static(b"WRITEFAIL aof fsync failed"));
-            }
-        }
-    }
+    // Phase 1 — group commit: the appends went out fire-and-forget as each
+    // write was applied; ONE fsync barrier (Always) confirms the whole batch
+    // — same contract as the sharded handlers' resolve_local_leg_barrier. On
+    // barrier failure every enqueued write in the batch is unconfirmed, so
+    // every joined slot is patched.
+    aof_log.settle(&mut responses).await;
     // Phase 2 — all acks received; flush responses to client.
     let mut break_outer = false;
     for response in responses {
@@ -557,13 +523,18 @@ pub async fn handle_connection(
                 // the binary never reaches it. Its own retro-encode behaviour is
                 // unchanged and recorded as a spec delta.
                 conn.proto_switches.clear();
-                // Each entry carries (resp_idx, db, bytes) so the Always-policy flush
-                // path can patch responses[resp_idx] with WRITEFAIL when fsync fails,
-                // before any response is sent to the client (H1 fix — FIX-W1-1).
-                // task #35: `db` is the connection's selected db at the moment this
-                // entry was recorded (only SELECT changes it, and SELECT itself is
-                // never persisted, so it is stable for every persisted entry).
-                let mut aof_entries: Vec<(usize, usize, Bytes)> = Vec::new();
+                // moon#1099: every write's record is enqueued in the stretch
+                // that applies it, while its db guard is held, so log order is
+                // apply order across connections. The log keeps each record's
+                // reply slot so the Always-policy flush can patch
+                // responses[resp_idx] with WRITEFAIL when fsync fails, before
+                // any response is sent (H1 fix — FIX-W1-1). task #35: the db a
+                // record is filed under is the one its write ran against.
+                let mut aof_log = SingleAofLog::new(
+                    aof_pool.as_deref(),
+                    &repl_state,
+                    &change_counter,
+                );
                 let mut should_quit = false;
                 let mut break_outer = false;
 
@@ -1190,6 +1161,13 @@ pub async fn handle_connection(
                         if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
                             // Execute any pending dispatchable frames before switching modes
                             if !dispatchable.is_empty() {
+                                // moon#1099: wait for AOF room with no guard held;
+                                // the records are enqueued under the guard below.
+                                if aof_log.enabled() {
+                                    aof_log
+                                        .admit(dispatchable.iter().filter(|d| d.2).count())
+                                        .await;
+                                }
                                 let mut guard = db[conn.selected_db].write();
                                 guard.refresh_now();
                                 let db_count = db.len();
@@ -1252,14 +1230,19 @@ pub async fn handle_connection(
                                     // never reach this loop); no record when the reply
                                     // proves nothing was written.
                                     if is_write
-                                        && aof_pool.is_some()
+                                        && aof_log.enabled()
                                         && metadata::is_persisted_write(d_cmd)
                                         && !matches!(&response, Frame::Error(_))
                                     {
                                         for bytes in crate::persistence::aof::serialize_effect_for_log(&disp_frame, &response) {
-                                            // Carry resp_idx so the Always-policy flush can
-                                            // patch responses[resp_idx] on fsync failure.
-                                            aof_entries.push((resp_idx, conn.selected_db, bytes));
+                                            // moon#1099: enqueued under the guard it
+                                            // was applied under. resp_idx lets the
+                                            // flush patch the slot on failure.
+                                            // moon#1130: a later record without an
+                                            // earlier one would replay out of order.
+                                            if !aof_log.append_locked(resp_idx, conn.selected_db, bytes) {
+                                                break;
+                                            }
                                         }
                                     }
                                     // Apply RESP3 response conversion if needed
@@ -1291,40 +1274,14 @@ pub async fn handle_connection(
                             //     +OK first, then checked AOF, causing WRITEFAIL to
                             //     be mistaken for the SUBSCRIBE ack by the client).
                             //
-                            // For everysec/no policies, try_send_append_durable is
-                            // fire-and-forget (returns Ok immediately) so no latency
-                            // penalty.
+                            // For everysec/no policies there is no barrier, so no
+                            // latency penalty.
                             //
-                            // Note: aof_entries carries (resp_idx, db, bytes) from
-                            // FIX-W1-1 — resp_idx is unused here because the
-                            // all-or-nothing failure mode discards the entire response
-                            // buffer; future per-slot patching could use it.
-                            let mut aof_write_failed = false;
-                            let mut aof_barrier_needed = false;
-                            for (_resp_idx, entry_db, bytes) in aof_entries.drain(..) {
-                                if let Some(ref pool) = aof_pool {
-                                    let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                                    // Later than the batch's mutations at worst
-                                    // (see `flush_with_aof_ack`), never earlier.
-                                    let stamp = pool.fold_stamp(0);
-                                    match pool.send_append_group(0, lsn, entry_db, bytes, stamp).await {
-                                        Ok(true) => aof_barrier_needed = true,
-                                        Ok(false) => {}
-                                        Err(_) => aof_write_failed = true,
-                                    }
-                                }
-                                if let Some(ref counter) = change_counter {
-                                    counter.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                            // ONE fsync confirms the whole batch (group commit).
-                            if aof_barrier_needed {
-                                if let Some(ref pool) = aof_pool {
-                                    if pool.fsync_barrier(0).await.is_err() {
-                                        aof_write_failed = true;
-                                    }
-                                }
-                            }
+                            // moon#1099: the records were enqueued above, under
+                            // the guard; this is the ONE fsync barrier (group
+                            // commit) and the patch of any slot whose record
+                            // failed.
+                            let aof_write_failed = aof_log.settle(&mut responses).await;
                             if aof_write_failed {
                                 // Discard buffered +OK responses — the writes are not
                                 // durable. Log at warn level so operators can correlate
@@ -1535,12 +1492,34 @@ pub async fn handle_connection(
                                 // post-EXEC `conn.selected_db` would mis-place
                                 // them on recovery.
                                 let txn_db = conn.selected_db;
-                                let (mut result, txn_aof_entries) = execute_transaction(
+                                // The EXEC response occupies responses[exec_resp_idx]
+                                // (pushed below; nothing is pushed in between). All
+                                // txn AOF records map to this same slot so that the
+                                // Always-policy flush can patch the EXEC frame if any
+                                // command's record fails.
+                                let exec_resp_idx = responses.len();
+                                // moon#1099: each body record is enqueued inside
+                                // `execute_transaction`, under the body's guards —
+                                // before this batch's later awaits (WAIT, CLIENT
+                                // PAUSE) can let another connection apply and log.
+                                // Room is awaited first, with no guard held.
+                                if aof_log.enabled() {
+                                    aof_log.admit(conn.command_queue.len()).await;
+                                }
+                                // task #35 + PR #282 review: the whole body
+                                // runs against the guard taken on `txn_db`
+                                // (captured before EXEC) — NOT the possibly
+                                // SELECT-mutated post-EXEC `conn.selected_db`.
+                                // A queued SELECT itself is never persisted.
+                                let mut result = execute_transaction(
                                     &db,
                                     &conn.command_queue,
                                     &conn.watched_keys,
                                     &mut conn.selected_db,
                                     &mut exec_publishes,
+                                    |bytes| {
+                                        let _ = aof_log.append_locked(exec_resp_idx, txn_db, bytes);
+                                    },
                                 );
                                 // C2: fan out PUBLISHes queued in the txn only
                                 // now — after the transaction body — and patch
@@ -1717,22 +1696,8 @@ pub async fn handle_connection(
                                 }
                                 conn.command_queue.clear();
                                 conn.watched_keys.clear();
-                                // The EXEC response occupies responses[exec_resp_idx].
-                                // All txn AOF entries map to this same slot so that
-                                // the Always-policy flush can patch the EXEC frame if
-                                // any command's fsync fails.
-                                let exec_resp_idx = responses.len();
+                                debug_assert_eq!(responses.len(), exec_resp_idx);
                                 responses.push(result);
-                                // task #35 + PR #282 review: the whole body
-                                // ran against the guard taken on `txn_db`
-                                // (captured before EXEC) — NOT the possibly
-                                // SELECT-mutated post-EXEC `conn.selected_db`.
-                                // A queued SELECT itself is never persisted.
-                                aof_entries.extend(
-                                    txn_aof_entries
-                                        .into_iter()
-                                        .map(|b| (exec_resp_idx, txn_db, b)),
-                                );
                             }
                             continue;
                         }
@@ -2347,14 +2312,17 @@ pub async fn handle_connection(
                     // Arena-backed scratch: collect write-command response indices for
                     // post-dispatch AOF batching. Rebuilt each batch cycle and
                     // bulk-deallocated by arena.reset() after the batch completes.
-                    let mut write_indices: BumpVec<usize> = BumpVec::new_in(&arena);
-                    for item in &dispatchable {
-                        if item.2 { // is_write
-                            write_indices.push(item.0); // resp_idx
+                    // Block-scoped: the write run below awaits AOF room
+                    // (moon#1099), and a BumpVec (`!Send`) must not be live
+                    // in the generator across that await.
+                    {
+                        let mut write_indices: BumpVec<usize> = BumpVec::new_in(&arena);
+                        for item in &dispatchable {
+                            if item.2 { // is_write
+                                write_indices.push(item.0); // resp_idx
+                            }
                         }
                     }
-                    // write_indices consumed here; drop before any await
-                    drop(write_indices);
 
                     let db_count = db.len();
                     let mut i = 0;
@@ -2648,6 +2616,13 @@ pub async fn handle_connection(
                             // read guard dropped here
                         } else {
                             // === Write run: exclusive write lock ===
+                            // moon#1099: every record of this run is enqueued
+                            // under the guard its write was applied under, and
+                            // enqueueing there must not park — so wait for room
+                            // first, with no guard held.
+                            if aof_log.enabled() {
+                                aof_log.admit(i - run_start).await;
+                            }
                             // Re-acquire guard if conn.selected_db changes mid-run (e.g. SELECT).
                             let mut current_db = conn.selected_db;
                             let mut guard = db[current_db].write();
@@ -2918,7 +2893,20 @@ pub async fn handle_connection(
                                             drop(guard);
                                             let r = crate::command::keyspace::move_cmd::with_two_dbs_locked(
                                                 db.as_slice(), src_db, dst_db,
-                                                |src, dst| crate::command::keyspace::move_cmd::move_core(src, dst, &key),
+                                                |src, dst| {
+                                                    let r = crate::command::keyspace::move_cmd::move_core(src, dst, &key);
+                                                    // moon#1099: logged while both dbs are
+                                                    // held. task #35: MOVE persists against
+                                                    // its SOURCE db (src_db ==
+                                                    // conn.selected_db; MOVE never changes
+                                                    // the connection's selected db).
+                                                    if matches!(r, Frame::Integer(1)) {
+                                                        if let Some(bytes) = &aof_bytes {
+                                                            aof_log.append_locked(resp_idx, src_db, bytes.clone());
+                                                        }
+                                                    }
+                                                    r
+                                                },
                                             );
                                             // Restore loop invariant: re-acquire guard
                                             current_db = conn.selected_db;
@@ -2927,15 +2915,6 @@ pub async fn handle_connection(
                                             r
                                         }
                                     };
-                                    if matches!(response, Frame::Integer(1)) {
-                                        if let Some(bytes) = &aof_bytes {
-                                            // task #35: MOVE persists against its
-                                            // SOURCE db (src_db == conn.selected_db;
-                                            // MOVE never changes the connection's
-                                            // selected db).
-                                            aof_entries.push((resp_idx, src_db, bytes.clone()));
-                                        }
-                                    }
                                     responses[resp_idx] = response;
                                     continue;
                                 }
@@ -2952,7 +2931,19 @@ pub async fn handle_connection(
                                                 drop(guard);
                                                 let r = crate::command::keyspace::move_cmd::with_two_dbs_locked(
                                                     db.as_slice(), src_db, ca.dst_db,
-                                                    |src, dst| crate::command::keyspace::move_cmd::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace),
+                                                    |src, dst| {
+                                                        let r = crate::command::keyspace::move_cmd::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace);
+                                                        // moon#1099: logged while both dbs
+                                                        // are held. task #35: COPY ... DB n
+                                                        // persists against its SOURCE db,
+                                                        // same as MOVE.
+                                                        if matches!(r, Frame::Integer(1)) {
+                                                            if let Some(bytes) = &aof_bytes {
+                                                                aof_log.append_locked(resp_idx, src_db, bytes.clone());
+                                                            }
+                                                        }
+                                                        r
+                                                    },
                                                 );
                                                 current_db = conn.selected_db;
                                                 guard = db[current_db].write();
@@ -2960,13 +2951,6 @@ pub async fn handle_connection(
                                                 r
                                             }
                                         };
-                                        if matches!(response, Frame::Integer(1)) {
-                                            if let Some(bytes) = &aof_bytes {
-                                                // task #35: COPY ... DB n persists
-                                                // against its SOURCE db, same as MOVE.
-                                                aof_entries.push((resp_idx, src_db, bytes.clone()));
-                                            }
-                                        }
                                         responses[resp_idx] = response;
                                         continue;
                                     }
@@ -3055,9 +3039,27 @@ pub async fn handle_connection(
                                     // restore the loop invariant.
                                     if d_cmd.eq_ignore_ascii_case(b"FLUSHALL") {
                                         drop(guard);
-                                        crate::command::server_admin::flush_every_database_locked(
-                                            db.as_slice(),
-                                        );
+                                        {
+                                            // moon#1099: every db is held (ascending
+                                            // order, as `with_two_dbs_locked` and
+                                            // `TxnLocks` take them) across the clear
+                                            // AND the enqueue of the record, so no
+                                            // write can land in a cleared db and be
+                                            // logged ahead of this FLUSHALL.
+                                            let mut all: Vec<_> =
+                                                db.iter().map(|d| d.write()).collect();
+                                            for g in all.iter_mut() {
+                                                g.clear();
+                                            }
+                                            crate::blocking::wakeup::note_unsignalled_removal();
+                                            if aof_log.enabled() {
+                                                for bytes in crate::persistence::aof::serialize_effect_for_log(disp_frame, &response) {
+                                                    if !aof_log.append_locked(resp_idx, conn.selected_db, bytes) {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
                                         current_db = conn.selected_db;
                                         guard = db[current_db].write();
                                         guard.refresh_now();
@@ -3100,9 +3102,17 @@ pub async fn handle_connection(
                                     }
                                     // moon#825: reply-derived record; none when the
                                     // reply proves nothing was written.
-                                    if metadata::is_persisted_write(d_cmd) && aof_pool.is_some() {
+                                    // moon#1099: enqueued here, under the guard the
+                                    // write was applied under. FLUSHALL logged
+                                    // itself above, while every db was held.
+                                    if aof_log.enabled()
+                                        && metadata::is_persisted_write(d_cmd)
+                                        && !d_cmd.eq_ignore_ascii_case(b"FLUSHALL")
+                                    {
                                         for bytes in crate::persistence::aof::serialize_effect_for_log(disp_frame, &response) {
-                                            aof_entries.push((resp_idx, conn.selected_db, bytes));
+                                            if !aof_log.append_locked(resp_idx, conn.selected_db, bytes) {
+                                                break;
+                                            }
                                         }
                                     }
                                 }
@@ -3129,49 +3139,26 @@ pub async fn handle_connection(
                 } // all locks dropped here -- BEFORE any await
 
                 // FIX-W1-1: appendfsync=always ordering — H1 close for the single-shard
-                // tokio path. Under Always policy: await all AOF fsync acks FIRST, patch
-                // any failed response slots with WRITEFAIL, THEN flush responses to the
-                // client (delegated to `flush_with_aof_ack` so tests can call the real
-                // production path rather than reproducing it inline).
-                // Under EverySec/No: keep existing fire-and-forget ordering (flush
-                // responses first, then enqueue AOF in the background — no latency impact).
+                // tokio path. Every record is already enqueued (moon#1099: in the
+                // stretch that applied it). Under Always: ONE fsync barrier for the
+                // batch FIRST, patch any failed response slot with WRITEFAIL, THEN
+                // flush responses to the client (delegated to `flush_with_aof_ack`
+                // so tests can call the real production path). Under EverySec/No
+                // there is no barrier; only a record that never reached the writer
+                // turns its reply into WRITEFAIL.
                 let use_always_ordering = aof_pool
                     .as_ref()
                     .map(|p| p.fsync_policy() == crate::persistence::aof::FsyncPolicy::Always)
                     .unwrap_or(false);
 
                 if use_always_ordering {
-                    // `use_always_ordering` is only true when aof_pool is Some + Always.
-                    if let Some(ref pool) = aof_pool {
-                        break_outer = flush_with_aof_ack(
-                            &mut framed,
-                            responses,
-                            aof_entries,
-                            pool,
-                            &repl_state,
-                            &change_counter,
-                        )
-                        .await;
-                    }
+                    break_outer = flush_with_aof_ack(&mut framed, responses, &mut aof_log).await;
                 } else {
-                    // EverySec / No policy: flush responses first (zero added latency),
-                    // then fire-and-forget AOF enqueue.
+                    aof_log.settle(&mut responses).await;
                     for response in responses {
                         if !send_bounded!(framed, response, write_timeout, client_id) {
                             break_outer = true;
                             break;
-                        }
-                    }
-                    for (_, entry_db, bytes) in aof_entries {
-                        if let Some(ref pool) = aof_pool {
-                            let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                            let stamp = pool.fold_stamp(0);
-                            let _ = pool
-                                .try_send_append_durable(0, lsn, entry_db, bytes, stamp)
-                                .await;
-                        }
-                        if let Some(ref counter) = change_counter {
-                            counter.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -3327,18 +3314,15 @@ mod tests {
         let start = Instant::now();
 
         let responses = vec![Frame::SimpleString(bytes::Bytes::from_static(b"OK"))];
-        let aof_entries = vec![(0usize, 0usize, bytes::Bytes::from_static(b"SET k v\r\n"))];
         let mut sink = RecordingSink::new();
 
-        let broke = flush_with_aof_ack(
-            &mut sink,
-            responses,
-            aof_entries,
-            &pool,
-            &None, // no replication state
-            &None, // no change counter
-        )
-        .await;
+        // moon#1099: the record is enqueued when its write is applied (here:
+        // before the flush), and the flush runs the batch's ONE barrier.
+        let (no_repl, no_counter) = (None, None);
+        let mut aof_log = SingleAofLog::new(Some(&*pool), &no_repl, &no_counter);
+        aof_log.append_locked(0, 0, bytes::Bytes::from_static(b"SET k v\r\n"));
+
+        let broke = flush_with_aof_ack(&mut sink, responses, &mut aof_log).await;
 
         mock_writer.await.expect("mock writer completed cleanly");
 

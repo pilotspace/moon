@@ -631,7 +631,12 @@ pub fn make_redis_call_fn(
             // that stronger rule would also catch a single-key write to an
             // undeclared remote key, and is a separate decision with a much
             // wider blast radius (tracked as a follow-up).
-            if let Some(err) = crate::server::conn::shared::cross_shard_multikey_rejection(
+            //
+            // The SCRIPT variant of the guard (moon#1133) also claims a plain
+            // `COPY`: on a connection it is coordinator-routed and correct
+            // across shards, but a script has no coordinator, so an
+            // undeclared remote destination was written into this slice.
+            if let Some(err) = crate::server::conn::shared::script_cross_shard_rejection(
                 &cmd_bytes,
                 &frames[1..],
                 crate::command::connection::shard_count(),

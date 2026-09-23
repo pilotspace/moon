@@ -792,6 +792,39 @@ impl AofWriterPool {
         self.free_append_slots(shard_id) >= need
     }
 
+    /// Wait, without holding anything, until `shard_id`'s writer can take
+    /// `records` more appends (moon#1099).
+    ///
+    /// For a producer that must then enqueue inside a lock, where it cannot
+    /// park: it awaits room here first, takes the lock, applies, and enqueues
+    /// synchronously. Polls every millisecond on the runtime timer, bounded
+    /// by `fsync_timeout` (`ZERO` = unbounded, like [`Self::await_ack`]).
+    ///
+    /// `Err(WriteFailed)` when the writer is gone, `Err(ChannelFull)` when
+    /// the bound elapsed. Admission is advisory: a concurrent producer can
+    /// take the room before the caller's enqueue, which must therefore still
+    /// handle a full channel.
+    pub async fn await_append_room(&self, shard_id: usize, records: usize) -> Result<(), AofAck> {
+        let mut deadline: Option<std::time::Instant> = None;
+        loop {
+            if self.append_writer_gone(shard_id) {
+                return Err(AofAck::WriteFailed);
+            }
+            if self.has_append_room(shard_id, 0, records, 0) {
+                return Ok(());
+            }
+            // Slow path only: the channel is full, so the clock read is noise.
+            if !self.fsync_timeout.is_zero() {
+                let now = std::time::Instant::now();
+                let d = *deadline.get_or_insert(now + self.fsync_timeout);
+                if now >= d {
+                    return Err(AofAck::ChannelFull);
+                }
+            }
+            Self::room_poll_sleep().await;
+        }
+    }
+
     /// Append with bounded *blocking* backpressure — for synchronous callers
     /// (the shard event loop's SPSC drain) that cannot await.
     ///

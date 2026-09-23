@@ -21,6 +21,8 @@ pub mod intercept;
 pub mod monitor_mode;
 pub mod park_policy;
 pub mod shared;
+#[cfg(feature = "runtime-tokio")]
+pub(crate) mod single_aof_log;
 pub mod subscriber_mode;
 #[cfg(all(test, feature = "runtime-monoio"))]
 mod tests;
