@@ -211,6 +211,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deletes anything, and deletes nothing if that commit fails. At most one
   entry per boot whatever the orphan backlog; a crash between the commit and
   the unlink re-sweeps the file on the next boot instead of leaking it.
+- **A document written to a shard while that shard runs its boot index
+  rescan stays searchable** (moon#1124). Writes routed from another shard are
+  applied during the walk (the `-LOADING` gate guards only the connection
+  path), and the rescan's deletion probe tombstoned every recovered document
+  whose key the walk had not observed — including a key that was deleted
+  while the server was down and re-created by a routed `HSET` mid-walk. The
+  key existed and `FT.SEARCH` never returned it. The live auto-index hook now
+  records `(db, key)` in a shard-local ledger while recovery runs, a live
+  `DEL`/`UNLINK` forgets it again, and both the vector and the text probe
+  skip a recorded key. Outside recovery the ledger is `None`: one branch per
+  indexed write. A 2-shard kill-9 restart that lands the write mid-walk
+  (`tests/vector_rescan_live_write.rs`) lost the document on every in-window
+  run before the fix (4/4) and keeps it after (6/6).
+- **A plain `XREADGROUP`, and `XCLAIM` / `XAUTOCLAIM`, are logged as the
+  effect they had, so consumer-group state survives a restart and reaches
+  replicas intact** (moon#1130). All three were written to the AOF and the
+  replication stream verbatim, and their outcome depends on the clock: the
+  replayed read stamped every pending entry with the REPLAY time (idle times
+  restarted from zero after a `kill -9`), and a replayed `XCLAIM ... 1000`
+  then found the entry a few ms idle and claimed nothing, so `XPENDING` named
+  the old owner again. They now propagate as redis does: a `>` read as
+  `XCLAIM key group consumer 0 <ids> TIME <delivery-ms> RETRYCOUNT 1 FORCE
+  JUSTID LASTID <last>` per stream served (`XGROUP CREATECONSUMER` +
+  `XGROUP SETID` under `NOACK`), a claim as `XCLAIM ... 0 <claimed ids> TIME
+  <ms> ... FORCE` with its own `RETRYCOUNT`/`JUSTID`/`LASTID`, and an
+  `XAUTOCLAIM` as one `XCLAIM` of the entries it claimed and the deleted ones
+  it dropped. Reads that deliver nothing, and history reads, log nothing. The
+  same records are written from every executor — connection, cross-shard,
+  `MULTI`/`EXEC` and Lua. A read over several streams writes one record per
+  stream, each its own AOF record.
+- **The library entry point logs a write before another connection can log a
+  later one** (moon#1099). `handler_single`, which `listener::run_with_shutdown`
+  and `moon::server::handle_connection` drive, collected a pipelined batch's
+  AOF records and sent them after the batch: after its `WAIT` / `CLIENT PAUSE`
+  awaits, after the reply writes under `everysec`, and always after the db
+  lock was released. A write from another connection that was applied later
+  could be logged first, and replay restored the older value (`MULTI / SET k 1
+  / EXEC / WAIT` with a `SET k 2` during the `WAIT` replayed `1`; eight
+  connections pipelining `APPEND`s to shared keys replayed a different order
+  on every run). Each record is now enqueued while the guard it was applied
+  under is held — inside `EXEC`'s body, inside `MOVE` / `COPY ... DB n`'s two-db
+  section, and with every db held across `FLUSHALL`'s clear. Room in the
+  writer is awaited before the guard is taken; the `appendfsync always` fsync
+  barrier stays one per batch. A record that cannot be enqueued now turns its
+  reply into `WRITEFAIL` under `everysec` / `no` too, where it used to be
+  dropped after `+OK`. The shipped binary (`run_sharded`) was not affected.
+- **A script's plain `COPY` to an undeclared key on another shard is refused
+  with `CROSSSLOT` instead of acking a copy nobody can read** (moon#1133). On a
+  connection a DB-less `COPY` is coordinator-routed and correct across shards;
+  a script has no coordinator, and `route_script_keys` sees only the declared
+  keys. So `EVAL "return redis.call('COPY', KEYS[1], ARGV[1])" 1 src dst` with
+  `dst` owned by another shard wrote the copy into the source's shard under a
+  name normal routing never looks for there — at `--shards 4`, `:1` for 8 of 8
+  destinations, 1 of 8 readable, `DBSIZE` counting all 8. The scripting
+  bridge's cross-shard guard now covers plain `COPY` (with or without
+  `REPLACE`) like the rest of the two-key write family, for `EVAL`, `EVALSHA`
+  and `FCALL`. Same-shard and `{hash}`-tagged pairs, `--shards 1`, and `COPY`
+  sent on a connection are unchanged.
+- **`test`: the ACL CAT diff in `scripts/test-consistency.sh` no longer
+  truncates the suite under a non-C locale.** Its `sort -u` and `comm` ran
+  under the caller's collation; under `en_US.UTF-8` GNU `comm` rejected the
+  sorted files as out of order, `set -e` ended the run, and the consistency
+  gate reported a TRUNCATED RUN on a freshly provisioned Ubuntu 26.04 VM
+  (reproduced on main `b65a73aa`). Both now run with `LC_ALL=C`; the gate
+  completes, tolerating only the documented moon#536 row.
 
 - **A key spilled again after a `BGREWRITEAOF` keeps its pre-rewrite value
   across a `kill -9`, even when the respill's `MOON.SPILLED` marker never

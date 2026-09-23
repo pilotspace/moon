@@ -245,11 +245,11 @@ pub(crate) fn record_effect_write(
     // moon#825: a script's `redis.call('SPOP', …)` / `XADD … '*'` is an
     // effect only together with its reply — the raw inner frame re-rolls on
     // replay exactly like the same command sent from a connection would.
-    // `None` means the reply proves the inner command wrote nothing.
-    let Some(serialized) = crate::persistence::aof::serialize_effect_for_log(&frame, reply) else {
-        return;
-    };
-    record_bytes_conn(repl_state, shard_id, num_shards, aof_pool, db, serialized);
+    // No record means the reply proves the inner command wrote nothing;
+    // several (moon#1130) are recorded one by one, in order.
+    for serialized in crate::persistence::aof::serialize_effect_for_log(&frame, reply) {
+        record_bytes_conn(repl_state, shard_id, num_shards, aof_pool, db, serialized);
+    }
 }
 
 /// Cheap pre-check (task #34 review, defect 2): `true` iff either

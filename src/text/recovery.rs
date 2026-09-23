@@ -121,14 +121,25 @@ impl TextRecoveryState {
     }
 
     /// Deletion probe + stats recompute + one summary line per loaded index.
-    pub fn finish(self, text_store: &mut TextStore) {
+    ///
+    /// `live`: keys the live write path indexed during the walk (moon#1124)
+    /// — their docs are current even though the walk never observed them.
+    pub fn finish(
+        self,
+        text_store: &mut TextStore,
+        live: Option<&crate::vector::persistence::live_writes::LiveWriteLedger>,
+    ) {
         for (name, mut c) in self.loaded {
             let observed = self.observed.get(&name);
             if let Some(idx) = text_store.get_index_mut(&name) {
+                let db = idx.db_index;
                 let stale: Vec<u32> = idx
                     .key_hash_to_doc_id
                     .iter()
-                    .filter(|(kh, _)| !observed.is_some_and(|o| o.contains(kh)))
+                    .filter(|(kh, _)| {
+                        !observed.is_some_and(|o| o.contains(kh))
+                            && !live.is_some_and(|l| l.written(db, **kh))
+                    })
                     .map(|(_, &doc_id)| doc_id)
                     .collect();
                 for doc_id in &stale {
@@ -231,7 +242,7 @@ mod tests {
         let args = frames("t:0", &[("body", "alpha beta")]);
         let _ = rec.reconcile(&store, b"t:0", &args, 0);
         // t:1 is never observed by the walk (deleted key) -> probe removes it
-        rec.finish(&mut store);
+        rec.finish(&mut store, None);
         let idx = store.get_index(b"ix").unwrap();
         assert_eq!(idx.num_docs(), 1);
         assert!(
@@ -245,5 +256,56 @@ mod tests {
         );
         assert_eq!(idx.field_stats[0].num_docs, 1);
         assert_eq!(idx.field_stats[0].total_field_length, 2);
+    }
+
+    /// moon#1124: writes routed here during the boot walk. `t:1` was deleted
+    /// while the server was down (the walk never lists it) and a live HSET
+    /// re-creates it; `t:2` is a brand-new key written live; `t:3` is written
+    /// and then DELeted live. The probe must keep `t:1` and `t:2` (their docs
+    /// are the live copies) and still remove `t:3`.
+    #[test]
+    fn finish_keeps_docs_the_live_path_wrote_during_the_walk() {
+        use crate::shard::spsc_handler::{auto_delete_vectors, auto_index_hset_public};
+        use crate::vector::store::VectorStore;
+
+        let (mut store, mut rec) = store_with_loaded_index();
+        let mut vs = VectorStore::new();
+        vs.begin_recovery_live_writes();
+
+        let args = frames("t:0", &[("body", "alpha beta")]);
+        let _ = rec.reconcile(&store, b"t:0", &args, 0);
+        for (k, body) in [
+            ("t:1", "recreated epsilon"),
+            ("t:2", "fresh zeta"),
+            ("t:3", "gone eta"),
+        ] {
+            let args = frames(k, &[("body", body)]);
+            let _ = auto_index_hset_public(&mut vs, &mut store, k.as_bytes(), &args, 0);
+        }
+        auto_delete_vectors(&mut vs, &frames("t:3", &[]), 0);
+
+        rec.finish(&mut store, vs.recovery_live_writes());
+        let idx = store.get_index(b"ix").unwrap();
+        let has = |k: &str| {
+            idx.key_hash_to_doc_id
+                .contains_key(&xxhash_rust::xxh64::xxh64(k.as_bytes(), 0))
+        };
+        assert!(has("t:0"), "observed by the walk");
+        assert!(
+            has("t:1"),
+            "re-created by a live write mid-walk: must survive"
+        );
+        assert!(has("t:2"), "written live mid-walk: must survive");
+        assert!(!has("t:3"), "written then DELeted live: must end deleted");
+        assert_eq!(
+            idx.search_field(0, &["epsilon".to_owned()], None, None, 10)
+                .len(),
+            1
+        );
+        assert!(
+            idx.search_field(0, &["gamma".to_owned()], None, None, 10)
+                .is_empty(),
+            "the pre-restart copy of t:1 stays gone"
+        );
     }
 }
