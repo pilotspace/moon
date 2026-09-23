@@ -713,3 +713,102 @@ fn t2k5_transactions_and_scripts_cannot_ack_a_lost_write_either() {
         wrong.join("\n")
     );
 }
+
+/// moon#1133: a script's PLAIN `COPY` whose destination is not a declared key.
+///
+/// On a connection a DB-less `COPY` is coordinator-routed and correct across
+/// shards (`coordinate_copy`), so it was never part of the guarded family. A
+/// script has no coordinator: every `redis.call` runs against the one shard the
+/// script was routed to, so an undeclared destination (`ARGV`, or built in Lua)
+/// owned by another shard was written into the SOURCE's slice under a name
+/// normal routing never looks for there. Measured on the pre-fix binary at
+/// `--shards 4`: `:1` for 8 of 8 placements, 1 of 8 readable, `DBSIZE` counting
+/// all of them.
+///
+/// Asserts the acknowledgement contract per placement, for `EVAL`, `EVALSHA`
+/// and `FCALL`, with and without `REPLACE`; a refusal must be the family's
+/// `CROSSSLOT`; and `DBSIZE` must equal what normally-routed reads can see, so
+/// a hidden misplaced copy fails even if the reply was an error.
+fn run_script_copy(port: u16, place: impl Fn(&str, usize) -> (String, String), must_land: bool) {
+    const COPY_VIA_ARGV: &str = "return redis.call('COPY', KEYS[1], ARGV[1])";
+    const COPY_VIA_ARGV_REPLACE: &str = "return redis.call('COPY', KEYS[1], ARGV[1], 'REPLACE')";
+    const LIB: &str = "#!lua name=lib1133\n\
+        redis.register_function('cp1133', function(keys, args) \
+        return redis.call('COPY', keys[1], args[1]) end)";
+
+    let mut c = Conn::open(port);
+    assert_eq!(c.send(&["FLUSHALL"]), "+OK\r\n");
+    let load = c.send(&["FUNCTION", "LOAD", "REPLACE", LIB]);
+    assert!(load.contains("lib1133"), "FUNCTION LOAD failed: {load:?}");
+    let sha_reply = c.send(&["SCRIPT", "LOAD", COPY_VIA_ARGV]);
+    // `$40\r\n<sha>\r\n`
+    let sha = sha_reply
+        .split("\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(sha.len(), 40, "SCRIPT LOAD failed: {sha_reply:?}");
+
+    let mut wrong: Vec<String> = Vec::new();
+    let mut visible: i64 = 0;
+    for shape in ["eval", "eval-replace", "evalsha", "fcall"] {
+        for i in 0..TRIALS {
+            let (src, dst) = place(&format!("1133-{shape}"), i);
+            assert_eq!(c.send(&["SET", &src, "VALUE-1"]), "+OK\r\n", "seed {src}");
+            visible += 1;
+            let reply = match shape {
+                "eval" => c.send(&["EVAL", COPY_VIA_ARGV, "1", &src, &dst]),
+                "eval-replace" => c.send(&["EVAL", COPY_VIA_ARGV_REPLACE, "1", &src, &dst]),
+                "evalsha" => c.send(&["EVALSHA", &sha, "1", &src, &dst]),
+                _ => c.send(&["FCALL", "cp1133", "1", &src, &dst]),
+            };
+            let src_now = c.send(&["GET", &src]);
+            let dst_now = c.send(&["GET", &dst]);
+            let ok = if reply == ":1\r\n" {
+                visible += 1;
+                dst_now == "$7\r\nVALUE-1\r\n" && src_now == "$7\r\nVALUE-1\r\n"
+            } else {
+                !must_land
+                    && reply.starts_with('-')
+                    && reply.contains("CROSSSLOT")
+                    && src_now == "$7\r\nVALUE-1\r\n"
+                    && dst_now == "$-1\r\n"
+            };
+            if !ok {
+                wrong.push(format!(
+                    "  {shape} [{src} -> {dst}]: reply={reply:?} src={src_now:?} dst={dst_now:?}"
+                ));
+            }
+        }
+    }
+    let dbsize = c.send(&["DBSIZE"]);
+    assert!(
+        wrong.is_empty(),
+        "{} of {} script COPY placements broke the acknowledgement contract (moon#1133):\n{}",
+        wrong.len(),
+        TRIALS * 4,
+        wrong.join("\n")
+    );
+    assert_eq!(
+        dbsize,
+        format!(":{visible}\r\n"),
+        "DBSIZE counts keys no normally-routed read can see — a misplaced copy (moon#1133)"
+    );
+}
+
+#[test]
+fn t2k6_script_plain_copy_to_an_undeclared_remote_key_never_acks_a_lost_copy() {
+    let m = spawn_moon(SHARDS);
+    run_script_copy(m.port, cross_shard_pair, false);
+}
+
+/// Narrowness controls for `t2k6`: a `{hash}`-tagged pair at `--shards 4`, and
+/// the identical cross-shard names at `--shards 1`, must both copy (`:1`).
+#[test]
+fn t2k7_script_plain_copy_still_works_colocated_and_at_one_shard() {
+    let m = spawn_moon(SHARDS);
+    run_script_copy(m.port, colocated_pair, true);
+    drop(m);
+    let one = spawn_moon(1);
+    run_script_copy(one.port, cross_shard_pair, true);
+}
