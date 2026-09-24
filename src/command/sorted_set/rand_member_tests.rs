@@ -113,15 +113,17 @@ fn zrandmember_contract_on_both_encodings() {
             }
         }
 
-        // count >= size: the whole zset, in score order (Redis CASE 2).
+        // count >= size: the whole zset, highest score first (Redis CASE 2
+        // walks it with `zuiNext`, which starts at the tail).
         for k in [n, n + 1, 10 * n] {
             let k_s = k.to_string();
             let got = members_of(&run(&mut db, &[b"z", k_s.as_bytes(), b"WITHSCORES"]), true);
             let expect: Vec<_> = want
                 .iter()
+                .rev()
                 .map(|(m, s)| (m.clone(), Some(format_score_bytes(*s))))
                 .collect();
-            assert_eq!(got, expect, "n={n} count {k}: whole zset in score order");
+            assert_eq!(got, expect, "n={n} count {k}: whole zset, descending");
         }
 
         // Negative count: exactly |count| draws, repeats allowed.

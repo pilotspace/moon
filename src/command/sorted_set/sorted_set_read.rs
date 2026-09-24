@@ -1519,17 +1519,20 @@ pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         let n = std::cmp::min(count as usize, len);
         let mut result = Vec::with_capacity(if withscores { n * 2 } else { n });
         if n == len {
-            // The whole zset, in score order — Redis's CASE 2 ("count >=
-            // size: return the whole zset", walked with its own iterator) —
-            // with no sampling at all.
+            // The whole zset with no sampling at all — Redis's CASE 2
+            // ("count >= size: return the whole zset"), which walks it with
+            // `zuiNext`, whose iterator starts at the skiplist TAIL / the
+            // listpack's last pair: DESCENDING (score, member) order.
+            // Verified on redis-server 7.0.15 (`ZRANDMEMBER z 100` on a
+            // 60-member zset answers its highest score first).
             match &pool {
                 RandPool::Tree(t) => {
-                    for (score, member) in t.iter() {
+                    for (score, member) in t.iter_rev() {
                         push(&mut result, member, score.0);
                     }
                 }
                 RandPool::Flat(_) => {
-                    for (member, score) in zref.entries_sorted() {
+                    for (member, score) in zref.entries_sorted().into_iter().rev() {
                         push(&mut result, &member, score);
                     }
                 }
