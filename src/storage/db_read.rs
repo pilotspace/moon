@@ -59,7 +59,7 @@ impl<'a> HashRef<'a> {
                 // materialized, instead of every field walked past -- and the
                 // listpack is not re-walked from the head to reach a position
                 // the lookup had already found (moon#799).
-                lp.pair_value(field).map(|v| Bytes::from(v.to_vec()))
+                lp.pair_value(field).map(|v| v.to_bytes())
             }
             HashRef::WithTtl {
                 fields,
@@ -147,8 +147,10 @@ impl<'a> HashRef<'a> {
     pub fn entries(&self) -> Vec<(Bytes, Bytes)> {
         match self {
             HashRef::Map(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            // Borrowed walk, one copy per entry (moon#1174 §3): `iter_pairs`
+            // decoded each into a `Vec` and `to_bytes` cloned it again.
             HashRef::Listpack(lp) => lp
-                .iter_pairs()
+                .iter_pair_refs()
                 .map(|(f, v)| (f.to_bytes(), v.to_bytes()))
                 .collect(),
             HashRef::WithTtl {
@@ -184,6 +186,149 @@ impl<'a> HashRef<'a> {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect()
             }
+        }
+    }
+}
+
+/// Whether a field of a TTL-carrying hash is still live at `now_ms` -- the
+/// rule `HashRef::get_field` applies, shared by the field-only and
+/// length-only reads so they cannot disagree with it. `min_expiry_ms` is the
+/// cached minimum TTL: below it nothing has expired and the probe is skipped.
+#[inline]
+fn hash_field_live(
+    ttls: &HashMap<Bytes, u64>,
+    field: &[u8],
+    now_ms: u64,
+    min_expiry_ms: u64,
+) -> bool {
+    now_ms < min_expiry_ms || ttls.get(field).is_none_or(|&t| t > now_ms)
+}
+
+impl HashRef<'_> {
+    /// Whether `field` is present and live -- `HEXISTS` -- without
+    /// materializing its value (moon#1174 §3: it used to go through
+    /// `get_field`, which copies the value out of a listpack just to be
+    /// dropped).
+    pub fn contains_field(&self, field: &[u8]) -> bool {
+        match self {
+            HashRef::Map(map) => map.contains_key(field),
+            HashRef::Owned(map) => map.contains_key(field),
+            HashRef::Listpack(lp) => lp.pair_value(field).is_some(),
+            HashRef::WithTtl {
+                fields,
+                ttls,
+                now_ms,
+                min_expiry_ms,
+            } => {
+                fields.contains_key(field) && hash_field_live(ttls, field, *now_ms, *min_expiry_ms)
+            }
+            HashRef::OwnedWithTtl {
+                fields,
+                ttls,
+                now_ms,
+                min_expiry_ms,
+            } => {
+                fields.contains_key(field) && hash_field_live(ttls, field, *now_ms, *min_expiry_ms)
+            }
+        }
+    }
+
+    /// Byte length of `field`'s value, if present and live -- `HSTRLEN` --
+    /// without materializing it (moon#1174 §3). A listpack integer measures
+    /// its canonical spelling, the bytes `HGET` would return.
+    pub fn field_len(&self, field: &[u8]) -> Option<usize> {
+        match self {
+            HashRef::Map(map) => map.get(field).map(Bytes::len),
+            HashRef::Owned(map) => map.get(field).map(Bytes::len),
+            HashRef::Listpack(lp) => lp.pair_value(field).map(|v| v.byte_len()),
+            HashRef::WithTtl {
+                fields,
+                ttls,
+                now_ms,
+                min_expiry_ms,
+            } => fields
+                .get(field)
+                .filter(|_| hash_field_live(ttls, field, *now_ms, *min_expiry_ms))
+                .map(Bytes::len),
+            HashRef::OwnedWithTtl {
+                fields,
+                ttls,
+                now_ms,
+                min_expiry_ms,
+            } => fields
+                .get(field)
+                .filter(|_| hash_field_live(ttls, field, *now_ms, *min_expiry_ms))
+                .map(Bytes::len),
+        }
+    }
+
+    /// An upper bound on the live field count that costs O(1) on every
+    /// encoding -- a reply's capacity, not an answer (`len` is O(n) on a TTL
+    /// hash past its first expiry).
+    pub fn len_hint(&self) -> usize {
+        match self {
+            HashRef::Map(map) => map.len(),
+            HashRef::Owned(map) => map.len(),
+            HashRef::Listpack(lp) => lp.len() / 2,
+            HashRef::WithTtl { fields, .. } => fields.len(),
+            HashRef::OwnedWithTtl { fields, .. } => fields.len(),
+        }
+    }
+
+    /// Hand every live FIELD name to `f` -- `HKEYS` -- without materializing
+    /// a single value (moon#1174 §3: it used to call `entries()`, which copied
+    /// every value just to drop it, twice per entry on a listpack).
+    pub fn for_each_field(&self, mut f: impl FnMut(Bytes)) {
+        match self {
+            HashRef::Map(map) => map.keys().for_each(|k| f(k.clone())),
+            HashRef::Owned(map) => map.keys().for_each(|k| f(k.clone())),
+            HashRef::Listpack(lp) => lp.iter_pair_refs().for_each(|(k, _)| f(k.to_bytes())),
+            HashRef::WithTtl {
+                fields,
+                ttls,
+                now_ms,
+                min_expiry_ms,
+            } => fields
+                .keys()
+                .filter(|k| hash_field_live(ttls, k, *now_ms, *min_expiry_ms))
+                .for_each(|k| f(k.clone())),
+            HashRef::OwnedWithTtl {
+                fields,
+                ttls,
+                now_ms,
+                min_expiry_ms,
+            } => fields
+                .keys()
+                .filter(|k| hash_field_live(ttls, k, *now_ms, *min_expiry_ms))
+                .for_each(|k| f(k.clone())),
+        }
+    }
+
+    /// Hand every live VALUE to `f` -- `HVALS` -- without materializing a
+    /// single field name (moon#1174 §3).
+    pub fn for_each_value(&self, mut f: impl FnMut(Bytes)) {
+        match self {
+            HashRef::Map(map) => map.values().for_each(|v| f(v.clone())),
+            HashRef::Owned(map) => map.values().for_each(|v| f(v.clone())),
+            HashRef::Listpack(lp) => lp.iter_pair_refs().for_each(|(_, v)| f(v.to_bytes())),
+            HashRef::WithTtl {
+                fields,
+                ttls,
+                now_ms,
+                min_expiry_ms,
+            } => fields
+                .iter()
+                .filter(|(k, _)| hash_field_live(ttls, k, *now_ms, *min_expiry_ms))
+                .for_each(|(_, v)| f(v.clone())),
+            HashRef::OwnedWithTtl {
+                fields,
+                ttls,
+                now_ms,
+                min_expiry_ms,
+            } => fields
+                .iter()
+                .filter(|(k, _)| hash_field_live(ttls, k, *now_ms, *min_expiry_ms))
+                .for_each(|(_, v)| f(v.clone())),
         }
     }
 }
@@ -328,7 +473,8 @@ impl<'a> ListRef<'a> {
     pub fn iter_bytes(&self) -> Vec<Bytes> {
         match self {
             ListRef::Deque(d) => d.iter().cloned().collect(),
-            ListRef::Listpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
+            // Borrowed walk, one copy per element (moon#1174 §3).
+            ListRef::Listpack(lp) => lp.iter_refs().map(|e| e.to_bytes()).collect(),
             ListRef::Owned(d) => d.iter().cloned().collect(),
         }
     }
@@ -391,7 +537,7 @@ impl<'a> SetRef<'a> {
             SetRef::Hash(s) => s.get_index(idx).cloned(),
             SetRef::Owned(s) => s.get_index(idx).cloned(),
             SetRef::Intset(is) => is.get(idx).map(|v| Bytes::from(v.to_string())),
-            SetRef::Listpack(lp) => lp.get_at(idx).map(|e| e.to_bytes()),
+            SetRef::Listpack(lp) => lp.get_at(idx).map(|e| e.into_bytes()),
         }
     }
 
@@ -399,7 +545,7 @@ impl<'a> SetRef<'a> {
     pub fn members(&self) -> Vec<Bytes> {
         match self {
             SetRef::Hash(s) => s.iter().cloned().collect(),
-            SetRef::Listpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
+            SetRef::Listpack(lp) => lp.iter().map(|e| e.into_bytes()).collect(),
             SetRef::Intset(is) => is.iter().map(|v| Bytes::from(v.to_string())).collect(),
             SetRef::Owned(s) => s.iter().cloned().collect(),
         }
@@ -411,7 +557,7 @@ impl<'a> SetRef<'a> {
             // The stored set is an `IndexSet`; set algebra wants a plain
             // `HashSet`, so this boundary re-collects rather than clones.
             SetRef::Hash(s) => s.iter().cloned().collect(),
-            SetRef::Listpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
+            SetRef::Listpack(lp) => lp.iter().map(|e| e.into_bytes()).collect(),
             SetRef::Intset(is) => is.iter().map(|v| Bytes::from(v.to_string())).collect(),
             SetRef::Owned(s) => s.iter().cloned().collect(),
         }
@@ -488,7 +634,7 @@ impl<'a> SortedSetRef<'a> {
                             .and_then(|ss| ss.parse().ok())
                             .unwrap_or(0.0),
                     };
-                    pairs.push((m.to_bytes(), score));
+                    pairs.push((m.into_bytes(), score));
                 }
                 pairs.sort_by(|a, b| {
                     OrderedFloat(a.1)
