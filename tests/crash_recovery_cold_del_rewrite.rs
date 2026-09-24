@@ -40,7 +40,16 @@ const PROBE_VALUE_LEN: usize = 500;
 const FILLER_COUNT: usize = 16_000;
 const FILLER_VALUE_LEN: usize = 600;
 const MAXMEMORY_BYTES: usize = 8 * 1024 * 1024;
-const SHARDS: usize = 4;
+/// `--shards` for every server this suite starts: 4 (the per-shard fold) by
+/// default; `MOON_TEST_COLD_DEL_SHARDS=1` runs the single-shard layouts — the
+/// TopLevel manifest fold on monoio, the legacy flat-file fold on tokio.
+fn shards() -> usize {
+    std::env::var("MOON_TEST_COLD_DEL_SHARDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(4)
+}
 const SETTLE_AFTER_FILLER: u64 = 8;
 const SETTLE_AFTER_MUTATION: u64 = 3;
 
@@ -66,7 +75,7 @@ fn start_moon(port: u16, dir: &std::path::Path, sweep_secs: u64) -> common::Serv
                 "--port",
                 &port.to_string(),
                 "--shards",
-                &SHARDS.to_string(),
+                &shards().to_string(),
                 "--maxmemory",
                 &MAXMEMORY_BYTES.to_string(),
                 "--maxmemory-policy",
@@ -315,26 +324,38 @@ fn overwrite_value() -> String {
     "N".repeat(PROBE_VALUE_LEN)
 }
 
-/// Number of shard AOF dirs holding a base with seq > 1 (a completed rewrite).
-fn shards_with_compacted_base(dir: &std::path::Path) -> usize {
-    let Ok(shards) = std::fs::read_dir(dir.join("appendonlydir")) else {
-        return 0;
-    };
-    shards
-        .flatten()
-        .filter(|s| s.path().is_dir())
-        .filter(|s| {
-            std::fs::read_dir(s.path()).is_ok_and(|files| {
-                files.flatten().any(|f| {
-                    let name = f.file_name().to_string_lossy().to_string();
-                    name.strip_prefix("moon.aof.")
-                        .and_then(|r| r.strip_suffix(".base.rdb"))
-                        .and_then(|seq| seq.parse::<u64>().ok())
-                        .is_some_and(|seq| seq > 1)
-                })
-            })
+/// Whether `dir` holds a base with seq > 1 (a completed rewrite).
+fn has_compacted_base(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|files| {
+        files.flatten().any(|f| {
+            let name = f.file_name().to_string_lossy().to_string();
+            name.strip_prefix("moon.aof.")
+                .and_then(|r| r.strip_suffix(".base.rdb"))
+                .and_then(|seq| seq.parse::<u64>().ok())
+                .is_some_and(|seq| seq > 1)
         })
-        .count()
+    })
+}
+
+/// Number of AOF generations cut by a completed rewrite: one per shard dir
+/// with a compacted base (PerShard), or one for a compacted TopLevel base,
+/// or one for a legacy `appendonly.aof` rewritten with its RDB preamble
+/// (tokio `--shards 1`).
+fn shards_with_compacted_base(dir: &std::path::Path) -> usize {
+    let aof_dir = dir.join("appendonlydir");
+    let per_shard = std::fs::read_dir(&aof_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|s| s.path().is_dir() && has_compacted_base(&s.path()))
+                .count()
+        })
+        .unwrap_or(0);
+    let top_level = usize::from(has_compacted_base(&aof_dir));
+    let flat = usize::from(
+        std::fs::read(dir.join("appendonly.aof")).is_ok_and(|b| b.starts_with(b"MOON")),
+    );
+    per_shard + top_level + flat
 }
 
 /// BGREWRITEAOF and wait until every shard has cut a new generation and INFO
@@ -346,13 +367,13 @@ fn rewrite_and_wait(port: u16, dir: &std::path::Path) {
     loop {
         let info = redis_cmd(port, &["INFO", "persistence"]);
         let idle = info.contains("aof_rewrite_in_progress:0");
-        if idle && shards_with_compacted_base(dir) == SHARDS {
+        if idle && shards_with_compacted_base(dir) == shards() {
             return;
         }
         assert!(
             Instant::now() < deadline,
             "rewrite did not complete on all {} shards within 60s ({} done); INFO:\n{}",
-            SHARDS,
+            shards(),
             shards_with_compacted_base(dir),
             info
         );
