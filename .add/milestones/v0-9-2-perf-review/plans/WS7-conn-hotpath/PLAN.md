@@ -21,6 +21,8 @@ Review measurements: ACL SETUSER mid-run → existing connections' GET −48.6% 
    - Must: striped tracking table (by key hash) with BCAST prefixes behind a lock-free count gate; inline SET stays enabled under tracking and invalidates the key itself; untracked keys never take a lock (pre-filter). All tracking integration suites by name green (incl. REDIRECT, BCAST, OPTIN/OPTOUT, NOLOOP, RESP2 redirect).
 6. **moon#1198 (conn items)**: cluster-mode lock-free served-slot bitmap for routing (+ inline path when bit set and !asking); non-inline local GET cold-peek under the shared guard; inline SET pre-gate without a second exclusive acquisition; resolve `COMMAND_META` once per command. Commits `refs moon#1198`.
 
+7. **moon#1187 (remainder, Should)** per-shard AOF staging buffer — read `plans/WS6-persistence/NOTES.md` for the design constraints first: every `send_append_group` / `try_send_append_durable` call site in `server/conn/**` writes into a per-shard buffer with flush points before every `AofFold` and `fsync_barrier`; PerShard framing, TopLevel SELECT injection and the #455 per-record epoch filter must stay correct (epoch per chunk). Only after items 1–6; DEFER with evidence if exactly-once cannot be preserved.
+
 ## Owned files
 `src/server/conn/**` EXCEPT the remote-dispatch / `remote_groups` / coordinator-call regions (WS8), `src/client_pause.rs`, `src/acl/**`, `src/tracking/**`, `src/replication/state.rs`, `src/replication/backlog.rs`, `src/persistence/aof/pool.rs` (`issue_append_lsn` only), `src/admin/metrics_setup/**`, `src/admin/http_server.rs` (scrape hook), `src/cluster/**` (slot bitmap), `src/config.rs` / `src/main.rs` (context wiring only), tests `tests/perf_ws7_*.rs`.
 
